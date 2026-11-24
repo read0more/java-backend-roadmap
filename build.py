@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""김영한 로드맵 강좌 빌드 스크립트 (표준 라이브러리만 사용).
+"""자바 백엔드 로드맵 빌드 스크립트 (표준 라이브러리만 사용).
 
   python3 build.py                      전체 빌드: 권별 HTML, index.html, IMAGE_PROMPTS.md, STATUS.md
   python3 build.py images               미생성 이미지 목록만 갱신
@@ -24,6 +24,8 @@ sys.path.insert(0, str(ROOT))
 from volumes import STAGES, VOLUMES, BY_SLUG, BY_NO  # noqa: E402
 
 CONTENT = ROOT / 'content'
+SITE_TITLE = '자바 백엔드 로드맵'
+STORAGE_PREFIX = 'java-backend-roadmap-'
 BUILD_DATE = '2026-11-14'
 MIN_CHARS, GOAL_CHARS = 8000, 14000
 ALLOWED = {'p', 'h3', 'h4', 'ul', 'ol', 'li', 'strong', 'b', 'em', 'i', 'code', 'pre', 'table', 'thead', 'tbody', 'tr',
@@ -271,13 +273,14 @@ def article(L, total, written):
 def head(title, desc):
     return (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark">'
             f'<title>{title}</title><meta name="description" content="{html.escape(desc)}"><link rel="stylesheet" href="assets/course.css"><link rel="stylesheet" href="assets/roadmap.css">'
-            "<script>try{document.documentElement.dataset.theme=localStorage.getItem('kyh-roadmap-theme')||'light'}catch(e){}</script></head>")
+            '<script src="assets/roadmap-storage.js"></script></head>')
 
 
 def volume_page(vol, lessons):
     total, written = len(vol['lessons']), set(lessons)
     file = f'{vol["no"]:02}-{vol["slug"]}.html'
     brand = f'ROADMAP {vol["no"]:02}'
+    page_title = f'{vol["short"]} · {SITE_TITLE}'
     nav = cards = ''
     for i, (title, _, _) in enumerate(vol['lessons'], 1):
         if i in written:
@@ -302,14 +305,14 @@ def volume_page(vol, lessons):
 <h2>학습 기록</h2><p>완료 표시·문제 답·메모는 이 브라우저에만 저장된다. 다른 기기로 옮기거나 브라우저 데이터를 지우기 전에는 기록을 내보내 둔다.</p></div></section>'''
     stage = stage_of(vol['no'])
     first = f'#lesson-{min(written):02}' if written else '#home'
-    return f'''{head(vol["short"] + " · 김영한 로드맵 강좌", vol["desc"])}<body data-key="kyh-roadmap-{vol["slug"]}-v1" data-total="{total}" data-title="{vol["short"]} · 김영한 로드맵 강좌" data-brand="{brand}" data-first="{first.lstrip("#")}"><a class="skip" href="#main">본문으로 건너뛰기</a><noscript><p class="noscript">JavaScript가 꺼져 있어 모든 강의를 한 페이지로 표시합니다.</p></noscript><div id="storage-warning" class="storage-warning" role="status" hidden>브라우저 저장소를 사용할 수 없습니다. 닫기 전에 기록 내보내기를 사용하세요.</div>
+    return f'''{head(page_title, vol["desc"])}<body data-key="{STORAGE_PREFIX}{vol["slug"]}-v1" data-total="{total}" data-title="{page_title}" data-brand="{brand}" data-first="{first.lstrip("#")}"><a class="skip" href="#main">본문으로 건너뛰기</a><noscript><p class="noscript">JavaScript가 꺼져 있어 모든 강의를 한 페이지로 표시합니다.</p></noscript><div id="storage-warning" class="storage-warning" role="status" hidden>브라우저 저장소를 사용할 수 없습니다. 닫기 전에 기록 내보내기를 사용하세요.</div>
 <aside id="sidebar" class="sidebar"><a class="brand" href="#home"><span class="brand-icon">▤</span><span>{brand}<small>{vol["short"]}</small></span></a><div class="sidebar-intro">문법이 아니라<br><b>그 아래의 원리를 배운다.</b></div><label class="search-label" for="course-search">강의 검색</label><input id="course-search" type="search" placeholder="스택 프레임, 프록시, 인덱스…"><p id="search-count" class="micro" aria-live="polite"></p><nav aria-label="전체 강의"><a class="overview-link" href="index.html">← 전체 로드맵</a><a class="overview-link" href="#home">이 권의 안내</a><div class="nav-group"><p>{stage[0]}</p>{nav}</div><div class="nav-resources"><a href="#glossary">↗ 용어 사전</a><a href="#sources">↗ 근거와 범위</a></div></nav><div class="sidebar-bottom"><span>{len(written)} / {total} LESSONS</span><span>VOL {vol["no"]:02}</span></div></aside>
 <div class="shell"><header class="topbar"><button id="menu-toggle" class="icon-button" type="button" aria-controls="sidebar" aria-expanded="false">목차 ☰</button><span id="current-label">수업 안내</span><div class="top-actions"><span id="progress-label">0 / {total} 완료</span><button id="theme-toggle" class="icon-button" type="button" aria-label="테마 전환">다크 모드</button><button id="print-current" class="icon-button" type="button">인쇄</button></div><div class="course-progress"><span id="course-progress-bar"></span></div></header><main id="main">
 <section id="home" class="page"><div class="hero"><div class="hero-copy"><span class="eyebrow">ROADMAP VOL {vol["no"]:02} · {stage[0]}</span><h1 tabindex="-1">{vol["short"]}</h1><p>{vol["desc"]}</p><div class="hero-actions"><a id="resume-link" class="button" href="{first}">첫 수업 시작하기 →</a><a class="hero-secondary" href="#curriculum">전체 강의 보기 ↓</a></div><div class="hero-stats"><span><b>{total}</b>회 수업</span><span><b>{len(written)}</b>회 작성됨</span><span><b>{sum(L["chars"] for L in lessons.values()):,}</b>자</span></div></div><div class="hero-art">{roadmap_svg(vol["no"])}<div class="art-caption"><span>BASED ON THE PUBLIC CURRICULUM</span><b>{vol["course"]}</b></div></div></div>
 <div class="home-intro"><div><span class="eyebrow">WHAT THIS VOLUME IS</span><h2>코드 작성법보다,<br>왜 그렇게 동작하는지.</h2><p>각 회차는 강의의 한 섹션에 대응한다. 그 섹션이 다루는 주제를 빠짐없이 짚되, 무게는 <b>바닥의 원리</b>에 둔다. {vol["focus"]}</p></div><aside><b>읽는 법</b><p>본문을 읽고 핵심 요약으로 뼈대를 확인한 다음, 적용 연습을 손으로 풀고 확인 문제로 이유를 점검한다. 한 회차가 책의 한 챕터 분량이므로 나눠 읽어도 된다.</p><p>사실 관계는 공식 명세와 문서를 근거로 삼았고, 회차 끝의 「근거와 더 읽을 자료」에 적어 두었다.</p></aside></div>
 <section class="learning-tools"><div><h2>내 학습 기록</h2><p>완료 표시·문제 답·메모를 이 브라우저에 보관합니다.</p></div><div><button id="export-progress" class="secondary" type="button">기록 내보내기</button><button id="import-progress" class="secondary" type="button">기록 가져오기</button><input id="import-file" type="file" accept="application/json,.json" hidden><button id="print-all" class="text-button" type="button">전체 강의 인쇄</button></div><p id="record-status" role="status"></p></section>
 <div id="curriculum"><div class="section-heading"><span class="eyebrow">THE LEARNING MAP</span><h2>{vol["short"]} — {total}회</h2><p>{vol["course"]}의 섹션 순서를 따른다.</p></div><section class="curriculum-group"><div class="lesson-grid">{cards}</div></section></div></section>
-{articles}{gloss}{sources}<footer class="site-footer"><span>KYH ROADMAP · VOL {vol["no"]:02}</span><a href="index.html">전체 로드맵</a><span>로컬 학습 자료 · 외부 분석 도구 없음</span></footer></main></div><div id="toast" role="status" hidden></div><script src="assets/vendor/highlightjs/highlight.min.js"></script><script src="assets/code-highlight.js"></script><script src="assets/course.js"></script></body></html>''', file
+{articles}{gloss}{sources}<footer class="site-footer"><span>{SITE_TITLE} · VOL {vol["no"]:02}</span><a href="index.html">전체 로드맵</a><span>로컬 학습 자료 · 외부 분석 도구 없음</span></footer></main></div><div id="toast" role="status" hidden></div><script src="assets/vendor/highlightjs/highlight.min.js"></script><script src="assets/code-highlight.js"></script><script src="assets/course.js"></script></body></html>''', file
 
 
 def hub_page(done):
@@ -323,21 +326,21 @@ def hub_page(done):
             v = BY_NO[n]
             w, t = len(done[v['slug']]), len(v['lessons'])
             state = '작성 완료' if w == t else (f'{w}/{t}회 작성됨' if w else '준비 중')
-            cards += (f'<a class="lesson-card{"" if w else " is-pending"}" href="{n:02}-{v["slug"]}.html" data-volume="kyh-roadmap-{v["slug"]}-v1" data-total="{t}"><span class="card-day">VOL {n:02} <small>{t}회 · {state}</small></span>'
+            cards += (f'<a class="lesson-card{"" if w else " is-pending"}" href="{n:02}-{v["slug"]}.html" data-volume="{STORAGE_PREFIX}{v["slug"]}-v1" data-total="{t}"><span class="card-day">VOL {n:02} <small>{t}회 · {state}</small></span>'
                       f'<h3>{v["short"]}</h3><p>{v["desc"]}</p><span class="card-link"><span class="vol-progress"></span> 열기 <span>↗</span></span></a>')
         sections += f'<section class="curriculum-group"><h2>{name}</h2><p class="stage-desc">{desc}</p><div class="lesson-grid">{cards}</div></section>'
     has_appx = any(APPX.glob('[0-9][0-9]-*.html'))
     appx_nav = f'<div class="nav-group"><p>부록</p><a href="{APPX_FILE}"><span class="nav-num">+</span><span>흔하지만 치명적인 실수</span></a></div>' if has_appx else ''
     appx_card = (f'<section class="curriculum-group"><h2>부록</h2><p class="stage-desc">권을 가로질러 모아 본 것.</p><div class="lesson-grid"><a class="lesson-card" href="{APPX_FILE}"><span class="card-day">APPENDIX</span>'
                  '<h3>흔하지만 치명적인 실수</h3><p>한두 줄로 저지르기 쉽고 결과가 큰 실수를 영역별로 모았다. 강의에 있는 것은 해당 회차로 연결하고, 없는 것은 부록에서 설명한다.</p><span class="card-link">열기 <span>↗</span></span></a></div></section>') if has_appx else ''
-    return f'''{head("김영한 로드맵 강좌 — 자바에서 스프링, JPA, 데이터베이스까지", "인프런 김영한 공부법 로드맵의 강의 구성을 따라, 바닥의 원리를 중심으로 다시 쓴 학습 자료.")}<body><a class="skip" href="#main">본문으로 건너뛰기</a>
-<aside id="sidebar" class="sidebar"><a class="brand" href="#home"><span class="brand-icon">▤</span><span>KYH ROADMAP<small>김영한 로드맵 강좌</small></span></a><div class="sidebar-intro">문법이 아니라<br><b>그 아래의 원리를 배운다.</b></div><nav aria-label="전체 권">{nav}{appx_nav}</nav><div class="sidebar-bottom"><span>{len(VOLUMES)} VOLUMES</span><span>{total_l} LESSONS</span></div></aside>
+    return f'''{head(SITE_TITLE, "자바에서 스프링, JPA, 데이터베이스까지 백엔드의 동작 원리를 배우는 학습 자료.")}<body><a class="skip" href="#main">본문으로 건너뛰기</a>
+<aside id="sidebar" class="sidebar"><a class="brand" href="#home"><span class="brand-icon">▤</span><span>{SITE_TITLE}</span></a><div class="sidebar-intro">문법이 아니라<br><b>그 아래의 원리를 배운다.</b></div><nav aria-label="전체 권">{nav}{appx_nav}</nav><div class="sidebar-bottom"><span>{len(VOLUMES)} VOLUMES</span><span>{total_l} LESSONS</span></div></aside>
 <div class="shell"><header class="topbar"><button id="menu-toggle" class="icon-button" type="button" aria-controls="sidebar" aria-expanded="false">목차 ☰</button><span id="current-label">전체 로드맵</span><div class="top-actions"><span id="progress-label">{done_l} / {total_l}회 작성됨</span><button id="theme-toggle" class="icon-button" type="button" aria-label="테마 전환">다크 모드</button></div></header><main id="main">
-<section id="home" class="page"><div class="hero"><div class="hero-copy"><span class="eyebrow">JAVA · SPRING · JPA · DATABASE</span><h1 tabindex="-1">자바 한 줄에서<br>실행 계획까지.</h1><p>인프런 「김영한 공부법」 로드맵의 강의 순서를 그대로 따라가되,<br>코드 작성법보다 JVM·스레드·네트워크·DB 엔진의 원리에 무게를 둔 강좌.</p><div class="hero-actions"><a class="button" href="01-java-intro.html">1권부터 시작하기 →</a><a class="hero-secondary" href="#curriculum">전체 권 보기 ↓</a></div><div class="hero-stats"><span><b>{len(VOLUMES)}</b>권</span><span><b>{total_l}</b>회 수업</span><span><b>{done_l}</b>회 작성됨</span></div></div><div class="hero-art">{roadmap_svg()}<div class="art-caption"><span>FUNDAMENTALS FIRST.</span><b>왜 그렇게 동작하는지<br>설명할 수 있을 때까지.</b></div></div></div>
+<section id="home" class="page"><div class="hero"><div class="hero-copy"><span class="eyebrow">JAVA · SPRING · JPA · DATABASE</span><h1 tabindex="-1">{SITE_TITLE}</h1><p>자바에서 스프링, JPA, 데이터베이스까지. JVM·스레드·네트워크·DB 엔진이 어떻게 동작하는지 살펴봅니다.</p><div class="hero-actions"><a class="button" href="01-java-intro.html">1권부터 시작하기 →</a><a class="hero-secondary" href="#curriculum">전체 권 보기 ↓</a></div><div class="hero-stats"><span><b>{len(VOLUMES)}</b>권</span><span><b>{total_l}</b>회 수업</span><span><b>{done_l}</b>회 작성됨</span></div></div><div class="hero-art">{roadmap_svg()}<div class="art-caption"><span>FUNDAMENTALS FIRST.</span><b>왜 그렇게 동작하는지<br>설명할 수 있을 때까지.</b></div></div></div>
 <div class="home-intro"><div><span class="eyebrow">HOW THIS COURSE IS BUILT</span><h2>로드맵의 순서,<br>실제 커리큘럼의 범위.</h2><p>권 하나가 로드맵의 강의 하나에, 회차 하나가 그 강의의 섹션 하나에 대응한다. 회차의 범위는 인프런에 공개된 커리큘럼(섹션·수업 제목)에서 가져왔고, 설명과 예제는 언어 명세·공식 문서를 근거로 새로 썼다. 강의 영상이나 교안의 내용을 옮긴 것이 아니다.</p></div><aside><b>빠진 것</b><p>로드맵 21번 「스프링 부트 - 핵심 원리와 활용」은 제외했다. 16번 도서 「자바 ORM 표준 JPA 프로그래밍」은 같은 주제인 15권 JPA 기본편에서 함께 다룬다.</p><p>로드맵은 스프링을 시작하기 전에 최소한 자바 기본편과 중급 1·2편(2~4권)을 다지라고 권한다.</p></aside></div>
 <div id="curriculum"><div class="section-heading"><span class="eyebrow">THE ROADMAP</span><h2>여덟 단계, {len(VOLUMES)}권.</h2><p>번호는 로드맵의 순번이다. 준비 중인 권은 회차가 작성되는 대로 채워진다.</p></div>{sections}{appx_card}</div></section>
-<footer class="site-footer"><span>KYH ROADMAP · {BUILD_DATE}</span><span>로컬 학습 자료 · 외부 분석 도구 없음</span></footer></main></div>
-<script>(()=>{{const $=s=>document.querySelector(s),t=$('#theme-toggle'),u=()=>t.textContent=document.documentElement.dataset.theme==='dark'?'라이트 모드':'다크 모드';t.addEventListener('click',()=>{{const d=document.documentElement;d.dataset.theme=d.dataset.theme==='dark'?'light':'dark';try{{localStorage.setItem('kyh-roadmap-theme',d.dataset.theme)}}catch(e){{}}u()}});u();$('#menu-toggle').addEventListener('click',()=>$('#sidebar').classList.toggle('is-open'));document.querySelectorAll('[data-volume]').forEach(a=>{{try{{const s=JSON.parse(localStorage.getItem(a.dataset.volume));if(s&&s.done&&s.done.length)a.querySelector('.vol-progress').textContent=s.done.length+' / '+a.dataset.total+' 완료 ·'}}catch(e){{}}}})}})();</script></body></html>'''
+<footer class="site-footer"><span>{SITE_TITLE} · {BUILD_DATE}</span><span>로컬 학습 자료 · 외부 분석 도구 없음</span></footer></main></div>
+<script>(()=>{{const $=s=>document.querySelector(s),t=$('#theme-toggle'),u=()=>t.textContent=document.documentElement.dataset.theme==='dark'?'라이트 모드':'다크 모드';t.addEventListener('click',()=>{{const d=document.documentElement;d.dataset.theme=d.dataset.theme==='dark'?'light':'dark';try{{localStorage.setItem(ROADMAP_THEME_KEY,d.dataset.theme)}}catch(e){{}}u()}});u();$('#menu-toggle').addEventListener('click',()=>$('#sidebar').classList.toggle('is-open'));document.querySelectorAll('[data-volume]').forEach(a=>{{try{{const s=JSON.parse(readRoadmapStorage(a.dataset.volume));if(s&&s.done&&s.done.length)a.querySelector('.vol-progress').textContent=s.done.length+' / '+a.dataset.total+' 완료 ·'}}catch(e){{}}}})}})();</script></body></html>'''
 
 
 # ---------------------------------------------------------------------------
@@ -442,15 +445,15 @@ def appendix_page(areas):
                      + (f'<details class="further"><summary>근거</summary><ul class="ref-list">{refs}</ul></details>' if refs else '') + '</article>')
         sections += (f'<section class="prose pitfall-area" id="area-{i:02}"><h2><span>{i:02}</span> {a["title"]}</h2><p>{a["desc"]}</p>'
                      f'<details class="lesson-toc" open><summary>이 영역의 실수 {len(a["items"])}개</summary><ol>{index}</ol></details>{arts}</section>')
-    return f'''{head("부록 · 흔하지만 치명적인 실수 · 김영한 로드맵 강좌", "자바·스프링·JPA에서 누구나 한 번쯤 저지르지만 결과가 큰 실수를 모았다.")}<body><a class="skip" href="#main">본문으로 건너뛰기</a>
+    return f'''{head(f"부록 · 흔하지만 치명적인 실수 · {SITE_TITLE}", "자바·스프링·JPA에서 누구나 한 번쯤 저지르지만 결과가 큰 실수를 모았다.")}<body><a class="skip" href="#main">본문으로 건너뛰기</a>
 <aside id="sidebar" class="sidebar"><a class="brand" href="#home"><span class="brand-icon">▤</span><span>APPENDIX<small>흔하지만 치명적인 실수</small></span></a><div class="sidebar-intro">한 줄의 실수가<br><b>장애가 되는 자리.</b></div><nav aria-label="영역"><a class="overview-link" href="index.html">← 전체 로드맵</a><div class="nav-group"><p>영역</p>{nav}</div></nav><div class="sidebar-bottom"><span>{n_all} PITFALLS</span><span>APPENDIX</span></div></aside>
 <div class="shell"><header class="topbar"><button id="menu-toggle" class="icon-button" type="button" aria-controls="sidebar" aria-expanded="false">목차 ☰</button><span id="current-label">부록 · 흔하지만 치명적인 실수</span><div class="top-actions"><span id="progress-label">{n_all}개 · 부록에서 설명 {n_new}개</span><button id="theme-toggle" class="icon-button" type="button" aria-label="테마 전환">다크 모드</button></div></header><main id="main">
 <section id="home" class="page lesson"><header class="lesson-header"><p class="eyebrow">APPENDIX / {n_all} PITFALLS</p><h1 tabindex="-1">흔하지만 치명적인 실수</h1><p class="deck">한두 줄로 저지르기 쉽고, 데이터가 깨지거나 서버가 멈추거나 조용히 틀린 결과가 나가는 실수를 영역별로 모았다.</p></header>
 <div class="prose"><p>강의 본문에서 이미 다룬 실수는 <b>증상 한 줄과 해당 회차의 소제목 링크</b>만 두었다. 원리는 그 회차에서 읽는다. 강의 본문에 없는 실수 {n_new}개는 <b>이 부록 안에서</b> 왜 그렇게 되는지, 어떻게 재현되는지, 어떻게 고치는지를 설명한다. 각 항목의 꼬리표는 그 실수가 주로 낳는 결과({" · ".join(HARMS)})다.</p></div>
 {sections}</section>
-<footer class="site-footer"><span>KYH ROADMAP · APPENDIX</span><a href="index.html">전체 로드맵</a><span>로컬 학습 자료 · 외부 분석 도구 없음</span></footer></main></div>
+<footer class="site-footer"><span>{SITE_TITLE} · APPENDIX</span><a href="index.html">전체 로드맵</a><span>로컬 학습 자료 · 외부 분석 도구 없음</span></footer></main></div>
 <script src="assets/vendor/highlightjs/highlight.min.js"></script><script src="assets/code-highlight.js"></script>
-<script>(()=>{{const $=s=>document.querySelector(s),t=$('#theme-toggle'),u=()=>t.textContent=document.documentElement.dataset.theme==='dark'?'라이트 모드':'다크 모드';t.addEventListener('click',()=>{{const d=document.documentElement;d.dataset.theme=d.dataset.theme==='dark'?'light':'dark';try{{localStorage.setItem('kyh-roadmap-theme',d.dataset.theme)}}catch(e){{}}u()}});u();$('#menu-toggle').addEventListener('click',()=>$('#sidebar').classList.toggle('is-open'))}})();</script></body></html>'''
+<script>(()=>{{const $=s=>document.querySelector(s),t=$('#theme-toggle'),u=()=>t.textContent=document.documentElement.dataset.theme==='dark'?'라이트 모드':'다크 모드';t.addEventListener('click',()=>{{const d=document.documentElement;d.dataset.theme=d.dataset.theme==='dark'?'light':'dark';try{{localStorage.setItem(ROADMAP_THEME_KEY,d.dataset.theme)}}catch(e){{}}u()}});u();$('#menu-toggle').addEventListener('click',()=>$('#sidebar').classList.toggle('is-open'))}})();</script></body></html>'''
 
 
 def appendix(lesson, write=True):

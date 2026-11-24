@@ -1,7 +1,7 @@
 'use strict';
 // software-design-books-course/assets/course.js를 권별 설정(body data-*)으로 일반화한 것. 실험(lab)과 구버전 이전 코드는 뺐다.
 (() => {
- const B=document.body.dataset, KEY=B.key, TOTAL=+B.total, TITLE=B.title, BRAND=B.brand, FIRST=B.first||'home', THEME='kyh-roadmap-theme';
+ const B=document.body.dataset, KEY=B.key, TOTAL=+B.total, TITLE=B.title, BRAND=B.brand, FIRST=B.first||'home';
  const $=(s,root=document)=>root.querySelector(s), $$=(s,root=document)=>[...root.querySelectorAll(s)];
  const fresh=()=>({version:1,done:[],notes:{},quizzes:{},last:FIRST});
  let state=fresh(),storageOK=true,active='home',toastTimer;
@@ -14,7 +14,7 @@
   if(typeof x.last==='string'&&isLesson(x.last))out.last=x.last;
   return out;
  }
- try{const raw=localStorage.getItem(KEY);if(raw)state=validate(JSON.parse(raw));localStorage.setItem(KEY,JSON.stringify(state));}catch(e){storageOK=false;$('#storage-warning').hidden=false;}
+ try{const raw=readRoadmapStorage(KEY);if(raw)state=validate(JSON.parse(raw));localStorage.setItem(KEY,JSON.stringify(state));}catch(e){storageOK=false;$('#storage-warning').hidden=false;}
  function save(){try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){storageOK=false;$('#storage-warning').hidden=false;}}
  function toast(s){$('#toast').textContent=s;$('#toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').hidden=true,2600);}
  function progress(){
@@ -48,7 +48,7 @@
  document.addEventListener('click',e=>{if(window.innerWidth<=860&&!e.target.closest('#sidebar')&&!e.target.closest('#menu-toggle'))closeMenu();});
  $$('[data-complete]').forEach(b=>b.addEventListener('click',()=>{const n=+b.dataset.complete;state.done=state.done.includes(n)?state.done.filter(x=>x!==n):[...state.done,n];save();progress();toast(state.done.includes(n)?'오늘의 학습을 기록했어요.':'완료 표시를 취소했어요.');}));
  function updateTheme(){const dark=document.documentElement.dataset.theme==='dark';$('#theme-toggle').textContent=dark?'라이트 모드':'다크 모드';$('#theme-toggle').setAttribute('aria-label',dark?'라이트 모드로 전환':'다크 모드로 전환');}
- $('#theme-toggle').addEventListener('click',()=>{document.documentElement.dataset.theme=document.documentElement.dataset.theme==='dark'?'light':'dark';try{localStorage.setItem(THEME,document.documentElement.dataset.theme);}catch(e){}updateTheme();});updateTheme();
+ $('#theme-toggle').addEventListener('click',()=>{document.documentElement.dataset.theme=document.documentElement.dataset.theme==='dark'?'light':'dark';try{localStorage.setItem(ROADMAP_THEME_KEY,document.documentElement.dataset.theme);}catch(e){}updateTheme();});updateTheme();
  function feedback(form,choice){const correct=choice===+form.dataset.answer;const p=$('.feedback',form);p.hidden=false;p.className='feedback '+(correct?'correct':'wrong');p.textContent=(correct?'맞았어요. ':'다시 생각해 보세요. ')+$('.explanation',form).textContent;}
  function hydrate(){
   $$('[data-note]').forEach(el=>el.value=state.notes[el.dataset.note]||'');

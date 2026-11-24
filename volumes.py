@@ -17,7 +17,7 @@ STAGES = [
 ]
 
 VOLUMES = [
- dict(no=1, slug='java-intro', short='자바 입문', course='김영한의 자바 입문 - 코드로 시작하는 자바 첫걸음',
+ dict(no=1, slug='java-intro', short='자바 입문', course='자바 입문 - 코드로 시작하는 자바 첫걸음',
   desc='문법을 외우는 대신, 소스 코드가 바이트코드가 되어 JVM 위에서 실행되기까지와 값이 메모리에 놓이는 방식을 처음부터 따라간다.',
   focus='javac와 java, 바이트코드와 JVM, 기본형의 비트 표현(2의 보수, IEEE 754), 오버플로, 연산자 평가 순서와 단락 평가, 지역 변수와 스택 프레임, 형변환 규칙(JLS 5장), 배열이 힙에 놓이는 방식, 메서드 호출과 값에 의한 전달.',
   lessons=[
@@ -31,7 +31,7 @@ VOLUMES = [
    ('배열 — 참조와 힙의 첫 만남', [9], ''),
    ('메서드 — 호출 스택과 값에 의한 전달', [10], ''),
   ]),
- dict(no=2, slug='java-basic', short='자바 기본편', course='김영한의 실전 자바 - 기본편',
+ dict(no=2, slug='java-basic', short='자바 기본편', course='실전 자바 - 기본편',
   desc='클래스, 참조, 생성자, static, 상속, 다형성을 JVM 메모리(메서드 영역·스택·힙)와 메서드 호출 규칙의 관점에서 이해한다.',
   focus='JVM 런타임 데이터 영역(JVMS 2.5), 객체 생성과 참조값, 기본형과 참조형의 대입·전달, 클래스 로딩과 초기화 시점(JLS 12.4), static과 인스턴스의 저장 위치, final의 의미, 상속 시 객체의 메모리 구조, 메서드 오버라이딩과 가상 메서드 호출(invokevirtual), 다운캐스팅과 instanceof, 추상 클래스·인터페이스, OCP와 다형성.',
   lessons=[
@@ -47,7 +47,7 @@ VOLUMES = [
    ('다형성 2 — 추상 클래스와 인터페이스', [12], ''),
    ('다형성과 설계', [13], ''),
   ]),
- dict(no=3, slug='java-mid1', short='자바 중급 1편', course='김영한의 실전 자바 - 중급 1편',
+ dict(no=3, slug='java-mid1', short='자바 중급 1편', course='실전 자바 - 중급 1편',
   desc='Object, 불변 객체, String, 래퍼와 Class, enum, 날짜와 시간, 중첩 클래스, 예외를 언어 명세와 JVM 동작 수준에서 살핀다.',
   focus='Object의 equals/hashCode/toString 규약, 동일성과 동등성, 불변 객체와 공유 참조의 부작용, String의 내부 표현(compact strings)과 문자열 상수 풀, 문자열 연결의 컴파일 방식, 오토박싱과 Integer 캐시, Class 객체와 클래스 메타데이터, enum의 컴파일 결과, java.time의 설계(불변, Instant와 시간대), 내부 클래스가 바깥 인스턴스·지역 변수를 캡처하는 방식, 예외 계층과 체크/언체크 예외, try-with-resources와 suppressed 예외, 스택 트레이스.',
   lessons=[
@@ -62,7 +62,7 @@ VOLUMES = [
    ('예외 처리 1 — 이론', [10], ''),
    ('예외 처리 2 — 실습과 자원 정리', [11], ''),
   ]),
- dict(no=4, slug='java-mid2', short='자바 중급 2편', course='김영한의 실전 자바 - 중급 2편',
+ dict(no=4, slug='java-mid2', short='자바 중급 2편', course='실전 자바 - 중급 2편',
   desc='제네릭과 컬렉션 프레임워크를 자료 구조와 시간 복잡도, 타입 소거, 해시와 동등성의 원리로 설명한다.',
   focus='제네릭의 타입 안전성과 타입 소거(JLS 4.6), 브리지 메서드, 와일드카드와 공변·반공변(PECS), 배열 기반 리스트의 동적 확장과 분할 상환 분석, 연결 리스트와 메모리 지역성, 빅오 표기, 해시 함수·해시 충돌·버킷, HashMap의 구조(트리화 포함)와 리사이즈, equals/hashCode 규약이 깨질 때 생기는 일, 레드-블랙 트리 기반 TreeMap, Iterator와 fail-fast, Comparable/Comparator와 정렬 안정성.',
   lessons=[
@@ -143,7 +143,7 @@ VOLUMES = [
    ('스프링 타입 컨버터', [11], ''),
    ('파일 업로드', [12], ''),
   ]),
- dict(no=10, slug='db-intro', short='데이터베이스 입문', course='김영한의 실전 데이터베이스 입문',
+ dict(no=10, slug='db-intro', short='데이터베이스 입문', course='실전 데이터베이스 입문',
   desc='데이터베이스가 왜 필요한지, 관계형 모델이 무엇인지에서 시작해 SQL의 데이터 관리·조회·가공·집계를 익힌다.',
   focus='파일 저장과 DBMS의 차이, 관계형 모델(테이블·행·열·키), SQL의 분류(DDL·DML·DCL·TCL), 자료형과 저장, NULL과 3값 논리, SELECT의 논리적 처리 순서, 정렬과 LIMIT, 함수, GROUP BY와 HAVING, 집계 함수가 NULL을 다루는 방식.',
   lessons=[
@@ -154,7 +154,7 @@ VOLUMES = [
    ('SQL — 데이터 가공', [6], ''),
    ('SQL — 집계와 그룹핑', [7], ''),
   ]),
- dict(no=11, slug='db-basic', short='데이터베이스 기본편', course='김영한의 실전 데이터베이스 - 기본편',
+ dict(no=11, slug='db-basic', short='데이터베이스 기본편', course='실전 데이터베이스 - 기본편',
   desc='조인, 서브쿼리, 집합 연산, 뷰, 인덱스, 무결성, 트랜잭션을 실행 원리와 함께 익힌다.',
   focus='조인의 논리적 의미와 실행 방식(중첩 루프 조인), 외부 조인과 NULL, 상관 서브쿼리, UNION과 중복 제거 비용, 뷰의 처리 방식, B+Tree 인덱스의 구조와 탐색, 클러스터형 인덱스와 보조 인덱스(InnoDB), 복합 인덱스와 최좌측 접두사, 제약 조건과 무결성, ACID, 격리 수준과 이상 현상, 잠금과 MVCC.',
   lessons=[
@@ -267,7 +267,7 @@ VOLUMES = [
    ('스프링 AOP — 포인트컷', [12], ''),
    ('스프링 AOP — 실전 예제와 실무 주의사항', [13, 14], ''),
   ]),
- dict(no=22, slug='java-adv1', short='자바 고급 1편', course='김영한의 실전 자바 - 고급 1편, 멀티스레드와 동시성',
+ dict(no=22, slug='java-adv1', short='자바 고급 1편', course='실전 자바 - 고급 1편, 멀티스레드와 동시성',
   desc='프로세스와 스레드, 스케줄링, 메모리 가시성, 동기화, 락, 생산자-소비자, CAS, 동시성 컬렉션, 스레드 풀을 운영체제와 자바 메모리 모델 수준에서 다룬다.',
   focus='프로세스·스레드·컨텍스트 스위칭, 스레드 상태(Thread.State)와 전이, 인터럽트, join과 yield, CPU 캐시와 메모리 가시성, volatile과 happens-before(JLS 17.4), 모니터 락과 synchronized, 임계 영역과 경합 조건, ReentrantLock과 LockSupport(park/unpark), Condition, wait/notify와 스레드 대기 집합, BlockingQueue, CAS와 Atomic 클래스, 스핀 락, ConcurrentHashMap 등 동시성 컬렉션, ThreadPoolExecutor의 동작(코어·큐·최대), Future와 Callable, 우아한 종료, 거절 정책.',
   lessons=[
@@ -285,7 +285,7 @@ VOLUMES = [
    ('스레드 풀과 Executor 프레임워크 1', [13], ''),
    ('스레드 풀과 Executor 프레임워크 2', [14], ''),
   ]),
- dict(no=23, slug='java-adv2', short='자바 고급 2편', course='김영한의 실전 자바 - 고급 2편, I/O, 네트워크, 리플렉션',
+ dict(no=23, slug='java-adv2', short='자바 고급 2편', course='실전 자바 - 고급 2편, I/O, 네트워크, 리플렉션',
   desc='문자 인코딩, 스트림 I/O, 파일, 소켓 프로그래밍, HTTP 서버 직접 구현, 리플렉션과 애노테이션을 운영체제와 프로토콜 수준에서 다룬다.',
   focus='문자 집합과 인코딩(ASCII, EUC-KR, UTF-8, UTF-16), 바이트 스트림과 문자 스트림, 버퍼링과 시스템 콜 비용, 데코레이터 구조의 I/O 클래스, 직렬화, NIO의 Files와 Path, TCP 소켓과 연결 수립, ServerSocket의 backlog, 블로킹 I/O와 스레드, 자원 정리와 정상 종료(셧다운 훅), 타임아웃과 연결 종료(FIN, RST), HTTP 메시지 파싱, 리플렉션과 Class 메타데이터, 애노테이션 보존 정책과 처리.',
   lessons=[
@@ -303,7 +303,7 @@ VOLUMES = [
    ('애노테이션', [14], ''),
    ('HTTP 서버 활용', [15], ''),
   ]),
- dict(no=24, slug='java-adv3', short='자바 고급 3편', course='김영한의 실전 자바 - 고급 3편, 람다, 스트림, 함수형 프로그래밍',
+ dict(no=24, slug='java-adv3', short='자바 고급 3편', course='실전 자바 - 고급 3편, 람다, 스트림, 함수형 프로그래밍',
   desc='람다와 함수형 인터페이스, 메서드 참조, 스트림, Optional, 병렬 스트림을 컴파일 결과와 실행 모델까지 내려가 설명한다.',
   focus='동작 매개변수화, 람다의 컴파일(invokedynamic과 LambdaMetafactory), 익명 클래스와의 차이(this, 클래스 파일), 변수 캡처와 사실상 final, 함수형 인터페이스와 타깃 타이핑, 메서드 참조의 네 종류, 스트림 파이프라인의 지연 평가와 단락, 기본형 특화 스트림, Collector의 구조, Optional의 의도와 오용, 디폴트 메서드와 다중 상속 해석 규칙, 포크/조인 프레임워크와 작업 훔치기, 공용 풀과 병렬 스트림의 주의점, 순수 함수와 불변성.',
   lessons=[
@@ -319,7 +319,7 @@ VOLUMES = [
    ('병렬 스트림', [13], ''),
    ('함수형 프로그래밍', [14], ''),
   ]),
- dict(no=25, slug='db-design1', short='데이터베이스 설계 1편', course='김영한의 실전 데이터베이스 - 설계 1편, 현대적 데이터 모델링 완전 정복',
+ dict(no=25, slug='db-design1', short='데이터베이스 설계 1편', course='실전 데이터베이스 - 설계 1편, 현대적 데이터 모델링 완전 정복',
   desc='개념적·논리적·물리적 모델링의 세 단계를 따라 엔티티, 키, 관계, 정규화, 물리 설계를 원리부터 다룬다.',
   focus='데이터 모델링 3단계, 엔티티·속성·관계와 ERD 표기, 후보 키·기본 키·대체 키, 자연 키와 대리 키, 카디널리티와 참여도, 일대일·일대다·다대다의 테이블 표현, 식별·비식별 관계, 함수 종속성과 정규형(1NF~BCNF), 이상 현상, 반정규화, 자료형 선택과 저장 크기, 제약 조건, 인덱스 설계.',
   lessons=[
@@ -333,7 +333,7 @@ VOLUMES = [
    ('물리적 모델링', [11], ''),
    ('물리적 모델링 — 실습', [12], ''),
   ]),
- dict(no=26, slug='db-design2', short='데이터베이스 설계 2편', course='김영한의 실전 데이터베이스 - 설계 2편, 실무에서 반드시 마주치는 9가지 설계 패턴',
+ dict(no=26, slug='db-design2', short='데이터베이스 설계 2편', course='실전 데이터베이스 - 설계 2편, 실무에서 반드시 마주치는 9가지 설계 패턴',
   desc='공통 코드, 계층 구조, 변경 이력, Soft Delete, 통계 테이블, 상속 관계, EAV, JSON 설계를 선택 기준과 비용 중심으로 정리한다.',
   focus='공통 코드 테이블의 설계 선택지와 참조 무결성, 계층 구조 표현(인접 목록, 경로 열거, 중첩 집합, 클로저 테이블)과 재귀 CTE, 이력 관리(선분 이력, 시점 이력), Soft Delete와 유니크 제약·인덱스, 사전 집계와 통계 테이블, 슈퍼타입·서브타입 변환 전략, EAV의 비용, MySQL JSON 자료형과 생성 컬럼·함수 기반 인덱스.',
   lessons=[
@@ -347,7 +347,7 @@ VOLUMES = [
    ('동적 설계 — EAV', [9], ''),
    ('JSON 설계', [10], ''),
   ]),
- dict(no=27, slug='db-perf', short='데이터베이스 성능 최적화', course='김영한의 실전 데이터베이스 - 성능 최적화, 실행 계획과 인덱스 완전 정복',
+ dict(no=27, slug='db-perf', short='데이터베이스 성능 최적화', course='실전 데이터베이스 - 성능 최적화, 실행 계획과 인덱스 완전 정복',
   desc='MySQL 아키텍처, 실행 계획, B+Tree와 클러스터형 인덱스, 옵티마이저, 조인·정렬·페이징 최적화를 엔진 내부 동작에 근거해 다룬다.',
   focus='MySQL 서버와 InnoDB 스토리지 엔진의 구조(버퍼 풀, 페이지, 리두 로그), 디스크 I/O와 랜덤·순차 접근, EXPLAIN의 각 컬럼과 EXPLAIN ANALYZE, B+Tree의 구조와 페이지 분할, 클러스터형 인덱스와 세컨더리 인덱스의 룩업, 복합 인덱스와 정렬, 인덱스 컨디션 푸시다운, 커버링 인덱스, 스킵 스캔, 인덱스 머지, MRR, 옵티마이저 비용 모델과 통계·히스토그램, 조인 알고리즘(NLJ, 해시 조인), filesort, 페이징 최적화(키셋), 그룹핑 최적화.',
   lessons=[
