@@ -1,0 +1,687 @@
+<x-meta>
+deck: 인터페이스 뒤에 숨은 SimpleJpaRepository와 여섯 겹의 인터셉터를 실험으로 벗겨 보고, save()가 persist와 merge 중 하나를 고르는 새 엔티티 판별 규칙이 어긋날 때 생기는 SELECT, 덮어쓰기, 예외를 추적한다.
+minutes: 80
+</x-meta>
+
+<x-goals>
+<li>리포지토리 빈의 실제 클래스와 그 안에 끼워진 인터셉터 여섯 개를 나열하고, <code>findById</code> 호출 하나가 각 인터셉터를 지나 <code>EntityManager.find</code>에 도달하는 경로를 순서대로 설명할 수 있다.</li>
+<li><code>SimpleJpaRepository</code>의 클래스 수준 <code>@Transactional(readOnly = true)</code>와 메서드 수준 <code>@Transactional</code>이 각 메서드의 트랜잭션 속성으로 정해지는 규칙을 말하고, 인터페이스에 선언한 쿼리 메서드에는 트랜잭션이 붙지 않는 이유를 소스 수준에서 설명할 수 있다.</li>
+<li><code>readOnly = true</code>가 하이버네이트 세션의 플러시 모드, 기본 읽기 전용 설정, JDBC 커넥션에 각각 무엇을 하는지 설명할 수 있다.</li>
+<li><code>save()</code>가 <code>persist</code>와 <code>merge</code>를 고르는 판별 순서(Persistable, 래퍼 타입 버전, 식별자)를 엔티티 정의만 보고 적용해, 어떤 SQL이 나갈지 예측할 수 있다.</li>
+<li>식별자를 직접 할당하는 엔티티에서 생기는 SELECT 후 INSERT, 기존 행 덮어쓰기, 하이버네이트 6.6의 낙관적 락 예외를 구분해 설명하고, <code>Persistable</code>이나 래퍼 타입 <code>@Version</code>으로 바로잡을 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 인터페이스만 있는데 누가 일을 하는가</h3>
+
+<p>지금까지 이 권에서는 <code>JpaRepository</code>를 상속한 인터페이스 하나만 선언하면 저장, 조회, 삭제, 페이징, 쿼리 메서드가 모두 동작한다는 사실을 당연하게 써 왔다. 자바에서 인터페이스는 메서드의 모양만 정할 뿐 몸체가 없다. 그런데도 <code>memberRepository.save(member)</code>를 호출하면 INSERT가 나가고, <code>findById</code>를 호출하면 SELECT가 나간다. 누군가 이 인터페이스를 구현한 객체를 만들어 빈으로 등록했고, 그 객체 안에서 진짜 일이 일어난다. 2회차에서 공통 인터페이스를 다루며 "스프링 데이터 JPA가 구현 클래스를 대신 만든다"고 짧게 상기했다면, 이번 회차는 그 구현을 직접 열어 본다.</p>
+
+<p>열어 봐야 하는 이유는 호기심 때문만이 아니다. 실무에서 스프링 데이터 JPA 때문에 생기는 장애의 상당수는 "<code>save()</code>가 내부에서 무엇을 하는지"를 모른 채 쓰는 데서 나온다. 저장 한 번에 SELECT가 먼저 나가는 이유, <code>save()</code>로 새 행을 만들려 했는데 기존 행이 조용히 덮어써지는 이유, <code>save()</code>가 돌려준 객체와 넘긴 객체가 다른 객체라서 이후 변경이 반영되지 않는 이유, 서비스 메서드에 <code>@Transactional</code>을 빼먹었는데도 저장은 되는 이유가 모두 같은 곳에서 출발한다. 그 출발점이 <code>SimpleJpaRepository</code>라는 클래스와, 이 클래스를 감싼 프록시다.</p>
+
+<p>이 회차는 두 부분으로 나뉜다. 앞부분은 "구현체 분석"이다. 리포지토리 빈의 정체가 JDK 동적 프록시라는 것을 실험으로 확인하고, 그 프록시에 끼워진 인터셉터들이 어떤 순서로 무슨 일을 하는지, 그리고 최종 목적지인 <code>SimpleJpaRepository</code>의 각 메서드가 <code>EntityManager</code>의 어떤 메서드로 번역되는지 따라간다. 트랜잭션 속성이 어디서 오는지, <code>readOnly = true</code>가 하이버네이트에게 실제로 무엇을 시키는지도 여기서 다룬다. 뒷부분은 "새로운 엔티티를 구별하는 방법"이다. <code>save()</code>는 엔티티가 새것이면 <code>persist</code>, 아니면 <code>merge</code>를 호출하는데, 그 "새것"의 판단 규칙과 규칙이 틀렸을 때 일어나는 일을 소스와 실행 결과로 확인한다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>리포지토리 빈은 인터페이스를 구현한 JDK 동적 프록시이고, 호출은 메타데이터 기록, 예외 변환, 트랜잭션, 쿼리 메서드 실행 인터셉터를 차례로 지난 뒤 <code>SimpleJpaRepository</code>에 도달한다. <code>SimpleJpaRepository.save()</code>는 판별 결과에 따라 <code>persist</code>나 <code>merge</code>를 부를 뿐이므로, 판별이 틀리면 불필요한 SELECT, 기존 행 덮어쓰기, 예외가 생긴다. 판별 규칙은 Persistable 구현 여부, 래퍼 타입 버전 필드, 식별자 값의 순서로 정해진다.</p></aside>
+
+<h3>실험 환경과 프록시의 정체</h3>
+
+<p>추측 대신 실제로 돌려 보자. 이 회차의 실험은 스프링 부트 없이 스프링 프레임워크만으로 구성했다. 부트의 자동 구성이 가려 버리는 부분을 직접 보기 위해서다. 사용한 버전은 Spring Framework 6.2.19, Spring Data JPA 3.5.13, Hibernate ORM 6.6.53.Final, H2 2.3.232, JDK 21이다. 이 조합은 Spring Boot 3.5.16의 의존성 관리 파일(<code>spring-boot-dependencies</code>)이 지정하는 버전과 같다. 그 파일은 <code>hibernate.version</code>을 6.6.53.Final로, <code>spring-framework.version</code>을 6.2.19로, 스프링 데이터 릴리스 트레인을 2025.0.13으로 정하고 있고, 2025.0.x 트레인의 Spring Data JPA가 3.5.x다. 따라서 아래에서 보는 동작은 부트 3.5.16 애플리케이션의 리포지토리에서도 같다.</p>
+
+<p>엔티티는 판별 규칙의 경우를 하나씩 대표하도록 네 개를 만들었다. 식별자를 DB 시퀀스로 생성하는 <code>Member</code>, 식별자를 애플리케이션이 직접 넣는 <code>Item</code>, 직접 넣는 식별자에 래퍼 타입 버전 필드를 더한 <code>Ticket</code>, 직접 넣는 식별자에 <code>Persistable</code>을 구현한 <code>Book</code>이다. 뒤의 두 엔티티는 이 회차 후반부에서 쓴다.</p>
+
+<pre><code class="language-java">package lab;
+
+import jakarta.persistence.*;
+
+@Entity
+public class Member {
+    @Id @GeneratedValue Long id;      // DB가 만들어 주는 식별자
+    String name;
+    protected Member() {}
+    public Member(String name) { this.name = name; }
+    public Long getId() { return id; }
+    public void setId(Long id) { this.id = id; }
+}
+
+@Entity
+public class Item {
+    @Id String id;                    // 애플리케이션이 직접 넣는 식별자
+    String name;
+    protected Item() {}
+    public Item(String id, String name) { this.id = id; this.name = name; }
+}
+// Ticket, Book은 뒤에서 본다. 실제로는 클래스마다 파일을 따로 두었다.</code></pre>
+
+<pre><code class="language-java">package lab;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface Repos {
+    interface MemberRepository extends JpaRepository<Member, Long> {}
+    interface ItemRepository extends JpaRepository<Item, String> {
+        java.util.List<Item> findByName(String name);   // 선언한 쿼리 메서드
+    }
+    interface TicketRepository extends JpaRepository<Ticket, String> {}
+    interface BookRepository extends JpaRepository<Book, String> {}
+}</code></pre>
+
+<pre><code class="language-java">// package, import 문 생략 (// ...)
+@Configuration
+@EnableTransactionManagement
+@EnableJpaRepositories(basePackages = "lab", considerNestedRepositories = true)
+public class Main {
+    @Bean DriverManagerDataSource dataSource() {
+        return new DriverManagerDataSource("jdbc:h2:mem:lab;DB_CLOSE_DELAY=-1", "sa", "");
+    }
+    @Bean LocalContainerEntityManagerFactoryBean entityManagerFactory(DriverManagerDataSource ds) {
+        var f = new LocalContainerEntityManagerFactoryBean();
+        f.setDataSource(ds);
+        f.setPackagesToScan("lab");
+        f.setJpaVendorAdapter(new HibernateJpaVendorAdapter());
+        var p = new Properties();
+        p.put("hibernate.hbm2ddl.auto", "create");
+        p.put("hibernate.show_sql", "true");
+        f.setJpaProperties(p);
+        return f;
+    }
+    @Bean JpaTransactionManager transactionManager(EntityManagerFactory emf) {
+        return new JpaTransactionManager(emf);
+    }
+
+    public static void main(String[] args) throws Exception {
+        var ctx = new AnnotationConfigApplicationContext(Main.class);
+        var members = ctx.getBean(MemberRepository.class);
+
+        System.out.println("bean class   = " + members.getClass().getName());
+        System.out.println("interfaces   = " + Arrays.toString(members.getClass().getInterfaces()));
+        Advised advised = (Advised) members;
+        System.out.println("target class = " + advised.getTargetSource().getTarget().getClass().getName());
+        for (Advisor a : advised.getAdvisors())
+            System.out.println("  advice: " + a.getAdvice().getClass().getName());
+        // ... 이후 시나리오는 아래에서 차례로 본다
+    }
+}</code></pre>
+
+<p>실행하면 다음이 출력된다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">bean class   = jdk.proxy2.$Proxy72
+interfaces   = [interface lab.Repos$MemberRepository, interface org.springframework.data.repository.Repository, interface org.springframework.transaction.interceptor.TransactionalProxy, interface org.springframework.aop.framework.Advised, interface org.springframework.core.DecoratingProxy]
+target class = org.springframework.data.jpa.repository.support.SimpleJpaRepository
+  advice: org.springframework.data.jpa.repository.support.CrudMethodMetadataPostProcessor$CrudMethodMetadataPopulatingMethodInterceptor
+  advice: org.springframework.dao.support.PersistenceExceptionTranslationInterceptor
+  advice: org.springframework.transaction.interceptor.TransactionInterceptor
+  advice: org.springframework.data.projection.DefaultMethodInvokingMethodInterceptor
+  advice: org.springframework.data.repository.core.support.QueryExecutorMethodInterceptor
+  advice: org.springframework.data.repository.core.support.RepositoryFactorySupport$ImplementationMethodExecutionInterceptor</code></pre>
+
+<p>첫 줄이 답이다. 빈의 클래스 이름이 <code>jdk.proxy2.$Proxy72</code>다. <code>$Proxy</code> 뒤의 숫자는 JVM이 프록시 클래스를 만든 순번이라 실행 환경마다 달라진다(같은 코드를 다시 돌렸을 때 <code>$Proxy73</code>이 나온 적도 있다). 이 이름은 <code>java.lang.reflect.Proxy</code>가 런타임에 바이트코드를 생성해 정의한 클래스에 붙는 이름이다. 즉 리포지토리 빈은 우리가 선언한 인터페이스를 구현하도록 실행 중에 만들어진 JDK 동적 프록시다. 스프링 DB 1, 2편에서 본 트랜잭션 AOP 프록시와 같은 스프링 AOP 프록시 계열이지만, 클래스를 상속해 만드는 CGLIB 방식이 아니라 인터페이스를 구현하는 JDK 방식으로 만들어졌다. 구현할 클래스가 애초에 없으니 당연한 선택이다.</p>
+
+<p>두 번째 줄은 이 프록시 클래스가 구현한 인터페이스 목록이다. 우리가 선언한 <code>MemberRepository</code> 외에 네 개가 더 있다. <code>Repository</code>는 스프링 데이터의 최상위 표식 인터페이스다. <code>TransactionalProxy</code>는 스프링 트랜잭션 모듈의 표식 인터페이스로, javap로 열어 보면 몸체 없이 <code>SpringProxy</code>를 상속하기만 한다. <code>Advised</code>와 <code>DecoratingProxy</code>는 스프링 AOP의 <code>ProxyFactory</code>가 만든 프록시에 붙는 인터페이스로, 위 실험에서 <code>(Advised) members</code>로 캐스팅해 인터셉터 목록을 꺼낼 수 있었던 것도 이 덕분이다. 세 번째 줄의 타깃 클래스가 <code>SimpleJpaRepository</code>라는 점이 이 회차의 주인공을 확인시켜 준다.</p>
+
+<x-visual id="spring-data-jpa-06-proxy-chain" title="리포지토리 프록시와 인터셉터 체인" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>서비스 코드의 호출이 JDK 동적 프록시에 들어가 여섯 개의 인터셉터를 바깥에서 안쪽 순서로 지난 뒤 SimpleJpaRepository와 EntityManager에 도달하는 경로를 보여 준다.</x-hint>
+<x-prompt>Left-to-right layered diagram on a white background. At far left a box labeled "서비스 코드". An arrow labeled "findById(id)" goes right into a large rounded container labeled "JDK 동적 프록시 ($Proxy)". Inside the container, six vertical slabs arranged left to right like nested layers, each with a short Korean label: "① 메서드 메타데이터 기록", "② 예외 변환", "③ 트랜잭션", "④ default 메서드", "⑤ 쿼리 메서드 실행", "⑥ 구현 조각에 위임". A single arrow threads through all six slabs from left to right. After the container, the arrow reaches a box labeled "SimpleJpaRepository", then a final box labeled "EntityManager". Under slab ⑤ draw a small side arrow curving downward labeled "쿼리 메서드면 여기서 반환". Flat vector style, muted blue and gray, thin lines.</x-prompt>
+<x-caption>리포지토리 호출은 프록시 안의 인터셉터를 바깥부터 차례로 지나 SimpleJpaRepository에 도달한다. 쿼리 메서드는 다섯 번째 인터셉터에서 처리가 끝난다.</x-caption>
+</x-visual>
+
+<h3>인터셉터 여섯 개: 호출 한 번이 지나가는 길</h3>
+
+<p>스프링 AOP의 <code>ProxyFactory</code>에 어드바이스를 추가하면, 먼저 추가된 것이 바깥쪽에 놓인다. 프록시의 메서드가 호출되면 <code>ReflectiveMethodInvocation</code>이 인터셉터 목록을 앞에서부터 하나씩 호출하고, 각 인터셉터는 <code>invocation.proceed()</code>를 불러 다음 인터셉터에게 넘기거나, 부르지 않고 직접 결과를 돌려준다. 그래서 위 출력의 순서가 곧 호출이 지나가는 순서다. 이 순서가 어떻게 정해지는지는 Spring Data Commons 3.5.13의 <code>RepositoryFactorySupport.getRepository()</code>를 읽으면 나온다.</p>
+
+<p><code>getRepository()</code>는 먼저 타깃 객체(<code>SimpleJpaRepository</code>)를 만들고, <code>ProxyFactory</code>를 생성해 타깃과 인터페이스(우리의 리포지토리 인터페이스, <code>Repository</code>, <code>TransactionalProxy</code>)를 지정한다. 그다음 조건부 어드바이스 두 개를 검사한다. 리포지토리 인터페이스가 널 허용성 검사 대상이면(<code>NullnessMethodInvocationValidator.supports</code>가 판단한다) 인자와 반환값을 검사하는 <code>MethodInvocationValidator</code>를, 메타데이터 노출이 켜져 있으면 <code>ExposeMetadataInterceptor</code>를 추가한다. 실험의 인터페이스에는 둘 다 해당하지 않아 목록에 없다. 이어서 등록된 <code>RepositoryProxyPostProcessor</code>들을 차례로 실행하는데, 이 후처리기들이 앞쪽 세 개의 인터셉터를 넣는다. 그 뒤에 인터페이스에 default 메서드가 있으면 <code>DefaultMethodInvokingMethodInterceptor</code>를, 마지막으로 <code>QueryExecutorMethodInterceptor</code>와 <code>ImplementationMethodExecutionInterceptor</code>를 무조건 추가한다.</p>
+
+<p>후처리기의 순서는 두 곳에서 정해진다. <code>JpaRepositoryFactory</code>의 생성자가 먼저 <code>CrudMethodMetadataPostProcessor</code>를 등록하고, 이어서 "인터페이스에 <code>Stream</code>을 반환하는 메서드나 <code>@Procedure</code> 메서드가 있으면 <code>SurroundingTransactionDetectorMethodInterceptor</code>를 추가하는" 람다를 등록한다. 실험의 인터페이스에는 그런 메서드가 없어서 이 인터셉터도 빠졌다. 그 뒤 <code>TransactionalRepositoryFactoryBeanSupport.createRepositoryFactory()</code>가 팩토리를 만든 다음 예외 변환 후처리기와 트랜잭션 후처리기를 이 순서로 덧붙인다. 그래서 메타데이터 기록이 가장 바깥, 그 안쪽에 예외 변환, 그 안쪽에 트랜잭션이 놓인다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>순서</th><th>인터셉터</th><th>누가 넣는가</th><th>하는 일</th></tr></thead><tbody>
+<tr><td>1</td><td><code>CrudMethodMetadataPopulatingMethodInterceptor</code></td><td><code>JpaRepositoryFactory</code> 생성자</td><td>지금 호출된 메서드 정보를 스레드 로컬에 올려 둔다. <code>SimpleJpaRepository</code>가 그 메서드에 붙은 <code>@Lock</code>, <code>@QueryHints</code>, <code>@EntityGraph</code>를 읽는 통로다.</td></tr>
+<tr><td>2</td><td><code>PersistenceExceptionTranslationInterceptor</code></td><td>예외 변환 후처리기</td><td>JPA나 하이버네이트 예외를 스프링의 <code>DataAccessException</code> 계층으로 바꾼다.</td></tr>
+<tr><td>3</td><td><code>TransactionInterceptor</code></td><td>트랜잭션 후처리기</td><td>메서드별 트랜잭션 속성을 찾아 트랜잭션을 시작하거나 기존 트랜잭션에 참여하고, 끝나면 커밋이나 롤백한다.</td></tr>
+<tr><td>4</td><td><code>DefaultMethodInvokingMethodInterceptor</code></td><td><code>getRepository()</code>(default 메서드가 있을 때)</td><td>인터페이스의 default 메서드가 호출되면 그 몸체를 직접 실행한다. <code>JpaRepository</code>에는 <code>deleteInBatch</code> 같은 default 메서드가 있어서 항상 들어간다.</td></tr>
+<tr><td>5</td><td><code>QueryExecutorMethodInterceptor</code></td><td><code>getRepository()</code></td><td>호출된 메서드가 쿼리 메서드면 미리 만들어 둔 <code>RepositoryQuery</code>를 실행하고 결과를 반환한다. 아니면 다음으로 넘긴다.</td></tr>
+<tr><td>6</td><td><code>ImplementationMethodExecutionInterceptor</code></td><td><code>getRepository()</code></td><td>리포지토리 조각(fragment)들의 조합에서 메서드를 구현한 객체를 찾아 호출한다. 기본 조각이 <code>SimpleJpaRepository</code>다.</td></tr>
+</tbody></table></div>
+
+<p>다섯 번째 인터셉터의 동작은 소스로 확인해 둘 가치가 있다. <code>QueryExecutorMethodInterceptor.doInvoke()</code>는 <code>hasQueryFor(method)</code>로 이 메서드에 대응하는 쿼리 객체가 있는지 보고, 있으면 그 쿼리를 실행해 결과를 반환한다. 없으면 <code>invocation.proceed()</code>를 호출해 다음 인터셉터로 넘긴다. 쿼리 객체는 이 인터셉터의 생성자에서, 즉 리포지토리 프록시를 만드는 시점(기본 설정에서는 애플리케이션 시작 시점)에 만들어진다. 3회차에서 본 메서드 이름 해석과 <code>@Query</code> 파싱이 바로 이 쿼리 객체를 만드는 과정이고, 잘못된 메서드 이름이 애플리케이션 시작 단계에서 실패하는 이유도 여기에 있다. 따라서 <code>findByName</code>은 다섯 번째 인터셉터에서 처리가 끝나 <code>SimpleJpaRepository</code>까지 내려가지 않는다. 반대로 <code>save</code>, <code>findById</code>처럼 <code>JpaRepository</code>가 정의한 메서드는 대응하는 쿼리 객체가 없으므로 여섯 번째 인터셉터를 거쳐 <code>SimpleJpaRepository</code>에 도달한다.</p>
+
+<p>여섯 번째 인터셉터가 "조각들의 조합"을 뒤진다는 점은 5회차에서 다룬 사용자 정의 리포지토리와 연결된다. <code>getRepository()</code>는 사용자 정의 구현 조각들 뒤에 <code>RepositoryFragment.implemented(target)</code>, 즉 <code>SimpleJpaRepository</code>를 덧붙여 조합을 만든다. 메서드를 찾을 때 앞의 조각부터 보므로, 사용자 정의 구현이 같은 시그니처의 메서드를 제공하면 그것이 기본 구현보다 먼저 선택된다. 이 회차에서는 조각이 기본 구현 하나뿐인 상황을 다룬다.</p>
+
+<figure class="flow-figure"><figcaption>members.findById(1L) 한 번의 호출 경로</figcaption><ol class="flow">
+<li><strong>프록시 진입</strong><span>JDK 프록시의 <code>invoke</code>가 스프링의 <code>JdkDynamicAopProxy</code>로 들어가 인터셉터 체인을 만든다.</span></li>
+<li><strong>메타데이터 기록</strong><span>현재 호출을 나타내는 <code>MethodInvocation</code> 객체를 스레드 로컬에 올리고, 그 메서드의 메타데이터를 현재 스레드에 묶는다. 이전 값은 보관했다가 끝나면 되돌린다.</span></li>
+<li><strong>예외 변환 준비</strong><span><code>proceed()</code>를 try로 감싸 두고 다음으로 넘긴다.</span></li>
+<li><strong>트랜잭션 시작</strong><span>속성 원본에서 <code>findById</code>의 속성(readOnly)을 찾고, 진행 중인 트랜잭션이 없으면 새로 시작한다.</span></li>
+<li><strong>default 메서드·쿼리 메서드 검사</strong><span>둘 다 해당하지 않으므로 그대로 넘긴다.</span></li>
+<li><strong>구현 조각 호출</strong><span><code>SimpleJpaRepository.findById</code>가 실행되어 <code>entityManager.find(Member.class, 1L)</code>을 부른다.</span></li>
+<li><strong>되감기</strong><span>반환값이 안쪽부터 바깥으로 돌아오며 트랜잭션이 커밋되고, 예외가 났다면 변환되며, 스레드 로컬이 원래대로 돌아간다.</span></li>
+</ol></figure>
+
+<h3>SimpleJpaRepository: 클래스 선언이 말해 주는 것</h3>
+
+<p>이제 타깃 클래스를 열어 보자. Spring Data JPA 3.5.13의 <code>SimpleJpaRepository</code>는 다음과 같이 선언되어 있다(필드 일부는 생략했다).</p>
+
+<pre><code class="language-java">@Repository
+@Transactional(readOnly = true)
+public class SimpleJpaRepository<T, ID> implements JpaRepositoryImplementation<T, ID> {
+
+    private final JpaEntityInformation<T, ?> entityInformation;
+    private final EntityManager entityManager;
+    private final PersistenceProvider provider;
+    private @Nullable CrudMethodMetadata metadata;
+    // ...
+
+    public SimpleJpaRepository(JpaEntityInformation<T, ?> entityInformation, EntityManager entityManager) { /* ... */ }
+    // ...
+}</code></pre>
+
+<p>클래스 선언에서 읽을 수 있는 사실이 세 가지 있다. 첫째, 클래스 수준에 <code>@Transactional(readOnly = true)</code>가 붙어 있다. 메서드에 별도 애너테이션이 없으면 이 클래스 수준 설정이 적용되므로, 조회 메서드는 기본적으로 읽기 전용 트랜잭션 안에서 실행된다. 쓰기 메서드(<code>save</code>, <code>delete</code>, <code>deleteById</code>, <code>saveAll</code>, <code>flush</code> 등)에는 메서드마다 속성 없는 <code>@Transactional</code>이 다시 붙어 있어 클래스 설정을 덮어쓴다. 소스에서 확인하면 <code>save</code>, <code>saveAndFlush</code>, <code>saveAll</code>, <code>saveAllAndFlush</code>, <code>flush</code>, <code>delete</code>, <code>deleteById</code>, <code>deleteAllById</code>, <code>deleteAllByIdInBatch</code>, <code>deleteAll</code>, <code>deleteAllInBatch</code>, 그리고 <code>Specification</code>을 받는 <code>delete</code>에 메서드 수준 <code>@Transactional</code>이 있다.</p>
+
+<p>둘째, <code>@Repository</code>가 붙어 있다. 이 클래스가 데이터 접근 계층의 구성 요소라는 스테레오타입 표식이다. 다만 리포지토리 빈은 컴포넌트 스캔이 아니라 리포지토리 팩토리가 만들고, 예외 변환도 앞에서 본 것처럼 팩토리가 <code>PersistenceExceptionTranslationInterceptor</code>를 프록시에 직접 끼워 넣는 방식으로 이루어진다. 예외 변환 후처리기의 <code>postProcess</code> 메서드는 조건 없이 <code>factory.addAdvice(interceptor)</code> 한 줄이다.</p>
+
+<p>셋째, 생성자가 <code>JpaEntityInformation</code>과 <code>EntityManager</code>를 받는다. <code>JpaEntityInformation</code>은 도메인 타입에 대한 정보, 즉 식별자 속성, 버전 속성, 엔티티 이름을 JPA 메타모델에서 읽어 담아 둔 객체다. 뒤에서 볼 새 엔티티 판별이 바로 이 객체의 <code>isNew()</code>다. <code>EntityManager</code>는 진짜 하이버네이트 세션이 아니라 스프링이 만든 공유 엔티티 매니저 프록시다. 이 프록시는 메서드가 호출될 때마다 현재 스레드의 트랜잭션에 묶인 진짜 엔티티 매니저를 찾아 위임한다. 리포지토리 인터페이스 하나당 <code>SimpleJpaRepository</code> 객체는 하나만 만들어지고 모든 요청 스레드가 그것을 공유하는데도 영속성 컨텍스트가 섞이지 않는 이유가 이것이다. <code>SimpleJpaRepository</code>의 필드는 생성 후 바뀌지 않는 설정값뿐이고, 요청마다 달라지는 상태(영속성 컨텍스트, 호출된 메서드의 메타데이터)는 모두 스레드 로컬을 통해 찾는다.</p>
+
+<pre class="diagram">  싱글톤 (모든 스레드가 공유)                      스레드마다 따로
+ ┌───────────────────────────────┐
+ │ $Proxy72  (MemberRepository)  │
+ │   └ target: SimpleJpaRepository│
+ │        ├ entityInformation ───┼─> Member의 id/version 메타정보 (불변)
+ │        ├ entityManager ───────┼─> 공유 EM 프록시 ──┐
+ │        └ metadata ────────────┼─> CRUD 메타데이터 ─┼──┐
+ └───────────────────────────────┘                     │  │
+                                                       ▼  ▼
+                         스레드 A: ThreadLocal ─ EntityManager(세션 A), 현재 Method
+                         스레드 B: ThreadLocal ─ EntityManager(세션 B), 현재 Method</pre>
+
+<h3>메서드별로 읽기: 조회, 존재 확인, 삭제</h3>
+
+<p><code>SimpleJpaRepository</code>의 메서드는 대부분 <code>EntityManager</code> 호출 한두 개로 번역된다. 이 번역을 알면 각 메서드가 영속성 컨텍스트와 어떻게 상호작용하는지, 몇 개의 SQL을 낼지 예측할 수 있다.</p>
+
+<p><code>findById(id)</code>는 크루드 메타데이터가 없으면 <code>entityManager.find(domainType, id)</code>를, 있으면 메타데이터에서 꺼낸 락 모드와 힌트를 더해 <code>find</code>의 다른 오버로드를 부른다. <code>find</code>는 JPA 기본편에서 본 대로 먼저 영속성 컨텍스트의 1차 캐시를 보고, 없을 때만 SELECT를 낸다. 같은 트랜잭션 안에서 같은 식별자로 <code>findById</code>를 두 번 부르면 SQL은 한 번만 나가는 이유가 여기 있다. 4회차의 <code>@Lock</code>을 리포지토리 인터페이스에 다시 선언한 <code>findById</code>에 붙이면 동작하는 것도, 첫 번째 인터셉터가 올려 둔 메서드 정보를 이 지점에서 읽기 때문이다.</p>
+
+<p><code>getReferenceById(id)</code>는 <code>entityManager.getReference(getDomainClass(), id)</code> 한 줄이다. 1차 캐시에 엔티티가 없으면 SQL 없이 프록시를 돌려주고, 프록시의 식별자가 아닌 필드를 처음 읽을 때 SELECT가 나간다. 연관관계를 걸 때 상대 엔티티의 식별자만 알면 될 때 쓰는 메서드다. 예전 이름인 <code>getOne</code>과 <code>getById</code>는 3.5.13에서 <code>@Deprecated</code>로 남아 있고 내부에서 <code>getReferenceById</code>를 그대로 호출한다.</p>
+
+<p><code>existsById(id)</code>는 엔티티를 읽지 않는다. 엔티티 이름과 식별자 속성 이름으로 개수를 세는 형태의 JPQL을 만들어 실행하고, 결과로 존재 여부만 판단한다. 엔티티를 영속성 컨텍스트에 올리지 않으므로 존재 확인 뒤 엔티티가 필요하다면 결국 다시 조회해야 한다. 복합 키에서 키 속성 값의 타입이 파라미터 타입과 맞지 않으면 <code>findById(id).isPresent()</code>로 물러선다는 분기도 소스에 있다. <code>count()</code>는 미리 만들어 둔 카운트 JPQL을 실행한다.</p>
+
+<p>삭제 쪽은 조금 더 복잡하다. <code>delete(entity)</code>의 몸체를 그대로 옮기면 다음과 같다.</p>
+
+<pre><code class="language-java">@Override
+@Transactional
+public void delete(T entity) {
+    Assert.notNull(entity, ENTITY_MUST_NOT_BE_NULL);
+
+    if (entityInformation.isNew(entity)) {
+        return;                                        // 새 엔티티는 지울 것이 없다
+    }
+    if (entityManager.contains(entity)) {
+        entityManager.remove(entity);                  // 이미 관리 중이면 바로 삭제 예약
+        return;
+    }
+    Class<?> type = ProxyUtils.getUserClass(entity);
+    T existing = (T) entityManager.find(type, entityInformation.getId(entity));
+    if (existing != null) {
+        entityManager.remove(entityManager.merge(entity));   // 준영속이면 병합 후 삭제
+    }
+}</code></pre>
+
+<p>세 갈래가 있다. 판별 결과 새 엔티티라면 아무것도 하지 않는다. DB에 행이 있을 리 없다고 보는 것이다. 영속성 컨텍스트가 관리 중인 엔티티라면 <code>remove</code>로 삭제를 예약한다. 그 밖, 즉 다른 트랜잭션에서 읽어 와 준영속(detached) 상태인 엔티티라면 먼저 <code>find</code>로 DB에 있는지 확인하고, 있을 때만 <code>merge</code>로 관리 상태의 인스턴스를 얻어 <code>remove</code>한다. JPA의 <code>remove</code>는 관리 중인 엔티티만 받기 때문에 이런 우회가 필요하다. <code>find</code>가 이미 엔티티를 1차 캐시에 올렸으므로 이어지는 <code>merge</code>는 추가 SELECT 없이 1차 캐시의 인스턴스에 값을 복사한다. 여기서 <code>delete</code>도 <code>isNew</code>를 쓴다는 점을 기억해 두자. 판별이 틀리면 저장뿐 아니라 삭제도 엉뚱하게 동작한다.</p>
+
+<p><code>deleteById(id)</code>는 3.5.13에서 <code>findById(id).ifPresent(this::delete)</code> 한 줄이다. 대상이 없으면 조용히 아무 일도 하지 않는다. 실험에서 존재하지 않는 식별자로 호출하자 SELECT 한 번 뒤에 예외 없이 끝났다. 이 동작은 버전에 따라 다르다. 2.7.18과 3.0.0, 3.0.1의 소스에서는 같은 메서드가 <code>findById(id).orElseThrow(...)</code>로 대상이 없으면 <code>EmptyResultDataAccessException</code>을 던졌고, 3.0.2의 소스부터 지금과 같은 형태다. 예전 버전 기준으로 작성된 코드가 이 예외를 잡아 "없는 데이터 삭제"를 처리하고 있었다면, 업그레이드 뒤 그 분기는 더 이상 실행되지 않는다.</p>
+
+<p><code>deleteAll()</code>과 <code>deleteAllInBatch()</code>는 이름이 비슷하지만 전혀 다르다. <code>deleteAll()</code>은 <code>findAll()</code>로 전부 읽어 온 뒤 하나씩 <code>delete</code>를 부른다. 행이 N개면 SELECT 한 번과 DELETE N번이 나가고, 엔티티마다 영속성 컨텍스트를 거치므로 <code>@PreRemove</code> 같은 콜백과 연관관계의 영속성 전이도 동작한다. <code>deleteAllInBatch()</code>는 <code>delete from 엔티티명 x</code> 형태의 JPQL 한 줄을 <code>executeUpdate()</code>로 실행한다. SQL은 한 번이지만 영속성 컨텍스트를 거치지 않는 벌크 연산이므로, 4회차에서 본 벌크 수정과 같은 주의가 필요하다. 이미 1차 캐시에 올라와 있는 엔티티는 DB에서 사라진 뒤에도 메모리에 그대로 남는다.</p>
+
+<p>마지막으로 <code>saveAll</code>, <code>deleteById</code>, <code>deleteAll</code>이 내부에서 <code>save</code>, <code>findById</code>, <code>delete</code>를 부르는 방식을 보자. 이 호출들은 모두 <code>this.save(...)</code>처럼 같은 객체 안에서의 호출이므로 프록시를 거치지 않는다. 스프링 DB 2편에서 다룬 "프록시 내부 호출에는 AOP가 적용되지 않는다"는 규칙이 여기에도 적용된다. 그래도 문제가 없는 이유는 바깥 메서드(<code>saveAll</code> 등)에 이미 <code>@Transactional</code>이 붙어 있어 프록시 단계에서 트랜잭션이 시작되었기 때문이다. 내부의 <code>save</code>는 그 트랜잭션 안에서 실행된다. <code>saveAll</code>에 100개를 넘기면 트랜잭션은 하나, 영속성 컨텍스트도 하나다.</p>
+
+<h3>트랜잭션 속성은 어디서 오는가</h3>
+
+<p>실험에서 트랜잭션 매니저의 로그를 켜고(<code>org.springframework.orm.jpa.JpaTransactionManager</code>를 java.util.logging의 FINE 레벨로 설정) 각 메서드를 호출해 보면, 프록시가 실제로 어떤 속성으로 트랜잭션을 여는지 보인다. 아래 출력은 로그 레벨 접두어와 <code>Exposing JPA transaction as JDBC</code> 줄을 지운 것이다.</p>
+
+<pre data-label="실행 결과 (save, findById)"><code class="language-text">JpaTransactionManager - Creating new transaction with name [org.springframework.data.jpa.repository.support.SimpleJpaRepository.save]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+JpaTransactionManager - Opened new EntityManager [SessionImpl(1454398423<open>)] for JPA transaction
+Hibernate: select next value for Member_SEQ
+JpaTransactionManager - Initiating transaction commit
+JpaTransactionManager - Committing JPA transaction on EntityManager [SessionImpl(1454398423<open>)]
+Hibernate: insert into Member (name,id) values (?,?)
+JpaTransactionManager - Closing JPA EntityManager [SessionImpl(1454398423<open>)] after transaction
+...
+JpaTransactionManager - Creating new transaction with name [org.springframework.data.jpa.repository.support.SimpleJpaRepository.findById]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT,readOnly
+Hibernate: select i1_0.id,i1_0.name from Item i1_0 where i1_0.id=?
+JpaTransactionManager - Initiating transaction commit</code></pre>
+
+<p>(로그의 <code>SessionImpl(...)</code> 괄호 안 숫자는 객체 해시코드라 실행마다 다르다.) 트랜잭션 이름이 <code>SimpleJpaRepository.save</code>, <code>SimpleJpaRepository.findById</code>로 찍힌다는 점, <code>save</code>에는 <code>readOnly</code>가 없고 <code>findById</code>에는 있다는 점이 핵심이다. 클래스 수준과 메서드 수준 애너테이션이 그대로 반영된 것이다. 또 하나 눈여겨볼 점은 <code>save</code>에서 INSERT가 커밋 단계에 나간다는 것이다. 시퀀스 값은 <code>persist</code> 시점에 가져오지만, INSERT 자체는 쓰기 지연 저장소에 쌓였다가 커밋 직전 플러시에서 실행된다.</p>
+
+<p>이 속성은 Spring Data Commons의 <code>TransactionalRepositoryProxyPostProcessor</code> 안에 있는 <code>RepositoryAnnotationTransactionAttributeSource</code>가 찾는다. 일반적인 <code>@Transactional</code> 처리와 다른 점은, 프록시가 인터페이스의 메서드로 호출되는데 애너테이션은 구현 클래스(<code>SimpleJpaRepository</code>)에 붙어 있다는 사정을 처리해야 한다는 것이다. 3.5.13 소스의 탐색 순서를 정리하면 다음과 같다.</p>
+
+<figure class="flow-figure"><figcaption>리포지토리 메서드의 트랜잭션 속성 탐색 순서</figcaption><ol class="flow">
+<li><strong>구현 메서드 찾기</strong><span>호출된 인터페이스 메서드에 대응하는 타깃 클래스의 메서드(<code>specificMethod</code>)를 찾는다. <code>save</code>라면 <code>SimpleJpaRepository.save</code>다.</span></li>
+<li><strong>대응 메서드가 있으면 인터페이스 쪽 먼저</strong><span>인터페이스 메서드 자체, 그다음 그 메서드를 선언한 인터페이스에 애너테이션이 있으면 그것을 쓴다. 리포지토리 인터페이스에서 <code>findAll</code>을 재선언하고 <code>@Transactional(timeout = 10)</code>을 붙이면 이 단계에서 결정된다.</span></li>
+<li><strong>구현 쪽</strong><span>없으면 <code>SimpleJpaRepository</code>의 메서드, 그다음 <code>SimpleJpaRepository</code> 클래스의 애너테이션을 본다. <code>save</code>는 메서드에서, <code>findById</code>는 클래스에서 결정된다.</span></li>
+<li><strong>대응 메서드가 없으면</strong><span>쿼리 메서드처럼 구현 클래스에 대응 메서드가 없는 경우, 인터페이스 메서드와 그 메서드를 선언한 인터페이스만 본다. 둘 다 없으면 트랜잭션 속성은 없다.</span></li>
+</ol></figure>
+
+<p>마지막 단계가 중요한 결론을 낳는다. 인터페이스에 선언한 쿼리 메서드는 <code>SimpleJpaRepository</code>에 대응 메서드가 없으므로 클래스 수준 <code>@Transactional(readOnly = true)</code>를 물려받지 않는다. 실험에서 <code>findByName</code>을 호출한 결과가 이를 보여 준다.</p>
+
+<pre data-label="실행 결과 (findByName)"><code class="language-text">== K. declared query method
+Hibernate: select i1_0.id,i1_0.name from Item i1_0 where i1_0.name=?
+1</code></pre>
+
+<p><code>findById</code> 때와 달리 <code>Creating new transaction</code> 로그가 한 줄도 없다. 트랜잭션 없이 실행된 것이다. Spring Data JPA 참조 문서의 트랜잭션 장도 "선언된 쿼리 메서드(default 메서드 포함)에는 기본적으로 어떤 트랜잭션 설정도 적용되지 않는다"고 적고, 트랜잭션 안에서 실행하려면 리포지토리 인터페이스에 <code>@Transactional</code>을 붙이라고 안내한다. 인터페이스에 <code>@Transactional(readOnly = true)</code>를 붙이면 위 탐색의 마지막 단계에서 "메서드를 선언한 인터페이스"의 애너테이션으로 발견된다. <code>@Modifying</code>을 쓰는 수정 쿼리 메서드라면 그 메서드에 따로 <code>@Transactional</code>을 붙여 읽기 전용을 덮어쓴다.</p>
+
+<p>트랜잭션 없이 실행된 쿼리 메서드는 어떻게 동작했을까. 공유 엔티티 매니저 프록시는 트랜잭션에 묶인 엔티티 매니저를 찾지 못하면 그 호출을 위해 새 엔티티 매니저를 만들고, 쿼리 실행이 끝나면 닫는다. 그래서 쿼리는 실행되지만, 반환된 엔티티는 이미 닫힌 영속성 컨텍스트에서 나온 준영속 엔티티다. 지연 로딩 연관관계를 건드리면 초기화할 세션이 없다. 물론 실무에서는 대개 서비스 계층의 <code>@Transactional</code> 안에서 쿼리 메서드를 부르므로 이 차이가 드러나지 않는다. 그 경우 쿼리 메서드는 바깥 트랜잭션의 엔티티 매니저를 그대로 쓴다.</p>
+
+<p>바깥에 트랜잭션이 있을 때 리포지토리 메서드가 어떻게 동작하는지도 로그로 확인할 수 있다. 실험에서 <code>TransactionTemplate</code>으로 바깥 트랜잭션을 열고 그 안에서 <code>items.save(...)</code>를 호출했다.</p>
+
+<pre data-label="실행 결과 (바깥 트랜잭션 안의 save)"><code class="language-text">JpaTransactionManager - Creating new transaction with name [null]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+JpaTransactionManager - Opened new EntityManager [SessionImpl(2029374405<open>)] for JPA transaction
+JpaTransactionManager - Found thread-bound EntityManager [SessionImpl(2029374405<open>)] for JPA transaction
+JpaTransactionManager - Participating in existing transaction
+Hibernate: select i1_0.id,i1_0.name from Item i1_0 where i1_0.id=?</code></pre>
+
+<p><code>save</code>의 <code>@Transactional</code>은 전파 속성 <code>REQUIRED</code>이므로, 프록시의 <code>TransactionInterceptor</code>는 스레드에 묶인 엔티티 매니저를 발견하고 "기존 트랜잭션에 참여한다"는 로그만 남긴다. 새 엔티티 매니저를 열지 않는다. 이 동작이 서비스 계층에서 여러 리포지토리 호출을 하나의 트랜잭션으로 묶는 기반이다. 반대로 서비스 메서드에 <code>@Transactional</code>이 없으면 리포지토리 호출 하나하나가 각자의 트랜잭션과 영속성 컨텍스트를 연다. 저장은 되니 겉으로는 잘 동작하는 것처럼 보이지만, 두 번째 호출이 실패해도 첫 번째 호출은 이미 커밋되어 있고, 첫 번째 호출이 돌려준 엔티티는 호출이 끝나는 순간 준영속이 되어 더티 체킹도 지연 로딩도 되지 않는다. 리포지토리의 기본 트랜잭션은 "단독 호출이 최소한 안전하게 동작하도록" 붙어 있는 것이지 업무 단위의 경계를 대신해 주지 않는다.</p>
+
+<aside class="note"><code>@EnableJpaRepositories</code>에는 <code>enableDefaultTransactions</code> 속성이 있고 기본값은 <code>true</code>다. 이것을 <code>false</code>로 바꾸면 위 탐색에서 <code>SimpleJpaRepository</code> 쪽 애너테이션을 보지 않게 되어, 인터페이스에 직접 붙인 <code>@Transactional</code>만 적용된다.</aside>
+
+<h3>readOnly = true가 실제로 바꾸는 것</h3>
+
+<p>조회 메서드에 붙는 <code>readOnly = true</code>는 "읽기만 한다"는 선언이다. 그런데 이 선언을 받은 쪽이 실제로 무엇을 바꾸는지는 트랜잭션 매니저와 JPA 구현체의 몫이다. <code>JpaTransactionManager</code>는 트랜잭션을 시작할 때 <code>JpaDialect.beginTransaction()</code>을 호출하고, 하이버네이트를 쓸 때의 구현이 <code>HibernateJpaDialect</code>다. Spring Framework 6.2.19의 이 클래스가 읽기 전용 트랜잭션에서 하는 일은 세 가지다.</p>
+
+<ol>
+<li><b>플러시 모드를 MANUAL로 바꾼다.</b> <code>prepareFlushMode(session, readOnly)</code>가 읽기 전용이면 세션의 하이버네이트 플러시 모드를 <code>FlushMode.MANUAL</code>로 설정한다. MANUAL에서는 커밋 직전에도 자동 플러시가 일어나지 않는다. 엔티티를 고쳐도 UPDATE가 나갈 기회 자체가 없다.</li>
+<li><b>세션의 기본 읽기 전용을 켠다.</b> 트랜잭션 정의가 이 트랜잭션을 위해 새로 만든 엔티티 매니저(로컬 자원)라고 알려 주면 <code>session.setDefaultReadOnly(true)</code>를 호출한다. 하이버네이트 <code>Session</code>의 Javadoc은 이 설정에 대해 "읽기 전용 엔티티는 더티 체킹을 하지 않고 영속 상태의 스냅샷도 유지하지 않는다"고 설명한다. 1차 캐시에 올라온 엔티티마다 보관하던 비교용 스냅샷이 없어지므로 메모리도 덜 쓴다.</li>
+<li><b>JDBC 커넥션에 읽기 전용 힌트를 준다.</b> 커넥션 준비 플래그가 켜져 있고(기본값) 하이버네이트의 커넥션 해제 모드가 세션 종료 시점(<code>ON_CLOSE</code>)이면, 물리 커넥션을 꺼내 <code>DataSourceUtils.prepareConnectionForTransaction()</code>에 넘기고, 이 메서드가 <code>Connection.setReadOnly(true)</code>를 호출한다. 스프링의 <code>HibernateJpaVendorAdapter</code>는 커넥션 준비 플래그가 켜져 있으면 하이버네이트의 커넥션 처리 모드를 <code>DELAYED_ACQUISITION_AND_HOLD</code>로 지정하므로, 일반적인 구성에서는 이 조건이 맞는다.</li>
+</ol>
+
+<p>실험에서 읽기 전용 <code>TransactionTemplate</code> 안에서 세션 상태를 찍고 엔티티를 고쳐 보았다.</p>
+
+<pre><code class="language-java">var ro = new TransactionTemplate(txm);
+ro.setReadOnly(true);
+ro.executeWithoutResult(s -> {
+    var session = em.unwrap(org.hibernate.Session.class);
+    System.out.println("flushMode=" + session.getHibernateFlushMode()
+            + ", defaultReadOnly=" + session.isDefaultReadOnly());
+    Item z = em.find(Item.class, "B-1");
+    z.name = "changed-in-readonly";       // 관리 중인 엔티티를 고친다
+});
+System.out.println("name in db = " + items.findById("B-1").get().name);</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">JpaTransactionManager - Creating new transaction with name [null]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT,readOnly
+JpaTransactionManager - Opened new EntityManager [SessionImpl(559087077<open>)] for JPA transaction
+flushMode=MANUAL, defaultReadOnly=true
+Hibernate: select i1_0.id,i1_0.name from Item i1_0 where i1_0.id=?
+JpaTransactionManager - Initiating transaction commit
+JpaTransactionManager - Committing JPA transaction on EntityManager [SessionImpl(559087077<open>)]
+...
+name in db = original</code></pre>
+
+<p>플러시 모드는 MANUAL, 기본 읽기 전용은 true로 바뀌었고, 관리 중인 엔티티의 이름을 바꿨는데도 커밋 때 UPDATE가 나가지 않았다. 리포지토리의 <code>findById</code>가 읽기 전용 트랜잭션으로 실행된다는 것은 이 세 가지가 모두 적용된다는 뜻이다. 다만 이 효과는 "그 트랜잭션이 새로 시작될 때"에만 생긴다. 서비스 계층의 읽기-쓰기 트랜잭션 안에서 <code>findById</code>를 호출하면 리포지토리는 기존 트랜잭션에 참여할 뿐이므로, 읽기 전용 설정은 적용되지 않고 바깥 트랜잭션의 설정을 따른다.</p>
+
+<p>세 번째 항목의 <code>Connection.setReadOnly(true)</code>는 JDBC API 문서에 따르면 데이터베이스 최적화를 위해 드라이버에 주는 힌트(hint)다. 이 힌트로 실제로 무엇이 바뀌는지는 드라이버와 DB마다 다르다. 따라서 "readOnly 트랜잭션이면 DB가 쓰기를 거부한다"고 일반화할 수는 없다. 확실하게 말할 수 있는 것은 하이버네이트 수준의 효과, 즉 플러시가 일어나지 않고 더티 체킹을 하지 않는다는 점이다.</p>
+
+<h3>save(): persist와 merge의 갈림길</h3>
+
+<p>이제 두 번째 수업 주제인 "새로운 엔티티를 구별하는 방법"으로 넘어간다. 출발점은 <code>save()</code>의 몸체다. 3.5.13 소스에서 그대로 옮기면 다음 몇 줄이 전부다.</p>
+
+<pre><code class="language-java">@Override
+@Transactional
+public <S extends T> S save(S entity) {
+
+    Assert.notNull(entity, ENTITY_MUST_NOT_BE_NULL);
+
+    if (entityInformation.isNew(entity)) {
+        entityManager.persist(entity);
+        return entity;
+    } else {
+        return entityManager.merge(entity);
+    }
+}</code></pre>
+
+<p>이름은 하나지만 하는 일은 두 가지다. 새 엔티티라고 판단하면 <code>persist</code>를 호출하고 넘겨받은 객체를 그대로 돌려준다. 아니라고 판단하면 <code>merge</code>를 호출하고 <code>merge</code>가 돌려준 객체를 돌려준다. 두 연산의 의미는 Jakarta Persistence 명세가 정한다. 이 차이를 정확히 알아야 판별이 틀렸을 때의 증상을 이해할 수 있다.</p>
+
+<p><code>persist(X)</code>는 새 엔티티 X를 관리 상태로 만든다. 넘긴 객체 X 자체가 영속성 컨텍스트에 등록되고, 1차 캐시의 키는 X의 식별자, 값은 X에 대한 참조다. 식별자 생성 전략이 시퀀스라면 이 시점에 시퀀스에서 값을 가져와 X의 식별자 필드에 넣는다. INSERT는 쓰기 지연 저장소에 쌓였다가 플러시 때 실행된다. 명세는 X가 준영속 객체일 때 <code>persist</code>를 부르면 그 자리에서 또는 플러시나 커밋 시점에 예외가 날 수 있다고 정한다. 즉 <code>persist</code>는 "DB에 아직 없는 객체"를 위한 연산이다.</p>
+
+<p><code>merge(X)</code>는 X의 상태를 관리 중인 인스턴스로 복사하는 연산이다. 명세의 규칙을 정리하면, X가 준영속이면 같은 식별자의 관리 인스턴스 X'를 찾거나 만들고 X의 상태를 X'에 복사한 뒤 X'를 반환한다. X가 새 엔티티면 새로운 관리 인스턴스 X'를 만들어 상태를 복사한다. X가 이미 관리 중이면 merge 연산 자체는 X를 무시한다(연관관계의 cascade 설정에 따라 전이만 된다). 어느 경우든 반환되는 것은 관리 인스턴스이고, 넘긴 X가 준영속이나 새 객체였다면 X는 호출 뒤에도 관리 상태가 되지 않는다. 하이버네이트는 X'를 찾기 위해 먼저 1차 캐시를 보고, 없으면 DB에서 SELECT로 읽어 온다. DB에도 없으면 새로 INSERT할 대상으로 본다(단, 뒤에서 볼 하이버네이트 6.6의 예외 규칙이 있다).</p>
+
+<p>실험으로 확인하자. 식별자를 생성하는 <code>Member</code>와 식별자를 직접 넣는 <code>Item</code>을 각각 새 객체로 만들어 <code>save</code>하고, 반환값이 넘긴 객체와 같은 객체인지 <code>==</code>로 비교했다.</p>
+
+<pre><code class="language-java">Member m = new Member("kim");
+Member savedM = members.save(m);
+System.out.println("same instance? " + (savedM == m) + ", id=" + m.getId());
+
+Item it = new Item("A-1", "pen");
+Item savedIt = items.save(it);
+System.out.println("same instance? " + (savedIt == it));</code></pre>
+
+<pre data-label="실행 결과 (트랜잭션 로그 생략)"><code class="language-text">== A. @GeneratedValue, id null
+Hibernate: select next value for Member_SEQ
+Hibernate: insert into Member (name,id) values (?,?)
+same instance? true, id=1
+== B. assigned String id, no version
+Hibernate: select i1_0.id,i1_0.name from Item i1_0 where i1_0.id=?
+Hibernate: insert into Item (name,id) values (?,?)
+same instance? false</code></pre>
+
+<p><code>Member</code>는 식별자가 <code>null</code>이라 새 엔티티로 판별되어 <code>persist</code>가 호출됐다. 시퀀스 조회 뒤 INSERT 하나, 반환값은 넘긴 객체 그대로다. <code>Item</code>은 식별자 <code>"A-1"</code>이 이미 채워져 있어 새 엔티티가 아니라고 판별되었고 <code>merge</code>가 호출됐다. 하이버네이트는 1차 캐시에 <code>Item#A-1</code>이 없으니 DB에서 SELECT로 찾아보고, 행이 없으니 새 관리 인스턴스를 만들어 상태를 복사한 뒤 INSERT를 예약했다. 반환값은 그 새 관리 인스턴스이므로 넘긴 객체와 다르다. DB에 남은 결과는 둘 다 "행 하나 INSERT"로 같지만, 거기까지 가는 길과 호출 뒤 객체의 상태가 다르다.</p>
+
+<pre class="diagram">persist (Member, id == null)                 merge (Item, id == "A-1")
+
+ m ──────────────┐                            it (넘긴 객체)        savedIt (반환값)
+                 ▼                            ┌──────────────┐     ┌──────────────┐
+ 영속성 컨텍스트                               │ id="A-1"     │복사 │ id="A-1"     │
+ ┌──────────────────────────┐                 │ name="pen"   │───> │ name="pen"   │
+ │ 1차 캐시                  │                 └──────────────┘     └──────┬───────┘
+ │  Member#1 ──> m (같은 객체)│                   관리 안 됨                │
+ │ 쓰기 지연: INSERT Member   │                                ┌──────────▼──────────┐
+ └──────────────────────────┘                                │ 1차 캐시             │
+ 반환값 == m                                                  │  Item#A-1 ──> savedIt│
+                                                             │ 쓰기 지연: INSERT Item│
+                                                             └─────────────────────┘
+                                                             반환값 != it</pre>
+
+<p>반환값이 다르다는 사실은 버그로 이어진다. 실험에서 바깥 트랜잭션 안에서 <code>Item</code>을 저장한 뒤, 넘긴 객체 쪽을 고쳤다.</p>
+
+<pre><code class="language-java">tt.executeWithoutResult(s -> {
+    Item x = new Item("B-1", "original");
+    Item y = items.save(x);
+    x.name = "changed-on-argument";                 // 넘긴 객체를 고친다
+    System.out.println("x managed? " + em.contains(x) + ", y managed? " + em.contains(y));
+});
+System.out.println("name in db = " + items.findById("B-1").get().name);</code></pre>
+
+<pre data-label="실행 결과 (트랜잭션 로그 일부 생략)"><code class="language-text">Hibernate: select i1_0.id,i1_0.name from Item i1_0 where i1_0.id=?
+x managed? false, y managed? true
+Hibernate: insert into Item (name,id) values (?,?)
+...
+name in db = original</code></pre>
+
+<p>같은 트랜잭션 안인데도 <code>x</code>에 한 변경은 DB에 반영되지 않았다. 영속성 컨텍스트가 감시하는 것은 <code>y</code>이고, <code>x</code>는 처음부터 끝까지 관리 대상이 아니었기 때문이다. INSERT에 들어간 값은 <code>merge</code> 시점에 <code>y</code>로 복사된 <code>"original"</code>이다. 반대로 <code>Member</code>처럼 <code>persist</code>로 저장된 엔티티는 넘긴 객체가 곧 관리 객체이므로 같은 코드가 잘 동작한다. 엔티티마다 다르게 동작하는 코드는 리뷰에서 잡아내기 어렵다. 그래서 "<code>save()</code>의 반환값을 받아서 그것을 계속 쓴다"를 습관으로 삼는 것이 안전하다. 반환값을 쓰면 <code>persist</code>든 <code>merge</code>든 항상 관리 인스턴스를 손에 쥐게 된다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>원본 장부와 신청서 사본</strong><p><code>persist</code>는 내가 들고 간 서류철을 그대로 사무실 캐비닛에 꽂는 일이다. 이후 그 서류철에 쓰는 내용은 캐비닛 속 서류에 바로 적힌다. <code>merge</code>는 창구에 신청서를 내면 직원이 장부(없으면 새 장부)를 꺼내 내 신청서의 내용을 옮겨 적고, 신청서는 나에게 돌려주는 일이다. 돌려받은 신청서에 무엇을 더 쓰든 장부는 바뀌지 않는다. 장부에 반영하려면 직원이 건네준 장부 페이지(반환값)에 써야 한다. 비유가 깨지는 지점도 있다. 현실의 직원은 장부를 찾으러 창고에 가는 비용을 말해 주지 않지만, <code>merge</code>는 1차 캐시에 없으면 반드시 SELECT라는 비용을 치른다.</p></aside>
+
+<h3>새 엔티티 판별 규칙을 소스로 읽기</h3>
+
+<p><code>save()</code>와 <code>delete()</code>의 운명을 가르는 <code>entityInformation.isNew(entity)</code>를 읽어 보자. 먼저 <code>entityInformation</code>이 어떤 클래스의 객체인지가 리포지토리 생성 시점에 정해진다. <code>JpaEntityInformationSupport.getEntityInformation()</code>은 도메인 클래스가 <code>Persistable</code>을 구현했으면 <code>JpaPersistableEntityInformation</code>을, 아니면 <code>JpaMetamodelEntityInformation</code>을 만든다.</p>
+
+<pre><code class="language-java">// JpaEntityInformationSupport (3.5.13)
+public static <T> JpaEntityInformation<T, ?> getEntityInformation(Class<T> domainClass, EntityManager em) {
+    // ... (인자 null 검사 생략)
+    Metamodel metamodel = em.getMetamodel();
+    PersistenceUnitUtil persistenceUnitUtil = em.getEntityManagerFactory().getPersistenceUnitUtil();
+
+    if (Persistable.class.isAssignableFrom(domainClass)) {
+        return new JpaPersistableEntityInformation(domainClass, metamodel, persistenceUnitUtil);
+    } else {
+        return new JpaMetamodelEntityInformation(domainClass, metamodel, persistenceUnitUtil);
+    }
+}</code></pre>
+
+<p><code>JpaPersistableEntityInformation</code>의 <code>isNew</code>는 <code>return entity.isNew();</code> 한 줄이다. 판단을 엔티티에게 완전히 맡긴다. <code>JpaMetamodelEntityInformation</code>의 <code>isNew</code>는 버전 속성을 먼저 본다.</p>
+
+<pre><code class="language-java">// JpaMetamodelEntityInformation (3.5.13)
+@Override
+public boolean isNew(T entity) {
+
+    if (versionAttribute.isEmpty()
+            || versionAttribute.map(Attribute::getJavaType).map(Class::isPrimitive).orElse(false)) {
+        return super.isNew(entity);
+    }
+
+    BeanWrapper wrapper = new DirectFieldAccessFallbackBeanWrapper(entity);
+
+    return versionAttribute.map(it -> wrapper.getPropertyValue(it.getName()) == null).orElse(true);
+}</code></pre>
+
+<p>버전 속성이 없거나, 있더라도 자바 타입이 원시 타입(<code>long</code>, <code>int</code> 등)이면 부모 클래스의 식별자 기반 판별로 넘긴다. 버전 속성이 래퍼 타입(<code>Long</code>, <code>Integer</code> 등)이면 그 값이 <code>null</code>인지로 판별한다. 버전 값은 메타모델이 알려 준 속성 이름으로 <code>DirectFieldAccessFallbackBeanWrapper</code>를 통해 읽는데, 이 래퍼는 게터가 없으면 필드에 직접 접근한다. 원시 타입 버전을 판별에 쓰지 않는 이유는 참조 문서에 적혀 있다. JPA는 0을 엔티티의 첫 번째 저장 버전으로 보기 때문에, 원시 타입 버전의 기본값 0으로는 "아직 저장 안 됨"과 "한 번 저장됨"을 구별할 수 없다.</p>
+
+<pre><code class="language-java">// AbstractEntityInformation (Spring Data Commons 3.5.13)
+@Override
+public boolean isNew(T entity) {
+
+    ID id = getId(entity);
+    Class<ID> idType = getIdType();
+
+    if (!idType.isPrimitive()) {
+        return id == null;
+    }
+
+    if (id instanceof Number n) {
+        return n.longValue() == 0L;
+    }
+
+    throw new IllegalArgumentException(String.format("Unsupported primitive id type %s", idType));
+}</code></pre>
+
+<p>식별자 기반 판별은 식별자 타입이 참조 타입이면 <code>null</code>인지, 원시 숫자 타입이면 0인지 본다. 원시 타입인데 숫자가 아니면(예를 들어 <code>char</code>) 예외를 던진다. 식별자 값을 읽는 <code>getId</code>도 한 번 볼 만하다. <code>JpaMetamodelEntityInformation.getId</code>는 먼저 넘어온 객체가 JPA 구현체의 프록시인지 확인해 프록시라면 구현체의 방식으로 식별자를 꺼내고, 단순 식별자라면 <code>PersistenceUnitUtil.getIdentifier(entity)</code>로 읽는다. 지연 로딩 프록시를 <code>save</code>나 <code>delete</code>에 넘겨도 식별자를 읽으려고 프록시를 초기화하지 않는 이유가 이것이다. 복합 키라면 키 속성들을 하나씩 읽어 하나라도 값이 있는지 본다.</p>
+
+<p>정리하면 판별은 다음 순서로 진행된다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>순서</th><th>조건</th><th>판별 방법</th><th>예</th></tr></thead><tbody>
+<tr><td>1</td><td>엔티티가 <code>Persistable</code>을 구현</td><td><code>entity.isNew()</code>의 반환값</td><td>직접 할당 식별자 + 일시적(transient) 플래그</td></tr>
+<tr><td>2</td><td>래퍼 타입 <code>@Version</code> 필드가 있음</td><td>버전 값이 <code>null</code>이면 새것</td><td><code>@Version Long version</code></td></tr>
+<tr><td>3</td><td>그 외, 식별자가 참조 타입</td><td>식별자가 <code>null</code>이면 새것</td><td><code>@Id @GeneratedValue Long id</code></td></tr>
+<tr><td>4</td><td>그 외, 식별자가 원시 숫자 타입</td><td>식별자가 0이면 새것</td><td><code>@Id @GeneratedValue long id</code></td></tr>
+</tbody></table></div>
+
+<x-visual id="spring-data-jpa-06-isnew-decision" title="save()의 새 엔티티 판별 순서도" kind="순서도" ratio="4:3">
+<x-hint>save()가 호출되었을 때 Persistable 여부, 래퍼 타입 버전 필드 여부, 식별자 값을 차례로 검사해 persist와 merge 중 하나로 가는 판단 흐름을 보여 준다.</x-hint>
+<x-prompt>Top-down flowchart on a white background. Start node at top labeled "save(entity)". First diamond labeled "Persistable 구현?" with a "예" arrow to a box "entity.isNew()" and a "아니오" arrow down to a second diamond "래퍼 타입 @Version 있음?". Second diamond "예" arrow goes to a box "version == null ?" and "아니오" arrow goes down to a third diamond "식별자 null 또는 0 ?". All decision results merge into two terminal boxes at the bottom: left green box "persist (새 엔티티)" and right orange box "merge (기존 엔티티)". Arrows from each check box labeled "true" to the green box and "false" to the orange box. Clean flat vector style, thin dark gray lines, rounded boxes.</x-prompt>
+<x-caption>판별은 Persistable, 래퍼 타입 버전, 식별자 순서로 진행되고, 결과에 따라 persist 또는 merge가 호출된다.</x-caption>
+</x-visual>
+
+<p>이 규칙을 보면 기본 판별이 어떤 엔티티를 전제로 설계되었는지 드러난다. 식별자를 DB나 JPA 구현체가 생성하는 엔티티다. 그런 엔티티는 저장 전에는 식별자가 반드시 <code>null</code>이고 저장 뒤에는 반드시 값이 있으므로, 식별자만 보고도 판별이 정확하다. 문제는 이 전제가 깨질 때, 즉 애플리케이션이 식별자를 직접 넣을 때 생긴다.</p>
+
+<h3>식별자를 직접 할당하면 생기는 일</h3>
+
+<p>주문 번호, 상품 코드, 외부 시스템에서 받은 키처럼 식별자를 애플리케이션이 정하는 경우는 흔하다. 이런 엔티티는 생성자에서 이미 식별자가 채워지므로 기본 판별로는 항상 "새것이 아님"이 된다. 참조 문서도 버전 속성 없이 직접 할당 식별자를 쓰는 엔티티에는 기본 판별이 쓸모없다고 명시한다. 그 결과로 생기는 증상은 세 가지다.</p>
+
+<h4>증상 1: 저장할 때마다 SELECT가 먼저 나간다</h4>
+
+<p>앞의 B 시나리오가 그 예다. 새 <code>Item</code>을 저장했을 뿐인데 <code>merge</code>가 호출되어 SELECT 후 INSERT가 나갔다. 한 건이면 왕복 한 번이 늘어나는 정도지만, <code>saveAll</code>로 천 건을 넣으면 SELECT 천 번이 INSERT 앞에 붙는다. 영속성 컨텍스트가 비어 있으니 SELECT는 매번 DB까지 간다. 대량 적재 작업이 예상보다 훨씬 느릴 때 SQL 로그에서 이 패턴을 찾아보면 원인이 바로 보인다.</p>
+
+<h4>증상 2: 새로 만들려던 행이 기존 행을 조용히 덮어쓴다</h4>
+
+<p>이 증상은 성능보다 훨씬 위험하다. 실험에서 이미 <code>"A-1"</code> 행이 있는 상태로, 같은 식별자의 새 객체를 만들어 <code>save</code>했다.</p>
+
+<pre><code class="language-java">Item it2 = new Item("A-1", "pencil");
+Item savedIt2 = items.save(it2);
+System.out.println("same instance? " + (savedIt2 == it2));</code></pre>
+
+<pre data-label="실행 결과 (트랜잭션 로그 생략)"><code class="language-text">== E. same Item id again (existing row)
+Hibernate: select i1_0.id,i1_0.name from Item i1_0 where i1_0.id=?
+Hibernate: update Item set name=? where id=?
+same instance? false</code></pre>
+
+<p>기본 키 중복 오류가 나지 않았다. <code>merge</code>는 SELECT로 기존 행을 읽어 관리 인스턴스를 만들고, 넘긴 객체의 상태(<code>name = "pencil"</code>)를 그 위에 복사했다. 플러시 때 더티 체킹이 스냅샷과 비교해 변경을 발견하고 UPDATE를 냈다. 코드를 쓴 사람의 의도가 "새 상품 등록"이었다면, 같은 코드가 이미 있을 때 기존 상품을 덮어쓰는 일이 오류 없이 일어난 것이다. 게다가 <code>merge</code>는 넘긴 객체의 모든 필드를 복사하므로, 넘긴 객체에서 비어 있던 필드는 기존 행의 값을 <code>null</code>로 지운다. 기본 키 제약이라는 DB의 안전장치가 있는데도 그 장치가 작동할 기회가 없었다는 점이 핵심이다. INSERT가 아니라 UPDATE가 나갔기 때문이다.</p>
+
+<h4>증상 3: 생성 전략이 있는 엔티티에 식별자를 손으로 넣으면 예외가 난다</h4>
+
+<p>세 번째는 반대 방향의 실수다. <code>@GeneratedValue</code>가 붙은 <code>Member</code>에 식별자를 직접 넣고 저장해 보았다. 테스트 데이터를 만들거나 다른 시스템에서 옮겨 온 값을 그대로 쓰려 할 때 생기는 상황이다.</p>
+
+<pre><code class="language-java">Member ghost = new Member("ghost");
+ghost.setId(999L);              // DB에 없는 식별자를 직접 넣는다
+Member r = members.save(ghost); // isNew: id != null 이므로 false -> merge</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">JpaTransactionManager - Creating new transaction with name [org.springframework.data.jpa.repository.support.SimpleJpaRepository.save]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+Hibernate: select m1_0.id,m1_0.name from Member m1_0 where m1_0.id=?
+Hibernate: select m1_0.id,m1_0.name from Member m1_0 where m1_0.id=?
+JpaTransactionManager - Initiating transaction rollback
+JpaTransactionManager - Rolling back JPA transaction on EntityManager [SessionImpl(1082537984<open>)]
+exception: org.springframework.orm.ObjectOptimisticLockingFailureException: Row was updated or deleted by another transaction (or unsaved-value mapping was incorrect): [lab.Member#999]
+  cause: org.hibernate.StaleObjectStateException: Row was updated or deleted by another transaction (or unsaved-value mapping was incorrect): [lab.Member#999]</code></pre>
+
+<p>식별자가 채워져 있으니 판별은 "새것 아님"이고 <code>merge</code>가 호출되었다. 하이버네이트는 SELECT로 행을 찾았지만 없었고, 이번에는 INSERT 대신 <code>StaleObjectStateException</code>을 던졌다. 이 예외는 트랜잭션 인터셉터를 지나며 롤백을 일으키고(로그의 <code>Initiating transaction rollback</code>), 그 바깥의 예외 변환을 거쳐 스프링의 <code>ObjectOptimisticLockingFailureException</code>이 되어 호출자에게 도착했다. 인터셉터 순서에서 트랜잭션이 예외 변환보다 안쪽에 있다는 것이 로그 순서로 드러난다.</p>
+
+<p>이 동작은 하이버네이트 6.6에서 바뀐 것이다. 하이버네이트 6.6 마이그레이션 가이드의 "Merge versioned entity when row is deleted" 항목은, 이전에는 일치하는 행이 없는 준영속 엔티티를 병합하면 INSERT가 나갔지만 이것이 낙관적 락의 규칙을 어기는 동작이었으므로, 이제는 엔티티가 확실히 준영속이라고 판단할 수 있는데 일치하는 행이 없으면 <code>OptimisticLockException</code>을 던진다고 설명한다. 그 판단이 가능하려면 엔티티에 생성되는 <code>@Id</code>나 원시 타입이 아닌 <code>@Version</code>이 있어야 하고, 둘 다 없는 엔티티는 새 인스턴스와 삭제된 준영속 인스턴스를 구별할 수 없으므로 동작이 이전과 같다고 덧붙인다. 위 실험의 <code>Member</code>는 생성되는 식별자를 가졌으므로 예외가 났고, B 시나리오의 <code>Item</code>은 둘 다 없으므로 예전처럼 INSERT가 나갔다. 6.5 이하에서 6.6으로 올리면서 "식별자를 손으로 넣은 저장" 코드가 갑자기 낙관적 락 예외를 내기 시작했다면 이 변경이 원인이다. 하이버네이트 입장에서 "생성 전략이 있는데 식별자가 이미 있다"는 것은 이미 저장된 적이 있다는 뜻이다. 그런데 행이 없으니 그사이 누군가 지운 것으로 본다. 예외 메시지 끝의 "unsaved-value mapping was incorrect"라는 문구가 바로 이 가능성, 즉 새 객체를 기존 객체로 잘못 판단했을 가능성을 가리킨다.</p>
+
+<h3>판별을 바로잡는 방법: Persistable, @Version, 그 밖</h3>
+
+<p>해법은 판별 규칙의 순서표를 거꾸로 읽으면 나온다. 식별자만으로 판단할 수 없다면, 그보다 앞서 검사되는 정보를 엔티티에 주면 된다.</p>
+
+<h4>Persistable 구현</h4>
+
+<p>참조 문서가 직접 할당 식별자 엔티티에 권하는 흔한 패턴은, 영속화되지 않는 플래그를 두고 JPA 생명주기 콜백으로 그 플래그를 뒤집는 것이다. 실험의 <code>Book</code>이 그 패턴이다.</p>
+
+<pre><code class="language-java">@Entity
+public class Book implements Persistable<String> {
+    @Id String isbn;
+    String title;
+    @Transient private boolean isNew = true;     // 컬럼이 아니다. 새로 만든 객체는 true
+
+    protected Book() {}
+    public Book(String isbn, String title) { this.isbn = isbn; this.title = title; }
+
+    @Override public String getId() { return isbn; }
+    @Override public boolean isNew() { return isNew; }
+
+    @PostPersist @PostLoad
+    void markNotNew() { this.isNew = false; }    // 저장된 뒤, 또는 DB에서 읽힌 뒤에는 false
+}</code></pre>
+
+<pre data-label="실행 결과 (트랜잭션 로그 생략)"><code class="language-text">== D. Persistable
+Hibernate: insert into Book (title,isbn) values (?,?)
+same instance? true, isNew after save=false</code></pre>
+
+<p>SELECT 없이 INSERT 하나만 나갔고, 반환값은 넘긴 객체 그대로다. <code>persist</code>가 호출되었다는 증거다. 이 패턴에서 각 부분의 역할을 짚어 보자. 필드 초기값 <code>true</code>는 <code>new</code>로 만든 객체가 새것이라는 뜻이다. 하이버네이트가 DB에서 엔티티를 읽을 때도 기본 생성자를 호출하므로 이 초기값이 일단 <code>true</code>로 들어가지만, 로딩이 끝나면 <code>@PostLoad</code>가 호출되어 <code>false</code>로 바뀐다. 따라서 조회한 엔티티를 <code>save</code>나 <code>delete</code>에 넘기면 기존 엔티티로 올바르게 판별된다. <code>@PostPersist</code>는 INSERT가 실행된 뒤(쓰기 지연 때문에 대개 플러시 시점) 호출되어 플래그를 내린다. 실험 출력의 <code>isNew after save=false</code>는 <code>save</code>의 트랜잭션이 커밋된 뒤 찍은 값이다. 이 콜백이 없으면 저장이 끝난 객체가 계속 새것으로 판별되어, 다음 트랜잭션에서 그 객체를 <code>delete</code>에 넘기면 아무 일도 일어나지 않고 <code>save</code>에 넘기면 준영속 객체에 <code>persist</code>를 시도하게 된다. <code>@Transient</code>는 이 필드가 컬럼으로 매핑되지 않게 한다. 참조 문서는 같은 패턴을 <code>@MappedSuperclass</code> 기반 추상 클래스로 만들어 여러 엔티티가 상속하게 하는 예를 보여 준다.</p>
+
+<p>이 방식의 부수 효과도 알아 두자. 같은 ISBN의 행이 이미 있는데 <code>new Book(...)</code>으로 만든 객체를 저장하면 이제 <code>persist</code>가 호출되고, INSERT가 DB에 도달하면 기본 키 제약에 걸려 실패한다. 증상 2처럼 조용히 덮어쓰는 대신 오류가 나는 것이다. 대개는 이쪽이 원하는 동작이다. 기존 데이터를 수정하려는 코드라면 처음부터 조회해서 관리 엔티티를 고치는 방식으로 써야 한다.</p>
+
+<p>스프링 데이터 JPA는 <code>AbstractPersistable</code>이라는 기반 클래스도 제공하지만, 3.5.13 소스에서 이 클래스는 식별자에 <code>@Id @GeneratedValue</code>를 붙이고 <code>isNew()</code>를 <code>null == getId()</code>로 구현한다. 생성 전략을 쓰는 엔티티용이므로 직접 할당 식별자 문제의 해법은 아니다.</p>
+
+<h4>래퍼 타입 @Version</h4>
+
+<p>두 번째 방법은 판별 순서표의 2번을 이용하는 것이다. 래퍼 타입 버전 필드를 두면 식별자를 보기 전에 버전 값으로 판별한다.</p>
+
+<pre><code class="language-java">@Entity
+public class Ticket {
+    @Id String id;
+    @Version Long version;        // 래퍼 타입. 새 객체에서는 null
+    protected Ticket() {}
+    public Ticket(String id) { this.id = id; }
+}</code></pre>
+
+<pre data-label="실행 결과 (트랜잭션 로그 생략)"><code class="language-text">== C. assigned id + @Version Long
+Hibernate: insert into Ticket (version,id) values (?,?)
+same instance? true</code></pre>
+
+<p>식별자가 채워져 있는데도 버전이 <code>null</code>이라 새 엔티티로 판별되어 <code>persist</code>가 호출되었다. 하이버네이트는 INSERT할 때 버전의 초기값을 채우고, 이후 이 엔티티를 조회하면 버전에는 항상 값이 있으므로 기존 엔티티로 판별된다. 이 방법은 낙관적 락이라는 덤을 준다. 동시에 두 트랜잭션이 같은 행을 고치면 나중에 커밋하는 쪽이 버전 불일치로 실패한다. 반대로 버전 필드를 원시 타입 <code>long</code>으로 선언하면 판별 순서의 2번을 건너뛰고 식별자 판별로 넘어가므로, 직접 할당 식별자 문제는 그대로 남는다. 타입 하나 차이로 동작이 갈리는 지점이니 주의한다.</p>
+
+<h4>그 밖의 방법</h4>
+
+<p>5회차에서 다룬 Auditing을 쓰고 있다면, 등록 시각 필드가 비어 있는지로 <code>Persistable.isNew()</code>를 구현하는 방법도 쓸 수 있다. 등록 시각은 엔티티가 처음 <code>persist</code>될 때 채워지므로, 판별 시점에 비어 있다면 아직 저장된 적이 없는 객체다. 참조 문서는 마지막 수단으로 <code>JpaRepositoryFactory</code>를 상속해 <code>getEntityInformation(...)</code>을 재정의하는 방법도 소개하지만, 그런 경우는 드물다고 적고 있다. 그리고 가장 단순한 해법을 잊지 말자. 식별자 생성 전략이 있는 엔티티라면 식별자를 손으로 넣지 않는 것이다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<p><b>"엔티티를 고쳤으면 save()를 불러야 반영된다."</b> 같은 트랜잭션 안에서 조회한 관리 엔티티라면 더티 체킹이 플러시 때 UPDATE를 만든다. 이때 <code>save()</code>를 부르면 판별 결과는 "새것 아님"이고 <code>merge</code>가 호출되는데, 명세상 관리 중인 엔티티에 대한 <code>merge</code>는 무시되므로 추가 SQL 없이 같은 객체가 돌아온다. 그래서 해롭지는 않다. 참조 문서도 트랜잭션 예제에서 이 <code>save</code> 호출이 JPA 관점에서 꼭 필요하지는 않지만 리포지토리 추상화와의 일관성을 위해 두라고 적는다. 문제는 준영속 엔티티(이전 트랜잭션에서 읽어 온 엔티티나, 요청 데이터로 새로 만든 객체)를 <code>save</code>할 때다. 그때는 진짜 <code>merge</code>가 일어나 SELECT와 전체 필드 덮어쓰기가 따라온다.</p>
+
+<p><b>"save()는 넘긴 객체를 저장하고 그 객체를 돌려준다."</b> <code>persist</code> 경로에서만 그렇다. <code>merge</code> 경로에서는 다른 객체가 돌아오고, 넘긴 객체는 관리되지 않는다. 앞에서 넘긴 객체 <code>x</code>를 고친 실험처럼 반환값을 버리면 이후 변경이 사라진다.</p>
+
+<p><b>"리포지토리 조회 메서드는 모두 읽기 전용 트랜잭션으로 실행된다."</b> <code>SimpleJpaRepository</code>에 구현이 있는 메서드(<code>findById</code>, <code>findAll</code>, <code>count</code> 등)만 그렇다. 인터페이스에 선언한 쿼리 메서드는 아무 트랜잭션 설정도 받지 않는다. 필요하면 리포지토리 인터페이스에 <code>@Transactional(readOnly = true)</code>를 붙인다.</p>
+
+<p><b>"readOnly = true면 쓰기가 원천 차단된다."</b> 하이버네이트 수준에서 플러시가 일어나지 않고 더티 체킹을 하지 않는 것은 확실하다. 그러나 JDBC 커넥션에 전달되는 것은 힌트이고, DB가 실제로 쓰기를 거부하는지는 드라이버와 DB에 달려 있다. 또 읽기 전용 설정은 그 트랜잭션이 새로 시작될 때만 적용되므로, 읽기-쓰기 트랜잭션에 참여한 <code>findById</code>에는 효과가 없다.</p>
+
+<p><b>"기본 키를 직접 넣으면 중복될 때 DB가 막아 준다."</b> 기본 판별을 쓰면 중복 키 저장은 INSERT가 아니라 UPDATE가 되어 DB 제약이 작동하지 않는다. 증상 2가 그것이다. <code>Persistable</code>이나 래퍼 타입 버전으로 판별을 바로잡아야 기본 키 제약이 다시 안전장치 역할을 한다.</p>
+
+<p><b>"deleteById는 대상이 없으면 예외를 던진다."</b> 2.7.18과 3.0.0의 소스에서는 그랬지만 3.5.13에서는 조용히 무시한다. 버전을 올릴 때 예외에 기대던 코드를 점검해야 한다.</p>
+
+<h3>다른 주제와의 연결</h3>
+
+<p>이 회차에서 본 구조, 즉 프록시에 인터셉터를 순서대로 끼우고 마지막에 실제 구현 객체를 부르는 구조는 스프링 AOP의 <code>ProxyFactory</code>가 만드는 프록시의 표준 형태다. 프록시를 JDK 방식으로 만드느냐 CGLIB 방식으로 만드느냐는 그다음 문제다. 스프링 DB 1, 2편의 트랜잭션 AOP도 이 구조 위에서 동작했고, 로드맵 뒤쪽의 스프링 핵심 원리 고급편 권은 이 프록시 팩토리를 정면으로 다룬다. 리포지토리 프록시를 <code>Advised</code>로 캐스팅해 인터셉터 목록을 찍어 보는 방법은 다른 스프링 프록시를 조사할 때도 그대로 쓸 수 있다.</p>
+
+<p>새 엔티티 판별과 <code>merge</code>의 동작은 웹 계층과 만나는 지점에서 특히 중요하다. 요청 데이터를 엔티티 객체로 바로 받아 <code>save</code>하는 코드는, 식별자가 있으면 <code>merge</code>가 되어 요청에 없던 필드를 <code>null</code>로 덮어쓴다. JPA 활용 1권에서 변경 감지와 병합을 비교하며 확인한 원칙, 곧 변경은 조회한 관리 엔티티를 고치는 방식으로 한다는 원칙이 리포지토리 수준에서도 같은 이유로 성립한다.</p>
+
+<p>이 권의 다음 회차인 7회차는 <code>SimpleJpaRepository</code>가 함께 구현하는 나머지 기능들, 곧 Specifications, Query By Example, Projections, 네이티브 쿼리를 다룬다. 이 회차에서 본 프록시와 인터셉터 구조, 그리고 쿼리 메서드가 다섯 번째 인터셉터에서 처리된다는 사실을 알고 있으면 그 기능들이 어디서 실행되는지도 자연스럽게 따라갈 수 있다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>리포지토리 프록시</dt><dd>리포지토리 빈은 <code>RepositoryFactorySupport.getRepository()</code>가 <code>ProxyFactory</code>로 만든 JDK 동적 프록시이고, 타깃은 <code>SimpleJpaRepository</code>다.</dd>
+<dt>인터셉터 순서</dt><dd>메서드 메타데이터 기록, 예외 변환, 트랜잭션, default 메서드 실행, 쿼리 메서드 실행, 구현 조각 위임 순으로 바깥부터 놓인다. 쿼리 메서드는 다섯 번째에서 끝난다.</dd>
+<dt>SimpleJpaRepository의 트랜잭션</dt><dd>클래스에 <code>@Transactional(readOnly = true)</code>, 쓰기 메서드에 속성 없는 <code>@Transactional</code>이 붙어 있다. 인터페이스에 선언한 쿼리 메서드는 아무 트랜잭션 설정도 받지 않는다.</dd>
+<dt>readOnly의 효과</dt><dd>하이버네이트에서는 플러시 모드 MANUAL, 세션 기본 읽기 전용(더티 체킹과 스냅샷 없음), 조건이 맞으면 JDBC <code>setReadOnly(true)</code> 힌트가 적용된다. 새로 시작한 트랜잭션에만 해당한다.</dd>
+<dt>save()</dt><dd><code>isNew</code>가 참이면 <code>persist</code> 후 넘긴 객체를, 거짓이면 <code>merge</code>의 반환값(관리 인스턴스)을 돌려준다.</dd>
+<dt>새 엔티티 판별 순서</dt><dd>Persistable이면 <code>isNew()</code>, 래퍼 타입 버전이 있으면 버전 <code>null</code> 여부, 그 외에는 식별자가 <code>null</code>(참조 타입) 또는 0(원시 숫자 타입)인지로 판단한다.</dd>
+<dt>직접 할당 식별자의 증상</dt><dd>저장마다 SELECT가 붙고, 기존 행이 있으면 오류 없이 UPDATE로 덮어쓴다.</dd>
+<dt>하이버네이트 6.6의 merge</dt><dd>생성 식별자나 래퍼 타입 버전이 있는 준영속 엔티티를 병합할 때 행이 없으면 INSERT 대신 낙관적 락 예외를 던진다.</dd>
+</x-summary>
+
+<x-review>
+<p>대량 적재 배치가 느리다는 보고를 받았을 때 가장 먼저 볼 것은 SQL 로그에서 INSERT 앞에 같은 키의 SELECT가 붙어 있는지다. 붙어 있다면 직접 할당 식별자 엔티티가 <code>merge</code> 경로를 타고 있다는 뜻이고, <code>Persistable</code>이나 래퍼 타입 <code>@Version</code>으로 판별을 바로잡으면 SELECT가 사라진다. 다만 판별을 바로잡은 뒤에는 중복 키가 UPDATE가 아니라 제약 위반 오류로 바뀌므로, 재실행 가능한 배치(같은 데이터를 다시 넣을 수 있는 작업)였다면 "있으면 수정, 없으면 추가"를 명시적으로 처리하는 코드가 따로 필요해진다. 어느 쪽이 맞는지는 업무 규칙이 정한다.</p>
+<p>하이버네이트 버전을 6.6 이상으로 올린 뒤 <code>ObjectOptimisticLockingFailureException</code>이 갑자기 늘었다면, 동시성 문제가 생겼다고 단정하기 전에 생성 식별자를 가진 엔티티에 식별자를 손으로 넣어 <code>save</code>하는 코드가 있는지 찾아본다. 테스트 픽스처나 데이터 이관 코드에 흔하다. 예외 메시지의 "unsaved-value mapping was incorrect"가 그 단서다.</p>
+<p>서비스 계층에 <code>@Transactional</code>을 붙일지 판단할 때는 리포지토리의 기본 트랜잭션이 "호출 하나"의 범위라는 점을 기준으로 삼는다. 두 개 이상의 리포지토리 호출이 함께 성공하거나 함께 실패해야 하거나, 조회한 엔티티를 고쳐서 더티 체킹으로 반영하려 한다면 서비스 메서드에 트랜잭션이 있어야 한다. 조회 위주의 서비스라면 <code>readOnly = true</code>로 시작해 플러시와 스냅샷 비용을 줄이고, 쿼리 메서드만 쓰는 리포지토리에도 트랜잭션이 필요하다면 인터페이스 수준에 붙인다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 네 엔티티를 각각 <code>new</code>로 만들어 식별자 필드에 값을 넣지 않은 채(단, (b)와 (d)는 생성자에서 식별자를 넣는다) <code>save</code>했을 때 <code>persist</code>와 <code>merge</code> 중 무엇이 호출되는지 판별 순서에 따라 답하라. (a) <code>@Id @GeneratedValue long id</code> (b) <code>@Id String code</code>와 <code>@Version long version</code> (c) <code>@Id @GeneratedValue Long id</code>와 <code>@Version Integer version</code> (d) <code>@Id String code</code>를 가지고 <code>Persistable</code>을 구현하며 <code>isNew()</code>가 <code>getId() == null</code>을 반환</li>
+<li>트랜잭션이 없는 서비스 메서드에서 <code>Item item = itemRepository.findById("A-1").orElseThrow(); item.name = "new";</code>만 실행했다. UPDATE가 나가는가? 각 호출이 어떤 트랜잭션과 영속성 컨텍스트에서 실행되는지 근거로 설명하라.</li>
+<li><code>@Transactional</code> 서비스 메서드 안에서 <code>Order o = new Order("O-1"); orderRepository.save(o); o.setStatus(PAID);</code>를 실행했더니 상태가 DB에 반영되지 않았다. <code>Order</code>는 직접 할당 식별자만 가지고 버전 필드는 없다. 원인과 두 가지 수정 방법을 말하라.</li>
+<li><code>SimpleJpaRepository.save</code> 안에서 예외가 발생했다. 트랜잭션 롤백과 예외 변환 중 무엇이 먼저 일어나는가? 프록시의 인터셉터 순서로 설명하라.</li>
+<li>인터페이스에 <code>List<Member> findByName(String name)</code>만 선언하고, 트랜잭션 없는 컨트롤러에서 이 메서드로 받은 회원의 지연 로딩 연관관계(팀)를 읽었다. OSIV가 꺼져 있다면 무슨 일이 일어나는가? 그리고 리포지토리 인터페이스에 <code>@Transactional(readOnly = true)</code>를 붙이면 해결되는가?</li>
+</x-practice>
+
+<x-answer>
+<p>1번. (a)는 Persistable이 아니고 버전 필드가 없으므로 식별자 판별로 간다. 식별자 타입이 원시 <code>long</code>이고 기본값이 0이므로 새것, <code>persist</code>다. (b)는 버전 필드가 원시 타입이라 판별 2번을 건너뛰고 식별자 판별로 간다. 생성자에서 넣은 <code>code</code>가 <code>null</code>이 아니므로 새것이 아니고 <code>merge</code>가 호출된다. 그래서 SELECT 후 INSERT가 나간다. (c)는 래퍼 타입 버전이 있으므로 버전 값으로 판별한다. 새 객체의 버전은 <code>null</code>이므로 <code>persist</code>다. (d)는 Persistable이므로 엔티티의 <code>isNew()</code>를 따른다. 생성자에서 <code>code</code>를 넣었으니 <code>getId() == null</code>은 거짓이고 <code>merge</code>가 호출된다. Persistable을 구현했다고 해서 저절로 해결되지 않는다. <code>isNew()</code>의 구현이 직접 할당 식별자의 사정을 반영해야 한다.</p>
+<p>2번. UPDATE는 나가지 않는다. 서비스에 트랜잭션이 없으므로 <code>findById</code>는 프록시의 트랜잭션 인터셉터가 연 읽기 전용 트랜잭션에서 실행되고, 메서드가 반환되는 순간 커밋되고 엔티티 매니저가 닫힌다. 반환된 <code>item</code>은 준영속이다. 이후 <code>item.name</code>을 바꿔도 감시하는 영속성 컨텍스트가 없다. 설령 같은 영속성 컨텍스트였더라도 그 트랜잭션은 읽기 전용이라 플러시 모드가 MANUAL이었다. 서비스 메서드에 <code>@Transactional</code>을 붙이면 <code>findById</code>는 그 트랜잭션에 참여하고, 서비스 메서드가 끝날 때 플러시에서 더티 체킹이 UPDATE를 만든다.</p>
+<p>3번. 식별자가 채워져 있고 버전이 없으므로 <code>save</code>는 <code>merge</code>를 호출했다. <code>merge</code>는 새 관리 인스턴스를 만들어 <code>o</code>의 상태를 복사하고 그것을 반환한다. <code>o</code>는 관리 대상이 아니므로 <code>o.setStatus(PAID)</code>는 플러시에 잡히지 않는다. 수정 방법은 (1) <code>Order saved = orderRepository.save(o); saved.setStatus(PAID);</code>처럼 반환값을 쓰는 것, (2) <code>Order</code>가 <code>Persistable</code>(일시적 플래그와 <code>@PostPersist</code>, <code>@PostLoad</code>)을 구현하거나 래퍼 타입 <code>@Version</code>을 갖게 해 <code>persist</code> 경로를 타게 하는 것이다. (2)를 적용하면 SELECT도 사라지고 <code>o</code> 자체가 관리 객체가 된다.</p>
+<p>4번. 롤백이 먼저다. 인터셉터는 바깥부터 메타데이터 기록, 예외 변환, 트랜잭션 순으로 놓여 있으므로, 안쪽에서 올라온 예외는 먼저 <code>TransactionInterceptor</code>를 지난다. 여기서 롤백 규칙에 따라 트랜잭션이 롤백되고 예외가 다시 던져진다. 그다음 바깥의 <code>PersistenceExceptionTranslationInterceptor</code>가 그 예외를 스프링의 <code>DataAccessException</code> 계층으로 바꾼다. 이 회차 실험에서 <code>Initiating transaction rollback</code> 로그가 찍힌 뒤에 <code>ObjectOptimisticLockingFailureException</code>이 호출자에게 도착한 것이 그 순서다.</p>
+<p>5번. <code>findByName</code>은 쿼리 메서드라 아무 트랜잭션 설정도 받지 않는다. 공유 엔티티 매니저 프록시는 호출을 위해 임시 엔티티 매니저를 열어 쿼리를 실행하고 닫으므로, 반환된 회원들은 준영속이다. 팀 프록시를 초기화할 세션이 없어 <code>LazyInitializationException</code>이 난다. 인터페이스에 <code>@Transactional(readOnly = true)</code>를 붙이면 쿼리 메서드가 읽기 전용 트랜잭션 안에서 실행되지만, 그 트랜잭션은 리포지토리 메서드가 반환될 때 끝난다. 컨트롤러에서 연관관계를 읽는 시점에는 이미 닫혀 있으므로 문제는 그대로다. 해결은 연관관계를 읽는 코드까지 포함하는 서비스 트랜잭션을 두거나, 4회차의 <code>@EntityGraph</code>나 페치 조인으로 필요한 연관관계를 쿼리에서 함께 읽어 오는 것이다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>@Id String id</code>(직접 할당)만 있고 버전 필드가 없는 엔티티를 새로 만들어 식별자를 넣고 <code>save</code>했다. DB에는 아직 그 식별자의 행이 없다. Hibernate 6.6 기준으로 어떤 SQL이 나가는가?</q>
+<o>INSERT 하나</o>
+<o>SELECT 하나, 그다음 INSERT 하나</o>
+<o>SELECT 하나 뒤 낙관적 락 예외</o>
+<o>UPDATE 하나</o>
+<why>식별자가 채워져 있으므로 기본 판별은 "새것 아님"이고 <code>merge</code>가 호출된다. 하이버네이트는 SELECT로 행을 찾고, 없으므로 INSERT한다. 6.6의 예외 규칙은 생성되는 식별자나 래퍼 타입 버전이 있는 엔티티에만 적용되므로 이 엔티티에는 해당하지 않는다. UPDATE는 행이 이미 있을 때의 결과다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>리포지토리 인터페이스에 애너테이션 없이 <code>Optional<Member> findByEmail(String email)</code>을 선언했다. 서비스 계층에 트랜잭션이 없는 상태에서 이 메서드를 호출하면 어떤 트랜잭션 속성으로 실행되는가?</q>
+<o><code>SimpleJpaRepository</code>의 클래스 수준 설정을 물려받아 readOnly 트랜잭션</o>
+<o>속성 없는 <code>@Transactional</code>과 같은 읽기-쓰기 트랜잭션</o>
+<o>트랜잭션 없이 실행</o>
+<o>항상 <code>REQUIRES_NEW</code>로 새 트랜잭션</o>
+<why>트랜잭션 속성 탐색은 구현 클래스에 대응 메서드가 있을 때만 <code>SimpleJpaRepository</code> 쪽을 본다. 쿼리 메서드는 대응 메서드가 없으므로 인터페이스 메서드와 인터페이스의 애너테이션만 보고, 둘 다 없으면 속성이 없다. 참조 문서도 선언된 쿼리 메서드에는 기본 트랜잭션 설정이 없다고 명시한다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>@Id @GeneratedValue Long id</code>와 <code>@Version long version</code>(원시 타입)을 가진 엔티티에서, 새 엔티티 판별은 무엇으로 결정되는가?</q>
+<o>식별자가 <code>null</code>인지</o>
+<o>버전이 0인지</o>
+<o>버전이 <code>null</code>인지</o>
+<o>DB에 같은 식별자의 행이 있는지 SELECT로 확인</o>
+<why><code>JpaMetamodelEntityInformation.isNew</code>는 버전 속성이 없거나 원시 타입이면 식별자 판별로 넘긴다. 식별자가 참조 타입 <code>Long</code>이므로 <code>null</code> 여부로 판별한다. 원시 타입 버전은 JPA가 0을 첫 저장 버전으로 보기 때문에 판별에 쓰이지 않는다. 판별 자체는 SELECT를 하지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>스프링의 <code>JpaTransactionManager</code>와 하이버네이트를 쓸 때, 새로 시작된 <code>readOnly = true</code> 트랜잭션에 대한 설명으로 옳은 것은?</q>
+<o>DB가 모든 쓰기 SQL을 거부하므로 UPDATE를 실행하면 반드시 SQL 오류가 난다.</o>
+<o>읽기 전용은 표식일 뿐이라 하이버네이트의 동작에는 아무 변화가 없다.</o>
+<o>1차 캐시를 쓰지 않으므로 같은 식별자로 두 번 조회하면 SELECT가 두 번 나간다.</o>
+<o>세션의 플러시 모드가 MANUAL이 되고 기본 읽기 전용이 켜져, 관리 엔티티를 고쳐도 커밋 때 UPDATE가 나가지 않는다.</o>
+<why><code>HibernateJpaDialect</code>는 읽기 전용 트랜잭션에서 플러시 모드를 MANUAL로 바꾸고, 로컬 자원 트랜잭션이면 <code>setDefaultReadOnly(true)</code>를 호출한다. 실험에서도 엔티티를 고쳤지만 UPDATE가 나가지 않았다. JDBC의 <code>setReadOnly</code>는 드라이버에 주는 힌트라 DB의 쓰기 거부를 보장하지 않으며, 1차 캐시는 그대로 동작한다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>리포지토리 프록시의 인터셉터 체인에서 <code>findByName</code> 같은 쿼리 메서드 호출은 어디에서 처리가 끝나는가?</q>
+<o><code>TransactionInterceptor</code>가 쿼리를 직접 실행한다.</o>
+<o><code>SimpleJpaRepository</code>가 메서드 이름을 그때그때 해석해 실행한다.</o>
+<o><code>QueryExecutorMethodInterceptor</code>가 시작 시점에 만들어 둔 쿼리 객체를 실행하고 반환한다.</o>
+<o><code>DefaultMethodInvokingMethodInterceptor</code>가 인터페이스의 default 구현을 호출한다.</o>
+<why><code>QueryExecutorMethodInterceptor.doInvoke</code>는 메서드에 대응하는 쿼리 객체가 있으면 그것을 실행해 반환하고, 없을 때만 <code>proceed()</code>로 넘긴다. 쿼리 객체는 애플리케이션 시작 시점에 메서드 이름 해석이나 <code>@Query</code> 파싱으로 만들어진다. <code>SimpleJpaRepository</code>에는 쿼리 메서드에 대응하는 메서드가 없다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>JDK 동적 프록시(JDK dynamic proxy)</dt><dd><code>java.lang.reflect.Proxy</code>가 실행 중에 생성하는, 지정한 인터페이스들을 구현한 클래스의 객체. 모든 메서드 호출을 하나의 호출 핸들러로 보낸다.</dd>
+<dt>메서드 인터셉터(MethodInterceptor)</dt><dd>스프링 AOP에서 메서드 호출을 감싸는 어드바이스. <code>proceed()</code>로 다음 단계에 넘기거나 직접 결과를 반환한다.</dd>
+<dt>리포지토리 조각(repository fragment)</dt><dd>리포지토리 인터페이스의 메서드를 구현하는 객체 단위. 사용자 정의 구현 조각들 뒤에 기본 구현인 <code>SimpleJpaRepository</code>가 놓여 하나의 조합을 이룬다.</dd>
+<dt>엔티티 정보(EntityInformation)</dt><dd>도메인 타입의 식별자, 버전, 엔티티 이름을 담고 <code>isNew</code>, <code>getId</code>를 제공하는 스프링 데이터의 추상화. JPA에서는 메타모델에서 정보를 읽는다.</dd>
+<dt>병합(merge)</dt><dd>넘긴 객체의 상태를 같은 식별자의 관리 인스턴스로 복사하고 그 관리 인스턴스를 반환하는 JPA 연산. 넘긴 객체는 관리 상태가 되지 않는다.</dd>
+<dt>준영속(detached)</dt><dd>식별자를 가지고 있고 DB에 대응하는 행이 있을 수 있지만, 현재 어떤 영속성 컨텍스트도 관리하지 않는 엔티티의 상태.</dd>
+<dt>Persistable</dt><dd>Spring Data Commons의 인터페이스. <code>getId()</code>와 <code>isNew()</code>를 구현하면 리포지토리가 새 엔티티 판별을 엔티티에게 맡긴다.</dd>
+<dt>플러시 모드(flush mode)</dt><dd>영속성 컨텍스트의 변경을 언제 SQL로 내보낼지 정하는 설정. 하이버네이트의 MANUAL은 명시적으로 <code>flush()</code>를 호출할 때만 플러시한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-data/jpa/reference/jpa/entity-persistence.html">Spring Data JPA Reference — Persisting Entities</a> — save()의 persist/merge 선택과 새 엔티티 판별 전략, Persistable 패턴</li>
+<li><a href="https://docs.spring.io/spring-data/jpa/reference/jpa/transactions.html">Spring Data JPA Reference — Transactionality</a> — CRUD 메서드의 트랜잭션 설정과 쿼리 메서드에 트랜잭션이 적용되지 않는다는 설명</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-data-jpa/3.5.13/spring-data-jpa/src/main/java/org/springframework/data/jpa/repository/support/SimpleJpaRepository.java">SimpleJpaRepository.java (Spring Data JPA 3.5.13 소스)</a> — 클래스 애너테이션, save/delete/findById 구현</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-framework/v6.2.19/spring-orm/src/main/java/org/springframework/orm/jpa/vendor/HibernateJpaDialect.java">HibernateJpaDialect.java (Spring Framework 6.2.19 소스)</a> — 읽기 전용 트랜잭션의 플러시 모드와 기본 읽기 전용 설정</li>
+<li><a href="https://docs.jboss.org/hibernate/orm/6.6/migration-guide/migration-guide.html#merge-versioned-deleted">Hibernate ORM 6.6 Migration Guide — Merge versioned entity when row is deleted</a> — 행이 없는 준영속 엔티티 병합 시 예외로 바뀐 동작</li>
+<li><a href="https://docs.jboss.org/hibernate/orm/6.6/javadocs/org/hibernate/Session.html">Hibernate ORM 6.6 Javadoc — Session</a> — setDefaultReadOnly와 읽기 전용 엔티티의 의미</li>
+</x-refs>

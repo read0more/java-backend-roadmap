@@ -1,0 +1,969 @@
+<x-meta>
+deck: 해시 인덱스로 중복 없는 집합을 직접 만들면서 문자열 해시 코드의 계산, hashCode()의 규약과 객체 헤더, equals와 hashCode가 어긋날 때 버킷에서 벌어지는 일을 추적한다.
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li>버킷 배열과 연결 리스트로 중복을 허용하지 않는 해시 셋을 구현하고, add·contains·remove가 거치는 단계를 인덱스 계산부터 비교까지 순서대로 설명할 수 있다.</li>
+<li><code>String.hashCode()</code>의 다항식 계산을 손으로 따라가고, int 오버플로로 음수가 나오는 이유와 음수 해시 코드를 안전하게 배열 인덱스로 바꾸는 방법을 설명할 수 있다.</li>
+<li><code>Object.hashCode()</code>의 규약 세 가지를 말하고, HotSpot이 기본 해시 코드를 메모리 주소가 아니라 객체 헤더에 저장한 값으로 돌려주는 이유를 설명할 수 있다.</li>
+<li>equals와 hashCode 중 하나만 재정의한 객체를 해시 셋에 넣었을 때의 결과를 버킷 단위로 추적해 예측할 수 있다.</li>
+<li>제네릭 배열을 만들 수 없는 이유를 타입 소거와 연결해 설명하고, 해시 셋 구현을 제네릭 인터페이스 뒤로 숨길 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 해시 인덱스만으로 집합이 되는가</h3>
+<p>셋(Set)은 두 가지 성질로 정의되는 자료 구조다. 같은 원소를 두 번 담지 않고, 원소 사이의 순서를 약속하지 않는다. 그래서 셋의 핵심 연산은 "몇 번째에 무엇이 있는가"가 아니라 "이 값이 이미 들어 있는가"다. 원소를 넣는 add조차 먼저 이 질문에 답해야 한다. 이미 있으면 넣지 않아야 하기 때문이다.</p>
+<p>리스트로 셋을 흉내 내면 이 질문 하나에 원소 전체를 훑어야 한다. 원소가 n개면 add 한 번이 O(n)이고, n개를 차례로 넣는 데 드는 비교 횟수는 n의 제곱에 비례한다. 06회에서 본 해시 인덱스는 이 탐색 범위를 줄이는 방법이었다. 값을 배열 크기로 나눈 나머지를 인덱스로 쓰면 값이 있어야 할 칸을 계산으로 바로 찾을 수 있고, 서로 다른 값이 같은 칸으로 몰리는 해시 충돌(hash collision)은 한 칸에 여러 값을 담는 버킷(bucket)으로 받아 낸다.</p>
+<p>이번 회차에서는 그 생각을 실제 셋으로 조립한다. 조립하다 보면 세 가지 질문에 차례로 부딪힌다.</p>
+<ul>
+<li>정수는 나머지 연산으로 인덱스를 만들 수 있다. 그러면 문자열이나 직접 만든 객체처럼 숫자가 아닌 것은 어떻게 배열 인덱스가 되는가.</li>
+<li>셋은 "같은 값"을 걸러 내야 한다. 그 "같다"는 판단은 누가, 어떤 기준으로 하는가.</li>
+<li>인덱스를 정하는 계산과 같음을 정하는 판단이 서로 어긋나면 셋 안에서 무슨 일이 벌어지는가.</li>
+</ul>
+<p>첫 질문의 답이 <code>hashCode()</code>, 둘째 질문의 답이 <code>equals()</code>, 셋째 질문의 답이 이 회차의 본론이다. 구현은 네 단계로 키운다. 정수만 담는 셋, 모든 객체를 담는 셋, 직접 만든 객체를 담았을 때의 문제, 마지막으로 제네릭과 인터페이스를 입힌 셋이다. 클래스 이름과 예제는 모두 이 글에서 새로 만든 것이다.</p>
+
+<h3>1단계: 정수만 담는 해시 셋</h3>
+<p>가장 단순한 형태부터 만든다. 버킷 배열을 하나 두고, 버킷마다 연결 리스트를 하나씩 넣는다. 값이 들어오면 배열 길이로 나눈 나머지를 인덱스로 삼아 그 버킷 하나만 들여다본다.</p>
+<pre><code class="language-java">import java.util.Arrays;
+import java.util.LinkedList;
+
+public class IntHashSet {
+    private static final int DEFAULT_CAPACITY = 10;
+
+    private final LinkedList<Integer>[] buckets;
+    private int size;
+
+    public IntHashSet() {
+        this(DEFAULT_CAPACITY);
+    }
+
+    @SuppressWarnings("unchecked")
+    public IntHashSet(int capacity) {
+        buckets = new LinkedList[capacity];
+        for (int i = 0; i < capacity; i++) {
+            buckets[i] = new LinkedList<>();
+        }
+    }
+
+    public boolean add(int value) {
+        LinkedList<Integer> bucket = buckets[indexOf(value)];
+        if (bucket.contains(value)) {
+            return false;               // 이미 있으면 넣지 않는다
+        }
+        bucket.add(value);
+        size++;
+        return true;
+    }
+
+    public boolean contains(int value) {
+        return buckets[indexOf(value)].contains(value);
+    }
+
+    public boolean remove(int value) {
+        boolean removed = buckets[indexOf(value)].remove(Integer.valueOf(value));
+        if (removed) {
+            size--;
+        }
+        return removed;
+    }
+
+    public int size() {
+        return size;
+    }
+
+    private int indexOf(int value) {
+        return value % buckets.length;
+    }
+
+    @Override
+    public String toString() {
+        return Arrays.toString(buckets) + " size=" + size;
+    }
+}</code></pre>
+<p>세 연산의 뼈대가 똑같다는 점을 먼저 본다. <code>indexOf(value)</code>로 버킷 하나를 고르고, 그 버킷 안에서만 일을 한다. 나머지 아홉 개 버킷은 쳐다보지 않는다. add가 contains와 다른 점은 "없으면 넣는다"가 붙는 것뿐이고, 셋의 "중복 없음"은 바로 이 한 줄(<code>if (bucket.contains(value)) return false;</code>)에서 나온다. 생성자의 <code>new LinkedList[capacity]</code>와 <code>@SuppressWarnings</code>가 눈에 걸리겠지만 그 이유는 4단계에서 따로 다룬다.</p>
+<pre><code class="language-java">public class IntHashSetMain {
+    public static void main(String[] args) {
+        IntHashSet set = new IntHashSet();
+        set.add(1);
+        set.add(2);
+        set.add(14);
+        set.add(99);
+        System.out.println(set.add(9));
+        System.out.println(set.add(99));
+        System.out.println(set);
+
+        System.out.println(set.contains(9));
+        System.out.println(set.contains(19));
+        System.out.println(set.remove(99));
+        System.out.println(set);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">true
+false
+[[], [1], [2], [], [14], [], [], [], [], [99, 9]] size=5
+true
+false
+true
+[[], [1], [2], [], [14], [], [], [], [], [9]] size=4</code></pre>
+<p>9번 버킷을 따라가 보자. <code>add(99)</code>는 99 % 10 = 9를 계산해 9번 버킷으로 간다. 버킷이 비어 있으니 비교할 것이 없고 바로 넣는다. <code>add(9)</code>도 9 % 10 = 9라서 같은 버킷으로 간다. 이번에는 버킷에 99가 있으므로 9와 99를 한 번 비교하고, 다르니 뒤에 붙인다. 버킷은 [99, 9]가 되고 true가 반환된다. 두 번째 <code>add(99)</code>는 같은 버킷에서 첫 원소와 비교하자마자 같다는 것을 알고 false를 돌려준다. 이때 1, 2, 14가 든 다른 버킷은 전혀 건드리지 않았다.</p>
+<p><code>contains(19)</code>가 false인 과정도 같다. 19 % 10 = 9이므로 9번 버킷의 99, 9 두 개와만 비교하고 끝난다. 원소가 다섯 개인데 비교는 두 번이다. 셋 전체의 크기가 아니라 <b>버킷 하나의 길이</b>가 비용을 정한다. 값이 버킷에 고르게 퍼져 있다면 버킷 하나의 평균 길이는 (원소 수 ÷ 버킷 수)이고, 이 값이 작게 유지되는 한 연산 비용은 원소 수와 무관하다.</p>
+
+<h4>메모리에서 본 구조</h4>
+<pre class="diagram">스택                힙
+set ───▶ IntHashSet
+         ├ size = 5
+         └ buckets ───▶ LinkedList[] (길이 10, 칸마다 참조 하나)
+                        [0] ───▶ LinkedList (비어 있음)
+                        [1] ───▶ LinkedList ─▶ Node ─▶ Integer(1)
+                        [2] ───▶ LinkedList ─▶ Node ─▶ Integer(2)
+                        [3] ───▶ LinkedList (비어 있음)
+                        [4] ───▶ LinkedList ─▶ Node ─▶ Integer(14)
+                        [5]~[8]  각각 비어 있는 LinkedList
+                        [9] ───▶ LinkedList ─▶ Node ─▶ Integer(99)
+                                               ⇅
+                                              Node ─▶ Integer(9)</pre>
+<p>배열 칸에 들어 있는 것은 리스트가 아니라 리스트 객체를 가리키는 참조다. 리스트 안의 노드도 값이 아니라 <code>Integer</code> 객체의 참조를 들고 있다. 제네릭의 타입 인자에는 기본형이 올 수 없으므로 <code>add(int)</code>로 받은 값은 <code>bucket.add(value)</code>에서 <code>Integer</code>로 박싱된다. <code>contains(9)</code> 한 번은 나머지 연산 한 번, 배열 칸 읽기 한 번, 그 뒤 리스트 노드를 따라가며 <code>Integer.equals</code>로 비교하는 순서로 진행된다.</p>
+<x-visual id="java-mid2-07-bucket-array-memory" title="버킷 배열의 각 칸이 연결 리스트를 가리키고 값이 나머지 연산으로 버킷에 배치되는 해시 셋의 구조" kind="메모리 구조도" ratio="16:9">
+<x-hint>버킷 배열 10칸과 각 칸에 매달린 연결 리스트, 그리고 99와 9가 같은 9번 버킷으로 들어가는 계산을 한 장에 보여 준다.</x-hint>
+<x-prompt>가로형 16:9의 깔끔한 기술 다이어그램. 왼쪽에 세로로 긴 배열 상자 10칸을 그리고 위에 라벨 "buckets (길이 10)"을 붙인다. 각 칸 왼쪽에 인덱스 숫자 0부터 9를 적는다. 1번 칸에서 오른쪽으로 화살표가 나가 둥근 사각형 "1"을 가리키고, 2번 칸은 "2", 4번 칸은 "14"를 가리킨다. 9번 칸에서 나간 화살표는 둥근 사각형 "99"를 가리키고, "99"에서 다시 화살표가 나가 "9"를 가리킨다. 나머지 칸 옆에는 옅은 회색의 작은 빈 상자를 그리고 라벨 "빈 리스트"를 한 번만 붙인다. 오른쪽 위에 말풍선 두 개 "99 % 10 = 9", "9 % 10 = 9"를 그려 둘 다 9번 칸을 가리키게 한다. 맨 아래에 강조 문구 "같은 인덱스 → 같은 버킷 → 버킷 안에서만 비교"를 넣는다. 흰 배경, 파랑과 주황 두 가지 색만 사용, 장식 없이 평면적인 선 그림.</x-prompt>
+<x-caption>값은 나머지 연산으로 버킷 하나를 고르고, 비교는 그 버킷 안에서만 일어난다.</x-caption>
+</x-visual>
+
+<h4>이 구현에 숨어 있는 세 가지 함정</h4>
+<p>첫째는 <code>remove</code>의 <code>Integer.valueOf(value)</code>다. 이것을 빼고 <code>bucket.remove(value)</code>라고 쓰면 전혀 다른 메서드가 호출된다. <code>LinkedList</code>에는 <code>remove(int index)</code>와 <code>remove(Object o)</code>가 둘 다 있고, 인자가 int면 컴파일러는 박싱이 필요 없는 <code>remove(int index)</code>를 먼저 고른다. 버킷 [99, 9]에서 <code>remove(99)</code>를 부르면 99번째 원소를 지우려다 <code>IndexOutOfBoundsException: Index: 99, Size: 2</code>가 난다. 값이 우연히 유효한 인덱스 범위에 들면 예외도 없이 엉뚱한 원소가 지워지므로 더 나쁘다. "값으로 지운다"는 의도를 <code>Integer</code> 객체를 넘겨 분명히 해야 한다.</p>
+<p>둘째는 음수다. <code>set.add(-3)</code>을 실행하면 <code>ArrayIndexOutOfBoundsException: Index -3 out of bounds for length 10</code>이 난다. 자바의 <code>%</code>는 나머지의 부호가 나누어지는 수(피제수)를 따르기 때문에 -3 % 10은 7이 아니라 -3이다. JLS §15.17.3은 정수 나머지 연산이 <code>(a/b)*b+(a%b) == a</code>를 만족하도록 정의되고, 그 결과는 피제수가 음수일 때만 음수가 될 수 있다고 적는다. 이 문제는 문자열 해시 코드를 다룰 때 다시 만나고, 거기서 고친다.</p>
+<p>셋째는 버킷 수가 고정이라는 점이다. 버킷이 10개인 채로 원소가 1,000개가 되면 버킷 하나에 평균 100개가 들어가고, 연산은 다시 리스트 탐색에 가까워진다. 원소가 늘 때 버킷 배열을 키워 다시 배치하는 방법은 자바가 제공하는 셋 구현을 다루는 08회의 몫으로 남겨 둔다.</p>
+
+<h3>문자열을 숫자로 바꾸기: 문자열 해시 코드</h3>
+<p>정수는 그 자체로 나머지 연산을 할 수 있었다. "AB" 같은 문자열을 버킷에 넣으려면 먼저 문자열을 정수로 바꾸는 계산이 필요하다. 이렇게 임의의 데이터에서 계산해 낸 정수를 해시 코드(hash code), 그 계산을 해시 함수(hash function)라고 부른다. 해시 코드를 배열 길이에 맞게 줄인 것이 해시 인덱스다. 두 단계를 구분해 두면 뒤의 이야기가 쉬워진다. 객체가 책임지는 것은 해시 코드까지이고, 인덱스로 줄이는 일은 셋이 한다.</p>
+<p>출발점은 문자가 이미 숫자라는 사실이다. 자바의 <code>char</code>는 UTF-16 코드 유닛을 나타내는 16비트 부호 없는 정수다(JLS §4.2). 'A'는 65, 'B'는 66, 'a'는 97, '가'는 44032다. 그러니 가장 먼저 떠오르는 방법은 글자 값을 전부 더하는 것이다.</p>
+<pre><code class="language-java">public class StringHashDemo {
+    static int sumHash(String s) {
+        int h = 0;
+        for (int i = 0; i < s.length(); i++) {
+            h += s.charAt(i);
+        }
+        return h;
+    }
+
+    static int polyHash(String s) {
+        int h = 0;
+        for (int i = 0; i < s.length(); i++) {
+            h = 31 * h + s.charAt(i);
+        }
+        return h;
+    }
+
+    public static void main(String[] args) {
+        System.out.println((int) 'A' + " " + (int) 'B' + " " + (int) 'a' + " " + (int) '가');
+        System.out.println(sumHash("AB") + " " + sumHash("BA"));
+        System.out.println(polyHash("AB") + " " + polyHash("BA"));
+        System.out.println("AB".hashCode() + " " + "BA".hashCode());
+        System.out.println("Aa".hashCode() + " " + "BB".hashCode());
+        System.out.println(polyHash("hello") + " " + polyHash("hello "));
+        System.out.println("collection".hashCode());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">65 66 97 44032
+131 131
+2081 2111
+2081 2111
+2112 2112
+99162322 -1220935282
+-1741312354</code></pre>
+
+<h4>더하기만 하면 순서가 사라진다</h4>
+<p><code>sumHash</code>는 "AB"와 "BA"에 똑같이 131을 준다. 덧셈은 순서를 바꿔도 결과가 같으므로 글자의 위치 정보가 통째로 사라진다. 같은 글자로 이루어진 문자열은 모두 한 버킷에 몰린다. 값의 범위도 좁다. 영문 소문자 10글자짜리 문자열의 합은 많아야 1,220('z'가 122)이어서, 버킷을 아무리 늘려도 앞쪽 일부만 쓰게 된다. 해시 함수가 지켜야 할 조건은 "같은 입력에 같은 결과"뿐이지만, 쓸모 있는 해시 함수는 서로 다른 입력을 되도록 서로 다른 값으로 넓게 흩어 놓아야 한다.</p>
+
+<h4>자릿값을 주면 순서가 살아난다</h4>
+<p>십진수 12와 21이 다른 수인 까닭은 자리마다 10의 거듭제곱이 곱해지기 때문이다. 같은 방법을 문자열에 쓴다. 글자 값을 자릿수로 보고, 자리마다 31의 거듭제곱을 곱한다. "AB"는 65×31 + 66 = 2081, "BA"는 66×31 + 65 = 2111이 된다. <code>String.hashCode()</code>의 API 문서는 이 계산을 식으로 못 박아 둔다. 길이가 n인 문자열 s의 해시 코드는 int 연산으로 계산한 <code>s[0]*31^(n-1) + s[1]*31^(n-2) + ... + s[n-1]</code>이고, 빈 문자열의 해시 코드는 0이다.</p>
+<p><code>polyHash</code>의 반복문 <code>h = 31 * h + c</code>는 이 식을 앞 글자부터 한 번의 순회로 계산하는 방법이다. 글자를 하나 받을 때마다 지금까지의 값을 한 자리 올리고(×31) 새 글자를 일의 자리에 더한다. 출력 셋째 줄과 넷째 줄이 같다는 것은 직접 만든 계산이 <code>String.hashCode()</code>와 같은 값을 낸다는 뜻이다.</p>
+<x-visual id="java-mid2-07-string-polynomial-hash" title="문자열 AB와 BA가 자릿값 31을 곱하는 계산을 거쳐 서로 다른 해시 코드가 되는 과정" kind="계산 흐름도" ratio="16:9">
+<x-hint>글자 값을 단순히 더하면 AB와 BA가 같아지지만, 자리마다 31을 곱하면 달라진다는 것을 나란히 보여 준다.</x-hint>
+<x-prompt>가로형 16:9, 좌우 두 칸으로 나눈 비교 다이어그램. 왼쪽 칸 제목은 "더하기만: 순서가 사라진다". 그 아래 두 줄로 "AB → 65 + 66 = 131", "BA → 66 + 65 = 131"을 적고 두 결과 131을 빨간 등호로 묶어 "충돌"이라고 표시한다. 오른쪽 칸 제목은 "자릿값 31: 순서가 남는다". 그 아래 두 줄로 "AB → 65 × 31 + 66 = 2081", "BA → 66 × 31 + 65 = 2111"을 적고 두 결과를 초록색 부등호로 구분한다. 각 문자열의 글자는 네모 타일로 그리고 타일 아래에 숫자 65, 66을 작게 적는다. 맨 아래 가운데에 공식 라벨 "h = 31 × h + 글자"를 넣는다. 흰 배경, 평면적인 선 그림, 글자는 굵은 고딕.</x-prompt>
+<x-caption>자리마다 31을 곱하면 같은 글자로 이루어진 문자열도 서로 다른 해시 코드를 얻는다.</x-caption>
+</x-visual>
+
+<h4>오버플로는 버그가 아니라 계산의 일부다</h4>
+<p>"hello"를 한 글자씩 따라가면 h는 104, 3325, 103183, 3198781, 99162322로 커진다. 여기에 공백 한 글자를 더 붙이면 31 × 99162322 + 32 = 3,074,032,014가 되어야 하는데, int의 최댓값 2,147,483,647을 넘는다. 실제로 나온 값은 -1,220,935,282다. 수학적인 값에서 2의 32제곱(4,294,967,296)을 뺀 값과 같다.</p>
+<p>이것은 예외 상황이 아니다. JLS §15.17.1은 정수 곱셈이 넘치면 결과가 수학적 곱의 하위 비트가 되고 부호가 달라질 수 있으며, 곱셈 연산자는 실행 중 예외를 던지지 않는다고 정한다. 32비트 밖으로 넘친 상위 비트는 버려지고, 남은 32비트의 최상위 비트가 1이면 2의 보수 표현에서 음수로 읽힌다. 해시 코드에 필요한 것은 크기의 의미가 아니라 "같은 문자열이면 언제나 같은 값"이라는 결정성이고, 넘친 비트를 버리는 계산도 입력이 같으면 결과가 같다. 그래서 길이가 조금만 되는 문자열의 해시 코드는 흔히 음수다. "collection"의 해시 코드는 -1741312354다.</p>
+
+<h4>왜 홀수를 곱하는가</h4>
+<p>int 연산은 사실상 2의 32제곱으로 나눈 나머지 위에서 이루어진다. 이 세계에서 짝수를 곱하면 정보가 빠져나간다. 곱하는 수가 2라고 해 보자. 글자를 하나 처리할 때마다 지금까지의 값이 왼쪽으로 한 비트씩 밀린다. 글자가 32개 더 들어오면 처음 글자가 남긴 비트는 전부 32비트 바깥으로 밀려나 사라지고, 그 뒤로는 앞 글자가 무엇이었든 결과가 같아진다.</p>
+<p>홀수를 곱할 때는 이런 일이 없다. 홀수를 곱하는 연산은 32비트 정수 전체를 서로 겹치지 않게 다른 값으로 옮기는 일대일 대응이어서, 서로 다른 두 값에 31을 곱하면 넘침이 있어도 결과가 서로 다르다. 앞 글자의 흔적이 뒤섞일 뿐 지워지지는 않는다. 31에는 계산상의 성질도 하나 있다. 31 = 32 - 1이므로 <code>31 * h</code>는 <code>(h << 5) - h</code>와 언제나 같은 값이다.</p>
+
+<h4>충돌은 없앨 수 없다</h4>
+<p>출력 다섯째 줄을 보면 "Aa"와 "BB"의 해시 코드가 둘 다 2112다. 65×31 + 97 = 2112이고 66×31 + 66 = 2112다. 첫 글자가 1 커지면 31이 늘고, 둘째 글자가 31 작아지면 31이 줄어 상쇄된다. 이런 쌍을 이어 붙인 "AaAa", "AaBB", "BBAa", "BBBB"도 모두 같은 해시 코드(2031744)를 가진다.</p>
+<p>이것은 31이라는 숫자의 결함이 아니다. int가 나타낼 수 있는 값은 2의 32제곱 가지뿐인데 문자열의 가짓수에는 끝이 없다. 어떤 해시 함수를 쓰든 서로 다른 문자열 둘이 같은 해시 코드를 받는 경우가 반드시 생긴다. 따라서 <b>해시 코드가 같다는 것은 같은 값이라는 증거가 될 수 없다.</b> 해시 코드는 후보를 좁히는 데까지만 쓰고, 정말 같은지는 내용을 직접 비교해야 한다. 이 역할 분담이 뒤에서 equals와 hashCode의 관계로 이어진다.</p>
+
+<h4>음수 해시 코드를 인덱스로 바꾸기</h4>
+<pre><code class="language-java">public class IndexDemo {
+    public static void main(String[] args) {
+        int h = "collection".hashCode();
+        System.out.println(h % 10);
+        System.out.println(Math.abs(h) % 10);
+
+        int min = "polygenelubricants".hashCode();
+        System.out.println(min);
+        System.out.println(Math.abs(min));
+        System.out.println(Math.abs(min) % 10);
+
+        System.out.println(Math.floorMod(h, 10));
+        System.out.println(Math.floorMod(min, 10));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">-4
+4
+-2147483648
+-2147483648
+-8
+6
+2</code></pre>
+<p>해시 코드가 음수면 <code>h % 10</code>도 음수(-4)가 되어 배열 인덱스로 쓸 수 없다. 흔히 떠올리는 해법은 <code>Math.abs</code>로 부호를 떼는 것인데, 여기에는 구멍이 하나 있다. int의 최솟값 -2147483648은 대응하는 양수가 int 범위에 없어서 <code>Math.abs</code>가 그 값을 그대로 돌려준다(API 문서에 명시되어 있다). 그리고 해시 코드가 정확히 그 값인 문자열이 실제로 있다. "polygenelubricants"가 그렇다. 이 문자열 하나 때문에 <code>Math.abs(h) % 10</code>은 -8이 되고, 평소에는 멀쩡하던 코드가 특정 입력에서만 <code>ArrayIndexOutOfBoundsException</code>을 낸다.</p>
+<p><code>Math.floorMod(h, n)</code>는 결과의 부호가 나누는 수를 따르므로, n이 양수면 결과는 언제나 0 이상 n 미만이다. 최솟값을 넣어도 2가 나온다. <code>Math.abs</code>를 쓴 결과(4)와 <code>floorMod</code>의 결과(6)가 다르다는 점은 문제가 되지 않는다. 넣을 때와 찾을 때 같은 계산을 쓰기만 하면 된다. 참고로 OpenJDK 21의 <code>HashMap</code>은 배열 길이 n을 2의 거듭제곱으로 유지하고 <code>(n - 1) & hash</code>로 인덱스를 구한다. 비트 AND의 결과는 음수가 될 수 없고 나눗셈도 필요 없다.</p>
+
+<h3>자바의 hashCode(): 모든 객체가 가진 해시 함수</h3>
+<p>문자열에 해시 함수가 필요했듯, 셋에 넣으려는 모든 타입에 "나를 정수로 바꾸는 방법"이 필요하다. 자바는 이 메서드를 최상위 클래스 <code>Object</code>에 두었다. <code>public int hashCode()</code>다. 모든 클래스가 <code>Object</code>를 상속하므로 어떤 객체에든 <code>hashCode()</code>를 부를 수 있고, 클래스마다 자기 내용에 맞게 재정의한다. API 문서는 이 메서드가 <code>HashMap</code> 같은 해시 테이블을 위해 존재한다고 밝히고, 지켜야 할 일반 규약 세 가지를 적는다.</p>
+<ol>
+<li><b>일관성.</b> 한 번의 프로그램 실행 안에서, equals 비교에 쓰이는 정보가 바뀌지 않았다면 같은 객체의 hashCode는 몇 번을 불러도 같은 정수여야 한다. 실행과 실행 사이에서는 값이 달라도 된다.</li>
+<li><b>equals가 같으면 hashCode도 같다.</b> 두 객체가 equals로 같다면 두 객체의 hashCode는 반드시 같은 정수여야 한다.</li>
+<li><b>역은 요구하지 않는다.</b> equals로 다른 두 객체가 서로 다른 hashCode를 가질 필요는 없다. 다만 다른 객체에 다른 값을 주면 해시 테이블의 성능이 좋아질 수 있다.</li>
+</ol>
+<p>둘째와 셋째를 합치면 방향이 하나뿐인 화살표가 된다. "같은 객체 → 같은 해시 코드"는 의무이고, "같은 해시 코드 → 같은 객체"는 성립하지 않아도 된다. 앞에서 본 "Aa"와 "BB"가 셋째 항목의 실례다. 첫째 항목의 "실행 사이에서는 달라도 된다"도 기억해 둔다. 해시 코드를 파일이나 DB에 저장해 두고 다음 실행에서 비교하는 코드는 이 규약에 기대어서는 안 된다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>우편번호와 주소</strong><p>우편물은 먼저 우편번호로 분류함을 정하고, 그 분류함 안에서 주소를 읽어 받는 집을 가린다. 같은 집이면 우편번호가 반드시 같아야 한다. 그렇지 않으면 우편물이 엉뚱한 분류함으로 가서 영영 찾지 못한다. 반대로 우편번호가 같다고 같은 집은 아니다. hashCode가 우편번호, equals가 주소 대조다. 비유가 맞지 않는 곳도 있다. 우편번호는 기관이 정해 주고 오래 유지되지만, 해시 코드는 객체가 자기 내용으로 직접 계산하고 프로그램을 다시 실행하면 달라질 수 있다.</p></aside>
+
+<h4>JDK 클래스들은 어떻게 계산하는가</h4>
+<pre><code class="language-java">import java.util.List;
+import java.util.Objects;
+
+public class HashCodeTour {
+    public static void main(String[] args) {
+        System.out.println(Integer.valueOf(14).hashCode());
+        System.out.println(Integer.valueOf(-3).hashCode());
+        System.out.println(Long.valueOf(1L << 32).hashCode());
+        System.out.println(Boolean.TRUE.hashCode() + " " + Boolean.FALSE.hashCode());
+        System.out.println(Character.valueOf('A').hashCode());
+        System.out.println(Double.valueOf(1.0).hashCode());
+        System.out.println("AB".hashCode());
+        System.out.println(List.of(3, 7).hashCode());
+        System.out.println(Objects.hash(3, 7) + " " + Objects.hash(7, 3));
+        System.out.println(Objects.hashCode(null));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">14
+-3
+1
+1231 1237
+65
+1072693248
+2081
+1061
+1061 1181
+0</code></pre>
+<div class="table-wrap"><table><thead><tr><th>타입</th><th>계산 방법(OpenJDK 21 소스 기준)</th><th>읽는 법</th></tr></thead><tbody>
+<tr><td><code>Integer</code></td><td>값 그대로</td><td>정수는 이미 해시 코드다. 1단계의 셋이 값을 바로 나눈 것과 같다.</td></tr>
+<tr><td><code>Long</code></td><td><code>(int)(value ^ (value >>> 32))</code></td><td>64비트를 32비트로 줄여야 하므로 상위 절반과 하위 절반을 XOR로 접는다.</td></tr>
+<tr><td><code>Boolean</code></td><td>true면 1231, false면 1237</td><td>값이 둘뿐이라 서로 다른 상수 두 개면 충분하다.</td></tr>
+<tr><td><code>Double</code></td><td>비트 표현을 long으로 본 뒤 Long과 같은 방식</td><td>실수도 결국 64비트 묶음이다.</td></tr>
+<tr><td><code>String</code></td><td>글자에 31의 거듭제곱을 곱한 합</td><td>앞 절에서 계산한 그대로다.</td></tr>
+<tr><td><code>List</code></td><td>1에서 시작해 원소마다 <code>31 * h + 원소의 hashCode</code></td><td>문자열과 같은 다항식을 원소에 적용한다. 31×(31×1+3)+7 = 1061.</td></tr>
+</tbody></table></div>
+<p>직접 만든 클래스에서 여러 필드를 묶을 때 쓰는 <code>Objects.hash(a, b, ...)</code>는 인자를 배열로 받아 <code>Arrays.hashCode</code>에 넘기고, 그 계산은 위 표의 <code>List</code>와 같다. 그래서 <code>Objects.hash(3, 7)</code>도 1061이고, 순서를 바꾼 <code>Objects.hash(7, 3)</code>은 1181로 다르다. 가변 인자 메서드이므로 호출할 때마다 인자를 담을 배열이 만들어지고 기본형 인자는 박싱된다는 점은 알아 두자. <code>Objects.hashCode(null)</code>은 0이다. null에는 메서드를 부를 수 없으므로 null의 해시 코드를 0으로 치는 관례를 메서드로 만든 것이다.</p>
+<p><code>String</code>에는 한 가지 장치가 더 있다. 문자열은 불변이라 해시 코드가 변할 일이 없으므로, OpenJDK 21의 <code>String</code>은 처음 계산한 값을 <code>hash</code> 필드에 저장해 두고 다음부터는 그 값을 돌려준다. 계산 결과가 마침 0인 경우를 "아직 계산하지 않음"과 구분하기 위한 <code>hashIsZero</code> 필드도 따로 둔다. 같은 문자열을 해시 셋에서 여러 번 찾아도 긴 문자열 전체를 매번 다시 훑지 않는 이유다.</p>
+
+<h3>한 층 아래: Object의 기본 hashCode는 어디에서 오는가</h3>
+<p>클래스가 <code>hashCode()</code>를 재정의하지 않으면 <code>Object</code>의 구현이 쓰인다. 소스에서 이 메서드는 <code>public native int hashCode();</code>로, 자바 코드가 아니라 JVM이 값을 만들어 준다. API 문서가 이 기본 구현에 대해 말하는 것은 한 문장뿐이다. 합리적으로 가능한 한 서로 다른 객체에 서로 다른 정수를 돌려준다는 것이다. 내용이 같은지는 전혀 보지 않고 "어느 객체인가"만으로 정해지는 값이어서 이것을 identity hash code라고 부른다.</p>
+<pre><code class="language-java">public class IdentityHashDemo {
+    public static void main(String[] args) {
+        Object o1 = new Object();
+        Object o2 = new Object();
+        System.out.println(o1.hashCode() + " " + o2.hashCode());
+        System.out.println(o1.hashCode() == System.identityHashCode(o1));
+        System.out.println(o1 + " / " + Integer.toHexString(o1.hashCode()));
+
+        int before = o1.hashCode();
+        System.gc();
+        System.out.println(before == o1.hashCode());
+
+        String s = new String("AB");
+        System.out.println(s.hashCode() + " " + System.identityHashCode(s));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (숫자는 JVM과 실행 환경에 따라 다르다)"><code class="language-text">705927765 366712642
+true
+java.lang.Object@2a139a55 / 2a139a55
+true
+2081 929338653</code></pre>
+<p>첫 줄의 두 숫자와 마지막 줄의 둘째 숫자는 환경에 따라 달라진다. 변하지 않는 것은 관계다. 둘째 줄은 재정의하지 않은 <code>hashCode()</code>가 <code>System.identityHashCode()</code>와 같은 값이라는 것, 셋째 줄은 <code>Object.toString()</code>이 출력하는 <code>@</code> 뒤의 16진수가 해시 코드를 16진수로 적은 것이라는 점을 보여 준다(<code>Object.toString()</code>의 구현이 <code>getClass().getName() + "@" + Integer.toHexString(hashCode())</code>다). 넷째 줄은 GC를 요청한 뒤에도 값이 같다는 것, 다섯째 줄은 <code>String</code>처럼 hashCode를 재정의한 클래스에서도 <code>System.identityHashCode()</code>로 기본 값을 따로 얻을 수 있다는 것을 보여 준다.</p>
+
+<h4>메모리 주소가 아니다</h4>
+<p>"hashCode의 기본값은 객체의 메모리 주소"라는 설명이 널리 퍼져 있지만, Java 21의 API 문서에는 주소라는 말이 없고 HotSpot의 기본 동작도 그렇지 않다. OpenJDK 21 HotSpot에서 identity hash를 만드는 코드(<code>synchronizer.cpp</code>의 <code>get_next_hash</code>)는 <code>hashCode</code>라는 실험용 VM 옵션 값에 따라 방식을 고르는데, 기본값은 5이고 이 경우 스레드마다 가진 상태로 xor-shift 방식의 의사 난수를 만들어 쓴다. 주소를 그대로 쓰는 방식은 옵션 값 4로만 선택할 수 있는 대안이다. 기본값은 다음 명령으로 확인할 수 있다.</p>
+<pre><code class="language-bash">java -XX:+UnlockExperimentalVMOptions -XX:+PrintFlagsFinal -version | grep hashCode
+# intx hashCode = 5   {experimental} {default}</code></pre>
+<p>주소를 쓰지 않는 까닭은 규약의 첫째 항목에서 나온다. HotSpot의 가비지 컬렉터는 살아 있는 객체를 다른 위치로 옮긴다. 주소가 곧 해시 코드라면 GC가 지나갈 때마다 해시 코드가 바뀌고, 해시 셋에 넣어 둔 객체는 옮겨진 뒤 엉뚱한 버킷에서 찾게 된다. 한 실행 안에서 값이 변하지 않아야 한다는 규약을 지키려면 값이 객체의 위치와 무관해야 한다.</p>
+<p>그래서 HotSpot은 identity hash를 <b>한 번 만들어 객체에 적어 둔다.</b> 모든 객체의 앞머리에는 마크 워드(mark word)라는 헤더가 있고, 64비트 HotSpot(OpenJDK 21)에서는 그 가운데 31비트가 해시 자리다. 객체가 처음 만들어질 때 이 자리는 비어 있다(0이 "아직 없음"을 뜻한다). <code>hashCode()</code>가 처음 불릴 때 값을 생성해 CAS로 헤더에 써 넣고, 그 뒤 호출은 헤더에서 읽기만 한다. GC가 객체를 옮길 때는 헤더도 함께 옮겨지므로 값이 유지된다. 잠금이 무거운 모니터로 팽창한 객체는 모니터가 보관하는 헤더 사본에 값이 들어가지만 원리는 같다.</p>
+<pre class="diagram">new Object() 직후               hashCode() 첫 호출 뒤            GC가 객체를 옮긴 뒤
+┌──────────────────────┐        ┌──────────────────────┐        ┌──────────────────────┐
+│ mark word            │        │ mark word            │        │ mark word            │
+│   hash 자리 = 0 (없음)│  ───▶  │   hash 자리 = 생성값  │  ───▶  │   hash 자리 = 같은 값 │
+│ 클래스 포인터          │        │ 클래스 포인터          │        │ 클래스 포인터          │
+└──────────────────────┘        └──────────────────────┘        └──────────────────────┘
+  주소 X                           주소 X                           주소 Y (바뀜)</pre>
+<x-visual id="java-mid2-07-identity-hash-header" title="HotSpot에서 identity hash가 처음 호출 때 생성되어 객체 헤더에 저장되고 GC 이동 뒤에도 유지되는 과정" kind="메모리 구조도" ratio="16:9">
+<x-hint>기본 hashCode가 주소가 아니라 헤더에 저장된 값이라는 점, 그래서 객체가 옮겨져도 변하지 않는다는 점을 세 장면으로 보여 준다.</x-hint>
+<x-prompt>가로형 16:9, 왼쪽에서 오른쪽으로 이어지는 세 장면. 각 장면에는 위아래 두 칸으로 나뉜 객체 상자가 있다. 위 칸 라벨은 "마크 워드", 아래 칸 라벨은 "필드". 첫 장면 제목 "객체 생성 직후": 마크 워드 칸 안에 작은 슬롯을 그리고 "hash: 비어 있음"이라고 적는다. 둘째 장면 제목 "hashCode() 첫 호출": 주사위 아이콘에서 슬롯으로 화살표를 그리고 슬롯에 "hash: 2a139a55"를 적는다. 셋째 장면 제목 "GC가 객체를 이동": 객체 상자가 힙 영역의 다른 위치로 옮겨진 모습을 점선 화살표로 표현하고 슬롯에는 여전히 "hash: 2a139a55"를 적는다. 각 장면 아래에 주소 라벨을 붙인다: 첫째와 둘째는 "주소 X", 셋째는 "주소 Y". 맨 아래에 강조 문구 "주소는 바뀌어도 해시 코드는 그대로"를 넣는다. 흰 배경, 차분한 파랑과 회색, 평면적인 선 그림.</x-prompt>
+<x-caption>기본 해시 코드는 처음 요청될 때 만들어져 객체 헤더에 저장된다. 객체의 위치와는 무관하다.</x-caption>
+</x-visual>
+<p>이 절에서 가져갈 결론은 하나다. <code>new</code>로 만든 두 객체는 필드 값이 완전히 같아도 기본 hashCode가 서로 다르다. 내용이 아니라 객체마다 따로 만들어 붙인 값이기 때문이다. 이 사실이 뒤에서 직접 만든 객체를 셋에 넣을 때 문제를 일으킨다.</p>
+
+<h3>2단계: 모든 객체를 담는 해시 셋</h3>
+<p>이제 정수 전용 셋을 일반화할 수 있다. 바꿀 곳은 두 군데다. 원소 타입을 <code>Object</code>로 넓히고, 인덱스를 값 자체가 아니라 <code>value.hashCode()</code>에서 구한다. 음수 해시 코드에 대비해 나머지 연산도 <code>Math.floorMod</code>로 바꾼다.</p>
+<pre><code class="language-java">import java.util.Arrays;
+import java.util.LinkedList;
+
+public class ObjectHashSet {
+    private final LinkedList<Object>[] buckets;
+    private int size;
+
+    @SuppressWarnings("unchecked")
+    public ObjectHashSet(int capacity) {
+        buckets = new LinkedList[capacity];
+        for (int i = 0; i < capacity; i++) {
+            buckets[i] = new LinkedList<>();
+        }
+    }
+
+    public boolean add(Object value) {
+        LinkedList<Object> bucket = buckets[indexOf(value)];
+        if (bucket.contains(value)) {   // 내부에서 value.equals(원소)를 호출한다
+            return false;
+        }
+        bucket.add(value);
+        size++;
+        return true;
+    }
+
+    public boolean contains(Object value) {
+        return buckets[indexOf(value)].contains(value);
+    }
+
+    public boolean remove(Object value) {
+        boolean removed = buckets[indexOf(value)].remove(value);
+        if (removed) {
+            size--;
+        }
+        return removed;
+    }
+
+    public int size() {
+        return size;
+    }
+
+    private int indexOf(Object value) {
+        return Math.floorMod(value.hashCode(), buckets.length);
+    }
+
+    @Override
+    public String toString() {
+        return Arrays.toString(buckets) + " size=" + size;
+    }
+}</code></pre>
+<pre><code class="language-java">public class ObjectHashSetMain {
+    public static void main(String[] args) {
+        ObjectHashSet set = new ObjectHashSet(10);
+        set.add("AB");
+        set.add("BA");
+        set.add("Aa");
+        set.add("BB");
+        set.add("collection");
+        set.add(14);
+        System.out.println(set.add(new String("AB")));
+        System.out.println(set);
+        System.out.println(set.contains("BB"));
+        System.out.println(set.contains("Bb"));
+        System.out.println(set.remove("Aa"));
+        System.out.println(set);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">false
+[[], [AB, BA], [Aa, BB], [], [14], [], [collection], [], [], []] size=6
+true
+false
+true
+[[], [AB, BA], [BB], [], [14], [], [collection], [], [], []] size=5</code></pre>
+<p>원소마다 버킷이 정해진 과정을 적어 보면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>원소</th><th>hashCode()</th><th>floorMod(해시 코드, 10)</th><th>비고</th></tr></thead><tbody>
+<tr><td>"AB"</td><td>2081</td><td>1</td><td></td></tr>
+<tr><td>"BA"</td><td>2111</td><td>1</td><td>해시 코드는 다르지만 인덱스가 같다</td></tr>
+<tr><td>"Aa"</td><td>2112</td><td>2</td><td></td></tr>
+<tr><td>"BB"</td><td>2112</td><td>2</td><td>해시 코드부터 같다</td></tr>
+<tr><td>"collection"</td><td>-1741312354</td><td>6</td><td>음수여도 인덱스는 0~9 안이다</td></tr>
+<tr><td>14 (Integer)</td><td>14</td><td>4</td><td>박싱된 Integer의 hashCode</td></tr>
+</tbody></table></div>
+<p>충돌에 두 종류가 있다는 것이 여기서 드러난다. "AB"와 "BA"는 해시 코드가 다른데 버킷 수 10으로 줄이는 과정에서 같은 인덱스가 되었다. 버킷을 늘리면 풀릴 수 있는 충돌이다. "Aa"와 "BB"는 해시 코드 자체가 같아서 버킷을 아무리 늘려도 같은 버킷에 들어간다. 어느 쪽이든 버킷 안에서 내용을 비교해 구분하므로 셋의 동작은 올바르다.</p>
+<p>출력 첫 줄의 false가 이 단계의 요점이다. <code>new String("AB")</code>는 리터럴 "AB"와 다른 객체다. <code>==</code>로 비교하면 false다. 그런데도 셋은 이것을 중복으로 판정했다. 해시 코드가 2081로 같아 같은 버킷으로 갔고, 버킷 안의 비교가 <code>==</code>가 아니라 <code>equals</code>였기 때문이다. <code>LinkedList.contains(o)</code>는 내부에서 노드를 차례로 돌며 <code>o.equals(노드의 원소)</code>를 호출한다(OpenJDK 21 <code>LinkedList.indexOf</code>). 셋이 말하는 "같다"는 참조가 같다는 뜻이 아니라 equals가 true라는 뜻이다.</p>
+
+<h4>하나의 구현이 모든 타입에 통하는 이유</h4>
+<p><code>indexOf</code>를 <code>javap -c -p</code>로 열어 보면 컴파일러가 남긴 것은 다음이 전부다.</p>
+<pre data-label="javap -c -p ObjectHashSet (일부)"><code class="language-text">private int indexOf(java.lang.Object);
+  Code:
+     0: aload_1
+     1: invokevirtual #34   // Method java/lang/Object.hashCode:()I
+     4: aload_0
+     5: getfield      #9    // Field buckets:[Ljava/util/LinkedList;
+     8: arraylength
+     9: invokestatic  #38   // Method java/lang/Math.floorMod:(II)I
+    12: ireturn</code></pre>
+<p>클래스 파일에 적힌 호출 대상은 <code>Object.hashCode</code>다. 컴파일러는 <code>value</code>가 <code>Object</code>라는 것밖에 모른다. 그런데 실행하면 "AB"에 대해서는 <code>String.hashCode</code>가, 14에 대해서는 <code>Integer.hashCode</code>가 돈다. <code>invokevirtual</code>은 스택에 놓인 객체의 실제 클래스에서 메서드를 골라 실행하는 명령이기 때문이다. 기본편에서 본 가상 메서드 호출(virtual method invocation)이 그대로 쓰인다. 셋은 원소가 무슨 타입인지 몰라도 되고, 각 타입이 "자기 해시 코드를 계산하는 법"과 "자기와 같은지 판단하는 법"을 스스로 들고 온다.</p>
+<aside class="note">이 구현은 null을 넣으면 <code>value.hashCode()</code>에서 <code>NullPointerException</code>이 난다. <code>java.util.HashSet</code>은 null 원소를 허용한다고 API 문서에 적혀 있고, 내부에서 null의 해시를 0으로 처리한다.</aside>
+<p>남은 불편은 타입이다. 원소 타입이 <code>Object</code>라서 문자열과 정수가 한 셋에 섞여 들어갔고, 컴파일러는 이것을 막지 못한다. 이 문제는 4단계에서 제네릭으로 푼다. 그 전에 더 중요한 문제를 먼저 본다.</p>
+
+<h3>3단계: 직접 만든 객체를 넣으면</h3>
+<p><code>String</code>과 <code>Integer</code>가 셋에서 잘 동작한 것은 두 클래스가 <code>hashCode()</code>와 <code>equals()</code>를 내용 기준으로 재정의해 두었기 때문이다. 직접 만든 클래스는 그렇지 않다. 공연장 좌석을 행과 열로 나타내는 클래스를 네 가지 모습으로 만들어 차이를 본다. 필드는 모두 같고, 무엇을 재정의했는지만 다르다.</p>
+<pre><code class="language-java">import java.util.Objects;
+
+public class SeatCases {
+
+    // (1) 둘 다 재정의하지 않음
+    static class SeatPlain {
+        final int row, col;
+        SeatPlain(int row, int col) { this.row = row; this.col = col; }
+        @Override public String toString() { return "(" + row + "," + col + ")"; }
+    }
+
+    // (2) hashCode만 재정의
+    static class SeatHashOnly {
+        final int row, col;
+        SeatHashOnly(int row, int col) { this.row = row; this.col = col; }
+        @Override public int hashCode() { return Objects.hash(row, col); }
+        @Override public String toString() { return "(" + row + "," + col + ")"; }
+    }
+
+    // (3) equals만 재정의
+    static class SeatEqualsOnly {
+        final int row, col;
+        SeatEqualsOnly(int row, int col) { this.row = row; this.col = col; }
+        @Override public boolean equals(Object o) {
+            return o instanceof SeatEqualsOnly s && row == s.row && col == s.col;
+        }
+        @Override public String toString() { return "(" + row + "," + col + ")"; }
+    }
+
+    // (4) 둘 다 재정의
+    static class Seat {
+        final int row, col;
+        Seat(int row, int col) { this.row = row; this.col = col; }
+        @Override public boolean equals(Object o) {
+            return o instanceof Seat s && row == s.row && col == s.col;
+        }
+        @Override public int hashCode() { return Objects.hash(row, col); }
+        @Override public String toString() { return "(" + row + "," + col + ")"; }
+    }
+
+    public static void main(String[] args) {
+        ObjectHashSet s1 = new ObjectHashSet(10);
+        s1.add(new SeatPlain(3, 7));
+        s1.add(new SeatPlain(3, 7));
+        System.out.println("(1) " + s1 + " contains=" + s1.contains(new SeatPlain(3, 7)));
+
+        ObjectHashSet s2 = new ObjectHashSet(10);
+        s2.add(new SeatHashOnly(3, 7));
+        s2.add(new SeatHashOnly(3, 7));
+        System.out.println("(2) " + s2 + " contains=" + s2.contains(new SeatHashOnly(3, 7)));
+
+        ObjectHashSet s3 = new ObjectHashSet(10);
+        s3.add(new SeatEqualsOnly(3, 7));
+        s3.add(new SeatEqualsOnly(3, 7));
+        System.out.println("(3) " + s3 + " contains=" + s3.contains(new SeatEqualsOnly(3, 7)));
+
+        ObjectHashSet s4 = new ObjectHashSet(10);
+        s4.add(new Seat(3, 7));
+        s4.add(new Seat(3, 7));
+        System.out.println("(4) " + s4 + " contains=" + s4.contains(new Seat(3, 7)));
+    }
+}</code></pre>
+<pre data-label="실행 결과 ((1)과 (3)의 버킷 위치는 실행 환경에 따라 다르다)"><code class="language-text">(1) [[], [], [], [(3,7)], [], [(3,7)], [], [], [], []] size=2 contains=false
+(2) [[], [(3,7), (3,7)], [], [], [], [], [], [], [], []] size=2 contains=false
+(3) [[(3,7)], [], [], [], [], [], [], [], [(3,7)], []] size=2 contains=false
+(4) [[], [(3,7)], [], [], [], [], [], [], [], []] size=1 contains=true</code></pre>
+<p>먼저 (1)만 본다. 3행 7열 좌석을 두 번 넣었더니 둘 다 들어갔고, 같은 좌석이 있느냐고 물으니 없다고 답한다. 셋으로서 완전히 실패한 모습이다. 그런데 셋의 코드는 2단계에서 문자열로 검증한 그대로다. 달라진 것은 원소 쪽이다.</p>
+<p><code>SeatPlain</code>은 아무것도 재정의하지 않았으므로 <code>Object</code>의 구현을 물려받는다. <code>Object.hashCode()</code>는 앞 절에서 본 identity hash여서 <code>new</code>로 만든 세 객체가 저마다 다른 값을 갖고, 그 값에 따라 제각기 다른 버킷으로 간다. <code>Object.equals()</code>는 <code>this == obj</code>, 곧 참조가 같은지를 본다. 셋의 관점에서 이 세 객체는 서로 아무 관계가 없는 원소다.</p>
+<p>여기서 드러나는 것이 동일성(identity)과 동등성(equality)의 차이다. 동일성은 두 참조가 같은 객체를 가리키는가이고 <code>==</code>로 확인한다. 동등성은 두 객체를 같은 것으로 취급할 것인가이고 <code>equals()</code>로 확인한다. 무엇을 같다고 볼지는 JVM이 알 수 없는 도메인의 결정이다. 좌석이라면 행과 열이 같을 때 같은 좌석이라고 정하는 것이 자연스럽고, 그 결정을 코드로 적는 자리가 <code>equals()</code>다.</p>
+<p><code>equals()</code>도 아무렇게나 쓸 수 있는 메서드는 아니다. API 문서는 null이 아닌 참조에 대해 다섯 가지를 요구한다. 자기 자신과는 같아야 하고(반사성), x가 y와 같으면 y도 x와 같아야 하며(대칭성), x와 y가 같고 y와 z가 같으면 x와 z도 같아야 한다(추이성). 비교에 쓰는 정보가 바뀌지 않는 한 결과가 변하지 않아야 하고(일관성), null과 비교하면 false여야 한다. (4)의 <code>o instanceof Seat s && row == s.row && col == s.col</code>은 이 조건을 만족하는 가장 짧은 형태다. <code>instanceof</code>는 null에 대해 false이므로 null 검사가 따로 필요 없고, 타입이 맞으면 변수 <code>s</code>에 바로 담아 필드를 비교한다.</p>
+
+<h3>equals와 hashCode의 중요성 1: 하나만 재정의하면 생기는 일</h3>
+<p>"같다"를 equals로 정의해야 한다는 것까지 왔다. 그러면 equals만 고치면 되는가, 아니면 hashCode만 고쳐도 되는가. 해시 셋의 조회는 두 단계다. hashCode로 버킷을 고르고, 그 버킷 안에서 equals로 같은 원소를 찾는다. 두 단계 중 어디에서 끊기는지를 (2)와 (3)이 각각 보여 준다.</p>
+<pre class="diagram">contains(x)의 두 단계
+
+  x.hashCode() ──▶ 인덱스 계산 ──▶ 버킷 하나 선택        ① 어디를 볼 것인가
+                                      │
+                                      ▼
+                         버킷 안의 원소 e마다 x.equals(e)   ② 그 안에 같은 것이 있는가
+                                      │
+                         하나라도 true ──▶ 있다
+                         모두 false   ──▶ 없다
+
+  ①에서 다른 버킷으로 가면 ②는 정답 근처에도 가지 못한다.
+  ②가 항상 false면 ①이 정확해도 찾지 못한다.</pre>
+
+<h4>(2) hashCode만 재정의한 경우: 같은 버킷까지는 간다</h4>
+<p><code>SeatHashOnly</code>의 해시 코드는 <code>Objects.hash(3, 7)</code> = 1061이고, 10으로 줄이면 1이다. 세 객체 모두 1번 버킷으로 간다. 첫 단계는 통과한 것이다. 문제는 둘째 단계다. equals를 재정의하지 않았으므로 버킷 안의 비교는 <code>Object.equals</code>, 곧 참조 비교다. 두 번째로 넣는 객체는 첫 번째와 다른 객체이니 "없다"는 판정을 받고 같은 버킷에 나란히 들어간다. 출력의 <code>[(3,7), (3,7)]</code>이 그 흔적이다. <code>contains</code>도 올바른 버킷까지 가서 두 원소와 비교하지만 둘 다 참조가 다르므로 false다. 이 실패는 실행할 때마다 똑같이 일어난다.</p>
+
+<h4>(3) equals만 재정의한 경우: 대부분 엉뚱한 버킷으로 간다</h4>
+<p><code>SeatEqualsOnly</code>는 내용이 같으면 equals가 true다. 그런데 hashCode는 identity hash 그대로여서 객체마다 다르다. 출력에서 두 객체는 0번과 8번 버킷에 따로 들어갔다. 두 번째 add는 자기 해시 코드가 가리키는 버킷만 보았고, 거기에는 아무것도 없었으니 equals는 한 번도 호출되지 않았다. 공들여 쓴 equals가 실행될 기회조차 얻지 못한 것이다. <code>contains</code>에 넘긴 세 번째 객체도 자기 해시 코드가 가리키는 버킷만 보고 false를 돌려준다.</p>
+<p>이 경우가 (2)보다 다루기 어려운 까닭은 결과가 매번 같지 않기 때문이다. identity hash가 우연히 같은 인덱스로 줄어들면 두 객체가 같은 버킷에서 만나고, 그때는 equals가 호출되어 중복이 걸러진다. 버킷이 10개이고 identity hash가 버킷에 고르게 퍼진다고 가정하면, 두 번째 객체가 첫 번째와 같은 버킷에 떨어질 가능성은 열 번에 한 번꼴이다. 버킷이 많아질수록 이 우연은 드물어진다. 테스트에서는 가끔 통과하고 운영에서는 거의 항상 실패하는 종류의 버그가 된다.</p>
+<p>이 실수는 컴파일러가 알려 주기도 한다. <code>javac -Xlint:all</code>로 컴파일하면 <code>[overrides] Class SeatEqualsOnly overrides equals, but neither it nor any superclass overrides hashCode method</code>라는 경고가 나온다. 규약의 둘째 항목(equals가 같으면 hashCode도 같아야 한다)을 어긴 것이 정확히 이 경우다. <code>Object.equals()</code>의 API 문서도 equals를 재정의하면 일반적으로 hashCode도 재정의해야 한다고 따로 적어 둔다.</p>
+
+<h4>(4) 둘 다 재정의한 경우</h4>
+<p><code>Seat</code>는 같은 필드(row, col)로 hashCode와 equals를 모두 정의했다. 내용이 같은 객체는 같은 해시 코드 1061을 받아 같은 1번 버킷으로 가고, 그 안에서 equals가 true를 돌려준다. 두 번째 add는 거절되고 size는 1, contains는 true다. 네 경우를 표로 모으면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>재정의한 것</th><th>① 내용이 같은 객체가 같은 버킷으로 가는가</th><th>② 버킷 안에서 같다고 판정되는가</th><th>결과</th></tr></thead><tbody>
+<tr><td>없음</td><td>아니다(우연히만)</td><td>아니다(참조 비교)</td><td>중복 저장, 조회 실패</td></tr>
+<tr><td>hashCode만</td><td>그렇다</td><td>아니다(참조 비교)</td><td>같은 버킷에 중복 저장, 조회 실패. 항상 재현된다</td></tr>
+<tr><td>equals만</td><td>아니다(우연히만)</td><td>만나기만 하면 그렇다</td><td>대부분 중복 저장과 조회 실패. 가끔 정상처럼 보인다</td></tr>
+<tr><td>둘 다</td><td>그렇다</td><td>그렇다</td><td>정상</td></tr>
+</tbody></table></div>
+<x-visual id="java-mid2-07-equals-hashcode-four-cases" title="equals와 hashCode의 재정의 조합 네 가지에서 내용이 같은 두 객체가 버킷에 배치되는 모습 비교" kind="비교 다이어그램" ratio="16:9">
+<x-hint>네 가지 조합마다 내용이 같은 좌석 객체 두 개가 어느 버킷에 들어가고 중복으로 걸러지는지를 한눈에 비교한다.</x-hint>
+<x-prompt>가로형 16:9, 2행 2열의 네 패널로 나눈 비교 다이어그램. 각 패널에는 가로로 늘어선 버킷 5칸과, 위에서 버킷으로 내려오는 좌석 카드 두 장이 있다. 카드에는 모두 "(3,7)"이라고 적는다. 왼쪽 위 패널 제목 "둘 다 없음": 두 카드가 서로 다른 버킷에 들어가고 빨간 표시 "중복 저장". 오른쪽 위 패널 제목 "hashCode만": 두 카드가 같은 버킷에 나란히 들어가고 두 카드 사이에 빨간 부등호와 문구 "참조가 달라 다르다고 판정". 왼쪽 아래 패널 제목 "equals만": 두 카드가 서로 다른 버킷에 들어가고 문구 "equals가 호출되지 않음". 오른쪽 아래 패널 제목 "둘 다 재정의": 첫 카드만 버킷에 들어가고 둘째 카드는 버킷 입구에서 초록색 표시 "중복이라 거절"과 함께 튕겨 나온다. 흰 배경, 실패 패널은 옅은 빨강 테두리, 성공 패널은 옅은 초록 테두리, 평면적인 선 그림.</x-prompt>
+<x-caption>hashCode는 같은 버킷으로 모으는 일을, equals는 버킷 안에서 같음을 판정하는 일을 맡는다. 둘 중 하나만 있으면 셋은 중복을 걸러 내지 못한다.</x-caption>
+</x-visual>
+<aside class="keyidea"><span>이 장의 핵심</span><p>해시 셋에서 hashCode는 "어느 버킷을 볼 것인가"를, equals는 "그 버킷 안에 같은 것이 있는가"를 정한다. 두 메서드는 한 가지 질문의 앞뒤 절반이므로 반드시 같은 필드를 기준으로 함께 재정의한다. equals가 같다고 하는 두 객체가 서로 다른 버킷으로 가는 순간, 셋은 조용히 틀린 답을 낸다.</p></aside>
+
+<h3>equals와 hashCode의 중요성 2: 호출 순서, 그리고 규약이 깨지는 다른 길</h3>
+<p>두 메서드를 모두 재정의하면 끝나는 것은 아니다. 언제 몇 번 호출되는지를 알아야 비용을 가늠할 수 있고, 규약을 지킨 것처럼 보이는데도 셋이 망가지는 경우가 두 가지 더 있다. 먼저 호출 순서를 눈으로 본다. 이번에는 직접 만든 셋이 아니라 <code>java.util.HashSet</code>에 넣고, 두 메서드가 불릴 때마다 출력하게 한다.</p>
+<pre><code class="language-java">import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
+
+public class TraceSeat {
+    final String name;
+    final int row, col;
+
+    TraceSeat(String name, int row, int col) {
+        this.name = name; this.row = row; this.col = col;
+    }
+
+    @Override
+    public int hashCode() {
+        int h = Objects.hash(row, col);
+        System.out.println("  " + name + ".hashCode() -> " + h);
+        return h;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        boolean r = o instanceof TraceSeat s && row == s.row && col == s.col;
+        System.out.println("  " + name + ".equals(" + ((TraceSeat) o).name + ") -> " + r);
+        return r;
+    }
+
+    public static void main(String[] args) {
+        Set<TraceSeat> set = new HashSet<>();
+        TraceSeat a = new TraceSeat("a", 3, 7);
+        TraceSeat b = new TraceSeat("b", 3, 7);   // a와 내용이 같다
+        TraceSeat c = new TraceSeat("c", 2, 38);  // 해시 코드만 a와 같다
+        TraceSeat d = new TraceSeat("d", 5, 1);   // 전혀 다르다
+
+        System.out.println("add(a)"); System.out.println("  => " + set.add(a));
+        System.out.println("add(a)"); System.out.println("  => " + set.add(a));
+        System.out.println("add(b)"); System.out.println("  => " + set.add(b));
+        System.out.println("add(c)"); System.out.println("  => " + set.add(c));
+        System.out.println("add(d)"); System.out.println("  => " + set.add(d));
+        System.out.println("contains(b)"); System.out.println("  => " + set.contains(b));
+        System.out.println("size = " + set.size());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">add(a)
+  a.hashCode() -> 1061
+  => true
+add(a)
+  a.hashCode() -> 1061
+  => false
+add(b)
+  b.hashCode() -> 1061
+  b.equals(a) -> true
+  => false
+add(c)
+  c.hashCode() -> 1061
+  c.equals(a) -> false
+  => true
+add(d)
+  d.hashCode() -> 1117
+  => true
+contains(b)
+  b.hashCode() -> 1061
+  b.equals(a) -> true
+  => true
+size = 3</code></pre>
+<p>한 줄씩 읽어 보자.</p>
+<ul>
+<li><b>첫 add(a).</b> hashCode가 한 번 불리고 equals는 불리지 않는다. 해당 버킷이 비어 있어 비교할 상대가 없다.</li>
+<li><b>두 번째 add(a).</b> 같은 객체를 다시 넣었다. hashCode는 불렸지만 equals는 불리지 않았는데도 false가 나왔다. <code>HashMap</code>이 equals보다 먼저 참조가 같은지를 확인하기 때문이다.</li>
+<li><b>add(b).</b> b는 a와 다른 객체지만 해시 코드가 같다. 참조가 다르므로 <code>b.equals(a)</code>가 호출되고, true이므로 넣지 않는다. equals를 부르는 쪽이 새로 들어온 객체이고 인자가 이미 들어 있던 원소라는 점도 보인다.</li>
+<li><b>add(c).</b> c는 (2, 38)이다. 31×(31+2)+38 = 1061로 a와 해시 코드가 같지만 내용은 다르다. equals가 false를 돌려주어 새 원소로 들어간다. 해시 코드의 충돌을 equals가 풀어 주는 장면이다.</li>
+<li><b>add(d).</b> 해시 코드가 1117로 다르다. equals는 호출되지 않는다.</li>
+<li><b>contains(b).</b> 조회도 add와 같은 순서다. hashCode 한 번, 후보에 대해 equals 한 번.</li>
+</ul>
+<p>이 순서는 OpenJDK 21 <code>HashMap</code>의 비교식에 그대로 적혀 있다. <code>HashSet</code>은 내부에 <code>HashMap</code>을 두고 일을 맡기는데, 그 안에서 후보 노드 p와 찾는 키를 견주는 조건이 다음과 같다.</p>
+<pre><code class="language-java">if (p.hash == hash &&
+    ((k = p.key) == key || (key != null && key.equals(k))))</code></pre>
+<p>세 가지를 싼 것부터 차례로 확인한다. 노드에 저장해 둔 해시 값이 같은가(정수 비교 한 번), 참조가 같은가(주소 비교 한 번), 그래도 아니면 equals를 부른다. 해시가 다르면 뒤는 평가하지 않으므로, 해시 코드가 다른 원소에 대해서는 같은 버킷에 있더라도 equals가 호출되지 않는다. 우리 구현은 해시 값을 따로 저장하지 않아 버킷 안의 모든 원소에 equals를 부르지만, 결과는 같다. 정리하면 hashCode는 연산마다 정확히 한 번, equals는 해시가 같은 후보에 대해서만 불린다. hashCode는 빨라야 하고, equals는 정확해야 한다.</p>
+
+<h4>규약은 지켰지만 쓸모없는 hashCode</h4>
+<p>규약의 셋째 항목은 다른 객체가 같은 해시 코드를 가져도 된다고 했다. 그렇다면 모든 객체가 같은 값을 돌려줘도 규약 위반이 아니다. 실제로 해 보면 무슨 일이 생기는지 equals 호출 횟수로 센다.</p>
+<pre><code class="language-java">public class ConstantHashDemo {
+    static int equalsCalls;
+
+    static class Key {
+        final int id;
+        Key(int id) { this.id = id; }
+        @Override public int hashCode() { return 1; }      // 규약 위반은 아니다
+        @Override public boolean equals(Object o) {
+            equalsCalls++;
+            return o instanceof Key k && k.id == id;
+        }
+    }
+
+    public static void main(String[] args) {
+        ObjectHashSet set = new ObjectHashSet(10);
+        for (int i = 0; i < 1000; i++) {
+            set.add(new Key(i));
+        }
+        System.out.println(set.size() + " " + equalsCalls);
+
+        equalsCalls = 0;
+        System.out.println(set.contains(new Key(-1)) + " " + equalsCalls);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">1000 499500
+false 1000</code></pre>
+<p>셋은 틀린 답을 내지 않는다. 1,000개가 모두 들어갔고 없는 값은 없다고 답한다. 하지만 모든 원소가 1번 버킷 하나에 몰려, i번째 add는 앞서 들어간 i개와 전부 비교한다. 0 + 1 + … + 999 = 499,500번이다. 없는 값을 찾는 contains 한 번에도 equals가 1,000번 불린다. 버킷 배열은 있으나 마나고, 셋은 연결 리스트 하나가 되었다. 규약의 둘째 항목은 정확성의 조건이고, 셋째 항목 끝에 붙은 "다른 값을 주면 성능이 좋아질 수 있다"는 성능의 조건이다. <code>HashSet</code>의 API 문서가 기본 연산의 상수 시간 성능을 약속하면서 "해시 함수가 원소를 버킷에 적절히 분산시킨다는 가정 아래"라는 단서를 다는 것도 같은 이야기다.</p>
+
+<h4>넣은 뒤에 내용을 바꾸면</h4>
+<p>두 메서드를 올바르게 재정의하고 해시도 잘 퍼지는데 셋이 망가지는 경우가 남았다. 셋에 들어 있는 객체의 필드를 바꾸는 것이다.</p>
+<pre><code class="language-java">import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
+
+public class MutableKey {
+    static class Tag {
+        String name;                      // final이 아니다
+        Tag(String name) { this.name = name; }
+        @Override public boolean equals(Object o) {
+            return o instanceof Tag t && Objects.equals(name, t.name);
+        }
+        @Override public int hashCode() { return Objects.hashCode(name); }
+        @Override public String toString() { return name; }
+    }
+
+    public static void main(String[] args) {
+        Set<Tag> set = new HashSet<>();
+        Tag tag = new Tag("AB");
+        set.add(tag);
+
+        tag.name = "BA";                  // 셋 안에 있는 채로 내용을 바꾼다
+
+        System.out.println(set.contains(tag));           // (1)
+        System.out.println(set.contains(new Tag("AB"))); // (2)
+        System.out.println(set.contains(new Tag("BA"))); // (3)
+        System.out.println(set.remove(tag));             // (4)
+        System.out.println(set.size() + " " + set);      // (5)
+        System.out.println(set.add(tag));                // (6)
+        System.out.println(set.size() + " " + set);      // (7)
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">false
+false
+false
+false
+1 [BA]
+true
+2 [BA, BA]</code></pre>
+<p>(5)를 보면 객체는 분명히 셋 안에 있다. 그런데 어떤 방법으로도 찾을 수 없다. 넣을 때 해시 코드는 "AB"의 2081이었고, 셋은 그 값으로 정한 버킷에 객체를 걸어 두었다. 기본 버킷 수 16에서 2081은 1번 버킷이다. 필드를 바꾼 뒤 객체의 해시 코드는 "BA"의 2111이 되었고, 이 값은 15번 버킷을 가리킨다.</p>
+<ul>
+<li>(1)과 (3)은 새 해시 코드 2111로 15번 버킷을 찾아간다. 그곳은 비어 있다.</li>
+<li>(2)는 옛 내용 "AB"로 찾는다. 해시 코드 2081로 1번 버킷까지는 정확히 도착하고 저장된 해시 값도 일치한다. 그러나 마지막 equals에서 "AB"와 지금의 "BA"를 비교해 false가 된다.</li>
+<li>(4)의 remove도 조회에 실패하므로 지우지 못한다. 이 객체는 셋을 통째로 비우거나 순회하며 지우기 전에는 빠져나오지 않는다.</li>
+<li>(6)에서 같은 객체를 다시 add하면 15번 버킷이 비어 있으니 성공한다. (7)의 셋에는 동일한 객체가 두 번 들어 있다. 중복이 없다는 셋의 성질이 깨졌다.</li>
+</ul>
+<p>hashCode 규약의 첫째 항목을 다시 읽어 보면, 일관성은 "equals 비교에 쓰이는 정보가 바뀌지 않는 한"이라는 조건 아래의 약속이다. 필드를 바꾸면 해시 코드가 바뀌는 것은 규약 위반이 아니다. 감당하지 못하는 쪽은 넣는 순간의 해시 코드로 위치를 정해 둔 셋이다. <code>Set</code> 인터페이스의 API 문서는 원소가 셋에 들어 있는 동안 equals 비교에 영향을 주는 방식으로 값이 바뀌면 셋의 동작이 규정되지 않는다고 경고한다. 그래서 equals와 hashCode에 쓰는 필드는 <code>final</code>로 두는 것이 가장 안전하고, 그럴 수 없다면 해시 컬렉션에 들어 있는 동안에는 그 필드를 바꾸지 않는다는 것을 설계로 보장해야 한다.</p>
+
+<h3>4단계: 제네릭과 인터페이스 도입</h3>
+<p>2단계의 <code>ObjectHashSet</code>에는 두 가지 아쉬움이 남아 있었다. 하나는 타입이다. 문자열 셋에 정수를 넣어도 컴파일러가 막지 못한다. 다른 하나는 구현에 묶인 코드다. 셋을 쓰는 쪽이 <code>ObjectHashSet</code>이라는 클래스 이름에 직접 의존하면, 나중에 다른 방식의 셋으로 바꿀 때 쓰는 쪽 코드를 모두 고쳐야 한다. 앞의 것은 제네릭으로, 뒤의 것은 인터페이스로 푼다.</p>
+<pre><code class="language-java">public interface SimpleSet<E> {
+    boolean add(E element);
+    boolean contains(E element);
+    boolean remove(E element);
+    int size();
+}</code></pre>
+<pre><code class="language-java">import java.util.Arrays;
+import java.util.LinkedList;
+
+public class ChainedHashSet<E> implements SimpleSet<E> {
+    private static final int DEFAULT_CAPACITY = 16;
+
+    private final LinkedList<E>[] buckets;
+    private int size;
+
+    public ChainedHashSet() {
+        this(DEFAULT_CAPACITY);
+    }
+
+    @SuppressWarnings("unchecked")
+    public ChainedHashSet(int capacity) {
+        buckets = new LinkedList[capacity];     // new LinkedList<E>[capacity]는 컴파일 오류
+        for (int i = 0; i < capacity; i++) {
+            buckets[i] = new LinkedList<>();
+        }
+    }
+
+    @Override
+    public boolean add(E element) {
+        LinkedList<E> bucket = buckets[indexOf(element)];
+        if (bucket.contains(element)) {
+            return false;
+        }
+        bucket.add(element);
+        size++;
+        return true;
+    }
+
+    @Override
+    public boolean contains(E element) {
+        return buckets[indexOf(element)].contains(element);
+    }
+
+    @Override
+    public boolean remove(E element) {
+        boolean removed = buckets[indexOf(element)].remove(element);
+        if (removed) {
+            size--;
+        }
+        return removed;
+    }
+
+    @Override
+    public int size() {
+        return size;
+    }
+
+    private int indexOf(Object element) {
+        return Math.floorMod(element.hashCode(), buckets.length);
+    }
+
+    @Override
+    public String toString() {
+        return Arrays.toString(buckets) + " size=" + size;
+    }
+}</code></pre>
+<pre><code class="language-java">public class ChainedHashSetMain {
+    public static void main(String[] args) {
+        SimpleSet<String> names = new ChainedHashSet<>(10);
+        names.add("AB");
+        names.add("BA");
+        names.add("AB");
+        System.out.println(names + " " + names.contains("BA"));
+
+        SimpleSet<Integer> numbers = new ChainedHashSet<>(10);
+        numbers.add(14);
+        numbers.add(-3);
+        numbers.remove(14);
+        System.out.println(numbers);
+        // names.add(14);   // 컴파일 오류
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[[], [AB, BA], [], [], [], [], [], [], [], []] size=2 true
+[[], [], [], [], [], [], [], [-3], [], []] size=1</code></pre>
+<p>주석을 풀어 <code>names.add(14)</code>를 컴파일하면 <code>incompatible types: int cannot be converted to String</code> 오류가 난다. 잘못된 타입이 실행 중이 아니라 컴파일 시점에 걸러진다. -3이 7번 버킷에 들어간 것은 <code>floorMod(-3, 10)</code>이 7이기 때문이고, 1단계에서 예외를 내던 음수 문제도 함께 풀렸다. <code>numbers.remove(14)</code>가 인덱스가 아니라 값으로 지운 것도 확인해 두자. 매개변수 타입이 <code>E</code>여서 14가 <code>Integer</code>로 박싱되어 전달되고, 버킷의 <code>remove(Object)</code>가 선택된다.</p>
+
+<h4>제네릭 배열은 왜 만들 수 없는가</h4>
+<p>생성자에서 <code>new LinkedList<E>[capacity]</code>라고 쓰면 <code>error: generic array creation</code>이라는 컴파일 오류가 난다. JLS §15.10.1은 배열 생성식의 원소 타입이 실체화 가능 타입(reifiable type, §4.7)이 아니면 컴파일 오류라고 정한다. 실체화 가능하다는 것은 타입 정보가 실행 시점에 온전히 남아 있다는 뜻이고, <code>LinkedList<E></code>는 02회에서 본 타입 소거 때문에 그렇지 못하다. 이 규칙이 왜 필요한지는 배열의 성질에서 나온다.</p>
+<pre><code class="language-java">import java.util.LinkedList;
+
+public class GenericArrayDemo {
+    @SuppressWarnings("unchecked")
+    public static void main(String[] args) {
+        Object[] objs = new String[1];
+        try {
+            objs[0] = Integer.valueOf(1);
+        } catch (ArrayStoreException e) {
+            System.out.println(e);
+        }
+
+        LinkedList<String>[] lists = new LinkedList[1];
+        Object[] alias = lists;
+        LinkedList<Integer> ints = new LinkedList<>();
+        ints.add(42);
+        alias[0] = ints;                      // 예외 없이 통과한다
+        try {
+            String s = lists[0].get(0);
+        } catch (ClassCastException e) {
+            System.out.println("ClassCastException");
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">java.lang.ArrayStoreException: java.lang.Integer
+ClassCastException</code></pre>
+<p>배열은 자기 원소 타입을 실행 중에도 기억하고, 원소를 저장할 때마다 검사한다. 앞 절반이 그 장면이다. <code>String[]</code>을 <code>Object[]</code>로 가리키고 <code>Integer</code>를 넣으려 하면 JVM이 <code>ArrayStoreException</code>으로 막는다. 뒤 절반은 제네릭이 끼어들었을 때다. 실행 중의 배열이 아는 원소 타입은 소거된 <code>LinkedList</code>뿐이어서, <code>LinkedList<Integer></code>를 넣어도 검사를 통과한다. 그 결과 <code>LinkedList<String>[]</code>이라고 선언한 배열 안에 정수 리스트가 들어앉고, 문제는 한참 뒤 원소를 꺼내 <code>String</code>으로 쓰는 자리에서 <code>ClassCastException</code>으로 터진다. 배열의 저장 검사가 제 역할을 할 수 없으니 언어가 생성 자체를 금지한 것이다.</p>
+<p>그래서 원시 타입(raw type)으로 <code>new LinkedList[capacity]</code>를 만들어 <code>LinkedList<E>[]</code> 필드에 대입한다. 이 대입에 컴파일러는 <code>[unchecked] unchecked conversion</code> 경고를 붙인다(<code>-Xlint:unchecked</code>로 전체 문구를 볼 수 있다). 컴파일러가 타입 안전성을 확인해 줄 수 없으니 작성자가 책임지라는 뜻이다. 이 클래스에서는 책임질 수 있다. <code>buckets</code>는 <code>private final</code>이고 바깥으로 내보내지 않으며, 칸에 넣는 것은 생성자에서 직접 만든 <code>LinkedList<E></code>뿐이다. 이렇게 안전하다는 근거를 댈 수 있을 때에만 <code>@SuppressWarnings("unchecked")</code>로 경고를 끈다.</p>
+
+<h4>소거된 뒤의 모습</h4>
+<pre data-label="javap -p -s ChainedHashSet / javap -c ChainedHashSetMain (일부)"><code class="language-text">private final java.util.LinkedList<E>[] buckets;
+  descriptor: [Ljava/util/LinkedList;
+public boolean add(E);
+  descriptor: (Ljava/lang/Object;)Z
+
+71: bipush        14
+73: invokestatic  #47   // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+76: invokeinterface #14,  2   // InterfaceMethod SimpleSet.add:(Ljava/lang/Object;)Z</code></pre>
+<p>클래스 파일의 디스크립터에서 <code>E</code>는 사라지고 <code>Object</code>가 남는다. 필드는 그냥 <code>LinkedList</code> 배열이고, <code>add</code>는 <code>Object</code> 하나를 받는 메서드다. 실행 중에 <code>ChainedHashSet<String></code>과 <code>ChainedHashSet<Integer></code>는 같은 클래스이며, 2단계의 <code>ObjectHashSet</code>과 하는 일이 같다. 제네릭이 더한 것은 실행 코드가 아니라 컴파일 시점의 검사다. 호출하는 쪽을 보면 <code>numbers.add(14)</code>가 박싱(<code>Integer.valueOf</code>)을 거쳐 <code>invokeinterface</code>로 <code>SimpleSet.add</code>를 부른다. 호출 대상이 구현 클래스가 아니라 인터페이스의 메서드로 적혀 있다.</p>
+<p>이것이 인터페이스를 둔 효과다. <code>ChainedHashSetMain</code>에서 구현 클래스 이름이 나오는 곳은 <code>new</code> 한 군데뿐이고, 나머지는 <code>SimpleSet</code>이 약속한 메서드만 안다. 버킷이 연결 리스트인지, 배열 길이가 몇인지는 쓰는 쪽이 알 필요가 없다. 자바 표준 라이브러리도 같은 구조다. <code>java.util.Set</code> 인터페이스 아래에 여러 구현이 있고, 그 구현들의 차이는 08회에서 다룬다. 한 가지 다른 점은 표준 <code>Set</code>의 조회 메서드가 <code>contains(Object o)</code>로 선언되어 있다는 것이다. 우리 인터페이스는 <code>contains(E)</code>로 좁혀 두었다.</p>
+
+<h3>직접 만든 셋과 java.util.HashSet의 차이</h3>
+<p>지금까지 만든 것은 원리를 드러내기 위한 구현이다. 실제 <code>java.util.HashSet</code>과 어디가 다른지 OpenJDK 21 소스를 기준으로 짚어 둔다. 원리는 같고, 차이는 대부분 메모리와 속도를 아끼는 방향이다.</p>
+<div class="table-wrap"><table><thead><tr><th>항목</th><th>ChainedHashSet (이 회차의 구현)</th><th>java.util.HashSet (OpenJDK 21)</th></tr></thead><tbody>
+<tr><td>저장 구조</td><td>버킷마다 <code>LinkedList</code> 객체 하나</td><td>내부에 <code>HashMap</code> 하나를 두고, 원소를 키로 넣는다. 값 자리에는 공유하는 더미 객체 <code>PRESENT</code>를 넣는다</td></tr>
+<tr><td>빈 버킷</td><td>빈 <code>LinkedList</code> 객체가 미리 만들어져 있다</td><td>배열 칸이 null이다</td></tr>
+<tr><td>인덱스 계산</td><td><code>Math.floorMod(hashCode, length)</code></td><td>길이를 2의 거듭제곱으로 유지하고 <code>(n - 1) & hash</code></td></tr>
+<tr><td>해시 값 보관</td><td>보관하지 않는다. 버킷 안의 모든 원소에 equals를 호출한다</td><td>노드에 해시 값을 저장해 두고 equals 전에 먼저 비교한다</td></tr>
+<tr><td>버킷 수</td><td>생성할 때 정한 값으로 고정</td><td>원소가 늘면 배열을 키워 다시 배치한다</td></tr>
+<tr><td>null 원소</td><td><code>NullPointerException</code></td><td>허용한다</td></tr>
+</tbody></table></div>
+<p><code>HashSet.add(e)</code>의 본문은 <code>return map.put(e, PRESENT)==null;</code> 한 줄이다. 셋은 "값이 없는 맵"이고, 이 회차에서 본 equals와 hashCode의 규칙은 <code>HashMap</code>의 키에도 그대로 적용된다. 버킷 배열을 언제 얼마나 키우는지는 08회에서, <code>HashMap</code>의 내부 구조는 09회에서 다룬다.</p>
+
+<h3>흔한 오해 정리</h3>
+<ul>
+<li><b>"hashCode가 같으면 같은 객체다."</b> 아니다. "Aa"와 "BB", 좌석 (3,7)과 (2,38)처럼 다른 값이 같은 해시 코드를 가질 수 있고, 가짓수를 따지면 그럴 수밖에 없다. 같음은 equals만이 판정한다.</li>
+<li><b>"hashCode는 유일해야 한다."</b> 규약은 그런 것을 요구하지 않는다. 요구하는 것은 equals가 같은 객체끼리 값이 같아야 한다는 한 방향뿐이다. 유일성은 성능을 위해 가까이 가려는 목표다.</li>
+<li><b>"기본 hashCode는 메모리 주소다."</b> Java 21의 API 문서에는 그런 말이 없고, OpenJDK 21 HotSpot의 기본 방식은 난수를 만들어 객체 헤더에 저장하는 것이다. 주소였다면 GC가 객체를 옮길 때 값이 바뀐다.</li>
+<li><b>"equals만 재정의해도 셋에서 중복이 걸러진다."</b> 대부분 걸러지지 않는다. 다른 버킷으로 가서 equals가 호출될 기회가 없다. 가끔 우연히 같은 버킷에서 만나 정상처럼 보이는 것이 오히려 문제를 숨긴다.</li>
+<li><b>"음수 해시 코드는 Math.abs로 처리하면 된다."</b> int 최솟값에서는 <code>Math.abs</code>의 결과도 음수다. <code>Math.floorMod</code>를 쓰거나, 길이를 2의 거듭제곱으로 두고 비트 AND를 쓴다.</li>
+<li><b>"셋에 넣은 객체는 바꿔도 셋이 따라온다."</b> 셋은 넣는 순간의 해시 코드로 위치를 정할 뿐, 그 뒤 객체가 바뀌는지 지켜보지 않는다.</li>
+</ul>
+
+<h3>다른 주제와의 연결</h3>
+<p>해시 코드로 후보를 좁히고 equals로 확정하는 두 단계는 컬렉션 밖에서도 쓰인다. 문자열을 대상으로 하는 <code>switch</code> 문이 한 예다.</p>
+<pre><code class="language-java">public class SwitchDemo {
+    static int code(String s) {
+        switch (s) {
+            case "Aa": return 1;
+            case "BB": return 2;
+            case "AB": return 3;
+            default:   return 0;
+        }
+    }
+}</code></pre>
+<pre data-label="javap -c SwitchDemo (일부, OpenJDK 21 javac)"><code class="language-text"> 5: invokevirtual #7    // Method java/lang/String.hashCode:()I
+ 8: lookupswitch  { // 2
+            2081: 64
+            2112: 36
+         default: 75
+    }
+36: aload_1
+37: ldc           #13   // String BB
+39: invokevirtual #15   // Method java/lang/String.equals:(Ljava/lang/Object;)Z
+    ...
+50: aload_1
+51: ldc           #19   // String Aa
+53: invokevirtual #15   // Method java/lang/String.equals:(Ljava/lang/Object;)Z</code></pre>
+<p>OpenJDK 21의 javac는 문자열 switch를 먼저 <code>hashCode()</code> 값으로 분기하고, 도착한 곳에서 <code>equals()</code>로 확인하는 코드로 바꾼다. case 라벨은 세 개인데 분기 값은 2081과 2112 둘뿐이다. "Aa"와 "BB"가 해시 코드 2112를 공유하므로 한 갈래에 묶이고, 그 안에서 equals를 차례로 불러 가른다. 이 회차에서 만든 셋의 버킷과 같은 구조다. 2081, 2112라는 숫자가 클래스 파일에 상수로 박혀 있다는 점도 눈여겨볼 만하다. <code>String.hashCode()</code>의 계산식이 API 문서에 식으로 명시되어 있기에 가능한 일이다.</p>
+<p>앞으로의 회차와는 이렇게 이어진다. 09회의 <code>HashMap</code>은 키를 이 회차의 원소와 똑같이 다룬다. 키로 쓰는 클래스가 equals와 hashCode를 어기면 넣은 값을 꺼내지 못한다. 레코드(record)는 모든 컴포넌트를 기준으로 한 equals와 hashCode를 컴파일러가 제공하므로, 값을 나타내는 작은 타입을 해시 컬렉션에 넣을 때 실수할 여지를 줄여 준다. JPA 엔티티처럼 식별자가 저장 시점에 채워지는 객체는 주의가 필요하다. hashCode를 식별자로 계산하면, 저장 전에 셋에 넣은 객체는 저장 후 "넣은 뒤에 내용을 바꾼" 경우와 같은 처지가 된다. 마지막으로 <code>HashSet</code>은 동기화되어 있지 않다고 API 문서에 명시되어 있다. 여러 스레드가 함께 쓰는 문제는 동시성을 다루는 권에서 본다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>해시 셋의 뼈대</dt><dd>버킷 배열과 버킷마다의 연결 리스트로 이루어진다. add·contains·remove 모두 해시 코드로 버킷 하나를 고른 뒤 그 안에서만 비교하므로, 비용은 전체 원소 수가 아니라 버킷 하나의 길이에 비례한다.</dd>
+<dt>문자열 해시 코드</dt><dd><code>String.hashCode()</code>는 글자 값에 31의 거듭제곱을 자릿값으로 곱해 더한 값이다. int 범위를 넘으면 상위 비트가 버려져 음수가 될 수 있고, 이것은 정의된 동작이다.</dd>
+<dt>해시 코드에서 인덱스로</dt><dd>음수 해시 코드에 <code>%</code>를 쓰면 음수 인덱스가 나온다. <code>Math.abs</code>는 int 최솟값에서 실패하므로 <code>Math.floorMod</code>나 2의 거듭제곱 길이와 비트 AND를 쓴다.</dd>
+<dt>hashCode 규약</dt><dd>한 실행 안에서 일관되어야 하고, equals가 같은 객체는 같은 값을 내야 한다. 다른 객체가 같은 값을 내는 것은 허용되지만 성능을 떨어뜨린다.</dd>
+<dt>기본 hashCode</dt><dd><code>Object</code>의 hashCode는 내용과 무관한 identity hash다. OpenJDK 21 HotSpot은 첫 호출 때 난수를 만들어 객체 헤더의 마크 워드에 저장하며, 메모리 주소가 아니다.</dd>
+<dt>두 단계 조회</dt><dd>hashCode가 볼 버킷을 정하고 equals가 버킷 안에서 같음을 판정한다. 하나만 재정의하면 중복이 저장되고 조회가 실패한다. equals만 재정의한 경우는 실패가 간헐적이어서 더 찾기 어렵다.</dd>
+<dt>넣은 뒤의 변경</dt><dd>셋은 넣는 순간의 해시 코드로 위치를 정한다. 들어 있는 동안 equals·hashCode에 쓰이는 필드를 바꾸면 그 원소는 찾을 수도 지울 수도 없게 된다.</dd>
+<dt>제네릭과 인터페이스</dt><dd>타입 매개변수로 원소 타입을 컴파일 시점에 검사하고, 인터페이스로 구현을 숨긴다. 제네릭 배열은 실체화 가능 타입이 아니어서 생성할 수 없고, 원시 타입 배열을 만들어 경고를 책임지고 억제한다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 이 회차의 내용은 대개 "분명히 넣었는데 못 찾는다"는 증상으로 돌아온다. 캐시에 넣은 값이 적중하지 않아 같은 계산을 반복하고 캐시만 계속 커지는 경우, 셋으로 중복을 걸렀는데 결과에 중복이 남는 경우, 맵에서 지웠다고 생각한 항목이 남아 메모리를 잡고 있는 경우다. 이런 증상을 보면 컬렉션보다 먼저 키로 쓰인 클래스를 연다. 확인할 것은 세 가지다. equals와 hashCode가 둘 다 재정의되어 있는가, 두 메서드가 같은 필드를 쓰는가, 그 필드가 컬렉션에 들어간 뒤에 바뀔 수 있는가. 특히 equals만 재정의한 경우는 작은 테스트에서 우연히 통과할 수 있으므로 "테스트는 통과했다"가 반증이 되지 못한다.</p>
+<p>hashCode에 어떤 필드를 넣을지는 equals를 기준으로 정한다. equals가 비교하지 않는 필드를 hashCode에 넣으면 같은 객체가 다른 해시 코드를 갖게 되어 규약 위반이다. 반대로 equals가 비교하는 필드 중 일부만 hashCode에 써도 규약은 지켜지지만, 빠뜨린 필드만 다른 객체들이 한 버킷에 몰린다. 원소가 적을 때는 드러나지 않다가 데이터가 늘면 조회가 느려지는 형태로 나타난다. 값을 나타내는 타입이라면 레코드를 쓰거나 필드를 final로 두고 IDE가 생성한 구현을 쓰는 편이 직접 쓰는 것보다 실수가 적다.</p>
+<p>모든 클래스가 equals와 hashCode를 재정의해야 하는 것은 아니다. 스레드, 커넥션, 열린 파일처럼 "이 객체 그 자체"가 의미인 것들은 내용이 같다고 같은 것으로 취급할 수 없고, <code>Object</code>의 기본 동작(참조 비교와 identity hash)이 올바른 정의다. 판단 기준은 이 타입의 두 인스턴스를 서로 바꿔 써도 되는가이다. 바꿔 써도 된다면 값이고 재정의가 필요하며, 안 된다면 개체이고 그대로 둔다. 상태가 바뀌는 객체를 꼭 해시 컬렉션의 원소나 키로 써야 한다면, 바뀌지 않는 식별 필드만으로 두 메서드를 정의하거나 컬렉션에 넣기 전에 상태를 확정하는 쪽으로 설계를 조정한다.</p>
+</x-review>
+
+<x-practice>
+<li>버킷이 8개인 <code>IntHashSet</code>에 3, 11, 19, 8, 16, 11을 이 순서로 add한다. 각 add의 반환값, 최종 버킷 상태와 size를 적어라. 이어서 <code>contains(27)</code>은 몇 번의 비교 끝에 무엇을 반환하는가.</li>
+<li>"Ab"와 "BC"의 <code>hashCode()</code>를 손으로 계산하라('A'=65, 'B'=66, 'C'=67, 'b'=98). 두 문자열을 버킷 10개인 <code>ObjectHashSet</code>에 차례로 add하면 각각 몇 번 버킷에 들어가는가. 두 번째 add에서 equals는 몇 번 호출되고 결과는 무엇인가.</li>
+<li>어떤 클래스가 필드 <code>id</code>, <code>name</code>을 갖고, equals는 <code>id</code>만 비교하며 hashCode는 <code>Objects.hash(id, name)</code>을 반환한다. <code>HashSet</code>에 <code>(1, "kim")</code>을 넣은 뒤 <code>contains((1, "lee"))</code>를 호출하면 무엇이 반환되는가. 규약의 어느 항목을 어겼는지와 고치는 방법을 설명하라.</li>
+<li>필드 <code>int n</code>(final 아님) 하나를 갖고 equals는 n을 비교하며 hashCode는 n을 반환하는 <code>Counter</code> 클래스가 있다. 버킷 10개인 <code>ObjectHashSet</code>에 <code>c = new Counter(3)</code>을 add한 뒤 다음을 차례로 실행한다. <code>c.n = 13; contains(c)</code> → <code>c.n = 4; contains(c)</code> → <code>contains(new Counter(3))</code> → <code>add(c)</code>. 네 결과를 예측하고 이유를 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 인덱스는 값 % 8이다. 3 → 3, 11 → 3, 19 → 3, 8 → 0, 16 → 0이므로 앞의 다섯 번은 모두 true다. 마지막 11은 3번 버킷 [3, 11, 19]에서 둘째 원소와 같으므로 false다. 최종 상태는 0번 버킷 [8, 16], 3번 버킷 [3, 11, 19], 나머지는 비어 있고 size는 5다. <code>contains(27)</code>은 27 % 8 = 3이라 3번 버킷의 세 원소와 모두 비교한 뒤 false를 반환한다. 0번 버킷의 원소와는 비교하지 않는다.</p>
+<p><b>2.</b> "Ab"는 65×31 + 98 = 2113, "BC"는 66×31 + 67 = 2113으로 같다. 첫 글자가 1 커져 31이 늘고 둘째 글자가 31 줄어 상쇄되었다. floorMod(2113, 10) = 3이므로 둘 다 3번 버킷이다. 두 번째 add에서 버킷 안의 "Ab"와 한 번 비교하고(<code>"BC".equals("Ab")</code>), 결과가 false이므로 "BC"는 새 원소로 저장된다. 해시 코드가 같아도 equals가 다르다고 하면 서로 다른 원소다.</p>
+<p><b>3.</b> false가 반환된다. 두 객체는 id가 같아 equals로는 같지만, hashCode에 name이 들어가 서로 다른 값을 낸다. "equals가 같으면 hashCode도 같아야 한다"는 둘째 항목 위반이다. 조회는 name이 "lee"인 쪽의 해시 코드가 가리키는 위치만 보므로 저장된 객체에 도달하지 못하고, 같은 이유로 add도 성공해 equals로 같은 원소 둘이 셋에 들어간다. hashCode를 equals와 같은 필드만 쓰도록 <code>Objects.hash(id)</code>(또는 <code>Integer.hashCode(id)</code>)로 고치거나, 도메인에서 이름까지 같아야 같은 것이라면 equals에 name 비교를 추가한다. 어느 쪽이든 두 메서드의 기준 필드를 일치시키는 것이 핵심이다.</p>
+<p><b>4.</b> 결과는 차례로 true, false, false, true다. c는 처음에 3번 버킷에 저장된다. n을 13으로 바꾸면 해시 코드는 13이지만 floorMod(13, 10) = 3이라 우연히 같은 버킷을 가리키고, 버킷 안에서 c와 c 자신을 equals로 비교하니 true다. 변경이 문제를 일으키지 않은 것처럼 보이는 경우다. n을 4로 바꾸면 4번 버킷을 보게 되고 그곳은 비어 있어 false다. <code>new Counter(3)</code>은 3번 버킷까지 가지만 그 안의 c는 이제 n이 4이므로 equals가 false다. 마지막 add(c)는 4번 버킷이 비어 있어 성공하고, 같은 객체가 3번과 4번 버킷에 한 번씩 들어 있는 상태가 된다. 넣은 뒤의 변경은 항상 실패하는 것이 아니라 새 해시 코드가 어느 버킷을 가리키느냐에 따라 달라지므로 재현이 어렵다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>equals만 내용 기준으로 재정의하고 hashCode는 재정의하지 않은 클래스가 있다. 내용이 같은 두 객체를 해시 셋에 차례로 add했을 때의 설명으로 옳은 것은?</q>
+<o>equals가 true이므로 두 번째 add는 항상 거절된다.</o>
+<o>대부분 서로 다른 버킷으로 가서 equals가 호출되지 않고 둘 다 저장되지만, 우연히 같은 버킷에 떨어지면 중복으로 걸러질 수도 있다.</o>
+<o>두 객체는 항상 같은 버킷에 들어가지만 참조가 달라 둘 다 저장된다.</o>
+<o>hashCode를 재정의하지 않았으므로 add 시점에 예외가 발생한다.</o>
+<why>기본 hashCode는 객체마다 다른 identity hash이므로 내용이 같아도 대개 다른 버킷으로 간다. 셋은 고른 버킷 안에서만 equals를 호출하므로 재정의한 equals는 실행될 기회가 없다. 다만 두 해시 코드가 우연히 같은 인덱스로 줄어들면 equals가 호출되어 걸러진다. 항상 같은 버킷에 들어가는 것은 hashCode만 재정의한 경우이고, 규약 위반은 예외로 드러나지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>객체의 메모리 주소를 그대로 기본 hashCode로 쓰면 곤란한 근본 이유는 무엇인가?</q>
+<o>주소는 64비트라서 int로 줄일 방법이 없기 때문이다.</o>
+<o>주소가 같은 객체가 둘 이상 존재할 수 있기 때문이다.</o>
+<o>GC가 객체를 옮기면 주소가 바뀌는데, hashCode는 한 실행 안에서 같은 객체에 대해 같은 값이어야 하기 때문이다.</o>
+<o>주소는 음수가 될 수 있어 배열 인덱스로 쓸 수 없기 때문이다.</o>
+<why>hashCode 규약의 첫째 항목은 한 실행 안에서의 일관성이다. 객체를 옮기는 GC 아래에서 주소는 이 조건을 만족하지 못한다. 그래서 HotSpot은 값을 한 번 만들어 객체 헤더에 저장한다. 서로 다른 객체가 같은 해시 코드를 갖는 것은 규약이 허용하므로 값의 중복도 이유가 되지 못한다. 64비트 값을 32비트로 접는 방법은 Long의 hashCode처럼 얼마든지 있고, 음수 해시 코드는 인덱스 계산 단계에서 처리할 수 있으므로 근본 이유가 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>해시 코드 h를 길이 n인 버킷 배열의 인덱스로 바꾸는 코드로 <code>Math.abs(h) % n</code>을 썼다. 이 코드의 문제는?</q>
+<o>h가 int의 최솟값이면 Math.abs의 결과도 음수여서 음수 인덱스가 나올 수 있다.</o>
+<o>Math.abs가 해시 코드의 분포를 망가뜨려 모든 원소가 한 버킷에 몰린다.</o>
+<o>넣을 때와 찾을 때 서로 다른 인덱스가 나온다.</o>
+<o>양수 해시 코드에 대해 n 이상의 값이 나올 수 있다.</o>
+<why>int 최솟값 -2147483648은 대응하는 양수가 int 범위에 없어 Math.abs가 같은 값을 돌려준다. 해시 코드가 정확히 그 값인 문자열도 실제로 있다. 그 한 가지 입력을 뺀 나머지에서는 정상 동작하므로 발견하기 어렵다. 같은 h에 같은 계산을 하면 결과는 항상 같으므로 넣을 때와 찾을 때가 어긋나지는 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>어떤 클래스가 equals는 내용 기준으로 올바르게 재정의하고 hashCode는 항상 1을 반환한다. 이 클래스의 객체를 해시 셋에 넣을 때의 설명으로 옳은 것은?</q>
+<o>hashCode 규약 위반이므로 중복이 저장된다.</o>
+<o>모든 객체가 같은 것으로 판정되어 원소가 하나만 저장된다.</o>
+<o>contains가 항상 false를 반환한다.</o>
+<o>규약 위반은 아니며 결과도 올바르지만, 모든 원소가 한 버킷에 몰려 연산이 원소 수에 비례해 느려진다.</o>
+<why>규약은 equals가 같은 객체의 hashCode가 같기를 요구할 뿐, 다른 객체의 hashCode가 달라야 한다고 하지 않는다. 상수 hashCode는 이 조건을 만족한다. 같음의 판정은 equals가 하므로 결과는 정확하다. 다만 버킷으로 후보를 좁히는 효과가 사라져 해시 셋이 연결 리스트 하나와 같아진다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>제네릭 클래스 안에서 <code>new LinkedList&lt;E&gt;[capacity]</code>가 컴파일 오류인 이유로 가장 정확한 것은?</q>
+<o>LinkedList는 배열의 원소가 될 수 없는 타입이기 때문이다.</o>
+<o>타입 소거로 실행 중의 배열은 원소 타입을 LinkedList까지만 알 수 있어, 다른 타입 인자의 리스트가 저장되는 것을 배열의 저장 검사로 막을 수 없기 때문이다.</o>
+<o>제네릭 클래스의 생성자에서는 배열을 만들 수 없기 때문이다.</o>
+<o>capacity가 컴파일 시점 상수가 아니기 때문이다.</o>
+<why>배열은 원소 타입을 실행 중에 기억하고 저장할 때마다 검사한다. 그런데 타입 인자는 소거되어 실행 중에 남지 않으므로 그 검사가 제 역할을 하지 못한다. JLS는 원소 타입이 실체화 가능 타입이 아닌 배열 생성식을 컴파일 오류로 정한다. 원시 타입 LinkedList의 배열은 만들 수 있고, 배열 길이는 상수일 필요가 없다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>해시 코드(hash code)</dt><dd>객체의 내용이나 정체에서 계산해 낸 int 값. 자바에서는 <code>hashCode()</code>가 반환한다.</dd>
+<dt>해시 인덱스(hash index)</dt><dd>해시 코드를 버킷 배열의 길이에 맞게 줄인 값. 어느 버킷을 볼지 정한다.</dd>
+<dt>버킷(bucket)</dt><dd>해시 인덱스 하나에 대응하는 저장 칸. 같은 인덱스로 온 원소 여러 개를 담는다.</dd>
+<dt>해시 충돌(hash collision)</dt><dd>서로 다른 값이 같은 해시 코드나 같은 인덱스를 갖는 것. 없앨 수 없으므로 버킷 안의 equals 비교로 구분한다.</dd>
+<dt>동일성(identity)과 동등성(equality)</dt><dd>동일성은 두 참조가 같은 객체를 가리키는지(<code>==</code>), 동등성은 두 객체를 같은 값으로 취급할지(<code>equals</code>)를 말한다.</dd>
+<dt>identity hash code</dt><dd>hashCode를 재정의하지 않았을 때 쓰이는, 객체의 내용과 무관한 해시 코드. <code>System.identityHashCode()</code>로 언제든 얻을 수 있다.</dd>
+<dt>마크 워드(mark word)</dt><dd>HotSpot 객체 헤더의 앞부분. 잠금 상태, GC 나이와 함께 identity hash가 저장된다.</dd>
+<dt>실체화 가능 타입(reifiable type)</dt><dd>타입 정보가 실행 시점에 온전히 남는 타입. 타입 인자가 붙은 제네릭 타입은 소거 때문에 해당하지 않는다.</dd>
+<dt>원시 타입(raw type)</dt><dd>제네릭 타입을 타입 인자 없이 쓴 것. 제네릭 이전 코드와의 호환을 위해 남아 있으며 타입 검사를 건너뛴다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Object.html">Java SE 21 API — java.lang.Object</a> — hashCode의 일반 규약 세 항목, 기본 구현에 대한 설명, equals의 요구 사항과 hashCode를 함께 재정의하라는 안내</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/String.html">Java SE 21 API — java.lang.String</a> — String.hashCode()의 계산식 s[0]*31^(n-1) + ... + s[n-1]</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/HashSet.html">Java SE 21 API — java.util.HashSet</a> — HashMap에 기반한다는 것, null 허용, 해시 함수의 분산을 전제로 한 상수 시간 성능, 비동기화</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html">JLS §15 Expressions</a> — §15.10.1 배열 생성식의 실체화 가능 타입 요구, §15.17.1 정수 곱셈의 오버플로, §15.17.3 나머지 연산의 부호</li>
+<li><a href="https://raw.githubusercontent.com/openjdk/jdk21u/master/src/hotspot/share/runtime/synchronizer.cpp">OpenJDK 21 HotSpot — synchronizer.cpp</a> — identity hash를 생성하는 get_next_hash와 값을 헤더에 저장하는 FastHashCode</li>
+<li><a href="https://raw.githubusercontent.com/openjdk/jdk21u/master/src/hotspot/share/oops/markWord.hpp">OpenJDK 21 HotSpot — markWord.hpp</a> — 마크 워드의 비트 배치와 해시 자리(64비트에서 31비트)</li>
+</x-refs>

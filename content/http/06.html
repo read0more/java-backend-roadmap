@@ -1,0 +1,793 @@
+<x-meta>
+deck: 응답 첫 줄의 세 자리 숫자가 수신자의 파싱·캐시·리다이렉션·재시도를 어떻게 결정하는지, RFC 9110 15절과 JDK로 만든 서버·클라이언트 실험으로 클래스별로 읽는다.
+minutes: 80
+</x-meta>
+
+<x-goals>
+<li>상태 줄의 문법(RFC 9112 4절)을 근거로, 프로그램이 사유 구문이 아니라 세 자리 숫자로 분기해야 하는 이유와 모르는 상태 코드를 받았을 때의 처리 규칙을 설명할 수 있다.</li>
+<li>주어진 응답의 상태 코드만 보고 본문이 있을 수 있는지, 캐시가 저장할 수 있는지, 사용자 에이전트가 자동으로 무엇을 할 수 있는지 판단할 수 있다.</li>
+<li>301·302·303·307·308을 "영구인가 일시인가", "메서드가 유지되는가"의 두 축으로 구분하고, POST 요청이 각 코드를 만났을 때 다음 요청의 메서드와 본문을 예측할 수 있다.</li>
+<li>POST 응답을 200으로 직접 돌려줄 때와 303으로 리다이렉트할 때 브라우저 새로고침의 결과가 어떻게 달라지는지 요청 단위로 추적할 수 있다.</li>
+<li>4xx와 5xx의 경계, 502·503·504를 만든 주체를 구분하고, 상태 코드와 메서드의 멱등성을 함께 보아 재시도해도 되는 경우를 가려낼 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 응답을 끝까지 읽지 않고 결과를 아는 법</h3>
+
+<p>04·05회에서 메서드는 요청의 의도를 몇 개의 표준 단어로 줄여 주었다. GET이면 조회이고 안전하며, PUT이면 멱등이라는 사실을 서버의 코드를 보지 않고도 알 수 있었다. 응답 쪽에서 같은 일을 하는 것이 상태 코드(status code)다. 서버가 요청을 어떻게 처리했는지를 세 자리 숫자 하나로 줄여서, 응답의 맨 첫 줄에 둔다.</p>
+
+<p>이 숫자가 없다고 해 보자. 주문이 성공했는지 알려면 본문을 읽어야 하는데, 본문의 형식은 서비스마다 다르다. 어떤 서버는 HTML 문장으로, 어떤 서버는 JSON의 <code>result</code> 필드로, 또 어떤 서버는 자기만의 오류 번호로 결과를 적을 것이다. 그 서비스를 위해 만든 클라이언트는 그것을 해석할 수 있지만, 그 서비스를 모르는 프로그램은 응답이 성공인지 실패인지조차 알 수 없다.</p>
+
+<p>문제는 HTTP 응답을 읽는 프로그램 대부분이 "그 서비스를 모르는 프로그램"이라는 점이다. 브라우저는 수많은 사이트의 응답을 받지만 사이트마다 다른 본문 규칙을 알지 못한다. 그런데도 다른 주소로 다시 요청을 보내거나, 비밀번호 입력 창을 띄우거나, 캐시에 저장할지 정해야 한다. 클라이언트와 서버 사이에 놓인 프록시와 캐시, 부하 분산기도 마찬가지다. 이들은 본문을 열어 보지 않고 메시지를 다뤄야 한다. 서버 운영자가 보는 감시 화면도 요청 수백만 건의 본문을 읽지 않고 "실패한 요청의 비율"을 계산해야 한다.</p>
+
+<p>상태 코드는 이 프로그램들이 공통으로 읽는 한 칸이다. 그래서 상태 코드를 고르는 일은 화면에 보일 문구를 고르는 일이 아니라, 응답을 받는 모든 프로그램에게 "이 응답을 이렇게 다뤄라"라고 지시하는 일에 가깝다. 이 회차는 네 가지를 묻는다. 첫째, 이 숫자는 메시지의 어디에 어떤 문법으로 놓이는가. 둘째, 다섯 클래스는 각각 수신자에게 어떤 행동을 허락하는가. 셋째, 리다이렉션에서 두 번째 요청은 누가 만들며 왜 메서드가 바뀌는가. 넷째, 4xx와 5xx의 경계는 어디이고, 실패한 요청을 다시 보내도 되는 것은 언제인가.</p>
+
+<h3>상태 줄: 세 자리 숫자와 사유 구문</h3>
+
+<p>03회에서 HTTP/1.1 메시지가 시작 줄, 헤더 필드, 빈 줄, 본문으로 이루어진다는 것을 보았다. 응답의 시작 줄을 상태 줄(status-line)이라고 한다. RFC 9112 4절이 정한 문법은 한 줄이다.</p>
+
+<pre data-label="RFC 9112 4절"><code class="language-text">status-line   = HTTP-version SP status-code SP [ reason-phrase ]
+status-code   = 3DIGIT
+reason-phrase = 1*( HTAB / SP / VCHAR / obs-text )
+
+예)  HTTP/1.1 404 Not Found</code></pre>
+
+<p>프로토콜 버전, 공백 하나, 숫자 세 개, 공백 하나, 그리고 대괄호로 표시된 선택 요소인 사유 구문(reason phrase)이 온다. <code>Not Found</code> 같은 글자는 없어도 되는 부분이다. RFC 9112는 사유 구문이 사람이 직접 글자를 치던 대화형 텍스트 클라이언트 시절의 인터넷 프로토콜들을 따른 것이라고 밝히고, 클라이언트는 그 내용을 무시하는 것이 좋다고(SHOULD) 정한다. 이유도 적혀 있다. 사유 구문은 지역 언어로 번역될 수 있고, 중개자가 덮어쓸 수 있으며, 다른 버전의 HTTP로 전달될 때 버려질 수 있다.</p>
+
+<p>마지막 이유는 실제 구조에서 나온다. HTTP/2에는 글자로 된 상태 줄이 없고, <code>:status</code>라는 의사 헤더 필드(pseudo-header field) 하나가 상태 코드를 싣는다(RFC 9113 8.3.2절). 사유 구문을 담을 자리가 따로 없다. 03회에서 본 대로 HTTP의 의미론은 버전과 무관하게 같아야 하므로, 버전에 따라 있다가 없어지는 글자에 의미를 실을 수는 없다. 프로그램이 <code>"Not Found"</code>라는 문자열을 비교해 분기한다면 그 코드는 HTTP/2 연결에서, 혹은 사유 구문을 바꿔 쓰는 서버 앞에서 틀리게 동작한다. 분기는 숫자로 한다.</p>
+
+<p>숫자 자체에는 구조가 있다. RFC 9110 15절은 유효한 상태 코드의 범위를 100 이상 599 이하로 정하고, 첫째 자리가 응답의 클래스(class)를 정의한다고 말한다. 나머지 두 자리는 분류 역할이 없다. 즉 404와 405가 "비슷한 종류"라는 뜻은 숫자에 들어 있지 않고, 둘 다 4로 시작한다는 사실만 의미가 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>클래스</th><th>이름</th><th>RFC 9110의 정의</th></tr></thead><tbody>
+<tr><td>1xx</td><td>정보(Informational)</td><td>요청을 받았고 처리를 계속하고 있다</td></tr>
+<tr><td>2xx</td><td>성공(Successful)</td><td>요청을 성공적으로 받았고, 이해했고, 받아들였다</td></tr>
+<tr><td>3xx</td><td>리다이렉션(Redirection)</td><td>요청을 완료하려면 추가 행동이 필요하다</td></tr>
+<tr><td>4xx</td><td>클라이언트 오류(Client Error)</td><td>요청에 잘못된 문법이 있거나 요청을 수행할 수 없다</td></tr>
+<tr><td>5xx</td><td>서버 오류(Server Error)</td><td>서버가 유효해 보이는 요청을 수행하지 못했다</td></tr>
+</tbody></table></div>
+
+<p>첫째 자리에 이렇게 무게를 둔 까닭은 확장성이다. RFC 9110은 상태 코드가 확장 가능하다고 밝히고, 클라이언트가 등록된 모든 상태 코드의 뜻을 알 필요는 없다고 한다. 대신 반드시 지켜야 하는(MUST) 규칙을 하나 둔다. 클라이언트는 어떤 상태 코드든 첫째 자리로 클래스를 이해해야 하고, 모르는 코드는 그 클래스의 x00 코드와 같은 것으로 취급해야 한다. 명세가 드는 예는 471이다. 이 숫자를 처음 본 클라이언트도 첫 자리가 4이므로 자기 요청에 문제가 있었다는 것을 알 수 있고, 400(Bad Request)을 받은 것처럼 처리하면 된다.</p>
+
+<p>이 규칙 덕분에 새 상태 코드가 생겨도 오래된 클라이언트가 망가지지 않는다. 새 코드는 IANA의 HTTP 상태 코드 레지스트리에 등록되며, 등록에는 IETF의 검토가 필요하다(RFC 9110 16.2절). 실제로 자주 쓰이는 429(Too Many Requests)는 RFC 9110이 아니라 RFC 6585에 정의되어 있다. 16.2.2절은 새 코드를 정의할 때의 제약도 적어 두었다. 새 코드는 다섯 클래스 중 하나에 속해야 하고, 기존 파서가 메시지를 처리할 수 있도록 본문을 금지하는 새 코드는 만들 수 없다. 길이 0의 본문을 요구하는 것까지만 허용된다.</p>
+
+<p>범위 밖의 값도 언급되어 있다. 100~599가 아닌 세 자리 값은 유효하지 않으며, 그런 응답을 받은 클라이언트는 5xx를 받은 것처럼 처리하는 것이 좋다(SHOULD). 명세는 구현들이 600~999 값을 라이브러리 오류 같은 HTTP가 아닌 상태를 내부에서 주고받는 용도로 쓰곤 한다는 점도 적어 둔다. 그리고 요청 하나에 응답이 여러 개 올 수 있다는 점을 분명히 한다. 1xx 범위의 중간(interim) 응답이 0개 이상 온 뒤, 다른 범위의 최종(final) 응답이 정확히 하나 온다.</p>
+
+<x-visual id="http-06-status-classes" title="상태 코드 첫째 자리가 나누는 다섯 클래스와 수신자가 각 클래스에서 취하는 행동" kind="분류 다이어그램" ratio="16:9">
+<x-hint>상태 줄의 세 자리 숫자에서 첫째 자리만 떼어 다섯 갈래로 나누고, 갈래마다 수신자가 무엇을 하는지 한 줄로 보여 준다.</x-hint>
+<x-prompt>깔끔한 평면 기술 다이어그램, 흰 배경. 화면 위쪽 가운데에 고정폭 글꼴로 크게 "HTTP/1.1 404 Not Found" 한 줄을 그린다. 숫자 404 중 첫 자리 4만 색 상자로 강조하고 그 위에 작은 라벨 "첫째 자리 = 클래스"를 붙인다. "Not Found" 부분은 흐린 회색으로 그리고 아래에 작은 라벨 "사유 구문: 무시"를 붙인다. 강조된 첫 자리에서 아래로 다섯 개의 화살표가 부채꼴로 내려가 가로로 나란한 다섯 개의 카드에 닿는다. 카드는 왼쪽부터 서로 다른 차분한 색(회색, 초록, 파랑, 주황, 빨강)이다. 각 카드의 큰 글자와 아래 작은 글자는 다음과 같다. 첫째 카드 "1xx 정보" / "최종 응답을 더 기다린다". 둘째 카드 "2xx 성공" / "결과를 사용한다". 셋째 카드 "3xx 리다이렉션" / "Location으로 다시 요청". 넷째 카드 "4xx 클라이언트 오류" / "요청을 고친다". 다섯째 카드 "5xx 서버 오류" / "서버 쪽 문제, 나중에 다시". 장식이나 인물 없이 도형과 글자만 사용한다.</x-prompt>
+<x-caption>수신자는 사유 구문을 버리고 숫자로 판단하며, 처음 보는 코드라도 첫째 자리만으로 무엇을 해야 할지 정할 수 있다.</x-caption>
+</x-visual>
+
+<h3>실험 1: 상태 줄을 바이트로 보기</h3>
+
+<p>명세의 문장을 실제 바이트로 확인해 보자. JDK에는 실험용으로 쓰기 좋은 작은 HTTP 서버(<code>com.sun.net.httpserver.HttpServer</code>, <code>jdk.httpserver</code> 모듈)가 들어 있다. 이 서버에 메모 목록을 흉내 낸 <code>/notes</code>와, 등록되지 않은 코드 471을 돌려주는 <code>/odd</code>를 만들고, 02회에서 했던 것처럼 소켓에 요청 글자를 직접 써 넣어 응답을 그대로 읽는다. HTTP 클라이언트 라이브러리를 쓰지 않는 이유는 라이브러리가 상태 줄을 해석해서 감추기 때문이다.</p>
+
+<pre><code class="language-java">import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+
+public class StatusLab {
+    public static void main(String[] args) throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/notes", StatusLab::notes);
+        server.createContext("/odd", ex -> reply(ex, 471, "custom\n"));
+        server.start();
+        int port = server.getAddress().getPort();
+        try {
+            send(port, "GET /notes HTTP/1.1", "");
+            send(port, "POST /notes HTTP/1.1", "hello");
+            send(port, "DELETE /notes HTTP/1.1", "");
+            send(port, "PATCH /notes HTTP/1.1", "");
+            send(port, "GET /odd HTTP/1.1", "");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    static void notes(HttpExchange ex) throws java.io.IOException {
+        switch (ex.getRequestMethod()) {
+            case "GET" -> reply(ex, 200, "note list\n");
+            case "POST" -> {
+                ex.getRequestBody().readAllBytes();
+                ex.getResponseHeaders().add("Location", "/notes/1");
+                reply(ex, 201, "created\n");
+            }
+            case "DELETE" -> {
+                ex.sendResponseHeaders(204, -1);   // -1: 본문 없음
+                ex.close();
+            }
+            default -> {
+                ex.getResponseHeaders().add("Allow", "GET, POST, DELETE");
+                reply(ex, 405, "method not allowed\n");
+            }
+        }
+    }
+
+    static void reply(HttpExchange ex, int status, String body) throws java.io.IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        ex.sendResponseHeaders(status, bytes.length);
+        try (OutputStream os = ex.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    static void send(int port, String requestLine, String body) throws Exception {
+        byte[] content = body.getBytes(StandardCharsets.UTF_8);
+        String head = requestLine + "\r\n"
+                + "Host: 127.0.0.1:" + port + "\r\n"
+                + "Content-Length: " + content.length + "\r\n"
+                + "Connection: close\r\n"
+                + "\r\n";
+        try (Socket socket = new Socket("127.0.0.1", port)) {
+            OutputStream out = socket.getOutputStream();
+            out.write(head.getBytes(StandardCharsets.US_ASCII));
+            out.write(content);
+            out.flush();
+            InputStream in = socket.getInputStream();
+            String raw = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            String[] parts = raw.split("\r\n\r\n", 2);          // 헤더 구역 | 본문
+            String[] lines = parts[0].split("\r\n");
+            System.out.println(">>> " + requestLine);
+            System.out.println("    [" + lines[0] + "]");          // 상태 줄, 끝의 공백까지 보이게
+            for (int i = 1; i < lines.length; i++) {
+                if (!lines[i].startsWith("Date:")) {               // 실행마다 달라지는 줄은 생략
+                    System.out.println("    " + lines[i]);
+                }
+            }
+            System.out.println("    (본문 " + parts[1].getBytes(StandardCharsets.UTF_8).length + "바이트) "
+                    + parts[1].strip());
+        }
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">>>> GET /notes HTTP/1.1
+    [HTTP/1.1 200 OK]
+    Content-length: 10
+    (본문 10바이트) note list
+>>> POST /notes HTTP/1.1
+    [HTTP/1.1 201 Created]
+    Content-length: 8
+    Location: /notes/1
+    (본문 8바이트) created
+>>> DELETE /notes HTTP/1.1
+    [HTTP/1.1 204 No Content]
+    (본문 0바이트)
+>>> PATCH /notes HTTP/1.1
+    [HTTP/1.1 405 Method Not Allowed]
+    Allow: GET, POST, DELETE
+    Content-length: 19
+    (본문 19바이트) method not allowed
+>>> GET /odd HTTP/1.1
+    [HTTP/1.1 471 ]
+    Content-length: 7
+    (본문 7바이트) custom</code></pre>
+
+<p>다섯 응답을 차례로 읽어 보자. 첫 응답의 상태 줄은 <code>HTTP/1.1 200 OK</code>이고, 문법 그대로 버전·공백·숫자·공백·사유 구문이다. 헤더 이름이 <code>Content-length</code>로 찍힌 것은 이 서버의 표기일 뿐이다. 필드 이름은 대소문자를 구분하지 않는다(RFC 9110 5.1절). 서버가 넣는 <code>Date</code> 줄은 실행 시각에 따라 달라지므로 출력에서 뺐다.</p>
+
+<p>둘째 응답은 같은 URI에 메서드만 POST로 바꾼 결과다. 상태 코드가 201로 바뀌고 <code>Location: /notes/1</code>이 붙었다. 같은 "성공"이라도 200과 201은 수신자에게 다른 것을 알려 준다. 201은 새 자원이 만들어졌고 그 자원의 식별자가 Location에 있다는 뜻이다. 셋째 응답 204에서는 눈여겨볼 것이 두 가지다. 본문이 0바이트이고, <code>Content-length</code> 헤더 자체가 없다. 본문이 없다는 사실을 헤더가 아니라 상태 코드가 말해 주고 있다. 이 점은 다음 절에서 다시 다룬다.</p>
+
+<p>넷째 응답은 이 서버가 처리하지 않는 PATCH를 보낸 결과다. 405와 함께 <code>Allow: GET, POST, DELETE</code>가 왔다. 서버가 "이 메서드는 안 된다"에서 그치지 않고 "이 자원에 쓸 수 있는 메서드는 이것들"이라고 알려 준 것이다. 마지막 응답의 상태 줄은 <code>HTTP/1.1 471 </code>이다. 숫자 뒤에 공백 하나가 있고 사유 구문은 비어 있다. JDK 서버가 471에 붙일 문구를 모르기 때문인데, RFC 9112의 문법상 문제가 없다. 서버는 사유 구문이 없어도 상태 코드 뒤의 공백은 보내야 한다(MUST). 이 응답을 받은 클라이언트는 471을 모르더라도 4xx로, 곧 400처럼 다루면 된다.</p>
+
+<h3>수신자는 상태 코드로 무엇을 결정하는가</h3>
+
+<p>상태 코드는 "결과 통보"라는 한마디로 뭉뚱그리기 쉽지만, 수신자의 코드 안에서는 서로 다른 네 가지 결정에 쓰인다. 하나씩 나누어 보면 각 상태 코드의 정의에 왜 그런 문장들이 들어 있는지가 보인다.</p>
+
+<h4>첫째, 메시지가 어디서 끝나는가</h4>
+
+<p>03회에서 수신자가 본문의 끝을 정하는 규칙(RFC 9112 6.3절)을 보았다. 그 규칙의 첫째 항목이 상태 코드에 관한 것이다. HEAD 요청에 대한 모든 응답, 그리고 1xx·204·304 응답은 헤더 필드 다음의 첫 빈 줄에서 끝난다. 메시지에 어떤 헤더가 있든 상관없다. 따라서 이 응답들은 본문도 트레일러도 가질 수 없다. 둘째 항목도 상태 코드를 본다. CONNECT 요청에 대한 2xx 응답은 빈 줄 직후부터 연결이 터널이 된다는 뜻이다.</p>
+
+<p>이 규칙은 권고가 아니라 파싱 규칙이라는 점이 중요하다. 지속 연결에서는 한 응답의 끝이 곧 다음 응답의 시작이다. 서버가 204 뒤에 본문 바이트를 몇 개 써 넣으면, 규칙을 따르는 클라이언트는 빈 줄에서 204 응답을 끝내고 그 뒤의 바이트를 다음 응답의 상태 줄로 읽으려 한다. 그 순간부터 같은 연결의 요청과 응답은 짝이 어긋난다. 그래서 구현은 애초에 그런 메시지를 만들지 못하게 막는다. OpenJDK 21의 내장 서버 소스(<code>sun.net.httpserver.ExchangeImpl</code>)를 보면, 상태 코드가 1xx·204·304일 때 핸들러가 넘긴 본문 길이를 무시하고 "본문 없음"으로 강제하며, 핸들러가 본문 길이를 넘겼다면 경고 로그를 남긴다. 앞 실험에서 204 응답에 <code>Content-length</code>가 없었던 것도 같은 코드의 결과다. RFC 9110 8.6절이 1xx와 204 응답에는 Content-Length를 보내지 말라고(MUST NOT) 정하기 때문이다.</p>
+
+<h4>둘째, 이 응답을 저장해 두었다가 다시 써도 되는가</h4>
+
+<p>캐시는 응답을 저장할지 정할 때 상태 코드를 본다. RFC 9111 3절에 따르면 캐시는 최종 상태 코드를 가진 응답만 저장할 수 있다. 그리고 응답에 명시적인 만료 정보가 없더라도 저장해 두고 추정한 유효 기간 동안 재사용할 수 있는 상태 코드가 따로 정해져 있다. 이를 휴리스틱하게 캐시 가능한(heuristically cacheable) 상태 코드라고 한다. RFC 9110 15.1절이 나열하는 목록은 200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501이다.</p>
+
+<p>이 목록에서 읽을 수 있는 것이 있다. 301과 308은 있고 302와 307은 없다. "영구히 옮겼다"는 답은 다시 물어보지 않아도 되지만 "잠시 옮겼다"는 답은 그렇지 않다는 판단이 숫자에 들어 있다. 404와 410이 목록에 있다는 것은 "없다"는 답도 재사용될 수 있다는 뜻이다. 캐시의 세부 규칙은 08회의 몫이다. 여기서는 상태 코드가 캐시의 입력이라는 사실만 기억해 두자.</p>
+
+<h4>셋째, 사용자에게 묻지 않고 다음 행동을 해도 되는가</h4>
+
+<p>일부 상태 코드는 사용자 에이전트에게 후속 요청을 자동으로 보낼 근거를 준다. 3xx와 Location이 오면 새 URI로 다시 요청할 수 있고, 401과 인증 요구가 오면 자격 증명을 붙여 같은 요청을 반복할 수 있으며, 1xx가 오면 연결을 그대로 쥔 채 최종 응답을 기다린다. 반대로 403은 같은 자격 증명으로 자동 반복하지 말라는 문장을 정의 안에 갖고 있다. 이런 자동 동작은 본문을 해석하지 않고 일어난다.</p>
+
+<h4>넷째, 모르는 코드를 만나면</h4>
+
+<p>앞에서 본 클래스 규칙이다. 수신자는 코드표에 없는 숫자를 만나도 첫째 자리로 처리 방침을 정한다. 네 결정을 표로 모으면 다음과 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>결정</th><th>상태 코드가 정해 주는 것</th><th>근거</th></tr></thead><tbody>
+<tr><td>메시지의 끝</td><td>1xx·204·304는 빈 줄에서 끝난다. 본문 없음</td><td>RFC 9112 6.3절</td></tr>
+<tr><td>캐시 저장</td><td>최종 응답만 저장. 명시적 만료 정보가 없어도 되는 코드가 따로 있다</td><td>RFC 9111 3절, RFC 9110 15.1절</td></tr>
+<tr><td>자동 후속 동작</td><td>3xx는 재요청, 401은 인증 후 반복, 1xx는 대기</td><td>RFC 9110 15.2·15.4·15.5절</td></tr>
+<tr><td>모르는 코드</td><td>같은 클래스의 x00으로 취급</td><td>RFC 9110 15절</td></tr>
+</tbody></table></div>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>상태 코드는 본문을 해석할 수 없는 수신자들, 곧 브라우저·라이브러리·프록시·캐시가 응답을 어떻게 다룰지 정하는 입력이다. 메시지의 끝, 저장 여부, 자동 후속 요청, 재시도 판단이 모두 이 세 자리 숫자에서 갈린다. 그래서 "실제로 일어난 일과 다른 상태 코드"는 문구가 어색한 정도의 문제가 아니라, 응답 경로에 있는 모든 프로그램을 잘못 움직이게 하는 문제다.</p></aside>
+
+<h3>1xx 정보 응답: 최종 응답보다 먼저 오는 말</h3>
+
+<p>1xx(Informational) 클래스는 요청된 동작을 끝내고 최종 응답을 보내기 전에, 연결 상태나 요청 진행 상황을 알리는 중간 응답이다(RFC 9110 15.2절). 1xx 응답은 헤더 구역의 끝에서 끝나며 본문과 트레일러를 가질 수 없다. 클라이언트는 자신이 기대하지 않았더라도 최종 응답 앞에 오는 하나 이상의 1xx 응답을 파싱할 수 있어야 한다(MUST). 사용자 에이전트는 예상하지 못한 1xx 응답을 무시해도 된다. HTTP/1.0은 1xx를 정의하지 않았으므로 서버는 HTTP/1.0 클라이언트에게 1xx를 보내서는 안 된다.</p>
+
+<p>가장 잘 알려진 것이 100(Continue)이다. 이 코드가 풀려는 문제를 먼저 보자. 클라이언트가 큰 파일을 PUT으로 올리려 한다. 그런데 서버는 헤더만 보고도 이 요청을 거절할 수 있다. 인증 정보가 없거나, 그 자원이 PUT을 허용하지 않거나, 본문이 너무 클 수 있다. 그런데도 클라이언트가 헤더에 이어 본문 전체를 밀어 넣는다면 전송량과 시간이 그대로 낭비된다.</p>
+
+<p>그래서 클라이언트는 요청에 <code>Expect: 100-continue</code> 헤더를 넣고 헤더까지만 보낸 뒤 잠시 기다릴 수 있다(RFC 9110 10.1.1절). 이 기대를 받은 원 서버는 둘 중 하나를 즉시 보내야 한다. 메서드, 대상 URI, 헤더 필드만으로 결과를 정할 수 있으면 최종 상태 코드를 가진 응답을, 그렇지 않으면 본문을 보내도 좋다는 뜻의 100 응답을 보낸다. 서버는 본문이 오기를 기다렸다가 100을 보내서는 안 된다. 100을 보낸 서버는 본문을 받고 처리한 뒤 반드시 최종 응답을 보내야 한다.</p>
+
+<p>이 대화도 소켓으로 직접 확인할 수 있다. 아래 프로그램은 헤더까지만 보낸 다음 서버의 말을 읽고, 그 뒤에 본문 5바이트를 보낸 다음 같은 연결에서 응답을 한 번 더 읽는다.</p>
+
+<pre><code class="language-java">import com.sun.net.httpserver.HttpServer;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+
+public class ContinueLab {
+    public static void main(String[] args) throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/upload", ex -> {
+            int received = ex.getRequestBody().readAllBytes().length;
+            byte[] body = ("received " + received + "\n").getBytes(StandardCharsets.UTF_8);
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        server.start();
+        int port = server.getAddress().getPort();
+        try (Socket socket = new Socket("127.0.0.1", port)) {
+            OutputStream out = socket.getOutputStream();
+            BufferedReader in = new BufferedReader(
+                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+
+            // 1) 헤더까지만 보내고 멈춘다
+            out.write(("PUT /upload HTTP/1.1\r\n"
+                    + "Host: 127.0.0.1:" + port + "\r\n"
+                    + "Content-Length: 5\r\n"
+                    + "Expect: 100-continue\r\n"
+                    + "Connection: close\r\n"
+                    + "\r\n").getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+
+            // 2) 본문을 보내기 전에 서버가 한 말을 읽는다
+            String line;
+            while (!(line = in.readLine()).isEmpty()) {
+                System.out.println("[본문 전송 전] " + line);
+            }
+
+            // 3) 이제 본문을 보낸다
+            out.write("hello".getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+
+            // 4) 같은 연결에서 두 번째 응답(최종 응답)을 읽는다
+            while ((line = in.readLine()) != null) {
+                if (line.startsWith("Date:")) continue;
+                System.out.println("[본문 전송 후] " + line);
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">[본문 전송 전] HTTP/1.1 100 Continue
+[본문 전송 전] Content-Length: 0
+[본문 전송 후] HTTP/1.1 200 OK
+[본문 전송 후] Content-length: 11
+[본문 전송 후]
+[본문 전송 후] received 5</code></pre>
+
+<p>요청은 하나인데 상태 줄이 두 번 왔다. 본문을 한 바이트도 보내지 않은 시점에 <code>HTTP/1.1 100 Continue</code>가 먼저 도착했고, 본문을 보낸 뒤에 <code>HTTP/1.1 200 OK</code>가 왔다. "0개 이상의 중간 응답 뒤에 최종 응답 하나"라는 문장이 연결 위에서 실제로 이런 모양이다. 응답을 읽는 코드가 "상태 줄은 요청당 한 번"이라고 가정하고 있었다면 100을 최종 응답으로 착각하고 빈 결과를 돌려주었을 것이다. HTTP 클라이언트 라이브러리가 1xx를 만나면 버리고 다음 상태 줄을 다시 읽는 이유다.</p>
+
+<aside class="note">출력에서 JDK 21의 내장 서버가 100 응답에 <code>Content-Length: 0</code>을 붙인 것이 보인다. RFC 9110 8.6절은 1xx 응답에 Content-Length를 보내지 말라고 정하므로 이 부분은 명세와 어긋난다. 그래도 수신자는 곤란하지 않다. RFC 9112 6.3절의 첫째 규칙에 따라 1xx는 어떤 헤더가 있든 빈 줄에서 끝나기 때문이다. 파싱 규칙이 헤더가 아니라 상태 코드를 먼저 보도록 되어 있는 이유를 여기서도 확인할 수 있다.</aside>
+
+<p>클라이언트가 100을 무한정 기다려야 하는 것은 아니다. RFC 9110은 100-continue 기대를 보낸 클라이언트가 응답을 받지 못했더라도 본문 전송을 진행할 수 있다고 하고, 중간에 HTTP/1.0 중개자가 있으면 100이 전달되지 못하므로 무기한 기다리지 말라고 권고한다. 얼마나 기다릴지는 명세가 정하지 않으며 클라이언트 구현의 몫이다.</p>
+
+<p>101(Switching Protocols)은 클라이언트가 <code>Upgrade</code> 헤더로 요청한 프로토콜 전환에 서버가 동의한다는 뜻이다. 서버는 응답에 Upgrade 헤더를 넣어 이 응답 이후 어떤 프로토콜이 쓰일지 밝혀야 한다. 이 응답 뒤로 그 연결에서는 지금까지의 프로토콜 대신 Upgrade에 적힌 프로토콜이 쓰인다. 웹소켓(WebSocket)의 여는 핸드셰이크가 바로 이 코드를 쓴다(RFC 6455). 그 밖에 RFC 8297이 정의한 103(Early Hints)은 최종 응답에 들어갈 것으로 예상되는 헤더 필드를 미리 알려 주는 코드다. 서버가 본문을 준비하는 동안 클라이언트가 <code>Link</code> 헤더에 적힌 자원을 먼저 가져오기 시작할 수 있게 한다.</p>
+
+<p>애플리케이션 코드에서 1xx를 직접 만들 일은 드물다. 서버 컨테이너나 프록시가 처리한다. 그래도 1xx를 알아야 하는 까닭은 응답의 구조에 대한 이해가 달라지기 때문이다. "요청 하나에 응답 하나"가 아니라 "요청 하나에 최종 응답 하나"가 정확한 표현이다.</p>
+
+<h3>2xx 성공: 무엇이 성공했는지는 메서드가 정한다</h3>
+
+<p>2xx(Successful) 클래스는 클라이언트의 요청을 성공적으로 받았고, 이해했고, 받아들였다는 뜻이다. 여기서 "무엇이 성공했는가"는 상태 코드만으로는 정해지지 않고 요청 메서드와 함께 읽어야 한다. 가장 흔한 200(OK)부터 그렇다. RFC 9110 15.3.1절은 200 응답의 본문이 무엇을 나타내는지가 메서드에 따라 다르다고 하고 표로 정리한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>요청 메서드</th><th>200 응답의 본문이 나타내는 것</th></tr></thead><tbody>
+<tr><td>GET</td><td>대상 자원의 표현</td></tr>
+<tr><td>HEAD</td><td>GET과 같되 표현 데이터는 전송하지 않음</td></tr>
+<tr><td>POST</td><td>동작의 상태 또는 동작으로 얻은 결과</td></tr>
+<tr><td>PUT, DELETE</td><td>동작의 상태</td></tr>
+<tr><td>OPTIONS</td><td>대상 자원의 통신 옵션</td></tr>
+</tbody></table></div>
+
+<p>GET의 200에 실린 본문은 그 URI가 가리키는 자원 자체의 표현이다. 그래서 캐시가 그 본문을 저장해 두었다가 같은 URI의 다음 GET에 답으로 쓸 수 있다. POST의 200에 실린 본문은 "처리 결과에 대한 설명"이지 그 URI의 표현이 아니다. 같은 200이어도 본문과 URI의 관계가 다르다. POST 응답이 명시적인 만료 정보와 대상 URI와 같은 값의 <code>Content-Location</code>을 함께 가질 때만 캐시될 수 있다는 규칙(RFC 9110 9.3.3절)도 이 차이에서 나온다. 또 명세는 200 응답이 본문을 갖는 것으로 기대된다고 말한다. 보낼 내용이 없는 성공을 위해서는 204가 따로 있다.</p>
+
+<h4>201 Created: 새 자원의 주소를 알려 준다</h4>
+
+<p>201은 요청이 수행되었고 그 결과 하나 이상의 새 자원이 만들어졌다는 뜻이다. 만들어진 주 자원은 응답의 Location 헤더 필드로 식별되고, Location이 없으면 요청의 대상 URI로 식별된다. 이 한 문장이 05회에서 다룬 두 가지 등록 방식과 정확히 대응한다. POST로 <code>/notes</code>에 등록하면 서버가 새 URI를 정하므로 Location이 필요하다. 클라이언트가 URI를 정해 PUT으로 <code>/notes/7</code>에 올렸다면 새 자원의 URI는 이미 대상 URI이므로 Location이 없어도 된다.</p>
+
+<p>명세의 요구 수준도 다르다. POST 처리로 자원이 만들어졌다면 원 서버는 Location을 담은 201을 보내는 것이 좋다(SHOULD, RFC 9110 9.3.3절). PUT이 현재 표현이 없던 대상 자원에 새 표현을 만들었다면 원 서버는 201을 보내야 한다(MUST, 9.3.4절). 한편 201의 Location은 3xx의 Location과 뜻이 다르다. RFC 9110 10.2.2절은 Location이 가리키는 관계의 종류가 요청 메서드와 상태 코드의 조합으로 정해진다고 말한다. 201에서는 "방금 만든 자원이 여기 있다"는 안내이고, 3xx에서는 "여기로 다시 요청하라"는 유도다. 브라우저의 동작을 정의하는 WHATWG Fetch 표준이 리다이렉트 상태로 정하는 것은 3xx의 다섯 코드뿐이어서, 브라우저는 201의 Location으로 자동 이동하지 않는다.</p>
+
+<h4>202 Accepted: 받았지만 끝나지 않았다</h4>
+
+<p>202는 요청을 처리하려고 받아들였으나 처리가 끝나지 않았다는 뜻이다. RFC 9110 15.3.3절은 이 응답이 "의도적으로 확답을 피한다"고 표현한다. 처리 시점에 가서 요청이 거부될 수도 있기 때문이다. 하루에 한 번 도는 배치 작업처럼 오래 걸리는 일을 맡길 때, 작업이 끝날 때까지 클라이언트의 연결을 붙잡아 두지 않으려는 것이 목적이다.</p>
+
+<p>명세는 한 가지 한계를 분명히 적는다. HTTP에는 비동기 작업의 상태 코드를 나중에 다시 보내 주는 수단이 없다. 응답은 요청에 대한 대답으로만 존재하므로(03회의 클라이언트 서버 구조), 서버가 한 시간 뒤에 "아까 그 요청은 실패했다"고 먼저 말을 걸 방법이 없다. 그래서 202 응답의 본문은 요청의 현재 상태를 설명하고, 언제 끝날지 알려 줄 수 있는 상태 확인용 자원을 가리키는 것이 좋다고 한다. 클라이언트가 그 URI를 GET으로 다시 조회해 결과를 알아내는 구조가 여기서 나온다.</p>
+
+<pre data-label="202 응답의 예"><code class="language-http">HTTP/1.1 202 Accepted
+Content-Type: application/json
+Content-Length: 50
+
+{"status":"queued","monitor":"/exports/42/status"}</code></pre>
+
+<p>202를 쓸 때 주의할 점은 이 코드가 "처리 성공"이 아니라는 것이다. 클라이언트가 202를 2xx이니 완료로 간주하면, 뒤에서 실패한 작업을 영영 알아채지 못한다. 실패를 알릴 경로를 설계에 포함해야 202가 성립한다.</p>
+
+<h4>204 No Content와 205 Reset Content</h4>
+
+<p>204는 서버가 요청을 성공적으로 수행했고 응답 본문으로 보낼 추가 내용이 없다는 뜻이다. 본문이 없을 뿐 헤더는 의미를 갖는다. 응답 헤더의 메타데이터는 동작이 적용된 뒤의 대상 자원에 대한 것이다. 명세의 예로, PUT에 대한 204에 <code>ETag</code>가 있으면 PUT이 성공했고 그 값이 새 표현의 엔티티 태그라는 뜻이다. PUT과 DELETE의 성공 응답으로 204가 자주 쓰이는 근거도 명세에 있다. 기존 표현을 PUT으로 수정했으면 200이나 204를 보내야 하고, DELETE가 수행되었고 더 알려 줄 정보가 없으면 204를 보내는 것이 좋다.</p>
+
+<p>204에는 사용자 에이전트를 향한 뜻도 들어 있다. 명세는 204가 사용자 에이전트가 현재의 "문서 뷰"에서 벗어날 필요가 없음을 암시한다고 하고, 문서 편집 화면의 "저장" 동작을 예로 든다. 저장 요청은 성공했지만 사용자는 편집하던 문서를 계속 보고 있어야 한다. 205(Reset Content)는 반대로, 요청을 보낸 문서 뷰를 처음 상태로 되돌리라는 뜻이다. 자료를 입력해 제출한 뒤 같은 양식에 다음 자료를 이어서 입력하는 경우를 위한 코드이며, 서버는 205 응답에 본문을 만들어서는 안 된다.</p>
+
+<p>그 밖에 206(Partial Content)은 <code>Range</code> 헤더로 표현의 일부만 요청했을 때 그 부분을 돌려주는 성공 응답이고, 203(Non-Authoritative Information)은 변환 프록시가 원 서버의 200 응답 본문을 수정했음을 알리는 코드다. 네 가지 주요 코드를 고르는 기준을 정리하면 다음과 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>상황</th><th>코드</th><th>수신자가 알게 되는 것</th></tr></thead><tbody>
+<tr><td>성공했고 돌려줄 내용이 있다</td><td>200</td><td>본문의 뜻은 메서드에 따라 읽는다</td></tr>
+<tr><td>새 자원이 만들어졌다</td><td>201</td><td>Location(없으면 대상 URI)이 새 자원의 식별자다</td></tr>
+<tr><td>받아 두었고 나중에 처리한다</td><td>202</td><td>완료가 아니다. 상태를 조회할 곳을 본문에서 찾는다</td></tr>
+<tr><td>성공했고 돌려줄 내용이 없다</td><td>204</td><td>빈 줄에서 응답이 끝난다. 현재 화면을 유지한다</td></tr>
+</tbody></table></div>
+
+<h3>3xx 리다이렉션 ①: 두 번째 요청은 클라이언트가 만든다</h3>
+
+<p>3xx(Redirection) 클래스는 요청을 완료하려면 사용자 에이전트가 추가 행동을 해야 한다는 뜻이다. RFC 9110 15.4절은 리다이렉션을 네 종류로 나눈다. 첫째는 자원이 다른 URI에 있을 수 있음을 Location으로 알리는 것으로 301, 302, 307, 308이 여기 속한다. 둘째는 자원을 나타낼 수 있는 여러 후보 중에서 고르게 하는 300이다. 셋째는 요청에 대한 간접적인 응답이 될 다른 자원으로 보내는 303이다. 넷째는 이전에 저장해 둔 결과로 보내는 304다.</p>
+
+<p>가장 먼저 바로잡아야 할 것은 "서버가 요청을 다른 곳으로 넘겨준다"는 인상이다. 리다이렉션에서 서버는 아무것도 넘기지 않는다. 서버는 3xx 응답 하나를 보내고 그 요청에 대한 일을 끝낸다. Location에 적힌 URI로 두 번째 요청을 새로 만들어 보내는 것은 클라이언트다. 요청과 응답의 쌍이 두 번 일어난다.</p>
+
+<pre class="diagram">브라우저                        old.example                    new.example
+   │                                │                              │
+   │ ① GET /guide HTTP/1.1          │                              │
+   │    Host: old.example           │                              │
+   │───────────────────────────────>│                              │
+   │                                │                              │
+   │ ② HTTP/1.1 301 Moved Permanently                              │
+   │    Location: https://new.example/guide                        │
+   │<───────────────────────────────│   (old.example의 일은 여기서 끝)
+   │                                                               │
+   │ ③ Location을 읽고 새 요청을 스스로 만든다                     │
+   │    (호스트가 다르므로 DNS 조회와 연결부터 다시)               │
+   │                                                               │
+   │ ④ GET /guide HTTP/1.1                                         │
+   │    Host: new.example                                          │
+   │──────────────────────────────────────────────────────────────>│
+   │                                                               │
+   │ ⑤ HTTP/1.1 200 OK                                             │
+   │<──────────────────────────────────────────────────────────────│
+   │                                                               │
+   │ ⑥ 주소 표시줄: https://new.example/guide</pre>
+
+<p>이 구조에서 몇 가지 결과가 따라 나온다. 왕복이 한 번 더 든다. Location의 호스트가 다르면 01·02회에서 본 DNS 조회와 TCP 연결 수립(HTTPS라면 TLS 핸드셰이크까지)을 새로 해야 한다. 두 번째 요청은 03회에서 본 무상태 원칙대로 독립된 요청이므로, 첫 서버가 알고 있던 맥락은 두 번째 서버에 전달되지 않는다. 전달할 것이 있으면 Location의 URI 안에 넣어야 한다. 그리고 최종 문서를 만든 요청이 ④이므로 브라우저의 주소 표시줄에는 새 URI가 남는다.</p>
+
+<x-visual id="http-06-redirect-sequence" title="301 응답을 받은 브라우저가 Location의 URI로 두 번째 요청을 직접 만들어 보내는 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>리다이렉션이 서버 간 전달이 아니라 요청·응답 쌍 두 개라는 점, 두 번째 요청의 출발점이 브라우저라는 점을 보여 준다.</x-hint>
+<x-prompt>깔끔한 평면 시퀀스 다이어그램, 흰 배경. 세로 생명선 세 개를 왼쪽부터 "브라우저", "old.example", "new.example"이라는 머리 상자와 함께 그린다. 첫째 화살표는 브라우저에서 old.example로 가는 실선이며 라벨 "① GET /guide". 둘째 화살표는 old.example에서 브라우저로 돌아오는 점선이며 라벨 "② 301 + Location: new.example/guide". 그 아래 브라우저 생명선 위에 작은 메모 상자를 두고 "③ 새 요청을 직접 만든다"라고 쓴다. 셋째 화살표는 브라우저에서 old.example 생명선을 건너뛰어 new.example로 가는 굵은 실선이며 라벨 "④ GET /guide". 넷째 화살표는 new.example에서 브라우저로 돌아오는 점선이며 라벨 "⑤ 200 OK". old.example과 new.example 사이에는 어떤 화살표도 없어야 하며, 그 빈 공간에 흐린 글씨로 "서버끼리는 통신하지 않는다"라고 적는다. 맨 아래 브라우저 쪽에 주소 표시줄 모양의 둥근 상자를 그리고 "https://new.example/guide"를 적는다.</x-prompt>
+<x-caption>3xx 응답을 보낸 서버의 일은 거기서 끝난다. Location을 해석하고 다음 요청을 보내는 것은 사용자 에이전트다.</x-caption>
+</x-visual>
+
+<h4>Location의 값은 어떻게 해석되는가</h4>
+
+<p>Location 헤더 필드의 값은 URI 참조(URI-reference) 하나다(RFC 9110 10.2.2절). 02회에서 본 대로 URI 참조는 절대 URI일 수도 있고 상대 참조일 수도 있다. 상대 참조이면 요청의 대상 URI를 기준으로 해석해 최종 값을 얻는다. 그래서 <code>Location: /notes/1</code>처럼 경로만 적어도 된다. 값에 쉼표로 구분한 목록을 넣을 수는 없다. 쉼표가 URI 안에서 유효한 문자이기 때문이다.</p>
+
+<p>프래그먼트에는 따로 규칙이 있다. 02회에서 프래그먼트는 서버로 전송되지 않는다고 했다. 그렇다면 <code>#larry</code>가 붙은 URI로 요청했다가 리다이렉트되면 프래그먼트는 어떻게 될까. RFC 9110은 3xx 응답의 Location 값에 프래그먼트가 없으면, 사용자 에이전트가 원래 참조의 프래그먼트를 물려받은 것으로 처리해야 한다고 정한다. 명세의 예에서 <code>http://www.example.org/index.html#larry</code>를 요청해 <code>Location: http://www.example.net/index.html</code>을 받으면 사용자 에이전트는 <code>http://www.example.net/index.html#larry</code>로 이동한다. 서버는 프래그먼트를 본 적이 없으므로, 이 일은 사용자 에이전트만 할 수 있다.</p>
+
+<h4>두 번째 요청은 첫 요청의 복사본이 아니다</h4>
+
+<p>Location이 있으면 사용자 에이전트는 자동으로 리다이렉트해도 된다(MAY). 의무가 아니라 허용이다. 명세는 안전하다고 알려지지 않은 메서드에 대해서는 자동 리다이렉션을 조심해서 해야 한다고 덧붙인다. 사용자가 그 요청이 다른 곳으로 다시 보내지기를 원하지 않을 수 있기 때문이다. 자동으로 따라갈 때 원래 요청을 어떻게 고쳐서 다시 보내야 하는지도 15.4절에 나열되어 있다.</p>
+
+<ol>
+<li>대상 URI를 Location 값(원래 대상 URI를 기준으로 해석한 결과)으로 바꾼다.</li>
+<li>구현이 자동으로 만든 헤더 필드를 제거하고 새 요청에 맞는 값으로 다시 만든다. 연결에 관한 필드, 프록시 설정에 관한 필드, <code>Host</code>처럼 출처에 관한 필드, 캐시가 붙인 조건부 필드, 그리고 <code>Referer</code>·<code>Origin</code>·<code>Authorization</code>·<code>Cookie</code>처럼 자원에 관한 필드가 해당한다.</li>
+<li>호출한 쪽이 직접 넣은 헤더 필드라도 보안상 문제가 될 수 있으면 제거를 고려한다. <code>Authorization</code>과 <code>Cookie</code>가 예로 들어 있다.</li>
+<li>리다이렉트하는 상태 코드의 의미에 따라, 해당하면 요청 메서드를 바꾼다.</li>
+<li>메서드가 GET이나 HEAD로 바뀌었으면 <code>Content-Type</code>, <code>Content-Length</code> 같은 본문 관련 헤더 필드를 제거한다.</li>
+</ol>
+
+<p>둘째와 셋째 항목이 중요한 이유는 다른 사이트로 리다이렉트될 때 드러난다. 한 사이트에 보내려던 인증 정보나 쿠키가 Location에 적힌 다른 사이트로 그대로 따라가면 자격 증명이 새어 나간다. 넷째와 다섯째 항목이 다음 절의 주제인 "메서드가 바뀌는 문제"다.</p>
+
+<h4>끝없이 도는 리다이렉션</h4>
+
+<p>A가 B로, B가 다시 A로 보내면 요청은 끝나지 않는다. RFC 9110은 클라이언트가 순환하는 리다이렉션을 감지하고 개입하는 것이 좋다고(SHOULD) 하면서 횟수는 정하지 않는다. 다만 예전 명세(RFC 2068)가 최대 5회를 권고했으므로 그런 고정 한도를 둔 클라이언트가 있을 수 있다는 점을 알아 두라고 적는다. 구현은 저마다 한도를 둔다. 브라우저의 동작을 정의하는 WHATWG Fetch 표준은 요청의 리다이렉트 횟수가 20이면 네트워크 오류를 돌려주도록 한다. OpenJDK 21의 <code>java.net.http.HttpClient</code> 소스에는 <code>jdk.httpclient.redirects.retrylimit</code> 시스템 프로퍼티로 조정하는 한도가 있고 기본값은 5다. 한도에 이르면 더 따라가지 않고 그 3xx 응답을 호출한 쪽에 그대로 돌려준다.</p>
+
+<p>한 가지 더, <code>Retry-After</code> 헤더는 3xx 응답에도 쓸 수 있다. 이때는 사용자 에이전트가 리다이렉트된 요청을 보내기 전에 기다려 달라고 요청받는 최소 시간을 뜻한다(RFC 9110 10.2.3절).</p>
+
+<h3>3xx 리다이렉션 ②: 영구와 일시, 그리고 메서드가 바뀌는 문제</h3>
+
+<p>Location으로 다른 URI를 알려 주는 코드들은 두 개의 축으로 구분된다. 첫째 축은 "앞으로 어느 URI를 써야 하는가"다. 301과 308은 대상 자원에 새 영구 URI가 부여되었고 앞으로 이 자원을 참조할 때는 새 URI를 쓰는 것이 좋다는 뜻이다. 302와 307은 자원이 일시적으로 다른 URI에 있다는 뜻이며, 이 리다이렉션은 바뀔 수 있으므로 클라이언트는 앞으로도 원래의 URI를 계속 써야 한다. 둘째 축은 "자동으로 따라갈 때 요청 메서드가 유지되는가"다. 308을 정의한 RFC 7538은 이 두 축으로 2×2 표를 그려 빈칸 하나를 채우는 것으로 자신을 소개한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th></th><th>영구(Permanent)</th><th>일시(Temporary)</th></tr></thead><tbody>
+<tr><td>POST를 GET으로 바꾸는 것을 허용한다</td><td>301 Moved Permanently</td><td>302 Found</td></tr>
+<tr><td>POST를 GET으로 바꾸는 것을 허용하지 않는다</td><td>308 Permanent Redirect</td><td>307 Temporary Redirect</td></tr>
+</tbody></table></div>
+
+<p>영구와 일시의 차이는 캐시에서 실제 동작의 차이로 나타난다. 앞에서 본 휴리스틱하게 캐시 가능한 코드 목록에 301과 308은 있고 302와 307은 없다. 301 응답을 저장한 캐시는 명시적인 만료 정보가 없어도 한동안 원 서버에 묻지 않고 같은 리다이렉션을 재사용할 수 있다. 명세는 301과 308에 대해, 링크를 편집할 수 있는 사용자 에이전트라면 대상 URI에 대한 참조를 새 URI로 영구히 바꿔도 된다고 서버가 제안하는 것이라고도 설명한다. 다만 이 제안은 사용자 에이전트가 참조를 편집하는 중이고, 연결이 보호되어 있으며, 원 서버가 편집 중인 콘텐츠에 대해 신뢰할 수 있는 권한자인 경우가 아니면 보통 무시된다고 덧붙인다. 301·302·307·308 모두 서버는 Location을 생성하는 것이 좋고(SHOULD), 응답 본문에는 대개 새 URI로 가는 하이퍼링크를 담은 짧은 안내문이 들어간다. 자동으로 따라가지 않는 클라이언트의 사용자를 위한 것이다.</p>
+
+<h4>301과 302는 왜 메서드를 바꿀 수 있게 되었는가</h4>
+
+<p>둘째 축은 설계가 아니라 역사의 결과다. HTTP/1.0(RFC 1945)은 301과 302를 메서드를 유지하는 리다이렉션으로 정의했다. 그 문서의 302 이름은 지금의 Found가 아니라 Moved Temporarily였다. RFC 1945는 POST 요청에 대해 301이나 302를 받으면 사용자가 확인해 주지 않는 한 자동으로 리다이렉트해서는 안 된다고 했다. 요청이 만들어진 조건이 달라질 수 있기 때문이다. 그리고 같은 자리에 주석을 달아, 일부 사용자 에이전트가 POST 요청을 자동으로 리다이렉트하면서 GET으로 잘못 바꾼다고 적어 두었다. 명세가 구현의 일탈을 당시에 이미 기록한 것이다.</p>
+
+<p>RFC 9110 15.4절은 그 뒤의 경과를 요약한다. 초기 사용자 에이전트들은 POST 요청을 명세대로 POST로 리다이렉트할지, GET으로 리다이렉트할지를 두고 갈렸다. 명세는 GET 쪽을 "다른 사이트로 리다이렉트될 때 더 안전한 대안"이라고 표현한다. POST의 본문에는 사용자가 입력한 데이터가 들어 있고 POST는 안전하지 않은 메서드다. 응답 한 줄 때문에 그 데이터가 사용자가 의도하지 않은 서버로 다시 전송되고 거기서 무언가를 변경하는 것보다, 본문을 버리고 조회만 하는 편이 피해가 작다. 관행은 결국 메서드를 GET으로 바꾸는 쪽으로 수렴했다.</p>
+
+<p>명세는 굳어진 관행을 되돌리는 대신 두 가지를 했다. 301과 302의 정의를 고쳐 "역사적인 이유로, 사용자 에이전트는 후속 요청에서 메서드를 POST에서 GET으로 바꿔도 된다"는 주석을 달았다. 그리고 메서드를 유지한다는 뜻이 모호하지 않은 코드를 새로 추가했다. 307은 정의 안에 사용자 에이전트가 자동 리다이렉션을 수행할 때 요청 메서드를 바꿔서는 안 된다(MUST NOT)는 문장을 갖고 있다. 308은 그 영구 버전으로 2014년 6월에 추가되었고, 명세는 형제 코드들보다 훨씬 늦게 나온 만큼 어디서나 인식되지는 않을 수 있다고 적어 둔다. 303은 반대로 메서드를 GET으로 바꾸는 리다이렉션을 위해 정의된 코드다.</p>
+
+<h4>실험 2: 같은 POST를 다섯 가지 리다이렉션에 보내기</h4>
+
+<p>주석의 "바꿔도 된다"가 실제 클라이언트에서 어떻게 구현되어 있는지 확인해 보자. 아래 서버는 <code>/r/301</code>처럼 요청하면 경로의 숫자를 상태 코드로 삼아 <code>Location: /target</code>을 돌려준다. <code>/target</code>은 자신이 받은 요청의 메서드와 본문 길이를 응답으로 알려 준다. 클라이언트는 JDK의 <code>java.net.http.HttpClient</code>이고, 리다이렉트를 따라가도록 설정한 뒤 10바이트 본문을 가진 POST와 PUT을 다섯 코드에 각각 보낸다.</p>
+
+<pre><code class="language-java">import com.sun.net.httpserver.HttpServer;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+
+public class RedirectLab {
+    public static void main(String[] args) throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        // /r/301 처럼 요청하면 그 숫자를 상태 코드로 삼아 /target 으로 보낸다
+        server.createContext("/r/", ex -> {
+            int status = Integer.parseInt(ex.getRequestURI().getPath().substring(3));
+            ex.getRequestBody().readAllBytes();
+            ex.getResponseHeaders().add("Location", "/target");
+            ex.sendResponseHeaders(status, -1);
+            ex.close();
+        });
+        // /target 은 자신이 받은 메서드와 본문 길이를 그대로 알려 준다
+        server.createContext("/target", ex -> {
+            int received = ex.getRequestBody().readAllBytes().length;
+            byte[] body = (ex.getRequestMethod() + ", 본문 " + received + "바이트")
+                    .getBytes(StandardCharsets.UTF_8);
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        server.start();
+        String base = "http://127.0.0.1:" + server.getAddress().getPort();
+
+        HttpClient following = HttpClient.newBuilder()
+                .followRedirects(HttpClient.Redirect.NORMAL).build();
+        HttpClient plain = HttpClient.newHttpClient();   // 기본값은 Redirect.NEVER
+        try {
+            for (String method : new String[] {"POST", "PUT"}) {
+                for (int status : new int[] {301, 302, 303, 307, 308}) {
+                    HttpRequest request = HttpRequest.newBuilder(URI.create(base + "/r/" + status))
+                            .method(method, HttpRequest.BodyPublishers.ofString("0123456789"))
+                            .build();
+                    HttpResponse<String> response =
+                            following.send(request, HttpResponse.BodyHandlers.ofString());
+                    System.out.println(method + " -> " + status + " -> /target 이 받은 요청: "
+                            + response.body());
+                }
+            }
+            HttpRequest request = HttpRequest.newBuilder(URI.create(base + "/r/302"))
+                    .POST(HttpRequest.BodyPublishers.ofString("0123456789")).build();
+            HttpResponse<String> response = plain.send(request, HttpResponse.BodyHandlers.ofString());
+            System.out.println("따라가지 않는 클라이언트: " + response.statusCode()
+                    + ", Location=" + response.headers().firstValue("Location").orElse("(없음)"));
+        } finally {
+            server.stop(0);
+        }
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">POST -> 301 -> /target 이 받은 요청: GET, 본문 0바이트
+POST -> 302 -> /target 이 받은 요청: GET, 본문 0바이트
+POST -> 303 -> /target 이 받은 요청: GET, 본문 0바이트
+POST -> 307 -> /target 이 받은 요청: POST, 본문 10바이트
+POST -> 308 -> /target 이 받은 요청: POST, 본문 10바이트
+PUT -> 301 -> /target 이 받은 요청: PUT, 본문 10바이트
+PUT -> 302 -> /target 이 받은 요청: PUT, 본문 10바이트
+PUT -> 303 -> /target 이 받은 요청: GET, 본문 0바이트
+PUT -> 307 -> /target 이 받은 요청: PUT, 본문 10바이트
+PUT -> 308 -> /target 이 받은 요청: PUT, 본문 10바이트
+따라가지 않는 클라이언트: 302, Location=/target</code></pre>
+
+<p>POST의 다섯 줄부터 보자. 301과 302를 만난 POST는 <code>/target</code>에 GET으로 도착했고 본문 10바이트는 사라졌다. 앞 절의 재작성 규칙 넷째와 다섯째가 적용된 것이다. 메서드가 GET으로 바뀌었고, 그에 따라 본문과 본문 관련 헤더가 제거되었다. 307과 308에서는 POST와 본문이 그대로 두 번째 요청에 실렸다. 클라이언트가 같은 본문을 한 번 더 전송했다는 뜻이기도 하다.</p>
+
+<p>PUT의 다섯 줄이 더 흥미롭다. 301과 302를 만난 PUT은 PUT으로 남았다. 명세의 주석이 허용한 것은 "POST에서 GET으로"의 변경뿐이기 때문이다. 303에서는 PUT도 GET이 되었다. 303은 원래 메서드가 무엇이든 조회 요청으로 따라가는 코드다. 이 동작은 JDK만의 선택이 아니다. 브라우저의 요청 처리를 정의하는 WHATWG Fetch 표준의 리다이렉트 절차에도 같은 조건이 적혀 있다. 상태가 301이나 302이고 메서드가 POST이거나, 상태가 303이고 메서드가 GET이나 HEAD가 아니면, 메서드를 GET으로 바꾸고 본문을 비우고 본문 관련 헤더를 지운다. 그 밖의 경우에는 메서드를 건드리지 않는다.</p>
+
+<p>마지막 줄은 리다이렉트를 따라가지 않는 클라이언트의 결과다. 응답의 상태 코드가 302 그대로이고 Location 값이 헤더에 들어 있다. <code>HttpClient</code>의 리다이렉트 정책 기본값은 <code>Redirect.NEVER</code>다(Javadoc). 자동 리다이렉션은 명세에서 "해도 된다"이므로 따라갈지 말지는 사용자 에이전트의 정책이다. 라이브러리로 다른 서버의 API를 호출하는 코드를 쓸 때는 그 라이브러리가 3xx를 스스로 따라가는지, 따라간다면 어느 코드에서 메서드를 바꾸는지를 알고 있어야 한다. 이 실험에서 쓴 <code>Redirect.NORMAL</code>은 HTTPS에서 HTTP로 가는 경우만 빼고 항상 따라가는 정책이다.</p>
+
+<p>이 결과에서 실무 규칙 하나가 나온다. GET으로 조회하는 페이지의 주소를 옮길 때는 301과 302로 충분하다. 메서드가 바뀔 일이 없기 때문이다. 그러나 POST로 호출되는 API의 주소를 301로 옮기면, 리다이렉트를 따라가는 클라이언트들은 본문 없는 GET을 새 주소로 보낸다. 서버는 405를 돌려주거나, 그 경로에 GET 처리가 있다면 엉뚱한 응답을 돌려준다. 메서드와 본문이 유지되어야 하는 이동에는 307이나 308을 쓴다.</p>
+
+<h3>3xx 리다이렉션 ③: 303과 PRG, 그리고 300·304</h3>
+
+<p>303(See Other)은 서버가 사용자 에이전트를 다른 자원으로 보내되, 그 자원이 원래 요청에 대한 간접적인 응답이 되도록 하려는 것이다. 사용자 에이전트는 Location의 URI에 조회 요청(HTTP에서는 GET이나 HEAD)을 보내고, 그 결과를 원래 요청의 답으로 제시할 수 있다. 301·302와 달리 Location의 새 URI는 대상 URI와 동등한 것으로 간주되지 않는다. "그 자원이 저기로 옮겨 갔다"가 아니라 "네 요청의 결과는 저기서 볼 수 있다"는 뜻이다. RFC 9110은 303이 어떤 메서드에도 쓸 수 있지만 주로 POST 동작의 결과를 다른 자원으로 리다이렉트하는 데 쓰인다고 설명한다.</p>
+
+<h4>POST 응답을 200으로 직접 돌려주면 생기는 일</h4>
+
+<p>웹 브라우저에서 폼으로 주문을 넣는 상황을 요청 단위로 추적해 보자. 사용자가 폼을 제출하면 브라우저는 <code>POST /orders</code>를 보낸다. 서버는 주문을 저장하고 "주문이 완료되었습니다"라는 HTML을 200 응답의 본문으로 돌려준다. 브라우저는 그 HTML을 화면에 그린다. 여기까지는 문제가 없어 보인다.</p>
+
+<p>문제는 사용자가 그 화면에서 새로고침을 누를 때 생긴다. 브라우저의 새로고침은 현재 문서를 만들어 낸 요청을 다시 보내는 동작이다. 지금 화면의 문서를 만든 요청은 <code>POST /orders</code>다. 따라서 같은 본문을 가진 POST가 다시 전송된다(그 전에 다시 제출할지 묻는 확인 창이 뜰 수 있다). 04회에서 본 대로 POST는 멱등이 아니므로 서버는 이것을 새 주문으로 처리한다. 사용자는 화면을 다시 그리려 했을 뿐인데 주문이 두 건이 된다.</p>
+
+<pre class="diagram">[200으로 직접 응답]                          [303으로 리다이렉트]
+
+① POST /orders        → 주문 1001 생성       ① POST /orders        → 주문 1001 생성
+② 200 OK (결과 HTML)                         ② 303 See Other
+   현재 문서 = POST /orders 의 응답              Location: /orders/1001
+                                             ③ GET /orders/1001
+③ 새로고침                                   ④ 200 OK (결과 HTML)
+④ POST /orders (다시) → 주문 1002 생성          현재 문서 = GET /orders/1001 의 응답
+
+                                             ⑤ 새로고침
+                                             ⑥ GET /orders/1001 (다시) → 변화 없음</pre>
+
+<h4>PRG: Post, Redirect, Get</h4>
+
+<p>해법은 POST에 대한 응답으로 결과 화면을 직접 주지 않는 것이다. 서버는 주문을 저장한 뒤 303과 함께 방금 만든 주문의 URI를 Location에 담아 돌려준다. 브라우저는 그 URI로 GET을 보내고, 결과 화면은 이 GET의 200 응답으로 받는다. 이 흐름을 요청 순서의 머리글자를 따서 PRG(Post/Redirect/Get) 패턴이라고 부른다.</p>
+
+<figure class="flow-figure"><figcaption>PRG: POST 다음에 303, 그다음에 GET</figcaption><ol class="flow">
+<li><strong>POST /orders</strong><span>브라우저가 주문 폼을 제출한다. 서버는 주문 1001을 저장한다.</span></li>
+<li><strong>303 See Other</strong><span>서버는 결과 화면을 본문에 싣지 않고 Location: /orders/1001을 돌려준다.</span></li>
+<li><strong>GET /orders/1001</strong><span>브라우저가 Location으로 조회 요청을 새로 만든다. 메서드는 GET이고 본문은 없다.</span></li>
+<li><strong>200 OK</strong><span>주문 결과 화면이 온다. 현재 문서를 만든 요청은 이제 GET이다.</span></li>
+<li><strong>새로고침</strong><span>GET /orders/1001이 다시 간다. 안전한 메서드이므로 주문은 늘어나지 않는다.</span></li>
+</ol></figure>
+
+<p>달라진 것은 "현재 문서를 만든 요청"이 POST에서 GET으로 바뀌었다는 한 가지다. 새로고침이 다시 보내는 것이 안전한 요청이 되었으므로 몇 번을 눌러도 서버의 상태는 변하지 않는다. 얻는 것이 하나 더 있다. 주문 결과가 <code>/orders/1001</code>이라는 독립된 URI를 가진 자원이 된다. RFC 9110이 303의 용도를 설명하며 드는 이유가 바로 이것이다. POST 응답에 해당하는 정보를 따로 식별하고, 북마크하고, 캐시할 수 있는 자원으로 제공한다. 200으로 직접 응답했다면 결과 화면의 주소는 폼을 제출한 주소와 같아서, 북마크해 두어도 다시 열 수 없는 화면이 된다.</p>
+
+<x-visual id="http-06-prg-pattern" title="POST에 200으로 직접 응답할 때와 303으로 리다이렉트할 때 새로고침이 다시 보내는 요청의 비교" kind="비교 다이어그램" ratio="16:9">
+<x-hint>두 흐름을 좌우로 나란히 놓고, 새로고침이 왼쪽에서는 POST를, 오른쪽에서는 GET을 다시 보낸다는 차이를 강조한다.</x-hint>
+<x-prompt>깔끔한 평면 비교 다이어그램, 흰 배경, 좌우 두 칸. 왼쪽 칸 제목 "200으로 직접 응답", 오른쪽 칸 제목 "303으로 리다이렉트 (PRG)". 각 칸에는 왼쪽에 브라우저 창 아이콘, 오른쪽에 서버 상자가 있고 그 사이를 화살표가 위에서 아래 순서로 오간다. 왼쪽 칸의 화살표: 브라우저에서 서버로 실선 "POST /orders", 서버에서 브라우저로 점선 "200 OK", 그 아래 브라우저 옆에 둥근 화살표 아이콘과 라벨 "새로고침", 다시 브라우저에서 서버로 빨간 실선 "POST /orders". 왼쪽 서버 상자 안에는 주문서 아이콘 두 장을 그리고 "주문 2건"이라고 쓴다. 오른쪽 칸의 화살표: 브라우저에서 서버로 실선 "POST /orders", 서버에서 브라우저로 점선 "303 + Location", 브라우저에서 서버로 실선 "GET /orders/1001", 서버에서 브라우저로 점선 "200 OK", 그 아래 둥근 화살표 아이콘과 라벨 "새로고침", 다시 브라우저에서 서버로 초록 실선 "GET /orders/1001". 오른쪽 서버 상자 안에는 주문서 아이콘 한 장을 그리고 "주문 1건"이라고 쓴다. 인물이나 장식 없이 도형, 화살표, 글자만 사용한다.</x-prompt>
+<x-caption>PRG는 화면을 만든 마지막 요청을 POST에서 GET으로 바꾼다. 새로고침이 다시 보내는 요청이 안전한 요청이 된다.</x-caption>
+</x-visual>
+
+<p>실제 웹 애플리케이션에서는 이 자리에 302를 쓰는 경우가 많다. 앞의 실험과 Fetch 표준에서 보았듯이 브라우저는 POST에 대한 302도 GET으로 따라가므로 브라우저를 상대로는 결과가 같다. 서블릿 API의 <code>HttpServletResponse.sendRedirect</code>가 설정하는 상태 코드도 302다(Jakarta Servlet 6.0 Javadoc). 그래도 두 코드의 뜻은 다르다. 302는 "대상 자원이 일시적으로 다른 URI에 있다"는 말이고, 303은 "요청의 결과를 다른 자원에서 조회하라"는 말이다. 그리고 302가 GET으로 바뀌는 것은 POST에 한한 허용이다. 실험에서 PUT은 302를 만나도 PUT으로 남았다. 원래 메서드가 무엇이든 조회로 이어지게 하려는 뜻을 정의로 보장하는 코드는 303뿐이다.</p>
+
+<p>PRG가 막아 주는 범위도 정확히 알아야 한다. PRG는 "결과 화면에서 새로고침하면 POST가 다시 간다"는 경로 하나를 없앤다. 응답이 오기 전에 제출 버튼을 두 번 누르는 경우나, 네트워크 문제로 클라이언트가 같은 POST를 다시 보내는 경우는 그대로 남는다. 이런 중복은 서버가 요청을 식별해 걸러 내는 방식으로 따로 막아야 한다.</p>
+
+<h4>300, 304, 그리고 쓰이지 않는 코드</h4>
+
+<p>300(Multiple Choices)은 대상 자원에 표현이 둘 이상 있고 각각 더 구체적인 식별자를 가지므로, 사용자나 사용자 에이전트가 그중에서 고르라는 뜻이다. 서버가 선호하는 선택지가 있으면 Location에 담는 것이 좋다. 다만 명세는 자동 선택을 위한 본문 형식을 정의하지 않는다. 그래서 프로그램이 자동으로 처리하기 어렵다.</p>
+
+<p>304(Not Modified)는 3xx에 속하지만 Location으로 이동시키는 코드가 아니다. 조건부 GET이나 HEAD 요청을 받았는데 조건이 거짓으로 평가되어, 그렇지 않았다면 200을 보냈을 상황이라는 뜻이다. 클라이언트가 이미 유효한 표현을 갖고 있으므로 서버는 본문을 보내지 않고, 클라이언트가 저장해 둔 표현을 200 응답의 본문인 것처럼 쓰도록 "리다이렉트"한다. 명세가 304를 리다이렉션 클래스에 넣은 이유가 이 표현에 있다. 304는 본문을 가질 수 없고 빈 줄에서 끝난다. 조건부 요청과 검증의 상세는 08회에서 다룬다.</p>
+
+<p>305(Use Proxy)는 예전 명세에 정의되었으나 지금은 폐기 예정(deprecated)이고, 306은 예전에 정의되었다가 더 쓰이지 않으며 번호만 예약되어 있다. 앞의 실험에서 쓴 JDK <code>HttpClient</code>의 소스도 300, 304, 305, 306은 따라가지 않고, 301·302·303·307·308만 따라간다. Fetch 표준이 "리다이렉트 상태"로 정의하는 집합도 같은 다섯 개다.</p>
+
+<h3>4xx 클라이언트 오류: 요청을 고쳐야 한다</h3>
+
+<p>4xx(Client Error) 클래스는 클라이언트가 잘못한 것으로 보인다는 뜻이다(RFC 9110 15.5절). 서버는 HEAD 요청에 대한 응답이 아니라면 오류 상황을 설명하고 그것이 일시적인지 영구적인지를 알리는 표현을 본문으로 보내는 것이 좋다(SHOULD). 4xx 코드는 어떤 요청 메서드에도 쓸 수 있다. 이 클래스가 수신자에게 주는 핵심 정보는 "같은 요청을 그대로 다시 보내도 결과가 달라지지 않을 테니, 요청의 무언가를 바꿔야 한다"는 것이다. 무엇을 바꿔야 하는지를 개별 코드가 좁혀 준다.</p>
+
+<h4>400: 요청 자체가 잘못되었다</h4>
+
+<p>400(Bad Request)은 클라이언트의 오류로 인식되는 무언가 때문에 서버가 요청을 처리할 수 없거나 처리하지 않겠다는 뜻이다. 명세가 드는 예는 잘못된 요청 문법, 유효하지 않은 메시지 프레이밍, 속이려는 요청 라우팅이다. 4xx의 대표 코드이기도 해서, 모르는 4xx 코드를 받은 클라이언트가 대신 적용하는 의미가 이것이다.</p>
+
+<h4>401과 403: 누구인지 모르는 것과 알지만 거절하는 것</h4>
+
+<p>401(Unauthorized)은 대상 자원에 대한 유효한 인증 자격 증명(authentication credentials)이 없어서 요청이 적용되지 않았다는 뜻이다. 이름은 Unauthorized지만 정의가 말하는 것은 인증(authentication), 곧 "당신이 누구인지 확인되지 않았다"이다. 그래서 401에는 다음 행동이 붙어 있다. 401을 생성하는 서버는 대상 자원에 적용할 수 있는 인증 요구(challenge)를 하나 이상 담은 <code>WWW-Authenticate</code> 헤더 필드를 보내야 한다(MUST). 사용자 에이전트는 새로운 <code>Authorization</code> 헤더를 붙여 요청을 반복할 수 있다. 요청에 이미 자격 증명이 있었다면 401은 그 자격 증명이 거부되었다는 뜻이다.</p>
+
+<p>403(Forbidden)은 서버가 요청을 이해했지만 수행하기를 거부한다는 뜻이다. 요청에 자격 증명이 있었다면 서버는 그것이 접근을 허락하기에 충분하지 않다고 본 것이다. 여기에 붙은 행동 규칙은 401과 반대다. 클라이언트는 같은 자격 증명으로 요청을 자동 반복하지 않는 것이 좋다(SHOULD NOT). 로그인하지 않은 사용자가 내 주문 목록을 요청하면 401이고, 로그인한 일반 사용자가 관리자 화면을 요청하면 403이다. 앞의 것은 로그인하면 해결되지만 뒤의 것은 다시 로그인해도 해결되지 않는다. 명세는 403이 자격 증명과 무관한 이유로 나올 수도 있다고 덧붙인다.</p>
+
+<h4>404와 410: 없다, 그리고 영영 없다</h4>
+
+<p>404(Not Found)는 원 서버가 대상 자원의 현재 표현을 찾지 못했거나, 표현이 존재한다는 사실을 밝히지 않으려 한다는 뜻이다. 뒤쪽 절반이 중요하다. 명세는 403 항목에서, 금지된 대상 자원의 존재를 "숨기고" 싶은 원 서버는 대신 404로 응답해도 된다고 명시한다. 남의 비공개 문서 URI에 403을 돌려주면 "그 문서가 있다"는 사실이 새어 나가기 때문이다. 그래서 404를 받았다는 것만으로 자원이 실제로 없다고 단정할 수는 없다.</p>
+
+<p>404는 이 상태가 일시적인지 영구적인지도 알려 주지 않는다. 자원이 영구히 사라졌다는 것을 원 서버가 알고 있다면 410(Gone)이 더 낫다. 410은 대상 자원이 더 이상 원 서버에 없고 이 상태가 영구적일 가능성이 높다는 뜻이며, 그 자원으로 향하는 링크를 지워 달라는 서버 소유자의 뜻을 전한다. 두 코드 모두 휴리스틱하게 캐시 가능하다는 점도 기억해 두자. "없다"는 응답을 캐시가 재사용할 수 있으므로, 방금 만든 자원이 어떤 클라이언트에게는 한동안 404로 보일 수 있다.</p>
+
+<h4>405, 409, 415, 422: 무엇이 맞지 않는지를 좁힌다</h4>
+
+<p>405(Method Not Allowed)는 요청 줄의 메서드를 원 서버가 알고는 있지만 대상 자원이 지원하지 않는다는 뜻이다. 원 서버는 405 응답에 그 자원이 현재 지원하는 메서드 목록을 담은 <code>Allow</code> 헤더 필드를 생성해야 한다(MUST). 실험 1에서 PATCH 요청에 <code>Allow: GET, POST, DELETE</code>가 돌아온 것이 이 규칙이다. 메서드를 서버가 아예 인식하지 못하고 어떤 자원에 대해서도 지원할 수 없을 때는 4xx가 아니라 501이 맞다.</p>
+
+<p>409(Conflict)는 대상 자원의 현재 상태와 충돌해서 요청을 완료할 수 없다는 뜻이다. 사용자가 충돌을 해결하고 요청을 다시 제출할 수 있을 법한 상황에 쓴다. 명세의 예는 버전 관리를 쓰는 자원에 PUT한 표현이 그사이 다른 요청이 만든 변경과 충돌하는 경우다. 요청 메시지에는 흠이 없고, 그 요청이 지금의 자원 상태와 맞지 않는다는 점이 400과 다르다.</p>
+
+<p>415(Unsupported Media Type)는 요청 본문이 이 메서드와 대상 자원이 지원하지 않는 형식이어서 원 서버가 거부한다는 뜻이다. JSON만 받는 자원에 XML을 보낸 경우다. 422(Unprocessable Content)는 한 걸음 더 들어간다. 서버가 본문의 콘텐츠 타입을 이해하고 본문의 문법도 올바르지만, 담긴 지시를 처리할 수 없다는 뜻이다. 형식은 맞는데 내용의 의미가 틀린 경우를 가리킨다.</p>
+
+<h4>408과 429: 다시 보내도 되는 4xx</h4>
+
+<p>"4xx는 다시 보내도 소용없다"는 요약에는 예외가 있다. 408(Request Timeout)은 서버가 기다리려 했던 시간 안에 완전한 요청 메시지를 받지 못했다는 뜻이다. 클라이언트에게 전송 중인 요청이 있다면 그 요청을 반복해도 된다. 429(Too Many Requests)는 RFC 6585가 정의한 코드로, 사용자가 주어진 시간 동안 너무 많은 요청을 보냈다는 뜻이다. 응답에 얼마나 기다린 뒤 새 요청을 보내야 하는지를 알리는 <code>Retry-After</code> 헤더를 넣을 수 있고, 429 응답은 캐시가 저장해서는 안 된다. 두 코드에서 고쳐야 하는 것은 요청의 내용이 아니라 요청을 보내는 시점이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>코드</th><th>뜻</th><th>함께 오는 헤더</th><th>클라이언트가 바꿀 것</th></tr></thead><tbody>
+<tr><td>400</td><td>요청의 문법·프레이밍이 잘못됨</td><td></td><td>요청 메시지</td></tr>
+<tr><td>401</td><td>유효한 인증 자격 증명이 없음</td><td>WWW-Authenticate (필수)</td><td>자격 증명을 붙인다</td></tr>
+<tr><td>403</td><td>이해했지만 거부</td><td></td><td>같은 자격 증명으로는 반복하지 않는다</td></tr>
+<tr><td>404</td><td>표현을 찾지 못했거나 밝히지 않음</td><td></td><td>URI를 확인한다</td></tr>
+<tr><td>405</td><td>이 자원이 지원하지 않는 메서드</td><td>Allow (필수)</td><td>메서드</td></tr>
+<tr><td>409</td><td>자원의 현재 상태와 충돌</td><td></td><td>최신 상태를 확인하고 다시 제출</td></tr>
+<tr><td>415</td><td>지원하지 않는 본문 형식</td><td></td><td>본문의 형식</td></tr>
+<tr><td>422</td><td>형식은 맞지만 지시를 처리할 수 없음</td><td></td><td>본문의 내용</td></tr>
+<tr><td>429</td><td>요청이 너무 많음</td><td>Retry-After (선택)</td><td>보내는 시점</td></tr>
+</tbody></table></div>
+
+<h3>5xx 서버 오류: 요청은 멀쩡했다</h3>
+
+<p>5xx(Server Error) 클래스는 서버가 자신이 잘못했거나 요청된 메서드를 수행할 능력이 없음을 알고 있다는 뜻이다(RFC 9110 15.6절). 클래스 요약의 표현으로는 "유효해 보이는 요청을 서버가 수행하지 못했다"이다. 4xx와 마찬가지로 서버는 상황을 설명하는 표현을 본문으로 보내는 것이 좋고, 어떤 메서드에도 쓸 수 있다. 500(Internal Server Error)은 서버가 요청을 수행하지 못하게 하는 예상치 못한 상황을 만났다는 뜻이다. 처리 중에 프로그램이 대비하지 않은 오류가 난 경우가 여기에 해당한다.</p>
+
+<h4>4xx와 5xx의 경계</h4>
+
+<p>두 클래스를 가르는 질문은 "무엇을 고쳐야 다음 요청이 성공하는가"다. 요청을 고쳐야 하면 4xx이고, 서버를 고치거나 서버가 회복되기를 기다려야 하면 5xx다. 헷갈리기 쉬운 것은 업무 규칙에 걸린 요청이다. 재고가 없어서 주문을 받을 수 없거나 잔액이 부족해서 이체할 수 없는 경우를 생각해 보자. 이때 서버는 고장 난 것이 아니라 정해진 규칙대로 정확히 동작했다. 서버가 아무리 건강해도 같은 요청은 같은 이유로 거절된다. 그러므로 이것은 5xx가 아니다. 4xx 중 어느 코드를 쓸지(상태 충돌로 보아 409, 본문의 내용 문제로 보아 422, 혹은 400)는 애플리케이션이 정할 일이지만, 클래스는 4xx여야 한다.</p>
+
+<p>이 구분이 중요한 까닭은 5xx를 읽는 쪽이 있기 때문이다. 5xx는 "서버 쪽에 문제가 있고, 나중에 다시 하면 될 수도 있다"는 신호다. 업무상 거절을 500으로 보내면 재시도해도 소용없는 요청을 다시 보내게 만들고, 서버 오류의 수를 세는 운영자에게는 고장이 아닌 것을 고장으로 보고하게 된다. 반대 방향의 잘못도 있다. 서버의 버그로 실패한 요청에 400을 돌려주면, 클라이언트 개발자는 문제가 없는 자기 요청에서 원인을 찾느라 시간을 쓴다.</p>
+
+<h4>502, 503, 504: 이 응답은 누가 만들었는가</h4>
+
+<p>실제 서비스에서 클라이언트의 요청은 애플리케이션에 바로 닿지 않는다. 03회에서 본 중개자, 그중에서도 게이트웨이(gateway, 리버스 프록시라고도 한다)가 앞에서 요청을 받아 뒤의 서버로 전달한다. 5xx 가운데 두 개는 이 중개자가 스스로 만드는 응답이다. 502(Bad Gateway)는 서버가 게이트웨이나 프록시로 동작하면서, 요청을 수행하려고 접근한 안쪽 서버로부터 유효하지 않은 응답을 받았다는 뜻이다. 504(Gateway Timeout)는 같은 위치의 서버가 요청을 완료하는 데 필요한 뒤쪽 서버로부터 제때 응답을 받지 못했다는 뜻이다.</p>
+
+<pre class="diagram">클라이언트 ──요청──> 게이트웨이(리버스 프록시) ──요청──> 원 서버(애플리케이션)
+
+ 경우 A  원 서버가 처리 중 오류를 만나 500 응답을 만든다  →  게이트웨이는 500을 그대로 전달
+ 경우 B  원 서버가 유효하지 않은 응답을 돌려준다          →  게이트웨이가 502를 만든다
+ 경우 C  원 서버가 제때 응답하지 않는다                    →  게이트웨이가 504를 만든다
+ 경우 D  과부하나 점검으로 요청을 처리할 수 없다           →  503 (그 상태에 있는 서버가 만든다)</pre>
+
+<p>상태 코드가 "어디에서 실패가 관찰되었는가"를 알려 준다는 점이 진단에 쓰인다. 500은 애플리케이션이 직접 만든 응답이므로 애플리케이션의 로그에 원인이 남아 있다. 502와 504는 애플리케이션이 아닌 프로그램이 만든 응답이다. 애플리케이션의 로그에는 아무 오류도 없을 수 있고, 504의 경우에는 요청이 정상 처리된 것으로 기록되어 있을 수도 있다. 게이트웨이가 기다리다 포기한 뒤에도 원 서버는 그 요청을 끝까지 처리할 수 있기 때문이다. 클라이언트는 504를 받았지만 주문은 저장되어 있는 상황이 이렇게 생긴다.</p>
+
+<p>503(Service Unavailable)은 서버가 일시적인 과부하나 예정된 점검 때문에 지금은 요청을 처리할 수 없으며, 얼마 뒤에는 나아질 것이라는 뜻이다. 서버는 클라이언트가 재시도 전에 기다릴 적절한 시간을 <code>Retry-After</code> 헤더 필드로 제안할 수 있다. Retry-After의 값은 HTTP 날짜이거나 응답을 받은 뒤 기다릴 초 단위의 정수다(RFC 9110 10.2.3절). 명세는 503이 있다고 해서 과부하에 빠진 서버가 반드시 이것을 써야 하는 것은 아니며, 어떤 서버는 그냥 연결을 거부할 수도 있다고 적는다. 01회에서 본 것처럼 연결이 거부되면 클라이언트는 HTTP 응답을 아예 받지 못한다. 상태 코드는 응답을 만들 여력이 남아 있을 때만 존재한다.</p>
+
+<p>501(Not Implemented)은 서버가 요청을 수행하는 데 필요한 기능을 지원하지 않는다는 뜻이고, 서버가 요청 메서드를 인식하지 못할 때의 응답이다. 405와의 차이는 범위다. 405는 "이 자원에는 안 되는 메서드", 501은 "이 서버가 모르는 메서드"다.</p>
+
+<x-visual id="http-06-gateway-errors" title="클라이언트, 게이트웨이, 원 서버 사이에서 500, 502, 503, 504가 각각 만들어지는 위치" kind="구조 다이어그램" ratio="16:9">
+<x-hint>같은 5xx라도 응답을 만든 주체가 다르다는 점을 위치로 보여 준다. 500은 원 서버, 502와 504는 게이트웨이가 만든다.</x-hint>
+<x-prompt>깔끔한 평면 구조 다이어그램, 흰 배경. 왼쪽부터 가로로 상자 세 개를 놓는다: "클라이언트", "게이트웨이", "원 서버". 상자 사이는 오른쪽으로 가는 요청 화살표로 연결한다. 그 아래에 같은 세 상자 배치를 네 줄로 반복한 작은 시나리오 띠를 그린다. 첫째 줄: 원 서버 상자에 번개 모양 오류 아이콘을 붙이고, 원 서버에서 클라이언트까지 왼쪽으로 가는 화살표에 "500" 라벨, 줄 왼쪽 끝 제목 "원 서버가 만든다". 둘째 줄: 원 서버에서 게이트웨이로 가는 화살표를 깨진 조각 모양으로 그리고, 게이트웨이에서 클라이언트로 가는 화살표에 "502" 라벨, 제목 "깨진 응답". 셋째 줄: 게이트웨이와 원 서버 사이에 모래시계 아이콘을 두고 원 서버 쪽 화살표는 그리지 않으며, 게이트웨이에서 클라이언트로 가는 화살표에 "504" 라벨, 제목 "응답이 늦다". 넷째 줄: 원 서버 상자에 공구 아이콘을 붙이고 클라이언트로 가는 화살표에 "503 + Retry-After" 라벨, 제목 "과부하·점검". 502와 504 화살표의 출발점이 게이트웨이 상자라는 점이 한눈에 보이도록 게이트웨이 상자를 강조색으로 칠한다.</x-prompt>
+<x-caption>500은 애플리케이션이, 502와 504는 그 앞의 게이트웨이가 만든다. 어느 프로그램의 로그를 볼지가 상태 코드에서 갈린다.</x-caption>
+</x-visual>
+
+<h3>상태 코드와 재시도: 다시 보내도 되는가</h3>
+
+<p>실패한 응답을 받은 클라이언트가 가장 먼저 정해야 하는 것은 같은 요청을 다시 보낼지다. 이 판단에는 두 가지 정보가 필요하다. 하나는 04회에서 다룬 메서드의 멱등성이고, 다른 하나가 상태 코드다. RFC 9110 9.2.2절은 멱등 메서드를 구분하는 이유를 이렇게 설명한다. 클라이언트가 서버의 응답을 읽기 전에 통신 장애가 일어나면, 멱등 요청은 자동으로 반복할 수 있다. 원래 요청이 성공했더라도 반복의 의도된 효과가 같기 때문이다. 멱등이 아닌 메서드의 요청은 실제로는 멱등이라는 것을 알 방법이 있거나 원래 요청이 적용되지 않았음을 알아낼 방법이 있지 않은 한, 자동으로 재시도하지 않는 것이 좋다(SHOULD NOT). 프록시는 멱등이 아닌 요청을 자동으로 재시도해서는 안 된다(MUST NOT).</p>
+
+<p>상태 코드는 여기에 "재시도가 의미 있는가, 있다면 언제인가"를 더해 준다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>받은 응답</th><th>같은 요청을 다시 보내면</th><th>판단</th></tr></thead><tbody>
+<tr><td>400, 404, 415, 422</td><td>같은 이유로 실패한다</td><td>요청을 고치기 전에는 재시도하지 않는다</td></tr>
+<tr><td>401</td><td>자격 증명을 붙이면 달라질 수 있다</td><td>새 Authorization과 함께 반복할 수 있다</td></tr>
+<tr><td>403</td><td>같은 자격 증명으로는 같다</td><td>자동 반복하지 않는다</td></tr>
+<tr><td>408</td><td>요청이 완전히 전달되지 않았다</td><td>반복해도 된다</td></tr>
+<tr><td>429, 503</td><td>시간이 지나면 달라질 수 있다</td><td>Retry-After가 있으면 그만큼 기다린 뒤</td></tr>
+<tr><td>500, 502, 504</td><td>성공할 수도 있다. 다만 원래 요청이 적용되었는지 알 수 없다</td><td>멱등 메서드일 때만 자동 재시도</td></tr>
+</tbody></table></div>
+
+<p>마지막 줄이 가장 조심해야 하는 부분이다. 5xx는 "서버가 요청을 수행하지 못했다"는 뜻이지만, "서버의 상태가 전혀 바뀌지 않았다"는 보장은 아니다. 처리의 절반이 끝난 뒤에 오류가 났을 수 있고, 앞에서 본 504처럼 게이트웨이만 포기했을 뿐 원 서버는 처리를 마쳤을 수 있다. 응답을 받지 못하고 연결이 끊긴 경우와 마찬가지로, 클라이언트는 요청이 적용되었는지 아닌지를 모르는 상태에 놓인다. GET, PUT, DELETE는 이 상태에서 다시 보내도 의도한 결과가 같다. POST는 그렇지 않다. 주문 POST가 504로 끝났을 때 자동으로 다시 보내면 주문이 두 건이 될 수 있다.</p>
+
+<p>그래서 재시도 설계는 "어떤 상태 코드에서 재시도할까"만으로는 끝나지 않는다. 상태 코드가 재시도의 가치를 말해 주고, 메서드의 멱등성이 재시도의 안전을 말해 준다. 둘이 모두 허락할 때만 자동 재시도가 성립한다. 명세는 한 가지를 더 권고한다. 클라이언트는 실패한 자동 재시도를 다시 자동 재시도하지 않는 것이 좋다. 과부하로 503을 내는 서버에 모든 클라이언트가 즉시, 그리고 반복해서 재시도하면 부하는 더 커진다. Retry-After는 서버가 이 악순환을 끊으려고 내미는 값이다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<h4>"항상 200으로 답하고, 성공 여부는 본문에 넣으면 된다"</h4>
+
+<p>클라이언트와 서버를 한 팀이 만들면 이 방식도 동작하는 것처럼 보인다. 그러나 응답을 읽는 것은 그 클라이언트만이 아니다. 200은 휴리스틱하게 캐시 가능한 코드이므로, 캐시는 GET 요청에 대해 온 "실패를 담은 200 응답"을 성공한 응답으로 저장하고 재사용할 수 있다. HTTP 라이브러리는 그 응답을 정상으로 돌려주므로 오류 처리가 본문 해석 뒤로 밀린다. 운영자가 보는 오류 비율에는 잡히지 않고, 4xx·5xx를 보고 동작하는 중개자의 기능도 쓸 수 없게 된다. 본문에 자세한 오류 정보를 넣는 것은 좋은 일이고 명세도 권한다. 다만 그것은 상태 코드에 더하는 것이지 상태 코드를 대신하는 것이 아니다.</p>
+
+<h4>"401은 권한이 없다는 뜻이다"</h4>
+
+<p>이름 Unauthorized 때문에 생기는 오해다. 정의에 따르면 401은 인증 자격 증명이 없거나 유효하지 않다는 뜻이고, 인증된 사용자에게 권한이 부족한 경우는 403이다. 구분의 실익은 클라이언트의 다음 행동에 있다. 401을 받은 클라이언트는 로그인 화면을 띄우거나 토큰을 갱신해 다시 시도한다. 권한이 부족한 사용자에게 401을 돌려주면 클라이언트는 로그인을 반복시키게 되고, 사용자는 로그인해도 같은 화면으로 돌아오는 상태에 갇힌다.</p>
+
+<h4>"301로 옮기면 요청이 그대로 새 주소로 간다"</h4>
+
+<p>GET이라면 맞다. POST라면 실험에서 본 대로 본문 없는 GET이 간다. 또 하나의 함정은 301이 휴리스틱하게 캐시 가능하다는 점이다. 잘못 설정한 301을 서버에서 바로잡아도, 그 응답을 이미 저장한 캐시는 유효 기간이 남아 있는 동안 서버에 묻지 않고 옛 리다이렉션을 따라갈 수 있다. 서버 쪽에서 되돌릴 수 없는 범위가 생기는 것이다. 이동이 확정되기 전에는 일시 리다이렉션을 쓰고, 확정된 뒤에 영구 리다이렉션으로 바꾸는 순서가 안전하다.</p>
+
+<h4>"204 응답에도 간단한 본문은 넣을 수 있다"</h4>
+
+<p>넣을 수 없다. 204가 본문을 갖지 않는 것은 관례가 아니라 메시지 길이 규칙이다. 수신자는 Content-Length가 있든 없든 빈 줄에서 응답을 끝낸다. 서버가 그 뒤에 쓴 바이트는 같은 연결의 다음 응답을 깨뜨린다. 성공 응답에 돌려줄 내용이 있으면 200을 쓴다.</p>
+
+<h4>"404는 그 자원이 없다는 확실한 증거다"</h4>
+
+<p>404의 정의에는 "표현이 존재한다는 사실을 밝히지 않으려 한다"가 포함되어 있다. 권한 없는 사용자에게 존재를 숨기려고 일부러 404를 쓰는 서버가 있고, 명세가 이를 허용한다. 또 404는 일시적인지 영구적인지를 말하지 않는다. 클라이언트가 404를 근거로 자기 쪽 데이터를 지우는 식의 되돌릴 수 없는 결정을 내리는 것은 위험하다.</p>
+
+<h4>"5xx를 받았으니 아무 일도 일어나지 않았다"</h4>
+
+<p>앞 절에서 본 대로 5xx는 실패의 통보이지 "변경 없음"의 보장이 아니다. 특히 게이트웨이가 만든 502와 504는 원 서버에서 무슨 일이 있었는지를 전혀 알려 주지 않는다. 결제나 주문처럼 중복이 곧 사고인 요청에서는, 실패 응답을 받은 뒤 다시 보내기 전에 결과를 조회해 확인하는 절차나 서버가 중복 요청을 걸러 내는 장치가 필요하다.</p>
+
+<h3>다른 주제와의 연결</h3>
+
+<p>이 회차에서 상태 코드는 거의 언제나 헤더 필드와 짝을 이루어 등장했다. 201과 3xx의 Location, 405의 Allow, 401의 WWW-Authenticate, 503과 429의 Retry-After가 그렇다. 상태 코드가 "무슨 일이 일어났는가"를 말하고 헤더가 "그래서 무엇을 하면 되는가"를 말한다. 헤더 필드 자체는 07회에서 체계적으로 다룬다. 304와 조건부 요청, 그리고 휴리스틱하게 캐시 가능한 코드가 캐시 안에서 실제로 어떻게 쓰이는지는 08회의 주제다.</p>
+
+<p>리다이렉션은 03회의 무상태 원칙을 다시 확인하게 해 준다. 두 번째 요청은 첫 요청과 독립된 요청이므로, PRG에서 주문 결과 화면이 올바르게 나오려면 Location의 URI만으로 그 주문을 찾을 수 있어야 한다. 재시도 판단은 04회의 멱등성과 한 쌍이다. 메서드를 고를 때 멱등인 것을 택해 두면, 실패 응답을 받았을 때 선택할 수 있는 길이 넓어진다.</p>
+
+<p>이후의 스프링 강의에서 이 지식은 그대로 코드가 된다. 스프링 프레임워크의 <code>ResponseEntity.created(location)</code>은 Javadoc에 적힌 대로 CREATED 상태와 주어진 URI의 Location 헤더를 가진 응답 빌더를 만들고, <code>ResponseEntity.noContent()</code>는 NO_CONTENT 상태의 빌더를 만든다. 서블릿의 <code>HttpServletResponse.sendRedirect</code>는 302를 설정한다. 프레임워크의 메서드 이름은 이 회차에서 읽은 명세의 단어를 그대로 옮긴 것이다. 어떤 메서드를 호출할지는 프레임워크 사용법의 문제가 아니라, 응답을 받는 프로그램들이 무엇을 하게 만들 것인가의 문제다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>상태 줄과 사유 구문</dt><dd>응답의 첫 줄은 버전, 세 자리 상태 코드, 선택적인 사유 구문으로 이루어진다. 사유 구문은 번역되거나 버려질 수 있으므로 프로그램은 숫자로만 분기한다.</dd>
+<dt>클래스 규칙</dt><dd>첫째 자리가 클래스를 정한다. 클라이언트는 모르는 코드를 같은 클래스의 x00 코드처럼 처리해야 하며, 이 규칙 덕분에 새 코드가 추가되어도 기존 클라이언트가 동작한다.</dd>
+<dt>상태 코드가 정하는 네 가지</dt><dd>메시지의 끝(1xx·204·304는 본문 없음), 캐시 저장 가능 여부, 자동 후속 동작(리다이렉트·인증·대기), 재시도의 의미가 상태 코드에서 갈린다.</dd>
+<dt>중간 응답과 최종 응답</dt><dd>요청 하나에는 0개 이상의 1xx 중간 응답과 정확히 하나의 최종 응답이 온다. 100 Continue는 본문을 보내기 전에 서버의 의사를 확인하는 수단이다.</dd>
+<dt>2xx의 구분</dt><dd>200은 메서드에 따라 본문의 뜻이 달라지고, 201은 Location으로 새 자원을 알리며, 202는 완료가 아닌 접수이고, 204는 본문 없는 성공이다.</dd>
+<dt>리다이렉션의 구조</dt><dd>3xx를 보낸 서버의 일은 거기서 끝나고, Location을 해석해 두 번째 요청을 만드는 것은 사용자 에이전트다. 두 번째 요청은 헤더와 메서드가 다시 정해진 독립된 요청이다.</dd>
+<dt>301·302·303·307·308</dt><dd>301과 308은 영구, 302와 307은 일시다. 301과 302는 POST를 GET으로 바꾸는 것이 허용되고, 307과 308은 메서드를 유지하며, 303은 어떤 메서드든 조회 요청으로 이어진다.</dd>
+<dt>PRG</dt><dd>POST에 303으로 답해 결과 화면을 GET으로 받게 하면, 새로고침이 다시 보내는 요청이 안전한 GET이 된다.</dd>
+<dt>4xx와 5xx, 그리고 재시도</dt><dd>요청을 고쳐야 하면 4xx, 서버 쪽 문제면 5xx다. 502와 504는 게이트웨이가 만든다. 5xx는 변경이 없었다는 보장이 아니므로 자동 재시도는 멱등 메서드에서만 안전하다.</dd>
+</x-summary>
+
+<x-review>
+<p>상태 코드를 고를 때의 실무 기준은 "이 응답을 받은 프로그램이 무엇을 하게 될까"다. 사람에게 보일 문구는 본문에 얼마든지 자세히 쓸 수 있지만, 캐시와 라이브러리와 게이트웨이와 감시 시스템은 숫자만 본다. 그래서 코드 리뷰에서 상태 코드를 볼 때는 정의에 맞는지와 함께, 그 코드에 붙은 자동 동작(저장, 리다이렉트, 재시도, 알림)이 의도한 것인지를 확인한다. 반대로 지나치게 세분할 필요는 없다. 클라이언트가 실제로 다르게 행동할 수 있는 구분, 곧 요청을 고칠지, 인증할지, 기다릴지, 포기할지가 드러나면 충분하고, 그보다 자세한 사정은 본문의 오류 표현에 담는다. 모르는 코드를 받은 클라이언트는 어차피 클래스로 처리한다.</p>
+
+<p>주소를 옮기는 작업에서는 영구 리다이렉션의 되돌리기 어려움을 먼저 따진다. 301과 308은 캐시가 재사용할 수 있으므로, 잘못된 목적지로 한번 나간 응답은 서버 설정을 고쳐도 한동안 살아 있다. 이동을 검증하는 동안에는 302나 307로 시작하고, 확정된 뒤에 영구 코드로 바꾼다. API의 이동이라면 메서드와 본문이 유지되어야 하므로 307과 308을 쓰고, 호출하는 쪽 라이브러리가 리다이렉트를 따라가도록 설정되어 있는지도 함께 확인한다. 따라가지 않는 클라이언트에게 리다이렉션은 그냥 실패다.</p>
+
+<p>장애 대응에서는 5xx의 종류가 조사 순서를 정한다. 500이면 애플리케이션 로그의 예외에서 시작하고, 502와 504면 게이트웨이의 로그와 타임아웃 설정, 그리고 그 시각에 원 서버가 무엇을 하고 있었는지를 본다. 504가 늘어날 때 게이트웨이의 대기 시간을 늘리는 것은 증상을 가릴 뿐이고, 원 서버가 왜 느려졌는지가 본래의 질문이다. 과부하 상황에서 503과 Retry-After로 요청을 일찍 돌려보내는 설계는, 모든 요청을 붙잡고 있다가 함께 타임아웃되는 것보다 회복에 유리한 경우가 많다. 다만 클라이언트가 Retry-After를 존중하도록 만들어져 있어야 효과가 있다.</p>
+
+<p>마지막으로, 재시도 정책은 상태 코드 목록만으로 정하지 않는다. "5xx면 세 번 재시도"라는 규칙을 POST에 그대로 적용하면 중복 처리가 생긴다. 변경 요청은 멱등 메서드로 설계하거나, 서버가 같은 요청의 반복을 알아볼 수 있는 식별자를 요청에 싣는 방식으로 중복을 걸러 낼 수 있게 한 다음에 재시도를 켠다. 이 준비가 없다면 실패 응답 뒤에는 자동 재시도 대신 결과 조회가 먼저다.</p>
+</x-review>
+
+<x-practice>
+<li>지속 연결에서 클라이언트가 다음 바이트열을 받았다(줄 끝은 모두 CRLF). <code>HTTP/1.1 304 Not Modified</code> / <code>ETag: "v7"</code> / <code>Content-Length: 348</code> / (빈 줄) / <code>HTTP/1.1 200 OK</code> / <code>Content-Length: 2</code> / (빈 줄) / <code>ok</code>. 응답은 몇 개이며 첫 응답은 어디에서 끝나는가? 클라이언트가 Content-Length만 보고 본문 길이를 정한다면 어떤 일이 벌어지는가?</li>
+<li>WHATWG Fetch 표준의 규칙을 따르는 클라이언트가 리다이렉트를 자동으로 따라간다. 다음 네 경우에 두 번째 요청의 메서드와 본문 유무를 예측하라. (가) 본문이 있는 POST가 308을 받았다. (나) DELETE가 302를 받았다. (다) 본문이 있는 PUT이 303을 받았다. (라) 본문이 있는 POST가 301을 받았다.</li>
+<li>주문 폼을 제출하면 서버가 <code>POST /orders</code>에 200과 결과 HTML로 응답한다. 사용자가 결과 화면에서 새로고침을 두 번 누르고 매번 재전송 확인 창에서 "확인"을 골랐다. 서버에 주문은 몇 건인가? 서버를 303과 <code>Location: /orders/{id}</code>로 응답하도록 바꾸면 같은 조작에서 몇 건이 되는가? 각 경우에 서버가 받은 요청을 순서대로 적어라.</li>
+<li>다음 상황마다 가장 알맞은 상태 코드를 고르고 이유를 한 줄로 적어라. (가) 로그인하지 않은 사용자가 내 주문 목록을 요청했다. (나) 로그인한 일반 사용자가 관리자 전용 통계를 요청했다. (다) 주문 본문의 JSON은 문법에 맞지만 수량이 -3이다. (라) 처리 중 데이터베이스 연결을 얻지 못해 예외가 발생했다. (마) 예정된 점검으로 30분간 요청을 받을 수 없다. (바) 게이트웨이가 원 서버의 응답을 60초 동안 기다리다 포기했다.</li>
+<li>클라이언트가 게이트웨이를 거쳐 <code>POST /payments</code>를 보냈고 504를 받았다. 같은 요청을 자동으로 다시 보내도 되는가? <code>PUT /payments/9f2c</code>였다면 답이 달라지는가? RFC 9110의 멱등 규칙과 504의 정의를 근거로 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 응답은 두 개다. 첫 응답은 <code>Content-Length: 348</code> 다음의 빈 줄에서 끝난다. RFC 9112 6.3절의 첫째 규칙에 따라 304 응답은 어떤 헤더 필드가 있든 헤더 뒤의 첫 빈 줄에서 끝나며 본문을 가질 수 없기 때문이다. 여기서 Content-Length 348은 "조건이 참이었다면 보냈을 200 응답의 본문 길이"에 관한 메타데이터일 뿐이다. 클라이언트가 상태 코드를 보지 않고 Content-Length만 따른다면 빈 줄 뒤의 348바이트를 304의 본문으로 읽으려 한다. 실제로 뒤에 온 것은 두 번째 응답의 상태 줄과 헤더와 본문이고 348바이트에 못 미치므로, 클라이언트는 두 번째 응답을 첫 응답의 본문으로 삼켜 버린 채 오지 않을 나머지 바이트를 기다리며 멈춘다. 상태 코드가 길이 규칙의 맨 앞에 있는 이유다.</p>
+
+<p><b>2.</b> (가) POST, 본문 있음. 308은 메서드를 유지하는 리다이렉션이고 Fetch 표준의 변경 조건에 해당하지 않는다. (나) DELETE 그대로. 302에서 GET으로 바뀌는 조건은 메서드가 POST일 때뿐이다. (다) GET, 본문 없음. 303이고 메서드가 GET이나 HEAD가 아니므로 GET으로 바뀌고 본문과 본문 관련 헤더가 제거된다. (라) GET, 본문 없음. 301이고 메서드가 POST이므로 조건에 해당한다. 본문에서 실행한 JDK <code>HttpClient</code>의 결과와 같은 규칙이다.</p>
+
+<p><b>3.</b> 200으로 직접 응답하는 경우, 서버가 받은 요청은 <code>POST /orders</code>, <code>POST /orders</code>, <code>POST /orders</code> 세 번이고 주문은 세 건이다. 현재 문서를 만든 요청이 POST이므로 새로고침할 때마다 같은 POST가 다시 전송되고, POST는 멱등이 아니어서 매번 새 주문으로 처리된다. 303으로 바꾼 경우 서버가 받은 요청은 <code>POST /orders</code>, <code>GET /orders/{id}</code>, <code>GET /orders/{id}</code>, <code>GET /orders/{id}</code>이고 주문은 한 건이다. 리다이렉트 뒤에는 현재 문서를 만든 요청이 GET이 되므로 새로고침은 GET만 반복한다.</p>
+
+<p><b>4.</b> (가) 401. 유효한 인증 자격 증명이 없는 경우이고, 서버는 WWW-Authenticate로 인증 방법을 알려야 한다. (나) 403. 누구인지는 확인되었지만 서버가 거부하며, 같은 자격 증명으로 다시 보내도 결과가 같다. (다) 422 또는 400. 본문의 형식과 문법은 맞지만 내용을 처리할 수 없는 경우로 422의 정의에 맞고, 세분하지 않는 API라면 400으로 묶을 수 있다. 어느 쪽이든 4xx여야 한다. (라) 500. 요청은 유효했고 서버가 예상하지 못한 상황을 만났다. 이 상태가 일시적인 과부하로 판단되고 곧 회복될 것이라면 503도 가능하다. (마) 503과 <code>Retry-After: 1800</code>. 예정된 점검은 503의 정의에 그대로 들어 있고, 기다릴 시간을 초 단위로 알려 줄 수 있다. (바) 504. 게이트웨이가 뒤쪽 서버로부터 제때 응답을 받지 못한 경우이며, 이 응답은 원 서버가 아니라 게이트웨이가 만든다.</p>
+
+<p><b>5.</b> POST는 자동으로 다시 보내면 안 된다. 504는 게이트웨이가 원 서버의 응답을 제때 받지 못했다는 뜻일 뿐, 원 서버가 요청을 처리하지 않았다는 뜻이 아니다. 원 서버는 결제를 끝냈을 수도, 처리 중일 수도, 시작하지 못했을 수도 있다. RFC 9110 9.2.2절은 멱등이 아닌 메서드의 요청을, 원래 요청이 적용되지 않았음을 알 방법이 없는 한 자동으로 재시도하지 말라고 한다. 다시 보내면 결제가 두 번 될 수 있으므로 먼저 결제 결과를 조회해야 한다. <code>PUT /payments/9f2c</code>였다면 답이 달라진다. PUT은 멱등이어서 같은 요청을 반복해도 의도한 효과가 같다. 원 서버가 첫 요청을 이미 처리했더라도 두 번째 PUT은 같은 URI의 자원을 같은 표현으로 다시 놓을 뿐이다. 클라이언트가 식별자를 정해 PUT으로 등록하는 설계가 재시도에 강한 이유가 여기에 있다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>어떤 클라이언트가 처음 보는 상태 코드 299를 받았다. RFC 9110에 따른 올바른 처리는 무엇인가?</q>
+<o>알 수 없는 코드이므로 유효하지 않은 응답으로 보고 5xx처럼 처리한다.</o>
+<o>첫째 자리가 2이므로 성공 클래스로 이해하고 200을 받은 것과 같이 처리한다.</o>
+<o>사유 구문을 읽어 그 문구에 따라 성공인지 실패인지 판단한다.</o>
+<o>가장 가까운 등록된 코드인 206(Partial Content)으로 간주해 범위 응답으로 처리한다.</o>
+<why>클라이언트는 모든 상태 코드의 클래스를 첫째 자리로 이해해야 하고, 모르는 코드는 그 클래스의 x00 코드와 같게 취급해야 한다. 299는 100~599 안의 유효한 값이므로 5xx로 볼 이유가 없다(5xx처럼 처리하는 것은 범위 밖의 값일 때다). 사유 구문은 신뢰할 수 없는 채널이어서 무시하는 것이 좋고, 둘째·셋째 자리에는 분류 역할이 없으므로 "가까운 코드"라는 개념은 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>서버가 지속 연결에서 204 응답을 보내면서 실수로 Content-Length: 12 헤더와 12바이트의 본문을 함께 써 넣었다. 규칙을 따르는 클라이언트에서 일어나는 일은?</q>
+<o>Content-Length가 우선하므로 12바이트를 204의 본문으로 읽고 정상 처리한다.</o>
+<o>204에 본문이 있으면 클라이언트가 자동으로 200으로 바꿔 해석한다.</o>
+<o>헤더 뒤의 빈 줄에서 204 응답을 끝내고, 뒤따르는 12바이트를 다음 응답의 시작으로 읽으려 해서 연결의 응답 경계가 어긋난다.</o>
+<o>본문이 있는 204는 문법 오류이므로 TCP가 해당 세그먼트를 재전송하게 한다.</o>
+<why>RFC 9112 6.3절의 첫째 규칙에 따라 1xx·204·304 응답은 헤더 필드가 무엇이든 첫 빈 줄에서 끝난다. Content-Length는 이 규칙보다 뒤에 적용된다. 따라서 남은 바이트는 다음 메시지의 일부로 해석되어 요청과 응답의 짝이 깨진다. 상태 코드를 바꿔 해석하는 규칙은 없고, TCP는 HTTP 메시지의 의미를 알지 못한다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>JSON 본문을 POST로 받는 API의 경로를 /v1/orders에서 /v2/orders로 옮기려 한다. 리다이렉트를 자동으로 따라가는 기존 클라이언트들이 새 경로에도 같은 메서드와 본문으로 요청하게 하려면, 그리고 이 이동이 영구적이라면 어떤 상태 코드가 맞는가?</q>
+<o>301 Moved Permanently</o>
+<o>302 Found</o>
+<o>303 See Other</o>
+<o>308 Permanent Redirect</o>
+<why>301과 302는 역사적인 이유로 POST를 GET으로 바꾸는 것이 허용되어 있고, Fetch 표준을 따르는 브라우저와 JDK HttpClient가 실제로 그렇게 한다. 그러면 본문이 사라진 GET이 새 경로에 도착한다. 303은 정의상 조회 요청으로 이어지는 코드다. 메서드를 유지하는 리다이렉션은 307과 308이고, 그중 영구 이동을 뜻하는 것이 308이다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>POST로 주문을 처리한 뒤 303과 Location으로 응답하는 PRG 패턴이 "새로고침에 의한 중복 주문"을 막는 원리로 옳은 것은?</q>
+<o>리다이렉트 뒤에는 현재 문서를 만든 요청이 GET이 되므로, 새로고침이 다시 보내는 요청이 안전한 조회 요청이 된다.</o>
+<o>303 응답을 받은 브라우저가 이후 같은 URI로 가는 POST를 모두 차단한다.</o>
+<o>서버가 303을 보내면 같은 본문의 POST를 자동으로 감지해 무시하게 된다.</o>
+<o>303 응답은 캐시에 영구 저장되므로 두 번째 POST가 서버에 도달하지 않는다.</o>
+<why>새로고침은 현재 문서를 만든 요청을 다시 보낸다. PRG는 그 요청을 POST에서 GET으로 바꿔 놓는다. 브라우저가 POST를 차단하는 것이 아니고, 서버의 중복 감지와도 무관하다. 그래서 응답 전에 버튼을 두 번 누르는 식의 중복은 PRG로 막을 수 없다. 303은 휴리스틱하게 캐시 가능한 코드 목록에도 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>클라이언트가 게이트웨이를 거쳐 POST /transfers(계좌 이체)를 보내고 502 응답을 받았다. 이 응답에서 알 수 있는 것으로 옳은 것은?</q>
+<o>원 서버가 요청 본문의 문법 오류를 발견했으므로 요청을 고쳐 다시 보내야 한다.</o>
+<o>5xx이므로 이체는 수행되지 않았음이 보장되고, 즉시 같은 요청을 다시 보내도 안전하다.</o>
+<o>게이트웨이가 안쪽 서버로부터 유효하지 않은 응답을 받았다는 사실뿐이며, 이체가 적용되었는지는 이 응답만으로 알 수 없다.</o>
+<o>원 서버의 애플리케이션 코드가 예외를 던져 직접 502를 만들었다.</o>
+<why>502는 게이트웨이나 프록시로 동작하는 서버가 안쪽 서버에서 유효하지 않은 응답을 받았을 때 만드는 응답이다. 요청의 문법 문제(4xx)가 아니고, 원 서버가 직접 만드는 응답도 아니다. 5xx는 실패의 통보이지 서버 상태가 바뀌지 않았다는 보장이 아니며, POST는 멱등이 아니므로 적용 여부를 확인하지 않고 자동으로 다시 보내면 이체가 중복될 수 있다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>상태 줄(status-line)</dt><dd>HTTP/1.1 응답 메시지의 첫 줄. 프로토콜 버전, 상태 코드, 선택적인 사유 구문으로 이루어진다.</dd>
+<dt>사유 구문(reason phrase)</dt><dd>상태 코드 뒤에 붙는 사람용 설명 문구. 생략할 수 있고 클라이언트는 그 내용을 무시하는 것이 좋다.</dd>
+<dt>중간 응답(interim response)</dt><dd>최종 응답 전에 오는 1xx 응답. 헤더 구역에서 끝나며 본문을 가질 수 없다.</dd>
+<dt>최종 응답(final response)</dt><dd>요청 하나에 정확히 하나 오는, 1xx가 아닌 상태 코드의 응답.</dd>
+<dt>리다이렉션(redirection)</dt><dd>요청을 완료하려면 사용자 에이전트가 추가 행동을 해야 함을 알리는 3xx 응답과, 그에 따라 사용자 에이전트가 새 요청을 보내는 일.</dd>
+<dt>Location</dt><dd>응답과 관련된 자원을 URI 참조로 가리키는 헤더 필드. 201에서는 만들어진 자원을, 3xx에서는 다시 요청할 대상을 뜻한다.</dd>
+<dt>PRG(Post/Redirect/Get)</dt><dd>POST 요청에 리다이렉션으로 응답해 결과 화면을 GET으로 받게 하는 흐름. 새로고침으로 POST가 다시 전송되는 것을 막는다.</dd>
+<dt>휴리스틱하게 캐시 가능(heuristically cacheable)</dt><dd>명시적인 만료 정보가 없어도 캐시가 추정한 유효 기간으로 저장하고 재사용할 수 있는 상태 코드의 성질.</dd>
+<dt>게이트웨이(gateway)</dt><dd>클라이언트 쪽에는 원 서버처럼 보이면서 받은 요청을 안쪽의 다른 서버로 전달하는 중개자. 리버스 프록시라고도 한다. 502와 504를 만드는 주체다.</dd>
+<dt>Retry-After</dt><dd>후속 요청 전에 얼마나 기다려야 하는지를 HTTP 날짜나 초 단위 정수로 알리는 응답 헤더 필드. 503, 429, 3xx와 함께 쓰인다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-15">RFC 9110 §15 Status Codes</a> — 다섯 클래스와 각 상태 코드의 정의, 리다이렉트 재작성 규칙, 9.2.2절의 멱등과 재시도, 10.2절의 Location·Retry-After</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9112.html#section-4">RFC 9112 §4 Status Line</a> — 상태 줄 문법과 사유 구문의 지위, 6.3절의 메시지 본문 길이 규칙</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9111.html">RFC 9111 HTTP Caching</a> — 3절의 응답 저장 조건과 휴리스틱 유효 기간</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc6585.html">RFC 6585 Additional HTTP Status Codes</a> — 429 Too Many Requests의 정의</li>
+<li><a href="https://fetch.spec.whatwg.org/#http-redirect-fetch">WHATWG Fetch Standard, HTTP-redirect fetch</a> — 브라우저가 리다이렉트를 따라갈 때의 횟수 제한과 메서드 변경 조건</li>
+<li><a href="https://jakarta.ee/specifications/servlet/6.0/apidocs/jakarta.servlet/jakarta/servlet/http/HttpServletResponse.html">Jakarta Servlet 6.0 HttpServletResponse</a> — sendRedirect가 설정하는 상태 코드 302</li>
+</x-refs>

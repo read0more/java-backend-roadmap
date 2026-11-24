@@ -1,0 +1,521 @@
+<x-meta>
+deck: 페이지 하나를 얻는 데 쿼리가 몇 번 나가는지, 벌크 UPDATE 뒤에 영속성 컨텍스트가 왜 거짓말을 하는지, 엔티티 그래프·힌트·락이 SQL과 InnoDB에서 무엇으로 바뀌는지를 실제 실행으로 추적한다
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li>순수 JPA의 setFirstResult/setMaxResults와 스프링 데이터 JPA의 Pageable이 각각 어떤 SQL과 count 쿼리를 만드는지 실행 로그로 설명할 수 있다.</li>
+<li>Page, Slice, List 반환 타입이 쿼리 횟수와 조회 행 수에서 어떻게 다른지, count 쿼리가 생략되는 조건이 무엇인지 말할 수 있다.</li>
+<li>벌크 수정 쿼리 뒤에 영속성 컨텍스트와 DB가 어긋나는 과정을 단계별로 그리고, flushAutomatically와 clearAutomatically를 언제 함께 써야 하는지 판단할 수 있다.</li>
+<li>@EntityGraph가 fetchgraph 힌트를 거쳐 LEFT JOIN으로 바뀌는 과정과, 컬렉션 그래프에 페이징을 걸면 메모리 페이징이 일어나는 이유를 설명할 수 있다.</li>
+<li>readOnly 힌트와 @Lock이 Hibernate 세션과 InnoDB 잠금에서 실제로 무엇을 바꾸는지, 트랜잭션 없이 락 쿼리가 실패하는 이유를 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 범위와 실험 환경</h3>
+<p>앞 회차(03회)에서는 메서드 이름으로 쿼리를 만드는 규칙, <code>@Query</code>로 JPQL을 직접 적는 방법, 파라미터 바인딩과 반환 타입을 다뤘다. 이 회차는 같은 "쿼리 메서드" 주제의 뒷부분이다. 순수 JPA로 페이징과 정렬을 직접 구현해 보고, 같은 일을 스프링 데이터 JPA의 <code>Pageable</code>로 바꾼 뒤, 벌크성 수정 쿼리, <code>@EntityGraph</code>, JPA 힌트와 락까지 차례로 내려간다. 각 기능의 사용법은 몇 줄이면 끝나지만, 그 몇 줄이 데이터베이스에 몇 번의 쿼리로, 어떤 SQL로, 어떤 잠금으로 바뀌는지는 겉으로 보이지 않는다. 이 회차의 목표는 그 보이지 않는 부분을 드러내는 것이다.</p>
+<p>본문에 나오는 SQL 로그와 실행 결과는 추측이 아니라 실제로 돌려서 얻은 것이다. 실험 환경은 JDK 21, Spring Framework 6.2.19, Spring Data JPA 3.5.13, Hibernate ORM 6.6.53.Final, H2 2.3.232이고, 스프링 부트 없이 <code>@EnableJpaRepositories</code>와 <code>LocalContainerEntityManagerFactoryBean</code>을 직접 등록해 구성했다. SQL은 <code>hibernate.show_sql=true</code>로 출력했다. MySQL용 SQL은 MySQL 서버가 아니라 Hibernate의 <code>MySQLDialect</code>(8.0 기준)에 같은 입력을 넣어 얻은 문자열이다. 내부 동작을 설명할 때는 Spring Data JPA 3.5.13 jar를 <code>javap</code>로 역어셈블해 확인한 내용만 쓴다.</p>
+<p>예제 도메인은 부서(<code>Department</code>)와 직원(<code>Employee</code>)이다. 직원은 부서를 지연 로딩(<code>LAZY</code>)하는 다대일 연관관계를 갖고, 부서는 직원 목록을 <code>mappedBy</code>로 갖는다. 웹 요청 파라미터를 <code>Pageable</code>로 바꿔 주는 기능은 05회(확장 기능)에서, 리포지토리 프록시와 <code>SimpleJpaRepository</code>의 트랜잭션 구조는 06회(스프링 데이터 JPA 분석)에서 다루므로 여기서는 필요한 만큼만 언급한다.</p>
+<pre><code class="language-java">@Entity
+@NamedEntityGraph(name = "Employee.withDepartment",
+        attributeNodes = @NamedAttributeNode("department"))
+public class Employee {
+    @Id @GeneratedValue Long id;
+    String name;
+    int age;
+    @ManyToOne(fetch = FetchType.LAZY) Department department;
+
+    protected Employee() {}
+    public Employee(String name, int age, Department d) {
+        this.name = name; this.age = age; this.department = d;
+    }
+    public int getAge() { return age; }
+    public void setAge(int age) { this.age = age; }
+    public Department getDepartment() { return department; }
+    // ... getId(), getName(), toString()은 "이름(나이)" 형식
+}
+
+@Entity
+public class Department {
+    @Id @GeneratedValue Long id;
+    String name;
+    @OneToMany(mappedBy = "department") List<Employee> employees = new ArrayList<>();
+    protected Department() {}
+    public Department(String name) { this.name = name; }
+    public void rename(String n) { this.name = n; }
+    // ... getName(), getEmployees()
+}</code></pre>
+<p>실험 데이터는 나이가 10인 직원 e1~e5 다섯 명과 나이가 20인 e6 한 명이다. e1~e3은 부서 A, 나머지는 부서 B에 속한다. 이후의 실행 결과는 모두 이 데이터에서 출발한다.</p>
+
+<h3>페이징이라는 문제: 데이터베이스가 잘라야 하는 이유</h3>
+<p>게시판이나 주문 목록처럼 행이 계속 늘어나는 테이블을 화면에 보여 줄 때, 조건에 맞는 행을 전부 가져와 자바에서 잘라 쓰면 어떻게 될까. 데이터베이스는 조건에 맞는 모든 행을 읽어 네트워크로 보내고, JDBC 드라이버는 그 행을 모두 받아 <code>ResultSet</code>을 채우고, Hibernate는 행마다 엔티티 객체를 만들어 영속성 컨텍스트에 등록한다. 영속성 컨텍스트는 등록된 엔티티에 대한 강한 참조를 유지하므로, 트랜잭션이 끝날 때까지 그 객체들은 가비지 컬렉션 대상이 되지 않는다. 화면에 필요한 것은 20건인데 수십만 건이 힙을 차지하는 셈이다. 그래서 페이징은 반드시 데이터베이스 쪽에서 일어나야 한다.</p>
+<p>페이징 화면을 그리려면 데이터베이스에 두 가지 질문을 해야 한다. 첫째, "정렬 기준에 따라 몇 번째부터 몇 개의 행"을 달라는 질문이다. 둘째, "조건에 맞는 행이 전부 몇 개인가"라는 질문이다. 두 번째 답이 있어야 전체 페이지 수와 "마지막 페이지" 버튼을 그릴 수 있다. 두 질문은 성격이 다르다. 첫 번째는 정렬된 순서에서 일부만 읽으면 되지만, 두 번째는 조건에 맞는 행을 끝까지 세어야 한다. 이 차이가 뒤에서 count 쿼리를 최적화하고, 아예 생략하고, <code>Slice</code>로 대체하는 모든 이야기의 출발점이 된다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>도서관 서가에서 책 고르기</strong><p>"제목 가나다순으로 41번째부터 20권"을 꺼내 달라는 요청과 "이 서가에 책이 몇 권 있느냐"는 요청을 생각해 보자. 책이 제목순으로 꽂혀 있다면 첫 요청은 앞에서부터 40권을 건너뛰고 20권을 꺼내면 된다. 둘째 요청은 끝까지 세어야 한다. 비유가 깨지는 지점도 있다. 실제 데이터베이스에서는 "건너뛰는 40권"도 공짜가 아니어서, 인덱스를 따라 하나씩 지나가며 버려야 한다. 이 비용은 뒤에서 OFFSET을 다룰 때 다시 본다.</p></aside>
+
+<h3>순수 JPA 페이징과 정렬</h3>
+<p>JPA 표준 API에서 첫 번째 질문은 <code>Query.setFirstResult(int)</code>와 <code>setMaxResults(int)</code>로 표현한다. 앞의 것은 건너뛸 행 수(offset), 뒤의 것은 최대로 가져올 행 수(limit)다. 정렬은 JPQL의 <code>order by</code>로 적는다. 두 번째 질문은 별도의 <code>select count(...)</code> JPQL로 던진다. 이 둘을 묶는 리포지토리를 직접 쓰면 다음과 같다.</p>
+<pre><code class="language-java">@Repository
+public class EmployeeJpaRepository {
+
+    @PersistenceContext
+    private EntityManager em;
+
+    public List<Employee> findByAge(int age, int offset, int limit) {
+        return em.createQuery(
+                    "select e from Employee e where e.age = :age order by e.name desc",
+                    Employee.class)
+                .setParameter("age", age)
+                .setFirstResult(offset)
+                .setMaxResults(limit)
+                .getResultList();
+    }
+
+    public long totalCount(int age) {
+        return em.createQuery(
+                    "select count(e) from Employee e where e.age = :age", Long.class)
+                .setParameter("age", age)
+                .getSingleResult();
+    }
+}</code></pre>
+<p>JPQL의 <code>count(e)</code>는 결과 타입이 <code>Long</code>이다. 그래서 <code>TypedQuery<Long></code>으로 받고, 반환할 때 <code>long</code>으로 언박싱된다. 페이지 번호(0부터)와 페이지 크기로 호출하려면 offset을 <code>page * size</code>로 계산하고, 전체 페이지 수는 <code>(total + size - 1) / size</code>처럼 올림 나눗셈으로 구한다. 페이지 크기 3으로 0번, 1번 페이지와 전체 개수를 조회한 실제 로그는 다음과 같다.</p>
+<pre data-label="실행 결과 (H2)"><code class="language-text">Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.age=? order by e1_0.name desc offset ? rows fetch first ? rows only
+page 0 [e5(10), e4(10), e3(10)]
+Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.age=? order by e1_0.name desc offset ? rows fetch first ? rows only
+page 1 [e2(10), e1(10)]
+Hibernate: select count(e1_0.id) from Employee e1_0 where e1_0.age=?
+total=5</code></pre>
+<p>JPQL에는 offset이나 limit을 적는 문법이 없는데 SQL에는 <code>offset ? rows fetch first ? rows only</code>가 붙었다. 이 변환은 Hibernate의 방언(<code>Dialect</code>)이 담당한다. 데이터베이스마다 행 수 제한 문법이 다르기 때문이다. H2 방언은 SQL 표준의 <code>OFFSET ... FETCH</code> 문법을 쓰고, MySQL 방언은 MySQL 고유의 <code>LIMIT</code> 문법을 쓴다. 두 방언의 <code>LimitHandler</code>에 같은 SQL을 넣어 보면 차이가 분명하다.</p>
+<pre data-label="Hibernate 6.6 LimitHandler 출력"><code class="language-text">MySQLDialect limitHandler=LimitLimitHandler
+  first page: select x from t order by x limit ?
+  page 3    : select x from t order by x limit ?,?
+H2Dialect limitHandler=OffsetFetchLimitHandler
+  first page: select x from t order by x fetch first ? rows only
+  page 3    : select x from t order by x offset ? rows fetch next ? rows only</code></pre>
+<p>MySQL의 <code>limit ?,?</code>에서 앞의 물음표가 offset, 뒤의 물음표가 행 수다. <code>LimitHandler</code>에 offset 0을 넘기면 offset 부분이 빠진다는 점도 보인다. 다만 앞의 순수 JPA 실행에서는 <code>setFirstResult(0)</code>을 명시적으로 호출한 0번 페이지에도 <code>offset ? rows</code>가 붙었으므로, 실제 SQL에서 offset 절이 생략되는지는 Hibernate가 쿼리를 번역하는 경로에 따라 다르다. 애플리케이션 코드는 <code>setFirstResult</code>와 <code>setMaxResults</code>만 호출했고, 어떤 문법으로 바꿀지는 런타임에 선택된 방언이 정한다. 이것이 JPA가 데이터베이스 이식성을 확보하는 방식이다. 또 숫자가 SQL 문자열에 직접 박히지 않고 바인딩 파라미터(<code>?</code>)로 들어간다는 점에도 주목하자. 페이지 번호가 바뀌어도 SQL 문자열이 같으므로, 드라이버나 데이터베이스가 준비된 문장(prepared statement)을 재사용할 여지가 생긴다.</p>
+
+<h4>정렬 없이 자르면 페이지가 흔들린다</h4>
+<p>페이징에서 <code>order by</code>는 선택이 아니다. SQL에서 <code>ORDER BY</code>가 없는 결과의 순서는 정해져 있지 않다. 정렬 기준에 중복 값이 있을 때도 마찬가지다. MySQL 매뉴얼의 LIMIT 최적화 절은 <code>ORDER BY</code> 열 값이 같은 행들은 서버가 아무 순서로나 반환할 수 있고, 실행 계획에 따라 그 순서가 달라질 수 있으며, <code>LIMIT</code>이 실행 계획에 영향을 주는 요인이라서 <code>LIMIT</code>이 있을 때와 없을 때 순서가 다를 수 있다고 적고 있다. 해결책으로 정렬 기준 끝에 유일한 열(예: 기본 키)을 덧붙이라고 권한다.</p>
+<p>이것이 페이징에서 왜 치명적인지 따져 보자. 같은 나이의 직원이 100명이고 <code>order by e.age</code>로만 정렬해 20건씩 자른다고 하자. 1페이지 요청과 2페이지 요청은 별개의 SQL 실행이다. 두 실행에서 같은 나이 100명의 상대 순서가 달라지면, 어떤 직원은 1페이지와 2페이지에 모두 나타나고 어떤 직원은 어디에도 나타나지 않는다. 사용자는 "목록에서 사람이 사라졌다"고 신고하지만 재현이 잘 되지 않는다. 그래서 페이징 쿼리의 정렬은 <code>order by e.age, e.id</code>처럼 유일성을 보장하는 열로 끝나야 한다.</p>
+
+<h3>한 층 아래: OFFSET과 COUNT가 데이터베이스에서 비싼 이유</h3>
+<p>MySQL 매뉴얼은 <code>LIMIT row_count</code>와 <code>ORDER BY</code>를 함께 쓰면 정렬된 결과의 첫 <code>row_count</code>개를 찾는 즉시 정렬을 멈춘다고 설명한다. 정렬을 인덱스로 할 수 있으면 매우 빠르고, 파일 정렬(filesort)이 필요하면 <code>LIMIT</code>이 없을 때 조건에 맞는 모든 행을 고른 뒤 대부분 또는 전부를 정렬하고 나서야 첫 행들을 찾는다고 적는다. 즉 정렬 열에 인덱스가 있느냐가 페이징 쿼리 비용을 가른다. InnoDB의 B+Tree 인덱스는 키 순서대로 리프 페이지가 연결되어 있으므로, 정렬 열 인덱스를 따라가면 이미 정렬된 순서로 행을 만날 수 있다.</p>
+<p>그런데 offset은 다르다. 인덱스를 따라가더라도 "41번째 행"이 어디 있는지 바로 알 방법은 없다. B+Tree는 키로 위치를 찾는 구조이지 순번으로 위치를 찾는 구조가 아니기 때문이다. 결국 앞의 40개 항목을 하나씩 지나가며 버린 뒤에야 41번째부터 결과로 내보낸다. Spring Data 레퍼런스도 오프셋 기반 조회는 오프셋이 커지면 데이터베이스가 여전히 전체 결과를 만들어 내야 하므로 비효율적이 된다고 설명한다. 1페이지와 10,000페이지의 SQL은 숫자 하나만 다르지만, 데이터베이스가 읽고 버리는 행 수는 페이지 번호에 비례해 늘어난다.</p>
+<pre class="diagram">정렬 인덱스(name 내림차순)의 리프 페이지를 따라가는 모습
+
+  [e5] → [e4] → [e3] → [e2] → [e1] → ...
+   │      │      │      │      │
+   └ 읽고 버림 ┘      └ 결과로 반환 ┘
+   (offset 3)          (limit 2)
+
+offset = 30000 이면: 30000개를 읽고 버린 뒤 20개를 반환
+키셋 방식: WHERE name < '마지막으로 본 값' 으로 인덱스에서 바로 위치를 찾은 뒤 20개만 읽음</pre>
+<p>이 문제의 대안이 키셋(keyset) 방식, 흔히 "커서 기반" 페이징이라 부르는 방법이다. "몇 개를 건너뛰어라" 대신 "직전 페이지의 마지막 행보다 뒤에 있는 것"을 <code>WHERE</code> 조건으로 표현하면, B+Tree에서 그 키의 위치를 바로 찾아 내려간 뒤 필요한 개수만 읽으면 된다. 대신 "임의의 페이지 번호로 점프"는 할 수 없고 다음 페이지로만 이동할 수 있다. Spring Data는 <code>Window</code>와 <code>ScrollPosition</code>(오프셋 기반과 키셋 기반)으로 이 방식을 지원하며, 레퍼런스는 키셋 기반 조회가 적절한 인덱스 구조를 요구하고, 결과에 <code>null</code>이 섞이면 대부분의 저장소에서 잘 동작하지 않는다는 제약을 함께 적고 있다. 이 회차의 범위는 오프셋 기반 <code>Pageable</code>이므로 키셋 방식은 이런 대안이 있다는 데서 멈춘다.</p>
+<p>count 쿼리는 왜 비쌀까. 테이블 전체 행 수쯤은 엔진이 어딘가에 숫자로 들고 있을 것 같지만, InnoDB는 그러지 않는다. MySQL 매뉴얼은 동시에 실행되는 트랜잭션들이 같은 순간에 서로 다른 행 수를 "볼" 수 있기 때문에 InnoDB가 내부 행 수를 유지하지 않으며, 따라서 <code>SELECT COUNT(*)</code>는 현재 트랜잭션에 보이는 행만 센다고 설명한다. MVCC 아래에서는 "지금 이 트랜잭션의 스냅숏에 보이는 행"이 트랜잭션마다 다르니, 하나의 숫자로 저장해 둘 수가 없는 것이다. 매뉴얼에 따르면 InnoDB는 <code>SELECT COUNT(*)</code>를 처리할 때 다른 인덱스를 쓰라는 힌트가 없으면 가장 작은 보조 인덱스를 훑고, 보조 인덱스가 없으면 클러스터드 인덱스를 훑는다. 인덱스 레코드가 버퍼 풀에 다 올라와 있지 않으면 디스크 읽기까지 더해진다. 또 InnoDB에서 <code>COUNT(*)</code>와 <code>COUNT(1)</code>은 같은 방식으로 처리되어 성능 차이가 없다고 명시한다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>페이징 쿼리 한 번은 "정렬된 순서에서 일부를 읽는 쿼리"와 "조건에 맞는 행을 끝까지 세는 쿼리" 두 개다. 앞의 것은 정렬 인덱스와 offset 크기가, 뒤의 것은 조건에 맞는 행 수와 버퍼 풀 상태가 비용을 정한다. 스프링 데이터 JPA의 페이징 기능은 이 두 쿼리를 대신 만들어 줄 뿐, 두 쿼리의 비용 구조를 바꾸지는 않는다.</p></aside>
+
+<h3>스프링 데이터 JPA의 페이징과 정렬</h3>
+<p>스프링 데이터는 페이징과 정렬을 저장소에 독립적인 타입으로 추상화한다. <code>org.springframework.data.domain</code> 패키지의 <code>Sort</code>는 정렬 조건, <code>Pageable</code>은 "몇 번째 페이지를 몇 개씩, 어떤 정렬로"라는 요청이다. <code>Pageable</code>의 대표 구현은 <code>PageRequest</code>이고, 페이지 번호는 0부터 센다. 결과 쪽에는 <code>Slice</code>와 그것을 확장한 <code>Page</code>가 있다. 리포지토리 메서드의 마지막 파라미터로 <code>Pageable</code>을 받고, 반환 타입을 무엇으로 선언하느냐에 따라 실행 방식이 달라진다.</p>
+<pre><code class="language-java">public interface EmployeeRepository extends JpaRepository<Employee, Long> {
+    Page<Employee> findByAge(int age, Pageable pageable);        // 내용 + count 쿼리
+    Slice<Employee> findSliceByAge(int age, Pageable pageable);  // 내용만, size + 1개 조회
+    List<Employee> findListByAge(int age, Pageable pageable);    // 내용만, count 없음
+}
+
+// 사용하는 쪽
+PageRequest req = PageRequest.of(0, 3, Sort.by(Sort.Direction.DESC, "name"));
+Page<Employee> page = repository.findByAge(10, req);
+page.getContent();        // 이 페이지의 엔티티 목록
+page.getTotalElements();  // 전체 개수(count 쿼리 결과)
+page.getTotalPages();     // 전체 페이지 수
+page.getNumber();         // 현재 페이지 번호(0부터)
+page.isFirst(); page.hasNext();</code></pre>
+<p>Spring Data 레퍼런스는 이 차이를 이렇게 정리한다. <code>Page</code>는 전체 요소 수와 페이지 수를 알며, 이를 위해 인프라가 count 쿼리를 실행한다. 이 비용이 클 수 있으므로 대신 <code>Slice</code>를 반환할 수 있는데, <code>Slice</code>는 다음 <code>Slice</code>가 있는지만 안다. <code>List</code>를 반환하면 <code>Page</code>를 만드는 데 필요한 부가 정보를 만들지 않으므로 count 쿼리도 나가지 않는다. 또 <code>Sort</code>, <code>Pageable</code>, <code>Limit</code> 파라미터에는 <code>null</code>을 넘기지 말고, 정렬이나 페이징을 원하지 않으면 <code>Sort.unsorted()</code>, <code>Pageable.unpaged()</code>를 쓰라고 안내한다. 세 가지 반환 타입으로 같은 조건을 조회한 실제 로그를 보자.</p>
+<pre data-label="실행 결과 (Page, size 3, 0번 페이지)"><code class="language-text">Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.age=? order by e1_0.name desc fetch first ? rows only
+Hibernate: select count(e1_0.id) from Employee e1_0 where e1_0.age=?
+[e5(10), e4(10), e3(10)] total=5 pages=2 number=0 first=true hasNext=true</code></pre>
+<pre data-label="실행 결과 (Slice, size 3, name 오름차순)"><code class="language-text">Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.age=? order by e1_0.name fetch first ? rows only
+[e1(10), e2(10), e3(10)] hasNext=true class=SliceImpl</code></pre>
+<pre data-label="실행 결과 (List + Pageable)"><code class="language-text">Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.age=? fetch first ? rows only
+[e1(10), e2(10), e3(10)]</code></pre>
+<p>메서드 선언 한 줄만 썼는데 <code>Page</code> 반환에서는 SQL이 두 번 나갔다. 내용 쿼리에는 <code>Sort</code>가 <code>order by e1_0.name desc</code>로, 페이지 정보가 <code>fetch first ? rows only</code>로 반영됐다. count 쿼리에는 같은 <code>where</code> 조건이 붙었지만 <code>order by</code>는 없다. 행 수를 세는 데 순서는 필요 없기 때문이다. <code>Slice</code>와 <code>List</code>는 SQL이 한 번만 나갔다. 그런데 <code>Slice</code>는 count 없이 어떻게 <code>hasNext=true</code>를 알았을까. 이것이 다음 절의 주제다.</p>
+<p>정렬 속성에도 검증이 있다. 메서드 이름으로 만든 쿼리에 엔티티에 없는 속성으로 정렬을 요청하면, SQL이 나가기 전에 스프링 데이터가 속성 경로를 해석하다 예외를 던진다. <code>@Query</code>로 쓴 JPQL에 <code>Sort</code>를 넘기면 스프링 데이터가 그 JPQL 끝에 <code>order by</code>를 덧붙이는데, 이때 함수 호출 같은 표현식이 들어오면 거부한다. 레퍼런스에 따르면 이런 정렬을 정말 원하면 <code>JpaSort.unsafe(...)</code>로 "안전하지 않다"는 것을 명시해야 한다. 정렬 문자열이 사용자 입력에서 오는 경우가 많으니, 아무 표현식이나 JPQL에 이어 붙이지 않도록 막아 둔 것이다.</p>
+<pre data-label="실행 결과 (정렬 속성 검증)"><code class="language-text">org.springframework.data.mapping.PropertyReferenceException: No property 'nickname' found for type 'Employee'
+
+org.springframework.dao.InvalidDataAccessApiUsageException: Sort expression 'LENGTH(name): ASC' must only contain property references or aliases used in the select clause; If you really want to use something other than that for sorting, please use JpaSort.unsafe(…)</code></pre>
+
+<h3>내부 추적: 쿼리 결과가 Page가 되기까지</h3>
+<p>리포지토리 인터페이스의 메서드를 호출하면 JDK 동적 프록시가 호출을 받는다(실험에서 리포지토리 객체의 클래스 이름은 <code>jdk.proxy2.$Proxy80</code>이었다. 숫자는 실행 환경마다 다를 수 있다). 프록시는 메서드마다 미리 만들어 둔 쿼리 객체를 찾아 실행을 맡기고, 쿼리 객체는 메서드의 반환 타입과 파라미터를 보고 실행 전략을 고른다. Spring Data JPA에서 이 전략들은 <code>JpaQueryExecution</code>의 내부 클래스들이다. <code>Page</code>를 반환하면 <code>PagedExecution</code>, <code>Slice</code>를 반환하면 <code>SlicedExecution</code>, 수정 쿼리면 <code>ModifyingExecution</code>이 선택된다. 프록시가 만들어지는 과정 자체는 06회의 주제다.</p>
+<p><code>PagedExecution.doExecute</code>를 역어셈블하면 흐름이 단순하다. 먼저 내용 쿼리를 만들어 <code>getResultList()</code>를 실행하고, 그 결과 목록과 <code>Pageable</code>, 그리고 "count 쿼리를 실행하는 람다"를 <code>PageableExecutionUtils.getPage</code>에 넘긴다. count 쿼리는 즉시 실행되지 않고 <code>LongSupplier</code>로 감싸여 전달된다. 실행할지 말지는 <code>getPage</code>가 결정한다. spring-data-commons 3.5.13의 <code>getPage</code> 바이트코드를 자바로 옮기면 다음과 같다.</p>
+<pre><code class="language-java">// PageableExecutionUtils.getPage 의 동작을 바이트코드에서 옮긴 것 (Assert 생략)
+static <T> Page<T> getPage(List<T> content, Pageable pageable, LongSupplier totalSupplier) {
+    if (pageable.isUnpaged()) {
+        return new PageImpl<>(content, pageable, content.size());
+    }
+    if (pageable.getPageSize() > content.size()) {          // 덜 찬 페이지
+        if (pageable.getOffset() == 0) {                     // 첫 페이지
+            return new PageImpl<>(content, pageable, content.size());
+        }
+        if (!content.isEmpty()) {                            // 내용이 있는 마지막 페이지
+            return new PageImpl<>(content, pageable, pageable.getOffset() + content.size());
+        }
+    }
+    return new PageImpl<>(content, pageable, totalSupplier.getAsLong());  // 여기서만 count 실행
+}</code></pre>
+<p>규칙을 말로 풀면 이렇다. 가져온 행이 페이지 크기보다 적다면 그 페이지가 마지막 페이지라는 뜻이다. 그런데 마지막 페이지라면 전체 개수는 "건너뛴 행 수 + 이번에 가져온 행 수"로 계산할 수 있다. 첫 페이지면 건너뛴 행이 0이니 가져온 개수가 곧 전체 개수다. 이 경우들에는 count 쿼리를 실행할 이유가 없다. 실행 로그로 확인해 보자. 다섯 명을 3명씩 나누면 1번 페이지는 2명만 차는 마지막 페이지다.</p>
+<pre data-label="실행 결과 (count 쿼리 생략 조건)"><code class="language-text">=== Page page1 size3 (last partial)
+Hibernate: select ... where e1_0.age=? order by e1_0.name desc offset ? rows fetch first ? rows only
+[e2(10), e1(10)] total=5 hasNext=false
+
+=== Page page0 size10 (first partial)
+Hibernate: select ... where e1_0.age=? fetch first ? rows only
+[e1(10), e2(10), e3(10), e4(10), e5(10)] total=5
+
+=== Page page5 size3 (empty beyond end)
+Hibernate: select ... where e1_0.age=? offset ? rows fetch first ? rows only
+Hibernate: select count(e1_0.id) from Employee e1_0 where e1_0.age=?
+[] total=5</code></pre>
+<p>마지막 페이지와 덜 찬 첫 페이지에서는 count 쿼리가 나가지 않았고, 전체 개수는 각각 3+2=5, 5로 계산됐다. 범위를 벗어난 5번 페이지는 결과가 비었다. 비어 있으면 "건너뛴 수 + 0"이 전체 개수라고 단정할 수 없으므로(건너뛴 위치가 이미 끝을 넘었을 수 있다) count 쿼리를 실행했다. 실무에서 count가 나가는 경우는 결국 "꽉 찬 페이지"를 조회할 때와 "범위 밖" 페이지를 조회할 때다. 목록 화면 대부분의 요청은 꽉 찬 페이지이므로 count 비용은 여전히 매 요청 들어간다고 보는 것이 맞다.</p>
+<p>count 람다 안쪽(<code>PagedExecution.count</code>)도 볼 만하다. count 쿼리를 <code>getResultList()</code>로 실행한 뒤, 결과 행이 정확히 1개면 그 값을 <code>Long</code>으로 변환해 쓰고, 그렇지 않으면 결과 행의 개수를 전체 개수로 쓴다. <code>group by</code>가 있는 쿼리의 count는 그룹마다 한 행씩 돌아오는데, 이때 "그룹의 개수"가 페이지 대상의 개수이기 때문이다.</p>
+<p><code>SlicedExecution</code>은 count 대신 한 개를 더 읽는다. 바이트코드를 보면 <code>pageable.getPageSize()</code>에 1을 더해 <code>setMaxResults</code>를 호출하고, 결과가 페이지 크기보다 많으면 <code>hasNext</code>를 참으로 하고 <code>subList(0, pageSize)</code>로 잘라 <code>SliceImpl</code>을 만든다. 앞의 실행에서 페이지 크기는 3이었지만 SQL의 <code>fetch first ? rows only</code>에 바인딩된 값은 4였던 것이다. 네 번째 행이 존재했으므로 <code>hasNext=true</code>가 나왔다. 모바일 앱의 "더 보기" 버튼이나 무한 스크롤처럼 전체 페이지 수가 필요 없는 화면이라면, count 쿼리 한 번을 행 하나 더 읽는 비용으로 바꾸는 셈이다.</p>
+<figure class="flow-figure"><figcaption>Page 반환 메서드 한 번의 실행 흐름</figcaption><ol class="flow">
+<li><strong>프록시가 호출을 받음</strong><span>JDK 동적 프록시가 메서드에 대응하는 쿼리 객체를 찾는다.</span></li>
+<li><strong>실행 전략 선택</strong><span>반환 타입이 Page이므로 PagedExecution이 선택된다.</span></li>
+<li><strong>내용 쿼리 실행</strong><span>Pageable의 offset과 size가 setFirstResult/setMaxResults로, Sort가 order by로 반영되어 SQL이 나간다.</span></li>
+<li><strong>count 필요 여부 판단</strong><span>PageableExecutionUtils.getPage가 덜 찬 첫 페이지나 내용이 있는 마지막 페이지인지 확인한다.</span></li>
+<li><strong>필요할 때만 count 실행</strong><span>LongSupplier가 호출되어 order by 없는 count 쿼리가 나간다.</span></li>
+<li><strong>PageImpl 생성</strong><span>내용 목록, Pageable, 전체 개수로 Page를 만들어 돌려준다.</span></li>
+</ol></figure>
+<x-visual id="spring-data-jpa-04-page-count-decision" title="Page 생성 시 count 쿼리 실행 여부를 결정하는 순서도" kind="순서도" ratio="16:9">
+<x-hint>PageableExecutionUtils.getPage가 내용 목록 크기와 offset을 보고 count 쿼리를 실행할지 결정하는 분기를 보여 준다.</x-hint>
+<x-prompt>Clean flowchart on white background, left to right. Start box "내용 쿼리 실행". Diamond 1 "가져온 행이 페이지 크기보다 적음?" — "아니오" arrow goes right to a red-outlined box "count 쿼리 실행". "예" arrow goes down to Diamond 2 "첫 페이지(offset 0)?" — "예" arrow to green box "전체 = 가져온 행 수". "아니오" arrow to Diamond 3 "가져온 행이 있음?" — "예" arrow to green box "전체 = offset + 가져온 행 수", "아니오" arrow to the red "count 쿼리 실행" box. All green and red boxes flow into end box "PageImpl 생성". Flat style, thin dark gray arrows, Korean labels exactly as quoted.</x-prompt>
+<x-caption>count 쿼리는 꽉 찬 페이지이거나 범위를 벗어난 빈 페이지일 때만 실행된다.</x-caption>
+</x-visual>
+
+<h3>count 쿼리는 누가 만드는가: 파생 count와 countQuery</h3>
+<p>메서드 이름으로 만든 쿼리라면 count 쿼리도 같은 조건으로 만들면 된다. 앞의 로그에서 <code>select count(e1_0.id) ... where e1_0.age=?</code>가 그것이다. 하지만 <code>@Query</code>로 직접 쓴 JPQL은 문자열이다. 스프링 데이터는 이 문자열을 파싱해 select 절을 <code>count(...)</code>로 바꾸고 <code>order by</code>를 떼어 내는 식으로 count 쿼리를 파생(derive)한다. Spring Data JPA 3.5.13에서 이 일을 하는 것은 <code>QueryEnhancer</code>이고, JPQL에는 ANTLR 문법으로 만든 <code>HqlQueryParser</code>가, 네이티브 SQL에는 JSqlParser가 클래스패스에 있으면 그것이, 없으면 <code>DefaultQueryEnhancer</code>가 쓰인다. 같은 패키지에 검사용 클래스를 두고 몇 가지 쿼리를 넣어 본 결과는 다음과 같다.</p>
+<pre data-label="파생 count 쿼리 (Spring Data JPA 3.5.13)"><code class="language-text">HqlQueryParser | select e from Employee e left join e.department d where e.age >= :age
+   -> select count(e) from Employee e left join e.department d where e.age >= :age
+HqlQueryParser | select e from Employee e left join fetch e.department d where e.age >= :age
+   -> select count(e) from Employee e left join e.department d where e.age >= :age
+HqlQueryParser | select distinct d from Department d join d.employees e
+   -> select count(distinct d) from Department d join d.employees e
+HqlQueryParser | select e from Employee e where e.age >= :age order by e.name
+   -> select count(e) from Employee e where e.age >= :age
+DefaultQueryEnhancer | select * from employee e where e.age >= ?1 order by e.name
+   -> select count(1) from employee e where e.age >= ?1</code></pre>
+<p>몇 가지를 읽어 낼 수 있다. 페치 조인의 <code>fetch</code>는 count 쿼리에서 빠진다. count 쿼리는 엔티티를 반환하지 않으니 연관 객체를 함께 채운다는 지시가 의미가 없기 때문이다. <code>distinct</code>는 <code>count(distinct d)</code>로 보존된다. 일대다 조인으로 부서 행이 직원 수만큼 불어나도 부서 개수를 정확히 세려면 꼭 필요한 변환이다. <code>order by</code>는 제거된다. 조인은 그대로 남는다는 점이 중요하다. 파서는 "이 조인이 개수에 영향을 주는가"를 판단하지 않고 문법 구조만 바꾼다.</p>
+<p>그렇다면 남아 있는 조인은 SQL에서 비용이 될까. 이 실험의 Hibernate 6.6.53에서는 흥미로운 결과가 나왔다. <code>left join e.department d</code>를 쓰고 <code>d</code>를 어디에서도 사용하지 않은 <code>@Query</code>를 <code>Page</code>로 실행하자, 내용 쿼리와 count 쿼리 모두에서 SQL의 조인이 사라졌다. 다대일 연관을 왼쪽 외부 조인하면 왼쪽 행의 수가 바뀌지 않으므로, 쓰이지 않는 그 조인을 Hibernate가 SQL로 옮기지 않은 것이다. 반면 페치 조인 버전은 내용 쿼리에는 조인이 남고 count 쿼리에서만 빠졌다.</p>
+<pre data-label="실행 결과 (@Query + Page)"><code class="language-text">=== left join, count 자동 파생
+Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.age>=? fetch first ? rows only
+Hibernate: select count(e1_0.id) from Employee e1_0 where e1_0.age>=?
+
+=== left join fetch, count 자동 파생
+Hibernate: select e1_0.id,e1_0.age,d1_0.id,d1_0.name,e1_0.name from Employee e1_0 left join Department d1_0 on d1_0.id=e1_0.department_id where e1_0.age>=? fetch first ? rows only
+Hibernate: select count(e1_0.id) from Employee e1_0 where e1_0.age>=?</code></pre>
+<p>이 결과를 "count 쿼리 분리는 이제 필요 없다"로 읽으면 안 된다. 제거된 것은 행 수에 영향을 주지 않는 다대일 외부 조인뿐이다. 내부 조인은 조인 상대가 없는 행을 걸러 내므로 개수를 바꿀 수 있어 제거할 수 없고, 일대다 조인은 행을 불린다. 조건이 여러 테이블에 걸친 통계성 목록에서 화면용 내용 쿼리는 여러 테이블을 조인해야 하지만, 개수는 기준 테이블 하나만 세면 되는 경우가 흔하다. 이럴 때 <code>countQuery</code> 속성으로 count 쿼리를 직접 지정한다. Spring Data 레퍼런스도 네이티브 쿼리에 대해, 단순한 쿼리는 자동으로 다시 쓸 수 있지만 복잡한 쿼리에는 JSqlParser나 직접 선언한 <code>countQuery</code>가 필요하다고 설명한다.</p>
+<pre><code class="language-java">@Query(value = "select e from Employee e left join e.department d where e.age >= :age",
+       countQuery = "select count(e) from Employee e where e.age >= :age")
+Page<Employee> findJoinedWithCount(@Param("age") int age, Pageable pageable);</code></pre>
+<p>직접 지정한 count 쿼리는 내용 쿼리와 같은 결과 집합의 크기를 세야 한다는 책임을 개발자에게 넘긴다. 내용 쿼리에는 있는 조건이 count 쿼리에서 빠지면, 페이지 내용과 전체 개수가 어긋나 "마지막 페이지가 비어 있는" 화면이 나온다. 두 쿼리의 <code>where</code> 절은 반드시 함께 고쳐야 한다.</p>
+<h4>Page.map: 엔티티를 그대로 내보내지 않기</h4>
+<p><code>Page</code>는 <code>map(Function)</code>을 제공한다. 내용 목록의 각 요소를 변환한 새 <code>Page</code>를 만들고, 페이지 번호와 전체 개수 같은 메타 정보는 그대로 유지한다. 실험에서 <code>findByAge(10, PageRequest.of(0, 3)).map(Employee::getName)</code>은 내용이 <code>[e1, e2, e3]</code>, 전체 개수가 5인 <code>Page<String></code>을 돌려줬다. 변환은 이미 조회된 목록 위에서 자바 메모리 안에서 일어나므로 추가 SQL은 없다. API 응답에 엔티티를 그대로 내보내면 지연 로딩 프록시가 직렬화 도중 초기화되거나, 엔티티 필드 변경이 곧 API 스펙 변경이 되는 문제가 생긴다. 컨트롤러에 넘기기 전에 <code>map</code>으로 DTO로 바꾸는 이유다.</p>
+
+<h3>벌크성 수정 쿼리: 한 문장으로 여러 행을 바꾸기</h3>
+<p>"나이가 15 이상인 직원의 나이를 1씩 올려라" 같은 요구를 변경 감지(dirty checking)로 처리하면 어떻게 될까. 대상 엔티티를 모두 조회해 영속성 컨텍스트에 올리고, 각각 <code>setAge</code>를 호출한 뒤, 플러시 시점에 Hibernate가 엔티티마다 스냅숏과 현재 값을 비교해 <code>update Employee set ... where id=?</code>를 행 수만큼 실행한다. 대상이 10만 건이면 10만 개의 객체와 10만 개의 스냅숏이 힙에 올라오고, UPDATE 문도 10만 번 나간다(JDBC 배치를 켜면 왕복 횟수는 줄지만 문장 수는 같다). 데이터베이스에 한 문장으로 맡기면 행을 애플리케이션으로 가져올 필요가 없다. JPQL의 <code>update</code>와 <code>delete</code>가 이 일을 하며, JPA 명세는 이를 벌크 업데이트·삭제 연산이라고 부른다.</p>
+<p>순수 JPA에서는 <code>em.createQuery("update ...").executeUpdate()</code>를 호출하고, 반환값으로 영향받은 행 수를 받는다. 스프링 데이터 JPA에서는 <code>@Query</code>에 update 문을 적고 <code>@Modifying</code>을 붙인다.</p>
+<pre><code class="language-java">@Modifying
+@Query("update Employee e set e.age = e.age + 1 where e.age >= :age")
+int bulkAgePlus(@Param("age") int age);</code></pre>
+<p><code>@Modifying</code>을 빼면 어떻게 될까. 스프링 데이터는 이 메서드를 조회 쿼리로 취급해 <code>getResultList()</code>로 실행하려 하고, Hibernate가 select가 아닌 문장이라며 거부한다. 실제 메시지는 다음과 같다.</p>
+<pre data-label="실행 결과 (@Modifying 누락)"><code class="language-text">org.springframework.dao.InvalidDataAccessApiUsageException: Query executed via 'getResultList()' or 'getSingleResult()' must be a 'select' query [update Employee e set e.age = e.age + 1 where e.age >= :age]</code></pre>
+<p><code>@Modifying</code>이 붙으면 실행 전략이 <code>ModifyingExecution</code>으로 바뀐다. 이 클래스의 생성자는 메서드 반환 타입을 검사해 <code>"Modifying queries can only use void, int/Integer, or long/Long as return type"</code>이라는 메시지로 다른 타입을 거부한다. 실행 메서드의 바이트코드 순서는 이렇다. ① <code>flushAutomatically</code>가 참이면 <code>em.flush()</code>, ② 쿼리를 만들어 <code>executeUpdate()</code>, ③ <code>clearAutomatically</code>가 참이면 <code>em.clear()</code>, ④ 영향받은 행 수를 <code>Integer</code>로 반환. 두 속성의 기본값은 모두 <code>false</code>다(애너테이션의 <code>AnnotationDefault</code>로 확인). 이 두 속성이 왜 필요한지가 다음 절의 핵심이다.</p>
+<p>트랜잭션도 짚어야 한다. JPA 명세는 <code>executeUpdate</code>를 제외한 조회 메서드는 트랜잭션 없이 호출할 수 있다고 적는다. 거꾸로 말해 <code>executeUpdate</code>는 트랜잭션이 필요하다. Spring Data 레퍼런스는 <code>CrudRepository</code>에서 물려받은 메서드는 <code>SimpleJpaRepository</code>의 트랜잭션 설정을 따르지만, 리포지토리 인터페이스에 선언한 쿼리 메서드에는 기본으로 어떤 트랜잭션 설정도 적용되지 않는다고 설명한다. 따라서 벌크 수정 메서드는 서비스 계층의 <code>@Transactional</code> 안에서 호출하거나, 레퍼런스 예제처럼 메서드에 <code>@Modifying</code>과 함께 <code>@Transactional</code>을 붙인다.</p>
+<h4>데이터베이스 안에서: 한 문장이 잡는 잠금</h4>
+<p>벌크 UPDATE는 SQL 한 문장이지만 가벼운 문장은 아니다. MySQL 매뉴얼의 "InnoDB에서 SQL 문이 거는 잠금" 절은 잠금 읽기, UPDATE, DELETE가 일반적으로 처리 중에 스캔한 모든 인덱스 레코드에 레코드 잠금을 걸며, 행을 제외하는 WHERE 조건이 있어도 상관없다고 설명한다. InnoDB는 정확한 WHERE 조건을 기억하지 않고 어떤 인덱스 범위를 스캔했는지만 알기 때문이다. 같은 절에 따르면 <code>UPDATE ... WHERE ...</code>는 검색 중 만나는 모든 레코드에 배타적 넥스트 키 잠금(next-key lock)을 건다. 그리고 문장에 알맞은 인덱스가 없어 테이블 전체를 스캔해야 하면 테이블의 모든 행이 잠기고, 다른 사용자의 삽입까지 모두 막힌다고 경고한다.</p>
+<p>이것을 앞의 예제에 대입해 보자. <code>age</code> 열에 인덱스가 없다면 <code>update ... where age >= 15</code>는 클러스터드 인덱스 전체를 훑으며 모든 행에 배타 잠금을 걸고, 이 잠금은 트랜잭션이 커밋되거나 롤백될 때까지 유지된다. 그 사이 다른 트랜잭션이 아무 직원 행이나 수정하려 하면 기다려야 한다. 대상이 몇 건인지가 아니라 "몇 건을 스캔하는지"가 잠금 범위를 정한다는 점이 핵심이다. 벌크 수정 쿼리의 WHERE 조건이 인덱스를 탈 수 있는지, 그리고 그 트랜잭션이 얼마나 오래 열려 있는지를 함께 따져야 하는 이유다.</p>
+<p>낙관적 락과의 관계도 있다. JPA 명세 4.10절은 벌크 업데이트가 데이터베이스 업데이트 연산으로 바로 매핑되어 낙관적 락 검사를 우회하며, 이식 가능한 애플리케이션은 필요하면 버전 열 값을 직접 갱신하거나 검증해야 한다고 적는다. <code>@Version</code> 필드가 있는 엔티티라도 벌크 UPDATE는 버전을 올리지 않는다는 뜻이다. 다른 트랜잭션이 변경 감지로 같은 행을 수정하면 버전 비교가 통과해 벌크 연산의 결과를 덮어쓸 수 있다. 버전 관리가 중요한 테이블이라면 JPQL에 <code>e.version = e.version + 1</code>을 직접 넣어야 한다.</p>
+
+<h3>벌크 연산 뒤의 영속성 컨텍스트: 단계별 추적</h3>
+<p>JPA 명세는 벌크 연산에 대해 분명하게 경고한다. 영속성 컨텍스트는 벌크 업데이트·삭제의 결과와 동기화되지 않으며, 벌크 연산은 데이터베이스와 활성 영속성 컨텍스트의 엔티티 사이에 불일치를 만들 수 있으니 주의하라고 한다. 그리고 일반적으로 새 영속성 컨텍스트를 쓰는 트랜잭션 안에서, 또는 영향받을 엔티티를 조회하기 전에 수행하라고 권한다. 이 문장이 실제로 무슨 뜻인지 한 트랜잭션 안에서 추적해 보자.</p>
+<pre><code class="language-java">tx.executeWithoutResult(status -> {
+    Employee e6 = repository.findPlainByName("e6");       // ① age 20으로 로딩
+    em.persist(new Employee("e7", 30, null));             // ② 아직 INSERT 안 됨
+    int n = repository.bulkAgePlus(15);                    // ③ age >= 15 인 행 +1
+    Employee again = repository.findPlainByName("e6");    // ④ 다시 조회
+    System.out.println("same instance=" + (again == e6) + " age=" + again.getAge());
+    em.clear();                                            // ⑤ 영속성 컨텍스트 비우기
+    System.out.println("after clear age=" + repository.findPlainByName("e6").getAge());
+});</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.name=?
+loaded e6 age=20
+-- calling bulk
+Hibernate: insert into Employee (age,department_id,name,id) values (?,?,?,?)
+Hibernate: update Employee e1_0 set age=(e1_0.age+1) where e1_0.age>=?
+updated rows=2
+Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.name=?
+same instance=true age=20
+Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.name=?
+after clear age=21</code></pre>
+<p>한 줄씩 따라가 보자. ①에서 e6이 나이 20으로 영속성 컨텍스트에 올라온다. ②의 <code>persist</code>는 INSERT를 즉시 실행하지 않고 쓰기 지연 저장소에 넣어 둔다. ③에서 <code>flushAutomatically</code>를 켜지 않았는데도 UPDATE 직전에 e7의 INSERT가 먼저 실행됐다. Hibernate가 쿼리 실행 전에 자동 플러시를 했기 때문이다. 업데이트된 행이 2개인 것은 e6(20)과 방금 들어간 e7(30)이 모두 조건에 맞았기 때문이다. INSERT가 먼저 나가지 않았다면 e7은 갱신되지 않았을 것이다.</p>
+<p>④가 이 절의 핵심이다. 다시 조회하자 SELECT가 실제로 실행됐다. 데이터베이스는 나이 21인 행을 돌려줬다. 그런데 결과 객체는 ①의 그 인스턴스이고 나이는 여전히 20이다. 영속성 컨텍스트는 식별자를 키로 하는 맵(identity map)이다. Hibernate는 JPQL 결과 행을 엔티티로 만들 때 그 식별자의 엔티티가 이미 관리 중이면 새 객체를 만들지 않고 기존 인스턴스를 돌려주며, 행에서 읽은 값으로 기존 인스턴스를 덮어쓰지 않는다. 한 트랜잭션 안에서 같은 엔티티는 같은 인스턴스라는 동일성 보장(JPA 기본편에서 다룬 1차 캐시의 성질)이 여기서는 "옛 값을 계속 보여 주는" 결과를 낳는다. ⑤에서 영속성 컨텍스트를 비우고 나서야 다시 조회한 객체가 21을 보여 준다.</p>
+<pre class="diagram">시점        영속성 컨텍스트(1차 캐시)          데이터베이스 Employee 행
+──────────────────────────────────────────────────────────────────────
+① 조회      e6 {age=20}, 스냅숏 {age=20}        e6 age=20
+② persist   + e7 {age=30} (INSERT 대기)          e6 age=20
+③ 벌크      (자동 플러시로 e7 INSERT)            e6 age=21, e7 age=31
+            e6 {age=20}  ← 그대로
+④ 재조회    SELECT 결과 age=21 행 → 이미 관리 중인 e6 인스턴스 반환 → age=20
+⑤ clear()   (비어 있음)                          e6 age=21
+   재조회   e6 {age=21} 새 인스턴스              e6 age=21</pre>
+<p>이 불일치를 없애는 방법이 <code>clearAutomatically = true</code>다. 벌크 연산 직후 <code>em.clear()</code>를 호출해 영속성 컨텍스트의 모든 엔티티를 준영속 상태로 만든다. 실험에서 이 옵션을 켠 메서드를 호출한 뒤 <code>em.contains(e6)</code>은 <code>false</code>였고, 다시 조회한 e6은 새 값을 보여 줬다. 주의할 점은 clear 이후 기존 참조 <code>e6</code>은 더 이상 관리되지 않는다는 것이다. 그 객체를 수정해도 변경 감지가 일어나지 않고, 지연 로딩 연관을 처음 건드리면 초기화에 실패할 수 있다. 필요한 엔티티는 벌크 연산 뒤에 다시 조회해야 한다.</p>
+<h4>자동 플러시는 어디까지 해 주는가</h4>
+<p>③에서 본 자동 플러시는 JPA 명세의 플러시 모드 규칙에서 나온다. 플러시 모드가 기본값 <code>AUTO</code>이면, 영속성 공급자는 쿼리 결과에 영향을 줄 수 있는 영속성 컨텍스트의 모든 변경이 쿼리 처리에 보이도록 보장할 책임이 있고, 이를 플러시로 해결할 수 있다고 명세는 적는다. "영향을 줄 수 있는" 변경만이 대상이라는 점에 주목하자. 이 실험의 Hibernate 6.6.53은 쿼리가 다루는 테이블에 걸리는 미반영 변경이 있을 때만 플러시를 실행했다. 그런 변경이 하나라도 있으면 다른 테이블의 변경까지 한꺼번에 내보냈고(직원 INSERT와 부서 이름 변경이 함께 대기 중일 때는 둘 다 벌크 직전에 실행됐다), 하나도 없으면 플러시를 아예 건너뛰었다. 부서 이름만 바꿔 둔 상태에서 직원 테이블에 벌크 UPDATE를 실행하면 결과가 이렇다.</p>
+<pre data-label="실행 결과 (다른 테이블의 변경)"><code class="language-text">=== flushAutomatically = false (기본)
+Hibernate: select d1_0.id,d1_0.name from Department d1_0
+-- bulk
+Hibernate: update Employee e1_0 set age=(e1_0.age+1) where e1_0.age>=?
+-- bulk done
+Hibernate: update Department set name=? where id=?     ← 커밋 시점에야 플러시
+
+=== flushAutomatically = true
+Hibernate: select d1_0.id,d1_0.name from Department d1_0
+-- bulk
+Hibernate: update Department set name=? where id=?     ← 벌크 직전에 전체 플러시
+Hibernate: update Employee e1_0 set age=(e1_0.age+1) where e1_0.age>=?
+-- bulk done</code></pre>
+<p>여기까지는 순서의 문제일 뿐이다. 진짜 문제는 <code>clearAutomatically</code>만 켜고 <code>flushAutomatically</code>를 켜지 않았을 때 생긴다. 직원 테이블에 걸리는 미반영 변경이 없어 자동 플러시가 일어나지 않았으므로 부서 이름 변경은 아직 메모리에만 있는데, 벌크 연산 직후 <code>em.clear()</code>가 그 부서 엔티티를 준영속으로 만들어 버린다. 커밋 시점의 플러시는 더 이상 그 엔티티를 보지 않는다.</p>
+<pre data-label="실행 결과 (clearAutomatically만 켠 경우)"><code class="language-text">Hibernate: select d1_0.id,d1_0.name from Department d1_0      ← 부서 이름 'A3'
+                                                              ← rename("LOST?") 호출
+Hibernate: update Employee e1_0 set age=(e1_0.age+1) where e1_0.age>=?
+-- bulk done, commit next
+Hibernate: select d1_0.name from Department d1_0              ← 다음 트랜잭션에서 확인
+dept name in db=A3</code></pre>
+<p>예외도 경고도 없이 부서 이름 변경이 사라졌다. Spring Data 레퍼런스가 수정 쿼리 뒤에 <code>EntityManager</code>를 자동으로 비우지 않는 이유로 든 것이 바로 이것이다. clear는 아직 플러시되지 않은 모든 변경을 사실상 버리기 때문이다. 그래서 <code>clearAutomatically = true</code>를 쓸 때는 <code>flushAutomatically = true</code>를 함께 쓰는 것이 안전하다. 먼저 모든 변경을 데이터베이스에 내보내고, 그다음 벌크 연산을 실행하고, 마지막으로 컨텍스트를 비우는 순서가 된다. 더 근본적인 방법은 명세의 권고처럼 벌크 연산을 트랜잭션의 맨 앞에 두거나 별도 트랜잭션으로 분리해, 비울 영속성 컨텍스트에 잃을 것이 없게 만드는 것이다.</p>
+<x-visual id="spring-data-jpa-04-bulk-context-mismatch" title="벌크 UPDATE 후 영속성 컨텍스트와 데이터베이스가 어긋나는 과정" kind="상태 비교 다이어그램" ratio="16:9">
+<x-hint>벌크 UPDATE가 데이터베이스만 바꾸고 1차 캐시는 그대로 두어, 재조회해도 옛 값이 반환되는 과정을 두 기둥의 비교로 보여 준다.</x-hint>
+<x-prompt>Two vertical columns side by side on white background. Left column titled "영속성 컨텍스트", right column titled "데이터베이스". Four horizontal rows from top to bottom labeled on the far left: "① 조회", "③ 벌크 UPDATE", "④ 재조회", "⑤ clear 후 재조회". Row ①: left card "e6 age=20", right card "e6 age=20". Row ③: left card "e6 age=20" in gray, right card "e6 age=21" highlighted in orange, with a thick arrow from a small box "UPDATE 한 문장" pointing only to the right column. Row ④: arrow from right card "age=21 행" toward left, blocked by a small shield icon labeled "이미 관리 중", left card still "e6 age=20". Row ⑤: left card "e6 age=21" in green, right card "e6 age=21". Minimal flat style, thin lines, Korean labels exactly as quoted.</x-prompt>
+<x-caption>벌크 연산은 데이터베이스만 바꾼다. 이미 관리 중인 엔티티는 다시 조회해도 옛 값을 유지한다.</x-caption>
+</x-visual>
+
+<h3>@EntityGraph: 메서드에 페치 계획을 선언하기</h3>
+<p>다대일 연관을 지연 로딩으로 두면 직원 목록을 조회한 뒤 각 직원의 부서 이름을 읽을 때마다 부서 조회 SQL이 추가로 나가는 N+1 문제가 생긴다(JPA 활용 2편에서 다룬 문제다). JPQL 페치 조인으로 해결할 수 있지만, 그러려면 메서드 이름 쿼리를 버리고 <code>@Query</code>로 JPQL을 직접 써야 한다. <code>JpaRepository</code>의 <code>findAll()</code> 같은 공통 메서드는 아예 JPQL을 바꿀 수 없다. <code>@EntityGraph</code>는 쿼리 문장은 그대로 두고 "이 메서드는 이 연관을 함께 가져온다"는 페치 계획만 덧붙이는 방법이다.</p>
+<pre><code class="language-java">public interface EmployeeRepository extends JpaRepository<Employee, Long> {
+
+    @Override
+    @EntityGraph(attributePaths = {"department"})
+    List<Employee> findAll();                                   // 공통 메서드 재선언
+
+    @EntityGraph(attributePaths = "department")
+    Page<Employee> findGraphByAge(int age, Pageable pageable);  // 메서드 이름 쿼리
+
+    @EntityGraph("Employee.withDepartment")                     // @NamedEntityGraph 참조
+    List<Employee> findNamedByName(String name);
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">=== findAll
+Hibernate: select e1_0.id,e1_0.age,d1_0.id,d1_0.name,e1_0.name from Employee e1_0 left join Department d1_0 on d1_0.id=e1_0.department_id
+7 dept loaded=true
+
+=== findGraphByAge (Page)
+Hibernate: select e1_0.id,e1_0.age,d1_0.id,d1_0.name,e1_0.name from Employee e1_0 left join Department d1_0 on d1_0.id=e1_0.department_id where e1_0.age=? fetch first ? rows only
+Hibernate: select count(e1_0.id) from Employee e1_0 where e1_0.age=?
+
+=== findNamedByName
+Hibernate: select e1_0.id,e1_0.age,d1_0.id,d1_0.name,e1_0.name from Employee e1_0 left join Department d1_0 on d1_0.id=e1_0.department_id where e1_0.name=?</code></pre>
+<p>세 경우 모두 부서 테이블이 <code>left join</code>으로 한 번에 조회됐고, <code>Hibernate.isInitialized(...)</code>로 확인한 부서 프록시는 초기화된 상태였다. 조인이 내부 조인이 아니라 왼쪽 외부 조인이라는 점이 중요하다. 부서가 없는 직원(실험의 e7)도 결과에서 빠지지 않는다. JPQL에서 <code>join fetch</code>라고 쓰면 내부 조인이므로 부서 없는 직원이 사라지는데, 엔티티 그래프는 "가져오는 방법"만 바꾸고 "어떤 행을 가져오는지"는 바꾸지 않는다. <code>Page</code>와 함께 쓰면 count 쿼리에는 그래프가 적용되지 않아 조인 없는 count가 나간다.</p>
+<h4>애너테이션이 SQL 조인이 되기까지</h4>
+<p>엔티티 그래프는 JPA 2.1에서 도입된 표준 기능이다. JPA 명세는 엔티티 그래프를 쿼리 힌트로 전달하도록 정의하며, 힌트 키가 두 가지다. <code>jakarta.persistence.fetchgraph</code>로 전달하면 그래프에 명시한 속성은 <code>FetchType.EAGER</code>로, 명시하지 않은 속성은 <code>FetchType.LAZY</code>로 취급한다(페치 그래프). <code>jakarta.persistence.loadgraph</code>로 전달하면 명시한 속성은 <code>EAGER</code>로, 명시하지 않은 속성은 원래 지정된 또는 기본 페치 타입을 따른다(로드 그래프). 명세는 또 공급자가 그래프가 지정한 것보다 더 많은 상태를 가져오는 것은 허용하되, 그래프가 지정한 상태는 반드시 가져와야 한다고 적는다. 즉 그래프는 "최소한 이것은 가져와라"는 보장이지 "이것만 가져와라"는 보장이 아니다.</p>
+<p>Spring Data JPA의 <code>@EntityGraph</code>에는 <code>type</code> 속성이 있고, 3.5.13 바이트코드의 <code>AnnotationDefault</code>를 보면 기본값은 <code>EntityGraphType.FETCH</code>다. 이 열거형은 <code>FETCH</code>에 <code>"jakarta.persistence.fetchgraph"</code>, <code>LOAD</code>에 <code>"jakarta.persistence.loadgraph"</code>라는 키 문자열을 들고 있다. 쿼리 객체는 실행 직전에 <code>attributePaths</code>로 <code>EntityManager.createEntityGraph</code>를 써서 그래프를 만들거나(<code>Jpa21Utils.getFetchGraphHint</code>), 이름이 주어지면 <code>@NamedEntityGraph</code>로 정의된 그래프를 찾아 해당 키의 힌트로 쿼리에 건다. Hibernate는 쿼리를 SQL로 번역할 때 이 힌트를 읽어 그래프에 포함된 연관을 외부 조인 페치로 바꾼다. 결국 <code>@EntityGraph</code>는 "애너테이션 → JPA 표준 힌트 → Hibernate의 SQL 번역"이라는 세 단계를 거쳐 <code>left join</code>이 된다.</p>
+<h4>컬렉션 그래프와 페이징을 섞으면</h4>
+<p>일대다 컬렉션을 그래프로 가져오면서 페이징을 걸면 어떻게 될까. 부서 리포지토리에 <code>@EntityGraph(attributePaths = "employees") Page<Department> findAll(Pageable)</code>을 선언하고 크기 1로 조회한 결과다.</p>
+<pre data-label="실행 결과 (컬렉션 그래프 + 페이징)"><code class="language-text">WARN: HHH90003004: firstResult/maxResults specified with collection fetch; applying in memory
+Hibernate: select d1_0.id,e1_0.department_id,e1_0.id,e1_0.age,e1_0.name,d1_0.name from Department d1_0 left join Employee e1_0 on d1_0.id=e1_0.department_id
+Hibernate: select count(d1_0.id) from Department d1_0
+A emps=3 total=2</code></pre>
+<p>SQL에는 행 수 제한이 전혀 없다. 일대다 조인의 결과는 부서 하나가 직원 수만큼의 행으로 불어난 형태다. 데이터베이스에서 "앞의 1행"을 자르면 부서 A의 직원 세 명 중 한 명만 붙은 반쪽짜리 부서가 나온다. 그래서 Hibernate는 SQL에서 자르지 않고 조인 결과 전체를 가져와 메모리에서 부서 단위로 묶은 뒤 페이징을 적용하고, 그 사실을 경고로 남긴다. JPA 명세는 컬렉션 페치 조인이 포함된 쿼리에 <code>setMaxResults</code>나 <code>setFirstResult</code>를 적용한 효과를 정의하지 않는다(undefined)고 명시한다. 데이터가 적은 개발 환경에서는 결과가 맞아 보이지만, 운영 데이터에서는 테이블 전체를 메모리로 가져오는 쿼리가 된다. Hibernate 6.6에는 이 상황을 경고 대신 예외로 바꾸는 <code>hibernate.query.fail_on_pagination_over_collection_fetch</code> 설정이 있다. 컬렉션은 그래프에서 빼고 지연 로딩과 배치 페치(<code>default_batch_fetch_size</code>, JPA 활용 2편의 주제)로 가져오는 것이 정석이다.</p>
+
+<h3>JPA 힌트: 읽기 전용 조회와 스냅숏</h3>
+<p>쿼리 힌트(query hint)는 JPA 공급자에게 전달하는 이름-값 쌍이다. JPA 명세가 정의한 힌트(<code>jakarta.persistence.*</code>)도 있고, 공급자 고유의 힌트도 있다. 앞 절의 엔티티 그래프도 힌트였다. 스프링 데이터에서는 <code>@QueryHints</code>로 메서드에 힌트를 붙인다. 가장 자주 쓰이는 것이 Hibernate의 읽기 전용 힌트다. 상수 <code>HibernateHints.HINT_READ_ONLY</code>의 값은 <code>"org.hibernate.readOnly"</code>다.</p>
+<pre><code class="language-java">@QueryHints(@QueryHint(name = "org.hibernate.readOnly", value = "true"))
+Employee findReadOnlyByName(String name);
+
+Employee findPlainByName(String name);</code></pre>
+<p>왜 이런 힌트가 필요한지 변경 감지의 원리에서 출발해 보자. Hibernate는 엔티티를 영속성 컨텍스트에 올릴 때 조회한 값의 복사본(스냅숏)을 함께 보관한다. 플러시할 때 관리 중인 모든 엔티티에 대해 현재 값과 스냅숏을 비교해 다른 것이 있으면 UPDATE를 만든다. 조회만 하고 끝날 화면이라도 엔티티 하나당 객체 하나와 스냅숏 하나가 메모리에 올라오고, 플러시 때마다 비교 비용이 든다. Hibernate <code>Session</code> Javadoc은 읽기 전용 엔티티에 대해 변경 감지를 하지 않고 영속 상태의 스냅숏도 유지하지 않는다고 설명하고, 읽기 전용 엔티티를 수정할 수는 있지만 그 변경은 저장되지 않는다고 적는다. 실험으로 확인해 보자. 각각 조회한 엔티티의 나이를 77로 바꾸고 플러시했다.</p>
+<pre data-label="실행 결과"><code class="language-text">=== readOnly 힌트
+Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.name=?
+readOnly=true
+-- flushed (readOnly)
+
+=== 힌트 없음
+Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.name=?
+Hibernate: update Employee set age=?,department_id=?,name=? where id=?
+-- flushed (plain)</code></pre>
+<p>읽기 전용 힌트로 조회한 엔티티는 <code>Session.isReadOnly</code>가 <code>true</code>였고, 값을 바꿨는데도 플러시 때 UPDATE가 나가지 않았다. 힌트 없는 쪽은 UPDATE가 나갔다. SQL 자체는 두 경우가 똑같다는 점에 주목하자. 읽기 전용 힌트는 데이터베이스에 보내는 쿼리를 바꾸지 않는다. 바뀌는 것은 결과를 받은 뒤 영속성 컨텍스트가 그 엔티티를 어떻게 관리하느냐다. 그래서 이득도 "스냅숏 메모리와 변경 감지 비용"에 한정된다. 엔티티 자체는 여전히 영속성 컨텍스트에 등록되어 1차 캐시와 동일성 보장을 받는다.</p>
+<p><code>@QueryHints</code>에는 <code>forCounting</code> 속성도 있다. 기본값은 <code>true</code>이고, 레퍼런스에 따르면 이 값을 <code>false</code>로 두면 페이징 시 추가로 실행되는 count 쿼리에는 힌트를 적용하지 않는다. count 쿼리는 엔티티를 반환하지 않으니 읽기 전용 힌트는 의미가 없지만, 쿼리 타임아웃 같은 힌트는 count 쿼리에도 걸고 싶을 수 있다. 어느 쪽인지는 힌트의 성격에 따라 정한다.</p>
+<h4>@Transactional(readOnly = true)와의 관계</h4>
+<p>메서드 하나가 아니라 트랜잭션 전체를 읽기 전용으로 만들면 어떻게 될까. Spring Data 레퍼런스는 트랜잭션을 <code>readOnly</code>로 설정하면 그 플래그가 JDBC 드라이버에 성능 최적화 힌트로 전달되고, Hibernate를 쓸 때는 플러시 모드가 <code>MANUAL</code>이 되어 Hibernate가 변경 감지를 건너뛴다고 설명한다. 이 실험의 Spring Framework 6.2.19에서 읽기 전용 <code>TransactionTemplate</code> 안의 세션 상태를 찍어 보니 다음과 같았다.</p>
+<pre data-label="실행 결과 (읽기 전용 트랜잭션)"><code class="language-text">defaultReadOnly=true flushMode=MANUAL
+Hibernate: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.name=?
+entity readOnly=true
+(트랜잭션 종료 후 다른 트랜잭션에서 확인) e4 age=10</code></pre>
+<p>플러시 모드가 <code>MANUAL</code>일 뿐 아니라 세션의 기본 읽기 전용 설정까지 켜져 있었고, 그 안에서 조회한 엔티티도 읽기 전용이었다. 나이를 55로 바꿨지만 커밋 뒤 데이터베이스에는 10이 그대로 남았다. 즉 이 버전의 스프링에서는 읽기 전용 트랜잭션이 개별 힌트 없이도 스냅숏 생략 효과까지 준다. Spring Data 레퍼런스에 따르면 <code>CrudRepository</code>에서 물려받은 조회 메서드는 <code>SimpleJpaRepository</code>의 설정에 따라 <code>readOnly</code> 플래그가 참인 트랜잭션으로 실행된다(구조는 06회에서 본다). 반대로 위험도 같다. 읽기 전용 트랜잭션 안에서 엔티티를 수정하면 예외 없이 변경이 버려진다. 수정이 필요한 서비스 메서드가 실수로 읽기 전용 트랜잭션에 참여하면, 버그는 "저장이 안 된다"는 조용한 형태로 나타난다.</p>
+
+<h3>JPA 락: @Lock이 InnoDB 잠금이 되기까지</h3>
+<p>재고 차감이나 좌석 예약처럼 "읽고, 계산하고, 쓰는" 작업을 여러 트랜잭션이 동시에 하면 갱신 손실이 생길 수 있다. 두 트랜잭션이 같은 재고 10을 읽고 각각 1을 빼서 9를 쓰면 결과는 8이 아니라 9다. 한 가지 해결책은 읽는 순간부터 그 행을 잠가 다른 트랜잭션이 끼어들지 못하게 하는 비관적 락(pessimistic lock)이다. 스프링 데이터 JPA에서는 쿼리 메서드에 <code>@Lock</code>을 붙인다.</p>
+<pre><code class="language-java">@Lock(LockModeType.PESSIMISTIC_WRITE)
+List<Employee> findLockByName(String name);
+
+@Lock(LockModeType.PESSIMISTIC_READ)
+List<Employee> findShareByName(String name);</code></pre>
+<p>스프링 데이터는 쿼리를 만든 뒤 JPA 표준 <code>Query.setLockMode</code>로 락 모드를 지정한다. Spring Data 레퍼런스는 공통 메서드도 리포지토리 인터페이스에 다시 선언하고 <code>@Lock</code>을 붙이면 락을 걸 수 있다고 설명한다. H2에서 실행한 SQL과, 같은 락 모드를 Hibernate의 MySQL 8.0 방언에 넣었을 때 붙는 절은 다음과 같다.</p>
+<pre data-label="실행 결과 (H2) 와 MySQLDialect 출력"><code class="language-text">H2  PESSIMISTIC_WRITE: select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.name=? for update
+H2  PESSIMISTIC_READ : select e1_0.id,e1_0.age,e1_0.department_id,e1_0.name from Employee e1_0 where e1_0.name=? for update
+
+MySQLDialect(8.0)
+  PESSIMISTIC_WRITE: [ for update]
+  PESSIMISTIC_READ : [ for share]
+  write nowait(0)  : [ for update nowait]
+  skip locked      : [ for update skip locked]</code></pre>
+<p>H2 방언은 읽기 락 요청에도 <code>for update</code>를 붙였다. 이것은 명세 위반이 아니다. JPA 명세는 <code>PESSIMISTIC_READ</code>가 요청된 곳에 <code>PESSIMISTIC_WRITE</code>를 쓰는 것은 허용하지만 그 반대는 허용하지 않는다고 적는다. 더 강한 락은 약한 락의 보장을 모두 포함하기 때문이다. 명세가 두 모드에 요구하는 보장은, 락을 건 트랜잭션에 대해 더티 리드(커밋 전 값을 다른 트랜잭션이 읽음)와 반복 불가능한 읽기(읽은 행을 다른 트랜잭션이 커밋 전에 바꾸거나 지움)가 일어나지 않게 하는 것이다. 명세는 <code>PESSIMISTIC_WRITE</code>를 갱신하려는 트랜잭션들을 직렬화하는 용도로, <code>PESSIMISTIC_READ</code>를 다른 트랜잭션의 읽기를 막지 않으면서 반복 가능한 읽기를 얻는 용도로 설명한다.</p>
+<h4>InnoDB에서 일어나는 일</h4>
+<p>MySQL 매뉴얼의 잠금 읽기 절에 따르면 <code>SELECT ... FOR UPDATE</code>는 검색 중 만나는 인덱스 레코드에 대해 그 행과 관련 인덱스 항목을 <code>UPDATE</code>를 실행한 것과 똑같이 잠근다. 다른 트랜잭션은 그 행을 갱신하거나 <code>FOR SHARE</code>로 읽을 수 없다. <code>SELECT ... FOR SHARE</code>는 읽은 행에 공유 잠금을 걸어 다른 세션이 읽을 수는 있지만 커밋 전까지 수정할 수는 없게 한다. <code>FOR SHARE</code>는 예전의 <code>LOCK IN SHARE MODE</code>를 대체하는 구문이다. 두 잠금 모두 트랜잭션이 커밋되거나 롤백될 때 풀리며, 자동 커밋이 꺼진 상태(트랜잭션 안)에서만 의미가 있다.</p>
+<p>여기서 많은 사람이 놓치는 점이 있다. 같은 매뉴얼은 일관된 읽기(consistent read)가 읽기 뷰에 존재하는 레코드에 걸린 잠금을 무시한다고 설명한다. 오래된 버전의 레코드는 잠글 수 없고, 언두 로그를 적용해 메모리에서 재구성되기 때문이다. 즉 어떤 트랜잭션이 <code>FOR UPDATE</code>로 행을 잠가도, 잠금 없이 평범한 <code>SELECT</code>를 하는 다른 트랜잭션은 기다리지 않고 MVCC 스냅숏의 값을 읽는다. 비관적 락은 "락을 거는 쪽끼리" 줄을 세우는 장치다. 재고를 읽는 모든 경로가 같은 락 모드로 읽어야 갱신 손실이 막힌다.</p>
+<p>잠금 범위는 앞의 벌크 UPDATE와 같은 규칙을 따른다. 잠금 읽기도 스캔한 모든 인덱스 레코드를 잠그므로, 조건 열에 인덱스가 없으면 테이블 전체가 잠긴다. 다만 유일 인덱스로 유일한 행을 찾는 조건이면 InnoDB는 찾은 인덱스 레코드만 잠그고 그 앞의 간격(gap)은 잠그지 않는다. 기본 키로 한 행을 조회하는 <code>findById</code>에 락을 거는 것과, 인덱스 없는 이름 조건으로 락을 거는 것은 잠금 범위가 전혀 다르다.</p>
+<pre class="diagram">T1                                   T2
+───────────────────────────────────  ───────────────────────────────────
+BEGIN                                BEGIN
+SELECT ... WHERE id=1 FOR UPDATE
+  → id=1 레코드 배타 잠금 획득
+                                     SELECT ... WHERE id=1 FOR UPDATE
+                                       → 대기 (최대 innodb_lock_wait_timeout)
+                                     SELECT ... WHERE id=1   (잠금 없는 읽기)
+                                       → 대기 없이 스냅숏 값 반환
+UPDATE ... SET stock = stock - 1
+COMMIT  → 잠금 해제
+                                       → 대기하던 FOR UPDATE가 잠금 획득,
+                                         T1이 커밋한 최신 값을 읽음</pre>
+<p>기다리는 쪽은 얼마나 기다릴까. MySQL의 <code>innodb_lock_wait_timeout</code>은 InnoDB 트랜잭션이 행 잠금을 기다리는 최대 시간(초)이고 기본값은 50초다. 이 시간을 넘기면 <code>ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction</code>이 발생하고, 매뉴얼에 따르면 트랜잭션 전체가 아니라 현재 문장만 롤백된다(전체 롤백을 원하면 서버를 <code>--innodb-rollback-on-timeout</code>으로 시작한다). 교착 상태는 이 타임아웃을 기다리지 않는다. <code>innodb_deadlock_detect</code>가 켜져 있으면(기본값) InnoDB가 교착 상태를 즉시 감지해 한 트랜잭션을 롤백한다.</p>
+<p>JPA 쪽에서 대기 시간을 지정하는 표준 힌트는 <code>jakarta.persistence.lock.timeout</code>이고 단위는 밀리초다. 명세는 이것이 힌트일 뿐이라고 적는다. 실제로 Hibernate 6.6의 MySQL 8.0 방언에 타임아웃 값을 넣어 보면, 0은 <code>for update nowait</code>, 잠긴 행 건너뛰기는 <code>for update skip locked</code>가 되지만, 3000 같은 양수는 그냥 <code>for update</code>가 되었다. MySQL의 잠금 읽기 구문에는 대기 시간을 적는 자리가 없으니, 이 경우 실제 대기 시간은 서버의 <code>innodb_lock_wait_timeout</code>이 정한다. MySQL 매뉴얼에 따르면 <code>NOWAIT</code>는 잠긴 행을 만나면 기다리지 않고 즉시 오류를 내고, <code>SKIP LOCKED</code>는 잠긴 행을 결과에서 빼고 즉시 실행한다. 매뉴얼은 <code>SKIP LOCKED</code>가 일관되지 않은 데이터 뷰를 돌려주므로 일반적인 트랜잭션 작업에는 맞지 않고, 여러 세션이 큐처럼 쓰는 테이블의 경합을 피하는 용도라고 설명한다.</p>
+<pre><code class="language-java">@Lock(LockModeType.PESSIMISTIC_WRITE)
+@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "0"))
+List<Employee> findLockNoWaitByName(String name);   // MySQL 8.0 방언: ... for update nowait</code></pre>
+<h4>트랜잭션 없이 락을 걸면</h4>
+<p>락은 트랜잭션이 끝날 때 풀리므로, 트랜잭션 밖의 락은 의미가 없다. JPA 명세는 쿼리 메서드가 트랜잭션 없이 호출될 수 있지만 <code>LockModeType.NONE</code>이 아닌 락 모드가 지정된 경우는 예외라고 적는다. 앞에서 본 것처럼 리포지토리에 선언한 쿼리 메서드에는 기본 트랜잭션이 없으므로, <code>@Lock</code> 메서드를 트랜잭션 밖에서 호출하면 바로 실패한다.</p>
+<pre data-label="실행 결과 (트랜잭션 밖에서 @Lock 메서드 호출)"><code class="language-text">org.springframework.dao.InvalidDataAccessApiUsageException: Query requires transaction be in progress, but no transaction is known to be in progress</code></pre>
+<p>메시지는 Hibernate가 낸 것이고 스프링이 예외를 번역했다. 비관적 락은 반드시 서비스 계층의 트랜잭션 안에서, 그리고 그 트랜잭션을 짧게 유지하는 방식으로 쓴다. 락을 잡은 채 외부 API를 호출하거나 사용자 입력을 기다리면, 그동안 같은 행을 원하는 모든 요청이 줄을 서고 커넥션 풀까지 고갈될 수 있다.</p>
+<p>비관적 락의 반대편에는 낙관적 락(optimistic lock)이 있다. 엔티티에 <code>@Version</code> 필드를 두면 변경 감지로 나가는 UPDATE의 WHERE 절에 버전 비교가 들어가고, 다른 트랜잭션이 먼저 고쳤다면 갱신된 행이 0건이 되어 예외가 난다. 충돌이 드물면 잠금 없이 동시성을 얻고, 충돌이 잦으면 재시도 비용이 커진다. 앞에서 본 것처럼 벌크 연산은 이 버전 검사를 우회한다는 점을 함께 기억해 두자.</p>
+<x-visual id="spring-data-jpa-04-pessimistic-lock-sequence" title="비관적 락을 건 두 트랜잭션의 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>T1이 FOR UPDATE로 행을 잠근 동안 T2의 FOR UPDATE는 대기하고, 잠금 없는 SELECT는 스냅숏을 바로 읽는 차이를 보여 준다.</x-hint>
+<x-prompt>Sequence diagram with three lifelines on white background: left "트랜잭션 T1", middle "InnoDB 행 id=1", right "트랜잭션 T2". T1 sends arrow "SELECT ... FOR UPDATE" to the middle; middle shows a lock icon labeled "배타 잠금". T2 sends arrow "SELECT ... FOR UPDATE" to the middle; a dashed vertical bar on T2 labeled "대기". T2 also sends a separate arrow "잠금 없는 SELECT" that returns immediately with label "스냅숏 값". T1 sends "UPDATE" then "COMMIT"; the lock icon opens with label "잠금 해제". Then the waiting T2 arrow completes with return label "최신 값". Clean flat style, blue for T1, purple for T2, Korean labels exactly as quoted.</x-prompt>
+<x-caption>비관적 락은 잠금을 요청하는 트랜잭션끼리만 줄을 세운다. 잠금 없는 읽기는 MVCC 스냅숏을 읽는다.</x-caption>
+</x-visual>
+
+<h3>흔한 오해와 함정</h3>
+<p><b>"Page를 반환하면 count 쿼리가 항상 나간다."</b> <code>PageableExecutionUtils.getPage</code>는 덜 찬 첫 페이지와 내용이 있는 마지막 페이지에서 count를 생략한다. 반대로 "count를 생략해 주니 Page를 써도 싸다"도 틀렸다. 목록 요청의 대부분은 꽉 찬 페이지이고, 그때마다 count 쿼리가 조건에 맞는 행을 끝까지 센다. 전체 개수가 꼭 필요한 화면인지 먼저 묻고, 아니라면 <code>Slice</code>를 쓴다.</p>
+<p><b>"벌크 연산 뒤에 다시 조회하면 새 값이 나온다."</b> SELECT는 실제로 실행되지만, 이미 관리 중인 엔티티는 옛 인스턴스와 옛 값이 그대로 반환된다. 새 값을 보려면 영속성 컨텍스트를 비우거나(<code>clearAutomatically</code>), 해당 엔티티를 <code>refresh</code>해야 한다.</p>
+<p><b>"clearAutomatically만 켜면 안전하다."</b> 자동 플러시는 쿼리가 다루는 테이블에 걸리는 미반영 변경이 있을 때만 일어난다. 그런 변경이 없으면 다른 테이블에 대한 미반영 변경은 플러시되지 않은 채 clear와 함께 사라진다. clear를 켤 때는 <code>flushAutomatically</code>도 켠다.</p>
+<p><b>"@EntityGraph는 페치 조인과 같다."</b> 엔티티 그래프는 외부 조인으로 번역되어 연관이 없는 행도 남긴다. 내부 조인 페치와 결과 행 집합이 다를 수 있다. 또 그래프는 "최소한 가져올 것"을 지정할 뿐이며, 컬렉션 그래프에 페이징을 걸면 메모리 페이징이 된다.</p>
+<p><b>"readOnly 힌트를 주면 쿼리가 빨라진다."</b> SQL은 바뀌지 않는다. 줄어드는 것은 스냅숏 메모리와 플러시 시점의 비교 비용이다. 대량 조회 화면에서 의미가 있고, 몇 건짜리 조회에서는 차이가 거의 없다.</p>
+<p><b>"PESSIMISTIC_WRITE로 읽으면 다른 트랜잭션은 그 행을 못 읽는다."</b> InnoDB에서 잠금 없는 일관된 읽기는 잠금을 무시하고 스냅숏을 읽는다. 막히는 것은 같은 행을 잠그려는 읽기와 수정이다.</p>
+
+<h3>다른 주제와의 연결</h3>
+<p>이 회차에서 본 두 쿼리 구조(내용 쿼리와 count 쿼리)는 스프링 데이터 JPA를 벗어나도 그대로 반복된다. 동적 조건이 많은 목록을 Querydsl로 구현할 때도 내용 쿼리와 count 쿼리를 따로 만들게 되며, 이때 <code>spring-data-commons</code>의 공개 클래스인 <code>PageableExecutionUtils.getPage</code>에 count를 람다로 넘기면 이 회차에서 본 count 생략 규칙을 그대로 얻는다. 웹 요청의 <code>page</code>, <code>size</code>, <code>sort</code> 파라미터가 <code>Pageable</code>로 바뀌는 과정은 05회에서 다룬다.</p>
+<p>벌크 연산과 락은 데이터베이스 기본편에서 다룬 MVCC와 잠금의 직접적인 응용이다. 벌크 UPDATE와 <code>FOR UPDATE</code>가 스캔한 인덱스 레코드를 잠근다는 사실은, 인덱스 설계가 성능뿐 아니라 동시성의 문제이기도 하다는 것을 보여 준다. 영속성 컨텍스트가 식별자 맵이라는 사실은 JPA 기본편의 1차 캐시와 동일성 보장에서 출발했고, 이 회차에서는 그 성질이 벌크 연산과 만날 때 어떤 함정이 되는지 봤다. 06회에서는 <code>SimpleJpaRepository</code>에 걸린 트랜잭션 설정과 리포지토리 프록시가 만들어지는 과정을 따라가며, 이 회차에서 "쿼리 메서드에는 기본 트랜잭션이 없다"고 한 사실이 구조적으로 어디서 오는지 확인한다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>Pageable과 PageRequest</dt><dd>"몇 번째 페이지를 몇 개씩, 어떤 정렬로"를 담는 요청 객체다. 페이지 번호는 0부터 세며, 실행 시 offset과 size는 setFirstResult/setMaxResults로, Sort는 order by로 바뀐다.</dd>
+<dt>Page, Slice, List</dt><dd>Page는 내용 쿼리와 count 쿼리로 전체 개수를 알고, Slice는 size + 1개를 읽어 다음 페이지 존재 여부만 알며, List는 내용 쿼리만 실행한다.</dd>
+<dt>count 생략 규칙</dt><dd>PageableExecutionUtils.getPage는 덜 찬 첫 페이지와 내용이 있는 마지막 페이지에서 전체 개수를 계산으로 얻고 count 쿼리를 실행하지 않는다.</dd>
+<dt>파생 count 쿼리와 countQuery</dt><dd>@Query의 JPQL에서 select 절을 count로 바꾸고 fetch와 order by를 제거해 count를 만든다. 조인은 남으므로 복잡한 쿼리는 countQuery로 직접 지정한다.</dd>
+<dt>@Modifying과 벌크 연산</dt><dd>update/delete JPQL을 executeUpdate로 실행하게 한다. 데이터베이스만 바꾸고 영속성 컨텍스트와 버전 검사는 우회한다.</dd>
+<dt>flushAutomatically와 clearAutomatically</dt><dd>벌크 전에 전체 플러시, 벌크 후에 영속성 컨텍스트 비우기를 한다. clear만 켜면 자동 플러시가 일어나지 않은 경우 미반영 변경이 사라질 수 있다.</dd>
+<dt>@EntityGraph</dt><dd>attributePaths나 @NamedEntityGraph로 페치 계획을 정해 jakarta.persistence.fetchgraph(기본) 또는 loadgraph 힌트로 전달한다. Hibernate는 이를 외부 조인 페치로 번역한다.</dd>
+<dt>readOnly 힌트</dt><dd>org.hibernate.readOnly 힌트로 조회한 엔티티는 스냅숏을 갖지 않고 변경 감지에서 빠진다. SQL은 바뀌지 않는다.</dd>
+<dt>@Lock</dt><dd>쿼리에 비관적 락 모드를 지정해 FOR UPDATE나 FOR SHARE를 붙인다. 트랜잭션 안에서만 쓸 수 있고, 잠금 범위는 스캔한 인덱스 레코드가 정한다.</dd>
+</x-summary>
+
+<x-review>
+<p>목록 화면이 느려졌다는 신고를 받으면 먼저 SQL 로그에서 쿼리가 몇 번 나가는지 센다. 내용 쿼리는 빠른데 count 쿼리가 느린 경우가 많다. 조건에 맞는 행이 수백만 건이면 count는 그만큼 인덱스를 훑는다. 이때 선택지는 화면 요구를 바꾸는 것(Slice로 "더 보기"), count 쿼리를 단순하게 분리하는 것(countQuery), 그리고 깊은 페이지 접근이 문제라면 키셋 방식으로 바꾸는 것이다. 어느 것을 고를지는 "사용자가 정말 전체 페이지 수와 임의 페이지 점프를 필요로 하는가"라는 화면 설계 질문으로 결정된다.</p>
+<p>벌크 수정 쿼리는 배치성 작업에서 큰 효과를 내지만, 장애의 형태가 조용하다는 점을 기억해야 한다. 벌크 후 같은 트랜잭션에서 엔티티를 다시 읽어 옛 값으로 계산하거나, clear 때문에 앞에서 바꾼 값이 사라져도 예외는 나지 않는다. 그래서 규칙을 단순하게 정하는 편이 낫다. 벌크 연산은 트랜잭션의 처음에 두거나 별도 트랜잭션으로 분리하고, 같은 트랜잭션에서 섞어야 한다면 flushAutomatically와 clearAutomatically를 함께 켠다. 또 벌크 UPDATE의 WHERE 조건이 인덱스를 타는지 실행 계획으로 확인한다. 인덱스가 없으면 그 트랜잭션이 끝날 때까지 테이블 전체의 쓰기가 막힐 수 있다.</p>
+<p>비관적 락은 정확성을 얻는 대신 처리량을 내준다. 락 대기는 기본 50초까지 이어질 수 있고, 그동안 요청 스레드와 DB 커넥션이 묶인다. 트래픽이 몰리는 행(인기 상품의 재고 같은)에 비관적 락을 걸면 대기열이 커넥션 풀을 고갈시켜 무관한 요청까지 실패하게 만든다. 충돌이 드물면 @Version 낙관적 락과 재시도로, 충돌이 잦고 짧은 임계 구역이면 비관적 락과 짧은 트랜잭션으로, 큐처럼 쓰는 테이블이면 SKIP LOCKED로 판단이 갈린다. 어느 경우든 락을 거는 조회는 기본 키나 유일 인덱스로 한 행을 찾게 설계하는 것이 잠금 범위를 줄이는 가장 확실한 방법이다.</p>
+</x-review>
+
+<x-practice>
+<li>직원 23명이 조건에 맞고 페이지 크기가 10이다. <code>Page</code>를 반환하는 메서드로 0번, 1번, 2번, 3번 페이지를 각각 조회할 때, 페이지마다 SQL이 몇 번 나가는지와 getTotalElements() 값이 어떻게 얻어지는지 적어라. 같은 조회를 <code>Slice</code>로 바꾸면 각 페이지의 SQL에 바인딩되는 행 수 제한 값은 얼마인가?</li>
+<li>한 트랜잭션에서 ① 직원 A(나이 30)를 조회하고 ② A의 나이를 40으로 바꾸고 ③ 부서 D의 이름을 바꾼 뒤 ④ <code>@Modifying(clearAutomatically = true)</code>로 "나이 35 이상 +1" 벌크 UPDATE를 실행하고 커밋했다. 커밋 후 데이터베이스에서 A의 나이와 D의 이름은 무엇인가? 이 회차의 실험에서 관찰한 Hibernate 6.6의 자동 플러시 동작을 근거로 설명하라.</li>
+<li><code>@Query("select d from Department d join fetch d.employees")</code>에 <code>Pageable</code>을 받아 <code>Page<Department></code>를 반환하는 메서드가 있다. 이 메서드를 운영 데이터(부서 1만 개, 직원 100만 명)에서 0번 페이지 크기 20으로 호출할 때 일어나는 일을 SQL, 메모리, count 쿼리로 나눠 설명하고 대안을 제시하라.</li>
+<li>MySQL InnoDB에서 <code>name</code> 열에 인덱스가 없는 직원 테이블에 대해 트랜잭션 T1이 <code>@Lock(PESSIMISTIC_WRITE) findByName("kim")</code>을 실행한 뒤 커밋하지 않았다. 이때 T2가 ① 다른 이름의 직원을 <code>PESSIMISTIC_WRITE</code>로 조회, ② 새 직원 INSERT, ③ 잠금 없는 평범한 SELECT를 하면 각각 어떻게 되는지 예측하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 0번, 1번 페이지는 10건이 꽉 찬 페이지이므로 내용 쿼리 뒤에 count 쿼리가 실행되어 SQL이 2번 나가고, 전체 개수는 count 결과 23이다. 2번 페이지는 3건만 차는 마지막 페이지이고 내용이 비어 있지 않으므로 count가 생략되어 SQL이 1번이며, 전체 개수는 offset 20 + 3 = 23으로 계산된다. 3번 페이지는 offset 30에서 결과가 비어 있으므로 "건너뛴 수 + 0"으로 단정할 수 없어 count가 실행된다(SQL 2번, 전체 23). Slice로 바꾸면 SlicedExecution이 pageSize + 1을 setMaxResults에 넘기므로 모든 페이지에서 행 수 제한 값은 11이고, count 쿼리는 어느 페이지에서도 나가지 않는다.</p>
+<p><b>2번.</b> 벌크 UPDATE는 Employee 테이블을 다루고, 같은 테이블에 A의 나이 변경(40)이 미반영으로 남아 있으므로 Hibernate는 실행 직전에 자동 플러시를 한다. 이 플러시는 A의 변경만 골라 내보내지 않고 대기 중인 변경을 모두 내보내므로, 부서 D의 이름 변경도 함께 UPDATE로 나간다(같은 조건을 Hibernate 6.6.53에서 실행하면 Employee UPDATE, Department UPDATE, 벌크 UPDATE 순으로 로그가 찍힌다). 그 뒤 벌크 UPDATE가 "35 이상 +1"을 적용하므로 A는 41이 되고, 벌크 직후의 clear는 이미 플러시가 끝난 뒤라 잃을 것이 없다. 따라서 커밋 후 A의 나이는 41이고 D의 이름도 바뀌어 있다. 본문의 실험처럼 ②가 없어 Employee 테이블에 걸리는 미반영 변경이 하나도 없었다면 자동 플러시가 일어나지 않아 D의 이름 변경은 clear와 함께 사라졌을 것이다. 이렇게 다른 변경이 있느냐에 따라 결과가 갈리므로, flushAutomatically = true를 함께 켜서 언제나 플러시가 먼저 일어나게 하는 편이 안전하다.</p>
+<p><b>3번.</b> 컬렉션 페치 조인에 페이징을 걸었으므로 Hibernate는 HHH90003004 경고를 남기고 SQL에서 행 수를 제한하지 않는다. 부서와 직원을 조인한 100만 행 규모의 결과 전체가 애플리케이션으로 전송되고, 1만 개 부서와 100만 개 직원 엔티티(그리고 스냅숏)가 영속성 컨텍스트에 올라온 뒤 메모리에서 앞의 20개 부서만 잘린다. count 쿼리는 파생 과정에서 fetch가 빠진 <code>select count(d) from Department d join d.employees</code>가 되는데, 내부 조인이 남아 직원 수만큼 행이 불어나므로 distinct가 없으면 부서 수가 아니라 조인 행 수를 센다. 대안은 부서만 페이징 조회하고 직원 컬렉션은 지연 로딩과 default_batch_fetch_size 같은 배치 페치로 가져오는 것, 그리고 count는 countQuery로 <code>select count(d) from Department d</code>를 직접 지정하는 것이다.</p>
+<p><b>4번.</b> InnoDB 기본 격리 수준인 REPEATABLE READ를 기준으로 답한다. name에 인덱스가 없으므로 T1의 잠금 읽기는 클러스터드 인덱스 전체를 스캔하며 모든 레코드를 잠근다(매뉴얼: 알맞은 인덱스가 없으면 모든 행이 잠기고 삽입도 막힌다). ① T2의 잠금 읽기도 같은 레코드들을 스캔하며 잠금을 요청하므로, 다른 이름을 찾더라도 T1이 잡은 잠금에서 대기하고 innodb_lock_wait_timeout(기본 50초)을 넘기면 오류 1205가 난다. ② INSERT도 넥스트 키 잠금의 간격 잠금에 막혀 대기한다. ③ 잠금 없는 SELECT는 일관된 읽기이므로 잠금을 무시하고 스냅숏 값을 바로 읽는다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>페이지 크기 10으로 Page를 반환하는 메서드를 호출했더니 내용 쿼리 결과가 7건이었다. Pageable의 offset이 30이었다면 Spring Data JPA 3.5는 어떻게 전체 개수를 얻는가?</q>
+<o>항상 count 쿼리를 실행해 얻는다.</o>
+<o>첫 페이지가 아니므로 count 쿼리를 실행해 얻는다.</o>
+<o>count 쿼리 없이 offset + 7 = 37로 계산한다.</o>
+<o>전체 개수를 알 수 없으므로 -1로 둔다.</o>
+<why>가져온 행 수(7)가 페이지 크기(10)보다 적으면 마지막 페이지다. 내용이 비어 있지 않으므로 PageableExecutionUtils.getPage는 offset + content.size()로 전체 개수를 계산하고 count 람다를 호출하지 않는다. 첫 페이지 여부는 "덜 찬 첫 페이지"일 때 전체 개수를 content.size()로 쓰는 분기에만 관여한다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>한 트랜잭션에서 직원 X(나이 20)를 조회한 뒤, clearAutomatically 없이 @Modifying 벌크 쿼리로 X의 나이를 21로 바꿨다. 이어서 같은 조건으로 X를 다시 조회하면?</q>
+<o>SELECT가 나가지 않고 1차 캐시에서 나이 20인 X를 돌려준다.</o>
+<o>SELECT는 실행되지만, 이미 관리 중인 X 인스턴스가 반환되어 나이는 20이다.</o>
+<o>SELECT가 실행되고 X 인스턴스의 나이가 21로 갱신된다.</o>
+<o>영속성 컨텍스트와 DB가 다르므로 예외가 발생한다.</o>
+<why>JPQL 조회는 1차 캐시를 먼저 보지 않고 SQL을 실행한다. 하지만 결과 행의 식별자에 해당하는 엔티티가 이미 관리 중이면 Hibernate는 그 인스턴스를 그대로 반환하고 행의 값으로 덮어쓰지 않는다. 실험에서도 SELECT 로그가 찍힌 뒤 same instance=true, age=20이 출력됐다. 예외는 나지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>@EntityGraph(attributePaths = "department")를 붙인 메서드 이름 쿼리에 대한 설명으로 옳은 것은?</q>
+<o>JPQL의 join fetch와 똑같이 내부 조인을 만들어 부서 없는 직원은 결과에서 빠진다.</o>
+<o>type을 지정하지 않으면 jakarta.persistence.loadgraph 힌트로 전달된다.</o>
+<o>Page를 반환하면 count 쿼리에도 부서 조인이 추가된다.</o>
+<o>JPA 표준 힌트로 전달되며, Hibernate는 이를 왼쪽 외부 조인 페치로 번역한다.</o>
+<why>Spring Data JPA의 @EntityGraph 기본 type은 FETCH이고, 그 키는 jakarta.persistence.fetchgraph다. 실험에서 Hibernate는 left join으로 부서를 함께 조회했으므로 부서 없는 직원도 남는다. count 쿼리에는 그래프가 적용되지 않아 조인 없는 count가 나갔다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>MySQL InnoDB에서 T1이 기본 키로 행 하나를 SELECT ... FOR UPDATE로 잠그고 커밋하지 않았다. 다른 트랜잭션들의 동작으로 옳은 것은?</q>
+<o>T2의 잠금 없는 평범한 SELECT는 기다리지 않고 MVCC 스냅숏 값을 읽는다.</o>
+<o>T2의 평범한 SELECT도 T1이 커밋할 때까지 기다린다.</o>
+<o>T2의 SELECT ... FOR SHARE는 공유 잠금이므로 기다리지 않는다.</o>
+<o>T2가 기다리다 innodb_lock_wait_timeout을 넘기면 T2의 트랜잭션 전체가 항상 롤백된다.</o>
+<why>MySQL 매뉴얼에 따르면 일관된 읽기는 읽기 뷰의 레코드에 걸린 잠금을 무시한다. FOR UPDATE로 잠긴 행에는 FOR SHARE도 막힌다. 잠금 대기 타임아웃은 기본적으로 현재 문장만 롤백하며, 트랜잭션 전체 롤백은 --innodb-rollback-on-timeout으로 서버를 시작했을 때다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>@Transactional(readOnly = true) 안에서 조회한 엔티티의 필드를 바꿨다(Spring Framework 6.2, Hibernate 6.6). 커밋 후 결과로 옳은 것은?</q>
+<o>JDBC 커넥션이 읽기 전용이므로 UPDATE를 시도하다 예외가 난다.</o>
+<o>커밋 시점에 변경 감지가 동작해 UPDATE가 나간다.</o>
+<o>플러시 모드가 MANUAL이고 엔티티도 읽기 전용으로 로딩되어, 예외 없이 변경이 반영되지 않는다.</o>
+<o>스냅숏과 비교해 변경을 발견하면 경고를 남기고 반영한다.</o>
+<why>Spring Data 레퍼런스는 readOnly 트랜잭션에서 Hibernate의 플러시 모드가 MANUAL이 된다고 설명한다. 실험에서는 세션의 defaultReadOnly도 true였고, 조회한 엔티티가 읽기 전용이라 스냅숏도 없었다. UPDATE는 시도되지 않으므로 예외도 나지 않고, 변경은 조용히 버려졌다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>오프셋 페이징(offset pagination)</dt><dd>정렬된 결과에서 앞의 N개를 건너뛰고 M개를 가져오는 방식이다. 건너뛰는 행도 데이터베이스가 읽고 버려야 하므로 페이지가 깊어질수록 비용이 커진다.</dd>
+<dt>키셋 페이징(keyset pagination)</dt><dd>직전 페이지의 마지막 정렬 키보다 뒤의 행을 WHERE 조건으로 찾는 방식이다. 인덱스에서 위치를 바로 찾지만 임의 페이지로 점프할 수 없다.</dd>
+<dt>count 쿼리(count query)</dt><dd>페이지의 전체 개수를 얻기 위해 같은 조건으로 행 수를 세는 쿼리다. InnoDB는 행 수를 따로 저장하지 않으므로 인덱스를 훑어 센다.</dd>
+<dt>벌크 연산(bulk operation)</dt><dd>JPQL update/delete로 여러 행을 한 문장으로 바꾸는 연산이다. 영속성 컨텍스트와 동기화되지 않고 낙관적 락 검사를 우회한다.</dd>
+<dt>식별자 맵(identity map)</dt><dd>영속성 컨텍스트가 식별자별로 엔티티 인스턴스 하나만 관리하는 구조다. 이미 관리 중인 엔티티는 다시 조회해도 같은 인스턴스가 반환된다.</dd>
+<dt>엔티티 그래프(entity graph)</dt><dd>조회 시 함께 가져올 속성을 지정하는 JPA 표준 페치 계획이다. fetchgraph와 loadgraph 두 가지 의미로 쿼리 힌트에 전달된다.</dd>
+<dt>스냅숏(snapshot)</dt><dd>엔티티를 로딩한 시점의 값 복사본이다. 플러시 때 현재 값과 비교해 변경을 감지하는 데 쓰이며, 읽기 전용 엔티티는 갖지 않는다.</dd>
+<dt>비관적 락(pessimistic lock)</dt><dd>읽는 시점에 데이터베이스 행 잠금을 걸어 다른 트랜잭션의 수정과 잠금 읽기를 막는 방식이다. MySQL에서는 FOR UPDATE, FOR SHARE로 표현된다.</dd>
+<dt>넥스트 키 잠금(next-key lock)</dt><dd>InnoDB에서 인덱스 레코드 잠금과 그 앞 간격 잠금을 합친 잠금이다. 범위 안으로의 삽입까지 막는다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-data/jpa/reference/jpa/query-methods.html">Spring Data JPA Reference — JPA Query Methods</a> — 수정 쿼리와 clearAutomatically, 쿼리 힌트의 forCounting, JpaSort.unsafe, countQuery, @EntityGraph 설정</li>
+<li><a href="https://docs.spring.io/spring-data/jpa/reference/repositories/query-methods-details.html">Spring Data JPA Reference — Defining Query Methods</a> — Page, Slice, List 반환 타입과 count 쿼리, 오프셋·키셋 기반 스크롤의 차이</li>
+<li><a href="https://docs.spring.io/spring-data/jpa/reference/jpa/transactions.html">Spring Data JPA Reference — Transactionality</a> — 쿼리 메서드의 기본 트랜잭션 설정, readOnly 트랜잭션과 Hibernate 플러시 모드</li>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html">Jakarta Persistence 3.1 Specification</a> — 3.4.4 비관적 락 모드, 3.7.4 페치·로드 그래프 의미, 3.10.8 플러시 모드, 4.10 벌크 연산</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html">MySQL 8.0 Reference Manual — Locks Set by Different SQL Statements in InnoDB</a> — UPDATE와 잠금 읽기가 스캔한 인덱스 레코드를 잠그는 규칙</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-locking-reads.html">MySQL 8.0 Reference Manual — Locking Reads</a> — FOR UPDATE, FOR SHARE, NOWAIT, SKIP LOCKED와 일관된 읽기의 관계</li>
+</x-refs>

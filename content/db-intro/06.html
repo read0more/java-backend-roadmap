@@ -1,0 +1,946 @@
+<x-meta>
+deck: 집계 함수가 NULL을 어떻게 건너뛰는지, GROUP BY가 행을 어떤 단위로 묶고 MySQL이 그 묶음을 임시 테이블과 인덱스로 어떻게 만드는지, WHERE와 HAVING이 어느 단계에서 거르는지를 논리적 처리 순서로 따라간다.
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li>NULL이 섞인 열에 COUNT(*), COUNT(열), SUM, AVG, MIN, MAX를 적용했을 때의 결과와 결과 타입을 손으로 계산하고, 행이 하나도 없을 때 각 함수가 0과 NULL 가운데 무엇을 돌려주는지 예측할 수 있다.</li>
+<li>GROUP BY가 만드는 그룹의 수와 각 그룹의 집계 값을 실행 추적으로 구하고, NULL이 하나의 그룹으로 모인다는 사실을 WHERE 비교의 동작과 구별해 설명할 수 있다.</li>
+<li>ONLY_FULL_GROUP_BY가 거부하는 쿼리를 알아보고, 오류의 이유를 "그룹 한 줄에 값이 여럿"이라는 관점과 함수 종속성으로 설명한 뒤 올바른 형태로 고칠 수 있다.</li>
+<li>조건 하나를 보고 WHERE와 HAVING 가운데 어디에 둘지 결정하고, 둘의 위치가 집계 결과를 어떻게 바꾸는지 예를 들어 보일 수 있다.</li>
+<li>FROM부터 LIMIT까지의 논리적 처리 순서로 쿼리 하나의 중간 결과를 단계별로 그려 보고, MySQL이 실제로 그룹을 만드는 방법(임시 테이블, 인덱스 순서 이용, 느슨한 인덱스 스캔)을 EXPLAIN의 표시와 연결할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 행 하나가 아니라 행의 묶음에 대해 묻기</h3>
+
+<p>04회에서는 <code>WHERE</code>, <code>ORDER BY</code>, <code>LIMIT</code>로 저장된 행 가운데 필요한 것을 골라 순서대로 꺼냈고, 05회에서는 함수와 연산으로 행 하나의 값을 가공했다. 두 회차의 쿼리는 공통점이 있다. 결과의 행 하나가 테이블의 행 하나에서 나온다. 열 개의 행 가운데 세 개를 고르든, 가격에 수량을 곱한 새 열을 만들든, 결과 행과 원래 행이 일대일로 대응한다.</p>
+
+<p>그런데 실제 업무에서 받는 질문의 상당수는 이런 모양이 아니다. "이번 달 매출이 얼마인가", "분류별로 몇 권이 팔렸는가", "주문을 세 번 이상 한 고객은 누구인가". 이 질문들의 답은 행 하나에서 나오지 않는다. 여러 행을 한데 모아 값 하나로 줄여야 한다. 이번 회차의 주제인 집계(aggregation)와 그룹핑(grouping)은 바로 이 "여러 행 → 값 하나" 변환을 SQL로 표현하는 방법이다.</p>
+
+<p>자바를 아는 독자라면 이런 계산을 애플리케이션에서 해도 되지 않느냐고 물을 수 있다. 모든 주문을 <code>SELECT</code>로 가져와 반복문에서 더하면 된다. 결과는 같을 수 있지만 비용이 다르다. 주문이 백만 건이고 분류가 세 개라면, 애플리케이션 방식은 백만 개의 행을 서버에서 네트워크로 보내고 JDBC 드라이버가 그것을 자바 객체로 만든 뒤에야 더하기를 시작한다. 데이터베이스에서 집계하면 서버는 버퍼 풀의 페이지를 읽으며 분류마다 합계 하나만 들고 있다가 결과 세 행만 보낸다. 데이터를 계산이 있는 곳으로 옮기느냐, 계산을 데이터가 있는 곳으로 옮기느냐의 차이다.</p>
+
+<p>이 회차는 다음 순서로 진행한다. 먼저 함정이 들어 있는 실습 데이터를 만든다. 그다음 집계 함수 다섯 개가 행을 어떻게 "접는지"와 NULL을 만났을 때 무엇을 하는지 본다. 이어서 <code>GROUP BY</code>로 행을 묶는 규칙, MySQL이 그 묶음을 실제로 만드는 방법, 묶은 결과에 쓸 수 없는 열이 생기는 이유를 차례로 다룬다. 마지막으로 그룹을 거르는 <code>HAVING</code>과, 지금까지의 모든 절이 어떤 순서로 의미를 갖는지를 정리한다. 별도로 밝히지 않으면 기준은 MySQL 8.0, 저장 엔진은 InnoDB다.</p>
+
+<h3>집계와 그룹핑 실습 데이터 준비: NULL이 섞인 열 개의 주문</h3>
+
+<p>앞 회차들과 같은 <code>bookstore</code> 데이터베이스에 주문 테이블 하나를 새로 만든다. 집계를 연습하려면 같은 값이 여러 번 나오는 열(고객, 분류)이 있어야 하고, 집계 함수의 NULL 처리를 보려면 NULL이 섞인 열이 있어야 한다. 아래 테이블은 그 두 조건을 일부러 갖추도록 설계했다.</p>
+
+<pre><code class="language-sql">USE bookstore;
+
+CREATE TABLE book_order (
+    order_id   INT         NOT NULL,
+    customer   VARCHAR(20) NOT NULL,
+    category   VARCHAR(20) NOT NULL,
+    title      VARCHAR(50) NOT NULL,
+    price      INT         NOT NULL,   -- 권당 가격
+    quantity   INT         NOT NULL,   -- 주문 수량
+    coupon     INT         NULL,       -- 쿠폰 할인액, 쿠폰을 쓰지 않았으면 NULL
+    region     VARCHAR(10) NULL,       -- 배송 지역, 전자책 주문이면 NULL
+    order_date DATE        NOT NULL,
+    PRIMARY KEY (order_id)
+);
+
+INSERT INTO book_order VALUES
+(1,  '민수', 'IT',   '자료구조 산책',  30000, 1, 3000, '서울', '2024-03-01'),
+(2,  '지은', 'IT',   '네트워크 첫 장', 25000, 2, NULL, '부산', '2024-03-01'),
+(3,  '민수', '소설', '여름의 끝',      15000, 1, NULL, '서울', '2024-03-02'),
+(4,  '도윤', '소설', '바다 쪽 창문',   12000, 3, 1000, NULL,   '2024-03-02'),
+(5,  '지은', '소설', '여름의 끝',      15000, 1, NULL, '부산', '2024-03-03'),
+(6,  '서연', '과학', '별의 지도',      22000, 1, 2000, '서울', '2024-03-03'),
+(7,  '민수', 'IT',   'DB 엔진 해부',   40000, 1, NULL, NULL,   '2024-03-04'),
+(8,  '도윤', '과학', '세포의 시간',    18000, 2, NULL, '대구', '2024-03-04'),
+(9,  '서연', 'IT',   '자료구조 산책',  30000, 1, 3000, '서울', '2024-03-05'),
+(10, '지은', '과학', '별의 지도',      22000, 1, NULL, '부산', '2024-03-05');</code></pre>
+
+<p>이 회차의 모든 예제는 이 열 개의 행에서 출발한다. 본문의 실행 결과는 이 데이터를 MySQL 8.0.46과 8.4.13에 넣고 실제로 실행한 것이며, 두 버전의 결과는 같았다. 실습에 쓴 데이터베이스 이름은 달랐으므로 오류 메시지 속의 데이터베이스 이름만 <code>bookstore</code>로 바꿔 적었다. 계산을 따라가기 쉽도록 행마다 주문 금액(<code>price * quantity</code>)을 덧붙여 표로 정리하면 다음과 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>order_id</th><th>customer</th><th>category</th><th>title</th><th>price</th><th>quantity</th><th>주문 금액</th><th>coupon</th><th>region</th><th>order_date</th></tr></thead><tbody>
+<tr><td>1</td><td>민수</td><td>IT</td><td>자료구조 산책</td><td>30000</td><td>1</td><td>30000</td><td>3000</td><td>서울</td><td>2024-03-01</td></tr>
+<tr><td>2</td><td>지은</td><td>IT</td><td>네트워크 첫 장</td><td>25000</td><td>2</td><td>50000</td><td>NULL</td><td>부산</td><td>2024-03-01</td></tr>
+<tr><td>3</td><td>민수</td><td>소설</td><td>여름의 끝</td><td>15000</td><td>1</td><td>15000</td><td>NULL</td><td>서울</td><td>2024-03-02</td></tr>
+<tr><td>4</td><td>도윤</td><td>소설</td><td>바다 쪽 창문</td><td>12000</td><td>3</td><td>36000</td><td>1000</td><td>NULL</td><td>2024-03-02</td></tr>
+<tr><td>5</td><td>지은</td><td>소설</td><td>여름의 끝</td><td>15000</td><td>1</td><td>15000</td><td>NULL</td><td>부산</td><td>2024-03-03</td></tr>
+<tr><td>6</td><td>서연</td><td>과학</td><td>별의 지도</td><td>22000</td><td>1</td><td>22000</td><td>2000</td><td>서울</td><td>2024-03-03</td></tr>
+<tr><td>7</td><td>민수</td><td>IT</td><td>DB 엔진 해부</td><td>40000</td><td>1</td><td>40000</td><td>NULL</td><td>NULL</td><td>2024-03-04</td></tr>
+<tr><td>8</td><td>도윤</td><td>과학</td><td>세포의 시간</td><td>18000</td><td>2</td><td>36000</td><td>NULL</td><td>대구</td><td>2024-03-04</td></tr>
+<tr><td>9</td><td>서연</td><td>IT</td><td>자료구조 산책</td><td>30000</td><td>1</td><td>30000</td><td>3000</td><td>서울</td><td>2024-03-05</td></tr>
+<tr><td>10</td><td>지은</td><td>과학</td><td>별의 지도</td><td>22000</td><td>1</td><td>22000</td><td>NULL</td><td>부산</td><td>2024-03-05</td></tr>
+</tbody></table></div>
+
+<p>데이터에 넣어 둔 함정을 미리 밝혀 둔다. 첫째, <code>coupon</code>의 NULL은 "할인액 0원"이 아니라 "쿠폰을 쓰지 않음"이다. 0과 NULL은 집계에서 전혀 다르게 취급되므로 이 구분이 결과를 바꾼다. 둘째, <code>region</code>의 NULL 두 개(4번, 7번)는 묶을 때 어디로 가는지 보기 위한 것이다. 셋째, 같은 제목이 다른 고객에게 두 번 팔린 경우(자료구조 산책, 여름의 끝, 별의 지도)가 있어 "주문 수"와 "서로 다른 책의 수"가 다르다. 넷째, 과학 분류에는 가격이 같은 22,000원짜리 주문이 두 개 있다. 최댓값이 하나의 행에서만 나온다고 생각하면 틀리는 지점이다. 다섯째, 지은은 주문이 세 건이지만 쿠폰을 한 번도 쓰지 않았다. 그룹 안의 값이 모두 NULL인 경우다.</p>
+
+<p>숫자 몇 개를 미리 계산해 두면 이후 결과를 검산하기 좋다. 전체 주문 금액의 합은 296,000원, 권당 가격의 합은 229,000원, 수량의 합은 14권이다. 쿠폰 할인액의 합은 3,000 + 1,000 + 2,000 + 3,000 = 9,000원이고 쿠폰을 쓴 주문은 네 건이다.</p>
+
+<h3>집계 함수: 여러 행을 값 하나로 접는다</h3>
+
+<p>집계 함수(aggregate function)는 행의 집합을 입력으로 받아 값 하나를 돌려주는 함수다. MySQL의 오류 메시지와 문서에서는 그룹 함수(group function)라고도 부른다. 05회의 함수들이 행마다 한 번씩 호출되어 행마다 결과를 하나씩 내놓는 스칼라 함수였다면, 집계 함수는 여러 행을 다 본 뒤에 결과를 한 번 내놓는다. MySQL 매뉴얼은 <code>GROUP BY</code> 없이 집계 함수를 쓰면 "모든 행을 하나의 그룹으로 묶은 것과 같다"고 정한다. 그래서 다음 쿼리는 열 개의 행을 하나의 그룹으로 보고 결과 행 하나를 만든다.</p>
+
+<pre><code class="language-sql">SELECT COUNT(*)              AS orders,
+       SUM(price * quantity) AS sales,
+       AVG(price)            AS avg_price,
+       MIN(price)            AS min_price,
+       MAX(price)            AS max_price,
+       MIN(order_date)       AS first_day,
+       MAX(order_date)       AS last_day
+FROM book_order;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+--------+--------+------------+-----------+-----------+------------+------------+
+| orders | sales  | avg_price  | min_price | max_price | first_day  | last_day   |
++--------+--------+------------+-----------+-----------+------------+------------+
+|     10 | 296000 | 22900.0000 |     12000 |     40000 | 2024-03-01 | 2024-03-05 |
++--------+--------+------------+-----------+-----------+------------+------------+</code></pre>
+
+<p>다섯 함수의 뜻은 이름 그대로다. <code>COUNT</code>는 개수, <code>SUM</code>은 합, <code>AVG</code>는 평균, <code>MIN</code>과 <code>MAX</code>는 최솟값과 최댓값이다. 이 결과에서 눈여겨볼 것은 값의 모양이다. <code>avg_price</code>는 22900이 아니라 <code>22900.0000</code>으로 나왔다. 이것은 화면 표시의 우연이 아니라 결과 타입 때문이다. 그 이야기는 조금 뒤에 하고, 먼저 집계 함수가 행들을 어떻게 값 하나로 줄이는지를 들여다보자.</p>
+
+<h4>누적 상태: 집계는 행을 하나씩 먹으며 상태를 고친다</h4>
+
+<p>집계 함수를 이해하는 가장 좋은 모델은 접기(fold)다. 함수마다 작은 누적 상태가 있고, 행이 하나 들어올 때마다 상태를 고친다. 모든 행을 다 보면 상태에서 최종 값을 꺼낸다. <code>COUNT</code>의 상태는 정수 하나, <code>SUM</code>의 상태는 합계 하나, <code>MAX</code>의 상태는 지금까지 본 최댓값 하나다. <code>AVG</code>는 조금 다르다. 평균은 중간에 바로 고칠 수 없으므로 합계와 개수 두 개를 들고 다니다가 마지막에 나눈다.</p>
+
+<p><code>COUNT(coupon)</code>, <code>SUM(coupon)</code>, <code>MAX(price)</code>의 상태가 열 개의 행을 지나며 어떻게 바뀌는지 추적해 보자. <code>COUNT(coupon)</code>과 <code>SUM(coupon)</code>은 <code>coupon</code>이 NULL인 행을 만나면 상태를 건드리지 않는다는 점에 주의한다. 이 규칙은 다음 절에서 자세히 다룬다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>읽은 행</th><th>coupon</th><th>price</th><th>COUNT(coupon) 상태</th><th>SUM(coupon) 상태</th><th>MAX(price) 상태</th></tr></thead><tbody>
+<tr><td>(시작)</td><td></td><td></td><td>0</td><td>NULL (아직 값 없음)</td><td>NULL (아직 값 없음)</td></tr>
+<tr><td>1</td><td>3000</td><td>30000</td><td>1</td><td>3000</td><td>30000</td></tr>
+<tr><td>2</td><td>NULL</td><td>25000</td><td>1</td><td>3000</td><td>30000</td></tr>
+<tr><td>3</td><td>NULL</td><td>15000</td><td>1</td><td>3000</td><td>30000</td></tr>
+<tr><td>4</td><td>1000</td><td>12000</td><td>2</td><td>4000</td><td>30000</td></tr>
+<tr><td>5</td><td>NULL</td><td>15000</td><td>2</td><td>4000</td><td>30000</td></tr>
+<tr><td>6</td><td>2000</td><td>22000</td><td>3</td><td>6000</td><td>30000</td></tr>
+<tr><td>7</td><td>NULL</td><td>40000</td><td>3</td><td>6000</td><td>40000</td></tr>
+<tr><td>8</td><td>NULL</td><td>18000</td><td>3</td><td>6000</td><td>40000</td></tr>
+<tr><td>9</td><td>3000</td><td>30000</td><td>4</td><td>9000</td><td>40000</td></tr>
+<tr><td>10</td><td>NULL</td><td>22000</td><td>4</td><td>9000</td><td>40000</td></tr>
+</tbody></table></div>
+
+<p>표의 첫 줄이 중요하다. <code>COUNT</code>의 시작 상태는 0이지만 <code>SUM</code>과 <code>MAX</code>의 시작 상태는 "아직 값이 없음"이다. 행을 하나도 보지 못하고 끝나면 <code>COUNT</code>는 0을, 나머지는 NULL을 돌려준다. 매뉴얼도 정확히 이렇게 정한다. 일치하는 행이 없으면 <code>COUNT()</code>는 0을, <code>SUM()</code>, <code>AVG()</code>, <code>MAX()</code>, <code>MIN()</code>은 NULL을 돌려준다. "합계가 없으면 0이겠지"라는 직관과 다른 이 규칙은 실무에서 꽤 자주 버그를 만든다. 다음 절에서 다시 본다.</p>
+
+<p>이 모델에서 한 가지 더 읽어 낼 수 있다. <code>COUNT</code>, <code>SUM</code>, <code>MAX</code>, <code>AVG</code>는 행이 백만 개여도 상태의 크기가 변하지 않는다. 정수 한두 개면 된다. 그래서 이 함수들은 행을 한 번 훑으면서 계산할 수 있다. 반면 <code>COUNT(DISTINCT customer)</code>처럼 "서로 다른 값의 개수"를 세려면 지금까지 본 값을 모두 기억해야 한다. 같은 고객이 다시 나왔는지 판단해야 하기 때문이다. 상태의 크기가 서로 다른 값의 수에 비례해 커진다. MySQL 매뉴얼이 내부 임시 테이블을 만드는 경우로 <code>COUNT(DISTINCT)</code>와 <code>GROUP_CONCAT()</code>의 평가를 따로 꼽는 이유가 여기에 있다.</p>
+
+<h4>자바의 컬렉터와 견주어 보기</h4>
+
+<p>자바 스트림의 <code>Collectors</code>도 같은 모델로 동작한다. <code>Collectors.counting()</code>, <code>summingInt()</code>, <code>averagingInt()</code>는 모두 "누적 상태를 만들고, 원소마다 고치고, 끝에 결과를 꺼내는" 컬렉터다. 다음 코드는 JDK 21에서 컴파일하고 실행한 것이다.</p>
+
+<pre><code class="language-java">import java.util.*;
+import java.util.stream.*;
+
+public class GroupDemo {
+    record Order(String customer, String category, int price, int quantity, Integer coupon, String region) {}
+
+    public static void main(String[] args) {
+        List<Order> orders = List.of(
+            new Order("민수", "IT", 30000, 1, 3000, "서울"),
+            new Order("지은", "IT", 25000, 2, null, "부산"),
+            new Order("도윤", "소설", 12000, 3, 1000, null));
+
+        Map<String, Integer> sales = orders.stream()
+            .collect(Collectors.groupingBy(Order::category, TreeMap::new,
+                     Collectors.summingInt(o -> o.price() * o.quantity())));
+        System.out.println(sales);
+
+        try {
+            orders.stream().collect(Collectors.groupingBy(Order::region, Collectors.counting()));
+        } catch (NullPointerException e) {
+            System.out.println("region: " + e.getMessage());
+        }
+
+        double avg = orders.stream()
+            .map(Order::coupon).filter(Objects::nonNull)
+            .mapToInt(Integer::intValue).average().orElseThrow();
+        System.out.println(avg);
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">{IT=80000, 소설=36000}
+region: element cannot be mapped to a null key
+2000.0</code></pre>
+
+<p>비슷해 보이지만 NULL에 대한 태도가 정반대다. 자바의 <code>groupingBy</code>는 분류 함수가 <code>null</code>을 돌려주면 <code>NullPointerException</code>을 던진다. 메시지가 "element cannot be mapped to a null key"다. 쿠폰 평균을 내려면 <code>filter(Objects::nonNull)</code>로 null을 직접 걸러야 하고, 걸러 내지 않은 채 언박싱하면 역시 예외가 난다. SQL은 이 두 가지를 조용히 처리한다. NULL 키는 하나의 그룹으로 모으고, 집계할 때 NULL 값은 건너뛴다. 자바에서는 개발자가 매번 결정해야 하는 것을 SQL은 규칙으로 정해 두었다. 규칙이 있다는 것은 편하지만, 규칙을 모르면 결과가 틀려도 오류 없이 지나간다는 뜻이기도 하다.</p>
+
+<h4>결과 타입: COUNT는 BIGINT, 정수의 SUM과 AVG는 DECIMAL</h4>
+
+<p>집계 결과의 타입은 인자의 타입을 그대로 따르지 않는다. 매뉴얼에 따르면 <code>COUNT()</code>의 결과는 <code>BIGINT</code>다. <code>SUM()</code>과 <code>AVG()</code>는 정확한 값의 인자(정수나 <code>DECIMAL</code>)에 대해 <code>DECIMAL</code>을, 근삿값 인자(<code>FLOAT</code>나 <code>DOUBLE</code>)에 대해 <code>DOUBLE</code>을 돌려준다. <code>INT</code> 열을 아무리 많이 더해도 결과가 <code>INT</code> 범위에 갇히지 않는 것은 이 때문이다.</p>
+
+<p><code>AVG(price)</code>가 <code>22900.0000</code>으로 나온 이유도 여기서 풀린다. 매뉴얼의 정밀 수학(precision math) 예제는 <code>INT</code> 열 <code>i</code>에 대해 <code>CREATE TABLE y SELECT AVG(i) ...</code>로 결과를 테이블로 만들고 <code>DESCRIBE</code>로 보여 주는데, <code>AVG(i)</code>의 타입이 <code>decimal(14,4)</code>다. 소수점 아래 네 자리를 갖는 정확한 수다. 그래서 정수 열의 평균은 나누어떨어져도 <code>.0000</code>이 붙는다. 자바로 이 값을 읽으면 <code>getBigDecimal()</code>이 자연스럽고, JPA에서 <code>AVG</code>를 담는 타입을 무엇으로 할지 고민할 때도 이 사실이 출발점이 된다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>함수</th><th>누적 상태</th><th>NULL 인자</th><th>행이 없을 때</th><th>결과 타입 (MySQL)</th></tr></thead><tbody>
+<tr><td><code>COUNT(*)</code></td><td>행 수</td><td>해당 없음(행을 센다)</td><td>0</td><td>BIGINT</td></tr>
+<tr><td><code>COUNT(expr)</code></td><td>NULL이 아닌 값의 수</td><td>건너뜀</td><td>0</td><td>BIGINT</td></tr>
+<tr><td><code>SUM(expr)</code></td><td>합계</td><td>건너뜀</td><td>NULL</td><td>정확한 수 → DECIMAL, 근삿값 → DOUBLE</td></tr>
+<tr><td><code>AVG(expr)</code></td><td>합계와 개수</td><td>건너뜀</td><td>NULL</td><td>정확한 수 → DECIMAL, 근삿값 → DOUBLE</td></tr>
+<tr><td><code>MIN(expr)</code>, <code>MAX(expr)</code></td><td>지금까지의 최솟값·최댓값</td><td>건너뜀</td><td>NULL</td><td>인자와 같은 종류(수, 문자열, 날짜)</td></tr>
+</tbody></table></div>
+
+<h4>MIN과 MAX는 숫자만 다루지 않는다</h4>
+
+<p><code>MIN</code>과 <code>MAX</code>는 비교할 수 있는 값이면 무엇이든 받는다. 날짜에 쓰면 가장 이른 날과 가장 늦은 날이 나온다(위 결과의 <code>first_day</code>, <code>last_day</code>). 문자열에 쓰면 열의 콜레이션(collation)이 정한 순서로 가장 앞선 문자열과 가장 뒤선 문자열이 나온다. 매뉴얼은 한 가지 예외를 적어 둔다. <code>ENUM</code>과 <code>SET</code> 열에 대해 <code>MIN()</code>과 <code>MAX()</code>는 정의 순서가 아니라 문자열 값으로 비교하며, 이는 <code>ORDER BY</code>가 이 타입을 비교하는 방식과 다르다. 같은 열을 정렬했을 때 맨 앞에 오는 값과 <code>MIN()</code>이 돌려주는 값이 다를 수 있다는 뜻이다.</p>
+
+<h4>DISTINCT를 품은 집계</h4>
+
+<p>집계 함수의 괄호 안에 <code>DISTINCT</code>를 쓰면 중복을 제거한 값들만 집계한다. 주문 수와 "주문한 서로 다른 고객 수"는 다르다.</p>
+
+<pre><code class="language-sql">SELECT COUNT(*)                 AS orders,
+       COUNT(DISTINCT customer) AS customers,
+       COUNT(DISTINCT title)    AS titles,
+       COUNT(DISTINCT region)   AS regions,
+       SUM(DISTINCT price)      AS sum_distinct_price
+FROM book_order;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+--------+-----------+--------+---------+--------------------+
+| orders | customers | titles | regions | sum_distinct_price |
++--------+-----------+--------+---------+--------------------+
+|     10 |         4 |      7 |       3 |             162000 |
++--------+-----------+--------+---------+--------------------+</code></pre>
+
+<p><code>regions</code>가 3인 것을 보자. 지역 값은 서울, 부산, 대구, 그리고 NULL이 있지만 <code>COUNT(DISTINCT region)</code>은 NULL이 아닌 서로 다른 값만 센다. 매뉴얼의 표현으로는 "서로 다른 non-NULL 값을 가진 행의 수"다. MySQL은 <code>COUNT(DISTINCT customer, category)</code>처럼 식을 여러 개 받아 서로 다른 조합의 수를 세는 문법도 지원하며, 이때도 어느 하나라도 NULL인 조합은 세지 않는다.</p>
+
+<p><code>SUM(DISTINCT price)</code>는 함정이다. 결과 162,000은 "서로 다른 책들의 가격 합"이 아니라 "서로 다른 가격 값의 합"이다. 가격 30,000원은 1번과 9번 두 주문에 나오고, 22,000원과 15,000원도 두 번씩 나오지만 각각 한 번만 더해졌다(30000 + 25000 + 15000 + 12000 + 22000 + 40000 + 18000 = 162000). 우연히 다른 두 책의 가격이 같았다면 한 권이 계산에서 사라졌을 것이다. <code>DISTINCT</code>는 값을 기준으로 중복을 지우지 행을 기준으로 지우지 않는다. <code>MIN(DISTINCT x)</code>와 <code>MAX(DISTINCT x)</code>는 문법상 허용되지만 매뉴얼이 밝히듯 <code>DISTINCT</code>를 빼고 쓴 것과 결과가 같다.</p>
+
+<h4>GROUP_CONCAT: 값들을 문자열 하나로 잇기</h4>
+
+<p>MySQL에는 그룹 안의 값들을 문자열 하나로 이어 주는 <code>GROUP_CONCAT()</code>도 있다. NULL이 아닌 값들을 이어 붙이며, 기본 구분자는 쉼표다. <code>ORDER BY</code>로 잇는 순서를, <code>SEPARATOR</code>로 구분자를 정할 수 있다. 주의할 점은 길이 제한이다. 결과는 <code>group_concat_max_len</code> 시스템 변수가 정한 길이에서 잘리고, 이 변수의 기본값은 1024다. 값이 많은 그룹에서 결과가 중간에 끊겨 있다면 이 제한을 먼저 의심한다. 그룹 안의 행을 "눈으로 확인"할 때 유용해서 이 회차의 다음 예제에서도 쓴다.</p>
+
+<h3>NULL을 만난 집계 함수: '무시한다'의 정확한 뜻</h3>
+
+<p>MySQL 매뉴얼의 규칙은 짧다. 따로 밝히지 않는 한 집계 함수는 NULL 값을 무시한다. 예외는 <code>COUNT(*)</code>로, 이것은 열의 값이 아니라 행을 센다. 짧은 규칙이지만 결과에 미치는 영향은 크다. 쿠폰 열로 확인해 보자.</p>
+
+<pre><code class="language-sql">SELECT COUNT(*)                AS all_rows,
+       COUNT(coupon)           AS coupon_rows,
+       COUNT(region)           AS region_rows,
+       SUM(coupon)             AS coupon_sum,
+       AVG(coupon)             AS avg_used,
+       AVG(IFNULL(coupon, 0))  AS avg_all,
+       SUM(coupon) / COUNT(*)  AS manual_avg
+FROM book_order;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+----------+-------------+-------------+------------+-----------+----------+------------+
+| all_rows | coupon_rows | region_rows | coupon_sum | avg_used  | avg_all  | manual_avg |
++----------+-------------+-------------+------------+-----------+----------+------------+
+|       10 |           4 |           8 |       9000 | 2250.0000 | 900.0000 |   900.0000 |
++----------+-------------+-------------+------------+-----------+----------+------------+</code></pre>
+
+<p>세 가지 평균이 두 가지 답을 낸다. <code>AVG(coupon)</code>은 NULL인 여섯 행을 아예 없는 것으로 보고, 남은 네 행으로 9000 / 4 = 2250을 계산한다. 분자에서도 분모에서도 빠진다. <code>AVG(IFNULL(coupon, 0))</code>는 05회에서 본 <code>IFNULL</code>로 NULL을 0으로 바꾼 뒤 평균을 내므로 9000 / 10 = 900이다. <code>SUM(coupon) / COUNT(*)</code>는 분자에서는 NULL이 빠지지만 분모는 모든 행을 세므로 역시 900이다. 마지막 값이 <code>900.0000</code>인 것은 <code>DECIMAL</code>을 <code>/</code>로 나눌 때 결과의 소수 자릿수가 늘어나는 규칙(<code>div_precision_increment</code>, 기본값 4) 때문으로, <code>AVG</code>의 네 자리와는 다른 경로로 나온 것이다.</p>
+
+<p>어느 쪽이 맞는가는 SQL이 아니라 질문이 정한다. "쿠폰을 쓴 주문은 평균 얼마를 할인받았나"라면 2250이 답이다. "주문 하나당 평균 할인액은 얼마인가"라면 900이 답이다. 문제는 개발자가 후자를 묻고 싶으면서 <code>AVG(coupon)</code>을 쓰는 경우다. 오류도 경고도 없이 2.5배 부풀려진 숫자가 보고서에 올라간다. 열에 NULL이 들어갈 수 있다면 집계 함수를 쓸 때마다 "NULL인 행을 모집단에서 빼는 것이 내 질문의 뜻인가"를 물어야 한다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>집계 함수가 NULL을 "무시한다"는 것은 NULL을 0으로 본다는 뜻이 아니라, 그 행을 그 함수의 입력에서 지운다는 뜻이다. 합계에서는 두 해석의 결과가 같지만, 개수와 평균에서는 다르다. 그리고 지울 행밖에 없으면 <code>COUNT</code>는 0을, 나머지 함수는 NULL을 돌려준다.</p></aside>
+
+<p>이 규칙은 04회의 3값 논리와 이어진다. <code>WHERE coupon > 0</code>이라면 NULL과의 비교는 참도 거짓도 아닌 UNKNOWN이 되어 그 행이 걸러진다. 집계 함수는 비교를 하지 않고, NULL을 입력에서 빼 버리는 방식으로 같은 문제를 피한다. 결과적으로 "값을 모르는 행은 계산에 넣지 않는다"는 태도가 두 곳에서 일관된다.</p>
+
+<h4>행이 하나도 없을 때: 결과 행은 하나인가, 없는가</h4>
+
+<p>조건에 맞는 행이 없을 때를 보자. 가격이 100,000원을 넘는 주문은 없다.</p>
+
+<pre><code class="language-sql">SELECT COUNT(*) AS cnt, SUM(price) AS total, AVG(price) AS avg_price, MAX(price) AS max_price
+FROM book_order
+WHERE price > 100000;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+-----+-------+-----------+-----------+
+| cnt | total | avg_price | max_price |
++-----+-------+-----------+-----------+
+|   0 |  NULL |      NULL |      NULL |
++-----+-------+-----------+-----------+</code></pre>
+
+<p>결과는 빈 집합이 아니라 행 하나다. <code>GROUP BY</code>가 없으면 전체가 하나의 그룹이고, 그 그룹은 행이 0개여도 존재하기 때문이다. 그룹이 하나 있으니 결과 행도 하나 있고, 그 안에서 <code>COUNT</code>는 0, 나머지는 NULL이다. 같은 조건에 <code>GROUP BY category</code>를 붙이면 결과가 완전히 달라진다. 이번에는 행이 하나도 없으니 만들어질 그룹도 없고, 결과는 빈 집합(0행)이다. "집계 쿼리는 항상 한 줄을 돌려준다"는 믿음은 <code>GROUP BY</code>가 없을 때만 맞다.</p>
+
+<p>이 차이는 애플리케이션 코드에서 그대로 드러난다. JDBC의 <code>ResultSet.getLong()</code>은 SQL NULL을 읽으면 0을 돌려주므로(값이 실제로 NULL이었는지는 <code>wasNull()</code>로 확인한다), 합계가 NULL이었다는 사실이 0으로 가려진다. 반대로 JPA에서 <code>SUM</code> 결과를 <code>Long</code>으로 받아 <code>long</code>에 대입하면 언박싱에서 <code>NullPointerException</code>이 난다. 어느 쪽이든 쿼리 단계에서 <code>COALESCE(SUM(price), 0)</code>처럼 의도를 밝혀 두는 것이 안전하다. 05회의 <code>COALESCE</code>와 <code>IFNULL</code>이 집계와 만나는 가장 흔한 자리다.</p>
+
+<h4>COUNT(*), COUNT(1), COUNT(열)</h4>
+
+<p>세 가지 <code>COUNT</code>는 뜻이 다르다. <code>COUNT(*)</code>는 행의 수다. <code>COUNT(열)</code>은 그 열이 NULL이 아닌 행의 수다. <code>COUNT(1)</code>은 상수 1이라는 식의 NULL이 아닌 값을 세는데, 1은 결코 NULL이 아니므로 결과가 <code>COUNT(*)</code>와 같다. 열이 <code>NOT NULL</code>로 선언되어 있다면 <code>COUNT(열)</code>도 결과는 같지만, 읽는 사람에게 "NULL이 아닌 것을 센다"는 다른 의도를 전한다. 행의 수를 원한다면 <code>COUNT(*)</code>를 쓰는 것이 의도를 가장 정확하게 드러낸다.</p>
+
+<p>"<code>COUNT(1)</code>이 <code>COUNT(*)</code>보다 빠르다"는 말이 오래 돌았지만, InnoDB에 대해서 매뉴얼은 분명하게 답한다. InnoDB는 <code>SELECT COUNT(*)</code>와 <code>SELECT COUNT(1)</code>을 같은 방식으로 처리하며 성능 차이가 없다. 매뉴얼은 MyISAM에서 <code>COUNT(1)</code>이 <code>COUNT(*)</code>와 같은 최적화를 받으려면 첫 번째 열이 <code>NOT NULL</code>이어야 한다고 따로 적는다. 성능에 관한 규칙은 이처럼 저장 엔진마다 다르므로, "어느 쪽이 빠르다"는 말을 들으면 어느 엔진에 대한 이야기인지부터 확인해야 한다.</p>
+
+<h4>한 층 아래: InnoDB는 행 수를 저장해 두지 않는다</h4>
+
+<p>테이블의 행 수 정도는 어딘가에 숫자로 저장해 두었다가 바로 돌려주면 될 것 같다. InnoDB는 그렇게 하지 않는다. 매뉴얼의 설명은 이렇다. 동시에 실행되는 트랜잭션들이 같은 순간에 서로 다른 수의 행을 "볼" 수 있기 때문에 InnoDB는 내부에 행 수를 두지 않으며, <code>SELECT COUNT(*)</code>는 현재 트랜잭션에 보이는 행만 센다. 03회에서 언두 로그를 다루며 이름만 꺼내고 뒤의 권으로 미룬 다중 버전 동시성 제어(MVCC, Multi-Version Concurrency Control)의 생각을 빌리면 이유가 분명하다. 트랜잭션 A가 행을 지우고 아직 커밋하지 않았다면, A에게 그 행은 없지만 다른 트랜잭션 B에게는 아직 있다. "테이블의 행 수"는 하나의 숫자가 아니라 보는 트랜잭션마다 다른 값이다.</p>
+
+<p>그래서 InnoDB의 <code>COUNT(*)</code>는 인덱스를 실제로 훑는다. 매뉴얼에 따르면 InnoDB는 인덱스나 옵티마이저 힌트가 다른 인덱스를 지정하지 않는 한 가장 작은 보조 인덱스를 훑어 <code>SELECT COUNT(*)</code>를 처리하고, 보조 인덱스가 없으면 클러스터형 인덱스를 훑는다. 가장 작은 인덱스를 고르는 이유는 03회에서 본 인덱스 구조에서 나온다. 클러스터형 인덱스의 리프에는 행 전체가 들어 있지만, 보조 인덱스의 리프에는 인덱스 키와 기본 키 값만 들어 있다. 같은 크기의 페이지에 더 많은 항목이 들어가니, 같은 수의 행을 세는 데 읽어야 할 페이지가 적다. 또 MySQL 8.0.13부터 <code>WHERE</code>나 <code>GROUP BY</code> 같은 다른 절이 없는 <code>SELECT COUNT(*) FROM 테이블</code>은 단일 스레드 작업에 맞춰 최적화되었다. 어느 경우든 행 수에 비례하는 일이 남아 있다는 점은 변하지 않는다. 큰 테이블에서 "전체 개수"를 자주 물어야 한다면 그 비용을 설계 단계에서 고려해야 한다.</p>
+
+<h3>GROUP BY: 같은 값끼리 묶는다</h3>
+
+<p>지금까지는 테이블 전체가 하나의 그룹이었다. <code>GROUP BY</code>는 이 그룹을 여러 개로 쪼갠다. <code>GROUP BY category</code>라고 쓰면 <code>category</code> 값이 같은 행끼리 하나의 그룹이 되고, 집계 함수는 그룹마다 따로 계산되며, 결과에는 그룹 하나당 행 하나가 나온다. 앞에서 본 누적 상태 모델로 말하면, 누적 상태가 테이블에 하나 있던 것이 그룹마다 하나씩으로 늘어난다.</p>
+
+<pre><code class="language-sql">SELECT category,
+       COUNT(*)              AS orders,
+       SUM(quantity)         AS books,
+       SUM(price * quantity) AS sales,
+       AVG(price)            AS avg_price,
+       GROUP_CONCAT(order_id ORDER BY order_id) AS order_ids
+FROM book_order
+GROUP BY category
+ORDER BY sales DESC;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+----------+--------+-------+--------+------------+-----------+
+| category | orders | books | sales  | avg_price  | order_ids |
++----------+--------+-------+--------+------------+-----------+
+| IT       |      4 |     5 | 150000 | 31250.0000 | 1,2,7,9   |
+| 과학     |      3 |     4 |  80000 | 20666.6667 | 6,8,10    |
+| 소설     |      3 |     5 |  66000 | 14000.0000 | 3,4,5     |
++----------+--------+-------+--------+------------+-----------+</code></pre>
+
+<p>세 그룹의 <code>sales</code>를 더하면 150000 + 80000 + 66000 = 296000으로, 전체 합과 같다. 그룹은 행을 빠짐없이, 겹치지 않게 나눈다. 모든 행은 정확히 한 그룹에 속한다. 과학 분류의 평균 가격은 (22000 + 18000 + 22000) / 3 = 20666.666…이고, <code>decimal(14,4)</code>에 맞춰 소수 넷째 자리까지 반올림된 <code>20666.6667</code>로 나왔다. <code>order_ids</code> 열은 <code>GROUP_CONCAT</code>으로 각 그룹에 어떤 행이 들어갔는지 보여 준다.</p>
+
+<p>서버가 이 결과를 만드는 과정을 행 단위로 추적해 보자. 행을 하나 읽을 때마다 그 행의 <code>category</code> 값으로 그룹을 찾고, 처음 보는 값이면 새 그룹을 만든 뒤, 그 그룹의 누적 상태만 고친다. 아래는 <code>COUNT(*)</code>와 <code>SUM(price * quantity)</code>의 상태만 적은 것이다(행을 읽는 순서는 설명을 위해 <code>order_id</code> 순으로 가정했다. 실제 순서는 실행 방법에 따라 다르지만 최종 결과는 같다).</p>
+
+<pre class="diagram">읽은 행  category  주문 금액   그룹별 누적 상태 (COUNT, SUM)
+------   --------  --------   -----------------------------------------------
+  1      IT          30000    IT(1, 30000)                       ← 새 그룹 IT
+  2      IT          50000    IT(2, 80000)
+  3      소설        15000    IT(2, 80000)   소설(1, 15000)      ← 새 그룹 소설
+  4      소설        36000                   소설(2, 51000)
+  5      소설        15000                   소설(3, 66000)
+  6      과학        22000                                  과학(1, 22000)  ← 새 그룹 과학
+  7      IT          40000    IT(3, 120000)
+  8      과학        36000                                  과학(2, 58000)
+  9      IT          30000    IT(4, 150000)
+ 10      과학        22000                                  과학(3, 80000)
+
+끝: IT(4, 150000)   소설(3, 66000)   과학(3, 80000)  → 결과 행 3개</pre>
+
+<x-visual id="db-intro-06-group-buckets" title="열 개의 주문 행이 분류 값에 따라 세 개의 그룹 상자로 나뉘고, 각 상자가 결과 행 하나로 접히는 모습" kind="개념도" ratio="16:9">
+<x-hint>GROUP BY가 행을 겹치지 않는 그룹으로 나누고, 그룹마다 따로 누적 상태를 들고 있다가 결과 행 하나로 만든다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 개념도. 왼쪽에 세로로 쌓인 작은 행 카드 열 개, 각 카드에 "1 IT", "2 IT", "3 소설", "4 소설", "5 소설", "6 과학", "7 IT", "8 과학", "9 IT", "10 과학"이라고 적혀 있다. 카드마다 오른쪽으로 가는 얇은 화살표가 있고, 가운데의 세 개의 큰 상자 중 하나로 들어간다. 가운데 상자 세 개는 위에서부터 파란 상자 "IT 그룹", 초록 상자 "소설 그룹", 주황 상자 "과학 그룹"이고, 각 상자 안에 작은 계산기 모양 아이콘과 "누적 상태" 라벨이 있다. 각 상자에서 오른쪽으로 굵은 화살표 하나씩이 나가 오른쪽의 결과 표의 한 줄로 이어진다. 결과 표 제목 "결과: 그룹 하나당 한 행", 세 줄은 "IT 4 150000", "소설 3 66000", "과학 3 80000". 평면적이고 차분한 색조, 고딕체 한국어 라벨.</x-prompt>
+<x-caption>GROUP BY는 행을 겹치지 않는 그룹으로 나누고, 그룹마다 따로 집계한 값을 한 행으로 내놓는다.</x-caption>
+</x-visual>
+
+<p>결과의 행 수는 <code>category</code>의 서로 다른 값의 수, 즉 3이다. 이 사실은 일반적이다. <code>GROUP BY</code> 결과의 행 수는 묶는 기준의 서로 다른 값(또는 값의 조합)이 데이터에 실제로 몇 개 나오느냐로 정해진다. 위 쿼리의 결과가 분류 순서가 아니라 <code>sales</code> 순서로 나온 것은 <code>ORDER BY sales DESC</code>를 썼기 때문이다. <code>ORDER BY</code>를 빼면 MySQL 8.0은 그룹의 출력 순서를 약속하지 않는다. 이유는 다음 절에서 본다.</p>
+
+<h4>그룹마다 다른 이야기: 고객별 집계</h4>
+
+<p>고객별로 묶으면 쿠폰 데이터에 넣어 둔 함정이 드러난다.</p>
+
+<pre><code class="language-sql">SELECT customer,
+       COUNT(*)              AS orders,
+       SUM(price * quantity) AS sales,
+       COUNT(coupon)         AS coupon_uses,
+       SUM(coupon)           AS coupon_sum
+FROM book_order
+GROUP BY customer
+ORDER BY sales DESC;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+----------+--------+-------+-------------+------------+
+| customer | orders | sales | coupon_uses | coupon_sum |
++----------+--------+-------+-------------+------------+
+| 지은     |      3 | 87000 |           0 |       NULL |
+| 민수     |      3 | 85000 |           1 |       3000 |
+| 도윤     |      2 | 72000 |           1 |       1000 |
+| 서연     |      2 | 52000 |           2 |       5000 |
++----------+--------+-------+-------------+------------+</code></pre>
+
+<p>지은의 그룹에는 행이 세 개 있지만 세 행의 <code>coupon</code>이 모두 NULL이다. <code>SUM(coupon)</code>의 입장에서 이 그룹은 입력이 하나도 없는 그룹이므로 결과가 NULL이다. 같은 그룹에서 <code>COUNT(coupon)</code>은 0이다. 앞 절의 "행이 없을 때" 규칙이 테이블 전체가 아니라 그룹 하나 단위로도 똑같이 적용된다는 것을 보여 준다. 이 결과를 받아 "쿠폰 할인 총액" 보고서를 만든다면, 지은의 칸에 빈 값이 찍히거나 자바 코드에서 언박싱 예외가 날 수 있다. <code>COALESCE(SUM(coupon), 0)</code>으로 바꾸면 0이 나온다.</p>
+
+<h4>여러 열로 묶기</h4>
+
+<p><code>GROUP BY</code>에 열을 여러 개 쓰면 값의 조합이 그룹의 기준이 된다. <code>GROUP BY category, customer</code>는 "분류와 고객이 모두 같은 행"을 한 그룹으로 묶는다.</p>
+
+<pre><code class="language-sql">SELECT category, customer, COUNT(*) AS orders, SUM(price * quantity) AS sales
+FROM book_order
+GROUP BY category, customer;</code></pre>
+
+<p>결과는 아래의 아홉 그룹이다(표는 읽기 쉽게 분류별로 모아 정리했다).</p>
+
+<div class="table-wrap"><table><thead><tr><th>category</th><th>customer</th><th>orders</th><th>sales</th><th>속한 주문</th></tr></thead><tbody>
+<tr><td>IT</td><td>민수</td><td>2</td><td>70000</td><td>1, 7</td></tr>
+<tr><td>IT</td><td>지은</td><td>1</td><td>50000</td><td>2</td></tr>
+<tr><td>IT</td><td>서연</td><td>1</td><td>30000</td><td>9</td></tr>
+<tr><td>소설</td><td>민수</td><td>1</td><td>15000</td><td>3</td></tr>
+<tr><td>소설</td><td>도윤</td><td>1</td><td>36000</td><td>4</td></tr>
+<tr><td>소설</td><td>지은</td><td>1</td><td>15000</td><td>5</td></tr>
+<tr><td>과학</td><td>서연</td><td>1</td><td>22000</td><td>6</td></tr>
+<tr><td>과학</td><td>도윤</td><td>1</td><td>36000</td><td>8</td></tr>
+<tr><td>과학</td><td>지은</td><td>1</td><td>22000</td><td>10</td></tr>
+</tbody></table></div>
+
+<p>분류가 셋, 고객이 넷이니 가능한 조합은 12개지만 결과는 9행이다. <code>GROUP BY</code>는 가능한 모든 조합을 만들어 내지 않는다. 데이터에 실제로 나타난 조합만 그룹이 된다. 민수는 과학 책을, 서연은 소설을, 도윤은 IT 책을 산 적이 없으므로 그 조합의 행은 결과에 없다. "주문이 0건인 조합도 0으로 보고 싶다"는 요구는 <code>GROUP BY</code>만으로는 풀리지 않고, 모든 조합을 담은 다른 테이블과 조인해야 한다. 또 <code>GROUP BY category, customer</code>와 <code>GROUP BY customer, category</code>는 같은 그룹들을 만든다. 조합이 같으면 같은 그룹이므로 열의 순서는 그룹의 구성에 영향을 주지 않는다. 다만 열의 순서는 다음 절에서 볼 인덱스 사용 가능성에 영향을 준다.</p>
+
+<h4>NULL은 하나의 그룹으로 모인다</h4>
+
+<p>배송 지역으로 묶어 보자. <code>region</code>이 NULL인 행이 두 개 있다.</p>
+
+<pre><code class="language-sql">SELECT region, COUNT(*) AS orders, COUNT(region) AS region_count
+FROM book_order
+GROUP BY region
+ORDER BY orders DESC;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+--------+--------+--------------+
+| region | orders | region_count |
++--------+--------+--------------+
+| 서울   |      4 |            4 |
+| 부산   |      3 |            3 |
+| NULL   |      2 |            0 |
+| 대구   |      1 |            1 |
++--------+--------+--------------+</code></pre>
+
+<p>NULL인 두 행(4번, 7번)은 하나의 그룹이 되었다. MySQL 매뉴얼은 <code>DISTINCT</code>, <code>GROUP BY</code>, <code>ORDER BY</code>에서 모든 NULL 값을 서로 같은 것으로 취급한다고 정한다. 04회에서 본 대로 <code>WHERE region = NULL</code>은 어떤 행도 고르지 못한다. NULL과의 비교 결과가 UNKNOWN이기 때문이다. 같은 NULL이 비교에서는 "같다고 말할 수 없는 값"이고, 묶기에서는 "같은 그룹에 넣는 값"이다. 모순처럼 보이지만 목적이 다르다. 비교는 참인 행만 통과시키는 필터라 모르는 것을 통과시키지 않는다. 묶기는 모든 행을 어딘가에 넣어야 하므로 NULL끼리 한곳에 모은다. 그 그룹 안에서 <code>COUNT(region)</code>은 0이다. 묶는 기준은 NULL이지만, 집계 함수는 여전히 NULL을 건너뛰기 때문이다. 앞에서 본 자바의 <code>groupingBy</code>가 null 키에서 예외를 던졌던 것과 대비된다.</p>
+
+<h4>식으로 묶기</h4>
+
+<p>열 대신 식으로 묶을 수도 있다. 가격을 만 원 단위 구간으로 나누어 구간별 주문 수를 세 보자.</p>
+
+<pre><code class="language-sql">SELECT FLOOR(price / 10000) * 10000 AS band,
+       COUNT(*)                      AS orders
+FROM book_order
+GROUP BY band
+ORDER BY band;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+-------+--------+
+| band  | orders |
++-------+--------+
+| 10000 |      4 |
+| 20000 |      3 |
+| 30000 |      2 |
+| 40000 |      1 |
++-------+--------+</code></pre>
+
+<p>10,000원대는 15000, 12000, 15000, 18000의 네 주문, 20,000원대는 25000, 22000, 22000의 세 주문이다. 여기서 <code>GROUP BY band</code>는 <code>SELECT</code> 목록의 별칭을 썼다. 매뉴얼에 따르면 표준 SQL은 <code>GROUP BY</code>에 열이 아닌 식도, 별칭도 허용하지 않으며, MySQL은 두 가지를 모두 허용하는 확장을 둔다. 다른 데이터베이스로 옮길 쿼리라면 <code>GROUP BY FLOOR(price / 10000) * 10000</code>처럼 식을 그대로 반복하는 편이 안전하다. 날짜 열에 <code>YEAR()</code>, <code>MONTH()</code>, <code>DATE_FORMAT()</code> 같은 05회의 함수를 씌워 월별·연도별로 묶는 것도 같은 원리다.</p>
+
+<h4>DISTINCT는 GROUP BY의 특수한 경우다</h4>
+
+<p>04회의 <code>SELECT DISTINCT</code>도 사실은 묶기다. MySQL 매뉴얼은 대부분의 경우 <code>DISTINCT</code>를 <code>GROUP BY</code>의 특수한 경우로 볼 수 있다고 설명하며, <code>SELECT DISTINCT c1, c2, c3 FROM t1 WHERE ...</code>와 <code>SELECT c1, c2, c3 FROM t1 WHERE ... GROUP BY c1, c2, c3</code>를 같은 쿼리의 예로 든다. 모든 선택 열로 묶고 집계 함수는 쓰지 않는 <code>GROUP BY</code>가 곧 <code>DISTINCT</code>다. 그러니 "중복 제거"가 비싼 이유와 "그룹핑"이 비싼 이유는 같다. 둘 다 같은 값을 가진 행들을 찾아 모아야 한다.</p>
+
+<h3>한 층 아래: MySQL이 그룹을 만드는 세 가지 길</h3>
+
+<p>앞의 추적에서는 "그룹을 찾고, 없으면 만든다"고 간단히 말했다. 실제로 서버는 그룹을 어디에 두고 어떻게 찾을까. MySQL 매뉴얼의 GROUP BY 최적화 절은 세 가지 방법을 설명한다.</p>
+
+<h4>첫째 길: 내부 임시 테이블</h4>
+
+<p>매뉴얼은 <code>GROUP BY</code>를 만족시키는 가장 일반적인 방법을 이렇게 요약한다. 테이블 전체를 훑으면서 각 그룹의 행들이 연속해 놓이는 새 임시 테이블을 만들고, 이 임시 테이블로 그룹을 찾아 집계 함수를 적용한다. 이 임시 테이블은 사용자가 <code>CREATE TEMPORARY TABLE</code>로 만드는 것이 아니라 서버가 쿼리 하나를 처리하려고 스스로 만들었다 버리는 내부 임시 테이블(internal temporary table)이다. 쿼리가 이 방법을 쓰는지는 <code>EXPLAIN</code>의 <code>Extra</code> 열에 <code>Using temporary</code>가 나오는지로 확인한다.</p>
+
+<p>MySQL 8.0에서 메모리에 만드는 내부 임시 테이블의 저장 엔진은 <code>internal_tmp_mem_storage_engine</code> 변수로 정하며, 기본값은 <code>TempTable</code>이다(다른 선택지는 <code>MEMORY</code>). 그룹의 수가 많아 임시 테이블이 메모리 한도를 넘으면 디스크의 임시 테이블로 옮겨 가고, 그만큼 느려진다. 고객별 집계처럼 묶는 열에 쓸 만한 인덱스가 없는 쿼리는 이 길로 간다. 그룹 수가 고객 수만큼 많아지면 임시 테이블도 그만큼 커진다. 집계 쿼리가 느릴 때 <code>EXPLAIN</code>에서 <code>Using temporary</code>를 먼저 찾아보는 이유다.</p>
+
+<h4>둘째 길: 이미 정렬된 인덱스를 따라 읽기</h4>
+
+<p>임시 테이블이 필요한 근본 이유는 같은 그룹의 행들이 테이블 여기저기에 흩어져 있기 때문이다. 같은 그룹의 행들이 처음부터 붙어 있다면 사정이 다르다. 01회와 03회에서 본 B-tree 인덱스는 리프 페이지에 키를 정렬된 순서로 담는다. 그래서 매뉴얼은 인덱스로 <code>GROUP BY</code>를 처리하기 위한 가장 중요한 전제 조건으로, 모든 <code>GROUP BY</code> 열이 같은 인덱스에 속하고 그 인덱스가 키를 순서대로 저장할 것(<code>BTREE</code>는 그렇고 <code>HASH</code>는 그렇지 않다)을 꼽는다. 분류와 가격으로 인덱스를 하나 만들어 보자.</p>
+
+<pre><code class="language-sql">CREATE INDEX idx_category_price ON book_order (category, price);</code></pre>
+
+<p>이 보조 인덱스의 리프에는 (분류, 가격) 순서로 정렬된 항목이 늘어서고, 03회에서 본 대로 각 항목 끝에는 행을 찾아갈 기본 키 값이 붙는다. 분류의 순서는 열의 콜레이션이 정한다. 아래 그림은 기본 콜레이션 <code>utf8mb4_0900_ai_ci</code>로 만든 테이블에서 이 인덱스를 순서대로 읽어(MySQL 8.0.46·8.4.13) 확인한 순서로, 한글 분류인 과학과 소설이 IT보다 앞에 온다. 중요한 것은 같은 분류의 항목들이 서로 붙어 있다는 점이다.</p>
+
+<pre class="diagram">idx_category_price 리프 (category, price | 기본 키) — 키 순서로 연속
+
+   과학, 18000 | 8    ┐
+   과학, 22000 | 6    │  과학 구간
+   과학, 22000 | 10   ┘  ← 과학의 마지막 항목 = MAX(price) 22000
+   소설, 12000 | 4    ┐
+   소설, 15000 | 3    │  소설 구간
+   소설, 15000 | 5    ┘  ← 소설의 마지막 항목 = MAX(price) 15000
+   IT,   25000 | 2    ┐
+   IT,   30000 | 1    │  IT 구간
+   IT,   30000 | 9    │
+   IT,   40000 | 7    ┘  ← IT의 마지막 항목   = MAX(price) 40000</pre>
+
+<p>이런 인덱스를 처음부터 끝까지 순서대로 읽으면, 같은 분류의 항목이 연달아 나오다가 분류 값이 바뀌는 순간 한 그룹이 끝난다. 서버는 현재 그룹의 누적 상태 하나만 들고 있다가, 값이 바뀌면 그 그룹의 결과 행을 내보내고 상태를 새로 시작하면 된다. 임시 테이블이 필요 없고, 그룹이 아무리 많아도 들고 있는 상태는 하나뿐이다. 매뉴얼은 이 방법을 촘촘한 인덱스 스캔(Tight Index Scan)이라고 부르며, <code>WHERE</code>에 범위 조건이 있으면 그 범위의 키만, 없으면 인덱스 전체를 읽는다고 설명한다. <code>SELECT category, SUM(price) FROM book_order GROUP BY category</code>는 이 인덱스만으로 답할 수 있는 형태다.</p>
+
+<h4>셋째 길: 그룹마다 건너뛰며 읽기</h4>
+
+<p>집계가 <code>MIN</code>이나 <code>MAX</code>뿐이라면 더 줄일 수 있다. 위 그림에서 각 분류의 <code>MAX(price)</code>는 그 분류 구간의 마지막 항목이다. 구간 안의 나머지 항목은 읽을 필요가 없다. 각 그룹의 첫 항목이나 마지막 항목으로 곧장 건너뛰며 읽는 이 방법을 매뉴얼은 느슨한 인덱스 스캔(Loose Index Scan)이라고 부른다. 적용 조건은 까다롭다.</p>
+
+<ul>
+<li>쿼리가 테이블 하나만 대상으로 한다.</li>
+<li><code>GROUP BY</code>가 인덱스의 가장 왼쪽 접두(leftmost prefix)를 이루는 열들만 쓴다. 인덱스가 <code>(c1, c2, c3)</code>라면 <code>GROUP BY c1, c2</code>는 되지만 <code>GROUP BY c2, c3</code>나 인덱스에 없는 열을 섞은 경우는 안 된다.</li>
+<li>집계 함수는 <code>MIN()</code>과 <code>MAX()</code>뿐이고, 모두 같은 열을 가리키며, 그 열은 인덱스에서 <code>GROUP BY</code> 열 바로 다음에 와야 한다.</li>
+<li>인덱스의 나머지 부분은 상수와의 동등 조건으로만 쓰여야 한다(<code>MIN</code>, <code>MAX</code>의 인자는 예외).</li>
+<li>열 값 전체가 인덱스에 들어 있어야 한다. <code>INDEX (c1(10))</code>처럼 앞부분만 담은 접두 인덱스는 안 된다.</li>
+</ul>
+
+<p><code>SELECT category, MAX(price) FROM book_order GROUP BY category</code>는 이 조건을 모두 만족한다. 이 방법이 선택되면 <code>EXPLAIN</code>의 <code>Extra</code> 열에 <code>Using index for group-by</code>가 나온다. 같은 인덱스에서도 <code>SUM(price)</code>를 구하면 그룹의 모든 항목을 더해야 하므로 느슨한 인덱스 스캔은 쓸 수 없고, 촘촘한 인덱스 스캔이 후보가 된다. 묶는 열이 <code>customer</code>라면 이 인덱스는 소용이 없고 첫째 길로 돌아간다. 다만 조건을 만족한다고 해서 옵티마이저가 반드시 그 방법을 고르는 것은 아니다. 옵티마이저는 비용으로 판단하므로, 행이 열 개뿐인 실습 테이블에서는 다른 계획을 고를 수도 있다. 실제 선택은 언제나 <code>EXPLAIN</code>으로 확인한다. 인덱스를 만들고 <code>ANALYZE TABLE book_order</code>로 통계를 갱신한 뒤 세 쿼리를 차례로 확인한 결과는 다음과 같다.</p>
+
+<pre><code class="language-sql">EXPLAIN SELECT category, MAX(price) FROM book_order GROUP BY category;
+EXPLAIN SELECT category, SUM(price) FROM book_order GROUP BY category;
+EXPLAIN SELECT customer, COUNT(*)   FROM book_order GROUP BY customer;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+----+-------------+------------+------------+-------+--------------------+--------------------+---------+------+------+----------+--------------------------+
+| id | select_type | table      | partitions | type  | possible_keys      | key                | key_len | ref  | rows | filtered | Extra                    |
++----+-------------+------------+------------+-------+--------------------+--------------------+---------+------+------+----------+--------------------------+
+|  1 | SIMPLE      | book_order | NULL       | range | idx_category_price | idx_category_price | 82      | NULL |    4 |   100.00 | Using index for group-by |
++----+-------------+------------+------------+-------+--------------------+--------------------+---------+------+------+----------+--------------------------+
++----+-------------+------------+------------+-------+--------------------+--------------------+---------+------+------+----------+-------------+
+| id | select_type | table      | partitions | type  | possible_keys      | key                | key_len | ref  | rows | filtered | Extra       |
++----+-------------+------------+------------+-------+--------------------+--------------------+---------+------+------+----------+-------------+
+|  1 | SIMPLE      | book_order | NULL       | index | idx_category_price | idx_category_price | 86      | NULL |   10 |   100.00 | Using index |
++----+-------------+------------+------------+-------+--------------------+--------------------+---------+------+------+----------+-------------+
++----+-------------+------------+------------+------+---------------+------+---------+------+------+----------+-----------------+
+| id | select_type | table      | partitions | type | possible_keys | key  | key_len | ref  | rows | filtered | Extra           |
++----+-------------+------------+------------+------+---------------+------+---------+------+------+----------+-----------------+
+|  1 | SIMPLE      | book_order | NULL       | ALL  | NULL          | NULL | NULL    | NULL |   10 |   100.00 | Using temporary |
++----+-------------+------------+------------+------+---------------+------+---------+------+------+----------+-----------------+</code></pre>
+
+<p>세 쿼리가 세 가지 길을 하나씩 보여 준다. <code>MAX(price)</code>는 <code>Using index for group-by</code>로 느슨한 인덱스 스캔이 선택되었다. <code>SUM(price)</code>는 인덱스 전체를 순서대로 읽고(<code>type</code>이 <code>index</code>) <code>Using temporary</code>가 없으니 촘촘한 인덱스 스캔으로 그룹을 만든 것이다. 인덱스가 쓸모없는 <code>customer</code> 묶기는 테이블 전체를 읽고(<code>ALL</code>) 임시 테이블을 쓴다. <code>rows</code> 같은 추정치는 실행 환경과 통계에 따라 달라지므로, 이 표에서는 <code>type</code>과 <code>Extra</code>를 읽으면 된다.</p>
+
+<x-visual id="db-intro-06-index-group-scan" title="GROUP BY를 처리하는 세 가지 방법: 임시 테이블, 촘촘한 인덱스 스캔, 느슨한 인덱스 스캔" kind="비교 다이어그램" ratio="16:9">
+<x-hint>같은 GROUP BY라도 임시 테이블에 그룹을 모으는 방법, 정렬된 인덱스를 순서대로 읽는 방법, 그룹마다 마지막 항목으로 건너뛰는 방법이 있다는 것을 세 줄로 비교한다.</x-hint>
+<x-prompt>흰 배경에 가로로 긴 세 줄의 비교 다이어그램. 첫째 줄 왼쪽 라벨 "임시 테이블": 왼쪽에 순서가 섞인 행 카드들("IT", "소설", "과학", "IT" 등)이 있고, 화살표가 오른쪽의 상자 세 칸짜리 표로 들어간다. 표 위 라벨 "Using temporary". 둘째 줄 왼쪽 라벨 "촘촘한 인덱스 스캔": 정렬된 인덱스 항목 열 칸이 가로로 이어져 있고 IT 네 칸은 파랑, 과학 세 칸은 주황, 소설 세 칸은 초록. 칸 아래를 따라 처음부터 끝까지 이어지는 하나의 긴 화살표. 셋째 줄 왼쪽 라벨 "느슨한 인덱스 스캔": 같은 색의 열 칸이 있고, 각 색 구간의 마지막 칸 위에만 굵은 점이 찍혀 있으며 점과 점 사이를 크게 건너뛰는 곡선 화살표 세 개. 셋째 줄 위 라벨 "Using index for group-by". 평면적이고 차분한 색조, 고딕체 한국어 라벨.</x-prompt>
+<x-caption>그룹의 행이 흩어져 있으면 임시 테이블에 모으고, 인덱스 덕분에 붙어 있으면 순서대로 읽거나 그룹마다 건너뛴다.</x-caption>
+</x-visual>
+
+<h4>GROUP BY는 더 이상 정렬을 약속하지 않는다</h4>
+
+<p>이 구조를 알면 오래된 상식 하나가 왜 깨졌는지도 이해된다. 매뉴얼에 따르면 MySQL 5.7 이하에서는 <code>GROUP BY</code>가 특정 조건에서 결과를 암묵적으로 정렬했다. MySQL 8.0에서는 더 이상 그렇지 않으며, 그래서 예전처럼 정렬을 막으려고 <code>ORDER BY NULL</code>을 붙일 필요도 없어졌다. 매뉴얼은 그 결과 쿼리 결과가 이전 버전과 다를 수 있으니 특정 순서가 필요하면 <code>ORDER BY</code>를 쓰라고 안내한다. 임시 테이블에서 그룹을 꺼내는 순서든, 인덱스를 따라 읽는 순서든, 그것은 실행 방법이 정하는 우연한 순서이지 SQL이 약속하는 순서가 아니다. 5.7 시절 <code>GROUP BY</code>만으로 정렬된 결과를 받던 코드는 8.0으로 올리면서 순서가 바뀔 수 있다. 같은 맥락에서 <code>GROUP BY category DESC</code>처럼 <code>GROUP BY</code> 열에 <code>ASC</code>나 <code>DESC</code>를 붙이던 MySQL 고유 문법은 8.0.13부터 지원되지 않는다. MySQL 8.0.46과 8.4.13에서 <code>SELECT category FROM book_order GROUP BY category DESC</code>를 실행하면 <code>ERROR 1064 (42000)</code> 구문 오류가 난다.</p>
+
+<h3>GROUP BY의 주의사항: 그룹 한 줄에 담을 수 없는 열</h3>
+
+<p>분류별로 가장 비싼 가격을 구했으니, 그 책의 제목도 같이 보고 싶어진다. 자연스럽게 다음 쿼리를 쓰게 된다.</p>
+
+<pre><code class="language-sql">SELECT category, title, MAX(price) AS max_price
+FROM book_order
+GROUP BY category;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'bookstore.book_order.title' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by</code></pre>
+
+<p>오류 메시지가 길지만 하는 말은 하나다. <code>SELECT</code> 목록의 두 번째 식 <code>title</code>은 <code>GROUP BY</code>에 없고, 집계 함수로 감싸지지도 않았으며, 묶는 기준에 의해 값이 하나로 정해지지도 않는다. 결과 행 하나가 그룹 하나를 대표한다는 것을 떠올리면 왜 문제인지 보인다. IT 그룹에는 행이 네 개 있고 제목은 '자료구조 산책', '네트워크 첫 장', 'DB 엔진 해부', '자료구조 산책'이다. 결과의 IT 행에는 <code>title</code> 칸이 하나뿐인데 후보가 여럿이다. 어느 것을 넣어야 하는지 쿼리가 말해 주지 않았다.</p>
+
+<p>사람은 "<code>MAX(price)</code>를 구했으니 그 최댓값을 가진 행의 제목"을 기대한다. 하지만 SQL에서 <code>SELECT</code> 목록의 각 식은 서로 독립적으로 평가된다. <code>MAX(price)</code>는 그룹의 가격들 가운데 최댓값이라는 값 하나를 만들 뿐, "최댓값을 가진 행"을 가리키지 않는다. 앞에서 본 누적 상태 모델로 보면 분명하다. <code>MAX</code>의 상태에는 지금까지의 최댓값 하나만 있고, 그 값이 어느 행에서 왔는지는 기록되지 않는다. 게다가 과학 분류처럼 최댓값 22,000원을 가진 행이 둘이면 "그 행"이라는 말 자체가 성립하지 않는다.</p>
+
+<h4>ONLY_FULL_GROUP_BY: 기본으로 켜져 있는 안전장치</h4>
+
+<p>이 오류를 내는 것은 SQL 모드 <code>ONLY_FULL_GROUP_BY</code>다. MySQL 8.0의 기본 SQL 모드에는 <code>ONLY_FULL_GROUP_BY</code>, <code>STRICT_TRANS_TABLES</code>, <code>NO_ZERO_IN_DATE</code>, <code>NO_ZERO_DATE</code>, <code>ERROR_FOR_DIVISION_BY_ZERO</code>, <code>NO_ENGINE_SUBSTITUTION</code>이 들어 있다. 매뉴얼의 정의로 이 모드는 <code>SELECT</code> 목록, <code>HAVING</code> 조건, <code>ORDER BY</code> 목록이 <code>GROUP BY</code>에 이름이 나오지도 않고 <code>GROUP BY</code> 열에 함수적으로 종속되지도(유일하게 결정되지도) 않는 집계되지 않은 열을 참조하는 쿼리를 거부한다. 정리하면 그룹 쿼리의 이 세 자리에 올 수 있는 것은 다음 넷이다.</p>
+
+<ol>
+<li><code>GROUP BY</code>에 쓴 열이나 식</li>
+<li>집계 함수로 감싼 식(그 안에는 어떤 열이 와도 된다)</li>
+<li>상수</li>
+<li><code>GROUP BY</code> 열에 함수적으로 종속된 열</li>
+</ol>
+
+<p>이 모드를 끄면 어떻게 될까. 매뉴얼은 분명하게 경고한다. <code>ONLY_FULL_GROUP_BY</code>가 꺼져 있으면 MySQL은 표준을 벗어난 확장으로 위 쿼리를 받아들이는데, 이때 서버는 각 그룹에서 아무 값이나 자유롭게 고를 수 있고, 그룹 안의 값이 모두 같지 않은 한 선택된 값은 비결정적(nondeterministic)이다. 또 <code>ORDER BY</code>를 붙여도 이 선택에 영향을 줄 수 없다. 정렬은 값이 선택된 뒤에 일어나기 때문이다. 다시 말해 IT 행에 'DB 엔진 해부'가 나올 수도, '네트워크 첫 장'이 나올 수도 있고, 어느 쪽이 나오는지 SQL은 약속하지 않는다. 테스트 데이터에서 우연히 맞는 제목이 나와 통과한 쿼리가 운영 데이터에서 틀린 제목을 보여 주는 일이 생기는 이유다. 오래된 애플리케이션이 이 모드를 끈 채로 운영되고 있다면, 그것은 설정 문제가 아니라 잠재된 결과 오류다.</p>
+
+<h4>함수적 종속성: 값이 하나로 정해지는 열은 써도 된다</h4>
+
+<p>네 번째 항목인 함수적 종속성(functional dependency)은 "X 값이 정해지면 Y 값이 하나로 정해진다"는 관계다. 매뉴얼은 SQL-92까지는 <code>GROUP BY</code>에 없는 집계되지 않은 열을 아예 허용하지 않았고, SQL:1999부터는 그 열이 <code>GROUP BY</code> 열에 함수적으로 종속되면 허용한다고 설명한다. MySQL은 이 종속성을 감지하는 기능을 구현한다. 가장 확실한 근거는 키다. 기본 키로 묶으면 그룹 하나에 행이 하나뿐이니, 그 테이블의 모든 열이 기본 키에 종속된다.</p>
+
+<pre><code class="language-sql">-- 허용된다: order_id가 기본 키이므로 title, customer는 order_id에 종속된다
+SELECT order_id, customer, title, SUM(price * quantity) AS amount
+FROM book_order
+GROUP BY order_id;</code></pre>
+
+<p><code>NOT NULL</code>인 열에 걸린 <code>UNIQUE</code> 인덱스도 기본 키처럼 종속성의 근거가 된다. 반면 NULL을 허용하는 <code>UNIQUE</code> 열은 근거가 되지 못한다. 매뉴얼의 설명대로 그런 인덱스는 NULL 값을 여러 개 허용하므로 유일성이 깨지기 때문이다. NULL 행들이 한 그룹으로 모인다는 앞 절의 사실과 연결하면, NULL 그룹 하나에 서로 다른 행이 여럿 들어갈 수 있다는 뜻이다. 이 감지는 조인으로도 이어진다. 매뉴얼은 두 테이블을 조인한 뒤 한쪽 테이블의 기본 키로 묶으면 그 테이블의 다른 열을 <code>SELECT</code>에 써도 된다는 예를 든다. 조인을 배운 뒤에 "회원 ID로 묶고 회원 이름을 함께 출력하는" 쿼리가 오류 없이 동작하는 이유가 이것이다.</p>
+
+<p>한계도 있다. MySQL이 아는 것은 선언된 키와 조건에서 끌어낼 수 있는 종속성뿐이다. 우리 데이터에서는 같은 제목이 늘 같은 분류에 속하지만(제목 → 분류), 이것은 데이터가 우연히 그런 것이지 스키마가 보장하는 것이 아니다. 그래서 <code>SELECT title, category, COUNT(*) FROM book_order GROUP BY title</code>은 거부된다. 이럴 때 고치는 방법은 두 가지다. 하나는 <code>GROUP BY title, category</code>처럼 열을 묶는 기준에 추가하는 것이다. 종속성이 실제로 성립한다면 그룹은 하나도 늘지 않고, 혹시 성립하지 않는 데이터가 들어오면 그룹이 둘로 나뉘어 문제가 드러난다. 다른 하나는 <code>ANY_VALUE(category)</code>다. 매뉴얼에 따르면 <code>ANY_VALUE()</code>는 집계 함수가 아니며, 인자와 같은 값과 타입을 돌려주되 <code>ONLY_FULL_GROUP_BY</code> 검사만 건너뛰게 한다. "그룹 안의 값이 모두 같다는 것을 내가 안다"고 서버에 말하는 표시이므로, 그 믿음이 틀리면 비결정적인 값이 조용히 나온다. 첫 번째 방법이 더 안전하다.</p>
+
+<h4>GROUP BY 없는 집계에도 같은 규칙이 적용된다</h4>
+
+<p><code>GROUP BY</code>가 없어도 집계 함수를 쓰면 전체가 하나의 그룹이 되므로 규칙은 그대로다.</p>
+
+<pre><code class="language-sql">SELECT title, MAX(price) FROM book_order;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">ERROR 1140 (42000): In aggregated query without GROUP BY, expression #1 of SELECT list contains nonaggregated column 'bookstore.book_order.title'; this is incompatible with sql_mode=only_full_group_by</code></pre>
+
+<p>전체 그룹 하나에 제목이 일곱 종류 있으니 어느 제목을 보여 줄지 정할 수 없다. "가장 비싼 책의 제목"을 원한다면 질문을 두 단계로 나눠야 한다. 먼저 최댓값을 구하고, 그 값과 같은 가격을 가진 행을 찾는 것이다. 이렇게 쿼리 안에 쿼리를 넣는 서브쿼리(subquery)는 이 권의 범위를 넘어서므로 모양만 보여 둔다.</p>
+
+<pre><code class="language-sql">-- 분류별 최고가 주문: 안쪽 쿼리가 바깥 행의 분류에서 최댓값을 구한다
+SELECT o.category, o.order_id, o.title, o.price
+FROM book_order o
+WHERE o.price = (SELECT MAX(i.price) FROM book_order i WHERE i.category = o.category);</code></pre>
+
+<p>이 쿼리는 다섯 행을 돌려준다. IT의 7번(DB 엔진 해부, 40000), 과학의 6번과 10번(별의 지도, 22000), 소설의 3번과 5번(여름의 끝, 15000)이다. 최댓값을 가진 행이 둘인 분류에서는 둘 다 나온다. "분류별로 한 줄"이라는 직관과 다르지만, 이것이 데이터를 정직하게 보여 주는 결과다. <code>GROUP BY</code>의 결과 행은 그룹을 대표하는 요약일 뿐 원래 행 중 하나가 아니라는 점, 그리고 원래 행을 보고 싶으면 요약과 원래 행을 다시 맞대어야 한다는 점을 기억해 두자. 조인과 윈도 함수를 배우면 같은 질문을 다른 방법으로도 풀 수 있다.</p>
+
+<h3>HAVING: 그룹을 거르는 조건 (1)</h3>
+
+<p>이번에는 "주문 금액 합계가 80,000원 이상인 고객"을 찾아보자. 04회에서 배운 대로 조건은 <code>WHERE</code>에 쓰면 될 것 같다.</p>
+
+<pre><code class="language-sql">SELECT customer, SUM(price * quantity) AS sales
+FROM book_order
+WHERE SUM(price * quantity) >= 80000
+GROUP BY customer;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">ERROR 1111 (HY000): Invalid use of group function</code></pre>
+
+<p>"그룹 함수를 잘못 썼다"는 오류다. 매뉴얼은 <code>WHERE</code> 절이 집계 함수를 참조할 수 없다고 정한다. 이유는 <code>WHERE</code>가 일하는 시점에 있다. <code>WHERE</code>는 행을 하나씩 보며 그 행을 남길지 버릴지 정한다. 그 시점에는 아직 그룹이 만들어지지 않았다. 민수의 합계는 민수의 행을 모두 모아야 알 수 있는데, <code>WHERE</code>는 바로 그 행들을 모으기 전에 하나씩 판정하는 단계다. 아직 존재하지 않는 값으로 판정할 수는 없다.</p>
+
+<p>그룹이 만들어지고 집계가 끝난 뒤에 그룹 단위로 거르는 절이 <code>HAVING</code>이다. 매뉴얼의 표현으로 <code>WHERE</code>는 행에 대한 조건을, <code>HAVING</code>은 보통 <code>GROUP BY</code>로 만든 그룹에 대한 조건을 지정하며, <code>HAVING</code>은 <code>WHERE</code>와 달리 집계 함수를 참조할 수 있다.</p>
+
+<pre><code class="language-sql">SELECT customer, SUM(price * quantity) AS sales
+FROM book_order
+GROUP BY customer
+HAVING SUM(price * quantity) >= 80000
+ORDER BY sales DESC;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+----------+-------+
+| customer | sales |
++----------+-------+
+| 지은     | 87000 |
+| 민수     | 85000 |
++----------+-------+</code></pre>
+
+<p>네 고객의 그룹이 모두 만들어진 뒤 <code>HAVING</code>이 그룹마다 조건을 평가한다. 지은(87000)과 민수(85000)는 참, 도윤(72000)과 서연(52000)은 거짓이므로 두 그룹만 남는다. <code>WHERE</code>가 행을 거르는 체라면 <code>HAVING</code>은 그룹을 거르는 체다. 행 단위에서 보면 <code>HAVING</code>은 그룹 전체를 통째로 남기거나 통째로 버린다. 민수의 행 세 개가 하나도 빠짐없이 합계에 들어간 뒤에야 판정이 내려진다는 점이 <code>WHERE</code>와 결정적으로 다르다.</p>
+
+<h4>SELECT에 없는 집계로도 거를 수 있다</h4>
+
+<p><code>HAVING</code>의 조건은 <code>SELECT</code> 목록에 나온 집계일 필요가 없다. "주문을 세 번 이상 한 고객의 매출"은 다음과 같다.</p>
+
+<pre><code class="language-sql">SELECT customer, SUM(price * quantity) AS sales
+FROM book_order
+GROUP BY customer
+HAVING COUNT(*) >= 3
+ORDER BY sales DESC;</code></pre>
+
+<p>결과는 앞과 같이 지은 87000, 민수 85000이다. 이번에는 우연히 같은 두 고객이 남았지만 기준이 다르다. 결과에 <code>COUNT(*)</code> 열이 없어도 서버는 그룹마다 <code>COUNT(*)</code>의 누적 상태를 따로 만들어 <code>HAVING</code> 판정에 쓴다. 누적 상태 모델로 말하면 쿼리에 나오는 모든 집계 함수가 출력 여부와 관계없이 그룹마다 하나씩 상태를 갖는다.</p>
+
+<h4>GROUP BY 없는 HAVING</h4>
+
+<p><code>HAVING</code>은 <code>GROUP BY</code> 없이도 쓸 수 있다. 매뉴얼의 설명대로 <code>GROUP BY</code>가 없으면 모든 행이 암묵적으로 하나의 집계 그룹을 이루므로, <code>HAVING</code>은 그 그룹 하나를 남길지 버릴지 정한다.</p>
+
+<pre><code class="language-sql">SELECT COUNT(*) AS cnt FROM book_order HAVING COUNT(*) > 5;   -- 결과 1행: cnt = 10
+SELECT COUNT(*) AS cnt FROM book_order HAVING COUNT(*) > 20;  -- 결과 0행 (Empty set)</code></pre>
+
+<p>앞에서 "<code>GROUP BY</code> 없는 집계는 행이 없어도 결과가 한 줄"이라고 했는데, <code>HAVING</code>은 그 한 줄마저 없앨 수 있는 유일한 장치다. 그룹이 하나뿐이니 그 그룹이 조건에 걸러지면 결과는 빈 집합이 된다.</p>
+
+<h3>HAVING: 그룹을 거르는 조건 (2) — WHERE와 나눠 쓰기</h3>
+
+<p>실제 쿼리는 <code>WHERE</code>와 <code>HAVING</code>을 함께 쓰는 경우가 많다. "3월 3일 이후 주문만 따져서, 그 기간 주문 금액 합계가 40,000원 이상인 고객을 합계가 큰 순으로" 구해 보자.</p>
+
+<pre><code class="language-sql">SELECT customer, COUNT(*) AS orders, SUM(price * quantity) AS sales
+FROM book_order
+WHERE order_date >= '2024-03-03'
+GROUP BY customer
+HAVING SUM(price * quantity) >= 40000
+ORDER BY sales DESC;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+----------+--------+-------+
+| customer | orders | sales |
++----------+--------+-------+
+| 서연     |      2 | 52000 |
+| 민수     |      1 | 40000 |
++----------+--------+-------+</code></pre>
+
+<p><code>WHERE</code>가 먼저 3월 3일 이후의 여섯 행(5번부터 10번)만 남긴다. 이 여섯 행을 고객별로 묶으면 지은(5번, 10번) 37000, 서연(6번, 9번) 52000, 민수(7번) 40000, 도윤(8번) 36000이다. <code>HAVING</code>이 40000 이상만 남기므로 서연과 민수가 남고, <code>ORDER BY</code>가 큰 순으로 늘어놓는다. 민수의 전체 매출은 85,000원이지만 여기서는 40,000원으로 나왔다. <code>WHERE</code>가 3월 1일과 2일의 민수 주문을 집계 전에 지웠기 때문이다. 이 쿼리의 흐름은 다음 절에서 단계별 중간 결과로 다시 따라간다.</p>
+
+<h4>조건을 어디에 둘 것인가</h4>
+
+<p>조건의 위치를 정하는 규칙은 간단하다. 집계 함수가 들어간 조건은 <code>HAVING</code>에만 쓸 수 있다. 집계 없이 행 하나만 보고 판정할 수 있는 조건은 <code>WHERE</code>에 쓴다. 두 번째 규칙은 문법이 강제하지 않는다. MySQL에서는 묶는 열에 대한 조건을 <code>HAVING customer <> '민수'</code>처럼 써도 결과는 같다. 그래도 매뉴얼은 <code>WHERE</code>에 들어가야 할 항목에 <code>HAVING</code>을 쓰지 말라고 명시한다. 이유도 매뉴얼에 있다. <code>HAVING</code> 절은 거의 마지막에, 결과가 클라이언트로 보내지기 직전에 최적화 없이 적용된다. <code>WHERE</code>에 둔 조건은 묶기 전에 행 수를 줄여 임시 테이블을 작게 만들고, 인덱스로 읽을 범위를 좁히는 데 쓰일 수 있다. <code>HAVING</code>에 둔 같은 조건은 모든 행을 묶고 집계한 다음에야 버린다. 결과는 같아도 일의 양이 다르다.</p>
+
+<p>그런데 조건의 위치가 결과 자체를 바꾸는 경우도 있다. "쿠폰을 쓴 적이 있는 고객"의 매출을 구하는 두 쿼리를 비교해 보자.</p>
+
+<pre><code class="language-sql">-- (가) 쿠폰을 쓴 주문만 남긴 뒤 고객별로 묶는다
+SELECT customer, COUNT(*) AS orders, SUM(price * quantity) AS sales
+FROM book_order
+WHERE coupon IS NOT NULL
+GROUP BY customer
+ORDER BY sales DESC;
+
+-- (나) 모든 주문을 고객별로 묶은 뒤, 쿠폰 사용이 1건 이상인 그룹만 남긴다
+SELECT customer, COUNT(*) AS orders, SUM(price * quantity) AS sales
+FROM book_order
+GROUP BY customer
+HAVING COUNT(coupon) >= 1
+ORDER BY sales DESC;</code></pre>
+
+<pre data-label="실행 결과 (가) — MySQL 8.0.46·8.4.13"><code class="language-text">+----------+--------+-------+
+| customer | orders | sales |
++----------+--------+-------+
+| 서연     |      2 | 52000 |
+| 도윤     |      1 | 36000 |
+| 민수     |      1 | 30000 |
++----------+--------+-------+</code></pre>
+
+<pre data-label="실행 결과 (나) — MySQL 8.0.46·8.4.13"><code class="language-text">+----------+--------+-------+
+| customer | orders | sales |
++----------+--------+-------+
+| 민수     |      3 | 85000 |
+| 도윤     |      2 | 72000 |
+| 서연     |      2 | 52000 |
++----------+--------+-------+</code></pre>
+
+<p>남는 고객은 같은데 숫자가 다르다. (가)의 <code>WHERE</code>는 쿠폰을 쓰지 않은 주문을 집계 전에 지웠으므로, 민수의 매출은 쿠폰을 쓴 1번 주문의 30,000원뿐이다. (나)의 <code>HAVING</code>은 그룹을 통째로 남기거나 버리므로, 남은 민수 그룹에는 세 주문이 모두 들어 있다. (가)는 "쿠폰을 쓴 주문의 매출"을, (나)는 "쿠폰을 쓴 적이 있는 고객의 전체 매출"을 답한다. 둘 다 올바른 쿼리이지만 다른 질문에 대한 답이다. <code>WHERE</code>는 집계 함수가 볼 행을 바꾸고, <code>HAVING</code>은 결과에 남을 그룹을 바꾼다. 이 차이를 의식하지 않으면 질문과 다른 쿼리를 쓰고도 알아채지 못한다.</p>
+
+<h4>HAVING에서 별칭 쓰기</h4>
+
+<p>앞의 쿼리들은 <code>HAVING SUM(price * quantity) >= 80000</code>처럼 식을 반복했다. MySQL에서는 <code>HAVING sales >= 80000</code>처럼 <code>SELECT</code> 목록의 별칭을 써도 된다. 매뉴얼은 이것을 표준 SQL에 대한 MySQL의 확장으로 분류한다. 표준 SQL은 <code>HAVING</code>이 <code>GROUP BY</code>의 열이나 집계 함수 안의 열만 참조하도록 요구한다. 이식성이 중요하면 식을 반복하고, MySQL 전용이면 별칭이 읽기 좋다. 한 가지 함정이 있다. 같은 이름이 <code>GROUP BY</code>의 열 이름이면서 <code>SELECT</code> 목록의 별칭이기도 하면, 매뉴얼에 따라 표준 동작을 우선해 <code>GROUP BY</code>의 열로 해석되고 모호하다는 경고가 난다. 별칭을 테이블의 열 이름과 겹치지 않게 짓는 습관이 이런 혼란을 막는다.</p>
+
+<h4>집계의 집계는 한 번에 할 수 없다</h4>
+
+<p>"고객별 주문 수 가운데 가장 큰 값"을 구하려고 <code>SELECT MAX(COUNT(*)) FROM book_order GROUP BY customer</code>라고 쓰면 역시 <code>ERROR 1111 (HY000): Invalid use of group function</code>이 난다. <code>COUNT(*)</code>는 그룹마다 하나씩 값을 내는데, 그 값들을 다시 모아 <code>MAX</code>를 구하려면 그룹들의 결과를 또 하나의 그룹으로 묶는 두 번째 집계 단계가 필요하다. 쿼리 하나의 <code>GROUP BY</code>는 한 단계뿐이다. 두 단계가 필요하면 첫 단계의 결과를 테이블처럼 감싸야 한다.</p>
+
+<pre><code class="language-sql">SELECT MAX(cnt) AS max_orders
+FROM (SELECT customer, COUNT(*) AS cnt
+      FROM book_order
+      GROUP BY customer) AS per_customer;   -- 결과: max_orders = 3</code></pre>
+
+<p><code>FROM</code> 안의 쿼리가 고객별 주문 수 네 행(3, 3, 2, 2)을 만들고, 바깥 쿼리가 그 네 행을 하나의 그룹으로 보고 최댓값 3을 구한다. 이런 형태를 파생 테이블(derived table)이라고 하며, 매뉴얼은 파생 테이블의 평가도 내부 임시 테이블을 쓰는 경우로 꼽는다. "가장 주문이 많은 고객 한 명"을 원해 <code>ORDER BY COUNT(*) DESC LIMIT 1</code>을 쓰는 방법도 흔한데, 여기에는 동점의 함정이 있다. 민수와 지은이 똑같이 3건이므로 둘 중 누가 나올지는 정해져 있지 않다. 매뉴얼은 <code>LIMIT</code>가 <code>HAVING</code> 뒤에 적용된다고 밝히는데, <code>LIMIT</code>는 순서가 정해진 결과에서 앞의 몇 행을 자를 뿐 동점자 가운데 누구를 고를지는 정하지 않는다. 동점을 모두 보고 싶다면 최댓값을 구한 뒤 그 값과 같은 그룹을 찾는 두 단계 쿼리가 필요하다.</p>
+
+<h3>SQL 실행 순서: 쓰는 순서와 의미가 정해지는 순서</h3>
+
+<p>지금까지 나온 절을 모두 모으면 <code>SELECT</code> 문은 이렇게 쓴다. <code>SELECT</code> → <code>FROM</code> → <code>WHERE</code> → <code>GROUP BY</code> → <code>HAVING</code> → <code>ORDER BY</code> → <code>LIMIT</code>. 이 순서는 문법이 정한 것이고, 바꿔 쓰면 구문 오류가 난다. 그런데 각 절이 "무엇을 입력으로 받아 무엇을 내놓는지"의 순서는 이와 다르다. 04회에서 <code>WHERE</code>, <code>SELECT</code>, <code>ORDER BY</code>, <code>LIMIT</code>의 논리적 처리 순서를 보았는데, 이번 회차에서 <code>GROUP BY</code>와 <code>HAVING</code>이 그 사이에 들어온다.</p>
+
+<p>이 순서를 문서로 가장 명확하게 적어 둔 곳 가운데 하나는 SQL Server의 <code>SELECT</code> 문서다. 그 문서는 이것을 논리적 처리 순서, 또는 바인딩 순서(binding order)라고 부르며, 한 단계에서 정의된 객체가 이후 단계의 절에서 언제 사용 가능해지는지를 이 순서가 정한다고 설명한다. 그 목록에서 이 회차와 관련된 부분만 추리면 <code>FROM</code> → <code>WHERE</code> → <code>GROUP BY</code> → <code>WITH ROLLUP</code> → <code>HAVING</code> → <code>SELECT</code> → <code>DISTINCT</code> → <code>ORDER BY</code> 순이다(SQL Server의 <code>TOP</code>이 맨 끝에 오는데, MySQL에서 그 자리는 <code>LIMIT</code>다). MySQL 매뉴얼에는 이런 목록이 따로 없지만, 앞에서 확인한 매뉴얼의 문장들이 같은 순서를 가리킨다. <code>WHERE</code>에서 열 별칭을 쓸 수 없는 이유는 <code>WHERE</code>가 실행될 때 그 값이 아직 정해지지 않았을 수 있기 때문이고, <code>HAVING</code>은 거의 마지막에 적용되며, <code>LIMIT</code>는 <code>HAVING</code> 뒤에 적용된다.</p>
+
+<figure class="flow-figure"><figcaption>집계 쿼리의 논리적 처리 순서</figcaption><ol class="flow">
+<li><strong>FROM</strong><span>읽을 테이블을 정한다. 이 단계의 결과는 테이블의 모든 행이다.</span></li>
+<li><strong>WHERE</strong><span>행을 하나씩 보며 조건이 참인 행만 남긴다. 그룹도 별칭도 아직 없다.</span></li>
+<li><strong>GROUP BY</strong><span>남은 행을 묶는 기준의 값으로 나누고, 그룹마다 집계 함수의 값을 계산한다.</span></li>
+<li><strong>HAVING</strong><span>그룹마다 조건을 평가해 참인 그룹만 남긴다. 집계 값을 쓸 수 있다.</span></li>
+<li><strong>SELECT</strong><span>남은 그룹마다 출력할 식을 계산하고 별칭을 붙인다. DISTINCT가 있으면 이어서 중복을 지운다.</span></li>
+<li><strong>ORDER BY</strong><span>결과 행을 정렬한다. SELECT에서 붙인 별칭을 쓸 수 있다.</span></li>
+<li><strong>LIMIT</strong><span>정렬된 결과에서 정해진 수의 행만 잘라 낸다.</span></li>
+</ol></figure>
+
+<h4>앞의 쿼리를 단계별로 따라가기</h4>
+
+<p>앞 절에서 본 "3월 3일 이후, 고객별 합계 40,000원 이상" 쿼리를 이 순서대로 실행하며 각 단계의 중간 결과를 그려 보자. 끝에 <code>LIMIT 1</code>이 붙었다고 가정하고 마지막 단계까지 간다.</p>
+
+<pre class="diagram">① FROM book_order                         → 10행 (주문 1~10)
+
+② WHERE order_date >= '2024-03-03'        → 6행
+   5 지은 15000 │ 6 서연 22000 │ 7 민수 40000 │ 8 도윤 36000 │ 9 서연 30000 │ 10 지은 22000
+
+③ GROUP BY customer (+ 그룹마다 COUNT(*), SUM(price*quantity) 계산)  → 4그룹
+   지은 {5, 10}  COUNT 2  SUM 37000
+   서연 {6, 9}   COUNT 2  SUM 52000
+   민수 {7}      COUNT 1  SUM 40000
+   도윤 {8}      COUNT 1  SUM 36000
+
+④ HAVING SUM(price*quantity) >= 40000     → 2그룹
+   서연 52000 (참)   민수 40000 (참)   지은 37000 (거짓)   도윤 36000 (거짓)
+
+⑤ SELECT customer, COUNT(*) AS orders, SUM(...) AS sales   → 열 3개, 별칭 orders·sales가 여기서 생긴다
+
+⑥ ORDER BY sales DESC                      → 서연(52000), 민수(40000)
+
+⑦ LIMIT 1                                  → 서연(52000) 한 행</pre>
+
+<x-visual id="db-intro-06-logical-order" title="집계 쿼리의 논리적 처리 순서와 단계마다 줄어드는 중간 결과" kind="순서도" ratio="16:9">
+<x-hint>FROM에서 LIMIT까지 일곱 단계를 왼쪽에서 오른쪽으로 놓고, 단계마다 중간 결과의 행 또는 그룹 수가 줄어드는 모습을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 가로 순서도. 왼쪽에서 오른쪽으로 일곱 개의 둥근 사각형이 화살표로 이어진다. 라벨은 차례로 "FROM", "WHERE", "GROUP BY", "HAVING", "SELECT", "ORDER BY", "LIMIT". 각 사각형 아래에 작은 막대 모양의 표가 있고, 표의 높이가 점점 줄어든다. 첫째 아래에 "10행", 둘째 아래에 "6행", 셋째 아래에는 네 개의 작은 상자 묶음과 "4그룹", 넷째 아래에 "2그룹", 다섯째 아래에 "별칭 생성", 여섯째 아래에 "정렬", 일곱째 아래에 "1행". WHERE와 HAVING 사각형은 같은 주황색 테두리로 강조하고, GROUP BY 사각형은 파란색. 평면적이고 차분한 색조, 고딕체 한국어 라벨.</x-prompt>
+<x-caption>각 절은 앞 단계의 결과를 입력으로 받는다. WHERE는 행을, HAVING은 그룹을 거른다.</x-caption>
+</x-visual>
+
+<h4>이 순서에서 나오는 규칙들</h4>
+
+<p>논리적 처리 순서를 알면 외워야 할 것처럼 보이던 규칙들이 한 원리로 정리된다. 어떤 절은 자기보다 앞 단계에서 만들어진 것만 쓸 수 있다.</p>
+
+<ul>
+<li><code>WHERE</code>에서 집계 함수를 쓸 수 없다. 집계 값은 ③에서 생기는데 <code>WHERE</code>는 ②다(ERROR 1111).</li>
+<li><code>WHERE</code>에서 <code>SELECT</code>의 별칭을 쓸 수 없다. 별칭은 ⑤에서 생긴다. <code>SELECT price * quantity AS amount FROM book_order WHERE amount >= 40000</code>은 <code>ERROR 1054 (42S22): Unknown column 'amount' in 'where clause'</code>로 실패한다. 식을 <code>WHERE price * quantity >= 40000</code>처럼 다시 써야 한다.</li>
+<li><code>HAVING</code>은 집계 값을 쓸 수 있다. 집계 값은 ③에서 이미 계산되었다.</li>
+<li><code>ORDER BY</code>는 별칭과 집계를 모두 쓸 수 있다. 둘 다 ⑥보다 앞에서 만들어졌다.</li>
+<li><code>LIMIT</code>는 모든 거르기와 정렬이 끝난 뒤의 행 수를 자른다. <code>HAVING</code>으로 걸러진 그룹은 <code>LIMIT</code>의 개수에 들어가지 않는다.</li>
+</ul>
+
+<p>MySQL이 <code>GROUP BY</code>와 <code>HAVING</code>에서 별칭을 허용하는 것은 이 원리의 예외처럼 보인다. 별칭은 ⑤에서 생기는데 ③과 ④에서 쓸 수 있기 때문이다. 이것은 <code>SELECT</code>가 먼저 실행된다는 뜻이 아니다. 매뉴얼은 <code>GROUP BY</code>의 별칭을 "열 식(column expression)으로 간주한다"고 설명한다. 서버가 별칭을 보면 그 이름이 가리키는 <code>SELECT</code> 목록의 식으로 바꿔 읽는다는 뜻이다. <code>band</code>라는 이름 뒤에는 <code>FLOOR(price / 10000) * 10000</code>이라는 식이 있고, 그 식은 행의 열만으로 계산되니 ③에서 계산하는 데 문제가 없다. 별칭은 사람을 위한 편의이고, 처리 순서 자체는 바뀌지 않는다. <code>WHERE</code>에는 이 편의가 주어지지 않았다는 점이 그 증거다.</p>
+
+<h4>논리적 순서와 물리적 실행은 다르다</h4>
+
+<p>논리적 처리 순서는 쿼리의 의미를 정의할 뿐, 서버가 실제로 그 순서대로 일한다는 약속이 아니다. SQL Server 문서도 실제 물리적 실행은 쿼리 처리기가 정하며 순서가 이 목록과 다를 수 있다고 밝힌다. MySQL에서도 마찬가지다. 앞 절의 촘촘한 인덱스 스캔은 인덱스를 읽는 동안 묶기와 집계를 함께 하며, 결과가 이미 원하는 순서라면 정렬을 따로 하지 않는다. 느슨한 인덱스 스캔은 ① 단계에서 행을 전부 읽지조차 않는다. 그래도 결과는 논리적 순서대로 처리했을 때와 같아야 한다. 옵티마이저는 결과를 바꾸지 않는 범위 안에서만 순서를 바꾸거나 단계를 합친다. 그래서 쿼리를 쓸 때는 논리적 순서로 의미를 생각하고, 성능을 볼 때는 <code>EXPLAIN</code>으로 물리적 실행을 확인하는 것이 올바른 분업이다. 매뉴얼이 <code>HAVING</code>에 대해서만 "최적화 없이" 적용된다고 굳이 적어 둔 것도 이 맥락에서 읽힌다. 옵티마이저가 <code>WHERE</code>의 조건은 인덱스와 엮어 앞당겨 쓸 수 있지만, <code>HAVING</code>에 둔 조건은 그 기회를 얻지 못한다.</p>
+
+<h3>WITH ROLLUP: 소계와 총계를 한 번에</h3>
+
+<p>분류별 매출을 보고 나면 "그래서 전체는 얼마인가"를 함께 보고 싶어진다. 별도의 쿼리를 하나 더 실행해도 되지만, MySQL은 <code>GROUP BY</code>에 <code>WITH ROLLUP</code> 수식어를 두어 더 높은 수준의 요약 행, 즉 상위 집계(super-aggregate) 행을 결과에 덧붙일 수 있게 한다.</p>
+
+<pre><code class="language-sql">SELECT IF(GROUPING(category) = 1, '전체', category) AS label,
+       COUNT(*)              AS orders,
+       SUM(price * quantity) AS sales
+FROM book_order
+GROUP BY category WITH ROLLUP
+ORDER BY GROUPING(category), sales DESC;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+-------+--------+--------+
+| label | orders | sales  |
++-------+--------+--------+
+| IT    |      4 | 150000 |
+| 과학  |      3 |  80000 |
+| 소설  |      3 |  66000 |
+| 전체  |     10 | 296000 |
++-------+--------+--------+</code></pre>
+
+<p>마지막 행이 상위 집계 행이다. 상위 집계 행에서 <code>category</code> 열의 값은 NULL로 채워진다. 매뉴얼은 이 NULL이 행을 클라이언트로 보낼 때 만들어진다고 설명한다. 그런데 <code>region</code>처럼 원래 데이터에도 NULL이 있는 열로 묶으면 문제가 생긴다. 원래의 NULL 그룹과 총계 행이 둘 다 NULL로 보인다. 이 둘을 구별하려고 있는 함수가 <code>GROUPING()</code>이다. <code>GROUPING(열)</code>은 그 행의 NULL이 상위 집계 때문에 생긴 것이면 1, 아니면 0을 돌려준다.</p>
+
+<pre><code class="language-sql">SELECT region, GROUPING(region) AS is_total, COUNT(*) AS orders
+FROM book_order
+GROUP BY region WITH ROLLUP
+ORDER BY GROUPING(region), orders DESC;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+--------+----------+--------+
+| region | is_total | orders |
++--------+----------+--------+
+| 서울   |        0 |      4 |
+| 부산   |        0 |      3 |
+| NULL   |        0 |      2 |
+| 대구   |        0 |      1 |
+| NULL   |        1 |     10 |
++--------+----------+--------+</code></pre>
+
+<p>NULL이 두 번 나오지만 <code>is_total</code>로 구별된다. 위의 NULL은 지역이 없는 주문 두 건의 그룹이고, 아래의 NULL은 열 건 전체의 총계다. 매뉴얼이 밝히는 버전 조건이 하나 있다. MySQL 8.0.12 전에는 <code>ROLLUP</code>과 <code>ORDER BY</code>를 함께 쓸 수 없었고, 8.0.12부터 함께 쓸 수 있게 되면서 <code>ORDER BY</code>에 <code>GROUPING()</code>을 써서 총계 행의 위치를 정할 수 있다. 위 두 쿼리가 그 기능을 쓴 것이다. 열을 둘 이상 쓰면 <code>ROLLUP</code>은 오른쪽 열부터 하나씩 걷어 내며 소계를 만든다. <code>GROUP BY category, customer WITH ROLLUP</code>은 앞에서 본 아홉 그룹에 분류별 소계 세 행과 총계 한 행을 더해 열세 행을 돌려준다. 논리적 처리 순서에서 <code>ROLLUP</code>이 <code>GROUP BY</code> 바로 뒤, <code>HAVING</code> 앞에 놓이는 것도 기억해 두자. 상위 집계 행도 <code>HAVING</code>의 판정을 받는다.</p>
+
+<h3>흔한 오해 바로잡기</h3>
+
+<h4>"COUNT(열)은 행의 수다"</h4>
+<p><code>COUNT(열)</code>은 그 열이 NULL이 아닌 행의 수다. 우리 데이터에서 <code>COUNT(*)</code>는 10이지만 <code>COUNT(coupon)</code>은 4, <code>COUNT(region)</code>은 8이다. 행의 수가 필요하면 <code>COUNT(*)</code>를 쓴다. 나중에 조인을 배우면 이 차이가 더 중요해진다. 짝이 없는 행이 NULL로 채워지는 외부 조인에서 "짝이 있는 행의 수"를 세는 표준적인 방법이 <code>COUNT(열)</code>이기 때문이다.</p>
+
+<h4>"AVG는 NULL을 0으로 계산한다"</h4>
+<p>NULL은 분자와 분모에서 모두 빠진다. <code>AVG(coupon)</code>은 2250이고, NULL을 0으로 보는 평균 900을 원하면 <code>AVG(COALESCE(coupon, 0))</code>처럼 명시해야 한다. 어느 쪽이 맞는지는 질문이 정한다.</p>
+
+<h4>"합계할 행이 없으면 SUM은 0이다"</h4>
+<p>행이 없거나 모두 NULL이면 <code>SUM</code>은 NULL이다. 0이 되는 것은 <code>COUNT</code>뿐이다. 고객별 집계에서 지은의 <code>SUM(coupon)</code>이 NULL이었던 것이 그 예다.</p>
+
+<h4>"GROUP BY를 하면 결과가 정렬되어 나온다"</h4>
+<p>MySQL 5.7 이하에서는 특정 조건에서 그랬지만 8.0에서는 그렇지 않다. 결과의 순서가 필요하면 반드시 <code>ORDER BY</code>를 쓴다. 지금 정렬되어 나오는 것처럼 보여도 실행 계획이 바뀌면 순서도 바뀔 수 있다.</p>
+
+<h4>"COUNT(1)이 COUNT(*)보다 빠르다"</h4>
+<p>InnoDB는 둘을 같은 방식으로 처리하며 성능 차이가 없다고 매뉴얼이 밝힌다. 의도를 드러내는 <code>COUNT(*)</code>를 쓰면 된다.</p>
+
+<h4>"테이블의 행 수는 데이터베이스가 이미 알고 있다"</h4>
+<p>InnoDB는 트랜잭션마다 보이는 행이 다르기 때문에 행 수를 따로 저장하지 않고, <code>COUNT(*)</code>를 할 때마다 인덱스를 훑는다. 큰 테이블의 전체 개수는 공짜가 아니다.</p>
+
+<h4>"HAVING은 집계용 WHERE일 뿐이다"</h4>
+<p>둘은 일하는 단계가 다르다. <code>WHERE</code>는 집계 함수가 볼 행을 바꾸고, <code>HAVING</code>은 집계가 끝난 그룹을 통째로 남기거나 버린다. 앞에서 (가)와 (나) 두 쿼리가 같은 고객을 남기고도 다른 매출을 보인 것이 그 차이다.</p>
+
+<h4>"MAX를 구하면 그 행의 다른 열도 같이 꺼낼 수 있다"</h4>
+<p>집계 함수는 값 하나를 만들 뿐 행을 가리키지 않는다. <code>ONLY_FULL_GROUP_BY</code>가 그런 쿼리를 막는 것은 고집이 아니라, 막지 않으면 비결정적인 값이 나오기 때문이다. 최댓값을 가진 행을 원하면 최댓값을 구한 뒤 그 값으로 행을 다시 찾아야 하고, 동점이 있으면 여러 행이 나온다는 것까지 받아들여야 한다.</p>
+
+<h3>적용 연습: 질문에서 쿼리까지</h3>
+
+<p>집계 쿼리를 쓸 때 막히는 지점은 대개 문법이 아니라 질문을 절로 나누는 단계다. 다음 순서로 질문을 분해하면 각 절에 무엇을 쓸지가 정해진다.</p>
+
+<ol>
+<li><b>결과 한 행이 무엇을 뜻하는가.</b> "날짜별", "고객별", "분류와 고객의 조합별"처럼 결과의 단위를 정한다. 이것이 <code>GROUP BY</code>다. "전체 하나"라면 <code>GROUP BY</code>가 없다.</li>
+<li><b>집계 전에 빠져야 할 행은 무엇인가.</b> 행 하나만 보고 판단할 수 있는 조건은 <code>WHERE</code>로 간다.</li>
+<li><b>그룹마다 무엇을 계산하는가.</b> 집계 함수를 고르고, 대상 열에 NULL이 있다면 빼는 것이 질문의 뜻인지 정한다.</li>
+<li><b>어떤 그룹만 보고 싶은가.</b> 집계 값에 대한 조건은 <code>HAVING</code>으로 간다.</li>
+<li><b>어떤 순서로, 몇 개를 보여 줄 것인가.</b> <code>ORDER BY</code>와 <code>LIMIT</code>를 붙이고, 자르는 경계에 동점이 있는지 확인한다.</li>
+</ol>
+
+<p>첫 번째 질문: "매출이 가장 많았던 날 세 개를, 그날의 주문 수와 함께 보여 달라." 결과의 단위는 날짜이고, 걸러 낼 행은 없으며, 그룹마다 주문 수와 매출을 구하고, 매출 순으로 세 개를 자른다.</p>
+
+<pre><code class="language-sql">SELECT order_date, COUNT(*) AS orders, SUM(price * quantity) AS sales
+FROM book_order
+GROUP BY order_date
+ORDER BY sales DESC
+LIMIT 3;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+------------+--------+-------+
+| order_date | orders | sales |
++------------+--------+-------+
+| 2024-03-01 |      2 | 80000 |
+| 2024-03-04 |      2 | 76000 |
+| 2024-03-05 |      2 | 52000 |
++------------+--------+-------+</code></pre>
+
+<p>날짜별 매출은 3월 1일 80000, 2일 51000, 3일 37000, 4일 76000, 5일 52000이다. 세 번째(52000)와 네 번째(51000)가 다르므로 <code>LIMIT 3</code>의 경계에 동점이 없고, 결과는 결정적이다. 만약 2일의 매출도 52000이었다면 5일과 2일 가운데 어느 쪽이 나올지 정해지지 않으므로, <code>ORDER BY sales DESC, order_date</code>처럼 두 번째 정렬 기준을 주어야 한다.</p>
+
+<p>두 번째 질문: "IT를 제외한 분류에서, 서로 다른 고객 두 명 이상이 산 책의 제목과 팔린 권수." 결과의 단위는 제목이다. 분류 조건은 행 하나로 판단되므로 <code>WHERE</code>로 가고, "서로 다른 고객 두 명 이상"은 그룹의 집계 값이므로 <code>HAVING</code>으로 간다. 같은 고객이 같은 책을 두 번 산 경우를 두 명으로 세지 않으려면 <code>COUNT(*)</code>가 아니라 <code>COUNT(DISTINCT customer)</code>가 맞다.</p>
+
+<pre><code class="language-sql">SELECT title, COUNT(DISTINCT customer) AS buyers, SUM(quantity) AS books
+FROM book_order
+WHERE category <> 'IT'
+GROUP BY title
+HAVING COUNT(DISTINCT customer) >= 2
+ORDER BY title;</code></pre>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">+--------------+--------+-------+
+| title        | buyers | books |
++--------------+--------+-------+
+| 별의 지도    |      2 |     2 |
+| 여름의 끝    |      2 |     2 |
++--------------+--------+-------+</code></pre>
+
+<p><code>WHERE</code>가 IT 네 주문을 지운 뒤 남은 여섯 행은 여름의 끝(민수, 지은), 바다 쪽 창문(도윤), 별의 지도(서연, 지은), 세포의 시간(도윤)의 네 그룹이 된다. 구매자가 두 명인 두 그룹만 <code>HAVING</code>을 통과한다. '자료구조 산책'도 두 명(민수, 서연)이 샀지만 IT 분류라서 <code>WHERE</code> 단계에서 이미 빠졌다.</p>
+
+<h3>다음으로 이어지는 것</h3>
+
+<p>이 회차의 내용은 이후 여러 곳에서 다시 쓰인다. 조인을 배우면 <code>GROUP BY</code>는 "회원별 주문 수"처럼 두 테이블에 걸친 질문에 쓰이고, 이때 앞에서 본 함수적 종속성 덕분에 회원의 기본 키로 묶고 회원 이름을 함께 출력할 수 있다. 서브쿼리와 파생 테이블은 "집계의 집계"와 "최댓값을 가진 행 찾기"를 푸는 도구다. MySQL 8.0에서는 매뉴얼의 표현대로 대부분의 집계 함수를 <code>OVER</code> 절과 함께 윈도 함수로 쓸 수 있는데, 이렇게 쓰면 행을 하나로 접지 않고 원래 행을 그대로 둔 채 그룹의 집계 값을 옆에 붙인다. 이 회차의 "그룹 한 줄에 담을 수 없는 열" 문제를 다른 방향에서 푸는 방법이다.</p>
+
+<p>성능 쪽에서는 인덱스 설계와 이어진다. 자주 묶는 열을 인덱스의 왼쪽에 두면 임시 테이블 없이 그룹을 만들 수 있고, <code>MIN</code>, <code>MAX</code>만 필요한 집계는 느슨한 인덱스 스캔으로 그룹마다 한 항목만 읽을 수 있다. 실행 계획에서 <code>Using temporary</code>와 <code>Using index for group-by</code>를 읽는 법은 인덱스와 옵티마이저를 깊이 다룰 때 다시 만난다.</p>
+
+<p>JPA로 넘어가도 같은 규칙이 그대로 적용된다. JPQL도 <code>GROUP BY</code>, <code>HAVING</code>, 집계 함수를 지원하며, 결국 이 회차에서 본 SQL로 번역되어 실행된다. 스프링 데이터의 페이지 조회가 내용 조회와 별도로 전체 개수를 세는 카운트 쿼리를 실행한다는 점도 기억해 두자. 그 카운트 쿼리도 결국 이 회차에서 본 InnoDB의 <code>COUNT</code> 집계이고, 큰 테이블에서 페이지 조회가 느려지는 원인이 목록이 아니라 개수 세기에 있는 경우가 적지 않다. 마지막으로, <code>COUNT(*)</code>가 "현재 트랜잭션에 보이는 행"만 센다는 사실은 트랜잭션 격리 수준을 배울 때 같은 쿼리가 언제 다른 숫자를 내는지 설명하는 출발점이 된다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>집계 함수</dt><dd>행의 집합을 받아 값 하나를 돌려준다. 함수마다 누적 상태(개수, 합계, 최댓값 등)를 두고 행을 하나씩 반영한다. GROUP BY가 없으면 모든 행이 하나의 그룹이다.</dd>
+<dt>집계와 NULL</dt><dd>COUNT(*)를 뺀 집계 함수는 NULL을 입력에서 지운다. 0으로 보는 것이 아니므로 COUNT와 AVG의 결과가 달라진다. 입력이 없으면 COUNT는 0, SUM·AVG·MIN·MAX는 NULL이다.</dd>
+<dt>결과 타입</dt><dd>COUNT는 BIGINT, 정수와 DECIMAL의 SUM·AVG는 DECIMAL이며 INT의 AVG는 decimal(14,4)라 소수 넷째 자리까지 나온다.</dd>
+<dt>GROUP BY</dt><dd>묶는 기준의 값(조합)이 같은 행을 한 그룹으로 모아, 그룹마다 결과 행 하나를 만든다. 데이터에 나타난 조합만 그룹이 되고, NULL은 하나의 그룹으로 모인다.</dd>
+<dt>그룹을 만드는 방법</dt><dd>MySQL은 내부 임시 테이블(Using temporary), 정렬된 인덱스를 순서대로 읽는 촘촘한 인덱스 스캔, 그룹마다 건너뛰는 느슨한 인덱스 스캔(Using index for group-by) 가운데 하나를 쓴다. 8.0의 GROUP BY는 정렬을 약속하지 않는다.</dd>
+<dt>ONLY_FULL_GROUP_BY</dt><dd>MySQL 8.0 기본 SQL 모드에 포함된다. SELECT, HAVING, ORDER BY에 묶는 기준도 집계도 아니고 함수적으로 종속되지도 않은 열이 오면 거부한다. 끄면 그룹에서 아무 값이나 비결정적으로 나온다.</dd>
+<dt>WHERE와 HAVING</dt><dd>WHERE는 묶기 전에 행을 거르므로 집계 함수를 쓸 수 없고, HAVING은 집계가 끝난 그룹을 거른다. 행 조건은 WHERE에 두며, 둘의 위치는 집계 결과 자체를 바꿀 수 있다.</dd>
+<dt>논리적 처리 순서</dt><dd>FROM → WHERE → GROUP BY(ROLLUP) → HAVING → SELECT(DISTINCT) → ORDER BY → LIMIT. 각 절은 앞 단계가 만든 것만 쓸 수 있으며, 실제 실행은 결과가 같은 범위에서 옵티마이저가 정한다.</dd>
+<dt>WITH ROLLUP</dt><dd>그룹 결과에 소계와 총계 행을 덧붙인다. 상위 집계 행의 NULL과 데이터의 NULL은 GROUPING()으로 구별한다.</dd>
+</x-summary>
+
+<x-review>
+<p>집계 쿼리의 오류는 대부분 예외가 아니라 그럴듯한 숫자로 나타난다. 쿠폰 평균이 2.5배 부풀려지거나, 쿠폰을 쓴 고객의 매출이 쿠폰 주문의 매출로 바뀌거나, 최고가 책의 제목이 다른 책의 제목으로 찍혀도 쿼리는 성공한다. 그래서 집계 쿼리를 검토할 때는 문법보다 세 가지를 먼저 본다. 집계 대상 열에 NULL이 들어갈 수 있는가, 조건이 행을 거르는가 그룹을 거르는가, 결과 행 하나가 정확히 무엇을 뜻하는가. 이 세 질문에 답하지 못하는 쿼리는 숫자가 맞아 보여도 신뢰할 수 없다.</p>
+<p>운영 환경에서 <code>ONLY_FULL_GROUP_BY</code>를 끄자는 요구가 나올 때가 있다. 오래된 쿼리가 8.0으로 올리면서 오류를 내기 시작했다는 이유가 대부분이다. 그 오류는 쿼리가 원래부터 비결정적인 값을 보여 주고 있었다는 신호이므로, 모드를 끄기보다 쿼리를 고치는 쪽이 맞다. 그룹 안에서 값이 하나로 정해진다는 것이 스키마로 보장되면 키를 기준으로 묶고, 데이터로만 성립한다면 묶는 열에 추가하거나 <code>ANY_VALUE()</code>로 의도를 드러낸다. 같은 이유로 <code>GROUP BY</code>의 암묵적 정렬에 기대던 화면도 8.0 이전 버전에서 올라올 때 점검 대상이다.</p>
+<p>성능 문제로 집계 쿼리를 볼 때는 <code>EXPLAIN</code>의 <code>Extra</code> 열이 출발점이다. <code>Using temporary</code>가 보이면 그룹의 수와 임시 테이블의 크기를 생각하고, 묶는 열이 인덱스의 왼쪽 접두를 이루도록 설계할 수 있는지 따져 본다. 판단이 달라지는 조건도 있다. 그룹의 수가 적고 행이 많으면 <code>WHERE</code>로 행을 줄이는 것이 효과가 크고, 그룹의 수가 많으면 임시 테이블 자체가 부담이 된다. 화면마다 전체 개수를 보여 주는 페이지 조회가 느리다면 목록 쿼리보다 카운트 쿼리를 먼저 의심하고, 정확한 전체 개수가 정말 필요한지부터 묻는 것이 InnoDB의 <code>COUNT(*)</code> 구조를 아는 사람의 판단이다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 쿼리의 결과 한 행을 예측하라. <code>SELECT COUNT(*), COUNT(region), COUNT(DISTINCT region), AVG(coupon), SUM(coupon) FROM book_order WHERE category = '소설';</code> 이어서 같은 쿼리에 <code>WHERE customer = '하늘'</code>을 쓴 경우와, 그 쿼리에 <code>GROUP BY customer</code>를 붙인 경우의 결과도 각각 예측하라.</li>
+<li><code>SELECT customer, region, COUNT(*) FROM book_order GROUP BY customer, region;</code>은 몇 행을 돌려주는가? 각 그룹에 어떤 주문이 들어가는지 적고, NULL이 들어간 그룹이 있다면 그 그룹에서 <code>COUNT(region)</code>은 얼마인지 답하라.</li>
+<li>어떤 시스템이 <code>ONLY_FULL_GROUP_BY</code>를 끈 채로 <code>SELECT category, title, MAX(price) FROM book_order GROUP BY category ORDER BY MAX(price) DESC;</code>를 실행해 "분류별 최고가 책"을 화면에 보여 주고 있다. 이 화면이 틀린 제목을 보여 줄 수 있는 이유를 설명하고, 올바른 결과를 얻는 방법을 제시하라.</li>
+<li>다음 두 쿼리의 결과를 각각 구하고, 각 쿼리가 어떤 질문에 대한 답인지 한 문장으로 설명하라. (A) <code>SELECT customer FROM book_order WHERE price >= 20000 GROUP BY customer HAVING COUNT(*) >= 2;</code> (B) <code>SELECT customer FROM book_order GROUP BY customer HAVING COUNT(*) >= 2 AND MIN(price) >= 20000;</code></li>
+<li>동료가 <code>SELECT customer, price * quantity AS amount FROM book_order WHERE amount >= 40000;</code>을 실행하고 오류를 받았다. 오류의 원인을 논리적 처리 순서로 설명하고, 같은 쿼리의 <code>ORDER BY amount</code>는 왜 문제가 없는지도 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 소설은 3, 4, 5번 주문이다. <code>COUNT(*)</code>는 3이다. <code>region</code>은 서울, NULL, 부산이므로 <code>COUNT(region)</code>은 2, <code>COUNT(DISTINCT region)</code>도 2다. <code>coupon</code>은 NULL, 1000, NULL이므로 NULL이 아닌 값은 1000 하나뿐이고 <code>AVG(coupon)</code>은 <code>1000.0000</code>, <code>SUM(coupon)</code>은 1000이다. NULL 두 개가 평균의 분모에서도 빠졌기 때문에 평균이 1000이 된다. 고객 '하늘'은 없으므로 <code>GROUP BY</code> 없는 쿼리는 전체가 하나의 빈 그룹이 되어 한 행(0, 0, 0, NULL, NULL)을 돌려준다. <code>COUNT</code> 계열 셋은 0이고 나머지는 NULL이다. <code>GROUP BY customer</code>를 붙이면 만들어질 그룹이 하나도 없으므로 결과는 빈 집합(0행)이다.</p>
+<p><b>2.</b> 여섯 행이다. 민수는 서울(1, 3번)과 NULL(7번) 두 그룹, 지은은 부산(2, 5, 10번) 한 그룹, 도윤은 NULL(4번)과 대구(8번) 두 그룹, 서연은 서울(6, 9번) 한 그룹이다. (민수, NULL)과 (도윤, NULL)은 서로 다른 그룹이다. 조합이 같아야 같은 그룹이고, 고객 값이 다르기 때문이다. 두 NULL 그룹에서 <code>COUNT(*)</code>는 각각 1이지만 <code>COUNT(region)</code>은 0이다. 묶는 기준으로서의 NULL은 그룹을 만들지만, 집계 함수는 여전히 NULL을 건너뛴다.</p>
+<p><b>3.</b> 모드가 꺼져 있으면 MySQL은 각 그룹에서 <code>title</code> 값을 아무것이나 고를 수 있고, 그 선택은 비결정적이다. <code>MAX(price)</code>는 최댓값이라는 값 하나만 만들 뿐 그 값을 가진 행을 가리키지 않으므로, 나온 제목이 최고가 행의 제목이라는 보장이 없다. <code>ORDER BY</code>는 값이 선택된 뒤에 결과를 정렬할 뿐 그룹 안에서 어떤 값을 고를지에는 영향을 주지 못한다. 올바른 방법은 최댓값과 행을 다시 맞대는 것이다. 예를 들어 본문의 서브쿼리 <code>WHERE o.price = (SELECT MAX(i.price) FROM book_order i WHERE i.category = o.category)</code>를 쓰면 IT는 DB 엔진 해부, 과학은 별의 지도 두 주문, 소설은 여름의 끝 두 주문이 나온다. 동점이 있으면 여러 행이 나온다는 것까지 화면 설계에 반영해야 한다.</p>
+<p><b>4.</b> (A) <code>WHERE</code>가 먼저 가격 20,000원 이상인 1, 2, 6, 7, 9, 10번만 남긴다. 고객별로 묶으면 민수 {1, 7}, 지은 {2, 10}, 서연 {6, 9}로 모두 2건이라 세 고객(민수, 지은, 서연)이 나온다. "2만 원 이상 주문이 두 건 이상인 고객"에 대한 답이다. (B) 모든 주문을 묶은 뒤 그룹을 거른다. 민수와 지은은 3건이지만 최저가가 15,000원이라 탈락하고, 도윤은 최저가 12,000원이라 탈락하며, 서연만 2건에 최저가 22,000원으로 남는다. "주문이 두 건 이상이고 모든 주문이 2만 원 이상인 고객"에 대한 답이다. <code>WHERE</code>는 집계가 볼 행을 줄이고, <code>HAVING</code>은 그룹 전체를 기준으로 판정하기 때문에 답이 달라진다.</p>
+<p><b>5.</b> <code>amount</code>라는 별칭은 논리적 처리 순서의 <code>SELECT</code> 단계에서 생기는데, <code>WHERE</code>는 그보다 앞 단계다. <code>WHERE</code>가 행을 판정하는 시점에는 그 이름이 존재하지 않으므로 MySQL은 <code>ERROR 1054 (42S22): Unknown column 'amount' in 'where clause'</code>를 낸다. 매뉴얼도 <code>WHERE</code>가 실행될 때 열 값이 아직 정해지지 않았을 수 있어 별칭을 참조할 수 없다고 설명한다. <code>WHERE price * quantity >= 40000</code>처럼 식을 다시 써야 한다. <code>ORDER BY</code>는 <code>SELECT</code> 뒤의 단계이므로 이미 만들어진 별칭을 쓸 수 있다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>book_order 테이블에서 coupon은 10행 가운데 4행만 값이 있고(합계 9000) 나머지는 NULL이다. <code>SELECT AVG(coupon) FROM book_order;</code>의 결과는?</q>
+<o>900.0000 — NULL을 0으로 보고 10행으로 나눈다</o>
+<o>2250.0000 — NULL인 행을 분자와 분모 모두에서 뺀다</o>
+<o>NULL — NULL이 하나라도 있으면 결과가 NULL이 된다</o>
+<o>2250 — 정수 열의 평균이므로 정수로 나온다</o>
+<why>집계 함수는 NULL을 0으로 바꾸지 않고 입력에서 지운다. 남은 네 값의 평균이 9000 / 4 = 2250이고, INT 인자의 AVG 결과 타입은 decimal(14,4)라 2250.0000으로 나온다. 900은 AVG(IFNULL(coupon, 0))의 결과이고, NULL 하나 때문에 결과 전체가 NULL이 되는 것은 산술 연산(+, *)의 규칙이지 집계 함수의 규칙이 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>조건에 맞는 행이 하나도 없을 때 <code>SELECT COUNT(*), SUM(price) FROM book_order WHERE price > 100000;</code>의 결과로 옳은 것은?</q>
+<o>빈 집합(0행)</o>
+<o>한 행: 0, 0</o>
+<o>한 행: 0, NULL</o>
+<o>한 행: NULL, NULL</o>
+<why>GROUP BY가 없으면 모든 행이 하나의 그룹이고, 그 그룹은 행이 0개여도 존재하므로 결과 행이 하나 나온다. 그 안에서 COUNT는 0을, SUM은 NULL을 돌려준다. 빈 집합이 되는 것은 같은 조건에 GROUP BY를 붙였을 때다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>WHERE SUM(price * quantity) >= 80000</code>이 ERROR 1111(Invalid use of group function)을 내는 가장 근본적인 이유는?</q>
+<o>WHERE는 그룹이 만들어지기 전에 행을 하나씩 판정하는 단계라서, 그 시점에는 집계 값이 존재하지 않는다</o>
+<o>MySQL이 WHERE 절에서 함수 호출을 일절 허용하지 않는다</o>
+<o>SUM 안에 곱셈 같은 식을 쓸 수 없다</o>
+<o>WHERE 절에 쓴 조건은 인덱스를 쓸 수 있어야 하는데 SUM은 인덱스를 쓸 수 없다</o>
+<why>논리적 처리 순서에서 WHERE는 GROUP BY보다 앞이다. 집계 값은 그룹이 만들어진 뒤에야 계산되므로 WHERE에서 참조할 수 없고, 그룹 조건은 HAVING에 써야 한다. WHERE에서도 UPPER(), DATE() 같은 스칼라 함수는 쓸 수 있고, SUM 안의 식도 허용되며, 인덱스 사용 여부는 문법 오류와 관계가 없다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>ONLY_FULL_GROUP_BY를 끈 서버에서 <code>SELECT category, title, MAX(price) FROM book_order GROUP BY category ORDER BY MAX(price) DESC;</code>를 실행했다. title 열에 대해 옳은 설명은?</q>
+<o>각 분류에서 MAX(price)를 가진 행의 title이 나온다</o>
+<o>ORDER BY가 있으므로 정렬 순서상 첫 행의 title이 나온다</o>
+<o>각 분류에서 기본 키가 가장 작은 행의 title이 나온다</o>
+<o>그룹 안의 아무 값이나 나올 수 있으며, 어느 값인지 정해져 있지 않다</o>
+<why>매뉴얼에 따르면 모드가 꺼져 있을 때 서버는 각 그룹에서 아무 값이나 고를 수 있고 그 선택은 비결정적이며, ORDER BY는 값이 선택된 뒤에 적용되므로 선택에 영향을 주지 못한다. MAX는 값 하나를 만들 뿐 행을 가리키지 않으므로 첫째 보기는 보장되지 않고, 기본 키 순서도 약속된 것이 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>book_order에 <code>INDEX (category, price)</code>가 있다. 다음 중 매뉴얼이 정한 느슨한 인덱스 스캔(Loose Index Scan)의 적용 조건을 만족하는 쿼리는?</q>
+<o><code>SELECT category, SUM(price) FROM book_order GROUP BY category</code></o>
+<o><code>SELECT category, MAX(price) FROM book_order GROUP BY category</code></o>
+<o><code>SELECT price, COUNT(*) FROM book_order GROUP BY price</code></o>
+<o><code>SELECT category, MIN(order_date) FROM book_order GROUP BY category</code></o>
+<why>느슨한 인덱스 스캔은 GROUP BY 열이 인덱스의 가장 왼쪽 접두이고, 집계가 MIN/MAX뿐이며 그 인자가 인덱스에서 GROUP BY 열 바로 다음 열이어야 한다. MAX(price)는 모두 만족한다. SUM은 그룹의 모든 값을 읽어야 하므로 안 되고, GROUP BY price는 왼쪽 접두가 아니며, order_date는 인덱스에 없다. 조건을 만족해도 실제 선택은 옵티마이저의 비용 판단에 달려 있다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>집계 함수(aggregate function)</dt><dd>행의 집합을 받아 값 하나를 돌려주는 함수. COUNT, SUM, AVG, MIN, MAX 등이 있고 MySQL 문서와 오류 메시지에서는 그룹 함수(group function)라고도 한다.</dd>
+<dt>그룹(group)</dt><dd>GROUP BY 기준의 값 또는 값의 조합이 같은 행들의 모임. 모든 행은 정확히 한 그룹에 속하며, 그룹 하나가 결과 행 하나가 된다.</dd>
+<dt>HAVING</dt><dd>GROUP BY로 만든 그룹에 대한 조건을 지정하는 절. 집계 함수를 참조할 수 있으며, 그룹을 통째로 남기거나 버린다.</dd>
+<dt>함수적 종속성(functional dependency)</dt><dd>X 값이 정해지면 Y 값이 하나로 정해지는 관계. MySQL은 기본 키, NOT NULL인 UNIQUE 키, 동등 조건에서 이를 감지해 GROUP BY에 없는 열의 사용을 허용한다.</dd>
+<dt>ONLY_FULL_GROUP_BY</dt><dd>SELECT, HAVING, ORDER BY가 묶는 기준도 집계도 아니며 함수적으로 종속되지도 않은 열을 참조하는 쿼리를 거부하는 SQL 모드. MySQL 8.0의 기본 SQL 모드에 포함된다.</dd>
+<dt>내부 임시 테이블(internal temporary table)</dt><dd>서버가 GROUP BY, COUNT(DISTINCT), 파생 테이블 등을 처리하려고 스스로 만들었다 버리는 테이블. EXPLAIN의 Extra 열에 Using temporary로 나타난다(매뉴얼에 따르면 파생 테이블에는 그렇게 표시되지 않을 수 있다).</dd>
+<dt>느슨한 인덱스 스캔(Loose Index Scan)</dt><dd>정렬된 인덱스에서 그룹마다 필요한 항목(첫 항목이나 마지막 항목)으로 건너뛰며 읽는 GROUP BY 처리 방법. EXPLAIN에 Using index for group-by로 나타난다.</dd>
+<dt>논리적 처리 순서(logical processing order)</dt><dd>SELECT 문의 각 절이 의미상 처리되는 순서로, 어떤 절에서 어떤 이름과 값을 쓸 수 있는지를 정한다. 실제 실행 순서는 옵티마이저가 정한다.</dd>
+<dt>상위 집계(super-aggregate)</dt><dd>WITH ROLLUP이 그룹 결과에 덧붙이는 소계·총계 행. 해당 열이 NULL로 표시되며 GROUPING()으로 데이터의 NULL과 구별한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/aggregate-functions.html">MySQL 8.0 Reference Manual — Aggregate Function Descriptions</a> — NULL 처리, 행이 없을 때의 결과, SUM·AVG의 결과 타입, InnoDB의 COUNT(*) 처리, GROUP_CONCAT의 길이 제한</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/group-by-handling.html">MySQL 8.0 Reference Manual — MySQL Handling of GROUP BY</a> — ONLY_FULL_GROUP_BY와 함수적 종속성, ANY_VALUE, GROUP BY의 식과 별칭 확장</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/group-by-optimization.html">MySQL 8.0 Reference Manual — GROUP BY Optimization</a> — 임시 테이블, 느슨한 인덱스 스캔의 조건, 촘촘한 인덱스 스캔</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/select.html">MySQL 8.0 Reference Manual — SELECT Statement</a> — WHERE와 HAVING의 차이, HAVING의 적용 시점과 LIMIT, 별칭 사용 규칙</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/group-by-modifiers.html">MySQL 8.0 Reference Manual — GROUP BY Modifiers</a> — WITH ROLLUP, 상위 집계 행의 NULL, GROUPING()과 ORDER BY(8.0.12)</li>
+<li><a href="https://learn.microsoft.com/en-us/sql/t-sql/queries/select-transact-sql">Microsoft Learn — SELECT (Transact-SQL), Logical processing order</a> — 논리적 처리(바인딩) 순서와 물리적 실행이 다를 수 있다는 설명</li>
+</x-refs>

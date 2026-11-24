@@ -1,0 +1,749 @@
+<x-meta>
+deck: if·else if·switch·삼항 연산자가 JVM의 조건 점프 명령으로 번역되는 과정을 따라가며, 분기가 실제로는 pc 레지스터를 옮기는 일임을 확인한다.
+minutes: 80
+</x-meta>
+
+<x-goals>
+<li>if, else if, else로 쓴 코드를 보고 javac가 만들 조건 점프(<code>if_icmp*</code>, <code>if*</code>, <code>goto</code>)의 구조를 손으로 그릴 수 있다.</li>
+<li>나란히 쓴 if 여러 개와 else if 사슬의 실행 흐름이 어떻게 다른지 값을 넣어 추적하고, 조건 순서가 틀린 코드를 고칠 수 있다.</li>
+<li>switch가 <code>tableswitch</code>와 <code>lookupswitch</code> 중 무엇으로 컴파일되는지, fall-through가 왜 생기는지 바이트코드로 설명할 수 있다.</li>
+<li>문자열 switch가 <code>hashCode()</code>와 <code>equals()</code>를 쓰는 두 단계 switch로 바뀌는 이유를 설명할 수 있다.</li>
+<li>삼항 연산자의 결과 타입을 JLS §15.25의 규칙으로 판정하고, switch 문과 switch 식의 차이를 구분해 쓸 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>위에서 아래로만 흐르는 프로그램의 한계</h3>
+<p>앞의 세 회차에서 만든 프로그램은 모두 첫 줄에서 시작해 마지막 줄까지, 적힌 순서대로 한 번씩 실행됐다. 변수에 값을 넣고, 연산하고, 출력하는 일은 이 방식으로 충분하다. 하지만 실제 프로그램이 풀어야 하는 문제는 대부분 "경우에 따라 다르게"라는 말을 포함한다. 나이가 18세 이상이면 입장시키고 아니면 돌려보낸다. 재고가 있으면 주문을 받고 없으면 품절을 알린다. 이런 요구를 표현하려면 어떤 줄은 실행하고 어떤 줄은 건너뛰는 수단이 필요하다. 그 수단이 조건문(conditional statement)이다.</p>
+<p>조건문을 문법으로만 보면 <code>if</code>, <code>else</code>, <code>switch</code> 같은 키워드의 사용법이 전부다. 이 회차에서는 한 층 아래에서 본다. JVM의 각 스레드는 pc 레지스터(program counter register)를 하나씩 갖는다. JVMS §2.5.1의 정의에 따르면 pc 레지스터에는 그 스레드가 지금 실행하고 있는 JVM 명령의 주소가 들어 있다. 명령 하나를 실행하고 나면 pc는 바로 뒤에 놓인 명령을 가리키도록 바뀐다. 프로그램이 위에서 아래로 흐르는 것처럼 보이는 까닭이 이것이다.</p>
+<p>분기(branch)는 pc에 "바로 뒤"가 아닌 다른 주소를 넣는 일이다. 무조건 옮기면 무조건 분기, 피연산자 스택(operand stack)에 있는 값을 검사해서 조건이 맞을 때만 옮기면 조건 분기다. 자바의 조건문은 종류가 여럿이지만, 바이트코드로 내려가면 전부 이 두 동작의 조합으로 바뀐다. 이 사실을 손에 쥐고 나면 else if의 순서가 왜 중요한지, switch에서 break를 빠뜨리면 왜 아래 case까지 실행되는지가 외울 규칙이 아니라 당연한 결과가 된다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>조건문은 "조건이 거짓이면 이 구간을 건너뛰어라"라는 점프로 번역된다. if·else if·삼항 연산자는 조건 점프와 <code>goto</code>의 조합이고, switch는 값으로 점프할 곳을 고르는 표다. 문법의 차이는 점프를 어떻게 배치하느냐의 차이일 뿐이다.</p></aside>
+
+<h3>if와 else — 조건식은 반드시 boolean이다</h3>
+<p>가장 단순한 형태부터 본다. <code>if</code> 뒤 괄호 안의 식이 참이면 바로 뒤의 문장(보통 중괄호 블록)을 실행하고, 거짓이면 건너뛴다. <code>else</code>가 붙어 있으면 거짓일 때 else 쪽을 실행한다. 두 블록 가운데 정확히 하나만 실행된다.</p>
+<pre><code class="language-java">public class AgeCheck {
+    public static void main(String[] args) {
+        int age = 16;
+        if (age >= 18) {
+            System.out.println("성인입니다.");
+        } else {
+            System.out.println("미성년자입니다.");
+        }
+        System.out.println("검사 끝");
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">미성년자입니다.
+검사 끝</code></pre>
+<p><code>age</code>가 16이므로 <code>age >= 18</code>은 <code>false</code>다. 첫 번째 블록은 건너뛰고 else 블록이 실행된다. 그다음 줄인 "검사 끝" 출력은 if 문 바깥에 있으므로 조건과 무관하게 항상 실행된다. 조건문이 끝나면 흐름은 다시 한 줄기로 합쳐진다는 점을 기억해 두자. 바이트코드에서는 이 "합쳐지는 지점"이 점프의 목적지로 나타난다.</p>
+<p>괄호 안의 식에는 타입 제한이 있다. JLS §14.9는 if 문의 식이 <code>boolean</code>이거나 <code>Boolean</code> 타입이어야 하고 그렇지 않으면 컴파일 오류라고 정한다. C 언어처럼 0이 아닌 정수를 참으로 취급하는 규칙이 자바에는 없다. 그래서 다음 코드는 컴파일되지 않는다.</p>
+<pre><code class="language-java">int x = 3;
+if (x) { }          // 컴파일 오류: int는 boolean으로 바뀌지 않는다
+if (x = 5) { }      // 컴파일 오류: 대입식 x = 5의 타입은 int다</code></pre>
+<p>두 번째 줄은 <code>==</code>를 쓰려다 <code>=</code>를 쓴 흔한 오타다. 대입식은 대입된 값을 결과로 갖는 식이고 그 타입은 변수의 타입이므로, <code>x = 5</code>는 <code>int</code> 타입의 식이다. 조건식 자리에 올 수 없으니 컴파일러가 잡아 준다. 다만 변수가 <code>boolean</code>이면 사정이 다르다. <code>if (flag = true)</code>는 타입이 맞기 때문에 그대로 컴파일되고, <code>flag</code>에 <code>true</code>를 넣은 뒤 항상 참으로 평가된다. boolean 변수는 <code>if (flag)</code>, <code>if (!flag)</code>처럼 비교 연산자 없이 쓰는 습관이 이 실수를 막는다.</p>
+
+<h3>if 문이 바이트코드가 되는 모습</h3>
+<p>이제 컴파일 결과를 본다. 출력 코드가 섞이면 읽기 어려우니, 두 수 가운데 큰 값을 돌려주는 메서드로 실험한다. 메서드는 09회에서 자세히 다루고, 여기서는 "인자 두 개를 받아 값 하나를 돌려주는 코드 덩어리" 정도로 보면 된다.</p>
+<pre><code class="language-java">public class Branch {
+    static int max(int a, int b) {
+        if (a > b) {
+            return a;
+        } else {
+            return b;
+        }
+    }
+}</code></pre>
+<p><code>javac Branch.java</code>로 컴파일한 뒤 <code>javap -c Branch</code>를 실행하면 클래스 파일 안의 바이트코드를 사람이 읽을 수 있는 형태로 볼 수 있다. 아래는 OpenJDK 21의 javac가 만든 결과다.</p>
+<pre data-label="javap -c 출력"><code class="language-text">  static int max(int, int);
+    Code:
+       0: iload_0
+       1: iload_1
+       2: if_icmple     7
+       5: iload_0
+       6: ireturn
+       7: iload_1
+       8: ireturn</code></pre>
+<p>왼쪽 숫자는 줄 번호가 아니라 메서드의 코드 배열 안에서 각 명령이 시작하는 바이트 위치다. <code>iload_0</code>은 1바이트짜리 명령이라 다음 명령이 1번에서 시작하고, <code>if_icmple</code>은 명령 코드 1바이트에 점프 거리 2바이트가 붙어 3바이트를 차지하므로 다음 명령이 5번에서 시작한다. 한 줄씩 읽어 보자.</p>
+<ol>
+<li><code>iload_0</code>: 지역 변수 0번의 int 값을 피연산자 스택에 올린다. static 메서드에서는 인자가 지역 변수 0번부터 차례로 들어가므로(JVMS §2.6.1) 0번이 <code>a</code>다.</li>
+<li><code>iload_1</code>: 지역 변수 1번, 곧 <code>b</code>를 스택에 올린다. 스택에는 아래부터 a, b가 쌓여 있다.</li>
+<li><code>if_icmple 7</code>: 스택에서 int 두 개를 꺼내 비교하고, 먼저 올린 값이 나중에 올린 값보다 작거나 같으면(<b>l</b>ess or <b>e</b>qual) 7번 위치로 점프한다. 그렇지 않으면 아무 일도 하지 않고 다음 명령인 5번으로 넘어간다.</li>
+<li>5~6번: <code>a</code>를 스택에 올리고 <code>ireturn</code>으로 그 값을 돌려주며 메서드를 끝낸다. 소스의 then 블록이다.</li>
+<li>7~8번: <code>b</code>를 올리고 돌려준다. 소스의 else 블록이다.</li>
+</ol>
+<p>눈여겨볼 부분은 조건이 뒤집혀 있다는 점이다. 소스에는 <code>a > b</code>라고 썼는데 바이트코드에는 "작거나 같으면"을 뜻하는 <code>if_icmple</code>이 나왔다. 컴파일러는 then 블록을 조건 검사 바로 뒤에 놓는다. 그러면 조건이 참일 때는 그냥 아래로 흘러가면 되고, 점프가 필요한 쪽은 조건이 <b>거짓</b>일 때다. 그래서 "<code>a > b</code>가 아니면, 곧 <code>a <= b</code>이면 else 블록으로 건너뛰어라"라는 명령이 만들어진다. if 문을 "조건이 참이면 실행한다"로 읽는 대신 "조건이 거짓이면 건너뛴다"로 읽는 편이 기계가 하는 일에 가깝다.</p>
+<pre class="diagram">소스                      바이트코드                 pc의 이동 (a=3, b=9)
+
+if (a > b) {              0: iload_0                 0 → 1 → 2
+    return a;             1: iload_1                         │ 3 <= 9 이므로 점프
+} else {                  2: if_icmple 7  ───────┐           ▼
+    return b;             5: iload_0             │           7 → 8 (9를 반환)
+}                         6: ireturn             │
+                          7: iload_1  ◀──────────┘
+                          8: ireturn</pre>
+<p>javap이 보여 주는 <code>7</code>은 읽기 편하게 계산해 준 절대 위치다. 클래스 파일에 실제로 적혀 있는 값은 이 명령 자신의 위치로부터의 상대 거리(여기서는 +5)이고, JVMS는 이 값이 부호 있는 16비트 정수라고 정한다. 점프는 앞으로도 뒤로도 갈 수 있다는 뜻이다. 뒤로 가는 점프가 다음 회차의 주제인 반복문이다.</p>
+
+<x-visual id="java-intro-04-if-bytecode-jump" title="if-else 문이 조건 점프 명령으로 번역되는 구조" kind="순서도 + 코드 대응 다이어그램" ratio="16:9">
+<x-hint>소스의 if-else 블록과 바이트코드 명령 줄이 어떻게 대응하고, 조건이 거짓일 때 pc가 else 블록으로 건너뛰는 모습을 보여 준다.</x-hint>
+<x-prompt>왼쪽과 오른쪽으로 나뉜 깔끔한 기술 다이어그램. 왼쪽 패널 제목은 "자바 소스"이고 코드 세 덩어리가 세로로 놓인다: 위에서부터 "if (a > b)", "return a;", "return b;". 오른쪽 패널 제목은 "바이트코드"이고 세로로 일곱 개의 작은 상자가 번호와 함께 놓인다: "0: iload_0", "1: iload_1", "2: if_icmple 7", "5: iload_0", "6: ireturn", "7: iload_1", "8: ireturn". 왼쪽 "if (a > b)"에서 오른쪽 0~2번 상자 묶음으로, "return a;"에서 5~6번 묶음으로, "return b;"에서 7~8번 묶음으로 옅은 연결선을 긋는다. 오른쪽 패널에서 "2: if_icmple 7" 상자에서 "7: iload_1" 상자로 굵은 주황색 곡선 화살표를 그리고 라벨 "조건이 거짓이면 점프"를 붙인다. 2번에서 5번으로 내려가는 얇은 회색 화살표에는 라벨 "참이면 그대로 진행"을 붙인다. 오른쪽 끝에 세로 화살표와 함께 "pc 레지스터"라는 라벨을 둔다. 흰 배경, 파란색과 주황색 두 가지 강조색, 고정폭 글꼴의 코드.</x-prompt>
+<x-caption>then 블록은 조건 검사 바로 뒤에 놓이고, 점프는 조건이 거짓일 때 일어난다. 그래서 소스의 <b>a &gt; b</b>가 바이트코드에서는 뒤집힌 조건으로 나타난다.</x-caption>
+</x-visual>
+
+<h4>조건 점프 명령의 종류</h4>
+<p>JVMS §2.11.7은 조건 분기 명령을 다음과 같이 나열한다. 이름 끝의 두 글자가 조건이다: <code>eq</code>(같다), <code>ne</code>(다르다), <code>lt</code>(작다), <code>le</code>(작거나 같다), <code>gt</code>(크다), <code>ge</code>(크거나 같다).</p>
+<div class="table-wrap"><table><thead><tr><th>명령</th><th>스택에서 꺼내는 값</th><th>점프하는 조건</th></tr></thead><tbody>
+<tr><td><code>if_icmpeq</code>, <code>if_icmpne</code>, <code>if_icmplt</code>, <code>if_icmple</code>, <code>if_icmpgt</code>, <code>if_icmpge</code></td><td>int 두 개</td><td>두 값을 부호 있는 정수로 비교한 결과</td></tr>
+<tr><td><code>ifeq</code>, <code>ifne</code>, <code>iflt</code>, <code>ifle</code>, <code>ifgt</code>, <code>ifge</code></td><td>int 한 개</td><td>그 값을 0과 비교한 결과</td></tr>
+<tr><td><code>if_acmpeq</code>, <code>if_acmpne</code></td><td>참조 두 개</td><td>두 참조가 같은지 다른지</td></tr>
+<tr><td><code>ifnull</code>, <code>ifnonnull</code></td><td>참조 한 개</td><td>null인지 아닌지</td></tr>
+</tbody></table></div>
+<p>0과 비교하는 명령이 따로 있는 것은 그런 비교가 흔하기 때문이다. <code>if (x < 0)</code>을 컴파일하면 0을 스택에 올려 <code>if_icmpge</code>를 쓰는 대신 <code>x</code>만 올리고 <code>ifge</code> 하나로 끝낸다. 명령 수가 줄고 클래스 파일도 작아진다.</p>
+
+<h4>boolean은 JVM에서 int다</h4>
+<p>JVMS §2.3.4에 따르면 JVM에는 boolean 값만을 다루는 전용 명령이 없고, 자바의 boolean 식은 JVM의 int 값을 쓰도록 컴파일된다. <code>true</code>는 1, <code>false</code>는 0이다. 그래서 boolean 변수를 검사하는 if 문은 "0과 같으면 점프"가 된다.</p>
+<pre><code class="language-java">static int flag(boolean on) {
+    if (on) {
+        return 1;
+    }
+    return 0;
+}
+
+static boolean isAdult(int age) {
+    return age >= 18;
+}</code></pre>
+<pre data-label="javap -c 출력"><code class="language-text">  static int flag(boolean);
+       0: iload_0
+       1: ifeq          6
+       4: iconst_1
+       5: ireturn
+       6: iconst_0
+       7: ireturn
+
+  static boolean isAdult(int);
+       0: iload_0
+       1: bipush        18
+       3: if_icmplt     10
+       6: iconst_1
+       7: goto          11
+      10: iconst_0
+      11: ireturn</code></pre>
+<p><code>flag</code>에서 boolean 인자를 꺼내는 명령이 int용인 <code>iload_0</code>이고, 검사는 <code>ifeq</code>(0이면 점프)다. <code>isAdult</code>는 더 흥미롭다. 소스에는 if가 없는데 바이트코드에는 조건 점프가 있다. <code>age >= 18</code>이라는 비교식의 결과를 값으로 만들려면, 비교해서 참이면 1을, 거짓이면 0을 스택에 올려야 하기 때문이다. JVM에는 "비교 결과를 0이나 1로 스택에 남기는" int 비교 명령이 없어서, 비교식의 값 자체가 분기로 만들어진다. 7번의 <code>goto 11</code>은 무조건 분기 명령으로, 1을 올린 뒤 0을 올리는 10번을 건너뛰게 한다.</p>
+
+<h3>else if — 조건을 차례로 걸러 내는 사슬</h3>
+<p>경우가 셋 이상이면 <code>else if</code>를 이어 붙인다. 나이에 따라 요금을 정하는 코드를 보자.</p>
+<pre><code class="language-java">static int fee(int age) {
+    int fee;
+    if (age < 8) {
+        fee = 0;
+    } else if (age < 19) {
+        fee = 1000;
+    } else {
+        fee = 2000;
+    }
+    return fee;
+}</code></pre>
+<p>문법적으로 <code>else if</code>라는 별도의 구문은 없다. JLS §14.9의 문법은 <code>if (식) 문장 else 문장</code> 하나뿐이고, else 뒤의 "문장" 자리에 또 다른 if 문이 온 것이 else if다. 위 코드는 첫 번째 if의 else 블록 안에 두 번째 if-else가 통째로 들어 있는 구조다. 들여쓰기를 한 단계씩 밀지 않고 나란히 적는 것은 읽기 편하라는 관례일 뿐이다.</p>
+<pre data-label="javap -c 출력"><code class="language-text">  static int fee(int);
+       0: iload_0
+       1: bipush        8
+       3: if_icmpge     11
+       6: iconst_0
+       7: istore_1
+       8: goto          28
+      11: iload_0
+      12: bipush        19
+      14: if_icmpge     24
+      17: sipush        1000
+      20: istore_1
+      21: goto          28
+      24: sipush        2000
+      27: istore_1
+      28: iload_1
+      29: ireturn</code></pre>
+<p>지역 변수 0번이 <code>age</code>, 1번이 <code>fee</code>다. <code>bipush</code>와 <code>sipush</code>는 각각 1바이트, 2바이트 크기의 정수 상수를 스택에 올리는 명령이고, <code>istore_1</code>은 스택 꼭대기의 int를 꺼내 지역 변수 1번에 저장한다. <code>age</code>가 15일 때의 실행을 따라가 보자.</p>
+<div class="table-wrap"><table><thead><tr><th>pc</th><th>명령</th><th>일어나는 일</th></tr></thead><tbody>
+<tr><td>0, 1</td><td><code>iload_0</code>, <code>bipush 8</code></td><td>스택에 15, 8을 올린다</td></tr>
+<tr><td>3</td><td><code>if_icmpge 11</code></td><td>15 >= 8이 참이므로 11번으로 점프한다(첫 조건 <code>age < 8</code>이 거짓)</td></tr>
+<tr><td>11, 12</td><td><code>iload_0</code>, <code>bipush 19</code></td><td>스택에 15, 19를 올린다</td></tr>
+<tr><td>14</td><td><code>if_icmpge 24</code></td><td>15 >= 19가 거짓이므로 점프하지 않는다(둘째 조건 <code>age < 19</code>가 참)</td></tr>
+<tr><td>17, 20</td><td><code>sipush 1000</code>, <code>istore_1</code></td><td><code>fee</code>에 1000을 저장한다</td></tr>
+<tr><td>21</td><td><code>goto 28</code></td><td>남은 else 블록을 건너뛰어 합류 지점으로 간다</td></tr>
+<tr><td>28, 29</td><td><code>iload_1</code>, <code>ireturn</code></td><td>1000을 반환한다</td></tr>
+</tbody></table></div>
+<p>각 블록 끝에 있는 <code>goto 28</code>이 else if 사슬의 핵심이다. 조건 하나가 참이어서 그 블록을 실행하고 나면, 나머지 조건은 검사하지도 않고 사슬 전체의 끝으로 빠져나간다. 반대로 조건이 거짓이면 다음 조건 검사로 넘어간다. 따라서 else if 사슬에서는 <b>위에서부터 처음으로 참이 되는 조건의 블록 하나만</b> 실행된다.</p>
+<p>이 구조 때문에 조건의 순서가 결과를 바꾼다. 두 번째 조건 <code>age < 19</code>는 겉으로는 "19세 미만"이지만, 첫 조건을 통과하지 못한 값만 도달하므로 실제 의미는 "8세 이상 19세 미만"이다. 앞 조건이 뒤 조건의 숨은 전제가 되는 셈이다. 순서를 잘못 잡으면 다음과 같은 일이 생긴다.</p>
+<pre><code class="language-java">int score = 95;
+if (score >= 60) {
+    System.out.println("D");
+} else if (score >= 70) {
+    System.out.println("C");
+} else if (score >= 90) {
+    System.out.println("A");
+}</code></pre>
+<p>이 코드는 <code>D</code>를 출력한다. 95는 첫 조건 <code>score >= 60</code>을 이미 만족하므로 그 블록을 실행하고 사슬을 빠져나간다. 60 이상인 값은 모두 첫 조건에서 걸러지기 때문에 둘째, 셋째 블록은 어떤 점수로도 실행되지 않는다. 컴파일러는 이것을 오류로 알려 주지 않는다. 자바 컴파일러의 도달 가능성 분석은 상수가 아닌 조건식의 값을 따지지 않기 때문이다. 범위를 나누는 조건은 가장 좁은 쪽(여기서는 90 이상)부터 적어야 한다.</p>
+
+<h3>if를 나란히 쓰는 것과 else if로 잇는 것</h3>
+<p>if 문 여러 개를 else 없이 나란히 쓰면 서로 관계없는 조건문 여러 개가 된다. 겉모습은 else if 사슬과 비슷하지만 실행 흐름이 다르다. 할인 금액을 계산하는 두 가지 코드를 비교한다.</p>
+<pre><code class="language-java">public class Discount {
+    public static void main(String[] args) {
+        int price = 12000;
+        int age = 9;
+
+        int discountA = 0;
+        if (price >= 10000) {
+            discountA += 1000;
+        }
+        if (age <= 10) {
+            discountA += 500;
+        }
+
+        int discountB = 0;
+        if (price >= 10000) {
+            discountB += 1000;
+        } else if (age <= 10) {
+            discountB += 500;
+        }
+
+        System.out.println("독립 if: " + discountA);
+        System.out.println("else if: " + discountB);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">독립 if: 1500
+else if: 1000</code></pre>
+<p>첫 번째 방식에서는 두 조건이 각각 검사된다. 가격 조건도 참이고 나이 조건도 참이므로 두 할인이 모두 적용되어 1500이 된다. 두 번째 방식에서는 가격 조건이 참이 되는 순간 사슬을 빠져나가므로 나이 조건은 검사조차 되지 않는다. 바이트코드로 보면 차이는 블록 끝에 <code>goto</code>가 있느냐 없느냐다. 나란히 쓴 if에는 블록 뒤에 <code>goto</code>가 없어서 흐름이 다음 조건 검사로 그대로 이어진다.</p>
+<p>어느 쪽이 맞는지는 문제의 성격이 정한다. 조건들이 서로 독립이어서 여러 개가 동시에 성립할 수 있고 각각 처리해야 한다면 if를 나란히 쓴다. 조건들이 하나의 값을 여러 구간으로 나누는 것이어서 그중 하나만 골라야 한다면 else if로 잇는다. 등급 판정을 if 나열로 쓰면 한 점수에 등급이 여러 개 출력되고, 중복 할인을 else if로 쓰면 할인이 하나만 적용된다. 두 실수 모두 컴파일은 되고 결과만 틀린다.</p>
+<p>else if 사슬에는 부수적인 이점도 있다. 구간을 나누는 조건을 if 나열로 쓰려면 <code>if (age >= 8 && age < 19)</code>처럼 아래쪽 경계를 매번 직접 적어야 하고, 참인 조건을 찾은 뒤에도 남은 조건을 모두 검사한다. 사슬로 쓰면 앞 조건이 아래쪽 경계를 대신 보장해 주고 불필요한 검사도 하지 않는다.</p>
+
+<h3>중괄호와 매달린 else</h3>
+<p>if 뒤에는 문장 하나가 온다. 중괄호 블록은 여러 문장을 문장 하나로 묶는 장치이므로, 중괄호를 생략하면 바로 뒤의 문장 하나만 if에 속한다. 이 규칙이 만드는 함정이 둘 있다.</p>
+<pre><code class="language-java">int a = 5, b = -1;
+if (a > 10)
+    if (b > 0)
+        System.out.println("A");
+else
+    System.out.println("B");
+System.out.println("end");</code></pre>
+<p>들여쓰기만 보면 <code>else</code>가 바깥 if(<code>a > 10</code>)의 짝처럼 보이고, 그렇다면 <code>B</code>가 출력되어야 한다. 실제 출력은 <code>end</code> 한 줄이다. JLS §14.5는 이것을 매달린 else 문제(dangling else problem)라 부르고, else는 자신이 속할 수 있는 가장 안쪽 if에 속한다고 정한다. 위 코드에서 else의 짝은 <code>if (b > 0)</code>이다. 바깥 조건 <code>a > 10</code>이 거짓이므로 안쪽 if-else 전체가 건너뛰어지고 아무것도 출력되지 않는다. 컴파일러는 들여쓰기를 보지 않는다.</p>
+<pre><code class="language-java">int x = 3;
+if (x > 5);
+{
+    System.out.println("always");
+}</code></pre>
+<p>이 코드는 <code>always</code>를 출력한다. <code>if (x > 5)</code> 뒤의 세미콜론은 아무 일도 하지 않는 빈 문장(empty statement, JLS §14.6)이고, if에 속하는 문장은 그 빈 문장 하나다. 뒤따르는 중괄호 블록은 if와 무관한 독립 블록이어서 조건과 상관없이 실행된다. 두 함정 모두 if와 else에 항상 중괄호를 쓰면 생기지 않는다. 중괄호는 컴파일러가 아니라 사람을 위한 표시이지만, 사람이 읽은 구조와 컴파일러가 읽은 구조를 일치시켜 주는 가장 값싼 수단이다.</p>
+
+<h3>int가 아닌 값의 비교 — long, double, 참조</h3>
+<p>앞의 표에 있는 조건 점프 명령은 int와 참조만 다룬다. <code>byte</code>, <code>short</code>, <code>char</code>, <code>boolean</code>은 JVM 안에서 int로 계산되므로 int용 명령을 그대로 쓴다. 그러면 <code>long</code>이나 <code>double</code>을 비교하는 if 문은 어떻게 될까. JVMS §2.11.7은 이 타입들의 비교를 두 단계로 한다고 설명한다. 먼저 두 값을 비교해 int 결과를 스택에 남기는 명령을 실행하고, 이어서 그 int를 0과 비교하는 조건 점프를 실행한다.</p>
+<pre><code class="language-java">static int cmpLong(long a, long b) {
+    if (a > b) {
+        return 1;
+    }
+    return 0;
+}
+
+static int gtDouble(double a, double b) {
+    if (a > b) {
+        return 1;
+    }
+    return 0;
+}
+
+static int ltDouble(double a, double b) {
+    if (a < b) {
+        return 1;
+    }
+    return 0;
+}</code></pre>
+<pre data-label="javap -c 출력"><code class="language-text">  static int cmpLong(long, long);
+       0: lload_0
+       1: lload_2
+       2: lcmp
+       3: ifle          8
+       6: iconst_1
+       7: ireturn
+       8: iconst_0
+       9: ireturn
+
+  static int gtDouble(double, double);
+       0: dload_0
+       1: dload_2
+       2: dcmpl
+       3: ifle          8
+       ...
+
+  static int ltDouble(double, double);
+       0: dload_0
+       1: dload_2
+       2: dcmpg
+       3: ifge          8
+       ...</code></pre>
+<p><code>lcmp</code>는 long 두 개를 꺼내 비교하고, 앞의 값이 크면 1, 같으면 0, 작으면 -1을 int로 스택에 올린다. 뒤따르는 <code>ifle 8</code>은 그 결과가 0 이하이면(곧 <code>a > b</code>가 아니면) 점프한다. 두 번째 인자가 지역 변수 1번이 아니라 2번에서 읽히는 것도 보인다. long과 double은 지역 변수 두 칸을 차지하기 때문이고(JVMS §2.6.1), 이 이야기는 06회에서 스코프와 함께 다시 다룬다.</p>
+<p>double 쪽에는 비교 명령이 <code>dcmpl</code>과 <code>dcmpg</code> 두 가지다. 둘은 NaN을 만났을 때만 다르게 동작한다. NaN(Not-a-Number)은 0.0을 0.0으로 나눈 결과처럼 수로 나타낼 수 없는 연산 결과를 표시하는 부동소수점의 특수한 값이고, JVMS §3.5의 표현으로는 순서가 없는(unordered) 값이어서 NaN이 낀 크기 비교는 모두 실패해야 한다. 피연산자 중 하나라도 NaN이면 <code>dcmpl</code>은 -1을, <code>dcmpg</code>는 1을 올린다. 컴파일러는 NaN일 때 조건이 거짓 쪽으로 떨어지도록 둘 중 하나를 고른다. <code>a > b</code>에는 <code>dcmpl</code>과 <code>ifle</code>를 짝지어 NaN이면 -1이 나와 점프하게(조건 거짓) 하고, <code>a < b</code>에는 <code>dcmpg</code>와 <code>ifge</code>를 짝지어 NaN이면 1이 나와 역시 점프하게 한다. float에도 같은 구조의 <code>fcmpl</code>, <code>fcmpg</code>가 있다.</p>
+<pre><code class="language-java">double nan = 0.0 / 0.0;
+System.out.println(nan > 1.0);    // false
+System.out.println(nan < 1.0);    // false
+System.out.println(nan == nan);   // false
+System.out.println(nan != nan);   // true</code></pre>
+<p>이 결과는 조건문을 쓸 때 주의할 점을 하나 알려 준다. 정수라면 <code>!(a > b)</code>와 <code>a <= b</code>는 언제나 같지만 실수에서는 NaN 때문에 다를 수 있다. "크지 않으면"이라는 else 블록에 NaN이 흘러 들어올 수 있다는 뜻이다. 실수 값을 조건으로 나눌 때는 계산 결과가 NaN이 될 가능성(0.0을 0.0으로 나누는 경우 등)을 따로 확인해야 한다.</p>
+<p>참조를 <code>==</code>로 비교하면 <code>if_acmpeq</code>나 <code>if_acmpne</code>가 쓰인다. 이 명령은 두 참조가 같은 객체를 가리키는지만 본다. 문자열을 <code>==</code>로 비교하면 내용이 같아도 결과가 <code>false</code>일 수 있는 이유가 이것이다.</p>
+<pre><code class="language-java">String s1 = "java";
+String s2 = new String("java");
+System.out.println(s1 == s2);        // false: 서로 다른 객체
+System.out.println(s1.equals(s2));   // true: 내용이 같다</code></pre>
+<p>참조와 객체의 관계는 기본편에서 본격적으로 다룬다. 지금은 조건문에서 문자열의 내용을 비교할 때 <code>equals()</code>를 써야 한다는 것과, 그 이유가 <code>==</code>가 참조값을 비교하는 명령으로 번역되기 때문이라는 것만 기억해 두면 된다.</p>
+
+<h3>논리 연산자가 들어간 조건 — 단락 평가의 정체</h3>
+<p>03회에서 <code>&&</code>와 <code>||</code>는 왼쪽만으로 결과가 정해지면 오른쪽을 평가하지 않는다는 단락 평가(short-circuit evaluation)를 배웠다. 바이트코드를 보면 이 규칙이 따로 구현된 기능이 아니라 조건 점프를 이어 놓은 모양에서 자연히 나오는 결과임을 알 수 있다.</p>
+<pre><code class="language-java">static int both(int a, int b) {
+    if (a > 0 && b > 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int either(int a, int b) {
+    if (a > 0 || b > 0) {
+        return 1;
+    }
+    return 0;
+}</code></pre>
+<pre data-label="javap -c 출력"><code class="language-text">  static int both(int, int);
+       0: iload_0
+       1: ifle          10
+       4: iload_1
+       5: ifle          10
+       8: iconst_1
+       9: ireturn
+      10: iconst_0
+      11: ireturn
+
+  static int either(int, int);
+       0: iload_0
+       1: ifgt          8
+       4: iload_1
+       5: ifle          10
+       8: iconst_1
+       9: ireturn
+      10: iconst_0
+      11: ireturn</code></pre>
+<p><code>both</code>에서 <code>a</code>가 0 이하이면 1번의 <code>ifle 10</code>이 곧바로 "거짓" 쪽인 10번으로 점프한다. <code>b</code>를 스택에 올리는 4번 명령은 실행되지 않는다. 오른쪽 피연산자를 "평가하지 않는다"는 말의 실체는 그 코드 구간을 건너뛰는 점프다. <code>either</code>에서는 방향이 반대다. <code>a</code>가 0보다 크면 1번의 <code>ifgt 8</code>이 "참" 쪽인 8번으로 곧장 점프해서 <code>b</code> 검사를 건너뛴다. <code>&&</code>는 "하나라도 거짓이면 거짓 쪽으로 탈출", <code>||</code>는 "하나라도 참이면 참 쪽으로 탈출"이다.</p>
+<p>단락 평가를 하지 않는 <code>&</code>로 같은 조건을 쓰면 컴파일 결과가 달라진다. <code>a > 0 & b > 0</code>은 두 비교식의 값을 각각 0이나 1로 만들어 스택에 올린 다음 <code>iand</code>(비트 AND)로 합치고, 그 결과를 <code>ifeq</code>로 한 번 검사한다. 양쪽이 항상 평가되고 명령 수도 더 많다. 조건문에서 <code>&&</code>와 <code>||</code>를 기본으로 쓰는 것은 관례이기 전에 더 짧은 코드가 나오는 선택이다. 그리고 <code>if (s != null && s.length() > 0)</code>처럼 왼쪽 조건이 오른쪽 식을 안전하게 만드는 보호 조건으로 쓰일 수 있는 것도 이 점프 구조 덕분이다.</p>
+
+<h3>switch 문 — 값 하나로 갈라지는 분기</h3>
+<p>else if 사슬 가운데에는 한 변수의 값이 1인지, 2인지, 3인지를 차례로 묻는 형태가 많다. 이런 분기를 위해 따로 마련된 구문이 <code>switch</code>다. 괄호 안의 식(선택자 식, selector expression)을 한 번 평가하고, 그 값과 일치하는 <code>case</code>로 이동한다.</p>
+<pre><code class="language-java">static int dense(int grade) {
+    int coupon;
+    switch (grade) {
+        case 1:
+            coupon = 1000;
+            break;
+        case 2:
+            coupon = 2000;
+            break;
+        case 3:
+            coupon = 3000;
+            break;
+        default:
+            coupon = 500;
+    }
+    return coupon;
+}</code></pre>
+<p><code>dense(2)</code>는 2000을, <code>dense(7)</code>은 일치하는 case가 없으므로 <code>default</code>로 가서 500을 돌려준다. 규칙을 정리하면 다음과 같다.</p>
+<ul>
+<li><b>선택자의 타입.</b> JLS §14.11에 따르면 선택자 식의 타입은 <code>char</code>, <code>byte</code>, <code>short</code>, <code>int</code>이거나 참조 타입이어야 한다. case에 상수를 쓰는 전통적인 switch에서 참조 타입은 <code>Character</code>, <code>Byte</code>, <code>Short</code>, <code>Integer</code>, <code>String</code>과 열거형(enum)이다. Java 21 기준으로 <code>long</code>, <code>float</code>, <code>double</code>, <code>boolean</code> 값으로는 switch를 쓸 수 없다.</li>
+<li><b>case 상수.</b> case 뒤에는 컴파일 시점에 값이 정해지는 상수식만 올 수 있다(열거형 상수의 이름은 예외적으로 허용된다). 변수를 쓰면 컴파일 오류다. 같은 값의 case를 두 번 쓰는 것도 컴파일 오류다(JLS §14.11.1).</li>
+<li><b>default.</b> 어느 case와도 일치하지 않을 때 가는 곳이다. 생략할 수 있고, 생략했는데 일치하는 case가 없으면 switch 문 전체를 건너뛴다. 맨 끝이 아닌 곳에 적어도 문법상 문제는 없다.</li>
+<li><b>break.</b> switch 문을 빠져나간다. 없으면 다음 case의 코드로 계속 흘러 내려간다.</li>
+</ul>
+<p>case에 상수만 허용된다는 제약은 불편해 보이지만 switch의 존재 이유와 직결된다. 값들이 컴파일 시점에 모두 알려져 있기 때문에 컴파일러가 "값에서 점프 위치를 바로 찾는 표"를 미리 만들어 둘 수 있다. 조건을 위에서부터 하나씩 검사하는 else if 사슬과 구조가 다르다.</p>
+
+<h4>fall-through — break가 없으면 생기는 일</h4>
+<pre><code class="language-java">static int fall(int grade) {
+    int point = 0;
+    switch (grade) {
+        case 3:
+            point += 300;
+        case 2:
+            point += 200;
+        case 1:
+            point += 100;
+            break;
+        default:
+            point = -1;
+    }
+    return point;
+}</code></pre>
+<p><code>fall(3)</code>은 600, <code>fall(2)</code>는 300, <code>fall(1)</code>은 100, <code>fall(9)</code>는 -1을 돌려준다. 3등급이면 <code>case 3</code>에서 시작해 300을 더하고, break가 없으므로 아래로 흘러 200과 100을 더한 뒤 break를 만나 빠져나간다. 이렇게 case 경계를 넘어 실행이 이어지는 것을 폴스루(fall-through)라 한다. 바이트코드를 보면 왜 이렇게 되는지 분명해진다.</p>
+<pre data-label="javap -c 출력"><code class="language-text">  static int fall(int);
+       0: iconst_0
+       1: istore_1
+       2: iload_0
+       3: tableswitch   { // 1 to 3
+                     1: 40
+                     2: 34
+                     3: 28
+               default: 46
+          }
+      28: iinc_w        1, 300
+      34: iinc_w        1, 200
+      40: iinc          1, 100
+      43: goto          48
+      46: iconst_m1
+      47: istore_1
+      48: iload_1
+      49: ireturn</code></pre>
+<p><code>tableswitch</code>는 값에 따라 28번, 34번, 40번, 46번 가운데 한 곳으로 점프할 뿐이다. 점프한 뒤에는 평범한 순차 실행이다. 28번에서 시작하면 34번, 40번이 차례로 실행되고(<code>iinc</code>는 지역 변수에 상수를 더하는 명령이고, javap이 <code>iinc_w</code>로 표시한 것은 더하는 값이 1바이트 범위를 넘어 <code>wide</code> 접두 명령이 붙은 형태다) 43번의 <code>goto 48</code>에서 빠져나간다. 이 <code>goto</code>가 소스의 <code>break</code>다. 즉 case 라벨은 코드 구간을 나누는 벽이 아니라 <b>진입 지점을 표시하는 이름표</b>이고, 구간 사이를 막아 주는 것은 프로그래머가 직접 적은 <code>break</code>뿐이다. 기계의 관점에서는 흘러 내려가는 쪽이 기본 동작이고 빠져나가는 쪽이 추가 동작이다.</p>
+<p>JLS §14.11.3은 이 동작이 C, C++와 같다고 설명하면서 미묘한 버그의 원인이 될 수 있다고 적고 있다. 폴스루를 의도적으로 쓰는 경우는 사실상 여러 값을 같은 코드로 처리할 때 하나뿐이다. <code>case 4: case 6: case 9: case 11: return 30;</code>처럼 라벨만 연달아 적는 형태다. 이 경우 네 라벨이 모두 같은 위치를 가리키게 되므로 흘러 내려갈 코드가 따로 없다.</p>
+
+<h3>tableswitch와 lookupswitch — 값으로 점프 위치를 찾는 두 가지 표</h3>
+<p>JVM에는 switch를 위한 명령이 두 개 있다. JVMS §3.10은 case 값들을 표의 색인으로 효율적으로 나타낼 수 있을 때 <code>tableswitch</code>를 쓰고, case 값들이 듬성듬성해서 표가 공간을 낭비하게 될 때는 <code>lookupswitch</code>를 쓸 수 있다고 설명한다. 앞의 <code>dense</code> 메서드와, case 값을 10, 500, 9000으로 바꾼 메서드를 컴파일해 비교한다.</p>
+<pre data-label="javap -c 출력"><code class="language-text">  static int dense(int);
+       0: iload_0
+       1: tableswitch   { // 1 to 3
+                     1: 28
+                     2: 35
+                     3: 42
+               default: 49
+          }
+      28: sipush        1000
+      ...
+
+  static int sparse(int);
+       0: iload_0
+       1: lookupswitch  { // 3
+                    10: 36
+                   500: 41
+                  9000: 46
+               default: 51
+          }
+      36: iconst_1
+      ...</code></pre>
+<p><code>tableswitch</code>의 피연산자는 default 위치, 최솟값(low), 최댓값(high), 그리고 low부터 high까지 모든 값에 대한 점프 위치의 배열이다. 실행할 때는 스택에서 꺼낸 값이 low와 high 사이인지 확인하고, 범위 안이면 <code>값 - low</code>를 색인으로 배열에서 점프 위치를 바로 꺼낸다. 범위 밖이면 default로 간다. case가 3개든 300개든 비교 횟수가 늘지 않는다.</p>
+<p><code>lookupswitch</code>의 피연산자는 default 위치, 쌍의 개수, 그리고 (case 값, 점프 위치) 쌍의 목록이다. 값이 연속이 아니므로 색인으로 바로 찾을 수 없고 목록에서 일치하는 값을 찾아야 한다. JVMS는 이 쌍들이 case 값의 오름차순으로 정렬되어 있어야 한다고 정하는데, 구현이 선형 탐색보다 효율적인 탐색(예를 들면 이진 탐색)을 쓸 수 있게 하기 위해서다. 그렇더라도 탐색이 필요하다는 점에서 JVMS는 공간이 허락한다면 <code>tableswitch</code>가 더 효율적일 것이라고 적고 있다.</p>
+<pre class="diagram">tableswitch (case 1, 2, 3)              lookupswitch (case 10, 500, 9000)
+
+ default → 49                            default → 51
+ low = 1, high = 3                       npairs = 3
+ ┌────────┬────────┬────────┐            ┌──────────────┬──────────────┬───────────────┐
+ │ [0]→28 │ [1]→35 │ [2]→42 │            │ 10 → 36      │ 500 → 41     │ 9000 → 46     │
+ └────────┴────────┴────────┘            └──────────────┴──────────────┴───────────────┘
+ 색인 = 값 - low                          값이 정렬되어 있으므로 탐색으로 찾는다
+ 범위 검사 한 번 + 배열 접근 한 번         쌍의 수가 늘면 비교 횟수도 늘어난다</pre>
+<p>출력에서 한 가지 이상한 점이 있다. <code>tableswitch</code> 명령은 1번 위치에서 시작하는데 다음 명령이 28번에 있다. case가 셋뿐인데 27바이트를 차지한 것이다. 계산해 보면 이렇다. 두 switch 명령은 4바이트 정수 여러 개를 피연산자로 갖고, JVMS는 이 값들이 메서드 시작으로부터 4의 배수 위치에서 시작하도록 명령 코드 뒤에 0~3바이트의 채움(padding)을 넣으라고 정한다. 명령 코드가 1번에 있으니 2~3번이 채움이고, 4번부터 default(4바이트), low(4바이트), high(4바이트), 점프 위치 3개(12바이트)가 놓여 27번에서 끝난다. <code>sparse</code>도 같은 식으로 4번부터 default(4), 쌍의 개수(4), 쌍 3개(각 8바이트, 24)가 놓여 35번에서 끝난다.</p>
+
+<h4>javac는 둘 중 무엇을 고르는가</h4>
+<p>어느 명령을 쓸지는 JVM 명세가 아니라 컴파일러가 정한다. OpenJDK 21의 javac 소스(<code>Gen.java</code>의 <code>handleSwitch</code>)는 두 표의 공간 비용과 시간 비용을 어림해서 비교한다. case 라벨의 개수를 n, 가장 작은 값과 큰 값을 lo, hi라 할 때 계산식은 다음과 같다.</p>
+<pre class="diagram">tableswitch 비용  = (4 + (hi - lo + 1)) + 3 × 3
+lookupswitch 비용 = (3 + 2 × n)        + 3 × n
+
+tableswitch 비용 <= lookupswitch 비용 이면 tableswitch, 아니면 lookupswitch</pre>
+<p>case가 1, 2, 3이면 tableswitch 비용은 (4 + 3) + 9 = 16, lookupswitch 비용은 (3 + 6) + 9 = 18이어서 <code>tableswitch</code>가 선택된다. case가 10, 500, 9000이면 tableswitch 비용은 (4 + 8991) + 9 = 9004로 치솟고 lookupswitch 비용은 그대로 18이므로 <code>lookupswitch</code>가 선택된다. 값 사이에 구멍이 조금 있는 정도는 표로 처리한다. 예를 들어 case가 1, 2, 4, 5이면 비용이 18 대 23이라 <code>tableswitch</code>가 되고, 비어 있는 3번 칸에는 default와 같은 점프 위치가 채워진다.</p>
+<pre data-label="case 1, 2, 4, 5를 컴파일한 결과"><code class="language-text">       1: tableswitch   { // 1 to 5
+                     1: 36
+                     2: 39
+                     3: 48
+                     4: 42
+                     5: 45
+               default: 48
+          }</code></pre>
+<p>이 선택 기준은 javac라는 구현의 세부 사항이어서 버전이 바뀌면 달라질 수 있고, 프로그래머가 맞춰 줄 대상도 아니다. 알아 둘 것은 원리다. switch는 조건을 차례로 검사하는 구문이 아니라 값에서 목적지를 찾는 구문이고, case 값이 촘촘할수록 그 찾기가 단순해진다. 그리고 JVMS §3.10이 밝히듯 두 명령은 int 값만 다룬다. <code>byte</code>, <code>char</code>, <code>short</code> 선택자는 어차피 int로 계산되므로 그대로 쓰이고, <code>Integer</code> 같은 래퍼 타입 선택자는 먼저 <code>intValue()</code>를 호출해 int를 꺼낸 다음 같은 명령을 쓴다. 이때 선택자가 <code>null</code>이면 <code>NullPointerException</code>이 발생한다.</p>
+
+<x-visual id="java-intro-04-tableswitch-lookupswitch" title="tableswitch와 lookupswitch의 구조 비교" kind="구조 비교 다이어그램" ratio="16:9">
+<x-hint>촘촘한 case 값은 색인으로 바로 찾는 표가 되고, 듬성듬성한 case 값은 정렬된 쌍의 목록에서 탐색하게 된다는 차이를 나란히 보여 준다.</x-hint>
+<x-prompt>좌우로 나뉜 비교 다이어그램. 왼쪽 제목 "tableswitch", 오른쪽 제목 "lookupswitch". 왼쪽: 위에 작은 상자 "값 2"가 있고, 아래로 화살표가 내려가 "색인 = 값 - low" 라벨이 붙은 연산 상자를 지난다. 그 아래에 가로로 붙은 세 칸짜리 배열이 있고 각 칸에 "1 → 28", "2 → 35", "3 → 42"가 적혀 있다. 화살표가 가운데 칸 "2 → 35"를 곧장 가리키고 그 칸이 주황색으로 강조된다. 배열 아래 라벨 "범위 검사 후 바로 접근". 오른쪽: 위에 작은 상자 "값 500"이 있고, 아래에 가로로 떨어져 놓인 세 개의 쌍 상자 "10 → 36", "500 → 41", "9000 → 46"이 있다. 값 상자에서 세 쌍으로 향하는 점선 화살표들이 있고 가운데 쌍 "500 → 41"이 주황색으로 강조된다. 쌍 아래 라벨 "정렬된 쌍에서 탐색". 두 패널 맨 아래에 공통으로 회색 상자 "default"를 두고 "일치하는 값이 없을 때"라는 라벨을 붙인다. 흰 배경, 평면적인 스타일, 파란색 기본에 주황색 강조.</x-prompt>
+<x-caption>tableswitch는 값에서 최솟값을 뺀 수를 색인으로 써서 점프 위치를 바로 꺼내고, lookupswitch는 정렬된 (값, 위치) 쌍에서 일치하는 값을 찾는다.</x-caption>
+</x-visual>
+
+<h3>문자열 switch는 어떻게 컴파일되는가</h3>
+<p>switch 명령이 int만 다룬다면 <code>String</code>으로 하는 switch는 어떻게 가능할까. 문자열에는 "최솟값부터 최댓값까지의 표"를 만들 수 없다. javac는 문자열 switch를 int switch 두 개로 풀어서 컴파일한다.</p>
+<pre><code class="language-java">static int str(String s) {
+    switch (s) {
+        case "Aa":
+            return 1;
+        case "BB":
+            return 2;
+        case "C":
+            return 3;
+        default:
+            return 0;
+    }
+}</code></pre>
+<pre data-label="javap -c 출력 (OpenJDK 21 javac)"><code class="language-text">       0: aload_0
+       1: astore_1
+       2: iconst_m1
+       3: istore_2
+       4: aload_1
+       5: invokevirtual #7     // Method java/lang/String.hashCode:()I
+       8: lookupswitch  { // 2
+                    67: 64
+                  2112: 36
+               default: 75
+          }
+      36: aload_1
+      37: ldc           #13    // String BB
+      39: invokevirtual #15    // Method java/lang/String.equals:(Ljava/lang/Object;)Z
+      42: ifeq          50
+      45: iconst_1
+      46: istore_2
+      47: goto          75
+      50: aload_1
+      51: ldc           #19    // String Aa
+      53: invokevirtual #15    // Method java/lang/String.equals:(Ljava/lang/Object;)Z
+      56: ifeq          75
+      59: iconst_0
+      60: istore_2
+      61: goto          75
+      64: aload_1
+      65: ldc           #21    // String C
+      67: invokevirtual #15    // Method java/lang/String.equals:(Ljava/lang/Object;)Z
+      70: ifeq          75
+      73: iconst_2
+      74: istore_2
+      75: iload_2
+      76: tableswitch   { // 0 to 2
+                     0: 104
+                     1: 106
+                     2: 108
+               default: 110
+          }
+     104: iconst_1
+     105: ireturn
+     106: iconst_2
+     107: ireturn
+     108: iconst_3
+     109: ireturn
+     110: iconst_0
+     111: ireturn</code></pre>
+<p>길지만 구조는 두 단계다.</p>
+<figure class="flow-figure"><figcaption>문자열 switch의 두 단계</figcaption><ol class="flow">
+<li><strong>준비</strong><span>선택자 문자열을 임시 지역 변수(1번)에 복사하고, "몇 번째 case인가"를 담을 임시 int 변수(2번)를 -1로 초기화한다.</span></li>
+<li><strong>1단계: 해시로 후보 좁히기</strong><span><code>hashCode()</code>를 호출해 int 값을 얻고, 그 값으로 <code>lookupswitch</code>를 실행한다. case 문자열들의 해시값은 컴파일할 때 미리 계산되어 표에 들어 있다.</span></li>
+<li><strong>확인: equals로 진짜인지 검사</strong><span>해시가 같다고 문자열이 같은 것은 아니므로 <code>equals()</code>로 확인한다. 일치하면 임시 변수에 case의 순번(0, 1, 2)을 넣는다.</span></li>
+<li><strong>2단계: 순번으로 진짜 switch</strong><span>임시 변수의 값으로 <code>tableswitch</code>를 실행해 원래 case 본문으로 점프한다. 어느 것과도 일치하지 않았다면 -1이 남아 default로 간다.</span></li>
+</ol></figure>
+<p>예제의 case 문자열은 일부러 골랐다. <code>String.hashCode()</code>의 계산식은 Javadoc에 명시되어 있는데, 각 문자의 코드값에 31의 거듭제곱을 곱해 더하는 식이다. "Aa"는 65 × 31 + 97 = 2112이고 "BB"는 66 × 31 + 66 = 2112다. 서로 다른 문자열이 같은 해시값을 갖는 해시 충돌(hash collision)이다. 그래서 1단계 표에는 2112가 한 번만 나오고, 36번 구간에서 "BB"인지 먼저 확인한 다음 아니면 50번에서 "Aa"인지 다시 확인한다. 해시만으로 분기했다면 "BB"를 넣었을 때 "Aa"의 코드가 실행되는 잘못된 프로그램이 된다. <code>equals()</code> 확인이 빠질 수 없는 이유다.</p>
+<p>두 단계로 나누는 까닭도 짚어 두자. 1단계에서 곧바로 case 본문으로 점프하지 않고 순번을 거쳐 가는 것은, 2단계를 평범한 int switch로 만들어 폴스루나 default의 위치 같은 원래 switch의 의미를 그대로 보존하기 위해서다. 그리고 이 방식이 성립하는 전제가 하나 있다. 해시값이 컴파일 시점에 계산되어 클래스 파일에 숫자로 박히므로, 실행 시점의 <code>hashCode()</code>가 반드시 같은 값을 내야 한다. <code>String.hashCode()</code>의 계산식이 API 문서에 고정되어 있기 때문에 가능한 일이다.</p>
+<aside class="note">이 컴파일 방식은 javac의 구현이지 JLS가 요구하는 것이 아니다. 명세가 정하는 것은 문자열 switch의 의미(내용이 같은 case로 간다)와, 선택자가 <code>null</code>이고 그것을 받는 라벨이 없으면 <code>NullPointerException</code>이 발생한다는 것(JLS §14.11.3)이다. 위 바이트코드에서는 5번의 <code>hashCode()</code> 호출이 null에 대해 실행되면서 그 예외가 자연스럽게 발생한다.</aside>
+
+<x-visual id="java-intro-04-string-switch-two-step" title="문자열 switch가 두 번의 int switch로 컴파일되는 과정" kind="단계 흐름도" ratio="16:9">
+<x-hint>문자열 선택자가 hashCode로 후보를 좁히고 equals로 확인한 뒤, case 순번으로 두 번째 switch를 실행하는 흐름과 해시 충돌 처리를 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 진행하는 네 단계 흐름도. 첫 번째 상자: 문자열 아이콘과 라벨 "선택자 s". 두 번째 상자: 제목 "1단계 lookupswitch", 안에 두 줄 "67", "2112", 상자 위 라벨 "s.hashCode()". 첫 번째에서 두 번째로 화살표. 두 번째 상자의 "2112" 줄에서 세 번째 영역으로 화살표가 나가고, 세 번째 영역에는 세로로 두 개의 마름모가 있다: 위 마름모 "equals(BB)", 아래 마름모 "equals(Aa)". 위 마름모에서 아래 마름모로 "아니면" 라벨의 화살표. "67" 줄에서는 별도의 마름모 "equals(C)"로 화살표. 세 마름모에서 오른쪽으로 나가는 화살표에는 각각 "순번 1", "순번 0", "순번 2" 라벨. 네 번째 상자: 제목 "2단계 tableswitch", 안에 세 줄 "0 → case Aa", "1 → case BB", "2 → case C"와 맨 아래 회색 줄 "default". 세 번째 영역 위에 말풍선 라벨 "해시 충돌: Aa와 BB는 둘 다 2112". 흰 배경, 파란색과 주황색 강조, 단순한 평면 도형.</x-prompt>
+<x-caption>해시값은 후보를 좁히는 데만 쓰이고, 실제 일치 여부는 equals가 결정한다. 해시가 같은 "Aa"와 "BB"는 같은 구간에서 차례로 확인된다.</x-caption>
+</x-visual>
+
+<h3>switch 식과 화살표 문법 (Java 14+)</h3>
+<p>전통적인 switch 문에는 두 가지 불편이 있다. break를 빠뜨리면 조용히 폴스루가 일어나고, 대부분의 switch가 결국 "값에 따라 변수 하나에 다른 값을 넣는" 일을 하는데도 case마다 대입문과 break를 반복해야 한다. Java 14에서 정식 기능이 된 switch 식(switch expression, JEP 361)은 이 둘을 고친다. Java 12와 13에서 미리 보기(preview)로 제공되다가 14에서 확정됐다.</p>
+<pre><code class="language-java">static int arrow(int grade) {
+    int coupon = switch (grade) {
+        case 1 -> 1000;
+        case 2 -> 2000;
+        case 3 -> 3000;
+        default -> 500;
+    };
+    return coupon;
+}
+
+static int arrowDays(int month) {
+    return switch (month) {
+        case 4, 6, 9, 11 -> 30;
+        case 2 -> 28;
+        default -> 31;
+    };
+}</code></pre>
+<p>바뀐 점은 두 가지이고 서로 독립적이다.</p>
+<ul>
+<li><b>화살표 라벨 <code>case 값 -></code>.</b> 일치하면 화살표 오른쪽만 실행하고 끝난다. 아래 case로 흘러 내려가지 않으므로 break가 필요 없다. 오른쪽에는 식 하나, 중괄호 블록, 또는 <code>throw</code> 문이 올 수 있다. 여러 값을 같은 코드로 처리하려면 <code>case 4, 6, 9, 11</code>처럼 쉼표로 나열한다.</li>
+<li><b>switch가 값을 내는 식이 된다.</b> switch 전체가 하나의 값으로 평가되므로 대입문의 오른쪽이나 <code>return</code> 뒤에 올 수 있다. 식이기 때문에 대입문으로 쓸 때는 끝에 세미콜론이 붙는다.</li>
+</ul>
+<p>화살표 라벨은 값을 내지 않는 switch 문에서도 쓸 수 있고, 반대로 switch 식 안에서 전통적인 콜론 라벨을 쓸 수도 있다. 다만 한 switch 안에서 두 종류의 라벨을 섞으면 컴파일 오류다. 화살표 오른쪽이 블록일 때, 또는 콜론 라벨을 쓴 switch 식에서 값을 지정하려면 <code>yield</code> 문을 쓴다. JLS §14.21에 따르면 yield는 가장 안쪽의 switch 식을 그 값으로 끝낸다.</p>
+<pre><code class="language-java">static int yieldDemo(int grade) {
+    return switch (grade) {
+        case 1 -> 1000;
+        case 2 -> {
+            int base = 1500;
+            yield base + 500;
+        }
+        default -> 500;
+    };
+}</code></pre>
+<p><code>yieldDemo(2)</code>는 2000을 돌려준다. switch 문에서 빠져나갈 때는 <code>break</code>, switch 식에서 값을 내며 끝낼 때는 <code>yield</code>로 구분된다. 값을 내야 하는 식이므로 switch 식의 블록이 <code>yield</code> 없이 끝까지 흘러가도록 쓰면 컴파일 오류다.</p>
+<h4>모든 경우를 다뤄야 한다</h4>
+<p>식은 반드시 값을 가져야 한다. 그래서 switch 식에는 switch 문에 없던 요구가 생긴다. JLS §15.28.1은 switch 식이 가능한 모든 값을 빠짐없이 다뤄야(exhaustive) 하고 그렇지 않으면 컴파일 오류라고 정한다. int 선택자라면 약 43억 가지 값을 case로 다 적을 수 없으니 <code>default</code>가 사실상 필수다. 위의 <code>arrow</code>에서 <code>default</code> 줄을 지우면 javac 21은 switch 식이 가능한 입력값을 모두 다루지 않는다는 오류를 낸다. switch 문에서 default를 빠뜨리면 조용히 아무 일도 일어나지 않던 것과 대비된다. "처리하지 않은 경우"가 실행 중의 침묵에서 컴파일 오류로 옮겨 온 것이다.</p>
+<h4>바이트코드는 같은 switch다</h4>
+<pre data-label="javap -c 출력"><code class="language-text">  static int arrow(int);
+       0: iload_0
+       1: tableswitch   { // 1 to 3
+                     1: 28
+                     2: 34
+                     3: 40
+               default: 46
+          }
+      28: sipush        1000
+      31: goto          49
+      34: sipush        2000
+      37: goto          49
+      40: sipush        3000
+      43: goto          49
+      46: sipush        500
+      49: istore_1
+      50: iload_1
+      51: ireturn</code></pre>
+<p>새 문법을 위한 새 명령은 없다. 같은 <code>tableswitch</code>이고, 화살표 라벨이 "흘러 내려가지 않는다"는 것은 컴파일러가 각 갈래 끝에 <code>goto</code>를 빠짐없이 넣어 준다는 뜻이다. 앞의 <code>dense</code>와 다른 점은 값이 저장되는 위치다. switch 문에서는 갈래마다 <code>istore_1</code>이 있었는데, switch 식에서는 각 갈래가 값을 피연산자 스택에 올려놓기만 하고 합류 지점인 49번에서 한 번만 저장한다. "식이 값을 낸다"는 말이 바이트코드에서는 "어느 갈래로 왔든 합류 지점에서 스택 꼭대기에 값 하나가 놓여 있다"는 모습으로 나타난다.</p>
+
+<h3>삼항 연산자 — 값을 만드는 분기와 타입 규칙</h3>
+<p>삼항 연산자(조건 연산자, conditional operator)는 <code>조건 ? 값1 : 값2</code> 형태의 식이다. 조건이 참이면 값1, 거짓이면 값2가 식 전체의 값이 된다. if 문은 문장이어서 값을 갖지 않지만 삼항 연산자는 식이므로 대입문의 오른쪽, 메서드 인자, 더 큰 식의 일부로 쓸 수 있다.</p>
+<pre><code class="language-java">static int ternary(int a, int b) {
+    int m = (a > b) ? a : b;
+    return m;
+}</code></pre>
+<pre data-label="javap -c 출력"><code class="language-text">       0: iload_0
+       1: iload_1
+       2: if_icmple     9
+       5: iload_0
+       6: goto          10
+       9: iload_1
+      10: istore_2
+      11: iload_2
+      12: ireturn</code></pre>
+<p>조건 점프 하나와 <code>goto</code> 하나로 이루어진, if-else와 같은 구조다. 두 갈래가 각자 값을 스택에 올리고 10번에서 합류해 한 번 저장하는 점은 방금 본 switch 식과 같다. JLS §15.25는 선택되지 않은 피연산자는 평가되지 않는다고 명시하는데, 바이트코드에서 보이는 대로 그 구간을 점프로 건너뛰기 때문이다. <code>b != 0 ? a / b : 0</code>처럼 쓸 때 <code>b</code>가 0이면 나눗셈이 실행되지 않는 것이 이 규칙 덕분이다.</p>
+<p>삼항 연산자는 오른쪽에서 왼쪽으로 묶인다. <code>score >= 90 ? "A" : score >= 80 ? "B" : "C"</code>는 <code>score >= 90 ? "A" : (score >= 80 ? "B" : "C")</code>로 해석되어, <code>score</code>가 85이면 <code>"B"</code>가 된다. else if 사슬을 식으로 쓴 것과 같지만 두 단계를 넘어가면 읽기 어려워지므로 그때는 if 문이나 switch 식이 낫다.</p>
+<h4>결과의 타입은 하나여야 한다</h4>
+<p>if-else에서는 두 블록이 서로 무관한 일을 해도 된다. 삼항 연산자는 식이어서 사정이 다르다. 식은 컴파일 시점에 타입이 하나로 정해져야 하는데, 값1과 값2의 타입이 다를 수 있다. JLS §15.25는 이때 식 전체의 타입을 정하는 규칙을 둔다. 두 피연산자가 모두 숫자일 때(numeric conditional expression)의 주요 규칙은 다음과 같다.</p>
+<ol>
+<li>두 피연산자의 타입이 같으면 그 타입이다.</li>
+<li>한쪽이 <code>byte</code>, <code>short</code>, <code>char</code> 가운데 하나인 타입 T이고, 다른 쪽이 <code>int</code> 타입의 상수식이며 그 값을 T로 나타낼 수 있으면 타입은 T다.</li>
+<li>그 밖에는 두 피연산자에 숫자 승격(numeric promotion)을 적용한 타입이다. 산술 연산에서 두 피연산자의 타입을 맞출 때 쓰는 것과 같은 규칙으로(06회에서 자세히 다룬다), 한쪽이 double이면 double, 아니면 float, 아니면 long, 아니면 int가 된다.</li>
+</ol>
+<pre><code class="language-java">boolean t = true;
+int i = 0;
+System.out.println(t ? 1 : 2.0);     // 1.0
+System.out.println(t ? 'a' : 0);     // a
+System.out.println(t ? 'a' : i);     // 97</code></pre>
+<p>첫 줄은 조건이 참이라 1이 선택되지만 출력은 <code>1.0</code>이다. 다른 쪽 피연산자가 double이어서 규칙 3에 따라 식 전체가 double이 되고, 선택된 1이 double로 변환되기 때문이다. 선택되지 않은 피연산자는 평가되지 않지만 <b>타입 결정에는 참여한다.</b> 타입은 컴파일 시점에, 어느 쪽이 선택될지는 실행 시점에 정해지기 때문에 생기는 일이다.</p>
+<p>둘째 줄과 셋째 줄의 차이는 규칙 2에서 나온다. <code>0</code>은 int 상수이고 char로 나타낼 수 있는 값이므로 식의 타입이 char가 되어 문자 <code>a</code>가 출력된다. 반면 <code>i</code>는 값이 0이어도 상수가 아니라 변수이므로 규칙 2가 적용되지 않고, 규칙 3에 따라 char와 int가 int로 승격되어 문자 a의 코드값 97이 출력된다. 값이 같아도 "컴파일러가 그 값을 아는가"에 따라 타입이 갈리는 것이다. 이 구분은 06회에서 형변환 규칙을 다룰 때 다시 나온다.</p>
+<aside class="note">두 피연산자가 숫자와 문자열처럼 공통된 기본형으로 맞출 수 없는 조합이면(reference conditional expression) 기본형 쪽이 객체로 감싸져 참조 타입의 식이 된다. 또 <code>Integer</code> 같은 래퍼 타입과 기본형이 섞이면 래퍼 쪽에서 값을 꺼내는 변환이 일어나는데, 이때 래퍼 변수가 <code>null</code>이면 <code>NullPointerException</code>이 발생한다. 래퍼 클래스는 중급 1편에서 다룬다.</aside>
+
+<h3>컴파일러가 이미 답을 아는 조건</h3>
+<p>조건식이 상수라면 컴파일러는 어느 쪽이 실행될지 미리 안다. 이때의 처리 방식에는 의도된 비대칭이 있다.</p>
+<pre><code class="language-java">static final boolean DEBUG = false;
+
+static int dead(int x) {
+    if (DEBUG) {
+        System.out.println("x = " + x);
+    }
+    return x + 1;
+}</code></pre>
+<pre data-label="javap -c 출력 (OpenJDK 21 javac)"><code class="language-text">  static int dead(int);
+       0: iload_0
+       1: iconst_1
+       2: iadd
+       3: ireturn</code></pre>
+<p>if 문이 통째로 사라졌다. <code>DEBUG</code>는 <code>static final</code>이고 상수로 초기화되었으므로 <code>if (DEBUG)</code>는 <code>if (false)</code>와 같고, javac는 실행될 수 없는 블록의 코드를 클래스 파일에 넣지 않았다. 조건 검사 자체도 남지 않는다. 한편 같은 상수 조건을 <code>while (false) { ... }</code>로 쓰면 javac는 본문이 도달할 수 없는 문장(unreachable statement)이라며 컴파일 오류를 낸다.</p>
+<p>JLS §14.22는 이 차이가 의도된 것이라고 설명한다. 자바는 실행될 수 없는 문장을 오류로 취급하지만 if 문만은 예외로 두었다. 위와 같은 플래그 상수의 값을 <code>false</code>에서 <code>true</code>로 바꾸는 것만으로 디버그 코드를 넣고 뺄 수 있게 하려는 것이다. 이 장치에는 주의할 점이 따라온다. 명세가 직접 경고하듯, 플래그를 정의한 클래스만 다시 컴파일해서 배포하면 그 플래그를 읽는 다른 클래스들은 이전 값 기준으로 코드가 빠진 상태 그대로 남는다. 상수의 값은 그것을 사용하는 쪽의 클래스 파일에 컴파일 시점에 반영되기 때문이다.</p>
+
+<h3>다른 주제와의 연결</h3>
+<p>이 회차에서 본 조건 점프는 이후의 거의 모든 주제 아래에 깔려 있다. 가장 가까운 것은 다음 회차의 반복문이다. 반복문은 새로운 종류의 명령을 쓰지 않는다. 이번에 본 조건 점프와 <code>goto</code>가 그대로 쓰이고, 점프의 방향이 앞이 아니라 뒤라는 점만 다르다. break는 이미 본 대로 <code>goto</code>이고, continue도 마찬가지다.</p>
+<p>기본편에서 배울 다형성(polymorphism)은 조건문과 깊은 관계가 있다. "객체의 종류에 따라 다른 코드를 실행한다"는 요구는 if나 switch로도 쓸 수 있지만, 다형성을 쓰면 그 분기가 소스에서 사라지고 JVM의 메서드 호출 명령이 실행 시점에 대상 메서드를 고르는 일로 바뀐다. 타입이 늘어날 때마다 switch의 case를 추가하는 코드와 클래스를 하나 추가하는 코드 중 무엇을 고를지는 그때 다시 판단하게 된다.</p>
+<p>switch는 계속 확장되고 있다. 중급 1편에서 다룰 열거형은 switch와 함께 쓰일 때 "모든 경우를 다뤘는지"를 컴파일러가 검사해 주는 대상이 되고, Java 21에서 정식 기능이 된 switch 패턴 매칭(JEP 441)은 값이 아니라 타입과 구조로 분기하게 해 준다. 그 기능들의 바탕에는 이 회차에서 본 두 가지가 있다. switch가 식이 될 수 있다는 것과, 식이 되려면 모든 경우를 빠짐없이 다뤄야 한다는 것이다.</p>
+<p>마지막으로, 여기서 본 바이트코드는 실행의 출발점이다. HotSpot JVM은 자주 실행되는 메서드를 JIT 컴파일러로 기계어로 바꾸고, 그때 이 조건 점프들은 CPU의 분기 명령이 된다. 소스 코드의 if 한 줄이 바이트코드의 조건 점프가 되고 다시 CPU의 분기가 되기까지, 층은 달라도 "조건에 따라 다음에 실행할 명령의 위치를 바꾼다"는 동작은 끝까지 같다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>분기와 pc 레지스터</dt><dd>스레드마다 있는 pc 레지스터는 지금 실행 중인 명령의 주소를 담는다. 조건문은 조건에 따라 pc를 바로 다음이 아닌 위치로 옮기는 조건 점프로 번역된다.</dd>
+<dt>뒤집힌 조건</dt><dd>컴파일러는 then 블록을 조건 검사 바로 뒤에 두고, 조건이 거짓일 때 건너뛰는 점프를 만든다. 그래서 <code>a > b</code>는 <code>if_icmple</code>로 나타난다.</dd>
+<dt>else if 사슬</dt><dd>else 뒤에 또 다른 if 문이 온 구조다. 위에서부터 처음 참이 되는 조건의 블록 하나만 실행하고 <code>goto</code>로 사슬 끝으로 빠져나가므로 조건의 순서가 결과를 바꾼다.</dd>
+<dt>long·double 비교</dt><dd><code>lcmp</code>, <code>dcmpl</code>/<code>dcmpg</code>가 비교 결과를 int로 만들고, 그 int를 조건 점프가 검사한다. NaN이 낀 크기 비교는 항상 거짓이 되도록 컴파일된다.</dd>
+<dt>tableswitch와 lookupswitch</dt><dd>switch는 값으로 점프 위치를 찾는 표다. case 값이 촘촘하면 색인으로 바로 찾는 tableswitch, 듬성듬성하면 정렬된 쌍에서 탐색하는 lookupswitch가 쓰인다.</dd>
+<dt>fall-through</dt><dd>case 라벨은 진입 지점일 뿐이고 구간을 막아 주는 것은 break(바이트코드의 <code>goto</code>)뿐이다. break가 없으면 다음 case의 코드가 이어서 실행된다.</dd>
+<dt>문자열 switch</dt><dd>javac는 <code>hashCode()</code>로 후보를 좁히고 <code>equals()</code>로 확인해 case 순번을 구한 뒤, 그 순번으로 두 번째 switch를 실행하도록 컴파일한다.</dd>
+<dt>switch 식</dt><dd>Java 14부터 switch가 값을 내는 식이 될 수 있다. 화살표 라벨은 흘러 내려가지 않고, 식은 모든 경우를 다뤄야 하므로 default가 없으면 컴파일 오류가 날 수 있다.</dd>
+<dt>삼항 연산자의 타입</dt><dd>선택되지 않은 피연산자는 평가되지 않지만 식의 타입 결정에는 참여한다. <code>true ? 1 : 2.0</code>의 값이 1.0인 이유다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 조건문에 관한 판단은 대부분 성능이 아니라 정확성과 읽기 쉬움의 문제다. else if의 순서를 정하는 일차 기준은 "자주 참이 되는 조건을 위로"가 아니라, 조건들이 서로의 전제가 되는 관계를 틀리지 않게 표현하는 것이다. 구간 판정에서 순서가 한 칸 어긋나면 컴파일도 되고 대부분의 입력에서 맞게 동작하다가 경계값에서만 틀리기 때문에, 경계값(딱 그 값, 하나 작은 값, 하나 큰 값)을 넣어 보는 테스트가 가장 값진 방어 수단이다.</p>
+<p>switch를 쓸지 if를 쓸지는 조건의 모양이 정한다. 하나의 값을 여러 상수와 견주는 분기라면 switch가 의도를 더 잘 드러내고, 범위 비교나 여러 변수가 얽힌 조건이라면 if가 맞다. Java 14 이상을 쓰는 코드에서는 새로 쓰는 switch를 화살표 형태로, 값을 계산하는 것이라면 switch 식으로 쓰는 편이 안전하다. 폴스루 실수가 문법적으로 불가능해지고, 식으로 쓰면 빠뜨린 경우를 컴파일러가 알려 준다. 반대로 기존 코드의 콜론 형태 switch를 읽을 때는 case 끝마다 break나 return이 있는지부터 확인하는 습관이 필요하다.</p>
+<p>삼항 연산자는 값 하나를 고르는 짧은 식에만 쓰는 것이 좋다. 두 피연산자의 타입이 다를 때의 규칙은 이 회차에서 본 것처럼 직관과 어긋나는 결과를 내기 쉽고, 래퍼 타입이 섞이면 실행 중 예외로 이어질 수 있다. 코드 리뷰에서 삼항 연산자의 두 갈래 타입이 다른 것을 보면 그 자리에서 결과 타입을 따져 보거나 if 문으로 풀어 쓰도록 요청할 만하다.</p>
+<p>상수 플래그로 코드를 켜고 끄는 방식은 지금도 쓰이지만, 상수가 사용처의 클래스 파일에 박힌다는 점 때문에 여러 모듈이 따로 배포되는 환경에서는 사고의 원인이 된다. 라이브러리의 <code>static final</code> 상수를 바꿨는데 그것을 쓰는 애플리케이션을 다시 컴파일하지 않으면 옛 값으로 동작한다. 실행 중에 바뀔 수 있어야 하는 설정이라면 컴파일 시점 상수가 아니라 실행 시점에 읽는 값으로 두어야 한다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 메서드에 <code>level</code>로 2를 넣어 호출했을 때 반환값을 예측하고, 그렇게 되는 이유를 바이트코드 수준에서 설명하라. <code>int bonus = 0; switch (level) { case 1: bonus += 1; case 2: bonus += 10; case 3: bonus += 100; default: bonus += 1000; } return bonus;</code></li>
+<li><code>static int leq(int a, int b) { if (a <= b) { return a; } return b; }</code>를 javac로 컴파일하면 조건 검사 자리에 어떤 조건 점프 명령이 나올지 예측하고, 그 이유를 설명하라.</li>
+<li><code>char c = 'x'; int i = 1;</code>일 때 다음 세 출력을 예측하라. (가) <code>System.out.println(true ? c : 0);</code> (나) <code>System.out.println(true ? c : i);</code> (다) <code>System.out.println(false ? 1.0f : 2);</code></li>
+<li>점수에 따라 등급을 출력하려고 <code>if (score >= 90) print("A"); if (score >= 80) print("B"); if (score >= 70) print("C");</code>처럼 if를 나란히 썼다. <code>score</code>가 95일 때 무엇이 출력되는지 쓰고, 한 등급만 출력되도록 고치는 방법을 두 가지 제시하라.</li>
+<li>본문의 javac 21 비용 계산식을 써서, case 값이 1, 3, 5, 7인 switch와 case 값이 1, 100인 switch가 각각 <code>tableswitch</code>와 <code>lookupswitch</code> 중 무엇으로 컴파일되는지 판정하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 1110이다. <code>tableswitch</code>는 값 2에 해당하는 위치, 곧 <code>bonus += 10</code>의 코드가 시작하는 곳으로 점프한다. 어느 case에도 break가 없으므로 구간 사이에 <code>goto</code>가 하나도 만들어지지 않고, 점프한 뒤에는 순차 실행으로 <code>+= 10</code>, <code>+= 100</code>, 그리고 default의 <code>+= 1000</code>까지 이어진다. <code>case 1</code>의 <code>+= 1</code>은 진입 지점보다 앞에 있어서 실행되지 않는다. default도 다른 case와 똑같이 하나의 진입 지점일 뿐이라 위에서 흘러 내려오는 실행을 막지 못한다.</p>
+<p><b>2번.</b> <code>if_icmpgt</code>다. 컴파일러는 then 블록(<code>return a</code>)을 조건 검사 바로 뒤에 놓고, 조건이 거짓일 때 그 블록을 건너뛰는 점프를 만든다. <code>a <= b</code>의 부정은 <code>a > b</code>이므로 "크면 점프"가 된다. 실제 출력은 <code>iload_0</code>, <code>iload_1</code>, <code>if_icmpgt 7</code>, <code>iload_0</code>, <code>ireturn</code>, <code>iload_1</code>, <code>ireturn</code> 순서다.</p>
+<p><b>3번.</b> (가) <code>x</code>. 한쪽이 char이고 다른 쪽이 char로 나타낼 수 있는 int 상수 0이므로 식의 타입이 char다. (나) <code>120</code>. <code>i</code>는 상수가 아닌 int 변수이므로 숫자 승격이 적용되어 식의 타입이 int가 되고, 문자 x의 코드값 120이 출력된다. (다) <code>2.0</code>. 조건이 거짓이라 2가 선택되지만 다른 쪽이 float이므로 식의 타입이 float가 되고, 2가 float로 변환되어 2.0으로 출력된다.</p>
+<p><b>4번.</b> 95는 세 조건을 모두 만족하고 세 if가 서로 독립이므로 A, B, C가 모두 출력된다. 첫째 방법은 else if 사슬로 바꾸는 것이다. <code>if (score >= 90) ... else if (score >= 80) ... else if (score >= 70) ...</code>로 쓰면 처음 참이 되는 블록 하나만 실행되고 <code>goto</code>로 빠져나간다. 둘째 방법은 if를 나란히 둔 채 각 조건에 위쪽 경계를 직접 적는 것이다. <code>if (score >= 80 && score < 90)</code>처럼 구간이 겹치지 않게 하면 된다. 다만 둘째 방법은 경계가 두 군데에 적히므로 한쪽만 고치는 실수가 생기기 쉽고, 참인 조건을 찾은 뒤에도 남은 조건을 모두 검사한다. 구간 판정에는 첫째 방법이 맞다.</p>
+<p><b>5번.</b> case 1, 3, 5, 7: n = 4, lo = 1, hi = 7이다. tableswitch 비용은 (4 + 7) + 9 = 20, lookupswitch 비용은 (3 + 8) + 12 = 23이므로 <code>tableswitch</code>다. 비어 있는 2, 4, 6번 칸에는 default와 같은 위치가 들어간다. case 1, 100: n = 2, lo = 1, hi = 100이다. tableswitch 비용은 (4 + 100) + 9 = 113, lookupswitch 비용은 (3 + 4) + 6 = 13이므로 <code>lookupswitch</code>다. 값의 범위가 넓어질수록 표가 커지는 비용이 탐색 비용을 넘어서는 것을 확인할 수 있다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>소스에 <code>if (a > b) { ... } else { ... }</code>라고 썼는데 javap 출력에는 <code>if_icmple</code>이 나온다. 이유로 옳은 것은?</q>
+<o>javac가 비교 방향을 바꾸는 최적화를 해서 실행 속도를 높이기 때문이다.</o>
+<o>then 블록을 조건 검사 바로 뒤에 두므로, 점프가 필요한 것은 조건이 거짓일 때(a가 b 이하일 때)이기 때문이다.</o>
+<o>JVM에는 "크다"를 검사하는 조건 점프 명령이 없기 때문이다.</o>
+<o>else 블록이 있으면 항상 조건이 반대로 기록되고, else가 없으면 그대로 기록된다.</o>
+<why>컴파일러는 조건이 참일 때 실행할 코드를 바로 아래에 놓고, 거짓일 때 그 코드를 건너뛰도록 뒤집힌 조건의 점프를 만든다. 속도를 위한 최적화가 아니라 코드 배치에서 나오는 결과다. JVM에는 <code>if_icmpgt</code>도 있으므로 셋째 보기는 틀리고, else가 없는 if에서도 조건은 똑같이 뒤집힌다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>전통적인 switch 문에서 break를 쓰지 않으면 다음 case의 코드까지 실행되는 까닭을 가장 정확히 설명한 것은?</q>
+<o>JVM이 일치하는 case를 찾은 뒤에도 남은 case 값을 계속 비교하기 때문이다.</o>
+<o>break가 없으면 컴파일러가 모든 case를 하나의 else if 사슬로 합치기 때문이다.</o>
+<o>switch 명령은 값에 맞는 위치로 한 번 점프할 뿐이고, case 구간 사이에는 break가 만드는 goto 외에 흐름을 끊는 것이 없기 때문이다.</o>
+<o>default가 맨 끝에 있을 때만 생기는 현상이고, default를 맨 위에 두면 생기지 않는다.</o>
+<why><code>tableswitch</code>나 <code>lookupswitch</code>는 진입 지점을 고르는 점프를 한 번 할 뿐이다. 그 뒤는 순차 실행이므로 구간 끝에 <code>goto</code>(break)가 없으면 다음 구간의 명령이 이어서 실행된다. 값을 다시 비교하는 일은 없고, default의 위치와도 무관하다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>javac가 문자열 switch를 컴파일할 때 <code>hashCode()</code>로 분기한 뒤 <code>equals()</code>를 한 번 더 호출하는 이유는?</q>
+<o>서로 다른 문자열이 같은 해시값을 가질 수 있어서, 해시만으로는 어느 case인지 확정할 수 없기 때문이다.</o>
+<o><code>hashCode()</code>의 결과가 실행할 때마다 달라질 수 있기 때문이다.</o>
+<o><code>equals()</code>를 호출해야 문자열이 null인지 검사할 수 있기 때문이다.</o>
+<o>lookupswitch는 int가 아니라 boolean 값으로 분기하는 명령이기 때문이다.</o>
+<why>"Aa"와 "BB"처럼 해시값이 같은 다른 문자열이 있으므로 해시는 후보를 좁히는 역할만 하고 실제 일치는 <code>equals()</code>로 확인해야 한다. <code>String.hashCode()</code>는 계산식이 API 문서에 고정되어 있어 항상 같은 값을 내며, 바로 그 덕분에 컴파일 시점에 해시값을 표에 넣을 수 있다. null은 <code>hashCode()</code> 호출 시점에 이미 예외가 되고, switch 명령은 int로 분기한다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>int i = 5;</code>일 때 <code>System.out.println(true ? i : 2.5);</code>의 출력과 그 이유로 옳은 것은?</q>
+<o>5. 조건이 참이어서 int인 i가 그대로 선택되기 때문이다.</o>
+<o>5. 선택되지 않은 피연산자는 평가되지 않으므로 타입에도 영향을 주지 않기 때문이다.</o>
+<o>2.5. 타입이 더 큰 쪽의 값이 선택되기 때문이다.</o>
+<o>5.0. 식의 타입이 컴파일 시점에 두 피연산자의 승격 결과인 double로 정해지고, 선택된 i가 double로 변환되기 때문이다.</o>
+<why>삼항 연산자는 식이므로 타입이 컴파일 시점에 하나로 정해져야 한다. int와 double은 숫자 승격으로 double이 되고, 실행 시점에 선택된 값 5가 5.0으로 변환된다. 선택되지 않은 피연산자는 평가(실행)만 되지 않을 뿐 타입 결정에는 참여한다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>int 값으로 분기하는 switch 식에서 default를 빼면 컴파일 오류가 나는데, 같은 모양의 switch 문에서는 오류가 나지 않는다. 이 차이의 근본 이유는?</q>
+<o>switch 식은 lookupswitch로만 컴파일되는데, 이 명령에는 default가 필수이기 때문이다.</o>
+<o>식은 어떤 경우에도 값을 내야 하므로 가능한 모든 값을 다뤄야 하지만, 문장은 일치하는 case가 없으면 아무 일도 하지 않고 끝나도 되기 때문이다.</o>
+<o>화살표 라벨은 default와 함께 쓸 때만 문법적으로 완성되기 때문이다.</o>
+<o>switch 문에서는 컴파일러가 보이지 않는 default를 자동으로 만들어 주기 때문이다.</o>
+<why>switch 식의 결과는 변수에 대입되거나 반환되므로 "값이 없는 경우"가 있어서는 안 된다. 그래서 JLS는 switch 식이 모든 경우를 빠짐없이 다룰 것을 요구한다. 바이트코드 수준에서는 두 switch 명령 모두 default 위치를 항상 갖고 있으며, 식이든 문이든 같은 명령으로 컴파일된다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>pc 레지스터(program counter register)</dt><dd>JVM 스레드마다 하나씩 있는, 현재 실행 중인 JVM 명령의 주소를 담는 레지스터.</dd>
+<dt>조건 분기(conditional branch)</dt><dd>피연산자 스택의 값을 검사해 조건이 맞을 때만 지정된 위치로 pc를 옮기는 명령. <code>ifeq</code>, <code>if_icmplt</code> 등이 있다.</dd>
+<dt>무조건 분기(goto)</dt><dd>조건 없이 지정된 위치로 pc를 옮기는 명령. else if 사슬의 탈출, break, 삼항 연산자의 합류에 쓰인다.</dd>
+<dt>선택자 식(selector expression)</dt><dd>switch 뒤 괄호 안의 식. 한 번 평가되어 그 값으로 실행할 case가 정해진다.</dd>
+<dt>폴스루(fall-through)</dt><dd>switch에서 한 case의 코드가 끝난 뒤 break 없이 다음 case의 코드로 실행이 이어지는 것.</dd>
+<dt>tableswitch / lookupswitch</dt><dd>switch를 위한 JVM 명령. 앞의 것은 연속된 값 범위의 점프 표를 색인으로 찾고, 뒤의 것은 정렬된 (값, 위치) 쌍에서 탐색한다. 둘 다 int만 다룬다.</dd>
+<dt>switch 식(switch expression)</dt><dd>값을 내는 switch. Java 14에서 정식 기능이 되었으며 모든 경우를 빠짐없이 다뤄야 한다.</dd>
+<dt>yield</dt><dd>switch 식의 블록 안에서 그 switch 식의 값을 지정하며 끝내는 문장.</dd>
+<dt>매달린 else(dangling else)</dt><dd>중괄호 없이 if가 중첩될 때 else가 어느 if의 짝인지 헷갈리는 문제. 자바에서는 가장 안쪽 if에 속한다.</dd>
+<dt>해시 충돌(hash collision)</dt><dd>서로 다른 값이 같은 해시값을 갖는 것. 문자열 switch에서 <code>equals()</code> 확인이 필요한 이유다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-14.html">JLS (Java SE 21) 14장 Blocks, Statements, and Patterns</a> — §14.5 매달린 else, §14.9 if 문의 조건식 타입, §14.11 switch 문과 폴스루, §14.21 yield, §14.22 도달 불가능한 문장과 if (false)의 예외</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html">JLS (Java SE 21) 15장 Expressions</a> — §15.25 조건 연산자의 분류와 타입 규칙, §15.28 switch 식과 완전성 요구</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-3.html">JVMS (Java SE 21) 3장 Compiling for the Java Virtual Machine</a> — §3.5 비교와 조건 점프, dcmpl/dcmpg의 NaN 처리, §3.10 tableswitch와 lookupswitch</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html">JVMS (Java SE 21) 2장 The Structure of the Java Virtual Machine</a> — §2.3.4 boolean 타입, §2.5.1 pc 레지스터, §2.11.7 제어 이동 명령 목록</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-6.html">JVMS (Java SE 21) 6장 The Java Virtual Machine Instruction Set</a> — if_icmp&lt;cond&gt;, goto, lcmp, lookupswitch, tableswitch 명령의 형식과 동작</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/language/java-language-changes.html">Java Language Changes (Java SE 21 문서)</a> — switch 식이 Java SE 12·13 미리 보기를 거쳐 14에서 확정된 경과(JEP 361), switch 패턴 매칭(JEP 441)</li>
+</x-refs>
+

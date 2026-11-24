@@ -1,0 +1,838 @@
+<x-meta>
+deck: 객체를 누가 만들고 누가 이어 주는지를 따라가며, 컴포넌트 스캔이 클래스 파일을 읽어 빈을 등록하는 과정과 생성자 주입, 자바 설정 클래스의 CGLIB 프록시까지 실행 결과로 확인한다.
+minutes: 100
+</x-meta>
+
+<x-goals>
+<li>객체가 협력 객체를 직접 <code>new</code>로 만들 때 생기는 문제를 객체 그래프로 그려 설명하고, 생성자로 받는 구조로 바꿀 수 있다.</li>
+<li>컴포넌트 스캔이 어느 패키지에서 출발해 무엇을 읽고 어떤 이름으로 빈을 등록하는지 말하고, 스캔 범위 밖의 클래스를 찾을 때 나오는 오류 문구를 해석할 수 있다.</li>
+<li>컨테이너가 생성자 인자를 채우는 과정을 스택 트레이스의 순서로 추적하고, 주입 후보가 0개일 때와 2개일 때 각각 어떤 예외가 나는지 예측할 수 있다.</li>
+<li><code>@Configuration</code> 클래스의 <code>@Bean</code> 메서드를 여러 번 불러도 객체가 하나인 이유를 CGLIB 자식 클래스로 설명하고, <code>proxyBeanMethods = false</code>일 때의 결과를 예측할 수 있다.</li>
+<li>생성자·필드·세터 주입이 일어나는 시점의 차이를 말하고, 컴포넌트 스캔과 자바 설정 가운데 무엇을 쓸지 근거를 들어 고를 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 객체는 누가 만들고 누가 이어 주는가</h3>
+<p>3회에서 백엔드 코드를 세 층으로 나눴다. 요청을 받아 응답을 정하는 컨트롤러, 업무 규칙을 담는 서비스, 데이터를 넣고 꺼내는 리포지토리다. 컨트롤러는 서비스의 메서드를 부르고, 서비스는 리포지토리의 메서드를 부른다. 한 객체가 자기 일을 하려면 다른 객체가 있어야 할 때 "컨트롤러가 서비스에 의존한다"고 말한다.</p>
+<p>이 문장에는 주어가 하나 빠져 있다. 컨트롤러가 쓸 서비스 객체는 누가 만드는가. 그 서비스가 쓸 리포지토리 객체는 누가 만들어서 서비스에게 쥐여 주는가. 클래스를 아무리 잘 나눠도 실행 중인 프로그램에는 객체가 있어야 하고, 객체들은 서로의 참조를 갖고 있어야 한다. 이 회차는 그 일을 누가, 언제, 어떤 순서로 하는지를 다룬다.</p>
+<p>순서는 이렇다. 먼저 스프링 없이 <code>new</code>만으로 객체를 엮어 보고 무엇이 곤란한지 실행 결과로 확인한다. 다음으로 그 문제를 푸는 구조인 의존관계 주입을 순수 자바로 만들고, 컨테이너가 하는 일을 50줄 남짓한 코드로 흉내 낸다. 그 위에서 스프링이 빈을 등록하는 두 가지 방법, 곧 컴포넌트 스캔과 자바 코드 설정을 각각 실행한다. 그리고 한 층 내려가 클래스 파일에 적힌 애노테이션, 리플렉션으로 호출되는 생성자, 설정 클래스를 상속한 CGLIB 자식 클래스가 각각 어떤 역할을 하는지 본다.</p>
+<p>이 강좌의 기준 버전은 Spring Boot 3.x와 Spring Framework 6.x다. 본문의 실행 결과, 예외 문구, 스택 트레이스는 JDK 21(Temurin 21.0.13)에서 Spring Framework 7.0.10의 <code>spring-context</code>만 클래스패스에 올려 직접 실행해 얻었다. 웹 서버 없이 컨테이너만 띄운 것이다. 스프링 소스를 인용하는 곳에는 어느 버전에서 확인했는지 적었다. 예외 문구의 세부와 내부 클래스 이름은 버전에 따라 조금씩 다를 수 있으니, 문구를 외우기보다 어느 부분이 무엇을 말하는지를 읽는 데 집중하자.</p>
+<aside class="note">"컨테이너"라는 말이 두 가지로 쓰인다. 1회에서 본 내장 톰캣은 서블릿을 실행하는 <b>서블릿 컨테이너</b>이고, 이 회차의 주제는 객체를 만들고 이어 주는 <b>스프링 컨테이너</b>다. 이 회차에서 수식어 없이 컨테이너라고 하면 스프링 컨테이너를 뜻한다.</aside>
+
+<h3>직접 new로 엮으면 생기는 일</h3>
+<p>도서를 등록하고 개수를 세는 작은 프로그램으로 시작한다. 저장소는 인터페이스 하나와 메모리 구현 하나로 두고, 서비스가 저장소를, 컨트롤러 둘이 서비스를 쓴다. 필요한 객체는 각자 필드에서 <code>new</code>로 만든다. 스프링은 전혀 쓰지 않는다.</p>
+<pre><code class="language-java">package byhand;
+
+public interface BookRepository {
+    void save(String title);
+    int count();
+}
+
+public class MemoryBookRepository implements BookRepository {
+    private final List<String> store = new ArrayList<>();
+
+    @Override public void save(String title) { store.add(title); }
+    @Override public int count() { return store.size(); }
+}
+
+public class BookService {
+    private final BookRepository bookRepository = new MemoryBookRepository();
+
+    public void register(String title) { bookRepository.save(title); }
+    public int count() { return bookRepository.count(); }
+}
+
+public class RegisterController {
+    private final BookService bookService = new BookService();
+
+    public void register(String title) { bookService.register(title); }
+}
+
+public class ListController {
+    private final BookService bookService = new BookService();
+
+    public int total() { return bookService.count(); }
+}
+
+public class ByHandMain {
+    public static void main(String[] args) {
+        RegisterController register = new RegisterController();
+        ListController list = new ListController();
+
+        register.register("첫 번째 책");
+        register.register("두 번째 책");
+        System.out.println("목록 화면이 센 책 수 = " + list.total());
+    }
+}</code></pre>
+<p>클래스마다 파일을 따로 두어야 하지만 지면을 아끼려고 한 블록에 모았고 import 문은 생략했다. 두 권을 등록했으니 2가 나올 것 같지만 결과는 다르다.</p>
+<pre data-label="실행 결과"><code class="language-text">목록 화면이 센 책 수 = 0</code></pre>
+<p>원인은 힙에 만들어진 객체를 그려 보면 보인다. <code>RegisterController</code>를 만들면 필드 초기화식이 <code>BookService</code>를 하나 만들고, 그 <code>BookService</code>의 필드 초기화식이 <code>MemoryBookRepository</code>를 하나 만든다. <code>ListController</code>를 만들 때 같은 일이 한 번 더 일어난다. 서비스가 둘, 저장소가 둘이다.</p>
+<pre class="diagram">main의 지역 변수            힙
+
+register ──▶ RegisterController ──▶ BookService(1) ──▶ MemoryBookRepository(1)
+                                                        store = [첫 번째 책, 두 번째 책]
+
+list ──────▶ ListController ──────▶ BookService(2) ──▶ MemoryBookRepository(2)
+                                                        store = []</pre>
+<p>등록 화면은 1번 저장소에 책을 넣었고 목록 화면은 2번 저장소를 셌다. 코드 어디에도 문법 오류는 없다. 틀린 것은 객체 그래프의 모양이다. 같은 저장소를 봐야 할 두 화면이 서로 다른 저장소를 보고 있다.</p>
+<p>이 구조에는 문제가 두 가지 더 숨어 있다. 하나는 <code>BookService</code>가 구현 클래스의 이름을 안다는 점이다. 필드 타입은 인터페이스 <code>BookRepository</code>로 선언했지만 <code>new</code>의 오른쪽에 <code>MemoryBookRepository</code>라고 적혀 있다. 저장소를 데이터베이스 구현으로 바꾸려면 서비스의 소스를 열어 고쳐야 한다. 자바 기본편에서 다형성을 배우며 역할과 구현을 나눴는데, 구현을 고르는 코드가 역할을 쓰는 클래스 안에 들어 있으면 그 분리가 절반만 된 것이다.</p>
+<p>다른 하나는 테스트다. <code>BookService</code>의 규칙만 검사하고 싶어도 이 클래스는 생성되는 순간 진짜 저장소를 스스로 만들어 버린다. 검사용 가짜 저장소를 끼워 넣을 틈이 없다. 저장소를 <code>static</code> 필드로 돌려 하나만 있게 만들면 첫 번째 문제는 사라지지만, 구현 클래스 이름이 박혀 있는 문제와 바꿔 끼울 수 없는 문제는 그대로 남는다.</p>
+
+<h3>의존관계 주입: 만드는 일과 쓰는 일을 가른다</h3>
+<p>해법은 단순하다. 필요한 객체를 스스로 만들지 않고 생성자의 매개변수로 받는다. 서비스는 "<code>BookRepository</code> 역할을 하는 객체를 하나 달라"고만 선언하고, 그것이 어떤 구현인지, 몇 개가 만들어졌는지는 신경 쓰지 않는다.</p>
+<pre><code class="language-java">package wired;
+
+public class BookService {
+    private final BookRepository bookRepository;
+
+    public BookService(BookRepository bookRepository) {   // 만들지 않고 받는다
+        this.bookRepository = bookRepository;
+    }
+
+    public void register(String title) { bookRepository.save(title); }
+    public int count() { return bookRepository.count(); }
+}
+
+public class RegisterController {
+    private final BookService bookService;
+
+    public RegisterController(BookService bookService) { this.bookService = bookService; }
+
+    public void register(String title) { bookService.register(title); }
+}
+
+public class ListController {
+    private final BookService bookService;
+
+    public ListController(BookService bookService) { this.bookService = bookService; }
+
+    public int total() { return bookService.count(); }
+}
+
+public class WiredMain {
+    public static void main(String[] args) {
+        // 조립: 어떤 구현을 쓸지, 무엇을 누구에게 줄지는 여기서만 정한다
+        BookRepository repository = new MemoryBookRepository();
+        BookService service = new BookService(repository);
+        RegisterController register = new RegisterController(service);
+        ListController list = new ListController(service);
+
+        register.register("첫 번째 책");
+        register.register("두 번째 책");
+        System.out.println("목록 화면이 센 책 수 = " + list.total());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">목록 화면이 센 책 수 = 2</code></pre>
+<pre class="diagram">register ──▶ RegisterController ──┐
+                                  ├──▶ BookService ──▶ MemoryBookRepository
+list ──────▶ ListController ──────┘                    store = [첫 번째 책, 두 번째 책]</pre>
+<p>바뀐 것을 짚어 보자. <code>BookService</code>의 소스에서 <code>MemoryBookRepository</code>라는 이름이 사라졌다. 구현을 고르는 코드는 <code>main</code>의 한 줄로 옮겨 갔다. 서비스와 저장소가 하나씩만 만들어지고 두 컨트롤러가 같은 서비스를 받는다. 테스트에서는 <code>new BookService(가짜저장소)</code>처럼 원하는 것을 넣어 만들 수 있다.</p>
+<p>이렇게 객체가 자기 협력 객체를 스스로 만들거나 찾지 않고 바깥에서 건네받는 방식을 <b>의존관계 주입</b>(Dependency Injection, DI)이라고 한다. 스프링 레퍼런스의 정의도 같다. 객체는 자기가 함께 일할 다른 객체를 생성자 인자나 세터로만 정의하고, 컨테이너가 빈을 만들 때 그것을 넣어 준다는 것이다. 객체를 만들고 연결하는 결정권이 쓰는 쪽에서 바깥으로 넘어갔다는 뜻에서 <b>제어의 역전</b>(Inversion of Control, IoC)이라는 말도 쓴다.</p>
+<p>의존관계 주입은 스프링의 기능이 아니라 객체를 짜는 방식이다. 위 코드에는 스프링이 한 줄도 없다. 다만 조립하는 코드를 누군가는 써야 한다. <code>main</code>의 네 줄을 다시 보면 조립에는 규칙이 있다. 인자로 줄 객체를 먼저 만들어야 하므로 순서가 있고, 같은 객체를 여러 곳에 주려면 한 번 만든 것을 변수에 잡아 두어야 한다. 클래스가 수백 개로 늘면 이 조립 코드가 길어지고, 클래스를 하나 추가할 때마다 조립 코드도 고쳐야 한다. 이 조립을 대신 맡는 것이 컨테이너다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>조립 라인의 부품 공급</strong><p>조립 라인의 작업자는 자기 자리에서 볼트를 깎아 만들지 않는다. 작업대에는 "이 자리에는 M8 볼트가 필요하다"는 표시만 있고, 부품 창고가 맞는 볼트를 가져다 놓는다. 볼트의 제조사가 바뀌어도 작업자의 손놀림은 그대로다. 생성자의 매개변수가 그 표시이고 컨테이너가 부품 창고다. 비유가 맞지 않는 곳도 있다. 창고는 자리마다 볼트를 하나씩 따로 주지만, 스프링 컨테이너는 기본적으로 같은 객체 하나를 필요한 모든 곳에 건넨다.</p></aside>
+
+<x-visual id="spring-intro-04-new-vs-inject" title="직접 new로 만든 객체 그래프와 주입으로 조립한 객체 그래프의 비교" kind="객체 그래프 비교 그림" ratio="16:9">
+<x-hint>각자 new로 만들면 서비스와 저장소가 둘씩 생겨 데이터가 갈라지고, 바깥에서 조립해 주입하면 하나를 함께 쓴다는 것을 한눈에 대비한다.</x-hint>
+<x-prompt>화면을 좌우 두 칸으로 나눈다. 왼쪽 칸 제목은 "직접 new", 오른쪽 칸 제목은 "바깥에서 주입". 왼쪽 칸: 위아래 두 줄. 윗줄에 둥근 사각형 세 개가 화살표로 이어진다 "RegisterController" → "BookService" → "MemoryBookRepository", 마지막 상자 아래에 작은 책 아이콘 두 개. 아랫줄에 "ListController" → "BookService" → "MemoryBookRepository", 마지막 상자 아래는 비어 있고 "0권"이라고 적는다. 두 줄 사이에는 연결선이 없다. 오른쪽 칸: 왼쪽에 "RegisterController"와 "ListController" 상자 두 개가 위아래로 놓이고, 두 상자에서 나온 화살표가 가운데의 "BookService" 상자 하나로 모인다. "BookService"에서 화살표 하나가 "MemoryBookRepository" 상자 하나로 가고 그 아래에 책 아이콘 두 개와 "2권". 오른쪽 칸 맨 위에 작은 상자 "조립하는 쪽"을 두고 점선 화살표로 네 상자 모두를 가리킨다. 왼쪽 칸의 중복된 상자는 연한 빨강 테두리, 오른쪽 칸의 공유 상자는 연한 초록 테두리.</x-prompt>
+<x-caption>왼쪽은 객체마다 자기 협력 객체를 만들어 저장소가 둘로 갈라진 모습이고, 오른쪽은 바깥에서 하나씩 만들어 건네 모두가 같은 저장소를 보는 모습이다.</x-caption>
+</x-visual>
+
+<h3>컨테이너가 하는 일을 50줄로 흉내 낸다</h3>
+<p>조립을 자동으로 하려면 프로그램이 클래스를 들여다볼 수 있어야 한다. 이 클래스에는 생성자가 무엇이 있는가, 그 생성자는 어떤 타입의 인자를 받는가. 자바는 실행 중에 이런 질문에 답하는 API를 제공하고 이를 <b>리플렉션</b>(reflection)이라 부른다. 자바 중급 1편에서 본 <code>Class</code> 객체가 출발점이다. <code>Class</code> 객체에게 생성자 목록을 달라고 하면 <code>Constructor</code> 객체가 나오고, <code>Constructor</code>에게 매개변수 타입을 물을 수 있으며, 인자 배열을 건네 <code>newInstance</code>를 부르면 객체가 만들어진다. 소스에 <code>new BookService(...)</code>라고 쓰지 않고도 객체를 만들 수 있다는 뜻이다.</p>
+<p>이 도구로 아주 작은 컨테이너를 만들어 본다. 만들 클래스의 목록을 받아서, 생성자가 요구하는 타입을 보고 필요한 객체를 먼저 만들어 넣어 주는 것이 전부다. 대상 클래스들은 앞의 <code>wired</code> 패키지와 같은 모양이고 애노테이션은 하나도 없다.</p>
+<pre><code class="language-java">package tiny;
+
+import java.lang.reflect.Constructor;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+public class TinyContainer {
+    private final List<Class<?>> registered = new ArrayList<>();      // 만들 클래스의 목록
+    private final Map<Class<?>, Object> singletons = new HashMap<>(); // 완성된 객체 보관소
+    private final Set<Class<?>> creating = new HashSet<>();           // 지금 만드는 중인 클래스
+
+    public TinyContainer(Class<?>... classes) throws Exception {
+        registered.addAll(List.of(classes));
+        for (Class<?> c : registered) {
+            getBean(c);                              // 시작할 때 전부 만들어 둔다
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T> T getBean(Class<T> type) throws Exception {
+        Class<?> impl = findImplementation(type);
+        Object existing = singletons.get(impl);
+        if (existing != null) {
+            return (T) existing;                     // 이미 있으면 그 객체를 돌려준다
+        }
+        if (!creating.add(impl)) {
+            throw new IllegalStateException("순환 의존: " + impl.getSimpleName());
+        }
+        Constructor<?> constructor = impl.getDeclaredConstructors()[0];
+        Class<?>[] paramTypes = constructor.getParameterTypes();
+        Object[] args = new Object[paramTypes.length];
+        for (int i = 0; i < paramTypes.length; i++) {
+            args[i] = getBean(paramTypes[i]);        // 인자로 줄 객체부터 구한다(재귀)
+        }
+        Object created = constructor.newInstance(args);
+        System.out.println("생성: " + impl.getSimpleName());
+        creating.remove(impl);
+        singletons.put(impl, created);
+        return (T) created;
+    }
+
+    private Class<?> findImplementation(Class<?> type) {
+        List<Class<?>> found = new ArrayList<>();
+        for (Class<?> c : registered) {
+            if (type.isAssignableFrom(c)) {
+                found.add(c);
+            }
+        }
+        if (found.size() != 1) {
+            throw new IllegalStateException(
+                    type.getSimpleName() + " 타입의 후보가 " + found.size() + "개다");
+        }
+        return found.get(0);
+    }
+}
+
+public class TinyMain {
+    public static void main(String[] args) throws Exception {
+        TinyContainer container = new TinyContainer(
+                BookController.class, BookService.class, MemoryBookRepository.class);
+
+        BookController controller = container.getBean(BookController.class);
+        BookService service = container.getBean(BookService.class);
+        BookRepository repository = container.getBean(BookRepository.class);
+
+        System.out.println(controller.service() == service);
+        System.out.println(service.repository() == repository);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">생성: MemoryBookRepository
+생성: BookService
+생성: BookController
+true
+true</code></pre>
+<p>목록의 첫 번째는 <code>BookController</code>인데 가장 먼저 만들어진 것은 저장소다. 실행을 한 단계씩 따라가면 이유가 드러난다. 표의 "만드는 중"은 <code>creating</code>, "보관소"는 <code>singletons</code>의 내용이다.</p>
+<div class="table-wrap"><table><thead><tr><th>단계</th><th>일어나는 일</th><th>만드는 중</th><th>보관소</th></tr></thead><tbody>
+<tr><td>1</td><td><code>getBean(BookController)</code>. 보관소에 없다. 생성자가 <code>BookService</code>를 요구한다</td><td>Controller</td><td>비어 있음</td></tr>
+<tr><td>2</td><td>안에서 <code>getBean(BookService)</code>. 생성자가 <code>BookRepository</code>를 요구한다</td><td>Controller, Service</td><td>비어 있음</td></tr>
+<tr><td>3</td><td>안에서 <code>getBean(BookRepository)</code>. 목록에서 이 타입에 대입할 수 있는 클래스는 <code>MemoryBookRepository</code> 하나다. 생성자에 인자가 없다</td><td>Controller, Service, Repository</td><td>비어 있음</td></tr>
+<tr><td>4</td><td><code>newInstance()</code>로 저장소를 만들고 보관소에 넣는다. "생성: MemoryBookRepository"</td><td>Controller, Service</td><td>Repository</td></tr>
+<tr><td>5</td><td>2단계로 돌아와 방금 받은 저장소를 인자로 서비스를 만든다. "생성: BookService"</td><td>Controller</td><td>Repository, Service</td></tr>
+<tr><td>6</td><td>1단계로 돌아와 서비스를 인자로 컨트롤러를 만든다. "생성: BookController"</td><td>없음</td><td>Repository, Service, Controller</td></tr>
+<tr><td>7</td><td>반복문이 목록의 나머지 두 클래스로 <code>getBean</code>을 부르지만 둘 다 보관소에 있어 그대로 돌아온다</td><td>없음</td><td>변화 없음</td></tr>
+</tbody></table></div>
+<p>이 작은 코드에 컨테이너의 뼈대가 다 들어 있다. 첫째, 무엇을 만들지 적은 목록이 있다. 둘째, 완성된 객체를 넣어 두는 맵이 있어서 같은 것을 두 번 만들지 않는다. <code>main</code>이 찍은 <code>true</code> 두 줄이 그 결과다. 셋째, 인자를 구하려고 자기 자신을 다시 부르는 재귀가 생성 순서를 저절로 정한다. 조립 코드를 손으로 쓸 때 사람이 지켜야 했던 "의존하는 것부터 먼저"라는 순서를 호출 스택이 대신 지킨다. 넷째, 만드는 중인 것을 기록해 두면 A가 B를 요구하고 B가 다시 A를 요구하는 순환을 알아챌 수 있다.</p>
+<p>스프링 컨테이너는 이 네 가지 위에 많은 것을 더한다. 목록을 사람이 넘기지 않아도 클래스패스에서 찾아내고, 객체에 이름을 붙이고, 생성자 말고 필드나 메서드로도 넣어 주고, 여러 스레드가 동시에 요청해도 안전하게 동작한다. 하지만 뒤에서 스프링의 스택 트레이스를 읽어 보면 뼈대가 이 코드와 같은 모양이라는 것을 확인할 수 있다.</p>
+
+<h3>스프링 컨테이너와 빈: 용어를 실물에 붙인다</h3>
+<p>이제 스프링의 용어를 위 코드의 부품에 하나씩 대응시킨다. 스프링 컨테이너가 만들고 보관하고 관리하는 객체를 <b>스프링 빈</b>(bean)이라고 한다. 빈은 특별한 종류의 클래스가 아니다. 평범한 자바 객체인데 컨테이너의 보관소에 들어 있다는 점만 다르다. 같은 클래스의 객체라도 누군가 <code>new</code>로 따로 만든 것은 빈이 아니다.</p>
+<p>컨테이너의 실체는 <code>ApplicationContext</code> 인터페이스를 구현한 객체다. 이 인터페이스의 상위에 빈을 꺼내는 <code>getBean</code> 메서드를 정의한 <code>BeanFactory</code>가 있다. 스프링 부트의 <code>SpringApplication</code>은 애플리케이션 종류에 맞는 <code>ApplicationContext</code>를 골라 만든다. 스프링 부트 레퍼런스에 따르면 클래스패스에 Spring MVC가 있으면 <code>AnnotationConfigServletWebServerApplicationContext</code>를, Spring MVC도 Spring WebFlux도 없으면 <code>AnnotationConfigApplicationContext</code>를 쓴다. 이 회차의 실험은 뒤의 것을 직접 만들어 쓴다. 웹 서버가 붙지 않을 뿐 빈을 등록하고 만드는 과정은 같은 코드를 탄다.</p>
+<p><code>TinyContainer</code>의 클래스 목록에 해당하는 것이 <b>빈 정의</b>(<code>BeanDefinition</code>)다. 빈 정의는 객체가 아니라 객체를 만드는 방법을 적은 메모다. 어떤 클래스인지, 스코프가 무엇인지, 생성자로 만들지 팩토리 메서드로 만들지 같은 정보가 들어 있다. 컨테이너는 빈 이름을 키로 빈 정의를 모아 둔다.</p>
+<p><code>singletons</code> 맵에 해당하는 것은 <code>DefaultSingletonBeanRegistry</code> 클래스의 <code>singletonObjects</code> 필드다. Spring Framework 6.2.x와 7.0.10의 소스에서 이 필드는 <code>new ConcurrentHashMap<>(256)</code>으로 초기화되는 <code>Map<String, Object></code>이고, 주석에는 "빈 이름에서 빈 인스턴스로 가는 싱글톤 객체 캐시"라고 적혀 있다. 키가 클래스가 아니라 빈 이름이라는 점이 <code>TinyContainer</code>와 다르다. 같은 클래스에는 <code>creating</code>에 해당하는 <code>singletonsCurrentlyInCreation</code>이라는 집합도 있다.</p>
+<pre class="diagram">ApplicationContext
+ │
+ ├─ 빈 정의 목록 (빈 이름 → 만드는 방법)
+ │     bookController        → 클래스 app.BookController,       스코프 singleton
+ │     bookService           → 클래스 app.BookService,          스코프 singleton
+ │     memoryBookRepository  → 클래스 app.MemoryBookRepository, 스코프 singleton
+ │
+ └─ 싱글톤 보관소 singletonObjects (빈 이름 → 완성된 객체)
+       bookController        → BookController 객체        (bookService 객체를 참조한다)
+       bookService           → BookService 객체           (memoryBookRepository 객체를 참조한다)
+       memoryBookRepository  → MemoryBookRepository 객체</pre>
+<p>컨테이너가 시작되는 과정은 이 두 저장소를 차례로 채우는 일이다. <code>ApplicationContext</code>를 초기화하는 메서드는 <code>AbstractApplicationContext.refresh()</code>이고, 그 안에서 부르는 메서드의 순서는 6.2.x와 7.0.10 소스에서 같다. 이 회차와 관계가 깊은 단계만 추리면 다음과 같다.</p>
+<figure class="flow-figure"><figcaption>refresh() 안에서 빈이 등록되고 만들어지는 순서</figcaption><ol class="flow">
+<li><strong>빈 팩토리 준비</strong><span><code>obtainFreshBeanFactory</code>, <code>prepareBeanFactory</code>. 빈 정의와 싱글톤을 담을 빈 팩토리를 준비한다. 이때 빈 정의 목록에는 스프링 내부용 항목과 컨테이너를 만들 때 넘긴 설정 클래스만 올라 있다.</span></li>
+<li><strong>빈 정의 수집</strong><span><code>invokeBeanFactoryPostProcessors</code>. <code>ConfigurationClassPostProcessor</code>가 설정 클래스를 분석한다. <code>@ComponentScan</code>이 있으면 스캔을 실행하고 <code>@Bean</code> 메서드를 찾아 빈 정의로 등록한다. 아직 애플리케이션 객체는 하나도 만들어지지 않았다.</span></li>
+<li><strong>빈 후처리기 등록</strong><span><code>registerBeanPostProcessors</code>. 빈이 만들어질 때 끼어들어 추가 작업을 하는 객체들을 등록한다. <code>@Autowired</code>를 처리하는 <code>AutowiredAnnotationBeanPostProcessor</code>가 여기에 속한다.</span></li>
+<li><strong>싱글톤 전부 생성</strong><span><code>finishBeanFactoryInitialization</code>. 등록된 빈 정의를 차례로 돌며 싱글톤 빈을 만든다. 생성자 인자를 채우는 일이 이 단계에서 일어난다.</span></li>
+<li><strong>완료 알림</strong><span><code>finishRefresh</code>. 컨텍스트가 준비되었다는 이벤트를 발행한다.</span></li>
+</ol></figure>
+<p>등록과 생성이 두 단계로 나뉘어 있다는 점을 기억해 두자. 컨테이너는 먼저 무엇을 만들지를 전부 파악하고, 그다음에 만든다. 그래서 어느 클래스가 먼저 발견되었는지는 주입 결과에 영향을 주지 않는다. 생성 단계에 들어설 때는 모든 후보가 이미 목록에 올라 있다.</p>
+
+<x-visual id="spring-intro-04-container-two-stores" title="스프링 컨테이너 안의 빈 정의 목록과 싱글톤 보관소" kind="구조 다이어그램" ratio="16:9">
+<x-hint>컨테이너가 '만드는 방법'을 담은 빈 정의 목록과 '완성된 객체'를 담은 싱글톤 보관소를 따로 갖고 있고, 등록 단계와 생성 단계가 나뉘어 있음을 보여 준다.</x-hint>
+<x-prompt>큰 둥근 사각형 하나를 그리고 위쪽에 "ApplicationContext"라고 적는다. 그 안에 좌우로 두 개의 패널을 둔다. 왼쪽 패널 제목은 "빈 정의 목록", 부제 "만드는 방법". 안에 세 줄의 카드가 세로로 놓인다: "bookController", "bookService", "memoryBookRepository". 각 카드는 설계 도면 아이콘과 함께 그린다. 오른쪽 패널 제목은 "싱글톤 보관소", 부제 "완성된 객체". 안에 같은 이름표가 붙은 세 개의 원(객체)이 세로로 놓이고, 맨 위 원에서 가운데 원으로, 가운데 원에서 맨 아래 원으로 실선 화살표가 내려간다(참조). 두 패널 사이에 왼쪽에서 오른쪽으로 가는 굵은 화살표를 그리고 그 위에 "생성 단계"라고 적는다. 큰 사각형 바깥 왼쪽에는 ".class 파일" 아이콘 묶음을 두고 왼쪽 패널로 가는 화살표에 "등록 단계"라고 적는다. 왼쪽 패널은 연한 파랑, 오른쪽 패널은 연한 초록.</x-prompt>
+<x-caption>컨테이너는 만드는 방법(빈 정의)을 먼저 모두 모으고, 그 목록을 돌며 객체를 만들어 싱글톤 보관소에 넣는다.</x-caption>
+</x-visual>
+
+<h3>컴포넌트 스캔 1: 애노테이션 세 개와 실행 결과</h3>
+<p>첫 번째 등록 방법은 클래스에 표시를 붙여 두고 컨테이너가 찾아가게 하는 것이다. 컨트롤러에는 <code>@Controller</code>, 서비스에는 <code>@Service</code>, 저장소 구현에는 <code>@Repository</code>를 붙인다. 생성자는 앞에서 만든 모양 그대로다. 언제 무엇이 만들어지는지 보려고 생성자에 출력문을 넣었다.</p>
+<pre><code class="language-java">package app;
+
+public interface BookRepository {
+    void save(String title);
+    int count();
+}
+
+@Repository
+public class MemoryBookRepository implements BookRepository {
+    private final List<String> store = new ArrayList<>();
+
+    public MemoryBookRepository() {
+        System.out.println("MemoryBookRepository 생성");
+    }
+
+    @Override public void save(String title) { store.add(title); }
+    @Override public int count() { return store.size(); }
+}
+
+@Service
+public class BookService {
+    private final BookRepository bookRepository;
+
+    public BookService(BookRepository bookRepository) {
+        this.bookRepository = bookRepository;
+        System.out.println("BookService 생성, 받은 것 = "
+                + bookRepository.getClass().getSimpleName());
+    }
+
+    public void register(String title) { bookRepository.save(title); }
+    public int count() { return bookRepository.count(); }
+    BookRepository repository() { return bookRepository; }
+}
+
+@Controller
+public class BookController {
+    private final BookService bookService;
+
+    public BookController(BookService bookService) {
+        this.bookService = bookService;
+        System.out.println("BookController 생성, 받은 것 = "
+                + bookService.getClass().getSimpleName());
+    }
+
+    BookService service() { return bookService; }
+}
+
+@Configuration
+@ComponentScan
+public class ShopApplication {
+    public static void main(String[] args) {
+        System.out.println("컨테이너 생성 시작");
+        var context = new AnnotationConfigApplicationContext(ShopApplication.class);
+        System.out.println("컨테이너 생성 끝");
+
+        for (String name : context.getBeanDefinitionNames()) {
+            if (!name.startsWith("org.springframework")) {
+                System.out.println("빈 이름 = " + name);
+            }
+        }
+
+        BookController controller = context.getBean(BookController.class);
+        BookService service = context.getBean(BookService.class);
+        BookRepository repository = context.getBean(BookRepository.class);
+
+        System.out.println(controller.service() == service);
+        System.out.println(service.repository() == repository);
+        System.out.println(context.getBean("bookService") == service);
+        context.close();
+    }
+}</code></pre>
+<p>세 애노테이션은 <code>org.springframework.stereotype</code> 패키지에, <code>@Configuration</code>과 <code>@ComponentScan</code>, <code>AnnotationConfigApplicationContext</code>는 <code>org.springframework.context.annotation</code> 패키지에 있다. 스프링 부트 프로젝트라면 <code>ShopApplication</code> 자리에 <code>@SpringBootApplication</code>이 붙은 메인 클래스가 오고 <code>SpringApplication.run</code>이 컨테이너를 만든다. 스프링이 내부용으로 등록하는 빈은 이름이 <code>org.springframework</code>로 시작하므로 출력에서 걸러 냈다.</p>
+<pre data-label="실행 결과"><code class="language-text">컨테이너 생성 시작
+MemoryBookRepository 생성
+BookService 생성, 받은 것 = MemoryBookRepository
+BookController 생성, 받은 것 = BookService
+컨테이너 생성 끝
+빈 이름 = shopApplication
+빈 이름 = bookController
+빈 이름 = bookService
+빈 이름 = memoryBookRepository
+true
+true
+true</code></pre>
+<p>이 출력에서 읽을 것이 다섯 가지다. 첫째, 세 객체는 "컨테이너 생성 시작"과 "컨테이너 생성 끝" 사이에 만들어졌다. 누가 <code>getBean</code>으로 요청하기 전이다. 스프링 레퍼런스는 싱글톤 스코프이면서 미리 생성하도록 설정된 빈(기본값이다)은 컨테이너가 만들어질 때 함께 만들어진다고 적고 있다.</p>
+<p>둘째, 빈 정의가 등록된 순서와 객체가 만들어진 순서가 다르다. 이름 목록에서는 <code>bookController</code>가 앞인데 생성 로그에서는 저장소가 먼저다. <code>TinyContainer</code>에서 본 것과 같은 현상이다. 컨테이너는 <code>bookController</code>부터 만들려고 했지만, 생성자 인자를 구하러 들어가면서 서비스가, 다시 그 인자를 구하러 들어가면서 저장소가 먼저 완성되었다.</p>
+<p>셋째, <code>BookService</code>의 생성자는 <code>BookRepository</code> 인터페이스를 요구했는데 실제로 받은 것은 <code>MemoryBookRepository</code>다. 컨테이너가 그 타입에 대입할 수 있는 빈을 찾아 넣었다. 넷째, 주입된 객체와 <code>getBean</code>으로 꺼낸 객체를 <code>==</code>로 비교하면 모두 <code>true</code>다. 컨트롤러가 가진 서비스와 컨테이너에서 타입으로 꺼낸 서비스, 이름 <code>"bookService"</code>로 꺼낸 서비스가 전부 같은 객체 하나다. 다섯째, <code>ShopApplication</code> 자신도 <code>shopApplication</code>이라는 이름의 빈으로 등록되어 있다. 설정 클래스도 빈이다.</p>
+
+<h3>컴포넌트 스캔 2: 애노테이션은 어디에 적혀 있고 누가 읽는가</h3>
+<p><code>@Service</code>를 붙였다고 클래스의 동작이 달라지지는 않는다. 애노테이션은 실행되는 코드가 아니라 클래스에 붙이는 표식이다. 컴파일러는 이 표식을 클래스 파일에 기록해 둘 뿐이고, 누군가 그것을 읽어 행동할 때에만 의미가 생긴다. 기록되는 위치는 JVM 명세가 정한 <code>RuntimeVisibleAnnotations</code> 속성(JVMS §4.7.16)이다. <code>javap -v</code>로 컴파일된 <code>BookService.class</code>를 열면 끝부분에 다음이 보인다. <code>#59</code>는 상수 풀 번호이고 소스에 따라 달라진다.</p>
+<pre data-label="javap -v app.BookService 출력의 일부"><code class="language-text">RuntimeVisibleAnnotations:
+  0: #59()
+    org.springframework.stereotype.Service</code></pre>
+<p>그런데 스캐너가 찾는 표식은 <code>@Service</code>가 아니라 <code>@Component</code>다. 스프링이 제공하는 <code>Service.class</code> 파일을 같은 방법으로 열어 보면 이유를 알 수 있다.</p>
+<pre data-label="javap -v org.springframework.stereotype.Service 출력의 일부"><code class="language-text">RuntimeVisibleAnnotations:
+  0: #17(#7=[e#18.#19])
+    java.lang.annotation.Target(
+      value=[Ljava/lang/annotation/ElementType;.TYPE]
+    )
+  1: #20(#7=e#21.#22)
+    java.lang.annotation.Retention(
+      value=Ljava/lang/annotation/RetentionPolicy;.RUNTIME
+    )
+  2: #23()
+    java.lang.annotation.Documented
+  3: #14()
+    org.springframework.stereotype.Component</code></pre>
+<p><code>@Service</code>라는 애노테이션 선언 자체에 <code>@Component</code>가 붙어 있다. 애노테이션에 붙은 애노테이션을 메타 애노테이션(meta-annotation)이라 하고, 스프링은 어떤 클래스에 <code>@Component</code>가 직접 붙었거나 메타 애노테이션으로 붙어 있으면 스캔 대상으로 본다. <code>@Controller</code>와 <code>@Repository</code>도 같은 구조다. 레퍼런스는 <code>@Component</code>를 스프링이 관리하는 컴포넌트를 가리키는 일반 표식으로, 나머지 셋을 각각 프레젠테이션·서비스·영속성 계층을 위한 특수화로 설명한다. 두 번째 항목의 <code>RetentionPolicy.RUNTIME</code>은 이 애노테이션을 클래스 파일에 남기고 실행 중에도 읽을 수 있게 하라는 지정이다.</p>
+<p>셋 가운데 어느 것을 붙여도 빈으로 등록된다는 결과는 같다. 차이는 그 위에 얹히는 부가 기능에 있다. 스프링 MVC는 <code>@Controller</code>가 붙은 빈에서 요청을 처리할 메서드를 찾고, <code>@Repository</code>는 데이터 접근 예외를 스프링의 예외로 바꿔 주는 기능의 표식으로도 쓰인다. <code>@Service</code>에는 부가 동작이 없고 이 클래스가 업무 로직 계층이라는 사실을 읽는 사람에게 알려 준다.</p>
+
+<h4>스캐너는 클래스를 로딩하지 않고 파일을 읽는다</h4>
+<p>스캔의 실제 동작을 소스로 확인하면 이렇다(6.2.x와 7.0.10에서 같다). <code>ClassPathScanningCandidateComponentProvider</code>는 기준 패키지 이름을 경로로 바꾸고 뒤에 <code>**/*.class</code>를 붙여 클래스패스에서 그 패턴에 맞는 파일을 전부 찾는다. 파일 하나하나는 <code>SimpleMetadataReader</code>가 읽는데, 이 클래스는 바이트코드 조작 라이브러리 ASM의 <code>ClassReader</code>로 클래스 파일의 바이트를 직접 해석한다. 읽기 옵션에는 메서드 본문을 건너뛰라는 <code>SKIP_CODE</code>가 들어 있다. 클래스 이름, 상위 타입, 붙어 있는 애노테이션 같은 겉 정보만 뽑는 것이다. 그 정보에 <code>@Component</code>가 있으면 빈 정의를 만들어 등록한다.</p>
+<p>여기서 중요한 점은 이 과정에서 클래스가 JVM에 로딩되지 않는다는 것이다. 자바 기본편에서 본 대로 클래스 로딩은 클래스 정보를 메서드 영역에 올리는 일이고, 한 클래스를 올리려면 그 상위 클래스와 인터페이스도 함께 올려야 한다. 스캐너는 파일을 데이터로 읽을 뿐이므로 후보가 아닌 클래스는 끝까지 JVM에 올라오지 않는다. 확인해 보자. <code>app</code> 패키지에 애노테이션이 없는 <code>PlainHelper</code> 클래스를 하나 추가하고 클래스 로딩 로그를 켜는 <code>-Xlog:class+load</code> 옵션으로 실행한다. 아래는 그 출력에서 <code>app</code> 패키지와 관련된 줄만 추리고 시각과 경로를 지운 것이다.</p>
+<pre data-label="java -Xlog:class+load ... app.ShopApplication 출력에서 추린 것"><code class="language-text">[info][class,load] app.ShopApplication source: file:(생략)
+컨테이너 생성 시작
+[info][class,load] app.BookController source: file:(생략)
+[info][class,load] app.BookService source: file:(생략)
+[info][class,load] app.BookRepository source: file:(생략)
+[info][class,load] app.MemoryBookRepository source: file:(생략)
+MemoryBookRepository 생성
+BookService 생성, 받은 것 = MemoryBookRepository
+BookController 생성, 받은 것 = BookService
+컨테이너 생성 끝</code></pre>
+<p><code>PlainHelper</code>는 같은 디렉터리에 <code>.class</code> 파일로 놓여 있고 스캐너가 그 파일을 열어 봤지만 로딩 로그에는 나오지 않는다. 빈이 될 클래스들만 객체를 만들기 직전에 로딩되었다. <code>BookRepository</code> 인터페이스는 애노테이션이 없는데도 로딩되었는데, 이것은 스캔 때문이 아니라 그것을 구현한 클래스와 그것을 매개변수로 쓰는 생성자를 다루려면 JVM이 이 타입을 알아야 하기 때문이다.</p>
+<aside class="note">Spring Framework 7.0의 <code>MetadataReader</code> Javadoc은 Java 24 이상에서는 ASM 대신 JDK의 <code>java.lang.classfile</code> API로 클래스 파일을 읽는다고 적고 있다. 어느 쪽이든 클래스를 로딩하지 않고 파일의 메타데이터를 읽는다는 점은 같다.</aside>
+
+<h4>어디서부터 훑는가</h4>
+<p><code>@ComponentScan</code>의 Javadoc은 패키지를 지정하지 않으면 이 애노테이션을 선언한 클래스의 패키지부터 하위 패키지로 내려가며 스캔한다고 정해 둔다. 위 예제에서는 <code>ShopApplication</code>이 <code>app</code> 패키지에 있으므로 <code>app</code>과 그 아래가 범위다. 스프링 부트의 <code>@SpringBootApplication</code>은 <code>@ComponentScan</code>을 포함하고 있어서 메인 클래스의 패키지가 스캔의 출발점이 된다. 스프링 부트 레퍼런스가 메인 클래스를 다른 클래스들보다 위에 있는 루트 패키지에 두라고 권하는 이유가 이것이다.</p>
+<p>범위 밖에 있는 클래스는 애노테이션이 붙어 있어도 발견되지 않는다. <code>outside</code>라는 별도 패키지에 <code>@Service</code>가 붙은 <code>AuditService</code>를 만들고 위 컨테이너에서 <code>context.getBean(AuditService.class)</code>를 부르면 다음 예외가 난다.</p>
+<pre data-label="실행 결과"><code class="language-text">NoSuchBeanDefinitionException: No qualifying bean of type 'outside.AuditService' available</code></pre>
+<p>주의할 것은 컨테이너가 시작될 때는 아무 경고도 없었다는 점이다. 스캐너 입장에서 범위 밖의 클래스는 존재하지 않는 것과 같다. 그 클래스를 누군가 주입받으려 하거나 꺼내려 할 때에야 "그런 타입의 빈이 없다"는 형태로 드러난다. 반대로 범위를 너무 넓게 잡는 것도 문제다. 스프링 부트 레퍼런스는 패키지 선언이 없는 기본 패키지에 메인 클래스를 두면 모든 JAR의 모든 클래스를 읽게 된다며 피하라고 경고한다.</p>
+
+<h4>빈 이름은 어떻게 정해지는가</h4>
+<p>이름을 따로 주지 않으면 패키지를 뗀 클래스 이름의 첫 글자를 소문자로 바꾼 것이 빈 이름이 된다. <code>BookService</code>는 <code>bookService</code>다. 예외가 하나 있다. 이름을 만드는 <code>AnnotationBeanNameGenerator</code>가 쓰는 <code>StringUtils.uncapitalizeAsProperty</code>는 첫 두 글자가 모두 대문자이면 이름을 그대로 둔다. 세 클래스를 스캔한 결과가 이를 보여 준다. <code>URLParser</code>와 <code>XmlParser</code>에는 <code>@Component</code>를, 세 번째 클래스 <code>Named</code>에는 <code>@Service("mainParser")</code>를 붙였다.</p>
+<pre data-label="실행 결과"><code class="language-text">빈 이름 = mainParser
+빈 이름 = URLParser
+빈 이름 = xmlParser</code></pre>
+<p>이름이 패키지를 포함하지 않는다는 점에서 충돌이 생길 수 있다. 두 패키지 <code>err.dup.a</code>와 <code>err.dup.b</code>에 같은 이름의 클래스 <code>Parser</code>가 하나씩 있고 둘 다 <code>@Component</code>라면 두 빈 정의가 모두 <code>parser</code>라는 이름을 갖게 된다. 스캐너는 이것을 덮어쓰지 않고 예외로 멈춘다.</p>
+<pre data-label="실행 결과"><code class="language-text">ConflictingBeanDefinitionException: Annotation-specified bean name 'parser' for bean class [err.dup.b.Parser] conflicts with existing, non-compatible bean definition of same name and class [err.dup.a.Parser]</code></pre>
+
+<x-visual id="spring-intro-04-scan-pipeline" title="컴포넌트 스캔이 클래스 파일에서 빈 정의를 만들고 객체로 이어지는 흐름" kind="순서도" ratio="16:9">
+<x-hint>스캔은 클래스를 로딩하지 않고 .class 파일의 애노테이션 정보를 읽어 후보를 가려낸 뒤 빈 정의를 등록하며, 객체 생성은 그다음 단계라는 것을 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 흐르는 다섯 단계의 순서도. 1단계: 폴더 아이콘과 그 안의 파일 아이콘 네 개, 라벨 "기준 패키지의 .class 파일". 파일 네 개 중 세 개에는 작은 꼬리표가 붙어 있고 하나에는 없다. 2단계: 돋보기 아이콘이 파일 위에 놓인 상자, 라벨 "파일의 애노테이션 정보만 읽기". 3단계: 깔때기 아이콘, 라벨 "@Component가 있는가". 깔때기 아래로 꼬리표 없는 파일 하나가 떨어져 나가고 그 옆에 "후보 아님: 로딩되지 않음"이라고 적는다. 4단계: 설계 도면 카드 세 장, 라벨 "빈 정의 등록". 5단계: 원 세 개가 화살표로 이어진 그림, 라벨 "싱글톤 생성과 주입". 1~4단계 아래에 가로로 긴 괄호를 치고 "등록 단계", 5단계 아래에 "생성 단계"라고 적는다. 단계 사이는 굵은 화살표로 잇는다.</x-prompt>
+<x-caption>스캐너는 기준 패키지 아래의 클래스 파일을 읽어 @Component가 있는 것만 빈 정의로 등록한다. 객체는 그 뒤의 생성 단계에서 만들어진다.</x-caption>
+</x-visual>
+
+<h3>자동 의존관계 설정: 생성자 인자는 어떻게 채워지는가</h3>
+<p>컴포넌트 스캔이 한 일은 빈 정의를 등록한 데까지다. <code>BookService</code>의 생성자에 저장소를 넣어 준 것은 별개의 장치다. 생성자나 필드, 메서드에 <code>@Autowired</code>를 붙이면 "이 자리를 컨테이너에 있는 빈으로 채워 달라"는 표시가 된다. 그런데 앞의 예제에는 <code>@Autowired</code>가 어디에도 없었는데 주입이 일어났다. <code>@Autowired</code>의 Javadoc에 그 규칙이 적혀 있다. 클래스가 생성자를 하나만 선언했다면 애노테이션이 없어도 그 생성자가 쓰인다. 생성자가 여러 개인데 어느 것에도 <code>@Autowired</code>가 없으면 기본 생성자(있다면)가 쓰이므로, 다른 생성자를 쓰게 하려면 그 생성자에 <code>@Autowired</code>를 붙여 알려 줘야 한다.</p>
+<p>인자를 고르는 기준은 타입이다. 컨테이너는 생성자의 매개변수 타입 <code>BookRepository</code>를 보고, 등록된 빈 정의 가운데 그 타입에 대입할 수 있는 것을 찾는다. <code>TinyContainer</code>의 <code>findImplementation</code>이 하던 일이다. 후보가 정확히 하나이면 그 빈을 구해 인자로 넘긴다. 그 빈이 아직 만들어지지 않았다면 이때 만들어진다.</p>
+<p>이 과정이 실제로 어떤 호출로 이루어지는지 스택 트레이스로 확인한다. 서비스와 저장소 두 클래스만 두고, <code>MemoryBookRepository</code>의 생성자 안에서 <code>new Throwable().getStackTrace()</code>를 출력했다. 아래는 Spring Framework 7.0.10에서 얻은 결과에서 클래스의 패키지 이름을 떼고 중간 프레임 일부를 생략한 것이다. 오른쪽의 번호와 설명은 덧붙였다. 스택은 아래가 먼저 호출된 쪽이므로 번호 순서대로 아래에서 위로 읽는다.</p>
+<pre data-label="MemoryBookRepository 생성자 안에서 찍은 호출 스택 (일부 생략)"><code class="language-text">  at MemoryBookRepository.<init>
+  at Constructor.newInstance                               (7) 리플렉션으로 생성자를 호출한다
+  at BeanUtils.instantiateClass
+  at AbstractAutowireCapableBeanFactory.createBean         (6) memoryBookRepository 빈을 만든다
+  at DefaultSingletonBeanRegistry.getSingleton             (5) 보관소에 없으므로 만들러 간다
+  at AbstractBeanFactory.getBean
+  at DefaultListableBeanFactory.resolveDependency          (4) 매개변수 타입에 맞는 빈을 찾는다
+  at ConstructorResolver.autowireConstructor               (3) BookService 생성자의 인자를 채운다
+  at AbstractAutowireCapableBeanFactory.createBean         (2) bookService 빈을 만든다
+  at DefaultSingletonBeanRegistry.getSingleton
+  at AbstractBeanFactory.getBean
+  at DefaultListableBeanFactory.preInstantiateSingletons   (1) 싱글톤을 미리 전부 만든다
+  at AbstractApplicationContext.finishBeanFactoryInitialization
+  at AbstractApplicationContext.refresh
+  at AnnotationConfigApplicationContext.<init>
+  at Main.main</code></pre>
+<p><code>getBean</code>, <code>getSingleton</code>, <code>createBean</code>으로 이어지는 묶음이 두 번 나온다. 아래쪽 묶음은 <code>bookService</code>를 만드는 호출이고, 위쪽 묶음은 그 생성자의 인자를 구하다가 <code>memoryBookRepository</code>를 만들러 들어간 호출이다. <code>TinyContainer.getBean</code>이 자기 자신을 다시 부르던 재귀와 같은 모양이다. 맨 위의 <code>Constructor.newInstance</code>는 앞에서 직접 쓴 그 리플렉션 API다. 스프링이 객체를 만드는 방법에 숨은 장치는 없다. 클래스 파일에서 읽은 정보로 생성자를 고르고, 인자를 구하고, 리플렉션으로 호출한다.</p>
+
+<h4>후보가 없을 때</h4>
+<p><code>MemoryBookRepository</code>에서 <code>@Repository</code>를 떼고 실행하면 컨테이너가 뜨지 못한다. 클래스 파일의 경로는 줄였다.</p>
+<pre data-label="실행 결과 (예외 메시지)"><code class="language-text">UnsatisfiedDependencyException: Error creating bean with name 'bookService' defined in file [.../nobean/BookService.class]: Unsatisfied dependency expressed through constructor parameter 0: No qualifying bean of type 'nobean.BookRepository' available: expected at least 1 bean which qualifies as autowire candidate. Dependency annotations: {}</code></pre>
+<p>긴 문장이지만 세 토막으로 끊어 읽으면 된다. 어떤 빈을 만들다가 실패했는가는 <code>bookService</code>다. 어느 자리를 채우지 못했는가는 생성자의 0번 매개변수다. 무엇이 없었는가는 <code>BookRepository</code> 타입의 빈이다. 이 예외의 원인 예외는 <code>NoSuchBeanDefinitionException</code>이다. <code>MemoryBookRepository</code> 클래스는 클래스패스에 멀쩡히 있다. 없는 것은 그 클래스의 빈 정의다. 클래스가 있다는 것과 빈이 있다는 것은 다른 말이다.</p>
+
+<h4>후보가 둘일 때</h4>
+<p>반대로 <code>BookRepository</code>를 구현한 클래스가 <code>MemoryBookRepository</code>와 <code>FileBookRepository</code> 둘이고 둘 다 <code>@Repository</code>가 붙어 있으면 이렇게 된다.</p>
+<pre data-label="실행 결과 (예외 메시지)"><code class="language-text">UnsatisfiedDependencyException: Error creating bean with name 'bookService' defined in file [.../twobeans/BookService.class]: Unsatisfied dependency expressed through constructor parameter 0: No qualifying bean of type 'twobeans.BookRepository' available: expected single matching bean but found 2: fileBookRepository,memoryBookRepository</code></pre>
+<p>원인 예외는 <code>NoUniqueBeanDefinitionException</code>이고 메시지 끝에 후보의 빈 이름이 나열된다. 컨테이너는 둘 가운데 아무거나 고르지 않는다. 어느 쪽이 맞는지 알 방법이 없기 때문이다. 이럴 때는 후보 하나에 <code>@Primary</code>를 붙여 우선 후보로 지정하거나, 주입받는 자리에 <code>@Qualifier</code>로 원하는 빈을 지목한다. 후보가 여럿일 때의 선택 규칙은 스프링 핵심 원리 기본편에서 자세히 다룬다.</p>
+<p>두 오류 모두 컨테이너가 만들어지는 도중에 났다는 점이 중요하다. 싱글톤을 시작할 때 전부 만들기 때문에 배선이 틀린 애플리케이션은 아예 뜨지 않는다. 첫 요청이 들어온 뒤에야 문제가 드러나는 것보다 훨씬 일찍 알 수 있다. 스프링 부트에는 빈을 필요할 때 만드는 지연 초기화 설정(<code>spring.main.lazy-initialization</code>)이 있지만 레퍼런스가 밝히듯 기본값은 꺼져 있다.</p>
+
+<h3>싱글톤: "하나"가 뜻하는 범위</h3>
+<p>스프링 빈의 기본 스코프(scope)는 싱글톤(singleton)이다. 레퍼런스의 정의로는 빈 정의 하나에 대해 컨테이너마다 객체를 하나만 두는 것이다. 디자인 패턴에서 말하는 싱글톤 패턴과는 범위가 다르다. 레퍼런스는 그 차이를 이렇게 설명한다. 싱글톤 패턴은 클래스 로더마다 그 클래스의 객체가 하나만 만들어지도록 클래스 안에 범위를 박아 넣은 것이고, 스프링의 싱글톤은 "컨테이너마다, 빈마다" 하나다.</p>
+<p>실험으로 확인한다. 같은 설정으로 컨테이너를 두 개 만들고 서비스 빈을 비교했다.</p>
+<pre><code class="language-java">var first = new AnnotationConfigApplicationContext(ShopApplication.class);
+var second = new AnnotationConfigApplicationContext(ShopApplication.class);
+
+System.out.println(first.getBean(BookService.class) == second.getBean(BookService.class));
+System.out.println(first.getBean(BookService.class) == first.getBean(BookService.class));</code></pre>
+<pre data-label="실행 결과 (생성 로그는 뺐다)"><code class="language-text">false
+true</code></pre>
+<p>한 JVM 안에 <code>BookService</code> 객체가 둘 있다. 컨테이너가 둘이기 때문이다. 한 컨테이너에서는 몇 번을 꺼내도 같은 객체가 나온다. <code>BookService</code>의 생성자는 <code>public</code>이므로 누구든 <code>new BookService(...)</code>로 객체를 더 만들 수 있다. 다만 그렇게 만든 것은 컨테이너의 보관소에 들어 있지 않으므로 빈이 아니다. 하나임을 보장하는 것은 클래스가 아니라 컨테이너의 보관소다.</p>
+<p>하나를 모두가 함께 쓴다는 사실에는 대가가 따른다. 웹 애플리케이션에서 요청은 서블릿 컨테이너의 스레드 풀에 있는 스레드가 처리한다. 동시에 들어온 요청들은 서로 다른 스레드에서 실행되지만 그 스레드들이 호출하는 <code>BookService</code> 객체는 하나다. 메서드의 매개변수와 지역 변수는 스레드마다 따로 있는 스택에 놓이므로 서로 섞이지 않는다. 필드는 다르다. 필드는 힙에 있는 그 객체 하나에 속하므로 모든 스레드가 같은 칸을 읽고 쓴다.</p>
+<p>그래서 싱글톤 빈의 필드에는 요청마다 달라지는 값을 두지 않는다. 현재 요청을 보낸 사용자나 처리 중인 주문 같은 값을 필드에 적어 두면, 다른 스레드가 그 칸을 덮어쓰는 순간 엉뚱한 사용자의 값으로 일을 하게 된다. 싱글톤 빈의 필드에는 주입받은 다른 빈의 참조처럼 한 번 정해지고 바뀌지 않는 것만 두는 것이 기본이다. 예제의 서비스와 컨트롤러가 <code>final</code> 필드 하나씩만 가진 것이 그 모양이다.</p>
+<p>예제의 <code>MemoryBookRepository</code>는 <code>store</code>라는 변경되는 필드를 갖고 있다. 저장소는 여러 요청이 함께 보는 데이터를 담는 것이 목적이므로 상태를 갖는 것 자체는 의도한 것이다. 다만 <code>ArrayList</code>는 동기화되지 않은 구현이어서 여러 스레드가 동시에 <code>add</code>를 부르는 상황에는 안전하지 않다. 학습용 메모리 저장소의 한계이고, 데이터베이스를 쓰면 동시 접근을 조율하는 책임이 데이터베이스로 넘어간다. 여러 스레드가 한 객체를 함께 쓸 때 생기는 문제는 자바 고급 1편에서 본격적으로 다룬다.</p>
+
+<h3>자바 코드로 직접 스프링 빈 등록하기</h3>
+<p>두 번째 등록 방법은 클래스에 표식을 붙이지 않고, 객체를 만드는 코드를 설정 클래스에 직접 적는 것이다. 앞에서 <code>WiredMain</code>에 손으로 쓴 조립 코드를 컨테이너가 읽을 수 있는 형식으로 옮긴다고 보면 된다. 서비스와 저장소 클래스에서 스프링 애노테이션을 모두 뗀다. 이 클래스들은 스프링의 존재를 모른다. 저장소를 함께 쓰는 서비스를 하나 더 두었고, 이 실험에서는 저장소의 메서드가 필요 없어 인터페이스를 비워 두었다.</p>
+<pre><code class="language-java">package manual;
+
+public interface BookRepository { }
+
+public class MemoryBookRepository implements BookRepository {
+    public MemoryBookRepository() { System.out.println("MemoryBookRepository 생성"); }
+}
+
+public class BookService {
+    private final BookRepository bookRepository;
+
+    public BookService(BookRepository bookRepository) {
+        this.bookRepository = bookRepository;
+        System.out.println("BookService 생성");
+    }
+
+    BookRepository repository() { return bookRepository; }
+}
+
+public class LoanService {
+    private final BookRepository bookRepository;
+
+    public LoanService(BookRepository bookRepository) {
+        this.bookRepository = bookRepository;
+        System.out.println("LoanService 생성");
+    }
+
+    BookRepository repository() { return bookRepository; }
+}
+
+@Configuration
+public class AppConfig {
+
+    @Bean
+    public BookRepository bookRepository() {
+        System.out.println("bookRepository() 본문 실행");
+        return new MemoryBookRepository();
+    }
+
+    @Bean
+    public BookService bookService() {
+        return new BookService(bookRepository());
+    }
+
+    @Bean
+    public LoanService loanService() {
+        return new LoanService(bookRepository());
+    }
+}
+
+public class ConfigMain {
+    public static void main(String[] args) {
+        var context = new AnnotationConfigApplicationContext(AppConfig.class);
+
+        Object config = context.getBean(AppConfig.class);
+        System.out.println("설정 객체의 클래스 = " + config.getClass().getName());
+        System.out.println("부모 클래스 = " + config.getClass().getSuperclass().getName());
+
+        BookRepository repository = context.getBean(BookRepository.class);
+        System.out.println(context.getBean(BookService.class).repository() == repository);
+        System.out.println(context.getBean(LoanService.class).repository() == repository);
+        context.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">bookRepository() 본문 실행
+MemoryBookRepository 생성
+BookService 생성
+LoanService 생성
+설정 객체의 클래스 = manual.AppConfig$$SpringCGLIB$$0
+부모 클래스 = manual.AppConfig
+true
+true</code></pre>
+<p><code>@Bean</code>이 붙은 메서드 하나가 빈 정의 하나가 된다. 메서드가 돌려주는 객체가 빈이고, 따로 지정하지 않으면 메서드 이름이 빈 이름이다. 이 컨테이너의 빈 이름을 출력하면 <code>appConfig</code>, <code>bookRepository</code>, <code>bookService</code>, <code>loanService</code>가 나온다. 컴포넌트 스캔에서는 구현 클래스 이름을 따라 <code>memoryBookRepository</code>였던 이름이 여기서는 <code>bookRepository</code>가 되었다는 점도 눈여겨보자.</p>
+<p><code>@Bean</code> 메서드를 호출하는 것은 컨테이너다. 등록 단계에서 컨테이너는 "<code>bookService</code> 빈은 <code>appConfig</code> 빈의 <code>bookService</code> 메서드를 불러서 얻는다"는 빈 정의를 만들어 둔다. 생성 단계에서는 생성자를 리플렉션으로 호출하던 자리에서 대신 그 메서드를 리플렉션(<code>Method.invoke</code>)으로 호출하고, 돌려받은 객체를 싱글톤 보관소에 넣는다. 객체를 <code>new</code>로 만드는 코드는 개발자가 썼지만, 그 코드가 언제 몇 번 실행될지는 컨테이너가 정한다.</p>
+
+<h4>메서드는 세 번 불리는데 객체는 하나다</h4>
+<p>소스만 보면 <code>bookRepository()</code>는 세 번 호출된다. 컨테이너가 <code>bookRepository</code> 빈을 만들려고 한 번, <code>bookService()</code>의 본문에서 한 번, <code>loanService()</code>의 본문에서 한 번이다. 평범한 자바 코드라면 <code>new MemoryBookRepository()</code>가 세 번 실행되어 저장소가 셋 생기고, 이 회차 첫머리에서 본 갈라진 객체 그래프가 다시 만들어진다. 그런데 출력에는 "본문 실행"이 한 번뿐이고 두 서비스가 가진 저장소는 컨테이너의 빈과 같은 객체다.</p>
+<p>단서는 출력의 다섯째 줄과 여섯째 줄에 있다. 컨테이너에 들어 있는 설정 객체의 클래스는 <code>AppConfig</code>가 아니라 <code>AppConfig$$SpringCGLIB$$0</code>이고, 그 부모 클래스가 <code>AppConfig</code>다. 스프링이 <code>AppConfig</code>를 상속한 자식 클래스를 실행 중에 바이트코드로 만들어 내고, 그 자식 클래스의 객체를 빈으로 등록한 것이다. 이 일에 쓰이는 라이브러리가 CGLIB이다. 스프링 레퍼런스는 이렇게 적는다. "All @Configuration classes are subclassed at startup-time with CGLIB. In the subclass, the child method checks the container first for any cached (scoped) beans before it calls the parent method and creates a new instance."</p>
+<p>자식 클래스가 하는 일을 자바 코드처럼 적으면 다음과 같다. 실제로 만들어지는 클래스는 이 판단을 인터셉터라는 별도 객체에 맡기지만 하는 일의 뜻은 같다.</p>
+<pre data-label="자식 클래스의 동작을 나타낸 의사 코드"><code class="language-text">class AppConfig$$SpringCGLIB$$0 extends AppConfig {
+
+    @Override
+    public BookRepository bookRepository() {
+        if (컨테이너가 지금 bookRepository 빈을 만들려고 이 메서드를 불렀다) {
+            return super.bookRepository();           // 원래 본문을 실행해 객체를 새로 만든다
+        }
+        return 컨테이너.getBean("bookRepository");    // 그 밖의 호출은 컨테이너에 맡긴다
+    }
+
+    // bookService(), loanService()도 같은 방식으로 오버라이드된다
+}</code></pre>
+<p>이 장치가 통하는 이유는 자바 기본편에서 배운 오버라이딩 규칙에 있다. <code>bookService()</code> 본문에 적힌 <code>bookRepository()</code>는 <code>this.bookRepository()</code>의 줄임이고, 이때 <code>this</code>가 가리키는 객체는 자식 클래스의 객체다. 인스턴스 메서드 호출은 객체의 실제 클래스에서부터 메서드를 찾으므로 부모에 적힌 본문이 아니라 자식이 오버라이드한 메서드가 실행된다. 자식 메서드는 본문을 실행하는 대신 컨테이너에 빈을 요청한다. 보관소에 이미 있으면 그것이 돌아오고, 없으면 그때 만들어져 보관소에 들어간 뒤 돌아온다.</p>
+<p>이 흐름도 스택으로 확인할 수 있다. <code>AppConfig</code>에서 <code>loanService()</code>를 지우고 <code>bookService()</code>를 <code>bookRepository()</code>보다 앞에 선언한 <code>TraceConfig</code>를 만들어, <code>bookRepository()</code>의 본문에서 호출 스택을 찍었다. 서비스가 먼저 만들어지므로 그 본문이 저장소를 요청하는 시점에는 저장소 빈이 아직 없다. Spring Framework 7.0.10의 결과에서 일부 프레임을 생략했다.</p>
+<pre data-label="bookRepository() 본문에서 찍은 호출 스택 (일부 생략)"><code class="language-text">  at TraceConfig.bookRepository                                    (5) 원래 본문이 실행된다
+  at ConfigurationClassEnhancer$BeanMethodInterceptor.intercept
+  at TraceConfig$$SpringCGLIB$$0.bookRepository                    (4) 컨테이너가 리플렉션으로 이 메서드를 부른다
+  at Method.invoke
+  at AbstractAutowireCapableBeanFactory.createBean                 (3) bookRepository 빈이 없으므로 만든다
+  at AbstractBeanFactory.getBean
+  at ConfigurationClassEnhancer$BeanMethodInterceptor.intercept    (2) 본문 대신 컨테이너에 빈을 요청한다
+  at TraceConfig$$SpringCGLIB$$0.bookRepository                    (1) bookService() 안의 호출이 자식 클래스로 간다
+  at TraceConfig.bookService</code></pre>
+<p><code>TraceConfig$$SpringCGLIB$$0.bookRepository</code>가 두 번 나온다. 아래쪽은 <code>bookService()</code>의 본문이 부른 것이고, 위쪽은 컨테이너가 빈을 만들려고 부른 것이다. 같은 메서드인데 아래쪽 호출에서는 인터셉터가 <code>getBean</code>으로 넘겼고 위쪽 호출에서는 원래 본문으로 넘겼다. 의사 코드의 <code>if</code> 문이 실제로 갈라지는 모습이다.</p>
+
+<h4>프록시를 끄면 평범한 자바로 돌아간다</h4>
+<p><code>@Configuration</code>에는 <code>proxyBeanMethods</code>라는 속성이 있고 기본값은 <code>true</code>다. <code>AppConfig</code>와 본문이 똑같은 클래스에 <code>@Configuration(proxyBeanMethods = false)</code>만 바꿔 붙여 실행하면 결과가 달라진다.</p>
+<pre data-label="proxyBeanMethods = false로 실행한 결과"><code class="language-text">bookRepository() 본문 실행
+MemoryBookRepository 생성
+bookRepository() 본문 실행
+MemoryBookRepository 생성
+BookService 생성
+bookRepository() 본문 실행
+MemoryBookRepository 생성
+LoanService 생성
+설정 객체의 클래스 = manual.LiteConfig
+부모 클래스 = java.lang.Object
+false
+false</code></pre>
+<p>설정 객체는 자식 클래스가 아닌 원래 클래스의 객체이고, 본문은 세 번 실행되었으며, 두 서비스는 컨테이너의 빈과 다른 저장소를 각자 갖고 있다. 가로채는 자식 클래스가 없으니 메서드 호출은 그냥 메서드 호출이다. 이 방식에서는 다른 빈이 필요할 때 메서드를 부르지 않고 매개변수로 받아야 한다. <code>@Bean</code> 메서드의 매개변수는 생성자의 매개변수와 마찬가지로 컨테이너가 타입에 맞는 빈을 찾아 채운다.</p>
+<pre><code class="language-java">@Configuration(proxyBeanMethods = false)
+public class ParamConfig {
+
+    @Bean
+    public BookRepository bookRepository() {
+        System.out.println("bookRepository() 본문 실행");
+        return new MemoryBookRepository();
+    }
+
+    @Bean
+    public BookService bookService(BookRepository bookRepository) {
+        return new BookService(bookRepository);
+    }
+
+    @Bean
+    public LoanService loanService(BookRepository bookRepository) {
+        return new LoanService(bookRepository);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">bookRepository() 본문 실행
+MemoryBookRepository 생성
+BookService 생성
+LoanService 생성
+설정 객체의 클래스 = manual.ParamConfig
+부모 클래스 = java.lang.Object
+true
+true</code></pre>
+<p>상속에 기대는 방식이라 제약도 따른다. 레퍼런스와 <code>@Configuration</code>의 Javadoc은 프록시를 쓰는 설정 클래스가 <code>final</code>이어서는 안 된다고 적고 있다. <code>final</code> 클래스는 상속할 수 없으니 자식 클래스를 만들 수 없기 때문이다. 그리고 레퍼런스가 명시하듯 메서드 호출로 빈끼리의 의존을 표현하는 방식은 <code>@Configuration</code> 클래스 안에서만 통한다. <code>@Component</code>가 붙은 평범한 클래스에 <code>@Bean</code> 메서드를 두면 가로채기가 일어나지 않는다.</p>
+
+<h4>컨트롤러와 설정 클래스는 어떻게 발견되는가</h4>
+<p>서비스와 저장소를 자바 설정으로 등록하더라도 컨트롤러는 보통 <code>@Controller</code>와 컴포넌트 스캔에 맡긴다. 설정 클래스 자신도 마찬가지로 스캔으로 발견되게 둘 수 있다. <code>Configuration.class</code>를 <code>javap</code>로 열어 보면 <code>@Service</code>와 똑같이 <code>@Component</code>가 메타 애노테이션으로 붙어 있기 때문이다. 스캔 범위 안에 <code>@Controller</code>가 붙은 <code>BookController</code>와 <code>@Configuration</code>이 붙은 <code>AppConfig</code>(서비스와 저장소를 <code>@Bean</code>으로 등록한다)를 함께 두고 컨테이너를 띄우면 빈 이름은 다음과 같다.</p>
+<pre data-label="실행 결과"><code class="language-text">빈 이름 = appConfig
+빈 이름 = bookController
+빈 이름 = bookService
+빈 이름 = bookRepository</code></pre>
+<p>스캔으로 등록된 컨트롤러의 생성자는 <code>BookService</code>를 요구하고, 그 자리는 <code>@Bean</code> 메서드로 등록된 서비스가 채운다. 등록한 방법이 달라도 빈 정의 목록에 올라간 뒤에는 구별이 없다. 주입은 등록 방법이 아니라 타입을 보고 이루어진다.</p>
+
+<x-visual id="spring-intro-04-cglib-config" title="@Configuration 클래스를 상속한 CGLIB 자식 클래스가 @Bean 메서드 호출을 가로채는 모습" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>bookService() 본문 안의 bookRepository() 호출이 자식 클래스의 메서드로 가고, 자식 메서드가 컨테이너의 보관소를 먼저 확인해 같은 객체를 돌려준다는 것을 보여 준다.</x-hint>
+<x-prompt>세로 생명선 세 개가 있는 시퀀스 다이어그램. 왼쪽부터 "AppConfig (부모)", "AppConfig$$SpringCGLIB$$0 (자식)", "컨테이너 보관소". 자식 생명선 머리 상자는 부모 머리 상자와 속이 빈 삼각형 상속 화살표로 이어진다. 메시지 1: 부모 생명선의 "bookService() 본문" 활성 구간에서 자식 생명선으로 가는 실선 화살표, 라벨 "bookRepository() 호출". 메시지 2: 자식에서 컨테이너 보관소로 가는 실선 화살표, 라벨 "이미 있는가?". 메시지 3: 컨테이너 보관소에서 자식으로 돌아오는 점선 화살표, 라벨 "있음: 같은 객체". 메시지 4: 자식에서 부모로 돌아오는 점선 화살표, 라벨 "보관소의 객체 반환". 컨테이너 보관소 생명선 옆에 원 하나를 그리고 "bookRepository 빈 1개"라고 적는다. 다이어그램 아래에 작은 주석 상자: "없을 때만 부모의 본문 실행".</x-prompt>
+<x-caption>설정 클래스의 객체는 실제로는 자식 클래스의 객체다. 본문 안에서 다른 @Bean 메서드를 부르면 자식이 가로채 컨테이너의 보관소부터 확인한다.</x-caption>
+</x-visual>
+
+<h3>주입 방법 세 가지와 일어나는 시점</h3>
+<p>지금까지는 생성자로만 주입받았다. 스프링은 필드와 세터 메서드로도 주입한다. 세 방법은 문법보다 값이 들어오는 시점이 다르다. 아래에서 <code>Repo</code>는 <code>@Repository</code>가 붙은 빈 클래스이고, 세 클래스는 모두 <code>fld</code> 패키지에 있다.</p>
+<pre><code class="language-java">// 필드 주입
+@Service
+public class FieldService {
+    @Autowired
+    private Repo repo;
+
+    public FieldService() {
+        System.out.println("생성자 안에서 repo = " + repo);
+    }
+
+    public boolean hasRepo() { return repo != null; }
+}
+
+// 세터 주입
+@Service
+public class SetterService {
+    private Repo repo;
+
+    public SetterService() {
+        System.out.println("생성자 호출, repo = " + repo);
+    }
+
+    @Autowired
+    public void setRepo(Repo repo) {
+        System.out.println("setRepo 호출");
+        this.repo = repo;
+    }
+}
+
+// 확인하는 코드 (main의 일부)
+var context = new AnnotationConfigApplicationContext("fld");
+System.out.println("-- 컨테이너 생성 끝");
+FieldService fromContainer = context.getBean(FieldService.class);
+System.out.println("컨테이너가 만든 객체: " + fromContainer.hasRepo());
+System.out.println("new로 만든 객체: " + new FieldService().hasRepo());</code></pre>
+<pre data-label="실행 결과"><code class="language-text">생성자 안에서 repo = null
+생성자 호출, repo = null
+setRepo 호출
+-- 컨테이너 생성 끝
+컨테이너가 만든 객체: true
+생성자 안에서 repo = null
+new로 만든 객체: false</code></pre>
+<p>생성자 주입에서는 객체를 만드는 그 호출에 의존 객체가 인자로 실려 온다. 필드 주입과 세터 주입은 두 단계다. 컨테이너가 먼저 인자 없는 생성자로 객체를 만들고, 그다음에 필드에 값을 넣거나 세터를 호출한다. 그래서 두 클래스 모두 생성자 안에서는 <code>repo</code>가 아직 <code>null</code>이다. <code>@Autowired</code>의 Javadoc도 필드는 빈이 생성된 직후에, 설정 메서드가 호출되기 전에 주입된다고 순서를 정해 둔다.</p>
+<p><code>private</code> 필드에 바깥에서 값을 넣는 수단은 리플렉션이다. <code>@Autowired</code>를 처리하는 <code>AutowiredAnnotationBeanPostProcessor</code>의 7.0.10 소스를 보면 필드 주입은 <code>ReflectionUtils.makeAccessible(field)</code>로 접근 제한을 푼 다음 <code>field.set(bean, value)</code>를 호출하는 두 줄이다. 접근 제어자는 일반 코드에 적용되는 규칙이고, 리플렉션 API는 허용된 범위 안에서 그 검사를 끌 수 있다.</p>
+<p>출력의 마지막 두 줄이 이 회차에서 가장 자주 겪게 될 함정이다. <code>new FieldService()</code>로 직접 만든 객체는 <code>@Autowired</code>가 붙어 있어도 필드가 <code>null</code>이다. 주입은 <code>@Autowired</code>라는 글자가 스스로 하는 일이 아니라, 컨테이너가 빈을 만드는 절차의 한 단계이기 때문이다. 컨테이너를 거치지 않고 만들어진 객체에는 그 절차가 적용되지 않는다.</p>
+
+<h4>생성자 주입을 기본으로 삼는 이유</h4>
+<p>첫째는 <code>final</code>이다. 필드 주입을 받을 필드에 <code>final</code>을 붙이면 컴파일되지 않는다. 생성자가 끝날 때까지 값이 정해지지 않기 때문이다.</p>
+<pre data-label="@Autowired private final Object repo; 를 컴파일한 결과"><code class="language-text">error: variable repo not initialized in the default constructor</code></pre>
+<p>생성자 주입은 생성자 안에서 값을 대입하므로 필드를 <code>final</code>로 선언할 수 있다. 그러면 한 번 주입된 의존 객체가 나중에 바뀌지 않는다는 것을 컴파일러가 보장한다. 여러 스레드가 함께 쓰는 싱글톤 빈에는 한 가지 이점이 더 있다. 자바 언어 명세(JLS §17.5)는 생성자가 끝나 완전히 초기화된 뒤에야 객체의 참조를 볼 수 있는 스레드는 그 객체의 <code>final</code> 필드에서 올바르게 초기화된 값을 본다고 보장한다.</p>
+<p>둘째는 컨테이너 없이도 완전한 객체를 만들 수 있다는 점이다. 생성자 주입 클래스는 <code>new BookService(검사용저장소)</code> 한 줄로 조립된다. 필드 주입 클래스는 컨테이너가 없으면 리플렉션 말고는 그 필드를 채울 방법이 없다. 셋째는 빠뜨릴 수 없다는 점이다. 생성자의 인자는 주지 않으면 컴파일이 안 되지만, 세터는 호출을 잊어도 컴파일된다.</p>
+<p>스프링 레퍼런스도 같은 판단을 적고 있다. 필수 의존관계에는 생성자를, 선택적인 의존관계에는 세터를 쓰는 것이 좋은 경험칙이라 하고, 이렇게 덧붙인다. "The Spring team generally advocates constructor injection, as it lets you implement application components as immutable objects and ensures that required dependencies are not null."</p>
+
+<h4>순환 의존은 어떻게 드러나는가</h4>
+<p><code>LoanService</code>의 생성자가 <code>StockService</code>를 요구하고, <code>StockService</code>의 생성자가 <code>LoanService</code>를 요구하게 만들면 컨테이너는 뜨지 못한다.</p>
+<pre data-label="실행 결과 (예외 메시지)"><code class="language-text">UnsatisfiedDependencyException: Error creating bean with name 'loanService' defined in file [.../cycle/LoanService.class]: Unsatisfied dependency expressed through constructor parameter 0: Error creating bean with name 'stockService' defined in file [.../cycle/StockService.class]: Unsatisfied dependency expressed through constructor parameter 0: Error creating bean with name 'loanService': Requested bean is currently in creation: Is there an unresolvable circular reference or an asynchronous initialization dependency?</code></pre>
+<p>메시지가 경로를 그대로 보여 준다. <code>loanService</code>를 만들다가 <code>stockService</code>가 필요해졌고, <code>stockService</code>를 만들다가 <code>loanService</code>가 필요해졌는데 그것은 지금 만드는 중이다. 맨 안쪽 원인 예외는 <code>BeanCurrentlyInCreationException</code>이다. 이 검사는 <code>TinyContainer</code>의 <code>creating.add(impl)</code>와 같은 방식이다. 6.2.x와 7.0.10의 <code>DefaultSingletonBeanRegistry.beforeSingletonCreation</code>은 빈 이름을 <code>singletonsCurrentlyInCreation</code> 집합에 넣어 보고, 이미 들어 있어 추가에 실패하면 이 예외를 던진다. 생성자 주입으로 엮인 순환은 풀 방법이 없다. 완성된 A가 있어야 B를 만들 수 있고 완성된 B가 있어야 A를 만들 수 있기 때문이다.</p>
+<p>필드 주입으로 엮인 순환은 사정이 다르다. 객체를 먼저 만들고 나중에 채우는 두 단계라서, 아직 필드가 비어 있는 객체의 참조를 상대에게 먼저 건넬 수 있다. 실제로 두 서비스가 서로를 필드로 주입받게 하고 스프링 프레임워크의 컨테이너를 기본 설정으로 띄우면 예외 없이 뜬다. 하지만 스프링 부트는 다르게 정했다. <code>SpringApplication.setAllowCircularReferences</code>의 Javadoc에 따르면 순환 참조 허용 여부는 2.6.0에 추가된 설정이고 기본값이 <code>false</code>다. 컨테이너에 같은 설정을 주고 실험하면 필드 주입 순환도 위와 같은 <code>BeanCurrentlyInCreationException</code>으로 멈춘다. 순환 의존은 두 클래스의 책임이 서로 얽혀 있다는 신호이므로, 설정으로 허용하기보다 공통으로 쓰는 부분을 제3의 클래스로 빼내는 쪽이 바른 대응이다.</p>
+<div class="table-wrap"><table><thead><tr><th>방식</th><th>값이 들어오는 시점</th><th>final 필드</th><th>컨테이너 없이 조립</th><th>순환 의존</th></tr></thead><tbody>
+<tr><td>생성자 주입</td><td>객체 생성과 동시에</td><td>가능</td><td><code>new</code>에 인자로 넘긴다</td><td>기동할 때 예외</td></tr>
+<tr><td>필드 주입</td><td>생성자가 끝난 직후, 리플렉션으로</td><td>불가(컴파일 오류)</td><td>리플렉션이 필요하다</td><td>프레임워크 기본 설정은 통과, 스프링 부트 기본 설정은 예외</td></tr>
+<tr><td>세터 주입</td><td>생성자가 끝난 뒤 세터 호출로</td><td>불가</td><td>세터를 직접 호출한다</td><td>필드 주입과 같다</td></tr>
+</tbody></table></div>
+
+<h3>컴포넌트 스캔과 자바 설정, 무엇을 언제 쓰는가</h3>
+<p>두 방법은 결과가 같다. 빈 정의가 등록되고, 싱글톤이 만들어지고, 타입으로 주입된다. 다른 것은 "이 클래스를 빈으로 쓴다"는 정보가 어디에 적히는가다.</p>
+<div class="table-wrap"><table><thead><tr><th>기준</th><th>컴포넌트 스캔</th><th>자바 설정</th></tr></thead><tbody>
+<tr><td>등록 정보가 적히는 곳</td><td>각 클래스의 애노테이션</td><td>설정 클래스 한 곳</td></tr>
+<tr><td>대상 클래스의 수정</td><td>애노테이션을 붙여야 한다</td><td>손대지 않는다</td></tr>
+<tr><td>클래스를 추가할 때</td><td>애노테이션만 붙이면 끝난다</td><td><code>@Bean</code> 메서드를 하나 더 쓴다</td></tr>
+<tr><td>구현을 바꿔 끼울 때</td><td>애노테이션을 떼고 붙이며 기존 클래스를 고친다</td><td>설정의 <code>new</code> 한 줄을 고친다</td></tr>
+<tr><td>생성에 값이나 준비 과정이 필요할 때</td><td>표현하기 어렵다</td><td>메서드 본문에 자유롭게 쓴다</td></tr>
+</tbody></table></div>
+<p>컨트롤러, 서비스, 리포지토리처럼 역할이 정해져 있고 구현이 하나뿐인 내 코드는 컴포넌트 스캔이 맞다. 클래스를 만들 때마다 설정 파일을 열 필요가 없고, 애노테이션이 그 클래스의 역할을 알려 주는 문서 노릇도 한다. 스프링 부트 레퍼런스도 의존관계를 잇는 데는 생성자 주입을, 빈을 찾는 데는 <code>@ComponentScan</code>을 쓰기를 권한다.</p>
+<p>자바 설정이 필요해지는 경우는 세 가지로 추릴 수 있다. 하나는 소스를 고칠 수 없는 클래스다. 라이브러리가 제공하는 클래스에는 애노테이션을 붙일 수 없으므로 <code>@Bean</code> 메서드에서 직접 만들어 등록한다. 둘은 상황에 따라 구현을 바꿔 끼워야 하는 것이다. 예제의 저장소가 그렇다. 지금은 메모리에 담지만 곧 데이터베이스로 바꿀 것이라면, 서비스와 컨트롤러의 코드를 건드리지 않고 설정 클래스의 한 줄만 고쳐 구현을 교체할 수 있다. 5회에서 저장소 구현을 바꿔 가며 이 교체를 실제로 하게 된다. 셋은 객체를 만드는 데 설정값이나 조건, 준비 과정이 필요한 경우다.</p>
+<p>실제 프로젝트는 두 방법을 섞어 쓴다. 이때 조심할 것이 같은 클래스를 두 방법으로 모두 등록하는 실수다. <code>MemoryBookRepository</code>에 <code>@Repository</code>를 붙여 둔 채로 설정 클래스에도 <code>bookRepository()</code>라는 <code>@Bean</code> 메서드를 두고 스캔하면 빈이 둘 생긴다.</p>
+<pre data-label="실행 결과: 빈 이름, 두 빈의 == 비교, getBean(BookRepository.class)"><code class="language-text">빈 이름 = appConfig
+빈 이름 = bookController
+빈 이름 = memoryBookRepository
+빈 이름 = bookRepository
+false
+NoUniqueBeanDefinitionException: No qualifying bean of type 'both.BookRepository' available: expected single matching bean but found 2: memoryBookRepository,bookRepository</code></pre>
+<p>이름이 다르므로 충돌 없이 둘 다 등록되고, 싱글톤은 빈 정의마다 하나이므로 저장소 객체도 둘이다. 타입으로 꺼내려 하면 후보가 둘이라 예외가 난다. 그런데 이 실수가 조용히 지나갈 때가 있다. 이 실험에서 <code>BookController</code>의 생성자 매개변수 이름은 <code>bookRepository</code>였는데, 컨테이너는 예외 없이 떴다. Spring Framework 7.0.10에서 확인한 바로는 매개변수 이름이 클래스 파일에 남도록 <code>-parameters</code> 옵션을 주고 컴파일했을 때 스프링이 후보 가운데 매개변수 이름과 같은 이름의 빈을 골랐고, 그 옵션 없이 컴파일하면 같은 코드가 <code>NoUniqueBeanDefinitionException</code>으로 기동에 실패했다. 예외 없이 뜬 쪽이 더 위험하다. 저장소가 둘이라는 사실을 아무도 모른 채 어떤 클래스는 이쪽을, 어떤 클래스는 저쪽을 쓰게 될 수 있다. 한 클래스는 한 가지 방법으로만 등록한다는 원칙을 지키면 피할 수 있다.</p>
+
+<h3>흔한 오해 다섯 가지</h3>
+<ul>
+<li><b>"<code>@Autowired</code>를 붙이면 어디서든 주입된다."</b> 주입은 컨테이너가 빈을 만드는 절차의 일부다. <code>new</code>로 직접 만든 객체에는 일어나지 않는다. 주입받은 필드가 <code>null</code>이라면 그 객체를 누가 만들었는지부터 확인한다.</li>
+<li><b>"<code>@Service</code>를 붙이면 클래스가 달라진다."</b> 애노테이션은 클래스 파일에 기록되는 표식이고 읽는 쪽이 있어야 효과가 생긴다. 스캔 범위 밖에 있으면 붙어 있어도 아무 일도 일어나지 않고, 경고도 없다.</li>
+<li><b>"스프링 빈은 싱글톤 패턴으로 만든 객체다."</b> 클래스는 평범하고 생성자도 열려 있다. 하나임을 보장하는 것은 컨테이너의 보관소이고, 그 범위는 컨테이너 하나, 빈 정의 하나다. 같은 클래스로 빈 정의를 둘 만들면 객체도 둘이다.</li>
+<li><b>"빈은 등록된 순서대로 만들어진다."</b> 컨테이너는 등록 순서대로 만들기 시작하지만, 생성자 인자를 구하러 들어가면서 의존되는 쪽이 먼저 완성된다. 코드는 생성 순서에 기대지 말고 필요한 것을 생성자로 선언해야 한다.</li>
+<li><b>"<code>@Bean</code> 메서드는 부를 때마다 새 객체를 만든다."</b> 프록시가 켜진 <code>@Configuration</code> 클래스 안에서는 자식 클래스가 호출을 가로채 같은 빈을 돌려준다. <code>proxyBeanMethods = false</code>이거나 <code>@Component</code> 클래스 안이라면 정말로 부를 때마다 새 객체가 만들어진다.</li>
+</ul>
+
+<h3>이 지식이 다시 쓰이는 곳</h3>
+<p>다음 회차인 5회에서는 저장소의 구현을 메모리에서 데이터베이스 접근 기술로 차례로 바꾼다. 서비스가 구현 클래스의 이름을 모르고 인터페이스만 생성자로 받도록 해 둔 덕분에, 그 교체는 빈을 등록하는 곳의 변경으로 끝난다. 이 회차에서 만든 구조가 무엇을 가능하게 하는지 거기서 확인하게 된다.</p>
+<p>6회의 AOP는 이 회차에서 본 두 가지 사실 위에 서 있다. 하나는 객체를 만들어 보관소에 넣는 주체가 컨테이너라는 것이다. 만드는 쪽이 컨테이너이므로, 컨테이너는 원래 객체 대신 그것을 감싼 다른 객체를 보관소에 넣을 수도 있다. 다른 하나는 실행 중에 자식 클래스를 만들어 메서드 호출을 가로채는 CGLIB 기법이다. 설정 클래스에 쓰인 그 기법이 일반 빈에 적용되면 메서드 앞뒤에 공통 동작을 끼워 넣을 수 있다. 이 회차의 예제가 주입받은 객체의 클래스 이름을 찍어 본 것도, 주입된 것이 내가 쓴 클래스의 객체인지 확인하는 습관을 들이기 위해서다.</p>
+<p>스프링 핵심 원리 기본편에서는 여기서 한 문장으로 넘어간 주제들을 하나씩 깊게 다룬다. 싱글톤이 아닌 스코프, 빈이 만들어지고 사라질 때 호출되는 콜백, 같은 타입의 후보가 여럿일 때의 선택 규칙이 그것이다. 테스트에서도 이 회차의 구조가 그대로 쓰인다. 생성자로 의존 객체를 받는 클래스는 컨테이너를 띄우지 않고도 검사할 수 있고, 컨테이너까지 함께 검사하고 싶을 때는 같은 빈 정의로 컨테이너를 띄우면 된다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>스프링 컨테이너는 "무엇을 만들지"를 적은 빈 정의 목록과 "만들어 둔 것"을 담은 싱글톤 보관소를 가진 객체 조립기다. 컴포넌트 스캔은 클래스 파일의 애노테이션을 읽어서, 자바 설정은 <code>@Bean</code> 메서드를 읽어서 빈 정의를 등록한다. 그다음 컨테이너는 리플렉션으로 생성자나 메서드를 호출하며 필요한 인자를 타입으로 찾아 재귀적으로 채운다. 클래스는 필요한 것을 생성자로 선언만 하고, 어떤 구현을 몇 개 만들어 누구에게 줄지는 컨테이너에 맡긴다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>의존관계 주입(DI)</dt><dd>객체가 협력 객체를 스스로 만들지 않고 생성자 인자 등으로 바깥에서 건네받는 방식이다. 구현을 고르는 코드가 쓰는 쪽에서 조립하는 쪽으로 옮겨 간다.</dd>
+<dt>스프링 컨테이너와 빈</dt><dd><code>ApplicationContext</code>가 컨테이너이고, 컨테이너가 만들어 보관하는 객체가 빈이다. <code>new</code>로 따로 만든 객체는 같은 클래스여도 빈이 아니다.</dd>
+<dt>빈 정의와 싱글톤 보관소</dt><dd>컨테이너는 만드는 방법을 적은 빈 정의를 먼저 모두 등록하고, 그 뒤에 객체를 만들어 빈 이름을 키로 하는 맵(<code>singletonObjects</code>)에 넣는다.</dd>
+<dt>컴포넌트 스캔</dt><dd>기준 패키지 아래의 클래스 파일을 로딩하지 않고 읽어 <code>@Component</code>가 직접 또는 메타 애노테이션으로 붙은 클래스를 빈 정의로 등록한다. 기준은 <code>@ComponentScan</code>이 붙은 클래스의 패키지다.</dd>
+<dt>자동 의존관계 설정</dt><dd>컨테이너가 생성자 매개변수의 타입에 맞는 빈을 찾아 인자로 넣는다. 후보가 없으면 <code>NoSuchBeanDefinitionException</code>, 둘 이상이면 <code>NoUniqueBeanDefinitionException</code>이 기동 중에 난다.</dd>
+<dt>자바 설정</dt><dd><code>@Configuration</code> 클래스의 <code>@Bean</code> 메서드가 빈 정의가 되고, 메서드 이름이 빈 이름, 반환 객체가 빈이다. 소스를 고칠 수 없거나 구현을 바꿔 끼워야 하는 대상에 쓴다.</dd>
+<dt>설정 클래스의 CGLIB 프록시</dt><dd>스프링은 <code>@Configuration</code> 클래스를 상속한 자식 클래스를 만들어 <code>@Bean</code> 메서드 호출을 가로채고 컨테이너의 빈을 돌려준다. <code>proxyBeanMethods = false</code>이면 가로채지 않는다.</dd>
+<dt>생성자 주입</dt><dd>객체 생성과 동시에 의존 객체가 들어오므로 필드를 <code>final</code>로 둘 수 있고, 컨테이너 없이 조립할 수 있으며, 순환 의존이 기동할 때 예외로 드러난다.</dd>
+<dt>싱글톤 스코프</dt><dd>빈 정의 하나에 대해 컨테이너마다 객체 하나다. 모든 요청 스레드가 같은 객체를 쓰므로 필드에 요청별 값을 두지 않는다.</dd>
+</x-summary>
+
+<x-review>
+<p>애플리케이션이 뜨다가 죽었을 때 가장 먼저 볼 것은 <code>UnsatisfiedDependencyException</code> 메시지의 구조다. "어느 빈을 만들다가, 어느 매개변수에서, 어떤 타입이 문제였는가"가 한 문장에 들어 있고, 예외가 여러 겹이면 맨 안쪽 원인이 실제 문제다. 타입의 빈이 없다고 하면 세 가지를 차례로 의심한다. 애노테이션을 빠뜨렸는가, 클래스가 스캔 기준 패키지 밖에 있는가, 설정 클래스에 <code>@Bean</code> 메서드를 쓰지 않았는가. 후보가 둘이라고 하면 같은 클래스를 두 가지 방법으로 등록하지 않았는지부터 본다.</p>
+<p>패키지 구조는 스캔 범위를 정하는 설계 결정이다. 프로젝트가 여러 모듈로 나뉘면 공통 모듈의 패키지가 메인 클래스의 패키지 아래에 놓이지 않는 일이 흔하다. 이때 그 모듈의 클래스는 조용히 빈에서 빠진다. 스캔 범위를 명시적으로 넓힐지, 그 모듈이 자기 설정 클래스를 제공하고 쓰는 쪽에서 가져오게 할지는 모듈의 성격으로 판단한다. 여러 애플리케이션이 가져다 쓰는 모듈이라면 스캔에 기대기보다 무엇을 등록하는지 설정 클래스에 드러내는 편이 예측하기 쉽다.</p>
+<p>싱글톤 빈의 필드에 요청별 값을 두는 버그는 개발자의 컴퓨터에서는 잘 드러나지 않는다. 혼자 요청을 하나씩 보낼 때는 덮어쓸 다른 스레드가 없기 때문이다. 동시 요청이 몰리는 운영 환경에서 다른 사용자의 데이터가 섞여 보이는 형태로 나타나고, 재현도 어렵다. 코드 리뷰에서 빈 클래스에 <code>final</code>이 아닌 필드가 보이면 그 값이 누구의 것인지 물어야 한다.</p>
+<p>순환 의존 예외를 만났을 때 순환을 허용하는 설정을 켜면 당장은 뜬다. 하지만 그 설정은 미완성 객체의 참조가 돌아다니는 것을 허용하는 것이고, 두 클래스가 서로 없이는 존재할 수 없다는 설계 문제는 그대로 남는다. 두 클래스가 함께 쓰는 기능을 제3의 클래스로 빼내 둘 다 그것에 의존하게 만드는 편이 대부분의 경우 옳다.</p>
+</x-review>
+
+<x-practice>
+<li>본문 첫 예제(<code>byhand</code>)에 <code>BookService</code>를 필드에서 <code>new</code>로 만드는 세 번째 컨트롤러 <code>DeleteController</code>를 추가하고 <code>main</code>에서 컨트롤러 셋을 모두 만들었다. 힙에 <code>BookService</code>와 <code>MemoryBookRepository</code> 객체가 각각 몇 개 있는지 객체 그래프를 그려 답하라. 같은 일을 생성자 주입 구조(<code>wired</code>)에서 하면 몇 개인가.</li>
+<li>컴포넌트 스캔 예제에서 <code>BookController</code>의 생성자를 <code>BookController(BookService bookService, BookRepository bookRepository)</code>로 바꿨다. 컨테이너를 띄울 때 "MemoryBookRepository 생성"은 몇 번 출력되는가. 세 클래스의 생성 로그는 어떤 순서로 나오는가. 이유를 호출 순서로 설명하라.</li>
+<li>스프링 부트 프로젝트의 메인 클래스가 <code>com.shop.web</code> 패키지에 있고, <code>@Controller</code>가 붙은 클래스도 같은 패키지에 있다. <code>@Service</code>가 붙은 <code>BookService</code>는 <code>com.shop.service</code> 패키지에 있다. 컨트롤러는 생성자로 <code>BookService</code>를 받는다. 실행하면 어떤 일이 일어나는가. 원인과 고치는 방법을 말하라.</li>
+<li>본문의 <code>AppConfig</code>에서 <code>@Configuration</code>을 <code>@Component</code>로 바꾸고 나머지는 그대로 두었다. "bookRepository() 본문 실행"은 몇 번 출력되고, 마지막의 <code>==</code> 비교 두 줄은 무엇이 출력되는가. 설정 객체의 클래스 이름은 무엇인가.</li>
+<li>다음 클래스를 컴포넌트 스캔으로 등록하면 컨테이너가 뜨는 도중에 예외가 난다. 맨 안쪽 원인 예외가 무엇인지, 왜 나는지 설명하고 고쳐라. <code>BookRepository</code>는 빈으로 등록되어 있다.
+<pre><code class="language-java">@Service
+public class ReportService {
+    @Autowired
+    private BookRepository bookRepository;
+    private final int initialCount;
+
+    public ReportService() {
+        this.initialCount = bookRepository.count();
+    }
+}</code></pre></li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> <code>byhand</code> 구조에서는 컨트롤러 하나가 만들어질 때마다 필드 초기화식이 <code>BookService</code>를 하나 만들고, 그 서비스의 필드 초기화식이 <code>MemoryBookRepository</code>를 하나 만든다. 컨트롤러가 셋이면 서비스 셋, 저장소 셋이다. 세 컨트롤러는 서로 다른 저장소를 보므로 등록·조회·삭제가 서로의 결과를 보지 못한다. <code>wired</code> 구조에서는 <code>main</code>이 저장소 하나와 서비스 하나를 만들어 세 컨트롤러의 생성자에 같은 서비스를 넘기므로 각각 하나다. 컨트롤러가 늘어도 조립 코드에 한 줄이 늘 뿐 서비스와 저장소의 수는 변하지 않는다.</p>
+<p><b>2.</b> "MemoryBookRepository 생성"은 한 번만 나오고, 순서는 본문과 같이 저장소, 서비스, 컨트롤러다. 컨테이너가 <code>bookController</code>를 만들려고 첫 번째 인자 <code>BookService</code>를 구하러 들어가고, 그 생성자의 인자를 구하다가 저장소가 먼저 만들어져 보관소에 들어간다. 서비스가 완성되어 돌아온 뒤 두 번째 인자 <code>BookRepository</code>를 구할 때는 보관소에 이미 저장소가 있으므로 새로 만들지 않고 그것을 쓴다. 그래서 컨트롤러가 직접 받은 저장소와 서비스가 가진 저장소는 같은 객체다.</p>
+<p><b>3.</b> 애플리케이션이 뜨지 못한다. <code>@SpringBootApplication</code>에 포함된 <code>@ComponentScan</code>은 메인 클래스의 패키지 <code>com.shop.web</code>과 그 하위만 훑는다. <code>com.shop.service</code>는 그 아래가 아니라 옆에 있으므로 <code>BookService</code>는 빈 정의로 등록되지 않는다. 컨트롤러 빈을 만들 때 생성자 인자를 채울 수 없어 <code>UnsatisfiedDependencyException</code>이 나고 원인 예외는 <code>NoSuchBeanDefinitionException</code>이다. 메인 클래스를 두 패키지의 공통 상위인 <code>com.shop</code>으로 옮기는 것이 바른 해결이다. 스캔할 패키지를 직접 지정하는 방법도 있지만, 메인 클래스를 루트 패키지에 두라는 스프링 부트의 권고를 따르는 편이 이후에 추가되는 패키지까지 자동으로 포함한다.</p>
+<p><b>4.</b> "본문 실행"은 세 번 출력되고 비교는 둘 다 <code>false</code>이며 설정 객체의 클래스는 자식 클래스가 아닌 원래 클래스 그대로다. 레퍼런스가 밝히듯 <code>@Bean</code> 메서드끼리의 호출을 가로채는 것은 <code>@Configuration</code> 클래스에서만 일어난다. <code>@Component</code> 클래스에는 자식 클래스가 만들어지지 않으므로 <code>bookService()</code> 안의 <code>bookRepository()</code>는 평범한 메서드 호출이고, 부를 때마다 새 저장소가 만들어진다. 결과는 <code>proxyBeanMethods = false</code>일 때와 같다. 저장소 객체는 컨테이너의 빈 하나와 두 서비스가 각자 가진 것 둘, 모두 셋이다.</p>
+<p><b>5.</b> 맨 안쪽 원인은 생성자 안에서 난 <code>NullPointerException</code>이다. 필드 주입은 컨테이너가 인자 없는 생성자로 객체를 만든 다음에 일어난다. 생성자가 실행되는 동안 <code>bookRepository</code>는 아직 <code>null</code>이고, 그 상태에서 <code>count()</code>를 호출했다. 컨테이너는 이 예외를 빈 생성 실패로 감싸 던지고 기동이 멈춘다. 생성자 주입으로 바꾸면 해결된다. <code>public ReportService(BookRepository bookRepository)</code>로 받아 필드에 대입하고 그 매개변수로 <code>count()</code>를 부르면, 생성자가 실행되는 시점에 의존 객체가 이미 인자로 와 있다. 필드도 <code>final</code>로 선언할 수 있게 된다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>컴포넌트 스캔이 어떤 클래스를 빈 후보로 가려내는 방식으로 옳은 것은?</q>
+<o>기준 패키지의 모든 클래스를 JVM에 로딩한 뒤 객체를 하나씩 만들어 보고 애노테이션을 확인한다.</o>
+<o>기준 패키지 아래의 클래스 파일을 읽어 <code>@Component</code>가 직접 또는 메타 애노테이션으로 붙어 있는지 확인하며, 이 과정에서 클래스를 로딩하지 않는다.</o>
+<o>컴파일할 때 <code>@Service</code>가 붙은 클래스의 목록이 별도 파일로 만들어지고 컨테이너는 그 파일만 읽는다.</o>
+<o>클래스 이름이 Controller, Service, Repository로 끝나는지를 보고 판단한다.</o>
+<why>스캐너는 기준 패키지 경로의 <code>.class</code> 파일을 찾아 메타데이터만 읽고, <code>@Component</code>가 있으면 빈 정의로 등록한다. <code>@Service</code>가 걸리는 것은 그 선언에 <code>@Component</code>가 붙어 있기 때문이다. 본문의 클래스 로딩 로그에서 애노테이션 없는 클래스가 로딩되지 않은 것이 증거다. 객체를 만들어 보는 일은 없고, 본문에서 다룬 기본 스캔은 이름 규칙이나 컴파일 시 만든 목록에 기대지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>빈 정의가 <code>bookController</code>, <code>bookService</code>, <code>memoryBookRepository</code> 순으로 등록되어 있고 컨트롤러는 서비스를, 서비스는 저장소를 생성자로 받는다. 생성자 실행이 끝나는 순서와 그 이유로 옳은 것은?</q>
+<o>컨트롤러, 서비스, 저장소 순이다. 컨테이너는 등록된 순서대로 객체를 만들고 나중에 서로 연결한다.</o>
+<o>실행할 때마다 달라진다. 컨테이너가 빈을 여러 스레드로 나누어 만들기 때문이다.</o>
+<o>저장소, 서비스, 컨트롤러 순이다. 컨트롤러를 만들려고 생성자 인자를 구하러 들어가면서 의존되는 빈이 먼저 완성된다.</o>
+<o>저장소, 서비스, 컨트롤러 순이다. 컨테이너가 빈 이름을 알파벳 역순으로 정렬해 만들기 때문이다.</o>
+<why>컨테이너는 등록 순서대로 만들기 시작하지만, 생성자 주입에서는 인자가 준비되어야 생성자를 호출할 수 있다. 그래서 컨트롤러의 생성자 인자인 서비스를 구하는 호출이 안에서 일어나고, 다시 그 안에서 저장소를 구하는 호출이 일어난다. 가장 안쪽 호출부터 끝나므로 저장소가 먼저 완성된다. 본문의 스택 트레이스에서 <code>getBean</code>, <code>createBean</code> 묶음이 겹쳐 나온 것이 이 재귀다. 정렬이나 스레드 분할과는 관계가 없다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>프록시가 켜진 <code>@Configuration</code> 클래스에서 <code>bookService()</code>와 <code>loanService()</code>가 각각 본문에서 <code>bookRepository()</code>를 호출한다. <code>bookRepository()</code>의 본문이 한 번만 실행되는 이유는?</q>
+<o>컨테이너에 등록된 설정 객체가 설정 클래스를 상속한 자식 클래스의 객체여서, 본문 안의 호출이 오버라이드된 메서드로 가고 그 메서드가 컨테이너의 빈을 돌려주기 때문이다.</o>
+<o>자바 컴파일러가 같은 메서드의 반복 호출을 한 번으로 줄여 컴파일하기 때문이다.</o>
+<o><code>@Bean</code>이 붙은 메서드는 JVM이 결과를 자동으로 캐시하기 때문이다.</o>
+<o>스프링이 설정 클래스의 소스를 고쳐 <code>static</code> 필드에 객체를 저장하도록 다시 컴파일하기 때문이다.</o>
+<why>본문 실험에서 설정 객체의 클래스는 <code>AppConfig$$SpringCGLIB$$0</code>이고 부모가 <code>AppConfig</code>였다. 본문 안의 <code>bookRepository()</code>는 <code>this</code>에 대한 호출이고 <code>this</code>는 자식 객체이므로 자식의 오버라이드 메서드가 실행되어 컨테이너에 빈을 요청한다. 컴파일러나 JVM은 이런 일을 하지 않는다. <code>proxyBeanMethods = false</code>로 자식 클래스를 없애면 본문이 세 번 실행되는 것이 그 증거다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>@Service</code>가 붙은 클래스에 <code>@Autowired private BookRepository bookRepository;</code> 필드가 있다. 어떤 코드가 이 클래스를 <code>new</code>로 직접 만들어 메서드를 호출했더니 <code>NullPointerException</code>이 났다. 원인으로 옳은 것은?</q>
+<o><code>private</code> 필드에는 스프링이 값을 넣을 수 없기 때문이다.</o>
+<o><code>@Autowired</code>는 생성자에만 쓸 수 있는 애노테이션이기 때문이다.</o>
+<o>빈이 싱글톤이어서 두 번째로 만든 객체에는 주입되지 않기 때문이다.</o>
+<o>주입은 컨테이너가 빈을 만드는 절차에서 일어나는데, <code>new</code>로 만든 객체는 그 절차를 거치지 않았기 때문이다.</o>
+<why>필드 주입은 컨테이너가 객체를 만든 직후 리플렉션으로 필드에 값을 넣는 단계다. <code>new</code>로 만든 객체에는 누구도 그 단계를 수행하지 않으므로 필드는 기본값 <code>null</code>로 남는다. 본문 실험에서 컨테이너가 만든 객체는 값이 들어 있고 <code>new</code>로 만든 객체는 비어 있었다. <code>private</code> 필드는 리플렉션으로 채울 수 있고, <code>@Autowired</code>는 필드와 세터에도 쓸 수 있으며, 싱글톤 여부는 이 현상과 관계가 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>싱글톤 빈인 서비스 클래스에 "현재 처리 중인 사용자 이름"을 담는 <code>final</code>이 아닌 필드를 두고 요청마다 값을 써넣었다. 예상되는 문제와 그 이유로 옳은 것은?</q>
+<o>문제가 없다. 요청마다 서비스 객체가 새로 만들어지기 때문이다.</o>
+<o>컨테이너가 뜰 때 예외가 난다. 싱글톤 빈에는 <code>final</code> 필드만 둘 수 있기 때문이다.</o>
+<o>동시에 처리되는 요청끼리 값이 섞일 수 있다. 여러 요청 스레드가 힙에 있는 같은 객체의 같은 필드를 읽고 쓰기 때문이다.</o>
+<o>값이 섞이지 않는다. 필드도 스레드마다 따로 있는 스택에 저장되기 때문이다.</o>
+<why>싱글톤 빈은 컨테이너에 하나뿐이고 모든 요청 스레드가 그 객체를 함께 쓴다. 지역 변수와 매개변수는 스레드별 스택에 있지만 필드는 힙의 객체에 속하므로 공유된다. 한 스레드가 써넣은 값을 다른 스레드가 덮어쓰면 엉뚱한 사용자의 값으로 처리하게 된다. 컨테이너는 이것을 검사하지 않으므로 기동할 때 예외가 나지 않고, 동시 요청이 있을 때에만 드러난다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>스프링 빈(bean)</dt><dd>스프링 컨테이너가 만들고 보관하고 관리하는 객체. 평범한 자바 객체이며 컨테이너의 보관소에 들어 있다는 점으로 구별된다.</dd>
+<dt>스프링 컨테이너(ApplicationContext)</dt><dd>빈 정의를 등록하고, 빈을 만들고, 의존관계를 이어 주는 객체. 빈을 꺼내는 <code>getBean</code>은 상위 인터페이스 <code>BeanFactory</code>에 정의되어 있다.</dd>
+<dt>의존관계 주입(Dependency Injection)</dt><dd>객체가 필요로 하는 다른 객체를 생성자 인자, 필드, 세터를 통해 바깥에서 넣어 주는 방식.</dd>
+<dt>제어의 역전(Inversion of Control)</dt><dd>객체의 생성과 연결을 그 객체를 쓰는 코드가 아니라 바깥의 조립자(컨테이너)가 결정하는 구조.</dd>
+<dt>빈 정의(BeanDefinition)</dt><dd>빈을 만드는 방법을 적은 정보. 클래스, 스코프, 생성자나 팩토리 메서드 같은 내용을 담으며 객체 자체는 아니다.</dd>
+<dt>컴포넌트 스캔(component scan)</dt><dd>기준 패키지 아래에서 <code>@Component</code> 계열 애노테이션이 붙은 클래스를 찾아 빈 정의로 등록하는 동작.</dd>
+<dt>메타 애노테이션(meta-annotation)</dt><dd>애노테이션 선언에 붙은 애노테이션. <code>@Service</code>에 붙은 <code>@Component</code>가 그 예다.</dd>
+<dt>리플렉션(reflection)</dt><dd>실행 중에 클래스의 생성자·메서드·필드 정보를 조회하고 그것을 통해 객체를 만들거나 메서드를 호출하는 자바의 기능.</dd>
+<dt>싱글톤 스코프(singleton scope)</dt><dd>빈 정의 하나에 대해 컨테이너마다 객체를 하나만 두는 스코프. 스프링 빈의 기본값이다.</dd>
+<dt>CGLIB</dt><dd>실행 중에 어떤 클래스를 상속한 자식 클래스의 바이트코드를 만들어 내는 라이브러리. 스프링은 <code>spring-core</code>에 포함된 것을 설정 클래스 프록시 등에 쓴다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/core/beans/classpath-scanning.html">Spring Framework Reference: Classpath Scanning and Managed Components</a> — 스테레오타입 애노테이션, 스캔으로 등록된 빈의 이름 규칙</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/core/beans/dependencies/factory-collaborators.html">Spring Framework Reference: Dependency Injection</a> — 의존관계 주입의 정의, 생성자 주입과 세터 주입의 선택, 순환 의존</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/core/beans/java/configuration-annotation.html">Spring Framework 6.2 Reference: Using the @Configuration annotation</a> — <code>@Bean</code> 메서드 사이의 호출과 CGLIB 자식 클래스, 그 제약</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/core/beans/factory-scopes.html">Spring Framework Reference: Bean Scopes</a> — 싱글톤 스코프의 정의와 싱글톤 패턴과의 차이</li>
+<li><a href="https://docs.spring.io/spring-boot/reference/using/structuring-your-code.html">Spring Boot Reference: Structuring Your Code</a> — 메인 클래스의 위치와 스캔 기준 패키지, 기본 패키지를 피해야 하는 이유</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html">JLS §17.5 final Field Semantics</a> — 생성자가 끝난 뒤 공개된 객체의 <code>final</code> 필드에 대한 보장</li>
+</x-refs>

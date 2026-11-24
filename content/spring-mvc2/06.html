@@ -1,0 +1,776 @@
+<x-meta>
+deck: 상태가 없는 HTTP 위에서 "방금 로그인한 사용자"를 기억하는 방법을, 쿠키 헤더의 규칙부터 톰캣이 세션 ID를 만들고 찾고 만료시키는 내부 동작까지 따라가며 세운다.
+minutes: 110
+</x-meta>
+
+<x-goals>
+<li><code>Set-Cookie</code>와 <code>Cookie</code> 헤더가 오가는 순서를 그리고, <code>Max-Age</code>·<code>Path</code>·<code>HttpOnly</code>·<code>Secure</code>가 브라우저의 저장·전송 결정에 각각 어떻게 쓰이는지 설명할 수 있다.</li>
+<li>쿠키에 사용자 식별값을 그대로 담는 방식의 세 가지 위험(위조, 탈취, 폐기 불가)을 구체적인 요청으로 재현하고, 세션 방식이 각각을 어떻게 줄이는지 설명할 수 있다.</li>
+<li><code>UUID</code>와 <code>ConcurrentHashMap</code>으로 세션 저장소를 직접 만들고, 서블릿 <code>HttpSession</code>이 그 위에 더해 주는 것(ID 생성, 쿠키 발급, 만료, 무효화)을 톰캣 소스의 호출 순서로 추적할 수 있다.</li>
+<li><code>getSession()</code>, <code>getSession(false)</code>, <code>@SessionAttribute</code>, <code>HttpSession</code> 파라미터 가운데 어느 것이 세션을 새로 만드는지 구분하고, URL에 <code>;jsessionid</code>가 붙는 조건을 설명할 수 있다.</li>
+<li>세션 타임아웃이 마지막 접근 시점 기준으로 계산되고 실제로 언제 메모리에서 빠지는지, 스프링 부트의 설정값이 톰캣에 어떤 단위로 전달되는지 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>HTTP는 왜 방금 로그인한 사용자를 모르는가</h3>
+<p>로그인은 웹 애플리케이션에서 가장 흔한 기능이지만, HTTP라는 프로토콜만 놓고 보면 이상한 기능이다. 사용자는 아이디와 비밀번호를 한 번 보냈을 뿐인데, 그 뒤로 이어지는 수십 번의 요청 모두가 "로그인한 사람의 요청"으로 처리되기를 기대한다. 그런데 RFC 9110 §3.3은 HTTP를 무상태(stateless) 프로토콜로 정의하고, 그 뜻을 "각 요청 메시지의 의미가 따로 떼어 놓고도 이해될 수 있다"는 것으로 설명한다. 서버는 두 번째 요청을 해석할 때 첫 번째 요청을 참고하지 않는다는 말이다.</p>
+<p>HTTP 기본 지식 권에서 본 것처럼, 같은 TCP 연결 위로 여러 요청이 오가더라도 이 원칙은 바뀌지 않는다. 브라우저는 연결을 여러 개 열기도 하고, 중간에 끊고 새로 맺기도 한다. 연결은 메시지를 나르는 통로일 뿐이고, 연결이 같다고 해서 같은 사용자라는 보장이 생기지 않는다. 결국 "이 요청을 보낸 사람이 누구인가"라는 정보는 매 요청 안에 들어 있어야 한다.</p>
+<p>서버 쪽 구조를 떠올려도 같은 결론이 나온다. 스프링 MVC 1편에서 본 것처럼 톰캣은 요청마다 스레드 풀의 작업 스레드 하나를 배정해 디스패처 서블릿을 호출하고, 컨트롤러는 스프링 컨테이너가 하나만 만들어 두는 싱글톤 빈이다. 컨트롤러의 필드에 "현재 로그인한 사용자"를 저장하면 그 값은 모든 사용자가 공유하게 된다. 스프링 핵심 원리 기본편에서 싱글톤 빈을 무상태로 설계해야 한다고 했던 이유가 바로 이런 상황이다. 로그인 상태는 요청을 처리하는 객체 안에 둘 수 없고, 다음 두 가지를 조합해서 만들어야 한다.</p>
+<ul>
+<li>클라이언트가 매 요청에 실어 보내는 값(쿠키)</li>
+<li>그 값을 열쇠로 서버가 찾아볼 수 있는 저장소(세션)</li>
+</ul>
+<p>이번 회차는 이 두 가지를 차례로 세운다. 처음에는 쿠키에 사용자 번호를 그대로 담는 가장 단순한 방법으로 로그인을 구현하고, 그 방법이 왜 위험한지 직접 공격해 본다. 그다음 세션 저장소를 손으로 만들어 문제를 고치고, 마지막으로 서블릿 컨테이너가 제공하는 <code>HttpSession</code>으로 바꾼 뒤 톰캣이 내부에서 무엇을 하는지 소스와 실험으로 확인한다.</p>
+<p>만들 기능의 요구사항은 다음과 같다. 상품 관리 화면은 이전 회차들에서 만든 것을 그대로 쓴다.</p>
+<ul>
+<li>홈 화면은 로그인 여부에 따라 달라진다. 로그인 전에는 회원 가입과 로그인 링크를, 로그인 후에는 사용자 이름과 상품 관리·로그아웃 링크를 보여 준다.</li>
+<li>회원 가입: 로그인 아이디, 이름, 비밀번호를 받는다. 모두 필수이고, 이미 쓰고 있는 아이디로는 가입할 수 없다.</li>
+<li>로그인: 아이디와 비밀번호가 맞으면 홈으로 보내고, 틀리면 폼을 다시 보여 주며 오류 메시지를 표시한다.</li>
+<li>로그아웃: 로그인 상태를 끝내고 홈으로 보낸다.</li>
+<li>상품 관리 화면은 로그인한 사용자만 쓸 수 있다. 이 요구사항을 모든 컨트롤러에 흩어지지 않게 한곳에서 처리하는 일은 다음 회차(필터와 인터셉터)의 몫이고, 이번 회차는 로그인 상태를 만들고 읽는 데 집중한다.</li>
+</ul>
+
+<h3>프로젝트의 뼈대: 도메인은 웹을 모른다</h3>
+<p>프로젝트는 스프링 부트 3.x 기준으로 Spring Web, Thymeleaf, Validation 의존성을 넣어 만든다. Validation은 지난 회차의 Bean Validation을 회원 가입·로그인 폼에 다시 쓰기 위해서다. 코드를 쓰기 전에 패키지 구조부터 정해 두자. 이번 회차에서 가장 중요한 설계 결정이 여기에 들어 있다.</p>
+<pre class="diagram">com.example.shop
+ ├─ domain                 ← 서블릿, 쿠키, 세션을 import하지 않는다
+ │   ├─ account            Account, AccountRepository
+ │   ├─ login              LoginService
+ │   └─ product            (이전 회차의 상품)
+ └─ web                    ← 요청·응답, 쿠키, 세션을 다룬다
+     ├─ HomeController
+     ├─ account            AccountController, SignUpForm
+     ├─ login              LoginController, LoginForm
+     └─ session            SimpleSessionStore, SessionKeys
+
+의존 방향:  web ──▶ domain     (반대 방향은 없다)</pre>
+<p>의존은 한 방향으로만 흐른다. 웹 계층은 도메인을 쓰지만, 도메인은 <code>jakarta.servlet</code> 패키지를 한 줄도 import하지 않는다. 이 규칙의 이득은 이번 회차 안에서 바로 확인된다. 로그인 상태를 유지하는 방법을 쿠키, 직접 만든 세션, 서블릿 세션으로 세 번 바꾸는데, 그동안 아이디와 비밀번호를 확인하는 <code>LoginService</code>는 한 글자도 바뀌지 않는다. "누가 맞는 자격 증명을 냈는가"는 도메인의 문제이고, "그 사실을 다음 요청까지 어떻게 기억하는가"는 웹의 문제이기 때문이다. 둘을 한 클래스에 섞어 두면 세 번의 교체가 세 번의 도메인 수정이 된다.</p>
+<p>도메인 객체와 저장소는 다음과 같다. 이번 회차의 주제가 아니므로 데이터베이스 대신 메모리 저장소를 쓴다. 이 회차의 예제 코드는 지면을 아끼려고 <code>package</code>와 <code>import</code> 줄을 생략한다.</p>
+<pre><code class="language-java">public class Account {
+    private Long id;
+    private String loginId;
+    private String name;
+    private String password;
+
+    public Account(String loginId, String name, String password) {
+        this.loginId = loginId;
+        this.name = name;
+        this.password = password;
+    }
+
+    void assignId(Long id) { this.id = id; }   // 같은 패키지의 저장소만 호출한다
+
+    public Long getId() { return id; }
+    public String getLoginId() { return loginId; }
+    public String getName() { return name; }
+    public String getPassword() { return password; }
+}
+
+@Repository
+public class AccountRepository {
+    private final Map<Long, Account> store = new ConcurrentHashMap<>();
+    private final AtomicLong sequence = new AtomicLong();
+
+    public Account save(Account account) {
+        account.assignId(sequence.incrementAndGet());
+        store.put(account.getId(), account);
+        return account;
+    }
+
+    public Optional<Account> findById(Long id) {
+        return Optional.ofNullable(store.get(id));
+    }
+
+    public Optional<Account> findByLoginId(String loginId) {
+        return store.values().stream()
+                .filter(a -> a.getLoginId().equals(loginId))
+                .findFirst();
+    }
+}</code></pre>
+<p>저장소가 <code>HashMap</code>과 <code>long</code> 필드 대신 <code>ConcurrentHashMap</code>과 <code>AtomicLong</code>을 쓰는 이유는 앞에서 말한 스레드 구조에 있다. 저장소 빈은 하나이고, 서로 다른 사용자의 회원 가입 요청은 서로 다른 작업 스레드에서 동시에 <code>save()</code>를 부른다. <code>sequence++</code>는 읽기·더하기·쓰기 세 단계라 두 스레드가 같은 값을 읽으면 같은 ID가 두 번 나온다. <code>AtomicLong.incrementAndGet()</code>은 이 세 단계를 하나의 원자적 연산으로 만든다.</p>
+<aside class="note">이 예제는 비밀번호를 평문으로 저장한다. 실제 서비스에서는 비밀번호를 그대로 저장하지 않고, 솔트를 넣은 단방향 해시로 바꿔 저장한 뒤 로그인할 때 같은 계산을 해서 비교한다. 이번 회차의 주제는 "인증한 뒤 그 상태를 어떻게 유지하는가"이므로 여기서는 비교를 단순하게 둔다.</aside>
+
+<h3>회원 가입과 로그인: 인증은 한 번, 유지는 매번</h3>
+<p>회원 가입은 지난 두 회차에서 만든 검증 흐름을 그대로 쓴다. 폼 객체에 Bean Validation 애너테이션을 붙이고, 아이디 중복처럼 저장소를 봐야 아는 규칙은 컨트롤러에서 <code>rejectValue</code>로 필드 오류를 더한다.</p>
+<pre><code class="language-java">public class SignUpForm {
+    @NotBlank private String loginId;
+    @NotBlank private String name;
+    @NotBlank private String password;
+    // getter, setter ...
+}
+
+@Controller
+@RequestMapping("/accounts")
+public class AccountController {
+    private final AccountRepository accountRepository;
+
+    public AccountController(AccountRepository accountRepository) {
+        this.accountRepository = accountRepository;
+    }
+
+    @GetMapping("/new")
+    public String form(@ModelAttribute("form") SignUpForm form) {
+        return "accounts/new";
+    }
+
+    @PostMapping("/new")
+    public String signUp(@Validated @ModelAttribute("form") SignUpForm form,
+                         BindingResult bindingResult) {
+        if (!bindingResult.hasFieldErrors("loginId")
+                && accountRepository.findByLoginId(form.getLoginId()).isPresent()) {
+            bindingResult.rejectValue("loginId", "duplicate", "이미 사용 중인 아이디입니다.");
+        }
+        if (bindingResult.hasErrors()) {
+            return "accounts/new";
+        }
+        accountRepository.save(new Account(form.getLoginId(), form.getName(), form.getPassword()));
+        return "redirect:/";
+    }
+}</code></pre>
+<p>중복 검사는 "있는지 확인한 뒤 저장한다"는 두 단계로 되어 있다. 같은 아이디로 두 요청이 거의 동시에 들어오면, 두 스레드가 모두 "없다"를 확인한 다음 둘 다 저장할 수 있다. 확인과 행동 사이에 틈이 있는 이런 경쟁 조건(check-then-act race)은 <code>ConcurrentHashMap</code>을 써도 사라지지 않는다. 맵의 연산 하나하나는 안전하지만 두 연산을 묶은 덩어리는 원자적이지 않기 때문이다. 실제 서비스에서는 데이터베이스의 유니크 제약으로 최종 방어선을 두고, 컨트롤러의 검사는 친절한 오류 메시지를 위한 1차 확인으로 쓴다.</p>
+<p>로그인의 핵심 판단은 도메인 서비스에 둔다. 아이디로 계정을 찾고, 비밀번호가 맞을 때만 계정을 돌려준다.</p>
+<pre><code class="language-java">@Service
+public class LoginService {
+    private final AccountRepository accountRepository;
+
+    public LoginService(AccountRepository accountRepository) {
+        this.accountRepository = accountRepository;
+    }
+
+    /** 아이디와 비밀번호가 모두 맞으면 계정을, 아니면 빈 Optional을 돌려준다. */
+    public Optional<Account> login(String loginId, String password) {
+        return accountRepository.findByLoginId(loginId)
+                .filter(a -> a.getPassword().equals(password));
+    }
+}</code></pre>
+<p>"아이디가 없다"와 "비밀번호가 틀렸다"를 구분하지 않고 같은 빈 결과로 돌려준다는 점을 눈여겨보자. 둘을 구분해 알려 주면 공격자는 오류 메시지만 보고 어떤 아이디가 가입되어 있는지 알아낼 수 있다. 그래서 로그인 실패는 특정 필드의 오류가 아니라 객체 전체의 오류(글로벌 오류)로 처리한다. 4회에서 본 <code>bindingResult.reject()</code>가 여기에 쓰인다.</p>
+<p>이제 이 회차의 진짜 문제가 드러난다. <code>LoginService.login()</code>이 계정을 돌려준 순간 인증(authentication)은 끝났다. 하지만 그 사실은 이 요청을 처리하는 스레드의 지역 변수에만 있고, 응답이 나가면 사라진다. 사용자가 홈 화면을 다시 요청하면 서버는 처음 보는 요청을 받는다. 인증은 한 번 하지만, 인증된 상태는 매 요청마다 다시 확인할 수 있어야 한다. 남은 지면은 모두 이 "유지"를 다룬다.</p>
+
+<h3>쿠키로 로그인 상태 유지하기</h3>
+<p>가장 단순한 방법은 로그인에 성공했을 때 사용자 번호를 쿠키(cookie)로 내려보내는 것이다. 쿠키는 서버가 <code>Set-Cookie</code> 응답 헤더로 보낸 이름=값 쌍을 브라우저가 저장해 두었다가, 조건에 맞는 다음 요청마다 <code>Cookie</code> 요청 헤더에 실어 돌려보내는 장치다. 규칙은 RFC 6265가 정한다.</p>
+<pre><code class="language-java">@Controller
+public class LoginController {
+    private final LoginService loginService;
+
+    public LoginController(LoginService loginService) {
+        this.loginService = loginService;
+    }
+
+    @PostMapping("/login")
+    public String login(@Validated @ModelAttribute LoginForm form, BindingResult bindingResult,
+                        HttpServletResponse response) {
+        if (bindingResult.hasErrors()) {
+            return "login/form";
+        }
+        Account account = loginService.login(form.getLoginId(), form.getPassword()).orElse(null);
+        if (account == null) {
+            bindingResult.reject("loginFail", "아이디 또는 비밀번호가 맞지 않습니다.");
+            return "login/form";
+        }
+        Cookie cookie = new Cookie("accountId", String.valueOf(account.getId()));
+        response.addCookie(cookie);   // Max-Age를 정하지 않았으므로 세션 쿠키
+        return "redirect:/";
+    }
+    // 로그아웃은 아래에서
+}</code></pre>
+<p>이 응답이 실제로 어떤 헤더가 되는지 확인하려고, 같은 코드를 내장 톰캣 11.0.27(스프링 부트 4.x에 들어 있는 버전) 위의 서블릿으로 돌려 응답 헤더를 그대로 찍어 보았다. 이 회차의 실험은 모두 같은 환경에서 했고, 기준 버전인 톰캣 10.1(스프링 부트 3.x)과 다른 부분은 그때마다 밝힌다.</p>
+<pre data-label="실행 결과 (톰캣 11.0.27)"><code class="language-text">Set-Cookie: accountId=1</code></pre>
+<p>속성이 하나도 붙지 않았다. 그렇다면 브라우저는 이 쿠키를 얼마나 오래, 어떤 요청에 실어 보낼까? RFC 6265 §5.3의 저장 알고리즘이 속성이 빠진 자리를 기본값으로 채운다.</p>
+<div class="table-wrap"><table><thead><tr><th>속성</th><th>생략했을 때 브라우저의 판단</th><th>근거</th></tr></thead><tbody>
+<tr><td><code>Max-Age</code>, <code>Expires</code></td><td>둘 다 없으면 영속 플래그가 꺼진 쿠키가 된다. 브라우저가 세션이 끝났다고 판단할 때 지운다.</td><td>RFC 6265 §5.3</td></tr>
+<tr><td><code>Domain</code></td><td>응답을 보낸 호스트와 정확히 같은 호스트에만 보낸다(host-only 쿠키).</td><td>RFC 6265 §5.3</td></tr>
+<tr><td><code>Path</code></td><td>요청 URI 경로에서 기본 경로(default-path)를 계산해 쓴다.</td><td>RFC 6265 §5.1.4</td></tr>
+<tr><td><code>Secure</code>, <code>HttpOnly</code></td><td>평문 HTTP로도 보내고, 자바스크립트에서도 읽을 수 있다.</td><td>RFC 6265 §4.1.2.5, §4.1.2.6</td></tr>
+</tbody></table></div>
+<p>만료 속성이 없는 쿠키를 흔히 세션 쿠키(session cookie)라고 부르고, <code>Max-Age</code>나 <code>Expires</code>가 있어 그 시각까지 디스크에 남는 쿠키를 영속 쿠키(persistent cookie)라고 부른다. 서블릿 <code>Cookie</code> 클래스의 <code>maxAge</code> 기본값은 -1이고, Javadoc은 음수를 "영속적으로 저장하지 않고 브라우저가 종료될 때 지운다"로, 0을 "쿠키를 삭제한다"로 설명한다. 여기서 "세션 쿠키"의 세션은 브라우저의 실행 기간을 말하는 것이지, 잠시 뒤에 만들 서버 세션과는 상관이 없다. 이름이 비슷해 자주 헷갈리는 지점이다.</p>
+<p>기본 경로 규칙은 실무에서 실제로 사고를 내는 규칙이라 자세히 보자. §5.1.4의 알고리즘은 요청 URI의 경로에 <code>/</code>가 하나 이하이면 <code>/</code>를, 그보다 많으면 마지막 <code>/</code> 앞까지를 기본 경로로 삼는다. 로그인 요청이 <code>POST /login</code>이면 기본 경로는 <code>/</code>라서 사이트 전체에 쿠키가 실린다. 그런데 로그인 URL이 <code>POST /members/login</code>이었다면 기본 경로는 <code>/members</code>가 되고, 브라우저는 <code>GET /</code> 요청에 이 쿠키를 싣지 않는다. 로그인은 성공했는데 홈 화면이 계속 손님 화면으로 보이는 현상이 이렇게 생긴다. 사이트 전체에서 써야 하는 쿠키라면 <code>cookie.setPath("/")</code>로 경로를 명시하는 편이 안전하다.</p>
+<p>로그인 다음 요청부터 브라우저는 쿠키를 실어 보낸다. 전체 교환을 HTTP 메시지로 그리면 다음과 같다.</p>
+<pre><code class="language-http">POST /login HTTP/1.1
+Host: localhost:8080
+Content-Type: application/x-www-form-urlencoded
+
+loginId=kim&password=secret
+
+HTTP/1.1 302
+Location: /
+Set-Cookie: accountId=1
+
+GET / HTTP/1.1
+Host: localhost:8080
+Cookie: accountId=1</code></pre>
+<p><code>Cookie</code> 요청 헤더에는 이름과 값만 실린다는 점도 중요하다. RFC 6265 §4.2.2는 쿠키 속성이 서버로 돌아오지 않는다고 명시한다. 서버는 요청에 실린 쿠키가 언제 만료되는지, 어떤 경로로 저장되었는지, <code>HttpOnly</code>였는지 알 수 없다. 서버가 볼 수 있는 것은 "이 이름에 이 값"뿐이다.</p>
+<p>홈 컨트롤러는 그 값을 <code>@CookieValue</code>로 받는다. 스프링 MVC의 인자 리졸버가 요청의 쿠키 배열에서 이름이 같은 쿠키를 찾고, 문자열 값을 파라미터 타입인 <code>Long</code>으로 변환해 넘겨준다. <code>required = false</code>로 두면 쿠키가 없을 때 <code>null</code>이 들어온다. 기본값인 <code>true</code>로 두면 로그인하지 않은 사용자는 홈 화면에 들어오지도 못하고 400 응답을 받는다.</p>
+<pre><code class="language-java">@Controller
+public class HomeController {
+    private final AccountRepository accountRepository;
+
+    public HomeController(AccountRepository accountRepository) {
+        this.accountRepository = accountRepository;
+    }
+
+    @GetMapping("/")
+    public String home(@CookieValue(name = "accountId", required = false) Long accountId,
+                       Model model) {
+        if (accountId == null) {
+            return "home";                 // 손님용 홈
+        }
+        Account account = accountRepository.findById(accountId).orElse(null);
+        if (account == null) {
+            return "home";                 // 쿠키는 있지만 계정이 없다
+        }
+        model.addAttribute("account", account);
+        return "loginHome";                // 로그인 사용자용 홈
+    }
+}</code></pre>
+<p>쿠키가 있는데 계정이 없는 경우를 따로 처리한 이유가 있다. 쿠키는 브라우저에 남아 있는데 서버의 데이터가 바뀌는 일은 흔하다. 이 예제처럼 메모리 저장소를 쓰면 서버를 재시작할 때마다 계정이 모두 사라지고, 브라우저는 여전히 <code>accountId=1</code>을 보낸다. 클라이언트가 보낸 값이 서버의 현재 상태와 맞는다는 가정은 언제든 깨질 수 있다. 로그인 사용자용 템플릿은 모델에 담긴 계정의 이름만 꺼내 쓴다.</p>
+<pre><code class="language-xml"><!-- templates/loginHome.html 의 일부 -->
+<h2 th:text="|${account.name}님, 환영합니다|">이름</h2>
+<form th:action="@{/logout}" method="post">
+    <button type="submit">로그아웃</button>
+</form></code></pre>
+<p>로그아웃은 같은 이름의 쿠키를 만료 시각이 지난 상태로 다시 내려보내 브라우저가 지우게 하는 것이다.</p>
+<pre><code class="language-java">@PostMapping("/logout")
+public String logout(HttpServletResponse response) {
+    Cookie cookie = new Cookie("accountId", null);
+    cookie.setMaxAge(0);          // 즉시 만료시켜 브라우저가 지우게 한다
+    response.addCookie(cookie);
+    return "redirect:/";
+}</code></pre>
+<pre data-label="실행 결과 (톰캣 11.0.27)"><code class="language-text">Set-Cookie: accountId=; Expires=Thu, 01 Jan 1970 00:00:10 GMT</code></pre>
+<p>톰캣 11.0.27은 <code>maxAge</code>가 0이면 1970년의 과거 시각을 <code>Expires</code>로만 쓴다. 톰캣 10.1 브랜치의 <code>Rfc6265CookieProcessor</code> 소스는 같은 경우에 <code>Max-Age=0</code>을 먼저 쓰고 과거 시각의 <code>Expires</code>를 함께 붙인다. 헤더 모양은 다르지만 결과는 같다. RFC 6265 §5.2.2는 <code>Max-Age</code>가 0 이하이면 만료 시각을 "표현할 수 있는 가장 이른 시각"으로 정하라고 하고, 과거의 <code>Expires</code>도 이미 지난 시각이다. 브라우저는 만료된 쿠키를 저장소에서 지운다.</p>
+<p>여기에 함정이 하나 있다. §5.3의 저장 알고리즘은 이름, 도메인, 경로가 모두 같은 쿠키가 이미 있을 때만 새 쿠키로 기존 쿠키를 교체한다. 로그인할 때는 <code>/members/login</code>에서 기본 경로 <code>/members</code>로 저장된 쿠키를, 로그아웃할 때 <code>/account/logout</code>에서 기본 경로 <code>/account</code>로 만료시키면 둘은 서로 다른 쿠키다. 만료된 새 쿠키만 저장되었다가 지워지고, 원래 쿠키는 그대로 남는다. 로그아웃 버튼을 눌러도 로그아웃이 안 되는 버그다. 쿠키를 지울 때는 만들 때와 같은 <code>Path</code>와 <code>Domain</code>을 지정해야 한다.</p>
+
+<h3>쿠키와 보안 문제</h3>
+<p>쿠키 방식은 동작한다. 하지만 이 상태로 서비스를 열면 안 된다. 문제를 하나씩 직접 만들어 보자.</p>
+<h4>첫째, 값을 바꿔 다른 사람이 될 수 있다</h4>
+<p>쿠키는 브라우저가 저장하고 클라이언트가 보내는 값이다. 4회에서 "서버가 받는 것은 브라우저가 아니라 HTTP 메시지"라고 했던 원칙이 쿠키에도 그대로 적용된다. 개발자 도구에서 값을 고칠 수도 있고, 아예 브라우저 없이 요청을 만들 수도 있다.</p>
+<pre data-label="다른 사용자로 위장하는 요청"><code class="language-bash">curl -i http://localhost:8080/ -H "Cookie: accountId=2"</code></pre>
+<p>홈 컨트롤러는 이 요청을 2번 사용자의 요청으로 처리한다. 사용자 번호는 1, 2, 3으로 차례로 늘어나므로 공격자는 추측할 필요도 없다. 숫자를 바꿔 가며 보내기만 하면 모든 사용자로 로그인할 수 있다. 문제의 뿌리는 서버가 클라이언트 입력을 신원의 증거로 믿었다는 데 있다. <code>accountId=1</code>은 "나는 1번이다"라는 주장일 뿐, 증명이 아니다.</p>
+<h4>둘째, 값이 새어 나가기 쉽다</h4>
+<p>쿠키는 조건에 맞는 모든 요청에 실려 나가므로 노출될 기회가 많다. 평문 HTTP로 통신하면 같은 네트워크의 누군가가 패킷을 엿볼 수 있다. 페이지에 악성 스크립트를 심는 공격(XSS, cross-site scripting)에 성공하면 그 스크립트가 <code>document.cookie</code>로 쿠키를 읽어 외부로 보낼 수 있다. 공용 컴퓨터의 브라우저에 남은 영속 쿠키도 노출 경로다. 쿠키에 사용자 번호가 아니라 이름이나 이메일 같은 개인정보를 담았다면, 새어 나간 순간 그 정보도 함께 새어 나간다.</p>
+<h4>셋째, 새어 나간 값을 서버가 무효로 만들 수 없다</h4>
+<p>가장 근본적인 문제다. 누군가 <code>accountId=1</code>을 알아냈다고 하자. 피해자가 로그아웃해도 지워지는 것은 피해자 브라우저의 쿠키뿐이다. 공격자는 같은 값을 계속 보낼 수 있고, 서버는 그 값을 거부할 근거가 없다. 1번 사용자를 나타내는 값이 영원히 <code>accountId=1</code>이기 때문이다. 값 자체가 신원이면 서버에는 "이 값은 이제 무효"라고 선언할 자리가 없다.</p>
+<div class="table-wrap"><table><thead><tr><th>문제</th><th>원인</th><th>필요한 대책</th></tr></thead><tbody>
+<tr><td>위조</td><td>값이 의미를 가지고 있고 예측 가능하다</td><td>의미 없고 추측할 수 없는 임의의 값을 쓴다</td></tr>
+<tr><td>정보 노출</td><td>중요한 정보가 클라이언트에 있다</td><td>중요한 정보는 서버에만 두고, 클라이언트에는 열쇠만 준다</td></tr>
+<tr><td>폐기 불가</td><td>서버에 값과 신원의 연결을 끊을 수단이 없다</td><td>연결을 서버가 보관해 언제든 지울 수 있게 한다</td></tr>
+<tr><td>탈취 후 장기 사용</td><td>만료가 없거나 길다</td><td>짧은 만료 시간을 서버가 강제한다</td></tr>
+<tr><td>전송·스크립트 노출</td><td>평문 전송, 스크립트에서 읽기 가능</td><td><code>Secure</code>, <code>HttpOnly</code> 속성과 HTTPS</td></tr>
+</tbody></table></div>
+<p>마지막 줄의 두 속성은 브라우저 쪽 방어선이다. RFC 6265 §4.1.2.5에 따르면 <code>Secure</code>는 쿠키의 범위를 "보안 채널"로 제한한다. 브라우저는 HTTPS 요청에만 이 쿠키를 싣는다. §4.1.2.6의 <code>HttpOnly</code>는 쿠키의 범위를 HTTP 요청으로 제한해, 자바스크립트 같은 HTTP가 아닌 API로는 읽을 수 없게 한다. XSS가 성공해도 스크립트가 쿠키 값을 직접 꺼내 가지 못한다. 다만 §4.1.2.5는 <code>Secure</code>가 기밀성만 보호할 뿐 무결성을 보호하지는 않는다고 덧붙인다. 두 속성 모두 값을 바꿔 보내는 위조는 막지 못한다.</p>
+<p>이 밖에 다른 사이트에서 시작된 요청에 쿠키를 실을지 정하는 <code>SameSite</code> 속성도 있다. RFC 6265 본문이 아니라 그 개정 초안(6265bis)에서 정의하는 속성이고, 서블릿 6.0부터는 <code>Cookie.setAttribute("SameSite", "Lax")</code>처럼 임의의 속성을 지정할 수 있으며, 스프링의 <code>ResponseCookie</code> 빌더도 <code>sameSite()</code>를 제공한다. 이 속성은 다른 사이트가 사용자의 쿠키를 이용해 요청을 위조하는 공격(CSRF)과 관련이 깊다.</p>
+<p>표의 위쪽 세 줄을 한 문장으로 모으면 해법이 나온다. <b>클라이언트에는 아무 의미 없는 추측 불가능한 열쇠만 주고, 그 열쇠가 누구를 가리키는지는 서버가 보관한다.</b> RFC 6265 §8.4도 서버가 세션 데이터를 쿠키에 직접 담는 대신 세션 식별자(nonce)를 담고 그 값으로 서버 쪽 상태를 찾는 방식이 흔하다고 설명한다. 이것이 세션이다.</p>
+
+<h3>세션의 동작 방식: 값 대신 열쇠를 준다</h3>
+<p>세션(session)은 서버가 클라이언트별 상태를 자기 쪽에 저장해 두고, 클라이언트에게는 그 상태를 찾는 열쇠인 세션 ID만 쿠키로 주는 방식이다. 로그인 흐름은 이렇게 바뀐다.</p>
+<pre class="diagram">브라우저                                      서버
+   │  POST /login (kim / secret)                 │
+   │────────────────────────────────────────────▶│ 1. 아이디·비밀번호 확인
+   │                                             │ 2. 세션 ID 생성 (추측 불가능한 난수)
+   │                                             │    예: 9F2C...E71A
+   │                                             │ 3. 세션 저장소에 보관
+   │                                             │    ┌──────────────┬─────────────┐
+   │                                             │    │ 9F2C...E71A  │ Account(kim)│
+   │                                             │    └──────────────┴─────────────┘
+   │  302 Location: /                            │
+   │  Set-Cookie: SESSIONID=9F2C...E71A          │
+   │◀────────────────────────────────────────────│
+   │                                             │
+   │  GET /                                      │
+   │  Cookie: SESSIONID=9F2C...E71A              │
+   │────────────────────────────────────────────▶│ 4. 쿠키에서 세션 ID를 꺼내
+   │                                             │    저장소에서 찾는다 → kim
+   │  200 (kim님, 환영합니다)                     │
+   │◀────────────────────────────────────────────│</pre>
+<p>쿠키를 쓴다는 점은 같다. 달라진 것은 쿠키에 담기는 값의 성격이다. 앞의 표와 하나씩 맞춰 보자.</p>
+<ul>
+<li><b>위조</b>: 세션 ID는 사용자 번호와 아무 관계가 없는 큰 난수다. 다른 사용자의 세션 ID를 맞히려면 엄청나게 큰 공간에서 아직 살아 있는 값 하나를 찍어야 한다. 숫자를 1 늘리는 공격은 통하지 않는다.</li>
+<li><b>정보 노출</b>: 쿠키에는 세션 ID만 있다. 이름, 권한, 계정 객체는 서버의 메모리에 있다.</li>
+<li><b>폐기</b>: 서버가 저장소에서 그 세션 ID를 지우면, 같은 쿠키를 아무리 보내도 아무것도 찾을 수 없다. 로그아웃이 서버 쪽에서 실제로 효력을 가진다.</li>
+<li><b>만료</b>: 저장소의 항목마다 마지막으로 쓰인 시각을 기록해 두고, 일정 시간 쓰이지 않으면 서버가 지운다. 쿠키가 탈취되어도 쓸 수 있는 기간이 제한된다.</li>
+</ul>
+<p>해결되지 않는 것도 분명히 알아 두자. 살아 있는 세션 ID를 누군가 손에 넣으면 그 사람은 세션이 끝날 때까지 사용자 행세를 할 수 있다. 이것을 세션 하이재킹(session hijacking)이라고 한다. 세션은 피해의 크기와 기간을 줄일 뿐 탈취 자체를 막지는 못한다. 그래서 HTTPS와 <code>Secure</code>, <code>HttpOnly</code>, 짧은 타임아웃, 로그인 시 세션 ID 교체 같은 방어선을 겹쳐 쌓는다. 마지막 항목은 이 회차 끝에서 다룬다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>외투 보관소의 번호표</strong><p>공연장 외투 보관소는 외투를 받고 번호표를 준다. 번호표에는 내 이름도, 외투가 어떤 옷인지도 적혀 있지 않다. 외투는 보관소 안에 있고, 공연이 끝나면 보관소는 남은 외투를 정리한다. 세션 ID가 번호표, 세션 저장소가 보관소, 타임아웃이 마감 정리다. 비유가 깨지는 곳이 두 군데 있다. 실제 번호표는 1, 2, 3 순서대로 나눠 주지만, 세션 ID가 그렇게 순서대로 나오면 앞에서 본 위조 문제가 그대로 돌아온다. 그리고 보관소 직원은 얼굴을 기억할 수도 있지만, 서버는 번호표를 내민 사람이 누구인지 전혀 확인하지 않는다. 번호표를 주운 사람이 외투를 찾아가는 것이 세션 하이재킹이다.</p></aside>
+<x-visual id="spring-mvc2-06-cookie-vs-session" title="쿠키에 값을 담는 방식과 세션 ID를 담는 방식의 비교" kind="비교 시퀀스 다이어그램" ratio="16:9">
+<x-hint>왼쪽은 쿠키에 사용자 번호를 직접 담는 방식, 오른쪽은 세션 ID만 담고 서버 저장소에서 찾는 방식이다. 공격자가 값을 바꿨을 때 결과가 어떻게 갈리는지 보여 준다.</x-hint>
+<x-prompt>A clean two-panel technical sequence diagram on a white background, flat vector style. Left panel titled "쿠키에 값 저장": a browser icon on the left and a server box on the right; an arrow from server to browser labeled "Set-Cookie: accountId=1"; below it a red attacker icon sending an arrow to the server labeled "Cookie: accountId=2", with the server answering "2번 사용자로 처리" in red. Right panel titled "세션 ID 저장": the same browser and server, plus a small table inside the server box with two columns, one row reading "9F2C…E71A" and "kim"; an arrow from server to browser labeled "Set-Cookie: SESSIONID=9F2C…E71A"; the attacker sends an arrow labeled "Cookie: SESSIONID=추측한 값" and the server answers "찾을 수 없음" in gray. Use blue for normal arrows and red for the attacker. Keep all labels exactly as written in Korean.</x-prompt>
+<x-caption>값이 신원인 쿠키는 숫자 하나만 바꿔도 다른 사람이 되지만, 세션 ID는 서버 저장소에 없는 값이면 아무것도 가리키지 않는다.</x-caption>
+</x-visual>
+
+<h3>세션 직접 만들기: 추측할 수 없는 ID와 동시에 쓰이는 저장소</h3>
+<p>서블릿 컨테이너가 세션을 제공하지만, 먼저 직접 만들어 보면 컨테이너가 해 주는 일이 무엇인지 분명해진다. 필요한 기능은 세 가지다.</p>
+<ol>
+<li>세션 생성: 추측할 수 없는 세션 ID를 만들고, 저장소에 값을 보관하고, 세션 ID를 쿠키로 내려보낸다.</li>
+<li>세션 조회: 요청의 쿠키에서 세션 ID를 꺼내 저장소에서 값을 찾는다.</li>
+<li>세션 만료: 요청의 세션 ID에 해당하는 항목을 저장소에서 지운다.</li>
+</ol>
+<pre><code class="language-java">@Component
+public class SimpleSessionStore {
+    public static final String COOKIE_NAME = "SHOPSESSION";
+
+    private final Map<String, Object> store = new ConcurrentHashMap<>();
+
+    /** 세션을 만들고, 세션 ID를 쿠키로 내려보낸다. */
+    public void create(Object value, HttpServletResponse response) {
+        String sessionId = UUID.randomUUID().toString();
+        store.put(sessionId, value);
+        Cookie cookie = new Cookie(COOKIE_NAME, sessionId);
+        cookie.setPath("/");
+        cookie.setHttpOnly(true);
+        response.addCookie(cookie);
+    }
+
+    /** 요청의 쿠키에서 세션 ID를 찾아 저장소의 값을 돌려준다. 없으면 null. */
+    public Object find(HttpServletRequest request) {
+        Cookie cookie = findCookie(request);
+        return cookie == null ? null : store.get(cookie.getValue());
+    }
+
+    /** 서버 쪽 저장소에서 세션을 지운다. */
+    public void expire(HttpServletRequest request) {
+        Cookie cookie = findCookie(request);
+        if (cookie != null) {
+            store.remove(cookie.getValue());
+        }
+    }
+
+    private Cookie findCookie(HttpServletRequest request) {
+        Cookie[] cookies = request.getCookies();   // 쿠키가 하나도 없으면 null
+        if (cookies == null) {
+            return null;
+        }
+        return Arrays.stream(cookies)
+                .filter(c -> c.getName().equals(COOKIE_NAME))
+                .findFirst()
+                .orElse(null);
+    }
+}</code></pre>
+<p>세 줄의 결정이 이 클래스의 전부다. 하나씩 아래로 내려가 보자.</p>
+<h4>왜 UUID.randomUUID()인가</h4>
+<p>세션 ID의 조건은 "추측할 수 없음"이다. 순서대로 늘어나는 번호는 당연히 안 되고, <code>java.util.Random</code>도 안 된다. <code>Random</code>의 Javadoc은 이 클래스가 48비트 시드를 선형 합동 공식으로 바꿔 가며 수를 만든다고 설명하고, 암호학적으로 안전하지 않으니 그런 용도에는 <code>SecureRandom</code>을 쓰라고 안내한다. 내부 상태가 48비트뿐이고 다음 값이 이전 값에서 결정되므로, 출력 몇 개를 관찰하면 다음 출력을 계산할 수 있는 구조다.</p>
+<p>JDK 21의 <code>UUID.randomUUID()</code> 소스를 열어 보면 무엇을 쓰는지 바로 보인다.</p>
+<pre data-label="JDK 21 java/util/UUID.java (발췌)"><code class="language-java">private static class Holder {
+    static final SecureRandom numberGenerator = new SecureRandom();
+}
+
+public static UUID randomUUID() {
+    SecureRandom ng = Holder.numberGenerator;
+
+    byte[] randomBytes = new byte[16];
+    ng.nextBytes(randomBytes);
+    randomBytes[6]  &= 0x0f;  /* clear version        */
+    randomBytes[6]  |= 0x40;  /* set to version 4     */
+    randomBytes[8]  &= 0x3f;  /* clear variant        */
+    randomBytes[8]  |= (byte) 0x80;  /* set to IETF variant  */
+    return new UUID(randomBytes);
+}</code></pre>
+<p>암호학적으로 강한 난수 생성기인 <code>SecureRandom</code>에서 16바이트(128비트)를 받은 다음, 6번 바이트의 상위 4비트를 버전 번호 4로, 8번 바이트의 상위 2비트를 변형(variant) 표시로 덮어쓴다. 고정되는 비트가 6개이므로 무작위인 비트는 122개다. 문자열로 바꾸면 <code>8-4-4-4-12</code> 형식의 16진수 36자가 된다. 살아 있는 세션이 아무리 많아도 122비트 공간에서 그중 하나를 무작위로 맞힐 확률은 무시할 수 있을 만큼 작다.</p>
+<p><code>Holder</code>라는 중첩 클래스에도 JVM 이야기가 숨어 있다. 자바 언어 명세(JLS §12.4.1)는 클래스의 정적 필드가 처음 사용될 때 그 클래스를 초기화한다고 정한다. <code>UUID</code> 클래스가 로딩되어도 <code>Holder</code>는 초기화되지 않고, <code>randomUUID()</code>가 처음 <code>Holder.numberGenerator</code>를 읽는 순간 초기화된다. 여러 스레드가 동시에 처음 호출해도 JVM이 클래스 초기화를 한 번만 수행하도록 보장하므로(JVMS §5.5), 별도의 동기화 없이 <code>SecureRandom</code> 인스턴스가 정확히 하나 만들어진다. 생성 비용이 있는 객체를 필요할 때 한 번만 만드는 "지연 초기화 홀더" 관용구다.</p>
+<h4>왜 ConcurrentHashMap인가</h4>
+<p><code>SimpleSessionStore</code>는 싱글톤 빈이고, 저장소 맵은 모든 요청이 함께 쓴다. 톰캣의 작업 스레드 여러 개가 동시에 <code>put</code>, <code>get</code>, <code>remove</code>를 호출한다. <code>HashMap</code>은 이런 동시 수정을 전제로 만들어지지 않았다. 두 스레드가 동시에 넣으면서 내부 배열을 늘리는 순간이 겹치면 항목이 사라지거나 구조가 깨질 수 있다. <code>ConcurrentHashMap</code>은 개별 연산을 스레드 안전하게 만들고, 읽기는 대부분 락 없이 처리한다. 세션 저장소처럼 읽기가 쓰기보다 훨씬 많은 맵에 잘 맞는다. 잠시 뒤에 보겠지만 톰캣도 세션을 똑같이 <code>ConcurrentHashMap</code>에 보관한다.</p>
+<h4>왜 getCookies()의 null을 확인하는가</h4>
+<p><code>HttpServletRequest.getCookies()</code>는 요청에 쿠키가 하나도 없으면 빈 배열이 아니라 <code>null</code>을 돌려준다고 Javadoc에 적혀 있다. 처음 방문한 브라우저의 요청이 정확히 이 경우다. 이 확인을 빠뜨리면 첫 방문자마다 <code>NullPointerException</code>이 난다.</p>
+<h4>테스트로 동작을 확인한다</h4>
+<p>스프링이 제공하는 <code>MockHttpServletRequest</code>, <code>MockHttpServletResponse</code>를 쓰면 서버를 띄우지 않고도 "서버가 쿠키를 내려보낸다 → 브라우저가 다음 요청에 싣는다"는 흐름을 흉내 낼 수 있다.</p>
+<pre><code class="language-java">class SimpleSessionStoreTest {
+    SimpleSessionStore sessionStore = new SimpleSessionStore();
+
+    @Test
+    void createFindExpire() {
+        // 1) 서버가 세션을 만들고 쿠키를 응답에 싣는다
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        Account account = new Account("kim", "김", "pw");
+        sessionStore.create(account, response);
+
+        // 2) 브라우저가 그 쿠키를 다음 요청에 싣는다고 흉내 낸다
+        Cookie issued = response.getCookie(SimpleSessionStore.COOKIE_NAME);
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.setCookies(issued);
+        assertSame(account, sessionStore.find(request));
+
+        // 3) 만료하면 같은 쿠키로도 찾을 수 없다
+        sessionStore.expire(request);
+        assertNull(sessionStore.find(request));
+
+        // 4) 쿠키가 아예 없는 요청
+        assertNull(sessionStore.find(new MockHttpServletRequest()));
+    }
+}</code></pre>
+<p>이 테스트는 통과한다. 3단계가 쿠키 방식과의 결정적인 차이를 보여 준다. 요청은 여전히 같은 쿠키를 들고 있지만, 서버가 저장소에서 지웠으므로 그 쿠키는 이제 아무것도 가리키지 않는다. 쿠키 방식에서는 할 수 없던 서버 쪽 폐기다. <code>assertSame</code>을 쓴 것도 의도가 있다. 저장소는 객체의 복사본이 아니라 참조를 보관하므로, 꺼낸 값은 넣은 객체와 같은 힙 객체다.</p>
+
+<h3>직접 만든 세션을 적용하고, 한계를 확인한다</h3>
+<p>컨트롤러에서 쿠키를 다루던 부분을 세션 저장소 호출로 바꾼다. <code>LoginService</code>와 도메인 코드는 그대로다.</p>
+<pre><code class="language-java">// 로그인 성공 시
+sessionStore.create(account, response);
+return "redirect:/";
+
+// 로그아웃
+@PostMapping("/logout")
+public String logout(HttpServletRequest request) {
+    sessionStore.expire(request);
+    return "redirect:/";
+}
+
+// 홈
+@GetMapping("/")
+public String home(HttpServletRequest request, Model model) {
+    Account account = (Account) sessionStore.find(request);
+    if (account == null) {
+        return "home";
+    }
+    model.addAttribute("account", account);
+    return "loginHome";
+}</code></pre>
+<p>이제 브라우저 개발자 도구에서 쿠키를 보면 <code>SHOPSESSION</code>에 36자의 UUID 문자열이 들어 있다. 이 값을 한 글자 바꿔 보내면 저장소에서 아무것도 찾지 못하므로 손님용 홈이 나온다. 로그아웃하면 서버 저장소의 항목이 지워지므로, 로그아웃 전에 복사해 둔 쿠키 값을 다시 보내도 로그인 상태로 돌아가지 않는다. 쿠키를 굳이 브라우저에서 지우지 않아도 되는 이유다. 남아 있는 쿠키는 이제 아무것도 열지 못하는 열쇠다.</p>
+<p>동작은 하지만, 이 저장소를 그대로 운영에 쓸 수는 없다. 부족한 점을 적어 보면 서블릿 컨테이너가 세션 기능으로 해결해 둔 목록이 그대로 나온다.</p>
+<ul>
+<li><b>만료가 없다.</b> 사용자가 로그아웃하지 않고 브라우저를 닫으면 그 항목은 영원히 남는다. 저장소 맵은 싱글톤 빈의 필드이고, 싱글톤 빈은 스프링 컨테이너가 살아 있는 동안 참조를 쥐고 있다. 가비지 컬렉터는 GC 루트에서 참조를 따라 닿을 수 있는 객체를 살려 두므로, 맵에 들어간 계정 객체도 함께 살아남는다. 자바에서 "메모리 누수"는 대개 이런 모습이다. 해제를 잊은 것이 아니라, 더 이상 쓰지 않을 객체를 닿을 수 있는 곳에 남겨 둔 것이다.</li>
+<li><b>세션 하나에 값이 하나다.</b> 로그인 계정 말고도 최근 본 상품, 장바구니처럼 사용자별로 기억할 것이 생기면 세션 ID마다 이름=값 맵이 하나씩 필요하다.</li>
+<li><b>로그인할 때 세션 ID를 바꾸지 않는다.</b> 이 문제는 끝에서 세션 고정 공격과 함께 다룬다.</li>
+<li><b>서버를 재시작하면 모두 사라지고, 서버가 여러 대면 공유되지 않는다.</b> 저장소가 한 JVM의 힙에 있기 때문이다.</li>
+<li><b>쿠키 발급의 세부를 직접 챙겨야 한다.</b> 경로, <code>HttpOnly</code>, HTTPS일 때의 <code>Secure</code>를 코드 한 줄씩으로 관리하고 있다.</li>
+</ul>
+
+<h3>서블릿 HttpSession: 컨테이너가 대신 해 주는 일</h3>
+<p>서블릿 명세는 이 기능을 <code>HttpSession</code> 인터페이스로 정의하고, 톰캣 같은 서블릿 컨테이너가 구현한다. 직접 만든 저장소를 걷어 내고 <code>HttpSession</code>으로 바꾼 로그인 컨트롤러는 다음과 같다.</p>
+<pre><code class="language-java">public final class SessionKeys {
+    public static final String LOGIN_ACCOUNT = "loginAccount";
+    private SessionKeys() {}
+}
+
+@PostMapping("/login")
+public String login(@Validated @ModelAttribute LoginForm form, BindingResult bindingResult,
+                    HttpServletRequest request) {
+    if (bindingResult.hasErrors()) {
+        return "login/form";
+    }
+    Account account = loginService.login(form.getLoginId(), form.getPassword()).orElse(null);
+    if (account == null) {
+        bindingResult.reject("loginFail", "아이디 또는 비밀번호가 맞지 않습니다.");
+        return "login/form";
+    }
+    HttpSession session = request.getSession();          // 없으면 만든다
+    session.setAttribute(SessionKeys.LOGIN_ACCOUNT, account);
+    return "redirect:/";
+}
+
+@PostMapping("/logout")
+public String logout(HttpServletRequest request) {
+    HttpSession session = request.getSession(false);     // 없으면 만들지 않는다
+    if (session != null) {
+        session.invalidate();
+    }
+    return "redirect:/";
+}</code></pre>
+<p><code>request.getSession()</code>은 <code>getSession(true)</code>와 같다. 이 요청에 연결된 유효한 세션이 있으면 그것을, 없으면 새로 만들어 돌려준다. <code>getSession(false)</code>는 없을 때 만들지 않고 <code>null</code>을 돌려준다. 로그인처럼 세션이 반드시 있어야 하는 곳에서는 앞의 것을, 로그아웃이나 조회처럼 "있으면 쓰는" 곳에서는 뒤의 것을 쓴다. 세션 하나는 이름=값 쌍을 여러 개 담는 맵처럼 쓰므로, 속성 이름은 오타가 나지 않게 상수로 모아 둔다.</p>
+<p>내장 톰캣 위에 같은 동작을 하는 서블릿을 올리고 HTTP 클라이언트로 요청을 보내 관찰한 결과는 다음과 같다. 세션 ID는 실행마다 다르므로 <code><32 hex></code>로 가렸다.</p>
+<pre data-label="실험 출력 발췌 (톰캣 11.0.27, 구분선은 번역)"><code class="language-text">== 쿠키 없이 로그인 요청
+Set-Cookie: JSESSIONID=<32 hex>; Path=/; HttpOnly
+isNew=true idLen=32 maxInactive=1800 fromCookie=false
+
+== 받은 쿠키를 실어 홈 요청
+isNew=false attr=kim
+
+== 서버에 없는 세션 ID를 지어내 홈 요청 (getSession(false))
+no session
+
+== 서버에 없는 세션 ID를 지어내 로그인 요청 (getSession())
+새로 발급된 ID가 지어낸 ID와 같은가? false</code></pre>
+<p>직접 만든 저장소에서 손으로 하던 일이 모두 들어 있다. 쿠키 이름은 <code>JSESSIONID</code>이고, 경로는 <code>/</code>, <code>HttpOnly</code>가 기본으로 붙었다. 세션 ID는 16진수 32자다. 지어낸 세션 ID를 보내도 그 값으로 세션이 만들어지지 않는다는 점도 확인할 수 있다. 각각이 어디서 오는지 톰캣 소스를 따라가 보자.</p>
+<h4>톰캣이 세션을 찾고 만드는 순서</h4>
+<p><code>request.getSession(create)</code>는 톰캣의 <code>org.apache.catalina.connector.Request.doGetSession()</code>으로 들어간다. 그 전에 요청을 받은 커넥터 쪽 어댑터(<code>CoyoteAdapter</code>)가 <code>Cookie</code> 헤더에서 <code>JSESSIONID</code> 값을 꺼내 "요청이 주장하는 세션 ID(requested session ID)"로 기록해 둔다. 아직은 주장일 뿐이다.</p>
+<figure class="flow-figure"><figcaption>Request.doGetSession()의 흐름 (톰캣 11.0.27 소스)</figcaption><ol class="flow">
+<li><strong>이미 찾은 세션 확인</strong><span>같은 요청 안에서 이미 세션을 얻었고 아직 유효하면 그것을 돌려준다.</span></li>
+<li><strong>요청이 주장한 ID로 조회</strong><span>매니저의 <code>findSession(id)</code>를 부른다. 기본 매니저(<code>StandardManager</code>)의 부모 클래스 <code>ManagerBase</code>는 세션을 <code>ConcurrentHashMap</code>에 보관하므로 이 조회는 맵의 <code>get</code>이다.</span></li>
+<li><strong>유효성 검사</strong><span>찾은 세션의 <code>isValid()</code>가 마지막 접근 이후 흐른 시간을 계산해 타임아웃을 넘었으면 그 자리에서 만료시킨다.</span></li>
+<li><strong>찾았으면 접근 기록</strong><span><code>access()</code>로 접근 시각을 갱신하고, 클라이언트가 세션에 합류했으므로 <code>isNew</code>를 false로 바꾼 뒤 돌려준다.</span></li>
+<li><strong>못 찾았고 create가 false</strong><span><code>null</code>을 돌려준다. <code>getSession(false)</code>는 여기서 끝난다.</span></li>
+<li><strong>새 세션 생성</strong><span>응답이 이미 커밋되었으면 쿠키를 보낼 수 없으므로 <code>IllegalStateException</code>을 던진다. 아니면 매니저가 새 ID를 만들고 타임아웃을 설정한 세션을 맵에 넣는다.</span></li>
+<li><strong>세션 쿠키 추가</strong><span><code>JSESSIONID</code> 쿠키를 만들어 응답 헤더에 넣는다. 경로는 컨텍스트 경로(루트면 <code>/</code>), <code>HttpOnly</code>는 컨텍스트 설정에 따라, <code>Secure</code>는 요청이 HTTPS면 붙는다.</span></li>
+</ol></figure>
+<p>6단계의 예외는 실무에서 가끔 만나는 오류의 원인이다. 세션 ID는 <code>Set-Cookie</code> 헤더로 전달되는데, 응답 본문이 버퍼를 넘쳐 이미 클라이언트로 나가기 시작했다면(커밋되었다면) 헤더를 더 붙일 수 없다. 큰 응답을 쓰는 도중이나 쓴 뒤에 처음으로 <code>getSession()</code>을 부르는 코드가 이 예외를 만난다. 세션은 응답을 쓰기 전에 확보해야 한다.</p>
+<p>새 세션의 ID를 정할 때 톰캣은 클라이언트가 보낸 ID를 함부로 받아들이지 않는다. 같은 호스트의 여러 웹 애플리케이션이 세션 ID를 공유하는 특수한 경우를 위해 재사용 경로가 있긴 하지만, 기본 설정(<code>validateClientProvidedNewSessionId=true</code>)에서는 그 ID의 세션이 호스트 안 어딘가에 실제로 있을 때만 재사용한다. 지어낸 ID를 보낸 실험에서 새 ID가 발급된 이유가 이것이다. 공격자가 자기가 정한 값을 세션 ID로 심는 일을 막는 장치다.</p>
+<x-visual id="spring-mvc2-06-tomcat-session-lookup" title="톰캣이 JSESSIONID로 세션을 찾고 만드는 과정" kind="구조도" ratio="16:9">
+<x-hint>요청의 Cookie 헤더에서 꺼낸 세션 ID가 Request, Manager, ConcurrentHashMap을 거쳐 StandardSession에 닿는 경로와, 못 찾았을 때 새 세션과 Set-Cookie가 만들어지는 갈래를 보여 준다.</x-hint>
+<x-prompt>A left-to-right architecture diagram on a white background, flat vector style with rounded boxes. Leftmost: an HTTP request card showing the text "Cookie: JSESSIONID=9F2C…". An arrow goes to a box labeled "CoyoteAdapter" with a note "세션 ID 추출". Next arrow to a box labeled "Request.doGetSession()". From there an arrow to a box labeled "StandardManager", which contains a table icon labeled "ConcurrentHashMap (ID → Session)". Inside the table, one row points with an arrow to a card labeled "StandardSession" containing three small lines: "attributes", "lastAccessedTime", "maxInactiveInterval". Below Request.doGetSession() a branching dashed arrow labeled "못 찾음 + create=true" leads to a box labeled "새 ID 생성 (SecureRandom 16바이트)" and then to a response card labeled "Set-Cookie: JSESSIONID=…; Path=/; HttpOnly". Another dashed branch labeled "못 찾음 + create=false" leads to a small gray box labeled "null". Use blue for the normal lookup path and orange for the creation path.</x-prompt>
+<x-caption>세션 조회는 결국 매니저가 쥔 ConcurrentHashMap의 get이다. 찾지 못했을 때만 새 ID와 Set-Cookie가 만들어진다.</x-caption>
+</x-visual>
+<h4>세션 ID는 어떻게 만들어지는가</h4>
+<p>톰캣의 기본 세션 ID 생성기(<code>StandardSessionIdGenerator</code>)는 <code>SecureRandom</code>에서 받은 바이트를 16진수 문자로 바꾼다. 기본 길이(<code>sessionIdLength</code>)는 16바이트이고, 바이트 하나가 16진수 두 글자가 되므로 결과는 32자다. 실험에서 본 <code>idLen=32</code>와 맞는다. 무작위인 비트가 128개이므로 UUID보다 6비트 많다. 매니저 설정 문서에 따르면 난수 알고리즘을 지정하지 않으면 SHA1PRNG를 쓰고, 그 알고리즘을 지원하지 않는 플랫폼에서는 플랫폼 기본값을 쓴다.</p>
+<p>소스에는 한 가지가 더 있다. 엔진에 <code>jvmRoute</code>가 설정되어 있으면 ID 끝에 <code>.node1</code>처럼 점과 경로 이름을 붙인다. 서버가 여러 대일 때 앞단의 로드 밸런서가 이 꼬리를 보고 같은 사용자를 같은 서버로 보내기 위한 것이다. 세션이 한 서버의 메모리에만 있다는 한계와 직결되는 장치로, 이 회차 끝에서 다시 나온다.</p>
+<div class="table-wrap"><table><thead><tr><th>할 일</th><th>SimpleSessionStore</th><th>톰캣 HttpSession</th></tr></thead><tbody>
+<tr><td>세션 ID</td><td><code>UUID.randomUUID()</code>, 122비트 난수</td><td><code>SecureRandom</code> 16바이트, 16진수 32자</td></tr>
+<tr><td>저장소</td><td><code>ConcurrentHashMap</code>, 세션당 값 하나</td><td><code>ConcurrentHashMap</code>, 세션마다 속성 맵</td></tr>
+<tr><td>쿠키</td><td>경로·<code>HttpOnly</code>를 코드로 지정</td><td>컨텍스트 경로, <code>HttpOnly</code> 기본, HTTPS면 <code>Secure</code></td></tr>
+<tr><td>만료</td><td>없음</td><td>유휴 타임아웃(기본 30분), 접근 시 검사와 주기적 정리</td></tr>
+<tr><td>무효화</td><td><code>store.remove()</code></td><td><code>invalidate()</code>, 리스너 통지</td></tr>
+<tr><td>재시작·다중 서버</td><td>대책 없음</td><td>설정에 따라 직렬화 저장, 클러스터링, 외부 저장소 연동</td></tr>
+</tbody></table></div>
+<h4>로그아웃: invalidate()가 하는 일</h4>
+<p><code>invalidate()</code>는 세션을 무효로 표시하고, 매니저의 맵에서 제거하고, 세션에 묶여 있던 속성을 모두 풀어 준다. 무효화된 세션 객체를 계속 쥐고 있다가 메서드를 부르면 어떻게 될까? 실험 결과는 다음과 같다.</p>
+<pre data-label="실험 출력 발췌 (톰캣 11.0.27, 구분선은 번역)"><code class="language-text">== 로그아웃: invalidate() 뒤 같은 객체의 getAttribute() 호출
+after invalidate: IllegalStateException
+
+== 로그아웃 전에 쓰던 쿠키 그대로 홈 요청
+no session</code></pre>
+<p>서블릿 Javadoc은 이미 무효화된 세션에 <code>getAttribute()</code>, <code>isNew()</code>, <code>invalidate()</code> 등을 호출하면 <code>IllegalStateException</code>을 던진다고 명시한다. 그래서 로그아웃 코드는 <code>getSession(false)</code>로 얻은 세션이 <code>null</code>이 아닐 때 한 번만 <code>invalidate()</code>한다. 브라우저에는 <code>JSESSIONID</code> 쿠키가 여전히 남아 있지만, 다음 요청에서 2단계의 맵 조회가 실패하므로 세션이 없는 요청과 똑같이 처리된다. 직접 만든 저장소의 테스트 3단계와 같은 원리다.</p>
+
+<h3>@SessionAttribute: 읽기만 하는 문, 만들지 않는 문</h3>
+<p>홈 화면처럼 세션에서 값을 읽기만 하는 곳에서는 스프링의 <code>@SessionAttribute</code>를 쓰면 코드가 짧아진다.</p>
+<pre><code class="language-java">@GetMapping("/")
+public String home(@SessionAttribute(name = SessionKeys.LOGIN_ACCOUNT, required = false)
+                   Account loginAccount, Model model) {
+    if (loginAccount == null) {
+        return "home";
+    }
+    model.addAttribute("account", loginAccount);
+    return "loginHome";
+}</code></pre>
+<p>이 애너테이션이 세션을 새로 만드는지가 중요하다. 스프링 MVC에서 이 파라미터를 채우는 <code>SessionAttributeMethodArgumentResolver</code>(스프링 4.3부터)는 <code>request.getAttribute(name, RequestAttributes.SCOPE_SESSION)</code>을 호출하고, 그 구현인 <code>ServletRequestAttributes</code>는 세션 범위를 읽을 때 <code>getSession(false)</code>를 쓴다(스프링 프레임워크 7.0.10 소스로 확인). 세션이 없으면 만들지 않고 <code>null</code>을 넘긴다. <code>required</code>를 기본값 <code>true</code>로 두면 속성이 없을 때 <code>ServletRequestBindingException</code>이 나고 400 응답이 된다. 스프링 레퍼런스도 이 애너테이션을 "컨트롤러 밖(예를 들어 필터)에서 관리되며, 있을 수도 없을 수도 있는 기존 세션 속성"에 접근하는 용도로 설명하고, 속성을 추가하거나 지울 때는 <code>HttpSession</code>이나 <code>WebRequest</code>를 주입받으라고 안내한다.</p>
+<p>반대로 컨트롤러 메서드의 파라미터로 <code>HttpSession</code>을 받으면 이야기가 다르다. 이 파라미터를 채우는 <code>ServletRequestMethodArgumentResolver</code>는 <code>request.getSession()</code>을 호출한다. 세션이 없으면 만든다는 뜻이다. 홈 컨트롤러가 무심코 <code>HttpSession</code>을 파라미터로 받으면, 로그인하지 않은 방문자와 검색 엔진 크롤러가 들어올 때마다 세션이 하나씩 생기고 <code>Set-Cookie</code>가 나간다. 각 세션은 타임아웃까지 서버 메모리를 차지한다.</p>
+<div class="table-wrap"><table><thead><tr><th>세션을 얻는 방법</th><th>세션이 없을 때</th></tr></thead><tbody>
+<tr><td><code>request.getSession()</code></td><td>새로 만들고 <code>Set-Cookie</code>를 보낸다</td></tr>
+<tr><td><code>request.getSession(false)</code></td><td><code>null</code></td></tr>
+<tr><td>컨트롤러 파라미터 <code>HttpSession</code></td><td>새로 만든다 (<code>request.getSession()</code> 호출)</td></tr>
+<tr><td><code>@SessionAttribute(required = false)</code></td><td><code>null</code>을 주입하고, 세션을 만들지 않는다</td></tr>
+<tr><td><code>@SessionAttribute</code> (기본 <code>required = true</code>)</td><td>예외, 400 응답</td></tr>
+</tbody></table></div>
+<p>이름이 비슷한 <code>@SessionAttributes</code>(끝에 s)와 혼동하지 않아야 한다. 이쪽은 클래스에 붙여 여러 요청에 걸친 폼 작업 동안 모델 속성을 잠시 세션에 보관하는 기능으로, 로그인 정보를 읽는 용도와는 관계가 없다.</p>
+<p>내부 동작을 하나 더 보자. <code>ServletRequestAttributes</code>는 세션 속성을 읽을 때 그 값을 따로 기록해 두었다가, 요청이 끝날 때 값이 문자열·숫자·<code>Boolean</code>처럼 내부가 바뀔 수 없는 타입이 아니면 같은 객체로 <code>session.setAttribute()</code>를 다시 호출한다. 소스의 주석은 이 판단을 "값이 내부적으로 의미 있게 바뀔 수 없으면 다시 설정할 필요가 없다"고 설명한다. 거꾸로 말하면, 세션 안의 객체가 내부적으로 바뀌었을 때 컨테이너가 <code>setAttribute</code> 호출을 통해 그 변경을 알아챌 기회를 주는 것이다. 세션 내용을 다른 서버로 복제하는 환경에서 의미가 있는 동작이다.</p>
+
+<h3>;jsessionid는 왜 URL에 붙는가: 세션 추적 방식</h3>
+<p><code>HttpSession</code>으로 바꾸고 처음 로그인하면, 리다이렉트된 주소창에 <code>http://localhost:8080/;jsessionid=9F2C...</code>처럼 세션 ID가 붙는 경우가 있다. 실험에서 응답의 <code>encodeURL("/home")</code>을 찍어 보면 원인이 보인다.</p>
+<pre data-label="실험 출력 발췌 (톰캣 11.0.27, 구분선은 번역)"><code class="language-text">== 세션을 막 만든 첫 요청 (쿠키 없음)
+encoded=/home;jsessionid=<32 hex>
+
+== 쿠키로 세션 ID를 보낸 다음 요청
+encoded=/home</code></pre>
+<p>서블릿 명세는 세션 ID를 클라이언트와 주고받는 방법(세션 추적 방식, session tracking mode)으로 쿠키 말고도 URL 재작성(URL rewriting)을 정의한다. 링크 URL 끝에 <code>;jsessionid=</code>로 세션 ID를 붙여, 쿠키를 받지 않는 브라우저도 세션을 이어 가게 하는 방식이다. 문제는 세션을 막 만든 첫 응답 시점에는 서버가 브라우저가 쿠키를 받아 줄지 알 수 없다는 점이다. 그래서 톰캣의 <code>Response.isEncodeable()</code>은 다음 조건을 차례로 검사하고, 모두 맞으면 대상 URL이 같은 웹 애플리케이션을 가리키는지까지 확인한 뒤 URL에 세션 ID를 붙인다.</p>
+<ul>
+<li>현재 요청에 유효한 세션이 있다.</li>
+<li>이번 요청의 세션 ID가 쿠키로 들어온 것이 아니다(<code>isRequestedSessionIdFromCookie()</code>가 false).</li>
+<li>애플리케이션의 유효한 세션 추적 방식에 URL이 포함되어 있다.</li>
+</ul>
+<p>로그인 요청이 정확히 이 조건에 걸린다. 세션은 이 요청에서 처음 만들어졌고, 쿠키로 들어온 ID가 없다. 그리고 스프링의 <code>RedirectView</code>는(스프링 프레임워크 7.0.10 소스로 확인) <code>redirect:</code> 주소를 <code>Location</code> 헤더에 쓰기 전에 <code>response.encodeRedirectURL()</code>을 거친다. 그 결과 첫 로그인 직후의 리다이렉트 주소에만 세션 ID가 붙는다. 브라우저가 쿠키를 받아 다음 요청에 실어 보내면 두 번째 조건이 깨지므로 그 뒤로는 붙지 않는다.</p>
+<p>URL에 세션 ID가 노출되면 세션 하이재킹의 문이 넓어진다. 주소는 브라우저 기록과 북마크에 남고, 다른 사이트로 이동할 때 <code>Referer</code> 헤더로 넘어갈 수 있으며, 프록시와 서버의 접근 로그에 기록되고, 사용자가 주소를 복사해 메신저로 공유할 수도 있다. 쿠키만으로 세션을 추적하려면 스프링 부트에서 추적 방식을 쿠키로 한정한다.</p>
+<pre data-label="application.properties"><code class="language-properties">server.servlet.session.tracking-modes=cookie</code></pre>
+<p>이렇게 하면 두 번째 조건과 상관없이 세 번째 조건에서 걸러지므로 URL 재작성이 일어나지 않는다. 대신 쿠키를 거부하는 브라우저는 로그인 상태를 유지할 수 없는데, 오늘날의 서비스에서는 대개 받아들일 만한 대가다.</p>
+
+<h3>세션 정보와 타임아웃</h3>
+<p><code>HttpSession</code>은 세션 자체에 대한 정보도 제공한다. 확인용 엔드포인트를 하나 만들어 보자.</p>
+<pre><code class="language-java">@RestController
+public class SessionInfoController {
+
+    @GetMapping("/session-info")
+    public String sessionInfo(HttpServletRequest request) {
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            return "세션이 없습니다.";
+        }
+        return String.join("\n",
+                "id=" + session.getId(),
+                "maxInactiveInterval=" + session.getMaxInactiveInterval(),
+                "creationTime=" + Instant.ofEpochMilli(session.getCreationTime()),
+                "lastAccessedTime=" + Instant.ofEpochMilli(session.getLastAccessedTime()),
+                "isNew=" + session.isNew());
+    }
+}</code></pre>
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>의미</th></tr></thead><tbody>
+<tr><td><code>getId()</code></td><td>세션 ID. <code>JSESSIONID</code> 쿠키의 값과 같다</td></tr>
+<tr><td><code>getMaxInactiveInterval()</code></td><td>요청 없이 버틸 수 있는 최대 시간(초). 0 이하이면 시간으로 만료되지 않는다</td></tr>
+<tr><td><code>getCreationTime()</code></td><td>세션이 만들어진 시각(1970-01-01 UTC 기준 밀리초)</td></tr>
+<tr><td><code>getLastAccessedTime()</code></td><td>이 세션과 연결된 요청이 마지막으로 들어온 시각(밀리초)</td></tr>
+<tr><td><code>isNew()</code></td><td>클라이언트가 아직 이 세션을 모르거나 합류하지 않았으면 true</td></tr>
+</tbody></table></div>
+<p>실행 결과의 ID와 시각은 실행마다 다르다. 결정적인 것은 두 가지다. 기본 설정이면 <code>maxInactiveInterval</code>은 1800(30분)이고, 세션을 만든 요청 안에서는 <code>isNew</code>가 true, 브라우저가 쿠키를 돌려보낸 다음 요청부터는 false다. 앞의 실험 출력에서 본 그대로다.</p>
+<h4>타임아웃은 "마지막 접근으로부터"다</h4>
+<p>세션 타임아웃은 세션이 만들어진 시각이 아니라 마지막으로 접근한 시각부터 센다. 서블릿 Javadoc은 <code>setMaxInactiveInterval</code>을 "클라이언트 요청 사이의 시간, 즉 이 시간 동안 요청이 없으면 컨테이너가 세션을 무효화한다"는 뜻으로 설명한다. 10시에 로그인하고 10시 20분에 마지막으로 요청한 사용자의 세션은, 타임아웃이 30분이라면 10시 30분이 아니라 10시 50분 무렵에 만료 대상이 된다. 활발히 쓰는 사용자는 로그아웃되지 않고, 자리를 비운 사용자만 정리된다. 이렇게 사용하지 않는 시간을 기준으로 하는 타임아웃을 유휴 타임아웃(idle timeout)이라고 한다.</p>
+<p>로그인 후 일정 시간이 지나면 활동과 무관하게 다시 로그인하게 하고 싶다면(절대 만료), 서블릿 세션이 그 기능을 직접 주지는 않는다. 로그인 시각을 세션 속성으로 저장해 두고 요청마다 비교하는 식으로 애플리케이션이 구현해야 한다. 다음 회차의 필터나 인터셉터가 그런 공통 검사를 두기 좋은 자리다.</p>
+<pre class="diagram">타임아웃 30분, 마지막 접근 기준
+
+10:00 로그인 ── 10:05 요청 ── 10:20 요청 ─────────────────────── 10:50 ──── 10:51
+  │               │             │                                 │          │
+  세션 생성        lastAccessed  lastAccessed                     타임아웃     다음 정리
+                  갱신          갱신                               도달        주기에 제거
+                                └──────── 30분 동안 요청 없음 ────────┘
+  ※ 10:50 이후 이 세션 ID로 요청이 오면 → isValid()가 그 자리에서 만료시키고 "세션 없음"</pre>
+<h4>만료된 세션은 언제 메모리에서 빠지는가</h4>
+<p>타임아웃에 도달했다고 해서 그 순간 누군가 세션을 지워 주는 것은 아니다. 톰캣은 두 경로로 만료를 처리한다.</p>
+<ol>
+<li><b>접근할 때 검사</b>: 앞의 흐름 3단계처럼 <code>StandardSession.isValid()</code>가 호출될 때마다 유휴 시간을 계산해, 최대 비활성 시간 이상이면 그 자리에서 <code>expire()</code>한다. 실험에서 세션의 최대 비활성 시간을 1초로 바꾸고 2.1초 뒤에 같은 쿠키로 요청하자 <code>no session</code>이 나왔다. 백그라운드 정리를 기다리지 않고 접근 시점에 만료된 것이다.</li>
+<li><b>주기적 정리</b>: 아무도 다시 찾지 않는 세션은 백그라운드 스레드가 정리한다. 톰캣 엔진의 <code>backgroundProcessorDelay</code> 기본값은 10초이고, 매니저는 <code>processExpiresFrequency</code>(기본값 6)번째 호출마다 한 번씩 모든 세션의 <code>isValid()</code>를 확인한다. 기본 설정이면 대략 60초에 한 번 정리가 돈다.</li>
+</ol>
+<p>그러므로 아무도 찾지 않는 세션은 타임아웃 시각에서 최대 1분 남짓 더 메모리에 머물 수 있다. <code>HttpSessionListener.sessionDestroyed()</code> 같은 통지가 정확히 타임아웃 시각에 오지 않는 것도 같은 이유다. 그래도 직접 만든 저장소와 달리 결국은 맵에서 제거되므로, 세션과 그 속성 객체는 GC 루트에서 닿을 수 없게 되어 다음 가비지 컬렉션 때 회수될 수 있다.</p>
+<h4>타임아웃 설정과 단위의 함정</h4>
+<p>애플리케이션 전체의 기본값은 스프링 부트 설정으로 바꾼다. 값만 쓰면 초 단위로 해석되고, <code>30m</code>처럼 단위를 붙일 수 있다. 기본값은 30분이다(스프링 부트 3.5 소스의 <code>Session</code> 클래스 확인).</p>
+<pre data-label="application.properties"><code class="language-properties">server.servlet.session.timeout=1800</code></pre>
+<p>세션 하나만 다르게 하고 싶으면 코드에서 <code>session.setMaxInactiveInterval(초)</code>를 호출한다. 이 값은 그 세션에만 적용되고 초 단위로 정확히 동작한다.</p>
+<p>함정은 전역 설정 쪽에 있다. 서블릿의 컨텍스트 수준 세션 타임아웃은 분 단위이고, 스프링 부트의 <code>TomcatServletWebServerFactory</code>는 설정값을 분으로 바꿔 톰캣에 넘긴다. 스프링 부트 3.5 소스는 이렇게 되어 있다.</p>
+<pre data-label="스프링 부트 3.5 TomcatServletWebServerFactory (발췌)"><code class="language-java">private long getSessionTimeoutInMinutes() {
+    Duration sessionTimeout = getSession().getTimeout();
+    if (isZeroOrLess(sessionTimeout)) {
+        return 0;
+    }
+    return Math.max(sessionTimeout.toMinutes(), 1);
+}</code></pre>
+<p><code>Duration.toMinutes()</code>는 분 미만을 버린다. 그리고 결과가 0분이 되지 않도록 최소 1분으로 올린다. 톰캣 매니저는 새 세션을 만들 때 컨텍스트 타임아웃(분)에 60을 곱해 세션의 최대 비활성 시간(초)으로 쓴다.</p>
+<div class="table-wrap"><table><thead><tr><th>설정값</th><th>톰캣에 넘어가는 값</th><th>세션의 maxInactiveInterval</th></tr></thead><tbody>
+<tr><td><code>1800</code> (30분)</td><td>30분</td><td>1800초</td></tr>
+<tr><td><code>90s</code></td><td>1분 (90초를 분으로 바꾸면 1, 나머지는 버림)</td><td>60초</td></tr>
+<tr><td><code>30s</code></td><td>1분 (0분을 최소 1분으로 올림)</td><td>60초</td></tr>
+<tr><td><code>0</code> 또는 음수</td><td>0 → 톰캣이 -1(만료 없음)로 바꿈</td><td>음수, 시간으로 만료되지 않음</td></tr>
+</tbody></table></div>
+<p>테스트하려고 타임아웃을 30초로 설정했는데 세션이 1분 동안 살아 있다면 이 변환 때문이다. 초 단위의 정밀한 타임아웃이 필요하면 로그인할 때 <code>setMaxInactiveInterval()</code>을 직접 호출한다.</p>
+<h4>타임아웃과 메모리는 함께 정한다</h4>
+<p>세션은 기본적으로 서버 힙에 있고, 살아 있는 세션 수는 대략 "타임아웃 동안 새로 만들어지는 세션 수"만큼 쌓인다. 계산을 위해 1분에 새 세션이 1,000개 생기고 세션 하나가 속성까지 합쳐 평균 2KB를 차지한다고 가정해 보자. 타임아웃이 30분이면 정리 직전까지 세션 약 30,000개, 약 60MB가 유지된다. 같은 조건에서 세션에 큰 객체 그래프(예: 조회 결과 목록)를 넣어 세션당 크기가 100배가 되면 필요한 힙도 100배가 된다. 이 수치는 측정값이 아니라 가정에서 나온 산술이고, 실제 크기는 힙 덤프나 프로파일러로 재야 한다. 원리만 기억하자. <b>세션 메모리는 "동시에 살아 있는 세션 수 × 세션당 크기"이고, 타임아웃은 앞의 곱셈 인자를, 세션에 넣는 데이터는 뒤의 인자를 정한다.</b> 그래서 세션에는 계정 객체 전체가 아니라 식별에 필요한 최소한의 정보(ID, 이름, 권한 정도)만 넣는 것이 원칙이다. 이 회차 예제는 단순하게 하려고 <code>Account</code>를 통째로 넣었는데, 그 안의 비밀번호까지 세션에 들어간다는 점에서도 운영 코드로는 좋지 않다.</p>
+<p>세션은 기본적으로 서버를 재시작하면 사라진다. 톰캣의 <code>StandardManager</code>는 <code>pathname</code> 속성을 설정했을 때만 정상 종료 시 세션을 파일로 직렬화했다가 다시 읽어 들이고, 스프링 부트의 <code>server.servlet.session.persistent</code>도 기본값이 <code>false</code>다. 세션을 파일이나 다른 서버로 옮기려면 속성 객체가 직렬화 가능(<code>Serializable</code>)해야 한다는 점도 세션에 넣을 타입을 고를 때 기억해 둘 조건이다.</p>
+<x-visual id="spring-mvc2-06-session-timeout-timeline" title="유휴 타임아웃과 실제 제거 시점의 타임라인" kind="타임라인" ratio="16:9">
+<x-hint>세션 타임아웃이 생성 시각이 아니라 마지막 접근 시각에서 시작한다는 것, 그리고 실제 제거는 접근 시 검사나 주기적 정리 때 일어난다는 것을 보여 준다.</x-hint>
+<x-prompt>A horizontal timeline diagram on a white background, flat vector style. The timeline axis has ticks labeled "10:00", "10:05", "10:20", "10:50", "10:51". At "10:00" a green dot labeled "로그인 · 세션 생성". At "10:05" and "10:20" blue dots labeled "요청 (lastAccessed 갱신)". A long orange bracket spans from "10:20" to "10:50" labeled "30분 동안 요청 없음". At "10:50" a red marker labeled "타임아웃 도달". At "10:51" a gray trash-bin icon labeled "주기적 정리로 제거 (약 60초 간격)". Above the "10:50" marker, a small dashed arrow from a browser icon labeled "이 시점 이후 요청" pointing to a note "isValid()가 즉시 만료". Clean sans-serif typography, all labels exactly as given in Korean.</x-prompt>
+<x-caption>타임아웃은 마지막 접근에서 시작한다. 만료된 세션은 다음 접근 때 즉시, 아무도 찾지 않으면 주기적 정리 때 제거된다.</x-caption>
+</x-visual>
+
+<h3>세션의 함정: 고정 공격, 동시 요청, 여러 대의 서버</h3>
+<h4>세션 고정 공격과 로그인 시 ID 교체</h4>
+<p>세션 고정(session fixation) 공격은 하이재킹과 방향이 반대다. 공격자가 피해자의 세션 ID를 훔치는 것이 아니라, 공격자가 아는 세션 ID를 피해자가 쓰게 만든다. 먼저 공격자가 사이트에 접속해 정상적인 세션 ID를 하나 받는다. 그다음 어떤 방법으로든 그 ID를 피해자의 브라우저에 심는다. URL 재작성이 켜져 있다면 <code>;jsessionid=</code>가 붙은 링크를 보내는 것만으로 충분하다. 피해자가 그 세션으로 로그인하면 로그인 컨트롤러는 기존 세션을 그대로 쓰면서(<code>getSession()</code>은 있으면 기존 것을 돌려준다) 계정 속성을 넣는다. 이제 공격자가 원래 알고 있던 그 세션 ID가 로그인된 세션이 된다.</p>
+<p>앞에서 본 톰캣의 <code>validateClientProvidedNewSessionId</code>는 공격자가 지어낸 값을 막을 뿐, 공격자가 정상적으로 받은 살아 있는 ID까지 막지는 못한다. 근본 대책은 로그인에 성공한 순간 세션 ID를 바꾸는 것이다. 서블릿 3.1부터 <code>HttpServletRequest.changeSessionId()</code>가 있다. Javadoc은 이 메서드를 "요청에 연결된 현재 세션의 ID를 바꾸고 새 ID를 돌려준다"고 설명한다.</p>
+<pre><code class="language-java">HttpSession session = request.getSession();
+request.changeSessionId();                         // 로그인 직전에 ID 교체
+session.setAttribute(SessionKeys.LOGIN_ACCOUNT, account);</code></pre>
+<pre data-label="실험 출력 발췌 (톰캣 11.0.27, 구분선은 번역)"><code class="language-text">== 로그인된 세션에서 changeSessionId() 호출
+Set-Cookie: JSESSIONID=<32 hex>; Path=/; HttpOnly
+changed=true attr=kim sameObject=true
+
+== 바뀌기 전 ID로 요청
+no session</code></pre>
+<p>ID가 바뀌었고, 속성은 그대로이며, 세션 객체도 같은 객체다. 새 ID를 담은 <code>Set-Cookie</code>가 응답에 실리고, 이전 ID로는 더 이상 세션을 찾을 수 없다. 공격자가 심어 둔 ID는 로그인과 동시에 쓸모가 없어진다. 이전 ID를 무효화하고 새 세션을 만들어 속성을 옮기는 방법도 있지만, <code>changeSessionId()</code>는 속성을 옮길 필요가 없어 더 단순하다. 같은 이유로 권한이 바뀌는 시점(관리자 권한 획득 등)에도 ID를 바꾸는 것이 좋다.</p>
+<h4>같은 세션에 동시에 들어오는 요청</h4>
+<p>세션은 사용자 한 명의 것이니 한 번에 한 스레드만 쓴다고 생각하기 쉽다. 그렇지 않다. 사용자가 탭 두 개를 열거나, 한 페이지가 이미지와 비동기 요청을 동시에 보내면 같은 <code>JSESSIONID</code>를 단 요청 여러 개가 서로 다른 작업 스레드에서 동시에 처리된다. 모두 매니저의 맵에서 <b>같은</b> <code>StandardSession</code> 객체를 꺼내 쓴다. 톰캣은 세션의 속성 맵을 <code>ConcurrentHashMap</code>으로 두므로 <code>setAttribute</code>, <code>getAttribute</code> 각각은 안전하다. 하지만 속성으로 넣은 객체의 내부는 보호하지 않는다. 세션에 <code>ArrayList</code>로 된 장바구니를 넣고 두 요청이 동시에 <code>add()</code>하면, 앞에서 본 경쟁 조건이 그대로 일어난다. 세션 속성은 가능하면 바뀌지 않는 객체로 두고, 바뀌어야 한다면 새 객체를 만들어 <code>setAttribute</code>로 통째로 교체하거나 동시성 컬렉션을 쓴다.</p>
+<h4>서버가 두 대가 되면</h4>
+<p>톰캣 세션은 그 톰캣이 도는 JVM의 힙에 있다. 서버를 두 대로 늘리고 로드 밸런서가 요청을 번갈아 보내면, 1번 서버에서 로그인한 사용자의 다음 요청이 2번 서버로 갔을 때 2번 서버의 맵에는 그 ID가 없다. 사용자는 이유 없이 로그아웃된 것처럼 보인다. 해결 방향은 세 가지다.</p>
+<ul>
+<li><b>고정 세션(sticky session)</b>: 로드 밸런서가 같은 사용자를 항상 같은 서버로 보낸다. 앞에서 본 세션 ID 끝의 <code>jvmRoute</code>가 이 용도다. 단순하지만 그 서버가 죽으면 거기 있던 세션은 모두 사라진다.</li>
+<li><b>세션 복제(replication)</b>: 서버끼리 세션 변경을 주고받는다. 속성 객체가 직렬화 가능해야 하고, 서버가 늘수록 복제 비용이 커진다.</li>
+<li><b>외부 세션 저장소</b>: 세션을 서버 밖의 공용 저장소(Redis, 데이터베이스 등)에 둔다. Spring Session 프로젝트가 <code>HttpSession</code>을 이런 저장소로 바꿔 끼우는 기능을 제공한다. 서버는 다시 무상태가 되고, 세션 조회는 네트워크 왕복이 된다.</li>
+</ul>
+<p>어느 쪽이든 이 회차에서 세운 그림은 바뀌지 않는다. 클라이언트는 추측할 수 없는 열쇠만 들고 다니고, 그 열쇠가 가리키는 상태는 서버 쪽 어딘가에 있으며, 서버는 그 상태를 지우거나 만료시킬 수 있다. 저장소의 위치만 JVM 힙에서 다른 곳으로 옮겨 간다.</p>
+
+<h3>정리: 상태를 어디에 두는가</h3>
+<p>이번 회차에서 로그인 상태를 유지하는 방법을 세 번 바꿨다. 비교해 보면 각 단계가 무엇을 고쳤는지 분명해진다.</p>
+<div class="table-wrap"><table><thead><tr><th></th><th>쿠키에 사용자 번호</th><th>직접 만든 세션</th><th>서블릿 HttpSession</th></tr></thead><tbody>
+<tr><td>클라이언트가 가진 것</td><td>신원 자체</td><td>UUID 열쇠</td><td>32자 세션 ID</td></tr>
+<tr><td>위조</td><td>숫자만 바꾸면 된다</td><td>추측 불가</td><td>추측 불가, 지어낸 ID는 채택하지 않음</td></tr>
+<tr><td>서버 쪽 폐기</td><td>불가능</td><td>가능</td><td>가능(<code>invalidate</code>)</td></tr>
+<tr><td>만료</td><td>쿠키 만료에 의존</td><td>없음(메모리 누수)</td><td>유휴 타임아웃, 주기적 정리</td></tr>
+<tr><td>쿠키 속성</td><td>직접 관리</td><td>직접 관리</td><td><code>HttpOnly</code> 기본, HTTPS면 <code>Secure</code></td></tr>
+</tbody></table></div>
+<aside class="keyidea"><span>이 장의 핵심</span><p>HTTP는 요청을 따로따로 해석하므로, 로그인 상태는 클라이언트가 매 요청에 싣는 쿠키와 서버가 보관하는 세션으로 만든다. 쿠키에는 의미 있는 값이 아니라 추측할 수 없는 세션 ID만 담고, 그 ID가 가리키는 상태는 서버가 쥔다. 그래야 위조가 어렵고, 서버가 로그아웃과 만료로 상태를 끊을 수 있다. 톰캣은 세션을 <code>ConcurrentHashMap</code>에 보관하고, 마지막 접근에서 시작하는 유휴 타임아웃으로 정리하며, <code>getSession()</code>을 부르는 순간 세션과 쿠키를 만든다. 그래서 세션을 언제 만들고 무엇을 넣을지가 곧 메모리와 보안의 설계다.</p></aside>
+<p>이번 회차의 홈 컨트롤러는 로그인 여부를 스스로 확인했다. 그런데 상품 목록, 상품 등록, 상품 수정 같은 모든 화면이 같은 확인을 해야 한다면, 그 코드를 컨트롤러마다 복사하는 것은 좋은 방법이 아니다. 다음 회차는 이 공통 관심사를 디스패처 서블릿 앞의 서블릿 필터와 뒤의 스프링 인터셉터로 옮기고, 두 장치의 호출 순서를 비교한다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>무상태 HTTP와 로그인 상태</dt><dd>HTTP는 각 요청을 따로 해석하므로, 로그인 상태는 클라이언트가 매 요청에 싣는 쿠키와 서버가 보관하는 세션의 조합으로 만든다.</dd>
+<dt>쿠키의 저장·전송 규칙</dt><dd>만료 속성이 없으면 세션 쿠키, <code>Path</code>가 없으면 요청 경로에서 계산한 기본 경로가 쓰인다. 요청의 <code>Cookie</code> 헤더에는 이름과 값만 실리고 속성은 돌아오지 않는다.</dd>
+<dt>쿠키 삭제</dt><dd>같은 이름·도메인·경로의 쿠키를 <code>Max-Age=0</code>이나 과거 <code>Expires</code>로 다시 보내 브라우저가 지우게 한다. 경로가 다르면 다른 쿠키로 취급되어 지워지지 않는다.</dd>
+<dt>쿠키에 값을 담는 방식의 위험</dt><dd>값이 곧 신원이면 위조가 쉽고, 노출된 값을 서버가 무효로 만들 수 없다.</dd>
+<dt>세션</dt><dd>서버가 상태를 보관하고 클라이언트에는 추측할 수 없는 세션 ID만 준다. 서버가 항목을 지우면 같은 쿠키로도 아무것도 찾을 수 없다.</dd>
+<dt>톰캣 HttpSession</dt><dd>세션을 <code>ConcurrentHashMap</code>에 보관하고, <code>SecureRandom</code> 16바이트로 32자 ID를 만들며, <code>JSESSIONID</code> 쿠키를 <code>HttpOnly</code>로 발급한다. 지어낸 ID는 새 세션의 ID로 채택하지 않는다.</dd>
+<dt>세션을 만드는 호출</dt><dd><code>getSession()</code>과 <code>HttpSession</code> 파라미터는 없으면 만들고, <code>getSession(false)</code>와 <code>@SessionAttribute</code>는 만들지 않는다.</dd>
+<dt>URL 재작성</dt><dd>세션을 막 만든 응답에서는 쿠키 지원 여부를 모르므로 <code>;jsessionid</code>를 URL에 붙인다. 추적 방식을 쿠키로 한정하면 사라진다.</dd>
+<dt>유휴 타임아웃</dt><dd>마지막 접근부터 센다. 접근 시 검사와 약 60초 간격의 주기적 정리로 제거되며, 스프링 부트 + 톰캣의 전역 설정은 분 단위(최소 1분)로 바뀐다.</dd>
+</x-summary>
+
+<x-review>
+<p>로그인 직후 리다이렉트 주소에 <code>;jsessionid</code>가 붙어 나온다는 문의를 받으면, 먼저 세션 추적 방식에 URL이 남아 있는지 본다. 이 현상 자체는 톰캣이 명세대로 동작한 결과이지 버그가 아니다. 하지만 세션 ID가 로그와 <code>Referer</code>로 새는 통로이고 세션 고정 공격의 재료가 되므로, 쿠키를 거부하는 클라이언트를 꼭 지원해야 하는 특별한 사정이 없다면 <code>tracking-modes=cookie</code>로 막는 것이 기본 판단이다.</p>
+<p>운영 중에 힙 사용량이 천천히 늘다가 새벽에 줄어드는 패턴이 보이면 세션을 의심해 볼 만하다. 힙 덤프에서 톰캣 매니저의 세션 맵이 큰 몫을 차지한다면 두 가지를 확인한다. 하나는 세션을 만들지 않아도 되는 요청(홈, 정적 페이지, 헬스 체크, 크롤러)이 세션을 만들고 있지 않은가다. 컨트롤러의 <code>HttpSession</code> 파라미터나 습관적인 <code>getSession()</code>이 흔한 원인이다. 다른 하나는 세션에 조회 결과나 엔티티 그래프 같은 큰 객체를 넣고 있지 않은가다. 타임아웃을 줄이는 것은 그다음 수단이다. 타임아웃은 사용성과 직접 맞바꾸는 값이기 때문이다.</p>
+<p>서버를 여러 대로 늘리는 순간 세션은 설계 문제가 된다. 고정 세션은 바로 쓸 수 있지만 배포나 장애로 서버가 내려가면 그 서버의 사용자가 모두 로그아웃된다. 이것을 받아들일 수 없다면 외부 세션 저장소로 옮기는데, 그러면 세션 조회가 매 요청의 네트워크 왕복이 되고 세션 속성은 직렬화 가능해야 한다. 어느 쪽을 고르든 "세션에는 작고 바뀌지 않는 식별 정보만 넣는다"는 원칙을 지켜 두면 옮기는 비용이 크게 줄어든다.</p>
+<p>보안 점검에서는 세 가지를 순서대로 본다. 세션 쿠키에 <code>HttpOnly</code>와 (HTTPS 환경에서) <code>Secure</code>가 붙는가, 로그인 성공 시 세션 ID가 바뀌는가, 로그아웃 시 서버 쪽 세션이 실제로 무효화되는가. 마지막 항목은 로그아웃 전에 복사해 둔 쿠키로 요청을 다시 보내 보면 바로 확인할 수 있다.</p>
+</x-review>
+
+<x-practice>
+<li>세션 방식으로 로그인한 뒤 홈을 보고 로그아웃하는 흐름(<code>POST /login</code> → <code>GET /</code> → <code>POST /logout</code> → <code>GET /</code>)에서, 각 요청의 <code>Cookie</code> 헤더와 각 응답의 <code>Set-Cookie</code> 헤더가 있는지 없는지, 있다면 대략 어떤 값인지 적어 보라. 마지막 <code>GET /</code>에서 서버 안에서는 어떤 일이 일어나는가?</li>
+<li>쿠키 방식 로그인에서 로그인 URL은 <code>POST /members/login</code>, 로그아웃 URL은 <code>POST /logout</code>이고, 두 곳 모두 <code>setPath()</code>를 호출하지 않았다. 로그인 직후 홈 화면(<code>GET /</code>)과 로그아웃 결과가 각각 어떻게 나오는지 예측하고, RFC 6265의 규칙으로 이유를 설명하라.</li>
+<li>다음 홈 컨트롤러를 배포한 뒤, 로그인한 사용자가 거의 없는데도 서버의 세션 수가 방문자 수만큼 늘었다. 원인을 설명하고 고쳐라.<pre><code class="language-java">@GetMapping("/")
+public String home(HttpSession session, Model model) {
+    Object account = session.getAttribute(SessionKeys.LOGIN_ACCOUNT);
+    if (account == null) {
+        return "home";
+    }
+    model.addAttribute("account", account);
+    return "loginHome";
+}</code></pre></li>
+<li>스프링 부트 3.x와 내장 톰캣에서 <code>server.servlet.session.timeout=150s</code>로 설정했다. 세션의 <code>getMaxInactiveInterval()</code>은 얼마를 돌려주는가? 사용자가 마지막 요청 뒤 아무것도 하지 않으면, 아무도 그 세션을 다시 찾지 않는다고 할 때 세션이 맵에서 제거되는 시점은 대략 언제인가?</li>
+<li>세션 속성으로 <code>ArrayList<Long></code> 장바구니를 넣어 두고, 상품 담기 요청마다 <code>getAttribute</code>로 꺼내 <code>add()</code>한다. 사용자가 두 탭에서 거의 동시에 상품을 담았더니 가끔 하나가 사라진다. 왜 그런지 스레드 관점에서 설명하고 고치는 방법을 두 가지 제시하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> <code>POST /login</code>: 요청에 쿠키가 없다(처음 방문이라면). 응답은 302이고 <code>Set-Cookie: JSESSIONID=…; Path=/; HttpOnly</code>가 실린다. <code>getSession()</code>이 새 세션을 만들면서 쿠키를 추가했기 때문이다. <code>GET /</code>: 요청에 <code>Cookie: JSESSIONID=…</code>가 실리고, 응답에는 <code>Set-Cookie</code>가 없다. 기존 세션을 찾았으므로 새 쿠키를 만들 일이 없다. <code>POST /logout</code>: 같은 쿠키가 실리고, 서버는 <code>invalidate()</code>로 세션을 맵에서 제거한다. 이 예제 코드는 쿠키를 지우지 않으므로 응답에 <code>Set-Cookie</code>는 없다. 마지막 <code>GET /</code>: 브라우저는 여전히 같은 <code>JSESSIONID</code>를 보낸다. 톰캣은 그 ID로 맵을 조회하지만 찾지 못하고, <code>@SessionAttribute</code>는 <code>getSession(false)</code>를 쓰므로 새 세션도 만들지 않는다. 그래서 <code>null</code>이 주입되어 손님용 홈이 나오고, 응답에 <code>Set-Cookie</code>도 없다.</p>
+<p><b>2.</b> 로그인 응답의 쿠키에는 <code>Path</code>가 없으므로 브라우저는 요청 경로 <code>/members/login</code>에서 기본 경로를 계산한다. <code>/</code>가 둘 이상이므로 마지막 <code>/</code> 앞까지인 <code>/members</code>가 된다. <code>GET /</code>는 <code>/members</code> 아래가 아니므로 쿠키가 실리지 않고, 홈은 손님 화면으로 나온다. 로그아웃 응답의 만료 쿠키는 <code>/logout</code>에서 계산한 기본 경로 <code>/</code>로 저장되므로, 이름은 같아도 경로가 다른 별개의 쿠키다. 원래의 <code>/members</code> 쿠키는 지워지지 않는다. 두 곳 모두 <code>setPath("/")</code>를 명시하면 해결된다.</p>
+<p><b>3.</b> 컨트롤러 파라미터로 <code>HttpSession</code>을 받으면 스프링의 <code>ServletRequestMethodArgumentResolver</code>가 <code>request.getSession()</code>을 호출하므로, 세션이 없는 방문자에게도 세션이 만들어지고 <code>JSESSIONID</code> 쿠키가 나간다. 크롤러처럼 쿠키를 돌려보내지 않는 클라이언트는 요청마다 새 세션을 만든다. 각 세션은 타임아웃까지 맵에 남는다. <code>@SessionAttribute(name = SessionKeys.LOGIN_ACCOUNT, required = false) Account loginAccount</code>로 바꾸거나, <code>HttpServletRequest</code>를 받아 <code>getSession(false)</code>로 확인하면 세션을 만들지 않는다.</p>
+<p><b>4.</b> 스프링 부트의 톰캣 팩토리는 150초를 <code>toMinutes()</code>로 바꿔 2분을 넘기고(30초는 버림), 톰캣은 새 세션의 최대 비활성 시간을 2 × 60 = 120초로 정한다. 따라서 <code>getMaxInactiveInterval()</code>은 120이다. 마지막 접근에서 120초가 지나면 만료 대상이 되지만, 아무도 그 세션을 다시 찾지 않으면 접근 시 검사가 일어나지 않으므로 주기적 정리를 기다린다. 기본 설정에서 정리는 약 60초 간격(10초 × 6)으로 돌므로, 마지막 접근 후 대략 2분에서 3분 사이에 제거된다. 정확히 150초를 원하면 로그인 시 <code>setMaxInactiveInterval(150)</code>을 호출한다.</p>
+<p><b>5.</b> 두 탭의 요청은 서로 다른 작업 스레드에서 처리되지만, 같은 세션 ID로 같은 <code>StandardSession</code> 객체를 찾고, <code>getAttribute</code>로 같은 <code>ArrayList</code> 객체를 꺼낸다. 세션의 속성 맵은 <code>ConcurrentHashMap</code>이라 꺼내는 동작은 안전하지만, <code>ArrayList.add()</code>는 동기화되지 않는다. 두 스레드가 동시에 크기를 읽고 같은 칸에 쓰면 한쪽 원소가 덮어써져 사라질 수 있다. 고치는 방법은 (1) 장바구니를 불변 리스트로 두고, 담을 때마다 새 리스트를 만들어 <code>setAttribute</code>로 교체하되 읽고-만들고-교체하는 과정을 세션 단위로 동기화하거나, (2) <code>CopyOnWriteArrayList</code>나 <code>Collections.synchronizedList</code>처럼 동시 수정을 견디는 컬렉션을 쓰는 것이다. 장바구니처럼 중요한 데이터라면 세션 대신 데이터베이스에 두는 설계도 검토할 만하다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>쿠키에 <code>accountId=1</code>을 담는 방식 대신 세션 ID를 담는 방식으로 바꾸었을 때, 서버가 새로 할 수 있게 되는 일로 가장 정확한 것은?</q>
+<o>쿠키가 네트워크에서 도청되는 것을 막는다</o>
+<o>특정 클라이언트가 가진 값을 서버 쪽에서 무효로 만들 수 있다</o>
+<o>브라우저가 쿠키를 자바스크립트에 노출하지 않게 한다</o>
+<o>사용자가 쿠키 값을 바꾸지 못하게 한다</o>
+<why>세션 방식에서는 세션 ID와 사용자의 연결을 서버가 보관하므로, 그 항목을 지우면 같은 쿠키를 보내도 아무것도 찾을 수 없다. 도청 방지는 HTTPS와 <code>Secure</code>, 스크립트 노출 방지는 <code>HttpOnly</code>의 역할이다. 사용자는 세션 ID도 얼마든지 바꿔 보낼 수 있다. 다만 바꾼 값이 다른 살아 있는 세션을 가리킬 가능성이 사실상 없을 뿐이다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>로그인하지 않은 방문자가 홈 화면에 들어왔을 때 세션을 새로 만드는 코드는?</q>
+<o><code>@SessionAttribute(name = "loginAccount", required = false) Account account</code> 파라미터</o>
+<o><code>request.getSession(false)</code></o>
+<o>컨트롤러 메서드의 <code>HttpSession session</code> 파라미터</o>
+<o><code>@CookieValue(name = "JSESSIONID", required = false) String id</code> 파라미터</o>
+<why><code>HttpSession</code> 파라미터는 <code>ServletRequestMethodArgumentResolver</code>가 <code>request.getSession()</code>으로 채우므로 세션이 없으면 만든다. <code>@SessionAttribute</code>는 내부에서 <code>getSession(false)</code>를 쓰고, <code>@CookieValue</code>는 요청의 쿠키만 읽을 뿐 세션을 건드리지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>로그인 처리 경로가 <code>POST /members/login</code>이고, 쿠키를 만들 때 경로를 지정하지 않았다. 로그인은 성공했는데 <code>GET /</code>의 홈 화면이 계속 손님 화면이다. 가장 그럴듯한 원인은?</q>
+<o>쿠키의 기본 경로가 <code>/members</code>가 되어 <code>/</code> 요청에는 쿠키가 실리지 않는다</o>
+<o>만료 속성이 없는 쿠키는 브라우저가 저장하지 않는다</o>
+<o>리다이렉트 응답에 실린 <code>Set-Cookie</code>는 브라우저가 무시한다</o>
+<o><code>HttpOnly</code>가 없어서 브라우저가 쿠키를 보내지 않는다</o>
+<why>RFC 6265 §5.1.4에 따라 <code>Path</code>가 없으면 요청 경로의 마지막 <code>/</code> 앞까지가 기본 경로가 된다. 만료 속성이 없는 쿠키는 세션 쿠키로 저장되고, 302 응답의 <code>Set-Cookie</code>도 정상적으로 처리되며, <code>HttpOnly</code>는 스크립트 접근을 막을 뿐 전송 여부와는 관계가 없다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>스프링 부트 3.x, 내장 톰캣 환경에서 <code>server.servlet.session.timeout=90s</code>로 설정했다. 새로 만든 세션의 <code>getMaxInactiveInterval()</code> 값은?</q>
+<o>90</o>
+<o>1800</o>
+<o>120</o>
+<o>60</o>
+<why>스프링 부트의 톰캣 팩토리는 설정값을 <code>Duration.toMinutes()</code>로 분 단위로 바꾸고(90초는 1분, 나머지 버림) 최소 1분을 보장해 톰캣 컨텍스트에 넘긴다. 톰캣은 새 세션의 최대 비활성 시간을 분 × 60초로 정하므로 60이 된다. 초 단위로 정확히 맞추려면 세션마다 <code>setMaxInactiveInterval()</code>을 호출해야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>공격자가 사이트에서 정상적으로 받은 세션 ID를 피해자에게 심어 두고, 피해자가 그 세션으로 로그인하기를 기다린다. 서버 쪽에서 가장 직접적인 대책은?</q>
+<o>세션 타임아웃을 5분으로 줄인다</o>
+<o>로그인에 성공한 직후 <code>request.changeSessionId()</code>로 세션 ID를 바꾼다</o>
+<o>세션 쿠키에 <code>HttpOnly</code>를 붙인다</o>
+<o>로그아웃할 때 <code>invalidate()</code>를 호출한다</o>
+<why>세션 고정 공격은 로그인 전후로 세션 ID가 그대로라는 점을 노린다. 로그인 순간 ID를 바꾸면 공격자가 아는 ID는 더 이상 로그인된 세션을 가리키지 않는다. 짧은 타임아웃은 공격 가능 시간을 줄일 뿐이고, <code>HttpOnly</code>는 스크립트로 ID를 읽는 것을 막을 뿐 심어 두는 것을 막지 못한다. 로그아웃 시 무효화는 필요하지만 로그인 중의 공격은 막지 못한다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>무상태 프로토콜(stateless protocol)</dt><dd>각 요청을 이전 요청과 관계없이 따로 해석하는 프로토콜. HTTP가 그렇게 정의되어 있으므로 요청 사이의 상태는 쿠키나 세션 같은 별도 장치로 만든다.</dd>
+<dt>세션 쿠키(session cookie)와 영속 쿠키(persistent cookie)</dt><dd>만료 속성이 없어 브라우저가 세션을 끝낼 때 지우는 쿠키와, <code>Max-Age</code>나 <code>Expires</code>로 정한 시각까지 남는 쿠키. 여기서 세션은 서버 세션이 아니라 브라우저의 실행 기간을 말한다.</dd>
+<dt>세션 ID(session identifier)</dt><dd>서버가 보관한 클라이언트별 상태를 찾는 열쇠. 의미가 없고 추측할 수 없는 난수여야 한다. 톰캣에서는 <code>JSESSIONID</code> 쿠키로 전달된다.</dd>
+<dt>HttpOnly / Secure</dt><dd>쿠키를 HTTP 요청에만 쓰게 해 스크립트에서 읽지 못하게 하는 속성과, HTTPS 같은 보안 채널에서만 보내게 하는 속성.</dd>
+<dt>세션 하이재킹(session hijacking)</dt><dd>살아 있는 세션 ID를 훔쳐 그 사용자 행세를 하는 공격. 세션은 피해의 기간과 범위를 줄일 뿐 탈취 자체를 막지는 못한다.</dd>
+<dt>세션 고정(session fixation)</dt><dd>공격자가 아는 세션 ID를 피해자가 쓰게 만든 뒤 피해자의 로그인으로 그 세션이 인증되기를 노리는 공격. 로그인 시 세션 ID를 바꿔 막는다.</dd>
+<dt>URL 재작성(URL rewriting)</dt><dd>링크 URL에 <code>;jsessionid=</code>로 세션 ID를 붙여 쿠키 없이 세션을 추적하는 방식. 세션 ID가 기록과 로그에 남기 쉽다.</dd>
+<dt>유휴 타임아웃(idle timeout)</dt><dd>마지막 접근 이후 요청이 없는 시간이 기준을 넘으면 세션을 만료시키는 방식. 서블릿 세션의 <code>maxInactiveInterval</code>이 이것이다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://www.rfc-editor.org/rfc/rfc6265">RFC 6265 HTTP State Management Mechanism</a> — 쿠키의 저장·전송 알고리즘, 기본 경로(§5.1.4), Max-Age(§5.2.2), Secure·HttpOnly, 세션 식별자(§8.4)</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-3.3">RFC 9110 §3.3 Connections, Clients and Servers</a> — HTTP를 무상태 프로토콜로 정의한 문장</li>
+<li><a href="https://tomcat.apache.org/tomcat-10.1-doc/config/manager.html">Apache Tomcat 10.1 Configuration Reference: The Manager Component</a> — StandardManager, processExpiresFrequency 기본값, 세션 ID 난수 알고리즘, 재시작 시 세션 저장</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-controller/ann-methods/sessionattribute.html">Spring Framework Reference: @SessionAttribute</a> — 기존 세션 속성을 읽는 용도와 속성 추가·삭제 시 권장 방식</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-boot/3.5.x/spring-boot-project/spring-boot/src/main/java/org/springframework/boot/web/embedded/tomcat/TomcatServletWebServerFactory.java">Spring Boot 3.5 TomcatServletWebServerFactory 소스</a> — 세션 타임아웃을 분 단위(최소 1분)로 바꿔 톰캣에 넘기는 코드</li>
+</x-refs>

@@ -1,0 +1,628 @@
+<x-meta>
+deck: API 클라이언트에게 HTML 오류 페이지 대신 약속된 JSON을 돌려주기 위해, 예외가 DispatcherServlet의 HandlerExceptionResolver 체인을 어떤 순서로 지나며 어디에서 응답이 확정되는지 소스와 실행 결과로 추적한다.
+minutes: 110
+</x-meta>
+
+<x-goals>
+<li>컨트롤러에서 던진 예외가 <code>processHandlerException</code>의 리졸버 목록을 지나 응답으로 끝나거나 서블릿 컨테이너의 <code>/error</code> 재디스패치로 넘어가는 두 경로를 구분하고, 각 경로에서 HTTP 요청이 몇 번 DispatcherServlet을 통과하는지 말할 수 있다.</li>
+<li><code>HandlerExceptionResolver</code>가 돌려주는 세 가지 값(뷰가 있는 <code>ModelAndView</code>, 빈 <code>ModelAndView</code>, <code>null</code>)이 각각 DispatcherServlet과 톰캣에 무엇을 뜻하는지 설명하고, 직접 리졸버를 만들어 등록 위치까지 고를 수 있다.</li>
+<li><code>ResponseStatusExceptionResolver</code>와 <code>DefaultHandlerExceptionResolver</code>가 <code>sendError</code>로 상태 코드만 정하고 본문은 <code>BasicErrorController</code>에 맡긴다는 사실을 바탕으로, 응답 본문에 무엇이 실리는지 예측할 수 있다.</li>
+<li><code>@ExceptionHandler</code> 메서드가 어떤 순서(컨트롤러 자신 → 우선순위 순 <code>@ControllerAdvice</code>, 예외 깊이, 원인 체인)로 선택되는지 설명하고, 상태 코드 200 응답이나 원인 체인 매칭 같은 함정을 실행 결과로 짚을 수 있다.</li>
+<li>스프링 6의 <code>ProblemDetail</code>·<code>ErrorResponse</code>가 기존 리졸버 구조 위에서 어떻게 동작하는지 설명하고, API 오류 응답 설계를 결정할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>API의 오류 응답은 왜 따로 설계해야 하는가</h3>
+<p>08회에서 본 오류 페이지는 사람을 위한 것이었다. 브라우저 사용자는 상태 코드를 읽지 않는다. 화면에 "요청하신 페이지를 찾을 수 없습니다"라는 문장과 홈으로 돌아가는 링크가 보이면 충분하다. 서블릿 컨테이너가 예외나 <code>sendError</code>를 감지해 <code>/error</code> 같은 오류 경로로 요청을 한 번 더 보내고, 그 경로가 상태 코드에 맞는 HTML 템플릿을 그려 주는 구조는 이 목적에 잘 맞는다. 오류 화면은 4xx 한 장, 5xx 한 장 정도면 대부분의 경우를 덮는다.</p>
+<p>API의 상대는 사람이 아니라 프로그램이다. 모바일 앱, 다른 서버, 프런트엔드 자바스크립트가 응답을 받아 <b>코드로</b> 분기한다. 이들에게 HTML 오류 페이지는 파싱할 수 없는 잡음이다. 클라이언트는 상태 코드로 큰 분류(내 잘못인가, 서버 잘못인가, 다시 시도해도 되는가)를 정하고, 본문에 실린 오류 코드로 세부 분기(재고 부족이면 수량 입력란을 다시 보여 준다, 인증 만료면 로그인 화면으로 보낸다)를 한다. 따라서 API 오류 응답은 정상 응답과 똑같이 <b>계약(contract)</b>이다. 필드 이름이 하나 바뀌면 클라이언트가 깨진다.</p>
+<p>이 계약에는 세 가지 요구가 겹친다. 첫째, 상태 코드가 정확해야 한다. 클라이언트가 보낸 값이 잘못되었는데 500을 돌려주면 클라이언트는 "서버가 잠시 아픈가 보다" 하고 같은 요청을 재시도한다. 둘째, 본문의 형식이 일정해야 한다. 어떤 API는 <code>{"error": "..."}</code>를, 다른 API는 <code>{"message": "..."}</code>를 돌려주면 클라이언트는 오류 처리 코드를 API마다 따로 써야 한다. 셋째, 내부 정보가 새어 나가면 안 된다. 스택 트레이스, SQL 문장, 클래스 이름은 공격자에게 서버 구조를 알려 주는 지도다.</p>
+<p>이 회차는 이 세 요구를 스프링 MVC가 어떤 장치로 해결하는지 따라간다. 출발점은 스프링 부트가 아무 설정 없이 해 주는 기본 오류 처리이고, 그다음 그 기본 동작이 어디서 결정되는지, 즉 DispatcherServlet이 예외를 잡아 <code>HandlerExceptionResolver</code> 목록에 넘기는 지점으로 내려간다. 그 위에 스프링이 기본으로 등록하는 세 리졸버, <code>@ExceptionHandler</code>와 <code>@ControllerAdvice</code>, 스프링 6의 <code>ProblemDetail</code>을 차례로 쌓는다. 예제는 스프링 프레임워크 6.x와 부트 3.x를 기준으로 쓰고, 실행 결과를 보여 줄 때는 실제로 돌린 버전을 함께 적는다.</p>
+
+<h3>스프링 부트의 기본 오류 처리: /error가 JSON도 만든다</h3>
+<p>먼저 아무것도 하지 않았을 때 무슨 일이 일어나는지 보자. 아래 컨트롤러는 주문 하나를 조회하는 API다. 주문 번호가 0이면 <code>IllegalArgumentException</code>을 던진다. 예외를 처리하는 코드는 하나도 없다.</p>
+<pre><code class="language-java">@RestController
+@RequestMapping("/api/orders")
+public class OrderApiController {
+
+    @GetMapping("/{id}")
+    public OrderDto find(@PathVariable long id) {
+        if (id == 0) {
+            throw new IllegalArgumentException("주문 번호는 0일 수 없습니다");
+        }
+        return new OrderDto(id, "책");
+    }
+}
+
+public record OrderDto(long id, String item) {}</code></pre>
+<p>이 API를 <code>Accept: application/json</code>으로 호출하면 스프링 부트 3.x 애플리케이션은 HTML이 아니라 JSON을 돌려준다. 본문의 모양은 다음과 같다. <code>timestamp</code>의 값은 요청 시각이므로 실행마다 다르다.</p>
+<pre data-label="응답 (상태 500)"><code class="language-json">{
+  "timestamp": "…요청 시각…",
+  "status": 500,
+  "error": "Internal Server Error",
+  "path": "/api/orders/0"
+}</code></pre>
+<p>같은 URL을 브라우저로 열면 "Whitelabel Error Page"라는 HTML이 나온다. 하나의 경로가 클라이언트에 따라 두 가지 표현을 돌려주는 셈이다. 스프링 부트 레퍼런스는 이를 "기계 클라이언트에게는 오류 세부 정보·HTTP 상태·예외 메시지를 담은 JSON을, 브라우저 클라이언트에게는 같은 데이터를 HTML로 그린 whitelabel 뷰를" 준다고 설명한다. 이 분기는 <code>BasicErrorController</code>의 두 메서드에서 일어난다. 부트 3.5 소스에서 핵심만 옮기면 이렇다.</p>
+<pre><code class="language-java">@Controller
+@RequestMapping("${server.error.path:${error.path:/error}}")
+public class BasicErrorController extends AbstractErrorController {
+
+    @RequestMapping(produces = MediaType.TEXT_HTML_VALUE)
+    public ModelAndView errorHtml(HttpServletRequest request, HttpServletResponse response) {
+        // ... HTML 오류 뷰를 고른다 (08회)
+    }
+
+    @RequestMapping
+    public ResponseEntity<Map<String, Object>> error(HttpServletRequest request) {
+        HttpStatus status = getStatus(request);
+        if (status == HttpStatus.NO_CONTENT) {
+            return new ResponseEntity<>(status);
+        }
+        Map<String, Object> body = getErrorAttributes(request, getErrorAttributeOptions(request, MediaType.ALL));
+        return new ResponseEntity<>(body, status);
+    }
+}</code></pre>
+<p>두 메서드는 경로가 같고 <code>produces</code> 조건만 다르다. 브라우저처럼 <code>Accept</code> 헤더에 <code>text/html</code>을 명시한 요청은 <code>produces = text/html</code> 조건이 붙은 <code>errorHtml</code>로 가고, <code>Accept: application/json</code>을 보낸 API 클라이언트의 요청은 <code>errorHtml</code>의 조건과 맞지 않으므로 조건 없는 <code>error</code>로 간다. 스프링 MVC 1편에서 본 요청 매핑의 내용 협상(content negotiation)이 오류 처리에서도 그대로 쓰이는 것이다. <code>error</code>는 <code>ResponseEntity</code>를 돌려주므로 HTTP 메시지 컨버터가 맵을 JSON으로 직렬화한다.</p>
+<aside class="note">스프링 부트 4.x에서는 이 클래스가 <code>spring-boot-webmvc</code> 모듈로 옮겨졌고 경로 프로퍼티도 <code>spring.web.error.path</code>로 바뀌었다(4.1.2 소스 기준). 3.x에서는 <code>server.error.path</code>다.</aside>
+<p>그렇다면 컨트롤러 안에서 던진 예외가 어떻게 <code>/error</code>까지 가는가. 08회에서 본 길을 API 관점에서 다시 짚으면 이렇다. 예외는 DispatcherServlet 밖으로 빠져나가 톰캣까지 전파된다. 톰캣은 예외를 잡아 응답 상태를 500으로 정하고, 스프링 부트가 컨테이너에 "전역(global) 오류 페이지"로 등록해 둔 <code>/error</code>로 요청을 <b>내부 포워드</b>한다. 이때 디스패처 타입은 <code>ERROR</code>이고, 요청 속성에 <code>jakarta.servlet.error.status_code</code>, <code>jakarta.servlet.error.exception</code>, <code>jakarta.servlet.error.request_uri</code> 같은 값이 채워진다. 포워드된 요청은 다시 DispatcherServlet으로 들어가 <code>BasicErrorController</code>에 매핑된다. <code>getStatus</code>는 <code>jakarta.servlet.error.status_code</code> 속성을 읽어 상태를 정한다.</p>
+
+<h4>본문은 DefaultErrorAttributes가 만들고, 대부분은 지운다</h4>
+<p>JSON 본문의 내용은 <code>ErrorAttributes</code> 빈이 만든다. 기본 구현인 <code>DefaultErrorAttributes</code>(부트 3.x 패키지 <code>org.springframework.boot.web.servlet.error</code>)는 <code>LinkedHashMap</code>에 <code>timestamp</code>, <code>status</code>, <code>error</code>를 넣고, 예외가 있으면 <code>exception</code>(클래스 이름)과 필요하면 <code>trace</code>를, 이어서 예외 유무와 관계없이 <code>message</code>(바인딩·검증 오류가 있으면 <code>errors</code>도)를 넣은 뒤, 마지막에 <code>path</code>를 넣는다. 그리고 <code>ErrorAttributeOptions.retainIncluded</code>로 <b>허용되지 않은 키를 지운다</b>. 부트 3.5의 <code>ErrorAttributeOptions.defaults()</code>는 <code>PATH</code>, <code>STATUS</code>, <code>ERROR</code>만 포함하므로, <code>timestamp</code>를 빼면 이 세 키만 남는다. 위 JSON에 예외 메시지가 없었던 이유가 이것이다. 메시지는 계산은 되었지만 응답에 실리기 전에 제거되었다.</p>
+<p>무엇을 남길지는 <code>server.error.*</code> 프로퍼티가 정한다. 부트 3.5 공식 프로퍼티 목록의 기본값은 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>프로퍼티</th><th>기본값</th><th>켜면 추가되는 키</th></tr></thead><tbody>
+<tr><td><code>server.error.include-exception</code></td><td><code>false</code></td><td><code>exception</code> (예외 클래스 이름)</td></tr>
+<tr><td><code>server.error.include-message</code></td><td><code>never</code></td><td><code>message</code></td></tr>
+<tr><td><code>server.error.include-binding-errors</code></td><td><code>never</code></td><td><code>errors</code> (바인딩·검증 오류 목록)</td></tr>
+<tr><td><code>server.error.include-stacktrace</code></td><td><code>never</code></td><td><code>trace</code></td></tr>
+<tr><td><code>server.error.include-path</code></td><td><code>always</code></td><td><code>path</code></td></tr>
+<tr><td><code>server.error.path</code></td><td><code>/error</code></td><td>오류 컨트롤러의 경로</td></tr>
+</tbody></table></div>
+<p><code>never</code>/<code>always</code> 외에 <code>on_param</code>도 있다. <code>on_param</code>으로 두면 요청 파라미터(예: <code>message</code>, <code>trace</code>)가 있을 때만 해당 키를 넣는다. 운영 환경에서 이 값을 바꾸는 것은 위험하다. <code>include-stacktrace=on_param</code>이면 누구든 URL 끝에 파라미터 하나를 붙여 스택 트레이스를 받아 갈 수 있다. 예외 메시지도 마찬가지다. 라이브러리가 만든 예외 메시지에는 SQL 일부, 파일 경로, 내부 호스트 이름이 섞이기 쉽다. 기본값이 모두 "숨김"인 이유는 오류 응답이 외부로 나가는 출구이기 때문이다.</p>
+
+<h4>기본 처리만으로 부족한 이유</h4>
+<p><code>BasicErrorController</code>는 HTML 오류 화면에는 충분하지만 API 계약으로는 세 군데가 모자라다. 첫째, <b>상태 코드가 예외의 의미를 모른다.</b> 위 예제에서 0번 주문은 클라이언트 입력이 잘못된 경우다. 400이어야 하는데, 컨테이너는 예외 종류를 해석하지 않으므로 처리되지 않은 예외는 모두 500이 된다. 둘째, <b>본문 형식이 하나뿐이다.</b> API마다, 또는 예외마다 다른 오류 코드나 추가 필드(재고 부족이면 남은 수량)를 넣을 방법이 없다. <code>ErrorAttributes</code> 빈을 바꾸면 형식은 바꿀 수 있지만 모든 오류가 한 형식을 공유한다. 셋째, <b>요청이 두 번 처리된다.</b> 예외 한 번에 DispatcherServlet을 두 번 통과하고, 그사이 필터와 인터셉터가 다시 실행될 수 있다(07·08회에서 <code>DispatcherType</code>과 <code>excludePathPatterns("/error")</code>로 다룬 문제다).</p>
+<p>이 세 문제를 풀려면 예외가 <b>DispatcherServlet을 빠져나가기 전에</b> 잡아야 한다. 예외를 잡을 수 있는 위치, 그리고 잡은 다음 응답을 어떻게 확정하느냐가 이 회차의 나머지 전부다.</p>
+
+<h3>DispatcherServlet이 예외를 붙잡는 자리</h3>
+<p>예외 처리의 입구는 <code>DispatcherServlet.doDispatch</code>다. 스프링 프레임워크 6.2 소스의 뼈대를 예외 처리 관점에서 줄이면 다음과 같다.</p>
+<pre><code class="language-java">protected void doDispatch(HttpServletRequest request, HttpServletResponse response) throws Exception {
+    HandlerExecutionChain mappedHandler = null;
+    try {
+        ModelAndView mv = null;
+        Exception dispatchException = null;
+        try {
+            mappedHandler = getHandler(processedRequest);           // 1. 핸들러 찾기
+            // ...
+            if (!mappedHandler.applyPreHandle(processedRequest, response)) {
+                return;                                              // 2. 인터셉터 preHandle
+            }
+            mv = ha.handle(processedRequest, response, mappedHandler.getHandler()); // 3. 컨트롤러 호출
+            mappedHandler.applyPostHandle(processedRequest, response, mv);
+        }
+        catch (Exception ex) {
+            dispatchException = ex;                                  // 여기까지의 예외를 기록만 한다
+        }
+        catch (Throwable err) {
+            dispatchException = new ServletException("Handler dispatch failed: " + err, err);
+        }
+        processDispatchResult(processedRequest, response, mappedHandler, mv, dispatchException);
+    }
+    catch (Exception ex) {
+        // 해결 못 한 예외: afterCompletion(ex)를 부른 뒤 ex를 다시 던진다
+        triggerAfterCompletion(processedRequest, response, mappedHandler, ex);
+    }
+    // ...
+}</code></pre>
+<p>안쪽 <code>try</code>는 핸들러 조회, 인터셉터 <code>preHandle</code>, 핸들러 어댑터 호출, <code>postHandle</code>을 감싼다. 이 구간에서 나온 예외는 곧바로 던져지지 않고 <code>dispatchException</code> 변수에 담긴다. <code>Error</code> 계열(<code>StackOverflowError</code> 같은 것)도 <code>ServletException</code>으로 감싸 같은 길로 보낸다. 소스 주석에 따르면 4.3부터 핸들러 메서드가 던진 <code>Error</code>도 <code>@ExceptionHandler</code>로 처리할 수 있게 하려는 것이다. 그리고 정상 결과든 예외든 <code>processDispatchResult</code>라는 한 곳으로 모인다.</p>
+<pre><code class="language-java">private void processDispatchResult(HttpServletRequest request, HttpServletResponse response,
+        HandlerExecutionChain mappedHandler, ModelAndView mv, Exception exception) throws Exception {
+    boolean errorView = false;
+    if (exception != null) {
+        // ...
+        Object handler = (mappedHandler != null ? mappedHandler.getHandler() : null);
+        mv = processHandlerException(request, response, handler, exception); // 해결 못 하면 여기서 throw
+        errorView = (mv != null);
+    }
+    if (mv != null && !mv.wasCleared()) {
+        render(mv, request, response);                                      // 오류 뷰도 같은 render
+        // ...
+    }
+    // ...
+    if (mappedHandler != null) {
+        mappedHandler.triggerAfterCompletion(request, response, null);      // 예외는 이미 처리됨
+    }
+}</code></pre>
+<p>마지막 줄의 주석이 중요하다. 원본 소스에도 "Exception (if any) is already handled.."라는 주석이 붙어 있다. 리졸버가 예외를 해결하면 인터셉터의 <code>afterCompletion</code>에는 예외 인자로 <code>null</code>이 전달된다. 07회에서 <code>afterCompletion</code>의 네 번째 인자로 예외를 받을 수 있다고 했는데, 그 값이 채워지는 것은 <b>어떤 리졸버도 해결하지 못해</b> 바깥 <code>catch</code>로 빠졌을 때뿐이다. 인터셉터에서 "예외가 났으면 로그를 남긴다"는 코드를 <code>ex != null</code>로만 판단하면, <code>@ExceptionHandler</code>로 처리한 예외는 하나도 기록되지 않는다.</p>
+<p>예외를 실제로 처리하는 곳은 <code>processHandlerException</code>이다.</p>
+<pre><code class="language-java">protected ModelAndView processHandlerException(HttpServletRequest request, HttpServletResponse response,
+        Object handler, Exception ex) throws Exception {
+    request.removeAttribute(HandlerMapping.PRODUCIBLE_MEDIA_TYPES_ATTRIBUTE);
+    try {
+        response.setHeader(HttpHeaders.CONTENT_TYPE, null);
+        response.setHeader(HttpHeaders.CONTENT_DISPOSITION, null);
+        response.resetBuffer();
+    }
+    catch (IllegalStateException illegalStateException) {
+        // 이미 커밋된 응답이면 그대로 둔다
+    }
+    ModelAndView exMv = null;
+    if (this.handlerExceptionResolvers != null) {
+        for (HandlerExceptionResolver resolver : this.handlerExceptionResolvers) {
+            exMv = resolver.resolveException(request, response, handler, ex);
+            if (exMv != null) {
+                break;                                   // 처음으로 null이 아닌 값을 준 리졸버에서 멈춘다
+            }
+        }
+    }
+    if (exMv != null) {
+        if (exMv.isEmpty()) {
+            request.setAttribute(EXCEPTION_ATTRIBUTE, ex);
+            return null;                                 // 빈 ModelAndView: 응답은 리졸버가 이미 끝냈다
+        }
+        // ... 뷰 이름이 없으면 기본 뷰 이름을 붙이고, 오류 요청 속성을 노출한다
+        WebUtils.exposeErrorRequestAttributes(request, ex, getServletName());
+        return exMv;                                     // 오류 뷰를 렌더링하게 한다
+    }
+    throw ex;                                            // 아무도 해결 못 함: 컨테이너로 전파
+}</code></pre>
+<p>세 가지를 읽어 낼 수 있다. 첫째, 리졸버 목록은 <b>책임 연쇄(chain of responsibility)</b>다. 앞에서부터 하나씩 묻고, 처음으로 <code>null</code>이 아닌 값을 돌려준 리졸버에서 멈춘다. 둘째, 리졸버를 부르기 전에 <code>Content-Type</code> 헤더와 응답 버퍼를 비운다(6.2 소스 기준). 컨트롤러가 정상 응답을 쓰다가 중간에 예외가 났더라도, 아직 커밋되지 않았다면 오류 응답을 깨끗한 상태에서 다시 쓸 수 있게 하려는 것이다. 핸들러 매핑이 기록해 둔 "생산 가능한 미디어 타입" 속성도 지운다. 정상 응답이 <code>produces = "application/xml"</code>로 묶여 있어도 오류 응답의 형식은 그 제약을 받지 않는다는 뜻이다. 셋째, 아무도 해결하지 못하면 원래 예외를 <b>다시 던진다</b>. 이 예외가 DispatcherServlet 밖, <code>FrameworkServlet</code>을 지나 톰캣까지 올라가는 것이 앞 절의 <code>/error</code> 경로다.</p>
+
+<x-visual id="spring-mvc2-09-resolver-chain" title="processHandlerException의 리졸버 체인과 세 가지 결과" kind="순서도" ratio="16:9">
+<x-hint>컨트롤러 예외가 리졸버 목록을 순서대로 지나며, 각 리졸버의 반환값에 따라 뷰 렌더링·응답 종료·다음 리졸버·컨테이너 전파로 갈라지는 모습을 보여 준다.</x-hint>
+<x-prompt>Flowchart, white background, left to right. Leftmost box "컨트롤러 예외". Arrow into a tall rounded container labeled "processHandlerException" holding four stacked boxes top to bottom: "DefaultErrorAttributes", "ExceptionHandlerExceptionResolver", "ResponseStatusExceptionResolver", "DefaultHandlerExceptionResolver". Thin downward arrows between consecutive boxes labeled "null". From each of the bottom three boxes, a rightward arrow to a diamond labeled "반환값?". The diamond has three outgoing arrows: up-right to a green box "뷰 렌더링", right to a blue box "응답 완료 (빈 ModelAndView)", and from the bottom of the container stack a red arrow down to a box "톰캣으로 전파 → /error". Flat style, thin lines, Korean labels exactly as given.</x-prompt>
+<x-caption>리졸버는 앞에서부터 차례로 질문을 받고, 처음으로 null이 아닌 답을 준 리졸버에서 체인이 끝난다. 끝까지 null이면 예외는 컨테이너로 올라간다.</x-caption>
+</x-visual>
+
+<h4>스프링 부트 애플리케이션의 리졸버 목록</h4>
+<p>DispatcherServlet은 초기화할 때 애플리케이션 컨텍스트에서 <code>HandlerExceptionResolver</code> 타입의 빈을 모두 찾아 <code>AnnotationAwareOrderComparator</code>로 정렬해 둔다(<code>detectAllHandlerExceptionResolvers</code>가 기본값 <code>true</code>일 때). 스프링 부트 3.x 웹 애플리케이션에서는 대체로 두 개의 빈이 잡힌다.</p>
+<pre class="diagram">handlerExceptionResolvers (정렬 후)
+ ├─ [0] DefaultErrorAttributes             order = HIGHEST_PRECEDENCE  (부트)
+ │       └ 예외를 요청 속성에 저장만 하고 null 반환
+ └─ [1] HandlerExceptionResolverComposite  order = 0                   (스프링 MVC 설정)
+         ├─ ExceptionHandlerExceptionResolver   @ExceptionHandler 메서드 호출
+         ├─ ResponseStatusExceptionResolver     @ResponseStatus, ResponseStatusException
+         └─ DefaultHandlerExceptionResolver     스프링 MVC 내부 예외 → 4xx/5xx</pre>
+<p>첫 번째 <code>DefaultErrorAttributes</code>는 리졸버이면서 동시에 앞 절의 <code>ErrorAttributes</code> 구현이다. <code>resolveException</code>은 예외를 자기 전용 요청 속성에 저장하고 무조건 <code>null</code>을 돌려준다. 그래서 체인을 멈추지 않는다. 이 단계가 있기 때문에 나중에 <code>/error</code>로 재디스패치되었을 때 <code>DefaultErrorAttributes</code>가 원래 예외를 꺼내 <code>exception</code>, <code>message</code> 같은 값을 계산할 수 있다. 가장 높은 우선순위를 받은 이유도 같다. 다른 리졸버가 예외를 처리해 버리기 전에 먼저 기록해 두어야 한다.</p>
+<p>두 번째 <code>HandlerExceptionResolverComposite</code>는 리졸버 세 개를 묶은 리졸버다. <code>WebMvcConfigurationSupport.handlerExceptionResolver()</code>가 만드는데, 소스를 보면 <code>configureHandlerExceptionResolvers</code>로 받은 목록이 비어 있을 때만 <code>addDefaultHandlerExceptionResolvers</code>로 위 세 개를 순서대로 넣고, 그다음 <code>extendHandlerExceptionResolvers</code>를 호출해 목록을 확장할 기회를 준다. 이 순서가 뒤에서 직접 만든 리졸버를 등록할 때 중요해진다. 이제 이 체인에 직접 끼어드는 것부터 해 보자.</p>
+
+<h3>HandlerExceptionResolver 시작: 계약 세 줄</h3>
+<p><code>HandlerExceptionResolver</code>는 메서드가 하나뿐인 인터페이스다.</p>
+<pre><code class="language-java">public interface HandlerExceptionResolver {
+    @Nullable
+    ModelAndView resolveException(HttpServletRequest request, HttpServletResponse response,
+                                  @Nullable Object handler, Exception ex);
+}</code></pre>
+<p>인자로 요청과 응답, 예외를 일으킨 핸들러(애너테이션 컨트롤러라면 <code>HandlerMethod</code>), 예외 자체를 받는다. 핸들러를 찾기 전에 예외가 났다면(예: 멀티파트 파싱 실패) <code>handler</code>는 <code>null</code>이다. 스프링 프레임워크 레퍼런스는 이 인터페이스의 계약을 다음 세 줄로 정리한다.</p>
+<div class="table-wrap"><table><thead><tr><th>반환값</th><th>뜻</th><th>DispatcherServlet이 하는 일</th></tr></thead><tbody>
+<tr><td>뷰를 가리키는 <code>ModelAndView</code></td><td>이 오류는 이 화면으로 보여 달라</td><td>체인을 멈추고, 오류 요청 속성을 노출한 뒤 그 뷰를 <code>render</code>한다</td></tr>
+<tr><td>빈 <code>ModelAndView</code> (<code>new ModelAndView()</code>)</td><td>리졸버 안에서 이미 처리했다</td><td>체인을 멈추고 아무것도 렌더링하지 않는다. 정상 흐름처럼 반환한다</td></tr>
+<tr><td><code>null</code></td><td>내 담당이 아니다</td><td>다음 리졸버에게 묻는다. 마지막까지 <code>null</code>이면 예외를 다시 던진다</td></tr>
+</tbody></table></div>
+<p>여기서 가장 오해하기 쉬운 것이 두 번째 줄이다. "빈 <code>ModelAndView</code>를 돌려주면 응답 본문이 비어 나간다"가 아니다. 정확히는 "DispatcherServlet은 더 할 일이 없다"는 뜻이다. 응답에 무엇이 실리는지는 리졸버가 그 전에 응답 객체에 <b>무엇을 했느냐</b>로 정해진다. 상태 코드만 바꾸고 끝낼 수도, 본문을 직접 쓸 수도, <code>sendError</code>로 컨테이너에 오류 페이지를 요청할 수도 있다. 이 차이를 예제로 확인하자.</p>
+<p>첫 번째 리졸버는 <code>IllegalArgumentException</code>을 400으로 바꾼다. 앞에서 500이 나왔던 0번 주문 요청을 고치려는 것이다.</p>
+<pre><code class="language-java">public class IllegalArgumentToBadRequestResolver implements HandlerExceptionResolver {
+
+    @Override
+    public ModelAndView resolveException(HttpServletRequest request, HttpServletResponse response,
+                                         Object handler, Exception ex) {
+        if (!(ex instanceof IllegalArgumentException)) {
+            return null;                                   // 내 담당이 아니다: 다음 리졸버로
+        }
+        try {
+            response.sendError(HttpServletResponse.SC_BAD_REQUEST, ex.getMessage());
+            return new ModelAndView();                     // 처리 끝
+        } catch (IOException e) {
+            return null;                                   // 실패하면 원래 예외 처리를 계속하게 둔다
+        }
+    }
+}</code></pre>
+<p>이 리졸버가 등록된 상태에서 <code>GET /api/orders/0</code>이 들어오면 무슨 일이 일어나는지 순서대로 따라가 보자.</p>
+<figure class="flow-figure"><figcaption>sendError를 쓰는 리졸버의 요청 처리 흐름</figcaption><ol class="flow">
+<li><strong>컨트롤러</strong><span><code>IllegalArgumentException</code>이 던져지고, <code>doDispatch</code>의 안쪽 <code>catch</code>가 <code>dispatchException</code>에 담는다.</span></li>
+<li><strong>DefaultErrorAttributes</strong><span>예외를 요청 속성에 저장하고 <code>null</code>을 돌려준다.</span></li>
+<li><strong>기본 리졸버 셋</strong><span><code>@ExceptionHandler</code>도, <code>@ResponseStatus</code>도 없고, 스프링 MVC 내부 예외도 아니므로 모두 <code>null</code>.</span></li>
+<li><strong>직접 만든 리졸버</strong><span><code>sendError(400, 메시지)</code>를 호출하고 빈 <code>ModelAndView</code>를 돌려준다. <code>processHandlerException</code>은 <code>null</code>을 반환한다.</span></li>
+<li><strong>DispatcherServlet 종료</strong><span>렌더링 없이 <code>afterCompletion(ex = null)</code>을 부르고 정상적으로 반환한다. 예외는 여기서 사라졌다.</span></li>
+<li><strong>톰캣</strong><span>응답에 오류 표시가 있으므로 상태 400에 맞는 오류 페이지를 찾는다. 스프링 부트가 등록한 기본 오류 페이지 <code>/error</code>로 <code>ERROR</code> 디스패치한다.</span></li>
+<li><strong>BasicErrorController</strong><span><code>status_code</code> 속성 400을 읽어 JSON 본문을 만든다. 클라이언트는 400과 기본 오류 JSON을 받는다.</span></li>
+</ol></figure>
+<p>4단계와 6단계 사이의 연결이 핵심이다. 서블릿 API의 <code>sendError</code> Javadoc은 이 메서드가 "지정한 상태 코드로 오류 응답을 보내고 출력 버퍼를 비우며", 해당 상태 코드에 대한 오류 페이지 선언이 있으면 그것을 우선해서 돌려준다고 설명한다. 또 호출 뒤에는 응답이 커밋된 것으로 보고 더 쓰지 말아야 한다고 적혀 있다. 톰캣 구현(11.0 소스 기준)을 보면 <code>sendError</code>는 응답에 "오류 상태"라는 표시를 남길 뿐 그 자리에서 오류 페이지를 그리지 않는다. 서블릿이 반환하고 필터 체인이 모두 풀린 뒤, <code>StandardHostValve</code>가 <code>response.isError()</code>를 확인하고 상태 코드에 맞는 오류 페이지(없으면 기본 오류 페이지)로 포워드한다. 그래서 <code>sendError</code>를 쓰는 리졸버는 <b>상태 코드만 정하고 본문은 컨테이너의 오류 경로에 위임하는</b> 방식이다.</p>
+<p>이 위임은 MockMvc로 테스트하면 눈에 보인다. MockMvc는 서블릿 컨테이너 없이 DispatcherServlet만 돌리므로 6단계 이후가 없다. 스프링 프레임워크 7.0.10의 MockMvc로 이 리졸버를 등록해 호출한 결과는 다음과 같다.</p>
+<pre data-label="실행 결과 (MockMvc, Spring Framework 7.0.10)"><code class="language-text">/api/orders/0 -> 400 errorMessage=주문 번호는 0일 수 없습니다 contentType=null body=</code></pre>
+<p>상태는 400이고 <code>sendError</code>에 넘긴 메시지는 응답 객체의 오류 메시지 필드에 기록되었지만, 본문은 비어 있다. 실제 톰캣에서는 이 빈자리를 <code>/error</code>가 채운다. 이때 본문에 메시지가 실리는지는 앞의 <code>server.error.include-message</code> 설정에 달려 있다. 톰캣은 <code>sendError</code>의 메시지를 <code>jakarta.servlet.error.message</code> 요청 속성에 넣고, <code>DefaultErrorAttributes</code>는 메시지를 고를 때 이 속성을 예외 자신의 메시지보다 먼저 본다. 기본값 <code>never</code>에서는 계산된 메시지가 결국 지워진다.</p>
+
+<h3>HandlerExceptionResolver 활용: 응답을 그 자리에서 끝내기</h3>
+<p><code>sendError</code> 방식은 상태 코드 문제는 풀었지만 앞에서 든 나머지 두 문제(본문 형식이 하나뿐, 요청이 두 번 처리됨)는 그대로다. 리졸버가 응답 본문을 <b>직접</b> 쓰면 둘 다 사라진다. 두 번째 리졸버는 재고 부족 예외를 409와 약속된 JSON으로 바꾼다.</p>
+<pre><code class="language-java">public class StockShortageException extends RuntimeException {
+    public StockShortageException(String message) {
+        super(message);
+    }
+}
+
+public record ApiError(String code, String message) {}
+
+public class StockShortageJsonResolver implements HandlerExceptionResolver {
+
+    private final ObjectMapper objectMapper;
+
+    public StockShortageJsonResolver(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    @Override
+    public ModelAndView resolveException(HttpServletRequest request, HttpServletResponse response,
+                                         Object handler, Exception ex) {
+        if (!(ex instanceof StockShortageException e)) {
+            return null;
+        }
+        try {
+            response.setStatus(HttpServletResponse.SC_CONFLICT);
+            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            response.setCharacterEncoding("UTF-8");
+            String json = objectMapper.writeValueAsString(new ApiError("STOCK_SHORTAGE", e.getMessage()));
+            response.getWriter().write(json);
+            return new ModelAndView();
+        } catch (IOException ioe) {
+            return null;
+        }
+    }
+}</code></pre>
+<p>패턴 변수 <code>e</code>는 <code>if</code> 블록이 <code>return</code>으로 끝나므로 그 아래에서도 쓸 수 있다(자바 16부터의 <code>instanceof</code> 패턴 매칭 규칙). <code>ObjectMapper.writeValueAsString</code>이 던지는 <code>JsonProcessingException</code>은 <code>IOException</code>의 하위 타입이라 같은 <code>catch</code>에 걸린다. MockMvc로 확인한 결과는 다음과 같다(같은 환경, JSON 직렬화 부분만 문자열 조립으로 바꿔 실행).</p>
+<pre data-label="실행 결과 (MockMvc, Spring Framework 7.0.10)"><code class="language-text">/api/orders/409 -> 409 errorMessage=null contentType=application/json;charset=UTF-8 body={"code":"STOCK_SHORTAGE","message":"재고 부족"}</code></pre>
+<p>이번에는 <code>sendError</code>를 부르지 않았으므로 톰캣의 응답에는 오류 표시가 없다. 상태가 409여도 컨테이너 입장에서는 정상적으로 끝난 응답이다. <code>StandardHostValve</code>는 <code>isError()</code>가 거짓이면 오류 페이지를 찾지 않는다. <code>/error</code> 재디스패치가 일어나지 않으므로 필터와 인터셉터가 두 번 실행될 일도, <code>BasicErrorController</code>가 형식을 덮어쓸 일도 없다. 응답이 리졸버 안에서 완결된다.</p>
+<x-visual id="spring-mvc2-09-senderror-vs-direct" title="sendError 위임과 직접 응답 작성의 비교" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>같은 예외를 sendError로 처리할 때는 요청이 /error로 한 번 더 DispatcherServlet을 지나고, 본문을 직접 쓸 때는 첫 디스패치에서 끝난다는 차이를 보여 준다.</x-hint>
+<x-prompt>Two-row sequence diagram on white background. Five vertical lifelines in both rows, left to right: "클라이언트", "톰캣", "DispatcherServlet", "리졸버", "BasicErrorController". Top row titled "sendError 위임": arrows "GET /api/orders/0" from 클라이언트 to 톰캣 to DispatcherServlet, "예외" to 리졸버, return arrow "sendError(400)" back to DispatcherServlet, return to 톰캣, then a highlighted orange arrow from 톰캣 back to DispatcherServlet labeled "ERROR 디스패치 /error", then to BasicErrorController, then dashed return arrow "400 + 기본 JSON" to 클라이언트. Bottom row titled "직접 작성": same first arrows, 리졸버 returns arrow labeled "409 + ApiError JSON 작성", then dashed arrows straight back to 클라이언트; BasicErrorController lifeline greyed out. Flat style, Korean labels exactly as given.</x-prompt>
+<x-caption>sendError는 본문을 컨테이너의 오류 경로에 맡기고, 직접 작성은 첫 디스패치에서 응답을 완결한다.</x-caption>
+</x-visual>
+
+<h4>리졸버 등록: configure와 extend의 차이</h4>
+<p>직접 만든 리졸버는 <code>WebMvcConfigurer</code>로 등록한다. 여기에 비슷한 이름의 메서드가 두 개 있고, 잘못 고르면 스프링 MVC의 기본 예외 처리 전체가 꺼진다.</p>
+<pre><code class="language-java">@Configuration
+public class WebConfig implements WebMvcConfigurer {
+
+    private final ObjectMapper objectMapper;
+
+    public WebConfig(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    @Override
+    public void extendHandlerExceptionResolvers(List<HandlerExceptionResolver> resolvers) {
+        resolvers.add(new IllegalArgumentToBadRequestResolver());
+        resolvers.add(new StockShortageJsonResolver(objectMapper));
+    }
+}</code></pre>
+<p><code>WebMvcConfigurer</code> Javadoc의 설명을 소스와 함께 읽으면 차이가 분명하다. <code>configureHandlerExceptionResolvers</code>가 받는 목록은 처음에 비어 있고, 이 목록이 <b>비어 있을 때만</b> 프레임워크가 기본 리졸버 셋을 채운다. 여기에 하나라도 넣으면 "애플리케이션이 넘겨받아 완전히 초기화된 리졸버를 모두 직접 제공해야" 한다. 즉 <code>@ExceptionHandler</code> 처리, <code>@ResponseStatus</code> 처리, 스프링 MVC 내부 예외의 4xx 변환이 한꺼번에 사라진다. 반면 <code>extendHandlerExceptionResolvers</code>(4.3부터)는 기본 셋이 채워진 <b>뒤의</b> 목록을 받는다. 기본 동작을 유지하면서 끼워 넣을 때는 이쪽을 쓴다.</p>
+<p>목록 안의 위치도 신경 써야 한다. <code>resolvers.add(...)</code>는 목록 끝에 붙이므로 위 설정의 결과는 [<code>ExceptionHandlerExceptionResolver</code>, <code>ResponseStatusExceptionResolver</code>, <code>DefaultHandlerExceptionResolver</code>, 직접 만든 둘] 순서다. 직접 만든 리졸버는 기본 셋이 모두 <code>null</code>을 돌려준 예외만 받는다. 같은 예외를 <code>@ExceptionHandler</code>로도 처리하고 있다면 그쪽이 먼저 이긴다. 기본 셋보다 먼저 보려면 <code>resolvers.add(0, ...)</code>로 맨 앞에 넣어야 한다. 그 대신 그 리졸버가 너무 넓은 타입(예: <code>Exception</code>)을 잡으면 스프링 MVC 내부 예외까지 가로채 400이어야 할 응답을 엉뚱하게 바꾼다. 리졸버의 순서는 곧 "누가 먼저 판단할 권리를 갖는가"다.</p>
+<aside class="note">직접 작성 방식은 강력하지만 대가가 있다. 응답 형식(JSON인지, 문자 인코딩은 무엇인지), <code>Accept</code> 헤더 협상, 직렬화 실패 처리를 모두 손으로 해야 한다. 스프링이 컨트롤러 반환값에 대해 해 주던 일, 즉 메시지 컨버터 선택과 내용 협상을 리졸버 안에서 다시 구현하는 셈이다. 다음 절의 <code>ExceptionHandlerExceptionResolver</code>는 바로 이 부분을 프레임워크가 대신 해 주는 리졸버다.</aside>
+
+<h3>스프링이 제공하는 리졸버 1: ResponseStatusExceptionResolver</h3>
+<p>기본 셋의 두 번째인 <code>ResponseStatusExceptionResolver</code>부터 보자. 이 리졸버는 두 종류의 예외를 상태 코드로 바꾼다. 클래스에 <code>@ResponseStatus</code>가 붙은 예외와, <code>ResponseStatusException</code>이다. 스프링 6.2 소스의 판단 순서는 다음과 같다.</p>
+<pre><code class="language-java">protected ModelAndView doResolveException(HttpServletRequest request, HttpServletResponse response,
+                                          Object handler, Exception ex) {
+    try {
+        if (ex instanceof ResponseStatusException rse) {
+            return resolveResponseStatusException(rse, request, response, handler);
+        }
+        ResponseStatus status = AnnotatedElementUtils.findMergedAnnotation(ex.getClass(), ResponseStatus.class);
+        if (status != null) {
+            return resolveResponseStatus(status, request, response, handler, ex);
+        }
+        if (ex.getCause() instanceof Exception cause) {
+            return doResolveException(request, response, handler, cause);   // 원인으로 재귀
+        }
+    }
+    catch (Exception resolveEx) {
+        // 경고 로그
+    }
+    return null;
+}
+
+protected ModelAndView applyStatusAndReason(int statusCode, String reason, HttpServletResponse response)
+        throws IOException {
+    if (!StringUtils.hasLength(reason)) {
+        response.sendError(statusCode);
+    }
+    else {
+        String resolvedReason = (this.messageSource != null ?
+                this.messageSource.getMessage(reason, null, reason, LocaleContextHolder.getLocale()) :
+                reason);
+        response.sendError(statusCode, resolvedReason);
+    }
+    return new ModelAndView();
+}</code></pre>
+<p>네 가지를 확인할 수 있다. 첫째, 애너테이션은 <code>findMergedAnnotation</code>으로 찾으므로 상위 클래스에 붙은 <code>@ResponseStatus</code>도 하위 예외에 적용된다. 둘째, 예외 자신에게 해당 사항이 없으면 <b>원인(cause)으로 재귀</b>한다. 다른 예외로 감싸진 <code>@ResponseStatus</code> 예외도 상태 코드가 살아남는다. 셋째, 결론은 결국 <code>sendError</code>다. 이 리졸버는 본문을 쓰지 않고 앞 절의 첫 번째 방식처럼 컨테이너의 <code>/error</code>에 위임한다. 넷째, <code>reason</code>은 <b>메시지 코드로 먼저 해석된다</b>. <code>WebMvcConfigurationSupport</code>가 이 리졸버를 만들 때 애플리케이션 컨텍스트를 <code>MessageSource</code>로 넣어 주므로, 03회에서 본 메시지 소스 기능이 그대로 쓰인다. 코드를 찾지 못하면 기본 메시지 인자로 넘긴 <code>reason</code> 문자열 자체가 쓰인다.</p>
+<pre><code class="language-java">@ResponseStatus(code = HttpStatus.NOT_FOUND, reason = "error.order.notfound")
+public class OrderNotFoundException extends RuntimeException {
+    public OrderNotFoundException(long id) {
+        super("order " + id);
+    }
+}</code></pre>
+<pre data-label="messages.properties"><code class="language-properties">error.order.notfound=주문을 찾을 수 없습니다</code></pre>
+<p><code>@ResponseStatus</code>는 자기가 만든 예외 클래스에만 붙일 수 있다. 라이브러리의 예외나, 같은 예외인데 상황마다 다른 상태를 주고 싶을 때는 <code>ResponseStatusException</code>을 직접 던진다. 이 예외는 생성자로 상태 코드와 이유를 받고, 리졸버는 예외가 가진 헤더까지 응답에 복사한 뒤 같은 <code>applyStatusAndReason</code>을 탄다. 스프링 6.0부터 <code>ResponseStatusException</code>은 <code>ErrorResponseException</code>을 상속해 <code>ErrorResponse</code> 인터페이스도 구현한다(이 인터페이스는 뒤의 <code>ProblemDetail</code> 절에서 다시 나온다).</p>
+<pre><code class="language-java">@GetMapping("/{id}")
+public OrderDto find(@PathVariable long id) {
+    // ...
+    if (id == 404) {
+        throw new OrderNotFoundException(id);
+    }
+    if (id == 410) {
+        throw new ResponseStatusException(HttpStatus.GONE, "삭제된 주문");
+    }
+    return new OrderDto(id, "책");
+}</code></pre>
+<p>이 컨트롤러를 예외 처리 설정 없이 MockMvc로 호출한 결과는 다음과 같다. MockMvc의 독립 실행(standalone) 설정에는 <code>messages.properties</code>를 읽는 메시지 소스가 없어서 <code>reason</code>이 코드 그대로 나왔다. 메시지 소스가 구성된 스프링 부트 애플리케이션이라면 "주문을 찾을 수 없습니다"로 해석된다.</p>
+<pre data-label="실행 결과 (MockMvc, Spring Framework 7.0.10)"><code class="language-text">/api/orders/404 -> 404 errorMessage=error.order.notfound body=
+/api/orders/410 -> 410 errorMessage=삭제된 주문 body=</code></pre>
+<p>두 경우 모두 본문이 비어 있다는 점에 주목하자. 실제 서버에서는 <code>/error</code>가 기본 JSON을 채운다. 따라서 <code>@ResponseStatus</code>와 <code>ResponseStatusException</code>은 <b>상태 코드를 정확히 하는</b> 도구이지, API 오류 본문을 설계하는 도구가 아니다. 이유 문자열이 클라이언트에 보이는지도 <code>server.error.include-message</code>에 달려 있다.</p>
+
+<h3>스프링이 제공하는 리졸버 2: DefaultHandlerExceptionResolver</h3>
+<p>기본 셋의 마지막 <code>DefaultHandlerExceptionResolver</code>는 <b>스프링 MVC 자신이 던지는 예외</b>를 맡는다. 클라이언트가 <code>/api/orders/abc</code>처럼 숫자 자리에 문자를 보내면 <code>long id</code>로 변환하다가 <code>MethodArgumentTypeMismatchException</code>이 난다. 이것은 서버 버그가 아니라 클라이언트의 잘못이므로 400이어야 한다. 아무 설정이 없어도 이 요청이 500이 아니라 400이 되는 것은 이 리졸버 덕분이다.</p>
+<pre data-label="실행 결과 (MockMvc, Spring Framework 7.0.10)"><code class="language-text">경고: Resolved [org.springframework.web.method.annotation.MethodArgumentTypeMismatchException: Method parameter 'id': Failed to convert value of type 'java.lang.String' to required type 'long'; For input string: "abc"]
+/api/orders/abc -> 400 errorMessage=null body=</code></pre>
+<p>첫 줄의 경고 로그도 이 리졸버가 남긴 것이다. 생성자에서 경고 로그 카테고리를 자기 클래스 이름으로 정해 두었기 때문에, 처리한 예외를 WARN 수준으로 "Resolved [...]"라고 기록한다. 소스의 <code>handleTypeMismatch</code>는 두 줄이다. <code>response.sendError(SC_BAD_REQUEST)</code>를 부르고 빈 <code>ModelAndView</code>를 돌려준다. 이 리졸버 역시 상태 코드만 정하고 본문은 컨테이너의 오류 경로에 맡긴다. 클래스 Javadoc에 실린 대응표 중 자주 만나는 것을 옮기면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>예외</th><th>상태</th><th>언제 나는가</th></tr></thead><tbody>
+<tr><td><code>HttpRequestMethodNotSupportedException</code></td><td>405</td><td>매핑에 없는 HTTP 메서드로 요청</td></tr>
+<tr><td><code>HttpMediaTypeNotSupportedException</code></td><td>415</td><td>요청 본문의 <code>Content-Type</code>을 읽을 컨버터가 없음</td></tr>
+<tr><td><code>HttpMediaTypeNotAcceptableException</code></td><td>406</td><td><code>Accept</code>가 원하는 형식으로 응답을 만들 수 없음</td></tr>
+<tr><td><code>MissingServletRequestParameterException</code></td><td>400</td><td>필수 요청 파라미터 누락</td></tr>
+<tr><td><code>TypeMismatchException</code></td><td>400</td><td>파라미터·경로 변수 타입 변환 실패</td></tr>
+<tr><td><code>HttpMessageNotReadableException</code></td><td>400</td><td>요청 본문 JSON 파싱 실패</td></tr>
+<tr><td><code>MethodArgumentNotValidException</code></td><td>400</td><td><code>@Valid</code> 검증 실패(05회)</td></tr>
+<tr><td><code>NoResourceFoundException</code></td><td>404</td><td>정적 리소스를 찾지 못함(6.1부터)</td></tr>
+<tr><td><code>HttpMessageNotWritableException</code></td><td>500</td><td>응답 객체를 직렬화하지 못함</td></tr>
+</tbody></table></div>
+<p>스프링 6에서 이 리졸버의 구조가 바뀌었다. 6.2 소스의 <code>doResolveException</code>은 먼저 <code>ex instanceof ErrorResponse</code>인지 본다. 스프링 레퍼런스에 따르면 스프링 MVC의 예외들은 모두 <code>ErrorResponse</code>를 구현하고, 이 인터페이스는 상태 코드·헤더·본문(<code>ProblemDetail</code>)을 스스로 노출한다. 예외별 처리 메서드(<code>handleHttpRequestMethodNotSupported</code> 등, 기본 구현은 <code>null</code>을 돌려준다)가 따로 응답을 만들지 않으면 <code>handleErrorResponse</code>가 예외가 알려 주는 상태와 헤더(예: 405의 <code>Allow</code>)로 <code>sendError</code>를 호출한다. 예외가 자기 HTTP 표현을 알고, 리졸버는 그것을 응답에 옮기는 구조다. <code>TypeMismatchException</code>처럼 웹 계층 밖(빈 프로퍼티 변환)에서 온 낮은 수준의 예외는 그 아래의 별도 분기에서 처리된다.</p>
+<p>여기서 하나의 함정을 짚어 두자. 응답이 이미 커밋되었다면 <code>sendError</code>는 <code>IllegalStateException</code>을 던진다. 그래서 이 리졸버의 여러 메서드는 <code>response.isCommitted()</code>를 먼저 확인하고, 커밋된 경우 경고 로그만 남긴다. 큰 응답을 스트리밍하다가 중간에 예외가 나면 클라이언트는 이미 200 상태 줄과 일부 본문을 받았다. 이 시점 이후로는 어떤 리졸버도 상태 코드를 바꿀 수 없다. HTTP 응답의 상태 줄은 본문보다 먼저 나가기 때문이다. 예외 처리의 모든 장치는 "응답이 아직 커밋되지 않았다"는 전제 위에서만 동작한다.</p>
+
+<h3>@ExceptionHandler: 예외 처리용 컨트롤러 메서드</h3>
+<p>기본 셋의 첫 번째, 그리고 실무에서 가장 많이 쓰는 것이 <code>ExceptionHandlerExceptionResolver</code>다. 이 리졸버는 <code>@ExceptionHandler</code>가 붙은 메서드를 찾아 <b>컨트롤러 메서드처럼</b> 호출한다. "컨트롤러 메서드처럼"이 핵심이다. 스프링 MVC 1편에서 본 <code>RequestMappingHandlerAdapter</code>의 구조, 즉 인자 리졸버(<code>HandlerMethodArgumentResolver</code>)가 파라미터를 채우고 반환값 처리기(<code>HandlerMethodReturnValueHandler</code>)가 반환값을 응답으로 바꾸는 구조가 예외 처리 메서드에도 그대로 적용된다. <code>WebMvcConfigurationSupport</code>는 이 리졸버를 만들 때 컨트롤러 쪽과 같은 메시지 컨버터, 사용자 정의 인자 리졸버, 반환값 처리기, 그리고 내용 협상 관리자를 넣어 준다. 그래서 <code>@ResponseBody</code> 객체를 돌려주면 <code>Accept</code> 헤더에 맞춰 JSON으로 직렬화된다. 앞 절에서 손으로 하던 일이 사라진다.</p>
+<pre><code class="language-java">@RestController
+@RequestMapping("/api/orders")
+public class OrderApiController {
+
+    @GetMapping("/{id}")
+    public OrderDto find(@PathVariable long id) {
+        // ... (앞의 예제와 같음)
+    }
+
+    @ExceptionHandler
+    public ApiError badArgument(IllegalArgumentException e) {
+        return new ApiError("BAD_ARGUMENT", e.getMessage());
+    }
+}</code></pre>
+<p><code>@ExceptionHandler</code>의 값을 비워 두면 메서드 파라미터 중 <code>Throwable</code> 하위 타입이 처리 대상이 된다. 위 메서드는 <code>IllegalArgumentException</code>과 그 하위 예외를 맡는다. 값과 파라미터 어디에서도 예외 타입을 찾지 못하면 "No exception types mapped to"로 시작하는 <code>IllegalStateException</code>이 난다. 이제 <code>GET /api/orders/0</code>을 보내 보자. 기대하는 것은 400과 <code>ApiError</code> JSON이다.</p>
+<pre data-label="실행 결과 (MockMvc, Spring Framework 7.0.10)"><code class="language-text">/api/orders/0 -> 200 errorMessage=null body={"code":"BAD_ARGUMENT","message":"주문 번호는 0일 수 없습니다"}</code></pre>
+<p>본문은 기대대로인데 <b>상태가 200</b>이다. 이유는 <code>processHandlerException</code>을 다시 보면 나온다. DispatcherServlet은 리졸버를 부르기 전에 헤더와 버퍼를 비울 뿐 상태 코드를 바꾸지 않는다. 서블릿 응답의 상태는 기본값 200 그대로이고, 예외 처리 메서드는 상태에 대해 아무 말도 하지 않았다. 반환값 처리기는 받은 객체를 현재 상태로 써 내려갈 뿐이다. 이 예외 처리 메서드는 "예외를 정상 응답으로 바꾼" 셈이 되었다. 클라이언트는 성공으로 판단하고 <code>ApiError</code>를 <code>OrderDto</code>로 파싱하려다 실패한다.</p>
+<p>상태를 정하는 방법은 둘이다. 메서드에 <code>@ResponseStatus</code>를 붙이거나, <code>ResponseEntity</code>를 돌려준다.</p>
+<pre><code class="language-java">@ResponseStatus(HttpStatus.BAD_REQUEST)
+@ExceptionHandler
+public ApiError badArgument(IllegalArgumentException e) {
+    return new ApiError("BAD_ARGUMENT", e.getMessage());
+}
+
+@ExceptionHandler
+public ResponseEntity<ApiError> stock(StockShortageException e) {
+    return ResponseEntity.status(HttpStatus.CONFLICT)
+            .body(new ApiError("STOCK_SHORTAGE", e.getMessage()));
+}</code></pre>
+<pre data-label="실행 결과 (MockMvc, Spring Framework 7.0.10)"><code class="language-text">/api/orders/0 -> 400 errorMessage=null body={"code":"BAD_ARGUMENT","message":"주문 번호는 0일 수 없습니다"}
+/api/orders/409 -> 409 errorMessage=null body={"code":"STOCK_SHORTAGE","message":"재고 부족"}</code></pre>
+<p>메서드에 붙은 <code>@ResponseStatus</code>는 예외 클래스에 붙은 것과 동작이 다르다. <code>ServletInvocableHandlerMethod.setResponseStatus</code>를 보면, <code>reason</code>이 없을 때는 <code>response.setStatus</code>만 호출하고, <code>reason</code>이 있을 때는 <code>response.sendError(status, reason)</code>를 호출한 뒤 요청을 처리 완료로 표시해 반환값을 쓰지 않는다. 즉 <code>@ExceptionHandler</code> 메서드에 <code>reason</code>까지 적으면 본문을 직접 만들겠다는 의도와 달리 다시 <code>/error</code> 위임으로 돌아간다. API 예외 처리 메서드에는 <code>reason</code> 없이 상태 코드만 적는다.</p>
+<p>두 경우 모두 <code>sendError</code>가 없으므로 응답은 첫 디스패치에서 끝난다. <code>doResolveHandlerMethodException</code>의 마지막 부분을 보면, 반환값 처리기가 응답을 직접 썼을 때(<code>mavContainer.isRequestHandled()</code>가 참) 리졸버는 빈 <code>ModelAndView</code>를 돌려준다. 앞 절에서 손으로 만든 "직접 작성" 리졸버와 결과가 같다. 반대로 메서드가 뷰 이름 문자열이나 <code>ModelAndView</code>를 돌려주면 뷰가 있는 <code>ModelAndView</code>가 만들어져 DispatcherServlet이 렌더링한다. 같은 장치로 HTML 오류 화면도 만들 수 있는 이유다.</p>
+
+<h4>여러 메서드가 맞을 때: 예외 깊이와 원인 체인</h4>
+<p>한 클래스에 <code>@ExceptionHandler</code>가 여러 개 있으면 어느 것이 선택되는가. 이 일은 클래스마다 하나씩 만들어지는 <code>ExceptionHandlerMethodResolver</code>가 한다. 6.2 소스의 규칙은 다음과 같다.</p>
+<ol>
+<li>던져진 예외의 클래스에 대해, 선언된 예외 타입이 그 클래스에 <b>대입 가능한</b>(상위 타입이거나 같은) 매핑을 모두 모은다.</li>
+<li>여러 개면 <code>ExceptionDepthComparator</code>로 정렬한다. 던져진 예외에서 상속 계층을 몇 단계 올라가야 선언된 타입에 닿는지가 깊이이고, <b>가장 가까운 것</b>이 이긴다. <code>IllegalArgumentException</code>을 던졌을 때 <code>IllegalArgumentException</code> 처리 메서드(깊이 0)는 <code>RuntimeException</code> 처리 메서드(깊이 1)와 <code>Exception</code> 처리 메서드(깊이 2)를 이긴다. 6.2부터는 같은 깊이일 때 <code>produces</code>로 선언한 미디어 타입이 동점을 가른다.</li>
+<li>아무것도 맞지 않으면 <code>getCause()</code>로 원인 예외를 꺼내 1부터 다시 한다. 레퍼런스에 따르면 5.3부터는 원인의 원인까지 임의의 깊이로 내려간다.</li>
+<li>조회 결과는 예외 타입과 미디어 타입 쌍을 키로 캐시된다. 같은 예외가 반복될 때 매번 계층을 훑지 않는다.</li>
+</ol>
+<p>같은 클래스 안에서 같은 예외 타입을 두 메서드가 선언하면 "Ambiguous @ExceptionHandler method mapped for"로 시작하는 <code>IllegalStateException</code>이 난다. 이 검사는 <code>ExceptionHandlerMethodResolver</code>를 만들 때 일어난다. <code>@ControllerAdvice</code>의 리졸버는 애플리케이션 시작 시점(리졸버의 <code>afterPropertiesSet</code>)에 만들어지므로 기동이 실패하지만, 컨트롤러 자신의 리졸버는 그 컨트롤러에서 <b>처음 예외가 났을 때</b> <code>computeIfAbsent</code>로 만들어진다. 같은 실수가 어디에 있느냐에 따라 기동 실패가 되기도, 운영 중 첫 예외에서야 드러나는 오류가 되기도 한다.</p>
+<p>원인 체인 매칭은 편리하지만 의외의 결과를 낳는다. 앞의 <code>badArgument</code>(상태 지정 없는 첫 버전)가 있는 상태에서 <code>/api/orders/abc</code>를 보내 보았다.</p>
+<pre data-label="실행 결과 (MockMvc, Spring Framework 7.0.10)"><code class="language-text">/api/orders/abc -> 200 errorMessage=null body={"code":"BAD_ARGUMENT","message":"For input string: \"abc\""}</code></pre>
+<p>원래라면 <code>DefaultHandlerExceptionResolver</code>가 400으로 처리했을 타입 변환 실패가 <code>IllegalArgumentException</code> 처리 메서드로 들어왔다. 던져진 <code>MethodArgumentTypeMismatchException</code>은 <code>IllegalArgumentException</code>의 하위 타입이 아니지만, 그 원인이 <code>NumberFormatException</code>이고 이것이 <code>IllegalArgumentException</code>의 하위 타입이다. 3단계의 원인 매칭에 걸린 것이다. 그리고 <code>ExceptionHandlerExceptionResolver</code>는 체인에서 <code>DefaultHandlerExceptionResolver</code>보다 앞에 있으므로 먼저 이긴다. 메시지에 원인 예외의 메시지가 찍힌 것도 이유가 있다. 리졸버는 메서드를 호출할 때 던져진 예외와 그 원인들을 모두 "제공된 인자" 후보로 넘기고, 인자 해석은 파라미터 타입에 대입 가능한 첫 후보를 고른다. 파라미터가 <code>IllegalArgumentException</code>이므로 감싼 예외가 아니라 원인인 <code>NumberFormatException</code>이 들어왔다. 파라미터를 <code>Exception</code>으로 선언했다면 감싼 예외가 들어온다.</p>
+<p>교훈은 <b>넓은 표준 예외를 처리 대상으로 삼지 말라</b>는 것이다. <code>IllegalArgumentException</code>, <code>IllegalStateException</code>, <code>RuntimeException</code>은 JDK와 라이브러리 곳곳에서 원인으로 쓰인다. 애플리케이션이 의미를 정할 수 있는 예외는 애플리케이션이 직접 정의한 예외뿐이다. 도메인 예외 계층(예: <code>BusinessException</code>을 루트로 하는 계층)을 만들고 그것을 처리 대상으로 삼으면 이런 충돌이 없다.</p>
+<p>마지막으로 예외 처리 메서드 자신이 예외를 던지면 어떻게 되는가. 6.2 소스의 <code>doResolveHandlerMethodException</code>은 호출 중 생긴 예외를 잡아, 원래 예외(또는 그 원인)와 다른 예외라면 "Failure in @ExceptionHandler"로 경고 로그를 남기고 <code>null</code>을 돌려준다. 원래 예외는 체인의 다음 리졸버로 넘어간다. 레퍼런스는 이 성질을 의도적으로 쓰는 방법도 소개한다. 예외 처리 메서드가 받은 예외를 그대로 다시 던지면 "이 메서드가 처음부터 맞지 않았던 것처럼" 나머지 체인이 처리를 이어 간다.</p>
+
+<h3>@ControllerAdvice: 예외 처리를 컨트롤러 밖으로</h3>
+<p>컨트롤러 안의 <code>@ExceptionHandler</code>는 <b>그 컨트롤러에서 난 예외만</b> 처리한다. API가 수십 개면 같은 처리 메서드가 수십 번 복사된다. <code>@ControllerAdvice</code>는 <code>@ExceptionHandler</code>, <code>@InitBinder</code>, <code>@ModelAttribute</code> 메서드를 여러 컨트롤러가 공유하도록 모으는 <code>@Component</code>의 특수화다. <code>@RestControllerAdvice</code>는 <code>@ControllerAdvice</code>에 <code>@ResponseBody</code>를 합친 애너테이션(4.3부터)으로, 모든 예외 처리 메서드의 반환값이 응답 본문이 된다.</p>
+<pre><code class="language-java">@RestControllerAdvice(basePackages = "com.example.shop.api")
+public class ApiExceptionAdvice {
+
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    @ExceptionHandler
+    public ApiError badArgument(IllegalArgumentException e) {
+        return new ApiError("BAD_ARGUMENT", e.getMessage());
+    }
+
+    @ExceptionHandler
+    public ResponseEntity<ApiError> stock(StockShortageException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ApiError("STOCK_SHORTAGE", e.getMessage()));
+    }
+
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    @ExceptionHandler
+    public ApiError unexpected(Exception e) {
+        // 원인 추적을 위해 서버 로그에는 예외 전체를 남긴다 (...)
+        return new ApiError("INTERNAL_ERROR", "일시적인 오류가 발생했습니다");
+    }
+}</code></pre>
+<p>마지막 메서드처럼 <code>Exception</code>을 잡는 최후 처리기를 두면 어떤 예외든 약속된 형식으로 나간다. 다만 두 가지를 의식해야 한다. 첫째, 클라이언트에게는 예외 메시지를 그대로 보내지 않는다. 앞에서 본 정보 노출 문제가 여기서 다시 생긴다. 둘째, <code>Exception</code> 처리기는 <code>ExceptionHandlerExceptionResolver</code>가 체인의 앞에 있기 때문에 <b>스프링 MVC 내부 예외까지 가로챈다</b>. 타입 변환 실패, 필수 파라미터 누락, 지원하지 않는 메서드가 모두 500이 된다. 이 문제의 해법은 뒤의 <code>ResponseEntityExceptionHandler</code>에서 다룬다.</p>
+
+<h4>처리 메서드를 찾는 순서</h4>
+<p><code>ExceptionHandlerExceptionResolver.getExceptionHandlerMethod</code>가 처리 메서드를 찾는 순서는 다음과 같다.</p>
+<pre class="diagram">getExceptionHandlerMethod(handlerMethod, exception)
+ 1. 예외를 던진 컨트롤러 클래스 자신
+      └ ExceptionHandlerMethodResolver(컨트롤러 클래스)에서 매칭 시도
+        → 하나라도 맞으면 즉시 반환 (깊이·원인 규칙은 이 클래스 안에서만)
+ 2. @ControllerAdvice 빈들, 우선순위 순서대로
+      for advice in exceptionHandlerAdviceCache:
+        if advice.isApplicableToBeanType(컨트롤러 타입):   ← basePackages 등 선택자 검사
+          ExceptionHandlerMethodResolver(advice)에서 매칭 시도
+          → 맞으면 즉시 반환
+ 3. 아무도 없으면 null → 다음 리졸버(ResponseStatus, Default)</pre>
+<p>"즉시 반환"이 이 표의 핵심이다. 예외 깊이를 비교하는 것은 <b>한 클래스 안에서만</b>이다. 컨트롤러에 <code>@ExceptionHandler(Exception.class)</code>가 하나라도 있으면, 어드바이스에 아무리 정확한 <code>IllegalArgumentException</code> 처리 메서드가 있어도 컨트롤러 쪽이 이긴다. 실험으로 확인해 보자. 아래 컨트롤러는 자기 안에 <code>Exception</code> 처리 메서드를 갖고 있고, 어드바이스에는 <code>IllegalArgumentException</code> 처리 메서드가 있다.</p>
+<pre><code class="language-java">@RestController
+public class LegacyController {
+
+    @GetMapping("/legacy")
+    public String legacy() {
+        throw new IllegalArgumentException("legacy");
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ApiError onAny(Exception e) {
+        return new ApiError("LOCAL", e.getClass().getSimpleName());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (MockMvc, Spring Framework 7.0.10)"><code class="language-text">/legacy -> 200 errorMessage=null body={"code":"LOCAL","message":"IllegalArgumentException"}</code></pre>
+<p>어드바이스 사이에서도 같은 규칙이 적용된다. <code>@ControllerAdvice</code> 빈들은 <code>ControllerAdviceBean.findAnnotatedBeans</code>가 <code>Ordered</code> 구현이나 <code>@Order</code>·<code>@Priority</code> 선언으로 정렬하고, 리졸버는 그 순서대로 묻다가 처음 맞는 어드바이스에서 멈춘다. <code>@ControllerAdvice</code> Javadoc은 이를 분명히 적는다. 한 어드바이스 안에서는 원인 매칭보다 루트 예외 매칭이 우선하지만, <b>우선순위가 높은 어드바이스의 원인 매칭이 낮은 어드바이스의 어떤 매칭보다도 우선한다</b>. 그래서 문서는 주요 루트 예외 매핑을 적절한 순서를 가진 우선 어드바이스에 선언하라고 권한다. <code>@Order</code>를 하나도 주지 않으면 모든 어드바이스가 같은 최저 우선순위가 되어, 실제 순서는 정렬 전 빈 조회 순서에 좌우된다. 이것은 코드로 약속된 계약이 아니다. 어드바이스가 둘 이상이면 순서를 명시한다.</p>
+<p>선택자(selector)는 어드바이스가 적용될 컨트롤러를 좁힌다. <code>basePackages</code>(별칭 <code>value</code>), 타입 안전한 <code>basePackageClasses</code>, 특정 타입에 대입 가능한 컨트롤러를 고르는 <code>assignableTypes</code>, 특정 애너테이션이 붙은 컨트롤러를 고르는 <code>annotations</code>가 있다. 여러 선택자를 함께 쓰면 OR로 결합된다. 아무것도 지정하지 않으면 모든 컨트롤러에 적용된다. Javadoc은 선택자 검사가 런타임에 이루어지므로 많이 쓰면 성능과 복잡도에 영향을 줄 수 있다고 경고한다. 위 표의 <code>isApplicableToBeanType</code>이 그 검사다. 웹 화면용 컨트롤러와 API 컨트롤러가 한 애플리케이션에 섞여 있다면, API용 어드바이스를 API 패키지로 한정해 HTML 컨트롤러의 예외가 JSON으로 바뀌지 않게 하는 것이 전형적인 사용법이다.</p>
+<x-visual id="spring-mvc2-09-handler-lookup" title="@ExceptionHandler 메서드를 찾는 순서" kind="구조도" ratio="16:9">
+<x-hint>예외 처리 메서드 탐색이 컨트롤러 자신에서 시작해 우선순위 순 어드바이스로 넘어가며, 각 단계에서 처음 맞는 곳에서 멈춘다는 점을 보여 준다.</x-hint>
+<x-prompt>Clean diagram, white background. On the left, a red lightning icon labeled "IllegalArgumentException". A horizontal pipeline of three boxes connected by arrows labeled "없으면": first box "① 컨트롤러 자신의 @ExceptionHandler", second box "② @Order(1) 어드바이스", third box "③ @Order(2) 어드바이스". Under each box, a small inner list showing "깊이 비교 · 원인 체인" in grey. From the first box, a green arrow upward labeled "맞으면 즉시 선택" to a green box "처리 메서드 호출". After the third box, a grey arrow to a box "다음 리졸버로 (null)". A small filter icon between box ① and ② labeled "선택자 검사". Flat style, thin lines, Korean labels exactly as given.</x-prompt>
+<x-caption>깊이 비교는 한 클래스 안에서만 일어난다. 컨트롤러 자신, 그다음 우선순위 순의 어드바이스에서 처음 맞는 곳이 이긴다.</x-caption>
+</x-visual>
+
+<h3>ProblemDetail과 ErrorResponse: 스프링 6의 표준 오류 본문</h3>
+<p>지금까지 만든 <code>ApiError</code>는 각자 정한 형식이다. 팀마다 <code>code</code>, <code>errorCode</code>, <code>message</code>, <code>detail</code>처럼 이름이 제각각이다. HTTP API의 오류 본문 형식을 표준으로 정한 것이 RFC 9457 "Problem Details for HTTP APIs"다. 스프링 프레임워크는 6.0부터 이 형식을 지원한다(6.0·6.1의 <code>ProblemDetail</code> Javadoc은 이전 판인 RFC 7807을 가리킨다. RFC 9457은 2023년 7월에 RFC 7807을 대체했다). 레퍼런스가 소개하는 구성 요소는 넷이다.</p>
+<ul>
+<li><code>ProblemDetail</code>: RFC 9457 문제 상세의 표현. 표준 필드(<code>type</code>, <code>title</code>, <code>status</code>, <code>detail</code>, <code>instance</code>)와 비표준 필드를 담는 단순한 컨테이너다.</li>
+<li><code>ErrorResponse</code>: 상태 코드, 응답 헤더, RFC 9457 형식의 본문을 노출하는 계약. 스프링 MVC의 예외들이 모두 이것을 구현한다.</li>
+<li><code>ErrorResponseException</code>: 다른 예외가 상속해 쓰기 좋은 <code>ErrorResponse</code> 기본 구현. <code>ResponseStatusException</code>이 이것을 상속한다.</li>
+<li><code>ResponseEntityExceptionHandler</code>: 스프링 MVC 예외 전부와 모든 <code>ErrorResponseException</code>을 처리해 본문 있는 오류 응답을 만드는 <code>@ControllerAdvice</code>용 기반 클래스.</li>
+</ul>
+<p><code>@ExceptionHandler</code> 메서드는 <code>ProblemDetail</code>이나 <code>ErrorResponse</code>를 그대로 돌려줄 수 있다. 상태 코드는 <code>ProblemDetail</code>의 <code>status</code>가 정하므로 앞의 200 함정도 없다.</p>
+<pre><code class="language-java">@RestControllerAdvice
+public class ProblemAdvice {
+
+    @ExceptionHandler
+    public ProblemDetail stock(StockShortageException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, e.getMessage());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (MockMvc, Spring Framework 7.0.10, 예외 메시지 'stock empty')"><code class="language-text">/pd status=409 contentType=application/problem+json body={"detail":"stock empty","instance":"/pd","status":409,"title":"Conflict"}</code></pre>
+<pre data-label="실행 결과 (MockMvc, Spring Framework 6.2.19 + Jackson 2.21, 같은 코드)"><code class="language-text">/pd status=409 contentType=application/problem+json body={"type":"about:blank","title":"Conflict","status":409,"detail":"stock empty","instance":"/pd"}</code></pre>
+<p>두 가지가 자동으로 일어났다. 레퍼런스에 따르면 <code>ProblemDetail</code>의 <code>instance</code>는 비어 있으면 현재 URL 경로로 채워지고, 잭슨 JSON 코덱은 <code>ProblemDetail</code>에 대해 <code>application/problem+json</code>을 생산 가능한 미디어 타입으로 쓴다. 클라이언트는 <code>Content-Type</code>만 보고도 이 본문이 표준 문제 상세임을 안다. 두 출력을 비교하면 상태, <code>Content-Type</code>, <code>instance</code>는 같지만, 기준 버전인 6.2.19에서는 본문에 <code>"type":"about:blank"</code>가 더 실리고 필드 순서도 다르다. 6.2의 레퍼런스로 확인되는 것은 이 두 동작(<code>instance</code> 채움, <code>application/problem+json</code>)과 <code>status</code>가 HTTP 상태를 정한다는 점이다. 표준 필드 외의 값(예: 남은 재고 수량)은 <code>setProperty</code>로 <code>properties</code> 맵에 넣으면 잭슨이 최상위 JSON 속성으로 펼쳐 준다.</p>
+<p>이제 앞 절에서 남긴 문제, 즉 <code>Exception</code> 최후 처리기가 스프링 MVC 내부 예외까지 500으로 만드는 문제를 풀 수 있다. 어드바이스가 <code>ResponseEntityExceptionHandler</code>를 상속하면, 이 기반 클래스가 스프링 MVC 예외들을 위한 <code>@ExceptionHandler</code> 메서드를 이미 갖고 있다. 기반 클래스가 선언한 <code>TypeMismatchException</code>, <code>HttpRequestMethodNotSupportedException</code> 같은 구체 타입이 같은 어드바이스 안에서 <code>Exception</code>보다 던져진 예외에 가까우므로 먼저 선택되어, 각 예외가 노출하는 상태 코드(400, 405, 415…)와 <code>ProblemDetail</code> 본문으로 응답한다. 이 기반 클래스는 <code>ErrorResponse</code>가 노출하는 <code>type</code>·<code>title</code>·<code>detail</code>의 메시지 코드(<code>problemDetail.title.</code> + 예외의 정규 클래스 이름 같은 형식)를 <code>MessageSource</code>로 해석하므로, 03회의 국제화 방식 그대로 문구를 바꿀 수 있다.</p>
+<p>스프링 부트는 이 구성을 프로퍼티 하나로 켜 준다. 부트 3.5에서 <code>spring.mvc.problemdetails.enabled</code>의 기본값은 <code>false</code>이고, <code>true</code>로 두면 <code>WebMvcAutoConfiguration</code>이 <code>ResponseEntityExceptionHandler</code>를 상속한 <code>ProblemDetailsExceptionHandler</code>를 <code>@Order(0)</code>의 어드바이스로 등록한다. 이 빈은 <code>@ConditionalOnMissingBean(ResponseEntityExceptionHandler.class)</code> 조건이 붙어 있어서, 애플리케이션이 직접 <code>ResponseEntityExceptionHandler</code> 하위 어드바이스를 만들면 물러난다.</p>
+<aside class="note"><code>ProblemDetail</code>은 새 리졸버가 아니다. 지금까지 본 체인은 그대로이고, <code>@ExceptionHandler</code>의 반환값 종류가 하나 늘었을 뿐이다. 반대로 <code>ErrorResponse</code> 예외가 <code>@ExceptionHandler</code>에서 처리되지 않고 <code>DefaultHandlerExceptionResolver</code>까지 가면, 그 리졸버는 6.2 소스 기준으로 상태와 <code>detail</code>을 <code>sendError</code>에 넘길 뿐이므로 본문은 여전히 <code>/error</code>의 기본 JSON이 된다. 문제 상세 본문을 원한다면 <code>ResponseEntityExceptionHandler</code> 계열 어드바이스가 있어야 한다.</aside>
+
+<h3>어디서 던진 예외까지 잡히는가</h3>
+<p>지금까지의 모든 장치는 DispatcherServlet의 <code>processHandlerException</code> 안에서 동작한다. 그러므로 "이 예외를 <code>@ExceptionHandler</code>로 잡을 수 있는가"라는 질문은 "이 예외가 <code>doDispatch</code>의 안쪽 <code>try</code> 안에서 던져졌는가"로 바뀐다. 요청이 지나는 구간별로 정리하면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>예외가 난 곳</th><th>리졸버 체인</th><th>결과</th></tr></thead><tbody>
+<tr><td>서블릿 필터 (07회)</td><td>거치지 않음</td><td>DispatcherServlet 바깥이므로 컨테이너로 바로 전파, <code>/error</code></td></tr>
+<tr><td>인터셉터 <code>preHandle</code></td><td>거침</td><td>안쪽 <code>try</code> 안이므로 <code>@ExceptionHandler</code>로 처리 가능</td></tr>
+<tr><td>인자 바인딩·타입 변환·검증</td><td>거침</td><td>핸들러 어댑터 호출 중이므로 처리 가능(앞의 타입 불일치 예)</td></tr>
+<tr><td>컨트롤러 메서드 본문</td><td>거침</td><td>가장 일반적인 경우</td></tr>
+<tr><td><code>@ResponseBody</code> 직렬화</td><td>거침</td><td>반환값 처리도 핸들러 어댑터 안에서 일어난다</td></tr>
+<tr><td>뷰 렌더링</td><td>거치지 않음</td><td><code>render</code>는 <code>processDispatchResult</code>에서 호출되어 안쪽 <code>try</code> 밖이다. 바깥 <code>catch</code>로 빠져 컨테이너로 전파</td></tr>
+<tr><td><code>@ExceptionHandler</code> 메서드 내부</td><td>원래 예외로 계속</td><td>경고 로그 후 다음 리졸버가 원래 예외를 처리</td></tr>
+</tbody></table></div>
+<p>필터에서 난 예외는 어떤 어드바이스로도 잡을 수 없다는 점이 실무에서 자주 문제가 된다. 인증 필터에서 토큰 검증 예외를 던지고 <code>@RestControllerAdvice</code>로 401 JSON을 만들려는 시도는 동작하지 않는다. 예외는 컨테이너의 오류 경로로 가서 <code>BasicErrorController</code>의 500 JSON이 된다. 필터에서는 필터가 직접 응답(상태와 본문)을 쓰고 체인을 진행하지 않는 방식으로 처리해야 한다. 스프링 시큐리티도 인증 실패 응답을 DispatcherServlet이 아니라 자신의 필터 체인 안에서 만든다.</p>
+<p>또 하나, 컨트롤러가 <code>handler</code>를 찾지 못한 경우도 있다. 6.1부터는 컨트롤러에 매핑되지 않은 경로가 정적 리소스 처리기(<code>ResourceHttpRequestHandler</code>)로 넘어가 리소스를 찾지 못하면 <code>NoResourceFoundException</code>이 던져지고, 이것이 <code>DefaultHandlerExceptionResolver</code>에서 404로 바뀐다. 그런데 6.2 소스의 <code>ExceptionHandlerExceptionResolver.shouldApplyTo</code>는 핸들러가 <code>ResourceHttpRequestHandler</code>이고 전역 예외 처리기가 있으면 이 리졸버를 적용한다. 선택자가 없는 전역 어드바이스는 컨트롤러 타입이 없어도 적용 대상이 되므로, 그 어드바이스의 <code>Exception</code> 최후 처리기가 이 404를 먼저 잡아 500으로 바꾼다. 최후 처리기를 둘 때 <code>ResponseEntityExceptionHandler</code>를 함께 쓰라는 앞 절의 권고가 여기서도 같은 문제를 막는다.</p>
+
+<h3>정리: 오류 응답이 확정되는 지점</h3>
+<p>섹션의 내용을 "응답이 어디서 확정되는가" 하나의 질문으로 묶을 수 있다. 예외 하나가 들어왔을 때 스프링 부트 3.x 애플리케이션이 판단하는 순서를 위에서부터 읽으면 된다.</p>
+<div class="table-wrap"><table><thead><tr><th>순서</th><th>판단 주체</th><th>응답을 만드는 방식</th><th>/error 재디스패치</th></tr></thead><tbody>
+<tr><td>0</td><td><code>DefaultErrorAttributes</code></td><td>예외를 기록만 하고 넘긴다</td><td>-</td></tr>
+<tr><td>1</td><td><code>@ExceptionHandler</code> (컨트롤러 → 어드바이스 순)</td><td>컨트롤러 메서드처럼 반환값을 직렬화</td><td>없음 (메서드 <code>@ResponseStatus</code>에 <code>reason</code>을 주면 있음)</td></tr>
+<tr><td>2</td><td><code>@ResponseStatus</code> 예외, <code>ResponseStatusException</code></td><td><code>sendError(상태, 이유)</code></td><td>있음</td></tr>
+<tr><td>3</td><td>스프링 MVC 내부 예외</td><td><code>sendError(4xx/5xx)</code></td><td>있음</td></tr>
+<tr><td>4</td><td><code>extendHandlerExceptionResolvers</code>로 추가한 리졸버</td><td>직접 작성 또는 <code>sendError</code></td><td>방식에 따라</td></tr>
+<tr><td>5</td><td>아무도 처리 못 함</td><td>컨테이너가 500으로 정함</td><td>있음</td></tr>
+</tbody></table></div>
+<aside class="keyidea"><span>이 장의 핵심</span><p>API 예외 처리는 DispatcherServlet의 <code>processHandlerException</code>에서 <code>HandlerExceptionResolver</code>들이 순서대로 "내 담당인가"를 판단하는 책임 연쇄다. <code>sendError</code>를 부르는 리졸버는 상태 코드만 정하고 본문은 컨테이너의 <code>/error</code>에 맡기며, 응답을 직접 쓰는 리졸버와 <code>@ExceptionHandler</code>는 첫 디스패치에서 응답을 완결한다. <code>@ExceptionHandler</code>는 컨트롤러 자신 → 우선순위 순 어드바이스에서 처음 맞는 곳이 이기고, 깊이 비교와 원인 체인 매칭은 그 클래스 안에서만 일어난다. 상태 코드를 명시하지 않으면 200이 나간다.</p></aside>
+<p>다음 10회에서는 이 회차에서 400의 원인으로 여러 번 등장한 타입 변환, 즉 문자열 <code>"abc"</code>를 <code>long</code>으로 바꾸려다 실패하는 그 과정을 맡는 <code>ConversionService</code>와 <code>Formatter</code>를 다룬다. 바인딩과 변환 단계에서 난 예외가 어떤 타입으로 감싸져 이 회차의 리졸버 체인에 도착하는지가 그 연결 고리다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>BasicErrorController</dt><dd>스프링 부트가 <code>/error</code>에 매핑한 오류 컨트롤러. <code>Accept</code>가 <code>text/html</code>이면 <code>errorHtml</code>, 아니면 <code>error</code>가 선택되어 <code>ErrorAttributes</code>가 만든 맵을 JSON으로 돌려준다.</dd>
+<dt>DefaultErrorAttributes</dt><dd>최우선 리졸버로 예외를 요청 속성에 기록하고 <code>null</code>을 돌려주며, 오류 본문의 키를 만든 뒤 <code>server.error.include-*</code> 설정에 없는 키를 지운다.</dd>
+<dt>HandlerExceptionResolver 계약</dt><dd>뷰가 있는 <code>ModelAndView</code>는 오류 뷰 렌더링, 빈 <code>ModelAndView</code>는 처리 완료, <code>null</code>은 다음 리졸버로. 모두 <code>null</code>이면 예외가 컨테이너로 전파된다.</dd>
+<dt>sendError 위임</dt><dd><code>ResponseStatusExceptionResolver</code>와 <code>DefaultHandlerExceptionResolver</code>는 <code>sendError</code>로 상태만 정하고, 본문은 톰캣의 <code>ERROR</code> 디스패치로 <code>/error</code>가 만든다.</dd>
+<dt>configure vs extend</dt><dd><code>configureHandlerExceptionResolvers</code>에 하나라도 넣으면 기본 리졸버 셋이 꺼진다. 기본을 유지하며 추가하려면 <code>extendHandlerExceptionResolvers</code>를 쓰고, 목록 내 위치로 우선순위를 정한다.</dd>
+<dt>@ExceptionHandler</dt><dd>예외 처리용 컨트롤러 메서드. 인자 리졸버와 반환값 처리기, 메시지 컨버터를 그대로 쓰며, 상태를 지정하지 않으면 200으로 응답한다.</dd>
+<dt>예외 매칭 규칙</dt><dd>한 클래스 안에서 <code>ExceptionDepthComparator</code>로 가장 가까운 타입이 이기고, 맞는 것이 없으면 원인 체인을 따라 내려간다. 컨트롤러 자신이 어드바이스보다, 우선순위 높은 어드바이스가 낮은 어드바이스보다 먼저다.</dd>
+<dt>@ControllerAdvice</dt><dd>여러 컨트롤러가 공유하는 <code>@ExceptionHandler</code> 등을 모은 컴포넌트. 선택자로 적용 범위를 좁히고 <code>@Order</code>로 순서를 정한다. <code>@RestControllerAdvice</code>는 <code>@ResponseBody</code>를 더한 것이다.</dd>
+<dt>ProblemDetail</dt><dd>RFC 9457 오류 본문의 스프링 6 표현. <code>@ExceptionHandler</code>에서 돌려주면 <code>status</code>로 상태가 정해지고 <code>application/problem+json</code>으로 직렬화된다.</dd>
+</x-summary>
+
+<x-review>
+<p>운영 중인 API에서 "클라이언트 오류인데 500이 찍혀 알람이 울린다"는 문제는 대개 이 회차의 체인 중 어느 단계가 빠졌는지로 설명된다. 처리되지 않은 도메인 예외가 컨테이너까지 올라가 500이 되었거나, 어드바이스의 <code>Exception</code> 최후 처리기가 스프링 MVC 내부 예외를 가로채 500으로 바꿨거나, 필터에서 난 예외라 어드바이스가 애초에 볼 수 없었던 경우다. 로그에서 "Resolved [...]" 경고(<code>DefaultHandlerExceptionResolver</code>)가 보이는지, "Failure in @ExceptionHandler"가 보이는지, 스택 트레이스가 <code>FrameworkServlet</code> 밖까지 올라갔는지를 보면 어느 단계에서 결정되었는지 좁힐 수 있다.</p>
+<p>반대 방향의 사고도 흔하다. 오류인데 200이 나가는 경우다. 상태를 지정하지 않은 <code>@ExceptionHandler</code>, 혹은 원인 체인 매칭으로 엉뚱한 처리 메서드가 선택된 경우가 그렇다. 200 오류는 모니터링의 오류율에 잡히지 않으므로 500보다 늦게 발견된다. 예외 처리 메서드는 반드시 <code>@ResponseStatus</code>, <code>ResponseEntity</code>, <code>ProblemDetail</code> 중 하나로 상태를 명시하고, MockMvc 테스트에서 본문뿐 아니라 상태 코드까지 검증하는 습관이 이 사고를 막는다.</p>
+<p>설계 판단은 조건에 따라 달라진다. 화면과 API가 섞인 애플리케이션이라면 API용 어드바이스를 패키지나 애너테이션 선택자로 한정해야 HTML 화면의 오류 페이지(08회)가 망가지지 않는다. 외부에 공개하는 API이거나 여러 팀이 클라이언트를 만든다면 자체 형식보다 RFC 9457 <code>ProblemDetail</code>을 기본으로 삼고, 필요한 필드만 <code>properties</code>로 확장하는 편이 계약을 설명하기 쉽다. 반대로 이미 클라이언트가 의존하는 자체 형식이 있다면 형식을 바꾸는 것 자체가 호환성 깨짐이므로, <code>ResponseEntityExceptionHandler</code>의 처리 메서드를 재정의해 기존 형식으로 응답하게 맞춘다.</p>
+</x-review>
+
+<x-practice>
+<li>어드바이스 없이 <code>extendHandlerExceptionResolvers</code>로 <code>IllegalArgumentToBadRequestResolver</code>만 등록한 스프링 부트 애플리케이션에 <code>GET /api/orders/0</code>(<code>Accept: application/json</code>)을 보낸다. 톰캣 기준으로 DispatcherServlet이 몇 번 호출되는지, 각 호출의 디스패처 타입과 최종 응답의 상태 코드, 본문 키 목록(기본 설정)을 적어라.</li>
+<li>다음 두 설정의 차이를 설명하라. (가) <code>configureHandlerExceptionResolvers</code>에서 <code>resolvers.add(new StockShortageJsonResolver(objectMapper))</code>, (나) <code>extendHandlerExceptionResolvers</code>에서 같은 코드. (가)에서 <code>/api/orders/abc</code>를 호출하면 무엇이 나오는가?</li>
+<li>컨트롤러 A에는 <code>@ExceptionHandler(RuntimeException.class)</code>가 있고, <code>@Order(1)</code> 어드바이스 X에는 <code>@ExceptionHandler(IllegalStateException.class)</code>, <code>@Order(2)</code> 어드바이스 Y에는 <code>@ExceptionHandler(MyBusinessException.class)</code>가 있다. <code>MyBusinessException extends IllegalStateException</code>일 때, (1) A에서 <code>MyBusinessException</code>을 던지면, (2) 다른 컨트롤러 B(로컬 처리기 없음)에서 같은 예외를 던지면 각각 어느 메서드가 선택되는가?</li>
+<li>인터셉터의 <code>afterCompletion</code>에서 <code>ex != null</code>일 때만 오류 로그를 남기도록 했더니, <code>@RestControllerAdvice</code>로 처리한 예외가 로그에 하나도 남지 않았다. 원인을 DispatcherServlet 소스로 설명하고, 처리된 예외를 인터셉터에서 알아낼 방법을 하나 제시하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 두 번이다. 첫 호출은 <code>REQUEST</code> 디스패치로 컨트롤러가 <code>IllegalArgumentException</code>을 던지고, <code>DefaultErrorAttributes</code>가 기록한 뒤 기본 리졸버 세 개가 모두 <code>null</code>을 돌려주고, 직접 만든 리졸버가 <code>sendError(400, 메시지)</code>를 부르고 빈 <code>ModelAndView</code>를 돌려준다. DispatcherServlet은 정상 반환하고, 톰캣의 <code>StandardHostValve</code>가 오류 표시를 보고 <code>/error</code>로 <code>ERROR</code> 디스패치한다. 두 번째 호출에서 <code>BasicErrorController.error</code>가 선택되어 상태 400의 JSON을 만든다. 본문 키는 <code>timestamp</code>, <code>status</code>, <code>error</code>, <code>path</code>다. 메시지는 계산되지만 <code>include-message=never</code> 때문에 지워진다.</p>
+<p><b>2번.</b> (가)는 목록이 비어 있지 않으므로 <code>addDefaultHandlerExceptionResolvers</code>가 호출되지 않아 <code>ExceptionHandlerExceptionResolver</code>, <code>ResponseStatusExceptionResolver</code>, <code>DefaultHandlerExceptionResolver</code>가 모두 빠진다. 합성 리졸버에는 재고 리졸버 하나만 있다. (나)는 기본 셋 뒤에 덧붙는다. (가)에서 <code>/api/orders/abc</code>는 <code>MethodArgumentTypeMismatchException</code>을 처리할 리졸버가 없으므로(재고 리졸버는 <code>null</code>) 예외가 컨테이너로 올라가 500이 된다. 기본 설정이었다면 400이었을 요청이다. <code>@ExceptionHandler</code>와 <code>@ResponseStatus</code>도 함께 무력화된다.</p>
+<p><b>3번.</b> (1) 컨트롤러 A 자신의 처리기가 먼저 검사되고, <code>RuntimeException</code>은 <code>MyBusinessException</code>에 대입 가능하므로 즉시 A의 메서드가 선택된다. 어드바이스 Y에 더 정확한 처리기가 있어도 비교되지 않는다. (2) B에는 로컬 처리기가 없으므로 어드바이스를 순서대로 본다. 우선순위가 높은 X의 <code>IllegalStateException</code> 처리기가 맞으므로(깊이 1) X에서 멈춘다. Y의 깊이 0 처리기는 검사조차 되지 않는다. 깊이 비교는 한 클래스 안에서만 일어나기 때문이다. Y를 쓰고 싶다면 Y의 우선순위를 X보다 높이거나, 도메인 예외 처리기를 X에 두어야 한다.</p>
+<p><b>4번.</b> <code>processDispatchResult</code>는 리졸버가 예외를 해결하면 마지막에 <code>triggerAfterCompletion(request, response, null)</code>을 호출한다. 원본 소스의 주석대로 예외는 이미 처리된 것으로 본다. <code>ex</code>가 채워지는 것은 아무 리졸버도 해결하지 못해 <code>doDispatch</code>의 바깥 <code>catch</code>로 빠졌을 때뿐이다. 방법으로는, <code>processHandlerException</code>이 빈 <code>ModelAndView</code>를 받았을 때 요청 속성 <code>DispatcherServlet.EXCEPTION_ATTRIBUTE</code>에 예외를 넣어 두므로 <code>afterCompletion</code>에서 이 속성을 읽거나, 응답 상태 코드(<code>response.getStatus()</code>)가 4xx·5xx인지로 판단할 수 있다. 다만 뷰를 렌더링한 경우에는 이 속성이 설정되지 않으므로, 어드바이스 안에서 직접 로그를 남기는 편이 가장 확실하다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>컨트롤러가 던진 예외를 처리하는 <code>@RestControllerAdvice</code> 메서드가 <code>ApiError</code> 객체만 반환하고 상태 관련 지정(<code>@ResponseStatus</code>, <code>ResponseEntity</code>)이 전혀 없다. 클라이언트가 받는 상태 코드는?</q>
+<o>500. 예외가 발생했으므로 DispatcherServlet이 자동으로 500을 설정한다.</o>
+<o>400. <code>@ExceptionHandler</code>는 기본적으로 클라이언트 오류로 취급한다.</o>
+<o>200. DispatcherServlet은 상태를 바꾸지 않고, 반환값 처리기는 현재 상태(기본 200)로 본문을 쓴다.</o>
+<o>상태 없이 연결이 끊긴다.</o>
+<why><code>processHandlerException</code>은 리졸버 호출 전 <code>Content-Type</code>·<code>Content-Disposition</code> 헤더와 버퍼만 비우고 상태 코드는 건드리지 않는다. <code>ExceptionHandlerExceptionResolver</code>는 예외 처리 메서드를 컨트롤러 메서드처럼 호출하므로, 상태를 지정하지 않으면 서블릿 응답의 기본값 200이 그대로 나간다. 500은 예외가 처리되지 않고 컨테이너까지 갔을 때의 결과다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>@ResponseStatus(code = HttpStatus.NOT_FOUND, reason = "error.order.notfound")</code>가 붙은 예외를 컨트롤러에서 던졌다. 스프링 부트 기본 설정에서 API 클라이언트가 받는 응답에 대한 설명으로 옳은 것은?</q>
+<o>상태 404와 함께 "error.order.notfound"를 메시지 소스로 해석한 문장이 본문 <code>message</code> 키에 실린다.</o>
+<o>리졸버는 <code>sendError(404, 해석된 이유)</code>만 호출하고, 본문은 <code>/error</code>의 기본 JSON이 만든다. 기본 설정에서는 <code>message</code> 키가 지워진다.</o>
+<o><code>ResponseStatusExceptionResolver</code>가 이유 문자열을 그대로 응답 본문에 텍스트로 쓴다.</o>
+<o><code>@ResponseStatus</code>는 <code>@ExceptionHandler</code>가 없으면 무시되어 500이 된다.</o>
+<why><code>applyStatusAndReason</code>은 이유를 <code>MessageSource</code>로 해석해 <code>sendError</code>에 넘기고 빈 <code>ModelAndView</code>를 돌려줄 뿐 본문을 쓰지 않는다. 본문은 톰캣의 <code>ERROR</code> 디스패치로 <code>BasicErrorController</code>가 만들고, <code>DefaultErrorAttributes</code>는 <code>server.error.include-message</code>의 기본값 <code>never</code>에 따라 <code>message</code>를 제거한다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>어드바이스에 <code>@ExceptionHandler</code>로 <code>IllegalArgumentException</code> 처리 메서드를 두었더니, <code>@PathVariable long id</code>에 <code>"abc"</code>를 보낸 요청까지 이 메서드로 들어왔다. 그 이유는?</q>
+<o><code>MethodArgumentTypeMismatchException</code>이 <code>IllegalArgumentException</code>을 상속하기 때문이다.</o>
+<o><code>DefaultHandlerExceptionResolver</code>가 처리한 뒤 결과를 <code>ExceptionHandlerExceptionResolver</code>에 다시 넘기기 때문이다.</o>
+<o>스프링이 모든 타입 변환 실패를 <code>IllegalArgumentException</code>으로 바꿔 다시 던지기 때문이다.</o>
+<o>던져진 예외 자체는 맞지 않지만 그 원인인 <code>NumberFormatException</code>이 <code>IllegalArgumentException</code>의 하위 타입이라 원인 체인 매칭에 걸렸고, 이 리졸버가 <code>DefaultHandlerExceptionResolver</code>보다 먼저 묻기 때문이다.</o>
+<why><code>ExceptionHandlerMethodResolver</code>는 예외 자신의 타입으로 맞는 매핑이 없으면 <code>getCause()</code>를 따라 내려가 다시 찾는다. <code>MethodArgumentTypeMismatchException</code>은 <code>TypeMismatchException</code> 계열이지 <code>IllegalArgumentException</code>의 하위 타입이 아니다. 기본 셋에서 <code>ExceptionHandlerExceptionResolver</code>가 첫 번째이므로 원인 매칭으로 먼저 처리해 버린다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>인증 필터(<code>OncePerRequestFilter</code>)에서 토큰이 만료되면 <code>TokenExpiredException</code>을 던지고, <code>@RestControllerAdvice</code>에 이 예외의 401 처리 메서드를 두었다. 실제 결과는?</q>
+<o>필터는 DispatcherServlet 바깥에서 실행되므로 리졸버 체인을 거치지 않고, 예외가 컨테이너로 전파되어 <code>/error</code>의 500 응답이 된다.</o>
+<o>어드바이스는 전역이므로 필터 예외도 처리되어 401이 된다.</o>
+<o>필터 예외는 <code>DefaultHandlerExceptionResolver</code>가 처리해 400이 된다.</o>
+<o>필터가 예외를 던지면 요청이 컨트롤러로 그대로 넘어간다.</o>
+<why>리졸버 체인은 <code>doDispatch</code> 안의 <code>processHandlerException</code>에서만 동작한다. 필터는 서블릿보다 바깥의 필터 체인에서 실행되므로 그 예외는 DispatcherServlet을 거치지 않고 톰캣까지 올라가고, 톰캣이 500으로 정한 뒤 <code>/error</code>로 포워드한다. 필터에서는 응답을 직접 써야 한다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>HandlerExceptionResolver</dt><dd>DispatcherServlet이 핸들러 실행 중 생긴 예외를 넘기는 전략 인터페이스. 반환값으로 오류 뷰, 처리 완료, 미처리를 알린다.</dd>
+<dt>책임 연쇄(chain of responsibility)</dt><dd>요청을 처리자 목록에 차례로 넘겨 처음으로 처리한 객체에서 멈추는 구조. 리졸버 목록과 어드바이스 목록이 모두 이 방식이다.</dd>
+<dt>sendError</dt><dd>서블릿 응답에 오류 상태를 표시하는 메서드. 호출 뒤 응답은 커밋된 것으로 보며, 컨테이너가 해당 상태의 오류 페이지로 디스패치한다.</dd>
+<dt>ERROR 디스패치(DispatcherType.ERROR)</dt><dd>컨테이너가 오류 페이지로 요청을 내부 포워드할 때의 디스패처 타입. <code>jakarta.servlet.error.*</code> 요청 속성이 함께 채워진다.</dd>
+<dt>ExceptionDepthComparator</dt><dd>던져진 예외에서 선언된 예외 타입까지의 상속 거리로 후보를 정렬하는 비교기. 가장 가까운 처리 메서드가 선택된다.</dd>
+<dt>원인 체인(cause chain)</dt><dd><code>getCause()</code>로 이어지는 감싼 예외들의 목록. <code>@ExceptionHandler</code> 매칭과 <code>@ResponseStatus</code> 해석에서 모두 탐색된다.</dd>
+<dt>응답 커밋(committed response)</dt><dd>상태 줄과 헤더가 이미 클라이언트로 전송된 상태. 이후에는 상태 코드를 바꾸거나 <code>sendError</code>를 호출할 수 없다.</dd>
+<dt>RFC 9457 Problem Details</dt><dd>HTTP API의 오류 본문 표준 형식. <code>type</code>, <code>title</code>, <code>status</code>, <code>detail</code>, <code>instance</code> 필드와 <code>application/problem+json</code> 미디어 타입을 정의한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/web/webmvc/mvc-servlet/exceptionhandlers.html">Spring Framework 6.2 Reference — Exceptions</a> — <code>HandlerExceptionResolver</code> 구현 목록, 반환값 계약, 컨테이너 오류 페이지</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/web/webmvc/mvc-controller/ann-exceptionhandler.html">Spring Framework 6.2 Reference — @ExceptionHandler</a> — 원인 매칭(5.3부터 임의 깊이), 어드바이스 우선순위, 지원 인자·반환값</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/web/webmvc/mvc-ann-rest-exceptions.html">Spring Framework 6.2 Reference — Error Responses</a> — <code>ProblemDetail</code>, <code>ErrorResponse</code>, <code>ResponseEntityExceptionHandler</code>, 메시지 코드</li>
+<li><a href="https://docs.spring.io/spring-boot/3.5/reference/web/servlet.html">Spring Boot 3.5 Reference — Servlet Web Applications</a> — <code>/error</code> 매핑과 JSON·whitelabel 응답, Problem Details 활성화</li>
+<li><a href="https://docs.spring.io/spring-boot/3.5/appendix/application-properties/index.html">Spring Boot 3.5 — Common Application Properties</a> — <code>server.error.*</code>, <code>spring.mvc.problemdetails.enabled</code> 기본값</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-framework/6.2.x/spring-webmvc/src/main/java/org/springframework/web/servlet/DispatcherServlet.java">Spring Framework 6.2.x 소스 — DispatcherServlet.java</a> — <code>processDispatchResult</code>, <code>processHandlerException</code></li>
+</x-refs>

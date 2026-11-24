@@ -1,0 +1,807 @@
+<x-meta>
+deck: 저장해 둔 응답을 캐시가 언제 그대로 쓰고 언제 서버에 다시 묻는지를, 신선도 계산과 조건부 요청·304의 규칙을 정한 RFC 9111과 9110을 따라 추적한다.
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li><code>Cache-Control: max-age</code>가 붙은 응답을 받은 캐시가 이후의 요청마다 저장·재사용·검증 가운데 무엇을 하는지 시각별로 추적한다.</li>
+<li><code>Date</code>, <code>Age</code>, 요청 시각과 응답 시각으로 응답의 현재 나이를 계산하고 신선한지 낡았는지 판정한다.</li>
+<li><code>Last-Modified</code>·<code>If-Modified-Since</code>와 <code>ETag</code>·<code>If-None-Match</code>의 왕복을 메시지 수준에서 쓰고, 서버가 조건을 평가하는 순서와 304 응답이 지켜야 할 규칙을 설명한다.</li>
+<li>사설 캐시와 공유 캐시를 구분하고 <code>public</code>, <code>private</code>, <code>s-maxage</code>, <code>Age</code>가 프록시 캐시에서 하는 일을 설명한다.</li>
+<li><code>no-cache</code>, <code>no-store</code>, <code>must-revalidate</code>를 "저장하는가, 검증 없이 재사용하는가, 오리진 서버에 닿지 않으면 어떻게 하는가"로 구분하고 자원의 성격에 맞는 지시어를 고른다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>같은 바이트를 두 번 보내지 않으려면</h3>
+
+<p>03회에서 HTTP는 무상태 프로토콜이라고 했다. 서버는 조금 전에 같은 클라이언트에게 무엇을 보냈는지 기억하지 않으므로, 같은 요청이 오면 같은 응답을 처음부터 다시 만든다. 쇼핑몰 첫 화면에 걸린 배너 이미지 <code>/img/banner.webp</code>가 491,520바이트(480KiB)라고 하자. 사용자가 상품 목록과 첫 화면을 오갈 때마다 브라우저는 이 이미지를 요청하고, 서버는 매번 같은 491,520바이트를 실어 보낸다. 이미지는 한 달에 한 번 바뀔까 말까인데도 그렇다.</p>
+
+<p>이 반복에는 세 가지 값이 든다. 첫째는 대역폭이다. 사용자의 회선과 서버의 회선이 같은 바이트를 나르는 데 쓰인다. 둘째는 시간이다. 01회에서 본 것처럼 요청이 서버에 닿고 응답이 돌아오려면 적어도 한 번의 왕복이 필요하고, 본문이 크면 TCP가 그것을 여러 세그먼트로 나누어 보내는 시간이 더해진다. 셋째는 서버의 자원이다. 파일을 읽고 소켓에 쓰는 일이 요청마다 되풀이된다.</p>
+
+<p>줄이는 방법은 두 단계로 생각할 수 있다. 가장 좋은 것은 요청을 아예 보내지 않는 것이다. 받아 둔 응답이 아직 쓸 만하다고 확신할 수 있으면 네트워크를 건드릴 이유가 없다. 그 확신이 없을 때의 차선은 요청은 보내되 본문은 받지 않는 것이다. "내가 가진 것이 아직 최신인가"만 묻고, 서버가 그렇다고 답하면 가진 것을 그대로 쓴다. 앞의 것은 신선도(freshness)에 기댄 재사용이고 뒤의 것은 검증(validation)이다. 이 장은 이 둘을 차례로 다룬다.</p>
+
+<p>문제는 "아직 쓸 만하다"를 누가 판단하느냐다. 응답을 저장해 두는 쪽은 브라우저나 중간의 프록시인데, 이들은 배너가 한 달에 한 번 바뀌는지 일 초마다 바뀌는지 알 길이 없다. 04회에서 메서드 토큰이 API 문서를 읽지 않는 참여자들에게 요청의 성격을 알려 주었듯이, 여기서도 표준이 뜻을 정해 둔 헤더가 그 일을 한다. 응답을 만든 서버가 "이 응답은 얼마 동안 다시 써도 된다", "다시 쓰기 전에 반드시 물어보라", "저장하지 마라"를 헤더에 적고, 저장하는 쪽은 그 선언에 따라 움직인다.</p>
+
+<p>이 규칙을 정한 문서는 둘이다. 저장과 재사용의 규칙은 RFC 9111(HTTP Caching)에 있고, 검증에 쓰이는 검증자 헤더와 조건부 요청(conditional request)은 RFC 9110의 8.8절과 13절에 있다. 헤더 이름 몇 개를 아는 것으로는 부족하다. 캐시가 응답의 나이를 어떻게 세는지, 서버가 조건을 어떤 순서로 평가하는지, 오리진 서버에 닿지 않을 때 캐시가 무엇을 해도 되고 무엇을 하면 안 되는지를 알아야 헤더 한 줄이 어떤 동작을 만드는지 예측할 수 있다.</p>
+
+<h3>캐시는 어디에 있고 무엇을 저장하는가</h3>
+
+<p>RFC 9111은 HTTP 캐시(cache)를 응답 메시지를 담아 두는 로컬 저장소와, 그 안의 메시지를 저장하고 꺼내고 지우는 일을 제어하는 하위 시스템이라고 정의한다. 목적도 한 문장으로 적혀 있다. 이전의 응답 메시지를 재사용해 현재의 요청을 만족시킴으로써 성능을 높이는 것이다. 이 정의에서 눈여겨볼 점은 캐시가 특정한 서버 제품을 가리키는 말이 아니라는 것이다. 응답을 저장했다가 다시 내주는 기능을 가진 참여자는 어디에 있든 캐시다.</p>
+
+<p>캐시는 요청이 지나가는 길 위의 여러 곳에 있을 수 있고, RFC 9111은 저장한 응답을 누구에게 재사용하느냐로 둘을 나눈다. 사설 캐시(private cache)는 한 사용자 전용이다. 브라우저가 가진 캐시가 대표적이다. 공유 캐시(shared cache)는 저장한 응답을 둘 이상의 사용자에게 재사용한다. 조직이나 통신사가 둔 프록시, 서비스 운영자가 오리진 서버 앞에 둔 리버스 프록시, CDN의 에지 서버가 여기에 속한다. 이 구분은 뒤에서 <code>private</code>, <code>public</code>, <code>s-maxage</code> 같은 지시어의 뜻을 가르는 기준이 된다.</p>
+
+<pre class="diagram">
+사용자 A ── [브라우저의 사설 캐시] ──┐
+                                      ├── [공유 캐시: 프록시, CDN 에지] ── [오리진 서버]
+사용자 B ── [브라우저의 사설 캐시] ──┘
+
+사설 캐시: 저장한 응답을 그 사용자 한 사람의 요청에만 재사용한다.
+공유 캐시: 저장한 응답을 A와 B 모두의 요청에 재사용한다.
+오리진 서버: 응답을 만들고, 캐시가 따라야 할 지시어를 헤더에 적는다.
+</pre>
+
+<p>캐시가 저장한 응답을 찾을 때 쓰는 열쇠가 캐시 키(cache key)다. RFC 9111 2절은 캐시 키가 최소한 요청 메서드와 대상 URI로 이루어진다고 적고, 오늘날 널리 쓰이는 캐시 상당수는 GET 응답만 저장하므로 URI만을 키로 쓴다고 덧붙인다. 02회에서 본 URI의 구성 요소 가운데 프래그먼트를 뺀 나머지, 곧 스킴·호스트·포트·경로·쿼리가 모두 대상 URI에 들어간다. 따라서 <code>/img/banner.webp</code>와 <code>/img/banner.webp?v=2</code>는 서버에서 같은 파일을 가리키더라도 캐시에게는 서로 다른 항목이다. 이 사실은 뒤에서 이미 퍼진 캐시를 무력화하는 방법의 근거가 된다.</p>
+
+<p>키에 딸린 값으로 캐시는 응답 메시지 전체, 곧 상태 코드와 헤더 필드와 본문을 저장한다. 여기에 캐시 스스로 두 가지 시각을 기록해 둔다. 그 응답을 얻으려고 요청을 보낸 시각(request_time)과 응답을 받은 시각(response_time)이다. 이 두 값은 뒤에서 응답의 나이를 계산할 때 쓰인다. 저장소를 메모리에 둘지 디스크에 둘지, 용량이 차면 무엇부터 지울지는 HTTP가 정하지 않는 구현의 몫이다.</p>
+
+<p>캐시가 하는 일은 세 가지 동사로 나뉜다. 이 셋을 구분하지 않으면 뒤에 나오는 지시어들이 서로 섞인다. 특히 "저장해도 된다"와 "묻지 않고 재사용해도 된다"는 별개의 허락이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>동작</th><th>뜻</th><th>이 동작을 제한하는 대표 지시어</th></tr></thead><tbody>
+<tr><td>저장(store)</td><td>받은 응답을 저장소에 넣는다.</td><td><code>no-store</code>는 모든 캐시의 저장을, <code>private</code>은 공유 캐시의 저장을 금지한다.</td></tr>
+<tr><td>재사용(reuse)</td><td>저장된 응답으로 이후의 요청에 답한다. 신선한 응답이면 오리진 서버에 접속하지 않는다.</td><td><code>max-age</code>가 묻지 않고 재사용할 수 있는 기간을 정한다.</td></tr>
+<tr><td>검증(validate)</td><td>재사용하기 전에 오리진 서버에 조건부 요청을 보내 저장된 응답이 아직 유효한지 확인한다.</td><td><code>no-cache</code>는 재사용할 때마다, <code>must-revalidate</code>는 낡은 뒤에는 반드시 검증하라고 요구한다.</td></tr>
+</tbody></table></div>
+
+<x-visual id="http-08-cache-locations" title="브라우저의 사설 캐시와 프록시·CDN의 공유 캐시가 사용자와 오리진 서버 사이에 놓인 위치" kind="구조 다이어그램" ratio="16:9">
+<x-hint>사설 캐시는 사용자마다 하나씩 있고 공유 캐시는 여러 사용자의 요청이 합쳐지는 지점에 있다는 것, 그리고 지시어를 정하는 쪽은 오리진 서버라는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 가로형 기술 다이어그램. 왼쪽에 노트북 아이콘 두 개를 위아래로 놓고 각각 "사용자 A", "사용자 B"라고 라벨을 붙인다. 각 노트북 바로 오른쪽에 파란색 원통 아이콘을 하나씩 두고 둘 다 "사설 캐시"라고 쓴다. 두 원통에서 나온 회색 실선 화살표가 가운데의 큰 주황색 원통 하나로 모인다. 주황색 원통의 라벨은 "공유 캐시", 그 아래 작은 글씨로 "프록시 · CDN 에지". 주황색 원통에서 오른쪽 끝의 서버 랙 아이콘으로 회색 실선 화살표 하나가 이어지고 서버 라벨은 "오리진 서버". 서버 위에는 말풍선을 두고 고정폭 글꼴로 "Cache-Control: max-age=60"이라고 쓴다. 파란 원통 아래에는 "한 사용자에게만 재사용", 주황 원통 아래에는 "여러 사용자에게 재사용"이라고 쓴다. 평면적인 선화 스타일, 색은 회색·파랑·주황 세 가지만 사용.</x-prompt>
+<x-caption>캐시는 한 곳에만 있지 않다. 사용자 전용인 사설 캐시와 여러 사용자가 함께 쓰는 공유 캐시는 같은 응답 헤더를 서로 다르게 해석한다.</x-caption>
+</x-visual>
+
+<h3>캐시 기본 동작: max-age와 신선도</h3>
+
+<p>가장 단순한 경우부터 보자. 서버가 배너 이미지를 보내면서 헤더 한 줄을 더한다.</p>
+
+<pre><code class="language-http">HTTP/1.1 200 OK
+Date: Mon, 03 Mar 2025 01:00:00 GMT
+Content-Type: image/webp
+Content-Length: 491520
+Cache-Control: max-age=60
+
+(이미지 데이터 491,520바이트)</code></pre>
+
+<p>RFC 9111 5.2.2.1절에 따르면 응답의 <code>max-age=60</code>은 이 응답의 나이가 60초를 넘으면 낡은 것으로 보라는 뜻이다. 뒤집어 말하면 그때까지는 서버에 묻지 않고 다시 써도 된다는 허락이다. RFC 9111은 두 상태에 이름을 붙인다. 나이가 아직 신선도 수명(freshness lifetime)을 넘지 않은 응답은 신선하다(fresh)고 하고, 넘은 응답은 낡았다(stale)고 한다. 판정식은 4.2절에 한 줄로 적혀 있다.</p>
+
+<pre class="diagram">
+response_is_fresh = (freshness_lifetime > current_age)
+</pre>
+
+<p>브라우저 캐시가 이 응답을 받은 뒤 같은 URI에 대한 요청이 두 번 더 일어난다고 하자. 하나는 20초 뒤, 하나는 75초 뒤다. 응답을 받는 데 걸린 시간은 무시할 만큼 짧다고 치면 캐시가 하는 일은 다음과 같다.</p>
+
+<pre class="diagram">
+시각(초)  브라우저 캐시                              오리진 서버
+   0     GET /img/banner.webp ──────────────────▶
+         ◀───────── 200 OK, max-age=60, 본문 491,520바이트
+         [저장: 응답 전체 + 요청 시각 + 응답 시각]
+
+  20     GET /img/banner.webp
+         나이 20, 수명 60  →  fresh
+         저장된 응답으로 바로 답한다           (요청이 오지 않는다)
+
+  75     GET /img/banner.webp
+         나이 75, 수명 60  →  stale
+         검증자를 실은 조건부 GET ──────────────▶
+         ◀───────── 304 Not Modified (본문 없음)
+         [저장된 응답의 헤더를 갱신 → 다시 fresh]
+</pre>
+
+<p>시각 20의 요청에서 일어나는 일을 정확히 보자. 페이지를 그리는 코드가 이미지를 요청하면 그 요청은 먼저 캐시에 닿는다. 캐시는 키로 저장된 응답을 찾고, 나이를 계산해 수명과 비교한 뒤, 신선하다고 판정하면 저장된 응답으로 답을 구성한다. 이 과정에서 DNS 조회도, TCP 연결도, 패킷 하나도 발생하지 않는다. 서버 쪽에서 보면 이 요청은 존재하지 않았다. 접근 로그에도 남지 않고 조회 수도 오르지 않는다. 캐시를 켜면 서버가 보는 요청 수와 사용자가 실제로 본 횟수가 달라지는 것은 이 때문이다.</p>
+
+<p>시각 75에는 응답이 낡았다. 여기서 흔히 하는 오해가 낡은 응답은 지워진다는 것이다. 그렇지 않다. 낡았다는 것은 "묻지 않고 써도 된다"는 허락이 끝났다는 뜻일 뿐, 저장된 본문이 틀렸다는 뜻이 아니다. 배너는 여전히 그 배너일 가능성이 높다. 그래서 캐시는 저장된 응답을 버리지 않고 서버에 유효한지만 묻는다. 서버가 304로 답하면 저장된 응답은 다시 신선해진다. 이 검증 과정은 뒤의 두 절에서 자세히 본다.</p>
+
+<pre class="diagram">
+                 200 응답을 저장
+   (없음) ─────────────────────────▶ fresh
+                                       │  ▲
+              나이가 수명에 도달        │  │  304: 헤더만 갱신, 본문은 그대로
+                                       ▼  │  200: 응답 전체를 새것으로 교체
+                                     stale ──── 조건부 요청으로 검증 ────┘
+</pre>
+
+<p>그러면 모든 응답이 저장되는가. RFC 9111 3절은 캐시가 응답을 저장하려면 다음 조건을 모두 만족해야 한다고 정한다. 하나라도 어긋나면 저장해서는 안 된다.</p>
+
+<ul>
+<li>캐시가 그 요청 메서드를 이해한다. 04회에서 본 대로 대부분의 캐시는 GET과 HEAD만 다룬다.</li>
+<li>응답의 상태 코드가 최종 상태 코드다. 1xx 같은 중간 응답은 저장 대상이 아니다.</li>
+<li>상태 코드가 206이나 304이거나 응답에 <code>must-understand</code> 지시어가 있으면, 캐시가 그 상태 코드를 이해해야 한다.</li>
+<li>응답에 <code>no-store</code> 지시어가 없다.</li>
+<li>공유 캐시라면 응답에 <code>private</code> 지시어가 없다.</li>
+<li>공유 캐시라면 요청에 <code>Authorization</code> 헤더가 없거나, 응답이 공유 캐시의 저장을 명시적으로 허용한다.</li>
+<li>응답이 다음 가운데 적어도 하나를 가진다: <code>public</code> 지시어, (공유 캐시가 아닐 때) <code>private</code> 지시어, <code>Expires</code> 헤더, <code>max-age</code> 지시어, (공유 캐시일 때) <code>s-maxage</code> 지시어, 저장을 허용하는 확장 지시어, 휴리스틱으로 캐시 가능하다고 정의된 상태 코드.</li>
+</ul>
+
+<p>마지막 조건이 중요하다. <code>Cache-Control</code>이 전혀 없는 200 응답도 "휴리스틱으로 캐시 가능한 상태 코드"에 해당하므로 저장될 수 있다. 헤더를 쓰지 않는 것이 캐시를 끄는 방법이 아니라는 뜻인데, 이 점은 다음 절의 휴리스틱 신선도에서 다시 다룬다.</p>
+
+<p>저장된 응답을 꺼내 쓸 때에도 조건이 있다. RFC 9111 4절에 따르면 요청의 대상 URI가 저장된 응답의 것과 일치하고, 요청 메서드가 저장된 응답의 재사용을 허용하며, 저장된 응답이 <code>Vary</code>로 지목한 요청 헤더들의 값이 지금 요청과 일치해야 한다. 그리고 저장된 응답이 신선하거나, 낡은 채로 내주는 것이 허용되었거나, 검증에 성공해야 한다. <code>no-cache</code>가 붙은 응답은 검증에 성공한 경우에만 쓸 수 있다. 캐시가 검증 없이 저장된 응답으로 답할 때에는 그 응답의 현재 나이를 <code>Age</code> 헤더에 적어서 내보내야 한다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>신선한 동안에는 캐시가 서버에 묻지 않으므로, 서버에서 자원이 바뀌어도 캐시는 그 사실을 알 수 없다. <code>max-age=60</code>은 성능 설정이기 전에 "앞으로 60초 동안은 누군가 옛 표현을 보더라도 괜찮다"는 서버의 약속이다. 값을 고르는 일은 얼마나 낡은 것까지 허용할지를 정하는 일이다.</p></aside>
+
+<x-visual id="http-08-freshness-timeline" title="max-age=60 응답이 저장된 뒤 시각 20의 요청은 캐시에서 끝나고 시각 75의 요청은 조건부 요청과 304로 검증되는 타임라인" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>신선한 동안의 요청은 서버에 닿지 않고, 낡은 뒤의 요청만 조건부 요청으로 서버에 가며 304를 받으면 다시 신선해진다는 흐름을 한 장에 담는다.</x-hint>
+<x-prompt>흰 배경의 세로 시퀀스 다이어그램. 위쪽에 왼쪽부터 세 개의 참여자 상자 "브라우저", "브라우저 캐시", "오리진 서버"를 놓고 각각 아래로 점선 생명선을 내린다. 왼쪽 가장자리에는 위에서 아래로 시간축을 그리고 눈금 "0초", "20초", "75초"를 표시한다. 0초 구간: 브라우저에서 캐시를 거쳐 서버까지 가는 회색 화살표 "GET", 서버에서 캐시로 돌아오는 굵은 주황색 화살표 "200 OK · max-age=60 · 본문 480KiB", 캐시 생명선 위에 초록색 상자 "저장". 20초 구간: 브라우저에서 캐시까지만 가는 화살표 "GET", 캐시에서 브라우저로 돌아오는 초록색 화살표 "fresh: 저장된 응답". 이 구간의 서버 생명선 옆에는 회색 글씨로 "요청 없음". 75초 구간: 캐시에서 서버로 가는 화살표 "GET + If-None-Match", 서버에서 캐시로 돌아오는 가는 파란색 화살표 "304 Not Modified · 본문 없음", 캐시 생명선 위에 초록색 상자 "다시 fresh". 화살표 굵기로 전송량의 차이가 드러나게 한다. 평면적인 선화 스타일.</x-prompt>
+<x-caption>신선한 동안에는 요청이 캐시에서 끝난다. 낡은 뒤에는 조건부 요청 한 번으로 본문 없이 다시 신선해질 수 있다.</x-caption>
+</x-visual>
+
+<h3>한 층 아래: 캐시는 응답의 나이를 어떻게 세는가</h3>
+
+<p>신선도 판정에는 숫자 두 개가 필요하다. 수명과 나이다. 수명부터 보면, RFC 9111 4.2.1절은 다음 규칙을 위에서부터 살펴 처음 들어맞는 것을 쓰라고 정한다.</p>
+
+<ol>
+<li>공유 캐시이고 응답에 <code>s-maxage</code> 지시어가 있으면 그 값.</li>
+<li>응답에 <code>max-age</code> 지시어가 있으면 그 값.</li>
+<li>응답에 <code>Expires</code> 헤더가 있으면 그 값에서 <code>Date</code> 헤더의 값을 뺀 것.</li>
+<li>어느 것도 없으면 명시된 만료 시간이 없는 것이고, 이때는 휴리스틱 신선도 수명을 적용할 수 있다.</li>
+</ol>
+
+<p>나이는 생각보다 단순하지 않다. "응답을 받은 뒤 흐른 시간"으로 세면 될 것 같지만, 응답은 내게 도착하기 전에 이미 나이를 먹었을 수 있다. 오리진 서버가 만든 응답이 공유 캐시에 40초 동안 저장되어 있다가 내게 왔다면, 그 응답은 도착하는 순간 이미 40살이다. 이 정보를 전하려고 헤더 두 개가 쓰인다. <code>Date</code>는 메시지가 만들어진 시각이다. RFC 9110 6.6.1절은 시계가 있는 오리진 서버가 2xx, 3xx, 4xx 응답에 <code>Date</code>를 반드시 넣도록 한다. <code>Age</code>는 캐시가 저장된 응답을 내줄 때 붙이는 헤더로, 그 응답이 오리진 서버에서 생성되거나 검증된 뒤 흐른 시간을 초 단위의 음이 아닌 정수로 적는다. RFC 9111 5.1절은 <code>Age</code>가 있다는 것 자체가 그 응답이 오리진 서버에서 방금 생성되거나 검증된 것이 아님을 뜻한다고 적는다.</p>
+
+<p>RFC 9111 4.2.3절의 계산은 다음과 같다. <code>date_value</code>는 응답의 <code>Date</code> 값, <code>age_value</code>는 응답의 <code>Age</code> 값(없으면 0), <code>request_time</code>과 <code>response_time</code>은 캐시 자신의 시계로 잰 요청·응답 시각, <code>now</code>는 지금 시각이다.</p>
+
+<pre class="diagram">
+apparent_age          = max(0, response_time - date_value)
+response_delay        = response_time - request_time
+corrected_age_value   = age_value + response_delay
+corrected_initial_age = max(apparent_age, corrected_age_value)
+resident_time         = now - response_time
+current_age           = corrected_initial_age + resident_time
+</pre>
+
+<p>앞의 네 줄은 "이 응답이 내게 도착했을 때 몇 살이었는가"를 두 가지 방법으로 추정하고 큰 쪽을 고른다. 첫째 방법(apparent_age)은 내 시계로 잰 도착 시각에서 서버가 적은 <code>Date</code>를 빼는 것이다. 두 기계의 시계가 어긋나 있으면 이 값은 틀릴 수 있고, 음수가 나오면 0으로 올린다. 둘째 방법(corrected_age_value)은 경로 위의 캐시들이 보고한 <code>Age</code>에 요청을 보내고 응답을 받기까지 걸린 시간을 더하는 것이다. 응답이 왕복 시간 가운데 어느 시점에 만들어졌는지 알 수 없으므로 왕복 시간 전체를 나이에 더해 보수적으로 잡는다. 마지막 두 줄은 거기에 내 저장소에 머문 시간을 더한다.</p>
+
+<p>이 계산을 자바로 그대로 옮겨 세 가지 상황에 넣어 보자. 시각은 모두 초 단위의 정수로 단순화했다.</p>
+
+<pre><code class="language-java">public class AgeCalc {
+
+    // 캐시가 응답 하나를 저장할 때 함께 적어 두는 값들(단위: 초)
+    record Stored(long dateValue, long ageValue, long requestTime, long responseTime, long freshnessLifetime) {}
+
+    // RFC 9111 4.2.3절의 계산을 그대로 옮긴 것
+    static long currentAge(Stored s, long now) {
+        long apparentAge = Math.max(0, s.responseTime() - s.dateValue());
+        long responseDelay = s.responseTime() - s.requestTime();
+        long correctedAgeValue = s.ageValue() + responseDelay;
+        long correctedInitialAge = Math.max(apparentAge, correctedAgeValue);
+        long residentTime = now - s.responseTime();
+        return correctedInitialAge + residentTime;
+    }
+
+    static void report(String label, Stored s, long now) {
+        long age = currentAge(s, now);
+        boolean fresh = s.freshnessLifetime() > age;
+        System.out.printf("%s: now=%d, current_age=%d, lifetime=%d -> %s%n",
+                label, now, age, s.freshnessLifetime(), fresh ? "fresh" : "stale");
+    }
+
+    public static void main(String[] args) {
+        // (가) 오리진에서 바로 받은 응답: Date=1000, Age 없음, 1000에 요청해 1001에 받음, max-age=60
+        Stored direct = new Stored(1000, 0, 1000, 1001, 60);
+        report("(가) 받은 직후", direct, 1001);
+        report("(가) 받고 59초 뒤", direct, 1060);
+        report("(가) 받고 60초 뒤", direct, 1061);
+
+        // (나) 공유 캐시가 40초 묵힌 응답: Date=1000, Age: 40, 1040에 요청해 1042에 받음, max-age=60
+        Stored viaCdn = new Stored(1000, 40, 1040, 1042, 60);
+        report("(나) 받은 직후", viaCdn, 1042);
+        report("(나) 받고 17초 뒤", viaCdn, 1059);
+        report("(나) 받고 18초 뒤", viaCdn, 1060);
+
+        // (다) 오리진 시계가 30초 빠른 경우: Date=1030인데 내 시계로는 1001에 받음
+        Stored fastClock = new Stored(1030, 0, 1000, 1001, 60);
+        report("(다) 받은 직후", fastClock, 1001);
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">(가) 받은 직후: now=1001, current_age=1, lifetime=60 -> fresh
+(가) 받고 59초 뒤: now=1060, current_age=60, lifetime=60 -> stale
+(가) 받고 60초 뒤: now=1061, current_age=61, lifetime=60 -> stale
+(나) 받은 직후: now=1042, current_age=42, lifetime=60 -> fresh
+(나) 받고 17초 뒤: now=1059, current_age=59, lifetime=60 -> fresh
+(나) 받고 18초 뒤: now=1060, current_age=60, lifetime=60 -> stale
+(다) 받은 직후: now=1001, current_age=1, lifetime=60 -> fresh</code></pre>
+
+<p>(가)는 오리진 서버에서 바로 받은 응답이다. apparent_age는 1001에서 1000을 뺀 1이고, corrected_age_value는 0에 응답 지연 1을 더한 1이라 도착 시점의 나이는 1이다. 응답을 받는 데 걸린 1초가 이미 나이에 들어간다. 그래서 받고 59초가 지난 시각 1060에 나이가 60이 되고, 판정식이 "수명이 나이보다 크다"이므로 나이가 수명과 같아지는 그 순간 응답은 낡는다.</p>
+
+<p>(나)가 이 절의 요점이다. 공유 캐시가 <code>Age: 40</code>을 붙여 준 응답은 도착하는 순간 이미 42살이다. <code>Age</code> 값 40에 응답 지연 2를 더한 값이고, apparent_age도 1042에서 1000을 뺀 42로 같다. 브라우저의 저장소에서 이 응답이 신선한 시간은 18초가 채 되지 않는다. <code>max-age</code>는 "내가 받은 때부터 60초"가 아니라 "오리진 서버가 응답을 만든 때부터 60초"다. 경로 위에 캐시가 여러 단 있어도 나이는 이어서 세어지므로, 오리진 서버의 약속보다 더 낡은 표현이 가장 바깥의 사용자에게 "신선한 것"으로 재사용되는 일은 생기지 않는다.</p>
+
+<p>(다)는 서버의 시계가 내 시계보다 30초 빠른 경우다. <code>Date</code>가 내 도착 시각보다 미래이므로 뺄셈 결과가 음수가 되고, apparent_age는 0으로 올라간다. 이때는 둘째 추정값인 1이 채택된다. 반대로 서버 시계가 느리면 apparent_age가 실제보다 크게 나와 응답이 더 빨리 낡는다. 어느 쪽으로 틀리든 두 추정값 가운데 큰 쪽을 택하므로 오차는 "더 일찍 서버에 다시 묻는" 방향으로 기운다. 성능에서는 손해지만 낡은 표현을 약속보다 오래 내주는 것보다는 안전하다.</p>
+
+<h4>Expires: 절대 시각으로 적는 만료</h4>
+
+<p><code>Expires</code>는 HTTP/1.0 때부터 있던 헤더로, 응답이 낡는 시점을 <code>Expires: Mon, 03 Mar 2025 01:01:00 GMT</code>처럼 절대 시각으로 적는다. 캐시는 이 값에서 <code>Date</code>를 빼서 수명을 얻는다. 두 값 모두 서버의 시계로 적은 것이므로 차이를 구하면 서버와 캐시의 시계 차이가 수명 계산에는 끼어들지 않는다. 그래도 날짜 형식을 정확히 만들고 해석해야 하는 부담이 남고, MDN은 형식 해석의 어려움과 구현 버그를 이 방식의 문제로 든다. HTTP/1.1이 초 단위의 상대 시간인 <code>max-age</code>를 도입한 까닭이다.</p>
+
+<p>둘이 함께 있을 때의 규칙은 분명하다. RFC 9111 5.3절은 응답에 <code>max-age</code> 지시어가 있으면 수신자가 <code>Expires</code>를 무시해야 한다고 정한다. 또 날짜 형식이 올바르지 않은 값, 특히 <code>Expires: 0</code>은 과거의 시각, 곧 이미 만료된 것으로 해석해야 한다. 오래된 코드에서 <code>Expires: 0</code>이나 <code>Expires: -1</code>을 "캐시하지 마라"의 뜻으로 쓰는 것은 이 규칙에 기댄 관습이다.</p>
+
+<h4>휴리스틱 신선도: 아무것도 적지 않았을 때</h4>
+
+<p>서버가 <code>max-age</code>도 <code>Expires</code>도 적지 않으면 어떻게 될까. RFC 9111 4.2.2절은 명시된 만료 시간이 없을 때 캐시가 스스로 수명을 추정하는 것을 허용하고 이를 휴리스틱 신선도(heuristic freshness)라고 부른다. 조건이 있다. 명시된 만료 시간이 있으면 휴리스틱을 써서는 안 되고, 상태 코드가 휴리스틱으로 캐시 가능하다고 정의된 것이거나 응답이 <code>public</code>처럼 명시적으로 캐시 가능하다고 표시된 경우에만 쓸 수 있다. RFC 9110 15.1절이 휴리스틱으로 캐시 가능하다고 정한 상태 코드는 200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501이다.</p>
+
+<p>추정의 근거로 흔히 쓰이는 것이 <code>Last-Modified</code>다. RFC는 응답에 <code>Last-Modified</code>가 있으면 그 시각부터 지금까지의 간격의 일정 비율을 넘지 않는 값을 쓰도록 권하고, 그 비율의 전형적인 설정으로 10%를 든다. 열흘 전에 마지막으로 수정된 파일이라면 하루까지는 신선한 것으로 볼 수 있다는 식이다. 오래 바뀌지 않은 것은 당분간도 바뀌지 않을 것이라는 추측이다.</p>
+
+<aside class="note">헤더를 쓰지 않으면 캐시되지 않을 것이라는 기대는 틀렸다. <code>Cache-Control</code> 없이 <code>Last-Modified</code>만 붙은 200 응답은 캐시가 스스로 정한 기간 동안 묻지 않고 재사용될 수 있고, 그 기간은 구현마다 다를 수 있다. 동작을 예측할 수 있게 하려면 모든 응답에 <code>Cache-Control</code>을 명시해야 한다. MDN의 HTTP 캐싱 안내서도 같은 권고를 한다.</aside>
+
+<h3>검증 헤더와 조건부 요청 ① Last-Modified와 If-Modified-Since</h3>
+
+<p>수명이 끝난 응답으로 돌아가자. 캐시가 가진 본문은 아직 맞을 수도 있고 틀릴 수도 있다. 캐시 혼자서는 알 수 없으니 서버에 물어야 하는데, 묻는 방법을 잘 고르면 답이 "그대로다"일 때 본문을 다시 받지 않을 수 있다. 필요한 것은 두 가지다. 서버가 표현에 붙여 주는 식별 정보와, 클라이언트가 그 정보를 요청에 실어 "이것과 같으면 본문을 보내지 마라"고 말하는 방법이다. 앞의 것을 검증자(validator)라 하고 뒤의 것을 조건부 요청이라 한다.</p>
+
+<p>가장 오래된 검증자는 표현이 마지막으로 수정된 시각이다. 서버는 응답에 <code>Last-Modified</code> 헤더를 넣는다. RFC 9110 8.8.2절은 오리진 서버가 수정 시각을 합리적으로 알아낼 수 있는 표현에는 이 헤더를 보내는 것이 좋다고 적는다. 정적 파일이라면 파일 시스템이 기록한 수정 시각을 쓰면 된다.</p>
+
+<pre><code class="language-http">HTTP/1.1 200 OK
+Date: Mon, 03 Mar 2025 01:00:00 GMT
+Content-Type: image/webp
+Content-Length: 491520
+Cache-Control: max-age=60
+Last-Modified: Sat, 01 Mar 2025 09:00:00 GMT
+
+(이미지 데이터 491,520바이트)</code></pre>
+
+<p>캐시는 이 응답을 헤더까지 통째로 저장한다. 75초 뒤 같은 URI를 요청해야 하는데 저장된 응답이 낡았다면, 캐시는 저장해 둔 <code>Last-Modified</code> 값을 <code>If-Modified-Since</code> 헤더에 그대로 옮겨 적은 GET 요청을 보낸다. "이 시각 이후로 수정되었으면 새 표현을 달라"는 뜻이다.</p>
+
+<pre><code class="language-http">GET /img/banner.webp HTTP/1.1
+Host: shop.example
+If-Modified-Since: Sat, 01 Mar 2025 09:00:00 GMT</code></pre>
+
+<p>서버의 평가 규칙은 RFC 9110 13.1.3절에 있다. 선택된 표현의 마지막 수정 시각이 헤더에 적힌 시각보다 이르거나 같으면 조건은 거짓이다. 조건이 거짓이라는 것은 "수정되었다면"이라는 전제가 성립하지 않는다는 뜻이고, 이때 서버는 본문을 보내지 않고 304 (Not Modified)로 답한다. 수정 시각이 더 나중이면 조건은 참이고 서버는 조건이 없었을 때와 똑같이 200과 새 본문을 보낸다.</p>
+
+<pre><code class="language-http">HTTP/1.1 304 Not Modified
+Date: Mon, 03 Mar 2025 01:01:15 GMT
+Cache-Control: max-age=60
+Last-Modified: Sat, 01 Mar 2025 09:00:00 GMT
+</code></pre>
+
+<p>304 응답에는 규칙이 몇 가지 있다. RFC 9110 15.4.5절에 따르면 304는 헤더 구역이 끝나는 곳에서 끝나며 본문을 가질 수 없다. 그리고 서버는 같은 요청에 200으로 답했다면 보냈을 <code>Content-Location</code>, <code>Date</code>, <code>ETag</code>, <code>Vary</code>, <code>Cache-Control</code>, <code>Expires</code>를 304에도 넣어야 한다. 그 밖의 표현 메타데이터는 캐시 갱신에 도움이 되는 경우가 아니면 넣지 않는 것이 좋다. 위 예에서 <code>Last-Modified</code>를 넣은 것은 이 응답에 <code>ETag</code>가 없어서 다음 검증에 쓸 검증자를 다시 알려 주기 위해서다. <code>Content-Type</code>이나 <code>Content-Length</code>가 빠진 것도 이 규칙 때문이다.</p>
+
+<p>304를 받은 캐시는 무엇을 하는가. RFC 9111 4.3.4절은 캐시가 저장된 응답의 헤더 필드를 304 응답이 준 헤더 필드로 갱신해야 한다고 정한다. 저장된 본문은 그대로 두고 <code>Date</code>와 <code>Cache-Control</code> 같은 헤더만 새 값으로 바뀐다. <code>Date</code>가 새로워졌으니 나이는 다시 0 근처에서 출발하고, 저장된 응답은 60초 동안 다시 신선하다. 캐시는 갱신된 헤더와 저장된 본문으로 200 응답을 구성해 요청한 쪽에 내준다. 페이지를 그리는 코드 쪽에서는 304를 볼 일이 없다.</p>
+
+<figure class="flow-figure"><figcaption>낡은 응답 하나가 검증을 거쳐 다시 신선해지기까지</figcaption><ol class="flow">
+<li><strong>낡음 판정</strong><span>캐시가 저장된 응답의 나이를 계산해 수명에 도달했음을 확인한다. 응답은 지우지 않는다.</span></li>
+<li><strong>조건부 요청 구성</strong><span>저장된 응답의 검증자를 꺼내 <code>If-Modified-Since</code>나 <code>If-None-Match</code>에 옮겨 적은 GET을 보낸다.</span></li>
+<li><strong>서버의 조건 평가</strong><span>서버가 현재 표현의 검증자와 요청의 검증자를 비교한다. 본문을 만들기 전에 판정할 수 있다면 그만큼 일을 덜 한다.</span></li>
+<li><strong>304 응답</strong><span>바뀌지 않았으면 본문 없이 헤더만 보낸다. 바뀌었으면 200과 새 본문을 보낸다.</span></li>
+<li><strong>저장된 응답 갱신</strong><span>304라면 저장된 응답의 헤더만 새 값으로 바꾸고 본문은 재사용한다. 200이라면 저장된 응답을 통째로 바꾼다.</span></li>
+</ol></figure>
+
+<p>얻는 것과 잃는 것을 정리하자. 표현이 바뀌지 않았다면 491,520바이트의 본문 대신 헤더 몇 줄만 오간다. 전송량은 크게 줄지만 왕복 한 번은 여전히 필요하다. 신선도에 의한 재사용이 왕복 0회라면 검증은 왕복 1회에 본문 0바이트다. 그래서 둘은 대체 관계가 아니라 순서 관계다. 신선한 동안에는 묻지 않고, 낡으면 가볍게 묻고, 바뀌었을 때에만 본문을 받는다.</p>
+
+<h3>검증 헤더와 조건부 요청 ② ETag와 If-None-Match</h3>
+
+<p>수정 시각은 쓰기 쉽지만 검증자로서 약점이 있다. 첫째, 해상도가 1초다. HTTP의 날짜 형식은 초 단위까지만 표현하므로 같은 1초 안에 표현이 두 번 바뀌면 둘째 변경을 구별하지 못한다. RFC 9110 8.8.2.2절이 <code>Last-Modified</code>를 기본적으로 약한 검증자로 취급하는 이유가 이것이다. 둘째, 시각이 바뀌었다고 내용이 바뀐 것은 아니다. 같은 내용의 파일을 다시 배포하면 수정 시각만 새로워지고, 캐시는 똑같은 본문을 처음부터 다시 받게 된다. 셋째, 서버가 여러 대일 때 같은 파일의 수정 시각이 서버마다 다를 수 있다. MDN도 분산된 서버들이 파일 갱신 시각을 맞추기 어렵다는 점을 이 방식의 문제로 든다. 넷째, 서버가 "이 정도 차이는 같은 것으로 치겠다"는 기준을 스스로 정할 방법이 없다.</p>
+
+<p>이 약점을 메우는 것이 엔티티 태그(entity tag)다. 서버는 표현마다 불투명한 문자열 하나를 붙여 <code>ETag</code> 헤더로 보낸다. RFC 9110 8.8.3절의 문법은 다음과 같다.</p>
+
+<pre class="diagram">
+entity-tag = [ weak ] opaque-tag
+weak       = %s"W/"
+opaque-tag = DQUOTE *etagc DQUOTE
+
+예)  ETag: "5d8c72a1"          강한 엔티티 태그
+     ETag: W/"5d8c72a1"        약한 엔티티 태그 (W/ 는 대문자여야 한다)
+</pre>
+
+<p>따옴표는 장식이 아니라 값의 일부다. 그리고 "불투명하다(opaque)"는 말이 핵심이다. 태그를 어떻게 만들지는 전적으로 서버가 정한다. 본문의 해시일 수도 있고, 데이터베이스 행의 버전 번호일 수도 있고, 수정 시각과 크기를 이어 붙인 것일 수도 있다. 클라이언트와 캐시는 그 문자열을 해석하지 않고 받은 그대로 저장했다가 그대로 돌려줄 뿐이다. 비교는 언제나 서버가 한다. 그래서 "무엇을 같은 표현으로 볼 것인가"의 결정권이 온전히 서버에 있다.</p>
+
+<p>흐름은 수정 시각의 경우와 같은 모양이다. 서버가 응답에 <code>ETag</code>를 넣고, 캐시는 낡은 응답을 검증할 때 그 값을 <code>If-None-Match</code>에 옮겨 적는다. "지금 표현의 태그가 이 가운데 어느 것과도 일치하지 않으면 새 표현을 달라"는 뜻이다. 일치하면 조건은 거짓이고 서버는 304로 답한다.</p>
+
+<pre><code class="language-http">GET /img/banner.webp HTTP/1.1
+Host: shop.example
+If-None-Match: "5d8c72a1"
+
+HTTP/1.1 304 Not Modified
+Date: Mon, 03 Mar 2025 01:01:15 GMT
+Cache-Control: max-age=60
+ETag: "5d8c72a1"
+</code></pre>
+
+<h4>강한 검증자와 약한 검증자</h4>
+
+<p>RFC 9110 8.8.1절은 검증자를 둘로 나눈다. 강한 검증자(strong validator)는 표현 데이터가 바뀔 때마다, 곧 200 응답의 본문에서 관찰될 수 있는 변화가 생길 때마다 값이 바뀌는 메타데이터다. 약한 검증자(weak validator)는 표현 데이터가 바뀌어도 값이 바뀌지 않을 수 있는 메타데이터다. 약한 검증자가 필요한 경우는 서버가 사소한 차이를 무시하고 싶을 때다. RFC는 일기 예보처럼 내용이 조금씩 계속 바뀌는 표현을 예로 든다. 숫자 하나가 달라질 때마다 캐시를 무효로 만들기보다, 의미상 같다고 볼 수 있는 동안에는 같은 약한 태그를 유지해 캐시가 적당한 기간 유효하게 한다.</p>
+
+<p>강한 태그와 약한 태그를 비교하는 함수도 둘이다. 강한 비교(strong comparison)에서는 두 태그가 모두 약하지 않고 opaque-tag가 글자 단위로 같아야 일치한다. 약한 비교(weak comparison)에서는 약함 표시와 상관없이 opaque-tag가 글자 단위로 같으면 일치한다. RFC 9110 8.8.3.2절의 예시 표는 다음과 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>태그 1</th><th>태그 2</th><th>강한 비교</th><th>약한 비교</th></tr></thead><tbody>
+<tr><td><code>W/"1"</code></td><td><code>W/"1"</code></td><td>불일치</td><td>일치</td></tr>
+<tr><td><code>W/"1"</code></td><td><code>W/"2"</code></td><td>불일치</td><td>불일치</td></tr>
+<tr><td><code>W/"1"</code></td><td><code>"1"</code></td><td>불일치</td><td>일치</td></tr>
+<tr><td><code>"1"</code></td><td><code>"1"</code></td><td>일치</td><td>일치</td></tr>
+</tbody></table></div>
+
+<p>어느 비교를 쓰는지는 조건 헤더마다 정해져 있다. <code>If-None-Match</code>는 약한 비교를 쓴다. 캐시 검증에서는 "의미상 같으면 다시 받지 않아도 된다"가 목적이기 때문이다. 반면 <code>If-Match</code>는 강한 비교를 쓴다. 이 헤더는 뒤에서 볼 것처럼 "내가 본 그 상태 그대로일 때에만 수정하라"는 뜻이어서, 바이트 하나라도 달라졌다면 일치로 보아서는 안 된다.</p>
+
+<p>강한 태그에는 놓치기 쉬운 결과가 하나 따른다. 07회에서 본 콘텐츠 코딩은 표현 데이터의 속성이다. 같은 자원이라도 gzip으로 인코딩한 표현과 인코딩하지 않은 표현은 바이트가 다르므로 강한 엔티티 태그도 달라야 한다. RFC 9110 8.8.3.3절은 같은 URI의 비압축 응답에 <code>"123-a"</code>, gzip 응답에 <code>"123-b"</code>를 붙인 예를 보여 준다. 압축을 담당하는 구성 요소와 태그를 만드는 구성 요소가 다를 때 이 규칙이 어긋나기 쉽다.</p>
+
+<h4>두 검증자가 함께 있을 때</h4>
+
+<p>서버는 두 검증자를 모두 보낼 수 있다. 캐시 쪽 규칙은 RFC 9111 4.3.1절에 있다. 저장된 응답에 엔티티 태그가 있으면 검증 요청에 반드시 그것을 실어야 하고, <code>Last-Modified</code> 값이 있으면 <code>If-Modified-Since</code>로 보내는 것이 권장된다. 그래서 두 검증자를 모두 받은 캐시의 검증 요청에는 두 조건 헤더가 함께 실린다. 서버 쪽 규칙은 RFC 9110 13.1.3절에 있다. 요청에 <code>If-None-Match</code>가 있으면 수신자는 <code>If-Modified-Since</code>를 무시해야 한다. 엔티티 태그가 더 정확한 검증자이므로 그것이 있으면 시각 비교는 하지 않는다는 뜻이다. <code>If-Modified-Since</code>는 엔티티 태그를 모르는 오래된 중간 장비를 위해 함께 보내는 것이다.</p>
+
+<x-visual id="http-08-conditional-request" title="ETag를 받은 캐시가 If-None-Match로 조건부 요청을 보내고 서버가 태그를 비교해 304 또는 200으로 답하는 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>검증자가 서버에서 캐시로 갔다가 조건 헤더에 실려 서버로 돌아오고, 비교 결과에 따라 본문 없는 304와 본문 있는 200으로 갈라지는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 가로형 시퀀스 다이어그램. 왼쪽에 "캐시", 오른쪽에 "오리진 서버"라는 두 참여자 상자를 두고 아래로 생명선을 내린다. 1단계: 서버에서 캐시로 가는 굵은 주황색 화살표, 라벨은 고정폭 글꼴로 "200 OK · ETag: \"5d8c72a1\" · 본문". 캐시 옆에 작은 메모 상자 "본문과 태그를 저장". 2단계: 캐시에서 서버로 가는 가는 회색 화살표 "GET · If-None-Match: \"5d8c72a1\"". 서버 옆에 마름모꼴 판단 기호를 그리고 안에 "현재 태그와 같은가?"라고 쓴다. 마름모에서 두 갈래 화살표가 캐시로 돌아온다. 위쪽 갈래는 가는 파란색 화살표로 라벨 "같다 → 304 Not Modified · 본문 없음", 아래쪽 갈래는 굵은 주황색 화살표로 라벨 "다르다 → 200 OK · 새 ETag · 새 본문". 캐시 쪽 끝에는 각각 "헤더만 갱신, 본문 재사용", "저장된 응답 교체"라는 메모를 붙인다. 평면적인 선화 스타일, 색은 회색·파랑·주황만 사용.</x-prompt>
+<x-caption>검증자는 서버에서 나와 캐시에 저장되었다가 조건 헤더에 실려 서버로 돌아간다. 비교는 항상 서버가 한다.</x-caption>
+</x-visual>
+
+<h3>직접 확인: JDK만으로 조건부 요청을 돌려 보기</h3>
+
+<p>지금까지의 규칙을 실행으로 확인해 보자. JDK에 들어 있는 <code>com.sun.net.httpserver.HttpServer</code>로 오리진 서버를 만들고 <code>java.net.http.HttpClient</code>로 요청을 보낸다. 이 예제의 클라이언트는 캐시를 쓰지 않고 조건 헤더를 손으로 붙인다. 캐시가 알아서 해 주는 일을 한 단계씩 눈으로 보기 위해서다. 서버는 <code>/notice</code>라는 자원 하나를 가지고 있고, GET에서는 <code>If-None-Match</code>와 <code>If-Modified-Since</code>를, PUT에서는 <code>If-Match</code>를 평가한다. 엔티티 태그는 본문의 SHA-256 해시 앞 8바이트를 16진수로 적은 것이다.</p>
+
+<pre><code class="language-java">import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.HexFormat;
+import java.util.Locale;
+
+public class ConditionalDemo {
+
+    // HTTP-date(IMF-fixdate): 일(day)은 항상 두 자리, 시간대는 항상 GMT
+    static final DateTimeFormatter HTTP_DATE = DateTimeFormatter
+            .ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US).withZone(ZoneOffset.UTC);
+
+    // 오리진 서버가 가진 자원의 현재 상태
+    static byte[] content = "v1: hello cache\n".getBytes(StandardCharsets.UTF_8);
+    static Instant lastModified = Instant.parse("2025-03-01T09:00:00Z");
+
+    static String etagOf(byte[] data) throws Exception {
+        byte[] hash = MessageDigest.getInstance("SHA-256").digest(data);
+        return '"' + HexFormat.of().formatHex(hash, 0, 8) + '"';   // 따옴표까지가 엔티티 태그다
+    }
+
+    // 약한 비교: W/ 접두사를 떼고 opaque-tag만 글자 단위로 비교한다
+    static boolean weakMatch(String fieldValue, String current) {
+        if (fieldValue.trim().equals("*")) return true;
+        for (String tag : fieldValue.split(",")) {
+            tag = tag.trim();
+            if (tag.startsWith("W/")) tag = tag.substring(2);
+            if (tag.equals(current)) return true;
+        }
+        return false;
+    }
+
+    // 강한 비교: 양쪽 모두 약한 태그가 아니어야 하고 글자 단위로 같아야 한다
+    static boolean strongMatch(String fieldValue, String current) {
+        if (fieldValue.trim().equals("*")) return true;
+        for (String tag : fieldValue.split(",")) {
+            if (tag.trim().equals(current)) return true;   // W/로 시작하면 여기서 걸러진다
+        }
+        return false;
+    }
+
+    static synchronized void handle(HttpExchange ex) throws java.io.IOException {
+        try (ex) {
+            String etag = etagOf(content);
+            var req = ex.getRequestHeaders();
+            var res = ex.getResponseHeaders();
+
+            if (ex.getRequestMethod().equals("PUT")) {
+                String ifMatch = req.getFirst("If-Match");
+                if (ifMatch != null && !strongMatch(ifMatch, etag)) {
+                    ex.sendResponseHeaders(412, -1);             // 전제 조건 실패: 아무것도 바꾸지 않는다
+                    return;
+                }
+                content = ex.getRequestBody().readAllBytes();
+                lastModified = Instant.parse("2025-03-02T10:30:00Z");   // 출력이 매번 같도록 고정한 값
+                res.set("ETag", etagOf(content));                // 받은 본문을 변형 없이 저장했으므로 새 태그를 알려 준다
+                ex.sendResponseHeaders(204, -1);
+                return;
+            }
+
+            // GET: If-None-Match가 있으면 그것만 본다. 없을 때에만 If-Modified-Since를 본다.
+            String ifNoneMatch = req.getFirst("If-None-Match");
+            String ifModifiedSince = req.getFirst("If-Modified-Since");
+            boolean notModified;
+            if (ifNoneMatch != null) {
+                notModified = weakMatch(ifNoneMatch, etag);
+            } else if (ifModifiedSince != null) {
+                Instant since = Instant.from(HTTP_DATE.parse(ifModifiedSince));
+                notModified = !lastModified.isAfter(since);     // 수정 시각 <= 조건 시각이면 바뀌지 않은 것
+            } else {
+                notModified = false;
+            }
+
+            res.set("ETag", etag);
+            res.set("Cache-Control", "max-age=60");
+            if (notModified) {
+                ex.sendResponseHeaders(304, -1);                 // 헤더만 보내고 끝낸다
+                return;
+            }
+            res.set("Last-Modified", HTTP_DATE.format(lastModified));
+            res.set("Content-Type", "text/plain; charset=utf-8");
+            ex.sendResponseHeaders(200, content.length);
+            ex.getResponseBody().write(content);
+        } catch (Exception e) {
+            throw new java.io.IOException(e);
+        }
+    }
+
+    static HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
+    static URI uri;
+
+    static HttpResponse<byte[]> send(String label, String method, String body, String... headers) throws Exception {
+        var builder = HttpRequest.newBuilder(uri)
+                .method(method, body == null ? HttpRequest.BodyPublishers.noBody()
+                                             : HttpRequest.BodyPublishers.ofString(body));
+        if (headers.length > 0) builder.headers(headers);
+        HttpResponse<byte[]> r = client.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+        System.out.printf("%s -> %d, 본문 %d바이트, ETag=%s%n", label, r.statusCode(), r.body().length,
+                r.headers().firstValue("ETag").orElse("-"));
+        return r;
+    }
+
+    public static void main(String[] args) throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/notice", ConditionalDemo::handle);
+        server.start();
+        uri = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/notice");
+        try {
+            var first = send("1. GET (조건 없음)", "GET", null);
+            String etag = first.headers().firstValue("ETag").orElseThrow();
+            String modified = first.headers().firstValue("Last-Modified").orElseThrow();
+            System.out.println("   Last-Modified=" + modified);
+
+            send("2. GET If-None-Match(같은 태그)", "GET", null, "If-None-Match", etag);
+            send("3. GET If-Modified-Since", "GET", null, "If-Modified-Since", modified);
+            send("4. GET If-None-Match(W/ 붙임)", "GET", null, "If-None-Match", "W/" + etag);
+            send("5. PUT If-Match(엉뚱한 태그)", "PUT", "v2: lost?\n", "If-Match", "\"0000000000000000\"");
+            send("6. PUT If-Match(현재 태그)", "PUT", "v2: updated body\n", "If-Match", etag);
+            send("7. GET If-None-Match(옛 태그)", "GET", null, "If-None-Match", etag);
+            send("8. GET 옛 태그 + 미래 시각", "GET", null,
+                    "If-None-Match", etag, "If-Modified-Since", "Fri, 01 Jan 2100 00:00:00 GMT");
+            send("9. GET If-Modified-Since(미래)", "GET", null,
+                    "If-Modified-Since", "Fri, 01 Jan 2100 00:00:00 GMT");
+        } finally {
+            server.stop(0);
+        }
+    }
+}</code></pre>
+
+<p>실행하면 다음이 출력된다. 서버가 쓰는 포트는 운영체제가 고르지만 출력에는 나타나지 않고, 태그는 본문의 해시이므로 실행할 때마다 같다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">1. GET (조건 없음) -> 200, 본문 16바이트, ETag="16135482dcfb1850"
+   Last-Modified=Sat, 01 Mar 2025 09:00:00 GMT
+2. GET If-None-Match(같은 태그) -> 304, 본문 0바이트, ETag="16135482dcfb1850"
+3. GET If-Modified-Since -> 304, 본문 0바이트, ETag="16135482dcfb1850"
+4. GET If-None-Match(W/ 붙임) -> 304, 본문 0바이트, ETag="16135482dcfb1850"
+5. PUT If-Match(엉뚱한 태그) -> 412, 본문 0바이트, ETag=-
+6. PUT If-Match(현재 태그) -> 204, 본문 0바이트, ETag="33ae73a2c37fb74f"
+7. GET If-None-Match(옛 태그) -> 200, 본문 17바이트, ETag="33ae73a2c37fb74f"
+8. GET 옛 태그 + 미래 시각 -> 200, 본문 17바이트, ETag="33ae73a2c37fb74f"
+9. GET If-Modified-Since(미래) -> 304, 본문 0바이트, ETag="33ae73a2c37fb74f"</code></pre>
+
+<p>한 줄씩 따라가 보자. 1번은 조건 없는 GET이다. 서버는 200과 16바이트의 본문, 그리고 <code>ETag</code>, <code>Last-Modified</code>, <code>Cache-Control</code>을 보낸다. 캐시라면 이 응답을 통째로 저장했을 것이다. 2번은 받은 태그를 <code>If-None-Match</code>에 그대로 실은 요청이다. 서버의 <code>weakMatch</code>가 현재 태그와 일치함을 확인하고, 핸들러는 <code>sendResponseHeaders(304, -1)</code>로 헤더만 보낸다. 본문은 0바이트인데 출력의 <code>ETag</code> 칸이 채워져 있는 것에 주목하자. 200이었다면 보냈을 <code>ETag</code>와 <code>Cache-Control</code>을 304에도 넣었기 때문이다.</p>
+
+<p>3번은 <code>If-Modified-Since</code>만 실은 요청이다. 서버의 수정 시각이 조건 시각보다 나중이 아니므로 304다. 4번은 같은 태그 앞에 <code>W/</code>를 붙여 보낸 것이다. 약한 비교는 약함 표시를 떼고 비교하므로 역시 304가 나온다. 캐시 검증에서는 약한 태그와 강한 태그가 섞여도 일치로 본다는 표의 셋째 줄을 그대로 보여 준다.</p>
+
+<p>5번과 6번은 PUT이다. 5번은 현재 표현의 것이 아닌 태그를 <code>If-Match</code>에 실었으므로 서버는 본문을 읽지도 않고 412 (Precondition Failed)로 답하며 자원은 바뀌지 않는다. 6번은 현재 태그를 실었으므로 수정이 적용되고, 서버는 새 표현의 태그를 204 응답에 담아 알려 준다. RFC 9110 9.3.4절은 PUT의 성공 응답에 검증자를 넣어도 되는 경우를 요청의 표현 데이터를 변형 없이 저장했고 검증자가 새 표현을 반영할 때로 제한한다. 서버가 받은 본문을 고쳐서 저장했다면 클라이언트가 가진 본문과 서버의 표현이 다르므로, 그 태그를 클라이언트의 본문에 붙여서는 안 되기 때문이다.</p>
+
+<p>7번은 옛 태그로 검증을 시도한 것이다. 태그가 달라졌으므로 조건은 참이고 서버는 200과 17바이트의 새 본문, 새 태그를 보낸다. 8번과 9번은 짝으로 보아야 한다. 둘 다 2100년이라는 미래 시각을 <code>If-Modified-Since</code>에 실었다. 이 조건만 있는 9번에서는 서버가 "그 시각 이후로 수정된 적이 없다"고 판정해 304를 보낸다. 그런데 같은 헤더에 일치하지 않는 <code>If-None-Match</code>를 함께 실은 8번은 200이다. <code>If-None-Match</code>가 있으면 <code>If-Modified-Since</code>는 평가되지 않는다는 규칙이 코드의 <code>if</code>와 <code>else if</code> 순서로 구현되어 있고, 결과가 그것을 확인해 준다.</p>
+
+<h4>서버가 조건을 평가하는 순서</h4>
+
+<p>조건 헤더가 여럿일 때의 순서는 RFC 9110 13.2.2절이 정한다. 예제의 핸들러는 이 가운데 필요한 부분만 구현한 것이다.</p>
+
+<ol>
+<li><code>If-Match</code>가 있으면 평가한다. 거짓이면 412로 답한다. 다만 상태를 바꾸는 요청이 이미 성공했다고 판단할 수 있으면 예외로 할 수 있다.</li>
+<li><code>If-Match</code>가 없고 <code>If-Unmodified-Since</code>가 있으면 평가한다. 거짓이면 같은 예외 아래 412로 답한다.</li>
+<li><code>If-None-Match</code>가 있으면 평가한다. 거짓이면 GET과 HEAD에는 304, 그 밖의 메서드에는 412로 답한다.</li>
+<li>메서드가 GET이나 HEAD이고 <code>If-None-Match</code>가 없으며 <code>If-Modified-Since</code>가 있으면 평가한다. 거짓이면 304로 답한다.</li>
+<li>메서드가 GET이고 <code>Range</code>와 <code>If-Range</code>가 함께 있으면 평가한다. 참이면 요청한 범위를 206으로 보내고, 거짓이면 <code>Range</code>를 무시하고 200으로 전체를 보낸다.</li>
+<li>여기까지 걸리지 않았으면 메서드를 수행하고 그 결과로 답한다.</li>
+</ol>
+
+<p>이 순서에는 두 가지 생각이 담겨 있다. 하나는 엔티티 태그 조건이 날짜 조건보다 앞선다는 것이다. 태그 조건이 있으면 같은 종류의 날짜 조건은 건너뛴다. 다른 하나는 "바뀌지 않았어야 수행하라"는 보호 조건(<code>If-Match</code>, <code>If-Unmodified-Since</code>)이 "바뀌었으면 달라"는 검증 조건보다 먼저라는 것이다. 보호 조건이 실패했는데 304가 나가는 일은 없다. 여기에 13.2.1절의 규칙이 하나 더 겹친다. 조건이 없었더라도 2xx나 412가 아닌 응답이 나갔을 요청이라면 서버는 조건을 모두 무시해야 한다. 존재하지 않는 자원에는 404가, 권한이 없는 요청에는 401이나 403이 조건 평가보다 먼저다.</p>
+
+<h4>날짜 형식에서 틀리기 쉬운 것</h4>
+
+<p>예제가 날짜 포매터를 직접 만든 데에는 이유가 있다. RFC 9110 5.6.7절은 HTTP의 날짜를 보내는 쪽이 IMF-fixdate 형식으로 만들어야 한다고 정하고, 그 문법에서 일(day)은 두 자리 숫자다. 예시는 <code>Sun, 06 Nov 1994 08:49:37 GMT</code>다. 그런데 자바의 <code>DateTimeFormatter.RFC_1123_DATE_TIME</code>으로 2025년 3월 1일 09시(UTC)를 출력하면 JDK 21에서 <code>Sat, 1 Mar 2025 09:00:00 GMT</code>가 나온다. 일이 한 자리로 출력되어 IMF-fixdate의 문법에 맞지 않는다. 그래서 예제는 <code>dd</code>를 쓴 패턴을 직접 지정했다.</p>
+
+<p>패턴에 <code>Locale.US</code>를 준 것도 같은 이유다. 요일과 달 이름은 영어 약어여야 하고 HTTP-date는 대소문자를 구별한다. 로케일을 주지 않으면 실행 환경의 기본 로케일로 요일과 달 이름이 만들어지므로, 서버를 어디에서 띄우느냐에 따라 헤더가 달라진다. 형식이 어긋난 날짜는 조용히 실패한다. RFC 9110 13.1.3절은 <code>If-Modified-Since</code>의 값이 올바른 HTTP-date가 아니면 수신자가 그 헤더를 무시해야 한다고 정하므로, 오류는 나지 않고 검증이 한 번도 성공하지 않은 채 매번 본문 전체가 오가게 된다.</p>
+
+<h3>캐시와 조건부 요청 헤더를 한자리에</h3>
+
+<p>등장한 헤더를 역할별로 정리하자. 캐시에 관여하는 헤더는 세 무리다. 캐시의 저장과 재사용을 지시하는 헤더, 표현에 붙는 검증자, 검증자를 실어 보내는 조건부 요청 헤더다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>무리</th><th>헤더</th><th>방향</th><th>하는 일</th></tr></thead><tbody>
+<tr><td rowspan="4">캐시 제어</td><td><code>Cache-Control</code></td><td>요청·응답</td><td>지시어의 목록으로 저장, 재사용, 검증의 조건을 정한다.</td></tr>
+<tr><td><code>Expires</code></td><td>응답</td><td>낡는 시점을 절대 시각으로 적는다. <code>max-age</code>가 있으면 무시된다.</td></tr>
+<tr><td><code>Age</code></td><td>응답</td><td>캐시가 내준 응답의 나이를 초로 적는다.</td></tr>
+<tr><td><code>Pragma</code></td><td>요청</td><td>HTTP/1.0 캐시를 위한 <code>no-cache</code> 요청. RFC 9111이 폐기 예정으로 지정했다.</td></tr>
+<tr><td rowspan="2">검증자</td><td><code>ETag</code></td><td>응답</td><td>표현을 식별하는 불투명한 태그. 강한 태그와 약한 태그가 있다.</td></tr>
+<tr><td><code>Last-Modified</code></td><td>응답</td><td>표현이 마지막으로 수정된 시각. 해상도는 1초다.</td></tr>
+<tr><td rowspan="5">조건부 요청</td><td><code>If-None-Match</code></td><td>요청</td><td>태그가 어느 것과도 일치하지 않을 때에만 수행. 약한 비교. 캐시 검증의 주된 수단이다.</td></tr>
+<tr><td><code>If-Modified-Since</code></td><td>요청</td><td>그 시각 이후에 수정되었을 때에만 표현을 전송. GET과 HEAD에만 적용된다.</td></tr>
+<tr><td><code>If-Match</code></td><td>요청</td><td>태그가 일치할 때에만 수행. 강한 비교. 갱신 손실을 막는 데 쓴다.</td></tr>
+<tr><td><code>If-Unmodified-Since</code></td><td>요청</td><td>그 시각 이후에 수정되지 않았을 때에만 수행.</td></tr>
+<tr><td><code>If-Range</code></td><td>요청</td><td>표현이 그대로이면 <code>Range</code>로 요청한 부분만, 바뀌었으면 전체를 달라.</td></tr>
+</tbody></table></div>
+
+<p><code>Cache-Control</code>의 값은 쉼표로 구분한 지시어의 목록이다. 지시어 이름은 대소문자를 구별하지 않지만, MDN은 대문자를 인식하지 못하는 구현이 있으므로 소문자로 쓰기를 권한다. 응답에 쓰는 지시어 가운데 RFC 9111이 정의한 것과 널리 쓰이는 확장을 표로 모으면 다음과 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>응답 지시어</th><th>뜻</th></tr></thead><tbody>
+<tr><td><code>max-age=N</code></td><td>나이가 N초를 넘으면 낡은 것으로 본다.</td></tr>
+<tr><td><code>s-maxage=N</code></td><td>공유 캐시에서는 이 값이 <code>max-age</code>와 <code>Expires</code>를 대신한다. 사설 캐시는 무시한다.</td></tr>
+<tr><td><code>no-cache</code></td><td>저장은 해도 되지만, 검증에 성공하기 전에는 다른 요청에 재사용해서는 안 된다.</td></tr>
+<tr><td><code>no-store</code></td><td>요청과 응답의 어느 부분도 저장해서는 안 된다.</td></tr>
+<tr><td><code>must-revalidate</code></td><td>낡은 뒤에는 검증에 성공하기 전까지 재사용해서는 안 된다. 오리진 서버에 닿지 않으면 오류 응답을 내야 한다.</td></tr>
+<tr><td><code>proxy-revalidate</code></td><td><code>must-revalidate</code>와 같되 공유 캐시에만 적용된다.</td></tr>
+<tr><td><code>private</code></td><td>공유 캐시는 저장해서는 안 된다. 사설 캐시는 저장할 수 있다.</td></tr>
+<tr><td><code>public</code></td><td>평소라면 저장이 금지되는 경우에도 저장해도 된다고 명시한다.</td></tr>
+<tr><td><code>no-transform</code></td><td>중간 장비가 콘텐츠를 변형하지 말 것을 요구한다.</td></tr>
+<tr><td><code>must-understand</code></td><td>그 응답의 상태 코드에 대한 요구 사항을 이해하고 따르는 캐시만 저장하도록 제한한다.</td></tr>
+<tr><td><code>immutable</code></td><td>RFC 8246의 확장. 신선한 동안에는 응답이 갱신되지 않음을 알린다.</td></tr>
+<tr><td><code>stale-while-revalidate=N</code>, <code>stale-if-error=N</code></td><td>낡은 응답을 백그라운드 검증 중에, 또는 오류가 났을 때 일정 시간 재사용해도 된다고 허락하는 확장이다.</td></tr>
+</tbody></table></div>
+
+<p><code>Cache-Control</code>은 요청에도 쓸 수 있다. 이때는 클라이언트가 캐시에게 바라는 바를 적는다. <code>max-age=N</code>은 나이가 N초 이하인 응답을 원한다는 뜻이고, <code>no-cache</code>는 저장된 응답을 오리진 서버의 검증 없이 쓰지 말아 달라는 뜻이다. <code>max-stale</code>은 낡은 응답도 받겠다는 뜻, <code>min-fresh=N</code>은 앞으로 N초 이상 신선할 응답을 원한다는 뜻, <code>only-if-cached</code>는 저장된 응답만 받겠다는 뜻이다. <code>no-store</code>와 <code>no-transform</code>은 요청에서도 응답에서와 같은 뜻이다.</p>
+
+<p>지시어가 서로 어긋날 때의 지침도 RFC 9111 4.2.1절에 있다. 같은 지시어가 여러 번 나오면 첫 번째 것을 쓰거나 응답을 낡은 것으로 보아야 하고, <code>max-age</code>와 <code>no-cache</code>처럼 서로 충돌하는 지시어가 함께 있으면 가장 제한적인 쪽을 따라야 한다. 모호할 때에는 덜 재사용하는 쪽으로 기운다는 원칙이다.</p>
+
+<p><code>Pragma: no-cache</code>는 <code>Cache-Control</code>이 없던 HTTP/1.0 캐시에게 클라이언트가 "저장된 것을 쓰지 말라"고 요청하려고 만든 요청 헤더다. RFC 9111 5.4절은 <code>Cache-Control</code>이 널리 지원된다는 이유로 <code>Pragma</code>를 폐기 예정(deprecated)으로 지정했다. 응답에 <code>Pragma: no-cache</code>를 넣는 관습도 흔하지만, 같은 절은 응답에서의 의미가 명세된 적이 없으므로 응답의 <code>Cache-Control: no-cache</code>를 믿을 만하게 대신하지 못한다고 적는다.</p>
+
+<h3>프록시 캐시: 여러 사용자가 함께 쓰는 캐시</h3>
+
+<p>브라우저의 사설 캐시에는 한계가 있다. 같은 사용자가 같은 URI를 다시 요청할 때에만 효과가 있다. 처음 방문한 사용자는 아무 혜택도 받지 못하고, 오리진 서버가 사용자에게서 멀리 있으면 그 첫 요청은 01회에서 본 대로 먼 거리를 왕복해야 한다. 공유 캐시는 이 두 가지를 함께 줄인다. 사용자와 가까운 곳에 응답의 사본을 두고, 한 사용자의 요청으로 저장된 응답을 다음 사용자의 요청에 재사용한다. 오리진 서버는 같은 자원에 대한 수많은 요청 가운데 캐시가 낡았을 때의 검증 요청만 받게 된다.</p>
+
+<p>공유 캐시는 누가 운영하느냐로 다시 둘로 나눌 수 있다. MDN의 분류를 따르면 프록시 캐시는 네트워크 쪽에서 트래픽을 줄이려고 둔 것으로 서비스 개발자가 관리하지 않는다. 관리형 캐시(managed cache)는 서비스 개발자가 오리진 서버의 부하를 덜려고 직접 배치한 것으로 리버스 프록시와 CDN이 여기에 든다. 오늘날에는 뒤쪽이 중심이다. 통신이 HTTPS로 암호화되면 경로 중간의 프록시는 내용을 볼 수 없어 바이트를 터널로 중계할 뿐 캐시로 동작하지 못하는 경우가 많기 때문이다. CDN이 캐시할 수 있는 것은 서비스 운영자가 CDN에게 TLS 연결의 종단을 맡겼기 때문이다.</p>
+
+<p>여러 사용자가 함께 쓴다는 성질은 위험도 만든다. 로그인한 사용자의 주문 내역을 내주는 <code>GET /orders</code>를 생각해 보자. 사용자 A의 요청에 대한 응답을 공유 캐시가 저장하고, 곧이어 사용자 B가 같은 URI를 요청한다. 캐시 키는 메서드와 URI이므로 두 요청의 키는 같다. 요청에 실린 쿠키가 다르다는 사실은 키에 반영되지 않는다. 캐시가 저장된 응답을 그대로 내주면 B는 A의 주문 내역을 보게 된다. 이것은 성능 문제가 아니라 정보 유출이다.</p>
+
+<p>이를 막는 장치가 사설과 공유의 구분에 맞춘 지시어들이다.</p>
+
+<ul>
+<li><b><code>private</code></b>: 이 응답은 한 사용자를 위한 것이므로 공유 캐시가 저장해서는 안 된다. 브라우저의 사설 캐시는 저장할 수 있다. 개인화된 응답에는 이것을 붙인다.</li>
+<li><b><code>public</code></b>: 평소라면 저장이 금지되는 경우에도 저장해도 된다고 명시한다. 대표적인 경우가 <code>Authorization</code> 헤더가 있는 요청이다. RFC 9111 3.5절은 공유 캐시가 <code>Authorization</code>이 있는 요청에 대한 응답을 재사용해서는 안 된다고 정하고, 응답에 <code>public</code>, <code>must-revalidate</code>, <code>s-maxage</code> 가운데 하나가 있을 때에만 예외로 한다.</li>
+<li><b><code>s-maxage</code></b>: 공유 캐시 전용의 수명이다. 공유 캐시에서는 이 값이 <code>max-age</code>와 <code>Expires</code>보다 우선하고, 사설 캐시는 이 지시어를 무시한다. RFC 9111은 이 지시어가 <code>proxy-revalidate</code>의 의미도 함께 가진다고 적는다. 공유 캐시는 이 응답이 낡으면 검증 없이 재사용할 수 없다.</li>
+</ul>
+
+<p>여기서 두 가지를 바로잡아 두자. 첫째, <code>public</code>은 "공유 캐시에 저장되게 하려면 붙여야 하는 것"이 아니다. <code>max-age</code>가 있는 평범한 응답은 <code>public</code> 없이도 공유 캐시에 저장된다. MDN은 <code>Authorization</code>이 있는 요청의 응답을 저장하게 할 필요가 있을 때에만 <code>public</code>을 쓰라고 권한다. 둘째, 쿠키는 <code>Authorization</code>과 같은 보호를 받지 못한다. 쿠키로 사용자를 구별해 응답을 달리 만든다는 사실을 캐시는 알 수 없다. 개인화된 응답을 공유 캐시로부터 지키는 책임은 <code>private</code>이나 <code>no-store</code>를 붙이는 서버에 있다.</p>
+
+<h4>두 단의 캐시와 Age</h4>
+
+<p>CDN을 앞에 둔 서비스가 정적 자원에 <code>Cache-Control: max-age=60, s-maxage=600</code>을 붙였다고 하자. 브라우저에서는 60초, CDN에서는 600초 동안 신선하게 하려는 의도다. 오리진 서버가 응답을 만든 시각을 0으로 두고, 전송 지연은 무시한 채 세 사용자의 요청을 따라가 본다.</p>
+
+<pre class="diagram">
+시각    사용자         CDN(공유 캐시, 수명 600)              브라우저(사설 캐시, 수명 60)
+   0    A가 요청       저장된 응답 없음 → 오리진에서 받아 저장    나이 0에서 출발 → 60초 동안 fresh
+  30    B가 요청       나이 30 → fresh, "Age: 30"을 붙여 응답    나이 30에서 출발 → 30초 동안 fresh
+ 200    C가 요청       나이 200 → fresh, "Age: 200"을 붙여 응답  나이 200에서 출발 → 받자마자 stale
+ 700    D가 요청       나이 700 → stale, 오리진에 조건부 요청     304를 받은 CDN이 헤더 갱신 후 응답
+</pre>
+
+<p>B의 브라우저가 받은 응답은 30살에서 출발한다. 앞에서 계산한 대로 <code>max-age</code>는 오리진 서버가 응답을 만든 때부터 세기 때문이다. C의 경우가 더 눈에 띈다. CDN은 600초 수명 안에 있으므로 저장된 응답을 내주지만, 그 응답의 나이 200은 브라우저가 적용하는 수명 60을 이미 넘었다. RFC의 계산을 그대로 따르면 이 응답은 브라우저 캐시에 저장되더라도 처음부터 낡은 상태다. C가 같은 자원을 다시 쓰려면 매번 검증 요청을 보내야 한다. 다만 그 요청은 CDN까지만 가면 된다. RFC 9111 4.3.2절에 따라 캐시는 조건부 요청을 받으면 자신이 가진 응답의 검증자와 비교해 304로 답할 수 있다. <code>s-maxage</code>를 <code>max-age</code>보다 길게 잡는 구성에서는 사용자 쪽의 이득이 "요청 없음"이 아니라 "가까운 곳에서 오는 304"로 바뀔 수 있다는 점을 계산에 넣어야 한다.</p>
+
+<h4>Vary: 같은 URI의 다른 표현</h4>
+
+<p>07회에서 본 콘텐츠 협상은 같은 URI에 대해 요청 헤더에 따라 다른 표현을 내준다. 캐시 키가 메서드와 URI뿐이라면 한국어 표현을 저장한 캐시가 영어를 원하는 요청에도 그것을 내줄 것이다. 서버는 응답에 <code>Vary: Accept-Language</code>처럼 표현 선택에 쓰인 요청 헤더의 이름을 적어 이를 막는다. RFC 9111 4.1절에 따라 캐시는 <code>Vary</code>가 지목한 요청 헤더들의 값이 저장 당시의 요청과 지금 요청에서 일치할 때에만 저장된 응답을 검증 없이 쓸 수 있다. 지목된 헤더가 사실상 보조 키가 되는 셈이다. 값의 가짓수가 많은 헤더를 지목하면 그만큼 캐시가 재사용될 기회가 줄어든다. MDN은 <code>User-Agent</code>를 그런 예로 든다.</p>
+
+<x-visual id="http-08-two-tier-age" title="CDN의 공유 캐시와 브라우저의 사설 캐시가 같은 응답에 서로 다른 수명을 적용하고 Age 헤더로 나이를 이어서 세는 모습" kind="타임라인 다이어그램" ratio="16:9">
+<x-hint>s-maxage는 공유 캐시가, max-age는 사설 캐시가 쓰고, 나이는 오리진 서버가 응답을 만든 때부터 이어서 세어지기 때문에 늦게 받은 사용자일수록 브라우저에서 신선한 시간이 짧다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 가로형 타임라인 다이어그램. 맨 위에 고정폭 글꼴로 "Cache-Control: max-age=60, s-maxage=600"이라고 쓴다. 그 아래 가로 시간축을 그리고 눈금 "0초", "30초", "200초", "600초"를 표시한다. 시간축 바로 아래에 0초부터 600초까지 이어지는 긴 주황색 막대를 그리고 라벨 "CDN: fresh (s-maxage=600)"을 붙인다. 그 아래로 세 줄의 짧은 막대를 그린다. 첫 줄 "사용자 A의 브라우저": 0초에서 60초까지 초록색 막대, 라벨 "60초 fresh". 둘째 줄 "사용자 B의 브라우저": 30초 지점에서 시작해 60초에서 끝나는 초록색 막대, 시작점 위에 작은 말풍선 "Age: 30", 막대 라벨 "30초 fresh". 셋째 줄 "사용자 C의 브라우저": 200초 지점에 초록색 막대 없이 회색 점 하나만 찍고 말풍선 "Age: 200", 옆에 빨간색 글씨로 "받자마자 stale". 주황 막대에서 세 줄의 시작점으로 가는 가는 점선 화살표를 그려 응답이 CDN에서 왔음을 나타낸다. 평면적인 스타일, 색은 주황·초록·회색·빨강만 사용.</x-prompt>
+<x-caption>나이는 캐시를 건너갈 때마다 다시 시작하지 않는다. 공유 캐시에서 오래 머문 응답은 사설 캐시에서 신선한 시간이 그만큼 짧다.</x-caption>
+</x-visual>
+
+<h3>캐시 무효화 ① 캐시되지 않게, 또는 매번 확인하게 하는 응답</h3>
+
+<p>"캐시 무효화"라는 말은 두 가지 일을 가리킨다. 하나는 어떤 응답이 캐시에 남지 않게 하거나 남더라도 매번 서버에 확인하게 만드는 것이고, 다른 하나는 이미 저장된 응답을 더 쓰지 못하게 하는 것이다. 이 절은 앞의 것을, 다음 절은 뒤의 것을 다룬다. 앞의 일에 쓰이는 지시어는 셋이고, 이름이 비슷해서 자주 혼동된다. 각각이 "저장", "검증 없는 재사용", "오리진 서버에 닿지 않을 때의 행동" 가운데 무엇을 건드리는지로 구분해야 한다.</p>
+
+<p><b><code>no-store</code></b>는 저장 자체를 금지한다. RFC 9111 5.2.2.5절의 표현으로는 캐시가 요청과 응답의 어느 부분도 저장해서는 안 된다. 저장된 것이 없으니 재사용도 검증도 일어나지 않고, 요청마다 본문 전체가 오간다. 같은 절은 이 지시어가 프라이버시를 보장하는 신뢰할 만하거나 충분한 수단은 아니라고 덧붙인다. 규칙을 지키지 않는 캐시나 도청까지 막아 주지는 못한다는 뜻이다.</p>
+
+<p><b><code>no-cache</code></b>는 이름과 달리 저장을 막지 않는다. 막는 것은 검증 없는 재사용이다. RFC 9111 5.2.2.4절에 따르면 이 응답은 검증 요청을 보내 성공 응답을 받기 전에는 다른 요청에 쓰여서는 안 된다. 캐시는 응답을 저장해 두고, 쓸 때마다 조건부 요청을 보내고, 304를 받으면 저장된 본문을 쓴다. 항상 최신임을 보장하면서도 바뀌지 않았을 때 본문 전송을 아낀다. "수명이 0인 캐시"라고 생각하면 된다.</p>
+
+<p><b><code>must-revalidate</code></b>는 신선한 동안에는 아무 일도 하지 않는다. 이 지시어가 건드리는 것은 낡은 뒤의 예외 상황이다. RFC 9111 4.2.4절은 캐시가 낡은 응답을 내주어서는 안 된다고 하면서 예외를 둔다. 캐시가 오리진 서버와 연결이 끊긴 경우, 그리고 클라이언트나 오리진 서버가 명시적으로 허락한 경우다. 오리진 서버가 죽어 있을 때 아무것도 보여 주지 않는 것보다 조금 낡은 것이라도 보여 주는 편이 나은 경우가 많기 때문이다. <code>must-revalidate</code>는 이 예외를 닫는다. 5.2.2.2절에 따르면 응답이 낡은 뒤에는 검증에 성공하기 전까지 재사용해서는 안 되고, 연결이 끊겼다면 낡은 응답을 내주는 대신 오류 응답을 만들어야 하며, 그 상태 코드는 다른 것이 더 알맞지 않은 한 504 (Gateway Timeout)여야 한다. 같은 절은 캐시가 이 지시어를 무시해서는 안 된다고 못박고, 검증 실패가 조용히 실행되지 않은 금융 거래 같은 잘못된 동작으로 이어질 수 있을 때 쓰라고 적는다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>응답 지시어</th><th>저장</th><th>신선한 동안</th><th>낡은 뒤, 오리진에 닿을 때</th><th>낡은 뒤, 오리진에 닿지 않을 때</th></tr></thead><tbody>
+<tr><td><code>max-age=60</code></td><td>한다</td><td>묻지 않고 재사용</td><td>검증 후 재사용</td><td>낡은 응답을 내줄 수 있다</td></tr>
+<tr><td><code>max-age=60, must-revalidate</code></td><td>한다</td><td>묻지 않고 재사용</td><td>검증 후 재사용</td><td>내주면 안 된다. 오류 응답(504 권장)</td></tr>
+<tr><td><code>no-cache</code></td><td>한다</td><td colspan="2">언제나 검증 후 재사용</td><td>검증에 성공하지 못했으므로 재사용할 수 없다</td></tr>
+<tr><td><code>no-store</code></td><td>하지 않는다</td><td colspan="3">저장된 것이 없으므로 요청마다 오리진 서버로 간다</td></tr>
+</tbody></table></div>
+
+<p><code>no-cache</code>의 마지막 칸은 따로 짚어 둘 만하다. <code>no-cache</code>는 오리진 서버에 닿지 않으면 낡은 응답을 내줄 수 있고 <code>must-revalidate</code>만이 그것을 막는다는 설명을 흔히 볼 수 있다. 그러나 RFC 9111 4.2.4절은 낡은 응답의 생성을 금지하는 지시어의 예로 <code>must-revalidate</code>와 함께 <code>no-cache</code> 응답 지시어를 직접 든다. MDN도 <code>no-cache</code>를 캐시가 오리진 서버와 끊겨 있을 때에도 재사용 전에 검증해야 하는 것으로 설명한다. 현재 명세의 문장으로는 두 지시어 모두 검증 없는 재사용을 허락하지 않는다. 차이는 <code>must-revalidate</code>가 신선한 동안의 재사용은 허용한다는 데에 있다.</p>
+
+<h4>흔히 보이는 조합과 그 유래</h4>
+
+<p>오래된 서비스의 응답에서는 다음과 같은 헤더를 자주 볼 수 있다.</p>
+
+<pre><code class="language-http">Cache-Control: no-cache, no-store, must-revalidate
+Pragma: no-cache</code></pre>
+
+<p>지금까지의 정의로 읽으면 <code>no-store</code> 하나로 저장이 금지되므로 나머지는 할 일이 없다. 그런데도 여러 지시어를 겹쳐 쓰는 것은 어느 하나를 제대로 처리하지 못하는 캐시가 있더라도 다른 하나가 걸리기를 바라서다. <code>Pragma: no-cache</code>는 <code>Cache-Control</code>을 모르는 HTTP/1.0 캐시를 겨냥한 것이지만, 앞에서 본 대로 응답에서의 의미는 명세된 적이 없다. MDN은 이런 식으로 지시어를 모두 늘어놓은 헤더를 오래된 구현을 위한 우회책으로 소개하면서, 그런 구현에 대비하는 방법으로는 <code>no-cache</code>를 쓰면 되고 공유 캐시가 걱정이면 <code>private</code>을 더하라고 권한다.</p>
+
+<p>그러니 오늘 새로 헤더를 정한다면 주문을 외우듯 조합을 붙이지 말고 원하는 동작에서 출발해야 한다. 어디에도 흔적이 남으면 안 되는 응답이면 <code>no-store</code>다. 저장은 되어도 좋으나 항상 최신이어야 하면 <code>no-cache</code>이고, 그것이 개인화된 응답이면 <code>no-cache, private</code>이다. MDN은 <code>no-store</code>를 넓게 쓰면 저장에서 얻는 이점을 통째로 잃는다는 점을 들어, 요구 사항이 "항상 최신"이라면 <code>no-cache</code>와 <code>private</code>의 조합을 먼저 고려하라고 권한다.</p>
+
+<h3>캐시 무효화 ② 이미 퍼진 응답은 어떻게 하는가</h3>
+
+<p>더 어려운 것은 이미 저장된 응답이다. <code>/css/site.css</code>를 <code>Cache-Control: max-age=31536000</code>으로 내보냈다고 하자. 31,536,000초는 365일이다. 다음 날 CSS를 고쳐 배포해도, 어제 이 파일을 받은 브라우저는 1년 동안 서버에 묻지 않는다. 묻지 않으니 서버는 바뀌었다고 알릴 기회조차 없다. HTTP 캐시는 서버가 캐시에게 먼저 말을 거는 통로를 두지 않는다. 03회에서 본 대로 HTTP에서 먼저 말하는 쪽은 언제나 클라이언트다. 그래서 무효화는 "저장된 것을 지운다"보다 "저장된 것이 쓰이지 않게 만든다"는 쪽으로 풀린다.</p>
+
+<h4>URL을 바꾼다: 캐시 버스팅</h4>
+
+<p>캐시 키가 URI라는 사실을 이용한다. 내용이 바뀔 때마다 URI도 바뀌게 하면, 옛 응답이 캐시에 남아 있더라도 새 URI에 대한 요청과는 키가 달라 쓰이지 않는다. 파일 이름에 버전이나 내용의 해시를 넣는 방식이 널리 쓰이고, 이를 캐시 버스팅(cache busting)이라 부른다. <code>/assets/site.3f9c1b.css</code>의 내용이 바뀌면 빌드 도구가 <code>/assets/site.a81e07.css</code>라는 새 파일을 만들고, HTML이 새 이름을 가리키게 한다. 이렇게 하면 각 URI의 내용은 영원히 바뀌지 않으므로 수명을 아주 길게 잡아도 안전하다.</p>
+
+<p>이 방식에는 고리가 하나 남는다. 새 URI를 알려 주는 HTML 문서 자체는 주소가 고정되어 있어서 같은 방법을 쓸 수 없다. 그래서 진입점이 되는 HTML에는 <code>no-cache</code>를 붙여 매번 검증하게 한다. HTML은 대체로 작고, 바뀌지 않았다면 304로 끝난다. 정리하면 "바뀌면 주소가 바뀌는 것은 길게, 주소가 고정된 것은 매번 확인"이다. MDN의 HTTP 캐싱 안내서가 권하는 구성도 이것이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>자원의 성격</th><th>예</th><th>알맞은 헤더</th><th>근거</th></tr></thead><tbody>
+<tr><td>내용이 바뀌면 URI도 바뀌는 정적 자원</td><td><code>/assets/site.3f9c1b.css</code></td><td><code>Cache-Control: max-age=31536000, immutable</code></td><td>그 URI의 내용은 바뀌지 않으므로 묻지 않고 오래 써도 된다.</td></tr>
+<tr><td>URI가 고정된 진입 문서</td><td><code>/index.html</code></td><td><code>Cache-Control: no-cache</code>와 <code>ETag</code></td><td>항상 최신이어야 하지만 바뀌지 않았을 때 본문을 다시 받을 필요는 없다.</td></tr>
+<tr><td>개인화된 응답</td><td><code>/orders</code></td><td><code>Cache-Control: no-cache, private</code></td><td>공유 캐시에 저장되어서는 안 되고, 사설 캐시에서도 매번 확인해야 한다.</td></tr>
+<tr><td>어디에도 남으면 안 되는 응답</td><td>일회용 인증 코드가 담긴 응답</td><td><code>Cache-Control: no-store</code></td><td>저장 자체가 문제가 된다.</td></tr>
+</tbody></table></div>
+
+<p>표의 <code>immutable</code>은 RFC 8246이 정의한 확장 지시어다. 사용자가 새로 고침을 하면 브라우저는 신선한 응답에 대해서도 검증 요청을 보내는 것이 보통인데, 내용이 절대 바뀌지 않는 URI에 대해서는 그 요청이 낭비다. <code>immutable</code>은 이 응답이 신선한 동안에는 갱신되지 않는다고 알려 그런 조건부 요청을 생략할 수 있게 한다.</p>
+
+<h4>그 밖의 수단과 한계</h4>
+
+<p>관리형 캐시는 표준 바깥의 수단을 갖고 있다. MDN이 적듯이 HTTP 캐싱 명세는 저장된 응답을 명시적으로 지우는 방법을 사실상 정의하지 않지만, 리버스 프록시나 CDN 같은 관리형 캐시에서는 운영자가 관리 화면이나 API로 저장된 응답을 언제든 지울 수 있다. 이것이 공유 캐시의 수명(<code>s-maxage</code>)을 브라우저의 수명보다 길게 잡을 수 있는 이유다. 내가 지울 수 있는 캐시에는 오래 두고, 지울 수 없는 캐시에는 짧게 둔다.</p>
+
+<p>표준 안에는 요청이 캐시를 지나가며 일으키는 무효화가 있다. RFC 9111 4.4절은 캐시가 안전하지 않은 메서드의 요청에 대해 오류가 아닌 응답, 곧 2xx나 3xx를 받으면 그 대상 URI의 저장된 응답을 무효화해야 한다고 정한다. <code>PUT /notice</code>가 성공하는 것을 본 캐시는 <code>GET /notice</code>로 저장해 둔 응답을 더 쓰지 않는다. 응답의 <code>Location</code>이나 <code>Content-Location</code>이 가리키는 URI도 같은 오리진이면 무효화할 수 있다. 그러나 이 규칙은 그 요청이 지나간 캐시에서만 작동한다. A의 브라우저를 거쳐 간 PUT은 B의 브라우저 캐시를 건드리지 못한다. RFC도 이것이 모든 캐시의 무효화를 보장하지는 않는다고 적는다.</p>
+
+<p>브라우저 캐시에 대해서는 <code>Clear-Site-Data: "cache"</code> 응답 헤더로 그 사이트의 캐시를 비우게 하는 방법이 있다고 MDN은 소개한다. 중간의 공유 캐시에는 효과가 없고, 응답 헤더이므로 브라우저가 그 사이트에 요청을 보내 응답을 받아야 전달된다. 그 밖에는 사용자가 직접 새로 고침을 하거나 저장 데이터를 지우는 길뿐이다.</p>
+
+<h4>사용자의 새로 고침이 하는 일</h4>
+
+<p>새로 고침은 브라우저가 요청에 <code>Cache-Control</code> 지시어를 실어 캐시의 판단을 덮어쓰는 동작이다. MDN이 단순화해 보여 주는 바로는, 일반 새로 고침에서 브라우저는 <code>Cache-Control: max-age=0</code>과 함께 <code>If-None-Match</code>, <code>If-Modified-Since</code>를 실은 요청을 보낸다. 나이가 0 이하인 응답만 받겠다는 뜻이므로 저장된 응답은 신선하더라도 검증을 거친다. 바뀌지 않았으면 304가 오고 본문은 저장된 것을 쓴다. 강력 새로 고침에서는 <code>Cache-Control: no-cache</code>와 <code>Pragma: no-cache</code>를 싣고 조건 헤더는 싣지 않는다. 조건이 없으므로 서버는 200과 본문 전체를 보낸다. 개발 중에 "새로 고침을 해도 옛 화면이 나온다"는 문제를 만났을 때, 어느 종류의 새로 고침이 어떤 요청을 만드는지 알면 원인이 브라우저 캐시인지 중간 캐시인지 서버인지 가려낼 수 있다.</p>
+
+<h3>조건부 요청의 다른 쓰임: 갱신 손실 막기</h3>
+
+<p>조건부 요청은 캐시만을 위한 장치가 아니다. 예제의 5번과 6번 요청이 보여 준 것처럼 상태를 바꾸는 요청에 조건을 걸 수 있다. 풀려는 문제는 갱신 손실(lost update)이다. 두 사용자가 같은 공지를 읽고 각자 고쳐서 저장하면, 나중에 저장한 쪽이 먼저 저장한 쪽의 수정을 모르는 채 덮어쓴다.</p>
+
+<pre class="diagram">
+A: GET /notice                      → 200, ETag: "v1"
+B: GET /notice                      → 200, ETag: "v1"
+A: PUT /notice  If-Match: "v1"      → 204, 서버의 태그는 "v2"가 된다
+B: PUT /notice  If-Match: "v1"      → 412 Precondition Failed
+                                       B의 요청은 수행되지 않고 A의 수정이 남는다
+</pre>
+
+<p><code>If-Match</code>는 "지금 표현의 태그가 내가 읽었던 그것일 때에만 수행하라"는 조건이다. RFC 9110 13.1.1절은 이 헤더의 목적을 여러 사용자 에이전트가 같은 자원에 동시에 작용할 때의 우발적인 덮어쓰기를 막는 것이라고 적고, 비교에는 강한 비교를 쓰도록 한다. 조건이 거짓이면 서버는 요청된 메서드를 수행해서는 안 되고 412로 답할 수 있다. 412를 받은 B는 최신 표현을 다시 읽어 자신의 수정을 합친 뒤 새 태그로 다시 시도한다.</p>
+
+<p>같은 발상의 변형이 둘 있다. <code>If-None-Match: *</code>는 "대상 자원에 현재 표현이 하나도 없을 때에만 수행하라"는 뜻으로, PUT과 함께 쓰면 이미 있는 자원을 실수로 덮어쓰지 않고 새로 만들 때에만 성공하게 할 수 있다. <code>If-Unmodified-Since</code>는 엔티티 태그가 없는 자원에 같은 보호를 날짜로 건다. 그리고 <code>If-Range</code>는 끊긴 다운로드를 이어받을 때 쓴다. 표현이 그대로이면 <code>Range</code>로 요청한 나머지 부분만 받고, 그 사이에 바뀌었으면 처음부터 전체를 받는다.</p>
+
+<p>이 패턴은 이후의 권에서 다른 모습으로 다시 나온다. 읽을 때 버전을 받아 두고 쓸 때 그 버전이 그대로인지 확인한 뒤에만 반영하는 방식을 데이터베이스에서는 낙관적 락(optimistic lock)이라 부르고, JPA는 <code>@Version</code>을 붙인 필드로 이것을 지원한다. HTTP의 엔티티 태그와 <code>If-Match</code>는 같은 생각을 프로토콜 수준에서 표현한 것이다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<ul>
+<li><b>"no-cache는 캐시하지 말라는 뜻이다."</b> 저장을 금지하는 것은 <code>no-store</code>다. <code>no-cache</code>는 저장을 허용하고 검증 없는 재사용만 금지한다. 둘을 바꿔 쓰면 한쪽에서는 304로 끝났을 요청이 매번 본문 전체를 주고받게 되고, 반대쪽에서는 남으면 안 되는 응답이 디스크에 남는다.</li>
+<li><b>"Cache-Control을 붙이지 않으면 캐시되지 않는다."</b> 명시된 만료 시간이 없는 200 응답은 휴리스틱 신선도의 대상이다. 의도하지 않은 캐시를 막으려면 헤더를 생략할 것이 아니라 원하는 동작을 명시해야 한다.</li>
+<li><b>"max-age는 브라우저가 응답을 받은 때부터 센다."</b> 나이는 오리진 서버가 응답을 만든 때부터 세어지고, 공유 캐시에 머문 시간은 <code>Age</code>로 넘어온다. 공유 캐시를 거친 응답은 받는 순간 이미 나이를 먹은 상태다.</li>
+<li><b>"낡은 응답은 캐시에서 지워진다."</b> 낡은 응답은 검증의 재료다. 304를 받으면 다시 신선해진다. 저장된 응답을 언제 지울지는 캐시 구현이 용량에 따라 정한다.</li>
+<li><b>"304가 나가면 서버는 일을 하지 않은 것이다."</b> 304가 아끼는 것은 본문 전송이다. 서버가 엔티티 태그를 얻으려고 응답 본문을 끝까지 만들어 해시해야 한다면 계산은 그대로 든다. 본문을 만들기 전에 알 수 있는 값(버전 번호, 수정 시각)으로 태그를 정할 수 있어야 계산까지 아낀다.</li>
+<li><b>"ETag는 본문의 해시여야 한다."</b> 엔티티 태그는 불투명한 문자열이고 생성 방법은 서버의 자유다. 지켜야 할 것은 강한 태그라면 표현 데이터가 바뀔 때마다 값이 바뀌어야 한다는 것, 그리고 같은 자원을 내주는 서버가 여러 대라면 같은 표현에 같은 태그를 만들어야 한다는 것이다. 서버마다 태그가 다르면 요청이 다른 서버로 갈 때마다 검증이 실패한다.</li>
+<li><b>"서버에 새 파일을 올리면 사용자도 새 파일을 본다."</b> 신선한 사본을 가진 캐시는 서버에 묻지 않는다. 길게 캐시한 자원을 같은 URI로 덮어쓰면, 옛 HTML과 새 스크립트가 섞이는 식으로 사용자마다 서로 다른 조합을 보게 된다.</li>
+<li><b>"private이면 응답이 보호된다."</b> <code>private</code>은 공유 캐시에게 저장하지 말라고 지시할 뿐이다. 응답을 암호화하지도, 사설 캐시에 남는 것을 막지도 않는다. 전송 구간의 보호는 TLS의 일이고, 저장을 막는 것은 <code>no-store</code>의 일이다.</li>
+</ul>
+
+<h3>다른 주제와의 연결</h3>
+
+<p>이 장의 헤더들은 스프링 MVC에서 그대로 다시 만난다. Spring Framework 참조 문서의 HTTP Caching 절에 따르면 <code>CacheControl.maxAge(1, TimeUnit.HOURS)</code>는 <code>Cache-Control: max-age=3600</code>을, <code>CacheControl.noStore()</code>는 <code>Cache-Control: no-store</code>를 만든다. 컨트롤러가 <code>ResponseEntity.ok().cacheControl(...).eTag(version).body(...)</code>처럼 응답을 만들면, 조건부 요청 헤더와 비교해 내용이 바뀌지 않은 경우 본문이 빈 304가 나간다. 핸들러 안에서 <code>WebRequest.checkNotModified(...)</code>를 호출해 본문을 만들기 전에 304로 끝낼 수도 있고, 같은 문서는 조건부 POST·PUT·DELETE에는 동시 수정을 막도록 412를 설정할 수 있다고 적는다. 이 장에서 손으로 구현한 평가 순서가 프레임워크 안에 들어 있는 것이다.</p>
+
+<p>같은 문서가 소개하는 <code>ShallowEtagHeaderFilter</code>는 앞의 오해 목록과 바로 이어진다. 이 필터는 응답 내용으로부터 엔티티 태그를 계산해 붙이므로 애플리케이션 코드를 고치지 않고도 304를 쓸 수 있게 해 주지만, 문서의 표현대로 대역폭은 아끼되 CPU 시간은 아끼지 못한다. 응답을 다 만든 뒤에야 태그를 알 수 있기 때문이다. 어느 쪽을 쓸지는 응답을 만드는 비용과 전송하는 비용 가운데 무엇이 더 큰지로 정해진다.</p>
+
+<p>이 권에서 다룬 것을 한 줄로 이어 보면 이렇다. 01회와 02회에서 이름이 주소가 되고 연결이 맺어지는 과정을 보았고, 03회에서 그 연결 위로 무상태의 메시지가 오간다는 것을, 04회부터 07회까지 메서드와 상태 코드와 헤더가 그 메시지에 어떤 약속을 싣는지를 보았다. 캐시는 그 약속들이 모이는 곳이다. 안전한 메서드라서 저장할 수 있고, 무상태라서 저장된 응답을 누구에게나 다시 내줄 수 있으며, 표현에 검증자가 붙어 있어서 가볍게 확인할 수 있다. 03회에서 본 대로 이 의미론은 HTTP/1.1, HTTP/2, HTTP/3이 함께 쓰는 것이어서, 메시지를 실어 나르는 방식이 바뀌어도 이 장의 규칙은 그대로 적용된다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>캐시와 캐시 키</dt><dd>캐시는 응답 메시지를 저장했다가 이후의 요청에 재사용하는 저장소와 그 제어 장치다. 저장된 응답은 최소한 요청 메서드와 대상 URI로 이루어진 키로 찾는다.</dd>
+<dt>신선도</dt><dd>응답의 나이가 신선도 수명보다 작으면 신선하고 캐시는 오리진 서버에 묻지 않고 재사용한다. 수명은 <code>s-maxage</code>, <code>max-age</code>, <code>Expires</code>에서 <code>Date</code>를 뺀 값, 휴리스틱의 순서로 정해진다.</dd>
+<dt>나이 계산</dt><dd>나이는 오리진 서버가 응답을 만들거나 검증한 때부터 센다. <code>Date</code>, <code>Age</code>, 응답 지연으로 도착 시점의 나이를 보수적으로 추정하고 거기에 저장소에 머문 시간을 더한다.</dd>
+<dt>검증자</dt><dd>표현에 붙는 식별 정보로 <code>Last-Modified</code>와 <code>ETag</code>가 있다. 엔티티 태그는 서버가 자유롭게 만드는 불투명한 문자열이고, 강한 태그와 약한 태그가 있다.</dd>
+<dt>조건부 요청과 304</dt><dd>캐시는 낡은 응답의 검증자를 <code>If-None-Match</code>나 <code>If-Modified-Since</code>에 실어 보낸다. 표현이 그대로이면 서버는 본문 없는 304로 답하고, 캐시는 저장된 응답의 헤더만 갱신해 다시 신선하게 만든다.</dd>
+<dt>조건 평가 순서</dt><dd>서버는 <code>If-Match</code>, <code>If-Unmodified-Since</code>, <code>If-None-Match</code>, <code>If-Modified-Since</code>, <code>If-Range</code>의 순서로 평가한다. <code>If-None-Match</code>가 있으면 <code>If-Modified-Since</code>는 무시한다.</dd>
+<dt>사설 캐시와 공유 캐시</dt><dd>사설 캐시는 한 사용자 전용이고 공유 캐시는 여러 사용자에게 재사용한다. <code>private</code>은 공유 캐시의 저장을 금지하고, <code>s-maxage</code>는 공유 캐시 전용의 수명이며, <code>Age</code>는 공유 캐시에 머문 시간을 전한다.</dd>
+<dt>no-cache, no-store, must-revalidate</dt><dd><code>no-store</code>는 저장을, <code>no-cache</code>는 검증 없는 재사용을 금지한다. <code>must-revalidate</code>는 낡은 뒤 검증에 실패하면 낡은 응답 대신 오류를 내게 한다.</dd>
+<dt>이미 저장된 응답의 무효화</dt><dd>서버는 신선한 사본을 가진 캐시에 먼저 알릴 수 없다. 내용이 바뀌면 URI를 바꾸고, URI가 고정된 문서는 <code>no-cache</code>로 매번 검증하게 하는 구성으로 해결한다.</dd>
+</x-summary>
+
+<x-review>
+<p>캐시와 관련된 장애는 대개 두 종류다. 하나는 낡은 것이 보이는 문제다. 배포했는데 일부 사용자에게 옛 화면이 나오거나 옛 HTML이 지워진 스크립트를 가리켜 화면이 깨진다. 이때 서버를 다시 띄우는 것은 소용이 없다. 요청이 서버에 오지 않기 때문이다. 원인은 주소가 고정된 자원에 긴 수명을 준 설계에 있고, 고칠 곳도 설계다. 내용이 바뀌면 주소가 바뀌게 하고, 진입 문서는 매번 검증하게 한다. 이미 나간 응답은 수명이 끝나기를 기다리거나 사용자가 새로 고치기를 기다릴 수밖에 없으므로, 긴 <code>max-age</code>는 되돌릴 수 없는 결정이라고 생각하고 붙여야 한다.</p>
+
+<p>다른 하나는 보여서는 안 될 것이 보이는 문제다. 공유 캐시 뒤에 서비스를 두었는데 개인화된 응답에 지시어를 붙이지 않았거나, 정적 자원용으로 만든 "모든 응답에 <code>max-age</code>를 붙이는" 설정이 API 응답에까지 적용된 경우다. 캐시 키에는 쿠키가 들어가지 않는다는 사실 하나만 기억해도 이 사고는 예측할 수 있다. CDN이나 리버스 프록시를 도입하는 날은 모든 응답의 <code>Cache-Control</code>을 다시 점검하는 날이어야 한다. 개인화된 응답에는 <code>private</code>이나 <code>no-store</code>가, 로그인 여부에 따라 달라지는 응답에는 그에 맞는 지시어가 붙어 있는지 확인한다.</p>
+
+<p><code>max-age</code>의 값을 정할 때 물어야 할 것은 "이 자원이 얼마나 자주 바뀌는가"보다 "낡은 것이 얼마 동안 보여도 괜찮은가"다. 환율이나 재고처럼 틀린 값이 곧 사고인 데이터는 <code>no-cache</code>로 매번 확인하게 하고, 확인 비용을 줄이기 위해 서버가 싸게 계산할 수 있는 검증자를 설계한다. 몇 분쯤 늦어도 되는 목록이라면 짧은 <code>max-age</code>만으로 요청의 대부분을 캐시에서 끝낼 수 있다. 여기에 오리진 서버가 죽었을 때의 정책이 더해진다. 낡은 것이라도 보여 주는 편이 나은 화면이 있고, 낡은 것을 보여 주면 안 되는 화면이 있다. 뒤의 것에 <code>must-revalidate</code>를 붙이는 것이 이 지시어의 본래 용도다.</p>
+
+<p>마지막으로 검증의 비용을 과소평가하지 말아야 한다. 304는 본문을 아끼지만 왕복 한 번은 든다. 작은 자원 수십 개가 모두 <code>no-cache</code>이면 페이지를 열 때마다 수십 번의 조건부 요청이 나간다. 자원의 크기가 작을수록 검증보다 신선도에 의한 재사용의 이득이 크다. 반대로 큰 본문을 만드는 데 서버 계산이 많이 드는 응답이라면, 본문을 만들기 전에 판정할 수 있는 검증자를 두는 것만으로 전송과 계산을 함께 줄일 수 있다.</p>
+</x-review>
+
+<x-practice>
+<li>캐시가 시각 5000(초)에 요청을 보내 시각 5002에 응답을 받았다. 응답의 <code>Date</code>는 5000에 해당하고 <code>Age</code> 헤더는 없으며 <code>Cache-Control: max-age=120</code>이 붙어 있다. RFC 9111 4.2.3절의 식으로 시각 5119와 시각 5120에서의 현재 나이를 각각 계산하고 신선한지 판정하라.</li>
+<li>오리진 서버가 시각 0에 만든 응답에 <code>Cache-Control: max-age=60, s-maxage=600</code>이 붙어 있고 CDN이 이를 저장했다. 시각 200에 사용자 C가 CDN으로부터 이 응답을 받았다(전송 지연은 무시한다). (1) CDN이 붙여야 하는 <code>Age</code> 값은 얼마인가. (2) 이 응답은 C의 브라우저 캐시에서 신선한가. (3) 10초 뒤 C의 브라우저가 같은 URI를 다시 필요로 할 때 일어나는 일을 요청과 응답의 순서로 설명하라.</li>
+<li>어떤 자원의 현재 엔티티 태그가 <code>"v7"</code>이고 마지막 수정 시각이 <code>Sat, 01 Mar 2025 09:00:00 GMT</code>다. 다음 요청 각각에 대해 서버가 답할 상태 코드와 그 이유를 적어라. (가) <code>GET</code>, <code>If-None-Match: "v6", "v7"</code> (나) <code>GET</code>, <code>If-None-Match: "v6"</code>와 <code>If-Modified-Since: Sun, 02 Mar 2025 00:00:00 GMT</code> (다) <code>PUT</code>, <code>If-Match: W/"v7"</code> (라) <code>PUT</code>, <code>If-None-Match: *</code> (마) <code>DELETE</code>, <code>If-Unmodified-Since: Fri, 28 Feb 2025 00:00:00 GMT</code></li>
+<li>운영자가 <code>/css/site.css</code>를 고쳐 배포했는데 일부 사용자에게는 며칠째 옛 스타일이 보인다는 신고가 들어왔다. 이 파일의 응답 헤더는 <code>Cache-Control: max-age=604800</code>이고 URI는 배포 전후로 같다. 서버를 재시작해도 해결되지 않는 이유를 요청의 흐름으로 설명하고, 앞으로 같은 일이 생기지 않게 하는 구성과 이미 옛 파일을 받은 사용자에게 일어날 일을 적어라.</li>
+<li>공유 캐시가 어떤 응답을 저장한 뒤 그 응답이 낡았고, 마침 오리진 서버가 응답하지 않는 상태다. 저장된 응답의 지시어가 (가) <code>max-age=300</code> (나) <code>max-age=300, must-revalidate</code> (다) <code>no-cache</code>일 때, 같은 URI에 대한 새 요청에 캐시가 할 수 있는 일과 해서는 안 되는 일을 각각 적어라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> apparent_age는 max(0, 5002 − 5000) = 2다. response_delay는 5002 − 5000 = 2이고 <code>Age</code>가 없으므로 age_value는 0, corrected_age_value는 0 + 2 = 2다. corrected_initial_age는 둘 가운데 큰 값인 2다. 시각 5119에서 resident_time은 5119 − 5002 = 117이므로 현재 나이는 119이고, 수명 120이 나이보다 크므로 신선하다. 시각 5120에서는 resident_time이 118, 현재 나이가 120이다. 판정식은 "수명이 나이보다 크다"인데 120은 120보다 크지 않으므로 낡았다. 응답을 받은 시각부터 120초가 아니라 요청을 보낸 시각부터 120초가 되는 순간에 낡는다는 점이 요점이다. 응답 지연이 통째로 나이에 들어가기 때문이다.</p>
+
+<p><b>2번.</b> (1) CDN은 저장된 응답을 검증 없이 내줄 때 현재 나이를 <code>Age</code>에 적어야 하므로 <code>Age: 200</code>이다. CDN에서 이 응답은 수명 600이 나이 200보다 크므로 신선하다. (2) 브라우저는 사설 캐시이므로 <code>s-maxage</code>를 무시하고 <code>max-age=60</code>을 수명으로 쓴다. 도착 시점의 나이가 200이므로 받자마자 낡은 상태다. 저장은 되지만 묻지 않고 재사용할 수는 없다. (3) 브라우저는 저장된 응답에 검증자가 있으면 그것을 실은 조건부 GET을 보낸다. 이 요청은 CDN에 닿고, CDN은 자신이 가진 신선한 응답의 검증자와 비교해 일치하면 오리진 서버에 묻지 않고 304로 답한다. 브라우저는 저장된 응답의 헤더를 갱신하고 본문을 재사용한다. 다만 CDN이 준 304에도 200이 넘는 <code>Age</code>가 실려 오므로 갱신된 응답 역시 브라우저의 수명 60을 넘어 있다. 이 구성에서 CDN에 오래 머문 응답을 받은 브라우저는 그 자원을 쓸 때마다 CDN과 한 번씩 왕복하게 된다.</p>
+
+<p><b>3번.</b> (가) 304. <code>If-None-Match</code>의 목록 가운데 <code>"v7"</code>이 현재 태그와 약한 비교로 일치하므로 조건은 거짓이고, GET이므로 304다. (나) 200. <code>If-None-Match</code>의 <code>"v6"</code>은 현재 태그와 일치하지 않으므로 조건은 참이다. <code>If-Modified-Since</code>만 보면 수정 시각이 조건 시각보다 이르므로 304가 나올 것 같지만, <code>If-None-Match</code>가 있으면 <code>If-Modified-Since</code>는 무시된다. (다) 412. <code>If-Match</code>는 강한 비교를 쓰고, 강한 비교에서는 한쪽이라도 약한 태그이면 일치하지 않는다. (라) 412. <code>If-None-Match: *</code>는 대상 자원에 현재 표현이 있으면 거짓이다. GET이나 HEAD가 아닌 메서드에서 이 조건이 거짓이면 412다. 이미 있는 자원을 덮어쓰지 않으려는 요청이 의도대로 거절된 것이다. (마) 412. 자원이 조건 시각인 2월 28일 이후(3월 1일)에 수정되었으므로 "그 뒤로 수정되지 않았을 때에만"이라는 조건이 거짓이다.</p>
+
+<p><b>4번.</b> 옛 파일을 받은 브라우저의 캐시에는 수명이 604,800초(7일)인 응답이 저장되어 있다. 그 기간 동안 브라우저는 <code>/css/site.css</code>를 요청해야 할 때마다 캐시에서 답을 얻으므로 요청이 서버에 가지 않는다. 서버를 재시작하든 파일을 바꾸든 그 브라우저는 알 수 없다. 앞으로는 파일 이름에 내용의 해시나 버전을 넣어 내용이 바뀌면 URI가 바뀌게 하고, 그 URI에는 긴 <code>max-age</code>와 <code>immutable</code>을 붙인다. 새 URI를 가리키는 HTML에는 <code>no-cache</code>를 붙여 매번 검증하게 한다. 이미 옛 파일을 받은 사용자는 HTML이 새 URI를 가리키게 된 순간부터 새 파일을 받는다. HTML마저 길게 캐시되어 있었다면 그 수명이 끝나거나 사용자가 새로 고침을 할 때까지 옛 화면을 본다.</p>
+
+<p><b>5번.</b> (가) RFC 9111 4.2.4절은 캐시가 오리진 서버와 연결이 끊긴 경우를 낡은 응답을 내줄 수 있는 예외로 둔다. 금지하는 지시어가 없으므로 캐시는 낡은 응답을 내줄 수 있다. 내주어야 한다는 뜻은 아니다. (나) <code>must-revalidate</code>가 있으므로 검증에 성공하기 전에는 재사용해서는 안 된다. 캐시는 낡은 응답 대신 오류 응답을 만들어야 하고 상태 코드는 504가 권장된다. (다) <code>no-cache</code> 응답은 검증 요청을 보내 성공 응답을 받기 전에는 다른 요청에 쓰여서는 안 된다. 검증에 성공하지 못했으므로 저장된 응답을 내줄 수 없다. (나)와 (다)의 차이는 낡기 전에 있다. (나)는 300초 동안 묻지 않고 재사용되지만 (다)는 처음부터 매번 검증한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>응답에 <code>Cache-Control: no-cache</code>가 붙어 있다. 이 응답을 받은 캐시의 동작으로 옳은 것은?</q>
+<o>응답을 저장하지 않고, 같은 URI를 요청할 때마다 본문 전체를 다시 받는다.</o>
+<o>응답을 저장할 수 있지만, 재사용하기 전에 매번 오리진 서버에 검증 요청을 보내 성공해야 한다.</o>
+<o>응답을 저장하고, 휴리스틱으로 정한 기간 동안 묻지 않고 재사용한다.</o>
+<o>사설 캐시는 저장할 수 있지만 공유 캐시는 저장할 수 없다.</o>
+<why><code>no-cache</code>는 저장을 금지하지 않는다. 금지하는 것은 검증 없는 재사용이다. 캐시는 저장해 둔 응답의 검증자로 조건부 요청을 보내고 304를 받으면 저장된 본문을 쓴다. 저장 자체를 금지하는 것은 <code>no-store</code>이고, 공유 캐시의 저장만 금지하는 것은 <code>private</code>이다. 명시적인 지시어가 있으므로 휴리스틱은 적용되지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>오리진 서버가 <code>Cache-Control: max-age=100</code>으로 내보낸 응답을 공유 캐시가 저장했다가, 어떤 브라우저의 요청에 <code>Age: 70</code>을 붙여 내주었다. 브라우저 캐시에서 이 응답이 신선한 시간에 대해 옳은 것은? (전송 지연은 무시한다.)</p></q>
+<o>브라우저가 받은 때부터 100초 동안 신선하다. <code>max-age</code>는 받는 쪽마다 새로 센다.</o>
+<o>브라우저가 받은 때부터 170초 동안 신선하다. <code>Age</code>만큼 수명이 늘어난다.</o>
+<o>브라우저가 받은 때부터 30초가 되기 전까지 신선하다. 나이는 70에서 출발한다.</o>
+<o><code>Age</code>가 붙은 응답은 사설 캐시에 저장될 수 없다.</o>
+<why>나이는 오리진 서버가 응답을 만들거나 검증한 때부터 세고, 공유 캐시에 머문 시간은 <code>Age</code>로 전달된다. 브라우저는 도착 시점의 나이를 70으로 잡고 거기에 자신의 저장소에 머문 시간을 더하므로, 30초가 지나 나이가 100이 되면 낡는다. <code>Age</code>는 수명을 늘리지 않으며 저장 가능 여부와도 관계가 없다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>GET 요청에 <code>If-None-Match: "a1"</code>과 <code>If-Modified-Since: (자원의 마지막 수정 시각과 같은 값)</code>이 함께 실려 왔다. 자원의 현재 엔티티 태그는 <code>"b2"</code>다. 서버의 응답으로 옳은 것은?</q>
+<o>200과 현재 표현. <code>If-None-Match</code>가 있으면 <code>If-Modified-Since</code>는 무시되고, 태그가 일치하지 않으므로 조건이 참이다.</o>
+<o>304. 두 조건 가운데 하나라도 "바뀌지 않았다"고 판정하면 304다.</o>
+<o>412. 두 조건의 결과가 서로 어긋나면 전제 조건 실패다.</o>
+<o>400. 두 조건 헤더를 함께 보내는 것은 문법 오류다.</o>
+<why>RFC 9110은 요청에 <code>If-None-Match</code>가 있으면 수신자가 <code>If-Modified-Since</code>를 무시하도록 한다. 엔티티 태그가 더 정확한 검증자이기 때문이다. 태그가 다르므로 표현이 바뀐 것이고 서버는 200으로 새 표현을 보낸다. 날짜만 보고 304를 보내면 같은 초 안에 일어난 변경을 놓치게 된다. 두 헤더를 함께 보내는 것은 정상이며 캐시는 실제로 그렇게 한다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>Cache-Control: max-age=600, must-revalidate</code>가 붙은 응답에 대한 설명으로 옳은 것은?</q>
+<o>캐시는 이 응답을 저장할 수 없다.</o>
+<o>캐시는 신선한 동안에도 재사용할 때마다 검증해야 한다.</o>
+<o>낡은 뒤 오리진 서버에 닿지 않으면 캐시는 저장된 응답을 그대로 내주어야 한다.</o>
+<o>600초 동안은 묻지 않고 재사용할 수 있고, 낡은 뒤에는 검증에 성공해야만 재사용할 수 있으며 검증할 수 없으면 오류 응답을 낸다.</o>
+<why><code>must-revalidate</code>는 신선한 동안의 재사용에는 영향을 주지 않는다. 이 지시어가 닫는 것은 "오리진 서버와 끊겼을 때 낡은 응답을 내줄 수 있다"는 예외다. 낡은 뒤에는 검증에 성공하기 전까지 재사용이 금지되고, 연결이 끊겼다면 504 같은 오류 응답을 만들어야 한다. 신선한 동안에도 매번 검증하게 하는 것은 <code>no-cache</code>, 저장을 금지하는 것은 <code>no-store</code>다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>낡은 응답을 검증하려고 조건부 요청을 보낸 캐시가 304 (Not Modified)를 받았다. 캐시가 하는 일로 옳은 것은?</q>
+<o>저장된 응답을 지우고, 조건 없는 GET을 다시 보내 본문을 받는다.</o>
+<o>304 응답을 저장된 응답 자리에 그대로 덮어쓴다. 이후 요청에는 본문 없는 응답이 나간다.</o>
+<o>저장된 응답의 헤더 필드를 304가 준 헤더 필드로 갱신하고, 저장된 본문을 재사용한다.</o>
+<o>저장된 응답을 그대로 두되 수명은 갱신하지 않으므로 다음 요청에서도 반드시 검증해야 한다.</o>
+<why>304는 저장된 응답을 갱신해 재사용할 수 있다는 뜻이다. 캐시는 저장된 응답의 헤더를 304의 헤더로 갱신하므로 <code>Date</code>와 <code>Cache-Control</code>이 새 값이 되고 응답은 다시 신선해진다. 본문은 304에 없으므로 저장된 것을 쓴다. 서버가 304에 <code>Cache-Control</code>, <code>ETag</code> 같은 헤더를 반드시 넣어야 하는 이유가 여기에 있다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>캐시(cache)</dt><dd>응답 메시지를 저장하는 로컬 저장소와 그 저장·검색·삭제를 제어하는 하위 시스템. 이전의 응답을 재사용해 현재의 요청을 만족시킨다.</dd>
+<dt>사설 캐시(private cache)</dt><dd>한 사용자 전용의 캐시. 브라우저 캐시가 대표적이며 개인화된 응답도 저장할 수 있다.</dd>
+<dt>공유 캐시(shared cache)</dt><dd>저장한 응답을 둘 이상의 사용자에게 재사용하는 캐시. 프록시, 리버스 프록시, CDN이 해당한다.</dd>
+<dt>신선도 수명(freshness lifetime)</dt><dd>응답이 생성된 때부터 낡은 것으로 간주되기까지의 시간. <code>s-maxage</code>, <code>max-age</code>, <code>Expires</code> 또는 휴리스틱으로 정해진다.</dd>
+<dt>나이(age)</dt><dd>응답이 오리진 서버에서 생성되거나 성공적으로 검증된 뒤 흐른 시간. 캐시는 이를 계산해 수명과 비교하고, 응답을 내줄 때 <code>Age</code> 헤더에 적는다.</dd>
+<dt>검증(validation)</dt><dd>저장된 응답이 아직 유효한지 조건부 요청으로 오리진 서버에 확인하는 일. 재검증(revalidation)이라고도 한다.</dd>
+<dt>검증자(validator)</dt><dd>표현의 변화를 판별하는 데 쓰는 메타데이터. <code>ETag</code>와 <code>Last-Modified</code>가 있고, 표현 데이터가 바뀔 때마다 값이 바뀌면 강한 검증자, 그렇지 않을 수 있으면 약한 검증자다.</dd>
+<dt>엔티티 태그(entity tag)</dt><dd>서버가 표현에 붙이는 불투명한 따옴표 문자열. <code>W/</code> 접두사가 붙으면 약한 태그다.</dd>
+<dt>조건부 요청(conditional request)</dt><dd><code>If-None-Match</code>, <code>If-Modified-Since</code>, <code>If-Match</code> 같은 전제 조건 헤더를 실은 요청. 서버는 조건을 평가해 304나 412로 답하거나 메서드를 수행한다.</dd>
+<dt>휴리스틱 신선도(heuristic freshness)</dt><dd>명시된 만료 시간이 없을 때 캐시가 <code>Last-Modified</code> 같은 다른 정보로 스스로 추정한 수명.</dd>
+<dt>캐시 버스팅(cache busting)</dt><dd>내용이 바뀔 때 URI도 바뀌게 해서, 캐시에 남은 옛 응답이 새 요청에 쓰이지 않도록 하는 기법.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9111.html">RFC 9111 — HTTP Caching</a> — 저장 조건(3절), 신선도와 나이 계산(4.2절), 검증(4.3절), 무효화(4.4절), Cache-Control 지시어(5.2절)</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110.html">RFC 9110 — HTTP Semantics</a> — 날짜 형식(5.6.7절), 검증자 필드(8.8절), 조건부 요청과 평가 순서(13절), 304(15.4.5절)</li>
+<li><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching">MDN — HTTP caching</a> — 캐시의 종류, 휴리스틱 캐싱, 새로 고침이 보내는 요청, 캐시 버스팅과 권장 구성</li>
+<li><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control">MDN — Cache-Control</a> — 지시어별 설명과 문법, immutable과 stale-while-revalidate 등 확장 지시어</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-caching.html">Spring Framework Reference — HTTP Caching</a> — CacheControl, ResponseEntity의 eTag, checkNotModified, ShallowEtagHeaderFilter</li>
+</x-refs>

@@ -1,0 +1,7 @@
+- 01: 2026-11-17 확인 26건 · 수정 0건 — 수정 없음(BOM 버전·자동 구성 조건·QueryUtils 상수·H2 포트와 생성 규칙·Proxy Javadoc·실험 로그 대조 모두 일치)
+- 02: 2026-11-18 확인 34건 · 수정 4건 — ListCrudRepository 3.0 근거를 레퍼런스→Javadoc @since로, 배치삭제 경고 출처를 deleteAllInBatch(Iterable)로, strict 모드 문장 좁힘, 객체 헤더 서술에 HotSpot 범위
+- 06: 2026-11-18 확인 41건 · 수정 4건 — deleteById 예외 제거 시점을 3.0.2로 특정(3.0.1까지 throw), 메타데이터 인터셉터가 스레드 로컬에 올리는 대상을 MethodInvocation으로 정정, 없는 I 시나리오 참조 수정, 생략 표시 추가
+- 04: 2026-11-18 확인 40건 · 수정 6건 — 자동 플러시는 겹치는 변경만이 아니라 겹치는 변경이 있으면 전체 플러시(재실행 확인), 연습 2번 정답 정정(D 이름 반영됨), countQuery 레퍼런스 인용을 네이티브 쿼리로 한정
+- 03: 2026-11-18 확인 32건 · 수정 6건 — searchTitle SQL에 escape '' 누락 보완, 12절 참조를 절 제목으로 정정, PartTree.toString 출력 3곳이 축약본임을 명시, 인자 부족 메시지 인용을 앞부분 인용으로 한정
+- 05: 2026-11-18 확인 41건 · 수정 2건 — 정렬 검증을 SortHandlerMethodArgumentResolverCustomizer로 옮길 수 있다는 서술 정정, AuditorAware 호출 스레드를 persist·플러시로 구분. 실험 출력은 Boot 3.5.16 재실행으로 일치
+- 07: 2026-11-18 확인 42건 · 수정 3건 — QBE 조건 순서가 HashSet 순회라 실행마다 다를 수 있음을 명시, 순환 검사를 identityHashCode 비교로 정정, findAll(Example) 몸체에 getResultList 보완

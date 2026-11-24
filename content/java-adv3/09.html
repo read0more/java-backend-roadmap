@@ -1,0 +1,849 @@
+<x-meta>
+deck: 이미 배포된 인터페이스에 메서드를 더하면 무엇이 깨지는지 실험으로 확인하고, 디폴트 메서드의 클래스 파일 표현과 JVM의 메서드 선택 규칙, 다중 상속 충돌 해석과 올바른 설계 기준까지 정리한다.
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li>인터페이스에 추상 메서드를 추가했을 때 소스를 다시 컴파일하는 쪽과 이미 컴파일된 바이너리를 그대로 실행하는 쪽에서 각각 무엇이 일어나는지(컴파일 오류, <code>AbstractMethodError</code>)를 실험 결과와 JLS 13장을 근거로 설명할 수 있다.</li>
+<li>디폴트·정적·private 인터페이스 메서드의 문법 규칙(허용되는 제어자, <code>Object</code> 메서드 재정의 금지, 정적 메서드는 상속되지 않음)을 말하고, javap 출력에서 접근 플래그와 호출 명령어(<code>invokeinterface</code>, <code>invokevirtual</code>, <code>invokespecial</code>, <code>invokestatic</code>)를 읽어 각각이 어떻게 표현되는지 설명할 수 있다.</li>
+<li>JVMS의 메서드 해석·선택 절차와 "가장 구체적인 상위 인터페이스 메서드"라는 정의를 써서, 주어진 상속 구조에서 어느 구현이 실행될지 예측할 수 있다.</li>
+<li>클래스 우선, 하위 인터페이스 우선, <code>X.super.m()</code>으로 직접 선택이라는 세 규칙과 그 경계(추상과 디폴트의 충돌, 재추상화, <code>X.super</code>의 제약, 분리 컴파일로 생긴 충돌)를 컴파일 오류와 런타임 오류 문구로 설명할 수 있다.</li>
+<li><code>forEach</code>, <code>removeIf</code>, <code>List.sort</code>, <code>Map.putIfAbsent</code>, <code>SequencedCollection</code> 같은 표준 라이브러리 사례를 근거로 디폴트 메서드를 설계할 때의 기준(상태를 갖지 않기, 다른 추상 메서드 위에 쌓기, 불변식과 동기화 정책, 기본 구현 문서화, 이름 충돌)을 판단할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 이미 배포된 인터페이스에 메서드를 더할 수 있는가</h3>
+<p>자바 8에 람다와 스트림을 넣으려던 사람들은 곤란한 문제 하나를 안고 있었다. 람다가 쓸모 있으려면 컬렉션이 람다를 받아야 한다. <code>list.forEach(x -> ...)</code>, <code>list.removeIf(x -> ...)</code>, <code>collection.stream()</code> 같은 메서드가 <code>Collection</code>, <code>List</code>, <code>Iterable</code>에 있어야 한다는 뜻이다. 그런데 <code>Collection</code>과 <code>List</code>는 자바 1.2부터, <code>Iterable</code>은 자바 5부터 존재했고, JDK 바깥의 수많은 라이브러리와 애플리케이션이 이것을 직접 구현해 왔다. 인터페이스에 추상 메서드를 하나 더하면, 세상의 모든 구현 클래스가 그 메서드를 새로 구현해야 한다.</p>
+<p>OpenJDK의 JEP 126(Lambda Expressions &amp; Virtual Extension Methods)은 이 상황을 "널리 쓰이는 인터페이스에 메서드를 추가할 수 없다는 오랜 제약"이라고 부르고, 그 원인을 소스 호환성 문제로 짚는다. 그리고 해법으로 <b>가상 확장 메서드(virtual extension method)</b>를 내놓는다. <code>Collection</code>이나 <code>List</code> 같은 기존 인터페이스에 구현이 딸린 메서드를 넣으면 기존 구현 클래스도 새로운 프로그래밍 방식에 참여할 수 있고, JDK 안팎의 구현 클래스는 그 기본 구현을 재정의해 더 빠르거나 특화된 구현을 줄 수 있다는 것이다. 이 기능이 자바 8에 <b>디폴트 메서드(default method)</b>라는 이름으로 들어왔다.</p>
+<p>이 회차는 먼저 "인터페이스에 메서드를 더하면 무엇이 깨지는가"를 실제로 깨뜨려 보면서 확인한다. 깨지는 방식은 두 가지다. 소스를 다시 컴파일하는 쪽과, 이미 컴파일된 클래스 파일을 그대로 실행하는 쪽이다. 그다음 디폴트 메서드의 문법 규칙, 클래스 파일에서의 모습, JVM이 실행할 메서드를 고르는 절차를 차례로 본다. 후반부는 여러 인터페이스가 같은 디폴트 메서드를 가질 때 무엇이 실행되는지를 정하는 해석 규칙, 분리 컴파일 때문에 실행 중에 드러나는 충돌, 표준 라이브러리의 실제 사례, 그리고 디폴트 메서드를 올바르게 쓰는 기준을 다룬다. 4회에서 람다는 디폴트 메서드를 재정의할 수 없고 다중 상속 규칙은 이번 회차에서 다룬다고 예고했는데, 그 이야기가 여기서 이어진다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>디폴트 메서드는 "인터페이스를 고칠 때 기존 구현 클래스를 깨뜨리지 않기 위한" 장치다. 몸체가 있는 메서드는 인터페이스의 클래스 파일에만 들어가고 구현 클래스에 복사되지 않는다. 호출 시점에 JVM이 수신 객체의 클래스에서 출발해 상위 클래스를 먼저, 그다음 상위 인터페이스 중 가장 구체적인 것을 찾아 실행할 메서드를 고른다. 이 선택 순서가 곧 "클래스가 이긴다", "더 구체적인 인터페이스가 이긴다", "그래도 모호하면 직접 고른다"라는 언어의 세 규칙이 된다. 디폴트 메서드는 행동의 다중 상속을 허용하지만 상태의 다중 상속은 허용하지 않는다. 그래서 좋은 디폴트 메서드는 필드 없이 인터페이스의 다른 추상 메서드 위에 쌓인다.</p></aside>
+
+<h3>인터페이스에 메서드를 추가하면 무엇이 깨지는가</h3>
+<p>호환성에는 두 종류가 있다. <b>소스 호환성(source compatibility)</b>은 기존 소스 코드가 새 버전의 라이브러리와 함께 다시 컴파일되는가를 묻는다. <b>바이너리 호환성(binary compatibility)</b>은 이미 컴파일된 <code>.class</code> 파일이 다시 컴파일하지 않고도 새 버전의 라이브러리와 링크되어 실행되는가를 묻는다. 자바 언어 명세(JLS) 13장은 바이너리 호환성을 다루는 장인데, 여기서 중요한 것은 기준이 "링크 시점에 오류가 생기는가"라는 점이다. 링크는 문제없이 되어도 실제로 그 메서드를 호출하는 순간 오류가 날 수 있다.</p>
+<p>직접 깨뜨려 보자. 라이브러리 1판에 인사 인터페이스가 있고, 사용자는 그것을 구현한 클래스를 만들어 컴파일해 두었다.</p>
+<pre><code class="language-java">// 1판 라이브러리: Greeting.java
+public interface Greeting {
+    String hello();
+}
+
+// 사용자 코드: OldGreeter.java (1판에 맞춰 컴파일해 둔 상태)
+public class OldGreeter implements Greeting {
+    public String hello() { return "hello"; }
+}</code></pre>
+<p>라이브러리 2판이 <code>bye()</code>라는 추상 메서드를 추가한다. 그리고 새 기능을 쓰는 코드가 등장한다.</p>
+<pre><code class="language-java">// 2판 라이브러리: Greeting.java
+public interface Greeting {
+    String hello();
+    String bye();          // 새로 추가한 추상 메서드
+}
+
+// 2판을 쓰는 새 코드: Main.java
+public class Main {
+    public static void main(String[] args) {
+        Greeting g = new OldGreeter();
+        System.out.println(g.hello());
+        System.out.println(g.bye());
+    }
+}</code></pre>
+<p>먼저 사용자가 2판으로 올리면서 <code>OldGreeter.java</code>까지 다시 컴파일하는 경우다. 결과는 컴파일 오류다. 소스 호환성이 깨진 것이다.</p>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">v1/OldGreeter.java:1: error: OldGreeter is not abstract and does not override abstract method bye() in Greeting
+public class OldGreeter implements Greeting {
+       ^
+1 error</code></pre>
+<p>이번에는 <code>OldGreeter.class</code>는 1판으로 컴파일된 그대로 두고, <code>Greeting</code>과 <code>Main</code>만 2판으로 컴파일해서 실행한다. 다른 회사가 만든 jar 안의 클래스가 이런 처지다. 그 jar는 다시 컴파일되지 않는다.</p>
+<pre data-label="실행 결과 (OpenJDK 21.0.13)"><code class="language-text">hello
+Exception in thread "main" java.lang.AbstractMethodError: Receiver class OldGreeter does not define or inherit an implementation of the resolved method 'abstract java.lang.String bye()' of interface Greeting.
+	at Main.main(Main.java:5)</code></pre>
+<p>두 가지를 눈여겨보자. 첫째, <code>hello</code>가 출력되었다. <code>OldGreeter</code> 클래스는 문제없이 로딩되고 링크되었으며 객체도 만들어졌다. JVM은 클래스를 로딩할 때 "추상 메서드를 전부 구현했는가"를 검사하지 않는다. 그런 검사는 컴파일러의 일이다. JLS §13.5.4가 "인터페이스에 abstract 메서드를 추가하는 것은 기존 바이너리와의 호환성을 깨지 않는다"고 적은 이유가 이것이다. 링크 오류가 나지 않으니 정의상 바이너리 호환이다. 둘째, 오류는 <code>bye()</code>를 <b>실제로 호출하는 줄</b>(Main.java:5)에서 났다. JVM이 <code>OldGreeter</code>에서 <code>bye</code>의 구현을 찾았지만 클래스에도, 상위 클래스에도, 상위 인터페이스에도 몸체가 있는 메서드가 없었다. JVM 명세(JVMS)의 <code>invokeinterface</code> 설명은 이렇게 선택된 메서드가 없고 추상이 아닌 후보도 없으면 <code>AbstractMethodError</code>를 던진다고 정한다.</p>
+<p>정리하면 추상 메서드 추가는 "소스는 깨지고, 바이너리는 링크는 되지만 호출하면 터지는" 변경이다. 라이브러리를 만드는 쪽에서 보면 어느 쪽도 받아들일 수 없다. 특히 JDK는 하위 호환성을 가장 중요한 약속으로 삼으므로, <code>Collection</code>에 추상 메서드를 하나 더하는 일은 불가능했다.</p>
+<p>이제 같은 자리에 디폴트 메서드를 넣고 <code>Greeting</code>과 <code>Main</code>만 다시 컴파일해 보자. <code>OldGreeter.class</code>는 여전히 1판 그대로다.</p>
+<pre><code class="language-java">public interface Greeting {
+    String hello();
+    default String bye() { return "bye (default)"; }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">hello
+bye (default)</code></pre>
+<p>이번에는 한 글자도 고치지 않은 옛 클래스가 새 메서드에 응답한다. <code>OldGreeter.java</code>를 다시 컴파일해도 오류가 나지 않는다. 소스와 바이너리 양쪽의 호환성이 지켜진 것이다. 어떻게 이것이 가능한지는 뒤에서 클래스 파일과 JVM의 메서드 선택 절차를 보며 확인한다.</p>
+
+<x-visual id="java-adv3-09-evolution-break" title="인터페이스에 메서드를 추가할 때 세 가지 결과" kind="비교 다이어그램" ratio="16:9">
+<x-hint>같은 옛 구현 클래스가 2판 인터페이스를 만났을 때, 추상 메서드 추가와 디폴트 메서드 추가에서 각각 무엇이 일어나는지 나란히 보여 준다.</x-hint>
+<x-prompt>A clean comparison diagram on a white background, flat style, thin lines, sans-serif font. Top left: a box labeled "Greeting 1판" containing "hello()". Below it a box labeled "OldGreeter.class" with an arrow labeled "구현" pointing up to Greeting 1판. To the right, three vertical columns separated by thin dividers. Column 1 titled "추상 메서드 추가 + 소스 재컴파일": a box "Greeting 2판: bye();" and a red stamp-like label "컴파일 오류". Column 2 titled "추상 메서드 추가 + 옛 바이너리 실행": the same box, then a timeline with a green check labeled "로딩·링크 성공" followed by a red cross labeled "bye() 호출 시 AbstractMethodError". Column 3 titled "디폴트 메서드 추가": a box "Greeting 2판: default bye() {...}" and a green check labeled "bye (default)". Use red for failures and green for success. Maximum 12 labels.</x-prompt>
+<x-caption>추상 메서드 추가는 소스 재컴파일을 깨고 옛 바이너리는 호출 시점에 실패한다. 디폴트 메서드 추가는 둘 다 지킨다.</x-caption>
+</x-visual>
+
+<h3>자바 8 이전의 우회책과 그 한계</h3>
+<p>디폴트 메서드가 없던 시절에도 라이브러리 설계자는 기능을 더해야 했다. 흔히 쓰던 방법은 세 가지였고, 각각 분명한 한계가 있었다.</p>
+<p>첫째는 <b>유틸리티 클래스의 정적 메서드</b>다. <code>java.util.Collections</code>의 Javadoc은 이 클래스가 "컬렉션에 대해 동작하거나 컬렉션을 반환하는 정적 메서드만으로 이루어져 있다"고 소개한다. <code>Collections.sort(list)</code>, <code>Collections.reverse(list)</code>가 그 예다. 인터페이스를 건드리지 않으니 호환성 문제는 없다. 대신 정적 메서드는 다형적이지 않다. <code>Collections.sort</code>는 자기가 받은 리스트가 배열 기반인지 연결 리스트인지 모른 채 한 가지 알고리즘으로 처리해야 하고, 특정 구현이 더 나은 방법을 알고 있어도 끼어들 수 없다. 기능이 타입 바깥에 있으니 <code>list.</code>을 찍어서 찾을 수도 없다.</p>
+<p>둘째는 <b>골격 구현(skeletal implementation)</b> 추상 클래스다. <code>AbstractCollection</code>의 Javadoc은 이 클래스가 "Collection 인터페이스의 골격 구현을 제공해 구현에 드는 노력을 최소화한다"고 적는다. 추상 클래스에는 구현이 있는 메서드를 얼마든지 더할 수 있으므로, 이 클래스를 상속한 구현은 새 메서드를 자동으로 얻는다. 하지만 자바 클래스는 상위 클래스를 하나만 가질 수 있다. 다른 클래스를 이미 상속해서 인터페이스를 직접 구현한 클래스에는 이 방법이 닿지 않는다. 그리고 인터페이스 타입으로 들고 있는 변수에서는 추상 클래스에만 있는 메서드를 부를 수 없다.</p>
+<p>셋째는 <b>확장 인터페이스</b>를 새로 만드는 것이다. 기존 인터페이스를 상속한 새 인터페이스에 메서드를 더하는 방식인데, 그러면 사용하는 쪽은 받은 객체가 새 인터페이스를 구현했는지 <code>instanceof</code>로 확인한 뒤 갈라 써야 한다. 판이 바뀔 때마다 인터페이스 이름이 늘어나고, 기존 API의 매개변수와 반환 타입은 여전히 옛 인터페이스라서 새 기능을 쓰려면 매번 형 변환이 필요하다.</p>
+<p>디폴트 메서드는 이 세 방법의 장점을 합친다. 메서드가 인터페이스 안에 있으니 타입만 보고 찾을 수 있고 다형적이다(구현 클래스가 재정의할 수 있다). 몸체가 있으니 옛 구현 클래스도 그대로 동작한다. 상위 클래스가 무엇이든 인터페이스만 구현했으면 혜택을 받는다. 그 결과로 흐름이 뒤집힌 곳이 있다. JDK 21의 <code>Collections.sort(list, c)</code>는 본문이 <code>list.sort(c);</code> 한 줄이고, Javadoc의 구현 노트도 "이 구현은 <code>List.sort(Comparator)</code>에 위임한다"고 적는다. 예전에는 유틸리티의 정적 메서드가 정렬 알고리즘을 쥐고 있었다면, 이제는 인터페이스의 디폴트 메서드가 기본 알고리즘을 갖고 <code>ArrayList</code> 같은 구현이 그것을 재정의하며, 정적 메서드는 그쪽으로 넘겨 줄 뿐이다.</p>
+
+<h3>디폴트 메서드 소개: 문법과 규칙</h3>
+<p>JLS §9.4는 디폴트 메서드를 "인터페이스에 <code>default</code> 제어자로 선언한 인스턴스 메서드"로 정의한다. 몸체는 언제나 블록이고, 그 블록은 메서드를 재정의하지 않은 구현 클래스에 대한 기본 구현이 된다. 같은 절은 디폴트 메서드가 클래스에 선언하는 구체 메서드(concrete method)와도, 상속도 재정의도 되지 않는 private 인터페이스 메서드와도 구별된다고 덧붙인다. 이 구별은 뒤의 다중 상속 규칙에서 중요해진다.</p>
+<pre><code class="language-java">public interface Shape {
+    double area();                       // 추상 메서드 (암묵적으로 public abstract)
+
+    default String describe() {          // 디폴트 메서드 (자바 8)
+        return label() + " 넓이=" + area();
+    }
+
+    private String label() {             // private 인스턴스 메서드 (자바 9)
+        return getClass().getSimpleName();
+    }
+
+    static Shape unit() {                // 정적 메서드 (자바 8)
+        return () -> 1.0;
+    }
+}</code></pre>
+<p>이 인터페이스 하나에 자바 21 인터페이스가 가질 수 있는 메서드 종류가 다 들어 있다. <code>area()</code>는 제어자가 없으므로 암묵적으로 추상이다. JLS §9.4는 <code>private</code>, <code>default</code>, <code>static</code>이 없는 인터페이스 메서드는 암묵적으로 <code>abstract</code>이고 몸체 대신 세미콜론을 갖는다고 정한다. <code>describe()</code>는 디폴트 메서드이고, 인터페이스의 다른 메서드인 <code>label()</code>과 <code>area()</code>를 불러 결과를 만든다. <code>label()</code>은 자바 9의 JEP 213(Milling Project Coin)이 들여온 private 인터페이스 메서드다. JEP 213은 이것이 자바 8 때 검토되었다가 빠졌고, 인터페이스의 추상이 아닌 메서드들이 코드를 공유할 수 있게 하려고 넣는다고 설명한다. <code>unit()</code>은 정적 메서드로, 람다를 이용해 <code>Shape</code>의 구현 객체를 만들어 돌려주는 팩토리다. <code>Shape</code>는 추상 메서드가 <code>area</code> 하나뿐이므로 함수형 인터페이스이기도 하다. 2회에서 본 대로 디폴트·정적·private 메서드는 추상 메서드 수에 들어가지 않는다.</p>
+<h4>허용되지 않는 조합</h4>
+<p>JLS §9.4는 인터페이스 메서드에 붙일 수 있는 제어자를 <code>public</code>, <code>private</code>, <code>abstract</code>, <code>default</code>, <code>static</code>, <code>strictfp</code>와 애너테이션으로 한정한다. 그리고 <code>abstract</code>·<code>default</code>·<code>static</code> 가운데 둘 이상을 함께 쓰는 것, <code>private</code>을 <code>abstract</code>나 <code>default</code>와 함께 쓰는 것을 컴파일 오류로 정한다(<code>private static</code>은 허용된다). <code>final</code>, <code>synchronized</code>, <code>protected</code>는 목록에 아예 없다. 클래스 파일 수준에서도 JVMS §4.6은 인터페이스 메서드에 <code>ACC_PROTECTED</code>, <code>ACC_FINAL</code>, <code>ACC_SYNCHRONIZED</code>, <code>ACC_NATIVE</code> 플래그를 허용하지 않는다.</p>
+<pre><code class="language-java">interface Counter {
+    final default int a() { return 1; }
+    synchronized default int b() { return 2; }
+    private default int c() { return 3; }
+}</code></pre>
+<pre data-label="javac 출력"><code class="language-text">E8.java:2: error: modifier final not allowed here
+    final default int a() { return 1; }
+                      ^
+E8.java:3: error: modifier synchronized not allowed here
+    synchronized default int b() { return 2; }
+                             ^
+E8.java:4: error: illegal combination of modifiers: private and default
+    private default int c() { return 3; }
+                        ^
+3 errors</code></pre>
+<p>각 금지에는 이유가 있다. <code>final</code>을 허용하면 디폴트 메서드가 구현 클래스의 메서드를 "이길" 수 있어야 하는데, 뒤에서 볼 "클래스가 이긴다" 규칙과 정면으로 부딪힌다. <code>synchronized</code>는 <code>this</code>의 모니터를 잡는다는 뜻인데, 인터페이스는 구현 클래스가 어떤 락 정책을 쓰는지 모른다. 락 정책은 상태를 가진 쪽, 즉 클래스가 정해야 한다. 이 점은 뒤의 "올바른 사용법"에서 동기화 래퍼 실험으로 다시 확인한다. <code>private default</code>는 말 자체가 모순이다. 디폴트 메서드는 구현 클래스가 물려받으라고 있는 것인데 private은 상속되지 않는다.</p>
+<h4>Object의 메서드는 디폴트로 정의할 수 없다</h4>
+<p>JLS §9.4.1.2는 디폴트 메서드가 <code>Object</code>의 private이 아닌 메서드와 오버라이드 동등(override-equivalent)하면 컴파일 오류라고 정하고, 그 이유를 "인터페이스를 구현하는 모든 클래스는 그 메서드의 구현을 이미 물려받기 때문"이라고 설명한다.</p>
+<pre><code class="language-java">interface Named {
+    default String toString() { return "named"; }
+    default boolean equals(Object o) { return false; }
+}</code></pre>
+<pre data-label="javac 출력"><code class="language-text">E1.java:2: error: default method toString in interface Named overrides a member of java.lang.Object
+    default String toString() { return "named"; }
+                   ^
+E1.java:3: error: default method equals in interface Named overrides a member of java.lang.Object
+    default boolean equals(Object o) { return false; }
+                    ^
+2 errors</code></pre>
+<p>모든 클래스는 <code>Object</code>를 상속하므로 <code>toString</code>, <code>equals</code>, <code>hashCode</code>를 언제나 상위 클래스로부터 받는다. 뒤에서 볼 첫 번째 규칙(클래스에서 온 메서드가 인터페이스의 디폴트보다 우선한다) 때문에 이런 디폴트 메서드는 절대 실행될 수 없다. 실행될 수 없는 코드를 쓰게 두는 대신 컴파일러가 막는 것이다. 반면 <code>Comparator</code>처럼 <code>boolean equals(Object)</code>를 <b>추상</b> 메서드로 다시 선언하는 것은 허용된다. 그것은 구현을 주는 것이 아니라 Javadoc으로 계약을 문서화하는 용도다.</p>
+<h4>정적 메서드는 상속되지 않는다</h4>
+<p>인터페이스의 정적 메서드는 반드시 인터페이스 이름으로 불러야 한다. JLS §8.4.8의 상속 규칙에서 클래스가 상위 인터페이스로부터 물려받는 것은 추상 메서드와 디폴트 메서드뿐이고, 정적 메서드는 들어 있지 않다. <code>ArrayList</code>는 <code>List</code>를 구현하지만 <code>List.of</code>를 물려받지 않는다.</p>
+<pre><code class="language-java">List<Integer> a = ArrayList.of(1, 2);   // 오류
+List<Integer> b = new ArrayList<>();
+List<Integer> c = b.of(1);              // 오류</code></pre>
+<pre data-label="javac 출력"><code class="language-text">E7.java:4: error: cannot find symbol
+        List<Integer> a = ArrayList.of(1, 2);
+                                   ^
+  symbol:   method of(int,int)
+  location: class ArrayList
+E7.java:6: error: illegal static interface method call
+        List<Integer> c = b.of(1);
+                              ^
+  the receiver expression should be replaced with the type qualifier 'List<Integer>'
+2 errors</code></pre>
+<p>클래스의 정적 메서드는 하위 클래스 이름으로도, 심지어 인스턴스 참조로도 부를 수 있는 것과 대조적이다. 인터페이스 정적 메서드가 상속되지 않으면 여러 인터페이스가 같은 이름의 정적 메서드를 가져도 구현 클래스에서 모호함이 생기지 않는다. <code>List.of</code>와 <code>Set.of</code>를 동시에 물려받는 클래스가 있다면 <code>of</code>가 무엇을 뜻하는지 정할 방법이 없었을 것이다.</p>
+<div class="table-wrap"><table><thead><tr><th>종류</th><th>도입</th><th>몸체</th><th>구현 클래스가 상속</th><th>호출 방법</th></tr></thead><tbody>
+<tr><td>추상 메서드</td><td>처음부터</td><td>없음</td><td>예(구현 의무)</td><td>객체를 통해</td></tr>
+<tr><td>디폴트 메서드</td><td>자바 8</td><td>있음</td><td>예(재정의 가능)</td><td>객체를 통해, 또는 <code>X.super.m()</code></td></tr>
+<tr><td>정적 메서드</td><td>자바 8</td><td>있음</td><td>아니오</td><td>인터페이스 이름으로만</td></tr>
+<tr><td>private 메서드(인스턴스·정적)</td><td>자바 9</td><td>있음</td><td>아니오</td><td>같은 인터페이스 안에서만</td></tr>
+</tbody></table></div>
+
+<h3>디폴트 메서드 안의 this와 클래스 파일</h3>
+<p>디폴트 메서드 본문의 <code>this</code>는 무엇일까. 인터페이스는 객체를 만들 수 없으니, <code>this</code>는 언제나 <b>그 인터페이스를 구현한 클래스의 객체</b>다. 위 <code>Shape</code>를 구현하는 두 클래스와 실행 코드를 보자.</p>
+<pre><code class="language-java">public class Square implements Shape {
+    public double area() { return 4.0; }
+}
+
+public class Circle implements Shape {
+    private final double r;
+    public Circle(double r) { this.r = r; }
+    public double area() { return Math.PI * r * r; }
+
+    @Override
+    public String describe() {
+        return "원: " + Shape.super.describe();   // 디폴트 구현을 직접 호출
+    }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        Shape s = new Square();
+        System.out.println(s.describe());      // 인터페이스 타입으로 호출
+        Square q = new Square();
+        System.out.println(q.describe());      // 클래스 타입으로 호출
+        System.out.println(new Circle(1).describe());
+        System.out.println(Shape.unit().area());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Square 넓이=4.0
+Square 넓이=4.0
+원: Circle 넓이=3.141592653589793
+1.0</code></pre>
+<p>첫 줄을 따라가 보자. <code>s.describe()</code>는 <code>Shape</code>의 디폴트 메서드를 실행한다. 그 안에서 <code>label()</code>이 <code>getClass().getSimpleName()</code>을 부르는데, <code>this</code>가 <code>Square</code> 객체이므로 <code>"Square"</code>가 나온다. 이어서 <code>area()</code>를 부르면 <code>Square.area()</code>가 실행되어 4.0이 된다. 디폴트 메서드는 "인터페이스가 정한 뼈대 안에서 구현 클래스가 채운 메서드를 부르는" 구조, 즉 템플릿 메서드 패턴을 상태 없이 표현한다. 세 번째 줄의 <code>Circle</code>은 <code>describe()</code>를 재정의하면서 <code>Shape.super.describe()</code>로 디폴트 구현을 불렀다. 그 디폴트 구현 안에서 다시 <code>this</code>는 <code>Circle</code> 객체이므로 <code>"Circle"</code>과 원의 넓이가 나온다.</p>
+<h4>javap로 본 인터페이스</h4>
+<p><code>javap -v -p Shape</code>로 클래스 파일을 열면 각 메서드의 플래그와 바이트코드가 보인다(필요한 부분만 발췌).</p>
+<pre data-label="javap -v -p Shape 발췌"><code class="language-text">  major version: 65
+  flags: (0x0601) ACC_PUBLIC, ACC_INTERFACE, ACC_ABSTRACT
+
+  public abstract double area();
+    flags: (0x0401) ACC_PUBLIC, ACC_ABSTRACT
+
+  public default java.lang.String describe();
+    flags: (0x0001) ACC_PUBLIC
+    Code:
+         0: aload_0
+         1: invokeinterface #1,  1    // InterfaceMethod label:()Ljava/lang/String;
+         6: aload_0
+         7: invokeinterface #7,  1    // InterfaceMethod area:()D
+        12: invokedynamic #11,  0     // InvokeDynamic #0:makeConcatWithConstants:(Ljava/lang/String;D)Ljava/lang/String;
+        17: areturn
+
+  private java.lang.String label();
+    flags: (0x0002) ACC_PRIVATE
+
+  public static Shape unit();
+    flags: (0x0009) ACC_PUBLIC, ACC_STATIC
+
+  private static double lambda$unit$0();
+    flags: (0x100a) ACC_PRIVATE, ACC_STATIC, ACC_SYNTHETIC</code></pre>
+<p>클래스 파일에는 "default"라는 플래그가 따로 없다. 디폴트 메서드는 <b>인터페이스 안에 있으면서 <code>ACC_ABSTRACT</code>가 없고 <code>Code</code> 속성(바이트코드)을 가진 public 인스턴스 메서드</b>로 표현된다. JVMS §4.6은 클래스 파일 버전이 52.0 미만이면 인터페이스의 모든 메서드가 <code>ACC_PUBLIC</code>과 <code>ACC_ABSTRACT</code>를 모두 가져야 하고, 52.0 이상이면 <code>ACC_PUBLIC</code>과 <code>ACC_PRIVATE</code> 가운데 정확히 하나를 가져야 한다고 정한다. 52.0은 자바 8의 클래스 파일 버전이다. 즉 "인터페이스 메서드에 몸체가 있어도 된다"는 것은 언어만의 변경이 아니라 클래스 파일 형식과 JVM의 변경이었다. 이 파일은 JDK 21로 컴파일했으므로 major version이 65다.</p>
+<p><code>describe()</code>의 바이트코드는 <code>aload_0</code>(지역 변수 0번, 즉 <code>this</code>)을 스택에 올리고 <code>invokeinterface</code>로 <code>area</code>를 부른다. 인터페이스 안의 코드는 <code>this</code>의 실제 클래스를 모르므로, 자기 인터페이스의 메서드를 부를 때도 가상 호출을 쓴다. 그래서 같은 바이트코드가 <code>Square</code>에서는 4.0을, <code>Circle</code>에서는 원의 넓이를 만든다. JDK 21의 javac는 private 메서드 <code>label()</code>을 부를 때도 <code>invokeinterface</code>를 썼다. private 메서드는 재정의될 수 없으므로 JVMS §5.4.6의 선택 절차에서 해석된 메서드가 private이면 그것이 곧 선택된 메서드다.</p>
+<h4>구현 클래스에는 복사되지 않는다</h4>
+<p>이제 구현 클래스를 보자. <code>javap -p Square</code>의 결과에는 <code>describe</code>가 없다.</p>
+<pre data-label="javap -p Square"><code class="language-text">Compiled from "Square.java"
+public class Square implements Shape {
+  public Square();
+  public double area();
+}</code></pre>
+<p>디폴트 메서드의 바이트코드는 <code>Shape.class</code>에 한 벌만 있고, 구현 클래스에 복사되지 않는다. 컴파일러가 구현 클래스마다 몸체를 복사해 넣는 방식이었다면 이미 컴파일된 옛 클래스는 새 메서드를 가질 수 없었을 것이다. 앞의 <code>OldGreeter</code>가 다시 컴파일하지 않고도 <code>bye()</code>에 응답한 것은 <b>JVM이 실행 시점에 인터페이스까지 찾아가기</b> 때문이다. 이것이 디폴트 메서드가 바이너리 호환성을 지키는 방법이다.</p>
+<h4>호출 지점의 바이트코드</h4>
+<p><code>Main</code>과 <code>Circle</code>의 호출 지점을 <code>javap -c</code>로 보면, 같은 디폴트 메서드가 부르는 방식에 따라 네 가지 명령어로 나타난다.</p>
+<div class="table-wrap"><table><thead><tr><th>소스</th><th>명령어</th><th>상수 풀 참조</th></tr></thead><tbody>
+<tr><td><code>s.describe()</code> (<code>Shape</code> 타입 변수)</td><td><code>invokeinterface</code></td><td><code>InterfaceMethod Shape.describe</code></td></tr>
+<tr><td><code>q.describe()</code> (<code>Square</code> 타입 변수)</td><td><code>invokevirtual</code></td><td><code>Method Square.describe</code></td></tr>
+<tr><td><code>Shape.super.describe()</code> (<code>Circle</code> 안)</td><td><code>invokespecial</code></td><td><code>InterfaceMethod Shape.describe</code></td></tr>
+<tr><td><code>Shape.unit()</code></td><td><code>invokestatic</code></td><td><code>InterfaceMethod Shape.unit</code></td></tr>
+</tbody></table></div>
+<p>두 번째 줄이 흥미롭다. 상수 풀은 <code>Square.describe</code>라는 메서드를 가리키는데, 방금 본 대로 <code>Square.class</code>에는 그런 메서드가 선언되어 있지 않다. 그래도 실행이 된다. JVM이 이 기호 참조를 해석할 때 <code>Square</code>와 그 상위 클래스에서 찾지 못하면 상위 인터페이스까지 찾기 때문이다. 세 번째 줄의 <code>invokespecial</code>은 상위 클래스의 메서드를 <code>super.m()</code>으로 부를 때와 같은 명령어다. 가상 호출이 아니라 "바로 이 인터페이스의 이 구현"을 지정해 부른다는 뜻이다. 그래서 <code>Circle</code>이 <code>describe</code>를 재정의했어도 무한 재귀에 빠지지 않고 <code>Shape</code>의 몸체가 실행된다. 정적 메서드 호출은 <code>invokestatic</code>이지만 참조 종류가 <code>Methodref</code>가 아니라 <code>InterfaceMethodref</code>라는 점이 클래스의 정적 메서드와 다르다.</p>
+
+<h3>JVM은 실행할 메서드를 어떻게 찾는가: 해석과 선택</h3>
+<p>JVM이 가상 호출을 처리하는 과정은 두 단계로 나뉜다. <b>해석(resolution)</b>은 상수 풀의 기호 참조(<code>Square.describe:()Ljava/lang/String;</code> 같은 문자열)를 실제 메서드 하나에 연결하는 일이다. 호출 지점의 정적 타입을 기준으로 하고, 한 번 해석된 결과는 다시 쓴다. <b>선택(selection)</b>은 호출할 때마다 스택에 놓인 수신 객체의 실제 클래스를 보고, 해석된 메서드를 재정의한 메서드 가운데 실제로 실행할 것을 고르는 일이다. 디폴트 메서드를 위해 자바 8에서 두 단계 모두에 "상위 인터페이스를 찾는다"는 단계가 들어갔다.</p>
+<h4>가장 구체적인 상위 인터페이스 메서드</h4>
+<p>두 단계가 공통으로 쓰는 개념이 JVMS §5.4.3.3에 정의된 <b>가장 구체적인 상위 인터페이스 메서드(maximally-specific superinterface method)</b>다. 클래스 C에 대해 이름과 디스크립터가 주어졌을 때 다음 조건을 모두 만족하는 메서드를 말한다.</p>
+<ul>
+<li>C의 상위 인터페이스(직접이든 간접이든)에 선언되어 있다.</li>
+<li>주어진 이름과 디스크립터로 선언되어 있다.</li>
+<li><code>ACC_PRIVATE</code>도 <code>ACC_STATIC</code>도 아니다.</li>
+<li>그 메서드가 인터페이스 I에 선언되어 있을 때, I의 하위 인터페이스에 선언된 다른 후보가 없다.</li>
+</ul>
+<p>마지막 조건이 핵심이다. 하위 인터페이스가 같은 메서드를 다시 선언했으면 상위 인터페이스의 것은 후보에서 빠진다. "더 구체적인 쪽만 남긴다"는 뜻이고, 이것이 뒤에서 볼 두 번째 해석 규칙의 JVM 쪽 근거다.</p>
+<h4>해석 절차</h4>
+<p>JVMS §5.4.3.3의 메서드 해석(<code>Methodref</code>, 즉 <code>invokevirtual</code>이 쓰는 클래스 메서드 참조)은 다음 순서로 진행한다. C가 인터페이스이면 <code>IncompatibleClassChangeError</code>다. 아니면 먼저 C와 그 상위 클래스를 차례로 올라가며 이름과 디스크립터가 같은 메서드를 찾는다. 거기서 찾지 못하면 상위 인터페이스로 넘어간다. 가장 구체적인 상위 인터페이스 메서드 가운데 <code>ACC_ABSTRACT</code>가 없는 것이 정확히 하나면 그것을 고른다. 그렇지 않고 상위 인터페이스 어딘가에 private도 static도 아닌 같은 메서드가 있으면 그중 하나를 임의로 고른다. 그것도 없으면 해석이 실패한다.</p>
+<p>앞의 <code>q.describe()</code>에 적용해 보자. 기호 참조의 클래스는 <code>Square</code>다. <code>Square</code>에 <code>describe()</code> 선언이 없고, 상위 클래스 <code>Object</code>에도 없다. 상위 인터페이스로 가면 후보는 <code>Shape.describe</code> 하나이고 추상이 아니다. 해석은 <code>Shape.describe</code>로 끝난다.</p>
+<h4>선택 절차</h4>
+<p>JVMS §5.4.6의 메서드 선택은 <code>invokeinterface</code>와 <code>invokevirtual</code>이 실행될 때마다 수신 객체의 클래스 C와 해석된 메서드 mR을 가지고 진행한다. mR이 private이면 그것이 선택된다. 아니면 다음 순서다.</p>
+<figure class="flow-figure"><figcaption>JVMS §5.4.6 메서드 선택 순서</figcaption><ol class="flow">
+<li><strong>수신 객체의 클래스</strong><span>C 자신이 mR을 재정의할 수 있는 인스턴스 메서드를 선언했으면 그것을 고른다.</span></li>
+<li><strong>상위 클래스 사슬</strong><span>C의 직접 상위 클래스부터 <code>Object</code>까지 올라가며 처음 발견한 선언을 고른다.</span></li>
+<li><strong>가장 구체적인 상위 인터페이스 메서드</strong><span>클래스 사슬에 없으면 C의 가장 구체적인 상위 인터페이스 메서드를 구한다. 이름과 디스크립터가 맞고 추상이 아닌 것이 정확히 하나면 그것을 고른다.</span></li>
+<li><strong>선택 실패</strong><span>추상이 아닌 후보가 여럿이면 <code>IncompatibleClassChangeError</code>, 하나도 없으면 <code>AbstractMethodError</code>(JVMS의 <code>invokeinterface</code>·<code>invokevirtual</code> 런타임 예외 항목).</span></li>
+</ol></figure>
+<p>이 순서를 앞의 실험에 대 보면 모든 결과가 설명된다. <code>s.describe()</code>에서 수신 객체는 <code>Square</code>다. 1단계에서 <code>Square</code>에 선언이 없고, 2단계에서 <code>Object</code>에도 없으며, 3단계에서 <code>Shape.describe</code>가 유일한 후보로 선택된다. <code>new Circle(1).describe()</code>는 1단계에서 <code>Circle</code>이 선언한 <code>describe</code>가 선택된다. <code>OldGreeter</code> 실험에서 <code>bye()</code>가 디폴트였을 때는 3단계에서 <code>Greeting.bye</code>가 선택되었고, 추상이었을 때는 3단계에서 추상이 아닌 후보가 하나도 없어 4단계의 <code>AbstractMethodError</code>가 났다.</p>
+<p>순서 자체에 설계 의도가 담겨 있다는 점도 보자. 1·2단계, 즉 클래스 사슬이 언제나 3단계의 인터페이스보다 먼저다. 그래서 클래스가 같은 시그니처의 메서드를 가지고 있으면 인터페이스의 디폴트는 결코 선택되지 않는다. 이미 그 메서드를 가진 옛 클래스는 인터페이스가 같은 이름의 디폴트를 새로 얻어도 동작이 바뀌지 않는다. 디폴트 메서드는 "구현이 없을 때만 채워 주는" 기본값이다.</p>
+<aside class="note">HotSpot은 이 탐색을 호출할 때마다 처음부터 하지 않는다. 클래스마다 가상 메서드 테이블(vtable)과 인터페이스 메서드 테이블(itable)을 만들어 선택 결과를 담아 두고, 호출 시에는 표를 찾는다. 명세가 정하는 것은 어떤 메서드가 선택되어야 하는가이고, 표를 어떻게 만들지는 구현의 몫이다.</aside>
+
+<x-visual id="java-adv3-09-selection-order" title="JVM의 메서드 선택 순서" kind="순서도" ratio="16:9">
+<x-hint>수신 객체의 클래스에서 출발해 상위 클래스 사슬, 가장 구체적인 상위 인터페이스 순서로 구현을 찾고, 실패하면 어떤 오류가 나는지 보여 준다.</x-hint>
+<x-prompt>A clean flowchart on a white background, flat style, thin lines, sans-serif font, top to bottom. Start node labeled "invokeinterface / invokevirtual 실행". Decision diamond 1: "수신 객체의 클래스에 선언?" with a "예" arrow to a green box "그 메서드 실행". "아니오" arrow down to decision diamond 2: "상위 클래스 사슬에 선언?" with "예" arrow to the same green box. "아니오" arrow down to decision diamond 3: "가장 구체적인 상위 인터페이스 메서드 중 추상 아닌 것이 몇 개?". Three arrows from diamond 3: "1개" to a green box "디폴트 메서드 실행"; "2개 이상" to a red box "IncompatibleClassChangeError"; "0개" to a red box "AbstractMethodError". On the left side draw a vertical bracket spanning diamonds 1 and 2 labeled "클래스 사슬이 먼저". Maximum 12 labels.</x-prompt>
+<x-caption>클래스 사슬을 먼저 보고, 없을 때만 가장 구체적인 상위 인터페이스의 디폴트 메서드를 고른다.</x-caption>
+</x-visual>
+
+<h3>다중 상속 해석 규칙: 세 가지 원칙</h3>
+<p>오라클의 자바 튜토리얼은 다중 상속을 세 가지로 나눈다. 여러 클래스로부터 필드를 물려받는 <b>상태의 다중 상속</b>, 여러 곳으로부터 메서드 정의를 물려받는 <b>구현의 다중 상속</b>, 여러 인터페이스를 구현해 여러 타입이 되는 <b>타입의 다중 상속</b>이다. 자바가 클래스를 하나만 상속하게 한 이유 중 하나는 상태의 다중 상속이 일으키는 문제(어느 상위 클래스의 생성자가 같은 필드를 초기화하는가)를 피하기 위해서다. 인터페이스는 인스턴스 필드를 가질 수 없으므로 상태 문제는 생기지 않는다. 그런데 튜토리얼이 적듯이 디폴트 메서드는 <b>구현의 다중 상속의 한 형태</b>를 들여왔다. 한 클래스가 같은 이름의 디폴트 메서드를 가진 인터페이스 둘을 구현하면, 어느 쪽을 쓸지 정하는 규칙이 필요하다.</p>
+<p>규칙은 세 가지이고, 위에서부터 차례로 적용한다. 다음 예제 하나에 세 규칙과 경계 사례 하나를 모두 담았다.</p>
+<pre><code class="language-java">public class Rules {
+    // 규칙 1: 클래스가 이긴다
+    interface Greeter { default String greet() { return "Greeter"; } }
+    static class Base { public String greet() { return "Base"; } }
+    static class Child extends Base implements Greeter { }
+
+    // 규칙 2: 더 구체적인 인터페이스가 이긴다 (다이아몬드)
+    interface Animal { default String sound() { return "Animal"; } }
+    interface Dog extends Animal { default String sound() { return "Dog"; } }
+    interface Pet extends Animal { }
+    static class Puppy implements Dog, Pet { }
+    static class Puppy2 implements Animal, Dog { }
+
+    // 규칙 3: 직접 고른다
+    interface Walker { default String move() { return "walk"; } }
+    interface Swimmer { default String move() { return "swim"; } }
+    static class Duck implements Walker, Swimmer {
+        @Override public String move() {
+            return Walker.super.move() + "+" + Swimmer.super.move();
+        }
+    }
+
+    // 경계 사례: 상위 클래스가 물려받은 디폴트 vs 더 구체적인 인터페이스
+    static class Plain implements Animal { }
+    static class Hound extends Plain implements Dog { }
+
+    public static void main(String[] args) {
+        System.out.println(new Child().greet());
+        System.out.println(new Puppy().sound());
+        System.out.println(new Puppy2().sound());
+        System.out.println(new Duck().move());
+        System.out.println(new Hound().sound());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Base
+Dog
+Dog
+walk+swim
+Dog</code></pre>
+<h4>규칙 1: 클래스가 이긴다</h4>
+<p><code>Child</code>는 상위 클래스 <code>Base</code>에서 <code>greet()</code>을, 인터페이스 <code>Greeter</code>에서 같은 시그니처의 디폴트 메서드를 받는다. 결과는 <code>Base</code>다. JLS §8.4.8은 클래스가 상위 인터페이스로부터 디폴트 메서드를 물려받는 조건 중 하나로 "직접 상위 클래스로부터 물려받은 구체 메서드 가운데 시그니처가 같은(서브시그니처인) 것이 없을 것"을 든다. <code>Base.greet()</code>이 있으므로 <code>Greeter.greet()</code>은 <code>Child</code>에 아예 상속되지 않는다. JVM 쪽에서는 앞의 선택 순서 2단계(상위 클래스 사슬)가 3단계(인터페이스)보다 먼저라서 같은 결론이 나온다. 이 규칙이 있어야 인터페이스에 디폴트 메서드를 추가해도 같은 이름의 메서드를 이미 가진 기존 클래스의 동작이 바뀌지 않는다. <code>Object</code>의 메서드를 디폴트로 정의할 수 없는 것도 이 규칙의 결과였다.</p>
+<h4>규칙 2: 더 구체적인 인터페이스가 이긴다</h4>
+<p><code>Puppy</code>는 <code>Dog</code>와 <code>Pet</code>을 구현하고, 둘 다 <code>Animal</code>을 상속한다. 전형적인 다이아몬드 구조다. <code>Pet</code>은 <code>sound()</code>를 다시 선언하지 않았으므로 <code>Pet</code>을 통해 오는 것은 <code>Animal.sound</code>이고, <code>Dog</code>를 통해 오는 것은 <code>Dog.sound</code>다. <code>Dog</code>가 <code>Animal</code>의 하위 인터페이스이고 그 메서드를 재정의했으므로, <code>Animal.sound</code>는 JVMS 정의의 마지막 조건("하위 인터페이스에 선언된 다른 후보가 없을 것")에 걸려 후보에서 빠진다. 남는 것은 <code>Dog.sound</code> 하나다. 언어 쪽에서는 JLS §8.4.8의 마지막 조건, "다른 상위 타입의 메서드가 이 메서드를 재정의하고 있으면 상속하지 않는다"가 같은 일을 한다. <code>Puppy2</code>처럼 <code>Animal</code>을 굳이 함께 나열해도 결과는 같다. JLS §8.4.8.4는 같은 메서드 선언이 여러 경로로 상속될 수 있지만 그것만으로는 아무 문제도 일으키지 않는다고 적는다.</p>
+<pre class="diagram">          Animal                         Walker      Swimmer
+      sound() = "Animal"               move()="walk"  move()="swim"
+        /          \                         \          /
+      Dog          Pet                        \        /
+  sound()="Dog"   (재선언 없음)                   Duck
+        \          /                     (재정의하지 않으면 컴파일 오류)
+          Puppy
+  후보: Dog.sound 하나 (Animal.sound는
+        하위 인터페이스 Dog가 가려서 탈락)
+  결과: "Dog"                            결과: Duck이 직접 고른다</pre>
+<h4>경계 사례: 상위 클래스가 물려받은 디폴트는 "클래스"가 아니다</h4>
+<p>마지막 줄의 <code>Hound</code>는 함정이 많은 사례다. 상위 클래스 <code>Plain</code>은 <code>Animal</code>을 구현해서 <code>sound()</code>를 가지고 있고, <code>Hound</code>는 추가로 <code>Dog</code>를 구현한다. "클래스가 이긴다"를 적용하면 상위 클래스 쪽인 <code>"Animal"</code>이 나올 것 같지만 결과는 <code>"Dog"</code>다. 첫 번째 규칙의 "클래스"는 <b>클래스에 선언된 메서드</b>를 뜻하기 때문이다. JLS §9.4는 디폴트 메서드가 클래스에 선언하는 구체 메서드와 구별된다고 명시한다. <code>Plain</code>이 가진 <code>sound()</code>는 <code>Animal</code>의 디폴트 메서드를 물려받은 것일 뿐이므로, §8.4.8에서 상위 클래스로부터 물려받는 "구체 메서드"에 해당하지 않는다. 그다음에는 규칙 2가 적용되어 <code>Dog.sound</code>가 <code>Animal.sound</code>를 재정의하고 있으니 <code>Dog.sound</code>만 상속된다. JVM의 선택 절차로 보아도 같다. <code>Hound</code>, <code>Plain</code>, <code>Object</code> 어디에도 <code>sound</code>의 선언이 없으므로 3단계로 넘어가고, 가장 구체적인 상위 인터페이스 메서드는 <code>Dog.sound</code> 하나다.</p>
+<h4>규칙 3: 그래도 모호하면 직접 고른다</h4>
+<p><code>Walker</code>와 <code>Swimmer</code>는 서로 아무 관계가 없고 둘 다 <code>move()</code>를 디폴트로 갖는다. 어느 쪽이 더 구체적이지도 않으니 규칙 1, 2로는 결정할 수 없다. 이때 클래스가 <code>move()</code>를 재정의하지 않으면 컴파일 오류다.</p>
+<pre data-label="javac 출력 (Duck이 재정의하지 않았을 때)"><code class="language-text">E2.java:3: error: types Walker and Swimmer are incompatible;
+class Duck implements Walker, Swimmer { }
+^
+  class Duck inherits unrelated defaults for move() from types Walker and Swimmer
+1 error</code></pre>
+<p>JLS §8.4.8.4는 클래스가 디폴트 메서드를 물려받는데 그것과 오버라이드 동등한 다른 메서드도 함께 물려받으면 컴파일 오류라고 정한다. 해결은 직접 재정의하는 것이고, 재정의한 메서드 안에서 <code>인터페이스이름.super.메서드()</code> 문법으로 원하는 디폴트 구현을 부를 수 있다. 예제의 <code>Duck</code>은 둘을 모두 불러 <code>"walk+swim"</code>을 만들었다. 한쪽만 고를 수도 있고, 완전히 새로 구현할 수도 있다. 컴파일러가 강제하는 것은 "모호한 채로 두지 말라"는 것뿐이다.</p>
+
+<h3>규칙의 경계: 추상 메서드, 재추상화, X.super의 제약</h3>
+<p>세 규칙만으로 정리되지 않는 경우들이 있다. 각각 컴파일러가 어떻게 반응하는지 보자.</p>
+<h4>디폴트는 남의 추상 메서드를 대신 구현해 주지 않는다</h4>
+<pre><code class="language-java">interface Walker { default String move() { return "walk"; } }
+interface Robot  { String move(); }
+class Android implements Walker, Robot { }</code></pre>
+<pre data-label="javac 출력"><code class="language-text">E3.java:3: error: Android is not abstract and does not override abstract method move() in Robot
+class Android implements Walker, Robot { }
+^
+1 error</code></pre>
+<p><code>Walker.move</code>에 몸체가 있으니 <code>Robot.move</code>의 구현으로 써 줄 것 같지만 그렇지 않다. JLS §8.4.8.4는 디폴트 메서드와 오버라이드 동등한 다른 메서드를 함께 물려받는 것을, 그 다른 메서드가 추상이든 디폴트든 오류로 본다(인터페이스끼리 상속할 때도 §9.4.1.3이 같은 규칙을 둔다). <code>Walker</code>와 <code>Robot</code>은 서로를 모른다. <code>Walker.move</code>를 쓴 사람은 <code>Robot.move</code>의 계약을 본 적이 없으니, 그것이 <code>Robot</code>의 계약을 만족한다고 볼 근거가 없다. 구현 클래스가 명시적으로 재정의해서 "이 구현이 두 계약을 모두 만족한다"고 선언해야 한다. 같은 상황에서 클래스를 <code>abstract</code>로 선언해도 오류는 사라지지 않는다. 이때 javac는 "inherits abstract and default for move() from types ..."라는 문구로 보고한다.</p>
+<h4>상위 클래스의 추상 메서드는 디폴트를 덮는다</h4>
+<pre><code class="language-java">interface Shape { default double area() { return 0; } }
+abstract class Base { public abstract double area(); }
+class Square extends Base implements Shape { }</code></pre>
+<pre data-label="javac 출력"><code class="language-text">E9.java:3: error: Square is not abstract and does not override abstract method area() in Base
+class Square extends Base implements Shape { }
+^
+1 error</code></pre>
+<p>클래스 쪽에서 온 메서드가 이기는 규칙은 그 메서드가 추상이어도 적용된다. JLS §8.4.8.4는 상위 클래스에 선언된 추상 메서드가 있으면 디폴트-추상 충돌 규칙의 예외로 두면서, "상위 클래스 계층에서 온 추상이라는 주장이 사실상 디폴트 메서드를 이긴다"고 설명한다. <code>Base</code>가 "<code>area</code>는 하위 클래스가 반드시 구현해야 한다"고 선언했으니, 인터페이스의 디폴트가 그 요구를 몰래 채워 버리면 안 된다는 판단이다. 명세는 이 예외가 추상 메서드가 모두 인터페이스에서 온 경우에는 적용되지 않는다고 덧붙인다. 그것이 바로 앞의 <code>Android</code> 사례다.</p>
+<h4>하위 인터페이스는 디폴트를 다시 추상으로 만들 수 있다</h4>
+<pre><code class="language-java">interface Animal { default String sound() { return "..."; } }
+interface Cat extends Animal { String sound(); }   // 재추상화
+class Kitty implements Cat { }</code></pre>
+<pre data-label="javac 출력"><code class="language-text">E10.java:3: error: Kitty is not abstract and does not override abstract method sound() in Cat
+class Kitty implements Cat { }
+^
+1 error</code></pre>
+<p>하위 인터페이스가 상위 인터페이스의 디폴트 메서드를 몸체 없이 다시 선언하면, 그 메서드는 이 인터페이스부터 다시 추상이 된다. 이를 재추상화(re-abstraction)라고 부른다. 상위 인터페이스의 기본 구현이 하위 인터페이스의 의미에는 맞지 않을 때, 구현 클래스가 반드시 자기 구현을 주도록 강제하는 수단이다. JVM 쪽에서 보면 <code>Cat.sound</code>가 <code>Animal.sound</code>보다 구체적인 후보이고 추상이므로, 옛 바이너리가 재정의 없이 실행되면 3단계에서 추상이 아닌 후보가 없어 <code>AbstractMethodError</code>가 난다.</p>
+<h4>X.super.m()은 직접 상위 인터페이스만, 가려지지 않은 것만</h4>
+<pre><code class="language-java">// (가) 직접 상위 인터페이스가 아니다
+interface Animal { default String sound() { return "..."; } }
+interface Dog extends Animal { }
+class Puppy implements Dog {
+    public String sound() { return Animal.super.sound(); }
+}
+
+// (나) 다른 직접 상위 인터페이스가 이미 재정의했다
+interface Animal { default String sound() { return "..."; } }
+interface Dog extends Animal { default String sound() { return "멍"; } }
+class Puppy implements Animal, Dog {
+    public String sound() { return Animal.super.sound(); }
+}</code></pre>
+<pre data-label="javac 출력 (각각 따로 컴파일)"><code class="language-text">E5.java:4: error: not an enclosing class: Animal
+    public String sound() { return Animal.super.sound(); }
+                                         ^
+E4.java:4: error: bad type qualifier Animal in default super call
+    public String sound() { return Animal.super.sound(); }
+                                         ^
+  redundant interface Animal is extended by Dog</code></pre>
+<p>JLS §15.12.1은 <code>I.super.m()</code>에서 I가 이 호출을 둘러싼 클래스나 인터페이스의 <b>직접</b> 상위 인터페이스여야 하고, 다른 직접 상위 타입 J 가운데 I의 하위 타입인 것이 있으면 안 된다고 정한다. (가)는 첫 조건을, (나)는 둘째 조건을 어겼다. 또 §15.12.3은 컴파일 시점에 고른 메서드가 추상이면 안 되고, 다른 직접 상위 타입이 그 메서드를 재정의하고 있으면 안 된다고 정한다. 명세는 마지막 규칙의 의도를 이렇게 설명한다. 하위 인터페이스가 할아버지 인터페이스의 메서드를 재정의했을 때, 구현 클래스가 할아버지를 직접 상위 인터페이스 목록에 끼워 넣는 것만으로 그 재정의를 "건너뛰지" 못하게 하려는 것이다. 상위 클래스의 <code>super.m()</code>이 바로 위 클래스만 부를 수 있고 할아버지 클래스로 건너뛸 수 없는 것과 같은 원칙이다. <code>Dog</code>가 <code>Animal</code>의 동작을 바꾸기로 했다면, <code>Dog</code>를 구현하는 쪽은 그 결정을 존중해야 한다.</p>
+<h4>재정의하는 메서드는 public이어야 한다</h4>
+<p>디폴트 메서드는 public이므로, 구현 클래스에서 재정의할 때 접근 제어자를 빠뜨리면 접근 범위를 좁히는 것이 되어 오류다.</p>
+<pre data-label="javac 출력"><code class="language-text">E6.java:3: error: greet() in Quiet cannot implement greet() in Greeter
+    String greet() { return "..."; }
+           ^
+  attempting to assign weaker access privileges; was public
+1 error</code></pre>
+<div class="table-wrap"><table><thead><tr><th>상황</th><th>결과</th><th>근거</th></tr></thead><tbody>
+<tr><td>클래스에 선언된 메서드 vs 디폴트</td><td>클래스 쪽 실행</td><td>JLS §8.4.8, JVMS §5.4.6 2단계</td></tr>
+<tr><td>상위 클래스의 추상 메서드 vs 디폴트</td><td>구현 의무(디폴트 무시)</td><td>JLS §8.4.8.4 예외</td></tr>
+<tr><td>하위 인터페이스 디폴트 vs 상위 인터페이스 디폴트</td><td>하위 인터페이스 쪽 실행</td><td>가장 구체적인 후보만 남음</td></tr>
+<tr><td>상위 클래스가 물려받은 디폴트 vs 더 구체적인 인터페이스 디폴트</td><td>더 구체적인 인터페이스 쪽</td><td>디폴트는 구체 메서드가 아님(JLS §9.4)</td></tr>
+<tr><td>무관한 두 인터페이스의 디폴트</td><td>컴파일 오류, 재정의 필요</td><td>JLS §8.4.8.4</td></tr>
+<tr><td>디폴트 vs 다른 인터페이스의 추상 메서드</td><td>컴파일 오류, 재정의 필요</td><td>JLS §8.4.8.4, §9.4.1.3</td></tr>
+<tr><td>하위 인터페이스가 추상으로 재선언</td><td>구현 의무</td><td>재추상화</td></tr>
+</tbody></table></div>
+
+<h3>분리 컴파일이 만드는 충돌: 실행 중에 드러나는 다이아몬드</h3>
+<p>규칙 3의 충돌은 컴파일러가 잡아 준다. 하지만 컴파일러는 자기가 컴파일하는 소스만 본다. 이미 컴파일된 클래스가 나중에 바뀐 인터페이스를 만나면 충돌은 실행 중에야 드러난다. 앞에서 추상 메서드 추가를 깨뜨려 본 것처럼, 이번에는 디폴트 메서드 추가를 깨뜨려 보자.</p>
+<pre><code class="language-java">// 1판: 두 인터페이스 모두 비어 있다. Duck은 이 상태로 컴파일되었다.
+public interface Walker { }
+public interface Swimmer { }
+public class Duck implements Walker, Swimmer { }
+
+// 2판: 두 라이브러리가 각자 move()를 디폴트로 추가했다. Duck.class는 그대로다.
+public interface Walker  { default String move() { return "walk"; } }
+public interface Swimmer { default String move() { return "swim"; } }</code></pre>
+<p><code>Walker</code>, <code>Swimmer</code>, 그리고 호출하는 코드만 다시 컴파일한다. 호출하는 코드는 두 가지로 만들었다. <code>Duck</code> 타입 변수로 부르는 것(<code>invokevirtual Duck.move</code>)과 <code>Walker</code> 타입 변수로 부르는 것(<code>invokeinterface Walker.move</code>)이다.</p>
+<pre data-label="Duck 타입으로 호출 (OpenJDK 21.0.13)"><code class="language-text">Exception in thread "main" java.lang.IncompatibleClassChangeError: Conflicting default methods: Walker.move Swimmer.move
+	at Duck.move(Duck.java)
+	at Main2.main(Main2.java:4)</code></pre>
+<pre data-label="Walker 타입으로 호출 (OpenJDK 21.0.13)"><code class="language-text">Duck 객체 생성 성공
+Exception in thread "main" java.lang.AbstractMethodError: Receiver class Duck does not define or inherit an implementation of the resolved method 'java.lang.String move()' of interface Walker.
+	at Main.main(Main.java:6)</code></pre>
+<p>먼저 공통점이다. <code>Duck</code>은 로딩되고 객체도 만들어진다. 충돌은 호출하는 순간에 터진다. JLS §13.5.7은 바로 이 상황을 다룬다. 디폴트 메서드를 추가하거나 추상 메서드를 디폴트로 바꾸는 것은 기존 바이너리와의 호환성을 깨지 않지만, 호출의 한정 타입이 두 인터페이스 I와 J의 하위 타입이고 둘 다 같은 시그니처의 디폴트 메서드를 선언했으며 어느 쪽도 다른 쪽의 하위 인터페이스가 아니면 <code>IncompatibleClassChangeError</code>가 날 수 있다고 적는다. 그리고 "링크 시점에는 오류를 만들지 않으므로 바이너리 호환 변경이다. 컴파일 시점이나 호출 시점에 오류를 만들더라도 그렇다"고 덧붙인다.</p>
+<p>첫 번째 스택 트레이스에서 이상한 줄을 보자. <code>at Duck.move(Duck.java)</code>다. 그런데 <code>javap -p Duck</code>으로 열어 보면 <code>Duck.class</code>에는 생성자밖에 없다. 소스에도 클래스 파일에도 없는 <code>Duck.move</code>가 스택에 찍힌 것이다. 이것은 HotSpot이 메서드 선택이 실패하는 자리를 발견하면, 그 메서드가 호출되었을 때 올바른 예외를 던지도록 <b>오버패스(overpass) 메서드</b>라는 합성 메서드를 만들어 두기 때문이다. 스택 트레이스가 보여 주듯 이 메서드는 <code>Duck</code>에 속한 것으로 나타나지만 클래스 파일에는 없다. OpenJDK 개발자 메일링 리스트의 JDK-8356942 수정 설명은 오버패스 메서드를 "해석이나 선택 오류가 있을 때, 문제의 메서드가 호출되면 올바른 예외(충돌하는 메서드를 보고하는 ICCE 같은)가 나도록 설정하는 것"이라고 설명한다.</p>
+<p>두 번째 결과는 왜 <code>AbstractMethodError</code>일까. JVMS의 <code>invokeinterface</code> 런타임 예외 항목은 선택된 메서드가 없고 추상이 아닌 가장 구체적인 후보가 여럿이면 <code>IncompatibleClassChangeError</code>를 던지라고 정한다. 이 실험의 결과는 명세와 다르다. 위의 JDK-8356942가 바로 이 문제("invokeinterface Throws AbstractMethodError Instead of IncompatibleClassChangeError")다. 설명에 따르면 JDK 10 시절의 다른 수정(JDK-8186092)이 인터페이스의 itable을 초기화할 때 오버패스 메서드를 건너뛰게 만들었고, 그래서 <code>invokeinterface</code> 경로에서는 오버패스가 던질 ICCE 대신 AME가 나왔다. 수정은 2025년 7월 JDK 메인 라인에 통합되었고 jdk25 브랜치에도 백포트되었다. 이 실험에 쓴 OpenJDK 21.0.13에서는 여전히 AME가 나온다.</p>
+<p>실무에서 이 차이가 덜 위험한 이유는 상속 관계에 있다. JDK 21 소스에서 <code>AbstractMethodError</code>는 <code>IncompatibleClassChangeError</code>를 상속한다. 그래서 <code>catch (IncompatibleClassChangeError e)</code>는 둘 다 잡는다.</p>
+<pre><code class="language-java">Walker w = new Duck();
+try {
+    w.move();
+} catch (IncompatibleClassChangeError e) {
+    System.out.println(e.getClass().getSimpleName());
+    System.out.println(e instanceof AbstractMethodError);
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21.0.13)"><code class="language-text">AbstractMethodError
+true</code></pre>
+<p>이 실험에서 얻을 교훈은 두 가지다. 첫째, 디폴트 메서드 추가는 "바이너리 호환"이지만 "실행 시 안전"과 같은 말이 아니다. 서로 모르는 두 라이브러리가 같은 이름의 디폴트 메서드를 추가하면, 두 인터페이스를 함께 구현한 제3의 클래스는 재컴파일 전까지 그 메서드를 부를 수 없다. 둘째, <code>Duck.java</code>를 다시 컴파일하면 이 문제는 앞에서 본 "inherits unrelated defaults" 컴파일 오류로 바뀐다. 즉 분리 컴파일은 컴파일 오류가 될 문제를 런타임으로 미룰 뿐이다. 운영 환경에서 <code>IncompatibleClassChangeError</code>나 <code>AbstractMethodError</code>를 만나면, 먼저 클래스 경로에 서로 다른 시점에 컴파일된 라이브러리 버전이 섞여 있지 않은지 의심해야 한다.</p>
+
+<x-visual id="java-adv3-09-overpass" title="분리 컴파일로 생긴 디폴트 메서드 충돌" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>옛날에 컴파일된 Duck.class가 나중에 디폴트 메서드를 얻은 두 인터페이스를 만나, 로딩은 성공하지만 호출 시점에 오류가 나는 과정을 보여 준다.</x-hint>
+<x-prompt>A clean sequence-style diagram on a white background, flat style, thin lines, sans-serif font. Left: a box labeled "Duck.class (1판으로 컴파일)" showing only "Duck()". Center top: two boxes side by side labeled "Walker 2판: default move()" and "Swimmer 2판: default move()". Right: a box labeled "JVM". Step arrows numbered 1 to 3 from left to right: arrow 1 labeled "로딩·링크 성공" to JVM; inside JVM draw a small dashed box labeled "오버패스 Duck.move (합성)" attached to Duck. Arrow 2 from a caller box "Main" to JVM labeled "d.move() (invokevirtual)", ending at a red box "IncompatibleClassChangeError: Conflicting default methods". Arrow 3 from Main labeled "w.move() (invokeinterface)", ending at a red box "AbstractMethodError (JDK 21)". Maximum 12 labels.</x-prompt>
+<x-caption>충돌은 로딩이 아니라 호출 시점에 드러난다. HotSpot은 충돌 자리에 예외를 던지는 오버패스 메서드를 합성해 둔다.</x-caption>
+</x-visual>
+
+<h3>HotSpot 안에서: 디폴트 메서드는 클래스를 로딩할 때 미리 골라 둔다</h3>
+<p>앞에서는 JVMS §5.4.6의 선택 절차를 "호출할 때마다" 진행되는 것처럼 설명했고, HotSpot은 그 결과를 vtable과 itable에 담아 둔다고만 짧게 적었다. 명세가 정하는 것은 어떤 메서드가 선택되어야 하는가뿐이니, 실제로 언제 어떻게 고르는지는 구현을 열어 봐야 안다. 이 절은 OpenJDK 21 HotSpot 소스(github.com/openjdk/jdk21u의 <code>src/hotspot/share</code> 아래 <code>classfile/classFileParser.cpp</code>, <code>classfile/defaultMethods.cpp</code>, <code>oops/klassVtable.cpp</code>, <code>interpreter/linkResolver.cpp</code>)와 <code>-Xlog:defaultmethods=debug</code> 로그로 그 과정을 따라간다. 여기 나오는 함수 이름과 자료 구조는 모두 OpenJDK 21 HotSpot의 구현이고 명세가 아니다.</p>
+<h4>언제: 클래스 파일을 파싱한 직후, 조상에 디폴트 메서드가 있을 때만</h4>
+<p><code>ClassFileParser</code>는 클래스 파일을 읽으면서 <code>_has_nonstatic_concrete_methods</code>라는 표시를 계산한다. 인터페이스가 static도 abstract도 아닌 메서드, 즉 몸체가 있는 인스턴스 메서드를 선언하면 이 표시가 켜지고, 클래스나 인터페이스는 직접 상위 인터페이스나 상위 클래스 가운데 하나라도 이 표시를 가지면 같이 켠다. 파싱을 마무리하는 단계의 소스에는 "Generate any default methods"라는 주석 아래 이 표시가 켜졌을 때만 <code>DefaultMethods::generate_default_methods</code>를 부르는 코드가 있다. 조상 어디에도 디폴트 메서드가 없는 클래스는 이 처리를 통째로 건너뛴다. 그리고 이 처리는 클래스마다 로딩할 때 한 번 일어난다. JVMS가 말하는 "가장 구체적인 상위 인터페이스 메서드" 계산은 HotSpot에서 호출 시점이 아니라 로딩 시점의 일이다.</p>
+<h4>무엇을 채우는가: 빈 vtable 칸과 미란다 메서드</h4>
+<p>파서는 vtable 크기를 계산하는 <code>klassVtable::compute_vtable_size_and_num_mirandas</code>에서 <b>미란다 메서드(miranda method)</b> 목록도 만든다. <code>klassVtable.cpp</code>의 주석은 미란다를 "이 클래스에서 재정의되지 않을, private이 아닌 추상 메서드"로 정의하고, 첫 계산에서는 vtable에 자리를 마련해 두려고 상위 인터페이스의 디폴트 메서드까지 후보에 넣는다고 적는다. 쉽게 말해 클래스 자신과 상위 클래스 사슬 어디에도 구현이 없는 인터페이스 메서드, 곧 JVMS 선택 절차의 1·2단계가 실패할 이름·디스크립터 쌍이다. <code>generate_default_methods</code>는 이 목록에 "상위 클래스가 디폴트나 오버패스로 채워 두었지만 이 클래스가 직접 구현하지 않은 메서드"를 더해 <b>채워야 할 빈 칸</b>(소스의 <code>EmptyVtableSlot</code>) 목록을 만든다. 상위 클래스가 채운 칸을 다시 보는 이유를 소스 주석은 "상위 클래스를 위한 디폴트 처리가 없었다면 미란다였을 메서드이므로, 새 문맥에서 다시 검토한다"고 설명한다. 예를 들어 <code>Plain</code>을 상속만 하고 인터페이스를 직접 나열하지 않은 <code>class Sub extends Plain { }</code>은 미란다 목록이 비지만, <code>Plain</code>이 디폴트로 채운 <code>sound</code>가 이 경로로 빈 칸 목록에 들어간다. 앞의 <code>Hound</code>는 <code>Dog</code>를 직접 나열하므로 <code>sound</code>가 이미 미란다 목록에 들어 있고, 이 경로에서는 같은 이름·디스크립터라 중복으로 걸러진다.</p>
+<h4>어떻게 고르는가: 깊이 우선 탐색과 자격 박탈</h4>
+<p>빈 칸마다 <code>FindMethodsByErasedSig</code>라는 방문자가 클래스 계층을 깊이 우선으로 걷는다. 클래스에서 같은 이름·디스크립터의 메서드를 만나면 <code>set_target_if_empty</code>로 그것을 곧바로 대상으로 정한다. 소스 주석은 이것을 "클래스의 메서드가 인터페이스의 메서드를 '이기는' 규칙"이라고 부르고, 단일 상속이기 때문에 이 방식이 성립한다고 적는다. 인터페이스에서 만나면 <code>record_method_and_dq_further</code>가 그 메서드를 기록한 뒤, 같은 경로에서 그보다 위쪽에서 만나는 같은 메서드를 모두 <code>DISQUALIFIED</code>(자격 박탈)로 기록한다. 경로를 빠져나오면 상태가 되돌아가고, 한 메서드가 어느 경로에서든 한 번이라도 박탈로 기록되면 박탈 상태가 유지된다. 그래서 방문 순서와 상관없이 하위 인터페이스에 가려진 메서드는 빠진다. 이것이 JVMS 정의의 마지막 조건("하위 인터페이스에 다른 후보가 없을 것")을 구현한 부분이다. 마지막으로 <code>determine_target_or_set_exception_message</code>가 자격이 남은 디폴트 메서드를 센다. 하나면 그것이 대상이다. 하나도 없으면 <code>AbstractMethodError</code>를, 둘 이상이면 "Conflicting default methods: ..." 메시지의 <code>IncompatibleClassChangeError</code>를 준비한다.</p>
+<p>로그로 확인해 보자. 앞의 <code>Square</code>와 <code>Hound</code>를 <code>java -Xlog:defaultmethods=debug</code>로 실행하고 해당 클래스 부분만 추렸다(앞의 시각 표시는 지웠다).</p>
+<pre data-label="-Xlog:defaultmethods=debug 발췌 (OpenJDK 21.0.13)"><code class="language-text">[debug][defaultmethods] Class Square requires default method processing
+[debug][defaultmethods] Square
+[debug][defaultmethods]   java/lang/Object
+[debug][defaultmethods]   Shape
+[debug][defaultmethods] Slots that need filling:
+[debug][defaultmethods]   describe()Ljava/lang/String;
+[debug][defaultmethods]   Looking for default methods for slot describe()Ljava/lang/String;
+[debug][defaultmethods] Creating defaults and overpasses...
+[debug][defaultmethods] for slot: describe()Ljava/lang/String;
+[debug][defaultmethods]   Selected method: Shape.describe()Ljava/lang/String;
+[debug][defaultmethods] Created 0 overpass methods
+[debug][defaultmethods] Created 1 default  methods
+[debug][defaultmethods] Default method processing complete
+...
+[debug][defaultmethods] Class Hound requires default method processing
+[debug][defaultmethods] Hound
+[debug][defaultmethods]   Plain
+[debug][defaultmethods]     java/lang/Object
+[debug][defaultmethods]     Animal
+[debug][defaultmethods]   Dog
+[debug][defaultmethods]     Animal
+[debug][defaultmethods] Slots that need filling:
+[debug][defaultmethods]   sound()Ljava/lang/String;
+[debug][defaultmethods]   Looking for default methods for slot sound()Ljava/lang/String;
+[debug][defaultmethods] Creating defaults and overpasses...
+[debug][defaultmethods] for slot: sound()Ljava/lang/String;
+[debug][defaultmethods]   Selected method: Dog.sound()Ljava/lang/String;
+[debug][defaultmethods] Created 0 overpass methods
+[debug][defaultmethods] Created 1 default  methods
+[debug][defaultmethods] Default method processing complete</code></pre>
+<p>들여쓰기로 찍힌 부분이 방문자가 걸은 계층이다. <code>Hound</code>에서는 <code>Plain</code>을 거쳐 <code>Animal</code>을 한 번, <code>Dog</code>를 거쳐 <code>Animal</code>을 또 한 번 만난다. <code>Plain</code> 경로에서 만난 <code>Animal.sound</code>는 처음에 자격이 있었지만, <code>Dog</code> 경로에서는 <code>Dog.sound</code>를 먼저 기록한 뒤 그 위의 <code>Animal.sound</code>를 박탈로 기록하므로 최종 후보에서 빠진다. <code>Plain</code>은 클래스지만 <code>sound</code>를 선언하지 않았으니 <code>set_target_if_empty</code>도 불리지 않는다. 앞에서 "상위 클래스가 물려받은 디폴트는 클래스에 선언된 메서드가 아니다"라고 했던 것이 HotSpot에서는 이렇게 처리된다.</p>
+<h4>결과 1: default_methods 배열, 복사가 아니라 포인터</h4>
+<p>대상이 정해졌고 그것이 인터페이스의 메서드이면 <code>create_default_methods</code>가 그 메서드를 클래스의 <code>_default_methods</code> 배열에 넣는다. <code>instanceKlass.hpp</code>는 이 필드를 "인터페이스로부터 물려받은 구체 메서드"의 배열이라고 설명한다. 배열의 원소 타입은 <code>Method*</code>, 즉 인터페이스에 이미 있는 메서드 메타데이터를 가리키는 포인터다. 바이트코드를 복사한 새 메서드를 만들지 않는다. 함께 <code>_default_vtable_indices</code> 배열을 만들어 두고, 각 디폴트 메서드가 이 클래스의 vtable 몇 번째 칸에 들어가는지는 링크 때 vtable을 채우면서 이 배열에 기록한다.</p>
+<p>클래스를 링크할 때 <code>klassVtable::initialize_vtable</code>은 상위 클래스의 vtable을 복사한 뒤 이 클래스가 선언한 메서드를 재정의 칸이나 새 칸에 놓고, 이어서 <code>default_methods</code>의 메서드를 놓고, 마지막으로 남은 미란다를 채운다. 그래서 <code>Square</code>의 vtable에는 <code>Shape.describe</code>를 가리키는 칸이 생기고, <code>invokevirtual Square.describe</code>는 그 칸을 거쳐 인터페이스의 바이트코드를 곧장 실행한다. 링크 해석기가 수신 클래스에서 실행할 메서드를 찾을 때 쓰는 <code>LinkResolver::lookup_instance_method_in_klasses</code>도 같은 구조를 따른다. 수신 클래스와 그 상위 클래스들의 메서드 배열을 먼저 찾고, 거기서 찾지 못했을 때만 수신 클래스의 <code>default_methods</code> 배열을 본다. JVMS의 1·2단계(클래스 사슬)와 3단계(상위 인터페이스)가 "메서드 배열 다음에 디폴트 배열"이라는 두 번의 조회로 바뀐 것이고, 3단계에 필요한 계층 탐색은 로딩 때 이미 끝나 있다. 클래스에 선언된 메서드와 물려받은 디폴트가 HotSpot 안에서는 <code>_methods</code>와 <code>_default_methods</code>라는 서로 다른 배열에 산다는 점도 보자. <code>Plain</code>의 <code>_methods</code>에는 <code>sound</code>가 없으므로 <code>Hound</code>에서 상위 클래스 사슬을 뒤져도 걸리지 않는다.</p>
+<h4>결과 2: 오버패스 메서드, 예외를 던지는 바이트코드 다섯 개</h4>
+<p>후보가 없거나 둘 이상이면 <code>create_defaults_and_exceptions</code>가 오버패스 메서드를 만든다. 몸체를 조립하는 <code>assemble_method_error</code>의 코드는 짧다. 예외 클래스로 <code>new</code>, <code>dup</code>, 메시지 문자열을 <code>ldc</code>(상수 풀 인덱스가 255를 넘으면 <code>ldc_w</code>), 문자열 하나를 받는 생성자를 <code>invokespecial</code>, 그리고 <code>athrow</code>다. 소스 주석대로 최대 스택 깊이는 3(예외 객체 두 개와 문자열 하나)이다. 접근 플래그는 <code>ACC_PUBLIC | ACC_SYNTHETIC | ACC_BRIDGE</code>이고 메서드 종류는 <code>ConstMethod::OVERPASS</code>로 표시된다. 이 메서드는 <code>_default_methods</code>가 아니라 클래스 자신의 메서드 배열에 합쳐진다(<code>merge_in_new_methods</code>). 앞 절의 스택 트레이스에서 <code>at Duck.move(Duck.java)</code>가 <code>Duck</code>의 메서드로 찍힌 이유가 이것이다. 이 합성 메서드는 줄 번호 표 없이 할당되므로 파일 이름 뒤에 줄 번호가 붙지 않았다. <code>Duck</code>의 처리 로그는 이렇다.</p>
+<pre data-label="-Xlog:defaultmethods=debug 발췌 (OpenJDK 21.0.13)"><code class="language-text">[debug][defaultmethods] Class Duck requires default method processing
+[debug][defaultmethods] Duck
+[debug][defaultmethods]   java/lang/Object
+[debug][defaultmethods]   Walker
+[debug][defaultmethods]   Swimmer
+[debug][defaultmethods] Slots that need filling:
+[debug][defaultmethods]   move()Ljava/lang/String;
+[debug][defaultmethods]   Looking for default methods for slot move()Ljava/lang/String;
+[debug][defaultmethods] 'Conflicting default methods: Walker.move Swimmer.move'
+[debug][defaultmethods] Creating defaults and overpasses...
+[debug][defaultmethods] for slot: move()Ljava/lang/String;
+[debug][defaultmethods]   java/lang/IncompatibleClassChangeError: Conflicting default methods: Walker.move Swimmer.move
+[debug][defaultmethods] Created 1 overpass methods
+[debug][defaultmethods] Created 0 default  methods
+[debug][defaultmethods] Default method processing complete</code></pre>
+<p>예외 메시지는 <code>Duck</code>을 로딩할 때 이미 만들어져 오버패스의 상수 풀에 들어간다. 실행 중 호출 시점에 하는 일은 그 바이트코드를 실행하는 것뿐이다. 리플렉션은 이 합성 메서드를 보여 주지 않는다. <code>jvm.cpp</code>에서 <code>getDeclaredMethods</code>의 결과를 고르는 <code>select_method</code>는 생성자가 아닌 메서드 중 오버패스를 뺀다. 같은 <code>Duck</code>에 대해 리플렉션을 써 보면 이렇다.</p>
+<pre data-label="리플렉션으로 본 Duck (OpenJDK 21.0.13)"><code class="language-text">Duck.class.getDeclaredMethods().length → 0
+Duck.class.getMethod("move")           → public default java.lang.String Walker.move()</code></pre>
+<p><code>getMethod</code>가 <code>Walker.move</code>를 돌려준 것은 JVM의 선택 결과가 아니다. <code>Class.getMethod</code>의 Javadoc은 상위 인터페이스들의 후보 가운데 가장 구체적인 것들을 남긴 뒤 "그중에서 임의로 고른다"고 적는다. <code>Walker.move</code>와 <code>Swimmer.move</code>는 서로 더 구체적이지 않으므로 둘 중 하나가 나온 것이다. 리플렉션이 돌려준 <code>Method</code>만 보고 "<code>Duck</code>은 <code>Walker</code>의 구현을 쓴다"고 판단하면 틀린다.</p>
+<h4>invokeinterface 경로가 AME를 낸 정확한 자리</h4>
+<p>앞 절에서 같은 <code>Duck</code>을 <code>Duck</code> 타입으로 부르면 ICCE, <code>Walker</code> 타입으로 부르면 AME가 났다. 이 차이도 소스에서 위치를 짚을 수 있다. vtable에는 클래스의 메서드 배열에 합쳐진 오버패스가 들어가므로, <code>invokevirtual Duck.move</code>는 오버패스를 실행해 ICCE를 던진다. 반면 itable을 채우는 <code>klassItable::initialize_itable_for_interface</code>는 OpenJDK 21에서 찾은 대상이 없거나, public이 아니거나, 추상이거나, <b>오버패스이면</b> 그 칸에 대상을 넣지 않는다(public이 아닌 경우에만 <code>IllegalAccessError</code>를 던지는 메서드를 대신 넣고, 나머지는 비워 둔다). 주석은 "Entry does not resolve. Leave it empty for AbstractMethodError or other error."다. 그래서 <code>Duck</code>의 <code>Walker</code> itable에서 <code>move</code> 칸이 비고, 그 칸을 만난 <code>invokeinterface</code>가 AME를 던졌다. 현재 openjdk/jdk 메인 라인의 같은 함수에서는 이 조건에 오버패스 검사가 없다. 앞에서 본 JDK-8356942 수정이 이 조건에서 오버패스 검사를 지웠다(같은 수정은 itable의 로더 제약 검사에서 오버패스를 건너뛰는 처리도 더했다).</p>
+<div class="table-wrap"><table><thead><tr><th>선택 결과(로딩 시점)</th><th>HotSpot이 남기는 것</th><th>invokevirtual</th><th>invokeinterface (OpenJDK 21)</th></tr></thead><tbody>
+<tr><td>클래스 사슬에 선언 있음</td><td>디폴트 처리 없음(빈 칸이 아님)</td><td>클래스의 메서드</td><td>클래스의 메서드</td></tr>
+<tr><td>디폴트 후보 정확히 하나</td><td><code>_default_methods</code>에 인터페이스 메서드 포인터</td><td>디폴트 메서드</td><td>디폴트 메서드</td></tr>
+<tr><td>디폴트 후보 둘 이상</td><td>ICCE를 던지는 오버패스를 <code>_methods</code>에 추가</td><td>ICCE("Conflicting default methods")</td><td>itable 칸이 비어 AME</td></tr>
+<tr><td>추상 후보만 있음</td><td>조상에 디폴트가 있어 처리가 돌면 AME를 던지는 오버패스, 디폴트가 전혀 없으면 처리 없이 추상 메서드(미란다) 칸</td><td>AME</td><td>AME</td></tr>
+</tbody></table></div>
+
+<h3>X.super.m()의 제약은 javac만 검사한다: invokespecial의 실제 선택</h3>
+<p>앞에서 <code>X.super.m()</code>에는 두 제약이 있다고 했다. X는 직접 상위 인터페이스여야 하고, 다른 직접 상위 타입이 그 메서드를 재정의하고 있으면 안 된다(JLS §15.12.1, §15.12.3). 그런데 이 호출은 바이트코드에서 <code>invokespecial</code>로 굳어지고, JVM은 JLS가 아니라 JVMS를 따른다. JVMS §4.9.2의 구조 제약은 <code>invokespecial</code>이 가리킬 수 있는 대상을 "인스턴스 초기화 메서드, 현재 클래스의 메서드, 상위 클래스의 메서드, 현재 클래스의 직접 상위 인터페이스의 메서드, <code>Object</code>의 메서드"로 한정한다. 첫 번째 제약(직접 상위 인터페이스)은 JVMS도 요구하지만, 두 번째 제약(다른 경로의 재정의를 건너뛰지 말 것)은 목록에 없다.</p>
+<p>JVMS §6.5의 <code>invokespecial</code> 선택 절차를 보면 이유가 드러난다. 기호 참조가 인터페이스 C를 가리키면, C 자신에 같은 이름·디스크립터의 인스턴스 메서드 선언이 있을 때 그것이 실행할 메서드다. 없을 때만 <code>Object</code>의 public 메서드, 그다음 C의 상위 인터페이스 가운데 가장 구체적인 메서드를 본다. 수신 객체의 클래스나 다른 상위 인터페이스는 보지 않는다. 그래서 분리 컴파일을 끼우면 javac가 막은 우회가 실행 중에 그대로 일어난다.</p>
+<pre><code class="language-java">// 1판: Dog는 Animal과 아무 관계가 없다. 이 상태로 Puppy를 컴파일했다.
+public interface Animal { default String sound() { return "Animal"; } }
+public interface Dog { }
+public class Puppy implements Animal, Dog {
+    public String sound() { return "Puppy+" + Animal.super.sound(); }
+}
+
+// 2판: Dog가 Animal을 상속하고 sound()를 재정의했다. Dog만 다시 컴파일한다.
+public interface Dog extends Animal { default String sound() { return "Dog"; } }</code></pre>
+<pre data-label="실행과 재컴파일 (OpenJDK 21.0.13)"><code class="language-text">$ java Main                       (1판 그대로)
+Puppy+Animal
+$ javac Dog.java                  (2판 Dog만 재컴파일)
+$ java Main
+Puppy+Animal
+$ javap -c Puppy | grep Animal.sound
+       1: invokespecial #7                  // InterfaceMethod Animal.sound:()Ljava/lang/String;
+$ javac Puppy.java                (Puppy를 2판 기준으로 재컴파일)
+Puppy.java:2: error: bad type qualifier Animal in default super call
+    public String sound() { return "Puppy+" + Animal.super.sound(); }
+                                                    ^
+  redundant interface Animal is extended by Dog
+1 error</code></pre>
+<p>2판에서 <code>Dog</code>는 <code>Animal.sound</code>를 재정의했고, 소스로 보면 <code>Puppy</code>의 <code>Animal.super.sound()</code>는 이제 금지된 우회다. 하지만 이미 컴파일된 <code>Puppy.class</code>는 링크 오류 없이 실행되고 <code>Animal</code>의 몸체를 그대로 부른다. <code>Animal</code>은 여전히 <code>Puppy</code>의 직접 상위 인터페이스이므로 §4.9.2의 구조 제약을 만족하고, §6.5의 선택 1단계에서 <code>Animal</code>에 선언된 <code>sound</code>가 곧바로 골라지기 때문이다. <code>Dog</code>가 무엇을 재정의했는지는 이 명령어의 선택 절차에 들어오지 않는다. 같은 소스를 다시 컴파일하는 순간 앞에서 본 "redundant interface" 오류로 바뀐다.</p>
+<p>이 실험은 가상 호출과 <code>invokespecial</code>의 성격 차이를 보여 준다. <code>invokevirtual</code>과 <code>invokeinterface</code>는 실행할 때마다 수신 객체의 클래스에서 다시 고르므로, 계층이 바뀌면 바뀐 계층대로 동작한다. <code>X.super.m()</code>은 컴파일 시점에 "이 인터페이스의 이 구현"을 바이트코드에 고정해 넣는다. 그래서 그 뒤에 계층이 바뀌어도 반영되지 않는다. 하위 인터페이스의 재정의 결정을 존중하라는 JLS의 규칙은 소스를 다시 컴파일할 때만 지켜진다.</p>
+
+<h3>표준 라이브러리는 디폴트 메서드를 어떻게 썼나</h3>
+<p>JDK 8 이후의 컬렉션과 함수형 인터페이스에는 디폴트 메서드가 많다. 그 소스를 읽으면 디폴트 메서드를 어떻게 설계해야 하는지가 구체적으로 보인다. 아래는 모두 OpenJDK 21 소스(<code>lib/src.zip</code>)에서 확인한 내용이다.</p>
+<h4>Iterable.forEach와 ArrayList의 재정의</h4>
+<pre><code class="language-java">// java.lang.Iterable (OpenJDK 21)
+default void forEach(Consumer<? super T> action) {
+    Objects.requireNonNull(action);
+    for (T t : this) {
+        action.accept(t);
+    }
+}</code></pre>
+<p>디폴트 구현은 인터페이스가 이미 가진 추상 메서드 <code>iterator()</code>(향상된 for 문이 부르는 것) 위에 쌓여 있다. 어떤 <code>Iterable</code>이든 반복자만 줄 수 있으면 <code>forEach</code>가 동작한다. 그리고 <code>ArrayList</code>는 이것을 재정의한다. 반복자 객체를 만들지 않고 내부 배열 <code>elementData</code>를 인덱스로 직접 돌며, 반복 중에 구조가 바뀌었는지(<code>modCount</code>)를 확인해 <code>ConcurrentModificationException</code>을 던진다. "기본 구현은 계약만 지키는 일반적인 방법, 구현 클래스는 자기 내부 구조를 아는 빠른 방법"이라는 분업이다. JEP 126이 말한 "더 높은 성능이나 특화된 구현을 위해 디폴트 구현을 재정의할 수 있다"가 이것이다.</p>
+<h4>Collection.removeIf: 반복자 위에 쌓은 기본 구현</h4>
+<pre><code class="language-java">// java.util.Collection (OpenJDK 21)
+default boolean removeIf(Predicate<? super E> filter) {
+    Objects.requireNonNull(filter);
+    boolean removed = false;
+    final Iterator<E> each = iterator();
+    while (each.hasNext()) {
+        if (filter.test(each.next())) {
+            each.remove();
+            removed = true;
+        }
+    }
+    return removed;
+}</code></pre>
+<p>역시 <code>iterator()</code>와 <code>Iterator.remove()</code>만으로 만든 구현이다. <code>ArrayList</code>에서 이 기본 구현을 그대로 쓰면, 반복자의 <code>remove()</code>는 지울 때마다 뒤쪽 원소를 한 칸씩 당기므로 지울 원소가 많을수록 배열 복사가 반복된다. 그래서 <code>ArrayList</code>는 <code>removeIf</code>를 재정의한다. 첫 번째 순회에서는 술어(<code>filter.test</code>)만 호출하며 지울 위치를 비트 배열에 표시하고, 두 번째 순회에서 살아남은 원소를 앞으로 모은 뒤 꼬리를 정리한다. 소스 주석은 이렇게 두 번 순회하는 이유를 "술어가 컬렉션을 재진입해서 읽는 것은 허용하기 위해서(쓰는 쪽은 여전히 CME를 받는다)"라고 적는다. 디폴트 구현이 정한 <b>계약</b>(술어가 참인 원소를 모두 지우고, 지웠으면 true)은 그대로 지키면서 구현 전략만 바꾼 것이다.</p>
+<h4>List.sort와 Collections.sort</h4>
+<pre><code class="language-java">// java.util.List (OpenJDK 21)
+default void sort(Comparator<? super E> c) {
+    Object[] a = this.toArray();
+    Arrays.sort(a, (Comparator) c);
+    ListIterator<E> i = this.listIterator();
+    for (Object e : a) {
+        i.next();
+        i.set((E) e);
+    }
+}</code></pre>
+<p>이 디폴트 구현의 Javadoc <code>@implSpec</code>은 모든 원소를 배열로 꺼내 정렬한 뒤 리스트 반복자로 각 위치에 다시 써 넣는다고 설명하고, 그 이유를 "연결 리스트를 제자리에서 정렬하려 할 때 생길 n² log(n) 성능을 피하기 위해서"라고 밝힌다. 연결 리스트는 인덱스 접근이 O(n)이므로 인덱스로 원소를 바꿔 가며 정렬하면 비싸다. 배열로 꺼내 정렬하고 순차적으로 다시 쓰면 그 비용을 피한다. <code>LinkedList</code>는 이 디폴트를 그대로 쓰고, <code>ArrayList</code>는 이미 배열이 있으므로 <code>Arrays.sort((E[]) elementData, 0, size, c)</code>로 내부 배열을 직접 정렬하도록 재정의한다. 앞에서 본 대로 <code>Collections.sort</code>는 이제 <code>list.sort(c)</code>에 위임한다. 같은 호출이 리스트의 실제 구현에 따라 가장 알맞은 알고리즘으로 연결되는 것, 정적 유틸리티로는 할 수 없던 일이다.</p>
+<h4>추상에서 디폴트로: Iterator.remove</h4>
+<p>자바 7까지 <code>Iterator.remove()</code>는 추상 메서드였다. 삭제를 지원하지 않는 반복자도 모두 이 메서드를 구현해 <code>UnsupportedOperationException</code>을 던져야 했다. 자바 8부터는 디폴트 메서드가 되었고, OpenJDK 21의 몸체는 <code>throw new UnsupportedOperationException("remove");</code> 한 줄이다. <code>@implSpec</code>도 "기본 구현은 <code>UnsupportedOperationException</code>을 던지고 다른 동작은 하지 않는다"고 약속한다. JLS §13.5.7이 말한 "추상 메서드를 디폴트로 바꾸기"의 실제 예다. 이렇게 하면 이미 <code>remove()</code>를 구현한 옛 클래스는 규칙 1에 따라 자기 구현을 계속 쓰고, 새로 만드는 읽기 전용 반복자는 <code>hasNext()</code>와 <code>next()</code>만 구현하면 된다.</p>
+<h4>Map의 디폴트 메서드와 원자성</h4>
+<pre><code class="language-java">// java.util.Map (OpenJDK 21)
+default V putIfAbsent(K key, V value) {
+    V v = get(key);
+    if (v == null) {
+        v = put(key, value);
+    }
+    return v;
+}</code></pre>
+<p>이 코드는 <code>get</code>과 <code>put</code>이라는 두 번의 호출로 이루어져 있다. 두 호출 사이에 다른 스레드가 같은 키를 넣으면, 둘 다 "없다"고 판단하고 둘 다 <code>put</code>을 해서 한쪽 값이 덮인다. 자바 고급 1편에서 본 "확인 후 행동(check-then-act)" 경쟁 조건 그대로다. 그래서 Javadoc의 <code>@implSpec</code>은 "기본 구현은 이 메서드의 동기화나 원자성에 대해 아무것도 보장하지 않는다. 원자성을 보장하는 구현은 이 메서드를 재정의하고 그 동시성 특성을 문서화해야 한다"고 적는다. <code>Map.java</code>에서 이 문장과 비슷한 "makes no guarantees about synchronization or atomicity" 문구는 <code>getOrDefault</code>, <code>forEach</code>, <code>replaceAll</code>, <code>putIfAbsent</code>, <code>remove</code>, <code>replace</code>, <code>computeIfAbsent</code>, <code>compute</code>, <code>merge</code> 같은 디폴트 메서드 문서에 반복해서 나온다. 인터페이스는 구현이 어떤 락을 쓰는지 모르므로, 원자성이 필요한 구현(<code>ConcurrentHashMap</code> 같은)이 직접 재정의해야 한다는 뜻이다.</p>
+<h4>함수형 인터페이스의 조합 메서드</h4>
+<p>2회에서 본 <code>Predicate</code>의 디폴트 메서드도 같은 원칙을 따른다. OpenJDK 21에서 <code>negate()</code>는 <code>return (t) -> !test(t);</code>, <code>and(other)</code>는 <code>return (t) -> test(t) && other.test(t);</code>이다. 둘 다 유일한 추상 메서드 <code>test</code>만 써서 새 <code>Predicate</code>를 만든다. 람다로 만든 객체도 이 메서드들을 그대로 쓸 수 있는 이유는, 람다 객체의 숨겨진 클래스가 <code>Predicate</code>를 구현하고 디폴트 메서드는 앞의 선택 절차 3단계로 인터페이스에서 찾아지기 때문이다. 람다가 디폴트 메서드를 재정의할 수 없다는 4회의 제약은 거꾸로 말하면 "람다 객체의 디폴트 메서드 동작은 인터페이스가 완전히 정한다"는 뜻이다.</p>
+<h4>자바 21의 SequencedCollection과 이름 충돌</h4>
+<p>디폴트 메서드를 이용한 인터페이스 진화는 지금도 진행 중이다. 자바 21의 <a href="https://openjdk.org/jeps/431">JEP 431(Sequenced Collections)</a>은 <code>SequencedCollection</code> 인터페이스를 새로 만들고 <code>List</code>와 <code>Deque</code>가 그것을 상속하게 했다. OpenJDK 21의 <code>List</code>에는 <code>addFirst</code>, <code>addLast</code>, <code>getFirst</code>, <code>getLast</code>, <code>removeFirst</code>, <code>removeLast</code>, <code>reversed</code>가 디폴트 메서드로 들어 있다. 덕분에 자바 21 이전에 만든 <code>List</code> 구현도 다시 컴파일하지 않고 <code>getFirst()</code>에 응답한다.</p>
+<p>그런데 JEP 431의 "위험과 가정" 절은 상속 계층 높은 곳에 <code>reversed()</code>, <code>getFirst()</code> 같은 흔한 이름을 넣으면 충돌 위험이 있다고 인정한다. 특히 <code>List</code>와 <code>Deque</code>가 <code>reversed()</code>를 각자 자기 타입을 반환하도록 공변 재정의(covariant override)하므로, <b>두 인터페이스를 모두 구현한 기존 컬렉션과는 소스와 바이너리 양쪽에서 호환되지 않는다</b>고 적는다. JDK 안의 <code>LinkedList</code>가 그런 클래스였고, <code>LinkedList</code> 자체에 <code>reversed()</code>의 공변 재정의를 추가해서 해결했다(OpenJDK 21 소스에 <code>public LinkedList&lt;E&gt; reversed()</code>가 <code>@since 21</code>로 있다). 같은 상황을 직접 만들어 보면 이렇다.</p>
+<pre><code class="language-java">import java.util.*;
+
+// 자바 17까지는 문제없이 컴파일되던 선언
+public abstract class ListDeque<E> extends AbstractList<E> implements Deque<E> {
+}</code></pre>
+<pre data-label="javac 출력"><code class="language-text">$ javac --release 17 ListDeque.java     (오류 없음)
+$ javac ListDeque.java                   (JDK 21)
+ListDeque.java:4: error: types Deque<E> and List<E> are incompatible;
+public abstract class ListDeque<E> extends AbstractList<E> implements Deque<E> {
+                ^
+  both define reversed(), but with unrelated return types
+  where E is a type-variable:
+    E extends Object declared in class ListDeque
+1 error</code></pre>
+<p>추상 클래스인데도 오류다. 앞에서 본 대로, 무관한 두 디폴트 메서드를 함께 물려받는 것은 클래스가 추상이어도 허용되지 않는다. 이 클래스에 <code>reversed()</code>를 재정의해 넣어도 다음에는 <code>removeLast()</code> 등에서 "inherits abstract and default" 오류가 이어진다(<code>List</code>의 디폴트와 <code>Deque</code>의 추상 메서드가 부딪힌다). <code>LinkedList</code>처럼 충돌하는 메서드를 모두 직접 선언해야 한다. 디폴트 메서드가 호환성을 지켜 주는 범위가 어디까지인지 JDK 스스로 보여 준 사례다.</p>
+
+<h3>디폴트 메서드의 올바른 사용법</h3>
+<p>지금까지 본 규칙과 사례에서 디폴트 메서드를 설계할 때의 기준을 정리할 수 있다. 공식 문서가 "이렇게 써라"라고 목록으로 정해 둔 것은 아니지만, 아래 기준은 모두 앞에서 확인한 명세 규칙과 JDK 소스의 실제 선택에서 나온 것이다.</p>
+<h4>1. 인터페이스의 다른 추상 메서드 위에 쌓을 수 있는 것만 디폴트로 만든다</h4>
+<p><code>forEach</code>는 <code>iterator()</code> 위에, <code>removeIf</code>는 <code>iterator()</code>와 <code>Iterator.remove()</code> 위에, <code>negate</code>는 <code>test</code> 위에, 이 회차의 <code>Shape.describe</code>는 <code>area</code> 위에 쌓였다. 디폴트 메서드가 쓸 수 있는 것은 인터페이스의 공개된 계약뿐이다. 그 계약만으로 정확하게 구현할 수 있다면 좋은 디폴트 메서드 후보이고, 특정 구현의 내부 구조를 알아야만 구현할 수 있다면 인터페이스에 둘 것이 아니다. 기본 구현이 느리더라도 정확하기만 하면, 빠른 구현은 구현 클래스가 재정의로 줄 수 있다. <code>List.sort</code>와 <code>ArrayList.sort</code>의 관계가 그렇다.</p>
+<h4>2. 상태를 흉내 내지 않는다</h4>
+<p>인터페이스에 선언한 필드는 암묵적으로 <code>public static final</code>이다. 인스턴스마다 다른 값을 둘 곳이 없다. 이 제약을 피하려고 인터페이스 안에 정적 <code>Map</code>을 두고 <code>this</code>를 키로 객체별 상태를 저장하는 방식이 가끔 보이는데, 이것은 디폴트 메서드의 취지를 거스른다. 그 맵이 모든 구현 객체를 강하게 참조해 가비지 컬렉션을 막고, 여러 스레드가 공유하는 전역 상태가 되어 동기화 문제를 만든다. 객체마다 상태가 필요한 기능은 상태를 가진 클래스, 즉 추상 클래스나 구현 클래스가 맡아야 한다. 튜토리얼이 정리한 대로 인터페이스가 허용하는 것은 구현의 다중 상속이지 상태의 다중 상속이 아니다.</p>
+<h4>3. 구현 클래스의 불변식과 동기화 정책을 생각한다</h4>
+<p>디폴트 메서드를 새로 추가하면, 그 메서드는 그 인터페이스를 구현한 <b>모든 기존 클래스</b>에 그 클래스 작성자의 검토 없이 들어간다. 기존 클래스가 지키던 규칙을 디폴트 메서드가 모르고 깨뜨릴 수 있다. 가장 분명한 예가 동기화 래퍼다. 자바 7 시절에 만든, 모든 메서드를 <code>synchronized</code>로 감싼 컬렉션 래퍼가 있다고 하자.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class LockCheck {
+    // 자바 7 시절에 만들었다고 가정한 동기화 래퍼.
+    // 그때 Collection에 있던 메서드만 synchronized로 감쌌다.
+    static class OldSyncCollection<E> extends AbstractCollection<E> {
+        private final Collection<E> c;
+        private final Object mutex = this;
+        OldSyncCollection(Collection<E> c) { this.c = c; }
+
+        public int size()               { synchronized (mutex) { return c.size(); } }
+        public boolean add(E e)         { synchronized (mutex) { return c.add(e); } }
+        public boolean remove(Object o) { synchronized (mutex) { return c.remove(o); } }
+        public Iterator<E> iterator()   { return c.iterator(); } // 순회는 호출자가 직접 동기화
+        @Override public String toString() { synchronized (mutex) { return c.toString(); } }
+    }
+
+    public static void main(String[] args) {
+        Collection<Integer> old = new OldSyncCollection<>(new ArrayList<>(List.of(1, 2, 3)));
+        old.removeIf(x -> {
+            System.out.println("old " + x + ": 락 보유 = " + Thread.holdsLock(old));
+            return x == 2;
+        });
+        System.out.println(old);
+
+        Collection<Integer> jdk = Collections.synchronizedCollection(new ArrayList<>(List.of(1, 2, 3)));
+        jdk.removeIf(x -> {
+            System.out.println("jdk " + x + ": 락 보유 = " + Thread.holdsLock(jdk));
+            return x == 2;
+        });
+        System.out.println(jdk);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">old 1: 락 보유 = false
+old 2: 락 보유 = false
+old 3: 락 보유 = false
+[1, 3]
+jdk 1: 락 보유 = true
+jdk 2: 락 보유 = true
+jdk 3: 락 보유 = true
+[1, 3]</code></pre>
+<p><code>Thread.holdsLock(obj)</code>는 현재 스레드가 그 객체의 모니터를 쥐고 있는지 알려 준다. 옛 래퍼의 <code>removeIf</code>는 <code>Collection</code>의 디폴트 구현이 실행되었다. <code>AbstractCollection</code>은 <code>removeIf</code>를 재정의하지 않는다. 디폴트 구현은 <code>iterator()</code>로 반복자를 얻어 <code>each.remove()</code>로 지우는데, 그 어디에도 래퍼의 락이 없다. 단일 스레드 실행 결과는 같아 보여도, 다른 스레드가 <code>add</code>를 하는 동안 이 <code>removeIf</code>가 돌면 래퍼가 약속한 "모든 연산이 상호 배제된다"는 불변식이 깨진다. 래퍼 작성자는 코드 한 줄 바꾸지 않았는데, 자바 8로 올리는 순간 동기화되지 않는 메서드가 생긴 것이다.</p>
+<p>JDK는 자기 래퍼에서 이 문제를 직접 막았다. <code>Collections.SynchronizedCollection</code>의 소스에는 "Override default methods in Collection"이라는 주석 아래 <code>forEach</code>와 <code>removeIf</code>를 <code>synchronized (mutex)</code>로 감싸 재정의한 코드가 있다. 래퍼의 <code>mutex</code>는 기본 생성자에서 <code>this</code>로 정해지므로 실행 결과에서 <code>holdsLock(jdk)</code>가 true였다. 같은 자리의 <code>spliterator()</code>, <code>stream()</code>, <code>parallelStream()</code>은 락 없이 위임하면서 "Must be manually synched by user!"라는 주석을 달았다. 스트림은 호출이 끝난 뒤에 소비되므로 메서드 안에서 락을 잡아도 소용이 없기 때문이다. <code>SynchronizedMap</code>도 "Override default methods in Map" 주석 아래 <code>getOrDefault</code>, <code>putIfAbsent</code>, <code>computeIfAbsent</code> 등을 락으로 감싸 재정의한다. 교훈은 이렇다. 디폴트 메서드를 추가하는 쪽은 그것이 기존 구현의 동기화·불변식과 어떻게 어울릴지 문서로 밝혀야 하고, 불변식을 가진 구현 클래스는 인터페이스가 새 디폴트 메서드를 얻을 때마다 재정의가 필요한지 검토해야 한다.</p>
+<h4>4. 기본 구현이 무엇을 하는지 문서로 약속한다</h4>
+<p>JDK 소스는 디폴트 메서드마다 Javadoc의 <code>@implSpec</code> 태그로 기본 구현의 동작을 적는다. <code>Iterable.forEach</code>는 "기본 구현은 <code>for (T t : this) action.accept(t);</code>처럼 동작한다", <code>List.sort</code>는 배열로 꺼내 정렬한 뒤 다시 쓴다, <code>Map.putIfAbsent</code>는 원자성을 보장하지 않는다고 적었다. 이것은 호출하는 사람보다 <b>재정의하는 사람</b>을 위한 정보다. 구현 클래스 작성자는 이것을 보고 기본 구현이 자기 클래스에서 정확한지(예: <code>removeIf</code>가 <code>iterator().remove()</code>를 쓰므로 반복자가 삭제를 지원해야 한다), 충분히 빠른지, 동기화 정책에 맞는지 판단한다. 기본 구현이 어떤 다른 메서드를 부르는지가 문서에 없으면, 구현 클래스는 그 메서드를 재정의했을 때 무슨 일이 생길지 알 수 없다.</p>
+<h4>5. 이름과 시그니처를 신중히 고른다</h4>
+<p>새 디폴트 메서드의 이름이 기존 구현 클래스에 이미 있는 메서드와 겹치면 두 가지 일이 생긴다. 시그니처가 같으면 규칙 1에 따라 클래스의 메서드가 조용히 그 디폴트를 재정의한 것이 된다. 그 메서드가 전혀 다른 의미였다면, 인터페이스 타입으로 부르는 새 코드는 엉뚱한 동작을 실행한다. 반환 타입이 다르면 그 클래스는 다음 재컴파일에서 오류가 난다. 그리고 앞에서 본 대로 함께 구현되는 다른 인터페이스에 같은 이름이 있으면 다이아몬드 충돌이 생긴다. JEP 431이 <code>SequencedMap</code>의 <code>keySet()</code>을 공변 재정의하는 대신 <code>sequencedKeySet()</code>이라는 새 이름을 만든 것도, 기존 하위 클래스를 무효로 만들 위험이 너무 크다고 판단했기 때문이라고 JEP 본문이 밝힌다.</p>
+<h4>추상 클래스와 인터페이스, 무엇을 고를까</h4>
+<p>디폴트 메서드가 생긴 뒤에도 추상 클래스가 필요한 자리는 분명히 있다. 둘의 차이는 모두 앞에서 확인한 규칙에서 나온다.</p>
+<div class="table-wrap"><table><thead><tr><th>항목</th><th>인터페이스 + 디폴트 메서드</th><th>추상 클래스</th></tr></thead><tbody>
+<tr><td>인스턴스 상태(필드)</td><td>불가(필드는 <code>public static final</code>)</td><td>가능</td></tr>
+<tr><td>생성자</td><td>없음</td><td>있음(상태 초기화 강제 가능)</td></tr>
+<tr><td>메서드 접근 제어자</td><td>public 또는 private</td><td>public, protected, package-private, private</td></tr>
+<tr><td><code>final</code>·<code>synchronized</code> 메서드</td><td>불가</td><td>가능</td></tr>
+<tr><td>여러 개 상속</td><td>가능(타입·구현의 다중 상속)</td><td>하나만</td></tr>
+<tr><td>람다로 구현</td><td>추상 메서드가 하나면 가능</td><td>불가</td></tr>
+<tr><td>같은 이름의 메서드와 경쟁할 때</td><td>클래스에 선언된 메서드에 진다</td><td>인터페이스 디폴트를 이긴다</td></tr>
+</tbody></table></div>
+<p>타입을 정의하고 그 위에 상태 없는 편의 기능을 얹는 것이 목적이면 인터페이스와 디폴트 메서드가 맞다. 구현 클래스가 공유해야 할 상태, 반드시 지켜야 할 초기화 순서, 하위 클래스가 바꾸지 못하게 할 메서드(<code>final</code>), 하위 클래스에만 보여 줄 훅(<code>protected</code>)이 필요하면 추상 클래스가 맞다. 둘을 함께 쓰는 것도 흔하다. 인터페이스로 타입을 정의하고, 그것을 구현하기 쉽게 하는 골격 추상 클래스를 따로 두는 것이다. <code>List</code>와 <code>AbstractList</code>가 지금도 그렇게 짝을 이룬다.</p>
+
+<x-visual id="java-adv3-09-library-pattern" title="디폴트 구현과 구현 클래스의 재정의" kind="구조 다이어그램" ratio="16:9">
+<x-hint>인터페이스의 디폴트 메서드가 추상 메서드 위에 쌓인 일반 구현을 제공하고, 구현 클래스가 자기 내부 구조를 이용해 재정의하는 분업 구조를 보여 준다.</x-hint>
+<x-prompt>A clean structure diagram on a white background, flat style, thin lines, sans-serif font. Top center: a large box labeled "Collection 인터페이스" with two compartments: upper compartment "추상: iterator(), size()" and lower compartment "디폴트: removeIf() → iterator() 위에 구현". Below it three boxes connected by upward arrows labeled "구현": left box "ArrayList" with a highlighted line "removeIf 재정의: 비트 배열 2회 순회"; middle box "LinkedList" with a line "디폴트 그대로 사용"; right box "SynchronizedCollection" with a line "removeIf 재정의: synchronized(mutex)". Draw a dashed arrow from the "디폴트" compartment to the middle box labeled "선택 3단계". Use blue for interface, gray for classes, orange highlight for overrides. Maximum 12 labels.</x-prompt>
+<x-caption>디폴트 구현은 계약만 지키는 일반적인 방법이고, 구현 클래스는 성능이나 동기화 정책 때문에 그것을 재정의한다.</x-caption>
+</x-visual>
+
+<h3>동적 프록시는 디폴트 메서드를 어떻게 다루는가</h3>
+<p>디폴트 메서드를 가진 인터페이스는 프록시로 감싸지는 일이 많다. 스프링의 JDK 동적 프록시, 스프링 데이터 JPA의 리포지토리처럼 인터페이스만 있고 구현 클래스는 실행 중에 만들어지는 경우다. 이때 디폴트 메서드의 몸체가 실행되는지는 앞에서 본 선택 순서로 결정된다. <code>java.lang.reflect.Proxy</code>의 Javadoc은 프록시 인스턴스에 대한 인터페이스 메서드 호출이 인코딩되어 호출 핸들러의 <code>invoke</code>로 전달된다고 적는다. 디폴트 메서드도 인터페이스 메서드이므로 예외가 아니다. 앞의 <code>Shape</code>를 프록시로 감싸 보자.</p>
+<pre><code class="language-java">import java.lang.reflect.*;
+
+public class ProxyDemo {
+    public static void main(String[] args) {
+        ClassLoader cl = Shape.class.getClassLoader();
+        Class<?>[] types = { Shape.class };
+
+        // (1) 모든 호출을 직접 처리하는 핸들러
+        Shape naive = (Shape) Proxy.newProxyInstance(cl, types, (proxy, method, a) -> {
+            System.out.println("  handler: " + method.getName() + " (isDefault=" + method.isDefault() + ")");
+            return method.getReturnType() == double.class ? 2.0 : "핸들러가 만든 값";
+        });
+        for (Method m : naive.getClass().getDeclaredMethods()) {
+            if (m.getName().equals("describe") || m.getName().equals("area")) {
+                System.out.println("프록시 클래스가 선언: " + m);
+            }
+        }
+        System.out.println("(1) " + naive.describe());
+
+        // (2) 디폴트 메서드는 invokeDefault로 인터페이스의 몸체를 실행
+        Shape proper = (Shape) Proxy.newProxyInstance(cl, types, (proxy, method, a) -> {
+            System.out.println("  handler: " + method.getName() + " (isDefault=" + method.isDefault() + ")");
+            if (method.isDefault()) {
+                return InvocationHandler.invokeDefault(proxy, method, a);
+            }
+            return 2.0;   // 추상 메서드 area()는 핸들러가 직접 답한다
+        });
+        System.out.println("(2) " + proper.describe());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21.0.13, 프록시 클래스 이름은 JDK가 정하며 환경에 따라 다를 수 있다)"><code class="language-text">프록시 클래스가 선언: public final java.lang.String jdk.proxy1.$Proxy0.describe()
+프록시 클래스가 선언: public final double jdk.proxy1.$Proxy0.area()
+  handler: describe (isDefault=true)
+(1) 핸들러가 만든 값
+  handler: describe (isDefault=true)
+  handler: area (isDefault=false)
+(2) $Proxy0 넓이=2.0</code></pre>
+<p>첫 두 줄이 핵심이다. JDK가 만든 프록시 클래스는 추상 메서드 <code>area</code>뿐 아니라 디폴트 메서드 <code>describe</code>도 <code>public final</code> 메서드로 직접 선언한다. 같은 실행에서 이 프록시 클래스의 선언 메서드를 모두 찍어 보면 <code>describe</code>, <code>area</code>, <code>equals</code>, <code>hashCode</code>, <code>toString</code>과 private 정적 메서드 <code>proxyClassLookup</code>이 나오고, private 인터페이스 메서드 <code>label</code>이나 정적 메서드 <code>unit</code>은 없다. 클래스에 <code>describe</code>가 선언되어 있으니 선택 1단계에서 프록시 클래스의 메서드가 골라지고, <code>Shape</code>의 디폴트 몸체는 저절로는 결코 실행되지 않는다. "클래스가 이긴다"는 규칙이 여기서도 그대로 작동한 것이다. (1)의 핸들러는 디폴트 메서드인지 신경 쓰지 않았으므로 <code>describe()</code>의 결과가 통째로 핸들러가 만든 값으로 바뀌었다. 인터페이스에 디폴트 메서드를 추가하면, 그 인터페이스를 프록시로 감싸는 모든 핸들러가 새 메서드 호출을 받게 된다는 뜻이기도 하다. 핸들러가 메서드 이름으로 분기하다가 모르는 메서드에 <code>null</code>을 돌려주는 식이라면, 디폴트 메서드 하나가 추가되는 것만으로 동작이 바뀐다.</p>
+<p>(2)는 자바 16에서 추가된 <code>InvocationHandler.invokeDefault</code>를 썼다. Javadoc은 이 메서드가 "프록시 클래스에서 <code>invokespecial</code> 명령어를 실행한 것처럼" 동작하며, <code>X.super.m()</code>을 호출하는 것과 같다고 설명한다. 구현을 보면 정말 그렇다. OpenJDK 21의 <code>Proxy.invokeDefault</code>는 프록시 인스턴스인지, 디폴트 메서드인지 확인한 뒤 <code>Proxy.defaultMethodHandle</code>로 메서드 핸들을 얻는데, 그 안에서 프록시 클래스의 <code>proxyClassLookup</code>으로 얻은 <code>Lookup</code>에 <code>findSpecial(프록시 인터페이스, 이름, 타입, 프록시 클래스)</code>를 호출한다. <code>findSpecial</code>은 <code>invokespecial</code>에 해당하는 메서드 핸들을 만드는 API다. 이렇게 실행된 <code>Shape.describe</code>의 몸체에서 <code>this</code>는 프록시 객체다. 그래서 <code>label()</code>의 <code>getClass().getSimpleName()</code>은 <code>$Proxy0</code>을 돌려주고, <code>label()</code> 호출 자체는 핸들러를 거치지 않는다(private 인터페이스 메서드는 해석된 메서드가 그대로 선택되고, 프록시 클래스도 그것을 선언하지 않는다). 반면 <code>area()</code>는 <code>invokeinterface</code>로 프록시의 <code>area</code>를 다시 부르므로 핸들러로 돌아가 2.0을 받는다. 출력의 "handler" 줄이 <code>describe</code>와 <code>area</code> 두 번뿐인 이유다.</p>
+<p><code>invokeDefault</code>의 Javadoc은 인터페이스 진화와 관련된 경고도 단다. 핸들러가 특정 상위 인터페이스의 디폴트 메서드 <code>Method</code> 객체를 골라 <code>invokeDefault</code>에 넘기는데, 나중에 프록시 인터페이스가 그 메서드를 재정의하면 그 호출은 <code>IllegalArgumentException</code>으로 실패한다. 디폴트 메서드를 추가하거나 추상 메서드를 디폴트로 바꾸는 것이 이미 있는 <code>invokeDefault</code> 코드에 예외를 일으킬 수 있다는 것이다. 앞의 <code>X.super</code> 규칙과 같은 원칙이다. 하위 인터페이스가 재정의를 결정하면, 바깥에서 그 재정의를 건너뛰어 할아버지의 구현을 부를 수 없다.</p>
+<p>자바 16 이전의 라이브러리들은 같은 일을 <code>MethodHandles.Lookup.findSpecial</code>로 직접 했다. 스프링 데이터 커먼즈 3.2.x 소스에는 "리포지토리 프록시에서 디폴트 메서드를 호출하기 위한" 메서드 인터셉터 <code>DefaultMethodInvokingMethodInterceptor</code>가 있다. 이 인터셉터는 호출된 메서드가 디폴트가 아니면 다음 인터셉터로 넘기고(<code>invocation.proceed()</code>), 디폴트이면 <code>MethodHandles.privateLookupIn</code>으로 선언 인터페이스에 대한 <code>Lookup</code>을 얻어 <code>findSpecial</code>로 핸들을 만든 뒤 프록시에 묶어 호출한다. 이름은 달라도 원리는 같다. 프록시 클래스가 모든 인터페이스 메서드를 선언해 "클래스가 이기는" 자리를 차지하므로, 디폴트 몸체를 실행하려면 누군가 <code>invokespecial</code>에 해당하는 호출로 인터페이스의 구현을 직접 지목해야 한다.</p>
+
+<h3>흔한 오해와 함정</h3>
+<ul>
+<li><b>"디폴트 메서드가 생겨서 인터페이스가 추상 클래스와 같아졌다."</b> 아니다. 인터페이스는 여전히 인스턴스 필드도 생성자도 없고, <code>protected</code>·<code>final</code>·<code>synchronized</code> 메서드도 가질 수 없다. 같은 이름의 메서드와 경쟁하면 언제나 클래스 쪽에 진다. 디폴트 메서드는 상태 없는 행동만 물려줄 수 있다.</li>
+<li><b>"디폴트 메서드는 컴파일할 때 구현 클래스에 복사된다."</b> 아니다. <code>javap -p Square</code>에 <code>describe</code>가 없었다. 몸체는 인터페이스의 클래스 파일에만 있고, JVM이 실행 시점에 해석·선택 절차로 찾아간다. 그래서 다시 컴파일하지 않은 옛 클래스도 새 디폴트 메서드를 쓸 수 있다.</li>
+<li><b>"상위 클래스에서 온 것이면 무엇이든 인터페이스를 이긴다."</b> 상위 클래스에 <b>선언된</b> 메서드만 그렇다. 상위 클래스가 다른 인터페이스로부터 물려받은 디폴트는 구체 메서드가 아니므로, 더 구체적인 인터페이스의 디폴트에 진다(<code>Hound</code> 사례). 반대로 상위 클래스에 선언된 추상 메서드는 디폴트를 이긴다.</li>
+<li><b>"<code>X.super.m()</code>으로 어느 조상 인터페이스든 부를 수 있다."</b> 직접 상위 인터페이스만 쓸 수 있고, 다른 직접 상위 타입이 그 메서드를 재정의했으면 쓸 수 없다. 하위 인터페이스가 내린 재정의 결정을 구현 클래스가 건너뛰지 못하게 하려는 규칙이다.</li>
+<li><b>"디폴트 메서드 추가는 언제나 안전하다."</b> 바이너리 호환일 뿐이다. 이름이 같은 디폴트를 가진 다른 인터페이스와 함께 구현된 클래스에서는 호출 시점에 <code>IncompatibleClassChangeError</code>(OpenJDK 21의 <code>invokeinterface</code> 경로에서는 <code>AbstractMethodError</code>)가 나고, 재컴파일하면 컴파일 오류가 된다. 같은 시그니처의 메서드를 가진 기존 클래스에서는 의미가 다른 메서드가 조용히 재정의자가 되고, 동기화 래퍼 같은 클래스에서는 불변식이 깨질 수 있다.</li>
+<li><b>"인터페이스에 <code>toString()</code> 디폴트를 두면 람다 객체의 출력을 바꿀 수 있다."</b> 컴파일 오류다(JLS §9.4.1.2). 모든 클래스가 <code>Object</code>로부터 <code>toString</code>을 받으므로 그런 디폴트는 절대 선택될 수 없다.</li>
+<li><b>"인터페이스의 정적 메서드도 구현 클래스로 부를 수 있다."</b> 아니다. <code>ArrayList.of(...)</code>는 컴파일되지 않는다. 인터페이스 정적 메서드는 상속되지 않으며, 인스턴스 참조로 부르면 "illegal static interface method call" 오류가 난다.</li>
+<li><b>"JVM이 클래스를 로딩할 때 추상 메서드를 다 구현했는지 확인한다."</b> 아니다. 그 검사는 javac가 한다. JVM은 링크까지 문제없이 마치고, 구현이 없는 메서드를 실제로 호출할 때 <code>AbstractMethodError</code>를 던진다. 옛 바이너리가 로딩은 되는데 특정 호출에서만 실패하는 이유다.</li>
+<li><b>"인터페이스를 프록시로 감싸도 디폴트 메서드는 인터페이스의 몸체가 실행된다."</b> 아니다. JDK 동적 프록시 클래스는 디폴트 메서드까지 <code>public final</code>로 직접 선언하므로 호출은 모두 핸들러로 간다. 몸체를 실행하려면 핸들러가 <code>InvocationHandler.invokeDefault</code>(자바 16)나 <code>findSpecial</code>로 만든 메서드 핸들로 인터페이스의 구현을 직접 지목해야 한다.</li>
+</ul>
+
+<h3>정리: 디폴트 메서드를 한 장으로</h3>
+<p>이 회차의 내용을 처음 질문으로 돌아가 정리하자. 인터페이스에 추상 메서드를 추가하면 소스를 다시 컴파일하는 구현 클래스는 컴파일 오류가 나고, 이미 컴파일된 구현 클래스는 링크는 되지만 그 메서드를 호출하는 순간 <code>AbstractMethodError</code>가 난다. 디폴트 메서드는 몸체를 인터페이스의 클래스 파일에 두고, JVM이 호출 시점에 상위 인터페이스까지 찾아 실행하게 함으로써 두 문제를 모두 피한다. 이를 위해 자바 8은 언어(JLS §9.4), 클래스 파일 형식(버전 52.0부터 인터페이스 메서드의 몸체 허용), JVM의 해석·선택 절차(JVMS §5.4.3.3, §5.4.6)를 함께 바꿨다.</p>
+<p>어느 구현이 실행되는지는 JVM의 선택 순서가 정한다. 수신 객체의 클래스와 상위 클래스 사슬에 선언된 메서드가 먼저이고(클래스가 이긴다), 그다음 가장 구체적인 상위 인터페이스의 디폴트 메서드다(더 구체적인 인터페이스가 이긴다). 무관한 인터페이스의 디폴트가 둘 이상이면 컴파일러가 재정의를 요구하고, 구현 클래스는 <code>X.super.m()</code>으로 원하는 것을 고른다(직접 고른다). 분리 컴파일 때문에 컴파일러가 이 충돌을 보지 못하면, 충돌은 실행 중 호출 시점에 오류로 드러난다.</p>
+<p>표준 라이브러리는 디폴트 메서드를 "인터페이스의 추상 메서드만으로 만든 정확한 기본 구현"으로 쓰고, <code>ArrayList</code>나 동기화 래퍼 같은 구현 클래스가 성능과 동기화 정책 때문에 그것을 재정의하는 분업 구조를 택했다. 기본 구현의 동작과 보장하지 않는 것(원자성 등)은 <code>@implSpec</code>으로 문서화한다. 디폴트 메서드를 직접 설계할 때도 같은 기준을 따르면 된다. 상태를 갖지 않고, 다른 추상 메서드 위에 쌓고, 기존 구현의 불변식과 이름 충돌을 검토한다.</p>
+<p>이 지식은 뒤에서 다시 쓰인다. 다음 10회의 병렬 스트림은 <code>Collection</code>의 디폴트 메서드 <code>parallelStream()</code>에서 시작한다. 11회의 함수형 프로그래밍에서 함수를 조합하는 <code>andThen</code>, <code>compose</code>, <code>negate</code>도 모두 디폴트 메서드다. 앞서 읽은 스프링 MVC에서도 같은 진화가 있었다. 스프링 프레임워크 5.3 Javadoc은 <code>WebMvcConfigurerAdapter</code>를 폐기 예정으로 표시하면서 그 이유를 "5.0부터 <code>WebMvcConfigurer</code>가 디폴트 메서드를 가지므로(자바 8 기준선 덕분에) 이 어댑터 없이 직접 구현할 수 있다"고 적는다. 빈 메서드만 가진 어댑터 추상 클래스를 상속하던 방식이, 디폴트 메서드를 가진 인터페이스를 직접 구현하는 방식으로 바뀐 것이다. 앞에서 본 "골격 추상 클래스에서 디폴트 메서드로"의 흐름이 프레임워크에서도 그대로 일어났다.</p>
+<aside class="keyidea"><span>정리의 핵심</span><p>디폴트 메서드는 인터페이스를 진화시키기 위한 장치이고, 그 동작은 "몸체는 인터페이스에 한 벌, 선택은 실행 시점에 클래스 사슬 먼저, 그다음 가장 구체적인 인터페이스"라는 한 문장으로 요약된다. 언어의 세 해석 규칙과 각종 컴파일 오류는 모두 이 선택 순서를 모호함 없이 만들기 위한 장치다. 좋은 디폴트 메서드는 상태 없이 인터페이스의 계약 위에 쌓이고, 무엇을 보장하고 무엇을 보장하지 않는지 문서로 밝힌다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>디폴트 메서드의 존재 이유</dt><dd>인터페이스에 추상 메서드를 더하면 구현 클래스의 소스는 컴파일 오류가 나고 옛 바이너리는 호출 시 <code>AbstractMethodError</code>가 난다. 몸체를 가진 디폴트 메서드는 두 호환성을 모두 지키며 인터페이스를 진화시킨다(JEP 126).</dd>
+<dt>문법 규칙</dt><dd><code>default</code> 제어자와 블록 몸체를 가진 public 인스턴스 메서드다. <code>abstract</code>·<code>static</code>·<code>private</code>와 함께 쓸 수 없고 <code>final</code>·<code>synchronized</code>도 불가하며, <code>Object</code>의 public 메서드를 재정의할 수 없다.</dd>
+<dt>정적·private 인터페이스 메서드</dt><dd>정적 메서드(자바 8)는 상속되지 않아 인터페이스 이름으로만 부른다. private 메서드(자바 9, JEP 213)는 디폴트 메서드끼리 코드를 공유하기 위한 것이다.</dd>
+<dt>클래스 파일 표현</dt><dd>인터페이스 안에서 <code>ACC_ABSTRACT</code> 없이 <code>Code</code> 속성을 가진 public 메서드다. 구현 클래스에 복사되지 않으며, 호출은 정적 타입에 따라 <code>invokeinterface</code>나 <code>invokevirtual</code>, <code>X.super.m()</code>은 <code>invokespecial</code>이 된다.</dd>
+<dt>메서드 선택 순서</dt><dd>수신 객체의 클래스, 상위 클래스 사슬, 가장 구체적인 상위 인터페이스 메서드 순으로 찾는다(JVMS §5.4.6). 추상 아닌 후보가 여럿이면 <code>IncompatibleClassChangeError</code>, 없으면 <code>AbstractMethodError</code>다.</dd>
+<dt>세 해석 규칙</dt><dd>클래스에 선언된 메서드가 이기고, 하위 인터페이스의 디폴트가 상위 인터페이스의 것을 이기며, 그래도 모호하면 재정의해서 <code>X.super.m()</code>으로 직접 고른다.</dd>
+<dt>규칙의 경계</dt><dd>디폴트는 다른 인터페이스의 추상 메서드를 대신 구현하지 않고, 상위 클래스의 추상 메서드는 디폴트를 덮으며, 하위 인터페이스는 디폴트를 재추상화할 수 있다. <code>X.super</code>는 직접 상위 인터페이스이면서 다른 직접 상위 타입이 재정의하지 않은 경우에만 쓸 수 있다.</dd>
+<dt>분리 컴파일 충돌</dt><dd>디폴트 추가는 링크 시점 오류를 만들지 않는 바이너리 호환 변경이지만, 두 인터페이스가 같은 디폴트를 얻으면 옛 클래스는 호출 시점에 실패한다. HotSpot은 오버패스 메서드로 이를 처리하며, OpenJDK 21의 <code>invokeinterface</code> 경로에서는 명세와 달리 AME가 난다(JDK-8356942).</dd>
+<dt>HotSpot의 디폴트 메서드 처리</dt><dd>OpenJDK 21 HotSpot은 클래스를 로딩할 때 <code>defaultMethods.cpp</code>에서 빈 vtable 칸마다 가장 구체적인 디폴트를 미리 골라, 하나면 인터페이스 메서드 포인터를 <code>_default_methods</code>에 넣고, 없거나 여럿이면 예외를 던지는 오버패스를 클래스의 메서드 배열에 넣는다. <code>X.super.m()</code>의 <code>invokespecial</code>은 지목한 인터페이스에서 바로 고르므로 나중에 생긴 다른 경로의 재정의를 보지 않는다.</dd>
+<dt>올바른 사용법</dt><dd>상태 없이 다른 추상 메서드 위에 쌓고, 기본 구현과 보장하지 않는 것을 <code>@implSpec</code>으로 밝히고, 기존 구현의 불변식·동기화 정책과 이름 충돌을 검토한다. 상태와 생성자가 필요하면 추상 클래스를 쓴다.</dd>
+</x-summary>
+
+<x-review>
+<p>사내 공통 모듈의 인터페이스를 고쳐야 하는 상황을 생각해 보자. 이 인터페이스를 구현한 클래스가 여러 팀의 서비스에 흩어져 있고, 각 서비스는 공통 모듈의 jar 버전을 서로 다른 시점에 올린다. 여기에 추상 메서드를 더하면 다음 빌드에서 모든 팀의 컴파일이 깨지고, 아직 다시 빌드하지 않은 서비스는 새 메서드를 부르는 순간 <code>AbstractMethodError</code>로 실패한다. 디폴트 메서드로 추가하면 두 문제를 모두 피할 수 있다. 다만 그 디폴트 구현이 기존 구현 클래스들의 전제와 맞는지, 특히 락이나 트랜잭션 경계를 가진 구현에서 정확히 동작하는지 따져야 한다. 동작을 보장할 수 없다면 기본 구현이 <code>UnsupportedOperationException</code>을 던지게 하고(<code>Iterator.remove</code> 방식) 그 사실을 문서화하는 편이 조용히 잘못 동작하는 것보다 낫다.</p>
+<p>운영 중에 <code>IncompatibleClassChangeError</code>나 <code>AbstractMethodError</code>가 나면, 원인은 거의 언제나 코드가 아니라 클래스 경로다. 오류 메시지의 "Receiver class X does not define or inherit an implementation of the resolved method"는 대개 X가 그 메서드를 모르는 시점에 컴파일되었다는 뜻이고(OpenJDK 21에서는 본문에서 본 대로 디폴트 충돌도 <code>invokeinterface</code> 경로에서 이 메시지로 나타난다), "Conflicting default methods: A.m B.m"은 X가 컴파일된 뒤에 A와 B가 각자 같은 디폴트를 얻었다는 뜻이다. 의존성 트리에서 같은 라이브러리의 여러 버전이 섞였는지, 플러그인 jar가 어느 버전의 API로 빌드되었는지를 먼저 확인한다. 소스를 다시 컴파일하면 이 오류가 컴파일 오류로 바뀌는지 보는 것이 가장 빠른 진단이다.</p>
+<p>판단이 달라지는 조건도 있다. 인터페이스를 구현하는 쪽이 전부 같은 저장소에 있고 항상 함께 컴파일된다면 추상 메서드 추가도 큰 문제가 아니다. 컴파일러가 빠뜨린 구현을 모두 찾아 주기 때문이다. 이때는 오히려 디폴트 메서드가 "구현을 빠뜨려도 컴파일되는" 위험을 만든다. 디폴트 메서드의 가치는 구현 클래스를 통제할 수 없을 때, 즉 공개 라이브러리나 플러그인 API에서 가장 크다. 반대로 구현 클래스마다 상태가 필요하거나 초기화 순서를 강제해야 한다면 디폴트 메서드로 버티지 말고 추상 클래스를 두는 것이 정직한 설계다. 스프링이 <code>WebMvcConfigurerAdapter</code>를 버리고 디폴트 메서드를 가진 <code>WebMvcConfigurer</code>로 옮긴 것은, 그 어댑터가 상태 없이 빈 메서드만 제공하던 경우였기 때문에 가능했다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 코드의 세 출력을 예측하고, 각각 JVMS §5.4.6의 선택 순서 몇 단계에서 결정되는지 설명하라.<br><code>interface A { default String who() { return "A"; } }</code> / <code>interface B extends A { }</code> / <code>interface C extends A { default String who() { return "C"; } }</code> / <code>class D implements B, C { }</code> / <code>class E extends D implements A { }</code> / <code>main</code>에서 <code>new D().who()</code>, <code>new E().who()</code>, <code>A a = new E(); a.who()</code>를 출력한다.</li>
+<li>1번의 인터페이스를 그대로 두고 <code>class F implements B, C { public String who() { return B.super.who(); } }</code>를 추가하면 컴파일되는가? 되지 않는다면 어느 규칙 때문인지 설명하고, <code>C</code>가 없는 <code>class G implements B { public String who() { return B.super.who() + "!"; } }</code>는 어떤지도 답하라.</li>
+<li>플러그인 API 1판이 <code>interface Plugin { void start(); }</code>이고, 어떤 플러그인 <code>MyPlugin</code>이 이것에 맞춰 컴파일되어 jar로 배포되었다. 2판은 <code>default void stop() { System.out.println("stop (default)"); }</code>와 추상 메서드 <code>void reload();</code>를 추가했다. 호스트가 2판으로 컴파일된 채 <code>p.start(); p.stop(); p.reload();</code>를 차례로 부르면 무엇이 출력되고 어디서 무엇이 실패하는가? <code>MyPlugin</code>의 소스를 2판으로 다시 컴파일하면 어떻게 되는가?</li>
+<li>자바 7 시절에 만든 <code>synchronized</code> 래퍼 클래스를 자바 8 이상에서 그대로 쓰면, 코드를 한 줄도 고치지 않았는데 스레드 안전성이 깨질 수 있다. 그 이유를 <code>Collection.removeIf</code>의 디폴트 구현과 메서드 선택 순서로 설명하고, 고치는 방법을 적어라.</li>
+<li>동료가 "인터페이스에 상태를 둘 수 없으니 <code>static Map&lt;Object, Integer&gt; COUNTS = new HashMap&lt;&gt;();</code>을 인터페이스에 두고, 디폴트 메서드 <code>increment()</code>에서 <code>COUNTS.merge(this, 1, Integer::sum)</code>으로 객체별 호출 횟수를 세자"고 제안했다. 이 설계의 문제를 메모리, 동시성, 동등성(<code>equals</code>/<code>hashCode</code>) 관점에서 각각 하나 이상 들고, 대안을 제시하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 세 출력 모두 <code>C</code>다. <code>new D().who()</code>: <code>D</code>에도, 상위 클래스 <code>Object</code>에도 <code>who</code> 선언이 없으므로 1·2단계를 지나 3단계로 간다. 상위 인터페이스 후보는 <code>A.who</code>와 <code>C.who</code>인데, <code>C</code>가 <code>A</code>의 하위 인터페이스이면서 <code>who</code>를 재선언했으므로 <code>A.who</code>는 가장 구체적인 후보에서 빠진다. <code>B</code>는 <code>who</code>를 선언하지 않았으므로 후보를 보태지 않는다. 남는 것은 <code>C.who</code> 하나다. <code>new E().who()</code>: <code>E</code>가 <code>A</code>를 다시 나열했지만 <code>E</code>, <code>D</code>, <code>Object</code>에 선언이 없으니 역시 3단계이고, 후보 집합은 <code>D</code>의 경우와 같다. <code>D</code>가 가진 <code>who</code>는 인터페이스로부터 물려받은 디폴트일 뿐 클래스에 선언된 메서드가 아니므로 2단계에서 선택되지 않는다. <code>a.who()</code>는 정적 타입이 <code>A</code>라서 <code>invokeinterface A.who</code>로 해석되지만, 선택은 수신 객체의 클래스 <code>E</code>를 기준으로 하므로 결과는 같다.</p>
+<p><b>2번.</b> <code>F</code>는 컴파일되지 않는다. javac는 "bad type qualifier B in default super call / method who() is overridden in C"라고 보고한다. <code>B.super.who()</code>가 컴파일 시점에 고르는 메서드는 <code>B</code>의 멤버로서의 <code>A.who</code>다. 그런데 다른 직접 상위 인터페이스 <code>C</code>가 그 메서드를 재정의하고 있다. JLS §15.12.3은 이 경우를 오류로 정한다. <code>C</code>가 내린 재정의 결정을 <code>B</code>를 통해 우회하지 못하게 하려는 규칙이다. <code>G</code>는 컴파일되고 <code>A!</code>를 출력한다. <code>B</code>는 직접 상위 인터페이스이고, <code>A.who</code>를 재정의하는 다른 직접 상위 타입이 없으며, 고른 메서드가 추상도 아니다. <code>invokespecial</code>이 <code>B</code>에서 출발해 찾으면 <code>A.who</code>가 유일한 후보다.</p>
+<p><b>3번.</b> 출력은 <code>start</code>, <code>stop (default)</code>이고, 그다음 <code>p.reload()</code>에서 <code>AbstractMethodError: Receiver class MyPlugin does not define or inherit an implementation of the resolved method 'abstract void reload()' of interface Plugin.</code>이 난다. <code>MyPlugin</code>은 로딩·링크에 문제가 없고(JLS §13.5.4: 추상 메서드 추가는 바이너리 호환을 깨지 않는다), <code>start</code>는 1단계에서 자기 메서드가 선택되며, <code>stop</code>은 3단계에서 디폴트가 선택된다. <code>reload</code>는 3단계에서 추상이 아닌 후보가 없어 실패한다. <code>MyPlugin</code>을 다시 컴파일하면 "MyPlugin is not abstract and does not override abstract method reload() in Plugin" 컴파일 오류가 난다. API 설계자가 <code>reload</code>도 디폴트로 추가했다면(예: 아무것도 하지 않거나 <code>UnsupportedOperationException</code>을 던지는 기본 구현) 둘 다 피할 수 있었다.</p>
+<p><b>4번.</b> 자바 7 시절의 래퍼는 그때 <code>Collection</code>에 있던 메서드만 <code>synchronized</code>로 감쌌다. 자바 8에서 <code>Collection</code>이 <code>removeIf</code>를 디폴트로 얻자, 래퍼 클래스와 그 상위 클래스 사슬에 <code>removeIf</code> 선언이 없으므로 선택 3단계에서 인터페이스의 디폴트 구현이 실행된다. 그 구현은 <code>iterator()</code>로 반복자를 얻고 <code>Iterator.remove()</code>로 지우는데, 래퍼의 락을 잡는 코드가 어디에도 없다. 그래서 다른 스레드의 <code>add</code>와 동시에 실행될 수 있고 "모든 연산이 상호 배제된다"는 래퍼의 불변식이 깨진다. 본문의 실험에서 <code>Thread.holdsLock</code>이 false로 나온 것이 그 증거다. 고치려면 JDK의 <code>Collections.SynchronizedCollection</code>처럼 <code>forEach</code>, <code>removeIf</code> 등 새 디폴트 메서드를 재정의해 <code>synchronized (mutex)</code> 안에서 내부 컬렉션에 위임하고, 스트림처럼 메서드 밖에서 소비되는 것은 호출자가 직접 동기화해야 한다고 문서화한다. 근본적으로는 인터페이스가 새 디폴트 메서드를 얻을 때마다 래퍼가 그것을 재정의해야 하는지 검토하는 절차가 필요하다.</p>
+<p><b>5번.</b> 메모리: 정적 맵이 모든 구현 객체를 키로 강하게 참조하므로, 다른 곳에서 더는 쓰지 않는 객체도 가비지 컬렉션되지 않는다. 객체가 생길 때마다 맵이 커진다. 동시성: <code>HashMap</code>은 스레드 안전하지 않으므로 여러 스레드가 동시에 <code>merge</code>하면 갱신이 사라지거나 내부 구조가 손상될 수 있다. <code>ConcurrentHashMap</code>으로 바꾸어도 메모리 문제는 그대로다. 동등성: 키 비교가 구현 클래스의 <code>equals</code>/<code>hashCode</code>를 따르므로, 값이 같은 서로 다른 두 객체가 같은 카운터를 공유하고, 가변 객체의 해시코드가 바뀌면 카운터를 잃는다. 결국 인터페이스가 구현 클래스의 동등성 정의라는 남의 계약에 의존하게 된다. 대안은 상태가 필요한 기능을 상태를 가진 쪽에 두는 것이다. 카운터 필드를 가진 추상 클래스를 두거나, 구현 클래스가 필드를 갖고 인터페이스에는 <code>int count()</code> 같은 추상 메서드만 두거나, 객체 바깥에서 세야 한다면 그 책임을 별도 객체(예: 동시성 안전한 카운터를 가진 서비스)로 분리한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>class Base { public String greet() { return "Base"; } }</code>, <code>interface Greeter { default String greet() { return "Greeter"; } }</code>, <code>class Child extends Base implements Greeter { }</code>일 때 <code>new Child().greet()</code>의 결과는?</q>
+<o><code>"Greeter"</code>. 나중에 나열된 인터페이스가 우선한다.</o>
+<o><code>"Base"</code>. 상위 클래스 사슬이 상위 인터페이스보다 먼저 탐색된다.</o>
+<o>컴파일 오류. 두 구현이 모호하므로 <code>Child</code>가 재정의해야 한다.</o>
+<o>실행 중 <code>IncompatibleClassChangeError</code>가 난다.</o>
+<why>JLS §8.4.8은 상위 클래스로부터 시그니처가 같은 구체 메서드를 물려받으면 인터페이스의 디폴트 메서드를 상속하지 않는다고 정하고, JVMS §5.4.6도 상위 클래스 사슬을 상위 인터페이스보다 먼저 본다. 이 규칙 덕분에 인터페이스에 같은 이름의 디폴트가 추가되어도 기존 클래스의 동작이 바뀌지 않는다. 클래스가 우선하므로 모호함이 없어 컴파일 오류도, 런타임 오류도 나지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>interface Animal { default String sound() { return "Animal"; } }</code>, <code>interface Dog extends Animal { default String sound() { return "Dog"; } }</code>, <code>class Plain implements Animal { }</code>, <code>class Hound extends Plain implements Dog { }</code>일 때 <code>new Hound().sound()</code>의 결과는?</q>
+<o><code>"Animal"</code>. 상위 클래스 <code>Plain</code>에서 온 메서드이므로 "클래스가 이긴다"가 적용된다.</o>
+<o>컴파일 오류. <code>Plain</code> 경로와 <code>Dog</code> 경로의 구현이 서로 다르다.</o>
+<o><code>"Dog"</code>. <code>Plain</code>이 가진 것은 물려받은 디폴트일 뿐 클래스에 선언된 메서드가 아니고, <code>Dog.sound</code>가 <code>Animal.sound</code>보다 구체적이다.</o>
+<o>실행 중 <code>AbstractMethodError</code>가 난다.</o>
+<why>JLS §9.4는 디폴트 메서드가 클래스에 선언된 구체 메서드와 구별된다고 명시하므로, <code>Plain</code>이 물려받은 <code>Animal.sound</code>는 "상위 클래스로부터 상속한 구체 메서드"가 아니다. JVM에서도 <code>Hound</code>, <code>Plain</code>, <code>Object</code>에 선언이 없어 상위 인터페이스 단계로 넘어가고, 가장 구체적인 후보는 <code>Dog.sound</code> 하나다. 그래서 모호함도 오류도 없다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>인터페이스 <code>Walker</code>와 <code>Swimmer</code>가 비어 있을 때 <code>class Duck implements Walker, Swimmer</code>를 컴파일해 두었다. 이후 두 인터페이스가 각자 <code>default String move()</code>를 추가했고, 인터페이스와 호출 코드만 다시 컴파일했다. <code>Duck d = new Duck(); d.move();</code>를 OpenJDK 21에서 실행하면?</q>
+<o><code>Duck</code>은 정상 로딩되고 객체도 만들어지지만, <code>d.move()</code> 호출에서 "Conflicting default methods" <code>IncompatibleClassChangeError</code>가 난다.</o>
+<o><code>Duck</code>을 로딩하는 시점에 <code>VerifyError</code>가 난다.</o>
+<o><code>implements</code> 목록에서 먼저 나온 <code>Walker.move</code>가 실행되어 <code>"walk"</code>가 출력된다.</o>
+<o>JVM이 두 결과를 이어 붙여 <code>"walkswim"</code>을 반환한다.</o>
+<why>JLS §13.5.7에 따르면 디폴트 메서드 추가는 링크 시점 오류를 만들지 않는 바이너리 호환 변경이지만, 무관한 두 인터페이스가 같은 디폴트를 선언하면 호출 시점에 <code>IncompatibleClassChangeError</code>가 날 수 있다. JVM은 나열 순서로 고르지 않는다. 가장 구체적인 후보 중 추상이 아닌 것이 둘이면 선택에 실패한다. HotSpot은 이 자리에 예외를 던지는 오버패스 메서드를 합성하므로 스택 트레이스에 <code>Duck.move</code>가 찍힌다. 같은 상황을 <code>Walker</code> 타입으로 부르면 OpenJDK 21에서는 <code>AbstractMethodError</code>가 나는데, 이것은 JDK-8356942로 수정된 구현 결함이다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>인터페이스에 <code>default String toString() { ... }</code>을 선언하면 컴파일 오류가 나는 이유로 가장 정확한 것은?</q>
+<o><code>Object.toString()</code>이 <code>final</code>이라서 재정의할 수 없기 때문이다.</o>
+<o>인터페이스는 <code>Object</code>를 상속하지 않으므로 <code>toString</code>이라는 이름을 알 수 없기 때문이다.</o>
+<o>디폴트 메서드는 반환 타입으로 <code>String</code>을 쓸 수 없기 때문이다.</o>
+<o>모든 구현 클래스는 <code>Object</code>로부터 <code>toString</code> 구현을 물려받고 클래스 쪽이 디폴트보다 우선하므로, 그 디폴트는 결코 선택될 수 없기 때문이다.</o>
+<why>JLS §9.4.1.2는 디폴트 메서드가 <code>Object</code>의 private이 아닌 메서드와 오버라이드 동등하면 컴파일 오류라고 정하고, 그 이유로 구현 클래스가 그 메서드의 구현을 이미 물려받는다는 점을 든다. 클래스 사슬이 인터페이스보다 먼저 탐색되므로 그런 디폴트는 실행될 수 없다. <code>Object.toString</code>은 final이 아니다. 클래스는 얼마든지 재정의한다. 인터페이스도 <code>Object</code>의 public 메서드를 멤버로 가진다(<code>Comparator</code>가 <code>equals</code>를 추상으로 재선언하는 것이 그 예다).</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>Square implements Shape</code>이고 <code>Shape</code>에 디폴트 메서드 <code>describe()</code>가 있으며 <code>Square</code>는 그것을 재정의하지 않았다. 다음 중 옳은 것은?</q>
+<o>javac가 <code>describe()</code>의 바이트코드를 <code>Square.class</code>에 복사해 넣는다.</o>
+<o>클래스 로딩 시 JVM이 <code>Square.class</code> 파일을 수정해 <code>describe()</code>를 추가한다.</o>
+<o>바이트코드는 <code>Shape.class</code>에만 있고, <code>Square</code> 타입 변수로 부르면 <code>invokevirtual Square.describe</code>가 생성되며 JVM이 해석 단계에서 상위 인터페이스까지 찾아 연결한다.</o>
+<o><code>Square</code> 타입 변수로는 <code>describe()</code>를 부를 수 없고 반드시 <code>Shape</code> 타입으로 변환해야 한다.</o>
+<why><code>javap -p Square</code>에는 <code>describe</code>가 없다. 디폴트 메서드의 몸체는 인터페이스의 클래스 파일에만 있다. 클래스 타입 변수로 호출하면 상수 풀은 <code>Square.describe</code>를 가리키는데, JVMS §5.4.3.3의 메서드 해석은 클래스와 상위 클래스에서 찾지 못하면 가장 구체적인 상위 인터페이스 메서드를 찾는다. 이렇게 복사 없이 실행 시점에 찾아가기 때문에, 다시 컴파일하지 않은 옛 클래스도 새 디폴트 메서드에 응답할 수 있다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>디폴트 메서드(default method)</dt><dd>인터페이스에 <code>default</code> 제어자로 선언한, 몸체가 있는 인스턴스 메서드. 재정의하지 않은 구현 클래스에 기본 구현을 제공한다(JLS §9.4). JEP 126에서는 가상 확장 메서드(virtual extension method)라고 불렀다.</dd>
+<dt>소스 호환성(source compatibility)</dt><dd>기존 소스 코드가 새 버전의 라이브러리와 함께 오류 없이 다시 컴파일되는 성질.</dd>
+<dt>바이너리 호환성(binary compatibility)</dt><dd>이미 컴파일된 클래스 파일이 다시 컴파일하지 않고도 새 버전과 링크 오류 없이 연결되는 성질(JLS 13장). 링크는 되어도 특정 호출에서 오류가 날 수는 있다.</dd>
+<dt>메서드 해석(method resolution)</dt><dd>상수 풀의 기호 참조를 실제 메서드 선언 하나에 연결하는 과정. 클래스와 상위 클래스를 먼저, 그다음 상위 인터페이스를 찾는다(JVMS §5.4.3.3).</dd>
+<dt>메서드 선택(method selection)</dt><dd>호출할 때마다 수신 객체의 실제 클래스를 기준으로, 해석된 메서드를 재정의한 메서드 가운데 실행할 것을 고르는 과정(JVMS §5.4.6).</dd>
+<dt>가장 구체적인 상위 인터페이스 메서드(maximally-specific superinterface method)</dt><dd>클래스의 상위 인터페이스에 선언된 private·static이 아닌 메서드 가운데, 그 인터페이스의 하위 인터페이스에 같은 메서드가 다시 선언되지 않은 것.</dd>
+<dt>재추상화(re-abstraction)</dt><dd>하위 인터페이스가 상위 인터페이스의 디폴트 메서드를 몸체 없이 다시 선언해 추상 메서드로 되돌리는 것. 구현 클래스에 구현 의무가 다시 생긴다.</dd>
+<dt>오버패스 메서드(overpass method)</dt><dd>HotSpot이 디폴트 메서드의 선택 오류(예: 충돌하는 디폴트)가 있는 자리에 합성해 넣는 메서드. 호출되면 해당 오류를 던진다. 클래스 파일에는 없다.</dd>
+<dt>미란다 메서드(miranda method)</dt><dd>HotSpot 소스의 용어로, 클래스와 상위 클래스 어디에서도 구현되지 않는 private이 아닌 상위 인터페이스 메서드. 클래스의 vtable 끝에 칸이 마련되며, 디폴트 메서드 처리가 이 칸들을 채울 후보로 삼는다.</dd>
+<dt>골격 구현(skeletal implementation)</dt><dd>인터페이스 구현을 쉽게 하려고 일부 메서드를 구현해 둔 추상 클래스. <code>AbstractCollection</code>, <code>AbstractList</code>가 대표적이다.</dd>
+<dt>@implSpec</dt><dd>JDK 소스의 Javadoc에서 디폴트 메서드의 기본 구현이 무엇을 하는지(그리고 무엇을 보장하지 않는지) 적는 태그. 주로 재정의하는 사람을 위한 정보다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-9.html">JLS 21 Chapter 9 Interfaces</a> — §9.4 디폴트 메서드의 정의와 허용 제어자, §9.4.1.2 Object 메서드 재정의 금지, §9.4.1.3 인터페이스의 상속 충돌</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html">JLS 21 Chapter 8 Classes</a> — §8.4.8 클래스가 디폴트 메서드를 상속하는 조건, §8.4.8.4 오버라이드 동등한 메서드의 상속과 상위 클래스 추상 메서드 예외</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-13.html">JLS 21 Chapter 13 Binary Compatibility</a> — §13.5.4 인터페이스 멤버 추가, §13.5.7 디폴트 메서드 추가와 IncompatibleClassChangeError</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-5.html">JVMS 21 Chapter 5 Loading, Linking, and Initializing</a> — §5.4.3.3 메서드 해석과 가장 구체적인 상위 인터페이스 메서드, §5.4.6 메서드 선택</li>
+<li><a href="https://openjdk.org/jeps/126">JEP 126: Lambda Expressions &amp; Virtual Extension Methods</a> — 기존 인터페이스에 메서드를 추가할 수 없던 제약과 가상 확장 메서드의 동기</li>
+<li><a href="https://mail.openjdk.org/pipermail/hotspot-runtime-dev/2025-July/079930.html">OpenJDK hotspot-runtime-dev: 8356942 invokeinterface Throws AbstractMethodError Instead of IncompatibleClassChangeError</a> — 오버패스 메서드의 역할과 invokeinterface 경로의 AME 결함 설명</li>
+</x-refs>

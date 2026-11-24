@@ -1,0 +1,10 @@
+- 02: 2026-11-18 확인 70건 · 수정 2건 — 명시/추론 호출 바이트코드 발췌의 줄 대응과 오프셋을 본문 코드 순서대로 실행한 결과(18·21, 43·46)로 교체, ArrayList elementData 가시성을 java.util 패키지 밖 비공개로 정정
+- 03: 2026-11-18 확인 63건 · 수정 0건 — 수정 없음. 예제 13개 출력·javap·javac 문구 재실행 일치, JDK 21 소스(ArrayList·ArraysSupport·Arrays·ASB)와 JLS/JVMS/Javadoc 인용 원문 대조 일치
+- 06: 2026-11-18 확인 46건 · 수정 1건 — HashMap 인덱스식 인용 tab[(n - 1) & hash]가 소스에 그대로 없어 실제 식 (n - 1) & hash 로 좁힘. 예제 출력·javap·JLS·Javadoc·객체 크기·확률 수치는 모두 일치
+- 07: 2026-11-18 확인 80건 · 수정 0건 — 수정 없음. 예제 12개 출력·예외/javac 문구·javap 4건·hashCode 플래그 재실행 일치, JDK 21 소스와 HotSpot synchronizer.cpp·markWord.hpp, JLS 4.2·15.10.1·15.17.1·15.17.3 원문 대조 일치
+- 04: 2026-11-18 확인 40건 · 수정 7건 — static 중첩 클래스의 타입 매개변수 금지 근거를 JLS 8.1.3 정적 문맥에서 8.1.1.4·6.5.5.1로 정정(목표·요약·퀴즈·refs 포함), LinkedHashMap 접근 순서→순회 순서
+- 08: 2026-11-19 확인 40건 · 수정 3건 — 트리화 시점(8개에 이르면→8개 있는 버킷에 하나 더 들어올 때), Set.of 솔트 용도(위치 계산→순회 시작 칸·방향), 리사이즈 이동 총합(두 배 안쪽→안팎)
+- 09: 2026-11-18 확인 43건 · 수정 2건 — Deque 스택 대응표의 peek 짝이 Java 21 문서 표에는 getFirst로 적혀 있음을 밝힘, 초기 용량 134 이상을 주어야 한다를 주면 된다로 좁힘
+- 01: 2026-11-19 확인 32건 · 수정 2건 — -Xlint 없을 때 안내를 요약 한 줄→요약 안내로, Wrong.java javac 출력에 실제 Note·2 errors 줄 추가
+- 05: 2026-11-19 확인 24건 · 수정 0건 — javap 출력·컴파일 오류·NoClassDefFoundError·클래스 로딩·연산 횟수·ArrayList 확장·jcmd 메모리·JVMS/JLS/Javadoc 인용 모두 일치, 수정 없음
+- 10: 2026-11-19 확인 42건 · 수정 3건 — Collections.sort 컴파일 오류 문구 T→T#1, PriorityQueue null 근거를 Queue·Deque Javadoc으로, Itr.remove 본문 네 줄→핵심 네 줄

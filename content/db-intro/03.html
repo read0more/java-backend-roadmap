@@ -1,0 +1,643 @@
+<x-meta>
+deck: CREATE·ALTER·DROP이 데이터 사전과 클러스터형 인덱스에 무엇을 남기는지, INSERT·UPDATE·DELETE가 행을 어떻게 넣고 바꾸고 지우는지, 제약 조건이 어느 순간 어떤 오류로 데이터를 지키는지를 MySQL 8.0 InnoDB 기준으로 따라간다.
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li>요구 사항을 읽고 기본 키, NOT NULL, DEFAULT, UNIQUE, CHECK, FOREIGN KEY를 갖춘 CREATE TABLE 문을 쓰고, InnoDB가 기본 키로 클러스터형 인덱스를 만든다는 사실에서 기본 키 선택이 저장 구조에 미치는 결과를 설명할 수 있다.</li>
+<li>ALTER TABLE의 변경 하나하나가 INSTANT·INPLACE·COPY 중 어떤 방식으로 처리되는지 매뉴얼의 규칙으로 판단하고, 끝나지 않은 트랜잭션이 DDL을 멈춰 세우는 이유를 메타데이터 락으로 설명할 수 있다.</li>
+<li>주어진 테이블 상태에서 INSERT·UPDATE·DELETE가 돌려주는 영향받은 행 수, 새로 생기는 AUTO_INCREMENT 값, 실패할 때의 오류 번호를 예측할 수 있다.</li>
+<li>DELETE, TRUNCATE TABLE, DROP TABLE을 트랜잭션, AUTO_INCREMENT, 외래 키의 세 관점에서 비교하고 상황에 맞는 것을 고를 수 있다.</li>
+<li>제약 조건이 검사되는 시점과 위반했을 때 남는 결과를 짚고, 애플리케이션의 사전 검사만으로는 막을 수 없는 경우를 예로 들 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 구조를 정하는 문장과 내용을 바꾸는 문장</h3>
+
+<p>02회에서 SQL이 어떤 언어인지, 그리고 데이터 타입과 제약 조건에 어떤 종류가 있는지를 살펴보았다. 그때는 재료를 늘어놓는 단계였다. 이번 회차는 그 재료로 실제 테이블을 만들고, 행을 넣고, 고치고, 지운다. 수업 주제로 말하면 DDL의 테이블 생성·변경·제거, DML의 등록·수정·삭제, 그리고 제약 조건 활용이다. 문법 자체는 몇 줄이면 끝난다. 이 회차가 시간을 쓰는 곳은 그 몇 줄이 데이터베이스 안에서 무엇을 바꾸는가이다.</p>
+
+<p>SQL 문장은 성격이 다른 두 무리로 나뉜다. 데이터 정의 언어(DDL, Data Definition Language)는 테이블이라는 그릇의 모양을 정한다. <code>CREATE TABLE</code>, <code>ALTER TABLE</code>, <code>DROP TABLE</code>, <code>TRUNCATE TABLE</code>이 여기에 속한다. 데이터 조작 언어(DML, Data Manipulation Language)는 그릇에 담긴 내용, 곧 행을 바꾼다. <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>가 여기에 속하고, 조회인 <code>SELECT</code>는 04회에서 따로 다룬다. 두 무리는 문법만 다른 것이 아니라 데이터베이스가 다루는 방식이 다르다. DDL은 테이블의 정의를 저장한 데이터 사전(data dictionary)을 고치고, 진행 중이던 트랜잭션을 강제로 끝낸다. DML은 행이 저장된 인덱스 페이지를 고치고, 트랜잭션 안에서 되돌릴 수 있다.</p>
+
+<p>이 차이를 염두에 두고 네 가지 질문을 따라가 보자. 첫째, <code>CREATE TABLE</code>에 적은 기본 키는 디스크에서 무엇이 되는가. 둘째, 이미 수백만 행이 들어 있는 테이블에 열을 하나 더하면 무슨 일이 일어나며, 그동안 다른 사용자는 테이블을 쓸 수 있는가. 셋째, <code>UPDATE</code>와 <code>DELETE</code>는 행을 어떻게 바꾸고 지우며, 지운 행은 바로 사라지는가. 넷째, 제약 조건은 언제 검사되고, 위반하면 무엇이 남는가.</p>
+
+<p>이 회차의 모든 설명은 MySQL 8.0의 InnoDB 저장 엔진을 기준으로 한다. 서버 설정은 기본값을 가정한다. 특히 두 가지가 결과를 좌우한다. 하나는 MySQL 8.0의 기본 SQL 모드에 <code>STRICT_TRANS_TABLES</code>가 들어 있다는 것이다. 이 엄격 모드(strict mode) 덕분에 잘못된 값이나 빠진 값은 경고가 아니라 오류가 된다. 다른 하나는 새 연결이 자동 커밋(autocommit)이 켜진 상태로 시작한다는 것이다. 자동 커밋 모드에서는 SQL 문장 하나가 그 자체로 트랜잭션 하나가 되고, 오류 없이 끝나면 바로 커밋된다. 다른 설정에서 결과가 어떻게 달라지는지는 해당하는 곳에서 따로 밝힌다.</p>
+
+<h3>첫 번째 CREATE TABLE: 열마다 내리는 결정</h3>
+
+<p>예제로 쓸 도메인은 동네 도서관이다. 이용자가 가입하고, 책을 빌리고, 반납한다. 요구 사항을 적어 보면 이렇다. 이용자는 이메일로 구별되며 같은 이메일로 두 번 가입할 수 없다. 이름은 반드시 있어야 한다. 등급은 따로 정하지 않으면 <code>BASIC</code>이다. 한 사람이 동시에 빌릴 수 있는 권수는 기본 3권이고 0권에서 10권 사이여야 한다. 가입 시각은 행이 만들어지는 순간으로 자동 기록한다. 이 요구 사항을 그대로 옮긴 테이블 정의가 다음이다.</p>
+
+<pre><code class="language-sql">CREATE TABLE patron (
+    patron_id  BIGINT       NOT NULL AUTO_INCREMENT,
+    email      VARCHAR(100) NOT NULL,
+    name       VARCHAR(50)  NOT NULL,
+    grade      VARCHAR(10)  NOT NULL DEFAULT 'BASIC',
+    max_loans  INT          NOT NULL DEFAULT 3,
+    joined_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (patron_id),
+    CONSTRAINT uk_patron_email UNIQUE (email),
+    CONSTRAINT chk_patron_max_loans CHECK (max_loans BETWEEN 0 AND 10)
+);</code></pre>
+
+<p>한 줄씩 읽어 보자. 열 정의는 "이름, 타입, 속성"의 순서다. <code>patron_id</code>는 <code>BIGINT</code>다. 부호 있는 <code>INT</code>는 4바이트라 2,147,483,647이 상한이고, <code>BIGINT</code>는 8바이트다. 행 수가 그 상한에 가까워질 일이 없어 보이더라도, 뒤에서 보듯 AUTO_INCREMENT 번호는 실패한 INSERT나 롤백 때문에 건너뛸 수 있으므로 실제 행 수보다 빨리 소모된다. 기본 키의 타입은 나중에 바꾸기가 가장 어려운 결정이라는 점도 기억해 두자. 이 회차 뒤쪽에서 보겠지만 열의 타입 변경은 테이블 전체를 복사하는 작업이 된다.</p>
+
+<p><code>AUTO_INCREMENT</code>는 값을 주지 않고 행을 넣으면 서버가 다음 번호를 붙여 주는 속성이다. MySQL은 이 속성에 세 가지 조건을 건다. 한 테이블에 하나만 둘 수 있고, 반드시 인덱스가 있어야 하며, <code>DEFAULT</code>를 가질 수 없다. 대개 기본 키에 붙이므로 인덱스 조건은 저절로 채워진다. <code>PRIMARY KEY (patron_id)</code>는 이 열을 기본 키로 선언한다. 기본 키는 모든 키 열이 <code>NOT NULL</code>인 유일 인덱스이며, <code>NOT NULL</code>을 적지 않았더라도 MySQL이 조용히 <code>NOT NULL</code>로 선언한다. 위 정의에서 <code>NOT NULL</code>을 적은 것은 읽는 사람을 위한 명시다.</p>
+
+<p><code>email VARCHAR(100)</code>의 100은 바이트가 아니라 문자 수다. MySQL 8.0 서버의 기본 문자 집합은 <code>utf8mb4</code>이고, 이 문자 집합은 문자 하나에 최대 4바이트를 쓴다. 따라서 이 열이 차지할 수 있는 최대 바이트 수는 400이다. 지금은 사소해 보이는 이 계산이 ALTER TABLE 절에서 열 길이를 늘릴 때 테이블 복사가 필요한지를 가른다. <code>name VARCHAR(50)</code>은 최대 200바이트다.</p>
+
+<p><code>DEFAULT</code>는 INSERT가 그 열의 값을 주지 않았을 때 쓸 값이다. <code>'BASIC'</code>, <code>3</code> 같은 리터럴이 가장 흔하다. <code>DATETIME</code>과 <code>TIMESTAMP</code> 열에는 예외적으로 <code>CURRENT_TIMESTAMP</code>를 괄호 없이 기본값으로 쓸 수 있다. MySQL 8.0.13부터는 <code>DEFAULT (CURRENT_DATE + INTERVAL 14 DAY)</code>처럼 괄호로 감싼 식도 기본값이 될 수 있다. 식을 괄호로 감싸는 것은 리터럴과 구별하기 위해서다. <code>BLOB</code>, <code>TEXT</code>, <code>JSON</code> 타입은 기본값을 식으로만 줄 수 있어서, <code>DEFAULT 'abc'</code>는 오류지만 <code>DEFAULT ('abc')</code>는 허용된다.</p>
+
+<p>기본값을 적지 않은 열은 어떻게 될까. 매뉴얼의 규칙은 이렇다. <code>NULL</code>을 허용하는 열은 기본값이 <code>NULL</code>이다. <code>NOT NULL</code>이면서 <code>DEFAULT</code>가 없는 열은 "기본값이 없는" 열이 된다. 이런 열을 INSERT에서 빼먹으면 엄격 모드에서는 오류가 나고 문장 전체가 취소된다. 엄격 모드가 꺼져 있으면 서버는 타입별 암묵적 기본값을 넣고 경고만 남긴다. 숫자 타입은 0, <code>ENUM</code>이 아닌 문자열은 빈 문자열, 날짜·시간 타입은 그 타입의 "0" 값이다. 엄격 모드를 끈 서버에서 이름이 빈 문자열인 이용자가 쌓이는 이유가 이것이다. 테이블 정의가 아무리 <code>NOT NULL</code>을 외쳐도 서버의 SQL 모드가 그 의미를 바꿀 수 있다는 점을 기억해 두자.</p>
+
+<aside class="note"><code>CREATE TABLE IF NOT EXISTS</code>는 같은 이름의 테이블이 이미 있으면 오류를 내지 않고 넘어간다. 그러나 매뉴얼이 밝히듯 기존 테이블의 구조가 지금 적은 정의와 같은지는 확인하지 않는다. 배포 스크립트에서 이 문장이 "성공"했다는 것은 테이블이 있다는 뜻일 뿐, 원하는 열이 있다는 뜻이 아니다.</aside>
+
+<h3>키와 제약을 함께 선언하기: 테이블 사이의 관계</h3>
+
+<p>이제 대출 기록을 담는 두 번째 테이블을 만든다. 대출은 반드시 실제로 존재하는 이용자의 것이어야 한다. 이 요구 사항은 열 하나의 성질이 아니라 두 테이블 사이의 관계에 대한 것이고, 그래서 외래 키(foreign key)로 표현한다.</p>
+
+<pre><code class="language-sql">CREATE TABLE loan (
+    loan_id      BIGINT       NOT NULL AUTO_INCREMENT,
+    patron_id    BIGINT       NOT NULL,
+    book_title   VARCHAR(200) NOT NULL,
+    loaned_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    due_date     DATE         NOT NULL,
+    returned_at  DATETIME     NULL,
+    PRIMARY KEY (loan_id),
+    CONSTRAINT fk_loan_patron
+        FOREIGN KEY (patron_id) REFERENCES patron (patron_id),
+    CONSTRAINT chk_loan_returned CHECK (returned_at >= loaned_at)
+);</code></pre>
+
+<p>제약 조건은 두 자리에 적을 수 있다. 열 정의 바로 뒤에 붙이는 열 수준 제약(column-level constraint)과, 열 목록이 끝난 뒤 따로 적는 테이블 수준 제약(table-level constraint)이다. <code>NOT NULL</code>과 <code>DEFAULT</code>는 열의 속성이므로 열 정의에만 붙는다. 기본 키, 유일, CHECK, 외래 키는 테이블 수준으로 적을 수 있고, 여러 열에 걸친 제약은 테이블 수준으로만 적을 수 있다. 위 예제처럼 <code>CONSTRAINT 이름</code>을 붙여 두면 나중에 오류 메시지에 그 이름이 나오고, ALTER TABLE로 지울 때 그 이름을 쓴다. 이름을 붙이지 않으면 서버가 만들어 준다. CHECK의 경우 테이블 이름, <code>_chk_</code>, 일련번호를 이어 <code>loan_chk_1</code> 같은 이름을 만든다. CHECK 제약 이름은 테이블 단위가 아니라 스키마 단위로 유일해야 하므로, 두 테이블에 같은 이름의 CHECK를 둘 수 없다.</p>
+
+<p>외래 키 선언에는 지켜야 할 조건이 있다. 첫째, 참조하는 쪽 열과 참조되는 쪽 열의 타입이 비슷해야 한다. 매뉴얼은 <code>INTEGER</code>나 <code>DECIMAL</code> 같은 고정 정밀도 타입은 크기와 부호가 같아야 한다고 적는다. <code>loan.patron_id</code>를 <code>INT</code>로 만들거나 한쪽에만 <code>UNSIGNED</code>를 붙이면 외래 키를 만들 수 없다. 문자열 열은 길이는 달라도 되지만 문자 집합과 콜레이션은 같아야 한다. 둘째, 양쪽 모두 해당 열을 첫 번째 열로 하는 인덱스가 있어야 한다. 외래 키 검사를 할 때마다 테이블 전체를 훑지 않기 위해서다. 참조되는 쪽인 <code>patron.patron_id</code>는 기본 키이므로 인덱스가 이미 있다. 참조하는 쪽인 <code>loan.patron_id</code>에는 인덱스를 따로 만들지 않았는데, 이 경우 MySQL이 자동으로 만들어 준다. 그래서 <code>loan</code> 테이블에는 우리가 적지 않은 인덱스가 하나 생긴다.</p>
+
+<p>외래 키를 적는 방법에는 함정이 하나 있다. SQL 표준에는 열 정의 안에 <code>REFERENCES</code>를 바로 붙이는 "인라인" 문법이 있다. MySQL은 이 문법을 오류 없이 받아들이지만, 8.0과 8.4 매뉴얼 모두 인라인 <code>REFERENCES</code>는 파싱만 하고 무시한다고 적는다. MySQL이 외래 키로 받아들이는 것은 별도의 <code>FOREIGN KEY</code> 절 안에 적은 <code>REFERENCES</code>뿐이다.</p>
+
+<pre><code class="language-sql">-- 오류 없이 만들어지지만 외래 키는 생기지 않는다
+CREATE TABLE loan_wrong (
+    loan_id   BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    patron_id BIGINT NOT NULL REFERENCES patron (patron_id)
+);
+
+-- 외래 키가 생긴다
+CREATE TABLE loan_right (
+    loan_id   BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    patron_id BIGINT NOT NULL,
+    FOREIGN KEY (patron_id) REFERENCES patron (patron_id)
+);</code></pre>
+
+<p>다른 데이터베이스에서 쓰던 DDL을 옮겨 왔다면 이 차이가 조용한 사고가 된다. 문장은 성공하고, 테이블은 만들어지고, 존재하지 않는 이용자 번호를 넣어도 아무 오류가 나지 않는다. 외래 키가 실제로 생겼는지는 <code>SHOW CREATE TABLE</code>의 출력에 <code>FOREIGN KEY</code> 절이 보이는지로 확인한다. 이 명령은 서버가 데이터 사전에 저장한 정의를 다시 SQL로 보여 주므로, 우리가 적은 문장이 아니라 서버가 이해한 문장을 볼 수 있다.</p>
+
+<p><code>chk_loan_returned</code>는 CHECK 제약이다. MySQL은 8.0.16부터 CHECK를 실제로 검사한다. 그 이전 버전은 CHECK 절을 파싱하고 무시했다. 같은 DDL이 오래된 서버에서는 오류 없이 실행되면서 아무것도 지키지 않는다는 뜻이다. CHECK의 조건식에는 제한이 있다. 다른 테이블의 열, 서브쿼리, 변수, 저장 함수는 쓸 수 없고, <code>NOW()</code>처럼 실행할 때마다 값이 달라지는 비결정적 함수도 쓸 수 없다. AUTO_INCREMENT 열도 참조할 수 없다. 그래서 "반납 예정일은 오늘 이후여야 한다"는 규칙은 CHECK로 표현할 수 없다. 오늘이 언제인지에 따라 같은 행이 통과했다가 위반하게 되기 때문이다. 이런 규칙은 애플리케이션이 맡는다.</p>
+
+<p>이 CHECK에는 눈여겨볼 점이 하나 더 있다. 반납하지 않은 대출은 <code>returned_at</code>이 <code>NULL</code>이다. <code>NULL >= loaned_at</code>은 참도 거짓도 아닌 "알 수 없음(UNKNOWN)"이 된다. 매뉴얼은 CHECK의 조건식이 각 행에 대해 <code>TRUE</code> 또는 <code>UNKNOWN</code>이어야 하고, <code>FALSE</code>일 때만 위반이라고 정한다. 그래서 <code>returned_at IS NULL OR</code>를 앞에 붙이지 않아도 미반납 대출은 통과한다. <code>NULL</code>이 만드는 세 번째 논리값은 04회에서 <code>WHERE</code>와 함께 자세히 다룬다. 여기서는 CHECK와 WHERE가 UNKNOWN을 반대로 다룬다는 점만 기억해 두자. WHERE는 UNKNOWN인 행을 버리고, CHECK는 UNKNOWN인 행을 통과시킨다.</p>
+
+<h3>한 층 아래: CREATE TABLE이 남기는 것</h3>
+
+<p><code>CREATE TABLE</code>이 성공하면 두 가지가 생긴다. 하나는 정의다. 열의 이름과 타입, 제약, 인덱스 목록이 서버의 데이터 사전에 기록된다. MySQL 8.0은 트랜잭션을 지원하는 데이터 사전(transactional data dictionary)을 갖고 있다. 이전 버전에서는 이 정보가 메타데이터 파일, 트랜잭션을 지원하지 않는 테이블, 저장 엔진별 사전에 흩어져 있었다. <code>SHOW CREATE TABLE</code>과 <code>information_schema</code>의 뷰가 이 정보를 보여 준다. 다른 하나는 빈 저장 구조다. 기본 키에 해당하는 인덱스와 보조 인덱스들이 아직 행이 하나도 없는 상태로 만들어진다.</p>
+
+<p>InnoDB에서 "테이블의 행이 저장되는 곳"은 별도의 파일 영역이 아니라 인덱스다. 매뉴얼은 모든 InnoDB 테이블에 클러스터형 인덱스(clustered index)라는 특별한 인덱스가 있고, 이 인덱스가 행 데이터를 저장한다고 설명한다. 기본 키를 정의하면 InnoDB는 그것을 클러스터형 인덱스로 쓴다. InnoDB의 인덱스는 B-tree 구조이고, 인덱스 레코드는 트리의 리프 페이지에 저장된다. 클러스터형 인덱스의 리프 레코드에는 키 값뿐 아니라 그 행의 나머지 열이 모두 들어 있다. 결국 <code>patron</code> 테이블의 행들은 <code>patron_id</code> 순서로 정렬된 채 리프 페이지에 늘어서 있는 것이다. 페이지의 기본 크기는 16KB이며, 인스턴스를 초기화할 때 <code>innodb_page_size</code>로 정해진다.</p>
+
+<p>기본 키를 정의하지 않으면 어떻게 될까. InnoDB는 모든 키 열이 <code>NOT NULL</code>인 첫 번째 <code>UNIQUE</code> 인덱스를 클러스터형 인덱스로 쓴다. 그런 인덱스도 없으면 6바이트짜리 행 ID를 가진 숨은 열을 만들고, 그 위에 <code>GEN_CLUST_INDEX</code>라는 숨은 클러스터형 인덱스를 만든다. 행 ID는 행이 들어올 때마다 단조 증가하므로 이 경우 행은 삽입 순서대로 놓인다. 만약 <code>patron</code>에서 기본 키 선언만 지웠다면, <code>email</code>이 <code>NOT NULL</code>이고 유일하므로 <code>uk_patron_email</code>이 클러스터형 인덱스가 된다. 행이 이메일 순서로 저장되는 것이다. 기본 키를 적지 않았다고 해서 정렬 기준이 없어지는 것이 아니라, 우리가 고르지 않은 기준이 쓰일 뿐이다. 매뉴얼이 모든 테이블에 기본 키를 정의하라고, 마땅한 열이 없으면 자동 증가 열을 더하라고 권하는 이유다.</p>
+
+<p>보조 인덱스(secondary index)는 클러스터형 인덱스가 아닌 나머지 인덱스다. <code>uk_patron_email</code>이 그렇다. InnoDB의 보조 인덱스 레코드에는 인덱스 열 값과 함께 그 행의 기본 키 값이 들어간다. 이메일로 이용자를 찾으면, 보조 인덱스에서 이메일을 찾아 기본 키를 얻고, 그 기본 키로 클러스터형 인덱스를 한 번 더 내려가 행 전체를 읽는다. 이 구조에서 바로 실무적인 결론이 나온다. 기본 키가 길면 모든 보조 인덱스가 그만큼 커진다. 매뉴얼도 짧은 기본 키가 유리하다고 적는다. 36자짜리 UUID 문자열을 기본 키로 쓰면, 그 36자가 테이블의 모든 보조 인덱스 레코드마다 복사된다.</p>
+
+<pre class="diagram">클러스터형 인덱스 PRIMARY (키 = patron_id) : 행 전체가 리프에 있다
+                    [ 루트 페이지 ]
+                   /       |       \
+   [리프] 1 | kim@example.com  | 김하늘 | BASIC | 3 | ...
+          2 | lee@example.com  | 이바다 | GOLD  | 5 | ...
+          3 | park@example.com | 박노을 | BASIC | 4 | ...
+
+보조 인덱스 uk_patron_email (키 = email) : 리프에 기본 키 값만 있다
+   [리프] kim@example.com  -> 1
+          lee@example.com  -> 2
+          park@example.com -> 3
+
+이메일로 찾기:  uk_patron_email 에서 'lee@...' 찾기 -> 2
+                -> PRIMARY 에서 2 찾기 -> 행 전체</pre>
+
+<x-visual id="db-intro-03-clustered-secondary" title="InnoDB의 클러스터형 인덱스와 보조 인덱스, 그리고 보조 인덱스를 거쳐 행을 찾는 경로" kind="구조 다이어그램" ratio="16:9">
+<x-hint>행 전체가 기본 키 순서로 클러스터형 인덱스의 리프에 들어 있고, 보조 인덱스의 리프에는 기본 키 값만 있어 두 번 내려가야 행에 닿는다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 구조 다이어그램. 왼쪽에 큰 트리 하나, 오른쪽에 작은 트리 하나. 왼쪽 트리 위 제목 "클러스터형 인덱스 (기본 키)". 루트 상자 하나에서 아래로 리프 상자 세 개가 가로로 이어지고, 리프 상자들은 넓은 표 모양이며 각 줄에 "1 · kim · 김하늘 · BASIC", "2 · lee · 이바다 · GOLD", "3 · park · 박노을 · BASIC"처럼 행 전체가 들어 있다. 리프 위에 작은 라벨 "행 전체". 오른쪽 트리 위 제목 "보조 인덱스 (email)". 루트에서 리프 하나로 이어지고, 리프 상자는 좁고 각 줄에 "kim → 1", "lee → 2", "park → 3". 리프 위에 작은 라벨 "기본 키 값만". 오른쪽 리프의 "lee → 2" 줄에서 왼쪽 트리의 루트로 굵은 주황 곡선 화살표를 그리고 라벨 "2로 다시 찾기", 이어서 왼쪽 루트에서 "2 · lee · 이바다 · GOLD" 줄로 주황 화살표. 평면적이고 차분한 색조, 고딕체 한국어 라벨.</x-prompt>
+<x-caption>InnoDB에서 테이블의 행은 기본 키로 정렬된 클러스터형 인덱스 안에 산다. 보조 인덱스는 기본 키를 거쳐 행에 닿는다.</x-caption>
+</x-visual>
+
+<p>DDL이 트랜잭션과 맺는 관계도 여기서 짚어 두자. 매뉴얼은 DDL 문장이 현재 세션에서 진행 중인 트랜잭션을 마치 <code>COMMIT</code>을 실행한 것처럼 끝낸다고 적는다. 이것을 암묵적 커밋(implicit commit)이라고 한다. 대부분의 DDL은 실행한 뒤에도 한 번 더 암묵적으로 커밋해서, 각 DDL이 자기만의 트랜잭션 안에서 처리되게 한다. 다음 순서를 따라가 보자.</p>
+
+<pre><code class="language-sql">START TRANSACTION;
+INSERT INTO patron (email, name) VALUES ('test@example.com', '시험용');
+CREATE TABLE memo (id INT PRIMARY KEY);   -- 여기서 앞의 INSERT가 커밋된다
+ROLLBACK;                                 -- 되돌릴 트랜잭션이 남아 있지 않다</code></pre>
+
+<p><code>ROLLBACK</code>을 실행한 뒤에도 <code>test@example.com</code> 이용자는 남아 있고, <code>memo</code> 테이블도 남아 있다. <code>CREATE TABLE</code>이 실행되기 직전에 INSERT를 포함한 트랜잭션이 커밋되었고, <code>CREATE TABLE</code> 자체도 실행 후 커밋되었기 때문이다. 예외는 <code>TEMPORARY</code> 키워드를 쓴 <code>CREATE TABLE</code>과 <code>DROP TABLE</code>이다. 이 둘은 커밋을 일으키지 않는다. 그렇다고 롤백되는 것도 아니어서, <code>CREATE TEMPORARY TABLE</code> 뒤에 롤백해도 임시 테이블은 남는다.</p>
+
+<p>MySQL 8.0은 원자적 DDL(atomic DDL)을 지원한다. 데이터 사전 갱신, 저장 엔진 작업, 바이너리 로그 기록을 하나의 원자적 작업으로 묶어서, 작업 도중 서버가 멈추더라도 전부 반영되거나 전부 취소되게 한다. 매뉴얼의 예가 차이를 잘 보여 준다. <code>t1</code>만 있고 <code>t2</code>는 없는 상태에서 <code>DROP TABLE t1, t2</code>를 실행하면, 8.0에서는 <code>t2</code>가 없다는 오류와 함께 아무것도 지워지지 않는다. 원자적 DDL 이전에는 오류를 내면서도 <code>t1</code>은 지워졌다. 다만 매뉴얼은 원자적 DDL이 트랜잭션 DDL(transactional DDL)이 아니라고 분명히 적는다. DDL은 여전히 진행 중인 트랜잭션을 끝내므로, <code>START TRANSACTION</code>과 <code>COMMIT</code> 사이에 DDL을 넣어 DML과 함께 되돌릴 수는 없다. "원자적"이라는 말은 DDL 문장 하나가 반쯤 실행된 채로 남지 않는다는 뜻이지, 사용자가 <code>ROLLBACK</code>으로 취소할 수 있다는 뜻이 아니다.</p>
+
+<h3>ALTER TABLE: 데이터가 들어 있는 테이블을 고친다</h3>
+
+<p>테이블은 한 번 만들고 끝나지 않는다. 연락처 열을 더하고, 쓰지 않는 열을 지우고, 이름을 바꾸고, 길이를 늘린다. 이 일을 하는 문장이 <code>ALTER TABLE</code>이다. 열을 다루는 절은 넷이 있고 할 수 있는 일이 조금씩 다르다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>절</th><th>할 수 있는 일</th><th>예</th></tr></thead><tbody>
+<tr><td><code>CHANGE</code></td><td>이름과 정의를 함께 또는 따로 바꾼다. 이름을 그대로 두려면 같은 이름을 두 번 적는다</td><td><code>CHANGE name full_name VARCHAR(50) NOT NULL</code></td></tr>
+<tr><td><code>MODIFY</code></td><td>정의만 바꾼다. 이름은 못 바꾼다</td><td><code>MODIFY name VARCHAR(80) NOT NULL</code></td></tr>
+<tr><td><code>RENAME COLUMN</code></td><td>이름만 바꾼다. 정의는 그대로다</td><td><code>RENAME COLUMN name TO full_name</code></td></tr>
+<tr><td><code>ALTER [COLUMN]</code></td><td>기본값만 바꾸거나 지운다</td><td><code>ALTER COLUMN grade SET DEFAULT 'NEW'</code></td></tr>
+</tbody></table></div>
+
+<p>열을 더하고 지우는 것은 <code>ADD</code>와 <code>DROP</code>이다. 새 열은 기본적으로 맨 끝에 붙고, <code>FIRST</code>나 <code>AFTER 열이름</code>으로 위치를 정할 수 있다. 테이블 이름은 <code>RENAME TO</code>로 바꾼다. 제약은 <code>ADD CONSTRAINT</code>로 더하고, 종류에 맞는 절로 지운다.</p>
+
+<pre><code class="language-sql">ALTER TABLE patron ADD COLUMN phone VARCHAR(20) NULL AFTER name;
+ALTER TABLE patron RENAME COLUMN phone TO phone_number;
+ALTER TABLE patron ALTER COLUMN grade SET DEFAULT 'NEW';
+ALTER TABLE patron DROP COLUMN phone_number;
+
+ALTER TABLE loan DROP CHECK chk_loan_returned;
+ALTER TABLE loan ADD CONSTRAINT chk_loan_returned CHECK (returned_at >= loaned_at);
+ALTER TABLE loan DROP FOREIGN KEY fk_loan_patron;
+ALTER TABLE loan ADD CONSTRAINT fk_loan_patron
+    FOREIGN KEY (patron_id) REFERENCES patron (patron_id);
+
+ALTER TABLE loan RENAME TO book_loan;</code></pre>
+
+<p><code>MODIFY</code>와 <code>CHANGE</code>에는 자주 밟는 함정이 있다. 이 두 절에는 열의 새 정의를 "완전하게" 적어야 한다. 매뉴얼은 원래 정의에 있었더라도 새 정의에 적지 않은 속성은 이어지지 않는다고 적는다. 예외는 <code>PRIMARY KEY</code>나 <code>UNIQUE</code> 같은 인덱스 속성뿐이다. 이름 길이를 늘리려고 다음과 같이 쓰면 어떻게 될까.</p>
+
+<pre><code class="language-sql">ALTER TABLE patron MODIFY name VARCHAR(80);</code></pre>
+
+<p>길이는 80으로 늘어나지만 <code>NOT NULL</code>이 빠졌으므로 <code>name</code>은 이제 <code>NULL</code>을 허용한다. 오류도 경고도 없다. 이 열에 <code>DEFAULT</code>나 <code>COMMENT</code>가 있었다면 그것도 사라진다. 매뉴얼의 예에서도 <code>INT UNSIGNED DEFAULT 1 COMMENT 'my column'</code>인 열을 <code>MODIFY col1 BIGINT</code>로 바꾸자 <code>UNSIGNED</code>, <code>DEFAULT</code>, <code>COMMENT</code>가 모두 사라진다. 올바른 문장은 유지할 속성을 다시 적은 <code>MODIFY name VARCHAR(80) NOT NULL</code>이다. 이름만 바꿀 때 <code>CHANGE</code> 대신 <code>RENAME COLUMN</code>을 쓰면 정의를 다시 적을 일이 없으므로 이 함정을 피할 수 있다. <code>RENAME COLUMN</code>이나 <code>CHANGE</code>로 이름을 바꾸면 그 열을 가리키던 인덱스와 외래 키의 참조는 서버가 함께 고친다. 그러나 뷰와 저장 프로그램 안의 참조는 고치지 않는다.</p>
+
+<p>이미 데이터가 있는 테이블에 제약을 더할 때는, 기존 데이터가 그 제약을 이미 어기고 있으면 ALTER 자체가 실패한다. 중복된 이메일이 두 건 있는 상태에서 <code>UNIQUE</code> 인덱스를 더하면 중복 키 오류(1062)가 나고, <code>NULL</code>이 들어 있는 열을 <code>NOT NULL</code>로 바꾸는 작업도 실패한다. 매뉴얼은 <code>NOT NULL</code>로 바꾸는 작업이 성공하려면 엄격 모드가 켜져 있어야 한다는 조건도 적는다. 실무에서 제약을 나중에 더할 때는 위반하는 행을 먼저 찾아 정리하는 단계가 늘 앞선다.</p>
+
+<h3>ALTER의 비용: INSTANT, INPLACE, COPY와 메타데이터 락</h3>
+
+<p>빈 테이블의 열을 바꾸는 일은 정의만 고치면 끝난다. 수천만 행이 든 테이블이라면 이야기가 다르다. 행 하나하나가 리프 페이지에 열 값을 나란히 담고 있으므로, 열의 타입이 바뀌면 모든 행의 바이트 배치가 바뀌어야 할 수 있다. InnoDB는 ALTER 작업마다 세 가지 처리 방식(algorithm) 중 하나를 쓴다.</p>
+
+<ul>
+<li><b>INSTANT</b>: 데이터 사전의 메타데이터만 고친다. 행은 건드리지 않으므로 테이블 크기와 상관없이 빨리 끝난다.</li>
+<li><b>INPLACE</b>: 테이블을 통째로 복사하지 않고 제자리에서 처리한다. 다만 작업에 따라 테이블을 제자리에서 다시 짓기(rebuild) 때문에 비용이 클 수 있다. 대부분의 경우 작업 중에도 다른 세션의 DML을 허용한다.</li>
+<li><b>COPY</b>: 원래 테이블의 복사본을 만들어 행을 하나씩 옮긴다. 매뉴얼에 따르면 변경을 적용한 복사본에 데이터를 옮긴 뒤 원래 테이블을 지우고 복사본의 이름을 원래 이름으로 바꾼다. 작업 중 동시 DML은 허용되지 않는다. 다른 세션은 읽을 수는 있지만, 작업이 시작된 뒤에 들어온 쓰기는 새 테이블이 준비될 때까지 멈춰 있다.</li>
+</ul>
+
+<p>어떤 작업이 어떤 방식으로 처리되는지는 매뉴얼의 온라인 DDL 표에 정해져 있다. 이 회차에서 다룬 열 작업을 정리하면 다음과 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>작업</th><th>처리 방식 (MySQL 8.0, InnoDB)</th></tr></thead><tbody>
+<tr><td>열 추가</td><td>8.0.12부터 INSTANT가 기본. 8.0.29부터는 어느 위치에 더해도 INSTANT, 그 전에는 맨 끝에 더할 때만 INSTANT</td></tr>
+<tr><td>열 삭제</td><td>8.0.29부터 INSTANT가 기본, 그 전에는 INPLACE이며 테이블을 다시 짓는다</td></tr>
+<tr><td>열 이름 변경</td><td>8.0.28부터 INSTANT 지원. 동시 DML을 허용하려면 타입은 그대로 두고 이름만 바꾼다</td></tr>
+<tr><td>기본값 설정·삭제</td><td>INSTANT. 기본값은 데이터 사전에 저장되므로 메타데이터만 바뀐다</td></tr>
+<tr><td>열 타입 변경</td><td>COPY만 지원. 동시 DML 불가</td></tr>
+<tr><td>NULL 허용 여부 변경</td><td>INPLACE이지만 테이블을 다시 짓는다. 동시 DML 허용</td></tr>
+<tr><td>VARCHAR 길이 늘리기</td><td>길이 바이트 수가 그대로면 INPLACE, 바뀌면 COPY</td></tr>
+</tbody></table></div>
+
+<p>INSTANT 방식의 열 추가·삭제에는 한도가 있다. 매뉴얼에 따르면 INSTANT로 열을 더하거나 지울 때마다 새로운 행 버전(row version)이 하나 생기고, 허용되는 행 버전은 최대 64개다. 한도에 이르면 INSTANT 방식의 <code>ADD COLUMN</code>과 <code>DROP COLUMN</code>은 거부된다. INSTANT는 기존 행을 고치지 않고 테이블 정의가 바뀐 이력을 메타데이터로 쌓아 두는데, 매뉴얼이 밝히는 한도의 이유도 행 버전마다 테이블 메타데이터에 추가 공간이 필요하다는 것이다. 한도에 이른 테이블은 INSTANT가 아닌 방식으로 다시 지어야 한다. MySQL 8.0.46과 8.4.13에서 빈 테이블에 <code>ALGORITHM=INSTANT</code>로 열 추가와 삭제를 번갈아 반복해 보면, 64번째 변경까지는 성공하고 <code>information_schema.INNODB_TABLES</code>의 <code>TOTAL_ROW_VERSIONS</code>가 64가 된 뒤 65번째 변경이 <code>ERROR 4092 (HY000): Maximum row versions reached for table m_db_intro_03/rv. No more columns can be added or dropped instantly. Please use COPY/INPLACE.</code>로 거부된다(<code>m_db_intro_03/rv</code>는 실행에 쓴 데이터베이스와 테이블 이름이다). 이때 <code>ALGORITHM</code>을 적지 않고 같은 열 추가를 실행하면 오류 없이 처리되고 <code>TOTAL_ROW_VERSIONS</code>는 0으로 돌아간다. 서버가 INSTANT가 아닌 방식으로 테이블을 다시 지은 것이다.</p>
+
+<p>마지막 줄의 VARCHAR 규칙은 앞에서 계산한 바이트 수와 이어진다. VARCHAR 열의 값 앞에는 실제 길이를 적는 길이 바이트가 붙는다. 열의 최대 크기가 255바이트 이하이면 1바이트, 256바이트 이상이면 2바이트다. 길이를 늘려도 길이 바이트 수가 그대로면 기존 행의 배치를 바꿀 필요가 없으므로 INPLACE로 메타데이터만 고치면 된다. 1바이트에서 2바이트로 넘어가면 모든 행의 배치가 바뀌므로 테이블을 복사해야 한다. <code>utf8mb4</code>에서 문자 하나는 최대 4바이트이므로, <code>VARCHAR(63)</code>은 최대 252바이트로 1바이트 구간이고 <code>VARCHAR(64)</code>는 256바이트로 2바이트 구간이다. 따라서 <code>name VARCHAR(50)</code>(최대 200바이트)을 <code>VARCHAR(80)</code>(최대 320바이트)으로 늘리는 것은 경계를 넘는 변경이고, <code>email VARCHAR(100)</code>(최대 400바이트)을 <code>VARCHAR(200)</code>으로 늘리는 것은 경계 안의 변경이다.</p>
+
+<p>처리 방식은 <code>ALGORITHM</code> 절로 명시할 수 있다. 명시한 방식으로 처리할 수 없으면 서버는 다른 방식으로 바꿔 실행하지 않고 오류를 낸다. 운영 중인 큰 테이블에서는 이것이 안전장치가 된다. "INPLACE로 안 되면 하지 말라"는 뜻을 문장에 담는 것이다.</p>
+
+<pre><code class="language-sql">-- 길이 바이트가 1에서 2로 바뀌는 변경: INPLACE를 요구하면 실패한다
+ALTER TABLE patron MODIFY name VARCHAR(80) NOT NULL, ALGORITHM=INPLACE;
+
+-- 길이 바이트가 2로 그대로인 변경: INPLACE로 처리된다
+ALTER TABLE patron MODIFY email VARCHAR(200) NOT NULL, ALGORITHM=INPLACE;</code></pre>
+
+<p>MySQL 8.0.46과 8.4.13에서 실행하면 첫 문장은 <code>ERROR 1846 (0A000): ALGORITHM=INPLACE is not supported. Reason: Cannot change column type INPLACE. Try ALGORITHM=COPY.</code>로 실패하고, 둘째 문장은 성공한다. 같은 서버에서 <code>max_loans</code>를 <code>INT</code>에서 <code>BIGINT</code>로 바꾸며 INPLACE를 요구하면 <code>ERROR 1845 (0A000): ALGORITHM=INPLACE is not supported for this operation. Try ALGORITHM=COPY.</code>가 난다. 오류 메시지가 COPY를 권하지만, 운영 중인 테이블이라면 그 권고를 바로 따르기 전에 복사에 걸릴 시간과 그동안 쓰기가 멈춘다는 사실을 따져야 한다.</p>
+
+<p>처리 방식과 별개로 모든 DDL이 피할 수 없는 관문이 하나 있다. 메타데이터 락(metadata lock)이다. 매뉴얼의 설명은 이렇다. 서버는 한 세션이 끝나지 않은 트랜잭션에서 쓰고 있는 테이블에 다른 세션이 DDL을 실행하는 것을 허용하지 않는다. 이를 위해 트랜잭션이 사용한 테이블에 메타데이터 락을 잡고, 그 락을 트랜잭션이 끝날 때까지 놓지 않는다. 메타데이터 락은 테이블의 구조가 바뀌는 것을 막는다.</p>
+
+<pre class="diagram">시간  세션 A                              세션 B
+ 1   START TRANSACTION;
+ 2   SELECT * FROM patron
+       WHERE patron_id = 1;
+     (patron 의 메타데이터 락 보유)
+ 3                                       ALTER TABLE patron
+                                           ADD COLUMN phone VARCHAR(20);
+                                         ... 대기 ...
+ 4   (커밋도 롤백도 하지 않고 다른 일)    ... 대기 ...
+ 5   COMMIT;  (메타데이터 락 해제)
+ 6                                       ALTER 진행, 완료</pre>
+
+<p>세션 A가 한 일은 행 하나를 읽은 것뿐이다. 그런데 트랜잭션을 열어 둔 채 다른 일을 하는 동안, 세션 B의 ALTER는 아무리 INSTANT로 처리될 작업이라도 시작조차 하지 못한다. 매뉴얼은 막히는 문장으로 <code>DROP TABLE</code>, <code>ALTER TABLE</code>, <code>LOCK TABLE ... WRITE</code>를 알고리즘 구분 없이 든다. 반대로 자동 커밋 모드에서는 문장 하나가 곧 트랜잭션이므로, 그 문장이 잡은 메타데이터 락은 문장이 끝날 때 풀린다. 실무에서 "열 하나 더하는 데 왜 몇 분씩 걸렸는가"를 조사해 보면, ALTER 자체가 느렸던 것이 아니라 어딘가에서 커밋하지 않고 열려 있던 트랜잭션을 기다린 경우가 많다. 이 대기는 스레드 상태 <code>Waiting for table metadata lock</code>으로 나타나므로, 프로세스 목록에서 이 상태를 보면 먼저 열린 트랜잭션부터 찾는다. 위 순서를 MySQL 8.0.46에서 재현하면서(세션 A는 트랜잭션 안에서 <code>DO SLEEP(6)</code>으로 "다른 일"을 흉내 냈다) 세션 B가 기다리는 동안 프로세스 목록을 조회한 결과가 다음이다. 세션 A가 커밋한 직후에 ALTER가 끝났다.</p>
+
+<pre data-label="MySQL 8.0.46에서 실행 (ID는 실행할 때마다 달라진다)"><code class="language-sql">SELECT ID, STATE, INFO FROM information_schema.PROCESSLIST
+WHERE DB = 'm_db_intro_03' AND COMMAND <> 'Sleep' AND INFO NOT LIKE '%PROCESSLIST%';
+
++----+---------------------------------+-------------------------------------------------+
+| ID | STATE                           | INFO                                            |
++----+---------------------------------+-------------------------------------------------+
+| 85 | User sleep                      | DO SLEEP(6)                                     |
+| 86 | Waiting for table metadata lock | ALTER TABLE patron ADD COLUMN phone VARCHAR(20) |
++----+---------------------------------+-------------------------------------------------+</code></pre>
+
+<x-visual id="db-intro-03-metadata-lock" title="열린 트랜잭션이 잡은 메타데이터 락 때문에 다른 세션의 ALTER TABLE이 대기하는 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>세션 A의 트랜잭션이 끝날 때까지 세션 B의 ALTER가 멈춰 있고, COMMIT 직후에야 진행된다는 것을 시간 축으로 보여 준다.</x-hint>
+<x-prompt>흰 배경의 시퀀스 다이어그램. 세로 생명선 세 개, 왼쪽부터 위에 "세션 A", "patron 테이블", "세션 B" 라벨. 세션 A에서 테이블로 파란 화살표 "START TRANSACTION; SELECT". 테이블 생명선 옆에 자물쇠 아이콘과 라벨 "메타데이터 락 (A)". 조금 아래 세션 B에서 테이블로 주황 화살표 "ALTER TABLE"이 오다가 자물쇠 앞에서 멈추고, 세션 B 생명선을 따라 긴 점선 구간과 모래시계 아이콘, 라벨 "대기". 그 구간 동안 세션 A 생명선에는 회색 띠 "트랜잭션 열린 채 다른 일". 아래쪽에서 세션 A에서 테이블로 초록 화살표 "COMMIT", 자물쇠가 열린 아이콘으로 바뀐다. 바로 아래 세션 B의 주황 화살표가 테이블에 닿고 라벨 "ALTER 진행". 평면적이고 차분한 색조, 고딕체 한국어 라벨.</x-prompt>
+<x-caption>ALTER가 기다리는 것은 데이터의 양이 아니라 그 테이블을 쓰고 있는 열린 트랜잭션이다.</x-caption>
+</x-visual>
+
+<h3>DROP TABLE과 TRUNCATE TABLE: 테이블을 없애는 두 방법</h3>
+
+<p><code>DROP TABLE</code>은 테이블의 정의와 데이터와 인덱스를 모두 없앤다. 테이블이 없을 때 오류를 내지 않으려면 <code>DROP TABLE IF EXISTS</code>를 쓴다. 앞에서 보았듯 여러 테이블을 한 문장으로 지울 때 그중 하나라도 없으면, MySQL 8.0에서는 아무것도 지워지지 않는다. DDL이므로 암묵적 커밋을 일으키고 되돌릴 수 없다.</p>
+
+<p>외래 키가 얽히면 지우는 순서가 생긴다. <code>loan</code>이 <code>patron</code>을 참조하는 상태에서 <code>DROP TABLE patron</code>을 실행하면 다음 형태의 오류가 난다.</p>
+
+<pre data-label="오류"><code class="language-text">ERROR 3730 (HY000): Cannot drop table 'patron' referenced by a foreign key constraint 'fk_loan_patron' on table 'loan'.</code></pre>
+
+<p>매뉴얼은 참조되는 테이블은 <code>foreign_key_checks</code>를 끈 뒤에만 지울 수 있다고 적는다. 정상적인 순서는 참조하는 쪽인 <code>loan</code>을 먼저 지우고 <code>patron</code>을 지우는 것이다. 테이블을 만드는 순서는 그 반대로, 참조되는 쪽이 먼저다. <code>foreign_key_checks</code>를 끄면 순서와 상관없이 지울 수 있지만, 이 변수에는 또 다른 함정이 있다. 매뉴얼에 따르면 다시 켤 때 테이블 데이터를 훑지 않으므로, 꺼져 있는 동안 들어간 행은 외래 키를 어기더라도 나중에 검사되지 않는다. 대량 적재를 빠르게 하려고 껐다가 고아 행을 남기는 사고가 이렇게 생긴다.</p>
+
+<p><code>TRUNCATE TABLE</code>은 테이블의 정의는 남기고 모든 행을 없앤다. 결과만 보면 <code>WHERE</code> 없는 <code>DELETE</code>와 같지만, 매뉴얼은 이것을 DML이 아니라 DDL로 분류한다. 그 차이는 다음과 같은 성질로 나타난다.</p>
+
+<ul>
+<li>암묵적 커밋을 일으키므로 롤백할 수 없다. 트랜잭션 안에서 다른 DML과 묶을 수 없다.</li>
+<li>다른 테이블의 외래 키가 이 테이블을 참조하고 있으면 InnoDB 테이블에서는 실패한다. 오류 번호는 1701이고 메시지는 <code>Cannot truncate a table referenced in a foreign key constraint</code>로 시작한다. 같은 테이블 안의 열끼리 맺은 외래 키는 허용된다.</li>
+<li>AUTO_INCREMENT 값이 시작 값으로 되돌아간다. 평소에는 번호를 재사용하지 않는 InnoDB에서도 마찬가지다.</li>
+<li><code>ON DELETE</code> 트리거를 실행하지 않는다.</li>
+<li>지운 행 수를 의미 있게 돌려주지 않는다. 보통 "0 rows affected"가 나오는데, 매뉴얼은 이것을 "정보 없음"으로 읽으라고 적는다.</li>
+<li><code>DROP</code> 권한이 필요하다.</li>
+</ul>
+
+<p>왜 행을 지우는 문장이 DDL일까. <code>DELETE</code>는 행을 하나씩 찾아 지우고 그 하나하나를 되돌릴 수 있게 기록한다. <code>TRUNCATE</code>는 행 단위로 일하지 않고 테이블의 저장 구조 자체를 비운다. 행 단위 기록이 없으니 되돌릴 수 없고, 행 단위로 확인하지 않으니 다른 테이블이 이 테이블의 행을 참조하는지 하나하나 검사할 수 없다. 외래 키로 참조되는 테이블에서 아예 실패하도록 정한 것은 그 때문이다. <code>DELETE</code>와의 자세한 비교는 DML의 삭제를 다룬 뒤에 표로 정리한다.</p>
+
+<h3>INSERT: 행 하나가 들어가는 길</h3>
+
+<p>이제 그릇에 내용을 담는다. 가장 기본적인 형태는 테이블 이름, 열 목록, 값 목록이다. 앞의 정의대로 만든 빈 <code>patron</code> 테이블에서 시작하자.</p>
+
+<pre><code class="language-sql">INSERT INTO patron (email, name) VALUES ('kim@example.com', '김하늘');</code></pre>
+
+<p>열 목록에 없는 열은 기본값을 받는다. <code>patron_id</code>는 AUTO_INCREMENT가 붙인 1, <code>grade</code>는 <code>'BASIC'</code>, <code>max_loans</code>는 3, <code>joined_at</code>은 문장이 실행된 시각이다. 마지막 값만은 실행할 때마다 달라진다. 자동 커밋 모드이므로 이 문장은 오류 없이 끝나는 순간 커밋되고, 다른 세션에서도 이 행을 볼 수 있다.</p>
+
+<p>값 목록을 여러 개 이어 쓰면 한 문장으로 여러 행을 넣는다. 값 자리에 <code>DEFAULT</code> 키워드를 쓰면 그 열의 기본값을 명시적으로 고른다.</p>
+
+<pre><code class="language-sql">INSERT INTO patron (email, name, grade, max_loans)
+VALUES ('lee@example.com',  '이바다', 'GOLD',  5),
+       ('park@example.com', '박노을', DEFAULT, 4);
+
+SELECT LAST_INSERT_ID();</code></pre>
+
+<pre data-label="실행 결과 (MySQL 8.0.46에서 실행)"><code class="language-text">Query OK, 2 rows affected (0.00 sec)
+Records: 2  Duplicates: 0  Warnings: 0
+
++------------------+
+| LAST_INSERT_ID() |
++------------------+
+|                2 |
++------------------+</code></pre>
+
+<p>괄호 안의 실행 시간은 실행 환경에 따라 달라진다. 다른 세션이 동시에 행을 넣지 않았다면 두 행은 2번과 3번을 받는다. 여러 행을 넣는 INSERT는 <code>Records: N1 Duplicates: N2 Warnings: N3</code> 형태의 정보 문자열을 돌려준다. <code>Records</code>는 처리한 행 수, <code>Duplicates</code>는 유일 값이 겹쳐 넣지 못한 행 수, <code>Warnings</code>는 값에 문제가 있었던 횟수다. <code>LAST_INSERT_ID()</code>가 3이 아니라 2인 데에는 이유가 있다. 매뉴얼은 한 INSERT로 여러 행을 넣으면 이 함수가 첫 번째 행에 생성된 값만 돌려준다고 정한다. 같은 INSERT를 다른 서버에서 쉽게 재현할 수 있게 하려는 것이다. 또 이 값은 연결마다 따로 유지되므로, 다른 클라이언트가 그 사이에 행을 넣어도 내 연결의 값은 바뀌지 않는다. "방금 넣은 행의 번호"를 얻으려고 <code>SELECT MAX(patron_id)</code>를 쓰면 다른 세션의 삽입과 섞일 수 있지만, <code>LAST_INSERT_ID()</code>는 그런 문제가 없다.</p>
+
+<p>열 목록을 생략할 수도 있다. 이때는 테이블의 모든 열에 대해 테이블에 정의된 순서대로 값을 주어야 한다. 짧아서 편해 보이지만, 앞 절의 ALTER TABLE과 함께 생각하면 위험하다. 누군가 <code>phone</code> 열을 더한 순간 열 목록 없이 쓴 INSERT는 모두 <code>ERROR 1136 (21S01): Column count doesn't match value count at row 1</code>로 실패한다. 더 나쁜 경우는 열의 개수는 그대로인데 순서가 바뀌는 것이다. 타입이 호환되면 값이 엉뚱한 열에 조용히 들어간다. 애플리케이션 코드의 INSERT에는 열 목록을 항상 적는다.</p>
+
+<p>INSERT가 실패하는 경우를 우리 테이블로 정리해 보자. 모두 기본 SQL 모드, 즉 엄격 모드에서의 결과이고, 오류 문구는 MySQL 8.0.46에서 실행해 얻은 그대로다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>문장</th><th>결과</th></tr></thead><tbody>
+<tr><td><code>INSERT INTO patron (email) VALUES ('choi@example.com')</code></td><td><code>ERROR 1364 (HY000): Field 'name' doesn't have a default value</code>. <code>NOT NULL</code>이면서 기본값이 없는 열을 빠뜨렸다</td></tr>
+<tr><td><code>INSERT INTO patron (email, name) VALUES ('choi@example.com', NULL)</code></td><td><code>ERROR 1048 (23000): Column 'name' cannot be null</code>. 값을 빠뜨린 것이 아니라 <code>NULL</code>을 명시했다</td></tr>
+<tr><td><code>name</code>에 51자 이상의 문자열</td><td><code>ERROR 1406 (22001): Data too long for column 'name' at row 1</code></td></tr>
+<tr><td><code>max_loans</code>에 20</td><td><code>ERROR 3819 (HY000): Check constraint 'chk_patron_max_loans' is violated.</code></td></tr>
+<tr><td><code>email</code>에 이미 있는 <code>'kim@example.com'</code></td><td><code>ERROR 1062 (23000): Duplicate entry 'kim@example.com' for key 'patron.uk_patron_email'</code></td></tr>
+<tr><td><code>loan</code>에 존재하지 않는 <code>patron_id</code> 99</td><td><code>ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint fails (`m_db_intro_03`.`loan`, CONSTRAINT `fk_loan_patron` FOREIGN KEY (`patron_id`) REFERENCES `patron` (`patron_id`))</code>. 괄호 안에 어떤 외래 키가 깨졌는지가 나온다. <code>m_db_intro_03</code>은 실행에 쓴 데이터베이스 이름이다</td></tr>
+</tbody></table></div>
+
+<p>엄격 모드가 꺼져 있다면 이 가운데 첫 번째와 세 번째 경우는 오류가 아니라 경고가 된다. 빠진 이름은 빈 문자열로, 긴 이름은 잘린 채로 들어간다. 두 번째 경우는 다르다. 매뉴얼에 따르면 한 행만 넣는 INSERT에서 <code>NOT NULL</code> 열에 <code>NULL</code>을 명시하면 엄격 모드가 아니어도 경고가 아니라 오류가 난다. 여러 행을 넣는 INSERT라면 그 열에 타입의 암묵적 기본값이 들어가고 경고가 남는다. 제약 조건(UNIQUE, CHECK, 외래 키) 위반은 SQL 모드와 상관없이 오류다. 여러 행을 넣는 INSERT의 두 번째 행에서 오류가 나면 어떻게 될까. InnoDB는 트랜잭션을 지원하는 테이블이므로, 매뉴얼에 따라 엄격 모드의 오류는 문장 전체를 취소하고 롤백한다. 중복 키 오류도 <code>IGNORE</code>가 없으면 그 SQL 문장을 롤백한다. 그래서 다음 문장은 <code>han@example.com</code>도 넣지 않는다. 문장 하나는 전부 성공하거나 전부 실패한다. 다만 매뉴얼은 문장 하나를 롤백할 때 그 문장이 잡은 락은 풀리지 않는다고 덧붙인다. 명시적 트랜잭션 안이라면 앞서 성공한 문장들과 락은 그대로 남아 있다.</p>
+
+<pre><code class="language-sql">INSERT INTO patron (email, name)
+VALUES ('han@example.com', '한가람'),
+       ('kim@example.com', '김중복');   -- 두 번째 행이 중복: 문장 전체가 취소된다</code></pre>
+
+<h4>AUTO_INCREMENT 번호는 어떻게 정해지는가</h4>
+
+<p>AUTO_INCREMENT 열에 값을 주지 않거나 <code>NULL</code> 또는 0을 주면, InnoDB는 값을 주지 않은 것으로 보고 새 값을 만든다. 0으로 번호를 생성하는 동작은 <code>NO_AUTO_VALUE_ON_ZERO</code> SQL 모드로 끌 수 있고, 그러면 <code>NULL</code>만 새 번호를 만든다. 반대로 카운터보다 큰 값을 직접 넣으면 카운터가 그 값으로 올라간다. 그 뒤의 자동 번호는 그 값 다음부터 이어진다.</p>
+
+<p>이 번호에 대해 가장 중요한 사실은 빈틈이 생길 수 있다는 것이다. 매뉴얼은 모든 잠금 모드에서, 값을 생성한 트랜잭션이 롤백되면 그 값은 "잃어버린" 값이 되며 다시 쓰이지 않는다고 적는다. 값이 한 번 생성되면, INSERT 문장이 끝까지 완료되었는지와 트랜잭션이 롤백되었는지에 상관없이 되돌려지지 않는다. 다음 순서를 따라가 보자.</p>
+
+<pre><code class="language-sql">-- 현재 patron_id 1, 2, 3 이 있다
+START TRANSACTION;
+INSERT INTO patron (email, name) VALUES ('oh@example.com', '오솔길');   -- 4 를 받는다
+ROLLBACK;                                                                 -- 행은 사라지지만 4 는 돌아오지 않는다
+INSERT INTO patron (email, name) VALUES ('yun@example.com', '윤새벽');  -- 5 를 받는다</code></pre>
+
+<p>왜 되돌리지 않을까. 번호를 되돌리려면, 4를 받은 트랜잭션이 끝날 때까지 다른 트랜잭션이 5를 받지 못하게 기다리게 해야 한다. 그렇지 않으면 4를 되돌렸을 때 이미 5가 쓰였으므로 순서가 꼬인다. 모든 삽입을 한 줄로 세우는 대가로 빈틈 없는 번호를 얻는 것은 손해다. 그래서 AUTO_INCREMENT는 "유일하고 증가하는 식별자"만 약속하고 "연속된 번호"는 약속하지 않는다. 잠금 모드를 정하는 <code>innodb_autoinc_lock_mode</code>는 0(traditional), 1(consecutive), 2(interleaved) 가운데 하나이고, MySQL 8.0의 기본값은 2다. 8.0 이전의 기본값은 1이었다. 어느 모드든 롤백된 번호를 잃는다는 점은 같다.</p>
+
+<p>카운터가 어디에 저장되는지도 버전에 따라 다르다. 매뉴얼에 따르면 MySQL 5.7까지는 카운터가 디스크가 아니라 메모리에만 있었다. 8.0부터는 카운터의 현재 최댓값이 바뀔 때마다 리두 로그에 기록되고 체크포인트마다 데이터 사전에 저장되어, 서버를 재시작해도 유지된다. 다만 서버가 예기치 않게 종료된 경우에는 이미 할당했던 값이 다시 쓰이지 않는다고 보장하지 못한다고 매뉴얼은 덧붙인다. 또 InnoDB는 가장 큰 번호의 행을 <code>DELETE</code>로 지워도 그 번호를 다시 쓰지 않는다. 번호를 처음으로 되돌리는 것은 <code>TRUNCATE TABLE</code>이다.</p>
+
+<p>결론은 업무 규칙에 쓰지 말라는 것이다. "회원 번호는 1부터 빈틈없이 매긴다"는 요구 사항이 있다면 AUTO_INCREMENT로는 지킬 수 없다. 반대로 "다음 번호는 마지막 번호 + 1일 것"이라고 가정한 코드도 틀린다. 생성된 번호는 <code>LAST_INSERT_ID()</code>나 드라이버가 돌려주는 생성 키로 받아야 한다.</p>
+
+<h4>한 층 아래: 새 행이 클러스터형 인덱스에 들어가는 자리</h4>
+
+<p>INSERT된 행은 클러스터형 인덱스의 리프 페이지 중 기본 키 순서에 맞는 자리에 들어간다. AUTO_INCREMENT 기본 키라면 새 행의 키는 항상 지금까지의 어떤 키보다 크므로, 새 행은 늘 트리의 가장 오른쪽 리프에 붙는다. 매뉴얼은 이 차이를 수치로 적는다. InnoDB는 새 레코드를 넣을 때 앞으로의 삽입과 갱신을 위해 페이지의 1/16을 비워 두려 한다. 레코드가 순차적으로(오름차순이든 내림차순이든) 들어오면 페이지는 약 15/16까지 채워진다. 무작위 순서로 들어오면 페이지는 1/2에서 15/16 사이로 채워진다.</p>
+
+<p>무작위 순서의 대표적인 예가 UUID 문자열을 기본 키로 쓰는 경우다. 새 행이 트리 곳곳의 이미 차 있는 페이지 사이로 끼어들어야 하므로, 같은 양의 데이터가 더 많은 페이지에 퍼지고 페이지마다 채워진 정도가 들쭉날쭉해진다. 여기에 앞에서 본 사실, 즉 모든 보조 인덱스 레코드가 기본 키 값을 품는다는 사실이 더해진다. 8바이트 <code>BIGINT</code> 대신 36자 문자열이 모든 보조 인덱스에 복사된다. 기본 키를 고르는 일이 단지 "행을 구별하는 값"을 고르는 일이 아니라 테이블의 물리적 배치를 고르는 일인 이유다. 보조 인덱스는 사정이 다르다. <code>uk_patron_email</code>의 키는 이메일이므로 새 이메일이 사전 순으로 어디에 올지는 예측할 수 없고, 보조 인덱스에는 늘 무작위 삽입이 일어난다.</p>
+
+<x-visual id="db-intro-03-insert-order" title="순차 증가 기본 키와 무작위 기본 키로 행을 넣을 때 클러스터형 인덱스 리프 페이지가 채워지는 모습의 비교" kind="비교 다이어그램" ratio="16:9">
+<x-hint>순차 키는 맨 오른쪽 리프에만 쌓여 페이지가 거의 가득 차고, 무작위 키는 여러 페이지에 흩어져 채움 정도가 들쭉날쭉하다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경을 좌우 두 패널로 나눈 비교 다이어그램. 왼쪽 패널 제목 "순차 키 (AUTO_INCREMENT)", 오른쪽 패널 제목 "무작위 키 (UUID)". 두 패널 모두 아래쪽에 가로로 늘어선 리프 페이지 사각형 네 개가 있고, 각 사각형은 아래에서부터 파란색으로 채워진 막대처럼 그린다. 왼쪽 패널: 왼쪽 세 페이지는 거의 가득(위에 얇은 빈 띠만 남음), 각 페이지 위에 "15/16". 맨 오른쪽 페이지는 절반쯤 채워져 있고, 위에서 굵은 초록 화살표가 그 페이지로만 들어오며 라벨 "새 행은 항상 여기". 오른쪽 패널: 네 페이지의 채움 높이가 서로 다르다(반, 3/4, 거의 가득, 2/3). 위에서 가는 주황 화살표 네 개가 서로 다른 페이지로 흩어져 들어오고, 패널 아래에 라벨 "1/2 ~ 15/16". 평면적이고 차분한 색조, 고딕체 한국어 라벨.</x-prompt>
+<x-caption>기본 키가 순차적으로 증가하면 새 행은 맨 오른쪽 페이지에만 쌓인다. 무작위 키는 트리 곳곳에 끼어든다.</x-caption>
+</x-visual>
+
+<p>되돌리기 위한 기록도 남는다. InnoDB의 언두 로그(undo log)는 삽입 언두 로그와 갱신 언두 로그로 나뉜다. 매뉴얼에 따르면 삽입 언두 로그는 트랜잭션 롤백에만 필요하므로 트랜잭션이 커밋되자마자 버릴 수 있다. 새로 넣은 행에는 다시 만들어 보여 줄 "이전 버전"이 없다. 롤백할 때 "이 행이 없던 상태"로 돌아가려면 행을 지우기만 하면 되고, 커밋된 뒤에는 그 기록이 쓰일 곳이 없다. 반면 UPDATE와 DELETE가 남기는 갱신 언두 로그는 사정이 다르다. 이것은 다음 절에서 본다.</p>
+
+<h3>INSERT의 변형: IGNORE와 ON DUPLICATE KEY UPDATE</h3>
+
+<p>INSERT에는 충돌을 다르게 처리하는 MySQL 확장이 둘 있다. 첫째는 <code>INSERT IGNORE</code>다. 매뉴얼에 따르면 <code>IGNORE</code>를 붙이면 무시할 수 있는 오류가 무시되고 경고로 바뀐다. 기존 행과 유일 값이 겹치는 행은 버려지고 문장은 계속된다. CHECK 제약을 어기는 행도 경고와 함께 건너뛴다. 여기까지는 "중복이면 넘어가라"는 의도에 맞는다.</p>
+
+<p>문제는 <code>IGNORE</code>가 중복 키만 무시하는 것이 아니라는 데 있다. 매뉴얼은 <code>IGNORE</code>를 쓰면 오류를 일으킬 데이터 변환에서도 문장을 멈추지 않고, 잘못된 값을 가장 가까운 유효한 값으로 고쳐 넣는다고 적는다. 엄격 모드가 막아 주던 것들이 경고로 내려간다는 뜻이다. 51자짜리 이름은 50자로 잘려 들어가고, 범위를 넘는 숫자는 범위의 끝 값으로 들어간다. 중복만 넘기고 싶어서 붙인 <code>IGNORE</code>가 데이터 품질 검사를 함께 꺼 버리는 것이다. <code>INSERT IGNORE</code>를 썼다면 <code>SHOW WARNINGS</code>로 무엇이 무시되었는지 확인하는 습관이 필요하다.</p>
+
+<p>둘째는 <code>INSERT ... ON DUPLICATE KEY UPDATE</code>다. 유일 값이 겹치면 새 행을 넣는 대신 기존 행을 갱신한다. 날짜별 방문자 수를 세는 테이블로 보자.</p>
+
+<pre><code class="language-sql">CREATE TABLE daily_visit (
+    visit_date DATE NOT NULL PRIMARY KEY,
+    cnt        INT  NOT NULL
+);
+
+INSERT INTO daily_visit (visit_date, cnt) VALUES ('2026-11-16', 1) AS new
+ON DUPLICATE KEY UPDATE cnt = daily_visit.cnt + new.cnt;</code></pre>
+
+<p>그날의 첫 실행에서는 행이 없으므로 <code>('2026-11-16', 1)</code>이 들어가고, 영향받은 행 수는 1이다. 두 번째 실행에서는 기본 키가 겹치므로 기존 행의 <code>cnt</code>가 1에서 2로 갱신되고, 영향받은 행 수는 2다. 매뉴얼은 행마다 새로 넣으면 1, 기존 행을 갱신하면 2, 기존 행을 현재 값 그대로 두게 되면 0이라고 정한다. MySQL 8.0.46에서 실행해 보면 세 경우에 각각 <code>Query OK, 1 row affected</code>, <code>2 rows affected</code>, <code>0 rows affected</code>가 나온다. 갱신 절의 <code>daily_visit.cnt</code>는 기존 행의 열이고 <code>new.cnt</code>는 넣으려던 값이다. 기존 행의 열에 테이블 이름을 붙인 데에는 이유가 있다. 행 별칭을 붙인 문장에서 <code>cnt = cnt + new.cnt</code>처럼 한정하지 않은 <code>cnt</code>를 쓰면, MySQL 8.0.46과 8.4.13 모두 <code>ERROR 1052 (23000): Column 'cnt' in field list is ambiguous</code>로 거부한다. 기존 행의 <code>cnt</code>인지 별칭 <code>new</code>의 <code>cnt</code>인지 정할 수 없다는 뜻이다. <code>AS new(d, c)</code>처럼 열 별칭까지 붙여 이름이 겹치지 않게 하면 <code>cnt = cnt + c</code>로 쓸 수 있다. <code>AS new</code>처럼 VALUES 뒤에 행 별칭을 붙이는 문법은 MySQL 8.0.19부터 쓸 수 있다. 그 전에는 <code>VALUES(cnt)</code> 함수로 넣으려던 값을 가리켰는데, 이 용법은 8.0.20부터 폐기 예정(deprecated)이다. 8.0.46에서 <code>VALUES(cnt)</code>를 쓰면 문장은 실행되지만 경고 1287 <code>'VALUES function' is deprecated and will be removed in a future release.</code>가 남는다.</p>
+
+<p>이 문장은 유일 인덱스가 하나일 때 의도대로 동작한다. 유일 인덱스가 여러 개이고 넣으려는 행이 서로 다른 인덱스로 서로 다른 기존 행과 겹치면, 매뉴얼에 따르면 그중 한 행만 갱신된다. 매뉴얼은 유일 인덱스가 여러 개인 테이블에서는 이 절을 피하라고 권한다. <code>patron</code>에 쓴다면 기본 키는 자동 생성이라 겹칠 일이 없고 이메일만 겹칠 수 있으므로 문제가 없지만, 유일 인덱스를 하나 더 둔다면 다시 따져 봐야 한다.</p>
+
+<h3>UPDATE: WHERE가 곧 범위다</h3>
+
+<p><code>UPDATE</code>는 <code>SET</code>으로 바꿀 값을, <code>WHERE</code>로 바꿀 행을 정한다. <code>WHERE</code>가 없으면 테이블의 모든 행이 대상이다. 이 단순한 규칙이 가장 비싼 실수를 낳는다. 조건을 적다가 실행 키를 먼저 누르면 모든 이용자의 등급이 한꺼번에 바뀐다. 자동 커밋 모드라면 그 변경은 이미 커밋되었다.</p>
+
+<p>이 실수를 막는 장치가 안전 갱신 모드(safe-updates mode)다. 세션 변수 <code>sql_safe_updates</code>를 켜면, <code>WHERE</code> 절에 키 조건이 없고 <code>LIMIT</code>도 없는 <code>UPDATE</code>와 <code>DELETE</code>가 오류로 거부된다. 오류 번호는 1175이고 메시지는 <code>You are using safe update mode and you tried to update a table without a WHERE that uses a KEY column.</code>로 시작한다. <code>mysql</code> 명령행 클라이언트의 <code>--safe-updates</code> 옵션은 접속할 때 <code>SET sql_safe_updates=1, sql_select_limit=1000, max_join_size=1000000</code>을 실행해 이 모드를 켠다. GUI 도구에서 이 오류를 처음 만났다면, 누가 켰든 그 세션에서 이 변수가 켜져 있다는 뜻이다. 매뉴얼은 키 조건을 적었더라도 옵티마이저가 그 인덱스를 쓰지 않기로 하면(예를 들어 범위 최적화의 메모리 한도를 넘거나 타입 변환이 일어나면) 이 모드에서 오류가 날 수 있다고 덧붙인다.</p>
+
+<p>UPDATE가 돌려주는 숫자를 정확히 읽어 보자. 지금 <code>patron</code>의 상태가 다음과 같다고 하자.</p>
+
+<pre class="diagram">patron_id | grade | max_loans
+----------+-------+----------
+        1 | BASIC |         5
+        2 | GOLD  |         5
+        3 | BASIC |         4</pre>
+
+<pre><code class="language-sql">UPDATE patron SET grade = 'GOLD' WHERE max_loans >= 4;</code></pre>
+
+<pre data-label="실행 결과 (mysql 클라이언트, MySQL 8.0.46에서 실행)"><code class="language-text">Query OK, 2 rows affected (0.00 sec)
+Rows matched: 3  Changed: 2  Warnings: 0</code></pre>
+
+<p>세 행이 조건에 맞았지만 2번 행은 이미 <code>GOLD</code>였다. 매뉴얼은 열을 현재 값과 같은 값으로 설정하면 MySQL이 이를 알아채고 갱신하지 않는다고 적는다. 그래서 실제로 바뀐 행은 두 개이고, UPDATE는 기본적으로 실제로 바뀐 행 수를 영향받은 행 수로 돌려준다. 조건에 맞은 행 수는 정보 문자열의 <code>Rows matched</code>에 따로 나온다.</p>
+
+<p>여기서 자바 개발자가 알아야 할 반전이 있다. 클라이언트가 접속할 때 <code>CLIENT_FOUND_ROWS</code> 플래그를 주면, 서버는 영향받은 행 수로 바뀐 행 수가 아니라 <code>WHERE</code>에 맞은 행 수를 돌려준다. MySQL Connector/J의 <code>useAffectedRows</code> 속성은 "접속할 때 <code>CLIENT_FOUND_ROWS</code> 플래그를 설정하지 않는다"는 뜻이고 기본값이 <code>false</code>다. 따라서 기본 설정의 Connector/J는 이 플래그를 설정해 접속한다. 매뉴얼은 이 속성을 켜는 것이 JDBC 규약에 맞지 않으며 "찾은 행"에 기대는 대부분의 애플리케이션을 깨뜨린다고 적는다. 결과적으로 같은 UPDATE를 JDBC의 <code>executeUpdate()</code>로 실행하면 기본 설정에서 3이 돌아온다. 애플리케이션이 "갱신 결과가 0이면 대상 행이 없었다"고 판단하는 코드는 이 기본값 덕분에 성립한다. 누군가 <code>useAffectedRows=true</code>로 바꾸면, 값이 그대로인 갱신이 0을 돌려주어 "없는 행"으로 오판된다.</p>
+
+<p>다음은 <code>SET</code>에 여러 대입을 적을 때의 순서다. 직전 값을 보관하는 카운터 테이블로 보자.</p>
+
+<pre><code class="language-sql">CREATE TABLE counter (id INT PRIMARY KEY, cur INT NOT NULL, prev INT NULL);
+INSERT INTO counter VALUES (1, 10, NULL);
+
+UPDATE counter SET cur = cur + 1, prev = cur WHERE id = 1;
+-- 결과: cur = 11, prev = 11</code></pre>
+
+<p>의도는 <code>prev</code>에 바꾸기 전 값 10을 남기는 것이었지만 결과는 11이다. 매뉴얼에 따르면 단일 테이블 UPDATE의 대입은 일반적으로 왼쪽에서 오른쪽으로 평가되고, 두 번째 대입의 <code>cur</code>은 원래 값이 아니라 방금 갱신된 값이다. 매뉴얼은 이 동작이 표준 SQL과 다르다고 명시한다. 의도대로 하려면 <code>SET prev = cur, cur = cur + 1</code>로 순서를 바꾼다. 그러면 <code>prev</code>가 먼저 10을 받고 <code>cur</code>이 11이 된다. 여러 테이블을 함께 갱신하는 UPDATE에서는 대입 순서가 보장되지 않는다는 점도 매뉴얼에 적혀 있다.</p>
+
+<p>유일 값을 한꺼번에 밀어내는 UPDATE에도 순서 문제가 있다. 좌석 번호 <code>seat_no</code>가 기본 키이고 값이 1, 2, 3인 테이블에서 <code>UPDATE seat SET seat_no = seat_no + 1</code>을 실행하면, 1이 2로 바뀌는 순간 아직 바뀌지 않은 2와 겹친다. 매뉴얼은 1이 2로 먼저 갱신되면 오류가 난다고 적는다. 표준 SQL이라면 문장 전체가 끝난 뒤에 제약을 검사하므로 결과(2, 3, 4)만 보고 통과시켰을 것이다. 그러나 MySQL은 유일 제약과 외래 키 제약을 행 단위로 즉시 검사한다. 매뉴얼이 제시하는 해법은 MySQL의 단일 테이블 UPDATE가 지원하는 <code>ORDER BY</code>로 처리 순서를 정하는 것이다. <code>UPDATE seat SET seat_no = seat_no + 1 ORDER BY seat_no DESC</code>는 3을 4로, 2를 3으로, 1을 2로 바꾸므로 중간에 겹치는 순간이 없다. 같은 문장에 붙이는 <code>LIMIT</code>은 바뀐 행이 아니라 조건에 맞은 행의 수로 센다. 맞은 행을 그만큼 찾으면 실제로 바뀌었든 아니든 멈춘다.</p>
+
+<p><code>NOT NULL</code> 열을 <code>NULL</code>로 바꾸는 UPDATE는 엄격 모드에서 오류다. 엄격 모드가 아니면 타입의 암묵적 기본값으로 바뀌고 경고만 늘어난다. 한 행 INSERT에서 <code>NULL</code>을 명시하면 엄격 모드와 상관없이 오류였던 것과 달리, UPDATE에서는 엄격 모드 여부가 결과를 가른다.</p>
+
+<h4>한 층 아래: UPDATE가 행을 바꾸는 방법</h4>
+
+<p>UPDATE는 행을 찾아서 바꾼다. 찾는 과정은 SELECT와 같다. <code>WHERE patron_id = 1</code>이면 클러스터형 인덱스를 따라 내려가 한 행에 바로 닿고, <code>WHERE max_loans >= 4</code>처럼 인덱스가 없는 열의 조건이면 클러스터형 인덱스의 리프를 처음부터 끝까지 훑는다. 수정 대상을 찾는 비용이 곧 UPDATE의 비용의 상당 부분이라는 점에서, 인덱스는 조회만이 아니라 수정과 삭제의 성능도 좌우한다.</p>
+
+<p>찾은 행을 바꾸는 방식은 매뉴얼의 다중 버전(multi-versioning) 설명에 나온다. InnoDB는 각 행에 숨은 열을 붙인다. 6바이트 <code>DB_TRX_ID</code>는 그 행을 마지막으로 넣거나 바꾼 트랜잭션의 식별자다. 7바이트 <code>DB_ROLL_PTR</code>은 롤 포인터(roll pointer)로, 롤백 세그먼트에 쓰인 언두 로그 레코드를 가리킨다. 행이 갱신되었다면 그 언두 레코드에는 갱신 전 행의 내용을 다시 만들 정보가 들어 있다. 기본 키가 없어 InnoDB가 클러스터형 인덱스를 직접 만든 경우에는 6바이트 <code>DB_ROW_ID</code>도 붙는다.</p>
+
+<p>매뉴얼은 클러스터형 인덱스와 보조 인덱스를 다르게 다룬다고 설명한다. 클러스터형 인덱스의 레코드는 제자리에서(in-place) 갱신되고, 그 숨은 열이 이전 버전을 재구성할 수 있는 언두 로그 항목을 가리킨다. 보조 인덱스 레코드는 숨은 열이 없고 제자리에서 갱신되지도 않는다. 보조 인덱스의 열이 바뀌면 옛 레코드에 삭제 표시(delete mark)를 하고 새 레코드를 넣으며, 삭제 표시된 레코드는 나중에 퍼지(purge)가 지운다. 이것을 우리 예제에 대입해 보면 다음과 같다.</p>
+
+<pre class="diagram">UPDATE patron SET grade = 'GOLD' WHERE patron_id = 1;   (트랜잭션 T2)
+
+클러스터형 인덱스 리프                       언두 로그
++----+-----------------+------+------+       +-----------------------------+
+| 1  | kim@example.com | GOLD | ...  |       | patron_id 1 의 이전 값:      |
+|    | DB_TRX_ID = T2  |      |      |       |   grade = 'BASIC'            |
+|    | DB_ROLL_PTR ----+------+------+-----> |   (이전 DB_TRX_ID = T1)      |
++----+-----------------+------+------+       +-----------------------------+
+grade 는 어떤 보조 인덱스에도 없다 -> 보조 인덱스는 그대로
+
+UPDATE patron SET email = 'kim2@example.com' WHERE patron_id = 1;
+
+클러스터형 인덱스: 제자리 갱신 + 언두 기록
+보조 인덱스 uk_patron_email:
+   kim@example.com  -> 1   (삭제 표시, 나중에 퍼지)
+   kim2@example.com -> 1   (새로 삽입)</pre>
+
+<p>이 그림에서 두 가지를 읽을 수 있다. 첫째, 롤백은 언두 로그를 따라 이전 값을 되돌려 놓는 일이다. UPDATE가 언두를 남기기 때문에 트랜잭션 안의 UPDATE를 되돌릴 수 있다. 둘째, 갱신 언두 로그는 롤백에만 쓰이지 않는다. 매뉴얼에 따르면 갱신 언두 로그는 일관된 읽기(consistent read)에도 쓰이므로, 그 정보로 예전 버전의 행을 만들어야 할 수 있는 스냅숏을 가진 트랜잭션이 하나도 남지 않을 때까지 버릴 수 없다. 다른 트랜잭션이 갱신 전의 값을 읽는 원리, 곧 MVCC는 트랜잭션과 격리 수준을 다루는 뒤의 권에서 본격적으로 다룬다. 지금은 UPDATE가 "덮어쓰기" 한 번이 아니라 "이전 값 기록 + 덮어쓰기 + 보조 인덱스 표시와 삽입"이라는 점, 그리고 인덱스가 걸린 열을 바꾸는 UPDATE가 더 많은 일을 한다는 점을 기억해 두자.</p>
+
+<x-visual id="db-intro-03-update-undo" title="UPDATE 뒤 클러스터형 인덱스의 행이 롤 포인터로 언두 로그의 이전 값을 가리키는 구조" kind="구조 다이어그램" ratio="16:9">
+<x-hint>행은 제자리에서 새 값으로 바뀌고, 숨은 열의 롤 포인터가 언두 로그에 남은 이전 값을 가리킨다는 것, 그리고 보조 인덱스에는 삭제 표시된 옛 레코드와 새 레코드가 함께 있다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 구조 다이어그램. 왼쪽 위에 넓은 표 모양 상자, 제목 "클러스터형 인덱스 리프". 상자 안 한 줄에 칸이 나뉘어 "1", "kim2@example.com", "GOLD", 그리고 회색으로 구분된 두 칸 "DB_TRX_ID: T3", "DB_ROLL_PTR". 오른쪽에 세로로 쌓인 작은 카드 두 장, 제목 "언두 로그". 위 카드 "email = kim@example.com (T2)", 아래 카드 "grade = BASIC (T1)". DB_ROLL_PTR 칸에서 위 카드로 주황 화살표, 위 카드에서 아래 카드로 점선 주황 화살표, 라벨 "이전 버전". 왼쪽 아래에 좁은 상자, 제목 "보조 인덱스 (email)". 두 줄: "kim@example.com → 1"은 회색 취소선과 라벨 "삭제 표시", "kim2@example.com → 1"은 초록 라벨 "새 레코드". 아래 상자 옆에 작은 빗자루 아이콘과 라벨 "퍼지가 나중에 제거". 평면적이고 차분한 색조, 고딕체 한국어 라벨.</x-prompt>
+<x-caption>InnoDB의 UPDATE는 행을 제자리에서 바꾸되 이전 값을 언두 로그에 남긴다. 보조 인덱스는 옛 레코드에 표시를 하고 새 레코드를 넣는다.</x-caption>
+</x-visual>
+
+<h3>DELETE: 지운 행은 바로 사라지지 않는다</h3>
+
+<p><code>DELETE</code>는 <code>WHERE</code>에 맞는 행을 지우고 지운 행 수를 돌려준다. 지운 행 수는 <code>ROW_COUNT()</code> 함수로도 확인할 수 있다. <code>WHERE</code>가 없으면 모든 행이 지워지며, 앞의 안전 갱신 모드는 DELETE에도 똑같이 적용된다.</p>
+
+<pre><code class="language-sql">DELETE FROM loan WHERE loan_id = 10;
+DELETE FROM loan WHERE returned_at < '2025-01-01';</code></pre>
+
+<p>두 번째 문장의 조건에서 <code>returned_at</code>이 <code>NULL</code>인 미반납 대출은 비교 결과가 UNKNOWN이므로 지워지지 않는다. 앞에서 본 것처럼 WHERE는 UNKNOWN인 행을 버린다. 여기서는 그 성질이 원하는 결과와 맞아떨어진다.</p>
+
+<p>InnoDB 안에서 DELETE는 어떻게 일어날까. 매뉴얼은 삭제를 내부적으로 갱신의 한 종류로 다룬다고 설명한다. 행 안의 특별한 비트를 켜서 삭제되었다고 표시하는 갱신이다. 그리고 다중 버전 방식에서는 SQL 문장으로 행을 지워도 데이터베이스에서 즉시 물리적으로 제거되지 않는다. InnoDB는 삭제를 위해 쓴 갱신 언두 로그 레코드를 버릴 때 비로소 해당 행과 그 인덱스 레코드를 물리적으로 제거하며, 이 작업을 퍼지라고 부른다. 삭제도 언두를 남기므로 트랜잭션 안의 DELETE는 롤백할 수 있다. 그리고 아직 지워지기 전의 행을 봐야 하는 다른 트랜잭션이 있다면, 그 트랜잭션은 언두를 통해 그 행을 계속 볼 수 있다.</p>
+
+<p>퍼지로 레코드가 빠져 페이지가 비면 어떻게 될까. 매뉴얼에 따르면 인덱스 페이지의 채움 비율이 <code>MERGE_THRESHOLD</code>(따로 정하지 않으면 50%) 아래로 떨어지면 InnoDB는 인덱스 트리를 줄여 페이지를 비우려고 시도한다. 대량 삭제 뒤에 페이지가 정리되는 과정이 문장 실행과 별도로 진행된다는 것을 알아 두면 된다.</p>
+
+<p>큰 테이블에서 많은 행을 지울 때는 한 문장으로 하지 않는다. MySQL의 단일 테이블 DELETE는 <code>ORDER BY</code>와 <code>LIMIT</code>을 지원하고, 매뉴얼은 DELETE가 너무 오래 걸리지 않게 하려면 <code>LIMIT</code>으로 지울 행 수의 상한을 정하고, 영향받은 행 수가 <code>LIMIT</code> 값보다 작아질 때까지 같은 문장을 반복하라고 안내한다. 한 문장이 거대한 트랜잭션이 되어 언두를 쌓고 락을 오래 쥐는 것을 피하는 방법이다. 매뉴얼은 InnoDB 테이블에서 많은 행을 지우면 락 테이블 크기를 넘을 수 있다고도 적고, 대안으로 남길 행만 같은 구조의 새 테이블에 복사한 뒤 <code>RENAME TABLE</code>로 두 테이블을 원자적으로 맞바꾸고 원래 테이블을 지우는 방법을 소개한다.</p>
+
+<pre><code class="language-sql">-- 반복 실행: 영향받은 행 수가 1000보다 작아지면 멈춘다
+DELETE FROM loan
+WHERE returned_at < '2025-01-01'
+ORDER BY loan_id
+LIMIT 1000;</code></pre>
+
+<p>이제 행을 없애는 세 문장을 나란히 놓고 비교할 수 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th></th><th><code>DELETE FROM t</code></th><th><code>TRUNCATE TABLE t</code></th><th><code>DROP TABLE t</code></th></tr></thead><tbody>
+<tr><td>분류</td><td>DML</td><td>DDL</td><td>DDL</td></tr>
+<tr><td>남는 것</td><td>테이블 정의, 조건에 맞지 않은 행</td><td>테이블 정의</td><td>없음</td></tr>
+<tr><td>조건 지정</td><td><code>WHERE</code>로 일부만 가능</td><td>불가, 항상 전부</td><td>불가</td></tr>
+<tr><td>트랜잭션</td><td>트랜잭션 안에서 롤백 가능</td><td>암묵적 커밋, 롤백 불가</td><td>암묵적 커밋, 롤백 불가</td></tr>
+<tr><td>AUTO_INCREMENT</td><td>InnoDB는 이어서 증가</td><td>시작 값으로 되돌림</td><td>테이블과 함께 사라짐</td></tr>
+<tr><td>다른 테이블이 외래 키로 참조할 때</td><td>행마다 검사, 참조 중인 행이 있으면 1451</td><td>참조되는 InnoDB 테이블이면 실패(1701)</td><td>실패(3730), <code>foreign_key_checks</code>를 끄면 가능</td></tr>
+<tr><td>돌려주는 행 수</td><td>지운 행 수</td><td>의미 없음(보통 0)</td><td>해당 없음</td></tr>
+<tr><td>ON DELETE 트리거</td><td>실행</td><td>실행 안 함</td><td>해당 없음</td></tr>
+</tbody></table></div>
+
+<p>표의 가로줄 하나하나가 실무 판단이다. 운영 데이터의 일부를 지운다면 DELETE 외에 선택지가 없다. 테스트 데이터를 비우고 번호까지 처음부터 다시 시작하고 싶다면 TRUNCATE가 맞다. 다만 외래 키로 참조되는 테이블은 TRUNCATE할 수 없으니 자식 테이블부터 비운다. 테이블 자체가 더 필요 없을 때만 DROP이다. 매뉴얼도 지운 행 수를 알 필요가 없다면 WHERE 없는 DELETE보다 TRUNCATE가 테이블을 비우는 더 빠른 방법이라고 적는다. 빠른 이유는 앞에서 본 그대로다. 행 하나하나에 삭제 표시를 하고 언두를 남기는 일을 건너뛰기 때문이다.</p>
+
+<h3>제약 조건 활용: 데이터베이스가 지키는 마지막 선</h3>
+
+<p>지금까지 제약 조건이 어기는 순간 어떤 오류를 내는지 흩어서 보았다. 이제 한데 모아 "제약 조건을 어떻게 쓸 것인가"를 생각해 보자. 출발점은 제약 조건이 검사되는 시점이다. MySQL은 데이터를 바꾸는 문장이 행을 하나 넣거나 바꿀 때마다 그 행에 대해 제약을 검사한다. 앞에서 본 행 단위 즉시 검사다. 매뉴얼은 외래 키 검사가 트랜잭션 커밋 시점까지 미뤄지지 않는다고 명시한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>제약</th><th>지키는 것</th><th>위반 시</th><th>알아 둘 점</th></tr></thead><tbody>
+<tr><td><code>NOT NULL</code></td><td>값이 반드시 있다</td><td>1048, 값을 빠뜨리면 1364</td><td>엄격 모드가 꺼져 있으면 값을 빠뜨린 경우는 암묵적 기본값과 경고로 바뀐다. 한 행 INSERT에 NULL을 명시하면 그래도 1048</td></tr>
+<tr><td><code>DEFAULT</code></td><td>값을 주지 않았을 때의 값</td><td>해당 없음</td><td>제약이라기보다 열의 속성. 값을 명시하면 쓰이지 않는다</td></tr>
+<tr><td><code>PRIMARY KEY</code></td><td>행마다 유일하고 NULL이 없는 식별자</td><td>1062</td><td>InnoDB에서는 클러스터형 인덱스, 곧 행의 저장 순서가 된다</td></tr>
+<tr><td><code>UNIQUE</code></td><td>값이 겹치지 않는다</td><td>1062</td><td><code>NULL</code>을 허용하는 열에서는 <code>NULL</code>이 여러 개 있어도 된다</td></tr>
+<tr><td><code>CHECK</code></td><td>행 안의 값이 조건을 만족한다</td><td>3819</td><td>8.0.16부터 검사. 조건이 UNKNOWN이면 통과</td></tr>
+<tr><td><code>FOREIGN KEY</code></td><td>참조하는 값이 실제로 있다</td><td>자식 쪽 1452, 부모 쪽 1451</td><td>인라인 <code>REFERENCES</code>는 무시된다. 검사 때 공유 행 락을 건다</td></tr>
+</tbody></table></div>
+
+<p><code>UNIQUE</code>와 <code>NULL</code>의 관계는 따로 짚어 둘 만하다. 매뉴얼은 <code>NULL</code>을 허용하는 열의 <code>UNIQUE</code> 인덱스는 <code>NULL</code>을 여러 개 허용한다고 적는다. 선택 입력인 전화번호 열에 <code>UNIQUE</code>를 걸면, 입력한 번호끼리는 겹칠 수 없지만 입력하지 않은 사람은 몇 명이든 있을 수 있다. <code>NULL</code>은 "알 수 없는 값"이므로 두 <code>NULL</code>이 같다고 판단하지 않는 것이다. 이 성질을 모르고 "이 열은 유일하다"고만 믿으면 <code>NULL</code>이 여러 개 있는 것을 보고 제약이 고장 났다고 오해하게 된다.</p>
+
+<p>외래 키는 부모 행이 바뀔 때의 동작, 곧 참조 동작(referential action)을 정할 수 있다. <code>ON DELETE</code>와 <code>ON UPDATE</code> 뒤에 다음 중 하나를 적는다.</p>
+
+<ul>
+<li><code>RESTRICT</code>: 자식 행이 참조하고 있으면 부모 행의 삭제나 갱신을 거부한다.</li>
+<li><code>NO ACTION</code>: 표준 SQL의 키워드다. InnoDB에서는 <code>RESTRICT</code>와 같아서, 참조하는 자식 행이 있으면 즉시 거부한다. 참조 동작을 적지 않았을 때의 기본값이 이것이다.</li>
+<li><code>CASCADE</code>: 부모 행을 지우거나 바꾸면 그것을 참조하는 자식 행도 자동으로 지우거나 바꾼다.</li>
+<li><code>SET NULL</code>: 부모 행을 지우거나 바꾸면 자식 행의 외래 키 열을 <code>NULL</code>로 바꾼다. 그 열이 <code>NOT NULL</code>로 선언되어 있으면 쓸 수 없다.</li>
+<li><code>SET DEFAULT</code>: 매뉴얼은 MySQL 파서가 인식하지만 InnoDB는 이 절이 들어간 테이블 정의를 거부한다고 적는다. 그러나 MySQL 8.0.46과 8.4.13에서 실행해 보면 <code>ON DELETE SET DEFAULT</code>를 넣은 <code>CREATE TABLE</code>이 오류도 경고도 없이 성공하고, <code>SHOW CREATE TABLE</code>에도 그 절이 남는다. 그런데 참조되는 부모 행을 지우면 자식 행이 기본값으로 바뀌지 않고 1451 오류로 거부된다. 정의는 받아들여도 동작은 하지 않는 셈이므로 쓰지 않는다.</li>
+</ul>
+
+<p>우리 <code>loan</code>은 참조 동작을 적지 않았으므로 기본값을 따른다. 대출 기록이 있는 1번 이용자를 지우려 하면 다음과 같이 거부된다.</p>
+
+<pre><code class="language-sql">INSERT INTO loan (patron_id, book_title, due_date) VALUES (1, '데이터베이스 첫걸음', '2026-11-30');
+DELETE FROM patron WHERE patron_id = 1;
+-- ERROR 1451 (23000): Cannot delete or update a parent row: a foreign key constraint fails (`m_db_intro_03`.`loan`, CONSTRAINT `fk_loan_patron` FOREIGN KEY (`patron_id`) REFERENCES `patron` (`patron_id`))
+-- (MySQL 8.0.46에서 실행. m_db_intro_03은 실행에 쓴 데이터베이스 이름이다)</code></pre>
+
+<p>만약 <code>fk_loan_patron</code>을 <code>ON DELETE CASCADE</code>로 정의했다면 같은 DELETE는 성공하고, 1번 이용자의 대출 기록도 함께 지워진다. 어느 쪽이 옳은지는 도메인이 정한다. 대출 기록이 연체 이력이나 통계에 쓰이는 중요한 기록이라면, 이용자 한 명을 지우는 문장이 그 기록을 조용히 없애는 CASCADE는 위험하다. 이 경우 기본 동작으로 삭제를 막고, 이용자는 탈퇴 상태로 표시하는 방식이 흔하다. 반대로 주문서와 주문 항목처럼 자식이 부모 없이는 의미가 없는 관계라면 CASCADE가 자연스럽다. CASCADE를 쓸 때 알아 둘 점이 하나 더 있다. 매뉴얼은 연쇄된 외래 키 동작은 트리거를 실행하지 않는다고 적는다. 자식 테이블의 DELETE 트리거에 기대는 로직이 있다면 CASCADE로 지워진 행에는 그 로직이 돌지 않는다.</p>
+
+<p>외래 키 검사는 공짜가 아니다. 매뉴얼에 따르면 InnoDB는 외래 키를 검사할 때 확인해야 하는 자식 또는 부모 레코드에 공유 행 락(shared row-level lock)을 건다. <code>loan</code>에 행을 넣는 트랜잭션은 그 행이 가리키는 <code>patron</code> 행을 잠깐 읽는 데서 끝나지 않고, 트랜잭션이 끝날 때까지 그 부모 행이 지워지지 않도록 잡아 둔다. 그래야 "부모가 있는 것을 확인했는데 커밋 직전에 부모가 사라진" 상태가 생기지 않는다. 이 락이 다른 트랜잭션과 어떻게 부딪히는지는 트랜잭션과 락을 다루는 뒤의 권에서 이어진다. 또 행 단위 즉시 검사이므로, 한 트랜잭션 안에서 부모와 자식을 함께 넣을 때는 부모를 먼저 넣어야 한다. 자식을 먼저 넣으면 그 순간 1452가 난다.</p>
+
+<p>이제 애플리케이션 검증과 데이터베이스 제약의 관계를 정리할 차례다. 스프링 MVC를 다룬 앞의 권들에서 요청 값을 Bean Validation으로 검증했다. 그렇다면 이메일 중복도 애플리케이션에서 "이미 있는지 조회해 보고 없으면 넣는" 방식으로 막으면 되지 않을까. 같은 이메일로 거의 동시에 들어온 가입 요청 두 개를 따라가 보자.</p>
+
+<pre class="diagram">시간  요청 1 (스레드 A)                      요청 2 (스레드 B)
+ 1   SELECT ... WHERE email = 'a@x.com'
+     -> 없음
+ 2                                          SELECT ... WHERE email = 'a@x.com'
+                                            -> 없음
+ 3   INSERT ... ('a@x.com', ...)  성공
+ 4                                          INSERT ... ('a@x.com', ...)
+                                            UNIQUE 가 있으면: 1062 로 실패
+                                            UNIQUE 가 없으면: 중복 행이 생긴다</pre>
+
+<p>두 요청 모두 조회 시점에는 이메일이 없었으므로 애플리케이션의 사전 검사는 둘 다 통과한다. 사전 검사와 INSERT 사이의 틈에 다른 요청이 끼어들 수 있기 때문이다. 이 틈을 막는 것은 <code>uk_patron_email</code>이다. 유일 인덱스는 INSERT가 인덱스에 레코드를 넣는 바로 그 순간에 검사하므로 틈이 없다. 따라서 역할을 이렇게 나눈다. 애플리케이션 검증은 사용자에게 친절한 오류 메시지를 빨리 돌려주기 위한 것이고, 데이터베이스 제약은 어떤 경로로 들어온 데이터든 규칙을 어길 수 없게 하는 마지막 선이다. 애플리케이션은 사전 검사를 하더라도 1062 오류가 올 수 있다고 보고 처리해야 한다. 스프링은 MySQL의 이 오류 코드를 <code>DuplicateKeyException</code> 같은 데이터 접근 예외로 번역해 주는데, 그 번역 구조는 스프링으로 데이터베이스에 접근하는 뒤의 권에서 다룬다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>DDL은 데이터 사전의 정의를 바꾸고 진행 중인 트랜잭션을 끝낸다. DML은 클러스터형 인덱스의 행을 바꾸고 언두 로그를 남겨 되돌릴 수 있게 한다. 제약 조건은 그 DML이 행을 하나 바꿀 때마다 즉시 검사되며, 애플리케이션의 사전 검사가 막지 못하는 동시 요청의 틈까지 막는 유일한 장치다.</p></aside>
+
+<h3>흔한 오해 바로잡기</h3>
+
+<p><b>"AUTO_INCREMENT 번호는 빈틈없이 이어진다."</b> 롤백된 트랜잭션이 받은 번호는 버려지고 다시 쓰이지 않는다. 값이 생성된 뒤 문장이 실패해도 마찬가지다. AUTO_INCREMENT가 약속하는 것은 유일성과 증가뿐이다. 빈틈은 오류가 아니라 설계의 결과다.</p>
+
+<p><b>"TRUNCATE는 빠른 DELETE다."</b> 결과는 비슷하지만 성격이 다르다. TRUNCATE는 DDL이라 롤백할 수 없고, 다른 테이블이 외래 키로 참조하면 실패하며, AUTO_INCREMENT를 처음으로 되돌리고, 트리거를 실행하지 않는다. "트랜잭션으로 감싸 두었으니 잘못되면 되돌리면 된다"는 생각이 TRUNCATE에는 통하지 않는다.</p>
+
+<p><b>"트랜잭션 안에서 실행한 ALTER는 롤백하면 된다."</b> DDL은 실행 전에 진행 중인 트랜잭션을 커밋하고 실행 후에도 커밋한다. 8.0의 원자적 DDL은 문장 하나가 반쯤 실행된 채 남지 않게 할 뿐, 사용자가 되돌릴 수 있게 해 주지 않는다. 스키마 변경을 되돌리려면 되돌리는 DDL을 따로 준비해야 한다.</p>
+
+<p><b>"UPDATE가 돌려주는 숫자는 WHERE에 걸린 행 수다."</b> 서버의 기본은 실제로 바뀐 행 수이고, 클라이언트가 <code>CLIENT_FOUND_ROWS</code>를 주면 맞은 행 수다. <code>mysql</code> 클라이언트와 JDBC 드라이버가 같은 UPDATE에 다른 숫자를 보여 줄 수 있다.</p>
+
+<p><b>"열 정의에 REFERENCES를 적으면 외래 키가 생긴다."</b> MySQL은 인라인 <code>REFERENCES</code>를 파싱하고 무시한다. 외래 키는 별도의 <code>FOREIGN KEY</code> 절로만 생긴다. 문장이 성공했다는 사실이 제약이 생겼다는 증거가 아니므로 <code>SHOW CREATE TABLE</code>로 확인한다.</p>
+
+<p><b>"CHECK가 있으면 그 조건을 어기는 값은 들어갈 수 없다."</b> 조건이 <code>FALSE</code>일 때만 거부된다. <code>NULL</code> 때문에 UNKNOWN이 되면 통과한다. <code>NULL</code>까지 막으려면 <code>NOT NULL</code>을 함께 건다.</p>
+
+<p><b>"MODIFY는 적은 부분만 바꾼다."</b> <code>MODIFY</code>와 <code>CHANGE</code>는 열 정의를 통째로 교체한다. 다시 적지 않은 <code>NOT NULL</code>, <code>DEFAULT</code>, <code>COMMENT</code>, <code>UNSIGNED</code>는 사라진다.</p>
+
+<p><b>"DELETE하면 행이 그 자리에서 사라진다."</b> InnoDB는 삭제 표시를 하고 언두를 남긴다. 물리적 제거는 더 이상 그 언두가 필요 없을 때 퍼지가 한다. 그래서 DELETE는 롤백할 수 있고, 그 사이 다른 트랜잭션은 지워지기 전의 행을 볼 수 있다.</p>
+
+<h3>다음으로 이어지는 것</h3>
+
+<p>이 회차에서 만든 테이블과 넣은 행은 다음 회차들의 재료가 된다. 04회는 <code>SELECT</code>로 행을 조회하고 <code>WHERE</code>, <code>ORDER BY</code>, <code>LIMIT</code>, <code>DISTINCT</code>를 다루며, 이 회차에서 잠깐 만난 <code>NULL</code>과 UNKNOWN을 본격적으로 설명한다. 05회는 산술 연산과 함수로 값을 가공하고, 06회는 집계 함수와 <code>GROUP BY</code>로 행을 묶는다.</p>
+
+<p>로드맵의 뒤쪽 권과도 여러 갈래로 이어진다. 이 회차에서 "뒤의 권에서"라고 미뤄 둔 것은 셋이다. 첫째, 언두 로그로 이전 버전의 행을 보여 주는 MVCC와 외래 키 검사가 거는 공유 락은 트랜잭션과 격리 수준을 다룰 때 다시 나온다. 둘째, 클러스터형 인덱스와 보조 인덱스의 구조는 인덱스 설계와 실행 계획을 다룰 때 성능의 언어로 다시 읽게 된다. 셋째, 1062나 1451 같은 오류 번호는 스프링이 데이터 접근 예외로 번역하는 대상이다. JPA의 스키마 자동 생성 기능이 만들어 내는 것도 결국 이 회차에서 본 <code>CREATE TABLE</code>과 <code>ALTER TABLE</code>이다. 도구가 DDL을 대신 써 주더라도, 그 DDL이 데이터 사전과 저장 구조에 무엇을 남기는지 아는 사람만 그것을 운영 데이터베이스에 안심하고 실행할 수 있다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>DDL과 DML</dt><dd>DDL(CREATE, ALTER, DROP, TRUNCATE)은 데이터 사전의 테이블 정의를 바꾸고 진행 중인 트랜잭션을 암묵적으로 커밋한다. DML(INSERT, UPDATE, DELETE)은 행을 바꾸며 트랜잭션 안에서 롤백할 수 있다.</dd>
+<dt>기본 키와 클러스터형 인덱스</dt><dd>InnoDB는 기본 키로 클러스터형 인덱스를 만들고 행 전체를 그 리프에 기본 키 순서로 저장한다. 보조 인덱스 레코드는 기본 키 값을 품으므로 기본 키가 길면 모든 보조 인덱스가 커진다.</dd>
+<dt>열 정의와 엄격 모드</dt><dd>NOT NULL이면서 DEFAULT가 없는 열을 빠뜨리면 엄격 모드에서는 오류, 아니면 암묵적 기본값과 경고가 된다. MySQL 8.0의 기본 SQL 모드는 STRICT_TRANS_TABLES를 포함한다.</dd>
+<dt>ALTER TABLE의 처리 방식</dt><dd>INSTANT는 메타데이터만, INPLACE는 복사 없이 제자리에서, COPY는 새 테이블로 행을 옮겨 처리한다. 열 타입 변경은 COPY만 가능하고, VARCHAR 확장은 길이 바이트 수가 바뀌는지에 따라 갈린다. MODIFY와 CHANGE는 다시 적지 않은 속성을 잃는다.</dd>
+<dt>메타데이터 락</dt><dd>트랜잭션이 사용한 테이블에 걸려 트랜잭션이 끝날 때까지 유지되며, 그동안 다른 세션의 DDL은 대기한다.</dd>
+<dt>AUTO_INCREMENT</dt><dd>유일하고 증가하는 값을 약속하지만 연속성은 약속하지 않는다. 롤백된 값은 재사용되지 않고, 8.0부터 카운터가 재시작 후에도 유지되며, DELETE로는 줄지 않고 TRUNCATE는 시작 값으로 되돌린다.</dd>
+<dt>UPDATE의 동작</dt><dd>단일 테이블 UPDATE의 대입은 왼쪽부터 평가되어 앞의 대입 결과를 뒤에서 본다. 기본 영향받은 행 수는 실제로 바뀐 행 수지만 Connector/J 기본 설정에서는 맞은 행 수가 돌아온다.</dd>
+<dt>DELETE와 퍼지</dt><dd>InnoDB의 DELETE는 삭제 표시를 하고 언두를 남기며, 물리적 제거는 언두가 필요 없어진 뒤 퍼지가 한다. TRUNCATE는 DDL로서 롤백 불가, 외래 키로 참조되면 실패, AUTO_INCREMENT 초기화의 성질을 가진다.</dd>
+<dt>제약 조건의 검사 시점</dt><dd>UNIQUE와 외래 키는 행 단위로 즉시 검사된다. CHECK는 FALSE일 때만 위반이고, 외래 키의 기본 참조 동작은 InnoDB에서 RESTRICT와 같은 NO ACTION이다.</dd>
+</x-summary>
+
+<x-review>
+<p>스키마 변경으로 장애가 나는 전형적인 경로는 ALTER 자체가 아니라 메타데이터 락 대기다. 배포 스크립트의 <code>ALTER TABLE</code>이 멈춰 있다면 먼저 그 테이블을 쓰는 열린 트랜잭션을 찾는다. 배치 작업이나 개발자의 콘솔 세션이 트랜잭션을 연 채 방치되어 있는 경우가 많다. 큰 테이블에 대한 변경은 <code>ALGORITHM=INSTANT</code>나 <code>ALGORITHM=INPLACE</code>를 명시해, 예상과 다른 처리 방식이면 실행되지 않고 오류가 나게 하는 편이 안전하다. 같은 열 추가라도 서버가 8.0.12 이전인지, 8.0.29 이전인지에 따라 처리 방식이 다르므로 버전을 먼저 확인한다.</p>
+<p>기본 키 선택은 초기 설계에서 가장 되돌리기 어려운 결정이다. 순차 증가하는 짧은 정수 키는 클러스터형 인덱스에 오른쪽으로만 쌓이고 보조 인덱스를 작게 유지한다. 분산 환경에서 키를 미리 만들어야 해서 UUID 같은 무작위 키를 쓰기로 했다면, 페이지 채움과 보조 인덱스 크기에서 치르는 비용을 알고 고르는 것이다. 판단이 달라지는 조건은 쓰기 양, 보조 인덱스의 수, 그리고 키를 데이터베이스 밖에서 만들어야 하는지 여부다.</p>
+<p>제약 조건은 성능을 이유로 빼자는 제안을 자주 받는다. 외래 키 검사에는 부모 행 조회와 공유 락이 따르는 것이 사실이다. 그러나 제약을 빼면 그 규칙을 지킬 책임이 모든 애플리케이션 경로와 수작업 SQL로 흩어지고, 동시 요청의 틈은 어떤 애플리케이션 검사로도 막을 수 없다. 유일성은 유일 인덱스 외에 동시성 안전한 대안이 사실상 없으므로 빼지 않는다. 외래 키는 쓰기 경합이 실제로 측정된 병목일 때, 그리고 고아 행을 찾아 정리하는 별도의 장치가 있을 때에 한해 빼는 것을 검토한다.</p>
+<p>데이터 정리 작업에서는 문장의 종류부터 고른다. 일부 행을 지우는 것이면 DELETE를 <code>LIMIT</code>으로 나누어 반복하고, 테이블 전체를 비우며 번호까지 초기화하는 것이면 TRUNCATE를 쓴다. 이때 TRUNCATE는 롤백할 수 없다는 점, 외래 키로 참조되는 테이블에서는 실패한다는 점을 실행 전에 확인한다. <code>foreign_key_checks</code>를 끄고 작업했다면 다시 켜도 기존 데이터가 검사되지 않으므로, 고아 행을 찾는 쿼리를 작업 절차에 넣는다.</p>
+</x-review>
+
+<x-practice>
+<li>빈 <code>patron</code> 테이블(AUTO_INCREMENT 카운터는 처음 상태)에 한 세션만 접속해 다음을 순서대로 실행했다. ① 두 행을 넣는 INSERT 한 문장 ② <code>START TRANSACTION</code> ③ 한 행 INSERT ④ <code>ROLLBACK</code> ⑤ 한 행 INSERT ⑥ <code>SELECT LAST_INSERT_ID()</code>. ①이 끝난 직후의 <code>LAST_INSERT_ID()</code> 값, ⑤에서 넣은 행의 <code>patron_id</code>, ⑥의 결과를 각각 예측하고 이유를 설명하라.</li>
+<li><code>counter</code> 테이블에 <code>(1, 10, NULL)</code>이 있다. <code>UPDATE counter SET cur = cur + 1, prev = cur WHERE id = 1</code>을 실행한 뒤 같은 문장을 한 번 더 실행했다. 두 번째 실행 뒤 <code>cur</code>과 <code>prev</code>의 값은 무엇인가. 또 <code>UPDATE counter SET prev = prev WHERE id = 1</code>을 <code>mysql</code> 클라이언트와 Connector/J 기본 설정의 <code>executeUpdate()</code>로 각각 실행하면 영향받은 행 수로 무엇이 나오는가.</li>
+<li>다음 스크립트를 실행한 뒤 <code>loan</code> 테이블에 남은 행과 다음 INSERT가 받을 <code>loan_id</code>를 설명하라. <code>loan</code>을 참조하는 외래 키는 없다. <code>START TRANSACTION; DELETE FROM loan WHERE loan_id = 1; TRUNCATE TABLE loan; ROLLBACK;</code></li>
+<li>MySQL 8.0.35, <code>utf8mb4</code> 서버의 <code>patron</code> 테이블에 다음 변경을 하려 한다. 각각 INSTANT, INPLACE, COPY 중 어떤 방식이 쓰이는지 판단하라. (a) 맨 끝에 <code>memo VARCHAR(255) NULL</code> 열 추가 (b) <code>max_loans</code>를 <code>INT</code>에서 <code>BIGINT</code>로 변경 (c) <code>name</code>을 <code>VARCHAR(50)</code>에서 <code>VARCHAR(60)</code>으로 확장 (d) <code>name</code>을 <code>VARCHAR(50)</code>에서 <code>VARCHAR(70)</code>으로 확장. 그리고 (a)가 몇 분째 끝나지 않을 때 가장 먼저 확인할 것을 적어라.</li>
+<li>회원 가입 코드가 "이메일로 조회해 없으면 INSERT"하도록 되어 있고 <code>email</code>에 유일 제약이 없다. 운영 데이터에서 같은 이메일의 회원이 두 명 발견되었다. 어떻게 이런 일이 생길 수 있는지 시간 순서로 설명하고, 앞으로 이를 막으려면 무엇을 해야 하는지, 그 조치를 적용하기 전에 먼저 해야 할 일은 무엇인지 적어라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> ①은 두 행에 1과 2를 붙이고, 여러 행 INSERT에서 <code>LAST_INSERT_ID()</code>는 첫 번째 행의 값만 돌려주므로 1이다. ③은 3을 받지만 ④에서 롤백된다. 행은 사라지지만 매뉴얼에 따르면 생성된 AUTO_INCREMENT 값은 롤백해도 되돌려지지 않고 재사용되지 않는다. 그래서 ⑤의 행은 4를 받는다. ⑥은 이 연결에서 가장 최근에 성공한 AUTO_INCREMENT 생성 문장인 ⑤의 첫 값, 곧 4를 돌려준다. 한 세션만 접속했다는 조건이 있어야 이 값들이 결정적이다. 다른 세션이 끼어들면 번호는 더 건너뛸 수 있지만, 내 연결의 <code>LAST_INSERT_ID()</code>는 다른 연결의 영향을 받지 않는다.</p>
+<p><b>2번.</b> 첫 실행에서 대입은 왼쪽부터 평가되므로 <code>cur</code>이 11이 되고 <code>prev</code>는 갱신된 <code>cur</code>인 11을 받는다. 두 번째 실행에서 <code>cur</code>은 12, <code>prev</code>는 12가 된다. 표준 SQL처럼 원래 값을 기준으로 평가했다면 두 번째 실행 뒤 <code>prev</code>는 11이었을 것이다. <code>SET prev = prev</code>는 값을 바꾸지 않으므로 MySQL은 갱신하지 않는다. <code>mysql</code> 클라이언트는 실제로 바뀐 행 수인 0을 보여 주고 정보 문자열에 <code>Rows matched: 1 Changed: 0</code>이 나온다. Connector/J는 기본적으로 <code>CLIENT_FOUND_ROWS</code>를 설정하므로 <code>executeUpdate()</code>는 맞은 행 수인 1을 돌려준다.</p>
+<p><b>3번.</b> <code>TRUNCATE TABLE</code>은 암묵적 커밋을 일으키는 DDL이다. 실행 직전에 진행 중인 트랜잭션이 커밋되므로 <code>loan_id = 1</code>의 삭제가 확정되고, 이어서 TRUNCATE가 모든 행을 지우고 AUTO_INCREMENT를 시작 값으로 되돌린다. 마지막 <code>ROLLBACK</code>은 되돌릴 트랜잭션이 없으므로 아무 효과가 없다. 결과적으로 <code>loan</code>은 비어 있고, 다음 INSERT는 시작 값인 1을 받는다. TRUNCATE 대신 <code>DELETE FROM loan</code>이었다면 롤백으로 모든 행이 돌아왔을 것이고, 롤백하지 않았더라도 InnoDB는 번호를 이어서 매겼을 것이다.</p>
+<p><b>4번.</b> (a) 8.0.12부터 열 추가의 기본 방식은 INSTANT다(8.0.29부터는 위치와 상관없이). 행 버전 한도 64에 이르지 않았다면 INSTANT로 메타데이터만 바뀐다. (b) 열 타입 변경은 COPY만 지원하며 그동안 동시 DML이 허용되지 않는다. (c) <code>VARCHAR(50)</code>은 최대 200바이트, <code>VARCHAR(60)</code>은 240바이트로 둘 다 255바이트 이하라 길이 바이트가 1로 같다. INPLACE로 처리된다. (d) <code>VARCHAR(70)</code>은 280바이트로 길이 바이트가 2로 바뀌므로 INPLACE를 쓸 수 없고 COPY가 필요하다. (a)처럼 즉시 끝나야 할 작업이 끝나지 않는다면 데이터 양의 문제가 아니라 메타데이터 락 대기일 가능성을 먼저 본다. 프로세스 목록에서 <code>Waiting for table metadata lock</code> 상태를 확인하고, <code>patron</code>을 사용한 채 끝나지 않은 트랜잭션을 찾는다.</p>
+<p><b>5번.</b> 같은 이메일로 거의 동시에 두 요청이 들어와, 두 요청이 모두 조회 단계에서 "없음"을 확인한 뒤 차례로 INSERT했기 때문이다. 조회와 삽입 사이에 다른 요청이 끼어들 수 있는 한 애플리케이션의 사전 검사로는 막을 수 없다. 막으려면 <code>email</code>에 유일 제약을 걸고, 애플리케이션은 사전 검사를 하더라도 중복 키 오류(1062)를 받을 수 있다고 보고 그 오류를 "이미 가입된 이메일" 응답으로 처리한다. 다만 이미 중복 행이 있는 상태에서 <code>UNIQUE</code>를 추가하면 ALTER가 1062로 실패하므로, 먼저 중복된 회원을 찾아 어느 쪽을 남길지 정리하는 작업이 앞서야 한다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q><code>loan</code> 테이블에 <code>CHECK (returned_at >= loaned_at)</code>가 있고 <code>returned_at</code>은 NULL을 허용한다. <code>returned_at</code>에 NULL을 넣는 INSERT는 어떻게 되는가?</q>
+<o>NULL과의 비교는 FALSE이므로 3819 오류가 난다</o>
+<o>CHECK가 참조하는 열에는 NULL을 넣을 수 없으므로 1048 오류가 난다</o>
+<o>비교 결과가 UNKNOWN이고, CHECK는 FALSE일 때만 위반이므로 성공한다</o>
+<o>경고와 함께 returned_at이 loaned_at과 같은 값으로 바뀌어 들어간다</o>
+<why>NULL과의 비교는 TRUE도 FALSE도 아닌 UNKNOWN이다. 매뉴얼은 CHECK의 조건식이 TRUE 또는 UNKNOWN이어야 하며 FALSE일 때만 위반이라고 정한다. 1048은 NOT NULL 열에 NULL을 넣을 때의 오류이고, CHECK가 NULL을 금지하지는 않는다. 값을 고쳐 넣는 동작은 없다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>자동 커밋이 켜진 세션에서 <code>START TRANSACTION; INSERT INTO patron ...; ALTER TABLE patron ADD COLUMN memo VARCHAR(100); ROLLBACK;</code>을 실행했다. 결과로 옳은 것은?</q>
+<o>INSERT와 ALTER가 모두 취소된다</o>
+<o>INSERT한 행도 남고 memo 열도 남는다</o>
+<o>INSERT는 취소되고 memo 열만 남는다</o>
+<o>8.0의 원자적 DDL 덕분에 ALTER만 취소되고 INSERT는 남는다</o>
+<why>ALTER TABLE은 실행 전에 진행 중인 트랜잭션을 암묵적으로 커밋하므로 INSERT가 확정된다. ALTER 자체도 실행 후 커밋되므로 ROLLBACK이 되돌릴 것이 없다. 원자적 DDL은 DDL 문장 하나가 반쯤 실행된 채 남지 않게 하는 것이지, 사용자의 ROLLBACK으로 DDL을 취소하게 해 주는 트랜잭션 DDL이 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>InnoDB 테이블의 기본 키를 BIGINT AUTO_INCREMENT에서 36자 UUID 문자열로 바꾸면, 다음 중 매뉴얼의 설명으로 뒷받침되지 않는 것은?</q>
+<o>보조 인덱스 레코드마다 기본 키 값이 들어가므로 모든 보조 인덱스가 커진다</o>
+<o>무작위 순서로 삽입되므로 클러스터형 인덱스 페이지의 채움 정도가 1/2에서 15/16 사이로 흩어진다</o>
+<o>순차 삽입일 때는 클러스터형 인덱스 페이지가 약 15/16까지 채워진다</o>
+<o>행이 기본 키 순서가 아니라 삽입 순서로 저장되므로 기본 키 조회가 느려진다</o>
+<why>InnoDB는 기본 키로 클러스터형 인덱스를 만들고 행은 기본 키 순서로 저장된다. 삽입 순서로 놓이는 것은 기본 키도 적절한 유일 인덱스도 없어 숨은 행 ID로 GEN_CLUST_INDEX를 만든 경우다. 나머지 셋은 매뉴얼에 그대로 적힌 내용이다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>MySQL 8.0, utf8mb4 서버에서 다음 ALTER 가운데 테이블 복사(ALGORITHM=COPY)가 필요한 것은?</q>
+<o><code>MODIFY max_loans BIGINT NOT NULL DEFAULT 3</code> (원래 INT)</o>
+<o><code>ALTER COLUMN grade SET DEFAULT 'NEW'</code></o>
+<o><code>RENAME COLUMN name TO full_name</code></o>
+<o><code>MODIFY email VARCHAR(200) NOT NULL</code> (원래 VARCHAR(100))</o>
+<why>열의 데이터 타입 변경은 COPY만 지원한다. 기본값 변경은 데이터 사전만 고치는 INSTANT다. 타입을 유지한 이름 변경은 8.0.28부터 INSTANT를 지원한다. email은 VARCHAR(100)이 이미 최대 400바이트로 길이 바이트가 2이고 VARCHAR(200)도 2이므로 INPLACE로 처리된다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>좌석 번호 seat_no가 기본 키이고 값 1, 2, 3이 있다. <code>UPDATE seat SET seat_no = seat_no + 1</code>이 중복 키 오류를 낼 수 있는 이유로 가장 정확한 것은?</q>
+<o>MySQL은 기본 키 값을 UPDATE로 바꾸는 것을 허용하지 않기 때문이다</o>
+<o>UPDATE가 끝난 뒤 결과에 4가 생기는데, 4는 AUTO_INCREMENT 카운터보다 크기 때문이다</o>
+<o>MySQL은 유일 제약을 문장 끝이 아니라 행 단위로 즉시 검사하므로, 1이 2로 먼저 바뀌는 순간 기존의 2와 겹치기 때문이다</o>
+<o>InnoDB가 보조 인덱스를 제자리에서 갱신하지 않기 때문이다</o>
+<why>매뉴얼은 유일 제약과 외래 키 제약이 행 단위로 검사된다고 적고, 이 문장에서 1이 2로 먼저 갱신되면 오류가 난다고 설명한다. 최종 결과(2, 3, 4)에는 중복이 없지만 중간 상태에서 충돌한다. ORDER BY seat_no DESC로 큰 값부터 바꾸면 피할 수 있다. 기본 키 변경 자체는 허용되고, AUTO_INCREMENT나 보조 인덱스 갱신 방식은 이 오류와 관계가 없다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>데이터 정의 언어(DDL, Data Definition Language)</dt><dd>CREATE, ALTER, DROP, TRUNCATE처럼 테이블 같은 객체의 정의를 만들고 바꾸는 문장. MySQL에서는 진행 중인 트랜잭션을 암묵적으로 커밋한다.</dd>
+<dt>데이터 조작 언어(DML, Data Manipulation Language)</dt><dd>INSERT, UPDATE, DELETE처럼 테이블의 행을 넣고 바꾸고 지우는 문장. 트랜잭션 안에서 롤백할 수 있다.</dd>
+<dt>클러스터형 인덱스(clustered index)</dt><dd>InnoDB에서 행 데이터를 리프에 저장하는 인덱스. 기본 키가 있으면 기본 키, 없으면 NOT NULL 유일 인덱스, 그것도 없으면 숨은 행 ID로 만든다.</dd>
+<dt>보조 인덱스(secondary index)</dt><dd>클러스터형 인덱스가 아닌 인덱스. 레코드에 인덱스 열과 기본 키 값을 담고, 기본 키로 클러스터형 인덱스를 다시 찾아 행에 닿는다.</dd>
+<dt>암묵적 커밋(implicit commit)</dt><dd>특정 문장이 실행되기 전에 현재 세션의 트랜잭션을 COMMIT한 것처럼 끝내는 동작. 대부분의 DDL이 일으킨다.</dd>
+<dt>메타데이터 락(metadata lock)</dt><dd>트랜잭션이 사용한 테이블의 구조 변경을 막는 락. 트랜잭션이 끝날 때까지 유지되므로 그동안 다른 세션의 DDL은 대기한다.</dd>
+<dt>엄격 모드(strict SQL mode)</dt><dd>STRICT_TRANS_TABLES 또는 STRICT_ALL_TABLES가 켜진 상태. 잘못되었거나 빠진 값을 경고가 아니라 오류로 처리한다.</dd>
+<dt>참조 동작(referential action)</dt><dd>외래 키가 참조하는 부모 행이 지워지거나 바뀔 때 자식 행에 할 일. RESTRICT, NO ACTION, CASCADE, SET NULL 등이 있다.</dd>
+<dt>언두 로그(undo log)</dt><dd>변경 전의 행을 다시 만들 수 있는 기록. 롤백과, 다른 트랜잭션이 이전 버전의 행을 읽는 일관된 읽기에 쓰인다.</dd>
+<dt>퍼지(purge)</dt><dd>삭제 표시된 행과 인덱스 레코드를, 그 삭제의 언두 로그가 더 이상 필요 없을 때 물리적으로 제거하는 InnoDB의 작업.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl-operations.html">MySQL 8.0 Reference Manual — Online DDL Operations</a> — 열 추가·삭제·타입 변경·VARCHAR 확장의 처리 방식과 버전별 차이</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/implicit-commit.html">MySQL 8.0 Reference Manual — Statements That Cause an Implicit Commit</a> — DDL의 암묵적 커밋과 TEMPORARY 예외</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-auto-increment-handling.html">MySQL 8.0 Reference Manual — AUTO_INCREMENT Handling in InnoDB</a> — 잠금 모드, 롤백 시 잃는 값, 카운터의 영속화</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/update.html">MySQL 8.0 Reference Manual — UPDATE Statement</a> — 대입의 평가 순서, 바뀐 행과 맞은 행, ORDER BY와 LIMIT</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-table-foreign-keys.html">MySQL 8.0 Reference Manual — FOREIGN KEY Constraints</a> — 참조 동작, 인덱스와 타입 조건, foreign_key_checks</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-multi-versioning.html">MySQL 8.0 Reference Manual — InnoDB Multi-Versioning</a> — 숨은 열, 언두 로그, 삭제 표시와 퍼지</li>
+</x-refs>

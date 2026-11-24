@@ -1,0 +1,792 @@
+<x-meta>
+deck: HashSet·LinkedHashSet·TreeSet의 차이를 해시 테이블, 이중 연결 리스트, 레드-블랙 트리라는 내부 구조에서 찾고, 로드 팩터와 리사이즈가 O(1)을 지키는 과정을 JDK 소스와 실측으로 추적한다.
+minutes: 100
+</x-meta>
+
+<x-goals>
+<li>같은 데이터를 <code>HashSet</code>, <code>LinkedHashSet</code>, <code>TreeSet</code>에 넣었을 때의 순회 순서를 해시 코드와 버킷 인덱스, 삽입 순서, 비교 결과로부터 손으로 예측할 수 있다.</li>
+<li><code>HashSet.add</code> 한 번이 <code>HashMap.put</code>으로 위임되어 버킷을 고르고 노드를 만드는 과정을 소스와 바이트코드로 설명하고, 구현체마다 요소 하나에 딸린 노드가 몇 바이트인지 말할 수 있다.</li>
+<li>레드-블랙 트리의 규칙과 회전을 작은 삽입 예로 추적하고, 오름차순으로 넣어도 트리 높이가 2·log₂(n+1)을 넘지 않는 이유를 설명할 수 있다.</li>
+<li><code>TreeSet</code>이 <code>equals</code>가 아니라 비교 결과 0으로 중복을 판단한다는 점에서 생기는 버그를 찾아 고칠 수 있다.</li>
+<li>용량·로드 팩터·임계값으로 리사이즈가 일어나는 시점을 계산하고, 예상 요소 수에 맞춰 초기 용량을 정할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>직접 만든 해시 셋 다음에 남은 질문</h3>
+<p>앞의 두 회차에서 해시 함수로 버킷 번호를 계산해 탐색 범위를 배열 한 칸으로 줄이는 원리를 보았고, 그 원리로 중복을 허용하지 않는 자료 구조인 셋(set)을 직접 만들었다. 요소의 <code>hashCode()</code>로 버킷을 고르고, 그 버킷 안에서 <code>equals()</code>로 같은 요소가 이미 있는지 확인하는 두 단계 구조였다. 이 회차는 그 지식을 들고 <code>java.util</code>이 제공하는 셋 구현체로 넘어간다.</p>
+<p>직접 만든 해시 셋에는 세 가지 질문이 남는다. 첫째는 순서다. 해시로 흩어 놓은 요소는 넣은 순서도 크기 순서도 기억하지 못하는데, 중복은 없애되 넣은 순서나 정렬된 순서로 꺼내야 하는 일은 흔하다. 둘째는 크기다. 버킷 수가 고정이면 요소가 늘수록 한 버킷에 쌓이는 요소가 늘어나 O(1)이 O(n)으로 무너진다. 셋째는 "중복 없음"을 해시 말고 다른 방법으로도 구현할 수 있는가이다.</p>
+<p>자바는 이 질문들에 구현체 세 개로 답한다. <code>HashSet</code>은 해시 테이블이고 스스로 버킷 수를 늘린다. <code>LinkedHashSet</code>은 해시 테이블에 삽입 순서를 기억하는 연결 리스트를 덧붙인 것이다. <code>TreeSet</code>은 해시를 쓰지 않고 정렬된 트리에 요소를 넣는다. 미리 말해 두면 세 클래스는 각각 <code>HashMap</code>, <code>LinkedHashMap</code>, <code>TreeMap</code> 객체를 안에 하나씩 들고 일을 거의 전부 맡긴다. 그래서 이 회차에서 셋의 속을 들여다보는 일은 다음 회차에서 다룰 맵의 구조를 미리 보는 일이기도 하다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>같은 회원 명부를 보관하는 세 가지 방법</strong><p>동호회 회원 명부를 중복 없이 관리한다고 하자. 첫째 방법은 이름으로 서랍 번호를 계산해 그 서랍에 회원 카드를 넣는 것이다. 누가 회원인지 확인할 때 서랍 하나만 열면 되지만, 서랍을 1번부터 차례로 열어 카드를 읽으면 가입 순서도 이름순도 아닌 순서가 나온다. 둘째 방법은 같은 서랍을 쓰되 카드마다 "내 앞에 가입한 사람, 내 뒤에 가입한 사람"을 적어 두는 것이다. 확인은 여전히 서랍 하나로 끝나고, 첫 카드부터 따라가면 가입 순서대로 읽을 수 있다. 셋째 방법은 서랍을 버리고 카드를 이름순 색인에 꽂는 것이다. 확인하려면 몇 번 비교해야 하지만 "김 씨 바로 다음 사람", "ㅂ으로 시작하는 사람 전부" 같은 질문에 바로 답할 수 있다. 비유가 깨지는 지점은 서랍 수다. 실제 해시 테이블은 카드가 늘면 서랍 수를 두 배로 늘리고 카드를 다시 나눠 담는다. 종이 서랍장으로는 흉내 내기 어려운 이 동작이 이 회차 후반의 주제다.</p></aside>
+
+<h3>Set 인터페이스가 약속하는 것</h3>
+<p>구현체를 보기 전에 세 클래스가 공통으로 지키는 계약부터 확인한다. <code>java.util.Set</code>의 API 문서는 셋을 "중복 요소가 없는 컬렉션"으로 정의하고, 더 정확히는 <code>e1.equals(e2)</code>가 참인 두 요소 쌍이 없으며 <code>null</code> 요소는 많아야 하나라고 적는다. 계약의 기준이 <code>equals</code>라는 점을 기억해 두자. <code>TreeSet</code>이 이 기준에서 살짝 벗어나는 지점이 뒤에서 문제가 된다.</p>
+<p>인터페이스에 없는 것도 계약의 일부다. <code>List</code>에는 <code>get(int index)</code>가 있지만 <code>Set</code>에는 없다. 리스트에서는 "몇 번째인가"가 의미를 갖고, 셋에서는 "들어 있는가"만 의미를 갖기 때문이다. 셋에서 요소를 꺼내는 방법은 순회뿐이고, 그 순회가 어떤 순서로 도는지는 <code>Set</code> 인터페이스가 정하지 않는다. 순서를 정하는 것은 구현체다.</p>
+<p><code>add(E e)</code>의 반환값도 리스트와 뜻이 다르다. 셋의 <code>add</code>는 요소가 실제로 추가되어 셋이 바뀌었으면 <code>true</code>, 이미 같은 요소가 있어 아무 일도 일어나지 않았으면 <code>false</code>를 돌려준다. 중복 요소를 넣어도 예외가 나지 않고, 넣기 전에 <code>contains</code>로 확인할 필요도 없다. "처음 본 값인가"를 알고 싶을 때는 <code>add</code>의 반환값 하나로 충분하다.</p>
+<p>셋끼리의 동등성도 인터페이스가 정한다. 두 셋은 크기가 같고 한쪽의 모든 요소가 다른 쪽에 들어 있으면 <code>equals</code>가 참이다. 구현 클래스가 달라도, 순회 순서가 달라도 상관없다. 셋의 <code>hashCode</code>는 요소들의 해시 코드를 모두 더한 값으로 정의되어 있는데, 덧셈은 순서를 타지 않으므로 순회 순서가 다른 두 셋도 같은 해시 코드를 갖는다.</p>
+<pre class="diagram">
+                   Collection<E>
+                   /            \
+   SequencedCollection<E>      Set<E> ◁─────────────── HashSet<E>
+        (Java 21)   \           /                          △ (상속)
+                  SequencedSet<E> (Java 21) ◁───────── LinkedHashSet<E>
+                         △
+                    SortedSet<E>
+                         △
+                   NavigableSet<E> ◁────────────────── TreeSet<E>
+
+   Set           : 중복 없음. 순회 순서에 대한 약속 없음
+   SequencedSet  : 정해진 순서가 있다. 첫 요소·마지막 요소·역순 뷰
+   SortedSet     : 그 순서가 "정렬 순서"다
+   NavigableSet  : 정렬 순서에서 가장 가까운 요소를 찾는 연산
+</pre>
+<p>계층도에서 볼 것은 세 구현체가 약속하는 범위가 다르다는 점이다. <code>HashSet</code>은 <code>Set</code>까지만 구현한다. <code>LinkedHashSet</code>은 <code>HashSet</code>을 상속하면서 Java 21에 추가된 <code>SequencedSet</code>을 구현하고, <code>TreeSet</code>은 <code>NavigableSet</code>까지 구현한다. 변수 타입을 <code>Set</code>으로 선언하면 세 구현체를 자유롭게 바꿔 끼울 수 있지만, 순서에 기대는 코드라면 타입을 <code>SequencedSet</code>이나 <code>NavigableSet</code>으로 선언해 그 의존을 드러내는 편이 낫다.</p>
+
+<h3>같은 데이터를 세 구현체에 넣어 본다</h3>
+<p>글에 붙은 태그 목록에서 중복을 없애는 상황을 가정하고, 같은 입력을 세 구현체에 똑같이 넣는다.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class SetOrderMain {
+    public static void main(String[] args) {
+        List<String> tags = List.of("java", "jvm", "gc", "java", "thread", "jvm", "heap");
+
+        Set<String> hash = new HashSet<>();
+        Set<String> linked = new LinkedHashSet<>();
+        Set<String> tree = new TreeSet<>();
+        for (String tag : tags) {
+            boolean added = hash.add(tag);
+            linked.add(tag);
+            tree.add(tag);
+            System.out.println("add(" + tag + ") -> " + added);
+        }
+        System.out.println("HashSet       = " + hash);
+        System.out.println("LinkedHashSet = " + linked);
+        System.out.println("TreeSet       = " + tree);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21)"><code class="language-text">add(java) -> true
+add(jvm) -> true
+add(gc) -> true
+add(java) -> false
+add(thread) -> true
+add(jvm) -> false
+add(heap) -> true
+HashSet       = [jvm, java, thread, gc, heap]
+LinkedHashSet = [java, jvm, gc, thread, heap]
+TreeSet       = [gc, heap, java, jvm, thread]</code></pre>
+<p>일곱 번 넣었지만 세 셋 모두 다섯 개만 남았다. 두 번째 <code>"java"</code>와 두 번째 <code>"jvm"</code>에서 <code>add</code>가 <code>false</code>를 돌려주었다. 중복을 걸러 내는 결과는 세 구현체가 같다. 다른 것은 꺼낼 때의 순서다.</p>
+<div class="table-wrap"><table><thead><tr><th>구현체</th><th>순회 순서</th><th>그 순서가 나오는 이유</th></tr></thead><tbody>
+<tr><td><code>HashSet</code></td><td>jvm, java, thread, gc, heap</td><td>버킷 배열을 0번 칸부터 훑은 순서</td></tr>
+<tr><td><code>LinkedHashSet</code></td><td>java, jvm, gc, thread, heap</td><td>요소가 처음 들어온 순서</td></tr>
+<tr><td><code>TreeSet</code></td><td>gc, heap, java, jvm, thread</td><td><code>String</code>의 자연 순서(사전순)</td></tr>
+</tbody></table></div>
+<p><code>LinkedHashSet</code>과 <code>TreeSet</code>의 순서는 API 문서가 보장하는 동작이다. <code>HashSet</code>의 순서는 그렇지 않다. 문서는 순회 순서에 대해 아무것도 보장하지 않으며 시간이 지나도 순서가 유지된다는 보장도 없다고 적는다. 위 출력은 OpenJDK 21의 구현에서 나온 결과일 뿐이다. 그런데도 이 순서가 왜 하필 jvm, java, thread, gc, heap인지는 계산으로 정확히 설명할 수 있다. 그 계산을 따라가려면 <code>HashSet</code>의 속을 열어야 한다.</p>
+
+<h3>HashSet의 속 — HashMap 위에 얹은 얇은 껍데기</h3>
+<p><code>HashSet</code>의 API 문서 첫 문장은 이 클래스가 해시 테이블로 뒷받침되며 그것이 실제로는 <code>HashMap</code> 인스턴스라고 밝힌다. JDK에 들어 있는 소스(<code>lib/src.zip</code>)를 열어 보면 그 말 그대로다. 핵심만 간추리면 다음과 같다.</p>
+<pre><code class="language-java">// OpenJDK 21의 java.util.HashSet에서 뼈대만 간추린 것
+public class HashSet<E> extends AbstractSet<E> implements Set<E>, Cloneable, java.io.Serializable {
+    transient HashMap<E,Object> map;
+    static final Object PRESENT = new Object();      // 모든 요소가 함께 쓰는 더미 값
+
+    public HashSet()                  { map = new HashMap<>(); }
+    public boolean add(E e)           { return map.put(e, PRESENT) == null; }
+    public boolean remove(Object o)   { return map.remove(o) == PRESENT; }
+    public boolean contains(Object o) { return map.containsKey(o); }
+    public int size()                 { return map.size(); }
+    // ...
+}</code></pre>
+<p>셋의 요소를 맵의 키 자리에 넣고, 값 자리에는 <code>PRESENT</code>라는 객체 하나를 모든 요소가 공유해서 넣는다. 맵은 "키가 중복되지 않는다"는 성질을 이미 갖고 있으므로 그 성질을 그대로 빌려 쓰는 것이다. <code>HashMap.put</code>은 새 키면 <code>null</code>을, 이미 있던 키면 이전 값을 돌려준다. 이전 값은 언제나 <code>PRESENT</code>이므로 <code>null</code>이 아니고, 그래서 <code>add</code>가 <code>false</code>가 된다. 컴파일된 클래스 파일에서도 같은 내용을 볼 수 있다.</p>
+<pre data-label="javap -c java.util.HashSet (일부, OpenJDK 21)"><code class="language-text">  public boolean add(E);
+    Code:
+       0: aload_0
+       1: getfield      #10                 // Field map:Ljava/util/HashMap;
+       4: aload_1
+       5: getstatic     #64                 // Field PRESENT:Ljava/lang/Object;
+       8: invokevirtual #68                 // Method java/util/HashMap.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+      11: ifnonnull     18
+      14: iconst_1
+      15: goto          19
+      18: iconst_0
+      19: ireturn</code></pre>
+<p>0~8번 명령은 <code>this.map</code>, 인자 <code>e</code>, 정적 필드 <code>PRESENT</code>를 차례로 피연산자 스택에 올리고 <code>HashMap.put</code>을 호출한다. 11번의 <code>ifnonnull</code>이 반환값이 <code>null</code>인지 검사해 <code>null</code>이면 1(<code>true</code>), 아니면 0(<code>false</code>)을 반환한다. <code>HashSet.add</code>가 직접 하는 일은 이것이 전부다. 타입 매개변수 <code>E</code>가 서술자에서 <code>Object</code>로 바뀌어 있는 것은 2회차에서 본 타입 소거의 결과다. <code>#10</code> 같은 상수 풀 번호는 JDK 빌드에 따라 달라질 수 있다.</p>
+<p>그러면 실제 일은 <code>HashMap</code>이 한다. <code>HashMap</code>은 <code>table</code>이라는 노드 배열을 갖고, 배열의 각 칸이 버킷이다. 노드는 <code>hash</code>, <code>key</code>, <code>value</code>, <code>next</code> 네 필드를 가진 객체다. <code>next</code>는 같은 버킷에 떨어진 다음 노드를 가리키므로, 버킷 하나는 4회차에서 만든 단일 연결 리스트와 같은 모양이다. 앞 예제의 <code>hash</code> 변수가 가리키는 구조를 그리면 이렇다.</p>
+<pre class="diagram">
+ 스택                 힙
+┌────────┐      ┌───────────┐      ┌─────────────────┐
+│ hash ──┼─────▶│ HashSet   │      │ HashMap         │
+└────────┘      │  map ─────┼─────▶│  table ───┐     │
+                └───────────┘      │  size = 5 │     │
+                                   │  threshold = 12 │
+                                   └───────────┼─────┘
+                                               ▼
+  Node[16]   [0]   [1] [2]  [3]  [4] ... [10]  [11]     [12]     [13] [14] [15]
+              │             │                   │        │
+              ▼             ▼                   ▼        ▼
+            Node          Node                Node     Node ──next──▶ Node
+           key="jvm"     key="java"        key="thread" key="gc"      key="heap"
+
+  노드 다섯 개의 value 필드는 모두 같은 객체(HashSet.PRESENT)를 가리킨다.
+</pre>
+<x-visual id="java-mid2-08-hashset-over-hashmap" title="HashSet 객체가 HashMap을 거쳐 버킷 배열과 노드로 이어지는 메모리 구조" kind="메모리 구조도" ratio="16:9">
+<x-hint>HashSet은 필드 하나짜리 껍데기이고 실제 저장은 HashMap의 버킷 배열과 노드가 하며, 모든 노드의 value가 PRESENT 객체 하나를 공유한다는 점을 보여 준다.</x-hint>
+<x-prompt>깔끔한 기술 다이어그램, 흰 배경, 왼쪽에서 오른쪽으로 흐르는 구도. 맨 왼쪽에 작은 상자 "지역 변수 hash", 여기서 화살표가 오른쪽 상자 "HashSet 객체"로 간다. HashSet 객체 안에는 "map" 필드 한 줄만 있고, 그 필드에서 화살표가 "HashMap 객체" 상자로 간다. HashMap 객체 안에는 "table", "size = 5", "threshold = 12" 세 줄이 있다. "table"에서 아래로 화살표가 내려가 가로로 긴 16칸 배열 "버킷 배열 Node[16]"을 가리킨다. 배열의 0번, 3번, 11번, 12번 칸만 채워져 있고 각 칸에서 아래로 화살표가 내려가 둥근 노드 상자를 가리킨다. 0번 아래 노드에는 "jvm", 3번 아래 "java", 11번 아래 "thread", 12번 아래 "gc"가 적혀 있고 "gc" 노드에서 오른쪽으로 "next" 라벨이 붙은 화살표가 "heap" 노드로 이어진다. 다섯 노드 모두에서 가는 점선 화살표가 오른쪽 아래의 작은 회색 상자 "PRESENT (공유되는 Object 하나)"로 모인다. 색은 파랑 계열 한 가지와 회색만 사용.</x-prompt>
+<x-caption>HashSet 객체에는 map 필드 하나뿐이다. 요소는 HashMap 노드의 key 자리에 들어가고, value 자리는 모든 노드가 PRESENT 하나를 함께 가리킨다.</x-caption>
+</x-visual>
+<p>값 자리를 버리지 않고 더미 객체로 채우는 설계는 낭비처럼 보일 수 있다. 치르는 값은 노드마다 참조 필드 하나이고, 얻는 것은 해시 테이블 구현을 한 벌만 유지해도 된다는 점이다. <code>PRESENT</code>는 요소마다 새로 만드는 것이 아니라 클래스에 하나뿐인 정적 객체이므로 요소가 백만 개여도 추가로 생기는 객체는 없다.</p>
+
+<h4>add 한 번이 지나가는 길</h4>
+<figure class="flow-figure"><figcaption>HashSet.add(e) 한 번의 경로 (OpenJDK 21의 HashMap.putVal 기준)</figcaption><ol class="flow">
+<li><strong>해시 코드 계산</strong><span>요소의 hashCode()를 한 번 호출해 int 값 h를 얻는다. 요소가 null이면 0으로 친다.</span></li>
+<li><strong>비트 섞기</strong><span>h ^ (h >>> 16)을 계산한다. 상위 16비트를 하위 16비트에 XOR로 접어 넣어, 아래쪽 비트만 쓰는 다음 단계에서 위쪽 비트의 차이가 버려지지 않게 한다.</span></li>
+<li><strong>버킷 선택</strong><span>(capacity - 1) & hash로 배열 인덱스를 얻는다. capacity가 2의 거듭제곱이라서 나머지 연산 대신 비트 AND 한 번으로 끝난다.</span></li>
+<li><strong>버킷 탐색</strong><span>칸이 비어 있으면 새 노드를 넣는다. 노드가 있으면 next를 따라가며 저장된 hash가 같은 노드에 대해서만 == 또는 equals로 같은 요소인지 확인한다.</span></li>
+<li><strong>마무리</strong><span>같은 요소가 있었으면 이전 값(PRESENT)을 돌려주어 add가 false가 된다. 없었으면 노드를 추가하고 size를 1 늘린 뒤, size가 임계값을 넘으면 리사이즈한다.</span></li>
+</ol></figure>
+<p>예제의 태그 다섯 개에 대해 이 계산을 실제로 해 보면 다음 표가 나온다. <code>String.hashCode()</code>는 API 문서에 계산식(<code>s[0]*31^(n-1) + s[1]*31^(n-2) + ... + s[n-1]</code>)이 명시되어 있어 어느 JVM에서 실행해도 값이 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>요소</th><th><code>hashCode()</code></th><th><code>h ^ (h >>> 16)</code></th><th><code>& 15</code> (버킷)</th></tr></thead><tbody>
+<tr><td>"java"</td><td>3254818</td><td>3254803</td><td>3</td></tr>
+<tr><td>"jvm"</td><td>105633</td><td>105632</td><td>0</td></tr>
+<tr><td>"gc"</td><td>3292</td><td>3292</td><td>12</td></tr>
+<tr><td>"thread"</td><td>-874443254</td><td>-874396181</td><td>11</td></tr>
+<tr><td>"heap"</td><td>3198444</td><td>3198428</td><td>12</td></tr>
+</tbody></table></div>
+<p>표에서 세 가지를 읽을 수 있다. 첫째, <code>"thread"</code>의 해시 코드는 음수인데 버킷 번호는 11로 멀쩡하다. 비트 AND는 부호 비트를 포함한 위쪽 비트를 전부 0으로 지우므로 결과가 항상 0 이상 15 이하다. 나머지 연산(<code>%</code>)이었다면 음수가 나오지 않게 따로 처리해야 했을 것이다. 둘째, <code>"gc"</code>와 <code>"heap"</code>은 해시 코드가 다른데도 같은 12번 버킷에 떨어졌다. 먼저 들어온 <code>"gc"</code>가 버킷의 첫 노드가 되고 <code>"heap"</code>이 그 뒤에 매달린다. 셋째, 순회는 배열을 0번부터 훑으며 각 버킷의 노드를 앞에서부터 따라가므로 0번(jvm), 3번(java), 11번(thread), 12번(gc, heap) 순서가 된다. 앞 예제의 출력 <code>[jvm, java, thread, gc, heap]</code>이 바로 이 순서다.</p>
+<p>두 번째 <code>"java"</code>를 넣을 때는 같은 계산으로 3번 버킷에 도착하고, 거기 있는 노드의 저장된 해시값이 같으며 <code>equals</code>도 참이므로 "이미 있는 키"로 처리된다. 이때 <code>HashMap</code>은 노드의 값만 덮어쓰고 키 참조는 건드리지 않는다. 따라서 <code>equals</code>로는 같지만 서로 다른 두 객체를 차례로 <code>add</code>하면 셋에 남는 것은 먼저 넣은 객체다.</p>
+<p>노드가 <code>hash</code> 필드에 해시값을 저장해 두는 이유는 두 가지다. 버킷 안에서 노드를 따라갈 때 <code>int</code> 비교 한 번으로 대부분의 다른 요소를 걸러 내 <code>equals</code> 호출을 줄일 수 있고, 뒤에서 볼 리사이즈 때 요소의 <code>hashCode()</code>를 다시 호출하지 않고도 새 버킷을 정할 수 있다.</p>
+
+<h4>호출 횟수로 확인하는 탐색 비용</h4>
+<p>시간을 재는 대신 <code>equals</code>, <code>hashCode</code>, <code>compareTo</code>가 몇 번 불리는지 세어 보면 구조의 차이가 실행마다 흔들리지 않는 숫자로 드러난다. 좌석 10,000개를 리스트와 두 종류의 셋에 넣고 한 좌석을 찾는다.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class LookupCostMain {
+    static final class Seat implements Comparable<Seat> {
+        static int hashCalls, equalsCalls, compareCalls;
+        final int row, no;
+
+        Seat(int row, int no) { this.row = row; this.no = no; }
+
+        @Override public boolean equals(Object o) {
+            equalsCalls++;
+            return o instanceof Seat s && row == s.row && no == s.no;
+        }
+        @Override public int hashCode() { hashCalls++; return 31 * row + no; }
+        @Override public int compareTo(Seat o) {
+            compareCalls++;
+            int c = Integer.compare(row, o.row);
+            return c != 0 ? c : Integer.compare(no, o.no);
+        }
+        static String countsAndReset() {
+            String s = "hashCode=" + hashCalls + ", equals=" + equalsCalls + ", compareTo=" + compareCalls;
+            hashCalls = equalsCalls = compareCalls = 0;
+            return s;
+        }
+    }
+
+    public static void main(String[] args) {
+        List<Seat> list = new ArrayList<>();
+        Set<Seat> hash = new HashSet<>();
+        Set<Seat> tree = new TreeSet<>();
+        for (int row = 1; row <= 100; row++) {
+            for (int no = 1; no <= 100; no++) {
+                Seat s = new Seat(row, no);
+                list.add(s); hash.add(s); tree.add(s);
+            }
+        }
+        Seat.countsAndReset();
+
+        Seat last = new Seat(100, 100);   // 들어 있는 좌석과 값이 같은 새 객체
+        System.out.println(list.contains(last) + "  ArrayList : " + Seat.countsAndReset());
+        System.out.println(hash.contains(last) + "  HashSet   : " + Seat.countsAndReset());
+        System.out.println(tree.contains(last) + "  TreeSet   : " + Seat.countsAndReset());
+
+        Seat absent = new Seat(101, 1);   // 들어 있지 않은 좌석
+        System.out.println(list.contains(absent) + " ArrayList : " + Seat.countsAndReset());
+        System.out.println(hash.contains(absent) + " HashSet   : " + Seat.countsAndReset());
+        System.out.println(tree.contains(absent) + " TreeSet   : " + Seat.countsAndReset());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21)"><code class="language-text">true  ArrayList : hashCode=0, equals=10000, compareTo=0
+true  HashSet   : hashCode=1, equals=1, compareTo=0
+true  TreeSet   : hashCode=0, equals=0, compareTo=24
+false ArrayList : hashCode=0, equals=10000, compareTo=0
+false HashSet   : hashCode=1, equals=3, compareTo=0
+false TreeSet   : hashCode=0, equals=0, compareTo=24</code></pre>
+<p><code>ArrayList.contains</code>는 앞에서부터 하나씩 <code>equals</code>로 비교하므로 맨 뒤에 있는 좌석을 찾는 데 10,000번, 없는 좌석을 확인하는 데도 10,000번이 든다. <code>HashSet</code>은 <code>hashCode</code> 한 번으로 버킷을 정하고 <code>equals</code> 한 번으로 확인을 끝냈다. 요소가 10,000개든 1,000만 개든 이 횟수는 버킷에 요소가 고르게 흩어지는 한 거의 변하지 않는다.</p>
+<p>없는 좌석을 찾을 때 <code>equals</code>가 3번 불린 것이 눈에 띈다. <code>Seat(101, 1)</code>의 해시 코드는 31×101+1 = 3132인데, 셋 안에 해시 코드가 정확히 3132인 좌석이 세 개 있기 때문이다. (100, 32), (99, 63), (98, 94)가 그렇다. 해시 코드가 완전히 같으면 저장된 <code>hash</code> 비교로는 걸러 낼 수 없으므로 <code>equals</code>까지 가야 한다. <code>31 * row + no</code>가 이 데이터에 대해 그리 좋은 해시 함수가 아니라는 사실이 숫자로 드러난 셈이다. <code>TreeSet</code> 줄은 해시 관련 메서드를 한 번도 부르지 않고 <code>compareTo</code>만 24번 불렀다. 이 숫자의 의미는 트리를 다룰 때 다시 본다.</p>
+
+<h3>HashSet의 순회 순서 — 정렬처럼 보이는 착시</h3>
+<p><code>HashSet</code>에 작은 정수를 넣어 출력하면 정렬된 것처럼 나오는 경우가 많아서 "해시 셋은 숫자를 정렬해 준다"는 오해가 생긴다. 다음 두 줄을 비교해 보자.</p>
+<pre><code class="language-java">Set<Integer> small = new HashSet<>(List.of(5, 3, 9, 1, 7));
+System.out.println(small);     // [1, 3, 5, 7, 9]
+
+Set<Integer> mixed = new HashSet<>(List.of(5, 3, 9, 1, 7, 100, 16, 21));
+System.out.println(mixed);     // [16, 1, 3, 100, 5, 21, 7, 9]</code></pre>
+<p>첫 줄이 정렬되어 보이는 이유는 계산으로 설명된다. <code>Integer.hashCode()</code>는 API 문서에 그 객체가 나타내는 <code>int</code> 값과 같다고 명시되어 있다. 값이 65536보다 작은 양수라면 <code>h >>> 16</code>이 0이므로 비트 섞기를 거쳐도 그대로이고, 버킷 수 16보다 작으면 <code>& 15</code>를 해도 그대로다. 결국 1은 1번 버킷, 3은 3번 버킷에 들어가고, 배열을 0번부터 훑으면 값의 크기 순서가 된다. 정렬한 것이 아니라 값이 곧 버킷 번호였을 뿐이다.</p>
+<p>두 번째 줄은 버킷 수를 넘는 값이 섞이자 착시가 깨진다. 16은 <code>16 & 15 = 0</code>이라 0번 버킷으로, 100은 4번으로, 21은 5번으로 간다. 21은 먼저 들어온 5의 뒤에 매달린다. 0번(16), 1번(1), 3번(3), 4번(100), 5번(5, 21), 7번(7), 9번(9)을 차례로 읽으면 출력과 일치한다.</p>
+<p>같은 요소라도 버킷 수가 달라지면 순서가 바뀐다. 다음 코드는 요소 네 개를 넣어 출력한 뒤, 아홉 개를 더 넣어 내부 배열이 32칸으로 늘어나게 한다.</p>
+<pre><code class="language-java">Set<Integer> nums = new HashSet<>();
+for (int n : new int[]{33, 1, 17, 2}) nums.add(n);
+System.out.println(nums);      // [33, 1, 17, 2]
+
+for (int n = 3; n <= 11; n++) nums.add(n);
+System.out.println(nums);      // [33, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 17]</code></pre>
+<p>처음에는 33, 1, 17이 모두 1번 버킷에 들어온 순서대로 매달려 있어서 2보다 먼저 나온다. 배열이 32칸이 되자 17은 17번 버킷으로 옮겨 가 맨 뒤로 밀렸다. 요소를 지운 적도 다시 넣은 적도 없는데 17의 위치가 달라졌다. API 문서가 "순서가 시간이 지나도 유지된다는 보장이 없다"고 적은 것은 바로 이런 동작을 가리킨다.</p>
+<p>정리하면 <code>HashSet</code>의 순회 순서는 무작위가 아니라 요소의 해시 코드, 현재 버킷 수, 삽입 순서, 그리고 <code>HashMap</code>의 구현이 함께 결정하는 값이다. 네 가지 가운데 어느 것도 <code>Set</code> 계약의 일부가 아니므로 코드가 이 순서에 기대면 안 된다. 특히 <code>hashCode()</code>를 재정의하지 않은 클래스는 <code>Object.hashCode()</code>를 쓰는데, 이 값은 같은 프로그램을 다시 실행했을 때 같다는 보장이 없어서 실행할 때마다 순회 순서가 달라질 수 있다. 테스트가 어떤 날은 통과하고 어떤 날은 실패하는 원인이 여기에 있는 경우가 있다.</p>
+
+<h3>LinkedHashSet — 해시 테이블에 이중 연결 리스트 한 줄을 더한다</h3>
+<p>넣은 순서대로 꺼내고 싶다면 순서를 따로 기록해야 한다. <code>LinkedHashSet</code>은 <code>HashSet</code>을 상속하고, 생성자에서 <code>HashMap</code> 대신 <code>LinkedHashMap</code>을 만들게 한다. OpenJDK 21 소스에서 <code>LinkedHashSet</code>의 생성자들은 모두 <code>HashSet</code>의 패키지 전용 생성자 <code>HashSet(int, float, boolean)</code>을 호출하고, 그 생성자의 본문이 <code>map = new LinkedHashMap<>(initialCapacity, loadFactor);</code> 한 줄이다. 세 번째 <code>boolean</code> 매개변수는 다른 생성자와 시그니처를 구분하려는 용도일 뿐 쓰이지 않는다.</p>
+<p><code>LinkedHashMap</code>의 노드는 <code>HashMap.Node</code>를 상속한 <code>Entry</code>이고, 필드 두 개 <code>before</code>와 <code>after</code>가 더 있다. 버킷 안에서의 연결은 여전히 <code>next</code>가 맡고, <code>before</code>·<code>after</code>는 버킷과 무관하게 모든 노드를 삽입 순서대로 잇는 이중 연결 리스트를 이룬다. 맵은 이 리스트의 양 끝을 <code>head</code>와 <code>tail</code>로 들고 있다. API 문서의 표현으로는 모든 엔트리를 관통하는 이중 연결 리스트를 유지하며 이 리스트가 순회 순서를 정의한다.</p>
+<pre class="diagram">
+ 탐색용: 버킷 배열과 next               순회용: before / after
+ [0]  ─▶ (jvm)                          head
+ [3]  ─▶ (java)                          │
+ [11] ─▶ (thread)                        ▼
+ [12] ─▶ (gc) ─next─▶ (heap)           (java) ⇄ (jvm) ⇄ (gc) ⇄ (thread) ⇄ (heap)
+                                                                             ▲
+                                                                           tail
+ 같은 Entry 객체가 두 구조에 동시에 속한다.
+   next          : 같은 버킷의 다음 Entry
+   before, after : 삽입 순서에서 바로 앞, 바로 뒤 Entry
+</pre>
+<x-visual id="java-mid2-08-linkedhashset-dual-structure" title="LinkedHashSet의 버킷 배열과 삽입 순서 이중 연결 리스트가 같은 노드를 공유하는 구조" kind="메모리 구조도" ratio="16:9">
+<x-hint>같은 노드가 버킷 체인(탐색용)과 삽입 순서 리스트(순회용)에 동시에 속한다는 것을 한 그림에서 두 가지 색의 화살표로 구분해 보여 준다.</x-hint>
+<x-prompt>깔끔한 기술 다이어그램, 흰 배경. 위쪽에 가로로 긴 16칸 배열 "버킷 배열"이 있고 0번, 3번, 11번, 12번 칸만 진하게 칠해져 있다. 배열 아래에 둥근 노드 다섯 개가 놓여 있다. 0번 칸 아래 "jvm", 3번 칸 아래 "java", 11번 칸 아래 "thread", 12번 칸 아래 "gc", 그리고 "gc" 오른쪽에 "heap". 배열 칸에서 각 노드로 내려가는 화살표와 "gc"에서 "heap"으로 가는 화살표는 파란 실선이며 범례에 "next (탐색용)"이라고 적는다. 별도로 주황색 양방향 화살표가 노드를 "java", "jvm", "gc", "thread", "heap" 순서로 구불구불 잇는다. 범례에 "before / after (순회용)"이라고 적는다. "java" 노드 위에 작은 주황 라벨 "head", "heap" 노드 위에 작은 주황 라벨 "tail". 그림 아래에 한 줄 설명 "노드는 하나, 연결은 두 벌".</x-prompt>
+<x-caption>파란 화살표는 해시 탐색에 쓰는 버킷 체인, 주황 화살표는 순회에 쓰는 삽입 순서 리스트다. 노드 객체는 하나뿐이고 두 구조가 그것을 함께 가리킨다.</x-caption>
+</x-visual>
+<p>탐색 경로는 <code>HashSet</code>과 똑같으므로 <code>add</code>, <code>contains</code>, <code>remove</code>는 여전히 평균 O(1)이다. 추가할 때는 새 노드를 <code>tail</code> 뒤에 잇는 참조 대입 몇 번이 더 들고, 삭제할 때는 그 노드의 <code>before</code>와 <code>after</code>를 서로 이어 주는 대입 몇 번이 더 든다. 5회차까지에서 본 것처럼 이중 연결 리스트는 지울 노드 자체를 손에 쥐고 있으면 앞뒤 노드를 찾으러 갈 필요가 없다. 해시 탐색이 그 노드를 바로 찾아 주므로 삭제 전체가 O(1)로 유지된다. 단일 연결이었다면 앞 노드를 찾기 위해 리스트를 처음부터 훑어야 했을 것이다.</p>
+<p>순회 비용에서는 오히려 유리한 점이 있다. <code>HashSet</code>의 순회는 빈 버킷까지 포함해 배열 전체를 훑어야 하므로 API 문서가 요소 수와 용량(버킷 수)의 합에 비례하는 시간이 든다고 적는다. <code>LinkedHashSet</code>의 순회는 <code>head</code>에서 시작해 <code>after</code>만 따라가므로 용량과 무관하게 요소 수에만 비례한다. 문서는 <code>LinkedHashSet</code>의 성능이 연결 리스트를 유지하는 비용 때문에 <code>HashSet</code>보다 약간 낮을 수 있지만 순회만은 예외라고 설명한다.</p>
+<p>순서에 관한 규칙은 두 가지만 기억하면 된다. 이미 들어 있는 요소를 <code>add</code>로 다시 넣어도 그 요소의 자리는 바뀌지 않는다. 지웠다가 다시 넣으면 새 요소로 취급되어 맨 뒤로 간다. Java 21부터는 <code>SequencedSet</code>의 메서드로 양 끝을 직접 다룰 수도 있다.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class SeqMain {
+    public static void main(String[] args) {
+        LinkedHashSet<String> set = new LinkedHashSet<>(List.of("a", "b", "c"));
+        set.add("a");
+        System.out.println(set);                        // 다시 add해도 자리는 그대로
+        set.remove("a");
+        set.add("a");
+        System.out.println(set);                        // 지웠다 넣으면 맨 뒤
+        System.out.println(set.getFirst() + " " + set.getLast() + " " + set.reversed());
+        set.addFirst("c");
+        System.out.println(set);                        // 이미 있는 요소를 맨 앞으로 옮긴다
+        System.out.println(set.removeLast() + " " + set);
+
+        TreeSet<String> sorted = new TreeSet<>(List.of("b", "a", "c"));
+        System.out.println(sorted.getFirst() + " " + sorted.getLast() + " " + sorted.reversed());
+        try {
+            sorted.addFirst("z");
+        } catch (UnsupportedOperationException e) {
+            System.out.println("TreeSet.addFirst -> " + e);
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[a, b, c]
+[b, c, a]
+b a [a, c, b]
+[c, b, a]
+a [c, b]
+a c [c, b, a]
+TreeSet.addFirst -> java.lang.UnsupportedOperationException</code></pre>
+<p><code>addFirst</code>와 <code>addLast</code>는 요소가 이미 있으면 그 요소를 맨 앞이나 맨 뒤로 옮긴다. <code>reversed()</code>는 복사본이 아니라 원본을 거꾸로 보여 주는 뷰(view)다. <code>TreeSet</code>도 <code>SequencedSet</code>이므로 <code>getFirst</code>, <code>getLast</code>, <code>reversed</code>를 쓸 수 있지만, 요소의 위치를 비교 결과가 정하는 구조에서 "맨 앞에 넣어라"는 요청은 성립하지 않으므로 <code>addFirst</code>와 <code>addLast</code>는 예외를 던진다. <code>HashSet</code>은 정해진 순서가 없어 <code>SequencedSet</code>이 아니다.</p>
+<aside class="note"><code>LinkedHashMap</code>에는 조회할 때마다 그 엔트리를 맨 뒤로 보내는 접근 순서(access-order) 모드가 있지만, <code>LinkedHashSet</code>에는 그 모드를 켜는 생성자가 없다. <code>LinkedHashSet</code>의 순서는 언제나 삽입 순서다.</aside>
+
+<h3>TreeSet 1 — 이진 탐색 트리와 균형</h3>
+<p><code>TreeSet</code>은 해시를 쓰지 않는다. API 문서는 이 클래스를 <code>TreeMap</code>에 기반한 <code>NavigableSet</code> 구현이라고 소개하고, <code>TreeMap</code>의 문서는 자신을 레드-블랙 트리(red-black tree) 기반 구현이라고 밝힌다. <code>HashSet</code>과 마찬가지로 <code>TreeSet</code>도 요소를 맵의 키로 넣고 값 자리에는 더미 객체를 둔다. 따라서 <code>TreeSet</code>을 이해하는 일은 정렬된 트리가 어떻게 "중복 없음"과 "정렬 순서"를 동시에 만들어 내는지 이해하는 일이다.</p>
+<h4>이진 탐색 트리</h4>
+<p>이진 탐색 트리(binary search tree)는 노드마다 자식이 최대 둘이고, 어떤 노드를 기준으로 왼쪽 서브트리의 값은 모두 그 노드보다 작고 오른쪽 서브트리의 값은 모두 더 크다는 규칙을 지키는 트리다. 이 규칙 덕분에 값을 찾을 때 비교 한 번마다 한쪽 서브트리를 통째로 버릴 수 있다.</p>
+<pre class="diagram">
+              50
+            /    \
+          30      70
+         /  \    /  \
+       20   40  60   80
+
+  60을 찾는다:  50보다 크다 → 오른쪽
+               70보다 작다 → 왼쪽
+               60과 같다   → 찾음 (비교 3번)
+  65를 넣는다:  50 → 70 → 60의 오른쪽이 비어 있다 → 그 자리에 새 노드
+               내려오는 도중 같은 값을 만나면 넣지 않는다 (중복)
+</pre>
+<p>탐색, 삽입, 삭제 모두 루트에서 한 방향으로 내려가는 일이므로 비용은 트리의 높이에 비례한다. 노드 7개가 위 그림처럼 꽉 차 있으면 높이는 3층이고, 노드가 n개인 꽉 찬 트리의 높이는 대략 log₂n이다. 그리고 왼쪽 서브트리, 자신, 오른쪽 서브트리 순으로 방문하면(중위 순회) 값이 오름차순으로 나온다. <code>TreeSet</code>을 순회하면 정렬된 순서가 나오는 이유가 이것이다. 정렬을 따로 하는 것이 아니라 구조 자체가 정렬되어 있다.</p>
+<p>문제는 모양이다. 아무 조정 없이 10, 20, 30, 40을 순서대로 넣으면 매번 오른쪽 끝에 매달려 한 줄짜리 트리가 된다. 이 모양은 사실상 연결 리스트이고 높이가 n이므로 탐색이 O(n)으로 떨어진다. 이미 정렬된 데이터를 넣는 일은 드물지 않으므로 이 최악의 경우는 실제로 자주 만난다.</p>
+<h4>레드-블랙 트리의 규칙</h4>
+<p>레드-블랙 트리는 노드마다 빨강 또는 검정이라는 색 정보를 하나 더 두고, 삽입·삭제 뒤에 다음 규칙이 유지되도록 트리를 고쳐 놓는 이진 탐색 트리다. <code>TreeMap</code>의 노드 클래스 <code>Entry</code>는 <code>key</code>, <code>value</code>, <code>left</code>, <code>right</code>, <code>parent</code>와 <code>boolean color</code> 필드를 가진다.</p>
+<ol>
+<li>루트는 검정이다.</li>
+<li>빨강 노드의 자식은 검정이다. 즉 빨강이 부모-자식으로 연달아 나오지 않는다.</li>
+<li>어느 노드에서 출발하든, 그 아래의 빈 자리(<code>null</code>)까지 내려가는 모든 경로는 검정 노드를 같은 개수만큼 지난다.</li>
+</ol>
+<p>빈 자리는 검정으로 취급한다(<code>TreeMap</code>의 <code>colorOf</code> 메서드는 <code>null</code>에 대해 검정을 돌려준다). 이 규칙에서 높이의 상한이 나온다. 루트에서 가장 깊은 빈 자리까지의 경로에 노드가 h개 있다고 하자. 빨강이 연달아 나올 수 없고 루트가 검정이므로 그 경로의 노드 가운데 절반 이상은 검정이다. 규칙 3에 따라 다른 모든 경로도 검정을 그만큼 지나야 하므로 어떤 경로도 h/2보다 짧을 수 없다. 그러면 트리의 위쪽 h/2개 층은 빈자리 없이 꽉 차 있어야 하고, 노드 수 n은 2^(h/2) − 1 이상이다. 이 부등식을 h에 대해 풀면 h ≤ 2·log₂(n+1)이 된다. 가장 깊은 곳이 가장 얕은 곳의 두 배를 넘지 못한다는 뜻이다.</p>
+<h4>삽입을 한 단계씩 추적한다</h4>
+<p>빈 <code>TreeSet</code>에 1, 2, 3, 4를 차례로 넣어 본다. 아래 모양은 OpenJDK 21에서 리플렉션으로 <code>TreeMap</code>의 노드를 읽어 확인한 것이다. 새 노드는 이진 탐색 트리의 규칙대로 자리를 찾아 매달린 뒤 빨강으로 칠해지고, 그 결과 빨강이 연달아 생기면 고치는 작업(<code>fixAfterInsertion</code>)이 이어진다.</p>
+<pre class="diagram">
+ add(1)      add(2)        add(3) 직후               회전과 재색칠 뒤
+  1(검)       1(검)          1(검)                       2(검)
+                 \              \                       /     \
+                2(빨)          2(빨)                 1(빨)   3(빨)
+                                  \
+                                 3(빨)  ← 빨강 아래 빨강: 규칙 2 위반
+
+ add(4) 직후                    재색칠 뒤
+      2(검)                       2(검)
+     /     \                     /     \
+  1(빨)   3(빨)               1(검)   3(검)
+              \                           \
+             4(빨) ← 위반                4(빨)
+</pre>
+<p>3을 넣었을 때는 부모 2가 빨강이고 부모의 형제 자리(1의 왼쪽)가 비어 있어 검정으로 취급된다. 이 경우 색만 바꿔서는 규칙 3을 맞출 수 없으므로 조부모 1을 기준으로 왼쪽 회전을 하고, 올라온 2를 검정으로, 내려간 1을 빨강으로 칠한다. 4를 넣었을 때는 부모 3과 부모의 형제 1이 모두 빨강이다. 이 경우에는 회전 없이 둘을 검정으로, 조부모 2를 빨강으로 바꾸면 된다. 조부모가 루트였으므로 마지막에 루트를 다시 검정으로 칠한다.</p>
+<pre class="diagram">
+ 왼쪽 회전 (p를 기준으로)
+
+      p                    r
+     / \                  / \
+    a   r       ──▶      p   c
+       / \              / \
+      b   c            a   b
+
+ 회전 전후 모두 a < p < b < r < c 이다. 순서는 그대로이고 높이만 바뀐다.
+</pre>
+<x-visual id="java-mid2-08-redblack-insert-rotation" title="1, 2, 3을 차례로 넣을 때 레드-블랙 트리가 회전으로 균형을 되찾는 과정" kind="단계별 다이어그램" ratio="16:9">
+<x-hint>오름차순 삽입으로 한쪽으로 기운 트리가 왼쪽 회전과 재색칠 한 번으로 균형 잡힌 모양이 되는 과정을 세 장면으로 보여 준다.</x-hint>
+<x-prompt>깔끔한 기술 다이어그램, 흰 배경, 왼쪽에서 오른쪽으로 세 장면이 화살표로 이어진다. 노드는 원으로 그리고 검정 노드는 짙은 회색 바탕에 흰 숫자, 빨강 노드는 빨간 바탕에 흰 숫자. 첫 장면 제목 "add(2) 뒤": 검정 노드 1이 위에 있고 오른쪽 아래에 빨강 노드 2가 매달려 있다. 둘째 장면 제목 "add(3) 직후": 검정 1, 그 오른쪽 아래 빨강 2, 다시 그 오른쪽 아래 빨강 3이 한 줄로 기울어 있고, 2와 3 사이 선 옆에 경고 표시와 라벨 "빨강 아래 빨강". 둘째 장면에서 셋째 장면으로 가는 굵은 화살표 위에 라벨 "왼쪽 회전 + 재색칠". 셋째 장면 제목 "균형 회복": 검정 노드 2가 맨 위에 있고 왼쪽 아래에 빨강 1, 오른쪽 아래에 빨강 3. 그림 맨 아래에 한 줄 "순서 1, 2, 3은 그대로, 높이는 3에서 2로".</x-prompt>
+<x-caption>정렬된 입력이 들어와도 회전이 트리를 다시 세운다. 회전은 참조 몇 개를 바꾸는 일이라 비용이 일정하다.</x-caption>
+</x-visual>
+<p>회전은 노드를 새로 만들거나 값을 옮기는 일이 아니라 <code>left</code>, <code>right</code>, <code>parent</code> 참조 몇 개를 다시 대입하는 일이다. 4회차에서 연결 리스트의 삽입이 참조 대입 두 번이었던 것과 같은 종류의 작업이고, 트리 크기와 무관하게 일정한 비용이 든다. 같은 방식으로 7까지 넣으면 다음 모양이 된다. 아무 조정이 없었다면 7층짜리 한 줄이 되었을 입력이 4층에 담겼다.</p>
+<pre class="diagram">
+          2(검)
+         /     \
+      1(검)   4(빨)
+             /     \
+          3(검)   6(검)
+                 /     \
+              5(빨)   7(빨)
+</pre>
+<p>더 큰 입력으로도 확인해 보았다. 1부터 1,000까지 오름차순으로 넣은 <code>TreeSet</code>의 높이는 17층이었고, 1부터 1,000,000까지 넣었을 때는 37층이었다(OpenJDK 21에서 리플렉션으로 측정). 앞에서 구한 상한 2·log₂(n+1)은 각각 약 19.9와 39.9이므로 측정값이 그 안에 들어온다. 조정 없는 이진 탐색 트리였다면 높이가 1,000층과 1,000,000층이었을 것이다. 앞의 <code>LookupCostMain</code>에서 요소 10,000개짜리 <code>TreeSet</code>이 <code>compareTo</code>를 24번 부른 것도 같은 이야기다. 2·log₂(10,001)이 약 26.6이므로 어떤 요소를 찾든 비교 횟수는 그 아래에 머문다.</p>
+<p>API 문서가 <code>TreeSet</code>의 <code>add</code>, <code>remove</code>, <code>contains</code>에 대해 "보장된" log(n) 시간이라고 쓰는 것은 이 상한 때문이다. <code>HashSet</code>의 O(1)에는 해시 함수가 요소를 버킷에 고르게 흩어 준다는 전제가 붙지만, 트리의 O(log n)은 데이터가 어떤 순서로 들어오든, 요소의 <code>hashCode</code>가 어떻게 구현되어 있든 성립한다. 평균은 해시가 빠르고, 최악의 경우에 대한 보증은 트리가 강하다.</p>
+
+<h3>TreeSet 2 — 무엇을 기준으로 정렬하고 무엇을 같다고 보는가</h3>
+<p>트리에 요소를 넣으려면 두 요소 가운데 어느 쪽이 앞인지 물을 수 있어야 한다. <code>TreeSet</code>은 그 답을 두 곳 중 하나에서 얻는다. 생성자에 <code>Comparator</code>를 넘기면 그것을 쓰고, 넘기지 않으면 요소가 <code>Comparable</code>을 구현했다고 보고 <code>compareTo</code>를 호출한다. 뒤쪽을 자연 순서(natural ordering)라고 부른다. 두 인터페이스 자체는 10회차에서 자세히 다루므로 여기서는 <code>TreeSet</code>이 비교 결과를 어떻게 쓰는지에 집중한다.</p>
+<p>핵심은 <code>TreeSet</code>이 <code>equals</code>와 <code>hashCode</code>를 호출하지 않는다는 점이다. <code>LookupCostMain</code>의 출력에서 <code>TreeSet</code> 줄의 <code>hashCode=0, equals=0</code>이 그 증거다. 트리를 내려가다가 비교 결과가 0인 노드를 만나면 그것이 "같은 요소"이고, 거기서 탐색이 끝난다. <code>TreeSet</code>의 문서도 이 점을 명시한다. <code>Set</code> 인터페이스는 <code>equals</code>로 정의되어 있지만 <code>TreeSet</code>은 모든 요소 비교를 <code>compareTo</code>(또는 <code>compare</code>)로 하므로, 이 메서드가 같다고 본 두 요소는 셋의 관점에서 같다는 것이다. 이 차이가 눈에 보이는 예를 실행해 보자.</p>
+<pre><code class="language-java">import java.math.BigDecimal;
+import java.util.*;
+
+public class CompareEqMain {
+    public static void main(String[] args) {
+        BigDecimal a = new BigDecimal("1.0");
+        BigDecimal b = new BigDecimal("1.00");
+        System.out.println(a.equals(b) + " " + a.compareTo(b));
+
+        Set<BigDecimal> hash = new HashSet<>(List.of(a, b));
+        Set<BigDecimal> tree = new TreeSet<>(List.of(a, b));
+        System.out.println(hash.size() + " " + tree.size() + " " + tree);
+        System.out.println(tree.contains(new BigDecimal("1.000")) + " " + hash.contains(new BigDecimal("1.000")));
+
+        TreeSet<String> ignoreCase = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        System.out.println(ignoreCase.add("Java") + " " + ignoreCase.add("JAVA") + " " + ignoreCase
+                + " " + ignoreCase.contains("java"));
+
+        TreeSet<String> byLength = new TreeSet<>(Comparator.comparingInt(String::length));
+        byLength.addAll(List.of("heap", "gc", "jvm", "java", "jit"));
+        System.out.println(byLength);
+
+        TreeSet<String> byLengthThenName =
+                new TreeSet<>(Comparator.comparingInt(String::length).thenComparing(Comparator.naturalOrder()));
+        byLengthThenName.addAll(List.of("heap", "gc", "jvm", "java", "jit"));
+        System.out.println(byLengthThenName);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">false 0
+2 1 [1.0]
+true false
+true false [Java] true
+[gc, jvm, heap]
+[gc, jit, jvm, heap, java]</code></pre>
+<p>첫 줄부터 보자. <code>BigDecimal</code>의 <code>equals</code>는 값과 소수 자릿수(scale)가 모두 같아야 참이라서 1.0과 1.00은 다르다. 반면 <code>compareTo</code>는 수치만 비교하므로 0을 돌려준다. 그 결과 같은 두 객체를 넣었는데 <code>HashSet</code>의 크기는 2이고 <code>TreeSet</code>의 크기는 1이다. <code>TreeSet</code>에는 먼저 들어온 1.0만 남았다. 세 번째 줄에서 <code>TreeSet</code>은 넣은 적 없는 1.000을 "들어 있다"고 답하고 <code>HashSet</code>은 "없다"고 답한다. <code>Comparable</code>의 API 문서는 이런 관계를 가리켜 자연 순서가 equals와 일관되지 않다(inconsistent with equals)고 부르고, 그 예로 바로 <code>BigDecimal</code>을 든다.</p>
+<p>네 번째 줄은 이 성질을 일부러 이용한 경우다. 대소문자를 무시하는 비교자를 주면 <code>"Java"</code>와 <code>"JAVA"</code>가 같은 요소로 취급되어 두 번째 <code>add</code>가 <code>false</code>가 되고, <code>contains("java")</code>가 참이 된다. 다섯 번째 줄은 같은 성질이 버그가 되는 경우다. 길이만 비교하는 비교자를 주었더니 길이가 같은 <code>"java"</code>와 <code>"jit"</code>이 각각 <code>"heap"</code>, <code>"jvm"</code>과 같은 요소로 취급되어 조용히 버려졌다. 예외도 경고도 없다. 여섯 번째 줄처럼 길이가 같을 때 다시 사전순으로 비교하게 해서, 서로 다른 요소에 대해 0이 나오지 않도록 비교자를 끝까지 써 주어야 한다.</p>
+<aside class="note"><code>TreeSet</code>에 줄 비교자를 만들 때는 "이 비교자가 0을 돌려주는 두 요소를 하나로 합쳐도 되는가"를 스스로 물어본다. 답이 "아니오"라면 구분에 필요한 기준을 <code>thenComparing</code>으로 덧붙인다.</aside>
+<p>타입 검사가 일어나는 시점도 해시 계열과 다르다. <code>TreeSet</code>의 타입 매개변수 <code>E</code>에는 <code>Comparable</code>이어야 한다는 제한이 없다. 비교자를 따로 받는 생성자가 있으므로 그런 제한을 걸 수 없기 때문이다. 그래서 <code>Comparable</code>을 구현하지 않은 클래스를 비교자 없이 넣는 코드는 컴파일을 통과하고, 실행 중 첫 <code>add</code>에서 예외가 난다. OpenJDK 21의 <code>TreeMap</code>은 비어 있는 상태에서 첫 키를 받을 때도 그 키를 자기 자신과 비교해 타입을 검사하기 때문에 요소가 하나뿐이어도 예외가 발생한다.</p>
+<pre><code class="language-java">class Box {
+    int v;
+    Box(int v) { this.v = v; }
+}
+
+Set<Box> boxes = new TreeSet<>();
+boxes.add(new Box(1));
+// java.lang.ClassCastException: class Box cannot be cast to class java.lang.Comparable (이하 모듈 정보)</code></pre>
+<p><code>null</code>의 취급도 다르다. <code>HashSet</code>은 <code>null</code> 요소를 하나 허용한다. <code>null</code>의 해시를 0으로 치므로 0번 버킷에 들어간다. 자연 순서를 쓰는 <code>TreeSet</code>은 <code>null.compareTo(...)</code>를 호출할 수 없으므로 <code>add(null)</code>뿐 아니라 <code>contains(null)</code>에서도 <code>NullPointerException</code>을 던진다. <code>Comparator.nullsFirst</code>처럼 <code>null</code>을 다룰 줄 아는 비교자를 준 경우에만 넣을 수 있다.</p>
+
+<h3>TreeSet 3 — 정렬된 구조만 할 수 있는 일</h3>
+<p><code>TreeSet</code>이 <code>HashSet</code>보다 느린데도 필요한 이유는 정렬 순서 위에서만 답할 수 있는 질문이 있기 때문이다. <code>NavigableSet</code> 인터페이스가 그 질문들을 메서드로 제공한다.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class TreeNavMain {
+    public static void main(String[] args) {
+        TreeSet<Integer> s = new TreeSet<>(List.of(40, 10, 50, 30, 20));
+        System.out.println(s + " first=" + s.first() + " last=" + s.last());
+        System.out.println("floor(35)=" + s.floor(35) + " ceiling(35)=" + s.ceiling(35));
+        System.out.println("floor(30)=" + s.floor(30) + " lower(30)=" + s.lower(30)
+                + " ceiling(30)=" + s.ceiling(30) + " higher(30)=" + s.higher(30));
+        System.out.println("lower(10)=" + s.lower(10) + " higher(50)=" + s.higher(50));
+        System.out.println("headSet(30)=" + s.headSet(30) + " tailSet(30)=" + s.tailSet(30));
+
+        SortedSet<Integer> view = s.subSet(20, 45);     // 20 이상 45 미만
+        System.out.println("view=" + view);
+        s.add(25);
+        s.remove(40);
+        System.out.println("원본 변경 뒤 view=" + view);
+        view.add(33);
+        System.out.println("view.add(33) 뒤 원본=" + s);
+        try {
+            view.add(45);
+        } catch (IllegalArgumentException e) {
+            System.out.println(e);
+        }
+        System.out.println(s.descendingSet() + " pollFirst=" + s.pollFirst() + " -> " + s);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[10, 20, 30, 40, 50] first=10 last=50
+floor(35)=30 ceiling(35)=40
+floor(30)=30 lower(30)=20 ceiling(30)=30 higher(30)=40
+lower(10)=null higher(50)=null
+headSet(30)=[10, 20] tailSet(30)=[30, 40, 50]
+view=[20, 30, 40]
+원본 변경 뒤 view=[20, 25, 30]
+view.add(33) 뒤 원본=[10, 20, 25, 30, 33, 50]
+java.lang.IllegalArgumentException: key out of range
+[50, 33, 30, 25, 20, 10] pollFirst=10 -> [20, 25, 30, 33, 50]</code></pre>
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>돌려주는 것</th><th>경계값 포함</th><th>없으면</th></tr></thead><tbody>
+<tr><td><code>lower(x)</code></td><td>x보다 작은 요소 중 가장 큰 것</td><td>x 자신은 제외</td><td><code>null</code></td></tr>
+<tr><td><code>floor(x)</code></td><td>x 이하인 요소 중 가장 큰 것</td><td>x 자신 포함</td><td><code>null</code></td></tr>
+<tr><td><code>ceiling(x)</code></td><td>x 이상인 요소 중 가장 작은 것</td><td>x 자신 포함</td><td><code>null</code></td></tr>
+<tr><td><code>higher(x)</code></td><td>x보다 큰 요소 중 가장 작은 것</td><td>x 자신은 제외</td><td><code>null</code></td></tr>
+</tbody></table></div>
+<p>이 연산들은 트리를 루트에서 한 번 내려가는 것으로 끝난다. <code>ceiling(35)</code>를 예로 들면, 현재 노드가 35 이상이면 그 노드를 후보로 기억하고 더 작은 후보를 찾아 왼쪽으로 내려가고, 35보다 작으면 오른쪽으로 내려간다. 더 내려갈 곳이 없으면 마지막으로 기억한 후보가 답이다. 비교 횟수가 트리 높이를 넘지 않으므로 O(log n)이다. <code>first()</code>와 <code>last()</code>는 각각 왼쪽 끝, 오른쪽 끝까지 내려가면 된다.</p>
+<p><code>headSet</code>, <code>tailSet</code>, <code>subSet</code>이 돌려주는 것은 요소를 복사한 새 셋이 아니라 원본의 일부 구간을 보여 주는 뷰다. 출력에서 원본에 25를 넣고 40을 지우자 뷰의 내용이 따라 바뀌었고, 뷰에 33을 넣자 원본에 들어갔다. 뷰는 자기 구간 밖의 요소를 받지 않으므로 45를 넣으려 하면 <code>IllegalArgumentException</code>이 난다. 인자가 하나나 둘인 기본 형태는 시작 값을 포함하고 끝 값을 제외한다. 포함 여부를 직접 정하려면 <code>headSet(30, true)</code>처럼 <code>boolean</code>을 함께 받는 <code>NavigableSet</code>의 메서드를 쓴다. <code>descendingSet()</code>도 역순 뷰이고, <code>pollFirst()</code>와 <code>pollLast()</code>는 양 끝 요소를 꺼내면서 지운다.</p>
+<p>해시 테이블은 이런 질문에 답할 수 없다. 해시 함수의 목적이 요소를 버킷에 고르게 흩는 것이어서, 값이 이웃한 두 요소가 어느 버킷에 가 있는지에는 아무 규칙이 없다. "35 이상인 것 중 가장 작은 값"을 <code>HashSet</code>에서 구하려면 모든 요소를 훑는 O(n) 말고는 방법이 없다. 같은 것인지만 물을 때는 해시가, 크기 관계를 물을 때는 정렬된 트리가 필요하다는 구분은 데이터베이스 인덱스에서도 똑같이 나타난다. MySQL 매뉴얼은 해시 인덱스가 <code>=</code>와 <code><=></code> 같은 동등 비교에만 쓰이고 범위를 찾는 <code><</code> 같은 연산이나 <code>ORDER BY</code>에는 쓰일 수 없으며, B-트리 인덱스는 <code>=</code>, <code>></code>, <code><</code>, <code>BETWEEN</code> 등에 쓰일 수 있다고 설명한다.</p>
+
+<h3>예제 — 집합 연산과 구현체 고르기</h3>
+<p>셋은 수학의 집합을 본뜬 것이므로 합집합, 교집합, 차집합을 <code>Collection</code>의 일괄 연산으로 바로 구할 수 있다. 월요일과 화요일 스터디에서 다룬 주제를 예로 든다.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class SetOpsMain {
+    public static void main(String[] args) {
+        Set<String> monday = new TreeSet<>(List.of("gc", "heap", "jit", "stack"));
+        Set<String> tuesday = new TreeSet<>(List.of("heap", "stack", "thread"));
+
+        Set<String> union = new TreeSet<>(monday);
+        union.addAll(tuesday);                       // 합집합
+        Set<String> both = new TreeSet<>(monday);
+        both.retainAll(tuesday);                     // 교집합
+        Set<String> onlyMonday = new TreeSet<>(monday);
+        onlyMonday.removeAll(tuesday);               // 차집합
+
+        System.out.println("합집합 = " + union);
+        System.out.println("교집합 = " + both);
+        System.out.println("차집합 = " + onlyMonday);
+        System.out.println(monday.containsAll(both) + " " + Collections.disjoint(onlyMonday, tuesday));
+
+        Set<String> h = new HashSet<>(List.of("b", "a", "c"));
+        Set<String> t = new TreeSet<>(List.of("a", "b", "c"));
+        Set<String> l = new LinkedHashSet<>(List.of("c", "b", "a"));
+        System.out.println(h.equals(t) + " " + t.equals(l) + " " + (h.hashCode() == l.hashCode()));
+
+        List<String> visits = List.of("/home", "/cart", "/home", "/pay", "/cart");
+        System.out.println(new ArrayList<>(new LinkedHashSet<>(visits)));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">합집합 = [gc, heap, jit, stack, thread]
+교집합 = [heap, stack]
+차집합 = [gc, jit]
+true true
+true true true
+[/home, /cart, /pay]</code></pre>
+<p><code>addAll</code>, <code>retainAll</code>, <code>removeAll</code>은 새 셋을 만들어 돌려주는 것이 아니라 호출한 셋 자신을 바꾸고, 바뀌었는지를 <code>boolean</code>으로 돌려준다. 그래서 원본을 보존하려면 예제처럼 복사본을 만든 뒤 호출한다. 다섯 번째 출력 줄은 앞에서 본 계약을 확인해 준다. 구현체와 순회 순서가 서로 다른 세 셋이 내용이 같으므로 <code>equals</code>로 같고 해시 코드도 같다. 마지막 줄은 실무에서 자주 쓰는 관용구다. 리스트를 <code>LinkedHashSet</code>에 통과시키면 처음 나온 순서를 유지한 채 중복이 제거된다.</p>
+<p>일괄 연산의 비용은 인자로 넘기는 컬렉션의 종류에 따라 크게 달라진다. OpenJDK 21에서 <code>retainAll(c)</code>는 자신의 요소를 하나씩 돌면서 <code>c.contains(요소)</code>를 호출한다. <code>c</code>가 셋이면 그 호출이 O(1) 또는 O(log n)이지만 <code>c</code>가 리스트이면 호출마다 O(m)이어서 전체가 O(n·m)이 된다. <code>removeAll(c)</code>도 자신의 크기가 <code>c</code>보다 크지 않을 때는 같은 방식으로 <code>c.contains</code>를 호출한다. 큰 데이터에 집합 연산을 할 때는 양쪽 모두 셋으로 만들어 두는 것이 안전하다.</p>
+<h4>요소 하나에 딸린 메모리</h4>
+<p>세 구현체는 요소마다 노드 객체를 하나씩 만든다. 그 크기를 계산으로 추측하는 대신 직접 재 보았다. <code>Integer</code> 100,000개를 <code>HashSet</code>에, 200,000개를 <code>LinkedHashSet</code>에, 300,000개를 <code>TreeSet</code>에 넣은 뒤 클래스 히스토그램(<code>jcmd</code>의 <code>GC.class_histogram</code>과 같은 진단 명령)을 출력한 결과에서 노드 클래스 줄만 옮기면 다음과 같다.</p>
+<pre data-label="클래스 히스토그램 일부 (Temurin 21.0.13, 기본 옵션)"><code class="language-text"> num     #instances         #bytes  class name (module)
+   1:        300162       12006480  java.util.TreeMap$Entry (java.base@21.0.13)
+   3:        200015        8000600  java.util.LinkedHashMap$Entry (java.base@21.0.13)
+   4:        101401        3244832  java.util.HashMap$Node (java.base@21.0.13)</code></pre>
+<p>인스턴스 수가 넣은 개수보다 조금 많은 것은 JVM 자신도 이 클래스들을 쓰기 때문이다. 바이트 수를 인스턴스 수로 나누면 <code>HashMap$Node</code>는 32바이트, <code>LinkedHashMap$Entry</code>와 <code>TreeMap$Entry</code>는 40바이트다. <code>LinkedHashMap$Entry</code>는 <code>before</code>·<code>after</code> 참조 두 개만큼 크고, <code>TreeMap$Entry</code>는 해시값 대신 <code>left</code>·<code>right</code>·<code>parent</code>·<code>color</code>를 가진다. 이 숫자는 HotSpot이 참조를 4바이트로 압축하는 기본 설정에서의 값이다. 같은 프로그램을 <code>-XX:-UseCompressedOops</code>로 실행하면 각각 40, 56, 56바이트로 늘어난다.</p>
+<p>해시 계열은 여기에 버킷 배열이 더해진다. 배열 한 칸은 참조 하나이고, 뒤에서 볼 규칙에 따라 버킷 수는 요소 수의 약 1.3배에서 2.7배 사이를 오간다. <code>TreeSet</code>은 배열 없이 노드만으로 이루어진다. 어느 쪽이든 <code>ArrayList</code>가 요소당 배열의 참조 한 칸만 쓰는 것과 비교하면 훨씬 무겁다. 그리고 4회차에서 본 것처럼 노드가 힙 여기저기에 흩어져 있으므로 순회할 때 참조를 따라 건너뛰는 비용도 따른다. 셋은 "들어 있는가"를 빨리 답하는 대가로 메모리와 지역성을 내주는 구조다.</p>
+<h4>구현체를 고르는 기준</h4>
+<div class="table-wrap"><table><thead><tr><th>항목</th><th><code>HashSet</code></th><th><code>LinkedHashSet</code></th><th><code>TreeSet</code></th></tr></thead><tbody>
+<tr><td>내부 구조</td><td>해시 테이블</td><td>해시 테이블 + 이중 연결 리스트</td><td>레드-블랙 트리</td></tr>
+<tr><td><code>add</code>·<code>contains</code>·<code>remove</code></td><td>평균 O(1)</td><td>평균 O(1)</td><td>O(log n) 보장</td></tr>
+<tr><td>순회 순서</td><td>보장 없음</td><td>삽입 순서</td><td>정렬 순서</td></tr>
+<tr><td>순회 시간</td><td>요소 수 + 버킷 수에 비례</td><td>요소 수에 비례</td><td>요소 수에 비례</td></tr>
+<tr><td>요소가 갖춰야 할 것</td><td><code>equals</code>, <code>hashCode</code></td><td><code>equals</code>, <code>hashCode</code></td><td><code>Comparable</code> 또는 <code>Comparator</code></td></tr>
+<tr><td>"같다"의 기준</td><td><code>equals</code></td><td><code>equals</code></td><td>비교 결과 0</td></tr>
+<tr><td><code>null</code> 요소</td><td>하나 허용</td><td>하나 허용</td><td>자연 순서에서는 불가</td></tr>
+<tr><td>노드 크기(위 측정)</td><td>32바이트</td><td>40바이트</td><td>40바이트</td></tr>
+</tbody></table></div>
+<aside class="keyidea"><span>이 장의 핵심</span><p>세 구현체는 "중복 없음"이라는 같은 계약을 서로 다른 자료 구조로 지킨다. 순서가 필요 없으면 <code>HashSet</code>, 넣은 순서가 결과에 드러나야 하면 <code>LinkedHashSet</code>, 정렬된 순서나 "가장 가까운 값", "구간" 같은 질문이 필요하면 <code>TreeSet</code>이다. 순서라는 추가 기능은 공짜가 아니어서 <code>LinkedHashSet</code>은 노드당 참조 두 개를, <code>TreeSet</code>은 연산마다 log n번의 비교를 값으로 치른다.</p></aside>
+
+<h3>최적화 1 — 로드 팩터와 리사이즈</h3>
+<p>이제 처음에 남겨 둔 두 번째 질문으로 돌아간다. 버킷이 16개로 고정된 해시 테이블에 요소 16,000개를 넣으면 해시 함수가 아무리 좋아도 버킷 하나에 평균 1,000개가 매달린다. 탐색 범위를 버킷 하나로 줄여도 그 버킷이 길면 소용이 없다. 해시 테이블의 탐색 비용은 요소 수가 아니라 <b>요소 수 ÷ 버킷 수</b>에 비례하고, O(1)을 지키려면 이 비율이 일정 수준을 넘지 않도록 버킷 수가 요소 수를 따라 늘어나야 한다.</p>
+<p><code>HashMap</code>의 API 문서는 이를 두 용어로 설명한다. 용량(capacity)은 해시 테이블의 버킷 수이고, 로드 팩터(load factor)는 용량을 자동으로 늘리기 전에 테이블이 얼마나 차도록 둘 것인지를 나타내는 값이다. 엔트리 수가 로드 팩터와 현재 용량의 곱을 넘으면 테이블을 다시 구성(rehash)해 버킷 수를 약 두 배로 만든다. 기본 용량은 16, 기본 로드 팩터는 0.75이므로 처음 임계값(threshold)은 16 × 0.75 = 12다. 리플렉션으로 내부 배열의 길이를 읽어 이 과정을 직접 관찰해 보자.</p>
+<pre><code class="language-java">import java.lang.reflect.Field;
+import java.util.*;
+
+public class TableWatchMain {
+    // HashSet -> HashMap -> table 배열의 길이. 아직 배열이 없으면 0
+    static int capacity(HashSet<?> set) throws Exception {
+        Field mapField = HashSet.class.getDeclaredField("map");
+        mapField.setAccessible(true);
+        Field tableField = HashMap.class.getDeclaredField("table");
+        tableField.setAccessible(true);
+        Object[] table = (Object[]) tableField.get(mapField.get(set));
+        return table == null ? 0 : table.length;
+    }
+
+    static void fill(String name, HashSet<Integer> set, int count) throws Exception {
+        int before = capacity(set);
+        System.out.println(name + ": 처음 capacity=" + before);
+        for (int i = 1; i <= count; i++) {
+            set.add(i);
+            int now = capacity(set);
+            if (now != before) {
+                System.out.println("  " + i + "번째 add에서 " + before + " -> " + now);
+                before = now;
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        fill("new HashSet<>()", new HashSet<>(), 100);
+        fill("new HashSet<>(100)", new HashSet<>(100), 100);
+        fill("HashSet.newHashSet(100)", HashSet.newHashSet(100), 100);
+
+        HashSet<Integer> shrink = new HashSet<>();
+        for (int i = 1; i <= 100; i++) shrink.add(i);
+        for (int i = 1; i <= 100; i++) shrink.remove(i);
+        System.out.println("전부 remove한 뒤: size=" + shrink.size() + ", capacity=" + capacity(shrink));
+        shrink.clear();
+        System.out.println("clear() 뒤: capacity=" + capacity(shrink));
+    }
+}</code></pre>
+<pre data-label="실행: java --add-opens java.base/java.util=ALL-UNNAMED TableWatchMain"><code class="language-text">new HashSet<>(): 처음 capacity=0
+  1번째 add에서 0 -> 16
+  13번째 add에서 16 -> 32
+  25번째 add에서 32 -> 64
+  49번째 add에서 64 -> 128
+  97번째 add에서 128 -> 256
+new HashSet<>(100): 처음 capacity=0
+  1번째 add에서 0 -> 128
+  97번째 add에서 128 -> 256
+HashSet.newHashSet(100): 처음 capacity=0
+  1번째 add에서 0 -> 256
+전부 remove한 뒤: size=0, capacity=256
+clear() 뒤: capacity=256</code></pre>
+<aside class="note">JDK 내부 필드를 리플렉션으로 읽는 것은 관찰을 위한 실험일 뿐이다. 모듈 시스템이 <code>java.util</code> 패키지의 내부를 열어 주지 않으므로 <code>--add-opens</code> 옵션 없이는 <code>InaccessibleObjectException</code>이 난다. 필드 이름과 구조는 OpenJDK 21의 것이고 명세가 보장하지 않는다.</aside>
+<p>첫 번째 묶음에서 읽을 것이 셋 있다. 먼저, 빈 <code>HashSet</code>은 버킷 배열을 갖고 있지 않다. 배열은 첫 <code>add</code>에서 만들어진다. 만들기만 하고 쓰지 않는 셋이 16칸짜리 배열을 낭비하지 않게 하려는 구현이다. 다음으로, 리사이즈는 12번째가 아니라 13번째 <code>add</code>에서 일어난다. <code>HashMap</code>은 노드를 추가한 다음 <code>++size > threshold</code>를 검사하므로, 크기가 임계값을 "넘는" 순간에 테이블을 늘린다. 마지막으로, 용량은 16, 32, 64, 128, 256으로 매번 두 배가 되고 임계값도 12, 24, 48, 96, 192로 함께 두 배가 된다.</p>
+<h4>리사이즈 한 번에 일어나는 일</h4>
+<p>리사이즈는 두 배 길이의 새 배열을 만들고 모든 노드를 새 배열로 옮기는 작업이다. 노드 객체를 새로 만들지는 않고 기존 노드의 <code>next</code> 참조를 고쳐 새 배열의 칸에 다시 매단다. 이때 요소의 <code>hashCode()</code>를 다시 부르지 않는다. 노드에 저장해 둔 <code>hash</code> 값을 쓰면 되기 때문이다.</p>
+<p>새 버킷을 정하는 방법에는 용량이 2의 거듭제곱이라는 조건이 다시 쓰인다. 버킷 번호는 <code>hash & (capacity - 1)</code>이었다. 용량이 16일 때 마스크는 이진수 <code>01111</code>이고 32일 때는 <code>11111</code>이다. 두 마스크의 차이는 비트 하나, 값으로는 16에 해당하는 자리뿐이다. 그러므로 어떤 노드의 해시에서 그 비트가 0이면 새 버킷 번호는 옛 번호와 같고, 1이면 옛 번호에 16을 더한 값이 된다. 구현은 버킷마다 노드를 따라가면서 <code>(hash & oldCap) == 0</code>인 것과 아닌 것으로 두 줄을 만들어, 한 줄은 원래 번호 j에, 다른 줄은 j + oldCap에 매단다. 앞에서 본 33, 1, 17의 예를 이 규칙으로 추적하면 다음과 같다.</p>
+<pre class="diagram">
+ 리사이즈 전 (capacity 16)                리사이즈 후 (capacity 32)
+ [1]  ─▶ 33 ─▶ 1 ─▶ 17                   [1]  ─▶ 33 ─▶ 1
+ [2]  ─▶ 2                               [2]  ─▶ 2
+                                         [17] ─▶ 17
+
+   hash    이진수     hash & 16     새 버킷
+    33     100001        0          그대로 1번
+     1     000001        0          그대로 1번
+    17     010001       16          1 + 16 = 17번
+     2     000010        0          그대로 2번
+</pre>
+<x-visual id="java-mid2-08-resize-split" title="용량 16에서 32로 리사이즈할 때 한 버킷의 노드가 해시의 비트 하나에 따라 두 버킷으로 나뉘는 과정" kind="단계별 다이어그램" ratio="16:9">
+<x-hint>리사이즈가 모든 요소를 무작위로 재배치하는 것이 아니라, 버킷마다 노드를 제자리 줄과 옛 용량만큼 떨어진 줄 둘로 가르는 작업이라는 점을 보여 준다.</x-hint>
+<x-prompt>깔끔한 기술 다이어그램, 흰 배경, 위아래 두 단 구도. 윗단 제목 "리사이즈 전: 버킷 16개". 가로 16칸 배열이 있고 1번 칸에서 아래로 노드 세 개가 사슬처럼 이어진다. 노드에는 차례로 "33", "1", "17"이 적혀 있다. 2번 칸 아래에는 노드 "2" 하나. 윗단과 아랫단 사이에 굵은 아래 화살표와 라벨 "hash의 16 자리 비트로 가른다". 아랫단 제목 "리사이즈 후: 버킷 32개". 가로 32칸 배열이 있고 1번 칸 아래에 노드 "33", "1"이 이어지고, 2번 칸 아래에 노드 "2", 17번 칸 아래에 노드 "17"이 있다. 윗단의 "17" 노드에서 아랫단 17번 칸으로 향하는 주황색 곡선 화살표에 라벨 "비트가 1이면 +16". 윗단의 "33", "1" 노드에서 아랫단 1번 칸으로 향하는 파란 화살표에 라벨 "비트가 0이면 제자리". 오른쪽 아래 구석에 작은 메모 "hashCode()는 다시 부르지 않는다".</x-prompt>
+<x-caption>용량이 두 배가 되면 버킷 번호 계산에 비트 하나가 더 쓰인다. 그 비트가 0인 노드는 제자리에, 1인 노드는 옛 용량만큼 뒤의 버킷으로 간다.</x-caption>
+</x-visual>
+<p>줄 안에서 노드의 상대 순서는 유지된다. 그래서 리사이즈 뒤의 순회 결과가 <code>[33, 1, 2, ..., 17]</code>이 된 것이다. 이 방식의 이점은 한 버킷에 몰려 있던 노드가 평균적으로 절반씩 나뉜다는 점이다. 용량을 16에서 17로 한 칸만 늘렸다면 모든 요소의 버킷 번호를 처음부터 다시 계산해야 하고, 비트 AND 대신 나머지 연산을 써야 한다. 용량을 2의 거듭제곱으로 유지하는 설계가 인덱스 계산과 리사이즈를 모두 단순하게 만든다. 대신 버킷 번호가 해시의 아래쪽 비트만으로 정해지는 약점이 생기는데, 앞에서 본 <code>h ^ (h >>> 16)</code>이 위쪽 비트를 아래로 접어 넣어 그 약점을 덜어 준다.</p>
+<h4>비싼 리사이즈가 있는데도 add가 O(1)인 이유</h4>
+<p>리사이즈 한 번은 모든 노드를 옮기므로 O(n)이다. 그런데도 <code>add</code>를 O(1)이라고 부를 수 있는 이유는 3회차에서 배열 리스트의 확장을 분석할 때와 같다. 위 출력에서 요소 100개를 넣는 동안 리사이즈는 13, 25, 49, 97번째에 일어났고, 그때마다 옮긴 노드는 13 + 25 + 49 + 97 = 184개다. 요소 100개에 대해 옮긴 횟수가 200을 넘지 않는다. 용량이 매번 두 배가 되므로 리사이즈 간격도 두 배씩 벌어지고, 옮긴 횟수의 총합은 넣은 요소 수의 두 배 안팎에 머문다. 총비용을 호출 횟수로 나눈 분할 상환(amortized) 비용이 상수라는 뜻이다.</p>
+<p>평균이 상수라는 것과 매번 상수라는 것은 다르다. 요소가 수백만 개인 셋에서 리사이즈에 걸린 그 한 번의 <code>add</code>는 큰 배열을 새로 할당하고 모든 노드를 건드려야 하므로 다른 호출보다 훨씬 오래 걸린다. 옮기는 동안에는 옛 배열과 새 배열이 함께 살아 있고, 옛 배열은 그 뒤에 가비지가 된다. 응답 시간이 고르게 나와야 하는 코드라면 이 순간을 미리 없애는 편이 낫다.</p>
+<p>로드 팩터 0.75라는 값에 대해 API 문서는 시간과 공간 비용 사이의 좋은 절충이라고만 설명한다. 값을 높이면 같은 요소 수에 버킷을 덜 써서 메모리는 줄지만 한 버킷에 여러 노드가 매달릴 가능성이 커져 탐색이 느려지고, 낮추면 그 반대가 된다. 해시가 고르게 흩어진다면 버킷당 평균 노드 수는 로드 팩터를 넘지 않으므로, 0.75에서는 버킷 하나에 평균 0.75개 이하가 들어 있는 상태가 유지된다. 특별한 측정 근거가 없다면 기본값을 바꿀 이유는 없다.</p>
+
+<h3>최적화 2 — 초기 용량, 줄지 않는 테이블, 최악의 경우</h3>
+<p>넣을 요소 수를 미리 안다면 처음부터 충분한 크기의 테이블을 만들어 리사이즈를 없앨 수 있다. 그런데 여기에 흔한 실수가 있다. <code>TableWatchMain</code>의 두 번째 묶음을 다시 보자. <code>new HashSet<>(100)</code>에 100개를 넣었는데 97번째에서 리사이즈가 일어났다.</p>
+<p>생성자의 인자는 "담을 요소 수"가 아니라 "초기 용량", 즉 버킷 수다. 게다가 용량은 2의 거듭제곱이어야 하므로 100은 그 이상인 가장 작은 2의 거듭제곱 128로 올림된다. 임계값은 128 × 0.75 = 96이고, 97번째 요소가 이를 넘는다. 요소 100개를 리사이즈 없이 담으려면 버킷 수가 100 ÷ 0.75 ≈ 133.3보다 커야 한다. API 문서의 표현으로는 초기 용량이 최대 엔트리 수를 로드 팩터로 나눈 값보다 크면 리해시가 일어나지 않는다.</p>
+<p>이 나눗셈을 매번 직접 하는 것은 번거롭고 틀리기 쉬워서, Java 19에 정적 팩터리 <code>HashSet.newHashSet(int numElements)</code>가 추가되었다. 인자는 예상 요소 수이고, 메서드가 그 수를 0.75로 나눠 올림한 값을 초기 용량으로 넘긴다. 100을 주면 134가 되고 이것이 256으로 올림되어 임계값 192인 테이블이 만들어진다. 세 번째 묶음에서 리사이즈가 한 번도 일어나지 않은 이유다. <code>LinkedHashSet.newLinkedHashSet(int)</code>도 같은 버전에 추가되었다.</p>
+<div class="table-wrap"><table><thead><tr><th>만드는 방법</th><th>첫 테이블 크기</th><th>임계값</th><th>100개를 넣는 동안의 리사이즈</th></tr></thead><tbody>
+<tr><td><code>new HashSet<>()</code></td><td>16</td><td>12</td><td>4번 (13, 25, 49, 97번째)</td></tr>
+<tr><td><code>new HashSet<>(100)</code></td><td>128</td><td>96</td><td>1번 (97번째)</td></tr>
+<tr><td><code>HashSet.newHashSet(100)</code></td><td>256</td><td>192</td><td>없음</td></tr>
+<tr><td><code>new HashSet<>(요소 100개인 컬렉션)</code></td><td>256</td><td>192</td><td>없음</td></tr>
+</tbody></table></div>
+<p>표의 마지막 줄처럼 다른 컬렉션을 넘겨 만드는 생성자는 원본의 크기를 보고 알맞은 용량을 스스로 계산한다(OpenJDK 21에서 확인). 그러므로 이미 있는 리스트로 셋을 만들 때는 빈 셋을 만들어 <code>addAll</code>하는 것보다 생성자에 바로 넘기는 편이 간단하고 리사이즈도 없다.</p>
+<p>반대 방향의 함정도 있다. 실행 결과의 마지막 두 줄을 보면 요소를 전부 지워도, <code>clear()</code>를 호출해도 테이블은 256칸 그대로다. OpenJDK의 <code>HashMap</code>은 테이블을 늘리기만 하고 줄이지 않는다. 한때 요소가 수백만 개였던 셋은 지금 비어 있어도 수백만 칸짜리 배열을 계속 붙들고 있고, <code>HashSet</code>의 순회는 버킷 수에도 비례하므로 요소 몇 개를 도는 데도 그 배열을 전부 훑는다. API 문서가 순회 성능이 중요하다면 초기 용량을 너무 크게(또는 로드 팩터를 너무 작게) 잡지 말라고 경고하는 것도 같은 이유다. 크게 부풀었던 셋을 오래 재사용할 때는 비우는 대신 새 셋을 만들어 교체하는 것이 낫다.</p>
+<p>마지막으로 최악의 경우를 짚어 둔다. 리사이즈는 요소가 버킷에 고르게 흩어진다는 전제에서만 효과가 있다. 모든 요소의 <code>hashCode()</code>가 같은 값이면 버킷을 아무리 늘려도 전부 한 버킷에 모인다. OpenJDK의 <code>HashMap</code>은 이 경우의 피해를 줄이려고, 이미 노드 8개가 매달린 버킷에 노드가 하나 더 들어오고 테이블이 64칸 이상이면 그 버킷의 연결 리스트를 레드-블랙 트리로 바꾼다. 테이블이 64칸보다 작을 때는 트리로 바꾸는 대신 리사이즈를 한다. API 문서는 같은 해시 코드를 가진 키가 많으면 어떤 해시 테이블이든 느려지며, 키가 <code>Comparable</code>이면 그 비교 순서를 이용해 영향을 줄일 수 있다고 적는다. 이 구조의 자세한 내용은 맵을 다루는 다음 회차의 몫이다. 여기서는 그것이 나쁜 해시 함수를 구제해 주는 안전망일 뿐 좋은 <code>hashCode</code>를 대신하지는 못한다는 점만 기억하면 된다.</p>
+
+<h3>흔한 오해와 함정</h3>
+<h4>셋에 넣은 객체의 값을 바꾸면</h4>
+<p>가장 위험한 함정은 셋에 들어 있는 객체의 필드를 바꾸는 것이다. 다음 코드는 예외 하나 없이 셋의 계약을 깨뜨린다.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class MutateMain {
+    static final class Cart {
+        String owner;
+        Cart(String owner) { this.owner = owner; }
+
+        @Override public boolean equals(Object o) { return o instanceof Cart c && owner.equals(c.owner); }
+        @Override public int hashCode() { return owner.hashCode(); }
+        @Override public String toString() { return "Cart(" + owner + ")"; }
+    }
+
+    public static void main(String[] args) {
+        Set<Cart> carts = new HashSet<>();
+        Cart cart = new Cart("kim");
+        carts.add(cart);
+
+        cart.owner = "lee";                                   // 셋에 들어 있는 채로 값을 바꾼다
+
+        System.out.println(carts);                            // 순회하면 보인다
+        System.out.println(carts.contains(cart));             // 같은 객체인데
+        System.out.println(carts.contains(new Cart("kim")));
+        System.out.println(carts.contains(new Cart("lee")));
+        System.out.println(carts.remove(cart));
+        System.out.println(carts.add(cart) + " " + carts);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[Cart(lee)]
+false
+false
+false
+false
+true [Cart(lee), Cart(lee)]</code></pre>
+<p>버킷 번호를 계산해 보면 원인이 드러난다. <code>"kim"</code>의 해시 코드는 106191이고 비트 섞기를 거친 값은 106190, 버킷은 14번이다. 노드는 14번 버킷에 매달렸고 노드의 <code>hash</code> 필드에는 106190이 저장되었다. 그 뒤 <code>owner</code>를 <code>"lee"</code>로 바꾸면 객체의 <code>hashCode()</code>는 107020을 돌려주고 이 값의 버킷은 13번이다. 그러나 노드는 여전히 14번 버킷에 있다.</p>
+<p>이제 세 번의 <code>contains</code>가 모두 실패하는 이유를 하나씩 설명할 수 있다. 바뀐 객체 자신으로 찾으면 13번 버킷을 보는데 그곳은 비어 있다. <code>"lee"</code>인 새 객체로 찾아도 마찬가지로 13번을 본다. <code>"kim"</code>인 새 객체로 찾으면 14번 버킷에서 노드를 만나고 저장된 해시값도 일치하지만, 마지막 <code>equals</code>에서 <code>"kim"</code>과 <code>"lee"</code>를 비교하게 되어 거짓이 된다. 같은 이유로 <code>remove</code>도 실패한다. 그 객체는 순회하면 보이지만 찾을 수도 지울 수도 없는 상태가 된다. 다시 <code>add</code>하면 13번 버킷이 비어 있으므로 새 노드가 만들어지고, 같은 객체가 셋에 두 번 들어간다.</p>
+<p><code>Set</code>의 API 문서는 요소가 셋에 들어 있는 동안 <code>equals</code> 비교에 영향을 주는 방식으로 값이 바뀌면 셋의 동작이 규정되지 않는다고 경고한다. <code>TreeSet</code>도 사정이 같다. 비교에 쓰이는 필드를 바꾸면 그 노드는 정렬 순서에 맞지 않는 자리에 남게 되고, 탐색이 그 노드에 도달하지 못할 수 있다. 대책은 두 가지다. 셋에 넣을 클래스는 <code>equals</code>·<code>hashCode</code>·<code>compareTo</code>에 쓰이는 필드를 <code>final</code>로 두거나 레코드로 만들어 바뀔 수 없게 한다. 꼭 바꿔야 한다면 먼저 셋에서 꺼내고(<code>remove</code>), 값을 바꾼 뒤, 다시 넣는다.</p>
+<h4>그 밖의 오해</h4>
+<ul>
+<li><b>"HashSet의 순서는 무작위다" 또는 "정렬된다"</b> — 둘 다 아니다. 해시 코드, 버킷 수, 삽입 순서로 결정되는 값이지만 계약이 아니다. 순서가 필요하면 <code>LinkedHashSet</code>이나 <code>TreeSet</code>을 쓴다.</li>
+<li><b>"TreeSet도 equals로 중복을 가린다"</b> — 비교 결과가 0인지로 가린다. <code>equals</code>와 어긋나는 비교 기준을 주면 요소가 조용히 사라지거나, 없는 요소가 있다고 답한다.</li>
+<li><b>"new HashSet<>(n)이면 n개까지 리사이즈가 없다"</b> — 인자는 버킷 수다. 예상 요소 수를 줄 때는 <code>HashSet.newHashSet(n)</code>을 쓴다.</li>
+<li><b>"Set.of로 만든 셋도 HashSet처럼 쓸 수 있다"</b> — <code>Set.of</code>가 돌려주는 것은 수정할 수 없는 셋이다. <code>add</code>는 <code>UnsupportedOperationException</code>을 던지고, 만들 때 중복 요소를 주면 <code>IllegalArgumentException</code>, <code>null</code>을 주면 <code>NullPointerException</code>이 난다. 순회 순서는 정해져 있지 않으며 바뀔 수 있다고 문서에 적혀 있다. 실제로 OpenJDK 21에서 <code>Set.of("java", "jvm", "gc", "thread", "heap")</code>을 출력하는 프로그램을 두 번 실행했더니 한 번은 <code>[jvm, gc, java, thread, heap]</code>, 다른 한 번은 <code>[java, thread, heap, jvm, gc]</code>가 나왔다. 이 구현은 JVM이 시작될 때 정한 값으로 순회를 시작할 칸과 순회 방향을 정한다.</li>
+<li><b>"for-each로 돌면서 조건에 맞는 요소를 remove하면 된다"</b> — 순회 도중 셋의 구조를 직접 바꾸면 반복자가 <code>ConcurrentModificationException</code>을 던진다. 이 fail-fast 동작의 원리는 10회차에서 다룬다. 조건부 삭제에는 <code>removeIf</code>를 쓴다.</li>
+<li><b>"LinkedHashSet은 조회한 요소를 뒤로 보낸다"</b> — 그런 모드는 <code>LinkedHashMap</code>에만 있다. <code>LinkedHashSet</code>에서 <code>contains</code>는 순서를 바꾸지 않는다.</li>
+</ul>
+
+<h3>다른 곳에서 다시 만나는 구조</h3>
+<p>이 회차에서 본 구조는 셋만의 것이 아니다. <code>HashSet</code>, <code>LinkedHashSet</code>, <code>TreeSet</code>은 각각 <code>HashMap</code>, <code>LinkedHashMap</code>, <code>TreeMap</code>의 키 부분만 쓰는 껍데기였다. 다음 회차에서 맵을 배울 때 달라지는 것은 노드의 <code>value</code> 자리에 더미 객체 대신 실제 값이 들어간다는 점뿐이다. 버킷 선택, 리사이즈, 삽입 순서 리스트, 레드-블랙 트리는 그대로다.</p>
+<p>10회차에서는 이 회차에서 이름만 나온 두 주제를 다룬다. 하나는 세 구현체를 같은 방식으로 순회하게 해 주는 <code>Iterator</code>와 fail-fast 동작이고, 다른 하나는 <code>TreeSet</code>이 기대는 <code>Comparable</code>과 <code>Comparator</code>의 규약이다.</p>
+<p>동시성 쪽에서는 이 구현체들이 동기화되어 있지 않다는 점이 출발점이 된다. API 문서는 여러 스레드가 동시에 접근하고 그중 하나라도 셋을 수정한다면 외부에서 동기화해야 한다고 적는다. 리사이즈 도중의 테이블이나 회전 도중의 트리를 다른 스레드가 읽는 상황을 떠올리면 이유를 짐작할 수 있다. <code>Collections.synchronizedSet</code>으로 감싸는 방법, <code>ConcurrentHashMap.newKeySet()</code>, 정렬이 필요할 때의 <code>ConcurrentSkipListSet</code> 같은 대안이 있고, 이들이 어떻게 안전을 얻는지는 동시성을 다루는 권에서 본다.</p>
+<p>데이터베이스에서는 같은 선택이 인덱스의 모습으로 나타난다. 동등 비교만 빠르면 되는가, 범위와 정렬이 필요한가라는 질문은 해시 인덱스와 B-트리 계열 인덱스를 가르는 질문과 같다. 그리고 "넣은 뒤에 해시 코드가 바뀌면 찾지 못한다"는 성질은 JPA 엔티티의 <code>equals</code>·<code>hashCode</code>를 무엇으로 구현할지 고민할 때 다시 등장한다. 그때 필요한 판단 근거는 이 회차의 14번 버킷과 13번 버킷 이야기에 이미 들어 있다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>Set의 계약</dt><dd><code>equals</code>로 같은 요소를 둘 이상 담지 않는다. 순회 순서는 인터페이스가 아니라 구현체가 정하고, 셋끼리의 동등성과 해시 코드는 구현체·순서와 무관하게 내용으로 결정된다.</dd>
+<dt>HashSet = HashMap의 키</dt><dd>요소를 <code>HashMap</code>의 키로 넣고 값 자리에는 공유 더미 객체 <code>PRESENT</code>를 둔다. <code>add</code>는 <code>map.put(e, PRESENT) == null</code>이다.</dd>
+<dt>HashSet의 순회 순서</dt><dd>버킷 배열을 0번부터 훑은 순서다. 해시 코드, 버킷 수, 삽입 순서에 따라 결정되지만 보장되지 않으며 리사이즈로 바뀔 수 있다.</dd>
+<dt>LinkedHashSet</dt><dd>해시 테이블의 노드에 <code>before</code>·<code>after</code> 참조를 더해 삽입 순서 이중 연결 리스트를 함께 유지한다. 탐색은 해시로, 순회는 리스트로 한다.</dd>
+<dt>TreeSet과 레드-블랙 트리</dt><dd>정렬된 이진 탐색 트리에 요소를 넣고, 색 규칙과 회전으로 높이를 2·log₂(n+1) 이하로 유지한다. 그래서 <code>add</code>·<code>remove</code>·<code>contains</code>가 입력 순서와 무관하게 O(log n)이다.</dd>
+<dt>TreeSet의 "같다"</dt><dd><code>equals</code>가 아니라 <code>compareTo</code>/<code>compare</code>의 결과 0이다. 비교 기준이 <code>equals</code>와 어긋나면 <code>Set</code> 계약과 다른 동작이 나온다.</dd>
+<dt>로드 팩터와 리사이즈</dt><dd>요소 수가 용량 × 로드 팩터(기본 16 × 0.75 = 12)를 넘으면 버킷 수를 두 배로 늘리고, 각 노드는 해시의 비트 하나에 따라 제자리 또는 옛 용량만큼 뒤로 옮겨진다.</dd>
+<dt>초기 용량</dt><dd>생성자 인자는 요소 수가 아니라 버킷 수다. 예상 요소 수를 알면 <code>HashSet.newHashSet(n)</code>(Java 19+)으로 리사이즈를 없앤다. 테이블은 줄어들지 않는다.</dd>
+<dt>요소의 불변성</dt><dd>셋에 들어 있는 객체의 <code>equals</code>·<code>hashCode</code>·비교에 쓰이는 값을 바꾸면 그 요소는 찾을 수도 지울 수도 없게 된다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 다시 판단하면, 셋 구현체의 기본값은 <code>HashSet</code>이다. 다른 둘로 바꾸는 근거는 "순서가 결과에 드러나는가"다. 셋의 내용이 JSON 응답, 로그, 화면 목록, 테스트의 단언문처럼 사람이 보거나 비교하는 곳으로 나간다면 <code>HashSet</code>의 순서는 JDK 버전이나 요소 수에 따라 달라질 수 있으므로 <code>LinkedHashSet</code>이나 <code>TreeSet</code>으로 순서를 고정하는 편이 안전하다. 간헐적으로 실패하는 테스트의 원인이 해시 순서에 대한 무의식적 의존인 경우가 있다.</p>
+<p><code>TreeSet</code>은 정렬된 출력이 한 번 필요하다는 이유만으로 고를 구조는 아니다. 데이터를 다 모은 뒤 한 번 정렬해 보여 주면 되는 경우에는 <code>HashSet</code>에 모으고 마지막에 리스트로 옮겨 정렬하는 편이 단순하다. 삽입과 조회가 계속 섞이는 가운데 "지금 시점의 최솟값", "이 값 이상인 첫 요소", "이 구간의 요소"를 반복해서 물어야 할 때 <code>TreeSet</code>이 제값을 한다. 이때 비교자가 서로 다른 요소에 0을 돌려주지 않는지 반드시 검토한다. 요소가 조용히 사라지는 버그는 예외가 없어서 발견이 늦다.</p>
+<p>대량의 데이터를 셋에 싣는 코드에서는 두 가지를 확인한다. 예상 크기를 안다면 <code>newHashSet</code>으로 리사이즈를 없애 적재 시간과 순간적인 메모리 사용량을 줄인다. 그리고 요소 하나에 노드 32~40바이트와 버킷 배열, 요소 객체 자신이 든다는 점을 계산에 넣는다. 요소 천만 개라면 노드만으로 수백 메가바이트다. 크게 부풀었던 셋을 <code>clear()</code>로 비워 재사용하면 테이블이 줄지 않아 메모리와 순회 시간이 그대로 남는다는 점도 장애 분석에서 종종 원인으로 드러난다.</p>
+<p>코드 리뷰에서 가장 먼저 볼 것은 셋에 들어가는 클래스의 가변성이다. <code>equals</code>와 <code>hashCode</code>에 참여하는 필드에 세터가 있다면, 그 객체가 셋(또는 맵의 키)에 들어 있는 동안 바뀌지 않는다는 보장이 어디에 있는지 물어야 한다. 보장이 없다면 필드를 불변으로 바꾸거나, 동일성 판단에 쓰는 값을 바뀌지 않는 식별자로 좁히는 설계를 검토한다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 세 줄의 출력을 각각 예측하라(OpenJDK 21). 그리고 첫 줄의 <code>HashSet</code>이 버킷 32개짜리 테이블을 쓰고 있었다면 출력이 어떻게 달라지는지도 구하라.
+<pre><code class="language-java">List<Integer> in = List.of(18, 2, 34, 7, 50);
+System.out.println(new HashSet<>(in));
+System.out.println(new LinkedHashSet<>(in));
+System.out.println(new TreeSet<>(in));</code></pre></li>
+<li><code>new HashSet<>(50)</code>으로 만든 셋에 서로 다른 요소 50개를 넣는다. 리사이즈는 몇 번째 <code>add</code>에서 일어나고 마지막 버킷 수는 얼마인가? 같은 일을 <code>HashSet.newHashSet(50)</code>으로 하면 어떻게 되는가?</li>
+<li>빈 <code>TreeSet<Integer></code>에 3, 2, 1, 0을 이 순서로 넣는다. 넣을 때마다 트리의 모양과 각 노드의 색을 그려라. 어느 단계에서 회전이 일어나고 어느 단계에서 색만 바뀌는가?</li>
+<li>다음 코드의 두 출력을 예측하고, 의도(회원을 나이순으로 정렬해 모두 보관)에 맞게 고쳐라.
+<pre><code class="language-java">record Member(String name, int age) {}
+
+Set<Member> members = new TreeSet<>(Comparator.comparingInt(Member::age));
+members.add(new Member("kim", 30));
+members.add(new Member("lee", 30));
+members.add(new Member("park", 25));
+System.out.println(members.size());
+System.out.println(members.contains(new Member("choi", 25)));</code></pre></li>
+<li>다음 세 요구에 맞는 구현체와 핵심 메서드를 고르고 이유를 설명하라. (가) 로그 파일에 등장한 서로 다른 IP 주소의 수를 센다. 약 200만 개로 예상된다. (나) 사용자가 최근에 본 상품을 중복 없이, 본 순서대로 보관한다. 이미 본 상품을 다시 보면 맨 뒤로 옮긴다. (다) 예약된 시작 시각들(예: 900, 1030, 1400, 1630) 가운데 주어진 시각 이후의 가장 가까운 예약을 찾는다.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 요소가 5개이므로 테이블은 16칸이다. <code>Integer</code>의 해시 코드는 값 자체이고 이 크기의 값은 비트 섞기를 거쳐도 변하지 않으므로 버킷은 <code>값 & 15</code>다. 18→2번, 2→2번, 34→2번, 7→7번, 50→2번. 2번 버킷에 들어온 순서대로 18, 2, 34, 50이 매달리고 7번에 7이 있다. 따라서 <code>HashSet</code>은 <code>[18, 2, 34, 50, 7]</code>, <code>LinkedHashSet</code>은 삽입 순서 <code>[18, 2, 34, 7, 50]</code>, <code>TreeSet</code>은 정렬 순서 <code>[2, 7, 18, 34, 50]</code>이다. 32칸이라면 버킷은 <code>값 & 31</code>이 되어 18→18번, 2→2번, 34→2번, 7→7번, 50→18번이다. 0번부터 훑으면 <code>[2, 34, 7, 18, 50]</code>이 된다. 16칸에서 리사이즈해 32칸이 된 경우에도 결과는 같다. 2번 버킷의 줄 18, 2, 34, 50에서 16 자리 비트가 0인 2와 34는 제자리에, 1인 18과 50은 18번으로 가며 줄 안의 상대 순서가 유지되기 때문이다.</p>
+<p><b>2.</b> 인자 50은 버킷 수이고 2의 거듭제곱인 64로 올림된다. 임계값은 64 × 0.75 = 48이다. 49번째 <code>add</code>에서 크기가 임계값을 넘어 128칸으로 리사이즈되고, 마지막 버킷 수는 128이다. <code>newHashSet(50)</code>은 50 ÷ 0.75를 올림한 67을 초기 용량으로 넘기고 이것이 128로 올림된다. 임계값이 96이므로 50개를 넣는 동안 리사이즈가 없다. 최종 버킷 수는 둘 다 128이지만 앞의 경우는 노드 49개를 한 번 옮기는 작업과 64칸짜리 배열 하나를 버리는 일이 더 든다.</p>
+<p><b>3.</b> 3을 넣으면 검정 루트 3 하나다. 2를 넣으면 3의 왼쪽에 빨강 2가 매달리고 부모가 검정이므로 고칠 것이 없다. 1을 넣으면 2의 왼쪽에 빨강 1이 매달려 빨강 2 아래에 빨강 1이 오는 위반이 생긴다. 부모의 형제 자리(3의 오른쪽)가 비어 있어 검정으로 취급되므로 조부모 3을 기준으로 오른쪽 회전을 하고 색을 바꾼다. 결과는 검정 2가 루트, 왼쪽에 빨강 1, 오른쪽에 빨강 3이다. 본문에서 1, 2, 3을 넣었을 때의 좌우 대칭이다. 0을 넣으면 1의 왼쪽에 빨강 0이 매달려 다시 위반이 생기는데, 이번에는 부모 1과 부모의 형제 3이 모두 빨강이므로 회전 없이 둘을 검정으로, 조부모 2를 빨강으로 바꾼 뒤 루트를 다시 검정으로 칠한다. 최종 모양은 검정 2 아래 왼쪽에 검정 1(그 왼쪽에 빨강 0), 오른쪽에 검정 3이다.</p>
+<p><b>4.</b> 출력은 <code>2</code>와 <code>true</code>다. 비교자가 나이만 보므로 <code>lee</code>(30)는 <code>kim</code>(30)과 비교 결과가 0이 되어 같은 요소로 취급되고 추가되지 않는다. 같은 이유로 넣은 적 없는 <code>choi</code>(25)를 찾으면 <code>park</code>(25)과의 비교가 0이 되어 "들어 있다"고 답한다. 레코드의 <code>equals</code>는 이름과 나이를 모두 비교하지만 <code>TreeSet</code>은 <code>equals</code>를 호출하지 않는다. 고치려면 나이가 같을 때 구분할 기준을 덧붙인다. <code>Comparator.comparingInt(Member::age).thenComparing(Member::name)</code>으로 바꾸면 크기는 3이 되고 <code>contains</code>는 <code>false</code>가 된다. 이름과 나이가 모두 같은 회원이 있을 수 있다면 회원 번호 같은 고유한 값을 마지막 기준으로 써야 한다.</p>
+<p><b>5.</b> (가) 순서가 필요 없고 "처음 본 값인가"만 중요하므로 <code>HashSet</code>이다. 예상 크기를 알기 때문에 <code>HashSet.newHashSet(2_000_000)</code>으로 만들어 적재 중 리사이즈를 없애고, 마지막에 <code>size()</code>를 읽는다. (나) 중복 제거와 순서 유지가 함께 필요하므로 <code>LinkedHashSet</code>이다. 단순히 <code>add</code>하면 이미 있는 요소의 자리가 바뀌지 않으므로 <code>remove</code> 후 <code>add</code>하거나, Java 21 이상에서는 이미 있는 요소를 맨 뒤로 옮겨 주는 <code>addLast</code>를 쓴다. (다) 크기 관계에 대한 질문이므로 <code>TreeSet</code>이고, 주어진 시각 "이상"이면 <code>ceiling</code>, "초과"면 <code>higher</code>를 쓴다. 예시 데이터에서 <code>ceiling(1100)</code>은 1400, <code>ceiling(1400)</code>은 1400, <code>higher(1400)</code>은 1630, <code>ceiling(1700)</code>은 <code>null</code>이다. 결과가 <code>null</code>일 수 있다는 점을 호출하는 쪽에서 처리해야 한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>이미 들어 있는 요소와 <code>equals</code>로 같은 객체를 <code>HashSet.add</code>에 넘기면 <code>false</code>가 반환된다. OpenJDK 21에서 이 <code>false</code>는 어떻게 만들어지는가?</q>
+<o><code>HashSet</code>이 먼저 <code>contains</code>를 호출해 중복을 확인하고, 있으면 <code>put</code>을 생략한다.</o>
+<o>내부 <code>HashMap.put(e, PRESENT)</code>이 이전 값인 <code>PRESENT</code>를 돌려주고, 그것이 <code>null</code>이 아니므로 <code>false</code>가 된다.</o>
+<o><code>HashMap</code>이 중복 키에 대해 예외를 던지고 <code>HashSet</code>이 그것을 잡아 <code>false</code>로 바꾼다.</o>
+<o>두 객체의 <code>hashCode</code>가 같으면 <code>equals</code>를 호출하지 않고 곧바로 <code>false</code>를 반환한다.</o>
+<why><code>HashSet.add</code>의 본문은 <code>map.put(e, PRESENT) == null</code> 한 줄이다. 새 키면 <code>put</code>이 <code>null</code>을, 있던 키면 이전 값(<code>PRESENT</code>)을 돌려준다. 미리 <code>contains</code>를 부르지 않으며 예외도 쓰지 않는다. 해시 코드가 같아도 서로 다른 요소일 수 있으므로 <code>equals</code> 확인은 생략되지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>new HashSet<>(100)</code>으로 만든 셋에 서로 다른 요소 100개를 넣었다. 이 과정에 대한 설명으로 옳은 것은?</q>
+<o>초기 용량이 100이므로 리사이즈 없이 100개가 모두 들어간다.</o>
+<o>버킷이 100개 만들어지고 임계값 75를 넘는 76번째에서 리사이즈된다.</o>
+<o>버킷이 128개 만들어지고 임계값 96을 넘는 97번째에서 256개로 리사이즈된다.</o>
+<o>버킷이 256개 만들어지므로 리사이즈가 일어나지 않는다.</o>
+<why>생성자의 인자는 버킷 수이며 2의 거듭제곱인 128로 올림된다. 임계값은 128 × 0.75 = 96이고 크기가 이를 넘는 97번째 <code>add</code>에서 리사이즈된다. 256칸으로 시작해 리사이즈가 없는 것은 예상 요소 수를 받는 <code>HashSet.newHashSet(100)</code>의 동작이다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>new BigDecimal("1.0")</code>과 <code>new BigDecimal("1.00")</code>을 차례로 넣었을 때 <code>HashSet</code>의 크기는 2, <code>TreeSet</code>의 크기는 1이 된다. 이유로 옳은 것은?</q>
+<o><code>HashSet</code>은 <code>equals</code>(값과 자릿수 모두 비교)로, <code>TreeSet</code>은 <code>compareTo</code>(수치만 비교)의 결과 0으로 같은 요소를 판단하기 때문이다.</o>
+<o><code>TreeSet</code>은 정렬 과정에서 해시 코드가 같은 요소를 하나로 합치기 때문이다.</o>
+<o><code>HashSet</code>은 해시 충돌이 난 요소를 모두 따로 저장하기 때문이다.</o>
+<o><code>TreeSet</code>은 <code>equals</code>와 <code>compareTo</code>를 모두 호출해 둘 중 하나라도 같다고 하면 중복으로 보기 때문이다.</o>
+<why><code>TreeSet</code>은 <code>equals</code>와 <code>hashCode</code>를 호출하지 않고 비교 결과가 0인지로만 판단한다. <code>BigDecimal</code>은 <code>equals</code>가 자릿수까지 비교하고 <code>compareTo</code>는 수치만 비교하므로 두 기준이 어긋난다. <code>Comparable</code> 문서가 "equals와 일관되지 않은" 자연 순서의 예로 드는 클래스다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>한때 요소가 수백만 개였다가 <code>clear()</code>로 비운 뒤 요소 10개만 담아 재사용하는 셋이 있다. 이 셋을 순회하는 비용에 대한 설명으로 옳은 것은?</q>
+<o><code>HashSet</code>이든 <code>LinkedHashSet</code>이든 요소가 10개이므로 순회 비용은 같다.</o>
+<o><code>clear()</code>가 버킷 배열을 기본 크기로 되돌리므로 두 구현체 모두 빠르다.</o>
+<o><code>LinkedHashSet</code>은 연결 리스트를 유지해야 하므로 <code>HashSet</code>보다 순회가 느리다.</o>
+<o><code>HashSet</code>은 줄어들지 않은 버킷 배열 전체를 훑어야 하고, <code>LinkedHashSet</code>은 연결 리스트만 따라가므로 요소 수에만 비례한다.</o>
+<why>OpenJDK의 <code>HashMap</code>은 테이블을 줄이지 않으므로 <code>clear()</code> 뒤에도 버킷 수가 그대로다. <code>HashSet</code>의 순회 시간은 요소 수와 버킷 수의 합에 비례하고, <code>LinkedHashSet</code>의 순회는 <code>before</code>·<code>after</code> 리스트를 따라가므로 용량과 무관하다. 두 클래스의 API 문서에 명시된 차이다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>equals</code>와 <code>hashCode</code>가 <code>owner</code> 필드로 구현된 객체를 <code>HashSet</code>에 넣은 뒤 <code>owner</code>를 바꿨더니, 같은 객체로 <code>contains</code>를 호출해도 <code>false</code>가 나왔다. 원인은?</q>
+<o><code>HashSet</code>이 요소의 복사본을 저장하기 때문에 원본을 바꿔도 셋 안의 값은 그대로다.</o>
+<o>필드가 바뀌는 순간 <code>HashSet</code>이 그 요소를 자동으로 제거한다.</o>
+<o>노드는 옛 해시값으로 정한 버킷에 그대로 있는데, 탐색은 바뀐 해시값으로 계산한 다른 버킷을 보기 때문이다.</o>
+<o><code>contains</code>는 <code>==</code>로만 비교하는데 필드를 바꾸면 객체의 참조값이 달라지기 때문이다.</o>
+<why>셋은 참조를 저장하며 복사하지 않는다. 버킷은 넣는 시점의 해시값으로 정해지고 이후 요소의 값이 바뀌어도 노드를 옮기지 않는다. 바뀐 해시값으로 찾으면 다른 버킷을 보게 되어 찾지 못한다. 필드를 바꿔도 객체의 참조는 변하지 않는다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>용량(capacity)</dt><dd>해시 테이블의 버킷 수. <code>HashMap</code>에서는 항상 2의 거듭제곱이고 기본값은 16이다.</dd>
+<dt>로드 팩터(load factor)</dt><dd>용량을 늘리기 전에 테이블이 얼마나 차도록 허용할지를 나타내는 비율. 기본값은 0.75다.</dd>
+<dt>임계값(threshold)</dt><dd>용량 × 로드 팩터. 요소 수가 이 값을 넘으면 리사이즈가 일어난다.</dd>
+<dt>리사이즈·리해시(resize, rehash)</dt><dd>버킷 배열을 약 두 배 크기로 새로 만들고 모든 노드를 새 버킷에 다시 배치하는 작업.</dd>
+<dt>이진 탐색 트리(binary search tree)</dt><dd>각 노드의 왼쪽 서브트리에는 더 작은 값, 오른쪽 서브트리에는 더 큰 값만 두는 이진 트리. 탐색 비용이 높이에 비례한다.</dd>
+<dt>레드-블랙 트리(red-black tree)</dt><dd>노드에 빨강·검정 색을 두고 색 규칙을 유지해 높이를 2·log₂(n+1) 이하로 묶는 균형 이진 탐색 트리. <code>TreeMap</code>의 구현 방식이다.</dd>
+<dt>회전(rotation)</dt><dd>이진 탐색 트리의 정렬 순서를 유지한 채 부모와 자식의 위아래 관계를 바꾸는 참조 재배치. 균형을 되찾는 데 쓴다.</dd>
+<dt>자연 순서(natural ordering)</dt><dd>클래스가 <code>Comparable</code>을 구현해 스스로 정의한 순서. 비교자를 주지 않은 <code>TreeSet</code>이 사용한다.</dd>
+<dt>equals와 일관된 순서(consistent with equals)</dt><dd>비교 결과가 0인 것과 <code>equals</code>가 참인 것이 항상 일치하는 순서. 일치하지 않으면 정렬 컬렉션이 <code>Set</code> 계약과 다르게 동작한다.</dd>
+<dt>뷰(view)</dt><dd>요소를 복사하지 않고 원본 컬렉션의 일부나 다른 순서를 보여 주는 객체. 원본의 변경이 뷰에, 뷰의 변경이 원본에 반영된다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Set.html">Java SE 21 API — Set</a> — 셋의 정의, 가변 요소에 대한 경고, equals/hashCode 규정, 수정 불가 셋의 성질</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/HashSet.html">Java SE 21 API — HashSet</a> — HashMap 기반 구현, 순회 순서 비보장, 순회 시간, newHashSet</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/LinkedHashSet.html">Java SE 21 API — LinkedHashSet</a> — 이중 연결 리스트와 삽입 순서, 재삽입 규칙, 순회 시간, addFirst/addLast</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/TreeSet.html">Java SE 21 API — TreeSet</a> — TreeMap 기반, log(n) 보장, 비교 메서드로 동등성을 판단한다는 설명, 범위 뷰</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/HashMap.html">Java SE 21 API — HashMap</a> — 용량과 로드 팩터의 정의, 리해시 조건, 기본 로드 팩터 0.75에 대한 설명</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Comparable.html">Java SE 21 API — Comparable</a> — equals와 일관된 자연 순서의 정의와 BigDecimal 예</li>
+</x-refs>

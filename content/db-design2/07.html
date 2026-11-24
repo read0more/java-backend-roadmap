@@ -1,0 +1,979 @@
+<x-meta>
+deck: 자바의 상속 계층을 테이블로 옮기는 세 가지 방법(구현 클래스마다 테이블, 단일 테이블, 조인)을 식별자, 참조 무결성, CHECK 제약, InnoDB 레코드 구조, 다형 조회의 실행 경로로 비교한다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>슈퍼타입·서브타입 모델의 배타성과 완전성을 구분하고, 주어진 업무 규칙이 어느 쪽인지 판정할 수 있다.</li>
+<li>구현 클래스마다 테이블 전략에서 식별자 충돌과 다형 참조 문제가 왜 생기는지 설명하고, 공유 시퀀스와 배타 아크(CHECK 제약)로 보완하는 DDL을 쓸 수 있다.</li>
+<li>단일 테이블 전략에서 서브타입별 필수 열을 CHECK 제약으로 강제하고, CHECK가 UNKNOWN을 통과시키는 규칙과 InnoDB의 NULL 비트 벡터를 근거로 공간 비용을 계산할 수 있다.</li>
+<li>조인 전략에서 복합 외래 키와 저장 생성 열로 "한 결제는 한 유형의 상세만 가진다"를 강제하고, 그래도 선언할 수 없는 규칙(모든 결제에 상세가 있다)을 검증 쿼리로 찾을 수 있다.</li>
+<li>세 전략에서 "최근 결제 20건" 같은 다형 조회가 어떤 인덱스와 테이블을 몇 번 읽는지 추적하고, 조회 패턴과 변경 빈도에 따라 전략을 고를 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 객체에는 상속이 있고 테이블에는 없다</h3>
+
+<p>주문 시스템의 결제를 자바로 모델링한다고 해 보자. 결제는 모두 결제 번호, 주문 번호, 금액, 상태, 요청 시각을 가진다. 그런데 결제 수단에 따라 따로 기억해야 하는 정보가 다르다. 카드 결제는 카드사, 마스킹된 카드 번호, 할부 개월 수, 승인 번호가 있어야 하고, 가상계좌 결제는 은행 코드, 발급된 계좌 번호, 입금자명, 입금 기한이 있어야 하며, 간편결제는 간편결제 사업자와 그 사업자가 준 거래 번호가 있어야 한다. 객체 세계에서는 고민할 것이 별로 없다. 추상 클래스 <code>Payment</code>에 공통 필드를 두고 <code>CardPayment</code>, <code>VbankPayment</code>, <code>EasyPayment</code>가 그것을 상속하면 된다.</p>
+
+<p>관계형 데이터베이스에는 이 "~는 ~의 일종이다(is-a)"를 표현하는 장치가 없다. 테이블은 열의 목록이 고정된 행의 집합이고, 한 테이블이 다른 테이블의 열을 물려받는 문법은 MySQL에 없다. 테이블 사이를 잇는 수단은 외래 키뿐이며, 외래 키는 "이 값은 저 테이블의 어느 행을 가리킨다"는 참조 관계일 뿐 "이 행은 저 행의 특수한 경우다"라는 뜻을 담지 못한다. 그래서 상속 관계를 저장하려면 클래스 계층을 테이블 몇 개에 어떻게 나눠 담을지 사람이 정해야 한다. 이 선택이 결제 목록 화면의 쿼리, 환불 테이블의 외래 키, 새 결제 수단을 추가하는 배포 절차까지 결정한다.</p>
+
+<p>선택지는 크게 세 가지다. 구체 클래스마다 공통 열까지 모두 가진 테이블을 하나씩 만드는 <b>구현 클래스마다 테이블 전략</b>, 계층 전체를 테이블 하나에 담고 유형을 구분하는 열을 두는 <b>단일 테이블 전략</b>, 공통 부분을 담은 테이블과 서브타입 고유 부분을 담은 테이블을 나누고 기본 키로 잇는 <b>조인 전략</b>이다. JPA 기본편에서 <code>@Inheritance</code>의 세 가지 값으로 이미 만났던 이름이지만, 이 회차는 매핑 애너테이션이 아니라 데이터베이스 설계의 관점에서 본다. 각 전략에서 데이터베이스가 스스로 지켜 주는 규칙과 지켜 주지 못하는 규칙은 무엇인지, 같은 질문에 답하려고 InnoDB가 어떤 인덱스를 몇 번 읽는지, 결제 수단이 하나 늘어날 때 무엇을 바꿔야 하는지를 따진다.</p>
+
+<p>설명의 기준은 MySQL 8.0 이상과 InnoDB 저장 엔진이다. CHECK 제약은 MySQL 8.0.16부터 실제로 검사되므로 그 이전 버전에서는 이 회차의 CHECK 예제가 효과가 없다는 점을 기억해 두자. 서브타입마다 속성이 수시로 바뀌거나 사용자가 속성을 정의하는 경우는 08회의 EAV와 09회의 JSON 설계에서 다루고, 결제 행의 논리 삭제는 05회의 Soft Delete, 결제 상태의 변경 이력은 03·04회의 이력 설계와 이어진다. 여기서는 서브타입의 종류와 속성이 설계 시점에 정해져 있는 상속 관계에 집중한다.</p>
+
+<h3>슈퍼타입과 서브타입: 논리 모델의 언어</h3>
+
+<p>데이터 모델링에서는 상속 관계를 슈퍼타입(supertype)과 서브타입(subtype)이라고 부른다. 슈퍼타입은 여러 서브타입이 공유하는 속성과 관계를 가진 상위 개체이고, 서브타입은 슈퍼타입의 모든 속성을 가지면서 자기만의 속성과 관계를 추가로 가진다. 여기서 "관계"를 빠뜨리면 안 된다. 서브타입이 속성만 다른 경우와, 서브타입마다 다른 테이블과 맺는 관계가 다른 경우는 설계 판단이 크게 달라진다. 예를 들어 가상계좌 결제에는 은행이 보내 오는 입금 통지가 여러 건 쌓일 수 있는데, 이 입금 통지 테이블은 가상계좌 결제만 참조해야 한다. 카드 결제를 가리키는 입금 통지는 의미가 없다.</p>
+
+<p>어떤 행이 어느 서브타입에 속하는지 알려 주는 속성을 구분자(discriminator) 또는 서브타입 구분 속성이라고 한다. 결제에서는 결제 유형 <code>payment_type</code>이 그 역할을 하고, 값은 <code>CARD</code>, <code>VBANK</code>, <code>EASY</code> 중 하나다. 구분자는 전략에 따라 실제 열로 존재하기도 하고(단일 테이블), 어느 테이블에 행이 있느냐로 암묵적으로 표현되기도 한다(구현 클래스마다 테이블). 조인 전략에서는 두 방식 모두 가능한데, 뒤에서 보듯 구분 열을 명시적으로 두면 무결성을 지키는 데 쓸 수 있다.</p>
+
+<p>슈퍼타입·서브타입 관계에는 두 가지 성질이 있고, 이 둘이 무결성 설계의 출발점이다. 첫째는 <b>배타성</b>이다. 슈퍼타입의 한 인스턴스가 서브타입 하나에만 속할 수 있으면 배타적(exclusive, disjoint) 관계이고, 여러 서브타입에 동시에 속할 수 있으면 포괄적(inclusive, overlapping) 관계다. 결제 한 건이 카드 결제이면서 가상계좌 결제일 수는 없으므로 결제는 배타적이다. 반면 회원이 판매자이면서 동시에 구매자일 수 있는 쇼핑몰이라면 판매자·구매자 구분은 포괄적이다. 둘째는 <b>완전성</b>이다. 슈퍼타입의 모든 인스턴스가 반드시 어떤 서브타입에 속해야 하면 완전(total) 관계, 서브타입 없이 슈퍼타입으로만 존재할 수 있으면 부분(partial) 관계다. 유형이 없는 결제는 처리할 수 없으므로 결제는 완전 관계다.</p>
+
+<p>자바의 클래스 상속은 이 두 성질 중 특정한 조합만 표현한다. 자바 객체의 실행 시점 클래스는 정확히 하나이므로, 한 객체가 <code>CardPayment</code>이면서 <code>VbankPayment</code>일 수 없다. 즉 클래스 상속은 언제나 배타적이다. 슈퍼클래스를 <code>abstract</code>로 선언하면 슈퍼클래스만의 인스턴스를 만들 수 없으므로 완전 관계가 되고, 구체 클래스로 두면 부분 관계가 된다. 포괄적 관계는 클래스 상속으로 표현할 수 없고, 회원과 역할(판매자 역할, 구매자 역할)을 별도 테이블로 두는 식의 연관 관계로 모델링해야 한다. 이 회차의 세 전략은 모두 배타적 상속을 테이블로 옮기는 방법이며, 각 전략이 배타성과 완전성을 데이터베이스 수준에서 얼마나 지켜 주는지가 비교의 중요한 축이 된다.</p>
+
+<aside class="note">배타성과 완전성은 업무 규칙이지 테이블 구조가 아니다. 같은 "회원" 개체라도 개인 회원과 법인 회원은 배타적이고, 판매자와 구매자는 포괄적일 수 있다. 설계를 시작하기 전에 업무 담당자에게 "한 건이 두 유형에 동시에 속할 수 있는가", "유형이 정해지지 않은 상태로 존재할 수 있는가"를 먼저 확인해야 한다.</aside>
+
+<h3>예제: 결제 수단 세 가지와 다섯 가지 질문</h3>
+
+<p>이 회차 내내 쓸 논리 모델은 다음과 같다. 공통 속성과 서브타입 고유 속성, 그리고 서브타입에 딸린 관계를 함께 적었다.</p>
+
+<pre class="diagram">
+                    ┌─────────────────────────────┐
+                    │ 결제 (Payment)  ← 슈퍼타입   │
+                    │  payment_id    결제 번호     │
+                    │  payment_type  구분자        │
+                    │  order_id      주문 번호     │
+                    │  amount        금액          │
+                    │  status        상태          │
+                    │  requested_at  요청 시각     │
+                    └──────────────┬──────────────┘
+                                   │  배타적(하나만), 완전(반드시 하나)
+          ┌────────────────────────┼────────────────────────┐
+          ▼                        ▼                        ▼
+┌───────────────────┐   ┌────────────────────┐   ┌────────────────────┐
+│ 카드 결제 CARD     │   │ 가상계좌 VBANK      │   │ 간편결제 EASY       │
+│ card_company      │   │ bank_code          │   │ provider           │
+│ card_no_masked    │   │ account_no         │   │ provider_tx_id     │
+│ installment_months│   │ depositor_name     │   └────────────────────┘
+│ approval_no       │   │ due_at             │
+└───────────────────┘   └─────────┬──────────┘
+                                  │ 1 : N
+                        ┌─────────▼──────────┐
+                        │ 입금 통지           │
+                        │ (가상계좌만 참조)    │
+                        └────────────────────┘
+
+  환불(refund) ──참조──▶ 결제 (유형과 무관하게 아무 결제나)
+</pre>
+
+<x-visual id="db-design2-07-supertype-subtype" title="결제 슈퍼타입과 세 서브타입의 논리 모델" kind="구조 다이어그램" ratio="16:9">
+<x-hint>슈퍼타입 하나에서 서브타입 셋으로 갈라지는 구조와, 슈퍼타입을 참조하는 관계(환불)와 서브타입 하나만 참조하는 관계(입금 통지)가 다르다는 점을 보여 준다.</x-hint>
+<x-prompt>깔끔한 데이터 모델 다이어그램. 위쪽 가운데에 큰 사각형 "결제(슈퍼타입)"이 있고 안에 공통 속성 다섯 줄이 흐리게 표시된다. 그 아래로 선이 하나 내려와 반원 모양의 분기 기호(배타 표시)를 지나 세 갈래로 갈라지고, 세 사각형 "카드 결제", "가상계좌", "간편결제"로 이어진다. 분기 기호 옆에 작은 라벨 "배타적·완전". 가운데 "가상계좌" 사각형 아래에 작은 사각형 "입금 통지"가 1:N 선으로 연결된다. 왼쪽 바깥에 사각형 "환불"이 있고 화살표가 "결제(슈퍼타입)"을 가리킨다. 슈퍼타입은 파란색, 서브타입은 연한 초록색, 참조하는 테이블은 회색. 흰 배경, 평면 스타일.</x-prompt>
+<x-caption>환불은 유형과 무관하게 결제 전체를 참조하고, 입금 통지는 가상계좌 결제만 참조한다. 두 관계를 어떻게 지키느냐가 전략마다 다르다.</x-caption>
+</x-visual>
+
+<p>세 전략을 공정하게 비교하려면 같은 질문을 던져 봐야 한다. 결제 시스템이 데이터베이스에 던지는 대표적인 질문 다섯 가지를 정해 두자.</p>
+
+<div class="table-wrap"><table><thead><tr><th>번호</th><th>질문</th><th>성격</th></tr></thead><tbody>
+<tr><td>Q1</td><td>오늘 들어온 카드 결제만 보여 달라</td><td>서브타입 하나만 조회</td></tr>
+<tr><td>Q2</td><td>유형에 상관없이 최근 결제 20건을 보여 달라(관리자 화면)</td><td>다형 조회(polymorphic query)</td></tr>
+<tr><td>Q3</td><td>결제 번호 42의 상세를 보여 달라. 유형은 모른다</td><td>식별자로 단건 조회</td></tr>
+<tr><td>Q4</td><td>환불은 반드시 실제로 존재하는 결제를 가리켜야 하고, 입금 통지는 가상계좌 결제만 가리켜야 한다</td><td>참조 무결성</td></tr>
+<tr><td>Q5</td><td>포인트 결제를 새 유형으로 추가하고, 모든 결제에 통화(currency) 속성을 추가한다</td><td>스키마 변경</td></tr>
+</tbody></table></div>
+
+<p>여기에 하나를 더 얹는다. 카드 결제에는 카드사와 승인 번호가 반드시 있어야 하고, 가상계좌 결제에는 그런 값이 있으면 안 된다. 이처럼 "이 유형에는 이 값이 필수, 저 유형에는 금지"라는 규칙을 데이터베이스가 강제할 수 있는가도 함께 본다. 애플리케이션 코드가 이 규칙을 지킨다고 해도, 배치 작업이나 운영자의 수동 쿼리, 다른 서비스가 같은 테이블에 쓰는 순간 데이터베이스 제약만이 마지막 방어선이 된다.</p>
+
+<h3>구현 클래스마다 테이블 전략</h3>
+
+<p>첫 번째 전략은 구체 클래스 하나에 테이블 하나를 만드는 것이다. 영어로는 table per concrete class라고 부르고, JPA에서는 <code>InheritanceType.TABLE_PER_CLASS</code>가 이 전략이다. 추상 슈퍼타입 <code>Payment</code>에 해당하는 테이블은 없다. 대신 각 서브타입 테이블이 공통 열을 모두 자기 열로 가진다. 객체로 치면 슈퍼클래스의 필드를 서브클래스마다 복사해 붙여 넣은 모양이다.</p>
+
+<pre><code class="language-sql">CREATE TABLE card_payment (
+  payment_id          BIGINT       NOT NULL,
+  order_id            BIGINT       NOT NULL,
+  amount              BIGINT       NOT NULL,
+  status              VARCHAR(20)  NOT NULL,
+  requested_at        DATETIME(6)  NOT NULL,
+  card_company        CHAR(2)      NOT NULL,
+  card_no_masked      VARCHAR(19)  NOT NULL,
+  installment_months  TINYINT      NOT NULL,
+  approval_no         VARCHAR(20)  NOT NULL,
+  PRIMARY KEY (payment_id),
+  KEY ix_card_payment_requested (requested_at),
+  CONSTRAINT ck_card_payment_amount CHECK (amount > 0),
+  CONSTRAINT ck_card_payment_installment CHECK (installment_months BETWEEN 0 AND 24)
+);
+
+CREATE TABLE vbank_payment (
+  payment_id          BIGINT       NOT NULL,
+  order_id            BIGINT       NOT NULL,
+  amount              BIGINT       NOT NULL,
+  status              VARCHAR(20)  NOT NULL,
+  requested_at        DATETIME(6)  NOT NULL,
+  bank_code           CHAR(3)      NOT NULL,
+  account_no          VARCHAR(20)  NOT NULL,
+  depositor_name      VARCHAR(50)  NOT NULL,
+  due_at              DATETIME(6)  NOT NULL,
+  PRIMARY KEY (payment_id),
+  KEY ix_vbank_payment_requested (requested_at),
+  CONSTRAINT ck_vbank_payment_amount CHECK (amount > 0)
+);
+
+CREATE TABLE easy_payment (
+  payment_id          BIGINT       NOT NULL,
+  order_id            BIGINT       NOT NULL,
+  amount              BIGINT       NOT NULL,
+  status              VARCHAR(20)  NOT NULL,
+  requested_at        DATETIME(6)  NOT NULL,
+  provider            VARCHAR(20)  NOT NULL,
+  provider_tx_id      VARCHAR(64)  NOT NULL,
+  PRIMARY KEY (payment_id),
+  KEY ix_easy_payment_requested (requested_at),
+  UNIQUE KEY uk_easy_payment_tx (provider, provider_tx_id),
+  CONSTRAINT ck_easy_payment_amount CHECK (amount > 0)
+);</code></pre>
+
+<p>먼저 눈에 띄는 것은 모든 열이 <code>NOT NULL</code>이라는 점이다. 카드 결제 테이블에는 카드 결제만 들어오므로 카드사 열은 언제나 값이 있어야 하고, 데이터베이스가 그것을 그대로 강제한다. 서브타입 고유 속성의 필수 여부를 가장 자연스럽게 표현하는 전략이 이것이다. 또 하나 눈여겨볼 것은 CHECK 제약 이름이다. 금액이 양수여야 한다는 같은 규칙을 세 테이블에 걸었는데 이름을 <code>ck_card_payment_amount</code>, <code>ck_vbank_payment_amount</code>처럼 모두 다르게 지었다. MySQL에서는 CHECK 제약 이름이 스키마(데이터베이스) 단위로 유일해야 하므로, 같은 스키마의 두 테이블이 같은 이름의 CHECK 제약을 가질 수 없다. 공통 규칙을 복사할 때마다 이름도 바꿔야 한다는 것 자체가 이 전략의 성격을 보여 준다. 위 세 테이블을 만든 스키마에서 다른 테이블에 <code>CONSTRAINT ck_card_payment_amount CHECK (a > 0)</code>를 걸어 보면 다음과 같이 거부된다.</p>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">ERROR 3822 (HY000): Duplicate check constraint name 'ck_card_payment_amount'.</code></pre>
+
+<p>Q1(오늘의 카드 결제)은 이 전략에서 가장 쉬운 질문이다. 카드 결제 테이블만 읽으면 되고, 다른 유형의 행이 섞여 있지 않으므로 유형 조건도 필요 없다.</p>
+
+<pre><code class="language-sql">SELECT payment_id, amount, card_company, approval_no
+  FROM card_payment
+ WHERE requested_at &gt;= '2026-11-17 00:00:00'
+   AND requested_at &lt;  '2026-11-18 00:00:00';</code></pre>
+
+<p>그런데 Q2(유형 무관 최근 20건)부터는 사정이 달라진다. 결제가 세 테이블에 흩어져 있으므로 세 테이블을 <code>UNION ALL</code>로 이어 붙여야 한다. 각 블록의 열 개수와 순서를 맞춰야 하고, 결과의 열 이름은 첫 번째 블록의 열 이름을 따른다. 테이블에 행이 들어 있다는 사실 자체가 유형 정보였으므로, 결과에서 유형을 구분하려면 각 블록에 상수 열을 직접 넣어야 한다.</p>
+
+<pre><code class="language-sql">SELECT payment_id, 'CARD' AS payment_type, amount, status, requested_at
+  FROM card_payment
+UNION ALL
+SELECT payment_id, 'VBANK', amount, status, requested_at
+  FROM vbank_payment
+UNION ALL
+SELECT payment_id, 'EASY', amount, status, requested_at
+  FROM easy_payment
+ORDER BY requested_at DESC
+LIMIT 20;</code></pre>
+
+<p>Q3(결제 번호 42의 상세, 유형 모름)도 마찬가지다. 42번이 어느 테이블에 있는지 모르므로 세 테이블을 모두 찾아봐야 한다. 기본 키 조회 세 번이니 비용 자체는 크지 않지만, 상세 화면에 서브타입 고유 속성까지 보여 주려면 블록마다 열 구성이 다르므로 다른 블록의 고유 열 자리를 <code>NULL</code>로 채워 열 개수를 맞추거나, 테이블마다 따로 질의해야 한다. 그리고 여기에는 더 근본적인 문제가 숨어 있다. "42번이 세 테이블 중 최대 한 곳에만 있다"는 전제를 누가 보장하는가?</p>
+
+<h3>구현 클래스마다 테이블 전략의 장단점</h3>
+
+<h4>장점: 서브타입 하나를 다루는 일은 모두 쉽다</h4>
+
+<p>이 전략의 장점은 서브타입 하나만 보는 작업에서 모두 나온다. 첫째, 앞에서 본 것처럼 모든 열에 <code>NOT NULL</code>을 걸 수 있다. 둘째, 테이블마다 행이 자기 유형의 열만 가지므로 행이 좁고, 서브타입 하나를 조회할 때 다른 유형의 행이나 인덱스 항목을 전혀 건드리지 않는다. 셋째, 서브타입에만 딸린 관계는 그 테이블을 참조하는 평범한 외래 키로 표현된다. 입금 통지 테이블이 <code>vbank_payment(payment_id)</code>를 참조하면 "입금 통지는 가상계좌 결제만 가리킨다"는 Q4의 뒷부분이 저절로 지켜진다. 넷째, 새 결제 유형을 추가하면 새 테이블을 하나 만들면 되므로, 운영 중인 기존 테이블에 <code>ALTER TABLE</code>을 걸 필요가 없다.</p>
+
+<h4>단점 1: 식별자가 테이블마다 따로 논다</h4>
+
+<p>가장 먼저 부딪히는 문제는 식별자다. 세 테이블이 각자 <code>AUTO_INCREMENT</code>로 결제 번호를 만든다고 해 보자. <code>AUTO_INCREMENT</code> 카운터는 테이블마다 따로 있으므로, 카드 결제의 첫 행도 1번이고 가상계좌 결제의 첫 행도 1번이다. 객체 세계에서 "결제 1번"은 하나의 결제를 가리켜야 하는데, 데이터베이스에는 "결제 1번"이 세 개 있을 수 있다. 환불 테이블에 <code>payment_id = 1</code>만 적혀 있으면 어느 결제를 환불한 것인지 알 수 없고, Q3의 세 테이블 조회는 결과가 여러 건 나올 수 있다.</p>
+
+<p>해결책은 세 테이블이 하나의 번호 공급원을 공유하는 것이다. MySQL에는 오라클이나 PostgreSQL의 시퀀스 객체가 없으므로, 매뉴얼은 <code>LAST_INSERT_ID(expr)</code>로 시퀀스를 흉내 내는 방법을 소개한다. 인자를 준 <code>LAST_INSERT_ID(expr)</code>는 그 값을 반환하면서 "다음에 <code>LAST_INSERT_ID()</code>가 반환할 값"으로 기억해 두고, 이 값은 연결(connection)마다 따로 유지된다.</p>
+
+<pre><code class="language-sql">CREATE TABLE payment_seq (id BIGINT NOT NULL);
+INSERT INTO payment_seq VALUES (0);
+
+-- 결제를 하나 만들 때마다
+UPDATE payment_seq SET id = LAST_INSERT_ID(id + 1);
+SELECT LAST_INSERT_ID();   -- 이 연결이 방금 받은 번호. 다른 연결의 UPDATE와 섞이지 않는다</code></pre>
+
+<p>이 방식은 다른 연결이 동시에 번호를 받아도 각자 자기 번호를 돌려받는다는 점에서 안전하지만, InnoDB의 잠금을 생각하면 주의할 점이 하나 있다. <code>UPDATE</code>는 <code>payment_seq</code>의 그 한 행에 배타 잠금을 걸고, 이 잠금은 트랜잭션이 끝날 때까지 유지된다. 번호 발급을 결제 생성 트랜잭션 안에서 하면, 결제 트랜잭션이 외부 결제 대행사의 응답을 기다리는 동안 다른 모든 결제 생성이 이 한 행에서 줄을 선다. 번호 발급은 자동 커밋으로 짧게 끝내고, 받은 번호로 결제 트랜잭션을 따로 시작하는 편이 낫다. 그 대가로 결제 트랜잭션이 롤백되면 받은 번호는 버려진다. 번호에 빈틈이 생기는 것은 <code>AUTO_INCREMENT</code>에서도 마찬가지이므로 결제 번호가 연속이라는 가정은 처음부터 하지 않아야 한다. 데이터베이스 바깥에서 UUID나 시각 기반의 고유 번호를 만들어 쓰는 방법도 있다.</p>
+
+<p>공유 번호 공급원을 써도 남는 문제가 있다. 그것은 <b>약속</b>일 뿐 <b>제약</b>이 아니라는 점이다. 기본 키와 유니크 제약은 테이블 하나 안에서만 유일성을 보장한다. 운영자가 수동 쿼리로 <code>vbank_payment</code>에 카드 결제와 같은 번호를 넣으면 MySQL은 아무 오류 없이 받아들인다. 세 테이블에 걸친 유일성을 선언할 방법이 없으므로, 이 전략에서 "결제 번호는 전체에서 유일하다"는 규칙은 애플리케이션과 운영 절차가 지켜야 한다. 실제로 Hibernate는 이 전략에서 <code>IDENTITY</code> 키 생성을 아예 거부한다. 뒤에서 실행 결과로 확인한다.</p>
+
+<h4>단점 2: 슈퍼타입을 가리키는 외래 키를 걸 수 없다</h4>
+
+<p>Q4의 앞부분, "환불은 실제로 존재하는 결제를 가리켜야 한다"가 이 전략의 가장 큰 약점이다. 외래 키는 참조할 테이블을 하나만 지정할 수 있다. 그런데 환불이 가리키는 "결제"는 세 테이블 중 어딘가에 있는 행이다. 가장 흔한 우회는 환불 테이블에 결제 유형과 결제 번호를 함께 적고 외래 키는 포기하는 것이다.</p>
+
+<pre><code class="language-sql">-- 다형 연관(polymorphic association): 외래 키가 없다
+CREATE TABLE refund (
+  refund_id     BIGINT       NOT NULL AUTO_INCREMENT,
+  payment_type  VARCHAR(10)  NOT NULL,   -- 'CARD' / 'VBANK' / 'EASY'
+  payment_id    BIGINT       NOT NULL,   -- 어느 테이블의 번호인지는 payment_type이 말해 준다
+  amount        BIGINT       NOT NULL,
+  PRIMARY KEY (refund_id),
+  KEY ix_refund_payment (payment_type, payment_id)
+);</code></pre>
+
+<p>이 설계를 다형 연관(polymorphic association)이라고 부른다. 읽기에는 편리해 보이지만 데이터베이스 입장에서 <code>payment_id</code>는 그냥 숫자다. 존재하지 않는 결제 번호를 넣어도, 결제를 지워서 환불이 고아가 되어도 아무도 막지 않는다. 조인할 때도 <code>payment_type</code> 값에 따라 조인할 테이블이 달라지므로 SQL 한 문장으로 쓰려면 유형마다 <code>LEFT JOIN</code>을 걸고 조건에 유형을 함께 넣어야 한다. 외래 키가 주던 보장(삽입 시점의 존재 확인, 부모 삭제의 차단)을 모두 애플리케이션 코드로 옮긴 셈이다.</p>
+
+<p>무결성을 지키고 싶다면 배타 아크(exclusive arc)라는 방법이 있다. 서브타입마다 따로 외래 키 열을 두고, 그중 정확히 하나만 값을 갖도록 CHECK 제약을 거는 것이다.</p>
+
+<pre><code class="language-sql">CREATE TABLE refund (
+  refund_id         BIGINT  NOT NULL AUTO_INCREMENT,
+  card_payment_id   BIGINT  NULL,
+  vbank_payment_id  BIGINT  NULL,
+  easy_payment_id   BIGINT  NULL,
+  amount            BIGINT  NOT NULL,
+  PRIMARY KEY (refund_id),
+  CONSTRAINT fk_refund_card  FOREIGN KEY (card_payment_id)  REFERENCES card_payment (payment_id),
+  CONSTRAINT fk_refund_vbank FOREIGN KEY (vbank_payment_id) REFERENCES vbank_payment (payment_id),
+  CONSTRAINT fk_refund_easy  FOREIGN KEY (easy_payment_id)  REFERENCES easy_payment (payment_id),
+  CONSTRAINT ck_refund_one_payment CHECK (
+      (card_payment_id IS NOT NULL)
+    + (vbank_payment_id IS NOT NULL)
+    + (easy_payment_id IS NOT NULL) = 1)
+);</code></pre>
+
+<p>CHECK 식이 동작하는 원리를 따라가 보자. MySQL에서 <code>IS NOT NULL</code>은 참이면 1, 거짓이면 0을 반환하므로 세 값을 더하면 값이 채워진 열의 개수가 된다. 그 개수가 정확히 1일 때만 식이 참이다. 외래 키 쪽은 값이 <code>NULL</code>인 열은 검사하지 않고, 값이 있는 열 하나만 해당 서브타입 테이블에서 부모 행을 찾는다. 두 장치가 합쳐져 "환불은 세 결제 중 정확히 하나를 가리키고, 그 결제는 실제로 존재한다"가 데이터베이스 수준에서 보장된다.</p>
+
+<p>대가도 분명하다. 결제 유형이 늘 때마다 환불 테이블에 열과 외래 키를 추가하고 CHECK 식을 고쳐야 한다. 결제를 참조하는 테이블이 환불 하나가 아니라 정산, 영수증, 분쟁 등 여럿이라면 그 모든 테이블이 같은 변경을 겪는다. 또 하나의 함정이 있다. MySQL 매뉴얼은 CHECK 제약에 쓰인 열에 외래 키 참조 동작(<code>ON UPDATE</code>, <code>ON DELETE</code>)을 금지한다고 적는다. 이 기능의 설계 문서(<a href="https://dev.mysql.com/worklog/task/?id=929">WL#929</a>)는 그 대상을 자식 쪽 열의 값을 엔진이 바꾸는 동작, 즉 <code>ON UPDATE CASCADE</code>와 <code>SET NULL</code>, <code>SET DEFAULT</code>로 적고 있다. 저장 엔진이 참조 동작으로 바꾼 행에는 CHECK를 다시 평가할 수 없기 때문이다. 그래서 위 설계에 "결제가 지워지면 환불의 참조를 NULL로 비운다(<code>ON DELETE SET NULL</code>)"를 추가하려 하면 제약을 만들 수 없다. 어차피 그 동작은 "정확히 하나"라는 규칙과 모순이기도 하다. 실제로 같은 모양의 테이블에 <code>ON DELETE SET NULL</code>을 붙이면 테이블 생성이 다음 오류로 실패하고, 같은 자리에 <code>ON DELETE CASCADE</code>를 붙인 테이블은 만들어졌다.</p>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">ERROR 3823 (HY000): Column 'card_payment_id' cannot be used in a check constraint 'ck_refund2_one': needed in a foreign key constraint 'fk_refund2_card' referential action.</code></pre>
+
+<h4>단점 3: 다형 조회는 UNION ALL이고, 정렬과 페이징이 비싸다</h4>
+
+<p>Q2의 <code>UNION ALL</code> 쿼리가 실행되는 모습을 생각해 보자. 바깥의 <code>ORDER BY requested_at DESC LIMIT 20</code>은 세 블록의 결과를 모두 합친 뒤에 적용된다. 각 블록에는 조건도 <code>LIMIT</code>도 없으므로 옵티마이저는 각 테이블의 모든 행을 읽어 합치고, 합친 결과 전체를 정렬 대상으로 삼아 앞의 20건만 남긴다. 결제가 수천만 건이면 20건을 보여 주려고 수천만 건을 읽고 임시 테이블에 복사한 뒤 정렬에 넣는 셈이다. 각 테이블에 <code>requested_at</code> 인덱스가 있어도, 합친 결과에 대한 정렬은 그 인덱스를 쓰지 못한다. 인덱스는 테이블마다 따로 있고, 세 인덱스를 하나의 순서로 엮은 구조는 어디에도 없다.</p>
+
+<p>사람이 쿼리를 고쳐 이 문제를 줄일 수 있다. 전체에서 최근 20건은 반드시 각 테이블의 최근 20건 안에 들어 있다. 어떤 결제가 전체 상위 20건에 들었는데 자기 테이블 안에서 21등 이하라면, 같은 테이블에 그보다 최근인 결제가 20건 이상 있다는 뜻이므로 모순이다. 그러니 각 블록에서 먼저 20건씩만 뽑고 합친 결과를 다시 정렬하면 된다. MySQL에서 집합 연산의 개별 블록에 <code>ORDER BY</code>나 <code>LIMIT</code>를 적용하려면 블록을 괄호로 감싸야 한다.</p>
+
+<pre><code class="language-sql">(SELECT payment_id, 'CARD' AS payment_type, amount, status, requested_at
+   FROM card_payment  ORDER BY requested_at DESC LIMIT 20)
+UNION ALL
+(SELECT payment_id, 'VBANK', amount, status, requested_at
+   FROM vbank_payment ORDER BY requested_at DESC LIMIT 20)
+UNION ALL
+(SELECT payment_id, 'EASY', amount, status, requested_at
+   FROM easy_payment  ORDER BY requested_at DESC LIMIT 20)
+ORDER BY requested_at DESC
+LIMIT 20;</code></pre>
+
+<p>이제 각 블록은 자기 테이블의 <code>requested_at</code> 인덱스를 뒤에서부터 20개 항목만 읽고(InnoDB 보조 인덱스에는 기본 키가 함께 들어 있으므로 나머지 열은 그 기본 키로 클러스터형 인덱스를 찾아 읽는다), 바깥 정렬은 많아야 60건을 다룬다. 블록 안의 <code>ORDER BY</code>는 반드시 <code>LIMIT</code>와 함께 써야 의미가 있다는 점에 주의하자. MySQL 매뉴얼에 따르면 집합 연산의 결과는 기본적으로 순서가 없으므로, 블록 안의 <code>ORDER BY</code>는 최종 결과의 순서에 아무 영향을 주지 않으며 <code>LIMIT</code> 없이 쓰면 옵티마이저가 아예 지워 버린다. 블록 안의 정렬은 "어떤 20건을 고를지"만 정하고, 최종 순서는 바깥의 <code>ORDER BY</code>가 정한다.</p>
+
+<p>두 쿼리의 실행 계획을 실제로 비교해 보자. 세 테이블에 각각 30,000행(모두 90,000행)을 넣고 <code>ANALYZE TABLE</code>을 실행한 뒤 <code>EXPLAIN FORMAT=TREE</code>로 본 결과다. 비용과 <code>rows</code> 추정치는 실행 환경과 통계에 따라 달라진다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 같은 계획)"><code class="language-text">-- 블록에 LIMIT가 없는 첫 번째 쿼리
+-> Limit: 20 row(s)  (cost=28285..28285 rows=20)
+    -> Sort: requested_at DESC, limit input to 20 row(s) per chunk  (cost=28285..28285 rows=20)
+        -> Table scan on &lt;union temporary&gt;  (cost=18145..19273 rows=90040)
+            -> Union all materialize  (cost=18145..18145 rows=90040)
+                -> Table scan on card_payment  (cost=3062 rows=30061)
+                -> Table scan on vbank_payment  (cost=3043 rows=30030)
+                -> Table scan on easy_payment  (cost=3035 rows=29949)
+
+-- 블록마다 ORDER BY ... LIMIT 20을 넣은 쿼리
+-> Limit: 20 row(s)  (cost=24..24 rows=20)
+    -> Sort: requested_at DESC, limit input to 20 row(s) per chunk  (cost=24..24 rows=20)
+        -> Table scan on &lt;union temporary&gt;  (cost=6.15..9.35 rows=60)
+            -> Union all materialize  (cost=6.1..6.1 rows=60)
+                -> Limit: 20 row(s)  (cost=0.0388 rows=20)
+                    -> Index scan on card_payment using ix_card_payment_requested (reverse)  (cost=0.0388 rows=20)
+                -> Limit: 20 row(s)  (cost=0.0281 rows=20)
+                    -> Index scan on vbank_payment using ix_vbank_payment_requested (reverse)  (cost=0.0281 rows=20)
+                -> Limit: 20 row(s)  (cost=0.0282 rows=20)
+                    -> Index scan on easy_payment using ix_easy_payment_requested (reverse)  (cost=0.0282 rows=20)</code></pre>
+
+<p>첫 번째 계획은 세 테이블을 모두 전체 스캔(<code>Table scan</code>)해 <code>&lt;union temporary&gt;</code>라는 임시 테이블에 모은 다음 정렬한다. 정렬 단계의 <code>limit input to 20 row(s)</code>는 정렬이 상위 20건만 유지한다는 뜻이지만, 그 전에 90,000행을 모두 읽고 임시 테이블에 넣는 일은 그대로다. 두 번째 계획에서는 각 블록이 <code>requested_at</code> 인덱스를 역순(<code>reverse</code>)으로 20개만 읽고, 임시 테이블에 들어가는 행도 60건으로 줄었다.</p>
+
+<p>페이지가 깊어지면 이 기법의 효과가 줄어든다. 3페이지(41~60번째)를 <code>LIMIT 20 OFFSET 40</code>으로 보여 주려면 각 블록이 60건씩을 내놓아야 하고, 바깥 정렬은 180건을 정렬해 120건을 버린다. 페이지 번호가 커질수록 버리는 양이 블록 수에 비례해 늘어난다. 마지막으로 본 결제의 <code>requested_at</code>보다 이전인 것만 각 블록에서 20건씩 가져오는 키셋 페이징(keyset pagination)으로 바꾸면 페이지 깊이와 상관없이 블록마다 20건만 읽는다. 어느 쪽이든 쿼리가 서브타입 수만큼 길어지고, 결제 유형이 추가될 때마다 이 쿼리를 쓰는 모든 곳을 찾아 고쳐야 한다는 점은 변하지 않는다.</p>
+
+<aside class="note"><code>UNION</code>과 <code>UNION ALL</code>은 다르다. 키워드 없이 쓴 <code>UNION</code>은 <code>UNION DISTINCT</code>와 같아서 중복 행을 제거한다. 서로 다른 테이블의 행이 우연히 모든 열 값이 같으면 하나로 합쳐지고, 중복 제거를 위한 추가 작업도 든다. 서브타입 테이블을 이어 붙일 때는 의도적으로 중복을 없애려는 경우가 아니라면 언제나 <code>UNION ALL</code>을 쓴다.</aside>
+
+<h4>단점 4: 공통 속성이 여러 곳에 복사된다</h4>
+
+<p>Q5의 뒷부분, 모든 결제에 통화(currency) 속성을 추가하는 일을 생각해 보자. 공통 속성이 테이블마다 복사되어 있으므로 세 테이블에 각각 <code>ALTER TABLE ... ADD COLUMN</code>을 실행해야 하고, 통화 코드를 검사하는 CHECK 제약도 이름을 바꿔 가며 세 번 걸어야 한다. 한 테이블에만 빠뜨리거나 열 길이를 다르게 주는 실수가 생기면, 그때부터 "결제의 공통 속성"이 테이블마다 조금씩 달라진다. 이 차이는 <code>UNION ALL</code>에서 드러난다. MySQL은 블록 사이에 같은 위치 열의 타입이 다르면 모든 블록의 값을 고려해 결과 열의 타입과 길이를 정하므로 쿼리는 실패하지 않지만, 비교와 정렬이 의도와 다르게 동작할 수 있다. 공통 규칙을 한 곳에서 관리할 수 없다는 것이 이 전략의 근본적인 비용이다.</p>
+
+<p>정리하면 구현 클래스마다 테이블 전략은 "서브타입들을 함께 다룰 일이 거의 없다"는 조건에서만 빛난다. 서브타입을 함께 조회하는 화면이 없고, 슈퍼타입을 참조하는 테이블도 없다면 이 전략이 가장 단순하다. 그런데 그런 조건이라면 사실 상속 관계라기보다 비슷한 열을 가진 독립된 테이블 여러 개에 가깝다. 결제처럼 전체 목록과 전체 참조가 필요한 개체에는 맞지 않는다.</p>
+
+<h3>단일 테이블 전략</h3>
+
+<p>두 번째 전략은 정반대로 간다. 계층 전체를 테이블 하나에 담는다. 공통 열과 모든 서브타입의 고유 열을 한 테이블에 나열하고, 각 행이 어느 서브타입인지는 구분 열에 적는다. 영어로는 single table, JPA에서는 <code>InheritanceType.SINGLE_TABLE</code>이며 <code>@Inheritance</code>에서 전략을 생략했을 때의 기본값이기도 하다.</p>
+
+<pre><code class="language-sql">CREATE TABLE payment (
+  payment_id          BIGINT       NOT NULL AUTO_INCREMENT,
+  payment_type        VARCHAR(10)  NOT NULL,
+  order_id            BIGINT       NOT NULL,
+  amount              BIGINT       NOT NULL,
+  status              VARCHAR(20)  NOT NULL,
+  requested_at        DATETIME(6)  NOT NULL,
+  -- CARD 전용
+  card_company        CHAR(2)      NULL,
+  card_no_masked      VARCHAR(19)  NULL,
+  installment_months  TINYINT      NULL,
+  approval_no         VARCHAR(20)  NULL,
+  -- VBANK 전용
+  bank_code           CHAR(3)      NULL,
+  account_no          VARCHAR(20)  NULL,
+  depositor_name      VARCHAR(50)  NULL,
+  due_at              DATETIME(6)  NULL,
+  -- EASY 전용
+  provider            VARCHAR(20)  NULL,
+  provider_tx_id      VARCHAR(64)  NULL,
+  PRIMARY KEY (payment_id),
+  KEY ix_payment_requested (requested_at),
+  KEY ix_payment_type_requested (payment_type, requested_at),
+  UNIQUE KEY uk_payment_easy_tx (provider, provider_tx_id),
+  CONSTRAINT ck_payment_amount CHECK (amount > 0),
+  CONSTRAINT ck_payment_type CHECK (payment_type IN ('CARD', 'VBANK', 'EASY')),
+  CONSTRAINT ck_payment_card CHECK (
+       (payment_type = 'CARD'
+          AND card_company IS NOT NULL AND card_no_masked IS NOT NULL
+          AND installment_months IS NOT NULL AND approval_no IS NOT NULL)
+    OR (payment_type &lt;&gt; 'CARD'
+          AND card_company IS NULL AND card_no_masked IS NULL
+          AND installment_months IS NULL AND approval_no IS NULL)),
+  CONSTRAINT ck_payment_vbank CHECK (
+       (payment_type = 'VBANK'
+          AND bank_code IS NOT NULL AND account_no IS NOT NULL
+          AND depositor_name IS NOT NULL AND due_at IS NOT NULL)
+    OR (payment_type &lt;&gt; 'VBANK'
+          AND bank_code IS NULL AND account_no IS NULL
+          AND depositor_name IS NULL AND due_at IS NULL)),
+  CONSTRAINT ck_payment_easy CHECK (
+       (payment_type = 'EASY'
+          AND provider IS NOT NULL AND provider_tx_id IS NOT NULL)
+    OR (payment_type &lt;&gt; 'EASY'
+          AND provider IS NULL AND provider_tx_id IS NULL)),
+  CONSTRAINT ck_payment_installment CHECK (installment_months BETWEEN 0 AND 24)
+);</code></pre>
+
+<p>서브타입 고유 열은 모두 <code>NULL</code>을 허용해야 한다. 카드 결제 행에는 가상계좌 열에 넣을 값이 없기 때문이다. 이것이 단일 테이블 전략의 본질적인 약점이고, Jakarta Persistence 명세도 이 전략의 단점으로 "서브클래스 고유 상태에 대응하는 열이 nullable이어야 한다"는 점을 적고 있다. 열 단위의 <code>NOT NULL</code>로는 "카드 결제에는 카드사가 필수"라는 규칙을 표현할 수 없다. 그 빈자리를 메우는 것이 행 단위 CHECK 제약이다. 한 행의 여러 열을 함께 보고 참·거짓을 판정하므로, 구분 열 값에 따라 필수와 금지를 달리하는 조건부 규칙을 쓸 수 있다.</p>
+
+<p>세 개의 서브타입 CHECK는 모두 같은 모양이다. "이 유형이면 이 유형의 열이 모두 채워져 있다" 또는 "이 유형이 아니면 이 유형의 열이 모두 비어 있다". 앞쪽 절반만 쓰면 필수 규칙만 생기고, 가상계좌 행에 실수로 카드사 값이 들어가는 것은 막지 못한다. 뒤쪽 절반이 있어야 다른 유형의 열에 쓰레기 값이 들어가는 것까지 막는다. 실제 행으로 따라가 보자.</p>
+
+<div class="table-wrap"><table><thead><tr><th>시도한 행</th><th>ck_payment_card의 판정</th><th>결과</th></tr></thead><tbody>
+<tr><td>CARD, 카드 열 네 개 모두 채움, 나머지 비움</td><td>앞쪽 절반이 참</td><td>통과(다른 CHECK도 같은 방식으로 통과)</td></tr>
+<tr><td>CARD, 승인 번호만 비움</td><td>앞쪽: <code>approval_no IS NOT NULL</code>이 거짓이라 거짓. 뒤쪽: 유형이 CARD라 거짓</td><td>거부</td></tr>
+<tr><td>VBANK, 가상계좌 열 채움, 카드사에 '04'가 잘못 들어감</td><td>앞쪽: 유형이 CARD가 아니라 거짓. 뒤쪽: <code>card_company IS NULL</code>이 거짓이라 거짓</td><td>거부</td></tr>
+<tr><td>기존 CARD 행을 <code>UPDATE ... SET payment_type = 'EASY'</code>로만 바꿈</td><td>카드 열이 채워진 채 유형이 EASY가 되어 뒤쪽이 거짓, ck_payment_easy도 거짓</td><td>거부</td></tr>
+</tbody></table></div>
+
+<p>여기서 CHECK 제약의 평가 규칙 하나를 정확히 알아야 한다. MySQL 매뉴얼에 따르면 CHECK 식은 각 행에 대해 <code>TRUE</code>이거나 <code>UNKNOWN</code>(NULL 값 때문에)이어야 하고, <code>FALSE</code>일 때만 위반이다. 즉 식의 결과가 NULL이면 통과한다. 위 서브타입 CHECK들은 <code>IS NULL</code>과 <code>IS NOT NULL</code>, 그리고 <code>NOT NULL</code>인 구분 열에 대한 비교만 쓰므로 결과가 언제나 참이나 거짓이고, UNKNOWN이 나올 틈이 없다. 반면 마지막 <code>ck_payment_installment</code>는 다르다. 카드가 아닌 행에서 <code>installment_months</code>는 NULL이고, <code>NULL BETWEEN 0 AND 24</code>는 UNKNOWN이므로 통과한다. 여기서는 그것이 의도한 동작이다. 하지만 누군가 서브타입 CHECK 없이 <code>ck_payment_installment</code>만 걸어 두고 "할부 개월 수가 검사된다"고 믿는다면, 카드 결제 행에 할부 값이 비어 있어도 아무 오류가 나지 않는다. 범위 검사는 값이 있을 때만 검사하고, 값이 있어야 한다는 규칙은 따로 써야 한다.</p>
+
+<p>위 표의 네 시도를 이 DDL에 실제로 실행하면 첫 번째 행만 들어가고, 나머지 셋은 모두 같은 오류로 거부된다. 네 번째 시도는 <code>ck_payment_easy</code>도 거짓이지만 오류 메시지에는 <code>ck_payment_card</code> 하나만 나왔다. 서브타입 CHECK 없이 <code>installment_months BETWEEN 0 AND 24</code>만 건 테이블에 <code>('CARD', NULL)</code>을 넣으면 오류 없이 들어갔고, 같은 CHECK에 30을 넣으면 <code>Check constraint 'ck_payment_installment' is violated.</code>로 거부되었다.</p>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">ERROR 3819 (HY000): Check constraint 'ck_payment_card' is violated.</code></pre>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>단일 테이블 전략은 열 단위 <code>NOT NULL</code>을 잃는 대신 행 단위 CHECK로 "유형별 필수·금지"를 되찾을 수 있다. 다만 CHECK는 결과가 거짓일 때만 막고 UNKNOWN은 통과시키므로, 필수 규칙은 반드시 <code>IS NOT NULL</code>로 써야 한다. MySQL 8.0.16 이전에는 CHECK 구문이 해석만 되고 무시되었다는 것도 기억하자.</p></aside>
+
+<p>이제 다섯 질문을 다시 던져 보자. Q1(오늘의 카드 결제)은 <code>WHERE payment_type = 'CARD' AND requested_at ...</code>이 되고, 복합 인덱스 <code>(payment_type, requested_at)</code>이 등호 조건과 범위 조건을 차례로 받아 카드 결제의 해당 구간만 읽는다. Q2(최근 20건)는 <code>ORDER BY requested_at DESC LIMIT 20</code> 하나로 끝나고, <code>ix_payment_requested</code>를 뒤에서부터 20개 읽으면 된다. 합칠 테이블도, 사람이 손으로 넣을 블록별 <code>LIMIT</code>도 없다. Q3(결제 42번 상세)는 기본 키 조회 한 번이다. Q4의 앞부분(환불은 존재하는 결제를 가리킨다)은 <code>refund.payment_id</code>가 <code>payment(payment_id)</code>를 참조하는 평범한 외래 키로 해결된다. 결제 번호가 처음부터 한 테이블의 기본 키이므로 식별자 충돌 문제도 없다.</p>
+
+<p>Q4의 뒷부분, "입금 통지는 가상계좌 결제만 가리킨다"는 조금 더 생각해야 한다. 입금 통지가 <code>payment(payment_id)</code>를 참조하면 카드 결제 번호를 넣어도 외래 키 검사를 통과한다. 이때 01회에서 공통 코드의 그룹을 고정할 때 쓴 기법을 그대로 쓸 수 있다. 자식 테이블에 상수 <code>'VBANK'</code>를 담은 저장 생성 열을 두고, <code>(payment_id, payment_type)</code> 두 열로 결제를 참조하는 것이다. MySQL은 참조되는 쪽에 참조 열이 맨 앞에 같은 순서로 오는 인덱스를 요구하므로, 결제 테이블에 <code>(payment_id, payment_type)</code> 유니크 키를 추가한다.</p>
+
+<pre><code class="language-sql">ALTER TABLE payment
+  ADD UNIQUE KEY uk_payment_id_type (payment_id, payment_type);
+
+CREATE TABLE vbank_deposit (
+  deposit_id        BIGINT       NOT NULL AUTO_INCREMENT,
+  payment_id        BIGINT       NOT NULL,
+  payment_type      VARCHAR(10)  AS ('VBANK') STORED,
+  deposited_amount  BIGINT       NOT NULL,
+  deposited_at      DATETIME(6)  NOT NULL,
+  PRIMARY KEY (deposit_id),
+  CONSTRAINT fk_vbank_deposit_payment FOREIGN KEY (payment_id, payment_type)
+      REFERENCES payment (payment_id, payment_type)
+);</code></pre>
+
+<p>입금 통지 행의 <code>payment_type</code>은 언제나 <code>'VBANK'</code>이므로, 외래 키 검사는 "그 번호를 가진 가상계좌 결제"가 있는지를 확인하게 된다. 카드 결제 번호를 넣으면 <code>(번호, 'VBANK')</code> 조합의 부모 행이 없어 거부된다. 반대 방향도 지켜진다. 입금 통지가 달린 가상계좌 결제의 <code>payment_type</code>을 다른 값으로 바꾸려 하면, 참조되는 키 값이 바뀌는 것이므로 기본 참조 동작(<code>NO ACTION</code>, InnoDB에서는 <code>RESTRICT</code>와 같다)에 따라 즉시 거부된다. 저장 생성 열에 대한 외래 키에는 <code>ON UPDATE CASCADE</code>나 <code>ON DELETE SET NULL</code> 같은 일부 참조 동작이 금지되지만, 여기서는 참조 동작을 지정하지 않았으므로 문제가 없다. 가상 생성 열(<code>VIRTUAL</code>)은 외래 키에 쓸 수 없으므로 반드시 <code>STORED</code>로 선언해야 한다. 가상계좌 결제 2번과 카드 결제 1번을 넣어 두고 차례로 시도한 결과는 다음과 같다. 가상계좌 결제 2번으로의 입금 통지는 들어갔고, 카드 결제 1번으로의 입금 통지, 입금 통지가 달린 결제 2번의 유형 변경, <code>VIRTUAL</code>로 선언한 생성 열에 대한 외래 키는 순서대로 거부되었다.</p>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint fails (`m_db_design2_07`.`vbank_deposit`, CONSTRAINT `fk_vbank_deposit_payment` FOREIGN KEY (`payment_id`, `payment_type`) REFERENCES `payment` (`payment_id`, `payment_type`))
+ERROR 1451 (23000): Cannot delete or update a parent row: a foreign key constraint fails (`m_db_design2_07`.`vbank_deposit`, CONSTRAINT `fk_vbank_deposit_payment` FOREIGN KEY (`payment_id`, `payment_type`) REFERENCES `payment` (`payment_id`, `payment_type`))
+ERROR 3733 (HY000): Foreign key 'fk_vbank_deposit_v' uses virtual column 'payment_type' which is not supported.</code></pre>
+
+<h3>단일 테이블 전략의 장단점</h3>
+
+<h4>장점: 조인도 UNION도 없다</h4>
+
+<p>단일 테이블 전략의 장점은 앞의 질문 풀이에 다 드러났다. 다형 조회든 서브타입 조회든 테이블 하나만 읽고, 조인이나 <code>UNION</code>이 없으므로 실행 계획이 단순하다. 결제 번호가 한 테이블의 기본 키이므로 식별자는 처음부터 전체에서 유일하고, 슈퍼타입을 참조하는 외래 키도 평범하게 걸린다. 결제 하나를 저장하는 것도 <code>INSERT</code> 한 문장이므로, 공통 부분만 저장되고 고유 부분이 빠지는 중간 상태가 생기지 않는다.</p>
+
+<p>무결성 측면에서도 장점이 있다. 한 행에는 구분 열 값이 하나뿐이므로 한 결제가 두 유형에 속하는 일은 구조적으로 불가능하다. 즉 배타성이 공짜로 지켜진다. 구분 열이 <code>NOT NULL</code>이고 <code>ck_payment_type</code>이 값을 세 가지로 제한하므로, 유형 없는 결제도 존재할 수 없다. 완전성까지 공짜다. 뒤에서 보겠지만 조인 전략은 이 두 성질을 지키려고 따로 장치를 마련해야 하고, 그래도 완전성은 선언할 수 없다.</p>
+
+<h4>단점 1: 넓은 행과 NULL, 정말 공간을 낭비하는가</h4>
+
+<p>단일 테이블 전략을 처음 보면 "NULL이 가득한 열이 공간을 낭비한다"는 걱정부터 든다. InnoDB의 레코드 형식을 보면 이 걱정은 대부분 근거가 없다. MySQL 8.0의 기본 행 형식은 <code>DYNAMIC</code>이고(<code>innodb_default_row_format</code>의 기본값), <code>DYNAMIC</code>은 <code>COMPACT</code> 형식의 변형이다. 매뉴얼은 <code>COMPACT</code> 형식의 레코드 헤더에 NULL 열을 표시하는 비트 벡터가 있고, NULL을 허용하는 열이 N개면 이 벡터가 <code>CEILING(N/8)</code>바이트를 차지하며, NULL인 열은 이 비트 외에는 공간을 차지하지 않는다고 설명한다.</p>
+
+<p>이 규칙으로 예제 테이블을 계산해 보자. NULL을 허용하는 열은 카드 4개, 가상계좌 4개, 간편결제 2개로 모두 10개다. 따라서 모든 행의 헤더에 <code>CEILING(10/8) = 2</code>바이트의 NULL 비트 벡터가 있다. 카드 결제 행은 가상계좌와 간편결제 열 6개가 NULL인데, 이 6개 열이 차지하는 공간은 비트 벡터 안의 6비트가 전부다. 카드 결제 행의 실제 크기는 공통 열과 카드 열의 값으로 정해지고, 다른 유형의 열이 몇 개 정의되어 있는지와는 비트 벡터의 바이트 수만큼만 관계가 있다. 서브타입이 늘어 NULL 허용 열이 80개가 되어도 비트 벡터는 10바이트다.</p>
+
+<pre class="diagram">
+DYNAMIC 행 형식에서 카드 결제 한 행 (개념도)
+
+┌──────────── 레코드 헤더 ────────────┐┌─────────────── 데이터 ────────────────┐
+│ 가변 길이 열의 길이 │ NULL 비트 벡터 ││ payment_id │ (숨은 필드: 트랜잭션 ID, │
+│                     │ 2바이트        ││            │  롤백 포인터) │ payment_type│
+│                     │ 0000 0011 1111 ││ order_id │ amount │ status │ requested_at│
+│                     │  ↑ 카드 열 4개는 0(값 있음)  ││ card_company │ card_no_masked│
+│                     │    나머지 6개는 1(NULL)      ││ installment_months │ approval_no│
+└─────────────────────────────────────┘└───────────────────────────────────────┘
+  가상계좌·간편결제 열 6개는 데이터 부분에 아무것도 남기지 않는다
+  (비트의 순서와 정확한 헤더 배치는 개념을 보이기 위해 단순화했다)
+</pre>
+
+<p>그렇다고 넓은 테이블에 비용이 없는 것은 아니다. 비용은 NULL이 아니라 다른 곳에 있다. 첫째, 테이블 정의에 한계가 있다. MySQL은 테이블당 4096열이라는 절대 한계가 있고 InnoDB는 테이블당 1017열로 더 작다. 또 MySQL의 내부 표현은 행 하나의 최대 크기를 65,535바이트로 제한하는데, 이것은 열들의 선언된 최대 길이로 계산하므로 <code>VARCHAR</code> 열을 넉넉하게 많이 선언하면 테이블 생성 자체가 실패할 수 있다(<code>BLOB</code>과 <code>TEXT</code> 열은 내용이 따로 저장되어 9~12바이트만 센다). 서브타입이 수십 개이고 각자 고유 열이 많은 계층이라면 이 한계를 진지하게 따져야 한다. 둘째, 서브타입 고유 열의 인덱스는 테이블 전체 크기로 자란다. 다음 단점에서 본다. 셋째, 스키마 변경이 하나의 큰 테이블에 집중된다. 이것도 뒤에서 본다.</p>
+
+<h4>단점 2: 서브타입 열의 인덱스에는 모든 행이 들어간다</h4>
+
+<p>간편결제 사업자의 거래 번호가 중복되면 안 되므로 <code>uk_payment_easy_tx (provider, provider_tx_id)</code> 유니크 키를 걸었다. 카드와 가상계좌 행은 두 열이 모두 NULL인데, 이 행들 때문에 유니크 위반이 나지는 않는다. MySQL 매뉴얼에 따르면 유니크 인덱스는 NULL을 허용하는 열에서 여러 개의 NULL을 허용하기 때문이다. 규칙 자체는 원하는 대로 동작한다.</p>
+
+<p>문제는 인덱스의 크기다. MySQL은 <code>IS NULL</code> 조건에도 인덱스를 쓸 수 있는데, 이것은 NULL 값도 인덱스의 키로 저장된다는 뜻이다. 즉 <code>uk_payment_easy_tx</code>에는 간편결제 행뿐 아니라 카드와 가상계좌 행까지 모든 결제 행의 항목이 들어간다. PostgreSQL의 부분 인덱스처럼 "간편결제 행만 인덱싱한다"는 선언은 MySQL에 없다. 간편결제가 전체 결제의 5%라면 이 인덱스 항목의 95%는 아무도 찾지 않는 <code>(NULL, NULL, payment_id)</code>다. 행 자체에서는 NULL이 비트 하나였지만, 보조 인덱스에서는 NULL 키 항목 하나하나가 인덱스 페이지를 차지하고, 결제가 들어올 때마다 갱신되며, 버퍼 풀을 차지한다. 서브타입 고유 열에 보조 인덱스를 많이 걸수록 이 비용이 쌓인다.</p>
+
+<h4>단점 3: 열의 의미가 흐려지기 쉽다</h4>
+
+<p>단일 테이블에서 가장 흔한 부패는 열 재사용이다. 새 결제 유형 "계좌이체"가 생겼는데 은행 코드와 계좌 번호가 필요하다. 가상계좌용 <code>bank_code</code>, <code>account_no</code> 열이 이미 있으니 그대로 쓰자는 유혹이 생긴다. 그 순간 <code>account_no</code>는 "가상계좌 결제에서는 발급된 입금용 계좌, 계좌이체 결제에서는 고객의 출금 계좌"라는 두 가지 뜻을 갖게 된다. 같은 열에 서로 다른 의미가 담기면 열 이름만 보고 데이터를 해석할 수 없고, 열에 걸린 CHECK와 인덱스도 어느 의미를 위한 것인지 모호해진다. 이런 재사용이 쌓이면 결국 <code>attr1</code>, <code>attr2</code> 같은 범용 열로 가는데, 이것은 08회의 EAV가 가진 문제를 한 테이블 안에 들여온 것과 같다. 단일 테이블 전략을 쓸 때는 열 하나가 서브타입 하나에 속하고 의미가 하나라는 규칙을 지켜야 한다. 두 유형이 진짜로 같은 속성을 공유한다면, 그것은 서브타입 고유 열이 아니라 공통 열이거나 두 유형 사이의 중간 계층이다.</p>
+
+<h4>단점 4: 유형 추가가 큰 테이블의 스키마 변경이 된다</h4>
+
+<p>Q5의 앞부분, 포인트 결제를 추가해 보자. 포인트 결제에 고유 열 <code>point_account_id</code>가 필요하다면 <code>payment</code> 테이블에 열을 추가하고, <code>ck_payment_type</code>의 허용 값 목록을 고치고, 새 서브타입 CHECK를 추가해야 한다. 모두 운영 중인 가장 큰 테이블에 대한 <code>ALTER TABLE</code>이다.</p>
+
+<p>열 추가 자체는 MySQL 8.0에서 많이 가벼워졌다. 8.0.12부터 열 추가의 기본 알고리즘이 <code>INSTANT</code>이고, 8.0.29부터는 <code>INSTANT</code>로 테이블의 어느 위치에나 열을 추가할 수 있다(그 전에는 마지막 열로만 가능했다). <code>INSTANT</code> 열 추가는 테이블 데이터를 다시 쓰지 않고 데이터 딕셔너리의 메타데이터만 바꾼다. 다만 제약이 있다. <code>INSTANT</code>를 지원하지 않는 다른 변경과 한 문장으로 묶을 수 없고, <code>FULLTEXT</code> 인덱스가 있는 테이블이나 <code>ROW_FORMAT=COMPRESSED</code> 테이블에는 쓸 수 없으며, 8.0.29부터는 <code>INSTANT</code>로 열을 추가하거나 삭제할 때마다 늘어나는 행 버전 수가 64에 이르면 더 이상 <code>INSTANT</code>로 처리할 수 없어 테이블을 다시 만들어야 한다. 유형이 자주 추가되는 계층이라면 이 한계에 생각보다 빨리 닿을 수 있다. CHECK 제약을 바꾸는 것도 <code>ALTER TABLE</code>이므로, 실제 운영 테이블에서는 어떤 알고리즘으로 실행되는지 미리 확인해야 한다. 반대로 공통 속성인 통화를 추가하는 Q5의 뒷부분은 이 전략에서 가장 쉽다. 열 하나를 한 테이블에 한 번 추가하면 끝이다.</p>
+
+<h3>조인 전략</h3>
+
+<p>세 번째 전략은 공통 부분과 고유 부분을 나눈다. 슈퍼타입의 공통 속성은 결제 테이블 하나에 두고, 서브타입마다 자기 고유 속성만 가진 테이블을 따로 만든다. 서브타입 테이블의 기본 키는 결제 테이블의 기본 키와 같은 값이고, 동시에 결제 테이블을 가리키는 외래 키다. Jakarta Persistence 명세는 이 전략을 joined subclass라고 부르며, 서브클래스 테이블의 기본 키 열이 슈퍼클래스 테이블의 기본 키를 가리키는 외래 키 역할을 한다고 정의한다. JPA에서는 <code>InheritanceType.JOINED</code>다. 논리 모델의 슈퍼타입 하나와 서브타입 셋이 각각 테이블 하나로 대응하므로, 세 전략 가운데 논리 모델을 가장 그대로 옮긴 모양이다.</p>
+
+<p>앞의 두 전략에서 배운 것을 모두 반영하면 DDL은 다음과 같다. 결제 테이블에 구분 열을 명시적으로 두고, 서브타입 테이블에는 단일 테이블 전략의 입금 통지에서 썼던 상수 저장 생성 열과 복합 외래 키를 쓴다.</p>
+
+<pre><code class="language-sql">CREATE TABLE payment (
+  payment_id    BIGINT       NOT NULL AUTO_INCREMENT,
+  payment_type  VARCHAR(10)  NOT NULL,
+  order_id      BIGINT       NOT NULL,
+  amount        BIGINT       NOT NULL,
+  status        VARCHAR(20)  NOT NULL,
+  requested_at  DATETIME(6)  NOT NULL,
+  PRIMARY KEY (payment_id),
+  UNIQUE KEY uk_payment_id_type (payment_id, payment_type),
+  KEY ix_payment_requested (requested_at),
+  KEY ix_payment_type_requested (payment_type, requested_at),
+  CONSTRAINT ck_payment_amount CHECK (amount > 0),
+  CONSTRAINT ck_payment_type CHECK (payment_type IN ('CARD', 'VBANK', 'EASY'))
+);
+
+CREATE TABLE card_payment (
+  payment_id          BIGINT       NOT NULL,
+  payment_type        VARCHAR(10)  AS ('CARD') STORED,
+  card_company        CHAR(2)      NOT NULL,
+  card_no_masked      VARCHAR(19)  NOT NULL,
+  installment_months  TINYINT      NOT NULL,
+  approval_no         VARCHAR(20)  NOT NULL,
+  PRIMARY KEY (payment_id),
+  CONSTRAINT fk_card_payment_payment FOREIGN KEY (payment_id, payment_type)
+      REFERENCES payment (payment_id, payment_type) ON DELETE CASCADE,
+  CONSTRAINT ck_card_payment_installment CHECK (installment_months BETWEEN 0 AND 24)
+);
+
+CREATE TABLE vbank_payment (
+  payment_id      BIGINT       NOT NULL,
+  payment_type    VARCHAR(10)  AS ('VBANK') STORED,
+  bank_code       CHAR(3)      NOT NULL,
+  account_no      VARCHAR(20)  NOT NULL,
+  depositor_name  VARCHAR(50)  NOT NULL,
+  due_at          DATETIME(6)  NOT NULL,
+  PRIMARY KEY (payment_id),
+  CONSTRAINT fk_vbank_payment_payment FOREIGN KEY (payment_id, payment_type)
+      REFERENCES payment (payment_id, payment_type) ON DELETE CASCADE
+);
+
+CREATE TABLE easy_payment (
+  payment_id      BIGINT       NOT NULL,
+  payment_type    VARCHAR(10)  AS ('EASY') STORED,
+  provider        VARCHAR(20)  NOT NULL,
+  provider_tx_id  VARCHAR(64)  NOT NULL,
+  PRIMARY KEY (payment_id),
+  UNIQUE KEY uk_easy_payment_tx (provider, provider_tx_id),
+  CONSTRAINT fk_easy_payment_payment FOREIGN KEY (payment_id, payment_type)
+      REFERENCES payment (payment_id, payment_type) ON DELETE CASCADE
+);
+
+-- 서브타입 전용 관계는 서브타입 테이블을, 유형 무관 관계는 결제 테이블을 참조한다
+CREATE TABLE vbank_deposit (
+  deposit_id        BIGINT       NOT NULL AUTO_INCREMENT,
+  payment_id        BIGINT       NOT NULL,
+  deposited_amount  BIGINT       NOT NULL,
+  deposited_at      DATETIME(6)  NOT NULL,
+  PRIMARY KEY (deposit_id),
+  CONSTRAINT fk_vbank_deposit_vbank FOREIGN KEY (payment_id) REFERENCES vbank_payment (payment_id)
+);
+
+CREATE TABLE refund (
+  refund_id   BIGINT  NOT NULL AUTO_INCREMENT,
+  payment_id  BIGINT  NOT NULL,
+  amount      BIGINT  NOT NULL,
+  PRIMARY KEY (refund_id),
+  CONSTRAINT fk_refund_payment FOREIGN KEY (payment_id) REFERENCES payment (payment_id)
+);</code></pre>
+
+<p>이 DDL을 부분별로 읽어 보자. 첫째, 서브타입 테이블의 고유 열이 다시 모두 <code>NOT NULL</code>이다. 카드 결제 테이블에는 카드 결제의 상세만 들어오므로 구현 클래스마다 테이블 전략과 같은 이유로 열 단위 필수 규칙을 그대로 쓸 수 있다. 단일 테이블에서 행 단위 CHECK 세 개로 겨우 되찾았던 규칙이 여기서는 열 선언만으로 해결된다. 둘째, 공통 속성과 공통 규칙은 결제 테이블 한 곳에만 있다. 금액 CHECK도 하나, 요청 시각 인덱스도 하나다. 셋째, 결제 번호는 결제 테이블의 <code>AUTO_INCREMENT</code>가 한 번 만들고 서브타입 테이블은 그 값을 받아 쓰므로, 식별자는 처음부터 전체에서 유일하다.</p>
+
+<p>넷째, 참조 관계가 논리 모델 그대로 표현된다. 환불은 결제 테이블을, 입금 통지는 가상계좌 결제 테이블을 평범한 단일 열 외래 키로 참조한다. 단일 테이블 전략에서는 입금 통지에 상수 생성 열을 따로 두어야 했지만, 조인 전략에서는 가상계좌 결제 테이블 자체가 "가상계좌 결제의 집합"이므로 그 테이블을 가리키기만 하면 된다. Q4의 두 요구가 모두 가장 단순한 외래 키로 풀린다.</p>
+
+<p>다섯째, 서브타입 테이블의 외래 키에 <code>ON DELETE CASCADE</code>를 걸었다. 결제가 지워지면 상세 행도 함께 지워진다. 앞에서 MySQL이 저장 생성 열에 대한 외래 키의 일부 참조 동작을 금지한다고 했는데, 매뉴얼이 금지하는 것은 <code>ON UPDATE</code>의 <code>CASCADE</code>·<code>SET NULL</code>·<code>SET DEFAULT</code>와 <code>ON DELETE</code>의 <code>SET NULL</code>·<code>SET DEFAULT</code>다. <code>ON DELETE CASCADE</code>는 허용된다. 상세 행은 부모가 사라지면 존재 의미가 없으므로 연쇄 삭제가 자연스럽다. 다만 환불의 외래 키에는 참조 동작을 지정하지 않았으므로, 환불이 달린 결제는 삭제가 거부된다. 결제 기록을 실제로 지우는 대신 05회의 Soft Delete를 쓰는 경우가 많다는 점도 함께 기억하자.</p>
+
+<p>여섯째, 숨은 비용이 하나 있다. 외래 키 <code>(payment_id, payment_type)</code>을 걸려면 자식 테이블에 이 두 열이 같은 순서로 맨 앞에 오는 인덱스가 있어야 한다. 기본 키는 <code>(payment_id)</code> 한 열뿐이므로 조건을 채우지 못하고, MySQL 매뉴얼에 따르면 이런 인덱스가 없을 때 MySQL이 자식 테이블에 자동으로 만든다. 서브타입 테이블마다 보조 인덱스가 하나씩 생기는 셈이다. 행이 좁은 상세 테이블이라 부담은 크지 않지만, <code>SHOW CREATE TABLE</code>에 직접 만들지 않은 인덱스가 보이는 이유가 이것이다. 위 DDL로 만든 <code>card_payment</code>를 확인하면 외래 키 이름과 같은 이름의 인덱스가 생겨 있다.</p>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">CREATE TABLE `card_payment` (
+  `payment_id` bigint NOT NULL,
+  `payment_type` varchar(10) GENERATED ALWAYS AS (_latin1'CARD') STORED,
+  `card_company` char(2) NOT NULL,
+  `card_no_masked` varchar(19) NOT NULL,
+  `installment_months` tinyint NOT NULL,
+  `approval_no` varchar(20) NOT NULL,
+  PRIMARY KEY (`payment_id`),
+  KEY `fk_card_payment_payment` (`payment_id`,`payment_type`),
+  CONSTRAINT `fk_card_payment_payment` FOREIGN KEY (`payment_id`, `payment_type`) REFERENCES `payment` (`payment_id`, `payment_type`) ON DELETE CASCADE,
+  CONSTRAINT `ck_card_payment_installment` CHECK ((`installment_months` between 0 and 24))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci</code></pre>
+
+<x-visual id="db-design2-07-joined-integrity" title="조인 전략의 테이블 구조와 복합 외래 키" kind="구조 다이어그램" ratio="16:9">
+<x-hint>결제 테이블의 (payment_id, payment_type) 유니크 키를 세 상세 테이블이 복합 외래 키로 가리키고, 상세 테이블의 payment_type은 상수 생성 열이라는 점을 보여 준다.</x-hint>
+<x-prompt>데이터베이스 테이블 구조도. 가운데 위에 테이블 상자 "payment"가 있고 안에 열 이름 payment_id, payment_type, amount, requested_at이 세로로 적혀 있다. payment_id와 payment_type 두 줄을 묶는 노란 테두리에 라벨 "유니크 키 (payment_id, payment_type)". 아래쪽에 세 테이블 상자 "card_payment", "vbank_payment", "easy_payment"가 가로로 나란히 있다. 각 상자 맨 위 두 줄은 payment_id와 payment_type이고, payment_type 옆에 작은 회색 글씨로 각각 "= 'CARD' 고정", "= 'VBANK' 고정", "= 'EASY' 고정". 세 상자의 두 줄 묶음에서 위의 노란 테두리로 화살표가 올라가고 화살표에 라벨 "복합 외래 키". 왼쪽 위에 상자 "refund"가 payment로 화살표, 오른쪽 아래에 상자 "vbank_deposit"이 vbank_payment로 화살표. 흰 배경, 평면 스타일, 상자는 연한 파랑.</x-prompt>
+<x-caption>상세 테이블의 유형 값이 상수로 고정되어 있어서, 외래 키가 "그 번호를 가진 같은 유형의 결제"를 찾게 된다.</x-caption>
+</x-visual>
+
+<h4>복합 외래 키가 배타성을 지키는 과정</h4>
+
+<p>조인 전략에서 서브타입 테이블이 결제 번호 하나만으로 결제를 참조하면, 한 결제 번호가 카드 결제 테이블과 가상계좌 결제 테이블에 동시에 들어가는 것을 막을 방법이 없다. 두 외래 키가 각자 "그 번호의 결제가 있는가"만 확인하기 때문이다. 결제 테이블의 구분 열과 상세 테이블의 상수 생성 열을 함께 외래 키로 묶으면 확인하는 내용이 "그 번호를 가진, 이 유형의 결제가 있는가"로 바뀐다. 실제 시도로 따라가 보자.</p>
+
+<div class="table-wrap"><table><thead><tr><th>시도</th><th>외래 키가 확인하는 부모 키</th><th>결과</th></tr></thead><tbody>
+<tr><td>결제 42를 <code>'CARD'</code>로 넣은 뒤 <code>card_payment</code>에 42 삽입</td><td><code>(42, 'CARD')</code></td><td>부모가 있어 통과</td></tr>
+<tr><td>같은 42로 <code>vbank_payment</code>에 삽입</td><td><code>(42, 'VBANK')</code></td><td>부모가 없어 거부. 한 결제에 두 유형의 상세가 생기지 않는다</td></tr>
+<tr><td><code>card_payment</code>에 42가 있는 상태에서 결제 42의 <code>payment_type</code>을 <code>'EASY'</code>로 변경</td><td>자식이 참조하는 <code>(42, 'CARD')</code>가 사라지려 함</td><td>참조 동작을 지정하지 않았으므로(<code>NO ACTION</code>, InnoDB에서는 <code>RESTRICT</code>와 같다) 즉시 거부</td></tr>
+<tr><td>결제 42 삭제(환불 없음)</td><td>—</td><td><code>ON DELETE CASCADE</code>로 <code>card_payment</code>의 42도 함께 삭제</td></tr>
+</tbody></table></div>
+
+<p>세 번째 줄이 특히 중요하다. 결제의 유형을 바꾸는 것은 "카드 결제였던 것이 간편결제가 된다"는 뜻인데, 그러려면 카드 상세를 지우고 간편결제 상세를 만들어야 한다. 복합 외래 키는 상세를 그대로 둔 채 구분 열만 바꾸는 반쪽짜리 변경을 거부한다. 자바 객체의 실행 시점 클래스를 바꿀 수 없는 것처럼, 유형 변경을 "삭제 후 새로 생성"으로만 할 수 있게 만든 것이다. 표의 네 시도를 위 DDL에 그대로 실행하면 둘째 줄과 셋째 줄이 다음 오류로 거부되고, 넷째 줄의 삭제 뒤에는 <code>card_payment</code>에서 42번이 0건으로 조회된다.</p>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-text">ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint fails (`m_db_design2_07`.`vbank_payment`, CONSTRAINT `fk_vbank_payment_payment` FOREIGN KEY (`payment_id`, `payment_type`) REFERENCES `payment` (`payment_id`, `payment_type`) ON DELETE CASCADE)
+ERROR 1451 (23000): Cannot delete or update a parent row: a foreign key constraint fails (`m_db_design2_07`.`card_payment`, CONSTRAINT `fk_card_payment_payment` FOREIGN KEY (`payment_id`, `payment_type`) REFERENCES `payment` (`payment_id`, `payment_type`) ON DELETE CASCADE)</code></pre>
+
+<h4>완전성: 데이터베이스가 선언으로 지킬 수 없는 규칙</h4>
+
+<p>배타성은 지켰다. 그러면 완전성, 즉 "모든 결제에는 자기 유형의 상세 행이 정확히 하나 있다"는 어떨까? 상세가 두 개 이상일 수 없다는 것은 상세 테이블의 기본 키가 결제 번호라는 사실로 이미 보장된다. 남은 것은 "적어도 하나"다. 결제 테이블에 <code>'CARD'</code> 행만 있고 카드 상세가 없는 상태를 막을 수 있는가?</p>
+
+<p>MySQL의 선언적 제약으로는 막을 수 없다. 이유를 하나씩 따져 보자. CHECK 제약은 한 행 안의 값만 볼 수 있다. MySQL 매뉴얼은 CHECK 식에 다른 테이블의 열과 서브쿼리를 쓸 수 없다고 명시하므로 "카드 상세 테이블에 내 번호가 있다"는 조건은 CHECK로 쓸 수 없다. 외래 키는 자식이 부모를 가리키는 방향으로만 존재를 확인한다. 부모에게 "자식이 있어야 한다"고 요구하는 장치는 아니다. 결제 테이블에서 상세 테이블로 거꾸로 외래 키를 하나 더 걸어 순환을 만드는 방법을 생각해 볼 수 있지만, 그러면 결제와 상세 중 어느 것도 먼저 넣을 수 없다. 결제를 넣는 순간 아직 없는 상세를 찾아야 하고, 상세를 넣는 순간 아직 없는 결제를 찾아야 하기 때문이다. SQL 표준은 제약 검사를 트랜잭션 끝으로 미루는 방법을 두고 있지만, MySQL 매뉴얼은 MySQL이 외래 키 제약을 즉시 검사하며 그 검사를 트랜잭션 커밋 시점으로 미루지 않는다고 적는다. 여러 행을 바꾸는 문장에서도 외래 키는 행 단위로 검사된다.</p>
+
+<p>따라서 완전성은 데이터베이스 바깥의 규율로 지켜야 한다. 첫째 장치는 트랜잭션이다. 결제 행과 상세 행을 반드시 한 트랜잭션 안에서 넣으면, 중간에 오류가 나도 롤백되어 결제만 남는 일이 없다. 다른 트랜잭션에서 그 사이 상태를 볼 수도 없다. InnoDB의 일관된 읽기는 커밋되지 않은 행을 보여 주지 않으므로, <code>READ UNCOMMITTED</code>를 쓰지 않는 한 다른 트랜잭션에는 결제와 상세가 커밋 시점에 함께 나타난다. 둘째 장치는 검증 쿼리다. 수동 쿼리나 버그로 규칙이 깨졌는지 주기적으로 찾아낸다.</p>
+
+<pre><code class="language-sql">-- 상세 행이 없는 결제를 찾는다(완전성 위반)
+SELECT p.payment_id, p.payment_type
+  FROM payment p
+ WHERE (p.payment_type = 'CARD'
+        AND NOT EXISTS (SELECT 1 FROM card_payment  c WHERE c.payment_id = p.payment_id))
+    OR (p.payment_type = 'VBANK'
+        AND NOT EXISTS (SELECT 1 FROM vbank_payment v WHERE v.payment_id = p.payment_id))
+    OR (p.payment_type = 'EASY'
+        AND NOT EXISTS (SELECT 1 FROM easy_payment  e WHERE e.payment_id = p.payment_id));</code></pre>
+
+<p>복합 외래 키 덕분에 상세 행의 유형은 언제나 결제의 유형과 일치하므로, 이 쿼리는 "자기 유형의 상세가 없는 결제"만 찾으면 충분하다. 복합 외래 키 없이 결제 번호만으로 참조하는 설계였다면 "두 유형의 상세를 동시에 가진 결제"와 "구분 열과 다른 유형의 상세를 가진 결제"까지 따로 찾아야 한다. 선언적 제약 하나가 검증 쿼리 두 개를 없앤 셈이다.</p>
+
+<h4>다섯 질문을 조인 전략으로 풀기</h4>
+
+<p>Q1(오늘의 카드 결제)은 카드 상세와 결제를 조인한다. 여기서 논리적으로는 필요 없는 조건 하나가 성능에 영향을 준다.</p>
+
+<pre><code class="language-sql">SELECT p.payment_id, p.amount, c.card_company, c.approval_no
+  FROM payment p
+  JOIN card_payment c ON c.payment_id = p.payment_id
+ WHERE p.payment_type = 'CARD'                 -- 조인만으로도 카드 결제만 남지만 넣는다
+   AND p.requested_at >= '2026-11-17 00:00:00'
+   AND p.requested_at <  '2026-11-18 00:00:00';</code></pre>
+
+<p>카드 상세와 조인하면 결과에는 카드 결제만 남으므로 <code>p.payment_type = 'CARD'</code>는 결과를 바꾸지 않는다. 그런데 이 조건이 없으면 결제 테이블에서 쓸 수 있는 인덱스는 <code>ix_payment_requested</code>뿐이고, 그 범위에는 오늘의 모든 유형 결제가 들어 있다. 결제 테이블을 먼저 읽는 계획이라면 가상계좌와 간편결제 행마다 카드 상세 테이블을 찾아가 헛걸음을 하게 된다. 조건을 넣으면 <code>ix_payment_type_requested</code>로 카드 결제의 오늘 구간만 읽을 수 있다. 어느 계획을 고를지는 옵티마이저가 통계로 정하지만, 고를 수 있는 길을 열어 주는 것은 쿼리를 쓰는 사람이다. 구분 열을 명시적으로 둔 효과가 여기서도 나타난다.</p>
+
+<p>결제 90,000건(1분 간격, 세 유형이 번갈아 들어감)과 각 유형의 상세 행을 넣고 하루 구간으로 두 쿼리를 비교해 보면 차이가 계획에 그대로 드러난다. 비용과 <code>rows</code> 추정치는 실행 환경과 통계에 따라 달라진다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 같은 계획)"><code class="language-text">-- p.payment_type = 'CARD'를 넣은 경우
+-> Nested loop inner join  (cost=384 rows=480)
+    -> Index range scan on p using ix_payment_type_requested over (payment_type = 'CARD' AND '2026-10-17 00:00:00.000000' &lt;= requested_at &lt; '2026-10-18 00:00:00.000000'), with index condition: (...)  (cost=216 rows=480)
+    -> Single-row index lookup on c using PRIMARY (payment_id=p.payment_id)  (cost=0.25 rows=1)
+
+-- 유형 조건을 뺀 경우
+-> Nested loop inner join  (cost=1152 rows=1440)
+    -> Index range scan on p using ix_payment_requested over ('2026-10-17 00:00:00.000000' &lt;= requested_at &lt; '2026-10-18 00:00:00.000000'), with index condition: (...)  (cost=648 rows=1440)
+    -> Single-row index lookup on c using PRIMARY (payment_id=p.payment_id)  (cost=0.25 rows=1)</code></pre>
+
+<p>(<code>with index condition</code> 뒤의 긴 조건식은 <code>(...)</code>로 줄였다.) 유형 조건을 빼면 하루치 결제 1,440건을 모두 읽으며 그때마다 카드 상세를 찾아가고, 그중 3분의 2는 상세를 찾지 못한다. 조건을 넣으면 카드 결제 480건만 읽는다.</p>
+
+<p>Q2(유형 무관 최근 20건)는 상세까지 보여 줄지에 따라 달라진다. 목록 화면이 공통 속성만 보여 준다면 결제 테이블 하나에 <code>ORDER BY requested_at DESC LIMIT 20</code>을 걸면 끝이고, 단일 테이블 전략과 똑같이 실행된다. 오히려 결제 테이블에는 공통 열만 있어 행이 좁으므로, 16KB InnoDB 페이지 하나에 더 많은 행이 들어간다. 상세까지 한 번에 보여 주려면 세 상세 테이블을 모두 <code>LEFT JOIN</code>해야 한다.</p>
+
+<pre><code class="language-sql">SELECT p.payment_id, p.payment_type, p.amount, p.status, p.requested_at,
+       c.card_company, c.approval_no, v.bank_code, v.due_at, e.provider
+  FROM payment p
+  LEFT JOIN card_payment  c ON c.payment_id = p.payment_id
+  LEFT JOIN vbank_payment v ON v.payment_id = p.payment_id
+  LEFT JOIN easy_payment  e ON e.payment_id = p.payment_id
+ ORDER BY p.requested_at DESC
+ LIMIT 20;</code></pre>
+
+<p>MySQL 매뉴얼의 외부 조인 최적화 설명에 따르면 <code>A LEFT JOIN B</code>에서 B는 A에 의존하도록 설정되고, 테이블은 자신이 의존하는 테이블을 모두 읽은 뒤에 읽힌다. 따라서 이 쿼리는 결제 테이블을 먼저 읽는다. 옵티마이저가 <code>ix_payment_requested</code>로 정렬을 대신하는 계획을 고르면 실행은 이렇게 흘러간다. 인덱스를 뒤에서부터 한 항목 읽고, 그 항목에 든 기본 키로 결제 테이블의 클러스터형 인덱스에서 행을 읽고, 같은 결제 번호로 세 상세 테이블의 기본 키 인덱스를 차례로 찾는다. 이것을 20번 반복하면 멈춘다. 상세 테이블 탐색은 모두 60번인데, 결제 하나는 상세가 하나뿐이므로 그중 40번은 아무것도 찾지 못하고 돌아온다. 서브타입이 열 개라면 결제 하나당 9번이 헛걸음이다.</p>
+
+<p>앞의 결제 90,000건 데이터에서 이 쿼리의 계획과, 실행 전후의 세션 핸들러 카운터를 확인한 결과다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 같은 결과)"><code class="language-text">-> Limit: 20 row(s)  (cost=67423 rows=20)
+    -> Nested loop left join  (cost=67423 rows=20)
+        -> Nested loop left join  (cost=44949 rows=20)
+            -> Nested loop left join  (cost=22474 rows=20)
+                -> Index scan on p using ix_payment_requested (reverse)  (cost=0.0236 rows=20)
+                -> Single-row index lookup on c using PRIMARY (payment_id=p.payment_id)  (cost=0.25 rows=1)
+            -> Single-row index lookup on v using PRIMARY (payment_id=p.payment_id)  (cost=0.25 rows=1)
+        -> Single-row index lookup on e using PRIMARY (payment_id=p.payment_id)  (cost=0.25 rows=1)
+
+-- FLUSH STATUS 후 쿼리 실행, SHOW SESSION STATUS
+Handler_read_last   1
+Handler_read_prev   19
+Handler_read_key    61</code></pre>
+
+<p>옵티마이저는 실제로 <code>ix_payment_requested</code>를 역순으로 읽는 계획을 골랐다. 인덱스 항목은 <code>Handler_read_last</code> 1번과 <code>Handler_read_prev</code> 19번으로 정확히 20개를 읽었다. 결제 테이블만 같은 방식으로 20건 읽는 쿼리에서는 <code>Handler_read_key</code>가 1이었으므로, 여기서 늘어난 60이 세 상세 테이블의 기본 키 탐색 횟수다.</p>
+
+<p>그래서 실무에서는 두 단계로 나누는 경우가 많다. 먼저 결제 테이블에서 20건을 가져오고, 애플리케이션이 유형별로 결제 번호를 모아 해당 상세 테이블만 <code>WHERE payment_id IN (...)</code>으로 조회한다. 쿼리는 최대 1 + 서브타입 수만큼 나가지만, 각 쿼리는 실제로 존재하는 행만 찾는다. JPA 활용 2편에서 본 컬렉션 조회 최적화와 같은 발상이다.</p>
+
+<p>Q3(결제 42번 상세, 유형 모름)도 두 가지 방법이 있다. 결제 테이블을 기본 키로 한 번 읽어 유형을 알아낸 다음 그 유형의 상세 테이블을 기본 키로 한 번 더 읽으면, 기본 키 조회 두 번으로 끝난다. 쿼리 하나로 하려면 Q2처럼 모든 상세 테이블을 <code>LEFT JOIN</code>해야 한다. 뒤에서 보겠지만 Hibernate는 유형을 모르는 단건 조회에 이 방식을 쓴다.</p>
+
+<p>Q4는 앞에서 본 대로 평범한 외래 키 두 개로 끝났다. Q5의 포인트 결제 추가는 <code>point_payment</code> 테이블을 새로 만들고 <code>ck_payment_type</code>의 허용 값에 <code>'POINT'</code>를 더하는 일이다. 새 테이블 생성은 운영 중인 테이블에 아무 영향이 없지만, CHECK 수정은 결제 테이블에 대한 <code>ALTER TABLE</code>이다. 이것마저 피하고 싶다면 01회에서 본 방식대로 결제 유형을 코드 테이블로 만들고 결제 테이블이 외래 키로 참조하게 하면 된다. 그러면 유형 추가는 코드 테이블에 행 하나를 넣고 상세 테이블 하나를 만드는 일이 되어, 기존 테이블의 정의를 전혀 바꾸지 않는다. 모든 결제에 통화를 추가하는 일은 결제 테이블 한 곳에 열 하나를 추가하면 끝난다.</p>
+
+<h3>조인 전략의 장단점</h3>
+
+<h4>장점: 무결성과 변경이 모두 제자리에 있다</h4>
+
+<p>조인 전략의 장점은 "모든 것이 한 곳에만 있다"로 요약된다. 공통 속성과 공통 규칙은 결제 테이블에만 있으므로 통화 열 추가도, 금액 규칙 변경도 한 번이다. 서브타입 고유 속성은 자기 테이블에만 있으므로 <code>NOT NULL</code>로 필수 여부를 그대로 선언하고, 그 열에 거는 보조 인덱스에는 그 서브타입의 행만 들어간다. 단일 테이블에서 간편결제 거래 번호 유니크 키가 모든 결제 행의 NULL 항목을 품었던 것과 달리, 여기서 <code>uk_easy_payment_tx</code>에는 간편결제 행만 들어 있다. 슈퍼타입을 가리키는 관계와 서브타입을 가리키는 관계가 모두 단일 열 외래 키로 표현되고, 식별자 충돌도 없다. 새 유형 추가가 새 테이블 생성이라는 점은 구현 클래스마다 테이블 전략의 장점을 그대로 물려받은 것이다.</p>
+
+<h4>단점 1: 쓰기가 두 번이고, 외래 키 검사가 잠금을 건다</h4>
+
+<p>결제 하나를 만들려면 결제 테이블과 상세 테이블에 한 번씩, 두 번 <code>INSERT</code>해야 한다. 두 테이블의 클러스터형 인덱스와 보조 인덱스가 모두 갱신되고, 상세 행을 넣을 때마다 외래 키 검사가 결제 테이블의 <code>uk_payment_id_type</code>을 찾아본다. MySQL 매뉴얼은 외래 키 조건을 검사해야 하는 삽입·수정·삭제가, 검사하려고 들여다본 레코드에 공유 레코드 잠금을 건다고 설명한다. 결제를 만드는 트랜잭션 안에서는 방금 자기가 넣은 결제 행이므로 충돌이 없지만, 입금 통지처럼 이미 있는 부모 행을 참조하는 자식을 넣을 때는 사정이 다르다. 같은 가상계좌 결제 행의 상태를 다른 트랜잭션이 바꾸고 있다면(배타 잠금), 입금 통지 삽입은 그 트랜잭션이 끝날 때까지 기다린다. 외래 키가 많을수록 쓰기 경로에 이런 잠금 지점이 늘어난다.</p>
+
+<h4>단점 2: 다형 조회와 전체 객체 조회에 조인이 따라온다</h4>
+
+<p>Q2와 Q3에서 본 것처럼 서브타입을 모르는 상태로 완전한 객체를 만들려면 모든 서브타입 테이블을 <code>LEFT JOIN</code>해야 한다. 서브타입이 셋이면 조인이 셋이고, 서른이면 서른이다. 계층이 여러 단계라면 손자 클래스의 객체 하나를 만드는 데 단계 수만큼 조인이 필요하다. Jakarta Persistence 명세도 이 전략의 단점으로 서브클래스 인스턴스를 만들려면 조인이 하나 이상 필요하고, 깊은 클래스 계층에서는 받아들일 수 없는 성능으로 이어질 수 있으며, 계층 전체를 대상으로 하는 질의도 마찬가지로 조인이 필요하다고 적는다. MySQL에는 한 조인에서 참조할 수 있는 테이블이 61개라는 한계도 있다. 서브타입이 수십 개인 계층을 조인 전략으로 만들고 다형 조회를 쿼리 하나로 하려 한다면 이 숫자를 의식해야 한다.</p>
+
+<h4>단점 3: 인덱스는 테이블 경계를 넘지 못한다</h4>
+
+<p>조인 전략에서 가장 늦게 깨닫는 비용이 이것이다. "카드사 코드가 <code>'04'</code>인 결제를 최근 순으로 20건" 같은 질의를 생각해 보자. 단일 테이블이었다면 <code>(card_company, requested_at)</code> 복합 인덱스 하나로 해당 카드사 구간을 뒤에서부터 20개만 읽고 끝낼 수 있다. 조인 전략에서는 <code>card_company</code>가 카드 상세 테이블에, <code>requested_at</code>이 결제 테이블에 있다. 인덱스는 테이블 하나의 열로만 만들 수 있으므로 두 열을 묶은 인덱스는 만들 수 없다.</p>
+
+<p>옵티마이저에게 남는 길은 둘이다. 카드 상세 테이블에서 카드사가 <code>'04'</code>인 행을 모두 찾아 결제 테이블과 조인한 뒤 요청 시각으로 정렬하는 방법은 그 카드사의 결제가 많을수록 느려진다. 결제 테이블의 <code>ix_payment_requested</code>를 뒤에서부터 읽으며 카드 상세를 찾아 카드사를 확인하는 방법은 그 카드사가 드물수록 느려진다. 20건을 채울 때까지 다른 카드사와 다른 유형의 결제를 계속 건너뛰어야 하기 때문이다. 어느 쪽도 단일 테이블의 복합 인덱스만큼 좋지 않다. 이 질의가 중요하다면 결제 테이블의 요청 시각을 카드 상세 테이블에도 복사해 두고 <code>(card_company, requested_at)</code> 인덱스를 거는 반정규화를 고려한다. 이때 복사하는 값은 요청 시각처럼 한 번 정해지면 바뀌지 않는 속성이어야 한다. 상태처럼 바뀌는 값을 복사하면 두 곳을 함께 갱신하는 책임이 새로 생긴다.</p>
+
+<h4>단점 4: 완전성은 애플리케이션의 몫이다</h4>
+
+<p>앞에서 따진 대로 "상세 없는 결제"는 선언적 제약으로 막을 수 없다. 단일 테이블 전략에서는 한 행에 공통 열과 고유 열이 함께 있으므로 CHECK 하나로 완전성까지 지켰던 것과 대비된다. 조인 전략은 구조가 가장 정규화되어 있지만, 그 대가로 하나의 논리적 개체가 두 테이블의 두 행으로 나뉘었고, 두 행이 함께 존재해야 한다는 규칙은 트랜잭션과 검증 쿼리에 맡겨야 한다.</p>
+
+<h3>JPA 구현체가 만드는 SQL로 다시 보기</h3>
+
+<p>지금까지는 사람이 SQL을 직접 쓴다고 가정했다. 실제로는 JPA의 <code>@Inheritance</code>로 매핑하고 SQL은 구현체가 만드는 경우가 많다. 앞에서 "Hibernate는 구현 클래스마다 테이블 전략에서 <code>IDENTITY</code> 키 생성을 거부한다"고 미뤄 둔 이야기를 포함해, 구현체가 각 전략에서 어떤 SQL을 만드는지 직접 실행해 확인해 보자. 실험 환경은 JDK 21, Hibernate ORM 6.6.53.Final, 인메모리 H2 2.3.232다. 쿼리는 H2에서 실제로 실행해 Hibernate가 출력한 SQL을 옮겼고, MySQL용 DDL은 <code>MySQLDialect</code>를 지정해 데이터베이스 연결 없이 스키마 생성 스크립트로 뽑았다. 엔티티는 실험마다 <code>@Inheritance</code>와 <code>@GeneratedValue</code>만 바꿨다.</p>
+
+<pre><code class="language-java">// import jakarta.persistence.*; import java.time.LocalDateTime; 은 생략
+@Entity
+@Table(name = "payment")
+@Inheritance(strategy = InheritanceType.TABLE_PER_CLASS)   // 실험마다 바꾼다
+public abstract class Payment {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)  // 실험마다 바꾼다
+    @Column(name = "payment_id")
+    Long id;
+
+    long amount;
+
+    @Column(name = "requested_at")
+    LocalDateTime requestedAt;
+
+    protected Payment() {}
+    protected Payment(long amount, LocalDateTime t) { this.amount = amount; this.requestedAt = t; }
+    public Long getId() { return id; }
+}
+
+@Entity
+@Table(name = "card_payment")
+@DiscriminatorValue("CARD")
+public class CardPayment extends Payment {
+    @Column(name = "card_company")
+    String cardCompany;
+
+    protected CardPayment() {}
+    public CardPayment(long amount, LocalDateTime t, String cardCompany) {
+        super(amount, t);
+        this.cardCompany = cardCompany;
+    }
+}
+// VbankPayment(vbank_payment 테이블, bank_code 열), EasyPayment(easy_payment, provider)도 같은 모양이다</code></pre>
+
+<p>실험 프로그램은 9시 정각의 카드 결제, 9시 1분의 가상계좌 결제, 9시 2분의 간편결제를 하나씩 저장한 뒤 세 가지를 실행한다. JPQL <code>select p from Payment p order by p.requestedAt desc</code>에 <code>setMaxResults(20)</code>을 건 다형 조회, <code>select c from CardPayment c where c.requestedAt >= :t</code>라는 서브타입 조회, 그리고 카드 결제의 번호로 <code>find(Payment.class, id)</code>를 호출하는 유형 모르는 단건 조회다. 아래 출력은 줄 바꿈과 들여쓰기만 줄였다.</p>
+
+<h4>구현 클래스마다 테이블 + IDENTITY: 시작하자마자 거부된다</h4>
+
+<pre data-label="실행 결과"><code class="language-text">Exception in thread "main" org.hibernate.MappingException: Cannot use identity column key generation with &lt;union-subclass&gt; mapping for: tpcid.CardPayment</code></pre>
+
+<p>세션 팩토리를 만드는 단계, 즉 매핑 정보를 읽는 단계에서 예외가 난다(<code>tpcid</code>는 실험용 패키지 이름이다). <code>&lt;union-subclass&gt;</code>는 Hibernate의 XML 매핑 시절부터 쓰던 구현 클래스마다 테이블 전략의 이름이다. 이유는 앞에서 따진 그대로다. <code>IDENTITY</code>는 행을 넣을 때 데이터베이스가 그 테이블의 카운터로 번호를 정하는 방식인데, 이 전략에서는 테이블이 서브타입마다 따로 있으므로 카운터도 따로 있고 번호가 겹친다. Hibernate 6.6의 영속성 컨텍스트가 엔티티를 구분하는 키(<code>EntityKey</code>)는 루트 엔티티 이름과 식별자가 같으면 같은 엔티티로 본다(바이트코드로 확인했다). 계층 안에서 "결제 1번"이 둘이면 1차 캐시부터 성립하지 않는 것이다. Hibernate는 이 위험한 조합을 실행 시점까지 기다리지 않고 매핑 단계에서 막는다.</p>
+
+<h4>구현 클래스마다 테이블 + SEQUENCE: 공유 번호 공급원과 UNION ALL</h4>
+
+<p>키 생성을 <code>GenerationType.SEQUENCE</code>로 바꾸면 매핑이 통과한다. <code>MySQLDialect</code>로 뽑은 DDL은 다음과 같다(같은 모양의 <code>easy_payment</code>, <code>vbank_payment</code>는 생략했다).</p>
+
+<pre data-label="MySQLDialect 스키마 스크립트(일부)"><code class="language-sql">create table card_payment (
+    amount bigint not null,
+    payment_id bigint not null,
+    requested_at datetime(6),
+    card_company varchar(255),
+    primary key (payment_id)
+) engine=InnoDB;
+
+create table payment_SEQ (
+    next_val bigint
+) engine=InnoDB;
+
+insert into payment_SEQ values ( 1 );</code></pre>
+
+<p>두 가지가 보인다. 첫째, 추상 클래스 <code>Payment</code>에 <code>@Table(name = "payment")</code>를 붙였는데도 <code>payment</code> 테이블은 만들어지지 않았다. 이 전략에서 추상 슈퍼타입은 테이블을 갖지 않는다. 둘째, MySQL에는 시퀀스 객체가 없으므로 Hibernate는 <code>next_val</code> 열 하나를 가진 <code>payment_SEQ</code> 테이블을 만들어 시퀀스를 흉내 낸다. 앞에서 <code>LAST_INSERT_ID(expr)</code>로 만든 <code>payment_seq</code>와 같은 발상으로, 세 서브타입 테이블이 번호 공급원 하나를 공유한다. 이것도 여전히 약속일 뿐이어서, 이 테이블을 거치지 않고 넣은 행의 중복은 막지 못한다.</p>
+
+<p>다형 조회에서 Hibernate가 만든 SQL은 이렇다. H2 방언이라 페이징이 <code>fetch first ? rows only</code>로 나왔는데, 페이징 구문은 방언마다 다르다.</p>
+
+<pre data-label="다형 조회(최근 20건)"><code class="language-sql">select p1_0.payment_id, p1_0.clazz_, p1_0.amount, p1_0.requested_at,
+       p1_0.card_company, p1_0.provider, p1_0.bank_code
+  from (select amount, payment_id, requested_at, card_company,
+               null as bank_code, null as provider, 1 as clazz_
+          from card_payment
+        union all
+        select amount, payment_id, requested_at, null as card_company,
+               bank_code, null as provider, 2 as clazz_
+          from vbank_payment
+        union all
+        select amount, payment_id, requested_at, null as card_company,
+               null as bank_code, provider, 3 as clazz_
+          from easy_payment) p1_0
+ order by p1_0.requested_at desc
+ fetch first ? rows only
+  -> EasyPayment
+  -> VbankPayment
+  -> CardPayment</code></pre>
+
+<p>앞에서 손으로 쓴 <code>UNION ALL</code>과 같은 구조다. 블록마다 다른 서브타입의 고유 열 자리를 <code>null as ...</code>로 채워 열 개수를 맞췄고, 어느 테이블에서 온 행인지 알려 주는 상수 열 <code>clazz_</code>를 1, 2, 3으로 넣었다. Hibernate는 이 값을 보고 어느 클래스의 객체를 만들지 정한다. 결과 객체가 요청 시각 역순으로 간편결제, 가상계좌, 카드 순서로 나온 것도 확인할 수 있다.</p>
+
+<p>중요한 것은 정렬과 페이징의 위치다. <code>order by</code>와 페이징은 <code>UNION ALL</code> 전체를 감싼 파생 테이블(derived table) <code>p1_0</code> 바깥에 있고, 블록 안에는 없다. 앞에서 사람이 블록마다 <code>LIMIT 20</code>을 넣어 읽는 양을 줄인 최적화를 구현체는 하지 않았다. 이 SQL이 MySQL에서 어떻게 처리되는지 따라가 보자. MySQL 매뉴얼은 파생 테이블을 바깥 쿼리에 병합하지 못하게 하는 구성 요소로 <code>UNION</code>과 <code>UNION ALL</code>을 꼽는다. 병합하지 못한 파생 테이블은 내부 임시 테이블로 구체화(materialization)된다. 블록마다 <code>WHERE</code> 조건도 없으므로, 세 테이블의 모든 행이 임시 테이블로 복사된 다음 그 전체를 요청 시각으로 정렬해 20건을 고른다. 앞의 구현 클래스마다 테이블 DDL(테이블마다 30,000행)에 이 SQL을 <code>fetch first</code> 대신 <code>limit 20</code>으로 바꿔 실행 계획을 보면 그대로다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 같은 계획)"><code class="language-text">-> Limit: 20 row(s)  (cost=28285..28285 rows=20)
+    -> Sort: p1_0.requested_at DESC, limit input to 20 row(s) per chunk  (cost=28285..28285 rows=20)
+        -> Table scan on p1_0  (cost=18145..19273 rows=90040)
+            -> Union all materialize  (cost=18145..18145 rows=90040)
+                -> Table scan on card_payment  (cost=3062 rows=30061)
+                -> Table scan on vbank_payment  (cost=3043 rows=30030)
+                -> Table scan on easy_payment  (cost=3035 rows=29949)</code></pre>
+
+<p>유형 모르는 단건 조회는 같은 파생 테이블 바깥에 <code>where p1_0.payment_id=?</code>가 붙은 모양으로 나왔다. 이번에는 바깥 조건을 각 블록 안으로 밀어 넣을 수 있다면 기본 키 조회 세 번으로 끝난다. MySQL은 8.0.22부터 파생 테이블 조건 푸시다운(derived condition pushdown)을 지원하지만, 매뉴얼에 따르면 처음에는 파생 테이블에 <code>UNION</code>이 있으면 이 최적화를 쓸 수 없었고 그 제한은 8.0.29에서 풀렸다. 즉 같은 SQL이 MySQL 8.0.29 이상에서는 각 블록에 결제 번호 조건이 내려가 기본 키로 찾을 수 있고, 그 이전 버전에서는 결제 하나를 찾으려고 세 테이블 전체를 구체화할 수 있다. 같은 매핑, 같은 SQL이 서버 버전에 따라 전혀 다른 비용을 낸다는 점에서, 구현 클래스마다 테이블 전략의 다형 조회는 실행 계획을 반드시 확인해야 하는 대상이다.</p>
+
+<p>8.0.29 이상 쪽은 직접 확인할 수 있다. 같은 데이터에서 <code>where p1_0.payment_id=42</code>를 붙인 SQL의 계획을 기본 설정으로 본 것과, 세션에서 <code>SET SESSION optimizer_switch='derived_condition_pushdown=off'</code>로 푸시다운을 끈 뒤 본 것이다. 42번은 카드 결제 테이블에 있다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 같은 계획)"><code class="language-text">-- 기본 설정(EXPLAIN)
++----+-------------+--------------+------------+-------+---------------+---------+---------+-------+------+----------+--------------------------------+
+| id | select_type | table        | partitions | type  | possible_keys | key     | key_len | ref   | rows | filtered | Extra                          |
++----+-------------+--------------+------------+-------+---------------+---------+---------+-------+------+----------+--------------------------------+
+|  1 | PRIMARY     | &lt;derived2&gt;   | NULL       | ALL   | NULL          | NULL    | NULL    | NULL  |    3 |   100.00 | NULL                           |
+|  2 | DERIVED     | card_payment | NULL       | const | PRIMARY       | PRIMARY | 8       | const |    1 |   100.00 | NULL                           |
+|  3 | UNION       | NULL         | NULL       | NULL  | NULL          | NULL    | NULL    | NULL  | NULL |     NULL | no matching row in const table |
+|  4 | UNION       | NULL         | NULL       | NULL  | NULL          | NULL    | NULL    | NULL  | NULL |     NULL | no matching row in const table |
++----+-------------+--------------+------------+-------+---------------+---------+---------+-------+------+----------+--------------------------------+
+
+-- derived_condition_pushdown=off(EXPLAIN FORMAT=TREE)
+-> Index lookup on p1_0 using &lt;auto_key0&gt; (payment_id=42)  (cost=18370..20397 rows=10)
+    -> Union all materialize  (cost=18145..18145 rows=90040)
+        -> Table scan on card_payment  (cost=3062 rows=30061)
+        -> Table scan on vbank_payment  (cost=3043 rows=30030)
+        -> Table scan on easy_payment  (cost=3035 rows=29949)</code></pre>
+
+<p>기본 설정에서는 결제 번호 조건이 세 블록에 모두 내려가 각 블록이 기본 키로 한 번씩 찾고(<code>const</code>), 카드 블록에서만 행이 나왔다. 푸시다운을 끄면 세 테이블 90,000행을 모두 구체화한 뒤 임시 테이블에 만든 자동 인덱스(<code>&lt;auto_key0&gt;</code>)로 42번을 찾는다. 8.0.29 이전 서버는 이번 실행 환경에 없어 직접 돌려 보지 못했으므로, 그 버전의 동작은 매뉴얼 설명에 근거한다.</p>
+
+<h4>조인 전략: 부모 먼저 넣고, 읽을 때는 모두 LEFT JOIN</h4>
+
+<p>전략을 <code>JOINED</code>로, 키 생성을 다시 <code>IDENTITY</code>로 바꾸면 매핑이 통과한다. 결제 테이블이 하나이므로 <code>AUTO_INCREMENT</code> 카운터도 하나이기 때문이다. 저장할 때의 SQL부터 보자.</p>
+
+<pre data-label="결제 세 건 저장"><code class="language-sql">insert into payment (amount, requested_at, payment_id) values (?, ?, default)
+insert into card_payment (card_company, payment_id) values (?, ?)
+insert into payment (amount, requested_at, payment_id) values (?, ?, default)
+insert into vbank_payment (bank_code, payment_id) values (?, ?)
+insert into payment (amount, requested_at, payment_id) values (?, ?, default)
+insert into easy_payment (provider, payment_id) values (?, ?)</code></pre>
+
+<p>결제 하나마다 부모 테이블에 먼저 넣고, 데이터베이스가 만든 번호를 받아 상세 테이블에 넣는다. 외래 키가 즉시 검사되므로 이 순서는 바뀔 수 없다. 결제 세 건에 <code>INSERT</code>가 여섯 번이다. 다형 조회는 다음과 같다.</p>
+
+<pre data-label="다형 조회(최근 20건)"><code class="language-sql">select p1_0.payment_id,
+       case when p1_1.payment_id is not null then 1
+            when p1_3.payment_id is not null then 2
+            when p1_2.payment_id is not null then 3
+       end,
+       p1_0.amount, p1_0.requested_at,
+       p1_1.card_company, p1_2.provider, p1_3.bank_code
+  from payment p1_0
+  left join card_payment p1_1 on p1_0.payment_id=p1_1.payment_id
+  left join easy_payment p1_2 on p1_0.payment_id=p1_2.payment_id
+  left join vbank_payment p1_3 on p1_0.payment_id=p1_3.payment_id
+ order by p1_0.requested_at desc
+ fetch first ? rows only</code></pre>
+
+<p>앞에서 손으로 쓴 Q2 쿼리와 같이 모든 상세 테이블을 <code>LEFT JOIN</code>한다. 이 매핑에는 구분 열이 없으므로, Hibernate는 어느 상세 테이블에서 행이 발견되었는지를 <code>CASE</code> 식으로 따져 클래스를 정한다. 여기에 미묘한 점이 있다. <code>CASE</code>는 위에서부터 처음 참이 되는 <code>WHEN</code>의 결과를 돌려준다. 만약 데이터가 잘못되어 한 결제 번호의 행이 카드 상세와 가상계좌 상세에 모두 있다면, 이 SQL은 첫 번째 <code>WHEN</code>에 걸려 그 결제를 카드 결제로 읽고, 가상계좌 상세는 아무 경고 없이 무시한다. 배타성이 깨진 데이터를 조회 코드가 조용히 덮어 버리는 것이다. 앞에서 복합 외래 키로 배타성을 데이터베이스에 맡긴 이유가 여기서 다시 확인된다.</p>
+
+<p>유형 모르는 단건 조회 <code>find(Payment.class, id)</code>도 같은 세 개의 <code>LEFT JOIN</code>에 <code>where p1_0.payment_id=?</code>를 붙인 SQL이었다. 기본 키 조회 두 번으로 나누는 대신 쿼리 하나로 모든 상세 테이블을 찾아보는 방식이다. 서브타입 조회는 이렇다.</p>
+
+<pre data-label="서브타입 조회"><code class="language-sql">select cp1_0.payment_id, cp1_1.amount, cp1_1.requested_at, cp1_0.card_company
+  from card_payment cp1_0
+  join payment cp1_1 on cp1_0.payment_id=cp1_1.payment_id
+ where cp1_1.requested_at>=?</code></pre>
+
+<p>카드 상세와 결제를 내부 조인하고 요청 시각 조건만 걸었다. 구분 열이 없으니 앞에서 권한 <code>payment_type = 'CARD'</code> 같은 조건이 들어갈 수 없다. 결제 테이블의 요청 시각 범위에 다른 유형의 결제가 많다면, 앞에서 말한 헛걸음이 생길 수 있는 모양이다.</p>
+
+<p>루트 클래스에 <code>@DiscriminatorColumn(name = "payment_type")</code>을 추가해 다시 실행하면 두 곳이 달라진다. 저장할 때 결제 테이블의 <code>INSERT</code>에 <code>values (?, ?, 'CARD', default)</code>처럼 <code>@DiscriminatorValue</code>의 값이 상수로 들어가고, 다형 조회에서는 <code>CASE</code> 식 대신 <code>p1_0.payment_type</code>을 그대로 읽는다. 상세 열을 채워야 하므로 세 개의 <code>LEFT JOIN</code>은 그대로 남는다. 서브타입 조회 SQL은 구분 열이 있어도 위와 똑같이 <code>payment_type</code> 조건 없이 나왔다. 이 실험의 매핑으로 생성한 MySQL용 DDL에서는 결제 테이블에 <code>payment_type varchar(31) not null</code> 열이 생겼다.</p>
+
+<p>마지막으로 조인 전략에서 생성된 DDL의 외래 키를 보자.</p>
+
+<pre data-label="MySQLDialect 스키마 스크립트(일부)"><code class="language-sql">create table card_payment (
+    payment_id bigint not null,
+    card_company varchar(255),
+    primary key (payment_id)
+) engine=InnoDB;
+
+alter table card_payment
+   add constraint FKcap4ufthfjwxxtprjy4ueqsh2
+   foreign key (payment_id)
+   references payment (payment_id);</code></pre>
+
+<p>외래 키는 결제 번호 한 열뿐이고, 카드사 열은 <code>NULL</code>을 허용한다. 매핑에 <code>nullable = false</code>를 적지 않았으니 당연한 결과이지만, 요점은 그것이 아니다. 구분 열을 넣은 실험에서도 상세 테이블의 외래 키는 그대로 결제 번호 한 열이었다. 매핑 애너테이션은 테이블과 열의 구조를 정할 뿐, 이 회차에서 손으로 쓴 복합 외래 키, 서브타입별 CHECK, 상수 생성 열 같은 무결성 장치는 만들어 주지 않는다. 운영 스키마는 스키마 생성 기능이 아니라 별도의 DDL 스크립트로 관리하고, 엔티티 매핑은 그 스키마에 맞추는 것이 안전하다.</p>
+
+<h3>세 전략을 한 표로 비교하기</h3>
+
+<p>지금까지의 분석을 같은 기준으로 모으면 다음과 같다. "선언 가능"은 MySQL의 제약만으로 강제할 수 있다는 뜻이고, 각 칸은 이 회차의 DDL을 기준으로 한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>기준</th><th>구현 클래스마다 테이블</th><th>단일 테이블</th><th>조인</th></tr></thead><tbody>
+<tr><td>결제 번호의 전체 유일성</td><td>선언 불가(공유 번호 공급원이라는 약속)</td><td>기본 키로 선언</td><td>기본 키로 선언</td></tr>
+<tr><td>슈퍼타입을 가리키는 외래 키(환불)</td><td>불가. 다형 연관 또는 배타 아크</td><td>단일 열 외래 키</td><td>단일 열 외래 키</td></tr>
+<tr><td>서브타입을 가리키는 외래 키(입금 통지)</td><td>단일 열 외래 키</td><td>상수 생성 열 + 복합 외래 키</td><td>단일 열 외래 키</td></tr>
+<tr><td>서브타입 고유 열의 필수 여부</td><td><code>NOT NULL</code></td><td>행 단위 CHECK</td><td><code>NOT NULL</code></td></tr>
+<tr><td>배타성(한 결제는 한 유형)</td><td>선언 불가(번호 중복을 막을 수 없음)</td><td>구조적으로 보장</td><td>구분 열 + 복합 외래 키로 선언</td></tr>
+<tr><td>완전성(모든 결제는 유형의 상세를 가짐)</td><td>구조적으로 보장(슈퍼타입 행이 따로 없음)</td><td>구분 열 <code>NOT NULL</code> + CHECK로 선언</td><td>선언 불가. 트랜잭션과 검증 쿼리</td></tr>
+<tr><td>Q1 서브타입 하나 조회</td><td>테이블 하나</td><td>구분 열 선두 복합 인덱스</td><td>조인 하나(구분 열 조건을 넣으면 유리)</td></tr>
+<tr><td>Q2 다형 조회 최근 20건</td><td><code>UNION ALL</code>. 구현체 SQL은 전체 구체화 후 정렬</td><td>인덱스 역순 20개</td><td>공통 열만이면 인덱스 역순 20개, 상세까지면 서브타입 수만큼 <code>LEFT JOIN</code></td></tr>
+<tr><td>저장 한 건의 문장 수</td><td>1</td><td>1</td><td>2</td></tr>
+<tr><td>새 서브타입 추가</td><td>새 테이블</td><td>큰 테이블에 <code>ALTER TABLE</code></td><td>새 테이블(+ 유형 목록 변경)</td></tr>
+<tr><td>공통 속성 추가</td><td>서브타입 수만큼 <code>ALTER TABLE</code></td><td>한 번</td><td>한 번</td></tr>
+</tbody></table></div>
+
+<p>표의 완전성 줄에서 구현 클래스마다 테이블 전략이 "구조적으로 보장"인 것을 보고 의아할 수 있다. 이 전략에는 슈퍼타입만의 행이 존재할 자리가 없으므로, 모든 결제는 태어날 때부터 어떤 서브타입 테이블의 행이다. 즉 완전성은 지켜지지만 배타성(번호 하나가 두 테이블에 있는 일)을 막지 못한다. 단일 테이블은 둘 다 지키고, 조인 전략은 배타성은 선언으로 지키되 완전성을 놓친다. 세 전략이 무결성의 서로 다른 조각을 내주고 있는 셈이다.</p>
+
+<x-visual id="db-design2-07-polymorphic-read-paths" title="세 전략에서 최근 결제 20건을 읽는 경로" kind="비교 다이어그램" ratio="16:9">
+<x-hint>같은 다형 조회가 단일 테이블에서는 인덱스 하나를 역순으로 20개 읽고, 조인 전략에서는 결제 20건마다 상세 테이블 세 곳을 탐색하며, 구현 클래스마다 테이블 전략의 구현체 SQL은 세 테이블 전체를 임시 테이블로 모은 뒤 정렬한다는 차이를 보여 준다.</x-hint>
+<x-prompt>세로로 세 칸으로 나뉜 비교 그림. 각 칸 왼쪽에 제목. 첫째 칸 제목 "단일 테이블": 긴 가로 막대(인덱스) 하나의 오른쪽 끝에서 왼쪽으로 짧은 화살표가 20칸만 훑고, 라벨 "인덱스 역순 20개". 둘째 칸 제목 "조인": 결제 인덱스에서 20칸을 읽는 화살표가 있고, 각 칸에서 오른쪽 세 개의 작은 상자(카드, 가상계좌, 간편결제)로 가는 가는 화살표 세 개가 뻗는다. 세 화살표 중 하나만 초록 체크, 두 개는 회색 X. 라벨 "결제마다 상세 3곳 탐색". 셋째 칸 제목 "구현 클래스마다 테이블": 세 개의 테이블 상자에서 모든 행이 큰 통 "임시 테이블"로 쏟아져 들어가고, 통에서 "정렬" 단계를 거쳐 "20건"으로 나가는 화살표. 흰 배경, 평면 스타일, 강조색은 파랑과 주황.</x-prompt>
+<x-caption>같은 질문이라도 전략에 따라 읽는 양이 "20개"에서 "모든 행"까지 달라진다. 구현 클래스마다 테이블 전략은 블록마다 LIMIT를 넣으면 셋째 칸의 비용을 크게 줄일 수 있지만, 구현체가 만든 SQL은 그렇게 하지 않았다.</x-caption>
+</x-visual>
+
+<h3>흔한 오해 바로잡기</h3>
+
+<h4>"조인 전략이 가장 정규화되어 있으니 무결성도 가장 강하다"</h4>
+
+<p>정규화는 중복을 없애는 것이지 모든 규칙을 선언하게 해 주는 것이 아니다. 구현체가 만든 기본 DDL처럼 결제 번호 한 열로만 상세가 결제를 참조하면, 한 결제가 두 유형의 상세를 갖는 일도, 상세가 하나도 없는 일도 막지 못한다. 조인 전략에서 배타성을 얻으려면 구분 열과 복합 외래 키를 직접 설계해야 하고, 완전성은 그렇게 해도 선언할 수 없다. 오히려 단일 테이블 전략이 배타성과 완전성을 가장 적은 장치로 지킨다. 무결성의 강도는 구조의 이름이 아니라 실제로 선언한 제약으로 판단해야 한다.</p>
+
+<h4>"단일 테이블은 NULL 때문에 공간을 낭비한다"</h4>
+
+<p>행 단위로는 거의 사실이 아니다. 앞에서 계산했듯 <code>DYNAMIC</code> 행 형식에서 NULL 열은 헤더의 NULL 비트 벡터 한 비트만 차지한다. 공간 비용이 실제로 생기는 곳은 서브타입 고유 열에 건 보조 인덱스다. NULL도 인덱스 키로 저장되므로 그 인덱스에는 다른 유형의 행까지 모두 들어간다. 단일 테이블의 공간 문제를 따질 때는 NULL 열의 개수가 아니라 서브타입 고유 열에 걸린 보조 인덱스의 개수를 세야 한다.</p>
+
+<h4>"구현 클래스마다 테이블은 조인이 없으니 빠르다"</h4>
+
+<p>서브타입 하나만 다룰 때는 맞다. 하지만 다형 조회에서는 조인 대신 <code>UNION ALL</code>이 들어오고, 구현체가 만든 SQL을 MySQL은 병합하지 못하는 파생 테이블로 처리한다. 단건 조회조차 서버 버전에 따라 세 테이블 전체를 구체화할 수 있었다. 조인이 없다는 것과 읽는 양이 적다는 것은 다른 이야기다.</p>
+
+<h4>"JPA 기본값이 SINGLE_TABLE이니 그것이 권장 전략이다"</h4>
+
+<p><code>@Inheritance</code>의 <code>strategy</code> 기본값이 <code>SINGLE_TABLE</code>인 것은 명세가 정한 기본값일 뿐 설계 권고가 아니다. 명세는 세 전략의 장단점을 나란히 적고 있고, 구현 클래스마다 테이블 전략에 대해서는 지원 자체가 선택 사항이며 이 전략을 쓰는 애플리케이션은 이식성이 없다고 밝힌다. 기본값을 고르는 기준은 편의이고, 설계를 고르는 기준은 조회 패턴과 무결성 요구다.</p>
+
+<h3>정리: 무엇을 보고 고르는가</h3>
+
+<p>세 전략 중 하나가 언제나 옳지는 않다. 다음 질문을 차례로 던지면 대부분의 경우 답이 좁혀진다.</p>
+
+<ol>
+<li><b>슈퍼타입 전체를 함께 조회하거나 참조하는 일이 있는가?</b> 전체 목록 화면, 유형 무관 단건 조회, 슈퍼타입을 가리키는 외래 키 중 하나라도 있으면 구현 클래스마다 테이블 전략은 후보에서 뺀다. 이 전략은 서브타입들이 사실상 독립된 개체일 때만 맞다.</li>
+<li><b>서브타입 고유 속성이 얼마나 많고, 그 속성으로 검색하는가?</b> 고유 속성이 적고 그 속성에 인덱스가 거의 필요 없다면 단일 테이블이 가장 단순하고 빠르다. 고유 속성이 많거나 고유 속성마다 인덱스가 필요하다면, 단일 테이블은 열 한계와 NULL 항목으로 가득한 인덱스를 떠안게 되므로 조인 전략이 낫다.</li>
+<li><b>서브타입마다 다른 관계가 있는가?</b> 가상계좌의 입금 통지처럼 서브타입 하나에만 딸린 테이블이 여럿이라면 조인 전략의 외래 키가 가장 자연스럽다. 단일 테이블에서도 상수 생성 열로 같은 보장을 얻을 수 있지만, 그런 관계가 늘어날수록 장치도 늘어난다.</li>
+<li><b>고유 속성과 공통 속성을 섞어 검색하는가?</b> "카드사별 최근 결제"처럼 고유 열과 공통 열을 함께 쓰는 정렬·검색이 핵심이라면, 그 조합의 복합 인덱스를 만들 수 있는 단일 테이블이 유리하다. 조인 전략이라면 바뀌지 않는 공통 속성을 상세 테이블에 복사하는 반정규화를 함께 설계한다.</li>
+<li><b>서브타입이 얼마나 자주 추가되고, 테이블은 얼마나 큰가?</b> 유형이 자주 추가되는데 테이블이 크다면, 단일 테이블은 추가마다 큰 테이블에 <code>ALTER TABLE</code>을 건다. 조인 전략에서는 새 테이블을 만들고 유형 목록을 코드 테이블로 두면 기존 테이블을 건드리지 않는다.</li>
+</ol>
+
+<p>현실의 설계는 이 셋을 섞기도 한다. 공통 속성과 자주 검색하는 고유 속성은 단일 테이블에 두고, 크고 드물게 쓰는 고유 속성만 서브타입 상세 테이블로 떼어 내는 식이다. 서브타입별 속성이 자주 바뀌고 검색에 거의 쓰이지 않는다면 그 부분을 09회에서 다룰 JSON 열에 담는 선택지도 있다. 어떤 조합이든 이 회차에서 던진 질문은 같다. 데이터베이스가 지켜 주는 규칙은 무엇이고 애플리케이션에 맡긴 규칙은 무엇인가, 그리고 가장 자주 묻는 질문에 답하려고 엔진이 무엇을 몇 번 읽는가.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>상속 관계 설계는 "객체 계층을 몇 개의 테이블로 나누는가"의 문제다. 테이블을 서브타입마다 나눌수록 서브타입 하나에 대한 작업(필수 열, 전용 관계, 유형 추가)이 쉬워지고, 하나로 합칠수록 계층 전체에 대한 작업(다형 조회, 슈퍼타입 참조, 배타성과 완전성)이 쉬워진다. 조인 전략은 그 사이에서 공통 부분과 고유 부분을 따로 두는 대신 쓰기 두 번, 다형 조회의 조인, 선언할 수 없는 완전성을 비용으로 낸다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>슈퍼타입·서브타입의 두 성질</dt><dd>배타성은 한 인스턴스가 서브타입 하나에만 속하는지, 완전성은 모든 인스턴스가 반드시 어떤 서브타입에 속하는지를 말한다. 자바의 클래스 상속은 언제나 배타적이고, 추상 슈퍼클래스면 완전 관계다.</dd>
+<dt>구현 클래스마다 테이블 전략</dt><dd>구체 클래스마다 공통 열까지 가진 테이블을 둔다. 서브타입 하나에 대한 작업은 쉽지만, 테이블 사이의 번호 유일성과 슈퍼타입을 가리키는 외래 키를 선언할 수 없고 다형 조회는 <code>UNION ALL</code>이 된다.</dd>
+<dt>다형 연관과 배타 아크</dt><dd>여러 테이블 중 하나를 가리키려고 유형과 번호만 적으면 외래 키가 없는 다형 연관이 된다. 서브타입마다 외래 키 열을 두고 CHECK로 정확히 하나만 채우게 하는 배타 아크는 무결성을 지키지만 유형이 늘 때마다 참조하는 모든 테이블을 고쳐야 한다.</dd>
+<dt>단일 테이블 전략</dt><dd>계층 전체를 한 테이블에 담고 구분 열로 유형을 나눈다. 배타성과 완전성이 구조적으로 지켜지고 다형 조회가 가장 싸지만, 서브타입 고유 열은 NULL을 허용해야 하므로 유형별 필수·금지 규칙을 행 단위 CHECK로 써야 한다.</dd>
+<dt>CHECK와 UNKNOWN</dt><dd>MySQL의 CHECK는 식이 거짓일 때만 위반이고 NULL 때문에 UNKNOWN이 되면 통과시킨다. 범위 검사는 값이 있을 때만 동작하므로 필수 규칙은 <code>IS NOT NULL</code>로 따로 써야 한다. CHECK는 8.0.16부터 실제로 검사된다.</dd>
+<dt>NULL의 실제 비용</dt><dd>InnoDB의 <code>DYNAMIC</code> 행에서 NULL 열은 NULL 비트 벡터의 한 비트만 차지한다. 비용은 서브타입 고유 열의 보조 인덱스에서 생긴다. NULL도 키로 저장되므로 그 인덱스에는 모든 행의 항목이 들어간다.</dd>
+<dt>조인 전략</dt><dd>공통 테이블과 서브타입 테이블을 나누고 같은 기본 키로 잇는다. 구분 열과 상수 저장 생성 열을 묶은 복합 외래 키로 배타성을 선언할 수 있지만, 완전성은 CHECK가 다른 테이블을 볼 수 없고 외래 키가 즉시 검사되므로 선언할 수 없다.</dd>
+<dt>구현체가 만드는 SQL</dt><dd>Hibernate 6.6은 구현 클래스마다 테이블 전략에서 <code>IDENTITY</code>를 매핑 단계에서 거부하고, 다형 조회를 <code>UNION ALL</code> 파생 테이블 바깥에서 정렬한다. 조인 전략의 다형 조회와 유형 모르는 단건 조회는 모든 서브타입 테이블을 <code>LEFT JOIN</code>한다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 상속 관계 설계가 문제로 드러나는 순간은 대개 처음 설계할 때가 아니라 유형과 데이터가 쌓인 뒤다. 단일 테이블로 시작한 결제 테이블에 유형이 열 개를 넘고 열이 백 개를 넘으면, 누군가 비슷한 의미의 열을 재사용하기 시작하고 서브타입 CHECK는 관리가 안 되어 빠진다. 조인 전략으로 시작한 시스템은 "상세 없는 결제" 몇 건이 정산 배치를 멈춰 세우고 나서야 검증 쿼리를 만든다. 구현 클래스마다 테이블로 시작한 시스템은 관리자 화면에 "전체 결제 목록"이 추가되는 날 <code>UNION ALL</code> 쿼리의 실행 계획을 처음 보게 된다. 설계 시점에 다섯 질문(서브타입 조회, 다형 조회, 단건 조회, 참조 무결성, 스키마 변경)을 미리 던져 보면 이런 미래의 상당 부분을 예측할 수 있다.</p>
+<p>판단이 달라지는 조건도 분명히 해 두자. 같은 결제라도 대부분의 화면이 유형별로 나뉘어 있고 전체 목록은 드물게 쓰는 관리 기능뿐이라면, 조인 전략의 <code>LEFT JOIN</code> 비용은 거의 문제가 되지 않는다. 반대로 사용자의 주문 내역 화면처럼 유형 무관 목록이 가장 자주 호출되는 질의라면, 그 목록이 공통 열만 쓰도록 화면을 설계하거나 단일 테이블로 가는 편이 낫다. 쓰기량도 변수다. 초당 결제 생성이 많지 않다면 조인 전략의 <code>INSERT</code> 두 번과 외래 키 검사 비용은 무시할 만하지만, 이벤트 로그처럼 쓰기가 압도적인 계층이라면 단일 테이블의 한 문장 쓰기가 큰 차이를 만든다.</p>
+<p>마지막으로, JPA를 쓰더라도 테이블 설계는 데이터베이스의 언어로 따로 해야 한다. 이 회차의 실험에서 보았듯 <code>@Inheritance</code>는 테이블의 모양과 조회 SQL을 정할 뿐, 복합 외래 키나 서브타입별 CHECK를 만들어 주지 않는다. 구현체가 만드는 다형 조회 SQL이 파생 테이블 조건 푸시다운 여부에 따라, 즉 MySQL 버전에 따라 전혀 다른 비용을 낸다는 것도 실행 계획으로 확인했다. 매핑 전략을 고른 뒤에는 생성된 SQL을 로그로 확인하고, 운영과 같은 버전의 MySQL에서 <code>EXPLAIN</code>으로 실행 계획을 확인하는 습관이 이 회차의 내용을 실제 장애 예방으로 바꿔 준다.</p>
+</x-review>
+
+<x-practice>
+<li>회원 개체를 설계한다. 업무 규칙은 다음과 같다. (가) 회원은 개인 회원이거나 법인 회원이며 둘 다일 수는 없다. (나) 가입 절차 중에는 개인·법인 여부를 아직 고르지 않은 회원이 존재할 수 있다. (다) 회원은 판매자 자격과 구매자 자격을 동시에 가질 수 있다. 각 규칙에 대해 배타적/포괄적, 완전/부분을 판정하고, 자바 클래스 상속으로 표현할 수 있는 것과 없는 것을 구분하라.</li>
+<li>단일 테이블 전략의 <code>payment</code>에 포인트 결제 유형 <code>'POINT'</code>와 그 고유 열 <code>point_account_id BIGINT NULL</code>을 추가한다. 필요한 CHECK 제약을 모두 쓰고(기존 CHECK 중 고쳐야 하는 것 포함), 다음 세 행이 각각 통과하는지 판정하라. (1) <code>'POINT'</code>, <code>point_account_id = 7</code>, 다른 고유 열은 모두 NULL. (2) <code>'CARD'</code>, 카드 열 네 개 채움, <code>point_account_id = 7</code>. (3) <code>'POINT'</code>, <code>point_account_id</code>가 NULL.</li>
+<li>구현체가 만든 기본 DDL처럼 상세 테이블이 결제 번호 한 열로만 결제를 참조하고, 결제 테이블에 구분 열이 없는 조인 전략 스키마가 있다. 배타성이 깨진 결제(두 개 이상의 상세 테이블에 행이 있는 결제)를 찾는 쿼리를 쓰고, 그런 결제를 Hibernate가 다형 조회로 읽으면 어떤 일이 생기는지 이 회차의 실행 결과를 근거로 설명하라.</li>
+<li>결제 3페이지(최근 순 41~60번째)를 <code>LIMIT 20 OFFSET 40</code>으로 보여 준다. (가) 블록마다 <code>LIMIT</code>를 넣은 구현 클래스마다 테이블 쿼리에서 각 블록이 내놓아야 하는 행 수와 바깥 정렬이 다루는 행 수, (나) 상세까지 <code>LEFT JOIN</code>하는 조인 전략 쿼리를 결제 테이블의 요청 시각 인덱스 역순으로 실행할 때 읽는 인덱스 항목 수와 상세 테이블 탐색 횟수를 구하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> (가)는 배타적 관계다. 한 회원이 개인이면서 법인일 수 없다. (나)는 부분 관계다. 서브타입이 정해지지 않은 회원이 존재할 수 있기 때문이다. 이 둘은 자바 상속으로 표현할 수 있다. 회원 클래스를 추상이 아닌 구체 클래스로 두고 개인 회원·법인 회원이 상속하면, 실행 시점 클래스가 하나뿐이므로 배타적이고, 회원 클래스 자체의 인스턴스가 허용되므로 부분 관계다. (다)는 포괄적 관계다. 한 객체가 두 클래스의 인스턴스일 수 없으므로 클래스 상속으로는 표현할 수 없고, 회원과 별도로 판매자 자격·구매자 자격 테이블을 두고 회원 번호로 참조하는 연관 관계로 모델링해야 한다. 판매자 자격 테이블의 기본 키를 회원 번호로 하면 "한 회원은 판매자 자격을 최대 하나" 같은 규칙도 함께 선언된다.</p>
+<p><b>2번.</b> 고칠 것은 셋이다. <code>ck_payment_type</code>의 허용 값에 <code>'POINT'</code>를 더한다. 새 CHECK <code>ck_payment_point</code>를 <code>(payment_type = 'POINT' AND point_account_id IS NOT NULL) OR (payment_type &lt;&gt; 'POINT' AND point_account_id IS NULL)</code>로 추가한다. 그리고 기존 서브타입 CHECK들은 "이 유형이 아니면 내 열은 비어 있다"는 뒤쪽 절반이 있으므로 그대로 두어도 포인트 행에서 카드·가상계좌·간편결제 열을 비우게 강제한다. 판정은 이렇다. (1)은 <code>ck_payment_point</code>의 앞쪽이 참이고, 다른 서브타입 CHECK는 뒤쪽이 참이므로 통과한다. (2)는 <code>ck_payment_point</code>에서 앞쪽은 유형이 달라 거짓, 뒤쪽은 <code>point_account_id IS NULL</code>이 거짓이므로 거부된다. (3)은 앞쪽의 <code>IS NOT NULL</code>이 거짓이고 뒤쪽은 유형이 <code>'POINT'</code>라 거짓이므로 거부된다. 모든 비교가 <code>NOT NULL</code> 열과 <code>IS [NOT] NULL</code>로만 이루어져 UNKNOWN이 나올 틈이 없다는 점이 이 판정을 결정적으로 만든다.</p>
+<p><b>3번.</b> 예를 들어 다음 쿼리로 찾는다. <code>SELECT p.payment_id FROM payment p WHERE (EXISTS (SELECT 1 FROM card_payment c WHERE c.payment_id = p.payment_id)) + (EXISTS (SELECT 1 FROM vbank_payment v WHERE v.payment_id = p.payment_id)) + (EXISTS (SELECT 1 FROM easy_payment e WHERE e.payment_id = p.payment_id)) &gt;= 2;</code> MySQL에서 <code>EXISTS</code>는 1 또는 0을 돌려주므로 더하면 상세가 있는 테이블의 개수가 된다. 조건을 <code>= 0</code>으로 바꾸면 상세가 하나도 없는 완전성 위반을 찾는다. 이런 결제를 Hibernate가 읽으면, 실험의 다형 조회 SQL은 <code>CASE</code>의 첫 번째 <code>WHEN</code>이 카드 상세의 존재를 검사하므로 그 결제를 카드 결제로 만들고 다른 상세는 오류 없이 버린다. 화면에는 정상 데이터처럼 보이므로 문제가 드러나지 않는다는 것이 가장 위험한 점이다.</p>
+<p><b>4번.</b> (가) 전체에서 41~60번째에 드는 행은 자기 테이블 안에서 60등 이내여야 한다. 그보다 뒤라면 같은 테이블에 그보다 최근인 행이 60개 이상 있어 전체 순위가 60등 밖이 되기 때문이다. 따라서 각 블록은 <code>LIMIT 60</code>으로 60행을 내놓아야 하고, 바깥 정렬은 최대 180행을 다뤄 앞의 40행을 버리고 20행을 돌려준다. (나) 결제 테이블의 인덱스를 역순으로 60개 항목 읽고, 그 60건마다 클러스터형 인덱스에서 결제 행을 읽고 세 상세 테이블을 탐색하므로 상세 탐색은 180번이다. 그중 120번은 아무것도 찾지 못한다. 앞의 40행은 조인까지 마친 뒤 버려진다. 본문의 결제 90,000건 데이터에서 <code>LIMIT 20 OFFSET 40</code>으로 실행해 보면 MySQL 8.4.13에서 <code>Handler_read_last</code> 1, <code>Handler_read_prev</code> 59(인덱스 항목 60개), <code>Handler_read_key</code> 181(결제 테이블만 읽을 때의 1을 빼면 상세 탐색 180번)이었다. 두 경우 모두 페이지가 깊어질수록 버리는 작업이 커지므로, 마지막으로 본 요청 시각을 기준으로 다음 20건을 가져오는 키셋 페이징이 낫다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>단일 테이블 전략의 결제 테이블에 서브타입 CHECK 없이 <code>CHECK (installment_months BETWEEN 0 AND 24)</code>만 걸려 있다. 카드 결제 행을 <code>installment_months</code>가 NULL인 채로 넣으면 어떻게 되는가? (MySQL 8.0.16 이상)</q>
+<o>NULL은 0과 24 사이가 아니므로 CHECK 위반으로 거부된다</o>
+<o>식의 결과가 UNKNOWN이므로 통과한다</o>
+<o>CHECK 식에 쓰인 열은 자동으로 NOT NULL이 되므로 NOT NULL 위반으로 거부된다</o>
+<o>카드 결제 행일 때만 CHECK가 평가되므로 거부된다</o>
+<why>MySQL의 CHECK는 식이 FALSE일 때만 위반이고, NULL 때문에 UNKNOWN이 되면 통과한다. <code>NULL BETWEEN 0 AND 24</code>는 UNKNOWN이다. CHECK는 열의 NULL 허용 여부를 바꾸지 않으며, 유형에 따라 평가 여부가 달라지지도 않는다. 유형별 필수 규칙은 <code>payment_type = 'CARD' AND installment_months IS NOT NULL</code>처럼 따로 써야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>조인 전략에서 "모든 결제에는 자기 유형의 상세 행이 있다"를 MySQL 제약만으로 강제할 수 없는 이유로 가장 정확한 것은?</q>
+<o>InnoDB는 서로 다른 테이블 사이에 외래 키를 걸 수 없기 때문이다</o>
+<o>저장 생성 열은 외래 키에 쓸 수 없기 때문이다</o>
+<o>CHECK는 다른 테이블이나 서브쿼리를 참조할 수 없고, 외래 키는 자식에서 부모 방향으로만 즉시 검사되어 부모가 자식을 요구하게 만들 수 없기 때문이다</o>
+<o>결제 테이블에 <code>AUTO_INCREMENT</code>가 있으면 외래 키 검사가 꺼지기 때문이다</o>
+<why>MySQL 매뉴얼은 CHECK 식에 다른 테이블의 열과 서브쿼리를 금지한다. 외래 키는 자식 행이 부모를 가리킬 때 부모의 존재를 확인하는 장치이고, MySQL은 이를 즉시(행 단위로) 검사하며 커밋 시점으로 미루지 않으므로 순환 외래 키로 "부모는 자식이 있어야 한다"를 만들면 어느 쪽도 먼저 넣을 수 없다. 저장 생성 열은 외래 키에 쓸 수 있고(가상 생성 열이 불가), 다른 보기는 사실이 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>Hibernate가 구현 클래스마다 테이블 전략의 다형 조회로 만든 SQL은 <code>select ... from (select ... from card_payment union all select ... from vbank_payment union all select ... from easy_payment) p1_0 order by p1_0.requested_at desc</code>에 페이징을 붙인 모양이었다. MySQL에서 이 쿼리가 결제 20건을 위해 세 테이블의 모든 행을 다루게 되는 이유는?</q>
+<o><code>UNION ALL</code>이 있는 파생 테이블은 바깥 쿼리에 병합되지 않고 구체화되며, 블록 안에 행을 줄일 조건이나 LIMIT가 없기 때문이다</o>
+<o><code>UNION ALL</code>은 중복 제거를 위해 항상 전체 정렬을 하기 때문이다</o>
+<o>InnoDB는 파생 테이블 안에서 인덱스를 전혀 쓸 수 없기 때문이다</o>
+<o>Hibernate가 페이징을 메모리에서 처리하기 때문이다</o>
+<why>MySQL 매뉴얼은 <code>UNION</code>·<code>UNION ALL</code>을 파생 테이블의 병합을 막는 구성 요소로 꼽는다. 병합되지 않은 파생 테이블은 임시 테이블로 구체화되고, 각 블록에 WHERE도 LIMIT도 없으므로 모든 행이 들어간 뒤 바깥에서 정렬된다. 중복 제거를 하는 것은 <code>UNION ALL</code>이 아니라 <code>UNION</code>(DISTINCT)이다. 페이징은 SQL에 들어가 있으므로 메모리 페이징도 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>조인 전략에서 <code>card_payment</code>가 <code>(payment_id, payment_type)</code>으로 결제를 참조하고, <code>card_payment.payment_type</code>은 <code>AS ('CARD') STORED</code>다. 카드 상세가 있는 결제 42의 <code>payment_type</code>을 <code>'EASY'</code>로 바꾸는 <code>UPDATE</code>는 어떻게 되는가? (외래 키에 참조 동작 미지정)</q>
+<o>성공하고, 카드 상세의 <code>payment_type</code>도 자동으로 <code>'EASY'</code>로 바뀐다</o>
+<o>성공하고, 카드 상세는 고아 행으로 남는다</o>
+<o>커밋할 때 외래 키를 검사해 그때 거부된다</o>
+<o>자식이 참조하는 부모 키 <code>(42, 'CARD')</code>를 바꾸려는 것이므로 즉시 거부된다</o>
+<why>참조 동작을 지정하지 않으면 <code>NO ACTION</code>이고, InnoDB에서 이는 <code>RESTRICT</code>와 같아 관련된 자식이 있으면 부모의 수정이 즉시 거부된다. MySQL은 외래 키 검사를 커밋 시점으로 미루지 않는다. 생성 열은 상수식이므로 저절로 바뀌지 않으며, 애초에 저장 생성 열에 대한 외래 키에는 <code>ON UPDATE CASCADE</code>를 지정할 수도 없다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>단일 테이블 결제 테이블에 간편결제 전용 열 <code>(provider, provider_tx_id)</code>로 유니크 인덱스를 걸었다. 간편결제가 전체 결제의 5%일 때 이 인덱스에 대한 설명으로 옳은 것은?</q>
+<o>NULL은 인덱스에 저장되지 않으므로 인덱스에는 간편결제 행만 들어간다</o>
+<o>NULL도 키로 저장되므로 모든 결제 행의 항목이 들어가고, 여러 NULL은 유니크 위반이 아니다</o>
+<o>NULL이 여러 개면 유니크 위반이므로 카드 결제를 두 건 이상 넣을 수 없다</o>
+<o>MySQL은 <code>WHERE provider IS NOT NULL</code> 조건을 붙인 부분 인덱스를 만들어 자동으로 해결한다</o>
+<why>MySQL은 <code>IS NULL</code> 조건에도 인덱스를 쓸 수 있으며, 이는 NULL이 인덱스 키로 저장된다는 뜻이다. 따라서 이 인덱스에는 간편결제가 아닌 95%의 행도 <code>(NULL, NULL)</code> 키로 들어간다. 유니크 인덱스는 NULL을 허용하는 열에서 여러 NULL을 허용하므로 위반은 아니다. MySQL에는 PostgreSQL식 부분 인덱스 선언이 없다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>슈퍼타입·서브타입(supertype/subtype)</dt><dd>공통 속성과 관계를 가진 상위 개체와, 그것을 모두 물려받고 고유한 속성·관계를 더한 하위 개체. 객체 지향의 상속 관계에 대응하는 데이터 모델링 용어다.</dd>
+<dt>구분자(discriminator)</dt><dd>한 행이 어느 서브타입에 속하는지 알려 주는 속성. 단일 테이블에서는 반드시 열로 존재하고, 조인 전략에서는 선택 사항이며, 구현 클래스마다 테이블에서는 행이 들어 있는 테이블 자체가 그 역할을 한다.</dd>
+<dt>배타적 관계(exclusive, disjoint)</dt><dd>슈퍼타입의 한 인스턴스가 서브타입 하나에만 속할 수 있는 관계. 여러 서브타입에 동시에 속할 수 있으면 포괄적(inclusive, overlapping) 관계다.</dd>
+<dt>완전 관계(total)</dt><dd>슈퍼타입의 모든 인스턴스가 반드시 어떤 서브타입에 속해야 하는 관계. 서브타입 없이 존재할 수 있으면 부분(partial) 관계다.</dd>
+<dt>다형 조회(polymorphic query)</dt><dd>서브타입을 가리지 않고 슈퍼타입 전체를 대상으로 하는 조회. 전략에 따라 테이블 하나, 여러 <code>LEFT JOIN</code>, 또는 <code>UNION ALL</code>로 실행된다.</dd>
+<dt>다형 연관(polymorphic association)</dt><dd>참조 대상 테이블을 유형 열로 구분하고 번호 열로 행을 가리키는 설계. 외래 키를 걸 수 없어 존재 확인과 삭제 차단을 데이터베이스가 해 주지 않는다.</dd>
+<dt>배타 아크(exclusive arc)</dt><dd>참조 대상마다 외래 키 열을 따로 두고, CHECK 제약으로 그중 정확히 하나만 값을 갖게 하는 설계. 무결성은 지키지만 대상이 늘 때마다 열과 제약을 고쳐야 한다.</dd>
+<dt>파생 테이블 구체화(derived table materialization)</dt><dd>FROM 절의 서브쿼리를 바깥 쿼리에 병합하지 못할 때, 그 결과를 내부 임시 테이블에 만들어 두고 읽는 방식. MySQL에서는 <code>UNION</code>·<code>UNION ALL</code>, 집계, <code>LIMIT</code> 등이 병합을 막는다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html">Jakarta Persistence 3.1 명세 §2.13 Inheritance Mapping Strategies</a> — 세 전략의 정의와 명세가 밝힌 단점, 구현 클래스마다 테이블 전략 지원이 선택 사항이라는 규정</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-table-check-constraints.html">MySQL 8.0 Reference Manual — CHECK Constraints</a> — CHECK의 TRUE/UNKNOWN 판정, 식에 쓸 수 없는 요소(다른 테이블의 열, 서브쿼리), 이름의 스키마 단위 유일성</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-table-foreign-keys.html">MySQL 8.0 Reference Manual — FOREIGN KEY Constraints</a> — 참조되는 쪽과 참조하는 쪽의 인덱스 요건, NO ACTION과 RESTRICT, 저장 생성 열에 대한 외래 키의 참조 동작 제한</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/ansi-diff-foreign-keys.html">MySQL 8.0 Reference Manual — FOREIGN KEY Constraint Differences</a> — 외래 키를 행 단위로 즉시 검사하고 커밋 시점으로 미루지 않는다는 설명</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/derived-table-optimization.html">MySQL 8.0 Reference Manual — Optimizing Derived Tables, View References, and Common Table Expressions with Merging or Materialization</a> — UNION이 파생 테이블 병합을 막는다는 목록과 구체화</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/derived-condition-pushdown-optimization.html">MySQL 8.0 Reference Manual — Derived Condition Pushdown Optimization</a> — 8.0.22 도입, UNION이 있는 파생 테이블에 대한 제한이 8.0.29에서 풀린 내용</li>
+</x-refs>

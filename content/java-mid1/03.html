@@ -1,0 +1,824 @@
+<x-meta>
+deck: 문자열 하나가 힙에서 String 객체와 byte[] 배열로 놓이는 모습에서 출발해, 문자열 풀·불변성·해시 캐싱·연결 연산의 컴파일 방식·StringBuilder의 배열 확장까지 명세와 바이트코드로 확인한다.
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li><code>"abc"</code>와 <code>"가나다"</code>가 OpenJDK 21에서 어떤 필드와 배열로 저장되는지 그림으로 그리고, <code>length()</code>가 세는 것이 글자 수가 아니라 UTF-16 코드 유닛 수임을 설명할 수 있다.</li>
+<li>리터럴, <code>new String</code>, 런타임 연결, <code>intern()</code>의 결과를 <code>==</code>로 비교했을 때의 참·거짓을 JLS 3.10.5와 15.29의 규칙으로 예측할 수 있다.</li>
+<li>String이 불변이어야 풀 공유와 해시코드 캐싱이 성립하는 이유를 "가변이었다면 벌어질 일"이라는 반례로 설명할 수 있다.</li>
+<li><code>+</code> 연결이 상수 접기, <code>invokedynamic</code>, <code>StringBuilder</code> 체인 가운데 무엇으로 컴파일되는지 <code>javap</code> 출력에서 구분하고, 반복문 안 <code>+=</code>가 복사하는 문자 수를 계산할 수 있다.</li>
+<li><code>StringBuilder</code>의 용량 확장을 단계별로 추적하고, <code>StringBuffer</code>와의 차이와 <code>return this</code>로 이뤄지는 메서드 체이닝의 동작을 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>문자열이 특별 대우를 받는 이유</h3>
+<p>자바에서 문자 하나는 기본형 <code>char</code>다. 문자 여러 개를 이어 놓은 문자열을 기본형만으로 다루려면 <code>char[]</code> 배열을 쓸 수밖에 없다. 그러면 두 문자열이 같은지 보려고 반복문을 돌려야 하고, 뒤에 한 글자를 붙이려면 더 큰 배열을 만들어 옮겨 담아야 한다. 배열은 누구나 원소를 바꿀 수 있으니, 다른 메서드에 넘겨준 문자열이 돌아왔을 때 그대로일지도 장담할 수 없다.</p>
+<p><code>String</code> 클래스가 이 일을 맡는다. <code>java.lang</code> 패키지에 있어서 <code>import</code> 없이 쓰고, 선언은 <code>public final class String</code>이다. 여기까지는 보통의 클래스와 다르지 않다. 다른 점은 언어가 이 클래스 하나를 위해 문법을 두 가지 마련해 두었다는 것이다. 큰따옴표로 감싼 <b>문자열 리터럴</b>(string literal, JLS 3.10.5)은 <code>new</code> 없이 String 객체를 가리키는 참조가 되고, <code>+</code> 연산자는 피연산자 가운데 하나가 String이면 <b>문자열 연결</b>(string concatenation, JLS 15.18.1)로 동작한다.</p>
+<p>이런 대우에는 이유가 있다. 문자열은 프로그램이 다루는 데이터의 큰 부분을 차지한다. 사용자 이름, 요청 경로, SQL, JSON, 로그 메시지가 전부 문자열이다. JDK의 문자열 표현을 바꾼 제안서인 JEP 254는 여러 애플리케이션에서 모은 자료를 근거로 문자열이 힙 사용량의 주요 구성 요소라고 적는다. 그래서 JDK와 JVM은 문자열에 대해서만 특별한 절약을 세 가지 한다. 같은 내용의 리터럴은 객체 하나를 함께 쓰고, 가능하면 한 글자를 1바이트로 저장하고, 연결 연산이 만드는 중간 객체를 줄인다.</p>
+<p>이 세 가지는 모두 "String 객체의 내용은 만들어진 뒤에 바뀌지 않는다"는 한 가지 성질에 기대고 있다. 이 회차는 String 객체의 속을 먼저 들여다본 다음, 풀, 비교, 불변, 주요 메서드, 연결의 컴파일, <code>StringBuilder</code> 순서로 그 구조를 따라간다. 불변 객체 일반의 이야기는 앞 회차에서 했으므로 여기서는 String이 불변성을 어디에 쓰는지에 집중한다.</p>
+
+<h3>String 객체의 속: byte[]와 coder</h3>
+<p>String 객체는 글자를 직접 품고 있지 않다. OpenJDK 21의 <code>String</code> 소스에서 인스턴스 필드만 뽑으면 다음 네 개다.</p>
+<pre data-label="OpenJDK 21 java.lang.String의 인스턴스 필드"><code class="language-java">public final class String
+    implements java.io.Serializable, Comparable<String>, CharSequence,
+               Constable, ConstantDesc {
+
+    private final byte[] value;   // 문자 데이터가 들어 있는 배열
+    private final byte coder;     // value의 인코딩: LATIN1(0) 또는 UTF16(1)
+    private int hash;             // 해시코드 캐시. 기본값 0
+    private boolean hashIsZero;   // 계산한 해시코드가 실제로 0인지 기억
+    // ...
+}</code></pre>
+<p>글자는 <code>value</code>가 가리키는 별도의 배열 객체에 들어 있다. 따라서 문자열 하나는 힙에서 <b>객체 두 개</b>다. String 객체 하나와 <code>byte[]</code> 배열 객체 하나다. 두 객체는 각각 객체 헤더를 가진다. JEP 450에 따르면 64비트 HotSpot에서 객체 헤더는 설정에 따라 12바이트에서 16바이트를 차지한다. 다섯 글자짜리 문자열이라도 실제로 차지하는 메모리는 글자 다섯 개 분량보다 훨씬 크다는 뜻이다.</p>
+<p>배열의 타입이 <code>char[]</code>가 아니라 <code>byte[]</code>인 데에는 역사가 있다. JDK 8까지 String은 글자를 <code>char</code> 배열에 저장했다. <code>char</code>는 16비트이므로 글자 하나에 항상 2바이트를 썼다. JEP 254는 대부분의 String 객체가 Latin-1 문자만 담고 있고, 그런 문자는 1바이트면 충분하므로 내부 <code>char</code> 배열 공간의 절반이 쓰이지 않고 있다고 지적했다. 그래서 JDK 9에서 내부 표현을 "UTF-16 <code>char</code> 배열"에서 "<code>byte</code> 배열 + 인코딩 표시 필드"로 바꿨다. 이것이 <b>Compact Strings</b>다.</p>
+<p>규칙은 단순하다. 문자열의 모든 문자가 Latin-1(ISO-8859-1) 범위, 곧 코드 값 0~255 안에 있으면 한 글자를 1바이트로 저장하고 <code>coder</code>를 <code>LATIN1</code>(0)로 둔다. 범위를 벗어나는 문자가 하나라도 있으면 문자열 전체를 UTF-16으로, 곧 한 코드 유닛을 2바이트로 저장하고 <code>coder</code>를 <code>UTF16</code>(1)으로 둔다. 영문·숫자·기호로 된 문자열은 앞쪽에, 한글이 한 글자라도 들어간 문자열은 뒤쪽에 해당한다.</p>
+<h4>직접 들여다보기</h4>
+<p><code>value</code>와 <code>coder</code>는 <code>private</code> 필드여서 보통의 코드로는 볼 수 없다. 뒤 회차에서 맛볼 리플렉션(reflection)으로 열어 보자. JDK 내부 필드에 접근하는 것이므로 실행할 때 <code>--add-opens</code> 옵션으로 <code>java.lang</code> 패키지를 열어 주어야 한다. 학습용 실험이고, 실제 코드에서 쓸 방법은 아니다.</p>
+<pre><code class="language-java">import java.lang.reflect.Field;
+
+public class PeekInside {
+    public static void main(String[] args) throws Exception {
+        peek("abc");
+        peek("café");
+        peek("가나다");
+        peek("abc가");
+        peek("😀");
+    }
+
+    static void peek(String s) throws Exception {
+        Field value = String.class.getDeclaredField("value");
+        Field coder = String.class.getDeclaredField("coder");
+        value.setAccessible(true);
+        coder.setAccessible(true);
+        byte[] bytes = (byte[]) value.get(s);
+        System.out.println(s + " length=" + s.length()
+                + " coder=" + coder.getByte(s)
+                + " value.length=" + bytes.length);
+    }
+}</code></pre>
+<pre><code class="language-bash">javac PeekInside.java
+java --add-opens java.base/java.lang=ALL-UNNAMED PeekInside</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21)"><code class="language-text">abc length=3 coder=0 value.length=3
+café length=4 coder=0 value.length=4
+가나다 length=3 coder=1 value.length=6
+abc가 length=4 coder=1 value.length=8
+😀 length=2 coder=1 value.length=4</code></pre>
+<p>한 줄씩 읽어 보자. <code>"abc"</code>는 세 글자가 3바이트에 들어갔다. <code>"café"</code>의 <code>é</code>는 유니코드 U+00E9로 Latin-1 범위 안이어서 여전히 글자당 1바이트다. <code>"가나다"</code>는 세 글자가 6바이트다. <code>"abc가"</code>가 중요하다. 한글은 한 글자뿐인데 배열 길이는 8이다. 인코딩은 문자열 단위로 정해지므로 <code>a</code>, <code>b</code>, <code>c</code>까지 2바이트씩 쓰게 된 것이다.</p>
+<p>마지막 줄은 다른 사실을 보여 준다. 이모지 한 글자인데 <code>length()</code>가 2다. String의 Javadoc은 String이 UTF-16 형식의 문자열을 나타내고, <code>length()</code>는 유니코드 <b>코드 유닛</b>(code unit)의 수를 돌려준다고 정한다. U+FFFF를 넘는 문자(보충 문자)는 UTF-16에서 코드 유닛 두 개(서로게이트 쌍)로 표현되므로 길이가 2가 된다. 사람이 세는 글자 수에 가까운 값이 필요하면 <code>codePointCount(0, s.length())</code>를 쓴다. 이 예에서는 1이 나온다. <code>charAt(i)</code>와 <code>substring</code>의 인덱스도 모두 코드 유닛 기준이다.</p>
+<p>OpenJDK 21에서 <code>length()</code>의 구현은 <code>return value.length >> coder();</code> 한 줄이다. <code>coder()</code>는 Compact Strings가 켜져 있으면(기본값) <code>coder</code> 필드의 값을 돌려주는 메서드다. <code>coder</code>가 0이면 배열 길이 그대로, 1이면 배열 길이를 2로 나눈 값이다. 인코딩 표시를 0과 1로 정해 둔 덕분에 인코딩별로 계산식을 나누지 않고 시프트 연산 하나로 길이를 구한다.</p>
+<pre class="diagram">"abc"                                   "abc가"
+
+ String 객체                             String 객체
+┌────────────────┐                      ┌────────────────┐
+│ (객체 헤더)    │                      │ (객체 헤더)    │
+│ value ─────────┼──┐                   │ value ─────────┼──┐
+│ coder = 0      │  │                   │ coder = 1      │  │
+│ hash  = 0      │  │                   │ hash  = 0      │  │
+└────────────────┘  │                   └────────────────┘  │
+                    ▼                                       ▼
+ byte[3]                                 byte[8]
+┌────────┬────┬────┬────┐               ┌────────┬───────┬───────┬───────┬───────┐
+│ (헤더) │ 61 │ 62 │ 63 │               │ (헤더) │ a(2B) │ b(2B) │ c(2B) │ 가(2B)│
+└────────┴────┴────┴────┘               └────────┴───────┴───────┴───────┴───────┘
+  글자당 1바이트 (LATIN1)                  코드 유닛당 2바이트 (UTF16)</pre>
+<aside class="note">이 표현은 OpenJDK 구현의 세부다. JEP 254는 이 변경이 구현만 바꾸고 공개 인터페이스는 바꾸지 않는다고 밝힌다. 프로그램이 보는 String은 언제나 "UTF-16 코드 유닛의 열"이고, 그 뒤에서 1바이트로 줄여 저장하느냐는 JVM의 사정이다. HotSpot에서는 <code>-XX:-CompactStrings</code> 옵션으로 이 기능을 끄고 모든 문자열을 UTF-16으로 저장하게 할 수 있다.</aside>
+
+<x-visual id="java-mid1-03-string-layout" title="String 객체와 byte 배열: LATIN1과 UTF16 저장 방식 비교" kind="메모리 구조도" ratio="16:9">
+<x-hint>문자열 하나가 String 객체와 byte 배열 객체 둘로 이루어지고, coder 값에 따라 글자당 1바이트 또는 2바이트로 저장된다는 것을 나란히 보여 준다.</x-hint>
+<x-prompt>흰 배경의 깔끔한 기술 다이어그램. 화면을 좌우 두 칸으로 나눈다. 왼쪽 칸 제목 "abc", 오른쪽 칸 제목 "abc가". 각 칸 위쪽에 둥근 모서리 상자 "String 객체"가 있고 안에 세 줄: "value", "coder", "hash". 왼쪽 상자의 coder 줄에는 "coder = 0 (LATIN1)", 오른쪽 상자의 coder 줄에는 "coder = 1 (UTF16)". 각 상자의 "value" 줄에서 아래로 화살표가 나와 가로로 긴 배열 그림을 가리킨다. 왼쪽 배열은 칸 3개로 각각 "a", "b", "c"가 적혀 있고 아래에 라벨 "byte[3] · 글자당 1바이트". 오른쪽 배열은 넓은 칸 4개로 각각 "a", "b", "c", "가"가 적혀 있고 각 칸이 두 조각으로 나뉘어 있으며 아래에 라벨 "byte[8] · 코드 유닛당 2바이트". 오른쪽 배열의 "가" 칸만 주황색으로 강조하고 그 옆에 작은 말풍선 "한 글자 때문에 전체가 2바이트". 맨 아래 가운데에 한 줄 "문자열 하나 = 객체 두 개". 선은 얇게, 색은 파랑과 주황 두 가지만 쓴다.</x-prompt>
+<x-caption>Latin-1 범위를 벗어나는 문자가 하나라도 있으면 문자열 전체가 UTF-16으로 저장된다(OpenJDK 9 이상).</x-caption>
+</x-visual>
+
+<h3>문자열 리터럴과 문자열 풀</h3>
+<p>이제 리터럴을 보자. JLS 3.10.5는 두 가지를 정한다. 첫째, 문자열 리터럴은 실행 시점에 String 클래스의 인스턴스를 가리키는 참조다. 둘째, 문자열 리터럴은 <b>항상 같은 인스턴스</b>를 가리킨다. 명세의 표현으로는 문자열 리터럴이, 더 일반적으로는 상수 표현식의 값인 문자열이 <code>String.intern</code> 메서드를 실행한 것처럼 "인턴(intern)"되어 유일한 인스턴스를 공유한다.</p>
+<p>이 "유일한 인스턴스들"을 모아 두는 곳이 <b>문자열 풀</b>(string pool)이다. <code>String.intern()</code>의 Javadoc은 String 클래스가 처음에는 비어 있는 문자열 풀을 비공개로 관리한다고 적는다. 흔히 문자열 상수 풀이라고도 부른다. 프로그램 어디에서든 <code>"hello"</code>라고 쓰면, 클래스가 다르고 패키지가 달라도 같은 JVM 안에서는 풀에 있는 그 String 객체 하나를 가리킨다.</p>
+<h4>리터럴이 객체가 되기까지</h4>
+<p>이 일이 일어나는 경로를 따라가 보자. 다음 두 줄을 컴파일한다.</p>
+<pre><code class="language-java">String a = "hello";
+String b = "hello";</code></pre>
+<pre data-label="javap -v 출력의 일부 (상수 풀과 바이트코드)"><code class="language-text">   #7 = String             #8             // hello
+   #8 = Utf8               hello
+   ...
+       0: ldc           #7                  // String hello
+       2: astore_1
+       3: ldc           #7                  // String hello
+       5: astore_2</code></pre>
+<p>컴파일러는 리터럴의 글자들을 클래스 파일의 <b>상수 풀</b>(constant pool)에 한 번만 기록한다. 8번 항목이 글자 데이터이고, 7번 항목이 "이것은 문자열 상수"라는 표시다. 소스에 <code>"hello"</code>를 두 번 썼지만 항목은 하나다. 바이트코드에서는 두 줄 모두 <code>ldc #7</code>이다. <code>ldc</code>는 런타임 상수 풀의 항목을 오퍼랜드 스택에 올리는 명령이고, 항목이 문자열 상수이면 그 String 인스턴스의 참조를 올린다(JVMS 6.5).</p>
+<p>그 String 인스턴스를 누가 언제 만드는가는 JVMS 5.1이 정한다. JVM은 클래스 파일의 문자열 상수 항목에서 문자열 상수를 끌어낼 때, 같은 문자 시퀀스를 가진 String에 대해 이전에 <code>String.intern</code>이 호출된 적이 있으면 그 인스턴스를 쓴다. 없으면 그 내용을 담은 String 인스턴스를 새로 만들고 그것을 인턴한다. 다른 클래스의 <code>"hello"</code>가 같은 객체로 귀결되는 것은 이 규칙 때문이다.</p>
+<p>여기서 이름이 비슷한 세 가지를 구분해 두어야 한다.</p>
+<div class="table-wrap"><table><thead><tr><th>이름</th><th>어디에 있는가</th><th>무엇이 들어 있는가</th></tr></thead><tbody>
+<tr><td>클래스 파일의 상수 풀</td><td><code>.class</code> 파일 안. 클래스마다 하나</td><td>리터럴의 글자, 클래스·메서드·필드 이름 같은 기호 정보</td></tr>
+<tr><td>런타임 상수 풀</td><td>JVM의 메서드 영역. 로드된 클래스마다 하나(JVMS 2.5.5)</td><td>위 표를 실행 중에 쓸 수 있게 옮긴 것. 문자열 상수는 String 참조로 바뀐다</td></tr>
+<tr><td>문자열 풀</td><td>JVM 전체에 하나</td><td>인턴된 String 객체들. 내용이 같으면 하나만 있다</td></tr>
+</tbody></table></div>
+<p>클래스 A와 클래스 B가 각자 상수 풀에 <code>hello</code>를 기록해도, 두 런타임 상수 풀의 항목은 문자열 풀에 있는 같은 String 객체를 가리키게 된다.</p>
+<h4>풀은 어디에 있는가</h4>
+<p>명세는 풀이 메모리의 어느 영역에 있는지 정하지 않는다. JLS는 "같은 인스턴스"라는 결과만 요구하고, Javadoc은 풀을 String 클래스가 비공개로 관리한다고만 적는다. 위치는 구현의 몫이다. HotSpot은 JDK 6까지 인턴된 문자열을 영구 세대(permanent generation)라는 별도 영역에 두었다. JDK 7 릴리스 노트는 인턴된 문자열이 더 이상 영구 세대에 할당되지 않고, 애플리케이션이 만든 다른 객체들과 함께 힙의 주된 부분(young, old 세대)에 할당된다고 밝힌다. 영구 세대 자체는 JDK 8에서 없어졌다(JEP 122).</p>
+<p>따라서 지금의 HotSpot에서 "풀에 있는 문자열"은 보통의 힙 객체다. 다른 String과 구조가 같고 필드도 같다. 다른 점은 JVM이 그 객체를 "이 내용의 대표"로 등록해 두고 내용으로 찾아낼 수 있다는 것뿐이다. HotSpot은 이 등록부를 문자열 테이블(string table)이라는 내부 표로 관리하고, <code>jcmd</code> 도구의 <code>VM.stringtable</code> 명령으로 그 내용을 덤프할 수 있다. "풀"을 힙과 분리된 저장 공간으로 그리면 틀린 그림이 된다. 객체는 힙에 있고, 풀은 그 객체들을 가리키는 찾아보기다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>도서관의 대표 서지 목록</strong><p>도서관은 같은 책을 여러 사람이 찾으면 책을 새로 사지 않고 이미 있는 책의 위치를 알려 준다. 문자열 풀은 "이 제목의 책은 저 서가에 있다"는 목록이고, 책 자체는 다른 책들과 같은 서가(힙)에 꽂혀 있다. 비유가 맞지 않는 곳도 있다. 도서관 책은 한 사람이 빌려 가면 다른 사람이 못 보지만 String은 몇 명이 동시에 참조해도 된다. 그리고 책에 낙서를 하면 다음 사람이 피해를 보는데, String은 내용을 고칠 방법이 아예 없어서 그런 일이 생기지 않는다. 풀이 성립하는 조건이 바로 이 점이다.</p></aside>
+
+<h3>new String과 리터럴: == 가 갈리는 지점</h3>
+<p>리터럴 대신 <code>new</code>로 String을 만들면 어떻게 되는지 보자.</p>
+<pre><code class="language-java">public class StringIdentity {
+    public static void main(String[] args) {
+        String a = "hello";
+        String b = "hello";
+        String c = new String("hello");
+        String d = new String("hello");
+
+        System.out.println(a == b);
+        System.out.println(a == c);
+        System.out.println(c == d);
+        System.out.println(a.equals(c));
+        System.out.println(c.intern() == a);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">true
+false
+false
+true
+true</code></pre>
+<p><code>c</code>를 만드는 줄의 바이트코드가 차이를 설명한다.</p>
+<pre data-label="javap -c 출력의 일부"><code class="language-text">       6: new           #9                  // class java/lang/String
+       9: dup
+      10: ldc           #7                  // String hello
+      12: invokespecial #11                 // Method java/lang/String."<init>":(Ljava/lang/String;)V
+      15: astore_3</code></pre>
+<p><code>new</code> 명령은 힙에 String 객체를 위한 공간을 새로 잡는다. 이 명령은 실행될 때마다 새 객체를 만든다. 풀을 찾아보는 일은 하지 않는다. 그다음 <code>ldc #7</code>이 풀에 있는 <code>"hello"</code>의 참조를 올리고, 생성자가 그것을 인자로 받아 새 객체를 초기화한다. 그러니 <code>new String("hello")</code> 한 줄에는 String 객체가 둘 관여한다. 풀에 있는 리터럴의 객체와 방금 만든 객체다.</p>
+<p>생성자가 하는 일도 볼 만하다. OpenJDK 21에서 <code>String(String original)</code> 생성자는 <code>original</code>의 <code>value</code>, <code>coder</code>, <code>hash</code>, <code>hashIsZero</code>를 새 객체의 필드에 그대로 대입한다. 배열을 복사하지 않는다. 새 String 객체는 생기지만 글자가 든 <code>byte[]</code>는 원본과 함께 쓴다. 내용을 바꿀 수 없으니 함께 써도 안전하다. Javadoc도 이 생성자에 대해, String은 불변이므로 원본의 명시적 복사본이 필요한 경우가 아니면 쓸 필요가 없다고 적어 둔다.</p>
+<pre class="diagram">main의 스택 프레임            힙
+
+ a ──┐
+     ├──────────────►  String ①  (풀에 등록됨)
+ b ──┘                 value ─────────┐
+                                      ▼
+ c ─────────────────►  String ②      byte[5]  h e l l o
+                       value ─────────┤
+                                      │
+ d ─────────────────►  String ③       │
+                       value ─────────┘
+
+ a == b  true   (같은 객체 ①)
+ a == c  false  (① 과 ②)
+ c == d  false  (② 와 ③)
+ 배열 공유는 OpenJDK 21의 구현 세부다. 명세가 보장하는 것은 ①②③이 서로 다른 객체라는 것까지다.</pre>
+<p>이제 결과를 설명할 수 있다. 참조 타입끼리의 <code>==</code>는 두 피연산자가 같은 객체를 가리키는지 본다(JLS 15.21.3). <code>a</code>와 <code>b</code>는 같은 리터럴이므로 같은 객체다. <code>c</code>와 <code>d</code>는 <code>new</code>가 각각 만든 서로 다른 객체이고, 풀의 객체와도 다르다. 반면 <code>equals</code>는 Javadoc의 정의대로 인자가 <code>null</code>이 아니고 같은 문자 시퀀스를 나타내는 String일 때 <code>true</code>다. 내용이 같으므로 <code>a.equals(c)</code>는 <code>true</code>다.</p>
+<p>OpenJDK 21의 <code>equals</code> 구현은 세 단계다. 먼저 <code>this == anObject</code>이면 곧바로 <code>true</code>를 돌려준다. 같은 객체라면 글자를 볼 필요가 없다. 다음으로 상대가 String이 아니거나 <code>coder</code>가 다르면 <code>false</code>다. 같은 내용은 항상 같은 인코딩으로 저장되므로 인코딩이 다르면 내용도 다르다. 마지막으로 두 <code>byte[]</code>의 길이와 내용을 비교한다. 풀을 공유하는 리터럴끼리는 첫 단계에서 끝난다.</p>
+<h4>intern()</h4>
+<p><code>c.intern() == a</code>가 <code>true</code>인 이유는 <code>intern()</code>의 정의에 있다. Javadoc에 따르면 <code>intern()</code>이 호출되었을 때 풀에 이미 <code>equals</code>로 같은 문자열이 있으면 풀의 그 문자열을 돌려주고, 없으면 이 String 객체를 풀에 추가하고 이 객체의 참조를 돌려준다. <code>c</code>와 내용이 같은 <code>"hello"</code>가 리터럴 때문에 이미 풀에 있으므로 그 객체, 곧 <code>a</code>가 가리키는 객체가 돌아온다. <code>c</code>가 가리키는 객체 자체는 풀에 들어가지 않는다.</p>
+<p>Javadoc은 여기서 한 가지 성질을 끌어낸다. 임의의 두 문자열 <code>s</code>, <code>t</code>에 대해 <code>s.intern() == t.intern()</code>이 <code>true</code>인 것과 <code>s.equals(t)</code>가 <code>true</code>인 것은 같은 조건이다. 그렇다고 문자열 비교를 <code>intern()</code>과 <code>==</code>로 하자는 뜻은 아니다. <code>intern()</code>은 풀을 찾아보는 비용이 들고, 실행 중에 만든 문자열을 계속 인턴하면 풀이 커진다. JDK 7 릴리스 노트도 <code>String.intern()</code>을 많이 쓰는 애플리케이션은 힙 사용량에서 더 큰 차이를 보게 된다고 적는다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>문자열의 내용이 같은지 묻는다면 <code>equals</code>를 쓴다. <code>==</code>는 "같은 객체인가"라는 다른 질문이고, 그 답은 문자열이 리터럴에서 왔는지, <code>new</code>나 런타임 연산에서 왔는지에 따라 달라진다. 파일에서 읽은 문자열, 네트워크로 받은 문자열, 사용자가 입력한 문자열은 모두 실행 중에 새로 만들어진 객체이므로 리터럴과 <code>==</code>로 비교하면 내용이 같아도 <code>false</code>가 나온다.</p></aside>
+
+<x-visual id="java-mid1-03-pool-literal-new" title="리터럴 두 개와 new String 두 개가 가리키는 객체" kind="메모리 구조도" ratio="16:9">
+<x-hint>리터럴 변수 둘은 풀에 등록된 한 객체를 가리키고, new로 만든 변수 둘은 각각 다른 객체를 가리키며, intern이 풀의 객체를 돌려준다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 메모리 구조 다이어그램. 왼쪽에 세로로 긴 상자 "스택: main 프레임"이 있고 안에 위에서 아래로 네 칸 "a", "b", "c", "d". 오른쪽 넓은 영역은 "힙"이라는 제목의 큰 둥근 상자. 힙 안 위쪽에 점선 테두리로 둘러싼 구역이 있고 라벨 "문자열 풀이 가리키는 객체". 그 구역 안에 상자 하나 "String ①". 힙 안 아래쪽에 상자 두 개 "String ②", "String ③". 힙 오른쪽 끝에 배열 그림 하나 "byte[5] h e l l o". 화살표: "a"와 "b"에서 각각 "String ①"로 파란 화살표. "c"에서 "String ②"로, "d"에서 "String ③"으로 주황 화살표. "String ①", "String ②", "String ③" 세 상자에서 모두 같은 배열 "byte[5] h e l l o"로 얇은 회색 화살표. "String ②"에서 "String ①"로 휘어지는 점선 화살표를 그리고 라벨 "c.intern()". 아래쪽에 작은 글씨 세 줄: "a == b : true", "a == c : false", "c.intern() == a : true".</x-prompt>
+<x-caption>new는 항상 새 객체를 만들고, intern()은 풀에 등록된 객체를 돌려준다.</x-caption>
+</x-visual>
+
+<h3>String은 왜 불변인가</h3>
+<p>String은 불변 객체(immutable object)다. 앞 회차의 기준으로 보면 조건을 모두 갖추고 있다. 클래스가 <code>final</code>이어서 하위 클래스가 내용을 바꾸는 메서드를 덧붙일 수 없다. 글자를 담는 <code>value</code>는 <code>private final</code>이고, 그 배열을 밖으로 내주거나 원소를 고치는 메서드가 없다. <code>toCharArray()</code>는 내부 배열이 아니라 새로 할당한 배열을 돌려준다. 그리고 내용을 바꾸는 것처럼 보이는 메서드는 전부 새 String을 만들어 돌려준다.</p>
+<pre><code class="language-java">public class Immutable {
+    public static void main(String[] args) {
+        String s = "java";
+        s.concat(" 21");
+        s.toUpperCase();
+        System.out.println(s);
+
+        String t = s.concat(" 21");
+        System.out.println(t);
+        System.out.println(s == t);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">java
+java 21
+false</code></pre>
+<p>둘째, 셋째 줄의 <code>concat</code>과 <code>toUpperCase</code>는 새 String 객체를 만들어 돌려주지만 그 반환값을 받는 변수가 없다. 객체는 만들어지자마자 아무도 참조하지 않는 상태가 된다. <code>s</code>가 가리키는 객체는 그대로이므로 <code>java</code>가 출력된다. 반환값을 <code>t</code>에 받아야 결과를 쓸 수 있고, 그때 <code>t</code>는 <code>s</code>와 다른 객체다. "String 메서드를 호출했는데 값이 안 바뀐다"는 초보적인 버그는 모두 이 구조에서 나온다.</p>
+<p>String이 불변이어야 하는 이유는 앞에서 본 구조들과 묶여 있다.</p>
+<h4>이유 1: 풀로 공유하려면 바뀌면 안 된다</h4>
+<p>String의 Javadoc은 "String 객체는 불변이므로 공유할 수 있다"고 적는다. 반대로 생각해 보면 분명해진다. String에 내용을 바꾸는 <code>setCharAt</code> 같은 메서드가 있었다고 하자. 결제 모듈의 어떤 클래스가 <code>String status = "OK";</code>로 받은 문자열의 첫 글자를 바꾸면, 같은 JVM 안에서 <code>"OK"</code> 리터럴을 쓰는 모든 클래스가 영향을 받는다. 전부 풀의 같은 객체를 가리키기 때문이다. 관계없는 모듈의 로그 메시지와 조건문이 한꺼번에 달라진다. 앞 회차에서 본 공유 참조의 사이드 이펙트가 프로그램 전체 규모로 일어나는 셈이다. 리터럴을 공유해서 메모리를 아끼는 설계는 내용이 바뀌지 않는다는 보장이 있어야만 성립한다.</p>
+<p><code>new String(original)</code>이 배열을 복사하지 않고 함께 쓰는 것, 뒤에서 볼 <code>StringBuilder.toString()</code>이 반대로 배열을 반드시 복사하는 것도 같은 원리다. 양쪽 다 불변이면 공유해도 되고, 한쪽이 가변이면 복사해야 한다.</p>
+<h4>이유 2: 해시코드를 한 번만 계산해도 된다</h4>
+<p>String의 <code>hashCode()</code>는 Javadoc에 계산식이 명시되어 있다. 길이가 n인 문자열 s에 대해 <code>s[0]*31^(n-1) + s[1]*31^(n-2) + ... + s[n-1]</code>을 <code>int</code> 산술로 계산한 값이다(<code>^</code>는 거듭제곱). 문자열 전체를 훑어야 하므로 길이에 비례하는 시간이 든다. 예를 들어 <code>"abc"</code>는 97×31×31 + 98×31 + 99 = 96354다.</p>
+<p>OpenJDK 21의 구현은 이 값을 <code>hash</code> 필드에 저장해 둔다. <code>hashCode()</code>가 처음 호출되면 계산해서 필드에 넣고, 그다음부터는 필드 값을 바로 돌려준다. 계산 결과가 정말 0인 문자열을 "아직 계산 안 함"과 구분하려고 <code>hashIsZero</code> 필드를 따로 둔다. 이 캐싱은 내용이 변하지 않을 때만 옳다. 내용이 바뀔 수 있다면 바뀔 때마다 캐시를 무효로 만들어야 하고, 그 String을 키로 넣어 둔 해시 기반 자료 구조는 엉뚱한 위치를 찾게 된다.</p>
+<p><code>hash</code> 필드는 <code>final</code>이 아니다. 그런데도 String을 불변이라고 부르는 것은 불변성이 "밖에서 관찰할 수 있는 상태가 변하지 않는다"는 뜻이기 때문이다. <code>hashCode()</code>는 언제 호출해도 같은 값을 돌려준다. 소스의 주석은 이 필드에 여러 스레드가 동시에 접근해도 문제가 없는 이유를 적어 둔다. 계산이 불변인 상태에서만 나오고 몇 번을 해도 결과가 같으므로, 두 스레드가 동시에 계산해서 각자 저장해도 같은 값이 들어간다. 락 없이 캐시를 둘 수 있는 것도 불변 덕분이다.</p>
+<p>덧붙여 해시코드가 같다고 내용이 같은 것은 아니다. <code>"Aa"</code>와 <code>"BB"</code>는 식에 넣어 보면 둘 다 2112다(65×31+97, 66×31+66). <code>int</code>는 약 43억 가지 값밖에 없으므로 서로 다른 문자열이 같은 해시코드를 갖는 일은 피할 수 없다. 해시코드는 후보를 좁히는 데 쓰고, 최종 판정은 <code>equals</code>가 한다. 이 관계는 다음 권의 해시 자료 구조에서 다시 다룬다.</p>
+<h4>이유 3: 스레드 사이에서, 검증 뒤에 안전하다</h4>
+<p>불변 객체는 여러 스레드가 동시에 읽어도 동기화가 필요 없다. 읽는 도중에 다른 스레드가 내용을 바꿀 수 없기 때문이다. 문자열은 스레드 사이를 가장 많이 오가는 데이터이므로 이 성질의 효과가 크다. 같은 이유로, 문자열을 한 번 검사한 뒤에는 그 검사가 계속 유효하다. 파일 경로나 클래스 이름을 문자열로 받아 허용 여부를 확인했다면, 호출한 쪽이 같은 객체를 쥐고 있어도 확인 뒤에 내용을 바꿔치기할 수 없다.</p>
+
+<h3>주요 메서드: 무엇을 돌려주는지에 주목한다</h3>
+<p>String의 메서드는 많지만 공통 규칙이 하나 있다. 원본을 바꾸는 메서드는 없고, 결과는 항상 반환값으로 나온다. 자주 쓰는 것을 하는 일에 따라 나누면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>분류</th><th>메서드</th><th>돌려주는 것</th></tr></thead><tbody>
+<tr><td>정보</td><td><code>length()</code>, <code>isEmpty()</code>, <code>isBlank()</code>, <code>charAt(i)</code></td><td>코드 유닛 수, 길이가 0인지, 공백뿐인지(Java 11), i번째 <code>char</code></td></tr>
+<tr><td>비교</td><td><code>equals</code>, <code>equalsIgnoreCase</code>, <code>compareTo</code>, <code>startsWith</code>, <code>endsWith</code></td><td>내용 동등 여부, 대소문자 무시 비교, 사전순 차이(<code>int</code>), 접두·접미 일치</td></tr>
+<tr><td>검색</td><td><code>contains</code>, <code>indexOf</code>, <code>lastIndexOf</code></td><td>포함 여부, 처음·마지막으로 나타나는 인덱스(없으면 -1)</td></tr>
+<tr><td>잘라내기·바꾸기</td><td><code>substring</code>, <code>concat</code>, <code>replace</code>, <code>replaceAll</code>, <code>toUpperCase</code>, <code>toLowerCase</code>, <code>trim</code>, <code>strip</code>(Java 11), <code>repeat</code>(Java 11)</td><td>새 String</td></tr>
+<tr><td>나누기·합치기</td><td><code>split</code>, <code>String.join</code>(Java 8)</td><td><code>String[]</code>, 구분자로 이어 붙인 새 String</td></tr>
+<tr><td>변환</td><td><code>String.valueOf</code>, <code>toCharArray</code>, <code>String.format</code>, <code>formatted</code>(Java 15)</td><td>다른 타입에서 만든 String, 새 <code>char[]</code>, 서식을 채운 String</td></tr>
+</tbody></table></div>
+<pre><code class="language-java">import java.util.Arrays;
+
+public class Methods {
+    public static void main(String[] args) {
+        String s = "  Hello, Java!  ";
+        String t = s.strip();
+        System.out.println("[" + t + "]");
+        System.out.println(t.length());
+        System.out.println(t.charAt(7));
+        System.out.println(t.indexOf("Java"));
+        System.out.println(t.indexOf('z'));
+        System.out.println(t.substring(7));
+        System.out.println(t.substring(7, 11));
+        System.out.println(t.replace("Java", "JVM"));
+        System.out.println(Arrays.toString("a,b,,c".split(",")));
+        System.out.println(String.join("-", "2026", "11", "14"));
+        System.out.println("%s는 %d살".formatted("자바", 30));
+        System.out.println("ab".repeat(3));
+        System.out.println("apple".compareTo("banana"));
+        System.out.println("   ".isEmpty() + " " + "   ".isBlank());
+
+        char[] cs = t.toCharArray();
+        cs[0] = 'J';
+        System.out.println(t + " / " + new String(cs));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[Hello, Java!]
+12
+J
+7
+-1
+Java!
+Java
+Hello, JVM!
+[a, b, , c]
+2026-11-14
+자바는 30살
+ababab
+-1
+false true
+Hello, Java! / Jello, Java!</code></pre>
+<p>몇 줄을 짚어 보자. <code>strip()</code>은 앞뒤 공백을 뗀 새 문자열을 돌려주고 <code>s</code>는 그대로다. <code>substring(7, 11)</code>은 인덱스 7부터 10까지, 곧 끝 인덱스 바로 앞까지를 잘라 낸다. 길이는 11 - 7 = 4다. <code>"a,b,,c".split(",")</code>의 결과에는 빈 문자열이 원소로 들어 있다. <code>split</code>의 인자는 단순한 구분 문자가 아니라 정규 표현식이라는 점도 기억해 둔다. <code>"1.2.3".split(".")</code>은 <code>.</code>이 "아무 문자"를 뜻하는 정규식이어서 기대와 다른 결과가 나온다.</p>
+<p><code>compareTo</code>는 사전순 비교인데 그 기준은 <code>char</code> 값이다. Javadoc에 따르면 두 문자열이 처음으로 달라지는 위치의 두 문자 값의 차를 돌려준다. <code>'a'</code>는 97, <code>'b'</code>는 98이므로 -1이다. 국어사전의 순서나 대소문자를 무시한 순서가 아니라 유니코드 값의 순서라는 점에 주의한다. 마지막 줄은 <code>toCharArray()</code>가 복사본을 준다는 것을 확인한다. 받은 배열의 첫 원소를 바꿔도 <code>t</code>는 변하지 않는다.</p>
+<p><code>trim()</code>과 <code>strip()</code>은 "공백"의 정의가 다르다. <code>trim()</code>은 코드 값이 U+0020(스페이스) 이하인 문자를 떼고, <code>strip()</code>은 <code>Character.isWhitespace</code>가 참인 문자를 뗀다. 전각 공백(U+3000)처럼 유니코드가 공백으로 분류하지만 코드 값이 큰 문자는 <code>strip()</code>만 뗀다. Java 11 이상에서는 <code>strip()</code>을 쓰는 편이 의도에 맞는 경우가 많다.</p>
+<p><code>null</code>과 관련한 두 가지도 정리한다. <code>"a" + x</code>에서 <code>x</code>가 <code>null</code>이면 예외가 나지 않고 <code>"anull"</code>이 된다. 문자열 변환 규칙(JLS 5.1.11)이 <code>null</code> 참조를 문자열 <code>"null"</code>로 바꾸기 때문이다. 반면 <code>x.equals("hello")</code>는 <code>NullPointerException</code>이다. 그래서 한쪽이 리터럴이면 <code>"hello".equals(x)</code>처럼 리터럴 쪽에서 호출하는 습관이 생겼다. 이 경우 <code>x</code>가 <code>null</code>이면 예외 없이 <code>false</code>가 나온다.</p>
+
+<h3>+ 연결은 무엇으로 컴파일되는가</h3>
+<p>문자열을 이어 붙이는 <code>+</code>로 넘어가자. JLS 15.18.1이 연결의 결과에 대해 정하는 것은 하나다. 결과인 String 객체는 그 식이 상수 표현식(constant expression)이 아닌 한 새로 만들어진다. 어떤 절차로 만드는지는 정하지 않는다. 같은 절은 구현이 변환과 연결을 한 단계로 처리해서 중간 String 객체를 만들었다 버리는 일을 피해도 된다고 적고, 자바 컴파일러가 반복되는 연결의 성능을 높이려고 <code>StringBuffer</code> 클래스나 비슷한 기법을 써도 된다고 덧붙인다. 명세는 결과를 고정하고 방법은 컴파일러와 라이브러리에 맡겼다.</p>
+<p>그래서 소스에서는 똑같은 <code>+</code>라도 클래스 파일에 남는 모습은 세 가지로 갈린다. 컴파일할 때 계산이 끝나 버리는 경우, 실행 시점에 JDK 라이브러리가 연결 방법을 정하는 경우, 컴파일러가 <code>StringBuilder</code> 호출을 직접 늘어놓는 경우다. 어느 쪽이 되는지는 식의 모양과 컴파일 대상 버전이 정한다. <code>javap</code>로 하나씩 확인한다.</p>
+<h4>경로 1: 상수 접기 — 컴파일할 때 끝난다</h4>
+<p>JLS 15.29는 상수 표현식을 정의한다. 기본형이나 String 값을 나타내는 식 가운데 정해진 재료로만 이루어진 것이다. 재료 목록에는 문자열 리터럴과 텍스트 블록, <code>+</code>를 비롯한 연산자, 그리고 <b>상수 변수</b>(constant variable)를 가리키는 단순 이름이 들어 있다. 상수 변수는 <code>final</code>이면서 상수 표현식으로 초기화된 기본형 또는 String 변수다(JLS 4.12.4). 같은 절은 String 타입의 상수 표현식이 항상 인턴된다고 적는다. 컴파일러는 이런 식의 값을 컴파일할 때 계산해서 결과만 클래스 파일에 적는다. 이것을 상수 접기(constant folding)라고 부른다.</p>
+<pre><code class="language-java">public class ConstantFold {
+    public static void main(String[] args) {
+        String hello = "hello";
+
+        String s1 = "hel" + "lo";
+
+        final String fh = "hel";
+        String s2 = fh + "lo";
+
+        String h = "hel";
+        String s3 = h + "lo";
+
+        System.out.println(s1 == hello);
+        System.out.println(s2 == hello);
+        System.out.println(s3 == hello);
+        System.out.println(s3.equals(hello));
+        System.out.println(s3.intern() == hello);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">true
+true
+false
+true
+true</code></pre>
+<pre data-label="javap -c ConstantFold 의 앞부분 (JDK 21)"><code class="language-text">       0: ldc           #7                  // String hello
+       2: astore_1
+       3: ldc           #7                  // String hello
+       5: astore_2
+       6: ldc           #7                  // String hello
+       8: astore_3
+       9: ldc           #9                  // String hel
+      11: astore        4
+      13: aload         4
+      15: invokedynamic #11,  0             // InvokeDynamic #0:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+      20: astore        5</code></pre>
+<p>바이트코드를 변수 순서대로 읽는다. <code>hello</code>(1번 지역 변수)에는 <code>ldc #7</code>로 <code>"hello"</code>가 들어간다. <code>s1</code>(2번)을 만드는 자리에도 똑같이 <code>ldc #7</code>이 있다. 소스의 <code>"hel" + "lo"</code>는 흔적이 없다. 컴파일러가 두 리터럴을 붙여 <code>"hello"</code>라는 상수 하나로 바꿨고, 그 상수는 <code>hello</code>가 쓰는 것과 같은 상수 풀 항목이다. 실행 중에는 연결이 일어나지 않고, 두 변수는 풀의 같은 객체를 가리킨다.</p>
+<p><code>s2</code>(3번)도 <code>ldc #7</code>이다. <code>fh</code>는 <code>final</code>이고 리터럴로 초기화되었으므로 상수 변수이고, 따라서 <code>fh + "lo"</code>도 상수 표현식이다. 바이트코드에는 <code>fh</code>에 값을 저장하는 명령이 아예 없다. 컴파일러가 <code>fh</code>가 나오는 자리에 값을 직접 넣었기 때문이다. 반면 <code>final</code>이 없는 <code>h</code>(4번)는 <code>ldc #9</code>로 <code>"hel"</code>을 받아 저장되고, <code>h + "lo"</code>는 <code>invokedynamic</code> 명령으로 남았다. 컴파일러는 <code>h</code>의 값이 그 사이에 바뀌지 않는다는 것을 따져 보지 않는다. 기준은 그 변수가 상수 변수인가 하나뿐이다.</p>
+<p>그래서 <code>s3</code>는 실행 중에 새로 만들어진 객체이고 <code>s3 == hello</code>는 <code>false</code>다. 내용은 같으므로 <code>equals</code>는 <code>true</code>이고, <code>intern()</code>을 거치면 풀의 객체가 돌아와 <code>true</code>가 된다. <code>final</code>만으로 충분하지 않다는 점도 짚어 둔다. <code>final String p = String.valueOf("hel");</code>처럼 초기화 식이 메서드 호출이면 <code>p</code>는 상수 변수가 아니고, <code>p + "lo"</code>는 실행 시점에 연결되어 <code>"hello"</code>와 <code>==</code>로 비교하면 <code>false</code>가 나온다.</p>
+<aside class="note">상수 접기 덕분에 소스를 읽기 좋게 나누어 쓰는 데에는 실행 비용이 들지 않는다. 긴 SQL이나 메시지를 여러 줄의 리터럴로 쪼개 <code>+</code>로 이어도 클래스 파일에는 문자열 하나만 남는다. Java 15부터는 텍스트 블록(<code>"""</code>)을 같은 용도로 쓸 수 있고, 텍스트 블록도 상수 표현식의 재료다.</aside>
+<h4>경로 2: invokedynamic — 연결 방법을 실행 시점의 JDK에 맡긴다</h4>
+<p>변수가 섞인 연결은 실행 중에 해야 한다. Java 21의 javac가 이것을 어떻게 내보내는지 보자.</p>
+<pre><code class="language-java">public class Greeting {
+    static String greet(String name, int age) {
+        return "이름: " + name + ", 나이: " + age;
+    }
+}</code></pre>
+<pre data-label="javap -c -v Greeting 의 일부 (JDK 21)"><code class="language-text">  static java.lang.String greet(java.lang.String, int);
+    Code:
+       0: aload_0
+       1: iload_1
+       2: invokedynamic #7,  0              // InvokeDynamic #0:makeConcatWithConstants:(Ljava/lang/String;I)Ljava/lang/String;
+       7: areturn
+
+BootstrapMethods:
+  0: #21 REF_invokeStatic java/lang/invoke/StringConcatFactory.makeConcatWithConstants:(...)Ljava/lang/invoke/CallSite;
+    Method arguments:
+      #19 이름: \u0001, 나이: \u0001</code></pre>
+<p><code>greet</code>의 본문은 명령 네 개다. 인자 <code>name</code>과 <code>age</code>를 오퍼랜드 스택에 올리고(<code>aload_0</code>, <code>iload_1</code>), <code>invokedynamic</code>을 실행하고, 결과를 돌려준다. <code>StringBuilder</code>도 <code>append</code>도 보이지 않는다. 명령에 붙은 서술자 <code>(Ljava/lang/String;I)Ljava/lang/String;</code>은 String 하나와 <code>int</code> 하나를 받아 String을 돌려준다는 뜻이다. <code>age</code>는 박싱되거나 미리 문자열로 바뀌지 않고 <code>int</code> 그대로 넘어간다. 리터럴 부분은 클래스 파일 끝의 <code>BootstrapMethods</code> 표에 레시피(recipe) 문자열로 들어 있다. <code>이름: \u0001, 나이: \u0001</code>에서 <code>\u0001</code>이 인자가 들어갈 자리를 표시한다(출력에서 부트스트랩 메서드의 긴 매개변수 목록은 <code>(...)</code>로 줄였다).</p>
+<p>클래스 파일에 적힌 것은 "무엇을 이을 것인가"뿐이고 "어떻게 이을 것인가"는 없다. 방법은 실행 시점에 정해진다. <code>invokedynamic</code> 명령이 처음 실행될 때 JVM은 표에 적힌 <b>부트스트랩 메서드</b>(bootstrap method), 여기서는 <code>java.lang.invoke.StringConcatFactory.makeConcatWithConstants</code>를 호출한다. 이 메서드는 인자 타입과 레시피를 받아 그 모양의 연결을 수행할 코드를 마련하고, 그것을 가리키는 <code>CallSite</code> 객체를 돌려준다. JVM은 그 결과를 해당 명령에 연결해 두고, 두 번째 실행부터는 부트스트랩을 다시 부르지 않고 연결된 코드를 바로 호출한다.</p>
+<figure class="flow-figure"><figcaption>invokedynamic으로 컴파일된 문자열 연결이 실행되는 순서</figcaption><ol class="flow">
+<li><strong>컴파일</strong><span>javac가 인자 타입과 레시피만 클래스 파일에 기록한다. 연결 절차는 기록하지 않는다.</span></li>
+<li><strong>첫 실행: 연결(linkage)</strong><span>JVM이 부트스트랩 메서드 StringConcatFactory.makeConcatWithConstants를 호출한다.</span></li>
+<li><strong>연결 코드 준비</strong><span>JDK 라이브러리가 이 인자 타입과 레시피에 맞는 연결 코드를 만들어 CallSite로 돌려준다.</span></li>
+<li><strong>호출 지점에 고정</strong><span>JVM이 그 CallSite를 이 invokedynamic 명령에 묶어 둔다.</span></li>
+<li><strong>이후 실행</strong><span>같은 명령이 다시 실행되면 묶여 있는 연결 코드를 바로 호출한다.</span></li>
+</ol></figure>
+<p>이 방식은 JDK 9에 들어간 JEP 280이 도입했다. 제안서의 요약은 두 문장이다. javac가 만드는 문자열 연결 바이트코드를 JDK 라이브러리 함수에 대한 <code>invokedynamic</code> 호출로 바꾼다. 그렇게 해서 javac가 내는 바이트코드를 더 바꾸지 않고도 이후의 문자열 연결 최적화가 가능해지게 한다. 연결 방법이 클래스 파일이 아니라 JDK 안에 있으므로, 한 번 컴파일한 클래스를 더 새로운 JDK에서 실행하면 다시 컴파일하지 않아도 그 JDK의 연결 방법을 쓰게 된다.</p>
+<p>OpenJDK 21의 라이브러리가 마련하는 연결 코드는 <code>StringBuilder</code>를 쓰지 않는다. <code>java.lang.StringConcatHelper</code>의 소스를 따라가면 순서는 이렇다. 먼저 이어 붙일 조각을 모두 훑어 결과의 전체 길이와 <code>coder</code>를 계산한다. 조각이 전부 Latin-1이면 결과도 Latin-1이고, 하나라도 UTF-16이면 결과는 UTF-16이다. 다음으로 정확히 그 크기의 <code>byte[]</code>를 한 번 할당한다. 그리고 각 조각을 배열의 제자리에 써 넣은 뒤, 그 배열을 복사하지 않고 그대로 품는 String을 만든다. 배열을 키우는 일도, 끝에서 한 번 더 복사하는 일도 없다. 식 하나 안에서는 이어 붙일 조각을 전부 알고 시작하므로 결과 길이를 먼저 셀 수 있다. 그래서 가능한 방법이다.</p>
+<h4>경로 3: StringBuilder 체인 — Java 8까지의 방식</h4>
+<p>같은 소스를 <code>javac --release 8</code>로 컴파일하면 JEP 280 이전의 모습이 나온다.</p>
+<pre data-label="javac --release 8 로 컴파일한 greet 의 바이트코드"><code class="language-text">       0: new           #7                  // class java/lang/StringBuilder
+       3: dup
+       4: invokespecial #9                  // Method java/lang/StringBuilder."<init>":()V
+       7: ldc           #10                 // String 이름:
+       9: invokevirtual #12                 // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+      12: aload_0
+      13: invokevirtual #12                 // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+      16: ldc           #16                 // String , 나이:
+      18: invokevirtual #12                 // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+      21: iload_1
+      22: invokevirtual #18                 // Method java/lang/StringBuilder.append:(I)Ljava/lang/StringBuilder;
+      25: invokevirtual #21                 // Method java/lang/StringBuilder.toString:()Ljava/lang/String;
+      28: areturn</code></pre>
+<p>컴파일러가 <code>new StringBuilder().append("이름: ").append(name).append(", 나이: ").append(age).toString()</code>을 손으로 쓴 것과 같은 코드를 냈다. JLS가 허용한 "비슷한 기법"이 이것이다. 이 방식에서는 연결 절차가 클래스 파일에 고정된다. 기본 용량으로 시작한 빌더는 내용이 길면 중간에 배열을 키워야 하고, <code>toString()</code>에서 한 번 더 복사한다. JEP 280의 동기 부분은 HotSpot의 JIT 컴파일러가 이런 <code>append</code> 체인을 알아보고 최적화하는 기능(<code>-XX:+OptimizeStringConcat</code>)을 갖고 있었지만, 그 최적화가 깨지기 쉽고 확장·유지하기 어려웠다고 적는다. 경로 2는 그 문제를 바이트코드의 모양을 바꿔서 푼 것이다.</p>
+<div class="table-wrap"><table><thead><tr><th>경로</th><th>언제</th><th>클래스 파일에 남는 것</th><th>실행 중에 하는 일</th></tr></thead><tbody>
+<tr><td>상수 접기</td><td>식 전체가 상수 표현식일 때(버전 무관)</td><td>결과 문자열 상수 하나와 <code>ldc</code></td><td>없음. 풀의 객체를 가리킨다</td></tr>
+<tr><td><code>invokedynamic</code></td><td>상수가 아닌 연결, 컴파일 대상이 Java 9 이상</td><td>인자 타입, 레시피, 부트스트랩 메서드 정보</td><td>첫 실행 때 연결 코드를 묶고, 호출마다 새 String 하나를 만든다</td></tr>
+<tr><td><code>StringBuilder</code> 체인</td><td>상수가 아닌 연결, 컴파일 대상이 Java 8 이하</td><td><code>new StringBuilder</code>, <code>append</code>, <code>toString</code> 호출 열</td><td>호출마다 빌더 하나와 새 String 하나를 만든다</td></tr>
+</tbody></table></div>
+<p>세 경로에서 결과 문자열의 내용은 같다. 달라지는 것은 실행 중에 만들어지는 객체의 수와 복사 횟수다. 그리고 어느 경로에서든 <code>+</code> 식 하나는 이미 손질되어 있다. 문제가 생기는 곳은 식 하나가 아니라 식이 되풀이되는 곳이다.</p>
+
+<h3>반복문 안의 +=: 무엇이 얼마나 복사되는가</h3>
+<p>문자열을 반복문에서 한 조각씩 붙여 나가는 코드를 보자.</p>
+<pre><code class="language-java">public class Repeat {
+    static String slow(int n) {
+        String s = "";
+        for (int i = 0; i < n; i++) {
+            s += "x";
+        }
+        return s;
+    }
+
+    static String fast(int n) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            sb.append("x");
+        }
+        return sb.toString();
+    }
+}</code></pre>
+<pre data-label="javap -c Repeat 중 slow (JDK 21)"><code class="language-text">       0: ldc           #7                  // String
+       2: astore_1
+       3: iconst_0
+       4: istore_2
+       5: iload_2
+       6: iload_0
+       7: if_icmpge     23
+      10: aload_1
+      11: invokedynamic #9,  0              // InvokeDynamic #0:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+      16: astore_1
+      17: iinc          2, 1
+      20: goto          5
+      23: aload_1
+      24: areturn</code></pre>
+<p>반복문의 본문은 10번부터 16번까지다. 지금의 <code>s</code>를 스택에 올리고(<code>aload_1</code>), 연결을 실행하고(<code>invokedynamic</code>), 결과를 다시 <code>s</code>에 저장한다(<code>astore_1</code>). 연결은 반복마다 한 번씩 실행되고, 실행될 때마다 새 String을 만든다. String은 불변이어서 기존 객체가 가진 배열의 끝에 글자를 덧붙일 수가 없다. 새 배열을 잡아 기존 내용을 옮기고 그 뒤에 새 글자를 놓는 방법밖에 없다.</p>
+<pre class="diagram">반복   연결 전 s        새로 만드는 문자열     새 문자열의 길이
+ 1     ""              "x"                   1
+ 2     "x"             "xx"                  2   (기존 1 + 새 1)
+ 3     "xx"            "xxx"                 3   (기존 2 + 새 1)
+ 4     "xxx"           "xxxx"                4   (기존 3 + 새 1)
+ ...
+ k     x가 k-1개       x가 k개               k   (기존 k-1 + 새 1)
+ ...
+ n     x가 n-1개       x가 n개               n
+
+ 만들어지는 문자열 길이의 합 = 1 + 2 + ... + n = n(n+1)/2</pre>
+<p>n이 100,000이면 이 합은 5,000,050,000이다. 최종 결과는 10만 글자인데, 거기에 이르기까지 만들었다 버리는 문자열의 글자를 모두 세면 50억 개가 넘는다. String 객체도 반복 횟수만큼 생기고, 마지막 것을 뺀 나머지는 다음 반복에서 곧바로 아무도 참조하지 않는 객체가 된다. n이 10배가 되면 일의 양은 약 100배가 된다. 적은 데이터로 시험할 때는 드러나지 않다가 데이터가 커진 뒤에 나타나는 종류의 문제다.</p>
+<p>컴파일러가 이것을 대신 고쳐 주지 못하는 이유도 짚는다. <code>s += "x"</code>는 <code>s + "x"</code>의 결과를 <code>s</code>에 대입하는 식이고, JLS는 그 결과가 새로 만든 String 객체라고 정한다. 반복이 한 번 끝날 때마다 <code>s</code>는 완성된 String을 가리키고 있어야 한다. 경로 2의 최적화는 식 하나 안에서 중간 객체를 없애는 것이고, 반복과 반복 사이를 이어 주지는 않는다. Java 8 방식으로 컴파일해도 달라지지 않는다. 그때는 반복마다 <code>new StringBuilder()</code>, <code>append(s)</code>, <code>append("x")</code>, <code>toString()</code>이 실행된다. 빌더를 쓰기는 하지만 반복마다 새로 만들어 전체를 옮겨 담으므로 복사량은 같다.</p>
+<p>해법은 반복 전체에 걸쳐 가변 버퍼 하나를 쓰는 것이다. <code>fast</code>가 그렇게 한다.</p>
+<pre data-label="javap -c Repeat 중 fast (JDK 21)"><code class="language-text">       0: new           #13                 // class java/lang/StringBuilder
+       3: dup
+       4: invokespecial #15                 // Method java/lang/StringBuilder."<init>":()V
+       7: astore_1
+       8: iconst_0
+       9: istore_2
+      10: iload_2
+      11: iload_0
+      12: if_icmpge     28
+      15: aload_1
+      16: ldc           #16                 // String x
+      18: invokevirtual #18                 // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+      21: pop
+      22: iinc          2, 1
+      25: goto          10
+      28: aload_1
+      29: invokevirtual #22                 // Method java/lang/StringBuilder.toString:()Ljava/lang/String;
+      32: areturn</code></pre>
+<p>빌더는 반복문 앞에서 한 번 만들어진다(0~7번). 본문(15~21번)은 같은 빌더에 <code>append</code>를 호출하고 반환값을 버린다(<code>pop</code>). 새 String은 반복이 끝난 뒤 <code>toString()</code>에서 한 번 만들어진다. n이 100,000일 때 옮기는 글자 수를 세어 보면, <code>append</code>가 써 넣는 100,000개, 뒤에서 볼 배열 확장 13번에서 복사하는 147,412개, 마지막 <code>toString()</code>이 복사하는 100,000개를 더해 347,412개다. 50억과 35만의 차이다. 이 수치는 소요 시간이 아니라 복사되는 글자 수를 계산한 것이다. 실제 시간은 환경마다 다르지만 일의 양이 n의 제곱으로 느는 쪽과 n에 비례하는 쪽이라는 구조는 변하지 않는다.</p>
+
+<x-visual id="java-mid1-03-loop-concat-copies" title="반복문 안의 += 와 StringBuilder의 복사량 비교" kind="비교 다이어그램" ratio="16:9">
+<x-hint>반복마다 새 문자열을 만들어 전체를 다시 복사하는 방식은 계단 모양으로 일이 늘고, 버퍼 하나에 덧붙이는 방식은 한 줄로 끝난다는 대비를 보여 준다.</x-hint>
+<x-prompt>흰 배경의 비교 다이어그램. 화면을 좌우로 나눈다. 왼쪽 제목 "s += x 를 반복". 왼쪽에는 위에서 아래로 점점 길어지는 가로 막대 다섯 개를 계단 모양으로 쌓는다. 첫 막대는 칸 1개, 둘째는 칸 2개, 셋째는 칸 3개, 넷째는 칸 4개, 다섯째는 칸 5개. 각 막대에서 마지막 칸만 주황색, 나머지 칸은 회색으로 칠하고 회색 칸에는 위 막대에서 내려오는 얇은 화살표를 그려 복사를 나타낸다. 위의 네 막대에는 옅은 취소선을 긋고 옆에 라벨 "버려지는 String". 다섯째 막대 옆에 라벨 "최종 결과". 왼쪽 아래에 수식 라벨 "복사량 = 1 + 2 + ... + n". 오른쪽 제목 "StringBuilder.append 를 반복". 오른쪽에는 긴 가로 막대 하나만 그리고 왼쪽부터 칸 5개가 주황색으로 채워져 있으며 나머지 칸은 비어 있다. 채워진 끝에 작은 삼각형 표시와 라벨 "count". 막대 전체 아래에 라벨 "capacity". 오른쪽 아래에 라벨 "버퍼 하나, 끝에만 쓴다". 두 영역 사이에 세로 점선. 색은 회색과 주황만 쓴다.</x-prompt>
+<x-caption>불변 String을 반복해서 잇는 쪽은 매번 전체를 다시 옮기고, 가변 버퍼는 끝에만 써 넣는다.</x-caption>
+</x-visual>
+
+<h4>StringBuilder를 직접 써야 하는 곳</h4>
+<p>정리하면 판단 기준은 "연결이 식 하나로 끝나는가"다.</p>
+<ul>
+<li><b>반복문 안에서 문자열을 누적할 때.</b> 위에서 본 경우다. 반복 횟수가 입력 크기에 따라 달라진다면 반드시 빌더를 쓴다.</li>
+<li><b>조건에 따라 여러 문장에 걸쳐 조각을 붙일 때.</b> <code>if</code>마다 <code>s += ...</code>를 하면 문장마다 새 String이 생긴다.</li>
+<li><b>문자열의 중간을 고치거나 뒤집을 때.</b> <code>insert</code>, <code>delete</code>, <code>reverse</code>, <code>setCharAt</code>처럼 제자리에서 고치는 연산은 String에는 없다.</li>
+<li><b>반대로, 한 식으로 끝나는 연결은 <code>+</code>로 쓴다.</b> <code>"이름: " + name + ", 나이: " + age</code>를 빌더로 풀어 쓰면 읽기만 어려워진다. Java 9 이상에서는 경로 2가 처리한다.</li>
+<li><b>구분자로 잇는 일이면 <code>String.join</code>을 쓴다.</b> 구분자를 언제 넣을지 따지는 코드를 직접 쓸 필요가 없다.</li>
+</ul>
+
+<h3>StringBuilder: 가변 문자열의 속</h3>
+<p><code>StringBuilder</code>의 Javadoc 첫 문장은 이 클래스를 가변 문자 시퀀스(mutable sequence of characters)라고 정의한다. String과 하는 일은 겹치지만 설계는 반대다. OpenJDK 21에서 <code>StringBuilder</code>의 상태는 패키지 전용 상위 클래스 <code>AbstractStringBuilder</code>에 들어 있다.</p>
+<pre data-label="OpenJDK 21 java.lang.AbstractStringBuilder의 필드"><code class="language-java">abstract sealed class AbstractStringBuilder implements Appendable, CharSequence
+    permits StringBuilder, StringBuffer {
+
+    byte[] value;   // 문자 데이터. final이 아니다
+    byte coder;     // LATIN1(0) 또는 UTF16(1)
+    int count;      // 지금까지 채운 문자(코드 유닛) 수
+    // ...
+}</code></pre>
+<p>String과 필드 구성이 닮았다. JEP 254가 String의 내부 표현을 바꾸면서 <code>AbstractStringBuilder</code>, <code>StringBuilder</code>, <code>StringBuffer</code>도 같은 표현을 쓰도록 고쳤기 때문이다. 다른 점은 세 가지다. <code>value</code>가 <code>final</code>이 아니어서 다른 배열로 바꿔 끼울 수 있다. 배열이 내용보다 클 수 있다. 그래서 "어디까지 찼는가"를 기억하는 <code>count</code>가 따로 있다. String에서는 배열 길이가 곧 내용의 길이였지만, 빌더에서는 배열 길이가 <b>용량</b>(capacity)이고 <code>count</code>가 <b>길이</b>(length)다.</p>
+<div class="table-wrap"><table><thead><tr><th></th><th>String</th><th>StringBuilder</th></tr></thead><tbody>
+<tr><td>배열</td><td><code>private final</code>. 내용과 크기가 정확히 같다</td><td><code>final</code> 아님. 빈자리를 포함한다</td></tr>
+<tr><td>길이</td><td>배열 길이에서 계산</td><td><code>count</code> 필드</td></tr>
+<tr><td>내용 변경</td><td>불가. 새 객체를 돌려준다</td><td>제자리에서 바꾸고 자기 자신을 돌려준다</td></tr>
+<tr><td><code>equals</code>·<code>hashCode</code></td><td>내용 기준으로 재정의. 해시 캐시 있음</td><td>재정의하지 않음(Object의 것 그대로)</td></tr>
+<tr><td>공유</td><td>풀과 여러 스레드에서 안전하게 공유</td><td>한 곳에서 만들고 쓰는 작업용 객체</td></tr>
+</tbody></table></div>
+<h4>용량과 확장을 추적한다</h4>
+<pre><code class="language-java">public class BuilderGrowth {
+    public static void main(String[] args) {
+        StringBuilder sb = new StringBuilder();
+        System.out.println("처음: length=" + sb.length() + " capacity=" + sb.capacity());
+
+        int last = sb.capacity();
+        for (int i = 1; i <= 150; i++) {
+            sb.append('x');
+            if (sb.capacity() != last) {
+                System.out.println(i + "번째 append: capacity " + last + " -> " + sb.capacity());
+                last = sb.capacity();
+            }
+        }
+        System.out.println("끝: length=" + sb.length() + " capacity=" + sb.capacity());
+
+        System.out.println(new StringBuilder("abc").capacity());
+        System.out.println(new StringBuilder(100).capacity());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21)"><code class="language-text">처음: length=0 capacity=16
+17번째 append: capacity 16 -> 34
+35번째 append: capacity 34 -> 70
+71번째 append: capacity 70 -> 142
+143번째 append: capacity 142 -> 286
+끝: length=150 capacity=286
+19
+100</code></pre>
+<p>Javadoc은 인자 없는 생성자가 초기 용량 16인 빌더를 만든다고 정한다. 16글자까지는 처음 배열에 그대로 들어간다. 17번째 글자를 넣으려는 순간 자리가 없다. 이때 빌더는 더 큰 배열을 새로 할당하고, 기존 내용을 거기로 복사하고, <code>value</code>가 새 배열을 가리키게 한다. 옛 배열은 아무도 참조하지 않게 된다. 새 용량의 규칙은 <code>ensureCapacity</code>의 Javadoc에 적혀 있다. "필요한 최소 용량"과 "기존 용량의 두 배 더하기 2" 가운데 큰 쪽이다. 16×2+2는 34, 34×2+2는 70, 70×2+2는 142, 142×2+2는 286이다. 출력과 일치한다.</p>
+<p>마지막 두 줄은 다른 생성자의 초기 용량이다. 문자열을 받는 생성자는 그 문자열의 길이에 16을 더한 용량으로 시작한다(3+16=19). 정수를 받는 생성자는 그 값을 용량으로 쓴다. 결과의 대략적인 크기를 미리 안다면 이 생성자로 용량을 정해 두어 확장을 없앨 수 있다.</p>
+<figure class="flow-figure"><figcaption>append 한 번이 하는 일 (OpenJDK 21의 AbstractStringBuilder.append)</figcaption><ol class="flow">
+<li><strong>필요한 용량 계산</strong><span>지금의 count에 덧붙일 길이를 더한다.</span></li>
+<li><strong>용량 확인</strong><span>지금 배열이 그만큼을 담을 수 있는지 본다. 담을 수 있으면 4단계로 간다.</span></li>
+<li><strong>확장</strong><span>더 큰 배열을 할당하고 기존 내용을 복사한 뒤 value를 새 배열로 바꾼다.</span></li>
+<li><strong>써 넣기</strong><span>배열의 count 위치부터 새 내용을 쓴다.</span></li>
+<li><strong>count 증가</strong><span>덧붙인 길이만큼 count를 늘린다.</span></li>
+<li><strong>return this</strong><span>빌더 자신의 참조를 돌려준다.</span></li>
+</ol></figure>
+<pre class="diagram">new StringBuilder()                          count=0    capacity=16
+ [················]
+
+x를 16번 append                              count=16   capacity=16
+ [xxxxxxxxxxxxxxxx]
+
+17번째 append: 자리가 없다. 34칸 배열을 새로 잡고 16글자를 복사한 뒤 한 글자를 쓴다
+ [xxxxxxxxxxxxxxxx]                          (옛 배열: 참조가 끊긴다)
+ [xxxxxxxxxxxxxxxxx·················]        count=17   capacity=34</pre>
+<h4>왜 한 칸씩이 아니라 두 배씩 늘리는가</h4>
+<p>확장은 기존 내용을 전부 복사하는 비싼 연산이다. 그런데 빌더는 꽉 찰 때마다 필요한 만큼만 늘리지 않고 대략 두 배로 늘린다. 이유는 복사량의 합을 세어 보면 나온다. 만약 모자랄 때마다 딱 한 칸씩 늘린다면 글자 하나를 붙일 때마다 전체를 복사해야 한다. n글자를 붙이는 동안의 복사량은 0+1+2+...+(n-1)이 되어, 앞에서 본 반복문 안 <code>+=</code>와 같은 제곱 꼴이 된다. 가변 버퍼를 쓰는 의미가 없어진다.</p>
+<p>두 배씩 늘리면 확장이 일어나는 간격도 두 배씩 벌어진다. 앞의 계산을 다시 보자. 10만 글자를 붙이는 동안 확장은 13번이고, 복사량은 16+34+70+...+73,726으로 147,412다. 확장 때 옮긴 양을 모두 더해도 최종 용량 147,454보다 작다. 직전 용량들의 합이 마지막 용량을 넘지 못하는 것은 매번 두 배 이상으로 늘렸기 때문이다. 따라서 가끔 일어나는 확장의 비용을 모든 <code>append</code>에 고르게 나누면 <code>append</code> 한 번의 몫은 글자 수에 비례하는 작은 값이 된다. 이런 계산법을 분할 상환(amortized) 분석이라고 한다. 다음 권에서 다룰 배열 기반 리스트도 같은 원리로 배열을 키운다.</p>
+<p>대가는 빈자리다. 끝난 뒤의 빌더는 286칸 가운데 150칸만 쓰고 있다. 공간을 조금 더 쓰고 복사를 크게 줄이는 교환이다. 빌더는 보통 메서드 안에서 잠깐 쓰고 버리는 객체이므로 이 빈자리는 오래 남지 않는다.</p>
+<h4>한글이 들어오면: 배열을 통째로 바꾼다</h4>
+<p>빌더도 <code>coder</code>를 가진다. Latin-1 문자만 담고 있던 빌더에 한글 한 글자를 붙이면 어떻게 되는지 리플렉션으로 확인하면 다음과 같다. <code>"abc"</code>를 붙인 직후에는 <code>count</code>가 3, <code>coder</code>가 0, <code>value.length</code>가 16이다. 여기에 <code>'가'</code>를 붙이면 <code>count</code>가 4, <code>coder</code>가 1, <code>value.length</code>가 32가 된다. <code>capacity()</code>는 그대로 16이다. 글자 수 기준의 용량은 같지만, 한 글자가 2바이트를 차지하게 되었으므로 바이트 배열은 두 배 크기로 새로 만들어지고 기존 세 글자도 2바이트씩으로 옮겨 적힌다. String에서 본 "한 글자 때문에 전체가 UTF-16"이라는 규칙이 빌더에서는 실행 도중의 배열 교체로 나타난다.</p>
+<h4>toString()은 반드시 복사한다</h4>
+<pre><code class="language-java">public class BuilderCopy {
+    public static void main(String[] args) {
+        StringBuilder sb = new StringBuilder("abc");
+        String s = sb.toString();
+        sb.append("!").reverse();
+        System.out.println(s);
+        System.out.println(sb);
+
+        StringBuilder x = new StringBuilder("abc");
+        StringBuilder y = new StringBuilder("abc");
+        System.out.println(x.equals(y));
+        System.out.println(x.toString().equals(y.toString()));
+        System.out.println(x.compareTo(y) == 0);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">abc
+!cba
+false
+true
+true</code></pre>
+<p><code>s</code>를 만든 뒤에 빌더를 고쳤는데 <code>s</code>는 그대로 <code>abc</code>다. OpenJDK 21의 <code>StringBuilder.toString()</code>은 한 줄이고, 그 위에 "복사본을 만든다, 배열을 공유하지 않는다"는 주석이 달려 있다. 앞에서 <code>new String(original)</code>이 배열을 공유하던 것과 대비된다. 그쪽은 양쪽이 모두 불변이라 공유해도 됐다. 여기서는 한쪽이 가변이다. 배열을 함께 쓴다면 빌더에 <code>append</code>하는 순간 이미 내보낸 String의 내용이 바뀌고, String의 불변성이 깨진다. 그래서 채워진 부분만큼의 새 배열을 만들어 복사한다. 복사본은 빈자리 없이 내용 크기에 맞춰진다.</p>
+<p>아래 세 줄은 비교에 관한 것이다. <code>StringBuilder</code>는 <code>equals</code>를 재정의하지 않는다. <code>x.equals(y)</code>는 <code>Object</code>의 기본 구현, 곧 같은 객체인지를 본다. 내용이 같아도 <code>false</code>다. 가변 객체는 내용이 계속 바뀌므로 내용 기준의 동등성과 해시코드를 주기 곤란하다는 사정이 있다. 내용을 비교하려면 String으로 바꿔 비교하거나, Java 11에 추가된 <code>compareTo</code>를 쓴다. 같은 이유로 빌더를 해시 기반 컬렉션의 키로 쓰면 안 된다.</p>
+<h4>StringBuffer: 같은 구조에 synchronized</h4>
+<p><code>StringBuffer</code>는 자바 1.0부터 있던 가변 문자열 클래스다. 구조는 <code>StringBuilder</code>와 같다. 둘 다 <code>AbstractStringBuilder</code>를 상속하고 같은 배열 확장 규칙을 쓴다. 다른 점은 <code>StringBuffer</code>에서는 내용을 읽고 고치는 메서드들에 <code>synchronized</code>가 붙어 있다는 것이다. OpenJDK 21의 <code>append(String)</code> 선언은 <code>public synchronized StringBuffer append(String str)</code>이다. 메서드에 들어갈 때마다 그 객체의 모니터 락을 얻고 나올 때 놓는다. 여러 스레드가 한 버퍼에 동시에 <code>append</code>해도 내부 상태(<code>count</code>와 배열)가 어긋나지 않는다.</p>
+<p><code>StringBuilder</code>는 Java 1.5에 추가되었다. Javadoc은 이 클래스가 <code>StringBuffer</code>와 호환되는 API를 제공하되 동기화는 보장하지 않으며, 버퍼를 스레드 하나가 쓰는 곳(대개 그렇다)에서 <code>StringBuffer</code>를 그대로 대체하도록 설계되었다고 적는다. 가능하면 <code>StringBuilder</code>를 쓰라고도 권한다. 메서드 안에서 지역 변수로 만든 빌더는 그 참조를 밖으로 내보내지 않는 한 다른 스레드가 접근할 길이 없다. 그런 객체에 락을 걸 이유가 없다.</p>
+<p>오해 하나를 막아 둔다. <code>StringBuffer</code>가 보장하는 것은 메서드 호출 하나의 원자성이다. <code>buf.append(a).append(b)</code>는 호출이 두 번이므로, 두 스레드가 같은 버퍼에 이 문장을 실행하면 한 스레드의 <code>a</code>와 <code>b</code> 사이에 다른 스레드의 조각이 끼어들 수 있다. 여러 호출을 한 덩어리로 묶으려면 호출하는 쪽에서 따로 동기화해야 한다. 모니터 락과 <code>synchronized</code>의 동작은 고급편의 동시성 회차에서 다룬다.</p>
+
+<x-visual id="java-mid1-03-builder-capacity-growth" title="StringBuilder의 배열 확장: 16칸에서 34칸으로" kind="메모리 구조도" ratio="16:9">
+<x-hint>StringBuilder 객체의 value가 가리키는 배열이 꽉 찼을 때 더 큰 배열로 복사해 옮기고 참조를 바꾸는 과정을 3단계로 보여 준다.</x-hint>
+<x-prompt>흰 배경의 3단계 메모리 다이어그램. 위에서 아래로 세 줄을 배치하고 각 줄 왼쪽에 단계 번호 동그라미 1, 2, 3을 둔다. 각 줄의 왼쪽에는 둥근 상자 "StringBuilder"가 있고 안에 두 줄 "value", "count". 1단계: count 줄에 "count = 16", value에서 오른쪽으로 화살표가 나와 칸 16개짜리 가로 배열을 가리킨다. 16칸 모두 파란색으로 채워져 있고 배열 아래 라벨 "capacity 16 · 가득 참". 2단계: 같은 16칸 배열 아래에 칸 34개짜리 더 긴 배열을 새로 그린다. 위 배열에서 아래 배열의 앞 16칸으로 여러 개의 얇은 화살표를 내려 그리고 라벨 "기존 내용 복사". 아래 배열 옆 라벨 "새 배열 capacity 34". 3단계: value의 화살표가 34칸 배열을 가리킨다. 앞 17칸이 채워져 있고 17번째 칸만 주황색, count 줄에 "count = 17". 옛 16칸 배열은 회색 점선 테두리로 흐리게 그리고 라벨 "참조가 끊긴 옛 배열". 맨 아래에 한 줄 "새 용량 = 기존 용량 × 2 + 2". 색은 파랑, 주황, 회색만 쓴다.</x-prompt>
+<x-caption>빈자리가 없으면 더 큰 배열로 옮겨 담는다. 두 배씩 늘리므로 확장은 갈수록 드물어진다.</x-caption>
+</x-visual>
+
+<h3>메서드 체이닝: 반환된 참조가 다음 호출의 대상이 된다</h3>
+<p><code>append</code>의 마지막 단계가 <code>return this</code>였다. 이 한 줄이 <code>sb.append("a").append("b")</code>처럼 호출을 줄줄이 잇는 문법, 곧 <b>메서드 체이닝</b>(method chaining)을 가능하게 한다. 특별한 문법이 아니라 "메서드 호출식의 값은 반환값"이라는 규칙의 결과다. 작은 클래스로 확인한다.</p>
+<pre><code class="language-java">public class Tally {
+    private int total;
+
+    public Tally add(int amount) {
+        total += amount;
+        return this;
+    }
+
+    public int total() {
+        return total;
+    }
+}</code></pre>
+<pre><code class="language-java">public class ChainMain {
+    public static void main(String[] args) {
+        Tally t1 = new Tally();
+        t1.add(10);
+        t1.add(20);
+        t1.add(30);
+        System.out.println(t1.total());
+
+        Tally t2 = new Tally();
+        Tally r1 = t2.add(10);
+        Tally r2 = r1.add(20);
+        System.out.println(r1 == t2);
+        System.out.println(r2 == t2);
+
+        Tally t3 = new Tally();
+        int sum = t3.add(10).add(20).add(30).total();
+        System.out.println(sum);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">60
+true
+true
+60</code></pre>
+<p>첫 번째 묶음은 반환값을 쓰지 않는다. <code>add</code>가 <code>this</code>를 돌려주지만 받는 곳이 없어 버려진다. 두 번째 묶음은 반환값을 변수에 받아 본다. <code>r1 == t2</code>와 <code>r2 == t2</code>가 모두 <code>true</code>다. <code>add</code>가 돌려준 참조는 호출된 바로 그 객체를 가리킨다. 힙에 있는 <code>Tally</code> 객체는 하나이고, <code>t2</code>, <code>r1</code>, <code>r2</code> 세 변수가 그것을 함께 가리킨다.</p>
+<p>세 번째 묶음이 체이닝이다. <code>t3.add(10).add(20).add(30).total()</code>은 왼쪽부터 평가된다. <code>t3.add(10)</code>이 실행되어 <code>total</code>이 10이 되고 참조가 돌아온다. 그 참조에 대해 <code>.add(20)</code>이 호출된다. 다시 돌아온 참조에 <code>.add(30)</code>이, 마지막 참조에 <code>.total()</code>이 호출되어 60이 나온다. 두 번째 묶음에서 <code>r1</code>, <code>r2</code>라는 이름을 붙여 받던 참조를 이름 없이 바로 쓰는 것이다.</p>
+<p>바이트코드를 보면 이 차이가 그대로 드러난다.</p>
+<pre data-label="javap -c ChainMain 중 첫 번째 묶음"><code class="language-text">       8: aload_1
+       9: bipush        10
+      11: invokevirtual #10                 // Method Tally.add:(I)LTally;
+      14: pop
+      15: aload_1
+      16: bipush        20
+      18: invokevirtual #10                 // Method Tally.add:(I)LTally;
+      21: pop
+      22: aload_1
+      23: bipush        30
+      25: invokevirtual #10                 // Method Tally.add:(I)LTally;
+      28: pop</code></pre>
+<pre data-label="javap -c ChainMain 중 세 번째 묶음"><code class="language-text">     104: aload         5
+     106: bipush        10
+     108: invokevirtual #10                 // Method Tally.add:(I)LTally;
+     111: bipush        20
+     113: invokevirtual #10                 // Method Tally.add:(I)LTally;
+     116: bipush        30
+     118: invokevirtual #10                 // Method Tally.add:(I)LTally;
+     121: invokevirtual #20                 // Method Tally.total:()I
+     124: istore        6</code></pre>
+<p><code>invokevirtual</code>은 오퍼랜드 스택에서 호출 대상 객체의 참조와 인자를 꺼내 메서드를 실행하고, 반환값을 스택에 올려놓는다. 체이닝을 쓰지 않은 쪽은 호출마다 지역 변수에서 참조를 올리고(<code>aload_1</code>), 호출이 끝나면 스택에 남은 반환값을 버린다(<code>pop</code>). 체이닝 쪽은 참조를 맨 처음에 한 번만 올린다(<code>aload 5</code>). 첫 <code>add</code>가 스택에 남긴 반환값이 그대로 다음 <code>add</code>의 호출 대상이 된다. 올리고 버리는 명령이 사라졌을 뿐 호출되는 메서드와 순서는 같다.</p>
+<h4>같은 객체를 돌려주는 체인과 새 객체를 돌려주는 체인</h4>
+<p>문법이 같아 보여도 체인에는 두 종류가 있다. 메모리에서 벌어지는 일이 다르므로 구분해야 한다.</p>
+<pre><code class="language-java">public class ChainKinds {
+    public static void main(String[] args) {
+        StringBuilder sb = new StringBuilder();
+        String r = sb.append("A").append(1).append('-').append(true).reverse().toString();
+        System.out.println(r);
+
+        StringBuilder same = sb.append("?");
+        System.out.println(same == sb);
+
+        String s = "  Hello  ";
+        String u = s.strip().toUpperCase().concat("!");
+        System.out.println(u);
+        System.out.println("[" + s + "]");
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">eurt-1A
+true
+HELLO!
+[  Hello  ]</code></pre>
+<p><code>StringBuilder</code>의 체인은 처음부터 끝까지 객체 하나에 대한 호출이다. <code>append</code> 네 번으로 <code>A1-true</code>가 쌓이고, <code>reverse()</code>가 같은 배열 안에서 순서를 뒤집어 <code>eurt-1A</code>가 된다. 각 단계의 반환값은 모두 <code>sb</code>와 같은 참조다. <code>same == sb</code>가 <code>true</code>인 것이 그 확인이다. 새 객체는 맨 끝의 <code>toString()</code>에서만 생긴다.</p>
+<p>String의 체인은 단계마다 새 객체가 생긴다. <code>s.strip()</code>이 <code>"Hello"</code>라는 새 String을 돌려주고, 그 객체의 <code>toUpperCase()</code>가 <code>"HELLO"</code>라는 또 다른 String을, 그 객체의 <code>concat("!")</code>이 <code>"HELLO!"</code>를 돌려준다. 가운데 두 객체는 다음 호출의 대상으로만 쓰이고 버려진다. <code>s</code>는 끝까지 그대로다. 불변 객체의 체인은 "값을 받아 새 값을 내는 변환을 이어 붙인 것"이고, 가변 객체의 체인은 "한 객체에 명령을 차례로 내리는 것"이다.</p>
+<p>한 가지 세부를 더 본다. <code>append</code>는 상위 클래스 <code>AbstractStringBuilder</code>에 정의되어 있고 거기서의 반환 타입은 <code>AbstractStringBuilder</code>다. <code>StringBuilder</code>는 이 메서드들을 재정의하면서 반환 타입을 <code>StringBuilder</code>로 좁혔다. 재정의할 때 반환 타입을 하위 타입으로 바꾸는 것은 허용되며, <code>javap -p -v java.lang.StringBuilder</code>로 보면 반환 타입이 <code>StringBuilder</code>인 <code>append</code>와 함께 컴파일러가 만든 브리지 메서드(<code>ACC_BRIDGE</code>, <code>ACC_SYNTHETIC</code> 표시가 붙은, 반환 타입이 <code>AbstractStringBuilder</code>인 <code>append</code>)가 나란히 들어 있다. 이 덕분에 체인의 중간 결과가 계속 <code>StringBuilder</code> 타입이어서 <code>StringBuilder</code>에만 있는 메서드도 이어서 부를 수 있다.</p>
+<p>체인이 길어지면 호출마다 줄을 바꿔 쓴다. 읽기 쉬울 뿐 아니라, 예외의 스택 트레이스에는 소스의 줄 번호가 찍히므로 어느 호출에서 문제가 났는지 가려내기 쉬워진다. 체인 중간의 메서드가 <code>null</code>을 돌려줄 수 있다면 그다음 호출에서 <code>NullPointerException</code>이 난다는 점도 기억해 둔다. <code>return this</code> 방식의 체인에서는 이런 일이 생기지 않는다.</p>
+
+<h3>적용: 같은 일을 세 가지 방법으로</h3>
+<p>배운 것을 한 문제에 모아 본다. 이름 배열을 쉼표와 공백으로 이어 한 줄로 만드는 일이다.</p>
+<pre><code class="language-java">public class JoinThree {
+    public static void main(String[] args) {
+        String[] names = {"kim", "lee", "park"};
+
+        String a = "";
+        for (int i = 0; i < names.length; i++) {
+            if (i > 0) {
+                a += ", ";
+            }
+            a += names[i];
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < names.length; i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(names[i]);
+        }
+        String b = sb.toString();
+
+        String c = String.join(", ", names);
+
+        System.out.println(a);
+        System.out.println(b);
+        System.out.println(c);
+        System.out.println(a.equals(b) && b.equals(c));
+        System.out.println(a == b);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">kim, lee, park
+kim, lee, park
+kim, lee, park
+true
+false</code></pre>
+<p>세 방법의 결과는 내용이 같다. 과정에서 생기는 객체가 다르다. 첫 번째 방법은 <code>+=</code>가 다섯 번 실행된다. <code>a</code>가 차례로 가리키는 문자열은 <code>"kim"</code>, <code>"kim, "</code>, <code>"kim, lee"</code>, <code>"kim, lee, "</code>, <code>"kim, lee, park"</code>이고, 앞의 넷은 다음 연결이 끝나는 순간 버려진다. 원소가 셋이라 표가 나지 않을 뿐, 원소 수가 늘면 앞 절의 계산대로 복사량이 제곱으로 는다.</p>
+<p>두 번째 방법은 빌더 하나와 배열 하나로 끝난다. 결과가 14글자여서 초기 용량 16 안에 들어가므로 확장도 일어나지 않는다. String은 <code>toString()</code>에서 하나 만들어진다. 세 번째 방법은 같은 일을 라이브러리에 맡긴 것이다. 구분자를 첫 원소 앞에는 넣지 않는다는 규칙을 직접 쓸 필요가 없다.</p>
+<p>마지막 줄의 <code>a == b</code>는 <code>false</code>다. 둘 다 실행 중에 만들어진 객체이고 서로 다른 경로로 만들어졌으므로 같은 객체일 이유가 없다. 내용 비교는 바로 윗줄처럼 <code>equals</code>로 한다. 이 회차의 앞부분에서 본 규칙이 여기에도 그대로 적용된다.</p>
+
+<h3>흔한 오해 여섯 가지</h3>
+<ul>
+<li><b>"문자열 풀은 힙과 다른 곳에 있다."</b> JDK 7 이후의 HotSpot에서 인턴된 문자열은 보통의 힙 객체다. 풀은 그 객체들을 내용으로 찾아 주는 표다.</li>
+<li><b>"<code>new String("hello")</code>는 객체를 하나 만든다."</b> 그 줄이 새로 만드는 String 객체는 하나지만, 인자인 리터럴의 객체가 풀에 따로 있다. 관여하는 String 객체는 둘이다.</li>
+<li><b>"<code>+</code>는 항상 <code>StringBuilder</code>로 바뀐다."</b> Java 8까지의 javac는 그렇게 했다. Java 9 이상을 대상으로 컴파일하면 <code>invokedynamic</code>이 되고, 상수 표현식이면 연결 자체가 사라진다.</li>
+<li><b>"<code>+</code>는 느리니 언제나 <code>StringBuilder</code>를 써야 한다."</b> 식 하나로 끝나는 연결은 <code>+</code>가 읽기 쉽고 충분히 손질되어 있다. 빌더가 필요한 곳은 연결이 반복문이나 여러 문장에 걸치는 곳이다.</li>
+<li><b>"<code>final</code>이 붙은 문자열 변수는 상수다."</b> 초기화 식까지 상수 표현식이어야 상수 변수다. 메서드 호출 결과나 매개변수로 초기화한 <code>final</code> 변수는 상수 변수가 아니다.</li>
+<li><b>"빈 문자열을 더하면 원래 객체가 그대로 나온다."</b> <code>String b = a + "";</code>에서 <code>a</code>가 상수 변수가 아니면 <code>b == a</code>는 <code>false</code>다. JLS 15.18.1이 상수 표현식이 아닌 연결의 결과는 새로 만든 객체라고 정하기 때문이다. OpenJDK 21의 연결 코드에도 이 경우에 새 String을 만들어야 한다는 주석이 달려 있다.</li>
+</ul>
+<aside class="keyidea"><span>이 장의 핵심</span><p>String은 공유하기 위해 불변으로 만들어졌고, 불변이기 때문에 고칠 때마다 새 객체가 필요하다. <code>StringBuilder</code>는 그 반대편에 있다. 공유하지 않는 대신 제자리에서 고친다. 조립하는 동안에는 빌더를 쓰고, 조립이 끝나면 <code>toString()</code>으로 불변 String을 만들어 내보낸다. 두 클래스는 경쟁하는 선택지가 아니라 작업의 두 단계를 나누어 맡는다.</p></aside>
+
+<h3>다른 주제와의 연결</h3>
+<p>이 회차의 내용은 뒤에서 여러 번 다시 쓰인다. 다음 회차의 래퍼 클래스에서는 <code>Integer</code>가 일정 범위의 값을 캐시해 두고 재사용하는 것을 본다. 불변 객체를 공유해 객체 수를 줄이고, 그 결과 <code>==</code>와 <code>equals</code>의 답이 갈린다는 구조가 문자열 풀과 같다. 다음 권의 해시 기반 컬렉션에서는 String이 키로 가장 많이 쓰인다. 해시코드를 캐시하는 불변 객체라는 성질이 거기서 값을 한다.</p>
+<p>로그를 남길 때도 이 지식이 쓰인다. 메서드 호출의 인자는 호출 전에 평가되므로, <code>log.debug("user=" + user)</code>는 디버그 로그를 끈 상태에서도 연결을 먼저 수행한다. 로깅 라이브러리들이 메시지 틀과 인자를 따로 받는 메서드를 제공하는 것은 이 연결을 필요할 때까지 미루기 위해서다. 데이터베이스 권에서는 사용자 입력을 <code>+</code>로 이어 SQL을 만드는 일이 왜 위험한지, 그리고 값의 자리를 비워 둔 SQL과 값을 따로 보내는 방식이 그것을 어떻게 막는지를 다룬다.</p>
+<p>메서드 체이닝은 자바 라이브러리 전반에 퍼져 있다. 고급편의 스트림은 새 객체를 돌려주는 쪽의 체인이고, 설정 값을 차례로 채워 객체를 만드는 빌더 계열의 API는 대개 같은 객체를 돌려주는 쪽의 체인이다. 체인을 볼 때마다 "지금 돌아온 참조가 같은 객체인가, 새 객체인가"를 묻는 습관을 들이면 메모리에서 벌어지는 일을 놓치지 않는다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>String의 내부 표현</dt><dd>OpenJDK 9 이상에서 String은 <code>byte[] value</code>와 <code>coder</code>로 글자를 저장한다. 모든 문자가 Latin-1 범위면 글자당 1바이트, 하나라도 벗어나면 전체를 UTF-16으로 저장한다. <code>length()</code>가 세는 것은 UTF-16 코드 유닛이다.</dd>
+<dt>문자열 리터럴과 풀</dt><dd>JLS 3.10.5에 따라 내용이 같은 리터럴과 String 상수 표현식은 인턴되어 같은 인스턴스를 가리킨다. HotSpot에서 그 객체는 JDK 7부터 보통의 힙에 있고, 풀은 내용으로 객체를 찾아 주는 표다.</dd>
+<dt>== 와 equals</dt><dd><code>==</code>는 같은 객체인지, <code>equals</code>는 같은 문자 시퀀스인지를 본다. <code>new</code>나 실행 중 연결로 만든 문자열은 풀의 객체와 다른 객체이므로 내용 비교에는 항상 <code>equals</code>를 쓴다.</dd>
+<dt>불변성이 받치는 것</dt><dd>풀을 통한 공유, 배열 공유, 해시코드 캐싱, 락 없는 스레드 간 공유가 모두 "내용이 바뀌지 않는다"는 보장 위에 서 있다. 내용을 바꾸는 것처럼 보이는 메서드는 새 String을 돌려준다.</dd>
+<dt>+ 연결의 세 경로</dt><dd>상수 표현식은 컴파일할 때 하나의 상수로 접힌다. 그 밖의 연결은 Java 9 이상에서 <code>invokedynamic</code>과 <code>StringConcatFactory</code>로, Java 8 이하에서 <code>StringBuilder</code> 호출 열로 컴파일된다.</dd>
+<dt>반복문 안의 +=</dt><dd>반복마다 기존 내용 전체를 담은 새 String이 만들어진다. n번 반복하면 만들어지는 문자열 길이의 합이 n(n+1)/2가 되어 일의 양이 n의 제곱으로 는다.</dd>
+<dt>StringBuilder</dt><dd>여유 공간이 있는 가변 배열과 <code>count</code>를 가진다. 초기 용량은 16이고, 모자라면 기존 용량의 두 배 더하기 2 이상으로 배열을 새로 잡아 복사한다. <code>toString()</code>은 배열을 복사해 불변 String을 만든다.</dd>
+<dt>StringBuffer</dt><dd><code>StringBuilder</code>와 구조가 같고 메서드에 <code>synchronized</code>가 붙어 있다. 보장하는 것은 호출 하나의 원자성이며, 한 스레드만 쓰는 버퍼에는 <code>StringBuilder</code>를 쓴다.</dd>
+<dt>메서드 체이닝</dt><dd>메서드가 참조를 돌려주면 그 반환값이 다음 호출의 대상이 된다. <code>return this</code>면 한 객체에 대한 연속 호출이고, 불변 객체의 메서드라면 단계마다 새 객체가 생긴다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 문자열 <code>==</code> 비교는 "테스트에서는 통과하고 운영에서 실패하는" 버그의 전형이다. 테스트 코드는 기대값과 입력을 모두 리터럴로 쓰는 일이 많고, 리터럴끼리는 풀 덕분에 <code>==</code>도 참이 된다. 운영에서는 같은 값이 HTTP 요청, 데이터베이스, 설정 파일에서 읽혀 온다. 전부 실행 중에 만들어진 객체이므로 <code>==</code>는 거짓이 된다. 코드 검토에서 String에 대한 <code>==</code>나 <code>!=</code>를 보면 의도와 무관하게 <code>equals</code>로 고치는 것이 맞다. 값의 종류가 정해져 있어서 동일성 비교가 필요한 것이라면 문자열이 아니라 뒤 회차의 열거형을 쓸 자리다.</p>
+<p>성능을 판단할 때는 연결이 일어나는 횟수가 입력 크기에 따라 달라지는지를 먼저 본다. 한 줄짜리 연결을 <code>StringBuilder</code>로 바꾸는 일은 얻는 것이 없고 코드만 길어진다. 반대로 조회 결과 수만 건을 반복문에서 <code>+=</code>로 이어 CSV나 로그 한 덩어리를 만드는 코드는 데이터가 늘어난 어느 날 갑자기 느려진다. 이런 코드는 빌더로 바꾸고, 결과 크기를 가늠할 수 있으면 생성자에 용량을 준다. 결과가 매우 크다면 문자열 하나로 다 만든 뒤 내보내는 구조 자체를 다시 본다. 완성된 문자열과 빌더의 배열이 동시에 힙에 있어야 하기 때문이다.</p>
+<p><code>intern()</code>은 평소에 쓸 일이 거의 없다. 같은 내용의 문자열이 대량으로 반복되어 메모리를 차지한다는 것이 측정으로 확인된 경우에나 검토하고, 그때도 풀이 커지는 비용을 함께 따진다. 메모리 관점에서 기억해 둘 사실은 따로 있다. 문자열 하나는 객체 둘이고, 한글이 한 글자라도 들어가면 그 문자열의 글자 저장 공간은 Latin-1일 때의 두 배가 된다. 캐시나 대량 적재 작업의 메모리를 어림할 때 이 차이를 넣어야 계산이 맞는다.</p>
+<p><code>StringBuffer</code>와 <code>StringBuilder</code> 사이의 선택은 대개 고민할 것이 없다. 메서드 안에서 만들어 쓰고 버리는 버퍼는 <code>StringBuilder</code>다. 여러 스레드가 한 버퍼에 써야 하는 설계라면 <code>StringBuffer</code>로 바꾸는 것으로 끝나지 않는다. 호출 하나하나는 안전해도 여러 호출로 이루어진 한 줄의 출력은 섞일 수 있다. 그런 경우에는 버퍼의 종류보다 "무엇을 한 덩어리로 보호할 것인가"를 먼저 정해야 한다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 코드가 출력하는 여섯 줄을 예측하고, 각 줄의 근거를 "어느 객체를 가리키는가"로 설명하라.
+<pre><code class="language-java">String s1 = "java";
+String s2 = "ja" + "va";
+String s3 = new String("java");
+String part = "ja";
+String s4 = part + "va";
+final String fpart = "ja";
+String s5 = fpart + "va";
+
+System.out.println(s1 == s2);
+System.out.println(s1 == s3);
+System.out.println(s1 == s4);
+System.out.println(s1 == s5);
+System.out.println(s1 == s4.intern());
+System.out.println(s3.equals(s4));</code></pre></li>
+<li>빈 문자열에서 시작해 반복문에서 <code>s += "x"</code>를 1,000번 실행한다. 이 과정에서 새로 만들어지는 문자열들의 길이를 모두 더하면 얼마인가. 같은 일을 <code>new StringBuilder()</code>와 <code>append('x')</code> 1,000번으로 하면 용량은 어떤 순서로 변하고, 확장 때 복사되는 글자 수의 합은 얼마인가.</li>
+<li>다음 세 줄이 실행된 뒤의 메모리 그림을 그려라. String 객체가 어떤 것들이 있고, <code>s</code>와 <code>t</code>가 각각 무엇을 가리키며, 어느 객체가 풀에 등록되어 있는지 표시한다. <code>s == t</code>와 <code>s.equals(t)</code>의 값도 적는다.
+<pre><code class="language-java">String s = "ab";
+s = s + "c";
+String t = "abc";</code></pre></li>
+<li>다음 코드는 <code>hi</code>와 <code>hi!</code>를 출력한다. 두 메서드의 본문이 비슷해 보이는데 결과가 다른 이유를 참조와 불변성으로 설명하라.
+<pre><code class="language-java">static void addBang(String s) { s = s + "!"; }
+static void addBang(StringBuilder sb) { sb.append("!"); }
+
+public static void main(String[] args) {
+    String str = "hi";
+    StringBuilder bld = new StringBuilder("hi");
+    addBang(str);
+    addBang(bld);
+    System.out.println(str);
+    System.out.println(bld);
+}</code></pre></li>
+<li><code>StringBuilder sb = new StringBuilder("hello");</code>로 시작해서 20글자짜리 영문 문자열을 <code>append</code>하고, 이어서 <code>'가'</code> 한 글자를 <code>append</code>한다. 세 시점(생성 직후, 첫 append 뒤, 둘째 append 뒤)의 <code>length()</code>와 <code>capacity()</code>를 구하고, 마지막 시점에 내부 <code>byte</code> 배열의 길이가 얼마인지 OpenJDK 21 기준으로 답하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 출력은 차례로 <code>true</code>, <code>false</code>, <code>false</code>, <code>true</code>, <code>true</code>, <code>true</code>다. <code>s2</code>는 리터럴 둘의 연결이라 상수 표현식이고 컴파일할 때 <code>"java"</code>로 접혀 <code>s1</code>과 같은 풀 객체를 가리킨다. <code>s3</code>는 <code>new</code>가 만든 별도 객체다. <code>s4</code>는 <code>part</code>가 상수 변수가 아니므로 실행 중에 연결되어 새 객체가 된다. <code>s5</code>는 <code>fpart</code>가 <code>final</code>이고 리터럴로 초기화된 상수 변수여서 식 전체가 상수 표현식이 되고, 다시 풀의 객체를 가리킨다. <code>s4.intern()</code>은 풀에 이미 있는 같은 내용의 객체, 곧 <code>s1</code>이 가리키는 객체를 돌려준다. 마지막 줄은 서로 다른 객체지만 내용이 같으므로 <code>equals</code>가 <code>true</code>다.</p>
+<p><b>2번.</b> k번째 반복이 길이 k인 문자열을 만들므로 합은 1+2+...+1000 = 1000×1001/2 = 500,500이다. 빌더의 용량은 16에서 시작해 17번째 글자에서 34, 35번째에서 70, 71번째에서 142, 143번째에서 286, 287번째에서 574, 575번째에서 1,150이 된다. 확장은 6번이고, 확장 때마다 그 시점의 내용 전체(직전 용량과 같다)를 복사하므로 복사량의 합은 16+34+70+142+286+574 = 1,122다. 여기에 <code>append</code>가 쓰는 1,000글자와 <code>toString()</code>의 복사 1,000글자를 더해도 3,122로, 500,500과는 자릿수가 다르다.</p>
+<p><b>3번.</b> 첫 줄에서 <code>s</code>는 풀에 등록된 <code>"ab"</code> 객체를 가리킨다. 둘째 줄의 연결은 상수 표현식이 아니므로 실행 중에 <code>"abc"</code> 내용의 새 String을 만들고, <code>s</code>는 이제 그 객체를 가리킨다. 이 객체는 풀에 등록되지 않는다. 풀의 <code>"ab"</code> 객체는 없어지지 않고 그대로 있다. 셋째 줄의 <code>t</code>는 리터럴 <code>"abc"</code>이므로 풀에 등록된 또 다른 <code>"abc"</code> 객체를 가리킨다. 내용이 <code>abc</code>인 String 객체가 둘 있는 것이다. 따라서 <code>s == t</code>는 <code>false</code>, <code>s.equals(t)</code>는 <code>true</code>다. 둘째 줄을 <code>s = (s + "c").intern();</code>으로 바꾸면 <code>s == t</code>가 <code>true</code>가 된다.</p>
+<p><b>4번.</b> 자바는 인자를 값으로 넘기고, 참조 타입에서는 그 값이 참조다. 두 메서드 모두 호출한 쪽 변수가 가진 참조의 복사본을 매개변수로 받는다. 첫 메서드의 <code>s = s + "!"</code>는 새 String <code>"hi!"</code>를 만들어 <b>매개변수 <code>s</code></b>가 그것을 가리키게 할 뿐이다. 호출한 쪽의 <code>str</code>은 여전히 원래의 <code>"hi"</code>를 가리키고, 그 객체는 불변이라 바뀔 수도 없다. 둘째 메서드의 <code>sb.append("!")</code>는 매개변수가 가리키는 객체, 곧 호출한 쪽의 <code>bld</code>가 가리키는 바로 그 빌더의 내부 배열을 고친다. 참조를 다시 대입한 것이 아니라 참조가 가리키는 가변 객체의 상태를 바꾼 것이므로 호출한 쪽에서도 변화가 보인다. String을 고친 결과를 호출한 쪽에 돌려주려면 반환값으로 내보내야 한다.</p>
+<p><b>5번.</b> 생성 직후에는 <code>length()</code>가 5, <code>capacity()</code>가 5+16 = 21이다. 20글자를 붙이려면 용량 25가 필요한데 21로는 모자라므로 확장한다. 새 용량은 필요한 25와 21×2+2 = 44 가운데 큰 쪽인 44다. 이 시점에 <code>length()</code>는 25, <code>capacity()</code>는 44다. <code>'가'</code>를 붙이면 <code>length()</code>는 26이 되고 용량 44 안에 들어가므로 <code>capacity()</code>는 그대로 44다. 다만 Latin-1 범위를 벗어난 문자가 들어왔으므로 <code>coder</code>가 UTF16으로 바뀌고 배열이 글자당 2바이트로 새로 만들어진다. 내부 <code>byte</code> 배열의 길이는 44×2 = 88이다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>지역 변수 <code>String h = "hel";</code>에 대해 <code>h + "lo" == "hello"</code>는 <code>false</code>다. 선언을 <code>final String h = "hel";</code>로 바꾸면 <code>true</code>가 된다. 이유로 옳은 것은?</q>
+<o><code>final</code> 지역 변수는 힙이 아닌 스택에 문자열을 저장하므로 주소가 같아진다.</o>
+<o><code>final</code>이 붙으면 JVM이 실행 중에 연결 결과에 자동으로 <code>intern()</code>을 호출한다.</o>
+<o><code>h</code>가 상수 변수가 되어 식 전체가 상수 표현식이 되고, 컴파일러가 결과 <code>"hello"</code>를 상수로 기록해 풀의 같은 객체를 가리키게 된다.</o>
+<o><code>final</code> 변수가 들어간 <code>==</code>는 <code>equals</code> 호출로 바뀌어 컴파일된다.</o>
+<why>JLS 15.29에 따라 상수 변수(<code>final</code>이고 상수 표현식으로 초기화된 String)를 가리키는 이름은 상수 표현식의 재료다. 식 전체가 상수 표현식이면 컴파일러가 값을 계산해 <code>ldc</code>로 꺼내는 상수 하나로 만들고, String 상수 표현식은 인턴되므로 리터럴 <code>"hello"</code>와 같은 객체가 된다. 실행 중에 자동으로 인턴하는 것이 아니고, <code>==</code>의 의미가 바뀌는 것도 아니며, 문자열 객체가 스택에 놓이는 일도 없다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>다음 가운데 String의 불변성에 기대고 있지 <b>않은</b> 것은?</q>
+<o>내용이 같은 리터럴들이 풀의 객체 하나를 함께 가리키는 것</o>
+<o><code>hashCode()</code>의 계산 결과를 필드에 저장해 두고 다시 쓰는 것</o>
+<o>OpenJDK 21에서 <code>new String(original)</code>이 원본의 <code>byte</code> 배열을 복사하지 않고 함께 쓰는 것</o>
+<o><code>length()</code>가 UTF-16 코드 유닛의 수를 돌려주는 것</o>
+<why><code>length()</code>가 무엇을 세는지는 String이 UTF-16 문자열을 나타낸다는 정의에서 나오며 불변성과는 관계가 없다. 나머지 셋은 내용이 바뀔 수 있다면 성립하지 않는다. 풀 공유는 한 곳의 변경이 모든 사용처에 퍼지게 되고, 해시 캐시는 내용이 바뀌는 순간 틀린 값이 되며, 배열 공유는 한 객체의 변경이 다른 객체의 내용을 바꾸게 된다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>반복문에서 <code>s += "x"</code>를 n번 실행하는 코드가 n이 커질수록 급격히 느려지는 근본 이유는?</q>
+<o>반복마다 기존 내용 전체를 담은 새 String을 만들어야 해서, 만들어지는 문자열 길이의 합이 n(n+1)/2로 늘기 때문이다.</o>
+<o><code>invokedynamic</code>의 부트스트랩 메서드가 반복마다 다시 호출되기 때문이다.</o>
+<o>반복마다 연결 결과가 문자열 풀에 등록되어 풀이 계속 커지기 때문이다.</o>
+<o>Java 9 이상의 javac가 반복문 안에서는 연결을 <code>StringBuilder</code>로 바꾸지 않기 때문이며, Java 8로 컴파일하면 해결된다.</o>
+<why>String은 불변이라 기존 객체에 덧붙일 수 없고, 연결할 때마다 기존 내용과 새 조각을 담은 새 객체가 필요하다. 그 길이가 반복마다 1씩 늘어나므로 합이 제곱 꼴이 된다. 부트스트랩 메서드는 호출 지점마다 첫 실행 때 한 번만 불린다. 실행 중 연결의 결과는 풀에 등록되지 않는다. Java 8 방식으로 컴파일해도 반복마다 새 <code>StringBuilder</code>를 만들어 전체를 옮기므로 복사량은 같다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>OpenJDK 21의 <code>StringBuilder.toString()</code>은 내부 배열을 복사해서 String을 만든다. 복사하지 않고 빌더의 배열을 String이 그대로 함께 쓰게 한다면 생기는 문제는?</q>
+<o>가비지 컬렉터가 공유된 배열을 회수하지 못해 메모리 누수가 생긴다.</o>
+<o>이후 빌더에 <code>append</code>나 <code>reverse</code>를 하면 이미 내보낸 String의 내용이 함께 바뀌어 String의 불변성이 깨진다.</o>
+<o>빌더와 String이 같은 모니터 락을 쓰게 되어 교착 상태가 생긴다.</o>
+<o>String의 <code>hashCode()</code>가 호출될 때마다 예외가 발생한다.</o>
+<why>배열을 공유해도 되는 것은 양쪽이 모두 불변일 때뿐이다. 빌더는 가변이므로 같은 배열을 쓰면 빌더의 변경이 String의 내용 변경으로 이어진다. 그러면 풀 공유와 해시 캐시를 비롯해 불변성에 기댄 것들이 모두 틀어진다. 여러 객체가 한 배열을 참조하는 것 자체는 가비지 컬렉션에 문제가 되지 않고, 락이나 예외와도 관계가 없다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>sb.append("a").append("b")</code>에서 두 번째 <code>append</code>가 첫 번째와 같은 빌더에 대해 실행되는 이유는?</q>
+<o>컴파일러가 점(<code>.</code>)으로 이어진 호출을 발견하면 맨 앞의 변수를 각 호출의 대상으로 복사해 넣기 때문이다.</o>
+<o><code>append</code>가 <code>static</code> 메서드여서 호출 대상 객체가 필요 없기 때문이다.</o>
+<o><code>StringBuilder</code>가 <code>final</code> 클래스이기 때문이다.</o>
+<o>첫 <code>append</code>가 자기 자신의 참조(<code>this</code>)를 돌려주고, 그 반환값이 다음 호출의 대상이 되기 때문이다.</o>
+<why>메서드 호출식의 값은 반환값이고, 체인의 다음 호출은 그 값에 대해 이뤄진다. 바이트코드에서도 첫 <code>invokevirtual</code>이 오퍼랜드 스택에 남긴 반환값이 그대로 다음 <code>invokevirtual</code>의 호출 대상이 된다. 컴파일러가 변수를 복사해 넣는 것이 아니므로, 메서드가 다른 객체를 돌려주면(String의 메서드처럼) 다음 호출은 그 다른 객체에 대해 실행된다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>문자열 리터럴(string literal)</dt><dd>소스에서 큰따옴표로 감싼 문자열. 실행 시점에 String 인스턴스를 가리키는 참조가 되며, 내용이 같은 리터럴은 항상 같은 인스턴스를 가리킨다(JLS 3.10.5).</dd>
+<dt>문자열 풀(string pool)</dt><dd>인턴된 String 객체를 내용으로 찾을 수 있게 String 클래스가 관리하는 모음. 같은 내용은 하나만 등록된다.</dd>
+<dt>인턴(intern)</dt><dd>어떤 내용의 문자열에 대해 풀에 등록된 대표 객체를 얻는 일. <code>String.intern()</code>은 풀에 같은 내용이 있으면 그 객체를, 없으면 자신을 등록하고 자신을 돌려준다.</dd>
+<dt>Compact Strings</dt><dd>JDK 9(JEP 254)에서 도입된 String의 내부 표현. <code>byte</code> 배열과 인코딩 표시 필드를 써서 Latin-1 문자열을 글자당 1바이트로 저장한다.</dd>
+<dt>코드 유닛(code unit)</dt><dd>UTF-16에서 16비트 단위 하나. <code>char</code> 하나에 해당한다. U+FFFF를 넘는 문자는 코드 유닛 두 개(서로게이트 쌍)로 표현된다.</dd>
+<dt>상수 표현식(constant expression)</dt><dd>리터럴, 상수 변수, 일부 연산자만으로 이루어져 컴파일할 때 값이 정해지는 식(JLS 15.29). String 타입이면 결과가 인턴된다.</dd>
+<dt>부트스트랩 메서드(bootstrap method)</dt><dd><code>invokedynamic</code> 명령이 처음 실행될 때 JVM이 호출하는 메서드. 그 호출 지점에서 실제로 실행할 코드를 정해 <code>CallSite</code>로 돌려준다. 문자열 연결에서는 <code>StringConcatFactory</code>의 메서드가 맡는다.</dd>
+<dt>용량(capacity)</dt><dd><code>StringBuilder</code>가 배열을 다시 할당하지 않고 담을 수 있는 문자 수. 실제로 담긴 문자 수인 길이(length)와 구분한다.</dd>
+<dt>분할 상환 분석(amortized analysis)</dt><dd>가끔 일어나는 비싼 연산의 비용을 전체 연산에 나누어 평균을 내는 계산법. 배열을 두 배씩 키우는 <code>append</code>의 비용을 설명할 때 쓴다.</dd>
+<dt>메서드 체이닝(method chaining)</dt><dd>메서드의 반환값에 대해 곧바로 다음 메서드를 호출하는 식으로 호출을 이어 쓰는 방식. 반환값이 <code>this</code>인지 새 객체인지에 따라 메모리에서 일어나는 일이 다르다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-3.html#jls-3.10.5">JLS §3.10.5 String Literals</a> — 리터럴이 항상 같은 String 인스턴스를 가리킨다는 규칙과 인턴</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html#jls-15.18.1">JLS §15.18.1 String Concatenation Operator +</a> — 연결 결과가 새 객체라는 규칙과 구현 재량. 같은 문서의 §15.21.3(참조 동등 연산자), §15.29(상수 표현식)도 함께 확인했다</li>
+<li><a href="https://openjdk.org/jeps/254">JEP 254: Compact Strings</a> — String 내부 표현을 byte 배열과 인코딩 표시로 바꾼 이유와 범위</li>
+<li><a href="https://openjdk.org/jeps/280">JEP 280: Indify String Concatenation</a> — 문자열 연결을 invokedynamic으로 컴파일하게 된 동기</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/String.html">Java SE 21 API: String</a> — 불변과 공유, length, hashCode 계산식, intern, equals의 정의</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/StringBuilder.html">Java SE 21 API: StringBuilder</a> — 초기 용량 16, ensureCapacity의 확장 규칙, StringBuffer와의 관계</li>
+</x-refs>

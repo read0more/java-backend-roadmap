@@ -1,0 +1,866 @@
+<x-meta>
+deck: 컴퓨터가 글자를 번호로, 번호를 바이트로 바꾸는 두 단계를 ASCII와 EUC-KR에서 유니코드·UTF-8·UTF-16까지 비트 단위로 따라가고, 자바 21에서 글자가 깨지는 순간을 직접 재현한다.
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li>문자 집합(coded character set)과 문자 인코딩(character-encoding scheme)을 구분해서 설명하고, "유니코드는 2바이트"라는 말이 왜 틀렸는지 말할 수 있다.</li>
+<li>코드 포인트가 주어지면 UTF-8과 UTF-16 바이트열을 손으로 계산할 수 있고(예: U+AC00 → EA B0 80, U+1F600 → D8 3D DE 00), 자바의 <code>byte</code>가 음수로 찍히는 이유를 2의 보수로 설명할 수 있다.</li>
+<li>EUC-KR과 MS949(CP949)가 담을 수 있는 한글의 범위와 바이트 구조의 차이를 설명하고, 그 차이가 바이트 단위 처리에 어떤 함정을 만드는지 예를 들 수 있다.</li>
+<li><code>Charset</code> API로 지원 문자 집합을 조회하고, 인코딩·디코딩에 서로 다른 문자 집합을 썼을 때 나오는 결과(<code>?</code>, U+FFFD, 엉뚱한 한자)를 바이트 수준에서 예측하고 복구 가능 여부를 판단할 수 있다.</li>
+<li>자바 소스의 문자열 리터럴이 javac, 클래스 파일(수정된 UTF-8), 힙의 <code>String</code>(Latin-1/UTF-16), 표준 출력을 거치며 몇 번 변환되는지 짚고, 각 단계의 인코딩 설정이 어디에서 오는지 말할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 메모리에는 글자가 없다</h3>
+<p>자바 코드에 <code>String s = "가";</code>라고 쓰고 저장하면, 디스크에 저장되는 것은 "가"라는 모양이 아니다. 파일 안에는 0과 1로 이루어진 바이트 몇 개가 있을 뿐이다. 그 파일을 javac가 읽고, 클래스 파일로 쓰고, JVM이 다시 읽어 힙에 문자열 객체를 만들고, 마지막에 <code>System.out.println</code>이 터미널로 바이트를 보낸다. 터미널은 그 바이트를 받아 글꼴에서 모양을 찾아 화면에 그린다. 이 긴 여정의 어느 구간에서도 "글자"라는 실체는 흐르지 않는다. 흐르는 것은 언제나 바이트이고, 각 구간의 프로그램이 "이 바이트는 이런 규칙으로 읽어야 글자가 된다"는 약속을 따를 뿐이다.</p>
+<p>그 약속이 바로 문자 인코딩이다. 약속이 하나뿐이라면 아무 문제가 없겠지만, 현실에는 ASCII, ISO-8859-1, EUC-KR, CP949, UTF-8, UTF-16 같은 약속이 여럿 공존한다. 보내는 쪽과 받는 쪽이 서로 다른 약속을 쓰면, 바이트는 한 비트도 손상되지 않았는데 화면에는 <code>���</code>나 <code>媛</code>나 <code>°¡</code> 같은 글자가 나타난다. 이 회차 내내 반복할 문장이 하나 있다. <b>바이트에는 이름표가 붙어 있지 않다.</b> 바이트열만 보고는 그것이 어떤 인코딩으로 만들어졌는지 알 수 없고, 읽는 쪽이 알고 있어야 한다.</p>
+<p>이 권(자바 고급 2편)은 파일, 네트워크, HTTP처럼 프로그램 바깥과 바이트를 주고받는 일을 다룬다. 바깥 세계와 주고받는 것은 결국 바이트이고, 그 바이트의 상당수는 사람이 읽는 텍스트다. 그래서 첫 회차에서 텍스트가 바이트가 되는 규칙을 바닥까지 정리한다. 순서는 이렇다. 먼저 실습 환경을 갖추고 자바가 쓰는 기본 인코딩을 확인한다. 다음으로 비트와 바이트, 그리고 자바 <code>byte</code>의 부호 문제를 정리한다. 그다음 문자 집합과 인코딩을 구분하고, ASCII에서 EUC-KR, CP949, 유니코드와 UTF-16, UTF-8까지 차례로 비트 수준에서 해부한다. 마지막으로 <code>Charset</code> API로 인코딩과 디코딩을 실험하고, 자바 프로그램 안에서 문자열이 거치는 변환 단계를 JVM 내부까지 따라간다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>문자를 바이트로 바꾸는 일은 두 단계다. 문자 집합이 글자마다 번호(코드 포인트)를 정하고, 인코딩이 그 번호를 바이트열로 바꾸는 방법을 정한다. 유니코드는 번호표이고 UTF-8과 UTF-16은 그 번호를 바이트로 적는 서로 다른 방식이다. 바이트열에는 어떤 인코딩으로 만들었는지가 적혀 있지 않으므로, 인코딩한 쪽과 디코딩하는 쪽이 같은 규칙을 써야 하며, 다른 규칙으로 읽는 순간 정보가 영구히 사라질 수 있다.</p></aside>
+
+<h3>실습 환경 구성: JDK 21과 기본 문자 집합 확인</h3>
+<p>이 회차의 예제는 JDK 21 하나로 따라 할 수 있다. 빈 폴더에 소스 파일을 만들고 <code>javac</code>로 컴파일한 뒤 <code>java</code>로 실행한다. 본문에 실은 출력은 Apple Silicon(arm64) macOS에서 Temurin JDK 21.0.13으로 실행한 결과다. 운영체제나 로캘에 따라 달라지는 값이 있는 곳에는 그렇다고 밝힌다. IDE를 쓴다면 프로젝트의 파일 인코딩이 UTF-8인지 먼저 확인해 두자. 이 회차가 다루는 문제의 상당수는 "편집기가 저장한 인코딩"과 "컴파일러가 읽는 인코딩"이 어긋나는 데서 시작한다.</p>
+<p>가장 먼저 확인할 것은 JVM이 지금 어떤 인코딩을 기본으로 쓰고 있는가다. 자바에는 인코딩과 관련된 시스템 프로퍼티가 여럿 있고, 각각 쓰이는 곳이 다르다. 다음 프로그램으로 한 번에 본다.</p>
+<pre><code class="language-java">import java.nio.charset.Charset;
+
+public class Props {
+    public static void main(String[] args) {
+        System.out.println("defaultCharset  = " + Charset.defaultCharset());
+        System.out.println("file.encoding   = " + System.getProperty("file.encoding"));
+        System.out.println("native.encoding = " + System.getProperty("native.encoding"));
+        System.out.println("stdout.encoding = " + System.getProperty("stdout.encoding"));
+        System.out.println("가");
+    }
+}</code></pre>
+<pre data-label="실행 결과 (macOS, 로캘 UTF-8)"><code class="language-text">defaultCharset  = UTF-8
+file.encoding   = UTF-8
+native.encoding = UTF-8
+stdout.encoding = UTF-8
+가</code></pre>
+<p>네 값이 모두 UTF-8이라 구분이 안 되어 보이지만, 의미는 서로 다르다. 자바 21의 <code>System.getProperties()</code> 문서와 <code>Charset</code> 문서를 기준으로 정리하면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>이름</th><th>의미</th><th>JDK 21에서 값이 정해지는 방식</th></tr></thead><tbody>
+<tr><td><code>Charset.defaultCharset()</code></td><td>문자 집합을 지정하지 않은 API(<code>getBytes()</code>, <code>new String(bytes)</code>, <code>FileReader</code> 등)가 쓰는 기본 문자 집합</td><td>UTF-8. 구현은 명령행의 <code>file.encoding</code>으로 이를 바꿀 수 있다</td></tr>
+<tr><td><code>file.encoding</code></td><td>기본 문자 집합의 이름</td><td>기본값 UTF-8. 명령행에서 <code>UTF-8</code> 또는 <code>COMPAT</code>만 허용되며, 그 밖의 값은 동작이 정해져 있지 않다</td></tr>
+<tr><td><code>native.encoding</code></td><td>운영체제 환경(로캘)에서 얻은 인코딩 이름</td><td>호스트 환경이 정한다. 사용자가 설정해도 효과가 없다</td></tr>
+<tr><td><code>stdout.encoding</code></td><td><code>System.out</code>이 문자를 바이트로 바꿀 때 쓰는 인코딩</td><td>터미널에 연결되어 있으면 <code>Console.charset()</code>과 같고, 아니면 <code>native.encoding</code>을 따른다</td></tr>
+</tbody></table></div>
+<p>기본 문자 집합이 어느 환경에서나 UTF-8이 된 것은 JDK 18에 들어간 JEP 400(UTF-8 by Default)부터다. 그 전까지 기본 문자 집합은 JVM이 시작할 때 운영체제의 로캘과 문자 집합에 따라 정해졌다. OpenJDK 블로그(inside.java)의 JEP 400 설명은 영어(미국) 로캘의 윈도우에서 기본값이 코드 페이지 1252였다는 예를 든다. 같은 프로그램이 개발자 PC와 리눅스 서버에서 서로 다른 바이트를 만들 수 있었다는 뜻이다. <code>native.encoding</code>은 JDK 17에 먼저 추가된 프로퍼티로, 기본 문자 집합이 UTF-8로 고정된 뒤에도 "운영체제가 원래 쓰는 인코딩"을 알 수 있게 해 준다. <code>file.encoding=COMPAT</code>을 주면 기본 문자 집합을 예전 방식, 즉 <code>native.encoding</code>에서 정한다.</p>
+<p>로캘을 바꿔 실행해 보면 이 프로퍼티들이 실제로 따로 움직인다는 것을 확인할 수 있다. macOS에서 <code>LC_ALL=C</code>로 로캘을 C로 바꾸면 운영체제 쪽 인코딩은 US-ASCII가 된다.</p>
+<pre><code class="language-bash">$ LC_ALL=C java Props
+defaultCharset  = UTF-8
+file.encoding   = UTF-8
+native.encoding = US-ASCII
+stdout.encoding = US-ASCII
+?
+
+$ LC_ALL=C java -Dfile.encoding=COMPAT Props
+defaultCharset  = US-ASCII
+file.encoding   = US-ASCII
+native.encoding = US-ASCII
+stdout.encoding = US-ASCII
+?</code></pre>
+<p>첫 실행에서 기본 문자 집합은 여전히 UTF-8이지만, 마지막 줄의 "가"는 <code>?</code>로 찍혔다. 출력을 <code>xxd</code>로 덤프하면 그 자리에 바이트 <code>3F</code> 하나가 있다. 프로그램 안의 문자열 "가"는 멀쩡했다. 문제는 <code>System.out</code>이 그 문자열을 US-ASCII로 바이트로 바꾸려 했고, US-ASCII에는 "가"가 없어서 대체 문자 <code>?</code>를 쓴 데 있다. 두 번째 실행은 <code>COMPAT</code> 때문에 기본 문자 집합까지 US-ASCII가 되었다. 이처럼 "글자가 깨졌다"는 현상 하나에도, 깨진 위치가 프로그램 안인지, 출력 경계인지, 받는 쪽인지를 나눠서 봐야 한다. 현재 JVM의 프로퍼티를 한꺼번에 보고 싶으면 <code>java -XshowSettings:properties -version</code>을 실행하면 된다. 출력 가운데 <code>file.encoding</code>, <code>native.encoding</code>, <code>stdout.encoding</code>, <code>stderr.encoding</code>, <code>sun.jnu.encoding</code> 줄을 찾으면 된다.</p>
+<p>컴파일러도 인코딩을 쓴다. javac 문서는 <code>-encoding</code> 옵션을 "소스 파일이 쓰는 문자 인코딩"을 지정하는 옵션으로 설명하고, 지정하지 않으면 플랫폼 기본 변환기를 쓴다고 적는다. JDK 18부터 기본 문자 집합이 UTF-8이므로 JDK 21의 javac는 옵션이 없으면 소스를 UTF-8로 읽는다. 이것이 실제로 어떤 결과를 낳는지는 뒤에서 EUC-KR로 저장한 소스를 컴파일해 확인한다. 빌드 도구를 쓰더라도 결국 javac에 이 옵션이 전달되므로, 소스 인코딩을 명시해 두는 습관(<code>javac -encoding UTF-8</code>, Gradle이라면 <code>options.encoding = 'UTF-8'</code>)이 환경 차이를 없애는 가장 확실한 방법이다.</p>
+
+<h3>컴퓨터와 데이터: 비트, 바이트, 그리고 해석</h3>
+<p>컴퓨터의 메모리와 디스크는 결국 두 상태 가운데 하나를 갖는 칸의 모음이다. 이 칸 하나가 비트(bit)이고, 0과 1로 적는다. 비트 하나로는 두 가지를, 두 개로는 네 가지를, n개로는 2의 n제곱 가지를 구분할 수 있다. 현대 컴퓨터는 비트 8개를 묶은 바이트(byte)를 주소를 붙이는 최소 단위로 쓴다. 메모리 주소 하나가 가리키는 칸에는 바이트 하나, 즉 256(2의 8제곱)가지 값 가운데 하나가 들어 있다. 파일도, 네트워크 패킷도, 결국 이런 바이트를 순서대로 늘어놓은 것이다.</p>
+<p>바이트를 사람이 읽을 때는 보통 16진수(hexadecimal)로 적는다. 16진수 한 자리가 정확히 4비트를 나타내므로, 바이트 하나는 16진수 두 자리로 딱 떨어진다. 예를 들어 이진수 <code>1110 1010</code>은 앞 네 비트가 14(E), 뒤 네 비트가 10(A)이므로 <code>0xEA</code>다. 이 회차에서 바이트열을 보여 줄 때는 <code>EA B0 80</code>처럼 16진수 두 자리씩 띄어 쓴다.</p>
+<p>중요한 점은 <b>바이트 자체에는 의미가 없다</b>는 것이다. 바이트 두 개 <code>41 42</code>는 ASCII로 읽으면 문자열 "AB"이고, 16비트 정수(빅 엔디언)로 읽으면 16706(0x4142)이고, 어떤 이미지 형식에서는 픽셀 색의 일부다. 같은 비트 패턴이 무엇을 뜻하는지는 읽는 프로그램이 어떤 규칙을 적용하느냐로 정해진다. 문자도 마찬가지다. 컴퓨터는 "A"라는 모양을 저장할 수 없으므로, 사람들이 "A는 65번"이라고 약속하고 65를 저장한다. 문자 인코딩 이야기는 전부 이 약속의 종류와 그 약속을 어겼을 때의 결과에 관한 것이다.</p>
+<h4>자바의 byte는 부호가 있다</h4>
+<p>자바로 인코딩 결과를 찍어 보면 <code>[-22, -80, -128]</code>처럼 음수가 줄줄이 나온다. 처음 보면 데이터가 잘못된 것 같지만, 이것은 자바의 <code>byte</code> 타입이 부호 있는 정수이기 때문이다. 자바 언어 명세(JLS §4.2.1)는 <code>byte</code>의 범위를 -128부터 127까지로 정하고, 정수 타입은 2의 보수(two's complement) 표현을 쓴다. 8비트 2의 보수에서 맨 앞 비트가 1인 값은 "256을 뺀 값"으로 해석된다. 그래서 비트 패턴 <code>1110 1010</code>(부호 없이 읽으면 234)은 <code>byte</code>로는 234 - 256 = -22가 된다. 비트는 같고 해석만 다르다.</p>
+<pre><code class="language-java">public class ByteView {
+    public static void main(String[] args) {
+        byte b = (byte) 0xEA;                                  // 1110 1010
+        System.out.println(b);                                 // 부호 있는 해석
+        System.out.println(b & 0xFF);                          // 부호 없는 해석
+        System.out.println(Byte.toUnsignedInt(b));             // 같은 일을 하는 메서드
+        System.out.println(Integer.toBinaryString(b & 0xFF));
+        System.out.println(Integer.toHexString(b));            // int로 넓혀진 뒤의 16진수
+        System.out.println(Integer.toHexString(b & 0xFF));
+        System.out.println((int) 'A' + " " + (int) 'a' + " " + (int) '가');
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">-22
+234
+234
+11101010
+ffffffea
+ea
+65 97 44032</code></pre>
+<p>한 줄씩 따라가 보자. <code>0xEA</code>는 정수 리터럴이므로 <code>int</code> 234다. 234는 <code>byte</code> 범위를 넘으므로 <code>(byte)</code> 캐스트가 필요하고, 이 축소 변환은 하위 8비트만 남긴다. 첫 줄은 그 8비트를 부호 있는 값으로 출력해 -22다. 둘째 줄의 <code>b & 0xFF</code>에서는 이항 숫자 승격(binary numeric promotion) 때문에 <code>b</code>가 먼저 <code>int</code>로 넓혀진다. 이때 부호 확장이 일어나 -22는 32비트 <code>0xFFFFFFEA</code>가 된다. 여기에 <code>0xFF</code>를 AND하면 위쪽 24비트가 지워져 <code>0x000000EA</code>, 즉 234가 남는다. 셋째 줄의 <code>Byte.toUnsignedInt</code>는 Java 8에 추가된 메서드로, JDK 21 소스에서도 본문이 정확히 <code>((int) x) & 0xff</code> 한 줄이다. 다섯째 줄에서 <code>Integer.toHexString(b)</code>가 <code>ffffffea</code>를 찍는 것도 같은 부호 확장 때문이다. 바이트를 16진수로 찍을 때 <code>& 0xFF</code>를 빠뜨리면 이렇게 앞에 f가 여섯 개 붙는다.</p>
+<p>마지막 줄은 자바의 <code>char</code>가 사실 숫자라는 것을 보여 준다. <code>'A'</code>는 65, <code>'a'</code>는 97, <code>'가'</code>는 44032다. 이 숫자들이 어디서 왔는지가 다음 절부터의 주제다. 한 가지 함정만 미리 짚자. <code>bytes[0] == 0xEA</code>는 항상 거짓이다. 비교 전에 <code>bytes[0]</code>이 <code>int</code> -22로 넓혀지고, 오른쪽은 <code>int</code> 234이기 때문이다. 바이트 값을 비교하려면 <code>bytes[0] == (byte) 0xEA</code>나 <code>(bytes[0] & 0xFF) == 0xEA</code>처럼 양쪽의 해석을 맞춰야 한다.</p>
+
+<h3>문자 집합과 인코딩: 두 번의 대응</h3>
+<p>"문자 인코딩"이라는 말은 흔히 한 덩어리로 쓰이지만, 실제로는 두 개의 대응을 합친 것이다. 자바의 <code>Charset</code> 클래스 문서는 이 용어를 이렇게 나눈다. <b>코드화된 문자 집합(coded character set)</b>은 추상적인 문자들의 집합과 정수들의 집합 사이의 대응이다. <b>문자 인코딩 방식(character-encoding scheme)</b>은 하나 이상의 코드화된 문자 집합과 옥텟(8비트 바이트)열 사이의 대응이다. 그리고 자바에서 말하는 <code>charset</code>은 이 둘의 조합이다. 같은 문서는 다른 소프트웨어에서는 charset을 코드화된 문자 집합과 같은 뜻으로 쓰기도 해서 이 정의가 혼란스럽다는 점도 스스로 인정한다.</p>
+<pre class="diagram">  추상적인 문자        코드화된 문자 집합         인코딩 방식            바이트열
+  (글자의 정체)   ───▶  (글자 → 번호)      ───▶  (번호 → 바이트)  ───▶  (저장·전송)
+
+     "가"                U+AC00 (44032)          UTF-8   : EA B0 80
+                                                 UTF-16BE: AC 00
+                                                 UTF-16LE: 00 AC
+
+     "가"                KS X 1001의 16행 1열     EUC-KR  : B0 A1
+                         (한국 국가 표준 번호)</pre>
+<p>위 그림의 위쪽 줄이 핵심이다. 유니코드라는 하나의 문자 집합이 "가"에 U+AC00이라는 번호를 붙인다. 그 번호를 바이트로 적는 방법은 하나가 아니다. UTF-8은 3바이트 <code>EA B0 80</code>으로, UTF-16은 2바이트 <code>AC 00</code>(또는 바이트 순서를 바꾼 <code>00 AC</code>)으로 적는다. 그러니 "유니코드에서 한글은 몇 바이트인가"라는 질문은 성립하지 않는다. 유니코드는 번호를 정할 뿐이고 바이트 수는 인코딩이 정한다. 반면 ASCII나 EUC-KR 같은 오래된 체계에서는 번호와 바이트가 거의 그대로 대응해서 두 단계를 굳이 구분할 필요가 없었다. 유니코드에 와서야 이 구분이 실질적인 의미를 갖게 된다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>학번과 출석부 적는 법</strong><p>학교가 학생마다 학번을 매기는 것이 문자 집합이다. 학번 20240001번이 누구인지는 학적부(문자 집합 표)를 보면 안다. 그 학번을 출석부에 옮겨 적는 방식이 인코딩이다. 어떤 반은 학번을 여덟 칸에 꽉 채워 적고, 어떤 반은 앞의 연도를 생략하고 짧게 적는다. 출석부만 받아 든 사람은 그 반의 적는 방식을 모르면 학번을 복원할 수 없다. 비유가 깨지는 지점도 있다. 실제 학번은 학생 한 명에 하나지만, EUC-KR과 유니코드처럼 서로 다른 문자 집합은 같은 글자에 전혀 다른 번호를 붙인다. 출석부 방식뿐 아니라 학적부 자체가 여러 권 있는 셈이다.</p></aside>
+<x-visual id="java-adv2-01-charset-vs-encoding" title="문자 집합과 인코딩의 두 단계 대응" kind="개념도" ratio="16:9">
+<x-hint>글자가 번호로, 번호가 바이트열로 바뀌는 두 단계를 분리해서 보여 주고, 같은 번호가 인코딩에 따라 다른 바이트가 됨을 보여 준다.</x-hint>
+<x-prompt>A clean left-to-right conceptual diagram on a white background. On the far left, a large rounded card containing the Korean character "가". An arrow labeled "문자 집합" points to a middle card showing "U+AC00". From that middle card, three arrows fan out to the right, labeled "UTF-8", "UTF-16BE", "UTF-16LE", each ending in a row of byte boxes: "EA B0 80" (three boxes), "AC 00" (two boxes), "00 AC" (two boxes). Below the main row, a separate thinner row: the same "가" card with an arrow labeled "KS X 1001" to a card "16행 1열", then an arrow labeled "EUC-KR" to two byte boxes "B0 A1". Top headings above the columns: "글자", "번호(코드 포인트)", "바이트열". Flat vector style, two accent colors, monospace font for hex bytes.</x-prompt>
+<x-caption>문자 집합은 글자에 번호를 붙이고, 인코딩은 그 번호를 바이트로 적는다. 같은 U+AC00도 인코딩에 따라 바이트가 달라진다.</x-caption>
+</x-visual>
+
+<h3>ASCII와 ISO-8859-1: 한 바이트의 세계</h3>
+<p>가장 오래되고 지금도 모든 인코딩의 바닥에 깔려 있는 것이 ASCII(American Standard Code for Information Interchange)다. ASCII는 7비트, 즉 0부터 127까지 128개의 번호를 쓴다. 0부터 31까지와 127은 줄바꿈(LF, 10), 캐리지 리턴(CR, 13), 탭(9) 같은 제어 문자이고, 32(공백)부터 126(<code>~</code>)까지 95개가 화면에 찍히는 문자다. 자바의 <code>Charset</code> 문서는 US-ASCII를 "7비트 ASCII, 유니코드 문자 집합의 Basic Latin 블록"이라고 설명한다. 유니코드의 첫 128개 번호가 ASCII와 똑같이 정해져 있다는 뜻이다.</p>
+<div class="table-wrap"><table><thead><tr><th>문자</th><th>10진수</th><th>16진수</th><th>2진수</th></tr></thead><tbody>
+<tr><td>공백</td><td>32</td><td>0x20</td><td>0010 0000</td></tr>
+<tr><td><code>0</code></td><td>48</td><td>0x30</td><td>0011 0000</td></tr>
+<tr><td><code>9</code></td><td>57</td><td>0x39</td><td>0011 1001</td></tr>
+<tr><td><code>A</code></td><td>65</td><td>0x41</td><td>0100 0001</td></tr>
+<tr><td><code>a</code></td><td>97</td><td>0x61</td><td>0110 0001</td></tr>
+</tbody></table></div>
+<p>표를 보면 ASCII 배치에 설계 의도가 있다는 것을 알 수 있다. 숫자 <code>0</code>~<code>9</code>는 0x30~0x39로 연속해 있어서, 자바에서 <code>c - '0'</code>으로 숫자 문자를 정숫값으로 바꾸는 관용구가 성립한다. 대문자 <code>A</code>(0100 0001)와 소문자 <code>a</code>(0110 0001)는 정확히 한 비트(0x20)만 다르다. 대소문자 변환이 비트 하나를 켜고 끄는 일이 되도록 배치한 것이다. 이 규칙은 ASCII 범위에서만 성립한다. 자바의 <code>Character.toUpperCase</code>는 유니코드 전체에 대해 정의된 대소문자 매핑을 따른다.</p>
+<p>ASCII는 7비트이므로 바이트 하나의 맨 앞 비트가 남는다. 128부터 255까지를 어떻게 쓸지를 두고 수많은 8비트 확장이 생겼고, 그 가운데 서유럽 언어용으로 널리 쓰인 것이 ISO-8859-1(Latin-1)이다. ISO-8859-1은 0x00~0x7F를 ASCII와 똑같이 두고, 0xA0~0xFF에 <code>é</code>, <code>ü</code>, <code>ñ</code>, <code>°</code> 같은 문자를 넣었다(0x80~0x9F는 제어 문자 영역이다). 유니코드의 U+0000~U+00FF는 ISO-8859-1과 같은 순서로 배치되어 있어서, 자바의 ISO-8859-1 디코더는 바이트 값 n을 그대로 코드 포인트 U+00nn인 문자로 바꾼다. 바이트 256종류와 문자 256개가 정확히 일대일로 대응한다는 이 성질은 뒤에서 "깨진 문자열의 복구"를 설명할 때 결정적인 역할을 한다.</p>
+<p>한 바이트 체계에는 한글이 들어갈 자리가 없다. 실제로 자바에서 <code>"가".getBytes(StandardCharsets.US_ASCII)</code>나 ISO-8859-1로 바꾸면 결과는 바이트 하나 <code>3F</code>, 즉 물음표다. 한글을 표현할 수 없으니 대체 문자를 넣은 것이다. 이 동작의 근거는 뒤의 예제에서 Javadoc과 함께 확인한다.</p>
+
+<h3>한글을 담는 방법 1: EUC-KR과 완성형 2,350자</h3>
+<p>256칸으로 부족하다면 바이트 두 개를 묶어 한 글자를 나타내면 된다. 한국의 국가 표준 KS X 1001(예전 이름 KS C 5601)은 이런 2바이트 문자 집합으로, 94×94 크기의 표에 한글, 한자, 기호를 배치했다. 한글은 이 표에 미리 완성된 음절 2,350자를 골라 넣는 완성형 방식을 택했다. EUC-KR은 이 KS X 1001의 글자를 ASCII와 함께 쓰기 위한 인코딩이다. ASCII 문자는 원래대로 1바이트(0x00~0x7F)로 두고, KS X 1001의 글자는 두 바이트 모두 0xA1~0xFE 범위에 오도록 적는다. 예를 들어 "가"는 <code>B0 A1</code>이다.</p>
+<p>이 설계에서 중요한 성질이 하나 나온다. EUC-KR에서 한글 바이트는 모두 0x80 이상이므로, 0x7F 이하의 바이트는 언제나 ASCII 문자 그 자체다. 바이트열에서 0x0A(줄바꿈)나 0x2C(쉼표)를 찾으면 그것은 반드시 진짜 줄바꿈이나 쉼표이고, 한글 글자의 한쪽 절반일 가능성이 없다. 영문 위주로 짜인 기존 프로그램이 EUC-KR 텍스트를 받아도 구분자 처리 정도는 깨지지 않는 이유다.</p>
+<p>문제는 2,350자라는 숫자다. 현대 한글은 초성 19개, 중성 21개, 종성 28개(종성 없음 포함)의 조합이므로 가능한 음절은 19×21×28 = 11,172자다. 완성형 2,350자는 그 가운데 자주 쓰이는 것만 고른 것이어서, "똠", "뷁", "햏" 같은 음절은 표현할 수 없다. 자바로 직접 세어 보자. 유니코드의 한글 음절 영역(U+AC00~U+D7A3) 11,172자를 하나씩 EUC-KR 인코더에 넣어 보면 된다.</p>
+<pre><code class="language-java">import java.nio.charset.Charset;
+import java.util.HexFormat;
+
+public class Unmappable {
+    public static void main(String[] args) {
+        HexFormat hex = HexFormat.ofDelimiter(" ").withUpperCase();
+        Charset eucKr = Charset.forName("EUC-KR");
+        Charset ms949 = Charset.forName("MS949");
+
+        System.out.println(hex.formatHex("똠".getBytes(eucKr)));
+        System.out.println(hex.formatHex("똠".getBytes(ms949)));
+        System.out.println(hex.formatHex("😀".getBytes(ms949)));
+        System.out.println(hex.formatHex("A가".getBytes(Charset.forName("ISO-8859-1"))));
+
+        int euc = 0, ms = 0;
+        for (char c = '가'; c <= '힣'; c++) {     // 유니코드의 한글 음절 전체
+            if (eucKr.newEncoder().canEncode(c)) euc++;
+            if (ms949.newEncoder().canEncode(c)) ms++;
+        }
+        System.out.println("EUC-KR = " + euc + ", MS949 = " + ms);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">3F
+8C 63
+3F
+41 3F
+EUC-KR = 2350, MS949 = 11172</code></pre>
+<p><code>HexFormat</code>은 Java 17에 추가된 클래스로, 바이트 배열을 16진수 문자열로 바꿔 준다. 앞에서 본 <code>& 0xFF</code> 처리를 대신 해 주므로 이 회차에서는 계속 이것을 쓴다. 결과를 보면 EUC-KR이 인코딩할 수 있는 한글 음절은 정확히 2,350자다. 이 2,350자의 바이트 범위를 따로 조사해 보면 첫 바이트는 0xB0~0xC8(25가지), 둘째 바이트는 0xA1~0xFE(94가지)로, 25×94 = 2,350이 꽉 찬다. KS X 1001 표에서 한글이 16행부터 40행까지 25개 행을 차지하고, EUC-KR이 행 번호와 열 번호에 각각 0xA0을 더해 바이트로 만들기 때문이다. "가"는 16행 1열이므로 0xA0+16 = 0xB0, 0xA0+1 = 0xA1, 즉 <code>B0 A1</code>이다. "똠"은 표에 없으므로 <code>3F</code>가 되었다.</p>
+
+<h3>한글을 담는 방법 2: CP949(MS949)와 확장 영역</h3>
+<p>나머지 8,822자(11,172 - 2,350)를 담기 위해 마이크로소프트는 EUC-KR을 확장한 코드 페이지 949(CP949, 통합형 한글 코드)를 윈도우에 넣었다. 자바에서는 정식 이름이 <code>x-windows-949</code>이고 <code>MS949</code>, <code>windows-949</code> 같은 별칭으로도 찾을 수 있다. CP949는 EUC-KR의 상위 집합이다. EUC-KR에 있는 글자는 바이트까지 똑같이 쓰고("가"는 두 인코딩 모두 <code>B0 A1</code>), EUC-KR이 쓰지 않던 바이트 조합에 나머지 한글을 채워 넣었다. 위 실행 결과에서 MS949가 11,172자를 모두 인코딩한 것이 그 증거다.</p>
+<p>그런데 채워 넣을 빈 자리를 찾다 보니 EUC-KR이 지키던 성질 하나를 포기했다. 같은 방법으로 MS949의 한글 11,172자의 바이트 범위를 조사하면, 첫 바이트는 0x81~0xC8, 둘째 바이트는 0x41~0x5A, 0x61~0x7A, 0x81~0xFE 범위에 걸친다. 둘째 바이트에 0x41~0x5A와 0x61~0x7A, 즉 ASCII의 영문 대문자와 소문자 범위가 들어간다. 실제로 "똠"은 <code>8C 63</code>으로 인코딩되었고, 0x63은 ASCII로 소문자 <code>c</code>다. CP949 바이트열에서 0x63을 찾았다고 해서 그것이 문자 <code>c</code>라고 단정할 수 없다는 뜻이다. 바이트 단위로 "c"를 검색하는 코드는 "똠"의 뒷절반에 걸려 잘못된 위치를 돌려줄 수 있다. 바이트열을 올바르게 나누려면 앞에서부터 첫 바이트를 보고 글자 경계를 따라가야 한다.</p>
+<pre class="diagram">EUC-KR "A가"   : 41 | B0 A1          0x80 미만 바이트는 언제나 ASCII
+MS949  "A똠"   : 41 | 8C 63          63('c')이 한글의 둘째 바이트로 쓰였다
+                       ^^
+                       바이트만 보고 'c'로 오해할 수 있는 자리</pre>
+<p>한 가지 결과가 더 있다. 확장 영역의 글자는 기존 2,350자 사이에 끼어들 수 없어서 바이트 공간의 앞쪽(0x81~0xA0 등)에 몰려 배치되었다. 예를 들어 "갂"(U+AC02)은 MS949로 <code>81 41</code>이고 "가"는 <code>B0 A1</code>이다. 가나다순으로는 "가" 다음이 "갂"인데, 바이트를 부호 없이 사전순 비교하면 "갂"이 "가"보다 앞선다(<code>Arrays.compareUnsigned</code>로 비교하면 음수가 나온다). CP949 바이트열을 그대로 정렬하면 한글 사전 순서가 나오지 않는다.</p>
+<p>EUC-KR과 CP949 모두 한국어용 체계라는 한계도 있다. 이모지나 아랍 문자처럼 표에 없는 글자는 아예 담을 수 없다. 위 실행 결과의 셋째 줄에서 "😀"를 MS949로 바꾸자 바이트 하나 <code>3F</code>가 나왔다. 자바 문자열에서 "😀"는 <code>char</code> 두 개로 되어 있는데(뒤에서 설명할 서로게이트 쌍이다), 인코더가 이 쌍을 한 글자로 인식해 물음표 하나로 바꾼 것이다. 여러 언어를 한 문서에 담으려면 언어마다 다른 문자 집합을 쓰는 방식을 버리고, 세상의 모든 문자에 하나의 번호표를 주는 체계가 필요했다. 그것이 유니코드다.</p>
+
+<h3>유니코드: 모든 문자에 번호 하나씩</h3>
+<p>유니코드(Unicode)는 세계의 문자에 하나씩 번호를 붙이는 문자 집합이다. 이 번호를 코드 포인트(code point)라고 하고, <code>U+</code> 뒤에 16진수 네 자리 이상을 붙여 적는다. "A"는 U+0041, "é"는 U+00E9, "가"는 U+AC00, "😀"는 U+1F600이다. 코드 포인트의 범위는 U+0000부터 U+10FFFF까지 1,114,112개이고, 자바에서도 <code>Character.MAX_CODE_POINT</code>가 0x10FFFF다. 이 공간은 65,536개씩 17개의 평면(plane)으로 나뉜다. 0번 평면(U+0000~U+FFFF)을 기본 다국어 평면(BMP, Basic Multilingual Plane)이라 하고, 그 밖의 문자를 보충 문자(supplementary character)라 한다. 한글 음절과 대부분의 한자, 라틴 문자는 BMP에 있고, 이모지 상당수와 옛 문자들은 보충 평면에 있다.</p>
+<p>유니코드는 한글 음절 11,172자를 모두 U+AC00(가)부터 U+D7A3(힣)까지 가나다순으로 연속 배치했다. 유니코드 표준 3.12절(Conjoining Jamo Behavior)은 초성 인덱스 L(0~18), 중성 인덱스 V(0~20), 종성 인덱스 T(0~27, 받침 없음이 0)로 음절의 코드 포인트를 계산하는 식을 정의한다.</p>
+<pre class="diagram">코드 포인트 = 0xAC00 + (L × 21 + V) × 28 + T
+
+"가" = ㄱ(L=0) + ㅏ(V=0) + 받침 없음(T=0)
+     = 0xAC00 + (0 × 21 + 0) × 28 + 0 = 0xAC00
+
+"한" = ㅎ(L=18) + ㅏ(V=0) + ㄴ(T=4)
+     = 44032 + (18 × 21 + 0) × 28 + 4
+     = 44032 + 10584 + 4 = 54620 = 0xD55C</pre>
+<p>자바로 <code>Integer.toHexString('한')</code>을 찍으면 실제로 <code>d55c</code>가 나온다. 이 규칙성 덕분에 유니코드 한글은 산술만으로 초성·중성·종성을 분해하고 조합할 수 있고, 코드 포인트 순서가 곧 가나다순이다. CP949의 확장 영역이 가나다순을 지키지 못했던 것과 대조적이다. <code>Character.getName(0xAC00)</code>은 <code>HANGUL SYLLABLES AC00</code>을 돌려준다. 이것은 유니코드 표준이 정한 이 글자의 이름(<code>HANGUL SYLLABLE GA</code>)이 아니다. <code>getName</code>의 Javadoc에 따르면 UnicodeData 파일에 개별 이름이 실려 있지 않은 한글 음절 같은 코드 포인트에 대해서는 유니코드 블록 이름과 16진수 코드 포인트를 이어 붙인 문자열을 돌려주며, 이 규칙은 유니코드 표준의 이름 규칙과 다르다고 문서 스스로 밝힌다.</p>
+<p>코드 포인트 공간 가운데 U+D800~U+DFFF의 2,048개는 어떤 문자에도 배정되지 않는다. 이 구간은 서로게이트(surrogate)라 불리며, 바로 다음에 볼 UTF-16이 보충 문자를 표현하기 위해 예약해 둔 자리다. 그리고 다시 강조하지만 유니코드는 번호만 정한다. 1,114,112개의 번호를 바이트로 적는 방법으로 UTF-8, UTF-16, UTF-32가 정의되어 있다. UTF-32는 모든 코드 포인트를 4바이트로 고정해 적는 단순한 방식이지만 공간 낭비가 커서 저장·전송용으로는 드물게 쓰인다. 실무에서 만나는 것은 거의 UTF-8과 UTF-16이다.</p>
+
+<h3>UTF-16: 16비트 코드 유닛과 서로게이트 쌍</h3>
+<p>UTF-16은 16비트 단위, 즉 코드 유닛(code unit) 하나가 2바이트인 인코딩이다. BMP 문자는 코드 포인트 값을 그대로 16비트 코드 유닛 하나로 적는다. "A"(U+0041)는 <code>0x0041</code>, "가"(U+AC00)는 <code>0xAC00</code>이다. 문제는 16비트로 표현할 수 없는 보충 문자다. UTF-16은 이들을 서로게이트 구간의 코드 유닛 두 개, 즉 서로게이트 쌍(surrogate pair)으로 적는다. 앞에 오는 상위 서로게이트(high surrogate)는 0xD800~0xDBFF, 뒤에 오는 하위 서로게이트(low surrogate)는 0xDC00~0xDFFF 범위다. 이 두 범위에는 문자가 배정되지 않으므로, 코드 유닛 하나만 보고도 그것이 단독 문자인지, 쌍의 앞쪽인지 뒤쪽인지 판별할 수 있다.</p>
+<p>"😀"(U+1F600)를 직접 계산해 보자.</p>
+<figure class="flow-figure"><figcaption>U+1F600을 UTF-16 서로게이트 쌍으로 바꾸는 과정</figcaption><ol class="flow">
+<li><strong>0x10000을 뺀다</strong><span>0x1F600 - 0x10000 = 0x0F600. 보충 문자는 U+10000~U+10FFFF이므로 빼고 나면 0x00000~0xFFFFF, 정확히 20비트에 들어간다.</span></li>
+<li><strong>20비트를 반으로 나눈다</strong><span>0x0F600 = 0000 1111 0110 0000 0000. 상위 10비트 0000111101 = 0x3D, 하위 10비트 1000000000 = 0x200.</span></li>
+<li><strong>각각 서로게이트 시작값에 더한다</strong><span>상위: 0xD800 + 0x3D = 0xD83D. 하위: 0xDC00 + 0x200 = 0xDE00.</span></li>
+<li><strong>바이트로 적는다</strong><span>빅 엔디언이면 D8 3D DE 00, 리틀 엔디언이면 3D D8 00 DE. BMP 문자는 2바이트, 보충 문자는 4바이트가 된다.</span></li>
+</ol></figure>
+<p>16비트 값을 바이트 두 개로 적을 때는 순서를 정해야 한다. 큰 쪽 바이트를 먼저 쓰는 빅 엔디언(big-endian, UTF-16BE)과 작은 쪽을 먼저 쓰는 리틀 엔디언(little-endian, UTF-16LE)이 모두 쓰인다. 어느 쪽인지 알리기 위해 데이터 맨 앞에 U+FEFF를 넣는 관례가 있는데, 이를 바이트 순서 표시(BOM, byte-order mark)라 한다. 빅 엔디언이면 <code>FE FF</code>, 리틀 엔디언이면 <code>FF FE</code>로 보이므로 읽는 쪽이 순서를 판별할 수 있다. 자바의 <code>Charset</code> 문서는 세 문자 집합의 동작을 명확히 정해 두었다. <code>UTF-16</code>은 디코딩할 때 맨 앞의 BOM으로 바이트 순서를 판단하고 BOM이 없으면 빅 엔디언으로 간주하며, 인코딩할 때는 빅 엔디언으로 쓰고 빅 엔디언 BOM을 붙인다. <code>UTF-16BE</code>와 <code>UTF-16LE</code>는 인코딩할 때 BOM을 쓰지 않고, 디코딩할 때 맨 앞의 BOM을 폭 없는 줄바꿈 금지 공백(ZERO WIDTH NO-BREAK SPACE) 문자로 해석한다.</p>
+<h4>자바의 char는 UTF-16 코드 유닛이다</h4>
+<p>이 절이 자바 개발자에게 특히 중요한 이유는 자바 언어 자체가 UTF-16 위에 서 있기 때문이다. JLS §3.1은 자바가 텍스트를 UTF-16 인코딩의 16비트 코드 유닛 열로 표현한다고 정하고, <code>char</code> 타입은 0부터 65535까지의 부호 없는 16비트 정수다. 즉 <code>char</code> 하나는 "글자 하나"가 아니라 "UTF-16 코드 유닛 하나"다. BMP 문자에서는 둘이 같아서 차이가 드러나지 않을 뿐이다. <code>String.length()</code>의 Javadoc도 길이가 문자열 안의 유니코드 코드 유닛 개수라고 적고 있다.</p>
+<pre><code class="language-java">public class CodeUnits {
+    public static void main(String[] args) {
+        String s = "a가😀";
+        System.out.println(s.length());                              // char(코드 유닛) 수
+        System.out.println(s.codePointCount(0, s.length()));         // 코드 포인트 수
+
+        for (char c : s.toCharArray()) {
+            System.out.print(Integer.toHexString(c) + " ");
+        }
+        System.out.println();
+        s.codePoints().forEach(cp -> System.out.print(Integer.toHexString(cp) + " "));
+        System.out.println();
+
+        System.out.println(Character.isHighSurrogate(s.charAt(2)));
+        System.out.println(Character.toCodePoint(s.charAt(2), s.charAt(3)) == 0x1F600);
+        System.out.println(Character.getName(0xAC00));
+
+        String broken = s.substring(0, 3);                           // 서로게이트 쌍의 앞 절반에서 자른다
+        System.out.println(broken.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">4
+3
+61 ac00 d83d de00
+61 ac00 1f600
+true
+true
+HANGUL SYLLABLES AC00
+5</code></pre>
+<p>눈에 보이는 글자는 세 개인데 <code>length()</code>는 4다. "😀"가 코드 유닛 두 개(<code>d83d de00</code>)를 차지하기 때문이다. <code>codePointCount</code>와 <code>codePoints()</code>는 서로게이트 쌍을 하나로 합쳐 코드 포인트 단위로 센다. 마지막 두 줄이 실무의 함정이다. <code>substring(0, 3)</code>은 코드 유닛 인덱스로 자르므로 "a", "가", 그리고 짝 잃은 상위 서로게이트 <code>\uD83D</code>가 남는다. 이것을 UTF-8로 인코딩하면 "a"(1바이트) + "가"(3바이트) + 대체 문자 <code>?</code>(1바이트)로 5바이트가 된다. 홀로 남은 서로게이트는 어떤 문자도 아니므로 UTF-8로 표현할 수 없고, 이모지 하나가 물음표로 바뀌어 저장된다. 문자열을 길이 제한에 맞춰 자르는 코드가 이모지를 쪼개는 전형적인 경로다. <code>StringBuilder.reverse()</code>처럼 서로게이트 쌍을 고려하도록 문서화된 메서드도 있지만, 인덱스를 직접 다루는 코드에서는 개발자가 <code>Character.isHighSurrogate</code> 같은 메서드로 경계를 확인해야 한다.</p>
+
+<h3>UTF-8: 가변 길이와 자기 동기화</h3>
+<p>UTF-8은 코드 포인트를 1~4바이트로 적는 가변 길이 인코딩이다. RFC 3629가 정의하며, 코드 포인트 범위에 따라 다음 네 가지 틀 가운데 하나를 쓴다. <code>x</code> 자리에 코드 포인트의 비트를 오른쪽부터 채워 넣는다.</p>
+<pre class="diagram">코드 포인트 범위        바이트 수   비트 틀                                  채울 비트 수
+U+0000   ~ U+007F       1          0xxxxxxx                                 7
+U+0080   ~ U+07FF       2          110xxxxx 10xxxxxx                        11
+U+0800   ~ U+FFFF       3          1110xxxx 10xxxxxx 10xxxxxx               16
+U+10000  ~ U+10FFFF     4          11110xxx 10xxxxxx 10xxxxxx 10xxxxxx      21</pre>
+<p>"가"(U+AC00)는 세 번째 줄 범위에 속하므로 3바이트다. 0xAC00을 16비트 이진수로 쓰면 <code>1010 1100 0000 0000</code>이고, 이것을 4비트, 6비트, 6비트로 나누면 <code>1010</code> | <code>110000</code> | <code>000000</code>이다. 틀에 채우면 <code>1110 1010</code>, <code>10 110000</code>, <code>10 000000</code>, 즉 <code>EA B0 80</code>이다. 자바의 <code>byte</code>로 찍으면 -22, -80, -128이 된다. 앞에서 본 그 음수들이다.</p>
+<p>"😀"(U+1F600)는 네 번째 줄 범위다. 0x1F600을 21비트로 쓰면 <code>0 0001 1111 0110 0000 0000</code>이고, 3비트, 6비트, 6비트, 6비트로 나누면 <code>000</code> | <code>011111</code> | <code>011000</code> | <code>000000</code>이다. 틀에 채우면 <code>11110 000</code>, <code>10 011111</code>, <code>10 011000</code>, <code>10 000000</code>, 즉 <code>F0 9F 98 80</code>이다. UTF-16에서 서로게이트 쌍 4바이트였던 글자가 UTF-8에서도 4바이트가 되었지만, 바이트의 모양은 전혀 다르다.</p>
+<x-visual id="java-adv2-01-utf8-bits" title="U+AC00을 UTF-8 세 바이트로 채워 넣는 과정" kind="비트 배치도" ratio="16:9">
+<x-hint>코드 포인트의 16비트가 4·6·6비트로 나뉘어 3바이트 UTF-8 틀의 x 자리에 들어가는 모습을 보여 준다.</x-hint>
+<x-prompt>A bit-layout diagram on a white background. Top row: sixteen small square cells containing the bits "1 0 1 0 1 1 0 0 0 0 0 0 0 0 0 0", with a label above reading "U+AC00 (가)". The cells are grouped by color into three groups of 4, 6 and 6 bits. Below, three wider byte boxes side by side, each containing eight bit cells: the first box shows fixed prefix bits "1110" in gray followed by the 4 colored bits "1010"; the second box shows gray prefix "10" followed by the 6 colored bits "110000"; the third shows gray prefix "10" followed by "000000". Curved arrows connect each colored group in the top row to its place in the boxes. Under each byte box, the hex value in large monospace: "EA", "B0", "80". At the bottom, a caption label: "고정 비트(회색)는 바이트의 역할을 알려 준다". Clean flat style, consistent colors for the three groups.</x-prompt>
+<x-caption>"가"의 16비트가 UTF-8의 3바이트 틀에 나뉘어 들어간다. 회색 고정 비트가 바이트의 역할(첫 바이트인지, 이어지는 바이트인지)을 나타낸다.</x-caption>
+</x-visual>
+<p>이 틀에는 우연이 아닌 설계가 담겨 있다. RFC 3629가 서두에서 꼽는 성질을 자바 개발자의 관점에서 풀어 보면 다음과 같다.</p>
+<ul>
+<li><b>ASCII 호환.</b> U+0000~U+007F는 ASCII 값 그대로 1바이트로 적힌다. 순수 ASCII 텍스트 파일은 그 자체로 올바른 UTF-8 파일이다.</li>
+<li><b>ASCII 바이트는 다른 글자 안에 나타나지 않는다.</b> 2바이트 이상인 글자의 모든 바이트는 맨 앞 비트가 1, 즉 0x80 이상이다. RFC 3629의 표현으로는 US-ASCII 바이트 값은 UTF-8 스트림에서 그 문자 자신으로만 나타난다. CP949에서 "똠"의 둘째 바이트가 <code>c</code>와 같았던 문제가 UTF-8에서는 생길 수 없다. 바이트 단위로 <code>/</code>나 줄바꿈을 찾아 나누는 코드가 UTF-8에서는 안전하다.</li>
+<li><b>첫 바이트가 길이를 알려 준다.</b> <code>0</code>으로 시작하면 1바이트, <code>110</code>이면 2바이트, <code>1110</code>이면 3바이트, <code>11110</code>이면 4바이트 글자의 시작이다.</li>
+<li><b>자기 동기화(self-synchronizing).</b> 이어지는 바이트는 모두 <code>10</code>으로 시작하고, 이 패턴은 첫 바이트에는 쓰이지 않는다. 그래서 바이트열의 아무 위치에서 읽기 시작해도, <code>10</code>으로 시작하는 바이트를 최대 세 개 건너뛰면 다음 글자의 시작을 찾을 수 있다. RFC 3629는 이를 "글자 경계를 옥텟 스트림의 어느 위치에서든 쉽게 찾을 수 있다"고 표현한다.</li>
+<li><b>정렬 순서 보존.</b> UTF-8 바이트열을 바이트 값의 사전순으로 정렬하면 코드 포인트 순서로 정렬한 것과 같다. 한글은 코드 포인트 순서가 가나다순이므로, UTF-8 바이트 비교로도 가나다순이 나온다. 앞의 "갂"과 "가"를 UTF-8 바이트로 비교하면 "가"가 앞선다.</li>
+</ul>
+<p>규칙이 엄격한 만큼 "틀린 UTF-8"도 명확히 정의된다. RFC 3629에 따르면 바이트 0xC0, 0xC1, 0xF5~0xFF는 올바른 UTF-8에 절대 나타나지 않는다. 0xC0과 0xC1이 금지되는 이유는 이것으로 시작하는 2바이트 열은 7비트에 들어가는 값, 즉 1바이트로 적어야 할 값을 굳이 2바이트로 적은 과잉 표현(overlong encoding)이 되기 때문이다. RFC는 디코더가 이런 잘못된 열을 받아들이지 않도록 보호해야 한다고 요구하며, 단순한 디코더가 <code>C0 80</code>을 U+0000으로 해석하는 경우를 예로 든다. 과잉 표현을 허용하면 같은 문자에 여러 바이트 표현이 생기고, 바이트 단위로 특정 문자를 걸러 내는 검사를 우회할 수 있기 때문이다. 서로게이트 구간 U+D800~U+DFFF를 UTF-8로 인코딩하는 것도 금지다. JDK 21의 UTF-8 디코더에 <code>C0 80</code>을 주면 실제로 U+FFFD 두 개가 나오고, 서로게이트를 적은 <code>ED A0 80</code>도 U+FFFD로 바뀐다.</p>
+<p>세 인코딩으로 같은 글자를 적을 때의 크기를 비교하면 다음과 같다. 모두 JDK 21로 확인한 값이다.</p>
+<div class="table-wrap"><table><thead><tr><th>글자</th><th>코드 포인트</th><th>UTF-8</th><th>UTF-16BE</th><th>EUC-KR</th></tr></thead><tbody>
+<tr><td>A</td><td>U+0041</td><td>41 (1바이트)</td><td>00 41 (2바이트)</td><td>41 (1바이트)</td></tr>
+<tr><td>é</td><td>U+00E9</td><td>C3 A9 (2바이트)</td><td>00 E9 (2바이트)</td><td>표현 불가</td></tr>
+<tr><td>가</td><td>U+AC00</td><td>EA B0 80 (3바이트)</td><td>AC 00 (2바이트)</td><td>B0 A1 (2바이트)</td></tr>
+<tr><td>한</td><td>U+D55C</td><td>ED 95 9C (3바이트)</td><td>D5 5C (2바이트)</td><td>C7 D1 (2바이트)</td></tr>
+<tr><td>😀</td><td>U+1F600</td><td>F0 9F 98 80 (4바이트)</td><td>D8 3D DE 00 (4바이트)</td><td>표현 불가</td></tr>
+</tbody></table></div>
+<p>한글만 놓고 보면 UTF-8이 EUC-KR이나 UTF-16보다 1.5배 크다. 그럼에도 UTF-8이 파일, 네트워크, 웹의 표준이 된 이유는 위의 성질들, 특히 ASCII 호환성과 바이트 순서 문제가 없다는 점 때문이다. UTF-8은 바이트 단위 인코딩이어서 엔디언을 따질 필요가 없다. 그래서 UTF-8에는 BOM이 필요 없지만, 일부 편집기는 파일 맨 앞에 U+FEFF를 UTF-8로 적은 <code>EF BB BF</code>를 붙이기도 한다. RFC 3629는 UTF-8에서 BOM이 쓰이면 항상 이 세 바이트로 나타난다고 적고 있다. 자바의 UTF-8 디코더는 이 세 바이트를 걸러 주지 않는다는 점을 기억해 두자. 이 문제는 뒤의 함정 절에서 실험으로 확인한다.</p>
+
+<h3>문자 집합 조회: Charset API</h3>
+<p>자바에서 문자 집합은 <code>java.nio.charset.Charset</code> 객체로 표현된다. 이 객체는 이름과 별칭을 갖고, 문자를 바이트로 바꾸는 인코더(<code>CharsetEncoder</code>)와 바이트를 문자로 바꾸는 디코더(<code>CharsetDecoder</code>)를 만들어 준다. <code>String.getBytes(Charset)</code>나 <code>new String(byte[], Charset)</code>은 내부에서 이 인코더와 디코더를 쓴다. 지금 JVM이 지원하는 문자 집합을 조회해 보자.</p>
+<pre><code class="language-java">import java.nio.charset.Charset;
+import java.util.SortedMap;
+
+public class CharsetList {
+    public static void main(String[] args) {
+        SortedMap<String, Charset> all = Charset.availableCharsets();
+        System.out.println("지원하는 문자 집합 수 = " + all.size());
+
+        System.out.println("기본 문자 집합 = " + Charset.defaultCharset());
+
+        Charset ms949 = Charset.forName("MS949");
+        System.out.println(ms949.name() + " " + ms949.aliases());
+
+        Charset eucKr = Charset.forName("euc-kr");             // 대소문자를 구분하지 않는다
+        System.out.println(eucKr.name() + " " + eucKr.aliases());
+
+        System.out.println(Charset.isSupported("x-windows-949"));
+        System.out.println(Charset.forName("x-windows-949") == ms949);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (Temurin 21.0.13, 별칭 순서는 실행마다 다를 수 있다)"><code class="language-text">지원하는 문자 집합 수 = 173
+기본 문자 집합 = UTF-8
+x-windows-949 [ms_949, ms949, windows949, windows-949]
+EUC-KR [euckr, euc_kr, ks_c_5601-1987, csEUCKR, ksc5601-1987, ksc_5601, ksc5601, ksc5601_1987, 5601]
+true
+true</code></pre>
+<p><code>availableCharsets()</code>는 정식 이름을 키로 하는 정렬된 맵을 돌려준다. 173이라는 숫자는 이 JDK 빌드에서 얻은 값이며 JDK 구현과 버전에 따라 다르다. 확실하게 보장되는 것은 <code>Charset</code> 문서가 정한 표준 문자 집합 여섯 개뿐이다. US-ASCII, ISO-8859-1, UTF-8, UTF-16BE, UTF-16LE, UTF-16은 모든 자바 플랫폼 구현이 지원해야 하고, 이 여섯 개는 <code>StandardCharsets</code> 클래스에 상수로 들어 있다. EUC-KR이나 MS949는 보장 목록에 없으므로 <code>forName</code>으로 찾아야 한다. 이 회차의 예제는 JDK 21에서 둘 다 지원되는 것을 확인하고 쓴 것이다.</p>
+<p><code>forName("MS949")</code>로 찾은 객체의 정식 이름은 <code>x-windows-949</code>이고, <code>MS949</code>는 별칭이다. 별칭으로 찾든 정식 이름으로 찾든 같은 객체가 나오는 것도 확인할 수 있다(<code>==</code> 비교가 참이다). <code>Charset</code> 문서에 따르면 문자 집합 이름은 영문자, 숫자, 그리고 <code>-</code>, <code>+</code>, <code>.</code>, <code>:</code>, <code>_</code>만으로 이루어지고, 영문자나 숫자로 시작해야 하며, 비교할 때 대소문자를 구분하지 않는다. 그래서 <code>"euc-kr"</code>로도 EUC-KR을 찾을 수 있다. 출력의 <code>aliases()</code>는 <code>Set</code>이므로 순서에 의미가 없고, 실제로 실행할 때마다 순서가 바뀌기도 했다.</p>
+<p>찾을 수 없을 때의 예외는 두 종류다. 이름 규칙에는 맞지만 이 JVM이 지원하지 않으면 <code>UnsupportedCharsetException</code>이 난다(<code>Charset.forName("NO-SUCH-CHARSET")</code>). 이름 자체가 규칙을 어기면 <code>IllegalCharsetNameException</code>이 난다(<code>Charset.forName("한글")</code>은 허용되지 않는 문자로 이루어져 있다). 둘 다 비검사 예외다. 반면 문자열 이름을 받는 옛 API인 <code>"가".getBytes("NO-SUCH")</code>나 <code>new String(bytes, "UTF-8")</code>은 검사 예외 <code>UnsupportedEncodingException</code>을 선언한다. <code>Charset</code> 객체를 받는 오버로드는 검사 예외를 선언하지 않고, <code>StandardCharsets.UTF_8</code>처럼 이미 만들어진 객체를 넘기면 이름을 찾다 실패할 일 자체가 없으므로 이쪽이 더 낫다. 미리 지원 여부만 확인하려면 <code>Charset.isSupported(name)</code>을 쓴다.</p>
+
+<h3>Charset.forName의 안쪽: 조회 순서와 jdk.charsets 모듈</h3>
+<p>앞의 실행 결과에서 지원 문자 집합 수가 173이었고, 이 숫자는 구현마다 다르다고 했다. 무엇이 이 숫자를 정하는지는 JDK 21의 <code>Charset</code> 소스를 따라가 보면 드러난다. <code>forName</code>은 내부의 <code>lookup</code> 메서드를 부르고, 이 메서드는 먼저 가장 최근에 돌려준 결과 두 개를 기억하는 아주 작은 캐시(<code>cache1</code>, <code>cache2</code>)를 본다. 캐시 한 칸은 "찾을 때 쓴 이름"과 <code>Charset</code> 객체의 쌍이고, 두 번째 칸에서 찾으면 두 칸을 맞바꿔 방금 쓴 것을 첫 칸으로 올린다. 같은 이름으로 거듭 찾는 흔한 경우를 해시 맵 없이 문자열 비교 한두 번으로 끝내려는 구조다. 캐시의 키가 정식 이름이 아니라 호출할 때 넘긴 문자열이라는 점도 소스에서 읽을 수 있다. <code>"ms949"</code>와 <code>"MS949"</code>는 캐시에서 서로 다른 키다.</p>
+<p>캐시에 없으면 <code>lookup2</code>가 세 곳에 차례로 묻고, 처음 찾은 결과를 캐시에 넣어 돌려준다.</p>
+<ol>
+<li><b>표준 제공자.</b> <code>java.base</code> 모듈 안의 <code>sun.nio.cs.StandardCharsets</code>다. UTF-8의 구현 클래스 <code>sun.nio.cs.UTF_8</code>도 <code>java.base</code>에 있다.</li>
+<li><b>확장 제공자.</b> <code>ServiceLoader.loadInstalled(CharsetProvider.class)</code>로 찾은 제공자들이다. <code>loadInstalled</code>는 플랫폼 클래스 로더가 볼 수 있는 제공자, 즉 런타임에 설치된 JDK 모듈이 제공하는 것만 찾는다. 이 목록은 <code>ExtendedProviderHolder</code>라는 중첩 클래스의 정적 필드에 담겨, 처음 필요할 때 한 번만 만들어진다.</li>
+<li><b>애플리케이션 제공자.</b> 시스템 클래스 로더로 <code>ServiceLoader.load</code>해서 찾은 <code>CharsetProvider</code>다. 애플리케이션이 직접 만든 문자 집합을 끼워 넣는 확장점이다.</li>
+</ol>
+<p>이 회차 내내 써 온 EUC-KR과 MS949는 1번이 아니라 2번에서 나온다. JDK 21 소스에서 두 문자 집합의 클래스는 <code>jdk.charsets</code> 모듈의 <code>sun.nio.cs.ext.EUC_KR</code>와 <code>sun.nio.cs.ext.MS949</code>이고, 이 모듈의 <code>module-info.java</code>는 <code>provides java.nio.charset.spi.CharsetProvider with sun.nio.cs.ext.ExtendedCharsets</code> 선언 하나가 전부다. 실행 중에 <code>Charset.forName("EUC-KR").getClass().getModule()</code>을 찍어도 <code>module jdk.charsets</code>가 나온다. 그렇다면 <code>jdk.charsets</code> 모듈이 없는 런타임에서는 어떻게 될까. <code>java --limit-modules java.base</code>는 관찰 가능한 모듈을 <code>java.base</code>(와 그 의존 모듈)로 제한하는 옵션이다.</p>
+<pre><code class="language-java">import java.nio.charset.Charset;
+
+public class Mods {
+    public static void main(String[] args) {
+        System.out.println("count = " + Charset.availableCharsets().size());
+        System.out.println("jdk.charsets present = "
+                + ModuleLayer.boot().findModule("jdk.charsets").isPresent());
+        for (String name : new String[]{"UTF-8", "EUC-KR", "MS949"}) {
+            try {
+                System.out.println(name + " -> " + Charset.forName(name));
+            } catch (Exception e) {
+                System.out.println(name + " -> " + e);
+            }
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (Temurin 21.0.13)"><code class="language-bash">$ java Mods
+count = 173
+jdk.charsets present = true
+UTF-8 -> UTF-8
+EUC-KR -> EUC-KR
+MS949 -> x-windows-949
+
+$ java --limit-modules java.base Mods
+count = 41
+jdk.charsets present = false
+UTF-8 -> UTF-8
+EUC-KR -> java.nio.charset.UnsupportedCharsetException: EUC-KR
+MS949 -> java.nio.charset.UnsupportedCharsetException: MS949</code></pre>
+<p>모듈을 제한하자 지원 문자 집합이 173개에서 41개로 줄었고, EUC-KR과 MS949는 <code>UnsupportedCharsetException</code>을 던졌다. 실제 배포에서 이 상황은 <code>jlink</code>로 런타임 이미지를 줄일 때 생긴다. jlink 문서에 따르면 <code>--add-modules</code>는 루트 모듈을 더하는 옵션이고(기본 루트 집합은 비어 있다), 서비스 제공자 모듈과 그 의존 모듈을 링크하는 것은 <code>--bind-services</code> 옵션의 일이다. JDK 21에서 <code>jdk.charsets</code>를 <code>requires</code>하는 모듈은 하나도 없다(<code>java --describe-module</code>로 모든 모듈을 훑어 확인했다). 순수한 제공자 모듈이라서 의존 관계만 따라가는 링크에는 끌려 들어오지 않는다. 이 실험 환경에서 <code>jlink --add-modules java.base</code>로 만든 이미지(약 48MB)로 같은 프로그램을 돌리면 위의 두 번째 실행과 똑같이 41개와 EUC-KR 예외가 나왔고, <code>--add-modules java.base,jdk.charsets</code>로 다시 만들자 173개로 돌아왔다. 개발 PC의 전체 JDK에서 잘 돌던 레거시 연동 코드가 작게 줄인 런타임 이미지에서 <code>UnsupportedCharsetException</code>을 던지는 경로가 이것이다. <code>Charset</code> 문서가 모든 구현에 지원을 요구하는 것은 표준 여섯 개뿐이라는 앞 절의 이야기가, 같은 JDK 안에서도 모듈 구성에 따라 현실이 된다.</p>
+<p>EUC-KR 클래스 자체도 들여다볼 만하다. <code>EUC_KR.java</code> 첫머리에는 기계적으로 생성된 파일이니 고치지 말라는 주석이 있고, 본문은 거의 전부 문자열 상수로 적힌 변환표다. 디코더는 <code>java.base</code>에 있는 공용 클래스 <code>sun.nio.cs.DoubleByte.Decoder</code>에 이 표를 넘겨 만들고(<code>new DoubleByte.Decoder(this, b2c, b2cSB, 0xa1, 0xfe, true)</code>), 인코더는 같은 표를 뒤집어 문자에서 바이트로 가는 역방향 표를 채운다. JDK 21의 <code>src.zip</code>에서 <code>new DoubleByte.Decoder</code>를 쓰는 소스 파일은 38개다. 2바이트 문자 집합 수십 개가 디코딩 알고리즘 하나를 공유하고 표만 바꿔 끼우는 구조다. 이 공용 알고리즘이 잘못된 바이트를 어떻게 다루는지는 예제 2 뒤에서 자세히 본다.</p>
+
+<h3>문자 인코딩 예제 1: 같은 글자, 다른 바이트</h3>
+<p>이제 같은 글자를 여러 문자 집합으로 인코딩해 결과를 나란히 놓아 보자. 영문 "A"와 한글 "가"를 여덟 가지 문자 집합으로 바이트 배열로 바꾼다.</p>
+<pre><code class="language-java">import java.nio.charset.Charset;
+import java.util.Arrays;
+import java.util.HexFormat;
+
+public class EncodeTable {
+    static final String[] NAMES = {
+        "US-ASCII", "ISO-8859-1", "EUC-KR", "MS949",
+        "UTF-8", "UTF-16", "UTF-16BE", "UTF-16LE"
+    };
+
+    public static void main(String[] args) {
+        for (String text : new String[]{"A", "가"}) {
+            for (String name : NAMES) {
+                byte[] bytes = text.getBytes(Charset.forName(name));
+                System.out.printf("%s %-10s %d바이트 %-18s %s%n",
+                        text, name, bytes.length,
+                        Arrays.toString(bytes),
+                        HexFormat.ofDelimiter(" ").withUpperCase().formatHex(bytes));
+            }
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">A US-ASCII   1바이트 [65]               41
+A ISO-8859-1 1바이트 [65]               41
+A EUC-KR     1바이트 [65]               41
+A MS949      1바이트 [65]               41
+A UTF-8      1바이트 [65]               41
+A UTF-16     4바이트 [-2, -1, 0, 65]    FE FF 00 41
+A UTF-16BE   2바이트 [0, 65]            00 41
+A UTF-16LE   2바이트 [65, 0]            41 00
+가 US-ASCII   1바이트 [63]               3F
+가 ISO-8859-1 1바이트 [63]               3F
+가 EUC-KR     2바이트 [-80, -95]         B0 A1
+가 MS949      2바이트 [-80, -95]         B0 A1
+가 UTF-8      3바이트 [-22, -80, -128]   EA B0 80
+가 UTF-16     4바이트 [-2, -1, -84, 0]   FE FF AC 00
+가 UTF-16BE   2바이트 [-84, 0]           AC 00
+가 UTF-16LE   2바이트 [0, -84]           00 AC</code></pre>
+<p>"A"의 결과부터 읽자. UTF-16 계열을 뺀 다섯 문자 집합이 모두 <code>41</code> 한 바이트를 만들었다. ASCII를 바닥에 깔고 그 위에 확장한 체계라서 ASCII 범위에서는 서로 호환된다. 영문과 숫자만 오가는 시스템에서 인코딩 설정이 틀려도 문제가 드러나지 않다가, 한글이 처음 들어오는 날 터지는 이유가 여기 있다. UTF-16 계열은 "A"도 2바이트로 적으므로 ASCII와 호환되지 않는다. 특히 <code>UTF-16</code>은 앞에서 본 문서 규칙대로 빅 엔디언 BOM <code>FE FF</code>를 먼저 쓰고 <code>00 41</code>을 이어 써서 4바이트가 되었다. BOM을 쓰지 않는 UTF-16BE는 <code>00 41</code>, UTF-16LE는 바이트 순서가 반대인 <code>41 00</code>이다.</p>
+<p>"가"의 결과에서는 체계마다 차이가 크다. US-ASCII와 ISO-8859-1은 "가"를 표현할 수 없어 <code>3F</code>(물음표)를 만들었다. 이것은 오류로 끝나지 않고 조용히 일어난다는 점이 중요하다. <code>String.getBytes(Charset)</code>의 Javadoc은 이 메서드가 잘못된 입력(malformed input)과 매핑할 수 없는 문자(unmappable character)를 항상 해당 문자 집합의 기본 대체 바이트 배열로 바꾼다고 명시한다. 대부분의 문자 집합에서 인코더의 기본 대체 바이트는 <code>?</code> 한 바이트다. 예외도 있다. UTF-16BE 인코더의 기본 대체 바이트는 U+FFFD를 적은 <code>FF FD</code>이고, 짝 잃은 서로게이트 <code>"\uD800"</code>을 UTF-16BE로 인코딩하면 실제로 <code>FF FD</code>가 나온다. EUC-KR과 MS949는 "가"를 같은 <code>B0 A1</code>로 만들었다. 완성형 2,350자 영역에서는 두 체계가 같기 때문이다. UTF-8은 앞에서 손으로 계산한 <code>EA B0 80</code>을 그대로 만들었다.</p>
+<p>정리하면 "가"라는 한 글자가 문자 집합에 따라 1바이트(정보를 잃은 물음표), 2바이트, 3바이트, 4바이트로 저장된다. 같은 "가나다"라도 파일 크기가 다르고, 무엇보다 <b>바이트 내용이 다르다</b>. EUC-KR로 저장한 파일과 UTF-8로 저장한 파일은 영문 부분만 같고 한글 부분은 공통 바이트가 하나도 없다. 그러니 읽는 쪽은 반드시 쓴 쪽과 같은 문자 집합을 알고 있어야 한다. 그렇지 않으면 무슨 일이 생기는지가 다음 예제다.</p>
+
+<h3>문자 인코딩 예제 2: 다른 문자 집합으로 읽으면</h3>
+<p>인코딩과 디코딩에 서로 다른 문자 집합을 쓰는 상황을 일부러 만들어 보자. "가나다"를 UTF-8과 EUC-KR로 각각 바이트로 만든 뒤, 여러 문자 집합으로 다시 문자열을 만든다. 결과 문자열의 코드 포인트까지 함께 찍어서, 화면에 보이는 모양이 아니라 실제로 무엇이 들어 있는지 확인한다.</p>
+<pre><code class="language-java">import java.nio.charset.Charset;
+import static java.nio.charset.StandardCharsets.*;
+
+public class Mojibake {
+    static final Charset EUC_KR = Charset.forName("EUC-KR");
+
+    public static void main(String[] args) {
+        byte[] utf8 = "가나다".getBytes(UTF_8);      // EA B0 80 EB 82 98 EB 8B A4
+        byte[] euc = "가나다".getBytes(EUC_KR);      // B0 A1 B3 AA B4 D9
+
+        show("UTF-8 → UTF-8     ", new String(utf8, UTF_8));
+        show("EUC-KR → UTF-8    ", new String(euc, UTF_8));
+        show("UTF-8 → EUC-KR    ", new String(utf8, EUC_KR));
+        show("EUC-KR → ISO-8859-1", new String(euc, ISO_8859_1));
+        show("UTF-8 → ISO-8859-1", new String(utf8, ISO_8859_1));
+        show("ASCII만 → UTF-8    ", new String("Hello".getBytes(EUC_KR), UTF_8));
+    }
+
+    static void show(String label, String s) {
+        StringBuilder cps = new StringBuilder();
+        s.codePoints().forEach(cp -> cps.append(String.format(" U+%04X", cp)));
+        System.out.println(label + " : " + s + "  (" + s.length() + "자," + cps + ")");
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">UTF-8 → UTF-8      : 가나다  (3자, U+AC00 U+B098 U+B2E4)
+EUC-KR → UTF-8     : ������  (6자, U+FFFD U+FFFD U+FFFD U+FFFD U+FFFD U+FFFD)
+UTF-8 → EUC-KR     : 媛�����  (6자, U+5A9B U+FFFD U+FFFD U+FFFD U+FFFD U+FFFD)
+EUC-KR → ISO-8859-1 : °¡³ª´Ù  (6자, U+00B0 U+00A1 U+00B3 U+00AA U+00B4 U+00D9)
+UTF-8 → ISO-8859-1 : ê°ëë¤  (9자, U+00EA U+00B0 U+0080 U+00EB U+0082 U+0098 U+00EB U+008B U+00A4)
+ASCII만 → UTF-8     : Hello  (5자, U+0048 U+0065 U+006C U+006C U+006F)</code></pre>
+<p>줄마다 디코더가 바이트를 어떻게 읽었는지 따라가 보자.</p>
+<p><b>EUC-KR 바이트를 UTF-8로 읽기.</b> 첫 바이트 <code>B0</code>은 이진수로 <code>1011 0000</code>, 즉 <code>10</code>으로 시작하는 이어지는 바이트다. 첫 바이트 없이 이어지는 바이트가 나왔으므로 잘못된 입력이다. 디코더는 이 자리를 대체 문자 U+FFFD(REPLACEMENT CHARACTER, 화면에는 보통 물음표가 든 마름모로 보인다)로 바꾸고 다음 바이트로 넘어간다. 둘째 바이트 <code>A1</code>도, 나머지도 모두 <code>10</code>으로 시작하므로 여섯 바이트가 모두 U+FFFD가 되었다. <code>new String(byte[], Charset)</code>의 Javadoc은 이 생성자가 잘못된 입력과 매핑할 수 없는 문자를 항상 문자 집합의 기본 대체 문자열로 바꾼다고 명시하며, 디코더의 기본 대체 문자열이 바로 U+FFFD 한 글자다.</p>
+<p><b>UTF-8 바이트를 EUC-KR로 읽기.</b> 첫 두 바이트 <code>EA B0</code>은 둘 다 0xA1~0xFE 범위에 있어서 EUC-KR 규칙에 맞는 한 쌍이다. KS X 1001 표에서 그 자리에 있는 글자는 한자 "媛"(U+5A9B)이다. UTF-8 한글이 EUC-KR이나 CP949로 읽힐 때 엉뚱한 한자가 섞여 나오는 이유가 이것이다. 셋째 바이트 <code>80</code>은 EUC-KR에서 유효한 첫 바이트가 아니므로 U+FFFD가 되었고, 그 뒤의 바이트들도 규칙에 맞는 쌍을 이루지 못해 대체 문자로 바뀌었다. 같은 바이트를 MS949로 읽으면 확장 영역 덕분에 일부 바이트 쌍이 또 다른 한글로 읽혀 결과가 달라진다. 깨진 모양은 원래 인코딩과 잘못 고른 인코딩의 조합마다 다르므로, 깨진 모양을 보고 어떤 조합인지 거꾸로 추정할 수도 있다.</p>
+<p><b>ISO-8859-1로 읽기.</b> ISO-8859-1 디코더는 오류를 내지 않는다. 앞에서 본 대로 모든 바이트 값 n을 U+00nn에 일대일로 대응시키기 때문이다. EUC-KR 바이트 <code>B0 A1</code>은 <code>°¡</code>가 되고, 9바이트짜리 UTF-8은 9글자가 된다. 글자 수가 바이트 수와 같다는 점에 주목하자. 출력에는 <code>ê°ëë¤</code>처럼 다섯 글자만 보이지만 U+0080, U+0082, U+0098, U+008B는 화면에 찍히지 않는 C1 제어 문자라서 보이지 않을 뿐, 문자열 안에는 9글자가 다 들어 있다.</p>
+<p><b>ASCII만 있을 때.</b> "Hello"는 EUC-KR로 인코딩해 UTF-8로 읽어도 멀쩡하다. 두 체계가 ASCII 범위에서 같은 바이트를 쓰기 때문이다. 인코딩 설정이 잘못된 시스템이 영문 데이터로 하는 테스트를 모두 통과하는 이유다.</p>
+<x-visual id="java-adv2-01-mojibake" title="같은 바이트를 서로 다른 디코더로 읽은 결과" kind="비교 다이어그램" ratio="16:9">
+<x-hint>하나의 UTF-8 바이트열이 세 디코더를 거쳐 서로 다른 문자열이 되는 모습을 보여 준다.</x-hint>
+<x-prompt>A comparison diagram on a white background. At the top center, a horizontal strip of nine byte boxes labeled in monospace: "EA B0 80 EB 82 98 EB 8B A4", with a title above it: "UTF-8로 저장된 가나다". Three arrows go down from the strip to three result panels arranged left to right. Left arrow labeled "UTF-8 디코더", panel shows large text "가나다" with a green check. Middle arrow labeled "EUC-KR 디코더", panel shows "媛" followed by several diamond-question-mark replacement symbols, with a red cross and small note "U+FFFD: 정보 손실". Right arrow labeled "ISO-8859-1 디코더", panel shows "ê°ëë¤" with a yellow warning sign and small note "바이트 1개 = 문자 1개". Flat vector style, monospace font for bytes.</x-prompt>
+<x-caption>바이트는 그대로인데 디코더가 바뀌면 문자열이 달라진다. 대체 문자(U+FFFD)가 들어간 결과는 원래 바이트로 되돌릴 수 없다.</x-caption>
+</x-visual>
+<h4>깨진 문자열을 되돌릴 수 있는가</h4>
+<p>잘못 읽은 문자열을 같은 잘못된 문자 집합으로 다시 인코딩하면 원래 바이트가 나올까? 답은 잘못 고른 문자 집합이 무엇이었느냐에 따라 갈린다.</p>
+<pre><code class="language-java">import java.nio.charset.Charset;
+import java.util.HexFormat;
+import static java.nio.charset.StandardCharsets.*;
+
+public class Recover {
+    public static void main(String[] args) {
+        HexFormat hex = HexFormat.ofDelimiter(" ").withUpperCase();
+        byte[] original = "가나다".getBytes(UTF_8);
+
+        // 1) ISO-8859-1로 잘못 읽은 경우
+        String wrong1 = new String(original, ISO_8859_1);
+        byte[] back1 = wrong1.getBytes(ISO_8859_1);
+        System.out.println(hex.formatHex(back1) + " -> " + new String(back1, UTF_8));
+
+        // 2) EUC-KR로 잘못 읽은 경우
+        Charset eucKr = Charset.forName("EUC-KR");
+        String wrong2 = new String(original, eucKr);
+        byte[] back2 = wrong2.getBytes(eucKr);
+        System.out.println(hex.formatHex(back2) + " -> " + new String(back2, UTF_8));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">EA B0 80 EB 82 98 EB 8B A4 -> 가나다
+EA B0 3F 3F 3F 3F 3F -> �?????</code></pre>
+<p>ISO-8859-1로 잘못 읽은 경우는 완전히 복구된다. 디코딩에서 바이트 n이 문자 U+00nn이 되었고, 인코딩에서 U+00nn이 다시 바이트 n이 되므로 9바이트가 그대로 돌아온다. 정보가 한 비트도 사라지지 않았다. EUC-KR로 잘못 읽은 경우는 복구되지 않는다. "媛"은 다시 <code>EA B0</code>이 되지만, U+FFFD는 EUC-KR에 없는 문자라서 인코딩할 때 <code>3F</code>가 되었다. 원래 바이트가 <code>80</code>이었는지 <code>EB</code>였는지는 U+FFFD로 바뀌는 순간 사라졌고, 바이트 수도 9개에서 7개로 줄었다. 대체 문자로의 치환은 되돌릴 수 없는 손실이다. 그래서 "깨진 글자를 복구한다"는 처방은 ISO-8859-1처럼 모든 바이트를 손실 없이 문자로 바꾸는 문자 집합으로 잘못 읽은 경우에만 통한다. 그 밖의 경우에는 원본 바이트를 다시 받아 올바른 문자 집합으로 읽는 수밖에 없다.</p>
+<h4>바이트 단위로 자르면 글자가 잘린다</h4>
+<p>인코딩이 맞아도 글자가 깨지는 경우가 있다. UTF-8 바이트 배열을 글자 경계가 아닌 곳에서 자르는 경우다. 예를 들어 "가나다"의 UTF-8 9바이트 가운데 앞 4바이트만 디코딩하면 어떻게 될까.</p>
+<pre><code class="language-java">byte[] utf8 = "가나다".getBytes(UTF_8);                  // EA B0 80 | EB 82 98 | EB 8B A4
+String cut = new String(Arrays.copyOf(utf8, 4), UTF_8);  // EA B0 80 | EB
+System.out.println(cut.length());                        // 2: "가"와 U+FFFD</code></pre>
+<p>앞 3바이트는 "가"로 디코딩되고, 남은 <code>EB</code>는 3바이트 글자의 첫 바이트인데 뒤가 없으므로 U+FFFD가 된다. 5바이트에서 잘라도 결과는 "가"와 U+FFFD 하나다. 고정 크기 버퍼로 네트워크 데이터를 받으면서 버퍼마다 따로 <code>new String</code>을 만들면, 버퍼 경계에 걸친 한글이 이렇게 깨진다. 이 문제를 스트림 수준에서 어떻게 해결하는지는 다음 회차들에서 문자 스트림을 다룰 때 이어진다. 앞서 본 <code>substring</code> 문제와 원리는 같다. 바이트 단위든 코드 유닛 단위든, 자르는 단위가 글자 경계와 맞지 않으면 글자가 깨진다.</p>
+<h4>조용한 대체 대신 오류를 원할 때</h4>
+<p><code>getBytes</code>와 <code>new String</code>이 항상 대체 문자로 바꾸는 것은 편리하지만, 데이터 손실을 조용히 숨긴다. 손실을 오류로 드러내고 싶다면 <code>CharsetDecoder</code>와 <code>CharsetEncoder</code>를 직접 만들어 쓴다. 이들의 기본 오류 동작은 <code>CodingErrorAction.REPORT</code>, 즉 예외를 던지는 것이다.</p>
+<pre><code class="language-java">import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.*;
+import static java.nio.charset.StandardCharsets.*;
+
+public class Strict {
+    public static void main(String[] args) throws CharacterCodingException {
+        byte[] eucBytes = "가".getBytes(Charset.forName("EUC-KR"));   // B0 A1
+
+        // 1) String 생성자: 항상 대체 문자로 바꾼다
+        System.out.println(new String(eucBytes, UTF_8).codePoints().count());
+
+        // 2) 디코더를 직접 만들면 기본 동작이 REPORT다
+        try {
+            UTF_8.newDecoder().decode(ByteBuffer.wrap(eucBytes));
+        } catch (MalformedInputException e) {
+            System.out.println(e + " / 길이 " + e.getInputLength());
+        }
+
+        // 3) 인코더도 마찬가지다
+        try {
+            Charset.forName("EUC-KR").newEncoder().encode(CharBuffer.wrap("A똠"));
+        } catch (UnmappableCharacterException e) {
+            System.out.println(e);
+        }
+
+        // 4) 동작을 명시적으로 바꿀 수도 있다
+        CharBuffer replaced = UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPLACE)
+                .replaceWith("?")
+                .decode(ByteBuffer.wrap(eucBytes));
+        System.out.println(replaced);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">2
+java.nio.charset.MalformedInputException: Input length = 1 / 길이 1
+java.nio.charset.UnmappableCharacterException: Input length = 1
+??</code></pre>
+<p>첫 줄은 <code>B0 A1</code>이 U+FFFD 두 개로 바뀌었다는 뜻이다. 둘째 줄에서 같은 바이트를 직접 만든 디코더에 넣자 <code>MalformedInputException</code>이 났다. <code>Input length = 1</code>은 잘못된 입력의 길이가 1바이트라는 뜻이다(첫 바이트 <code>B0</code>에서 바로 막혔다). 셋째 줄은 인코딩 쪽 오류인 <code>UnmappableCharacterException</code>이다. "똠"이 EUC-KR에 없기 때문이다. 두 예외는 모두 검사 예외 <code>CharacterCodingException</code>의 하위 클래스다. 넷째 줄처럼 <code>onMalformedInput</code>과 <code>replaceWith</code>로 오류 동작과 대체 문자열을 바꿀 수도 있다. 외부에서 들어오는 데이터가 정말 UTF-8인지 검증해야 하는 경계(파일 업로드, 외부 API 응답)에서는 이렇게 REPORT 동작으로 디코딩해 문제를 일찍 드러내는 편이 안전하다.</p>
+
+<h3>디코더 안쪽: 잘못된 바이트는 U+FFFD 몇 개가 되는가</h3>
+<p>예제 2의 결과에는 설명하지 않고 넘어간 숫자가 있다. EUC-KR 바이트 6개를 UTF-8로 읽었을 때는 U+FFFD가 6개 나왔는데, UTF-8 바이트 9개를 EUC-KR로 읽었을 때는 "媛" 뒤에 남은 7바이트가 U+FFFD 5개가 되었다. 잘못된 바이트 하나가 대체 문자 하나가 되는 것이 아니다. 몇 바이트를 묶어 대체 문자 하나로 바꿀지는 디코더가 정한다. <code>CharsetDecoder</code>의 계약으로 보면, 디코더는 오류를 만날 때마다 "잘못된 입력, 길이 n"(<code>CoderResult.malformedForLength(n)</code>)이나 "매핑할 수 없는 문자, 길이 n"(<code>CoderResult.unmappableForLength(n)</code>)을 보고하고, REPLACE 동작이면 그 n바이트를 대체 문자열 하나로 바꾼 뒤 n바이트 뒤에서 디코딩을 이어 간다. 앞 절의 <code>MalformedInputException: Input length = 1</code>에 찍힌 길이가 이 n이다. 그러니 U+FFFD의 개수를 이해하려면 디코더가 n을 어떻게 고르는지를 봐야 한다.</p>
+<h4>EUC-KR 디코더: 표 두 장과 "둘째 바이트를 돌려줄까"의 판단</h4>
+<p>JDK 21의 EUC-KR 디코더(<code>DoubleByte.Decoder</code>)는 표 두 장으로 동작한다. <code>b2cSB</code>는 256칸짜리 1바이트 표로, 0x00~0x7F 칸에는 ASCII 문자가, 0x80~0xFF 칸에는 "1바이트 글자가 아님"을 뜻하는 표시값 <code>UNMAPPABLE_DECODING</code>이 들어 있다(<code>CharsetMapping</code> 소스에서 이 값은 <code>'�'</code>다). <code>b2c</code>는 첫 바이트로 행을, 둘째 바이트에서 0xA1을 뺀 값으로 열을 찾는 2차원 표다. 첫 바이트가 될 수 없는 값의 행에는 전체가 표시값으로 채워진 공용 배열 <code>B2C_UNMAPPABLE</code>이 들어 있어서, "이 바이트가 첫 바이트가 될 수 있는가"는 <code>b2c[b1] == B2C_UNMAPPABLE</code>이라는 참조 비교 한 번으로 판단된다. 디코딩 루프는 첫 바이트로 <code>b2cSB</code>를 보고, 표시값이 나오면 둘째 바이트까지 읽어 <code>b2c[b1][b2 - 0xA1]</code>을 본다. 글자 하나에 배열 접근 두 번이면 끝나는 순수한 표 조회다.</p>
+<p>표 조회가 실패했을 때 n을 고르는 것이 <code>crMalformedOrUnmappable(b1, b2)</code> 메서드다. 다음 셋 가운데 하나라도 참이면 "잘못된 입력, 길이 1"을, 모두 거짓이면 "매핑할 수 없음, 길이 2"를 돌려준다.</p>
+<ul>
+<li>첫 바이트가 첫 바이트가 될 수 없는 값이다(<code>b2c[b1]</code>이 <code>B2C_UNMAPPABLE</code>이다).</li>
+<li>둘째 바이트가 그 자체로 첫 바이트가 될 수 있는 값이다.</li>
+<li>둘째 바이트가 그 자체로 1바이트 글자(ASCII)다.</li>
+</ul>
+<p>길이 1을 보고하면 둘째 바이트는 소비되지 않고 다음 글자의 시작으로 다시 검사된다. 즉 둘째 바이트가 새 글자의 시작일 가능성이 있으면 돌려주고, 어떤 글자의 시작도 될 수 없을 때만 첫 바이트와 함께 삼킨다. 그래서 EUC-KR로 <code>B0 41</code>을 읽으면 U+FFFD 뒤에 "A"가 살아남고, <code>B0 82 41</code>은 <code>B0 82</code>가 대체 문자 하나로 묶인 뒤 "A"가 남는다. 앞에서 본 "0x80 미만 바이트는 언제나 ASCII"라는 EUC-KR의 성질을 오류 처리에서도 지키는 셈이다. 이 규칙으로 "가나다"의 UTF-8 바이트를 따라가면 예제 2의 결과가 정확히 나온다.</p>
+<div class="table-wrap"><table><thead><tr><th>위치의 바이트</th><th>디코더의 판단</th><th>결과</th></tr></thead><tbody>
+<tr><td>EA B0</td><td>EA는 첫 바이트가 될 수 있고 B0은 A1~FE 범위다. 표 칸에 글자가 있다</td><td>媛(U+5A9B), 2바이트 소비</td></tr>
+<tr><td>80 (다음 EB)</td><td>0x80은 첫 바이트가 될 수 없다 → 잘못된 입력, 길이 1. EB는 돌려준다</td><td>U+FFFD, 1바이트 소비</td></tr>
+<tr><td>EB 82</td><td>EB는 첫 바이트가 될 수 있지만 82는 A1 미만이고, 82는 첫 바이트도 ASCII도 아니다 → 매핑할 수 없음, 길이 2</td><td>U+FFFD, 2바이트 소비</td></tr>
+<tr><td>98 (다음 EB)</td><td>0x98은 첫 바이트가 될 수 없다 → 길이 1</td><td>U+FFFD, 1바이트 소비</td></tr>
+<tr><td>EB 8B</td><td>EB 82와 같은 경우 → 길이 2</td><td>U+FFFD, 2바이트 소비</td></tr>
+<tr><td>A4</td><td>첫 바이트 후보인데 뒤에 바이트가 없다</td><td>U+FFFD</td></tr>
+</tbody></table></div>
+<p>바이트를 앞에서부터 하나씩 늘려 가며 디코딩하면 이 추적을 확인할 수 있다. 출력에서는 U+FFFD를 <code>R</code>로 바꿔 찍었다.</p>
+<pre><code class="language-java">import java.nio.charset.Charset;
+import java.util.HexFormat;
+import static java.nio.charset.StandardCharsets.UTF_8;
+
+public class Trace {
+    public static void main(String[] args) {
+        HexFormat hex = HexFormat.ofDelimiter(" ").withUpperCase();
+        Charset eucKr = Charset.forName("EUC-KR");
+        byte[] b = "가나다".getBytes(UTF_8);                      // EA B0 80 EB 82 98 EB 8B A4
+        for (int n = 2; n <= b.length; n++) {                    // 앞에서부터 n바이트만 디코딩
+            String s = new String(b, 0, n, eucKr);
+            System.out.printf("%-26s -> %s%n", hex.formatHex(b, 0, n), s.replace('�', 'R'));
+        }
+        for (String in : new String[]{"B0 41", "B0 82 41"}) {
+            System.out.println(in + " -> " + new String(hex.parseHex(in), eucKr).replace('�', 'R'));
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">EA B0                      -> 媛
+EA B0 80                   -> 媛R
+EA B0 80 EB                -> 媛RR
+EA B0 80 EB 82             -> 媛RR
+EA B0 80 EB 82 98          -> 媛RRR
+EA B0 80 EB 82 98 EB       -> 媛RRRR
+EA B0 80 EB 82 98 EB 8B    -> 媛RRRR
+EA B0 80 EB 82 98 EB 8B A4 -> 媛RRRRR
+B0 41 -> RA
+B0 82 41 -> RA</code></pre>
+<p>바이트를 하나 더했는데 R이 늘지 않는 줄이 두 번 있다. 끝에 홀로 남은 <code>EB</code>가 R 하나였다가, <code>82</code>가 붙자 <code>EB 82</code>가 한 덩어리로 R 하나가 되었기 때문이다. 대체 문자의 개수가 바이트 수가 아니라 디코더가 보고한 오류 단위의 개수라는 것이 이렇게 보인다.</p>
+<h4>UTF-8 디코더: 최대 부분열 규칙과 JDK의 선택</h4>
+<p>UTF-8에는 유니코드 표준이 제시하는 기준이 있다. 유니코드 표준 3.9.3절의 표 3-7(Well-Formed UTF-8 Byte Sequences)은 올바른 UTF-8을 바이트 범위로 정의하는데, 앞에서 본 비트 틀보다 엄격하다. 첫 바이트가 E0이면 둘째 바이트는 A0~BF만(그보다 작으면 과잉 표현이다), ED이면 80~9F만(그보다 크면 서로게이트를 적은 것이다), F0이면 90~BF만, F4이면 80~8F만 허용된다. 3.9.6절(U+FFFD Substitution of Maximal Subparts)은 이 표를 바탕으로 대체 문자를 넣는 방법을 설명한다. 변환할 수 없는 위치에서 시작해 "올바른 바이트열의 앞부분이 되는 가장 긴 부분열", 그런 것이 없으면 1바이트를 최대 부분열(maximal subpart)이라 하고, 그것을 U+FFFD 하나로 바꾼 뒤 바로 다음 위치에서 변환을 계속한다. 다만 표준은 이 방법을 적합성(conformance)의 요구 사항으로 두지 않는다고 명시한다. 요구되는 것은 잘못된 바이트열을 오류로 다루고 문자로 해석하지 않는 것(적합성 조항 C10)이고, 대체 문자를 몇 개 넣을지는 구현이 고를 수 있다.</p>
+<p>JDK 21의 <code>new String(bytes, UTF_8)</code>은 <code>CharsetDecoder</code>를 거치지 않고 <code>String</code> 클래스 안의 <code>decodeUTF8_UTF16</code> 메서드로 디코딩한다(이 지름길은 다음 절에서 본다). 이 메서드는 첫 바이트를 부호 있는 <code>int</code>로 받아 산술 시프트로 분류한다. <code>(b1 >> 5) == -2</code>는 비트 패턴 <code>110xxxxx</code>를, <code>(b1 >> 4) == -2</code>는 <code>1110xxxx</code>를, <code>(b1 >> 3) == -2</code>는 <code>11110xxx</code>를 뜻한다. 맨 앞 비트가 1인 <code>byte</code>는 음수로 넓혀지므로 오른쪽 시프트 결과도 음수로 남는다는 점을 이용한 것이다. 2바이트 조건에는 <code>(b1 & 0x1e) != 0</code>이 덧붙어 있는데, 이것이 C0과 C1을 걸러 내는 검사다. C0(1100 0000)과 C1(1100 0001)은 x 자리의 상위 4비트가 모두 0이라서 7비트 값의 과잉 표현밖에 만들 수 없다. 3바이트 틀에서는 <code>isMalformed3</code>가 "E0 뒤에 80~9F"를 과잉 표현으로 거른다. 이 구현에 여러 입력을 넣어 표준의 예제와 비교해 보자.</p>
+<pre><code class="language-java">import java.nio.ByteBuffer;
+import java.nio.charset.CodingErrorAction;
+import java.util.HexFormat;
+import static java.nio.charset.StandardCharsets.UTF_8;
+
+public class Replace {
+    public static void main(String[] args) throws Exception {
+        HexFormat hex = HexFormat.ofDelimiter(" ").withUpperCase();
+        String[] inputs = {
+            "C0 80", "E0 80 80", "F0 9F 98", "F0 9F 98 41",
+            "C0 AF E0 80 BF F0 81 82 41",      // 유니코드 표준 표 3-8의 예
+            "ED A0 80 ED BF BF ED AF 41"       // 유니코드 표준 표 3-9의 예
+        };
+        for (String in : inputs) {
+            byte[] b = hex.parseHex(in);
+            String viaString = new String(b, UTF_8);                       // String 안의 전용 디코딩
+            String viaDecoder = UTF_8.newDecoder()                         // sun.nio.cs.UTF_8
+                    .onMalformedInput(CodingErrorAction.REPLACE)
+                    .decode(ByteBuffer.wrap(b)).toString();
+            System.out.printf("%-27s %-22s %s%n", in, show(viaString), viaString.equals(viaDecoder));
+        }
+    }
+
+    static String show(String s) {                                         // U+FFFD는 R로 표시
+        StringBuilder sb = new StringBuilder();
+        s.codePoints().forEach(cp -> sb.append(cp == 0xFFFD ? "R" : Character.toString(cp)).append(' '));
+        return sb.toString().trim();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">C0 80                       R R                    true
+E0 80 80                    R R R                  true
+F0 9F 98                    R                      true
+F0 9F 98 41                 R A                    true
+C0 AF E0 80 BF F0 81 82 41  R R R R R R R R A      true
+ED A0 80 ED BF BF ED AF 41  R R R A                true</code></pre>
+<p>앞의 다섯 줄은 최대 부분열 방식과 같은 결과다. <code>C0 80</code>과 <code>E0 80 80</code>은 어느 위치에서도 올바른 바이트열의 앞부분이 시작되지 않으므로 바이트마다 U+FFFD가 되었다. 잘린 <code>F0 9F 98</code>은 4바이트 글자의 올바른 앞부분이므로 U+FFFD 하나로 묶였고, 뒤에 "A"가 오면 "A"는 살아남는다. 표준의 표 3-8 예제도 표준이 보여 주는 그대로 U+FFFD 8개와 "A"가 나왔다. 차이는 마지막 줄의 서로게이트에서 난다. 표준의 표 3-9는 <code>ED A0 80 ED BF BF ED AF 41</code>이 U+FFFD 8개와 "A"가 된다고 보여 준다. ED 뒤에 허용 범위(80~9F) 밖의 A0이 왔으니 ED 하나가 최대 부분열이고, 이후 바이트도 하나씩 대체되기 때문이다. JDK 21은 3개를 만들었다. 소스를 보면 이유가 분명하다. <code>decodeUTF8_UTF16</code>은 세 바이트를 일단 비트 틀대로 조립한 뒤, 결과가 <code>Character.isSurrogate</code>이면 세 바이트 전체를 U+FFFD 하나로 바꾼다. <code>CharsetDecoder</code> 쪽 구현인 <code>sun.nio.cs.UTF_8</code>도 같은 경우에 길이 3의 잘못된 입력을 보고하고, 위 실험의 마지막 열처럼 두 경로의 결과는 모든 입력에서 같았다.</p>
+<p>실무적인 결론은 이렇다. U+FFFD의 개수는 표준이 정하지 않으며 디코더 구현마다 다를 수 있다. 그러니 깨진 데이터를 서로 다른 시스템에서 디코딩한 문자열끼리 비교하거나, U+FFFD 개수로 원래 바이트 수를 거꾸로 추정하는 일은 믿을 수 없다. 대체 문자의 개수는 원래 바이트에 대한 정보가 아니라 디코더 구현에 대한 정보다. 손상 여부와 위치를 정확히 알아야 한다면 앞 절처럼 REPORT 동작으로 오류를 받는 쪽이 확실하다.</p>
+
+<h3>String 생성자의 지름길: 표준 문자 집합은 디코더 객체를 만들지 않는다</h3>
+<p>앞 절에서 <code>new String(bytes, UTF_8)</code>이 <code>CharsetDecoder</code>가 아니라 <code>String</code> 안의 메서드로 디코딩한다고 했다. JDK 21에서 바이트 배열과 <code>Charset</code>을 받는 공개 생성자들은 결국 비공개 생성자 <code>String(Charset, byte[], int, int)</code>를 부르는데, 이 생성자의 첫머리는 문자 집합의 동일성 비교다. <code>charset == UTF_8.INSTANCE</code>, <code>ISO_8859_1.INSTANCE</code>, <code>US_ASCII.INSTANCE</code>이면 각자의 전용 코드로 처리하고, 그 밖의 문자 집합일 때만 <code>charset.newDecoder()</code>로 디코더 객체를 만든다. 가장 자주 쓰이는 세 문자 집합에 대해서는 디코더 객체 생성, <code>ByteBuffer</code>와 <code>CharBuffer</code> 포장, 중간 <code>char[]</code> 배열을 모두 건너뛰는 셈이다. 인코딩 쪽(<code>getBytes</code>가 부르는 <code>encode</code>)도 같은 세 문자 집합을 먼저 비교해 전용 메서드로 보낸다.</p>
+<p>UTF-8 디코딩 경로는 컴팩트 스트링과 맞물려 있다. 소스의 순서대로 적으면 다음과 같다.</p>
+<figure class="flow-figure"><figcaption>JDK 21 String 생성자의 UTF-8 경로 (컴팩트 스트링이 켜진 경우)</figcaption><ol class="flow">
+<li><strong>양수 바이트 세기</strong><span>StringCoding.countPositives로 앞에서부터 0x80 미만 바이트가 몇 개 이어지는지 센다. 전부라면(순수 ASCII) 디코딩할 것이 없으므로 배열을 복사해 그대로 LATIN1 문자열의 내부 배열로 쓴다.</span></li>
+<li><strong>Latin-1로 시도</strong><span>아니라면 입력의 사본 위에서 계속 디코딩하되, ASCII 바이트와 C2·C3으로 시작하는 2바이트 열(U+0080~U+00FF)만 만나는 동안은 ASCII는 그대로, 2바이트 열은 1바이트로 줄여 같은 배열에 덮어쓴다. 끝까지 가면 결과는 LATIN1이다. "café"가 이 경로로 만들어진다.</span></li>
+<li><strong>UTF-16으로 전환</strong><span>그 밖의 바이트(한글의 EA 같은)를 만나면 지금까지 만든 Latin-1 부분을 글자당 2바이트로 늘려(inflate) UTF-16 배열에 옮기고, 나머지를 decodeUTF8_UTF16으로 디코딩한다. 결과 길이가 처음 잡은 크기보다 작으면 마지막에 잘라 낸다.</span></li>
+</ol></figure>
+<p>ISO-8859-1 경로는 더 단순하다. 컴팩트 스트링이 켜져 있으면 <code>Arrays.copyOfRange</code> 한 줄로 끝난다. 바이트 n이 U+00nn이고 LATIN1 문자열의 내부 표현이 "글자당 1바이트, 값은 코드 포인트"이므로, ISO-8859-1 바이트 배열은 그 자체로 이미 LATIN1 문자열의 내부 배열이다. ISO-8859-1 디코딩은 실패하지도 정보를 잃지도 않는다는 앞의 이야기가 구현에서는 "복사밖에 하지 않는다"로 나타난다. 반대 방향도 비슷해서, <code>getBytes(UTF_8)</code>은 문자열이 LATIN1이고 음수 바이트가 없으면 내부 배열을 <code>clone()</code>해 돌려준다. 그 밖의 문자 집합 가운데 EUC-KR처럼 디코더가 <code>ArrayDecoder</code> 인터페이스를 구현한 경우에도 지름길이 하나 있다. ASCII 호환 문자 집합이고 입력에 음수 바이트가 하나도 없으면 역시 복사만 한다. 영문만 있는 데이터는 어느 ASCII 호환 문자 집합으로 읽어도 결과가 같다는 사실을 구현이 그대로 이용하는 것이다. 음수 바이트가 있으면 앞 절에서 본 표 조회 루프(<code>ArrayDecoder.decode</code>)로 <code>char[]</code>를 채운 뒤, <code>StringUTF16.compress</code>로 LATIN1로 줄일 수 있는지 보고 <code>coder</code>를 정한다.</p>
+<h4>countPositives와 HotSpot 인트린식</h4>
+<p>복사 한 줄로 끝나는 ISO-8859-1을 빼면, 이 지름길들의 입구에는 모두 <code>StringCoding.countPositives</code>(또는 이를 감싼 <code>hasNegatives</code>)가 있다. 자바 코드는 바이트를 하나씩 보며 음수를 찾는 단순한 반복문이지만, 메서드에 <code>@IntrinsicCandidate</code>가 붙어 있다. HotSpot이 이 메서드 호출을 바이트코드 대신 직접 만든 기계어로 바꿔 넣을 수 있다는 표시다. HotSpot 소스(jdk21u)에서 <code>vmIntrinsics.hpp</code>는 <code>_countPositives</code>를 <code>java.lang.StringCoding</code>의 <code>countPositives</code>, 시그니처 <code>([BII)I</code>로 등록하고, C2 컴파일러의 <code>LibraryCallKit::inline_countPositives</code>(<code>library_call.cpp</code>)는 이 호출을 <code>CountPositivesNode</code>라는 전용 노드로 바꾼다. 이 노드가 어떤 명령어가 되는지는 CPU마다 다르다. 이 실험을 돌린 arm64에서는 <code>MacroAssembler::count_positives</code>(<code>macroAssembler_aarch64.cpp</code>)가 코드를 내보낸다. 이 코드는 8바이트를 한 번에 64비트 레지스터로 읽어 <code>0x8080808080808080</code>과 비트 검사(<code>tst</code>)를 해서, 여덟 바이트 가운데 맨 앞 비트가 켜진 것이 있는지를 명령어 하나로 확인한다. 길이가 32바이트 이상이면 미리 생성해 둔 스텁 루틴(<code>count_positives_long</code>)으로 넘어가고, 배열 시작 주소가 메모리 페이지 끝에서 32바이트 안쪽이라 8바이트씩 읽다가 다음 페이지를 건드릴 수 있는 경우에도 스텁으로 간다.</p>
+<p>그래서 <code>countPositives</code>의 <code>@implSpec</code>은 묘하게 느슨하다. 음수 바이트가 없으면 반드시 길이를 돌려줘야 하지만, 음수 바이트가 있으면 "첫 음수 바이트의 인덱스 이하"의 값을 돌려주면 된다고 적혀 있다. 묶음 단위로 검사하는 기계어는 음수가 든 묶음을 찾을 뿐 그 안의 정확한 위치를 따지지 않아도 되게 하려는 것이다. 실제로 위의 짧은 배열용 arm64 코드는 음수가 발견된 8바이트 묶음의 시작 위치를 결과로 계산한다. String 생성자가 이 결과를 "여기까지는 확실히 ASCII"라는 하한으로만 쓰고, 그 뒤부터는 바이트 단위 루프로 다시 확인하는 이유다. 인트린식이 실제로 쓰이는지는 C2의 진단 옵션 <code>PrintIntrinsics</code>(<code>c2_globals.hpp</code>에 정의되어 있다)로 볼 수 있다.</p>
+<pre><code class="language-java">import static java.nio.charset.StandardCharsets.UTF_8;
+
+public class Hot {
+    public static void main(String[] args) {
+        byte[] ascii = "Hello, encoding world! 0123456789".getBytes(UTF_8);
+        long sum = 0;
+        for (int i = 0; i < 200_000; i++) {                 // String 생성자가 C2로 컴파일될 만큼 반복
+            sum += new String(ascii, UTF_8).length();
+        }
+        System.out.println(sum);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (관련 줄만, 시각과 컴파일 번호는 실행마다 다르다)"><code class="language-bash">$ java -XX:+UnlockDiagnosticVMOptions -XX:+PrintIntrinsics -XX:+PrintCompilation Hot
+...
+25   20   !   4       java.lang.String::<init> (880 bytes)
+26   13   !   3       java.lang.String::<init> (880 bytes)   made not entrant
+                              @ 47   java.lang.StringCoding::countPositives (33 bytes)   (intrinsic)
+...
+
+$ javap -c -p java.lang.String    # String(Charset, byte[], int, int) 부분
+      47: invokestatic  #92                 // Method java/lang/StringCoding.countPositives:([BII)I</code></pre>
+<p>첫 줄은 880바이트짜리 String 생성자가 티어 4, 즉 C2로 컴파일되었다는 기록이고, 그 컴파일에서 바이트코드 위치 47의 <code>countPositives</code> 호출이 <code>(intrinsic)</code>으로 처리되었다. <code>javap</code>로 보면 생성자의 47번 명령이 정확히 그 <code>invokestatic</code>이다. 같은 프로그램을 <code>-XX:DisableIntrinsic=_countPositives</code>를 더해 실행하면 이 줄이 사라진다. 이 실험 환경에는 디스어셈블러(hsdis)가 없어서 생성된 기계어를 직접 보여 줄 수는 없고, 위의 명령어 설명은 jdk21u 소스에 근거한 것이다. 이 인트린식이 얼마나 빨라지는지는 입력 길이와 CPU에 따라 다르므로 여기서는 수치를 싣지 않는다. 확실한 것은 구조다. 바이트열이 ASCII인지 확인하는 일은 한 바이트의 맨 앞 비트 하나를 보는 일이고, UTF-8과 ASCII 호환 인코딩의 설계 덕분에 그 검사를 여러 바이트에 한꺼번에 적용할 수 있다.</p>
+
+<h3>한 층 아래: 자바 프로그램 속 "가"가 거치는 네 번의 변환</h3>
+<p>지금까지는 <code>getBytes</code>와 <code>new String</code>으로 우리가 명시적으로 일으킨 변환을 보았다. 그런데 자바 프로그램은 우리가 의식하지 못하는 곳에서도 문자를 변환한다. 소스 코드에 쓴 <code>"가"</code>라는 리터럴 하나가 화면에 찍히기까지 거치는 단계를 JVM 안쪽까지 따라가 보자.</p>
+<figure class="flow-figure"><figcaption>문자열 리터럴 "가"가 화면에 나오기까지</figcaption><ol class="flow">
+<li><strong>소스 파일 → javac</strong><span>편집기가 저장한 바이트를 javac가 -encoding(없으면 기본 문자 집합, JDK 21에서는 UTF-8)으로 디코딩해 문자로 읽는다.</span></li>
+<li><strong>javac → 클래스 파일</strong><span>문자열 상수를 상수 풀의 CONSTANT_Utf8_info에 수정된 UTF-8(modified UTF-8)로 기록한다.</span></li>
+<li><strong>클래스 파일 → 힙의 String</strong><span>JVM이 상수를 읽어 String 객체를 만든다. HotSpot은 내용에 따라 Latin-1 또는 UTF-16 바이트 배열로 저장한다.</span></li>
+<li><strong>String → 표준 출력</strong><span>System.out이 stdout.encoding으로 인코딩해 바이트를 내보내고, 터미널이 자기 설정으로 다시 디코딩해 그린다.</span></li>
+</ol></figure>
+<h4>1단계: javac는 소스를 어떤 인코딩으로 읽는가</h4>
+<p>다음 소스를 EUC-KR로 저장했다고 하자(<code>iconv -f UTF-8 -t EUC-KR</code>로 변환하면 같은 상황을 만들 수 있다). 파일 안에서 "가"는 <code>B0 A1</code> 두 바이트다.</p>
+<pre><code class="language-java">public class Hello {
+    public static void main(String[] args) {
+        String s = "가";
+        System.out.println(s.length() + " " + Integer.toHexString(s.charAt(0)));
+    }
+}</code></pre>
+<pre data-label="EUC-KR로 저장한 소스를 JDK 21에서 컴파일"><code class="language-bash">$ javac Hello.java
+Hello.java:3: error: unmappable character (0xB0) for encoding UTF-8
+        String s = "��";
+                    ^
+Hello.java:3: error: unmappable character (0xA1) for encoding UTF-8
+        String s = "��";
+                     ^
+2 errors
+
+$ javac -encoding EUC-KR Hello.java && java Hello
+1 ac00</code></pre>
+<p>옵션 없이 컴파일하면 javac가 기본 문자 집합인 UTF-8로 소스를 읽다가 <code>B0</code>과 <code>A1</code>에서 오류를 낸다. 앞에서 본 UTF-8 규칙대로 둘 다 첫 바이트 없이 나타난 이어지는 바이트이기 때문이다. <code>-encoding EUC-KR</code>을 주면 javac가 <code>B0 A1</code>을 "가"로 올바르게 읽고, 실행 결과 문자열의 길이는 1, 첫 <code>char</code>는 0xAC00이다. 반대로 UTF-8로 저장한 소스를 <code>-encoding EUC-KR</code>로 컴파일하면 <code>EA B0</code>을 "媛"으로 읽은 뒤 <code>80</code>에서 <code>unmappable character (0x80) for encoding EUC-KR</code> 오류가 난다. JDK 17까지는 기본 문자 집합이 로캘을 따랐기 때문에, 같은 소스가 어떤 PC에서는 컴파일되고 어떤 서버에서는 오류가 나는 일이 생길 수 있었다. 소스 인코딩을 빌드 설정에 명시하는 것이 그래서 중요하다.</p>
+<h4>2단계: 클래스 파일에는 수정된 UTF-8로 기록된다</h4>
+<p>javac가 소스를 읽은 뒤에는 원래 소스의 인코딩이 더 이상 중요하지 않다. 클래스 파일의 문자열 상수는 소스 인코딩과 무관하게 항상 같은 형식으로 기록되기 때문이다. JVMS §4.4.7은 상수 풀의 <code>CONSTANT_Utf8_info</code> 구조가 문자열을 수정된 UTF-8(modified UTF-8)로 담는다고 정한다. 표준 UTF-8과의 차이는 두 가지다. 첫째, 널 문자 U+0000을 1바이트 <code>00</code>이 아니라 2바이트 형식으로 적어서 문자열 안에 0 바이트가 생기지 않게 한다. 둘째, 4바이트 형식을 쓰지 않고, 보충 문자는 UTF-16 서로게이트 두 개를 각각 3바이트로 적어 총 6바이트로 표현한다. 그 결과 JVMS는 이 구조의 바이트 배열에 <code>(byte)0</code>도, 0xF0~0xFF 범위의 바이트도 나타날 수 없다고 명시한다.</p>
+<p>직접 확인해 보자. <code>static final String S = "가\0😀";</code>라는 상수를 가진 클래스를 컴파일하고, 클래스 파일을 16진수로 덤프해서 이 상수가 들어 있는 부분을 찾으면 다음 바이트가 나온다.</p>
+<pre class="diagram">01 | 00 0B | EA B0 80 | C0 80 | ED A0 BD  ED B8 80
+태그  길이 11    "가"       "\0"     상위 서로게이트  하위 서로게이트
+(Utf8)          표준과 같음  2바이트   \uD83D를 3바이트 \uDE00을 3바이트</pre>
+<p>태그 1은 <code>CONSTANT_Utf8</code>을 뜻하고, 이어지는 두 바이트가 길이(11바이트)다. "가"는 표준 UTF-8과 같은 <code>EA B0 80</code>이다. 널 문자는 <code>C0 80</code>으로 적혔다. 표준 UTF-8에서는 금지된 과잉 표현이지만, 수정된 UTF-8은 바로 이 표현을 일부러 쓴다. "😀"는 표준 UTF-8의 <code>F0 9F 98 80</code>이 아니라, 서로게이트 <code>\uD83D</code>와 <code>\uDE00</code>을 각각 3바이트 틀에 넣은 <code>ED A0 BD ED B8 80</code>이 되었다. 표준 UTF-8에서는 서로게이트를 인코딩하는 것이 금지라는 것을 떠올리면, 수정된 UTF-8은 표준 UTF-8 디코더로 읽을 수 없는 형식이라는 것을 알 수 있다. <code>javap -v</code>로 보면 상수 풀에 <code>#8 = Utf8 가</code>처럼 디코딩된 모양으로 표시되므로, 바이트를 보려면 이렇게 덤프해야 한다.</p>
+<p>같은 형식이 <code>java.io.DataOutputStream.writeUTF</code>에도 쓰인다. <code>DataOutput</code> 문서는 이 메서드가 2바이트 길이 뒤에 수정된 UTF-8 바이트를 쓴다고 정의한다.</p>
+<pre><code class="language-java">import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.util.HexFormat;
+import static java.nio.charset.StandardCharsets.UTF_8;
+
+public class WriteUtf {
+    public static void main(String[] args) throws IOException {
+        String s = "가\0😀";
+        HexFormat hex = HexFormat.ofDelimiter(" ").withUpperCase();
+
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        new DataOutputStream(buf).writeUTF(s);
+        System.out.println("writeUTF : " + hex.formatHex(buf.toByteArray()));
+        System.out.println("UTF-8    : " + hex.formatHex(s.getBytes(UTF_8)));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">writeUTF : 00 0B EA B0 80 C0 80 ED A0 BD ED B8 80
+UTF-8    : EA B0 80 00 F0 9F 98 80</code></pre>
+<p><code>writeUTF</code>의 결과는 클래스 파일에서 본 바이트와 길이 필드까지 똑같다. 이름에 UTF가 들어 있다고 해서 <code>writeUTF</code>로 쓴 데이터를 다른 언어의 UTF-8 디코더로 읽을 수 있다고 생각하면 안 된다. 앞에 길이 2바이트가 붙고, 널 문자와 보충 문자의 표현이 다르다. 한글과 영문만 있으면 길이 필드를 빼고는 같아 보이기 때문에 이 차이가 늦게 발견된다. I/O 스트림을 다루는 다음 회차들에서 <code>DataOutputStream</code>을 만나면 이 점을 떠올리자.</p>
+<h4>3단계: 힙의 String은 UTF-16이 아닐 수도 있다</h4>
+<p>JVM이 상수 풀의 문자열로 <code>String</code> 객체를 만들면, 그 내용은 어떤 형태로 힙에 저장될까. 자바 API는 문자열을 UTF-16 코드 유닛의 열로 보여 주지만, 내부 저장 방식은 구현의 몫이다. JDK 21의 <code>String</code> 소스를 보면 내용은 <code>private final byte[] value</code>에, 그 바이트의 인코딩 종류는 <code>private final byte coder</code>에 들어 있고, 소스 주석은 지원하는 값을 <code>LATIN1</code>(0)과 <code>UTF16</code>(1) 두 가지로 적고 있다. Java 9의 JEP 254(Compact Strings)가 도입한 구조로, 모든 문자가 U+00FF 이하이면 한 글자를 1바이트로, 하나라도 넘으면 전체를 글자당 2바이트로 저장한다. 리플렉션으로 내부를 직접 들여다보자(리플렉션 자체는 이 권의 11회차에서 다룬다). <code>java.base</code> 모듈의 비공개 필드에 접근해야 하므로 <code>--add-opens</code> 옵션이 필요하다.</p>
+<pre><code class="language-java">import java.lang.reflect.Field;
+import java.util.HexFormat;
+
+// 실행: java --add-opens java.base/java.lang=ALL-UNNAMED Internals
+public class Internals {
+    public static void main(String[] args) throws Exception {
+        Field value = String.class.getDeclaredField("value");
+        Field coder = String.class.getDeclaredField("coder");
+        value.setAccessible(true);
+        coder.setAccessible(true);
+
+        HexFormat hex = HexFormat.ofDelimiter(" ").withUpperCase();
+        for (String s : new String[]{"ABC", "café", "가나다", "A가"}) {
+            byte[] v = (byte[]) value.get(s);
+            System.out.printf("%-4s length=%d coder=%s value=[%s]%n",
+                    s, s.length(), coder.get(s), hex.formatHex(v));
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (HotSpot, arm64 macOS)"><code class="language-text">ABC  length=3 coder=0 value=[41 42 43]
+café length=4 coder=0 value=[63 61 66 E9]
+가나다  length=3 coder=1 value=[00 AC 98 B0 E4 B2]
+A가   length=2 coder=1 value=[41 00 00 AC]</code></pre>
+<p>"ABC"와 "café"는 coder가 0(LATIN1)이고 글자당 1바이트다. "é"(U+00E9)도 U+00FF 이하이므로 1바이트 <code>E9</code>로 들어갔다. 이 배열은 ISO-8859-1 인코딩 결과와 같다. "가나다"는 coder가 1(UTF16)이고 글자당 2바이트인데, <code>AC 00</code>이 아니라 <code>00 AC</code> 순서로 들어 있다. JDK 21의 <code>StringUTF16</code> 소스는 플랫폼이 빅 엔디언인지 확인하는 네이티브 메서드로 바이트 배치 순서를 정하는데, 이 실험을 돌린 arm64 macOS는 리틀 엔디언이므로 하위 바이트가 먼저 저장되었다. "A가"는 한글 하나 때문에 전체가 UTF16이 되어 "A"도 <code>41 00</code> 2바이트를 차지한다. HotSpot 옵션 <code>-XX:-CompactStrings</code>로 실행하면 이 최적화가 꺼져서 "ABC"도 coder 1, <code>41 00 42 00 43 00</code> 6바이트로 저장되는 것을 같은 프로그램으로 확인할 수 있다.</p>
+<p>이 실험에서 얻을 결론은 두 가지다. 하나는 <b>힙의 문자열은 UTF-8도 EUC-KR도 아니다</b>라는 것이다. 문자열 객체 안에는 디코딩이 끝난 "문자"가 구현이 정한 형식으로 들어 있고, 바깥 세계의 인코딩은 경계를 넘을 때(<code>getBytes</code>, <code>new String</code>, 리더와 라이터)에만 등장한다. 다른 하나는 내부 형식은 구현 세부라는 것이다. 이 구조는 JDK 9 이후 HotSpot의 구현이고, 리플렉션으로 이 필드에 의존하는 코드를 쓰면 안 된다. 여기서는 원리를 보려고 열어 본 것뿐이다. 프로그램이 의존할 수 있는 것은 <code>String</code>이 UTF-16 코드 유닛의 열처럼 동작한다는 API 수준의 약속뿐이다.</p>
+<x-visual id="java-adv2-01-string-journey" title="문자열 리터럴이 소스에서 화면까지 거치는 인코딩 변환" kind="파이프라인 다이어그램" ratio="16:9">
+<x-hint>소스 파일, 클래스 파일, 힙, 터미널의 네 구역에서 "가"가 서로 다른 바이트 형태를 갖고, 구역 사이마다 어떤 설정으로 변환되는지 보여 준다.</x-hint>
+<x-prompt>A horizontal pipeline diagram with four rounded boxes from left to right on a white background. Box 1 titled "소스 파일" shows bytes "EA B0 80" with a small tag "UTF-8로 저장". Box 2 titled "클래스 파일" shows "01 00 03 EA B0 80" with a tag "수정된 UTF-8". Box 3 titled "힙의 String" shows two fields: "coder = 1" and "value = 00 AC". Box 4 titled "터미널" shows the large Korean character "가". Arrows between boxes carry labels: arrow 1→2 labeled "javac -encoding", arrow 2→3 labeled "클래스 로딩", arrow 3→4 labeled "stdout.encoding". Above the whole pipeline, a thin banner reading "바이트에는 이름표가 없다". Flat vector style, monospace font for bytes.</x-prompt>
+<x-caption>같은 "가"가 구역마다 다른 바이트로 존재한다. 구역 사이의 화살표마다 인코딩 설정이 하나씩 끼어 있고, 그중 하나만 어긋나도 글자가 깨진다.</x-caption>
+</x-visual>
+<h4>4단계: 출력할 때 다시 인코딩된다</h4>
+<p>마지막으로 <code>System.out.println("가")</code>는 문자열을 바이트로 바꿔 표준 출력(파일 디스크립터 1)에 쓴다. 자바 21의 <code>System.out</code> 문서는 이때 쓰는 인코딩이 콘솔이 있으면 <code>Console.charset()</code>과 같고, 없으면 <code>stdout.encoding</code>이라고 적는다. JDK 21의 <code>System</code> 초기화 코드는 <code>stdout.encoding</code> 값으로 <code>PrintStream</code>을 만들고, 주석에 이 프로퍼티가 터미널에 연결되었을 때는 <code>Console.charset()</code>과 같고 아니면 <code>native.encoding</code>을 따른다고 설명한다. 환경 구성 절에서 <code>LC_ALL=C</code>로 실행했을 때 "가"가 <code>3F</code>로 나간 것이 이 단계의 실패였다. 기본 문자 집합(UTF-8)과 출력 인코딩(US-ASCII)이 서로 다른 프로퍼티에서 온다는 점이 핵심이다. 그리고 바이트가 터미널에 도착한 뒤에도 한 번 더 변환이 있다. 터미널 프로그램이 받은 바이트를 자기 인코딩 설정으로 디코딩해 글꼴로 그리기 때문이다. 자바가 UTF-8로 바르게 내보내도, 터미널이 다른 인코딩으로 설정되어 있으면 화면은 깨진다. 이 경우 프로그램과 데이터에는 아무 잘못이 없다.</p>
+<p>네 단계를 한 문장으로 줄이면 이렇다. 인코딩은 경계에서만 일어나고, 경계마다 설정이 따로 있다. 글자가 깨졌을 때 할 일은 "어느 경계에서 어떤 두 설정이 어긋났는가"를 찾는 것이다.</p>
+
+<h3>HotSpot 안쪽: ldc 한 번에 상수 풀의 바이트가 String이 되기까지</h3>
+<p>네 단계 가운데 2단계와 3단계 사이, 즉 클래스 파일의 수정된 UTF-8 바이트가 힙의 <code>String</code> 객체가 되는 순간을 HotSpot 소스(jdk21u)로 한 걸음 더 따라가 보자. 클래스를 읽어 들일 때 HotSpot은 상수 풀의 <code>CONSTANT_Utf8</code> 항목을 <code>Symbol</code>이라는 VM 내부 객체로 만든다. <code>symbolTable.cpp</code>를 보면 <code>Symbol</code>은 C 힙(<code>AllocateHeap(..., mtSymbol)</code>)이나 심볼 전용 아레나에 할당되므로 자바 힙의 객체가 아니고, 클래스 파일의 바이트를 수정된 UTF-8 그대로 담는다. 이 시점에는 아직 <code>String</code> 객체가 없다. 문자열 리터럴을 쓰는 코드는 바이트코드에서 <code>ldc</code> 명령이 되는데, HotSpot에서 리터럴의 <code>String</code> 객체가 만들어지는 것은 이 <code>ldc</code>가 처음 실행될 때다. 그 경로는 다음과 같다.</p>
+<figure class="flow-figure"><figcaption>OpenJDK 21 HotSpot에서 문자열 상수가 처음 쓰일 때</figcaption><ol class="flow">
+<li><strong>ConstantPool::string_at_impl</strong><span>이 상수 풀 항목에 대응하는 resolved_references 칸을 본다. 이미 String이 들어 있으면 그것을 돌려주고 끝난다.</span></li>
+<li><strong>Symbol::as_unicode</strong><span>칸이 비어 있으면 StringTable::intern(Symbol*)을 부르고, 그 첫머리에서 Symbol의 수정된 UTF-8 바이트를 16비트 jchar 배열로 푼다. 글자 수는 UTF8::unicode_length가 10xxxxxx 꼴의 이어지는 바이트를 뺀 바이트 수로 센다.</span></li>
+<li><strong>StringTable::intern</strong><span>그 jchar 배열로 문자열 테이블을 찾는다. CDS 아카이브에 공유된 문자열(lookup_shared)을 먼저, 실행 중에 등록된 문자열(do_lookup)을 다음으로 본다.</span></li>
+<li><strong>java_lang_String::create_from_unicode</strong><span>테이블에 없으면 새 String을 만든다. UNICODE::is_latin1로 모든 글자가 U+00FF 이하인지 보고 LATIN1(글자당 1바이트) 또는 UTF16(글자당 2바이트) 배열을 채운 뒤, 테이블에 등록한다.</span></li>
+<li><strong>string_at_put</strong><span>결과를 resolved_references 칸에 넣는다. 같은 ldc가 다시 실행되면 1단계에서 끝난다.</span></li>
+</ol></figure>
+<p>4단계가 앞에서 리플렉션으로 본 <code>coder</code> 값을 리터럴에 대해 정하는 곳이다. "ABC" 리터럴은 여기서 LATIN1이 되고 "가나다" 리터럴은 UTF16이 된다. 수정된 UTF-8이 자바의 <code>Charset</code>이 아니라 VM 안의 전용 함수(<code>utf8.cpp</code>)로만 풀린다는 것도 보인다. 이어지는 바이트만 빼고 세는 단순한 글자 수 계산이 허용되는 것은, <code>utf8.cpp</code>의 주석이 밝히듯 여기 오는 바이트가 이미 클래스 파일 형식 검사(format checker)를 통과한 올바른 형식이기 때문이다. 수정된 UTF-8에서 보충 문자는 서로게이트 두 개를 각각 3바이트로 적으므로, 이 계산으로 나온 수는 코드 포인트 수가 아니라 UTF-16 코드 유닛 수, 즉 나중의 <code>length()</code>와 같다.</p>
+<p>JVMS §5.1은 문자열 상수를 이렇게 파생하라고 정한다. <code>CONSTANT_String_info</code>가 주는 코드 포인트 열과 같은 내용의 <code>String</code>에 대해 이전에 <code>String.intern</code>이 호출된 적이 있으면 그 인스턴스를 쓰고, 아니면 새 인스턴스를 만든 뒤 그것에 <code>intern</code>을 호출한다. 위의 3·4단계가 이 규칙의 구현이다. 그리고 HotSpot은 이 파생을 <code>ldc</code>가 처음 실행되는 순간에 하므로, 실행 순서에 따라 결과가 달라지는 것을 직접 관찰할 수 있다.</p>
+<pre><code class="language-java">public class Lazy {
+    public static void main(String[] args) {
+        String runtime = new String(new char[]{'가', '나', '다', '라'});   // 실행 중에 만든 객체
+        String canonical = runtime.intern();                              // 문자열 테이블에 먼저 등록
+        System.out.println(canonical == runtime);
+        System.out.println("가나다라" == runtime);                         // 이 ldc 는 여기서 처음 실행된다
+
+        String other = new String(new char[]{'마', '바'});
+        System.out.println("마바" == other);                              // 리터럴이 먼저 테이블에 들어간다
+        System.out.println(other.intern() == other);
+    }
+}</code></pre>
+<pre data-label="실행 결과와 javap -c 의 ldc 줄 (OpenJDK 21 HotSpot)"><code class="language-text">true
+true
+false
+false
+
+       9: ldc           #9                  // int 44032
+      14: ldc           #10                 // int 45208
+      19: ldc           #11                 // int 45796
+      24: ldc           #12                 // int 46972
+      55: ldc           #32                 // String 가나다라
+      78: ldc           #34                 // int 47560
+      83: ldc           #35                 // int 48148
+      93: ldc           #36                 // String 마바</code></pre>
+<p>첫 블록에서는 실행 중에 만든 "가나다라" 객체를 먼저 <code>intern</code>했다. 테이블에 같은 내용이 없었으므로 <code>intern</code>은 그 객체 자신을 등록하고 돌려준다(첫 줄 <code>true</code>). 그 뒤에 처음 실행된 <code>ldc "가나다라"</code>는 3단계에서 테이블에 이미 있는 그 객체를 찾았고, 그래서 리터럴이 실행 중에 만든 객체와 같은 참조가 되었다(둘째 줄 <code>true</code>). 둘째 블록은 순서가 반대다. <code>ldc "마바"</code>가 먼저 실행되어 리터럴용 객체가 테이블에 들어갔으므로, 나중에 <code>other.intern()</code>을 불러도 돌아오는 것은 그 리터럴 객체이지 <code>other</code>가 아니다(넷째 줄 <code>false</code>). 만약 클래스를 로딩할 때 모든 문자열 상수를 미리 만들었다면 첫 블록의 두 줄도 모두 <code>false</code>였을 것이다. 이것은 OpenJDK 21 HotSpot에서 관찰한 동작이고, 프로그램이 이런 순서에 기대서는 안 된다. 원리를 보려고 일부러 만든 실험이다.</p>
+<p><code>javap</code> 출력에는 덤으로 볼 것이 하나 더 있다. <code>char</code> 배열의 원소 '가'(44032), '나'(45208) 같은 값이 <code>ldc</code>로 상수 풀의 정수 상수(<code>CONSTANT_Integer</code>)에서 읽혀 온다. 작은 정수를 명령어 안에 직접 담는 <code>sipush</code>는 부호 있는 16비트 값, 즉 32767까지만 표현하는데, 한글 음절의 코드 값은 모두 0xAC00(44032) 이상이라 그 범위를 넘기 때문이다. <code>char</code>는 부호 없는 16비트 타입이지만, 바이트코드에서 상수를 스택에 올리는 단계에서는 <code>int</code>로 다뤄진다는 점이 여기서 드러난다.</p>
+
+<h3>흔한 오해와 함정</h3>
+<h4>"유니코드는 2바이트, UTF-8은 3바이트"</h4>
+<p>유니코드는 문자 집합이므로 바이트 수를 갖지 않는다. 같은 U+AC00이 UTF-8로는 3바이트, UTF-16으로는 2바이트다. 지금의 유니코드는 U+10FFFF까지 쓰므로 16비트 하나로 모든 문자를 담을 수 없고, UTF-16도 2바이트 또는 4바이트를 쓰는 가변 길이 인코딩이다. "UTF-8은 3바이트"도 한글(그리고 U+0800~U+FFFF 범위)에만 맞는 말이다. ASCII는 1바이트, 이모지는 4바이트다.</p>
+<h4>"char 하나가 글자 하나"</h4>
+<p><code>char</code>는 UTF-16 코드 유닛이다. 보충 문자는 <code>char</code> 두 개를 차지하므로 <code>length()</code>, <code>charAt()</code>, <code>substring()</code>은 보충 문자를 쪼갤 수 있다. 사용자가 입력한 닉네임의 글자 수를 <code>length()</code>로 세서 제한하면 이모지 하나가 두 글자로 계산된다. 코드 포인트 단위가 필요하면 <code>codePointCount</code>, <code>codePoints()</code>, <code>offsetByCodePoints</code>를 쓴다. 덧붙여, 화면에 보이는 "한 글자"는 코드 포인트 여러 개가 결합한 것일 수도 있어서 코드 포인트 수와도 다를 수 있다. 이 회차에서는 코드 유닛과 코드 포인트의 구분까지만 다룬다.</p>
+<h4>"EUC-KR과 MS949는 같은 것"</h4>
+<p>MS949(CP949)는 EUC-KR의 상위 집합이다. 2,350자 안의 글자만 쓰면 바이트가 같아서 차이가 드러나지 않다가, "똠" 같은 글자가 들어오는 순간 EUC-KR 쪽에서 <code>?</code>로 바뀐다. 자바에서 <code>Charset.forName("EUC-KR")</code>은 확장 영역을 인코딩하지 못한다는 것을 앞에서 11,172자를 세어 확인했다. 레거시 시스템과 연동할 때 상대가 "EUC-KR"이라고 말해도, 실제로는 CP949 데이터를 보내는 경우가 있으므로 받은 바이트를 확인해 보는 것이 좋다.</p>
+<h4>"getBytes()는 어디서나 같은 결과를 낸다"</h4>
+<p>인자 없는 <code>getBytes()</code>와 <code>new String(bytes)</code>는 기본 문자 집합을 쓴다. JDK 18 이후에는 기본값이 UTF-8이지만, <code>-Dfile.encoding=COMPAT</code>으로 실행되는 환경이나 JDK 17 이하에서 같은 코드를 돌리면 로캘에 따라 결과가 달라진다. 앞의 <code>LC_ALL=C</code> 실험에서 <code>COMPAT</code>을 주자 기본 문자 집합이 US-ASCII로 바뀐 것을 보았다. 문자 집합을 항상 명시적으로 넘기면(<code>getBytes(StandardCharsets.UTF_8)</code>) 이런 차이가 사라진다.</p>
+<h4>"BOM은 알아서 처리된다"</h4>
+<p>UTF-8 BOM이 붙은 파일을 자바의 UTF-8 디코더로 읽으면 맨 앞에 U+FEFF 문자가 그대로 남는다. 바이트 <code>EF BB BF 69 64</code>를 <code>new String(bytes, UTF_8)</code>로 디코딩하면 길이가 3인 문자열이 되고, <code>equals("id")</code>는 거짓이며, 첫 글자는 0xFEFF다. U+FEFF는 폭이 없는 문자여서 출력해도 보이지 않으므로, CSV 파일의 첫 열 이름이 맞는데도 비교가 실패하는 식으로 나타난다. 이런 입력이 예상되면 첫 글자가 U+FEFF인지 확인해 제거해야 한다. 반면 <code>UTF-16</code> 문자 집합은 문서에 정해진 대로 BOM을 해석해 소비하므로, <code>FF FE 41 00</code>을 디코딩하면 "A" 한 글자만 남는다.</p>
+<h4>"글자 수 × 3이면 UTF-8 바이트 수"</h4>
+<p>UTF-8의 바이트 수는 글자의 종류에 따라 1~4바이트로 달라지므로, 저장 공간의 상한을 계산할 때는 문자 집합이 허용하는 최대 바이트 수를 써야 한다. <code>CharsetEncoder.maxBytesPerChar()</code>는 JDK 21에서 UTF-8에 대해 3.0을 돌려준다. 이 값은 <code>char</code>(코드 유닛) 하나당 최대 바이트 수이므로, 4바이트가 되는 보충 문자도 <code>char</code> 두 개 기준으로는 이 상한 안에 들어온다. 데이터베이스도 같은 문제를 겪는다. MySQL 문서에 따르면 <code>utf8mb3</code>는 문자당 최대 3바이트이고 BMP 문자만 지원하며 보충 문자를 지원하지 않는다. 이모지를 저장하려면 <code>utf8mb4</code>를 써야 하고, MySQL 문서는 새 애플리케이션에 <code>utf8mb4</code>를 권장한다. <code>utf8</code>이라는 이름은 <code>utf8mb3</code>의 (폐기 예정인) 별칭이다. 데이터베이스의 문자 집합은 로드맵의 데이터베이스 강좌에서 다시 다룬다.</p>
+
+<h3>정리: 바이트에는 이름표가 없다</h3>
+<p>이 회차에서 세운 그림을 정리하자. 컴퓨터는 바이트만 저장하고 전송한다. 문자를 바이트로 바꾸는 일은 두 단계로, 문자 집합이 글자에 번호를 주고 인코딩이 번호를 바이트열로 적는다. ASCII는 7비트 128자, ISO-8859-1은 1바이트 256자로 모든 바이트 값을 문자에 일대일로 대응시킨다. 한국어용 EUC-KR은 KS X 1001의 완성형 2,350자를 2바이트로 적고, CP949(자바의 <code>x-windows-949</code>, 별칭 MS949)는 이를 확장해 11,172자를 모두 담지만 둘째 바이트에 ASCII 영문 범위를 쓰는 대가를 치렀다. 유니코드는 모든 문자에 U+0000~U+10FFFF의 번호를 주고, UTF-16은 그 번호를 2바이트 또는 서로게이트 쌍 4바이트로, UTF-8은 1~4바이트의 자기 동기화되는 틀로 적는다.</p>
+<p>자바 쪽에서는 세 가지를 기억하자. 첫째, <code>byte</code>는 부호가 있어서 0x80 이상은 음수로 보이고, 부호 없는 값이 필요하면 <code>& 0xFF</code>나 <code>Byte.toUnsignedInt</code>를 쓴다. 둘째, <code>char</code>와 <code>String.length()</code>는 UTF-16 코드 유닛 단위다. 셋째, 인코딩은 경계에서 일어난다. 소스 파일(javac <code>-encoding</code>), 클래스 파일(수정된 UTF-8), 힙(HotSpot의 Latin-1/UTF-16), 표준 출력(<code>stdout.encoding</code>), 그리고 우리가 직접 호출하는 <code>getBytes</code>와 <code>new String</code>이 그 경계다. <code>getBytes</code>와 <code>new String</code>은 실패를 숨기고 대체 문자로 바꾸며, 오류로 드러내려면 <code>CharsetDecoder</code>의 REPORT 동작을 쓴다. 대체 문자로 바뀐 정보는 돌아오지 않고, ISO-8859-1처럼 모든 바이트를 문자에 일대일로 대응시키는 문자 집합으로 잘못 읽은 경우에만 손실 없이 되돌릴 수 있다.</p>
+<p>이 지식은 이 권 전체에서 계속 쓰인다. 다음 회차부터 다루는 I/O 기본에서는 바이트를 다루는 스트림과 문자를 다루는 리더·라이터를 나누고, 그 사이에서 문자 집합을 지정해 변환하는 구조를 본다. 네트워크와 HTTP 회차에서는 소켓으로 오가는 바이트를 문자열로 읽어야 하고, HTTP 메시지의 <code>Content-Type</code> 헤더가 본문의 문자 집합을 알려 주는 역할을 한다. 바이트에는 이름표가 없으므로, 프로토콜이 그 이름표를 따로 실어 보내는 것이다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>문자 집합과 인코딩</dt><dd>문자 집합은 글자에 번호(코드 포인트)를 붙이는 대응이고, 인코딩은 그 번호를 바이트열로 적는 방법이다. 유니코드는 문자 집합, UTF-8과 UTF-16은 인코딩이다.</dd>
+<dt>자바 byte의 부호</dt><dd>byte는 -128~127의 2의 보수 정수라서 0x80 이상의 바이트는 음수로 보인다. 부호 없는 값은 <code>b & 0xFF</code>나 <code>Byte.toUnsignedInt(b)</code>로 얻는다.</dd>
+<dt>ASCII와 ISO-8859-1</dt><dd>ASCII는 7비트 128자이고, ISO-8859-1은 1바이트 256자로 바이트 n을 U+00nn에 일대일 대응시킨다. 그래서 ISO-8859-1 디코딩은 정보를 잃지 않는다.</dd>
+<dt>EUC-KR과 CP949(MS949)</dt><dd>EUC-KR은 KS X 1001 완성형 한글 2,350자를 두 바이트(각 0xA1~0xFE)로 적는다. CP949는 상위 집합으로 11,172자를 모두 담지만 둘째 바이트에 ASCII 영문 범위가 나올 수 있다.</dd>
+<dt>UTF-16과 서로게이트 쌍</dt><dd>BMP 문자는 2바이트, 보충 문자는 D800~DBFF와 DC00~DFFF의 코드 유닛 두 개(4바이트)로 적는다. 자바의 char와 String.length()는 이 코드 유닛 단위다.</dd>
+<dt>UTF-8</dt><dd>코드 포인트를 1~4바이트 틀에 채우는 가변 길이 인코딩으로, ASCII와 호환되고 멀티바이트 글자 안에 ASCII 바이트가 나오지 않으며 글자 경계를 어디서든 찾을 수 있다.</dd>
+<dt>대체 문자와 REPORT</dt><dd>getBytes와 new String은 표현할 수 없거나 잘못된 입력을 항상 대체값(<code>?</code>, U+FFFD)으로 바꾼다. 직접 만든 CharsetEncoder/Decoder는 기본으로 예외를 던진다.</dd>
+<dt>수정된 UTF-8</dt><dd>클래스 파일 상수 풀과 DataOutputStream.writeUTF가 쓰는 형식으로, 널 문자를 C0 80으로, 보충 문자를 서로게이트 두 개의 3바이트씩 6바이트로 적는다. 표준 UTF-8과 호환되지 않는다.</dd>
+<dt>JDK 18 이후의 기본 문자 집합</dt><dd>JEP 400으로 기본 문자 집합이 UTF-8이 되었다. 운영체제 쪽 인코딩은 native.encoding으로, System.out의 인코딩은 stdout.encoding으로 따로 정해진다.</dd>
+</x-summary>
+
+<x-review>
+<p>운영 중인 서비스에서 "한글이 깨진다"는 보고를 받으면 먼저 깨진 모양을 본다. 물음표(<code>?</code>)가 글자 수만큼 있으면 인코딩 쪽에서 표현할 수 없는 문자를 만났다는 뜻이므로, 한글을 지원하지 않는 문자 집합(US-ASCII, ISO-8859-1)이나 EUC-KR에 확장 한글·이모지를 넣은 경로를 의심한다. U+FFFD 마름모가 보이면 디코딩 쪽에서 규칙에 맞지 않는 바이트를 만난 것이므로, EUC-KR이나 CP949 데이터를 UTF-8로 읽은 경로를 찾는다. 엉뚱한 한자가 섞여 있으면 UTF-8 데이터를 EUC-KR이나 CP949로 읽은 경우다. <code>ê°</code> 같은 라틴 문자 조합이면 UTF-8을 ISO-8859-1로 읽은 것이며, 이 경우만 원래 바이트를 손실 없이 되살릴 수 있다. 이 분류만으로 범인이 되는 경계를 상당히 좁힐 수 있다.</p>
+<p>설계 단계의 판단은 단순하다. 시스템 안에서는 UTF-8 하나로 통일하고, 모든 경계에서 문자 집합을 명시한다. 소스 인코딩은 빌드 설정에, 파일 입출력은 <code>Charset</code>을 받는 생성자나 메서드에, HTTP는 <code>Content-Type</code>의 charset 파라미터에, 데이터베이스는 연결과 테이블의 문자 집합에 적는다. JDK 18 이후 기본값이 UTF-8이 되어 명시하지 않아도 동작하는 경우가 많아졌지만, 기본값은 <code>file.encoding=COMPAT</code> 같은 실행 옵션으로 바뀔 수 있고, 출력 인코딩처럼 기본 문자 집합과 별도로 움직이는 설정도 있다. 명시하는 비용은 한 줄이고, 명시하지 않아 생긴 장애는 데이터 손실로 이어질 수 있다.</p>
+<p>판단이 달라지는 조건도 있다. 레거시 시스템이나 외부 기관이 EUC-KR이나 CP949로 데이터를 보낸다면 그 경계에서만 해당 문자 집합으로 디코딩해 내부에서는 UTF-8로 다룬다. 이때 상대가 "EUC-KR"이라고 해도 CP949 확장 한글이 섞일 수 있으므로 MS949로 디코딩하는 편이 안전한지 실제 데이터로 확인한다. 외부 입력이 정말 UTF-8인지 신뢰할 수 없다면 <code>new String</code> 대신 REPORT 동작의 디코더로 검증해 손상된 데이터가 저장되기 전에 거부한다. 길이 제한은 무엇을 기준으로 하는지(바이트, 코드 유닛, 코드 포인트)를 명세에 적고, 문자열을 자를 때는 서로게이트 쌍과 UTF-8 글자 경계를 지킨다.</p>
+</x-review>
+
+<x-practice>
+<li>문자열 <code>"한A"</code>를 UTF-8, UTF-16(자바의 <code>"UTF-16"</code>), MS949로 인코딩한 바이트를 16진수로 손으로 계산하라. "한"의 코드 포인트는 유니코드 한글 음절 공식으로 구하고, MS949 값은 EUC-KR 2,350자 안에 있는 글자라는 점을 이용해 "EUC-KR과 같다"는 사실만 쓰면 된다(실제 값은 C7 D1이다).</li>
+<li>다음 코드의 출력 세 줄을 예측하고 이유를 설명하라. <code>byte[] b = "가".getBytes(StandardCharsets.UTF_8);</code> 다음에 <code>System.out.println(b[0] == 0xEA);</code>, <code>System.out.println(b[0] == (byte) 0xEA);</code>, <code>System.out.println((b[0] & 0xFF) == 0xEA);</code></li>
+<li><code>String s = "😀😀";</code>에 대해 <code>s.length()</code>, <code>s.codePointCount(0, s.length())</code>, <code>s.getBytes(UTF_8).length</code>, 그리고 <code>s.substring(0, 3).getBytes(UTF_8)</code>의 바이트를 예측하라.</li>
+<li>어떤 서버 로그에 사용자 이름이 <code>ê°ëë¤</code>처럼 찍혀 있다. 원래 데이터가 무엇이었을 가능성이 높은지, 어떤 코드로 복구할 수 있는지, 같은 데이터가 <code>媛�����</code>처럼 찍혀 있었다면 복구가 왜 불가능한지 바이트 수준에서 설명하라.</li>
+<li>EUC-KR로 저장한 소스 파일을 JDK 21에서 옵션 없이 <code>javac</code>로 컴파일하면 무슨 일이 생기는가? <code>-encoding EUC-KR</code>로 컴파일해 만든 클래스 파일과, 같은 내용을 UTF-8로 저장해 옵션 없이 컴파일한 클래스 파일에서 문자열 상수 부분의 바이트는 서로 같은가 다른가?</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> "한"은 ㅎ(L=18), ㅏ(V=0), ㄴ(T=4)이므로 0xAC00 + (18×21+0)×28 + 4 = 0xD55C다. UTF-8에서는 U+0800~U+FFFF 범위라 3바이트 틀을 쓴다. 0xD55C = <code>1101 0101 0101 1100</code>을 4·6·6비트로 나누면 <code>1101</code>, <code>010101</code>, <code>011100</code>이고, 틀에 채우면 <code>1110 1101</code>=ED, <code>10 010101</code>=95, <code>10 011100</code>=9C다. 여기에 "A"의 41이 붙어 <code>ED 95 9C 41</code>이다. 자바의 <code>"UTF-16"</code>은 빅 엔디언 BOM을 붙이므로 <code>FE FF D5 5C 00 41</code>이다. MS949는 2,350자 영역에서 EUC-KR과 같으므로 <code>C7 D1 41</code>이다. 모두 JDK 21에서 실행해 확인한 값이다.</p>
+<p><b>2번.</b> 출력은 <code>false</code>, <code>true</code>, <code>true</code>다. <code>b[0]</code>은 비트 패턴 1110 1010을 담은 byte, 즉 -22다. 첫 비교에서 <code>b[0]</code>은 int -22로 넓혀지고 오른쪽 0xEA는 int 234이므로 다르다. 둘째는 오른쪽도 byte로 캐스트해 -22가 되므로 같다(비교 시 양쪽이 같은 값으로 넓혀진다). 셋째는 <code>b[0] & 0xFF</code>가 부호 확장된 0xFFFFFFEA에서 하위 8비트만 남겨 234가 되므로 같다.</p>
+<p><b>3번.</b> 이모지 하나가 서로게이트 쌍, 즉 char 두 개이므로 <code>length()</code>는 4, 코드 포인트 수는 2다. UTF-8로는 이모지 하나가 4바이트이므로 8바이트다. <code>substring(0, 3)</code>은 첫 이모지 전체와 둘째 이모지의 상위 서로게이트만 남긴다. 첫 이모지는 <code>F0 9F 98 80</code>이 되고, 짝 잃은 서로게이트는 UTF-8로 표현할 수 없어 <code>getBytes</code>가 대체 바이트 <code>3F</code>를 넣는다. 결과는 <code>F0 9F 98 80 3F</code>, 5바이트다.</p>
+<p><b>4번.</b> <code>ê°ëë¤</code>는 "가나다"의 UTF-8 바이트 <code>EA B0 80 EB 82 98 EB 8B A4</code>를 ISO-8859-1로 읽은 모양이다(눈에 안 보이는 제어 문자 U+0080 등 포함 9글자). ISO-8859-1은 바이트와 문자가 일대일이므로 <code>new String(s.getBytes(StandardCharsets.ISO_8859_1), StandardCharsets.UTF_8)</code>로 원래 바이트를 되찾아 올바르게 디코딩할 수 있다. <code>媛�����</code>는 같은 바이트를 EUC-KR로 읽은 결과다. 이때 <code>80</code> 이후의 바이트들은 U+FFFD로 바뀌었고, U+FFFD는 원래 바이트가 무엇이었는지 정보를 담지 않는다. 다시 EUC-KR로 인코딩해도 <code>EA B0 3F 3F 3F 3F 3F</code>처럼 물음표만 나오므로 복구할 수 없다. 원본 바이트를 다시 받아야 한다.</p>
+<p><b>5번.</b> JDK 21의 javac는 <code>-encoding</code>이 없으면 기본 문자 집합 UTF-8로 소스를 읽는다. EUC-KR의 한글 바이트(예: B0 A1)는 UTF-8에서 첫 바이트 없이 나온 이어지는 바이트이므로 <code>unmappable character (0xB0) for encoding UTF-8</code> 같은 오류로 컴파일이 실패한다. 두 클래스 파일의 문자열 상수 바이트는 같다. javac가 소스를 올바르게 디코딩한 뒤에는 문자가 같고, 클래스 파일에는 소스 인코딩과 무관하게 수정된 UTF-8(한글 "가"라면 EA B0 80)로 기록되기 때문이다. 소스 인코딩은 javac의 입력 경계에서만 의미가 있다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>"유니코드로 한글 한 글자는 몇 바이트인가?"라는 질문에 대한 가장 정확한 답은?</q>
+<o>항상 2바이트다. 유니코드는 16비트 문자 집합이기 때문이다.</o>
+<o>질문이 성립하지 않는다. 유니코드는 번호(코드 포인트)만 정하고, 바이트 수는 UTF-8(3바이트)이나 UTF-16(2바이트) 같은 인코딩이 정한다.</o>
+<o>항상 3바이트다. 유니코드의 표준 인코딩은 UTF-8이기 때문이다.</o>
+<o>4바이트다. 유니코드의 코드 포인트는 최대 U+10FFFF이므로 모든 글자를 4바이트로 저장한다.</o>
+<why>유니코드는 코드화된 문자 집합으로, "가"에 U+AC00이라는 번호를 붙일 뿐이다. 그 번호를 바이트로 적는 방법은 인코딩마다 다르다. UTF-8로는 EA B0 80(3바이트), UTF-16BE로는 AC 00(2바이트)이다. 1번은 초창기의 16비트 가정에서 나온 오해이며 지금 유니코드는 U+10FFFF까지 쓴다. 3번은 인코딩 하나를 유니코드와 동일시한 것이고, 4번은 UTF-32 같은 특정 인코딩에만 해당한다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>어떤 바이트열에서 0x63(ASCII 'c')을 찾았다. 이 바이트가 반드시 문자 'c' 자체라고 단정할 수 있는 인코딩만 고른 것은?</q>
+<o>EUC-KR, CP949, UTF-8</o>
+<o>CP949, UTF-8</o>
+<o>EUC-KR, UTF-8</o>
+<o>UTF-16LE, UTF-8</o>
+<why>EUC-KR은 한글의 두 바이트가 모두 0xA1~0xFE이고, UTF-8은 멀티바이트 글자의 모든 바이트가 0x80 이상이므로 0x63은 언제나 'c'다. CP949는 확장 영역의 둘째 바이트로 0x41~0x5A, 0x61~0x7A를 쓰므로 "똠"(8C 63)처럼 0x63이 한글의 일부일 수 있다. UTF-16LE는 'c'를 63 00으로 적지만, 다른 글자의 코드 유닛 안에도 0x63 바이트가 얼마든지 나올 수 있다(예: U+0163은 63 01).</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>String s = "a가😀";</code>일 때 <code>s.length()</code>의 값과 그 이유로 옳은 것은?</q>
+<o>3. 눈에 보이는 글자가 세 개이기 때문이다.</o>
+<o>6. UTF-8로 a(1) + 가(3) + 😀(4)에서 바이트 수를 글자 수로 환산하기 때문이다.</o>
+<o>8. 자바 문자열은 모든 글자를 UTF-16 2바이트 이상으로 저장하기 때문이다.</o>
+<o>4. length()는 UTF-16 코드 유닛 수를 세며, 😀는 서로게이트 쌍으로 코드 유닛 두 개를 차지하기 때문이다.</o>
+<why>String.length()는 유니코드 코드 유닛(UTF-16의 16비트 단위) 수를 돌려준다. a와 가는 BMP 문자라 각각 하나, 😀(U+1F600)는 D83D DE00 두 개이므로 4다. 글자(코드 포인트) 수 3은 codePointCount로 얻는다. 내부 저장 바이트 수는 구현 세부이며 length()와 관계가 없다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>UTF-8로 인코딩된 "가나다"를 실수로 다른 문자 집합으로 디코딩해 문자열을 만들었다. 그 문자열을 같은 (잘못된) 문자 집합으로 다시 인코딩해 원래 바이트를 완전히 되찾을 수 있는 경우는?</q>
+<o>ISO-8859-1로 디코딩한 경우</o>
+<o>EUC-KR로 디코딩한 경우</o>
+<o>US-ASCII로 디코딩한 경우</o>
+<o>MS949로 디코딩한 경우</o>
+<why>ISO-8859-1은 바이트 256종류를 U+0000~U+00FF에 일대일로 대응시키므로 디코딩에서 정보가 사라지지 않고, 다시 인코딩하면 같은 바이트가 나온다. EUC-KR, MS949, US-ASCII는 규칙에 맞지 않는 바이트를 U+FFFD로 바꾸며, U+FFFD는 원래 바이트를 기억하지 않으므로 되돌릴 수 없다. 실제로 EUC-KR 경로는 EA B0 3F 3F 3F 3F 3F처럼 바이트 수부터 달라진다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>JDK 21에서 <code>LC_ALL=C java Props</code>로 실행했더니 <code>Charset.defaultCharset()</code>은 UTF-8인데 <code>System.out.println("가")</code>의 출력이 <code>?</code>였다. 가장 정확한 설명은?</q>
+<o>기본 문자 집합이 UTF-8이므로 소스 파일의 "가"가 컴파일 단계에서 이미 ?로 바뀌었다.</o>
+<o>힙의 String이 로캘에 따라 US-ASCII로 저장되어 "가"를 담지 못했다.</o>
+<o>System.out은 기본 문자 집합이 아니라 stdout.encoding으로 인코딩하며, 이 값이 로캘에서 온 US-ASCII여서 "가"를 대체 바이트 3F로 바꿨다.</o>
+<o>터미널이 UTF-8 바이트 EA B0 80을 받아 ASCII로 해석하면서 ?를 그렸다.</o>
+<why>기본 문자 집합(file.encoding)과 표준 출력의 인코딩(stdout.encoding)은 별개의 프로퍼티다. stdout.encoding은 터미널에 연결되어 있으면 Console.charset()과 같고 아니면 native.encoding을 따르는데, LC_ALL=C에서는 두 경우 모두 US-ASCII였다. 출력을 덤프하면 실제로 바이트 3F가 나가므로 4번처럼 터미널의 해석 문제가 아니다. 컴파일과 힙의 문자열은 로캘과 무관하게 "가"를 올바르게 담고 있다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>코드 포인트(code point)</dt><dd>유니코드가 각 문자에 붙인 번호. U+0000부터 U+10FFFF까지이며 U+AC00처럼 적는다.</dd>
+<dt>코드 유닛(code unit)</dt><dd>인코딩이 쓰는 최소 단위. UTF-8은 8비트, UTF-16은 16비트다. 자바의 char 하나가 UTF-16 코드 유닛 하나다.</dd>
+<dt>기본 다국어 평면(BMP, Basic Multilingual Plane)</dt><dd>코드 포인트 U+0000~U+FFFF 영역. 그 밖의 문자를 보충 문자(supplementary character)라 한다.</dd>
+<dt>서로게이트 쌍(surrogate pair)</dt><dd>UTF-16에서 보충 문자를 나타내는 두 코드 유닛. 상위는 D800~DBFF, 하위는 DC00~DFFF 범위다.</dd>
+<dt>바이트 순서 표시(BOM, byte-order mark)</dt><dd>데이터 맨 앞에 두는 U+FEFF. UTF-16에서는 바이트 순서를 알리고, UTF-8에서는 EF BB BF로 나타난다.</dd>
+<dt>대체 문자(replacement character)</dt><dd>디코딩할 수 없는 입력 자리에 넣는 U+FFFD. 원래 바이트의 정보를 담지 않으므로 넣는 순간 정보가 사라진다.</dd>
+<dt>과잉 표현(overlong encoding)</dt><dd>더 짧게 적을 수 있는 코드 포인트를 불필요하게 긴 UTF-8 열로 적은 것. 예: U+0000을 C0 80으로 적는 것. 표준 UTF-8에서는 금지된다.</dd>
+<dt>수정된 UTF-8(modified UTF-8)</dt><dd>JVM 클래스 파일과 DataOutput.writeUTF가 쓰는 변형. 널 문자를 C0 80으로, 보충 문자를 서로게이트 각각 3바이트씩 6바이트로 적는다.</dd>
+<dt>최대 부분열(maximal subpart)</dt><dd>유니코드 표준 3.9.6절의 용어. 변환할 수 없는 위치에서 시작해 올바른 UTF-8 바이트열의 앞부분이 되는 가장 긴 부분열(없으면 1바이트)로, 이것을 U+FFFD 하나로 바꾸는 방식이 설명되어 있다. 적합성 요구 사항은 아니며, JDK 21은 서로게이트를 적은 3바이트를 U+FFFD 하나로 바꾼다는 점에서 이 방식과 다르다.</dd>
+<dt>컴팩트 스트링(Compact Strings)</dt><dd>Java 9의 JEP 254로 도입된 String 내부 표현. 모든 문자가 U+00FF 이하이면 Latin-1(글자당 1바이트), 아니면 UTF-16(글자당 2바이트)으로 저장한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/charset/Charset.html">Java SE 21 API: java.nio.charset.Charset</a> — 문자 집합·인코딩 용어 정의, 표준 문자 집합 6개, UTF-16 BOM 규칙, 이름 규칙, 기본 문자 집합</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc3629">RFC 3629: UTF-8, a transformation format of ISO 10646</a> — UTF-8 비트 틀, 금지 바이트, 과잉 표현과 서로게이트 금지, BOM, 정렬 순서와 자기 동기화 성질</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-4.html#jvms-4.4.7">JVMS §4.4.7 The CONSTANT_Utf8_info Structure</a> — 클래스 파일의 수정된 UTF-8 정의</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/specs/man/javac.html">The javac Command (JDK 21)</a> — <code>-encoding</code> 옵션과 기본 변환기</li>
+<li><a href="https://inside.java/2021/10/04/the-default-charset-jep400/">JEP 400 and the Default Charset (inside.java)</a> — JDK 18에서 기본 문자 집합이 UTF-8이 된 경위, native.encoding과 COMPAT</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/charset-unicode-utf8mb3.html">MySQL 8.0 Reference Manual: The utf8mb3 Character Set</a> — utf8mb3의 3바이트 제한과 utf8mb4 권장</li>
+</x-refs>

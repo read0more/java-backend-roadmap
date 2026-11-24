@@ -1,0 +1,560 @@
+<x-meta>
+deck: 컨트롤러에서 던진 예외가 서블릿 컨테이너까지 올라가 같은 요청 안에서 오류 페이지로 다시 디스패치되는 과정을, Tomcat 밸브와 스프링 부트 BasicErrorController의 소스로 따라간다.
+minutes: 110
+</x-meta>
+
+<x-goals>
+<li>예외 전파와 <code>response.sendError()</code>가 컨테이너에 남기는 신호가 어떻게 다른지 설명하고, 예외 계층·루트 원인·상태 코드·기본 오류 페이지 순서의 매칭 규칙으로 어떤 오류 페이지가 선택될지 예측할 수 있다.</li>
+<li>오류 페이지 호출이 리다이렉트가 아니라 같은 요청의 ERROR 디스패치라는 것을 요청 속성(<code>jakarta.servlet.error.*</code>)과 <code>DispatcherType</code>으로 확인할 수 있다.</li>
+<li>필터와 인터셉터가 오류 디스패치에서 다시 호출되는 조건을 설명하고, <code>dispatcherTypes</code>와 <code>excludePathPatterns</code>로 중복 호출을 제어할 수 있다.</li>
+<li>스프링 부트가 <code>/error</code>를 전역 오류 페이지로 등록하는 경로와 <code>BasicErrorController</code>가 오류 뷰를 고르는 우선순위를 소스 수준에서 추적할 수 있다.</li>
+<li><code>server.error.*</code> 설정이 오류 응답에 남는 정보를 어떻게 바꾸는지 설명하고, 운영 환경에서 무엇을 노출하지 않을지 판단할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>예외는 결국 누가 받는가</h3>
+<p>주문 상세를 보여 주는 컨트롤러가 존재하지 않는 주문 번호를 받아 <code>IllegalStateException</code>을 던졌다고 해 보자. 평범한 자바 프로그램이라면 이 예외를 아무도 잡지 않을 때 스레드가 끝나고, 기본 처리기가 스택 트레이스를 표준 오류에 찍는다. 그런데 웹 애플리케이션에서 요청을 처리하는 스레드는 서블릿 컨테이너의 스레드 풀에서 빌려 온 작업자 스레드다. 이 스레드가 예외 하나 때문에 죽어 버리면 풀은 스레드를 다시 만들어야 하고, 무엇보다 요청을 보낸 클라이언트는 아무 응답도 받지 못한 채 연결만 끊긴다. 그래서 요청 처리의 호출 스택 어딘가에는 반드시 "마지막으로 예외를 받아 주는 곳"이 있어야 하고, 그 자리를 차지하는 것이 서블릿 컨테이너다.</p>
+<p>예외가 위로 올라가는 과정은 JVM 수준에서는 단순하다. 메서드 안에서 예외가 발생하면 JVM은 그 메서드의 예외 테이블(exception table)에서 현재 명령 위치를 덮는 처리기를 찾는다. 찾지 못하면 그 메서드 호출은 갑작스럽게 완료(complete abruptly)되고 프레임이 스택에서 제거된 뒤, 호출한 쪽에서 같은 예외를 다시 찾는다(JVMS §2.10). 이 과정에서 <code>finally</code> 블록은 실행되므로, 필터의 <code>finally</code>에 쓴 로그는 예외가 지나가는 길에도 찍힌다. 요청 하나의 호출 스택을 위에서부터 적으면 "커넥터의 프로세서 → 엔진·호스트·컨텍스트·래퍼의 밸브 → 필터 체인 → 서블릿(<code>DispatcherServlet</code>) → 인터셉터 → 컨트롤러" 순서이고, 컨트롤러에서 던진 예외는 이 프레임들을 아래에서 위로 하나씩 되감으며 올라간다.</p>
+<p>이 회차는 그 되감기가 어디에서 멈추고, 멈춘 뒤 컨테이너가 무엇을 하는지를 다룬다. 결론부터 말하면 컨테이너는 예외를 받아 상태 코드 500을 정하고, 등록된 오류 페이지가 있으면 <b>같은 요청 객체로 오류 페이지 경로를 한 번 더 호출</b>한다. 이 두 번째 호출을 오류 디스패치(error dispatch)라고 부른다. 필터와 인터셉터가 한 요청에서 두 번 불리는 현상, 오류 페이지에서 원래 요청 URI를 꺼낼 수 있는 이유, 스프링 부트의 <code>/error</code>가 아무 설정 없이 동작하는 이유가 모두 이 재호출에서 나온다.</p>
+<p>실험 환경도 정리해 두자. 서블릿 수준 동작은 스프링 없이 내장 Tomcat만으로 확인하는 편이 군더더기가 없다. 이 회차의 서블릿 실험은 JDK 21과 <code>tomcat-embed-core</code> 11.0.27(Servlet 6.1)로 직접 실행했고, 스프링 쪽 설명은 Spring Boot 3.5.0과 Spring Framework 6.2.7 소스를 기준으로 했다. Boot 3.5.0이 기본으로 쓰는 Tomcat은 10.1.41(Servlet 6.0)인데, 이 회차에서 따라가는 <code>StandardHostValve</code>의 예외 처리·forward 코드를 두 버전에서 비교해 보면 Servlet 6.1에 새로 생긴 요청 속성 두 개를 채우는 줄과 디버그 로그 한 줄 말고는 같다. 스프링 부트 프로젝트로 따라 하려면 <code>spring-boot-starter-web</code>과 <code>spring-boot-starter-thymeleaf</code> 의존성이면 충분하다.</p>
+
+<h3>컨테이너가 알아듣는 두 가지 오류 신호</h3>
+<p>서블릿이나 필터가 "이 요청은 실패했다"고 컨테이너에 알리는 방법은 두 가지뿐이다. 첫째는 <b>예외를 던져 컨테이너까지 전파하는 것</b>이다. <code>Servlet.service()</code>와 <code>Filter.doFilter()</code>의 시그니처가 선언한 검사 예외는 <code>ServletException</code>과 <code>IOException</code>뿐이므로, 컨테이너까지 올라올 수 있는 것은 이 둘(과 하위 타입), 그리고 선언 없이 던질 수 있는 <code>RuntimeException</code>과 <code>Error</code>다. Jakarta Servlet 명세 §10.9.2도 서블릿이나 필터가 던질 수 있는 예외를 이 세 부류로 적는다. 다른 검사 예외는 컴파일러가 막기 때문에 <code>ServletException</code>으로 감싸서 던져야 한다.</p>
+<p>둘째는 <b><code>HttpServletResponse.sendError(int)</code> 또는 <code>sendError(int, String)</code>을 호출하는 것</b>이다. 이 메서드는 예외를 던지지 않는다. 메서드는 정상적으로 반환하고, 호출 스택도 평소처럼 되감긴다. 다만 응답 객체에 "오류로 끝났다"는 표시가 남는다. Tomcat 11.0.27의 <code>org.apache.catalina.connector.Response.sendError()</code>를 열어 보면 하는 일이 분명하다. 응답이 이미 커밋되었으면 <code>IllegalStateException</code>을 던지고, 아니면 오류 플래그를 켜고(<code>setError()</code>), 상태 코드와 메시지를 저장하고, 지금까지 버퍼에 쓴 본문을 비우고(<code>resetBuffer()</code>), 응답을 일시 중지(suspended) 상태로 바꾼다. 일시 중지된 응답의 출력 버퍼는 <code>write</code>와 <code>flush</code> 호출을 그냥 무시하므로, <code>sendError</code> 뒤에 본문을 써도 클라이언트에게 가지 않는다.</p>
+<p>여기서 자주 헷갈리는 것이 <code>setStatus(404)</code>다. <code>setStatus</code>는 상태 코드 숫자만 바꾸고 오류 플래그를 켜지 않는다. 명세는 컨테이너와 기본 서블릿이 4xx·5xx 응답에는 <code>sendError</code>를 써서 오류 페이지 메커니즘이 동작하게 하고, 2xx·3xx에는 <code>setStatus</code>를 써서 오류 페이지 메커니즘을 부르지 않는다고 적는다(§10.9.2). 즉 오류 페이지를 띄우는 스위치는 상태 코드 값이 아니라 <code>sendError</code> 호출 여부다. 뒤의 실험에서 <code>setStatus(404)</code>만 한 요청은 404 상태로 나가지만 오류 페이지 없이 서블릿이 쓴 본문 그대로 나가는 것을 볼 수 있다.</p>
+<div class="table-wrap"><table><thead><tr><th>신호</th><th>호출 스택</th><th>응답 객체에 남는 것</th><th>오류 페이지 탐색 기준</th></tr></thead><tbody>
+<tr><td>예외 전파</td><td>예외로 되감김(필터의 <code>finally</code>는 실행됨)</td><td>컨테이너가 잡아서 요청 속성에 예외 저장, 상태 500, 오류 플래그</td><td>예외 타입 → (못 찾으면) 상태 코드 → 기본 페이지</td></tr>
+<tr><td><code>sendError(code)</code></td><td>정상 반환</td><td>오류 플래그, 상태 코드, 메시지, 버퍼 비움, 일시 중지</td><td>상태 코드 → 기본 페이지</td></tr>
+<tr><td><code>setStatus(code)</code></td><td>정상 반환</td><td>상태 코드만</td><td>오류 페이지를 찾지 않음</td></tr>
+</tbody></table></div>
+
+<h3>오류 페이지를 등록하고 찾는 규칙</h3>
+<p>오류 페이지는 원래 배포 서술자(<code>web.xml</code>)의 <code>error-page</code> 요소로 등록한다. 요소 하나는 <code>exception-type</code>(예외 클래스 이름)이나 <code>error-code</code>(상태 코드) 중 하나와 <code>location</code>(오류 페이지 경로)을 가진다. 둘 다 없는 <code>error-page</code>는 기본 오류 페이지(default error page)가 된다. 명세 §10.9.2는 매칭 규칙을 다음과 같이 정한다. 예외가 전파되면 <code>exception-type</code> 선언들과 비교하되 <b>클래스 계층에서 가장 가까운 것</b>이 이긴다. 맞는 것이 없고 던져진 예외가 <code>ServletException</code>이면 <code>getRootCause()</code>로 감싸인 예외를 꺼내 한 번 더 비교한다. <code>sendError</code>가 호출되었으면 <code>error-code</code> 선언과 비교한다.</p>
+<pre><code class="language-xml"><error-page>
+    <exception-type>java.lang.RuntimeException</exception-type>
+    <location>/error-page/runtime</location>
+</error-page>
+<error-page>
+    <error-code>404</error-code>
+    <location>/error-page/404</location>
+</error-page>
+<error-page>
+    <!-- exception-type도 error-code도 없으면 기본 오류 페이지 -->
+    <location>/error-page/default</location>
+</error-page></code></pre>
+<p>Tomcat은 이 규칙을 <code>org.apache.catalina.util.ErrorPageSupport</code>로 구현한다. 예외 타입 매칭은 예외 객체의 클래스 이름으로 맵을 찾고, 없으면 <code>getSuperclass()</code>로 한 단계씩 올라가며 <code>Object</code> 직전까지 반복한다. 그래서 <code>IllegalStateException</code>을 던지면 <code>IllegalStateException</code> → <code>RuntimeException</code> → <code>Exception</code> → <code>Throwable</code> 순서로 찾고, 처음 걸리는 선언이 "가장 가까운 것"이 된다. 인터페이스는 이 탐색에 들어가지 않는다. 상태 코드 매칭은 정수 키로 맵을 찾을 뿐이고, 기본 오류 페이지는 상태 코드 0번 자리에 저장되어 있다. <code>StandardHostValve.status()</code>는 <code>findErrorPage(statusCode)</code>가 <code>null</code>이면 <code>findErrorPage(0)</code>을 한 번 더 부른다.</p>
+<p>두 탐색이 이어지는 방식도 알아 둘 만하다. Tomcat의 <code>StandardHostValve.throwable()</code>은 예외 타입으로 페이지를 찾지 못하면 포기하지 않고, 응답 상태가 400 미만이면 500으로 바꾸고 오류 플래그를 켠 뒤 <code>status()</code>로 넘어간다. 그래서 예외가 전파되었는데 예외 타입 페이지가 없으면 "500번 페이지 → 기본 페이지" 순서로 다시 찾는다. 결과적으로 예외 하나에 대한 탐색 순서는 "예외 타입(계층) → 루트 원인 타입(계층) → 상태 코드 → 기본 페이지"가 된다. 기본 페이지까지 없으면 컨테이너가 스스로 만든 오류 화면이 나간다.</p>
+<p>스프링 부트처럼 내장 서버를 쓰면 <code>web.xml</code>이 없다. 대신 부트의 <code>ErrorPage</code> 객체를 <code>ErrorPageRegistry</code>에 등록한다. 내장 서버 팩토리(<code>ConfigurableWebServerFactory</code>)가 이 인터페이스를 구현하고 있어서, <code>ErrorPageRegistrar</code> 빈을 하나 두면 부트가 팩토리를 초기화할 때 그 빈을 호출해 준다(<code>ErrorPageRegistrarBeanPostProcessor</code>). 아래 코드는 위의 <code>web.xml</code>과 같은 의미다.</p>
+<pre><code class="language-java">import org.springframework.boot.web.server.ErrorPage;
+import org.springframework.boot.web.server.ErrorPageRegistrar;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpStatus;
+
+@Configuration(proxyBeanMethods = false)
+public class ContainerErrorPageConfig {
+
+    @Bean
+    public ErrorPageRegistrar containerErrorPages() {
+        return registry -> registry.addErrorPages(
+                new ErrorPage(RuntimeException.class, "/error-page/runtime"), // 예외 타입
+                new ErrorPage(HttpStatus.NOT_FOUND, "/error-page/404"),       // 상태 코드
+                new ErrorPage("/error-page/default"));                        // 기본(전역) 페이지
+    }
+}</code></pre>
+<p>부트의 <code>ErrorPage</code>는 상태와 예외가 모두 없으면 <code>isGlobal()</code>이 참이고, <code>getStatusCode()</code>는 상태가 없을 때 0을 돌려준다. Boot 3.5.0의 <code>TomcatServletWebServerFactory</code>는 부트 <code>ErrorPage</code>를 Tomcat의 <code>ErrorPage</code>로 옮기면서 <code>setErrorCode(errorPage.getStatusCode())</code>를 호출하므로, 전역 페이지는 Tomcat 안에서 정확히 "0번 상태 코드 = 기본 오류 페이지" 자리에 들어간다. 부트의 추상화가 서블릿 명세의 기본 오류 페이지와 그대로 연결되는 지점이다.</p>
+
+<h3>오류 페이지는 같은 요청의 재디스패치다</h3>
+<p>오류 페이지를 찾으면 컨테이너는 그 경로를 호출한다. 이때 클라이언트에게 302 응답을 보내 다시 요청하게 하는 것이 아니다. Tomcat의 <code>StandardHostValve.custom()</code>은 <code>ServletContext.getRequestDispatcher(location)</code>으로 디스패처를 얻어 <b><code>forward()</code></b>를 호출한다. 명세 §10.9.1도 오류 처리 자원이 서블릿이나 JSP라면 컨테이너가 만든 원래의 요청·응답 객체를 넘기고, 요청 경로와 속성은 <code>RequestDispatcher.forward</code>를 한 것처럼 설정한다고 적는다. 그래서 오류 페이지를 처리하는 동안 <code>request.getRequestURI()</code>는 오류 페이지 경로를 돌려주지만, 브라우저 주소창의 URL은 원래 요청 그대로이고 HTTP 요청·응답도 한 쌍뿐이다. 같은 작업자 스레드가 같은 요청 객체를 들고 오류 페이지 서블릿까지 내려간다.</p>
+<p>오류 페이지를 호출하기 전에 Tomcat은 요청에 오류 정보를 속성으로 붙이고(<code>setRequestErrorAttributes()</code>), <code>forward()</code> 직전에 응답 버퍼를 비우되 상태 코드와 메시지는 남기고(<code>resetBuffer(true)</code>), 콘텐츠 길이를 초기화한다. 명세가 반드시 설정하라고 정한 속성은 아래 여섯 개다(표 10-1). Servlet 6.1에서는 원래 요청의 HTTP 메서드와 쿼리 문자열을 담는 두 속성이 추가되었고, Tomcat 11은 이것도 채운다. Tomcat 10.1(Servlet 6.0)에는 이 두 상수가 없다.</p>
+<div class="table-wrap"><table><thead><tr><th>요청 속성 이름</th><th>타입</th><th>내용</th></tr></thead><tbody>
+<tr><td><code>jakarta.servlet.error.status_code</code></td><td><code>Integer</code></td><td>응답 상태 코드</td></tr>
+<tr><td><code>jakarta.servlet.error.exception_type</code></td><td><code>Class</code></td><td>예외 클래스(예외 타입으로 매칭되었을 때)</td></tr>
+<tr><td><code>jakarta.servlet.error.message</code></td><td><code>String</code></td><td>오류 메시지</td></tr>
+<tr><td><code>jakarta.servlet.error.exception</code></td><td><code>Throwable</code></td><td>예외 객체</td></tr>
+<tr><td><code>jakarta.servlet.error.request_uri</code></td><td><code>String</code></td><td>오류가 난 원래 요청의 URI</td></tr>
+<tr><td><code>jakarta.servlet.error.servlet_name</code></td><td><code>String</code></td><td>오류가 난 서블릿의 논리 이름</td></tr>
+<tr><td><code>jakarta.servlet.error.method</code>, <code>jakarta.servlet.error.query_string</code></td><td><code>String</code></td><td>Servlet 6.1에서 추가. 원래 요청의 메서드와 쿼리 문자열</td></tr>
+</tbody></table></div>
+<p>이 이름들은 <code>RequestDispatcher.ERROR_STATUS_CODE</code>, <code>ERROR_EXCEPTION</code> 같은 상수로 정의되어 있어서 코드에서는 상수를 쓰면 된다. 명세는 예외 객체 속성이 2.3 버전에 추가된 뒤로 예외 타입과 메시지 속성은 중복이지만 하위 호환을 위해 남겨 둔다고 적는다. 그리고 컨테이너는 이 디스패치의 종류를 <code>DispatcherType.ERROR</code>로 표시한다. Tomcat은 내부 속성에 <code>DispatcherType.ERROR</code>를 넣어 두고, 필터 체인을 만들 때 이 값을 읽어 어떤 필터를 끼울지 고른다. 다음 절의 실험에서 이 모든 것을 출력으로 확인한다.</p>
+
+<x-visual id="spring-mvc2-08-error-dispatch-sequence" title="예외 전파와 ERROR 디스패치의 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>하나의 HTTP 요청 안에서 REQUEST 디스패치가 예외로 되감긴 뒤, 컨테이너가 같은 요청 객체로 ERROR 디스패치를 다시 수행하는 흐름을 보여 준다.</x-hint>
+<x-prompt>가로 16:9 시퀀스 다이어그램. 왼쪽부터 세로 생명선 6개: "클라이언트", "Tomcat 밸브", "필터", "DispatcherServlet", "컨트롤러", "/error 컨트롤러". 위쪽 절반은 "REQUEST 디스패치" 라벨이 붙은 회색 박스로 묶는다: 클라이언트에서 Tomcat 밸브로 "GET /orders/7" 화살표, 밸브→필터→DispatcherServlet→컨트롤러로 이어지는 실선 화살표, 컨트롤러에서 빨간 번개 아이콘과 "예외 발생" 라벨, 그 뒤 컨트롤러→DispatcherServlet→필터→Tomcat 밸브로 되돌아가는 빨간 점선 화살표. Tomcat 밸브 옆에 "오류 페이지 탐색" 메모. 아래쪽 절반은 "ERROR 디스패치" 라벨이 붙은 연한 주황 박스: Tomcat 밸브에서 필터로 "forward /error" 화살표, 필터→DispatcherServlet→/error 컨트롤러로 실선, /error 컨트롤러에서 밸브로 "오류 HTML" 응답 화살표. 마지막으로 밸브에서 클라이언트로 "500 응답 (URL 그대로)" 화살표. 클라이언트와 밸브 사이에 "HTTP 요청·응답은 한 쌍" 메모.</x-prompt>
+<x-caption>컨트롤러의 예외는 REQUEST 디스패치를 되감아 컨테이너까지 올라가고, 컨테이너는 같은 요청으로 오류 페이지를 ERROR 디스패치한다.</x-caption>
+</x-visual>
+
+<h3>내장 Tomcat으로 직접 확인하기</h3>
+<p>아래 프로그램은 스프링 없이 내장 Tomcat에 서블릿 두 개와 필터 두 개를 올린다. <code>/ex</code> 서블릿은 쿼리 파라미터 <code>t</code>에 따라 런타임 예외, <code>ServletException</code>으로 감싼 예외, <code>IOException</code>, <code>sendError(404)</code>, <code>setStatus(404)</code>, 응답을 내보낸 뒤의 예외를 각각 일으킨다. <code>/error-page/*</code> 서블릿은 오류 페이지 역할을 하며 받은 요청 속성을 모두 출력한다. 필터 <code>reqOnly</code>는 <code>REQUEST</code> 디스패치에만, <code>reqErr</code>는 <code>REQUEST</code>와 <code>ERROR</code> 디스패치에 매핑했다. 오류 페이지는 <code>RuntimeException</code> 타입, 404, 500 세 개를 등록했다.</p>
+<pre><code class="language-java">import jakarta.servlet.*;
+import jakarta.servlet.http.*;
+import org.apache.catalina.Context;
+import org.apache.catalina.startup.Tomcat;
+import org.apache.tomcat.util.descriptor.web.*;
+import java.io.*;
+import java.net.URI;
+import java.net.http.*;
+
+public class ErrExp {
+    static class LogFilter implements Filter {
+        final String name;
+        LogFilter(String name) { this.name = name; }
+        public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain) throws IOException, ServletException {
+            HttpServletRequest r = (HttpServletRequest) req;
+            System.out.println("[" + name + "] in  " + r.getDispatcherType() + " " + r.getRequestURI());
+            try {
+                chain.doFilter(req, res);
+            } catch (Exception e) {
+                System.out.println("[" + name + "] saw " + e.getClass().getSimpleName());
+                throw e;
+            } finally {
+                System.out.println("[" + name + "] out " + r.getDispatcherType());
+            }
+        }
+    }
+    static class ExServlet extends HttpServlet {
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException, ServletException {
+            String t = req.getParameter("t");
+            if ("rt".equals(t)) throw new IllegalStateException("boom");
+            if ("wrap".equals(t)) throw new ServletException("wrapped", new IllegalArgumentException("inner"));
+            if ("io".equals(t)) throw new IOException("disk");
+            if ("404".equals(t)) { resp.sendError(404, "no item"); return; }
+            if ("status".equals(t)) { resp.setStatus(404); resp.getWriter().write("plain 404 body"); return; }
+            if ("commit".equals(t)) { resp.getWriter().write("partial"); resp.flushBuffer(); throw new IllegalStateException("late"); }
+            resp.getWriter().write("ok");
+        }
+    }
+    static class ErrServlet extends HttpServlet {
+        protected void service(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+            System.out.println("  error page: type=" + req.getDispatcherType() + " uri=" + req.getRequestURI()
+                + " status_code=" + req.getAttribute(RequestDispatcher.ERROR_STATUS_CODE)
+                + " exception_type=" + req.getAttribute(RequestDispatcher.ERROR_EXCEPTION_TYPE)
+                + " message=" + req.getAttribute(RequestDispatcher.ERROR_MESSAGE)
+                + " exception=" + req.getAttribute(RequestDispatcher.ERROR_EXCEPTION)
+                + " request_uri=" + req.getAttribute(RequestDispatcher.ERROR_REQUEST_URI)
+                + " servlet_name=" + req.getAttribute(RequestDispatcher.ERROR_SERVLET_NAME)
+                + " resp.status=" + resp.getStatus());
+            resp.setContentType("text/plain");
+            resp.getWriter().write("custom error page " + req.getRequestURI());
+        }
+    }
+    public static void main(String[] args) throws Exception {
+        boolean withPages = args.length == 0;   // 인자를 주면 오류 페이지 없이 실행
+        Tomcat tomcat = new Tomcat();
+        tomcat.setPort(0);                      // 빈 포트를 OS가 고른다
+        tomcat.setBaseDir(new File("tc").getAbsolutePath());
+        Context ctx = tomcat.addContext("", null);
+        Tomcat.addServlet(ctx, "ex", new ExServlet()); ctx.addServletMappingDecoded("/ex", "ex");
+        Tomcat.addServlet(ctx, "err", new ErrServlet()); ctx.addServletMappingDecoded("/error-page/*", "err");
+        addFilter(ctx, "reqOnly", new LogFilter("reqOnly"), "REQUEST");
+        addFilter(ctx, "reqErr", new LogFilter("reqErr"), "REQUEST", "ERROR");
+        if (withPages) {
+            ErrorPage p1 = new ErrorPage(); p1.setExceptionType("java.lang.RuntimeException"); p1.setLocation("/error-page/runtime"); ctx.addErrorPage(p1);
+            ErrorPage p2 = new ErrorPage(); p2.setErrorCode(404); p2.setLocation("/error-page/404"); ctx.addErrorPage(p2);
+            ErrorPage p3 = new ErrorPage(); p3.setErrorCode(500); p3.setLocation("/error-page/500"); ctx.addErrorPage(p3);
+        }
+        tomcat.getConnector();
+        tomcat.start();
+        int port = tomcat.getConnector().getLocalPort();
+        HttpClient c = HttpClient.newHttpClient();
+        for (String t : new String[]{"rt", "wrap", "io", "404", "status", "commit"}) {
+            System.out.println("=== GET /ex?t=" + t);
+            try {
+                HttpResponse<String> r = c.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/ex?t=" + t)).build(), HttpResponse.BodyHandlers.ofString());
+                String body = r.body().replaceAll("\\s+", " ");
+                System.out.println("  client: " + r.statusCode() + " body=" + (body.length() > 120 ? body.substring(0, 120) + "..." : body));
+            } catch (IOException e) {
+                System.out.println("  client: " + e);
+            }
+            Thread.sleep(100);
+        }
+        tomcat.stop(); tomcat.destroy();
+    }
+    static void addFilter(Context ctx, String name, Filter f, String... types) {
+        FilterDef d = new FilterDef(); d.setFilterName(name); d.setFilter(f); ctx.addFilterDef(d);
+        FilterMap m = new FilterMap(); m.setFilterName(name); m.addURLPattern("/*");
+        for (String t : types) m.setDispatcher(t);
+        ctx.addFilterMap(m);
+    }
+}</code></pre>
+<p>컴파일과 실행에는 <code>tomcat-embed-core-11.0.27.jar</code>와 <code>jakarta.annotation-api</code> JAR이 클래스패스에 있어야 한다(후자가 없으면 컨텍스트 시작 중 <code>NoClassDefFoundError: jakarta/annotation/Resource</code>로 실패한다). 컨테이너가 표준 오류에 남기는 스택 트레이스 로그는 빼고 표준 출력만 옮기면 다음과 같다. 필터와 서블릿의 출력 순서는 한 스레드 안에서 일어나므로 실행마다 같다.</p>
+<pre data-label="실행 결과 (오류 페이지 등록)"><code class="language-text">=== GET /ex?t=rt
+[reqOnly] in  REQUEST /ex
+[reqErr] in  REQUEST /ex
+[reqErr] saw IllegalStateException
+[reqErr] out REQUEST
+[reqOnly] saw IllegalStateException
+[reqOnly] out REQUEST
+[reqErr] in  ERROR /error-page/runtime
+  error page: type=ERROR uri=/error-page/runtime status_code=500 exception_type=class java.lang.IllegalStateException message=boom exception=java.lang.IllegalStateException: boom request_uri=/ex servlet_name=ex resp.status=500
+[reqErr] out ERROR
+  client: 500 body=custom error page /error-page/runtime
+=== GET /ex?t=wrap
+[reqOnly] in  REQUEST /ex
+[reqErr] in  REQUEST /ex
+[reqErr] saw ServletException
+[reqErr] out REQUEST
+[reqOnly] saw ServletException
+[reqOnly] out REQUEST
+[reqErr] in  ERROR /error-page/runtime
+  error page: type=ERROR uri=/error-page/runtime status_code=500 exception_type=class java.lang.IllegalArgumentException message=wrapped exception=java.lang.IllegalArgumentException: inner request_uri=/ex servlet_name=ex resp.status=500
+[reqErr] out ERROR
+  client: 500 body=custom error page /error-page/runtime
+=== GET /ex?t=io
+[reqOnly] in  REQUEST /ex
+[reqErr] in  REQUEST /ex
+[reqErr] saw IOException
+[reqErr] out REQUEST
+[reqOnly] saw IOException
+[reqOnly] out REQUEST
+[reqErr] in  ERROR /error-page/500
+  error page: type=ERROR uri=/error-page/500 status_code=500 exception_type=null message= exception=java.io.IOException: disk request_uri=/ex servlet_name=ex resp.status=500
+[reqErr] out ERROR
+  client: 500 body=custom error page /error-page/500
+=== GET /ex?t=404
+[reqOnly] in  REQUEST /ex
+[reqErr] in  REQUEST /ex
+[reqErr] out REQUEST
+[reqOnly] out REQUEST
+[reqErr] in  ERROR /error-page/404
+  error page: type=ERROR uri=/error-page/404 status_code=404 exception_type=null message=no item exception=null request_uri=/ex servlet_name=ex resp.status=404
+[reqErr] out ERROR
+  client: 404 body=custom error page /error-page/404
+=== GET /ex?t=status
+[reqOnly] in  REQUEST /ex
+[reqErr] in  REQUEST /ex
+[reqErr] out REQUEST
+[reqOnly] out REQUEST
+  client: 404 body=plain 404 body
+=== GET /ex?t=commit
+[reqOnly] in  REQUEST /ex
+[reqErr] in  REQUEST /ex
+[reqErr] saw IllegalStateException
+[reqErr] out REQUEST
+[reqOnly] saw IllegalStateException
+[reqOnly] out REQUEST
+  error page: type=INCLUDE uri=/ex status_code=500 exception_type=class java.lang.IllegalStateException message=late exception=java.lang.IllegalStateException: late request_uri=/ex servlet_name=ex resp.status=200
+  client: java.io.IOException: chunked transfer encoding, state: READING_LENGTH</code></pre>
+<h4>출력을 한 줄씩 읽기</h4>
+<p><b>런타임 예외(<code>t=rt</code>).</b> 필터는 등록 순서대로 <code>reqOnly</code>, <code>reqErr</code> 순으로 들어갔다. 서블릿이 던진 <code>IllegalStateException</code>은 안쪽 필터 <code>reqErr</code>의 <code>catch</code>를 먼저 지나고 바깥 <code>reqOnly</code>를 나중에 지난다. 두 필터 모두 <code>finally</code>의 <code>out</code>을 찍었다. 스택이 되감기는 순서 그대로다. 그다음 줄에서 <code>reqErr</code>만 <code>ERROR</code> 디스패치로 다시 들어온다. 오류 페이지 서블릿 안에서 <code>getRequestURI()</code>는 <code>/error-page/runtime</code>이지만 <code>jakarta.servlet.error.request_uri</code>는 원래 경로 <code>/ex</code>다. forward가 경로를 바꾼다는 것과, 원래 경로는 속성으로 보존된다는 것이 동시에 보인다. 클라이언트는 500 상태와 오류 페이지 본문을 한 번의 응답으로 받았다.</p>
+<p><b>감싼 예외(<code>t=wrap</code>).</b> 던진 것은 <code>ServletException</code>이고, 이 클래스는 <code>Exception</code>을 상속하지 <code>RuntimeException</code>을 상속하지 않는다. 그래서 첫 번째 탐색(던진 예외 자체의 계층)은 실패하고, 루트 원인 <code>IllegalArgumentException</code>으로 두 번째 탐색을 해서 <code>RuntimeException</code> 페이지가 걸렸다. 속성을 자세히 보면 <code>exception_type</code>과 <code>exception</code>은 루트 원인인데 <code>message</code>는 바깥 예외의 메시지 <code>wrapped</code>다. Tomcat의 <code>throwable()</code>이 속성을 채울 때 타입과 예외 객체에는 루트 원인을, 메시지에는 원래 던져진 예외의 <code>getMessage()</code>를 넘기기 때문이다. 명세가 정한 것이 아니라 Tomcat 구현(10.1.41, 11.0.27 모두 같음)에서 나온 결과이므로, 오류 페이지에서 메시지를 보여 주고 싶다면 메시지 속성보다 예외 객체를 직접 보는 편이 의도가 분명하다.</p>
+<p><b>검사 예외(<code>t=io</code>).</b> <code>IOException</code>은 <code>RuntimeException</code> 계열이 아니고 <code>ServletException</code>도 아니므로 예외 타입 탐색은 두 번 다 실패한다. Tomcat은 상태를 500으로 두고 <code>status()</code>로 넘어가 500번 페이지를 찾았다. 이 경로는 "상태 코드로 찾은 오류"이므로 <code>exception_type</code>을 채우지 않고, 메시지는 <code>sendError</code>로 지정된 메시지가 없어 빈 문자열이다. 그런데 <code>exception</code> 속성에는 <code>IOException</code>이 들어 있다. 이 값은 오류 페이지를 찾기 전에, 서블릿을 호출한 <code>StandardWrapperValve</code>가 예외를 잡은 순간 이미 요청 속성에 넣어 둔 것이기 때문이다. 같은 500 오류라도 어떤 경로로 페이지가 선택되었느냐에 따라 채워지는 속성이 다르다는 점이 중요하다.</p>
+<p><b><code>sendError</code>(<code>t=404</code>)와 <code>setStatus</code>(<code>t=status</code>).</b> <code>sendError(404, "no item")</code>에서는 두 필터의 <code>catch</code>가 아무것도 보지 못했다. 예외가 없었으니 당연하다. 그래도 컨테이너는 응답의 오류 플래그를 보고 404번 페이지로 ERROR 디스패치를 했고, 메시지 속성에는 <code>sendError</code>의 두 번째 인자가 그대로 들어왔다. 반면 <code>setStatus(404)</code>는 오류 디스패치 자체가 일어나지 않았다. 클라이언트는 404 상태와 서블릿이 쓴 본문 <code>plain 404 body</code>를 받았다. 마지막 <code>t=commit</code>은 응답을 먼저 내보낸 뒤 예외를 던진 경우로, 조금 뒤에 따로 다룬다.</p>
+<p>같은 프로그램을 오류 페이지 없이(인자를 하나 주고) 실행하면 <code>t=rt</code>, <code>t=wrap</code>, <code>t=io</code>는 모두 500, <code>t=404</code>는 404 상태로 끝나고, 본문은 Tomcat이 직접 만든 HTML(<code><title></code>이 <code>HTTP Status 500 – Internal Server Error</code>인 문서)이다. 필터 <code>reqErr</code>의 <code>ERROR</code> 줄은 하나도 찍히지 않는다. 오류 페이지가 없으면 ERROR 디스패치도 없다.</p>
+
+<h3>한 층 아래: Tomcat 밸브 파이프라인</h3>
+<p>Tomcat은 요청을 컨테이너 계층(엔진 → 호스트 → 컨텍스트 → 래퍼)을 따라 내려보내고, 각 계층은 밸브(valve)의 사슬인 파이프라인을 가진다. 각 파이프라인의 마지막 밸브(basic valve)가 다음 계층의 파이프라인을 부른다. 오류 처리에 관여하는 밸브는 세 개다. 래퍼 계층의 <code>StandardWrapperValve</code>, 호스트 계층의 <code>StandardHostValve</code>, 그리고 호스트 파이프라인에서 <code>StandardHostValve</code>보다 앞에 끼워지는 <code>ErrorReportValve</code>다(<code>StandardHost</code>가 시작할 때 <code>errorReportValveClass</code> 속성의 밸브를 파이프라인에 추가한다).</p>
+<pre class="diagram">작업자 스레드
+ └ CoyoteAdapter.service()
+    └ [Engine 파이프라인] StandardEngineValve
+       └ [Host 파이프라인] ErrorReportValve ──▶ StandardHostValve(basic)
+             (3) 커밋 안 됐으면                (2) 오류 플래그를 보고
+                 Tomcat 기본 HTML 작성            오류 페이지 탐색 → forward
+          └ [Context 파이프라인] StandardContextValve
+             └ [Wrapper 파이프라인] StandardWrapperValve
+                   (1) 필터 체인·서블릿 호출을 try로 감싸고
+                       예외를 잡으면: 요청 속성에 예외 저장, 상태 500, 오류 플래그
+                └ ApplicationFilterChain → 필터1 → 필터2 → Servlet.service()</pre>
+<p><b>(1) 예외를 잡는 곳.</b> <code>StandardWrapperValve.invoke()</code>는 <code>filterChain.doFilter(...)</code> 호출을 <code>try</code>로 감싸고 <code>IOException</code>, <code>ServletException</code>, <code>Throwable</code> 등을 차례로 잡는다. 대부분의 경우 private 메서드 <code>exception()</code>을 부르는데, 하는 일은 세 줄이다. 요청 속성 <code>jakarta.servlet.error.exception</code>에 예외를 넣고, 상태를 500으로 바꾸고, 응답의 오류 플래그를 켠다. 예외는 여기서 삼켜지고 더 위로 올라가지 않는다. 예외 몇 가지는 다르게 다룬다. 잘못된 요청을 뜻하는 Tomcat 내부 예외(<code>BadRequestException</code>)는 500 대신 400을 쓰고, <code>UnavailableException</code>은 서블릿을 사용 불가 상태로 표시하는 별도 경로로 간다. Tomcat 11.0.27 소스의 <code>ExceptionUtils.handleThrowable()</code>은 <code>StackOverflowError</code>는 삼키지만 <code>OutOfMemoryError</code> 같은 <code>VirtualMachineError</code>는 다시 던지므로, 그런 오류는 이 회차의 오류 페이지 경로를 타지 않는다.</p>
+<p><b>(2) 오류 페이지를 고르는 곳.</b> 컨텍스트 파이프라인 호출이 돌아오면 <code>StandardHostValve.invoke()</code>는 요청 속성에서 예외를 꺼내고, 응답이 오류 보고를 필요로 하는지(<code>isErrorReportRequired()</code>) 확인한다. 예외가 있으면 <code>throwable()</code>, 없으면 <code>status()</code>를 부른다. 앞에서 본 매칭 규칙과 <code>custom()</code>의 forward가 모두 이 클래스 안에 있다. forward가 성공하면 <code>response.finishResponse()</code>로 응답을 끝내 버린다. 이 시점에 응답은 커밋되고 클라이언트로 나간다.</p>
+<p><b>(3) 마지막 안전망.</b> <code>ErrorReportValve.invoke()</code>는 먼저 다음 밸브(<code>StandardHostValve</code>)를 부르고, 돌아온 뒤 응답이 이미 커밋되었으면 오류 화면을 쓰지 않는다(아직 오류 보고 표시가 없으면 남은 출력을 내보내고 연결만 닫는다). 오류 페이지가 성공적으로 그려졌다면 여기서 끝난다. 커밋되지 않았는데 오류 상태라면 Tomcat이 직접 HTML 오류 보고서를 쓴다. 오류 페이지를 등록하지 않았을 때 본 <code>HTTP Status 500 – Internal Server Error</code> 화면이 이것이다. 이 화면에는 기본 설정에서 예외 보고와 서버 정보가 들어갈 수 있는데, Spring Boot 3.5.0의 <code>TomcatWebServerFactoryCustomizer</code>는 <code>server.error.include-stacktrace</code>가 기본값 <code>never</code>일 때 이 밸브를 <code>setShowReport(false)</code>, <code>setShowServerInfo(false)</code>로 다시 등록한다. 부트 애플리케이션에서 Tomcat 기본 화면까지 떨어지더라도 스택 트레이스와 서버 버전이 노출되지 않는 이유다.</p>
+<p>이 구조는 "오류 페이지가 또 실패하면 무한히 재시도하는가"라는 질문에도 답을 준다. <code>custom()</code>은 forward 전체를 <code>try</code>로 감싸고 <code>Throwable</code>을 잡으면 로그를 남긴 뒤 <code>false</code>를 반환한다. 오류 페이지를 다시 찾지 않는다. 실제로 기본 오류 페이지 <code>/error</code>로 등록한 서블릿이 항상 예외를 던지게 해 보면, 그 서블릿은 <code>ERROR</code> 디스패치로 딱 한 번 호출되고 클라이언트는 Tomcat 기본 화면(500)을 받는다. 같은 서블릿을 기본 페이지가 아니라 <code>RuntimeException</code> 타입 페이지로 등록하면 결과가 조금 다르다. 역시 한 번만 호출되지만 클라이언트는 본문이 빈 500 응답을 받는다. 예외 타입 경로(<code>throwable()</code>)는 forward하기 <b>전에</b> 응답에 "오류 보고 완료" 표시(<code>setErrorReported()</code>)를 하고, 상태 코드 경로(<code>status()</code>)는 forward가 <b>성공한 뒤에</b> 표시한다. <code>ErrorReportValve</code>는 이 표시가 이미 되어 있으면 기본 화면을 쓰지 않기 때문이다.</p>
+<pre data-label="실행 결과 (오류 페이지 자체가 예외를 던질 때)"><code class="language-text">error page call #1 ERROR
+client: 500 <!doctype html><html lang="en"><head><title>HTTP Status 500 – Internal Server Error</title></code></pre>
+
+<x-visual id="spring-mvc2-08-tomcat-valves" title="Tomcat 밸브 파이프라인과 오류 처리 지점" kind="구조도" ratio="4:3">
+<x-hint>컨테이너 계층별 파이프라인을 중첩 상자로 그리고, 예외를 잡는 곳·오류 페이지를 고르는 곳·기본 화면을 쓰는 곳을 번호로 표시한다.</x-hint>
+<x-prompt>세로 4:3 구조도. 바깥에서 안쪽으로 중첩된 둥근 사각형 4개: 가장 바깥 "Engine", 그 안 "Host", 그 안 "Context", 가장 안쪽 "Wrapper". Host 상자 상단에 작은 칩 두 개를 왼쪽에서 오른쪽으로 배치: "ErrorReportValve"(회색)와 "StandardHostValve"(주황), 사이에 오른쪽 화살표. Wrapper 상자 안에 "StandardWrapperValve" 칩과 그 아래 가로 사슬 "필터1" → "필터2" → "서블릿". 서블릿에서 위쪽 StandardWrapperValve로 빨간 점선 화살표와 라벨 "예외". StandardWrapperValve 옆에 원형 번호 1과 라벨 "예외 저장·상태 500". StandardHostValve 옆에 번호 2와 라벨 "오류 페이지 forward". ErrorReportValve 옆에 번호 3과 라벨 "기본 HTML". 흰 배경, 단색 선.</x-prompt>
+<x-caption>예외는 StandardWrapperValve에서 멈추고, StandardHostValve가 오류 페이지를 고르며, 그래도 응답이 비어 있으면 ErrorReportValve가 기본 화면을 쓴다.</x-caption>
+</x-visual>
+
+<h3>응답이 이미 커밋되었다면</h3>
+<p>커밋(commit)은 상태 줄과 헤더가 이미 소켓으로 나갔다는 뜻이다. 서블릿이 응답 본문을 쓰면 우선 응답 버퍼에 쌓이고, 버퍼가 가득 차거나 <code>flushBuffer()</code>를 부르면 그 순간 상태 줄과 헤더가 함께 전송된다. 한 번 나간 상태 줄은 되돌릴 수 없다. 실험의 <code>t=commit</code> 케이스는 <code>partial</code>을 쓰고 <code>flushBuffer()</code>로 200 응답을 커밋한 뒤 예외를 던졌다.</p>
+<p>Tomcat의 <code>custom()</code>은 이 상황을 따로 처리한다. 응답이 커밋되었으면 forward 대신 <code>include()</code>로 오류 페이지를 부르고, 버퍼를 비운 뒤, 연결을 즉시 닫는다(<code>ActionCode.CLOSE_NOW</code>). 소스의 주석은 이것을 "할 수 있는 최선"이라고 적고, 연결을 닫는 것은 클라이언트에게 무언가 잘못되었다는 추가 신호라고 설명한다. 실험 출력이 정확히 그렇다. 오류 페이지 서블릿은 <code>type=INCLUDE</code>로 호출되었고, include는 요청 경로를 바꾸지 않으므로 <code>uri=/ex</code>가 찍혔다. <code>status_code</code> 속성은 500이지만 실제 응답 상태는 이미 나간 <code>resp.status=200</code>이다. <code>ERROR</code> 디스패치가 아니므로 <code>reqErr</code> 필터도 불리지 않았다. 청크 전송 인코딩(chunked transfer encoding)으로 나가던 응답이 마지막 청크 없이 끊겼기 때문에, 클라이언트(JDK <code>HttpClient</code>)는 응답을 완성하지 못하고 <code>IOException</code>을 던졌다. 오류 페이지를 등록하지 않은 실행에서도 <code>ErrorReportValve</code>가 같은 방식으로 연결을 닫아 같은 결과가 나온다.</p>
+<p>이 케이스는 실무에서 대용량 파일 다운로드, CSV 스트리밍, 템플릿이 중간에 버퍼를 비운 뒤의 렌더링 실패처럼 "쓰는 도중에 실패"하는 곳에서 나타난다. 이때는 어떤 오류 페이지 설정도 상태 코드를 바꿀 수 없다. 스프링 부트의 화이트라벨 뷰(<code>StaticView</code>)도 응답이 커밋되어 있으면 아무것도 쓰지 않고 <code>Cannot render error page for request [...] as the response has already been committed.</code>로 시작하는 오류 로그만 남긴다. 스트리밍 응답은 시작하기 전에 실패할 수 있는 검증(권한, 존재 여부, 파일 열기)을 모두 끝내 두는 것이 유일한 방어다.</p>
+
+<h3>필터는 오류 디스패치에서 다시 불린다: DispatcherType</h3>
+<p>한 요청 안에서 서블릿이 여러 번 호출될 수 있기 때문에, 서블릿 명세는 "이번 호출이 어떤 경로로 들어왔는가"를 <code>jakarta.servlet.DispatcherType</code> 열거형으로 구분한다. 값은 다섯 개다. 클라이언트에서 직접 온 <code>REQUEST</code>, <code>RequestDispatcher.forward()</code>의 <code>FORWARD</code>, <code>include()</code>의 <code>INCLUDE</code>, 오류 페이지 메커니즘의 <code>ERROR</code>, 비동기 처리의 <code>AsyncContext.dispatch()</code>로 들어온 <code>ASYNC</code>다. <code>request.getDispatcherType()</code>으로 현재 값을 읽을 수 있다.</p>
+<p>필터 매핑은 이 값 중 어떤 디스패치에 필터를 끼울지 고를 수 있고, 명세 §6.2.5는 <code>dispatcher</code> 요소가 하나도 없으면 <code>REQUEST</code>로 간주한다고 정한다. Tomcat은 필터 체인을 만들 때(<code>ApplicationFilterFactory</code>) 현재 디스패치 타입을 읽어 각 필터 매핑의 디스패처 비트와 비교하고, 맞는 필터만 체인에 넣는다. 실험에서 <code>reqOnly</code>가 오류 디스패치에 보이지 않고 <code>reqErr</code>만 두 번 보인 것이 이 비교의 결과다. 즉 07회에서 만든 로그 필터나 로그인 체크 필터는, 디스패처 타입을 지정하지 않았다면 오류 페이지 호출에서는 실행되지 않는다.</p>
+<p>스프링 부트의 <code>FilterRegistrationBean</code>도 같은 기본값을 따르되 한 가지 예외가 있다. Boot 3.5.0의 <code>AbstractFilterRegistrationBean.determineDispatcherTypes()</code>는 디스패처 타입을 지정하지 않았을 때, 필터가 스프링의 <code>OncePerRequestFilter</code>이면 <b>모든 타입</b>(<code>EnumSet.allOf</code>)을, 그 밖의 필터면 <code>REQUEST</code>만 쓴다. 오류 디스패치에서도 필터를 실행하고 싶다면 직접 지정한다.</p>
+<pre><code class="language-java">import jakarta.servlet.DispatcherType;
+import jakarta.servlet.Filter;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class FilterConfig {
+
+    @Bean
+    public FilterRegistrationBean<Filter> accessLogFilter() {
+        FilterRegistrationBean<Filter> bean = new FilterRegistrationBean<>();
+        bean.setFilter(new AccessLogFilter());   // AccessLogFilter: jakarta.servlet.Filter 구현 // ...
+        bean.setOrder(1);
+        bean.addUrlPatterns("/*");
+        bean.setDispatcherTypes(DispatcherType.REQUEST, DispatcherType.ERROR);
+        return bean;
+    }
+}</code></pre>
+<p>그렇다면 <code>OncePerRequestFilter</code>는 모든 디스패치에 등록되니 오류 디스패치에서 두 번 실행될까? 아니다. Spring Framework 6.2.7의 <code>OncePerRequestFilter.doFilter()</code>는 먼저 <code>skipDispatch()</code>를 확인한다. 요청에 <code>jakarta.servlet.error.request_uri</code> 속성이 있고(즉 오류 디스패치이고) <code>shouldNotFilterErrorDispatch()</code>가 참이면 자기 로직을 건너뛰고 체인만 넘긴다. 이 메서드의 기본 반환값이 <code>true</code>다. 비동기 디스패치도 <code>shouldNotFilterAsyncDispatch()</code>의 기본값 <code>true</code>로 같은 처리를 한다. 오류 디스패치에서도 실행되기를 원하면 하위 클래스에서 <code>shouldNotFilterErrorDispatch()</code>가 <code>false</code>를 반환하도록 재정의한다. 이 클래스는 한 요청에서 이미 실행되었는지를 "<code>필터이름.FILTERED</code>" 형태의 요청 속성으로 기록하고, 자기 로직이 끝나면 그 속성을 지운다. 컨테이너 수준의 등록(모든 타입)과 필터 내부의 판단(오류 디스패치는 건너뜀)을 분리해 둔 설계다.</p>
+<aside class="note">어느 쪽이 옳은 기본값인지는 필터가 하는 일에 달려 있다. 요청 수를 세거나 접근 로그를 남기는 필터를 ERROR에도 걸면 실패한 요청이 두 번 기록된다. 반대로 응답 헤더를 붙이거나 요청 추적 정보를 설정하는 필터가 오류 디스패치에서 빠지면, 오류 페이지를 그리는 동안에는 그 정보가 없을 수 있다.</aside>
+
+<h3>인터셉터는 디스패치 타입을 모른다</h3>
+<p>스프링 인터셉터(<code>HandlerInterceptor</code>)는 서블릿 컨테이너가 아니라 <code>DispatcherServlet</code> 안에서 동작한다. 컨테이너가 오류 페이지 <code>/error</code>로 ERROR 디스패치를 하면 그 요청도 <code>DispatcherServlet</code>을 지나고, 핸들러 매핑은 <code>/error</code>에 매핑된 컨트롤러를 찾아 등록된 인터셉터와 함께 <code>HandlerExecutionChain</code>을 만든다. 인터셉터 등록에는 디스패치 타입을 고르는 설정이 없으므로, 경로 패턴이 맞으면 오류 디스패치에서도 <code>preHandle</code>이 다시 불린다. 그래서 인터셉터에서는 오류 경로를 경로 패턴으로 빼는 것이 일반적인 방법이다. 경로 비교는 현재 디스패치의 경로로 하므로, ERROR 디스패치에서는 원래 URI가 아니라 <code>/error</code>로 비교된다.</p>
+<pre><code class="language-java">import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.servlet.HandlerInterceptor;
+import org.springframework.web.servlet.ModelAndView;
+import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+
+class DispatchTraceInterceptor implements HandlerInterceptor {
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+        System.out.println("preHandle " + request.getDispatcherType() + " " + request.getRequestURI());
+        return true;
+    }
+    @Override
+    public void postHandle(HttpServletRequest request, HttpServletResponse response, Object handler,
+                           ModelAndView modelAndView) {
+        System.out.println("postHandle " + request.getDispatcherType());
+    }
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler,
+                                Exception ex) {
+        System.out.println("afterCompletion " + request.getDispatcherType() + " ex=" + ex);
+    }
+}
+
+@Configuration
+public class InterceptorConfig implements WebMvcConfigurer {
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(new DispatchTraceInterceptor())
+                .order(1)
+                .addPathPatterns("/**")
+                .excludePathPatterns("/error", "/error-page/**"); // 이 줄을 빼면 오류 디스패치에서도 호출된다
+    }
+}</code></pre>
+<p>예외가 났을 때 인터셉터의 세 메서드가 어떻게 불리는지는 <code>DispatcherServlet.doDispatch()</code>를 읽으면 정확히 알 수 있다. 6.2.7 소스의 뼈대는 이렇다. <code>applyPreHandle</code> → <code>ha.handle(...)</code>(컨트롤러 호출) → <code>applyPostHandle</code>이 하나의 <code>try</code> 안에 있고, 여기서 난 예외는 <code>dispatchException</code> 변수에 담긴다. 그다음 <code>processDispatchResult()</code>가 예외를 <code>HandlerExceptionResolver</code>들에게 넘긴다. 아무 리졸버도 처리하지 못하면 예외를 다시 던지고, 바깥 <code>catch</code>가 <code>triggerAfterCompletion(..., ex)</code>을 부른 뒤 또 다시 던진다. 결과적으로 다음이 성립한다.</p>
+<ul>
+<li>컨트롤러가 예외를 던지면 <code>applyPostHandle</code>에 도달하지 못하므로 <b><code>postHandle</code>은 호출되지 않는다.</b></li>
+<li><code>afterCompletion</code>은 <code>preHandle</code>이 <code>true</code>를 반환한 인터셉터에 대해 <b>역순으로</b> 호출된다(<code>HandlerExecutionChain</code>이 기록한 <code>interceptorIndex</code>부터 0까지). <code>afterCompletion</code> 안에서 난 예외는 로그만 남기고 삼킨다.</li>
+<li>리졸버가 예외를 처리하지 못했을 때 <code>afterCompletion</code>의 <code>ex</code>는 컨트롤러가 던진 바로 그 예외 객체다. 반대로 리졸버가 처리했다면(<code>@ExceptionHandler</code> 등) <code>processDispatchResult()</code>가 정상 경로로 <code>triggerAfterCompletion(request, response, null)</code>을 부르므로 <code>ex</code>는 <code>null</code>이다. "afterCompletion의 ex가 null이면 성공한 요청"이라고 판단하면 틀릴 수 있다.</li>
+</ul>
+<p>제외 패턴 줄을 지운 채로 <code>/orders/7</code>에서 <code>IllegalStateException</code>이 나는 경우를 소스대로 추적하면(직접 실행한 결과가 아니라 위의 분기를 따라 정한 순서다) 출력은 다음 순서가 된다. ERROR 디스패치에서 <code>BasicErrorController</code>는 정상적으로 반환하므로 그때는 <code>postHandle</code>이 불리고 <code>ex</code>는 <code>null</code>이다.</p>
+<pre data-label="소스로 추적한 호출 순서"><code class="language-text">preHandle REQUEST /orders/7
+afterCompletion REQUEST ex=java.lang.IllegalStateException: ...
+preHandle ERROR /error
+postHandle ERROR
+afterCompletion ERROR ex=null</code></pre>
+<p>필터·서블릿·인터셉터·컨트롤러를 한 그림에 놓으면 전체 흐름은 아래와 같다. 07회에서 본 필터와 인터셉터의 호출 순서가 한 요청 안에서 두 번 반복되고, 두 번째 반복에서는 디스패치 타입 설정과 경로 제외 설정에 따라 빠지는 구성 요소가 생긴다.</p>
+<pre class="diagram">[1] REQUEST 디스패치  GET /orders/7
+  WAS → 필터(REQUEST) → DispatcherServlet → 인터셉터.preHandle → 컨트롤러
+  컨트롤러: throw IllegalStateException
+  DispatcherServlet: 리졸버 순회 → 처리 못 함 → 다시 던짐
+  인터셉터.afterCompletion(ex)                  (postHandle 없음)
+  FrameworkServlet: ServletException으로 감싸 던짐
+  필터: catch하지 않으면 통과, finally 실행
+  StandardWrapperValve: 예외 저장 · 상태 500 · 오류 플래그
+
+[2] 오류 페이지 선택 (StandardHostValve)
+  예외 타입 페이지? 없음 → 500 페이지? 없음 → 기본(0) 페이지 = /error
+
+[3] ERROR 디스패치  forward /error  (같은 요청 객체, 같은 스레드)
+  WAS → 필터(ERROR 포함 등록분만) → DispatcherServlet
+      → 인터셉터(/error 제외 안 했으면) → BasicErrorController → 오류 뷰 렌더링
+  응답 완료: 500 + 오류 HTML, 주소창 URL은 /orders/7 그대로</pre>
+
+<h3>스프링 MVC가 예외를 컨테이너에 넘기는 마지막 구간</h3>
+<p>위 그림의 [1]에서 "다시 던짐"과 "감싸 던짐" 사이를 조금 더 자세히 보자. <code>DispatcherServlet.processHandlerException()</code>은 등록된 <code>HandlerExceptionResolver</code>들을 순서대로 부르고, 처음으로 <code>null</code>이 아닌 <code>ModelAndView</code>를 돌려준 리졸버에서 멈춘다. 모두 <code>null</code>이면 <code>throw ex</code>로 예외를 그대로 다시 던진다. 스프링 부트에서는 이 목록의 맨 앞에 <code>DefaultErrorAttributes</code>가 있다. 이 클래스는 <code>ErrorAttributes</code>이면서 <code>HandlerExceptionResolver</code>이기도 하고, 순서가 <code>Ordered.HIGHEST_PRECEDENCE</code>다. 하는 일은 예외를 자기만 아는 요청 속성(<code>DefaultErrorAttributes.class.getName() + ".ERROR"</code>)에 저장하고 <code>null</code>을 반환하는 것뿐이다. 예외를 처리하지는 않고 기록만 해 두었다가, 나중에 오류 디스패치에서 오류 정보를 만들 때 다시 꺼내 쓴다. 나머지 리졸버(<code>@ExceptionHandler</code>를 처리하는 리졸버 등)의 동작은 09회 「API 예외 처리」에서 자세히 다룬다.</p>
+<p>리졸버가 모두 포기한 예외는 <code>doDispatch()</code>와 <code>doService()</code>를 지나 <code>FrameworkServlet.processRequest()</code>에 도착한다. 6.2.7 소스에서 이 메서드는 <code>ServletException</code>과 <code>IOException</code>은 그대로 다시 던지고, 그 밖의 모든 <code>Throwable</code>은 <code>new ServletException("Request processing failed: " + ex, ex)</code>로 감싸 던진다. <code>HttpServlet.service()</code>의 시그니처가 허용하는 예외로 바꾸는 것이다. 그래서 컨트롤러의 <code>IllegalStateException</code>은 컨테이너에 <code>ServletException</code>으로 도착하고, Tomcat은 그 루트 원인을 꺼내 로그를 찍고 오류 페이지를 찾는다. 앞의 명세 규칙에서 "<code>ServletException</code>이면 루트 원인으로 한 번 더 찾는다"가 왜 필요한지가 여기서 드러난다. 프레임워크가 예외를 감싸도 원래 예외 타입으로 오류 페이지를 고를 수 있어야 하기 때문이다.</p>
+<p>오류 디스패치로 가는 또 하나의 길은 리졸버가 예외를 <code>sendError</code>로 바꾸는 경우다. 예를 들어 Spring Framework 6.1부터 정적 자원 처리기(<code>ResourceHttpRequestHandler</code>)는 요청한 파일을 찾지 못하면 <code>NoResourceFoundException</code>을 던지고, <code>DefaultHandlerExceptionResolver</code>는 이 예외를 받아 <code>response.sendError(404, 상세 메시지)</code>를 호출한 뒤 빈 <code>ModelAndView</code>를 반환한다. 빈 <code>ModelAndView</code>는 "처리 완료, 그릴 뷰 없음"이라는 뜻이라 예외는 더 올라가지 않는다. 서블릿은 정상 반환하지만 응답에는 오류 플래그와 404가 남아 있으므로, 컨테이너는 상태 코드 경로로 오류 페이지를 찾는다. 스프링 부트에서 없는 URL을 요청하면 <code>/error</code>가 404 화면을 그리는 것이 이 경로다. 정리하면 스프링 MVC 요청이 <code>/error</code>에 도달하는 길은 "예외가 컨테이너까지 전파"와 "리졸버나 코드가 <code>sendError</code> 호출" 두 가지이고, 이것은 서블릿 명세의 두 가지 오류 신호와 정확히 같다.</p>
+
+<h3>스프링 부트가 /error를 만드는 방법</h3>
+<p>스프링 부트로 웹 애플리케이션을 만들면 오류 페이지를 하나도 등록하지 않아도 브라우저에서는 화이트라벨 오류 페이지가, API 클라이언트에서는 JSON 오류 응답이 나온다. 부트 레퍼런스 문서는 이것을 "모든 오류를 처리하는 <code>/error</code> 매핑을 제공하고, 서블릿 컨테이너에 '전역' 오류 페이지로 등록한다"고 설명한다. 이 동작은 <code>ErrorMvcAutoConfiguration</code>이 등록하는 빈 몇 개의 협업이다(Boot 3.5.0 소스 기준).</p>
+<div class="table-wrap"><table><thead><tr><th>빈</th><th>역할</th><th>바꾸는 법</th></tr></thead><tbody>
+<tr><td><code>ErrorPageCustomizer</code></td><td><code>ErrorPageRegistrar</code> 구현. <code>server.error.path</code>(기본 <code>/error</code>)로 상태·예외 없는 <code>ErrorPage</code> 하나를 등록한다. 즉 컨테이너의 기본 오류 페이지.</td><td>경로는 <code>server.error.path</code></td></tr>
+<tr><td><code>BasicErrorController</code></td><td><code>@RequestMapping("${server.error.path:${error.path:/error}}")</code>. 오류 디스패치를 받아 HTML 또는 JSON을 만든다.</td><td><code>ErrorController</code> 빈을 직접 등록하면 생성되지 않음</td></tr>
+<tr><td><code>DefaultErrorAttributes</code></td><td>요청 속성에서 상태·예외·경로를 모아 모델(<code>Map</code>)을 만든다. 리졸버로서 예외도 기록한다.</td><td><code>ErrorAttributes</code> 빈을 직접 등록</td></tr>
+<tr><td><code>DefaultErrorViewResolver</code></td><td>상태 코드에 맞는 <code>error/</code> 아래 템플릿·정적 HTML을 찾는다.</td><td><code>ErrorViewResolver</code> 빈 추가</td></tr>
+<tr><td>화이트라벨 뷰(이름 <code>error</code>)</td><td><code>error</code> 템플릿이 없을 때만 등록되는 <code>StaticView</code>와 <code>BeanNameViewResolver</code></td><td><code>server.error.whitelabel.enabled=false</code> 또는 <code>error</code> 템플릿 작성</td></tr>
+</tbody></table></div>
+<p><code>ErrorPageCustomizer</code>가 등록한 전역 페이지는 앞에서 본 대로 Tomcat 안에서 상태 코드 0번, 즉 기본 오류 페이지가 된다. 이 사실에서 중요한 결론이 하나 나온다. 부트의 <code>/error</code>는 <b>가장 마지막 후보</b>다. 직접 <code>ErrorPageRegistrar</code>로 예외 타입 페이지나 상태 코드 페이지를 등록하면, Tomcat은 그것을 먼저 찾고 아무것도 맞지 않을 때만 <code>/error</code>로 간다. 컨테이너 수준 오류 페이지와 부트의 오류 컨트롤러는 경쟁 관계가 아니라 같은 탐색 순서의 앞뒤 자리에 있는 것이다.</p>
+<p><code>BasicErrorController</code>는 같은 경로에 메서드 두 개를 둔다. <code>errorHtml()</code>은 <code>produces = "text/html"</code>이 붙어 있어 요청의 <code>Accept</code> 헤더가 HTML을 원할 때(브라우저) 선택되고, 오류 뷰를 찾아 <code>ModelAndView</code>를 반환한다. 다른 모든 요청은 <code>error()</code>가 받아 오류 정보 <code>Map</code>을 <code>ResponseEntity</code> 본문으로 돌려주고, 메시지 컨버터가 JSON으로 쓴다. 두 메서드 모두 상태 코드를 <code>jakarta.servlet.error.status_code</code> 요청 속성에서 읽는다(<code>AbstractErrorController.getStatus()</code>). 속성이 없거나 알 수 없는 값이면 500으로 본다. 상태 코드 결정 권한이 컨트롤러가 아니라 컨테이너가 남긴 속성에 있다는 점이, 오류 컨트롤러가 일반 컨트롤러와 다른 부분이다.</p>
+<p>오류 정보 모델은 <code>DefaultErrorAttributes</code>가 만든다. 상태는 <code>jakarta.servlet.error.status_code</code>에서, 경로는 <code>jakarta.servlet.error.request_uri</code>에서 가져온다. 예외는 자기가 리졸버 단계에서 저장해 둔 속성을 먼저 보고, 없으면 <code>jakarta.servlet.error.exception</code>을 본다. 꺼낸 예외가 <code>ServletException</code>이고 원인이 있으면 원인 쪽으로 계속 벗겨 낸다. 그래서 프레임워크가 감싼 <code>ServletException</code>이 아니라 컨트롤러가 던진 원래 예외의 클래스 이름이 <code>exception</code> 항목이 된다. 메시지는 <code>jakarta.servlet.error.message</code>가 비어 있지 않으면 그것을, 비어 있으면 예외의 메시지를, 둘 다 없으면 <code>No message available</code>을 쓴다. 실험의 <code>t=io</code>에서 본 것처럼 상태 코드 경로로 선택된 오류 페이지에서는 메시지 속성이 빈 문자열이므로, 부트에서 예외가 전파된 경우의 메시지는 대개 예외 객체의 메시지가 된다.</p>
+
+<h3>어떤 오류 뷰가 선택되는가</h3>
+<p><code>errorHtml()</code>은 먼저 등록된 <code>ErrorViewResolver</code>들에게 뷰를 묻는다. 기본 구현 <code>DefaultErrorViewResolver.resolveErrorView()</code>의 규칙은 짧다. 먼저 상태 코드 그대로의 이름(<code>"500"</code>)으로 찾고, 없으면 상태 코드의 계열(series)이 4xx면 <code>"4xx"</code>, 5xx면 <code>"5xx"</code>로 다시 찾는다. 이름 하나를 찾는 <code>resolve()</code>는 앞에 <code>error/</code>를 붙인 뒤, 그 이름의 템플릿이 있는지 템플릿 엔진별 <code>TemplateAvailabilityProvider</code>에게 묻고, 없으면 정적 자원 위치들(<code>spring.web.resources.static-locations</code>, 기본값은 <code>classpath:/META-INF/resources/</code>, <code>classpath:/resources/</code>, <code>classpath:/static/</code>, <code>classpath:/public/</code>)에서 <code>error/500.html</code> 파일을 찾는다. 여기서 순서를 정확히 읽어야 한다. <b>템플릿과 정적 파일을 한 이름 안에서 먼저 모두 본 다음</b>에 계열 이름으로 넘어간다.</p>
+<div class="table-wrap"><table><thead><tr><th>순서</th><th>상태 500에 대해 확인하는 것 (Thymeleaf 기준 경로)</th><th>근거</th></tr></thead><tbody>
+<tr><td>1</td><td><code>templates/error/500.html</code></td><td><code>resolve("500")</code>의 템플릿 확인</td></tr>
+<tr><td>2</td><td>정적 위치의 <code>error/500.html</code> (예: <code>static/error/500.html</code>)</td><td><code>resolve("500")</code>의 정적 자원 확인</td></tr>
+<tr><td>3</td><td><code>templates/error/5xx.html</code></td><td><code>resolve("5xx")</code>의 템플릿 확인</td></tr>
+<tr><td>4</td><td>정적 위치의 <code>error/5xx.html</code></td><td><code>resolve("5xx")</code>의 정적 자원 확인</td></tr>
+<tr><td>5</td><td>뷰 이름 <code>error</code>: <code>templates/error.html</code>이 있으면 그 템플릿</td><td><code>errorHtml()</code>의 <code>new ModelAndView("error", model)</code></td></tr>
+<tr><td>6</td><td>화이트라벨 <code>StaticView</code></td><td><code>error</code> 템플릿이 없을 때만 등록되는 빈</td></tr>
+</tbody></table></div>
+<p>그래서 <code>templates/error/5xx.html</code>과 <code>static/error/500.html</code>이 함께 있으면 500 오류에는 정적 파일이 선택된다. "템플릿이 정적 파일보다 우선"이라고 외워 두면 틀리는 지점이다. 정확한 규칙은 "구체적인 상태 코드가 계열보다 우선, 같은 이름 안에서는 템플릿이 정적 파일보다 우선"이다. 정적 HTML이 선택되면 부트는 그 파일을 그대로 복사해 응답하는 내부 뷰(<code>HtmlResourceView</code>)를 쓰므로 모델 값을 출력할 수 없다. 오류 정보(상태, 경로)를 화면에 넣고 싶다면 템플릿을 써야 한다.</p>
+<p>5번과 6번은 조건부 빈 등록으로 연결되어 있다. <code>WhitelabelErrorViewConfiguration</code>에는 <code>ErrorTemplateMissingCondition</code>이 붙어 있어서, 템플릿 엔진이 <code>error</code>라는 템플릿을 찾을 수 있으면 화이트라벨 뷰 빈 자체가 만들어지지 않는다. 그러면 <code>ModelAndView("error")</code>는 일반 뷰 리졸버(Thymeleaf)가 <code>templates/error.html</code>로 해석한다. 템플릿이 없으면 이름이 <code>error</code>인 <code>StaticView</code> 빈이 등록되고 <code>BeanNameViewResolver</code>가 그 빈을 찾는다. 이 뷰는 <code>Whitelabel Error Page</code> 제목과 <code>This application has no explicit mapping for /error, so you are seeing this as a fallback.</code> 문장, 시각, 오류 종류와 상태를 HTML 이스케이프해서 쓴다. <code>server.error.whitelabel.enabled=false</code>로 끄면 이 빈이 없어지고, <code>error</code> 뷰를 해석할 수 없으면 오류 디스패치 자체가 실패해 결국 앞에서 본 Tomcat 기본 화면까지 떨어진다.</p>
+<p>템플릿에서는 모델의 키를 그대로 쓴다. 기본으로 들어 있는 키는 <code>timestamp</code>, <code>status</code>, <code>error</code>(상태의 이유 문구), <code>path</code>이고, 다음 절의 설정에 따라 <code>exception</code>, <code>message</code>, <code>trace</code>, <code>errors</code>가 추가된다.</p>
+<pre data-label="templates/error/5xx.html"><code class="language-xml"><!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="utf-8">
+    <title>일시적인 오류</title>
+</head>
+<body>
+<h1>요청을 처리하지 못했습니다</h1>
+<p th:text="|상태: ${status} ${error}|">상태</p>
+<p th:text="|요청 경로: ${path}|">경로</p>
+<p th:if="${message != null}" th:text="${message}">메시지</p>
+</body>
+</html></code></pre>
+<p>더 복잡한 규칙이 필요하면 <code>ErrorViewResolver</code> 빈을 추가한다. <code>BasicErrorController</code>는 등록된 리졸버를 순서대로 물어보고 처음 <code>null</code>이 아닌 결과를 쓴다. <code>DefaultErrorViewResolver</code>의 순서는 <code>Ordered.LOWEST_PRECEDENCE</code>라서 직접 만든 리졸버에 순서를 지정하면 기본 규칙보다 먼저 물어보게 할 수 있다.</p>
+
+<x-visual id="spring-mvc2-08-error-view-ladder" title="BasicErrorController의 오류 뷰 선택 순서" kind="순서도" ratio="4:3">
+<x-hint>상태 500 오류에서 정확한 코드 → 계열 → error 뷰 → 화이트라벨로 내려가는 사다리를 보여 주고, 같은 이름 안에서 템플릿을 정적 파일보다 먼저 본다는 것을 강조한다.</x-hint>
+<x-prompt>세로 4:3 순서도. 맨 위 시작 상자 "오류 디스패치 /error (상태 500)". 아래로 마름모 6개를 세로로 연결: "templates/error/500.html?", "static/error/500.html?", "templates/error/5xx.html?", "static/error/5xx.html?", "templates/error.html?", 마지막은 사각형 "화이트라벨 페이지". 각 마름모 오른쪽으로 '예' 화살표가 초록 상자 "이 뷰로 렌더링"에 모인다. 아래로 가는 화살표에는 '아니오' 라벨. 첫 두 마름모를 연한 파란 배경 띠로 묶어 "정확한 코드", 다음 두 개를 연한 보라 띠로 묶어 "계열(5xx)" 라벨. 흰 배경, 간결한 선.</x-prompt>
+<x-caption>정확한 상태 코드가 계열보다 먼저이고, 같은 이름 안에서는 템플릿을 정적 파일보다 먼저 확인한다.</x-caption>
+</x-visual>
+
+<h3>오류 응답에 무엇을 남길 것인가: server.error 설정</h3>
+<p>오류 정보는 디버깅에는 유용하지만 외부에 그대로 보이면 위험하다. 스택 트레이스는 내부 패키지 구조와 사용하는 라이브러리를 드러내고, 예외 메시지에는 SQL 일부나 내부 식별자, 사용자가 입력한 값이 섞여 있을 수 있다. 부트는 그래서 오류 모델에 들어갈 항목을 설정으로 고르게 하고, 위험한 항목은 기본으로 뺀다. Boot 3.5.0의 <code>ErrorProperties</code> 기본값은 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>속성</th><th>기본값</th><th>모델의 키</th></tr></thead><tbody>
+<tr><td><code>server.error.path</code></td><td><code>/error</code></td><td>(오류 컨트롤러 경로)</td></tr>
+<tr><td><code>server.error.include-exception</code></td><td><code>false</code></td><td><code>exception</code></td></tr>
+<tr><td><code>server.error.include-stacktrace</code></td><td><code>never</code></td><td><code>trace</code></td></tr>
+<tr><td><code>server.error.include-message</code></td><td><code>never</code></td><td><code>message</code></td></tr>
+<tr><td><code>server.error.include-binding-errors</code></td><td><code>never</code></td><td><code>errors</code></td></tr>
+<tr><td><code>server.error.include-path</code></td><td><code>always</code></td><td><code>path</code></td></tr>
+<tr><td><code>server.error.whitelabel.enabled</code></td><td><code>true</code></td><td>(화이트라벨 뷰 등록 여부)</td></tr>
+</tbody></table></div>
+<p><code>include-exception</code>을 뺀 나머지 <code>include-*</code> 속성은 <code>never</code>, <code>always</code>, <code>on-param</code> 중 하나다. <code>on-param</code>이면 요청 파라미터로 켠다. <code>BasicErrorController</code>가 보는 파라미터 이름은 각각 <code>trace</code>, <code>message</code>, <code>errors</code>, <code>path</code>이고, 파라미터가 있으면서 값이 <code>false</code>가 아니면 켠 것으로 본다. 오류 디스패치는 원래 요청의 forward이므로 원래 요청의 쿼리 문자열이 그대로 보인다. 즉 <code>on-param</code>은 "누구든 URL에 <code>?trace</code>를 붙이면 스택 트레이스를 볼 수 있다"는 뜻이 되므로, 운영 환경에서 켜는 것은 <code>always</code>와 크게 다르지 않다.</p>
+<p>구현은 "일단 다 만들고 허용되지 않은 키를 지우는" 방식이다. <code>DefaultErrorAttributes</code>는 시각, 상태, 이유 문구, 예외 클래스, 메시지, 경로를 모두 계산하고(스택 트레이스는 요청받았을 때만 계산), 마지막에 <code>ErrorAttributeOptions.retainIncluded()</code>가 포함되지 않은 키를 맵에서 제거한다. 3.5.0의 <code>ErrorAttributeOptions.defaults()</code>는 <code>PATH</code>, <code>STATUS</code>, <code>ERROR</code>를 포함하고, <code>timestamp</code>는 제거 대상 목록(<code>Include</code> 열거형)에 아예 없어서 항상 남는다. 결과적으로 기본 설정의 JSON 오류 응답은 <code>timestamp</code>, <code>status</code>, <code>error</code>, <code>path</code> 네 키로 이루어진다. 열거형의 <code>STATUS</code>와 <code>ERROR</code>에는 <code>@since 3.2.7</code>, <code>PATH</code>에는 <code>@since 3.3.0</code>이 붙어 있으니, 그보다 오래된 3.x에서는 이 키들을 옵션으로 지울 수 없었다.</p>
+<pre data-label="application.properties (개발 환경 예)"><code class="language-properties"># 개발 중에만: 예외 클래스와 메시지를 응답에 포함
+server.error.include-exception=true
+server.error.include-message=always
+# 스택 트레이스는 ?trace 파라미터가 있을 때만
+server.error.include-stacktrace=on-param</code></pre>
+<p>이 설정은 HTML 화면과 JSON 응답 양쪽의 모델에 똑같이 적용된다. 운영 환경에서는 기본값을 유지하고, 원인 분석은 응답이 아니라 서버 로그로 하는 것이 원칙이다. 앞에서 본 것처럼 Tomcat은 서블릿이 던진 예외를 잡을 때 루트 원인과 함께 오류 로그를 남기므로, 오류 응답에서 정보를 빼도 로그에는 스택 트레이스가 남는다.</p>
+
+<h3>흔한 오해와 함정</h3>
+<p><b>"오류 페이지로 리다이렉트된다."</b> 리다이렉트는 3xx 응답과 클라이언트의 두 번째 요청이 필요하지만, 오류 페이지는 서버 안의 forward다. 주소창은 바뀌지 않고, 응답 상태는 원래 오류 상태 그대로다. 그래서 오류 페이지 컨트롤러가 <code>redirect:</code>를 반환하는 식으로 "오류 화면으로 이동"을 흉내 내면 상태 코드가 3xx로 바뀌어 검색 엔진이나 API 클라이언트가 오류를 오류로 인식하지 못한다.</p>
+<p><b>"404 상태를 주면 404 페이지가 뜬다."</b> 오류 페이지 메커니즘의 스위치는 <code>sendError</code>다. <code>setStatus(404)</code>나 <code>ResponseEntity.status(404).body(...)</code>는 상태만 정할 뿐 오류 디스패치를 일으키지 않는다. 반대로 <code>@ResponseStatus</code>를 붙인 예외나 <code>ResponseStatusException</code>처럼 스프링이 <code>sendError</code>로 바꿔 주는 경로는 오류 디스패치로 이어진다(이 변환의 자세한 규칙은 09회의 몫이다).</p>
+<p><b>"<code>RuntimeException</code> 오류 페이지를 등록하면 모든 예외가 잡힌다."</b> 검사 예외인 <code>IOException</code>은 <code>RuntimeException</code>의 하위 타입이 아니어서 걸리지 않는다. <code>ServletException</code>도 마찬가지인데, 이 경우는 루트 원인으로 다시 찾으므로 원인이 런타임 예외면 걸린다. 모든 예외를 한 페이지로 보내려면 <code>Throwable</code>이나 <code>Exception</code>으로 등록하거나 기본 오류 페이지를 두어야 한다. 또 <code>Exception</code>으로 등록하면 <code>ServletException</code> 자체가 첫 번째 탐색에서 걸리므로, 루트 원인 타입별로 나눈 페이지들은 두 번째 탐색까지 가지 못한다는 점도 기억하자.</p>
+<p><b>"오류 페이지에서 또 오류가 나면 무한 루프가 생긴다."</b> Tomcat은 오류 페이지 forward 중의 예외를 잡아 로그만 남기고 다시 오류 페이지를 찾지 않는다. 결과는 기본 오류 페이지(부트의 <code>/error</code>)가 실패했을 때는 Tomcat 기본 화면, 예외 타입 페이지가 실패했을 때는 빈 본문의 500 응답이다. 무한 루프는 없어도, 오류 페이지가 실패하면 사용자에게는 서버 정보가 담길 수 있는 기본 화면이나 빈 화면이 보이고 원래 예외와 오류 페이지의 예외가 로그에 함께 남아 원인 분석이 어려워진다. 오류 페이지는 데이터베이스 조회나 세션 접근처럼 실패할 수 있는 일을 최소화한다.</p>
+<p><b>"필터 로그가 두 번 찍히는 것은 버그다."</b> ERROR 디스패치에 매핑된 필터라면 정상 동작이다. 원래 요청과 오류 페이지 호출을 구분하려면 <code>request.getDispatcherType()</code>을 함께 찍는다. 같은 맥락에서 인터셉터의 <code>preHandle</code>이 오류 경로에서 다시 불려 로그인 검사가 오류 화면 요청까지 막는 일이 생기므로, 07회의 로그인 인터셉터에도 <code>/error</code> 제외가 필요하다.</p>
+<p><b>"오류 페이지에서 <code>request.getRequestURI()</code>로 실패한 경로를 알 수 있다."</b> forward 이후의 <code>getRequestURI()</code>는 오류 페이지 경로다. 실패한 원래 경로는 <code>jakarta.servlet.error.request_uri</code> 속성에 있고, 부트의 오류 모델에서는 <code>path</code>다. 응답이 커밋되어 include로 처리된 경우만 예외적으로 <code>getRequestURI()</code>가 원래 경로를 돌려준다.</p>
+
+<h3>정리: 오류 한 건이 화면이 되기까지</h3>
+<figure class="flow-figure"><figcaption>스프링 부트에서 컨트롤러 예외가 오류 화면이 되는 순서</figcaption><ol class="flow">
+<li><strong>예외 발생과 기록</strong><span>컨트롤러가 예외를 던지면 <code>DefaultErrorAttributes</code>가 리졸버로서 예외를 요청 속성에 저장한다. 다른 리졸버가 처리하지 못하면 예외는 다시 던져진다.</span></li>
+<li><strong>되감기</strong><span>인터셉터의 <code>afterCompletion(ex)</code>가 역순으로 불리고 <code>postHandle</code>은 건너뛴다. <code>FrameworkServlet</code>이 예외를 <code>ServletException</code>으로 감싸고, 필터를 지나 컨테이너로 올라간다.</span></li>
+<li><strong>컨테이너가 받음</strong><span><code>StandardWrapperValve</code>가 예외를 잡아 요청 속성에 저장하고 상태 500과 오류 플래그를 설정한다.</span></li>
+<li><strong>오류 페이지 선택</strong><span><code>StandardHostValve</code>가 예외 타입 → 루트 원인 → 상태 코드 → 기본 페이지 순으로 찾는다. 부트의 <code>/error</code>는 기본 페이지 자리에 있다.</span></li>
+<li><strong>ERROR 디스패치</strong><span>오류 속성을 붙이고 같은 요청으로 <code>/error</code>에 forward한다. ERROR에 매핑된 필터와, 경로를 제외하지 않은 인터셉터가 다시 실행된다.</span></li>
+<li><strong>뷰 선택과 응답</strong><span><code>BasicErrorController</code>가 상태 속성을 읽고, 정확한 코드 → 계열 → <code>error</code> → 화이트라벨 순으로 뷰를 고르거나 JSON을 쓴다. 응답이 끝나면 <code>ErrorReportValve</code>는 할 일이 없다.</span></li>
+</ol></figure>
+<aside class="keyidea"><span>이 장의 핵심</span><p>서블릿 컨테이너가 이해하는 오류 신호는 "예외 전파"와 "<code>sendError</code>" 두 가지뿐이고, 둘 다 같은 결말로 이어진다. 컨테이너가 오류 페이지를 고른 뒤 같은 요청 객체로 그 경로를 ERROR 디스패치하는 것이다. 필터가 두 번 불리는 현상, 오류 속성으로 원래 경로를 아는 방법, 부트의 <code>/error</code>가 아무 설정 없이 동작하는 이유, 커밋된 응답에서 오류 페이지가 무력한 이유가 모두 이 재디스패치 하나로 설명된다.</p></aside>
+<p>다음 09회 「API 예외 처리」에서는 같은 문제를 반대쪽에서 본다. 이 회차의 방식은 예외가 <code>DispatcherServlet</code> 밖으로 나가 컨테이너를 한 바퀴 돈 뒤 다시 들어오는 구조인데, JSON을 주고받는 API에서는 이 왕복 없이 <code>DispatcherServlet</code> 안에서 <code>HandlerExceptionResolver</code>와 <code>@ExceptionHandler</code>로 예외를 끝내는 경우가 많다. 그 경우 이 회차에서 본 ERROR 디스패치가 아예 일어나지 않는다는 점이 두 회차를 잇는 연결 고리다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>두 가지 오류 신호</dt><dd>서블릿·필터가 컨테이너에 실패를 알리는 방법은 예외를 전파하는 것과 <code>sendError</code>를 호출하는 것뿐이다. <code>setStatus</code>는 상태만 바꾸고 오류 페이지를 부르지 않는다.</dd>
+<dt>오류 페이지 매칭</dt><dd>예외 타입은 클래스 계층에서 가장 가까운 선언이 이기고, 못 찾으면 <code>ServletException</code>의 루트 원인으로 다시 찾는다. 그래도 없으면 상태 코드, 마지막으로 기본 오류 페이지(Tomcat 내부 코드 0)를 본다.</dd>
+<dt>ERROR 디스패치</dt><dd>오류 페이지는 리다이렉트가 아니라 같은 요청 객체로 하는 forward다. <code>DispatcherType.ERROR</code>로 표시되고 <code>jakarta.servlet.error.*</code> 속성에 원래 상태·예외·URI가 담긴다.</dd>
+<dt>Tomcat 밸브</dt><dd><code>StandardWrapperValve</code>가 예외를 잡아 기록하고, <code>StandardHostValve</code>가 오류 페이지로 forward하며, 응답이 비어 있으면 <code>ErrorReportValve</code>가 기본 화면을 쓴다.</dd>
+<dt>커밋된 응답</dt><dd>이미 헤더가 나간 응답에서는 상태를 바꿀 수 없어 Tomcat이 오류 페이지를 include하고 연결을 닫는다. 클라이언트는 잘린 응답을 받는다.</dd>
+<dt>필터와 DispatcherType</dt><dd>필터 매핑의 기본은 <code>REQUEST</code>뿐이다. 부트의 <code>FilterRegistrationBean</code>은 <code>OncePerRequestFilter</code>만 모든 타입에 등록하고, 그 필터는 기본적으로 오류 디스패치를 스스로 건너뛴다.</dd>
+<dt>인터셉터와 오류 경로</dt><dd>인터셉터는 디스패치 타입을 구분하지 않으므로 <code>/error</code>를 <code>excludePathPatterns</code>로 빼야 한다. 예외가 나면 <code>postHandle</code>은 생략되고 <code>afterCompletion</code>이 역순으로 불린다.</dd>
+<dt>부트의 /error</dt><dd><code>ErrorPageCustomizer</code>가 <code>/error</code>를 전역 오류 페이지로 등록하고, <code>BasicErrorController</code>가 HTML이면 뷰를, 그 밖에는 JSON을 만든다.</dd>
+<dt>오류 뷰 우선순위</dt><dd>정확한 코드(템플릿 → 정적) → 계열 4xx/5xx(템플릿 → 정적) → <code>error</code> 템플릿 → 화이트라벨 순이다. 노출 항목은 <code>server.error.include-*</code>로 정하며 기본은 시각·상태·이유 문구·경로뿐이다.</dd>
+</x-summary>
+
+<x-review>
+<p>장애 대응에서 이 지식이 가장 먼저 쓰이는 곳은 "사용자는 500을 봤다는데 로그에 컨트롤러 예외가 없다"는 신고다. 오류 디스패치가 있다는 것을 알면 확인할 곳이 늘어난다. 원래 요청이 <code>sendError</code>로 끝났을 수도 있고(리졸버나 필터가 호출), 오류 페이지 자체가 실패해 Tomcat 기본 화면이 나갔을 수도 있고, 응답이 커밋된 뒤 예외가 나서 연결이 끊겼을 수도 있다. 접근 로그에 같은 요청이 두 번 찍힌다면 로그 필터가 ERROR 디스패치에도 걸려 있는지부터 본다. <code>getDispatcherType()</code>과 <code>jakarta.servlet.error.request_uri</code>를 로그에 남겨 두면 이런 분석이 훨씬 빨라진다.</p>
+<p>설계 판단에서는 "오류를 어느 층에서 끝낼 것인가"가 핵심 질문이다. 서버가 HTML을 그리는 애플리케이션이라면 컨테이너의 오류 페이지와 부트의 <code>error/</code> 템플릿 규칙만으로 충분한 경우가 많다. 상태 코드별 화면을 만들고 계열 템플릿으로 나머지를 덮으면 된다. 반면 JSON API라면 컨테이너를 한 바퀴 도는 구조는 응답 형식을 통제하기 어렵고 필터·인터셉터가 두 번 실행되는 비용도 있어서, <code>DispatcherServlet</code> 안에서 예외를 끝내는 쪽을 선호하게 된다. 같은 애플리케이션에서 두 방식이 섞이면, 어떤 예외가 어느 쪽으로 가는지 표로 정리해 두는 것이 좋다.</p>
+<p>보안 관점의 판단은 단순하다. 운영 환경에서 <code>include-stacktrace</code>와 <code>include-message</code>는 기본값 <code>never</code>를 유지하고, <code>on-param</code>을 쓰지 않는다. 오류 메시지를 사용자에게 보여 주어야 한다면 예외 메시지를 그대로 노출하지 말고, 미리 정의한 안전한 메시지(03회의 메시지 소스를 쓸 수 있다)로 바꿔 템플릿에서 출력한다. 조건이 달라지는 경우는 내부망 전용 관리 도구처럼 접근이 통제된 환경뿐인데, 그때도 스택 트레이스보다 상관관계 ID(요청 추적 번호)를 화면에 보여 주고 로그에서 찾게 하는 방식이 더 안전하다.</p>
+</x-review>
+
+<x-practice>
+<li>오류 페이지가 <code>java.lang.Exception</code> → <code>/x</code>, 404 → <code>/y</code> 두 개만 등록되어 있다. 서블릿이 (a) <code>throw new ServletException("outer", new IllegalStateException("inner"))</code>, (b) <code>response.sendError(500)</code>, (c) <code>throw new NullPointerException()</code>을 할 때 각각 어떤 화면이 나오는지 Tomcat의 탐색 순서로 설명하라. (a)에서 <code>jakarta.servlet.error.exception_type</code>과 <code>jakarta.servlet.error.message</code>의 값도 예측하라.</li>
+<li>스프링 부트 애플리케이션에서 컨트롤러 메서드가 <code>HttpServletResponse</code>를 파라미터로 받아 <code>response.sendError(404, "없음")</code>을 호출하고 반환 타입 <code>void</code>로 끝난다. <code>REQUEST</code>와 <code>ERROR</code>에 모두 매핑된 필터 하나, <code>/error</code>를 제외하지 않은 인터셉터 하나가 있을 때 필터의 <code>doFilter</code> 진입, 인터셉터의 세 메서드, 오류 컨트롤러 호출을 시간 순서대로 적어라.</li>
+<li>요청 수를 세는 <code>Filter</code>를 <code>FilterRegistrationBean</code>으로 등록하면서 <code>setDispatcherTypes(DispatcherType.REQUEST, DispatcherType.ERROR)</code>를 지정했더니, 모니터링 대시보드에서 오류 요청이 정상 요청보다 두 배로 집계되었다. 원인을 설명하고 고치는 방법 두 가지를 제시하라.</li>
+<li>CSV 다운로드 컨트롤러가 응답 스트림에 데이터를 쓰는 도중(이미 여러 번 버퍼가 비워진 뒤) 데이터베이스 예외를 맞았다. <code>templates/error/5xx.html</code>을 잘 만들어 두었는데 사용자가 받은 것은 무엇이며, 왜 오류 페이지가 도움이 되지 않는지 Tomcat의 <code>custom()</code> 동작으로 설명하라.</li>
+<li><code>src/main/resources</code> 아래에 <code>templates/error/4xx.html</code>, <code>static/error/404.html</code>, <code>templates/error.html</code>이 있다. 브라우저로 (a) 없는 URL을 요청했을 때(404), (b) 405 오류가 났을 때, (c) 500 오류가 났을 때 각각 어떤 파일이 선택되는지 <code>DefaultErrorViewResolver</code>의 규칙으로 답하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> (a) Tomcat은 먼저 던져진 예외 자체(<code>ServletException</code>)의 계층을 <code>ServletException</code> → <code>Exception</code> 순으로 올라가며 찾고, <code>Exception</code>에서 <code>/x</code>가 걸린다. 첫 번째 탐색에서 찾았으므로 루트 원인으로 다시 찾는 단계는 없다. 하지만 속성을 채울 때 Tomcat(10.1.41, 11.0.27)은 타입에는 루트 원인의 클래스를, 메시지에는 던져진 예외의 메시지를 넘기므로 <code>exception_type</code>은 <code>IllegalStateException</code>, <code>message</code>는 <code>outer</code>다. <code>exception</code> 속성도 루트 원인이다. (b) 예외가 아니므로 상태 코드 500으로 찾는데 500 페이지도, 기본 페이지도 없다. 오류 디스패치 없이 <code>ErrorReportValve</code>가 Tomcat 기본 500 화면을 쓴다. (c) <code>NullPointerException</code> → <code>RuntimeException</code> → <code>Exception</code>에서 <code>/x</code>가 걸린다.</p>
+<p><b>2.</b> 필터 진입(REQUEST) → 인터셉터 <code>preHandle</code>(REQUEST) → 컨트롤러가 <code>sendError</code> 후 정상 반환 → 예외가 없으므로 <code>postHandle</code>(REQUEST) → <code>afterCompletion</code>(REQUEST, <code>ex=null</code>) → 필터에서 나옴 → 컨테이너가 오류 플래그를 보고 404 페이지를 찾음(부트에서는 기본 페이지 <code>/error</code>) → 필터 진입(ERROR) → <code>preHandle</code>(ERROR) → <code>BasicErrorController</code> → <code>postHandle</code>(ERROR) → <code>afterCompletion</code>(ERROR, <code>ex=null</code>) → 필터에서 나옴. 컨트롤러가 정상 반환했기 때문에 REQUEST 디스패치에서도 <code>postHandle</code>이 불린다는 점이 예외 전파의 경우와 다르다.</p>
+<p><b>3.</b> 실패한 요청은 REQUEST 디스패치에서 한 번, 오류 페이지를 그리는 ERROR 디스패치에서 또 한 번 필터를 지나므로 두 번 집계된다. 고치는 방법은 (1) 디스패처 타입을 <code>REQUEST</code>만 남기는 것(지정하지 않으면 일반 필터는 <code>REQUEST</code>만), (2) ERROR에도 등록해야 하는 이유가 있다면 필터 안에서 <code>request.getDispatcherType() == DispatcherType.ERROR</code>일 때 집계를 건너뛰는 것이다. <code>OncePerRequestFilter</code>를 상속하면 기본 설정만으로 오류 디스패치를 건너뛰는 동작을 얻는다.</p>
+<p><b>4.</b> 사용자는 200 상태와 CSV 일부를 받다가 연결이 끊긴다. 버퍼를 비우는 순간 200 상태 줄과 헤더가 이미 나갔으므로 상태를 500으로 바꿀 수 없다. Tomcat의 <code>custom()</code>은 커밋된 응답에서 오류 페이지를 forward 대신 include로 부르고 연결을 즉시 닫는다. include된 오류 페이지가 무언가를 쓰더라도 이미 나간 CSV 뒤에 이어 붙을 뿐이고(화이트라벨 뷰는 커밋된 응답에는 아무것도 쓰지 않고 로그만 남긴다), 청크 응답은 끝맺음 없이 끊긴다. 화면을 보여 줄 기회는 첫 바이트를 보내기 전에만 있다.</p>
+<p><b>5.</b> (a) 404: <code>resolve("404")</code>에서 템플릿 <code>error/404</code>는 없고 정적 <code>error/404.html</code>이 있으므로 <code>static/error/404.html</code>. (b) 405: <code>error/405</code>는 템플릿도 정적 파일도 없고, 계열 4xx에서 템플릿 <code>error/4xx</code>가 있으므로 <code>templates/error/4xx.html</code>. (c) 500: <code>error/500</code>, <code>error/5xx</code> 모두 없어 <code>DefaultErrorViewResolver</code>는 <code>null</code>을 돌려주고, <code>errorHtml()</code>이 <code>ModelAndView("error")</code>를 반환해 <code>templates/error.html</code>이 선택된다. <code>error</code> 템플릿이 있으므로 화이트라벨 뷰는 등록되지도 않는다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>오류 페이지가 <code>RuntimeException</code> → <code>/a</code>, 상태 500 → <code>/b</code>, 기본 페이지 → <code>/c</code>로 등록되어 있다. 서블릿이 <code>throw new IOException("disk")</code>를 하면 어떤 경로가 호출되는가?</q>
+<o><code>/a</code></o>
+<o><code>/b</code></o>
+<o><code>/c</code></o>
+<o>오류 페이지 없이 Tomcat 기본 화면</o>
+<why><code>IOException</code>은 <code>RuntimeException</code>의 하위 타입이 아니고 <code>ServletException</code>도 아니어서 예외 타입 탐색이 실패한다. Tomcat은 상태를 500으로 두고 상태 코드 탐색으로 넘어가 <code>/b</code>를 찾는다. 기본 페이지 <code>/c</code>는 500 페이지가 없을 때만 쓰인다. 이 경로에서는 <code>exception_type</code> 속성이 채워지지 않지만 <code>exception</code> 속성에는 <code>IOException</code>이 들어 있다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>스프링 부트 기본 설정에서 컨트롤러가 <code>response.setStatus(404)</code>를 하고 본문으로 "없음"을 쓴 뒤 정상 반환했다. 클라이언트가 받는 것은?</q>
+<o>302 응답으로 <code>/error</code>로 이동한다</o>
+<o>404 상태와 <code>BasicErrorController</code>가 만든 오류 화면</o>
+<o>404 상태와 컨트롤러가 쓴 "없음"</o>
+<o>500 상태와 화이트라벨 페이지</o>
+<why>오류 페이지 메커니즘은 <code>sendError</code>로 켜진 오류 플래그를 보고 동작한다. <code>setStatus</code>는 상태 숫자만 바꾸므로 오류 디스패치가 일어나지 않고, 서블릿이 쓴 본문이 그대로 나간다. 오류 페이지는 리다이렉트가 아니므로 302는 어떤 경우에도 답이 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>jakarta.servlet.Filter</code>를 직접 구현한 로그 필터를 <code>FilterRegistrationBean</code>으로 등록하면서 디스패처 타입을 지정하지 않았다. 컨트롤러가 예외를 던져 부트의 <code>/error</code>가 오류 화면을 그릴 때, 이 필터의 <code>doFilter</code>는 몇 번 호출되는가?</q>
+<o>0번</o>
+<o>1번</o>
+<o>2번</o>
+<o>인터셉터의 <code>excludePathPatterns</code> 설정에 따라 1번 또는 2번</o>
+<why>Boot의 <code>AbstractFilterRegistrationBean</code>은 디스패처 타입이 비어 있으면 <code>OncePerRequestFilter</code>가 아닌 필터를 <code>REQUEST</code>에만 등록한다. 따라서 원래 요청에서 한 번 호출되고 ERROR 디스패치에서는 체인에 들어가지 않는다. 인터셉터 설정은 <code>DispatcherServlet</code> 안의 일이라 필터 등록과 무관하다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>templates/error/5xx.html</code>(Thymeleaf)과 <code>static/error/500.html</code>이 모두 있다. 브라우저 요청에서 상태 500 오류가 나면 무엇이 렌더링되는가?</q>
+<o><code>templates/error/5xx.html</code>. 템플릿이 정적 파일보다 항상 우선이다</o>
+<o>화이트라벨 페이지. 두 파일이 충돌하면 기본 뷰로 떨어진다</o>
+<o><code>templates/error.html</code>을 찾다가 없어서 Tomcat 기본 화면</o>
+<o><code>static/error/500.html</code>. 정확한 상태 코드 이름을 계열 이름보다 먼저 확인한다</o>
+<why><code>DefaultErrorViewResolver</code>는 <code>resolve("500")</code>에서 템플릿과 정적 파일을 모두 확인한 뒤에야 <code>resolve("5xx")</code>로 넘어간다. 템플릿 우선은 같은 이름 안에서만 성립한다. 따라서 정적 <code>error/500.html</code>이 계열 템플릿보다 먼저 선택된다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>인터셉터를 <code>/**</code>에 등록하고 <code>/error</code>를 제외하지 않았다. 컨트롤러가 예외를 던졌고 어떤 <code>HandlerExceptionResolver</code>도 처리하지 못했다. 이 요청 전체에서 인터셉터 메서드 호출로 옳은 것은?</q>
+<o><code>preHandle</code>(REQUEST) → <code>afterCompletion</code>(REQUEST, 예외) → <code>preHandle</code>(ERROR) → <code>postHandle</code>(ERROR) → <code>afterCompletion</code>(ERROR, <code>null</code>)</o>
+<o><code>preHandle</code>(REQUEST) → <code>postHandle</code>(REQUEST) → <code>afterCompletion</code>(REQUEST, 예외)</o>
+<o><code>preHandle</code>(REQUEST) → <code>afterCompletion</code>(REQUEST, 예외)만 호출되고 오류 디스패치에서는 인터셉터가 불리지 않는다</o>
+<o><code>preHandle</code>(REQUEST) → <code>preHandle</code>(ERROR) → <code>afterCompletion</code>(ERROR, 예외)</o>
+<why><code>doDispatch()</code>에서 컨트롤러가 예외를 던지면 <code>applyPostHandle</code>에 도달하지 못하고, 리졸버가 처리하지 못한 예외와 함께 <code>afterCompletion</code>이 불린다. 이후 컨테이너가 <code>/error</code>로 ERROR 디스패치를 하면 그 요청도 <code>DispatcherServlet</code>을 지나므로, 경로를 제외하지 않은 인터셉터가 다시 호출되고 이번에는 오류 컨트롤러가 정상 반환하므로 <code>postHandle</code>과 <code>ex=null</code>인 <code>afterCompletion</code>이 이어진다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>오류 디스패치(error dispatch)</dt><dd>컨테이너가 오류 페이지를 호출하기 위해 같은 요청·응답 객체로 오류 페이지 경로에 forward하는 것. <code>DispatcherType.ERROR</code>로 표시된다.</dd>
+<dt>DispatcherType</dt><dd>현재 서블릿 호출이 어떤 경로로 들어왔는지를 나타내는 열거형. <code>REQUEST</code>, <code>FORWARD</code>, <code>INCLUDE</code>, <code>ERROR</code>, <code>ASYNC</code>가 있다.</dd>
+<dt>기본 오류 페이지(default error page)</dt><dd>예외 타입도 상태 코드도 지정하지 않은 오류 페이지 선언. 다른 선언이 맞지 않을 때 쓰이며, 스프링 부트의 <code>/error</code>가 이 자리에 등록된다.</dd>
+<dt>루트 원인(root cause)</dt><dd><code>ServletException</code>이 감싸고 있는 원래 예외. <code>getRootCause()</code>로 얻으며, 예외 타입 오류 페이지의 두 번째 탐색에 쓰인다.</dd>
+<dt>커밋(commit)</dt><dd>응답의 상태 줄과 헤더가 클라이언트로 전송된 상태. 이후에는 상태 코드와 헤더를 바꿀 수 없고 <code>sendError</code>도 <code>IllegalStateException</code>을 던진다.</dd>
+<dt>밸브(valve)</dt><dd>Tomcat 컨테이너 계층마다 있는 파이프라인의 처리 단계. <code>StandardWrapperValve</code>, <code>StandardHostValve</code>, <code>ErrorReportValve</code>가 오류 처리를 나눠 맡는다.</dd>
+<dt>화이트라벨 오류 페이지(whitelabel error page)</dt><dd><code>error</code> 템플릿이 없을 때 스프링 부트가 등록하는 기본 오류 뷰. <code>server.error.whitelabel.enabled</code>로 끌 수 있다.</dd>
+<dt>ErrorViewResolver</dt><dd>상태 코드와 오류 모델을 받아 오류 뷰를 고르는 부트의 인터페이스. 기본 구현 <code>DefaultErrorViewResolver</code>는 <code>error/코드</code>와 <code>error/4xx</code>·<code>error/5xx</code>를 찾는다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/servlet/6.0/jakarta-servlet-spec-6.0.html">Jakarta Servlet 6.0 Specification</a> — §10.9 Error Handling(오류 요청 속성, 오류 페이지 매칭 규칙)과 §6.2.5 Filters and the RequestDispatcher(디스패처 타입별 필터 매핑)</li>
+<li><a href="https://docs.spring.io/spring-boot/3.5/reference/web/servlet.html">Spring Boot 3.5 Reference — Servlet Web Applications</a> — Error Handling, Custom Error Pages, Mapping Error Pages Outside of Spring MVC 절</li>
+<li><a href="https://raw.githubusercontent.com/apache/tomcat/10.1.41/java/org/apache/catalina/core/StandardHostValve.java">Apache Tomcat 10.1.41 StandardHostValve.java</a> — 예외·상태 코드로 오류 페이지를 찾고 forward/include하는 구현</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-boot/v3.5.0/spring-boot-project/spring-boot-autoconfigure/src/main/java/org/springframework/boot/autoconfigure/web/servlet/error/ErrorMvcAutoConfiguration.java">Spring Boot 3.5.0 ErrorMvcAutoConfiguration.java</a> — /error 등록, BasicErrorController, 화이트라벨 뷰 조건</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-boot/v3.5.0/spring-boot-project/spring-boot-autoconfigure/src/main/java/org/springframework/boot/autoconfigure/web/servlet/error/DefaultErrorViewResolver.java">Spring Boot 3.5.0 DefaultErrorViewResolver.java</a> — 상태 코드·계열별 오류 뷰 탐색 순서</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-framework/v6.2.7/spring-web/src/main/java/org/springframework/web/filter/OncePerRequestFilter.java">Spring Framework 6.2.7 OncePerRequestFilter.java</a> — 오류·비동기 디스패치를 건너뛰는 기본 동작</li>
+</x-refs>

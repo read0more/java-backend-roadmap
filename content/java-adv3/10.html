@@ -1,0 +1,1021 @@
+<x-meta>
+deck: 같은 계산을 스레드, 스레드 풀, 포크/조인으로 병렬화하며 작업 훔치기와 공용 풀의 구조를 OpenJDK 21 소스로 따라가고, 병렬 스트림이 이득인 조건과 서버를 느리게 만드는 조건을 가른다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>같은 계산을 스레드 직접 사용, <code>ExecutorService</code>, <code>ForkJoinPool</code>로 병렬화했을 때 분할·결과 전달·대기를 각각 누가 맡는지 비교하고, 고정 크기 스레드 풀에서 재귀 분할이 교착에 빠지는 이유를 실행 추적으로 설명할 수 있다.</li>
+<li><code>RecursiveTask</code>로 분할·정복·결합을 구현하고, <code>fork</code>/<code>compute</code>/<code>join</code> 호출 순서에 따라 작업자의 덱(deque)에 무엇이 쌓이고 누가 어느 쪽 끝에서 가져가는지 그림으로 그릴 수 있다.</li>
+<li>공용 풀의 병렬성 기본값(<code>availableProcessors() - 1</code>)과 그 근거인 호출 스레드 참여 정책, 설정 방법과 적용 시점, 공용 풀을 함께 쓰는 다른 API를 말할 수 있다.</li>
+<li>병렬 스트림의 최종 연산이 <code>ForkJoinTask</code>로 바뀌어 <code>Spliterator</code>를 쪼개는 과정을 OpenJDK 21 소스 수준에서 추적하고, 원소 수와 병렬성으로 잎 작업의 크기를 계산할 수 있다.</li>
+<li>블로킹 작업, 공유 가변 상태, 항등원·결합 법칙 위반, 순서 제약, 잘 쪼개지지 않는 소스가 병렬 스트림의 결과나 성능을 어떻게 망치는지 실행 결과로 설명하고 상황에 맞는 대안을 고를 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 코어는 여덟 개인데 왜 하나만 일하는가</h3>
+<p>5회부터 8회까지 스트림 파이프라인의 지연 평가, 컬렉터, <code>Optional</code>을 다졌고 9회에서 디폴트 메서드를 보았다. 지금까지 다룬 스트림은 모두 순차 스트림(sequential stream)이었다. 최종 연산을 호출한 스레드 하나가 소스에서 원소를 하나씩 꺼내 Sink 사슬로 끝까지 밀어 넣는다. 컴퓨터에 코어가 여덟 개 있어도 그 파이프라인을 실행하는 동안 일하는 코어는 하나다. 이 회차는 같은 파이프라인을 여러 코어에 나누어 실행하는 병렬 스트림(parallel stream)을 다룬다.</p>
+<p>병렬 스트림은 겉으로는 <code>parallel()</code> 한 줄이다. 하지만 그 한 줄 아래에는 자바 7에 들어온 포크/조인 프레임워크(Fork/Join framework)가 있고, 그 아래에는 작업자마다 하나씩 붙은 덱과 작업 훔치기(work stealing) 알고리즘, 그리고 JVM 전체가 공유하는 공용 풀(common pool)이 있다. 병렬 스트림의 함정은 거의 모두 이 아래층에서 나온다. 그래서 이 회차는 병렬 스트림에서 출발하지 않는다. 같은 계산을 단일 스레드, 스레드 직접 사용, 스레드 풀, 포크/조인 순서로 직접 병렬화해 보면서 단계마다 무엇이 불편해지는지 확인한다. 그다음 작업 훔치기와 공용 풀을 OpenJDK 21 소스로 내려가 보고, 마지막으로 병렬 스트림의 내부와 주의점을 정리한다. 순수 함수와 불변성이 왜 병렬 실행의 전제가 되는지는 11회에서 함수형 프로그래밍의 관점으로 다시 묶는다.</p>
+<p>실습 환경을 먼저 밝혀 둔다. 이 회차의 예제는 모두 Temurin 21.0.13, 논리 프로세서 8개인 macOS에서 실행했다. 실행 시간, 작업자 스레드 번호, 여러 스레드가 섞어 찍는 출력의 순서는 실행할 때마다 다르다. 본문에 적은 시간은 한 번 실행한 예이고, 따져야 할 것은 숫자 자체가 아니라 "100ms짜리 작업 몇 개가 몇 줄로 겹쳐 실행되었는가"라는 구조다.</p>
+<p>무거운 작업은 <code>Thread.sleep(100)</code>으로 흉내 낸다. 실행 시간을 머릿속으로 예측하기 쉽기 때문이다. 다만 <code>sleep</code>은 CPU를 쓰지 않고 기다리기만 하는 작업이라는 점을 기억해 두자. CPU를 계속 쓰는 계산이라면 코어 수가 속도의 상한이 되지만, 기다리는 작업은 스레드 수가 상한이 된다. 이 차이가 뒤의 "주의점"에서 결정적인 역할을 한다.</p>
+<pre><code class="language-java">public class Work {
+    static int heavyTask(int i) {
+        log("calculate " + i + " -> " + i * 10);
+        sleep(100);                       // 100ms 걸리는 작업을 흉내 낸다
+        return i * 10;
+    }
+
+    static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { throw new RuntimeException(e); }
+    }
+
+    static void log(String msg) {
+        System.out.println("[" + Thread.currentThread().getName() + "] " + msg);
+    }
+}</code></pre>
+
+<h3>단일 스트림: 기준선을 잰다</h3>
+<p>1부터 8까지의 수 각각에 <code>heavyTask</code>를 적용하고 결과를 더하는 계산을 기준선으로 삼는다. 결과는 10+20+…+80 = 360이다.</p>
+<pre><code class="language-java">import java.util.stream.IntStream;
+
+public class SingleStreamMain {
+    public static void main(String[] args) {
+        long start = System.currentTimeMillis();
+        int sum = IntStream.rangeClosed(1, 8)
+                .map(Work::heavyTask)
+                .sum();
+        long time = System.currentTimeMillis() - start;
+        Work.log("sum=" + sum + ", time=" + time + "ms");
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[main] calculate 1 -> 10
+[main] calculate 2 -> 20
+[main] calculate 3 -> 30
+[main] calculate 4 -> 40
+[main] calculate 5 -> 50
+[main] calculate 6 -> 60
+[main] calculate 7 -> 70
+[main] calculate 8 -> 80
+[main] sum=360, time=866ms</code></pre>
+<p>모든 줄이 <code>[main]</code>이다. 5회에서 본 대로 순차 스트림의 최종 연산은 <code>AbstractPipeline.evaluate</code>에서 <code>evaluateSequential</code>로 가고, 호출한 스레드가 직접 <code>Spliterator.forEachRemaining</code>을 돌며 원소를 map Sink, sum Sink로 밀어 넣는다. 다른 스레드가 끼어들 자리가 없다. 시간은 100ms 작업 여덟 번에 스트림 관련 클래스 로딩, 메서드 참조의 첫 연결(4회에서 본 <code>invokedynamic</code> 부트스트랩) 같은 첫 실행 비용이 더해진 값이다.</p>
+<p>이 계산의 구조를 보자. 여덟 번의 <code>heavyTask</code>는 서로의 결과를 쓰지 않는다. 3의 계산이 2의 결과를 기다릴 이유가 없다. 서로 독립인 작업이 차례로 줄 서 있으니 두 줄로 나누면 절반, 여덟 줄로 나누면 8분의 1의 시간에 끝날 수 있다. 마지막 덧셈만 모든 결과를 모아야 하지만, 덧셈은 순서를 바꾸어 묶어도 결과가 같으므로 각 줄이 부분합을 내고 마지막에 부분합끼리 더하면 된다. 이 "독립적인 부분 작업"과 "순서를 바꿔 묶어도 되는 결합"이 병렬화의 두 전제다. 이제 이 계산을 직접 나누어 보자.</p>
+
+<h3>스레드 직접 사용: 나누기, 넘기기, 기다리기를 모두 손으로</h3>
+<p>가장 원시적인 방법은 스레드를 두 개 만들어 앞 절반과 뒤 절반을 맡기는 것이다. 각 스레드가 계산한 부분합은 작업 객체의 필드에 담고, <code>main</code>은 두 스레드가 끝나기를 기다렸다가 필드를 읽어 더한다.</p>
+<pre><code class="language-java">public class ThreadMain {
+    static class SumTask implements Runnable {
+        private final int start, end;
+        int result;                       // 작업 스레드가 쓰고, main이 join 뒤에 읽는다
+        SumTask(int start, int end) { this.start = start; this.end = end; }
+        @Override public void run() {
+            int sum = 0;
+            for (int i = start; i <= end; i++) sum += Work.heavyTask(i);
+            result = sum;
+            Work.log("작업 완료 result=" + result);
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        long start = System.currentTimeMillis();
+        SumTask task1 = new SumTask(1, 4);
+        SumTask task2 = new SumTask(5, 8);
+        Thread t1 = new Thread(task1, "thread-1");
+        Thread t2 = new Thread(task2, "thread-2");
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+        int sum = task1.result + task2.result;
+        long time = System.currentTimeMillis() - start;
+        Work.log("sum=" + sum + ", time=" + time + "ms");
+    }
+}</code></pre>
+<pre data-label="실행 결과 (줄 순서는 실행마다 다르다)"><code class="language-text">[thread-1] calculate 1 -> 10
+[thread-2] calculate 5 -> 50
+[thread-2] calculate 6 -> 60
+[thread-1] calculate 2 -> 20
+[thread-1] calculate 3 -> 30
+[thread-2] calculate 7 -> 70
+[thread-1] calculate 4 -> 40
+[thread-2] calculate 8 -> 80
+[thread-2] 작업 완료 result=260
+[thread-1] 작업 완료 result=100
+[main] sum=360, time=459ms</code></pre>
+<p>시간이 절반 정도로 줄었다. 실행을 따라가 보자. <code>main</code>은 힙에 <code>SumTask</code> 두 개와 <code>Thread</code> 객체 두 개를 만든다. <code>start()</code>를 부르는 순간 HotSpot은 운영체제 스레드를 하나씩 만들어 붙이고(자바 고급 1편에서 본 대로 플랫폼 스레드는 OS 스레드와 1:1이다), 각 OS 스레드는 자기 스택에서 <code>run()</code>을 실행한다. <code>main</code>은 <code>t1.join()</code>에서 WAITING 상태로 들어가 <code>thread-1</code>이 끝나기를 기다리고, 이어서 <code>t2.join()</code>에서 다시 기다린다. 두 스레드는 운영체제 스케줄러가 서로 다른 코어에 올려 동시에 실행하므로, 100ms짜리 작업 네 개짜리 줄 두 개가 겹쳐 약 400ms에 끝난다.</p>
+<p><code>main</code>이 <code>task1.result</code>를 읽는 것이 안전한 이유도 짚고 가자. <code>result</code>는 <code>volatile</code>도 아니고 락으로 보호되지도 않는다. 그런데도 <code>main</code>이 0이 아닌 값을 확실히 보는 것은 자바 메모리 모델 덕분이다. JLS §17.4.4는 스레드 T1의 마지막 동작이, T1이 종료했음을 감지한 다른 스레드의 동작과 synchronizes-with 관계라고 정하고, 그 감지 수단으로 <code>T1.join()</code>을 든다. 따라서 <code>join()</code>이 반환된 뒤의 읽기는 작업 스레드의 쓰기를 반드시 본다. <code>join()</code>을 빼고 적당히 <code>sleep</code>으로 기다렸다면 이 보장은 사라진다.</p>
+<p>이 방법의 문제를 정리하면 다음과 같다.</p>
+<ul>
+<li><b>분할을 사람이 정했다.</b> 1~4, 5~8로 두 줄을 고정했다. 코어가 여덟 개여도 두 개만 쓴다. 코어 수에 맞추려면 분할 코드를 다시 써야 한다.</li>
+<li><b>결과와 예외를 넘기는 통로가 없다.</b> 결과는 필드라는 임시 통로로 넘겼다. <code>run()</code>에서 예외가 나면 그 스레드는 기본 예외 처리기가 스택 트레이스를 찍고 종료할 뿐이고, <code>main</code>은 <code>result</code>가 0인 채로 아무 일 없다는 듯 합계를 낸다.</li>
+<li><b>스레드를 매번 만들고 버린다.</b> 스레드 생성은 OS 스레드와 스택 메모리를 준비하는 일이어서 작업이 작고 많을수록 생성 비용이 이득을 갉아먹는다.</li>
+<li><b>일의 양이 고르지 않으면 한쪽이 논다.</b> 이 예제는 모든 작업이 100ms라 두 줄이 동시에 끝났다. 작업 시간이 <code>i</code>에 비례한다면 5~8을 맡은 스레드가 훨씬 늦게 끝나고, 먼저 끝난 스레드는 도와줄 방법이 없다.</li>
+</ul>
+
+<h3>스레드 풀 사용: 스레드는 재사용하지만 나누는 일은 여전히 사람 몫</h3>
+<p>자바 고급 1편에서 다룬 <code>ExecutorService</code>를 쓰면 앞의 두 문제가 풀린다. 스레드를 미리 만들어 재사용하고, 결과와 예외는 <code>Future</code>가 실어 나른다.</p>
+<pre><code class="language-java">import java.util.concurrent.*;
+
+public class PoolMain {
+    static class SumTask implements Callable<Integer> {
+        private final int start, end;
+        SumTask(int start, int end) { this.start = start; this.end = end; }
+        @Override public Integer call() {
+            int sum = 0;
+            for (int i = start; i <= end; i++) sum += Work.heavyTask(i);
+            Work.log("작업 완료 result=" + sum);
+            return sum;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        ExecutorService es = Executors.newFixedThreadPool(2);
+        long start = System.currentTimeMillis();
+        Future<Integer> f1 = es.submit(new SumTask(1, 4));
+        Future<Integer> f2 = es.submit(new SumTask(5, 8));
+        int sum = f1.get() + f2.get();
+        long time = System.currentTimeMillis() - start;
+        Work.log("sum=" + sum + ", time=" + time + "ms");
+        es.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (줄 순서는 실행마다 다르다)"><code class="language-text">[pool-1-thread-1] calculate 1 -> 10
+[pool-1-thread-2] calculate 5 -> 50
+[pool-1-thread-1] calculate 2 -> 20
+[pool-1-thread-2] calculate 6 -> 60
+[pool-1-thread-1] calculate 3 -> 30
+[pool-1-thread-2] calculate 7 -> 70
+[pool-1-thread-1] calculate 4 -> 40
+[pool-1-thread-2] calculate 8 -> 80
+[pool-1-thread-2] 작업 완료 result=260
+[pool-1-thread-1] 작업 완료 result=100
+[main] sum=360, time=458ms</code></pre>
+<p><code>Executors.newFixedThreadPool(2)</code>는 작업자 스레드 두 개가 공유하는 무제한 큐 하나를 가진 <code>ThreadPoolExecutor</code>를 만든다. <code>submit</code>은 작업을 그 큐에 넣고, 놀고 있는 작업자가 큐에서 꺼내 실행한다. <code>call()</code>의 반환값이나 예외는 <code>Future</code> 안에 저장되고, <code>get()</code>은 그것을 꺼내 준다. 예외는 <code>ExecutionException</code>으로 감싸져 <code>main</code>에 전달되므로 조용히 0이 더해지는 일이 없다. 메모리 가시성도 <code>java.util.concurrent</code> 패키지 문서가 보장한다. <code>Future</code>가 나타내는 비동기 계산의 동작은 다른 스레드에서 <code>Future.get()</code>으로 결과를 얻은 뒤의 동작보다 happens-before다. 마지막 줄의 <code>close()</code>는 자바 19에서 <code>ExecutorService</code>에 추가된 메서드로, <code>shutdown()</code> 후 모든 작업이 끝날 때까지 기다린다.</p>
+<p>그러나 분할은 여전히 사람이 한다. 그리고 분할을 자동으로, 즉 재귀적으로 하려는 순간 더 근본적인 문제가 드러난다. "구간이 크면 둘로 나누어 각각을 풀에 제출하고, 두 결과를 기다려 더한다"를 그대로 코드로 옮겨 보자.</p>
+<pre><code class="language-java">import java.util.concurrent.*;
+
+public class PoolRecursionMain {
+    static final ExecutorService es = Executors.newFixedThreadPool(2);
+
+    static int sum(int start, int end) throws Exception {
+        if (end - start + 1 <= 2) {
+            int s = 0;
+            for (int i = start; i <= end; i++) s += Work.heavyTask(i);
+            return s;
+        }
+        int mid = start + (end - start) / 2;
+        Work.log("[분할] " + start + "~" + end);
+        Future<Integer> left = es.submit(() -> sum(start, mid));
+        Future<Integer> right = es.submit(() -> sum(mid + 1, end));
+        return left.get() + right.get();        // 풀 스레드가 풀의 다른 작업을 기다린다
+    }
+
+    public static void main(String[] args) throws Exception {
+        Future<Integer> root = es.submit(() -> sum(1, 8));
+        try {
+            Work.log("sum=" + root.get(2, TimeUnit.SECONDS));
+        } catch (TimeoutException e) {
+            Work.log("2초 안에 끝나지 않음: " + e);
+        }
+        es.shutdownNow();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[pool-1-thread-1] [분할] 1~8
+[pool-1-thread-2] [분할] 1~4
+[main] 2초 안에 끝나지 않음: java.util.concurrent.TimeoutException</code></pre>
+<p>100ms 작업 여덟 개짜리 계산이 2초 안에 끝나지 않는다. 정확히는 영원히 끝나지 않는다. 추적해 보자. <code>thread-1</code>이 루트 작업(1~8)을 꺼내 1~4와 5~8을 큐에 넣고 <code>left.get()</code>에서 멈춘다. <code>thread-2</code>가 큐 앞의 1~4를 꺼내 1~2와 3~4를 큐에 넣고 역시 <code>get()</code>에서 멈춘다. 이제 큐에는 [5~8, 1~2, 3~4]가 남아 있는데, 그것을 실행할 스레드가 하나도 없다. 두 스레드 모두 큐 안의 작업이 끝나기를 기다리고, 큐 안의 작업은 스레드가 비기를 기다린다. 이것이 스레드 기아 교착(thread starvation deadlock)이다.</p>
+<pre class="diagram">thread-1 : sum(1~8) 실행 중 ── left.get() 대기 ──▶ 1~4 의 완료를 기다림
+thread-2 : sum(1~4) 실행 중 ── left.get() 대기 ──▶ 1~2 의 완료를 기다림
+
+공유 큐   : [ 5~8 ][ 1~2 ][ 3~4 ]   ← 꺼내 줄 스레드가 없다
+
+기다리는 쪽이 스레드를 쥔 채 놓지 않으므로, 기다림의 대상이 영원히 실행되지 않는다.</pre>
+<p>스레드를 늘리면 해결될까? 이 예제라면 기다리는 내부 노드(1~8, 1~4, 5~8)만큼 스레드가 더 있으면 끝난다. 하지만 데이터가 커지면 기다리는 내부 노드도 늘어나고, 그만큼 스레드를 만들면 대부분은 아무 일 없이 기다리기만 하는 스레드가 된다. 스레드마다 스택 메모리와 OS 자원이 들고 문맥 전환 비용이 붙는다. 근본 원인은 "기다리는 스레드가 아무것도 하지 않는다"는 데 있다. 기다리는 동안 자기가 기다리는 바로 그 작업을, 혹은 그 작업을 앞당길 다른 작업을 직접 실행할 수 있다면 교착은 사라진다. 이 생각을 구현한 것이 포크/조인 프레임워크다.</p>
+
+<h3>Fork/Join 패턴: 분할, 정복, 결합</h3>
+<p>포크/조인 프레임워크를 보기 전에 그 프레임워크가 전제하는 계산의 모양부터 정리하자. 분할 정복(divide and conquer)은 세 단계로 이루어진다.</p>
+<figure class="flow-figure"><figcaption>분할 정복의 세 단계</figcaption><ol class="flow">
+<li><strong>분할(Divide)</strong><span>문제가 충분히 작지 않으면 서로 독립인 하위 문제로 나눈다. 1~8을 1~4와 5~8로 나누는 식이다.</span></li>
+<li><strong>정복(Conquer)</strong><span>하위 문제가 기준(임계값, threshold) 이하로 작아지면 더 나누지 않고 순차적으로 직접 푼다. 독립인 하위 문제들은 서로 다른 스레드에서 동시에 풀 수 있다.</span></li>
+<li><strong>결합(Combine)</strong><span>하위 문제의 결과를 합쳐 상위 문제의 결과를 만든다. 합계라면 두 부분합을 더한다. 결합은 트리를 거슬러 올라가며 반복된다.</span></li>
+</ol></figure>
+<p>임계값을 2로 두고 1~8의 합을 나누면 다음 트리가 생긴다. 잎(leaf)은 4개, 내부 노드는 3개, 작업 객체는 모두 7개다. 일반적으로 잎이 L개인 이진 분할 트리에는 내부 노드가 L-1개 있으므로 작업 객체는 2L-1개 만들어진다. 깊이는 대략 log₂(N/임계값)이다.</p>
+<pre class="diagram">                    [1~8]                 ← 분할
+                  /       \
+             [1~4]         [5~8]          ← 분할
+             /   \         /   \
+         [1~2] [3~4]   [5~6] [7~8]        ← 정복(임계값 2 이하: 직접 계산)
+           30    70     110    150
+             \   /         \   /
+              100           260           ← 결합
+                  \       /
+                     360                  ← 결합</pre>
+<p>이 패턴이 맞아떨어지려면 두 가지가 성립해야 한다. 첫째, 하위 문제가 서로 독립이어야 한다. [1~2]를 계산하는 동안 [5~6]의 중간 상태를 읽거나 쓰면 동시에 실행할 수 없다. 둘째, 결합 연산이 묶는 방식에 무관해야 한다. 순차 계산은 ((((1+2)+3)+4)+…) 순서로 더하지만 트리는 ((1+2)+(3+4))+((5+6)+(7+8)) 순서로 더한다. 덧셈은 결합 법칙(associativity)을 만족하므로 둘이 같다. 이 조건은 뒤에서 병렬 스트림의 <code>reduce</code>가 요구하는 조건과 정확히 같다.</p>
+<p>임계값은 성능을 좌우한다. 너무 크면 잎이 몇 개 안 되어 코어가 놀고, 한 잎이 늦게 끝나면 전체가 그 잎을 기다린다. 너무 작으면 작업 객체 생성, 큐 넣고 빼기, 결과 결합 같은 관리 비용이 실제 계산보다 커진다. <code>ForkJoinTask</code>의 Javadoc은 이를 "매우 거친 경험 규칙"이라고 단서를 달아, 작업 하나가 기본 계산 단계를 100개보다 많이, 10,000개보다 적게 수행하는 것이 좋다고 적는다. 정확한 값은 계산의 종류와 하드웨어에 따라 달라지므로 측정으로 정한다.</p>
+<x-visual id="java-adv3-10-fork-join-tree" title="1~8 합계를 임계값 2로 분할·정복·결합하는 작업 트리" kind="트리 다이어그램" ratio="16:9">
+<x-hint>하나의 큰 작업이 위에서 아래로 쪼개지고(분할), 잎에서 직접 계산되고(정복), 결과가 아래에서 위로 합쳐지는(결합) 세 단계를 한 그림에서 보여 준다.</x-hint>
+<x-prompt>A clean flat vector tree diagram on a white background. Top root box labeled "1~8". Two child boxes "1~4" and "5~8". Four leaf boxes at the bottom labeled "1~2", "3~4", "5~6", "7~8", each leaf colored green with a small number under it: "30", "70", "110", "150". Downward blue arrows from parent to children on the left side of each edge, with a blue tag at the top left reading "분할". Upward orange arrows on the right side of each edge going back up, with an orange tag at the right reading "결합". A green tag near the leaves reading "정복". Next to the "1~4" box write "100" in orange and next to "5~8" write "260"; next to the root write "360". Keep total labels under 12, minimal style, no shadows.</x-prompt>
+<x-caption>분할은 위에서 아래로, 결합은 아래에서 위로 진행된다. 잎에서만 실제 계산이 일어난다.</x-caption>
+</x-visual>
+
+<h3>Fork/Join 프레임워크 1: ForkJoinPool과 RecursiveTask</h3>
+<p>포크/조인 프레임워크는 자바 7(<code>@since 1.7</code>)에 <code>java.util.concurrent</code>로 들어왔다. 등장인물은 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>타입</th><th>역할</th></tr></thead><tbody>
+<tr><td><code>ForkJoinPool</code></td><td><code>ExecutorService</code>의 구현체. 작업 훔치기를 하는 작업자 스레드(<code>ForkJoinWorkerThread</code>)들을 관리한다.</td></tr>
+<tr><td><code>ForkJoinTask<V></code></td><td>풀에서 실행되는 작업의 추상 기반 클래스. Javadoc의 표현으로 "가벼운 형태의 <code>Future</code>"이며, 스레드보다 훨씬 가벼운 "스레드 비슷한 실체"라서 적은 수의 스레드가 매우 많은 작업을 실행할 수 있다.</td></tr>
+<tr><td><code>RecursiveTask<V></code></td><td>결과를 돌려주는 재귀 작업. <code>protected V compute()</code>를 구현한다.</td></tr>
+<tr><td><code>RecursiveAction</code></td><td>결과가 없는 재귀 작업. <code>protected void compute()</code>를 구현한다. 배열을 제자리에서 바꾸는 작업 등에 쓴다.</td></tr>
+<tr><td><code>CountedCompleter<T></code></td><td>하위 작업들이 끝나면 완료 동작이 연쇄로 실행되는 작업. <code>join</code>으로 기다리지 않는다. 병렬 스트림 내부가 이것을 쓴다.</td></tr>
+</tbody></table></div>
+<p>앞의 트리를 <code>RecursiveTask</code>로 옮기면 다음과 같다.</p>
+<pre><code class="language-java">import java.util.concurrent.RecursiveTask;
+
+public class SumTask extends RecursiveTask<Integer> {
+    static int THRESHOLD = 4;            // 이 크기 이하면 더 쪼개지 않는다
+    private final int start, end;        // [start, end] 닫힌 구간
+
+    public SumTask(int start, int end) {
+        this.start = start;
+        this.end = end;
+    }
+
+    @Override
+    protected Integer compute() {
+        int size = end - start + 1;
+        if (size <= THRESHOLD) {                         // 정복: 직접 계산
+            Work.log("[처리 시작] " + start + "~" + end);
+            int sum = 0;
+            for (int i = start; i <= end; i++) sum += Work.heavyTask(i);
+            Work.log("[처리 완료] " + start + "~" + end + " -> " + sum);
+            return sum;
+        }
+        int mid = start + (end - start) / 2;             // 분할
+        SumTask left = new SumTask(start, mid);
+        SumTask right = new SumTask(mid + 1, end);
+        Work.log("[분할] " + start + "~" + end + " -> " + start + "~" + mid + ", " + (mid + 1) + "~" + end);
+
+        left.fork();                       // 왼쪽은 큐에 넣어 다른 스레드가 가져가게
+        int rightResult = right.compute(); // 오른쪽은 지금 스레드가 직접
+        int leftResult = left.join();      // 왼쪽 결과를 기다린다(또는 직접 처리한다)
+        return leftResult + rightResult;   // 결합
+    }
+}</code></pre>
+<pre><code class="language-java">import java.util.concurrent.ForkJoinPool;
+
+public class ForkJoinMain {
+    public static void main(String[] args) {
+        if (args.length > 0) SumTask.THRESHOLD = Integer.parseInt(args[0]);
+        ForkJoinPool pool = new ForkJoinPool(10);
+        long start = System.currentTimeMillis();
+        int sum = pool.invoke(new SumTask(1, 8));
+        long time = System.currentTimeMillis() - start;
+        Work.log("sum=" + sum + ", time=" + time + "ms");
+        Work.log("pool=" + pool);
+        pool.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과: 임계값 4 (calculate 줄 순서는 실행마다 다르다)"><code class="language-text">[ForkJoinPool-1-worker-1] [분할] 1~8 -> 1~4, 5~8
+[ForkJoinPool-1-worker-1] [처리 시작] 5~8
+[ForkJoinPool-1-worker-2] [처리 시작] 1~4
+[ForkJoinPool-1-worker-1] calculate 5 -> 50
+[ForkJoinPool-1-worker-2] calculate 1 -> 10
+...
+[ForkJoinPool-1-worker-2] [처리 완료] 1~4 -> 100
+[ForkJoinPool-1-worker-1] [처리 완료] 5~8 -> 260
+[main] sum=360, time=465ms
+[main] pool=java.util.concurrent.ForkJoinPool@45ee12a7[Running, parallelism = 10, size = 2, active = 0, running = 0, steals = 2, tasks = 0, submissions = 0]</code></pre>
+<p>임계값을 2로 낮추면(<code>java ForkJoinMain 2</code>) 잎이 네 개가 되어 작업자 네 개가 동시에 일하고 약 200ms(이 실행에서 239ms)에 끝난다. 1로 낮추면 잎이 여덟 개가 되어 약 100ms(134ms)에 끝난다. 풀의 병렬성을 10으로 넉넉히 주었으므로 잎 수만큼 작업자가 붙은 것이다. 분할 코드는 한 번 썼고 데이터 크기나 임계값이 바뀌어도 고칠 필요가 없다. 스레드를 직접 쓸 때 사람이 하던 "나누기"를 작업 스스로 재귀적으로 하게 된 것이다.</p>
+<h4>compute() 한 줄씩 읽기</h4>
+<p><code>left.fork()</code>는 작업을 실행하지 않는다. 실행을 "예약"한다. OpenJDK 21의 <code>fork()</code>는 현재 스레드가 <code>ForkJoinWorkerThread</code>이면 그 작업자의 작업 큐에, 아니면 공용 풀의 제출 큐에 작업을 넣고 곧바로 반환한다. 그러면 놀고 있는 다른 작업자가 그 작업을 가져갈 수 있다.</p>
+<p><code>right.compute()</code>는 그냥 메서드 호출이다. 작업 큐를 거치지 않고 지금 스레드의 스택에 <code>compute()</code> 프레임이 하나 더 쌓인다. 오른쪽 절반은 다른 스레드에 넘길 필요 없이 내가 하면 되기 때문이다. <code>RecursiveTask</code> Javadoc의 예제도 같은 모양(왼쪽을 <code>fork</code>, 오른쪽을 <code>compute</code>, 그다음 왼쪽을 <code>join</code>)에 "일의 절반 정도는 여기서 직접 한다"는 주석을 붙여 둔다.</p>
+<p><code>left.join()</code>은 왼쪽 작업의 결과를 돌려준다. 이미 끝났으면 바로 반환한다. 아직이면 <code>Thread.join</code>처럼 무작정 잠들지 않는다. 먼저 그 작업이 아직 내 큐에 있는지 찾아보고, 있으면 꺼내서 직접 실행한다. 다른 작업자가 훔쳐 갔다면 그 작업자의 큐에서 일을 거들거나(helping), 그래도 안 되면 필요할 때 예비 스레드를 깨워 병렬성을 보충한다(compensating). 이 동작은 다음 절에서 소스로 확인한다. 이것이 고정 크기 스레드 풀의 교착을 없앤 핵심이다. 실제로 병렬성 2인 <code>ForkJoinPool</code>로 임계값 2의 같은 계산을 돌리면, 앞의 <code>PoolRecursionMain</code>과 스레드 수가 같은데도 교착 없이 끝난다.</p>
+<pre data-label="실행 결과: new ForkJoinPool(2), 임계값 2 (calculate 줄은 생략)"><code class="language-text">[ForkJoinPool-1-worker-1] [분할] 1~8 -> 1~4, 5~8
+[ForkJoinPool-1-worker-1] [분할] 5~8 -> 5~6, 7~8
+[ForkJoinPool-1-worker-2] [분할] 1~4 -> 1~2, 3~4
+[ForkJoinPool-1-worker-1] [처리 시작] 7~8
+[ForkJoinPool-1-worker-2] [처리 시작] 3~4
+[ForkJoinPool-1-worker-1] [처리 완료] 7~8 -> 150
+[ForkJoinPool-1-worker-2] [처리 완료] 3~4 -> 70
+[ForkJoinPool-1-worker-2] [처리 시작] 1~2
+[ForkJoinPool-1-worker-1] [처리 시작] 5~6
+[ForkJoinPool-1-worker-2] [처리 완료] 1~2 -> 30
+[ForkJoinPool-1-worker-1] [처리 완료] 5~6 -> 110
+[main] sum=360, time=457ms
+[main] pool=java.util.concurrent.ForkJoinPool@45ee12a7[Running, parallelism = 2, size = 2, active = 0, running = 0, steals = 2, tasks = 0, submissions = 0]</code></pre>
+<p><code>worker-1</code>은 7~8을 마친 뒤 <code>join</code>으로 5~6을 기다리는 대신 자기 큐에 남아 있던 5~6을 직접 처리했다. <code>worker-2</code>도 3~4를 마친 뒤 1~2를 직접 처리했다. 아무도 "기다리기만 하는" 상태로 스레드를 묶어 두지 않는다.</p>
+<h4>왜 둘 다 fork하지 않는가</h4>
+<p><code>left.fork(); right.fork(); return left.join() + right.join();</code>도 동작은 한다. 그러나 현재 스레드는 두 작업을 큐에 넣고 나서 할 일이 없어 곧바로 <code>join</code>에 들어가고, 큐 맨 위에는 나중에 넣은 <code>right</code>가 있는데 먼저 <code>left</code>를 찾게 된다. <code>ForkJoinTask</code>의 Javadoc은 재귀 호출의 반환처럼 <code>join</code>도 "가장 안쪽부터" 해야 한다며 <code>a.fork(); b.fork(); b.join(); a.join();</code>이 <code>a</code>를 먼저 join하는 것보다 상당히 효율적일 수 있다고 적는다. OpenJDK 21의 <code>tryRemoveAndExec</code>는 큐 위쪽부터 찾아 내려가 중간에 있는 작업을 꺼내고 나머지를 한 칸씩 당겨 메운다. 꺼낼 수는 있지만 그만큼 일이 늘고, 그 사이 큐에 생긴 틈은 훔치려는 다른 작업자를 잠시 멈추게 한다. 한쪽을 <code>compute()</code>로 직접 하는 형태는 이 문제를 아예 만들지 않는다. 같은 일을 하는 정적 메서드 <code>ForkJoinTask.invokeAll(t1, t2)</code>도 OpenJDK 21에서는 <code>t2</code>를 fork하고 <code>t1</code>은 현재 스레드에서 실행한 뒤 <code>t2</code>를 기다린다.</p>
+<h4>외부에서 부르는 메서드와 안에서 부르는 메서드</h4>
+<p><code>ForkJoinPool</code> Javadoc은 작업 실행 메서드를 호출 위치로 나눈 표를 제공한다. 포크/조인 계산 바깥(예: <code>main</code>)에서는 풀의 메서드를, 이미 풀 안에서 실행 중인 작업 안에서는 작업의 메서드를 쓴다.</p>
+<div class="table-wrap"><table><thead><tr><th>하려는 일</th><th>포크/조인 바깥에서</th><th>포크/조인 계산 안에서</th></tr></thead><tbody>
+<tr><td>비동기 실행 예약</td><td><code>pool.execute(task)</code></td><td><code>task.fork()</code></td></tr>
+<tr><td>실행하고 결과를 기다림</td><td><code>pool.invoke(task)</code></td><td><code>task.invoke()</code></td></tr>
+<tr><td>실행하고 Future를 받음</td><td><code>pool.submit(task)</code></td><td><code>task.fork()</code> (작업 자체가 Future)</td></tr>
+</tbody></table></div>
+<p><code>ForkJoinMain</code>의 출력에서 <code>main</code>이 계산에 한 번도 등장하지 않은 것은 <code>pool.invoke(task)</code> 때문이다. OpenJDK 21에서 이 메서드는 작업을 풀의 제출 큐에 넣고(<code>poolSubmit</code>) <code>join()</code>으로 기다린다. 이렇게 풀에 "제출"된 작업은 외부 스레드가 기다리면서 거들지 않는다(뒤의 공용 풀 절에서 이 규칙의 이유를 본다). 그래서 작업자 1이 루트를 가져갔다. 마지막 줄의 <code>steals = 2</code>는 <code>getStealCount()</code>의 값으로, Javadoc 정의는 "제출한 스레드가 아닌 다른 스레드가 실행을 마친 작업 수의 추정치"다. <code>main</code>이 제출한 루트를 작업자 1이 실행했고, 작업자 1이 fork한 1~4를 작업자 2가 실행했으니 2다.</p>
+<p>예외 처리도 다르다. <code>compute()</code>의 시그니처에는 <code>throws</code>가 없어 검사 예외를 던질 수 없다. Javadoc은 이것이 블로킹 I/O를 하지 말라는 지침을 "느슨하게 강제"하기 위한 것이라고 설명한다. 비검사 예외는 그 작업을 <code>join</code>하는 쪽으로 다시 던져지며, 가능하면 계산을 시작한 스레드와 실제로 예외를 만난 스레드의 스택 트레이스를 모두 담는다. 마지막 줄의 <code>pool.close()</code>는 자바 19에서 추가되었고, 공용 풀에 대해서는 아무 효과가 없다.</p>
+
+<h3>Fork/Join 프레임워크 2: 작업 훔치기</h3>
+<p><code>ThreadPoolExecutor</code>는 작업자들이 큐 하나를 공유한다. 넣는 쪽도 꺼내는 쪽도 모두 같은 큐에 몰린다. 작업이 크고 드물면 문제가 없지만, 포크/조인처럼 작업이 잘게 쪼개져 초당 수많은 작업이 생기고 사라지면 이 큐 하나가 병목이 된다. 게다가 이 구조에서는 앞서 본 대로 기다리는 작업자가 큐의 다른 작업을 실행할 방법이 없다.</p>
+<p><code>ForkJoinPool</code>은 다르게 생겼다. 작업자마다 자기 작업 큐(<code>WorkQueue</code>)를 하나씩 가진다. 이 큐는 양쪽 끝을 쓰는 덱이다. 작업자가 <code>fork()</code>한 작업은 자기 덱에 들어가고, 작업자는 평소에 자기 덱에서만 작업을 꺼낸다. 자기 덱이 비면 다른 작업자의 덱을 무작위로 골라 반대쪽 끝에서 작업을 하나 훔쳐 온다. Javadoc의 표현으로, 풀의 모든 스레드는 풀에 제출되었거나 다른 활성 작업이 만든 작업을 찾아 실행하려고 시도한다. OpenJDK 소스의 구현 개요는 이 방식을 생산자가 놀고 있는 스레드에 작업을 배정하는 "작업 배분(work dealing)"과 대비하면서, 신호를 받은 스레드가 깨어나는 동안(긴 시간이 걸릴 수 있다) 다른 일을 먼저 마친 스레드가 대신 그 작업을 가져갈 수 있어 처리량이 대개 더 좋다고 설명한다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>각자의 서류함과 남의 서류함 바닥</strong><p>사무실 직원마다 자기 서류함이 있다. 큰 업무를 받은 직원은 업무를 반으로 나눠 절반을 자기 서류함 맨 위에 올려 두고 나머지 절반을 붙잡고 일한다. 그 절반도 크면 또 나눠 올려 둔다. 자기 서류함이 빈 직원은 다른 직원의 서류함 맨 아래, 즉 가장 오래전에 올려 둔 서류를 빼 온다. 맨 아래 서류는 처음에 나눈 것이라 가장 큰 덩어리다. 주인은 위에서, 손님은 아래에서 빼니 둘이 손이 부딪히는 일은 서류가 한 장 남았을 때뿐이다. 비유가 깨지는 지점도 있다. 사람은 서로 말로 조율하지만 작업자 스레드는 대화하지 않고 원자적 연산(CAS)으로 누가 가져갈지 정한다. 또 "맨 아래가 가장 크다"는 것은 재귀적으로 반씩 나누는 작업에서만 성립하는 성질이다.</p></aside>
+<p>이 구조가 주는 이득은 세 가지다. 첫째, 탈중앙화다. 작업자는 대부분의 시간에 자기 덱만 만지므로 공유 지점에서 경쟁하지 않는다. 구현 개요는 작업 훔치기의 처리량 이점이 "탈중앙화된 제어"에서 온다고 적는다. 둘째, 자동 부하 분산이다. 스레드를 직접 쓸 때 일의 양이 고르지 않으면 먼저 끝난 스레드가 놀았지만, 여기서는 먼저 끝난 작업자가 아직 바쁜 작업자의 덱에서 일을 가져온다. 사람이 미리 공평하게 나눌 필요가 없다. 셋째, <code>join</code>하는 스레드가 놀지 않는다. 앞 절에서 본 대로 기다리는 작업자는 자기 덱이나 자기 일을 훔쳐 간 작업자의 덱에서 일을 찾아 실행한다.</p>
+<x-visual id="java-adv3-10-work-stealing-deques" title="작업자마다 덱을 가지고, 주인은 위에서 꺼내고 도둑은 아래에서 훔치는 구조" kind="구조도" ratio="16:9">
+<x-hint>ForkJoinPool의 작업자 두 명이 각자 덱을 가지고 있으며, 주인은 top 쪽에서 넣고 빼고(LIFO), 놀고 있는 작업자는 다른 덱의 base 쪽에서 훔친다(FIFO)는 것을 보여 준다.</x-hint>
+<x-prompt>A flat vector diagram, white background. Two worker figures drawn as rounded rectangles side by side: left labeled "작업자 1", right labeled "작업자 2". Under each worker, a vertical stack of slots representing a deque, with the top end labeled "top" and the bottom end labeled "base". Worker 1's deque contains two task boxes: bottom box "1~4" (large) and above it "5~6" (smaller). Worker 2's deque is empty. Blue curved arrow from Worker 1 to the top of its own deque labeled "push / pop (LIFO)". A red arrow from Worker 2 reaching into the bottom of Worker 1's deque, pulling out the box "1~4", labeled "steal (FIFO)". A small gray note at the bottom: "주인과 도둑은 서로 반대쪽 끝을 쓴다". Use blue for owner operations, red for stealing. Under 12 labels.</x-prompt>
+<x-caption>주인은 덱의 위쪽에서 넣고 빼며, 일이 없는 작업자는 다른 덱의 아래쪽에서 가장 오래된 작업을 훔친다.</x-caption>
+</x-visual>
+
+<h3>작업 훔치기 알고리즘: 덱의 양 끝을 나눠 쓰는 이유</h3>
+<p>이제 OpenJDK 21의 <code>ForkJoinPool</code> 소스 주석(구현 개요)과 코드로 내려가자. 아래 내용은 Javadoc이 보장하는 규약이 아니라 OpenJDK 21의 구현이다. 버전에 따라 세부는 바뀔 수 있다.</p>
+<h4>WorkQueue: 배열 하나와 인덱스 두 개</h4>
+<p><code>WorkQueue</code>는 원형 버퍼로 쓰는 배열 <code>array</code>와 두 인덱스 <code>base</code>, <code>top</code>으로 이루어진다. 배열 크기는 항상 2의 거듭제곱이어서 나머지 연산 대신 비트 마스킹으로 인덱스를 계산한다. 소스 주석은 이 큐가 덱의 네 가지 끝 연산 중 세 가지만 지원한다고 설명한다.</p>
+<ul>
+<li><b>push</b>: 주인 스레드만 호출한다. 개념적으로 <code>array[top++ % length] = task</code>다.</li>
+<li><b>pop</b>: 주인 스레드만 호출한다. <code>top - 1</code> 칸의 작업을 원자적으로 꺼내(<code>getAndSet</code>으로 null로 바꾸며) <code>top</code>을 줄인다. 가장 최근에 넣은 것을 꺼내므로 LIFO다.</li>
+<li><b>poll(=steal)</b>: 다른 스레드가 호출한다. <code>base</code> 칸의 작업을 CAS로 null로 바꾸는 데 성공하면 <code>base</code>를 올리고 그 작업을 가져간다. 가장 오래된 것을 가져가므로 FIFO다.</li>
+</ul>
+<p>주인과 도둑이 마지막 남은 작업 하나를 두고 동시에 달려들면 누가 이기는가? OpenJDK 구현은 이 경쟁을 인덱스가 아니라 배열의 칸 자체에 대한 원자 연산으로 판정한다. 칸을 먼저 null로 바꾼 쪽이 가져간다. 소스 주석은 이렇게 설계한 이유를 GC와 연결한다. 가져간 칸을 가능한 한 빨리 null로 비워 두어야, 작업을 엄청나게 많이 만드는 프로그램에서도 큐가 이미 끝난 작업 객체를 붙잡아 GC를 방해하지 않는다. 자바 고급 1편에서 본 CAS가 여기서 락 없이 주인과 도둑을 중재하는 도구로 쓰인다.</p>
+<h4>주인은 LIFO, 도둑은 FIFO인 이유</h4>
+<p>재귀 분할에서 덱에 쌓이는 작업의 모양을 생각해 보면 이 선택의 이유가 보인다. 작업자는 큰 작업을 반으로 나눠 절반을 push하고, 남은 절반을 다시 나눠 그 절반을 push한다. 그러므로 덱의 아래쪽(base)에는 일찍 나눈 큰 작업이, 위쪽(top)에는 최근에 나눈 작은 작업이 쌓인다.</p>
+<ul>
+<li><b>주인이 위에서 꺼내는 이유</b>: 가장 최근에 fork한 작업은 방금 다루던 데이터 범위와 가깝고 크기도 작다. 주인이 이것부터 처리하는 것은 재귀 호출이 가장 안쪽부터 반환되는 것과 같은 순서여서, 앞에서 본 "join은 가장 안쪽부터" 규칙과 자연스럽게 맞아떨어진다.</li>
+<li><b>도둑이 아래에서 훔치는 이유</b>: 가장 오래된 작업은 트리의 뿌리에 가까운 큰 덩어리다. 한 번 훔쳐 오면 그 안에서 다시 분할하며 오랫동안 혼자 일할 수 있으므로 훔치는 횟수가 줄어든다. 그리고 주인과 도둑이 서로 반대쪽 끝을 쓰므로 둘의 경쟁은 덱에 작업이 하나 남았을 때만 생긴다.</li>
+</ul>
+<p>소스 주석은 작업자가 자기 큐의 작업을 먼저 처리하고(모드에 따라 LIFO 또는 FIFO), 그다음 다른 큐에서 무작위로 고른 FIFO 훔치기를 한다는 우선순위를 밝혀 둔다. 생성자의 <code>asyncMode</code>를 <code>true</code>로 주면 주인도 자기 큐를 FIFO로 처리한다. Javadoc은 이 모드가 join되지 않는 이벤트 형태의 작업에 적합할 수 있다고 설명한다. 재귀 분할에는 기본값인 LIFO가 맞다.</p>
+<h4>실제 실행을 덱으로 다시 읽기</h4>
+<p>앞에서 본 병렬성 2, 임계값 2의 실행을 덱의 상태로 추적해 보자. 출력 로그와 <code>steals = 2</code>가 이 추적과 일치한다.</p>
+<pre class="diagram">시점  작업자 1이 하는 일                  작업자 1의 덱 (base → top)   작업자 2
+────  ───────────────────────────────    ─────────────────────────   ──────────────────────────
+t0    제출 큐에서 루트 1~8을 가져옴        [ ]                          놀고 있음
+t1    1~8 분할, 1~4 fork                  [1~4]
+t2    5~8 compute → 분할, 5~6 fork        [1~4][5~6]                   1~4를 base에서 훔침
+t3    7~8 compute (직접 계산)             [5~6]                        1~4 분할, 1~2 fork
+                                                                       3~4 compute (직접 계산)
+t4    5~6 join → 자기 덱 top에서 꺼내      [ ]                          1~2 join → 자기 덱에서 꺼내
+      직접 실행                                                         직접 실행
+t5    1~4 join → 작업자 2가 훔쳐 간 작업.                               1~2 끝, 1~4 결합(30+70=100)
+      거들 일이 없으면 끝나기를 기다림
+t6    5~8 결합(110+150=260), 루트 결합(100+260=360) → main에 결과 전달</pre>
+<p>훔치기는 두 번 일어났다. <code>main</code>이 제출한 루트를 작업자 1이 가져간 것, 작업자 1이 fork한 1~4를 작업자 2가 가져간 것이다. 작업자 2는 덱 아래쪽의 1~4를 훔쳤다. 위쪽의 5~6이 아니다. 그래서 작업자 2는 1~4 전체(작업 네 개 분량)를 혼자 맡아 다시 분할했고, 그 뒤로는 훔칠 필요가 없었다.</p>
+<h4>join이 기다리지 않고 하는 일</h4>
+<p>t4와 t5의 <code>join</code>에서 일어난 일을 OpenJDK 21 코드로 확인하자. <code>ForkJoinTask.join()</code>은 작업이 아직 끝나지 않았으면 <code>awaitDone</code>으로 가고, 현재 스레드가 작업자라면 다음 순서로 시도한다.</p>
+<ol>
+<li><b>tryRemoveAndExec</b>: 기다리려는 작업이 아직 내 덱에 있으면 꺼내서 바로 실행한다. 메서드 주석은 이것을 "top부터 훑어 작업을 찾으면 제거해 실행하고, 나머지를 당겨 빈 칸을 메우는" 깊은 형태의 pop이라고 설명한다. t4에서 두 작업자가 각자 한 일이 이것이다.</li>
+<li><b>helpJoin</b>: 작업을 누가 훔쳐 갔다면, 훔쳐 간 작업자의 덱에서 작업을 가져와 실행한다. 구현 개요는 이를 "선형 도움(linear helping)"이라 부른다. 각 작업자는 마지막으로 훔쳐 온 큐를 <code>source</code> 필드에 기록하고, 기다리는 쪽은 이 표시를 따라 내 작업을 가져간 작업자를 찾는다. 그 결과 기다리는 쪽은 "도둑맞지 않았다면 자기 덱에 있었을" 작업을 실행하게 된다. t5에서 작업자 1이 이것을 시도했지만 작업자 2의 덱에 남은 일이 없었다.</li>
+<li><b>보상(compensation)</b>: 거들 일도 찾지 못하면 필요할 때 예비 스레드를 만들거나 깨워 병렬성을 보충한 뒤 잠든다. 구현 개요는 대부분의 막힘이 GC나 OS 활동 같은 일시적인 원인이라 즉시 보상하면 오히려 스레드가 과잉이 될 수 있어, 기본 정책은 "명백히 굶주릴 때만" 스레드를 추가한다고 설명한다.</li>
+</ol>
+<p>외부 스레드의 제출도 같은 자료 구조로 처리된다. 풀의 <code>queues</code> 배열에서 작업자 큐는 홀수 인덱스에, 외부 제출용 공유 큐는 짝수 인덱스에 놓인다. 외부 스레드는 <code>ThreadLocalRandom</code>의 탐침값을 해시처럼 써서 제출 큐를 고르고, 공유 큐에 넣을 때는 간단한 스핀 락을 잡는다. 작업자 입장에서는 제출 큐도 훔칠 대상 중 하나다. t0에서 작업자 1이 루트를 가져온 것이 이 경로다.</p>
+<aside class="note">블로킹은 이 정교한 장치를 무력화한다. <code>ForkJoinPool</code> Javadoc은 풀이 작업이 다른 작업의 join을 기다리느라 멈춘 경우에도 충분한 스레드를 유지하려 하지만, 블로킹 I/O나 관리되지 않는 동기화 앞에서는 그런 조정이 보장되지 않는다고 적는다. 블로킹이 꼭 필요하면 <code>ForkJoinPool.ManagedBlocker</code> 인터페이스로 풀에 알려야 보상을 받을 수 있다.</aside>
+
+<h3>Fork/Join 프레임워크 3: 공용 풀</h3>
+<p>지금까지는 <code>new ForkJoinPool(10)</code>처럼 풀을 직접 만들었다. 자바 8부터는 <code>ForkJoinPool.commonPool()</code>이라는 정적 풀이 JVM에 하나 있다(<code>@since 1.8</code>). Javadoc은 이 공용 풀이 대부분의 애플리케이션에 적합하며, 특정 풀에 명시적으로 제출되지 않은 모든 <code>ForkJoinTask</code>가 공용 풀을 쓴다고 정한다. <code>main</code> 같은 일반 스레드에서 <code>task.fork()</code>나 <code>task.invoke()</code>를 부르면 그 작업은 공용 풀로 간다. 앞에서 본 <code>fork()</code> 코드의 else 분기, 즉 "현재 스레드가 작업자가 아니면 공용 풀의 제출 큐에 넣는다"가 그 경로다.</p>
+<pre><code class="language-java">import java.util.concurrent.ForkJoinPool;
+
+public class CommonPoolMain {
+    public static void main(String[] args) {
+        Work.log("processors=" + Runtime.getRuntime().availableProcessors());
+        Work.log("commonPool parallelism=" + ForkJoinPool.getCommonPoolParallelism());
+        long start = System.currentTimeMillis();
+        int sum = new SumTask(1, 8).invoke();   // 풀을 지정하지 않았다 (임계값 4)
+        long time = System.currentTimeMillis() - start;
+        Work.log("sum=" + sum + ", time=" + time + "ms");
+        Work.log("pool=" + ForkJoinPool.commonPool());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (calculate 줄은 생략)"><code class="language-text">[main] processors=8
+[main] commonPool parallelism=7
+[main] [분할] 1~8 -> 1~4, 5~8
+[main] [처리 시작] 5~8
+[ForkJoinPool.commonPool-worker-1] [처리 시작] 1~4
+[main] [처리 완료] 5~8 -> 260
+[ForkJoinPool.commonPool-worker-1] [처리 완료] 1~4 -> 100
+[main] sum=360, time=452ms
+[main] pool=java.util.concurrent.ForkJoinPool@1c20c684[Running, parallelism = 7, size = 1, active = 0, running = 0, steals = 1, tasks = 0, submissions = 0]</code></pre>
+<p>두 가지가 눈에 띈다. 첫째, 논리 프로세서가 8개인데 공용 풀의 병렬성은 7이다. 둘째, <code>main</code>이 계산에 직접 참여했다. 루트를 분할한 것도, 5~8을 처리한 것도 <code>main</code>이다. <code>ForkJoinTask.invoke()</code>의 Javadoc은 이 메서드가 의미상 <code>fork(); join()</code>과 같지만 "항상 현재 스레드에서 실행을 시작하려고 시도한다"고 정한다. 그래서 <code>main</code>이 루트의 <code>compute()</code>를 실행했고, 거기서 fork된 1~4를 공용 풀의 작업자 1이 훔쳐 갔다. 작업자가 하나만 필요했으므로 풀의 <code>size</code>도 1이다. 공용 풀은 작업자 스레드를 처음부터 다 만들어 두지 않고 필요할 때 만들며, Javadoc에 따르면 쓰이지 않는 동안에는 스레드를 천천히 회수했다가 다시 쓰일 때 되살린다.</p>
+<h4>병렬성이 코어 수보다 하나 적은 이유</h4>
+<p>OpenJDK 21의 공용 풀 생성자는 시스템 속성이 없으면 병렬성을 <code>Math.max(1, Runtime.getRuntime().availableProcessors() - 1)</code>로 정한다. 하나를 빼는 이유는 위 실행 결과에 그대로 나타난다. 공용 풀에 작업을 fork한 외부 스레드는 join하면서 자기 하위 작업을 직접 처리한다. 구현 개요는 이 "호출자도 돕는(caller-helps)" 정책 덕분에 공용 풀의 병렬성을 전체 코어 수보다 하나(또는 그 이상) 적게, 심지어 호출자만 실행하는 0으로 두는 것이 합리적이라고 설명한다. 작업자 7개와 호출 스레드 1개를 합치면 코어 8개를 모두 쓰는 셈이다. 다만 프로세서가 하나뿐이어도 병렬성은 최소 1이다.</p>
+<p>이 정책에는 조건이 있다. 같은 공용 풀이라도 <code>ForkJoinPool.commonPool().invoke(task)</code>로 "제출"하면 <code>main</code>은 돕지 않는다.</p>
+<pre data-label="ForkJoinPool.commonPool().invoke(new SumTask(1, 8))의 실행 결과 (calculate 줄은 생략)"><code class="language-text">[ForkJoinPool.commonPool-worker-1] [분할] 1~8 -> 1~4, 5~8
+[ForkJoinPool.commonPool-worker-2] [처리 시작] 1~4
+[ForkJoinPool.commonPool-worker-1] [처리 시작] 5~8
+[ForkJoinPool.commonPool-worker-2] [처리 완료] 1~4 -> 100
+[ForkJoinPool.commonPool-worker-1] [처리 완료] 5~8 -> 260
+[main] sum=360</code></pre>
+<p>구현 개요는 그 이유를 <code>ExecutorService</code> 규약에서 찾는다. 풀에 제출한 작업은 풀이 실행해야 하므로, 호출자 돕기는 <code>fork</code>로 들어온 작업에만 적용하고 <code>submit</code>류로 들어온 작업에는 적용하지 않는다. OpenJDK는 이를 작업의 상태 비트로 구분한다. 같은 계산이라도 <code>task.invoke()</code>는 호출 스레드를 일꾼으로 쓰고, <code>pool.invoke(task)</code>는 호출 스레드를 순수한 대기자로 둔다.</p>
+<h4>설정과 생명 주기</h4>
+<p>공용 풀은 생성자로 만들 수 없으므로 시스템 속성으로 설정한다. Javadoc이 정하는 속성은 네 가지다.</p>
+<div class="table-wrap"><table><thead><tr><th>시스템 속성</th><th>의미</th></tr></thead><tbody>
+<tr><td><code>java.util.concurrent.ForkJoinPool.common.parallelism</code></td><td>병렬성. 음이 아닌 정수</td></tr>
+<tr><td><code>java.util.concurrent.ForkJoinPool.common.threadFactory</code></td><td><code>ForkJoinWorkerThreadFactory</code> 구현 클래스 이름. 시스템 클래스 로더로 읽는다</td></tr>
+<tr><td><code>java.util.concurrent.ForkJoinPool.common.exceptionHandler</code></td><td><code>UncaughtExceptionHandler</code> 구현 클래스 이름</td></tr>
+<tr><td><code>java.util.concurrent.ForkJoinPool.common.maximumSpares</code></td><td>목표 병렬성을 유지하려고 추가로 둘 수 있는 예비 스레드 최대 수. 기본값 256</td></tr>
+</tbody></table></div>
+<p>적용 시점이 중요하다. OpenJDK 21에서 공용 풀은 <code>ForkJoinPool</code> 클래스의 정적 초기화 블록에서 만들어지고, 위 속성은 그 생성자에서 한 번 읽힌다. 따라서 <code>-Djava.util.concurrent.ForkJoinPool.common.parallelism=3</code>처럼 JVM 시작 인자로 주는 것이 확실하다. 코드에서 <code>System.setProperty</code>로 바꾸면, 그 전에 병렬 스트림이나 <code>CompletableFuture</code> 같은 다른 코드가 이미 <code>ForkJoinPool</code> 클래스를 초기화했을 경우 아무 효과가 없다. 속성 값에 오류가 있으면 기본값이 쓰인다. 병렬성을 0으로 두는 것도 허용되지만, Javadoc은 그러면 join되지 않는 작업이 영영 실행되지 않을 수 있다고 경고한다.</p>
+<p>생명 주기도 일반 풀과 다르다. Javadoc에 따르면 공용 풀은 정적으로 만들어지며 <code>shutdown()</code>이나 <code>shutdownNow()</code>를 불러도 실행 상태가 바뀌지 않는다. 모든 작업자 스레드는 데몬 스레드로 초기화되므로 JVM은 공용 풀의 작업이 끝나기를 기다리지 않고 종료할 수 있다. 프로그램 종료 전에 비동기 작업이 끝나야 한다면 <code>commonPool().awaitQuiescence(...)</code>로 기다리라는 것이 Javadoc의 안내다.</p>
+<h4>공용 풀을 쓰는 다른 API</h4>
+<p>공용 풀은 병렬 스트림만의 것이 아니다. 같은 JVM 안에서 다음 API가 모두 같은 풀을 쓴다.</p>
+<ul>
+<li><b>병렬 스트림</b>: 다음 절에서 본다.</li>
+<li><b><code>CompletableFuture</code>의 비동기 메서드</b>: <code>supplyAsync(supplier)</code>처럼 <code>Executor</code> 인자가 없는 비동기 메서드는 공용 풀에서 실행된다. 단, Javadoc은 공용 풀이 병렬성 2 이상을 지원하지 않으면 작업마다 새 스레드를 만든다고 정한다. OpenJDK 21 코드도 <code>getCommonPoolParallelism() > 1</code>일 때만 공용 풀을 쓴다. 즉 <code>availableProcessors()</code>가 2 이하인 환경에서는 동작 방식이 바뀐다.</li>
+<li><b><code>Arrays.parallelSort</code></b>: Javadoc은 병렬 작업 실행에 포크/조인 공용 풀을 쓴다고 밝힌다.</li>
+<li><b>직접 만든 <code>ForkJoinTask</code></b>: 작업자가 아닌 스레드에서 <code>fork()</code>나 <code>invoke()</code>를 부르면 공용 풀로 간다.</li>
+</ul>
+<p>그러므로 공용 풀은 JVM 전체가 함께 쓰는 공유 자원이다. 어느 한 기능이 공용 풀의 작업자를 오래 붙잡으면, 그 기능과 아무 관련 없는 다른 기능의 병렬 스트림과 비동기 작업이 함께 느려진다. 이것이 뒤의 주의점 1의 출발점이다.</p>
+
+<h3>작업자 스레드의 일생: pthread로 태어나 park로 잠들고 keepAlive로 사라진다</h3>
+<p>앞 절에서 공용 풀은 작업자를 필요할 때 만들고, 쓰이지 않으면 천천히 회수한다고 했다. 병렬화의 고정 비용 목록에 "스레드 깨우기"가 들어가는 것도 같은 이야기다. 그렇다면 작업자는 정확히 언제 만들어지고, 일이 없을 때 어디서 무엇을 하며 기다리고, 언제 사라지는가. 이 절은 OpenJDK 21의 <code>ForkJoinPool</code> 코드, HotSpot의 C++ 코드(jdk21u 저장소), 그리고 macOS(이 실험 환경)에서 관찰한 결과로 그 일생을 따라간다. 모두 구현의 세부이며 Javadoc이 약속한 동작이 아니다.</p>
+<h4>ctl: 64비트 하나에 담긴 풀의 상태</h4>
+<p>풀의 활성화 상태는 <code>volatile long ctl</code> 필드 하나에 모여 있다. 소스 주석에 따르면 64비트를 16비트씩 네 칸으로 나누어 쓴다.</p>
+<pre class="diagram">비트  63        48 47        32 31        16 15         0
+     ┌────────────┬────────────┬────────────┬────────────┐
+ctl  │     RC     │     TC     │     SS     │     ID     │
+     └────────────┴────────────┴────────────┴────────────┘
+RC : 풀려난(released) 작업자 수 — 작업을 찾거나 실행 중인 작업자
+TC : 전체 작업자 수             — getPoolSize() 가 이 칸을 읽는다
+SS : 대기 스택 맨 위 작업자의 버전 카운터와 상태
+ID : 대기 스택 맨 위 작업자의 큐 인덱스   (아래 32비트가 0이면 대기자가 없다)</pre>
+<p>아래 32비트는 놀고 있는 작업자들이 쌓인 스택의 꼭대기다. 소스 주석은 이것을 트라이버 스택(Treiber stack), 즉 CAS로 꼭대기를 바꾸는 락 없는 연결 스택이라고 부른다. 각 작업자의 <code>WorkQueue.stackPred</code> 필드가 바로 아래 작업자를 가리키는데, 참조가 아니라 <code>queues</code> 배열의 인덱스를 담는다. 주석은 그 이유를 대기·신호·제어 경로가 작업자나 작업 객체를 붙잡아 GC를 방해하지 않게 하려는 것이라고 밝힌다. 개수 칸과 버전 칸이 같은 64비트 안에 있으므로 "스택에서 작업자 하나를 꺼내면서 RC를 1 올리기" 같은 여러 칸의 변경을 CAS 한 번으로 원자적으로 할 수 있고, 버전 값은 같은 인덱스가 빠졌다 다시 들어오는 ABA 문제를 막는다. 앞에서 출력한 풀 정보의 <code>size</code>가 TC 칸이고, <code>getActiveThreadCount()</code>가 RC 칸이다.</p>
+<h4>태어남: signalWork에서 pthread_create까지</h4>
+<p>작업이 큐에 들어가면 누군가 그것을 실행하도록 신호를 보내야 한다. 이 일을 하는 메서드가 <code>signalWork()</code>다. 줄여 말하면 이렇다. RC가 병렬성보다 작을 때만 움직인다. 대기 스택에 작업자가 있으면 CAS로 그 작업자를 꺼내 RC를 올리고, 그 작업자가 실제로 잠들어 있으면 <code>LockSupport.unpark</code>로 깨운다. 대기자가 없고 TC가 병렬성보다 작으면 TC를 먼저 올려 자리를 예약한 뒤 <code>createWorker()</code>로 새 스레드를 만든다. 구현 개요는 자원 사용을 줄이려고 "새로 만들기보다 놀고 있는 스레드를 다시 활성화하는 쪽"을 우선한다고 적는다.</p>
+<p>누가 <code>signalWork()</code>를 부르는지도 정해져 있다. <code>fork()</code>가 부르는 <code>WorkQueue.push</code>는 새 작업을 넣은 칸의 바로 앞 칸이 비어 있을 때, 즉 빈 큐에 작업을 넣었을 때 신호를 보낸다. <code>scan</code>으로 다른 큐에서 작업을 훔친 작업자는 그 큐에 작업이 더 남아 있으면 신호를 하나 더 보낸다. 구현 개요는 계산이 순수한 트리 구조라면 첫 규칙만으로도 작업자가 다른 작업자 하나를 깨우는 연쇄가 생겨 O(log(스레드 수)) 단계 만에 모두 활성화되고, 작업이 한 생산자에게서 차례로 들어오는 경우는 둘째 규칙이 같은 효과를 낸다고 설명한다. <code>main</code> 혼자 일곱 번 신호를 보내는 것이 아니라, 깨어난 작업자가 다음 작업자를 깨우는 나무 모양의 전파다.</p>
+<p>새 작업자는 결국 <code>Thread.start()</code>로 시작된다. HotSpot에서 이 호출은 <code>JVM_StartThread</code>(jvm.cpp)에 도착해 <code>JavaThread</code> 객체를 만들고, 그 생성자가 <code>os::create_thread</code>를 부른다. macOS용 구현(os_bsd.cpp)은 pthread 속성에 스택 크기와 detached 상태를 설정한 뒤 <code>pthread_create</code>를 호출하고, 성공하면 로그를 한 줄 남긴다. <code>-Xlog:os+thread</code>로 그 로그를 켜면 병렬 스트림 한 번에 OS 스레드가 몇 개 생기는지 볼 수 있다.</p>
+<pre><code class="language-java">import java.util.concurrent.ForkJoinPool;
+import java.util.stream.IntStream;
+
+public class Birth {
+    public static void main(String[] args) {
+        System.out.println("before: poolSize=" + ForkJoinPool.commonPool().getPoolSize());
+        int sum = IntStream.rangeClosed(1, 8).parallel().map(i -> i * 10).sum();
+        System.out.println("after : poolSize=" + ForkJoinPool.commonPool().getPoolSize() + ", sum=" + sum);
+    }
+}</code></pre>
+<pre data-label="java -Xlog:os+thread=info:stdout:uptime Birth (일부. pthread id와 tid, 시각은 실행마다 다르다)"><code class="language-text">before: poolSize=0
+[0.057s] Thread "Unknown thread" started (pthread id: 6135459840, attributes: stacksize: 2048k, guardsize: 16k, detached).
+[0.057s] Thread is alive (tid: 26115, pthread id: 6135459840).
+[0.057s] Thread "Unknown thread" started (pthread id: 6137606144, attributes: stacksize: 2048k, guardsize: 16k, detached).
+[0.057s] Thread is alive (tid: 26627, pthread id: 6137606144).
+...  (같은 쌍이 네 번 더)
+after : poolSize=6, sum=360</code></pre>
+<p><code>before</code>와 <code>after</code> 사이에 pthread가 여섯 개 생겼고 <code>poolSize</code>도 6이다. 2048k는 이 플랫폼(macOS, AArch64)에서 <code>ThreadStackSize</code>의 기본값이다(<code>java -XX:+PrintFlagsFinal -version</code>으로 확인). 같은 프로그램을 다섯 번 실행하자 <code>after</code>의 <code>poolSize</code>는 5, 5, 4, 6, 6으로 매번 달랐다. 병렬성은 7인데 일곱 개를 다 만들지 않은 것이다. 작업자는 "병렬성만큼 미리" 만들어지는 것이 아니라, 위의 두 규칙에 따라 신호가 나간 만큼만 만들어진다. 원소당 계산이 곱셈 하나뿐이면 신호를 보낼 조건(빈 큐에 들어간 작업, 훔친 뒤에도 남은 작업)이 몇 번 생기는지가 실행마다 달라진다. 첫 병렬 스트림 호출은 작업자 생성, 즉 <code>pthread_create</code>와 스레드 초기화 비용까지 치르고, 그다음 호출부터는 이미 있는 스레드를 깨운다.</p>
+<h4>잠듦: awaitWork에서 pthread_cond_wait까지</h4>
+<p>작업자의 최상위 루프 <code>runWorker</code>는 <code>scan</code>으로 작업을 찾다가 찾지 못하면 <code>awaitWork</code>로 들어간다. 여기서 하는 일은 세 단계다. 첫째, 자기 <code>phase</code> 필드에 비활성 비트(부호 비트)를 세우고, CAS로 <code>ctl</code>의 대기 스택 꼭대기에 자신을 올리면서 RC를 1 내린다. 둘째, 곧바로 잠들지 않고 큐 배열 크기에 비례하는 짧은 횟수만큼 <code>Thread.onSpinWait()</code>를 부르며 신호를 기다린다. 구현 개요는 park/unpark가 느리고 들쭉날쭉할 수 있지만 계속 스캔하면 메모리와 CAS 경쟁이 커지므로, 비활성화와 활성화가 아슬아슬하게 엇갈리는 경우만 덮을 만큼 작은 값으로 정했다고 설명한다. 셋째, 그래도 신호가 없으면 <code>access</code> 필드를 <code>PARKED</code>로 바꿔 "깨우려면 unpark가 필요하다"고 알린 뒤 <code>LockSupport.park()</code>를 부른다. 앞의 <code>signalWork</code>가 <code>access == PARKED</code>일 때만 <code>unpark</code>를 부르는 이유가 이것이다. 아직 스핀 중인 작업자는 <code>phase</code>만 바꿔 주면 스스로 알아차린다.</p>
+<p>그 아래는 HotSpot이다. <code>LockSupport.park</code>는 <code>Unsafe.park</code>라는 네이티브 메서드를 부르고, HotSpot의 <code>Unsafe_Park</code>(unsafe.cpp)는 스레드 상태를 파킹으로 바꾼 뒤 스레드마다 하나씩 있는 <code>Parker</code> 객체의 <code>park</code>를 호출한다. POSIX용 구현(os_posix.cpp)의 <code>Parker::park</code>는 먼저 허가(permit) 카운터 <code>_counter</code>를 원자적으로 0으로 바꿔 보고, 원래 값이 1이었으면(누군가 먼저 unpark했으면) 잠들지 않고 바로 반환한다. 아니면 pthread 뮤텍스를 잡고 <code>pthread_cond_wait</code>로 조건 변수에서 잠든다(<code>parkUntil</code>처럼 기한이 있으면 <code>pthread_cond_timedwait</code>). <code>Parker::unpark</code>는 카운터를 1로 만들고, 그 스레드가 조건 변수에서 기다리는 중이면 <code>pthread_cond_signal</code>을 보낸다. unpark가 park보다 먼저 도착해도 깨움을 잃지 않는 것은 이 카운터 덕분이다.</p>
+<p>정말 그렇게 잠들어 있는지 보자. 앞의 <code>ParallelStreamMain</code>과 같은 병렬 스트림을 한 번 실행한 뒤 8초 동안 <code>Thread.sleep</code>하는 프로그램을 띄우고, <code>jstack</code>으로 자바 스택을, macOS의 <code>sample</code> 명령으로 네이티브 스택을 찍었다.</p>
+<pre data-label="jstack PID (작업자 하나만. 주소와 시간 값은 실행마다 다르다)"><code class="language-text">"ForkJoinPool.commonPool-worker-1" #20 [26115] daemon prio=5 os_prio=31 cpu=0.48ms elapsed=2.80s ... waiting on condition
+   java.lang.Thread.State: WAITING (parking)
+	at jdk.internal.misc.Unsafe.park(java.base@21.0.13/Native Method)
+	- parking to wait for  <0x000000701062fab8> (a java.util.concurrent.ForkJoinPool)
+	at java.util.concurrent.locks.LockSupport.park(java.base@21.0.13/LockSupport.java:371)
+	at java.util.concurrent.ForkJoinPool.awaitWork(java.base@21.0.13/ForkJoinPool.java:1893)
+	at java.util.concurrent.ForkJoinPool.runWorker(java.base@21.0.13/ForkJoinPool.java:1809)
+	at java.util.concurrent.ForkJoinWorkerThread.run(java.base@21.0.13/ForkJoinWorkerThread.java:188)</code></pre>
+<pre data-label="sample PID 1 (같은 작업자의 네이티브 스택, 아래쪽만. ???는 심볼이 없는 자바 프레임)"><code class="language-text">749 Thread_72703823: Java: ForkJoinPool.commonPool-worker-1
++ 749 thread_start  (in libsystem_pthread.dylib)
++   749 _pthread_start  (in libsystem_pthread.dylib)
++     749 thread_native_entry(Thread*)  (in libjvm.dylib)
+  ...
++             ???  (in <unknown binary>)
++               749 Unsafe_Park(JNIEnv_*, _jobject*, unsigned char, long)  (in libjvm.dylib)
++                 749 Parker::park(bool, long)  (in libjvm.dylib)
++                   749 _pthread_cond_wait  (in libsystem_pthread.dylib)
++                     749 __psynch_cvwait  (in libsystem_kernel.dylib)</code></pre>
+<p>자바 스택은 <code>runWorker → awaitWork → LockSupport.park → Unsafe.park</code>에서 멈춰 있고, 네이티브 스택은 그 밑에서 <code>Unsafe_Park → Parker::park → _pthread_cond_wait → __psynch_cvwait</code>로 이어진다. 맨 위의 <code>thread_start</code>와 <code>thread_native_entry</code>는 앞에서 본 <code>pthread_create</code>가 이 스레드를 시작한 진입점이다. <code>__psynch_cvwait</code>는 libsystem_kernel에 있는 macOS의 조건 변수 대기 시스템 콜이다. 스레드는 커널 안에서 잠들어 실행 대기열에서 빠지므로 CPU를 쓰지 않는다. jstack의 <code>cpu=0.48ms</code>는 이 작업자가 태어나서 지금까지 쓴 CPU 시간 전체다. Linux에서는 같은 <code>pthread_cond_wait</code>가 glibc를 거쳐 futex 시스템 콜로 내려간다. 잠든 작업자를 깨우는 비용, 즉 <code>unpark</code>에서 시작해 커널이 그 스레드를 다시 실행 대기열에 넣고 코어에 올리기까지의 시간이 병렬화의 고정 비용 가운데 하나다. 구현 개요도 작업자를 빨리 일하게 만드는 지연 시간이 주로 JVM과 그 아래 OS의 park/unpark 성능에 달려 있으며, 이 값은 느리고 들쭉날쭉할 수 있다고 적는다.</p>
+<h4>사라짐: keepAlive와 하나씩의 회수</h4>
+<p>같은 덤프에서 공용 풀 작업자 일곱 중 여섯은 <code>WAITING (parking)</code>이었고, 하나(이 실행에서는 worker-5)만 <code>TIMED_WAITING (parking)</code>이었다. 이 차이도 <code>awaitWork</code>에 있다. 대기 스택에 올라가면서 RC를 0으로 만든 작업자, 즉 마지막으로 일을 놓은 작업자만 풀 전체가 쉬고 있을 수 있다고 보고(소스의 변수 이름으로 <code>idle</code>) <code>LockSupport.parkUntil(현재 시각 + keepAlive)</code>로 기한을 두고 잔다. 나머지는 기한 없는 <code>park()</code>로 잔다. <code>Thread.State</code> Javadoc이 정한 대로 기한 없는 <code>park</code>는 WAITING, <code>parkUntil</code>은 TIMED_WAITING으로 보인다.</p>
+<p>기한이 지나 깨어난 작업자는 <code>tryTrim</code>으로 물러나려 한다. 자신이 대기 스택의 꼭대기일 때만 CAS로 스택에서 빠지면서 TC를 1 내리고 루프를 끝낸다. 종료 처리(<code>deregisterWorker</code>)는 마지막에 <code>signalWork()</code>를 부르는데, 이때 RC는 0이고 대기 스택에는 다음 작업자가 있으므로 그 작업자가 깨어난다. 깨어난 작업자는 일을 찾지 못해 다시 <code>awaitWork</code>로 들어가고, 이번에는 자신이 RC를 0으로 만드는 마지막 작업자이므로 기한을 두고 잔다. 그래서 작업자는 keepAlive마다 하나씩 사라진다. 공용 풀의 keepAlive는 <code>DEFAULT_KEEPALIVE = 60_000L</code>, 60초다. 이 과정을 보려고 자바 9부터 있는 긴 생성자로 keepAlive를 1초로 줄인 풀을 만들었다.</p>
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.IntStream;
+
+public class Lifecycle {
+    static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { throw new RuntimeException(e); }
+    }
+
+    static String states(ForkJoinPool pool) {      // 이 풀의 작업자 이름과 상태
+        List<String> list = new ArrayList<>();
+        for (Thread t : Thread.getAllStackTraces().keySet())
+            if (t instanceof ForkJoinWorkerThread w && w.getPool() == pool)
+                list.add(t.getName().replace("ForkJoinPool-1-", "") + "=" + t.getState());
+        Collections.sort(list);
+        return list.toString();
+    }
+
+    public static void main(String[] args) throws Exception {
+        ForkJoinPool pool = new ForkJoinPool(4, ForkJoinPool.defaultForkJoinWorkerThreadFactory,
+                null, false, 0, 4, 1, null, 1, TimeUnit.SECONDS);    // 마지막 두 인자: keepAlive 1초
+        int sum = pool.submit(() -> IntStream.rangeClosed(1, 8).parallel()
+                .map(i -> { sleep(100); return i * 10; }).sum()).get();
+        System.out.println("sum=" + sum);
+        long start = System.currentTimeMillis();
+        for (int k = 0; k < 12; k++) {
+            System.out.printf("%5dms size=%d active=%d %s%n", System.currentTimeMillis() - start,
+                    pool.getPoolSize(), pool.getActiveThreadCount(), states(pool));
+            sleep(500);
+        }
+        pool.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (어느 작업자가 먼저 사라지는지와 시각은 실행마다 다르다)"><code class="language-text">sum=360
+    0ms size=4 active=0 [worker-1=TIMED_WAITING, worker-2=WAITING, worker-3=WAITING, worker-4=WAITING]
+  525ms size=4 active=0 [worker-1=TIMED_WAITING, worker-2=WAITING, worker-3=WAITING, worker-4=WAITING]
+ 1036ms size=3 active=0 [worker-2=TIMED_WAITING, worker-3=WAITING, worker-4=WAITING]
+ 1546ms size=3 active=0 [worker-2=TIMED_WAITING, worker-3=WAITING, worker-4=WAITING]
+ 2050ms size=2 active=0 [worker-3=WAITING, worker-4=TIMED_WAITING]
+ 2558ms size=2 active=0 [worker-3=WAITING, worker-4=TIMED_WAITING]
+ 3060ms size=1 active=0 [worker-3=TIMED_WAITING]
+ 3564ms size=1 active=0 [worker-3=TIMED_WAITING]
+ 4067ms size=0 active=0 []
+...  (size=0인 줄이 세 번 더)</code></pre>
+<p>어느 순간에도 TIMED_WAITING인 작업자는 정확히 하나이고, 그 작업자가 사라지면 다른 작업자가 그 역할을 넘겨받는다. 작업자는 약 1초마다 하나씩 줄어 4초 뒤 0이 되었다. <code>active</code>는 RC 칸이므로 모두 잠든 동안 계속 0이다. Javadoc이 말한 "천천히 회수한다"의 구체적인 모습이 이것이다. 공용 풀의 작업자 7개가 모두 사라지려면 keepAlive 60초의 약 7배, 7분 가까이 걸린다. 그 뒤 다시 병렬 스트림을 쓰면 <code>signalWork</code>가 대기자가 없음을 보고 <code>createWorker</code>로 스레드를 새로 만든다.</p>
+<p>이 지식은 스레드 덤프를 읽을 때 바로 쓰인다. 공용 풀 작업자들이 <code>ForkJoinPool.awaitWork</code>의 <code>park</code>에 모여 있다면 막힌 것이 아니라 일이 없어 쉬는 정상 상태다. 뒤의 주의점 1에서 다룰 장애 상황의 덤프는 모양이 다르다. 작업자 스택의 꼭대기가 <code>awaitWork</code>가 아니라 소켓 읽기, <code>Thread.sleep</code>, 다른 락의 대기처럼 사용자 코드 쪽에 있다.</p>
+
+<h3>availableProcessors()는 어디서 오는가: 공용 풀의 크기를 정하는 숫자</h3>
+<p>공용 풀의 병렬성, 병렬 스트림의 잎 목표 수, <code>CompletableFuture</code>의 기본 실행기는 모두 <code>Runtime.getRuntime().availableProcessors()</code>라는 숫자 하나에서 갈라져 나온다. 이 숫자가 어디서 오는지 알아야 "개발 노트북에서는 빨랐는데 운영 컨테이너에서는 다르게 동작한다"는 현상을 설명할 수 있다.</p>
+<h4>자바에서 커널까지</h4>
+<p><code>availableProcessors()</code>는 <code>native</code> 메서드다. JDK의 네이티브 코드(Runtime.c)는 곧바로 <code>JVM_ActiveProcessorCount()</code>를 부르고, HotSpot(jvm.cpp)은 이를 <code>os::active_processor_count()</code>로 넘긴다. 이 함수는 운영체제마다 구현이 다르다. jdk21u 소스로 확인한 내용은 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>환경</th><th><code>os::active_processor_count()</code>가 돌려주는 값</th></tr></thead><tbody>
+<tr><td>공통</td><td><code>-XX:ActiveProcessorCount=N</code>을 주면 다른 무엇보다 우선해 N</td></tr>
+<tr><td>macOS (os_bsd.cpp)</td><td>JVM 초기화 때 <code>sysctl(CTL_HW, HW_NCPU)</code>로 읽어 둔 프로세서 수</td></tr>
+<tr><td>Linux (os_linux.cpp)</td><td><code>sched_getaffinity</code>로 얻은, 이 프로세스가 쓸 수 있는 CPU 수. 컨테이너 안이라고 판단되면(<code>UseContainerSupport</code>, 기본 true) cgroup의 CPU 쿼터로 계산한 값과 비교해 작은 쪽</td></tr>
+</tbody></table></div>
+<p>Linux의 쿼터 계산(cgroupUtil_linux.cpp의 <code>CgroupUtil::processor_count</code>)은 쿼터를 주기로 나눈 값을 올림한다. 호스트에 코어가 64개 있어도 컨테이너의 CPU 한도가 1.5코어, 즉 cgroup v2의 <code>cpu.max</code>가 "150000 100000"이라면 ceil(150000 / 100000) = 2가 되고, <code>availableProcessors()</code>는 2를 돌려준다. <code>taskset</code> 같은 도구로 CPU 친화도를 줄인 경우에도 <code>sched_getaffinity</code> 결과가 줄어 같은 효과가 난다.</p>
+<p>이 실험 환경의 Mac은 <code>sysctl hw.ncpu</code>가 8이고, 그 안에서 <code>hw.perflevel0.logicalcpu</code>(성능 코어)가 4, <code>hw.perflevel1.logicalcpu</code>(효율 코어)가 4다. HotSpot은 <code>HW_NCPU</code> 하나만 읽으므로 둘을 구분하지 않고 8로 센다. 공용 풀 작업자 7개와 <code>main</code>은 속도가 다른 두 종류의 코어 위에서 실행되고, 어느 스레드를 어느 코어에 올릴지는 macOS 스케줄러가 정한다. 같은 크기의 잎이라도 끝나는 시각이 달라질 수 있는 환경이며, 앞에서 본 4배 과분할과 작업 훔치기가 이런 불균형을 흡수하는 장치다.</p>
+<h4>숫자가 작아지면 일어나는 일</h4>
+<p><code>-XX:ActiveProcessorCount</code>로 프로세서가 적은 환경을 흉내 낼 수 있다. <code>-Xlog:os=trace</code>를 함께 켜면 HotSpot이 사용자가 정한 값을 쓴다는 로그가 남는다.</p>
+<pre><code class="language-java">import java.util.concurrent.*;
+
+public class Cpus {
+    public static void main(String[] args) throws Exception {
+        System.out.println("availableProcessors = " + Runtime.getRuntime().availableProcessors());
+        System.out.println("commonPool parallelism = " + ForkJoinPool.getCommonPoolParallelism());
+        String where = CompletableFuture.supplyAsync(() -> Thread.currentThread().getName()).get();
+        System.out.println("supplyAsync ran on = " + where);
+        System.out.println("defaultExecutor = "
+                + new CompletableFuture<Void>().defaultExecutor().getClass().getName());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">$ java Cpus
+availableProcessors = 8
+commonPool parallelism = 7
+supplyAsync ran on = ForkJoinPool.commonPool-worker-1
+defaultExecutor = java.util.concurrent.ForkJoinPool
+
+$ java -XX:ActiveProcessorCount=3 Cpus
+availableProcessors = 3
+commonPool parallelism = 2
+supplyAsync ran on = ForkJoinPool.commonPool-worker-1
+defaultExecutor = java.util.concurrent.ForkJoinPool
+
+$ java -XX:ActiveProcessorCount=2 Cpus
+availableProcessors = 2
+commonPool parallelism = 1
+supplyAsync ran on = Thread-0
+defaultExecutor = java.util.concurrent.CompletableFuture$ThreadPerTaskExecutor
+
+$ java -XX:ActiveProcessorCount=2 -Xlog:os=trace:stdout Cpus | grep active_processor_count
+[0.002s][trace][os] active_processor_count: active processor count set by user : 2
+[0.007s][trace][os] active_processor_count: active processor count set by user : 2
+...  (같은 줄이 여러 번)</code></pre>
+<p>프로세서가 3개일 때는 병렬성 2인 공용 풀이 <code>supplyAsync</code>를 실행했다. 2개가 되자 병렬성이 1로 내려갔고, 공용 풀 절에서 본 조건(공용 풀 병렬성이 2 이상)이 깨져 <code>CompletableFuture</code>의 기본 실행기가 <code>ThreadPerTaskExecutor</code>로 바뀌었다. <code>supplyAsync</code>는 공용 풀이 아닌 새 스레드 <code>Thread-0</code>에서 실행되었다. 공용 풀을 오염시킬 걱정은 사라지지만, 이제는 비동기 작업 하나마다 OS 스레드가 새로 생긴다. 앞 절에서 본 <code>pthread_create</code>와 스택 준비를 작업마다 치르는 것이다. CPU 한도가 1.5코어인 컨테이너가 정확히 이 경우다. 같은 설정에서 병렬 스트림은 이렇게 실행된다.</p>
+<pre data-label="java -XX:ActiveProcessorCount=2 (100ms 작업 8개를 병렬 스트림으로, 순서는 실행마다 다르다)"><code class="language-text">[ForkJoinPool.commonPool-worker-1] 3
+[main] 5
+[main] 6
+[ForkJoinPool.commonPool-worker-1] 4
+[main] 7
+[ForkJoinPool.commonPool-worker-1] 1
+[main] 8
+[ForkJoinPool.commonPool-worker-1] 2
+sum=360, time=441ms</code></pre>
+<p>공용 풀 병렬성이 1이므로 잎 목표 수는 1 × 4 = 4, 임계값은 8 / 4 = 2다. 잎은 [1~2], [3~4], [5~6], [7~8] 네 개이고, 이것을 작업자 1과 <code>main</code> 두 스레드가 둘씩 맡아 100ms 작업 네 바퀴, 약 400ms가 걸렸다. <code>main</code>은 앞에서 본 번갈아 fork하기에 따라 [1~4]를 fork하고, [5~8]에서 [7~8]을 fork한 뒤 [5~6]을 직접 처리하고, 이어서 아무도 가져가지 않은 [7~8]을 거들어 처리했다. 작업자 1은 [1~4]를 훔쳐 [1~2]를 fork하고 [3~4]를 처리한 뒤 자기 덱의 [1~2]를 꺼내 처리했다. 출력 순서가 이 추적과 맞는다.</p>
+<h4>숫자는 시작할 때 한 번 굳는다</h4>
+<p><code>Runtime.availableProcessors()</code>의 Javadoc은 이 값이 JVM 실행 중에 바뀔 수 있으므로 프로세서 수에 민감한 애플리케이션은 가끔 다시 물어보고 자원 사용을 조정하라고 적는다. <code>availableProcessors()</code>는 자바 쪽에 캐시가 없는 <code>native</code> 메서드라 호출할 때마다 <code>os::active_processor_count()</code>까지 내려간다(위의 trace 로그에는 JVM 내부의 호출도 섞여 있다). 다만 그 아래에서 macOS 구현은 초기화 때 읽어 둔 <code>HW_NCPU</code> 값을 그대로 돌려주고, Linux 구현은 CPU 친화도와 cgroup 한도를 다시 읽는다(cgroup 쪽 결과는 잠깐 캐시한다). 그러나 공용 풀은 다시 묻지 않는다. OpenJDK 21에서 공용 풀의 병렬성은 <code>ForkJoinPool</code> 클래스 초기화 때 한 번 계산되고, 병렬 스트림의 <code>LEAF_TARGET</code>도 <code>AbstractTask</code>의 <code>static final</code> 필드로 그 클래스가 초기화될 때 한 번 정해진다. 실행 중에 컨테이너의 CPU 한도가 바뀌어도 이미 만들어진 공용 풀의 크기는 그대로다. 공용 풀의 병렬성만 고정하려면 앞에서 본 <code>parallelism</code> 시스템 속성을, JVM 전체가 보는 프로세서 수를 바꾸려면 <code>-XX:ActiveProcessorCount</code>를 쓴다. 후자는 HotSpot 내부에도 영향을 준다. 예를 들어 GC 작업자 스레드 수의 기본값을 정하는 <code>WorkerPolicy</code>(workerPolicy.cpp)도 JVM 시작 시점의 활성 프로세서 수를 쓴다.</p>
+
+<h3>자바 병렬 스트림: parallel() 한 줄 뒤에서 일어나는 일</h3>
+<p>이제 처음의 단일 스트림에 <code>parallel()</code> 한 줄을 더한다. 병렬 스트림은 <code>collection.parallelStream()</code>으로 처음부터 만들 수도 있고, 이미 만든 스트림에 <code>parallel()</code>을 붙여 바꿀 수도 있다.</p>
+<pre><code class="language-java">import java.util.stream.IntStream;
+
+public class ParallelStreamMain {
+    public static void main(String[] args) {
+        long start = System.currentTimeMillis();
+        int sum = IntStream.rangeClosed(1, 8)
+                .parallel()
+                .map(Work::heavyTask)
+                .sum();
+        long time = System.currentTimeMillis() - start;
+        Work.log("sum=" + sum + ", time=" + time + "ms");
+    }
+}</code></pre>
+<pre data-label="실행 결과 (순서와 작업자 번호는 실행마다 다르다)"><code class="language-text">[main] calculate 6 -> 60
+[ForkJoinPool.commonPool-worker-2] calculate 8 -> 80
+[ForkJoinPool.commonPool-worker-4] calculate 5 -> 50
+[ForkJoinPool.commonPool-worker-7] calculate 7 -> 70
+[ForkJoinPool.commonPool-worker-5] calculate 1 -> 10
+[ForkJoinPool.commonPool-worker-3] calculate 2 -> 20
+[ForkJoinPool.commonPool-worker-6] calculate 4 -> 40
+[ForkJoinPool.commonPool-worker-1] calculate 3 -> 30
+[main] sum=360, time=131ms</code></pre>
+<p>작업 여덟 개가 약 100ms 만에 끝났다. 공용 풀 작업자 7개와 <code>main</code>이 하나씩 맡았기 때문이다. 분할 코드도, <code>RecursiveTask</code>도, 풀도 우리가 만들지 않았다. 병렬성을 3으로 줄여 실행하면 스레드가 넷(작업자 3 + <code>main</code>)이므로 두 바퀴가 필요하다.</p>
+<pre data-label="java -Djava.util.concurrent.ForkJoinPool.common.parallelism=3 ParallelStreamMain"><code class="language-text">[ForkJoinPool.commonPool-worker-3] calculate 2 -> 20
+[main] calculate 6 -> 60
+[ForkJoinPool.commonPool-worker-2] calculate 8 -> 80
+[ForkJoinPool.commonPool-worker-1] calculate 3 -> 30
+[ForkJoinPool.commonPool-worker-2] calculate 7 -> 70
+[ForkJoinPool.commonPool-worker-3] calculate 1 -> 10
+[ForkJoinPool.commonPool-worker-1] calculate 4 -> 40
+[main] calculate 5 -> 50
+[main] sum=360, time=236ms</code></pre>
+<p>왜 하필 <code>main</code>이 6을 먼저 계산했을까? 두 번의 실행 모두 그랬다. 우연이 아니다. 이를 이해하려면 병렬 스트림의 실행 경로를 OpenJDK 21 소스로 따라가야 한다.</p>
+<figure class="flow-figure"><figcaption>병렬 스트림 최종 연산의 실행 경로 (OpenJDK 21)</figcaption><ol class="flow">
+<li><strong>parallel()은 깃발만 세운다</strong><span><code>AbstractPipeline.parallel()</code>은 <code>sourceStage.parallel = true</code> 한 줄을 실행하고 자신을 반환한다. 아무것도 실행되지 않는다. 깃발이 파이프라인 단계마다가 아니라 소스 단계 하나에 있으므로, 패키지 문서의 말대로 "가장 마지막의 sequential 또는 parallel 설정이 파이프라인 전체의 실행에 적용"된다.</span></li>
+<li><strong>최종 연산이 갈림길을 고른다</strong><span><code>sum()</code>은 리듀스 연산이고, <code>AbstractPipeline.evaluate</code>는 <code>isParallel()</code>이면 <code>terminalOp.evaluateParallel</code>을, 아니면 <code>evaluateSequential</code>을 부른다.</span></li>
+<li><strong>최종 연산이 작업 객체가 된다</strong><span>리듀스의 <code>evaluateParallel</code>은 <code>new ReduceTask<>(this, helper, spliterator).invoke().get()</code>을 실행한다. <code>invoke()</code>이므로 루트 작업은 호출 스레드, 여기서는 <code>main</code>에서 시작한다.</span></li>
+<li><strong>Spliterator를 쪼개며 fork한다</strong><span><code>AbstractTask.compute()</code>는 남은 크기가 임계값보다 큰 동안 <code>trySplit()</code>으로 소스를 둘로 나누고, 한쪽 자식은 fork하고 다른 쪽으로 반복을 이어 간다. <code>main</code>이 fork한 작업은 공용 풀로 가서 작업자들이 훔쳐 간다.</span></li>
+<li><strong>잎은 순차 파이프라인을 돌린다</strong><span>더 나누지 않는 잎에서 <code>ReduceTask.doLeaf()</code>는 <code>helper.wrapAndCopyInto(op.makeSink(), spliterator)</code>를 실행한다. 5회에서 본 Sink 사슬을 자기 몫의 원소에 대해 순차로 돌리는 것이다.</span></li>
+<li><strong>완료가 위로 전파되며 결합된다</strong><span><code>AbstractTask</code>는 <code>CountedCompleter</code>를 상속한다. 두 자식이 모두 끝나면 부모의 <code>onCompletion</code>이 불리고, <code>ReduceTask</code>는 왼쪽 결과에 오른쪽 결과를 결합한다. 루트가 완료되면 <code>invoke()</code>가 반환된다.</span></li>
+</ol></figure>
+<h4>compute 반복문과 번갈아 fork하기</h4>
+<p><code>AbstractTask.compute()</code>의 반복문을 단순화하면 다음과 같다. 재귀 호출 대신 반복문을 쓰는 이유를 소스 주석은 깊은 재귀를 피하기 위해서라고 설명한다.</p>
+<pre><code class="language-text">rs = 이 작업의 spliterator
+threshold = 루트 크기 / (병렬성 × 4)  (최소 1)
+forkRight = false
+while (rs의 크기 > threshold 이고 ls = rs.trySplit() 가 null 이 아님):
+    왼쪽 자식(ls), 오른쪽 자식(rs) 생성
+    if forkRight: 오른쪽 자식을 fork, 왼쪽 자식으로 계속 (rs = ls)
+    else:         왼쪽 자식을 fork, 오른쪽 자식으로 계속
+    forkRight = !forkRight
+지금 붙잡은 자식에서 doLeaf() 실행 → tryComplete()</code></pre>
+<p>fork할 쪽을 매번 바꾸는 이유도 주석에 있다. 왼쪽이나 오른쪽으로 체계적으로 치우쳐 쪼개지는 Spliterator에 대처하기 위해서다. 이제 <code>IntStream.rangeClosed(1, 8)</code>을 따라가 보자. 범위 스트림의 Spliterator(<code>Streams.RangeIntSpliterator</code>)는 크기가 2^24 미만이면 정확히 반으로 쪼갠다. 원소 8개에 대한 임계값은 아래에서 계산하듯 1이다.</p>
+<pre class="diagram">main: [1~8]  분할 → 왼쪽 [1~4] fork,   오른쪽 [5~8] 로 계속   (forkRight: false → true)
+main: [5~8]  분할 → 오른쪽 [7~8] fork, 왼쪽 [5~6] 로 계속     (forkRight: true → false)
+main: [5~6]  분할 → 왼쪽 [5] fork,     오른쪽 [6] 으로 계속    (forkRight: false → true)
+main: [6]    크기 1 ≤ 임계값 1 → doLeaf() → calculate 6
+
+공용 풀 제출 큐에 쌓인 것: [1~4] [7~8] [5]   → 작업자들이 가져가 각자 다시 분할한다</pre>
+<p>그래서 <code>main</code>은 언제나 6을 가장 먼저 계산한다. 병렬성 3의 실행에서 <code>main</code>이 이어서 5를 계산한 것은 호출자 돕기다. 6을 마친 <code>main</code>은 루트의 완료를 기다리면서, 자기가 공용 풀에 넣었지만 아직 아무도 가져가지 않은 하위 작업(가장 마지막에 넣은 [5])을 직접 처리했다. 작업자가 넉넉한 첫 실행에서는 [5]를 이미 작업자 4가 가져갔으므로 그런 일이 없었다.</p>
+<h4>잎의 크기는 어떻게 정해지는가</h4>
+<p>임계값은 <code>AbstractTask.suggestTargetSize</code>가 정한다. 루트의 크기 추정값을 "잎 목표 수"로 나눈 값이고, 0이면 1로 올린다. 잎 목표 수(<code>LEAF_TARGET</code>)는 공용 풀 병렬성의 4배(<code>getCommonPoolParallelism() << 2</code>)다. 현재 스레드가 어떤 <code>ForkJoinPool</code>의 작업자라면 그 풀의 병렬성의 4배를 쓴다. 소스 주석은 4배로 "과분할(over-partition)"하는 이유를, 잎 작업의 크기가 고르지 않거나 일부 프로세서가 다른 일로 바쁠 때 다른 작업자가 도울 수 있게 하기 위해서라고 설명한다. 잎이 코어 수만큼만 있으면 늦게 끝나는 잎 하나가 전체를 붙잡지만, 코어당 네 개쯤 있으면 먼저 끝난 작업자가 남은 잎을 훔쳐 갈 수 있다.</p>
+<div class="table-wrap"><table><thead><tr><th>소스 크기</th><th>병렬성</th><th>잎 목표 수</th><th>임계값</th><th>결과</th></tr></thead><tbody>
+<tr><td>8</td><td>7</td><td>28</td><td>8 / 28 = 0 → 1</td><td>원소 하나하나가 잎. 잎 8개</td></tr>
+<tr><td>1,000,000</td><td>7</td><td>28</td><td>35,714</td><td>500,000 → 250,000 → 125,000 → 62,500 → 31,250에서 멈춤. 31,250개짜리 잎 32개</td></tr>
+<tr><td>1,000,000</td><td>3</td><td>12</td><td>83,333</td><td>62,500에서 멈춤. 62,500개짜리 잎 16개</td></tr>
+</tbody></table></div>
+<h4>순서는 실행이 아니라 결합에서 지켜진다</h4>
+<p>위 실행에서 원소를 처리한 순서는 6, 8, 5, 7, …로 뒤죽박죽이었다. 그런데도 <code>toList()</code>나 <code>toArray()</code> 같은 최종 연산은 만남 순서(encounter order)대로 결과를 낸다. 패키지 문서는 <code>IntStream.range(0,5).parallel().map(x -> x*2).toArray()</code>가 반드시 <code>[0, 2, 4, 6, 8]</code>을 내야 한다고 하면서도, 매퍼 함수가 어떤 순서로, 어느 스레드에서 적용되는지는 보장하지 않는다고 명시한다. 순서를 지키는 곳은 결합 단계다. 분할 트리는 원래 순서의 왼쪽과 오른쪽을 기억하고, <code>onCompletion</code>은 언제나 "왼쪽 결과 ⊕ 오른쪽 결과" 순으로 합친다. 실행은 아무 순서로 일어나도 결합은 트리 모양대로 일어난다. 이 때문에 결합 연산의 결합 법칙이 필수 조건이 된다.</p>
+<x-visual id="java-adv3-10-parallel-stream-internals" title="병렬 스트림의 최종 연산이 작업 트리로 바뀌어 실행되는 과정" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>parallel()은 깃발만 세우고, 최종 연산이 ReduceTask를 만들어 main에서 invoke하며, Spliterator가 쪼개져 공용 풀 작업자들이 잎을 처리하고 결과가 위로 결합된다는 흐름을 보여 준다.</x-hint>
+<x-prompt>A left-to-right flat vector flow diagram on white background. Far left: a code-like box reading "IntStream.rangeClosed(1, 8).parallel().map(...).sum()". An arrow to a small flag icon labeled "parallel = true". Next arrow to a box labeled "ReduceTask.invoke() (main)". From that box, a binary tree fans out to the right: root "1~8", children "1~4" and "5~8", grandchildren down to eight small leaf circles labeled 1 to 8. Color the leaf "6" purple with a tag "main"; color other leaves teal with a tag "공용 풀 작업자". On the far right, upward orange arrows merge the leaves back into one box labeled "결합 → 360". A thin gray caption at the bottom: "실행 순서는 제각각, 결합 순서는 트리 모양". Keep labels under 12.</x-prompt>
+<x-caption>최종 연산이 호출되는 순간 파이프라인은 ForkJoinTask 트리가 되고, 잎은 순차 파이프라인을 돌리며, 결과는 트리 모양대로 결합된다.</x-caption>
+</x-visual>
+
+<h3>병렬 스트림 사용 시 주의점 1: 공용 풀은 JVM 전체가 나눠 쓴다</h3>
+<p>단독 실행에서 병렬 스트림은 8배 가까이 빨랐다. 이제 서버처럼 여러 요청이 동시에 들어오는 상황을 흉내 내 보자. 요청 하나를 스레드 하나가 처리하고, 각 요청은 앞의 병렬 스트림 계산을 한 번씩 한다.</p>
+<pre><code class="language-java">import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.stream.IntStream;
+
+public class ServerSimMain {
+    static int quietTask(int i) {      // 로그 없이 100ms 걸리는 작업
+        Work.sleep(100);
+        return i * 10;
+    }
+
+    static void handleRequest(String name) {
+        long start = System.currentTimeMillis();
+        int sum = IntStream.rangeClosed(1, 8)
+                .parallel()
+                .map(ServerSimMain::quietTask)
+                .sum();
+        long time = System.currentTimeMillis() - start;
+        Work.log(name + " sum=" + sum + ", time=" + time + "ms");
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        int requests = Integer.parseInt(args[0]);
+        ExecutorService requestPool = Executors.newFixedThreadPool(requests);
+        for (int i = 1; i <= requests; i++) {
+            String name = "req" + i;
+            requestPool.submit(() -> handleRequest(name));
+        }
+        requestPool.close();     // 제출한 요청이 모두 끝날 때까지 기다린다
+    }
+}</code></pre>
+<pre data-label="실행 결과: 요청 1개, 4개, 8개 (시간은 실행마다 다르다)"><code class="language-text">$ java ServerSimMain 1
+[pool-1-thread-1] req1 sum=360, time=114ms
+
+$ java ServerSimMain 4
+[pool-1-thread-2] req2 sum=360, time=218ms
+[pool-1-thread-1] req1 sum=360, time=323ms
+[pool-1-thread-3] req3 sum=360, time=324ms
+[pool-1-thread-4] req4 sum=360, time=427ms
+
+$ java ServerSimMain 8
+[pool-1-thread-6] req6 sum=360, time=225ms
+[pool-1-thread-4] req4 sum=360, time=329ms
+[pool-1-thread-8] req8 sum=360, time=329ms
+[pool-1-thread-1] req1 sum=360, time=437ms
+[pool-1-thread-2] req2 sum=360, time=439ms
+[pool-1-thread-3] req3 sum=360, time=540ms
+[pool-1-thread-5] req5 sum=360, time=540ms
+[pool-1-thread-7] req7 sum=360, time=544ms</code></pre>
+<p>혼자일 때 100ms 남짓이던 요청이 넷이 되자 200~400ms, 여덟이 되자 200~500ms대로 늘었다. 계산해 보자. 요청 4개면 100ms짜리 작업이 32개다. 이 작업들을 실행할 수 있는 스레드는 공용 풀 작업자 7개와, 자기 요청의 하위 작업만 거들 수 있는 요청 스레드 4개, 합쳐서 최대 11개다. 32개를 11줄로 나누면 적어도 세 바퀴가 필요하므로 평균 300ms 근처가 된다. 그리고 어느 요청의 작업이 먼저 작업자를 차지하느냐에 따라 요청마다 걸리는 시간이 들쭉날쭉하다. 요청이 늘수록 이 꼬리는 길어진다.</p>
+<p>공용 풀이 스레드를 더 만들어 주지 않는 이유는 작업이 <code>sleep</code>으로 막혀 있기 때문이다. 앞에서 본 보상 메커니즘은 join 때문에 막힌 작업자를 위한 것이다. <code>ForkJoinPool</code> Javadoc은 블로킹 I/O나 관리되지 않는 동기화 앞에서는 스레드 수 조정이 보장되지 않는다고 분명히 적는다. <code>sleep</code> 대신 원격 API 호출, DB 쿼리, 파일 읽기가 있어도 마찬가지다. 작업자는 CPU를 쓰지 않으면서 자리만 차지하고, 공용 풀의 다른 모든 사용자가 그 뒤에 줄을 선다.</p>
+<p>실제 서버로 옮겨 보면 위험이 더 분명해진다. 서블릿 컨테이너는 요청마다 스레드 풀의 스레드 하나를 배정한다(스프링 MVC 1편에서 본 구조다). 수백 개의 요청 스레드가 각자 병렬 스트림 안에서 외부 API를 부르면, JVM 하나에 고작 "코어 수 - 1"개뿐인 공용 풀 작업자가 모두 응답을 기다리며 묶인다. 그러면 그 API와 무관한 다른 기능의 병렬 스트림, <code>Executor</code>를 지정하지 않은 <code>CompletableFuture.supplyAsync</code> 작업, <code>Arrays.parallelSort</code>까지 함께 느려진다. 한 기능의 느린 외부 의존성이 공용 풀을 매개로 전체 서비스로 번지는 것이다. 이런 장애를 스레드 덤프로 보면 <code>ForkJoinPool.commonPool-worker-N</code> 스레드들이 모두 소켓 읽기나 대기 상태에 있다.</p>
+<p>CPU만 쓰는 계산이라면 괜찮을까? 그렇지도 않다. 서버는 이미 요청 단위로 병렬이다. 요청 스레드가 코어 수보다 많이 동시에 일하고 있다면 코어는 이미 바쁘고, 각 요청을 다시 잘게 쪼개 봐야 전체 CPU 작업량은 그대로이면서 분할, 작업 객체 생성, 훔치기, 결합 비용만 더해진다. 부하가 낮을 때 요청 하나의 응답 시간은 줄일 수 있지만 부하가 높을 때의 처리량은 늘지 않는다. 병렬 스트림이 가장 잘 맞는 곳은 배치 작업이나 단독으로 실행되는 계산처럼 "이 계산 하나가 기계를 독차지해도 되는" 상황이다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>건물 공용 화물 엘리베이터</strong><p>공용 풀은 건물 전체가 함께 쓰는 화물 엘리베이터 일곱 대와 같다. 짐을 빨리 옮기고 싶은 입주사가 엘리베이터를 잡아 두고 짐이 다 포장될 때까지(I/O를 기다리는 동안) 문을 열어 두면, 다른 층의 입주사들은 영문도 모르고 기다린다. 다만 비유와 다른 점도 있다. 공용 풀에서는 짐을 맡긴 사람(호출 스레드)이 자기 짐 일부를 직접 나르기도 하므로, 엘리베이터가 모두 묶여도 각자의 일이 완전히 멈추지는 않는다. 대신 그만큼 느려진다.</p></aside>
+<x-visual id="java-adv3-10-common-pool-contention" title="여러 요청 스레드가 공용 풀 작업자를 나눠 쓰며 대기하는 모습" kind="구조도" ratio="16:9">
+<x-hint>여러 요청 스레드의 병렬 스트림과 CompletableFuture 작업이 하나의 공용 풀(작업자 7개)로 몰리고, 작업자들이 I/O 대기로 묶이면 나머지 작업이 큐에서 기다린다는 것을 보여 준다.</x-hint>
+<x-prompt>A flat vector architecture diagram on white background. Left column: five stacked rounded boxes labeled "요청 스레드 1" through "요청 스레드 5" (only label the first and last, middle ones blank). Another box below them in a different color labeled "CompletableFuture.supplyAsync". All of these send arrows to the right into a single large container labeled "ForkJoinPool.commonPool (작업자 7)". Inside the container, seven small worker circles in a row; each circle has a small hourglass icon and the group is tagged "I/O 대기". Below the workers, a long queue of small gray task squares labeled "대기 중인 작업". On the far right, a red clock icon with the label "응답 지연". Keep labels under 12, clean minimal style.</x-prompt>
+<x-caption>공용 풀은 JVM 전체가 함께 쓴다. 작업자가 I/O 대기로 묶이면 관련 없는 기능의 작업까지 같은 큐에서 기다린다.</x-caption>
+</x-visual>
+
+<h3>병렬 스트림 사용 시 주의점 2: 풀을 분리하는 방법과 그 한계</h3>
+<p>공용 풀을 오염시키지 않으려면 작업의 성격에 따라 실행할 곳을 분리해야 한다. 세 가지 선택지를 차례로 보자.</p>
+<h4>선택 1: 전용 ForkJoinPool 안에서 병렬 스트림 실행하기</h4>
+<pre><code class="language-java">import java.util.concurrent.ForkJoinPool;
+import java.util.stream.IntStream;
+
+public class CustomPoolMain {
+    public static void main(String[] args) throws Exception {
+        ForkJoinPool myPool = new ForkJoinPool(4);
+        int sum = myPool.submit(() ->
+                IntStream.rangeClosed(1, 8)
+                        .parallel()
+                        .map(Work::heavyTask)
+                        .sum()
+        ).get();
+        Work.log("sum=" + sum);
+        myPool.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (순서는 실행마다 다르다)"><code class="language-text">[ForkJoinPool-1-worker-4] calculate 5 -> 50
+[ForkJoinPool-1-worker-2] calculate 3 -> 30
+[ForkJoinPool-1-worker-3] calculate 8 -> 80
+[ForkJoinPool-1-worker-1] calculate 6 -> 60
+[ForkJoinPool-1-worker-4] calculate 7 -> 70
+[ForkJoinPool-1-worker-3] calculate 1 -> 10
+[ForkJoinPool-1-worker-2] calculate 4 -> 40
+[ForkJoinPool-1-worker-1] calculate 2 -> 20
+[main] sum=360</code></pre>
+<p>스레드 이름이 <code>ForkJoinPool.commonPool-worker-N</code>이 아니라 <code>ForkJoinPool-1-worker-N</code>이다. 공용 풀을 전혀 쓰지 않았다. 원리는 앞에서 본 것들의 조합이다. 람다는 <code>myPool</code>의 작업자에서 실행되고, 그 안에서 <code>ReduceTask.invoke()</code>가 시작된다. 이후의 <code>fork()</code>는 Javadoc대로 "현재 작업이 실행 중인 풀"에 작업을 넣는다. 잎 목표 수도 <code>AbstractTask.getLeafTarget()</code>이 현재 작업자의 풀 병렬성(4)으로 계산한다. <code>main</code>은 <code>submit</code>으로 제출했으므로 거들지 않고 <code>get()</code>에서 기다린다.</p>
+<p>한계도 분명하다. 첫째, 스트림 API 문서는 병렬 스트림을 어느 풀에서 실행하는지 규정하지 않는다. 이 방법은 <code>ForkJoinTask</code>의 의미와 OpenJDK 구현에서 나오는 결과이지 스트림이 약속한 동작이 아니다. 둘째, 피해를 격리할 뿐 해결하지는 않는다. 블로킹 작업은 여전히 <code>myPool</code>의 작업자 4개를 붙잡는다. 셋째, 풀은 한 번 만들어 재사용하고 애플리케이션이 끝날 때 닫아야 한다. 요청마다 <code>new ForkJoinPool()</code>을 만들고 닫지 않으면 스레드가 계속 쌓인다.</p>
+<h4>선택 2: I/O 작업은 대기에 맞게 크기를 정한 ExecutorService로</h4>
+<p>병렬화하려는 것이 기다리는 작업이라면 애초에 포크/조인이 맞는 도구가 아니다. <code>ForkJoinTask</code> Javadoc은 분할 가능한 작업이 블로킹 I/O를 하지 않아야 한다고 적는다. 기다리는 작업은 동시에 기다릴 수 있는 수만큼 스레드를 가진 전용 풀에 맡긴다.</p>
+<pre><code class="language-java">import java.util.List;
+import java.util.concurrent.*;
+import java.util.stream.IntStream;
+
+public class ExecutorIoMain {
+    public static void main(String[] args) throws Exception {
+        ExecutorService ioPool = Executors.newFixedThreadPool(8);   // I/O 대기용 전용 풀
+        long start = System.currentTimeMillis();
+        List<Future<Integer>> futures = IntStream.rangeClosed(1, 8)
+                .mapToObj(i -> ioPool.submit(() -> Work.heavyTask(i)))
+                .toList();                                   // 1단계: 모두 제출
+        int sum = 0;
+        for (Future<Integer> f : futures) sum += f.get();    // 2단계: 모두 기다림
+        long time = System.currentTimeMillis() - start;
+        Work.log("sum=" + sum + ", time=" + time + "ms");
+        ioPool.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (calculate 줄은 생략)"><code class="language-text">[main] sum=360, time=130ms</code></pre>
+<p>여기에는 지연 평가와 관련된 함정이 하나 숨어 있다. 제출과 대기를 한 파이프라인에 이어 붙이면 어떻게 될까?</p>
+<pre><code class="language-java">int sum = IntStream.rangeClosed(1, 8)
+        .mapToObj(i -> ioPool.submit(() -> Work.heavyTask(i)))
+        .mapToInt(f -> {
+            try { return f.get(); } catch (Exception e) { throw new RuntimeException(e); }
+        })
+        .sum();</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[main] sum=360, time=867ms</code></pre>
+<p>스레드 8개짜리 풀을 썼는데 순차 실행과 같은 시간이 걸렸다. 5회에서 본 대로 순차 스트림은 원소 하나가 파이프라인 끝까지 내려간 뒤에 다음 원소가 출발한다(세로 방향 처리). 원소 1이 제출되자마자 같은 원소의 <code>get()</code>이 100ms를 기다리고, 그다음에야 원소 2가 제출된다. 풀에는 언제나 작업이 하나뿐이다. <code>ExecutorIoMain</code>은 <code>toList()</code>라는 최종 연산으로 "모두 제출"을 끝낸 뒤에 기다리기 시작하므로 여덟 작업이 겹쳐 실행되었다. <code>CompletableFuture.supplyAsync(..., executor)</code>로 바꿔도 같은 원리가 적용된다. 제출하는 단계와 기다리는 단계를 두 개의 파이프라인으로 나누어야 한다.</p>
+<p>자바 21에서는 가상 스레드(JEP 444)도 선택지다. <code>Executors.newVirtualThreadPerTaskExecutor()</code>(<code>@since 21</code>)는 작업마다 가상 스레드를 하나씩 만드는 실행기로, 블로킹 작업이 아주 많을 때 플랫폼 스레드 풀의 크기를 고민하는 문제를 덜어 준다. 가상 스레드 자체는 이 권의 범위를 벗어나므로 이름만 적어 둔다.</p>
+<h4>선택 3: 꼭 블로킹해야 한다면 풀에 알린다</h4>
+<p>포크/조인 계산 안에서 블로킹이 불가피하다면 <code>ForkJoinPool.managedBlock(ManagedBlocker)</code>로 감싸 풀에 "이 작업자는 지금부터 막힌다"고 알린다. 그러면 풀은 보상 스레드를 만들어 병렬성을 유지하려 한다. 구현 개요에 따르면 <code>ManagedBlocker</code>는 도움(helping)을 쓸 수 없어 보상에만 의존하고, 공용 풀의 보상 스레드 수는 <code>maximumSpares</code>(기본 256)로 제한된다.</p>
+<h4>스레드에 묶인 문맥은 작업자에게 따라가지 않는다</h4>
+<p>풀을 어떻게 고르든 병렬 스트림의 람다는 호출 스레드가 아닌 스레드에서도 실행된다. <code>ThreadLocal</code>에 담긴 문맥은 그 스레드에만 있으므로 작업자에게 전달되지 않는다. 가장 위험한 예가 스프링 트랜잭션이다. <code>TransactionSynchronizationManager</code>의 Javadoc 첫 문장은 이 클래스가 리소스와 트랜잭션 동기화를 "스레드별로" 관리한다는 것이다. 스프링 DB 편에서 본 대로 <code>@Transactional</code> 메서드의 커넥션은 이 스레드별 저장소에 묶인다. 그 메서드 안에서 병렬 스트림으로 리포지토리를 호출하면, 공용 풀 작업자에서 실행된 원소들은 트랜잭션에 참여하지 않는다. 더 고약한 것은 호출 스레드도 잎 몇 개를 직접 처리한다는 점이다. 원소 일부는 트랜잭션 안에서, 일부는 밖에서 실행되고, 어느 원소가 어느 쪽인지는 실행마다 다르다. 스프링 시큐리티의 <code>SecurityContextHolder</code>처럼 기본적으로 <code>ThreadLocal</code>에 보관하는 다른 문맥도 같은 문제를 겪는다.</p>
+<p>클래스 로더도 차이가 난다. Javadoc에 따르면 스레드 팩토리를 따로 지정하지 않은 공용 풀은 시스템 클래스 로더를 작업자의 스레드 문맥 클래스 로더(thread context class loader)로 쓴다. 애플리케이션 전용 클래스 로더를 쓰는 환경에서 문맥 클래스 로더로 클래스나 리소스를 찾는 라이브러리를 병렬 스트림 안에서 부르면, 호출 스레드에서와 다른 결과가 나올 수 있다.</p>
+
+<h3>결과와 성능을 지키는 규칙</h3>
+<p>패키지 문서는 실행이 순차든 병렬이든, <code>findAny()</code>처럼 명시적으로 비결정적인 연산을 제외하면 계산 결과가 바뀌어서는 안 된다고 정한다. 이 약속이 지켜지려면 사용자가 넘기는 람다(문서의 용어로 행동 매개변수, behavioral parameter)가 조건을 지켜야 한다. 다음 실험들은 조건을 어겼을 때 무슨 일이 일어나는지 보여 준다.</p>
+<h4>공유 가변 상태를 건드리지 않는다</h4>
+<pre><code class="language-java">List<Integer> list = new ArrayList<>();
+IntStream.range(0, 10_000).parallel().forEach(list::add);
+System.out.println("size=" + list.size());</code></pre>
+<pre data-label="세 번 실행한 결과 (실행마다 다르다)"><code class="language-text">size=3553
+size=4927
+size=5900</code></pre>
+<p>10,000개를 넣었는데 절반 안팎만 남았다. 같은 코드를 200번 반복한 실험에서는 세 번 <code>ArrayIndexOutOfBoundsException</code>이 났다. <code>ArrayList.add</code>는 "현재 크기를 읽고, 필요하면 배열을 늘리고, 그 칸에 쓰고, 크기를 1 늘리는" 여러 단계로 이루어지며 어느 단계도 원자적이지 않다. 두 스레드가 같은 크기를 읽으면 같은 칸에 덮어써 값 하나가 사라진다. 한 스레드가 배열을 늘려 교체하는 동안 다른 스레드가 옛 크기를 기준으로 쓰면 범위를 벗어난다. 자바 고급 1편의 경쟁 상태(race condition) 그대로다.</p>
+<p><code>Collections.synchronizedList</code>로 감싸면 안전해지지만, 패키지 문서의 표현대로 이것은 "나쁜 선택지" 중 하나다. 동기화하지 않으면 데이터 경쟁이고, 동기화하면 모든 스레드가 락 하나에 줄을 서서 병렬화의 이득이 사라진다. 올바른 방법은 가변 상태를 공유하지 않는 것이다. <code>IntStream.range(0, 10_000).parallel().boxed().toList()</code>는 크기 10,000에 첫 원소 0, 마지막 원소 9999로 정확하다. 7회에서 본 대로 컬렉터는 잎마다 자기 컨테이너를 따로 만들어 채우고, 결합 단계에서 트리 순서대로 합친다. 공유하는 것이 없으니 락도 필요 없다.</p>
+<h4>항등원과 결합 법칙을 지킨다</h4>
+<p><code>Stream.reduce(identity, accumulator)</code>의 Javadoc은 두 조건을 요구한다. <code>identity</code>는 누산 함수의 항등원이어야 하고(모든 <code>t</code>에 대해 <code>accumulator.apply(identity, t)</code>가 <code>t</code>와 같아야 한다), 누산 함수는 결합 법칙을 만족해야 한다. 어기면 이렇게 된다.</p>
+<pre><code class="language-java">IntStream.rangeClosed(1, 8).reduce(10, Integer::sum);                 // 46
+IntStream.rangeClosed(1, 8).parallel().reduce(10, Integer::sum);      // 116
+IntStream.rangeClosed(1, 8).reduce(0, (a, b) -> a - b);               // -36
+IntStream.rangeClosed(1, 8).parallel().reduce(0, (a, b) -> a - b);    // 0</code></pre>
+<p>첫 번째 쌍에서 10은 덧셈의 항등원이 아니다. 순차 실행은 10에서 한 번 출발해 10+36 = 46이다. 병렬 실행은 잎마다 <code>identity</code>에서 출발한다. 앞에서 계산했듯 원소 8개는 잎 8개가 되므로 10이 여덟 번 더해져 36+80 = 116이 된다. 잎의 개수는 원소 수와 병렬성에 따라 바뀌므로, 이 값은 기계에 따라 달라질 수 있다.</p>
+<p>두 번째 쌍에서 뺄셈은 결합 법칙을 만족하지 않는다. 순차 실행은 ((((0-1)-2)-3)…-8) = -36이다. 병렬 실행에서는 잎 <code>i</code>가 0-i = -i를 내고, 결합이 "왼쪽 - 오른쪽"으로 일어난다. [1,2]는 (-1)-(-2) = 1, [3,4]도 1, 그래서 [1~4]는 1-1 = 0이다. [5~8]도 같은 방식으로 0이 되어 최종 결과는 0-0 = 0이다. 패키지 문서는 결합 법칙이 병렬 평가에 중요한 이유를 <code>a op b op c op d == (a op b) op (c op d)</code>로 설명한다. 이 등식이 성립해야 (a op b)와 (c op d)를 동시에 계산할 수 있다. 덧셈, 최솟값, 최댓값, 문자열 연결이 결합 법칙을 만족하는 예다. 문자열 연결은 교환 법칙을 만족하지 않지만 결합 법칙은 만족하므로 순서를 지키는 병렬 결합에 쓸 수 있다.</p>
+<h4>순서에 기대지 않거나, 순서의 비용을 치른다</h4>
+<pre><code class="language-java">IntStream.rangeClosed(1, 8).parallel().forEach(i -> System.out.print(i + " "));
+IntStream.rangeClosed(1, 8).parallel().forEachOrdered(i -> System.out.print(i + " "));
+IntStream.rangeClosed(1, 1000).parallel().filter(i -> i % 7 == 0).findFirst();   // 언제나 7
+IntStream.rangeClosed(1, 1000).parallel().filter(i -> i % 7 == 0).findAny();     // 이 실행에서는 658</code></pre>
+<pre data-label="앞의 두 줄의 실행 결과 (첫 줄은 실행마다 다르다)"><code class="language-text">5 6 7 4 3 8 2 1
+1 2 3 4 5 6 7 8 </code></pre>
+<p><code>forEach</code>는 원소를 처리한 스레드가 그 자리에서 동작을 실행하므로 순서가 없다. <code>forEachOrdered</code>는 만남 순서를 지키지만, 그러려면 앞쪽 원소의 동작이 끝날 때까지 뒤쪽 원소의 동작을 미뤄야 하므로 병렬성의 이득이 줄어든다. <code>findAny</code>의 Javadoc은 이 연산이 명시적으로 비결정적이며 병렬 연산에서 최대 성능을 내기 위해 아무 원소나 고를 수 있다고 하고, 안정된 결과가 필요하면 <code>findFirst</code>를 쓰라고 한다.</p>
+<p><code>limit</code>, <code>skip</code>, <code>takeWhile</code>, <code>dropWhile</code>도 같다. <code>Stream.limit</code>의 API Note는 이 연산이 순차 파이프라인에서는 대개 싸지만 순서가 있는 병렬 파이프라인에서는 아무 n개가 아니라 "처음 n개"를 돌려줘야 하므로 상당히 비쌀 수 있다고 적는다. 의미상 허용된다면 <code>unordered()</code>로 순서 제약을 풀면 크게 빨라질 수 있고, 순서가 꼭 필요하다면 <code>sequential()</code>로 바꾸는 편이 나을 수 있다는 것이 문서의 안내다. 5회에서 본 <code>sorted</code>, <code>distinct</code> 같은 상태 있는 연산도 병렬에서는 잎의 결과를 모아야 하는 장벽이 된다.</p>
+<h4>잘 쪼개지는 소스를 쓴다</h4>
+<p>병렬 스트림의 분할은 소스의 <code>Spliterator.trySplit()</code>이 얼마나 잘 쪼개 주느냐에 달려 있다. 원소 10,000개짜리 소스들에 <code>trySplit()</code>을 한 번 불러 보자.</p>
+<pre><code class="language-java">static void show(String name, Spliterator<?> right) {
+    Spliterator<?> left = right.trySplit();
+    System.out.println(name + ": left=" + (left == null ? "null" : left.estimateSize())
+            + ", right=" + right.estimateSize()
+            + ", SIZED=" + right.hasCharacteristics(Spliterator.SIZED));
+}
+// data는 0~9999를 담은 리스트
+show("ArrayList ", new ArrayList<>(data).spliterator());
+show("LinkedList", new LinkedList<>(data).spliterator());
+show("range     ", IntStream.range(0, 10_000).spliterator());
+show("iterate   ", Stream.iterate(0, i -> i + 1).spliterator());</code></pre>
+<pre data-label="실행 결과"><code class="language-text">ArrayList : left=5000, right=5000, SIZED=true
+LinkedList: left=1024, right=8976, SIZED=true
+range     : left=5000, right=5000, SIZED=true
+iterate   : left=4611686018427387903, right=9223372036854775807, SIZED=false</code></pre>
+<p><code>ArrayList</code>와 범위 스트림은 인덱스 계산 한 번으로 정확히 반을 나눈다. 비용이 들지 않고, 나뉜 두 쪽의 크기를 정확히 안다(<code>SIZED</code>). 이런 소스는 앞에서 본 이진 분할 트리를 그대로 만든다.</p>
+<p><code>LinkedList</code>는 다르다. 노드를 인덱스로 건너뛸 수 없으므로 반을 나누려면 절반까지 노드를 따라가야 한다. OpenJDK 21의 구현은 대신 앞에서부터 원소를 배열에 복사해 떼어 낸다. 떼어 내는 크기는 1024(<code>BATCH_UNIT</code>)에서 시작해 분할할 때마다 1024씩 커진다. 같은 Spliterator에 계속 <code>trySplit()</code>을 부르면 1024, 2048, 3072개를 떼어 내고, 네 번째에는 남은 3856개를 모두 떼어 낸다. 분할 자체가 순차 순회와 복사이고 나뉜 크기도 고르지 않다.</p>
+<p><code>Stream.iterate(seed, f)</code>는 더 나쁘다. 각 원소가 이전 원소에 <code>f</code>를 적용해야 나오므로 본질적으로 순차다. 크기를 모르므로(<code>SIZED=false</code>) 추정값은 <code>Long.MAX_VALUE</code>이고, 떼어 낸 쪽의 추정값도 그 절반이라는 의미 없는 수다. 실제로 떼어 낸 것은 원소 1024개를 복사한 배열이다. 이 분할을 구현한 <code>Spliterators.AbstractSpliterator</code>의 주석은 등차적으로 커지는 배치로 쪼개며, 원소당 동작이 배열로 옮기는 비용보다 클 때만 병렬 성능이 좋아진다고 밝힌다. 같은 수열이라도 <code>IntStream.range</code>로 표현할 수 있다면 그쪽이 병렬에 훨씬 유리하다.</p>
+<h4>원소당 비용과 박싱을 따진다</h4>
+<p>병렬화에는 고정 비용이 있다. 분할, 작업 객체 생성, 큐에 넣고 훔치기, 스레드 깨우기, 결과 결합이다. 원소당 작업이 아주 가볍고(정수 덧셈처럼) 원소 수도 적으면 이 고정 비용이 계산 자체보다 크다. <code>ForkJoinTask</code> Javadoc의 "작업 하나당 기본 단계 100~10,000개"라는 경험 규칙이 같은 이야기다. <code>Stream<Integer></code>로 박싱된 값을 다루면 원소마다 객체를 만들고 참조를 따라가는 비용이 더해지므로(2회에서 본 기본형 특화의 이유), 수치 계산은 <code>IntStream</code>, <code>LongStream</code>, <code>DoubleStream</code>으로 하는 것이 순차든 병렬이든 유리하다.</p>
+<p>결국 병렬이 이득인지는 측정해야 안다. 측정할 때는 JIT 컴파일 전의 첫 실행이 느리다는 점, 공용 풀 스레드가 처음에는 아직 만들어지지 않았다는 점을 고려해 충분히 예열한 뒤 재야 한다. 이 회차의 <code>System.currentTimeMillis()</code> 측정은 구조를 보기 위한 것이지 성능 비교용이 아니다. 정밀한 비교에는 OpenJDK의 JMH 같은 마이크로벤치마크 도구를 쓴다.</p>
+<div class="table-wrap"><table><thead><tr><th>확인할 것</th><th>병렬에 유리한 쪽</th><th>병렬에 불리한 쪽</th></tr></thead><tbody>
+<tr><td>작업의 성격</td><td>CPU를 쓰는 계산</td><td>I/O, 락 대기 등 블로킹</td></tr>
+<tr><td>실행 환경</td><td>배치, 단독 실행</td><td>동시 요청이 많은 서버</td></tr>
+<tr><td>소스</td><td>배열, <code>ArrayList</code>, <code>IntStream.range</code></td><td><code>LinkedList</code>, <code>Stream.iterate</code>, 크기를 모르는 소스</td></tr>
+<tr><td>람다</td><td>상태 없음, 부수 효과 없음</td><td>공유 가변 상태, <code>ThreadLocal</code> 문맥 의존</td></tr>
+<tr><td>결합</td><td>결합 법칙 + 진짜 항등원</td><td>뺄셈, 잘못된 초깃값</td></tr>
+<tr><td>순서</td><td>순서 무관(<code>findAny</code>, <code>unordered</code>)</td><td><code>forEachOrdered</code>, 큰 <code>limit</code>, <code>sorted</code></td></tr>
+<tr><td>규모</td><td>원소 수 × 원소당 비용이 큼</td><td>원소가 적고 원소당 작업이 가벼움</td></tr>
+</tbody></table></div>
+
+<h3>거짓 공유: 나눠 쓰지 않는 변수도 캐시 라인은 나눠 쓴다</h3>
+<p>앞 절의 첫 규칙은 "가변 상태를 공유하지 않는다"였다. 그런데 코드에서 아무것도 공유하지 않아도 하드웨어 수준에서는 공유가 일어날 수 있다. 병렬 계산을 손으로 짤 때 흔한 모양이 "스레드마다 배열의 자기 칸에 부분 결과를 쌓고, 마지막에 칸들을 더한다"이다. 칸이 서로 다르니 데이터 경쟁은 없고 결과도 정확하다. 그런데 느릴 수 있다.</p>
+<pre><code class="language-java">import java.util.concurrent.atomic.AtomicLongArray;
+
+public class FalseSharing {
+    static final int THREADS = 4;
+    static final long N = 50_000_000L;
+
+    static long run(int stride) throws InterruptedException {
+        AtomicLongArray counters = new AtomicLongArray(THREADS * stride);
+        Thread[] ts = new Thread[THREADS];
+        long start = System.nanoTime();
+        for (int t = 0; t < THREADS; t++) {
+            int idx = t * stride;                       // 스레드마다 자기 칸만 쓴다
+            ts[t] = new Thread(() -> { for (long i = 0; i < N; i++) counters.getAndIncrement(idx); });
+            ts[t].start();
+        }
+        for (Thread th : ts) th.join();
+        return (System.nanoTime() - start) / 1_000_000;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        for (int round = 1; round <= 3; round++)
+            System.out.printf("round %d: stride 1 (8바이트 간격) = %dms, stride 16 (128바이트 간격) = %dms%n",
+                    round, run(1), run(16));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (시간은 실행마다 다르다)"><code class="language-text">round 1: stride 1 (8바이트 간격) = 5275ms, stride 16 (128바이트 간격) = 1090ms
+round 2: stride 1 (8바이트 간격) = 3241ms, stride 16 (128바이트 간격) = 1017ms
+round 3: stride 1 (8바이트 간격) = 4920ms, stride 16 (128바이트 간격) = 1048ms</code></pre>
+<p>두 실행이 하는 일은 같다. 스레드 넷이 각자 자기 칸만 5천만 번씩 증가시킨다. 다른 것은 칸 사이의 거리뿐인데 시간이 3~5배 차이 났다. 원인은 CPU 캐시가 데이터를 변수 단위가 아니라 캐시 라인(cache line) 단위로 다룬다는 데 있다. 이 Mac은 <code>sysctl hw.cachelinesize</code>가 128이다. 8바이트짜리 칸 넷이 붙어 있으면 모두 32바이트이므로 한 캐시 라인, 경계에 걸쳐도 많아야 두 라인 안에 들어간다. 여러 코어가 각자 캐시를 가진 시스템은 캐시 일관성(cache coherence)을 지키기 위해, 한 코어가 어떤 라인에 쓰려면 다른 코어 캐시에 있는 그 라인의 사본을 무효화하고 그 라인을 독점해야 한다. 네 코어가 같은 라인의 서로 다른 칸에 번갈아 쓰면 라인의 소유권이 코어 사이를 계속 오가고, 증가 연산 하나하나가 자기 캐시에서 끝나지 못하고 다른 코어와의 통신을 기다린다. 칸을 16개(128바이트) 간격으로 벌리면 어느 두 칸도 같은 128바이트 라인에 들어갈 수 없으므로 이 왕복이 사라진다. 프로그램은 아무것도 공유하지 않는데 캐시 라인이 공유되는 이 현상을 거짓 공유(false sharing)라고 한다.</p>
+<h4>ForkJoinPool 자신의 방어: @Contended</h4>
+<p>포크/조인 프레임워크는 이 문제를 정면으로 겪는 코드다. 작업자 큐의 <code>top</code>은 주인이 push/pop할 때마다 바뀌고, <code>base</code>는 도둑이 훔칠 때마다 바뀐다. 두 필드가 한 캐시 라인에 있으면 주인과 도둑이 덱의 서로 다른 끝을 쓰게 한 설계가 캐시 수준에서 무너진다. OpenJDK 21 <code>ForkJoinPool</code>의 구현 개요 중 "Memory placement" 부분은 거짓 공유로 인한 캐시 미스와 경쟁 때문에 일부 프로그램이 4배 넘게 느려지는 것이 관찰되었다고 적고, 그래서 <code>ctl</code>과 거짓 공유 미스를 가장 많이 일으키는 <code>WorkQueue</code> 필드들을 따로 떼어 둔다고 설명한다. 그 수단이 JDK 내부 애너테이션 <code>@jdk.internal.vm.annotation.Contended</code>다. <code>WorkQueue</code>의 <code>top</code>, <code>access</code>, <code>phase</code>, <code>source</code>, <code>nsteals</code> 다섯 필드에 같은 그룹 이름 "w"가, <code>ForkJoinPool</code>의 <code>ctl</code>과 <code>parallelism</code>에 그룹 "fjpctl"이 붙어 있다. 실제 배치를 <code>sun.misc.Unsafe.objectFieldOffset</code>으로 읽어 보았다(OpenJDK 21 HotSpot, 압축 참조가 켜진 이 실험 환경 기준).</p>
+<pre data-label="인스턴스 필드의 오프셋(바이트)"><code class="language-text">WorkQueue
+    12  int stackPred
+    16  int config
+    20  int base
+    24  ForkJoinTask[] array
+    28  ForkJoinWorkerThread owner
+   160  int top          ┐
+   164  int access       │ @Contended("w")
+   168  int phase        │
+   172  int source       │
+   176  int nsteals      ┘
+ForkJoinPool
+    12  int config
+   ...
+    80  SharedThreadContainer container
+   216  long ctl         ┐ @Contended("fjpctl")
+   224  int parallelism  ┘</code></pre>
+<p><code>owner</code>가 끝나는 32바이트와 <code>top</code>이 시작하는 160바이트 사이가 정확히 128바이트 비어 있다. HotSpot 플래그 <code>ContendedPaddingWidth</code>의 기본값 128만큼 채움(padding)을 넣은 것이다. 같은 그룹의 다섯 필드는 서로 붙어 있고, 도둑이 읽고 쓰는 <code>base</code>, <code>array</code>와는 128바이트 이상 떨어져 있으므로 이 환경의 캐시 라인 하나에 함께 들어갈 수 없다. 풀의 <code>ctl</code>도 마찬가지로 다른 필드들과 떨어져 있다. 이 애너테이션을 애플리케이션 클래스에 붙여도 기본 설정에서는 효과가 없다. HotSpot의 클래스 파일 파서(classFileParser.cpp)는 <code>RestrictContended</code>(기본 true)가 켜져 있으면 부트 또는 플랫폼 클래스 로더가 읽은 클래스처럼 VM 내부 애너테이션이 허용된 클래스에서만 이 애너테이션을 인정하고, 나머지 클래스에서는 조용히 무시한다.</p>
+<p>애플리케이션 코드가 가져갈 교훈은 간단하다. 반복문 안에서는 지역 변수에 누적하고, 공유 구조에는 끝날 때 한 번만 쓴다. 지역 변수는 스레드마다 따로 있는 스택이나 레지스터에 있으므로 다른 코어와 캐시 라인을 다툴 일이 없다. 병렬 스트림의 <code>reduce</code>와 <code>collect</code>가 잎마다 <code>doLeaf()</code>에서 자기 Sink를 새로 만들어 누적하고 결과를 트리로 결합하는 것도, 모든 스레드가 함께 쓰는 카운터 배열을 두지 않는다는 점에서 같은 방향이다. 경쟁이 심한 카운터라면 <code>java.util.concurrent.atomic.LongAdder</code>가 있다. 경쟁이 생기면 값을 여러 셀에 나누어 누적하는 클래스인데, 그 셀 클래스인 <code>Striped64.Cell</code>에도 <code>@Contended</code>가 붙어 있다.</p>
+
+<h3>정리: 병렬 스트림을 켜기 전에</h3>
+<p>이 회차는 같은 계산을 다섯 가지 방식으로 실행했다. 단일 스트림은 <code>main</code> 하나로 800ms를 썼다. 스레드를 직접 쓰면 시간은 줄었지만 나누기, 결과 전달, 예외, 스레드 생성을 모두 손으로 해야 했다. 스레드 풀은 재사용과 <code>Future</code>를 주었지만 재귀 분할에서는 기다리는 스레드가 풀을 막아 교착에 빠졌다. 포크/조인은 기다리는 스레드가 자기 덱의 작업을 직접 실행하고 남의 덱에서 일을 훔쳐 오게 해서 이 문제를 풀었다. 병렬 스트림은 그 포크/조인 위에서 <code>Spliterator</code>를 쪼개고 잎마다 순차 파이프라인을 돌린 뒤 결과를 트리 모양대로 결합한다.</p>
+<p>병렬 스트림의 함정은 모두 이 구조에서 나온다. 기본 실행 장소가 JVM 전체가 공유하는 공용 풀이라서 블로킹 작업 하나가 무관한 기능을 느리게 한다. 람다가 여러 스레드에서 동시에, 아무 순서로 실행되므로 공유 가변 상태와 스레드에 묶인 문맥이 깨진다. 결과가 트리 모양으로 결합되므로 결합 법칙과 항등원이 필요하다. 분할은 소스에 달려 있으므로 쪼개지지 않는 소스는 병렬로 만들어도 빨라지지 않는다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>병렬 스트림은 "스트림을 빠르게 만드는 스위치"가 아니라 "이 계산을 공용 포크/조인 풀에서 분할 정복으로 실행하라"는 지시다. 그 지시가 이득이 되려면 계산이 CPU 중심이고, 원소가 충분히 많고 비싸며, 소스가 잘 쪼개지고, 람다가 공유 상태 없이 결합 법칙을 지키고, 그 계산이 공용 풀을 잠시 독차지해도 되는 상황이어야 한다. 하나라도 어긋나면 순차 스트림이나 전용 실행기가 낫다.</p></aside>
+<p>다음 11회에서는 함수형 프로그래밍을 정리한다. 이 회차의 조건들, 즉 상태 없는 람다, 부수 효과 없음, 결합 법칙을 지키는 결합은 우연히 모인 규칙이 아니다. 같은 입력에 언제나 같은 출력을 내고 바깥을 바꾸지 않는 순수 함수와 불변 데이터가 왜 병렬 실행을 안전하게 만드는지를 거기서 원리로 묶는다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>스레드 기아 교착(thread starvation deadlock)</dt><dd>고정 크기 풀의 작업이 같은 풀에 제출한 하위 작업을 <code>Future.get()</code>으로 기다리면, 모든 스레드가 기다리기만 하고 큐의 하위 작업을 실행할 스레드가 없어 영원히 멈춘다. 재귀 분할에 일반 스레드 풀이 맞지 않는 이유다.</dd>
+<dt>분할 정복과 임계값</dt><dd>문제를 독립적인 하위 문제로 나누고(분할), 임계값 이하가 되면 직접 풀고(정복), 결과를 합친다(결합). 임계값이 너무 크면 코어가 놀고, 너무 작으면 작업 관리 비용이 계산을 넘어선다.</dd>
+<dt>fork / compute / join</dt><dd><code>fork()</code>는 현재 작업자의 덱(작업자가 아니면 공용 풀)에 작업을 넣고 바로 반환한다. 한쪽은 <code>compute()</code>로 직접 실행하고 다른 쪽은 <code>join()</code>으로 받는다. <code>join()</code>은 잠들기 전에 그 작업을 직접 실행하거나 훔쳐 간 작업자를 돕는다.</dd>
+<dt>작업 훔치기(work stealing)</dt><dd>작업자마다 덱을 가지며, 주인은 top에서 넣고 빼고(LIFO), 일이 없는 작업자는 다른 덱의 base에서 가장 오래된 작업을 훔친다(FIFO). 재귀 분할에서는 base 쪽 작업이 가장 크므로 훔치는 횟수가 적고, 양쪽 끝을 나눠 쓰므로 경쟁도 적다.</dd>
+<dt>공용 풀(common pool)</dt><dd>JVM에 하나 있는 정적 <code>ForkJoinPool</code>. 기본 병렬성은 <code>max(1, availableProcessors() - 1)</code>이며, fork한 호출 스레드가 함께 일하기 때문에 하나를 뺀다. 병렬 스트림, <code>CompletableFuture</code> 기본 비동기 실행, <code>Arrays.parallelSort</code>가 함께 쓴다.</dd>
+<dt>병렬 스트림의 실행 경로</dt><dd><code>parallel()</code>은 소스 단계의 깃발만 세운다. 최종 연산이 <code>ReduceTask</code> 같은 <code>CountedCompleter</code>를 만들어 호출 스레드에서 <code>invoke()</code>하고, <code>Spliterator</code>를 쪼개며 fork하며, 잎은 순차 파이프라인을 돌리고, 결과는 트리 모양대로 결합된다.</dd>
+<dt>잎 목표 수</dt><dd>OpenJDK 21은 병렬성의 4배만큼 잎을 만들도록 임계값(루트 크기 / (병렬성 × 4), 최소 1)을 정한다. 고르지 않은 잎이나 바쁜 코어가 있어도 다른 작업자가 도울 수 있게 일부러 과분할한다.</dd>
+<dt>공유 풀의 블로킹</dt><dd>블로킹 I/O나 관리되지 않는 동기화는 보상 스레드를 부르지 않는다. 공용 풀 작업자가 대기로 묶이면 무관한 기능의 병렬 작업까지 함께 느려진다. 기다리는 작업은 크기를 맞춘 전용 <code>ExecutorService</code>로 보낸다.</dd>
+<dt>작업자의 잠과 회수</dt><dd>OpenJDK 21에서 일이 없는 작업자는 <code>ctl</code>의 대기 스택에 올라가 잠깐 스핀한 뒤 <code>LockSupport.park</code>로 잠든다(HotSpot <code>Parker::park</code> → <code>pthread_cond_wait</code>). 마지막으로 잠든 하나만 keepAlive(공용 풀 60초) 기한을 두고 자므로 작업자는 keepAlive마다 하나씩 종료된다.</dd>
+<dt>availableProcessors의 출처</dt><dd>HotSpot의 <code>os::active_processor_count()</code>가 <code>-XX:ActiveProcessorCount</code>, macOS의 <code>hw.ncpu</code>, Linux의 CPU 친화도와 cgroup CPU 쿼터에서 구한다. 공용 풀 병렬성과 병렬 스트림의 잎 목표 수는 클래스 초기화 때 한 번 굳는다.</dd>
+<dt>행동 매개변수의 조건</dt><dd>병렬에서 결과가 바뀌지 않으려면 람다가 간섭하지 않고 상태가 없어야 하며, <code>reduce</code>의 초깃값은 진짜 항등원, 누산 함수는 결합 법칙을 만족해야 한다. 순서가 필요하면 그 비용(<code>forEachOrdered</code>, 순서 있는 <code>limit</code>)을 감수한다.</dd>
+</x-summary>
+
+<x-review>
+<p>병렬 스트림과 관련된 장애는 대개 "평소엔 멀쩡하다가 트래픽이 몰리면 전혀 관련 없는 API까지 느려지는" 모습으로 나타난다. 스레드 덤프에서 <code>ForkJoinPool.commonPool-worker</code> 스레드들이 소켓 읽기나 <code>sleep</code>, 락 대기에 모여 있다면 공용 풀이 블로킹 작업에 묶인 것이다. 원인을 찾으면 그 병렬 스트림을 순차로 되돌리거나, 블로킹 호출을 크기를 정한 전용 실행기로 옮긴다. <code>Executor</code> 없이 호출한 <code>CompletableFuture.supplyAsync</code>도 같은 풀을 쓰므로 함께 점검한다. 같은 이유로, 코드 리뷰에서 서버 코드의 <code>parallelStream()</code>을 보면 그 안에 I/O가 있는지, 이 계산이 공용 풀을 잠시 독차지해도 되는지부터 묻는 습관을 들이면 좋다.</p>
+<p>데이터 정합성 문제는 더 조용히 나타난다. <code>@Transactional</code> 메서드 안의 병렬 스트림에서 저장한 데이터 일부만 롤백되지 않거나, 병렬 <code>forEach</code>로 채운 리스트의 개수가 가끔 모자라거나, <code>reduce</code> 결과가 개발자 노트북과 운영 서버에서 다르게 나오는 식이다. 마지막 경우는 잎의 개수가 병렬성에 따라 달라지기 때문이다. 코어 수가 다른 환경에서만 재현되는 버그를 만나면 항등원과 결합 법칙을 먼저 의심한다.</p>
+<p>판단이 달라지는 조건도 분명히 하자. 배치 작업처럼 한 JVM에서 그 계산 하나만 돌고, 원소가 많고 원소당 계산이 무거우며, 소스가 배열이나 <code>ArrayList</code>이고, 람다가 순수하다면 병렬 스트림은 코드 한 줄로 코어를 모두 쓰게 해 주는 좋은 도구다. 반대로 서버의 요청 처리 경로라면 요청 자체가 이미 병렬이므로 기본값은 순차 스트림으로 두고, 측정으로 이득이 확인된 경우에만 전용 풀과 함께 병렬을 쓴다. <code>availableProcessors()</code>가 2 이하인 환경에서는 공용 풀의 병렬성이 1로 내려가고, 그러면 <code>CompletableFuture</code>의 기본 실행 방식까지 바뀐다는 점도 기억해 둔다.</p>
+</x-review>
+
+<x-practice>
+<li>임계값이 4인 이 회차의 <code>SumTask</code>를 논리 프로세서 8개인 기계의 <code>main</code>에서 (가) <code>new SumTask(1, 8).invoke()</code>와 (나) <code>ForkJoinPool.commonPool().invoke(new SumTask(1, 8))</code>로 각각 실행한다. 각 경우 "[분할] 1~8" 줄과 "[처리 시작] 5~8" 줄을 어느 스레드가 찍는지 예측하고, 두 경우가 다른 이유를 설명하라.</li>
+<li>논리 프로세서가 8개인 기계에서 기본 설정으로 <code>IntStream.range(0, 1_000_000).parallel().sum()</code>을 <code>main</code>에서 실행한다. OpenJDK 21 기준으로 임계값과 잎 작업의 수, 잎 하나의 크기를 계산하라. <code>-Djava.util.concurrent.ForkJoinPool.common.parallelism=3</code>을 주면 어떻게 바뀌는가? 같은 계산을 <code>new ForkJoinPool(4)</code>에 <code>submit</code>해서 실행하면?</li>
+<li>다음 스프링 서비스 코드에서 일어날 수 있는 문제를 모두 찾고, 각각의 원인을 이 회차의 원리로 설명하라. <code>@Transactional public void importAll(List<Item> items) { items.parallelStream().forEach(item -> { ExternalData d = externalApi.fetch(item.id()); itemRepository.save(item.with(d)); }); }</code></li>
+<li><code>LinkedList</code>에 원소 10,000개를 넣고 같은 <code>Spliterator</code>에 <code>trySplit()</code>을 반복해서 부르면 떼어 낸 쪽과 남은 쪽의 크기가 어떻게 변하는지 네 번째 호출까지 적어라. 이것이 병렬 스트림의 분할 트리 모양에 어떤 영향을 주는지, <code>ArrayList</code>와 비교해 설명하라.</li>
+<li>동료가 <code>List<String> result = new ArrayList<>(); names.parallelStream().map(String::toUpperCase).forEach(result::add);</code>를 썼다. 생길 수 있는 문제 두 가지(내용과 순서)를 설명하고, 원래 순서를 지키는 올바른 코드로 고쳐라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> (가)에서는 두 줄 모두 <code>main</code>이 찍는다. <code>ForkJoinTask.invoke()</code>는 현재 스레드에서 실행을 시작하므로 <code>main</code>이 루트의 <code>compute()</code>를 실행해 1~8을 분할하고, 1~4를 공용 풀에 fork한 뒤 5~8을 <code>compute()</code>로 직접 처리한다. 1~4는 공용 풀 작업자가 훔쳐 가서 "[처리 시작] 1~4"를 찍는다. (나)에서는 두 줄 모두 공용 풀 작업자가 찍고 <code>main</code>은 결과만 찍는다. <code>pool.invoke(task)</code>는 작업을 풀에 제출하고 기다리는데, OpenJDK는 <code>ExecutorService</code> 규약 때문에 제출된 작업에는 호출자 돕기를 적용하지 않는다. 그래서 작업자 하나가 루트를 가져가 분할하고 5~8을 직접 처리하며, 다른 작업자가 1~4를 훔친다.</p>
+<p><b>2번.</b> 공용 풀 병렬성은 8-1 = 7, <code>main</code>은 작업자가 아니므로 잎 목표 수는 7×4 = 28이다. 임계값은 1,000,000 / 28 = 35,714(정수 나눗셈)다. 범위 Spliterator는 2^24 미만이면 반으로 쪼개므로 500,000 → 250,000 → 125,000 → 62,500 → 31,250으로 내려가고, 31,250 ≤ 35,714에서 멈춘다. 잎은 2^5 = 32개, 각 31,250개다. 병렬성을 3으로 주면 잎 목표 수 12, 임계값 83,333이므로 62,500에서 멈춰 잎 16개, 각 62,500개다. <code>new ForkJoinPool(4)</code>에 제출하면 람다가 그 풀의 작업자에서 실행되므로 <code>getLeafTarget()</code>이 그 풀의 병렬성 4를 써서 잎 목표 수 16, 임계값 62,500이 되고, 역시 62,500개짜리 잎 16개가 된다. 이때 공용 풀은 쓰이지 않는다.</p>
+<p><b>3번.</b> 세 가지 문제가 있다. (1) 블로킹 I/O를 공용 풀에서 한다. <code>externalApi.fetch</code>가 응답을 기다리는 동안 공용 풀 작업자가 묶이고, 풀은 이를 보상하지 않으므로 같은 JVM의 다른 병렬 스트림과 기본 <code>CompletableFuture</code> 작업까지 느려진다. (2) 트랜잭션이 일부에만 적용된다. 스프링은 트랜잭션 리소스를 스레드별로 관리하므로 공용 풀 작업자에서 실행된 <code>save</code>는 이 트랜잭션에 참여하지 않는다. 호출 스레드도 잎 일부를 처리하므로 일부 원소만 트랜잭션 안에서 저장되고, 어느 원소인지는 실행마다 다르다. 예외가 나서 롤백되어도 작업자에서 저장한 것은 남을 수 있다. (3) <code>forEach</code>의 실행 순서가 없으므로 저장 순서에 의존하는 로직이 있다면 깨진다. 고치려면 외부 API 호출은 크기를 정한 전용 실행기로 먼저 "모두 제출한 뒤 모두 기다려" 결과를 모으고, 저장은 트랜잭션 스레드에서 순차로 한다.</p>
+<p><b>4번.</b> OpenJDK 21의 <code>LinkedList</code> Spliterator는 앞에서부터 원소를 배열에 복사해 떼어 내며, 크기는 1024부터 호출마다 1024씩 늘어난다. 실측 결과는 1번째 (1024, 8976), 2번째 (2048, 6928), 3번째 (3072, 3856), 4번째에는 남은 3856개를 모두 떼어 내 (3856, 0)이다. 분할할 때마다 노드를 순차로 따라가며 복사해야 하고 나뉜 두 쪽의 크기가 고르지 않으므로, 분할 트리가 한쪽으로 치우친다. <code>ArrayList</code>는 인덱스 계산 한 번으로 (5000, 5000)처럼 정확히 반을 나누므로 균형 잡힌 이진 트리가 되고, 분할 비용도 거의 없다.</p>
+<p><b>5번.</b> 내용 문제: 여러 스레드가 동기화 없이 <code>ArrayList.add</code>를 호출하므로 값이 사라지거나 <code>ArrayIndexOutOfBoundsException</code>이 날 수 있다(이 회차의 실험에서 10,000개 중 절반 안팎만 남았고, 200번 중 세 번 예외가 났다). 순서 문제: 운 좋게 모두 들어가도 <code>forEach</code>는 원소를 처리한 스레드가 그 자리에서 실행하므로 순서가 원래 순서와 다르다. 고친 코드는 <code>List<String> result = names.parallelStream().map(String::toUpperCase).toList();</code>다. 컬렉터는 잎마다 따로 담고 트리 순서대로 결합하므로 공유 상태가 없고 만남 순서가 지켜진다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>논리 프로세서 8개, 기본 설정인 JVM의 <code>main</code>에서 100ms씩 걸리는 원소 8개짜리 <code>IntStream.rangeClosed(1, 8).parallel().map(...).sum()</code>을 실행한다. 이 계산을 동시에 실행할 수 있는 스레드는 최대 몇 개이고, 그 이유는?</q>
+<o>7개. 공용 풀의 병렬성이 <code>availableProcessors() - 1</code>이기 때문이다.</o>
+<o>8개. 공용 풀 작업자 7개에 더해, 최종 연산을 호출한 <code>main</code>이 루트 작업을 직접 실행하며 함께 일하기 때문이다.</o>
+<o>16개. 공용 풀은 코어당 두 개의 스레드를 만든다.</o>
+<o>1개. <code>IntStream.rangeClosed</code>는 순차 스트림을 만들므로 <code>parallel()</code>이 무시된다.</o>
+<why>병렬 스트림의 최종 연산은 <code>ReduceTask.invoke()</code>를 호출 스레드에서 실행하므로 <code>main</code>도 잎을 처리한다. 공용 풀 병렬성 7은 바로 이 호출자 참여를 고려해 하나를 뺀 값이다. 16개라는 규칙은 없고, <code>rangeClosed</code>가 순차 스트림을 만들어도 <code>parallel()</code>이 소스 단계의 깃발을 바꾸므로 병렬로 실행된다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>Executors.newFixedThreadPool(2)</code>에서 작업이 하위 작업 두 개를 같은 풀에 <code>submit</code>하고 <code>get()</code>으로 기다리는 재귀 합계가 끝나지 않았다. 같은 계산을 <code>new ForkJoinPool(2)</code>와 <code>fork</code>/<code>join</code>으로 바꾸자 끝났다. 차이를 가장 정확히 설명한 것은?</q>
+<o><code>ForkJoinPool</code>은 작업이 막히면 즉시 스레드를 무제한으로 추가하기 때문이다.</o>
+<o><code>ForkJoinPool</code>의 스레드가 데몬 스레드라서 교착이 생기지 않는다.</o>
+<o><code>join()</code>은 무작정 잠들지 않고 기다리는 작업이 자기 덱에 있으면 직접 실행하며, 도둑맞았으면 훔쳐 간 작업자를 거든다. 그래서 기다리는 스레드가 하위 작업을 실행할 수 있다.</o>
+<o><code>ForkJoinPool</code>은 작업을 LIFO로 처리하므로 교착이 원리적으로 불가능하다.</o>
+<why><code>Future.get()</code>은 스레드를 잡은 채 잠들기 때문에 큐의 하위 작업을 실행할 스레드가 남지 않는다. <code>join()</code>은 <code>tryRemoveAndExec</code>와 <code>helpJoin</code>으로 기다리는 대상을 직접 실행하거나 도우므로 같은 스레드 수로도 끝난다. 보상 스레드는 "명백한 굶주림"일 때만 제한적으로 추가되며 무제한이 아니다. 데몬 여부는 JVM 종료와 관련이 있을 뿐 교착과 무관하고, LIFO 순서만으로 교착이 막히는 것도 아니다(join 대상이 순환하면 포크/조인도 교착할 수 있어 Javadoc은 의존 관계가 DAG일 때만 <code>join</code>이 적절하다고 한다).</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>작업 훔치기에서 일이 없는 작업자가 다른 작업자의 덱 base 쪽(가장 오래된 작업)에서 훔치는 이유로 옳은 것은?</q>
+<o>재귀 분할에서는 일찍 fork된 base 쪽 작업이 큰 덩어리라 한 번 훔쳐 오면 오래 일할 수 있고, 주인이 쓰는 top 쪽과 반대 끝이라 경쟁이 줄기 때문이다.</o>
+<o>가장 오래된 작업일수록 CPU 캐시에 남아 있을 가능성이 높아 훔친 작업자가 빨리 처리할 수 있기 때문이다.</o>
+<o>base 쪽 작업은 이미 실행이 시작된 작업이라 이어서 실행하기만 하면 되기 때문이다.</o>
+<o>자바 언어 명세가 작업 훔치기를 FIFO로 하도록 정하고 있기 때문이다.</o>
+<why>주인은 최근에 fork한 작고 데이터가 가까운 작업을 top에서 꺼내고, 도둑은 오래된 큰 작업을 base에서 가져간다. 그래서 훔치는 횟수가 적고 주인과 도둑의 경쟁은 작업이 하나 남았을 때만 생긴다. 캐시 지역성은 오히려 최근 작업(top) 쪽의 이점이고, 덱에 있는 작업은 아직 시작되지 않은 작업이다. 이 규칙은 JLS가 아니라 <code>ForkJoinPool</code> 구현의 설계다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>원소 8개가 잎 8개로 나뉘는 기계에서 <code>IntStream.rangeClosed(1, 8).parallel().reduce(10, Integer::sum)</code>의 결과는 116, 순차 실행은 46이었다. 원인으로 옳은 것은?</q>
+<o>병렬 실행에서 덧셈의 순서가 바뀌었기 때문이다. 정수 덧셈은 순서에 따라 결과가 달라진다.</o>
+<o>공유 변수에 대한 데이터 경쟁 때문에 일부 덧셈이 두 번 실행되었다.</o>
+<o><code>Integer::sum</code>은 박싱을 일으키므로 병렬에서 쓸 수 없다.</o>
+<o>병렬 리듀스는 잎마다 <code>identity</code>에서 출발하는데 10은 덧셈의 항등원이 아니어서, 잎 수만큼 10이 더해졌다.</o>
+<why><code>reduce</code>의 Javadoc은 <code>identity</code>가 누산 함수의 항등원이어야 한다고 요구한다. 병렬 실행은 잎마다 <code>identity</code>로 시작하므로 36 + 10×8 = 116이 된다. 정수 덧셈은 (오버플로가 있어도 2의 보수 산술에서) 결합 법칙과 교환 법칙을 만족하고, 리듀스에는 공유 변수가 없으며, <code>IntStream.reduce</code>의 <code>Integer::sum</code>은 <code>IntBinaryOperator</code>로 쓰여 박싱이 없다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>다음 코드는 어떻게 실행되는가? <code>list.stream().parallel().filter(x -> x > 0).sequential().map(x -> x * 2).toList()</code></q>
+<o><code>filter</code>까지는 병렬로, <code>map</code>부터는 순차로 실행된다.</o>
+<o>파이프라인 전체가 순차로 실행된다.</o>
+<o>파이프라인 전체가 병렬로 실행된다. 한 번 <code>parallel()</code>이 불리면 되돌릴 수 없다.</o>
+<o><code>IllegalStateException</code>이 난다. 같은 파이프라인에서 모드를 두 번 바꿀 수 없다.</o>
+<why><code>parallel()</code>과 <code>sequential()</code>은 소스 단계 하나의 깃발을 바꿀 뿐이고, 패키지 문서는 가장 마지막 설정이 파이프라인 전체의 실행에 적용된다고 정한다. 이 회차의 실험에서도 <code>parallel()</code> 뒤에 <code>sequential()</code>을 부른 스트림의 <code>isParallel()</code>은 <code>false</code>였다. 구간마다 모드를 다르게 하는 방법은 없고, 모드를 바꾸는 것 자체는 예외를 일으키지 않는다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>포크/조인 프레임워크(Fork/Join framework)</dt><dd>자바 7에 추가된 <code>java.util.concurrent</code>의 분할 정복 실행 틀. <code>ForkJoinPool</code>, <code>ForkJoinTask</code>, <code>RecursiveTask</code>, <code>RecursiveAction</code>, <code>CountedCompleter</code>로 이루어진다.</dd>
+<dt>작업 훔치기(work stealing)</dt><dd>작업자마다 자기 작업 큐를 두고, 자기 큐가 빈 작업자가 다른 작업자의 큐에서 작업을 가져와 실행하는 스케줄링 방식. 생산자가 놀고 있는 스레드에 작업을 배정하는 방식과 대비된다.</dd>
+<dt>덱(deque, double-ended queue)</dt><dd>양쪽 끝에서 넣고 뺄 수 있는 큐. <code>ForkJoinPool</code>의 <code>WorkQueue</code>는 주인이 top에서 push/pop, 다른 스레드가 base에서 poll하는 세 연산만 지원한다.</dd>
+<dt>공용 풀(common pool)</dt><dd><code>ForkJoinPool.commonPool()</code>이 돌려주는 JVM 전역의 정적 풀. 명시적인 풀 없이 실행되는 <code>ForkJoinTask</code>, 병렬 스트림, <code>CompletableFuture</code>의 기본 비동기 실행이 쓴다.</dd>
+<dt>병렬성(parallelism)</dt><dd><code>ForkJoinPool</code>이 목표로 유지하려는 활성 작업자 스레드 수. 일반 풀의 기본값은 <code>availableProcessors()</code>, 공용 풀은 OpenJDK 21에서 <code>max(1, availableProcessors() - 1)</code>이다.</dd>
+<dt>임계값(threshold)</dt><dd>분할 정복에서 더 나누지 않고 직접 계산하기로 정한 문제 크기. 병렬 스트림에서는 OpenJDK가 루트 크기와 병렬성으로 자동 계산한다.</dd>
+<dt>Spliterator.trySplit</dt><dd>소스의 원소 일부를 떼어 새 <code>Spliterator</code>로 돌려주는 메서드. 병렬 스트림의 분할 품질은 이 메서드가 얼마나 싸고 고르게 나누는지에 달려 있다.</dd>
+<dt>CountedCompleter</dt><dd>대기 중인 하위 작업 수를 세다가 모두 끝나면 완료 동작(<code>onCompletion</code>)을 실행하고 부모에게 완료를 전파하는 <code>ForkJoinTask</code>. <code>join</code>으로 블로킹하지 않으며 병렬 스트림의 내부 작업이 이를 상속한다.</dd>
+<dt>ManagedBlocker</dt><dd><code>ForkJoinPool</code> 안에서 블로킹할 때 풀에 이를 알려 보상 스레드로 병렬성을 유지하게 하는 인터페이스. <code>ForkJoinPool.managedBlock</code>으로 사용한다.</dd>
+<dt>거짓 공유(false sharing)</dt><dd>서로 다른 스레드가 서로 다른 변수에 쓰지만 그 변수들이 같은 캐시 라인에 있어, 캐시 일관성 때문에 라인의 소유권이 코어 사이를 오가며 느려지는 현상. <code>ForkJoinPool</code>은 <code>@Contended</code> 채움으로 이를 피한다.</dd>
+<dt>스레드 기아 교착(thread starvation deadlock)</dt><dd>풀의 스레드가 모두 같은 풀에 제출된 작업의 완료를 기다리느라 그 작업을 실행할 스레드가 남지 않아 진행이 멈추는 상태.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ForkJoinPool.html">ForkJoinPool (Java SE 21 API)</a> — 작업 훔치기, 데몬 작업자, 공용 풀과 시스템 속성, 블로킹 시 조정이 보장되지 않는다는 설명</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ForkJoinTask.html">ForkJoinTask (Java SE 21 API)</a> — fork/join/invoke의 의미, 가장 안쪽부터 join하라는 지침, 작업 크기의 경험 규칙, 블로킹 I/O 지양</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/package-summary.html">java.util.stream 패키지 요약 (Java SE 21 API)</a> — 병렬 모드 설정, 비간섭·상태 없음·부수 효과, 결합 법칙</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/Stream.html">Stream (Java SE 21 API)</a> — reduce의 항등원·결합 법칙 요구, 순서 있는 병렬 파이프라인에서 limit의 비용, findAny의 비결정성</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html">CompletableFuture (Java SE 21 API)</a> — Executor 없는 비동기 메서드가 공용 풀을 쓰는 조건</li>
+<li><a href="https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/transaction/support/TransactionSynchronizationManager.html">TransactionSynchronizationManager (Spring Framework Javadoc)</a> — 트랜잭션 리소스를 스레드별로 관리한다는 정의</li>
+</x-refs>

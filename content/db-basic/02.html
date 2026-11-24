@@ -1,0 +1,647 @@
+<x-meta>
+deck: 짝이 없는 행을 버리지 않는 외부 조인, 한 테이블을 두 번 읽는 셀프 조인, 모든 조합을 만드는 CROSS 조인을 결과 행 수와 NULL, 그리고 MySQL이 이를 실행하는 방식으로 따라간다.
+minutes: 105
+</x-meta>
+
+<x-goals>
+<li>LEFT JOIN과 RIGHT JOIN의 결과를 행 단위로 추적해, 어느 행이 NULL로 채워져 나오는지와 결과 행 수의 하한을 말할 수 있다.</li>
+<li>외부 조인에서 같은 조건을 ON에 둘 때와 WHERE에 둘 때 결과가 어떻게 달라지는지 예측하고, MySQL 옵티마이저가 외부 조인을 내부 조인으로 바꾸는 조건(null-rejected)을 설명할 수 있다.</li>
+<li>MySQL에 없는 FULL OUTER JOIN을 LEFT JOIN, 안티 조인, UNION ALL로 흉내 내고, 짝 없는 행을 찾는 쿼리에서 IS NULL을 검사할 열을 올바르게 고를 수 있다.</li>
+<li>중첩 루프 조인이 외부 조인을 처리할 때 쓰는 일치 플래그와 그 때문에 생기는 테이블 접근 순서 제약, MySQL 8.0.20 이후 해시 조인이 맡는 역할을 설명할 수 있다.</li>
+<li>셀프 조인과 CROSS 조인의 결과 행 수를 계산하고, 하나의 부모에서 1:N 관계 두 갈래를 함께 조인할 때 생기는 집계 부풀림(팬아웃)을 찾아 고칠 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 짝이 없는 행은 어디로 가는가</h3>
+<p>앞 회차에서 본 내부 조인(inner join)은 두 테이블의 행을 짝지어 조인 조건이 참이 되는 짝만 결과로 내보낸다. 규칙은 단순하지만 한 가지를 조용히 버린다. 짝을 찾지 못한 행이다. 직원이 한 명도 없는 부서, 아직 부서에 배정되지 않은 직원, 주문을 한 번도 하지 않은 회원은 내부 조인 결과에 나타나지 않는다. 오류도 경고도 없다. 결과가 그냥 짧아질 뿐이다.</p>
+<p>그런데 실무에서 받는 질문의 상당수는 바로 그 버려진 행에 관한 것이다. "부서별 직원 수를 보여 달라"는 요청에 직원이 0명인 부서가 빠진 표를 내밀면 틀린 답이다. "한 번도 로그인하지 않은 회원", "입고 기록이 없는 상품"처럼 짝이 없다는 사실 자체가 답인 질문도 있다. 이런 질문에 답하려면 짝이 없는 행도 결과에 남기는 조인이 필요하다. 그것이 외부 조인(outer join)이다.</p>
+<p>이 회차는 외부 조인을 중심으로 조인의 나머지 형태를 다룬다. 먼저 LEFT JOIN과 RIGHT JOIN이 결과를 만드는 규칙을 행 단위로 추적하고, MySQL에 없는 FULL OUTER JOIN을 만드는 방법을 본다. 다음으로 외부 조인에서 버그가 가장 많이 나는 지점, 조건을 ON에 두느냐 WHERE에 두느냐의 차이를 파고든다. 한 층 아래에서는 MySQL이 외부 조인을 중첩 루프와 해시 조인으로 어떻게 실행하는지, 외부 조인이 왜 테이블 읽기 순서를 묶어 두는지 본다. 후반부는 조인 일반의 특징(결과 행 수, 순서와 괄호, 조건식의 자유), 한 테이블을 두 번 읽는 셀프 조인(self join), 모든 조합을 만드는 CROSS 조인, 그리고 이것들을 한데 엮는 종합 실습이다. 모든 내용은 MySQL 8.0 이상과 InnoDB 스토리지 엔진을 기준으로 하며, 버전에 따라 달라지는 동작은 그때마다 버전을 밝힌다.</p>
+
+<h3>실습에 쓸 테이블: 부서, 직원, 비용</h3>
+<p>이 회차의 예제는 모두 아래 다섯 테이블로 돌린다. 중심은 부서(<code>department</code>)와 직원(<code>employee</code>)이다. 직원 테이블의 <code>manager_id</code>는 같은 테이블의 <code>emp_id</code>를 가리키는 외래 키로, 셀프 조인에서 쓴다. 비용(<code>expense</code>)은 부서별·분기별 지출 기록이고, <code>report_quarter</code>와 <code>salary_grade</code>는 CROSS 조인과 비등가 조인 예제에서 쓴다.</p>
+<pre><code class="language-sql">CREATE TABLE department (
+  dept_id INT PRIMARY KEY,
+  name    VARCHAR(20) NOT NULL
+);
+
+CREATE TABLE employee (
+  emp_id     INT PRIMARY KEY,
+  name       VARCHAR(20) NOT NULL,
+  dept_id    INT NULL,
+  manager_id INT NULL,
+  salary     INT NOT NULL,                 -- 연봉(만 원)
+  FOREIGN KEY (dept_id)    REFERENCES department (dept_id),
+  FOREIGN KEY (manager_id) REFERENCES employee (emp_id)
+);
+
+CREATE TABLE expense (
+  expense_id INT PRIMARY KEY,
+  dept_id    INT NOT NULL,
+  q          INT NOT NULL,                 -- 분기
+  amount     INT NOT NULL,                 -- 금액(만 원)
+  FOREIGN KEY (dept_id) REFERENCES department (dept_id)
+);
+
+CREATE TABLE report_quarter (q INT PRIMARY KEY);
+CREATE TABLE salary_grade (grade CHAR(1) PRIMARY KEY, min_sal INT NOT NULL, max_sal INT NOT NULL);
+
+INSERT INTO department VALUES (10,'개발'), (20,'디자인'), (30,'영업'), (40,'인사');
+INSERT INTO employee VALUES
+  (1,'한서준',10,NULL,9000), (2,'이도윤',10,1,6000), (3,'박지아',20,1,7000),
+  (4,'최민재',20,3,4500),    (5,'정하린',30,1,5000), (6,'윤태오',NULL,3,4000);
+INSERT INTO expense VALUES (1,10,1,300), (2,10,1,200), (3,10,2,400), (4,20,2,150), (5,30,1,500);
+INSERT INTO report_quarter VALUES (1), (2);
+INSERT INTO salary_grade VALUES ('A',8000,99999), ('B',6000,7999), ('C',0,5999);</code></pre>
+<p>일부러 짝이 없는 데이터를 넣어 두었다. 인사 부서(40)에는 직원이 없다. 윤태오(6)는 부서가 정해지지 않아 <code>dept_id</code>가 NULL이다. 한서준(1)은 최상위 관리자라 <code>manager_id</code>가 NULL이다. 이 세 행이 이 회차 내내 결과를 가르는 시험대가 된다. 아래 그림은 두 중심 테이블의 상태다. 이후의 실행 결과는 모두 이 데이터에서 결정적으로 나오는 값이고, 순서는 <code>ORDER BY</code>로 고정했다. 모든 결과는 MySQL 8.4.13과 8.0.46에서 실행해 두 버전이 같은 값을 내는 것을 확인했다(결과 표의 칸 너비만 한글 폭에 맞춰 정리했다). MySQL은 오름차순 정렬에서 NULL을 맨 앞에, 내림차순 정렬에서 맨 뒤에 놓는다(레퍼런스 매뉴얼 "Working with NULL Values").</p>
+<pre class="diagram">department                      employee
++---------+--------+            +--------+--------+---------+------------+--------+
+| dept_id | name   |            | emp_id | name   | dept_id | manager_id | salary |
++---------+--------+            +--------+--------+---------+------------+--------+
+|      10 | 개발   |            |      1 | 한서준 |      10 |       NULL |   9000 |
+|      20 | 디자인 |            |      2 | 이도윤 |      10 |          1 |   6000 |
+|      30 | 영업   |            |      3 | 박지아 |      20 |          1 |   7000 |
+|      40 | 인사   | ← 직원 없음 |      4 | 최민재 |      20 |          3 |   4500 |
++---------+--------+            |      5 | 정하린 |      30 |          1 |   5000 |
+                                |      6 | 윤태오 |    NULL |          3 |   4000 | ← 부서 없음
+                                +--------+--------+---------+------------+--------+
+
+expense: (1,10,1분기,300) (2,10,1분기,200) (3,10,2분기,400) (4,20,2분기,150) (5,30,1분기,500)</pre>
+<p>참고로 내부 조인 <code>department d JOIN employee e ON d.dept_id = e.dept_id</code>의 결과는 다섯 행이다. 인사 부서와 윤태오가 모두 빠진다. 인사 부서는 <code>e.dept_id = 40</code>인 직원이 없어서, 윤태오는 <code>NULL = 10</code> 같은 비교가 참이 되지 않아서다. 이 다섯 행이 출발점이다.</p>
+
+<h3>LEFT JOIN: 왼쪽 테이블의 행은 하나도 버리지 않는다</h3>
+<p>LEFT JOIN(정식 이름은 LEFT OUTER JOIN이고, <code>OUTER</code>는 생략할 수 있다)은 내부 조인의 결과에 한 가지 규칙을 더한다. 왼쪽 테이블의 어떤 행이 오른쪽 테이블에서 짝을 하나도 찾지 못하면, 그 행을 버리지 않고 오른쪽 테이블의 열을 모두 NULL로 채워 결과에 내보낸다. MySQL 레퍼런스 매뉴얼의 JOIN 절 설명은 이를 "LEFT JOIN의 ON 또는 USING 부분에서 오른쪽 테이블에 일치하는 행이 없으면, 모든 열이 NULL인 행이 오른쪽 테이블의 행으로 쓰인다"고 적는다. 이렇게 만들어진 행을 매뉴얼은 NULL로 보완된 행(NULL-complemented row)이라고 부른다.</p>
+<pre><code class="language-sql">SELECT d.dept_id, d.name AS dept_name, e.emp_id, e.name AS emp_name
+FROM department d
+LEFT JOIN employee e ON d.dept_id = e.dept_id
+ORDER BY d.dept_id, e.emp_id;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+---------+-----------+--------+----------+
+| dept_id | dept_name | emp_id | emp_name |
++---------+-----------+--------+----------+
+|      10 | 개발      |      1 | 한서준   |
+|      10 | 개발      |      2 | 이도윤   |
+|      20 | 디자인    |      3 | 박지아   |
+|      20 | 디자인    |      4 | 최민재   |
+|      30 | 영업      |      5 | 정하린   |
+|      40 | 인사      |   NULL | NULL     |
++---------+-----------+--------+----------+</code></pre>
+<p>왼쪽 행 하나씩 따라가 보자. 개발(10)은 <code>e.dept_id = 10</code>을 만족하는 직원 두 명(한서준, 이도윤)과 짝지어져 두 행이 된다. 디자인(20)도 두 행, 영업(30)은 한 행이다. 여기까지는 내부 조인과 똑같다. 인사(40)에서 차이가 난다. <code>e.dept_id = 40</code>을 만족하는 직원이 없으므로 내부 조인이라면 인사는 사라진다. LEFT JOIN은 대신 <code>(40, 인사)</code> 뒤에 직원 쪽 열을 전부 NULL로 붙인 행 하나를 만든다. 그래서 결과는 여섯 행이다.</p>
+<p>결과에 윤태오가 없다는 점도 눈여겨보자. LEFT JOIN이 보존하는 것은 왼쪽 테이블, 여기서는 부서다. 직원 테이블은 짝을 대 주는 쪽일 뿐이라, 어떤 부서와도 짝이 되지 못한 윤태오는 내부 조인에서처럼 버려진다. 외부 조인은 "양쪽을 다 보여 주는 조인"이 아니라 "한쪽을 보존하는 조인"이다. 보존되는 쪽과 NULL로 채워질 수 있는 쪽을 MySQL 매뉴얼은 각각 외부 테이블(outer table)과 내부 테이블(inner table)이라 부른다. 이 회차에서도 이 용어를 쓴다. <code>A LEFT JOIN B</code>에서 A가 외부 테이블, B가 내부 테이블이다.</p>
+<p>이 규칙을 집합으로 적으면 다음과 같다. 조건 P가 "참"인 짝만 짝으로 인정한다는 점이 중요하다. SQL의 비교는 참, 거짓, 알 수 없음(UNKNOWN)의 세 값을 갖는데, 거짓과 UNKNOWN은 모두 "짝이 아님"으로 처리된다. 윤태오가 어떤 부서와도 짝이 되지 못한 이유가 이것이다. <code>NULL = 10</code>은 거짓이 아니라 NULL(UNKNOWN)이지만, 참이 아니므로 짝이 아니다.</p>
+<pre class="diagram">A LEFT JOIN B ON P
+  =  (A INNER JOIN B ON P)                                  ← 짝이 있는 행들
+  ∪  { a ∥ (NULL, NULL, …) | a ∈ A 이고, P(a, b)가 참인 b가 B에 하나도 없음 }
+                                                           ← 짝이 없는 A의 행마다 정확히 한 행
+
+결과 행 수 ≥ |A|      (A의 모든 행이 적어도 한 번 나온다)
+결과 행 수 = |A|      (B 쪽 조인 열이 유일해 A의 각 행이 짝을 최대 하나만 가질 때)</pre>
+<p>마지막 두 줄이 LEFT JOIN을 쓸 때 가장 먼저 떠올려야 할 성질이다. LEFT JOIN의 결과는 왼쪽 테이블의 행 수보다 작아지지 않는다(WHERE로 거르지 않는 한). 그리고 오른쪽 테이블의 조인 열이 기본 키나 UNIQUE 열이면, 즉 N:1 방향으로 조인하면 결과 행 수가 왼쪽 테이블 행 수와 정확히 같다. 반대로 1:N 방향(부서에서 직원으로)으로 조인하면 왼쪽 행이 짝의 수만큼 반복된다. 위 결과에서 개발과 디자인이 두 번씩 나온 것이 그것이다. 이 성질은 뒤의 "조인의 특징"에서 집계 오류의 원인으로 다시 나온다.</p>
+
+<x-visual id="db-basic-02-left-join-null-row" title="LEFT JOIN이 짝 없는 왼쪽 행을 NULL로 채워 내보내는 과정" kind="구조도" ratio="16:9">
+<x-hint>왼쪽 부서 테이블의 네 행이 오른쪽 직원 테이블과 짝지어지고, 짝이 없는 인사 부서가 NULL로 채워진 행으로 결과에 남으며, 짝이 없는 직원 윤태오는 버려지는 모습을 보여 준다.</x-hint>
+<x-prompt>깔끔한 평면 인포그래픽, 흰 배경. 왼쪽에 "department" 라벨이 붙은 4행 표(개발 10, 디자인 20, 영업 30, 인사 40), 가운데에 "employee" 라벨이 붙은 6행 표(한서준, 이도윤, 박지아, 최민재, 정하린, 윤태오). 개발에서 한서준·이도윤으로, 디자인에서 박지아·최민재로, 영업에서 정하린으로 파란 화살표가 이어진다. 인사 행에서는 화살표가 빈 회색 점선 상자로 가고, 그 상자에 "NULL로 채운 행"이라는 라벨이 붙는다. 윤태오 행은 흐리게 처리하고 옆에 "버려짐"이라는 라벨을 단다. 오른쪽에 "결과 6행" 라벨이 붙은 결과 표가 있고, 마지막 행 "인사 | NULL | NULL"이 노란색으로 강조된다. 위쪽에 "외부 테이블(보존)"과 "내부 테이블(짝 제공)"이라는 라벨이 각각 왼쪽 표와 가운데 표 위에 있다.</x-prompt>
+<x-caption>LEFT JOIN은 외부 테이블(department)의 행을 모두 보존한다. 짝이 없는 인사 부서는 직원 열이 NULL인 행으로 남고, 어떤 부서와도 짝이 되지 않은 윤태오는 결과에 나타나지 않는다.</x-caption>
+</x-visual>
+
+<h3>RIGHT JOIN, 그리고 MySQL에 없는 FULL OUTER JOIN</h3>
+<p>RIGHT JOIN은 LEFT JOIN의 거울상이다. 보존되는 쪽이 오른쪽 테이블이다. 부서가 없는 직원까지 모두 보고 싶다면 직원 테이블을 보존해야 하므로, 다음 두 쿼리는 같은 결과를 낸다.</p>
+<pre><code class="language-sql">-- 직원을 보존한다: RIGHT JOIN으로 쓴 형태
+SELECT e.emp_id, e.name AS emp_name, d.dept_id, d.name AS dept_name
+FROM department d
+RIGHT JOIN employee e ON e.dept_id = d.dept_id
+ORDER BY e.emp_id;
+
+-- 같은 의미를 LEFT JOIN으로 쓴 형태
+SELECT e.emp_id, e.name AS emp_name, d.dept_id, d.name AS dept_name
+FROM employee e
+LEFT JOIN department d ON e.dept_id = d.dept_id
+ORDER BY e.emp_id;</code></pre>
+<pre data-label="실행 결과(두 쿼리 동일)"><code class="language-text">+--------+----------+---------+-----------+
+| emp_id | emp_name | dept_id | dept_name |
++--------+----------+---------+-----------+
+|      1 | 한서준   |      10 | 개발      |
+|      2 | 이도윤   |      10 | 개발      |
+|      3 | 박지아   |      20 | 디자인    |
+|      4 | 최민재   |      20 | 디자인    |
+|      5 | 정하린   |      30 | 영업      |
+|      6 | 윤태오   |    NULL | NULL      |
++--------+----------+---------+-----------+</code></pre>
+<p>이번에는 윤태오가 남고 인사 부서가 사라졌다. 보존하는 쪽이 바뀌었기 때문이다. 직원 쪽에서 부서 쪽으로 조인하면 N:1 방향이므로(부서의 <code>dept_id</code>가 기본 키) 결과는 직원 수와 같은 여섯 행이다.</p>
+<p>MySQL 안에서 두 쿼리는 실제로 같은 것이 된다. 매뉴얼의 "Outer Join Simplification" 절은 오른쪽 외부 조인이 들어 있는 쿼리가 파서 단계에서 왼쪽 조인만으로 이루어진 동등한 쿼리로 바뀐다고 적는다. <code>(T1, ...) RIGHT JOIN (T2, ...) ON P</code>는 <code>(T2, ...) LEFT JOIN (T1, ...) ON P</code>가 된다. 그러니 RIGHT JOIN을 위한 별도의 실행 알고리즘은 없다. 매뉴얼의 JOIN 절 설명은 데이터베이스 사이의 이식성을 위해 RIGHT JOIN 대신 LEFT JOIN을 쓰라고 권한다. 실무적인 이유도 있다. 조인이 세 개, 네 개로 이어질 때 LEFT와 RIGHT가 섞이면 어느 테이블이 보존되는지 읽는 사람이 매번 계산해야 한다. "보존할 테이블을 FROM 맨 앞에 쓰고, 나머지는 LEFT JOIN으로 붙인다"는 한 가지 습관으로 통일하면 이 계산이 사라진다.</p>
+
+<h4>FULL OUTER JOIN: 양쪽을 모두 보존하기</h4>
+<p>양쪽 테이블을 모두 보존하는 조인이 FULL OUTER JOIN이다. 짝이 있는 행, 짝 없는 왼쪽 행(오른쪽을 NULL로 채움), 짝 없는 오른쪽 행(왼쪽을 NULL로 채움)이 모두 나온다. SQL 표준에 있고 PostgreSQL 같은 다른 DBMS에서도 쓸 수 있지만, MySQL 8.0 레퍼런스 매뉴얼의 조인 문법에는 없다. 문법이 허용하는 조인은 <code>[INNER | CROSS] JOIN</code>, <code>STRAIGHT_JOIN</code>, <code>{LEFT|RIGHT} [OUTER] JOIN</code>, <code>NATURAL ... JOIN</code>뿐이다.</p>
+<p>그래서 MySQL에서는 FULL OUTER JOIN을 두 쿼리의 합으로 만든다. 정의를 그대로 옮기면 된다. "LEFT JOIN 결과(짝 있는 행 + 짝 없는 왼쪽 행)"에 "짝 없는 오른쪽 행"만 더하면 FULL OUTER JOIN이다. 짝 없는 오른쪽 행은 RIGHT JOIN 결과 중 왼쪽 키가 NULL인 행이다.</p>
+<pre><code class="language-sql">SELECT d.dept_id AS dept_id, d.name AS dept_name, e.emp_id AS emp_id, e.name AS emp_name
+FROM department d
+LEFT JOIN employee e ON d.dept_id = e.dept_id
+UNION ALL
+SELECT d.dept_id, d.name, e.emp_id, e.name
+FROM department d
+RIGHT JOIN employee e ON d.dept_id = e.dept_id
+WHERE d.dept_id IS NULL                 -- 짝 없는 직원만
+ORDER BY dept_id, emp_id;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+---------+-----------+--------+----------+
+| dept_id | dept_name | emp_id | emp_name |
++---------+-----------+--------+----------+
+|    NULL | NULL      |      6 | 윤태오   |
+|      10 | 개발      |      1 | 한서준   |
+|      10 | 개발      |      2 | 이도윤   |
+|      20 | 디자인    |      3 | 박지아   |
+|      20 | 디자인    |      4 | 최민재   |
+|      30 | 영업      |      5 | 정하린   |
+|      40 | 인사      |   NULL | NULL     |
++---------+-----------+--------+----------+</code></pre>
+<p>첫 번째 SELECT가 여섯 행(짝 있는 다섯 행과 인사), 두 번째 SELECT가 한 행(윤태오)을 내고, 둘을 합쳐 일곱 행이다. 정렬에서 NULL이 맨 앞에 오므로 윤태오 행이 첫 줄이다. 두 가지를 짚어 두자.</p>
+<p>첫째, 왜 <code>UNION</code>이 아니라 <code>UNION ALL</code>이고, 두 번째 SELECT에는 왜 <code>WHERE d.dept_id IS NULL</code>이 붙는가. 흔히 보는 다른 흉내 방식은 "LEFT JOIN 결과 <code>UNION</code> RIGHT JOIN 결과"다. 두 결과에는 짝 있는 행이 똑같이 들어 있으므로, <code>UNION</code>의 중복 제거로 그 겹침을 없애는 방식이다. 매뉴얼("Set Operations with UNION, INTERSECT, and EXCEPT")에 따르면 집합 연산은 기본적으로 중복 행을 제거하고, <code>ALL</code>을 붙여야 제거하지 않는다. 문제는 중복 제거가 "두 쿼리의 겹침"만 없애는 것이 아니라 "값이 같은 모든 행"을 없앤다는 데 있다. SELECT 목록에 행을 구별하는 키가 빠져 있으면, 예를 들어 <code>d.name, e.salary</code>만 고르고 같은 부서에 연봉이 같은 직원이 둘 있으면, 정당하게 두 번 나와야 할 행이 하나로 합쳐진다. 위 방식은 두 번째 쿼리를 처음부터 겹치지 않는 행으로 제한하므로 중복 제거가 필요 없고, 결과가 정의와 정확히 일치한다. 중복 제거에 드는 비용은 04회에서 UNION을 다룰 때 본다.</p>
+<p>둘째, <code>ORDER BY dept_id, emp_id</code>에 테이블 이름이 붙어 있지 않다. 집합 연산 결과 전체에 붙는 ORDER BY는 <code>tbl_name.col_name</code> 형태의 참조를 쓸 수 없고, 첫 번째 쿼리 블록에서 준 별칭을 써야 한다고 매뉴얼이 정한다. 결과의 열 이름도 첫 번째 쿼리 블록의 열 이름을 따른다. 그래서 첫 번째 SELECT에만 <code>AS</code> 별칭을 꼼꼼히 붙였다.</p>
+<aside class="note">FULL을 그대로 써 보면 위험한 일이 생길 수 있다. MySQL 8.0의 키워드 목록에서 <code>FULL</code>은 예약어가 아니고, 테이블 참조 뒤에는 <code>AS</code> 없이 별칭을 쓸 수 있다. 따라서 <code>FROM department FULL JOIN employee USING (dept_id)</code>는 문법 오류가 아니라 "department에 FULL이라는 별칭을 붙이고 employee와 내부 조인"으로 해석된다. MySQL 8.4.13과 8.0.46에서 실행하면 두 버전 모두 오류 없이 내부 조인 결과 다섯 행(인사와 윤태오가 없다)이 나오고, 경고 하나만 붙는다. <code>Warning (Code 4119): Using FULL as unquoted identifier is deprecated, please use quotes or rename the identifier.</code> 경고는 따로 확인하지 않으면 지나치기 쉽고 결과는 내부 조인 그대로이므로, 다른 DBMS에서 옮겨 온 쿼리에 FULL JOIN이 있다면 결과 행 수부터 확인해야 한다.</aside>
+
+<h3>ON과 WHERE: 외부 조인에서는 조건의 자리가 결과를 바꾼다</h3>
+<p>내부 조인에서 조건을 ON에 두든 WHERE에 두든 결과는 같다. 짝 중에서 조건을 만족하는 것만 남는다는 점에서 두 자리가 구별되지 않기 때문이다. 외부 조인에서는 다르다. 이 차이가 외부 조인 버그의 가장 큰 원천이다. "부서마다, 연봉 6,000 이상인 직원을 보여 달라"는 요청을 두 가지로 써 보자.</p>
+<pre><code class="language-sql">-- (가) 조건을 ON에 둔다
+SELECT d.dept_id, d.name AS dept_name, e.name AS emp_name, e.salary
+FROM department d
+LEFT JOIN employee e ON d.dept_id = e.dept_id AND e.salary >= 6000
+ORDER BY d.dept_id, e.emp_id;
+
+-- (나) 조건을 WHERE에 둔다
+SELECT d.dept_id, d.name AS dept_name, e.name AS emp_name, e.salary
+FROM department d
+LEFT JOIN employee e ON d.dept_id = e.dept_id
+WHERE e.salary >= 6000
+ORDER BY d.dept_id, e.emp_id;</code></pre>
+<pre data-label="(가)의 실행 결과"><code class="language-text">+---------+-----------+----------+--------+
+| dept_id | dept_name | emp_name | salary |
++---------+-----------+----------+--------+
+|      10 | 개발      | 한서준   |   9000 |
+|      10 | 개발      | 이도윤   |   6000 |
+|      20 | 디자인    | 박지아   |   7000 |
+|      30 | 영업      | NULL     |   NULL |
+|      40 | 인사      | NULL     |   NULL |
++---------+-----------+----------+--------+</code></pre>
+<pre data-label="(나)의 실행 결과"><code class="language-text">+---------+-----------+----------+--------+
+| dept_id | dept_name | emp_name | salary |
++---------+-----------+----------+--------+
+|      10 | 개발      | 한서준   |   9000 |
+|      10 | 개발      | 이도윤   |   6000 |
+|      20 | 디자인    | 박지아   |   7000 |
++---------+-----------+----------+--------+</code></pre>
+<p>(가)는 다섯 행, (나)는 세 행이다. 차이는 처리 단계에 있다. ON 조건은 "어떤 직원 행을 이 부서의 짝으로 인정할 것인가"를 정한다. (가)에서 영업(30)의 유일한 직원 정하린은 연봉이 5,000이라 ON 조건 전체가 거짓이 된다. 짝이 하나도 없으니 영업은 NULL로 채워진 행으로 남는다. 반면 WHERE는 짝짓기와 NULL 채우기가 모두 끝난 뒤의 결과 행을 거른다. (나)에서 LEFT JOIN 단계를 마친 결과는 앞 절의 여섯 행이다. 여기에 <code>e.salary >= 6000</code>을 적용하면 정하린(5,000)과 최민재(4,500) 행은 거짓으로 걸러지고, 인사 행은 <code>NULL >= 6000</code>이 UNKNOWN이라 역시 걸러진다. WHERE는 참인 행만 통과시키기 때문이다. 결국 (나)는 LEFT JOIN이라고 써 놓고 내부 조인과 같은 결과를 낸 셈이다.</p>
+<p>MySQL 매뉴얼은 이 역할 분담을 "일반적으로 ON 절은 테이블을 어떻게 조인할지 지정하는 조건에, WHERE 절은 결과 집합에 어떤 행을 포함할지 제한하는 데 쓴다"고 정리한다. 외부 조인에서는 이것이 권고가 아니라 결과를 가르는 의미 차이다.</p>
+<h4>왼쪽 테이블에 대한 조건을 ON에 두면</h4>
+<p>반대 방향의 실수도 흔하다. "디자인 부서와 그 직원만 보고 싶다"며 왼쪽 테이블 조건을 ON에 넣는 경우다.</p>
+<pre><code class="language-sql">SELECT d.dept_id, d.name AS dept_name, e.name AS emp_name
+FROM department d
+LEFT JOIN employee e ON d.dept_id = e.dept_id AND d.dept_id = 20
+ORDER BY d.dept_id, e.emp_id;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+---------+-----------+----------+
+| dept_id | dept_name | emp_name |
++---------+-----------+----------+
+|      10 | 개발      | NULL     |
+|      20 | 디자인    | 박지아   |
+|      20 | 디자인    | 최민재   |
+|      30 | 영업      | NULL     |
+|      40 | 인사      | NULL     |
++---------+-----------+----------+</code></pre>
+<p>부서는 하나도 걸러지지 않았다. LEFT JOIN은 왼쪽 행을 무조건 보존하므로, ON 조건으로는 왼쪽 행을 없앨 수 없다. ON에 넣은 <code>d.dept_id = 20</code>은 "20번이 아닌 부서는 어떤 직원과도 짝이 될 수 없다"는 뜻이 되어, 개발·영업·인사가 NULL로 채워진 행으로 남는다. 디자인 부서만 원한다면 이 조건은 WHERE에 있어야 한다.</p>
+<div class="table-wrap"><table><thead><tr><th>조건이 참조하는 테이블</th><th>ON에 둘 때</th><th>WHERE에 둘 때</th></tr></thead><tbody>
+<tr><td>내부 테이블(NULL로 채워질 쪽)</td><td>짝 후보를 줄인다. 외부 테이블의 행은 남고, 짝이 모두 걸러지면 NULL로 채운 행이 된다.</td><td>NULL로 채운 행까지 걸러지므로(IS NULL류 조건이 아니면) 결과가 내부 조인과 같아진다.</td></tr>
+<tr><td>외부 테이블(보존되는 쪽)</td><td>외부 테이블의 행을 거르지 못한다. 조건이 거짓인 행은 짝 없이 NULL로 채워져 나온다.</td><td>외부 테이블의 행을 거른다.</td></tr>
+</tbody></table></div>
+
+<h4>null-rejected 조건과 외부 조인 단순화</h4>
+<p>(나)처럼 WHERE 조건이 NULL로 채운 행을 반드시 걸러 낸다면, 외부 조인으로 실행할 이유가 없다. MySQL 옵티마이저도 이것을 안다. 매뉴얼의 "Outer Join Simplification" 절은 조건이 어떤 외부 조인 연산에 대해 null-rejected라는 것을 "그 연산이 만든 NULL로 보완된 행에 대해 조건이 FALSE나 UNKNOWN으로 평가되는 것"으로 정의하고, WHERE 조건이 null-rejected이면 그 외부 조인을 내부 조인으로 바꾼다고 적는다. 우리 예제에 대입하면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th><code>department d LEFT JOIN employee e</code>의 WHERE 조건</th><th>null-rejected인가</th><th>이유</th></tr></thead><tbody>
+<tr><td><code>e.salary >= 6000</code></td><td>예</td><td>NULL로 채운 행에서 <code>e.salary</code>가 NULL이라 항상 UNKNOWN</td></tr>
+<tr><td><code>e.emp_id IS NOT NULL</code></td><td>예</td><td>NULL로 채운 행에서 항상 FALSE</td></tr>
+<tr><td><code>e.emp_id IS NULL</code></td><td>아니오</td><td>NULL로 채운 행에서 TRUE(바로 이 성질을 안티 조인에 쓴다)</td></tr>
+<tr><td><code>d.dept_id = 40 OR e.salary > 5000</code></td><td>아니오</td><td>인사 부서의 NULL 행에서 앞쪽이 TRUE가 된다</td></tr>
+</tbody></table></div>
+<p>바꿔 쓰기는 결과를 바꾸지 않는다. 어차피 WHERE가 NULL 행을 모두 버릴 테니 처음부터 만들지 않아도 같다는 논리다. 바꿔 쓰기가 주는 이득은 실행 계획의 선택지다. 뒤에서 보겠지만 외부 조인은 외부 테이블을 먼저 읽어야 한다는 제약이 있는데, 내부 조인으로 바뀌면 그 제약이 풀린다. 매뉴얼의 예에서도 원래 쿼리는 T1, T2, T3 순서의 계획만 평가하지만, 바꿔 쓴 쿼리는 T3, T1, T2 순서도 추가로 고려한다. 우리 예제의 (나)를 MySQL 8.4.13과 8.0.46에서 EXPLAIN하면 두 버전 모두 이 일이 실제로 보인다. 계획의 첫 행이 내부 테이블이었던 <code>e</code>(type <code>ALL</code>)이고 <code>d</code>가 기본 키로 찾는 <code>eq_ref</code>로 뒤따른다. 이어서 <code>SHOW WARNINGS</code>로 옵티마이저가 바꿔 쓴 쿼리를 보면 FROM 절이 <code>`department` `d` join `employee` `e`</code>로, ON 조건은 WHERE의 <code>(`d`.`dept_id` = `e`.`dept_id`) and (`e`.`salary` >= 6000)</code>로 들어가 있어 LEFT JOIN이 사라졌다. 개발자 입장에서 이 최적화는 하나의 신호로 읽으면 된다. LEFT JOIN을 쓰고 내부 테이블 열에 대한 일반 조건을 WHERE에 걸었다면, 실제로 쓴 것은 내부 조인이다. 그것이 의도였다면 JOIN으로 고쳐 쓰는 편이 읽기 쉽고, 의도가 아니었다면 조건을 ON으로 옮겨야 한다.</p>
+
+<x-visual id="db-basic-02-on-vs-where" title="외부 조인에서 ON 조건과 WHERE 조건이 적용되는 단계" kind="순서도" ratio="16:9">
+<x-hint>ON 조건은 짝짓기 단계에서 짝 후보를 거르고, 짝이 없으면 NULL 행이 만들어진 뒤, WHERE가 그 결과 전체를 거르는 3단계 파이프라인을 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 흐르는 3단계 파이프라인 순서도, 흰 배경, 평면 스타일. 1단계 상자 "짝짓기(ON 조건)" 안에 부서 행과 직원 행이 선으로 연결되고, 일부 선에 빨간 X 표시. 2단계 상자 "짝 없는 외부 행에 NULL 채우기" 안에 회색 NULL 칸이 붙은 행 두 개. 3단계 상자 "결과 거르기(WHERE 조건)" 안에 거름망 아이콘과, NULL 행이 거름망에 걸려 떨어지는 모습. 아래쪽에 두 갈래 비교: 위 갈래에 "조건을 ON에: 5행", 아래 갈래에 "조건을 WHERE에: 3행"이라는 라벨. 화살표는 1단계에서 2단계, 2단계에서 3단계로 이어진다.</x-prompt>
+<x-caption>ON 조건은 1단계에서 짝 후보만 줄이고, WHERE 조건은 NULL 채우기가 끝난 3단계에서 행을 걸러 낸다. 같은 조건이라도 어느 단계에 두느냐에 따라 결과 행 수가 달라진다.</x-caption>
+</x-visual>
+
+<h3>짝이 없는 행 찾기와 NULL이 섞인 집계</h3>
+<p>null-rejected의 반대 성질, 즉 <code>IS NULL</code> 조건이 NULL 행에서 참이 된다는 성질을 이용하면 "짝이 없는 행"만 골라낼 수 있다. MySQL 매뉴얼의 JOIN 절 설명도 바로 이 용도를 예로 든다. 직원이 없는 부서를 찾아 보자.</p>
+<pre><code class="language-sql">SELECT d.dept_id, d.name
+FROM department d
+LEFT JOIN employee e ON d.dept_id = e.dept_id
+WHERE e.emp_id IS NULL;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+---------+------+
+| dept_id | name |
++---------+------+
+|      40 | 인사 |
++---------+------+</code></pre>
+<p>이처럼 "A 중에서 B에 짝이 없는 행"을 구하는 연산을 안티 조인(anti-join)이라고 한다. LEFT JOIN으로 짝 없는 행을 NULL 행으로 드러낸 뒤, WHERE로 NULL 행만 남기는 두 단계다. 이 패턴에서 가장 중요한 결정은 <b>어느 열의 IS NULL을 검사하느냐</b>다. 검사할 열은 "짝이 있는 진짜 행이라면 절대 NULL일 수 없는 열"이어야 한다. 내부 테이블의 기본 키나 NOT NULL 열, 또는 ON에서 <code>=</code>로 비교한 조인 열이 그런 열이다. 조인 열은 짝이 되었다면 <code>=</code> 비교가 참이었다는 뜻이므로 NULL일 수 없다.</p>
+<p>NULL을 허용하는 열을 고르면 어떻게 되는지 보자. 같은 질문을 <code>e.manager_id IS NULL</code>로 쓰면 결과가 틀린다.</p>
+<pre><code class="language-sql">SELECT d.dept_id, d.name, e.name AS emp_name
+FROM department d
+LEFT JOIN employee e ON d.dept_id = e.dept_id
+WHERE e.manager_id IS NULL      -- 잘못된 열을 검사했다
+ORDER BY d.dept_id;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+---------+------+----------+
+| dept_id | name | emp_name |
++---------+------+----------+
+|      10 | 개발 | 한서준   |
+|      40 | 인사 | NULL     |
++---------+------+----------+</code></pre>
+<p>개발 부서가 "직원 없는 부서"처럼 섞여 나왔다. 한서준은 개발 부서와 정상적으로 짝지어졌지만 최상위 관리자라 <code>manager_id</code>가 원래 NULL이다. 결과 행만 봐서는 "짝이 없어 NULL로 채워진 manager_id"와 "짝은 있지만 값이 원래 NULL인 manager_id"를 구별할 수 없다. 테스트 데이터에 우연히 NULL 값이 없으면 이 버그는 개발 중에 드러나지 않다가 운영 데이터에서 나타난다.</p>
+<p>엔진 쪽에도 이 패턴을 위한 최적화가 있다. MySQL 매뉴얼의 EXPLAIN 출력 설명에서 Extra 열의 <code>Not exists</code>는 MySQL이 LEFT JOIN 최적화를 적용해, 이전 행 조합에 대해 LEFT JOIN 조건에 맞는 행을 하나 찾으면 이 테이블에서 더 이상 행을 살피지 않는다는 뜻이다. 매뉴얼의 예는 <code>t1 LEFT JOIN t2 ON t1.id = t2.id WHERE t2.id IS NULL</code>이고, 전제는 <code>t2.id</code>가 NOT NULL로 정의된 것이다. 짝이 하나라도 있으면 그 외부 행은 어차피 WHERE에서 버려질 운명이므로, 나머지 짝을 찾을 필요가 없다는 논리다. 검사 열이 NOT NULL이라는 전제가 여기서도 핵심이다. 위의 직원 없는 부서 쿼리(<code>e.emp_id</code>는 기본 키라 NOT NULL)를 EXPLAIN하면 실제로 이 표시가 나온다. 아래는 MySQL 8.4.13의 출력이고 8.0.46도 같았다. <code>rows</code>와 <code>filtered</code>는 통계 기반 추정치라 실행 환경과 통계에 따라 달라진다.</p>
+<pre data-label="MySQL 8.4.13에서 실행"><code class="language-text">+----+-------------+-------+------------+------+---------------+---------+---------+-------------------------+------+----------+--------------------------------------+
+| id | select_type | table | partitions | type | possible_keys | key     | key_len | ref                     | rows | filtered | Extra                                |
++----+-------------+-------+------------+------+---------------+---------+---------+-------------------------+------+----------+--------------------------------------+
+|  1 | SIMPLE      | d     | NULL       | ALL  | NULL          | NULL    | NULL    | NULL                    |    4 |   100.00 | NULL                                 |
+|  1 | SIMPLE      | e     | NULL       | ref  | dept_id       | dept_id | 5       | m_db_basic_02.d.dept_id |    1 |    16.67 | Using where; Not exists; Using index |
++----+-------------+-------+------------+------+---------------+---------+---------+-------------------------+------+----------+--------------------------------------+</code></pre>
+<p>같은 질문을 <code>NOT EXISTS</code>나 <code>NOT IN</code> 서브쿼리로도 쓸 수 있고, MySQL 8.0.17부터는 이런 서브쿼리를 안티 조인으로 변환할 수 있다. 서브쿼리 쪽 이야기는 03회에서 다룬다.</p>
+
+<h4>외부 조인 뒤의 집계: COUNT(*)와 COUNT(열)</h4>
+<p>"부서별 직원 수"는 외부 조인과 집계가 만나는 가장 흔한 자리다. 여기에도 NULL 행이 함정을 판다.</p>
+<pre><code class="language-sql">SELECT d.dept_id, d.name,
+       COUNT(*)                  AS cnt_star,
+       COUNT(e.emp_id)           AS cnt_emp,
+       SUM(e.salary)             AS sum_sal,
+       COALESCE(SUM(e.salary),0) AS sum_sal0
+FROM department d
+LEFT JOIN employee e ON d.dept_id = e.dept_id
+GROUP BY d.dept_id, d.name
+ORDER BY d.dept_id;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+---------+--------+----------+---------+---------+----------+
+| dept_id | name   | cnt_star | cnt_emp | sum_sal | sum_sal0 |
++---------+--------+----------+---------+---------+----------+
+|      10 | 개발   |        2 |       2 |   15000 |    15000 |
+|      20 | 디자인 |        2 |       2 |   11500 |    11500 |
+|      30 | 영업   |        1 |       1 |    5000 |     5000 |
+|      40 | 인사   |        1 |       0 |    NULL |        0 |
++---------+--------+----------+---------+---------+----------+</code></pre>
+<p>인사 부서에서 <code>COUNT(*)</code>는 1, <code>COUNT(e.emp_id)</code>는 0이다. 매뉴얼에 따르면 <code>COUNT(expr)</code>는 expr이 NULL이 아닌 값의 개수를 세고, <code>COUNT(*)</code>는 NULL 포함 여부와 상관없이 가져온 행의 수를 센다. 인사 그룹에는 NULL로 채운 행이 하나 있으므로 행 수는 1이지만, 그 행의 <code>e.emp_id</code>는 NULL이므로 직원 수는 0이다. "부서별 직원 수"의 정답은 <code>COUNT(e.emp_id)</code>다. <code>SUM</code>은 집계할 값이 하나도 없으면 0이 아니라 NULL을 돌려준다(매뉴얼: 일치하는 행이 없거나 expr이 NULL이면 SUM()은 NULL). 리포트에 0을 보여야 한다면 <code>COALESCE(SUM(...), 0)</code>처럼 바깥에서 바꾼다.</p>
+<p>GROUP BY의 기준 열도 외부 테이블에서 골라야 한다. 위 쿼리를 <code>GROUP BY e.dept_id</code>로 쓰면, 직원이 없는 부서는 모두 <code>e.dept_id</code>가 NULL인 행이 된다. 매뉴얼은 GROUP BY에서 두 NULL을 같은 값으로 본다고 적으므로, 직원 없는 부서가 여럿이면 그 부서들이 NULL 그룹 하나로 뭉친다. 게다가 SELECT 목록의 <code>d.name</code>은 그룹 기준에서 함수적으로 결정되지 않으므로, MySQL 8.0의 기본 SQL 모드에 포함된 ONLY_FULL_GROUP_BY에서 오류가 난다. 기본 SQL 모드인 MySQL 8.4.13과 8.0.46에서 <code>SELECT e.dept_id, d.name, COUNT(e.emp_id) ... GROUP BY e.dept_id</code>를 실행하면 두 버전 모두 <code>ERROR 1055 (42000): Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'm_db_basic_02.d.name' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by</code>를 낸다(<code>m_db_basic_02</code>는 실습에 쓴 데이터베이스 이름이다). 보존되는 쪽의 키로 묶는다는 원칙 하나면 두 문제가 함께 사라진다.</p>
+
+<h3>한 층 아래: 엔진은 외부 조인을 어떻게 실행하는가</h3>
+<p>ON과 WHERE의 차이, 외부 조인이 실행 순서를 묶는다는 이야기는 엔진이 조인을 실제로 어떻게 돌리는지 보면 한 번에 이해된다. 앞 회차에서 본 것처럼 MySQL의 기본 조인 방식은 중첩 루프 조인(nested-loop join, NLJ)이다. 매뉴얼("Nested-Loop Join Algorithms")의 설명대로 첫 번째 테이블에서 행을 하나씩 읽어, 다음 테이블을 처리하는 안쪽 루프에 넘기는 일을 조인할 테이블이 남아 있는 만큼 반복한다. 내부 조인이라면 안쪽 루프에서 조건을 만족하는 짝이 나올 때마다 출력하면 끝이다.</p>
+<p>외부 조인에는 정보가 하나 더 필요하다. "이 외부 행이 짝을 하나라도 찾았는가"다. 매뉴얼의 "Nested Join Optimization" 절은 이를 위해 외부 조인의 첫 번째 내부 테이블을 도는 루프마다 플래그를 하나 둔다고 설명한다. 플래그는 루프 전에 꺼 두고, 현재 외부 행의 짝을 찾으면 켜고, 루프가 끝난 뒤 검사한다. 끝까지 꺼져 있으면 짝이 없었던 것이므로 내부 테이블 열을 NULL로 채운 행을 만든다. 매뉴얼의 의사 코드를 우리 예제 <code>department d LEFT JOIN employee e ON d.dept_id = e.dept_id WHERE W</code>에 맞춰 옮기면 다음과 같다.</p>
+<pre><code class="language-text">FOR each row d in department {                         -- 외부 테이블: 바깥 루프
+  BOOL matched := FALSE
+  FOR each row e in employee such that e.dept_id = d.dept_id {   -- ON 조건으로 짝 후보 탐색
+    matched := TRUE                                     -- 짝을 하나라도 찾으면 켠다
+    IF W(d, e) { OUTPUT d || e }                        -- WHERE는 출력 직전에 검사
+  }
+  IF (NOT matched) {                                    -- 루프가 끝난 뒤에야 판정 가능
+    IF W(d, NULL) { OUTPUT d || NULL }                  -- NULL로 채운 행도 WHERE를 거친다
+  }
+}</code></pre>
+<p>이 코드에 앞 절의 (나), 즉 <code>W = e.salary >= 6000</code>을 넣고 한 줄씩 돌려 보자. 개발(10)에서는 한서준과 이도윤이 모두 ON을 통과해 플래그가 켜지고, 둘 다 W를 만족해 출력된다. 디자인(20)에서는 박지아가 출력되고 최민재는 W에서 떨어지지만 플래그는 이미 켜져 있다. 영업(30)이 결정적이다. 정하린이 ON을 통과해 플래그가 켜지고, W에서 떨어진다. 플래그가 켜져 있으니 NULL 행도 만들지 않는다. 영업은 결과에서 완전히 사라진다. 인사(40)는 짝이 없어 플래그가 꺼진 채 루프를 빠져나오지만, <code>W(d, NULL)</code>이 UNKNOWN이라 출력되지 않는다. 결과는 세 행이다.</p>
+<p>(가)처럼 연봉 조건을 ON에 넣으면 영업의 안쪽 루프는 "such that" 조건을 만족하는 행을 하나도 찾지 못한다. 플래그가 꺼진 채 끝나므로 NULL 행이 나온다. ON 조건은 <b>플래그를 켤 자격</b>을 정하고, WHERE 조건은 <b>출력할 자격</b>을 정한다. 두 조건의 의미 차이가 이 의사 코드의 두 자리 차이와 정확히 대응한다.</p>
+
+<x-visual id="db-basic-02-nlj-outer-flag" title="중첩 루프 조인이 LEFT JOIN을 실행할 때의 일치 플래그" kind="순서도" ratio="16:9">
+<x-hint>바깥 루프가 부서 행을 하나 꺼낼 때마다 플래그를 끄고, 안쪽 루프에서 짝을 찾으면 켜며, 안쪽 루프가 끝난 뒤 플래그가 꺼져 있으면 NULL로 채운 행을 만드는 흐름을 보여 준다.</x-hint>
+<x-prompt>세로 방향 순서도, 흰 배경, 평면 스타일. 맨 위 상자 "바깥 루프: department 행 하나 읽기", 그 아래 상자 "matched = FALSE". 그 아래 반복 영역 상자 "안쪽 루프: ON 조건을 만족하는 employee 행" 안에 두 개의 작은 상자 "matched = TRUE"와 "WHERE 통과 시 출력". 반복 영역 아래 마름모 "matched?"에서 두 갈래 화살표가 나온다. "TRUE" 갈래는 "다음 부서 행으로" 상자로 가고, "FALSE" 갈래는 "NULL로 채운 행 만들기" 상자를 거쳐 "WHERE 통과 시 출력" 상자로 간 뒤 "다음 부서 행으로"에 합류한다. "다음 부서 행으로"에서 맨 위 상자로 되돌아가는 화살표가 있다. 오른쪽 여백에 "외부 테이블이 바깥 루프여야 하는 이유"라는 짧은 메모 라벨.</x-prompt>
+<x-caption>짝이 없었다는 사실은 안쪽 루프가 끝난 뒤에야 알 수 있다. 그래서 보존되는 외부 테이블이 바깥 루프에 있어야 하고, 이것이 외부 조인의 테이블 접근 순서 제약이 된다.</x-caption>
+</x-visual>
+
+<h4>외부 조인은 읽기 순서를 묶는다</h4>
+<p>의사 코드에서 플래그는 "어떤 외부 행에 대해 내부 테이블의 후보를 모두 본 뒤"에만 판정할 수 있다. 만약 직원 테이블을 바깥 루프에 두면, 인사 부서에 짝이 없다는 사실은 직원 테이블을 끝까지 다 읽은 뒤에야 알 수 있고, 그 정보를 루프 밖에서 따로 기억해야 한다. 중첩 루프의 모양에 맞지 않는다. 그래서 매뉴얼은 외부 조인이 있는 쿼리에서 옵티마이저가 "외부 테이블의 루프가 내부 테이블의 루프보다 앞서는 순서만" 고를 수 있다고 적는다. "Outer Join Optimization" 절의 표현으로는 <code>A LEFT JOIN B</code>에서 B는 A에 의존하는 테이블로 설정되고, 테이블은 항상 그것이 의존하는 테이블을 모두 읽은 뒤에 읽힌다.</p>
+<p>내부 조인에는 이런 제약이 없다. <code>department JOIN employee</code>라면 옵티마이저는 부서를 먼저 읽을 수도, 직원을 먼저 읽을 수도 있다. 테이블이 n개인 내부 조인에서 옵티마이저가 고려할 수 있는 순서는 최대 n!개이고, 외부 조인은 그중 일부를 처음부터 배제한다. 앞 절의 외부 조인 단순화가 실행 계획에 의미가 있는 이유가 여기에 있다. 내부 조인으로 바뀌는 순간 배제되었던 순서가 다시 후보가 된다. 덧붙여 <code>STRAIGHT_JOIN</code>은 매뉴얼의 정의대로 "왼쪽 테이블을 항상 오른쪽 테이블보다 먼저 읽는" JOIN이다. 내부 조인에 사람이 순서를 강제하는 수단이지만, 옵티마이저가 나쁜 순서를 고르는 드문 경우를 위한 것이다.</p>
+
+<h4>안쪽 루프의 비용은 인덱스가 정한다</h4>
+<p>의사 코드의 "such that <code>e.dept_id = d.dept_id</code>" 한 줄이 실제로 무슨 일을 하는지에 따라 조인의 비용이 결정된다. <code>employee.dept_id</code>에 인덱스가 있으면 이 줄은 B+Tree 인덱스에서 <code>dept_id</code> 값을 찾는 탐색 한 번과, 같은 값을 가진 인덱스 레코드를 따라가는 짧은 스캔이다. 인덱스가 없으면 외부 행 하나마다 직원 테이블 전체를 읽어야 하므로, 비교 횟수가 대략 (부서 수) × (직원 수)가 된다. 우리 예제에서는 외래 키를 선언했으므로 InnoDB가 참조하는 쪽 열(<code>employee.dept_id</code>, <code>employee.manager_id</code>)에 인덱스가 없을 때 자동으로 만든다. 데이터베이스 입문에서 본 외래 키의 인덱스 요구 사항이 조인 성능과 직결되는 지점이다. 인덱스의 구조와 탐색 비용은 05·06회에서 다룬다.</p>
+<p>EXPLAIN에서는 내부 테이블 행의 <code>type</code> 열이 이 접근 방식을 알려 준다. 매뉴얼의 정의로 <code>eq_ref</code>는 이전 테이블들의 행 조합마다 이 테이블에서 한 행만 읽는 방식으로, 조인이 PRIMARY KEY나 UNIQUE NOT NULL 인덱스의 모든 부분을 쓸 때 나온다. <code>employee e LEFT JOIN department d</code>에서 부서 쪽이 이 경우다. <code>ref</code>는 일치하는 인덱스 값을 가진 모든 행을 읽는 방식으로, 유일하지 않은 인덱스를 쓸 때 나온다. <code>department d LEFT JOIN employee e</code>에서 직원 쪽이 이 경우다. <code>ALL</code>은 이전 행 조합마다 테이블 전체를 스캔한다는 뜻이고, 매뉴얼은 첫 번째가 아닌 테이블에서 이것이 보통 매우 나쁘다고 적는다. 실제 계획은 테이블 크기와 통계에 따라 옵티마이저가 고르므로, 아주 작은 테이블에서는 인덱스가 있어도 다른 방식을 고를 수 있다. 이 회차의 데이터로 MySQL 8.4.13과 8.0.46에서 EXPLAIN을 실행했을 때는 두 버전 모두 앞의 두 경우가 위 설명대로 나왔다. <code>employee e LEFT JOIN department d</code>에서 d는 <code>eq_ref</code>(key <code>PRIMARY</code>), <code>department d LEFT JOIN employee e</code>에서 e는 <code>ref</code>(key <code>dept_id</code>, InnoDB가 외래 키 때문에 만든 인덱스)였고, 바깥 루프의 테이블은 두 경우 모두 <code>ALL</code>이었다.</p>
+
+<h4>인덱스가 없을 때: 해시 조인</h4>
+<p>조인 열에 쓸 수 있는 인덱스가 없을 때 MySQL이 쓰는 방식은 버전에 따라 바뀌었다. 매뉴얼("Hash Join Optimization", "Nested-Loop Join Algorithms")에 따르면 MySQL 8.0.18 이전에는 블록 중첩 루프(Block Nested-Loop, BNL)를 썼다. 외부 루프의 행을 조인 버퍼에 모아 두고, 내부 테이블을 한 번 읽을 때 버퍼의 여러 행과 한꺼번에 비교해 내부 테이블을 읽는 횟수를 줄이는 방식이다. 8.0.18부터는 등가 조인 조건이 있고 인덱스를 쓸 수 없는 내부 조인에 해시 조인(hash join)을 쓰기 시작했다. 8.0.20부터는 BNL 지원이 제거되고, 예전에 BNL을 쓰던 모든 경우에 해시 조인을 쓴다. 이때부터 외부 조인(안티 조인과 세미 조인 포함)과 등가 조건이 없는 조인에도 해시 조인이 쓰인다. 조인 조건이 아예 없는 카티션 곱은 8.0.18 릴리스 노트부터 해시 조인을 쓴다고 적혀 있다.</p>
+<p>해시 조인 알고리즘의 일반적인 모양은 두 단계다. 한쪽 입력을 읽어 조인 키로 메모리에 해시 테이블을 만들고(빌드), 다른 쪽 입력을 한 행씩 읽으며 같은 키를 해시 테이블에서 찾는다(프로브). 각 입력을 한 번씩만 읽으므로, 인덱스 없는 중첩 루프처럼 내부 테이블을 외부 행 수만큼 반복해 읽지 않는다. 외부 조인이라면 보존되는 쪽 행으로 해시 테이블을 조회하고, 아무것도 찾지 못한 행에 NULL을 채워 내보내면 된다. MySQL의 EXPLAIN에서는 Extra 열에 <code>Using join buffer (hash join)</code>이 나타나고, <code>EXPLAIN FORMAT=TREE</code>에서는 <code>Inner hash join</code> 같은 노드 아래 <code>Hash</code>라는 하위 노드로 해시 테이블이 만들어지는 입력이 표시된다. 외부 조인이면 노드 이름이 <code>Left hash join</code>이 된다. 예를 들어 인덱스가 없는 <code>expense.q</code>로 <code>department d LEFT JOIN expense x ON x.q = d.dept_id</code>를 EXPLAIN하면(조인의 의미는 없고 인덱스 없는 열로 조인하기 위한 실험이다) MySQL 8.4.13과 8.0.46 모두 Extra에 <code>Using where; Using join buffer (hash join)</code>을 보이고, TREE 출력은 <code>Left hash join (x.q = d.dept_id)</code> 아래 <code>Table scan on d</code>와 <code>Hash</code> → <code>Table scan on x</code>였다. 보존되는 d가 프로브 쪽, x가 해시 테이블을 만드는 쪽이다. 해시 테이블이 쓸 수 있는 메모리는 <code>join_buffer_size</code>로 제한되고, 넘치면 디스크의 파일을 쓴다. 매뉴얼은 8.0.18부터 해시 조인용 조인 버퍼가 필요한 만큼 점진적으로 할당되지만 외부 조인은 버퍼 전체를 할당했고, 8.0.20부터는 외부 조인(안티 조인과 세미 조인 포함)에도 해시 조인이 쓰이므로 더는 문제가 아니라고 적는다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>외부 조인의 NULL 행은 "안쪽 루프가 끝났는데 짝이 없었다"는 사실에서 만들어진다. 그 사실을 알려면 보존되는 테이블이 바깥에 있어야 하므로 외부 조인은 읽기 순서를 묶고, ON은 짝의 자격을, WHERE는 출력의 자격을 정한다. 결과의 의미와 실행의 제약이 같은 뿌리에서 나온다.</p></aside>
+
+<h3>조인의 특징 1: 결과 행 수는 키 관계가 정한다</h3>
+<p>조인을 쓸 때 결과 행 수를 미리 예측할 수 있어야 한다. 예측이 어긋나는 순간이 바로 버그가 숨어 있는 순간이기 때문이다. 조인 종류별로 결과 행 수의 범위는 다음과 같다. |A|, |B|는 각 테이블의 행 수다.</p>
+<div class="table-wrap"><table><thead><tr><th>조인</th><th>최소</th><th>최대</th><th>정확히 정해지는 경우</th></tr></thead><tbody>
+<tr><td><code>A JOIN B ON P</code></td><td>0</td><td>|A| × |B|</td><td>B의 조인 열이 유일하고 A의 모든 행이 짝을 가지면 |A|</td></tr>
+<tr><td><code>A LEFT JOIN B ON P</code></td><td>|A|</td><td>max(|A|, |A| × |B|)</td><td>B의 조인 열이 유일하면 |A|</td></tr>
+<tr><td><code>A CROSS JOIN B</code></td><td colspan="2">항상 |A| × |B|</td><td>조건이 없으므로 언제나</td></tr>
+</tbody></table></div>
+<p>결과 행 수를 결정하는 것은 조인 열의 키 관계다. 조인 방향이 N:1이면, 즉 내부 테이블 쪽 조인 열이 기본 키나 UNIQUE 열이면 외부 행 하나에 짝이 최대 하나다. 이때 LEFT JOIN은 외부 테이블의 행 수를 그대로 보존하고, 내부 테이블의 열을 "옆에 붙이는" 역할만 한다. 직원에서 부서로 LEFT JOIN한 결과가 정확히 여섯 행이었던 이유다. 조인 방향이 1:N이면 외부 행이 짝의 수만큼 복제된다. 부서에서 직원으로 조인하면 개발 부서의 열 값이 두 번 나온다. N:M이면 양쪽이 서로를 곱한다.</p>
+
+<h4>팬아웃: 1:N을 두 갈래로 조인하면 집계가 부풀어 오른다</h4>
+<p>1:N 복제가 집계와 만나면 조용히 틀린 숫자가 나온다. "부서별 연봉 합계와 비용 합계"를 한 쿼리로 구한다고 하자. 부서 하나에서 직원(1:N)과 비용(1:N) 두 갈래로 조인하는 자연스러워 보이는 쿼리다.</p>
+<pre><code class="language-sql">SELECT d.dept_id, d.name, COUNT(*) AS row_cnt,
+       SUM(e.salary) AS sum_sal, SUM(x.amount) AS sum_exp
+FROM department d
+LEFT JOIN employee e ON e.dept_id = d.dept_id
+LEFT JOIN expense  x ON x.dept_id = d.dept_id
+GROUP BY d.dept_id, d.name
+ORDER BY d.dept_id;</code></pre>
+<pre data-label="실행 결과(틀린 합계)"><code class="language-text">+---------+--------+---------+---------+---------+
+| dept_id | name   | row_cnt | sum_sal | sum_exp |
++---------+--------+---------+---------+---------+
+|      10 | 개발   |       6 |   45000 |    1800 |
+|      20 | 디자인 |       2 |   11500 |     300 |
+|      30 | 영업   |       1 |    5000 |     500 |
+|      40 | 인사   |       1 |    NULL |    NULL |
++---------+--------+---------+---------+---------+</code></pre>
+<p>개발 부서의 실제 연봉 합계는 9,000 + 6,000 = 15,000이고 비용 합계는 300 + 200 + 400 = 900인데, 결과는 45,000과 1,800이다. 행 수를 따라가면 원인이 보인다. 첫 번째 LEFT JOIN 뒤 개발 부서는 직원 수만큼 두 행이 된다. 두 번째 LEFT JOIN은 그 두 행 각각을 개발 부서의 비용 세 건과 짝짓는다. 두 번째 조인의 조건 <code>x.dept_id = d.dept_id</code>는 직원과 비용 사이에 아무 관계도 요구하지 않으므로, 결과는 직원 2 × 비용 3 = 6행의 모든 조합이다. 그 안에서 각 연봉은 3번, 각 비용은 2번 나타난다. 15,000 × 3 = 45,000, 900 × 2 = 1,800이다. 디자인 부서는 직원 2 × 비용 1 = 2행이라 연봉 합계는 우연히 맞고, 비용 150만 두 번 더해져 300이 된다. 영업은 1 × 1이라 맞는다. 데이터에 따라 맞기도 하고 틀리기도 하므로, 작은 테스트 데이터로는 발견되지 않기 쉽다.</p>
+<p>이처럼 한 부모에서 독립된 1:N 관계 둘 이상을 한꺼번에 조인해 행이 곱으로 늘어나는 현상을 팬아웃(fan-out)이라고 부른다. 같은 쿼리에서 <code>COUNT(e.emp_id)</code>와 <code>COUNT(x.expense_id)</code>를 세어 보면 개발 부서에서 둘 다 6이 나온다. 직원도 비용도 6개인 것처럼 보이는 것이다. 처방은 "곱하기 전에 줄인다"다. 각 갈래를 부서 단위로 먼저 집계해 부서당 한 행으로 만든 뒤 조인하면, 두 갈래 모두 N:1 조인이 되어 행이 늘어나지 않는다.</p>
+<pre><code class="language-sql">SELECT d.dept_id, d.name, es.sum_sal, xs.sum_exp
+FROM department d
+LEFT JOIN (SELECT dept_id, SUM(salary) AS sum_sal FROM employee GROUP BY dept_id) es
+       ON es.dept_id = d.dept_id
+LEFT JOIN (SELECT dept_id, SUM(amount) AS sum_exp FROM expense GROUP BY dept_id) xs
+       ON xs.dept_id = d.dept_id
+ORDER BY d.dept_id;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+---------+--------+---------+---------+
+| dept_id | name   | sum_sal | sum_exp |
++---------+--------+---------+---------+
+|      10 | 개발   |   15000 |     900 |
+|      20 | 디자인 |   11500 |     150 |
+|      30 | 영업   |    5000 |     500 |
+|      40 | 인사   |    NULL |    NULL |
++---------+--------+---------+---------+</code></pre>
+<p>FROM 절 안의 SELECT(파생 테이블, derived table)는 03회 서브쿼리에서 자세히 다룬다. 여기서 핵심은 각 파생 테이블이 <code>dept_id</code>로 GROUP BY되어 있어 <code>dept_id</code>가 유일하다는 점, 그래서 두 LEFT JOIN 모두 N:1 방향이 되어 부서 행이 복제되지 않는다는 점이다. 개수만 필요하다면 <code>COUNT(DISTINCT e.emp_id)</code>로 복제를 걷어 낼 수 있지만, 합계에 <code>SUM(DISTINCT ...)</code>를 쓰는 것은 처방이 아니다. 서로 다른 두 직원의 연봉이 우연히 같으면 그 값이 한 번만 더해지기 때문이다. DISTINCT는 "같은 행의 복제"가 아니라 "같은 값"을 없앤다.</p>
+
+<x-visual id="db-basic-02-fanout" title="두 갈래 1:N 조인에서 행이 곱으로 늘어나는 팬아웃" kind="구조도" ratio="16:9">
+<x-hint>개발 부서 한 행이 직원 두 명, 비용 세 건과 동시에 조인되어 2 × 3 = 6행이 되고, 그 안에서 각 연봉이 세 번, 각 비용이 두 번 반복되는 모습을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 평면 구조도. 왼쪽에 "개발" 라벨이 붙은 부서 상자 하나. 위쪽 갈래로 "직원 2명" 라벨과 함께 "한서준 9000", "이도윤 6000" 두 상자, 아래쪽 갈래로 "비용 3건" 라벨과 함께 "300", "200", "400" 세 상자가 나뉘어 있다. 오른쪽에 2행 × 3열의 격자 표가 있고 각 칸에 직원과 비용 조합이 적혀 있으며, 격자 위에 "결과 6행"이라는 라벨. 격자 아래에 "SUM(연봉) = 45000 (실제 15000)", "SUM(비용) = 1800 (실제 900)"이라는 빨간 라벨 두 개. 맨 오른쪽에 초록 체크 표시와 함께 "먼저 집계한 뒤 조인"이라는 라벨.</x-prompt>
+<x-caption>서로 독립된 두 1:N 관계를 한 번에 조인하면 행이 곱으로 늘어나고, 그 위의 SUM은 반복된 횟수만큼 부풀어 오른다. 각 갈래를 먼저 집계해 부모당 한 행으로 만든 뒤 조인하면 문제가 사라진다.</x-caption>
+</x-visual>
+
+<h3>조인의 특징 2: 순서, 괄호, 그리고 조건식의 자유</h3>
+<p>내부 조인만으로 이루어진 식은 순서와 괄호를 자유롭게 바꿀 수 있다. 매뉴얼("Nested Join Optimization")은 내부 조인만 있는 조인 식에서는 괄호를 없애고 왼쪽부터 평가해도 되며, 사실 테이블을 어떤 순서로 평가해도 된다고 적는다. 수학으로 말하면 내부 조인은 교환 법칙과 결합 법칙이 성립한다. 옵티마이저가 테이블 읽기 순서를 마음대로 고를 수 있는 근거가 이것이다.</p>
+<p>외부 조인에서는 둘 다 성립하지 않는다. 교환이 안 된다는 것은 이미 보았다. 부서 LEFT JOIN 직원은 인사를 남기고, 직원 LEFT JOIN 부서는 윤태오를 남긴다. 결합도 일반적으로 안 된다. 매뉴얼은 외부 조인의 내부 테이블 쪽 피연산자(LEFT JOIN의 오른쪽, RIGHT JOIN의 왼쪽)에 있는 괄호는 없앨 수 없다고 적고 예를 든다. <code>t1 LEFT JOIN (t2 LEFT JOIN t3 ON t2.b=t3.b OR t2.b IS NULL) ON t1.a=t2.a</code>와 괄호를 왼쪽으로 옮긴 <code>(t1 LEFT JOIN t2 ON t1.a=t2.a) LEFT JOIN t3 ON t2.b=t3.b OR t2.b IS NULL</code>은 다르다. t1에 (1), (2), t2에 (1, 101), t3에 (101)이 있을 때, t1의 2번 행은 두 식 모두에서 t2와 짝이 없다. 첫 식에서는 괄호 안의 결과와 짝이 없으므로 t2, t3 열이 모두 NULL인 <code>(2, NULL, NULL, NULL)</code>이 된다. 둘째 식에서는 먼저 <code>(2, NULL, NULL)</code>이 만들어지고, 이 행의 <code>t2.b</code>가 NULL이라 <code>t2.b IS NULL</code>이 참이 되어 t3의 101과 짝지어진다. 결과는 <code>(2, NULL, NULL, 101)</code>이다. NULL로 채운 행이 다음 조인의 조건에 들어가는 순간, 괄호의 위치가 의미를 바꾼다.</p>
+
+<h4>LEFT JOIN 뒤에 붙인 내부 조인</h4>
+<p>실무에서 이 성질이 가장 자주 드러나는 형태는 LEFT JOIN 다음에 내부 조인을 이어 붙이는 경우다. 부서별 직원과 그 연봉 등급을 함께 보려고 다음처럼 썼다고 하자.</p>
+<pre><code class="language-sql">SELECT d.name, e.name AS emp_name, g.grade
+FROM department d
+LEFT JOIN employee e     ON e.dept_id = d.dept_id
+JOIN      salary_grade g ON e.salary BETWEEN g.min_sal AND g.max_sal
+ORDER BY d.dept_id, e.emp_id;</code></pre>
+<p>결과는 다섯 행이고 인사 부서가 없다. 조인은 왼쪽부터 묶이므로 이 식은 <code>(d LEFT JOIN e) JOIN g</code>다. 첫 LEFT JOIN이 만든 인사의 NULL 행은 두 번째 조인에서 <code>NULL BETWEEN ...</code>이 UNKNOWN이 되어 짝을 찾지 못하고, 내부 조인이라 버려진다. 내부 테이블의 열을 조건으로 쓰는 내부 조인이 뒤에 오면, 앞의 LEFT JOIN이 지켜 낸 행이 다시 사라진다. 고치는 방법은 두 가지다. 두 번째 조인도 <code>LEFT JOIN</code>으로 바꾸거나, 괄호로 직원과 등급을 먼저 묶은 뒤 그 결과를 부서에 LEFT JOIN하는 것이다(<code>department d LEFT JOIN (employee e JOIN salary_grade g ON ...) ON e.dept_id = d.dept_id</code>). 이 데이터에서는 두 방법 모두 인사의 NULL 행을 포함한 여섯 행을 돌려준다. 두 방법은 등급이 없는 직원이 있을 때 갈린다. 앞의 방법은 그 직원을 등급 NULL로 남기고, 뒤의 방법은 그 직원을 짝에서 빼 버린다.</p>
+
+<h4>조인 조건은 어떤 조건식이든 될 수 있다</h4>
+<p>지금까지의 조인 조건은 대부분 기본 키와 외래 키의 등호였지만, 이것은 습관이지 규칙이 아니다. 매뉴얼은 ON에 쓰는 조건이 WHERE 절에 쓸 수 있는 형태의 어떤 조건식이든 될 수 있다고 적는다. 외래 키 제약이 선언되어 있을 필요도 없다. 등호가 아닌 조건으로 조인하는 것을 비등가 조인(non-equi join)이라고 한다. 연봉을 등급 구간에 대응시키는 쿼리가 전형적인 예다.</p>
+<pre><code class="language-sql">SELECT e.name, e.salary, g.grade
+FROM employee e
+JOIN salary_grade g ON e.salary BETWEEN g.min_sal AND g.max_sal
+ORDER BY e.emp_id;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+--------+--------+-------+
+| name   | salary | grade |
++--------+--------+-------+
+| 한서준 |   9000 | A     |
+| 이도윤 |   6000 | B     |
+| 박지아 |   7000 | B     |
+| 최민재 |   4500 | C     |
+| 정하린 |   5000 | C     |
+| 윤태오 |   4000 | C     |
++--------+--------+-------+</code></pre>
+<p>등급 구간이 서로 겹치지 않고 빈틈없이 이어져 있으므로 직원마다 짝이 정확히 하나다. 구간이 겹치면 한 직원이 두 행이 되고, 빈틈이 있으면 내부 조인에서 사라진다. 비등가 조인에서는 "짝이 정확히 하나"라는 성질을 키 제약이 보장해 주지 않으므로 데이터가 대신 지켜야 한다. 실행 측면에서는 MySQL 8.0.20부터 등가 조건이 없는 조인에도 해시 조인이 쓰일 수 있다. 매뉴얼의 예에서 이런 경우 TREE 출력은 조건 없는 해시 조인 위에 비교 조건을 필터로 얹은 모양이다. 위 등급 쿼리를 MySQL 8.4.13과 8.0.46에서 <code>EXPLAIN FORMAT=TREE</code>로 보면 두 버전 모두 <code>Filter: (e.salary between g.min_sal and g.max_sal)</code> 아래 <code>Inner hash join (no condition)</code>이 있고, 그 아래 <code>Table scan on e</code>와 <code>Hash</code> → <code>Table scan on g</code>가 놓인 바로 그 모양이었다.</p>
+<p>조건식이 자유롭다는 것은 NULL 규칙도 그대로 따른다는 뜻이다. 매뉴얼에 따르면 <code>=</code>로 NULL과 비교하면 항상 NULL이 나온다. 그래서 <code>dept_id</code>가 NULL인 윤태오는 어떤 등호 조인에서도, 심지어 같은 테이블의 자기 자신과도 짝이 되지 않는다. 두 NULL을 같다고 보고 싶다면 MySQL의 NULL-안전 등호 <code><=></code>를 쓴다. 매뉴얼은 이 연산자가 <code>=</code>처럼 비교하되 두 피연산자가 모두 NULL이면 1을, 한쪽만 NULL이면 0을 돌려준다고 설명한다. 다만 NULL은 "값이 없음"이라는 뜻이므로, 부서가 없는 두 직원을 "같은 부서"라고 보는 것이 의도에 맞는지는 매번 따져야 한다.</p>
+
+<h4>USING과 NATURAL JOIN</h4>
+<p>조인 열 이름이 양쪽에서 같다면 <code>ON d.dept_id = e.dept_id</code> 대신 <code>USING (dept_id)</code>라고 쓸 수 있다. 차이는 결과의 열이다. USING으로 조인하면 공통 열이 하나로 합쳐지고, 매뉴얼은 그 하나의 열이 병합(coalesce) 연산으로 정의된다고 적는다. 두 열이 <code>COALESCE(d.dept_id, e.dept_id)</code>로 합쳐지는 것이다. 외부 조인에서는 이 점이 쓸모 있다. LEFT JOIN의 NULL 행에서도 외부 테이블 쪽 값이 살아 있으므로 합쳐진 <code>dept_id</code>가 NULL이 되지 않는다. <code>SELECT *</code>의 열 순서도 정해져 있다. 매뉴얼에 따르면 병합된 공통 열이 첫 번째 테이블에서의 순서대로 먼저 오고, 이어서 첫 번째 테이블에만 있는 열, 그다음 두 번째 테이블에만 있는 열이 온다.</p>
+<p>NATURAL JOIN은 한 걸음 더 나가, 두 테이블에 공통으로 있는 <b>모든</b> 열 이름으로 USING한 것과 같다(매뉴얼의 정의). 편해 보이지만 우리 예제에서 바로 사고가 난다. <code>department NATURAL JOIN employee</code>는 0행이다. 두 테이블에 <code>dept_id</code>뿐 아니라 <code>name</code>이라는 열도 있으므로, 조건이 "부서 번호가 같고 <b>부서 이름과 직원 이름이 같은</b> 짝"이 되기 때문이다. 오늘은 공통 열이 하나뿐인 두 테이블이라도, 나중에 누군가 양쪽에 <code>created_at</code> 같은 열을 추가하면 쿼리 문자열은 그대로인데 조인 조건이 바뀐다. 조인 조건은 ON으로 명시하는 것이 안전하다.</p>
+
+<h3>셀프 조인: 한 테이블에 두 가지 역할을 준다</h3>
+<p>직원 테이블의 <code>manager_id</code>는 같은 테이블의 다른 행을 가리킨다. "각 직원의 상사 이름"을 구하려면 직원 테이블의 한 행(부하)을 같은 테이블의 다른 행(상사)과 짝지어야 한다. 이렇게 테이블을 자기 자신과 조인하는 것을 셀프 조인(self join)이라고 한다. 특별한 문법은 없다. 같은 테이블을 FROM에 두 번 쓰고 서로 다른 별칭을 주면, SQL 입장에서는 이름이 다른 두 테이블의 조인일 뿐이다.</p>
+<pre><code class="language-sql">SELECT e.emp_id, e.name AS employee, m.name AS manager
+FROM employee e                                   -- 부하 역할
+JOIN employee m ON e.manager_id = m.emp_id        -- 상사 역할
+ORDER BY e.emp_id;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+--------+----------+---------+
+| emp_id | employee | manager |
++--------+----------+---------+
+|      2 | 이도윤   | 한서준  |
+|      3 | 박지아   | 한서준  |
+|      4 | 최민재   | 박지아  |
+|      5 | 정하린   | 한서준  |
+|      6 | 윤태오   | 박지아  |
++--------+----------+---------+</code></pre>
+<p>별칭은 선택이 아니라 필수다. <code>FROM employee JOIN employee</code>처럼 같은 이름을 두 번 쓰면 MySQL은 1066번 오류 <code>Not unique table/alias: 'employee'</code>를 낸다(MySQL 8.4.13과 8.0.46에서 <code>ERROR 1066 (42000)</code>으로 확인했다). 열 참조 <code>employee.name</code>이 어느 쪽을 뜻하는지 정할 수 없기 때문이다. 조건의 방향도 의미를 정한다. <code>e.manager_id = m.emp_id</code>는 "e의 상사 번호가 m의 번호와 같다", 즉 m이 e의 상사라는 뜻이다. 이것을 <code>e.emp_id = m.manager_id</code>로 뒤집으면 m이 e의 부하가 되어, 같은 SELECT 목록이 "직원과 그 부하"라는 전혀 다른 표를 만든다. 셀프 조인에서는 별칭 이름을 역할 이름(<code>e</code>와 <code>m</code>, 또는 <code>sub</code>와 <code>boss</code>)으로 지으면 이런 실수가 줄어든다.</p>
+<p>결과에 한서준이 없다. 최상위 관리자라 <code>manager_id</code>가 NULL이고, 내부 조인에서는 짝이 없는 행이 버려지기 때문이다. 앞에서 배운 그대로 LEFT JOIN을 쓰면 된다. <code>FROM employee e LEFT JOIN employee m ON e.manager_id = m.emp_id</code>로 바꾸면 여섯 행이 나오고, 한서준 행의 manager는 NULL이다. 셀프 조인도 조인이므로 외부 조인, 집계, 행 수에 관한 규칙이 모두 그대로 적용된다. 예를 들어 "직원마다 직속 부하가 몇 명인가"는 상사 역할을 보존 쪽에 두고 세면 된다.</p>
+<pre><code class="language-sql">SELECT m.emp_id, m.name, COUNT(e.emp_id) AS reports
+FROM employee m
+LEFT JOIN employee e ON e.manager_id = m.emp_id
+GROUP BY m.emp_id, m.name
+ORDER BY m.emp_id;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+--------+--------+---------+
+| emp_id | name   | reports |
++--------+--------+---------+
+|      1 | 한서준 |       3 |
+|      2 | 이도윤 |       0 |
+|      3 | 박지아 |       2 |
+|      4 | 최민재 |       0 |
+|      5 | 정하린 |       0 |
+|      6 | 윤태오 |       0 |
++--------+--------+---------+</code></pre>
+
+<h4>같은 부서 동료 쌍: 자기 자신과 중복을 걸러 내기</h4>
+<p>"같은 부서에 속한 직원 쌍"을 구할 때 셀프 조인의 행 수 성질이 잘 드러난다. 조건을 <code>a.dept_id = b.dept_id</code> 하나만 두면 결과는 9행이다. 직원이 n명인 부서에서 a와 b가 각각 n명 중 하나를 고르므로 n²개의 짝이 생긴다. 개발 2² + 디자인 2² + 영업 1² = 9다. 그중에는 (한서준, 한서준) 같은 자기 자신과의 짝이 섞여 있다. 윤태오는 <code>NULL = NULL</code>이 참이 아니므로 자기 자신과도 짝이 되지 않는다.</p>
+<p>자기 자신을 빼려고 <code>a.emp_id <> b.emp_id</code>를 더하면 4행이 된다. (한서준, 이도윤)과 (이도윤, 한서준)이 둘 다 남기 때문이다. 순서가 다른 같은 쌍을 하나로 줄이려면 부등호를 한 방향으로 건다. <code>a.emp_id < b.emp_id</code>를 쓰면 쌍마다 번호가 작은 쪽이 a인 한 가지만 남아 (한서준, 이도윤), (박지아, 최민재)의 2행이 된다. 직원이 n명인 부서에서 n(n−1)/2쌍이다. 이 부등호 기법은 "중복 데이터 쌍 찾기", "겹치는 예약 구간 찾기"처럼 한 테이블 안의 행끼리 비교하는 문제에 두루 쓰인다.</p>
+
+<h4>계층의 깊이와 재귀</h4>
+<p>셀프 조인 한 번은 계층을 한 단계 올라간다. "상사의 상사"까지 보려면 같은 테이블을 세 번 쓴다.</p>
+<pre><code class="language-sql">SELECT e.name, m.name AS manager, mm.name AS manager2
+FROM employee e
+LEFT JOIN employee m  ON e.manager_id = m.emp_id
+LEFT JOIN employee mm ON m.manager_id = mm.emp_id
+ORDER BY e.emp_id;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+--------+---------+----------+
+| name   | manager | manager2 |
++--------+---------+----------+
+| 한서준 | NULL    | NULL     |
+| 이도윤 | 한서준  | NULL     |
+| 박지아 | 한서준  | NULL     |
+| 최민재 | 박지아  | 한서준   |
+| 정하린 | 한서준  | NULL     |
+| 윤태오 | 박지아  | 한서준   |
++--------+---------+----------+</code></pre>
+<p>두 번째 LEFT JOIN의 조건 <code>m.manager_id = mm.emp_id</code>는 첫 번째 조인이 만든 NULL 행(한서준의 상사 자리)에서 UNKNOWN이 되어 짝이 없으므로, 다시 NULL로 채워진다. 외부 조인이 사슬처럼 이어질 때 NULL이 그대로 전파되는 모습이다. 이 방식의 한계는 깊이가 쿼리에 고정된다는 점이다. 조직이 몇 단계인지 미리 알 수 없다면 단계마다 조인을 늘리는 방식으로는 답할 수 없다. MySQL 8.0은 자기 이름을 참조하는 공통 테이블 식인 재귀 CTE(<code>WITH RECURSIVE</code>)를 지원하고, 매뉴얼은 바로 이런 직원 계층 예제로 그것을 설명한다. 재귀 CTE도 한 단계마다 "이전 단계 결과 JOIN 직원 테이블"을 반복하는 구조라, 안에서 하는 일은 셀프 조인이다. 재귀 깊이는 <code>cte_max_recursion_depth</code>로 제한되며 기본값은 1000이다.</p>
+<p>엔진 입장에서도 셀프 조인은 그냥 두 테이블의 조인이다. EXPLAIN은 별칭마다 한 행씩 보여 주고, 각 별칭은 자기 접근 방식을 따로 갖는다. 위 상사 조회라면 부하 역할 <code>e</code>를 바깥 루프에서 읽고, 상사 역할 <code>m</code>은 기본 키 <code>emp_id</code>로 찾는 계획(<code>eq_ref</code>)이 가능하다. 직속 부하 수 쿼리는 방향이 반대라 <code>e.manager_id</code>로 찾아야 하는데, 이 열은 외래 키라 InnoDB가 만든 인덱스가 있다. MySQL 8.4.13과 8.0.46에서 EXPLAIN하면 두 버전 모두 상사 조회는 <code>e</code>가 <code>ALL</code>, <code>m</code>이 <code>eq_ref</code>(key <code>PRIMARY</code>)였고, 직속 부하 수 쿼리는 <code>m</code>이 <code>ALL</code>, <code>e</code>가 <code>ref</code>(key <code>manager_id</code>)였다. 같은 테이블이라도 어느 역할로 어느 열을 찾느냐에 따라 필요한 인덱스가 다르다.</p>
+
+<x-visual id="db-basic-02-self-join-roles" title="같은 직원 테이블을 부하 역할과 상사 역할로 두 번 읽는 셀프 조인" kind="구조도" ratio="16:9">
+<x-hint>하나의 직원 테이블이 별칭 e(부하)와 m(상사)으로 두 번 등장하고, e의 manager_id가 m의 emp_id로 이어지는 모습을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 평면 구조도. 같은 모양의 직원 표 두 개를 좌우로 나란히 그린다. 왼쪽 표 위에 "e: 부하 역할", 오른쪽 표 위에 "m: 상사 역할" 라벨. 두 표 모두 emp_id, name, manager_id 세 열과 한서준, 이도윤, 박지아, 최민재, 정하린, 윤태오 여섯 행을 가진다. 왼쪽 표의 manager_id 칸에서 오른쪽 표의 emp_id 칸으로 화살표가 이어진다(이도윤의 1에서 한서준으로, 최민재의 3에서 박지아로 등). 왼쪽 표의 한서준 행 manager_id 칸은 "NULL"로 표시되고 화살표가 없으며, 옆에 "LEFT JOIN이어야 남는다"라는 라벨. 두 표 아래 가운데에 "실제로는 같은 테이블 employee"라는 라벨과 두 표를 묶는 중괄호.</x-prompt>
+<x-caption>셀프 조인은 한 테이블에 별칭으로 두 역할을 주는 것이다. 조건 e.manager_id = m.emp_id가 "m이 e의 상사"라는 관계를 만들고, 상사가 없는 최상위 직원을 남기려면 LEFT JOIN이 필요하다.</x-caption>
+</x-visual>
+
+<h3>CROSS JOIN: 조건 없이 모든 조합을 만든다</h3>
+<p>CROSS JOIN은 조인 조건 없이 왼쪽 테이블의 모든 행을 오른쪽 테이블의 모든 행과 짝짓는다. 결과는 두 테이블의 카티션 곱(Cartesian product)이고, 행 수는 언제나 |A| × |B|다. <code>department CROSS JOIN employee</code>는 4 × 6 = 24행이다. 조건이 없으니 NULL 규칙도, 짝이 없는 행도 없다. 한쪽 테이블이 비어 있으면 결과도 0행이다.</p>
+<p>MySQL에서는 쓰는 방법이 여러 가지다. 매뉴얼에 따르면 MySQL에서 <code>JOIN</code>, <code>CROSS JOIN</code>, <code>INNER JOIN</code>은 구문상 같은 것이라 서로 바꿔 쓸 수 있다. 표준 SQL에서는 그렇지 않아서, INNER JOIN은 ON 절과 함께 쓰고 CROSS JOIN은 그 밖의 경우에 쓴다. 또 조인 조건이 없을 때 INNER JOIN과 쉼표(<code>,</code>)는 의미상 같아서 둘 다 카티션 곱을 만든다. 정리하면 MySQL에서는 다음 세 문장이 모두 24행을 돌려준다.</p>
+<pre><code class="language-sql">SELECT COUNT(*) FROM department CROSS JOIN employee;   -- 24
+SELECT COUNT(*) FROM department JOIN employee;         -- 24: MySQL에서는 ON 없는 JOIN도 허용된다
+SELECT COUNT(*) FROM department, employee;             -- 24</code></pre>
+<p>두 번째 줄이 함정이다. ON을 깜빡 빠뜨린 내부 조인이 MySQL에서는 문법 오류가 아니라 카티션 곱으로 실행된다. 반면 LEFT JOIN과 RIGHT JOIN은 문법상 ON이나 USING이 반드시 있어야 하므로 빠뜨리면 구문 오류가 난다. MySQL 8.4.13과 8.0.46에서 <code>SELECT COUNT(*) FROM department LEFT JOIN employee;</code>는 두 버전 모두 <code>ERROR 1064 (42000)</code>(<code>You have an error in your SQL syntax; ... near '' at line 1</code>)를 냈다. 곱의 크기는 금방 커진다. 1,000행짜리 테이블 셋을 조건 없이 조인하면 10억 행이다. 조건 없는 조인이 의도한 것이라면 <code>CROSS JOIN</code>이라고 명시해, 읽는 사람이 실수와 의도를 구별할 수 있게 한다.</p>
+<p>실행 측면에서 카티션 곱은 조인 조건이 없으므로 인덱스로 짝을 좁힐 방법이 없다. 매뉴얼은 조인 조건이 없는 카티션 곱에도 해시 조인이 쓰인다고 적고(8.0.18 릴리스 노트부터 명시되어 있다), 그 TREE 출력 예에서 조건 없는 <code>Inner hash join</code> 노드를 보여 준다. <code>department CROSS JOIN employee</code>를 MySQL 8.4.13과 8.0.46에서 <code>EXPLAIN FORMAT=TREE</code>로 보면 두 버전 모두 <code>Inner hash join (no condition)</code> 아래 <code>Table scan on employee</code>와 <code>Hash</code> → <code>Table scan on department</code>가 나오고, 추정 행 수는 <code>rows=24</code>다. 어떤 알고리즘을 쓰든 결과 행 자체가 |A| × |B|개이므로 출력 비용을 줄일 수는 없다.</p>
+<p>CROSS JOIN이 쓸모 있는 곳은 "모든 조합"이 실제로 필요한 경우다. 사이즈 목록과 색상 목록으로 상품 옵션 조합을 만들거나, 날짜 목록과 매장 목록으로 "매장별 일별" 리포트의 빈 격자를 만드는 일이 그렇다. 격자를 먼저 만들고 실제 데이터를 LEFT JOIN으로 붙이면, 데이터가 없는 칸도 0으로 채워진 리포트가 나온다. 다음 절의 종합 실습이 바로 이 형태다.</p>
+
+<h3>조인 종합 실습: 빈칸 없는 분기별 비용 리포트</h3>
+<p>요구 사항은 이렇다. "모든 부서에 대해 1분기와 2분기의 비용 합계를 보여 달라. 비용이 없는 칸은 0으로 표시한다." 부서 4개 × 분기 2개이므로 정답은 정확히 8행이어야 한다. 이 행 수를 먼저 정해 두는 것이 조인 쿼리를 짜는 좋은 습관이다.</p>
+<p>먼저 떠오르는 쿼리는 부서에 비용을 LEFT JOIN하고 부서와 분기로 묶는 것이다.</p>
+<pre><code class="language-sql">SELECT d.name, x.q, SUM(x.amount) AS total
+FROM department d
+LEFT JOIN expense x ON x.dept_id = d.dept_id
+GROUP BY d.dept_id, d.name, x.q
+ORDER BY d.dept_id, x.q;</code></pre>
+<pre data-label="실행 결과(5행: 빈칸이 빠졌다)"><code class="language-text">+--------+------+-------+
+| name   | q    | total |
++--------+------+-------+
+| 개발   |    1 |   500 |
+| 개발   |    2 |   400 |
+| 디자인 |    2 |   150 |
+| 영업   |    1 |   500 |
+| 인사   | NULL |  NULL |
++--------+------+-------+</code></pre>
+<p>다섯 행뿐이다. LEFT JOIN은 부서를 보존할 뿐, "부서 × 분기" 조합을 보존하지는 않는다. 디자인의 1분기, 영업의 2분기처럼 비용 기록이 없는 조합은 애초에 어떤 행으로도 존재하지 않으므로 GROUP BY가 그룹을 만들 수 없다. 인사는 NULL 행 하나로 남았지만 분기 값이 NULL이다. 보존하고 싶은 것이 "부서 × 분기"라면, 그 조합을 담은 행 집합을 먼저 만들어 외부 테이블로 삼아야 한다. CROSS JOIN이 그 일을 한다.</p>
+<pre><code class="language-sql">SELECT d.name, q.q, COALESCE(SUM(x.amount), 0) AS total
+FROM department d
+CROSS JOIN report_quarter q                                   -- 1) 4 × 2 = 8행의 격자
+LEFT JOIN expense x ON x.dept_id = d.dept_id AND x.q = q.q    -- 2) 칸마다 비용을 붙인다
+GROUP BY d.dept_id, d.name, q.q                               -- 3) 칸 단위로 합친다
+ORDER BY d.dept_id, q.q;</code></pre>
+<pre data-label="실행 결과"><code class="language-text">+--------+---+-------+
+| name   | q | total |
++--------+---+-------+
+| 개발   | 1 |   500 |
+| 개발   | 2 |   400 |
+| 디자인 | 1 |     0 |
+| 디자인 | 2 |   150 |
+| 영업   | 1 |   500 |
+| 영업   | 2 |     0 |
+| 인사   | 1 |     0 |
+| 인사   | 2 |     0 |
++--------+---+-------+</code></pre>
+<p>단계별로 따라가 보자. (1) <code>department CROSS JOIN report_quarter</code>가 (개발,1), (개발,2), …, (인사,2)의 8행을 만든다. 이것이 보존할 격자다. (2) 이 8행이 LEFT JOIN의 외부 테이블이 된다. 조인은 왼쪽부터 묶이므로 식은 <code>(d CROSS JOIN q) LEFT JOIN x</code>이고, ON 조건은 d와 q의 열을 모두 참조할 수 있다. (개발,1)은 1분기 개발 비용 두 건(300, 200)과 짝지어져 두 행이 되고, (디자인,1)처럼 짝이 없는 칸은 NULL로 채운 행 하나가 된다. (3) GROUP BY가 칸마다 한 행으로 합친다. (개발,1)은 500이 되고, NULL 행만 있는 칸은 <code>SUM</code>이 NULL을 돌려주므로 <code>COALESCE</code>가 0으로 바꾼다. 8행이 나왔으니 처음에 정한 행 수와 맞다.</p>
+<p>이 쿼리에는 이 회차의 내용이 거의 다 들어 있다. 분기 조건 <code>x.q = q.q</code>는 반드시 ON에 있어야 한다. WHERE로 옮기면 짝 없는 칸의 NULL 행이 <code>NULL = 1</code>로 UNKNOWN이 되어 걸러지고, 리포트에서 0인 칸이 다시 사라진다. 집계 열은 <code>COUNT(*)</code>가 아니라 내부 테이블의 값으로 계산해야 하고, 그룹 기준은 보존되는 쪽(d, q)의 열이어야 한다. 그리고 비용 테이블만 붙였으므로 팬아웃은 없다. 만약 여기에 직원 테이블까지 부서 기준으로 조인하면 앞에서 본 곱셈이 다시 일어난다.</p>
+
+<h4>쉼표 조인과 우선순위</h4>
+<p>같은 쿼리를 CROSS JOIN 대신 쉼표로 쓰면 MySQL에서는 실행조차 되지 않는다.</p>
+<pre><code class="language-sql">SELECT d.name, q.q, COALESCE(SUM(x.amount), 0) AS total
+FROM department d, report_quarter q
+LEFT JOIN expense x ON x.dept_id = d.dept_id AND x.q = q.q
+GROUP BY d.dept_id, d.name, q.q;
+-- MySQL 8.4.13, 8.0.46에서 실행한 결과
+-- ERROR 1054 (42S22): Unknown column 'd.dept_id' in 'on clause'</code></pre>
+<p>매뉴얼은 쉼표 연산자의 우선순위가 INNER JOIN, CROSS JOIN, LEFT JOIN 등보다 낮다고 적고, 쉼표 조인과 다른 조인을 섞으면 <code>Unknown column 'col_name' in 'on clause'</code> 형태의 오류가 날 수 있다고 경고한다. 위 FROM 절은 <code>department d, (report_quarter q LEFT JOIN expense x ON ...)</code>로 묶인다. ON 절의 피연산자는 q와 x뿐이므로, 그 안에서 d의 열을 참조할 수 없다. 고치는 방법은 쉼표를 <code>CROSS JOIN</code>으로 바꾸거나, 괄호로 <code>(department d, report_quarter q)</code>를 먼저 묶는 것이다. 쉼표 조인은 조인 조건이 WHERE로 흩어져 의도를 읽기 어렵다는 문제도 있으므로, 조인은 처음부터 명시적 JOIN 문법으로 쓰는 편이 낫다.</p>
+
+<h3>흔한 오해와 함정</h3>
+<h4>"LEFT JOIN 결과는 왼쪽 테이블 행 수와 같다"</h4>
+<p>LEFT JOIN이 보장하는 것은 하한이다. 왼쪽 행이 적어도 한 번씩 나온다는 것뿐이다. 행 수가 왼쪽 테이블과 같아지는 것은 오른쪽 조인 열이 유일할 때, 즉 N:1 방향으로 조인할 때뿐이다. 1:N 방향이면 행이 늘어나고, 그 위의 집계는 팬아웃으로 부풀 수 있다. 조인을 추가할 때마다 "이 조인은 행을 늘리는가"를 키 관계로 확인하는 습관이 필요하다.</p>
+<h4>"ON과 WHERE는 같은 일을 한다"</h4>
+<p>내부 조인에서만 그렇다. 외부 조인에서 ON은 짝의 자격을, WHERE는 결과 행의 자격을 정한다. 내부 테이블에 대한 조건을 WHERE에 두면 외부 조인이 사실상 내부 조인이 되고, 외부 테이블에 대한 조건을 ON에 두면 외부 행이 걸러지지 않는다. MySQL이 WHERE의 null-rejected 조건을 보고 외부 조인을 내부 조인으로 바꾸는 것은 결과가 같다는 것을 증명할 수 있을 때뿐이며, 의도를 고쳐 주는 기능이 아니다.</p>
+<h4>"IS NULL이면 짝이 없었던 것이다"</h4>
+<p>검사한 열이 원래 NULL을 허용한다면 아니다. 안티 조인에서는 내부 테이블의 기본 키나 NOT NULL 열, 또는 ON에서 등호로 비교한 조인 열을 검사해야 한다. 그래야 "NULL로 채워진 값"과 "원래 NULL인 값"이 섞이지 않고, EXPLAIN의 <code>Not exists</code> 최적화의 전제도 성립한다.</p>
+<h4>"RIGHT JOIN은 LEFT JOIN과 다르게 실행된다"</h4>
+<p>MySQL은 파서 단계에서 RIGHT JOIN을 LEFT JOIN으로 바꾼다. 실행 알고리즘은 같다. 차이는 읽는 사람에게만 있으므로, 보존할 테이블을 FROM 맨 앞에 두고 LEFT JOIN으로 통일하는 편이 읽기 쉽다.</p>
+<h4>"FULL JOIN이라고 쓰면 양쪽이 다 나온다"</h4>
+<p>MySQL의 조인 문법에는 FULL OUTER JOIN이 없고, <code>FULL</code>은 예약어가 아니어서 테이블 별칭으로 해석될 수 있다. 양쪽을 보존해야 한다면 LEFT JOIN 결과에 짝 없는 오른쪽 행만 <code>UNION ALL</code>로 더한다.</p>
+<h4>"ON을 빠뜨리면 오류가 나니 안전하다"</h4>
+<p>MySQL에서 JOIN, INNER JOIN, CROSS JOIN은 구문상 같으므로, ON 없는 JOIN은 오류가 아니라 카티션 곱이다. 외부 조인만 ON이나 USING이 필수다. 테스트 데이터가 작으면 곱해진 결과도 작아서 눈에 띄지 않는다는 점이 이 함정을 더 위험하게 만든다.</p>
+
+<h3>이 회차의 내용이 다시 쓰이는 곳</h3>
+<p>03회 서브쿼리에서는 안티 조인을 <code>NOT EXISTS</code>와 <code>NOT IN</code>으로 다시 쓰고, 특히 <code>NOT IN</code>이 NULL과 만날 때 결과가 어떻게 달라지는지 본다. 이 회차에서 본 3값 논리와 "참인 것만 통과한다"는 규칙이 그대로 쓰인다. 팬아웃을 고칠 때 쓴 파생 테이블도 거기서 자세히 다룬다. 04회에서는 FULL OUTER JOIN 흉내에서 쓴 UNION과 UNION ALL의 차이, 중복 제거의 비용을 다룬다.</p>
+<p>05·06회 인덱스에서는 중첩 루프 안쪽 루프의 "조인 열로 찾기"가 B+Tree에서 실제로 어떤 탐색이 되는지, 왜 <code>eq_ref</code>와 <code>ref</code>가 <code>ALL</code>보다 싼지를 구조 수준에서 보게 된다. 외래 키 열에 인덱스가 있어야 하는 이유도 이 회차의 셀프 조인과 LEFT JOIN 예제에서 이미 드러났다. 07회 데이터 무결성에서는 <code>employee.dept_id</code>를 NULL 허용으로 둘지 NOT NULL로 둘지 같은 결정을 다루는데, 그 결정은 곧 "이 관계를 읽을 때 외부 조인이 필요한가"를 정하는 결정이기도 하다.</p>
+<p>로드맵의 뒤쪽, JPA 같은 ORM을 다룰 때도 이 회차의 내용은 그대로 돌아온다. 엔티티의 연관 관계를 함께 읽는 쿼리는 결국 조인 SQL로 바뀌고, 선택적인 연관을 읽으려면 외부 조인이 필요하다. 컬렉션 연관을 조인으로 함께 읽을 때 부모 행이 자식 수만큼 반복되는 현상은 이 회차에서 본 1:N 조인의 행 증가와 같은 원리이며, 두 컬렉션을 한꺼번에 조인하면 팬아웃이 생긴다. ORM이 만든 SQL의 결과 행 수를 키 관계로 예측할 수 있다면, 그런 문제를 로그에서 바로 알아볼 수 있다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>외부 조인(LEFT/RIGHT JOIN)</dt><dd>한쪽 테이블(외부 테이블)의 행을 모두 보존하는 조인. 짝이 없는 외부 행은 내부 테이블의 열을 모두 NULL로 채운 행으로 결과에 남는다. MySQL은 RIGHT JOIN을 파서 단계에서 LEFT JOIN으로 바꾼다.</dd>
+<dt>결과 행 수</dt><dd>LEFT JOIN의 결과는 외부 테이블 행 수 이상이고, 내부 테이블의 조인 열이 유일하면(N:1) 정확히 같다. 1:N 방향이면 외부 행이 짝의 수만큼 반복된다.</dd>
+<dt>ON과 WHERE</dt><dd>외부 조인에서 ON은 짝으로 인정할 자격을, WHERE는 NULL 채우기까지 끝난 결과 행의 자격을 정한다. 내부 테이블 조건을 WHERE에 두면 사실상 내부 조인이 된다.</dd>
+<dt>외부 조인 단순화</dt><dd>WHERE 조건이 NULL로 채운 행에서 항상 FALSE나 UNKNOWN이면(null-rejected) MySQL은 외부 조인을 내부 조인으로 바꾸고, 그 덕에 테이블 읽기 순서의 선택지가 넓어진다.</dd>
+<dt>안티 조인과 NULL 집계</dt><dd>LEFT JOIN 뒤 내부 테이블의 NOT NULL 열에 IS NULL을 걸면 짝 없는 행만 남는다. 외부 조인 뒤의 개수는 COUNT(*)가 아니라 COUNT(내부 테이블 열)로 세고, 빈 SUM은 COALESCE로 0으로 바꾼다.</dd>
+<dt>외부 조인의 실행</dt><dd>중첩 루프는 외부 행마다 일치 플래그를 두고, 안쪽 루프가 끝난 뒤 플래그가 꺼져 있으면 NULL 행을 만든다. 그래서 외부 테이블이 먼저 읽혀야 한다. 8.0.20부터는 인덱스가 없을 때 외부 조인에도 해시 조인을 쓴다.</dd>
+<dt>팬아웃</dt><dd>한 부모에서 독립된 1:N 관계 둘을 함께 조인하면 행이 곱으로 늘어 SUM이 부풀어 오른다. 각 갈래를 먼저 집계해 부모당 한 행으로 만든 뒤 조인한다.</dd>
+<dt>셀프 조인</dt><dd>한 테이블을 별칭 둘로 두 번 읽어 서로 다른 역할을 주는 조인. 조건의 방향이 관계의 의미를 정하고, 쌍을 셀 때는 부등호로 자기 자신과 순서만 다른 중복을 걸러 낸다.</dd>
+<dt>CROSS JOIN</dt><dd>조건 없이 모든 조합(카티션 곱, |A| × |B|행)을 만드는 조인. MySQL에서는 ON 없는 JOIN과 쉼표도 같은 결과를 내며, 쉼표는 다른 JOIN보다 우선순위가 낮다. 빈칸 없는 리포트의 격자를 만들 때 쓴다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 조인 쿼리를 검토할 때 가장 먼저 할 일은 결과 행 수를 키 관계로 예측하는 것이다. "부서별 리포트"라면 결과는 부서 수만큼, "부서 × 분기 리포트"라면 그 곱만큼이어야 한다. N:1 방향 LEFT JOIN만으로 이루어진 쿼리라면 결과 행 수가 기준 테이블 행 수와 같아야 하므로, 이것을 테스트의 단언문으로 넣어 두면 누군가 1:N 조인을 끼워 넣는 순간 바로 드러난다. 합계가 이상하게 크다는 장애 보고를 받았다면 먼저 GROUP BY를 빼고 그룹당 행 수를 세어 보는 것이 가장 빠른 진단이다. 팬아웃은 거의 항상 거기서 보인다.</p>
+<p>외부 조인을 쓸지 내부 조인을 쓸지는 성능이 아니라 의미로 정한다. 다만 결정에 따르는 비용은 알아야 한다. 외부 조인은 옵티마이저가 고를 수 있는 테이블 순서를 줄이고, 내부 테이블의 조인 열에 인덱스가 없으면 해시 조인이 쓰인다. EXPLAIN의 Extra에 <code>Using join buffer (hash join)</code>이 보인다면 조인 열에 쓸 수 있는 인덱스가 없다는 뜻이므로, 그 조인이 자주 실행되는 쿼리라면 인덱스를 검토할 신호다. 반대로 LEFT JOIN과 내부 테이블에 대한 WHERE 조건이 함께 있다면, 의도가 내부 조인이었는지 확인하고 그렇다면 JOIN으로 고쳐 쓰는 것이 읽는 사람과 옵티마이저 모두에게 정직하다.</p>
+<p>판단이 달라지는 지점은 데이터 모델이다. <code>employee.dept_id</code>가 NOT NULL이고 모든 직원이 반드시 부서를 가진다면 직원 쪽에서 부서로의 조인은 내부 조인으로 충분하다. 반대로 NULL을 허용하는 외래 키, 자식이 없을 수 있는 1:N 관계, 계층의 최상위처럼 짝이 없을 수 있는 자리가 있다면 그 관계를 읽는 모든 쿼리가 외부 조인을 고민해야 한다. 스키마를 설계할 때 "이 열에 NULL을 허용하면 이 관계를 읽는 쿼리는 어떤 조인이 되는가"를 함께 묻는 습관이, 나중에 조용히 사라지는 행을 미리 막는다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 쿼리의 결과 행 수와, <code>dept_name</code>이 NULL이 아닌 행을 모두 예측하라. 그리고 조건 <code>d.name = '디자인'</code>을 WHERE로 옮기면 결과가 어떻게 바뀌는지 설명하라.<br><code>SELECT e.emp_id, e.name, d.dept_id, d.name AS dept_name FROM employee e LEFT JOIN department d ON e.dept_id = d.dept_id AND d.name = '디자인' ORDER BY e.emp_id;</code></li>
+<li>"부서마다 연봉 6,000 이상인 직원 수를 0명인 부서까지 포함해 보여 달라"는 요청에 누군가 <code>SELECT d.name, COUNT(e.emp_id) FROM department d LEFT JOIN employee e ON e.dept_id = d.dept_id WHERE e.salary >= 6000 GROUP BY d.dept_id, d.name;</code>을 썼다. 실제 결과를 예측하고, 요구 사항에 맞게 고친 쿼리와 그 결과를 적어라.</li>
+<li>본문의 팬아웃 쿼리(부서 LEFT JOIN 직원 LEFT JOIN 비용)에서 SELECT 목록을 <code>COUNT(e.emp_id), COUNT(x.expense_id), COUNT(DISTINCT e.emp_id), COUNT(DISTINCT x.expense_id)</code>로 바꾸었다. 개발 부서와 인사 부서 행의 네 값을 각각 예측하라.</li>
+<li><code>FROM department d, report_quarter q LEFT JOIN expense x ON x.dept_id = d.dept_id AND x.q = q.q</code>가 MySQL에서 오류를 내는 이유를 FROM 절이 묶이는 모양으로 설명하고, 결과를 바꾸지 않는 고치는 방법 두 가지를 적어라.</li>
+<li>"자기 상사와 다른 부서에 속한 직원"을 구하려고 <code>SELECT e.name, m.name FROM employee e JOIN employee m ON e.manager_id = m.emp_id WHERE e.dept_id <> m.dept_id;</code>를 썼다. 결과를 예측하고, 부서가 없는 직원도 "상사와 다른 부서"로 보고 싶다면 조건을 어떻게 고쳐야 하는지 적어라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 결과는 6행이다. 보존되는 쪽은 직원 테이블이므로 직원 여섯 명이 모두 나온다. ON 조건은 "부서 번호가 같고 그 부서 이름이 디자인인 부서"만 짝으로 인정하므로, 디자인 부서 소속인 박지아(3)와 최민재(4)만 <code>(20, 디자인)</code>과 짝지어진다. 한서준, 이도윤, 정하린은 자기 부서가 있지만 이름 조건 때문에 짝이 없어 부서 열이 NULL이고, 윤태오는 원래 부서가 없어 NULL이다. 조건을 WHERE로 옮기면 NULL 행의 <code>d.name = '디자인'</code>이 UNKNOWN이 되어 걸러지므로 박지아와 최민재 두 행만 남는다. 이 WHERE 조건은 null-rejected이므로 MySQL은 이 외부 조인을 내부 조인으로 바꿔 실행할 수 있다.</p>
+<p><b>2번.</b> 실제 결과는 개발 2, 디자인 1의 두 행뿐이다. WHERE의 <code>e.salary >= 6000</code>이 영업(정하린 5,000)의 행을 거짓으로, 인사의 NULL 행을 UNKNOWN으로 걸러 내기 때문이다. 연봉 조건을 ON으로 옮기면 된다. <code>... LEFT JOIN employee e ON e.dept_id = d.dept_id AND e.salary >= 6000 GROUP BY d.dept_id, d.name</code>의 결과는 개발 2, 디자인 1, 영업 0, 인사 0의 네 행이다. 영업은 짝이 하나도 없어 NULL 행 하나가 되고, <code>COUNT(e.emp_id)</code>가 NULL을 세지 않으므로 0이 된다. 여기서 <code>COUNT(*)</code>를 썼다면 영업과 인사가 1로 잘못 나온다.</p>
+<p><b>3번.</b> 개발 부서는 직원 2 × 비용 3 = 6행이고, 여섯 행 모두 <code>e.emp_id</code>와 <code>x.expense_id</code>가 NULL이 아니므로 <code>COUNT(e.emp_id)</code> = 6, <code>COUNT(x.expense_id)</code> = 6이다. 직원도 비용도 6개처럼 보이는 것이 팬아웃의 증상이다. DISTINCT를 붙이면 복제가 걷혀 각각 2와 3이 된다. 인사 부서는 NULL 행 하나뿐이므로 네 값이 모두 0이다. 개수는 DISTINCT로 바로잡을 수 있지만, 본문에서 본 것처럼 합계는 SUM(DISTINCT)로 바로잡을 수 없고 먼저 집계한 뒤 조인해야 한다.</p>
+<p><b>4번.</b> 쉼표 연산자는 LEFT JOIN보다 우선순위가 낮아서 FROM 절이 <code>department d, (report_quarter q LEFT JOIN expense x ON ...)</code>로 묶인다. ON 절은 자기 피연산자인 q와 x의 열만 볼 수 있으므로 <code>d.dept_id</code>를 찾지 못하고 <code>Unknown column 'd.dept_id' in 'on clause'</code> 오류(1054)를 낸다. 고치는 방법은 쉼표를 <code>CROSS JOIN</code>으로 바꾸는 것(<code>department d CROSS JOIN report_quarter q LEFT JOIN expense x ON ...</code>)과, 괄호로 <code>(department d, report_quarter q) LEFT JOIN expense x ON ...</code>처럼 앞의 두 테이블을 먼저 묶는 것이다. 두 경우 모두 LEFT JOIN의 왼쪽 피연산자가 d와 q의 카티션 곱이 되어 본문의 8행 결과와 같다.</p>
+<p><b>5번.</b> 셀프 조인으로 각 직원과 상사를 짝지은 뒤 부서를 비교한다. 이도윤(10)–한서준(10), 최민재(20)–박지아(20)는 같은 부서라 걸러지고, 박지아(20)–한서준(10), 정하린(30)–한서준(10)은 다른 부서라 남는다. 윤태오(NULL)–박지아(20)는 <code>NULL <> 20</code>이 UNKNOWN이라 걸러진다. 결과는 박지아와 정하린 두 행이다. 부서 없는 직원도 포함하려면 NULL-안전 비교를 부정해 <code>WHERE NOT (e.dept_id <=> m.dept_id)</code>로 쓴다. <code><=></code>는 한쪽만 NULL이면 0을 돌려주므로 NOT을 붙이면 참이 되어 윤태오가 포함되고, 양쪽이 같은 값이면 1이 되어 여전히 걸러진다. 결과는 박지아, 정하린, 윤태오의 세 행이다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>본문의 데이터에서 다음 중 인사 부서(직원 없음)가 결과에 나타나는 쿼리는?</q>
+<o><code>FROM department d LEFT JOIN employee e ON d.dept_id = e.dept_id WHERE e.salary > 0</code></o>
+<o><code>FROM department d LEFT JOIN employee e ON d.dept_id = e.dept_id AND e.salary > 0</code></o>
+<o><code>FROM department d JOIN employee e ON d.dept_id = e.dept_id AND e.salary > 0</code></o>
+<o><code>FROM employee e LEFT JOIN department d ON e.dept_id = d.dept_id</code></o>
+<why>LEFT JOIN은 외부 테이블 행을 보존하고, ON의 조건은 짝 후보만 줄이므로 인사는 NULL 행으로 남는다(보기 1). 보기 0은 WHERE의 <code>e.salary > 0</code>이 NULL 행에서 UNKNOWN이라 인사를 걸러 낸다(null-rejected). 보기 2는 내부 조인이라 짝 없는 인사가 처음부터 빠진다. 보기 3은 직원 테이블을 보존하므로 짝 없는 직원(윤태오)은 남지만, 직원이 없는 부서는 나타날 길이 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>department d LEFT JOIN employee e ON d.dept_id = e.dept_id</code>를 부서별로 GROUP BY했을 때, 인사 부서 그룹에서 <code>COUNT(*)</code>와 <code>COUNT(e.emp_id)</code>의 값은?</q>
+<o>0과 0</o>
+<o>1과 1</o>
+<o>1과 0</o>
+<o>0과 NULL</o>
+<why>인사 그룹에는 직원 열이 모두 NULL인 행이 하나 있다. <code>COUNT(*)</code>는 NULL 여부와 상관없이 행 수를 세므로 1이고, <code>COUNT(e.emp_id)</code>는 NULL이 아닌 값만 세므로 0이다. COUNT는 일치하는 행이 없어도 NULL이 아니라 0을 돌려준다. "부서별 직원 수"를 구할 때 <code>COUNT(*)</code>를 쓰면 직원이 없는 부서가 1명으로 잘못 나오는 이유가 이것이다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>MySQL 옵티마이저가 <code>A LEFT JOIN B</code>에 대해 A를 B보다 먼저 읽는 계획만 고려하는 근본적인 이유로 가장 알맞은 것은?</q>
+<o>A가 FROM 절에서 먼저 쓰였기 때문에 SQL 표준이 그 순서대로 읽도록 정하고 있어서</o>
+<o>B의 조인 열에는 항상 인덱스가 있고 A에는 없어서</o>
+<o>LEFT JOIN은 해시 조인으로만 실행할 수 있어서</o>
+<o>A의 행에 짝이 없다는 사실은 그 행에 대해 B의 후보를 다 살핀 뒤에야 알 수 있어, 중첩 루프에서 A가 바깥 루프에 있어야 NULL 행을 만들 수 있어서</o>
+<why>중첩 루프는 외부 행마다 일치 플래그를 두고 안쪽 루프가 끝난 뒤 플래그로 NULL 행을 만들지 판정한다. 이 판정이 가능하려면 보존되는 A가 바깥 루프여야 한다(보기 3). 내부 조인은 FROM 절 순서와 상관없이 어떤 순서로든 읽을 수 있으므로 보기 0은 틀리다. 인덱스 유무는 접근 방식을 정할 뿐 순서 제약의 이유가 아니며(보기 1), LEFT JOIN은 인덱스가 있으면 중첩 루프로도 실행된다(보기 2).</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>직원이 4명이고 <code>dept_id</code>가 모두 같은 부서가 있다. 이 부서에 대해 <code>employee a JOIN employee b ON a.dept_id = b.dept_id AND a.emp_id < b.emp_id</code>가 만드는 행 수는?</q>
+<o>6</o>
+<o>12</o>
+<o>16</o>
+<o>4</o>
+<why>조건이 <code>a.dept_id = b.dept_id</code>뿐이면 4 × 4 = 16행(자기 자신과의 짝 포함)이다. <code><></code>로 자기 자신을 빼면 16 − 4 = 12행(순서만 다른 쌍이 두 번씩)이고, <code><</code>로 한 방향만 남기면 4 × 3 / 2 = 6행이다. n명이면 n(n−1)/2쌍이다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>MySQL에서 FULL OUTER JOIN을 흉내 내는 방법으로, SELECT 목록에 키가 없어 값이 같은 행이 정당하게 여러 번 나올 수 있는 경우에도 정확한 것은?</q>
+<o><code>A LEFT JOIN B</code> 결과 <code>UNION</code> <code>A RIGHT JOIN B</code> 결과</o>
+<o><code>A LEFT JOIN B</code> 결과 <code>UNION ALL</code> <code>A RIGHT JOIN B</code> 결과</o>
+<o><code>A LEFT JOIN B</code> 결과 <code>UNION ALL</code> (<code>A RIGHT JOIN B</code> 결과 중 A의 키가 NULL인 행)</o>
+<o><code>A FULL JOIN B</code>를 그대로 쓴다</o>
+<why>보기 2는 겹치지 않는 두 부분(LEFT JOIN 전체, 짝 없는 B의 행)을 더하므로 중복 제거가 필요 없고 정의와 정확히 일치한다. 보기 0은 겹치는 짝 있는 행을 UNION의 중복 제거로 없애는데, 그 과정에서 정당하게 반복되어야 할 같은 값의 행까지 하나로 합친다. 보기 1은 짝 있는 행이 두 번씩 나온다. 보기 3은 MySQL 문법에 FULL OUTER JOIN이 없고, 예약어가 아닌 FULL이 별칭으로 해석되어 내부 조인이 될 수 있다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>외부 조인(outer join)</dt><dd>짝이 없는 행도 버리지 않고 결과에 남기는 조인. 보존하는 쪽에 따라 LEFT, RIGHT, FULL로 나뉘며, MySQL은 LEFT와 RIGHT만 지원한다.</dd>
+<dt>NULL로 보완된 행(NULL-complemented row)</dt><dd>외부 조인에서 짝을 찾지 못한 외부 행에 내부 테이블의 열을 모두 NULL로 붙여 만든 결과 행.</dd>
+<dt>외부 테이블과 내부 테이블(outer table, inner table)</dt><dd>외부 조인에서 행이 보존되는 쪽과, 짝을 대 주며 NULL로 채워질 수 있는 쪽. <code>A LEFT JOIN B</code>에서 A가 외부, B가 내부 테이블이다.</dd>
+<dt>null-rejected 조건</dt><dd>외부 조인이 만든 NULL로 보완된 행에 대해 항상 FALSE나 UNKNOWN이 되는 조건. WHERE에 이런 조건이 있으면 MySQL은 그 외부 조인을 내부 조인으로 바꾼다.</dd>
+<dt>안티 조인(anti-join)</dt><dd>한 테이블에서 다른 테이블에 짝이 없는 행만 골라내는 연산. LEFT JOIN 뒤 내부 테이블의 NOT NULL 열에 IS NULL을 걸거나 NOT EXISTS로 표현한다.</dd>
+<dt>셀프 조인(self join)</dt><dd>한 테이블을 서로 다른 별칭으로 두 번 이상 참조해 자기 자신과 조인하는 것. 계층 구조나 같은 테이블 안의 행끼리 비교할 때 쓴다.</dd>
+<dt>카티션 곱(Cartesian product)</dt><dd>두 집합의 모든 원소 쌍. 조인에서는 조건 없이 모든 행을 짝지은 결과로, 행 수가 두 테이블 행 수의 곱이다. CROSS JOIN이 만든다.</dd>
+<dt>비등가 조인(non-equi join)</dt><dd>등호가 아닌 조건(BETWEEN, 부등호 등)으로 짝을 짓는 조인. 연봉을 등급 구간에 대응시키는 경우가 대표적이다.</dd>
+<dt>팬아웃(fan-out)</dt><dd>1:N 조인으로 부모 행이 자식 수만큼 복제되는 현상. 독립된 1:N 관계 둘을 함께 조인하면 곱으로 늘어나 집계 값이 부풀어 오른다.</dd>
+<dt>해시 조인(hash join)</dt><dd>한 입력으로 조인 키의 해시 테이블을 만들고 다른 입력으로 그것을 조회하는 조인 알고리즘. MySQL은 8.0.18부터 쓰기 시작했고(카티션 곱 포함), 8.0.20부터 블록 중첩 루프를 대신해 외부 조인과 등가 조건이 없는 조인에도 쓴다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/join.html">MySQL 8.0 Reference Manual — JOIN Clause</a> — 조인 문법, JOIN·CROSS JOIN·INNER JOIN의 동등성, 쉼표 우선순위, LEFT JOIN의 NULL 행과 안티 조인 예, USING·NATURAL JOIN의 열 병합</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/outer-join-simplification.html">MySQL 8.0 Reference Manual — Outer Join Simplification</a> — RIGHT JOIN의 LEFT JOIN 변환, null-rejected 조건의 정의와 외부 조인의 내부 조인 변환</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/nested-join-optimization.html">MySQL 8.0 Reference Manual — Nested Join Optimization</a> — 외부 조인의 중첩 루프 실행과 일치 플래그, 테이블 순서 제약, 괄호를 없앨 수 없는 경우</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/hash-joins.html">MySQL 8.0 Reference Manual — Hash Join Optimization</a> — 8.0.18 도입과 8.0.20의 BNL 제거, 외부 조인·카티션 곱의 해시 조인, join_buffer_size와 디스크 사용</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/explain-output.html">MySQL 8.0 Reference Manual — EXPLAIN Output Format</a> — eq_ref·ref·ALL 조인 타입, Extra의 Not exists와 Using join buffer</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/set-operations.html">MySQL 8.0 Reference Manual — Set Operations with UNION, INTERSECT, and EXCEPT</a> — 집합 연산의 중복 제거 기본값, 결과 열 이름, ORDER BY의 별칭 참조 규칙</li>
+</x-refs>

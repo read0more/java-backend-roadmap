@@ -1,0 +1,768 @@
+<x-meta>
+title: 트랜잭션·JDBC·커넥션 풀
+desc: 자바 코드가 데이터베이스와 만나는 자리의 실수다. 대부분 "트랜잭션은 커넥션 하나에 속한 상태이고, 커밋은 메서드가 끝난 뒤에 일어난다"는 사실을 잊거나, 커넥션·락·메모리처럼 한정된 자원을 얼마나 오래 쥐는지 세지 않거나, 같은 행을 동시에 건드리는 다른 트랜잭션이 있다는 것을 잊어서 생긴다.
+</x-meta>
+
+<x-item id="tx-no-transaction-autocommit" harm="데이터 손상">
+<x-title>함께 성공해야 하는 여러 쓰기를 트랜잭션 없이 실행한다</x-title>
+<x-symptom>서비스 메서드에 트랜잭션 경계가 없으면 저장소 호출마다 커넥션이 따로 열리고 문장이 끝나는 즉시 커밋된다(자동 커밋). 출금은 반영됐는데 입금에서 실패하면 되돌릴 수단이 없어 출금만 남는다.</x-symptom>
+<x-see to="spring-db1/03" h="계좌이체로 보는 원자성">자동 커밋 모드의 이체와 트랜잭션 안의 이체가 같은 실패에서 어떻게 달라지는지</x-see>
+<x-see to="spring-db2/09" h="경우 1·2">서비스에 트랜잭션이 없고 저장소에만 있을 때 커밋과 롤백이 따로 일어나는 로그</x-see>
+</x-item>
+
+<x-item id="tx-checked-exception-commit" harm="데이터 손상">
+<x-title>체크 예외를 던지면 <code>@Transactional</code>이 롤백해 줄 것이라고 믿는다</x-title>
+<x-symptom><code>@Transactional</code> 메서드가 <code>Exception</code>을 상속한 업무 예외나 <code>IOException</code> 같은 체크 예외를 던지면, 기본 규칙에서는 롤백이 아니라 커밋이 일어난다. 예외 직전까지 실행한 SQL이 모두 확정되고 호출자는 예외를 받으므로 "실패했는데 데이터는 절반만 바뀐" 상태가 된다.</x-symptom>
+<x-see to="spring-db2/07" h="기본 규칙과 그 구현"><code>rollbackOn</code>의 한 줄짜리 기본 규칙, 체크 예외가 커밋되는 실험 로그, <code>rollbackFor</code>로 바꾸는 법</x-see>
+</x-item>
+
+<x-item id="tx-catch-and-swallow-commit" harm="데이터 손상">
+<x-title>트랜잭션 메서드 안에서 예외를 잡고 정상 반환한다</x-title>
+<x-symptom>두 번째 쓰기가 실패했는데 <code>try-catch</code>로 잡아 로그만 남기고 메서드를 끝내면, 프록시는 정상 종료만 보고 커밋한다. 첫 번째 쓰기만 확정된다. JDBC로 직접 트랜잭션을 다룰 때도 같다. MySQL InnoDB는 교착 상태를 빼면 실패한 문장 하나만 되돌리고 트랜잭션은 열어 두므로, 오류 뒤에 <code>commit()</code>이 실행되면 앞 문장들이 확정된다.</x-symptom>
+<x-see to="spring-db2/07" h="기본 규칙과 그 구현">커밋·롤백 판정이 프록시 밖으로 나간 예외만을 대상으로 한다는 것과 <code>setRollbackOnly</code></x-see>
+<x-see to="db-basic/08" h="문장 하나가 실패하면">InnoDB가 오류마다 되돌리는 범위(문장 롤백과 트랜잭션 롤백)와 오류 뒤 COMMIT의 결과</x-see>
+</x-item>
+
+<x-item id="tx-rollback-only-unexpected" harm="장애">
+<x-title>안쪽 트랜잭션 메서드가 던진 예외를 바깥에서 잡고 계속 진행한다</x-title>
+<x-symptom>"부가 작업이 실패해도 본 작업은 커밋하자"는 생각으로, <code>@Transactional</code>이 붙은 다른 빈의 메서드 호출을 <code>try-catch</code>로 감싼다. 예외는 그 빈의 프록시를 지나면서 이미 공유 트랜잭션에 rollback-only 표시를 남겼으므로, 바깥 메서드가 정상 반환해도 커밋 시점에 전체가 롤백되고 호출자는 <code>UnexpectedRollbackException</code>을 받는다.</x-symptom>
+<x-see to="spring-db2/09" h="경우 5">예외를 잡았는데 전부 롤백되는 실행 로그와, 잡는 위치보다 예외가 지나온 경로가 중요한 이유</x-see>
+<x-see to="spring-db2/08" h="내부 롤백">참여한 트랜잭션의 롤백이 "표시"로 바뀌는 구조와 예외가 던져지는 지점</x-see>
+</x-item>
+
+<x-item id="tx-self-invocation" harm="데이터 손상">
+<x-title>같은 클래스 안의 <code>@Transactional</code> 메서드를 <code>this</code>로 호출한다</x-title>
+<x-symptom>트랜잭션이 없는 메서드가 같은 클래스의 <code>@Transactional</code> 메서드를 부르면 호출이 프록시를 거치지 않아 트랜잭션이 시작되지 않는다. 그 안의 SQL은 문장마다 자동 커밋되고, 중간에 예외가 나도 앞의 변경은 롤백되지 않는다. 바깥에 트랜잭션이 이미 있는 경우에는 안쪽 메서드에 붙인 <code>REQUIRES_NEW</code>나 <code>readOnly</code>가 조용히 무시된다.</x-symptom>
+<x-see to="spring-db2/07" h="프록시 내부 호출 1">내부 호출에서 트랜잭션 로그가 한 줄도 찍히지 않는 실험과 바이트코드 수준의 원인</x-see>
+<x-see to="spring-db2/07" h="프록시 내부 호출 2">클래스 분리 등 피하는 방법</x-see>
+</x-item>
+
+<x-item id="tx-other-thread-outside-transaction" harm="데이터 손상">
+<x-title>트랜잭션 메서드 안에서 DB 작업을 다른 스레드에 넘긴다</x-title>
+<x-symptom><code>@Transactional</code> 메서드 안에서 <code>CompletableFuture</code>, 병렬 스트림, <code>@Async</code>로 저장소를 호출하면 그 스레드에는 트랜잭션에 묶인 커넥션이 없다. 새 커넥션에서 따로 실행되어 즉시(또는 자기 트랜잭션으로) 커밋되고, 원래 트랜잭션이 롤백되어도 그 변경은 남는다.</x-symptom>
+<x-see to="spring-db1/04" h="트랜잭션 매니저 2">새 스레드가 별도의 자동 커밋 커넥션을 여는 로그와 <code>ThreadLocal</code> 바인딩의 경계</x-see>
+<x-see to="spring-db2/08" h="흔한 오해와 함정">다른 스레드에서 연 <code>REQUIRED</code> 트랜잭션이 별개의 물리 트랜잭션이 되는 이유</x-see>
+</x-item>
+
+<x-item id="tx-notify-before-commit" harm="틀린 결과">
+<x-title>커밋되기 전에 메일·메시지·비동기 작업으로 밖에 알린다</x-title>
+<x-symptom><code>@Transactional</code> 메서드 안에서 저장 직후에 메일을 보내거나, 메시지를 발행하거나, 다른 스레드에 후속 작업을 넘긴다. 받는 쪽이 곧바로 조회하면 그 행은 아직 보이지 않고, 뒤이어 트랜잭션이 롤백되면 존재하지 않는 주문에 대한 메일만 남는다.</x-symptom>
+<x-see to="spring-db1/03" h="커밋 전의 데이터는 누구에게 보이는가">커밋하지 않은 변경이 다른 세션에 보이지 않는다는 것을 두 세션으로 확인한다</x-see>
+<x-see to="spring-db2/08" h="흔한 오해와 함정">참여한 안쪽 트랜잭션의 "커밋"은 DB 커밋이 아니므로, 안쪽 메서드가 끝난 직후에 "저장 완료"를 알리면 안 된다는 것</x-see>
+<x-see to="spring-db2/09" h="또 다른 길 2">커밋 후 콜백(<code>afterCommit</code>)에서 DB에 쓸 때 새 트랜잭션이 필요한 이유</x-see>
+<x-body>
+<p>트랜잭션 메서드의 코드는 위에서 아래로 실행되지만 커밋은 메서드가 반환된 뒤 프록시에서 일어난다. 메서드 안에서 "저장했다"는 것은 커넥션 하나에 INSERT를 보냈다는 뜻이고, 다른 커넥션이 그 행을 볼 수 있게 되는 시점은 메서드의 마지막 줄보다 뒤다. 그 사이에 밖으로 나간 알림은 두 방향으로 어긋난다. 다음 코드로 확인한다. <code>Notifier</code>는 트랜잭션 밖의 세계, 곧 메일 서버와 다른 스레드에서 주문을 읽어 가는 후속 작업을 흉내 낸다.</p>
+<pre><code class="language-java">static class Notifier {
+    final JdbcTemplate jdbc;
+    final ExecutorService worker = Executors.newSingleThreadExecutor();
+    final List<String> mails = new CopyOnWriteArrayList<>();
+    Notifier(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+
+    void sendMail(long orderId) {                 // 되돌릴 수 없는 외부 효과
+        mails.add("주문 " + orderId + " 접수 메일");
+    }
+
+    void startShipping(long orderId) {            // 다른 스레드(다른 커넥션)가 주문을 읽는다
+        Future<?> f = worker.submit(() -> {
+            Integer n = jdbc.queryForObject("select count(*) from orders where id = ?", Integer.class, orderId);
+            System.out.println("  [worker] 주문 " + orderId + (n == 1 ? " 출고 준비 시작" : " 을 찾지 못함"));
+        });
+        try { f.get(); } catch (Exception e) { throw new IllegalStateException(e); }  // 결과를 고정하려고 기다린다
+    }
+
+    @TransactionalEventListener                   // 기본 phase 는 AFTER_COMMIT
+    void on(OrderPlaced e) {
+        sendMail(e.orderId());
+        startShipping(e.orderId());
+    }
+}
+
+static class OrderService {
+    // jdbc, notifier, events(ApplicationEventPublisher) 필드와 생성자 생략 ...
+
+    @Transactional
+    public void placeAndNotify(long id, String item, boolean failAfter) {
+        jdbc.update("insert into orders(id, item) values (?, ?)", id, item);
+        notifier.sendMail(id);                    // 커밋 전에 밖으로 알린다
+        notifier.startShipping(id);
+        if (failAfter) throw new IllegalStateException("재고 부족");
+    }
+
+    @Transactional
+    public void placeAndPublish(long id, String item, boolean failAfter) {
+        jdbc.update("insert into orders(id, item) values (?, ?)", id, item);
+        events.publishEvent(new OrderPlaced(id)); // 리스너는 커밋된 뒤에 불린다
+        if (failAfter) throw new IllegalStateException("재고 부족");
+    }
+}</code></pre>
+<p><code>placeAndNotify(1, "키보드", false)</code>, <code>placeAndNotify(2, "마우스", true)</code>, <code>placeAndPublish(3, "모니터", false)</code>, <code>placeAndPublish(4, "의자", true)</code>를 차례로 부르고, 호출마다 테이블의 주문 번호와 그 호출에서 나간 메일을 찍었다. JDK 21.0.13, Spring Framework 6.2.19(<code>DataSourceTransactionManager</code>, <code>@EnableTransactionManagement</code>), H2 2.3.232 인메모리 DB에서 실행한 결과다.</p>
+<pre data-label="실행 결과"><code class="language-text">1) 커밋 전에 알림, 트랜잭션 성공
+  [worker] 주문 1 을 찾지 못함
+  orders=[1] 메일=[주문 1 접수 메일]
+2) 커밋 전에 알림, 그 뒤 롤백
+  [worker] 주문 2 을 찾지 못함
+  호출자가 받은 예외: 재고 부족
+  orders=[1] 메일=[주문 2 접수 메일]
+3) 커밋 후 리스너, 트랜잭션 성공
+  [worker] 주문 3 출고 준비 시작
+  orders=[1, 3] 메일=[주문 3 접수 메일]
+4) 커밋 후 리스너, 그 뒤 롤백
+  호출자가 받은 예외: 재고 부족
+  orders=[1, 3] 메일=[]</code></pre>
+<h4>왜 그런가</h4>
+<p>1번에서 주문 1은 결국 커밋되었는데도 후속 작업은 찾지 못했다. 작업 스레드는 요청 스레드와 다른 커넥션을 쓰고, 커밋되지 않은 INSERT는 다른 커넥션에 보이지 않기 때문이다. 이 실험은 결과를 고정하려고 후속 작업이 끝날 때까지 기다렸다. 실제 코드는 기다리지 않으므로 커밋과 후속 작업의 조회가 경쟁한다. 평소에는 커밋이 먼저 끝나 잘 동작하다가, 트랜잭션의 남은 부분이 길어지거나 부하가 걸린 날에만 "방금 만든 주문이 없다"는 오류가 드문드문 난다. 메시지 브로커에 발행하고 소비자가 식별자로 다시 조회하는 구조도 똑같다. 소비자는 다른 프로세스의 다른 커넥션이다.</p>
+<p>2번에서는 주문 2가 롤백되어 테이블에 없는데 메일은 나갔다. 롤백은 그 커넥션에 보낸 SQL만 되돌린다. 메일 서버, 메시지 브로커, 다른 서비스의 HTTP API는 이 데이터베이스 트랜잭션에 속하지 않으므로 되돌릴 방법이 없다.</p>
+<h4>고치는 법</h4>
+<p>밖으로 알리는 일을 커밋 뒤로 미룬다. 3번과 4번이 그 결과다. 스프링 레퍼런스에 따르면 <code>@TransactionalEventListener</code>는 기본적으로 트랜잭션의 커밋 단계에 묶이고(<code>AFTER_COMMIT</code>이 기본값), 그래서 리스너는 커밋이 성공한 뒤에만 불린다. 3번에서는 커밋된 주문을 후속 작업이 읽었고, 4번에서는 롤백되었으므로 리스너가 불리지 않아 메일이 없다. 이벤트를 쓰지 않고 <code>TransactionSynchronizationManager.registerSynchronization</code>으로 <code>afterCommit</code> 콜백을 직접 등록해도 원리는 같다.</p>
+<p>이 방법에는 알아 둘 점이 세 가지 있다.</p>
+<ul>
+<li>레퍼런스는 실행 중인 트랜잭션이 없으면 이 리스너가 아예 호출되지 않는다고 적는다. 트랜잭션 밖에서 이벤트를 발행하는 경로가 있으면 알림이 조용히 사라진다. 그런 경로에서도 실행하려면 <code>fallbackExecution = true</code>를 준다.</li>
+<li>커밋 후 리스너 안에서 DB에 다시 쓰려면 새 트랜잭션을 열어야 한다. 이유는 스프링 DB 2편 09회에 있다.</li>
+<li>커밋과 발송 사이에서 프로세스가 죽으면 주문은 있는데 알림은 영영 나가지 않는다. 사라지면 안 되는 알림은 메모리에 두지 않는다. 주문을 저장하는 그 트랜잭션에서 "보낼 메시지"를 테이블에 함께 저장하고, 별도 작업이 그 테이블을 읽어 발송한 뒤 처리 표시를 한다(트랜잭셔널 아웃박스). 주문과 보낼 메시지가 같은 커밋으로 확정되므로 둘 중 하나만 남는 일이 없다. 대신 발송 작업이 보낸 직후 표시하기 전에 죽으면 같은 메시지가 다시 나가므로, 받는 쪽은 같은 메시지를 두 번 받아도 결과가 같게 만들어야 한다.</li>
+</ul>
+</x-body>
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/data-access/transaction/event.html">Spring Framework Reference — Transaction-bound Events</a> — <code>@TransactionalEventListener</code>의 기본 단계(AFTER_COMMIT), 트랜잭션이 없으면 호출되지 않는다는 것과 <code>fallbackExecution</code></li>
+<li><a href="https://microservices.io/patterns/data/transactional-outbox.html">microservices.io — Pattern: Transactional outbox</a> — 보낼 메시지를 같은 트랜잭션에서 테이블에 저장하는 방식과 중복 발행 때문에 소비자가 멱등해야 한다는 점</li>
+</x-refs>
+</x-item>
+
+<x-item id="tx-external-call-in-transaction" harm="장애">
+<x-title>트랜잭션을 연 채로 외부 API를 호출한다</x-title>
+<x-symptom><code>@Transactional</code> 메서드는 시작부터 끝까지 커넥션 하나와 그 트랜잭션이 잡은 행 락을 쥔다. 그 안에서 결제 API 호출이나 파일 업로드를 하면 외부가 느려지는 순간 커넥션이 SQL 없이 묶이고, 같은 행을 기다리는 요청들도 커넥션을 하나씩 붙잡은 채 줄을 서서 풀이 바닥난다. DB는 한가한데 애플리케이션 전체가 멈춘다.</x-symptom>
+<x-see to="spring-db1/03" h="정리: 트랜잭션은 세션의 상태다">외부 호출 중인 트랜잭션이 커넥션과 락을 함께 쥐어 풀 고갈로 번지는 과정</x-see>
+<x-see to="spring-db1/02" h="풀이 바닥나면">풀이 바닥났을 때의 대기와 시간 초과, 요청 스레드까지 모자라게 되는 경로</x-see>
+</x-item>
+
+<x-item id="tx-requires-new-pool-deadlock" harm="장애">
+<x-title>풀 크기를 따지지 않고 <code>REQUIRES_NEW</code>를 쓴다</x-title>
+<x-symptom><code>REQUIRES_NEW</code> 메서드는 바깥 트랜잭션의 커넥션을 쥔 채 커넥션을 하나 더 빌린다. 요청 스레드들이 모두 바깥 커넥션을 하나씩 쥐고 두 번째를 기다리면 아무도 반납하지 못해 전원이 풀 대기 시간 초과로 실패한다. 평소 부하에서는 드러나지 않고 동시 요청이 풀 크기에 닿는 순간에만 터진다.</x-symptom>
+<x-see to="spring-db2/09" h="REQUIRES_NEW의 비용 1">풀 크기 1에서 <code>CannotCreateTransactionException</code>이 나는 실험과 레퍼런스의 경고</x-see>
+<x-see to="spring-db1/02" h="풀 크기는 어떻게">한 스레드가 커넥션 여러 개를 동시에 쥘 때 풀 교착을 피하는 최소 크기</x-see>
+</x-item>
+
+<x-item id="tx-requires-new-self-lock" harm="장애">
+<x-title>바깥 트랜잭션이 바꾼 행을 <code>REQUIRES_NEW</code> 안에서 다시 건드린다</x-title>
+<x-symptom>바깥 트랜잭션이 UPDATE로 락을 잡은 행을 안쪽 <code>REQUIRES_NEW</code> 트랜잭션이 갱신하려 하면, 안쪽은 바깥의 락을 기다리고 바깥은 안쪽 메서드가 끝나기를 기다린다. DB가 보기에는 서로 다른 두 세션이라 교착 상태로 감지되지도 않고, 락 대기 시간이 끝날 때까지 요청이 멈춰 있다.</x-symptom>
+<x-see to="spring-db2/09" h="REQUIRES_NEW의 비용 2">같은 스레드가 자기 자신을 기다리는 실험과 그 로그</x-see>
+</x-item>
+
+<x-item id="tx-readonly-misunderstood" harm="틀린 결과">
+<x-title><code>readOnly = true</code>가 쓰기를 막아 준다고(또는 어디서든 적용된다고) 믿는다</x-title>
+<x-symptom><code>readOnly</code>는 층마다 다르게 반응하는 힌트다. JPA(Hibernate)에서는 플러시가 꺼져서 읽기 전용 메서드 안에서 엔티티를 고쳐도 오류 없이 UPDATE가 나가지 않는다. JDBC에서는 드라이버와 DB 설정에 따라 쓰기가 그대로 실행되기도 한다. 그리고 이미 시작된 트랜잭션에 참여하는 안쪽 메서드의 <code>readOnly</code>와 격리 수준은 조용히 무시된다.</x-symptom>
+<x-see to="spring-db2/07" h="트랜잭션 옵션 소개">스프링·JPA·JDBC·드라이버 네 층에서 <code>readOnly</code>가 각각 하는 일</x-see>
+<x-see to="spring-db2/08" h="격리 수준, 읽기 전용, 타임아웃은">참여하는 트랜잭션에서 설정이 적용되지 않는 실험과 <code>validateExistingTransaction</code></x-see>
+</x-item>
+
+<x-item id="tx-ddl-implicit-commit" harm="데이터 손상">
+<x-title>트랜잭션 도중에 DDL을 실행한다</x-title>
+<x-symptom>MySQL에서 <code>CREATE TABLE</code>, <code>ALTER TABLE</code>, <code>DROP TABLE</code>, <code>TRUNCATE TABLE</code> 같은 문장은 실행되기 전에 진행 중인 트랜잭션을 커밋해 버린다(암묵적 커밋). 그 앞에서 실행한 변경은 이미 확정되어, 뒤에서 예외가 나 프레임워크가 롤백을 보내도 되돌아가지 않는다. 테스트에서 <code>TRUNCATE</code>로 테이블을 비우는 순간 자동 롤백도 같은 이유로 무력해진다.</x-symptom>
+<x-see to="db-intro/02" h="SQL 문장의 네 갈래">암묵적 커밋을 일으키는 문장의 무리와, 프레임워크의 롤백이 그것을 되돌릴 수 없는 이유</x-see>
+<x-see to="spring-db1/03" h="자동 커밋과 수동 커밋">트랜잭션 도중의 <code>START TRANSACTION</code>, <code>SET autocommit = 1</code>도 커밋을 일으킨다는 것</x-see>
+</x-item>
+
+<x-item id="tx-test-rollback-hides" harm="틀린 결과">
+<x-title>테스트의 <code>@Transactional</code> 자동 롤백만 믿고 운영 동작을 검증했다고 여긴다</x-title>
+<x-symptom>롤백으로 끝나는 테스트는 커밋을 한 번도 하지 않는다. 커밋 때에야 일어나는 일(커밋 후 콜백, JPA의 플러시와 그때 드러나는 제약 위반)이 실행되지 않아 테스트는 통과하고 운영에서 실패한다. 다른 스레드나 <code>REQUIRES_NEW</code>로 쓴 데이터는 롤백되지 않고 남으며, 저장과 조회가 한 트랜잭션 안에서 일어나므로 커밋 뒤 다른 트랜잭션에서 보이는 모습은 확인되지 않는다.</x-symptom>
+<x-see to="spring-db2/02" h="테스트 트랜잭션의 함정">롤백 범위 밖의 일과, 운영에서는 일어나는데 테스트에서는 일어나지 않는 일</x-see>
+</x-item>
+
+<x-item id="tx-two-resources-one-transaction" harm="데이터 손상">
+<x-title>서로 다른 두 저장소에 쓰는 일이 <code>@Transactional</code> 하나로 묶였다고 믿는다</x-title>
+<x-symptom>주문 DB와 포인트 DB(또는 DB와 메시지 큐)에 차례로 쓰는 메서드에 <code>@Transactional</code>을 붙이고, 예외가 나면 둘 다 되돌아가리라 기대한다. 실제로는 그 트랜잭션 매니저가 맡은 한쪽만 롤백되고 다른 쪽 변경은 커밋된 채 남는다.</x-symptom>
+<x-see to="spring-db1/04" h="트랜잭션 동기화: 커넥션">스레드에 묶이는 자원의 키가 <code>DataSource</code> 객체라는 것(데이터소스마다 커넥션이 따로다)</x-see>
+<x-see to="spring-db2/07" h="트랜잭션 옵션 소개"><code>@Transactional("이름")</code>으로 트랜잭션 매니저를 고르는 <code>value</code> 속성</x-see>
+<x-body>
+<p>데이터소스가 둘이고 트랜잭션 매니저도 둘인 구성에서, 주문을 넣고 포인트를 차감한 뒤 예외가 나는 메서드를 두 가지로 만들었다. V1은 포인트 DB를 <code>JdbcTemplate</code>으로 직접 고치고, V2는 포인트 쪽 트랜잭션이 걸린 다른 빈을 부른다.</p>
+<pre><code class="language-java">static class PointService {
+    final JdbcTemplate pointJdbc;
+    PointService(JdbcTemplate pointJdbc) { this.pointJdbc = pointJdbc; }
+
+    @Transactional("pointTx")
+    public void use(long memberId, int amount) {
+        pointJdbc.update("update point set balance = balance - ? where member_id = ?", amount, memberId);
+    }
+}
+
+static class OrderService {
+    // orderJdbc, pointJdbc, pointService 필드와 생성자 생략 ...
+
+    @Transactional("orderTx")      // 주문 DB의 트랜잭션 하나만 열린다
+    public void placeV1(long memberId, int amount) {
+        orderJdbc.update("insert into orders(member_id, amount) values (?, ?)", memberId, amount);
+        pointJdbc.update("update point set balance = balance - ? where member_id = ?", amount, memberId);
+        throw new IllegalStateException("결제 승인 실패");
+    }
+
+    @Transactional("orderTx")      // 안쪽에서 포인트 DB의 트랜잭션이 따로 열리고 따로 커밋된다
+    public void placeV2(long memberId, int amount) {
+        orderJdbc.update("insert into orders(member_id, amount) values (?, ?)", memberId, amount);
+        pointService.use(memberId, amount);
+        throw new IllegalStateException("결제 승인 실패");
+    }
+}
+
+@Configuration
+@EnableTransactionManagement
+static class Config {
+    @Bean DataSource orderDs() { return new DriverManagerDataSource("jdbc:h2:mem:orderdb;DB_CLOSE_DELAY=-1", "sa", ""); }
+    @Bean DataSource pointDs() { return new DriverManagerDataSource("jdbc:h2:mem:pointdb;DB_CLOSE_DELAY=-1", "sa", ""); }
+    @Bean JdbcTemplate orderJdbc() { return new JdbcTemplate(orderDs()); }
+    @Bean JdbcTemplate pointJdbc() { return new JdbcTemplate(pointDs()); }
+    @Bean PlatformTransactionManager orderTx() { return new DataSourceTransactionManager(orderDs()); }
+    @Bean PlatformTransactionManager pointTx() { return new DataSourceTransactionManager(pointDs()); }
+    // PointService, OrderService 빈 등록 생략 ...
+}</code></pre>
+<p>포인트 잔액 10,000에서 시작해 <code>placeV1(1, 3000)</code>, <code>placeV2(1, 3000)</code>을 차례로 불렀다(JDK 21.0.13, Spring Framework 6.2.19, H2 2.3.232).</p>
+<pre data-label="실행 결과"><code class="language-text">V1 예외: 결제 승인 실패
+  주문 수=0, 포인트 잔액=7000
+V2 예외: 결제 승인 실패
+  주문 수=0, 포인트 잔액=4000</code></pre>
+<p>두 번 모두 주문은 롤백되어 0건인데 포인트는 3,000씩 빠져나갔다. 주문 없이 포인트만 사라진 것이다. V2를 실행할 때의 트랜잭션 매니저 디버그 로그가 순서를 그대로 보여 준다(커넥션 번호는 실행마다 다를 수 있다).</p>
+<pre data-label="V2의 DEBUG 로그(발췌)"><code class="language-text">Creating new transaction with name [TwoDataSources$OrderService.placeV2]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT; 'orderTx'
+Acquired Connection [conn7: url=jdbc:h2:mem:orderdb user=SA] for JDBC transaction
+Creating new transaction with name [TwoDataSources$PointService.use]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT; 'pointTx'
+Acquired Connection [conn8: url=jdbc:h2:mem:pointdb user=SA] for JDBC transaction
+Initiating transaction commit
+Committing JDBC transaction on Connection [conn8: url=jdbc:h2:mem:pointdb user=SA]
+Initiating transaction rollback
+Rolling back JDBC transaction on Connection [conn7: url=jdbc:h2:mem:orderdb user=SA]</code></pre>
+<h4>왜 그런가</h4>
+<p>데이터베이스 트랜잭션은 커넥션 하나에 속한 상태다. <code>DataSourceTransactionManager</code>의 Javadoc 첫 문장은 이 클래스가 "하나의 JDBC <code>DataSource</code>를 위한" 구현이라고 밝히고, 지정된 <code>DataSource</code>의 커넥션을 현재 스레드에 묶는다고 설명한다. <code>@Transactional("orderTx")</code>가 연 것은 주문 DB 커넥션의 트랜잭션 하나뿐이다.</p>
+<p>V1에서 <code>pointJdbc</code>는 포인트 DB의 데이터소스로 스레드에 묶인 커넥션을 찾지만 없다. 그래서 새 커넥션을 얻어 자동 커밋으로 UPDATE를 실행한다. 문장이 끝나는 순간 차감은 확정된다. V2에서는 <code>pointTx</code>가 포인트 DB에 자기 트랜잭션을 열었고, <code>use()</code>가 정상 반환하자 로그대로 그 자리에서 커밋했다. 뒤이어 난 예외는 주문 쪽 트랜잭션만 롤백한다. 두 커밋은 서로를 모른다.</p>
+<p>순서를 바꾸거나 예외를 잘 잡는다고 해결되지 않는다. 두 쪽 모두 성공한 뒤 차례로 커밋하더라도, 첫 커밋과 둘째 커밋 사이에 프로세스가 죽거나 둘째 커밋이 실패하면 한쪽만 반영된다. 스프링 레퍼런스도 로컬 트랜잭션은 여러 트랜잭션 자원에 걸쳐 동작할 수 없다는 것을 로컬 트랜잭션의 큰 단점으로 적는다. DB와 메시지 큐의 조합도 같은 구조다. JDBC 커넥션의 커밋과 브로커로의 발행은 별개의 일이다.</p>
+<h4>고치는 법</h4>
+<ul>
+<li><b>한 트랜잭션에 들어가게 데이터를 둔다.</b> 반드시 함께 바뀌어야 하는 데이터를 같은 데이터베이스의 같은 커넥션으로 고칠 수 있다면 문제 자체가 사라진다. 가장 먼저 검토할 방법이다.</li>
+<li><b>전역 트랜잭션.</b> 스프링 레퍼런스는 여러 트랜잭션 자원(대표적으로 관계형 데이터베이스와 메시지 큐)을 함께 다루는 것이 전역 트랜잭션이고 JTA로 관리된다고 설명한다. 스프링에서는 트랜잭션 매니저 설정을 <code>JtaTransactionManager</code>로 바꾸면 되고 애플리케이션 코드는 그대로 둘 수 있다고 레퍼런스는 적는다. 다만 <code>JtaTransactionManager</code>는 컨테이너가 제공하는 전역 트랜잭션 관리 기반에 일을 맡기는 클래스이므로, 그 기반이 먼저 갖춰져 있어야 한다.</li>
+<li><b>원자성을 포기하고 어긋남을 메우는 설계.</b> 한쪽을 기준으로 삼아 먼저 커밋하고, 다른 쪽 작업은 "해야 할 일"로 기록해 두었다가 성공할 때까지 다시 시도한다. 앞 항목의 아웃박스가 이 방식이다. 다시 시도하는 쪽은 같은 작업이 두 번 실행되어도 결과가 같아야 하므로 다음 항목의 요청 식별자가 함께 필요하다. 되돌릴 수 없는 작업(외부 결제, 메일)은 맨 마지막에 두고, 실패했을 때 어느 쪽이 남는지를 코드의 순서로 의도해서 정한다.</li>
+</ul>
+<p>어느 방법을 택하든, 두 저장소에 쓰는 메서드에 붙은 <code>@Transactional</code> 하나는 그중 한 곳만 지킨다는 사실에서 출발해야 한다.</p>
+</x-body>
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/docs/6.2.x/javadoc-api/org/springframework/jdbc/datasource/DataSourceTransactionManager.html">DataSourceTransactionManager (Spring Framework 6.2 API)</a> — 하나의 JDBC DataSource를 위한 구현이며 그 DataSource의 커넥션을 스레드에 묶는다는 설명</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/data-access/transaction/motivation.html">Spring Framework Reference — Advantages of the Spring Framework's Transaction Support Model</a> — 로컬 트랜잭션은 여러 트랜잭션 자원에 걸칠 수 없고, 전역 트랜잭션은 JTA로 여러 자원을 다룬다는 구분</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/data-access/transaction/strategies.html">Spring Framework Reference — Understanding the Spring Framework Transaction Abstraction</a> — <code>JtaTransactionManager</code>와, 설정만 바꿔 로컬에서 전역 트랜잭션으로 옮길 수 있다는 설명</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html">Spring Framework Reference — Using @Transactional</a> — 여러 트랜잭션 매니저를 <code>value</code>/<code>transactionManager</code>로 구분해 쓰는 법</li>
+</x-refs>
+</x-item>
+
+<x-item id="tx-retry-without-idempotency-key" harm="데이터 손상">
+<x-title>다시 올 수 있는 쓰기 요청을 요청 식별자 없이 처리한다</x-title>
+<x-symptom>결제, 포인트 차감, 주문 생성 요청은 타임아웃 뒤에 다시 온다(클라이언트나 게이트웨이의 재시도, 두 번 누른 버튼, 메시지 재전달). 서버가 두 요청이 같은 것임을 알 방법이 없으면 두 번 다 정상 처리해 두 번 차감한다. 두 트랜잭션 모두 성공이므로 오류 로그도 남지 않는다.</x-symptom>
+<x-see to="http/04" h="멱등: 다시 보내도 되는가">타임아웃이 "실패"가 아니라 "모름"인 이유(응답이 사라지는 세 지점)와, 클라이언트 라이브러리가 요청을 스스로 다시 보내는 실험</x-see>
+<x-see to="http/05" h="새 자원의 식별자는">응답이 사라졌을 때 POST 재시도로 예약이 두 건 생기는 과정과 세 가지 대처</x-see>
+<x-see to="db-basic/07" h="애플리케이션 검사만으로는">"조회해서 없으면 처리"가 동시 요청에 뚫리고 UNIQUE 제약이 그것을 막는 원리</x-see>
+<x-see to="db-design2/06" h="멱등성 설계">더하기는 멱등하지 않다: 배치를 다시 돌려도 같은 결과가 되게 만드는 방법</x-see>
+<x-body>
+<p>포인트 1,000을 차감하는 서버 코드와, 응답을 받지 못하면 같은 요청을 한 번 더 보내는 클라이언트다. 서버는 첫 요청을 커밋까지 끝냈지만 응답이 도중에 사라졌다고 하자.</p>
+<pre><code class="language-java">/** 서버: 포인트를 차감하고 내역을 남긴다. */
+static String charge(long memberId, int amount) {
+    return tx.execute(status -> {
+        jdbc.update("update point set balance = balance - ? where member_id = ?", amount, memberId);
+        jdbc.update("insert into point_history(member_id, amount) values (?, ?)", memberId, -amount);
+        return "OK";
+    });
+}
+
+/** 서버: 요청 키를 같은 트랜잭션에서 먼저 기록한다. 이미 있으면 아무것도 바꾸지 않는다. */
+static String chargeOnce(String requestId, long memberId, int amount) {
+    try {
+        return tx.execute(status -> {
+            jdbc.update("insert into charge_request(request_id, member_id, amount) values (?, ?, ?)", requestId, memberId, amount);
+            jdbc.update("update point set balance = balance - ? where member_id = ?", amount, memberId);
+            jdbc.update("insert into point_history(member_id, amount) values (?, ?)", memberId, -amount);
+            return "OK";
+        });
+    } catch (DuplicateKeyException e) {
+        return "OK(이미 처리된 요청)";
+    }
+}
+
+/** 클라이언트: 응답을 받지 못하면(타임아웃) 같은 요청을 한 번 더 보낸다. */
+static void callWithRetry(Callable<String> request) throws Exception {
+    String first = request.call();                 // 서버는 처리하고 커밋까지 끝냈다
+    System.out.println("  1차 시도: 서버 결과=" + first + ", 그러나 응답이 도중에 사라져 클라이언트는 타임아웃");
+    System.out.println("  2차 시도: 서버 결과=" + request.call());
+}
+
+// charge_request 테이블: request_id varchar(36) primary key, member_id bigint, amount int
+// tx 는 TransactionTemplate, jdbc 는 JdbcTemplate. 잔액은 실험마다 10000 으로 되돌린다 ...</code></pre>
+<pre data-label="실행 결과 (JDK 21.0.13, Spring Framework 6.2.19, H2 2.3.232)"><code class="language-text">키 없이 재시도
+  1차 시도: 서버 결과=OK, 그러나 응답이 도중에 사라져 클라이언트는 타임아웃
+  2차 시도: 서버 결과=OK
+  잔액=8000, 차감 내역 수=2
+요청 키와 함께 재시도
+  1차 시도: 서버 결과=OK, 그러나 응답이 도중에 사라져 클라이언트는 타임아웃
+  2차 시도: 서버 결과=OK(이미 처리된 요청)
+  잔액=9000, 차감 내역 수=1
+같은 키의 요청 두 개가 동시에 도착
+  결과: OK(이미 처리된 요청) / OK
+  잔액=9000, 차감 내역 수=1</code></pre>
+<p>마지막 실험은 스레드 두 개가 같은 키로 동시에 <code>chargeOnce</code>를 부른 것이다. 둘 중 어느 쪽이 "이미 처리된 요청"이 되는지는 실행마다 달랐고, 차감은 언제나 한 번이었다.</p>
+<h4>왜 그런가</h4>
+<p>타임아웃은 "처리되지 않았다"가 아니라 "결과를 모른다"는 뜻이다. 요청이 서버에 닿지 못한 경우와 서버가 커밋까지 끝냈는데 응답만 사라진 경우를 클라이언트는 구별할 수 없다. RFC 9110 9.2.2절이 멱등(idempotent)하지 않은 메서드의 요청을 클라이언트가 자동으로 재시도하지 말아야 한다고 정하면서, 예외로 든 조건이 "요청의 의미가 실제로 멱등임을 알 수단이 있거나, 원래 요청이 적용되지 않았음을 탐지할 수단이 있을 때"다. <code>balance = balance - 1000</code>은 실행할 때마다 결과가 달라지므로 멱등하지 않다.</p>
+<p>트랜잭션은 이 문제를 풀어 주지 않는다. 트랜잭션은 시도 한 번을 원자적으로 만들 뿐이고, 두 번의 시도가 같은 요청인지는 알지 못한다. 첫 실험에서 두 트랜잭션은 각각 완벽하게 성공했다.</p>
+<h4>고치는 법</h4>
+<p>요청을 만드는 쪽이 요청 하나에 고유한 키(UUID 등)를 하나 붙이고, 재시도할 때 같은 키를 다시 보낸다. 서버는 그 키를 유니크 제약이 걸린 열에 넣는 INSERT를 업무 변경과 <b>같은 트랜잭션</b>에서 실행한다. 여기에 세 가지 이유가 들어 있다.</p>
+<ul>
+<li><b>유니크 제약이 판정한다.</b> "키가 있는지 조회하고 없으면 처리"로 짜면 동시에 도착한 두 요청이 모두 "없음"을 본다. 중복 판정은 조회가 아니라 INSERT의 성공·실패로 해야 한다. 동시 실험에서 한쪽만 차감된 것이 그 결과다.</li>
+<li><b>같은 트랜잭션이어야 한다.</b> 키 기록과 차감이 함께 커밋되거나 함께 롤백되어야 한다. 따로 커밋하면 "키는 남았는데 차감은 실패"(영영 처리되지 않는다)나 "차감은 됐는데 키가 없다"(재시도 때 또 차감된다)가 생긴다.</li>
+<li><b>중복이면 변경 없이 성공으로 답한다.</b> 재시도한 클라이언트가 원하는 것은 "처리되었다"는 답이다. 위 코드에서 <code>DuplicateKeyException</code>은 트랜잭션 콜백 밖으로 나가 그 시도의 트랜잭션을 롤백시킨 뒤에 잡힌다. 실제로는 첫 처리의 결과를 키와 함께 저장해 두었다가 그대로 돌려준다.</li>
+</ul>
+<p>남는 일도 있다. 같은 키로 내용이 다른 요청이 오면(키를 잘못 재사용한 클라이언트) 저장해 둔 값과 비교해 거부해야 하고, 키를 얼마 동안 보관할지도 정해야 한다. 그리고 이 설계는 HTTP 재시도에만 쓰이는 것이 아니다. 교착 상태로 롤백된 트랜잭션을 다시 실행하는 코드, 메시지를 한 번 이상 전달하는 큐의 소비자, 실패한 배치의 재실행이 모두 "같은 일을 두 번 해도 한 번 한 것과 같아야 한다"는 같은 조건 위에 서 있다.</p>
+</x-body>
+<x-refs>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2">RFC 9110 §9.2.2 Idempotent Methods</a> — 멱등의 정의, 멱등하지 않은 요청을 자동으로 재시도하지 말아야 한다는 규정과 그 예외 조건</li>
+<li><a href="https://docs.spring.io/spring-framework/docs/6.2.x/javadoc-api/org/springframework/transaction/support/TransactionTemplate.html">TransactionTemplate (Spring Framework 6.2 API)</a> — 콜백이 던진 <code>RuntimeException</code>은 롤백을 강제하고 호출자에게 전파된다는 <code>execute</code>의 계약</li>
+</x-refs>
+</x-item>
+
+<x-item id="tx-connection-not-closed" harm="장애">
+<x-title>빌린 커넥션을 예외 경로에서 닫지 않는다</x-title>
+<x-symptom>정상 경로에서만 <code>close()</code>를 부르는 코드는 예외가 날 때마다 커넥션을 하나씩 잃는다. 풀은 그 커넥션을 계속 "사용 중"으로 세므로 쓸 수 있는 커넥션이 줄어들고, 결국 모든 요청이 <code>Connection is not available, request timed out</code>으로 실패한다. 재시작하면 잠시 멀쩡해졌다가 다시 마른다.</x-symptom>
+<x-see to="spring-db1/02" h="풀이 바닥나면">커넥션 누수가 풀 고갈로 이어지는 경로와 <code>leakDetectionThreshold</code>로 빌려 간 위치를 찾는 법</x-see>
+<x-see to="spring-db1/01" h="자원 정리">try-with-resources가 닫는 순서와 억제된 예외에 대해 보장하는 것</x-see>
+</x-item>
+
+<x-item id="tx-raw-getconnection-in-transaction" harm="데이터 손상">
+<x-title>스프링 트랜잭션 안에서 <code>dataSource.getConnection()</code>으로 커넥션을 직접 얻는다</x-title>
+<x-symptom>트랜잭션 매니저가 스레드에 묶어 둔 커넥션은 <code>DataSourceUtils.getConnection()</code>으로만 찾아진다. <code>DataSource.getConnection()</code>을 직접 부르면 풀에서 다른 커넥션(자동 커밋)을 새로 받는다. 그 커넥션으로 실행한 SQL은 즉시 커밋되어 바깥 트랜잭션이 롤백되어도 남고, 바깥 트랜잭션이 아직 커밋하지 않은 변경은 그 커넥션에서 보이지 않는다.</x-symptom>
+<x-see to="spring-db1/04" h="트랜잭션 매니저 1">저장소가 <code>DataSourceUtils</code>로 커넥션을 얻고 돌려주어야 하는 이유와 바꾼 코드</x-see>
+<x-see to="spring-db1/04" h="트랜잭션 동기화: 커넥션">커넥션이 스레드에 묶이는 구조(<code>TransactionSynchronizationManager</code>)</x-see>
+</x-item>
+
+<x-item id="tx-manual-commit-left-open" harm="데이터 손상">
+<x-title><code>setAutoCommit(false)</code> 뒤 커밋도 롤백도 없이 커넥션을 반납한다</x-title>
+<x-symptom>예외 경로에서 <code>commit()</code>과 <code>rollback()</code>을 모두 건너뛰고 <code>close()</code>만 하면, 그때의 결과는 JDBC가 구현에 맡긴 영역이다. HikariCP는 반납 때 롤백하고 자동 커밋을 되돌려 주므로 변경이 조용히 사라진다. 그런 정리가 없는 풀에서는 다음에 그 커넥션을 빌린 코드가 수동 커밋 상태를 물려받아, 커밋되지 않는 쓰기와 풀리지 않는 락을 만든다.</x-symptom>
+<x-see to="spring-db1/03" h="트랜잭션 적용 2">반납 전에 세션 상태를 되돌리는 이유, 커밋 없이 닫았을 때 HikariCP가 하는 일(소스 발췌와 실험)</x-see>
+</x-item>
+
+<x-item id="tx-pool-size-over-max-connections" harm="장애">
+<x-title>인스턴스 수를 곱하지 않고 커넥션 풀 크기를 정한다</x-title>
+<x-symptom>풀 크기는 인스턴스 하나의 값이다. 같은 DB에 붙는 인스턴스 수 × 풀 크기가 MySQL의 <code>max_connections</code>를 넘으면, 인스턴스를 늘리거나 배포 중 옛 인스턴스와 새 인스턴스가 함께 떠 있는 순간에 <code>Too many connections</code>로 새 인스턴스가 커넥션을 얻지 못한다. 풀이 모자란다고 크기만 키우면 DB가 동시에 처리하는 작업이 늘어 오히려 느려질 수 있다.</x-symptom>
+<x-see to="spring-db1/02" h="풀 크기는 어떻게">풀 크기의 출발점 공식, 풀 교착을 피하는 하한, 인스턴스 수와 서버 연결 한도의 계산</x-see>
+</x-item>
+
+<x-item id="tx-jdbc-no-socket-timeout" harm="장애">
+<x-title>JDBC 드라이버에 소켓 타임아웃을 주지 않는다</x-title>
+<x-symptom>DB 서버나 그 사이 네트워크가 연결을 끊지도 않고 응답도 하지 않는 상태가 되면(패킷 유실, 세션을 지워 버린 방화벽, 멈춘 장비) 쿼리를 보낸 스레드는 응답을 읽는 자리에서 끝없이 기다린다. 풀의 커넥션이 그 스레드들에 묶여 돌아오지 않으므로 이후의 모든 요청이 커넥션 대기 시간 초과로 실패한다.</x-symptom>
+<x-see to="spring-db1/02" h="풀이 바닥나면"><code>connectionTimeout</code>이 지키는 구간: 풀에서 커넥션을 기다리는 시간</x-see>
+<x-see to="spring-db2/07" h="트랜잭션 옵션 소개"><code>@Transactional(timeout)</code>이 실제로 강제되는 두 지점</x-see>
+<x-see to="java-adv2/08" h="네트워크 예외 2">연결은 살아 있는데 상대가 아무것도 보내지 않으면 소켓의 <code>read()</code>가 기본적으로 끝없이 기다리는 이유와 읽기 타임아웃</x-see>
+<x-body>
+<p>"응답 없는 DB"를 만들기 위해 애플리케이션과 H2 TCP 서버 사이에 바이트를 그대로 전달하는 중계 소켓을 두고, 중간에 전달을 멈춘다. 연결은 살아 있지만 아무 바이트도 오가지 않는 상태다. 풀 크기는 2, 풀 대기 시간(<code>connectionTimeout</code>)은 1초다.</p>
+<pre><code class="language-java">public class SilentDb {
+    /** 애플리케이션과 DB 사이의 네트워크. frozen 이 되면 연결은 살아 있지만 아무 바이트도 전달하지 않는다. */
+    static class Network {
+        final ServerSocket listen = new ServerSocket(0);
+        final int dbPort; volatile boolean frozen;
+        Network(int dbPort) throws IOException {
+            this.dbPort = dbPort;
+            daemon(() -> { while (true) { Socket app = listen.accept(); Socket db = new Socket("localhost", dbPort);
+                daemon(() -> pump(app, db)); daemon(() -> pump(db, app)); } });
+        }
+        void pump(Socket from, Socket to) throws IOException {
+            InputStream in = from.getInputStream(); OutputStream out = to.getOutputStream();
+            byte[] buf = new byte[8192];
+            for (int n; (n = in.read(buf)) > 0; ) { if (frozen) continue; out.write(buf, 0, n); out.flush(); }
+        }
+        interface Io { void run() throws IOException; }
+        static void daemon(Io io) { Thread t = new Thread(() -> { try { io.run(); } catch (IOException ignored) { } }); t.setDaemon(true); t.start(); }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Server h2 = Server.createTcpServer("-tcpPort", "0", "-ifNotExists").start();   // org.h2.tools.Server
+        Network net = new Network(h2.getPort());
+        HikariDataSource ds = new HikariDataSource();
+        ds.setJdbcUrl("jdbc:h2:tcp://localhost:" + net.listen.getLocalPort() + "/mem:silent");
+        ds.setUsername("sa"); ds.setPassword("");
+        ds.setMaximumPoolSize(2);
+        ds.setConnectionTimeout(1000);          // 풀에서 커넥션을 기다리는 시간
+
+        try (Connection a = ds.getConnection(); Connection b = ds.getConnection()) { }   // 풀에 커넥션 두 개를 채워 둔다
+        System.out.println("정상: " + query(ds));
+        net.frozen = true;                      // 이제 DB 쪽에서 아무 응답도 오지 않는다
+
+        Thread[] workers = new Thread[2];
+        for (int i = 0; i < 2; i++) {
+            workers[i] = new Thread(() -> { try { System.out.println(query(ds)); } catch (SQLException e) { System.out.println(e); } }, "request-" + (i + 1));
+            workers[i].setDaemon(true); workers[i].start();
+        }
+        Thread.sleep(5000);
+        // 두 스레드의 상태와 스택 일부를 출력한다 (생략) ...
+        long start = System.nanoTime();
+        try { query(ds); } catch (SQLException e) {
+            System.out.println("세 번째 요청: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            System.out.println("  (" + (System.nanoTime() - start) / 1_000_000 + "ms 대기)");
+        }
+        System.exit(0);
+    }
+
+    static String query(HikariDataSource ds) throws SQLException {
+        try (Connection con = ds.getConnection(); Statement st = con.createStatement()) {
+            if (Boolean.getBoolean("queryTimeout")) st.setQueryTimeout(1);
+            try (ResultSet rs = st.executeQuery("select 'pong'")) { rs.next(); return rs.getString(1); }
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (JDK 21.0.13, HikariCP 6.3.3, H2 2.3.232 TCP 서버 모드)"><code class="language-text">정상: pong
+request-1 5초 뒤 상태=RUNNABLE
+    at java.base/sun.nio.ch.Net.poll(Native Method)
+    at org.h2.jdbc.JdbcConnection.prepareCommand(JdbcConnection.java:1164)
+    at org.h2.jdbc.JdbcStatement.executeQuery(JdbcStatement.java:94)
+    at SilentDb.query(SilentDb.java:64)
+request-2 5초 뒤 상태=RUNNABLE
+    at java.base/sun.nio.ch.Net.poll(Native Method)
+    at org.h2.jdbc.JdbcConnection.prepareCommand(JdbcConnection.java:1164)
+    at org.h2.jdbc.JdbcStatement.executeQuery(JdbcStatement.java:94)
+    at SilentDb.query(SilentDb.java:64)
+세 번째 요청: SQLTransientConnectionException: HikariPool-1 - Connection is not available, request timed out after 1002ms (total=2, active=2, idle=0, waiting=0)
+  (1017ms 대기)</code></pre>
+<p>대기 시간(1002ms, 1017ms)은 실행마다 조금씩 다르다. 두 요청 스레드는 5초가 지나도 <code>executeQuery</code> 안에서 소켓 응답을 기다리고 있고, 프로그램을 끝내지 않으면 계속 그 자리에 있다. 세 번째 요청은 1초 뒤 풀 대기 시간 초과로 실패했다. <code>-DqueryTimeout=true</code>로 쿼리 타임아웃 1초를 걸고 다시 돌려도 결과는 같았고, 멈춘 자리만 <code>JdbcConnection.setQueryTimeout</code>으로 바뀌었다. H2 클라이언트는 그 값을 서버에 보내는데 그 응답부터 오지 않기 때문이다.</p>
+<p>스레드 상태가 <code>BLOCKED</code>나 <code>WAITING</code>이 아니라 <code>RUNNABLE</code>이라는 점도 기억해 둘 만하다. 소켓 읽기에서 멈춘 스레드는 스레드 덤프에서 일하는 것처럼 보인다. 판단은 상태가 아니라 스택 맨 위의 소켓 읽기 프레임으로 한다.</p>
+<h4>왜 그런가</h4>
+<p>DB 접근에는 이름이 비슷한 타임아웃이 여럿 있고, 각자 지키는 구간이 다르다.</p>
+<div class="table-wrap"><table><thead><tr><th>타임아웃</th><th>지키는 구간</th><th>위 실험에서</th></tr></thead><tbody>
+<tr><td>풀의 <code>connectionTimeout</code></td><td>풀에서 커넥션을 빌리려고 기다리는 시간</td><td>세 번째 요청을 1초 만에 실패시켰다</td></tr>
+<tr><td>쿼리 타임아웃(<code>Statement.setQueryTimeout</code>, 스프링의 트랜잭션 타임아웃이 쓰는 수단)</td><td>문장 하나의 실행 시간. 시간이 지나면 문장 실행이 취소된다</td><td>H2 클라이언트는 이 값을 서버에 보내는데, 네트워크가 조용하니 그 응답부터 오지 않았다</td></tr>
+<tr><td>드라이버의 소켓 타임아웃</td><td>보낸 요청의 응답을 소켓에서 기다리는 시간</td><td>설정하지 않았다. 멈춘 두 스레드를 깨울 수 있는 것은 이것뿐이다</td></tr>
+</tbody></table></div>
+<p>HikariCP 위키의 Rapid Recovery 문서는 이 경계를 분명히 적는다. 커넥션이 풀 밖으로 나간 뒤에는 HikariCP가 빠른 복구를 보장할 수단이 거의 없고, 사용 중인 커넥션은 운영체제 수준의 TCP 타임아웃이 일어날 때까지 "붙잡힌" 채로 있으며, 그 시간은 운영체제 설정에 따라 몇 시간에 이를 수 있다는 것이다. 그래서 문서는 드라이버 수준의 소켓 타임아웃을 반드시 설정하라고 하고, 값은 가장 오래 걸리는 SQL 트랜잭션의 2~3배 또는 30초 가운데 긴 쪽 이상을 권한다.</p>
+<p>JDBC 표준에도 같은 구분이 있다. <code>Connection.setNetworkTimeout</code>의 Javadoc은 이 값을 "데이터베이스가 요청 하나에 응답하기를 기다리는 최대 시간"으로 정의하고, 쿼리 타임아웃과는 독립된 값이라고 적는다. 시간이 지나면 기다리던 메서드는 <code>SQLException</code>으로 돌아오고 그 커넥션은 닫힌 것으로 표시된다. 같은 Javadoc은 쿼리 타임아웃에 의한 문장 취소가 네트워크 문제로 실패할 수 있다는 것도 적어 둔다. 위 실험의 쿼리 타임아웃이 아무 일도 하지 못한 것이 그 경우다.</p>
+<h4>고치는 법</h4>
+<p>쓰는 드라이버의 연결 타임아웃과 소켓 타임아웃을 명시한다. MySQL Connector/J 문서에 따르면 <code>connectTimeout</code>(소켓 연결 타임아웃)과 <code>socketTimeout</code>(네트워크 소켓 동작의 타임아웃)은 둘 다 밀리초 단위이고 기본값이 0, 곧 "타임아웃 없음"이다. 아무것도 적지 않은 JDBC URL은 위 실험과 같은 상태다. 다음처럼 URL에 값을 준다(값은 예시다).</p>
+<pre><code class="language-properties">spring.datasource.url=jdbc:mysql://db.example.internal:3306/shop?connectTimeout=3000&socketTimeout=60000</code></pre>
+<p>값을 정할 때는 두 가지를 함께 본다. 소켓 타임아웃이 정상적인 쿼리보다 짧으면 느리지만 멀쩡한 쿼리가 응답을 받기 전에 끊긴다. JDBC 표준의 <code>setNetworkTimeout</code>도 이 타임아웃을 효과가 가혹한 수단이라고 부르며, 트랜잭션 타임아웃 같은 더 평범한 타임아웃보다 먼저 걸리지 않을 만큼 큰 값을 주라고 적는다. 그래서 가장 긴 쿼리보다 넉넉히 길게 잡는다. 오래 걸리는 배치나 리포트 쿼리가 있다면 그 작업만 타임아웃이 긴 별도의 데이터소스를 쓰게 나누는 편이 온라인 요청의 값을 짧게 유지하는 데 낫다. 그리고 소켓 타임아웃은 "문장이 너무 오래 걸린다"를 다루는 수단이 아니다. 그것은 쿼리 타임아웃과 트랜잭션 타임아웃의 몫이고, 소켓 타임아웃은 그 수단들이 닿지 않는 응답 없는 네트워크를 위한 마지막 안전망이다.</p>
+</x-body>
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/connector-j/en/connector-j-connp-props-networking.html">MySQL Connector/J Developer Guide — Configuration Properties: Networking</a> — <code>connectTimeout</code>과 <code>socketTimeout</code>의 뜻과 기본값 0(타임아웃 없음)</li>
+<li><a href="https://github.com/brettwooldridge/HikariCP/wiki/Rapid-Recovery">HikariCP Wiki — Rapid Recovery</a> — 풀 밖으로 나간 커넥션은 TCP 타임아웃까지 붙잡힌다는 것, 드라이버 소켓 타임아웃 설정 권고와 권장 값</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.sql/java/sql/Connection.html">Connection (Java SE 21 API)</a> — <code>setNetworkTimeout</code>의 정의, 만료 때 커넥션이 닫힌 것으로 표시된다는 것, 쿼리 타임아웃과 독립이라는 설명</li>
+<li><a href="https://github.com/brettwooldridge/HikariCP/blob/dev/README.md">HikariCP README</a> — <code>connectionTimeout</code>은 풀에서 커넥션을 기다리는 최대 시간이라는 정의</li>
+</x-refs>
+</x-item>
+
+<x-item id="tx-sql-string-concat" harm="보안">
+<x-title>외부 입력을 문자열 연결로 SQL에 넣는다</x-title>
+<x-symptom><code>"... where id = '" + input + "'"</code>처럼 만든 SQL은 입력에 든 작은따옴표가 문자열 리터럴을 닫아, 입력의 나머지가 값이 아니라 SQL 문법이 된다. <code>x' or '1'='1</code> 하나로 조건이 무력해져 모든 행이 조회되고, 같은 방식으로 UPDATE·DELETE의 조건도 무너진다.</x-symptom>
+<x-see to="spring-db1/01" h="SQL 인젝션과 파라미터 바인딩">문자열 연결과 바인딩에 같은 입력을 넣은 실험, 바인딩이 구조와 값을 분리하는 원리</x-see>
+</x-item>
+
+<x-item id="tx-mybatis-dollar-order-by" harm="보안">
+<x-title>정렬 열이나 검색어를 MyBatis <code>${}</code>로(또는 문자열 연결로) 그대로 끼워 넣는다</x-title>
+<x-symptom><code>?</code>는 값 자리에만 쓸 수 있어서 정렬 열, 테이블 이름에는 바인딩이 통하지 않는다. 그래서 화면의 정렬 파라미터를 <code>order by ${sort}</code>에 그대로 넘기거나 <code>like '%${keyword}%'</code>로 쓰게 되는데, <code>${}</code>는 값을 이스케이프하지 않고 SQL 문자열에 끼우는 문자열 치환이라 그대로 SQL 인젝션 경로가 된다.</x-symptom>
+<x-see to="spring-db2/03" h="문자열 치환"><code>#{}</code>와 <code>${}</code>의 차이, <code>order by ?</code>가 동작하지 않는 실험, 허용 목록으로 대응시키는 코드</x-see>
+<x-see to="querydsl/06" h="검증하지 않는 Sort">요청으로 들어온 정렬 속성을 허용 목록으로 받는 방법</x-see>
+</x-item>
+
+<x-item id="tx-update-delete-without-where" harm="데이터 손상">
+<x-title>조건이 비어 버릴 수 있는 UPDATE·DELETE를 실행한다</x-title>
+<x-symptom>WHERE가 없는 UPDATE·DELETE는 테이블의 모든 행이 대상이고, 자동 커밋이면 실행 즉시 확정된다. 손으로 친 SQL에서만 생기는 일이 아니다. 동적 쿼리에서 조건 값이 모두 <code>null</code>이면 MyBatis의 <code>&lt;where&gt;</code>도, Querydsl의 <code>where()</code>도 WHERE 절을 통째로 빼므로, 검색에서는 "전체 조회"였던 동작이 삭제·수정에서는 "전체 삭제"가 된다.</x-symptom>
+<x-see to="db-intro/03" h="WHERE가 곧 범위다">WHERE 없는 UPDATE의 범위와 MySQL의 안전 갱신 모드(<code>sql_safe_updates</code>)</x-see>
+<x-see to="spring-db2/06" h="where는 null 조건을 건너뛴다">모든 조건이 null이면 where 절이 사라지는 규칙과 그것이 위험한 경우</x-see>
+<x-see to="spring-db2/03" h="기능 정리 1">MyBatis의 <code>&lt;where&gt;</code>가 남은 내용이 있을 때만 WHERE를 붙이는 구현(조건이 하나도 맞지 않으면 WHERE가 붙지 않는다)</x-see>
+</x-item>
+
+<x-item id="tx-lost-update-read-modify-write" harm="데이터 손상">
+<x-title>읽어 온 값으로 자바에서 계산한 결과를 그대로 UPDATE한다</x-title>
+<x-symptom>재고나 잔액을 SELECT로 읽고 자바에서 빼거나 더한 뒤 <code>set balance = ?</code>로 써 넣으면, 동시에 들어온 두 요청이 같은 값을 읽고 각자 계산한 상수를 차례로 덮어쓴다. 두 번 차감했는데 한 번만 줄어든다(갱신 손실). 트랜잭션 안에 있어도, MySQL InnoDB의 기본 격리 수준인 REPEATABLE READ에서도 오류 없이 일어난다.</x-symptom>
+<x-see to="spring-db1/03" h="DB 락 실습 2">두 세션으로 재현한 갱신 손실, <code>FOR UPDATE</code>로 읽기부터 줄을 세우는 법, 계산을 UPDATE 문 안으로 옮기는 법(<code>balance = balance - ?</code>)</x-see>
+<x-see to="db-basic/08" h="갱신 손실과 쓰기 치우침 다시 보기">REPEATABLE READ에서도 일어나는 이유와 막는 네 가지 방법(상대 갱신과 바뀐 행 수 확인, 잠금 읽기, 버전 열, SERIALIZABLE)</x-see>
+</x-item>
+
+<x-item id="tx-synchronized-transactional" harm="데이터 손상">
+<x-title><code>@Transactional</code> 메서드에 <code>synchronized</code>를 붙여 동시 갱신을 막으려 한다</x-title>
+<x-symptom>재고 차감처럼 "읽고, 빼고, 쓰는" 서비스 메서드에 <code>synchronized</code>를 붙이거나 본문을 <code>synchronized</code> 블록으로 감싸면 한 번에 한 요청만 실행되니 안전하다고 믿는다. 그러나 락은 메서드 본문이 끝날 때 풀리고 커밋은 그 뒤 프록시에서 일어나므로, 다음 요청은 아직 커밋되지 않은 차감을 보지 못한 채 같은 값을 읽는다. 서버가 두 대 이상이면 처음부터 아무것도 막지 못한다.</x-symptom>
+<x-see to="spring-db2/07" h="호출 하나가 지나가는 길"><code>invokeWithinTransaction</code>이 대상 메서드를 부른 뒤에 커밋하는 순서와 그 흐름도</x-see>
+<x-see to="spring-db1/03" h="DB 락 실습 2">두 세션으로 재현한 갱신 손실과 <code>FOR UPDATE</code>, 계산을 UPDATE 문 안으로 옮기는 법</x-see>
+<x-see to="db-basic/08" h="갱신 손실과 쓰기 치우침 다시 보기">갱신 손실을 막는 네 가지 방법(상대 갱신과 바뀐 행 수 확인, 잠금 읽기, 버전 열, SERIALIZABLE)</x-see>
+<x-body>
+<p>재고 행 하나(처음 100개)를 여러 스레드가 1개씩 100번 차감한다. 기대하는 결과는 0이다. 서비스는 스프링 빈으로 등록하고 <code>@EnableTransactionManagement</code>가 만든 CGLIB 프록시를 통해 호출한다.</p>
+<pre><code class="language-java">static class StockService {
+    final JdbcTemplate jdbc;
+    StockService(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+
+    @Transactional
+    public synchronized void decrease(long id, int qty) {     // 한 번에 한 스레드만 들어온다
+        Integer stock = jdbc.queryForObject("select stock from item where id = ?", Integer.class, id);
+        jdbc.update("update item set stock = ? where id = ?", stock - qty, id);
+    }
+}
+
+@Configuration
+@EnableTransactionManagement
+static class Config {
+    @Bean DataSource dataSource() {
+        return new DriverManagerDataSource("jdbc:h2:mem:stock;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000", "sa", "");
+    }
+    @Bean JdbcTemplate jdbcTemplate(DataSource ds) { return new JdbcTemplate(ds); }
+    @Bean PlatformTransactionManager txManager(DataSource ds) {
+        return new DataSourceTransactionManager(ds) {
+            @Override protected void doCommit(DefaultTransactionStatus status) {
+                sleep(COMMIT_DELAY_MS);                            // 커밋에 걸리는 시간을 흉내 낸다(0 또는 2)
+                super.doCommit(status);
+            }
+        };
+    }
+    @Bean StockService stockService(JdbcTemplate jdbc) { return new StockService(jdbc); }
+}
+
+static void run(String name, Runnable call) throws Exception {
+    jdbc.update("update item set stock = 100 where id = 1");
+    ExecutorService pool = Executors.newFixedThreadPool(8);
+    for (int i = 0; i < 100; i++) pool.submit(call);           // call = () -> service.decrease(1, 1)
+    pool.shutdown();
+    pool.awaitTermination(1, TimeUnit.MINUTES);
+    Integer stock = jdbc.queryForObject("select stock from item where id = 1", Integer.class);
+    System.out.printf("%s 100번 차감 → 남은 재고 %d (기대값 0)%n", name, stock);
+}
+// main: 컨텍스트 생성, create table item(id bigint primary key, stock int not null, version bigint not null),
+//       insert into item values (1, 100, 0), 아래 고치는 법의 메서드들까지 차례로 run(...) ...
+// sleep(ms)는 Thread.sleep을 감싼 도우미 ...</code></pre>
+<p>H2 인메모리 DB의 커밋은 매우 빠르다. 네트워크 너머의 DB는 커밋 한 번에 왕복과 로그 기록이 들어가므로 그만큼 걸린다. 그 차이를 보려고 트랜잭션 매니저의 <code>doCommit</code> 앞에 지연을 넣을 수 있게 했다. 지연 0ms로 여덟 번, 2ms로 세 번 실행했다.</p>
+<pre data-label="실행 결과 (JDK 21.0.13, Spring Framework 6.2.19, H2 2.3.232)"><code class="language-text">커밋 지연 0ms
+synchronized @Transactional 100번 차감 → 남은 재고 1 (기대값 0)    ← 여덟 번 실행에서 1, 7, 3, 3, 4, 4, 4, 5
+커밋 지연 2ms
+synchronized @Transactional 100번 차감 → 남은 재고 50 (기대값 0)   ← 세 번 모두 50</code></pre>
+<p>지연이 없어도 차감이 사라졌고, 몇 개가 사라지는지는 실행마다 달랐다. 커밋에 2ms가 걸리게 하자 세 번 모두 정확히 절반이 사라졌다. 예외도 경고도 없다. <code>synchronized</code>가 실제로 작동해 한 번에 한 스레드만 본문을 실행했는데도 그렇다.</p>
+<h4>왜 그런가</h4>
+<p>먼저 락이 풀리는 시점이다. JLS 8.4.3.6절에 따르면 <code>synchronized</code> 인스턴스 메서드는 실행 전에 <code>this</code>의 모니터를 얻고, 14.19절에 따르면 <code>synchronized</code> 문은 블록이 정상적으로든 예외로든 끝나면 모니터를 푼다. 메서드에 붙이든 본문을 블록으로 감싸든 락은 <b>대상 객체의 메서드 본문이 끝나는 순간</b> 풀린다. 여기서 <code>this</code>는 프록시가 아니라 프록시가 감싼 실제 객체다.</p>
+<p>다음은 커밋 시점이다. 스프링 레퍼런스는 선언적 트랜잭션을 <code>TransactionInterceptor</code>를 쓰는 AOP 프록시가 메서드 호출을 "둘러싸서(around)" 구동한다고 설명한다. 순서는 소스에서 확인할 수 있다. Spring Framework 6.2.19의 <code>TransactionInterceptor.invoke</code>는 <code>invokeWithinTransaction(invocation.getMethod(), targetClass, invocation::proceed)</code>를 부르고, <code>TransactionAspectSupport.invokeWithinTransaction</code>의 명령형 경로는 다음 순서로 실행된다.</p>
+<ol>
+<li><code>createTransactionIfNecessary</code>로 트랜잭션을 시작한다(커넥션을 얻고 자동 커밋을 끈 뒤 스레드에 묶는다).</li>
+<li><code>invocation.proceedWithInvocation()</code>으로 대상 메서드를 실행한다. <code>synchronized</code> 모니터를 얻고 푸는 일은 전부 이 안에서 끝난다.</li>
+<li>예외가 나왔으면 <code>completeTransactionAfterThrowing</code>, finally에서 <code>cleanupTransactionInfo</code>를 거친다.</li>
+<li>정상 반환이면 그 뒤에 <code>commitTransactionAfterReturning(txInfo)</code>가 커밋한다.</li>
+</ol>
+<p>그래서 "락 해제 → 커밋" 사이에 틈이 생기고, 기다리던 다음 스레드는 그 틈에 들어와 SELECT를 실행한다. 커밋되지 않은 변경은 다른 커넥션에 보이지 않는다. H2의 기본 격리 수준은 READ COMMITTED이고, MySQL InnoDB의 기본인 REPEATABLE READ에서도 매뉴얼에 따르면 일반 SELECT(일관된 읽기)는 아직 커밋되지 않은 트랜잭션의 변경을 보지 않는다. 다음 스레드는 이전 값을 읽는다. 커밋 지연 2ms에서 정확히 절반이 사라진 이유는 다음 시간표로 설명된다.</p>
+<pre class="diagram">요청 A: 읽기 100 → 쓰기 99 → 반환(락 해제) ─[커밋 중]─ 커밋(99)
+요청 B:                       └ 진입, 읽기 100(A 미커밋) → UPDATE는 A의 행 락을 기다림
+                                                          └ A 커밋 뒤 쓰기 99 → 반환 ─[커밋 중]─ 커밋(99)
+요청 C:                                                                   └ 진입, 읽기 99(B 미커밋) → B 커밋 뒤 쓰기 98
+요청 D:                                                                   ... C가 커밋 중일 때 진입, 읽기 99 → 쓰기 98
+결과: 99, 99, 98, 98, 97, 97 ... 두 번에 한 번 차감이 사라진다</pre>
+<p>둘째 스레드의 UPDATE는 첫째 스레드의 행 락 때문에 기다렸다가 실행되지만, 쓰는 값은 자바에서 미리 계산한 상수(<code>stock - qty</code>)이므로 기다린 뒤에도 옛 값으로 계산한 99를 그대로 쓴다. 지연이 0이면 대개는 다음 스레드가 모니터를 얻기 전에 커밋이 끝나지만, 스레드 전환 시점에 따라 가끔 틈에 걸려서 사라지는 수가 실행마다 달라진다. 실제 DB에서는 커밋이 더 오래 걸리므로 틈도 넓다.</p>
+<p>그리고 <code>synchronized</code>는 JVM 하나 안의 객체 모니터다. 같은 애플리케이션을 서버 두 대에 띄우면 두 JVM의 모니터는 서로를 모르므로, 서버 사이의 동시 요청은 처음부터 아무 배제 없이 같은 행을 읽고 쓴다. 이 실수가 개발 환경(서버 한 대, 요청 몇 개)에서 드러나지 않다가 운영에서 재고가 맞지 않는 형태로 나타나는 이유다.</p>
+<h4>고치는 법</h4>
+<p>같은 실험에서 메서드만 바꿔 실행했다. 커밋 지연 0ms(여덟 번)와 2ms(세 번) 모두에서 아래 세 방법은 매번 남은 재고 0이었다.</p>
+<pre><code class="language-java">@Transactional
+public void decreaseAtomic(long id, int qty) {                // 1. 읽기와 쓰기를 한 문장으로
+    int rows = jdbc.update("update item set stock = stock - ? where id = ? and stock >= ?", qty, id, qty);
+    if (rows == 0) throw new IllegalStateException("재고 부족");
+}
+
+@Transactional
+public void decreaseForUpdate(long id, int qty) {             // 2. 비관적 락: 읽을 때부터 줄을 세운다
+    Integer stock = jdbc.queryForObject("select stock from item where id = ? for update", Integer.class, id);
+    jdbc.update("update item set stock = ? where id = ?", stock - qty, id);
+}
+
+@Transactional
+public boolean decreaseVersioned(long id, int qty) {          // 3. 낙관적 락: 버전이 그대로일 때만 쓴다
+    Map<String, Object> row = jdbc.queryForMap("select stock, version from item where id = ?", id);
+    int stock = (Integer) row.get("STOCK");
+    long version = (Long) row.get("VERSION");
+    return jdbc.update("update item set stock = ?, version = version + 1 where id = ? and version = ?",
+            stock - qty, id, version) == 1;                   // false면 호출자가 다시 시도한다
+}</code></pre>
+<ul>
+<li><b>원자적 UPDATE.</b> 계산을 DB 안으로 옮기면 "읽기"가 UPDATE 문 자체가 하는 일이 되고, 행 락을 쥔 채 최신 값에서 뺀다. <code>stock >= ?</code> 조건과 바뀐 행 수(0이면 재고 부족)로 음수 재고도 막는다. 가장 단순하고 락을 쥐는 시간도 가장 짧다.</li>
+<li><b>비관적 락(<code>SELECT ... FOR UPDATE</code>).</b> 둘째 요청의 SELECT가 첫째 요청의 커밋까지 기다리므로 커밋된 값을 읽는다. 읽은 값으로 복잡한 검사를 해야 할 때 쓴다. 이 락은 트랜잭션이 끝날 때 풀리므로 반드시 트랜잭션 안에서 실행해야 한다(다음 항목).</li>
+<li><b>낙관적 락(버전 열).</b> 갱신 조건에 읽을 때의 버전을 넣어, 그 사이에 누가 바꿨으면 0행이 갱신되게 한다. 실험에서는 호출자가 <code>false</code>를 받으면 다시 시도하게 했고, 결과는 0이었지만 재시도가 실행마다 달라 201~292번 일어났다. 같은 행에 요청이 몰리는 재고 차감에서는 충돌과 재시도가 그만큼 많다는 뜻이다. JPA라면 <code>@Version</code>이 같은 조건을 UPDATE에 붙여 준다.</li>
+</ul>
+<p><code>synchronized</code>를 프록시 <b>바깥</b>으로 옮겨 <code>synchronized (lock) { service.decrease(1, 1); }</code>처럼 커밋까지 락 안에 넣으면 이 실험에서도 0이 나왔다. 그러나 이 방법은 서버가 한 대일 때만 맞고, 모든 상품의 차감이 락 하나에 줄을 서며, 호출하는 쪽이 이미 바깥 트랜잭션 안에 있으면(<code>REQUIRED</code>로 참여하면) 실제 커밋은 바깥 트랜잭션이 끝날 때 일어나므로 같은 틈이 다시 생긴다. 동시성 제어는 데이터가 있는 DB에 맡기는 것이 맞다.</p>
+</x-body>
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/tx-decl-explained.html">Spring Framework Reference — Understanding the Spring Framework's Declarative Transaction Implementation</a> — AOP 프록시가 <code>TransactionInterceptor</code>로 메서드 호출을 둘러싸 트랜잭션을 구동한다는 것</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html#jls-8.4.3.6">JLS 21 §8.4.3.6 synchronized Methods</a> — 인스턴스 메서드는 실행 전에 <code>this</code>의 모니터를 얻는다</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-14.html#jls-14.19">JLS 21 §14.19 The synchronized Statement</a> — 블록이 정상·비정상으로 끝나면 모니터를 풀고, 메서드와 같은 락이다</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html">MySQL 8.4 Reference Manual — Consistent Nonlocking Reads</a> — 일관된 읽기는 커밋되지 않은 트랜잭션의 변경을 보지 않는다, REPEATABLE READ의 스냅샷 시점</li>
+<li><a href="https://www.h2database.com/html/advanced.html">H2 — Advanced (Transaction Isolation, Multi-Version Concurrency Control)</a> — 기본 격리 수준이 READ COMMITTED라는 것, 같은 행을 갱신하려는 연결은 락 시간 초과까지 기다린다는 것</li>
+</x-refs>
+</x-item>
+
+<x-item id="tx-for-update-outside-transaction" harm="데이터 손상">
+<x-title><code>SELECT ... FOR UPDATE</code>를 트랜잭션 밖에서 실행한다</x-title>
+<x-symptom>갱신 손실을 막으려고 조회에 <code>FOR UPDATE</code>를 붙였지만 그 호출이 트랜잭션 안에 있지 않으면(<code>@Transactional</code> 누락, 같은 클래스 안의 내부 호출 등) 자동 커밋으로 실행되어 조회가 끝나는 순간 락이 풀린다. SQL에는 락이 적혀 있는데 아무것도 지켜지지 않고, 오류도 경고도 없이 갱신 손실이 그대로 일어난다.</x-symptom>
+<x-see to="spring-db1/03" h="DB 락 실습 2">잠금 읽기가 읽기와 쓰기 사이의 틈을 막는 원리와, 자동 커밋 모드에서는 소용이 없다는 매뉴얼의 설명</x-see>
+<x-see to="spring-db1/03" h="자동 커밋과 수동 커밋">자동 커밋에서 문장 하나가 트랜잭션 하나가 되는 규칙</x-see>
+<x-body>
+<p>잔액을 <code>FOR UPDATE</code>로 잠그며 읽고, 자바에서 계산한 값을 써 넣는 출금 코드다. 같은 메서드를 한 번은 트랜잭션 없이, 한 번은 트랜잭션 안에서 두 스레드가 동시에 부른다.</p>
+<pre><code class="language-java">public class ForUpdateNoTx {
+    static JdbcTemplate jdbc;
+
+    /** 잔액을 잠그며 읽고, 자바에서 계산한 값을 써 넣는다. */
+    static void withdraw(String who, int amount) {
+        Integer balance = jdbc.queryForObject("select balance from account where id = 1 for update", Integer.class);
+        System.out.println("  " + who + ": 읽은 잔액=" + balance);
+        sleep(300);                                   // 한도 검사 같은, 읽기와 쓰기 사이의 로직
+        jdbc.update("update account set balance = ? where id = 1", balance - amount);
+    }
+
+    public static void main(String[] args) throws Exception {
+        DriverManagerDataSource ds = new DriverManagerDataSource("jdbc:h2:mem:fu;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000", "sa", "");
+        jdbc = new JdbcTemplate(ds);
+        TransactionTemplate tx = new TransactionTemplate(new DataSourceTransactionManager(ds));
+        jdbc.execute("create table account(id bigint primary key, balance int not null)");
+        jdbc.update("insert into account values (1, 10000)");
+
+        System.out.println("트랜잭션 없이 호출");
+        twoRequests(() -> withdraw("요청 A", 1000), () -> withdraw("요청 B", 1000));
+
+        jdbc.update("update account set balance = 10000 where id = 1");
+        System.out.println("트랜잭션 안에서 호출");
+        twoRequests(() -> tx.executeWithoutResult(s -> withdraw("요청 A", 1000)),
+                    () -> tx.executeWithoutResult(s -> withdraw("요청 B", 1000)));
+    }
+
+    static void twoRequests(Runnable a, Runnable b) throws InterruptedException {
+        Thread ta = new Thread(a), tb = new Thread(b);
+        ta.start(); sleep(100); tb.start();           // A가 먼저 읽게 한다
+        ta.join(); tb.join();
+        System.out.println("  두 번 출금한 뒤 잔액=" + jdbc.queryForObject("select balance from account where id = 1", Integer.class));
+    }
+
+    static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException e) { throw new IllegalStateException(e); } }
+}</code></pre>
+<pre data-label="실행 결과 (JDK 21.0.13, Spring Framework 6.2.19, H2 2.3.232)"><code class="language-text">트랜잭션 없이 호출
+  요청 A: 읽은 잔액=10000
+  요청 B: 읽은 잔액=10000
+  두 번 출금한 뒤 잔액=9000
+트랜잭션 안에서 호출
+  요청 A: 읽은 잔액=10000
+  요청 B: 읽은 잔액=9000
+  두 번 출금한 뒤 잔액=8000</code></pre>
+<p>세 번 실행해 세 번 모두 같은 결과였다. 트랜잭션 없이 부르면 요청 B는 기다리지 않고 요청 A와 같은 10,000을 읽었고, 1,000씩 두 번 출금했는데 잔액은 9,000이다. 트랜잭션 안에서 부르면 요청 B의 조회가 요청 A의 커밋까지 기다렸다가 9,000을 읽었다. 두 실행에서 SQL은 한 글자도 다르지 않다.</p>
+<h4>왜 그런가</h4>
+<p><code>FOR UPDATE</code>가 건 락의 수명은 문장이 아니라 트랜잭션이다. MySQL 8.4 매뉴얼은 <code>FOR SHARE</code>와 <code>FOR UPDATE</code>가 건 모든 락이 트랜잭션이 커밋되거나 롤백될 때 풀린다고 적고, 같은 절에서 잠금 읽기는 자동 커밋을 끈 상태(<code>START TRANSACTION</code>으로 트랜잭션을 시작했거나 <code>autocommit</code>을 0으로 둔 상태)에서만 가능하다고 밝힌다.</p>
+<p>자동 커밋 모드에서는 문장 하나가 트랜잭션 하나다. <code>Connection.setAutoCommit</code>의 Javadoc에 따르면 자동 커밋 모드의 커넥션은 모든 SQL 문을 개별 트랜잭션으로 실행하고 커밋하며, 커밋은 문장이 완료될 때 일어난다. SELECT 문은 결과 집합이 닫힐 때 완료된 것으로 본다. <code>JdbcTemplate</code>은 스레드에 묶인 트랜잭션 커넥션이 없으면 호출마다 커넥션을 얻어 쓰고 돌려준다. 그래서 <code>queryForObject</code>가 값을 돌려준 시점에는 결과 집합이 닫히고 그 조회의 트랜잭션이 커밋되어 락이 이미 풀려 있다. 자바 변수에 담긴 10,000은 아무 락으로도 보호되지 않는 값이고, 뒤의 UPDATE는 다른 트랜잭션에서 실행된다.</p>
+<p>이 실수가 오래 살아남는 이유는 눈에 보이는 단서가 없기 때문이다. 문장은 정상 실행되고, 코드 검토에서는 <code>for update</code>가 적혀 있으니 안전해 보이고, 요청이 하나씩 오는 테스트는 모두 통과한다. 트랜잭션이 빠지는 경로는 여러 가지다. 서비스 메서드에 <code>@Transactional</code>을 붙이지 않았거나, 붙였지만 같은 클래스 안에서 <code>this</code>로 불러 프록시를 거치지 않았거나(앞의 내부 호출 항목), 잠금 읽기와 갱신을 서로 다른 스레드에서 실행한 경우가 모두 같은 결과를 만든다.</p>
+<h4>고치는 법</h4>
+<ul>
+<li><b>잠금 읽기, 계산, 쓰기를 한 트랜잭션에 넣는다.</b> 위 실험의 둘째 실행이다. 락은 커밋까지 유지되므로 다른 요청은 조회에서부터 기다린다.</li>
+<li><b>트랜잭션 경계에 기대지 않는 문장으로 바꾼다.</b> <code>update account set balance = balance - ? where id = ? and balance >= ?</code>처럼 계산을 UPDATE 안으로 옮기면 읽기와 쓰기가 한 문장이 되어, 자동 커밋으로 실행되더라도 두 출금이 모두 반영된다. 바뀐 행 수가 0이면 잔액 부족으로 처리한다. 원리는 스프링 DB 1편 03회에 있다.</li>
+<li><b>동시 실행으로 검증한다.</b> 이 실수는 스레드 하나로는 드러나지 않는다. 위 실험처럼 두 스레드가 같은 행을 동시에 갱신한 뒤 결과 값을 확인하는 테스트가 있어야 락이 실제로 걸리는지 알 수 있다.</li>
+</ul>
+<p>트랜잭션 안에 넣은 뒤에는 반대쪽 비용이 생긴다. 락을 쥔 채 메서드가 오래 걸리면 같은 행을 기다리는 요청이 그만큼 줄을 서고, 대기가 길어지면 락 대기 시간 초과로 실패한다. 잠금 읽기와 커밋 사이에는 외부 호출처럼 오래 걸리는 일을 두지 않는다.</p>
+</x-body>
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html">MySQL 8.4 Reference Manual — Locking Reads</a> — 잠금 읽기는 자동 커밋을 끈 상태에서만 가능하다는 것, <code>FOR UPDATE</code>의 락이 커밋·롤백 때 풀린다는 것</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.sql/java/sql/Connection.html">Connection (Java SE 21 API)</a> — <code>setAutoCommit</code>: 자동 커밋에서 문장마다 커밋되고, SELECT는 결과 집합이 닫힐 때 완료된다는 규칙</li>
+</x-refs>
+</x-item>
+
+<x-item id="tx-check-then-insert-no-unique" harm="데이터 손상">
+<x-title>유니크 제약 없이 "조회해서 없으면 삽입"한다</x-title>
+<x-symptom>이메일 중복 가입이나 중복 신청을 <code>select count(*)</code>로 확인한 뒤 INSERT하는 코드는 요청이 차례로 올 때만 맞다. 거의 동시에 온 두 요청은 서로의 커밋되지 않은 INSERT를 보지 못해 둘 다 "없음"을 확인하고 둘 다 삽입한다. 트랜잭션으로 감싸도 달라지지 않고, 같은 값의 행이 두 개 생긴다.</x-symptom>
+<x-see to="db-basic/07" h="애플리케이션 검사만으로는">두 트랜잭션의 시간표로 본 검사 후 실행 경쟁과, UNIQUE 인덱스가 둘째 INSERT를 기다리게 한 뒤 1062 오류로 거절하는 과정</x-see>
+<x-see to="db-design2/06" h="UPSERT 최적화">"없으면 INSERT, 있으면 UPDATE"를 애플리케이션에서 흉내 낼 때의 경쟁과 교착 상태, 한 문장으로 처리하는 <code>ON DUPLICATE KEY UPDATE</code></x-see>
+</x-item>
+
+<x-item id="tx-count-check-write-skew" harm="데이터 손상">
+<x-title>여러 행에 걸친 규칙을 조회로 확인한 뒤 자기 행만 고친다</x-title>
+<x-symptom>"당직은 최소 한 명 남아야 한다" 같은 규칙을 평범한 SELECT로 인원을 세어 확인하고 자기 행만 고치는 코드는, 동시에 실행된 두 트랜잭션이 같은 인원수를 보고 둘 다 통과한다. 서로 다른 행을 쓰므로 락 충돌도 오류도 없이 둘 다 커밋되고, 규칙이 깨진 상태가 남는다(쓰기 치우침). MySQL InnoDB의 REPEATABLE READ에서 그대로 일어난다.</x-symptom>
+<x-see to="db-basic/08" h="격리 수준과 이상 현상">당직 의사 예로 본 쓰기 치우침과, 이것이 표준의 세 이상 현상 표에 없는 현상이라는 것</x-see>
+<x-see to="db-basic/08" h="갱신 손실과 쓰기 치우침 다시 보기">REPEATABLE READ에서는 둘 다 커밋되고 SERIALIZABLE에서는 한쪽이 1213을 받는 실행 결과, 규칙 검사에 쓰는 읽기만 잠금 읽기로 바꾸는 방법</x-see>
+</x-item>
+
+<x-item id="tx-lock-order-deadlock" harm="장애">
+<x-title>여러 행을 트랜잭션마다 다른 순서로 잠근다</x-title>
+<x-symptom>1번에서 2번 계좌로의 이체는 1번 행부터, 2번에서 1번으로의 이체는 2번 행부터 갱신하면, 두 트랜잭션이 서로가 쥔 행 락을 기다리는 원이 생긴다. InnoDB는 이를 감지해 한쪽 트랜잭션을 통째로 롤백하고 <code>ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction</code>을 돌려준다. 같은 행들을 반대 순서로 건드리는 요청이 겹칠 때만 나므로 테스트에서는 드러나지 않고, 재시도가 없는 코드에서는 그 요청이 그대로 실패한다.</x-symptom>
+<x-see to="db-basic/08" h="잠금과 교착 상태">이체 두 건으로 만든 교착 상태의 시간표, 희생자 롤백, 잠그는 순서를 맞추는 법과 재시도해야 하는 이유</x-see>
+<x-see to="db-design2/06" h="UPSERT 최적화">여러 행을 갱신하는 배치가 보내기 전에 기본 키 순서로 정렬해 순환 대기를 없애는 코드</x-see>
+</x-item>
+
+<x-item id="tx-update-without-index-locks-all" harm="장애">
+<x-title>인덱스가 없는 열을 조건으로 UPDATE·DELETE한다</x-title>
+<x-symptom>InnoDB의 행 락은 조건에 맞는 행이 아니라 문장이 훑은 인덱스 레코드에 걸린다. 조건 열에 알맞은 인덱스가 없어 테이블 전체를 훑는 UPDATE·DELETE·잠금 읽기는 기본 격리 수준 REPEATABLE READ에서 테이블의 모든 행을 잠그고 삽입까지 막는다. 한 건을 고치는 트랜잭션이 끝날 때까지 그 테이블에 쓰려는 다른 요청이 모두 기다린다.</x-symptom>
+<x-see to="spring-db1/03" h="DB 락 개념">락이 인덱스 레코드에 걸린다는 것과 인덱스가 없을 때의 전체 잠금, READ COMMITTED에서 달라지는 점</x-see>
+<x-see to="db-basic/08" h="네 격리 수준이 실제로 하는 일">인덱스 없는 UPDATE가 잡는 락을 격리 수준별로 비교한 실행 예</x-see>
+</x-item>
+
+<x-item id="tx-large-result-into-memory" harm="장애">
+<x-title>대량 조회 결과를 통째로 리스트로 받는다</x-title>
+<x-symptom>정산·통계·내보내기 배치에서 "전부 조회해 리스트로 받은 뒤 루프를 도는" 코드는 메모리 사용량이 행 수에 비례한다. 데이터가 적을 때는 문제없이 돌다가 테이블이 자란 어느 날 <code>OutOfMemoryError: Java heap space</code>로 죽는다. 코드를 한 행씩 처리하게 바꿔도 MySQL Connector/J는 기본 설정에서 결과 집합 전체를 먼저 메모리에 받으므로 드라이버 쪽에서 같은 일이 생긴다.</x-symptom>
+<x-see to="db-perf/01" h="쿼리 실행 흐름 1">Connector/J가 기본적으로 결과 집합을 모두 받아 메모리에 저장한다는 것과 스트리밍으로 받는 두 가지 설정</x-see>
+<x-see to="spring-db1/01" h="JDBC 개발 — 조회"><code>ResultSet</code>의 커서와 <code>setFetchSize</code>가 힌트일 뿐이라는 JDBC의 정의</x-see>
+<x-see to="spring-db2/01" h="JdbcTemplate 기능 정리"><code>RowMapper</code>는 결과를 리스트에 모으고 <code>RowCallbackHandler</code>와 <code>queryForStream</code>은 모으지 않는다는 차이</x-see>
+<x-body>
+<p>20만 행을 조회해 금액을 더하는 코드를 두 가지로 썼다. 하나는 결과를 리스트로 받은 뒤 처리하고, 다른 하나는 한 행씩 처리하고 버린다. 행마다 서로 다른 200자짜리 메모 열이 있다. H2 서버는 다른 JVM에서 TCP 서버로 띄우고, 조회하는 프로그램만 <code>-Xmx32m</code>으로 실행했다.</p>
+<pre><code class="language-java">public class BigResult {
+    record OrderLine(long id, String memo, int amount) { }
+
+    public static void main(String[] args) {
+        SingleConnectionDataSource ds = new SingleConnectionDataSource("jdbc:h2:tcp://localhost:19092/mem:big", "sa", "", true);
+        JdbcTemplate jdbc = new JdbcTemplate(ds);
+        // 20만 행, 행마다 다른 200자짜리 메모. 서버가 즉석에서 만들어 내는 결과다.
+        String sql = "select x as id, lpad(cast(x as varchar), 200, '0') as memo, 10 as amount from system_range(1, 200000)";
+        System.out.println("최대 힙=" + Runtime.getRuntime().maxMemory() / (1024 * 1024) + "MB");
+
+        if (args[0].equals("list")) {
+            // 실수: 결과 전체를 리스트로 받은 다음 처리한다
+            List<OrderLine> all = jdbc.query(sql, (rs, n) -> new OrderLine(rs.getLong("id"), rs.getString("memo"), rs.getInt("amount")));
+            long sum = 0;
+            for (OrderLine o : all) sum += o.amount();
+            System.out.println("행 수=" + all.size() + ", 합계=" + sum);
+        } else {
+            // 한 행씩 처리하고 버린다
+            long[] acc = new long[2];
+            jdbc.query(sql, (RowCallbackHandler) rs -> { acc[0]++; acc[1] += rs.getInt("amount"); });
+            System.out.println("행 수=" + acc[0] + ", 합계=" + acc[1]);
+        }
+        ds.destroy();
+    }
+}</code></pre>
+<pre data-label="java -Xmx32m BigResult list (스택 발췌)"><code class="language-text">최대 힙=32MB
+Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
+    at BigResult.lambda$main$0(BigResult.java:19)
+    at org.springframework.jdbc.core.RowMapperResultSetExtractor.extractData(RowMapperResultSetExtractor.java:94)
+    at org.springframework.jdbc.core.JdbcTemplate.query(JdbcTemplate.java:476)
+    at BigResult.main(BigResult.java:19)</code></pre>
+<pre data-label="java -Xmx32m BigResult row"><code class="language-text">최대 힙=32MB
+행 수=200000, 합계=2000000</code></pre>
+<p>JDK 21.0.13, Spring Framework 6.2.19, H2 2.3.232(TCP 서버 모드)에서 실행했다. 메모리가 바닥나는 순간 어느 할당이 실패하는지는 실행에 따라 달라질 수 있으므로 스택의 맨 위 줄은 다를 수 있다.</p>
+<h4>왜 그런가</h4>
+<p>메모리는 두 층에서 쌓인다. 첫째 층은 애플리케이션이다. <code>query(sql, rowMapper)</code>는 <code>List</code>를 돌려주는 메서드이고, 스택에 보이는 <code>RowMapperResultSetExtractor</code>가 행마다 매퍼가 만든 객체를 리스트에 더한다. 리스트가 모든 객체를 참조하고 있으므로 마지막 행을 읽을 때까지 어느 것도 가비지 컬렉션 대상이 되지 않는다. 필요한 힙은 행 수 × 행 하나의 크기이고, 위 실험에서는 200자 문자열 20만 개가 32MB에 들어가지 않았다. JPA의 <code>findAll()</code>, MyBatis의 <code>selectList</code>도 결과를 리스트로 돌려주는 한 구조는 같다. 힙은 JVM 전체가 함께 쓰므로, 배치 하나가 힙을 채우면 같은 프로세스의 다른 요청도 객체를 할당하다가 같은 오류를 만날 수 있다.</p>
+<p>한 행씩 처리하는 둘째 코드는 지금 보고 있는 행만 참조한다. 처리한 행은 곧바로 수거 대상이 되므로 20만 행이든 2,000만 행이든 필요한 힙이 같다. 이 실험이 32MB로 끝난 데에는 드라이버의 몫도 있다. H2의 TCP 클라이언트는 결과를 한꺼번에 받지 않고 나누어 받아 온다(2.3.232에서 <code>SysProperties.SERVER_RESULT_SET_FETCH_SIZE</code>의 값은 100이다).</p>
+<p>둘째 층이 바로 그 드라이버다. MySQL Connector/J 문서는 기본 동작을 이렇게 적는다. 결과 집합은 기본적으로 전부 가져와 메모리에 저장한다. 그러므로 MySQL에서는 둘째 코드처럼 써도 드라이버가 20만 행을 모두 힙에 올려 둔다. 문서가 안내하는 길은 두 가지다.</p>
+<ul>
+<li>전진 전용·읽기 전용 문장에 <code>setFetchSize(Integer.MIN_VALUE)</code>를 준다. 드라이버는 이 조합을 한 행씩 흘려 받으라는 신호로 해석한다. <code>JdbcTemplate.setFetchSize</code>의 Javadoc도 MySQL이 <code>Integer.MIN_VALUE</code>에 특별한 동작을 하기 때문에 -1이 아닌 음수 값은 드라이버에 그대로 넘긴다고 적는다.</li>
+<li>연결 속성 <code>useCursorFetch=true</code>를 주고 <code>setFetchSize(n)</code>으로 한 번에 가져올 행 수를 정한다(커서 기반 가져오기).</li>
+</ul>
+<p>JDBC 표준에서 <code>Statement.setFetchSize</code>는 드라이버에 주는 힌트이고 기본값 0은 "힌트 없음"이다. 값을 어떻게 해석할지는 드라이버가 정하므로, 큰 결과를 다루는 코드는 쓰는 드라이버의 문서를 확인해야 한다.</p>
+<h4>고치는 법</h4>
+<ul>
+<li><b>가져오지 않아도 되는 것은 가져오지 않는다.</b> 위 예의 합계는 <code>select sum(amount)</code> 한 줄이면 된다. 화면에 보여 줄 목록이라면 <code>LIMIT</code>으로 한 번에 읽는 양에 상한을 둔다. 상한이 없는 조회는 테이블이 자라는 만큼 응답도 자란다.</li>
+<li><b>일정한 크기로 끊어 읽는다.</b> <code>where id > ? order by id limit 1000</code>처럼 직전 묶음의 마지막 키 다음부터 읽기를 반복하면 한 번에 메모리에 있는 것은 한 묶음뿐이고, 문장 하나하나가 짧게 끝난다.</li>
+<li><b>흘려 받으며 처리한다.</b> <code>RowCallbackHandler</code>나 <code>queryForStream</code>으로 한 행씩 처리하고, 드라이버도 위 설정으로 스트리밍하게 한다. <code>queryForStream</code>이 돌려주는 스트림은 Javadoc대로 다 쓴 뒤 닫아야 하므로 try-with-resources 안에서 쓴다.</li>
+</ul>
+<p>스트리밍에는 대가가 있다. Connector/J 문서에 따르면 한 행씩 받는 동안에는 결과를 끝까지 읽거나 닫기 전에 같은 커넥션으로 다른 쿼리를 보낼 수 없고(예외가 난다), 문장이 쥔 락은 결과를 다 읽어 문장이 끝나야 풀릴 수 있으므로 가능한 한 빨리 읽어 내야 한다. 행마다 외부 API를 부르는 식으로 느리게 소비하면 커넥션과 트랜잭션이 그 시간 내내 열려 있게 된다. 행 하나의 처리가 느리다면 끊어 읽는 쪽이 낫다.</p>
+</x-body>
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/connector-j/en/connector-j-reference-implementation-notes.html">MySQL Connector/J Developer Guide — JDBC API Implementation Notes (ResultSet)</a> — 결과 집합을 기본적으로 전부 메모리에 저장한다는 것, 스트리밍의 조건과 제약, <code>useCursorFetch</code></li>
+<li><a href="https://docs.spring.io/spring-framework/docs/6.2.x/javadoc-api/org/springframework/jdbc/core/JdbcTemplate.html">JdbcTemplate (Spring Framework 6.2 API)</a> — <code>setFetchSize</code>의 기본값 -1과 음수 값 전달, <code>RowCallbackHandler</code>를 받는 <code>query</code>, 닫아야 하는 <code>queryForStream</code></li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.sql/java/sql/Statement.html">Statement (Java SE 21 API)</a> — <code>setFetchSize</code>는 드라이버에 주는 힌트이고 기본값은 0이라는 정의</li>
+</x-refs>
+</x-item>
+
+<x-item id="tx-insert-row-by-row" harm="성능">
+<x-title>대량의 행을 자동 커밋으로 한 건씩 INSERT한다</x-title>
+<x-symptom>수만 건을 루프에서 한 건씩 INSERT하면 행마다 문장 전송과 파싱이 반복되고, 자동 커밋이면 행마다 커밋이 일어나 MySQL InnoDB 기본 설정에서는 그때마다 로그를 디스크에 내려쓰는 것을 기다린다. 건수에 비례해 느려져 데이터가 늘면 배치가 제시간에 끝나지 않는다. <code>addBatch()</code>와 <code>executeBatch()</code>로 바꿔도 MySQL Connector/J는 <code>rewriteBatchedStatements</code>의 기본값이 false라 배치의 각 항목을 따로 실행한다.</x-symptom>
+<x-see to="db-design2/06" h="UPSERT 최적화">행 하나를 넣는 비용의 구성, 여러 VALUES 목록과 적당한 크기의 커밋, JDBC 배치가 한 문장으로 가려면 필요한 드라이버 설정</x-see>
+<x-see to="jpa-basic/03" h="IDENTITY: 키를 받으려면">JPA에서 IDENTITY 키 생성을 쓰면 INSERT를 JDBC 배치로 묶을 수 없는 이유</x-see>
+</x-item>
+
+<x-item id="tx-getint-null-as-zero" harm="틀린 결과">
+<x-title>NULL일 수 있는 열을 <code>rs.getInt()</code>로 읽는다</x-title>
+<x-symptom><code>ResultSet.getInt()</code>와 <code>getLong()</code>은 SQL NULL을 읽으면 0을 돌려준다. "할인율 미정"(NULL)이 "할인 없음"(0)으로, NULL이 된 계산 열이 0원으로 바뀌어 예외 없이 화면과 계산에 들어간다.</x-symptom>
+<x-see to="db-intro/04" h="NULL: 알 수 없는 값">SQL의 NULL과 자바의 null이 다른 점, <code>getInt()</code> 직후 <code>wasNull()</code>로 구별하는 법</x-see>
+<x-see to="db-intro/05" h="식은 트리가 되고">NULL이 섞인 산술식이 NULL이 되고 그것이 <code>getInt()</code>에서 0으로 바뀌는 경로</x-see>
+</x-item>
+
+<x-item id="tx-timestamp-session-timezone" harm="틀린 결과">
+<x-title>시각 열의 시간대 기준을 정하지 않고 저장한다</x-title>
+<x-symptom>MySQL의 <code>TIMESTAMP</code>는 저장할 때 세션 시간대에서 UTC로, 읽을 때 UTC에서 세션 시간대로 변환되고, <code>DATETIME</code>은 받은 값을 변환 없이 그대로 둔다. 연결마다 세션 시간대가 다르면 같은 <code>TIMESTAMP</code> 값이 다른 시각으로 읽히고, <code>DATETIME</code>에 서버 지역의 벽시계 값을 넣어 두면 시간대가 다른 서버가 같은 테이블에 쓰는 순간 값들의 의미가 섞인다. 어느 쪽도 값에 시간대를 남기지 않으므로 섞인 뒤에는 가려낼 수 없다.</x-symptom>
+<x-see to="db-intro/02" h="날짜와 시간: DATE, DATETIME, TIMESTAMP">세션 시간대를 바꿔 가며 같은 행을 읽는 실험과 두 자료형의 변환 규칙, 2038년 상한</x-see>
+<x-see to="db-design1/08" h="데이터 타입 2: 날짜와 시간">순간과 달력 값의 구분, 순간을 저장하는 두 가지 방식과 각각이 지켜야 하는 규칙</x-see>
+</x-item>

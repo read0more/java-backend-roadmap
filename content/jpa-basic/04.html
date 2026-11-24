@@ -1,0 +1,667 @@
+<x-meta>
+deck: 객체는 참조로, 테이블은 외래 키로 연결을 표현한다. 이 차이에서 단방향·양방향 매핑과 연관관계의 주인이 왜 생겼는지, 하이버네이트 6.6을 직접 돌려 나온 SQL로 따라간다.
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li>외래 키 하나로 양쪽 조인이 되는 테이블과, 참조 하나가 한 방향만 가리키는 객체의 차이를 힙 메모리 그림과 조인 SQL로 설명할 수 있다.</li>
+<li>@ManyToOne과 @JoinColumn으로 단방향 연관관계를 매핑하고, 기본 외래 키 컬럼 이름과 저장·조회·변경 때 나가는 SQL을 예측할 수 있다.</li>
+<li>양방향 연관관계에서 참조 두 개가 외래 키 하나에 대응한다는 문제를 근거로 연관관계의 주인과 mappedBy의 의미를 설명하고, 주인을 외래 키 위치로 정할 수 있다.</li>
+<li>역방향에만 값을 넣은 코드, 1차 캐시에 남은 빈 컬렉션, toString 무한 재귀 같은 버그를 보고 원인을 짚고, 연관관계 편의 메서드로 양쪽을 맞출 수 있다.</li>
+<li>외래 키 식별자를 필드로 들고 있는 데이터 중심 모델을 참조 기반 모델로 바꾸고, 어느 관계에 반대 방향을 추가할지 판단할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 외래 키를 필드로 들고 있으면 무엇이 곤란한가</h3>
+
+<p>앞 회차에서 엔티티 하나를 테이블 하나에 매핑하는 방법을 정리했다. 클래스는 테이블이 되고, 필드는 컬럼이 되고, <code>@Id</code>는 기본 키가 된다. 그런데 실제 도메인에서 엔티티는 혼자 있지 않다. 사원은 부서에 속하고, 대출은 회원의 것이고, 대출 항목은 어떤 책을 가리킨다. 이 회차는 엔티티와 엔티티 사이의 연결, 곧 연관관계(association)를 매핑하는 기초를 다룬다.</p>
+
+<p>연결을 가장 손쉽게 표현하는 방법은 테이블 모양을 그대로 따라 하는 것이다. <code>employee</code> 테이블에 <code>department_id</code> 컬럼이 있으니, <code>Employee</code> 클래스에도 <code>Long departmentId</code> 필드를 둔다. 이렇게 테이블의 외래 키를 객체에 그대로 옮겨 놓은 설계를 흔히 데이터 중심 설계라고 부른다. 처음에는 아무 문제가 없어 보인다. 저장할 때는 부서의 식별자를 꺼내 사원에 넣으면 되고, 테이블에도 그 값이 그대로 들어간다.</p>
+
+<pre><code class="language-java">// 데이터 중심 설계: 외래 키 값을 필드로 들고 있다
+@Entity
+public class Employee {
+    @Id @GeneratedValue
+    private Long id;
+    private String name;
+    private Long departmentId;   // department 테이블의 id 값
+    // ...
+}
+
+// 사원이 속한 부서의 이름을 알고 싶다
+Employee employee = em.find(Employee.class, employeeId);
+Department department = em.find(Department.class, employee.getDepartmentId());
+String departmentName = department.getName();</code></pre>
+
+<p>문제는 조회에서 드러난다. 사원이 속한 부서를 알려면 사원을 찾고, 거기서 꺼낸 숫자로 부서를 다시 찾아야 한다. 객체 그래프를 따라 <code>employee.getDepartment().getName()</code>처럼 점을 찍어 나가는 것이 객체 지향 언어의 기본 동작인데, 이 모델에서는 그 길이 숫자 하나로 끊겨 있다. 연결을 따라가는 일이 언어의 참조가 아니라 개발자가 손으로 쓰는 두 번째 조회가 된다. 사원과 부서의 관계를 다루는 모든 코드가 이 끊긴 길을 이어 붙이는 일을 반복하게 된다.</p>
+
+<p>더 근본적인 문제는 이 숫자가 아무것도 보장하지 않는다는 점이다. <code>departmentId</code>에 존재하지 않는 부서의 번호를 넣어도 자바 컴파일러는 아무 말을 하지 않는다. 타입이 <code>Long</code>이니 사원 번호를 실수로 넣어도 똑같이 통과한다. 객체 세계에서 "이 사원은 저 부서에 속한다"는 사실을 표현하는 수단은 원래 참조(reference)다. 참조는 타입이 정해져 있고, 가리키는 대상이 실제로 메모리에 존재한다. 이 회차의 목표는 이 참조와 테이블의 외래 키를 JPA가 서로 번역하게 만드는 것이다. 그러려면 두 세계가 연결을 표현하는 방식이 정확히 어떻게 다른지부터 봐야 한다.</p>
+
+<h3>테이블은 외래 키 하나로 양쪽을 잇는다</h3>
+
+<p>관계형 데이터베이스에서 일대다 관계는 "다" 쪽 테이블에 외래 키(foreign key) 컬럼을 두는 것으로 표현한다. 사원 여러 명이 부서 하나에 속한다면 <code>employee</code> 테이블의 각 행이 <code>department_id</code> 컬럼에 자기 부서의 기본 키 값을 갖는다. 반대로 <code>department</code> 테이블에 사원 목록을 넣을 칸은 없다. 한 행의 한 컬럼에는 값 하나만 들어가므로, 여러 개를 가리켜야 하는 "일" 쪽은 외래 키를 가질 수 없다. 일대다에서 외래 키가 항상 "다" 쪽에 있는 이유가 이것이다.</p>
+
+<p>이 외래 키 하나로 양쪽 방향의 질문에 모두 답할 수 있다. "이 사원의 부서는?"이라는 질문은 사원 행의 <code>department_id</code>로 부서를 찾는 조인이고, "이 부서의 사원들은?"이라는 질문은 <code>department_id</code>가 그 부서의 id인 사원 행을 찾는 조인이다. 두 질문에 쓰는 조인 조건은 똑같다.</p>
+
+<pre><code class="language-sql">-- 사원에서 부서로
+select d.name
+from employee e join department d on e.department_id = d.id
+where e.id = 1;
+
+-- 부서에서 사원으로: 조인 조건은 같다
+select e.name
+from department d join employee e on e.department_id = d.id
+where d.id = 10;</code></pre>
+
+<p>조인 조건 <code>e.department_id = d.id</code>는 등호이고, 등호에는 방향이 없다. 데이터베이스 입장에서 외래 키는 두 테이블의 행을 짝짓는 규칙일 뿐, 어느 쪽에서 출발해야 한다는 정보를 담고 있지 않다. 그래서 테이블의 연관관계에는 단방향, 양방향이라는 개념 자체가 없다. 굳이 말하자면 언제나 양방향이다.</p>
+
+<p>저장 엔진 수준에서도 양쪽 방향이 모두 효율적으로 동작하도록 준비되어 있다. MySQL은 외래 키 검사가 테이블 전체를 훑지 않도록 참조하는 쪽과 참조되는 쪽 모두에 인덱스를 요구하며, 참조하는 테이블에 외래 키 컬럼을 앞에 둔 인덱스가 없으면 InnoDB가 자동으로 만든다(MySQL 8.0 Reference Manual, FOREIGN KEY Constraints). 부서 쪽에서 출발하는 조회 <code>where department_id = ?</code>는 이 인덱스를 타고, 사원 쪽에서 출발하는 조회는 <code>department</code>의 기본 키 인덱스를 탄다. B+Tree 인덱스가 양쪽에 하나씩 있으니 어느 방향에서 들어와도 전체 스캔 없이 짝을 찾는다.</p>
+
+<h3>객체는 참조로 한쪽만 가리킨다</h3>
+
+<p>자바 객체의 세계에서는 사정이 다르다. <code>Employee</code> 객체에 <code>Department department</code> 필드를 두면, 힙(heap)에 있는 사원 객체의 그 필드 칸에는 부서 객체를 가리키는 참조 값이 들어간다. JVM 명세는 참조 값을 객체를 가리키는 값이라고만 정하고 그 표현 방식은 구현에 맡기지만, 어떤 구현이든 이 값은 사원 객체 안에만 있다. 부서 객체는 자기를 가리키는 사원이 몇 명인지, 누구인지 전혀 모른다. 참조는 출발지에만 기록되는 일방통행이다.</p>
+
+<pre class="diagram">  [자바 힙]                                   [데이터베이스]
+
+  Employee@1                                  employee
+  ┌──────────────────┐                        ┌────┬──────┬───────────────┐
+  │ id = 1           │                        │ id │ name │ department_id │
+  │ name = "kim"     │                        ├────┼──────┼───────────────┤
+  │ department ──────┼──┐                     │ 1  │ kim  │ 10            │──┐
+  └──────────────────┘  │                     │ 2  │ lee  │ 10            │──┤ 같은 조인 조건으로
+  Employee@2            │                     └────┴──────┴───────────────┘  │ 양쪽 탐색 가능
+  ┌──────────────────┐  │    Department@3                                    │
+  │ id = 2           │  ├──▶ ┌────────────┐     department                   │
+  │ name = "lee"     │  │    │ id = 10    │     ┌────┬──────┐                 │
+  │ department ──────┼──┘    │ name="dev" │     │ id │ name │◀────────────────┘
+  └──────────────────┘       └────────────┘     │ 10 │ dev  │
+                                 ▲              └────┴──────┘
+          Department@3 에서는 사원으로 가는 길이 없다</pre>
+
+<p>부서에서 사원으로 가는 길이 필요하면 부서 객체에도 참조를 따로 만들어야 한다. 이번에는 여러 명을 가리켜야 하므로 <code>List<Employee></code> 같은 컬렉션 필드를 두고, 그 컬렉션 객체 안에 사원 참조들을 담는다. 그러면 힙에는 사원에서 부서로 가는 참조와 부서의 컬렉션에서 사원으로 가는 참조가 따로따로 존재한다. 객체에서 양방향이라고 부르는 것은 실제로는 서로 다른 단방향 참조 두 개다. 두 참조는 같은 사실을 말하도록 만들 수도 있지만, 언어는 그 둘이 일치한다는 것을 전혀 보장하지 않는다. 사원은 개발팀을 가리키는데 개발팀의 목록에는 그 사원이 없는 상태가 자바에서는 아무 문제 없이 만들어진다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>관점</th><th>테이블</th><th>객체</th></tr></thead><tbody>
+<tr><td>연결을 표현하는 수단</td><td>외래 키 컬럼 하나</td><td>참조 필드(필요하면 양쪽에 하나씩)</td></tr>
+<tr><td>방향</td><td>없음. 조인 조건은 대칭이다</td><td>있음. 참조를 가진 쪽에서만 따라갈 수 있다</td></tr>
+<tr><td>일대다의 "다"를 담는 법</td><td>"다" 쪽 행마다 외래 키 값</td><td>"일" 쪽에 컬렉션(선택 사항)</td></tr>
+<tr><td>일관성</td><td>외래 키 제약 조건이 보장</td><td>두 참조의 일치를 아무도 보장하지 않는다</td></tr>
+</tbody></table></div>
+
+<p>이 표의 마지막 줄이 이 회차 전체를 끌고 가는 문제다. 테이블은 사실 하나를 컬럼 하나에 저장하는데, 객체는 같은 사실을 두 군데에 나누어 들고 있을 수 있다. JPA는 이 객체 그래프를 테이블로 옮겨야 하므로, 두 군데의 값이 다를 때 어느 쪽을 믿을지 정해야 한다. 그 답이 연관관계의 주인이다. 그 전에 참조가 한 개뿐인 가장 단순한 경우, 단방향 연관관계부터 매핑해 보자.</p>
+
+<x-visual id="jpa-basic-04-reference-vs-fk" title="객체 참조와 외래 키의 비교" kind="구조 비교도" ratio="16:9">
+<x-hint>왼쪽은 자바 힙에서 사원 객체 두 개가 부서 객체 하나를 한 방향으로 가리키는 모습, 오른쪽은 employee 테이블의 department_id 컬럼이 department 테이블을 가리키는 모습. 객체는 방향이 있고 테이블은 조인 조건이 대칭이라는 대비를 보여 준다.</x-hint>
+<x-prompt>Two-panel technical diagram, clean flat style, white background. Left panel titled "자바 힙": two rounded boxes labeled "Employee kim" and "Employee lee", each with a solid arrow pointing to one box labeled "Department dev". No arrow goes back from Department. A small crossed-out dashed arrow from Department toward the employees with label "되돌아갈 길 없음". Right panel titled "데이터베이스": a table grid labeled "employee" with columns "id", "name", "department_id" and two rows, and a table grid labeled "department" with columns "id", "name" and one row. A double-headed arrow between the department_id column and department id column labeled "조인 조건은 대칭". Between the panels, a vertical divider with the caption "참조는 한 방향, 외래 키는 양쪽". Keep labels under 12.</x-prompt>
+<x-caption>객체의 참조는 출발지에만 기록되는 일방통행이고, 테이블의 외래 키는 같은 조인 조건으로 양쪽 탐색을 모두 허용한다.</x-caption>
+</x-visual>
+
+<h3>단방향 연관관계: @ManyToOne과 @JoinColumn</h3>
+
+<p>사원이 부서를 참조하도록 바꾸고, 그 참조를 <code>employee.department_id</code> 외래 키에 매핑해 보자. 이 회차의 실험은 스프링 부트 없이 하이버네이트 6.6.53.Final과 H2 2.3.232 메모리 데이터베이스를 JDK 21에서 직접 실행했다. <code>hibernate.hbm2ddl.auto=create</code>로 테이블을 만들게 하고, <code>hibernate.show_sql=true</code>로 실행되는 SQL을 출력했다. 실행 결과에는 설명에 필요한 줄만 옮겼고, 시퀀스 조회(<code>select next value for ...</code>)와 시퀀스·임시 테이블 DDL 같은 나머지 줄은 따로 보여 줄 때 말고는 생략했다. 실험 코드를 짧게 하려고 엔티티 필드를 같은 패키지에서 직접 읽고 쓴다.</p>
+
+<pre><code class="language-java">package ex;
+import jakarta.persistence.*;
+
+@Entity
+public class Employee {
+    @Id @GeneratedValue Long id;
+    String name;
+
+    @ManyToOne
+    @JoinColumn(name = "department_id")
+    Department department;
+
+    protected Employee() {}
+    public Employee(String name) { this.name = name; }
+}</code></pre>
+
+<p><code>@ManyToOne</code>은 이 필드가 다대일(many-to-one) 연관관계라는 선언이다. 사원 여러 명이 부서 하나를 가리키므로 사원 쪽에서 보면 "다대일"이다. 어노테이션 이름은 언제나 현재 클래스를 앞에 두고 읽는다. <code>@JoinColumn</code>은 이 연관관계를 테이블의 어느 외래 키 컬럼과 짝지을지 정한다. 하이버네이트가 만든 DDL은 다음과 같다.</p>
+
+<pre data-label="실행 결과 (DDL 일부)"><code class="language-text">Hibernate: create table Department (id bigint not null, name varchar(255), primary key (id))
+Hibernate: create table Employee (department_id bigint, id bigint not null, name varchar(255), primary key (id))
+Hibernate: alter table if exists Employee add constraint FK14tijxqry9ml17nk86sqfp561 foreign key (department_id) references Department</code></pre>
+
+<p>참조 필드 하나가 <code>department_id bigint</code> 컬럼과 외래 키 제약 조건으로 바뀌었다. 컬럼 타입이 <code>bigint</code>인 것은 부서의 기본 키 타입이 <code>Long</code>이기 때문이다. 외래 키 컬럼은 결국 상대 테이블의 기본 키 값을 담으므로 타입을 상대의 <code>@Id</code>에서 가져온다. 제약 조건 이름 <code>FK14tij...</code>는 이름을 지정하지 않아 하이버네이트가 자동으로 지은 것이다. 테이블 이름이 클래스 이름 그대로 <code>Employee</code>인 것은 스프링 부트 없이 돌렸기 때문이다. 스프링 부트는 기본 물리 이름 전략으로 <code>CamelCaseToUnderscoresNamingStrategy</code>를 설정해 테이블 이름을 소문자와 밑줄로 바꾼다(Spring Boot 3.5 How-to, Configure Hibernate Naming Strategy). 이름 전략은 03회의 몫이므로 여기서는 넘어간다.</p>
+
+<h4>@JoinColumn을 생략하면 컬럼 이름은 어떻게 정해지는가</h4>
+
+<p><code>@JoinColumn</code>을 빼고 같은 실험을 다시 돌렸더니 컬럼 이름은 똑같이 <code>department_id</code>였다. Jakarta Persistence 명세가 정한 기본 규칙 때문이다. 다대일 관계의 기본 외래 키 컬럼 이름은 "참조하는 쪽의 관계 필드 이름 + 밑줄 + 참조되는 쪽 기본 키 컬럼 이름"이다(Jakarta Persistence 3.1 §2.11, 관계 매핑의 기본값). 필드 이름이 <code>department</code>이고 부서의 기본 키 컬럼이 <code>id</code>이니 <code>department_id</code>가 된다. 클래스 이름이 아니라 필드 이름에서 온다는 점에 주의하자. 필드 이름을 <code>dept</code>로 바꾸면 컬럼은 <code>dept_id</code>가 된다. 기존 테이블에 매핑하거나 필드 이름을 바꿀 가능성이 있다면 <code>@JoinColumn(name = ...)</code>으로 명시해 두는 편이 안전하다. 실제로 <code>@JoinColumn</code>의 <code>name</code> 속성 기본값은 빈 문자열이고, 빈 문자열이면 이 기본 규칙이 적용된다.</p>
+
+<h4>저장: 참조를 넣으면 외래 키가 채워진다</h4>
+
+<pre><code class="language-java">Department dev = new Department("dev");
+em.persist(dev);
+
+Employee kim = new Employee("kim");
+kim.department = dev;          // 숫자가 아니라 객체를 넣는다
+em.persist(kim);
+
+tx.commit();</code></pre>
+
+<pre data-label="실행 결과 (커밋 시점)"><code class="language-text">Hibernate: insert into Department (name,id) values (?,?)
+Hibernate: insert into Employee (department_id,name,id) values (?,?,?)</code></pre>
+
+<p>코드에서는 부서 객체를 넣었는데 SQL에서는 <code>department_id</code> 자리에 값 하나가 바인딩된다. 플러시 시점에 하이버네이트가 사원 엔티티의 <code>department</code> 필드를 읽고, 그 참조가 가리키는 부서 엔티티의 식별자를 꺼내 외래 키 컬럼 값으로 쓰는 것이다. 이 변환이 가능하려면 부서가 식별자를 가지고 있어야 한다. 이 실험에서는 기본 키 전략이 시퀀스라 <code>persist()</code> 시점에 이미 식별자가 정해져 있었다. 시퀀스 값을 받아 오는 과정과 쓰기 지연은 02·03회에서 다뤘다.</p>
+
+<h4>조회: 다대일은 기본값이 즉시 로딩이다</h4>
+
+<pre><code class="language-java">em.flush();
+em.clear();                    // 1차 캐시를 비워 데이터베이스에서 다시 읽게 한다
+Employee found = em.find(Employee.class, kim.id);
+System.out.println(found.department.name);</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select e1_0.id,d1_0.id,d1_0.name,e1_0.name from Employee e1_0 left join Department d1_0 on d1_0.id=e1_0.department_id where e1_0.id=?
+dev</code></pre>
+
+<p>사원 하나를 찾았는데 SQL이 부서 테이블을 조인했다. <code>@ManyToOne</code>의 <code>fetch</code> 속성 기본값이 <code>FetchType.EAGER</code>이기 때문이다. 반대로 <code>@OneToMany</code>의 기본값은 <code>LAZY</code>다. 리플렉션으로 <code>jakarta.persistence</code> 3.1 API의 어노테이션 기본값을 직접 읽어 보면 <code>ManyToOne.fetch = EAGER</code>, <code>OneToOne.fetch = EAGER</code>, <code>OneToMany.fetch = LAZY</code>, <code>ManyToMany.fetch = LAZY</code>가 나온다. 즉시 로딩이 JPQL과 만나 추가 쿼리를 만드는 문제, 그리고 실무에서 다대일을 지연 로딩으로 바꾸는 이유는 07회 「프록시와 연관관계 관리」의 주제다. 여기서는 조인의 종류만 눈여겨보자.</p>
+
+<p>조인이 <code>left join</code>인 이유는 <code>@ManyToOne</code>의 <code>optional</code> 기본값이 <code>true</code>이기 때문이다. 부서가 없는 사원도 있을 수 있다고 선언한 셈이므로, 내부 조인으로 읽으면 부서 없는 사원이 결과에서 사라진다. 하이버네이트는 그런 사원도 찾을 수 있도록 외부 조인을 쓴다. <code>@ManyToOne(optional = false)</code>로 바꿔 다시 돌리면 DDL의 컬럼이 <code>department_id bigint not null</code>이 되고, 조회 SQL은 <code>join Department d1_0 on ...</code>, 즉 내부 조인이 된다. 매핑의 선언 한 줄이 DDL의 제약 조건과 조회 SQL의 조인 종류를 함께 바꾼다. 연관관계가 반드시 있어야 하는 도메인이라면 이 사실을 매핑에 적어 두는 것이 데이터에도, 쿼리에도 정확하다.</p>
+
+<h4>변경: 참조를 바꾸면 외래 키가 바뀐다</h4>
+
+<pre><code class="language-java">Department ops = new Department("ops");
+em.persist(ops);
+found.department = ops;        // 영속 상태의 사원이 가리키는 부서를 바꾼다
+em.flush();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: insert into Department (name,id) values (?,?)
+Hibernate: update Employee set department_id=?,name=? where id=?</code></pre>
+
+<p>연관관계를 바꾸는 별도의 API는 없다. 영속 상태의 사원 객체에서 참조를 다른 부서로 바꿨을 뿐인데 플러시 때 <code>update</code>가 나갔다. 02회에서 본 변경 감지(dirty checking)가 연관관계 필드에도 똑같이 동작한 결과다. 하이버네이트는 엔티티를 영속성 컨텍스트에 올릴 때의 상태를 기억해 두었다가, 플러시 때 현재 값과 비교해 달라진 엔티티의 <code>update</code>를 만든다. 이 비교에서 연관 필드는 참조가 가리키는 엔티티가 바뀌었는지로 판단되고, 바뀌었다면 새 부서의 식별자가 <code>department_id</code>에 쓰인다. <code>name</code>까지 함께 갱신하는 것은 하이버네이트가 기본적으로 모든 컬럼을 갱신하는 <code>update</code> 문을 쓰기 때문이며 연관관계와는 관계없다.</p>
+
+<p>여기까지가 단방향 연관관계의 전부다. 사원에서 부서로 가는 참조 하나가 외래 키 컬럼 하나에 대응하고, 저장·조회·변경이 모두 참조 하나를 통해 이루어진다. 참조와 외래 키가 일대일로 짝지어져 있으니 어느 값을 믿을지 고민할 필요가 없다. 고민은 반대 방향 참조를 추가하는 순간 시작된다.</p>
+
+<h3>양방향 연관관계: 반대 방향 참조를 추가한다</h3>
+
+<p>이제 "이 부서의 사원 목록"을 객체 그래프로 얻고 싶다고 하자. 앞에서 본 대로 테이블은 이미 그 질문에 답할 수 있다. <code>where department_id = ?</code> 한 줄이면 된다. 객체 쪽에 부서에서 사원으로 가는 참조가 없을 뿐이다. 그래서 부서에 사원 컬렉션을 추가한다.</p>
+
+<pre><code class="language-java">package ex;
+import jakarta.persistence.*;
+import java.util.*;
+
+@Entity
+public class Department {
+    @Id @GeneratedValue Long id;
+    String name;
+
+    @OneToMany(mappedBy = "department")
+    List<Employee> employees = new ArrayList<>();
+
+    protected Department() {}
+    public Department(String name) { this.name = name; }
+}</code></pre>
+
+<p><code>@OneToMany</code>는 부서 하나가 사원 여럿을 가리키는 일대다(one-to-many) 관계라는 선언이고, <code>mappedBy = "department"</code>는 "이 컬렉션은 <code>Employee</code>의 <code>department</code> 필드가 이미 매핑한 관계를 반대편에서 바라본 것"이라는 선언이다. 이 매핑을 추가하고 DDL을 다시 보면 달라진 것이 하나도 없다. <code>Department</code> 테이블은 여전히 <code>id</code>와 <code>name</code>뿐이고, <code>Employee</code> 테이블의 <code>department_id</code>와 외래 키 제약 조건도 그대로다. 양방향 매핑은 테이블을 한 글자도 바꾸지 않는다. 테이블은 원래 양방향이었으므로 바꿀 것이 없고, 바뀐 것은 객체 쪽에 참조가 하나 늘었다는 사실뿐이다.</p>
+
+<p>이 컬렉션을 데이터베이스에서 읽어 오면 어떻게 되는지 보자. 부서를 새로 조회한 뒤 컬렉션의 실제 클래스를 출력하고, 크기를 물었다.</p>
+
+<pre><code class="language-java">em.flush();
+em.clear();
+Department d2 = em.find(Department.class, dev.id);
+System.out.println("collection class=" + d2.employees.getClass().getName());
+System.out.println("size=" + d2.employees.size());</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select d1_0.id,d1_0.name from Department d1_0 where d1_0.id=?
+collection class=org.hibernate.collection.spi.PersistentBag
+Hibernate: select e1_0.department_id,e1_0.id,e1_0.name from Employee e1_0 where e1_0.department_id=?
+size=1</code></pre>
+
+<p>세 가지를 읽을 수 있다. 첫째, 부서를 조회하는 SQL은 사원 테이블을 건드리지 않았다. <code>@OneToMany</code>의 기본값이 지연 로딩이기 때문이다. 둘째, 필드를 <code>new ArrayList<>()</code>로 초기화했는데 조회한 엔티티의 컬렉션은 <code>ArrayList</code>가 아니라 하이버네이트의 <code>PersistentBag</code>이다. 하이버네이트는 데이터베이스에서 읽은 엔티티의 컬렉션 필드에 자기 컬렉션 구현을 넣어 두고, 그 컬렉션이 처음 사용될 때 내용을 읽어 온다. 컬렉션 필드를 <code>ArrayList</code> 같은 구현 타입이 아니라 <code>List</code> 인터페이스로 선언해야 하는 이유가 여기에 있다. 셋째, <code>size()</code>를 부르는 순간 <code>where e1_0.department_id=?</code> 조회가 나갔다. 이 SQL은 앞에서 손으로 쓴 "부서에서 사원으로" 조인 방향과 같다. 역방향 컬렉션은 결국 외래 키를 거꾸로 읽는 질의를 객체 모양으로 감싼 것이다.</p>
+
+<h3>연관관계의 주인: 참조 두 개, 외래 키 하나</h3>
+
+<p>이제 객체에는 참조가 두 개 있다. <code>Employee.department</code>와 <code>Department.employees</code>다. 테이블에는 외래 키가 <code>employee.department_id</code> 하나뿐이다. 사원을 다른 부서로 옮기는 상황을 생각해 보자. 객체에서는 사원의 <code>department</code>를 바꿀 수도 있고, 이전 부서의 컬렉션에서 빼고 새 부서의 컬렉션에 넣을 수도 있다. 둘 다 할 수도 있고, 실수로 한쪽만 할 수도 있다. 사원은 운영팀을 가리키는데 운영팀의 컬렉션에는 그 사원이 없다면, 플러시 때 <code>department_id</code>에 무엇을 써야 하는가. 두 참조가 서로 다른 말을 할 때 JPA는 어느 한쪽을 기준으로 삼아야 한다. 그 기준이 되는 쪽이 연관관계의 주인(owning side)이고, 나머지가 역방향(inverse side)이다.</p>
+
+<p>Jakarta Persistence 명세(3.1 §2.10 Entity Relationships)가 정한 규칙은 다음과 같다.</p>
+
+<ul>
+<li>양방향 관계에는 주인과 역방향이 있다. 데이터베이스의 관계 갱신은 주인 쪽이 결정한다.</li>
+<li>역방향은 <code>mappedBy</code> 속성으로 주인 쪽의 필드 이름을 가리켜야 한다.</li>
+<li>일대다·다대일 양방향 관계에서는 "다" 쪽이 반드시 주인이다. 그래서 <code>@ManyToOne</code>에는 <code>mappedBy</code>를 지정할 수 없다.</li>
+</ul>
+
+<p>마지막 규칙은 어노테이션의 정의 자체에 들어 있다. <code>@ManyToOne</code>에는 <code>mappedBy</code>라는 속성이 아예 없어서, 써 보면 매핑 오류가 아니라 컴파일 오류가 난다. 실제로 사원 쪽에 <code>@ManyToOne(mappedBy = "employees")</code>라고 쓰면 javac이 다음과 같이 거부한다.</p>
+
+<pre data-label="컴파일 결과"><code class="language-text">Employee.java:7: error: cannot find symbol
+    @ManyToOne(mappedBy = "employees")
+               ^
+  symbol:   method mappedBy()
+  location: @interface ManyToOne</code></pre>
+
+<p>명세 3.2.4절(Synchronization to the Database)은 이 규칙이 런타임에 무슨 뜻인지 더 직접적으로 말한다. 영속 상태 엔티티 사이의 양방향 관계는 주인 쪽이 들고 있는 참조를 기준으로 저장되며, 주인 쪽과 역방향 쪽의 메모리 참조를 서로 맞게 유지하는 것은 개발자의 책임이다. 정리하면 이렇다. JPA는 주인의 값만 외래 키에 반영하고, 역방향의 값은 외래 키를 결정할 때 보지 않는다. 그리고 두 쪽을 맞추는 일은 JPA가 해 주지 않는다.</p>
+
+<p>하이버네이트 내부에도 이 구분이 그대로 있다. 컬렉션을 테이블에 반영하는 역할을 맡은 <code>org.hibernate.persister.collection.CollectionPersister</code> 인터페이스에는 <code>isInverse()</code> 메서드가 있다. <code>mappedBy</code>로 매핑한 컬렉션은 역방향(inverse) 컬렉션으로 표시되고, 하이버네이트는 이런 컬렉션의 추가·삭제를 외래 키 갱신 SQL로 바꾸지 않는다. 하이버네이트 사용자 가이드도 양방향 연관관계에는 주인이 하나뿐이며 그것이 자식 쪽이라고 설명한다(Hibernate ORM 6.6 User Guide, §3.8.2 <code>@OneToMany</code>).</p>
+
+<pre class="diagram">        객체 (참조 두 개)                              테이블 (외래 키 하나)
+
+  Employee.department  ──── 주인(owning side) ─────▶  employee.department_id
+     @ManyToOne                 읽기 + 쓰기                    ▲
+     @JoinColumn                                               │ 플러시 때 주인의
+                                                               │ 값만 반영된다
+  Department.employees ──── 역방향(inverse side) ──▶  (반영 안 함)
+     @OneToMany(mappedBy = "department")
+                                읽기 전용: 조회할 때는 외래 키로 채워진다</pre>
+
+<h4>mappedBy를 빼먹으면: 관계가 두 개가 된다</h4>
+
+<p><code>mappedBy</code>가 왜 꼭 필요한지는 빼 보면 알 수 있다. 부서 쪽을 <code>@OneToMany</code>만 남기고 <code>mappedBy</code>를 지운 뒤 DDL을 다시 보았다.</p>
+
+<pre data-label="실행 결과 (mappedBy 없음)"><code class="language-text">Hibernate: create table Department (id bigint not null, name varchar(255), primary key (id))
+Hibernate: create table Department_Employee (Department_id bigint not null, employees_id bigint not null unique)
+Hibernate: create table Employee (department_id bigint not null, id bigint not null, name varchar(255), primary key (id))</code></pre>
+
+<p>(이 변형에서는 사원 쪽에 <code>optional = false</code>도 함께 주어서 <code>department_id</code>가 <code>not null</code>이다.) 테이블이 하나 더 생겼다. <code>mappedBy</code>가 없으면 하이버네이트는 부서의 컬렉션을 사원의 <code>department</code>와 무관한, 독립된 두 번째 관계로 해석한다. 그리고 일대다 단방향 관계를 표현하기 위해 기본으로 조인 테이블(join table) <code>Department_Employee</code>를 만든다. 사용자 가이드도 단방향 <code>@OneToMany</code>에 대해 하이버네이트가 두 엔티티 사이에 링크 테이블을 쓴다고 적고 있다. <code>employees_id</code>에 <code>unique</code>가 붙은 것은 사원 하나가 이 테이블에 한 번만 나올 수 있어야 일대다가 되기 때문이다. 이 상태에서 양쪽에 값을 넣고 저장하면 <code>Employee</code>에 <code>department_id</code>를 넣는 <code>insert</code>와 <code>Department_Employee</code>에 행을 넣는 <code>insert</code>가 따로 나간다. 같은 사실이 두 곳에 저장되고, 둘이 어긋나도 아무도 모른다. <code>mappedBy</code>는 "이 두 참조는 하나의 관계다"라고 JPA에 알려 주는 유일한 수단이다.</p>
+
+<p>반대로 <code>mappedBy</code>에 쓴 이름이 틀리면 엔티티 매니저 팩토리를 만드는 단계에서 바로 실패한다. <code>mappedBy = "dept"</code>로 바꿔 돌리면 다음 예외가 난다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">Exception in thread "main" org.hibernate.AnnotationException: Collection 'ex.Department.employees' is 'mappedBy' a property named 'dept' which does not exist in the target entity 'ex.Employee'</code></pre>
+
+<p><code>mappedBy</code>의 값은 테이블의 컬럼 이름이 아니라 상대 엔티티의 필드(속성) 이름이다. <code>department_id</code>를 쓰는 실수가 흔한데, 그 이름의 필드가 없으니 같은 예외가 난다.</p>
+
+<h4>주인은 외래 키가 있는 곳으로 정한다</h4>
+
+<p>어느 쪽을 주인으로 할지는 비즈니스 중요도로 정하지 않는다. 부서가 사원보다 "상위" 개념처럼 느껴져서 부서 쪽을 주인으로 삼고 싶어질 수 있지만, 기준은 하나다. <b>외래 키가 있는 테이블에 매핑된 엔티티가 주인이다.</b> 일대다에서 외래 키는 항상 "다" 쪽 테이블에 있으므로 "다" 쪽, 곧 <code>@ManyToOne</code>이 주인이 된다. 명세가 다대일 쪽을 주인으로 강제하는 것과 같은 결론이다.</p>
+
+<p>이 기준이 좋은 이유는 SQL과 코드의 대응이 단순해지기 때문이다. 사원 엔티티의 필드를 바꾸면 사원 테이블의 컬럼이 바뀐다. 엔티티 하나의 변경이 그 엔티티의 테이블에 대한 <code>insert</code>·<code>update</code>로 끝나므로, 코드를 보고 SQL을 예측하기 쉽다. 만약 부서의 컬렉션이 외래 키를 관리한다면, 부서 엔티티를 바꿨는데 사원 테이블에 <code>update</code>가 나가는 구조가 된다. 이것이 실제로 가능한 일대다 단방향 매핑이며, 그 비용과 함정은 05회 「다양한 연관관계 매핑」에서 다룬다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>주민등록 주소와 집주인의 세입자 명단</strong><p>세입자가 어느 집에 사는지는 세입자의 주민등록 주소가 공식 기록이다. 집주인도 세입자 명단을 수첩에 적어 둘 수 있지만, 이사를 했는데 집주인 수첩만 고친다고 주민등록이 바뀌지는 않는다. 사원의 <code>department</code>가 주민등록이고, 부서의 컬렉션이 집주인의 수첩이다. 이 비유가 깨지는 지점도 있다. 현실의 수첩은 집주인이 직접 고치지 않으면 영영 틀린 채로 남지만, JPA의 역방향 컬렉션은 엔티티를 데이터베이스에서 새로 읽어 오면 외래 키를 기준으로 다시 채워진다. 틀린 상태는 한 영속성 컨텍스트 안에서만 산다.</p></aside>
+
+<x-visual id="jpa-basic-04-owning-side" title="연관관계의 주인과 역방향" kind="구조도" ratio="16:9">
+<x-hint>객체 쪽의 참조 두 개 중 주인 쪽만 외래 키 컬럼에 연결되고, 역방향 컬렉션은 조회할 때만 외래 키로 채워진다는 것을 보여 준다.</x-hint>
+<x-prompt>Technical diagram, flat style, white background. Left side: a box labeled "Employee" containing a field row "department" with a tag "주인", and a box labeled "Department" containing a field row "employees (List)" with a tag "mappedBy". Arrows between the two boxes in both directions. Right side: a table grid labeled "employee" with a highlighted column "department_id". A thick solid arrow from the Employee "department" row to the "department_id" column, labeled "쓰기·읽기". A thin dashed arrow from the "department_id" column back to the Department "employees" row, labeled "조회 때만 채움". A crossed-out arrow from "employees" to "department_id" labeled "반영 안 함". Keep it under 10 labels.</x-prompt>
+<x-caption>참조는 두 개지만 외래 키는 하나다. 플러시 때 외래 키에 반영되는 것은 주인 쪽 값뿐이고, mappedBy 컬렉션은 읽기 전용이다.</x-caption>
+</x-visual>
+
+<h3>주의점 1: 역방향에만 값을 넣으면 외래 키는 null이다</h3>
+
+<p>양방향 매핑에서 가장 흔한 버그는 역방향에만 값을 넣는 것이다. 부서에 사원을 "추가"한다는 말이 자연스러워서 <code>department.employees.add(employee)</code>만 쓰고 끝내기 쉽다. 실험으로 확인해 보자.</p>
+
+<pre><code class="language-java">Employee lee = new Employee("lee");
+dev.employees.add(lee);        // 역방향에만 넣었다. lee.department 는 null
+em.persist(lee);
+em.flush();
+em.clear();
+
+Object fk = em.createNativeQuery(
+        "select department_id from Employee where name='lee'").getSingleResult();
+System.out.println("lee fk=" + fk);</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: insert into Employee (department_id,name,id) values (?,?,?)
+Hibernate: select department_id from Employee where name='lee'
+lee fk=null</code></pre>
+
+<p>예외도 경고도 없이 <code>department_id</code>가 <code>null</code>로 저장되었다. 하이버네이트는 <code>lee</code>를 저장할 때 주인인 <code>lee.department</code>만 보았고, 그 값이 <code>null</code>이었다. 부서의 컬렉션은 역방향이라 외래 키를 결정할 때 쓰이지 않는다. 이 데이터로 부서를 다시 읽으면 <code>lee</code>는 부서의 사원 목록에 나오지 않는다. 같은 실험에서 부서를 다시 조회했을 때 <code>size=1</code>이 나오고 목록에 <code>kim</code>만 있었던 것이 바로 이 때문이다. 사원 쪽에 <code>@ManyToOne(optional = false)</code>를 주었다면 이 실수는 바로 드러난다. 그렇게 바꾸고 부서 없는 사원을 <code>persist()</code>해 보면 <code>insert</code>가 나가기도 전에 <code>PropertyValueException: not-null property references a null or transient value: ex.Employee.department</code> 예외가 난다. 이 검사(<code>hibernate.check_nullability</code>)는 Bean Validation이 클래스패스에 있으면 기본으로 꺼지고, 없으면 켜진다(Hibernate ORM 6.6 User Guide). 꺼져 있으면 <code>persist()</code>는 통과하고, 플러시 때 데이터베이스가 <code>not null</code> 컬럼에 null을 넣는 <code>insert</code>를 거부해 <code>ConstraintViolationException</code>이 난다. 연관관계가 필수인 도메인에서 <code>optional = false</code>가 문서 이상의 의미를 갖는 지점이다.</p>
+
+<p>같은 원리로, 역방향 컬렉션에서 빼기만 해서는 관계가 끊어지지 않는다. 영속 상태의 사원 <code>kim</code>이 속한 부서의 컬렉션에서 <code>kim</code>을 지우고 플러시했다.</p>
+
+<pre><code class="language-java">Employee k = em.find(Employee.class, kim.id);
+k.department.employees.remove(k);   // 역방향에서만 뺐다
+em.flush();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select e1_0.department_id,e1_0.id,e1_0.name from Employee e1_0 where e1_0.department_id=?</code></pre>
+
+<p>나간 SQL은 컬렉션을 초기화하는 조회 하나뿐이고, <code>update</code>는 없다. <code>remove()</code>를 하려면 컬렉션 내용을 알아야 하니 지연 로딩 컬렉션이 먼저 초기화되었고, 그 뒤의 삭제는 역방향 컬렉션의 변경이라 SQL로 바뀌지 않았다. 여기서 부수적인 사실도 하나 보인다. 역방향 컬렉션을 건드리면 그 부서의 사원 전체를 읽어 온다. 사원이 수만 명인 부서라면 사원 하나를 빼려다 수만 행을 메모리에 올리게 된다. 이 <code>remove()</code>가 제대로 동작한 것도 우연이 아니다. 컬렉션에 로딩된 <code>kim</code>은 <code>em.find()</code>로 얻은 <code>k</code>와 같은 인스턴스다. 02회에서 본 대로 영속성 컨텍스트는 같은 식별자에 대해 같은 인스턴스를 돌려주므로, 기본 <code>equals()</code>(참조 비교)로도 찾을 수 있다.</p>
+
+<h3>주의점 2: 순수한 객체 상태도 맞춰야 한다</h3>
+
+<p>그렇다면 주인에만 값을 넣으면 충분할까. 데이터베이스에는 충분하다. 하지만 같은 트랜잭션 안에서 객체를 계속 쓰는 코드에는 충분하지 않다.</p>
+
+<pre><code class="language-java">Department dev = new Department("dev");
+em.persist(dev);
+Employee kim = new Employee("kim");
+kim.department = dev;          // 주인에만 넣었다
+em.persist(kim);
+
+Department found = em.find(Department.class, dev.id);
+System.out.println("same=" + (found == dev) + " size=" + found.employees.size());</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select next value for Department_SEQ
+Hibernate: select next value for Employee_SEQ
+same=true size=0</code></pre>
+
+<p>(시퀀스 조회가 언제 몇 번 나가는지는 하이버네이트 시퀀스 최적화기의 동작으로, 03회의 몫이다.) <code>em.find()</code>가 SQL 없이 돌려준 것은 1차 캐시에 있던 바로 그 <code>dev</code> 인스턴스다. <code>same=true</code>가 이를 보여 준다. 이 인스턴스의 <code>employees</code>는 처음 <code>new ArrayList<>()</code>로 만든 빈 리스트 그대로다. 아직 데이터베이스에는 <code>insert</code>도 나가지 않았고, 설령 나갔더라도 하이버네이트는 이미 1차 캐시에 있는 엔티티의 컬렉션을 외래 키를 보고 다시 채우지 않는다. 그래서 <code>size=0</code>이다. 커밋하고 나면 데이터베이스는 정확하지만, 그 전까지 이 트랜잭션 안에서 "부서의 사원 수"를 세는 코드는 틀린 답을 얻는다.</p>
+
+<p>이 상태가 해소되는 것은 영속성 컨텍스트가 엔티티를 데이터베이스에서 새로 읽을 때뿐이다. 앞의 실험에서 <code>em.flush()</code>와 <code>em.clear()</code>를 한 뒤 다시 조회했을 때 컬렉션이 <code>PersistentBag</code>으로 다시 만들어지고 외래 키 기준으로 채워진 것이 그 경우다. 하지만 운영 코드에서 정합성을 위해 <code>clear()</code>를 부르는 것은 답이 아니다. 영속성 컨텍스트에 있던 다른 엔티티의 변경 추적까지 모두 버리게 된다.</p>
+
+<p>JPA가 전혀 없는 상황도 생각해 보자. 엔티티는 평범한 자바 클래스이므로 단위 테스트에서는 <code>new</code>로 만들어 바로 쓴다. 이때 주인 쪽만 세팅하면 <code>department.employees</code>는 영원히 비어 있다. 도메인 로직이 이 컬렉션을 읽는다면, 같은 코드가 테스트에서와 운영에서 다른 결과를 낸다. 결론은 하나다. <b>양방향 관계를 맺을 때는 주인과 역방향 양쪽 모두에 값을 넣는다.</b> 주인은 데이터베이스를 위해, 역방향은 메모리 위의 객체 그래프를 위해서다.</p>
+
+<figure class="flow-figure"><figcaption>주인에만 값을 넣었을 때 트랜잭션 안에서 벌어지는 일</figcaption><ol class="flow">
+<li><strong>persist(dev), persist(kim)</strong><span>두 엔티티가 1차 캐시에 들어간다. insert는 쓰기 지연 저장소에서 기다린다.</span></li>
+<li><strong>kim.department = dev</strong><span>주인 쪽 참조만 생긴다. dev.employees는 빈 ArrayList 그대로다.</span></li>
+<li><strong>em.find(Department, id)</strong><span>1차 캐시에서 dev 인스턴스를 그대로 돌려준다. SQL은 나가지 않는다.</span></li>
+<li><strong>employees.size()</strong><span>메모리의 빈 리스트를 세므로 0이다.</span></li>
+<li><strong>커밋(플러시)</strong><span>주인 값으로 department_id가 채워진 insert가 나간다. 데이터베이스는 정확하다.</span></li>
+<li><strong>다음 트랜잭션에서 조회</strong><span>새 영속성 컨텍스트가 외래 키로 컬렉션을 채우므로 그때부터 1이 보인다.</span></li>
+</ol></figure>
+
+<h3>연관관계 편의 메서드</h3>
+
+<p>양쪽에 값을 넣으라는 규칙을 호출하는 쪽 코드에 맡기면 언젠가 한 줄이 빠진다. 그래서 두 참조를 한 메서드 안에서 함께 바꾸는 연관관계 편의 메서드를 엔티티에 둔다. 하이버네이트 사용자 가이드의 양방향 <code>@OneToMany</code> 예제도 양쪽을 동기화하는 유틸리티 메서드를 두고, 양방향 연관관계를 만들 때 두 쪽이 항상 일치하도록 하는 것이 애플리케이션 개발자의 몫이라고 적는다. 다음은 이 회차의 예제를 그 원칙대로 고친 것이다.</p>
+
+<pre><code class="language-java">package hr;
+import jakarta.persistence.*;
+
+@Entity
+public class Employee {
+    @Id @GeneratedValue
+    private Long id;
+    private String name;
+
+    @ManyToOne
+    @JoinColumn(name = "department_id")
+    private Department department;      // 연관관계의 주인
+
+    protected Employee() {}
+    public Employee(String name) { this.name = name; }
+
+    public void changeDepartment(Department newDepartment) {
+        if (this.department == newDepartment) return;
+        if (this.department != null) {
+            this.department.internalRemove(this);   // 이전 부서의 목록에서 빠진다
+        }
+        this.department = newDepartment;            // 주인: 외래 키에 반영되는 값
+        if (newDepartment != null) {
+            newDepartment.internalAdd(this);        // 역방향: 메모리 일관성
+        }
+    }
+
+    public Department getDepartment() { return department; }
+}</code></pre>
+
+<pre><code class="language-java">package hr;
+import jakarta.persistence.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+@Entity
+public class Department {
+    @Id @GeneratedValue
+    private Long id;
+    private String name;
+
+    @OneToMany(mappedBy = "department")
+    private List<Employee> employees = new ArrayList<>();
+
+    protected Department() {}
+    public Department(String name) { this.name = name; }
+
+    public List<Employee> getEmployees() {
+        return Collections.unmodifiableList(employees);   // 밖에서는 읽기만
+    }
+
+    // Employee.changeDepartment() 만 부르도록 패키지 전용으로 둔다
+    void internalAdd(Employee e)    { employees.add(e); }
+    void internalRemove(Employee e) { employees.remove(e); }
+}</code></pre>
+
+<p>몇 가지 설계 결정이 들어 있다. 첫째, 관계를 바꾸는 진입점은 <code>Employee.changeDepartment()</code> 하나뿐이다. 편의 메서드를 양쪽에 모두 public으로 두고 서로를 부르게 만들면, <code>a</code>가 <code>b</code>를 부르고 <code>b</code>가 다시 <code>a</code>를 부르는 재귀가 생기기 쉽고, 어느 쪽을 불러야 하는지 호출하는 쪽이 헷갈린다. 둘째, 이전 부서의 목록에서 자신을 뺀다. 이 줄이 없으면 부서를 옮긴 사원이 이전 부서의 컬렉션에도 남아, 한 트랜잭션 안에서 두 부서에 동시에 속한 것처럼 보인다. 데이터베이스에는 주인 값만 반영되니 커밋 결과는 맞지만, 그 전에 이전 부서의 목록을 읽는 코드는 틀린 답을 얻는다. 셋째, 부서는 컬렉션을 읽기 전용 뷰로만 내보낸다. 바깥 코드가 <code>getEmployees().add()</code>로 역방향만 바꾸는 실수를 컴파일 이후 실행 시점에 <code>UnsupportedOperationException</code>으로 막는다. 넷째, 메서드 이름이 <code>setDepartment</code>가 아니다. 세터는 필드 하나를 바꾼다는 관례적인 의미를 갖는데, 이 메서드는 두 객체의 상태를 함께 바꾸므로 그 일을 드러내는 이름을 붙였다.</p>
+
+<p>이 코드를 실제로 돌려 보았다. 부서 둘과 사원 하나를 저장하고, 사원을 개발팀에 넣었다가 운영팀으로 옮겼다.</p>
+
+<pre><code class="language-java">Department dev = new Department("dev"); em.persist(dev);
+Department ops = new Department("ops"); em.persist(ops);
+Employee kim = new Employee("kim");     em.persist(kim);
+kim.changeDepartment(dev);
+kim.changeDepartment(ops);
+System.out.println("dev=" + dev.getEmployees().size() + " ops=" + ops.getEmployees().size());
+tx.commit();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">dev=0 ops=1
+Hibernate: insert into Department (name,id) values (?,?)
+Hibernate: insert into Department (name,id) values (?,?)
+Hibernate: insert into Employee (department_id,name,id) values (?,?,?)
+Hibernate: update Employee set department_id=?,name=? where id=?</code></pre>
+
+<p>메모리의 두 컬렉션이 정확하다. SQL에서는 하나 더 볼 것이 있다. 사원의 <code>insert</code> 다음에 <code>update</code>가 따로 나갔다. 사원을 <code>persist()</code>한 뒤에 부서를 정했기 때문이다. <code>persist()</code> 시점의 상태로 <code>insert</code>가 예약되고, 그 뒤에 바뀐 <code>department</code>는 플러시 때 변경 감지에 걸려 <code>update</code>가 되었다. 관계를 먼저 맺고 <code>persist()</code>하면 <code>insert</code> 하나로 끝난다. <code>@ManyToOne(optional = false)</code>로 매핑했다면 이 순서는 선택이 아니라 필수다. 부서 없이 <code>persist()</code>하면 nullability 검사가 켜진 환경에서는 그 순간 하이버네이트가 <code>PropertyValueException</code>을 던지고, 꺼진 환경에서는 플러시 때 데이터베이스가 그 <code>insert</code>를 거부한다.</p>
+
+<aside class="note">편의 메서드를 어느 쪽에 둘지는 정답이 없다. 부서에 <code>addEmployee()</code>를 두는 쪽이 자연스러운 도메인도 있다. 중요한 것은 진입점을 한쪽으로 정하고, 그 메서드가 주인과 역방향을 모두 맞추게 하는 것이다. <code>internalRemove()</code>는 기본 <code>equals()</code>로 원소를 찾는다. 엔티티의 <code>equals()</code>·<code>hashCode()</code>를 재정의할 때의 함정은 이 회차의 범위를 넘는다.</aside>
+
+<h3>주의점 3: 양방향 참조는 무한 재귀를 만든다</h3>
+
+<p>객체 그래프에 순환이 생기면 그래프를 끝까지 따라가는 코드는 끝나지 않는다. 양방향 연관관계는 정의상 순환이다. 사원은 부서를 가리키고, 부서의 컬렉션은 다시 사원을 가리킨다. 가장 흔하게 이 순환을 밟는 코드는 <code>toString()</code>이다. JPA 없이 순수 자바로 재현해 보자.</p>
+
+<pre><code class="language-java">import java.util.*;
+
+public class Loop {
+    static class Dept { String name = "dev"; List<Emp> emps = new ArrayList<>();
+        public String toString() { return "Dept{name=" + name + ", emps=" + emps + "}"; } }
+    static class Emp { String name = "kim"; Dept dept;
+        public String toString() { return "Emp{name=" + name + ", dept=" + dept + "}"; } }
+
+    public static void main(String[] args) {
+        Dept d = new Dept(); Emp e = new Emp();
+        e.dept = d; d.emps.add(e);
+        System.out.println(e);
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21, 맨 위 프레임은 실행마다 다르다)"><code class="language-text">Exception in thread "main" java.lang.StackOverflowError
+	at java.base/java.lang.AbstractStringBuilder.append(AbstractStringBuilder.java:811)
+	at java.base/java.lang.StringBuilder.append(StringBuilder.java:246)
+	at java.base/java.util.AbstractCollection.toString(AbstractCollection.java:456)
+	...</code></pre>
+
+<p>무슨 일이 일어났는지 스택 관점에서 따라가 보자. <code>Emp.toString()</code>은 문자열 연결 중에 <code>dept</code>를 문자열로 바꾸려고 <code>Dept.toString()</code>을 부른다. <code>Dept.toString()</code>은 <code>emps</code>를 문자열로 바꾸려고 <code>ArrayList</code>의 <code>toString()</code>(실제 구현은 <code>AbstractCollection.toString()</code>)을 부르고, 그것은 원소마다 다시 <code>Emp.toString()</code>을 부른다. 호출이 끝나지 않으니 메서드 호출마다 스레드의 JVM 스택에 프레임이 쌓이기만 하고, 스택이 허용된 크기를 넘는 순간 JVM이 <code>StackOverflowError</code>를 던진다(JVMS §2.5.2). 스택 트레이스에서 <code>Dept.toString</code>, <code>AbstractCollection.toString</code>, <code>Emp.toString</code> 프레임이 되풀이되는 것이 순환이 컬렉션을 거쳐 돈다는 증거다. 맨 위 몇 프레임은 스택이 어느 호출에서 넘쳤느냐에 따라 달라서, Temurin 21.0.13에서 같은 코드를 여러 번 돌리면 <code>AbstractCollection.toString</code>이 맨 위에 오기도 하고 위처럼 <code>AbstractStringBuilder.append</code>가 오기도 했다.</p>
+
+<p>이 순환은 직접 쓴 <code>toString()</code>에서만 생기지 않는다.</p>
+
+<ul>
+<li><b>Lombok</b>: <code>@ToString</code>이나 <code>@Data</code>(내부에 <code>@ToString</code>과 <code>@EqualsAndHashCode</code>를 포함한다)를 양쪽 엔티티에 붙이면 모든 필드를 따라가는 메서드가 생성되어 같은 순환에 빠진다. <code>toString()</code>에서는 연관 필드를 빼고, <code>@Data</code>는 엔티티에 쓰지 않는 편이 안전하다.</li>
+<li><b>JSON 직렬화</b>: Jackson 같은 라이브러리는 객체의 속성을 따라가며 JSON을 만든다. 양방향 엔티티를 컨트롤러에서 그대로 반환하면 부서 → 사원 목록 → 사원 → 부서 → ... 를 따라가다 끝나지 않는다. 게다가 엔티티를 API 응답으로 내보내면 엔티티 필드를 바꿀 때마다 API 스펙이 바뀐다. 응답에는 필요한 값만 담은 DTO를 쓴다.</li>
+<li><b>디버거와 로그</b>: 디버거의 변수 창이나 로그 문장이 <code>toString()</code>을 부르는 순간 같은 일이 벌어진다. 지연 로딩 컬렉션이라면 로그 한 줄이 의도치 않은 SQL을 실행시키기도 한다.</li>
+</ul>
+
+<h3>양방향 매핑 정리: 단방향으로 설계를 끝내고, 필요할 때 추가한다</h3>
+
+<p>지금까지 본 것을 한 문장으로 모으면 이렇다. <b>단방향 매핑만으로 이미 연관관계 매핑은 완료되었다.</b> 외래 키를 관리하는 것은 주인 쪽 <code>@ManyToOne</code> 하나이고, 양방향으로 만들기 위해 추가한 <code>mappedBy</code> 컬렉션은 테이블에 아무것도 더하지 않는다. 역방향은 데이터베이스에 쓰지 않는 읽기 전용 통로다. 양방향 매핑은 반대 방향으로 객체 그래프를 탐색하는 기능을 추가하는 것이고, 그 대가로 두 참조를 맞추는 책임, 순환 참조의 위험, 컬렉션 초기화 비용이 따라온다.</p>
+
+<p>그래서 실무에서 권할 만한 순서는 이렇다. 처음 설계할 때는 모든 연관관계를 단방향 <code>@ManyToOne</code>으로 끝낸다. 객체와 테이블의 매핑은 이것으로 완성된다. 그 뒤 애플리케이션을 만들면서 반대 방향 탐색이 실제로 필요한 곳에만 역방향 컬렉션을 추가한다. 역방향은 테이블을 바꾸지 않으므로, 나중에 추가해도 스키마 마이그레이션이 필요 없다. 반대 방향 탐색이 자주 필요해지는 것은 JPQL을 쓸 때다. <code>select d from Department d join d.employees e where ...</code>처럼 "일" 쪽에서 출발해 컬렉션을 조인하는 쿼리는 역방향 컬렉션이 있어야 쓸 수 있다. 이런 쿼리 문법은 09·10회에서 다룬다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>질문</th><th>답</th><th>근거</th></tr></thead><tbody>
+<tr><td>주인은 누구인가</td><td>외래 키가 있는 테이블의 엔티티. 일대다에서는 다 쪽(@ManyToOne)</td><td>명세 §2.10: 다 쪽이 주인이며 @ManyToOne에는 mappedBy가 없다</td></tr>
+<tr><td>외래 키에 반영되는 값</td><td>주인 쪽 참조만</td><td>역방향에만 넣은 실험에서 department_id = null</td></tr>
+<tr><td>역방향 컬렉션의 역할</td><td>조회 전용. 새로 읽을 때 외래 키로 채워진다</td><td>재조회 때 where department_id=? 로 초기화</td></tr>
+<tr><td>양쪽에 값을 넣어야 하는가</td><td>그렇다. 1차 캐시와 순수 자바 객체 상태 때문에</td><td>같은 트랜잭션의 find()에서 size=0</td></tr>
+<tr><td>mappedBy를 빼면</td><td>독립된 관계 두 개가 되어 조인 테이블이 생긴다</td><td>Department_Employee 테이블 생성</td></tr>
+</tbody></table></div>
+
+<h3>실습: 외래 키 필드를 참조로 바꾸기</h3>
+
+<p>이제 배운 것을 작은 도메인 하나에 적용해 보자. 이 실습의 도메인은 이 원고를 위해 새로 만든 것이다. 도서관 대출 시스템을 생각한다. 회원(Patron)이 책을 빌리면 대출(Loan)이 하나 생기고, 한 번에 여러 권을 빌릴 수 있으므로 대출 하나에 대출 항목(LoanLine)이 여러 개 붙는다. 대출 항목은 각각 도서(Book) 한 권을 가리키고 반납 예정일을 갖는다. 테이블로 그리면 외래 키는 세 개다. <code>loan.patron_id</code>, <code>loan_line.loan_id</code>, <code>loan_line.book_id</code>. 모두 일대다의 "다" 쪽에 있다.</p>
+
+<p>데이터 중심으로 설계하면 대출 엔티티에 <code>Long patronId</code>, 대출 항목에 <code>Long loanId</code>와 <code>Long bookId</code>가 들어간다. 테이블의 컬럼 구성은 맞지만, "이 대출 항목의 책 제목"을 얻으려면 대출 항목을 찾고 <code>bookId</code>로 도서를 다시 찾아야 하고, 외래 키 제약 조건도 하이버네이트의 DDL에 나타나지 않는다. 엔티티 매핑이 관계를 모르니 만들 수가 없다. 이 숫자 필드들을 하나씩 참조로 바꾼다.</p>
+
+<pre><code class="language-java">package lib;
+import jakarta.persistence.*;
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.List;
+
+@Entity
+public class Loan {
+    @Id @GeneratedValue
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "patron_id")
+    private Patron patron;
+
+    @OneToMany(mappedBy = "loan")
+    private List<LoanLine> lines = new ArrayList<>();
+
+    private LocalDate loanedOn;
+
+    protected Loan() {}
+    public Loan(Patron patron, LocalDate loanedOn) {
+        this.patron = patron;
+        this.loanedOn = loanedOn;
+    }
+
+    // 연관관계 편의 메서드: 주인(LoanLine.loan)과 역방향(lines)을 한 번에 맞춘다
+    public void addLine(LoanLine line) {
+        lines.add(line);
+        line.assignTo(this);
+    }
+
+    public List<LoanLine> getLines() { return lines; }
+}</code></pre>
+
+<pre><code class="language-java">package lib;
+import jakarta.persistence.*;
+import java.time.LocalDate;
+
+@Entity
+public class LoanLine {
+    @Id @GeneratedValue
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "loan_id")
+    private Loan loan;          // 연관관계의 주인: loan_id 를 관리한다
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "book_id")
+    private Book book;
+
+    private LocalDate dueOn;
+
+    protected LoanLine() {}
+    public LoanLine(Book book, LocalDate dueOn) {
+        this.book = book;
+        this.dueOn = dueOn;
+    }
+
+    void assignTo(Loan loan) { this.loan = loan; }   // 같은 패키지의 Loan만 부른다
+    public Loan getLoan() { return loan; }
+}</code></pre>
+
+<p><code>Patron</code>과 <code>Book</code>은 <code>id</code>와 이름(제목) 필드만 가진 단순한 엔티티로 두었다. 각각 <code>@Id @GeneratedValue</code> 식별자, <code>String</code> 필드 하나, protected 기본 생성자, 그 필드를 받는 생성자만 있으므로 코드는 생략한다. 다대일 세 개에는 모두 <code>fetch = FetchType.LAZY</code>를 주었다. 기본값 <code>EAGER</code>를 바꾸는 이유는 07회에서 자세히 다루므로, 여기서는 "다대일은 지연 로딩으로 매핑해 두는 것이 출발점"이라는 정도로만 받아들이자. 이 엔티티들로 하이버네이트가 만든 DDL과 저장 SQL은 다음과 같다.</p>
+
+<pre data-label="실행 결과 (DDL과 저장)"><code class="language-text">Hibernate: create table Book (id bigint not null, title varchar(255), primary key (id))
+Hibernate: create table Loan (loanedOn date, id bigint not null, patron_id bigint, primary key (id))
+Hibernate: create table LoanLine (dueOn date, book_id bigint, id bigint not null, loan_id bigint, primary key (id))
+Hibernate: create table Patron (id bigint not null, name varchar(255), primary key (id))
+Hibernate: alter table if exists Loan add constraint FKtospiyfnj76p0vm4t2q5x54q7 foreign key (patron_id) references Patron
+Hibernate: alter table if exists LoanLine add constraint FKt9ctw17m3rn1gf4xit730bm27 foreign key (book_id) references Book
+Hibernate: alter table if exists LoanLine add constraint FKlw352t3xrs793fg6u5l68qs0v foreign key (loan_id) references Loan
+before flush: lines=1 owner=true
+Hibernate: insert into Patron (name,id) values (?,?)
+Hibernate: insert into Book (title,id) values (?,?)
+Hibernate: insert into Loan (loanedOn,patron_id,id) values (?,?,?)
+Hibernate: insert into LoanLine (book_id,dueOn,loan_id,id) values (?,?,?,?)</code></pre>
+
+<p>저장 코드는 회원, 도서, 대출을 차례로 <code>persist()</code>하고, 대출 항목을 만들어 <code>loan.addLine(line)</code>으로 연결한 뒤 <code>persist(line)</code>했다. 플러시 전에 출력한 <code>lines=1 owner=true</code>는 편의 메서드가 역방향 컬렉션과 주인 참조를 함께 맞췄다는 뜻이다. 외래 키 세 개가 모두 제약 조건과 함께 생겼고, <code>insert</code>는 참조되는 쪽부터 나갔다. 관계를 먼저 맺고 <code>persist()</code>했으므로 <code>update</code>는 없다. 테이블 컬럼 구성은 데이터 중심 설계와 같지만, 이제 객체 쪽에서 <code>line.getLoan()</code>으로 대출을, 대출에서 <code>getLines()</code>로 항목들을 따라갈 수 있다.</p>
+
+<h4>어디에 역방향을 둘 것인가</h4>
+
+<p>이 실습에서 역방향 컬렉션은 <code>Loan.lines</code> 하나만 두었다. 그 판단 근거를 적어 두는 것이 실습의 진짜 목적이다.</p>
+
+<ul>
+<li><b><code>Loan.lines</code>를 둔 이유</b>: 대출과 대출 항목은 함께 만들어지고 함께 조회된다. 대출 화면은 거의 항상 항목 목록을 보여 주고, 대출 하나의 항목 수는 한 번에 빌릴 수 있는 권수로 제한된다. 컬렉션을 초기화하는 비용이 작고, 대출을 중심으로 항목을 다루는 코드가 자연스럽다.</li>
+<li><b><code>Patron.loans</code>를 두지 않은 이유</b>: 회원의 대출 이력은 해가 갈수록 끝없이 늘어난다. 컬렉션으로 두면 회원 엔티티를 통해 대출 이력 전체를 메모리에 올리는 길이 생긴다. 회원의 대출 이력이 필요하면 <code>select l from Loan l where l.patron = :patron</code>처럼 조건과 페이징을 붙인 쿼리로 가져오는 편이 낫다. 쿼리에서 대출 쪽의 <code>patron</code> 필드를 쓰므로 역방향이 없어도 된다.</li>
+<li><b><code>Book.lines</code>를 두지 않은 이유</b>: "이 책을 빌린 모든 대출 항목"을 도서 객체에서 탐색할 일이 없다. 필요해지면 그때 추가해도 테이블은 바뀌지 않는다.</li>
+</ul>
+
+<p>이 판단은 테이블 설계와는 독립적이다. 세 외래 키의 위치는 도메인의 다중성이 정했고, 역방향 컬렉션을 어디에 둘지는 애플리케이션이 객체 그래프를 어떻게 탐색하는지가 정한다. 같은 스키마에서도 화면과 기능에 따라 역방향의 위치는 달라질 수 있다.</p>
+
+<x-visual id="jpa-basic-04-library-model" title="도서 대출 도메인의 참조 모델과 테이블" kind="구조도" ratio="16:9">
+<x-hint>네 엔티티 사이의 참조 방향(단방향 셋, 그중 하나만 양방향)과 테이블의 외래 키 세 개를 위아래로 나란히 놓아, 테이블은 같아도 객체 쪽 방향은 설계 선택이라는 점을 보여 준다.</x-hint>
+<x-prompt>Two-row technical diagram, flat style, white background. Top row titled "객체": four boxes "Patron", "Loan", "LoanLine", "Book" from left to right. Arrow from Loan to Patron labeled "patron". Arrow from LoanLine to Loan labeled "loan (주인)" and a second arrow from Loan to LoanLine labeled "lines (mappedBy)". Arrow from LoanLine to Book labeled "book". Bottom row titled "테이블": four table icons "patron", "loan", "loan_line", "book" aligned under each box; foreign key lines from loan.patron_id to patron, loan_line.loan_id to loan, loan_line.book_id to book, each line labeled "FK". Keep labels concise.</x-prompt>
+<x-caption>외래 키 세 개는 다중성이 정하고, 역방향 컬렉션은 탐색 필요가 정한다. 이 실습에서는 Loan.lines만 양방향이다.</x-caption>
+</x-visual>
+
+<h3>다음 회차들과의 연결</h3>
+
+<p>이 회차의 내용은 이후 회차들의 바닥이 된다. 05회는 다대일 말고도 일대다 단방향, 일대일, 다대다를 다루는데, 어느 경우든 "외래 키가 어디에 있고, 그것을 누가 관리하는가"라는 질문으로 분석된다. 06회의 상속 매핑과 <code>@MappedSuperclass</code>는 연관관계와 직접 관계는 적지만, 상속 구조의 엔티티도 똑같이 <code>@ManyToOne</code>의 대상이 된다. 07회에서는 이 회차에 지나가며 본 즉시 로딩과 지연 로딩, 그리고 <code>PersistentBag</code> 같은 하이버네이트 구현 객체가 프록시라는 더 큰 그림 안에서 설명되고, 부모를 저장할 때 자식을 함께 저장하는 영속성 전이(cascade)도 다룬다. 이 회차의 실습에서 대출 항목을 따로 <code>persist()</code>한 번거로움이 그때 해결된다.</p>
+
+<p>그 밑에 깔린 원리는 하나로 모인다. 객체는 참조로, 테이블은 외래 키로 연결을 표현하고, 이 둘은 개수도 방향도 다르다. JPA가 할 수 있는 일은 외래 키 하나를 참조 하나와 짝짓는 것까지이며, 남는 참조를 맞추는 일은 개발자에게 돌아온다. 연관관계의 주인이라는 이름은 거창하지만, 실제로는 "외래 키를 쓰는 필드는 이것 하나"라는 약속이다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>테이블은 외래 키 하나로 양방향 조인이 되지만, 객체는 방향마다 참조가 따로 필요하다. 양방향 매핑은 참조 두 개를 외래 키 하나에 대응시키므로 기준이 될 주인이 필요하고, 주인은 외래 키가 있는 "다" 쪽(@ManyToOne)이다. JPA는 주인 값만 외래 키에 반영하고 mappedBy 쪽은 읽기 전용으로 다룬다. 그래서 역방향에만 넣은 값은 저장되지 않고, 주인에만 넣은 값은 같은 영속성 컨텍스트 안에서 컬렉션에 보이지 않는다. 양쪽을 맞추는 편의 메서드를 한쪽에 두고, 순환 참조를 따라가는 toString·JSON 직렬화를 피하며, 설계는 단방향으로 끝낸 뒤 필요한 곳에만 역방향을 추가한다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>객체 참조와 외래 키</dt><dd>객체는 참조로 한 방향만 가리키고, 테이블은 외래 키 하나로 같은 조인 조건을 써서 양쪽을 탐색한다. 객체의 양방향은 단방향 참조 두 개다.</dd>
+<dt>단방향 다대일 매핑</dt><dd>@ManyToOne과 @JoinColumn으로 참조 필드를 외래 키 컬럼에 매핑한다. @JoinColumn을 생략하면 컬럼 이름은 "필드 이름_참조 기본 키 컬럼 이름"이 된다.</dd>
+<dt>@ManyToOne의 기본값</dt><dd>fetch는 EAGER, optional은 true다. optional이 true면 조회가 left join, false면 inner join이 되고 컬럼은 not null이 된다.</dd>
+<dt>연관관계의 주인</dt><dd>양방향 관계에서 외래 키를 관리하는 쪽. 외래 키가 있는 테이블의 엔티티, 일대다에서는 다 쪽 @ManyToOne이다.</dd>
+<dt>mappedBy</dt><dd>역방향이 주인 쪽 필드 이름을 가리키는 속성. 이 쪽의 변경은 외래 키에 반영되지 않는다. 빼먹으면 독립된 관계로 해석되어 조인 테이블이 생긴다.</dd>
+<dt>양쪽에 값 넣기</dt><dd>주인은 데이터베이스를 위해, 역방향은 1차 캐시에 남은 객체와 순수 자바 객체의 일관성을 위해 함께 세팅한다.</dd>
+<dt>연관관계 편의 메서드</dt><dd>주인과 역방향을 한 메서드에서 함께 바꾸는 메서드. 진입점은 한쪽에만 두고, 이전 관계에서 자신을 빼는 처리를 포함한다.</dd>
+<dt>순환 참조와 무한 재귀</dt><dd>양방향 참조를 끝까지 따라가는 toString, Lombok, JSON 직렬화는 StackOverflowError로 끝난다. 연관 필드를 빼고, API 응답은 DTO로 만든다.</dd>
+<dt>단방향 우선 설계</dt><dd>단방향 매핑으로 연관관계 매핑은 완성된다. 역방향은 테이블을 바꾸지 않으므로 탐색이 필요할 때 추가한다.</dd>
+</x-summary>
+
+<x-review>
+<p>운영 중인 서비스에서 "부서별 인원 수가 가끔 틀리게 나온다"는 보고가 들어왔다고 하자. 집계 쿼리를 확인해 보니 정확했다. 문제는 같은 트랜잭션 안에서 사원을 등록한 직후 부서 엔티티의 컬렉션 크기를 읽어 화면에 내려 주는 코드였다. 사원 쪽 참조만 세팅했기 때문에 1차 캐시의 부서 컬렉션은 등록 전 상태였다. 이런 버그는 다음 요청에서 다시 조회하면 사라지기 때문에 재현이 어렵고, 테스트에서도 트랜잭션을 나누어 검증하면 드러나지 않는다. 연관관계 편의 메서드 하나로 원천 차단할 수 있는 종류의 버그다.</p>
+<p>반대 방향의 사고도 흔하다. 관리 화면에서 부서의 사원 목록에 사원을 추가하는 기능을 만들면서 <code>department.getEmployees().add(employee)</code>만 호출했다. 테스트 화면에서는 추가한 사원이 목록에 바로 보여서 통과했지만, 데이터베이스의 외래 키는 그대로였다. 외래 키 컬럼이 nullable이고 신규 사원이었다면 <code>department_id</code>가 <code>null</code>로 저장되어 소속 없는 사원이 생긴다. 필수 관계라면 <code>@ManyToOne(optional = false)</code>로 선언하는 것이 이런 실수를 조용한 데이터 오류가 아니라 즉시 드러나는 예외로 바꾸는 방법이다. nullability 검사가 켜져 있으면 하이버네이트가 <code>persist()</code> 시점에 null 참조를 거부하고, 생성한 DDL의 컬럼에도 <code>not null</code>이 붙어 검사가 꺼진 환경에서도 플러시 때 데이터베이스가 거부한다.</p>
+<p>역방향 컬렉션을 추가할지 결정할 때는 그 컬렉션이 커질 수 있는지를 먼저 본다. 컬렉션은 한 번 초기화되면 전체를 읽어 오고, 원소 하나를 빼는 <code>remove()</code>도 초기화를 일으킨다. 원소 수가 작고 부모와 함께 다뤄지는 관계(주문과 주문 항목, 대출과 대출 항목)는 역방향이 코드를 단순하게 만든다. 반대로 시간이 지날수록 끝없이 늘어나는 관계(회원과 전체 이력, 게시판과 전체 게시글)는 역방향 대신 조건과 페이징이 있는 쿼리로 다루는 편이 안전하다. 이 판단은 스키마를 바꾸지 않으므로, 확신이 없을 때는 단방향으로 두고 필요해질 때 추가하면 된다.</p>
+</x-review>
+
+<x-practice>
+<li>영속 상태의 사원 <code>kim</code>이 부서 <code>dev</code>에 속해 있고, 두 엔티티 모두 같은 트랜잭션에서 이미 1차 캐시에 올라와 있으며 <code>dev.employees</code>도 초기화되어 <code>kim</code>을 담고 있다. 편의 메서드 없이 <code>kim.department = ops;</code>만 실행한 뒤 (가) <code>dev.employees.contains(kim)</code>과 <code>ops.employees.contains(kim)</code>의 값, (나) 플러시 때 나가는 SQL, (다) 커밋 후 새 영속성 컨텍스트에서 <code>dev</code>를 조회했을 때 컬렉션 내용을 예측하라.</li>
+<li>본문의 <code>Department</code>에서 <code>mappedBy</code>를 지우고 사원 쪽 <code>@ManyToOne</code>은 그대로 둔 채 사원 한 명을 양쪽에 모두 세팅해 저장했다. 어떤 테이블에 몇 개의 행이 들어가는지 쓰고, 이후 사원 쪽 참조만 다른 부서로 바꿨을 때 두 테이블의 정보가 어떻게 어긋나는지 설명하라.</li>
+<li>컨트롤러가 <code>Department</code> 엔티티를 그대로 반환하자 서버 로그에 <code>StackOverflowError</code>가 남았다. 엔티티에는 <code>@Data</code>가 붙어 있다. 오류가 나는 호출 경로를 스택 프레임이 쌓이는 순서대로 적고, 고칠 방법 두 가지를 제시하라.</li>
+<li>게시판 서비스의 게시글(Post)과 댓글(Comment)은 일대다다. 외래 키는 어느 테이블에 두고, 연관관계의 주인은 어느 필드인가? 게시글 상세 화면은 댓글을 최대 50개씩 페이지로 보여 주고, 마이페이지는 회원이 쓴 댓글 전체 이력을 보여 준다. <code>Post.comments</code> 역방향 컬렉션을 둘지 판단하고 이유를 적어라.</li>
+</x-practice>
+
+<x-answer>
+<p>1번. (가) <code>dev.employees.contains(kim)</code>은 <code>true</code>, <code>ops.employees.contains(kim)</code>은 <code>false</code>다. 역방향 컬렉션은 자바 리스트일 뿐이고, 주인 참조를 바꾼다고 저절로 갱신되지 않는다. (나) 플러시 때 변경 감지가 주인 필드의 변화를 보고 <code>update Employee set department_id=?,name=? where id=?</code> 하나를 낸다. 역방향 컬렉션의 내용은 SQL에 영향을 주지 않는다. (다) 새 영속성 컨텍스트에서는 <code>where department_id=?</code>로 컬렉션을 채우므로 <code>dev</code>의 목록에 <code>kim</code>이 없다. 즉 데이터베이스는 정확하고, 틀린 상태는 커밋 전의 그 영속성 컨텍스트 안에만 있었다. 이 차이를 없애려면 이전 부서에서 빼고 새 부서에 넣는 편의 메서드를 쓴다.</p>
+<p>2번. <code>mappedBy</code>가 없으면 부서의 컬렉션은 독립된 일대다 단방향 관계가 되어 조인 테이블 <code>Department_Employee</code>가 생긴다. 저장하면 <code>Department</code> 1행, <code>Employee</code> 1행(사원 쪽 참조로 <code>department_id</code>가 채워짐), <code>Department_Employee</code> 1행(컬렉션으로 채워짐)이 들어간다. 이후 사원 쪽 참조만 바꾸면 <code>Employee.department_id</code>는 새 부서를 가리키지만 <code>Department_Employee</code>에는 이전 부서와 사원의 행이 그대로 남는다. 같은 사실이 두 곳에 저장되어 있고 어느 쪽도 다른 쪽을 고치지 않으므로, 어떤 경로로 조회하느냐에 따라 사원의 부서가 다르게 보인다. <code>mappedBy</code>는 이 둘이 하나의 관계임을 선언해 저장 위치를 외래 키 하나로 만든다.</p>
+<p>3번. 직렬화 라이브러리가 <code>Department</code>의 속성을 읽다가 <code>employees</code>를 만나 각 <code>Employee</code>를 직렬화하고, <code>Employee</code>의 <code>department</code> 속성에서 다시 같은 <code>Department</code>를 직렬화하는 호출이 반복된다. 로그 경로에 따라서는 <code>@Data</code>가 만든 <code>toString()</code>이 <code>Department.toString()</code> → 리스트의 <code>toString()</code> → <code>Employee.toString()</code> → <code>Department.toString()</code> 순으로 프레임을 쌓기도 한다. 어느 쪽이든 호출이 끝나지 않아 스레드 스택이 넘친다. 고치는 방법은 (1) 엔티티 대신 필요한 필드만 담은 응답 DTO를 만들어 반환하고, (2) 엔티티에서 <code>@Data</code>를 빼고 연관 필드를 제외한 <code>toString()</code>만 두는 것이다. DTO는 순환을 끊을 뿐 아니라 엔티티 변경이 API 스펙을 바꾸는 문제도 막는다.</p>
+<p>4번. 댓글이 "다" 쪽이므로 외래 키 <code>post_id</code>는 <code>comment</code> 테이블에 두고, 주인은 <code>Comment.post</code>(<code>@ManyToOne</code>)다. 게시글 상세의 댓글 목록은 페이징이 필요하다. 컬렉션은 초기화하면 전체를 읽어 오므로 50개씩 끊어 보여 주려면 결국 쿼리가 필요하고, 마이페이지의 회원별 댓글 이력은 게시글과 무관한 축이라 <code>Post.comments</code>로는 얻을 수 없다. 두 화면 모두 <code>Comment</code>에서 출발하는 쿼리로 해결되므로 <code>Post.comments</code>는 일단 두지 않는 것이 합리적이다. 게시글 삭제 시 댓글을 함께 처리하는 등 게시글 중심의 동작이 생기면 그때 역방향을 추가해도 테이블은 바뀌지 않는다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>Department.employees가 @OneToMany(mappedBy = "department")이고 Employee.department가 @ManyToOne이다. 새 사원을 만들어 department.employees.add(employee)만 하고 persist(employee)한 뒤 커밋했다. employee 테이블의 department_id에는 무엇이 저장되는가?</q>
+<o>department의 id. 컬렉션에 넣었으므로 하이버네이트가 외래 키를 채운다.</o>
+<o>null. 외래 키는 주인인 employee.department 값으로만 결정된다.</o>
+<o>커밋 시점에 예외가 발생해 저장되지 않는다.</o>
+<o>Department_Employee 조인 테이블에 행이 들어가고 department_id는 비어 있다.</o>
+<why>mappedBy 쪽은 역방향이라 외래 키를 결정할 때 쓰이지 않는다. 실험에서도 lee fk=null이 나왔다. 기본값 optional = true에서는 예외 없이 null로 들어가고, optional = false였다면 예외로 드러난다(nullability 검사가 켜져 있으면 persist() 시점의 PropertyValueException, 꺼져 있으면 플러시 때 데이터베이스의 not null 제약 위반). 조인 테이블은 mappedBy를 빼먹었을 때나 생긴다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>일대다 양방향 관계에서 연관관계의 주인을 정하는 기준으로 옳은 것은?</q>
+<o>도메인에서 더 중요한 엔티티(예: 부서) 쪽을 주인으로 한다.</o>
+<o>컬렉션을 가진 쪽을 주인으로 해야 여러 행을 한 번에 갱신할 수 있다.</o>
+<o>외래 키가 있는 테이블에 매핑된 엔티티, 즉 다 쪽의 @ManyToOne을 주인으로 한다.</o>
+<o>어느 쪽이든 먼저 persist하는 엔티티가 주인이 된다.</o>
+<why>주인은 외래 키를 관리하는 쪽이므로 외래 키가 있는 테이블의 엔티티가 주인이 되어야 엔티티 변경과 SQL이 일치한다. 명세도 일대다·다대일 양방향에서 다 쪽이 주인이어야 한다고 정하고, @ManyToOne에는 mappedBy 속성이 없다. 비즈니스 중요도나 저장 순서는 기준이 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>한 트랜잭션 안에서 dev 부서와 kim 사원을 persist하고 kim.department = dev만 세팅했다. 이어서 em.find(Department.class, dev.id).employees.size()를 호출했다. 결과와 이유로 옳은 것은?</q>
+<o>0. find()가 1차 캐시의 dev 인스턴스를 그대로 돌려주고, 그 컬렉션은 처음 만든 빈 리스트이기 때문이다.</o>
+<o>1. find()가 데이터베이스를 조회하면서 외래 키로 컬렉션을 채우기 때문이다.</o>
+<o>1. 하이버네이트가 주인 쪽 변경을 감지해 역방향 컬렉션을 자동으로 갱신하기 때문이다.</o>
+<o>LazyInitializationException이 발생한다.</o>
+<why>같은 영속성 컨텍스트에서 find()는 SQL 없이 1차 캐시의 같은 인스턴스를 돌려준다(실험에서 same=true size=0). JPA는 역방향 컬렉션을 자동으로 맞춰 주지 않으며, 그것은 개발자의 책임이라고 명세가 밝힌다. 영속성 컨텍스트가 열려 있으므로 지연 로딩 예외와는 무관하다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>부서 쪽 @OneToMany에서 mappedBy를 빼고 사원 쪽 @ManyToOne은 그대로 두었다. 하이버네이트 6.6이 생성하는 스키마에 대한 설명으로 옳은 것은?</q>
+<o>mappedBy가 없으면 매핑 오류로 엔티티 매니저 팩토리 생성이 실패한다.</o>
+<o>department 테이블에 사원 id 목록을 담는 컬럼이 추가된다.</o>
+<o>아무 변화가 없다. 하이버네이트가 반대편의 @ManyToOne을 찾아 자동으로 짝짓는다.</o>
+<o>두 관계를 독립된 것으로 보고, 컬렉션을 위한 조인 테이블을 따로 만든다.</o>
+<why>mappedBy가 없으면 컬렉션은 별개의 일대다 단방향 관계로 해석되고, 하이버네이트는 기본으로 링크 테이블을 쓴다. 실험에서 Department_Employee 테이블이 생겼다. 하이버네이트는 이름이 맞는 반대편 필드를 추측해 짝짓지 않으며, 행 하나에 여러 값을 담는 컬럼은 관계형 모델에 없다. 실패하는 것은 mappedBy의 이름이 틀렸을 때다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>연관관계(association)</dt><dd>엔티티와 엔티티 사이의 연결. 객체에서는 참조 필드, 테이블에서는 외래 키로 표현된다.</dd>
+<dt>외래 키(foreign key)</dt><dd>다른 테이블의 기본 키 값을 담아 두 테이블의 행을 짝짓는 컬럼. 일대다에서는 다 쪽 테이블에 있다.</dd>
+<dt>단방향 연관관계(unidirectional association)</dt><dd>한쪽 엔티티만 상대를 참조하는 관계. 다대일 단방향이면 @ManyToOne 하나로 외래 키 매핑이 끝난다.</dd>
+<dt>양방향 연관관계(bidirectional association)</dt><dd>양쪽 엔티티가 서로를 참조하는 관계. 실제로는 단방향 참조 두 개이며, 하나의 관계로 묶으려면 mappedBy가 필요하다.</dd>
+<dt>연관관계의 주인(owning side)</dt><dd>양방향 관계에서 데이터베이스의 외래 키를 결정하는 쪽. 주인 값만 플러시 때 반영된다.</dd>
+<dt>역방향(inverse side)</dt><dd>mappedBy로 주인을 가리키는 쪽. 조회할 때 외래 키로 채워지지만, 그 변경은 외래 키에 반영되지 않는다.</dd>
+<dt>조인 테이블(join table)</dt><dd>두 엔티티의 식별자 쌍을 행으로 저장해 관계를 표현하는 별도 테이블. 일대다 단방향의 하이버네이트 기본 매핑이다.</dd>
+<dt>연관관계 편의 메서드</dt><dd>주인과 역방향 참조를 한 번에 맞추는 엔티티 메서드. 메모리의 객체 그래프를 데이터베이스와 같은 모양으로 유지한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html">Jakarta Persistence 3.1 Specification</a> — §2.10 Entity Relationships(주인·역방향·mappedBy 규칙), §2.11 관계 매핑 기본값, §3.2.4 Synchronization to the Database</li>
+<li><a href="https://docs.hibernate.org/orm/6.6/userguide/html_single/Hibernate_User_Guide.html#associations-one-to-many-bidirectional">Hibernate ORM 6.6 User Guide, §3.8 Associations</a> — @ManyToOne과 외래 키, 단방향 @OneToMany의 링크 테이블, 양방향 동기화 메서드</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-table-foreign-keys.html">MySQL 8.0 Reference Manual, FOREIGN KEY Constraints</a> — 외래 키 컬럼 인덱스 요구와 자동 생성</li>
+<li><a href="https://docs.spring.io/spring-boot/3.5/how-to/data-access.html">Spring Boot 3.5 How-to Guides, Data Access</a> — 기본 물리 이름 전략 CamelCaseToUnderscoresNamingStrategy</li>
+</x-refs>

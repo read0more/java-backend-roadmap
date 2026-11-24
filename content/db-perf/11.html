@@ -1,0 +1,770 @@
+<x-meta>
+deck: 중첩 루프 조인과 해시 조인이 몇 번 찾아 들어가는지 세어 드라이빙 테이블의 원리를 세우고, 회원별 주문 통계에 숨은 클러스터형 인덱스 랜덤 룩업을 커버링 인덱스로 걷어낸다.
+minutes: 110
+</x-meta>
+
+<x-goals>
+<li>중첩 루프 조인의 의사 코드로 "드라이빙 행 수 × 드리븐 1회 접근 비용"을 계산하고, EXPLAIN의 <code>rows</code>·<code>filtered</code>와 EXPLAIN ANALYZE의 <code>loops</code>에서 그 곱을 읽어 낼 수 있다.</li>
+<li>드리븐 테이블의 조인 열에 쓸 인덱스가 없을 때 MySQL 8.0이 해시 조인을 쓰는 이유를 블록 중첩 루프의 한계로부터 설명하고, 빌드·프로브 단계와 <code>join_buffer_size</code>를 넘었을 때 디스크로 넘치는 과정을 그릴 수 있다.</li>
+<li>옵티마이저가 조인 순서를 고르는 기준(조건을 거친 뒤의 행 수, 드리븐 쪽 접근 방법, 외부 조인의 의존 관계)을 근거로 "작은 테이블이 드라이빙 테이블"이라는 통념의 반례를 들 수 있다.</li>
+<li>세컨더리 인덱스로 짝을 찾은 뒤 클러스터형 인덱스로 되돌아가는 룩업이 EXPLAIN에서 잘 보이지 않는 이유를 알고, <code>Extra</code>의 <code>Using index</code> 유무와 InnoDB 버퍼 풀 카운터로 진단할 수 있다.</li>
+<li>드리븐 테이블에 커버링 인덱스를 설계하고, 드라이빙 쪽 정리·집계 후 조인·해시 조인·BKA 같은 대안과 비교해 어떤 조건에서 무엇이 유리한지 판단할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 조인의 비용은 "몇 번 찾아 들어가는가"로 정해진다</h3>
+
+<p>관계형 데이터베이스는 정규화를 거쳐 데이터를 여러 테이블에 나눠 담고, 조회할 때 조인(join)으로 다시 붙인다. 나눠 담는 쪽의 이득, 즉 중복이 없고 갱신 이상이 생기지 않는다는 이득은 설계할 때 한 번 얻는다. 반면 다시 붙이는 비용은 조회할 때마다 치른다. 이 회차는 그 비용이 정확히 무엇으로 이루어지는지를 따진다.</p>
+
+<p>SQL로 쓴 조인은 집합 연산처럼 보인다. "두 테이블에서 조건을 만족하는 행 쌍의 집합"이라는 정의에는 순서도 반복도 없다. 그러나 MySQL의 실행기는 두 집합을 한꺼번에 들고 맞춰 보지 않는다. 한 테이블에서 행을 하나 꺼내고, 그 행과 짝이 될 행을 다른 테이블에서 찾아 들어간다. 그래서 조인의 비용은 거의 언제나 <b>바깥에서 꺼낸 행의 수 × 안쪽에서 짝을 찾는 한 번의 비용</b>이라는 곱으로 쓸 수 있다. 앞 회차들에서 단일 테이블 접근의 비용, 즉 풀 테이블 스캔·인덱스 레인지 스캔·클러스터형 인덱스 룩업이 각각 몇 페이지를 만지는지 세었다. 조인은 그 비용 앞에 곱셈이 하나 붙는 일이다.</p>
+
+<p>곱셈은 작은 낭비를 크게 키운다. 한 번에 몇 페이지만 더 읽는 비효율은 단일 행 조회에서는 보이지도 않지만, 그 접근이 바깥 루프에서 1만 번 반복되면 1만 배가 된다. 반대로 바깥 루프의 반복 횟수를 줄이거나 안쪽 접근을 한 단계 싸게 만들면 효과도 그만큼 곱해진다. 조인 튜닝이 결국 두 질문으로 모이는 이유다. <b>바깥 루프는 몇 번 도는가. 안쪽에서 한 번 찾을 때 몇 페이지를 만지는가.</b></p>
+
+<p>전반부에서는 MySQL이 조인을 실행하는 알고리즘을 바닥부터 세운다. 중첩 루프 조인(nested-loop join, NLJ)의 동작, 안쪽 테이블에 인덱스가 있을 때와 없을 때의 차이, 인덱스가 없을 때 MySQL 8.0이 쓰는 해시 조인(hash join), 그리고 어느 테이블을 바깥에 둘지 옵티마이저가 정하는 방식이다. 후반부에서는 회원별 주문 통계 쿼리 하나를 진단한다. 이 쿼리의 실행 계획은 겉보기에 흠잡을 데가 없다. 접근 유형은 <code>ref</code>이고 예상 행 수는 9다. 그런데도 느린 이유가 세컨더리 인덱스에서 클러스터형 인덱스로 되돌아가는 룩업에 숨어 있고, 그것을 커버링 인덱스로 걷어내는 과정을 끝까지 따라간다. 결과를 정렬하고 그룹을 만드는 단계의 최적화는 12회의 주제이므로 여기서는 조인까지만 다룬다.</p>
+
+<h3>실습 스키마와 데이터: 한 회원의 주문이 흩어져 있게 만든다</h3>
+
+<p>이 회차의 예제는 아래 두 테이블로 설명한다. 01회와 같은 방식으로 재귀 CTE를 써서 일련번호 <code>n</code>을 만들고 모든 열을 <code>n</code>의 식으로 채우므로, 행 수와 값은 누가 만들어도 똑같다. 인덱스는 데이터를 다 넣은 뒤에 붙인다. 테이블 이름은 01회와 같지만 구조가 다르므로 별도의 데이터베이스 <code>join_lab</code>에 만든다.</p>
+
+<pre><code class="language-sql">CREATE DATABASE join_lab DEFAULT CHARACTER SET utf8mb4;
+USE join_lab;
+
+CREATE TABLE member (
+  member_id BIGINT      NOT NULL,
+  name      VARCHAR(50) NOT NULL,
+  region    VARCHAR(20) NOT NULL,
+  PRIMARY KEY (member_id)
+) ENGINE = InnoDB;
+
+CREATE TABLE orders (
+  order_id   BIGINT       NOT NULL,
+  member_id  BIGINT       NOT NULL,
+  status     VARCHAR(20)  NOT NULL,
+  amount     INT          NOT NULL,
+  ordered_at DATETIME     NOT NULL,
+  memo       VARCHAR(200) NULL,
+  PRIMARY KEY (order_id)
+) ENGINE = InnoDB;
+
+SET SESSION cte_max_recursion_depth = 1000000;
+
+INSERT INTO member (member_id, name, region)
+WITH RECURSIVE seq (n) AS (
+  SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 100000
+)
+SELECT n,
+       CONCAT('회원', LPAD(n, 6, '0')),
+       CASE MOD(n, 10)
+         WHEN 0 THEN '서울' WHEN 1 THEN '서울' WHEN 2 THEN '서울'
+         WHEN 3 THEN '경기' WHEN 4 THEN '경기' WHEN 5 THEN '경기'
+         WHEN 6 THEN '부산' WHEN 7 THEN '대구' WHEN 8 THEN '광주'
+         ELSE '대전' END
+FROM seq;
+
+INSERT INTO orders (order_id, member_id, status, amount, ordered_at, memo)
+WITH RECURSIVE seq (n) AS (
+  SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 1000000
+)
+SELECT n,
+       MOD(n * 7919, 100000) + 1,
+       IF(MOD(n, 7) = 0, 'CANCELED', 'DELIVERED'),
+       (MOD(n, 97) + 1) * 1000,
+       TIMESTAMP('2024-01-01') + INTERVAL n MINUTE,
+       CONCAT('배송 메모 ', REPEAT('-', 100))
+FROM seq;
+
+ALTER TABLE orders
+  ADD INDEX idx_orders_member  (member_id),
+  ADD INDEX idx_orders_ordered (ordered_at);
+
+ANALYZE TABLE member, orders;</code></pre>
+
+<p>이 데이터에서 계산으로 확정되는 사실을 정리해 두자. 뒤의 모든 예제가 이 목록을 근거로 행 수를 맞힌다.</p>
+
+<ul>
+<li>회원은 100,000명이고, 지역은 회원 번호의 끝자리로 정해진다. <b>부산 회원은 끝자리가 6인 회원, 곧 6, 16, 26, …, 99996번의 정확히 10,000명</b>이다.</li>
+<li>주문은 1,000,000건이고 주문의 회원 번호는 <code>n × 7919</code>를 100,000으로 나눈 나머지에 1을 더한 값이다. 7919는 소수이고 100,000 = 2<sup>5</sup> × 5<sup>5</sup>와 서로소이므로, n을 100,000으로 나눈 나머지가 다르면 회원 번호도 다르다. 연속한 100,000개의 n은 모든 회원을 정확히 한 번씩 거치고, n이 1부터 1,000,000까지이므로 <b>회원마다 주문이 정확히 10건</b>이다. 부산 회원의 주문은 100,000건이다.</li>
+<li>n과 <code>n + 100000</code>은 100,000으로 나눈 나머지가 같으므로 같은 회원의 주문이다. 즉 <b>한 회원의 주문 10건은 주문 번호가 100,000씩 떨어져 있다.</b> 6번 회원의 주문 번호는 88395, 188395, 288395, …, 988395이고, 16번 회원은 65185, 165185, …, 26번 회원은 41975, 141975, …이다. 회원 번호가 이웃해도 주문 번호는 서로 멀다.</li>
+<li>6번 회원의 주문 금액 합계는 460,000원, 16번은 578,000원, 26번은 405,000원이다. 회원마다 금액이 다르게 나오도록 금액은 <code>n</code>을 97로 나눈 나머지로 만들었다.</li>
+<li>주문 시각은 2024-01-01 00:01부터 1분씩 늦어진다. 1월과 2월(윤년)을 합하면 60일, 곧 86,400분이므로 <b>2024-03-01 하루의 주문은 n이 86,400부터 87,839까지인 1,440건</b>이다.</li>
+<li>상태는 n이 7의 배수일 때만 CANCELED이고 나머지는 DELIVERED다. 취소 주문은 142,857건이며, 회원마다 1건 또는 2건이다.</li>
+</ul>
+
+<p>주문 번호, 곧 기본 키는 시간 순서로 매겨지는데 회원 번호는 주문 번호와 무관하게 뒤섞여 있다. 실제 서비스의 주문 테이블도 대체로 이렇다. 주문은 들어온 순서대로 기본 키를 받고, 한 회원의 주문은 몇 달, 몇 년에 걸쳐 띄엄띄엄 들어온다. 클러스터형 인덱스는 기본 키 순서로 행을 저장하므로, <b>한 회원의 주문들은 클러스터형 인덱스 여기저기에 흩어져 있다.</b> 이 성질이 후반부 진단의 핵심이다.</p>
+
+<p>물리적인 크기에 대해서는 계산 편의를 위해 다음과 같이 가정한다. 이 숫자는 측정값이 아니라 이 원고에서 정한 가정이고, 실제 값은 <code>mysql.innodb_index_stats</code>에서 <code>stat_name</code>이 <code>size</code>(전체 페이지 수)와 <code>n_leaf_pages</code>(리프 페이지 수)인 행을 조회해 확인할 수 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>구조</th><th>가정한 값</th><th>근거</th></tr></thead><tbody>
+<tr><td><code>orders</code> 클러스터형 인덱스</td><td>리프 한 페이지에 약 100행, 리프 약 10,000페이지(약 160MB), 높이 3</td><td>메모 100여 바이트 때문에 한 행이 150바이트를 넘는다</td></tr>
+<tr><td><code>idx_orders_member</code></td><td>리프 한 페이지에 약 500항목, 리프 약 2,000페이지, 높이 3</td><td>항목은 <code>member_id</code> 8바이트 + 기본 키 8바이트 + 레코드 헤더</td></tr>
+<tr><td><code>member</code> 클러스터형 인덱스</td><td>리프 약 300페이지, 높이 2</td><td>행이 짧다(번호, 짧은 이름, 지역)</td></tr>
+<tr><td>버퍼 풀</td><td>기본값 128MB</td><td><code>innodb_buffer_pool_size</code>의 기본값</td></tr>
+</tbody></table></div>
+
+<p>마지막 줄이 중요하다. 가정한 크기라면 <code>orders</code>의 클러스터형 인덱스만으로도 기본 크기의 버퍼 풀을 넘는다. 버퍼 풀에는 다른 테이블과 인덱스의 페이지도 함께 올라가므로, 이 테이블의 페이지를 무작위로 건드리면 이미 읽었던 페이지가 밀려났다가 다시 디스크에서 읽히는 일이 생긴다. 실제로 MySQL 8.4.13과 8.0.46에서 이 규칙대로 데이터를 만들고 <code>ANALYZE TABLE</code> 뒤에 <code>mysql.innodb_index_stats</code>를 조회해 보면 두 버전 모두 <code>orders</code> 클러스터형 인덱스가 리프 11,237페이지(전체 11,311페이지, 16KB 페이지로 리프만 약 176MiB), <code>idx_orders_member</code>가 리프 1,325페이지(전체 1,572페이지), <code>member</code> 클러스터형 인덱스가 리프 307페이지(전체 353페이지)였다. 세컨더리 인덱스가 가정보다 작은 것 말고는 가정과 규모가 같고, <code>orders</code>의 클러스터형 인덱스가 기본 크기의 버퍼 풀보다 크다는 점도 그대로다. 아래의 어림은 계산이 쉬운 가정한 값으로 계속한다.</p>
+
+<h3>조인의 동작 원리: 중첩 루프 조인(NLJ)</h3>
+
+<p>MySQL 매뉴얼은 중첩 루프 조인을 이렇게 정의한다. 첫 번째 테이블에서 행을 한 번에 하나씩 읽고, 그 행을 다음 테이블을 처리하는 중첩된 루프에 넘긴다. 조인할 테이블이 남아 있는 만큼 이 과정을 반복한다. 바깥 루프의 테이블을 <b>드라이빙 테이블(driving table)</b>, 그 안쪽에서 짝을 찾아 들어가는 테이블을 <b>드리븐 테이블(driven table)</b>이라고 부른다. 외부 테이블(outer table)과 내부 테이블(inner table)이라고도 한다. 아래 쿼리를 예로 들자.</p>
+
+<pre><code class="language-sql">SELECT m.member_id, m.name, o.order_id, o.amount
+FROM member m
+JOIN orders o ON o.member_id = m.member_id
+WHERE m.region = '부산';</code></pre>
+
+<p><code>member</code>를 드라이빙 테이블로 삼으면 실행은 다음 의사 코드와 같다.</p>
+
+<pre><code class="language-text">for each row m in member:                              -- 바깥 루프 (드라이빙)
+    if m.region != '부산': continue                     -- 드라이빙 쪽 조건
+    for each row o in orders where o.member_id = m.member_id:   -- 안쪽 루프 (드리븐)
+        send (m.member_id, m.name, o.order_id, o.amount) to client</code></pre>
+
+<p>한 줄씩 따라가 보자. 바깥 루프가 1번 회원을 꺼낸다. 지역이 서울이므로 안쪽 루프에 들어가지 않고 다음 행으로 넘어간다. 2번부터 5번 회원도 마찬가지다. 6번 회원은 부산이므로 안쪽 루프가 시작된다. 안쪽 루프는 <code>orders</code>에서 회원 번호가 6인 주문을 찾아 88395번, 188395번, …, 988395번 주문을 차례로 내놓고, 그때마다 결합된 행이 하나씩 클라이언트 쪽으로 흘러간다. 10건을 다 내놓으면 안쪽 루프가 끝나고 바깥 루프는 7번 회원으로 넘어간다. 이렇게 100,000명을 다 훑으면 안쪽 루프는 부산 회원 수만큼, 곧 10,000번 시작되고 결과는 100,000행이 된다.</p>
+
+<p>이 실행에는 세 가지 성질이 있다. 첫째, <b>안쪽 루프가 시작되는 횟수는 드라이빙 쪽 조건을 통과한 행의 수다.</b> 드라이빙 테이블 전체 행 수가 아니다. 그래서 드라이빙 쪽 조건은 조인 전에 최대한 먼저 적용되어야 하고, MySQL 옵티마이저도 한 테이블만 참조하는 조건을 그 테이블을 읽는 단계로 밀어 넣는다. 둘째, <b>결합된 행은 만들어지는 즉시 위로 흘러간다.</b> 중간 결과를 어딘가에 모아 두지 않으므로 필요한 메모리가 일정하고, 첫 행이 빨리 나온다. 03회에서 본 것처럼 <code>LIMIT</code>이 있으면 필요한 행 수가 채워지는 순간 바깥 루프까지 멈출 수 있다. 셋째, <b>드리븐 테이블은 여러 번 읽힌다.</b> 매뉴얼도 NLJ가 바깥 루프에서 안쪽 루프로 행을 하나씩 넘기므로 안쪽 루프에서 처리하는 테이블을 대개 여러 번 읽는다고 적고 있다. 이 셋째 성질 때문에 드리븐 쪽 한 번의 접근 비용이 전체 비용을 좌우한다.</p>
+
+<x-visual id="db-perf-11-nlj-loop" title="중첩 루프 조인에서 드라이빙 행 하나가 드리븐 테이블 탐색 한 번을 일으키는 모습" kind="구조 그림" ratio="16:9">
+<x-hint>드라이빙 테이블의 행이 위에서 아래로 하나씩 꺼내지고, 조건을 통과한 행마다 드리븐 테이블의 인덱스로 화살표가 내려가 짝을 찾는 반복 구조를 보여 준다.</x-hint>
+<x-prompt>왼쪽에 세로로 긴 표 "member (드라이빙)"을 그리고 행 여섯 개에 "1 서울", "2 서울", "…", "6 부산", "…", "16 부산"을 적는다. 부산 행 두 개만 진한 색으로 강조한다. 오른쪽에 B+Tree 모양의 삼각형 "orders.idx_orders_member (드리븐)"을 그린다. 강조된 "6 부산" 행에서 오른쪽 트리의 루트로 화살표를 긋고, 화살표가 루트에서 리프로 내려가 "member_id = 6 항목 10개"라는 묶음에 닿게 한다. "16 부산" 행에서도 같은 모양의 두 번째 화살표를 긋는다. 서울 행 옆에는 회색 글씨로 "조건 불통과: 안쪽 루프 없음"을 적는다. 그림 아래에 큰 글씨로 "비용 = 조건 통과 행 수 × 드리븐 1회 탐색 비용"이라는 수식을 넣는다. 배경은 흰색, 선은 단순한 평면 스타일.</x-prompt>
+<x-caption>드라이빙 쪽 조건을 통과한 행 하나가 드리븐 쪽 탐색 한 번을 일으킨다. 조인 비용은 이 반복의 횟수와 한 번의 비용을 곱한 것이다.</x-caption>
+</x-visual>
+
+<p>테이블이 셋 이상이면 루프가 한 겹씩 더 중첩된다. 매뉴얼의 예처럼 <code>t1</code>은 범위 접근, <code>t2</code>는 참조 키 접근, <code>t3</code>은 풀 스캔으로 읽는 조인이라면, <code>t1</code>에서 범위에 맞는 행 하나를 꺼낼 때마다 <code>t2</code>에서 키가 맞는 행들을 찾고, 그 조합 하나마다 다시 <code>t3</code>을 훑는다. 02회에서 EXPLAIN의 행 순서가 이 중첩 순서와 같다고 했다. 같은 <code>id</code>를 가진 행들은 위에서 아래로, 바깥 루프에서 안쪽 루프 순서로 읽는다.</p>
+
+<p>반복 횟수는 EXPLAIN에서 곱셈으로 읽어 낸다. 매뉴얼은 <code>rows</code>가 살펴볼 것으로 예상하는 행 수이고, <code>rows × filtered</code>가 다음 테이블과 조인될 행 수라고 설명한다. 그러므로 어떤 테이블의 접근이 몇 번 반복되는지는 <b>그보다 위에 있는 모든 행의 <code>rows × filtered / 100</code>을 곱한 값</b>이다. 위 쿼리에서 <code>member</code> 행이 <code>rows</code> 100,000, <code>filtered</code> 10.00으로 예상되었다면 <code>orders</code>의 접근은 약 10,000번 반복될 것으로 예상된 것이다. <code>orders</code> 행의 <code>rows</code>가 10이라는 것은 "한 번 찾아 들어갈 때 10행"이라는 뜻이지 "전부 해서 10행"이라는 뜻이 아니다. EXPLAIN ANALYZE에서는 같은 곱이 실측으로 나온다. 03회에서 본 것처럼 안쪽 이터레이터의 <code>rows</code>는 한 번 실행할 때의 평균이고 <code>loops</code>가 실행 횟수이므로, 둘을 곱해야 그 단계에서 처리한 전체 행 수가 된다.</p>
+
+<p>비용을 식으로 적어 두자. 드라이빙 테이블을 읽는 비용을 C<sub>outer</sub>, 드라이빙 쪽 조건을 통과한 행 수를 N, 드리븐 테이블에서 짝을 한 번 찾는 비용을 C<sub>inner</sub>라고 하면 두 테이블 NLJ의 비용은 대략 <b>C<sub>outer</sub> + N × C<sub>inner</sub></b>다. 조인 최적화의 거의 모든 기법은 이 식의 어느 항을 줄이는가로 분류할 수 있다. 드라이빙 쪽을 인덱스로 좁히는 것은 C<sub>outer</sub>와 N을 줄이고, 드리븐 쪽에 인덱스를 두는 것은 C<sub>inner</sub>를 줄이고, 조인 순서를 바꾸는 것은 N과 C<sub>inner</sub>의 조합 자체를 바꾼다.</p>
+
+<p>이 식이 실제로 어떤 차이를 만드는지 작은 자바 모형으로 세어 보자. 아래 코드는 MySQL의 구현이 아니다. 회원 1,000명과 주문 10,000건을 메모리에 만들고, 조인 방식마다 "몇 번 비교했는가", "몇 번 찾아 들어갔는가"만 센다. <code>TreeMap</code>은 B+Tree가 아니라 레드블랙 트리지만 "정렬된 키로 찾아 들어간다"는 점만 흉내 내면 충분하다. 회원 번호 공식은 위 SQL과 같은 모양이고, 7919가 1,000과 서로소이므로 회원마다 주문이 정확히 10건이다.</p>
+
+<pre><code class="language-java">import java.util.*;
+
+public class JoinDemo {
+    record Member(long id, String name, String region) {}
+    record Order(long id, long memberId, int amount) {}
+
+    public static void main(String[] args) {
+        int memberCount = 1_000, orderCount = 10_000;
+
+        List<Member> members = new ArrayList<>();
+        for (long n = 1; n <= memberCount; n++) {
+            members.add(new Member(n, "회원" + n, n % 10 == 6 ? "부산" : "기타"));
+        }
+        // 클러스터형 인덱스 흉내: 주문 번호(PK) 순서로 정렬된 맵
+        TreeMap<Long, Order> clustered = new TreeMap<>();
+        for (long n = 1; n <= orderCount; n++) {
+            clustered.put(n, new Order(n, (n * 7919) % memberCount + 1, (int) (n % 97 + 1) * 1000));
+        }
+
+        // 1) 인덱스 없는 NLJ: 드라이빙 행마다 orders 전체를 훑는다
+        long compares = 0, sum1 = 0;
+        for (Member m : members) {
+            if (!m.region().equals("부산")) continue;
+            for (Order o : clustered.values()) {
+                compares++;
+                if (o.memberId() == m.id()) sum1 += o.amount();
+            }
+        }
+        System.out.printf("NLJ(인덱스 없음)   비교 %,d회, 합계 %,d%n", compares, sum1);
+
+        // 2) 세컨더리 인덱스 NLJ: member_id -> [order_id...] 를 찾고, PK로 다시 클러스터형 인덱스를 찾는다
+        TreeMap<Long, List<Long>> secondary = new TreeMap<>();
+        for (Order o : clustered.values()) {
+            secondary.computeIfAbsent(o.memberId(), k -> new ArrayList<>()).add(o.id());
+        }
+        long indexLookups = 0, pkLookups = 0, sum2 = 0;
+        for (Member m : members) {
+            if (!m.region().equals("부산")) continue;
+            indexLookups++;
+            for (long orderId : secondary.getOrDefault(m.id(), List.of())) {
+                pkLookups++;
+                sum2 += clustered.get(orderId).amount();
+            }
+        }
+        System.out.printf("NLJ(세컨더리)      인덱스 탐색 %,d회, PK 룩업 %,d회, 합계 %,d%n", indexLookups, pkLookups, sum2);
+
+        // 3) 커버링 인덱스 NLJ: 인덱스 항목에 amount 가 들어 있어 PK 룩업이 없다
+        TreeMap<Long, List<Integer>> covering = new TreeMap<>();
+        for (Order o : clustered.values()) {
+            covering.computeIfAbsent(o.memberId(), k -> new ArrayList<>()).add(o.amount());
+        }
+        long coverLookups = 0, sum3 = 0;
+        for (Member m : members) {
+            if (!m.region().equals("부산")) continue;
+            coverLookups++;
+            for (int amount : covering.getOrDefault(m.id(), List.of())) sum3 += amount;
+        }
+        System.out.printf("NLJ(커버링)        인덱스 탐색 %,d회, PK 룩업 0회, 합계 %,d%n", coverLookups, sum3);
+
+        // 4) 해시 조인: 걸러낸 member 로 해시 테이블을 만들고(빌드), orders 를 한 번 훑으며 찾는다(프로브)
+        Map<Long, Member> hash = new HashMap<>();
+        for (Member m : members) {
+            if (m.region().equals("부산")) hash.put(m.id(), m);
+        }
+        long probes = 0, matches = 0, sum4 = 0;
+        for (Order o : clustered.values()) {
+            probes++;
+            if (hash.containsKey(o.memberId())) { matches++; sum4 += o.amount(); }
+        }
+        System.out.printf("해시 조인          빌드 %,d행, 프로브 %,d회, 일치 %,d행, 합계 %,d%n", hash.size(), probes, matches, sum4);
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">NLJ(인덱스 없음)   비교 1,000,000회, 합계 48,956,000
+NLJ(세컨더리)      인덱스 탐색 100회, PK 룩업 1,000회, 합계 48,956,000
+NLJ(커버링)        인덱스 탐색 100회, PK 룩업 0회, 합계 48,956,000
+해시 조인          빌드 100행, 프로브 10,000회, 일치 1,000행, 합계 48,956,000</code></pre>
+
+<p>네 방식 모두 같은 답을 낸다. 부산 회원은 100명이고 각자 주문이 10건이므로 일치하는 행은 1,000개다. 다른 것은 답에 이르는 일의 양이다. 인덱스 없는 NLJ는 100명 × 10,000건 = 1,000,000번 비교한다. 세컨더리 인덱스를 쓰는 NLJ는 인덱스를 100번 찾아 들어가지만, 찾은 항목에는 주문 번호만 있으므로 금액을 얻으려고 기본 키로 다시 1,000번 찾아 들어간다. 커버링 인덱스는 이 두 번째 룩업을 없앤다. 해시 조인은 걸러낸 회원 100명으로 해시 테이블을 만든 뒤 주문 10,000건을 한 번씩만 훑는다. 이 네 줄이 이 회차 전체의 지도다. 지금부터 각 줄이 InnoDB 안에서는 어떤 페이지 접근이 되는지 하나씩 내려가 본다.</p>
+
+<h3>NLJ와 인덱스: 드리븐 테이블의 생명줄</h3>
+
+<p>먼저 드리븐 테이블의 조인 열에 인덱스가 없다고 해 보자. 의사 코드의 안쪽 루프 <code>for each row o in orders where o.member_id = m.member_id</code>를 실행할 방법이 테이블 전체를 훑는 것밖에 없다. 실습 데이터라면 부산 회원 10,000명 각각에 대해 <code>orders</code> 1,000,000행을 훑는다. 비교 횟수는 10,000 × 1,000,000 = 100억 번이고, 가정한 크기로 페이지를 세면 10,000번 × 리프 10,000페이지 = 1억 번의 페이지 접근이다. 버퍼 풀에 다 들어 있다 해도 감당할 수 없는 양이다. 이 단순한 형태의 NLJ는 드리븐 테이블이 아주 작을 때가 아니면 쓸모가 없고, 실제로 MySQL은 이런 경우에 다른 알고리즘으로 바꾼다. 그 이야기는 다음 절에서 한다.</p>
+
+<p>드리븐 테이블의 조인 열에 인덱스가 있으면 안쪽 루프 한 번이 "B+Tree를 루트에서 리프까지 내려가 키가 같은 항목들을 읽는 일"로 바뀐다. 05회에서 본 것처럼 B+Tree의 높이는 데이터가 크게 늘어도 거의 늘지 않는다. 가정한 <code>idx_orders_member</code>는 높이 3이므로 한 번 찾아 들어갈 때 루트, 중간 노드, 리프 세 페이지를 만지고, 한 회원의 항목 10개는 <code>(member_id, order_id)</code> 순으로 붙어 있으므로 대개 리프 한 페이지 안에서 끝난다. C<sub>inner</sub>가 "테이블 전체"에서 "페이지 세 개 남짓"으로 줄어든 것이다. 같은 10,000번 반복이라도 1억 번의 페이지 접근이 3만 번 남짓이 된다. 드리븐 테이블의 조인 열 인덱스를 "생명줄"이라고 부르는 이유가 이 차이다.</p>
+
+<p>EXPLAIN은 드리븐 쪽 인덱스 접근을 두 가지 유형으로 보여 준다. 매뉴얼의 정의를 옮기면 이렇다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>type</th><th>뜻</th><th>이 회차의 예</th></tr></thead><tbody>
+<tr><td><code>eq_ref</code></td><td>앞 테이블들의 행 조합 하나마다 이 테이블에서 한 행만 읽는다. 조인이 인덱스의 모든 부분을 쓰고, 그 인덱스가 <code>PRIMARY KEY</code>이거나 <code>UNIQUE NOT NULL</code>일 때 쓰인다.</td><td><code>orders</code>가 드라이빙이고 <code>member</code>를 기본 키로 찾을 때</td></tr>
+<tr><td><code>ref</code></td><td>앞 테이블들의 행 조합 하나마다 인덱스 값이 일치하는 모든 행을 읽는다. 키의 왼쪽 접두사만 쓰거나, 키가 기본 키나 유니크 인덱스가 아닐 때 쓰인다.</td><td><code>member</code>가 드라이빙이고 <code>orders</code>를 <code>idx_orders_member</code>로 찾을 때</td></tr>
+</tbody></table></div>
+
+<p><code>eq_ref</code>는 "찾으면 반드시 한 행"이므로 첫 행을 찾는 즉시 그 탐색을 끝낼 수 있다. <code>ref</code>는 일치하는 행이 몇 개일지 모르므로 다음 항목의 키가 달라질 때까지 리프를 따라 읽는다. 어느 쪽이든 EXPLAIN의 <code>ref</code> 열에는 인덱스에 대 본 값의 출처가 나온다. 드라이빙 테이블의 열이면 <code>join_lab.m.member_id</code>처럼 데이터베이스·테이블·열 이름이, 상수면 <code>const</code>가, 식의 결과면 <code>func</code>가 나온다.</p>
+
+<h4>인덱스는 어느 쪽에 있어야 하는가</h4>
+
+<p>조인 조건 <code>o.member_id = m.member_id</code>는 대칭으로 보이지만 인덱스의 쓸모는 대칭이 아니다. 안쪽 루프에서 "찾아 들어가는" 쪽, 곧 드리븐 테이블의 조인 열에 인덱스가 있어야 C<sub>inner</sub>가 줄어든다. 드라이빙 테이블의 조인 열은 바깥 루프에서 순서대로 읽어 나가는 값일 뿐이므로, 거기에 인덱스가 있어도 이 조인의 반복 비용은 줄지 않는다. 회원과 주문 같은 일대다 관계에서 <code>member.member_id</code>는 기본 키라서 언제나 인덱스가 있다. 그래서 <code>orders</code>가 드라이빙이 되는 계획은 늘 <code>eq_ref</code>를 쓸 수 있다. 반대로 <code>member</code>가 드라이빙이 되는 계획은 <code>orders.member_id</code>에 인덱스가 있어야만 성립한다. 01회에서 언급했듯이 MySQL은 외래 키를 선언할 때 참조하는 쪽 열에 인덱스가 없으면 자동으로 만든다. 외래 키를 선언하지 않는 설계라면 이 인덱스를 직접 챙겨야 한다.</p>
+
+<h4>조인 열의 인덱스를 무력하게 만드는 조건</h4>
+
+<p>인덱스가 있어도 조인 조건의 모양 때문에 인덱스로 찾아 들어가지 못하는 경우가 있다. 04회에서 단일 테이블 조건이 범위를 만들지 못하는 경우를 보았는데, 조인 조건도 원리가 같다. 인덱스로 찾으려면 드리븐 쪽 인덱스 열이 <b>변형되지 않은 채로</b> 비교되어야 하고, 비교하는 값이 그 열의 정렬 순서와 같은 규칙으로 비교될 수 있어야 한다.</p>
+
+<ul>
+<li><b>타입이 다른 열끼리의 비교.</b> 매뉴얼은 문자열 열과 숫자 열처럼 서로 다른 종류의 열을 비교하면 변환 없이 직접 비교할 수 없어 인덱스 사용이 막힐 수 있다고 설명한다. 숫자 1은 문자열 <code>'1'</code>, <code>' 1'</code>, <code>'00001'</code>과 모두 같다고 비교될 수 있으므로, 문자열 열의 인덱스에서 한 구간으로 찾아 들어갈 수 없다. 회원 번호를 한 테이블은 <code>BIGINT</code>, 다른 테이블은 <code>VARCHAR</code>로 저장하는 설계가 위험한 이유다.</li>
+<li><b>문자 집합이 다른 문자열 열.</b> 매뉴얼은 비이진 문자열 열끼리 비교할 때 두 열이 같은 문자 집합을 써야 한다고 하고, <code>utf8mb4</code> 열과 <code>latin1</code> 열을 비교하면 인덱스를 쓸 수 없다고 예를 든다. 매뉴얼은 또 같은 타입과 크기로 선언된 열끼리 조인할 때 인덱스를 더 효율적으로 쓸 수 있다고 적는다.</li>
+<li><b>드리븐 쪽 열에 씌운 함수나 연산.</b> <code>ON DATE(o.ordered_at) = d.day</code>처럼 드리븐 쪽 열을 변형하면 인덱스의 정렬 순서로 찾아 들어갈 수 없다. 반면 변형이 드라이빙 쪽 값에만 걸려 있으면 그 결과를 계산해 인덱스에 대 보면 되므로 인덱스를 쓸 수 있고, 이때 EXPLAIN의 <code>ref</code> 열에 <code>func</code>가 보인다.</li>
+</ul>
+
+<p>드리븐 쪽에 조인 조건 말고 다른 조건도 있다면 복합 인덱스로 함께 처리할 수 있다. 예를 들어 <code>ON o.member_id = m.member_id AND o.status = 'DELIVERED'</code>라면 <code>(member_id, status)</code> 인덱스에서 두 열이 모두 등치로 비교되므로 한 번의 탐색으로 두 조건을 만족하는 항목 구간에 바로 들어간다. 이때 <code>ref</code> 열에는 <code>join_lab.m.member_id,const</code>가 나오고, <code>key_len</code>은 <code>BIGINT NOT NULL</code> 8바이트와 <code>VARCHAR(20) NOT NULL</code> utf8mb4의 20 × 4 + 2 = 82바이트를 더한 90이 된다. MySQL 8.4.13과 8.0.46에서 실습 데이터에 <code>(member_id, status)</code> 인덱스를 만들어 확인하면 두 버전 모두 <code>o</code> 행이 <code>ref</code>, <code>key_len</code> 90, <code>ref</code> 열이 <code>m_db_perf_11.m.member_id,const</code>(실습 서버의 데이터베이스 이름)로 나온다. 조인 조건도 결국 "앞 테이블에서 온 상수"와의 등치 비교이므로, 04회의 열 순서 원칙(등치 조건 열을 앞에, 범위 조건 열을 뒤에)이 그대로 적용된다.</p>
+
+<h3>블록 중첩 루프에서 해시 조인으로: 인덱스가 없을 때</h3>
+
+<p>드리븐 테이블에 쓸 인덱스가 없다면 반복마다 테이블을 다시 훑는 것을 피해야 한다. MySQL 8.0.18 이전에 쓰던 답은 <b>블록 중첩 루프(Block Nested-Loop, BNL)</b> 조인이었다. 매뉴얼의 설명은 이렇다. 바깥 루프에서 읽은 행들을 조인 버퍼(join buffer)에 모아 두었다가, 버퍼가 차면 안쪽 테이블을 한 번 훑으면서 읽은 행 하나를 버퍼에 든 모든 행과 비교한다. 행 10개를 버퍼에 담으면 안쪽 테이블을 읽는 횟수가 한 자릿수 줄어든다. 조인 버퍼에는 행 전체가 아니라 조인에 필요한 열만 담기고, 버퍼 크기는 <code>join_buffer_size</code>가 정한다. 버퍼에 담긴 조합 하나의 크기가 S, 조합의 수가 C일 때 안쪽 테이블을 훑는 횟수는 매뉴얼의 식으로 <code>(S × C) / join_buffer_size + 1</code>이다.</p>
+
+<p>BNL은 디스크 읽기를 줄이지만 비교 횟수는 줄이지 못한다. 안쪽 테이블의 행 하나를 버퍼의 모든 행과 하나씩 비교하므로, 부산 회원 10,000명과 주문 1,000,000건을 BNL로 조인하면 테이블을 훑는 횟수는 몇 번으로 줄어도 비교는 여전히 100억 번이다. 이 한계를 해결한 것이 해시 조인이다. 버퍼에 담은 행들을 조인 키로 해시 테이블에 넣어 두면, 안쪽 테이블의 행 하나에 대해 버퍼 전체를 훑는 대신 해시 값으로 한 칸만 들여다보면 된다.</p>
+
+<p>버전별 경과는 매뉴얼에 다음과 같이 정리되어 있다. 이 차이는 같은 8.0 안에서도 마이너 버전에 따라 실행 계획이 달라진다는 뜻이므로 정확히 알아 두어야 한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>버전</th><th>변화</th></tr></thead><tbody>
+<tr><td>8.0.18</td><td>각 조인에 등치 조건이 있고 조인 조건에 쓸 인덱스가 없는 쿼리에 해시 조인을 쓴다. 이 버전에서만 <code>optimizer_switch</code>의 <code>hash_join</code> 플래그와 <code>HASH_JOIN</code>, <code>NO_HASH_JOIN</code> 힌트가 동작했다.</td></tr>
+<tr><td>8.0.19</td><td><code>hash_join</code> 플래그와 <code>HASH_JOIN</code>·<code>NO_HASH_JOIN</code> 힌트가 더 이상 효과가 없다.</td></tr>
+<tr><td>8.0.20</td><td>블록 중첩 루프를 더 이상 쓰지 않고, 예전에 BNL을 쓰던 모든 경우에 해시 조인을 쓴다. 등치 조건이 없는 내부 조인, 외부 조인, 세미조인, 안티조인에도 해시 조인을 쓴다. 해시 조인 여부는 <code>BNL</code>·<code>NO_BNL</code> 힌트나 <code>optimizer_switch</code>의 <code>block_nested_loop</code> 플래그로 켜고 끈다.</td></tr>
+</tbody></table></div>
+
+<h4>빌드 단계와 프로브 단계</h4>
+
+<p>해시 조인은 두 단계로 실행된다. <b>빌드 단계(build phase)</b>에서는 한쪽 입력의 행을 모두 읽어 조인 열을 키로 하는 메모리 해시 테이블에 넣는다. 이쪽을 빌드 입력(build input)이라고 한다. MySQL 공식 블로그의 해시 조인 소개 글은 서버가 두 입력 중 <b>행 수가 아니라 바이트로 잰 크기가 작은 쪽</b>을 빌드 입력으로 고르는 것이 이상적이라고 설명한다. 해시 테이블에 담기는 것은 행 전체가 아니라 필요한 열뿐이므로 행 수와 바이트 크기는 다를 수 있다. <b>프로브 단계(probe phase)</b>에서는 다른 쪽 입력, 곧 프로브 입력(probe input)을 한 행씩 읽으면서 그 행의 조인 열 값으로 해시 테이블을 찾고, 일치하는 행이 있으면 결합된 행을 내보낸다. 결과적으로 두 입력을 각각 한 번씩만 읽고, 짝을 찾는 일은 해시 테이블 조회 한 번으로 끝난다.</p>
+
+<pre class="diagram">빌드 단계                                 프로브 단계
+
+member (region = '부산'인 10,000행)        orders (1,000,000행을 처음부터 끝까지 한 번)
+   │ 조인 키 member_id 로 해시                 │ 행마다 o.member_id 로 해시
+   ▼                                          ▼
+┌───────────── 해시 테이블 ─────────────┐     ┌──────────────────────────┐
+│ 버킷 a: 6 → (6, '회원000006')         │ ◀── │ o(88395, member_id=6)    │ → 일치: 내보냄
+│ 버킷 b: 16 → (16, '회원000016')       │ ◀── │ o(1, member_id=7920)     │ → 없음: 버림
+│ ...                                   │     │ ...                      │
+└───────────────────────────────────────┘     └──────────────────────────┘
+  join_buffer_size 안에서 메모리를 쓴다          첫 결과는 빌드가 끝나야 나온다</pre>
+
+<p>이 구조에서 해시 조인의 성격이 바로 나온다. 첫째, <b>인덱스가 필요 없다.</b> 양쪽을 한 번씩 순차로 읽기만 하면 된다. 둘째, <b>비용이 두 입력의 크기에 비례한다.</b> 결과가 몇 행이든 프로브 입력은 처음부터 끝까지 읽힌다. 셋째, <b>빌드가 끝나기 전에는 결과가 한 행도 나오지 않는다.</b> NLJ는 첫 짝을 찾는 즉시 내보내지만 해시 조인은 빌드 입력을 전부 읽어야 첫 프로브를 할 수 있다. 그래서 <code>LIMIT 10</code>처럼 앞의 몇 행만 필요한 쿼리에서는 NLJ의 조기 종료를 따라가지 못한다. 넷째, <b>해시 테이블은 같음만 찾을 수 있다.</b> 해시 값은 크기 순서를 보존하지 않으므로 <code>t1.c1 < t2.c1</code> 같은 비등치 조건으로는 버킷을 고를 수 없다. 매뉴얼의 예에서 비등치 조인은 <code>Inner hash join (no condition)</code> 위에 <code>Filter: (t1.c1 < t2.c1)</code>가 얹힌 계획으로 나온다. 조건 없이 모든 조합을 만든 뒤 걸러 낸다는 뜻이다.</p>
+
+<h4>메모리가 모자랄 때: 디스크로 넘치는 해시 조인</h4>
+
+<p>해시 테이블의 크기는 <code>join_buffer_size</code>로 제한된다. 매뉴얼은 해시 조인이 이 값보다 많은 메모리를 쓸 수 없다고 하고, 이 변수의 기본값은 262,144바이트(256KB)다. 8.0.18부터 해시 조인용 버퍼는 필요한 만큼 점진적으로 할당되므로, 값을 크게 잡아도 작은 쿼리가 그만큼의 메모리를 한꺼번에 차지하지는 않는다. 빌드 입력이 이 한도를 넘으면 해시 조인은 디스크의 파일을 쓴다. 해시 조인이 도입된 8.0.18 무렵 공식 블로그가 설명한 과정은 다음과 같다.</p>
+
+<figure class="flow-figure"><figcaption>메모리를 넘은 해시 조인의 처리 순서</figcaption><ol class="flow">
+<li><strong>빌드 중 메모리가 가득 참</strong><span>나머지 빌드 행을 조인 키의 해시 값에 따라 여러 개의 청크 파일(chunk file)로 나눠 디스크에 쓴다. 서버는 가장 큰 청크가 메모리에 꼭 맞도록 청크 수를 정하려 하지만, 입력 하나당 청크 파일은 최대 128개다. MySQL 8.0 소스(<code>hash_join_iterator.h</code>)의 주석에 따르면 파일 디스크립터가 바닥나지 않게 하려는 상한이다.</span></li>
+<li><strong>프로브</strong><span>프로브 행은 메모리에 있는 해시 테이블과 대조하고, 같은 해시 함수와 공식으로 프로브 쪽 청크 파일에도 나눠 쓴다. 같은 공식을 쓰므로 서로 짝이 될 수 있는 행은 반드시 같은 번호의 청크 쌍에 들어간다.</span></li>
+<li><strong>청크 쌍 처리</strong><span>빌드 쪽 청크 하나를 메모리 해시 테이블에 올리고, 같은 번호의 프로브 쪽 청크를 읽어 대조한다. 모든 청크 쌍을 처리할 때까지 반복한다.</span></li>
+</ol></figure>
+
+<p>청크를 나눌 때와 해시 테이블에 넣을 때는 서로 다른 해시 함수를 쓴다. 같은 함수를 쓰면 한 청크 파일에 든 행들은 모두 같은 규칙으로 걸러져 들어온 것이므로, 그 청크를 해시 테이블에 다시 올릴 때 행들이 소수의 버킷에 몰려 해시 테이블이 극도로 나빠진다. 블로그의 설명이 바로 이 점이다. 넘침에는 두 가지 대가가 따른다. 하나는 디스크 쓰기와 다시 읽기의 비용이고, 다른 하나는 열린 파일 수다. 매뉴얼은 해시 조인이 <code>open_files_limit</code>보다 많은 파일을 만들게 되면 조인이 실패할 수 있다고 경고하고, 대책으로 <code>join_buffer_size</code>나 <code>open_files_limit</code>를 늘리는 방법을 든다. 실습 데이터로 감을 잡아 보자. 부산 회원 10,000명을 빌드 입력으로 삼으면 행마다 회원 번호 8바이트와 이름 문자열이 담긴다. 이름은 한글 두 글자(utf8mb4에서 글자당 3바이트)와 숫자 여섯 자리라 12바이트다. 자료만 세어도 10,000 × 20바이트 남짓, 곧 200KB 안팎이고 해시 테이블 자체의 부가 공간도 있으므로, 기본값 256KB 안에 다 들어간다고 장담할 수 없다. 빌드 입력이 작은 쪽이 되도록 조건을 먼저 걸러 내는 것이 해시 조인에서도 중요한 이유다.</p>
+
+<h4>실행 계획에서 해시 조인 알아보기</h4>
+
+<p>8.0.20부터는 전통 형식의 EXPLAIN에서도 해시 조인을 볼 수 있다. 매뉴얼의 예에서 <code>t1 JOIN t2 ON t1.c1 = t2.c1</code>(두 테이블 모두 인덱스 없음)의 두 번째 행은 <code>type</code>이 <code>ALL</code>이고 <code>Extra</code>가 <code>Using where; Using join buffer (hash join)</code>이다. 매뉴얼은 이 표시를 "앞선 조인의 테이블을 조인 버퍼에 나눠 읽고, 버퍼의 행으로 현재 테이블과 조인한다"고 설명한다. 즉 이 표시가 붙은 테이블이 프로브 쪽이고, 그보다 위의 테이블들이 버퍼(해시 테이블)에 담긴다. 트리 형식에서는 <code>Inner hash join (t2.c1 = t1.c1)</code> 아래에 두 자식이 나오고, <code>Hash</code>라는 노드 아래에 있는 쪽이 빌드 입력이다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (매뉴얼의 예처럼 인덱스 없는 빈 테이블 t1(c1 INT, c2 INT), t2(c1 INT, c2 INT)에 EXPLAIN FORMAT=TREE SELECT * FROM t1 JOIN t2 ON t1.c1 = t2.c1, 8.0.46도 같다)"><code class="language-text">-> Inner hash join (t2.c1 = t1.c1)  (cost=0.7 rows=1)
+    -> Table scan on t2  (cost=0.35 rows=1)
+    -> Hash
+        -> Table scan on t1  (cost=0.35 rows=1)</code></pre>
+
+<p>실습 쿼리에서 해시 조인을 일부러 보고 싶다면 조인 조건에 쓸 인덱스를 막으면 된다. 아래처럼 인덱스 힌트로 <code>idx_orders_member</code>를 무시하게 하면 <code>orders</code>에는 조인 조건에 쓸 인덱스가 남지 않는다. 이때 옵티마이저가 <code>member</code>를 먼저 읽는 순서를 고른다면 <code>member</code>가 빌드 입력, <code>orders</code>의 풀 스캔이 프로브 입력이 되고, <code>orders</code> 행의 <code>Extra</code>에 <code>Using join buffer (hash join)</code>이 붙는다. 실제로 어느 순서가 선택되었는지는 EXPLAIN으로 확인해야 하는데, 실습 데이터에서 확인해 보면 이 힌트만으로는 해시 조인이 나오지 않는다.</p>
+
+<pre><code class="language-sql">EXPLAIN FORMAT=TREE
+SELECT m.member_id, m.name, o.order_id, o.amount
+FROM member m
+JOIN orders o IGNORE INDEX (idx_orders_member) ON o.member_id = m.member_id
+WHERE m.region = '부산';
+
+-- 해시 조인 자체를 끄고 싶을 때(8.0.20 이상)
+SELECT /*+ NO_BNL(o) */ ...</code></pre>
+
+<p>MySQL 8.4.13과 8.0.46 모두 위 쿼리에 <code>orders</code>를 먼저 풀 스캔하고 행마다 <code>member</code>를 기본 키로 찾는 계획을 골랐다. 트리 형식으로는 <code>Nested loop inner join</code> 아래에 <code>Table scan on o</code>와 <code>Single-row index lookup on m using PRIMARY (member_id=o.member_id)</code>가 나오고, 전통 형식으로는 <code>o</code>가 <code>ALL</code>, <code>m</code>이 <code>eq_ref</code>다. <code>idx_orders_member</code>를 막아도 <code>member</code> 쪽에는 조인 조건에 쓸 기본 키가 남아 있으므로, 순서를 뒤집으면 인덱스를 쓰는 NLJ가 여전히 가능하기 때문이다. 해시 조인을 보려면 <code>/*+ JOIN_ORDER(m, o) */</code>를 더해 <code>member</code>를 먼저 읽게 하거나, <code>member m IGNORE INDEX (PRIMARY)</code>로 그 길까지 막아야 한다. 그러면 두 버전 모두 아래 계획이 나온다. 비용과 예상 행 수는 실행 환경과 통계에 따라 달라진다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (위 쿼리에 JOIN_ORDER(m, o) 힌트를 더함)"><code class="language-text">-> Inner hash join (o.member_id = m.member_id)  (cost=990e+6 rows=99589)
+    -> Table scan on o  (cost=6.64 rows=988856)
+    -> Hash
+        -> Filter: (m.region = '부산')  (cost=10152 rows=10008)
+            -> Table scan on m  (cost=10152 rows=100082)</code></pre>
+
+<p><code>Hash</code> 아래의 <code>member</code>가 빌드 입력, <code>orders</code>의 풀 스캔이 프로브 입력이다. 같은 쿼리의 전통 형식 EXPLAIN에서는 <code>o</code> 행이 <code>type</code> <code>ALL</code>, <code>Extra</code> <code>Using where; Using join buffer (hash join)</code>으로 나온다. 여기에 <code>NO_BNL(o)</code>까지 주어 해시 조인을 끄면, 두 버전 모두 <code>member</code>의 부산 회원 행마다 <code>orders</code>를 풀 스캔하는 단순 NLJ(<code>Filter: (o.member_id = m.member_id)</code> 아래 <code>Table scan on o</code>)가 되고 비용 추정은 <code>1.04e+9</code>(8.0.46은 <code>1.06e+9</code>)로 뛴다.</p>
+
+<p>공식 블로그는 조인 조건에 쓸 인덱스가 있으면 MySQL이 인덱스 룩업을 쓰는 중첩 루프 쪽을 택하는 경향이 있다고 적고 있다. 두 알고리즘을 나란히 놓으면 왜 그런 선택이 합리적인지 보인다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>관점</th><th>인덱스를 쓰는 NLJ</th><th>해시 조인</th></tr></thead><tbody>
+<tr><td>필요한 것</td><td>드리븐 쪽 조인 열의 인덱스</td><td>조인 버퍼 메모리(<code>join_buffer_size</code>)</td></tr>
+<tr><td>비용이 비례하는 것</td><td>드라이빙 쪽 통과 행 수 × 한 번의 탐색 비용</td><td>두 입력의 전체 크기</td></tr>
+<tr><td>데이터가 10배로 늘면</td><td>드라이빙 통과 행이 그대로면 거의 그대로(트리 높이만 영향)</td><td>프로브 입력을 읽는 비용이 10배</td></tr>
+<tr><td>첫 행이 나오는 시점</td><td>첫 짝을 찾는 즉시</td><td>빌드 입력을 다 읽은 뒤</td></tr>
+<tr><td>디스크 접근 모양</td><td>탐색마다 트리를 내려간다(흩어져 있으면 무작위)</td><td>양쪽 모두 순차 읽기</td></tr>
+<tr><td>비등치 조건</td><td>인덱스 범위로 처리 가능</td><td>조건 없는 조합 + 필터</td></tr>
+</tbody></table></div>
+
+<p>표의 셋째 줄이 OLTP 쿼리에서 인덱스를 쓰는 NLJ가 기본이 되는 이유다. 한 화면에 필요한 결과가 일정한 크기라면, 비용이 결과 크기에 비례하는 계획은 테이블이 커져도 버틴다. 반면 해시 조인은 테이블 전체를 읽으므로 테이블과 함께 느려진다. 하지만 다섯째 줄도 기억해 두자. 드라이빙 쪽 통과 행이 아주 많고 드리븐 쪽 탐색이 디스크의 무작위 위치를 건드린다면, 테이블을 한 번 순차로 읽는 해시 조인이 오히려 싸질 수 있다. 후반부의 진단이 정확히 이 경계 위에 있다.</p>
+
+<h3>드라이빙 테이블은 누가 정하는가</h3>
+
+<p>내부 조인에서 <code>FROM</code> 절에 테이블을 쓴 순서는 실행 순서와 관계가 없다. MySQL에서 <code>JOIN</code>, <code>CROSS JOIN</code>, <code>INNER JOIN</code>은 문법적으로 같은 것이고(매뉴얼의 표현으로 서로 바꿔 쓸 수 있다), 내부 조인은 교환 법칙과 결합 법칙이 성립하므로 어느 테이블을 바깥에 두어도 결과는 같다. 그래서 순서는 옵티마이저가 정한다. 옵티마이저는 가능한 조인 순서들을 탐색하면서 순서마다 각 테이블의 접근 방법과 비용, 그리고 다음 테이블로 넘어갈 예상 행 수를 누적해 가장 싼 순서를 고른다. 앞 절의 식 C<sub>outer</sub> + N × C<sub>inner</sub>를 테이블 수만큼 이어 붙여 비교하는 셈이다.</p>
+
+<p>탐색해야 할 순서의 수는 테이블 수의 계승으로 늘어난다. 테이블이 3개면 6가지, 5개면 120가지, 10개면 3,628,800가지다. 매뉴얼은 조인 쿼리에서 옵티마이저가 조사하는 계획의 수가 테이블 수에 따라 지수적으로 늘고, 테이블이 대략 7~10개보다 적으면 문제가 되지 않는다고 설명한다. 이 탐색을 조절하는 변수가 둘 있다. <code>optimizer_prune_level</code>(기본값 1)은 중간 계획이 읽을 행 수를 기준으로 가망 없는 부분 계획을 잘라 내는 휴리스틱을 켠다. 0으로 끄면 완전 탐색을 한다. <code>optimizer_search_depth</code>(기본값 62)는 탐색의 최대 깊이다. 쿼리의 테이블 수보다 크면 더 좋은 계획을 찾지만 계획을 만드는 데 오래 걸리고, 작으면 빨리 끝나지만 계획이 최적과 멀 수 있으며, 0이면 서버가 적당한 값을 고른다. 조인 테이블이 아주 많은 쿼리에서 실행보다 계획 수립에 시간이 더 걸리는 현상이 있다면 이 두 변수를 의심한다.</p>
+
+<h4>비용 비교 1: 같은 쿼리, 두 가지 순서</h4>
+
+<p>부산 회원의 주문을 조인하는 앞 절의 쿼리로 두 순서를 직접 비교해 보자. 숫자는 실습 데이터에서 계산되는 실제 행 수이고, 옵티마이저는 이 값들을 통계로 추정해서 같은 비교를 한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>순서</th><th>드라이빙 쪽</th><th>반복 횟수 N</th><th>드리븐 쪽 한 번</th><th>합계</th></tr></thead><tbody>
+<tr><td>A: member → orders</td><td><code>member</code> 풀 스캔 100,000행, 부산 조건 통과 10,000행</td><td>10,000</td><td><code>idx_orders_member</code> 탐색(<code>ref</code>), 10행</td><td>인덱스 탐색 10,000번, 주문 100,000행</td></tr>
+<tr><td>B: orders → member</td><td><code>orders</code> 풀 스캔 1,000,000행, 조건 없음</td><td>1,000,000</td><td><code>member</code> 기본 키 탐색(<code>eq_ref</code>), 1행 후 지역 검사</td><td>기본 키 탐색 1,000,000번, 그중 100,000행 통과</td></tr>
+</tbody></table></div>
+
+<p>순서 B는 <code>orders</code>에 아무 조건이 없어 드라이빙 행을 줄이지 못하고, 결과에 남지 않을 900,000건의 주문에 대해서도 회원을 찾아 들어간다. MySQL 8.4.13과 8.0.46에서 EXPLAIN으로 확인하면 옵티마이저도 순서 A를 고른다(<code>m</code>이 <code>ALL</code>, <code>o</code>가 <code>idx_orders_member</code>의 <code>ref</code>). 여기까지는 "작은 테이블을 드라이빙으로"라는 흔한 말과 맞아떨어진다.</p>
+
+<h4>비용 비교 2: 큰 테이블이 드라이빙이 되는 경우</h4>
+
+<p>이번에는 2024년 3월 1일 하루의 주문과 주문한 회원의 이름을 구하는 쿼리다.</p>
+
+<pre><code class="language-sql">SELECT o.order_id, o.amount, m.name
+FROM member m
+JOIN orders o ON o.member_id = m.member_id
+WHERE o.ordered_at >= '2024-03-01'
+  AND o.ordered_at <  '2024-03-02';</code></pre>
+
+<div class="table-wrap"><table><thead><tr><th>순서</th><th>드라이빙 쪽</th><th>반복 횟수 N</th><th>드리븐 쪽 한 번</th><th>합계</th></tr></thead><tbody>
+<tr><td>A: member → orders</td><td><code>member</code> 풀 스캔, 조건 없음</td><td>100,000</td><td><code>idx_orders_member</code>로 10행을 찾고, 행마다 클러스터형 인덱스에서 <code>ordered_at</code>을 확인</td><td>인덱스 탐색 100,000번, 주문 1,000,000행을 읽고 1,440행만 남김</td></tr>
+<tr><td>B: orders → member</td><td><code>idx_orders_ordered</code> 범위 1,440항목 + 클러스터형 인덱스 룩업 1,440번</td><td>1,440</td><td><code>member</code> 기본 키 탐색(<code>eq_ref</code>)</td><td>기본 키 탐색 1,440번</td></tr>
+</tbody></table></div>
+
+<p>MySQL 8.4.13과 8.0.46의 EXPLAIN도 순서 B를 고른다. <code>o</code>가 <code>idx_orders_ordered</code>의 <code>range</code>(<code>rows</code> 1440, <code>Extra</code> <code>Using index condition</code>)이고, <code>m</code>이 <code>PRIMARY</code>의 <code>eq_ref</code>다. 테이블 크기로는 <code>orders</code>가 <code>member</code>의 10배인데, 이번에는 큰 테이블이 드라이빙이 되어야 한다. 하루치 주문 1,440건은 주문 번호가 86,400부터 87,839까지 연속이므로 클러스터형 인덱스 룩업도 가정한 크기로 리프 15페이지 남짓에 몰려 있다. 그러므로 정확한 규칙은 "작은 테이블"이 아니라 <b>"자기 조건을 거친 뒤 남는 행이 적고, 그 행마다 상대 테이블을 싸게 찾아 들어갈 수 있는 쪽"</b>이 드라이빙이 된다는 것이다. 두 요소는 서로 얽혀 있다. 드라이빙 행이 아무리 적어도 드리븐 쪽 조인 열에 인덱스가 없으면 C<sub>inner</sub>가 커지고, 드리븐 쪽 접근이 아무리 싸도 드라이빙 행이 많으면 N이 커진다.</p>
+
+<h4>추정이 틀리면 순서가 틀린다</h4>
+
+<p>옵티마이저의 비교는 실제 행 수가 아니라 통계로 추정한 행 수 위에서 이루어진다. 인덱스가 있는 열의 조건은 인덱스를 직접 살펴보거나 인덱스 통계로 비교적 잘 추정하지만, 인덱스도 히스토그램도 없는 열의 조건은 근거가 약한 추정에 기댄다. 조인에서 이 오차는 곱해진다. 첫 테이블의 통과 행 수를 2배 틀리면 둘째 테이블의 반복 횟수 추정도 2배 틀리고, 둘째 테이블의 통과율까지 2배 틀리면 셋째 테이블에서는 4배가 된다. 테이블이 많을수록 뒤쪽 추정은 실제와 크게 멀어질 수 있고, 그 결과로 좋지 않은 순서가 선택된다. EXPLAIN ANALYZE에서 예상 행 수와 실제 행 수가 크게 다른 단계를 찾는 03회의 방법, 그리고 인덱스가 없는 열의 분포를 옵티마이저에게 알려 주는 10회의 히스토그램이 바로 이 문제를 다루는 도구다.</p>
+
+<h4>옵티마이저가 순서를 마음대로 바꾸지 못하는 경우</h4>
+
+<p>순서 선택에는 제약도 있다. 첫째, EXPLAIN의 <code>type</code>이 <code>system</code>이나 <code>const</code>인 테이블은 일치하는 행이 많아야 하나라서 쿼리 시작 시점에 먼저 읽히고, 그 행의 값은 나머지 최적화에서 상수처럼 취급된다. 둘째, 외부 조인에는 의존 관계가 있다. 매뉴얼은 <code>A LEFT JOIN B</code>를 구현할 때 B가 A에 의존하도록 설정하고, 모든 표준 조인 최적화를 하되 테이블은 항상 자신이 의존하는 테이블들을 다 읽은 뒤에 읽는다고 설명한다. 즉 <code>LEFT JOIN</code>의 왼쪽 테이블이 오른쪽 테이블보다 먼저, 바깥 루프에 놓인다. 오른쪽 테이블에 아주 선택적인 조건이 있어도 왼쪽부터 읽어야 하므로 비효율적인 계획이 강제될 수 있다.</p>
+
+<p>그런데 이 제약이 풀리는 경우가 있다. 매뉴얼은 <code>WHERE</code> 조건이 <b>널 거부(null-rejected)</b> 조건이면 외부 조인을 내부 조인으로 바꾼다고 설명한다. 널 거부 조건이란 외부 조인이 만들어 낸 "NULL로 채운 행"에 대해 FALSE나 UNKNOWN이 되는 조건이다. 예를 들어 <code>FROM member m LEFT JOIN orders o ON o.member_id = m.member_id WHERE o.status = 'CANCELED'</code>에서 주문이 없는 회원의 행은 <code>o.status</code>가 NULL이므로 <code>WHERE</code>에서 반드시 탈락한다. 그렇다면 결과는 내부 조인과 같고, 옵티마이저는 이 쿼리를 내부 조인으로 바꾼 뒤 <code>orders</code>를 먼저 읽는 순서도 고려할 수 있다. 매뉴얼의 예도 변환 전에는 <code>T1, T2, T3</code> 순서만 평가하던 계획이 변환 후에는 <code>T3, T1, T2</code> 순서까지 고려하게 된다고 보여 준다.</p>
+
+<h4>서브쿼리도 조인이 된다: 세미조인</h4>
+
+<p>02회에서 <code>DEPENDENT SUBQUERY</code>는 바깥 행마다 서브쿼리를 다시 실행한다고 했다. 이것은 "바깥 쿼리를 드라이빙으로 고정한 NLJ"와 같은 모양이다. MySQL은 <code>WHERE m.member_id IN (SELECT o.member_id FROM orders o WHERE ...)</code> 같은 서브쿼리를 <b>세미조인(semijoin)</b>으로 변환해 이 고정을 푼다. 세미조인은 매뉴얼의 표현으로 준비 단계의 변환이고, 바깥 테이블의 행 중 서브쿼리와 짝이 맞는 행을 한 번씩만 돌려주는 연산이다. 일단 조인이 되면 옵티마이저는 서브쿼리 쪽 테이블을 드라이빙으로 두는 순서까지 비교할 수 있다. 문제는 일대다 관계에서 조인을 하면 바깥 행이 여러 번 나온다는 것이고, 이 중복을 어떻게 없애느냐에 따라 실행 전략이 갈린다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>전략</th><th>방법</th><th>EXPLAIN 표시</th></tr></thead><tbody>
+<tr><td>테이블 풀아웃(table pullout)</td><td>서브쿼리의 테이블을 바깥 쿼리로 끌어내 보통의 내부 조인으로 실행한다</td><td>전용 표시 없음, <code>SHOW WARNINGS</code>의 재작성된 쿼리에서 확인</td></tr>
+<tr><td>중복 제거(duplicate weedout)</td><td>일반 조인처럼 실행하고 임시 테이블로 중복 행을 걸러 낸다</td><td><code>Start temporary</code>, <code>End temporary</code></td></tr>
+<tr><td>퍼스트 매치(FirstMatch)</td><td>안쪽 테이블에서 짝을 하나 찾으면 같은 값 묶음의 나머지 탐색을 건너뛴다</td><td><code>FirstMatch(tbl_name)</code></td></tr>
+<tr><td>루스 스캔(LooseScan)</td><td>서브쿼리 테이블을 인덱스로 읽으며 값 묶음마다 하나만 고른다</td><td><code>LooseScan(m..n)</code></td></tr>
+<tr><td>구체화(materialization)</td><td>서브쿼리 결과를 인덱스가 있는 임시 테이블로 만들고 그것과 조인한다</td><td><code>select_type</code>이 <code>MATERIALIZED</code>, <code>table</code>이 <code><subqueryN></code></td></tr>
+</tbody></table></div>
+
+<p>매뉴얼에 따르면 8.0.16부터 <code>EXISTS</code> 서브쿼리도 같은 <code>IN</code> 서브쿼리와 똑같이 세미조인 변환을 받고, 8.0.17부터는 <code>NOT IN</code>, <code>NOT EXISTS</code> 같은 부정형이 안티조인(antijoin)으로 변환된다. 세미조인에는 조건이 몇 가지 있는데, 그중 하나가 바깥 쿼리에 <code>STRAIGHT_JOIN</code>이 없어야 한다는 것이다. 조인 순서를 고정하려고 넣은 <code>STRAIGHT_JOIN</code>이 서브쿼리 최적화를 꺼 버릴 수 있다는 뜻이다.</p>
+
+<h4>순서를 직접 지정하는 방법과 그 대가</h4>
+
+<p>옵티마이저의 선택이 틀렸다고 확신할 때는 순서를 지정할 수 있다. <code>t1 STRAIGHT_JOIN t2</code>는 매뉴얼의 표현으로 <code>JOIN</code>과 같되 왼쪽 테이블을 항상 오른쪽 테이블보다 먼저 읽는다. <code>SELECT STRAIGHT_JOIN</code>은 <code>FROM</code> 절에 나열한 순서대로 모든 테이블을 조인한다. 8.0의 옵티마이저 힌트로는 더 세밀하게 지정할 수 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>힌트</th><th>뜻</th></tr></thead><tbody>
+<tr><td><code>JOIN_FIXED_ORDER()</code></td><td><code>FROM</code> 절에 나온 순서대로 조인한다. <code>SELECT STRAIGHT_JOIN</code>과 같다.</td></tr>
+<tr><td><code>JOIN_ORDER(t1, t2, ...)</code></td><td>지정한 테이블들을 그 순서로 조인한다. 지정하지 않은 테이블은 그 사이 어디에든 놓일 수 있다.</td></tr>
+<tr><td><code>JOIN_PREFIX(t1, t2, ...)</code></td><td>지정한 테이블들을 계획의 맨 앞에 그 순서로 놓는다.</td></tr>
+<tr><td><code>JOIN_SUFFIX(t1, t2, ...)</code></td><td>지정한 테이블들을 계획의 맨 뒤에 그 순서로 놓는다.</td></tr>
+</tbody></table></div>
+
+<pre><code class="language-sql">SELECT /*+ JOIN_ORDER(o, m) */ o.order_id, o.amount, m.name
+FROM member m
+JOIN orders o ON o.member_id = m.member_id
+WHERE o.ordered_at >= '2024-03-01' AND o.ordered_at < '2024-03-02';</code></pre>
+
+<p>힌트에는 두 가지 함정이 있다. 하나는 조용히 무시될 수 있다는 것이다. 매뉴얼은 지정한 조인 종류와 충돌하는 힌트는 경고 없이 무시된다고 하고, <code>FROM t2 LEFT JOIN t1</code>에 <code>JOIN_PREFIX(t1, t2)</code>를 준 예를 든다. 왼쪽 조인이 요구하는 순서와 충돌하기 때문이다. 힌트를 넣었으면 반드시 EXPLAIN으로 실제 순서를 확인한다. 다른 하나는 힌트가 오늘의 데이터에 대한 판단을 코드에 못 박는다는 것이다. 데이터 분포가 바뀌어 다른 순서가 더 좋아져도 힌트는 따라가지 않는다. 힌트는 통계를 바로잡고 인덱스를 고친 뒤에도 옵티마이저가 틀릴 때 쓰는 마지막 수단이다.</p>
+
+<h3>정리: 조인 계획을 읽고 판단하는 순서</h3>
+
+<p>전반부에서 세운 원리를 실행 계획을 읽는 순서로 묶어 두자. 후반부의 진단도 이 순서를 그대로 따른다.</p>
+
+<figure class="flow-figure"><figcaption>조인 계획 진단의 순서</figcaption><ol class="flow">
+<li><strong>순서 확인</strong><span>EXPLAIN의 같은 <code>id</code> 행들을 위에서 아래로 읽어 드라이빙과 드리븐을 확인한다. 트리 형식이라면 <code>Nested loop</code>의 첫 자식이 바깥, 둘째 자식이 안쪽이고, <code>Inner hash join</code>에서는 <code>Hash</code> 아래가 빌드 입력이다.</span></li>
+<li><strong>반복 횟수 계산</strong><span>위쪽 행들의 <code>rows × filtered / 100</code>을 곱해 각 드리븐 접근이 몇 번 반복되는지 구한다. EXPLAIN ANALYZE라면 <code>loops</code>를 바로 읽는다.</span></li>
+<li><strong>드리븐 접근의 한 번 비용</strong><span><code>type</code>이 <code>eq_ref</code>나 <code>ref</code>인지, <code>ALL</code>이나 <code>index</code>에 <code>Using join buffer (hash join)</code>이 붙었는지 본다. <code>ref</code>라면 <code>Extra</code>에 <code>Using index</code>가 있는지, 곧 클러스터형 인덱스로 되돌아가는지 확인한다.</span></li>
+<li><strong>곱해 보기</strong><span>반복 횟수 × 한 번에 만지는 페이지 수를 어림하고, 그 페이지들이 연속인지 흩어져 있는지 판단한다.</span></li>
+<li><strong>처방 고르기</strong><span>곱의 어느 항이 큰지에 따라 드라이빙 쪽 조건·인덱스, 드리븐 쪽 인덱스·커버링, 조인 순서·알고리즘 중에서 고른다.</span></li>
+</ol></figure>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>조인 비용은 드라이빙 쪽 조건을 통과한 행 수와 드리븐 쪽 한 번의 접근 비용의 곱이다. 드리븐 쪽 조인 열의 인덱스는 그 한 번의 비용을 테이블 크기에서 트리 높이로 줄이고, 인덱스가 없을 때 MySQL 8.0은 두 입력을 한 번씩 읽는 해시 조인으로 곱셈 자체를 피한다. 어느 테이블을 바깥에 둘지는 옵티마이저가 추정한 행 수 위에서 비용을 비교해 정하므로, 계획이 틀렸다면 먼저 추정과 인덱스를 의심한다.</p></aside>
+
+<h3>실전 진단: 회원별 주문 통계</h3>
+
+<p>이제 실전 쿼리 하나를 진단한다. 아래 시나리오는 설명을 위해 이 원고에서 정한 가정이다. 영업 지원 화면에 "지역별 회원 주문 통계" 메뉴가 있고, 지역을 고르면 그 지역 회원마다 주문 건수와 주문 총액을 보여 준다. 화면 뒤의 SQL은 이렇다.</p>
+
+<pre><code class="language-sql">SELECT m.member_id, m.name,
+       COUNT(*)      AS order_count,
+       SUM(o.amount) AS total_amount
+FROM member m
+JOIN orders o ON o.member_id = m.member_id
+WHERE m.region = '부산'
+GROUP BY m.member_id, m.name;</code></pre>
+
+<p>결과는 부산 회원 10,000명의 10,000행이다. 실습 데이터라면 6번 회원의 행은 <code>(6, '회원000006', 10, 460000)</code>, 16번은 <code>(16, '회원000016', 10, 578000)</code>, 26번은 <code>(26, '회원000026', 10, 405000)</code>이다. <code>ORDER BY</code>가 없으므로 행의 순서는 보장되지 않는다. 증상은 이렇다. 개발 서버에서는 금방 끝나던 쿼리가 운영 서버에서는 오래 걸리고, 쿼리가 도는 동안 <code>Innodb_buffer_pool_reads</code>가 눈에 띄게 늘어난다. 같은 시간대에 다른 쿼리들의 응답도 함께 나빠진다.</p>
+
+<h4>1단계: 실행 계획은 멀쩡해 보인다</h4>
+
+<p>EXPLAIN의 핵심 열은 다음과 같다. MySQL 8.4.13에서 실행한 결과이고 8.0.46도 같았다. 예상 행 수(<code>rows</code>)와 <code>filtered</code>는 실행 환경과 통계에 따라 달라지고, <code>ref</code> 열의 데이터베이스 이름은 원고의 <code>join_lab</code>으로 바꿔 적었다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>table</th><th>type</th><th>key</th><th>key_len</th><th>ref</th><th>rows</th><th>filtered</th><th>Extra</th></tr></thead><tbody>
+<tr><td>m</td><td>ALL</td><td>NULL</td><td>NULL</td><td>NULL</td><td>100082</td><td>10.00</td><td>Using where; Using temporary</td></tr>
+<tr><td>o</td><td>ref</td><td>idx_orders_member</td><td>8</td><td>join_lab.m.member_id</td><td>9</td><td>100.00</td><td>NULL</td></tr>
+</tbody></table></div>
+
+<p>전반부의 순서대로 읽어 보자. 드라이빙은 <code>member</code>이고 풀 스캔이다. 회원 100,000명 중 부산을 고르는 조건에는 인덱스가 없지만, 결과에 10%가 남는 조건이라 풀 스캔 자체가 터무니없는 선택은 아니다. 드리븐인 <code>orders</code>는 <code>ref</code>로 조인 열의 인덱스를 쓰고, 한 번에 9행을 예상한다(트리 형식으로는 9.95행, 실제는 정확히 10행). <code>key_len</code> 8은 <code>BIGINT</code> 하나를 다 썼다는 뜻이다. <code>m</code> 행의 <code>Using temporary</code>는 <code>GROUP BY</code> 집계를 내부 임시 테이블로 처리한다는 표시이고, 이 부분은 12회에서 다룬다. "조인 열에 인덱스가 없다"거나 "해시 조인으로 테이블을 통째로 읽는다" 같은 눈에 띄는 문제는 없다. EXPLAIN ANALYZE로 실제 반복을 확인하면 다음과 같다. MySQL 8.4.13에서 실행한 결과이고, 맨 위 두 줄이 그룹 집계 노드, 그 아래가 조인 부분이다. 비용과 시간은 실행 환경과 통계에 따라 달라진다. 행 수와 루프 수는 데이터로 결정되는 값이며 8.0.46에서도 같았다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행한 EXPLAIN ANALYZE"><code class="language-text">-> Table scan on <temporary>  (actual time=2270..2272 rows=10000 loops=1)
+    -> Aggregate using temporary table  (actual time=2270..2270 rows=10000 loops=1)
+        -> Nested loop inner join  (cost=84216 rows=99589) (actual time=0.995..2197 rows=100000 loops=1)
+            -> Filter: (m.region = '부산')  (cost=10096 rows=10008) (actual time=0.331..35.8 rows=10000 loops=1)
+                -> Table scan on m  (cost=10096 rows=100082) (actual time=0.31..19.5 rows=100000 loops=1)
+            -> Index lookup on o using idx_orders_member (member_id=m.member_id)  (cost=6.41 rows=9.95) (actual time=0.214..0.215 rows=10 loops=10000)</code></pre>
+
+<p>마지막 줄이 이 쿼리의 무게 중심이다. 인덱스 탐색이 10,000번 반복되고 한 번에 10행씩, 모두 100,000행이 나온다. 여기까지는 계획표와 실측이 잘 맞는다. 그런데 이 한 줄 안에서 InnoDB가 실제로 하는 일은 한 가지가 아니다.</p>
+
+<h4>2단계: 한 줄 안에 숨은 두 번째 탐색</h4>
+
+<p>06회에서 본 것처럼 InnoDB의 세컨더리 인덱스 항목에는 인덱스 열과 기본 키만 들어 있다. 매뉴얼의 표현으로 세컨더리 인덱스의 각 레코드는 그 행의 기본 키 열과 세컨더리 인덱스에 지정한 열을 담고, InnoDB는 이 기본 키 값으로 클러스터형 인덱스에서 행을 찾는다. <code>idx_orders_member</code>의 항목은 <code>(member_id, order_id)</code>뿐이다. 그런데 이 쿼리는 <code>SUM(o.amount)</code>를 계산해야 하고, <code>amount</code>는 이 인덱스에 없다. 그러므로 <code>Index lookup on o</code>가 내놓는 100,000행 하나하나마다 InnoDB는 항목의 <code>order_id</code>로 클러스터형 인덱스를 루트부터 다시 내려가 행 전체가 든 리프 레코드를 읽는다. 금액 4바이트를 얻으려고 메모까지 든 150바이트 남짓의 행이 있는 페이지를 통째로 버퍼 풀에 올리는 것이다.</p>
+
+<p>이 두 번째 탐색은 실행 계획에 별도의 줄로 나오지 않는다. 계획에서 그것을 알려 주는 단서는 <b>없는 것</b> 하나뿐이다. <code>o</code> 행의 <code>Extra</code>에 <code>Using index</code>가 없다는 사실이다. 매뉴얼은 <code>Using index</code>를 "실제 행을 읽으려고 추가로 탐색하지 않고 인덱스 트리의 정보만으로 열 정보를 가져온다"는 표시로 정의한다. 그 표시가 없는 <code>ref</code> 접근은, 찾은 항목마다 클러스터형 인덱스로 되돌아간다는 뜻이다. 그러므로 이 쿼리의 실제 반복 구조는 이렇다.</p>
+
+<pre class="diagram">for each m in member (풀 스캔, 100,000행):            ← 1회, 리프 약 300페이지를 순서대로
+    if m.region != '부산': continue                    ← 10,000행 통과
+    idx_orders_member 를 루트부터 탐색 (member_id = m) ← 10,000회, 회당 약 3페이지
+    for each 항목 (member_id, order_id):               ← 회당 10항목, 모두 100,000항목
+        클러스터형 인덱스를 루트부터 탐색 (order_id)    ← 100,000회, 회당 약 3페이지  ★
+        amount 를 꺼내 집계에 넘긴다</pre>
+
+<h4>3단계: 카운터로 숨은 탐색을 드러내기</h4>
+
+<p>01회에서 쓴 두 종류의 카운터를 같이 보면 이 숨은 탐색이 드러난다. 세션 범위의 <code>Handler_read_*</code>는 SQL 계층이 스토리지 엔진에 보낸 행 읽기 요청을 센다. 매뉴얼의 정의로 <code>Handler_read_key</code>는 키로 행을 읽으라는 요청 수이고 <code>Handler_read_next</code>는 키 순서로 다음 행을 읽으라는 요청 수다. 조인만 놓고 보면 <code>Handler_read_rnd_next</code>가 회원 풀 스캔의 약 100,000, <code>Handler_read_key</code>가 인덱스 탐색 시작의 약 10,000, <code>Handler_read_next</code>가 이어 읽은 항목의 약 100,000 규모로 늘어날 것이다. 여기에 <code>GROUP BY</code>를 처리하는 임시 테이블의 읽기가 더해진다.</p>
+
+<pre><code class="language-sql">FLUSH STATUS;
+SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_read%';   -- 실행 전 값
+
+SELECT m.member_id, m.name, COUNT(*), SUM(o.amount)
+FROM member m JOIN orders o ON o.member_id = m.member_id
+WHERE m.region = '부산'
+GROUP BY m.member_id, m.name;
+
+SHOW SESSION STATUS LIKE 'Handler_read%';
+SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_read%';   -- 실행 후 값, 차이를 본다</code></pre>
+
+<pre data-label="MySQL 8.4.13에서 실행한 SHOW SESSION STATUS LIKE 'Handler_read%' (8.0.46도 같다)"><code class="language-text">+-----------------------+--------+
+| Variable_name         | Value  |
++-----------------------+--------+
+| Handler_read_first    | 1      |
+| Handler_read_key      | 110001 |
+| Handler_read_last     | 0      |
+| Handler_read_next     | 100000 |
+| Handler_read_prev     | 0      |
+| Handler_read_rnd      | 0      |
+| Handler_read_rnd_next | 110002 |
++-----------------------+--------+</code></pre>
+
+<p><code>Handler_read_next</code>는 정확히 100,000이지만 <code>Handler_read_key</code>와 <code>Handler_read_rnd_next</code>는 어림보다 각각 100,000과 10,000가량 많다. <code>GROUP BY</code>를 뺀 같은 조인(<code>SELECT m.member_id, m.name, o.order_id, o.amount ...</code>)을 같은 방식으로 재면 <code>Handler_read_key</code> 10,001, <code>Handler_read_next</code> 100,000, <code>Handler_read_rnd_next</code> 100,001로 어림과 맞는다. 차이는 집계 단계에서 생긴 것으로, 조인 행 100,000개를 그룹별로 임시 테이블에 모으고 그룹 10,000개를 다시 읽는 일이 이 카운터들에 더해진 것이다. 이처럼 <code>Handler_read_*</code>에는 조인 바깥의 단계도 섞이므로, 조인만 보고 싶으면 집계를 뺀 쿼리와 비교한다. 버퍼 풀 카운터는 서버 전체의 값이라 여러 작업이 함께 도는 실습 서버에서는 재지 않았다.</p>
+
+<p>여기서 중요한 사실은 <b><code>Handler_read_*</code>에는 클러스터형 인덱스로 되돌아가는 룩업이 따로 잡히지 않는다</b>는 것이다. SQL 계층은 "다음 행을 달라"고 한 번 요청했을 뿐이고, 그 요청을 처리하려고 InnoDB가 세컨더리 인덱스와 클러스터형 인덱스를 차례로 탐색한 것은 엔진 내부의 일이다. 반면 InnoDB의 <code>Innodb_buffer_pool_read_requests</code>는 버퍼 풀에 대한 논리적 읽기 요청을 세므로, 엔진 안에서 만진 페이지가 모두 반영된다. 이 카운터는 서버 전체의 누적값이라 다른 연결의 일도 섞이므로, 다른 작업이 없는 실습 서버에서 전후의 차이를 본다. 가정한 크기로 이 쿼리의 논리적 읽기를 어림하면 다음과 같다. 실측이 아니라 가정에서 나온 어림이고, 실제 값은 페이지 채움 정도와 트리 높이에 따라 달라지고, InnoDB가 자주 찾는 페이지에 대해 필요할 때 만드는 적응형 해시 인덱스(adaptive hash index)가 트리 하강의 일부를 대신하면 더 적게 나올 수 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>단계</th><th>횟수</th><th>논리적 페이지 접근(어림)</th></tr></thead><tbody>
+<tr><td><code>member</code> 풀 스캔</td><td>1회</td><td>약 300</td></tr>
+<tr><td><code>idx_orders_member</code> 탐색</td><td>10,000회</td><td>10,000 × 3 = 약 30,000</td></tr>
+<tr><td>클러스터형 인덱스 룩업</td><td>100,000회</td><td>100,000 × 3 = 약 300,000</td></tr>
+<tr><td>합계</td><td></td><td>약 330,000, 그중 약 90%가 클러스터형 인덱스 룩업</td></tr>
+</tbody></table></div>
+
+<p>EXPLAIN에서 보이지 않던 단계가 일의 대부분을 차지한다. 다만 페이지 접근 수만으로는 아직 "왜 운영 서버에서만 느린가"가 설명되지 않는다. 루트와 중간 노드는 늘 버퍼 풀에 있으므로 그 접근은 싸다. 비싼 것은 리프 페이지가 버퍼 풀에 없을 때의 디스크 읽기이고, 그것은 리프를 어떤 순서로 건드리느냐에 달려 있다.</p>
+
+<h4>4단계: 왜 무작위 접근인가</h4>
+
+<p>세컨더리 인덱스의 항목은 <code>(member_id, order_id)</code> 순으로 정렬되어 있다. 드라이빙 쪽 풀 스캔은 <code>member</code>의 클러스터형 인덱스를 기본 키 순서로 읽으므로 회원은 6, 16, 26, … 순으로 나오고, 세컨더리 인덱스 탐색도 이 순서를 따라 앞에서 뒤로 진행한다. 세컨더리 인덱스 쪽은 접근에 지역성이 있다. 문제는 그 항목들이 가리키는 주문 번호다. 가정대로 리프 한 페이지에 주문 100행이 들어간다면, 주문 번호를 100으로 나눈 몫이 그 주문이 든 리프의 대략적인 순번이다.</p>
+
+<pre class="diagram">idx_orders_member 리프 (member_id 순)        가리키는 orders 클러스터형 인덱스 리프 순번 (order_id ÷ 100)
+
+(6,  88395) (6, 188395) … (6, 988395)    →    883, 1883, 2883, 3883, 4883, 5883, 6883, 7883, 8883, 9883
+(16, 65185) (16,165185) … (16,965185)    →    651, 1651, 2651, 3651, 4651, 5651, 6651, 7651, 8651, 9651
+(26, 41975) (26,141975) … (26,941975)    →    419, 1419, 2419, 3419, 4419, 5419, 6419, 7419, 8419, 9419
+   …                                            …
+세컨더리 쪽: 앞에서 뒤로 한 방향                클러스터형 쪽: 10,000개 리프 전체를 이리저리 오간다</pre>
+
+<p>회원 한 명의 주문 10건이 리프 1,000개 간격으로 흩어져 있고, 다음 회원의 주문은 또 다른 10개 리프에 흩어져 있다. 부산 회원 10,000명을 처리하는 동안 100,000번의 룩업이 가정한 리프 10,000페이지 전체를 고르게, 그러나 순서 없이 건드린다. 리프 하나가 평균 10번 쓰이지만 그 10번은 시간적으로 멀리 떨어져 있다. 리프 전체가 160MB라면 기본 크기 128MB의 버퍼 풀, 그것도 다른 테이블과 나눠 쓰는 버퍼 풀에 다 머물 수 없으므로, 한 번 읽은 리프가 다음 쓰임 전에 밀려났다가 다시 디스크에서 읽히는 일이 반복된다. 최악이면 물리적 읽기가 룩업 수인 100,000번에 가까워지고, 그 읽기는 모두 서로 떨어진 위치를 읽는 무작위 읽기다.</p>
+
+<p>개발 서버에서 빨랐던 이유도 여기서 나온다. 개발 데이터가 작으면 테이블 전체가 버퍼 풀에 들어가므로 100,000번의 룩업이 모두 메모리에서 끝난다. 논리적 읽기는 똑같이 많지만 물리적 읽기가 거의 없다. 운영 데이터가 버퍼 풀을 넘는 순간 같은 계획이 디스크 무작위 읽기의 연속으로 바뀌고, 그동안 다른 쿼리들이 쓰던 페이지까지 버퍼 풀에서 밀어내므로 다른 쿼리도 함께 느려진다. 진단의 결론은 이렇다. <b>조인의 반복 횟수(10,000번)는 적절하지만, 반복 하나하나가 클러스터형 인덱스로 10번씩 무작위로 되돌아가는 것이 비용의 대부분이다.</b></p>
+
+<x-visual id="db-perf-11-random-lookup" title="세컨더리 인덱스는 순서대로 읽히지만 클러스터형 인덱스 룩업은 흩어지는 모습" kind="구조 비교 그림" ratio="16:9">
+<x-hint>위쪽의 세컨더리 인덱스 리프는 왼쪽에서 오른쪽으로 차례대로 읽히는데, 각 항목에서 아래쪽 클러스터형 인덱스 리프로 내려가는 화살표들이 넓게 교차하며 흩어지는 대비를 보여 준다.</x-hint>
+<x-prompt>화면을 위아래로 나눈다. 위쪽에 가로로 긴 띠 "idx_orders_member 리프 (member_id 순)"를 그리고 칸 세 개에 "회원 6의 항목 10개", "회원 16의 항목 10개", "회원 26의 항목 10개"를 적는다. 띠 위에 왼쪽에서 오른쪽으로 향하는 굵은 화살표와 라벨 "차례대로 읽음"을 둔다. 아래쪽에 작은 사각형 20개가 늘어선 긴 띠 "orders 클러스터형 인덱스 리프 (order_id 순)"를 그린다. 위쪽 각 칸에서 아래쪽 띠의 멀리 떨어진 여러 사각형으로 가는 가는 화살표를 칸마다 서로 다른 색으로 여러 개 그려 화살표들이 넓게 교차하게 한다. 아래쪽 띠 옆에 "무작위 룩업 100,000회"라는 라벨을 붙이고, 오른쪽 구석에 작은 상자 "버퍼 풀 128MB"와 그 안에 넘쳐 나가는 페이지 아이콘 몇 개를 그린다. 평면적이고 깔끔한 다이어그램 스타일.</x-prompt>
+<x-caption>세컨더리 인덱스는 회원 순서대로 읽히지만, 항목이 가리키는 주문은 클러스터형 인덱스 전체에 흩어져 있어 룩업이 무작위 접근이 된다.</x-caption>
+</x-visual>
+
+<h3>해결 방안 1: 드리븐 테이블을 커버링 인덱스로</h3>
+
+<p>진단이 가리키는 처방은 클러스터형 인덱스로 되돌아갈 이유를 없애는 것이다. 쿼리가 <code>orders</code>에서 쓰는 열은 조인 열 <code>member_id</code>와 집계할 <code>amount</code> 둘뿐이고, <code>COUNT(*)</code>는 행이 있다는 사실만 필요하다. 두 열을 모두 담은 인덱스가 있으면 08회에서 다룬 커버링 인덱스(covering index)가 되어 인덱스 항목만으로 쿼리를 처리할 수 있다.</p>
+
+<pre><code class="language-sql">ALTER TABLE orders ADD INDEX idx_orders_member_amount (member_id, amount);</code></pre>
+
+<p>열 순서에는 이유가 있다. 조인에서 이 인덱스로 찾아 들어가려면 등치로 비교되는 <code>member_id</code>가 맨 앞에 있어야 한다. <code>(amount, member_id)</code>로 만들면 두 열을 모두 담고 있어도 최좌측 접두사가 <code>amount</code>이므로 회원 번호로 찾아 들어갈 수 없다. 인덱스 전체를 훑는 데는 쓸 수 있겠지만 조인의 반복마다 그럴 수는 없다. <code>amount</code>는 찾는 데가 아니라 "들고 나오는" 데 쓰이는 열이므로 뒤에 둔다. 새 인덱스의 항목은 <code>(member_id, amount, order_id)</code>가 된다. 기본 키 <code>order_id</code>는 InnoDB가 자동으로 붙이므로 따로 적지 않아도 된다.</p>
+
+<p>MySQL 8.4.13과 8.0.46에서 새 인덱스를 만들고 EXPLAIN을 다시 보면, 옵티마이저는 새 인덱스를 고르고 <code>o</code> 행은 이렇게 바뀐다(<code>ref</code> 열의 데이터베이스 이름은 원고에 맞춰 적었다).</p>
+
+<div class="table-wrap"><table><thead><tr><th>table</th><th>type</th><th>key</th><th>key_len</th><th>ref</th><th>rows</th><th>Extra</th></tr></thead><tbody>
+<tr><td>o</td><td>ref</td><td>idx_orders_member_amount</td><td>8</td><td>join_lab.m.member_id</td><td>9</td><td><b>Using index</b></td></tr>
+</tbody></table></div>
+
+<p>바뀐 것은 <code>key</code>와 <code>Extra</code>뿐이다. 조인 순서, 접근 유형, <code>key_len</code>, 예상 행 수가 모두 같고, EXPLAIN ANALYZE의 행 수와 루프 수도 같다. <code>Handler_read_*</code>도 그대로다. 두 버전에서 재 보면 커버링 전과 똑같이 <code>Handler_read_key</code> 110,001, <code>Handler_read_next</code> 100,000, <code>Handler_read_rnd_next</code> 110,002였다. 여전히 인덱스 탐색 10,000번과 항목 100,000개를 읽기 때문이다. 줄어드는 것은 <code>Innodb_buffer_pool_read_requests</code>다. 어림으로 다시 세면 회원 풀 스캔 약 300과 인덱스 탐색 10,000 × 3 = 약 30,000을 더한 약 30,300으로, 원래의 약 330,000에서 11분의 1 남짓이 된다. 트리 형식에서는 버전에 따라 이 접근이 <code>Covering index lookup</code>으로 표시되기도 하는데, 8.0.46과 8.4.13은 둘 다 그렇게 표시한다. 이처럼 계획의 모양은 그대로이고 카운터 하나만 크게 바뀌는 개선이라서, 효과를 확인할 때도 EXPLAIN보다 버퍼 풀 카운터와 실제 시간을 함께 본다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행한 EXPLAIN ANALYZE (커버링 인덱스 추가 후)"><code class="language-text">-> Table scan on <temporary>  (actual time=242..243 rows=10000 loops=1)
+    -> Aggregate using temporary table  (actual time=242..242 rows=10000 loops=1)
+        -> Nested loop inner join  (cost=30461 rows=98958) (actual time=0.747..182 rows=100000 loops=1)
+            -> Filter: (m.region = '부산')  (cost=10340 rows=10008) (actual time=0.692..37.4 rows=10000 loops=1)
+                -> Table scan on m  (cost=10340 rows=100082) (actual time=0.682..27.9 rows=100000 loops=1)
+            -> Covering index lookup on o using idx_orders_member_amount (member_id=m.member_id)  (cost=1.02 rows=9.89) (actual time=0.0127..0.0137 rows=10 loops=10000)</code></pre>
+
+<p>행 수와 루프 수는 커버링 전과 똑같다. 이 실행에서는 조인 노드의 실제 시간이 2,197ms에서 182ms로 줄었지만, 실습 서버는 다른 작업과 버퍼 풀을 나눠 쓰고 있었으므로 이 비율을 일반적인 효과로 읽어서는 안 된다. 시간은 실행 환경과 버퍼 풀 상태에 따라 크게 달라진다.</p>
+
+<x-visual id="db-perf-11-covering-path" title="커버링 인덱스 전후로 드리븐 쪽 탐색 경로가 짧아지는 모습" kind="구조 비교 그림" ratio="16:9">
+<x-hint>왼쪽은 세컨더리 인덱스를 내려간 뒤 클러스터형 인덱스를 다시 내려가는 두 단계 경로, 오른쪽은 커버링 인덱스 하나만 내려가고 끝나는 한 단계 경로를 나란히 비교한다.</x-hint>
+<x-prompt>화면을 좌우로 나눈다. 왼쪽 제목 "전: idx_orders_member", 오른쪽 제목 "후: idx_orders_member_amount". 왼쪽에는 작은 삼각형 트리 "세컨더리 인덱스"와 그 옆의 큰 삼각형 트리 "클러스터형 인덱스"를 그린다. 위에서 내려온 화살표가 세컨더리 트리의 리프 항목 "(6, 88395)"에 닿고, 거기서 다시 클러스터형 트리의 루트로 올라가 리프의 "주문 88395 전체 행"까지 내려가는 꺾인 경로를 빨간색으로 그리고 "PK 룩업"이라고 라벨을 붙인다. 오른쪽에는 삼각형 트리 하나 "커버링 인덱스"만 그리고, 화살표가 리프 항목 "(6, 29000, 88395)"에 닿은 뒤 바로 "amount 획득"이라는 초록색 체크 표시로 끝나게 한다. 아래쪽에 왼쪽은 "탐색 1만 회 + PK 룩업 10만 회", 오른쪽은 "탐색 1만 회"라는 비교 라벨을 둔다. 깔끔한 평면 스타일.</x-prompt>
+<x-caption>커버링 인덱스는 조인의 반복 횟수를 바꾸지 않는다. 반복 하나하나에서 클러스터형 인덱스로 되돌아가는 두 번째 탐색을 없앤다.</x-caption>
+</x-visual>
+
+<p>물리적 읽기는 더 크게 줄어든다. 이유는 두 가지다. 첫째, 인덱스가 작다. 항목이 회원 번호 8바이트, 금액 4바이트, 기본 키 8바이트에 레코드 헤더를 더한 크기이므로, 리프 한 페이지에 400항목 정도가 들어간다고 가정하면 100만 항목이 리프 약 2,500페이지, 약 40MB다. 실습 서버(8.4.13, 8.0.46)에서 잰 실제 값은 이보다 작은 리프 1,570페이지(전체 1,828페이지), 약 25MiB였다. 메모가 든 클러스터형 인덱스 160MB와 달리 기본 크기의 버퍼 풀에도 여유 있게 머문다. 둘째, 접근 순서가 한 방향이다. 드라이빙 행은 회원 번호 순으로 나오고 이 인덱스도 회원 번호 순으로 정렬되어 있다. 부산 회원 6, 16, 26, …의 항목 묶음은 그 사이에 낀 회원 9명의 항목 90개를 사이에 두고 100항목 간격으로 놓여 있으므로, 연달아 나오는 부산 회원 네댓 명이 같은 리프에서 처리되고 다음 리프로 넘어간다. 리프 하나를 한 번 읽어 와서 다 쓰고 다음으로 가는 접근이다. 원래 계획에서 무작위였던 부분이 통째로 사라지고, 남은 부분은 순서가 맞는 접근이 되었다.</p>
+
+<h4>기존 인덱스 정리하기</h4>
+
+<p>새 인덱스의 최좌측 접두사가 <code>member_id</code>이므로 <code>idx_orders_member</code>로 할 수 있는 일은 새 인덱스로 모두 할 수 있다. 두 인덱스를 다 두면 쓰기마다 두 인덱스를 고쳐야 하고, 옵티마이저가 둘 중 무엇을 고를지 헷갈릴 여지도 남는다. 다만 바로 지우기보다 MySQL 8.0의 보이지 않는 인덱스(invisible index)로 먼저 감춰 두는 것이 안전하다. 보이지 않는 인덱스는 옵티마이저가 쓰지 않지만 데이터 변경에 맞춰 계속 유지되므로, 문제가 생기면 곧바로 되돌릴 수 있다. 인덱스를 추가하고 지우는 작업 자체의 비용과 검증 절차는 04회에서 다뤘다.</p>
+
+<pre><code class="language-sql">ALTER TABLE orders ALTER INDEX idx_orders_member INVISIBLE;
+-- 운영 쿼리들의 실행 계획과 느린 쿼리 로그를 지켜본 뒤
+ALTER TABLE orders DROP INDEX idx_orders_member;
+-- 문제가 생기면: ALTER TABLE orders ALTER INDEX idx_orders_member VISIBLE;</code></pre>
+
+<h4>커버링이 깨지는 순간</h4>
+
+<p>커버링 인덱스는 쿼리가 쓰는 열이 인덱스 안에 모두 있다는 <b>조건이 성립하는 동안만</b> 효과가 있다. 그 조건은 쿼리가 조금만 바뀌어도 조용히 깨진다. 통계 화면에 "취소 주문은 빼 달라"는 요구가 들어와 <code>AND o.status <> 'CANCELED'</code>가 붙었다고 하자. <code>status</code>는 <code>idx_orders_member_amount</code>에 없으므로 InnoDB는 조건을 검사하려고 다시 항목마다 클러스터형 인덱스로 되돌아가고, <code>Extra</code>에서 <code>Using index</code>가 사라진다. MySQL 8.4.13과 8.0.46에서 확인하면 <code>o</code> 행은 <code>key</code>와 <code>key_len</code>이 그대로인 채 <code>Extra</code>가 <code>Using where</code>로 바뀐다. 에러도 경고도 없이 원래의 무작위 룩업 100,000번이 돌아온다. 대응은 인덱스를 <code>(member_id, status, amount)</code>로 바꾸는 것이다. 이러면 조인 열로 찾아 들어간 뒤 각 항목의 <code>status</code>를 인덱스 안에서 검사하고 <code>amount</code>를 꺼낼 수 있어 다시 커버링이 된다. 조건이 <code>o.status = 'DELIVERED'</code>처럼 등치라면 두 열로 바로 찾아 들어가므로 <code>ref</code>가 <code>join_lab.m.member_id,const</code>, <code>key_len</code>이 8 + 82 = 90이 된다.</p>
+
+<p>"최근 주문일"을 보여 달라며 <code>MAX(o.ordered_at)</code>가 추가되어도 같은 일이 생긴다. 요구가 늘 때마다 열을 덧붙이면 인덱스는 점점 테이블을 닮아 가고, 크기가 커지는 만큼 버퍼 풀에서 차지하는 자리와 쓰기 비용도 늘어난다. <code>orders</code>에 행이 들어오거나 해당 열이 바뀔 때마다 이 인덱스도 고쳐야 하기 때문이다. 통계용으로 들고 나와야 하는 열이 계속 늘어난다면, 조회 시점에 매번 집계하는 대신 집계 결과를 따로 저장해 두는 설계를 검토할 때다. 그 사전 집계 테이블은 12회에서 다룬다. 반대로 기본 키는 공짜다. <code>COUNT(o.order_id)</code>를 쓰거나 <code>o.order_id</code>를 함께 조회해도 기본 키가 항목에 이미 들어 있으므로 커버링은 유지된다.</p>
+
+<h3>해결 방안 2: 반복의 모양을 바꾸기</h3>
+
+<p>방안 1은 조인의 모양을 그대로 두고 드리븐 쪽 한 번의 비용 C<sub>inner</sub>를 줄였다. 방안 2는 식의 다른 항을 건드린다. 드라이빙 쪽 C<sub>outer</sub>를 줄이는 방법, 조인과 집계의 순서를 바꿔 N을 줄이는 방법, 그리고 반복 자체를 다른 알고리즘으로 바꾸는 방법이다. 어느 것이 좋은지는 쿼리와 데이터에 따라 달라지므로 각각이 이기는 조건을 함께 따진다.</p>
+
+<h4>드라이빙 쪽 정리: 곱해지지 않는 항의 이득은 작다</h4>
+
+<p>방안 1 이후 남은 일은 회원 풀 스캔(리프 약 300페이지, 100,000행 검사)과 커버링 인덱스 탐색 10,000번이다. 드라이빙 쪽에도 인덱스를 두면 회원 100,000행을 다 검사하지 않아도 된다. 그런데 <code>(region)</code> 하나짜리 인덱스는 생각만큼 좋지 않다. 이름을 얻으려고 부산 회원 10,000명마다 <code>member</code>의 클러스터형 인덱스로 되돌아가야 하고, 높이 2의 트리를 10,000번 내려가면 약 20,000번의 페이지 접근이다. 리프 300페이지를 한 번 순서대로 읽는 풀 스캔보다 오히려 많다. 04회에서는 결과의 10%를 남기는 조건이라면 옵티마이저가 이런 인덱스를 두고도 풀 스캔을 고를 수 있다고 했다. 그러나 MySQL 8.4.13에서 실습 데이터에 <code>(region)</code> 인덱스를 만들어 EXPLAIN을 보면 옵티마이저는 이 인덱스를 고른다. <code>m</code> 행이 <code>type</code> <code>ref</code>, <code>key_len</code> 82, <code>ref</code> <code>const</code>이고, 예상 행 수는 실제 10,000보다 많은 19,228이다(실행 환경과 통계에 따라 달라진다). 위의 페이지 접근 어림과 옵티마이저의 비용 모델이 늘 같은 답을 내지는 않으므로, 이런 선택이 실제로 나은지는 EXPLAIN ANALYZE의 실제 시간과 버퍼 풀 카운터로 따로 확인해야 한다.</p>
+
+<pre><code class="language-sql">ALTER TABLE member ADD INDEX idx_member_region_name (region, name);</code></pre>
+
+<p>드라이빙 쪽도 커버링으로 만들면 이야기가 달라진다. <code>(region, name)</code>의 항목에는 기본 키 <code>member_id</code>가 붙으므로, 부산 회원의 항목 10,000개를 연속된 구간으로 읽는 것만으로 번호와 이름이 모두 나온다. 이때 <code>m</code> 행은 <code>type</code>이 <code>ref</code>, <code>ref</code>가 <code>const</code>, <code>key_len</code>이 <code>VARCHAR(20)</code> utf8mb4의 82, <code>Extra</code>가 <code>Using index</code>가 된다. MySQL 8.4.13에서 방안 1의 인덱스와 함께 만들어 확인하면 <code>m</code> 행의 <code>Extra</code>는 집계용 표시까지 붙은 <code>Using index; Using temporary</code>이고, <code>o</code> 행은 그대로 <code>idx_orders_member_amount</code>의 <code>ref</code>에 <code>Using index</code>다. 다만 이득의 크기를 정직하게 보자. 줄어드는 것은 리프 300페이지가 수십 페이지로, 검사하는 행 100,000개가 10,000개로 바뀌는 정도다. 반복 횟수 N은 그대로 10,000이고, 비용의 대부분인 드리븐 쪽 탐색 10,000번도 그대로다. <b>곱해지는 항을 먼저 고치고, 곱해지지 않는 항은 그다음에 고친다</b>는 순서가 여기서 나온다.</p>
+
+<p>드라이빙 쪽 인덱스에는 눈여겨볼 부수 효과가 하나 있다. 드라이빙 행이 나오는 순서가 드리븐 쪽 접근의 지역성을 정한다는 점이다. 풀 스캔은 회원을 번호 순으로 내놓았고, 그래서 회원 번호 순으로 정렬된 드리븐 인덱스를 한 방향으로 훑을 수 있었다. <code>(region, name)</code> 인덱스는 같은 지역 안에서 이름, 그다음 기본 키 순으로 정렬되어 있다. 이 실습 데이터는 이름이 회원 번호를 0으로 채운 문자열이라 이름 순서와 번호 순서가 우연히 같지만, 실제 이름이라면 드라이빙 행이 회원 번호와 무관한 순서로 나오고 드리븐 인덱스 탐색은 그만큼 이리저리 뛰게 된다. 인덱스가 작아서 버퍼 풀에 다 머문다면 문제가 되지 않지만, 드리븐 쪽 인덱스가 버퍼 풀보다 크다면 드라이빙 쪽 인덱스를 바꾼 것이 드리븐 쪽 물리 읽기를 늘리는 결과가 될 수 있다.</p>
+
+<h4>집계 후 조인: 조인이 행을 불리기 전에 줄이기</h4>
+
+<p>이번에는 같은 화면에서 "전체 지역"을 고른 경우를 생각해 보자. 지역 조건이 없으므로 회원 100,000명이 모두 드라이빙 행이 되고, 커버링 인덱스 탐색이 100,000번 반복되어 조인 결과 1,000,000행이 만들어진 뒤에야 집계가 100,000행으로 줄인다. 조인이 행을 10배로 불렸다가 집계가 다시 10분의 1로 줄이는 모양이다. 이럴 때는 집계를 조인보다 먼저 할 수 있다.</p>
+
+<pre><code class="language-sql">SELECT m.member_id, m.name, s.order_count, s.total_amount
+FROM (
+  SELECT member_id, COUNT(*) AS order_count, SUM(amount) AS total_amount
+  FROM orders
+  GROUP BY member_id
+) AS s
+JOIN member m ON m.member_id = s.member_id;</code></pre>
+
+<p>FROM 절의 서브쿼리, 곧 파생 테이블(derived table)에 <code>GROUP BY</code>와 집계 함수가 있으면 바깥 쿼리에 병합(merge)될 수 없다. 매뉴얼은 병합을 막는 구성 요소로 집계 함수, <code>DISTINCT</code>, <code>GROUP BY</code>, <code>HAVING</code>, <code>LIMIT</code>, <code>UNION</code> 등을 든다. 그래서 이 파생 테이블은 먼저 구체화(materialization)되어 회원별 한 행씩 100,000행의 내부 임시 테이블이 된다. 그 안쪽의 집계는 <code>idx_orders_member_amount</code>를 처음부터 끝까지 한 번 순서대로 읽으면 된다. 매뉴얼은 <code>GROUP BY</code>의 모든 열이 같은 인덱스의 열이고 그 인덱스가 키를 순서대로 저장하는 것을 인덱스로 그룹을 처리하는 가장 중요한 전제 조건으로 드는데, 이 경우가 그렇다. 실제로 그룹핑용 임시 테이블이 생겼는지는 EXPLAIN의 <code>Using temporary</code>로 확인하고, 그룹핑 최적화의 자세한 내용은 12회에서 다룬다. 이어지는 조인은 100,000행짜리 구체화 결과와 <code>member</code>의 조인이다. 매뉴얼에 따르면 옵티마이저는 구체화된 파생 테이블에 인덱스를 만들어 <code>ref</code> 접근을 할 수 있고, <code>member</code> 쪽은 기본 키로 <code>eq_ref</code> 접근을 할 수 있다. 어느 순서든 조인이 다루는 행은 주문 1,000,000행이 아니라 그룹 100,000행이다. MySQL 8.4.13에서 방안 1의 인덱스와 앞 절의 <code>(region, name)</code> 인덱스가 있는 상태로 EXPLAIN을 보면, <code>DERIVED</code> 행은 <code>orders</code>를 <code>idx_orders_member_amount</code>로 처음부터 끝까지 읽는 <code>type</code> <code>index</code>에 <code>Extra</code>가 <code>Using index</code>뿐이고 <code>Using temporary</code>는 없다. 바깥 조인은 <code>member</code>를 커버링 인덱스 <code>idx_member_region_name</code> 전체로 읽고(<code>type</code> <code>index</code>, <code>Using index</code>), 구체화된 <code><derived2></code>를 자동 생성 인덱스 <code><auto_key0></code>의 <code>ref</code>로 찾는 순서를 골랐다.</p>
+
+<p>그런데 같은 모양을 부산 쿼리에 적용하면 오히려 나빠진다. 파생 테이블 안에는 지역 조건을 넣을 수 없다. <code>region</code>은 <code>member</code>에 있는 열이고 <code>orders</code>에는 없기 때문이다. 그래서 파생 테이블은 전체 회원 100,000명의 집계를 다 만든 뒤 조인에서 90%를 버린다. 방안 1의 계획이 커버링 인덱스 항목 100,000개만 읽는 데 비해, 집계 후 조인은 1,000,000개를 모두 읽는다. 정리하면 <b>집계 후 조인은 결과에 대부분의 그룹이 남을 때, 그리고 조인이 행을 크게 불린 다음 집계가 다시 줄이는 모양일 때 유리하다.</b> 조인 상대 쪽의 조건이 그룹을 크게 줄인다면 조인으로 먼저 좁히는 쪽이 낫다.</p>
+
+<h4>해시 조인으로 바꾸기: 무작위 룩업을 순차 읽기 한 번으로</h4>
+
+<p>커버링 인덱스를 만들 수 없는 경우도 있다. 드리븐 쪽에서 들고 나와야 하는 열이 많아 인덱스가 테이블만큼 커지거나, 쓰기 부담 때문에 인덱스를 더 늘릴 수 없는 경우다. 이때 원래 계획의 문제는 "같은 테이블의 리프 10,000페이지를 100,000번 무작위로 오간다"는 것이었다. 해시 조인은 이 테이블을 처음부터 끝까지 <b>한 번 순차로</b> 읽는다. 부산 회원 10,000명으로 해시 테이블을 만들고 주문 1,000,000건을 차례로 프로브하면, 페이지 접근은 회원 쪽 약 300과 주문 쪽 약 10,000이다. 논리적 읽기만 보면 원래 계획의 약 330,000보다 훨씬 적고 접근도 순차다.</p>
+
+<p>대가도 분명하다. 해시 조인은 결과에 쓰이지 않을 90%의 주문까지 모두 읽고 1,000,000행을 하나씩 프로브하므로, 비용이 결과가 아니라 <code>orders</code> 테이블의 크기에 비례한다. 주문이 1,000만 건으로 늘면 부산 회원 수가 그대로여도 비용은 10배가 된다. 빌드 입력이 <code>join_buffer_size</code>를 넘으면 디스크로 넘치고, 결과의 첫 행은 빌드가 끝나야 나온다. 그리고 공식 블로그가 말하듯 조인 조건에 쓸 인덱스가 있으면 옵티마이저는 대개 인덱스 NLJ를 택하므로, 해시 조인을 원하면 앞서 본 <code>IGNORE INDEX</code> 같은 힌트로 인덱스 사용을 막아야 한다. 힌트로 고정한 계획은 데이터가 변해도 따라가지 않는다는 점까지 감수해야 하는 선택이다. 커버링 인덱스를 만들 수 있다면 방안 1이 거의 언제나 낫다.</p>
+
+<h4>BKA: 룩업은 그대로 두고 순서만 정렬하기</h4>
+
+<p>NLJ를 유지하면서 무작위 룩업의 순서만 바꾸는 방법도 있다. <b>배치 키 접근(Batched Key Access, BKA)</b>이다. 매뉴얼의 설명으로 BKA는 BNL처럼 조인 버퍼에 첫 번째 피연산자가 만든 행의 필요한 열을 모은 뒤, 버퍼의 모든 행에 대해 조인할 테이블을 찾을 키를 만들어 09회에서 본 다중 범위 읽기(Multi-Range Read, MRR) 인터페이스로 엔진에 한꺼번에 넘긴다. InnoDB 같은 디스크 기반 엔진에서는 MRR이 행을 기본 키 순서로 가져오므로, 무작위 순서가 아니라 디스크 순서로 읽게 된다. 부산 쿼리라면 한 번에 모은 회원들의 주문 룩업이 주문 번호 순으로 정렬되어 클러스터형 인덱스를 한 방향으로 훑는다. 룩업의 수는 줄지 않지만 같은 리프를 멀리 떨어진 시점에 다시 읽는 일이 줄어든다.</p>
+
+<pre><code class="language-sql">-- BKA는 기본적으로 꺼져 있다. MRR이 필요하고, MRR 비용 추정이 비관적이라 mrr_cost_based도 꺼야 한다
+SET optimizer_switch = 'mrr=on,mrr_cost_based=off,batched_key_access=on';
+-- 문장 하나에만 적용하려면 SET_VAR 힌트로 같은 값을 준다
+SELECT /*+ SET_VAR(optimizer_switch = 'mrr=on,mrr_cost_based=off,batched_key_access=on') */ ...</code></pre>
+
+<p>매뉴얼에 따르면 기본값은 <code>batched_key_access=off</code>이고, BKA를 쓰려면 <code>mrr</code>이 켜져 있어야 하며 MRR의 비용 추정이 지나치게 비관적이라 <code>mrr_cost_based</code>도 꺼야 한다. 사용 여부는 EXPLAIN에서 <code>type</code>이 <code>ref</code>나 <code>eq_ref</code>이면서 <code>Extra</code>에 <code>Using join buffer (Batched Key Access)</code>가 붙는지로 확인한다. MySQL 8.4.13에서 커버링 인덱스를 만들기 전의 진단 쿼리에 위 <code>SET_VAR</code> 힌트를 주면, 순서와 접근은 원래대로(<code>m</code>이 <code>ALL</code>, <code>o</code>가 <code>idx_orders_member</code>의 <code>ref</code>)이고 <code>o</code> 행의 <code>Extra</code>만 <code>Using join buffer (Batched Key Access)</code>로 바뀐다. 기본으로 꺼져 있는 기능을 서버 전체에서 켜는 일은 다른 쿼리의 계획까지 바꾸므로, 쓰더라도 <code>SET_VAR</code> 힌트로 문장 하나에만 적용하는 편이 안전하다.</p>
+
+<h4>방안 비교</h4>
+
+<p>부산 쿼리를 기준으로 지금까지의 방안을 한 표에 모으면 다음과 같다. 모든 숫자는 앞에서 정한 크기 가정에서 나온 어림이고, 실측이 아니다. 최종 판단은 실습 서버에서 <code>Innodb_buffer_pool_read_requests</code>, <code>Innodb_buffer_pool_reads</code>, EXPLAIN ANALYZE의 실제 시간으로 한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>방식</th><th>드리븐 쪽에서 하는 일</th><th>논리적 페이지 접근</th><th>접근 모양</th><th>비용이 비례하는 것</th><th>주의할 점</th></tr></thead><tbody>
+<tr><td>원래 계획</td><td>인덱스 탐색 1만 + 클러스터형 룩업 10만</td><td>약 33만</td><td>클러스터형 룩업이 무작위</td><td>부산 회원 수 × 주문 수</td><td>테이블이 버퍼 풀보다 크면 같은 리프를 다시 읽는다</td></tr>
+<tr><td>방안 1: 드리븐 커버링</td><td>인덱스 탐색 1만</td><td>약 3만</td><td>한 방향, 작은 인덱스</td><td>부산 회원 수 × 주문 수</td><td>쿼리에 열이 늘면 조용히 깨진다</td></tr>
+<tr><td>방안 1 + 드라이빙 커버링</td><td>같음</td><td>약 3만 (드라이빙 300 → 수십)</td><td>같음</td><td>같음</td><td>이득이 작고, 드라이빙 순서가 바뀔 수 있다</td></tr>
+<tr><td>집계 후 조인</td><td>커버링 인덱스 전체를 한 번</td><td>약 2,500 + 조인</td><td>순차</td><td>전체 주문 수</td><td>부산처럼 그룹 대부분을 버리면 손해</td></tr>
+<tr><td>해시 조인</td><td><code>orders</code> 전체를 한 번</td><td>약 1만</td><td>순차</td><td>전체 주문 수</td><td>빌드 메모리, 첫 행 지연, 힌트 필요</td></tr>
+<tr><td>BKA</td><td>탐색 1만 + 클러스터형 룩업 10만(기본 키 순)</td><td>룩업 수는 원래와 같다</td><td>기본 키 순으로 정렬</td><td>부산 회원 수 × 주문 수</td><td>기본 꺼짐, 조인 버퍼 사용</td></tr>
+</tbody></table></div>
+
+<p>표에서 논리적 페이지 접근이 가장 적은 것은 해시 조인과 집계 후 조인이지만, 둘은 비용이 전체 주문 수에 비례한다. 방안 1은 비용이 결과 규모, 곧 부산 회원 수에 비례한다. 데이터가 계속 쌓이는 주문 테이블에서 이 차이는 시간이 갈수록 벌어진다. 04회에서 "결과에 비례하는 계획과 테이블에 비례하는 계획"을 구분했던 기준이 조인에서도 그대로 판단의 축이 된다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<p><b>"EXPLAIN의 rows가 작으니 빠를 것이다."</b> 드리븐 테이블의 <code>rows</code>는 한 번 찾아 들어갈 때의 예상 행 수다. 위쪽 테이블들의 <code>rows × filtered</code>를 곱한 반복 횟수를 곱해야 전체 규모가 된다. 이 회차의 진단 쿼리도 <code>rows</code>는 10이었지만 실제로는 100,000행과 100,000번의 룩업이었다.</p>
+
+<p><b>"조인 열 양쪽에 인덱스를 만들어 두면 된다."</b> 반복을 줄이는 것은 드리븐 쪽 조인 열의 인덱스다. 드라이빙 쪽 조인 열의 인덱스는 그 테이블이 드리븐이 되는 다른 순서에서만 쓸모가 있다. 인덱스는 공짜가 아니므로 어느 순서로 실행될지 생각하고 만든다.</p>
+
+<p><b>"FROM 절에 먼저 쓴 테이블이 드라이빙이다."</b> 내부 조인에서는 아니다. 옵티마이저가 비용으로 정한다. 외부 조인에서는 왼쪽 테이블이 먼저 읽혀야 한다는 제약이 있지만, <code>WHERE</code>의 널 거부 조건 때문에 내부 조인으로 바뀌면 그 제약도 사라진다. 반대로 결과가 내부 조인과 같은데 습관적으로 <code>LEFT JOIN</code>을 쓰고 오른쪽 테이블의 조건을 <code>ON</code> 절에만 두면, 외부 조인이 유지되어 옵티마이저가 고를 수 있는 순서가 줄어든다.</p>
+
+<p><b>"해시 조인이 생겼으니 조인 인덱스는 덜 중요하다."</b> 해시 조인은 인덱스가 없을 때 최악을 막아 주는 장치다. 비용이 테이블 크기에 비례하고 첫 행이 늦으므로, 화면 하나에 필요한 결과를 빨리 돌려줘야 하는 쿼리에서는 드리븐 쪽 인덱스를 쓰는 NLJ를 대신하지 못한다. 반대로 대량 데이터를 한꺼번에 조인하는 배치나 분석 쿼리에서는 해시 조인이 더 나을 수 있다.</p>
+
+<p><b>"Handler 카운터로 엔진이 한 일을 다 셀 수 있다."</b> <code>Handler_read_*</code>는 SQL 계층이 엔진에 보낸 요청의 수다. 세컨더리 인덱스 항목에서 클러스터형 인덱스로 되돌아가는 룩업은 엔진 내부의 일이라 여기에 따로 잡히지 않는다. 커버링 인덱스 전후로 <code>Handler_read_*</code>는 거의 같고 <code>Innodb_buffer_pool_read_requests</code>만 크게 달라지는 것이 그 증거다.</p>
+
+<p><b>"개발 서버에서 빨랐으니 계획은 괜찮다."</b> 무작위 룩업의 비용은 대상이 버퍼 풀에 들어가느냐에 따라 극적으로 달라진다. 데이터가 작은 개발 환경에서는 논리적 읽기가 아무리 많아도 디스크를 거의 건드리지 않는다. 계획을 평가할 때는 시간보다 논리적 읽기 수와 접근 모양을 먼저 보고, 운영 규모의 데이터에서 그 읽기가 몇 번의 디스크 접근이 될지 어림한다.</p>
+
+<h3>다른 주제와의 연결: 애플리케이션의 N+1도 중첩 루프다</h3>
+
+<p>JPA를 쓸 때 자주 만나는 N+1 문제는 이 회차의 NLJ를 애플리케이션이 직접 실행하는 모양이다. 회원 목록을 조회하는 쿼리 한 번이 바깥 루프이고, 회원마다 주문을 조회하는 쿼리가 안쪽 루프다. DB 안의 NLJ에서는 안쪽 루프 한 번이 B+Tree 탐색 한 번이지만, 애플리케이션의 N+1에서는 안쪽 루프 한 번이 네트워크 왕복, SQL 파싱과 실행, 결과 전송을 모두 포함한다. 반복 횟수가 같아도 한 번의 비용이 비교할 수 없이 크다. 페치 조인은 이 루프를 DB 안으로 옮겨 한 문장의 NLJ나 해시 조인으로 바꾸는 일이고, 여러 회원의 식별자를 모아 <code>IN</code> 절 하나로 조회하는 배치 페치는 키를 모아 한꺼번에 넘긴다는 점에서 BKA와 같은 발상이다.</p>
+
+<p>커버링 인덱스도 JPA와 직접 이어진다. 기본 설정에서 엔티티를 조회하면 Hibernate는 매핑된 열을 모두 SELECT 절에 넣는다. 이 회차의 통계 쿼리를 <code>Order</code> 엔티티 목록을 읽어 자바 코드에서 합산하는 식으로 구현하면, <code>memo</code>를 포함한 모든 열이 필요해지므로 어떤 커버링 인덱스도 성립하지 않는다. 통계처럼 몇 개의 열만 필요한 조회는 DTO 프로젝션이나 집계 쿼리로 필요한 열만 요청해야 DB가 인덱스만으로 답할 기회가 생긴다. 프로젝션이 단지 코드의 편의만을 위한 기능이 아니라는 뜻이다.</p>
+
+<p>다음 회차는 조인 다음 단계의 비용을 다룬다. 이 회차의 진단 쿼리에서 생략했던 <code>GROUP BY</code> 집계가 임시 테이블을 쓰는지, 인덱스 순서를 이용해 흘려보내며 집계할 수 있는지, 그리고 매번 집계하는 대신 집계 결과를 미리 저장하는 사전 집계 테이블이 언제 필요한지를 정렬·페이징 최적화와 함께 살펴본다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>중첩 루프 조인(NLJ)</dt><dd>드라이빙 테이블에서 행을 하나씩 꺼내 드리븐 테이블에서 짝을 찾는다. 비용은 드라이빙 쪽 조건을 통과한 행 수 × 드리븐 쪽 한 번의 접근 비용이며, 결과가 즉시 흘러가 <code>LIMIT</code>에서 일찍 멈출 수 있다.</dd>
+<dt>드리븐 쪽 조인 열 인덱스</dt><dd>안쪽 루프 한 번을 테이블 전체 스캔에서 트리 높이만큼의 탐색으로 줄인다. 반복을 줄이는 것은 드리븐 쪽 인덱스이며, 타입·문자 집합이 다르거나 드리븐 열을 변형하면 쓸 수 없다.</dd>
+<dt>반복 횟수 읽기</dt><dd>EXPLAIN에서는 위쪽 행들의 <code>rows × filtered / 100</code>을 곱하고, EXPLAIN ANALYZE에서는 <code>loops</code>를 읽는다. 드리븐 행의 <code>rows</code>는 한 번 탐색할 때의 값이다.</dd>
+<dt>해시 조인</dt><dd>8.0.18에 도입되고 8.0.20부터 BNL을 완전히 대체했다. 작은 입력으로 해시 테이블을 만들고(빌드) 다른 입력을 한 번 읽으며 찾는다(프로브). 메모리는 <code>join_buffer_size</code>로 제한되고, 넘치면 청크 파일로 나눠 처리한다.</dd>
+<dt>드라이빙 테이블 결정</dt><dd>옵티마이저가 추정 행 수 위에서 순서별 비용을 비교해 정한다. 기준은 테이블 크기가 아니라 조건을 거친 뒤의 행 수와 상대 테이블에 찾아 들어가는 비용이며, 외부 조인의 의존 관계가 순서를 제약한다.</dd>
+<dt>숨은 클러스터형 룩업</dt><dd>세컨더리 인덱스로 찾은 항목에 필요한 열이 없으면 항목마다 기본 키로 클러스터형 인덱스를 다시 탐색한다. 계획에서는 <code>Extra</code>에 <code>Using index</code>가 없다는 것으로만 드러나고, <code>Innodb_buffer_pool_read_requests</code>로 확인한다.</dd>
+<dt>드리븐 커버링 인덱스</dt><dd>조인 열을 앞에, 들고 나올 열을 뒤에 둔 인덱스로 클러스터형 룩업을 없앤다. 반복 횟수는 그대로이고 한 번의 비용과 무작위 접근이 사라지며, 쿼리에 열이 추가되면 조용히 깨진다.</dd>
+<dt>반복의 모양 바꾸기</dt><dd>집계 후 조인은 그룹 대부분이 남을 때, 해시 조인은 커버링이 불가능하고 드라이빙 행이 많을 때, BKA는 룩업을 기본 키 순으로 정렬하고 싶을 때 쓴다. 앞의 둘은 비용이 테이블 크기에 비례한다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 조인이 느리다는 신고를 받으면 가장 먼저 할 일은 "반복이 몇 번이고, 반복 한 번이 무엇을 하는가"를 실행 계획에서 분리해 읽는 것이다. 반복 횟수가 비정상적으로 많다면 드라이빙 쪽 조건이나 조인 순서의 문제이고, 통계 추정이 틀린 것은 아닌지 EXPLAIN ANALYZE의 예상과 실제를 비교한다. 반복 횟수는 적절한데 느리다면 반복 한 번의 비용이 문제이고, 그중에서도 <code>ref</code> 접근인데 <code>Using index</code>가 없는 드리븐 테이블이 가장 흔한 범인이다. 이 경우 EXPLAIN은 정상처럼 보이므로 버퍼 풀 카운터와 실제 시간을 같이 보지 않으면 놓치기 쉽다.</p>
+
+<p>판단이 달라지는 조건은 주로 데이터의 크기와 버퍼 풀의 관계다. 드리븐 테이블이 버퍼 풀에 다 들어간다면 클러스터형 룩업은 메모리 접근이라 비교적 싸고, 커버링 인덱스의 이득은 CPU와 래치 비용 정도로 줄어든다. 테이블이 버퍼 풀보다 크고 룩업이 흩어져 있다면 같은 계획이 디스크 무작위 읽기의 연속이 되고, 그 쿼리 하나가 버퍼 풀의 다른 페이지를 밀어내 서버 전체를 느리게 만든다. 그래서 같은 쿼리라도 데이터가 쌓이는 어느 시점부터 갑자기 문제가 되는 경우가 많고, 그 시점을 미리 어림하려면 테이블과 인덱스의 리프 페이지 수를 알아 두어야 한다.</p>
+
+<p>처방을 고를 때는 비용이 무엇에 비례하는지를 기준으로 삼는다. 커버링 인덱스와 인덱스 NLJ는 결과 규모에 비례하므로 데이터가 늘어도 버티지만, 인덱스를 늘리는 만큼 쓰기 비용과 저장 공간을 내야 하고 쿼리 변경에 취약하다. 해시 조인과 집계 후 조인은 인덱스 없이도 순차 읽기로 끝나지만 비용이 테이블 크기에 비례한다. 화면용 OLTP 쿼리라면 전자를, 하루 한 번 도는 정산 배치라면 후자를 먼저 검토하는 식으로, 쿼리가 얼마나 자주 돌고 결과가 얼마나 빨리 필요한지가 최종 결정을 좌우한다.</p>
+</x-review>
+
+<x-practice>
+<li>세 테이블 조인의 EXPLAIN에서 첫 행은 <code>rows</code> 2,000, <code>filtered</code> 50.00, 둘째 행은 <code>ref</code> 접근으로 <code>rows</code> 5, <code>filtered</code> 20.00, 셋째 행은 <code>eq_ref</code> 접근으로 <code>rows</code> 1이다. 둘째 테이블과 셋째 테이블의 접근은 각각 몇 번 반복될 것으로 예상된 것인가? EXPLAIN ANALYZE에서 셋째 테이블의 <code>loops</code>가 40,000으로 나왔다면 어느 단계의 추정이 얼마나 틀렸을 가능성이 있는가?</li>
+<li>방안 1의 인덱스 <code>(member_id, amount)</code>를 만든 뒤 통계 쿼리에 <code>AND o.status <> 'CANCELED'</code>가 추가되었다. EXPLAIN의 <code>o</code> 행에서 무엇이 바뀌고, InnoDB 안에서는 무엇이 다시 생기는가? 커버링을 되살리는 인덱스를 설계하고 열 순서의 이유를 설명하라. 조건이 <code>o.status = 'DELIVERED'</code>라면 <code>key_len</code>은 얼마인가?</li>
+<li>동료가 진단 쿼리를 고치려고 <code>orders</code>에 <code>(amount, member_id)</code> 인덱스를 만들었다. 두 열이 모두 들어 있는데도 조인의 반복이 빨라지지 않는 이유를 B+Tree의 정렬 순서로 설명하라.</li>
+<li>2024-03-01 하루 주문과 회원 이름을 구하는 쿼리에서 <code>idx_orders_ordered</code>가 없다면 두 조인 순서의 비용은 각각 어떻게 바뀌는가? 이 경우 옵티마이저가 어떤 순서와 알고리즘을 고를 가능성이 있는지 근거와 함께 추론하라.</li>
+<li>인덱스를 막아 해시 조인으로 진단 쿼리를 실행한다고 하자. 빌드 입력이 <code>member</code>(부산 10,000행)일 때와 <code>orders</code>(1,000,000행)일 때 각각 해시 테이블에 담길 자료의 크기를 어림하고, <code>join_buffer_size</code> 기본값 256KB에서 어떤 일이 일어날지 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 둘째 테이블의 반복은 첫 행의 <code>rows × filtered / 100</code> = 2,000 × 0.5 = 1,000번으로 예상된 것이다. 셋째 테이블의 반복은 그 1,000번에 둘째 행의 5 × 0.2 = 1을 곱한 1,000번이다. 실제 <code>loops</code>가 40,000이라면 셋째 테이블 앞까지 넘어온 행이 예상의 40배다. 첫 테이블의 통과 행 수나 둘째 테이블의 <code>rows</code>·<code>filtered</code> 중 어디서 틀렸는지는 EXPLAIN ANALYZE에서 첫째와 둘째 이터레이터의 실제 <code>rows × loops</code>를 각각 예상과 비교해 찾는다. 예를 들어 첫 테이블의 실제 통과 행이 1,000이고 둘째 테이블이 한 번에 실제로 40행을 내놓았다면 둘째 테이블의 추정(5행, 20%)이 틀린 것이다. 조인에서는 이런 오차가 곱해지므로 앞쪽의 작은 오차도 뒤쪽에서 커진다.</p>
+<p><b>2.</b> <code>status</code>가 인덱스에 없으므로 <code>Extra</code>에서 <code>Using index</code>가 사라진다. 조건을 검사하려고 항목마다 기본 키로 클러스터형 인덱스를 다시 탐색하는 룩업 100,000번이 돌아온다. 접근 유형과 <code>key_len</code>, 예상 행 수는 그대로라서 EXPLAIN만 봐서는 놓치기 쉽다. 인덱스를 <code>(member_id, status, amount)</code>로 바꾸면 회원 번호로 찾아 들어간 뒤 각 항목의 <code>status</code>를 인덱스 안에서 검사하고 <code>amount</code>를 꺼낼 수 있어 다시 커버링이 된다. <code>member_id</code>는 조인에서 등치로 찾아 들어가는 열이라 맨 앞이어야 하고, <code>status</code>는 조건 검사에, <code>amount</code>는 들고 나오는 데만 쓰이므로 뒤에 둔다. 등치 조건 <code>o.status = 'DELIVERED'</code>라면 두 열로 찾아 들어가므로 <code>key_len</code>은 <code>BIGINT NOT NULL</code> 8 + <code>VARCHAR(20) NOT NULL</code> utf8mb4의 20 × 4 + 2 = 82, 합계 90이다.</p>
+<p><b>3.</b> 복합 인덱스의 항목은 첫 열인 <code>amount</code>로 먼저 정렬되고, 같은 금액 안에서만 <code>member_id</code> 순서다. 회원 6번의 항목은 금액별로 인덱스 여기저기에 흩어져 있으므로, 회원 번호 하나로 찾아 들어갈 연속 구간이 없다. 최좌측 접두사 규칙 때문에 이 인덱스는 <code>member_id = ?</code> 탐색에 쓸 수 없고, 쓸 수 있는 것은 인덱스 전체를 훑는 방법뿐이다. 반복마다 전체를 훑을 수는 없으므로 조인의 반복은 빨라지지 않는다. 열을 담는 것과 그 열로 찾아 들어갈 수 있는 것은 다른 문제다.</p>
+<p><b>4.</b> <code>orders</code>를 먼저 읽는 순서는 범위 접근을 할 수 없으므로 <code>orders</code> 1,000,000행을 풀 스캔해 하루치 1,440행을 걸러 낸 뒤 <code>member</code>를 기본 키로 1,440번 찾는다. <code>member</code>를 먼저 읽는 순서는 원래와 같이 회원 100,000명마다 <code>idx_orders_member</code>로 10행씩 찾고 행마다 클러스터형 인덱스에서 <code>ordered_at</code>을 확인하므로, 인덱스 탐색 100,000번과 클러스터형 룩업 1,000,000번이 든다. 앞의 순서는 순차 풀 스캔 한 번과 기본 키 탐색 1,440번, 뒤의 순서는 무작위 룩업 1,000,000번이므로 앞의 순서가 훨씬 싸다. 옵티마이저도 <code>ordered_at</code> 조건의 선택도를 제대로 추정한다면 <code>orders</code>를 드라이빙으로 두고 <code>member</code>를 <code>eq_ref</code>로 찾는 NLJ를 고를 가능성이 크다. 드리븐 쪽인 <code>member</code>에는 기본 키라는 인덱스가 있으므로 해시 조인이 필요한 상황이 아니다. 다만 <code>ordered_at</code>에 인덱스가 없으면 그 조건의 선택도는 히스토그램이 없는 한 근거가 약한 추정에 기대므로, 실제 선택은 EXPLAIN으로 확인해야 한다. MySQL 8.4.13에서 <code>IGNORE INDEX (idx_orders_ordered)</code>로 확인하면 옵티마이저는 실제로 <code>o</code>를 <code>ALL</code>로 먼저 읽고 <code>m</code>을 <code>PRIMARY</code>의 <code>eq_ref</code>로 찾는 NLJ를 골랐다. 이때 <code>o</code> 행의 <code>filtered</code>는 11.11, 트리 형식의 필터 예상 행 수는 109,742로 실제 1,440과 크게 다르다(값은 실행 환경과 통계에 따라 달라진다). 인덱스도 히스토그램도 없는 범위 조건에 기본 추정치가 쓰였다는 뜻이고, 이 경우에는 순서가 맞았지만 추정 자체는 근거가 약하다.</p>
+<p><b>5.</b> <code>member</code>가 빌드 입력이면 부산 회원 10,000행에서 조인 키와 필요한 열(회원 번호 8바이트, 이름 12바이트 안팎)만 담기므로 자료만 200KB 안팎이다. 해시 테이블의 부가 공간을 더하면 256KB에 들어갈 수도, 조금 넘칠 수도 있는 경계의 크기다. 넘친다면 남은 빌드 행이 청크 파일로 나뉘고 프로브 행도 같은 공식으로 청크에 기록된 뒤 청크 쌍 단위로 다시 처리된다. <code>orders</code>가 빌드 입력이면 1,000,000행에서 회원 번호와 금액만 담아도 12MB 이상이므로 확실히 디스크로 넘치고, 청크 파일 수 상한(입력당 128개)과 <code>open_files_limit</code>까지 신경 써야 한다. 그래서 바이트 크기가 작은 쪽을 빌드 입력으로 고르는 것이 중요하고, 빌드 쪽 조건을 먼저 걸러 크기를 줄이는 것이 해시 조인에서도 효과가 있다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>EXPLAIN에서 <code>member m</code> 행이 <code>type</code> ALL, <code>rows</code> 100,000, <code>filtered</code> 10.00이고, 그 아래 <code>orders o</code> 행이 <code>type</code> ref, <code>rows</code> 10이다. <code>orders</code>의 인덱스 탐색은 몇 번 반복될 것으로 예상된 것인가?</q>
+<o>10번</o>
+<o>약 10,000번</o>
+<o>약 100,000번</o>
+<o>1,000,000번</o>
+<why>드리븐 테이블의 반복 횟수는 위쪽 행의 <code>rows × filtered / 100</code> = 100,000 × 0.1 = 10,000이다. <code>orders</code> 행의 <code>rows</code> 10은 한 번 탐색할 때 나올 행 수이므로 반복 횟수가 아니다. 100,000은 반복 횟수에 한 번의 행 수를 곱한 전체 조인 행 수이고, 1,000,000은 주문 테이블 전체 행 수다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>진단 쿼리(부산 회원별 주문 건수와 금액 합계)에서 <code>orders</code>의 클러스터형 인덱스 룩업 100,000번을 없애는 변경은 무엇인가?</q>
+<o><code>member</code>에 <code>(region)</code> 인덱스를 추가한다</o>
+<o><code>join_buffer_size</code>를 크게 늘린다</o>
+<o><code>orders</code>에 <code>(member_id, amount)</code> 인덱스를 추가한다</o>
+<o><code>orders</code>에 <code>(amount, member_id)</code> 인덱스를 추가한다</o>
+<why><code>(member_id, amount)</code>는 조인 열로 찾아 들어갈 수 있고 집계에 필요한 <code>amount</code>까지 담고 있어 항목만으로 처리가 끝난다(<code>Using index</code>). <code>member</code>의 인덱스는 드라이빙 쪽 비용만 바꾸고 드리븐 쪽 룩업은 그대로다. <code>join_buffer_size</code>는 인덱스 NLJ의 룩업과 관계가 없다. <code>(amount, member_id)</code>는 두 열을 담고 있지만 최좌측 열이 <code>amount</code>라서 회원 번호로 찾아 들어갈 수 없다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>MySQL 8.0.20 이상의 해시 조인에 대한 설명으로 옳은 것은?</q>
+<o>빌드 입력을 모두 읽어 해시 테이블을 만든 뒤에야 프로브를 시작하므로, 첫 결과 행이 나오는 시점이 NLJ보다 늦을 수 있다.</o>
+<o>조인 조건에 등치 비교가 하나도 없으면 해시 조인을 쓸 수 없고 블록 중첩 루프로 돌아간다.</o>
+<o>해시 테이블이 <code>join_buffer_size</code>를 넘으면 쿼리가 오류로 중단된다.</o>
+<o>해시 조인을 끄려면 <code>NO_HASH_JOIN</code> 힌트를 쓴다.</o>
+<why>해시 조인은 빌드 단계가 끝나야 프로브를 할 수 있으므로 첫 행이 늦다. 8.0.20부터는 등치 조건이 없는 조인에도 해시 조인을 쓰며(조건 없는 해시 조인 위에 필터) BNL은 더 이상 쓰이지 않는다. 메모리를 넘으면 청크 파일로 디스크를 쓴다(파일 수가 <code>open_files_limit</code>을 넘으면 실패할 수는 있다). <code>HASH_JOIN</code>·<code>NO_HASH_JOIN</code> 힌트는 8.0.18에서만 동작했고, 이후에는 <code>BNL</code>·<code>NO_BNL</code> 힌트를 쓴다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>SELECT ... FROM member m LEFT JOIN orders o ON o.member_id = m.member_id WHERE o.status = 'CANCELED'</code>에 대해 옳은 것은?</q>
+<o><code>LEFT JOIN</code>이므로 <code>member</code>가 반드시 드라이빙 테이블이 된다.</o>
+<o><code>WHERE</code> 조건이 오른쪽 테이블에 있으므로 주문이 없는 회원도 NULL로 채워져 결과에 남는다.</o>
+<o>옵티마이저는 <code>orders</code>를 먼저 읽을 수 없으므로 <code>JOIN_PREFIX(o, m)</code> 힌트를 주면 오류가 난다.</o>
+<o>NULL로 채운 행은 <code>WHERE</code>에서 반드시 탈락하므로 내부 조인으로 바뀌고, <code>orders</code>를 먼저 읽는 순서도 고려할 수 있다.</o>
+<why><code>o.status = 'CANCELED'</code>는 NULL로 채운 행에 대해 UNKNOWN이 되는 널 거부 조건이다. 매뉴얼에 따라 MySQL은 이런 외부 조인을 내부 조인으로 바꾸고, 그러면 왼쪽 테이블을 먼저 읽어야 한다는 제약이 사라진다. 주문이 없는 회원의 행은 결과에 남지 않는다. 외부 조인이 유지되는 경우라도 충돌하는 조인 순서 힌트는 오류 없이 무시된다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>커버링 인덱스를 추가하기 전과 후에 진단 쿼리의 카운터를 비교했다. 가장 크게 달라지는 것은 무엇이고, 그 이유는?</q>
+<o><code>Handler_read_next</code>. 커버링 인덱스는 읽는 항목 수를 줄이기 때문이다.</o>
+<o><code>Innodb_buffer_pool_read_requests</code>. 클러스터형 인덱스 룩업은 엔진 내부에서 일어나 Handler 카운터에는 따로 잡히지 않고 버퍼 풀 접근에만 나타나기 때문이다.</o>
+<o><code>Handler_read_key</code>. 조인의 반복 횟수가 줄기 때문이다.</o>
+<o>EXPLAIN ANALYZE의 <code>loops</code>. 커버링 인덱스는 드라이빙 행 수를 줄이기 때문이다.</o>
+<why>커버링 인덱스는 반복 횟수(10,000)도, 한 번에 읽는 항목 수(10)도 바꾸지 않으므로 <code>Handler_read_key</code>, <code>Handler_read_next</code>, <code>loops</code>는 거의 그대로다. 바뀌는 것은 항목마다 클러스터형 인덱스를 다시 내려가던 페이지 접근이고, 이것은 버퍼 풀의 논리적 읽기 요청 수에만 나타난다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>중첩 루프 조인(nested-loop join, NLJ)</dt><dd>바깥 테이블에서 행을 하나씩 읽어 안쪽 테이블에서 짝을 찾는 조인 알고리즘. MySQL의 기본 조인 방식이다.</dd>
+<dt>드라이빙 테이블(driving table)</dt><dd>중첩 루프의 바깥 루프에서 읽는 테이블. 이 테이블의 조건 통과 행 수가 안쪽 접근의 반복 횟수가 된다.</dd>
+<dt>드리븐 테이블(driven table)</dt><dd>바깥 행마다 짝을 찾아 들어가는 안쪽 테이블. 조인 열의 인덱스가 한 번의 접근 비용을 정한다.</dd>
+<dt>블록 중첩 루프(Block Nested-Loop, BNL)</dt><dd>바깥 행을 조인 버퍼에 모아 안쪽 테이블을 훑는 횟수를 줄이던 알고리즘. 8.0.20부터 쓰이지 않고 해시 조인으로 대체되었다.</dd>
+<dt>해시 조인(hash join)</dt><dd>한 입력으로 조인 키의 해시 테이블을 만들고(빌드), 다른 입력을 읽으며 해시 테이블을 찾는(프로브) 조인. 인덱스 없이 두 입력을 한 번씩 읽는다.</dd>
+<dt>조인 버퍼(join buffer)</dt><dd>BNL, BKA, 해시 조인이 앞 테이블의 필요한 열을 담아 두는 메모리. 크기는 <code>join_buffer_size</code>로 정하며 기본값은 256KB다.</dd>
+<dt>세미조인(semijoin)</dt><dd>바깥 행 중 서브쿼리와 짝이 맞는 행을 한 번씩만 돌려주는 연산. MySQL은 <code>IN</code>·<code>EXISTS</code> 서브쿼리를 세미조인으로 변환해 조인 순서와 중복 제거 전략을 비용으로 고른다.</dd>
+<dt>널 거부 조건(null-rejected condition)</dt><dd>외부 조인이 만든 NULL 채움 행에 대해 FALSE나 UNKNOWN이 되는 조건. <code>WHERE</code>에 있으면 외부 조인이 내부 조인으로 바뀐다.</dd>
+<dt>배치 키 접근(Batched Key Access, BKA)</dt><dd>조인 버퍼에 모은 키를 MRR로 엔진에 한꺼번에 넘겨, 드리븐 테이블의 행을 기본 키 순서로 읽게 하는 조인 방식. 기본으로 꺼져 있다.</dd>
+<dt>커버링 인덱스(covering index)</dt><dd>쿼리가 그 테이블에서 쓰는 열을 모두 담고 있어 클러스터형 인덱스로 되돌아가지 않고 처리할 수 있는 인덱스. EXPLAIN의 <code>Extra</code>에 <code>Using index</code>로 나타난다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/nested-loop-joins.html">MySQL 8.0 Reference Manual — Nested-Loop Join Algorithms</a> — NLJ와 BNL의 의사 코드, 조인 버퍼의 성질, 안쪽 테이블 스캔 횟수 식</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/hash-joins.html">MySQL 8.0 Reference Manual — Hash Join Optimization</a> — 해시 조인의 도입 버전, 적용 범위, 메모리와 디스크 사용, EXPLAIN 표기, 제어 방법</li>
+<li><a href="https://dev.mysql.com/blog-archive/hash-join-in-mysql-8/">MySQL Blog Archive — Hash join in MySQL 8</a> — 빌드·프로브 단계, 빌드 입력 선택, 청크 파일로 넘치는 과정과 두 해시 함수를 쓰는 이유</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/outer-join-simplification.html">MySQL 8.0 Reference Manual — Outer Join Simplification</a> — 널 거부 조건과 외부 조인의 내부 조인 변환, 조인 순서 선택지의 변화</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/bnl-bka-optimization.html">MySQL 8.0 Reference Manual — Block Nested-Loop and Batched Key Access Joins</a> — BKA의 동작, MRR과의 관계, 활성화 조건과 EXPLAIN 표기</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-index-types.html">MySQL 8.0 Reference Manual — Clustered and Secondary Indexes</a> — 세컨더리 인덱스 레코드가 기본 키를 담고 그것으로 클러스터형 인덱스를 찾는다는 설명</li>
+</x-refs>

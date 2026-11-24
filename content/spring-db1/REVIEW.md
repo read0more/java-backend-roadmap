@@ -1,0 +1,7 @@
+- 01: 2026-11-17 확인 31건 · 수정 3건 — 중복 키 출력에 실제 메시지 끝 [23505-240] 복원, jdbc.drivers 속성 읽는 시점 정정, H2 -ifNotExists 보안 경고를 튜토리얼 문구대로 좁힘
+- 03: 2026-11-17 확인 38건 · 수정 7건 — 인덱스 없는 전체 스캔 락을 REPEATABLE READ 기준으로 한정(본문·요약·연습3), DML 스냅샷 번역·LOCK_DATA·새 스냅샷 문구를 매뉴얼에 맞춤
+- 02: 2026-11-17 확인 34건 · 수정 4건 — DCL 출처 자바 중급→스프링 핵심 원리 기본편, failFast 조건 0 이상→0보다 큼, Spring 호출 체인 중간 단계 보완, Javadoc 굵은 글씨 범위 정정
+- 04: 2026-11-17 확인 30건 · 수정 1건 — Boot 3.0.x DataSourceTransactionManagerAutoConfiguration의 @ConditionalOnClass에 DataSource가 없음을 반영(3.5.x에만 명시)
+- 05: 2026-11-17 확인 32건 · 수정 6건 — B·C javac 오류 행번호·들여쓰기를 실제 출력으로, Javadoc 첫 문단→Javadoc, 람다 규칙 근거 JLS §11.2.3, getNextException 의도 추측 제거, FastThrow 동일 객체 서술 보정
+- 06: 2026-11-17 확인 32건 · 수정 5건 — 6.0.0~6.0.2 기본 변환기는 키 중복을 DuplicateKeyException으로 안 바꿈 → 6.0.4 이후로 범위 좁힘(본문·그림·연습 3), 오류 코드 비교 순서 보완
+- 03: 2026-11-19 MySQL 실측 10건 · 채움/수정 13건 — 1205·1213·NOWAIT 3572 문구, data_locks 출력, 갱신 손실·FOR UPDATE·연습 1·3 결과를 8.4.13·8.0.46에서 확인, NOWAIT 문구 정정

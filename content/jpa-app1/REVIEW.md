@@ -1,0 +1,6 @@
+- 01: 2026-11-17 확인 40건 · 수정 6건 — BOM 함께 시험한→지원하는(부트 문서 표현), Not a managed type 문장을 실측 오류 문구로 좁힘, DB_CLOSE_DELAY 이유(풀 반납 시 소멸) 추측 제거
+- 05: 2026-11-17 확인 24건 · 수정 3건 — HibernateJpaDialect의 setDefaultReadOnly(true)는 트랜잭션용으로 새로 만든 엔티티 매니저일 때만(OSIV 재사용 시 아님) 호출됨으로 본문·연습 해설·퀴즈 해설 범위 좁힘
+- 02: 2026-11-17 확인 39건 · 수정 5건 — Bad.java 오류 줄 4→5, 필드 초기화식 복사 범위(this() 생성자 제외), transient 예외 시점 플러시→persist, optional=false 오류 주체 정정
+- 03: 2026-11-17 확인 26건 · 수정 2건 — 공유 프록시의 TransactionRequiredException 조건을 소스대로 정정, readOnly flush 모드 이전 값 보관은 새로 만든 EM이 아닐 때만으로 좁힘
+- 04: 2026-11-17 확인 31건 · 수정 19건 — mappedBy 컬렉션 cascade 누락 시 실패→예외 없이 INSERT 누락, readOnly의 setDefaultReadOnly는 새 EM일 때만, 로그 테이블명 대소문자·예외 래핑 실측대로
+- 03: 2026-11-17 확인 24건 · 수정 0건 — 수정 없음(SQL 로그·예외 연쇄·readOnly 동작을 Hibernate 6.6.53·Spring ORM 6.2.19로 재실행해 일치 확인)

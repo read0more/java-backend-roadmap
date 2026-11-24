@@ -1,0 +1,838 @@
+<x-meta>
+deck: 부모 타입 변수가 자식 객체를 가리킬 때 컴파일러가 보는 타입과 JVM이 보는 객체가 어떻게 갈리는지, 캐스팅과 instanceof, 오버라이딩된 메서드가 invokevirtual로 선택되는 과정까지 따라간다.
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li>부모 타입 변수가 자식 객체를 참조할 때 스택과 힙의 상태를 그리고, 그 변수로 호출할 수 있는 멤버와 없는 멤버를 컴파일 타임 타입으로 판정한다.</li>
+<li>업캐스팅과 다운캐스팅이 각각 컴파일 시점과 실행 시점에 무엇을 검사하는지 설명하고, ClassCastException이 발생하는 코드를 실행 전에 가려낸다.</li>
+<li>instanceof의 결과를 객체의 런타임 클래스로부터 예측하고, 패턴 매칭으로 선언한 변수를 쓸 수 있는 범위를 판단한다.</li>
+<li>부모 타입 변수로 필드에 접근할 때와 오버라이딩된 메서드를 호출할 때의 결과가 다른 이유를 바이트코드 수준에서 설명한다.</li>
+<li>invokevirtual의 메서드 선택 규칙(JVMS §5.4.6)과 HotSpot의 가상 메서드 테이블이 같은 결과를 내는 방식을 그림으로 설명한다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>타입마다 따로 써야 하는 코드</h3>
+
+<p>앞 회차에서 만든 직원 클래스들을 계속 쓴다. <code>Employee</code>가 부모이고 <code>Manager</code>와 <code>Engineer</code>가 자식이다. <code>Manager</code>는 월급 계산을 오버라이딩했다.</p>
+
+<pre><code class="language-java">public class Employee {
+    String name;
+    int baseSalary;
+
+    Employee(String name, int baseSalary) {
+        this.name = name;
+        this.baseSalary = baseSalary;
+    }
+
+    void work() {
+        System.out.println(name + ": 업무를 처리한다");
+    }
+
+    int monthlyPay() {
+        return baseSalary;
+    }
+}
+
+public class Manager extends Employee {
+    int teamSize;
+
+    Manager(String name, int baseSalary, int teamSize) {
+        super(name, baseSalary);
+        this.teamSize = teamSize;
+    }
+
+    void approve() {
+        System.out.println(name + ": 결재한다 (팀원 " + teamSize + "명)");
+    }
+
+    @Override
+    int monthlyPay() {
+        return super.monthlyPay() + teamSize * 100_000;
+    }
+}
+
+public class Engineer extends Employee {
+    String language;
+
+    Engineer(String name, int baseSalary, String language) {
+        super(name, baseSalary);
+        this.language = language;
+    }
+
+    void deploy() {
+        System.out.println(name + ": " + language + " 서비스를 배포한다");
+    }
+}</code></pre>
+
+<p>이제 전 직원의 월급 합계를 구하는 기능이 필요하다. 지금까지 배운 것만으로 쓰면, 변수의 타입과 객체의 타입이 항상 같아야 하므로 직원의 종류마다 배열과 반복문을 따로 둬야 한다.</p>
+
+<pre><code class="language-java">static int totalPay(Manager[] managers, Engineer[] engineers) {
+    int total = 0;
+    for (Manager manager : managers) {
+        total += manager.monthlyPay();
+    }
+    for (Engineer engineer : engineers) {
+        total += engineer.monthlyPay();
+    }
+    return total;
+}</code></pre>
+
+<p>두 반복문은 변수의 타입만 다르고 하는 일이 같다. 상속으로 클래스 <b>정의</b>의 중복은 없앴지만, 그 클래스들을 <b>사용하는 코드</b>의 중복은 그대로 남아 있다. 디자이너라는 직원 종류가 추가되면 매개변수와 반복문을 하나씩 더 써야 하고, 이 메서드를 호출하는 모든 곳도 고쳐야 한다. "관리자든 개발자든 직원이다"라는 사실을 클래스 정의에는 표현했는데, 사용하는 코드에서는 활용하지 못하고 있는 것이다.</p>
+
+<p>이 문제를 푸는 것이 <b>다형성(polymorphism)</b>이다. 하나의 타입으로 여러 종류의 객체를 다룰 수 있고, 같은 호출이 객체에 따라 다르게 동작하는 성질을 말한다. 자바의 다형성은 두 가지 장치 위에 서 있다. 부모 타입의 변수가 자식 객체를 가리킬 수 있다는 <b>다형적 참조</b>와, 그 변수로 메서드를 호출하면 객체의 클래스에서 오버라이딩한 메서드가 실행된다는 <b>메서드 오버라이딩</b>이다. 이 회차는 두 장치를 차례로 본 다음, JVM이 실제로 어떻게 메서드를 골라 실행하는지까지 내려간다.</p>
+
+<h3>다형적 참조: 부모 타입 변수가 자식 객체를 가리킨다</h3>
+
+<p>지금까지는 <code>Manager</code> 타입 변수에 <code>Manager</code> 객체를 담았다. 자바는 여기서 한 걸음 더 허용한다. <b>부모 타입의 변수에 자식 타입의 객체를 대입할 수 있다.</b></p>
+
+<pre><code class="language-java">public class PolyMain {
+    public static void main(String[] args) {
+        Employee e1 = new Employee("오세린", 4_000_000);       // 부모 타입 변수 → 부모 객체
+        Manager m1 = new Manager("한지우", 5_000_000, 4);      // 자식 타입 변수 → 자식 객체
+        Employee e2 = new Manager("문가람", 5_500_000, 2);     // 부모 타입 변수 → 자식 객체
+
+        e2.work();                 // Employee에 선언된 메서드: 호출할 수 있다
+        // e2.approve();           // 컴파일 오류: cannot find symbol
+        // Manager m2 = e1;        // 컴파일 오류: incompatible types: Employee cannot be converted to Manager
+
+        System.out.println(e2.getClass().getName());
+        Employee e3 = m1;          // 이미 있는 Manager 객체를 부모 타입 변수로도 가리킨다
+        System.out.println(e3 == m1);
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">문가람: 업무를 처리한다
+Manager
+true</code></pre>
+
+<p>세 번째 줄 <code>Employee e2 = new Manager(...)</code>가 다형적 참조다. 힙에 만들어진 것은 <code>Manager</code> 객체이고, 그것을 가리키는 변수의 타입은 <code>Employee</code>다. <code>e2.getClass().getName()</code>이 "Manager"를 출력하는 것에서 보듯 객체는 여전히 <code>Manager</code>다. 변수의 타입이 <code>Employee</code>라고 해서 객체가 <code>Employee</code>로 바뀌거나 줄어드는 일은 없다. 마지막 두 줄도 같은 사실을 보여 준다. <code>e3</code>와 <code>m1</code>은 타입이 다른 변수지만 같은 참조값을 담고 있어서 <code>==</code> 비교가 true다.</p>
+
+<pre class="diagram">스택 (main의 프레임)                      힙
+┌──────────────────────────────┐
+│ e1 : Employee      x001  ────┼──▶  Employee 객체 (x001)
+│                              │       [Employee 부분] name="오세린", baseSalary=4000000
+│                              │
+│ m1 : Manager       x002  ────┼──▶  Manager 객체 (x002)
+│ e3 : Employee      x002  ────┼──▶    [Employee 부분] name="한지우", baseSalary=5000000
+│                              │       [Manager 부분]  teamSize=4
+│                              │
+│ e2 : Employee      x003  ────┼──▶  Manager 객체 (x003)
+└──────────────────────────────┘       [Employee 부분] name="문가람", baseSalary=5500000
+                                       [Manager 부분]  teamSize=2
+
+변수의 타입(Employee, Manager)은 스택 쪽의 정보이고, 객체의 클래스는 힙 쪽의 정보다.</pre>
+
+<h4>왜 이 방향만 허용되는가</h4>
+
+<p>부모 타입 변수가 자식 객체를 가리키는 것은 되고, 자식 타입 변수가 부모 객체를 가리키는 것(<code>Manager m2 = e1;</code>)은 안 된다. 이유는 앞 회차의 메모리 구조에 있다. <code>Manager</code> 객체 안에는 <code>Employee</code>에 선언된 필드가 모두 들어 있고, <code>Employee</code>의 메서드는 전부 <code>Manager</code> 객체에 대해 실행할 수 있다. 그러므로 <code>Employee</code> 타입 변수를 통해 할 수 있는 모든 일은 그 변수가 <code>Manager</code> 객체를 가리키고 있어도 문제없이 성립한다.</p>
+
+<p>반대는 그렇지 않다. <code>Manager</code> 타입 변수로는 <code>approve()</code>를 호출하고 <code>teamSize</code>를 읽을 수 있어야 하는데, <code>Employee</code> 객체에는 <code>teamSize</code> 필드가 없다. 그 변수로 <code>teamSize</code>를 읽으면 객체에 존재하지 않는 자리를 읽게 된다. 컴파일러는 이런 대입을 처음부터 막는다.</p>
+
+<p>JLS는 이 대입을 <b>확장 참조 변환(widening reference conversion)</b>이라고 부른다(§5.1.5). 타입 S가 타입 T의 하위 타입이면 S에서 T로의 변환이 존재하고, 이 변환은 실행 시점에 어떤 동작도 요구하지 않으며 예외를 던지지도 않는다고 규정한다. 올바름이 컴파일 시점에 증명되는 변환이기 때문이다. 객체는 그대로이고, 참조값도 그대로 복사된다. 달라지는 것은 그 참조를 "어떤 타입으로 간주하는가"뿐이다.</p>
+
+<p>다형적 참조는 변수 대입에서만 일어나는 것이 아니다. 매개변수에 인자를 넘길 때, 배열에 요소를 넣을 때, 메서드가 값을 반환할 때 모두 같은 변환이 적용된다. <code>Employee</code>를 받는 메서드에는 <code>Manager</code>도 <code>Engineer</code>도 넘길 수 있고, <code>Employee[]</code> 배열에는 세 종류의 객체를 섞어 담을 수 있다.</p>
+
+<x-visual id="java-basic-09-polymorphic-reference" title="부모 타입 변수가 자식 객체를 가리키는 다형적 참조" kind="메모리 구조도" ratio="16:9">
+<x-hint>Employee 타입 변수가 Manager 객체를 가리킬 때 객체는 온전히 Manager이지만, 그 변수를 통해서는 Employee 부분만 보인다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 메모리 구조도. 왼쪽에 "스택" 상자가 있고 그 안에 변수 칸 하나: 위에 작은 꼬리표 "타입: Employee", 칸 안에 "e2" 와 값 "x003". 오른쪽에 "힙" 상자가 있고 그 안에 둥근 사각형 "Manager 객체 x003" 이 있다. 객체 내부는 위아래 두 층: 위층은 밝은 파랑 바탕에 라벨 "Employee 부분" 과 "name", "baseSalary", "work()", "monthlyPay()". 아래층은 회색 빗금 바탕에 라벨 "Manager 부분" 과 "teamSize", "approve()". 스택의 e2 칸에서 객체로 화살표 하나. 화살표가 객체에 닿는 곳에서 위층만 감싸는 굵은 파란 테두리를 그리고 테두리 옆에 라벨 "e2 로 볼 수 있는 범위". 아래층 옆에는 라벨 "존재하지만 e2 로는 접근 불가". 객체 오른쪽 위에 작은 꼬리표 "객체의 클래스: Manager". 색은 파랑, 회색, 남색만 사용하고 글자는 고딕체로 선명하게.</x-prompt>
+<x-caption>변수의 타입은 그 참조로 할 수 있는 일의 범위를 정할 뿐, 객체 자체를 바꾸지 않는다. 객체는 처음 만들어진 클래스 그대로다.</x-caption>
+</x-visual>
+
+<h3>컴파일 타임 타입과 런타임 타입</h3>
+
+<p>다형적 참조를 허용하는 순간, 지금까지 하나였던 "타입"이 둘로 갈린다. 변수에 선언된 타입과, 그 변수가 실제로 가리키는 객체의 클래스다. JLS §4.12.6은 이 둘을 구분해서 설명한다.</p>
+
+<ul>
+<li><b>컴파일 타임 타입(compile-time type)</b>: 변수에 선언된 타입, 또는 식에 대해 컴파일러가 추론한 타입. 소스 코드만 보고 정해지며 실행 중에 바뀌지 않는다. <code>Employee e2</code>에서 <code>e2</code>의 컴파일 타임 타입은 언제나 <code>Employee</code>다.</li>
+<li><b>런타임 타입(run-time type)</b>: 실행 중에 그 변수의 값이 가리키는 객체의 클래스. <code>e2</code>가 가리키는 객체의 클래스는 <code>Manager</code>다. 값이 null이면 런타임 타입은 없다.</li>
+</ul>
+
+<p>JLS는 둘의 관계도 규정한다. 컴파일 타임 타입은 실행 중에 변수가 가질 수 있는 값을 제한하며, null이 아닌 참조가 가리키는 객체의 클래스는 반드시 컴파일 타임 타입과 호환된다. <code>Employee</code> 타입 변수가 가리키는 객체는 <code>Employee</code>이거나 그 하위 클래스의 객체임이 보장된다는 뜻이다.</p>
+
+<p>컴파일러는 왜 객체의 실제 클래스를 기준으로 삼지 않는가. 알 수 없기 때문이다. 위의 예에서는 <code>new Manager(...)</code>가 같은 줄에 있어서 사람 눈에 뻔하지만, 일반적으로 변수가 어떤 객체를 가리킬지는 실행해 봐야 정해진다.</p>
+
+<pre><code class="language-java">static Employee pick(boolean senior) {
+    if (senior) {
+        return new Manager("한지우", 5_000_000, 4);
+    }
+    return new Engineer("나도윤", 4_500_000, "Kotlin");
+}
+
+static void run(boolean senior) {
+    Employee employee = pick(senior);
+    employee.work();          // 항상 가능
+    // employee.approve();    // 컴파일 오류: Manager가 아닐 수도 있다
+}</code></pre>
+
+<p><code>employee</code>가 <code>Manager</code>를 가리킬지 <code>Engineer</code>를 가리킬지는 실행 중의 <code>senior</code> 값에 달려 있다. 컴파일러가 확실히 아는 것은 "<code>Employee</code>이거나 그 하위 타입의 객체"라는 것뿐이다. 그래서 컴파일러는 선언된 타입인 <code>Employee</code>에 있는 멤버만 허용한다. <code>approve()</code>는 <code>Employee</code>의 멤버가 아니므로, 설령 실행 중에 그 객체가 <code>Manager</code>라 해도 호출할 수 없다. 앞 회차에서 본 메서드 탐색의 첫 단계가 "변수의 타입에서 메서드를 찾는다"였던 것을 떠올리면 된다. 탐색은 변수의 타입에서 시작해 <b>부모 방향으로만</b> 올라가고, 자식 방향으로는 내려가지 않는다.</p>
+
+<p>이후의 내용은 모두 "이것은 컴파일 타임 타입으로 결정되는가, 런타임 타입으로 결정되는가"라는 질문으로 정리된다. 먼저 결론을 표로 보고, 각 항목을 차례로 확인하자.</p>
+
+<div class="table-wrap"><table><thead><tr><th>결정되는 것</th><th>기준</th><th>결정 시점</th></tr></thead><tbody>
+<tr><td>그 변수로 쓸 수 있는 멤버의 이름</td><td>컴파일 타임 타입</td><td>컴파일</td></tr>
+<tr><td>대입과 캐스팅이 문법적으로 허용되는지</td><td>컴파일 타임 타입</td><td>컴파일</td></tr>
+<tr><td>읽고 쓰는 필드가 어느 클래스에 선언된 것인지</td><td>컴파일 타임 타입</td><td>컴파일</td></tr>
+<tr><td>오버로딩된 메서드 중 어느 것을 호출할지</td><td>인자의 컴파일 타임 타입</td><td>컴파일</td></tr>
+<tr><td>실제로 실행되는 인스턴스 메서드의 구현</td><td>런타임 타입(객체의 클래스)</td><td>실행</td></tr>
+<tr><td>다운캐스팅의 성공 여부, instanceof의 결과</td><td>런타임 타입(객체의 클래스)</td><td>실행</td></tr>
+</tbody></table></div>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>리모컨과 기기</strong><p>참조 변수는 리모컨이고 객체는 기기다. 기본 리모컨에는 전원과 음량 버튼만 있고, 전용 리모컨에는 거기에 녹화 버튼이 더 있다. 녹화 기능이 있는 기기를 기본 리모컨으로 조작할 수는 있다. 전원과 음량은 어느 기기에나 있기 때문이다. 다만 기본 리모컨에는 녹화 버튼이 없으니 녹화를 시킬 수 없다. 기기에서 녹화 기능이 사라진 것이 아니라 손에 든 리모컨에 버튼이 없을 뿐이다. 반대로 녹화 기능이 없는 기기에 전용 리모컨을 쓰면 녹화 버튼이 눌러도 되는 버튼인 것처럼 보이므로 위험하다. 이 비유가 맞지 않는 지점은 "같은 버튼을 눌러도 기기마다 다르게 동작한다"는 부분이다. 그것이 오버라이딩이며 뒤에서 따로 본다.</p></aside>
+
+<h3>다운캐스팅: 자식의 기능을 다시 꺼내기</h3>
+
+<p>부모 타입 변수로는 자식에만 있는 기능을 쓸 수 없다. 그런데 객체가 실제로 <code>Manager</code>라는 것을 프로그래머가 알고 있고, <code>approve()</code>를 호출해야 한다면 어떻게 하는가. 참조를 자식 타입으로 다시 바꿔야 한다. 부모 타입의 참조를 자식 타입으로 바꾸는 것을 <b>다운캐스팅(downcasting)</b>이라 하고, 괄호 안에 타입을 적는 캐스트 연산자로 명시한다.</p>
+
+<pre><code class="language-java">public class CastMain {
+    public static void main(String[] args) {
+        Employee e = new Manager("문가람", 5_500_000, 2);
+
+        Manager m = (Manager) e;          // 다운캐스팅
+        m.approve();
+        ((Manager) e).approve();          // 일시적 다운캐스팅
+
+        Employee up = (Employee) m;       // 업캐스팅: (Employee)는 생략할 수 있다
+        up.work();
+
+        System.out.println(e == m);       // 같은 객체를 가리키는가
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">문가람: 결재한다 (팀원 2명)
+문가람: 결재한다 (팀원 2명)
+문가람: 업무를 처리한다
+true</code></pre>
+
+<p><code>Manager m = (Manager) e;</code>를 풀어서 읽으면 이렇다. <code>e</code>에 든 참조값을 꺼낸다. 그 참조를 <code>Manager</code> 타입으로 간주해도 되는지 확인한다. 된다면 같은 참조값을 <code>m</code>에 대입한다. <code>e</code> 자신은 변하지 않는다. 변수 <code>e</code>의 타입은 여전히 <code>Employee</code>이고 값도 그대로다. 마지막 줄의 <code>e == m</code>이 true인 것에서 두 변수가 같은 객체를 가리킨다는 것을 확인할 수 있다.</p>
+
+<p>여기서 가장 흔한 오해를 바로잡아야 한다. <b>캐스팅은 객체를 변환하지 않는다.</b> <code>(int) 3.7</code>처럼 기본형의 캐스팅은 값 자체를 다른 값으로 바꾸지만, 참조형의 캐스팅은 객체에 손을 대지 않는다. 힙의 객체는 생성된 순간부터 사라질 때까지 같은 클래스의 객체다. 캐스팅이 바꾸는 것은 "이 참조를 컴파일러가 어떤 타입으로 취급하는가"이고, 그 결과 그 참조로 쓸 수 있는 멤버의 범위가 달라진다. JLS §15.16도 캐스트 식의 결과는 변수가 아니라 값이라고 설명한다.</p>
+
+<p>두 번째 형태인 <code>((Manager) e).approve()</code>는 새 변수를 만들지 않고, 캐스팅한 결과에 대해 바로 메서드를 호출한다. 흔히 일시적 다운캐스팅이라고 부른다. 괄호가 두 겹인 이유는 연산자 우선순위 때문이다. <code>(Manager) e.approve()</code>라고 쓰면 메서드 호출이 캐스트보다 먼저 묶여 <code>e.approve()</code>의 결과를 캐스팅하는 식이 된다. <code>Employee</code>에는 <code>approve()</code>가 없으므로 이 식은 컴파일되지 않는다. 대입문의 오른쪽 같은 자리에 쓰면 "cannot find symbol" 오류가 나고, 이 식만으로 한 문장을 쓰면 JDK 21의 <code>javac</code>는 그보다 먼저 "not a statement" 오류를 낸다.</p>
+
+<h4>바이트코드로 본 캐스팅</h4>
+
+<p>캐스팅이 실행 시점에 무엇을 하는지는 바이트코드에 그대로 나타난다.</p>
+
+<pre data-label="javap -c CastMain (일부)"><code class="language-text">      12: astore_1
+      13: aload_1
+      14: checkcast     #7                  // class Manager
+      17: astore_2
+      18: aload_2
+      19: invokevirtual #15                 // Method Manager.approve:()V
+      22: aload_1
+      23: checkcast     #7                  // class Manager
+      26: invokevirtual #15                 // Method Manager.approve:()V
+      29: aload_2
+      30: astore_3
+      31: aload_3
+      32: invokevirtual #18                 // Method Employee.work:()V</code></pre>
+
+<p>지역 변수 슬롯 1, 2, 3이 차례로 <code>e</code>, <code>m</code>, <code>up</code>이다. 13~17번은 <code>m = (Manager) e</code>, 22~26번은 <code>((Manager) e).approve()</code>, 29~30번은 <code>up = (Employee) m</code>에 해당한다. 다운캐스팅 두 곳에는 <code>checkcast</code>라는 명령이 있다. 이 명령은 스택 위의 참조가 가리키는 객체가 지정된 타입으로 캐스팅될 수 있는지 검사하고, 될 수 있으면 스택을 그대로 둔 채 다음으로 넘어간다(JVMS §6.5 checkcast). 참조값을 바꾸거나 객체를 복사하는 동작은 없다. 검사만 한다.</p>
+
+<p>업캐스팅인 <code>Employee up = (Employee) m;</code>에 해당하는 29~30번 줄에는 <code>aload_2</code>와 <code>astore_3</code>뿐이다. 변수 하나에서 값을 꺼내 다른 변수에 넣는 것이 전부이고 <code>checkcast</code>가 없다. 소스에 <code>(Employee)</code>라고 적었는데도 그렇다. 업캐스팅은 컴파일 시점에 올바름이 증명되므로 실행 시점에 검사할 것이 없기 때문이다. "업캐스팅은 실행 시점에 아무 동작도 요구하지 않는다"는 JLS §5.1.5의 문장이 바이트코드에서 그대로 확인된다.</p>
+
+<h3>캐스팅의 종류: 업캐스팅과 다운캐스팅</h3>
+
+<p>두 방향의 캐스팅을 정리한다. 상속 계층을 부모가 위, 자식이 아래에 오도록 그렸을 때 위로 올라가는 것이 업캐스팅, 아래로 내려가는 것이 다운캐스팅이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th></th><th>업캐스팅(upcasting)</th><th>다운캐스팅(downcasting)</th></tr></thead><tbody>
+<tr><td>방향</td><td>자식 타입 → 부모 타입</td><td>부모 타입 → 자식 타입</td></tr>
+<tr><td>JLS의 용어</td><td>확장 참조 변환(§5.1.5)</td><td>축소 참조 변환(§5.1.6)</td></tr>
+<tr><td>캐스트 연산자</td><td>생략할 수 있다(생략하는 것이 보통이다)</td><td>반드시 써야 한다</td></tr>
+<tr><td>컴파일 시점</td><td>항상 허용</td><td>클래스 타입끼리는 두 타입이 상속 관계에 있을 때만 허용</td></tr>
+<tr><td>실행 시점</td><td>아무 동작 없음</td><td>객체의 클래스를 검사(checkcast)</td></tr>
+<tr><td>실패 가능성</td><td>없음</td><td>ClassCastException</td></tr>
+</tbody></table></div>
+
+<p>업캐스팅을 명시적으로 쓰는 일은 드물다. <code>Employee up = m;</code>이면 충분하다. 다운캐스팅은 생략할 수 없는데, 이것은 문법적 불편이 아니라 의도된 설계다. 실패할 수 있는 변환은 프로그래머가 "실패할 수 있음을 알고 한다"는 것을 소스에 적게 하는 것이다. 기본형에서 <code>double</code>을 <code>int</code>에 대입할 때 값의 손실 가능성 때문에 캐스트를 요구하는 것과 같은 원칙이다.</p>
+
+<p>다운캐스팅이라고 아무 타입으로나 되는 것은 아니다. 컴파일러는 두 타입의 관계를 보고, 실행 시점에 성공할 가능성이 전혀 없는 캐스팅은 컴파일 오류로 거부한다(JLS §15.16, §5.5).</p>
+
+<pre><code class="language-java">Manager manager = new Manager("한지우", 5_000_000, 4);
+Engineer engineer = (Engineer) manager;   // error: incompatible types: Manager cannot be converted to Engineer
+String text = (String) manager;           // error: incompatible types: Manager cannot be converted to String</code></pre>
+
+<p><code>Manager</code>와 <code>Engineer</code>는 같은 부모를 둔 형제일 뿐 서로 상속 관계가 아니다. 클래스는 부모가 하나뿐이므로 <code>Manager</code> 타입 변수가 가리키는 객체(<code>Manager</code> 또는 그 하위 클래스의 객체)가 동시에 <code>Engineer</code>일 방법은 없다. 컴파일러는 이것을 타입만 보고 판단할 수 있으므로 실행까지 가지 않고 막는다. 반면 <code>Employee</code>에서 <code>Manager</code>로의 캐스팅은 성공할 수도 실패할 수도 있어서, 컴파일은 통과시키고 판단을 실행 시점으로 미룬다.</p>
+
+<h3>다운캐스팅과 ClassCastException</h3>
+
+<p>다운캐스팅이 실행 시점에 실패하면 어떻게 되는가. 다음 코드는 세 번의 다운캐스팅을 한다.</p>
+
+<pre><code class="language-java">public class CceMain {
+    public static void main(String[] args) {
+        Employee e1 = new Manager("문가람", 5_500_000, 2);
+        Manager ok = (Manager) e1;              // 성공: 객체가 실제로 Manager다
+        ok.approve();
+
+        Employee none = null;
+        Manager nothing = (Manager) none;       // 성공: null은 어떤 참조 타입으로도 캐스팅된다
+        System.out.println(nothing);
+
+        Employee e2 = new Employee("오세린", 4_000_000);
+        Manager bad = (Manager) e2;             // 컴파일은 되지만 실행 중에 예외가 난다
+        bad.approve();                          // 여기까지 오지 못한다
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">문가람: 결재한다 (팀원 2명)
+null
+Exception in thread "main" java.lang.ClassCastException: class Employee cannot be cast to class Manager (Employee and Manager are in unnamed module of loader 'app')
+	at CceMain.main(CceMain.java:12)</code></pre>
+
+<p>세 캐스팅 모두 소스의 모양은 같다. <code>Employee</code> 타입의 값을 <code>Manager</code>로 캐스팅한다. 컴파일러는 셋을 구분하지 못하고 모두 통과시킨다. 결과를 가르는 것은 실행 시점에 그 참조가 가리키는 객체다. <code>e2</code>가 가리키는 것은 <code>new Employee(...)</code>로 만든 객체이고, 이 객체에는 <code>Manager</code> 부분이 없다. <code>teamSize</code> 필드를 위한 자리 자체가 없는 객체를 <code>Manager</code>로 취급하게 두면 <code>bad.approve()</code>가 존재하지 않는 필드를 읽게 된다. JVM은 그 전에, 캐스팅하는 지점에서 <code>ClassCastException</code>을 던져 막는다.</p>
+
+<pre class="diagram">(Manager) e1                              (Manager) e2
+
+e1 ──▶ Manager 객체                       e2 ──▶ Employee 객체
+        ┌────────────────────┐                    ┌────────────────────┐
+        │ Employee 부분      │                    │ Employee 부분      │
+        ├────────────────────┤                    └────────────────────┘
+        │ Manager 부분       │                      Manager 부분이 없다
+        └────────────────────┘
+   객체의 클래스 Manager는                    객체의 클래스 Employee는
+   Manager와 같다 → 통과                      Manager도, 그 하위 클래스도 아니다
+                                              → ClassCastException</pre>
+
+<p>검사 규칙은 JVMS의 <code>checkcast</code> 항목에 적혀 있다. 참조가 null이면 아무것도 하지 않고 통과한다. null이 아니면, 객체의 클래스를 S, 캐스팅하려는 클래스 타입을 T라 할 때 S가 T와 같은 클래스이거나 T의 하위 클래스여야 한다. 그렇지 않으면 <code>ClassCastException</code>을 던진다. 한 문장으로 줄이면 "객체의 클래스에서 부모 방향으로 올라가다 T를 만나면 성공"이다. <code>Manager</code> 객체는 <code>Manager</code>, <code>Employee</code>, <code>Object</code> 어느 것으로도 캐스팅된다. <code>Employee</code> 객체는 <code>Employee</code>와 <code>Object</code>로만 캐스팅된다.</p>
+
+<p>이제 업캐스팅이 항상 안전하고 다운캐스팅이 위험한 이유를 메모리 구조로 말할 수 있다. 객체를 생성하면 그 클래스와 모든 조상 클래스의 부분이 함께 만들어진다. 그래서 어떤 객체든 자기 조상 타입으로는 언제나 취급할 수 있다. 하지만 자손 클래스의 부분은 만들어지지 않는다. 부모 타입 변수가 가리키는 객체에 특정 자식의 부분이 들어 있는지는 그 객체가 무엇으로 생성됐는지에 달려 있고, 변수의 타입만으로는 알 수 없다.</p>
+
+<p>이 차이는 오류가 발견되는 시점의 차이이기도 하다. 잘못된 업캐스팅이라는 것은 없고, 타입이 맞지 않는 대입은 컴파일 오류로 드러난다. 잘못된 다운캐스팅은 컴파일을 통과하고, 그 코드가 실제로 실행되는 순간에야 예외로 드러난다. 그 코드가 특정 조건에서만 실행된다면 테스트에서 발견되지 않고 운영 환경에서 처음 터질 수 있다. 다운캐스팅을 쓸 때 반드시 객체의 타입을 먼저 확인해야 하는 이유다.</p>
+
+<aside class="note"><code>ClassCastException</code>은 <code>RuntimeException</code>의 하위 클래스다. 예외 메시지의 형식은 명세가 정한 것이 아니라 JDK 구현에 따른 것이며, 위 출력은 JDK 21에서 얻은 것이다. 객체의 클래스와 캐스팅하려던 클래스가 모두 적혀 있어서, 어떤 객체가 예상과 다르게 들어왔는지 바로 알 수 있다.</aside>
+
+<x-visual id="java-basic-09-downcast-check" title="다운캐스팅의 성공과 실패를 가르는 객체의 실제 클래스" kind="비교 다이어그램" ratio="16:9">
+<x-hint>같은 (Manager) 캐스팅이라도 참조가 가리키는 객체가 Manager면 통과하고 Employee면 ClassCastException이 난다는 것을 객체 내부 구조의 차이로 보여 준다.</x-hint>
+<x-prompt>흰 배경의 좌우 비교 다이어그램. 가운데 위에 공통 코드 상자 "(Manager) e". 왼쪽 절반 제목 "성공": 변수 칸 "e" 에서 화살표가 둥근 사각형 객체로 간다. 객체는 위아래 두 층으로, 위층 파랑 "Employee 부분", 아래층 주황 "Manager 부분". 객체 위 꼬리표 "객체의 클래스: Manager". 객체 아래에 초록 체크 표시와 라벨 "checkcast 통과". 오른쪽 절반 제목 "실패": 변수 칸 "e" 에서 화살표가 둥근 사각형 객체로 간다. 이 객체는 위층 파랑 "Employee 부분" 만 있고, 아래층 자리는 점선 테두리의 빈 칸으로 그리며 안에 "Manager 부분 없음". 객체 위 꼬리표 "객체의 클래스: Employee". 객체 아래에 빨간 X 표시와 라벨 "ClassCastException". 색은 파랑, 주황, 초록, 빨강만 사용하고 글자는 고딕체로 선명하게.</x-prompt>
+<x-caption>다운캐스팅의 성패는 변수의 타입이 아니라 객체가 무엇으로 생성됐는지에 달려 있다.</x-caption>
+</x-visual>
+
+<h3>instanceof와 패턴 매칭</h3>
+
+<p>다운캐스팅 전에 객체의 타입을 확인하는 연산자가 <code>instanceof</code>다. <code>참조 instanceof 타입</code>의 형태로 쓰고 결과는 boolean이다. JLS §15.20.2는 그 의미를 캐스팅으로 정의한다. 참조가 null이면 결과는 false다. null이 아니면, 그 값을 해당 타입으로 캐스팅했을 때 <code>ClassCastException</code>이 나지 않으면 true, 나면 false다. 즉 <code>instanceof</code>는 "캐스팅해도 안전한가"를 예외 없이 미리 물어보는 연산자다.</p>
+
+<pre><code class="language-java">public class InstanceofMain {
+    public static void main(String[] args) {
+        Employee e1 = new Employee("오세린", 4_000_000);
+        Employee e2 = new Manager("문가람", 5_500_000, 2);
+        Employee e3 = null;
+
+        System.out.println(e1 instanceof Employee);   // true
+        System.out.println(e1 instanceof Manager);    // false
+        System.out.println(e2 instanceof Employee);   // true
+        System.out.println(e2 instanceof Manager);    // true
+        System.out.println(e2 instanceof Engineer);   // false
+        System.out.println(e2 instanceof Object);     // true
+        System.out.println(e3 instanceof Employee);   // false: null
+
+        call(e1);
+        call(e2);
+        call(new Engineer("나도윤", 4_500_000, "Kotlin"));
+    }
+
+    static void call(Employee employee) {
+        employee.work();
+        if (employee instanceof Manager) {
+            Manager manager = (Manager) employee;     // 검사한 뒤이므로 안전하다
+            manager.approve();
+        } else if (employee instanceof Engineer) {
+            ((Engineer) employee).deploy();
+        }
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">true
+false
+true
+true
+false
+true
+false
+오세린: 업무를 처리한다
+문가람: 업무를 처리한다
+문가람: 결재한다 (팀원 2명)
+나도윤: 업무를 처리한다
+나도윤: Kotlin 서비스를 배포한다</code></pre>
+
+<p>결과를 예측하는 요령은 대입으로 바꿔 생각하는 것이다. <code>x instanceof T</code>는 "x가 가리키는 객체를 T 타입 변수에 담을 수 있는가"와 같다. <code>e2</code>가 가리키는 것은 <code>Manager</code> 객체이고, <code>Manager</code> 객체는 <code>Manager</code>, <code>Employee</code>, <code>Object</code> 타입 변수에 모두 담을 수 있으므로 셋 다 true다. <code>Engineer</code> 타입 변수에는 담을 수 없으므로 false다. 기준은 변수 <code>e2</code>의 타입(<code>Employee</code>)이 아니라 객체의 클래스(<code>Manager</code>)다. <code>e2 instanceof Employee</code>가 true라는 점도 눈여겨보자. <code>instanceof</code>는 "정확히 그 클래스인가"가 아니라 "그 타입으로 취급할 수 있는가"를 묻는다.</p>
+
+<p>컴파일러는 캐스팅과 같은 규칙을 <code>instanceof</code>에도 적용한다. 결과가 true일 가능성이 전혀 없는 검사는 컴파일 오류다. <code>Manager</code> 타입 변수 <code>m</code>에 대해 <code>m instanceof Engineer</code>라고 쓰면 "incompatible types: Manager cannot be converted to Engineer" 오류가 난다. 바이트코드에서는 캐스팅의 <code>checkcast</code>에 대응하는 <code>instanceof</code> 명령이 쓰인다. JVMS §6.5에 적힌 두 명령의 판정 규칙은 같고, JVMS는 둘이 null의 취급, 검사가 실패했을 때의 동작(예외를 던지느냐, 결과 값을 스택에 올리느냐), 피연산자 스택에 미치는 효과에서 다르다고 설명한다.</p>
+
+<h4>패턴 매칭: 검사와 캐스팅을 한 번에</h4>
+
+<p>위의 <code>call</code> 메서드에는 반복이 있다. <code>Manager</code>라는 타입 이름이 검사에 한 번, 변수 선언에 한 번, 캐스팅에 한 번, 모두 세 번 나온다. 검사한 타입과 캐스팅하는 타입을 다르게 쓰는 실수가 끼어들 여지도 있다. Java 16에서 정식 기능이 된 <b>instanceof 패턴 매칭</b>(JEP 394)은 이 셋을 하나로 합친다.</p>
+
+<pre><code class="language-java">public class PatternMain {
+    public static void main(String[] args) {
+        call(new Manager("문가람", 5_500_000, 2));
+        call(new Engineer("나도윤", 4_500_000, "Kotlin"));
+        call(new Employee("오세린", 4_000_000));
+        System.out.println(bigTeam(new Manager("문가람", 5_500_000, 2)));
+        System.out.println(bigTeam(new Manager("한지우", 5_000_000, 12)));
+        System.out.println(teamSizeOf(new Employee("오세린", 4_000_000)));
+        System.out.println(teamSizeOf(new Manager("한지우", 5_000_000, 12)));
+    }
+
+    static void call(Employee employee) {
+        if (employee instanceof Manager manager) {        // 검사 + 캐스팅 + 변수 선언
+            manager.approve();
+        } else if (employee instanceof Engineer engineer) {
+            engineer.deploy();
+        } else {
+            employee.work();
+        }
+    }
+
+    static boolean bigTeam(Employee employee) {
+        // &&의 오른쪽은 왼쪽이 true일 때만 평가되므로 manager를 쓸 수 있다
+        return employee instanceof Manager manager && manager.teamSize >= 10;
+    }
+
+    static int teamSizeOf(Employee employee) {
+        if (!(employee instanceof Manager manager)) {
+            return 0;                                     // 여기서는 manager를 쓸 수 없다
+        }
+        return manager.teamSize;                          // 여기서는 쓸 수 있다
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">문가람: 결재한다 (팀원 2명)
+나도윤: Kotlin 서비스를 배포한다
+오세린: 업무를 처리한다
+false
+true
+0
+12</code></pre>
+
+<p><code>employee instanceof Manager manager</code>에서 <code>Manager manager</code> 부분을 타입 패턴이라고 한다. 검사가 성공하면 <code>employee</code>의 값이 <code>Manager</code>로 캐스팅되어 새 지역 변수 <code>manager</code>에 대입된다. 실패하면 <code>manager</code>에는 아무것도 대입되지 않는다.</p>
+
+<p>그렇다면 <code>manager</code>는 어디서 쓸 수 있는가. 일반 지역 변수처럼 "선언한 블록 안"이 아니다. JEP 394는 이를 흐름 기반 스코프(flow scoping)라고 설명한다. <b>패턴 변수는 검사가 성공했음이 확실한 곳에서만 쓸 수 있다.</b> final 회차에서 본 확정 할당과 같은 종류의 흐름 분석이다. 세 메서드가 그 규칙을 하나씩 보여 준다.</p>
+
+<ul>
+<li><code>call</code>: if의 본문은 조건이 true일 때만 실행되므로 그 안에서 <code>manager</code>를 쓸 수 있다. else 쪽에서는 쓸 수 없다.</li>
+<li><code>bigTeam</code>: <code>&&</code>의 오른쪽은 왼쪽이 true일 때만 평가된다. 따라서 오른쪽에서 <code>manager</code>를 쓸 수 있다. <code>||</code>로 바꾸면 오른쪽은 왼쪽이 false일 때 평가되므로 <code>manager</code>에 값이 없고, "cannot find symbol" 컴파일 오류가 난다.</li>
+<li><code>teamSizeOf</code>: 조건을 부정하고 if 본문에서 메서드를 빠져나가면, if 문 다음에 도달했다는 것 자체가 검사가 성공했다는 뜻이다. 그래서 if 문 <b>뒤</b>에서 <code>manager</code>를 쓸 수 있다.</li>
+</ul>
+
+<p>패턴 매칭이 새로운 실행 방식을 도입한 것은 아니다. <code>call</code> 메서드의 바이트코드를 보면 직접 쓴 코드와 같은 두 명령의 조합이다.</p>
+
+<pre data-label="javap -c -p PatternMain (call 메서드의 앞부분)"><code class="language-text">       0: aload_0
+       1: instanceof    #7                  // class Manager
+       4: ifeq          19
+       7: aload_0
+       8: checkcast     #7                  // class Manager
+      11: astore_1
+      12: aload_1
+      13: invokevirtual #65                 // Method Manager.approve:()V</code></pre>
+
+<p><code>instanceof</code>로 검사하고, 통과하면 <code>checkcast</code>로 캐스팅해 지역 변수에 저장한다. 패턴 매칭은 컴파일러가 이 관용구를 대신 써 주면서 타입 이름의 반복과 불일치 가능성을 없애 준 문법이다.</p>
+
+<aside class="note">Java 16에서 이 기능이 확정될 때는 왼쪽 식의 타입이 패턴 타입의 하위 타입인 경우(예: <code>Manager</code> 타입 변수 <code>m</code>에 대한 <code>m instanceof Employee e</code>)를 항상 성공하는 무의미한 검사로 보아 컴파일 오류로 정했다(JEP 394). Java 21의 명세(JLS §15.20.2)에는 이 제한이 없으며, JDK 21의 <code>javac</code>는 이런 코드를 컴파일한다.</aside>
+
+<p><code>instanceof</code>가 있으면 다운캐스팅은 안전해진다. 그렇다고 타입을 검사해 분기하는 코드가 좋은 코드라는 뜻은 아니다. <code>call</code> 메서드는 직원의 종류가 늘어날 때마다 분기를 추가해야 하고, 추가를 잊어도 컴파일러가 알려 주지 않는다. 이 회차의 첫머리에서 본 "타입마다 따로 쓰는 코드"가 모양만 바뀌어 다시 나타난 것이다. 다형성의 두 번째 장치가 이 문제를 푼다.</p>
+
+<h3>다형성과 메서드 오버라이딩</h3>
+
+<p>부모 타입 변수로는 부모에 선언된 멤버만 쓸 수 있다고 했다. 그런데 그 멤버가 자식에서 다시 정의돼 있다면 어느 쪽이 쓰이는가. 필드와 메서드의 답이 다르다. 확인을 위해 <code>Employee</code>와 <code>Manager</code>에 같은 이름의 필드 <code>title</code>을 추가하고, <code>Employee</code>에 월급을 출력하는 메서드를 하나 더한다.</p>
+
+<pre><code class="language-java">public class Employee {
+    String title = "사원";
+    // ... name, baseSalary, 생성자, work(), monthlyPay()는 앞과 같다
+
+    void printPay() {
+        System.out.println(name + " 급여: " + monthlyPay());
+    }
+}
+
+public class Manager extends Employee {
+    String title = "관리자";          // 필드 숨김
+    // ... teamSize, 생성자, approve(), 오버라이딩한 monthlyPay()는 앞과 같다
+}</code></pre>
+
+<pre><code class="language-java">public class OverrideMain {
+    public static void main(String[] args) {
+        Manager manager = new Manager("한지우", 5_000_000, 4);
+        Employee employee = manager;                 // 같은 객체를 부모 타입으로도 가리킨다
+
+        System.out.println(manager.title);
+        System.out.println(employee.title);
+        System.out.println(manager.monthlyPay());
+        System.out.println(employee.monthlyPay());
+        employee.printPay();
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">관리자
+사원
+5400000
+5400000
+한지우 급여: 5400000</code></pre>
+
+<p><code>manager</code>와 <code>employee</code>는 같은 객체를 가리킨다. 그런데 <code>title</code>을 읽으면 변수에 따라 결과가 다르고, <code>monthlyPay()</code>를 호출하면 변수와 상관없이 결과가 같다.</p>
+
+<p><b>필드는 변수의 타입을 따른다.</b> 앞 회차에서 본 대로 이 객체 안에는 <code>title</code> 필드가 두 개 있다. <code>employee.title</code>에서 컴파일러는 <code>employee</code>의 타입 <code>Employee</code>를 보고 <code>Employee</code>에 선언된 <code>title</code>로 확정한다. 실행 시점에 객체가 <code>Manager</code>라는 사실은 필드 접근에 영향을 주지 않는다(JLS §15.11.1).</p>
+
+<p><b>인스턴스 메서드는 객체의 클래스를 따른다.</b> <code>employee.monthlyPay()</code>에서 컴파일러는 <code>Employee</code>에 <code>monthlyPay()</code>가 있는지만 확인한다. 어느 구현을 실행할지는 실행 시점에 객체의 클래스 <code>Manager</code>에서 출발해 찾는다. <code>Manager</code>가 이 메서드를 오버라이딩했으므로 <code>Manager.monthlyPay()</code>가 실행되어 5,400,000이 나온다. 부모 타입 변수로 호출했는데도 자식의 메서드가 실행된다. <b>오버라이딩된 메서드가 항상 우선한다</b>는 것이 다형성의 핵심 규칙이다.</p>
+
+<p>마지막 줄은 이 규칙이 얼마나 철저한지 보여 준다. <code>printPay()</code>는 <code>Employee</code>에만 있는 메서드다. 그 본문에서 호출하는 <code>monthlyPay()</code>는 <code>this.monthlyPay()</code>이고, <code>this</code>가 가리키는 객체의 클래스는 <code>Manager</code>다. 그래서 <code>Employee</code>의 코드 안에서 호출했는데도 <code>Manager.monthlyPay()</code>가 실행된다. 부모 클래스를 작성한 사람은 <code>Manager</code>라는 클래스가 생길 줄 몰랐더라도, 부모의 코드는 나중에 만들어진 자식의 메서드를 호출하게 된다.</p>
+
+<p>이제 처음의 문제로 돌아갈 수 있다. 월급 합계를 구하는 코드는 직원의 종류를 구분할 필요가 없다.</p>
+
+<pre><code class="language-java">public class PayrollMain {
+    public static void main(String[] args) {
+        Employee[] staff = {
+                new Employee("오세린", 4_000_000),
+                new Manager("한지우", 5_000_000, 4),
+                new Engineer("나도윤", 4_500_000, "Kotlin")
+        };
+
+        int total = 0;
+        for (Employee employee : staff) {
+            total += employee.monthlyPay();     // 객체마다 실행되는 메서드가 다르다
+        }
+        System.out.println(total);
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">13900000</code></pre>
+
+<p>배열의 타입은 <code>Employee[]</code>이고 요소는 세 가지 클래스의 객체다. 다형적 참조 덕분에 한 배열에 담을 수 있다. 반복문 안의 <code>employee.monthlyPay()</code>는 소스에서는 한 줄이지만, 첫 번째 객체에 대해서는 <code>Employee</code>의 구현이(4,000,000), 두 번째에 대해서는 <code>Manager</code>의 구현이(5,400,000), 세 번째에 대해서는 <code>Engineer</code>가 오버라이딩하지 않았으므로 다시 <code>Employee</code>의 구현이(4,500,000) 실행된다. 합은 13,900,000이다. 디자이너 클래스가 추가되어도 이 반복문은 고칠 필요가 없다. <code>instanceof</code>로 분기하던 코드와의 차이가 여기에 있다. 분기를 호출하는 쪽이 하는 것이 아니라, 객체가 자기 클래스에 맞는 메서드를 실행하는 것으로 대신한다.</p>
+
+<h3>한 층 아래 ①: invokevirtual과 메서드 선택</h3>
+
+<p>"실행 시점에 객체의 클래스를 보고 메서드를 고른다"는 것을 JVM은 어떻게 수행하는가. <code>OverrideMain</code>의 바이트코드에서 필드 접근과 메서드 호출 부분을 나란히 보자.</p>
+
+<pre data-label="javap -c OverrideMain (일부)"><code class="language-text">      18: aload_1
+      19: getfield      #21                 // Field Manager.title:Ljava/lang/String;
+      ...
+      28: aload_2
+      29: getfield      #31                 // Field Employee.title:Ljava/lang/String;
+      ...
+      38: aload_1
+      39: invokevirtual #34                 // Method Manager.monthlyPay:()I
+      ...
+      48: aload_2
+      49: invokevirtual #41                 // Method Employee.monthlyPay:()I</code></pre>
+
+<p>지역 변수 슬롯 1이 <code>manager</code>, 슬롯 2가 <code>employee</code>다. 두 슬롯에는 같은 참조값이 들어 있다. 컴파일러가 바이트코드에 적은 것은 변수의 컴파일 타임 타입에 따른 기호 참조다. 필드는 <code>Manager.title</code>과 <code>Employee.title</code>, 메서드는 <code>Manager.monthlyPay</code>와 <code>Employee.monthlyPay</code>로 서로 다르게 적혔다. 여기까지는 필드와 메서드가 똑같이 취급된다. 차이는 JVM이 이 명령을 실행하는 방식에서 생긴다.</p>
+
+<p><code>getfield</code>는 기호 참조를 해석해 필드를 하나 정하면(JVMS §5.4.3.2) 그것으로 끝이다. <code>Employee.title</code>이라는 참조는 <code>Employee</code> 클래스에서 <code>title</code>을 찾아 그 필드로 확정되고, 스택 위의 객체에서 그 필드의 값을 읽는다. 객체의 클래스가 무엇인지는 묻지 않는다. 그래서 "사원"이 나온다.</p>
+
+<p><code>invokevirtual</code>은 한 단계가 더 있다. JVMS §6.5의 설명은 이렇다. 먼저 기호 참조를 해석해 메서드를 정한다(해석된 메서드). 그다음 스택 위 참조가 가리키는 <b>객체의 클래스를 C</b>라 하고, C와 해석된 메서드에 대해 <b>메서드 선택</b>(JVMS §5.4.6)을 수행한다. 선택된 메서드가 실제로 호출되는 메서드다. 선택 규칙 가운데 클래스 계층에 관한 부분은 다음과 같다. 슈퍼클래스에서도 찾지 못했을 때 슈퍼인터페이스의 메서드를 살피는 마지막 단계는 여기서 생략했다.</p>
+
+<figure class="flow-figure"><figcaption>invokevirtual의 메서드 선택 (JVMS §5.4.6)</figcaption><ol class="flow">
+<li><strong>private이면 그대로</strong><span>해석된 메서드가 private이면 그 메서드가 선택된다. private 메서드는 오버라이딩될 수 없기 때문이다.</span></li>
+<li><strong>객체의 클래스 C에서 찾기</strong><span>C가 해석된 메서드를 오버라이딩할 수 있는 인스턴스 메서드(이름과 디스크립터가 같고 접근 조건을 만족하는 것)를 선언하고 있으면 그 메서드가 선택된다.</span></li>
+<li><strong>슈퍼클래스로 올라가기</strong><span>없으면 C의 직접 슈퍼클래스, 그 슈퍼클래스의 슈퍼클래스 순으로 올라가며 같은 조건의 메서드를 찾는다. 처음 찾은 것이 선택된다.</span></li>
+</ol></figure>
+
+<p>49번 줄의 <code>invokevirtual Employee.monthlyPay:()I</code>에 적용해 보자. 해석된 메서드는 <code>Employee.monthlyPay()</code>다. 스택 위 참조가 가리키는 객체의 클래스 C는 <code>Manager</code>다. <code>Manager</code>는 이름이 <code>monthlyPay</code>이고 디스크립터가 <code>()I</code>인 인스턴스 메서드를 선언하고 있으므로 2단계에서 <code>Manager.monthlyPay()</code>가 선택된다. 같은 명령이 <code>Engineer</code> 객체에 대해 실행되면 C는 <code>Engineer</code>이고, <code>Engineer</code>에는 그런 메서드가 없으므로 3단계에서 슈퍼클래스 <code>Employee</code>로 올라가 <code>Employee.monthlyPay()</code>가 선택된다.</p>
+
+<p>한 줄의 바이트코드가 실행될 때마다 다른 메서드에 도달할 수 있다는 점이 중요하다. 어느 메서드를 호출할지가 컴파일 시점이 아니라 실행 시점에, 그때 스택에 올라와 있는 객체에 의해 정해진다. 이것을 <b>동적 디스패치(dynamic dispatch)</b> 또는 가상 메서드 호출(virtual method invocation)이라고 한다. 명령의 이름 invokevirtual이 여기서 왔다. JLS §15.12.4.4도 같은 과정을 언어 수준에서 "대상 객체의 실제 런타임 클래스에서 출발하는 동적 메서드 탐색"으로 규정한다.</p>
+
+<p>선택의 기준이 객체이므로, 객체가 없으면 선택도 할 수 없다. 참조가 null이면 <code>invokevirtual</code>은 <code>NullPointerException</code>을 던진다(JVMS §6.5). null 참조에 대한 메서드 호출이 예외가 되는 것은 "어느 메서드를 실행할지 물어볼 객체가 없다"는 상황의 직접적인 결과다.</p>
+
+<p>메서드를 호출하는 바이트코드 명령은 여러 가지이고, 객체의 클래스를 보는지 여부로 나뉜다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>명령</th><th>쓰이는 곳</th><th>호출 대상이 정해지는 방식</th></tr></thead><tbody>
+<tr><td><code>invokestatic</code></td><td>static 메서드 호출</td><td>해석된 메서드 그대로. 객체가 필요 없다.</td></tr>
+<tr><td><code>invokespecial</code></td><td>생성자 호출, <code>super.메서드()</code> 호출</td><td>객체의 클래스를 보지 않는다. 지정된 클래스(또는 직접 슈퍼클래스)에서 출발해 찾는다.</td></tr>
+<tr><td><code>invokevirtual</code></td><td>클래스 타입을 통한 인스턴스 메서드 호출</td><td>객체의 클래스를 기준으로 선택한다.</td></tr>
+<tr><td><code>invokeinterface</code></td><td>인터페이스 타입을 통한 메서드 호출(다음 회차)</td><td>객체의 클래스를 기준으로 선택한다.</td></tr>
+</tbody></table></div>
+
+<p>앞 회차에서 <code>super.monthlyPay()</code>가 <code>invokespecial</code>로 컴파일되는 것을 봤다. 그 이유가 이 표에 있다. <code>invokevirtual</code>이었다면 객체의 클래스 <code>Manager</code>에서 다시 <code>Manager.monthlyPay()</code>가 선택되어 무한히 자신을 호출했을 것이다.</p>
+
+<x-visual id="java-basic-09-compile-runtime" title="컴파일러가 보는 타입과 JVM이 보는 객체" kind="2단계 흐름도" ratio="16:9">
+<x-hint>employee.monthlyPay() 한 줄에 대해 컴파일러는 변수의 타입으로 메서드의 존재를 확인하고, JVM은 객체의 클래스로 실제 구현을 선택한다는 두 단계를 나란히 보여 준다.</x-hint>
+<x-prompt>흰 배경의 좌우 2단계 흐름도. 맨 위 가운데에 코드 상자 "employee.monthlyPay()". 왼쪽 단 제목 "컴파일 시점: javac". 그 아래 상자 "변수의 타입 = Employee" 에서 화살표가 내려가 상자 "Employee 에 monthlyPay() 가 있는가" 로, 다시 화살표가 내려가 결과 상자 "invokevirtual Employee.monthlyPay" 로 간다. 오른쪽 단 제목 "실행 시점: JVM". 그 아래 상자 "객체의 클래스 = Manager" 에서 화살표가 내려가 상자 "Manager 에서 오버라이딩한 메서드를 찾는다" 로, 다시 화살표가 내려가 초록색 결과 상자 "Manager.monthlyPay() 실행" 으로 간다. 왼쪽 단의 결과 상자에서 오른쪽 단의 첫 상자로 가는 가로 점선 화살표에 라벨 "클래스 파일". 왼쪽 단은 파랑 계열, 오른쪽 단은 초록 계열로 구분하고 글자는 고딕체로 선명하게.</x-prompt>
+<x-caption>컴파일러는 변수의 타입으로 "호출할 수 있는가"를 정하고, JVM은 객체의 클래스로 "무엇을 실행할 것인가"를 정한다.</x-caption>
+</x-visual>
+
+<h3>한 층 아래 ②: 가상 메서드 테이블</h3>
+
+<p>명세의 메서드 선택 규칙은 "객체의 클래스에서 시작해 슈퍼클래스로 올라가며 찾는다"는 탐색으로 적혀 있다. 그런데 메서드 호출은 프로그램에서 가장 자주 일어나는 동작이다. 호출할 때마다 클래스 계층을 거슬러 올라가며 이름과 디스크립터를 비교한다면 비용이 크다. 명세는 결과가 무엇이어야 하는지를 정할 뿐 어떻게 구현할지는 정하지 않는다. 여기서부터는 <b>OpenJDK의 HotSpot 구현(21 기준)</b>에 한정된 이야기다.</p>
+
+<p>HotSpot은 클래스마다 <b>가상 메서드 테이블(virtual method table, vtable)</b>을 둔다. HotSpot 용어집은 객체 헤더의 klass pointer가 가리키는 클래스 메타데이터에 C++ 방식의 vtable이 들어 있다고 설명하고, 소스 코드의 주석도 vtable이 클래스 메타데이터(InstanceKlass) 안에 포함돼 있다고 적고 있다. vtable은 메서드를 가리키는 칸들의 배열이다. 클래스가 링크될 때 채워지며, 그 방식은 OpenJDK 소스(klassVtable.cpp)의 주석에 다음과 같이 정리돼 있다.</p>
+
+<ul>
+<li>슈퍼클래스의 vtable을 이 클래스 vtable의 앞부분에 그대로 복사한다.</li>
+<li>이 클래스의 메서드 하나하나를 슈퍼클래스의 것과 비교한다. 오버라이딩이면 복사해 온 칸의 내용을 자기 메서드로 <b>교체</b>하고, 아니면 테이블 <b>끝에 새 칸을 추가</b>한다.</li>
+<li>private 메서드, static 메서드, 생성자는 vtable에 넣지 않는다. final 메서드는 새 칸을 받지 않으며, 슈퍼클래스의 메서드를 오버라이딩한 경우에만 그 칸을 재사용한다.</li>
+</ul>
+
+<p>이 규칙의 결과로 중요한 성질 하나가 생긴다. <b>어떤 메서드의 칸 번호는 그 메서드를 처음 선언한 클래스와 모든 하위 클래스에서 같다.</b> 직원 클래스들의 vtable을 그려 보면 다음과 같다. 칸 번호 k는 설명을 위한 것이고, 실제 번호와 칸의 순서는 JVM이 정한다. 앞 절에서 추가한 <code>printPay()</code>는 그림에서 생략했다.</p>
+
+<pre class="diagram">Employee의 vtable             Manager의 vtable                  Engineer의 vtable
+┌──────────────────────┐      ┌───────────────────────────┐     ┌──────────────────────┐
+│ (Object에서 온 칸들) │      │ (Object에서 온 칸들)      │     │ (Object에서 온 칸들) │
+│ [k]   Employee.work  │      │ [k]   Employee.work       │     │ [k]   Employee.work  │
+│ [k+1] Employee.      │      │ [k+1] Manager.monthlyPay  │     │ [k+1] Employee.      │
+│         monthlyPay   │      │         ← 교체됨          │     │         monthlyPay   │
+└──────────────────────┘      │ [k+2] Manager.approve     │     │ [k+2] Engineer.deploy│
+                              │         ← 추가됨          │     │         ← 추가됨     │
+                              └───────────────────────────┘     └──────────────────────┘
+
+monthlyPay의 칸 번호는 세 클래스에서 모두 k+1이다.</pre>
+
+<p>호출은 이 성질을 이용한다. <code>invokevirtual Employee.monthlyPay</code>의 기호 참조를 해석하면 <code>Employee.monthlyPay()</code>라는 메서드가 정해지고, 그 메서드에는 vtable 번호(k+1)가 붙어 있다. 메서드 선택은 계층을 탐색하는 대신 이 번호를 쓴다. HotSpot의 소스(linkResolver.cpp)에 적힌 대로, 수신 객체의 클래스에서 그 vtable 번호의 칸에 있는 메서드를 꺼내면 그것이 선택된 메서드다.</p>
+
+<figure class="flow-figure"><figcaption>HotSpot에서 employee.monthlyPay()가 실행되는 경로</figcaption><ol class="flow">
+<li><strong>참조에서 객체로</strong><span>스택 위의 참조값을 따라 힙의 객체에 도달한다.</span></li>
+<li><strong>객체에서 클래스로</strong><span>객체 헤더의 klass pointer를 따라 그 객체의 클래스 메타데이터에 도달한다. 객체가 Manager라면 Manager의 메타데이터다.</span></li>
+<li><strong>vtable의 정해진 칸 읽기</strong><span>그 클래스의 vtable에서 번호 k+1의 칸을 읽는다. Manager의 vtable이면 Manager.monthlyPay, Engineer의 vtable이면 Employee.monthlyPay가 들어 있다.</span></li>
+<li><strong>호출</strong><span>그 칸이 가리키는 메서드를 호출한다.</span></li>
+</ol></figure>
+
+<p>클래스 계층을 올라가는 탐색은 vtable을 <b>만들 때</b> 한 번 이루어지고, 호출할 때는 배열의 칸 하나를 읽는 일로 바뀐다. 명세의 "C에서 찾고, 없으면 슈퍼클래스로"라는 규칙과 결과가 같다. 자식이 오버라이딩했으면 그 칸에 자식의 메서드가 들어 있고, 하지 않았으면 부모에게서 복사해 온 내용이 그대로 있기 때문이다.</p>
+
+<p>부모 타입 변수로 자식의 고유 메서드를 호출할 수 없는 이유도 이 그림에서 다시 읽을 수 있다. <code>Manager</code>의 vtable에는 <code>approve</code>의 칸이 있다. 그러나 <code>Employee</code> 타입으로 컴파일하는 코드는 <code>Employee</code>의 vtable에 있는 칸 번호만 알 수 있고, k+2번 칸은 <code>Employee</code>에 존재하지 않는다. 게다가 같은 k+2번 칸이 <code>Engineer</code>에서는 <code>deploy</code>다. 컴파일러가 변수의 타입에 있는 메서드만 허용하는 것은 이런 호출이 성립하지 않기 때문이다.</p>
+
+<x-visual id="java-basic-09-vtable-dispatch" title="HotSpot의 가상 메서드 테이블을 통한 동적 디스패치" kind="구조도" ratio="16:9">
+<x-hint>참조 → 객체 → 클래스 메타데이터 → vtable의 같은 번호 칸 → 메서드 코드로 이어지는 경로와, 같은 번호 칸에 클래스마다 다른 메서드가 들어 있음을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 구조도. 왼쪽에 변수 칸 "employee" 가 있고, 화살표가 오른쪽의 둥근 사각형 "Manager 객체" 로 간다. 객체 맨 위 칸에 "klass pointer" 라벨. 그 칸에서 화살표가 오른쪽의 큰 상자 "Manager 클래스 메타데이터" 로 간다. 이 상자 안에 세로로 칸이 쌓인 표 "vtable" 이 있고 칸은 위에서부터 "k: work", "k+1: monthlyPay", "k+2: approve". 가운데 칸 "k+1: monthlyPay" 를 주황색으로 강조하고, 거기서 화살표가 맨 오른쪽 상자 "Manager.monthlyPay 코드" 로 간다. 아래쪽에는 흐린 회색으로 비교용 표 하나를 더 그린다: 제목 "Engineer 의 vtable", 칸은 "k: work", "k+1: monthlyPay", "k+2: deploy" 이고 가운데 칸에서 나온 회색 화살표가 "Employee.monthlyPay 코드" 상자로 간다. 두 표의 가운데 칸을 잇는 세로 점선에 라벨 "같은 번호, 다른 메서드". 그림 왼쪽 아래 구석에 작은 글씨 "HotSpot 구현". 색은 주황, 남색, 회색만 사용하고 글자는 고딕체로 선명하게.</x-prompt>
+<x-caption>HotSpot은 클래스마다 vtable을 두고, 호출할 때 객체의 클래스에서 정해진 번호의 칸을 읽는다. 이것은 명세가 아니라 구현 방식이다.</x-caption>
+</x-visual>
+
+<p>JIT 컴파일러는 여기서 더 나아간다. HotSpot 용어집은 클래스 계층 분석(class hierarchy analysis, CHA)을 "가상 호출 지점의 수신 객체에 구현이 하나뿐인지 판단하기 위해 컴파일러가 수행하는 클래스 트리 분석"이라고 정의하고, 하나뿐이면 호출 대상을 인라이닝하거나 정적인 호출 방식을 쓸 수 있다고 설명한다. 어떤 메서드를 오버라이딩한 클래스가 현재 하나도 로드돼 있지 않다면, vtable을 거치지 않고 그 메서드를 직접 호출하는 코드로 컴파일할 수 있다는 뜻이다. 같은 용어집은 컴파일된 코드가 의존하던 가정이 깨지면 그 코드를 버리고 다시 컴파일하는 과정을 역최적화(deoptimization)라고 설명한다. 소스에서 다형적 호출로 보이는 코드가 실행 중에 언제나 테이블 조회를 거치는 것은 아니라는 뜻이다.</p>
+
+<aside class="note">다운캐스팅과 <code>instanceof</code>의 검사에도 비슷한 구현상의 준비가 있다. OpenJDK 21의 소스(klass.hpp)를 보면 각 클래스의 메타데이터가 자신의 조상 클래스들을 깊이 순서대로 담은 배열을 갖고 있고, 주석은 이것이 빠른 하위 타입 검사를 위한 것이라고 설명한다. 이것도 HotSpot의 구현 세부이며 명세의 요구 사항은 아니다.</aside>
+
+<h3>다형적이지 않은 것들</h3>
+
+<p>동적 디스패치는 인스턴스 메서드 호출에만 적용된다. 그 밖의 것은 모두 컴파일 시점의 타입으로 결정된다. 헷갈리기 쉬운 네 가지를 정리한다.</p>
+
+<p><b>필드.</b> 이미 봤듯이 필드 접근에는 메서드 선택에 해당하는 단계가 없다. 부모 타입 변수로 읽으면 부모에 선언된 필드가 읽힌다. 필드를 private으로 두고 메서드로만 접근하게 하는 캡슐화는 이 문제도 함께 해결한다. 메서드는 오버라이딩되므로, 값을 메서드로 읽으면 객체의 클래스에 맞는 결과를 얻는다.</p>
+
+<p><b>static 메서드.</b> static 메서드 호출은 <code>invokestatic</code>으로 컴파일되고 객체를 보지 않는다. 문법상 <code>참조변수.static메서드()</code>도 허용되지만, 이때도 컴파일러는 변수의 타입으로 메서드를 정하고 객체는 쓰지 않는다. 부모 타입 변수로 호출하면 그 변수가 자식 객체를 가리키더라도 부모의 static 메서드가 실행된다. 이런 혼동을 피하려면 static 메서드는 항상 클래스 이름으로 호출한다.</p>
+
+<p><b>private 메서드.</b> private 메서드는 오버라이딩되지 않는다. 메서드 선택 규칙의 첫 단계가 "private이면 그 메서드"였다. 부모의 메서드가 자신의 private 메서드를 호출하면, 자식에 같은 이름의 메서드가 있더라도 부모의 것이 실행된다.</p>
+
+<p><b>오버로딩.</b> 이름이 같고 매개변수가 다른 메서드들 가운데 어느 것을 호출할지는 컴파일러가 <b>인자의 컴파일 타임 타입</b>으로 정한다(JLS §15.12.2). 인자가 실행 시점에 어떤 객체를 가리키는지는 고려되지 않는다.</p>
+
+<pre><code class="language-java">public class OverloadMain {
+    static String rank(Employee employee) {
+        return "직원";
+    }
+
+    static String rank(Manager manager) {
+        return "관리자";
+    }
+
+    public static void main(String[] args) {
+        Manager manager = new Manager("한지우", 5_000_000, 4);
+        Employee employee = manager;
+
+        System.out.println(rank(manager));
+        System.out.println(rank(employee));
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">관리자
+직원</code></pre>
+
+<p>두 호출에 넘긴 것은 같은 <code>Manager</code> 객체다. 그런데 결과가 다르다. <code>rank(employee)</code>에서 인자 식 <code>employee</code>의 컴파일 타임 타입은 <code>Employee</code>이므로 컴파일러는 <code>rank(Employee)</code>를 고르고, 그 선택은 바이트코드에 메서드의 디스크립터로 고정된다. <code>javap</code>로 보면 두 호출은 각각 <code>rank:(LManager;)Ljava/lang/String;</code>과 <code>rank:(LEmployee;)Ljava/lang/String;</code>이라는 서로 다른 메서드에 대한 호출로 적혀 있다. 동적 디스패치가 기준으로 삼는 것은 메서드를 호출받는 객체(점 왼쪽의 객체) 하나뿐이고, 인자로 넘어가는 객체의 클래스는 메서드를 고르는 데 쓰이지 않는다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<ul>
+<li><b>"업캐스팅하면 자식의 필드와 메서드가 사라진다."</b> 객체는 변하지 않는다. 부모 타입 변수로는 자식의 멤버에 접근할 수 없을 뿐이고, 다시 다운캐스팅하면 <code>teamSize</code>의 값도 그대로 있다.</li>
+<li><b>"다운캐스팅은 부모 객체를 자식 객체로 바꿔 준다."</b> 캐스팅은 변환이 아니라 검사다. <code>new Employee(...)</code>로 만든 객체는 어떤 캐스팅으로도 <code>Manager</code>가 되지 않는다. 다운캐스팅이 성공하는 것은 객체가 처음부터 그 자식 타입(또는 더 아래 타입)으로 생성된 경우뿐이다.</li>
+<li><b>"컴파일이 됐으니 캐스팅은 안전하다."</b> 클래스 타입끼리의 캐스팅에서 컴파일러는 두 타입이 상속 관계에 있는지만 확인한다. 실제 객체가 맞는지는 실행해야 드러난다. 다운캐스팅 앞에는 <code>instanceof</code> 검사가 있어야 한다.</li>
+<li><b>"부모 타입 변수로 호출하면 부모의 메서드가 실행된다."</b> 변수의 타입은 호출 가능 여부만 정한다. 실행되는 것은 객체의 클래스에서 오버라이딩한 메서드다. 부모의 구현이 실행되는 것은 자식이 오버라이딩하지 않았을 때뿐이다.</li>
+<li><b>"메서드가 그렇다면 필드도 객체를 따를 것이다."</b> 필드, static 메서드, 오버로딩의 선택은 모두 컴파일 시점의 타입을 따른다.</li>
+<li><b>"instanceof로 타입을 확인하는 것이 다형성을 쓰는 방법이다."</b> 반대에 가깝다. 타입을 확인해 분기하는 코드는 타입이 추가될 때마다 수정해야 한다. 타입마다 달라지는 동작은 오버라이딩으로 표현하고, <code>instanceof</code>와 다운캐스팅은 그것으로 풀 수 없는 경우에 쓴다.</li>
+</ul>
+
+<h3>어디서 다시 만나는가</h3>
+
+<p>이 회차에서 본 예제에는 아직 허점이 있다. <code>Employee</code>를 직접 생성할 수 있고, 자식이 <code>monthlyPay()</code>를 오버라이딩하지 않아도 아무 경고가 없다. 다음 회차의 추상 클래스와 인터페이스는 "이 타입은 직접 생성할 수 없다", "이 메서드는 자식이 반드시 구현해야 한다"를 컴파일러가 강제하게 한다. 인터페이스 타입을 통한 호출이 위 표의 <code>invokeinterface</code>다. 그다음 회차에서는 다형성이 설계에서 어떤 의미를 갖는지, 기존 코드를 고치지 않고 기능을 확장한다는 원칙(OCP)과 함께 본다.</p>
+
+<p>중급 1편의 첫 주제인 <code>Object</code>는 다형성의 끝에 있는 타입이다. 모든 객체는 <code>Object</code> 타입 변수에 담을 수 있다. <code>equals(Object obj)</code>를 오버라이딩할 때 매개변수가 <code>Object</code>이므로, 그 안에서 <code>instanceof</code>로 타입을 확인하고 다운캐스팅하는 코드를 쓰게 된다. <code>System.out.println(객체)</code>가 객체마다 다른 문자열을 출력하는 것도 <code>toString()</code>의 동적 디스패치다. 중급 2편의 컬렉션에서는 <code>List</code> 타입 변수에 <code>ArrayList</code>나 <code>LinkedList</code> 객체를 담아 쓰는 것이 기본 사용법이 된다.</p>
+
+<p>스프링에서는 다형성이 구조의 중심이다. 객체가 필요로 하는 다른 객체를 인터페이스나 부모 타입의 필드로 선언해 두고, 실제로 어떤 구현 객체가 들어올지는 실행 시점에 컨테이너가 정한다. 호출하는 코드는 선언된 타입만 알고, 실행되는 코드는 주입된 객체의 클래스가 결정한다. 앞 회차에서 언급한 프록시도 같은 원리다. 대상 클래스를 상속한 프록시 객체가 대상 타입의 변수에 담기고, 메서드를 호출하면 프록시가 오버라이딩한 메서드가 먼저 실행된다. 컴파일 타임 타입과 런타임 타입을 구분해 읽는 습관은 그때 스택 트레이스와 디버거 화면을 이해하는 데 그대로 쓰인다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>부모 타입 변수는 자식 객체를 가리킬 수 있고, 그때 타입은 둘로 갈린다. 변수의 컴파일 타임 타입은 "무엇을 호출할 수 있는가"를 정하고, 객체의 런타임 클래스는 "무엇이 실행되는가"를 정한다. 캐스팅은 객체를 바꾸지 않으며, 다운캐스팅은 실행 시점에 객체의 클래스를 검사한다. 인스턴스 메서드 호출은 invokevirtual이 객체의 클래스를 기준으로 오버라이딩된 메서드를 선택하고, 필드·static 메서드·오버로딩은 컴파일 시점의 타입으로 정해진다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>다형적 참조</dt><dd>부모 타입의 변수가 자식 타입의 객체를 가리킬 수 있다. 자식 객체는 부모 부분을 모두 포함하므로 이 방향의 대입은 항상 안전하고, 실행 시점에 아무 동작도 필요하지 않다(JLS §5.1.5).</dd>
+<dt>컴파일 타임 타입과 런타임 타입</dt><dd>변수에 선언된 타입과, 그 변수가 실행 중에 가리키는 객체의 클래스. 앞의 것은 그 참조로 쓸 수 있는 멤버를, 뒤의 것은 실제로 실행되는 인스턴스 메서드를 결정한다.</dd>
+<dt>업캐스팅과 다운캐스팅</dt><dd>자식에서 부모 타입으로 바꾸는 업캐스팅은 생략할 수 있고 실패하지 않는다. 부모에서 자식 타입으로 바꾸는 다운캐스팅은 명시해야 하고 실행 시점에 checkcast로 객체의 클래스를 검사한다. 어느 쪽도 객체를 바꾸지 않는다.</dd>
+<dt>ClassCastException</dt><dd>다운캐스팅하려는 타입이 객체의 클래스나 그 조상이 아닐 때 실행 중에 발생한다. null은 어떤 참조 타입으로도 캐스팅된다.</dd>
+<dt>instanceof</dt><dd>참조가 null이 아니고 그 타입으로 캐스팅해도 예외가 나지 않으면 true다. 판정 기준은 변수의 타입이 아니라 객체의 클래스다.</dd>
+<dt>instanceof 패턴 매칭</dt><dd>Java 16부터 검사, 캐스팅, 변수 선언을 한 번에 쓸 수 있다. 패턴 변수는 검사가 성공했음이 확실한 범위에서만 쓸 수 있다.</dd>
+<dt>오버라이딩과 다형성</dt><dd>부모 타입 변수로 메서드를 호출해도 객체의 클래스에서 오버라이딩한 메서드가 실행된다. 부모 클래스의 코드 안에서 하는 호출도 마찬가지다.</dd>
+<dt>동적 디스패치</dt><dd>invokevirtual은 실행 시점에 객체의 클래스에서 출발해 호출할 메서드를 선택한다(JVMS §5.4.6). HotSpot은 클래스마다 둔 가상 메서드 테이블의 정해진 칸을 읽는 방식으로 이를 구현한다.</dd>
+<dt>다형적이지 않은 것</dt><dd>필드 접근, static 메서드 호출, private 메서드 호출, 오버로딩된 메서드의 선택은 컴파일 시점의 타입으로 결정된다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 다시 판단하면, 변수와 매개변수의 타입은 "그 코드가 실제로 필요로 하는 가장 넓은 타입"으로 선언하는 쪽이 변경에 강하다. 월급만 합산하는 코드가 <code>Manager</code>를 요구할 이유는 없다. <code>Employee</code>로 받으면 직원 종류가 늘어도 그 코드는 그대로다. 반대로 관리자 고유의 기능을 써야 하는 코드라면 처음부터 <code>Manager</code> 타입으로 받는 것이 맞다. 넓은 타입으로 받은 뒤 안에서 다운캐스팅하는 구조는 타입 검사를 컴파일 시점에서 실행 시점으로 미루는 것이고, 그만큼 오류가 늦게 발견된다.</p>
+<p>운영 로그에서 <code>ClassCastException</code>을 보면 메시지에 적힌 두 클래스부터 읽는다. 앞의 것이 실제로 들어온 객체의 클래스이고 뒤의 것이 코드가 기대한 타입이다. 원인은 대개 캐스팅하는 줄이 아니라 그 객체를 그 자리에 넣은 쪽에 있다. 공통 타입(<code>Object</code>나 부모 타입)으로 값을 주고받는 지점, 예를 들어 범용 저장소에서 값을 꺼내는 코드나 여러 종류의 메시지를 받는 처리기가 주요 발생 지점이다. 캐스팅 앞에 <code>instanceof</code> 검사가 없다면 추가하되, 기대하지 않은 타입이 들어왔을 때 조용히 무시할지 명시적으로 실패시킬지는 따로 결정해야 한다.</p>
+<p><code>instanceof</code> 분기가 여러 곳에 반복해서 나타나면 설계를 다시 본다. 같은 타입 목록으로 분기하는 코드가 세 군데 있다면, 타입이 하나 추가될 때 세 군데를 모두 찾아 고쳐야 하고 빠뜨려도 컴파일러가 알려 주지 않는다. 타입마다 달라지는 동작을 부모 타입의 메서드로 올리고 각 자식이 오버라이딩하게 하면 분기가 사라지고, 새 타입은 자기 클래스 안에서만 작업하면 된다. 다만 모든 분기를 없애야 하는 것은 아니다. 클래스를 수정할 수 없거나, 그 동작이 해당 클래스의 책임으로 보기 어려운 경우에는 호출하는 쪽의 <code>instanceof</code>가 더 나은 선택일 수 있다.</p>
+<p>디버깅할 때는 화면에 보이는 타입이 어느 쪽인지 구분한다. 소스 코드와 컴파일 오류가 말하는 타입은 변수의 타입이고, 디버거의 변수 창과 스택 트레이스, <code>getClass()</code>가 보여 주는 것은 객체의 클래스다. 스프링처럼 프록시를 쓰는 환경에서는 인터페이스나 부모 타입의 변수에 전혀 다른 이름의 클래스 객체가 들어 있는 것이 정상이다. "선언은 A인데 실제 객체는 B"라는 상황을 이상하게 여기지 않고, 어느 메서드가 실행될지를 B에서부터 따져 보는 것이 이 회차의 내용을 실무에 적용하는 방식이다.</p>
+</x-review>
+
+<x-practice>
+<li>아래 클래스가 있을 때 (1)~(10) 각 줄을 "정상 실행", "컴파일 오류", "실행 중 ClassCastException" 중 하나로 분류하고 이유를 적어라. 각 줄은 앞 줄들이 정상 실행됐다고 가정한다.
+<pre><code class="language-java">class Notice { void send() { } }
+class Email extends Notice { void attach() { } }
+class Sms extends Notice { void shorten() { } }
+
+Notice a = new Email();          // (1)
+a.send();                        // (2)
+a.attach();                      // (3)
+Email e1 = (Email) a;            // (4)
+Notice b = new Notice();
+Email e2 = (Email) b;            // (5)
+Sms s1 = (Sms) a;                // (6)
+Sms s2 = (Sms) e1;               // (7)
+Object o = e1;
+boolean r = o instanceof Notice; // (8)
+Email e3 = a;                    // (9)
+Notice n = null;
+Email e4 = (Email) n;            // (10)</code></pre></li>
+<li>다음 프로그램의 출력 네 줄을 예측하고, 각 줄이 컴파일 타임 타입으로 결정되는지 런타임 타입으로 결정되는지 설명하라.
+<pre><code class="language-java">class Account {
+    String type = "일반";
+
+    int fee() {
+        return 500;
+    }
+
+    String info() {
+        return type + ":" + fee();
+    }
+}
+
+class VipAccount extends Account {
+    String type = "VIP";
+
+    @Override
+    int fee() {
+        return 0;
+    }
+}
+
+public class AccountMain {
+    public static void main(String[] args) {
+        Account account = new VipAccount();
+        System.out.println(account.type);
+        System.out.println(account.fee());
+        System.out.println(account.info());
+        System.out.println(((VipAccount) account).type);
+    }
+}</code></pre></li>
+<li><code>Object o</code>가 매개변수로 주어졌을 때 다음 네 조각 중 컴파일되는 것을 고르고, 나머지는 패턴 변수 <code>s</code>의 범위로 이유를 설명하라.
+<pre><code class="language-java">// (a)
+if (o instanceof String s && s.length() > 3) { System.out.println(s); }
+
+// (b)
+if (o instanceof String s || s.isEmpty()) { System.out.println("b"); }
+
+// (c)
+if (!(o instanceof String s)) { return; }
+System.out.println(s.length());
+
+// (d)
+if (o instanceof String s) { System.out.println("문자열"); }
+System.out.println(s);</code></pre></li>
+<li>다음 프로그램의 출력을 예측하고, 세 호출이 각각 어느 <code>print</code>로 연결되는지가 언제 결정되는지 설명하라.
+<pre><code class="language-java">class Printer {
+    void print(Object value) {
+        System.out.println("Object 버전");
+    }
+
+    void print(String value) {
+        System.out.println("String 버전");
+    }
+}
+
+public class PrintMain {
+    public static void main(String[] args) {
+        Printer printer = new Printer();
+        Object value = "hello";
+        printer.print(value);
+        printer.print("hello");
+        printer.print((String) value);
+    }
+}</code></pre></li>
+<li>클래스 <code>A</code>에 인스턴스 메서드 <code>m1()</code>, <code>m2()</code>가 있고, <code>B extends A</code>가 <code>m2()</code>를 오버라이딩하며 새 메서드 <code>m3()</code>를 선언한다. HotSpot의 방식에 따라 두 클래스의 vtable을 그려라(Object에서 온 칸은 생략해도 된다). 그리고 <code>A a = new B();</code> 뒤의 <code>a.m1()</code>, <code>a.m2()</code>가 각각 어느 메서드를 실행하는지와, <code>a.m3()</code>가 컴파일되지 않는 이유를 그림으로 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> (1) 정상. 업캐스팅이다. (2) 정상. <code>send()</code>는 <code>Notice</code>의 멤버다. (3) 컴파일 오류. 변수 <code>a</code>의 타입 <code>Notice</code>에는 <code>attach()</code>가 없다. 객체가 <code>Email</code>이라는 사실은 컴파일러의 판단에 쓰이지 않는다. (4) 정상. 객체의 클래스가 <code>Email</code>이므로 checkcast를 통과한다. (5) 실행 중 ClassCastException. <code>b</code>가 가리키는 객체는 <code>Notice</code>로 생성됐고 <code>Email</code> 부분이 없다. (6) 실행 중 ClassCastException. <code>Notice</code>에서 <code>Sms</code>로의 캐스팅은 컴파일러가 허용하지만, 객체의 클래스 <code>Email</code>은 <code>Sms</code>도 그 하위 클래스도 아니다. (7) 컴파일 오류. 변수 <code>e1</code>의 타입 <code>Email</code>과 <code>Sms</code>는 상속 관계가 아니어서 성공할 가능성이 없다. (6)과 (7)은 같은 객체를 대상으로 하지만 변수의 타입이 달라 한쪽은 실행 시점에, 다른 쪽은 컴파일 시점에 걸린다. (8) 정상이고 값은 true. 객체의 클래스 <code>Email</code>은 <code>Notice</code>의 하위 클래스다. (9) 컴파일 오류. 부모 타입의 값을 자식 타입 변수에 대입하려면 명시적 캐스팅이 필요하다. (10) 정상. null은 어떤 참조 타입으로도 캐스팅되며 결과도 null이다.</p>
+<p><b>2.</b> 출력은 <code>일반</code>, <code>0</code>, <code>일반:0</code>, <code>VIP</code>다. 첫 줄은 필드 접근이므로 변수 <code>account</code>의 컴파일 타임 타입 <code>Account</code>에 선언된 <code>type</code>이 읽힌다. 둘째 줄은 인스턴스 메서드 호출이므로 객체의 클래스 <code>VipAccount</code>에서 오버라이딩한 <code>fee()</code>가 실행된다. 셋째 줄의 <code>info()</code>는 <code>Account</code>의 코드다. 그 안의 <code>type</code>은 컴파일 시점에 <code>Account.type</code>으로 확정됐으므로 "일반"이고, <code>fee()</code>는 <code>this.fee()</code>로서 동적 디스패치되어 0이다. 한 메서드 안에서 필드와 메서드가 서로 다른 기준을 따르는 것이 그대로 드러난다. 넷째 줄은 캐스팅한 식의 타입이 <code>VipAccount</code>이므로 <code>VipAccount.type</code>이 읽힌다. 객체는 네 줄 내내 같은 객체다.</p>
+<p><b>3.</b> 컴파일되는 것은 (a)와 (c)다. (a)에서 <code>&&</code>의 오른쪽과 if 본문은 검사가 성공했을 때만 실행되므로 <code>s</code>를 쓸 수 있다. (b)에서 <code>||</code>의 오른쪽은 왼쪽이 false일 때, 즉 검사가 실패했을 때 평가되므로 <code>s</code>에 값이 없어 "cannot find symbol" 오류다. (c)는 검사 실패 시 메서드를 빠져나가므로 if 문 뒤에 도달했다면 검사가 성공한 것이고, <code>s</code>를 쓸 수 있다. (d)는 if 본문이 정상적으로 끝나고 다음 문장으로 이어지므로, if 문 뒤에는 검사가 성공한 경로와 실패한 경로가 모두 도달한다. 성공이 확실하지 않으므로 <code>s</code>는 범위 밖이다.</p>
+<p><b>4.</b> 출력은 <code>Object 버전</code>, <code>String 버전</code>, <code>String 버전</code>이다. 오버로딩된 메서드 중 어느 것을 호출할지는 컴파일러가 인자 식의 컴파일 타임 타입으로 정한다. 첫 호출의 인자 <code>value</code>는 타입이 <code>Object</code>이므로, 그 객체가 실제로는 String이어도 <code>print(Object)</code>가 선택된다. 둘째 호출의 인자는 문자열 리터럴이라 타입이 <code>String</code>이고, 셋째는 캐스트 식의 타입이 <code>String</code>이다. 세 선택은 모두 컴파일 시점에 끝나 바이트코드에 서로 다른 디스크립터로 기록된다. 실행 시점의 동적 디스패치는 점 왼쪽의 객체(<code>printer</code>)에 대해서만 일어나고, 인자의 실제 클래스는 메서드 선택에 관여하지 않는다.</p>
+<p><b>5.</b> <code>A</code>의 vtable은 [k] A.m1, [k+1] A.m2다. <code>B</code>의 vtable은 <code>A</code>의 것을 복사한 뒤 오버라이딩한 칸을 교체하고 새 메서드를 끝에 추가하므로 [k] A.m1, [k+1] B.m2, [k+2] B.m3이 된다. <code>a.m1()</code>은 객체의 클래스 <code>B</code>의 vtable에서 [k]번 칸을 읽어 <code>A.m1</code>을 실행한다. <code>a.m2()</code>는 [k+1]번 칸을 읽어 <code>B.m2</code>를 실행한다. 두 호출 모두 컴파일러가 적은 것은 <code>A</code>의 메서드에 대한 기호 참조이고, 칸 번호는 <code>A</code>와 <code>B</code>에서 같다. <code>a.m3()</code>는 컴파일 단계에서 거부된다. 컴파일러는 변수의 타입 <code>A</code>의 멤버에서 <code>m3</code>를 찾는데 <code>A</code>에는 없다. 그림으로 보면 <code>A</code>의 vtable에는 [k+2]번 칸이 없다. <code>A</code> 타입으로 작성된 코드는 <code>A</code>의 다른 하위 클래스에서 그 칸에 무엇이 있는지, 칸이 있기는 한지 알 수 없다. <code>((B) a).m3()</code>처럼 다운캐스팅해 식의 타입을 <code>B</code>로 만들면 호출할 수 있다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q><code>Employee e = new Manager("문가람", 5_500_000, 2);</code> 뒤에 <code>e.approve()</code>가 컴파일 오류가 되는 이유로 가장 정확한 것은? (<code>approve()</code>는 <code>Manager</code>에만 선언돼 있다.)</q>
+<o>업캐스팅하는 순간 객체에서 Manager 부분이 제거되기 때문이다.</o>
+<o>JVM이 실행 시점에 Employee의 vtable에서 approve를 찾지 못하기 때문이다.</o>
+<o>컴파일러는 변수의 선언 타입인 Employee의 멤버에서만 메서드를 찾고, 객체의 실제 클래스는 고려하지 않기 때문이다.</o>
+<o>부모 타입 변수로는 어떤 메서드도 호출할 수 없기 때문이다.</o>
+<why>메서드 호출의 첫 단계는 컴파일 시점에 변수(식)의 타입에서 메서드를 찾는 것이고, 탐색은 부모 방향으로만 올라간다. Employee에 approve()가 없으므로 실행까지 가지 않고 컴파일 오류가 난다. 객체는 그대로 Manager이며 Manager 부분도 남아 있다. Employee에 선언된 메서드는 정상적으로 호출할 수 있다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>다음 중 컴파일은 되지만 실행하면 ClassCastException이 발생하는 것은? (<code>Manager</code>와 <code>Engineer</code>는 각각 <code>Employee</code>를 상속한다.)</q>
+<o><code>Employee e = new Manager("a", 1, 1); Manager m = (Manager) e;</code></o>
+<o><code>Employee e = new Engineer("a", 1, "Java"); Manager m = (Manager) e;</code></o>
+<o><code>Manager m = new Manager("a", 1, 1); Engineer g = (Engineer) m;</code></o>
+<o><code>Employee e = null; Manager m = (Manager) e;</code></o>
+<why>두 번째 보기에서 Employee를 Manager로 캐스팅하는 것은 상속 관계가 있으므로 컴파일된다. 그러나 객체의 클래스 Engineer는 Manager도 그 하위 클래스도 아니어서 checkcast가 예외를 던진다. 첫 번째는 객체가 실제로 Manager라 성공한다. 세 번째는 Manager와 Engineer가 상속 관계가 아니어서 컴파일 오류다. 네 번째의 null은 어떤 참조 타입으로도 캐스팅된다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>Employee</code>와 <code>Manager</code>에 각각 <code>String title</code> 필드("사원", "관리자")가 있고 <code>Manager</code>가 <code>monthlyPay()</code>를 오버라이딩했다. <code>Employee e = new Manager(...)</code>일 때 옳은 것은?</q>
+<o><code>e.title</code>은 "사원"이고, <code>e.monthlyPay()</code>는 Manager의 구현을 실행한다.</o>
+<o><code>e.title</code>은 "관리자"이고, <code>e.monthlyPay()</code>는 Manager의 구현을 실행한다.</o>
+<o><code>e.title</code>은 "사원"이고, <code>e.monthlyPay()</code>는 Employee의 구현을 실행한다.</o>
+<o><code>e.title</code>은 "관리자"이고, <code>e.monthlyPay()</code>는 Employee의 구현을 실행한다.</o>
+<why>필드 접근은 식의 컴파일 타임 타입으로 대상 필드가 정해진다(JLS §15.11.1). e의 타입이 Employee이므로 Employee에 선언된 title이 읽힌다. 인스턴스 메서드 호출은 invokevirtual이 객체의 클래스 Manager에서 출발해 오버라이딩한 메서드를 선택한다(JVMS §5.4.6).</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>Employee e = new Manager(...)</code>와 <code>Employee n = null</code>이 있을 때 instanceof의 결과로 옳지 않은 것은?</q>
+<o><code>e instanceof Employee</code>는 true다.</o>
+<o><code>e instanceof Object</code>는 true다.</o>
+<o><code>n instanceof Employee</code>는 false다.</o>
+<o><code>e instanceof Manager</code>는 변수 e의 타입이 Employee이므로 false다.</o>
+<why>instanceof는 변수의 타입이 아니라 객체의 클래스로 판정한다. e가 가리키는 객체는 Manager이므로 Manager, Employee, Object에 대해 모두 true다. 참조가 null이면 어떤 타입에 대해서도 false다(JLS §15.20.2).</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>HotSpot의 가상 메서드 테이블(vtable)에 대한 설명으로 옳은 것은?</q>
+<o>JVM 명세가 모든 구현에 요구하는 자료 구조다.</o>
+<o>하위 클래스의 vtable은 상위 클래스의 vtable을 앞부분에 복사한 뒤, 오버라이딩한 메서드의 칸은 교체하고 새 메서드의 칸은 끝에 추가해 만든다.</o>
+<o>객체마다 하나씩 만들어지며 객체의 필드와 함께 힙에 저장된다.</o>
+<o>static 메서드와 private 메서드, 생성자도 모두 vtable에 칸을 갖는다.</o>
+<why>vtable은 명세가 아니라 HotSpot의 구현 방식이다. 명세(JVMS §5.4.6)는 메서드 선택의 결과만 규정한다. vtable은 객체가 아니라 클래스의 메타데이터에 속하며, 객체는 헤더의 klass pointer로 자기 클래스에 연결된다. OpenJDK 소스의 주석에 따르면 private·static 메서드와 생성자는 vtable에 들어가지 않는다. 상위 클래스의 테이블을 복사하고 교체·추가하기 때문에 같은 메서드의 칸 번호가 계층 전체에서 같다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>다형성(polymorphism)</dt><dd>하나의 타입으로 여러 클래스의 객체를 다루고, 같은 메서드 호출이 객체의 클래스에 따라 다른 구현을 실행하는 성질.</dd>
+<dt>다형적 참조</dt><dd>부모 타입의 변수가 자식 타입의 객체를 가리키는 것. 대입, 인자 전달, 반환, 배열 요소 저장에서 모두 일어난다.</dd>
+<dt>컴파일 타임 타입(compile-time type)</dt><dd>변수에 선언된 타입 또는 식에 대해 컴파일러가 정한 타입. 정적 타입이라고도 한다.</dd>
+<dt>런타임 타입(run-time type)</dt><dd>실행 중에 변수의 값이 가리키는 객체의 클래스(JLS §4.12.6). 동적 타입이라고도 한다.</dd>
+<dt>업캐스팅(upcasting)</dt><dd>자식 타입의 참조를 부모 타입으로 취급하는 것. JLS의 확장 참조 변환이며 실행 시점의 검사가 없다.</dd>
+<dt>다운캐스팅(downcasting)</dt><dd>부모 타입의 참조를 자식 타입으로 취급하는 것. JLS의 축소 참조 변환이며 실행 시점에 객체의 클래스를 검사한다.</dd>
+<dt>checkcast</dt><dd>참조가 가리키는 객체를 지정한 타입으로 캐스팅할 수 있는지 검사하는 바이트코드 명령. 실패하면 ClassCastException을 던진다.</dd>
+<dt>타입 패턴(type pattern)</dt><dd>instanceof의 오른쪽에 타입과 변수 이름을 함께 적은 것. 검사가 성공하면 캐스팅된 값이 그 변수에 대입된다.</dd>
+<dt>동적 디스패치(dynamic dispatch)</dt><dd>호출할 메서드의 구현을 실행 시점에 수신 객체의 클래스를 기준으로 정하는 것. 가상 메서드 호출이라고도 한다.</dd>
+<dt>가상 메서드 테이블(vtable)</dt><dd>HotSpot이 클래스 메타데이터에 두는 메서드 참조의 배열. 동적 디스패치를 배열 칸 읽기로 구현하기 위한 것이며 명세가 아닌 구현 세부다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html#jls-15.12.4.4">JLS §15.12.4.4 Locate Method to Invoke</a> — 호출 방식(static, super, virtual, interface)에 따른 메서드 결정과 런타임 클래스에서 출발하는 동적 메서드 탐색</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-5.html#jvms-5.4.6">JVMS §5.4.6 Method Selection</a> — invokevirtual과 invokeinterface가 객체의 클래스에 대해 메서드를 선택하는 규칙</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-6.html#jvms-6.5.checkcast">JVMS §6.5 checkcast</a> — 다운캐스팅의 실행 시점 검사 규칙과 null의 처리, instanceof 명령과의 차이</li>
+<li><a href="https://openjdk.org/jeps/394">JEP 394: Pattern Matching for instanceof</a> — Java 16에서 확정된 타입 패턴과 패턴 변수의 흐름 기반 스코프</li>
+<li><a href="https://github.com/openjdk/jdk21u/blob/master/src/hotspot/share/oops/klassVtable.cpp">OpenJDK 21 소스: klassVtable.cpp</a> — HotSpot이 상위 클래스의 vtable을 복사하고 오버라이딩한 칸을 교체해 vtable을 구성하는 방식(구현 세부)</li>
+<li><a href="https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html">HotSpot Glossary of Terms</a> — klass pointer와 vtable, 클래스 계층 분석(CHA), 역최적화의 정의</li>
+</x-refs>

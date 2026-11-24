@@ -1,0 +1,1126 @@
+<x-meta>
+deck: 람다가 값이 되려면 받아 줄 타입이 있어야 한다. 함수형 인터페이스의 정의, 제네릭과 타입 소거, 타깃 타이핑 규칙, java.util.function의 43개 인터페이스를 바이트코드와 박싱 비용까지 따라간다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>JLS §9.8의 정의로 어떤 인터페이스가 함수형 인터페이스인지 판정하고, <code>equals</code>를 다시 선언한 <code>Comparator</code>는 함수형이지만 <code>clone()</code>을 선언한 인터페이스는 아닌 이유를 설명할 수 있다.</li>
+<li>제네릭 함수형 인터페이스가 컴파일되면 메서드 디스크립터가 <code>(Object)Object</code>로 지워지는 것과, 호출 지점과 람다 프록시 클래스에 각각 <code>checkcast</code>가 들어가는 위치를 <code>javap</code> 출력으로 짚을 수 있다.</li>
+<li>람다가 대입·호출·캐스트 문맥에서만 쓰일 수 있는 이유를 타깃 타입으로 설명하고, 같은 람다 본문이 오버로딩된 메서드 중 어디로 가는지 JLS §15.12.2.5의 규칙으로 예측할 수 있다.</li>
+<li><code>Function</code>, <code>Consumer</code>, <code>Supplier</code>, <code>Runnable</code>, <code>Predicate</code>, <code>UnaryOperator</code>, <code>BinaryOperator</code>와 기본형 특화 인터페이스 중 주어진 함수 모양에 맞는 것을 이름 규칙으로 골라낼 수 있다.</li>
+<li><code>Function<Integer, Integer></code>와 <code>IntUnaryOperator</code>의 바이트코드 차이로 박싱 비용을 설명하고, 박싱된 값을 <code>==</code>로 비교하는 람다가 127과 128에서 다른 결과를 내는 이유를 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>람다는 무엇에 담기는가</h3>
+<p>앞 회차에서 람다(lambda expression)를 "이름 없는 함수를 값처럼 넘기는 문법"으로 만났다. 그런데 자바에서 값은 반드시 타입을 가진다. <code>int x = 3</code>의 3은 <code>int</code>이고, <code>"kim"</code>은 <code>String</code>이다. 그렇다면 <code>s -> s.length()</code>라는 값의 타입은 무엇인가. 자바의 타입 시스템에는 <code>(String) -> int</code> 같은 함수 타입을 변수 선언에 직접 쓰는 문법이 없다. 변수의 타입 자리에 올 수 있는 것은 기본형, 클래스, 인터페이스, 배열, 타입 변수뿐이다.</p>
+<p>자바가 택한 해법은 새로운 종류의 타입을 만드는 대신 이미 있는 인터페이스를 재활용하는 것이었다. 추상 메서드가 딱 하나인 인터페이스가 있으면, 그 메서드 하나의 매개변수 목록과 반환 타입이 곧 "함수의 모양"이 된다. 람다는 그 모양에 맞으면 그 인터페이스를 구현한 객체로 만들어진다. 이 역할을 하는 인터페이스를 <b>함수형 인터페이스(functional interface)</b>라고 부른다. 람다는 함수형 인터페이스 없이는 존재할 수 없다.</p>
+<p>이 선택에는 대가가 따른다. 함수의 모양마다 인터페이스가 하나씩 필요하다. 문자열을 받아 정수를 돌려주는 함수, 정수 두 개를 받아 정수를 돌려주는 함수, 아무것도 받지 않고 값을 만들어 내는 함수가 모두 서로 다른 인터페이스여야 한다. 이 회차는 이 대가를 자바가 어떻게 줄였는지를 따라간다. 제네릭으로 모양의 수를 줄이고, 표준 라이브러리 <code>java.util.function</code> 패키지에 자주 쓰는 모양을 미리 정의해 두었으며, 기본형 때문에 생기는 비용은 특화 인터페이스로 다시 덜어 냈다. 그리고 그 과정에서 컴파일러가 람다의 타입을 정하는 규칙, 즉 타깃 타이핑(target typing)이 어떻게 작동하는지, 바이트코드에서는 이 모든 것이 어떻게 보이는지를 확인한다.</p>
+
+<h3>함수형 인터페이스의 정의: 추상 메서드가 하나</h3>
+<p>함수형 인터페이스는 Java Language Specification(JLS) §9.8이 정의한다. 요지는 <b>sealed로 선언되지 않았고, <code>Object</code>의 메서드를 제외하면 추상 메서드가 하나뿐인 인터페이스</b>다. 이 짧은 정의에 판정에 필요한 규칙이 여러 개 들어 있으니 하나씩 풀어 보자.</p>
+<p>첫째, 세는 대상은 <b>추상 메서드</b>뿐이다. 디폴트 메서드(default method)와 정적 메서드(static method), private 메서드는 몸체가 있으므로 세지 않는다. 그래서 <code>Function</code>은 <code>andThen</code>, <code>compose</code>라는 디폴트 메서드와 <code>identity</code>라는 정적 메서드를 가지고 있지만 추상 메서드는 <code>apply</code> 하나라서 함수형 인터페이스다. 디폴트 메서드가 몇 개든 상관없다.</p>
+<p>둘째, <code>Object</code>의 <b>public</b> 메서드와 시그니처가 같은 추상 메서드는 세지 않는다. 대표적인 예가 <code>java.util.Comparator</code>다. 이 인터페이스의 소스에는 <code>int compare(T o1, T o2)</code>와 함께 <code>boolean equals(Object obj)</code>도 추상 메서드로 선언되어 있다. 그런데도 함수형 인터페이스다. 어떤 클래스가 <code>Comparator</code>를 구현하든 그 클래스는 이미 <code>Object</code>로부터 public <code>equals</code>를 물려받으므로, 이 선언은 새로운 계약을 추가하지 않는다. JLS는 이 규칙이 바로 <code>Comparator</code> 같은 인터페이스를 함수형으로 다루기 위한 것이라고 설명한다.</p>
+<p>이 예외가 public 메서드에만 적용된다는 점이 중요하다. <code>Object.clone()</code>은 protected다. 인터페이스에 <code>Object clone();</code>을 선언하면 그것은 public 추상 메서드가 되고, 구현 클래스가 물려받은 protected <code>clone</code>으로는 채워지지 않는다. 그래서 JLS의 예제 9.8-1은 <code>int m();</code>과 <code>Object clone();</code>을 가진 인터페이스 <code>Foo</code>를 함수형이 아니라고 판정한다. <code>Object</code>의 멤버가 아닌 추상 메서드는 하나지만, <code>Object</code>의 <b>public</b> 멤버가 아닌 추상 메서드는 둘이기 때문이다.</p>
+<p>셋째, 상속받은 추상 메서드도 센다. 다만 상위 인터페이스 여러 곳에서 오버라이드 동등(override-equivalent)한 시그니처를 물려받으면 그것들은 논리적으로 메서드 하나로 본다. 넷째, sealed 인터페이스는 추상 메서드가 하나여도 함수형 인터페이스가 아니다. sealed 인터페이스는 허용된 구현 클래스 목록을 고정하는데, 람다는 이름 없는 새 구현 클래스를 만들어 내므로 그 목록과 충돌한다.</p>
+<pre><code class="language-java">public class Sealed {
+    sealed interface Shape permits Circle { double area(); }
+    record Circle(double r) implements Shape {
+        public double area() { return Math.PI * r * r; }
+    }
+
+    interface Named { String name(); }
+    interface Labeled extends Named {
+        String name();                                   // 상속받은 것과 같은 시그니처: 여전히 하나
+        default String label() { return "[" + name() + "]"; }  // 디폴트 메서드는 세지 않는다
+    }
+
+    public static void main(String[] args) {
+        Labeled l = () -> "kim";
+        System.out.println(l.label());   // [kim]
+        Shape s = () -> 1.0;             // 컴파일 오류
+    }
+}</code></pre>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">Sealed.java:16: error: incompatible types: Shape is not a functional interface
+        Shape s = () -> 1.0;
+                  ^
+1 error</code></pre>
+<p>판정 결과를 표로 모아 두면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>인터페이스의 추상 메서드</th><th>함수형인가</th><th>이유</th></tr></thead><tbody>
+<tr><td><code>int compare(T, T)</code>, <code>boolean equals(Object)</code></td><td>예</td><td><code>equals</code>는 <code>Object</code>의 public 메서드와 같아 세지 않는다</td></tr>
+<tr><td><code>boolean equals(Object)</code> 하나뿐</td><td>아니오</td><td>센 결과가 0개다. 새 계약이 없다</td></tr>
+<tr><td><code>int m()</code>, <code>Object clone()</code></td><td>아니오</td><td><code>clone</code>은 <code>Object</code>에서 protected라 예외가 적용되지 않는다</td></tr>
+<tr><td><code>R apply(T)</code> + 디폴트 메서드 여러 개</td><td>예</td><td>디폴트·정적 메서드는 세지 않는다</td></tr>
+<tr><td>sealed, <code>double area()</code> 하나</td><td>아니오</td><td>JLS §9.8이 sealed 인터페이스를 제외한다</td></tr>
+</tbody></table></div>
+<p>함수형 인터페이스의 그 유일한 추상 메서드를 Javadoc은 <b>기능 메서드(functional method)</b>라고 부르고, JLS §9.9는 그 메서드를 오버라이드할 수 있는 메서드 타입(매개변수 타입, 반환 타입, throws 절)을 <b>함수 타입(function type)</b>이라고 부른다. 흔히 함수 디스크립터라고도 하는데, javac의 오류 메시지에는 functional descriptor라는 말로 나온다. 람다가 어떤 인터페이스에 맞는지 판단할 때 컴파일러가 실제로 비교하는 대상은 인터페이스 이름이 아니라 이 함수 타입이다.</p>
+
+<h3>@FunctionalInterface는 무엇을 약속하는가</h3>
+<p><code>java.util.function</code>의 인터페이스에는 모두 <code>@FunctionalInterface</code> 애너테이션이 붙어 있다. 이 애너테이션이 있어야 람다를 쓸 수 있다고 오해하기 쉽지만 그렇지 않다. <code>FunctionalInterface</code>의 Javadoc은 이 애너테이션이 없어도 컴파일러는 정의를 만족하는 인터페이스를 함수형 인터페이스로 다룬다고 명시한다. 앞의 <code>Labeled</code>에는 애너테이션이 없었지만 람다를 받았다.</p>
+<p>애너테이션이 하는 일은 하나다. 붙인 인터페이스가 함수형 인터페이스의 조건을 만족하지 않으면 <b>컴파일 오류</b>를 내게 한다(JLS §9.6.4.9). 추상 메서드를 두 개 선언하고 애너테이션을 붙여 보면 javac가 이렇게 거부한다.</p>
+<pre><code class="language-java">@FunctionalInterface
+interface TwoMethods {
+    void a();
+    void b();
+}</code></pre>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">T2.java:5: error: Unexpected @FunctionalInterface annotation
+    @FunctionalInterface
+    ^
+  TwoMethods is not a functional interface
+    multiple non-overriding abstract methods found in interface TwoMethods</code></pre>
+<p>이 검사가 왜 필요한지는 인터페이스가 시간이 지나며 바뀐다는 점을 생각하면 분명해진다. 어떤 라이브러리가 함수형 인터페이스를 공개했고 사용자 코드 수백 곳이 그것을 람다로 구현하고 있다고 하자. 누군가 이 인터페이스에 추상 메서드를 하나 더 추가하면 라이브러리 자체는 문제없이 컴파일되지만, 그 순간 사용자 코드의 모든 람다가 "is not a functional interface" 오류로 깨진다. 오류가 라이브러리가 아니라 사용하는 쪽에서 터지는 것이다. 애너테이션을 붙여 두면 이 실수가 인터페이스를 고치는 사람의 컴파일 단계에서 바로 드러난다. Javadoc의 표현대로 설계 의도를 기록하고 그 의도를 컴파일러가 지키게 하는 장치다.</p>
+<p>이 애너테이션은 <code>@Retention(RetentionPolicy.RUNTIME)</code>으로 선언되어 있어서 클래스 파일의 <code>RuntimeVisibleAnnotations</code> 속성에 남고 리플렉션으로도 읽을 수 있다. 그러나 런타임에 람다가 만들어지는 과정은 이 애너테이션을 보지 않는다. 람다 객체를 만드는 데 필요한 정보는 컴파일러가 이미 바이트코드에 다 적어 두었기 때문이다. 그 정보가 무엇인지는 잠시 뒤에 <code>javap</code>로 확인한다. 반대로 JLS는 우연히 함수형인 인터페이스도 있으므로 모든 함수형 인터페이스에 이 애너테이션을 붙이는 것이 필요하지도 바람직하지도 않다고 적고 있다. 람다로 구현되기를 의도한 인터페이스에만 붙이면 된다.</p>
+
+<h3>타입마다 인터페이스를 만들면 생기는 일</h3>
+<p>이제 함수 모양마다 인터페이스가 필요하다는 대가를 직접 치러 보자. 문자열을 받아 문자열을 돌려주는 함수와 정수를 받아 정수를 돌려주는 함수가 필요하다면 이렇게 두 개를 만들어야 한다.</p>
+<pre><code class="language-java">interface StringFunction  { String  apply(String s);  }
+interface IntegerFunction { Integer apply(Integer n); }
+interface StringToInteger { Integer apply(String s);  }
+// 입력 타입 × 출력 타입의 조합마다 하나씩 ...</code></pre>
+<p>입력 타입과 출력 타입의 조합마다 인터페이스가 늘어난다. 타입이 열 개면 단항 함수만 백 개다. 세 인터페이스의 구조는 완전히 같고 다른 것은 타입 이름뿐인데, 그 차이 때문에 코드를 복제해야 한다. 이 중복을 없애는 첫 번째 시도는 가장 일반적인 타입인 <code>Object</code>를 쓰는 것이다.</p>
+<pre><code class="language-java">interface ObjectFunction {
+    Object apply(Object input);
+}
+
+public class ObjFn {
+    public static void main(String[] args) {
+        ObjectFunction upper = o -> ((String) o).toUpperCase();
+        String s = (String) upper.apply("java");   // 쓸 때마다 캐스트
+        System.out.println(s);
+        Object r = upper.apply(10);                // 컴파일은 통과한다
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">JAVA
+Exception in thread "main" java.lang.ClassCastException: class java.lang.Integer cannot be cast to class java.lang.String (java.lang.Integer and java.lang.String are in module java.base of loader 'bootstrap')
+	at ObjFn.lambda$main$0(ObjFn.java:7)
+	at ObjFn.main(ObjFn.java:10)</code></pre>
+<p>인터페이스는 하나로 줄었지만 두 가지를 잃었다. 람다 안에서 <code>((String) o)</code>처럼 직접 캐스트해야 하고, 결과를 받을 때도 <code>(String)</code> 캐스트가 필요하다. 더 큰 손실은 <b>타입 안전성</b>이다. <code>upper.apply(10)</code>은 명백히 잘못된 호출인데 컴파일러는 통과시킨다. 매개변수 타입이 <code>Object</code>이니 정수도 받을 자격이 있기 때문이다. 오류는 실행 중에, 그것도 호출한 곳이 아니라 람다 본문 안의 캐스트에서 터진다. 스택 트레이스의 <code>lambda$main$0</code>은 javac가 람다 본문을 옮겨 담은 private 정적 메서드의 이름이다.</p>
+<p>제네릭(generics)은 이 두 손실을 동시에 해결한다. 타입을 매개변수로 빼면 인터페이스 하나로 모든 조합을 표현하면서도, 사용하는 쪽에서 타입을 정해 컴파일러가 검사하게 할 수 있다.</p>
+<pre><code class="language-java">@FunctionalInterface
+public interface GenericFunction<T, R> {
+    R apply(T t);
+}</code></pre>
+<p>입력 타입 <code>T</code>와 출력 타입 <code>R</code>을 타입 매개변수로 뺐다. 이 인터페이스를 쓰는 쪽은 다음과 같다.</p>
+<pre><code class="language-java">public class GenericMain {
+    public static void main(String[] args) {
+        GenericFunction<String, Integer> length = s -> s.length();
+        GenericFunction<Integer, Integer> square = n -> n * n;
+        Integer a = length.apply("hello");
+        Integer b = square.apply(7);
+        System.out.println(a + " " + b);   // 5 49
+    }
+}</code></pre>
+<p>두 가지가 달라졌다. 첫째, 람다의 매개변수 <code>s</code>에 타입을 적지 않았는데도 <code>s.length()</code>를 부를 수 있다. 대입 대상의 타입 <code>GenericFunction<String, Integer></code>에서 함수 타입이 <code>(String) -> Integer</code>로 정해지고, 컴파일러가 그 매개변수 타입을 <code>s</code>에 준다. 둘째, <code>length.apply(10)</code>은 이제 컴파일 오류다. 타입 검사가 실행 시점에서 컴파일 시점으로 돌아왔다. 결과를 받을 때 캐스트를 쓰지도 않는다. 그렇다면 그 캐스트는 정말로 사라졌을까. 한 층 아래로 내려가 보자.</p>
+
+<h3>바이트코드에서 본 제네릭 함수형 인터페이스</h3>
+<p>자바 제네릭은 타입 소거(type erasure)로 구현된다. 타입 매개변수는 컴파일 후 그 상한(bound)으로 지워지는데, 상한을 적지 않은 <code>T</code>와 <code>R</code>은 <code>Object</code>가 된다. <code>javap -s</code>로 <code>GenericFunction</code>을 보면 소스의 <code>R apply(T)</code>가 JVM 수준에서 어떤 메서드인지 드러난다.</p>
+<pre data-label="javap -s GenericFunction"><code class="language-text">public interface GenericFunction<T, R> {
+  public abstract R apply(T);
+    descriptor: (Ljava/lang/Object;)Ljava/lang/Object;
+}</code></pre>
+<p>JVM이 메서드를 찾을 때 쓰는 디스크립터(descriptor)는 <code>(Object)Object</code>다. 앞에서 만든 <code>ObjectFunction</code>과 바이트코드 수준에서는 같은 메서드다. <code>javap -v</code>로 더 보면 <code>Signature: (TT;)TR;</code>라는 속성이 따로 붙어 있는데, 이것은 컴파일러와 리플렉션을 위한 제네릭 정보이고 JVM의 메서드 호출에는 쓰이지 않는다. 그렇다면 <code>ObjectFunction</code>에서 사람이 손으로 쓰던 캐스트는 누가 하고 있을까. <code>GenericMain.main</code>의 바이트코드를 보자.</p>
+<pre data-label="javap -c -p GenericMain (main 일부, JDK 21)"><code class="language-text"> 0: invokedynamic #7,  0   // InvokeDynamic #0:apply:()LGenericFunction;
+ 5: astore_1
+ 6: invokedynamic #11,  0  // InvokeDynamic #1:apply:()LGenericFunction;
+11: astore_2
+12: aload_1
+13: ldc           #12      // String hello
+15: invokeinterface #14,  2 // InterfaceMethod GenericFunction.apply:(Ljava/lang/Object;)Ljava/lang/Object;
+20: checkcast     #19      // class java/lang/Integer
+23: astore_3
+24: aload_2
+25: bipush        7
+27: invokestatic  #21      // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+30: invokeinterface #14,  2 // InterfaceMethod GenericFunction.apply:(Ljava/lang/Object;)Ljava/lang/Object;
+35: checkcast     #19      // class java/lang/Integer</code></pre>
+<p>15번과 30번의 <code>invokeinterface</code>는 <code>apply:(Object)Object</code>를 부른다. 그리고 20번과 35번에 <code>checkcast Integer</code>가 있다. 소스에서 사라진 결과 캐스트는 <b>컴파일러가 호출 지점에 대신 넣어 둔 것</b>이다. 27번의 <code>Integer.valueOf</code>도 눈여겨보자. <code>square.apply(7)</code>의 7은 <code>int</code> 리터럴인데 디스크립터가 <code>Object</code>를 요구하므로 박싱이 일어난다. 이 비용은 뒤에서 기본형 특화를 다룰 때 다시 본다.</p>
+<p>람다 본문은 어디로 갔을까. javac는 람다 본문을 같은 클래스의 private 정적 합성 메서드로 옮긴다. 여기서는 타입이 지워지지 않는다.</p>
+<pre data-label="javap -c -p GenericMain (람다 본문 메서드)"><code class="language-text">private static java.lang.Integer lambda$main$1(java.lang.Integer);
+   0: aload_0
+   1: invokevirtual #41  // Method java/lang/Integer.intValue:()I
+   4: aload_0
+   5: invokevirtual #41  // Method java/lang/Integer.intValue:()I
+   8: imul
+   9: invokestatic  #21  // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+  12: areturn
+
+private static java.lang.Integer lambda$main$0(java.lang.String);
+   0: aload_0
+   1: invokevirtual #45  // Method java/lang/String.length:()I
+   4: invokestatic  #21  // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+   7: areturn</code></pre>
+<p><code>lambda$main$0</code>은 <code>(String)Integer</code>로, 구체적인 타입을 그대로 가진다. 그러면 <code>(Object)Object</code>를 요구하는 인터페이스 메서드와 <code>(String)Integer</code>인 구현 메서드 사이의 간극은 누가 메울까. <code>javap -v</code>의 <code>BootstrapMethods</code> 표에 답이 있다.</p>
+<pre data-label="javap -v GenericMain (BootstrapMethods 일부)"><code class="language-text">0: #74 REF_invokeStatic java/lang/invoke/LambdaMetafactory.metafactory:(...)Ljava/lang/invoke/CallSite;
+  Method arguments:
+    #63 (Ljava/lang/Object;)Ljava/lang/Object;
+    #64 REF_invokeStatic GenericMain.lambda$main$0:(Ljava/lang/String;)Ljava/lang/Integer;
+    #67 (Ljava/lang/String;)Ljava/lang/Integer;</code></pre>
+<p><code>invokedynamic</code>이 처음 실행될 때 JVM은 부트스트랩 메서드 <code>LambdaMetafactory.metafactory</code>를 호출하면서 이 세 인자를 넘긴다. <code>LambdaMetafactory</code>의 Javadoc에 따르면 첫째는 구현해야 할 인터페이스 메서드의 타입(<code>interfaceMethodType</code>), 둘째는 실제로 호출할 구현 메서드의 메서드 핸들(<code>implementation</code>), 셋째는 <b>호출 시점에 동적으로 강제해야 할 타입</b>(<code>dynamicMethodType</code>)이다. Javadoc은 <code>Predicate<String></code>을 예로 들어, 구현할 메서드는 어떤 <code>Object</code>든 받지만 입력은 <code>String</code>이어야 하므로 이 추가 타입이 필요하다고 설명한다. 세 번째 인자 <code>(String)Integer</code>가 바로 제네릭 타입 인자가 남긴 흔적이다.</p>
+<p>OpenJDK 21에서는 이 메타팩토리가 만들어 내는 클래스를 파일로 덤프해 볼 수 있다. <code>-Djdk.invoke.LambdaMetafactory.dumpProxyClassFiles=true</code> 옵션을 주고 실행하면 작업 디렉터리 아래 <code>DUMP_LAMBDA_PROXY_CLASS_FILES</code>에 클래스 파일이 생긴다. 다음은 <code>GenericFunction<String, Integer> length = s -> s.length();</code>에 대해 생성된 클래스를 <code>javap -c -p</code>로 본 것이다. 클래스 이름 뒤의 16진수 주소는 구현이 붙이는 것이고 환경과 실행에 따라 다를 수 있다.</p>
+<pre data-label="생성된 람다 프록시 클래스 (OpenJDK 21, Temurin 21.0.13)"><code class="language-text">final class RawCall$$Lambda implements GenericFunction {
+  private RawCall$$Lambda();
+    ...
+  public java.lang.Object apply(java.lang.Object);
+    Code:
+       0: aload_1
+       1: checkcast     #14   // class java/lang/String
+       4: invokestatic  #20   // Method RawCall.lambda$main$0:(Ljava/lang/String;)Ljava/lang/Integer;
+       7: areturn
+}</code></pre>
+<p>생성된 클래스는 <code>GenericFunction</code>을 구현하고, 지워진 시그니처 그대로 <code>apply(Object)Object</code>를 가진다. 몸체는 인자를 <code>String</code>으로 <code>checkcast</code>한 다음 <code>lambda$main$0</code>을 호출한다. 반환값 <code>Integer</code>는 <code>Object</code>의 하위 타입이라 그대로 돌려줄 수 있다. 즉 제네릭 함수형 인터페이스를 람다로 구현하면 캐스트가 <b>두 곳</b>에 생긴다. 입력 쪽 캐스트는 프록시 클래스의 <code>apply</code> 안에, 출력 쪽 캐스트는 호출 지점에 있다. 사람이 <code>ObjectFunction</code>에 손으로 쓰던 캐스트 두 개를 컴파일러와 메타팩토리가 나눠서 대신 쓰는 셈이다.</p>
+<p>이 입력 쪽 캐스트가 실제로 작동하는지 확인해 보자. 로 타입(raw type)을 쓰면 컴파일러의 검사를 우회해 정수를 밀어 넣을 수 있다.</p>
+<pre><code class="language-java">public class RawCall {
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static void main(String[] args) {
+        GenericFunction<String, Integer> length = s -> s.length();
+        GenericFunction raw = length;           // 로 타입으로 검사를 끈다
+        System.out.println(raw.apply("abc"));   // 3
+        System.out.println(raw.apply(42));      // 문자열이 아닌 값
+    }
+}</code></pre>
+<pre data-label="java -XX:+UnlockDiagnosticVMOptions -XX:+ShowHiddenFrames RawCall"><code class="language-text">3
+Exception in thread "main" java.lang.ClassCastException: class java.lang.Integer cannot be cast to class java.lang.String (java.lang.Integer and java.lang.String are in module java.base of loader 'bootstrap')
+	at RawCall$$Lambda/0x0000008001000c08.apply(Unknown Source)
+	at RawCall.main(RawCall.java:7)</code></pre>
+<p>예외는 람다 본문(<code>lambda$main$0</code>)에 들어가기도 전에, 프록시 클래스의 <code>apply</code>에서 던져졌다. 이 프레임은 숨겨진 클래스(hidden class)의 것이어서 기본 설정으로 실행하면 스택 트레이스에서 빠지고 <code>at RawCall.main(RawCall.java:7)</code>만 보인다. 위 출력은 HotSpot의 진단 옵션 <code>-XX:+ShowHiddenFrames</code>로 숨은 프레임을 드러낸 것이다. 제네릭은 컴파일 시점의 검사지만, 람다로 만든 함수 객체는 <code>dynamicMethodType</code> 덕분에 런타임에도 입력 타입을 한 번 더 확인한다는 것을 알 수 있다.</p>
+<x-visual id="java-adv3-02-erasure-path" title="제네릭 함수형 인터페이스 호출이 바이트코드에서 거치는 경로" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>length.apply("hello") 호출이 호출 지점, 람다 프록시 클래스, 람다 본문 메서드를 차례로 지나며 어디서 타입이 지워지고 어디서 checkcast가 일어나는지 보여 준다.</x-hint>
+<x-prompt>A clean left-to-right sequence diagram with three vertical lifelines on a white background. Left lifeline box labeled "호출 지점 (main)", middle lifeline box labeled "람다 프록시 클래스", right lifeline box labeled "lambda$main$0(String)". Arrow 1 from left to middle labeled "apply(Object)Object". Inside the middle lifeline a small orange box labeled "checkcast String". Arrow 2 from middle to right labeled "invokestatic". A return arrow from right to middle labeled "Integer", then a return arrow from middle to left labeled "Object". On the left lifeline after the return, a small orange box labeled "checkcast Integer". Above the whole diagram a thin banner labeled "디스크립터: (Object)Object". Use flat colors, thin lines, sans-serif font, no shadows, maximum 8 labels.</x-prompt>
+<x-caption>입력 캐스트는 프록시 클래스가, 출력 캐스트는 호출 지점이 맡는다. 그 사이의 인터페이스 메서드는 지워진 (Object)Object다.</x-caption>
+</x-visual>
+<pre class="diagram">  main()                      RawCall$$Lambda (숨겨진 클래스)        lambda$main$0
+    |                                  |                                   |
+    |-- invokeinterface -------------->|                                   |
+    |   apply(Object)Object            |-- checkcast String                |
+    |                                  |-- invokestatic ------------------>|
+    |                                  |   (String)Integer                 |-- String.length()
+    |                                  |                                   |-- Integer.valueOf
+    |                                  |<--------------- Integer ----------|
+    |<------------- Object ------------|                                   |
+    |-- checkcast Integer              |                                   |</pre>
+
+<h3>같은 메서드, 여러 디스크립터: 브리지 메서드와 altMetafactory</h3>
+<p>지금까지 본 람다 프록시 클래스에는 인터페이스 메서드가 하나뿐이었다. 함수형 인터페이스의 추상 메서드가 JVM 수준에서도 디스크립터 하나, <code>(Object)Object</code>로만 존재했기 때문이다. 그런데 언어 수준에서는 메서드 하나인데 JVM 수준에서는 디스크립터가 둘 이상인 경우가 있다. 제네릭 상위 인터페이스의 메서드를 하위 인터페이스가 구체적인 타입으로 다시 선언하는 경우, 그리고 소거 결과가 서로 다른 두 상위 인터페이스에서 같은 시그니처를 물려받는 경우다. 이때 무엇이 필요한지는 JVM이 호출할 메서드를 고르는 규칙에서 나온다.</p>
+<p>JVMS §5.4.6은 <code>invokeinterface</code>나 <code>invokevirtual</code>을 실행할 때, 수신 객체의 런타임 클래스에서 호출 지점이 해석해 둔 메서드를 오버라이드할 수 있는 메서드를 고른다고 정한다. 그리고 §5.4.5의 오버라이드 정의는 이름과 <b>디스크립터</b>가 같을 것을 요구한다. 그러니 JVM에게 <code>apply(String)String</code>과 <code>apply(Object)Object</code>는 이름만 같은 서로 다른 메서드다. 소스에서 <code>Function<String, String></code> 변수로 부른 호출 지점은 바이트코드에 <code>apply:(Object)Object</code>를 적고, 그 하위 인터페이스 변수로 부른 호출 지점은 <code>apply:(String)String</code>을 적는다. 같은 람다 객체가 두 경로 모두에서 같은 본문에 닿으려면 두 디스크립터가 다 구현되어 있어야 한다. 지워진 디스크립터를 구체적인 디스크립터로 이어 주는 이 메서드를 <b>브리지 메서드(bridge method)</b>라고 부른다. 누가 이 브리지를 만드는지는 경우에 따라 다르다.</p>
+<h4>경우 1: 인터페이스가 다시 선언하면 javac가 인터페이스 안에 넣는다</h4>
+<pre><code class="language-java">import java.util.function.Function;
+
+public class Bridge {
+    interface StringMapper extends Function<String, String> {
+        String apply(String s);          // 상위의 R apply(T)를 구체 타입으로 다시 선언
+    }
+    public static void main(String[] args) {
+        StringMapper up = s -> s.toUpperCase();
+        Function<String, String> f = up;
+        System.out.println(up.apply("kim") + " " + f.apply("lee"));
+        for (var m : up.getClass().getDeclaredMethods())
+            System.out.println(m);
+    }
+}</code></pre>
+<pre data-label="실행 결과와 javap -c -p 'Bridge$StringMapper' (JDK 21)"><code class="language-text">KIM LEE
+public java.lang.String Bridge$$Lambda/0x000000e001000c08.apply(java.lang.String)
+
+interface Bridge$StringMapper extends java.util.function.Function<java.lang.String, java.lang.String> {
+  public abstract java.lang.String apply(java.lang.String);
+
+  public default java.lang.Object apply(java.lang.Object);
+    Code:
+       0: aload_0
+       1: aload_1
+       2: checkcast     #1                  // class java/lang/String
+       5: invokeinterface #3,  2            // InterfaceMethod apply:(Ljava/lang/String;)Ljava/lang/String;
+      10: areturn
+}</code></pre>
+<p>javac는 <code>StringMapper</code>를 컴파일하면서 지워진 <code>apply(Object)</code>를 <b>디폴트 메서드</b>로 인터페이스 안에 직접 넣었다. <code>javap -v</code>로 보면 이 메서드의 플래그는 <code>ACC_PUBLIC, ACC_BRIDGE, ACC_SYNTHETIC</code>이고, 리플렉션의 <code>Method.isBridge()</code>도 true를 돌려준다. 몸체는 인자를 <code>String</code>으로 캐스트해 구체적인 <code>apply(String)</code>을 다시 <code>invokeinterface</code>로 부르는 것이 전부다. 브리지가 인터페이스에 이미 있으니 람다 쪽은 할 일이 없다. 그래서 <code>Bridge</code>의 부트스트랩 메서드는 앞에서 본 것과 같은 <code>LambdaMetafactory.metafactory</code>이고 세 인자는 모두 <code>(String)String</code>이며, 프록시 클래스에 선언된 메서드도 <code>apply(String)</code> 하나뿐이다. <code>Function</code> 변수로 부른 <code>f.apply("lee")</code>는 프록시가 물려받은 디폴트 브리지를 거쳐 그 메서드에 닿는다.</p>
+<h4>경우 2: 브리지를 둘 곳이 없으면 메타팩토리가 만든다</h4>
+<pre><code class="language-java">public class Multi {
+    interface Sink<T> { void put(T t); }
+    interface StringSink { void put(String s); }
+    interface Both extends Sink<String>, StringSink { }   // 아무것도 선언하지 않는다
+
+    public static void main(String[] args) {
+        Both b = s -> System.out.println("put " + s);
+        Sink<String> a = b;
+        StringSink c = b;
+        a.put("x");     // 바이트코드: Sink.put:(Ljava/lang/Object;)V
+        c.put("y");     // 바이트코드: StringSink.put:(Ljava/lang/String;)V
+        for (var m : b.getClass().getDeclaredMethods())
+            System.out.println(m);
+    }
+}</code></pre>
+<pre data-label="실행 결과와 javap (JDK 21, 프록시는 dumpProxyClassFiles로 덤프)"><code class="language-text">put x
+put y
+public void Multi$$Lambda/0x0000008001001800.put(java.lang.String)
+public void Multi$$Lambda/0x0000008001001800.put(java.lang.Object)
+
+// javap -p 'Multi$Both'
+interface Multi$Both extends Multi$Sink<java.lang.String>, Multi$StringSink {
+}
+
+// javap -v Multi (BootstrapMethods)
+0: #98 REF_invokeStatic java/lang/invoke/LambdaMetafactory.altMetafactory:(...)Ljava/lang/invoke/CallSite;
+  Method arguments:
+    #87 (Ljava/lang/String;)V
+    #88 REF_invokeStatic Multi.lambda$main$0:(Ljava/lang/String;)V
+    #87 (Ljava/lang/String;)V
+    #91 4
+    #92 1
+    #93 (Ljava/lang/Object;)V
+
+// 생성된 프록시 클래스
+final class Multi$$Lambda implements Multi$Both {
+  public void put(java.lang.String);
+       0: aload_1
+       1: invokestatic  #17   // Method Multi.lambda$main$0:(Ljava/lang/String;)V
+       4: return
+  public void put(java.lang.Object);
+       0: aload_1
+       1: checkcast     #20   // class java/lang/String
+       4: invokestatic  #17   // Method Multi.lambda$main$0:(Ljava/lang/String;)V
+       7: return
+}</code></pre>
+<p><code>Sink<String></code>의 <code>put(T)</code>와 <code>StringSink</code>의 <code>put(String)</code>은 언어 수준에서 같은 시그니처 <code>put(String)</code>이므로 <code>Both</code>는 함수형 인터페이스다. 그러나 소거 결과는 <code>(Object)V</code>와 <code>(String)V</code>로 다르고, <code>Both</code>는 메서드를 하나도 선언하지 않았으니 javac가 브리지를 넣을 자리가 없다. 실제로 <code>javap</code>로 본 <code>Both</code>는 몸체가 비어 있다. 그래서 javac는 부트스트랩 메서드를 <code>altMetafactory</code>로 바꾸고, 앞의 세 인자 뒤에 플래그와 "추가로 구현할 디스크립터"를 덧붙였다. 4는 <code>FLAG_BRIDGES</code>(소스에서 <code>1 << 2</code>), 이어지는 1은 추가 디스크립터의 개수, <code>(Object)V</code>가 그 디스크립터다. <code>LambdaMetafactory</code>의 Javadoc은 이 플래그가 언어는 같은 메서드로 보지만 VM 시그니처가 여럿인 경우를 위한 것이라고 설명한다. 생성된 프록시에는 <code>put</code>이 둘 있고, <code>put(Object)</code>는 <code>checkcast String</code> 뒤에 같은 본문 메서드를 부른다. (<code>getDeclaredMethods</code>가 돌려주는 순서는 명세가 정하지 않는다.)</p>
+<p>이 두 번째 <code>put</code>은 역할로는 브리지지만 <code>ACC_BRIDGE</code> 플래그는 없다. JDK 21의 <code>InnerClassLambdaMetafactory</code>는 추가 디스크립터를 구현하는 메서드도 기능 메서드와 똑같이 <code>ACC_PUBLIC</code>만 주어 만든다. 위 프록시에서 <code>Method.isBridge()</code>를 부르면 두 메서드 모두 false다. 리플렉션으로 "브리지가 아닌 메서드만" 골라내는 코드는 javac가 만든 브리지(경우 1)는 걸러 내지만 메타팩토리가 만든 것(경우 2)은 걸러 내지 못한다는 뜻이다.</p>
+<p>javac가 어느 쪽을 택하는지는 JDK 21 소스의 <code>LambdaToMethod</code>에서 읽을 수 있다. 람다마다 <code>Types.functionalInterfaceBridges</code>로 함수 타입의 메서드가 오버라이드하는 같은 이름의 메서드들을 모으는데, 지워진 디스크립터가 이미 모은 것과 같거나 클래스 파일에 이미 브리지 구현이 있는 메서드는 건너뛴다. <code>needsAltMetafactory()</code>는 이렇게 모은 것이 둘 이상이거나, 타깃이 교집합 타입이거나, 직렬화가 필요할 때 true가 된다. 경우 1에서는 <code>Function.apply(Object)</code>가 <code>StringMapper</code>의 디폴트 브리지로 이미 구현되어 있어 빠지고, 경우 2에서는 두 <code>put</code>이 모두 남는다.</p>
+<h4>교집합 타입 타깃: 마커 인터페이스를 함께 구현하기</h4>
+<p><code>altMetafactory</code>가 필요한 또 하나의 경우는 타깃이 교집합 타입(intersection type)일 때다. JLS §9.9는 함수형 인터페이스 타입을 네 종류로 나누는데, 그 넷째가 "개념상의 함수형 인터페이스(notional functional interface)를 유도하는 교집합 타입"이다. JLS는 이것이 보통 <code>Runnable & java.io.Serializable</code>처럼 함수형 인터페이스와 메서드 없는 마커 인터페이스의 교집합이며, 캐스트에서 람다가 그 타입을 따르게 하는 데 쓰인다고 설명한다. 함수 타입은 그 개념상의 인터페이스의 것, 여기서는 <code>run()</code>의 것이다.</p>
+<pre><code class="language-java">public class Inter {
+    interface Marker {}
+    public static void main(String[] args) {
+        Object o = (Runnable & Marker) () -> System.out.println("run");
+        System.out.println((o instanceof Runnable) + " " + (o instanceof Marker));   // true true
+        ((Runnable) o).run();                                                        // run
+    }
+}</code></pre>
+<pre data-label="javap -v Inter (BootstrapMethods, JDK 21)"><code class="language-text">0: #54 REF_invokeStatic java/lang/invoke/LambdaMetafactory.altMetafactory:(...)Ljava/lang/invoke/CallSite;
+  Method arguments:
+    #45 ()V
+    #46 REF_invokeStatic Inter.lambda$main$0:()V
+    #45 ()V
+    #49 6
+    #50 1
+    #11 Inter$Marker
+    #51 0</code></pre>
+<p>플래그 6은 <code>FLAG_MARKERS</code>(2)와 <code>FLAG_BRIDGES</code>(4)를 합친 값이다. 이어지는 1과 <code>Inter$Marker</code>가 추가로 구현할 인터페이스의 개수와 목록이고, 마지막 0은 추가 디스크립터의 개수다. JDK 21의 javac는 브리지 목록이 비어 있지 않으면 <code>FLAG_BRIDGES</code>를 켜되 개수는 목록 길이에서 하나를 뺀 값을 적으므로, 여기서는 플래그만 켜지고 추가 메서드는 없다. 프록시 클래스는 <code>Runnable</code>과 <code>Marker</code>를 모두 구현하므로 두 <code>instanceof</code>가 모두 true다. 교집합에 <code>Serializable</code>이 들어 있으면 javac는 그것을 마커 목록에 넣지 않고 따로 <code>FLAG_SERIALIZABLE</code>(1)을 켠다. 그러면 Javadoc 설명대로 프록시는 <code>SerializedLambda</code>를 직렬화 형태로 쓰게 되며, 이를 위해 람다를 만든 클래스 쪽에도 추가 지원 코드가 생긴다.</p>
+<div class="table-wrap"><table><thead><tr><th>상황</th><th>부트스트랩</th><th>브리지·마커를 누가 만드는가</th></tr></thead><tbody>
+<tr><td>디스크립터가 하나(<code>Function<String, Integer></code> 등)</td><td><code>metafactory</code></td><td>필요 없다. 입력 캐스트만 프록시에 들어간다</td></tr>
+<tr><td>하위 인터페이스가 구체 타입으로 다시 선언</td><td><code>metafactory</code></td><td>javac가 인터페이스에 디폴트 브리지(<code>ACC_BRIDGE</code>)를 넣는다</td></tr>
+<tr><td>소거가 다른 두 상위 인터페이스를 선언 없이 합침</td><td><code>altMetafactory</code>, <code>FLAG_BRIDGES</code></td><td>메타팩토리가 프록시에 추가 메서드를 만든다(<code>ACC_BRIDGE</code> 없음)</td></tr>
+<tr><td>교집합 타입 캐스트 <code>(Runnable & Marker)</code></td><td><code>altMetafactory</code>, <code>FLAG_MARKERS</code></td><td>메타팩토리가 프록시에 마커 인터페이스를 추가한다</td></tr>
+</tbody></table></div>
+
+<h3>직렬화 가능한 람다: SerializedLambda와 $deserializeLambda$</h3>
+<p>앞에서 교집합에 <code>Serializable</code>이 들어 있으면 javac가 <code>FLAG_SERIALIZABLE</code>을 켜고 람다를 만든 클래스 쪽에도 추가 지원 코드가 생긴다고만 적었다. 그 코드가 무엇이고 왜 필요한지 따라가 보면, 람다 객체가 겉으로는 평범한 인스턴스여도 JVM 안에서는 보통의 객체와 상당히 다르게 다뤄진다는 것이 드러난다. 출발점은 JLS §15.27.4다. 타깃 함수형 인터페이스 타입이 <code>java.io.Serializable</code>의 하위 타입이면 결과 객체는 직렬화 가능한 클래스의 인스턴스가 된다. 같은 절은 람다에서 나온 객체를 직렬화 가능하게 만드는 데에는 실행 시간 부담과 보안상의 함의가 따르므로 "기본으로" 직렬화 가능할 필요는 없다고 덧붙인다. 그래서 <code>Serializable</code>을 섞지 않은 보통의 람다를 <code>ObjectOutputStream</code>에 쓰면 <code>NotSerializableException</code>이 난다.</p>
+<p>직렬화 가능하게 만들 때의 문제는 무엇을 기록하느냐다. 람다 프록시는 숨겨진 클래스이고, 이름 뒤의 주소는 실행마다 달라질 수 있으며, 바이트를 읽는 다른 JVM에는 그 클래스가 아예 없다. 클래스 이름과 필드 값을 그대로 적는 보통의 직렬화로는 읽는 쪽이 같은 클래스를 찾을 수 없다. 그래서 OpenJDK는 람다 객체 자체가 아니라 <b>그 람다를 다시 만드는 데 필요한 정보</b>를 기록한다. 그 정보를 담는 그릇이 <code>java.lang.invoke.SerializedLambda</code>다. 직접 꺼내 보자.</p>
+<pre><code class="language-java">import java.io.*;
+import java.lang.invoke.SerializedLambda;
+import java.lang.reflect.Method;
+import java.util.function.Function;
+
+public class Ser {
+    public static void main(String[] args) throws Exception {
+        int base = 10;
+        Function<Integer, Integer> f = (Function<Integer, Integer> & Serializable) x -> x + base;
+
+        Method wr = f.getClass().getDeclaredMethod("writeReplace");
+        wr.setAccessible(true);
+        SerializedLambda sl = (SerializedLambda) wr.invoke(f);
+        System.out.println("capturingClass        = " + sl.getCapturingClass());
+        System.out.println("functionalInterface   = " + sl.getFunctionalInterfaceClass()
+                + "." + sl.getFunctionalInterfaceMethodName() + sl.getFunctionalInterfaceMethodSignature());
+        System.out.println("implMethod            = " + sl.getImplClass() + "." + sl.getImplMethodName()
+                + sl.getImplMethodSignature() + " (kind " + sl.getImplMethodKind() + ")");
+        System.out.println("instantiatedMethodType= " + sl.getInstantiatedMethodType());
+        System.out.println("capturedArgs          = " + sl.getCapturedArgCount() + " -> " + sl.getCapturedArg(0));
+
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bos)) { out.writeObject(f); }
+        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bos.toByteArray()))) {
+            @SuppressWarnings("unchecked")
+            Function<Integer, Integer> g = (Function<Integer, Integer>) in.readObject();
+            System.out.println("g.apply(5) = " + g.apply(5) + ", same object? " + (f == g)
+                    + ", same class? " + (f.getClass() == g.getClass()));
+        }
+
+        Function<Integer, Integer> plain = x -> x + 1;
+        try (ObjectOutputStream out = new ObjectOutputStream(new ByteArrayOutputStream())) {
+            out.writeObject(plain);
+        } catch (NotSerializableException e) {
+            System.out.println("plain: " + e);
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과와 javap -p Ser, 덤프한 프록시 (Temurin 21.0.13)"><code class="language-text">capturingClass        = Ser
+functionalInterface   = java/util/function/Function.apply(Ljava/lang/Object;)Ljava/lang/Object;
+implMethod            = Ser.lambda$main$5b16fa8b$1(ILjava/lang/Integer;)Ljava/lang/Integer; (kind 6)
+instantiatedMethodType= (Ljava/lang/Integer;)Ljava/lang/Integer;
+capturedArgs          = 1 -> 10
+g.apply(5) = 15, same object? false, same class? false
+plain: java.io.NotSerializableException: Ser$$Lambda/0x0000007801015800
+
+// javap -p Ser
+  private static java.lang.Object $deserializeLambda$(java.lang.invoke.SerializedLambda);
+  private static java.lang.Integer lambda$main$0(java.lang.Integer);
+  private static java.lang.Integer lambda$main$5b16fa8b$1(int, java.lang.Integer);
+
+// 직렬화 가능한 람다의 프록시
+final class Ser$$Lambda implements java.util.function.Function,java.io.Serializable {
+  private final int arg$1;
+  private Ser$$Lambda(int);
+  public java.lang.Object apply(java.lang.Object);
+  private final java.lang.Object writeReplace();
+}</code></pre>
+<p>프록시에는 <code>apply</code> 외에 <code>writeReplace</code>라는 private 메서드가 하나 더 있다. 직렬화 API는 쓰려는 객체에 이 이름의 메서드가 있으면 그것이 돌려준 객체를 대신 기록한다. JDK 21의 <code>InnerClassLambdaMetafactory.generateSerializationFriendlyMethods</code>가 이 메서드를 만들며, 몸체는 위 출력에 찍힌 항목들로 <code>SerializedLambda</code>를 생성해 돌려주는 것이 전부다. 만든 클래스, 구현할 인터페이스 메서드, 실제 본문이 든 구현 메서드(kind 6은 <code>REF_invokeStatic</code>), <code>dynamicMethodType</code>에 해당하는 <code>instantiatedMethodType</code>, 그리고 캡처한 값이다. 캡처한 <code>int base</code>는 프록시의 <code>arg$1</code> 필드에서 꺼내 박싱한 뒤 <code>Object[]</code>에 담는다. 즉 바이트 스트림에 실리는 것은 람다의 클래스가 아니라 앞에서 본 부트스트랩 인자와 캡처 값이다.</p>
+<p>읽는 쪽은 반대 방향으로 간다. <code>SerializedLambda</code>에는 <code>readResolve</code>가 있어서, 역직렬화가 끝나면 이 객체 대신 그 메서드가 돌려준 객체가 결과가 된다. JDK 21 소스의 <code>readResolve</code>는 <code>capturingClass</code>에서 <code>$deserializeLambda$(SerializedLambda)</code>라는 private 정적 메서드를 리플렉션으로 찾아 호출한다. 이 메서드는 javac가 직렬화 가능한 람다를 가진 클래스에 넣어 둔 것이다. <code>javap -c</code>로 본 몸체를 요약하면 다음과 같다.</p>
+<pre data-label="javap -c -p Ser ($deserializeLambda$ 요약)"><code class="language-text">  0: getImplMethodName() → hashCode() → lookupswitch       // 구현 메서드 이름으로 후보를 고른다
+ 29: ldc "lambda$main$5b16fa8b$1" → String.equals
+ 61: getImplMethodKind() == 6
+ 73: getFunctionalInterfaceClass()     equals "java/util/function/Function"
+ 85: getFunctionalInterfaceMethodName() equals "apply"
+ 97: getFunctionalInterfaceMethodSignature() equals "(Ljava/lang/Object;)Ljava/lang/Object;"
+109: getImplClass()                     equals "Ser"
+121: getImplMethodSignature()           equals "(ILjava/lang/Integer;)Ljava/lang/Integer;"
+131: getCapturedArg(0) → checkcast Integer → intValue
+140: invokedynamic #7, 0   // InvokeDynamic #0:apply:(I)Ljava/util/function/Function;
+145: areturn
+146: new IllegalArgumentException("Invalid lambda deserialization") → athrow</code></pre>
+<p>이 메서드는 클래스 안의 직렬화 가능한 람다마다 한 갈래씩, 기록된 구현 메서드 이름과 종류, 인터페이스와 그 메서드의 이름·시그니처, 구현 클래스와 구현 메서드 시그니처가 그 람다와 일치하는지 비교한다(위 요약에서 보듯 <code>capturingClass</code>와 <code>instantiatedMethodType</code>은 비교하지 않는다). 하나라도 다르면 <code>IllegalArgumentException</code>을 던진다. <code>SerializedLambda</code>의 Javadoc이 <code>$deserializeLambda$</code>를 구현하는 쪽에 그 정보가 실제로 그 클래스가 캡처한 람다와 일치하는지 검증할 책임을 지우는데, javac는 이렇게 그 책임을 진다. 바이트 스트림을 조작해 클래스 안의 아무 private 메서드나 가리키게 만들어도, 이 목록에 없는 메서드라면 람다로 되살아나지 않는다.</p>
+<p>모든 항목이 맞으면 140번의 <code>invokedynamic</code>이 새 람다를 만든다. 실행 결과에서 <code>same class? false</code>가 나온 이유가 여기에 있다. 이 명령은 <code>main</code>의 람다 생성 명령(bci 4)과 <b>같은 상수 풀 항목 #7</b>을 가리키지만, JVMS §6.5의 <code>invokedynamic</code> 설명은 심볼 참조가 "이 특정 invokedynamic 명령"에 대해 해석되고, 그 결과인 <code>CallSite</code>가 그 명령에 묶인다고 정한다. 그래서 역직렬화 경로의 명령을 처음 실행할 때 부트스트랩 메서드가 다시 호출되고, 메타팩토리는 프록시 클래스를 하나 더 만든다. 실제로 <code>dumpProxyClassFiles</code>로 덤프하면 <code>Serializable</code>을 구현한 프록시가 두 개 나온다. <code>SerializedLambda</code>의 Javadoc도 역직렬화로 만들어진 함수 객체의 동일성은 예측할 수 없으므로 참조 비교, 객체 락, <code>System.identityHashCode()</code>가 구현마다, 심지어 같은 구현에서도 역직렬화할 때마다 다른 결과를 낼 수 있다고 적고 있다.</p>
+<h4>직렬화된 람다는 합성 메서드 이름에 묶여 있다</h4>
+<p>위 출력에서 구현 메서드 이름도 눈여겨보자. 보통 람다는 <code>lambda$main$0</code>인데, 직렬화 가능한 람다는 <code>lambda$main$5b16fa8b$1</code>이다. 기록된 정보가 결국 이 이름을 가리키므로, 소스를 고쳐 다시 컴파일했을 때 이름이 바뀌면 예전에 써 둔 바이트를 읽을 수 없다. JDK 21의 <code>LambdaToMethod</code>는 보통 람다에는 클래스마다 0부터 세는 순번(<code>lambdaName()</code>)을 붙이지만, 직렬화 가능한 람다에는 <code>serializedLambdaName()</code>으로 그 순번 대신 문자열 하나의 <code>hashCode</code>를 16진수로 붙이고, 앞부분까지 같은 이름이 겹칠 때만 늘어나는 번호(<code>$1</code>)를 끝에 단다. 그 문자열(<code>serializedLambdaDisambiguation()</code>)은 바깥 메서드의 시그니처, 타깃 인터페이스 이름, 람다를 대입한 변수 이름, 캡처한 지역 변수의 타입과 이름으로 이루어진다. 소스 주석의 표현대로 역직렬화를 위해 이름의 안정성을 최대화하려는 장치다. 그렇다면 무엇이 이름을 바꾸고 무엇이 바꾸지 않는지 직접 확인해 보자.</p>
+<pre><code class="language-java">import java.io.*;
+import java.util.function.Function;
+
+public class W {
+    static Function<Integer, Integer> make() {
+        int base = 10;
+        return (Function<Integer, Integer> & Serializable) x -> x + base;
+    }
+    public static void main(String[] args) throws Exception {
+        if (args[0].equals("write")) {
+            try (var out = new ObjectOutputStream(new FileOutputStream("f.ser"))) { out.writeObject(make()); }
+            System.out.println("written");
+        } else {
+            try (var in = new ObjectInputStream(new FileInputStream("f.ser"))) {
+                @SuppressWarnings("unchecked")
+                var g = (Function<Integer, Integer>) in.readObject();
+                System.out.println("g.apply(5) = " + g.apply(5));
+            }
+        }
+    }
+}</code></pre>
+<pre data-label="java W write 뒤에 소스를 고쳐 다시 컴파일하고 java W read (JDK 21)"><code class="language-text">== 원본: lambda$make$c9e6e30d$1(int, Integer)
+written
+
+== 수정 1: make() 첫 줄에 Runnable r = () -> {}; r.run(); 을 추가
+   lambda$make$0()                       (새로 생긴 보통 람다)
+   lambda$make$c9e6e30d$1(int, Integer)  (이름 그대로)
+g.apply(5) = 15
+
+== 수정 2: 캡처 변수 base 의 이름만 offset 으로 변경
+   lambda$make$a343a10b$1(int, Integer)
+Exception in thread "main" java.io.InvalidObjectException: ReflectiveOperationException during deserialization
+	at java.base/java.lang.invoke.SerializedLambda.readResolve(SerializedLambda.java:280)
+	...
+Caused by: java.lang.IllegalArgumentException: Invalid lambda deserialization
+	at W.$deserializeLambda$(W.java:4)</code></pre>
+<p>보통 람다를 앞에 하나 끼워 넣어도 직렬화 가능한 람다의 이름은 그대로였고 역직렬화도 성공했다. 순번이 아니라 해시로 이름을 짓기 때문이다. 반면 동작에 아무 영향이 없는 지역 변수 이름 하나를 바꾸자 해시가 바뀌었고, 새 클래스의 <code>$deserializeLambda$</code>는 예전 이름을 알아보지 못해 예외를 던졌다. 정리하면 직렬화된 람다는 "그 람다를 만든 클래스의 그 컴파일 결과"에 묶인 데이터다. 같은 버전의 코드끼리 잠깐 주고받는 데는 쓸 수 있지만, 오래 저장하거나 서로 다르게 컴파일된 시스템 사이에서 주고받는 형식으로는 기대기 어렵다. 함수를 저장하거나 전송해야 한다면 람다 대신 이름이 있는 클래스나 enum 상수처럼 직렬화 형식을 직접 통제할 수 있는 형태가 필요하다.</p>
+
+<h3>제네릭 메서드와 함수: 추론과 와일드카드</h3>
+<p>함수형 인터페이스가 제네릭이 되면 이번에는 그 함수를 <b>받는</b> 메서드도 제네릭이 된다. 리스트의 원소마다 함수를 적용해 새 리스트를 만드는 메서드를 생각해 보자. 이런 메서드를 어떻게 쓰는지는 다음 회차에서 본격적으로 다루고, 여기서는 타입이 어떻게 결정되는지만 본다.</p>
+<pre><code class="language-java">static <T, R> List<R> map(List<T> list, Function<T, R> f) {
+    List<R> result = new ArrayList<>();
+    for (T t : list) result.add(f.apply(t));
+    return result;
+}
+
+List<String> names = List.of("kim", "lee");
+List<Integer> lengths = map(names, s -> s.length());   // [3, 3]</code></pre>
+<p>호출 <code>map(names, s -> s.length())</code>에서 컴파일러는 타입 추론(type inference)으로 <code>T</code>와 <code>R</code>을 정한다. <code>names</code>가 <code>List<String></code>이므로 <code>T</code>는 <code>String</code>이다. 그러면 람다의 대상 타입이 <code>Function<String, R></code>이 되고, 매개변수 <code>s</code>는 <code>String</code>이 된다. 람다 본문 <code>s.length()</code>는 <code>int</code>를 내므로 박싱을 거쳐 <code>Integer</code>와 호환되고, 결과를 받는 변수가 <code>List<Integer></code>이므로 <code>R</code>은 <code>Integer</code>로 정해진다. 람다의 매개변수 타입은 바깥(<code>T</code>)에서 들어오고, 람다의 반환 타입은 다시 바깥(<code>R</code>)을 정하는 데 쓰인다. 람다와 제네릭 메서드는 이렇게 서로의 타입을 주고받는다.</p>
+<p>이 선언에는 숨은 약점이 있다. 이미 만들어 둔 함수 객체를 넘길 때 드러난다.</p>
+<pre><code class="language-java">Function<Object, String> describe = o -> "[" + o + "]";   // 무엇이든 받는 함수
+Function<String, Integer> length  = s -> s.length();
+
+List<String> a = map(names, describe);   // 컴파일 오류
+List<Number> b = map(names, length);     // 컴파일 오류
+List<Number> c = map(names, s -> s.length());   // 통과</code></pre>
+<pre data-label="javac 출력 (JDK 21, 일부)"><code class="language-text">Strict.java:13: error: method map in class Strict cannot be applied to given types;
+        List<String> a = map(names, describe);
+                         ^
+  required: List<T>,Function<T,R>
+  found:    List<String>,Function<Object,String>
+  reason: inference variable T has incompatible equality constraints Object,String
+Strict.java:14: error: incompatible types: inference variable R has incompatible equality constraints Number,Integer
+        List<Number> b = map(names, length);
+                            ^</code></pre>
+<p>첫 번째 오류부터 보자. <code>describe</code>는 어떤 객체든 받을 수 있는 함수이니 문자열을 넘기는 데 아무 문제가 없어야 한다. 그런데 <code>List<T></code>에서는 <code>T = String</code>이라는 제약이, <code>Function<T, R></code>에서는 <code>T = Object</code>라는 제약이 나온다. 제네릭 타입은 무공변(invariant)이어서 <code>Function<Object, String></code>은 <code>Function<String, String></code>의 하위 타입이 아니고, 두 제약이 모두 "같아야 한다(equality)"이므로 충돌한다. 두 번째 오류는 반환 쪽에서 같은 일이 일어난 것이다. 결과를 <code>List<Number></code>로 받으려니 <code>R = Number</code>인데, 넘긴 함수는 <code>R = Integer</code>로 고정되어 있다.</p>
+<p>세 번째 줄이 통과하는 이유가 흥미롭다. 람다는 미리 만들어진 객체가 아니라 <b>문맥에 맞춰 타입이 정해지는 식</b>이다. <code>R = Number</code>로 정해진 뒤 람다는 <code>Function<String, Number></code>로 만들어지고, 본문의 <code>int</code>는 박싱되어 <code>Integer</code>가 되며 이는 <code>Number</code>에 대입 가능하다. 같은 계산이라도 람다로 바로 쓰면 통과하고 변수에 담아 두었다가 넘기면 실패하는 것은 이 차이 때문이다.</p>
+<p>해결책은 함수의 매개변수 자리를 <code>? super T</code>로, 반환 자리를 <code>? extends R</code>로 여는 것이다. 함수는 매개변수로 값을 <b>소비</b>하고 반환값으로 값을 <b>생산</b>한다. <code>T</code>를 받을 수 있는 함수라면 <code>T</code>의 상위 타입을 받는 함수여도 되고, <code>R</code>을 내야 하는 자리라면 <code>R</code>의 하위 타입을 내는 함수여도 된다. 선언을 <code>Function<? super T, ? extends R> f</code>로 바꾸면 세 줄 모두 컴파일되고 결과는 <code>[[kim], [lee]] [3, 3] [3, 3]</code>이다. JDK의 API가 바로 이렇게 선언되어 있다.</p>
+<div class="table-wrap"><table><thead><tr><th>JDK 21의 선언</th><th>와일드카드의 위치</th></tr></thead><tbody>
+<tr><td><code>Stream<T>.map(Function<? super T, ? extends R> mapper)</code></td><td>입력은 super, 출력은 extends</td></tr>
+<tr><td><code>Stream<T>.filter(Predicate<? super T> predicate)</code></td><td>입력만 있으므로 super</td></tr>
+<tr><td><code>Iterable<T>.forEach(Consumer<? super T> action)</code></td><td>입력만 있으므로 super</td></tr>
+<tr><td><code>Map<K,V>.computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction)</code></td><td>입력은 super, 출력은 extends</td></tr>
+</tbody></table></div>
+<p>함수형 인터페이스와 제네릭이 만나는 곳에는 한 가지 제약이 더 있다. 인터페이스가 아니라 <b>추상 메서드 자체</b>가 제네릭이면 람다로 구현할 수 없다. JLS §15.27.3은 람다가 함수 타입과 맞으려면 그 함수 타입에 타입 매개변수가 없어야 한다고 정한다. 람다 문법에는 <code><T></code> 같은 타입 매개변수를 선언할 자리가 없기 때문이다.</p>
+<pre><code class="language-java">interface Identity { <T> T id(T t); }   // 메서드가 제네릭이다
+
+Identity i = t -> t;                    // 컴파일 오류</code></pre>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">T2.java:12: error: incompatible types: invalid functional descriptor for lambda expression
+        Identity i = t -> t;
+                     ^
+    method <T>(T)T in interface Identity is generic
+  where T is a type-variable:
+    T extends Object declared in method <T>id(T)</code></pre>
+<p><code>Identity</code>는 여전히 함수형 인터페이스이지만 람다는 받을 수 없다. 이 인터페이스는 <code>static <T> T same(T t)</code> 같은 제네릭 메서드를 가리키는 메서드 참조(<code>GenRef::same</code>)로는 구현할 수 있다. 실제로 그렇게 하면 <code>i.id("kim")</code>과 <code>i.id(7)</code>이 각각 <code>String</code>과 <code>Integer</code>를 돌려준다. 메서드 참조의 규칙은 04회에서 다룬다. 실무에서는 타입 매개변수를 메서드가 아니라 인터페이스에 두는 것이 일반적이고, <code>java.util.function</code>의 인터페이스도 전부 그렇게 되어 있다.</p>
+
+<h3>람다에는 스스로의 타입이 없다: 타깃 타입</h3>
+<p>지금까지의 예제에서 람다의 타입은 늘 바깥에서 정해졌다. 변수 선언의 타입, 메서드 매개변수의 타입이 람다가 무엇이 될지를 결정했다. 이것은 우연이 아니라 람다라는 식(expression)의 본질이다. JLS는 람다를 <b>폴리 식(poly expression)</b>으로 분류한다. 폴리 식은 식 자체만 보고는 타입이 정해지지 않고, 그 식이 놓인 문맥이 기대하는 타입, 즉 <b>타깃 타입(target type)</b>을 알아야 타입이 정해지는 식이다. <code>3 + 4</code>는 어디에 있든 <code>int</code>이지만, <code>s -> s.length()</code>는 어디에 있느냐에 따라 <code>Function<String, Integer></code>일 수도, <code>ToIntFunction<String></code>일 수도, 직접 만든 어떤 인터페이스일 수도 있다.</p>
+<p>그래서 JLS §15.27은 람다가 <b>대입 문맥(assignment context), 호출 문맥(invocation context), 캐스트 문맥(casting context)</b> 이외의 곳에 나타나면 컴파일 오류라고 정한다. 세 문맥은 모두 "이 자리에는 이런 타입이 와야 한다"는 정보를 가진 곳이다. 타깃 타입이 없거나, 있어도 함수형 인터페이스가 아니면 람다는 갈 곳이 없다. javac로 직접 확인해 보자.</p>
+<pre><code class="language-java">Object o = () -> System.out.println("hi");      // (1) 타깃 타입이 Object
+var f = (String s) -> s.length();               // (2) 타깃 타입이 없다
+(s -> s.length()).apply("x");                   // (3) 문맥이 없는 곳
+Object o2 = (Runnable) () -> System.out.println("hi");   // (4) 캐스트 문맥: 통과</code></pre>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">T1.java:5: error: incompatible types: Object is not a functional interface
+        Object o = () -> System.out.println("hi");
+                   ^
+T1.java:6: error: cannot infer type for local variable f
+        var f = (String s) -> s.length();
+            ^
+  (lambda expression needs an explicit target-type)
+T1.java:12: error: lambda expression not expected here
+        (s -> s.length()).apply("x");
+         ^</code></pre>
+<p>(1)은 타깃 타입이 있지만 <code>Object</code>는 함수형 인터페이스가 아니다. 모든 람다 객체는 결국 <code>Object</code>이지만, 컴파일러는 <code>Object</code>에서 함수 타입을 끌어낼 수 없으니 람다를 어떤 인터페이스로 만들지 정할 수 없다. (2)는 반대 방향의 문제다. <code>var</code>는 오른쪽 식의 타입으로 왼쪽 변수의 타입을 정하는데, 람다는 왼쪽이 정해져야 자기 타입이 정해진다. 서로가 서로를 기다리므로 추론이 불가능하다. 매개변수 타입을 <code>(String s)</code>로 명시해도 소용없다. 매개변수 타입을 안다고 해서 그것이 <code>Function</code>인지 <code>ToIntFunction</code>인지 정해지지는 않기 때문이다. (3)은 메서드 호출의 수신 객체 자리로, 어떤 타입도 기대되지 않는 곳이다. (4)처럼 캐스트를 씌우면 캐스트가 타깃 타입을 제공하므로 통과한다.</p>
+<p>세 가지 기본 문맥만 있는 것 같지만 타깃 타입은 여러 겹으로 전달된다. 조건 연산자의 두 피연산자는 조건식 전체의 타깃 타입을 물려받고, return 문의 식은 메서드의 반환 타입을, 람다 본문의 식은 바깥 람다의 함수 타입이 정한 반환 타입을 물려받는다. 다음 코드는 모두 컴파일되고 <code>inner</code>, <code>LOUD</code>를 차례로 출력한다.</p>
+<pre><code class="language-java">static Runnable make(boolean loud) {
+    // return 문 → 조건 연산자 → 두 람다 모두 Runnable
+    return loud ? () -> System.out.println("LOUD") : () -> System.out.println("quiet");
+}
+
+Supplier<Runnable> factory = () -> () -> System.out.println("inner");  // 바깥 람다의 반환 타입이 안쪽 람다의 타깃
+factory.get().run();   // inner
+make(true).run();      // LOUD</code></pre>
+<p>타깃 타입이 같은 람다 본문을 전혀 다른 객체로 만든다는 점도 기억해 두자. <code>() -> System.out.println("same body")</code>를 <code>Runnable</code> 변수에 대입하면 <code>Runnable</code>을 구현한 객체가 되어 <code>new Thread(r)</code>에 넘길 수 있다. 같은 일을 <code>Callable<Void></code>로 하려면 본문이 값을 돌려줘야 하므로 <code>() -> { System.out.println("same body"); return null; }</code>로 써야 한다. 두 객체는 서로 다른 클래스의 인스턴스이고 서로 대입할 수 없다.</p>
+<h4>타깃 타입이 와일드카드를 가질 때</h4>
+<p>앞에서 본 <code>Function<? super T, ? extends R></code>처럼 타깃 타입에 와일드카드가 들어 있으면, 람다는 어떤 매개변수 타입과 반환 타입으로 만들어질까. 와일드카드 자체는 구체적인 타입이 아니므로 그대로는 함수 타입을 정할 수 없다. JLS §15.27.3은 이때 <b>그라운드 타깃 타입(ground target type)</b>을 따로 구한다고 정한다. 매개변수 타입을 생략한 람다라면 JLS §9.9의 "와일드카드가 아닌 매개변수화(non-wildcard parameterization)"를 쓴다. 규칙은 단순하다. <code>? super L</code>은 <code>L</code>로, <code>? extends U</code>는 <code>U</code>와 타입 매개변수 상한의 교집합으로, 아무 제한 없는 <code>?</code>는 타입 매개변수의 상한으로 바꾼다.</p>
+<pre><code class="language-java">Function<? super String, ? extends Number> f = s -> s.length();
+Number n = f.apply("abcd");   // 4</code></pre>
+<p>이 경우 그라운드 타깃 타입은 <code>Function<String, Number></code>다. 그래서 <code>s</code>는 <code>String</code>이 되어 <code>s.length()</code>를 부를 수 있고, 본문의 <code>int</code>는 박싱되어 <code>Number</code> 자리에 들어간다.</p>
+<h4>명시한 매개변수 타입은 정확히 같아야 한다</h4>
+<p>람다 매개변수에 타입을 직접 적으면 그 타입은 함수 타입의 매개변수 타입과 <b>정확히 같아야</b> 한다(JLS §15.27.3). 메서드 오버라이딩과 달리 더 넓은 타입을 받겠다고 선언할 수 없다. <code>Object</code>를 받는 함수는 <code>String</code>도 받을 수 있으니 논리적으로는 문제가 없어 보이지만 규칙이 허용하지 않는다.</p>
+<pre><code class="language-java">Function<String, Integer> f = (Object o) -> o.hashCode();   // 컴파일 오류
+Function<String, Integer> g = (String s) -> s.length();     // 통과</code></pre>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">E.java:4: error: incompatible types: incompatible parameter types in lambda expression
+        Function<String, Integer> f = (Object o) -> o.hashCode();
+                                      ^</code></pre>
+<x-visual id="java-adv3-02-target-typing" title="같은 람다 본문이 타깃 타입에 따라 다른 객체가 되는 모습" kind="개념도" ratio="16:9">
+<x-hint>람다 식 하나가 문맥이 주는 타깃 타입에 따라 서로 다른 함수형 인터페이스의 객체로 만들어지고, 타깃 타입이 없으면 오류가 된다는 것을 보여 준다.</x-hint>
+<x-prompt>A conceptual diagram on a white background. In the center-left, a rounded rectangle containing the code text "s -> s.length()". Three arrows fan out to the right, each ending at a box. Top box labeled "Function<String, Integer>" with a small note under it "apply(Object)Object". Middle box labeled "ToIntFunction<String>" with a note "applyAsInt(Object)int". Bottom box labeled "StringToInt (직접 만든 인터페이스)". Each arrow carries a small tag reading "타깃 타입". A fourth arrow goes downward from the central box to a gray box with a red X labeled "Object o = ... → 오류". A title at the top reads "람다의 타입은 문맥이 정한다". Flat design, thin lines, sans-serif font, no more than 9 labels.</x-prompt>
+<x-caption>람다는 스스로 타입을 갖지 않는다. 대입·호출·캐스트 문맥이 주는 타깃 타입이 그 람다가 어떤 인터페이스의 객체가 될지 정한다.</x-caption>
+</x-visual>
+
+<h3>모양이 같아도 이름이 다르면 다른 타입이다</h3>
+<p>람다가 문맥에 따라 어떤 인터페이스든 될 수 있다고 해서, 이미 만들어진 함수 객체도 그렇게 자유로운 것은 아니다. 자바의 타입 호환성은 구조가 아니라 이름과 선언된 상속 관계로 정해진다. 이를 명목적 타이핑(nominal typing)이라고 한다. 메서드 모양이 똑같은 두 인터페이스라도 상속 관계가 없으면 서로 대입할 수 없다.</p>
+<pre><code class="language-java">interface StringToInt { int convert(String s); }
+
+Function<String, Integer> fn = s -> s.length();
+StringToInt sti = fn;            // 컴파일 오류
+StringToInt ok  = s -> s.length();     // 람다: 새로 타입이 정해진다
+StringToInt ok2 = fn::apply;           // 메서드 참조: fn을 감싼 새 객체</code></pre>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">T1.java:8: error: incompatible types: Function<String,Integer> cannot be converted to StringToInt
+        StringToInt sti = fn;
+                          ^</code></pre>
+<p>차이는 <b>식인가, 값인가</b>에 있다. 람다 <code>s -> s.length()</code>는 아직 타입이 정해지지 않은 식이므로 <code>StringToInt</code> 자리에 놓이면 <code>StringToInt</code>로 만들어진다. 반면 <code>fn</code>은 이미 만들어진 객체를 가리키는 변수이고, 그 객체의 클래스는 <code>Function</code>을 구현했을 뿐 <code>StringToInt</code>를 구현하지 않았다. 객체의 클래스는 만들어진 뒤 바뀌지 않으므로 대입은 일반 참조 타입 변환 규칙을 따르고, 상속 관계가 없으니 실패한다. 두 타입을 잇고 싶다면 <code>fn::apply</code>나 <code>s -> fn.apply(s)</code>처럼 기존 객체에 위임하는 <b>새 객체</b>를 만들어야 한다. 이때 호출이 한 단계 더 생긴다는 점도 알아 두자.</p>
+<p>상속 관계가 있으면 한 방향으로만 대입된다. <code>UnaryOperator<T></code>는 <code>Function<T, T></code>를 상속하므로 <code>UnaryOperator<String></code>은 <code>Function<String, String></code> 변수에 대입할 수 있다. 반대는 안 된다. <code>List.replaceAll</code>은 <code>UnaryOperator<E></code>를 받도록 선언되어 있어서, <code>Function<String, String></code> 변수를 넘기면 거부된다.</p>
+<pre><code class="language-java">Function<String, String> f = s -> s.toUpperCase();
+UnaryOperator<String> u = f;              // 컴파일 오류
+List<String> names = new ArrayList<>(List.of("kim"));
+names.replaceAll(f);                      // 컴파일 오류
+names.replaceAll(f::apply);               // 통과: UnaryOperator로 감싼다</code></pre>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">Pred2.java:6: error: incompatible types: Function<String,String> cannot be converted to UnaryOperator<String>
+        UnaryOperator<String> u = f;
+                                  ^
+Pred2.java:8: error: incompatible types: Function<String,String> cannot be converted to UnaryOperator<String>
+        names.replaceAll(f);
+                         ^</code></pre>
+<p>이 성질은 API를 설계할 때 중요한 판단 기준이 된다. 메서드 매개변수를 직접 만든 함수형 인터페이스로 선언하면, 호출하는 쪽이 람다를 바로 쓸 때는 불편이 없지만 이미 <code>Function</code>으로 가지고 있는 객체를 넘기려면 매번 감싸야 한다. 표준 인터페이스를 쓰면 이런 변환이 필요 없다. 반대로 도메인에서 의미가 분명한 이름(예: <code>DiscountPolicy</code>)이 주는 가독성을 택할 수도 있다. 어느 쪽이든 "모양이 같으니 알아서 맞춰지겠지"라는 기대는 람다 식에만 통한다.</p>
+
+<h3>오버로딩과 람다: 컴파일러는 어느 메서드를 고르는가</h3>
+<p>타깃 타입이 람다의 타입을 정한다면, 같은 이름의 메서드가 서로 다른 함수형 인터페이스를 받도록 오버로딩되어 있을 때는 어떻게 될까. 타깃 타입 후보가 둘이 되는 셈이다. 이 문제를 풀려면 먼저 람다 본문의 두 가지 성질을 알아야 한다.</p>
+<p>JLS §15.27.2는 블록 본문의 모든 return 문이 <code>return;</code> 꼴이면 <b>void 호환(void-compatible)</b>, 블록이 정상적으로 끝날 수 없고 모든 return 문이 <code>return 식;</code> 꼴이면 <b>값 호환(value-compatible)</b>이라고 정의한다. 본문이 블록이 아니라 식 하나일 때는 그 식이 문장으로도 쓰일 수 있는 식(statement expression), 예를 들어 메서드 호출이나 대입이라면 void를 돌려주는 함수 타입과도 호환된다. 결과는 버려진다. JLS §15.27.3의 표현대로, <code>() -> expr</code>에서 <code>expr</code>이 문장 식이면 타깃 타입에 따라 <code>() -> { return expr; }</code>로도, <code>() -> { expr; }</code>로도 해석된다.</p>
+<pre><code class="language-java">List<String> list = new ArrayList<>();
+Consumer<String>  adder  = s -> list.add(s);   // void로 해석: 반환값 boolean을 버린다
+Predicate<String> adder2 = s -> list.add(s);   // 값으로 해석: boolean을 돌려준다
+adder.accept("a");
+System.out.println(adder2.test("b") + " " + list);   // true [a, b]</code></pre>
+<p>같은 본문 <code>list.add(s)</code>가 두 인터페이스 모두에 맞는다. 그렇다면 둘 다 받는 오버로딩이 있을 때는 어느 쪽인가. 다음 실험의 결과는 javac(JDK 21)로 확인한 것이다.</p>
+<pre><code class="language-java">static void run(Runnable r)       { System.out.println("Runnable"); r.run(); }
+static <T> void run(Supplier<T> s) { System.out.println("Supplier -> " + s.get()); }
+
+static int counter = 0;
+static int next() { return ++counter; }
+
+run(() -> next());                         // Supplier -> 1
+run(() -> { next(); });                    // Runnable
+run(() -> System.out.println("print"));    // Runnable, 이어서 print</code></pre>
+<p>둘째와 셋째는 쉽다. <code>{ next(); }</code>는 return 문이 없는 블록이라 void 호환일 뿐 값 호환이 아니고, <code>System.out.println(...)</code>은 반환 타입이 void라 값이 될 수 없다. 후보가 <code>Runnable</code> 하나로 줄어든다. 문제는 첫째다. <code>next()</code>는 문장 식이면서 <code>int</code> 값을 내므로 두 메서드에 모두 맞는다. 이때는 JLS §15.12.2.5의 "가장 구체적인 메서드" 규칙이 작동한다. 이 규칙에 따르면 서로 상속 관계가 없는 두 함수형 인터페이스 S와 T에 대해, 인자가 <b>명시적 타입 람다(explicitly typed lambda)</b>이고 T의 함수 타입 반환형이 void이면 S가 더 구체적이다. 그래서 값을 돌려주는 <code>Supplier</code> 쪽이 선택된다.</p>
+<p>여기서 "명시적 타입 람다"라는 조건이 핵심이다. JLS §15.27.1은 모든 매개변수에 타입을 적은 람다를 명시적 타입, 모두 생략한 람다를 암묵적 타입이라 부르고, <b>매개변수가 없는 람다는 명시적 타입</b>으로 본다. <code>() -> next()</code>는 매개변수가 없으니 명시적 타입이라 규칙이 적용되었다. 매개변수가 있는 람다에서는 결과가 달라진다.</p>
+<pre><code class="language-java">static void exec(Consumer<String> c)          { System.out.println("Consumer"); }
+static void exec(Function<String, Integer> f) { System.out.println("Function"); }
+
+exec(s -> s.length());            // 컴파일 오류: 모호하다
+exec((String s) -> s.length());   // Function</code></pre>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">T5.java:6: error: reference to exec is ambiguous
+        exec(s -> s.length());
+        ^
+  both method exec(Consumer<String>) in T5 and method exec(Function<String,Integer>) in T5 match</code></pre>
+<p>암묵적 타입 람다 <code>s -> s.length()</code>는 반환형 비교 규칙의 대상이 아니므로 두 후보 중 어느 쪽도 더 구체적이지 않고, 모호하다는 오류가 난다. 매개변수 타입을 적으면 규칙이 적용되어 <code>Function</code>이 선택된다. 같은 본문인데 매개변수 타입 표기 하나로 결과가 갈리는 셈이다. 이런 미묘함 때문에 서로 다른 함수형 인터페이스를 받는 같은 이름의 메서드를 만들면 사용자는 매개변수 타입을 적느냐 마느냐에 따라 다른 결과를 만나게 된다. 함수를 받는 메서드를 설계할 때는 오버로딩 대신 이름을 나누는 쪽이 이 문제를 원천적으로 피한다.</p>
+<p>JDK에도 이런 오버로딩이 있다. <code>ExecutorService.submit</code>은 <code>Runnable</code>을 받는 것과 <code>Callable<T></code>를 받는 것이 있다. 자바 고급 1편의 스레드 풀에서 써 본 메서드다.</p>
+<pre><code class="language-java">ExecutorService es = Executors.newSingleThreadExecutor();
+Future<?> f1 = es.submit(() -> System.out.println("side effect"));   // void 호출: Runnable
+Future<?> f2 = es.submit(() -> 42);                                  // 값: Callable
+System.out.println(f1.get() + " " + f2.get());
+es.shutdown();</code></pre>
+<pre data-label="실행 결과"><code class="language-text">side effect
+null 42</code></pre>
+<p><code>println</code>은 void라 값 호환이 아니므로 <code>Runnable</code> 버전이 선택되고, 그 <code>Future</code>의 <code>get()</code>은 <code>null</code>을 돌려준다. <code>42</code>는 문장 식이 아니므로 void 호환이 아니어서 <code>Callable</code> 버전이 선택된다. <code>side effect</code>가 항상 먼저 찍히는 이유는 <code>f1.get()</code>이 작업이 끝날 때까지 기다린 뒤에야 <code>println</code>의 인자가 완성되기 때문이다.</p>
+
+<h3>기본 함수형 인터페이스: Function, Consumer, Supplier, Runnable</h3>
+<p>함수 모양마다 인터페이스를 직접 만들 필요가 없도록 자바 8은 <code>java.util.function</code> 패키지를 추가했다. 패키지 문서는 이 인터페이스들이 모든 함수 모양을 망라하지는 않지만 흔한 요구를 충족하기에 충분하도록 골랐다고 밝힌다. 그 중심에는 네 가지 기본 모양이 있다. 여기에 이 패키지 밖에 있지만 같은 자리에 놓이는 <code>Runnable</code>을 함께 보자.</p>
+<div class="table-wrap"><table><thead><tr><th>인터페이스</th><th>추상 메서드</th><th>모양</th><th>패키지(도입)</th></tr></thead><tbody>
+<tr><td><code>Function<T, R></code></td><td><code>R apply(T t)</code></td><td>T 하나를 받아 R을 낸다</td><td>java.util.function (1.8)</td></tr>
+<tr><td><code>Consumer<T></code></td><td><code>void accept(T t)</code></td><td>T 하나를 받고 아무것도 내지 않는다</td><td>java.util.function (1.8)</td></tr>
+<tr><td><code>Supplier<T></code></td><td><code>T get()</code></td><td>아무것도 받지 않고 T를 낸다</td><td>java.util.function (1.8)</td></tr>
+<tr><td><code>Runnable</code></td><td><code>void run()</code></td><td>받지도 내지도 않는다</td><td>java.lang (1.0)</td></tr>
+<tr><td><code>Callable<V></code></td><td><code>V call() throws Exception</code></td><td>받지 않고 V를 내며 검사 예외를 던질 수 있다</td><td>java.util.concurrent (1.5)</td></tr>
+</tbody></table></div>
+<p>모양을 입력의 개수와 출력의 유무로 보면 체계가 보인다. 입력 1, 출력 1이 <code>Function</code>, 입력 1, 출력 0이 <code>Consumer</code>, 입력 0, 출력 1이 <code>Supplier</code>, 입력 0, 출력 0이 <code>Runnable</code>이다. <code>Runnable</code>과 <code>Callable</code>은 람다보다 훨씬 오래되었지만 추상 메서드가 하나뿐이었기 때문에 함수형 인터페이스의 정의를 그대로 만족한다. 두 인터페이스의 소스에는 지금 <code>@FunctionalInterface</code>가 붙어 있는데, 이 애너테이션 자체가 1.8에 생겼으니 붙은 시점도 그 이후다. 자바는 오래된 인터페이스를 버리지 않고 람다의 타깃으로 그대로 흡수했다. <code>Comparator</code>(1.2)도 마찬가지다.</p>
+<h4>Function: 변환과 합성</h4>
+<p><code>Function</code>은 값을 다른 값으로 바꾸는 변환이다. 스트림의 <code>map</code>, <code>Map.computeIfAbsent</code>가 이것을 받는다. 추상 메서드 외에 디폴트 메서드 <code>andThen</code>과 <code>compose</code>, 정적 메서드 <code>identity</code>를 가진다. JDK 21 소스에서 <code>andThen</code>은 <code>(T t) -> after.apply(apply(t))</code>를, <code>compose</code>는 <code>(V v) -> apply(before.apply(v))</code>를 돌려준다. 둘 다 새 람다 객체를 만들어 돌려주며, 원래 함수 객체는 바뀌지 않는다.</p>
+<pre><code class="language-java">Function<Integer, Integer> plus1  = x -> x + 1;
+Function<Integer, Integer> times2 = x -> x * 2;
+System.out.println(plus1.andThen(times2).apply(5));   // 12: (5 + 1) * 2
+System.out.println(plus1.compose(times2).apply(5));   // 11: (5 * 2) + 1</code></pre>
+<p><code>a.andThen(b)</code>는 "a를 먼저, 그다음 b", <code>a.compose(b)</code>는 "b를 먼저, 그 결과에 a"다. 수학의 함수 합성 <code>(f ∘ g)(x) = f(g(x))</code>가 <code>f.compose(g)</code>에 해당한다. 합성된 함수를 호출하면 호출이 겹겹이 일어난다는 점도 알아 두자. <code>plus1.andThen(times2).apply(5)</code>는 합성 람다의 <code>apply</code>가 <code>plus1.apply</code>를 부르고, 그 결과로 <code>times2.apply</code>를 부른다. 각 단계에서 <code>Integer</code> 박싱과 언박싱이 일어난다.</p>
+<h4>Consumer: 부수 효과</h4>
+<p><code>Consumer</code>는 값을 받아 무언가를 <b>하는</b> 함수다. 반환값이 없으니 쓸모가 있으려면 출력, 컬렉션 변경, 필드 갱신 같은 부수 효과(side effect)를 일으켜야 한다. <code>Iterable.forEach</code>가 이것을 받는다. 디폴트 메서드 <code>andThen</code>으로 여러 동작을 순서대로 이을 수 있다.</p>
+<pre><code class="language-java">List<String> log = new ArrayList<>();
+Consumer<String> print = s -> System.out.println("print " + s);
+Consumer<String> save  = s -> log.add(s);
+print.andThen(save).accept("hello");   // print hello
+System.out.println(log);               // [hello]</code></pre>
+<p>부수 효과를 일으키는 함수라는 사실은 나중에 병렬 스트림을 다룰 때(10회) 다시 중요해진다. 여러 스레드가 동시에 <code>save</code> 같은 <code>Consumer</code>를 호출하면, 스레드 안전하지 않은 <code>ArrayList</code>에 동시에 쓰게 된다. 자바 고급 1편에서 본 경쟁 조건이 람다 안에서도 똑같이 일어난다.</p>
+<h4>Supplier: 지연된 값</h4>
+<p><code>Supplier</code>는 입력 없이 값을 만들어 낸다. 같은 모양의 람다 <code>() -> buildReport()</code>와 그냥 <code>buildReport()</code>의 차이는 <b>언제 계산되는가</b>다. 메서드 인자로 <code>buildReport()</code>를 쓰면 메서드가 호출되기 전에 무조건 계산된다. 자바는 인자를 먼저 평가하고 메서드를 호출하기 때문이다. <code>Supplier</code>로 넘기면 계산하는 코드만 넘어가고, 실제 계산은 받는 쪽이 <code>get()</code>을 부를 때 일어난다.</p>
+<pre><code class="language-java">static String buildReport() {
+    System.out.println("  (buildReport 실행)");
+    return "report#1";
+}
+
+static void debug(boolean enabled, Supplier<String> message) {
+    if (enabled) {
+        System.out.println("DEBUG " + message.get());
+    }
+}
+
+debug(false, () -> buildReport());   // 아무것도 출력되지 않는다
+debug(true,  () -> buildReport());</code></pre>
+<pre data-label="실행 결과"><code class="language-text">  (buildReport 실행)
+DEBUG report#1</code></pre>
+<p>첫 호출에서는 <code>buildReport</code>가 아예 실행되지 않았다. 이것이 지연 평가(lazy evaluation)의 가장 작은 형태다. JDK에도 이 모양이 여러 곳에 있다. <code>Objects.requireNonNull(T obj, Supplier<String> messageSupplier)</code>는 객체가 null일 때만 메시지를 만들고, <code>Optional.orElseGet(Supplier<? extends T>)</code>는 값이 없을 때만 대체 값을 만든다. 후자는 08회에서 <code>orElse</code>와 비교해 다시 본다. 스트림 파이프라인의 지연 평가(05회)도 같은 생각을 더 크게 확장한 것이다.</p>
+
+<h3>특화 함수형 인터페이스: Predicate, UnaryOperator, BinaryOperator</h3>
+<p>기본 네 모양만으로도 대부분의 함수를 표현할 수 있다. 조건 검사는 <code>Function<T, Boolean></code>, 같은 타입으로의 변환은 <code>Function<T, T></code>, 같은 타입 두 개를 합치는 연산은 <code>BiFunction<T, T, T></code>로 쓰면 된다. 그런데도 자바는 이 세 경우를 위해 별도의 인터페이스를 두었다. 각각 이유가 있다.</p>
+<h4>Predicate: Function&lt;T, Boolean&gt;과 무엇이 다른가</h4>
+<p><code>Predicate<T></code>의 추상 메서드는 <code>boolean test(T t)</code>다. 반환형이 래퍼 <code>Boolean</code>이 아니라 기본형 <code>boolean</code>이라는 점이 첫 번째 차이다. <code>Function<T, Boolean></code>은 반환형이 참조 타입이므로 <code>null</code>을 돌려줄 수 있고, 그 결과를 <code>if</code>에 쓰면 언박싱 과정에서 <code>NullPointerException</code>이 난다. <code>Predicate</code>는 이런 상태를 타입 수준에서 없앤다.</p>
+<pre><code class="language-java">Function<String, Boolean> isBlankFn = s -> s.isBlank() ? Boolean.TRUE : null;
+if (isBlankFn.apply("x")) { /* ... */ }   // 언박싱에서 예외</code></pre>
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">Exception in thread "main" java.lang.NullPointerException: Cannot invoke "java.lang.Boolean.booleanValue()" because the return value of "java.util.function.Function.apply(Object)" is null</code></pre>
+<p>메시지가 정확히 무슨 일이 일어났는지 말해 준다. <code>if</code> 조건에 <code>Boolean</code>이 오면 javac는 <code>booleanValue()</code> 호출을 끼워 넣고, 그 수신 객체가 <code>null</code>이었다. 두 번째 차이는 조건 조합 메서드다. <code>Predicate</code>에는 디폴트 메서드 <code>and</code>, <code>or</code>, <code>negate</code>와 정적 메서드 <code>isEqual</code>, 그리고 Java 11에 추가된 정적 메서드 <code>not</code>이 있다. JDK 21 소스에서 <code>and</code>는 <code>(t) -> test(t) && other.test(t)</code>, <code>or</code>는 <code>(t) -> test(t) || other.test(t)</code>로 구현되어 있다. 자바의 <code>&&</code>와 <code>||</code>를 그대로 쓰므로 단락 평가(short-circuit)가 그대로 적용된다. 앞의 조건으로 결과가 정해지면 뒤의 <code>Predicate</code>는 호출되지 않는다.</p>
+<pre><code class="language-java">Predicate<String> isBlank   = s -> s.isBlank();
+Predicate<String> notBlank  = isBlank.negate();
+Predicate<String> shortWord = s -> s.length() <= 3;
+System.out.println(notBlank.and(shortWord).test("kim"));            // true
+System.out.println(notBlank.and(shortWord).test("park"));           // false
+System.out.println(Predicate.not(isBlank).or(shortWord).test(" "));  // true</code></pre>
+<p>세 번째 줄을 추적해 보자. <code>" "</code>는 공백뿐이라 <code>isBlank</code>가 <code>true</code>, <code>not(isBlank)</code>가 <code>false</code>다. <code>or</code>이므로 뒤의 <code>shortWord</code>를 평가하고, 길이 1은 3 이하이므로 <code>true</code>가 된다. <code>Predicate.not</code>이 특히 쓸모 있는 곳은 메서드 참조와 함께 쓸 때다. <code>String::isBlank</code>라는 메서드 참조에는 <code>.negate()</code>를 바로 붙일 수 없다. 메서드 참조도 타깃 타입이 있어야 타입이 정해지는 폴리 식이기 때문이다. <code>Predicate.not(String::isBlank)</code>는 인자 자리라는 호출 문맥이 타깃 타입을 주므로 가능하다.</p>
+<h4>UnaryOperator와 BinaryOperator: 입력과 출력의 타입이 같을 때</h4>
+<p><code>UnaryOperator<T></code>는 <code>Function<T, T></code>를 상속하고 추상 메서드를 새로 선언하지 않는다. 함수형 인터페이스로서의 추상 메서드는 상속받은 <code>apply</code>다. <code>BinaryOperator<T></code>도 <code>BiFunction<T, T, T></code>를 상속한다. 새로운 능력이 생기는 것이 아니라 <b>타입 매개변수를 하나로 묶는다</b>. 입력과 출력이 같은 타입이어야 한다는 제약을 이름과 타입으로 표현한 것이다.</p>
+<p>이 제약이 의미를 가지는 곳이 있다. <code>List<E>.replaceAll(UnaryOperator<E>)</code>는 리스트의 각 원소를 같은 자리에서 바꿔 끼운다. 결과가 다른 타입이면 <code>List<E></code>에 다시 넣을 수 없으니, 매개변수를 <code>Function<E, ?></code>가 아니라 <code>UnaryOperator<E></code>로 선언한 것이다. <code>Stream<T>.reduce(T identity, BinaryOperator<T> accumulator)</code>도 마찬가지다. 누적값과 원소를 합친 결과가 다음 단계의 누적값이 되려면 세 타입이 모두 같아야 한다. 07회의 컬렉터와 10회의 병렬 리듀스에서 이 모양이 다시 나온다.</p>
+<p>두 인터페이스는 정적 팩터리도 제공한다. <code>UnaryOperator.identity()</code>는 받은 값을 그대로 돌려준다. <code>BinaryOperator.minBy(Comparator)</code>와 <code>maxBy(Comparator)</code>는 두 값 중 작은(큰) 것을 고르는 연산을 만든다. JDK 21 소스에서 <code>minBy</code>는 <code>(a, b) -> comparator.compare(a, b) <= 0 ? a : b</code>를 돌려준다. 비교 결과가 같으면(0이면) 첫 번째 인자를 고른다는 점이 소스에서 읽힌다.</p>
+<pre><code class="language-java">BinaryOperator<String> shorter = BinaryOperator.minBy(Comparator.comparingInt(String::length));
+System.out.println(shorter.apply("java", "go"));   // go
+System.out.println(shorter.apply("ab", "cd"));     // ab: 길이가 같으면 첫 번째</code></pre>
+
+<h3>기본형 특화: 박싱이 만드는 비용과 함정</h3>
+<p>제네릭의 타입 인자에는 참조 타입만 올 수 있다. <code>Function<int, int></code>는 쓸 수 없고 <code>Function<Integer, Integer></code>로 써야 한다. 앞에서 바이트코드로 본 것처럼 이것은 호출할 때마다 박싱과 언박싱을 일으킨다. 같은 계산을 <code>Function<Integer, Integer></code>와 기본형 특화 인터페이스 <code>IntUnaryOperator</code>로 각각 써서 비교해 보자.</p>
+<pre><code class="language-java">Function<Integer, Integer> boxed = x -> x + 1;
+IntUnaryOperator prim = x -> x + 1;
+int a = boxed.apply(10);
+int b = prim.applyAsInt(10);</code></pre>
+<pre data-label="javap -c -p (호출 지점과 람다 본문, JDK 21)"><code class="language-text">// boxed.apply(10)
+13: bipush        10
+15: invokestatic  #15  // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+18: invokeinterface #21,  2  // InterfaceMethod java/util/function/Function.apply:(Ljava/lang/Object;)Ljava/lang/Object;
+23: checkcast     #16  // class java/lang/Integer
+26: invokevirtual #26  // Method java/lang/Integer.intValue:()I
+
+// prim.applyAsInt(10)
+31: bipush        10
+33: invokeinterface #30,  2  // InterfaceMethod java/util/function/IntUnaryOperator.applyAsInt:(I)I
+
+private static java.lang.Integer lambda$main$0(java.lang.Integer);
+   0: aload_0
+   1: invokevirtual #26  // Method java/lang/Integer.intValue:()I
+   4: iconst_1
+   5: iadd
+   6: invokestatic  #15  // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+   9: areturn
+
+private static int lambda$main$1(int);
+   0: iload_0
+   1: iconst_1
+   2: iadd
+   3: ireturn</code></pre>
+<p><code>x + 1</code> 한 번을 위해 <code>Function</code> 쪽은 박싱(<code>valueOf</code>) → 인터페이스 호출 → 프록시의 캐스트 → 언박싱(<code>intValue</code>) → 덧셈 → 박싱(<code>valueOf</code>) → 호출 지점의 캐스트 → 언박싱(<code>intValue</code>)을 거친다. <code>IntUnaryOperator</code> 쪽은 디스크립터가 <code>(I)I</code>라서 <code>int</code>가 그대로 오가고, 본문은 <code>iload</code>, <code>iadd</code>, <code>ireturn</code>뿐이다.</p>
+<p>박싱의 비용은 메서드 호출 몇 번에 그치지 않는다. <code>Integer.valueOf</code>의 Javadoc은 이 메서드가 -128부터 127까지의 값은 <b>항상 캐시한다</b>고 약속한다. 그 범위 밖의 값은 캐시가 보장되지 않으며, OpenJDK 구현에서는 새 <code>Integer</code> 객체를 힙에 할당한다(캐시 상한은 HotSpot의 <code>-XX:AutoBoxCacheMax</code> 옵션으로 바꿀 수 있다고 소스 주석이 적고 있다). 수백만 개의 원소를 함수에 통과시키면 그만큼의 작은 객체가 힙에 생겼다가 GC의 대상이 된다. JIT 컴파일러가 이런 할당을 최적화로 없앨 수 있는 경우도 있지만 그것은 구현과 상황에 달린 일이고 언어가 약속하는 것이 아니다. 기본형 특화 인터페이스는 이 비용을 타입 수준에서 없애는 방법이다.</p>
+<h4>박싱된 값을 ==로 비교하는 람다</h4>
+<p>박싱은 비용 말고 정확성 문제도 만든다. 두 정수가 같은지 검사하는 <code>BiPredicate<Integer, Integer></code>를 만들어 보자.</p>
+<pre><code class="language-java">BiPredicate<Integer, Integer> same = (x, y) -> x == y;
+System.out.println(same.test(127, 127));   // true
+System.out.println(same.test(128, 128));   // false
+BiPredicate<Integer, Integer> eq = (x, y) -> x.equals(y);
+System.out.println(eq.test(128, 128));     // true</code></pre>
+<p>람다 본문의 <code>x</code>와 <code>y</code>는 <code>Integer</code>다. 참조 타입끼리의 <code>==</code>는 값이 아니라 <b>같은 객체인지</b>를 비교한다. 실제로 이 람다의 본문 메서드(위 코드만 컴파일하면 <code>lambda$main$0(Integer, Integer)</code>)를 <code>javap</code>로 보면 숫자 비교 명령이 아니라 참조 비교 명령 <code>if_acmpne</code>가 들어 있다. 127은 캐시 범위 안이라 두 번의 <code>Integer.valueOf(127)</code>이 같은 객체를 돌려주므로 <code>true</code>, 128은 기본 설정에서 캐시 밖이라 서로 다른 객체가 만들어지므로 <code>false</code>다. 코드만 보면 숫자를 비교하는 것 같지만, 함수형 인터페이스의 제네릭 타입 인자가 매개변수를 참조 타입으로 바꿔 놓았다. 박싱된 값은 <code>equals</code>로 비교하거나, 처음부터 <code>IntBinaryOperator</code>나 <code>IntPredicate</code> 같은 기본형 특화 인터페이스를 쓰면 이 함정이 사라진다.</p>
+<h4>이름 규칙과 43개의 인터페이스</h4>
+<p>기본형 특화를 모든 조합에 대해 만들면 인터페이스가 끝없이 늘어난다. <code>java.util.function</code>은 <code>int</code>, <code>long</code>, <code>double</code> 세 기본형에 대해서만 체계적으로 특화를 제공하고, <code>boolean</code>은 <code>BooleanSupplier</code> 하나뿐이며, <code>byte</code>, <code>short</code>, <code>char</code>, <code>float</code>용은 없다. 작은 정수 타입은 <code>int</code>로 넓히는 변환(widening)이 자동으로 일어나므로 <code>int</code> 버전으로 다룰 수 있다. 예를 들어 <code>IntUnaryOperator next = c -> c + 1;</code>에 <code>next.applyAsInt('a')</code>를 호출하면 <code>char</code>가 <code>int</code>로 넓혀져 98이 나온다.</p>
+<p>패키지 문서(<code>package-info.java</code>)는 이름을 붙이는 규칙을 명시한다. 이 규칙을 알면 처음 보는 이름도 모양을 읽어 낼 수 있다.</p>
+<ul>
+<li><b>기본 모양</b>: <code>Function</code>(T → R), <code>Consumer</code>(T → void), <code>Predicate</code>(T → boolean), <code>Supplier</code>(() → T).</li>
+<li><b>인자 개수 접두사</b>: <code>Bi</code>를 붙이면 인자가 둘이다. <code>BiFunction<T, U, R></code>.</li>
+<li><b>파생 모양</b>: <code>UnaryOperator</code>는 <code>Function</code>을, <code>BinaryOperator</code>는 <code>BiFunction</code>을 확장한다.</li>
+<li><b>기본형 접두사</b>: 입력이 기본형이면 <code>Int</code>, <code>Long</code>, <code>Double</code>을 앞에 붙인다. <code>IntFunction<R></code>은 <code>int</code>를 받아 <code>R</code>을 낸다. 입력은 제네릭이고 반환만 기본형이면 <code>ToXxx</code>를 붙인다. <code>ToIntFunction<T></code>는 <code>T</code>를 받아 <code>int</code>를 낸다. 두 규칙은 합쳐질 수 있다. <code>IntToDoubleFunction</code>은 <code>int</code>를 받아 <code>double</code>을 낸다.</li>
+<li><b>Obj 접두사</b>: 왼쪽에서부터 특화하다가 특화하지 않을 인자를 건너뛸 때 <code>Obj</code>를 쓴다. <code>ObjIntConsumer<T></code>는 <code>(T, int)</code>를 받는다. 모든 인자에 특화 접두사가 있으면 인자 개수 접두사 <code>Bi</code>는 생략할 수 있다.</li>
+</ul>
+<p>이 규칙으로 패키지의 43개 인터페이스를 모두 분류할 수 있다. Java SE 21 API 문서의 패키지 요약에 실린 인터페이스 수가 43개이고, 아래 표의 합도 43이다.</p>
+<div class="table-wrap"><table><thead><tr><th>분류</th><th>인터페이스</th><th>개수</th></tr></thead><tbody>
+<tr><td>제네릭 기본·Bi·파생</td><td><code>Function</code>, <code>Consumer</code>, <code>Predicate</code>, <code>Supplier</code>, <code>BiFunction</code>, <code>BiConsumer</code>, <code>BiPredicate</code>, <code>UnaryOperator</code>, <code>BinaryOperator</code></td><td>9</td></tr>
+<tr><td>Int/Long/Double × 여섯 모양</td><td><code>IntFunction</code>, <code>IntConsumer</code>, <code>IntPredicate</code>, <code>IntSupplier</code>, <code>IntUnaryOperator</code>, <code>IntBinaryOperator</code> 및 Long, Double 버전</td><td>18</td></tr>
+<tr><td>To 기본형</td><td><code>ToIntFunction</code>, <code>ToIntBiFunction</code> 및 Long, Double 버전</td><td>6</td></tr>
+<tr><td>기본형 사이 변환</td><td><code>IntToLongFunction</code>, <code>IntToDoubleFunction</code>, <code>LongToIntFunction</code>, <code>LongToDoubleFunction</code>, <code>DoubleToIntFunction</code>, <code>DoubleToLongFunction</code></td><td>6</td></tr>
+<tr><td>Obj + 기본형 소비자</td><td><code>ObjIntConsumer</code>, <code>ObjLongConsumer</code>, <code>ObjDoubleConsumer</code></td><td>3</td></tr>
+<tr><td>boolean</td><td><code>BooleanSupplier</code></td><td>1</td></tr>
+</tbody></table></div>
+<p>추상 메서드의 이름도 규칙을 따른다. 기본형을 돌려주는 메서드는 <code>applyAsInt</code>, <code>applyAsLong</code>, <code>getAsInt</code>, <code>getAsBoolean</code>처럼 <code>As</code>와 타입 이름이 붙는다. 자바에서는 매개변수 목록이 같고 반환형만 다른 두 메서드를 한 클래스에 둘 수 없다. 메서드 이름이 서로 다르기 때문에, 예를 들어 한 클래스가 <code>IntSupplier</code>와 <code>LongSupplier</code>를 동시에 구현해도 <code>getAsInt()</code>와 <code>getAsLong()</code>이 충돌하지 않는다. 이 인터페이스들은 기본형 스트림에서 그대로 쓰인다. <code>IntStream.reduce(int identity, IntBinaryOperator op)</code>, <code>Stream.mapToInt(ToIntFunction<? super T> mapper)</code>가 그 예이고, 05회와 06회에서 기본형 특화 스트림과 함께 다룬다.</p>
+<x-visual id="java-adv3-02-function-family" title="java.util.function 인터페이스의 이름 규칙 지도" kind="개념도" ratio="4:3">
+<x-hint>네 가지 기본 모양에서 Bi 접두사, 파생 모양, 기본형 접두사가 어떻게 가지를 쳐서 43개 인터페이스가 되는지 한눈에 보여 준다.</x-hint>
+<x-prompt>A tree-like concept map on a white background. At the top, four rounded boxes in a row labeled "Function", "Consumer", "Predicate", "Supplier". Below Function, a branch labeled "Bi" leading to "BiFunction", and a branch labeled "입력=출력" leading to "UnaryOperator"; from BiFunction a branch "입력=출력" to "BinaryOperator". From each top box, a dashed branch labeled "Int · Long · Double" leading to a small stack of three cards (e.g. under Function the cards read "IntFunction"). A separate side panel on the right titled "기본형 반환" listing "ToIntFunction" and "IntToDoubleFunction". A footer badge reads "총 43개". Flat colors, thin connecting lines, sans-serif font, at most 12 labels.</x-prompt>
+<x-caption>기본 모양 넷에 Bi, 파생, 기본형 접두사를 조합한 것이 java.util.function의 43개 인터페이스다.</x-caption>
+</x-visual>
+
+<h3>함수형 인터페이스 호출 한 번: itable, 인라인 캐시, 타입 프로파일</h3>
+<p>앞에서 <code>Function<Integer, Integer></code>가 호출마다 박싱을 일으키는 것을 바이트코드로 보았고, JIT 컴파일러가 그 할당을 없앨 수도 있지만 언어가 약속하는 일은 아니라고 했다. 그 "경우에 따라"가 무엇에 달려 있는지 OpenJDK 21 HotSpot 기준으로 한 층 내려가 보자. 출발점은 함수형 인터페이스를 거친 호출이 언제나 <code>invokeinterface</code>라는 사실이다. 함수를 받는 메서드의 바이트코드는 <code>IntUnaryOperator.applyAsInt:(I)I</code> 같은 인터페이스 메서드만 알 뿐이고, 실제로 실행할 코드는 실행 중 수신 객체의 클래스로 정해진다. 그리고 람다 식은 식마다 서로 다른 숨겨진 클래스가 되므로, 같은 호출 지점이 여러 클래스를 만날 수 있다.</p>
+<p>HotSpot은 클래스마다 인터페이스 메서드 표인 itable을 둔다. <code>oops/klassVtable.hpp</code>의 주석이 적은 형식은 다음과 같다. 앞쪽에 "구현한 인터페이스의 Klass 포인터와 그 인터페이스용 메서드 표의 위치" 쌍이 나열되고, 뒤쪽에 인터페이스마다 메서드 표가 이어진다.</p>
+<pre class="diagram">  람다 프록시 클래스의 Klass
+  +------------------------------+
+  | ... vtable ...               |
+  +------------------------------+  <- itable 시작
+  | IntUnaryOperator 의 Klass*   |  \  오프셋 표: 구현한 인터페이스마다
+  | 그 인터페이스 메서드 표 위치 |  /  한 쌍. 이 쌍을 차례로 훑는다
+  | 0 (끝 표시)                  |
+  +------------------------------+
+  | Method* applyAsInt           |  \  IntUnaryOperator 용 메서드 표
+  | compiler entry point         |  /  (itable 인덱스로 바로 찾는다)
+  +------------------------------+</pre>
+<p>인터페이스 메서드를 이 표로 찾으려면 먼저 오프셋 표를 훑어 해당 인터페이스의 항목을 찾아야 한다. 컴파일된 코드에서 이 탐색을 맡는 것이 itable 스텁이다. 이 실험 환경(macOS, arm64)용 구현인 <code>MacroAssembler::lookup_interface_method_stub</code>의 주석은 오프셋 표의 항목을 하나씩 넘기며 인터페이스 Klass가 일치할 때까지 도는 루프를 그대로 적고 있다. 다만 모든 호출이 이 스텁을 거치는 것은 아니다. 컴파일된 코드의 가상 호출 지점은 인라인 캐시(inline cache)로 시작한다. <code>code/compiledIC.hpp</code>의 상태도에 따르면 호출 지점은 처음 만난 수신 클래스를 기억하는 모노모픽(monomorphic) 상태가 되고, 다른 클래스를 만나 캐시가 빗나가면 곧바로 메가모픽(megamorphic) 상태로 넘어간다. <code>invokeinterface</code>의 메가모픽 상태는 <code>compiledIC.cpp</code>의 <code>set_to_megamorphic</code>이 <code>VtableStubs::find_itable_stub</code>으로 얻은 itable 스텁에 연결한다.</p>
+<p>그러나 표를 훑는 비용보다 훨씬 큰 차이를 만드는 것은 <b>인라이닝(inlining)</b>이다. C2 컴파일러는 호출된 메서드의 본문을 호출 지점에 펼쳐 넣어야 그 너머까지 최적화를 이어 갈 수 있다. 인터페이스 호출은 대상이 고정되어 있지 않으므로 C2는 인터프리터와 C1이 모아 둔 <b>타입 프로파일(type profile)</b>을 본다. 호출 지점마다 지금까지 만난 수신 클래스와 횟수를 기록한 것으로, 기록하는 클래스의 수는 <code>-XX:TypeProfileWidth</code>(기본값 2)다. <code>opto/doCall.cpp</code>의 <code>Compile::call_generator</code>는 이 프로파일로 다음처럼 정한다.</p>
+<ul>
+<li>수신 클래스가 하나뿐이면 그 클래스의 메서드를 인라인하고, 다른 클래스가 오는 경로는 역최적화 트랩(uncommon trap)으로 둔다.</li>
+<li>둘이면(<code>UseBimorphicInlining</code>, 기본 true) 두 클래스를 차례로 검사해 둘 다 인라인한다.</li>
+<li>그보다 많으면 한 클래스가 전체 호출의 <code>TypeProfileMajorReceiverPercent</code>(기본 90) 퍼센트 이상일 때만 그 클래스를 인라인하고 나머지 경로는 가상 호출로 남긴다. 그런 클래스도 없으면 가상 호출만 남는다.</li>
+</ul>
+<p>람다의 수만 바꿔 가며 이 결정을 직접 보자.</p>
+<pre><code class="language-java">import java.util.function.IntUnaryOperator;
+
+public class Mega {
+    static int sum(IntUnaryOperator f, int n) {
+        int s = 0;
+        for (int i = 0; i < n; i++) s += f.applyAsInt(i);   // bci 12: invokeinterface
+        return s;
+    }
+    public static void main(String[] args) {
+        int kinds = Integer.parseInt(args[0]);   // sum에 넘길 람다 클래스의 수(1~3)
+        IntUnaryOperator[] fs = { x -> x + 1, x -> x * 2, x -> x - 3 };
+        long r = 0;
+        for (int k = 0; k < 20_000; k++) r += sum(fs[k % kinds], 1_000);
+        System.out.println(r);
+    }
+}</code></pre>
+<pre data-label="java -XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining -XX:-TieredCompilation Mega 1|2|3 (일부)"><code class="language-text">== kinds=1
+@ 12   Mega$$Lambda/0x000000b801000a08::applyAsInt (5 bytes)   inline (hot)
+ \-> TypeProfile (17128/17128 counts) = Mega$$Lambda+0x000000b801000a08
+  @ 1   Mega::lambda$main$0 (4 bytes)   inline (hot)
+
+== kinds=2
+@ 12   Mega$$Lambda/0x000000a001000c48::applyAsInt (5 bytes)   inline (hot)
+@ 12   Mega$$Lambda/0x000000a001000a08::applyAsInt (5 bytes)   inline (hot)
+ \-> TypeProfile (7854/15734 counts) = Mega$$Lambda+0x000000a001000a08
+ \-> TypeProfile (7880/15734 counts) = Mega$$Lambda+0x000000a001000c48
+  @ 1   Mega::lambda$main$0 (4 bytes)   inline (hot)
+  @ 1   Mega::lambda$main$1 (4 bytes)   inline (hot)
+
+== kinds=3
+@ 12   java.util.function.IntUnaryOperator::applyAsInt (0 bytes)   virtual call</code></pre>
+<p>출력을 읽기 쉽게 하려고 <code>-XX:-TieredCompilation</code>으로 C2만 쓰게 했다. bci 12는 <code>sum</code>의 <code>invokeinterface</code>다. 람다 클래스가 하나일 때는 프로파일이 한 클래스만 가리키고(17128/17128), C2는 프록시의 <code>applyAsInt</code>(5바이트)와 그 안의 <code>lambda$main$0</code>까지 루프 안에 펼쳐 넣었다. 둘일 때는 두 클래스가 거의 반씩 기록되었고 둘 다 인라인되었다. 셋일 때는 각 클래스가 약 3분의 1씩이라 90% 기준을 넘는 클래스가 없고, 출력은 인터페이스 메서드 자체에 대해 <code>virtual call</code>이라고만 적는다. 이 경우 람다 본문 <code>x + 1</code>은 루프 안으로 들어오지 못하고 반복마다 실제 호출이 일어난다. 카운트 수치와 숨겨진 클래스 이름의 주소는 실행마다 다르다.</p>
+<p>여기서 기억할 점은 HotSpot의 프로파일이 메서드의 바이트코드 위치마다 하나라는 것이다. <code>sum</code>을 부르는 곳이 프로그램 여기저기에 있고 각자 다른 람다를 넘긴다면, 그 람다 클래스들이 모두 <code>sum</code>의 bci 12 한 곳에 섞여 기록된다. 함수형 인터페이스를 받는 범용 메서드는 쓰이는 곳이 많을수록 메가모픽이 되기 쉽다. 반대로 어떤 호출 지점을 지나가는 람다가 하나뿐이라면, 인터페이스를 거친다는 사실은 컴파일된 코드에서 클래스 검사 하나로 줄어들고 본문은 펼쳐진다. 함수형 인터페이스 호출의 성능은 인터페이스 자체가 아니라 그 호출 지점을 몇 종류의 람다가 지나가느냐로 정해진다.</p>
+
+<h3>박싱 객체는 언제 실제로 힙에 생기는가</h3>
+<p>이제 박싱 문제로 돌아오자. 인라이닝 여부가 바뀌면 박싱된 <code>Integer</code>의 운명도 바뀐다. 호출당 힙 할당량을 직접 재 보자. <code>com.sun.management.ThreadMXBean.getCurrentThreadAllocatedBytes()</code>(JDK 14부터)는 현재 스레드가 힙에 할당한 총 바이트 수의 근삿값을 돌려주는 JDK의 확장 API다. 호출 전후 값의 차이를 호출 횟수로 나누면 호출 한 번이 힙에 남긴 바이트를 알 수 있다.</p>
+<pre><code class="language-java">import java.lang.management.ManagementFactory;
+import java.util.List;
+import java.util.function.Function;
+import java.util.function.IntUnaryOperator;
+
+public class BoxCost {
+    static final com.sun.management.ThreadMXBean MX =
+            (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+
+    static long boxed(Function<Integer, Integer> f, int n) {
+        long s = 0;
+        for (int i = 0; i < n; i++) s += f.apply(1000 + i);   // 캐시 범위(-128~127) 밖의 값
+        return s;
+    }
+    static long prim(IntUnaryOperator f, int n) {
+        long s = 0;
+        for (int i = 0; i < n; i++) s += f.applyAsInt(1000 + i);
+        return s;
+    }
+    public static void main(String[] args) {
+        int kinds = Integer.parseInt(args[0]);   // boxed에 넘길 람다 클래스의 수(1~3)
+        List<Function<Integer, Integer>> fs = List.of(x -> x + 1, x -> x + 2, x -> x + 3);
+        IntUnaryOperator pf = x -> x + 1;
+        int n = 3_000_000;
+        long sink = 0;
+        for (int round = 1; round <= 5; round++) {
+            long a0 = MX.getCurrentThreadAllocatedBytes();
+            for (int k = 0; k < 30; k++) sink += boxed(fs.get(k % kinds), n / 30);
+            long a1 = MX.getCurrentThreadAllocatedBytes();
+            sink += prim(pf, n);
+            long a2 = MX.getCurrentThreadAllocatedBytes();
+            System.out.printf("round %d: Function %.1f B/call, IntUnaryOperator %.1f B/call%n",
+                    round, (a1 - a0) / (double) n, (a2 - a1) / (double) n);
+        }
+        System.out.println(sink);   // 결과를 써서 루프가 통째로 지워지지 않게 한다
+    }
+}</code></pre>
+<pre data-label="실행 결과 (Temurin 21.0.13, macOS arm64, 마지막 줄의 합계는 생략)"><code class="language-text">== java BoxCost 1
+round 1: Function 3.3 B/call, IntUnaryOperator 0.0 B/call
+round 2: Function 0.0 B/call, IntUnaryOperator 0.0 B/call
+round 3: Function 0.0 B/call, IntUnaryOperator 0.0 B/call
+round 4: Function 0.0 B/call, IntUnaryOperator 0.0 B/call
+round 5: Function 0.0 B/call, IntUnaryOperator 0.0 B/call
+== java BoxCost 3
+round 1: Function 32.0 B/call, IntUnaryOperator 0.0 B/call
+round 2: Function 32.0 B/call, IntUnaryOperator 0.0 B/call
+round 3: Function 32.0 B/call, IntUnaryOperator 0.0 B/call
+round 4: Function 32.0 B/call, IntUnaryOperator 0.0 B/call
+round 5: Function 32.0 B/call, IntUnaryOperator 0.0 B/call</code></pre>
+<p>같은 프로그램을 옵션만 바꿔 돌린 결과를 모으면 다음과 같다(5라운드째 값). 첫 라운드의 값은 JIT 컴파일이 언제 끝나느냐에 따라 실행마다 다르다.</p>
+<div class="table-wrap"><table><thead><tr><th>실행 옵션</th><th>Function, 람다 1개</th><th>Function, 람다 3개</th><th>IntUnaryOperator</th></tr></thead><tbody>
+<tr><td>기본</td><td>0.0</td><td>32.0</td><td>0.0</td></tr>
+<tr><td><code>-Xint</code> (인터프리터만)</td><td>32.0</td><td>32.0</td><td>0.0</td></tr>
+<tr><td><code>-XX:-DoEscapeAnalysis</code></td><td>32.0</td><td>32.0</td><td>0.0</td></tr>
+<tr><td><code>-Xint -XX:-UseCompressedClassPointers</code></td><td>48.0</td><td>-</td><td>0.0</td></tr>
+</tbody></table></div>
+<p>먼저 32바이트의 정체다. 호출 한 번에 <code>Integer</code>가 둘 생긴다. 인자 <code>1000 + i</code>를 넘기며 박싱한 것과, 람다 본문이 <code>x + 1</code>을 돌려주며 박싱한 것이다. 값이 1000 이상이라 <code>Integer.valueOf</code>의 캐시에 걸리지 않는다. 64비트 HotSpot의 기본 설정에서 <code>Integer</code> 하나는 마크 워드 8바이트, 압축된 클래스 포인터 4바이트, <code>int</code> 필드 4바이트를 합친 16바이트다. 압축 클래스 포인터를 끄면 클래스 포인터가 8바이트가 되어 합이 20바이트이고, 기본 객체 정렬(<code>ObjectAlignmentInBytes</code> = 8)에 맞춰 24바이트가 된다. 표의 48은 그 24바이트 객체 두 개다.</p>
+<p>인터프리터에서는 바이트코드에 적힌 박싱이 그대로 실행되므로 32바이트가 꾸준히 나온다. 기본 설정에서 람다가 하나뿐이면 둘째 라운드부터 0바이트가 된다. 앞 절의 실험처럼 C2가 <code>boxed</code>의 루프를 컴파일하면서 프록시의 <code>apply</code>와 람다 본문까지 인라인했고, 그러자 두 <code>Integer</code>가 컴파일된 코드 밖으로 나가지 않는다는 것이 드러났기 때문이다. 이 판정을 하는 것이 C2의 탈출 분석(escape analysis)이고, <code>-XX:-DoEscapeAnalysis</code>로 끄면 같은 모노모픽 호출에서도 32바이트로 돌아온다. 참고로 <code>-XX:-EliminateAllocations</code>와 <code>-XX:-EliminateAutoBox</code>를 각각 또는 함께 꺼도 이 실험에서는 0바이트였다. 탈출 분석 뒤의 어느 세부 단계가 할당을 지웠는지는 이 측정만으로는 가릴 수 없고, 확실한 것은 탈출 분석이 꺼지면 할당이 돌아온다는 데까지다.</p>
+<p>람다가 셋이면 JIT가 켜져 있어도 32바이트다. 앞 절에서 본 대로 이 호출 지점은 가상 호출로 남는다. C2의 탈출 분석(<code>opto/escape.cpp</code>)은 어떤 메서드가 불릴지 모르는 호출에 넘긴 객체를 최악으로 가정해 전역으로 탈출한다(<code>GlobalEscape</code>)고 표시한다. 그래서 인자로 넘기는 <code>Integer</code>는 힙에 만들어져야 하고, 돌려받는 <code>Integer</code>는 따로 컴파일된 람다 쪽 코드가 힙에 만들어 반환한 객체다. 박싱 비용이 사라질지는 결국 호출 지점을 몇 종류의 람다가 지나가느냐에 달려 있고, 이것은 소스 한 줄만 봐서는 알 수 없는 프로그램 전체의 성질이다. 오늘 모노모픽이던 호출 지점이 다른 곳에서 새 람다를 넘기기 시작하면 할당이 소리 없이 돌아온다.</p>
+<p><code>IntUnaryOperator</code> 열은 측정한 모든 설정에서 0바이트다. 인터프리터에서도, 탈출 분석을 꺼도 그렇다. 기본형 특화 인터페이스의 이득은 JIT 최적화가 성공했을 때만 얻는 것이 아니라, 바이트코드에 박싱이 처음부터 없다는 데서 나온다. 앞에서 "JIT가 할당을 없앨 수 있는 경우도 있지만 언어가 약속하는 것이 아니다"라고 한 말의 구체적인 내용이 이것이다. 박싱을 없애는 일을 JIT의 조건부 최적화에 맡길지, 타입으로 확정할지의 차이다.</p>
+
+<h3>기타 함수형 인터페이스: 인자 둘, 셋, 그리고 검사 예외</h3>
+<p>인자가 둘인 함수는 <code>Bi</code> 계열이 맡는다. <code>BiFunction<T, U, R></code>의 <code>R apply(T t, U u)</code>, <code>BiConsumer<T, U></code>의 <code>void accept(T t, U u)</code>, <code>BiPredicate<T, U></code>의 <code>boolean test(T t, U u)</code>다. 가장 자주 만나는 곳은 <code>Map</code>이다. <code>Map.forEach(BiConsumer<? super K, ? super V>)</code>는 키와 값을 함께 넘기고, <code>Map.replaceAll(BiFunction<? super K, ? super V, ? extends V>)</code>는 키와 기존 값으로 새 값을 계산한다. <code>Bi</code> 계열에도 단항 계열과 같은 디폴트 메서드가 있다. <code>BiFunction.andThen</code>, <code>BiPredicate.and</code>, <code>or</code>, <code>negate</code>, <code>BiConsumer.andThen</code>이다. 단, <code>Supplier</code>에는 인자가 없으니 <code>Bi</code> 버전이 없다.</p>
+<h4>인자가 셋 이상이면 직접 만든다</h4>
+<p><code>java.util.function</code>에는 인자가 셋 이상인 인터페이스가 없다. 필요하면 직접 정의한다. 앞에서 만든 <code>GenericFunction</code>과 같은 방식이다.</p>
+<pre><code class="language-java">@FunctionalInterface
+interface TriFunction<A, B, C, R> {
+    R apply(A a, B b, C c);
+}
+
+TriFunction<Integer, Integer, Integer, Integer> clamp =
+        (value, min, max) -> Math.max(min, Math.min(max, value));
+System.out.println(clamp.apply(15, 0, 10));   // 10
+System.out.println(clamp.apply(-3, 0, 10));   // 0
+System.out.println(clamp.apply(7, 0, 10));    // 7</code></pre>
+<p>다만 인자가 셋 이상인 함수를 자주 만들게 된다면 그 인자들이 사실은 하나의 개념을 이루는 것은 아닌지 먼저 따져 볼 만하다. 위의 <code>min</code>과 <code>max</code>는 "범위"라는 하나의 값으로 묶을 수 있다. 레코드로 묶으면 함수는 다시 <code>BiFunction</code>이나 <code>Function</code>의 모양으로 돌아온다.</p>
+<h4>검사 예외와 함수형 인터페이스</h4>
+<p>람다 본문이 던질 수 있는 검사 예외(checked exception)는 람다 본문의 규칙이 아니라 <b>함수형 인터페이스의 추상 메서드가 선언한 throws 절</b>이 정한다. 람다 본문은 결국 그 메서드의 구현이기 때문이다. <code>Function.apply</code>에는 throws 절이 없다. 그래서 파일을 읽는 람다를 <code>Function</code>에 담으면 컴파일되지 않는다.</p>
+<pre><code class="language-java">Function<String, String> read = path -> Files.readString(Path.of(path));   // 컴파일 오류
+Callable<String> c = () -> Files.readString(Path.of("a.txt"));             // 통과</code></pre>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">T3.java:6: error: unreported exception IOException; must be caught or declared to be thrown
+        Function<String, String> read = path -> Files.readString(Path.of(path));
+                                                                ^</code></pre>
+<p><code>Callable.call()</code>은 <code>throws Exception</code>을 선언하므로 같은 본문이 통과한다. 스프링 DB 편에서 쓴 <code>JdbcTemplate</code>의 <code>RowMapper<T></code>도 같은 이유로 편하다. Spring Framework 6.1 Javadoc에서 <code>RowMapper</code>는 <code>@FunctionalInterface</code>이고, 추상 메서드 <code>T mapRow(ResultSet rs, int rowNum)</code>은 <code>throws SQLException</code>을 선언한다. 그래서 <code>(rs, rowNum) -> rs.getString("name")</code> 같은 람다 안에서 <code>SQLException</code>을 던지는 <code>getString</code>을 try 없이 부를 수 있고, 그 예외는 Javadoc 설명대로 호출한 <code>JdbcTemplate</code>이 잡아 처리한다.</p>
+<p>표준 인터페이스를 써야 하는데 본문이 검사 예외를 던진다면, 예외를 던질 수 있는 인터페이스를 따로 정의하고 표준 인터페이스로 바꿔 주는 어댑터를 둘 수 있다.</p>
+<pre><code class="language-java">@FunctionalInterface
+interface ThrowingFunction<T, R> {
+    R apply(T t) throws Exception;
+}
+
+static <T, R> Function<T, R> unchecked(ThrowingFunction<T, R> f) {
+    return t -> {
+        try {
+            return f.apply(t);
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RuntimeException(e);   // 원인을 감싸서 다시 던진다
+        }
+    };
+}
+
+Function<String, String> read = unchecked(p -> Files.readString(Path.of(p)));
+try {
+    read.apply("no-such-file.txt");
+} catch (RuntimeException e) {
+    System.out.println(e.getCause().getClass().getSimpleName() + ": " + e.getCause().getMessage());
+}
+// NoSuchFileException: no-such-file.txt</code></pre>
+<p>이 어댑터는 검사 예외를 언체크 예외로 바꿀 뿐 예외를 삼키지 않는다. 원인(cause)을 유지하므로 호출한 쪽에서 원래 예외를 꺼낼 수 있다. 다만 검사 예외의 목적은 호출자에게 처리를 강제하는 것이므로, 이렇게 감싸면 그 강제가 사라진다는 점을 알고 써야 한다. 스프링이 <code>SQLException</code>을 언체크 예외인 <code>DataAccessException</code> 계층으로 바꾸는 것도 같은 방향의 선택이었다.</p>
+<p>마지막으로, 함수형 인터페이스는 <code>java.util.function</code>에만 있는 것이 아니다. 패키지 문서도 특정 용도의 함수형 인터페이스는 그것이 쓰이는 패키지에 정의된다고 하며 <code>java.io.FileFilter</code>를 예로 든다. <code>Runnable</code>, <code>Callable</code>, <code>Comparator</code>, 스프링의 <code>RowMapper</code>가 모두 그렇다. 어떤 인터페이스든 추상 메서드가 하나면 람다의 타깃이 될 수 있다.</p>
+
+<h3>상속받은 추상 메서드가 여럿일 때: 함수 타입의 반환형과 throws 절</h3>
+<p>함수형 인터페이스의 정의를 다룰 때, 상위 인터페이스 여러 곳에서 오버라이드 동등한 시그니처를 물려받으면 그것들을 메서드 하나로 본다고 했다. 그런데 매개변수가 같다고 반환형과 throws 절까지 같은 것은 아니다. 그렇다면 그런 인터페이스의 함수 타입, 즉 람다 본문이 지켜야 할 계약은 무엇인가. JLS §9.9가 이 경우를 정확히 정한다. 인터페이스 I의 추상 메서드 집합을 M이라 할 때, 함수 타입의 매개변수와 반환형은 M의 모든 시그니처에 대해 하위 시그니처(subsignature)이면서 반환형이 모두와 같거나 모두의 하위 타입인 메서드에서 가져온다. 그런 메서드가 없으면 모두에 대해 반환 타입 대체 가능(return-type-substitutable)한 메서드에서 가져온다.</p>
+<p>throws 절의 규칙은 다르다. 제네릭이 아닌 경우 함수 타입의 throws 절에는 어느 한 throws 절에 적힌 타입 E 중에서, <b>모든</b> throws 절 각각에 대해 그 절에 적힌 어떤 타입의 하위 타입인 것만 들어간다. 쉽게 말해 모든 메서드가 함께 허락하는 예외만 남는 교집합이다. JLS는 그 이유를 이렇게 설명한다. 함수 타입은 M의 추상 메서드를 하나하나 오버라이드할 수 있는 메서드 타입이어야 하고, §8.4.6에 따라 오버라이드하는 메서드는 오버라이드되는 어느 메서드보다도 "더 많이" 던질 수 없다. JLS의 예제 9.9-1을 그대로 컴파일해 보자.</p>
+<pre><code class="language-java">import java.io.*;
+
+public class Merge {
+    interface X { void m() throws IOException; }
+    interface Y { void m() throws EOFException; }
+    interface Z { void m() throws ClassNotFoundException; }
+    interface XY extends X, Y { }
+    interface XYZ extends X, Y, Z { }
+
+    static void callXY(XY xy) {
+        try {
+            xy.m();
+        } catch (EOFException e) {            // IOException 을 잡지 않아도 된다
+            System.out.println("caught " + e);
+        }
+    }
+    static void callXYZ(XYZ xyz) {
+        xyz.m();                              // 아무것도 잡지 않아도 된다
+    }
+
+    public static void main(String[] args) {
+        XY a = () -> { throw new EOFException("eof"); };
+        callXY(a);
+        XYZ d = () -> System.out.println("no checked exception");
+        callXYZ(d);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">caught java.io.EOFException: eof
+no checked exception</code></pre>
+<p><code>XY</code>의 함수 타입은 <code>() -> void throws EOFException</code>이다. <code>EOFException</code>은 <code>X</code>의 throws 절(<code>IOException</code>)에도, <code>Y</code>의 throws 절(<code>EOFException</code>)에도 덮이지만, <code>IOException</code>은 <code>Y</code>의 절에 덮이지 않으므로 빠진다. <code>XYZ</code>는 셋 모두가 덮는 예외가 없어 아무것도 던지지 않는 함수 타입이 된다. 같은 파일에 다음 두 줄을 넣으면 javac가 둘 다 거부한다.</p>
+<pre><code class="language-java">XY b = () -> { throw new FileNotFoundException("f"); };   // IOException 의 하위지만 EOFException 은 아니다
+XYZ c = () -> { throw new EOFException("eof"); };        // XYZ 는 검사 예외를 하나도 허락하지 않는다</code></pre>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">Merge2.java:11: error: unreported exception FileNotFoundException; must be caught or declared to be thrown
+        XY b = () -> { throw new FileNotFoundException("f"); };
+                       ^
+Merge2.java:12: error: unreported exception EOFException; must be caught or declared to be thrown
+        XYZ c = () -> { throw new EOFException("eof"); };
+                        ^</code></pre>
+<p>이 규칙은 람다를 만드는 쪽에만 적용되는 것이 아니다. <code>callXY</code>의 <code>xy.m()</code>은 <code>EOFException</code>만 잡고도 컴파일되었고, <code>callXYZ</code>는 아무것도 잡지 않았다. JLS §15.12.2.5는 가장 구체적인 메서드 후보들이 모두 추상이고 시그니처가 오버라이드 동등할 때 호출이 던지는 예외 타입을 같은 교집합 규칙으로 정하고, 이 규칙이 함수 타입(§9.9)을 정할 때에도 쓰인다고 밝힌다. 람다 본문이 지켜야 할 계약과 호출하는 쪽이 대비해야 할 계약이 같은 계산에서 나오므로, 두 쪽이 어긋나지 않는다.</p>
+<p>반환형도 같은 방식으로 합쳐진다. <code>interface P { Object get(); }</code>와 <code>interface Q { CharSequence get(); }</code>를 함께 상속한 <code>PQ</code>의 함수 타입은 <code>() -> CharSequence</code>다. 그래서 <code>PQ ok = () -> "kim";</code>은 통과하고 <code>ok.get()</code>의 결과를 <code>CharSequence</code>로 받을 수 있지만, <code>PQ bad = () -> 42;</code>는 "bad return type in lambda expression ... int cannot be converted to CharSequence"로 거부된다. 바이트코드에서는 앞에서 본 브리지 이야기와 만난다. <code>P.get</code>의 디스크립터는 <code>()Object</code>, <code>Q.get</code>은 <code>()CharSequence</code>로 서로 다르고 <code>PQ</code>는 아무것도 선언하지 않았으니, javac는 <code>altMetafactory</code>에 <code>FLAG_BRIDGES</code>(4)와 추가 디스크립터 <code>()Ljava/lang/Object;</code>를 넘긴다. JDK 21에서 직접 확인한 부트스트랩 인자가 정확히 그랬다.</p>
+<p>javac에서 이 계산을 하는 곳은 <code>com.sun.tools.javac.code.Types</code>다. JDK 21 소스에서 <code>DescriptorCache.findDescriptorInternal</code>은 인터페이스의 멤버 중 추상 메서드를 모으면서 이름이 다르거나 오버라이드 동등하지 않은 것이 나오면 곧바로 함수형 인터페이스가 아니라고 판정한다. 모인 것이 하나면 그것이 디스크립터이고, 둘 이상이면 <code>mergeDescriptors</code>를 거쳐 <code>mergeAbstracts</code>를 부른다. <code>mergeAbstracts</code>는 다른 모든 메서드의 하위 시그니처이면서 반환형 검사(<code>MostSpecificReturnCheck</code>)를 통과하는 메서드를 고르고, 그동안 <code>chk.intersect</code>로 throws 목록의 교집합을 쌓는다. 교집합이 원래 throws 절과 다르면 그 교집합을 throws로 가진 합성 <code>MethodSymbol</code>을 새로 만든다. 소스의 주석도 결과 메서드의 throws 절이 병합된 메서드들의 throws 절의 교집합이라고 적고 있다.</p>
+<p>한 가지 더 관찰해 둘 것이 있다. <code>javap -v -p Merge</code>로 보면 javac는 람다 본문 메서드 <code>lambda$main$0</code>에 <code>Exceptions</code> 속성 <code>throws java.io.EOFException</code>을 붙여 두었다. 그런데 <code>dumpProxyClassFiles</code>로 덤프한 <code>XY</code>용 프록시의 <code>public void m()</code>에는 <code>Exceptions</code> 속성이 아예 없다. 선언하지 않은 메서드를 통해 <code>EOFException</code>이 그대로 빠져나갔는데도 실행에는 아무 문제가 없었다. 이것이 무엇을 뜻하는지는 다음 절에서 본다.</p>
+
+<h3>예외 타입을 타입 매개변수로: throws E의 추론</h3>
+<p>앞에서 만든 <code>unchecked</code> 어댑터는 검사 예외를 언체크 예외로 감싸서 표준 인터페이스에 맞췄다. 다른 방법은 예외 타입 자체를 함수형 인터페이스의 타입 매개변수로 빼서, 람다 본문이 던지는 예외가 함수 타입의 throws 절로, 다시 그 함수를 받는 메서드의 throws 절로 흘러가게 하는 것이다. <code>java.util.function</code>에는 이런 인터페이스가 없으니 직접 만든다.</p>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Ex {
+    @FunctionalInterface
+    interface ThrowingSupplier<T, E extends Exception> {
+        T get() throws E;
+    }
+
+    static <T, E extends Exception> T call(ThrowingSupplier<T, E> s) throws E {
+        return s.get();
+    }
+
+    static String plain() {                         // throws 절이 없다
+        return call(() -> "plain");
+    }
+    static String io() throws IOException {
+        return call(() -> Files.readString(Path.of("no-such-file.txt")));
+    }
+
+    public static void main(String[] args) {
+        System.out.println(plain());
+        try {
+            io();
+        } catch (IOException e) {
+            System.out.println("IOException: " + e.getClass().getSimpleName());
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">plain
+IOException: NoSuchFileException</code></pre>
+<p>같은 <code>call</code>인데 <code>plain()</code>은 아무 예외도 선언하지 않았고, <code>io()</code>는 <code>IOException</code>을 선언해야 했다. <code>io()</code>의 <code>throws IOException</code>을 지우면 "unreported exception IOException"으로 실패한다. 그리고 람다 본문이 <code>SQLException</code>과 <code>IOException</code>을 둘 다 던질 수 있으면 오류 메시지는 "unreported exception Exception"이 된다. 세 경우의 <code>E</code>가 각각 <code>RuntimeException</code>, <code>IOException</code>, <code>Exception</code>으로 추론되었다는 뜻이다. 이 결과는 JLS 18장의 규칙 세 개로 설명된다.</p>
+<ol>
+<li><b>throws 경계를 단다.</b> JLS §18.5.1에 따르면 제네릭 메서드의 타입 매개변수가 그 메서드의 throws 절에 나오면 해당 추론 변수에 <code>throws α</code>라는 경계(bound)가 붙는다. §18.1.3은 이 경계가 순전히 정보용이며, 가능하면 α를 검사 예외가 아닌 타입으로 정하도록 해석 단계를 이끈다고 설명한다.</li>
+<li><b>람다 본문이 던지는 예외가 하한이 된다.</b> §18.2.5의 검사 예외 제약은 함수 타입의 throws 절에 아직 정해지지 않은 타입 E가 있을 때, 람다 본문이 던질 수 있는 검사 예외 X마다(절의 확정된 타입에 덮이지 않는 것이라면) <code>X <: E</code>라는 제약을 만든다.</li>
+<li><b>해석 순서.</b> §18.4는 추론 변수에 하한이 있으면 하한들의 최소 상위 타입(lub)으로 정한다. 하한이 없고 <code>throws α</code> 경계가 있으며 확정된 상한이 모두 <code>RuntimeException</code>의 상위 타입이면 <code>RuntimeException</code>으로 정한다. 그 밖에는 상한들의 최대 하위 타입(glb)으로 정한다.</li>
+</ol>
+<p><code>() -> "plain"</code>은 검사 예외를 던지지 않으므로 하한이 없고, 상한 <code>Exception</code>은 <code>RuntimeException</code>의 상위 타입이므로 둘째 규칙에 따라 <code>E = RuntimeException</code>이다. 그러면 <code>call</code>은 <code>throws RuntimeException</code>인 메서드가 되어 처리할 것이 없다. <code>Files.readString</code>은 <code>IOException</code>을 던지므로 하한이 <code>IOException</code> 하나이고 <code>E = IOException</code>이다. 두 예외를 함께 던지면 <code>lub(IOException, SQLException)</code>, 곧 <code>Exception</code>이 되어 정밀도를 잃는다. 타입 매개변수 하나로는 서로 무관한 예외 둘을 따로 전달할 수 없다는 것이 이 방식의 한계다. javac에서는 <code>comp/Infer.java</code>의 <code>InferenceStep.THROWS</code>가 이 둘째 규칙을 구현한다. JDK 21 소스에서 이 단계는 추론 변수가 throws 변수이고 확정된 상한이 모두 <code>RuntimeException</code>의 상위 타입일 때만 적용되며, 해는 언제나 <code>syms.runtimeExceptionType</code>이다. 소스 주석도 throws 절에 나오는 미정 추론 변수를 <code>RuntimeException</code>으로 추론한다고 적는다.</p>
+<h4>JVM은 검사 예외를 검사하지 않는다</h4>
+<p>앞 절 끝에서 본 관찰로 돌아가자. 프록시의 <code>m()</code>은 아무 예외도 선언하지 않았는데 <code>EOFException</code>이 빠져나갔다. JVMS §4.7.5는 메서드가 던질 예외를 <code>Exceptions</code> 속성에 적는 규칙을 설명한 뒤, 이 요구 사항들은 JVM에서 강제되지 않고 <b>컴파일 시점에만</b> 강제된다고 명시한다. 검사 예외는 javac가 소스에 대해 확인하는 계약일 뿐이고, 바이트코드의 <code>athrow</code>는 어떤 <code>Throwable</code>이든 던진다. 방금 본 추론 규칙과 이 사실을 합치면 javac의 검사를 통째로 피하는 코드가 만들어진다.</p>
+<pre><code class="language-java">import java.io.IOException;
+
+public class Sneaky {
+    @SuppressWarnings("unchecked")
+    static <E extends Throwable> void sneakyThrow(Throwable t) throws E {
+        throw (E) t;                          // 소거 후에는 Throwable 로의 캐스트일 뿐이다
+    }
+
+    public static void main(String[] args) {  // throws 절이 없다
+        sneakyThrow(new IOException("checked, but undeclared"));
+    }
+}</code></pre>
+<pre data-label="실행 결과와 javap -c -p Sneaky (JDK 21)"><code class="language-text">Exception in thread "main" java.io.IOException: checked, but undeclared
+	at Sneaky.main(Sneaky.java:10)
+
+  static <E extends java.lang.Throwable> void sneakyThrow(java.lang.Throwable) throws E;
+    Code:
+       0: aload_0
+       1: athrow</code></pre>
+<p>호출 <code>sneakyThrow(...)</code>에서 <code>E</code>는 어떤 인자와도 관련이 없으니 하한이 없고, 상한 <code>Throwable</code>은 <code>RuntimeException</code>의 상위 타입이다. 그래서 <code>E = RuntimeException</code>으로 추론되고, javac는 <code>main</code>이 처리할 검사 예외가 없다고 판단한다. 메서드 본문의 <code>(E) t</code>는 <code>E</code>의 소거가 <code>Throwable</code>이고 <code>t</code>도 <code>Throwable</code>이라 <code>checkcast</code>조차 남지 않았다. 바이트코드는 <code>aload_0</code>, <code>athrow</code> 두 줄이고, <code>main</code>에는 <code>Exceptions</code> 속성이 없다. 그런데도 JVM은 <code>IOException</code>을 그대로 전파했다.</p>
+<p>이 코드의 대가는 호출하는 쪽에 있다. 같은 호출을 <code>try</code>로 감싸고 <code>catch (IOException e)</code>를 쓰면 javac는 "exception IOException is never thrown in body of corresponding try statement"로 거부한다. JLS §11.2.3은 try 블록이 던질 수 없는 검사 예외 클래스를 잡는 catch 절을 컴파일 오류로 정하는데(<code>Exception</code>과 그 상위 타입은 예외), javac가 보기에 이 try 블록은 <code>IOException</code>을 던질 수 없기 때문이다. 실제로는 던지는 예외를 그 타입으로 잡을 길이 막히는 셈이다. 이 기법이 보여 주는 것은 함수 타입의 throws 절이 검사 예외를 전달하는 <b>유일한</b> 통로라는 사실이다. 앞 절의 교집합 규칙, 이 절의 <code>throws E</code> 추론, 그리고 <code>Function.apply</code>에 throws 절이 없어 파일을 읽는 람다가 거부되던 일까지 모두 javac가 그 통로 하나로 계약을 검사한 결과다. JVM은 그 계약을 모른다.</p>
+
+<h3>정리: 함수형 인터페이스를 고르는 순서와 흔한 오해</h3>
+<p>함수 모양이 주어졌을 때 인터페이스를 고르는 과정은 기계적으로 할 수 있다. 먼저 입력의 개수(0, 1, 2)와 출력의 종류(없음, boolean, 값)를 센다. 이것으로 기본 모양(<code>Supplier</code>, <code>Consumer</code>, <code>Predicate</code>, <code>Function</code>, <code>Runnable</code>)과 <code>Bi</code> 여부가 정해진다. 다음으로 입력과 출력의 타입이 같으면 <code>UnaryOperator</code>나 <code>BinaryOperator</code>를 고려한다. 그다음 입력이나 출력에 <code>int</code>, <code>long</code>, <code>double</code>이 있으면 기본형 특화 이름을 붙인다. 이 단계들로 맞는 것이 없거나(인자 셋 이상, 검사 예외), 도메인에서 의미 있는 이름이 필요하면 직접 정의한다.</p>
+<div class="table-wrap"><table><thead><tr><th>함수 모양</th><th>고를 인터페이스</th></tr></thead><tbody>
+<tr><td><code>(String, int) -> void</code></td><td><code>ObjIntConsumer<String></code></td></tr>
+<tr><td><code>(int) -> String</code></td><td><code>IntFunction<String></code></td></tr>
+<tr><td><code>(String) -> int</code></td><td><code>ToIntFunction<String></code></td></tr>
+<tr><td><code>(long, long) -> long</code></td><td><code>LongBinaryOperator</code></td></tr>
+<tr><td><code>() -> boolean</code></td><td><code>BooleanSupplier</code></td></tr>
+<tr><td><code>(int) -> double</code></td><td><code>IntToDoubleFunction</code></td></tr>
+</tbody></table></div>
+<p>이 회차에서 확인한 사실로 흔한 오해 몇 가지를 바로잡아 두자.</p>
+<ul>
+<li><b>"@FunctionalInterface가 있어야 람다를 쓸 수 있다."</b> 아니다. 컴파일러는 정의를 만족하는 모든 인터페이스를 함수형으로 다룬다. 애너테이션은 정의를 어기면 오류를 내게 하는 검사 장치다.</li>
+<li><b>"디폴트 메서드가 있으면 함수형 인터페이스가 아니다."</b> 아니다. 세는 것은 추상 메서드뿐이다. <code>Function</code>과 <code>Predicate</code>에도 디폴트 메서드가 여럿 있다.</li>
+<li><b>"메서드 모양이 같은 인터페이스끼리는 서로 대입된다."</b> 람다 식은 문맥에 맞춰지지만 이미 만들어진 객체는 그렇지 않다. 명목적 타이핑을 따르므로 상속 관계가 없으면 대입되지 않는다.</li>
+<li><b>"제네릭은 컴파일이 끝나면 아무 검사도 하지 않는다."</b> 타입 인자 자체는 지워지지만, 호출 지점의 <code>checkcast</code>와 람다 프록시 클래스의 <code>checkcast</code>가 남아 실행 중에도 타입을 확인한다. 로 타입으로 잘못된 값을 넣으면 프록시에서 <code>ClassCastException</code>이 난다.</li>
+<li><b>"<code>Function<Integer, Integer></code>와 <code>IntUnaryOperator</code>는 같은 일을 한다."</b> 결과는 같아도 바이트코드는 다르다. 전자는 호출마다 박싱·언박싱과 캐스트를 거치고, 박싱된 값을 <code>==</code>로 비교하면 128 이상에서 틀린 결과가 나올 수 있다.</li>
+</ul>
+<p>이 회차의 내용은 이 권의 나머지 회차가 모두 딛고 서는 바닥이다. 03회는 이 인터페이스들을 받는 고차 함수를 직접 만들어 보고, 04회는 람다와 익명 클래스의 차이, 그리고 이 회차에서 잠깐 쓴 메서드 참조를 정식으로 다룬다. 05~07회의 스트림 API는 <code>filter(Predicate)</code>, <code>map(Function)</code>, <code>forEach(Consumer)</code>, <code>reduce(BinaryOperator)</code>와 기본형 특화 스트림으로 가득하고, 09회는 <code>andThen</code>이나 <code>negate</code> 같은 디폴트 메서드가 인터페이스에 들어갈 수 있게 한 규칙을 다룬다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>자바에는 함수 타입이 없고, 추상 메서드가 하나인 인터페이스가 그 역할을 대신한다. 람다는 스스로 타입을 갖지 않는 폴리 식이라 대입·호출·캐스트 문맥이 주는 타깃 타입에 맞춰 그 인터페이스의 객체가 된다. 제네릭은 함수 모양의 수를 줄이지만 타입 소거 때문에 JVM 수준에서는 <code>(Object)Object</code> 메서드와 두 개의 <code>checkcast</code>가 되고, 기본형을 다룰 때는 박싱 비용과 <code>==</code> 함정이 따라온다. <code>java.util.function</code>의 43개 인터페이스는 기본 모양 넷에 Bi, 파생, 기본형 접두사를 조합한 것이며, 이름 규칙만 알면 모양을 읽어 낼 수 있다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>함수형 인터페이스</dt><dd>sealed가 아니고, <code>Object</code>의 public 메서드를 제외한 추상 메서드가 하나뿐인 인터페이스(JLS §9.8). 디폴트·정적 메서드는 세지 않는다. 람다와 메서드 참조의 유일한 타깃이다.</dd>
+<dt>@FunctionalInterface</dt><dd>붙인 인터페이스가 함수형 인터페이스가 아니면 컴파일 오류를 내게 하는 애너테이션. 없어도 람다는 쓸 수 있으며, 나중에 추상 메서드가 추가되어 사용자 코드가 깨지는 것을 막는 장치다.</dd>
+<dt>제네릭과 타입 소거</dt><dd><code>R apply(T)</code>는 디스크립터 <code>(Object)Object</code>로 컴파일된다. 출력 캐스트는 호출 지점의 <code>checkcast</code>가, 입력 캐스트는 <code>dynamicMethodType</code>에 따라 람다 프록시 클래스의 <code>checkcast</code>가 맡는다.</dd>
+<dt>와일드카드 선언</dt><dd>함수를 받는 메서드는 <code>Function<? super T, ? extends R></code>처럼 입력은 super, 출력은 extends로 연다. 그래야 더 넓은 입력을 받거나 더 좁은 출력을 내는 기존 함수 객체를 넘길 수 있다.</dd>
+<dt>타깃 타입</dt><dd>람다는 폴리 식이라 대입·호출·캐스트 문맥이 기대하는 타입으로 타입이 정해진다. 타깃이 없거나(<code>var</code>) 함수형이 아니면(<code>Object</code>) 컴파일 오류다. 와일드카드 타깃은 그라운드 타깃 타입으로 바뀐다.</dd>
+<dt>오버로딩 선택</dt><dd>문장 식 본문은 void와 값 양쪽에 호환된다. 명시적 타입 람다(매개변수 없는 람다 포함)는 값을 돌려주는 쪽이 더 구체적이라 선택되고, 암묵적 타입 람다는 모호성 오류가 날 수 있다.</dd>
+<dt>기본·특화 인터페이스</dt><dd><code>Function</code>, <code>Consumer</code>, <code>Supplier</code>, <code>Runnable</code>이 기본 모양이고, <code>Predicate</code>는 기본형 <code>boolean</code>을 돌려주며, <code>UnaryOperator</code>와 <code>BinaryOperator</code>는 입력과 출력 타입을 하나로 묶는다.</dd>
+<dt>기본형 특화</dt><dd><code>int</code>, <code>long</code>, <code>double</code>용 인터페이스는 박싱·언박싱과 캐스트를 없앤다. 박싱된 값을 <code>==</code>로 비교하면 캐시 범위(-128~127) 밖에서 참조 비교가 되어 틀린다.</dd>
+<dt>함수 타입의 throws 절</dt><dd>추상 메서드를 여럿 물려받으면 함수 타입의 throws 절은 모든 throws 절이 함께 덮는 예외만 남긴 교집합이다(JLS §9.9). <code>throws E</code>로 선언하면 E는 람다 본문의 검사 예외로 추론되고, 없으면 <code>RuntimeException</code>이 된다(JLS §18.4). 이 검사는 javac만 하며 JVM은 강제하지 않는다(JVMS §4.7.5).</dd>
+<dt>직렬화 가능한 람다</dt><dd>프록시의 <code>writeReplace</code>가 부트스트랩 인자와 캡처 값을 <code>SerializedLambda</code>로 기록하고, 읽을 때는 만든 클래스의 <code>$deserializeLambda$</code>가 합성 메서드 이름 등을 대조해 새 <code>invokedynamic</code>으로 다시 만든다. 그래서 그 클래스의 컴파일 결과에 묶인다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 함수형 인터페이스를 다시 판단하는 첫 장면은 API 설계다. 메서드가 함수를 받도록 만들 때 표준 인터페이스를 쓸지 직접 만들지를 정해야 한다. 표준 인터페이스는 이미 만들어진 함수 객체를 변환 없이 넘길 수 있고 <code>andThen</code>, <code>negate</code> 같은 조합 메서드가 딸려 온다. 직접 만든 인터페이스는 도메인 이름으로 의도를 드러내고, 필요하면 throws 절을 선언할 수 있다. 판단 기준은 그 함수가 "일반적인 변환·조건"인지 "도메인의 정책"인지다. 어느 쪽을 택하든 매개변수 선언에 <code>? super</code>와 <code>? extends</code>를 빠뜨리면 사용자가 넘길 수 있는 함수가 불필요하게 좁아진다는 점은 같다.</p>
+<p>두 번째 장면은 성능이다. 대량의 숫자를 다루는 코드에서 <code>Function<Integer, Integer></code>나 <code>Stream<Integer></code>를 쓰고 있다면 호출마다 박싱과 캐스트가 일어나고 캐시 범위 밖의 값은 새 객체가 된다. 프로파일러에서 <code>Integer.valueOf</code>나 <code>Integer</code> 할당이 눈에 띄면 기본형 특화 인터페이스와 기본형 스트림으로 바꾸는 것이 첫 번째 후보다. 반대로 원소 수가 적은 코드에서는 이 차이가 의미 있는 비용이 되지 않을 수 있으니, 측정 없이 모든 코드를 특화 인터페이스로 바꿀 필요는 없다.</p>
+<p>세 번째 장면은 정확성 문제다. <code>BiPredicate<Integer, Integer></code>에서 <code>==</code>로 비교하는 코드는 테스트 데이터가 작은 수일 때는 통과하고 운영 데이터에서 틀린다. 리뷰에서 박싱된 타입 인자를 가진 함수형 인터페이스 안의 <code>==</code>를 보면 의심해야 한다. 같은 맥락에서 <code>Function<T, Boolean></code>은 <code>null</code>을 돌려줄 수 있어 조건문에서 NPE가 난다. 조건이라면 <code>Predicate</code>를 쓰는 것이 타입으로 이 경우를 막는 방법이다.</p>
+<p>마지막으로, 람다를 받는 메서드를 오버로딩할 때는 사용자가 어떤 람다를 쓸지 모두 예측할 수 없다. <code>Consumer</code>와 <code>Function</code>을 받는 같은 이름의 메서드는 매개변수 타입 표기 하나에 따라 모호성 오류와 정상 선택이 갈린다. 라이브러리를 만든다면 함수형 인터페이스 매개변수만 다른 오버로딩은 피하고, 이름으로 구분하는 편이 사용자를 덜 놀라게 한다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 코드의 출력을 순서대로 적어라. <code>Predicate<Integer> positive = n -> { System.out.print("[positive " + n + "]"); return n > 0; };</code>, <code>Predicate<Integer> even = n -> { System.out.print("[even " + n + "]"); return n % 2 == 0; };</code>, <code>Predicate<Integer> p = positive.and(even).negate();</code>일 때 <code>System.out.println(" -> " + p.test(-4));</code>, <code>System.out.println(" -> " + p.test(6));</code>, <code>System.out.println(" -> " + positive.or(even).test(3));</code></li>
+<li><code>static void run(Runnable r)</code>와 <code>static <T> void run(Supplier<T> s)</code>가 오버로딩되어 있다. <code>List<String> list = new ArrayList<>();</code>에 대해 <code>run(() -> list.add("x"))</code>와 <code>run(() -> { list.add("y"); })</code>는 각각 어느 메서드를 호출하는지 JLS 규칙으로 설명하라.</li>
+<li>다음 함수 모양에 맞는 <code>java.util.function</code>의 인터페이스 이름을 써라. (a) <code>(String, int) -> void</code> (b) <code>(int) -> String</code> (c) <code>(String) -> int</code> (d) <code>(long, long) -> long</code> (e) <code>() -> boolean</code></li>
+<li><code>Function<String, String> f = s -> s.toUpperCase();</code>를 <code>names.replaceAll(f)</code>에 넘기면 컴파일 오류가 난다. 그런데 <code>names.replaceAll(s -> s.toUpperCase())</code>는 통과한다. 두 경우의 차이를 "식과 값"의 관점에서 설명하고, <code>f</code>를 그대로 활용해 컴파일되게 고쳐라.</li>
+<li><code>GenericFunction<String, Integer> length = s -> s.length();</code>를 로 타입 변수 <code>GenericFunction raw = length;</code>에 담고 <code>raw.apply(42)</code>를 호출했다. 예외가 어느 클래스의 어느 바이트코드 명령에서 나는지, 그 명령은 누가 왜 넣었는지 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 출력은 <code>[positive -4] -> true</code>, <code>[positive 6][even 6] -> false</code>, <code>[positive 3] -> true</code>다. <code>and</code>는 소스에서 <code>test(t) && other.test(t)</code>로 구현되어 단락 평가를 한다. -4는 <code>positive</code>가 거짓이므로 <code>even</code>을 호출하지 않고 <code>and</code> 결과가 거짓, <code>negate</code>로 참이 된다. 6은 두 조건이 모두 참이라 둘 다 호출되고, <code>and</code>가 참이므로 <code>negate</code> 후 거짓이다. 3은 <code>or</code>에서 <code>positive</code>가 참이므로 <code>even</code>이 호출되지 않는다. 출력에 <code>[even 3]</code>이 없는 이유다.</p>
+<p><b>2.</b> <code>() -> list.add("x")</code>의 본문은 메서드 호출이라는 문장 식이므로 void 호환이면서 <code>boolean</code> 값을 내는 값 호환이다. 두 메서드가 모두 적용 가능하다. 매개변수가 없는 람다는 JLS §15.27.1에 따라 명시적 타입 람다이고, JLS §15.12.2.5에 따라 상대(<code>Runnable</code>)의 함수 타입 반환형이 void이면 <code>Supplier</code>가 더 구체적이다. 그래서 <code>Supplier</code> 버전이 호출되어 <code>Supplier -> true</code>가 출력된다. <code>{ list.add("y"); }</code>는 return 문이 없는 블록이라 값 호환이 아니므로 <code>Runnable</code> 버전만 적용 가능하다. JDK 21에서 실행하면 <code>Supplier -> true</code>, <code>Runnable</code>이 출력되고 리스트는 <code>[x, y]</code>가 된다.</p>
+<p><b>3.</b> (a) <code>ObjIntConsumer<String></code>: 첫 인자는 특화하지 않으므로 <code>Obj</code>, 둘째는 <code>Int</code>, 반환이 없으므로 <code>Consumer</code>. (b) <code>IntFunction<String></code>: 입력이 <code>int</code>이므로 <code>Int</code> 접두사, 출력은 제네릭. (c) <code>ToIntFunction<String></code>: 입력은 제네릭이고 반환만 기본형이므로 <code>ToInt</code>. (d) <code>LongBinaryOperator</code>: 같은 타입 둘을 받아 같은 타입을 내는 <code>BinaryOperator</code>의 <code>long</code> 특화. (e) <code>BooleanSupplier</code>: <code>boolean</code> 특화는 이것 하나뿐이다.</p>
+<p><b>4.</b> <code>replaceAll</code>의 매개변수 타입은 <code>UnaryOperator<E></code>다. 람다 <code>s -> s.toUpperCase()</code>는 타입이 정해지지 않은 식이어서 호출 문맥의 타깃 타입 <code>UnaryOperator<String></code>으로 만들어진다. 반면 <code>f</code>는 이미 <code>Function</code>을 구현한 객체를 가리키는 값이고, <code>Function<String, String></code>은 <code>UnaryOperator<String></code>의 하위 타입이 아니다(상속은 반대 방향이다). 자바는 명목적 타이핑을 따르므로 모양이 같아도 대입되지 않는다. <code>names.replaceAll(f::apply)</code>나 <code>names.replaceAll(s -> f.apply(s))</code>로 쓰면 <code>f</code>에 위임하는 <code>UnaryOperator</code> 객체가 새로 만들어져 컴파일된다.</p>
+<p><b>5.</b> 예외는 람다 프록시 클래스(OpenJDK 21에서는 <code>RawCall$$Lambda</code> 같은 숨겨진 클래스)의 <code>apply(Object)</code> 메서드 첫 부분에 있는 <code>checkcast java/lang/String</code>에서 난다. 람다 본문 메서드 <code>lambda$main$0(String)</code>은 호출되지도 않는다. 이 명령은 <code>LambdaMetafactory</code>가 클래스를 생성하면서 넣은 것으로, javac가 부트스트랩 인자로 넘긴 세 번째 메서드 타입 <code>(String)Integer</code>, 즉 <code>dynamicMethodType</code>을 호출 시점에 강제하기 위한 것이다. 인터페이스 메서드는 소거되어 <code>Object</code>를 받으므로, 제네릭 타입 인자가 약속한 <code>String</code>을 확인하는 일이 이 프록시로 옮겨 왔다. 기본 설정에서는 숨겨진 프레임이 스택 트레이스에 보이지 않아 <code>RawCall.main</code>에서 난 것처럼 보이고, <code>-XX:+UnlockDiagnosticVMOptions -XX:+ShowHiddenFrames</code>를 주면 프록시의 <code>apply</code> 프레임이 드러난다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>다음 중 함수형 인터페이스가 <b>아닌</b> 것은?</q>
+<o><code>interface A { int compare(String a, String b); boolean equals(Object o); }</code></o>
+<o><code>interface B { void run(); default void twice() { run(); run(); } }</code></o>
+<o><code>interface C { int m(); Object clone(); }</code></o>
+<o><code>interface D extends Function<String, String> { }</code></o>
+<why>C가 정답이다. <code>Object.clone()</code>은 protected이므로 JLS §9.8의 "Object의 public 메서드는 세지 않는다"는 예외가 적용되지 않고, 추상 메서드가 <code>m</code>과 <code>clone</code> 두 개로 세어진다. A는 <code>equals</code>가 <code>Object</code>의 public 메서드와 같아 세지 않으므로 추상 메서드가 <code>compare</code> 하나다. B는 디폴트 메서드를 세지 않으므로 <code>run</code> 하나다. D는 상속받은 <code>apply</code> 하나를 가진다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>static <T, R> List<R> map(List<T> list, Function<T, R> f)</code>에 <code>List<String></code>과 <code>Function<Object, String></code> 변수를 넘기면 컴파일 오류가 난다. 가장 정확한 원인은?</q>
+<o>타입 소거 때문에 런타임에 <code>T</code>가 무엇인지 알 수 없어서</o>
+<o><code>T</code>에 대해 <code>String</code>과 <code>Object</code>라는 서로 다른 "같아야 한다" 제약이 생기는데, 제네릭은 무공변이라 둘을 동시에 만족하는 <code>T</code>가 없어서</o>
+<o><code>Function</code>의 추상 메서드가 제네릭 메서드라서 람다가 아닌 값을 받을 수 없어서</o>
+<o><code>Object</code>를 받는 함수에 <code>String</code>을 넘기면 정보가 손실되므로 컴파일러가 막아서</o>
+<why>javac는 "inference variable T has incompatible equality constraints Object,String"이라고 보고한다. <code>List<T></code>에서 <code>T = String</code>, <code>Function<T, R></code>에서 <code>T = Object</code>가 나오고, <code>Function<Object, String></code>은 <code>Function<String, String></code>의 하위 타입이 아니다. 매개변수를 <code>Function<? super T, ? extends R></code>로 바꾸면 해결된다. 타입 추론은 컴파일 시점의 일이라 소거와는 무관하고, <code>Function.apply</code>는 제네릭 메서드가 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>exec(Consumer<String> c)</code>와 <code>exec(Function<String, Integer> f)</code>가 오버로딩되어 있을 때, <code>exec(s -> s.length())</code>는 어떻게 되는가?</q>
+<o><code>Function</code> 버전이 호출된다. 본문이 값을 내기 때문이다.</o>
+<o><code>Consumer</code> 버전이 호출된다. 먼저 선언되었기 때문이다.</o>
+<o><code>Consumer</code> 버전이 호출된다. 반환값을 버리는 쪽이 더 일반적이기 때문이다.</o>
+<o>모호하다는 컴파일 오류가 난다.</o>
+<why><code>s.length()</code>는 문장 식이라 void 호환이면서 값 호환이므로 두 메서드가 모두 적용 가능하다. JLS §15.12.2.5의 "반환형이 void인 쪽보다 값을 내는 쪽이 더 구체적"이라는 규칙은 명시적 타입 람다에만 적용되는데, <code>s -> ...</code>는 매개변수 타입을 생략한 암묵적 타입 람다다. 그래서 어느 쪽도 더 구체적이지 않아 "reference to exec is ambiguous" 오류가 난다. <code>(String s) -> s.length()</code>로 쓰면 <code>Function</code> 버전이 선택된다. 선언 순서는 오버로딩 선택에 영향을 주지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>BiPredicate<Integer, Integer> same = (x, y) -> x == y;</code>에서 <code>same.test(127, 127)</code>은 <code>true</code>, <code>same.test(128, 128)</code>은 <code>false</code>다(기본 JVM 설정). 이유로 가장 정확한 것은?</q>
+<o>람다 본문의 <code>x</code>, <code>y</code>가 <code>Integer</code>라서 <code>==</code>가 참조 비교(<code>if_acmpne</code>)가 되고, <code>Integer.valueOf</code>는 -128~127만 캐시를 보장하므로 128은 서로 다른 객체가 되기 때문이다.</o>
+<o><code>BiPredicate</code>의 <code>test</code>가 128 이상의 값을 언박싱하지 못하기 때문이다.</o>
+<o>람다 프록시 클래스가 127을 넘는 값을 <code>Long</code>으로 바꾸기 때문이다.</o>
+<o>JIT 컴파일러가 128 이상의 비교를 최적화하면서 결과가 달라지기 때문이다.</o>
+<why>제네릭 타입 인자 때문에 람다 매개변수가 참조 타입 <code>Integer</code>가 되고, 참조 타입 사이의 <code>==</code>는 같은 객체인지를 본다. 실제로 본문 메서드의 바이트코드는 <code>if_acmpne</code>다. 인자 127과 128은 호출 지점에서 <code>Integer.valueOf</code>로 박싱되는데, Javadoc은 -128~127을 항상 캐시한다고 약속하므로 127은 같은 객체, 128은 기본 설정에서 각각 새 객체가 된다. <code>equals</code>를 쓰거나 기본형 특화 인터페이스를 쓰면 해결된다. 나머지 보기는 이 동작과 관계없다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>interface ThrowingSupplier<T, E extends Exception> { T get() throws E; }</code>와 <code>static <T, E extends Exception> T call(ThrowingSupplier<T, E> s) throws E</code>가 있다. throws 절이 없는 메서드 안에서 <code>call(() -> "plain")</code>을 쓰면 어떻게 되는가?</q>
+<o><code>E</code>가 상한인 <code>Exception</code>으로 추론되어 "unreported exception Exception" 오류가 난다.</o>
+<o>람다 본문이 검사 예외를 던지지 않아 <code>E</code>에 하한이 없고, <code>throws E</code> 경계 때문에 <code>E</code>가 <code>RuntimeException</code>으로 추론되어 그대로 컴파일된다.</o>
+<o><code>E</code>를 정할 근거가 없으므로 타입 인자를 명시하라는 오류가 난다.</o>
+<o>컴파일은 되지만 실행 중에 JVM이 <code>Exceptions</code> 속성을 검사해 예외를 던진다.</o>
+<why>JLS §18.5.1에 따라 throws 절에 나오는 타입 매개변수에는 <code>throws α</code> 경계가 붙는다. §18.2.5에서 람다 본문이 던지는 검사 예외가 하한이 되는데 <code>() -> "plain"</code>은 아무것도 던지지 않는다. §18.4의 해석은 하한이 없고 <code>throws α</code>가 있으며 상한(<code>Exception</code>)이 모두 <code>RuntimeException</code>의 상위 타입이면 <code>RuntimeException</code>을 고른다. 그래서 처리할 검사 예외가 없다. 상한으로 정하는 것은 이 규칙이 적용되지 않을 때의 마지막 단계이고, JVMS §4.7.5대로 JVM은 <code>Exceptions</code> 속성을 강제하지 않는다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>함수형 인터페이스(functional interface)</dt><dd>sealed가 아니며 <code>Object</code>의 public 메서드를 제외한 추상 메서드가 정확히 하나인 인터페이스. 람다 식과 메서드 참조의 타깃 타입이 된다.</dd>
+<dt>함수 타입(function type)</dt><dd>함수형 인터페이스의 추상 메서드를 오버라이드할 수 있는 메서드 타입(매개변수 타입, 반환 타입, throws 절). javac 메시지에서는 함수 디스크립터(functional descriptor)라고도 부른다.</dd>
+<dt>폴리 식(poly expression)</dt><dd>식 자체만으로는 타입이 정해지지 않고 문맥이 기대하는 타입에 따라 타입이 정해지는 식. 람다, 메서드 참조, 일부 제네릭 메서드 호출 등이 해당한다.</dd>
+<dt>타깃 타입(target type)</dt><dd>대입·호출·캐스트 문맥이 그 자리의 식에 기대하는 타입. 람다는 이 타입의 함수형 인터페이스 객체로 만들어진다.</dd>
+<dt>그라운드 타깃 타입(ground target type)</dt><dd>와일드카드가 들어간 함수형 인터페이스 타입에서 람다의 함수 타입을 정하기 위해 와일드카드를 구체 타입으로 바꾼 타입. <code>Function<? super String, ? extends Number></code>는 <code>Function<String, Number></code>가 된다.</dd>
+<dt>타입 소거(type erasure)</dt><dd>제네릭 타입 정보를 컴파일 후 지우고 타입 변수를 상한 타입으로 바꾸는 자바 제네릭의 구현 방식. 필요한 곳에는 컴파일러가 <code>checkcast</code>를 넣는다.</dd>
+<dt>박싱(boxing)</dt><dd>기본형 값을 대응하는 래퍼 객체로 바꾸는 변환. javac는 <code>Integer.valueOf</code> 같은 호출로 컴파일한다.</dd>
+<dt>throws 경계(throws bound)</dt><dd>타입 추론에서 throws 절에 나오는 추론 변수에 붙는 정보용 경계(JLS §18.1.3). 하한이 없으면 그 변수를 검사 예외가 아닌 <code>RuntimeException</code>으로 정하게 한다.</dd>
+<dt>SerializedLambda</dt><dd>직렬화 가능한 람다 대신 기록되는 객체. 만든 클래스, 인터페이스 메서드, 구현 메서드, 캡처 값을 담고, 읽을 때 <code>readResolve</code>가 만든 클래스의 <code>$deserializeLambda$</code>를 불러 람다를 다시 만든다.</dd>
+<dt>void 호환·값 호환(void-compatible, value-compatible)</dt><dd>람다 본문이 void를 돌려주는 함수 타입에 맞는지, 값을 돌려주는 함수 타입에 맞는지를 나타내는 성질. 문장 식 하나로 된 본문은 둘 다에 맞을 수 있다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-9.html">JLS (Java SE 21) 9장 인터페이스</a> — §9.8 함수형 인터페이스의 정의와 예제, §9.9 함수 타입과 와일드카드의 비와일드카드 매개변수화, §9.6.4.9 @FunctionalInterface</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html">JLS (Java SE 21) 15장 식</a> — §15.27 람다 식(허용 문맥, 명시적·암묵적 타입, void/값 호환, 그라운드 타깃 타입), §15.12.2.5 가장 구체적인 메서드 선택</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/function/package-summary.html">java.util.function 패키지 요약 (Java SE 21)</a> — 43개 인터페이스 목록과 이름 규칙</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/invoke/LambdaMetafactory.html">LambdaMetafactory (Java SE 21)</a> — interfaceMethodType, implementation, dynamicMethodType의 의미와 호출 시점 타입 검사</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-18.html">JLS (Java SE 21) 18장 타입 추론</a> — §18.1.3 throws 경계, §18.2.5 검사 예외 제약, §18.4 throws 추론 변수를 RuntimeException으로 정하는 해석 규칙</li>
+<li><a href="https://docs.spring.io/spring-framework/docs/6.1.x/javadoc-api/org/springframework/jdbc/core/RowMapper.html">Spring Framework 6.1 RowMapper Javadoc</a> — @FunctionalInterface 선언과 throws SQLException을 선언한 mapRow</li>
+</x-refs>

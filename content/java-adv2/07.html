@@ -1,0 +1,1385 @@
+<x-meta>
+deck: 에코 서버를 세 번 고쳐 쓰며 연결 수립, accept 큐, 블로킹 읽기를 커널 수준에서 확인하고, finally에서 try-with-resources로 가는 자원 정리 규칙을 바이트코드까지 따라간다.
+minutes: 100
+</x-meta>
+
+<x-goals>
+<li><code>new Socket(host, port)</code> 한 줄이 이름 해석, 임시 포트 배정, TCP 3-way 핸드셰이크를 거쳐 반환된다는 것을 설명하고, <code>Socket</code>의 <code>toString()</code> 출력에서 네 개의 주소 값(양쪽 IP와 포트)을 짚어 낼 수 있다.</li>
+<li>서버가 <code>accept()</code>를 호출하기 전에도 연결이 완성되고 데이터까지 도착한다는 것을 실험으로 보이고, 리스닝 소켓과 accept 큐, backlog의 관계를 설명할 수 있다.</li>
+<li>스레드 하나로 만든 서버가 두 번째 클라이언트를 처리하지 못하는 이유를 스레드 덤프로 확인하고, 연결마다 스레드를 붙이는 구조로 바꾼 뒤 그 비용(스택, 파일 디스크립터)을 말할 수 있다.</li>
+<li>정리 코드를 try 끝에 둘 때, finally에 둘 때, finally 안에서 예외를 따로 잡을 때 각각 무엇이 깨지는지 실행 결과로 설명할 수 있다.</li>
+<li>try-with-resources가 언어 명세에서 어떤 코드로 번역되는지, 자원을 닫는 순서와 억제된 예외(suppressed exception)가 어떻게 정해지는지 javap 출력과 함께 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 다른 프로세스와 바이트를 주고받는 법</h3>
+<p>앞 회차에서 네트워크의 바탕을 봤다. IP는 패킷을 목적지 컴퓨터까지 나르고, TCP는 그 위에서 순서가 보장되고 빠짐없는 바이트의 흐름을 만들며, 포트 번호는 한 컴퓨터 안에서 그 흐름이 어느 프로그램의 것인지 가른다. DNS는 사람이 읽는 이름을 IP 주소로 바꾼다. 이번 회차는 그 이론을 자바 코드로 옮긴다. 클라이언트가 문자열을 보내면 서버가 앞에 <code>[echo]</code>를 붙여 돌려주는 아주 작은 에코 서버를 만들고, 이것을 세 번 고쳐 쓴다.</p>
+<p>코드는 짧다. 소켓을 열고, 스트림을 얻고, 쓰고 읽는다. I/O 회차에서 본 <code>InputStream</code>/<code>OutputStream</code>과 <code>DataInputStream</code>/<code>DataOutputStream</code>이 그대로 다시 나온다. 파일 대신 네트워크 연결이 스트림의 끝에 붙어 있을 뿐이다. 그래서 이번 회차의 무게는 코드보다 코드 아래에 있다. <code>new Socket(...)</code>이 반환되기까지 어떤 패킷이 오갔는가, <code>accept()</code>는 연결을 "만드는" 메서드인가 "꺼내는" 메서드인가, <code>readUTF()</code>에서 멈춘 스레드는 운영체제 입장에서 무엇을 하고 있는가 같은 질문이다.</p>
+<p>후반부는 자원 정리다. 소켓은 메모리가 아니라 운영체제의 자원이다. 가비지 컬렉터가 객체를 치워 주는 것과 달리, 소켓은 누군가 <code>close()</code>를 호출해야 운영체제에 반납된다. 예외가 나는 경로에서도 확실히 닫으려고 정리 코드를 다듬어 가다 보면 finally의 함정을 차례로 밟게 되고, 그 끝에 try-with-resources가 있다. 이 문법이 정확히 어떤 코드로 바뀌는지를 언어 명세와 바이트코드로 확인한다. 이 도구를 네트워크 서버에 실제로 적용하는 일과 연결 종료·타임아웃 같은 네트워크 예외는 다음 회차의 몫이다.</p>
+<p>이번 회차의 실행 결과는 모두 macOS(Apple Silicon)의 Temurin OpenJDK 21.0.13에서 직접 돌려 얻었다. 포트 번호처럼 실행할 때마다 달라지는 값은 그렇다고 밝혀 둔다. 운영체제마다 다르게 동작하는 부분은 어느 운영체제의 관찰인지 함께 적는다.</p>
+
+<h3>네트워크 프로그램1 — 예제: 한 번 묻고 한 번 답하기</h3>
+<p>먼저 로그 출력용 도우미를 하나 둔다. 어떤 스레드가 그 줄을 찍었는지가 이번 회차 내내 중요하므로 스레드 이름을 앞에 붙인다. 시간은 실행마다 달라지므로 일부러 찍지 않는다.</p>
+<pre><code class="language-java">package net;
+
+public class Log {
+    public static void log(Object msg) {
+        System.out.println("[" + Thread.currentThread().getName() + "] " + msg);
+    }
+}</code></pre>
+<p>서버는 포트 7777에서 연결을 기다렸다가, 연결이 오면 문자열 하나를 읽고, 응답 하나를 쓰고, 모든 것을 닫는다.</p>
+<pre><code class="language-java">package net;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+import static net.Log.log;
+
+public class EchoServer1 {
+    private static final int PORT = 7777;
+
+    public static void main(String[] args) throws IOException {
+        log("서버 시작");
+        ServerSocket serverSocket = new ServerSocket(PORT);
+        log("리스닝 포트: " + PORT);
+
+        Socket socket = serverSocket.accept();          // (1) 연결이 올 때까지 대기
+        log("연결됨: " + socket);
+
+        DataInputStream input = new DataInputStream(socket.getInputStream());
+        DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+
+        String received = input.readUTF();              // (2) 메시지가 올 때까지 대기
+        log("받음: " + received);
+
+        String reply = "[echo] " + received;
+        output.writeUTF(reply);                         // (3) 응답 전송
+        log("보냄: " + reply);
+
+        log("연결 종료: " + socket);
+        input.close();
+        output.close();
+        socket.close();
+        serverSocket.close();
+    }
+}</code></pre>
+<p>클라이언트는 서버에 연결하고, <code>hello</code>를 보내고, 응답을 읽은 뒤 닫는다.</p>
+<pre><code class="language-java">package net;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.net.Socket;
+
+import static net.Log.log;
+
+public class EchoClient1 {
+    private static final int PORT = 7777;
+
+    public static void main(String[] args) throws IOException {
+        log("클라이언트 시작");
+        Socket socket = new Socket("localhost", PORT);  // (1) 연결 수립
+        log("연결됨: " + socket);
+
+        DataInputStream input = new DataInputStream(socket.getInputStream());
+        DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+
+        String message = "hello";
+        output.writeUTF(message);                       // (2) 메시지 전송
+        log("보냄: " + message);
+
+        String reply = input.readUTF();                 // (3) 응답 대기
+        log("받음: " + reply);
+
+        log("연결 종료: " + socket);
+        input.close();
+        output.close();
+        socket.close();
+    }
+}</code></pre>
+<p>서버를 먼저 띄우고 다른 터미널에서 클라이언트를 실행한다. 순서를 바꿔 클라이언트를 먼저 실행하면 7777 포트에서 기다리는 프로그램이 없으므로 연결이 거부된다(이 예외는 다음 회차에서 자세히 본다).</p>
+<pre data-label="클라이언트 실행 결과"><code class="language-text">[main] 클라이언트 시작
+[main] 연결됨: Socket[addr=localhost/127.0.0.1,port=7777,localport=58743]
+[main] 보냄: hello
+[main] 받음: [echo] hello
+[main] 연결 종료: Socket[addr=localhost/127.0.0.1,port=7777,localport=58743]</code></pre>
+<pre data-label="서버 실행 결과"><code class="language-text">[main] 서버 시작
+[main] 리스닝 포트: 7777
+[main] 연결됨: Socket[addr=/127.0.0.1,port=58743,localport=7777]
+[main] 받음: hello
+[main] 보냄: [echo] hello
+[main] 연결 종료: Socket[addr=/127.0.0.1,port=58743,localport=7777]</code></pre>
+<p>58743은 실행할 때마다 바뀐다. 이 숫자가 어디서 왔는지, 왜 클라이언트 출력에서는 <code>localport</code>에, 서버 출력에서는 <code>port</code>에 같은 값이 찍히는지가 다음 절의 첫 번째 주제다. 코드에 표시한 (1), (2), (3)은 모두 상대가 무언가를 할 때까지 스레드가 멈출 수 있는 지점이다. 이 지점들이 이번 회차 전체를 끌고 간다.</p>
+
+<h3>네트워크 프로그램1 — 분석(1): 이름에서 주소로, 주소에서 연결로</h3>
+<h4>localhost는 누가 127.0.0.1로 바꾸는가</h4>
+<p><code>new Socket("localhost", 7777)</code>의 첫 일은 이름 해석이다. TCP는 이름을 모른다. 연결 대상은 IP 주소와 포트 번호의 쌍이어야 하므로, 생성자는 먼저 <code>InetAddress.getByName("localhost")</code>에 해당하는 작업으로 이름을 주소로 바꾼다. <code>InetAddress</code>의 Javadoc은 실제 해석을 "InetAddress resolver"에 위임한다고 적고, 기본으로 내장된 해석기는 로컬 컴퓨터의 설정 정보와 DNS 같은 네이밍 서비스를 조합해 쓰며 어떤 서비스를 쓰는지는 그 컴퓨터의 설정에 달려 있다고 설명한다. 이 해석기를 갈아 끼우는 서비스 제공자 인터페이스 <code>InetAddressResolverProvider</code>는 Java 18에 들어왔다.</p>
+<p>localhost는 보통 DNS 서버까지 가지 않는다. 이 실험 컴퓨터의 <code>/etc/hosts</code>에는 <code>127.0.0.1 localhost</code>와 <code>::1 localhost</code> 두 줄이 있고, 운영체제의 해석 절차가 이 파일을 먼저 본다. 자바로 확인하면 다음과 같다.</p>
+<pre><code class="language-java">InetAddress a = InetAddress.getByName("localhost");
+System.out.println(a);                                   // localhost/127.0.0.1
+System.out.println(a.isLoopbackAddress());               // true
+System.out.println(Arrays.toString(InetAddress.getAllByName("localhost")));
+// [localhost/127.0.0.1, localhost/0:0:0:0:0:0:0:1]
+System.out.println(InetAddress.getByName("127.0.0.1"));  // /127.0.0.1</code></pre>
+<p>이름 하나에 IPv4 주소와 IPv6 주소가 함께 돌아왔고, <code>getByName</code>은 그중 첫 번째를 고른다. 자바 네트워킹 속성 문서에 따르면 <code>java.net.preferIPv6Addresses</code>의 기본값은 false이고, 이때 IPv4와 IPv6 주소를 모두 가진 호스트에서는 IPv4 주소를 우선한다. 출력 형식 <code>localhost/127.0.0.1</code>은 "호스트 이름/IP 문자열"이다. <code>InetAddress.toString()</code>의 Javadoc에 따르면 호스트 이름이 정해지지 않은 주소는 역방향 조회를 하지 않고 이름 부분을 빈 문자열로 둔다. 그래서 IP 문자열로 만든 주소는 <code>/127.0.0.1</code>로 찍힌다. 서버 쪽 출력의 <code>addr=/127.0.0.1</code>도 같은 이유다. 서버는 연결해 온 상대의 IP 주소만 커널에게서 받았고 이름은 모른다.</p>
+<p>이름 해석 결과는 JVM 안에서도 캐시된다. Javadoc은 보안 관리자가 없을 때 성공한 조회를 "구현에 따라 정해지는 유한한 시간" 동안 캐시한다고만 적는다. OpenJDK 21의 구현(<code>sun.net.InetAddressCachePolicy</code>)을 열어 보면 <code>networkaddress.cache.ttl</code> 보안 속성을 지정하지 않았고 보안 관리자도 없으면 30초를 쓴다. 실패한 조회는 Javadoc에 명시된 대로 10초 동안 캐시된다. 서버의 IP가 바뀌는 환경(클라우드의 로드 밸런서 같은)에서 자바 클라이언트가 옛 주소로 계속 붙는 현상을 만나면 이 캐시가 첫 번째 용의자다.</p>
+
+<h4>connect: 커널끼리 주고받는 세 개의 세그먼트</h4>
+<p>주소가 정해지면 생성자는 소켓을 만들고 연결한다. 자바 코드에서는 한 줄이지만, 운영체제 수준에서는 <code>socket()</code> 시스템 콜로 소켓을 만들고 <code>connect()</code> 시스템 콜로 연결을 시작하는 두 단계다. <code>connect()</code>가 호출되면 클라이언트의 커널이 TCP 연결 수립 절차를 진행한다. RFC 9293은 이를 three-way handshake라고 부른다. 연결을 시작하는 쪽이 SYN을 보내고, 받는 쪽이 자기 SYN과 상대 SYN에 대한 ACK를 한 세그먼트에 담아 보내고, 시작한 쪽이 그 SYN에 ACK로 답한다. 이 세 세그먼트가 오가면 양쪽 모두 ESTABLISHED 상태가 되고 데이터를 보낼 수 있다.</p>
+<p>중요한 점은 이 과정을 진행하는 주체가 자바 코드가 아니라 양쪽의 커널이라는 것이다. 클라이언트 스레드는 <code>connect()</code> 시스템 콜 안에서 핸드셰이크가 끝나기를 기다릴 뿐이다. 서버 쪽에서도 SYN을 받고 SYN+ACK로 답하는 것은 서버 프로그램이 아니라 서버 컴퓨터의 커널이다. 이 사실이 뒤에서 <code>accept()</code>의 정체를 밝히는 열쇠가 된다.</p>
+
+<h4>클라이언트 포트는 누가 정했는가</h4>
+<p>TCP 연결은 양 끝의 (IP 주소, 포트) 쌍으로 정의된다. RFC 9293은 "A connection is defined by a pair of sockets."라고 적는다. 여기서 소켓은 자바 클래스가 아니라 (IP, 포트) 쌍을 가리키는 TCP 용어다. 서버의 쌍은 (127.0.0.1, 7777)로 정해져 있지만 클라이언트는 포트를 지정하지 않았다. 지정하지 않으면 커널이 임시 포트(ephemeral port) 범위에서 비어 있는 번호 하나를 골라 붙인다. 이 실험 컴퓨터(macOS)에서 그 범위는 <code>sysctl</code>로 확인할 수 있다.</p>
+<pre data-label="macOS에서 임시 포트 범위 확인"><code class="language-bash">$ sysctl net.inet.ip.portrange.first net.inet.ip.portrange.last
+net.inet.ip.portrange.first: 49152
+net.inet.ip.portrange.last: 65535</code></pre>
+<p>58743은 이 범위 안의 값이다. 범위가 유한하므로 같은 목적지로 연결을 계속 열어 두면 언젠가 포트가 바닥난다. 실제로 한 프로세스에서 같은 서버로 연결을 닫지 않고 계속 만드는 실험을 했더니, 16,293개째에서 <code>java.net.BindException: Can't assign requested address</code>가 났다. 49152부터 65535까지는 16,384개이고, 다른 프로그램이 이미 쓰고 있던 포트를 빼면 대략 그 정도가 남는다. 커넥션 풀 없이 짧은 연결을 대량으로 맺는 클라이언트가 이 오류를 만나는 이유가 여기에 있다.</p>
+<p>이제 <code>Socket</code>의 출력을 읽을 수 있다. <code>Socket.toString()</code>은 <code>addr</code>에 상대 주소, <code>port</code>에 상대 포트, <code>localport</code>에 내 포트를 찍는다. 같은 연결을 양쪽에서 보면 역할이 뒤집힌다.</p>
+<div class="table-wrap"><table><thead><tr><th>관점</th><th>내 주소</th><th>상대 주소</th><th>toString 출력</th></tr></thead><tbody>
+<tr><td>클라이언트의 Socket</td><td>127.0.0.1:58743</td><td>127.0.0.1:7777</td><td><code>addr=localhost/127.0.0.1,port=7777,localport=58743</code></td></tr>
+<tr><td>서버의 Socket(accept 결과)</td><td>127.0.0.1:7777</td><td>127.0.0.1:58743</td><td><code>addr=/127.0.0.1,port=58743,localport=7777</code></td></tr>
+<tr><td>서버의 ServerSocket</td><td>0.0.0.0:7777(모든 주소)</td><td>없음</td><td><code>getLocalSocketAddress()</code>가 <code>0.0.0.0/0.0.0.0:7777</code></td></tr>
+</tbody></table></div>
+<p>마지막 줄에 주목하자. <code>new ServerSocket(7777)</code>처럼 주소 없이 포트만 주면 서버 소켓은 와일드카드 주소에 묶인다. 이 컴퓨터의 모든 네트워크 인터페이스로 들어오는 7777 포트 연결을 받겠다는 뜻이다. 개발용 서버를 외부에 열고 싶지 않다면 <code>new ServerSocket(port, backlog, InetAddress.getLoopbackAddress())</code>처럼 루프백 주소에만 묶을 수 있다. 그러면 같은 컴퓨터 안의 프로그램만 접속할 수 있다.</p>
+
+<h3>네트워크 프로그램1 — 분석(2): ServerSocket, backlog, 그리고 accept의 정체</h3>
+<h4>new ServerSocket(port)가 하는 일</h4>
+<p>서버 쪽 한 줄 <code>new ServerSocket(7777)</code>도 운영체제 수준에서는 세 단계다. 소켓을 만들고(<code>socket()</code>), 그 소켓을 주소와 포트에 묶고(<code>bind()</code>), 연결 요청을 받겠다고 선언한다(<code>listen()</code>). JDK 소스에서 <code>ServerSocket.bind</code>를 보면 마지막에 <code>impl.listen(backlog)</code>를 호출한다. <code>listen</code>을 마친 소켓을 리스닝 소켓(listening socket)이라 부르고, TCP 상태로는 LISTEN이다. RFC 9293은 LISTEN을 "임의의 원격 TCP 상대와 포트로부터 연결 요청을 기다리는 상태"로 정의한다. 리스닝 소켓은 데이터를 주고받는 데 쓰이지 않는다. 오직 연결 요청을 받는 창구다.</p>
+<p>backlog는 <code>listen</code>에 넘기는 숫자다. <code>ServerSocket(int port)</code> 생성자의 Javadoc은 들어오는 연결 요청을 담는 큐의 최대 길이를 50으로 둔다고 적고, 실제로 소스에도 backlog가 1보다 작으면 50을 쓰는 코드가 있다. 다만 backlog를 직접 받는 <code>ServerSocket(int port, int backlog)</code> 생성자의 Javadoc은 "정확한 의미는 구현에 따라 다르며, 구현이 최대 길이를 강제하거나 이 값을 아예 무시할 수도 있다"고 적는다. 그 구현이 바로 운영체제다.</p>
+<p>리눅스의 <code>listen(2)</code> 매뉴얼은 이 값을 더 구체적으로 설명한다. 리눅스 2.2부터 backlog는 핸드셰이크가 끝나 <code>accept</code>를 기다리는 "완성된" 연결의 큐 길이를 뜻하고, 아직 핸드셰이크 중인 연결의 한도는 따로 <code>/proc/sys/net/ipv4/tcp_max_syn_backlog</code>로 정한다. backlog가 <code>/proc/sys/net/core/somaxconn</code>보다 크면 조용히 그 값으로 잘린다. somaxconn의 기본값은 리눅스 5.4부터 4096이고 그 전에는 128이었다. 큐가 가득 찬 상태에서 연결 요청이 오면 클라이언트가 ECONNREFUSED를 받을 수도 있고, 프로토콜이 재전송을 지원하면 요청이 무시되어 나중의 재시도가 성공할 수도 있다고 매뉴얼은 적는다. 이 실험 컴퓨터의 macOS에서는 <code>sysctl kern.ipc.somaxconn</code>이 128이었다.</p>
+
+<h4>accept 전에 연결은 이미 완성되어 있다</h4>
+<p>앞에서 핸드셰이크는 커널끼리 진행한다고 했다. 그렇다면 서버 프로그램이 <code>accept()</code>를 아직 호출하지 않았어도 연결이 완성될 수 있어야 한다. 직접 확인해 보자. 서버는 리스닝 소켓을 만든 뒤 3초 동안 <code>accept()</code>를 호출하지 않는다. 그동안 클라이언트 스레드가 연결하고 메시지를 보낸다.</p>
+<pre><code class="language-java">package net;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+import static net.Log.log;
+
+public class AcceptLater {
+    public static void main(String[] args) throws Exception {
+        ServerSocket serverSocket = new ServerSocket(7778);
+        log("listen 시작, accept는 3초 뒤에 호출");
+
+        Thread client = new Thread(() -> {
+            try {
+                long start = System.nanoTime();
+                Socket socket = new Socket("localhost", 7778);
+                log("connect 반환까지 " + (System.nanoTime() - start) / 1_000_000 + "ms");
+                DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                out.writeUTF("accept 전에 보낸 메시지");
+                log("writeUTF 반환");
+                DataInputStream in = new DataInputStream(socket.getInputStream());
+                log("응답 대기 시작");
+                String r = in.readUTF();
+                log("응답: " + r);
+                socket.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }, "client");
+        client.start();
+
+        Thread.sleep(1000);
+        log("client 스레드 상태: " + client.getState());
+        Thread.sleep(2000);
+
+        Socket socket = serverSocket.accept();
+        log("accept 반환: " + socket);
+        DataInputStream in = new DataInputStream(socket.getInputStream());
+        log("받음: " + in.readUTF());
+        new DataOutputStream(socket.getOutputStream()).writeUTF("ok");
+        client.join();
+        socket.close();
+        serverSocket.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (ms 값과 포트는 실행마다 다르다)"><code class="language-text">[main] listen 시작, accept는 3초 뒤에 호출
+[client] connect 반환까지 8ms
+[client] writeUTF 반환
+[client] 응답 대기 시작
+[main] client 스레드 상태: RUNNABLE
+[main] accept 반환: Socket[addr=/127.0.0.1,port=58774,localport=7778]
+[main] 받음: accept 전에 보낸 메시지
+[client] 응답: ok</code></pre>
+<p>결과를 한 줄씩 읽자. 클라이언트의 <code>connect</code>는 서버가 <code>accept()</code>를 부르기 한참 전에 몇 밀리초 만에 반환됐다. 핸드셰이크가 서버 커널에서 끝났다는 뜻이다. <code>writeUTF</code>도 곧바로 반환됐다. 쓰기는 상대 프로그램이 읽을 때까지 기다리지 않는다. 내 커널의 송신 버퍼(send buffer)에 자리가 있으면 데이터를 거기에 복사하고 반환되며(버퍼가 가득 차 있으면 자리가 날 때까지 기다린다), 커널이 그것을 상대 커널의 수신 버퍼(receive buffer)로 보낸다. 3초 뒤 서버가 <code>accept()</code>를 호출하자 곧바로 연결이 나왔고, 이어서 <code>readUTF()</code>는 3초 전에 도착해 서버 커널의 수신 버퍼에 쌓여 있던 메시지를 읽었다.</p>
+<p>따라서 <code>accept()</code>는 연결을 "만드는" 메서드가 아니다. 커널이 이미 만들어 큐에 넣어 둔 연결을 하나 "꺼내서" 프로그램이 쓸 수 있는 소켓으로 건네주는 메서드다. 큐가 비어 있으면 연결이 들어올 때까지 기다린다. Javadoc의 표현으로는 "연결이 만들어질 때까지 블록된다".</p>
+<pre class="diagram">  클라이언트 프로세스        클라이언트 커널          서버 커널                         서버 프로세스
+  ───────────────────        ───────────────          ─────────                         ─────────────
+  new Socket(...)
+    connect() 호출 ────────▶ SYN ─────────────────▶ 리스닝 소켓 *:7777 (LISTEN)
+                             ◀──────────────────── SYN+ACK
+                             ACK ─────────────────▶ 연결 완성
+                                                     │
+    connect() 반환 ◀───────── ESTABLISHED             ▼
+                                                   accept 큐 [ 127.0.0.1:58774 ↔ 127.0.0.1:7778 ]
+  writeUTF() ─▶ 송신 버퍼 ─────── 데이터 ────────▶ 이 연결의 수신 버퍼에 쌓임
+                                                     │
+                                                     │          accept() 호출 (3초 뒤)
+                                                     └────────▶ 큐에서 꺼내 새 fd로 만듦 ──▶ Socket 객체
+                                                                readUTF() ──▶ 버퍼에 있던 데이터를 읽음</pre>
+<x-visual id="java-adv2-07-accept-queue" title="리스닝 소켓, accept 큐, accept가 꺼내 주는 연결 소켓" kind="구조 다이어그램" ratio="16:9">
+<x-hint>핸드셰이크는 커널이 끝내고 완성된 연결은 accept 큐에서 기다리며, accept()는 그중 하나를 꺼내 새 소켓으로 만든다는 것을 보여 준다.</x-hint>
+<x-prompt>가로로 긴 기술 다이어그램. 왼쪽에 "클라이언트" 상자 두 개(위 "클라이언트 A :58774", 아래 "클라이언트 B :58775"). 가운데에 큰 점선 영역 "서버 커널"이 있고, 그 안 위쪽에 둥근 사각형 "리스닝 소켓 *:7777 (LISTEN)", 그 아래에 칸 세 개로 나뉜 가로 막대 "accept 큐"가 있다. 큐의 칸 두 개에는 "연결 A", "연결 B"가 들어 있고 한 칸은 비어 있다. 각 클라이언트에서 리스닝 소켓으로 화살표가 가고 화살표 위에 "SYN / SYN+ACK / ACK"라고 적는다. 리스닝 소켓에서 큐로 아래 방향 화살표. 오른쪽에 "서버 프로세스" 상자가 있고 그 안에 "accept()"라는 손 모양 아이콘이 큐의 맨 앞 칸 "연결 A"를 꺼내는 화살표, 꺼낸 결과로 "Socket (새 fd)" 상자가 생긴다. 하단에 작은 글씨 "핸드셰이크는 accept 전에 커널이 끝낸다". 단색 계열의 차분한 파란색과 회색, 흰 배경.</x-prompt>
+<x-caption>연결 수립은 커널의 일이고, accept()는 완성된 연결을 큐에서 꺼낼 뿐이다.</x-caption>
+</x-visual>
+
+<h4>netstat과 lsof로 본 accept 전의 연결</h4>
+<p>운영체제 도구로도 같은 사실을 볼 수 있다. 다음 프로그램은 backlog를 받아 리스닝 소켓을 만들고, <code>accept()</code>는 끝까지 호출하지 않은 채 클라이언트 연결을 여러 개 시도한다.</p>
+<pre><code class="language-java">package net;
+
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.ArrayList;
+import java.util.List;
+
+public class NoAccept {
+    public static void main(String[] args) throws Exception {
+        int backlog = Integer.parseInt(args[0]);
+        int clients = Integer.parseInt(args[1]);
+        ServerSocket serverSocket = new ServerSocket(7780, backlog);  // accept를 호출하지 않는다
+        List<Socket> sockets = new ArrayList<>();
+        for (int i = 1; i <= clients; i++) {
+            Socket s = new Socket();
+            long start = System.nanoTime();
+            try {
+                s.connect(new InetSocketAddress("localhost", 7780), 2000);
+                System.out.println(i + "번 connect 성공 (" + (System.nanoTime() - start) / 1_000_000
+                        + "ms), local port " + s.getLocalPort());
+                sockets.add(s);
+            } catch (Exception e) {
+                System.out.println(i + "번 connect 실패 (" + (System.nanoTime() - start) / 1_000_000
+                        + "ms): " + e);
+            }
+        }
+        if (args.length > 2) Thread.sleep(Long.parseLong(args[2]));
+        for (Socket s : sockets) s.close();
+        serverSocket.close();
+    }
+}</code></pre>
+<p>backlog 2, 클라이언트 2개로 실행해 연결 두 개가 성공한 상태에서 4초를 기다리게 하고, 그동안 다른 터미널에서 <code>netstat</code>과 <code>lsof</code>를 실행했다.</p>
+<pre data-label="macOS에서 관찰 (포트 번호는 실행마다 다르다)"><code class="language-bash">$ netstat -an -p tcp | grep 7780
+tcp4       0      0  127.0.0.1.7780         127.0.0.1.58798        ESTABLISHED
+tcp4       0      0  127.0.0.1.58798        127.0.0.1.7780         ESTABLISHED
+tcp4       0      0  127.0.0.1.7780         127.0.0.1.58797        ESTABLISHED
+tcp4       0      0  127.0.0.1.58797        127.0.0.1.7780         ESTABLISHED
+tcp46      0      0  *.7780                 *.*                    LISTEN
+
+$ lsof -nP -iTCP:7780
+COMMAND  PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+java    4124 read    5u  IPv6  0x7be62ef73fdb327      0t0  TCP *:7780 (LISTEN)
+java    4124 read    8u  IPv6 0xc06797b11f2060b9      0t0  TCP 127.0.0.1:58797->127.0.0.1:7780 (ESTABLISHED)
+java    4124 read    9u  IPv6 0x40775fa8ce16685f      0t0  TCP 127.0.0.1:58798->127.0.0.1:7780 (ESTABLISHED)</code></pre>
+<p>두 출력을 겹쳐 보면 흥미로운 차이가 있다. <code>netstat</code>은 커널이 가진 TCP 연결 표를 보여 준다. 여기에는 연결 하나마다 두 줄이 있다. 같은 컴퓨터 안의 연결이므로 클라이언트 쪽 끝(<code>58797 → 7780</code>)과 서버 쪽 끝(<code>7780 → 58797</code>)이 모두 이 커널에 있기 때문이다. 서버 쪽 끝도 ESTABLISHED다. 반면 <code>lsof</code>는 프로세스가 가진 파일 디스크립터(file descriptor)를 보여 준다. 5번은 리스닝 소켓, 8번과 9번은 클라이언트 소켓이다. 서버 쪽 끝 두 개는 이 목록에 없다. 커널 안에서 연결은 완성됐지만 아직 <code>accept()</code>가 꺼내 가지 않았으므로 프로세스의 파일 디스크립터 표에 들어오지 않은 것이다. <code>accept()</code>가 하는 일이 바로 큐에 있는 연결에 새 파일 디스크립터 번호를 붙여 프로세스에 넘겨주는 것이다.</p>
+<p>또 하나, 서버 쪽 연결 두 개가 모두 로컬 포트 7780을 쓴다. 포트 하나에 연결이 여러 개 붙을 수 있는 것은 연결이 (내 IP, 내 포트, 상대 IP, 상대 포트) 네 값의 조합으로 구별되기 때문이다. 상대 포트가 58797과 58798로 다르므로 서로 다른 연결이다. 서버가 같은 포트로 수천 개의 연결을 동시에 받을 수 있는 이유가 이것이다. 리스닝 소켓의 <code>tcp46 *.7780</code>은 와일드카드 주소에서 IPv4와 IPv6 연결을 모두 받는 소켓이라는 macOS의 표기다.</p>
+<p>backlog를 넘기면 어떻게 될까. 같은 프로그램을 backlog 3, 클라이언트 8개로 실행한 결과다.</p>
+<pre data-label="macOS에서 관찰 (backlog 3, 클라이언트 8개)"><code class="language-text">1번 connect 성공 (12ms), local port 58823
+2번 connect 성공 (0ms), local port 58824
+3번 connect 성공 (0ms), local port 58825
+4번 connect 성공 (0ms), local port 58826
+5번 connect 실패 (0ms): java.net.SocketException: Connection reset by peer (connect failed)
+6번 connect 실패 (0ms): java.net.SocketException: Connection reset by peer (connect failed)
+7번 connect 성공 (0ms), local port 58829
+8번 connect 실패 (0ms): java.net.SocketException: Connection reset by peer (connect failed)</code></pre>
+<p>backlog로 준 3보다 많은 4개가 성공했고, 그 뒤로는 실패와 성공이 섞였다. 커널이 backlog 값을 그대로 큐 길이로 쓰지 않으며 큐가 넘칠 때의 처리도 운영체제마다 다르다는 것을 보여 준다. 이 macOS에서는 넘친 연결이 RST로 거절되어 <code>Connection reset by peer</code>가 났지만, 리눅스 매뉴얼은 거부 대신 요청을 무시해 클라이언트의 재전송에 맡길 수도 있다고 적는다. 그 경우 클라이언트는 즉시 실패하지 않고 연결이 늦게 맺어지거나 연결 타임아웃까지 기다리게 된다. 정확한 숫자를 외울 필요는 없다. 기억할 것은 두 가지다. 서버가 <code>accept()</code>를 늦게 부르면 연결은 커널의 큐에 쌓이고, 그 큐는 유한하다.</p>
+<aside class="note">backlog는 동시에 처리할 수 있는 연결 수의 한도가 아니다. 이미 accept된 연결은 큐에서 빠져나갔으므로 backlog와 무관하다. backlog는 "커널이 완성했지만 프로그램이 아직 꺼내 가지 않은" 연결이 얼마나 쌓일 수 있는지를 정할 뿐이다. 그래서 accept를 빨리 부르는 서버라면 backlog가 작아도 문제가 없고, accept가 밀리는 서버라면 backlog를 키워도 지연만 늘어난다.</aside>
+
+<h3>네트워크 프로그램1 — 분석(3): 소켓 위의 스트림과 블로킹</h3>
+<h4>소켓의 스트림은 커널 버퍼로 가는 통로다</h4>
+<p><code>socket.getInputStream()</code>과 <code>socket.getOutputStream()</code>이 돌려주는 것은 I/O 회차에서 본 바로 그 바이트 스트림이다. 파일 스트림의 <code>write</code>가 파일 디스크립터에 대한 <code>write</code> 시스템 콜로 이어지듯, 소켓 스트림의 <code>write</code>는 소켓 파일 디스크립터에 대한 쓰기 시스템 콜로 이어지고, 데이터는 커널의 송신 버퍼로 복사된다. 읽기도 마찬가지로 커널의 수신 버퍼에서 바이트를 가져온다. 이 실험 컴퓨터에서 <code>getSendBufferSize()</code>와 <code>getReceiveBufferSize()</code>를 찍어 보니 각각 146988, 408300이었다. 이 값은 운영체제와 설정에 따라 다르므로 고정된 숫자로 기억할 대상이 아니다.</p>
+<p>그 위에 <code>DataInputStream</code>/<code>DataOutputStream</code>을 씌운 것은 데코레이터 구조 그대로다. 소켓 스트림은 바이트만 알고, Data 스트림이 문자열을 바이트로 바꾸는 형식을 더한다. 시스템 콜 비용을 다시 떠올려 보자. 쓰기 한 번이 시스템 콜 한 번이라면, 작은 쓰기를 여러 번 하는 코드는 비싸다. JDK 21의 <code>DataOutputStream.writeUTF</code> 소스를 보면 길이 2바이트와 문자열 바이트를 하나의 배열에 모두 만든 뒤 <code>out.write(bytearr, 0, utflen + 2)</code>로 한 번에 내보낸다. <code>writeInt</code>도 4바이트를 내부 배열에 채워 한 번에 쓴다. 그래서 이 예제처럼 소켓 스트림에 직접 Data 스트림을 씌워도 메시지 하나가 쓰기 한 번이 된다. 반면 여러 필드를 연달아 쓰는 프로토콜이라면 필드마다 쓰기가 일어나므로 <code>BufferedOutputStream</code>을 사이에 두고 메시지 끝에서 <code>flush()</code>하는 편이 낫다. 이때 <code>flush()</code>를 잊으면 데이터가 자바 버퍼에 머물러 상대가 영영 받지 못한다는 것도 함께 기억해 두자.</p>
+
+<h4>TCP에는 메시지 경계가 없다</h4>
+<p>TCP가 보장하는 것은 바이트의 순서와 완전성이지, "보낸 단위 그대로 받는다"가 아니다. 한 번에 쓴 7바이트가 받는 쪽에서 3바이트와 4바이트로 나뉘어 읽힐 수도 있고, 두 번에 쓴 메시지가 한 번의 <code>read</code>에 붙어서 올 수도 있다. 그러면 <code>readUTF()</code>는 어떻게 문자열 하나를 정확히 잘라 낼까. <code>writeUTF</code>가 쓰는 형식을 바이트로 찍어 보면 답이 보인다.</p>
+<pre><code class="language-java">ByteArrayOutputStream bos = new ByteArrayOutputStream();
+DataOutputStream out = new DataOutputStream(bos);
+out.writeUTF("hello");
+out.writeUTF("안녕");
+for (byte b : bos.toByteArray()) System.out.printf("%02X ", b);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">00 05 68 65 6C 6C 6F 00 06 EC 95 88 EB 85 95 </code></pre>
+<p>각 문자열 앞에 2바이트 길이가 붙는다. <code>00 05</code>는 뒤따르는 5바이트가 "hello"라는 뜻이고, <code>00 06</code>은 "안녕"을 나타내는 6바이트(한 글자당 3바이트)가 따른다는 뜻이다. 이런 방식을 길이 접두(length prefix) 프레이밍이라고 한다. 받는 쪽의 <code>readUTF()</code>는 먼저 2바이트를 읽어 길이를 알아낸 다음, 정확히 그만큼을 읽는다. JDK 21 소스에서 그 "정확히 그만큼"을 맡는 <code>readFully</code>를 보면 이렇다.</p>
+<pre><code class="language-java">// java.io.DataInputStream (JDK 21)
+public final void readFully(byte[] b, int off, int len) throws IOException {
+    Objects.checkFromIndexSize(off, len, b.length);
+    int n = 0;
+    while (n < len) {
+        int count = in.read(b, off + n, len - n);
+        if (count < 0)
+            throw new EOFException();
+        n += count;
+    }
+}</code></pre>
+<p><code>read</code>가 요청한 것보다 적게 돌려줄 수 있으므로 원하는 길이가 찰 때까지 반복한다. 중간에 <code>read</code>가 -1을 돌려주면, 즉 상대가 연결을 닫아 더 올 바이트가 없으면 <code>EOFException</code>을 던진다. 이 루프가 있기 때문에 네트워크가 바이트를 어떻게 쪼개 보내든 <code>readUTF()</code>는 문자열 하나를 온전히 돌려준다. 바꿔 말하면, <code>InputStream.read(byte[])</code>를 한 번 호출하고 "메시지 하나를 받았다"고 가정하는 코드는 틀린 코드다. 테스트할 때는 같은 컴퓨터 안이라 우연히 맞아떨어지다가 실제 네트워크에서 깨진다.</p>
+
+<h4>readUTF에서 멈춘 스레드는 무엇을 하고 있는가</h4>
+<p>앞의 <code>AcceptLater</code> 출력에서 응답을 기다리는 client 스레드의 상태가 <code>RUNNABLE</code>로 찍혔다. 멈춰 있는데 실행 가능 상태라니 이상하다. 더 확인하기 위해 <code>accept()</code>에서 멈춘 스레드와 <code>Object.wait()</code>에서 멈춘 스레드의 상태를 나란히 찍어 봤다.</p>
+<pre><code class="language-java">package net;
+
+import java.net.ServerSocket;
+
+import static net.Log.log;
+
+public class BlockedState {
+    public static void main(String[] args) throws Exception {
+        ServerSocket serverSocket = new ServerSocket(7779);
+        Thread acceptor = new Thread(() -> {
+            try { serverSocket.accept(); } catch (Exception e) { log(e); }
+        }, "acceptor");
+        acceptor.start();
+        Thread.sleep(500);
+        log("accept 중인 스레드 상태: " + acceptor.getState());
+
+        Object lock = new Object();
+        Thread waiter = new Thread(() -> {
+            synchronized (lock) {
+                try { lock.wait(); } catch (InterruptedException e) { }
+            }
+        }, "waiter");
+        waiter.setDaemon(true);
+        waiter.start();
+        Thread.sleep(500);
+        log("wait 중인 스레드 상태: " + waiter.getState());
+
+        acceptor.interrupt();
+        Thread.sleep(500);
+        log("interrupt 후 accept 스레드 상태: " + acceptor.getState());
+        serverSocket.close();
+        acceptor.join();
+        log("close 후 accept 스레드 상태: " + acceptor.getState());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[main] accept 중인 스레드 상태: RUNNABLE
+[main] wait 중인 스레드 상태: WAITING
+[main] interrupt 후 accept 스레드 상태: RUNNABLE
+[acceptor] java.net.SocketException: Socket closed
+[main] close 후 accept 스레드 상태: TERMINATED</code></pre>
+<p>세 가지를 알 수 있다. 첫째, 소켓 I/O에서 멈춘 스레드는 <code>WAITING</code>이나 <code>BLOCKED</code>가 아니라 <code>RUNNABLE</code>이다. 자바의 스레드 상태는 JVM이 관리하는 상태다. <code>Object.wait()</code>이나 <code>synchronized</code> 진입 대기는 JVM이 직접 스레드를 세우는 것이라 JVM이 그 사실을 안다. 반면 소켓 읽기는 네이티브 코드에서 운영체제 시스템 콜을 부른 상태이고, JVM 입장에서 그 스레드는 "네이티브 코드를 실행 중"이다. <code>Thread.State.RUNNABLE</code>의 Javadoc도 이 상태의 스레드는 JVM 안에서 실행 중이지만 프로세서 같은 운영체제 자원을 기다리고 있을 수 있다고 적는다. 스레드 덤프에서 RUNNABLE 스레드가 많다고 해서 CPU를 쓰고 있다고 단정하면 안 되는 이유다.</p>
+<p>둘째, <code>accept()</code>에서 멈춘 플랫폼 스레드는 <code>interrupt()</code>로 깨어나지 않는다. <code>ServerSocket.accept()</code>의 Javadoc은 인터럽트가 통하는 경우를 두 가지로 한정한다. 소켓이 <code>ServerSocketChannel</code>에 연결된 경우, 그리고 시스템 기본 구현을 쓰면서 가상 스레드(virtual thread)가 accept 중인 경우다. 이 예제는 둘 다 아니다. 셋째, 다른 스레드가 <code>close()</code>를 호출하면 멈춰 있던 스레드가 <code>SocketException: Socket closed</code>로 빠져나온다. <code>Socket.close()</code>의 Javadoc도 "이 소켓의 I/O 연산에서 블록된 스레드는 <code>SocketException</code>을 던진다"고 적는다. 블로킹 I/O에 갇힌 스레드를 꺼내는 표준적인 방법은 인터럽트가 아니라 소켓을 닫는 것이고, 이것이 다음 회차에서 서버를 정상 종료시키는 방법의 바탕이 된다.</p>
+<p>이 스레드가 정확히 어디서 멈췄는지는 <code>jstack</code>으로 볼 수 있다. 뒤에서 만들 <code>EchoServer2</code>가 클라이언트의 메시지를 기다리는 순간의 main 스레드 덤프다.</p>
+<pre data-label="jstack 출력 (일부)"><code class="language-text">"main" #1 [6403] prio=5 os_prio=31 cpu=40.38ms elapsed=2.90s tid=0x00000001034e7280 nid=6403 runnable  [0x000000016d25a000]
+   java.lang.Thread.State: RUNNABLE
+	at sun.nio.ch.SocketDispatcher.read0(java.base@21.0.13/Native Method)
+	at sun.nio.ch.SocketDispatcher.read(java.base@21.0.13/SocketDispatcher.java:48)
+	at sun.nio.ch.NioSocketImpl.tryRead(java.base@21.0.13/NioSocketImpl.java:256)
+	at sun.nio.ch.NioSocketImpl.implRead(java.base@21.0.13/NioSocketImpl.java:307)
+	at sun.nio.ch.NioSocketImpl.read(java.base@21.0.13/NioSocketImpl.java:346)
+	at sun.nio.ch.NioSocketImpl$1.read(java.base@21.0.13/NioSocketImpl.java:796)
+	at java.net.Socket$SocketInputStream.read(java.base@21.0.13/Socket.java:1099)
+	at java.io.DataInputStream.readFully(java.base@21.0.13/DataInputStream.java:208)
+	at java.io.DataInputStream.readUnsignedShort(java.base@21.0.13/DataInputStream.java:341)
+	at java.io.DataInputStream.readUTF(java.base@21.0.13/DataInputStream.java:575)
+	at java.io.DataInputStream.readUTF(java.base@21.0.13/DataInputStream.java:550)
+	at net.EchoServer2.main(EchoServer2.java:24)</code></pre>
+<p>아래에서 위로 읽으면 데코레이터와 계층 구조가 그대로 드러난다. 우리 코드의 <code>readUTF</code>가 길이 2바이트를 읽으려고 <code>readUnsignedShort</code>를 부르고, 그것이 <code>readFully</code>의 루프로, 다시 소켓의 입력 스트림(<code>Socket$SocketInputStream</code>)으로 내려간다. 그 아래는 실제 소켓 구현인 <code>NioSocketImpl</code>이다. JDK 소스의 <code>SocketImpl.createPlatformSocketImpl</code>은 이 클래스를 생성해 돌려주므로, JDK 21에서 <code>java.net.Socket</code>의 기본 구현은 NIO 기반의 <code>NioSocketImpl</code>이다. 맨 위의 <code>read0</code>는 네이티브 메서드이고, 그 안에서 운영체제의 읽기 시스템 콜이 수신 버퍼에 데이터가 올 때까지 스레드를 재우고 있다. 첫 줄의 <code>nid</code>는 이 자바 스레드에 대응하는 운영체제 스레드의 번호다. HotSpot에서 플랫폼 스레드는 운영체제 스레드 하나로 만들어지고, 그 운영체제 스레드가 지금 커널 안에서 잠들어 있는 것이다.</p>
+<figure class="flow-figure"><figcaption>readUTF() 한 번이 내려가는 계층</figcaption><ol class="flow">
+<li><strong>DataInputStream.readUTF</strong><span>길이 2바이트를 읽고, 그 길이만큼 본문을 읽어 문자열로 디코딩한다</span></li>
+<li><strong>DataInputStream.readFully</strong><span>원하는 바이트 수가 찰 때까지 하위 스트림의 read를 반복한다. -1이면 EOFException</span></li>
+<li><strong>Socket$SocketInputStream.read</strong><span>소켓의 바이트 스트림. 소켓 구현에 읽기를 위임한다</span></li>
+<li><strong>NioSocketImpl.read</strong><span>JDK 21의 기본 소켓 구현. 타임아웃과 닫힘 상태를 처리하고 네이티브 읽기를 호출한다</span></li>
+<li><strong>read 시스템 콜(커널)</strong><span>수신 버퍼가 비어 있으면 스레드를 재운다. 데이터나 FIN이 도착하면 깨운다</span></li>
+</ol></figure>
+
+<h3>한 층 더(1): NioSocketImpl 안의 블로킹, 그리고 close가 잠든 스레드를 깨우는 길</h3>
+<p>앞 절에서 두 가지를 관찰만 하고 넘어갔다. 플랫폼 스레드가 소켓에서 멈추면 <code>interrupt()</code>로는 깨어나지 않는데, 다른 스레드가 <code>close()</code>를 부르면 곧바로 <code>SocketException</code>으로 빠져나온다. 둘 다 스레드를 깨우려는 시도인데 왜 하나만 통할까. 스레드 덤프에 보였던 <code>NioSocketImpl</code>과 그 아래 네이티브 코드를 열면 이유가 정확히 드러난다. 이 절에서 인용하는 자바 소스는 Temurin 21.0.13에 들어 있는 <code>src.zip</code>, C 소스는 github.com/openjdk/jdk21u의 것이고, 모두 OpenJDK 21 기준이다.</p>
+
+<h4>플랫폼 스레드는 블로킹 모드의 파일 디스크립터에서 read(2)를 그대로 부른다</h4>
+<p><code>NioSocketImpl.implRead</code>의 뼈대는 다음과 같다. 예외 처리 몇 줄을 줄였다.</p>
+<pre><code class="language-java">// sun.nio.ch.NioSocketImpl (OpenJDK 21, 일부 생략)
+private int implRead(byte[] b, int off, int len) throws IOException {
+    int n = 0;
+    FileDescriptor fd = beginRead();          // readerThread = NativeThread.current()
+    try {
+        // ...
+        int timeout = this.timeout;
+        configureNonBlockingIfNeeded(fd, timeout > 0);
+        if (timeout > 0) {
+            n = timedRead(fd, b, off, len, MILLISECONDS.toNanos(timeout));
+        } else {
+            n = tryRead(fd, b, off, len);      // nd.read(...) → SocketDispatcher.read0
+            while (IOStatus.okayToRetry(n) && isOpen()) {
+                park(fd, Net.POLLIN);
+                n = tryRead(fd, b, off, len);
+            }
+        }
+        return n;
+    } finally {
+        endRead(n > 0);                        // readerThread = 0, 닫히는 중이었다면 예외
+    }
+}</code></pre>
+<p><code>configureNonBlockingIfNeeded</code>는 이름 그대로 필요할 때만 소켓을 논블로킹으로 바꾼다. 조건은 "타임아웃이 설정되어 있거나 현재 스레드가 가상 스레드일 때"다. 이번 회차의 서버처럼 타임아웃 없는 플랫폼 스레드라면 파일 디스크립터는 블로킹 모드 그대로이고, <code>tryRead</code>가 부르는 네이티브 메서드 <code>SocketDispatcher.read0</code>는 C 코드에서 <code>read(fd, buf, len)</code> 한 줄을 실행한다. 수신 버퍼가 비어 있으면 커널이 그 자리에서 스레드를 재운다. 앞의 jstack에서 맨 위 프레임이 <code>read0</code>였던 것이 이 상태다. 아래쪽 <code>while</code> 루프는 <code>read0</code>가 "지금은 읽을 것이 없음"(EAGAIN을 바꾼 <code>IOS_UNAVAILABLE</code>)이나 "시스템 콜이 중단됨"(EINTR을 바꾼 <code>IOS_INTERRUPTED</code>)을 돌려줄 때만 돈다. <code>IOStatus.okayToRetry</code>가 정확히 이 두 값에 true를 돌려준다. 이 두 번째 값이 뒤에서 <code>close()</code>의 비밀을 푸는 열쇠다.</p>
+<p><code>accept()</code>도 같은 모양이다. <code>Net.accept</code>의 C 구현은 <code>accept(fd, &sa.sa, &sa_len)</code>를 부르는데, <code>errno</code>가 ECONNABORTED이면 아무 일도 없었던 것처럼 다시 <code>accept</code>를 부르는 루프로 감싸여 있다. ECONNABORTED는 "연결이 중단되었다"는 뜻의 오류이고, JDK는 이것을 예외로 올리지 않고 그 연결을 건너뛰어 다음 연결을 기다린다. 자바 쪽 <code>NioSocketImpl.accept</code>는 받아 낸 새 파일 디스크립터의 로컬 주소를 읽은 뒤 곧바로 <code>IOUtil.configureBlocking(newfd, true)</code>를 적용한다. 그래서 <code>accept()</code>가 돌려준 소켓은 리스닝 소켓의 모드와 상관없이 블로킹 모드로 출발한다.</p>
+
+<h4>블로킹 모드가 바뀌는 두 경우</h4>
+<p>타임아웃이 있거나 가상 스레드라면 <code>IOUtil.configureBlocking(fd, false)</code>가 불린다. 그 C 구현은 <code>fcntl(fd, F_GETFL)</code>로 현재 플래그를 읽어 <code>O_NONBLOCK</code>을 더한 뒤 <code>fcntl(fd, F_SETFL, ...)</code>로 다시 쓴다. 이제 <code>read</code>는 데이터가 없으면 잠들지 않고 곧바로 EAGAIN으로 돌아오고, JDK는 그때 <code>park</code>를 불러 "읽을 수 있게 될 때까지" 따로 기다린다. 플랫폼 스레드의 <code>park</code>는 <code>Net.poll</code>, 즉 <code>poll(2)</code> 시스템 콜에 남은 시간을 밀리초로 넘기고, 가상 스레드의 <code>park</code>는 다음 절에서 볼 <code>Poller</code>로 간다. JEP 353도 타임아웃이 있는 connect, accept, read는 소켓을 논블로킹 모드로 바꾸고 폴링하는 방식으로 구현했다고 적는다.</p>
+<p>이 전환은 한 방향이다. <code>nonBlocking</code> 필드는 한 번 true가 되면 다시 false로 돌아가지 않는다. 이 macOS의 <code>lsof</code>는 <code>+fg</code> 옵션을 주면 파일 플래그를 보여 주고, 논블로킹이면 <code>NB</code>가 붙는다. 연결 직후, <code>setSoTimeout(100)</code>을 걸고 타임아웃이 나도록 한 번 읽은 뒤, 타임아웃을 0으로 되돌린 뒤 세 번 같은 소켓을 찍었다.</p>
+<pre data-label="macOS에서 관찰 (lsof -nP +fg, PID와 포트는 실행마다 다르다)"><code class="language-text">== 연결 직후
+java    84083 read    8u  IPv6       R,W 0xe0119bfd21cacfb9      0t0  TCP 127.0.0.1:53701->127.0.0.1:7792 (ESTABLISHED)
+java.net.SocketTimeoutException: Read timed out
+== setSoTimeout(100) 뒤 read 한 번
+java    84083 read    8u  IPv6    R,W,NB 0xe0119bfd21cacfb9      0t0  TCP 127.0.0.1:53701->127.0.0.1:7792 (ESTABLISHED)
+== setSoTimeout(0)으로 되돌린 뒤
+java    84083 read    8u  IPv6    R,W,NB 0xe0119bfd21cacfb9      0t0  TCP 127.0.0.1:53701->127.0.0.1:7792 (ESTABLISHED)</code></pre>
+<p>타임아웃이 걸린 읽기를 한 번 거친 뒤로는 타임아웃을 지워도 <code>NB</code>가 남는다. 이후의 읽기는 <code>read</code>가 EAGAIN을 돌려주면 <code>park</code>로 <code>poll(2)</code>를 부르고 다시 읽는 루프로 돈다. 결과는 같지만 커널 안에서 잠드는 자리가 <code>read</code>에서 <code>poll</code>로 바뀐 것이다. 타임아웃이 무엇을 보장하고 언제 써야 하는지는 다음 회차의 주제이고, 여기서는 "블로킹 소켓"이라는 말이 이 구현에서는 커널 수준의 블로킹 모드와 반드시 일치하지는 않는다는 것만 기억하자.</p>
+
+<h4>interrupt가 커널까지 닿지 않는 이유</h4>
+<p>JDK 21의 <code>Thread.interrupt()</code>는 세 가지 일을 한다. 인터럽트 플래그를 켜고, 네이티브 메서드 <code>interrupt0()</code>로 JVM에 알리고, 그 스레드에 <code>nioBlocker</code>가 등록되어 있으면 그것의 <code>interrupt</code>를 부른다. <code>interrupt0()</code>이 도착하는 HotSpot의 <code>JavaThread::interrupt()</code>(src/hotspot/share/runtime/javaThread.cpp)를 보면, 주석과 함께 세 개의 대기 객체만 깨운다. <code>Thread.sleep</code>용 <code>_SleepEvent</code>, <code>LockSupport.park</code>용 <code>parker()</code>, 모니터와 <code>Object.wait</code>용 <code>_ParkEvent</code>다. JVM이 직접 재운 스레드는 이 셋 중 하나에서 자고 있으므로 깨어난다. 그러나 <code>read(2)</code> 안에서 커널이 재운 스레드는 이 중 어디에서도 자고 있지 않다.</p>
+<p>남은 통로는 <code>nioBlocker</code>다. 이 필드를 채우는 것은 <code>AbstractInterruptibleChannel.begin()</code>이 부르는 <code>blockedOn</code>이고, 채널(<code>SocketChannel</code>, <code>ServerSocketChannel</code>)의 블로킹 연산이 이 경로를 쓴다. <code>Socket</code>이 쓰는 <code>NioSocketImpl</code>에는 <code>blockedOn</code> 호출이 한 군데도 없다. 그래서 플랫폼 스레드가 <code>Socket</code>의 읽기나 <code>accept</code>에서 멈춰 있으면 <code>interrupt()</code>는 플래그만 켜고 끝난다. <code>ServerSocket.accept()</code>의 Javadoc이 "채널에 연결된 소켓"을 인터럽트가 통하는 경우로 따로 적어 둔 것이 이 차이다.</p>
+
+<h4>close가 닿는 이유: dup2와 신호</h4>
+<p><code>NioSocketImpl.close()</code>는 상태를 <code>ST_CLOSING</code>으로 바꾼 뒤 <code>tryClose()</code>를 부른다. <code>tryClose()</code>는 <code>readerThread</code>와 <code>writerThread</code>가 모두 0일 때, 즉 이 소켓에서 진행 중인 I/O가 없을 때만 실제로 파일 디스크립터를 닫는다. 앞의 <code>beginRead()</code>가 읽기를 시작하며 <code>readerThread</code>에 현재 스레드의 식별자(<code>NativeThread.current()</code>, 유닉스에서는 C의 <code>pthread_self()</code> 값)를 적어 두었으므로, 누군가 읽는 중이면 <code>tryClose()</code>는 실패하고 대신 <code>nd.preClose(fd, readerThread, writerThread)</code>가 불린다. 유닉스 구현(<code>UnixDispatcher.implPreClose</code>)은 두 가지를 한다.</p>
+<ol>
+<li><b>dup2로 번호를 바꿔치기한다.</b> JDK는 초기화 때 <code>socketpair(PF_UNIX, SOCK_STREAM, 0, sp)</code>로 유닉스 도메인 소켓 한 쌍을 만들고 한쪽(<code>sp[1]</code>)을 곧바로 닫아, 상대 끝이 이미 닫힌 소켓 <code>preCloseFD</code>를 하나 들고 있다. <code>preClose0</code>는 <code>dup2(preCloseFD, fd)</code>를 실행한다. 이제 그 fd 번호는 원래의 TCP 소켓이 아니라 이 죽은 소켓을 가리킨다. 번호 자체는 열린 채로 남아 있으므로 그동안 다른 파일이나 소켓이 같은 번호를 받을 수 없다.</li>
+<li><b>잠든 스레드에 신호를 보낸다.</b> <code>NativeThread.signal</code>의 C 구현은 <code>pthread_kill(thread, INTERRUPT_SIGNAL)</code>이다. 신호 번호는 소스에 플랫폼별로 정의되어 있어서, macOS를 포함한 BSD 계열은 <code>SIGIO</code>, 리눅스는 <code>SIGRTMAX - 2</code>다. JDK는 이 신호에 아무것도 하지 않는 처리기(<code>nullHandler</code>)를 <code>sa_flags = 0</code>으로 설치해 둔다. <code>SA_RESTART</code>가 없으므로, 신호를 받은 스레드의 <code>read</code>나 <code>accept</code>는 자동으로 재시작되지 않고 -1과 EINTR로 돌아온다.</li>
+</ol>
+<p>EINTR은 앞에서 본 대로 <code>IOS_INTERRUPTED</code>로 바뀌어 자바로 돌아온다. <code>okayToRetry</code>는 true지만 루프 조건의 다른 쪽 <code>isOpen()</code>이 false(상태가 이미 <code>ST_CLOSING</code>)이므로 루프를 빠져나간다. <code>finally</code>의 <code>endRead(false)</code>는 <code>readerThread</code>를 0으로 되돌리고, 상태가 <code>ST_CLOSING</code>이므로 <code>tryFinishClose()</code>로 이번에는 진짜로 파일 디스크립터를 닫는다. 마지막으로 연산이 완료되지 않았고 소켓이 닫히는 중이므로 <code>SocketException("Socket closed")</code>를 던진다. 앞의 <code>BlockedState</code> 실험에서 본 메시지가 바로 이 줄에서 나온 것이다. <code>NioSocketImpl.close()</code>의 주석도 진행 중인 I/O가 있으면 소켓을 미리 닫고(pre-close) 스레드에 신호를 보내며, 실제 닫기는 마지막 I/O 연산이 중단될 때 일어난다고 적는다. <code>NativeThread</code> 클래스의 주석은 리눅스 같은 운영체제에서는 다른 스레드가 블록된 채널을 닫는 것만으로는 그 스레드가 풀려나지 않기 때문에 이 신호 장치가 있다고 설명한다.</p>
+<pre class="diagram">  reader 스레드 (플랫폼)                       close()를 부른 스레드
+  ──────────────────────                       ─────────────────────
+  beginRead(): readerThread = pthread_self()
+  read0 → read(fd 6) ── 커널 안에서 잠듦
+                                               state = ST_CLOSING
+                                               tryClose(): readerThread != 0 → 실패
+                                               preClose:
+                                                 dup2(preCloseFD, 6)   ← 번호 6은 죽은 소켓을 가리킴
+                                                 pthread_kill(reader, SIGIO)   (macOS 기준)
+  read가 -1 / EINTR 로 돌아옴  ◀──── 신호 ────
+  okayToRetry 는 true 지만 isOpen() 이 false → 루프 종료
+  endRead(false):
+    readerThread = 0
+    tryFinishClose() → close(6)   ← 실제 닫기는 여기서
+    throw SocketException("Socket closed")</pre>
+
+<h4>가상 스레드라면: unpark 한 번</h4>
+<p>가상 스레드는 이 경로를 타지 않는다. <code>NativeThread.current()</code>는 가상 스레드에서 -1을 돌려주고, <code>NativeDispatcher.preClose</code>는 기록된 값이 -1이면 신호 대신 <code>Poller.stopPoll(fd)</code>를 불러 그 fd를 기다리던 가상 스레드를 <code>LockSupport.unpark</code>로 깨운다. 인터럽트도 마찬가지로 단순하다. <code>VirtualThread.interrupt()</code>는 플래그를 켠 뒤 끝에서 <code>unpark()</code>를 부른다. 깨어난 스레드는 <code>NioSocketImpl.park</code>에서 인터럽트 플래그를 보고 <code>InterruptedIOException</code>을 던지고, <code>Socket$SocketInputStream.read</code>가 그것을 잡아 "가상 스레드이고 인터럽트되었으면" 소켓을 닫고 <code>SocketException("Closed by interrupt")</code>로 바꿔 던진다. 같은 프로그램에서 플랫폼 스레드와 가상 스레드를 각각 소켓 읽기에 세워 두고 인터럽트해 봤다.</p>
+<pre><code class="language-java">package net;
+
+import java.io.DataInputStream;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+public class InterruptRead {
+    public static void main(String[] args) throws Exception {
+        try (ServerSocket ss = new ServerSocket(7791)) {
+            for (boolean virtual : new boolean[]{false, true}) {
+                Socket client = new Socket("localhost", 7791);
+                Socket peer = ss.accept();                 // 상대는 아무것도 쓰지 않는다
+                Runnable task = () -> {
+                    try {
+                        new DataInputStream(client.getInputStream()).readUTF();
+                    } catch (Exception e) {
+                        System.out.println("  reader 종료: " + e);
+                    }
+                };
+                Thread reader = virtual ? Thread.ofVirtual().start(task)
+                                        : Thread.ofPlatform().start(task);
+                Thread.sleep(300);
+                System.out.println((virtual ? "가상" : "플랫폼") + " 스레드, interrupt 전: " + reader.getState());
+                reader.interrupt();
+                Thread.sleep(300);
+                System.out.println("  interrupt 후: " + reader.getState() + ", client.isClosed()=" + client.isClosed());
+                if (reader.isAlive()) {
+                    client.close();
+                    reader.join();
+                    System.out.println("  close 후: " + reader.getState());
+                }
+                peer.close();
+            }
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (macOS, OpenJDK 21.0.13)"><code class="language-text">플랫폼 스레드, interrupt 전: RUNNABLE
+  interrupt 후: RUNNABLE, client.isClosed()=false
+  reader 종료: java.net.SocketException: Socket closed
+  close 후: TERMINATED
+가상 스레드, interrupt 전: WAITING
+  reader 종료: java.net.SocketException: Closed by interrupt
+  interrupt 후: TERMINATED, client.isClosed()=true</code></pre>
+<p>두 가지가 눈에 띈다. 플랫폼 스레드는 인터럽트 뒤에도 소켓이 열린 채 RUNNABLE로 남았다가 <code>close()</code>로만 풀려났고, 가상 스레드는 인터럽트 한 번에 소켓까지 닫히며 끝났다. 그리고 같은 소켓 읽기에서 멈춘 스레드인데 가상 스레드의 상태는 RUNNABLE이 아니라 WAITING이다. 가상 스레드는 커널 안에서 잠드는 것이 아니라 <code>LockSupport.park</code>로 JVM 수준에서 멈추기 때문이다. 앞에서 "소켓 I/O에서 멈춘 스레드는 RUNNABLE"이라고 한 것은 플랫폼 스레드에 대한 이야기이고, 가상 스레드의 스레드 덤프를 읽을 때는 이 차이를 함께 기억해야 한다.</p>
+<div class="table-wrap"><table><thead><tr><th>OpenJDK 21, 유닉스 계열 기준</th><th>플랫폼 스레드(타임아웃 없음)</th><th>가상 스레드</th></tr></thead><tbody>
+<tr><td>파일 디스크립터 모드</td><td>블로킹(accept 직후 명시적으로 설정)</td><td>첫 읽기에서 O_NONBLOCK으로 전환</td></tr>
+<tr><td>데이터가 없을 때 멈추는 곳</td><td>커널의 read(2) / accept(2) 안</td><td>LockSupport.park (캐리어 스레드는 풀려남)</td></tr>
+<tr><td>Thread.getState()</td><td>RUNNABLE</td><td>WAITING</td></tr>
+<tr><td>interrupt()</td><td>플래그만 켜짐, 계속 대기</td><td>unpark → 소켓을 닫고 "Closed by interrupt"</td></tr>
+<tr><td>다른 스레드의 close()</td><td>dup2 + pthread_kill → EINTR → "Socket closed"</td><td>Poller.stopPoll → unpark → "Socket closed"</td></tr>
+</tbody></table></div>
+
+<h3>네트워크 프로그램2 — 예제: 여러 번 주고받기</h3>
+<p>첫 번째 예제는 메시지 하나로 끝났다. 이번에는 클라이언트가 사용자 입력을 받아 여러 번 보내고, <code>exit</code>를 보내면 양쪽이 연결을 닫게 한다. 서버는 한 클라이언트와 반복해서 주고받는다.</p>
+<pre><code class="language-java">package net;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+import static net.Log.log;
+
+public class EchoServer2 {
+    private static final int PORT = 7777;
+
+    public static void main(String[] args) throws IOException {
+        log("서버 시작");
+        ServerSocket serverSocket = new ServerSocket(PORT);
+        Socket socket = serverSocket.accept();
+        log("연결됨: " + socket);
+
+        DataInputStream input = new DataInputStream(socket.getInputStream());
+        DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+
+        while (true) {
+            String received = input.readUTF();
+            log("받음: " + received);
+            if (received.equals("exit")) {
+                break;
+            }
+            String reply = "[echo] " + received;
+            output.writeUTF(reply);
+            log("보냄: " + reply);
+        }
+
+        log("연결 종료: " + socket);
+        input.close();
+        output.close();
+        socket.close();
+        serverSocket.close();
+    }
+}</code></pre>
+<pre><code class="language-java">package net;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.net.Socket;
+import java.util.Scanner;
+
+import static net.Log.log;
+
+public class EchoClient2 {
+    private static final int PORT = 7777;
+
+    public static void main(String[] args) throws IOException {
+        Socket socket = new Socket("localhost", PORT);
+        log("연결됨: " + socket);
+
+        DataInputStream input = new DataInputStream(socket.getInputStream());
+        DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+
+        Scanner scanner = new Scanner(System.in);
+        while (true) {
+            System.out.print("보낼 메시지: ");
+            String message = scanner.nextLine();
+            output.writeUTF(message);
+            log("보냄: " + message);
+            if (message.equals("exit")) {
+                break;
+            }
+            String reply = input.readUTF();
+            log("받음: " + reply);
+        }
+
+        log("연결 종료: " + socket);
+        input.close();
+        output.close();
+        socket.close();
+    }
+}</code></pre>
+<p>서버의 줄 번호를 기억해 두자. 앞의 스레드 덤프 마지막 줄 <code>EchoServer2.java:24</code>는 이 파일의 <code>String received = input.readUTF();</code> 줄이다. 클라이언트 A가 <code>hi</code>, <code>second</code>, <code>exit</code>를 차례로 입력하면 결과는 다음과 같다(사용자가 입력한 글자도 터미널에 함께 보인다).</p>
+<pre data-label="클라이언트 A"><code class="language-text">[main] 연결됨: Socket[addr=localhost/127.0.0.1,port=7777,localport=58868]
+보낼 메시지: hi
+[main] 보냄: hi
+[main] 받음: [echo] hi
+보낼 메시지: second
+[main] 보냄: second
+[main] 받음: [echo] second
+보낼 메시지: exit
+[main] 보냄: exit
+[main] 연결 종료: Socket[addr=localhost/127.0.0.1,port=7777,localport=58868]</code></pre>
+<pre data-label="서버"><code class="language-text">[main] 서버 시작
+[main] 연결됨: Socket[addr=/127.0.0.1,port=58868,localport=7777]
+[main] 받음: hi
+[main] 보냄: [echo] hi
+[main] 받음: second
+[main] 보냄: [echo] second
+[main] 받음: exit
+[main] 연결 종료: Socket[addr=/127.0.0.1,port=58868,localport=7777]</code></pre>
+<p>한 연결 위에서 요청과 응답이 여러 번 오갔다. 연결을 한 번 맺어 두고 계속 쓰는 것이므로 메시지마다 핸드셰이크를 다시 할 필요가 없다. HTTP/1.1의 지속 연결(persistent connection)이나 데이터베이스 커넥션 풀이 연결을 재사용하는 이유도 같다. 연결 수립에는 왕복 시간과 커널 자원이 들기 때문이다.</p>
+
+<h3>네트워크 프로그램2 — 분석: 두 번째 클라이언트는 어디서 기다리는가</h3>
+<p>클라이언트 A가 접속해 있는 동안 클라이언트 B를 하나 더 실행해 보자. B가 <code>B-1</code>을 입력한 뒤 기다리는 사이 A가 <code>exit</code>로 끝냈다.</p>
+<pre data-label="클라이언트 B (macOS에서 관찰)"><code class="language-text">[main] 연결됨: Socket[addr=localhost/127.0.0.1,port=7777,localport=58869]
+보낼 메시지: B-1
+[main] 보냄: B-1
+Exception in thread "main" java.net.SocketException: Connection reset
+	at java.base/sun.nio.ch.NioSocketImpl.implRead(NioSocketImpl.java:318)
+	at java.base/sun.nio.ch.NioSocketImpl.read(NioSocketImpl.java:346)
+	at java.base/sun.nio.ch.NioSocketImpl$1.read(NioSocketImpl.java:796)
+	at java.base/java.net.Socket$SocketInputStream.read(Socket.java:1099)
+	at java.base/java.io.DataInputStream.readFully(DataInputStream.java:208)
+	at java.base/java.io.DataInputStream.readUnsignedShort(DataInputStream.java:341)
+	at java.base/java.io.DataInputStream.readUTF(DataInputStream.java:575)
+	at java.base/java.io.DataInputStream.readUTF(DataInputStream.java:550)
+	at net.EchoClient2.main(EchoClient2.java:30)</code></pre>
+<p>서버 로그에는 B에 관한 줄이 하나도 없다. 그런데 B 쪽에서는 <code>연결됨</code>이 찍혔고 <code>보냄: B-1</code>까지 성공했다. 앞 절의 내용을 그대로 적용하면 이 현상이 설명된다.</p>
+<ol>
+<li>B의 <code>new Socket(...)</code>: 서버 커널이 핸드셰이크를 끝내고 연결을 accept 큐에 넣는다. 서버 프로그램은 아무것도 하지 않았지만 B의 <code>connect</code>는 성공한다.</li>
+<li>B의 <code>writeUTF("B-1")</code>: 데이터가 서버 커널에 도착해 아직 accept되지 않은 그 연결의 수신 버퍼에 쌓인다. B의 쓰기는 송신 버퍼에 복사되는 순간 끝나므로 역시 성공한다.</li>
+<li>B의 <code>readUTF()</code>: 응답이 올 때까지 기다린다. 응답은 오지 않는다. 서버의 유일한 스레드인 main은 A의 소켓에서 <code>readUTF()</code>를 기다리고 있고, <code>accept()</code>는 프로그램 맨 앞에서 한 번만 호출했기 때문이다.</li>
+<li>A가 <code>exit</code>를 보내면 서버는 루프를 빠져나와 리스닝 소켓까지 닫고 끝난다. 큐에 남아 있던 B의 연결은 끝내 accept되지 못한 채 커널이 정리하고, 이 실험(macOS)에서 B는 RST를 받아 <code>Connection reset</code> 예외로 끝났다.</li>
+</ol>
+<p>스택 트레이스 맨 아래의 <code>EchoClient2.java:30</code>은 <code>String reply = input.readUTF();</code> 줄이다. B는 응답을 기다리다가 연결이 리셋되었다는 통지를 받은 것이다. RST가 무엇이고 FIN과 어떻게 다른지는 다음 회차의 정상 종료·강제 종료에서 자세히 다룬다.</p>
+<p>서버를 조금 고쳐 <code>accept()</code>를 바깥 루프로 감싸면 어떨까. A와의 대화가 끝나면 다시 <code>accept()</code>를 불러 B를 꺼내 처리하는 서버다. 이런 서버를 반복 서버(iterative server)라고 한다. B는 결국 응답을 받지만, A가 접속해 있는 내내 기다려야 한다. A가 사람이고 몇 분 동안 아무것도 입력하지 않으면 B도 몇 분을 기다린다. 문제의 본질은 스레드가 하나뿐이고 그 스레드가 블로킹 I/O에 묶여 있다는 데 있다. 스레드 하나는 한순간에 한 곳에서만 멈춰 있을 수 있다. A의 <code>readUTF()</code>에서 멈춘 스레드는 <code>accept()</code>를 부를 수도, B의 메시지를 읽을 수도 없다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>직원이 한 명뿐인 상담 창구</strong><p>건물 입구의 경비원(커널)은 손님이 오면 번호표를 주고 대기실(accept 큐)에 앉힌다. 손님은 들어왔으니 서류(데이터)를 대기실 우편함에 넣어 둘 수도 있다. 하지만 창구 직원(서버 스레드)이 한 명이고, 그 직원이 첫 손님이 말을 이어 가기를 하염없이 기다리고 있으면 대기실의 손님은 아무리 기다려도 불리지 않는다. 직원이 퇴근하며 문을 닫으면(리스닝 소켓 close) 대기실의 손님은 그대로 돌려보내진다. 비유가 깨지는 지점도 있다. 실제 대기실은 사람이 많아지면 넓힐 수 있지만, accept 큐의 길이는 운영체제 설정이 정한 상한을 넘지 못한다.</p></aside>
+
+<h3>네트워크 프로그램3: 연결마다 스레드 하나</h3>
+<p>스레드 하나가 한 곳에서만 멈출 수 있다면, 멈출 곳마다 스레드를 따로 두면 된다. 연결을 받는 일과 대화하는 일을 나눈다. main 스레드는 <code>accept()</code>만 반복하고, 연결이 하나 나올 때마다 새 스레드를 만들어 그 연결과의 대화를 맡긴다. 이 구조를 연결당 스레드(thread-per-connection) 모델이라고 한다. 자바 고급 1편에서 본 <code>Runnable</code>과 <code>Thread</code>가 그대로 쓰인다.</p>
+<pre><code class="language-java">package net;
+
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+import static net.Log.log;
+
+public class EchoServer3 {
+    private static final int PORT = 7777;
+
+    public static void main(String[] args) throws IOException {
+        log("서버 시작");
+        ServerSocket serverSocket = new ServerSocket(PORT);
+
+        int sessionId = 0;
+        while (true) {
+            Socket socket = serverSocket.accept();      // main 스레드는 연결 받기만 한다
+            log("연결됨: " + socket);
+            Thread worker = new Thread(new Session(socket), "session-" + (++sessionId));
+            worker.start();                             // 대화는 새 스레드에 맡긴다
+        }
+    }
+}</code></pre>
+<pre><code class="language-java">package net;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.net.Socket;
+
+import static net.Log.log;
+
+public class Session implements Runnable {
+    private final Socket socket;
+
+    public Session(Socket socket) {
+        this.socket = socket;
+    }
+
+    @Override
+    public void run() {
+        try {
+            DataInputStream input = new DataInputStream(socket.getInputStream());
+            DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+
+            while (true) {
+                String received = input.readUTF();
+                log("받음: " + received);
+                if (received.equals("exit")) {
+                    break;
+                }
+                String reply = "[echo] " + received;
+                output.writeUTF(reply);
+                log("보냄: " + reply);
+            }
+
+            log("연결 종료: " + socket);
+            input.close();
+            output.close();
+            socket.close();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}</code></pre>
+<p><code>Runnable.run()</code>은 검사 예외를 던질 수 없으므로 <code>IOException</code>을 런타임 예외로 감쌌다. 이 선택이 뒤에서 문제를 일으킨다. 클라이언트는 <code>EchoClient2</code>를 그대로 쓴다. A가 <code>hi</code>를 보내고 3초 뒤 <code>exit</code>, 그 사이 B가 접속해 <code>B-1</code>과 <code>exit</code>를 보내게 했다.</p>
+<pre data-label="서버 실행 결과 (포트는 실행마다 다르다)"><code class="language-text">[main] 서버 시작
+[main] 연결됨: Socket[addr=/127.0.0.1,port=58920,localport=7777]
+[session-1] 받음: hi
+[session-1] 보냄: [echo] hi
+[main] 연결됨: Socket[addr=/127.0.0.1,port=58921,localport=7777]
+[session-2] 받음: B-1
+[session-2] 보냄: [echo] B-1
+[session-2] 받음: exit
+[session-2] 연결 종료: Socket[addr=/127.0.0.1,port=58921,localport=7777]
+[session-1] 받음: exit
+[session-1] 연결 종료: Socket[addr=/127.0.0.1,port=58920,localport=7777]</code></pre>
+<p>A가 접속해 있는 동안에도 B가 곧바로 응답을 받았다. 로그의 스레드 이름이 역할 분담을 보여 준다. <code>[main]</code>은 연결을 받는 줄에만 나오고, 대화는 <code>[session-1]</code>, <code>[session-2]</code>가 맡는다. 두 세션의 로그가 섞여 찍히는 순서는 클라이언트의 입력 시점과 스케줄링에 따라 달라진다. 이번 실험에서는 입력 시점을 일부러 벌려 두었기 때문에 이 순서가 나왔을 뿐이다.</p>
+<p>이 순간 서버 프로세스 안의 상태를 그려 보면 다음과 같다. 스레드가 세 개이고, 각자 다른 곳에서 멈춰 있다. main은 리스닝 소켓의 <code>accept()</code>에서, 두 세션 스레드는 각자 자기 소켓의 <code>readUTF()</code>에서 기다린다. 커널은 어떤 소켓에 데이터가 오면 그 소켓에서 기다리는 스레드만 깨운다.</p>
+<pre class="diagram">서버 프로세스 (JVM)
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │ main 스레드        : serverSocket.accept()   ── 리스닝 소켓 fd 5 (*:7777)  │
+ │ session-1 스레드   : input.readUTF()         ── 연결 소켓 fd 6 (↔ :58920)  │
+ │ session-2 스레드   : input.readUTF()         ── 연결 소켓 fd 7 (↔ :58921)  │
+ │                                                                        │
+ │ 힙: ServerSocket, Socket×2, Session×2, Data*Stream×4                    │
+ │ 스택: 스레드마다 하나씩 (플랫폼 스레드 = 운영체제 스레드)                  │
+ └──────────────────────────────────────────────────────────────────────┘
+                      │ fd 번호는 예시
+                      ▼
+ 커널: 소켓마다 송신 버퍼·수신 버퍼, 데이터가 오면 그 소켓을 기다리는 스레드를 깨움</pre>
+<x-visual id="java-adv2-07-thread-per-connection" title="연결당 스레드 모델: accept 스레드와 세션 스레드" kind="구조 다이어그램" ratio="16:9">
+<x-hint>main 스레드는 accept만 반복하고, 연결마다 세션 스레드가 하나씩 붙어 각자 자기 소켓에서 블로킹 읽기를 한다는 것을 보여 준다.</x-hint>
+<x-prompt>왼쪽에 노트북 아이콘 세 개 "클라이언트 A", "클라이언트 B", "클라이언트 C". 오른쪽에 큰 사각형 "서버 프로세스". 사각형 안 맨 위에 "main 스레드" 레인이 있고 그 레인 안에 "accept() 반복"이라는 루프 화살표 아이콘과 "리스닝 소켓 :7777"이 있다. 그 아래로 가로 레인 세 개 "session-1 스레드", "session-2 스레드", "session-3 스레드"가 있고 각 레인에 "소켓"과 "readUTF() 대기" 모래시계 아이콘이 있다. 각 클라이언트에서 해당 세션 레인의 소켓으로 양방향 화살표가 이어진다. main 레인에서 각 세션 레인으로 점선 화살표 "new Thread(...).start()". 사각형 오른쪽 아래에 작은 메모 "연결 1개 = 스레드 1개 + fd 1개". 차분한 청록색과 회색, 흰 배경, 깔끔한 선.</x-prompt>
+<x-caption>연결마다 스레드가 하나씩 붙으면 한 클라이언트의 대기가 다른 클라이언트를 막지 않는다.</x-caption>
+</x-visual>
+
+<h4>연결당 스레드의 비용</h4>
+<p>이 구조는 단순하고, 블로킹 I/O의 코드를 그대로 쓸 수 있다는 큰 장점이 있다. 대신 연결 수만큼 플랫폼 스레드가 생긴다. 스레드마다 스택이 있다. <code>java</code> 명령의 공식 문서는 <code>-Xss</code>(스레드 스택 크기)의 기본값을 플랫폼별로 적는데, Linux/x64와 macOS/x64는 1024KB, Linux/Aarch64와 macOS/Aarch64는 2048KB다. 연결 1만 개면 스택으로 예약되는 주소 공간만 10GB(1024KB 기준)에서 20GB(2048KB 기준)에 이른다. 운영체제가 만들 수 있는 스레드 수에도 한도가 있고, 스레드가 많아지면 문맥 전환(context switch)도 늘어난다.</p>
+<p>스레드만 자원인 것이 아니다. 연결 하나는 서버 프로세스에서 파일 디스크립터 하나를 차지하고, 프로세스가 열 수 있는 파일 디스크립터 수에는 한도가 있다. 한도를 일부러 낮춰 확인해 봤다. 한 프로세스 안에서 서버 스레드가 연결을 계속 accept하고 main 스레드는 연결을 닫지 않고 계속 만든다. 연결 하나에 클라이언트 쪽과 서버 쪽 디스크립터가 하나씩, 두 개가 든다. 셸에서 <code>ulimit -n 256</code>으로 한도를 낮췄는데, HotSpot에는 시작할 때 열린 파일 수의 소프트 한도를 올리는 <code>MaxFDLimit</code> 옵션이 있고 이 macOS의 JDK 21에서 기본값이 true여서 한도가 적용되지 않았다. <code>-XX:-MaxFDLimit</code>로 끄고 다시 실행하자 124개째 연결을 만든 뒤 <code>java.net.SocketException: Too many open files</code>가 났다. 124 × 2 = 248개에 JVM이 원래 열어 두는 파일 몇 개가 더해져 256에 닿은 것이다.</p>
+<p>그래서 실무에서는 스레드를 무한정 만들지 않는다. 고급 1편의 스레드 풀(<code>ExecutorService</code>)에 세션을 맡기면 스레드 수에 상한이 생긴다. 상한을 넘은 연결은 풀의 작업 큐에서 기다리므로, 위에서 본 accept 큐와 비슷한 대기가 한 층 위에 생긴다. 서블릿 컨테이너가 요청을 스레드 풀의 스레드에 맡겨 처리하는 것도 같은 생각이다. 또 다른 길은 Java 21에서 정식 기능이 된 가상 스레드다. <code>Thread</code>의 Javadoc은 가상 스레드를 운영체제가 아니라 자바 런타임이 스케줄링하는 가벼운 스레드로 소개하며, JVM 하나가 수백만 개를 지원할 수 있고 대부분의 시간을 I/O 대기로 보내는 작업에 알맞다고 적는다. 앞에서 본 것처럼 소켓 API도 가상 스레드일 때 동작이 달라지는 부분(인터럽트로 깨어나는 것 같은)을 Javadoc에 따로 명시한다. 연결당 스레드 코드를 그대로 두고 <code>new Thread(...)</code>를 <code>Thread.ofVirtual().start(...)</code>로 바꾸는 것만으로 이 비용 구조가 달라진다는 점은 기억해 둘 만하다.</p>
+
+<h3>한 층 더(2): 연결 1,000개를 플랫폼 스레드와 가상 스레드로 받아 보기</h3>
+<p>"스택 예약", "운영체제 스레드", "비용 구조가 달라진다"는 말을 숫자로 확인해 보자. 연결당 스레드 서버를 인자 하나로 플랫폼 스레드와 가상 스레드 중에 고르게 만들고, 별도 프로세스의 클라이언트가 연결 1,000개를 열어 각각 메시지 하나를 주고받은 뒤 연결을 연 채로 몇 초를 기다리게 했다. 그동안 서버의 세션 1,000개는 모두 다음 <code>readUTF()</code>에서 멈춰 있다. 실험은 모두 이 macOS(Apple Silicon, 논리 CPU 8개)의 OpenJDK 21.0.13에서 했다.</p>
+<pre><code class="language-java">package net;
+
+import java.io.*;
+import java.net.*;
+
+public class Srv {
+    public static void main(String[] args) throws Exception {
+        boolean virtual = args[0].equals("virtual");
+        ServerSocket ss = new ServerSocket(7790, 4096);
+        int id = 0;
+        while (true) {
+            Socket s = ss.accept();
+            Runnable r = () -> {
+                try (s; DataInputStream in = new DataInputStream(s.getInputStream());
+                     DataOutputStream out = new DataOutputStream(s.getOutputStream())) {
+                    while (true) {
+                        String m = in.readUTF();
+                        out.writeUTF("[echo] " + m);
+                    }
+                } catch (IOException e) { }
+            };
+            if (virtual) Thread.ofVirtual().name("vs-" + (++id)).start(r);
+            else new Thread(r, "session-" + (++id)).start();
+        }
+    }
+}</code></pre>
+<p>서버는 <code>-XX:NativeMemoryTracking=summary</code>를 켜고 실행했고, 클라이언트가 1,000개를 모두 연 뒤 다음 네 가지를 찍었다. <code>ps -M -p PID</code>는 macOS에서 프로세스의 운영체제 스레드를 한 줄씩 보여 주므로 그 줄 수로 스레드 수를 셌다. <code>jcmd PID VM.native_memory summary</code>는 HotSpot이 추적한 네이티브 메모리를, <code>lsof +fg</code>는 앞 절에서 본 파일 플래그를 보여 준다.</p>
+<div class="table-wrap"><table><thead><tr><th>macOS, OpenJDK 21.0.13 관찰</th><th>플랫폼 스레드</th><th>가상 스레드</th></tr></thead><tbody>
+<tr><td>운영체제 스레드 수(연결 전 → 1,000개 연결 중)</td><td>22 → 1027</td><td>21 → 32</td></tr>
+<tr><td>NMT의 Thread 항목 스레드 수</td><td>1025</td><td>30</td></tr>
+<tr><td>NMT의 스레드 스택 reserved</td><td>2,111,500KB(약 2GB)</td><td>61,800KB</td></tr>
+<tr><td>세션 소켓의 lsof 플래그</td><td><code>R,W,0x10000</code></td><td><code>R,W,NB,0x10000</code></td></tr>
+</tbody></table></div>
+<p>플랫폼 스레드 서버는 연결 1,000개에 운영체제 스레드가 1,005개 늘었다. 가상 스레드 서버는 11개만 늘었다. 마지막 줄의 <code>NB</code>는 앞 절에서 본 그대로, 가상 스레드가 읽은 소켓은 논블로킹 모드로 바뀌었다는 표시다. 두 서버 모두 리스닝 소켓은 <code>R,W</code>로 블로킹 모드였다. <code>accept()</code>를 부르는 main이 플랫폼 스레드이기 때문이다.</p>
+
+<h4>플랫폼 스레드 하나가 만들어지는 과정</h4>
+<p><code>-Xlog:os+thread=info</code>를 켜면 HotSpot이 운영체제 스레드를 만들 때마다 한 줄씩 남긴다. 플랫폼 스레드 서버의 로그에는 같은 모양의 줄이 1,024개 찍혔다.</p>
+<pre data-label="-Xlog:os+thread=info 출력 (pthread id는 실행마다 다르다)"><code class="language-text">[1.602s][info][os,thread] Thread "Unknown thread" started (pthread id: 6148747264, attributes: stacksize: 2048k, guardsize: 16k, detached).</code></pre>
+<p>이 줄을 찍는 코드는 src/hotspot/os/bsd/os_bsd.cpp의 <code>os::create_thread</code>다. 함수는 <code>pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED)</code>로 분리(detached) 속성을 주고, <code>os::Posix::get_initial_stack_size</code>로 계산한 크기를 <code>pthread_attr_setstacksize</code>에 넣은 뒤 <code>pthread_create</code>를 부른다(EAGAIN이면 몇 번 다시 시도한다). <code>java -XX:+PrintFlagsFinal -version</code>으로 보면 이 플랫폼의 <code>ThreadStackSize</code> 기본값은 2048(KB)이고, 로그의 <code>stacksize: 2048k</code>가 그 값이다. <code>new Thread(...).start()</code> 한 번이 결국 C 라이브러리의 <code>pthread_create</code> 한 번이고, 그 결과물이 커널이 스케줄링하는 스레드 하나다. 앞에서 본 jstack의 <code>nid</code>가 가리키던 것이 이것이다.</p>
+<p>NMT의 스택 reserved 2,111,500KB를 스레드 수 1,025로 나누면 스레드당 2,060KB로, 대략 <code>-Xss</code>만큼씩 주소 공간이 예약된 것이다. 그런데 이 macOS의 NMT 출력에서는 committed도 reserved와 똑같이 2,111,500KB로 찍혔다. 이것을 "스택 2GB를 실제로 쓰고 있다"로 읽으면 안 된다. NMT는 스레드 스택 중 실제로 커밋된 부분을 <code>os::committed_in_range</code>로 알아내는데, OpenJDK 21의 src/hotspot/share/runtime/os.cpp에서 리눅스와 윈도우가 아닌 플랫폼용 구현은 주어진 범위 전체를 커밋된 것으로 돌려준다. 이 macOS에서는 NMT가 스택의 실제 사용량을 구분하지 못하는 것이다. 운영체제의 <code>vmmap --summary</code>로 같은 순간을 보면 다르다.</p>
+<pre data-label="vmmap --summary (플랫폼 스레드 서버, 일부. 실행과 메모리 상황에 따라 다르다)"><code class="language-text">                                VIRTUAL RESIDENT    DIRTY  SWAPPED VOLATILE   NONVOL    EMPTY   REGION
+REGION TYPE                        SIZE     SIZE     SIZE     SIZE     SIZE     SIZE     SIZE    COUNT (non-coalesced)
+Stack                              2.0G     336K     336K    90.3M       0K       0K       0K     1027
+Stack Guard                      119.4M       0K       0K       0K       0K       0K       0K     2036</code></pre>
+<p>스택 영역 1,027개의 가상 크기는 2.0G지만, 실제로 손이 닿은 페이지는 상주(RESIDENT)와 스왑·압축(SWAPPED)을 합쳐 90MB 남짓이다. 이 실험 컴퓨터는 메모리 여유가 적어 대부분이 SWAPPED로 잡혔다. 예약은 주소 공간을 잡아 두는 것일 뿐이고, 물리 메모리는 스레드가 스택을 실제로 깊이 쓸 때 페이지 단위로 들어온다. 그래도 연결 하나에 운영체제 스레드 하나와 수십 KB의 실제 스택, 스택마다 붙는 가드 영역, 그리고 커널의 스레드 자료구조가 따라붙는다는 사실은 바뀌지 않는다. 연결 수가 늘면 이것들이 함께 늘어난다.</p>
+
+<h4>가상 스레드 1,000개는 어디서 기다리는가</h4>
+<p>JEP 444에 따르면 jstack이나 <code>jcmd Thread.print</code>가 만드는 전통적인 스레드 덤프에는 가상 스레드가 나오지 않고, 가상 스레드까지 보려면 <code>jcmd PID Thread.dump_to_file</code>로 새 형식의 덤프를 받아야 한다. 가상 스레드 서버에서 받은 덤프의 한 세션은 이렇다.</p>
+<pre data-label="jcmd PID Thread.dump_to_file -format=text 출력 (일부)"><code class="language-text">#531 "vs-500" virtual
+      java.base/java.lang.VirtualThread.park(VirtualThread.java:596)
+      java.base/java.lang.System$2.parkVirtualThread(System.java:2644)
+      java.base/jdk.internal.misc.VirtualThreads.park(VirtualThreads.java:54)
+      java.base/java.util.concurrent.locks.LockSupport.park(LockSupport.java:369)
+      java.base/sun.nio.ch.Poller.pollIndirect(Poller.java:139)
+      java.base/sun.nio.ch.Poller.poll(Poller.java:102)
+      java.base/sun.nio.ch.Poller.poll(Poller.java:87)
+      java.base/sun.nio.ch.NioSocketImpl.park(NioSocketImpl.java:175)
+      java.base/sun.nio.ch.NioSocketImpl.park(NioSocketImpl.java:201)
+      java.base/sun.nio.ch.NioSocketImpl.implRead(NioSocketImpl.java:309)
+      java.base/sun.nio.ch.NioSocketImpl.read(NioSocketImpl.java:346)
+      ...
+      java.base/java.io.DataInputStream.readUTF(DataInputStream.java:575)
+
+#35 "Read-Poller"
+      java.base/sun.nio.ch.KQueue.poll(Native Method)
+      java.base/sun.nio.ch.KQueuePoller.poll(KQueuePoller.java:69)
+      java.base/sun.nio.ch.Poller.poll(Poller.java:370)
+      java.base/sun.nio.ch.Poller.pollLoop(Poller.java:277)
+      java.base/java.lang.Thread.run(Thread.java:1583)
+      java.base/jdk.internal.misc.InnocuousThread.run(InnocuousThread.java:186)</code></pre>
+<p>위에서부터 사정이 읽힌다. 세션의 <code>readUTF</code>가 <code>NioSocketImpl.implRead</code>까지 내려가는 길은 플랫폼 스레드와 똑같다. 차이는 그다음이다. 가상 스레드이므로 소켓이 논블로킹이 되었고, <code>read</code>가 EAGAIN으로 돌아오자 <code>park</code>가 <code>Poller.poll</code>을 불렀다. 그 끝은 커널의 <code>read</code>가 아니라 <code>VirtualThread.park</code>다. JEP 444의 설명대로, 블로킹 연산에서 가상 스레드는 캐리어(carrier) 플랫폼 스레드에서 내려오고(unmount) 캐리어는 다른 가상 스레드를 실행하러 간다. 가상 스레드의 스택은 JEP 444가 적듯이 힙에 스택 청크(stack chunk) 객체로 저장된다.</p>
+<p>그러면 데이터가 도착한 것은 누가 알아차릴까. 덤프의 <code>"Read-Poller"</code>라는 플랫폼 스레드다. OpenJDK 21의 macOS용 <code>DefaultPollerProvider</code>는 <code>KQueuePoller</code>를 만들고(리눅스용은 <code>EPollPoller</code>를 만든다), 이 스레드는 <code>pollLoop</code>에서 <code>kevent</code> 시스템 콜로 kqueue를 기다리는 일만 반복한다. 흐름을 소스대로 따라가면 이렇다.</p>
+<figure class="flow-figure"><figcaption>가상 스레드의 소켓 읽기가 기다리고 깨어나는 과정 (OpenJDK 21, macOS)</figcaption><ol class="flow">
+<li><strong>등록</strong><span>Poller가 ConcurrentHashMap에 "fd → 현재 가상 스레드"를 넣고, kqueue에 그 fd를 EVFILT_READ, EV_ADD|EV_ONESHOT으로 등록한다. macOS에서는 이 등록을 Read-Updater 스레드가 대신 한다(pollIndirect)</span></li>
+<li><strong>park</strong><span>가상 스레드는 LockSupport.park로 멈추고 캐리어에서 내려온다. 이 순간 운영체제 스레드는 하나도 묶여 있지 않다</span></li>
+<li><strong>kevent 반환</strong><span>데이터가 수신 버퍼에 도착하면 Read-Poller의 kevent가 그 fd를 돌려준다. EV_ONESHOT이므로 등록은 한 번 쓰이고 사라진다</span></li>
+<li><strong>unpark</strong><span>Poller가 맵에서 fd에 해당하는 스레드를 꺼내 LockSupport.unpark를 부른다</span></li>
+<li><strong>다시 읽기</strong><span>가상 스레드가 ForkJoinPool의 캐리어에 다시 올라가 implRead 루프의 tryRead를 다시 실행한다. 이번에는 데이터가 있으므로 read가 바이트를 돌려준다</span></li>
+</ol></figure>
+<p>macOS에서 등록이 별도 스레드를 거치는 것은 <code>PollerProvider.useDirectRegister()</code>의 기본값이 false이고 macOS용 구현이 이를 바꾸지 않기 때문이다(<code>jdk.useDirectRegister</code> 시스템 속성으로 바꿀 수 있다). 덤프에 <code>"Read-Updater"</code> 스레드가 따로 보이는 이유다. 캐리어 쪽을 보면 덤프에 <code>ForkJoinPool-1-worker-1</code>부터 <code>-8</code>까지 8개가 있었다. JEP 444는 가상 스레드 스케줄러가 FIFO 모드로 동작하는 작업 훔치기(work-stealing) <code>ForkJoinPool</code>이고 병렬도의 기본값이 사용 가능한 프로세서 수라고 적는데, 이 Mac의 <code>sysctl -n hw.ncpu</code>가 8이다. 덤프에서 가상 스레드가 아닌 스레드를 모두 보면, 플랫폼 스레드 서버에도 있던 JVM 기본 스레드(main, Reference Handler, Common-Cleaner 등) 말고 새로 생긴 것은 캐리어 8개와 <code>Read-Poller</code>, <code>Read-Updater</code>, <code>Write-Poller</code>, <code>Write-Updater</code> 네 개다. 앞 표의 운영체제 스레드 수 증가(11)와 정확히 맞지 않는 것은, <code>ps</code>가 세는 수에 덤프에 나오지 않는 JVM 내부 스레드도 들어 있고 그중 JIT 컴파일러 스레드는 이 JDK에서 기본으로 켜진 <code>UseDynamicNumberOfCompilerThreads</code> 때문에 그때그때 늘고 줄기 때문이다.</p>
+<p>정리하면, 1,000개의 연결이 기다리는 비용이 플랫폼 스레드 서버에서는 "커널 안에서 잠든 운영체제 스레드 1,000개"였고, 가상 스레드 서버에서는 "kqueue에 등록된 fd 1,000개와 힙의 가상 스레드 객체 1,000개"로 바뀌었다. 코드는 한 줄만 달랐다. 다만 이 그림이 늘 성립하는 것은 아니다. JEP 444는 Java 21에서 가상 스레드가 <code>synchronized</code> 블록이나 메서드 안에서 블로킹되거나 네이티브 메서드를 실행하는 동안에는 캐리어에 고정(pinned)되어 내려오지 못한다고 적는다. 세션 코드가 <code>synchronized</code> 안에서 소켓을 읽는다면 그동안은 캐리어 하나를 붙잡게 된다.</p>
+
+<h3>정리되지 않은 소켓: CLOSE_WAIT로 남는 연결</h3>
+<p><code>EchoServer3</code>는 클라이언트가 <code>exit</code>를 보낼 때만 깔끔하게 끝난다. 클라이언트가 <code>exit</code> 없이 사라지면 어떻게 될까. A가 <code>hi</code>를 주고받은 뒤 클라이언트 프로세스에 <code>kill</code>로 SIGTERM을 보내 끝냈다. 프로세스가 끝나면 운영체제는 그 프로세스가 열어 둔 파일 디스크립터를 모두 닫고, 소켓이 닫히면서 서버 쪽으로 FIN이 간다. 서버의 <code>readUTF()</code>는 더 이상 올 바이트가 없다는 것(read가 -1)을 보고 <code>EOFException</code>을 던진다.</p>
+<pre data-label="서버 실행 결과"><code class="language-text">[main] 서버 시작
+[main] 연결됨: Socket[addr=/127.0.0.1,port=58931,localport=7777]
+[session-1] 받음: hi
+[session-1] 보냄: [echo] hi
+Exception in thread "session-1" java.lang.RuntimeException: java.io.EOFException
+	at net.Session.run(Session.java:39)
+	at java.base/java.lang.Thread.run(Thread.java:1583)
+Caused by: java.io.EOFException
+	at java.base/java.io.DataInputStream.readFully(DataInputStream.java:210)
+	at java.base/java.io.DataInputStream.readUnsignedShort(DataInputStream.java:341)
+	at java.base/java.io.DataInputStream.readUTF(DataInputStream.java:575)
+	at java.base/java.io.DataInputStream.readUTF(DataInputStream.java:550)
+	at net.Session.run(Session.java:24)
+	... 1 more</code></pre>
+<p><code>DataInputStream.java:210</code>은 앞에서 본 <code>readFully</code> 루프의 <code>throw new EOFException()</code> 줄이다. 예외는 <code>session-1</code> 스레드를 끝냈을 뿐 서버는 계속 돈다. 처리되지 않은 예외는 그 예외가 난 스레드만 종료시키고, 기본 처리기가 스택 트레이스를 찍는다. 문제는 그다음이다. 예외가 <code>input.readUTF()</code>에서 났으므로 그 아래의 <code>input.close()</code>, <code>output.close()</code>, <code>socket.close()</code>는 한 줄도 실행되지 않았다. 이 상태에서 운영체제를 보자.</p>
+<pre data-label="macOS에서 관찰"><code class="language-bash">$ netstat -an -p tcp | grep 7777
+tcp4       0      0  127.0.0.1.7777         127.0.0.1.58931        CLOSE_WAIT
+tcp4       0      0  127.0.0.1.58931        127.0.0.1.7777         FIN_WAIT_2
+tcp46      0      0  *.7777                 *.*                    LISTEN
+
+$ lsof -nP -p 5316 | grep TCP
+java    5316 read    5u  IPv6 0x2e4a67f7aa4d2c8d       0t0                 TCP *:7777 (LISTEN)
+java    5316 read    6u  IPv6 0x7dc9c2cce8db633d       0t0                 TCP 127.0.0.1:7777->127.0.0.1:58931 (CLOSE_WAIT)</code></pre>
+<p>서버 쪽 연결이 CLOSE_WAIT에 머물러 있고, 서버 프로세스는 6번 파일 디스크립터를 여전히 쥐고 있다. RFC 9293은 CLOSE-WAIT를 "로컬 사용자로부터 연결 종료 요청을 기다리는 상태"로 정의한다. 상대는 이미 FIN을 보내 끝을 알렸고, TCP는 이쪽 애플리케이션이 <code>close()</code>를 호출해 주기를 기다리고 있다는 뜻이다. 클라이언트 쪽 끝은 FIN_WAIT_2, 즉 상대의 종료 요청(FIN)을 기다리는 상태로 걸려 있다. 세션 스레드는 이미 죽었고 소켓 객체를 가리키던 지역 변수도 사라졌으니 이 소켓을 닫아 줄 코드는 어디에도 없다. 운영 중인 서버에서 CLOSE_WAIT 연결이 계속 늘어난다면 거의 언제나 애플리케이션이 소켓을 닫지 않는 버그다.</p>
+<p>가비지 컬렉터가 언젠가 이 <code>Socket</code> 객체를 수거하면 닫아 주지 않을까 기대할 수 있다. 그러나 GC는 힙 메모리가 부족할 때 돌고, 파일 디스크립터가 부족한 것은 GC를 부르는 이유가 되지 않는다. 메모리가 넉넉한 서버라면 디스크립터 한도에 먼저 닿는다. 객체가 수거될 때 정리 코드를 실행하던 <code>finalize()</code>는 <code>@Deprecated(since="9", forRemoval=true)</code>로 표시되어 있고, Javadoc은 종료자(finalization) 사용이 보안, 성능, 신뢰성 문제를 일으킬 수 있다고 적는다. 운영체제 자원은 사용한 쪽이 명시적으로, 정해진 시점에 반납해야 한다. 이것이 자원 정리의 출발점이다.</p>
+
+<h3>한 층 더(3): 닫지 않은 소켓을 Cleaner가 닫는 때</h3>
+<p>앞 절에서 GC를 기대할 수 없다고 했는데, 정확히 말하면 OpenJDK의 소켓에는 GC와 이어진 안전망이 하나 있다. JEP 353은 <code>NioSocketImpl</code>이 명시적으로 닫히지 않은 채 가비지 컬렉션되면 <code>java.lang.ref.Cleaner</code> 메커니즘으로 소켓을 닫는다고 적는다. 소스를 보면 <code>NioSocketImpl.create()</code>가 소켓을 만들 때와 <code>accept()</code>가 새 연결을 받을 때, 그 파일 디스크립터를 닫는 동작(<code>closerFor(fd, stream)</code>)을 <code>CleanerFactory.cleaner().register(this, closer)</code>로 등록한다. <code>Cleaner</code>의 Javadoc에 따르면 등록된 정리 동작은 객체가 팬텀 도달 가능(phantom reachable)해졌을 때 최대 한 번 실행된다. 앞에서 본 <code>tryClose()</code>가 실제로 닫을 때 부르는 <code>cleaner.clean()</code>도 같은 정리 동작을 지금 당장 실행하고 등록을 해제하는 호출이다. 그래서 명시적으로 닫은 소켓은 GC 때 다시 닫히지 않는다.</p>
+<p>정말로 닫히는지 확인해 보자. 세션 스레드가 소켓을 지역 변수에만 담은 채 <code>EOFException</code>으로 끝나게 하고, 세션 스레드가 끝난 뒤 <code>netstat</code>을 찍고, <code>System.gc()</code>를 부른 뒤 다시 찍는다. 한 프로세스 안에서 클라이언트와 서버를 모두 돌렸다.</p>
+<pre><code class="language-java">package net;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+public class LeakGc {
+    static void netstat(String label) throws Exception {
+        System.out.println("== " + label);
+        Process p = new ProcessBuilder("netstat", "-an", "-p", "tcp").start();
+        p.inputReader().lines().filter(l -> l.contains(".7793 ") && !l.contains("LISTEN"))
+                .forEach(System.out::println);
+        p.waitFor();
+    }
+
+    public static void main(String[] args) throws Exception {
+        ServerSocket ss = new ServerSocket(7793);
+        Thread session = new Thread(() -> {
+            try {
+                Socket s = ss.accept();                       // 지역 변수에만 담는다
+                DataInputStream in = new DataInputStream(s.getInputStream());
+                while (true) System.out.println("받음: " + in.readUTF());
+            } catch (Exception e) {
+                System.out.println("session 예외: " + e);    // close 없이 끝난다
+            }
+        }, "session");
+        session.start();
+
+        try (Socket c = new Socket("localhost", 7793)) {
+            new DataOutputStream(c.getOutputStream()).writeUTF("hi");
+        }                                                     // 클라이언트는 닫는다(FIN)
+        session.join();
+        netstat("세션 스레드 종료 직후");
+        System.gc();
+        Thread.sleep(500);
+        netstat("System.gc() 0.5초 뒤");
+        ss.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (macOS, OpenJDK 21.0.13, 포트는 실행마다 다르다)"><code class="language-text">받음: hi
+session 예외: java.io.EOFException
+== 세션 스레드 종료 직후
+tcp4       0      0  127.0.0.1.7793         127.0.0.1.55884        CLOSE_WAIT
+tcp4       0      0  127.0.0.1.55884        127.0.0.1.7793         FIN_WAIT_2
+== System.gc() 0.5초 뒤
+tcp4       0      0  127.0.0.1.55884        127.0.0.1.7793         TIME_WAIT  </code></pre>
+<p>세션 스레드가 끝난 직후에는 앞 절과 똑같이 서버 쪽이 CLOSE_WAIT, 클라이언트 쪽이 FIN_WAIT_2다. GC 뒤에는 서버 쪽 줄이 사라지고 클라이언트 쪽이 TIME_WAIT로 넘어갔다. 세션 스레드가 끝나면서 <code>Socket</code>과 그 안의 <code>NioSocketImpl</code>을 가리키는 참조가 모두 사라졌고, GC가 그것을 발견하자 <code>"Common-Cleaner"</code>라는 JDK 내부 스레드가 등록된 정리 동작을 실행해 파일 디스크립터를 닫았다. 서버 커널이 그제야 FIN을 보냈고, 상대의 FIN을 기다리던 클라이언트 쪽이 그것을 받아 TIME_WAIT로 들어간 것이다. TIME_WAIT가 무엇인지는 다음 회차에서 연결 종료와 함께 다룬다.</p>
+<p>이 실험이 보여 주는 것은 안전망이 있다는 사실과 함께 그 안전망의 한계다. 이번에는 <code>System.gc()</code>를 직접 불렀기 때문에 곧바로 닫혔다. <code>System.gc()</code>의 Javadoc은 이 호출이 최선의 노력(best effort)일 뿐이라고 적고, 실제 서버에서 GC는 힙 사용량에 따라 돈다. 힙이 넉넉한 서버라면 CLOSE_WAIT 소켓이 수천 개 쌓여 "Too many open files"가 날 때까지 GC가 한 번도 돌지 않을 수 있다. 또 정리 동작은 파일 디스크립터를 닫을 뿐, <code>BufferedOutputStream</code>처럼 자바 쪽 버퍼에 남은 데이터를 <code>flush()</code>해 주지 않는다. 등록된 것은 소켓 구현의 fd를 닫는 동작이지 그 위에 씌운 스트림의 <code>close()</code>가 아니기 때문이다. Cleaner는 누수가 영원히 가지 않게 하는 마지막 그물이고, 자원을 반납하는 방법은 여전히 정해진 시점의 <code>close()</code>다.</p>
+
+<h3>자원 정리1: 정리 코드를 맨 끝에 두면</h3>
+<p>자원 정리의 규칙을 네트워크와 떼어 놓고 살펴보자. 열 때와 닫을 때를 출력하고, 사용 중이나 닫는 중에 예외를 낼 수 있는 가짜 자원 <code>Handle</code>을 만든다. <code>AutoCloseable</code>을 구현해 두는 것은 마지막 단계에서 쓰기 위해서다.</p>
+<pre><code class="language-java">package res;
+
+public class Handle implements AutoCloseable {
+    private final String name;
+    private final boolean failOnClose;
+
+    public Handle(String name, boolean failOnClose) {
+        this.name = name;
+        this.failOnClose = failOnClose;
+        System.out.println(name + " 열기");
+    }
+
+    public void use() {
+        System.out.println(name + " 사용");
+    }
+
+    public void useFail() throws UseException {
+        System.out.println(name + " 사용 중 예외");
+        throw new UseException(name + " 사용 실패");
+    }
+
+    @Override
+    public void close() throws CloseFailException {
+        if (failOnClose) {
+            System.out.println(name + " 닫기 중 예외");
+            throw new CloseFailException(name + " 닫기 실패");
+        }
+        System.out.println(name + " 닫기");
+    }
+}</code></pre>
+<pre><code class="language-java">package res;
+
+public class UseException extends Exception {
+    public UseException(String message) {
+        super(message);
+    }
+}</code></pre>
+<pre><code class="language-java">package res;
+
+public class CloseFailException extends Exception {
+    public CloseFailException(String message) {
+        super(message);
+    }
+}</code></pre>
+<p>첫 번째 시도는 <code>EchoServer3</code>의 <code>Session</code>과 같은 모양이다. 사용하고, 끝에서 닫는다.</p>
+<pre><code class="language-java">package res;
+
+public class CleanupV1 {
+    public static void main(String[] args) {
+        try {
+            logic();
+        } catch (Exception e) {
+            System.out.println("잡은 예외: " + e);
+        }
+    }
+
+    static void logic() throws UseException, CloseFailException {
+        Handle a = new Handle("a", false);
+        Handle b = new Handle("b", false);
+        a.use();
+        b.useFail();     // 여기서 예외가 나면
+        b.close();       // 이 두 줄은 실행되지 않는다
+        a.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">a 열기
+b 열기
+a 사용
+b 사용 중 예외
+잡은 예외: res.UseException: b 사용 실패</code></pre>
+<p>"닫기"가 한 번도 찍히지 않았다. 예외는 정상 흐름을 건너뛰는 제어 흐름이다. <code>b.useFail()</code>에서 예외가 던져지면 그 메서드의 나머지 문장은 실행되지 않고 호출자로 올라간다. 정리 코드가 정상 흐름의 끝에 있으면 예외 경로에서는 정리가 일어나지 않는다. 바로 앞 절에서 본 CLOSE_WAIT가 이 구조의 결과였다.</p>
+
+<h3>자원 정리2: finally로 옮기면 생기는 문제</h3>
+<p>예외가 나든 안 나든 실행되는 곳은 <code>finally</code>다. 정리 코드를 <code>finally</code>로 옮기면 바로 몇 가지 문제가 생기고, 그것을 하나씩 해결하다 보면 코드가 이렇게 된다. 이번에는 b가 닫을 때 실패하는 자원이라고 하자.</p>
+<pre><code class="language-java">package res;
+
+public class CleanupV2 {
+    public static void main(String[] args) {
+        try {
+            logic();
+        } catch (Exception e) {
+            System.out.println("잡은 예외: " + e);
+        }
+    }
+
+    static void logic() throws UseException, CloseFailException {
+        Handle a = null;                   // finally에서 보이도록 try 밖에 선언
+        Handle b = null;
+        try {
+            a = new Handle("a", false);
+            b = new Handle("b", true);     // 닫을 때 실패하는 자원
+            a.use();
+            b.useFail();                   // 핵심 예외
+        } finally {
+            if (b != null) {               // 생성 전에 실패했을 수 있다
+                b.close();                 // 정리 중 예외
+            }
+            if (a != null) {
+                a.close();                 // 실행되지 않는다
+            }
+        }
+    }
+}</code></pre>
+<p>코드에 이미 세 가지 고민이 들어 있다. 첫째, 변수의 스코프. <code>try</code> 블록 안에서 선언한 지역 변수는 <code>finally</code>에서 보이지 않으므로 바깥에 선언하고 <code>null</code>로 초기화해야 한다. 지역 변수는 확정 할당(definite assignment) 규칙 때문에 초기화 없이 <code>finally</code>에서 읽으면 컴파일 오류가 난다. 둘째, null 검사. <code>a</code>를 만든 뒤 <code>b</code>의 생성자에서 예외가 나면 <code>b</code>는 <code>null</code>인 채로 <code>finally</code>에 도착한다. 검사 없이 <code>b.close()</code>를 부르면 <code>NullPointerException</code>이 난다. 셋째, 닫는 순서. 나중에 연 것을 먼저 닫는다. 나중에 만든 자원이 먼저 만든 자원에 기대는 경우가 많기 때문이다. <code>DataOutputStream</code>이 소켓 스트림에 기대고, 소켓 스트림이 소켓에 기대는 것처럼.</p>
+<pre data-label="실행 결과"><code class="language-text">a 열기
+b 열기
+a 사용
+b 사용 중 예외
+b 닫기 중 예외
+잡은 예외: res.CloseFailException: b 닫기 실패</code></pre>
+<p>그런데도 두 가지가 깨졌다. 하나는 a가 닫히지 않았다는 것이다. <code>b.close()</code>가 예외를 던지는 순간 <code>finally</code> 블록의 나머지도 건너뛰어진다. <code>finally</code>는 "반드시 실행되는 블록"이지 "블록 안의 모든 문장이 반드시 실행되는 블록"이 아니다. 다른 하나는 더 나쁘다. 호출자가 받은 예외가 <code>UseException</code>이 아니라 <code>CloseFailException</code>이다. JLS의 try 문 규칙에 따르면, <code>try</code> 블록이 예외로 끝났더라도 <code>finally</code> 블록이 다른 이유(새 예외)로 갑자기 끝나면 try 문 전체가 그 새 이유로 끝나고 원래 예외는 버려진다. 장애를 분석하는 사람에게 중요한 것은 "왜 사용 중에 실패했는가"인데, 로그에는 "닫다가 실패했다"만 남는다. 원인이 된 예외가 정리 중의 부수적인 예외에 가려진 것이다.</p>
+<div class="table-wrap"><table><thead><tr><th>문제</th><th>원인</th><th>결과</th></tr></thead><tbody>
+<tr><td>변수 스코프</td><td>try 블록 안의 변수는 finally에서 안 보인다</td><td>바깥에 null로 선언해야 한다</td></tr>
+<tr><td>null 자원</td><td>생성 도중 실패하면 뒤의 변수는 null</td><td>검사 없이 close하면 NPE</td></tr>
+<tr><td>닫는 순서</td><td>나중 자원이 먼저 자원에 기댄다</td><td>역순으로 닫아야 한다</td></tr>
+<tr><td>정리 중 예외가 다음 정리를 막음</td><td>finally 안에서도 예외는 남은 문장을 건너뛴다</td><td>a가 닫히지 않는다(자원 누수)</td></tr>
+<tr><td>핵심 예외가 사라짐</td><td>finally가 새 예외로 끝나면 원래 예외는 버려진다</td><td>호출자는 CloseFailException만 본다</td></tr>
+</tbody></table></div>
+
+<h3>자원 정리3: 정리 중 예외를 따로 잡기</h3>
+<p>남은 두 문제는 같은 처방으로 풀린다. 각 자원의 <code>close()</code>를 자기만의 try-catch로 감싸 정리 중 예외가 밖으로 새지 않게 한다. 반복되는 모양이므로 도우미 메서드로 뺀다.</p>
+<pre><code class="language-java">package res;
+
+public class CleanupV3 {
+    public static void main(String[] args) {
+        try {
+            logic();
+        } catch (Exception e) {
+            System.out.println("잡은 예외: " + e);
+        }
+    }
+
+    static void logic() throws UseException {
+        Handle a = null;
+        Handle b = null;
+        try {
+            a = new Handle("a", false);
+            b = new Handle("b", true);
+            a.use();
+            b.useFail();
+        } finally {
+            closeQuietly(b);
+            closeQuietly(a);
+        }
+    }
+
+    static void closeQuietly(AutoCloseable resource) {
+        if (resource == null) {
+            return;
+        }
+        try {
+            resource.close();
+        } catch (Exception e) {
+            System.out.println("정리 중 예외(기록만 함): " + e);
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">a 열기
+b 열기
+a 사용
+b 사용 중 예외
+b 닫기 중 예외
+정리 중 예외(기록만 함): res.CloseFailException: b 닫기 실패
+a 닫기
+잡은 예외: res.UseException: b 사용 실패</code></pre>
+<p>이제 a도 닫히고 호출자는 핵심 예외인 <code>UseException</code>을 받는다. 정리 중 예외는 기록만 하고 삼켰다. 실무 코드에서 오래 쓰인 방식이고, 지금도 소켓처럼 닫는 중의 실패를 더 처리할 방법이 없는 자원에는 충분히 쓸 만하다. 그래도 아쉬움이 남는다. 자원이 늘 때마다 바깥 선언, null 초기화, finally의 호출이 하나씩 늘고, 순서를 지키는 것은 여전히 사람의 몫이다. 또 정리 중 예외는 로그로만 흩어지고, 호출자가 받은 예외 객체에는 "정리하다가 이런 일도 있었다"는 정보가 붙어 있지 않다. 예외를 잡아 기록하는 곳과 이 메서드가 떨어져 있으면 두 사건을 이어 붙이기 어렵다.</p>
+
+<h3>자원 정리4: try-with-resources</h3>
+<p>Java 7에 들어온 try-with-resources는 지금까지 손으로 쓴 정리 코드를 컴파일러가 대신 만들게 한다. 괄호 안에 선언한 자원은 try 블록이 끝나면 자동으로 닫힌다. 자원의 타입은 <code>AutoCloseable</code>의 하위 타입이어야 하고, 그렇지 않으면 컴파일 오류다.</p>
+<pre><code class="language-java">package res;
+
+public class CleanupV4 {
+    public static void main(String[] args) {
+        try {
+            logic();
+        } catch (Exception e) {
+            System.out.println("잡은 예외: " + e);
+            for (Throwable s : e.getSuppressed()) {
+                System.out.println("  억제된 예외: " + s);
+            }
+        }
+    }
+
+    static void logic() throws UseException, CloseFailException {
+        try (Handle a = new Handle("a", false);
+             Handle b = new Handle("b", true)) {
+            a.use();
+            b.useFail();
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">a 열기
+b 열기
+a 사용
+b 사용 중 예외
+b 닫기 중 예외
+a 닫기
+잡은 예외: res.UseException: b 사용 실패
+  억제된 예외: res.CloseFailException: b 닫기 실패</code></pre>
+<p>앞의 모든 문제가 해결됐다. 변수는 try 문 안에서 선언되고, b와 a가 역순으로 닫히고, b의 닫기 실패가 a의 닫기를 막지 않았다. 호출자는 핵심 예외 <code>UseException</code>을 받았고, 정리 중 예외는 버려지지 않고 그 예외 객체 안에 억제된 예외(suppressed exception)로 붙어 왔다. <code>Throwable.getSuppressed()</code>로 꺼낼 수 있고, 스택 트레이스를 출력하면 <code>Suppressed:</code>로 함께 찍힌다. 두 자원이 모두 닫기에 실패하는 경우를 스택 트레이스로 보자.</p>
+<pre><code class="language-java">package res;
+
+public class CleanupV4Trace {
+    public static void main(String[] args) throws Exception {
+        try (Handle a = new Handle("a", true);
+             Handle b = new Handle("b", true)) {
+            b.useFail();
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">a 열기
+b 열기
+b 사용 중 예외
+b 닫기 중 예외
+a 닫기 중 예외
+Exception in thread "main" res.UseException: b 사용 실패
+	at res.Handle.useFail(Handle.java:19)
+	at res.CleanupV4Trace.main(CleanupV4Trace.java:7)
+	Suppressed: res.CloseFailException: b 닫기 실패
+		at res.Handle.close(Handle.java:26)
+		at res.CleanupV4Trace.main(CleanupV4Trace.java:5)
+	Suppressed: res.CloseFailException: a 닫기 실패
+		at res.Handle.close(Handle.java:26)
+		at res.CleanupV4Trace.main(CleanupV4Trace.java:5)</code></pre>
+<p>핵심 예외 하나에 정리 중 예외 두 개가 닫힌 순서대로 매달렸다. 억제된 예외의 호출 위치가 <code>CleanupV4Trace.java:5</code>, 즉 <code>try (</code>가 있는 줄로 찍힌 점도 보자. <code>close()</code> 호출은 우리가 쓴 코드가 아니라 컴파일러가 만들어 넣은 코드이고, 그 코드에 try 문의 줄 번호가 붙은 것이다.</p>
+
+<h4>언어 명세가 정한 번역</h4>
+<p>try-with-resources는 JLS 14.20.3절에 정의되어 있고, 그 의미를 일반 try-catch-finally로 번역하는 방식으로 규정한다. 자원이 하나이고 catch나 finally가 없는 "기본(basic)" 형태에 대한 명세의 번역을 우리 예제의 이름으로 옮기면 이런 모양이다. <code>primary</code>와 <code>t</code>, <code>s</code>는 명세에서 컴파일러가 만든 이름으로 표시한 변수들이다.</p>
+<pre><code class="language-java">{
+    final Handle a = new Handle("a", false);
+    Throwable primary = null;
+    try {
+        a.use();                         // 원래의 try 블록
+    } catch (Throwable t) {
+        primary = t;                     // 본문에서 난 예외를 기억하고
+        throw t;                         // 그대로 다시 던진다
+    } finally {
+        if (a != null) {                 // null 자원은 닫지 않는다
+            if (primary != null) {
+                try {
+                    a.close();
+                } catch (Throwable s) {
+                    primary.addSuppressed(s);   // 정리 중 예외는 핵심 예외에 매단다
+                }
+            } else {
+                a.close();               // 본문이 정상이면 close의 예외가 그대로 나간다
+            }
+        }
+    }
+}</code></pre>
+<p>이 번역에서 규칙이 모두 읽힌다. 자원 변수는 암묵적으로 <code>final</code>이다. 본문에서 예외가 났으면 <code>close()</code>의 예외는 핵심 예외의 <code>addSuppressed</code>로 들어가고, 본문이 정상으로 끝났으면 <code>close()</code>의 예외가 그대로 try 문의 결과가 된다. 자원이 여러 개면 명세는 "자원이 n개인 문장을 자원 n-1개짜리 try-with-resources를 품은 문장으로 번역하고, 이를 반복한다"고 정의한다. 첫 번째 자원의 try 블록 안에 두 번째 자원의 try 문이 들어가는 중첩 구조이므로, 안쪽(나중) 자원이 먼저 닫히고 바깥쪽(먼저) 자원이 나중에 닫힌다. 역순 정리는 이 중첩에서 자연스럽게 나온다.</p>
+<p>명세는 경계 조건도 정해 둔다. 자원 초기화가 도중에 실패하면 그때까지 초기화된 자원만 닫힌다. 본문은 정상으로 끝났는데 여러 자원이 닫기에 실패하면, 가장 오른쪽(가장 나중에 선언된) 자원의 예외가 던져지고 나머지가 그 예외의 억제된 예외가 된다. 직접 확인한 두 경우다.</p>
+<pre data-label="a, b, c 중 b와 c가 닫기 실패, 본문은 정상"><code class="language-text">a 열기
+b 열기
+c 열기
+본문 정상 종료
+c 닫기 중 예외
+b 닫기 중 예외
+a 닫기
+잡은 예외: c 닫기 실패
+  억제된 예외: b 닫기 실패</code></pre>
+<pre data-label="a는 열렸고 b의 초기화 식이 예외를 던짐, a는 닫기 실패"><code class="language-text">a 열기
+a 닫기 중 예외
+잡은 예외: b 열기 실패
+  억제된 예외: a 닫기 실패</code></pre>
+<p>catch나 finally가 붙은 "확장(extended)" 형태는 기본 형태를 바깥 try로 한 번 더 감싼 것으로 번역된다. 그래서 catch와 finally가 실행될 때는 자원이 이미 모두 닫혀 있다. catch 블록에서 자원을 다시 쓰려는 코드가 동작하지 않는 이유다.</p>
+<pre><code class="language-java">package res;
+
+public class Order {
+    public static void main(String[] args) {
+        try (Handle a = new Handle("a", false);
+             Handle n = null;
+             Handle b = new Handle("b", false)) {
+            System.out.println("try 블록");
+            throw new IllegalStateException("본문 예외");
+        } catch (Exception e) {
+            System.out.println("catch: " + e.getMessage());
+        } finally {
+            System.out.println("finally");
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">a 열기
+b 열기
+try 블록
+b 닫기
+a 닫기
+catch: 본문 예외
+finally</code></pre>
+<p>닫기가 catch보다 먼저 일어났고, <code>null</code>로 초기화된 자원 <code>n</code>은 닫기를 시도하지 않고 건너뛰었다.</p>
+<x-visual id="java-adv2-07-twr-close-order" title="try-with-resources의 중첩 번역과 닫는 순서, 억제된 예외" kind="순서도" ratio="16:9">
+<x-hint>자원 a, b를 선언한 try-with-resources가 중첩된 try로 번역되어 b, a 순서로 닫히고, 닫기 중 예외가 핵심 예외에 suppressed로 매달리는 흐름을 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 흐르는 순서도. 맨 왼쪽에 바깥 상자 "try (a)"가 있고 그 안에 안쪽 상자 "try (b)", 그 안에 가장 안쪽 상자 "본문"이 있다(상자 세 개가 겹겹이 중첩된 모양). 본문 상자에서 빨간 번개 아이콘과 라벨 "핵심 예외 UseException". 오른쪽으로 화살표가 나가 "① b.close()" 원형 노드, 이어서 "② a.close()" 원형 노드로 이어진다. ① 노드에서 작은 주황 번개 "CloseFailException"이 아래로 떨어져 오른쪽 끝의 큰 예외 카드 "UseException"의 하단 칸 "Suppressed"에 붙는 곡선 화살표. 오른쪽 끝 카드 위에 "호출자에게 전달". 아래쪽에 작은 글씨 "나중에 연 자원부터 닫는다". 남색, 주황, 빨강 포인트, 흰 배경.</x-prompt>
+<x-caption>자원이 여러 개면 중첩된 try로 번역되므로 역순으로 닫히고, 닫기 중 예외는 핵심 예외에 매달린다.</x-caption>
+</x-visual>
+
+<h4>javac가 실제로 만든 바이트코드</h4>
+<p>명세는 의미를 정할 뿐 컴파일러가 똑같은 코드를 만들라고 하지는 않는다. OpenJDK 21의 javac가 실제로 만든 것을 <code>javap -c</code>로 보자. 자원 하나짜리 메서드다.</p>
+<pre><code class="language-java">static void run() throws Exception {
+    try (Handle a = new Handle("a", false)) {
+        a.use();
+    }
+}</code></pre>
+<pre data-label="javap -c -p 출력"><code class="language-text">  static void run() throws java.lang.Exception;
+    Code:
+       0: new           #7                  // class res/Handle
+       3: dup
+       4: ldc           #9                  // String a
+       6: iconst_0
+       7: invokespecial #11                 // Method res/Handle."<init>":(Ljava/lang/String;Z)V
+      10: astore_0
+      11: aload_0
+      12: invokevirtual #14                 // Method res/Handle.use:()V
+      15: aload_0
+      16: invokevirtual #17                 // Method res/Handle.close:()V
+      19: goto          38
+      22: astore_1
+      23: aload_0
+      24: invokevirtual #17                 // Method res/Handle.close:()V
+      27: goto          36
+      30: astore_2
+      31: aload_1
+      32: aload_2
+      33: invokevirtual #22                 // Method java/lang/Throwable.addSuppressed:(Ljava/lang/Throwable;)V
+      36: aload_1
+      37: athrow
+      38: return
+    Exception table:
+       from    to  target type
+          11    15    22   Class java/lang/Throwable
+          23    27    30   Class java/lang/Throwable</code></pre>
+<p>읽는 법은 이렇다. 0~10은 자원을 만들어 지역 변수 0번에 저장한다. 11~12가 본문 <code>a.use()</code>다. 본문이 정상으로 끝나면 15~19에서 <code>close()</code>를 부르고 38의 <code>return</code>으로 간다. 이 경로의 <code>close()</code>는 예외 테이블의 어떤 범위에도 들어 있지 않으므로, 여기서 난 예외는 그대로 메서드 밖으로 나간다. 명세의 "본문이 정상이면 close의 예외가 그대로 나간다"에 해당한다.</p>
+<p>예외 테이블의 첫 줄은 "11~15 사이(본문)에서 어떤 <code>Throwable</code>이든 나면 22로 가라"는 뜻이다. 22에서 예외를 지역 변수 1번(명세의 <code>primary</code>)에 저장하고 23~24에서 <code>close()</code>를 부른다. 예외 테이블 둘째 줄이 이 <code>close()</code> 호출(23~27)을 감싼다. 닫기가 성공하면 27에서 36으로 뛰어 저장해 둔 핵심 예외를 <code>athrow</code>로 다시 던진다. 닫기가 실패하면 30으로 가서 그 예외를 지역 변수 2번에 저장하고, 31~33에서 <code>primary.addSuppressed(그 예외)</code>를 부른 뒤 36~37에서 핵심 예외를 던진다. finally가 바이트코드에 따로 있는 것이 아니라 정상 경로와 예외 경로에 정리 코드가 복제되어 들어가 있다는 점도 볼 수 있다. javac는 finally 블록을 이렇게 각 경로에 복사해 넣는다.</p>
+<p>명세의 번역에 있던 <code>if (a != null)</code> 검사는 이 바이트코드에 없다. 자원이 <code>new</code> 식으로 만들어졌으니 null일 수 없다는 것을 javac가 알기 때문이다. 자원을 메서드 호출 결과로 받도록 바꾸면 검사가 생긴다.</p>
+<pre data-label="자원을 open() 메서드의 반환값으로 받을 때 (일부)"><code class="language-text">       0: invokestatic  #14                 // Method open:()Lres/Handle;
+       3: astore_0
+       4: aload_0
+       5: invokevirtual #20                 // Method res/Handle.use:()V
+       8: aload_0
+       9: ifnull        39
+      12: aload_0
+      13: invokevirtual #23                 // Method res/Handle.close:()V</code></pre>
+<p><code>ifnull</code>이 명세의 null 검사다. 같은 의미를 지키면서 필요 없는 검사를 빼는 것은 컴파일러의 자유이고, 이 생략은 OpenJDK 21의 javac에서 관찰한 결과다.</p>
+
+<h4>이미 있는 변수를 자원으로 쓰기, 그리고 AutoCloseable과 Closeable</h4>
+<p>Java 9부터는 괄호 안에서 새 변수를 선언하지 않고 이미 있는 변수를 자원으로 쓸 수 있다. JLS 14.20.3은 그 변수가 <code>final</code>이거나 사실상 final(effectively final)이어야 하고 try 문 전에 확정 할당되어 있어야 한다고 정한다. 필드도 쓸 수 있지만 <code>final</code> 필드여야 한다. 필드에는 "사실상 final"이라는 개념이 없기 때문이다. <code>final</code>이 아닌 필드를 넣으면 javac는 다음 오류를 낸다.</p>
+<pre data-label="컴파일 오류"><code class="language-text">res/FieldTwr.java:14: error: variable notFinal used as a try-with-resources resource neither final nor effectively final
+        try (notFinal) {
+             ^
+1 error</code></pre>
+<p>연결당 스레드 서버의 <code>Session</code>은 소켓을 <code>final</code> 필드로 들고 있으므로 이 형태를 쓸 수 있다. 실제로 세션에 적용하는 것은 다음 회차에서 한다.</p>
+<p>자원 인터페이스는 둘이다. <code>java.io.Closeable</code>은 Java 5부터 있던 I/O용 인터페이스이고, try-with-resources와 함께 Java 7에 들어온 <code>java.lang.AutoCloseable</code>이 그 상위 인터페이스가 되었다. 둘의 <code>close()</code> 계약은 다르다. <code>Closeable.close()</code>의 Javadoc은 이미 닫힌 스트림에 다시 호출하면 아무 효과가 없어야 한다고 적는다. 즉 멱등(idempotent)이어야 한다. <code>AutoCloseable.close()</code>는 멱등이 요구되지 않지만 Javadoc이 멱등으로 만들 것을 강하게 권한다. 또 <code>Closeable.close()</code>는 <code>IOException</code>만 던질 수 있고, <code>AutoCloseable.close()</code>는 <code>Exception</code>을 던질 수 있다.</p>
+<p>이 멱등성이 소켓 정리에서 중요하다. 소켓과 그 스트림의 Javadoc을 모으면 이렇다. <code>Socket.getInputStream()</code>과 <code>getOutputStream()</code>이 돌려준 스트림을 닫으면 연결된 소켓이 닫힌다. <code>Socket.close()</code>는 소켓의 입력 스트림과 출력 스트림도 닫는다. <code>DataOutputStream</code>의 부모인 <code>FilterOutputStream.close()</code>는 자기 <code>flush()</code>를 부른 다음 감싸고 있는 하위 스트림의 <code>close()</code>를 부른다. 따라서 이번 회차의 예제처럼 <code>input.close()</code>, <code>output.close()</code>, <code>socket.close()</code>를 차례로 부르면, 실제로 소켓은 첫 번째 호출에서 이미 닫히고 나머지 호출은 이미 닫힌 것을 다시 닫는 호출이 된다. 이것이 문제없이 끝나는 것은 각 <code>close()</code>가 이미 닫힌 상태를 검사하고 그냥 반환하기 때문이다(<code>Socket.close()</code>의 구현은 상태 플래그에 CLOSED가 이미 켜져 있으면 아무것도 하지 않는다). 래퍼를 닫으면 안쪽이 닫히고, 같은 것을 두 번 닫아도 안전하다는 두 성질 덕분에 "만든 것을 모두 역순으로 닫는다"는 단순한 규칙을 그대로 따를 수 있다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>소켓 프로그램의 모든 동작은 두 층으로 나뉜다. 연결 수립, 버퍼링, 재전송은 커널이 하고, 자바 코드는 시스템 콜로 그 결과를 꺼내거나 넣을 뿐이다. 그래서 connect와 write는 상대 프로그램이 아무것도 하지 않아도 성공할 수 있고, accept와 read는 커널에 무언가 쌓일 때까지 스레드를 묶어 둔다. 커널 자원은 GC가 아니라 close()로 반납되므로, 예외 경로까지 포함해 확실히 닫는 일은 try-with-resources에 맡긴다. 이 문법은 역순 정리, null 건너뛰기, 핵심 예외 보존과 억제된 예외 기록을 언어 명세 수준에서 보장한다.</p></aside>
+
+<h3>흔한 오해와 함정</h3>
+<h4>"accept()가 연결을 맺는다"</h4>
+<p>연결은 서버 커널이 맺는다. <code>accept()</code>는 완성된 연결을 꺼내 파일 디스크립터를 붙여 줄 뿐이다. 이 오해가 있으면 "서버가 바빠서 accept를 못 하면 클라이언트의 connect가 실패하겠지"라고 생각하게 되는데, 실제로는 connect도 write도 성공하고 클라이언트는 응답을 기다리며 멈춘다. 장애 상황에서는 "연결은 되는데 응답이 없다"로 나타난다. 그래서 클라이언트에는 연결 타임아웃과 별개로 읽기 타임아웃이 필요하다(다음 회차의 주제다).</p>
+<h4>"write가 반환되면 상대가 받았다"</h4>
+<p><code>write</code>의 반환은 데이터가 내 커널의 송신 버퍼에 들어갔다는 뜻일 뿐이다. 상대 커널에 도착했는지, 상대 프로그램이 읽었는지는 알 수 없다. 위의 B 클라이언트는 쓰기에 성공했지만 그 메시지는 한 번도 읽히지 않고 버려졌다. 상대가 처리했는지 알아야 한다면 애플리케이션 수준의 응답이 필요하다. 에코 서버의 응답, HTTP의 응답 코드가 그 역할을 한다.</p>
+<h4>"read(byte[]) 한 번이 메시지 하나다"</h4>
+<p>TCP는 바이트 스트림이다. 보낸 단위와 받는 단위는 같지 않을 수 있다. 메시지의 경계는 애플리케이션 프로토콜이 정해야 한다. <code>writeUTF</code>/<code>readUTF</code>는 길이 접두로, 텍스트 프로토콜은 줄바꿈 같은 구분자로, HTTP는 헤더의 길이 정보나 빈 줄로 경계를 정한다. 같은 컴퓨터 안의 테스트에서 우연히 맞는다고 안심하면 안 된다.</p>
+<h4>"RUNNABLE이면 일하고 있는 스레드다"</h4>
+<p>소켓 I/O에서 멈춘 스레드도 RUNNABLE이다. 스레드 덤프에서 <code>SocketDispatcher.read0</code>나 <code>Net.accept</code> 같은 네이티브 메서드 위에 있는 RUNNABLE 스레드는 대부분 커널 안에서 잠들어 있다. CPU 사용률이 높은 원인을 찾을 때는 이런 스레드를 걸러 내고 봐야 한다.</p>
+<h4>"finally에 close를 넣으면 안전하다"</h4>
+<p>finally 안에서도 예외는 나머지 문장을 건너뛰고, finally가 던진 예외는 try 블록의 예외를 덮어쓴다. 자원이 둘 이상이면 손으로 쓴 finally는 거의 항상 어딘가 빈틈이 생긴다. 자원 정리는 try-with-resources로 쓰고, 정리할 객체가 <code>AutoCloseable</code>이 아니라면 그것을 구현한 작은 래퍼를 만드는 편이 낫다.</p>
+
+<h3>다른 주제와의 연결</h3>
+<p>여기서 본 구조는 앞으로 계속 다시 나온다. 다음 회차는 이번에 만든 연결당 스레드 서버에 try-with-resources를 적용하고, 서버를 끌 때 열린 세션을 모두 닫는 방법(셧다운 훅)과 연결 거부, 타임아웃, FIN과 RST로 인한 정상 종료·강제 종료를 다룬다. 이어지는 채팅 프로그램은 세션들이 서로의 소켓에 메시지를 써야 하므로, 고급 1편의 동시성 도구가 공유 상태를 지키는 데 다시 쓰인다. HTTP 서버를 직접 만드는 회차에서는 <code>readUTF</code>의 길이 접두 대신 HTTP 메시지의 줄바꿈과 헤더로 경계를 찾는다.</p>
+<p>로드맵의 앞 강의와도 이어진다. 스프링 MVC가 그 위에서 도는 서블릿 컨테이너는 결국 리스닝 소켓에서 연결을 받아 스레드 풀의 스레드에 요청 처리를 맡기는 프로그램이다. 데이터베이스 커넥션 풀이 있는 이유도 이번 회차의 실험으로 설명된다. 연결 하나를 맺는 데 핸드셰이크와 커널 자원이 들고, 연결을 닫지 않으면 클라이언트 쪽에서는 임시 포트와 파일 디스크립터가, 서버 쪽에서는 CLOSE_WAIT 연결이 쌓인다. JDBC의 <code>Connection</code>, <code>Statement</code>, <code>ResultSet</code>이 모두 <code>AutoCloseable</code>이고 try-with-resources로 닫는 것이 권장되는 이유가 여기에 있다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>소켓과 TCP 연결</dt><dd>TCP 연결은 (내 IP, 내 포트, 상대 IP, 상대 포트)로 구별된다. 클라이언트 포트는 커널이 임시 포트 범위에서 고르고, 서버는 포트 하나로 여러 연결을 받는다.</dd>
+<dt>connect와 3-way handshake</dt><dd>new Socket(host, port)은 이름 해석 뒤 connect 시스템 콜을 부르고, 커널끼리 SYN, SYN+ACK, ACK를 주고받아 연결이 완성되면 반환된다.</dd>
+<dt>리스닝 소켓과 accept 큐</dt><dd>ServerSocket은 socket, bind, listen을 거친 LISTEN 상태의 소켓이다. 커널이 완성한 연결은 accept 큐에 쌓이고, accept()는 그중 하나를 꺼내 새 파일 디스크립터를 가진 Socket으로 준다.</dd>
+<dt>backlog</dt><dd>accept되지 않은 연결이 쌓일 수 있는 큐 길이의 요청값이다. 기본 50이지만 실제 의미와 상한은 운영체제가 정하며, 넘치면 거부되거나 무시된다.</dd>
+<dt>블로킹 I/O와 스레드 상태</dt><dd>accept와 read는 커널에 무언가 쌓일 때까지 스레드를 묶는다. 이때 자바 스레드 상태는 RUNNABLE이고, 플랫폼 스레드는 인터럽트가 아니라 소켓 close로 깨운다.</dd>
+<dt>메시지 경계</dt><dd>TCP는 바이트 스트림이라 경계가 없다. writeUTF는 2바이트 길이 접두를 붙이고, readUTF는 readFully 루프로 정확히 그만큼 읽는다.</dd>
+<dt>연결당 스레드</dt><dd>accept 스레드가 연결마다 세션 스레드를 만든다. 구현이 단순한 대신 연결마다 스택과 파일 디스크립터가 들고, 스레드 풀이나 가상 스레드로 비용을 조절한다.</dd>
+<dt>CLOSE_WAIT</dt><dd>상대가 FIN을 보냈는데 이쪽 애플리케이션이 close하지 않은 상태다. 늘어나면 예외 경로에서 소켓을 닫지 않는 버그를 의심한다.</dd>
+<dt>소켓 대기를 깨우는 길</dt><dd>OpenJDK 21에서 플랫폼 스레드는 블로킹 fd의 read(2)/accept(2) 안에서 잠들어 interrupt가 닿지 않고, close가 dup2와 신호로 EINTR을 일으켜 깨운다. 가상 스레드는 논블로킹 fd와 Poller(kqueue/epoll)로 park하므로 interrupt나 close가 unpark로 깨운다.</dd>
+<dt>try-with-resources</dt><dd>자원을 역순으로 닫고, null 자원은 건너뛰고, 본문 예외를 보존하며 정리 중 예외를 addSuppressed로 매다는 try-catch-finally로 번역된다.</dd>
+</x-summary>
+
+<x-review>
+<p>운영 중인 서버에서 "가끔 응답이 없다"는 신고가 들어왔을 때 이번 회차의 지식은 증상을 층별로 나누는 데 쓰인다. 클라이언트의 connect가 실패했는가, connect는 됐는데 응답이 없는가. 후자라면 연결은 커널이 받아 줬는데 애플리케이션이 accept를 못 하고 있거나(accept 스레드가 막혔거나 스레드 풀이 바닥났다), accept는 했는데 읽고 쓰는 스레드가 다른 곳에 묶여 있는 경우다. 스레드 덤프에서 소켓 읽기의 네이티브 메서드에 걸린 RUNNABLE 스레드가 몇 개인지, <code>ss</code>나 <code>netstat</code>에서 리스닝 소켓의 대기 큐와 ESTABLISHED 연결 수가 어떤지를 보면 어느 층의 문제인지 좁힐 수 있다.</p>
+<p>CLOSE_WAIT가 쌓이는 것은 거의 언제나 코드의 문제이고, 운영체제 설정을 바꿔 해결할 일이 아니다. 상대가 이미 FIN을 보냈으니 이쪽이 close만 하면 끝나는 상태이기 때문이다. 예외가 난 경로, 특히 스레드의 <code>run()</code>에서 런타임 예외로 감싸 던지는 경로에서 close가 빠지지 않았는지 본다. 이번 회차의 <code>Session</code>이 정확히 그 모양이었다. 같은 이유로 "Too many open files"를 만났을 때 한도부터 올리는 것은 누수를 늦출 뿐이다. 한도를 올려야 할 때(연결 수 자체가 많은 서버)와 누수를 고쳐야 할 때를 구분하려면 시간에 따라 디스크립터 수가 계속 오르는지를 본다.</p>
+<p>연결당 스레드 모델을 택할지는 동시 연결 수와 연결의 성격이 정한다. 연결 수가 수백 개 수준이고 각 연결이 대부분 일을 하고 있다면 플랫폼 스레드 풀로 충분하다. 연결이 수만 개이고 대부분 놀고 있다면(채팅, 알림처럼) 플랫폼 스레드를 연결마다 두는 것은 스택과 스레드 수 한도 때문에 맞지 않고, 가상 스레드나 논블로킹 I/O를 검토한다. 어느 쪽을 택하든 자원 정리의 규칙은 같다. 연 것은 예외 경로까지 포함해 반드시 닫는다.</p>
+</x-review>
+
+<x-practice>
+<li><code>AcceptLater</code>를 고쳐 서버가 <code>accept()</code>를 영영 호출하지 않게 했다. 클라이언트의 connect, writeUTF, readUTF는 각각 어떻게 되는가? 이때 <code>lsof</code>로 서버 프로세스의 파일 디스크립터를 보면 서버 쪽 연결이 보이는가, <code>netstat</code>에서는 보이는가?</li>
+<li>다음 정리 코드가 있다. <code>try { a = open("a"); b = open("b"); work(a, b); } finally { a.close(); b.close(); }</code> (a, b는 try 밖에서 null로 선언). <code>open("b")</code>가 예외를 던지는 경우와, <code>work</code>가 예외를 던지고 <code>a.close()</code>도 예외를 던지는 경우 각각 무엇이 잘못되는지 설명하라.</li>
+<li>try-with-resources에 자원 a, b, c를 이 순서로 선언했다. 본문은 정상으로 끝났고 b와 c의 close가 예외를 던진다. 호출자가 받는 예외와 그 예외의 억제된 예외는 무엇인가? 닫기 메시지는 어떤 순서로 찍히는가?</li>
+<li>어떤 개발자가 클라이언트가 보낸 메시지를 <code>byte[] buf = new byte[1024]; int n = in.read(buf); String msg = new String(buf, 0, n, UTF_8);</code>로 읽었다. 로컬 테스트에서는 항상 맞았는데 운영 환경에서 가끔 메시지가 잘리거나 두 개가 붙는다. 원인과 고치는 방법을 설명하라.</li>
+<li>스레드 덤프에서 <code>RUNNABLE</code> 상태의 스레드 500개가 모두 <code>sun.nio.ch.SocketDispatcher.read0</code>에 있다. 그런데 CPU 사용률은 거의 0이다. 이 상황을 설명하고, 이 서버가 동시 연결을 더 받으려 할 때 먼저 닿을 수 있는 한계 두 가지를 들어라.</li>
+</x-practice>
+
+<x-answer>
+<p>1. connect는 성공한다. 핸드셰이크는 서버 커널이 끝내고 연결을 accept 큐에 넣는다. writeUTF도 성공한다. 데이터는 클라이언트의 송신 버퍼로 복사된 뒤 서버 커널의 그 연결 수신 버퍼에 쌓인다. readUTF는 응답이 오지 않으므로 무한히 기다린다(읽기 타임아웃을 설정하지 않았으므로). 이번 회차의 관찰대로 <code>lsof</code>에는 서버 쪽 연결이 보이지 않는다. accept가 파일 디스크립터를 붙여 주지 않았기 때문이다. <code>netstat</code>은 커널의 연결 표를 보므로 서버 쪽 끝이 ESTABLISHED로 보인다.</p>
+<p>2. <code>open("b")</code>가 실패하면 b는 null이므로, finally의 <code>a.close()</code>는 성공하더라도 <code>b.close()</code>에서 NullPointerException이 나고 이 NPE가 원래의 open 예외를 덮어쓴다. 두 번째 경우에는 <code>a.close()</code>의 예외가 finally를 끝내 버리므로 <code>b.close()</code>가 실행되지 않아 b가 새고, 호출자는 work의 예외가 아니라 a의 close 예외를 받는다. 또 a를 먼저 닫는 순서 자체도 나중에 연 b가 a에 기대는 경우에 문제가 된다. 역순으로, null 검사와 함께, 각 close를 독립적으로 처리해야 하며, try-with-resources가 이것을 모두 해 준다.</p>
+<p>3. 닫기는 역순이므로 "c 닫기 중 예외", "b 닫기 중 예외", "a 닫기" 순서로 찍힌다. 본문이 정상이었으므로 핵심 예외가 없고, JLS 14.20.3.1에 따라 가장 오른쪽 자원인 c의 close 예외가 던져지며 b의 close 예외가 그 억제된 예외가 된다. 중첩 번역으로 보면, 가장 안쪽 try(c)가 c의 예외로 끝나고, 그 예외가 바깥 try(b)의 입장에서는 본문 예외가 되므로 b의 예외가 그것에 addSuppressed되고, a는 정상으로 닫혀 그 예외가 그대로 전파된다.</p>
+<p>4. TCP는 바이트 스트림이라 한 번의 read가 상대의 한 번의 write와 대응하지 않는다. read는 그 순간 수신 버퍼에 있는 만큼(요청한 길이 이하)만 돌려주므로 메시지 일부만 읽힐 수도 있고, 두 메시지가 버퍼에 함께 있으면 붙어서 읽힐 수도 있다. 로컬에서는 데이터가 거의 즉시 한꺼번에 도착해 우연히 맞았을 뿐이다. 메시지 경계를 프로토콜로 정해야 한다. 길이 접두(writeUTF/readUTF, 또는 writeInt로 길이를 쓰고 readFully로 정확히 그만큼 읽기)나 구분자(줄바꿈을 쓰고 BufferedReader.readLine으로 읽기)를 쓴다. UTF-8 문자열을 바이트 단위로 자르면 한 글자가 둘로 쪼개질 수 있다는 것도 함께 문제가 된다.</p>
+<p>5. 소켓 읽기는 네이티브 코드의 read 시스템 콜에서 기다리므로 JVM은 그 스레드를 RUNNABLE로 보고하지만, 실제로는 커널 안에서 데이터가 오기를 기다리며 잠들어 있다. CPU를 쓰지 않으니 사용률이 낮다. 연결당 스레드 구조라면 연결 500개가 대부분 놀고 있는 것이다. 더 많은 연결을 받으려 할 때 먼저 닿을 수 있는 한계는 스레드 수(스레드마다 -Xss만큼의 스택 예약, 운영체제의 스레드 수 한도)와 프로세스의 파일 디스크립터 한도("Too many open files")다. 스레드 풀을 쓴다면 풀 크기가 먼저 한계가 되어 새 연결이 대기한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>서버가 <code>new ServerSocket(7777)</code>까지만 실행하고 아직 <code>accept()</code>를 호출하지 않았다. 이때 클라이언트가 <code>new Socket("localhost", 7777)</code>을 실행하면 어떻게 되는가?</q>
+<o>서버가 accept()를 호출할 때까지 클라이언트의 생성자가 반환되지 않는다.</o>
+<o>서버 커널이 핸드셰이크를 끝내 연결을 accept 큐에 넣으므로 생성자는 곧바로 반환된다.</o>
+<o>서버 프로그램이 연결을 받을 준비가 안 되었으므로 Connection refused 예외가 난다.</o>
+<o>연결은 되지만 accept 전에는 데이터를 보낼 수 없어서 write가 예외를 던진다.</o>
+<why>listen까지 마친 소켓에 들어온 연결 요청은 서버 커널이 처리한다. SYN에 SYN+ACK로 답하고 ACK를 받으면 연결이 완성되어 accept 큐에 들어가므로 클라이언트의 connect는 accept와 무관하게 반환된다. 데이터도 그 연결의 수신 버퍼에 쌓이므로 write도 성공한다. Connection refused는 그 포트에 리스닝 소켓이 없을 때(또는 큐가 넘친 일부 경우) 나는 결과다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>backlog에 대한 설명으로 옳은 것은?</q>
+<o>서버가 동시에 처리할 수 있는 최대 연결 수다. 50이면 51번째 클라이언트는 세션 스레드를 받지 못한다.</o>
+<o>서버가 accept할 수 있는 연결의 총 개수다. 다 쓰면 ServerSocket을 다시 만들어야 한다.</o>
+<o>아직 accept되지 않은 연결이 쌓일 수 있는 큐 길이의 요청값이며, 실제 의미와 상한은 운영체제가 정한다.</o>
+<o>클라이언트 하나가 보낼 수 있는 메시지 수의 상한이다.</o>
+<why>accept된 연결은 큐에서 빠지므로 backlog와 무관하다. backlog는 커널이 완성했지만 프로그램이 아직 꺼내 가지 않은 연결의 대기열 길이를 요청하는 값이다. ServerSocket Javadoc은 정확한 의미가 구현에 따라 다르다고 하고, 리눅스는 somaxconn으로 상한을 둔다. 이번 실험의 macOS에서도 backlog 3에 4개의 연결이 성공했다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>플랫폼 스레드가 <code>socket.getInputStream()</code>을 감싼 <code>DataInputStream.readUTF()</code>에서 데이터를 기다리고 있다. 이 스레드에 대한 설명으로 옳은 것은?</q>
+<o>Thread.getState()는 RUNNABLE을 돌려주고, 다른 스레드가 그 소켓을 close하면 SocketException으로 빠져나온다.</o>
+<o>Thread.getState()는 WAITING을 돌려주고, interrupt()를 호출하면 InterruptedException으로 빠져나온다.</o>
+<o>Thread.getState()는 BLOCKED를 돌려주고, 모니터 락을 얻으면 깨어난다.</o>
+<o>스레드가 바쁘게 반복하며 데이터를 확인하므로 CPU를 계속 사용한다.</o>
+<why>소켓 읽기는 네이티브 코드의 시스템 콜에서 기다리므로 JVM은 RUNNABLE로 보고한다. 이번 실험에서 accept 중인 스레드도 RUNNABLE이었고 interrupt로는 깨어나지 않았으며, 소켓을 닫자 SocketException: Socket closed로 빠져나왔다. 기다리는 동안 스레드는 커널 안에서 잠들어 있으므로 CPU를 쓰지 않는다. 인터럽트로 깨어나는 것은 채널에 연결된 소켓이거나 가상 스레드인 경우다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>try (Handle a = ...; Handle b = ...) { 본문 }</code>에서 본문이 예외 E를 던졌고, b의 close가 예외 X를, a의 close가 예외 Y를 던졌다. 호출자가 받는 것은?</q>
+<o>Y. 가장 마지막에 난 예외가 최종 결과가 된다.</o>
+<o>X. 가장 먼저 닫힌 자원의 예외가 우선한다.</o>
+<o>E만 전달되고 X와 Y는 버려진다.</o>
+<o>E가 전달되고, X와 Y가 그 순서로 E의 억제된 예외로 붙는다.</o>
+<why>JLS 14.20.3은 본문이 예외로 끝나면 그 예외가 try 문의 결과가 되고, 자원을 닫는 중의 예외는 그 예외의 suppressed 목록에 더해진다고 정한다. 자원은 역순(b, a)으로 닫히므로 X, Y 순서로 붙는다. 실험의 CleanupV4Trace 출력에서도 b의 예외, a의 예외 순서로 Suppressed가 찍혔다. 손으로 쓴 finally라면 Y가 E를 덮어써서 첫 번째 보기와 비슷한 결과가 된다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>서버에서 <code>netstat</code>을 보니 서버 포트 쪽 연결 수백 개가 CLOSE_WAIT 상태로 쌓여 있다. 가장 그럴듯한 원인은?</q>
+<o>클라이언트가 FIN에 응답하지 않아 서버가 상대의 확인을 기다리고 있다.</o>
+<o>클라이언트는 연결을 닫았는데 서버 애플리케이션이 그 소켓에 close()를 호출하지 않았다.</o>
+<o>backlog가 너무 작아 연결이 accept 큐에 들어가지 못했다.</o>
+<o>서버가 close()를 너무 빨리 호출해 커널이 연결을 정리하지 못했다.</o>
+<why>RFC 9293의 CLOSE-WAIT는 상대의 종료 요청(FIN)을 받은 뒤 로컬 사용자의 종료 요청을 기다리는 상태다. 상대는 이미 끝났고 이쪽 애플리케이션이 close만 하면 되는데 하지 않은 것이다. 이번 회차의 Session이 예외 경로에서 close를 건너뛰었을 때 정확히 이 상태가 관찰됐다. 상대의 FIN을 기다리는 쪽은 FIN_WAIT_2로 보인다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>리스닝 소켓(listening socket)</dt><dd>bind와 listen을 마쳐 LISTEN 상태가 된 소켓. 데이터를 주고받지 않고 연결 요청을 받는 창구 역할만 한다. 자바에서는 ServerSocket이 감싼다.</dd>
+<dt>accept 큐(accept queue)</dt><dd>커널이 핸드셰이크를 끝낸 연결을 애플리케이션이 accept로 꺼내 갈 때까지 보관하는 대기열. 길이는 backlog와 운영체제 설정이 정한다.</dd>
+<dt>임시 포트(ephemeral port)</dt><dd>클라이언트가 포트를 지정하지 않을 때 커널이 정해진 범위에서 골라 붙이는 포트. 이 실험의 macOS에서 범위는 49152~65535였다.</dd>
+<dt>파일 디스크립터(file descriptor)</dt><dd>프로세스가 연 파일, 소켓 등을 가리키는 운영체제의 번호. 프로세스마다 열 수 있는 개수에 한도가 있고 close로 반납한다.</dd>
+<dt>3-way 핸드셰이크(three-way handshake)</dt><dd>SYN, SYN+ACK, ACK 세 세그먼트로 TCP 연결을 수립하는 절차. 양쪽 커널이 진행한다.</dd>
+<dt>길이 접두 프레이밍(length-prefix framing)</dt><dd>메시지 앞에 길이를 붙여 바이트 스트림에서 메시지 경계를 표시하는 방식. writeUTF는 2바이트 길이를 붙인다.</dd>
+<dt>연결당 스레드(thread-per-connection)</dt><dd>연결마다 전용 스레드를 두어 블로킹 I/O로 처리하는 서버 구조. 단순하지만 연결 수만큼 스레드 자원이 든다.</dd>
+<dt>억제된 예외(suppressed exception)</dt><dd>핵심 예외가 이미 진행 중일 때 자원 정리 중에 난 예외. 버려지지 않고 Throwable.addSuppressed로 핵심 예외에 기록된다.</dd>
+<dt>try-with-resources</dt><dd>AutoCloseable 자원을 선언하면 블록이 끝날 때 역순으로 자동으로 닫아 주는 try 문. Java 7에 도입됐고 Java 9부터 기존의 final 또는 사실상 final 변수도 자원으로 쓸 수 있다.</dd>
+<dt>폴러(Poller)</dt><dd>OpenJDK 21에서 가상 스레드의 소켓 대기를 맡는 내부 장치. fd를 kqueue(macOS)나 epoll(리눅스)에 등록하고 가상 스레드를 park했다가, 전용 플랫폼 스레드(Read-Poller)가 준비된 fd를 받으면 그 가상 스레드를 unpark한다.</dd>
+<dt>CLOSE_WAIT</dt><dd>상대의 FIN을 받았지만 로컬 애플리케이션이 아직 연결을 닫지 않은 TCP 상태. 쌓이면 소켓 누수를 뜻한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-14.html#jls-14.20.3">JLS (Java SE 21) §14.20.3 try-with-resources</a> — 자원의 역순 정리, null 자원, 억제된 예외, 기본·확장 형태의 번역 규칙</li>
+<li><a href="https://man7.org/linux/man-pages/man2/listen.2.html">listen(2) — Linux manual page</a> — backlog의 의미, 큐가 찼을 때의 동작, somaxconn 상한과 기본값</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9293.html">RFC 9293 Transmission Control Protocol (TCP)</a> — 소켓 쌍으로 정의되는 연결, 3-way 핸드셰이크, LISTEN·CLOSE-WAIT·FIN-WAIT-2 상태의 정의</li>
+<li><a href="https://openjdk.org/jeps/353">JEP 353: Reimplement the Legacy Socket API</a> — NioSocketImpl 도입, 타임아웃 연산의 논블로킹 전환과 폴링, Cleaner로 닫는 소켓</li>
+<li><a href="https://openjdk.org/jeps/444">JEP 444: Virtual Threads</a> — 캐리어와 unmount, 스케줄러 병렬도, 고정(pinning), Thread.dump_to_file 스레드 덤프</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html">The java Command (Java SE 21)</a> — -Xss 스레드 스택 크기의 플랫폼별 기본값</li>
+</x-refs>

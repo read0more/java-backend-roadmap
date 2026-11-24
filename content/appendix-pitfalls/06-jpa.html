@@ -1,0 +1,671 @@
+<x-meta>
+title: JPA·Hibernate·Spring Data JPA
+desc: 엔티티는 평범한 자바 객체처럼 보이지만 필드에는 프록시와 래퍼 컬렉션이 들어 있고, 영속성 컨텍스트가 그 상태를 지켜보다가 SQL로 바꾼다. 이 영역의 실수는 대부분 "객체를 다뤘을 뿐인데 SQL이 나갔다" 또는 "SQL이 나갈 줄 알았는데 나가지 않았다"에서 나온다.
+</x-meta>
+
+<x-item id="jpa-equals-lazy-collection" harm="성능">
+<x-title><code>equals</code>·<code>hashCode</code>에 지연 로딩 컬렉션이나 연관 엔티티를 넣는다</x-title>
+<x-symptom>엔티티를 <code>HashSet</code>·<code>HashMap</code>에 넣거나 <code>equals</code>로 비교하는 순간, 아직 읽지 않은 컬렉션과 연관 엔티티를 초기화하는 SELECT가 실행된다. 엔티티 N개를 셋에 담으면 SELECT가 N번 더 나가고(N+1), 영속성 컨텍스트가 닫힌 뒤라면 <code>LazyInitializationException</code>이 난다.</x-symptom>
+<x-see to="jpa-basic/07" h="프록시의 정체">엔티티가 equals·hashCode를 재정의하면 프록시가 그 호출을 초기화 경로로 보낸다는 것을 바이트코드로 확인한다</x-see>
+<x-see to="jpa-basic/07" h="N+1: 즉시 로딩은">쿼리 하나가 결과 건수만큼의 추가 쿼리를 낳는 과정</x-see>
+<x-body>
+<p>엔티티의 모든 필드를 넣어 <code>equals</code>와 <code>hashCode</code>를 만들면 연관 필드도 비교 대상이 된다. 그런데 영속 상태인 엔티티의 연관 필드에는 평범한 컬렉션이나 객체가 아니라 Hibernate가 끼워 넣은 래퍼 컬렉션과 프록시가 들어 있고, 이것들은 내용을 물으면 데이터베이스에 다녀온다. 비교는 메모리 안의 일이라는 가정이 깨지는 자리다.</p>
+
+<h4>실수가 나오는 코드</h4>
+<pre><code class="language-java">@Entity
+public class Team {
+    @Id @GeneratedValue Long id;
+    String name;
+    @OneToMany(mappedBy = "team")              // 기본값 LAZY
+    Set<Member> members = new HashSet<>();
+    // 생성자, getter 생략
+
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Team t)) return false;
+        return Objects.equals(getName(), t.getName())
+            && Objects.equals(getMembers(), t.getMembers());   // 컬렉션 비교
+    }
+    @Override public int hashCode() {
+        return Objects.hash(getName(), getMembers());           // 컬렉션 해시
+    }
+}
+
+@Entity
+public class Member {
+    @Id @GeneratedValue Long id;
+    String name;
+    @ManyToOne(fetch = FetchType.LAZY) Team team;
+    // equals·hashCode 를 재정의하지 않았다
+}</code></pre>
+<p>팀 A, B, C에 회원을 둘씩 저장해 두고, 새 영속성 컨텍스트에서 팀 세 개를 조회해 <code>HashSet</code>에 담았다. 실행 환경은 JDK 21(Temurin 21.0.13), Hibernate ORM 6.6.53.Final, H2 2.3.232 인메모리다. SQL은 <code>hibernate.show_sql</code>로 찍었고, <code>count()</code>는 Hibernate 통계의 <code>getPrepareStatementCount()</code>에서 조회 직전 값을 뺀 것이다.</p>
+<pre><code class="language-java">List<Team> teams = em.createQuery("select t from Team t order by t.id", Team.class).getResultList();
+System.out.println("SQL 수 = " + count());
+
+Set<Team> unique = new HashSet<>(teams);       // 중복을 없애려고, 또는 Map 의 키로 쓰려고
+System.out.println("SQL 수 = " + count() + ", size = " + unique.size());</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select t1_0.id,t1_0.name from Team t1_0 order by t1_0.id
+SQL 수 = 1
+Hibernate: select m1_0.team_id,m1_0.id,m1_0.name from Member m1_0 where m1_0.team_id=?
+Hibernate: select m1_0.team_id,m1_0.id,m1_0.name from Member m1_0 where m1_0.team_id=?
+Hibernate: select m1_0.team_id,m1_0.id,m1_0.name from Member m1_0 where m1_0.team_id=?
+SQL 수 = 4, size = 3</code></pre>
+<p>쿼리는 하나였는데 셋에 담는 한 줄에서 SELECT가 세 번 더 나갔다. 팀이 1,000개면 1,000번이다. <code>equals</code>도 같다. 이름이 같은 팀 두 개를 조회해 <code>a.equals(b)</code>를 한 번 호출하자 두 팀의 회원 컬렉션을 읽는 SELECT가 두 번 나간 뒤에 <code>false</code>가 나왔다. <code>&&</code>는 앞 조건이 거짓이면 뒤를 평가하지 않으므로, 이름이 다른 팀끼리 비교할 때는 SQL이 나가지 않는다. 같은 코드가 데이터에 따라 SQL을 내기도 하고 안 내기도 해서, 테스트 데이터로는 드러나지 않다가 운영 데이터에서 나타난다.</p>
+
+<h4>왜 SQL이 나가는가</h4>
+<p><code>new HashSet<>(teams)</code>는 원소마다 <code>hashCode()</code>를 부르고, <code>Objects.hash(name, members)</code>는 다시 <code>members.hashCode()</code>를 부른다. 조회한 팀의 <code>members</code> 필드에 들어 있는 것은 우리가 넣은 <code>HashSet</code>이 아니다. 실험에서 클래스 이름을 찍어 보면 <code>org.hibernate.collection.spi.PersistentSet</code>이고, <code>Hibernate.isInitialized()</code>는 <code>false</code>다. 이 래퍼의 <code>hashCode()</code>를 <code>javap -c</code>로 열면 두 줄이다.</p>
+<pre data-label="PersistentSet (Hibernate 6.6.53, javap -c, 상수 풀 번호 생략)"><code class="language-text">public int hashCode();
+   0: aload_0
+   1: invokevirtual  // Method read:()V
+   4: aload_0
+   5: getfield       // Field set:Ljava/util/Set;
+   8: invokeinterface // InterfaceMethod java/util/Set.hashCode:()I
+  13: ireturn</code></pre>
+<p>먼저 <code>read()</code>를 부르고, 그다음에 안쪽의 진짜 셋에 위임한다. <code>read()</code>는 <code>AbstractPersistentCollection.initialize()</code>를 부르고, 아직 초기화되지 않았으면 세션을 통해 컬렉션을 읽는다. <code>equals()</code>의 바이트코드도 다른 일을 하기 전에 <code>read()</code>부터 부른다. 셋의 해시 코드는 원소들의 해시 코드를 더한 값이므로(<code>java.util.Set.hashCode()</code>의 규약) 원소를 모르고는 답할 수 없다. 래퍼로서는 다른 선택이 없다.</p>
+<p>영속성 컨텍스트가 이미 닫혔다면 읽어 올 통로가 없다. 같은 팀 목록을 <code>em.close()</code> 뒤에 셋에 담자 SQL 대신 예외가 났다.</p>
+<pre data-label="실행 결과"><code class="language-text">org.hibernate.LazyInitializationException: failed to lazily initialize a collection of role: demo.Team.members: could not initialize proxy - no Session</code></pre>
+<p>예외가 난 줄은 <code>new HashSet<>(teams)</code>다. 그 줄 어디에도 컬렉션을 읽는 코드가 없으니 원인을 찾기 어렵다.</p>
+
+<h4>컬렉션이 List이면: SQL은 없지만 결과가 틀린다</h4>
+<p>같은 매핑에서 컬렉션 타입만 <code>List</code>(순서 열이 없는 리스트, Hibernate 용어로 bag)로 바꾸면 동작이 달라진다. 클럽 세 개를 조회해 셋에 담았을 때 SQL 수는 1에서 늘지 않았다. 필드에 들어 있는 래퍼가 <code>PersistentBag</code>이고, 이 클래스의 <code>equals()</code>와 <code>hashCode()</code>는 바이트코드에서 <code>Object.equals</code>와 <code>Object.hashCode</code>를 <code>invokespecial</code>로 부를 뿐이기 때문이다. 내용이 아니라 참조로 비교한다는 뜻이다. SQL은 나가지 않지만 이번에는 비교 결과가 틀린다. 같은 행을 두 영속성 컨텍스트에서 각각 읽어 비교하면 이렇게 된다.</p>
+<pre data-label="실행 결과"><code class="language-text">이름 같음 = true, equals = false</code></pre>
+<p>두 객체는 같은 행에서 왔고 선수 목록도 같지만, 래퍼 인스턴스가 서로 다르므로 <code>Objects.equals(getPlayers(), c.getPlayers())</code>가 거짓이다. 컬렉션을 넣은 <code>equals</code>는 컬렉션 타입에 따라 SQL을 내거나 조용히 틀린다. 어느 쪽도 원하던 동작이 아니다.</p>
+
+<h4>연관 엔티티(<code>@ManyToOne</code>)를 넣어도 같다</h4>
+<p>반대편도 마찬가지다. 선수의 <code>hashCode</code>를 <code>Objects.hash(getName(), getClub())</code>로 만들고, 클럽은 <code>equals</code>·<code>hashCode</code>를 재정의한 상태에서, 세 클럽에 속한 선수 여섯 명을 조회해 셋에 담았다.</p>
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select p1_0.id,p1_0.club_id,p1_0.name from Player p1_0 order by p1_0.id
+SQL 수 = 1
+Hibernate: select c1_0.id,c1_0.name from Club c1_0 where c1_0.id=?
+Hibernate: select c1_0.id,c1_0.name from Club c1_0 where c1_0.id=?
+Hibernate: select c1_0.id,c1_0.name from Club c1_0 where c1_0.id=?
+SQL 수 = 4, size = 6</code></pre>
+<p>선수의 <code>club</code> 필드에는 지연 로딩 프록시가 들어 있다. 대상 엔티티가 <code>hashCode()</code>를 재정의하지 않았다면 프록시는 초기화 없이 답하지만, 재정의했다면 그 메서드는 일반 메서드와 같은 경로를 타고 진짜 엔티티를 읽어 온다. 추가 SELECT의 수는 서로 다른 클럽의 수(3)다. 양쪽 엔티티가 서로를 해시에 넣었다면 호출이 서로를 오가며 끝나지 않는다. 그 경우는 다음 항목에서 본다.</p>
+
+<h4>고치는 법</h4>
+<p><code>equals</code>와 <code>hashCode</code>에는 연관 필드(컬렉션, 다른 엔티티에 대한 참조)를 넣지 않는다. 위 <code>Team</code>에서 <code>members</code>를 빼고 다시 실행하면 셋에 담은 뒤에도 <code>SQL 수 = 1</code>이다. 무엇을 넣을지에 대해서는 Hibernate 6.6 문서(Introduction 3.24절)가 원칙을 적어 두었다. 변경될 수 있는 필드는 해시 코드에 넣지 않는다. 데이터베이스가 생성하는 필드도 넣지 않기를 권한다. 변경되지 않고 생성되지도 않는 필드는 넣어도 된다. 그래서 문서는 엔티티마다 자연 키(프로그램의 관점에서 인스턴스를 유일하게 식별하는 필드 조합이고, 데이터베이스의 유일 제약에 대응하는 것)를 찾아 그것으로 두 메서드를 구현하라고 권한다.</p>
+<p>자연 키가 없고 엔티티를 한 영속성 컨텍스트 안에서만 다룬다면 두 메서드를 재정의하지 않는 것도 선택지다. Hibernate User Guide 3.4.7절은 식별자 클래스 같은 몇 가지 경우를 빼면 재정의하지 않는 쪽을 고려해 보라고 하면서, 한 세션 안에서는 같은 행이 같은 인스턴스로 보장된다는 점을 근거로 든다. 재정의가 필요해지는 것은 서로 다른 세션에서 읽은 인스턴스나 아직 저장하지 않은 인스턴스를 한 컬렉션에 섞을 때다.</p>
+</x-body>
+<x-refs>
+<li><a href="https://docs.jboss.org/hibernate/orm/6.6/introduction/html_single/Hibernate_Introduction.html#equals-and-hash">Hibernate ORM 6.6 Introduction 3.24 equals() and hashCode()</a> — 해시 코드에 넣어도 되는 필드의 원칙과 자연 키 권고</li>
+<li><a href="https://docs.jboss.org/hibernate/orm/6.6/userguide/html_single/Hibernate_User_Guide.html#mapping-model-pojo-equalshashcode">Hibernate ORM 6.6 User Guide 3.4.7 Implementing equals() and hashCode()</a> — 세션 범위의 동일성 보장과, 재정의가 필요해지는 경우</li>
+</x-refs>
+</x-item>
+
+<x-item id="jpa-lombok-data-entity" harm="장애">
+<x-title>엔티티에 Lombok <code>@Data</code>를 붙인다</x-title>
+<x-symptom><code>@Data</code>가 만든 <code>toString</code>·<code>equals</code>·<code>hashCode</code>는 연관 필드를 포함한 모든 필드를 따라간다. 엔티티를 로그에 찍는 한 줄이 지연 로딩 SQL을 실행하고 양방향 연관에서는 <code>StackOverflowError</code>로 끝나며, 식별자가 해시에 들어가 <code>persist</code> 뒤에는 <code>HashSet</code>에서 그 엔티티를 찾지 못한다.</x-symptom>
+<x-see to="jpa-basic/04" h="주의점 3">양방향 참조를 따라가는 toString이 스택을 넘치게 하는 과정을 순수 자바로 재현한다</x-see>
+<x-see to="jpa-app1/02" h="주의점 1">엔티티에 세터를 모두 열어 두면 생기는 일</x-see>
+<x-see to="spring-data-jpa/01" h="예제 도메인 모델">toString에서 연관 필드를 빼는 이유와, 출력할 필드를 골라 적는 방식</x-see>
+<x-body>
+<p>Lombok 문서는 <code>@Data</code>를 <code>@ToString</code>, <code>@EqualsAndHashCode</code>, <code>@Getter</code>/<code>@Setter</code>, <code>@RequiredArgsConstructor</code>를 한데 묶은 것이라고 설명한다. 값 객체나 DTO에는 편리하지만, 엔티티에 붙이면 앞 항목과 다음 항목의 실수를 애너테이션 하나로 한꺼번에 저지르게 된다. <code>@EqualsAndHashCode</code>는 기본으로 static도 transient도 아닌 모든 필드를 쓰고, <code>@ToString</code>은 static이 아닌 모든 필드를 출력하기 때문이다.</p>
+
+<h4>실수가 나오는 코드</h4>
+<pre><code class="language-java">@Entity @Data
+public class Post {
+    @Id @GeneratedValue Long id;
+    String title;
+    @OneToMany(mappedBy = "post")
+    List<Comment> comments = new ArrayList<>();
+}
+
+@Entity @Data
+public class Comment {
+    @Id @GeneratedValue Long id;
+    String body;
+    @ManyToOne(fetch = FetchType.LAZY) Post post;
+}</code></pre>
+<p>Lombok 1.18.46으로 컴파일한 <code>Post.class</code>를 <code>javap -p</code>로 열면 무엇이 생겼는지 보인다.</p>
+<pre data-label="javap -p demo.Post"><code class="language-text">public class demo.Post {
+  java.lang.Long id;
+  java.lang.String title;
+  java.util.List<demo.Comment> comments;
+  public demo.Post();
+  public java.lang.Long getId();
+  public java.lang.String getTitle();
+  public java.util.List<demo.Comment> getComments();
+  public void setId(java.lang.Long);
+  public void setTitle(java.lang.String);
+  public void setComments(java.util.List<demo.Comment>);
+  public boolean equals(java.lang.Object);
+  protected boolean canEqual(java.lang.Object);
+  public int hashCode();
+  public java.lang.String toString();
+}</code></pre>
+<p>이 엔티티로 세 가지를 실행했다(JDK 21, Hibernate ORM 6.6.53.Final, H2 2.3.232 인메모리).</p>
+<pre><code class="language-java">// (1) 새 글을 Set 에 넣고 저장한다
+Post post = new Post();
+post.setTitle("first");
+Set<Post> seen = new HashSet<>();
+seen.add(post);
+System.out.println("persist 전 hashCode = " + post.hashCode() + ", contains = " + seen.contains(post));
+em.persist(post);
+System.out.println("persist 후 hashCode = " + post.hashCode() + ", contains = " + seen.contains(post) + ", id = " + post.getId());
+
+// (2) 다른 트랜잭션에서 댓글을 조회해 로그에 찍는다
+Comment found = em.find(Comment.class, commentId);
+System.out.println("SQL 수 = " + count());
+try {
+    System.out.println("comment = " + found);
+} catch (StackOverflowError e) {
+    System.out.println("StackOverflowError, SQL 수 = " + count());
+}
+
+// (3) 저장하기 전의 객체끼리 연결하고 hashCode 를 부른다
+Post p2 = new Post();
+Comment c2 = new Comment();
+c2.setPost(p2);
+p2.getComments().add(c2);
+System.out.println(c2.hashCode());        // StackOverflowError</code></pre>
+<pre data-label="실행 결과 (persist 후의 hashCode 값은 실행 환경에 따라 다르다)"><code class="language-text">=== (1)
+persist 전 hashCode = 1454373255, contains = true
+Hibernate: select next value for Post_SEQ
+persist 후 hashCode = -1139278889, contains = false, id = 1
+=== (2)
+Hibernate: select c1_0.id,c1_0.body,c1_0.post_id from Comment c1_0 where c1_0.id=?
+SQL 수 = 1
+Hibernate: select p1_0.id,p1_0.title from Post p1_0 where p1_0.id=?
+Hibernate: select c1_0.post_id,c1_0.id,c1_0.body from Comment c1_0 where c1_0.post_id=?
+StackOverflowError, SQL 수 = 3
+=== (3)
+StackOverflowError</code></pre>
+
+<h4>왜 그런가</h4>
+<p>(1)에서 해시 코드가 바뀐 데는 원인이 둘 있다. 생성된 <code>hashCode()</code>의 바이트코드는 <code>getId()</code>, <code>getTitle()</code>, <code>getComments()</code>를 차례로 불러 59를 곱하며 더한다. 첫째 원인은 식별자다. 식별자는 <code>persist</code>가 끝나야 정해지는 값이라 <code>null</code>에서 1로 바뀌었다. 둘째 원인은 컬렉션이다. <code>persist</code> 전후로 <code>getComments().getClass()</code>를 찍어 보면 <code>java.util.ArrayList</code>가 <code>org.hibernate.collection.spi.PersistentBag</code>으로 바뀌어 있다. Hibernate가 엔티티를 영속 상태로 만들면서 컬렉션 필드를 자기 래퍼로 바꿔 끼운 것이고, 앞 항목에서 본 대로 이 래퍼의 <code>hashCode()</code>는 <code>Object.hashCode()</code>다. 빈 <code>ArrayList</code>의 해시 코드 1이 래퍼 객체의 식별 해시 코드로 바뀌었으므로 <code>persist</code> 뒤의 값은 실행 환경에 따라 달라진다(식별자만 바뀌었다면 1454227053이 나왔을 것이다). 어느 쪽 때문이든 결과는 같다. <code>persist</code> 전에 셋에 들어간 객체는 옛 해시 코드의 버킷에 남고, 같은 객체로 다시 찾아도 다른 버킷을 뒤지게 된다. 식별자 쪽의 원리와 그 결과는 다음 항목에서 따로 다룬다. 제목 같은 가변 필드도 해시에 들어 있으므로 <code>setTitle()</code>만 불러도 같은 일이 생긴다.</p>
+<p>(2)는 로그 한 줄이 한 일이다. <code>Comment.toString()</code>은 <code>getPost()</code>의 결과를 문자열로 바꾸려 한다. 그 자리에는 지연 로딩 프록시가 있고, 프록시의 <code>toString()</code>은 진짜 엔티티를 읽어야 답할 수 있으므로 <code>Post</code>를 조회한다. <code>Post.toString()</code>은 다시 <code>getComments()</code>를 문자열로 바꾸려 하고, <code>PersistentBag.toString()</code>은 내용을 문자열로 바꾸기 전에 <code>read()</code>부터 불러 댓글 컬렉션을 조회한다. 컬렉션의 원소인 댓글이 다시 <code>toString()</code>으로 글을 부르면서 호출이 끝나지 않고, 스레드 스택이 넘친다. SQL 두 개를 쓰고 나서 오류로 죽은 것이다. Lombok 문서가 getter가 있으면 필드 대신 getter를 호출한다고 밝혀 둔 대로, 생성된 메서드는 getter를 거치므로 프록시와 래퍼를 그대로 건드린다.</p>
+<p>(3)은 데이터베이스와 무관하다. <code>Comment.hashCode()</code>가 <code>Post.hashCode()</code>를, 그것이 <code>ArrayList.hashCode()</code>를, 그것이 다시 원소인 <code>Comment.hashCode()</code>를 부른다. 양방향 연관의 양쪽에 <code>@Data</code>를 붙이면 두 객체를 연결하는 순간부터 <code>hashCode()</code>, <code>equals()</code>, <code>toString()</code> 어느 것도 끝나지 않는다.</p>
+<p><code>javap</code> 출력에는 문제가 하나 더 보인다. <code>setId()</code>와 <code>setComments()</code>다. 식별자를 바꾸거나 Hibernate가 관리하는 컬렉션을 통째로 갈아 끼우는 문이 열려 있다.</p>
+
+<h4>고치는 법</h4>
+<p>엔티티에는 <code>@Data</code>, 속성 없는 <code>@EqualsAndHashCode</code>, 속성 없는 <code>@ToString</code>을 쓰지 않는다. 필요한 것만 골라 붙인다. getter는 <code>@Getter</code>로 만들고, <code>toString</code>은 출력할 필드를 명시한다. <code>@ToString(onlyExplicitlyIncluded = true)</code>와 <code>@ToString.Include</code>, 또는 연관 필드에 <code>@ToString.Exclude</code>를 쓴다. <code>equals</code>와 <code>hashCode</code>는 앞뒤 항목의 원칙대로 직접 정하거나 재정의하지 않는다.</p>
+<pre><code class="language-java">@Entity @Getter @Setter
+@ToString(onlyExplicitlyIncluded = true)
+public class Comment {
+    @Id @GeneratedValue @ToString.Include Long id;
+    @ToString.Include String body;
+    @ManyToOne(fetch = FetchType.LAZY) Post post;
+}</code></pre>
+<p><code>Post</code>도 같은 방식으로 바꾸고 같은 실험을 다시 실행하면, (2)의 SQL 수는 1에서 늘지 않고 <code>comment = Comment(id=1, body=hello)</code>가 찍힌다. (1)의 <code>contains</code>는 <code>persist</code> 뒤에도 <code>true</code>이고, (3)은 정수 하나를 출력하고 끝난다. 실험 코드가 setter를 쓰고 있어서 <code>@Setter</code>는 남겨 두었다. 세터를 어디까지 열지는 별개의 설계 문제이고, 적어도 식별자와 컬렉션 필드의 세터는 만들지 않는 편이 안전하다(필드에 <code>@Setter</code>를 따로 붙이면 그 필드에만 생긴다).</p>
+</x-body>
+<x-refs>
+<li><a href="https://projectlombok.org/features/Data">Project Lombok — @Data</a> — @Data가 묶는 애너테이션 목록</li>
+<li><a href="https://projectlombok.org/features/EqualsAndHashCode">Project Lombok — @EqualsAndHashCode</a> — 기본으로 static·transient가 아닌 모든 필드를 쓰고 getter가 있으면 getter를 호출한다는 것, Include/Exclude</li>
+<li><a href="https://projectlombok.org/features/ToString">Project Lombok — @ToString</a> — 기본으로 static이 아닌 모든 필드를 출력한다는 것, onlyExplicitlyIncluded</li>
+</x-refs>
+</x-item>
+
+<x-item id="jpa-hashcode-generated-id" harm="틀린 결과">
+<x-title>생성 식별자(<code>@GeneratedValue</code>)만으로 <code>hashCode</code>를 만든다</x-title>
+<x-symptom>식별자가 <code>persist</code> 때 정해지는 엔티티의 <code>hashCode</code>를 식별자로 계산하면, 저장하기 전에 <code>HashSet</code>·<code>HashMap</code>에 넣은 객체의 해시 코드가 저장 뒤에 바뀐다. 그 객체는 셋 안에 들어 있는데도 <code>contains</code>가 <code>false</code>이고 <code>remove</code>는 아무것도 지우지 못한다. 컬렉션에서 빼서 지우려던 자식 행이 예외 없이 데이터베이스에 남는다.</x-symptom>
+<x-see to="java-mid2/07" h="중요성 2">해시 셋에 넣은 뒤 해시 코드가 바뀐 원소가 어느 버킷에 남고, 조회가 어느 버킷으로 가는지</x-see>
+<x-see to="jpa-basic/05" h="다대다 [N:M]">Set으로 매핑한 연관 컬렉션이 원소의 equals·hashCode에 기대는 자리</x-see>
+<x-body>
+<p>"같은 행이면 같은 엔티티"라는 뜻으로 <code>equals</code>가 식별자를 비교하게 하고, 규약에 맞추려고 <code>hashCode</code>도 식별자로 계산하는 구현은 IDE가 만들어 주는 가장 흔한 모양이다. 식별자를 애플리케이션이 직접 넣는 엔티티라면 이 구현에 문제가 없다. 문제는 식별자를 시퀀스나 <code>AUTO_INCREMENT</code>가 만들어 주는 엔티티다. 그 식별자는 객체를 만들 때가 아니라 <code>persist</code> 때 정해지므로, 그 사이에 해시 컬렉션에 들어간 객체는 해시 코드가 한 번 바뀐다.</p>
+
+<h4>실수가 나오는 코드</h4>
+<pre><code class="language-java">@Entity
+public class Article {
+    @Id @GeneratedValue Long id;
+    String title;
+    @OneToMany(mappedBy = "article", cascade = CascadeType.ALL, orphanRemoval = true)
+    Set<Attachment> attachments = new HashSet<>();
+    // 생성자, getter 생략
+
+    public void attach(Attachment a) { attachments.add(a); a.article = this; }
+}
+
+@Entity
+public class Attachment {
+    @Id @GeneratedValue Long id;
+    String fileName;
+    @ManyToOne(fetch = FetchType.LAZY) Article article;
+    // 생성자, getter 생략
+
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Attachment a)) return false;
+        return Objects.equals(getId(), a.getId());
+    }
+    @Override public int hashCode() { return Objects.hash(getId()); }   // 생성 식별자만으로 해시
+}</code></pre>
+<p>글에 첨부 파일을 붙여 저장하고, 같은 트랜잭션에서 그 첨부 파일을 다시 뺐다. <code>orphanRemoval = true</code>이므로 컬렉션에서 빠진 첨부 파일은 플러시 때 삭제되어야 한다. 실행 환경은 JDK 21(Temurin 21.0.13), Hibernate ORM 6.6.53.Final, H2 2.3.232 인메모리다.</p>
+<pre><code class="language-java">Article article = new Article("notice");
+Attachment file = new Attachment("a.pdf");
+article.attach(file);                                  // id == null 인 채로 Set 에 들어간다
+System.out.println("persist 전: hashCode = " + file.hashCode()
+    + ", contains = " + article.getAttachments().contains(file));
+
+em.persist(article);                                   // cascade 로 file 도 식별자를 받는다
+System.out.println("persist 후: id = " + file.getId() + ", hashCode = " + file.hashCode()
+    + ", contains = " + article.getAttachments().contains(file));
+
+boolean removed = article.getAttachments().remove(file);   // 첨부 파일을 지우려는 코드
+System.out.println("remove = " + removed + ", size = " + article.getAttachments().size());
+em.getTransaction().commit();
+// 새 EntityManager 로 select count(a) from Attachment a 를 실행해 행 수를 출력한다</code></pre>
+<pre data-label="실행 결과"><code class="language-text">persist 전: hashCode = 31, contains = true
+Hibernate: select next value for Article_SEQ
+Hibernate: select next value for Attachment_SEQ
+persist 후: id = 1, hashCode = 32, contains = false
+remove = false, size = 1
+Hibernate: insert into Article (title,id) values (?,?)
+Hibernate: insert into Attachment (article_id,fileName,id) values (?,?,?)
+Hibernate: select count(a1_0.id) from Attachment a1_0
+DB 의 첨부 파일 행 수 = 1</code></pre>
+<p><code>remove</code>가 <code>false</code>를 돌려주었고 셋의 크기는 그대로 1이다. DELETE는 나가지 않았고 첨부 파일 행이 남았다. 예외도 경고도 없다. 지웠다고 믿은 파일이 다음 조회에서 다시 나타난다.</p>
+
+<h4>왜 그런가</h4>
+<p><code>Objects.hash(getId())</code>는 식별자가 <code>null</code>일 때 31이고 1일 때 32다. 해시 셋은 원소를 넣는 순간의 해시 코드로 버킷을 고른다. OpenJDK 21의 <code>HashSet</code>은 내부에 <code>HashMap</code>을 두고, <code>HashMap</code>은 해시 코드의 위쪽 16비트를 아래쪽에 섞은 값에서 테이블 크기만큼의 아래 비트를 버킷 번호로 쓴다. 기본 크기 16인 테이블에서 31과 32처럼 작은 값은 아래 네 비트가 그대로 버킷 번호이므로, 식별자가 없을 때 들어간 첨부 파일은 15번 버킷에 놓인다. <code>persist</code>가 식별자 1을 채운 뒤 <code>contains(file)</code>와 <code>remove(file)</code>는 해시 코드 32로 0번 버킷을 찾아가고, 거기에는 아무것도 없다. 넣은 객체와 찾는 객체가 같은 인스턴스인데도 찾지 못한다. <code>java.util.Set</code>의 Javadoc은 이 상황을 규약 밖에 두었다. 셋의 원소인 동안 <code>equals</code> 비교에 영향을 주는 방식으로 객체의 값이 바뀌면 셋의 동작은 정해져 있지 않다고 적는다.</p>
+<p>이 실수가 유독 엔티티에서 잦은 이유는 코드의 자연스러운 순서가 곧 문제의 순서이기 때문이다. 부모와 자식 객체를 만들고, 연관관계 편의 메서드로 서로 연결하고, 부모를 <code>persist</code>해 전이로 한꺼번에 저장한다. 연결이 저장보다 먼저이므로 자식은 언제나 식별자 없이 셋에 들어간다. 시퀀스 전략이든 <code>IDENTITY</code> 전략이든 식별자가 채워지는 시점은 <code>persist</code> 호출 안이므로 결과는 같다.</p>
+<p>테스트로 잡기도 어렵다. 같은 글을 새 영속성 컨텍스트에서 다시 읽으면 첨부 파일은 처음부터 식별자를 가진 채 셋에 들어가므로 <code>contains</code>가 <code>true</code>다(같은 실험의 마지막 단계에서 확인했다). 저장하고, 영속성 컨텍스트를 비우고, 다시 읽어 검증하는 테스트는 통과한다. 어긋나는 것은 "새로 만든 객체를 저장한 바로 그 트랜잭션 안에서 계속 다루는" 경로뿐이다. Lombok의 <code>@EqualsAndHashCode</code>에 식별자 필드만 포함시킨 경우도 해시 코드를 식별자로 계산하는 점이 같으므로 같은 일이 생긴다.</p>
+
+<h4>고치는 법</h4>
+<p>Hibernate 6.6 User Guide 3.4.7절은 이 사례를 그대로 예제로 싣고("Auto-generated identifiers with Sets and naive equals/hashCode") 대안을 든다. 가장 좋다고 하는 것은 자연 키(비즈니스 키)로 두 메서드를 구현하는 것이다. 객체를 만들 때 정해지고 그 뒤로 바뀌지 않는 값이면 해시 코드도 바뀌지 않는다.</p>
+<pre><code class="language-java">@Entity
+public class Attachment {
+    @Id @GeneratedValue Long id;
+    @Column(nullable = false, unique = true, updatable = false)
+    String storageKey = UUID.randomUUID().toString();     // 객체를 만들 때 정해지고 바뀌지 않는 키
+    // ...
+
+    @Override public boolean equals(Object o) {
+        return o instanceof Attachment a && getStorageKey().equals(a.getStorageKey());
+    }
+    @Override public int hashCode() { return getStorageKey().hashCode(); }
+}</code></pre>
+<pre data-label="실행 결과 (해시 코드 값은 실행마다 다르다)"><code class="language-text">persist 전: hashCode = -1383717382, contains = true
+persist 후: id = 1, hashCode = -1383717382, contains = true
+remove = true, size = 0
+Hibernate: insert into Article (title,id) values (?,?)
+Hibernate: insert into Attachment (article_id,fileName,storageKey,id) values (?,?,?,?)
+Hibernate: delete from Attachment where id=?
+DB 의 첨부 파일 행 수 = 0</code></pre>
+<p>마땅한 자연 키가 없어 식별자로 동등성을 정해야 한다면, 같은 절이 조건 두 가지를 붙인다. <code>hashCode</code>는 플러시 전후로 값이 바뀌지 않도록 상수를 돌려주고, 식별자 비교는 식별자가 있는 엔티티끼리만 한다.</p>
+<pre><code class="language-java">@Override public boolean equals(Object o) {
+    if (this == o) return true;
+    return o instanceof Attachment a && getId() != null && getId().equals(a.getId());
+}
+@Override public int hashCode() { return Attachment.class.hashCode(); }   // 식별자와 무관한 상수</code></pre>
+<p>이 구현으로 같은 실험을 돌리면 <code>persist</code> 전후의 해시 코드가 같고, <code>remove = true</code>, DELETE 한 번, 남은 행 수 0이 나온다. 대가는 해시 컬렉션의 성질이다. 이 클래스의 모든 인스턴스가 같은 해시 코드를 가지므로 한 버킷에 모이고, 원소가 많은 셋이나 맵에서는 조회가 그 버킷 안을 뒤지는 일이 된다. 식별자가 없는 두 객체는 같은 참조일 때만 같다는 점도 이 구현의 일부다.</p>
+<p>엔티티를 한 영속성 컨텍스트 안에서만 다룬다면 두 메서드를 재정의하지 않는 것도 여전히 선택지다(첫 항목의 마지막 문단). 같은 절은 식별자를 먼저 생성시킨 뒤, 즉 <code>persist</code>와 <code>flush</code>를 한 뒤에 셋에 넣는 방법도 보여 주지만, 그 순서를 모든 호출 경로가 지켜야 하므로 문서도 이것이 가능하지 않은 경우가 많다고 덧붙인다.</p>
+</x-body>
+<x-refs>
+<li><a href="https://docs.jboss.org/hibernate/orm/6.6/userguide/html_single/Hibernate_User_Guide.html#mapping-model-pojo-equalshashcode">Hibernate ORM 6.6 User Guide 3.4.7 Implementing equals() and hashCode()</a> — 생성 식별자 기반 구현이 Set에서 깨지는 예제, 자연 키 구현, 상수 hashCode 우회</li>
+<li><a href="https://docs.jboss.org/hibernate/orm/6.6/introduction/html_single/Hibernate_Introduction.html#equals-and-hash">Hibernate ORM 6.6 Introduction 3.24 equals() and hashCode()</a> — 데이터베이스가 생성하는 필드를 해시 코드에 넣지 말라는 권고</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Set.html">Java SE 21 API — java.util.Set</a> — 원소인 동안 equals에 영향을 주는 변경이 있으면 셋의 동작이 정해져 있지 않다는 주의</li>
+</x-refs>
+</x-item>
+
+<x-item id="jpa-equals-getclass-proxy" harm="틀린 결과">
+<x-title>엔티티 <code>equals</code>에서 <code>getClass()</code>로 타입을 비교하거나 상대의 필드를 직접 읽는다</x-title>
+<x-symptom>지연 로딩 연관에 들어 있는 것은 엔티티를 상속한 프록시다. <code>getClass() != o.getClass()</code>는 같은 행의 진짜 엔티티와 프록시를 다른 타입으로 판정하고, <code>other.name</code>처럼 필드를 직접 읽으면 프록시 자신의 비어 있는 필드에서 <code>null</code>이 나온다. 예외 없이 "같지 않다"가 되어, 같은 행인데도 셋에 두 번 들어가거나 비교 분기가 틀린 쪽으로 간다.</x-symptom>
+<x-see to="jpa-basic/07" h="프록시와 동일성">프록시와 진짜 엔티티 사이에서 <code>==</code>, <code>instanceof</code>, <code>getClass()</code>, 필드 접근, getter가 각각 내는 결과와 equals 구현 원칙</x-see>
+<x-see to="jpa-app1/02" h="지연 로딩의 정체">손으로 만든 프록시로 필드 직접 접근이 null을 돌려주는 과정을 재현한다</x-see>
+</x-item>
+
+<x-item id="jpa-tostring-bidirectional-recursion" harm="장애">
+<x-title>양방향 연관의 양쪽을 <code>toString</code>이나 JSON 직렬화가 따라가게 둔다</x-title>
+<x-symptom>부모는 자식 컬렉션을, 자식은 부모를 출력하는 <code>toString</code>은 서로를 끝없이 호출하다 <code>StackOverflowError</code>로 끝난다. 로그 한 줄, 디버거의 변수 창도 같은 길을 밟는다. 엔티티를 그대로 JSON으로 내보내면 Jackson이 같은 순환을 돌다가 중첩 깊이 한도 예외(한도가 없던 버전에서는 스택 오버플로)로 실패한다.</x-symptom>
+<x-see to="jpa-basic/04" h="주의점 3">순수 자바로 재현한 toString 순환과 스택 트레이스, Lombok·JSON·디버거에서 같은 일이 생기는 자리</x-see>
+<x-see to="jpa-app2/02" h="두 번째 벽">Jackson이 양방향 참조를 따라 돌 때 나는 예외와, <code>@JsonIgnore</code>가 근본 해법이 아닌 이유</x-see>
+</x-item>
+
+<x-item id="jpa-entity-as-api-response" harm="장애">
+<x-title>엔티티를 API 응답으로 그대로 반환한다</x-title>
+<x-symptom>직렬화는 객체 그래프 순회라서 게터가 열린 연관을 모두 따라간다. 지연 로딩 프록시에서 직렬화 예외가 나고, 예외를 설정으로 눌러도 연관마다 SELECT가 나가며, 양방향 연관에서는 본문이 중간에 끊긴 JSON이 상태 코드 200으로 나간다. 응답 모양이 엔티티 필드와 로딩 이력에 묶여, 필드 하나를 바꾸면 API가 바뀐다.</x-symptom>
+<x-see to="jpa-app2/02" h="첫 번째 벽">프록시를 Jackson이 일반 빈으로 훑다가 실패하는 과정과, 미리 초기화해도 해결되지 않는 이유</x-see>
+<x-see to="jpa-app2/02" h="벽을 모두 넘은 V1">예외를 모두 치운 뒤에도 주문 네 건에 SQL 15개가 나가는 내역</x-see>
+<x-see to="jpa-app2/01" h="회원 조회 API v1">응답이 이미 커밋된 뒤 예외가 나서 200과 깨진 JSON이 나가는 실험</x-see>
+</x-item>
+
+<x-item id="jpa-toone-default-eager" harm="성능">
+<x-title><code>@ManyToOne</code>·<code>@OneToOne</code>의 <code>fetch</code>를 기본값으로 둔다</x-title>
+<x-symptom>대상이 하나인 연관의 기본값은 <code>EAGER</code>다. <code>em.find</code>는 조인 한 번으로 끝나서 문제가 보이지 않지만, JPQL은 적힌 대로만 SQL이 되므로 결과를 돌려주기 전에 연관 엔티티를 행마다 따로 조회한다. 그 연관이 필요 없는 화면에서도 항상 일어나고, 쿼리 단위로 끌 방법이 없다.</x-symptom>
+<x-see to="jpa-basic/07" h="즉시 로딩과 지연 로딩">애노테이션별 fetch 기본값을 클래스 파일에서 읽고, EAGER가 "요구 사항"이고 LAZY가 "힌트"라는 차이를 본다</x-see>
+<x-see to="jpa-app1/02" h="주의점 2">EAGER 연관이 JPQL에서 추가 쿼리를 만드는 과정과, 모든 연관을 LAZY로 두는 이유</x-see>
+</x-item>
+
+<x-item id="jpa-n-plus-one-lazy-loop" harm="성능">
+<x-title>목록을 조회한 뒤 반복문에서 지연 로딩 연관을 건드린다</x-title>
+<x-symptom>엔티티 N개를 쿼리 하나로 가져온 뒤 반복문에서 <code>getTeam().getName()</code>처럼 연관을 읽으면, 처음 초기화되는 프록시와 컬렉션마다 SELECT가 하나씩 나간다. 테스트 데이터 몇 건에서는 보이지 않다가 목록이 수천 건이 되면 요청 하나가 SQL 수천 번이 된다. DTO로 변환하는 코드, 템플릿, JSON 직렬화가 모두 그 반복문 노릇을 한다.</x-symptom>
+<x-see to="jpa-basic/07" h="N+1: 즉시 로딩은">즉시 로딩과 지연 로딩에서 추가 쿼리가 나가는 시점의 차이, 페치 조인으로 한 번에 가져오기</x-see>
+<x-see to="jpa-basic/10" h="N+1을 SQL 단위로">추가 쿼리 수가 결과 행 수가 아니라 처음 초기화되는 프록시 수라는 것을 SQL 한 줄씩 추적한다</x-see>
+<x-see to="jpa-app2/03" h="배치 페치: IN 하나로">컬렉션처럼 페치 조인이 맞지 않는 자리에서 N을 1로 줄이는 방법</x-see>
+</x-item>
+
+<x-item id="jpa-onetoone-inverse-not-lazy" harm="성능">
+<x-title>양방향 <code>@OneToOne</code>의 <code>mappedBy</code> 쪽에 <code>LAZY</code>를 적고 지연 로딩을 기대한다</x-title>
+<x-symptom>외래 키가 없는 쪽은 상대가 있는지 없는지를 자기 행만으로는 알 수 없어서, <code>LAZY</code>라고 적어도 엔티티를 읽는 즉시 상대 테이블을 조회한다. 그 엔티티를 목록으로 조회하면 행마다 SELECT가 하나씩 붙는다.</x-symptom>
+<x-see to="jpa-basic/05" h="일대일의 함정">프록시와 null 중 하나를 로딩 시점에 정해야 한다는 제약, 목록 조회에서의 N+1, 외래 키 위치를 바꾸는 선택</x-see>
+<x-see to="jpa-basic/07" h="양방향 일대일의 반대쪽">주인 쪽과 반대쪽을 각각 조회했을 때의 SQL 수를 통계로 비교한다</x-see>
+</x-item>
+
+<x-item id="jpa-lazy-outside-transaction" harm="장애">
+<x-title>영속성 컨텍스트가 닫힌 뒤에 지연 로딩 연관을 건드린다</x-title>
+<x-symptom>서비스의 트랜잭션이 끝난 뒤 컨트롤러·뷰·직렬화기가 초기화되지 않은 프록시나 컬렉션을 처음 읽으면 <code>LazyInitializationException</code>(no Session)이 난다. 예외가 나는 줄과 조회한 줄이 멀리 떨어져 있고, OSIV 설정이나 호출 순서에 따라 나기도 하고 안 나기도 한다.</x-symptom>
+<x-see to="jpa-basic/07" h="프록시가 실패하는 순간">준영속 프록시의 초기화가 실패하는 실험과, <code>em.close()</code>가 트랜잭션 경계에 따라 다르게 동작하는 이유</x-see>
+<x-see to="jpa-app2/05" h="OSIV를 끄면">필요한 데이터를 트랜잭션 안에서 모두 읽어 두는 방법들</x-see>
+</x-item>
+
+<x-item id="jpa-osiv-connection-held" harm="장애">
+<x-title>OSIV를 켠 채로 트랜잭션 뒤에 외부 API 호출 같은 느린 일을 한다</x-title>
+<x-symptom>스프링 부트의 기본값인 OSIV에서는 요청이 처음 쓴 DB 커넥션이 트랜잭션이 끝나도 풀로 돌아가지 않고 응답이 끝날 때까지 붙잡혀 있다. 컨트롤러가 외부 API를 기다리는 동안에도 커넥션이 묶이므로, 트래픽이 늘면 DB는 한가한데 커넥션 풀이 고갈되어 요청 스레드가 줄줄이 멈춘다.</x-symptom>
+<x-see to="jpa-app2/05" h="커넥션 풀 고갈의 산술">커넥션 점유 시간이 풀 고갈로 번지는 계산과, 풀 크기 1로 재현한 타임아웃</x-see>
+<x-see to="jpa-app2/05" h="커넥션을 요청 끝까지">커밋 뒤에도 커넥션이 반납되지 않는 이유(커넥션 처리 모드)</x-see>
+</x-item>
+
+<x-item id="jpa-collection-fetch-join-paging" harm="장애">
+<x-title>컬렉션 페치 조인에 페이징을 함께 건다</x-title>
+<x-symptom>일대다 컬렉션을 <code>join fetch</code>한 쿼리에 <code>setFirstResult</code>·<code>setMaxResults</code>(또는 <code>Pageable</code>)를 붙이면 SQL에 LIMIT이 붙지 않는다. Hibernate는 경고(HHH90003004) 한 줄을 남기고 조인 결과 전체를 읽어 엔티티로 만든 뒤 메모리에서 자른다. 결과는 맞으므로 테스트를 통과하고, 데이터가 쌓인 운영에서 한 페이지를 그리려다 힙이 바닥난다.</x-symptom>
+<x-see to="jpa-app2/03" h="한계 1">LIMIT이 행을 세기 때문에 데이터베이스에 맡길 수 없는 이유, 명세가 이 경우를 정의하지 않는다는 것</x-see>
+<x-see to="jpa-basic/10" h="한계 3">경고를 예외로 바꾸는 설정(<code>hibernate.query.fail_on_pagination_over_collection_fetch</code>)과 대안</x-see>
+</x-item>
+
+<x-item id="jpa-multiple-collection-fetch-join" harm="틀린 결과">
+<x-title>컬렉션 둘을 한꺼번에 페치 조인하고, 예외가 나면 <code>List</code>를 <code>Set</code>으로 바꾼다</x-title>
+<x-symptom><code>List</code> 컬렉션 둘을 함께 <code>join fetch</code>하면 <code>MultipleBagFetchException</code>이 난다. 한쪽을 <code>Set</code>으로 바꾸면 예외는 사라지지만 SQL이 돌려주는 행 수는 두 컬렉션 크기의 곱 그대로이고, <code>List</code>로 남은 쪽에는 같은 원소가 여러 번 들어간다.</x-symptom>
+<x-see to="jpa-basic/10" h="한계 2">선수 2명·코치 3명을 함께 페치 조인했을 때 List 쪽 크기가 6이 되는 실험</x-see>
+<x-see to="jpa-app2/03" h="한계 2">bag이 무엇이고 왜 거부되는지, Set으로 바꿔도 전송량의 곱셈이 남는 이유</x-see>
+</x-item>
+
+<x-item id="jpa-fetch-join-filtered-collection" harm="틀린 결과">
+<x-title>페치 조인한 컬렉션에 별칭을 붙여 WHERE로 거른다</x-title>
+<x-symptom><code>join fetch o.lines l where l.quantity > 1</code>처럼 쓰면 조건에 맞는 원소만 담긴 컬렉션이 "초기화 완료"로 영속성 컨텍스트에 남는다. 같은 트랜잭션의 다른 코드가 그 엔티티를 다시 조회해도 같은 인스턴스가 돌아오므로, 합계를 내거나 응답을 만드는 코드가 일부 원소만 보고 조용히 틀린 값을 낸다.</x-symptom>
+<x-see to="jpa-basic/10" h="한계 1">일부만 채워진 컬렉션이 find와 이후 쿼리에서도 그대로 유지되는 실험, 명세가 별칭을 금지한 이유</x-see>
+<x-see to="jpa-app2/03" h="한계 3">주문 상품 일부가 빠진 채 총액이 계산되는 예와 대안(exists 서브쿼리, DTO 조회)</x-see>
+</x-item>
+
+<x-item id="jpa-implicit-join-drops-rows" harm="틀린 결과">
+<x-title>경로 표현식(<code>e.department.name</code>)이 내부 조인이 된다는 것을 모르고 쓴다</x-title>
+<x-symptom>JPQL이나 Querydsl에서 연관을 점으로 따라가면 SQL에는 내부 조인이 생긴다. 연관이 <code>null</code>인 행은 예외 없이 결과에서 빠지고, OR 조건의 다른 쪽을 만족하는 행까지 함께 사라진다. "모든 직원"을 조회한 목록과 합계에서 부서 없는 직원이 조용히 누락된다.</x-symptom>
+<x-see to="jpa-basic/10" h="묵시적 조인이 만드는">SELECT 절의 경로 하나로 네 명 중 한 명이 빠지는 실험과 명세의 정의, 외부 조인을 명시하는 방법</x-see>
+<x-see to="querydsl/07" h="조인을 고를 수 없다">OR 조건과 만났을 때 다른 조건을 만족하는 행까지 사라지는 과정</x-see>
+</x-item>
+
+<x-item id="jpa-findall-filter-in-java" harm="장애">
+<x-title><code>findAll()</code>로 전부 읽어 온 뒤 자바에서 거른다</x-title>
+<x-symptom>조건을 쿼리에 쓰지 않고 테이블 전체를 엔티티로 읽은 다음 스트림의 <code>filter</code>·<code>count</code>·<code>sorted</code>·<code>limit</code>으로 처리하면, 필요한 것이 300건이어도 테이블의 모든 행이 엔티티가 되어 영속성 컨텍스트에 올라온다. 행이 늘수록 느려지다가 <code>OutOfMemoryError</code>로 끝난다.</x-symptom>
+<x-see to="spring-data-jpa/02" h="공통 인터페이스 분석 2">리포지토리의 <code>findAll()</code>이 실제로 실행하는 쿼리</x-see>
+<x-see to="jpa-basic/02" h="메모리와 성능의 관점">영속 엔티티 하나가 힙에 남기는 것들과, 그것이 GC 대상이 되지 않는 이유</x-see>
+<x-see to="querydsl/05" h="조건이 모두 비었을 때">동적 쿼리의 조건이 전부 비어 같은 "전체 조회"가 되는 경우와 막는 층</x-see>
+<x-body>
+<p>리포지토리에 이미 있는 메서드로 일을 끝내려는 마음에서 나오는 코드다. 조건에 맞는 메서드를 새로 만드는 대신 전부 가져와 스트림으로 거른다.</p>
+<pre><code class="language-java">// 실패한 결제만 필요하다
+List<Payment> failed = paymentRepository.findAll().stream()
+        .filter(p -> p.getStatus().equals("FAILED"))
+        .toList();</code></pre>
+<p>코드는 짧고 결과도 맞다. 무엇이 일어나는지는 행 수를 늘려 봐야 보인다.</p>
+
+<h4>실험</h4>
+<p>결제 30만 건이 든 테이블을 만들었다. 1,000건에 한 건꼴로 상태가 <code>FAILED</code>여서 실패한 결제는 300건이다. 스프링 없이 <code>EntityManager</code>로 두 방식을 실행했다. (가)는 <code>findAll()</code>이 실행하는 것과 같은 조건 없는 조회 뒤에 스트림으로 거르고, (나)는 조건을 JPQL에 쓴다. 실행 환경은 JDK 21(Temurin 21.0.13), Hibernate ORM 6.6.53.Final, H2 2.3.232이고, H2는 파일 데이터베이스를 같은 JVM 안에서 여는 임베디드 모드다(데이터 파일은 약 12MB). "로딩한 엔티티"는 Hibernate 통계의 <code>getEntityLoadCount()</code>다.</p>
+<pre><code class="language-java">@Entity
+public class Payment {
+    @Id Long id;
+    String status;      // "DONE" 또는 "FAILED"
+    String memo;
+    // ...
+}
+
+// (가) 전부 읽어 와서 자바에서 거른다
+failed = em.createQuery("select p from Payment p", Payment.class).getResultList()
+           .stream().filter(p -> p.getStatus().equals("FAILED")).toList();
+
+// (나) 데이터베이스가 거른다
+failed = em.createQuery("select p from Payment p where p.status = :s", Payment.class)
+           .setParameter("s", "FAILED").getResultList();</code></pre>
+<pre data-label="실행 결과: -Xmx512m"><code class="language-text">(가)
+Hibernate: select p1_0.id,p1_0.memo,p1_0.status from Payment p1_0
+실패한 결제 = 300건, 로딩한 엔티티 = 300000개
+
+(나)
+Hibernate: select p1_0.id,p1_0.memo,p1_0.status from Payment p1_0 where p1_0.status=?
+실패한 결제 = 300건, 로딩한 엔티티 = 300개</code></pre>
+<p>결과는 같은 300건이다. 차이는 그 300건을 얻으려고 만든 객체 수다. 힙을 줄여 다시 실행했다.</p>
+<pre data-label="실행 결과: -Xmx48m"><code class="language-text">(가)
+Hibernate: select p1_0.id,p1_0.memo,p1_0.status from Payment p1_0
+Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
+	at org.hibernate.engine.internal.EntityEntryContext.addEntityEntry(EntityEntryContext.java:124)
+	at org.hibernate.engine.internal.StatefulPersistenceContext.addEntry(StatefulPersistenceContext.java:700)
+	at org.hibernate.sql.results.graph.entity.internal.EntityInitializerImpl.initializeEntityInstance(EntityInitializerImpl.java:1427)
+	...
+
+(나)
+Hibernate: select p1_0.id,p1_0.memo,p1_0.status from Payment p1_0 where p1_0.status=?
+실패한 결제 = 300건, 로딩한 엔티티 = 300개</code></pre>
+<p>힙 한도를 바꿔 가며 (가)를 실행해 보니 96MB와 128MB에서는 같은 오류로 죽었고 192MB에서 끝까지 실행됐다. 열이 세 개뿐이고 디스크에서 12MB인 데이터를 읽는 데 그만큼이 필요했다. 오류가 난 지점은 실행마다 달라질 수 있지만, 위 스택에서는 읽은 행을 영속성 컨텍스트에 등록하는 <code>addEntityEntry</code>였다. (나)는 48MB에서도 끝났다. 같은 JVM 안에서 도는 H2 엔진이 30만 행을 훑는 일 자체는 그 힙으로 충분했다는 뜻이다.</p>
+
+<h4>왜 그런가</h4>
+<p>스트림이 게으르다는 사실은 여기서 도움이 되지 않는다. <code>filter</code>가 실행되는 시점에는 <code>getResultList()</code>가 이미 끝나 있고, 그 리스트에는 30만 개의 엔티티가 모두 들어 있다. 스트림은 이미 만들어진 것 중에서 고를 뿐이다.</p>
+<p>그리고 엔티티는 행 하나 크기의 객체 하나로 끝나지 않는다. 조회한 엔티티는 영속 상태가 되므로 영속성 컨텍스트가 엔티티마다 등록 정보와 변경 감지용 스냅샷을 함께 보관한다. Hibernate 6.6 Introduction 5.1절은 영속성 컨텍스트가 자기 엔티티 모두에 대한 강한 참조를 쥐고 있어 가비지 컬렉션을 막는다고 적는다. 스트림이 299,700개를 걸러 버려도 그 객체들은 영속성 컨텍스트가 닫힐 때까지 힙에 남는다. 트랜잭션이 길면 그만큼 오래 남고, 플러시 때마다 전부가 변경 감지의 비교 대상이 된다.</p>
+<p>데이터베이스 쪽에서도 손해다. WHERE가 없는 쿼리는 테이블 전체를 읽어 전부 전송한다. 상태 열에 인덱스가 있어도 쓸 기회가 없다. 조건을 SQL에 쓰면 데이터베이스는 조건에 맞는 행만 찾아 보내고, 나머지는 애플리케이션까지 오지 않는다.</p>
+<p>같은 실수는 모양을 바꿔 나타난다. 개수를 세려고 <code>findAll().size()</code>를 부르고, 최근 10건을 얻으려고 <code>findAll()</code> 뒤에 정렬해서 앞을 자르고, 하나라도 있는지 보려고 전체를 읽어 <code>isEmpty()</code>를 묻는다. 모두 테스트 데이터 수십 건에서는 차이가 없고, 테이블이 자라면서 응답 시간과 힙 사용량이 행 수에 비례해 늘어난다.</p>
+
+<h4>고치는 법</h4>
+<p>거르기, 세기, 정렬해서 자르기, 존재 확인은 데이터베이스에 맡긴다.</p>
+<ul>
+<li>조건은 쿼리에 쓴다. Spring Data JPA라면 <code>findByStatus(...)</code> 같은 쿼리 메서드나 <code>@Query</code>, 조건이 동적으로 바뀌면 Querydsl을 쓴다.</li>
+<li>개수는 <code>count</code> 쿼리로, 존재 여부는 <code>exists</code> 쿼리로 묻는다. 엔티티를 만들지 않는다.</li>
+<li>상위 N건은 정렬과 행 제한을 쿼리에 넣는다. JPA의 <code>setMaxResults</code>, Spring Data의 <code>Pageable</code>이 SQL의 행 제한 구문이 된다.</li>
+</ul>
+<p>조건을 쿼리로 옮겨도 남는 것이 있다. 조건에 맞는 행 자체가 많으면 같은 일이 다시 생긴다. 결과 건수에 상한이 없는 조회에는 페이징이나 행 제한을 함께 둔다. 검색 조건이 모두 비어 WHERE가 사라지는 동적 쿼리도 결과는 <code>findAll()</code>과 같다. 정말로 전체를 훑어야 하는 배치 작업이라면 한 번에 읽지 않고 구간을 나눠 읽으면서, 구간마다 영속성 컨텍스트를 비운다. Introduction 7.13절은 세션에서 엔티티를 떼어 내는 <code>detach()</code>와 <code>clear()</code>를 소개하면서, 그런 조작이 필요하다고 느껴지는 상황이라면 영속성 컨텍스트가 없는 <code>StatelessSession</code>을 고려하라고 권한다.</p>
+</x-body>
+<x-refs>
+<li><a href="https://docs.jboss.org/hibernate/orm/6.6/introduction/html_single/Hibernate_Introduction.html#persistence-contexts">Hibernate ORM 6.6 Introduction 5.1 Persistence Contexts</a> — 영속성 컨텍스트가 엔티티에 대한 강한 참조를 쥐어 가비지 컬렉션을 막는다는 설명</li>
+<li><a href="https://docs.jboss.org/hibernate/orm/6.6/introduction/html_single/Hibernate_Introduction.html#pagination">Hibernate ORM 6.6 Introduction 5.14 Limits, pagination, and ordering</a> — 결과 행 수를 제한하는 방법(<code>setMaxResults</code>)</li>
+<li><a href="https://docs.jboss.org/hibernate/orm/6.6/introduction/html_single/Hibernate_Introduction.html#session-cache-management">Hibernate ORM 6.6 Introduction 7.13 Session cache management</a> — 엔티티가 세션이 버려질 때까지 메모리에 남는다는 것, <code>detach()</code>·<code>clear()</code>와 StatelessSession 권고</li>
+</x-refs>
+</x-item>
+
+<x-item id="jpa-inverse-side-only" harm="데이터 손상">
+<x-title>양방향 연관에서 주인이 아닌 쪽(<code>mappedBy</code>)에만 값을 넣는다</x-title>
+<x-symptom><code>team.getMembers().add(member)</code>만 하고 <code>member.setTeam(team)</code>을 빼먹으면 외래 키가 <code>null</code>로 저장된다. 예외도 경고도 없고, 같은 트랜잭션 안에서는 컬렉션에 들어 있어 정상으로 보인다. 다시 조회하면 그 회원은 팀의 목록에 없다.</x-symptom>
+<x-see to="jpa-basic/04" h="주의점 1">역방향에만 넣었을 때 외래 키가 null로 들어가는 실험과 <code>optional = false</code>로 드러내는 방법</x-see>
+<x-see to="jpa-basic/04" h="연관관계의 주인">참조는 둘인데 외래 키는 하나라서 한쪽만 기준이 되는 이유</x-see>
+<x-see to="jpa-basic/04" h="연관관계 편의 메서드">양쪽을 한 메서드에서 함께 맞추는 방법</x-see>
+</x-item>
+
+<x-item id="jpa-persist-without-transaction" harm="데이터 손상">
+<x-title>트랜잭션을 시작하지 않고 <code>persist</code>한다</x-title>
+<x-symptom>직접 만든 <code>EntityManager</code>에서 트랜잭션 없이 <code>persist</code>를 부르면 예외 없이 끝나고 엔티티는 영속성 컨텍스트에 들어간다. 그러나 INSERT는 끝내 나가지 않고, <code>EntityManager</code>가 닫히면 데이터는 흔적 없이 사라진다. 저장에 실패한 것이 아니라 아직 저장하지 않은 채로 끝난 것이라 오류가 남지 않는다.</x-symptom>
+<x-see to="jpa-basic/01" h="흔한 함정: 실험으로">트랜잭션 밖 persist가 받아들여진 뒤 flush에서야 <code>TransactionRequiredException</code>이 나는 실험, 명세가 정한 범위</x-see>
+<x-see to="jpa-basic/02" h="트랜잭션을 지원하는 쓰기 지연">persist가 INSERT를 바로 보내지 않고 모아 두는 구조</x-see>
+</x-item>
+
+<x-item id="jpa-detached-entity-modified" harm="데이터 손상">
+<x-title>준영속 엔티티의 필드를 고치고 반영되기를 기대한다</x-title>
+<x-symptom>트랜잭션이 끝난 뒤의 엔티티, <code>detach</code>·<code>clear</code>된 엔티티, 폼이나 JSON의 값에 식별자를 채워 새로 만든 객체는 영속성 컨텍스트에 등록 정보가 없다. setter로 값을 바꿔도 UPDATE가 나가지 않고 예외도 없어서, 화면에서는 저장된 것처럼 보이고 데이터베이스는 그대로다.</x-symptom>
+<x-see to="jpa-basic/02" h="준영속 상태">엔티티가 준영속이 되는 여섯 경로와, 고쳐도 UPDATE가 나가지 않는 실험</x-see>
+<x-see to="jpa-app1/05" h="상품 수정: 폼에서">폼에서 돌아온 값으로 만든 객체가 왜 준영속과 같은 처지인지</x-see>
+</x-item>
+
+<x-item id="jpa-modify-entity-for-display" harm="데이터 손상">
+<x-title>조회한 엔티티를 화면·응답에 맞게 고쳐서 내보낸다</x-title>
+<x-symptom>트랜잭션 안에서 조회한 엔티티의 필드를 마스킹하거나 컬렉션에서 원소를 빼면, 저장 메서드를 부르지 않아도 커밋 때 그 변경이 UPDATE·DELETE로 데이터베이스에 반영된다. 화면에서만 가리려던 전화번호가 가려진 채로 저장되고, 화면에서만 빼려던 행이 삭제된다.</x-symptom>
+<x-see to="jpa-app1/04" h="필드 하나를 바꿨을 뿐인데">스냅샷과 플러시가 UPDATE를 만드는 과정</x-see>
+<x-see to="jpa-app2/05" h="함정: 트랜잭션 밖에서 바꾼">OSIV가 켜져 있으면 컨트롤러에서 고친 엔티티도 같은 요청의 다음 트랜잭션이 저장한다는 실험</x-see>
+<x-see to="jpa-basic/07" h="고아 객체 제거">컬렉션에서 원소를 빼는 것이 삭제가 되는 규칙</x-see>
+<x-see to="spring-data-jpa/06" h="readOnly = true가 실제로">읽기 전용 트랜잭션이 플러시 모드와 스냅샷에 하는 일, 그 효과가 생기는 조건</x-see>
+<x-body>
+<p>변경 감지는 "엔티티를 고치면 저장된다"는 편리함이지만, 뒤집어 읽으면 "저장할 생각 없이 고쳐도 저장된다"는 뜻이다. 조회만 하는 메서드에서 엔티티를 응답에 맞게 다듬는 코드가 이 뒷면을 밟는다.</p>
+
+<h4>실수가 나오는 코드 1: 값을 가려서 보여 준다</h4>
+<pre><code class="language-java">record CustomerView(String name, String phone) {}
+
+static String mask(String phone) {                       // 010-1234-5678 → 010-****-5678
+    return phone.substring(0, 4) + "****" + phone.substring(8);
+}
+
+// 고객 한 명을 화면에 보여 주는 "조회" 메서드
+static CustomerView view(EntityManager em, Long id) {
+    Customer c = em.find(Customer.class, id);
+    c.setPhone(mask(c.getPhone()));                       // 화면에는 가려서 보여 주려고
+    return new CustomerView(c.getName(), c.getPhone());
+}</code></pre>
+<p>전화번호가 <code>010-1234-5678</code>인 고객을 저장해 두고, 새 트랜잭션에서 <code>view()</code>를 호출한 뒤 커밋했다. 그다음 다른 <code>EntityManager</code>의 네이티브 쿼리로 데이터베이스의 값을 읽었다. 실행 환경은 JDK 21(Temurin 21.0.13), Hibernate ORM 6.6.53.Final, H2 2.3.232 인메모리다.</p>
+<pre data-label="실행 결과"><code class="language-text">--- 조회 시작
+Hibernate: select c1_0.id,c1_0.name,c1_0.phone from Customer c1_0 where c1_0.id=?
+CustomerView[name=kim, phone=010-****-5678]
+--- 커밋
+Hibernate: update Customer set name=?,phone=? where id=?
+DB 에 남은 phone = 010-****-5678</code></pre>
+<p>화면에는 의도한 대로 가려진 번호가 나갔다. 그리고 커밋에서 UPDATE가 나가 원래 번호가 사라졌다. 이 고객을 한 번 조회할 때마다 한 명씩 번호를 잃는다. 응답이 정상이라 화면 테스트로는 알 수 없고, 나중에 원본이 필요한 자리(문자 발송, 본인 확인)에서 드러난다.</p>
+
+<h4>실수가 나오는 코드 2: 목록에서 일부를 빼고 보여 준다</h4>
+<pre><code class="language-java">@Entity
+public class Cart {
+    @Id @GeneratedValue Long id;
+    @OneToMany(mappedBy = "cart", cascade = CascadeType.ALL, orphanRemoval = true)
+    List<CartLine> lines = new ArrayList<>();
+    // ...
+}
+
+// 장바구니 화면: 품절된 상품은 빼고 보여 준다
+static List<String> view(EntityManager em, Long cartId) {
+    Cart cart = em.find(Cart.class, cartId);
+    cart.getLines().removeIf(CartLine::isSoldOut);          // 화면에서만 빼려는 의도
+    return cart.getLines().stream().map(CartLine::getProduct).toList();
+}</code></pre>
+<p>장바구니에 keyboard, mouse(품절), monitor 세 줄을 저장해 두고 같은 순서로 실행했다.</p>
+<pre data-label="실행 결과"><code class="language-text">--- 조회 시작
+Hibernate: select c1_0.id from Cart c1_0 where c1_0.id=?
+Hibernate: select l1_0.cart_id,l1_0.id,l1_0.product,l1_0.soldOut from CartLine l1_0 where l1_0.cart_id=?
+[keyboard, monitor]
+--- 커밋
+Hibernate: delete from CartLine where id=?
+DB 에 남은 행 = [keyboard, monitor]</code></pre>
+<p>이번에는 행이 삭제됐다. 품절이 풀려도 그 상품은 장바구니로 돌아오지 않는다.</p>
+
+<h4>왜 그런가</h4>
+<p>Jakarta Persistence 3.1 명세 3.2.4절은 영속 엔티티의 상태가 트랜잭션 커밋 때 데이터베이스에 동기화된다고 정하고, 엔티티 상태의 변경에는 영속 필드에 새 값을 대입하는 것이 포함된다고 적는다. 동기화의 조건은 "그 엔티티가 영속 상태인가"와 "값이 달라졌는가" 둘뿐이다. 개발자가 저장을 의도했는지, 그 메서드의 이름이 조회인지는 조건에 없다. <code>em.find</code>가 돌려준 객체는 영속 상태이고, Hibernate는 커밋 직전 플러시에서 그 객체의 현재 값을 로딩 시점의 스냅샷과 비교해 UPDATE를 만든다. <code>setPhone</code>이 불렸는지를 보는 것이 아니라 값이 달라졌는지를 본다.</p>
+<p>두 번째 경우는 명세 2.10절의 고아 객체 제거 규칙이다. <code>orphanRemoval</code>이 켜진 연관에서 대상 엔티티가 관계의 컬렉션에서 제거되면 그 엔티티에 remove 연산이 적용되고, 그 연산은 플러시 때 실행된다. <code>getLines()</code>가 돌려준 것은 사본이 아니라 Hibernate가 추적하는 바로 그 컬렉션이므로, <code>removeIf</code>는 "이 줄을 지워라"는 지시가 된다. <code>orphanRemoval</code>이 없는 양방향 일대다였다면 역방향 컬렉션의 변경이라 SQL은 나가지 않지만, 같은 영속성 컨텍스트에서 그 장바구니를 다시 읽는 코드는 줄이 빠진 컬렉션을 받는다.</p>
+<p>위 실험은 스프링 없이 돌렸다. 조회 메서드가 스프링의 <code>@Transactional(readOnly = true)</code>로 새 트랜잭션을 시작하는 경우는 사정이 다르다. Spring Framework 6.2.19의 <code>HibernateJpaDialect</code>는 읽기 전용 트랜잭션을 시작할 때 세션의 플러시 모드를 <code>MANUAL</code>로 바꾸므로(바이트코드의 <code>prepareFlushMode</code>에서 확인) 커밋 때 플러시가 없고, 이 UPDATE·DELETE도 나가지 않는다. 스프링의 읽기 전용 트랜잭션에서 엔티티를 고쳐 본 결과는 위의 스프링 데이터 JPA 링크에 있다. 이 부록의 실험에서도 세션에 같은 설정을 직접 걸고(<code>setHibernateFlushMode(FlushMode.MANUAL)</code>, <code>setDefaultReadOnly(true)</code>) 위의 두 <code>view()</code>를 다시 실행하자 커밋 때 SQL이 나가지 않았고, 데이터베이스에는 원래 번호와 품절 줄이 그대로 남았다. 그렇다고 실수가 없어진 것은 아니다. 같은 트랜잭션에서 그 엔티티를 다시 읽는 코드는 가려진 값을 진짜 값으로 받는다(같은 실행에서 <code>em.find</code>로 다시 읽은 번호는 <code>010-****-5678</code>이었다). 누군가 <code>readOnly</code>를 떼거나 그 메서드를 쓰기 트랜잭션 안에서 호출하면 읽기 전용 설정은 적용되지 않고 바깥 트랜잭션을 따르므로 그날부터 UPDATE가 나간다. OSIV가 켜진 애플리케이션에서는 읽기 전용 트랜잭션에서 읽은 엔티티도 요청이 끝날 때까지 평범한 영속 엔티티로 남아서, 트랜잭션이 끝난 뒤 컨트롤러에서 고친 것까지 같은 요청의 다음 쓰기 트랜잭션이 저장한다(위의 JPA 활용 2 링크).</p>
+
+<h4>고치는 법</h4>
+<p>엔티티는 데이터베이스 상태의 사본으로 두고, 보여 주기 위한 가공은 엔티티 밖에서 한다. 가공한 값은 DTO에만 담는다.</p>
+<pre><code class="language-java">static CustomerView view(EntityManager em, Long id) {
+    Customer c = em.find(Customer.class, id);
+    return new CustomerView(c.getName(), mask(c.getPhone()));   // 가공한 값은 DTO 에만 담는다
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">--- 조회 시작
+Hibernate: select c1_0.id,c1_0.name,c1_0.phone from Customer c1_0 where c1_0.id=?
+CustomerView[name=kim, phone=010-****-5678]
+--- 커밋
+DB 에 남은 phone = 010-1234-5678</code></pre>
+<p>컬렉션도 같다. 엔티티의 컬렉션을 고치지 않고 스트림으로 걸러 새 리스트를 만든다(<code>cart.getLines().stream().filter(l -> !l.isSoldOut())...</code>). 품절이 아닌 줄만 필요하다면 처음부터 그 조건으로 조회하는 편이 낫다.</p>
+<p>구조로 막는 방법도 있다. 엔티티에 setter를 열어 두지 않고 의미가 있는 변경 메서드만 두면 "표시용으로 살짝 고치는" 코드를 쓸 자리가 줄어든다. 컬렉션 getter가 <code>Collections.unmodifiableList(lines)</code>를 돌려주게 하면 바깥의 <code>removeIf</code>는 <code>UnsupportedOperationException</code>으로 바로 드러난다. 조회 전용 경로에서 엔티티 대신 DTO를 직접 조회하면 고칠 엔티티 자체가 없다.</p>
+</x-body>
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html#a1955">Jakarta Persistence 3.1 명세 3.2.4 Synchronization to the Database</a> — 영속 엔티티의 상태가 커밋 때 동기화되고, 필드에 새 값을 대입하는 것이 상태 변경에 포함된다는 규정</li>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html#a516">Jakarta Persistence 3.1 명세 2.10 Entity Relationships</a> — orphanRemoval: 관계의 컬렉션에서 제거된 엔티티에 remove가 적용되고 플러시 때 실행된다는 규정</li>
+</x-refs>
+</x-item>
+
+<x-item id="jpa-merge-partial-object" harm="데이터 손상">
+<x-title>폼에서 받은 값으로 만든 객체를 <code>merge</code>해서 수정한다</x-title>
+<x-symptom><code>merge</code>는 "채워진 필드만 반영하라"가 아니라 "이 객체의 상태가 새 상태"라는 뜻이다. 폼에 없던 필드는 <code>null</code>이나 0으로 덮이고, 수정 화면을 열어 둔 사이 다른 사람이 고친 값도 폼에 실려 온 옛 값으로 되돌아간다. 예외는 나지 않는다.</x-symptom>
+<x-see to="jpa-app1/05" h="merge가 데이터를 잃는">식별자와 가격만 채운 객체를 merge했을 때 이름이 null, 재고가 0이 되는 실험과 나머지 두 경우</x-see>
+<x-see to="jpa-app1/05" h="그래서 수정은 이렇게">식별자와 바꿀 값만 받아 조회 후 변경 감지로 고치는 구조</x-see>
+</x-item>
+
+<x-item id="jpa-save-assigned-id-merge" harm="데이터 손상">
+<x-title>식별자를 직접 넣은 새 엔티티를 Spring Data JPA <code>save()</code>로 저장한다</x-title>
+<x-symptom><code>save()</code>는 식별자가 채워져 있으면 새 엔티티가 아니라고 판단해 <code>merge</code>를 부른다. 저장할 때마다 SELECT가 먼저 나가고, 같은 식별자의 행이 이미 있으면 기본 키 중복 오류가 나는 대신 기존 행을 UPDATE로 덮어쓴다. "등록" 코드가 조용히 "덮어쓰기"가 된다.</x-symptom>
+<x-see to="spring-data-jpa/06" h="식별자를 직접 할당하면">SELECT가 붙는 경우, 기존 행을 덮어쓰는 경우, 예외가 나는 경우를 각각 실험한다</x-see>
+<x-see to="spring-data-jpa/06" h="판별을 바로잡는 방법"><code>Persistable</code> 구현과 래퍼 타입 <code>@Version</code>으로 새 엔티티 판별을 고치는 방법</x-see>
+</x-item>
+
+<x-item id="jpa-lost-update-without-version" harm="데이터 손상">
+<x-title>읽은 값으로 계산해 저장하면서 <code>@Version</code>도 잠금도 두지 않는다</x-title>
+<x-symptom>두 트랜잭션이 같은 행을 읽어 각자 계산한 값을 쓰면 나중 UPDATE가 앞의 변경을 덮는다. Hibernate가 만드는 UPDATE는 "1 줄여라"가 아니라 메모리에서 계산한 "9로 만들어라"이기 때문이다. 재고 10에서 두 번 뺐는데 9가 남고, 어느 쪽에도 오류가 없다. MySQL의 기본 격리 수준(REPEATABLE READ)에서도 결과는 같다.</x-symptom>
+<x-see to="jpa-app1/04" h="재고 감소의 경쟁 조건">두 EntityManager로 재현한 갱신 유실과 세 가지 해법(낙관적 잠금, 비관적 잠금, 조건부 UPDATE)</x-see>
+<x-see to="spring-data-jpa/04" h="JPA 락"><code>@Lock</code>이 SQL의 잠금 절이 되는 과정</x-see>
+</x-item>
+
+<x-item id="jpa-bulk-update-stale-context" harm="데이터 손상">
+<x-title>벌크 UPDATE·DELETE 뒤에 이미 조회해 둔 엔티티를 계속 쓴다</x-title>
+<x-symptom>벌크 연산은 영속성 컨텍스트를 거치지 않고 데이터베이스만 바꾼다. 먼저 읽어 둔 엔티티는 옛 값을 들고 있고, 다시 JPQL로 조회해도 같은 인스턴스가 옛 값 그대로 돌아온다. 그 엔티티의 다른 필드를 고치면 변경 감지가 만든 전체 열 UPDATE가 벌크 연산의 결과를 옛 값으로 되돌린다.</x-symptom>
+<x-see to="jpa-basic/10" h="벌크 연산">벌크 UPDATE 전후를 단계별로 추적하고, 낡은 엔티티가 결과를 덮어쓰는 실험과 안전한 순서를 본다</x-see>
+<x-see to="spring-data-jpa/04" h="벌크 연산 뒤의"><code>@Modifying</code>의 <code>clearAutomatically</code>가 하는 일과 그 뒤에 남는 주의점</x-see>
+</x-item>
+
+<x-item id="jpa-jdbc-mix-without-flush" harm="틀린 결과">
+<x-title>JPA로 바꾼 뒤 플러시 없이 같은 트랜잭션에서 JdbcTemplate·MyBatis로 읽는다</x-title>
+<x-symptom>엔티티의 값을 바꾼 직후 같은 <code>@Transactional</code> 메서드에서 JdbcTemplate이나 MyBatis로 그 행을 조회하거나 집계하면 바꾸기 전 값이 나온다. 같은 커넥션, 같은 트랜잭션인데도 변경 감지의 UPDATE는 아직 플러시되지 않았고, JDBC로 실행한 SQL은 Hibernate의 자동 플러시를 일으키지 않기 때문이다. 반대로 JDBC로 행을 고친 뒤에는 이미 읽어 둔 엔티티가 옛 값을 그대로 들고 있다.</x-symptom>
+<x-see to="spring-db2/06" h="활용 방안 3"><code>JpaTransactionManager</code>가 JdbcTemplate과 커넥션을 공유하는 구조, 변경 직후 JDBC 조회는 옛 값이고 <code>em.flush()</code> 뒤에는 새 값인 추적, 반대 방향의 <code>refresh</code>·<code>clear</code></x-see>
+<x-see to="jpa-basic/02" h="플러시: 영속성 컨텍스트를">플러시가 일어나는 세 시점과, JPQL·네이티브 쿼리 앞의 자동 플러시가 무엇을 기준으로 판단되는지</x-see>
+<x-see to="jpa-basic/09" h="프로젝션">다른 경로로 바뀐 행을 JPQL로 다시 읽어도 엔티티는 옛 값이고 스칼라만 새 값인 실험</x-see>
+</x-item>
+
+<x-item id="jpa-batch-without-flush-clear" harm="장애">
+<x-title>한 트랜잭션에서 수만 건을 저장·수정하면서 영속성 컨텍스트를 비우지 않는다</x-title>
+<x-symptom>영속성 컨텍스트는 관리하는 엔티티와 스냅샷을 모두 강한 참조로 쥐고 있다. 루프가 돌수록 힙이 차고, 자동 플러시가 일어날 때마다 그때까지 쌓인 엔티티 전부를 비교하므로 뒤로 갈수록 느려지다가 <code>OutOfMemoryError</code>로 끝난다. <code>flush()</code>만으로는 메모리가 줄지 않고, <code>clear()</code>만 하면 보내지 않은 변경이 사라진다.</x-symptom>
+<x-see to="jpa-basic/02" h="메모리와 성능의 관점">영속 엔티티가 GC 대상이 되지 않는 이유와, 일정 건수마다 flush 후 clear를 하는 순서</x-see>
+<x-see to="jpa-basic/10" h="벌크 연산">같은 값으로 여러 행을 바꾸는 일이라면 엔티티를 올리지 않고 SQL 한 문장으로 끝내는 방법과 그 주의점</x-see>
+</x-item>
+
+<x-item id="jpa-identity-no-jdbc-batch" harm="성능">
+<x-title><code>IDENTITY</code> 전략 엔티티를 대량으로 넣으면서 JDBC 배치가 될 것으로 기대한다</x-title>
+<x-symptom><code>IDENTITY</code>는 INSERT를 실행해야 키를 알 수 있어서 <code>persist</code>마다 INSERT가 바로 나간다. <code>hibernate.jdbc.batch_size</code>를 켜도 이 엔티티의 INSERT는 묶이지 않으므로 십만 건을 넣으면 데이터베이스 왕복도 십만 번이다.</x-symptom>
+<x-see to="jpa-basic/03" h="IDENTITY: 키를">persist 안에서 INSERT가 실행되는 이유와, 배치 설정을 켠 채 IDENTITY와 SEQUENCE를 비교한 JDBC 추적</x-see>
+<x-see to="jpa-basic/03" h="SEQUENCE와 allocationSize">키를 먼저 받아 두어 INSERT를 모을 수 있는 전략</x-see>
+</x-item>
+
+<x-item id="jpa-delete-all-row-by-row" harm="성능">
+<x-title><code>deleteAll()</code>·<code>deleteBy…</code>로 대량의 행을 지운다</x-title>
+<x-symptom>이름과 달리 DELETE 한 문장이 아니다. 대상을 모두 SELECT해 엔티티로 올린 뒤 한 건씩 <code>remove</code>하므로, 만 건이면 엔티티 만 개와 DELETE 만 번이다. 한 문장으로 지우는 <code>deleteAllInBatch()</code>나 벌크 쿼리는 영속성 컨텍스트와 영속성 전이를 거치지 않는다는 다른 성질을 가진다.</x-symptom>
+<x-see to="spring-data-jpa/06" h="메서드별로 읽기"><code>deleteAll()</code>과 <code>deleteAllInBatch()</code>가 각각 실행하는 것</x-see>
+<x-see to="spring-data-jpa/03" h="파생 쿼리가 SQL이 되기까지">파생 삭제 쿼리가 지우기 전에 먼저 읽는다는 것을 SQL 로그로 확인한다</x-see>
+</x-item>
+
+<x-item id="jpa-cascade-remove-shared-target" harm="데이터 손상">
+<x-title>여러 엔티티가 공유하는 대상에 <code>CascadeType.REMOVE</code>·<code>ALL</code>을 건다</x-title>
+<x-symptom><code>@ManyToOne</code> 쪽이나 여러 부모가 함께 참조하는 자식에 삭제가 전이되면, 엔티티 하나를 지울 때 다른 엔티티들이 아직 참조하는 대상까지 지우려 한다. 외래 키 제약이 있으면 삭제가 실패하고, 없으면 존재하지 않는 행을 가리키는 참조가 남는다.</x-symptom>
+<x-see to="jpa-basic/07" h="생명주기를 함께하는">전이와 고아 객체 제거를 걸어도 되는 세 조건, <code>@ManyToOne</code>에 REMOVE를 걸면 생기는 일</x-see>
+<x-see to="jpa-app1/02" h="주의점 5">주문 항목에서 상품으로 전이를 걸었을 때의 결과, JPA의 cascade와 DB의 ON DELETE CASCADE의 차이</x-see>
+</x-item>
+
+<x-item id="jpa-orphan-removal-collection-replaced" harm="장애">
+<x-title><code>orphanRemoval</code> 컬렉션 필드를 새 컬렉션으로 통째로 갈아 끼운다</x-title>
+<x-symptom>내용을 바꾸려고 setter로 새 <code>ArrayList</code>를 넣으면, Hibernate가 추적하던 래퍼 컬렉션이 엔티티에서 떨어져 나가 플러시에서 예외가 난다("A collection with orphan deletion was no longer referenced by the owning entity instance"). 수정 요청 전체가 실패한다.</x-symptom>
+<x-see to="jpa-basic/07" h="고아 객체 제거">컬렉션 필드에 실제로 들어 있는 것과, 참조는 두고 <code>clear()</code>·<code>addAll()</code>로 내용만 바꿔야 하는 이유</x-see>
+<x-see to="jpa-app1/02" h="주의점 3">Hibernate가 컬렉션 필드를 자기 구현으로 바꿔 끼우는 과정</x-see>
+</x-item>
+
+<x-item id="jpa-embeddable-shared-reference" harm="데이터 손상">
+<x-title>가변 임베디드 값 객체 하나를 여러 엔티티가 함께 참조한다</x-title>
+<x-symptom>한 회원의 <code>Address</code> 객체를 다른 회원에게 그대로 대입한 뒤 한쪽에서 <code>setCity()</code>를 부르면, 두 엔티티가 모두 변경된 것으로 감지되어 UPDATE가 두 번 나간다. 고치지 않은 회원의 주소까지 바뀌고, 예외도 경고도 없다.</x-symptom>
+<x-see to="jpa-basic/08" h="공유 참조의 부작용">한 번 바꿨는데 UPDATE가 두 번 나가는 실험과 힙·영속성 컨텍스트의 그림</x-see>
+<x-see to="jpa-basic/08" h="불변 객체로 막는다">값 타입을 불변으로 만들어, 공유되어도 부작용이 생기지 않게 하는 방법</x-see>
+</x-item>
+
+<x-item id="jpa-element-collection-without-equals" harm="성능">
+<x-title>값 타입 컬렉션의 원소 클래스에 <code>equals</code>·<code>hashCode</code>를 구현하지 않는다</x-title>
+<x-symptom>Set으로 매핑한 임베디드 값 컬렉션에서 Hibernate는 스냅샷의 복사본과 현재 원소를 <code>equals</code>·<code>hashCode</code>로 대조한다. 구현이 없으면 어떤 원소도 서로 같지 않아서, 아무것도 바꾸지 않아도 플러시할 때마다 그 컬렉션의 행을 전부 지우고 다시 넣는다. 데이터는 맞게 남으므로 기능 테스트로는 보이지 않는다.</x-symptom>
+<x-see to="jpa-basic/08" h="하이버네이트는 값을 어떻게">원소 하나를 지웠을 때와 아무것도 하지 않았을 때 나가는 SQL, <code>PersistentSet</code>의 변경 추적 방식</x-see>
+<x-see to="jpa-basic/08" h="값 타입 컬렉션의 변경">매핑(Set, List, nullable 여부)에 따라 한 행만 지우는지 전부 다시 쓰는지</x-see>
+</x-item>
+
+<x-item id="jpa-enumerated-ordinal" harm="데이터 손상">
+<x-title><code>@Enumerated</code>를 기본값(<code>ORDINAL</code>)으로 둔다</x-title>
+<x-symptom>기본값은 상수의 선언 순서 번호를 저장한다. 나중에 상수를 중간에 끼워 넣거나 순서를 바꾸면 데이터베이스의 숫자는 그대로인데 의미가 한 칸씩 밀려 읽힌다. 확정이 대기로, 취소가 확정으로 보이고, 예외도 경고도 없다.</x-symptom>
+<x-see to="jpa-basic/03" h="@Enumerated, 날짜와 시간">상수 하나를 끼워 넣었을 때 저장된 값이 어떻게 달리 읽히는지와, <code>STRING</code>을 고를 때 MySQL에서 알아야 할 것</x-see>
+</x-item>
+
+<x-item id="jpa-ddl-auto-in-production" harm="데이터 손상">
+<x-title>운영 데이터베이스에 <code>ddl-auto</code>를 <code>create</code>나 <code>update</code>로 둔다</x-title>
+<x-symptom><code>create</code>·<code>create-drop</code>은 애플리케이션이 뜰 때 테이블을 지우고 다시 만들므로 데이터가 사라진다. <code>update</code>는 없는 것을 추가만 하고 엔티티에서 지운 컬럼은 남겨 두므로, 남은 NOT NULL 컬럼 때문에 그 테이블의 모든 INSERT가 실패하게 된다.</x-symptom>
+<x-see to="jpa-basic/03" h="데이터베이스 스키마 자동 생성">값마다 시작·종료 때 실행되는 DDL, update가 남긴 컬럼으로 INSERT가 실패하는 실험, 스프링 부트의 기본값이 환경에 따라 달라지는 규칙</x-see>
+</x-item>
+
+<x-item id="jpa-jpql-string-concatenation" harm="보안">
+<x-title>JPQL에 입력값을 문자열 연결로 넣는다</x-title>
+<x-symptom>JPQL도 문자열이라 SQL과 똑같이 인젝션이 된다. <code>"... where e.name = '" + name + "'"</code>에 <code>x' or '1'='1</code>이 들어오면 조건이 무력해지고, Hibernate는 JPQL의 리터럴을 SQL의 리터럴로 옮기므로 공격이 데이터베이스까지 그대로 간다. "엔티티를 대상으로 하는 쿼리라서 안전하다"는 근거가 없다.</x-symptom>
+<x-see to="jpa-basic/09" h="파라미터 바인딩은 문법이">같은 입력을 문자열 연결과 <code>setParameter</code>에 넣었을 때의 차이, 바인딩이 쿼리 해석 캐시에도 영향을 주는 이유</x-see>
+</x-item>
+
+<x-item id="jpa-entitymanager-shared-across-threads" harm="데이터 손상">
+<x-title>직접 만든 <code>EntityManager</code> 하나를 여러 스레드가 함께 쓴다</x-title>
+<x-symptom><code>EntityManager</code>를 싱글톤 객체의 필드나 static 변수에 하나 두면 요청 스레드들이 영속성 컨텍스트 하나를 같이 쓴다. 서로의 엔티티와 대기 중인 SQL이 섞이고, 한 스레드의 커밋이 다른 스레드가 고치던 엔티티까지 플러시한다. 스프링이 주입하는 <code>EntityManager</code>가 공유되어도 안전한 것은 그것이 트랜잭션별 실제 객체로 위임하는 프록시이기 때문이다.</x-symptom>
+<x-see to="jpa-basic/01" h="흔한 함정: 실험으로">EntityManagerFactory는 하나를 공유하고 EntityManager는 스레드마다 따로 쓰는 이유, 공유했을 때 무너지는 것</x-see>
+<x-see to="jpa-app1/03" h="싱글톤 리포지토리와">주입되는 공유 EntityManager 프록시가 호출마다 현재 트랜잭션의 실제 객체를 찾아가는 과정</x-see>
+</x-item>

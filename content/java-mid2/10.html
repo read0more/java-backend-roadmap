@@ -1,0 +1,1270 @@
+<x-meta>
+deck: 어떤 자료 구조든 같은 코드로 훑게 하는 Iterator와 순서를 정하는 Comparable·Comparator를 바이트코드와 JDK 소스로 확인하고, fail-fast 검사와 TimSort의 동작, 컬렉션 프레임워크 전체 지도를 정리한다.
+minutes: 110
+</x-meta>
+
+<x-goals>
+<li><code>Iterable</code>과 <code>Iterator</code>를 직접 구현하고, 두 인터페이스가 나뉜 이유를 "위치를 기억하는 상태가 어디에 놓이는가"로 설명할 수 있다.</li>
+<li>향상된 for문이 배열과 <code>Iterable</code>에 대해 각각 어떤 코드로 번역되는지 JLS §14.14.2의 규칙과 <code>javap</code> 출력으로 보여 줄 수 있다.</li>
+<li>순회 도중 컬렉션을 고쳤을 때 <code>ConcurrentModificationException</code>이 나는 경우와 나지 않는 경우를 <code>cursor</code>·<code>size</code>·<code>modCount</code> 값의 변화로 추적할 수 있다.</li>
+<li><code>Comparable</code>과 <code>Comparator</code>의 규약을 말하고, 뺄셈으로 만든 비교와 0을 돌려주지 않는 비교가 무엇을 망가뜨리는지, 안정 정렬이 무엇을 보장하는지 실행 결과로 설명할 수 있다.</li>
+<li>순서·중복·조회 방식이라는 요구 조건에서 출발해 컬렉션 구현체를 고르고, 그 구현체가 원소에게 요구하는 메서드(<code>equals</code>, <code>hashCode</code>, <code>compareTo</code>)를 짚을 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 구조가 다른데 꺼내는 코드는 같을 수 있는가</h3>
+<p>이 권에서 지금까지 만든 자료 구조를 떠올려 보자. 3회의 배열 리스트는 칸이 이어진 배열 하나였고, 4회의 연결 리스트는 참조로 이어진 노드의 사슬이었다. 6회부터 8회까지는 해시 값으로 버킷을 고르는 구조와 값의 크기로 좌우를 가르는 트리를 다뤘고, 9회에서는 키로 값을 찾는 맵과 끝으로만 드나드는 스택·큐를 봤다. 속 모양이 전부 다르다.</p>
+<p>속 모양이 다르면 "들어 있는 것을 전부 하나씩 꺼내 본다"는 단순한 일도 방법이 달라진다. 배열은 인덱스를 0부터 올리면 되고, 연결 리스트는 첫 노드에서 <code>next</code>를 따라가야 한다. 해시 구조는 버킷 배열을 처음부터 훑으면서 버킷마다 매달린 노드를 따라가야 하고, 트리는 왼쪽 서브트리, 자기 자신, 오른쪽 서브트리 순으로 내려갔다 올라와야 한다. 쓰는 쪽이 이 방법을 구조마다 알아야 한다면, 5회에서 인터페이스로 구현을 감춘 일은 절반만 된 셈이다.</p>
+<p>이 회차의 첫 번째 주제가 이 문제의 답이다. 자바는 "다음 원소가 있는가"와 "다음 원소를 달라"는 두 질문만으로 어떤 자료 구조든 훑을 수 있게 하는 약속을 정해 두었다. <code>Iterable</code>과 <code>Iterator</code>다. 향상된 for문은 이 약속 위에서 컴파일러가 대신 써 주는 코드이고, 순회 도중에 컬렉션을 고치면 터지는 <code>ConcurrentModificationException</code>도 이 약속을 구현한 코드에서 나온다.</p>
+<p>두 번째 주제는 정렬이다. 정렬 알고리즘이 원소에게 묻는 것은 하나뿐이다. 둘 중 누가 앞인가. 정수라면 CPU가 답하지만 객체라면 누군가 답을 정해 줘야 한다. 그 답을 원소 자신이 갖고 있게 하는 것이 <code>Comparable</code>이고, 바깥에서 따로 건네는 것이 <code>Comparator</code>다. 이 둘의 규약이 깨지면 무슨 일이 생기는지, 자바가 실제로 돌리는 정렬 알고리즘이 무엇을 보장하는지까지 내려간다.</p>
+<p>마지막으로 <code>Collections</code>와 <code>Arrays</code>의 도구 메서드와 수정할 수 없는 컬렉션을 살핀 다음, 이 권에서 다룬 컬렉션 프레임워크 전체를 한 장의 지도로 묶는다. 본문의 실행 결과, 오류 문구, 바이트코드, JDK 소스 인용은 모두 OpenJDK 21(Temurin 21.0.13)에서 직접 확인한 것이다.</p>
+
+<h3>순회 1 — Iterable과 Iterator를 직접 만든다</h3>
+<p>순회(iteration, traversal)는 자료 구조에 들어 있는 원소를 빠짐없이 한 번씩 방문하는 일이다. 방문하는 쪽에서 보면 필요한 것은 두 가지 동작뿐이다. 아직 방문하지 않은 원소가 남았는지 묻는 것, 그리고 다음 원소를 하나 받는 것. 자바는 이 두 동작을 <code>java.util.Iterator</code> 인터페이스로 정해 두었고, "이 객체는 그런 반복자를 내줄 수 있다"는 사실을 <code>java.lang.Iterable</code> 인터페이스로 표시한다.</p>
+<pre data-label="JDK 소스에서 추상 메서드만 추린 것"><code class="language-java">package java.lang;
+
+public interface Iterable<T> {
+    Iterator<T> iterator();          // 반복자를 하나 만들어 돌려준다
+    // default 메서드 forEach, spliterator 생략
+}
+
+package java.util;
+
+public interface Iterator<E> {
+    boolean hasNext();               // 남은 원소가 있는가
+    E next();                        // 다음 원소를 돌려주고 한 칸 나아간다
+    // default 메서드 remove, forEachRemaining 생략
+}</code></pre>
+<p>이름이 비슷해서 헷갈리기 쉬우니 역할을 먼저 못 박아 두자. <code>Iterable</code>은 "순회할 수 있는 것", 곧 자료 구조 쪽이다. <code>Iterator</code>는 "순회하는 것", 곧 지금 어디까지 왔는지를 기억하며 한 칸씩 나아가는 객체다. 한국어로는 보통 반복자라고 부른다. 자료 구조는 반복자를 만들어 내주기만 하고, 실제로 걸어가는 일은 반복자가 한다.</p>
+<p>속 모양이 다른 두 자료 구조에 이 약속을 구현해 보자. 하나는 배열을 감싼 것이고, 하나는 4회에서 본 단일 연결 구조다.</p>
+<pre><code class="language-java">import java.util.Iterator;
+import java.util.NoSuchElementException;
+
+class ArrayBox implements Iterable<String> {
+    private final String[] items;
+
+    ArrayBox(String... items) {
+        this.items = items;
+    }
+
+    @Override
+    public Iterator<String> iterator() {
+        return new BoxIterator();          // 부를 때마다 새 반복자
+    }
+
+    private class BoxIterator implements Iterator<String> {
+        private int cursor = 0;            // 다음에 돌려줄 칸의 인덱스
+
+        @Override
+        public boolean hasNext() {
+            return cursor < items.length;
+        }
+
+        @Override
+        public String next() {
+            if (!hasNext()) {
+                throw new NoSuchElementException();
+            }
+            return items[cursor++];
+        }
+    }
+}</code></pre>
+<pre><code class="language-java">import java.util.Iterator;
+import java.util.NoSuchElementException;
+
+class Chain implements Iterable<String> {
+    private static class Node {
+        final String item;
+        final Node next;
+
+        Node(String item, Node next) {
+            this.item = item;
+            this.next = next;
+        }
+    }
+
+    private Node first;
+
+    void addFirst(String item) {
+        first = new Node(item, first);
+    }
+
+    @Override
+    public Iterator<String> iterator() {
+        return new Iterator<String>() {
+            private Node cursor = first;   // 다음에 돌려줄 노드
+
+            @Override
+            public boolean hasNext() {
+                return cursor != null;
+            }
+
+            @Override
+            public String next() {
+                if (cursor == null) {
+                    throw new NoSuchElementException();
+                }
+                String item = cursor.item;
+                cursor = cursor.next;
+                return item;
+            }
+        };
+    }
+}</code></pre>
+<p>두 반복자의 차이는 "위치"를 무엇으로 기억하느냐다. <code>ArrayBox</code>의 반복자는 정수 인덱스를, <code>Chain</code>의 반복자는 노드 참조를 들고 있다. <code>hasNext()</code>의 조건도 다르다. 하나는 인덱스가 길이보다 작은지를, 하나는 참조가 <code>null</code>이 아닌지를 본다. 그런데 바깥에서 부르는 메서드의 이름과 의미는 똑같다. 쓰는 쪽 코드를 보자.</p>
+<pre><code class="language-java">import java.util.Iterator;
+
+public class IterMain {
+    static void printAll(Iterable<String> source) {
+        Iterator<String> it = source.iterator();
+        while (it.hasNext()) {
+            String s = it.next();
+            System.out.print(s + " ");
+        }
+        System.out.println();
+    }
+
+    public static void main(String[] args) {
+        ArrayBox box = new ArrayBox("A", "B", "C");
+
+        Chain chain = new Chain();
+        chain.addFirst("C");
+        chain.addFirst("B");
+        chain.addFirst("A");
+
+        printAll(box);
+        printAll(chain);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">A B C
+A B C </code></pre>
+<p><code>printAll</code>은 매개변수의 타입을 <code>Iterable<String></code>으로만 알고 있다. 넘어온 것이 배열인지 노드 사슬인지 모르고, 알 필요도 없다. 5회에서 리스트를 인터페이스 뒤로 감췄던 것과 같은 구조인데, 감춘 대상이 "저장 방식"에서 "훑는 방식"으로 바뀌었을 뿐이다.</p>
+
+<h4>왜 인터페이스가 둘인가: 위치를 기억하는 상태</h4>
+<p>자료 구조가 <code>hasNext()</code>와 <code>next()</code>를 직접 갖고 있으면 안 되는가 하는 의문이 든다. 답은 반복자에 상태가 있기 때문이다. "지금 어디까지 왔는가"라는 값은 순회 한 번마다 따로 있어야 한다. 그 값을 자료 구조 안에 필드 하나로 두면, 같은 자료 구조를 동시에 두 군데서 훑는 순간 서로의 위치를 망가뜨린다. 그래서 위치는 별도의 객체에 담고, 자료 구조는 그런 객체를 필요할 때마다 새로 만들어 준다.</p>
+<pre><code class="language-java">Iterator<String> it1 = box.iterator();
+Iterator<String> it2 = box.iterator();
+
+System.out.println(it1 == it2);               // false: 서로 다른 객체
+System.out.println(it1.next() + it1.next());  // AB: it1만 두 칸 나아갔다
+System.out.println(it2.next());               // A : it2는 처음 위치 그대로다</code></pre>
+<p>이때의 힙을 그려 보면 다음과 같다. 반복자 객체 둘이 같은 <code>ArrayBox</code>를 가리키면서 저마다 <code>cursor</code>를 갖고 있다.</p>
+<pre class="diagram">  it1                      it2
+   │                        │
+   ▼                        ▼
+┌ BoxIterator ─┐      ┌ BoxIterator ─┐
+│ cursor = 2   │      │ cursor = 1   │
+│ this$0 ──┐   │      │ this$0 ──┐   │
+└──────────┼───┘      └──────────┼───┘
+           └───────┬─────────────┘
+                   ▼
+            ┌ ArrayBox ─┐        ┌ String[3] ───────────────┐
+            │ items ────┼───────▶│ [0]→"A" [1]→"B" [2]→"C"  │
+            └───────────┘        └──────────────────────────┘</pre>
+<p>그림의 <code>this$0</code>은 소스에 없는 필드다. <code>BoxIterator</code>는 <code>static</code>이 붙지 않은 내부 클래스이므로, 중급 1편의 중첩 클래스 회차에서 본 대로 컴파일러가 바깥 인스턴스를 가리키는 숨은 필드를 넣는다. <code>items[cursor++]</code>라고만 썼지만 실제로는 <code>this$0.items</code>를 읽는 것이다. 클래스 파일을 열어 보면 그대로 나온다.</p>
+<pre data-label="javap -p 'ArrayBox$BoxIterator'"><code class="language-text">class ArrayBox$BoxIterator implements java.util.Iterator<java.lang.String> {
+  private int cursor;
+  final ArrayBox this$0;
+  private ArrayBox$BoxIterator(ArrayBox);
+  public boolean hasNext();
+  public java.lang.String next();
+  public java.lang.Object next();
+}</code></pre>
+<p><code>next()</code>가 둘인 것도 눈에 띈다. 반환 타입이 <code>Object</code>인 쪽은 2회에서 다룬 브리지 메서드다. <code>Iterator<E></code>의 <code>next()</code>는 타입 소거 뒤에 <code>Object</code>를 돌려주는 메서드가 되므로, 컴파일러가 그 시그니처로 들어온 호출을 <code>String next()</code>로 넘겨주는 메서드를 하나 더 만든 것이다. 이 사실은 조금 뒤 향상된 for문의 바이트코드를 읽을 때 다시 쓰인다.</p>
+
+<h4>반복자의 규칙</h4>
+<p><code>Iterator</code>의 Javadoc이 정한 규칙은 짧다. <code>hasNext()</code>는 <code>next()</code>가 예외 없이 원소를 돌려줄 수 있으면 <code>true</code>다. <code>next()</code>는 다음 원소를 돌려주고, 더 돌려줄 원소가 없으면 <code>NoSuchElementException</code>을 던진다. 여기서 구현자가 지켜야 할 것이 두 가지 나온다. <code>hasNext()</code>는 몇 번을 불러도 위치를 옮기지 않아야 하고, <code>next()</code>는 끝을 넘었을 때 <code>null</code>이나 엉뚱한 값을 돌려주지 말고 예외를 던져야 한다. 위의 두 구현이 <code>next()</code> 첫머리에서 검사하는 이유다.</p>
+<p>반복자는 한 방향으로만 가고, 다 쓰면 끝이다. 처음으로 되돌리는 메서드가 없다. 다시 훑고 싶으면 <code>iterator()</code>를 한 번 더 불러 새 반복자를 받는다. 반복자를 값싸게 만들고 버리는 객체로 설계한 것이다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>책과 책갈피</strong><p>책 한 권을 두 사람이 번갈아 읽는다면 책갈피를 각자 하나씩 꽂는다. 책이 <code>Iterable</code>이고 책갈피가 <code>Iterator</code>다. 책은 내용을 갖고 있고, 책갈피는 "어디까지 읽었는가"만 갖고 있다. 책갈피가 책 속에 인쇄되어 있다면 한 번에 한 사람만 읽을 수 있을 것이다. 비유가 깨지는 지점도 있다. 종이 책갈피는 책의 쪽수가 바뀌어도 알아채지 못하지만, 자바 컬렉션의 반복자는 자기가 만들어진 뒤에 컬렉션이 바뀌었는지를 검사한다. 이 검사는 뒤의 fail-fast 절에서 다룬다.</p></aside>
+
+<x-visual id="java-mid2-10-iterable-iterator" title="하나의 Iterable에서 만들어진 두 Iterator가 각자의 커서를 갖는 모습" kind="메모리 구조도" ratio="16:9">
+<x-hint>자료 구조(Iterable)는 원소를 갖고, 반복자(Iterator)는 위치만 갖는다는 것과 반복자를 여러 개 만들어도 서로 간섭하지 않는다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 메모리 구조 다이어그램. 화면 아래쪽 가운데에 가로로 긴 세 칸짜리 배열이 있고 칸 안에 차례로 "A", "B", "C"가 적혀 있다. 배열 왼쪽에 둥근 모서리 상자가 있고 제목 "ArrayBox", 안에 한 줄 "items". items에서 배열로 가는 파란 화살표. 이 묶음 전체를 옅은 파란 점선 테두리로 감싸고 라벨 "Iterable (원소를 가진 쪽)". 화면 위쪽에는 작은 둥근 상자 두 개가 좌우로 떨어져 있다. 왼쪽 상자의 제목은 "반복자 1", 안에 "cursor = 2". 오른쪽 상자의 제목은 "반복자 2", 안에 "cursor = 1". 두 상자를 옅은 주황 점선 테두리로 감싸고 라벨 "Iterator (위치만 가진 쪽)". 왼쪽 상자에서 아래 배열의 세 번째 칸 "C" 위로 내려오는 주황색 화살표, 오른쪽 상자에서 두 번째 칸 "B" 위로 내려오는 주황색 화살표. 각 화살표 끝에 작은 글씨 "다음에 줄 칸". ArrayBox 상자에서 두 반복자 상자로 올라가는 회색 점선 화살표 두 개에 라벨 "iterator() 호출마다 새로 생성". 차분한 파랑과 회색, 강조는 주황. 평면적인 기술 도해 스타일.</x-prompt>
+<x-caption>원소는 자료 구조가 갖고, 위치는 반복자가 갖는다. 반복자는 부를 때마다 새로 만들어지므로 여러 순회가 서로를 방해하지 않는다.</x-caption>
+</x-visual>
+
+<h3>순회 2 — 향상된 for문은 컴파일러가 풀어 쓴다</h3>
+<p><code>while (it.hasNext())</code>로 시작하는 세 줄은 순회할 때마다 똑같이 반복된다. 자바 5에서 들어온 향상된 for문(enhanced for statement), 흔히 for-each라고 부르는 문법은 이 세 줄을 컴파일러가 대신 쓰게 한 것이다. JLS §14.14.2는 이 문법의 의미를 "다음과 같은 기본 for문으로 번역한 것과 같다"는 식으로 정의한다. 규칙은 두 갈래다.</p>
+<p>먼저 조건이 있다. 콜론 오른쪽 식의 타입은 배열이거나 <code>Iterable</code>의 하위 타입이어야 하고, 아니면 컴파일 오류다. 식이 <code>Iterable</code>이면 다음 모양으로 번역된다. <code>#i</code>는 컴파일러가 만든, 소스의 다른 이름과 겹치지 않는 변수다.</p>
+<pre data-label="JLS §14.14.2 — Iterable인 경우의 번역"><code class="language-java">for (I #i = Expression.iterator(); #i.hasNext(); ) {
+    T Identifier = (TargetType) #i.next();
+    Statement
+}</code></pre>
+<p>식이 배열이면 반복자가 등장하지 않는다. 배열 참조를 임시 변수에 한 번 담고, 정수 인덱스로 훑는다.</p>
+<pre data-label="JLS §14.14.2 — 배열인 경우의 번역"><code class="language-java">S[] #a = Expression;
+for (int #i = 0; #i < #a.length; #i++) {
+    T Identifier = #a[#i];
+    Statement
+}</code></pre>
+<p>명세의 말을 컴파일러가 실제로 그렇게 하는지 확인해 보자. 배열을 도는 메서드와 리스트를 도는 메서드를 나란히 놓고 바이트코드를 본다.</p>
+<pre><code class="language-java">import java.util.List;
+
+public class ForEachMain {
+    static int sumArray(int[] arr) {
+        int sum = 0;
+        for (int v : arr) {
+            sum += v;
+        }
+        return sum;
+    }
+
+    static int totalLength(List<String> list) {
+        int total = 0;
+        for (String s : list) {
+            total += s.length();
+        }
+        return total;
+    }
+}</code></pre>
+<pre data-label="javap -c ForEachMain (두 메서드)"><code class="language-text">static int sumArray(int[]);
+   0: iconst_0
+   1: istore_1              // sum = 0
+   2: aload_0
+   3: astore_2              // #a = arr
+   4: aload_2
+   5: arraylength
+   6: istore_3              // 길이를 한 번만 읽어 둔다
+   7: iconst_0
+   8: istore        4       // #i = 0
+  10: iload         4
+  12: iload_3
+  13: if_icmpge     33      // #i >= 길이면 반복 종료
+  16: aload_2
+  17: iload         4
+  19: iaload                // #a[#i]
+  20: istore        5       // v = ...
+  22: iload_1
+  23: iload         5
+  25: iadd
+  26: istore_1              // sum += v
+  27: iinc          4, 1    // #i++
+  30: goto          10
+  33: iload_1
+  34: ireturn
+
+static int totalLength(java.util.List<java.lang.String>);
+   0: iconst_0
+   1: istore_1              // total = 0
+   2: aload_0
+   3: invokeinterface #7,  1   // InterfaceMethod java/util/List.iterator:()Ljava/util/Iterator;
+   8: astore_2              // #i = list.iterator()
+   9: aload_2
+  10: invokeinterface #13,  1  // InterfaceMethod java/util/Iterator.hasNext:()Z
+  15: ifeq          38      // false면 반복 종료
+  18: aload_2
+  19: invokeinterface #19,  1  // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+  24: checkcast     #23     // class java/lang/String
+  27: astore_3              // s = (String) #i.next()
+  28: iload_1
+  29: aload_3
+  30: invokevirtual #25     // Method java/lang/String.length:()I
+  33: iadd
+  34: istore_1              // total += s.length()
+  35: goto          9
+  38: iload_1
+  39: ireturn</code></pre>
+<p>오른쪽의 <code>//</code> 주석 가운데 한글로 된 것은 읽기 쉽게 붙인 것이고 나머지는 <code>javap</code>이 출력한 그대로다. 위쪽 메서드에는 메서드 호출이 하나도 없다. 배열 참조를 지역 변수 2번에, 길이를 3번에, 인덱스를 4번에 두고 <code>iaload</code>로 칸을 읽는다. 3회에서 본 "인덱스에서 위치를 계산해 바로 읽는" 접근 그대로다. 명세의 번역문은 조건식에 <code>#a.length</code>를 적었지만 <code>javac</code>는 길이를 반복 전에 한 번 읽어 둔다. 배열의 길이는 만들어진 뒤 바뀌지 않으므로 결과는 같다.</p>
+<p>아래쪽 메서드는 명세의 첫 번째 번역문을 그대로 옮긴 모양이다. <code>iterator()</code>를 한 번 부르고, 돌 때마다 <code>hasNext()</code>와 <code>next()</code>를 부른다. 세 호출 모두 5회에서 다룬 <code>invokeinterface</code>이므로, 실제로 어느 클래스의 메서드가 실행될지는 실행 시점에 객체의 클래스를 보고 정해진다. 그리고 <code>next()</code> 바로 뒤에 <code>checkcast</code>가 있다. 타입 소거 뒤의 <code>next()</code>는 <code>Object</code>를 돌려주므로, 컴파일러가 <code>String</code>으로 받기 위한 캐스트를 끼워 넣은 것이다. 소스에 캐스트를 쓰지 않았어도 검사는 실행 시점에 일어난다.</p>
+
+<h4>번역 규칙에서 따라 나오는 것들</h4>
+<p>향상된 for문의 동작에 대한 질문은 대부분 번역문을 보면 답이 나온다. 하나씩 확인해 보자.</p>
+<p><b>직접 만든 클래스도 for-each의 대상이 된다.</b> 컴파일러가 확인하는 것은 식의 타입이 <code>Iterable</code>인가 하나뿐이다. <code>java.util</code>의 컬렉션일 필요가 없다. 더 나아가 원소를 저장하고 있을 필요조차 없다. 다음 클래스는 숫자를 하나도 담아 두지 않고, 요청받을 때마다 다음 숫자를 계산해서 내준다.</p>
+<pre><code class="language-java">import java.util.Iterator;
+import java.util.NoSuchElementException;
+
+public class Range implements Iterable<Integer> {
+    private final int from;
+    private final int to;                  // to는 포함하지 않는다
+
+    Range(int from, int to) {
+        this.from = from;
+        this.to = to;
+    }
+
+    @Override
+    public Iterator<Integer> iterator() {
+        return new Iterator<>() {
+            private int next = from;
+
+            @Override
+            public boolean hasNext() {
+                return next < to;
+            }
+
+            @Override
+            public Integer next() {
+                if (next >= to) {
+                    throw new NoSuchElementException();
+                }
+                return next++;
+            }
+        };
+    }
+
+    public static void main(String[] args) {
+        int sum = 0;
+        for (int n : new Range(1, 5)) {
+            sum += n;
+            System.out.print(n + " ");
+        }
+        System.out.println("합 = " + sum);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">1 2 3 4 합 = 10</code></pre>
+<p><code>Iterable</code>이 약속하는 것은 "원소를 차례로 내줄 수 있다"이지 "원소를 갖고 있다"가 아니라는 점을 이 예제가 보여 준다. 파일의 줄, 네트워크에서 오는 메시지, 계산으로 만들어지는 수열도 같은 약속으로 다룰 수 있다.</p>
+<p><b>콜론 오른쪽 식은 한 번만 평가된다.</b> 번역문에서 <code>Expression</code>은 for문의 초기화 자리에 한 번 나온다. <code>for (String s : loadNames())</code>라고 써도 <code>loadNames()</code>는 한 번만 호출된다.</p>
+<p><b>식이 <code>null</code>이면 <code>NullPointerException</code>이다.</b> <code>null.iterator()</code>나 <code>null</code>에 대한 <code>arraylength</code>를 실행하게 되기 때문이다. 원소가 0개인 컬렉션은 <code>hasNext()</code>가 처음부터 <code>false</code>라서 본문이 한 번도 실행되지 않을 뿐 문제가 없다. "없음"을 <code>null</code>이 아니라 빈 컬렉션으로 표현하라는 조언의 근거가 여기에 있다.</p>
+<p><b>반복 변수는 복사본이다.</b> 번역문의 <code>T Identifier = #a[#i]</code>는 칸의 값을 지역 변수에 복사한다. 그 변수에 다른 값을 대입해도 배열의 칸은 바뀌지 않는다. <code>int[] arr = {1, 2, 3}</code>을 돌면서 <code>v = v * 10</code>을 해도 배열은 <code>[1, 2, 3]</code> 그대로다. 참조 타입이라면 복사되는 것이 참조이므로, 변수가 가리키는 객체의 필드를 바꾸는 것은 원래 객체에 반영된다. 기본편에서 다룬 "자바는 언제나 값을 복사한다"는 규칙의 한 사례다.</p>
+<p><b><code>Map</code>은 for-each의 대상이 아니다.</b> <code>Map</code>은 <code>Iterable</code>을 확장하지 않는다. 맵을 콜론 오른쪽에 그대로 놓으면 컴파일러가 이렇게 답한다.</p>
+<pre data-label="javac 출력"><code class="language-text">MapFor.java:5: error: for-each not applicable to expression type
+        for (String k : m) { }
+                        ^
+  required: array or java.lang.Iterable
+  found:    Map<String,Integer></code></pre>
+<p>맵을 훑으려면 9회에서 본 세 가지 뷰 가운데 하나를 고른다. <code>keySet()</code>, <code>values()</code>, <code>entrySet()</code>은 모두 <code>Collection</code>이고 따라서 <code>Iterable</code>이다.</p>
+<p><b>여러 번 돌면 반복자도 여러 개다.</b> for문 하나가 <code>iterator()</code>를 한 번 부른다. 같은 대상을 이중으로 돌면 바깥 반복과 안쪽 반복이 각자의 반복자를 갖는다. 앞에서 인터페이스를 둘로 나눈 덕분에 다음 코드가 아홉 쌍을 모두 출력한다.</p>
+<pre><code class="language-java">ArrayBox box = new ArrayBox("A", "B", "C");
+for (String outer : box) {
+    for (String inner : box) {
+        System.out.print(outer + inner + " ");
+    }
+}
+// AA AB AC BA BB BC CA CB CC</code></pre>
+
+<h4>반복자가 성능을 바꾸는 경우</h4>
+<p>반복자는 편의 문법이기만 한 것이 아니다. 연결 리스트에서는 시간 복잡도를 바꾼다. <code>LinkedList</code>의 Javadoc은 인덱스로 접근하는 연산이 리스트의 처음이나 끝 가운데 가까운 쪽에서부터 걸어간다고 적고 있다. 그래서 <code>for (int i = 0; i < list.size(); i++) list.get(i)</code>는 매번 사슬을 다시 걸어가고, 전체로는 노드를 건너는 횟수가 대략 n²/4번이 된다. O(n²)이다. 반복자는 "지금 서 있는 노드"를 필드로 기억하므로 <code>next()</code> 한 번이 참조 하나를 따라가는 O(1)이고, 전체가 O(n)이다.</p>
+<p>배열 리스트에서는 인덱스 반복과 반복자 반복이 모두 O(n)이다. 반복자 쪽에는 반복자 객체 하나를 만드는 일과 호출마다의 검사가 더 있지만, 어느 쪽이 더 빠른지를 가를 만큼의 차이인지는 측정해 봐야 아는 영역이다. 판단 기준은 이렇게 잡으면 된다. 인덱스가 따로 필요하지 않다면 for-each를 쓴다. 그러면 구현체가 <code>LinkedList</code>로 바뀌어도, <code>HashSet</code>으로 바뀌어도 순회 코드는 그 구조에 맞는 방법으로 돌아간다.</p>
+
+<h3>순회 3 — 자바가 제공하는 Iterable과 Iterator</h3>
+<p>컬렉션 프레임워크의 뿌리 인터페이스인 <code>Collection<E></code>는 <code>Iterable<E></code>를 확장한다. <code>List</code>, <code>Set</code>, <code>Queue</code>, <code>Deque</code>가 모두 <code>Collection</code>의 하위 인터페이스이므로, 이 권에서 다룬 구현체는 맵을 빼면 전부 <code>iterator()</code>를 갖고 있고 for-each의 대상이 된다. 다음 메서드 하나로 여섯 가지 구조의 합을 구할 수 있다.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class SumMain {
+    static int sum(Iterable<Integer> source) {
+        int total = 0;
+        for (int n : source) {
+            total += n;
+        }
+        return total;
+    }
+
+    public static void main(String[] args) {
+        List<Integer> data = List.of(1, 2, 3, 4);
+
+        System.out.println(sum(new ArrayList<>(data)));    // 배열
+        System.out.println(sum(new LinkedList<>(data)));   // 이중 연결 노드
+        System.out.println(sum(new HashSet<>(data)));      // 해시 테이블
+        System.out.println(sum(new TreeSet<>(data)));      // 레드-블랙 트리
+        System.out.println(sum(new ArrayDeque<>(data)));   // 원형 배열
+        System.out.println(sum(new Range(1, 5)));          // 저장소 없음
+    }
+}</code></pre>
+<p>여섯 줄 모두 <code>10</code>을 출력한다. <code>sum</code> 안의 바이트코드는 앞에서 본 <code>totalLength</code>와 같은 모양, 곧 <code>invokeinterface</code> 세 번이다. 달라지는 것은 실행 시점에 그 호출이 도착하는 클래스다. 구현체마다 자기 구조에 맞는 반복자 클래스를 내부에 갖고 있다. OpenJDK 21 소스에서 각 반복자가 위치를 기억하는 필드를 추려 보면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>컬렉션</th><th>반복자 클래스</th><th>위치를 기억하는 필드</th><th>next()가 하는 일</th></tr></thead><tbody>
+<tr><td><code>ArrayList</code></td><td><code>ArrayList.Itr</code></td><td><code>int cursor</code></td><td>배열의 <code>cursor</code>번 칸을 읽고 1 올린다</td></tr>
+<tr><td><code>LinkedList</code></td><td><code>LinkedList.ListItr</code></td><td><code>Node next</code>, <code>int nextIndex</code></td><td>노드의 값을 읽고 다음 노드로 옮긴다</td></tr>
+<tr><td><code>HashMap</code>(과 <code>HashSet</code>)</td><td><code>HashMap.HashIterator</code></td><td><code>Node next</code>, <code>int index</code></td><td>버킷 안의 다음 노드로, 없으면 다음 비어 있지 않은 버킷으로 옮긴다</td></tr>
+<tr><td><code>TreeMap</code>(과 <code>TreeSet</code>)</td><td><code>TreeMap.PrivateEntryIterator</code></td><td><code>Entry next</code></td><td>정렬 순서상 바로 다음 노드(후속자)로 옮긴다</td></tr>
+</tbody></table></div>
+<p>표에서 두 가지를 읽을 수 있다. 첫째, 순회 순서는 구조가 정한다. 리스트는 인덱스 순서, 해시 구조는 버킷 순서(원소를 넣은 순서와 무관하다), 트리는 정렬 순서다. 둘째, 순회 비용도 구조가 정한다. <code>HashMap</code>의 Javadoc은 컬렉션 뷰를 순회하는 데 걸리는 시간이 맵의 용량(버킷 수)과 크기(매핑 수)의 합에 비례한다고 적고, 그래서 순회 성능이 중요하다면 초기 용량을 너무 크게 잡지 말라고 덧붙인다. 원소가 10개뿐이어도 버킷이 백만 개면 반복자는 빈 버킷 백만 개를 지나가야 한다.</p>
+
+<h4>Iterator와 Iterable의 나머지 메서드</h4>
+<p><code>Iterator</code>에는 추상 메서드 둘 말고 <code>default</code> 메서드가 둘 있다. <code>remove()</code>는 방금 <code>next()</code>가 돌려준 원소를 밑에 있는 컬렉션에서 지운다. 지원하지 않아도 되는 선택적 연산이라서 기본 구현은 <code>UnsupportedOperationException</code>을 던진다. 앞에서 만든 <code>Range</code>의 반복자에 <code>remove()</code>를 부르면 이 예외가 난다. <code>forEachRemaining(action)</code>은 남은 원소 전부에 대해 주어진 동작을 실행한다.</p>
+<p><code>Iterable</code>에도 <code>default</code> 메서드 <code>forEach(action)</code>이 있다. 소스를 보면 특별한 것이 없다. <code>for (T t : this) action.accept(t);</code>가 전부다. 향상된 for문을 메서드 호출 모양으로 감싼 것이고, 동작을 인자로 넘기는 방식은 중급 1편에서 잠깐 본 람다와 함께 쓰인다.</p>
+<p>리스트에는 <code>Iterator</code>를 확장한 <code>ListIterator</code>도 있다. <code>hasPrevious()</code>와 <code>previous()</code>로 뒤로 갈 수 있고, <code>set()</code>으로 방금 본 원소를 바꾸거나 <code>add()</code>로 현재 위치에 끼워 넣을 수 있다. 연결 리스트의 "위치를 알고 있으면 삽입이 O(1)"이라는 장점을 실제로 쓰려면 이 반복자를 통해야 한다. 인덱스로 <code>add(i, e)</code>를 부르면 그 위치까지 걸어가는 비용을 다시 치르기 때문이다.</p>
+<aside class="note">자료 구조의 내부를 드러내지 않고 원소를 차례로 방문하게 하는 이 구조에는 반복자 패턴(Iterator pattern)이라는 이름이 붙어 있다. 자바는 이 패턴을 인터페이스 두 개와 문법 하나(향상된 for문)로 언어 수준에 들여놓았다.</aside>
+
+<h3>fail-fast — 순회 도중에 컬렉션을 고치면</h3>
+<p>반복자가 위치를 기억한다는 것은, 그 위치가 가리키는 대상이 순회 도중에 바뀌면 곤란해진다는 뜻이기도 하다. 리스트를 돌면서 조건에 맞는 원소를 지우는, 누구나 한 번쯤 쓰는 코드를 보자.</p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class FailFastMain {
+    public static void main(String[] args) {
+        List<String> list = new ArrayList<>(List.of("A", "B", "C", "D"));
+        for (String s : list) {
+            System.out.println("방문: " + s);
+            if (s.equals("B")) {
+                list.remove(s);
+            }
+        }
+        System.out.println(list);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">방문: A
+방문: B
+Exception in thread "main" java.util.ConcurrentModificationException
+	at java.base/java.util.ArrayList$Itr.checkForComodification(ArrayList.java:1095)
+	at java.base/java.util.ArrayList$Itr.next(ArrayList.java:1049)
+	at FailFastMain.main(FailFastMain.java:7)</code></pre>
+<p>스택 트레이스가 원인을 알려 준다. 예외는 <code>remove</code>를 부른 10행이 아니라 for문이 있는 7행에서, 정확히는 반복자의 <code>next()</code> 안에서 났다. 삭제는 성공했고, 그다음 원소를 꺼내려는 순간에 반복자가 "내가 모르는 사이에 리스트가 바뀌었다"는 것을 알아챈 것이다. <code>ArrayList</code> 소스의 해당 부분이다.</p>
+<pre data-label="OpenJDK 21 java.util.ArrayList (발췌)"><code class="language-java">private class Itr implements Iterator<E> {
+    int cursor;       // index of next element to return
+    int lastRet = -1; // index of last element returned; -1 if no such
+    int expectedModCount = modCount;
+
+    public boolean hasNext() {
+        return cursor != size;
+    }
+
+    public E next() {
+        checkForComodification();
+        int i = cursor;
+        if (i >= size)
+            throw new NoSuchElementException();
+        Object[] elementData = ArrayList.this.elementData;
+        if (i >= elementData.length)
+            throw new ConcurrentModificationException();
+        cursor = i + 1;
+        return (E) elementData[lastRet = i];
+    }
+
+    final void checkForComodification() {
+        if (modCount != expectedModCount)
+            throw new ConcurrentModificationException();
+    }
+    // remove, forEachRemaining 생략
+}</code></pre>
+<p>우리가 만든 <code>BoxIterator</code>와 뼈대가 같다. <code>cursor</code>가 있고, <code>hasNext()</code>가 크기와 비교하고, <code>next()</code>가 칸을 읽고 한 칸 나아간다. 더해진 것은 <code>modCount</code>와 <code>expectedModCount</code>다. <code>modCount</code>는 <code>ArrayList</code>가 상위 클래스 <code>AbstractList</code>에서 물려받은 <code>int</code> 필드로, Javadoc의 표현으로는 리스트가 구조적으로 수정된(structurally modified) 횟수다. <code>add</code>나 <code>remove</code>처럼 크기를 바꾸는 메서드가 실행될 때마다 1씩 올라간다. 반복자는 만들어질 때 그 값을 <code>expectedModCount</code>에 복사해 두고, <code>next()</code>를 부를 때마다 둘이 여전히 같은지 본다.</p>
+<p>위 프로그램을 값의 변화로 추적해 보자. 반복자가 만들어지는 시점의 <code>modCount</code>를 m이라 하자.</p>
+<div class="table-wrap"><table><thead><tr><th>단계</th><th>실행되는 것</th><th>cursor</th><th>size</th><th>modCount</th><th>expectedModCount</th><th>일어난 일</th></tr></thead><tbody>
+<tr><td>1</td><td><code>list.iterator()</code></td><td>0</td><td>4</td><td>m</td><td>m</td><td>반복자 생성</td></tr>
+<tr><td>2</td><td><code>hasNext()</code></td><td>0</td><td>4</td><td>m</td><td>m</td><td>0 ≠ 4이므로 true</td></tr>
+<tr><td>3</td><td><code>next()</code></td><td>1</td><td>4</td><td>m</td><td>m</td><td>검사 통과, "A" 반환</td></tr>
+<tr><td>4</td><td><code>hasNext()</code></td><td>1</td><td>4</td><td>m</td><td>m</td><td>true</td></tr>
+<tr><td>5</td><td><code>next()</code></td><td>2</td><td>4</td><td>m</td><td>m</td><td>검사 통과, "B" 반환</td></tr>
+<tr><td>6</td><td><code>list.remove("B")</code></td><td>2</td><td>3</td><td>m+1</td><td>m</td><td>배열이 [A, C, D]로 당겨진다</td></tr>
+<tr><td>7</td><td><code>hasNext()</code></td><td>2</td><td>3</td><td>m+1</td><td>m</td><td>2 ≠ 3이므로 true</td></tr>
+<tr><td>8</td><td><code>next()</code></td><td>2</td><td>3</td><td>m+1</td><td>m</td><td>m+1 ≠ m, 예외</td></tr>
+</tbody></table></div>
+<p>8단계에서 검사가 없었다면 무슨 일이 생겼을지가 이 설계의 핵심이다. <code>cursor</code>는 2인데, 삭제로 원소들이 한 칸씩 앞으로 당겨졌으므로 2번 칸에는 이제 "D"가 있다. 반복자는 "D"를 돌려주고 끝났을 것이고, "C"는 한 번도 방문되지 않는다. 예외도 없고 경고도 없이 원소 하나를 건너뛴 결과가 나온다. 이런 버그는 증상이 원인에서 멀리 떨어진 곳에서, 그것도 데이터에 따라 가끔만 나타난다.</p>
+<p><code>ArrayList</code>의 Javadoc은 이 선택을 이렇게 설명한다. 반복자가 만들어진 뒤에 반복자 자신의 <code>remove</code>나 <code>add</code>가 아닌 방법으로 리스트가 구조적으로 수정되면 반복자는 <code>ConcurrentModificationException</code>을 던진다. 그럼으로써 언제 터질지 모르는 임의의 동작을 감수하는 대신 빠르고 깨끗하게 실패한다. 이 성질을 fail-fast라고 부른다. 잘못된 상태로 계속 가느니 잘못을 발견한 자리에서 멈추는 것이다.</p>
+
+<h4>검사는 최선을 다할 뿐, 보장이 아니다</h4>
+<p>같은 프로그램에서 지우는 원소만 "B"에서 "C"로 바꿔 보자. 끝에서 두 번째 원소다.</p>
+<pre><code class="language-java">List<String> list = new ArrayList<>(List.of("A", "B", "C", "D"));
+for (String s : list) {
+    System.out.println("방문: " + s);
+    if (s.equals("C")) {
+        list.remove(s);
+    }
+}
+System.out.println(list);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">방문: A
+방문: B
+방문: C
+[A, B, D]</code></pre>
+<p>예외가 나지 않는다. 그리고 "D"는 방문되지 않았다. 추적해 보면 이유가 보인다. "C"를 돌려준 직후 <code>cursor</code>는 3이다. 삭제로 <code>size</code>가 4에서 3이 된다. 다음 <code>hasNext()</code>는 <code>cursor != size</code>, 곧 3 ≠ 3을 계산해 <code>false</code>를 돌려주고, 반복은 <code>next()</code>를 부르지 않은 채 끝난다. 검사는 <code>next()</code> 안에 있으므로 실행될 기회가 없었다.</p>
+<p>이것은 구현의 결함이 아니라 문서에 적힌 한계다. Javadoc은 fail-fast 동작을 보장할 수 없다고, 반복자는 최선을 다해(best-effort) 예외를 던질 뿐이라고 밝힌다. 그리고 이렇게 맺는다. 이 예외에 프로그램의 정확성을 기대는 것은 잘못이며, fail-fast 동작은 버그를 찾는 용도로만 써야 한다. 예외가 안 났다고 코드가 옳은 것이 아니다. 위 코드는 조용히 틀렸다.</p>
+<p>덧붙여 <code>hasNext()</code>가 <code>cursor < size</code>가 아니라 <code>cursor != size</code>인 데에도 쓸모가 있다. 마지막 원소를 방문하다가 그 원소를 지우면 <code>cursor</code>가 <code>size</code>보다 1 커진다. 부등호였다면 반복이 조용히 끝났겠지만, <code>!=</code>이므로 <code>true</code>가 되어 <code>next()</code>가 불리고 검사에 걸린다.</p>
+
+<h4>무엇이 구조적 수정인가</h4>
+<p><code>ArrayList</code>의 Javadoc은 구조적 수정을 원소를 하나 이상 더하거나 지우는 연산, 또는 내부 배열의 크기를 명시적으로 바꾸는 연산이라고 정의하고, 원소의 값을 바꾸기만 하는 것은 구조적 수정이 아니라고 덧붙인다. 그래서 순회 중에 <code>list.set(i, 값)</code>으로 칸의 내용을 바꾸는 것은 예외를 일으키지 않는다. 칸의 수와 위치가 그대로라서 반복자의 <code>cursor</code>가 여전히 옳기 때문이다.</p>
+<p><code>HashMap</code>도 같은 방식으로 <code>modCount</code>를 센다. 이미 있는 키에 <code>put</code>으로 값을 덮어쓰는 것은 노드가 늘지 않으므로 구조적 수정이 아니고, 새 키를 넣는 것은 구조적 수정이다. <code>keySet()</code>을 돌면서 <code>map.put(k, map.get(k) * 10)</code>을 하면 정상적으로 끝나지만 <code>map.put(k + k, 0)</code>을 하면 <code>ConcurrentModificationException</code>이 난다. 반대로 원소 수가 그대로여도 구조적 수정으로 세는 경우가 있다. <code>ArrayList.sort</code>는 끝에서 <code>modCount++</code>를 실행한다. 순회 중에 그 리스트를 정렬하면 다음 <code>next()</code>에서 예외가 난다.</p>
+
+<h4>순회하면서 지우는 올바른 방법</h4>
+<p>반복자에게 삭제를 맡기면 된다. <code>Iterator.remove()</code>는 방금 돌려준 원소를 지우면서 반복자 자신의 상태를 함께 고친다. <code>ArrayList.Itr.remove()</code>의 핵심은 네 줄이다. <code>ArrayList.this.remove(lastRet)</code>로 지우고, <code>cursor = lastRet</code>으로 당겨진 만큼 커서를 되돌리고, <code>lastRet = -1</code>로 "방금 돌려준 원소"를 비우고, <code>expectedModCount = modCount</code>로 기대값을 새로 맞춘다. 커서 보정과 기대값 갱신, 두 가지가 바깥에서 지울 때 빠져 있던 것이다.</p>
+<pre><code class="language-java">List<String> list = new ArrayList<>(List.of("A", "B", "C", "D"));
+
+Iterator<String> it = list.iterator();
+while (it.hasNext()) {
+    String s = it.next();
+    if (s.equals("B") || s.equals("C")) {
+        it.remove();                 // 반복자를 통해 지운다
+    }
+}
+System.out.println(list);            // [A, D]
+
+List<String> list2 = new ArrayList<>(List.of("A", "B", "C", "D"));
+list2.removeIf(s -> s.equals("B") || s.equals("C"));
+System.out.println(list2);           // [A, D]</code></pre>
+<p><code>lastRet = -1</code> 때문에 <code>next()</code> 한 번에 <code>remove()</code>는 한 번만 부를 수 있다. 연달아 두 번 부르면 <code>IllegalStateException</code>이 난다. 두 번째 방법인 <code>removeIf</code>는 자바 8에서 <code>Collection</code>에 추가된 메서드로, 조건을 넘기면 컬렉션이 스스로 훑으며 지운다. <code>ArrayList</code>는 이 메서드를 따로 구현해 두었다. 지울 원소에 먼저 표시만 해 두고, 남길 원소를 앞으로 모으는 이동을 한 번에 한다. 반복자의 <code>remove()</code>는 지울 때마다 뒤쪽 원소 전체를 한 칸씩 당기므로 지울 것이 많으면 O(n²)까지 가지만, <code>removeIf</code>는 O(n)이다.</p>
+<p>마지막으로 이름에 대해 짚어 둔다. 예외 이름의 Concurrent 때문에 스레드 문제로 오해하기 쉽지만, 지금까지의 예제에는 스레드가 하나뿐이었다. <code>ConcurrentModificationException</code>의 Javadoc도 이 예외가 언제나 다른 스레드의 수정을 뜻하는 것은 아니라고 명시한다. 여기서 "동시"는 "순회가 진행되는 동안"이라는 뜻이다. 거꾸로, <code>modCount</code>는 평범한 <code>int</code> 필드일 뿐 스레드 사이의 동기화 수단이 아니다. 여러 스레드가 한 컬렉션을 건드리는 상황은 이 검사로 막을 수 없고, 그 문제는 고급 1편에서 동시성 컬렉션과 함께 다룬다.</p>
+
+<x-visual id="java-mid2-10-failfast-modcount" title="순회 중 삭제에서 modCount와 expectedModCount가 어긋나 예외가 나는 과정" kind="단계별 상태 다이어그램" ratio="16:9">
+<x-hint>삭제 직후 배열이 당겨져 커서가 가리키는 칸의 내용이 달라지고, 다음 next()에서 두 카운터의 불일치가 발견된다는 것을 세 장면으로 보여 준다.</x-hint>
+<x-prompt>흰 배경의 가로 3단계 다이어그램. 세 장면이 왼쪽에서 오른쪽으로 화살표로 이어진다. 각 장면에는 위쪽에 가로 배열이 있고 아래쪽에 작은 상자 두 개가 있다. 장면 1의 제목 "B를 방문한 직후". 배열은 네 칸 "A", "B", "C", "D"이고, 세 번째 칸 "C" 위에 주황색 삼각형 표시와 라벨 "cursor = 2". 아래 상자 두 개에는 각각 "modCount = m", "expectedModCount = m"이라고 적고 둘 사이에 초록색 등호. 장면 2의 제목 "리스트에서 B를 삭제". 배열은 세 칸 "A", "C", "D"와 옅은 회색 빈 칸 하나이고, "C"와 "D" 위에 왼쪽으로 한 칸 이동을 나타내는 짧은 곡선 화살표. 주황색 삼각형은 여전히 세 번째 칸 위에 있는데 그 칸의 내용은 이제 "D". 아래 상자는 "modCount = m+1"(빨간 글씨), "expectedModCount = m". 장면 3의 제목 "다음 next() 호출". 배열은 장면 2와 같고, 아래 두 상자 사이에 빨간색 부등호(≠)와 번개 모양 아이콘, 그 아래 라벨 "ConcurrentModificationException". 장면 3 오른쪽 구석에 작은 회색 글씨 "검사가 없었다면 C를 건너뛴다". 차분한 파랑과 회색, 커서는 주황, 불일치는 빨강. 평면적인 기술 도해 스타일.</x-prompt>
+<x-caption>바깥에서 지우면 배열은 당겨지는데 반복자의 커서는 그대로다. 반복자는 다음 next()에서 수정 횟수가 달라진 것을 보고 멈춘다.</x-caption>
+</x-visual>
+
+<h3>정렬 1 — 순서는 원소가 정한다: Comparable</h3>
+<p>정렬(sort)은 원소를 정해진 순서대로 늘어놓는 일이다. 여기서 다루는 정렬 알고리즘은 모두 비교 기반이다. 알고리즘은 원소의 내용을 모른다. 하는 일은 두 원소를 골라 "누가 앞인가"를 묻고, 답에 따라 자리를 옮기는 것의 반복이다. 원소가 <code>int</code>라면 JVM에 두 정수를 비교하는 명령이 있으니 물을 것도 없다. 그런데 원소가 객체라면 변수에 들어 있는 것은 참조이고, 참조끼리는 같은지 다른지만 가릴 수 있을 뿐 크고 작음이 없다. 회원 객체 둘 가운데 누가 앞인지는 그 클래스를 만든 사람이 정해 줘야 한다.</p>
+<p>그 답을 클래스 자신이 갖고 있게 하는 인터페이스가 <code>java.lang.Comparable<T></code>다. 메서드는 <code>int compareTo(T o)</code> 하나다. 자기 자신(<code>this</code>)이 인자 <code>o</code>보다 앞이면 음수, 순서가 같으면 0, 뒤면 양수를 돌려준다. Javadoc은 이렇게 정해진 순서를 그 클래스의 자연 순서(natural ordering)라고 부른다. <code>Integer</code>, <code>String</code> 같은 클래스는 이미 이 인터페이스를 구현하고 있다.</p>
+<pre><code class="language-java">import java.util.Arrays;
+
+public class NaturalOrderMain {
+    public static void main(String[] args) {
+        Integer[] nums = {30, 10, 20};
+        Arrays.sort(nums);
+        System.out.println(Arrays.toString(nums));
+
+        String[] words = {"banana", "Apple", "cherry", "apple", "Banana"};
+        Arrays.sort(words);
+        System.out.println(Arrays.toString(words));
+
+        String[] mixed = {"다", "가", "나", "a", "Z", "1"};
+        Arrays.sort(mixed);
+        System.out.println(Arrays.toString(mixed));
+
+        System.out.println("a".compareTo("b"));
+        System.out.println("b".compareTo("a"));
+        System.out.println("a".compareTo("a"));
+        System.out.println("apple".compareTo("Banana"));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[10, 20, 30]
+[Apple, Banana, apple, banana, cherry]
+[1, Z, a, 가, 나, 다]
+-1
+1
+0
+31</code></pre>
+<p>둘째 줄과 셋째 줄이 <code>String</code>의 자연 순서가 무엇인지 알려 준다. 사람이 기대하는 사전 순서가 아니다. <code>String.compareTo</code>는 두 문자열을 앞에서부터 한 글자씩 견주다가 처음으로 다른 자리에서 두 문자의 유니코드 값의 차를 돌려준다. 대문자 'B'는 66이고 소문자 'a'는 97이므로 "Banana"가 "apple"보다 앞이고, <code>"apple".compareTo("Banana")</code>는 97 − 66 = 31이다. 숫자 '1'(49), 대문자, 소문자, 한글 '가'(44032) 순으로 늘어서는 것도 같은 이유다.</p>
+<p>마지막 줄의 31에서 하나 더 배운다. <code>compareTo</code>의 반환값에서 의미가 있는 것은 부호뿐이다. -1, 0, 1만 나온다고 가정하고 <code>== 1</code>이나 <code>== -1</code>로 비교하는 코드는 틀린 코드다. <code>< 0</code>, <code>== 0</code>, <code>> 0</code>으로 써야 한다.</p>
+
+<h4>직접 만든 클래스에 자연 순서 주기</h4>
+<pre><code class="language-java">class Runner implements Comparable<Runner> {
+    final String name;
+    final int age;
+
+    Runner(String name, int age) {
+        this.name = name;
+        this.age = age;
+    }
+
+    @Override
+    public int compareTo(Runner other) {
+        return Integer.compare(this.age, other.age);   // 나이가 적은 쪽이 앞
+    }
+
+    @Override
+    public String toString() {
+        return name + "(" + age + ")";
+    }
+}</code></pre>
+<pre><code class="language-java">import java.util.Arrays;
+
+public class RunnerMain {
+    public static void main(String[] args) {
+        Runner[] runners = {
+            new Runner("다온", 31), new Runner("가람", 27),
+            new Runner("나래", 31), new Runner("라희", 27), new Runner("마루", 24)
+        };
+        Arrays.sort(runners);
+        System.out.println(Arrays.toString(runners));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[마루(24), 가람(27), 라희(27), 다온(31), 나래(31)]</code></pre>
+<p><code>Arrays.sort</code>는 <code>Runner</code>가 무엇인지 모른다. 정렬하는 동안 원소 둘을 골라 <code>compareTo</code>를 부르고 부호만 본다. 나이가 같은 원소들이 원래 놓여 있던 순서(가람이 라희보다 앞, 다온이 나래보다 앞)를 유지한 것도 눈여겨봐 두자. 우연이 아니고, 정렬 3에서 다룰 보장이다.</p>
+
+<h4>Comparable이 아니면 언제 실패하는가</h4>
+<p><code>Comparable</code>을 구현하지 않은 클래스의 배열을 정렬하면 어떻게 될까. 번호만 가진 <code>Ticket</code> 클래스의 배열을 넘겨 보자.</p>
+<pre><code class="language-java">class Ticket {
+    final int no;
+
+    Ticket(int no) {
+        this.no = no;
+    }
+}
+
+// ...
+Ticket[] tickets = {new Ticket(2), new Ticket(1)};
+Arrays.sort(tickets);        // 컴파일은 된다</code></pre>
+<pre data-label="실행 결과 (첫 두 줄)"><code class="language-text">Exception in thread "main" java.lang.ClassCastException: class Ticket cannot be cast to class java.lang.Comparable (Ticket is in unnamed module of loader 'app'; java.lang.Comparable is in module java.base of loader 'bootstrap')
+	at java.base/java.util.ComparableTimSort.countRunAndMakeAscending(ComparableTimSort.java:320)</code></pre>
+<p>컴파일은 통과하고 실행 중에 터진다. <code>Arrays.sort(Object[] a)</code>의 매개변수 타입이 <code>Object[]</code>라서 컴파일러가 막을 근거가 없기 때문이다. 스택 트레이스가 가리키는 소스 320행에는 <code>((Comparable) a[runHi++]).compareTo(a[lo])</code>가 있다. 정렬 코드가 원소를 <code>Comparable</code>로 캐스트해서 쓰고, 그 캐스트가 실패한 것이다.</p>
+<p>리스트 쪽은 다르다. <code>Collections.sort(List<T> list)</code>의 선언에는 타입 매개변수 제한이 붙어 있다.</p>
+<pre><code class="language-java">public static <T extends Comparable<? super T>> void sort(List<T> list)</code></pre>
+<p><code>List<Ticket></code>을 넘기면 컴파일러가 <code>T</code>를 <code>Ticket</code>으로 추론한 뒤 제한을 만족하는지 검사하고, 만족하지 못하므로 컴파일을 거부한다. 오류 문구에는 <code>inference variable T#1 has incompatible bounds</code>, <code>upper bounds: Comparable<? super T#1></code>가 나온다(<code>T#1</code>은 <code>javac</code>가 두 <code>sort</code> 오버로드의 타입 변수를 구별하려고 붙인 이름이다). 2회에서 다룬 타입 매개변수 제한이 실행 시점의 <code>ClassCastException</code>을 컴파일 시점의 오류로 끌어올린 사례다. 다만 <code>list.sort(null)</code>처럼 비교자 자리에 <code>null</code>을 넘겨 자연 순서를 쓰겠다고 하는 호출에는 이 제한이 없어서, 원소가 <code>Comparable</code>이 아니면 배열 때와 똑같이 실행 중에 실패한다.</p>
+<p>제한이 <code>Comparable<T></code>가 아니라 <code>Comparable<? super T></code>인 이유도 2회의 하한 와일드카드로 설명된다. <code>Runner</code>를 상속한 <code>class Sprinter extends Runner</code>가 있다고 하자. <code>Sprinter</code>는 <code>compareTo</code>를 물려받았으므로 <code>Comparable<Runner></code>이지 <code>Comparable<Sprinter></code>가 아니다. 제한이 <code>Comparable<T></code>였다면 <code>List<Sprinter></code>는 정렬할 수 없다. "T 자신 또는 T의 상위 타입과 비교할 수 있으면 된다"고 풀어 준 덕분에 <code>Collections.sort(sprinters)</code>가 컴파일된다. 비교자는 원소를 받아 쓰기만 하는 소비자이므로 <code>super</code>다.</p>
+
+<h4>compareTo가 지켜야 하는 규약</h4>
+<p><code>compareTo</code>는 아무 정수나 돌려주면 되는 메서드가 아니다. Javadoc은 구현자가 반드시 지켜야 할 조건 세 가지를 적고 있다. <code>sgn</code>은 부호(음수면 -1, 0이면 0, 양수면 1)를 뜻한다.</p>
+<ul>
+<li><b>대칭성</b>: 모든 x, y에 대해 <code>sgn(x.compareTo(y)) == -sgn(y.compareTo(x))</code>. x가 y보다 앞이면 y는 x보다 뒤여야 한다. x와 자기 자신을 넣어 보면 <code>x.compareTo(x)</code>는 0일 수밖에 없다는 것도 나온다.</li>
+<li><b>추이성</b>: <code>x.compareTo(y) > 0</code>이고 <code>y.compareTo(z) > 0</code>이면 <code>x.compareTo(z) > 0</code>. x가 y보다 뒤이고 y가 z보다 뒤이면 x는 z보다 뒤다.</li>
+<li><b>동순위의 일관성</b>: <code>x.compareTo(y) == 0</code>이면 모든 z에 대해 <code>sgn(x.compareTo(z)) == sgn(y.compareTo(z))</code>. 순서가 같은 둘은 다른 어떤 원소와 견줘도 같은 결과를 내야 한다.</li>
+</ul>
+<p>이 세 조건이 필요한 이유는 정렬 알고리즘이 모든 쌍을 비교하지 않기 때문이다. 원소가 n개면 쌍은 n(n−1)/2개인데, 좋은 정렬은 그보다 훨씬 적은 횟수만 묻는다. a가 b보다 앞이고 b가 c보다 앞이라는 답을 얻었으면 a와 c는 묻지 않고 a를 앞에 둔다. 묻지 않은 쌍의 답을 이미 얻은 답에서 추론하는 것이다. 추론이 맞으려면 비교가 위의 조건을 만족해야 한다. 조건이 깨지면 알고리즘은 틀린 추론 위에서 계속 진행하고, 그 결과는 정렬 2의 함정에서 직접 보게 된다.</p>
+<p>네 번째로, 필수는 아니지만 강하게 권장되는 것이 있다. <code>x.compareTo(y) == 0</code>인 것과 <code>x.equals(y)</code>가 참인 것이 일치해야 한다는 것이다. Javadoc은 이것을 equals와 일관된(consistent with equals) 순서라고 부른다. 이 권장을 어기면 무슨 일이 생기는지는 뒤의 "정렬 컬렉션은 equals를 묻지 않는다"에서 확인한다.</p>
+
+<h3>정렬 2 — 순서를 바깥에서 건넨다: Comparator</h3>
+<p>자연 순서는 클래스에 하나만 줄 수 있다. <code>Runner</code>를 나이순으로 정했다면 이름순으로 보고 싶을 때 쓸 수가 없다. 고칠 수 없는 클래스도 있다. <code>String</code>의 자연 순서가 마음에 들지 않아도 <code>String</code>을 고칠 수는 없다. 그리고 "어떤 순서로 보여 줄 것인가"는 대개 원소의 본질이 아니라 화면이나 기능의 사정이다. 순서를 원소 바깥의 객체로 떼어 낼 필요가 여기서 나온다.</p>
+<p><code>java.util.Comparator<T></code>가 그 객체의 타입이다. 추상 메서드는 <code>int compare(T o1, T o2)</code> 하나이고, 반환값의 의미는 <code>compareTo</code>와 같다. 첫 인자가 앞이면 음수, 같으면 0, 뒤면 양수다. 지켜야 하는 규약 세 가지도 같다. 차이는 비교의 주체가 원소가 아니라 제삼자라는 점이다. 그래서 인자가 둘이다. 한국어로는 비교자라고 부른다.</p>
+<pre><code class="language-java">import java.util.Comparator;
+
+class ByName implements Comparator<Runner> {
+    @Override
+    public int compare(Runner a, Runner b) {
+        return a.name.compareTo(b.name);     // String의 자연 순서에 맡긴다
+    }
+}</code></pre>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
+
+public class ComparatorMain {
+    public static void main(String[] args) {
+        Runner[] runners = {
+            new Runner("다온", 31), new Runner("가람", 27),
+            new Runner("나래", 31), new Runner("라희", 27), new Runner("마루", 24)
+        };
+
+        Arrays.sort(runners, new ByName());
+        System.out.println(Arrays.toString(runners));
+
+        Arrays.sort(runners, new ByName().reversed());
+        System.out.println(Arrays.toString(runners));
+
+        List<Runner> list = new ArrayList<>(List.of(runners));
+        list.sort(Comparator.comparing((Runner r) -> r.age).reversed()
+                .thenComparing(r -> r.name));
+        System.out.println(list);
+
+        list.sort(null);                     // null이면 자연 순서(compareTo)
+        System.out.println(list);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[가람(27), 나래(31), 다온(31), 라희(27), 마루(24)]
+[마루(24), 라희(27), 다온(31), 나래(31), 가람(27)]
+[나래(31), 다온(31), 가람(27), 라희(27), 마루(24)]
+[마루(24), 가람(27), 라희(27), 나래(31), 다온(31)]</code></pre>
+<p>비교자를 넘기면 정렬은 원소의 <code>compareTo</code>를 부르지 않고 비교자의 <code>compare</code>만 부른다. 원소가 <code>Comparable</code>이든 아니든 상관없다. 첫 줄은 이름순, 둘째 줄은 그 역순이다. <code>reversed()</code>는 <code>Comparator</code>의 <code>default</code> 메서드로, 원래 비교자를 감싸 인자의 자리를 바꿔 부르는 새 비교자를 돌려준다. OpenJDK 21 소스에서 그 비교자의 <code>compare(t1, t2)</code>는 <code>cmp.compare(t2, t1)</code> 한 줄이다. 결과에 -1을 곱하는 것이 아니라 인자를 뒤집는다.</p>
+<p>셋째 줄은 비교자를 조립한 것이다. <code>Comparator.comparing</code>은 원소에서 비교 기준이 될 값을 뽑는 함수를 받아, 뽑은 값끼리 <code>compareTo</code>로 견주는 비교자를 만든다. <code>thenComparing</code>은 앞의 비교가 0을 돌려줄 때만 다음 기준을 묻는 비교자를 만든다. 소스로는 <code>int res = compare(c1, c2); return (res != 0) ? res : other.compare(c1, c2);</code>다. 그래서 "나이 내림차순, 나이가 같으면 이름 오름차순"이 된다. 인자로 넘긴 <code>r -> r.age</code>는 중급 1편 8회에서 본 람다이고, 클래스를 따로 선언하지 않고 비교 기준만 적은 것이다. <code>Comparator</code>는 추상 메서드가 하나뿐인 함수형 인터페이스라서 람다를 받을 수 있다.</p>
+<p>비교자를 받는 자리는 정렬 메서드만이 아니다. 순서가 필요한 곳이면 어디든 받는다. <code>Arrays.sort(배열, 비교자)</code>, <code>List.sort(비교자)</code>, <code>Collections.sort(리스트, 비교자)</code>, <code>Collections.max(컬렉션, 비교자)</code>, 그리고 <code>TreeSet</code>, <code>TreeMap</code>, <code>PriorityQueue</code>의 생성자가 그렇다. 정렬 컬렉션에 비교자를 넘기면 그 컬렉션은 원소의 자연 순서 대신 비교자의 순서로 자리를 잡는다.</p>
+<aside class="keyidea"><span>Comparable과 Comparator</span><p><code>Comparable</code>은 원소가 "나는 이렇게 줄을 선다"고 스스로 밝히는 것이고, <code>Comparator</code>는 바깥에서 "이번에는 이 기준으로 줄을 세운다"고 정하는 것이다. 클래스에 누가 봐도 당연한 순서가 하나 있으면(수의 크기, 날짜의 선후) <code>Comparable</code>로 두고, 그 밖의 순서는 필요한 자리에서 <code>Comparator</code>로 건넨다. 둘 다 있으면 비교자가 우선한다.</p></aside>
+
+<h4>함정 1: 뺄셈으로 만든 비교</h4>
+<p>정수 필드를 비교할 때 <code>a - b</code>를 돌려주는 코드를 흔히 본다. a가 작으면 음수, 같으면 0, 크면 양수이니 맞는 것처럼 보인다. 다음을 실행해 보자.</p>
+<pre><code class="language-java">import java.util.Arrays;
+import java.util.Comparator;
+
+public class SubtractMain {
+    public static void main(String[] args) {
+        Comparator<Integer> bySubtract = new Comparator<>() {
+            @Override
+            public int compare(Integer a, Integer b) {
+                return a - b;                 // 흔히 쓰는 지름길
+            }
+        };
+
+        System.out.println(bySubtract.compare(-2_000_000_000, 2_000_000_000));
+        System.out.println(Integer.compare(-2_000_000_000, 2_000_000_000));
+
+        Integer[] xs = {2_000_000_000, -2_000_000_000, 0};
+        Arrays.sort(xs, bySubtract);
+        System.out.println(Arrays.toString(xs));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">294967296
+-1
+[2000000000, -2000000000, 0]</code></pre>
+<p>−20억에서 20억을 빼면 −40억인데, <code>int</code>가 담을 수 있는 가장 작은 값은 −2,147,483,648이다. 입문편에서 본 오버플로가 일어나 결과는 −4,000,000,000 + 2³² = 294,967,296, 양수가 된다. 비교자가 "−20억이 20억보다 뒤"라고 답한 것이다. 그 결과 정렬을 마친 배열이 정렬되어 있지 않다. 예외도 없다.</p>
+<p>이 비교자는 규약을 어긴다. −20억은 0보다 앞이고(−20억 − 0은 음수) 0은 20억보다 앞인데(0 − 20억은 음수) −20억은 20억보다 뒤라고 하니 추이성이 깨진다. 나이처럼 범위가 좁은 값에서는 드러나지 않다가, 금액이나 ID처럼 큰 값이 섞일 때 터진다. <code>Integer.compare(x, y)</code>를 쓰면 된다. 소스는 <code>(x < y) ? -1 : ((x == y) ? 0 : 1)</code>로, 빼지 않고 견준다. <code>Long.compare</code>, <code>Double.compare</code>도 같은 용도다.</p>
+
+<h4>함정 2: 0을 돌려주지 않는 비교</h4>
+<p>두 번째 함정은 "같다"를 빼먹는 것이다. 크면 1, 아니면 -1을 돌려주는 비교자를 만들어 같은 값이 여럿 든 배열을 정렬해 보자.</p>
+<pre><code class="language-java">import java.util.Arrays;
+import java.util.Comparator;
+
+public class NoZeroMain {
+    public static void main(String[] args) {
+        Comparator<Integer> noZero = new Comparator<>() {
+            @Override
+            public int compare(Integer a, Integer b) {
+                return a > b ? 1 : -1;        // 같을 때도 -1을 돌려준다
+            }
+        };
+
+        for (int n : new int[]{31, 32, 100}) {
+            Integer[] arr = new Integer[n];
+            for (int i = 0; i < n; i++) {
+                arr[i] = i % 3;               // 0, 1, 2, 0, 1, 2, ...
+            }
+            try {
+                Arrays.sort(arr, noZero);
+                System.out.println(n + "개: 예외 없음");
+            } catch (IllegalArgumentException e) {
+                System.out.println(n + "개: " + e.getMessage());
+            }
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21)"><code class="language-text">31개: 예외 없음
+32개: Comparison method violates its general contract!
+100개: Comparison method violates its general contract!</code></pre>
+<p>이 비교자에서 <code>compare(1, 1)</code>은 -1이다. 인자를 바꿔도 -1이다. "x가 y보다 앞이면 y는 x보다 뒤"라는 대칭성이 깨졌다. 그런데 원소가 31개일 때는 아무 일도 없고 32개부터 예외가 난다. 이 경계는 정렬 3에서 볼 구현 상수에서 나온다. OpenJDK의 정렬은 원소가 32개 미만이면 병합 없이 삽입 정렬만으로 끝내고, 32개 이상이면 구간을 나눠 정렬한 뒤 병합한다. 예외는 병합하는 코드에 있다. 정렬된 두 구간을 합치다가 규약이 지켜졌다면 있을 수 없는 상태를 만나면 던진다.</p>
+<p>이 예외도 최선을 다한 검출일 뿐이다. <code>List.sort</code>의 Javadoc은 이 <code>IllegalArgumentException</code>에 "(optional)"이라는 꼬리표를 달아 두었다. 구현이 위반을 발견하면 던질 수 있다는 뜻이지, 위반하면 반드시 던진다는 뜻이 아니다. 앞의 뺄셈 비교자는 규약을 어겼는데도 조용히 틀린 결과를 냈다. 그리고 테스트 데이터 10건에서는 통과하던 코드가 운영 데이터 수천 건에서 처음 터지는 일이 이 구조에서 나온다. 비교자를 쓸 때는 "같으면 0"을 포함해 규약 세 가지를 눈으로 확인하는 수밖에 없다.</p>
+
+<h3>정렬 3 — 한 층 아래: 안정 정렬과 TimSort</h3>
+<p>정렬 1의 실행 결과에서 나이가 같은 원소들이 원래 순서를 유지했다. 이 성질을 안정성(stability)이라고 하고, 그런 정렬을 안정 정렬(stable sort)이라고 한다. 비교 결과가 0인 원소들끼리는 정렬 전의 상대 순서가 정렬 후에도 그대로라는 뜻이다. <code>Arrays.sort(Object[])</code>, <code>List.sort</code>, <code>Collections.sort</code>의 Javadoc에는 모두 같은 문장이 있다. "This sort is guaranteed to be stable: equal elements will not be reordered as a result of the sort." 구현의 우연이 아니라 API의 보장이다.</p>
+<p>안정성이 실제로 쓸모 있는 장면은 기준이 둘 이상일 때다. 먼저 이름순으로 정렬하고, 그 결과를 나이순으로 다시 정렬해 보자.</p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class StableMain {
+    public static void main(String[] args) {
+        List<Runner> list = new ArrayList<>(List.of(
+            new Runner("다온", 31), new Runner("가람", 27),
+            new Runner("나래", 31), new Runner("라희", 27), new Runner("마루", 24)));
+
+        list.sort(new ByName());
+        System.out.println("이름순: " + list);
+
+        list.sort(null);
+        System.out.println("나이순: " + list);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">이름순: [가람(27), 나래(31), 다온(31), 라희(27), 마루(24)]
+나이순: [마루(24), 가람(27), 라희(27), 나래(31), 다온(31)]</code></pre>
+<p>두 번째 정렬은 나이만 봤는데, 나이가 같은 원소들이 이름순으로 늘어서 있다. 첫 번째 정렬이 만든 이름 순서를 두 번째 정렬이 동순위 안에서 깨뜨리지 않았기 때문이다. 표의 열 제목을 차례로 눌러 정렬하는 화면이 기대대로 동작하는 것도 이 성질 덕분이다. 덜 중요한 기준부터 먼저 정렬하고 가장 중요한 기준을 마지막에 정렬한다는 순서만 기억하면 된다. 안정하지 않은 정렬이라면 두 번째 정렬 뒤에 27세 두 명의 순서가 어떻게 될지 알 수 없다.</p>
+
+<x-visual id="java-mid2-10-stable-sort" title="같은 입력을 안정 정렬과 불안정 정렬로 정렬했을 때 동순위 원소의 순서 비교" kind="비교 다이어그램" ratio="16:9">
+<x-hint>나이가 같은 카드들의 상대 순서가 안정 정렬에서는 유지되고 불안정 정렬에서는 뒤바뀔 수 있다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 비교 다이어그램. 맨 위 가운데에 "입력"이라는 라벨과 함께 카드 다섯 장이 가로로 놓여 있다. 카드마다 큰 숫자와 작은 이름이 적혀 있다. 왼쪽부터 "27 가람", "31 나래", "31 다온", "27 라희", "24 마루". 숫자 27인 카드 두 장은 파란색, 31인 카드 두 장은 초록색, 24인 카드는 회색이다. 입력에서 아래 왼쪽과 아래 오른쪽으로 화살표가 갈라진다. 아래 왼쪽 묶음의 제목은 "안정 정렬". 카드가 "24 마루", "27 가람", "27 라희", "31 나래", "31 다온" 순서로 놓여 있고, 파란 카드 두 장 아래에 "가람 → 라희 순서 유지", 초록 카드 두 장 아래에 "나래 → 다온 순서 유지"라는 작은 글씨와 체크 표시. 아래 오른쪽 묶음의 제목은 "불안정 정렬 (가능한 결과의 하나)". 카드가 "24 마루", "27 라희", "27 가람", "31 다온", "31 나래" 순서로 놓여 있고, 파란 카드 두 장과 초록 카드 두 장 위에 각각 서로 교차하는 주황색 화살표. 맨 아래에 작은 글씨 "숫자만 보면 둘 다 정렬된 결과다". 차분한 파랑·초록·회색, 강조는 주황. 평면적인 기술 도해 스타일.</x-prompt>
+<x-caption>비교 기준만 보면 두 결과 모두 정렬되어 있다. 안정 정렬은 여기에 더해 동순위 원소의 원래 순서를 지킨다.</x-caption>
+</x-visual>
+
+<h4>호출은 어디로 흘러가는가</h4>
+<p>정렬 메서드가 여럿이지만 끝은 한 곳이다. OpenJDK 21 소스를 따라가면 다음과 같다.</p>
+<pre class="diagram">Collections.sort(list)        → list.sort(null)
+Collections.sort(list, c)     → list.sort(c)
+
+ArrayList.sort(c)             → Arrays.sort(elementData, 0, size, c)   내부 배열을 그 자리에서 정렬
+                                 그리고 modCount++
+List.sort(c)의 기본 구현       → Object[] a = this.toArray();          배열로 복사
+(LinkedList가 쓰는 것)           Arrays.sort(a, c);                     배열을 정렬
+                                 ListIterator로 돌며 set(...)           결과를 다시 써넣는다
+
+Arrays.sort(a, c)   c != null → TimSort.sort(...)             compare를 부른다
+Arrays.sort(a)      c == null → ComparableTimSort.sort(...)   compareTo를 부른다
+Arrays.sort(int[])            → DualPivotQuicksort.sort(...)  기본형 전용</pre>
+<p>여기서 세 가지를 읽을 수 있다. 첫째, 리스트의 정렬은 결국 배열의 정렬이다. <code>ArrayList</code>는 자기 내부 배열을 그대로 넘기고, <code>LinkedList</code>는 따로 구현이 없어 인터페이스의 기본 구현을 쓴다. 노드의 연결을 바꿔 가며 정렬하지 않는다. 원소를 배열로 복사해 정렬한 뒤, 반복자로 처음부터 돌면서 각 노드의 값을 바꿔 넣는다. 둘째, 정렬은 새 리스트를 만들지 않고 그 자리에서(in place) 원본을 바꾼다. 셋째, 객체 배열과 기본형 배열은 서로 다른 알고리즘을 쓴다.</p>
+<p>세 번째 점의 이유는 안정성이다. <code>Arrays.sort(int[])</code>의 Javadoc은 구현이 이중 피벗 퀵 정렬(Dual-Pivot Quicksort)이라고 밝힌다. 퀵 정렬 계열은 일반적으로 안정하지 않다. 그런데 기본형에서는 그것이 문제가 되지 않는다. 값이 같은 두 <code>int</code>는 구별할 방법이 없으므로 순서가 바뀌어도 관찰할 수 없다. 객체는 다르다. 비교 결과가 0이어도 서로 다른 객체이고 다른 필드를 갖고 있으므로 순서가 바뀐 것이 보인다. 그래서 객체 쪽은 안정성을 보장하는 병합 정렬 계열을 쓴다.</p>
+
+<h4>TimSort가 하는 일</h4>
+<p><code>Arrays.sort(Object[])</code>의 Javadoc은 구현을 "안정적이고 적응적인 반복형 병합 정렬"이라고 소개하고, 팀 피터스(Tim Peters)가 파이썬의 리스트 정렬을 위해 만든 TimSort에서 가져왔다고 밝힌다. 적응적(adaptive)이라는 말은 입력이 이미 얼마나 정렬되어 있느냐에 따라 일의 양이 달라진다는 뜻이다. 실제 데이터는 완전히 뒤섞여 있기보다 군데군데 정렬된 구간을 갖고 있는 경우가 많다는 관찰에서 출발한 알고리즘이다. <code>TimSort.java</code>를 따라 큰 줄기를 보자.</p>
+<figure class="flow-figure"><figcaption>OpenJDK 21 TimSort.sort의 흐름</figcaption><ol class="flow">
+<li><strong>작은 배열은 따로 처리</strong><span>원소가 32개(<code>MIN_MERGE</code>) 미만이면 맨 앞의 정렬된 구간 하나를 찾고, 나머지 원소를 이진 삽입 정렬로 그 구간에 끼워 넣고 끝낸다. 병합은 하지 않는다.</span></li>
+<li><strong>런(run) 찾기</strong><span>왼쪽부터 훑으며 이미 정렬된 구간을 찾는다. 오름차순(<code>a[i] <= a[i+1]</code>)이 이어지는 구간이거나, 엄격한 내림차순(<code>a[i] > a[i+1]</code>)이 이어지는 구간이다. 내림차순 구간은 그 자리에서 뒤집어 오름차순으로 만든다.</span></li>
+<li><strong>짧은 런 늘리기</strong><span>찾은 런이 최소 길이(<code>minRun</code>, 16~32 사이로 계산된다)보다 짧으면 뒤의 원소를 이진 삽입 정렬로 끼워 넣어 그 길이까지 늘린다.</span></li>
+<li><strong>런을 스택에 쌓고 병합</strong><span>런의 시작 위치와 길이를 스택에 쌓는다. 쌓을 때마다 스택 위쪽 런들의 길이를 견줘, 길이가 비슷한 이웃 런끼리 병합되도록 한다.</span></li>
+<li><strong>남은 런을 모두 병합</strong><span>배열 끝에 닿으면 스택에 남은 런을 차례로 병합해 하나로 만든다.</span></li>
+</ol></figure>
+<p>런을 찾는 규칙을 작은 배열로 따라가 보자. 규칙만 보려는 것이므로 길이 제한은 잠시 잊는다.</p>
+<pre class="diagram">입력:   1  2  5  9  8  6  3  4  7  7
+
+런 1:  [1  2  5  9]              1 ≤ 2 ≤ 5 ≤ 9, 다음의 8이 9보다 작으므로 여기서 끊는다
+런 2:              [8  6  3]     8 > 6 > 3, 다음의 4가 3보다 크므로 여기서 끊는다 → 뒤집어 [3 6 8]
+런 3:                       [4  7  7]   4 ≤ 7 ≤ 7
+
+뒤집은 뒤: [1 2 5 9] [3 6 8] [4 7 7]   → 이웃한 런끼리 병합</pre>
+<p>내림차순의 조건이 "크거나 같다"가 아니라 "크다"인 데에 안정성이 걸려 있다. 소스의 주석이 이유를 적어 두었다. 내림차순 구간을 뒤집어도 안정성이 깨지지 않으려면 엄격한 내림차순이어야 한다는 것이다. 같은 값이 섞인 구간을 뒤집으면 동순위 원소의 순서가 거꾸로 되기 때문이다. 오름차순 쪽에서는 같은 값이 이어져도 그대로 두면 되므로 등호를 허용한다. 런 3이 <code>7 7</code>을 품을 수 있는 이유다.</p>
+<p>병합은 정렬된 두 런을 앞에서부터 견줘 작은 쪽을 먼저 내려놓는 일이다. 두 원소의 비교 결과가 0이면 왼쪽 런의 것을 먼저 내려놓는다. 왼쪽 런은 원래 배열에서 앞에 있던 구간이므로 이렇게 하면 동순위의 순서가 유지된다. 병합에는 두 런 가운데 짧은 쪽을 옮겨 둘 임시 배열이 필요하다. Javadoc은 이 임시 공간이 거의 정렬된 입력에서는 작은 상수이고, 무작위 입력에서는 최대 n/2개의 참조라고 적는다. 병합 중에 한쪽 런의 원소가 연달아 선택되면(<code>MIN_GALLOP</code>, 7번) 한 칸씩 견주는 대신 보폭을 늘려 가며 건너뛰는 갤러핑(galloping) 방식으로 바뀐다. 한쪽이 통째로 앞서는 구간을 빨리 지나가기 위한 것이다.</p>
+<p>정렬이 옮기는 것은 참조다. <code>Runner</code> 객체는 힙의 제자리에 있고, 배열의 칸에 든 참조만 자리를 바꾼다. 원소 객체가 아무리 커도 정렬 중에 복사되는 것은 칸 하나 크기의 참조뿐이다.</p>
+
+<x-visual id="java-mid2-10-timsort-runs" title="TimSort가 입력에서 런을 찾고 내림차순 런을 뒤집은 뒤 병합하는 과정" kind="단계별 다이어그램" ratio="16:9">
+<x-hint>입력에 이미 들어 있는 정렬된 구간(런)을 찾아 재활용하고, 내림차순 구간은 뒤집으며, 런끼리 병합해 전체를 완성한다는 흐름을 세 줄로 보여 준다.</x-hint>
+<x-prompt>흰 배경의 세로 3단 다이어그램. 각 단에는 숫자 칸 열 개가 가로로 놓여 있다. 1단의 왼쪽 라벨은 "1. 런 찾기". 칸의 숫자는 왼쪽부터 1, 2, 5, 9, 8, 6, 3, 4, 7, 7. 앞의 네 칸을 파란 테두리로 묶고 위에 "오름차순 런", 다음 세 칸(8, 6, 3)을 주황 테두리로 묶고 위에 "엄격한 내림차순 런", 마지막 세 칸(4, 7, 7)을 초록 테두리로 묶고 위에 "오름차순 런". 2단의 왼쪽 라벨은 "2. 내림차순 런 뒤집기". 칸의 숫자는 1, 2, 5, 9, 3, 6, 8, 4, 7, 7. 가운데 세 칸(3, 6, 8) 위에 좌우로 뒤집는 것을 나타내는 주황색 양방향 곡선 화살표. 세 묶음의 테두리 색은 1단과 같다. 3단의 왼쪽 라벨은 "3. 런끼리 병합". 칸의 숫자는 1, 2, 3, 4, 5, 6, 7, 7, 8, 9이고 전체를 하나의 회색 테두리로 묶는다. 2단의 세 묶음에서 3단으로 모이는 가는 화살표 세 개. 3단의 두 7 칸 아래에 작은 글씨 "같은 값은 원래 순서 그대로". 차분한 파랑·초록·회색, 강조는 주황. 평면적인 기술 도해 스타일.</x-prompt>
+<x-caption>TimSort는 입력에 이미 있는 정렬된 구간을 찾아 그대로 쓰고, 그 구간들을 병합해 전체를 완성한다. 입력이 정렬되어 있을수록 할 일이 줄어든다.</x-caption>
+</x-visual>
+
+<h4>적응적이라는 말을 숫자로 확인하기</h4>
+<p>비교자 안에서 호출 횟수를 세면 정렬이 비교를 몇 번 했는지 알 수 있다. 원소 1,000개를 세 가지 상태로 준비해 정렬해 보자.</p>
+<pre><code class="language-java">import java.util.Arrays;
+import java.util.Collections;
+import java.util.Random;
+
+public class CountMain {
+    static int countComparisons(Integer[] arr) {
+        int[] count = {0};
+        Arrays.sort(arr, (x, y) -> {
+            count[0]++;
+            return Integer.compare(x, y);
+        });
+        return count[0];
+    }
+
+    static Integer[] ascending(int n) {
+        Integer[] arr = new Integer[n];
+        for (int i = 0; i < n; i++) {
+            arr[i] = i;
+        }
+        return arr;
+    }
+
+    public static void main(String[] args) {
+        Integer[] sorted = ascending(1000);
+
+        Integer[] reversed = ascending(1000);
+        Collections.reverse(Arrays.asList(reversed));      // 배열을 감싼 리스트를 뒤집는다
+
+        Integer[] shuffled = ascending(1000);
+        Collections.shuffle(Arrays.asList(shuffled), new Random(42));
+
+        System.out.println("정렬된 입력: " + countComparisons(sorted));
+        System.out.println("역순 입력: " + countComparisons(reversed));
+        System.out.println("섞인 입력: " + countComparisons(shuffled));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21.0.13)"><code class="language-text">정렬된 입력: 999
+역순 입력: 999
+섞인 입력: 8688</code></pre>
+<p>이미 정렬된 입력은 비교 999번으로 끝난다. 런을 찾으면서 이웃한 원소를 한 번씩 견줬더니 배열 전체가 런 하나였고, 병합할 것이 없었다. 역순 입력도 999번이다. 전체가 엄격한 내림차순 런 하나라서 찾은 뒤 뒤집기만 하면 된다. Javadoc의 "거의 정렬된 입력이면 대략 n번의 비교"라는 설명과 맞는다.</p>
+<p>섞인 입력의 8,688이라는 값은 이 JDK 버전과 시드 42에서 나온 것이고, 섞는 방법이 달라지면 값도 달라진다. 크기를 가늠할 기준은 있다. 원소 n개를 늘어놓는 방법은 n!가지이고, 비교 한 번은 그 가짓수를 많아야 절반으로 줄인다. 그러므로 어떤 비교 기반 정렬도 최악의 경우 log₂(n!)번보다 적은 비교로는 끝낼 수 없다. n = 1000이면 이 값은 약 8,529다. 섞인 입력에서 TimSort가 쓴 비교 횟수는 이 한계에서 멀지 않다. 정렬된 입력에서는 그 한계의 8분의 1도 쓰지 않았다. 입력의 순서가 이미 갖고 있는 정보를 버리지 않고 쓴 결과다.</p>
+
+<h3>정렬 컬렉션은 equals를 묻지 않는다</h3>
+<p>8회와 9회에서 본 <code>TreeSet</code>과 <code>TreeMap</code>은 원소를 넣을 때마다 트리를 타고 내려가며 자리를 찾는다. 내려가는 방향을 정하는 것이 비교다. 비교 결과가 음수면 왼쪽, 양수면 오른쪽으로 가고, 0이면 "이미 있는 원소"로 판단하고 멈춘다. 이 과정 어디에도 <code>equals</code>나 <code>hashCode</code>는 등장하지 않는다. 정렬 컬렉션에서 "같다"의 기준은 비교 결과가 0인가이다.</p>
+<pre><code class="language-java">import java.math.BigDecimal;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.TreeSet;
+
+public class SortedSetMain {
+    public static void main(String[] args) {
+        Comparator<String> byLength = Comparator.comparing(s -> s.length());
+
+        Set<String> names = new TreeSet<>(byLength);
+        names.add("kiwi");
+        names.add("plum");
+        names.add("fig");
+        names.add("pear");
+        System.out.println(names);
+        System.out.println(names.contains("lime"));
+
+        BigDecimal p = new BigDecimal("1.0");
+        BigDecimal q = new BigDecimal("1.00");
+        System.out.println(p.equals(q) + " " + p.compareTo(q));
+
+        Set<BigDecimal> hashSet = new HashSet<>();
+        hashSet.add(p);
+        hashSet.add(q);
+        Set<BigDecimal> treeSet = new TreeSet<>();
+        treeSet.add(p);
+        treeSet.add(q);
+        System.out.println(hashSet.size() + " " + treeSet.size());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[fig, kiwi]
+true
+false 0
+2 1</code></pre>
+<p>길이로만 비교하는 비교자를 준 <code>TreeSet</code>에는 네 개를 넣었는데 두 개만 남았다. "plum"과 "pear"는 "kiwi"와 길이가 같아 비교 결과가 0이었고, 집합은 이미 있는 원소라고 판단해 넣지 않았다. 넣은 적도 없는 "lime"을 갖고 있다고 답하는 것도 같은 이유다. 집합은 문서대로 동작했다. 기대와 달랐던 것은 우리가 준 "같다"의 정의다.</p>
+<p>아래 두 줄은 표준 라이브러리 안에 있는 사례다. <code>BigDecimal</code>의 <code>equals</code>는 값과 소수 자릿수가 모두 같아야 참이고, <code>compareTo</code>는 수로서의 크기만 본다. 그래서 1.0과 1.00은 <code>equals</code>로는 다르고 <code>compareTo</code>로는 같다. <code>HashSet</code>은 <code>hashCode</code>와 <code>equals</code>로 판단하므로 둘을 다른 원소로 보고, <code>TreeSet</code>은 <code>compareTo</code>로 판단하므로 같은 원소로 본다. <code>Comparable</code>의 Javadoc이 equals와 일관되지 않은 자연 순서의 예로 직접 드는 클래스가 <code>BigDecimal</code>이다.</p>
+<p>컬렉션이 원소의 어떤 메서드에 의지하는지를 한 표로 모으면 이 권의 6회부터 이어진 이야기가 정리된다.</p>
+<div class="table-wrap"><table><thead><tr><th>컬렉션 또는 연산</th><th>원소에게 묻는 것</th><th>"같다"의 기준</th></tr></thead><tbody>
+<tr><td><code>ArrayList</code>·<code>LinkedList</code>의 <code>contains</code>, <code>indexOf</code>, <code>remove(Object)</code></td><td><code>equals</code></td><td><code>equals</code>가 참</td></tr>
+<tr><td><code>HashSet</code>, <code>HashMap</code>, <code>LinkedHashSet</code>, <code>LinkedHashMap</code></td><td><code>hashCode</code>로 버킷을 고르고 <code>equals</code>로 확인</td><td>해시가 같고 <code>equals</code>가 참</td></tr>
+<tr><td><code>TreeSet</code>, <code>TreeMap</code></td><td><code>compareTo</code> 또는 생성자에 준 비교자의 <code>compare</code></td><td>비교 결과가 0</td></tr>
+<tr><td><code>Arrays.sort</code>, <code>List.sort</code>, <code>Collections.max</code></td><td><code>compareTo</code> 또는 넘겨준 비교자의 <code>compare</code></td><td>(순서만 정한다. 0이면 원래 순서 유지)</td></tr>
+</tbody></table></div>
+<p>여기서 실무 규칙이 나온다. 정렬만 할 때는 비교자가 필드 일부만 봐도 괜찮다. 동순위가 생길 뿐이고, 안정 정렬이 원래 순서를 지켜 준다. 그러나 그 비교자를 <code>TreeSet</code>이나 <code>TreeMap</code>에 주면 동순위가 곧 중복이 되어 원소가 사라진다. 정렬 컬렉션에 쓸 비교자는 서로 다른 원소에 대해 0을 돌려주지 않도록, <code>thenComparing</code>으로 식별자 같은 유일한 값을 마지막 기준에 덧붙여 둔다. 그리고 <code>Comparable</code>을 구현하지 않은 클래스를 비교자 없이 <code>TreeSet</code>에 넣으면 첫 번째 <code>add</code>에서 곧바로 <code>ClassCastException</code>이 난다. 배열 정렬에서 본 것과 같은 캐스트 실패다.</p>
+
+<h3>컬렉션 유틸 — Collections, Arrays, 수정할 수 없는 컬렉션</h3>
+<p>정렬이 <code>ArrayList</code>만의 일이 아니라 <code>Arrays.sort</code> 한 곳으로 모이는 것을 앞에서 봤다. 저장 방식과 상관없이 할 수 있는 일은 구현체마다 따로 만들 이유가 없다. 원소를 차례로 받을 수 있고 둘을 견줄 수 있으면 최댓값을 찾을 수 있고, 인덱스로 읽고 쓸 수 있으면 뒤집거나 섞을 수 있다. 자바는 이런 알고리즘을 <code>java.util.Collections</code>와 <code>java.util.Arrays</code> 두 클래스의 <code>static</code> 메서드로 모아 두었다. 인스턴스를 만들지 않고 쓰는 도구 상자다. 이름 끝에 s가 붙은 <code>Collections</code>는 클래스이고 s가 없는 <code>Collection</code>은 인터페이스라는 점만 헷갈리지 않으면 된다.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class UtilMain {
+    public static void main(String[] args) {
+        List<Integer> list = new ArrayList<>(List.of(40, 10, 30, 20, 50));
+
+        System.out.println(Collections.max(list));
+        System.out.println(Collections.min(list));
+        System.out.println(Collections.max(list, Comparator.reverseOrder()));
+        System.out.println(Collections.binarySearch(list, 10));   // 정렬 전에 부르면
+
+        Collections.reverse(list);
+        System.out.println(list);
+
+        Collections.swap(list, 0, 4);
+        System.out.println(list);
+
+        Collections.sort(list);
+        System.out.println(list);
+        System.out.println(Collections.binarySearch(list, 30));
+        System.out.println(Collections.binarySearch(list, 35));
+
+        Collections.shuffle(list, new Random(7));
+        System.out.println(list);
+        System.out.println(Collections.frequency(list, 10));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21.0.13)"><code class="language-text">50
+10
+10
+-1
+[50, 20, 30, 10, 40]
+[40, 20, 30, 10, 50]
+[10, 20, 30, 40, 50]
+2
+-4
+[50, 40, 10, 30, 20]
+1</code></pre>
+<p>첫 세 줄은 최댓값과 최솟값이다. 셋째 줄에서 역순 비교자를 주고 <code>max</code>를 불렀더니 10이 나왔다. <code>max</code>가 찾는 것은 "가장 큰 수"가 아니라 "주어진 순서에서 가장 뒤에 오는 원소"이기 때문이다. 역순에서는 10이 맨 뒤다. 소스를 보면 이 회차의 두 주제가 그대로 합쳐져 있다.</p>
+<pre data-label="OpenJDK 21 java.util.Collections.max"><code class="language-java">public static <T extends Object & Comparable<? super T>> T max(Collection<? extends T> coll) {
+    Iterator<? extends T> i = coll.iterator();
+    T candidate = i.next();
+
+    while (i.hasNext()) {
+        T next = i.next();
+        if (next.compareTo(candidate) > 0)
+            candidate = next;
+    }
+    return candidate;
+}</code></pre>
+<p>반복자를 얻어 첫 원소를 후보로 잡고, 나머지를 하나씩 받아 후보와 견준다. 원소가 n개면 비교는 n−1번이다. 인덱스를 쓰지 않으므로 리스트든 집합이든 큐든 <code>Collection</code>이면 받는다. 빈 컬렉션을 넘기면 첫 <code>i.next()</code>에서 <code>NoSuchElementException</code>이 난다. 반복자의 규칙이 "돌려줄 원소가 없으면 예외"였기 때문에 비어 있는지 따로 검사하는 코드가 없어도 된다.</p>
+<p>선언부에는 이 권 앞부분에서 배운 제네릭 장치가 셋 들어 있다. 매개변수의 <code>Collection<? extends T></code>는 원소를 꺼내 읽기만 하므로 상한 와일드카드다. <code>Comparable<? super T></code>는 정렬 1에서 본 그대로다. 남은 것은 <code>T extends Object & Comparable<? super T></code>의 <code>Object &</code>인데, 타입 검사만 놓고 보면 있으나 없으나 같다. 이것이 바꾸는 것은 클래스 파일이다. 2회에서 다룬 타입 소거 규칙(JLS §4.6)에 따르면 타입 변수는 가장 왼쪽 제한으로 소거된다. 맨 왼쪽에 <code>Object</code>를 두었으므로 반환 타입은 <code>Object</code>로 소거되고, <code>javap -s</code>가 보여 주는 이 메서드의 서술자는 <code>(Ljava/util/Collection;)Ljava/lang/Object;</code>다. <code>Object &</code>가 없었다면 반환 타입 자리는 <code>Ljava/lang/Comparable;</code>이 된다. 제네릭이 들어오기 전의 <code>max</code>는 <code>Object</code>를 돌려주는 메서드였고, 그 시절에 컴파일된 클래스 파일은 그 서술자로 메서드를 찾는다. 단어 하나가 서술자를 예전 그대로 붙들어 두는 것이다.</p>
+<p><code>reverse</code>와 <code>swap</code>은 새 리스트를 만들지 않고 넘겨받은 리스트의 칸을 바꾼다. <code>Collections.sort(list)</code>는 앞에서 본 대로 <code>list.sort(null)</code>을 부르는 한 줄이다. <code>shuffle</code>은 원소를 무작위로 섞는다. 예제처럼 시드를 정한 <code>Random</code>을 넘기면 같은 JDK에서는 실행할 때마다 같은 순서가 나오고, 인자 없이 부르면 실행마다 달라진다. 테스트에서 "무작위이지만 재현되는 입력"이 필요할 때 시드를 넘긴다. <code>frequency</code>는 컬렉션을 for-each로 돌며 <code>equals</code>가 참인 원소를 센다. 리스트의 <code>contains</code>와 같은 기준이다.</p>
+
+<h4>이진 탐색이 믿는 것</h4>
+<p><code>binarySearch</code>는 정렬된 리스트에서 원소의 인덱스를 찾는다. 가운데 원소와 견줘 찾는 값이 더 뒤면 왼쪽 절반을, 더 앞이면 오른쪽 절반을 버리는 일을 되풀이하므로 비교 횟수가 O(log n)이다. 인덱스로 접근하는 쪽의 본문은 다음과 같다.</p>
+<pre data-label="OpenJDK 21 Collections.indexedBinarySearch (본문)"><code class="language-java">int low = 0;
+int high = list.size()-1;
+
+while (low <= high) {
+    int mid = (low + high) >>> 1;
+    Comparable<? super T> midVal = list.get(mid);
+    int cmp = midVal.compareTo(key);
+
+    if (cmp < 0)
+        low = mid + 1;
+    else if (cmp > 0)
+        high = mid - 1;
+    else
+        return mid; // key found
+}
+return -(low + 1);  // key not found</code></pre>
+<p>정렬된 <code>[10, 20, 30, 40, 50]</code>에서 35를 찾는 과정을 따라가 보자. 처음에 <code>low = 0</code>, <code>high = 4</code>이고 <code>mid = 2</code>다. 30은 35보다 앞이므로 <code>low = 3</code>이 된다. 다음 <code>mid</code>는 3이고, 40은 35보다 뒤이므로 <code>high = 2</code>가 된다. <code>low</code>가 <code>high</code>를 넘었으니 반복이 끝나고 <code>-(3 + 1)</code>, 곧 −4를 돌려준다. 못 찾았을 때의 반환값은 "그 값을 넣는다면 들어갈 인덱스"를 음수로 접은 것이다. 3을 그냥 −3으로 돌려주지 않고 1을 더 빼는 이유는 삽입 위치가 0일 때 때문이다. −0은 0이라서 "0번 칸에서 찾았다"와 구별할 수 없다.</p>
+<p><code>mid</code>를 구하는 식이 <code>(low + high) / 2</code>가 아니라 <code>>>> 1</code>인 것도 이유가 있다. 리스트가 아주 크면 <code>low + high</code>가 <code>int</code> 범위를 넘어 음수가 될 수 있다. 부호 없는 오른쪽 시프트는 그 비트들을 부호 없는 수로 보고 반으로 나누므로 올바른 가운데 인덱스가 나온다. 뺄셈 비교자와 같은 종류의 오버플로를 피한 것이다.</p>
+<p>예제의 넷째 줄은 정렬하기 전에 10을 찾은 결과다. 리스트 <code>[40, 10, 30, 20, 50]</code>에 10이 분명히 들어 있는데 −1이 나왔다. 추적하면 이렇다. <code>mid = 2</code>의 30이 10보다 뒤이므로 <code>high = 1</code>, 다음 <code>mid = 0</code>의 40도 10보다 뒤이므로 <code>high = -1</code>, 반복이 끝나고 <code>-(0 + 1)</code>이다. 알고리즘은 "30이 10보다 뒤이니 30의 오른쪽에는 10이 없다"고 추론해 절반을 버렸다. 그 추론은 리스트가 정렬되어 있을 때만 옳다. Javadoc은 정렬되어 있지 않으면 결과가 정의되지 않는다고 적는다. 예외로 알려 주지 않는다. 정렬 알고리즘이 비교 규약을 믿고 일부 쌍만 비교하는 것과 같은 구조다. 빠른 알고리즘은 입력에 대한 전제를 믿기 때문에 빠르고, 전제가 깨지면 조용히 틀린다.</p>
+<p>이 메서드는 리스트의 종류도 가린다. 소스의 첫 줄이 <code>if (list instanceof RandomAccess || list.size() < BINARYSEARCH_THRESHOLD)</code>이고 상수의 값은 5000이다. <code>RandomAccess</code>는 5회에서 본, 메서드가 하나도 없는 표시용 인터페이스다. <code>ArrayList</code>는 이것을 구현하고 <code>LinkedList</code>는 구현하지 않는다. 표시가 없는 큰 리스트에는 <code>get(mid)</code>를 쓰지 않고 반복자를 앞뒤로 움직여 가운데로 가는 방식을 쓴다. Javadoc의 표현으로 이때의 비용은 노드 건너기 O(n)번, 원소 비교 O(log n)번이다. 연결 리스트에서는 이진 탐색을 해도 걷는 비용이 남는다는 것, 그리고 순회 방식이 시간 복잡도를 정한다는 것을 라이브러리 코드가 스스로 알고 대응하는 것이다.</p>
+
+<h4>Arrays.asList — 배열 위에 씌운 리스트</h4>
+<p><code>Arrays</code>는 배열을 위한 도구 상자다. 배열 타입에는 메서드를 덧붙일 수 없고, <code>toString()</code>과 <code>equals()</code>도 <code>Object</code>에서 물려받은 그대로다. 그래서 내용을 문자열로 만드는 <code>Arrays.toString</code>, 내용을 비교하는 <code>Arrays.equals</code>, 정렬하는 <code>Arrays.sort</code>, 정렬된 배열에서 찾는 <code>Arrays.binarySearch</code>가 바깥에 따로 있다. 이 가운데 컬렉션으로 건너가는 다리가 <code>Arrays.asList</code>다.</p>
+<pre><code class="language-java">import java.util.Arrays;
+import java.util.List;
+
+public class ViewMain {
+    public static void main(String[] args) {
+        String[] arr = {"x", "y", "z"};
+        List<String> asList = Arrays.asList(arr);
+
+        asList.set(0, "X");                 // 리스트에 쓰면
+        System.out.println(arr[0]);         // 배열이 바뀌어 있다
+        arr[1] = "Y";                       // 배열에 쓰면
+        System.out.println(asList);         // 리스트에서도 보인다
+        System.out.println(asList.getClass().getName());
+
+        try {
+            asList.add("w");
+        } catch (UnsupportedOperationException e) {
+            System.out.println("add 실패: " + e);
+        }
+
+        int[] prim = {1, 2, 3};
+        System.out.println(Arrays.asList(prim).size());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">X
+[X, Y, z]
+java.util.Arrays$ArrayList
+add 실패: java.lang.UnsupportedOperationException
+1</code></pre>
+<p>리스트에 쓴 것이 배열에 보이고 배열에 쓴 것이 리스트에 보인다. <code>asList</code>가 돌려준 객체는 원소를 복사해 갖고 있지 않다. 넘겨받은 배열의 참조를 필드 하나에 들고, <code>get(i)</code>는 그 배열의 i번 칸을 읽고 <code>set(i, v)</code>는 그 칸에 쓴다. 이렇게 자기 저장소 없이 다른 것의 내용을 다른 모양으로 보여 주는 객체를 뷰(view)라고 한다. 9회에서 본 <code>keySet()</code>이 맵의 뷰였던 것과 같다. 정렬 3의 비교 횟수 예제에서 <code>Collections.reverse(Arrays.asList(reversed))</code> 한 줄로 배열 자체를 뒤집을 수 있었던 것도 이 때문이다.</p>
+<p>클래스 이름이 <code>java.util.Arrays$ArrayList</code>인 것에 주의하자. 우리가 아는 <code>java.util.ArrayList</code>가 아니라 <code>Arrays</code> 안에 중첩된 다른 클래스다. 이 클래스는 배열을 감쌀 뿐이고 배열의 길이는 바꿀 수 없으므로, 리스트의 크기도 바꿀 수 없다. <code>add</code>를 따로 구현하지 않았고, 상위 클래스 <code>AbstractList</code>의 <code>add(int, E)</code>는 본문이 <code>throw new UnsupportedOperationException();</code> 한 줄이다. 값을 바꿀 수는 있지만 넣거나 뺄 수는 없는, 크기가 고정된 리스트다.</p>
+<p>마지막 줄의 1은 자주 걸리는 함정이다. <code>asList</code>의 선언은 <code>static <T> List<T> asList(T... a)</code>이고, 1회에서 본 대로 타입 인자는 참조 타입이어야 한다. <code>int[]</code>를 넘기면 <code>T</code>가 <code>int</code>일 수 없으므로 컴파일러는 <code>T</code>를 <code>int[]</code>로 추론한다. 결과는 배열 하나를 원소로 가진 <code>List<int[]></code>다. <code>Integer[]</code>를 넘겨야 원소 셋짜리 리스트가 된다.</p>
+
+<h4>수정할 수 없는 컬렉션: 팩토리, 뷰, 사본</h4>
+<p>자바 9에서 <code>List.of</code>, <code>Set.of</code>, <code>Map.of</code>가 들어왔다. 이 메서드들이 돌려주는 컬렉션은 수정할 수 없다(unmodifiable). 넣기, 빼기, 바꾸기, 정렬처럼 내용을 바꾸는 메서드를 부르면 언제나 <code>UnsupportedOperationException</code>이 난다. "수정할 수 없음"을 만드는 방법은 <code>Collections.unmodifiableList</code>와 <code>List.copyOf</code>(자바 10)까지 셋인데, 메모리에서 벌어지는 일이 서로 다르다.</p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class CopyMain {
+    public static void main(String[] args) {
+        List<String> fixed = List.of("A", "B", "C");
+        try {
+            fixed.add("D");
+        } catch (UnsupportedOperationException e) {
+            System.out.println("add 실패: " + e);
+        }
+        System.out.println(List.of("A", "B").getClass().getName());
+        System.out.println(fixed.getClass().getName());
+
+        List<String> source = new ArrayList<>(List.of("A", "B"));
+        List<String> view = Collections.unmodifiableList(source);   // 뷰
+        List<String> copy = List.copyOf(source);                    // 사본
+
+        source.add("C");                    // 원본을 바꾸면
+        System.out.println(view);           // 뷰에는 보인다
+        System.out.println(copy);           // 사본에는 보이지 않는다
+        System.out.println(List.copyOf(copy) == copy);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21)"><code class="language-text">add 실패: java.lang.UnsupportedOperationException
+java.util.ImmutableCollections$List12
+java.util.ImmutableCollections$ListN
+[A, B, C]
+[A, B]
+true</code></pre>
+<p>둘째, 셋째 줄이 팩토리가 만든 리스트의 속을 보여 준다. 원소가 둘인 리스트의 실제 클래스는 <code>List12</code>이고 셋인 리스트는 <code>ListN</code>이다. OpenJDK 21의 <code>List12</code>는 배열 없이 필드 <code>e0</code>, <code>e1</code>에 원소의 참조를 직접 담고, <code>ListN</code>은 원소 수에 딱 맞는 배열 하나를 갖는다. 바뀔 일이 없으니 3회에서 본 여유 용량도, 순회 중 수정을 감시하는 <code>modCount</code>도 필요 없다. <code>Set.of</code>가 만드는 <code>SetN</code>도 같은 발상이다. 6회와 7회의 해시 테이블처럼 버킷마다 노드를 매다는 대신, 원소 수의 두 배 길이인 배열 하나에 원소의 참조를 직접 넣는다. 해시 값을 배열 길이로 나눈 나머지 칸에서 시작해, 그 칸이 차 있으면 빈칸이 나올 때까지 다음 칸으로 간다. 원소마다 노드 객체를 만들지 않아도 되고, 삭제와 리사이즈가 없으니 이 단순한 방식으로 충분하다.</p>
+<p>이 팩토리들은 입력에도 엄격하다. <code>null</code>을 원소로 주면 <code>NullPointerException</code>이 나고, <code>Set.of("a", "a")</code>처럼 중복을 주면 <code>IllegalArgumentException: duplicate element: a</code>가 난다. 조용히 하나를 버리지 않고, 집합을 만들겠다면서 같은 것을 두 번 적은 것을 실수로 보고 멈춘다. 그리고 <code>Set.of</code>로 만든 집합의 순회 순서는 실행할 때마다 달라질 수 있다. <code>Set.of("a", "b", "c", "d", "e")</code>를 출력하는 프로그램을 두 번 돌렸더니 한 번은 <code>[e, d, c, b, a]</code>, 한 번은 <code>[d, e, a, b, c]</code>가 나왔다. 구현이 JVM이 뜰 때 정해지는 값으로 순회의 시작 칸과 방향을 고르기 때문이다. Javadoc도 이 순서가 정해져 있지 않고 바뀔 수 있다고 적는다. 해시 구조의 순회 순서에 기댄 코드는 이 집합 앞에서 금방 드러난다.</p>
+<p>넷째와 다섯째 줄이 뷰와 사본의 차이다. <code>Collections.unmodifiableList(source)</code>는 원본을 가리키는 참조 하나를 가진 래퍼(wrapper) 객체를 만든다. 읽는 메서드는 원본에 그대로 넘기고, 쓰는 메서드는 예외를 던진다. 원소를 복사하지 않으므로 만드는 비용이 O(1)이지만, 원본을 쥔 쪽이 원본을 바꾸면 뷰를 통해 그대로 보인다. "이 참조로는 못 바꾼다"는 것이지 "바뀌지 않는다"가 아니다. <code>List.copyOf(source)</code>는 그 시점의 원소를 새 저장소로 옮겨 담는다. O(n)이 들지만 그 뒤로는 원본과 무관하다. 마지막 줄의 <code>true</code>는 덤이다. OpenJDK 21에서 이미 수정할 수 없는 리스트를 <code>copyOf</code>에 넘기면 복사하지 않고 그 객체를 그대로 돌려준다. 바뀔 수 없는 것은 공유해도 안전하다는, 중급 1편의 불변 객체에서 본 논리다.</p>
+<p>이 차이는 객체의 경계에서 중요해진다. 생성자가 받은 리스트를 필드에 그대로 저장하면, 호출한 쪽이 나중에 그 리스트를 바꿔 객체의 내부 상태를 흔들 수 있다. 받을 때 <code>List.copyOf</code>로 끊어 두면 그럴 수 없다. 반대로 내부 리스트를 밖으로 내줄 때 <code>Collections.unmodifiableList</code>로 감싼 뷰를 주면 복사 비용 없이 바깥의 수정을 막는다. 다만 어느 쪽이든 막는 것은 컬렉션의 칸까지다. 칸이 가리키는 원소 객체가 가변이면 그 객체의 필드는 여전히 바뀔 수 있다. <code>List</code>의 Javadoc도 원소가 가변이면 리스트의 내용이 바뀐 것처럼 보일 수 있다고 적는다.</p>
+<p>수정 금지가 실행 시점에야 드러난다는 점도 짚어 둔다. <code>List.of</code>가 돌려주는 값의 타입은 그냥 <code>List<String></code>이고, 그 인터페이스에는 <code>add</code>가 있다. 그래서 <code>fixed.add("D")</code>는 컴파일된다. 자바의 컬렉션 인터페이스는 읽기 전용 타입을 따로 두지 않고, 수정 메서드를 선택적 연산(optional operation)으로 표시해 구현체가 <code>UnsupportedOperationException</code>으로 거부할 수 있게 했다. 타입만으로는 수정할 수 있는지 알 수 없으므로, 남에게서 받은 컬렉션을 고쳐야 한다면 <code>new ArrayList<>(받은_리스트)</code>로 내 사본을 만들어 고치는 것이 안전하다.</p>
+<p><code>Collections</code>에는 빈 컬렉션과 래퍼를 만드는 메서드가 더 있다. <code>Collections.emptyList()</code>는 원소가 없는 수정 불가 리스트를 돌려주는데, 부를 때마다 같은 객체다(<code>==</code> 비교가 <code>true</code>다). 결과가 없을 때 <code>null</code> 대신 빈 컬렉션을 돌려줘도 객체가 새로 만들어지지 않는다. <code>Collections.synchronizedList</code>는 메서드마다 <code>synchronized (mutex) { ... }</code>로 원본 호출을 감싼 래퍼를 만든다. 메서드 하나하나는 한 번에 한 스레드만 실행하지만, 순회는 여러 번의 호출로 이뤄지므로 Javadoc은 순회할 때 사용자가 직접 그 리스트에 대해 동기화해야 한다고 요구한다. 그 이유는 고급 1편의 몫이다.</p>
+
+<h3>컬렉션 프레임워크 전체 정리</h3>
+<p>이 권에서 다룬 인터페이스와 구현체를 한 장에 놓아 보자. 아래의 상속·구현 관계는 JDK 21의 클래스 선언을 <code>javap</code>으로 확인한 것이다.</p>
+<pre class="diagram">Iterable<E>                          "원소를 차례로 내줄 수 있다"   → for-each
+  └─ Collection<E>                   "원소의 모임"                 → add, remove, contains, size
+       ├─ List<E>                    순서가 있고 중복을 허용한다. 인덱스로 접근한다
+       │    ├─ ArrayList             배열
+       │    └─ LinkedList            이중 연결 노드 (Deque도 구현한다)
+       ├─ Set<E>                     중복이 없다
+       │    ├─ HashSet               해시 테이블
+       │    │    └─ LinkedHashSet    해시 테이블 + 넣은 순서를 잇는 연결
+       │    └─ SortedSet ─ NavigableSet
+       │         └─ TreeSet          레드-블랙 트리
+       └─ Queue<E>                   꺼낼 차례가 정해진 대기열
+            ├─ PriorityQueue         이진 힙 (배열)
+            └─ Deque<E>              양쪽 끝에서 넣고 뺀다
+                 ├─ ArrayDeque       원형 배열
+                 └─ LinkedList
+
+Map<K,V>                             "키로 값을 찾는다"  (Collection이 아니다)
+  ├─ HashMap                         해시 테이블
+  │    └─ LinkedHashMap              해시 테이블 + 넣은 순서를 잇는 연결
+  └─ SortedMap ─ NavigableMap
+       └─ TreeMap                    레드-블랙 트리</pre>
+<p>그림에서 읽을 것은 세 가지다. 첫째, 뿌리가 둘이다. 원소 하나하나를 담는 <code>Collection</code> 계열과 키-값 쌍을 담는 <code>Map</code>이 따로 서 있고, <code>Iterable</code>인 것은 <code>Collection</code> 쪽뿐이다. 맵은 <code>keySet()</code>, <code>values()</code>, <code>entrySet()</code>이라는 뷰를 통해 <code>Collection</code>의 세계로 건너온다. 둘째, 인터페이스는 "무엇을 할 수 있는가"를, 구현체는 "어떻게 저장하는가"를 맡는다. 같은 인터페이스 아래의 구현체는 약속이 같으므로 바꿔 끼울 수 있고, 바꾸면 달라지는 것은 비용과 순회 순서다. 셋째, 구현체의 이름이 곧 설명이다. <code>ArrayList</code>는 배열로 만든 리스트, <code>HashSet</code>은 해시로 만든 집합, <code>TreeMap</code>은 트리로 만든 맵, <code>LinkedHashMap</code>은 연결을 더한 해시 맵, <code>ArrayDeque</code>는 배열로 만든 덱이다.</p>
+<p>자바 21에서는 이 그림에 <code>SequencedCollection</code>, <code>SequencedSet</code>, <code>SequencedMap</code>이 더해졌다. "순회 순서가 정해져 있다"는 성질을 타입으로 드러낸 인터페이스다. <code>List</code>, <code>Deque</code>, <code>LinkedHashSet</code>, <code>SortedSet</code>이 <code>SequencedCollection</code> 아래에 놓이고, <code>LinkedHashMap</code>과 <code>SortedMap</code>이 <code>SequencedMap</code> 아래에 놓인다. 앞 회차들에서 언급한 <code>getFirst()</code>, <code>getLast()</code>, <code>reversed()</code>가 여기서 온다. 위 그림에서는 줄기를 단순하게 보이려고 뺐다.</p>
+<p>구현체마다 속 구조가 정하는 성질을 표로 모으면 다음과 같다. 비용은 각 클래스의 Javadoc과 앞 회차에서 본 구조에서 나온 것이고, <code>null</code> 열은 직접 넣어 본 결과다.</p>
+<div class="table-wrap"><table><thead><tr><th>구현체</th><th>내부 구조</th><th>순회 순서</th><th>주요 연산의 비용</th><th>원소(키)에게 요구하는 것</th><th>null</th></tr></thead><tbody>
+<tr><td><code>ArrayList</code></td><td>배열</td><td>인덱스 순</td><td><code>get(i)</code> O(1), 끝에 추가 분할 상환 O(1), 중간 삽입·삭제 O(n), <code>contains</code> O(n)</td><td><code>equals</code>(찾을 때)</td><td>허용</td></tr>
+<tr><td><code>LinkedList</code></td><td>이중 연결 노드</td><td>인덱스 순</td><td>양 끝 추가·삭제 O(1), <code>get(i)</code> O(n), <code>contains</code> O(n)</td><td><code>equals</code>(찾을 때)</td><td>허용</td></tr>
+<tr><td><code>HashSet</code> / <code>HashMap</code></td><td>버킷 배열 + 노드(긴 버킷은 트리)</td><td>정해져 있지 않다</td><td>추가·조회·삭제 평균 O(1)(해시가 고르게 퍼질 때)</td><td><code>hashCode</code>, <code>equals</code></td><td>허용(원소 하나 / 키 하나)</td></tr>
+<tr><td><code>LinkedHashSet</code> / <code>LinkedHashMap</code></td><td>해시 테이블 + 노드를 잇는 이중 연결</td><td>넣은 순서(맵은 접근 순서로도 설정 가능)</td><td>평균 O(1)</td><td><code>hashCode</code>, <code>equals</code></td><td>허용</td></tr>
+<tr><td><code>TreeSet</code> / <code>TreeMap</code></td><td>레드-블랙 트리</td><td>정렬 순서</td><td>추가·조회·삭제 O(log n)</td><td><code>compareTo</code> 또는 비교자</td><td>자연 순서에서는 <code>NullPointerException</code></td></tr>
+<tr><td><code>ArrayDeque</code></td><td>원형 배열</td><td>앞에서 뒤로</td><td>양 끝 추가·삭제 분할 상환 O(1)</td><td>없음</td><td><code>NullPointerException</code></td></tr>
+<tr><td><code>PriorityQueue</code></td><td>이진 힙(배열)</td><td>정해져 있지 않다</td><td><code>offer</code>·<code>poll</code> O(log n), <code>peek</code> O(1)</td><td><code>compareTo</code> 또는 비교자</td><td><code>NullPointerException</code></td></tr>
+</tbody></table></div>
+<p><code>null</code> 열에도 원리가 있다. 자연 순서를 쓰는 <code>TreeSet</code>은 <code>null</code>을 받지 않는다. <code>null</code>에게는 <code>compareTo</code>를 물을 수 없고, 비교할 수 없는 것은 정렬 구조에 자리가 없다. <code>ArrayDeque</code>와 <code>PriorityQueue</code>가 <code>null</code>을 거부하는 이유는 다르다. <code>Queue</code>와 <code>Deque</code>의 Javadoc이 밝히듯 <code>poll()</code>이나 <code>peek()</code> 같은 메서드가 "비어 있다"는 뜻으로 <code>null</code>을 돌려주기 때문이다. 원소로 <code>null</code>을 허용하면 꺼낸 <code>null</code>이 원소인지 신호인지 가릴 수 없다.</p>
+<p>구현체를 고를 때는 성능표부터 보지 않는다. 요구 조건을 차례로 물으면 후보가 좁혀진다.</p>
+<figure class="flow-figure"><figcaption>요구 조건에서 구현체로</figcaption><ol class="flow">
+<li><strong>키로 값을 찾는가</strong><span>그렇다면 <code>Map</code> 계열이다. 아니라면 원소 하나하나를 담는 <code>Collection</code> 계열에서 고른다.</span></li>
+<li><strong>중복을 담아야 하는가, 순번이 필요한가</strong><span>같은 값이 여러 번 들어가야 하거나 "몇 번째"가 의미가 있으면 <code>List</code>다. 중복이 없어야 하고 "들어 있는가"가 주된 질문이면 <code>Set</code>이다.</span></li>
+<li><strong>넣고 꺼내는 차례가 정해져 있는가</strong><span>먼저 넣은 것부터, 또는 나중에 넣은 것부터 꺼내 처리하는 용도라면 <code>Deque</code>(<code>ArrayDeque</code>)다. 우선순위가 높은 것부터라면 <code>PriorityQueue</code>다.</span></li>
+<li><strong>순회 순서에 요구가 있는가</strong><span>없으면 <code>Hash</code> 계열, 넣은 순서가 필요하면 <code>LinkedHash</code> 계열, 정렬 순서나 "이 값 이상인 것 중 가장 작은 것" 같은 범위 조회가 필요하면 <code>Tree</code> 계열이다.</span></li>
+<li><strong>원소가 그 구조의 요구를 채우는가</strong><span>해시 계열이면 <code>equals</code>와 <code>hashCode</code>를 함께 재정의했는지, 트리 계열이면 <code>Comparable</code>이거나 비교자를 줄 수 있는지, 그 비교가 서로 다른 원소에 0을 돌려주지 않는지 확인한다.</span></li>
+</ol></figure>
+<p>특별한 요구가 없을 때의 기본값은 <code>ArrayList</code>, <code>HashSet</code>, <code>HashMap</code>, <code>ArrayDeque</code>다. 앞의 셋은 배열 위에서 인덱스나 해시로 위치를 계산해 바로 가는 구조이고, <code>ArrayDeque</code>는 Javadoc 스스로 스택으로 쓸 때는 <code>Stack</code>보다, 큐로 쓸 때는 <code>LinkedList</code>보다 빠를 가능성이 높다고 적고 있다. 그리고 변수와 매개변수의 타입은 <code>List</code>, <code>Set</code>, <code>Map</code> 같은 인터페이스로 선언한다. 구현체의 이름은 <code>new</code> 하는 한 곳에만 나오게 해 두면, 요구가 바뀌었을 때 고칠 곳도 그 한 곳이다.</p>
+<aside class="keyidea"><span>이 권 전체의 핵심</span><p>컬렉션의 성질은 외워야 할 표가 아니라 속 구조에서 따라 나오는 결과다. 배열은 위치를 계산해 바로 가지만 중간에 끼워 넣으려면 밀어야 한다. 노드는 끼워 넣기는 쉽지만 찾아가려면 걸어야 한다. 해시는 값에서 위치를 계산하므로 빠르지만 순서를 잃고 <code>equals</code>·<code>hashCode</code>의 약속에 기댄다. 트리는 비교로 자리를 찾으므로 순서를 유지하지만 비교의 규약에 기댄다. 그 위에 제네릭이 타입을, 인터페이스가 구현을, 반복자가 순회 방식을 감춘다.</p></aside>
+
+<x-visual id="java-mid2-10-collections-map" title="컬렉션 프레임워크의 인터페이스와 구현체, 각 구현체의 내부 구조를 한 장에 놓은 지도" kind="구조도" ratio="16:9">
+<x-hint>Collection 계열과 Map 계열이라는 두 뿌리, 그 아래 인터페이스, 그리고 구현체마다 내부 구조가 무엇인지를 작은 아이콘으로 구별해 보여 준다.</x-hint>
+<x-prompt>흰 배경의 구조도. 화면을 좌우 두 영역으로 나눈다. 왼쪽 영역(전체 폭의 약 3분의 2)의 맨 위에 둥근 상자 "Iterable", 그 아래에 화살표로 이어진 상자 "Collection". Collection 아래로 세 갈래가 내려간다. 첫째 갈래의 상자는 "List"이고 그 아래에 구현체 카드 두 장 "ArrayList", "LinkedList". 둘째 갈래의 상자는 "Set"이고 그 아래에 카드 세 장 "HashSet", "LinkedHashSet", "TreeSet". 셋째 갈래의 상자는 "Queue · Deque"이고 그 아래에 카드 두 장 "ArrayDeque", "PriorityQueue". 오른쪽 영역의 맨 위에는 따로 떨어진 둥근 상자 "Map"이 있고 그 아래에 카드 세 장 "HashMap", "LinkedHashMap", "TreeMap". Map 상자에서 왼쪽의 Collection 상자로 가는 회색 점선 화살표가 하나 있고 라벨은 "keySet · values · entrySet". 인터페이스 상자는 옅은 파란색, 구현체 카드는 흰색에 회색 테두리. 각 구현체 카드의 오른쪽 아래 구석에 내부 구조를 나타내는 작은 아이콘을 그린다: ArrayList와 ArrayDeque에는 가로로 이어진 네모 칸들, LinkedList에는 화살표로 이어진 동그라미들, HashSet과 HashMap에는 세로 칸 배열에서 옆으로 매달린 작은 동그라미들, LinkedHashSet과 LinkedHashMap에는 같은 그림에 동그라미들을 잇는 주황색 선, TreeSet과 TreeMap에는 작은 이진 트리, PriorityQueue에는 삼각형 모양의 힙. 화면 맨 아래에 범례 한 줄: 네모 칸 아이콘 옆에 "배열", 이어진 동그라미 옆에 "연결 노드", 매달린 동그라미 옆에 "해시 테이블", 이진 트리 옆에 "레드-블랙 트리". 차분한 파랑과 회색, 강조는 주황. 평면적인 기술 도해 스타일.</x-prompt>
+<x-caption>인터페이스는 무엇을 할 수 있는지를, 구현체는 어떻게 저장하는지를 정한다. 구현체의 성질은 카드 구석의 내부 구조에서 나온다.</x-caption>
+</x-visual>
+
+<h3>흔한 오해와 함정</h3>
+<h4>"문자열을 정렬하면 사전 순서가 된다"</h4>
+<p>정렬 1에서 본 대로 <code>String</code>의 자연 순서는 문자의 유니코드 값 순서다. 대문자가 전부 소문자보다 앞에 온다. 대소문자를 가리지 않는 순서가 필요하면 <code>String</code>이 상수로 갖고 있는 비교자를 넘긴다.</p>
+<pre><code class="language-java">String[] words = {"banana", "Apple", "cherry", "apple", "Banana"};
+Arrays.sort(words, String.CASE_INSENSITIVE_ORDER);
+System.out.println(Arrays.toString(words));
+// [Apple, apple, banana, Banana, cherry]</code></pre>
+<p>"Apple"과 "apple"은 이 비교자에서 순서가 같다. 둘 가운데 "Apple"이 앞에 온 것은 입력에서 앞에 있었기 때문이고, "banana"가 "Banana"보다 앞인 것도 같은 이유다. 안정 정렬의 보장이 여기서도 보인다. 언어별 사전 순서처럼 더 복잡한 규칙이 필요하면 <code>java.text.Collator</code>를 쓴다. 이 클래스는 <code>Comparator<Object></code>를 구현하고 있어서 비교자 자리에 그대로 넘길 수 있다. 순서를 원소 바깥의 객체로 떼어 낸 설계가 실제로 쓰이는 자리다.</p>
+
+<h4>"정렬 메서드는 정렬된 새 리스트를 돌려준다"</h4>
+<p><code>Collections.sort</code>, <code>List.sort</code>, <code>Arrays.sort</code>의 반환 타입은 모두 <code>void</code>다. 넘겨받은 리스트나 배열을 그 자리에서 고친다. 그래서 수정할 수 없는 리스트는 정렬할 수 없다. <code>List.of(3, 1, 2).sort(null)</code>은 <code>UnsupportedOperationException</code>으로 끝난다. 원본을 그대로 두고 정렬된 결과가 필요하면 사본을 만들어 그것을 정렬한다.</p>
+<pre><code class="language-java">List<Integer> scores = List.of(3, 1, 2);
+List<Integer> sorted = new ArrayList<>(scores);   // 원소(참조)를 복사한 새 리스트
+sorted.sort(null);
+System.out.println(scores + " " + sorted);         // [3, 1, 2] [1, 2, 3]</code></pre>
+<p>같은 이유로, 메서드가 인자로 받은 리스트를 안에서 정렬하면 호출한 쪽의 리스트 순서가 바뀐다. 남의 리스트를 정렬해야 하면 먼저 복사한다.</p>
+
+<h4>"PriorityQueue를 for-each로 돌면 우선순위 순서로 나온다"</h4>
+<pre><code class="language-java">PriorityQueue<Integer> pq = new PriorityQueue<>(List.of(5, 1, 4, 2, 3));
+System.out.println(pq);                       // [1, 2, 4, 5, 3]
+while (!pq.isEmpty()) {
+    System.out.print(pq.poll() + " ");        // 1 2 3 4 5
+}</code></pre>
+<p><code>toString()</code>은 반복자로 원소를 훑어 문자열을 만든다. 그 결과가 정렬 순서가 아니다. <code>PriorityQueue</code>가 보장하는 것은 <code>poll()</code>이 매번 가장 앞선 원소를 꺼낸다는 것뿐이고, 내부 배열은 힙의 조건(부모가 자식보다 뒤에 오지 않는다)만 만족하도록 놓여 있다. 반복자는 그 배열을 앞에서부터 읽는다. Javadoc도 이 반복자가 특정한 순서로 순회한다는 보장이 없다고 적는다. "순회 순서는 구조가 정한다"는 순회 3의 결론이 그대로 적용되는 예다. 정렬 순서로 훑어야 한다면 배열로 꺼내 정렬하거나, 처음부터 <code>TreeSet</code>이나 <code>TreeMap</code>을 쓴다.</p>
+
+<h4>"정렬된 채로 갖고 있으려면 무조건 TreeSet이다"</h4>
+<p><code>TreeSet</code>은 집합이다. 비교 결과가 0인 원소는 하나만 남는다. 점수 목록처럼 같은 값이 여러 번 나올 수 있는 데이터를 넣으면 중복이 사라진다. 또 "언제 정렬된 순서가 필요한가"도 따져야 한다. 데이터를 다 모은 뒤에 한 번 정렬된 결과가 필요한 것이라면 <code>ArrayList</code>에 모아 <code>sort</code>를 한 번 부르면 된다. 넣고 빼는 사이사이에 계속 정렬 순서로 조회하거나 범위를 물어야 할 때가 트리의 자리다. 구조를 고르는 기준은 "어떤 연산을 얼마나 자주 하는가"이지 "정렬이라는 단어가 요구 사항에 있는가"가 아니다.</p>
+
+<h3>다른 주제와의 연결</h3>
+<p>이 회차의 두 약속은 로드맵 뒤쪽에서 계속 다시 나온다. 고급 3편의 스트림은 컬렉션 위에 서 있다. <code>Collection.stream()</code>의 기본 구현은 <code>StreamSupport.stream(spliterator(), false)</code> 한 줄이고, <code>Iterable</code>이 기본으로 내주는 <code>spliterator()</code>는 <code>iterator()</code>로 만든 반복자를 감싼 것이다. 스트림의 정렬 연산이 받는 것도 이 회차의 <code>Comparator</code>이고, <code>Comparator.comparing</code>에 넘긴 람다가 무엇인지도 그 권에서 제대로 다룬다.</p>
+<p>고급 1편에서는 여러 스레드가 한 컬렉션을 쓰는 상황을 다룬다. 이 회차의 컬렉션들은 순회 도중의 수정을 fail-fast로 "발견하면 멈춘다"는 방침이었다. 동시성 컬렉션은 방침이 다르다. <code>CopyOnWriteArrayList</code>의 Javadoc은 반복자가 만들어진 시점의 배열을 스냅샷으로 들고 순회하며 <code>ConcurrentModificationException</code>을 던지지 않는다고 밝히고, <code>ConcurrentHashMap</code>의 뷰가 내주는 반복자는 약한 일관성(weakly consistent)을 갖는다고 적혀 있다. 순회와 수정이 겹칠 때 무엇을 보여 줄 것인가는 자료 구조마다 고르는 설계 결정이고, <code>modCount</code> 검사는 그 선택지의 하나다.</p>
+<p>데이터베이스 권에서는 같은 원리를 디스크 위에서 다시 만난다. 정렬된 구조는 "이 값부터 저 값까지"를 이어서 읽을 수 있고 해시 구조는 그럴 수 없다는 차이, 정렬 기준이 여러 개일 때 앞 기준이 같은 것끼리만 다음 기준이 의미를 갖는다는 <code>thenComparing</code>의 구조는 인덱스와 <code>ORDER BY</code>를 이해할 때 그대로 쓰인다. 스프링과 JPA 권에서 주고받는 데이터도 대부분 <code>List</code>, <code>Set</code>, <code>Map</code>이다. 그때마다 이 컬렉션의 속은 무엇이고, 원소에게 무엇을 요구하며, 순회 순서는 무엇이 정하는가를 물을 수 있으면 이 권의 목표는 이룬 것이다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>Iterable과 Iterator</dt><dd><code>Iterable</code>은 반복자를 내줄 수 있는 자료 구조이고, <code>Iterator</code>는 위치를 기억하며 <code>hasNext()</code>와 <code>next()</code>로 한 칸씩 나아가는 객체다. 위치라는 상태를 별도 객체에 두었기 때문에 같은 자료 구조를 여러 곳에서 동시에 훑어도 서로 간섭하지 않는다.</dd>
+<dt>향상된 for문의 번역</dt><dd>JLS §14.14.2에 따라 배열이면 인덱스 반복으로, <code>Iterable</code>이면 <code>iterator()</code>·<code>hasNext()</code>·<code>next()</code> 호출로 번역된다. 콜론 오른쪽 식은 한 번만 평가되고, 반복 변수는 원소의 복사본이며, <code>Map</code>은 대상이 아니다.</dd>
+<dt>fail-fast와 modCount</dt><dd>반복자는 만들어질 때의 <code>modCount</code>를 기억해 두고 <code>next()</code>마다 견줘, 바깥에서 구조적 수정이 있었으면 <code>ConcurrentModificationException</code>을 던진다. 최선을 다한 검출일 뿐이라 예외 없이 원소를 건너뛰는 경우도 있다. 순회 중 삭제는 <code>Iterator.remove()</code>나 <code>removeIf</code>로 한다.</dd>
+<dt>Comparable과 자연 순서</dt><dd>클래스가 <code>compareTo</code>로 스스로 정한 순서다. 반환값은 부호만 의미가 있다. <code>String</code>의 자연 순서는 사전 순서가 아니라 유니코드 값 순서다.</dd>
+<dt>Comparator</dt><dd>순서를 원소 바깥의 객체로 건네는 방법이다. <code>reversed</code>, <code>comparing</code>, <code>thenComparing</code>으로 조립할 수 있고, 정렬 메서드와 <code>TreeSet</code>·<code>TreeMap</code>·<code>PriorityQueue</code>의 생성자가 받는다. 주어지면 자연 순서보다 우선한다.</dd>
+<dt>비교 규약</dt><dd>대칭성, 추이성, 동순위의 일관성이다. 정렬·이진 탐색·트리는 모든 쌍을 비교하지 않고 이미 얻은 답에서 나머지를 추론하므로, 규약이 깨지면 조용히 틀린 결과가 나오거나 예외가 난다. 뺄셈으로 만든 비교와 0을 돌려주지 않는 비교가 대표적인 위반이다.</dd>
+<dt>안정 정렬과 TimSort</dt><dd>객체 정렬은 비교 결과가 0인 원소들의 원래 순서를 유지한다고 API가 보장한다. OpenJDK의 구현은 입력에서 정렬된 구간(런)을 찾아 병합하는 TimSort이고, 입력이 정렬되어 있을수록 비교 횟수가 줄어든다. 기본형 배열은 이중 피벗 퀵 정렬을 쓴다.</dd>
+<dt>정렬 컬렉션의 "같다"</dt><dd><code>TreeSet</code>과 <code>TreeMap</code>은 <code>equals</code>가 아니라 비교 결과가 0인지로 중복을 판단한다. 필드 일부만 보는 비교자를 주면 동순위 원소가 중복으로 취급되어 사라진다.</dd>
+<dt>뷰와 사본</dt><dd><code>Arrays.asList</code>와 <code>Collections.unmodifiableList</code>는 원본을 가리키는 뷰라서 원본의 변화가 그대로 보인다. <code>List.of</code>와 <code>List.copyOf</code>는 원본과 독립된 수정 불가 컬렉션을 만든다. 수정 금지는 타입이 아니라 실행 시점의 <code>UnsupportedOperationException</code>으로 드러난다.</dd>
+</x-summary>
+
+<x-review>
+<p>운영 로그에서 <code>ConcurrentModificationException</code>을 만나면 스택 트레이스 맨 위의 <code>next()</code>가 아니라 그 반복문의 본문이 닿는 곳을 봐야 한다. 본문에서 직접 지우는 경우보다, 본문이 부른 메서드가 몇 단계 아래에서 같은 컬렉션을 고치는 경우가 더 찾기 어렵다. 등록된 리스너를 차례로 호출하는데 리스너가 자기 자신을 목록에서 빼는 구조가 전형적이다. 고치는 방법은 상황에 따라 다르다. 조건에 맞는 원소를 지우는 것이라면 <code>removeIf</code>가 가장 단순하고 O(n)이다. 본문이 무엇을 할지 통제할 수 없다면 <code>new ArrayList<>(원본)</code>으로 순회용 사본을 떠서 돌린다. 복사 비용 O(n)을 치르고 "순회를 시작한 시점의 목록"이라는 분명한 의미를 얻는 것이다. 어느 경우든 예외를 <code>catch</code>로 덮어서는 안 된다. 이 예외는 이미 원소를 건너뛰었거나 건너뛸 뻔했다는 신호이고, 더 위험한 것은 예외 없이 건너뛰는 경우다. 그리고 스레드가 여럿인 코드에서 이 예외가 가끔 난다면 동기화 없이 컬렉션을 공유하고 있다는 증상이다. 순회 방법이 아니라 공유 방식을 고쳐야 한다.</p>
+<p>"Comparison method violates its general contract!"는 개발 환경에서 한 번도 못 보다가 운영에서 처음 만나기 쉬운 예외다. 원소가 32개 미만이면 병합 단계가 없어 검출될 기회가 없고, 검출 자체도 데이터의 배치에 달려 있기 때문이다. 그래서 비교자는 실행해 보는 것으로 검증되지 않고 읽어서 검증해야 한다. 뺄셈을 돌려주는가, 같을 때 0을 돌려주는가를 본다. 한 가지 더 볼 것은 비교에 쓰는 값이 정렬하는 동안 변하지 않는가이다. 다른 스레드가 바꾸는 필드나 호출할 때마다 달라지는 값으로 비교하면 코드가 옳아 보여도 규약을 어긴 것과 같은 결과가 난다. 같은 이유로 <code>TreeMap</code>의 키나 <code>TreeSet</code>의 원소로 넣은 객체에서 비교 기준 필드를 나중에 바꾸면 안 된다. 트리는 넣을 때의 비교 결과로 자리를 정했으므로, 값이 바뀐 뒤에는 그 원소를 찾아가는 길이 맞지 않게 된다. 해시 컬렉션에 넣은 객체의 <code>hashCode</code>를 바꾸는 것과 같은 종류의 문제다.</p>
+<p>정렬을 어디서 할지도 판단 대상이다. 이미 메모리에 있는 수십, 수백 건을 화면에 맞게 다시 늘어놓는 일은 <code>Comparator</code>가 알맞다. 데이터베이스에서 가져오는 데이터라면 사정이 다르다. 일부만 잘라서 보여 주는 페이징이 있으면 정렬은 자르기 전에 끝나 있어야 하므로 데이터베이스가 정렬해야 하고, 전부 가져와 메모리에서 정렬하는 방식은 데이터가 늘수록 감당하기 어려워진다. 반대로 정렬 기준이 애플리케이션의 계산 결과라서 SQL로 표현하기 어렵다면 메모리 정렬이 맞는 선택일 수 있다. 기준은 정렬할 데이터의 양과 정렬 뒤에 전부를 쓰는지 일부만 쓰는지다.</p>
+<p>객체의 경계에서는 컬렉션을 어떤 모양으로 주고받을지를 정해야 한다. 내부 리스트를 그대로 돌려주면 바깥에서 고칠 수 있고, 그 순간 객체가 지키려던 조건은 보장되지 않는다. 뷰를 돌려주면 복사 비용 없이 수정을 막지만, 받은 쪽이 순회하는 동안 내부가 바뀌면 받은 쪽의 반복문에서 <code>ConcurrentModificationException</code>이 난다. 뷰의 반복자는 원본의 반복자를 감싼 것이기 때문이다. 사본을 돌려주면 받은 쪽은 변하지 않는 스냅샷을 얻지만 호출마다 O(n)을 치른다. 호출하는 쪽이 "그 시점의 목록"을 기대하는지 "언제나 최신 목록"을 기대하는지, 컬렉션이 얼마나 크고 얼마나 자주 불리는지에 따라 답이 달라진다. 받을 때 <code>List.copyOf</code>를 쓰면 <code>null</code> 원소가 섞인 입력을 그 자리에서 <code>NullPointerException</code>으로 거부한다는 것도 알고 써야 한다. 경계에서 일찍 실패하는 것은 대개 장점이지만, 그 입력이 어디서 오는지에 따라서는 미리 걸러야 할 수 있다.</p>
+</x-review>
+
+<x-practice>
+<li>아래 메서드를 <code>run(2)</code>, <code>run(4)</code>, <code>run(5)</code>로 각각 호출한다. 호출마다 (가) 예외가 나는지, (나) 예외가 나지 않는다면 무엇이 출력되고 방문하지 못한 원소가 무엇인지 예측하라. 답은 삭제 직후의 <code>cursor</code>와 <code>size</code> 값으로 설명하라.
+<pre><code class="language-java">static void run(int target) {
+    List<Integer> list = new ArrayList<>(List.of(1, 2, 3, 4, 5));
+    for (Integer n : list) {
+        if (n == target) {
+            list.remove(n);              // n이 Integer이므로 remove(Object)가 호출된다
+        }
+    }
+    System.out.println(list);
+}</code></pre></li>
+<li>3부터 1까지 거꾸로 세는 <code>Iterable</code>을 만들려고 아래처럼 썼다. 출력을 예측하고, 기대한 결과(아홉 쌍을 출력한 뒤 다음 줄에 <code>321끝</code>)와 다른 이유를 설명하라. 어디를 어떻게 고쳐야 하는가? 이 반복자가 <code>Iterator</code>의 규칙을 어기는 곳이 한 군데 더 있다. 어디인가?
+<pre><code class="language-java">class Countdown implements Iterable<Integer> {
+    private int current;                 // 위치를 Iterable 쪽에 두었다
+
+    Countdown(int start) {
+        this.current = start;
+    }
+
+    @Override
+    public Iterator<Integer> iterator() {
+        return new Iterator<>() {
+            @Override
+            public boolean hasNext() {
+                return current > 0;
+            }
+
+            @Override
+            public Integer next() {
+                return current--;
+            }
+        };
+    }
+}
+
+// ...
+Countdown c = new Countdown(3);
+for (int a : c) {
+    for (int b : c) {
+        System.out.print(a + "" + b + " ");
+    }
+}
+System.out.println();
+for (int a : c) {
+    System.out.print(a);
+}
+System.out.println("끝");</code></pre></li>
+<li>같은 비교자를 정렬과 <code>TreeSet</code>에 각각 썼다. 두 줄의 출력을 예측하고, 둘째 줄에서 남는 원소가 왜 하필 그 원소들인지 설명하라. 길이순으로 늘어놓되 다섯 원소가 모두 남게 하려면 비교자를 어떻게 바꿔야 하는가?
+<pre><code class="language-java">Comparator<String> byLength = Comparator.comparing(s -> s.length());
+
+List<String> words = new ArrayList<>(List.of("bb", "a", "ccc", "dd", "e"));
+words.sort(byLength);
+System.out.println(words);
+
+Set<String> set = new TreeSet<>(byLength);
+set.addAll(List.of("bb", "a", "ccc", "dd", "e"));
+System.out.println(set);</code></pre></li>
+<li>잔액이 <code>long</code>인 계좌 클래스에 아래처럼 자연 순서를 주었다. 잔액이 0, 2,000,000,000, 4,000,000,000인 계좌를 차례로 a, b, c라 할 때 <code>b.compareTo(a)</code>, <code>c.compareTo(b)</code>, <code>c.compareTo(a)</code>의 부호를 손으로 구하라. <code>long</code>을 <code>int</code>로 좁히면 아래 32비트만 남고, 2³²은 4,294,967,296이다. 세 결과는 <code>compareTo</code>의 어느 규약을 어기는가? 잔액 차이가 정확히 4,294,967,296인 두 계좌는 어떻게 비교되는가? 올바르게 고쳐라.
+<pre><code class="language-java">class Account implements Comparable<Account> {
+    final long balance;
+
+    Account(long balance) {
+        this.balance = balance;
+    }
+
+    @Override
+    public int compareTo(Account o) {
+        return (int) (this.balance - o.balance);
+    }
+}</code></pre></li>
+<li>다음 다섯 요구 각각에 알맞은 구현체를 고르고, 그 구현체가 원소나 키에게 요구하는 메서드를 적어라. (가) 사용자가 본 상품의 ID를 중복 없이, 처음 본 순서대로 보여 준다. (나) 회원 ID로 회원 객체를 찾는다. 순서는 필요 없다. (다) 시험 점수를 전부 모은 다음 오름차순으로 한 번 출력한다. 같은 점수가 여러 번 나올 수 있다. (라) 예약 시각을 키로 예약을 저장하고, "지금 이후 가장 가까운 예약"을 자주 조회한다. (마) 들어온 순서대로 처리할 작업을 쌓아 두고 하나씩 꺼낸다.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> <code>run(2)</code>는 <code>ConcurrentModificationException</code>으로 끝난다. 2를 돌려준 직후 <code>cursor</code>는 2이고, 삭제로 <code>size</code>는 4가 된다. <code>hasNext()</code>는 2 ≠ 4이므로 <code>true</code>, 이어진 <code>next()</code>가 <code>modCount</code>와 <code>expectedModCount</code>의 불일치를 발견한다. <code>run(4)</code>는 예외 없이 <code>[1, 2, 3, 5]</code>를 출력한다. 4를 돌려준 직후 <code>cursor</code>는 4이고 삭제로 <code>size</code>도 4가 되어 <code>hasNext()</code>가 <code>false</code>다. <code>next()</code>가 불리지 않으니 검사도 실행되지 않고, 5는 방문되지 않았다. 이 코드에서는 5를 볼 필요가 없었으니 결과가 우연히 맞았을 뿐이고, 본문이 모든 원소에 대해 무언가를 하는 코드였다면 조용히 틀렸을 것이다. <code>run(5)</code>는 다시 예외다. 5를 돌려준 직후 <code>cursor</code>는 5이고 삭제로 <code>size</code>는 4가 된다. <code>hasNext()</code>가 <code>cursor != size</code>이므로 5 ≠ 4는 <code>true</code>이고, <code>next()</code>에서 검사에 걸린다. 부등호 <code><</code>로 구현되어 있었다면 이 경우도 조용히 끝났을 것이다. 세 경우 모두 올바른 코드는 <code>list.removeIf(n -> n == target)</code>이다.</p>
+<p><b>2.</b> 출력은 첫 줄에 <code>32 31 </code>, 둘째 줄에 <code>끝</code>이다. 위치 <code>current</code>가 반복자가 아니라 <code>Countdown</code> 객체에 있어서, <code>iterator()</code>를 몇 번 부르든 모든 반복자가 같은 위치를 함께 쓴다. 바깥 반복이 3을 꺼내 <code>current</code>가 2가 되고, 안쪽 반복이 2와 1을 꺼내 <code>current</code>가 0이 된다. 안쪽 반복이 끝난 뒤 바깥 반복의 <code>hasNext()</code>는 0 > 0, 곧 <code>false</code>이므로 바깥도 끝난다. 두 번째 for문은 새 반복자를 받지만 <code>current</code>가 이미 0이라 한 번도 돌지 않는다. 고치려면 <code>Countdown</code>에는 시작값만 <code>final</code> 필드로 두고, 익명 클래스 안에 <code>private int current = start;</code>를 두어 반복자마다 자기 위치를 갖게 한다. 그러면 아홉 쌍이 출력되고 두 번째 반복도 <code>321</code>을 출력한다. 또 하나의 위반은 <code>next()</code>다. 남은 원소가 없을 때 <code>NoSuchElementException</code>을 던져야 하는데 0, −1, …을 계속 돌려준다.</p>
+<p><b>3.</b> 첫 줄은 <code>[a, e, bb, dd, ccc]</code>다. 길이 1인 "a"와 "e", 길이 2인 "bb"와 "dd"는 비교 결과가 0이고, 안정 정렬이므로 입력에서의 순서(a가 e보다 앞, bb가 dd보다 앞)가 유지된다. 둘째 줄은 <code>[a, bb, ccc]</code>다. <code>TreeSet</code>은 비교 결과가 0이면 이미 있는 원소로 보고 넣지 않는다. <code>addAll</code>은 "bb", "a", "ccc", "dd", "e" 순서로 넣으므로 길이 2에서는 먼저 들어간 "bb"가, 길이 1에서는 먼저 들어간 "a"가 자리를 차지했고, 나중에 온 "dd"와 "e"가 거부되었다. 다섯 원소를 모두 남기려면 길이가 같을 때 0이 나오지 않도록 두 번째 기준을 붙인다. <code>byLength.thenComparing(Comparator.naturalOrder())</code>를 주면 <code>[a, e, bb, dd, ccc]</code>가 된다. 이 비교자는 내용이 다른 두 문자열에 0을 돌려주지 않으므로 <code>equals</code>와도 일관된다.</p>
+<p><b>4.</b> <code>b.compareTo(a)</code>는 2,000,000,000으로 <code>int</code> 범위 안이라 양수다. <code>c.compareTo(b)</code>도 2,000,000,000, 양수다. <code>c.compareTo(a)</code>는 차가 4,000,000,000인데 <code>int</code>로 좁히면 4,000,000,000 − 4,294,967,296 = −294,967,296, 음수다. c가 b보다 뒤이고 b가 a보다 뒤인데 c는 a보다 앞이라고 답하므로 추이성이 깨진다. 잔액 차이가 정확히 2³²이면 아래 32비트가 모두 0이라 결과는 0이다. 잔액이 42억 넘게 차이 나는 두 계좌를 "순서가 같다"고 하는 셈이고, 이 클래스를 <code>TreeSet</code>에 넣으면 둘 중 하나가 사라진다. 고치는 방법은 빼지 않고 견주는 것이다. <code>return Long.compare(this.balance, o.balance);</code>로 바꾼다. 캐스트를 지우고 <code>long</code> 뺄셈의 부호만 보는 식으로 고쳐도 차가 <code>long</code> 범위를 넘는 입력에서는 같은 문제가 남는다.</p>
+<p><b>5.</b> (가) <code>LinkedHashSet</code>. 중복을 막는 것은 해시 테이블이고 본 순서는 노드를 잇는 연결이 지킨다. 원소에 <code>hashCode</code>와 <code>equals</code>가 필요하다. ID가 <code>Long</code>이나 <code>String</code>이면 이미 갖춰져 있다. (나) <code>HashMap</code>. 키로 값을 찾고 순서 요구가 없다. 키에 <code>hashCode</code>와 <code>equals</code>가 필요하다. (다) <code>ArrayList</code>에 모아 <code>sort</code>를 한 번 부른다. <code>TreeSet</code>은 같은 점수를 하나로 합치므로 쓸 수 없다. 원소가 <code>Comparable</code>이거나 비교자를 넘겨야 한다. (라) <code>TreeMap</code>. "이 키 이상인 것 가운데 가장 작은 키"는 정렬된 구조에서만 O(log n)으로 답할 수 있다. 키가 <code>Comparable</code>이거나 생성자에 비교자를 줘야 하고, 그 비교가 서로 다른 시각에 0을 돌려주면 예약이 덮어써진다. (마) <code>ArrayDeque</code>를 <code>Queue</code> 타입으로 받아 <code>offer</code>와 <code>poll</code>로 쓴다. 원소에 요구하는 메서드는 없지만 <code>null</code>은 넣을 수 없다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>순회 위치를 자료 구조(<code>Iterable</code>) 안의 필드로 두지 않고 별도의 <code>Iterator</code> 객체에 두는 이유로 가장 알맞은 것은?</q>
+<o>반복자 객체를 따로 두어야 JVM이 배열 접근을 더 빠른 명령으로 바꿀 수 있기 때문이다.</o>
+<o>위치는 순회 한 번마다 따로 있어야 하는 상태이므로, 분리해야 같은 자료 구조에 대한 여러 순회가 서로의 위치를 망가뜨리지 않기 때문이다.</o>
+<o>자료 구조 클래스에는 <code>hasNext()</code>라는 이름의 메서드를 선언할 수 없기 때문이다.</o>
+<o>반복자를 분리해야 컴파일러가 타입 소거를 하지 않기 때문이다.</o>
+<why>위치는 "이번 순회가 어디까지 왔는가"라는 순회별 상태다. 자료 구조에 필드 하나로 두면 이중 반복문이나 두 군데에서의 동시 순회가 같은 위치를 함께 써서 서로를 망가뜨린다(적용 연습 2번). <code>iterator()</code>를 부를 때마다 새 반복자를 만들기 때문에 순회마다 자기 위치를 갖는다. 배열 접근 명령이나 타입 소거와는 관계가 없고, 메서드 이름에 그런 제약도 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>ArrayList</code> <code>[A, B, C, D]</code>를 향상된 for문으로 돌면서 "C"를 방문했을 때 <code>list.remove("C")</code>를 했더니 예외 없이 끝났고 "D"는 방문되지 않았다. 이유는?</q>
+<o>끝에서 두 번째 원소를 지우는 것은 구조적 수정이 아니어서 <code>modCount</code>가 오르지 않는다.</o>
+<o>향상된 for문은 배열 리스트를 인덱스 반복으로 번역하므로 반복자가 쓰이지 않는다.</o>
+<o>삭제 뒤 <code>cursor</code>와 <code>size</code>가 둘 다 3이 되어 <code>hasNext()</code>가 <code>false</code>를 돌려주고, 수정 검사가 들어 있는 <code>next()</code>가 호출되지 않는다.</o>
+<o><code>remove(Object)</code>는 반복자의 <code>expectedModCount</code>를 함께 갱신해 준다.</o>
+<why>검사는 <code>next()</code> 안에 있다. "C"를 돌려준 직후 <code>cursor</code>는 3이고 삭제로 <code>size</code>가 3이 되면 <code>hasNext()</code>(<code>cursor != size</code>)가 <code>false</code>라서 <code>next()</code>가 불리지 않는다. <code>modCount</code>는 분명히 올랐다. 리스트는 <code>Iterable</code>이므로 향상된 for문은 반복자를 쓴다. 기대값을 갱신해 주는 것은 리스트의 <code>remove</code>가 아니라 반복자의 <code>remove()</code>다. fail-fast는 최선을 다한 검출일 뿐이라는 것을 보여 주는 사례다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>비교자가 추이성 같은 규약을 어기면 정렬 결과가 틀리거나 예외가 날 수 있다. 근본 이유는?</q>
+<o>정렬 알고리즘은 모든 쌍을 비교하지 않고, 이미 얻은 비교 결과에서 나머지 순서를 추론하기 때문이다.</o>
+<o>정렬 알고리즘이 비교자를 부르기 전에 모든 원소의 <code>hashCode()</code>를 먼저 비교하기 때문이다.</o>
+<o>규약을 어긴 비교자는 컴파일러가 다른 바이트코드로 번역하기 때문이다.</o>
+<o>정렬 도중에 원소 객체가 힙에서 복사되면서 필드 값이 바뀌기 때문이다.</o>
+<why>원소 n개의 쌍은 n(n−1)/2개지만 좋은 정렬은 훨씬 적게 묻는다. a가 b보다 앞이고 b가 c보다 앞이면 a와 c는 묻지 않고 a를 앞에 둔다. 이 추론은 비교가 규약을 지킬 때만 옳다. 정렬은 <code>hashCode</code>를 쓰지 않고, 컴파일러는 비교자의 규약을 알지 못하며, 정렬이 옮기는 것은 참조일 뿐 객체는 복사되지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>길이만 비교하는 비교자로 만든 <code>TreeSet<String></code>에 "kiwi"를 넣었다. 넣은 적 없는 "lime"에 대해 <code>contains("lime")</code>이 <code>true</code>를 돌려주는 이유는?</q>
+<o>"kiwi"와 "lime"의 <code>hashCode()</code>가 우연히 같기 때문이다.</o>
+<o><code>TreeSet</code>은 <code>contains</code>에서 <code>equals</code>를 부르는데 <code>String.equals</code>가 길이만 비교하기 때문이다.</o>
+<o><code>TreeSet</code>의 반복자가 fail-fast라서 조회 결과가 정확하지 않을 수 있기 때문이다.</o>
+<o><code>TreeSet</code>은 트리를 내려가며 비교 결과가 0인 노드를 만나면 같은 원소로 판단하고, <code>equals</code>나 <code>hashCode</code>는 쓰지 않기 때문이다.</o>
+<why>정렬 컬렉션에서 "같다"의 기준은 비교 결과가 0인가이다. 길이 4인 "lime"은 길이 4인 "kiwi"와 비교 결과가 0이므로 집합은 이미 있는 원소라고 답한다. <code>hashCode</code>는 해시 컬렉션이 쓰는 것이고, <code>String.equals</code>는 내용 전체를 비교한다. fail-fast는 순회 중 수정에 관한 것이라 이 상황과 무관하다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>List<String> src = new ArrayList<>(List.of("A"))</code>에서 <code>v = Collections.unmodifiableList(src)</code>와 <code>c = List.copyOf(src)</code>를 만든 뒤 <code>src.add("B")</code>를 실행했다. 옳은 설명은?</q>
+<o><code>v</code>와 <code>c</code> 모두 <code>[A]</code>다. 둘 다 수정할 수 없는 리스트이기 때문이다.</o>
+<o><code>v</code>는 <code>[A, B]</code>, <code>c</code>는 <code>[A]</code>다. <code>v</code>는 원본을 가리키는 뷰이고 <code>c</code>는 만든 시점의 원소를 따로 담은 사본이기 때문이다.</o>
+<o><code>src.add("B")</code>에서 <code>UnsupportedOperationException</code>이 난다. 뷰를 만든 뒤에는 원본도 수정할 수 없기 때문이다.</o>
+<o><code>v</code>는 <code>[A]</code>, <code>c</code>는 <code>[A, B]</code>다. <code>copyOf</code>가 원본과 저장소를 공유하기 때문이다.</o>
+<why><code>unmodifiableList</code>는 원본의 참조를 쥔 래퍼를 만들 뿐 원소를 복사하지 않는다. 래퍼를 통한 수정만 막으므로 원본은 여전히 수정할 수 있고, 그 변화는 뷰에 그대로 보인다. <code>copyOf</code>는 호출 시점의 원소를 새 저장소에 담으므로 이후의 원본 변화와 무관하다. "이 참조로는 못 바꾼다"와 "바뀌지 않는다"는 다른 말이다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>반복자(Iterator)</dt><dd>자료 구조의 원소를 차례로 방문하기 위해 현재 위치를 기억하는 객체. <code>hasNext()</code>와 <code>next()</code>를 제공하고, <code>Iterable</code>의 <code>iterator()</code>가 부를 때마다 새로 만들어 준다.</dd>
+<dt>향상된 for문(enhanced for statement)</dt><dd><code>for (T x : 식)</code> 형태의 반복문. 식이 배열이면 인덱스 반복으로, <code>Iterable</code>이면 반복자 호출로 컴파일러가 번역한다(JLS §14.14.2).</dd>
+<dt>fail-fast</dt><dd>잘못된 상태를 발견한 자리에서 곧바로 실패하는 방침. 컬렉션의 반복자는 순회 중 바깥의 수정을 발견하면 <code>ConcurrentModificationException</code>을 던진다. 검출은 보장되지 않는다.</dd>
+<dt>구조적 수정(structural modification)</dt><dd>원소를 더하거나 지워 컬렉션의 크기를 바꾸는 등, 진행 중인 순회를 어긋나게 할 수 있는 수정. 원소의 값만 바꾸는 것은 해당하지 않는다. <code>modCount</code>가 그 횟수를 센다.</dd>
+<dt>자연 순서(natural ordering)</dt><dd>클래스가 <code>Comparable</code>의 <code>compareTo</code>로 스스로 정한 순서. 비교자를 주지 않은 정렬과 정렬 컬렉션이 이 순서를 쓴다.</dd>
+<dt>비교자(Comparator)</dt><dd>두 원소를 받아 순서를 정해 주는 원소 바깥의 객체. <code>compare(a, b)</code>가 음수면 a가 앞, 0이면 동순위, 양수면 a가 뒤다.</dd>
+<dt>안정 정렬(stable sort)</dt><dd>비교 결과가 0인 원소들의 상대 순서를 정렬 전 그대로 유지하는 정렬. 자바의 객체 정렬은 이를 API 수준에서 보장한다.</dd>
+<dt>TimSort</dt><dd>입력에 이미 있는 정렬된 구간(런)을 찾아 병합하는 안정적이고 적응적인 병합 정렬. OpenJDK에서 객체 배열과 리스트의 정렬에 쓰인다.</dd>
+<dt>뷰(view)</dt><dd>자기 저장소 없이 다른 배열이나 컬렉션의 내용을 보여 주는 객체. 원본의 변화가 그대로 보인다. <code>Arrays.asList</code>, <code>Collections.unmodifiableList</code>, 맵의 <code>keySet()</code>이 돌려주는 것이 그렇다.</dd>
+<dt>수정할 수 없는 컬렉션(unmodifiable collection)</dt><dd>내용을 바꾸는 메서드를 부르면 <code>UnsupportedOperationException</code>을 던지는 컬렉션. 원소 객체 자체가 가변이면 그 객체의 상태까지 막아 주지는 않는다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-14.html#jls-14.14.2">JLS §14.14.2 The enhanced for statement</a> — 향상된 for문이 배열과 Iterable에 대해 각각 어떤 기본 for문으로 번역되는지의 정의</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/ArrayList.html">Java SE 21 API — ArrayList</a> — fail-fast 반복자와 구조적 수정의 정의, 검출이 최선을 다한 것일 뿐이라는 설명</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Comparable.html">Java SE 21 API — Comparable</a> — 자연 순서, compareTo의 규약 세 가지, equals와의 일관성과 BigDecimal 예</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Arrays.html">Java SE 21 API — Arrays</a> — 객체 정렬의 안정성 보장과 TimSort 구현 노트, 기본형 정렬의 이중 피벗 퀵 정렬, asList</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/List.html">Java SE 21 API — List</a> — 수정할 수 없는 리스트의 성질, copyOf, sort의 안정성과 규약 위반 시의 선택적 예외</li>
+</x-refs>

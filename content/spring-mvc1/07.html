@@ -1,0 +1,878 @@
+<x-meta>
+deck: 컨트롤러의 반환값이 정적 파일·뷰·메시지 바디 중 어느 길로 나가는지, 메시지 컨버터와 요청 매핑 핸들러 어댑터 내부의 목록과 선택 규칙을 실험으로 추적한다.
+minutes: 100
+</x-meta>
+
+<x-goals>
+<li>정적 리소스, 뷰 템플릿, 메시지 바디 세 가지 응답 방식에서 각각 어떤 핸들러와 부품이 본문을 만드는지 구분하고, 컨트롤러 메서드의 반환 타입과 애노테이션만 보고 어느 길로 갈지 예측할 수 있다.</li>
+<li><code>HttpMessageConverter</code>의 <code>canRead</code>·<code>canWrite</code>가 보는 두 조건(자바 타입, 미디어 타입)을 말하고, <code>Accept</code>·<code>Content-Type</code> 헤더와 컨버터 목록의 순서가 주어졌을 때 어느 컨버터가 선택되는지 추적할 수 있다.</li>
+<li>400, 406, 415 응답이 요청 처리의 어느 단계에서 어떤 조건으로 나오는지 구분해 원인을 진단할 수 있다.</li>
+<li><code>RequestMappingHandlerAdapter</code> 안에서 인자 리졸버, 컨트롤러 메서드, 반환값 핸들러, 메시지 컨버터가 호출되는 순서를 호출 스택으로 그릴 수 있다.</li>
+<li>커스텀 인자 리졸버나 메시지 컨버터를 추가했을 때 기본 목록의 어느 위치에 들어가는지, 그 위치 때문에 무엇을 가로챌 수 있고 없는지 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 반환값은 어떻게 HTTP 응답이 되는가</h3>
+<p>앞 회차에서는 요청이 컨트롤러 메서드에 도달하는 쪽, 곧 URL 매핑과 요청 데이터를 파라미터로 받는 방법을 다뤘다. 이번에는 반대쪽이다. 컨트롤러 메서드가 <code>return</code>한 뒤에 무슨 일이 일어나는가. HTTP 응답은 상태 줄, 헤더, 그리고 바이트로 된 본문이다. 서블릿을 직접 쓸 때는 <code>response.setStatus()</code>, <code>response.setContentType()</code>, <code>response.getWriter().write()</code>를 차례로 불러 이 셋을 손으로 채웠다. 스프링 MVC의 컨트롤러는 그렇게 하지 않고 문자열이나 객체를 돌려줄 뿐이다. 그 값을 누가, 어떤 규칙으로 상태 코드와 헤더와 바이트로 바꾸는지가 이 회차의 주제다.</p>
+<p>스프링 MVC에서 응답 본문이 만들어지는 길은 크게 셋이다. 셋은 본문의 출처가 다르고, 요청을 맡는 핸들러가 다르고, 마지막에 바이트를 쓰는 부품이 다르다.</p>
+<div class="table-wrap"><table><thead><tr><th>응답 방식</th><th>본문의 출처</th><th>요청을 맡는 핸들러</th><th>바이트를 쓰는 부품</th></tr></thead><tbody>
+<tr><td>정적 리소스</td><td>클래스패스나 디스크에 있는 파일 그대로</td><td><code>ResourceHttpRequestHandler</code></td><td><code>ResourceHttpMessageConverter</code></td></tr>
+<tr><td>뷰 템플릿</td><td>템플릿 파일에 모델을 채워 서버가 만든 HTML</td><td><code>@RequestMapping</code> 메서드(뷰 이름 반환)</td><td><code>ViewResolver</code>가 찾아 준 <code>View</code></td></tr>
+<tr><td>HTTP API(메시지 바디)</td><td>컨트롤러가 반환한 값 자체</td><td><code>@RequestMapping</code> 메서드(<code>@ResponseBody</code>, <code>ResponseEntity</code>)</td><td><code>HttpMessageConverter</code></td></tr>
+</tbody></table></div>
+<p>이 표를 외우는 것이 목표가 아니다. 다음 질문에 소스와 실행 결과로 답할 수 있게 되는 것이 목표다.</p>
+<ul>
+<li>반환 타입이 똑같이 <code>String</code>인데 어떤 때는 뷰 이름이 되고 어떤 때는 본문이 된다. 그 갈림은 어디서 정해지는가.</li>
+<li>객체를 반환하면 JSON이 된다. 그것은 누가 정하는가. 다른 형식으로 내보낼 수도 있는가.</li>
+<li>한글이 <code>?</code>로 바뀌어 나가거나, 406·415 응답이 돌아올 때 어느 단계를 의심해야 하는가.</li>
+<li>컨트롤러 메서드의 파라미터와 반환 타입이 그렇게 다양할 수 있는 구조는 무엇인가. 새로운 종류를 지원하려면 무엇을 어디에 끼우는가.</li>
+</ul>
+<aside class="note">이 회차의 실험은 로컬에 있는 Spring Framework 7.0.10, Jackson 3.1.7, <code>spring-test</code>의 Mock 서블릿 객체로 실행했다. 톰캣을 띄우지 않고 <code>DispatcherServlet</code> 객체의 <code>service()</code>를 직접 호출한 것이다. 이 강좌의 기준은 Spring Framework 6.x이므로 규칙은 6.2.x 소스와 레퍼런스 문서로 다시 확인했고, 두 버전이 다른 곳은 따로 적었다. 가장 눈에 띄는 차이는 JSON 컨버터의 이름이다. 6.x에서는 Jackson 2를 쓰는 <code>MappingJackson2HttpMessageConverter</code>이고, 7.0.10의 실험 출력에는 Jackson 3을 쓰는 <code>JacksonJsonHttpMessageConverter</code>로 나온다. 실행 결과에서 로그 줄은 뺐다.</aside>
+<h4>실험용 컨트롤러</h4>
+<p>도메인은 택배 접수 창구로 잡았다. 메서드마다 반환 방식이 다르다. 아래 코드와 그 실행 결과를 회차 내내 다시 본다.</p>
+<pre><code class="language-java">// import 생략: org.springframework.web.bind.annotation.*, org.springframework.http.*, jakarta.servlet.http.* 등
+public class BodyLab {
+
+    record Parcel(String code, int weight) {}
+
+    @Controller
+    static class ParcelController {
+
+        @GetMapping("/page")                       // (1) 뷰 이름을 반환
+        String page(Model model) { model.addAttribute("count", 2); return "parcel-list"; }
+
+        @GetMapping("/direct")                     // (2) 서블릿 응답 객체에 직접 쓴다
+        void direct(HttpServletResponse response) throws IOException { response.getWriter().write("direct ok"); }
+
+        @GetMapping("/text") @ResponseBody         // (3) 문자열을 본문으로
+        String text() { return "접수 ok"; }
+
+        @GetMapping(value = "/text-utf8", produces = "text/plain;charset=UTF-8") @ResponseBody
+        String textUtf8() { return "접수 ok"; }
+
+        @GetMapping("/parcel") @ResponseBody       // (4) 객체를 본문으로
+        Parcel parcel() { return new Parcel("P-100", 3); }
+
+        @PostMapping("/parcels")                   // (5) 상태 코드·헤더·본문을 한 값으로
+        ResponseEntity<Parcel> create(@RequestBody Parcel parcel) {
+            return ResponseEntity.status(HttpStatus.CREATED)
+                    .header("Location", "/parcels/" + parcel.code())
+                    .body(parcel);
+        }
+
+        @PostMapping("/raw") @ResponseBody         // (6) 본문을 문자열 그대로 받는다
+        String raw(@RequestBody String body) { return "chars=" + body.length(); }
+    }
+    // ... 설정 클래스와 요청을 보내는 도우미는 필요한 곳에서 보인다
+}</code></pre>
+<p>관찰 장치는 두 가지를 달았다. 하나는 인터셉터로, <code>preHandle</code>에서 선택된 핸들러의 종류를 찍고 <code>postHandle</code>에서 어댑터가 돌려준 <code>ModelAndView</code>가 무엇인지 찍는다. 다른 하나는 <code>@ControllerAdvice</code>로 등록한 <code>ResponseBodyAdvice</code>·<code>RequestBodyAdvice</code>다. 이 두 인터페이스의 콜백은 어떤 메시지 컨버터가 선택되었는지를 인자로 받으므로, 출력의 <code>[write]</code>, <code>[read ]</code> 줄에서 컨버터 이름과 미디어 타입을 볼 수 있다.</p>
+<x-visual id="spring-mvc1-07-three-response-paths" title="요청 하나가 DispatcherServlet에서 정적 리소스, 뷰 템플릿, 메시지 바디 세 갈래로 나뉘어 응답 본문이 만들어지는 경로" kind="구조 다이어그램" ratio="16:9">
+<x-hint>응답 본문을 만드는 길이 세 가지이고, 각 길에서 마지막에 바이트를 쓰는 부품이 다르다는 것을 한눈에 보여 준다.</x-hint>
+<x-prompt>깔끔한 구조 다이어그램, 흰 배경, 평면 색. 왼쪽 끝에 세로로 긴 남색 상자 "DispatcherServlet". 그 오른쪽으로 세 개의 가로 줄이 평행하게 뻗는다. 첫째 줄(회색 계열): 상자 "ResourceHttpRequestHandler" → 문서 아이콘과 라벨 "파일 그대로" → 오른쪽 끝의 넓은 상자 "HTTP 응답 본문"으로 화살표. 둘째 줄(파란 계열): 상자 "컨트롤러 메서드" → 화살표 라벨 "뷰 이름" → 상자 "ViewResolver · View" → 화살표 라벨 "렌더링한 HTML" → "HTTP 응답 본문". 셋째 줄(주황 계열, 가장 굵게): 상자 "컨트롤러 메서드" → 화살표 라벨 "객체 반환" → 상자 "HttpMessageConverter" → 화살표 라벨 "JSON · 텍스트 바이트" → "HTTP 응답 본문". 각 줄 맨 왼쪽 위에 작은 라벨을 붙인다: "정적 리소스", "뷰 템플릿", "HTTP API". 장식 없이 단순한 선.</x-prompt>
+<x-caption>세 길은 DispatcherServlet에서 갈라진다. 정적 리소스는 핸들러 자체가 다르고, 뷰와 메시지 바디는 같은 컨트롤러 메서드에서 반환값을 다루는 방식이 다르다.</x-caption>
+</x-visual>
+
+<h3>정적 리소스: 파일을 그대로 내려 주는 핸들러</h3>
+<p>정적 리소스(static resource)는 서버가 내용을 가공하지 않고 파일의 바이트를 그대로 내려 주는 응답이다. HTML, CSS, 자바스크립트, 이미지가 여기에 속한다. 스프링 부트는 클래스패스의 네 위치를 기본 정적 리소스 위치로 삼는다. 부트 3.5의 <code>WebProperties</code>에 적힌 순서대로 <code>classpath:/META-INF/resources/</code>, <code>classpath:/resources/</code>, <code>classpath:/static/</code>, <code>classpath:/public/</code>이다. URL 패턴의 기본값은 <code>/**</code>이고 <code>spring.mvc.static-path-pattern</code>으로 바꿀 수 있으며, 위치는 <code>spring.web.resources.static-locations</code>로 바꾼다. 그래서 <code>src/main/resources/static/guide/price.html</code> 파일은 <code>GET /guide/price.html</code>로 열린다. 빌드 도구가 <code>src/main/resources</code> 아래를 클래스패스 루트로 복사하기 때문에 경로가 그렇게 이어진다.</p>
+<p>이 일을 하는 객체는 <code>ResourceHttpRequestHandler</code>다. 이름에 드러나듯 05회에서 본 <code>HttpRequestHandler</code>의 구현체이고, 따라서 <code>HttpRequestHandlerAdapter</code>가 실행한다. 컨트롤러가 아니므로 <code>RequestMappingHandlerAdapter</code>도, 뷰 리졸버도 관여하지 않는다. 정적 리소스 요청과 컨트롤러 요청은 <code>DispatcherServlet</code>의 첫 단계인 핸들러 조회에서 이미 다른 핸들러로 갈린다.</p>
+<p><code>/**</code>는 모든 경로에 걸리는 패턴이다. 그런데도 컨트롤러가 가려지지 않는 것은 핸들러 매핑의 순서 때문이다. 정적 리소스용 매핑을 만드는 <code>ResourceHandlerRegistry</code>의 기본 순서 값은 <code>Ordered.LOWEST_PRECEDENCE - 1</code>로, 거의 맨 끝이다. 순서 값 0인 <code>RequestMappingHandlerMapping</code>이 먼저 질문을 받으므로 같은 경로에 컨트롤러 메서드가 있으면 컨트롤러가 이긴다. 정적 리소스 핸들러는 다른 누구도 맡지 않은 요청을 마지막에 받는 자리에 있다.</p>
+<h4>실험: 정적 파일 하나를 두 번 요청한다</h4>
+<p>부트 없이 같은 구조를 만들려면 <code>WebMvcConfigurer.addResourceHandlers</code>로 URL 패턴과 위치를 직접 등록한다. 부트의 자동 구성이 하는 일도 결국 이 등록이다. 실험에서는 클래스패스의 <code>static-lab</code> 디렉터리에 64바이트짜리 <code>guide.html</code>을 두고 <code>/files/**</code>에 연결했다.</p>
+<pre><code class="language-java">@Configuration
+@EnableWebMvc
+static class LabConfig implements WebMvcConfigurer {
+    @Override
+    public void addResourceHandlers(ResourceHandlerRegistry registry) {
+        registry.addResourceHandler("/files/**").addResourceLocations("classpath:/static-lab/");
+    }
+    // ... 인터셉터, 컨트롤러 빈 등록 등
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">GET /files/guide.html
+    [handler] ResourceHttpRequestHandler
+    [postHandle] mv=null, committed=false
+    status=200
+    Last-Modified: Mon, 16 Nov 2026 01:02:56 GMT
+    Content-Type: text/html
+    Accept-Ranges: bytes
+    Content-Length: 64
+    body(64 bytes): <!doctype html>
+<html><body><h1>parcel guide</h1></body></html>
+GET /files/guide.html  If-Modified-Since: Mon, 16 Nov 2026 01:02:56 GMT
+    [handler] ResourceHttpRequestHandler
+    [postHandle] mv=null, committed=false
+    status=304
+    Last-Modified: Mon, 16 Nov 2026 01:02:56 GMT
+GET /files/none.html
+    [handler] ResourceHttpRequestHandler
+    status=404 (No static resource none.html.)
+GET /files/../BodyLab.class
+    [handler] ResourceHttpRequestHandler
+    status=404 (No static resource ../BodyLab.class.)</code></pre>
+<p>첫 요청에서 읽을 것이 네 가지 있다. 핸들러는 컨트롤러 메서드가 아니라 <code>ResourceHttpRequestHandler</code> 객체다. <code>Content-Type</code>은 파일 확장자 <code>.html</code>에서 정해졌고, <code>Content-Length</code>는 파일 크기 그대로다. <code>Last-Modified</code>는 파일의 수정 시각이므로 실행 환경마다 다르다. 그리고 어댑터가 돌려준 <code>ModelAndView</code>가 <code>null</code>이다. 핸들러가 응답을 스스로 다 썼으니 그릴 뷰가 없다는 뜻이다.</p>
+<p>두 번째 요청은 첫 응답의 <code>Last-Modified</code> 값을 <code>If-Modified-Since</code> 헤더에 넣어 보냈다. 결과는 본문이 없는 304다. 「HTTP 웹 기본 지식」 권에서 본 조건부 요청(conditional request)이 프레임워크 안에서 구현된 자리가 여기다. 세 번째 요청은 없는 파일이어서 404가 되었다. Spring Framework 6.1부터는 핸들러가 <code>NoResourceFoundException</code>을 던지고 기본 예외 리졸버가 그것을 404로 바꾼다. 네 번째 요청은 <code>../</code>로 등록한 위치 밖의 파일을 노린 것인데, 핸들러가 경로를 검사해 거부했다. 정적 리소스 위치는 URL로 접근할 수 있는 파일의 경계이고, 그 경계를 지키는 검사가 핸들러 안에 들어 있다.</p>
+<p>7.0.10 소스의 <code>ResourceHttpRequestHandler.handleRequest</code>를 순서대로 옮기면 다음과 같다. 마지막 단계에서 파일을 쓰는 것이 메시지 컨버터라는 점을 눈여겨보자. 메시지 컨버터는 컨트롤러 전용 부품이 아니라 "자바 객체를 HTTP 본문으로 쓰는 일"이 필요한 곳 어디서나 쓰이는 부품이다.</p>
+<figure class="flow-figure"><figcaption>ResourceHttpRequestHandler가 요청 하나를 처리하는 순서</figcaption><ol class="flow">
+<li><strong>리소스 찾기</strong><span>요청 경로를 등록된 위치에 대입해 Resource 객체를 찾는다. 없거나 경로가 위치 밖을 가리키면 NoResourceFoundException을 던진다.</span></li>
+<li><strong>요청 검사</strong><span>허용하는 HTTP 메서드인지 확인하고, 설정된 캐시 헤더가 있으면 응답에 넣는다.</span></li>
+<li><strong>조건부 요청 검사</strong><span>리소스의 수정 시각(설정했다면 ETag)을 요청의 조건 헤더와 비교한다. 바뀌지 않았으면 304로 끝낸다.</span></li>
+<li><strong>헤더 쓰기</strong><span>리소스에서 미디어 타입을 정하고 Content-Type 등 헤더를 채운다.</span></li>
+<li><strong>본문 쓰기</strong><span>Range 헤더가 없으면 ResourceHttpMessageConverter로 전체를, 있으면 206과 함께 ResourceRegionHttpMessageConverter로 요청한 구간만 쓴다.</span></li>
+</ol></figure>
+<p>정적 리소스에서 자주 하는 착각이 둘 있다. 첫째, 정적 파일은 템플릿 엔진을 거치지 않는다. <code>static/</code> 아래 HTML에 템플릿 문법을 적어도 서버는 해석하지 않고 그대로 내려보낸다. 둘째, 템플릿 디렉터리(<code>templates/</code>)는 정적 리소스 위치가 아니다. 그 안의 파일은 URL로 직접 열리지 않고, 컨트롤러가 뷰 이름을 반환해야만 쓰인다. 부트는 여기에 웰컴 페이지 규칙을 하나 더 얹는다. 레퍼런스에 따르면 정적 위치에서 <code>index.html</code>을 먼저 찾고, 없으면 <code>index</code> 템플릿을 찾아 루트 경로의 화면으로 쓴다.</p>
+
+<h3>뷰 템플릿: 문자열 반환이 뷰 이름이 되는 경로</h3>
+<p>뷰 템플릿 방식은 서버가 요청마다 HTML을 만들어 내려 주는 응답이다. 컨트롤러는 화면에 쓸 데이터를 모델에 담고 뷰의 논리 이름을 반환한다. 05회에서 본 대로 어댑터는 이 결과를 <code>ModelAndView</code>로 맞춰 <code>DispatcherServlet</code>에 돌려주고, <code>DispatcherServlet</code>은 뷰 리졸버로 <code>View</code>를 얻어 <code>render</code>를 호출한다. 실험의 <code>/page</code>가 이 경로다.</p>
+<pre data-label="실행 결과"><code class="language-text">GET /page
+    [handler] HandlerMethod page()
+    [postHandle] mv=view 'parcel-list', committed=false
+    status=200
+    Content-Language: en
+    Content-Type: text/html;charset=UTF-8
+    body(30 bytes): <h1>parcel-list {count=2}</h1></code></pre>
+<p><code>postHandle</code> 시점에 <code>ModelAndView</code>가 있고 뷰 이름이 <code>parcel-list</code>다. 본문은 아직 한 바이트도 쓰이지 않았다. 본문은 그 뒤 <code>DispatcherServlet</code>이 <code>View.render</code>를 호출할 때 만들어진다. <code>Content-Language</code>는 <code>DispatcherServlet</code>이 뷰를 그리기 직전에 응답의 로케일을 설정해서 붙은 헤더이고, 값은 요청의 로케일에 따라 달라진다. 실험의 뷰 리졸버는 템플릿 엔진을 흉내 낸 람다 한 개다.</p>
+<pre><code class="language-java">@Override
+public void configureViewResolvers(ViewResolverRegistry registry) {
+    // 템플릿 엔진 흉내: 뷰 이름과 모델을 받아 HTML 문자열을 응답에 쓴다
+    registry.viewResolver((viewName, locale) -> (View) (model, request, response) -> {
+        response.setContentType("text/html;charset=UTF-8");
+        response.getWriter().write("<h1>" + viewName + " " + model + "</h1>");
+    });
+}</code></pre>
+<p>이 가짜 엔진과 실제 템플릿 엔진은 구조상 같은 자리에 있다. <code>ViewResolver</code>가 이름을 받아 <code>View</code>를 만들고, <code>View</code>가 모델을 받아 응답 스트림에 HTML을 쓴다. 스프링 부트에 타임리프 스타터를 넣으면 자동 구성이 타임리프용 뷰 리졸버를 등록한다. 부트 3.5의 <code>ThymeleafProperties</code>에서 <code>spring.thymeleaf.prefix</code>의 기본값은 <code>classpath:/templates/</code>, <code>spring.thymeleaf.suffix</code>의 기본값은 <code>.html</code>이다. 뷰 이름 <code>parcel-list</code>는 앞뒤에 이 둘이 붙어 <code>classpath:/templates/parcel-list.html</code>이 된다. 소스 트리에서는 <code>src/main/resources/templates/parcel-list.html</code>이다. 템플릿 문법과 화면 구성은 다음 회차에서 다룬다.</p>
+<h4>문자열이 뷰 이름으로 해석되는 지점</h4>
+<p>반환된 <code>String</code>을 뷰 이름으로 받아들이는 것은 <code>ViewNameMethodReturnValueHandler</code>라는 작은 클래스다. 이 클래스의 <code>supportsReturnType</code>은 반환 타입이 <code>void</code>이거나 <code>CharSequence</code>의 하위 타입이면 <code>true</code>를 돌려주고, <code>handleReturnValue</code>는 요청마다 만들어지는 <code>ModelAndViewContainer</code>에 <code>setViewName</code>으로 그 문자열을 적어 둔다. 하는 일은 그것뿐이다. 응답에는 손대지 않는다. 메서드 호출이 끝난 뒤 어댑터가 컨테이너에서 뷰 이름과 모델을 꺼내 <code>ModelAndView</code>를 만든다. 이 클래스가 목록의 어디에 있고 왜 <code>@ResponseBody</code>가 붙으면 선택되지 않는지는 뒤에서 어댑터 구조를 볼 때 확인한다.</p>
+<h4>void를 반환하면</h4>
+<p>반환 타입이 <code>void</code>인 메서드는 두 가지로 해석될 수 있다. 레퍼런스의 규칙은 이렇다. 메서드가 <code>ServletResponse</code>나 <code>OutputStream</code> 파라미터를 받거나 <code>@ResponseStatus</code>가 붙어 있으면 응답을 스스로 다 처리한 것으로 본다. 그런 것이 없으면 REST 컨트롤러에서는 "본문 없음", HTML 컨트롤러에서는 "기본 뷰 이름을 쓰겠다"는 뜻이 된다. 실험의 <code>/direct</code>는 <code>HttpServletResponse</code>를 받으므로 앞의 경우다. 비교를 위해 응답 객체를 받지 않는 <code>void</code> 메서드를 <code>/parcels/board</code>에 하나 더 만들어 함께 호출했다.</p>
+<pre data-label="실행 결과"><code class="language-text">GET /direct
+    [handler] HandlerMethod direct()
+    [postHandle] mv=null, committed=false
+    status=200
+    body(9 bytes): direct ok
+GET /parcels/board
+    [handler] HandlerMethod board()
+    [postHandle] mv=view 'parcels/board', committed=false
+    status=200
+    Content-Language: en
+    Content-Type: text/html;charset=UTF-8
+    body(32 bytes): <h1>parcels/board {count=9}</h1></code></pre>
+<p><code>/direct</code>는 <code>ModelAndView</code>가 <code>null</code>이고 본문은 메서드가 직접 쓴 9바이트다. <code>Content-Type</code> 헤더가 아예 없다는 점도 보인다. 직접 쓰는 방식에서는 헤더도 직접 챙겨야 한다. <code>/parcels/board</code>는 뷰 이름을 반환하지 않았는데도 <code>parcels/board</code>라는 뷰가 그려졌다. 05회의 <code>doDispatch</code> 뼈대에 있던 <code>applyDefaultViewName</code>이 요청 경로에서 기본 뷰 이름을 만들어 넣은 것이다. URL과 템플릿 경로가 암묵적으로 묶이므로, 이 규칙에 기대기보다 뷰 이름을 명시해 반환하는 쪽이 코드를 읽는 사람에게 분명하다.</p>
+<div class="table-wrap"><table><thead><tr><th>반환 형태</th><th>누가 받아 처리하는가</th><th>결과</th></tr></thead><tbody>
+<tr><td><code>ModelAndView</code></td><td><code>ModelAndViewMethodReturnValueHandler</code></td><td>뷰 이름과 모델을 그대로 써서 뷰 렌더링</td></tr>
+<tr><td><code>String</code> (애노테이션 없음)</td><td><code>ViewNameMethodReturnValueHandler</code></td><td>문자열을 뷰 이름으로 써서 뷰 렌더링</td></tr>
+<tr><td><code>void</code> + 응답 객체 파라미터</td><td>(반환값 처리 전에 "처리 완료"로 판정)</td><td>메서드가 쓴 내용이 곧 응답</td></tr>
+<tr><td><code>void</code> (그 밖)</td><td><code>ViewNameMethodReturnValueHandler</code></td><td>요청 경로에서 만든 기본 뷰 이름으로 렌더링</td></tr>
+<tr><td><code>@ResponseBody</code> + 임의의 값</td><td><code>RequestResponseBodyMethodProcessor</code></td><td>메시지 컨버터가 값을 본문으로 쓴다</td></tr>
+<tr><td><code>ResponseEntity</code>, <code>HttpEntity</code></td><td><code>HttpEntityMethodProcessor</code></td><td>상태·헤더를 옮기고 메시지 컨버터가 본문을 쓴다</td></tr>
+</tbody></table></div>
+
+<h3>HTTP API 응답: 메시지 바디에 직접 쓰는 세 가지 방법</h3>
+<p>HTML 화면이 아니라 데이터를 주고받는 HTTP API에서는 뷰가 필요 없다. 반환한 값이 곧 본문이어야 한다. 스프링 MVC에서 본문을 직접 정하는 방법은 세 가지이고, 뒤로 갈수록 서블릿 API에서 멀어진다.</p>
+<ol>
+<li><b><code>HttpServletResponse</code>에 직접 쓴다.</b> 실험의 <code>/direct</code>다. 서블릿을 직접 쓸 때와 같다. 상태 코드, <code>Content-Type</code>, 문자 인코딩, 직렬화를 모두 손으로 한다.</li>
+<li><b><code>ResponseEntity</code>를 반환한다.</b> 상태 코드, 헤더, 본문 객체를 한 값에 담아 돌려준다. 실험의 <code>POST /parcels</code>다. 본문 객체는 메시지 컨버터가 바이트로 바꾼다.</li>
+<li><b><code>@ResponseBody</code>를 붙이고 값을 반환한다.</b> 실험의 <code>/text</code>, <code>/parcel</code>이다. 상태 코드는 기본 200이고, 바꾸려면 <code>@ResponseStatus</code>를 함께 쓴다.</li>
+</ol>
+<pre data-label="실행 결과"><code class="language-text">GET /parcel
+    [handler] HandlerMethod parcel()
+    [write] JacksonJsonHttpMessageConverter as application/json
+    [postHandle] mv=null, committed=false
+    status=200
+    Content-Type: application/json
+    body(27 bytes): {"code":"P-100","weight":3}
+POST /parcels  Content-Type: application/json
+    [handler] HandlerMethod create()
+    [read ] JacksonJsonHttpMessageConverter -> Parcel
+    [write] JacksonJsonHttpMessageConverter as application/json
+    [postHandle] mv=null, committed=true
+    status=201
+    Location: /parcels/P-200
+    Content-Type: application/json
+    body(27 bytes): {"code":"P-200","weight":7}</code></pre>
+<p><code>/parcel</code>에서 컨트롤러는 <code>Parcel</code> 객체를 반환했을 뿐인데 응답에는 <code>Content-Type: application/json</code>과 27바이트의 JSON이 실렸다. <code>[write]</code> 줄이 그 일을 한 주체를 알려 준다. <code>POST /parcels</code>에서는 읽기와 쓰기 양쪽에 컨버터가 나온다. 요청 본문의 JSON을 <code>Parcel</code>로 바꾼 것도, <code>ResponseEntity</code>에 담긴 <code>Parcel</code>을 다시 JSON으로 바꾼 것도 같은 컨버터다. 상태 코드 201과 <code>Location</code> 헤더는 <code>ResponseEntity</code>에 담은 값이 그대로 응답으로 옮겨진 것이다. 두 경우 모두 <code>ModelAndView</code>는 <code>null</code>이다.</p>
+<h4>@ResponseBody, @RestController, @ResponseStatus가 하는 일</h4>
+<p><code>@ResponseBody</code>는 스스로 아무 일도 하지 않는 표식이다. 일을 하는 것은 이 표식을 찾는 쪽인 <code>RequestResponseBodyMethodProcessor</code>다. 이 클래스의 <code>supportsReturnType</code>은 두 곳을 본다. 메서드에 <code>@ResponseBody</code>가 붙어 있는가, 또는 메서드를 가진 클래스에 <code>@ResponseBody</code>가 붙어 있는가. 클래스 쪽 검사는 메타 애노테이션까지 따라간다. <code>@RestController</code>의 소스를 열면 선언 위에 <code>@Controller</code>와 <code>@ResponseBody</code>가 나란히 붙어 있다. 그래서 <code>@RestController</code> 클래스의 모든 메서드는 <code>@ResponseBody</code>를 붙인 것과 같아진다. 새로운 기능이 아니라 두 애노테이션을 묶은 이름이다.</p>
+<p><code>@ResponseStatus</code>는 메서드 호출 직후, 반환값을 처리하기 전에 반영된다. <code>ServletInvocableHandlerMethod.invokeAndHandle</code>은 컨트롤러 메서드를 부른 다음 곧바로 <code>setResponseStatus</code>를 호출하는데, 이 메서드는 <code>reason</code> 속성이 비어 있으면 <code>response.setStatus(코드)</code>를, 값이 있으면 <code>response.sendError(코드, reason)</code>을 부른다. <code>sendError</code>는 서블릿 컨테이너의 오류 처리로 넘어가는 호출이므로, <code>reason</code>을 적으면 메서드의 반환값은 버려진다. <code>@RestController</code> 클래스에 두 메서드를 만들어 확인했다. 하나는 <code>@ResponseStatus(HttpStatus.ACCEPTED)</code>를 붙이고 <code>"queued"</code>를 반환하고, 다른 하나는 <code>@ResponseStatus(code = HttpStatus.GONE, reason = "desk closed")</code>를 붙이고 <code>"ignored"</code>를 반환한다.</p>
+<pre data-label="실행 결과"><code class="language-text">POST /desk/pickup
+    [handler] HandlerMethod pickup()
+    [write] StringHttpMessageConverter as text/plain
+    [postHandle] mv=null, committed=false
+    status=202
+    Content-Type: text/plain;charset=ISO-8859-1
+    Content-Length: 6
+    body(6 bytes): queued
+GET /desk/old
+    [handler] HandlerMethod old()
+    [postHandle] mv=null, committed=true
+    status=410 (desk closed)</code></pre>
+<p>둘째 요청에는 <code>[write]</code> 줄이 없고 본문도 없다. 스프링은 이 경우 기동 시점에 "Return value of […] will be ignored since @ResponseStatus 'reason' attribute is set"이라는 경고를 남긴다. <code>@ResponseStatus</code>와 <code>ResponseEntity</code>의 차이도 여기서 정리된다. 애노테이션의 값은 컴파일 시점에 고정되므로 메서드 안의 조건에 따라 상태 코드를 바꿀 수 없다. 처리 결과에 따라 201과 200을 나눠 보내야 한다면 상태 코드를 값으로 다루는 <code>ResponseEntity</code>가 맞는 도구다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>컨트롤러 메서드는 응답을 쓰지 않는다. 값을 돌려줄 뿐이다. 그 값을 "뷰 이름"으로 읽을지 "본문"으로 읽을지는 반환값 핸들러 목록에서 누가 먼저 손을 드느냐로 정해지고, 본문으로 읽기로 했다면 그것을 어떤 바이트로 바꿀지는 메시지 컨버터 목록에서 누가 먼저 손을 드느냐로 정해진다. 이 회차에 나오는 동작은 대부분 이 두 목록의 순서에서 설명된다.</p></aside>
+
+<h3>HttpMessageConverter: 객체와 바이트 사이의 계약</h3>
+<p>HTTP 본문은 바이트의 나열이고, 그 바이트를 어떻게 읽어야 하는지는 <code>Content-Type</code> 헤더의 미디어 타입(media type)이 알려 준다. 자바 쪽에는 <code>String</code>, <code>byte[]</code>, 사용자 정의 객체가 있다. 이 둘 사이를 오가는 변환을 한 가지 계약으로 묶은 것이 <code>HttpMessageConverter</code> 인터페이스다. Javadoc의 설명은 "HTTP 요청과 응답으로부터, 그리고 그쪽으로 변환하는 전략 인터페이스"이고, 6.2.x 기준 메서드는 여섯 개다.</p>
+<pre><code class="language-java">public interface HttpMessageConverter<T> {
+
+    boolean canRead(Class<?> clazz, @Nullable MediaType mediaType);   // 이 타입을, 이 미디어 타입의 본문에서 읽을 수 있는가
+    boolean canWrite(Class<?> clazz, @Nullable MediaType mediaType);  // 이 타입을, 이 미디어 타입의 본문으로 쓸 수 있는가
+
+    List<MediaType> getSupportedMediaTypes();                         // 지원하는 미디어 타입 목록
+    default List<MediaType> getSupportedMediaTypes(Class<?> clazz) { /* ... */ }   // 5.3.4부터
+
+    T read(Class<? extends T> clazz, HttpInputMessage inputMessage)
+            throws IOException, HttpMessageNotReadableException;
+    void write(T t, @Nullable MediaType contentType, HttpOutputMessage outputMessage)
+            throws IOException, HttpMessageNotWritableException;
+}</code></pre>
+<p>질문 메서드 <code>canRead</code>·<code>canWrite</code>는 인자가 둘이다. 자바 타입과 미디어 타입이다. 컨버터 선택은 언제나 이 두 조건을 함께 본다. "이 컨버터는 JSON 담당"이라는 식으로 한 가지 조건만 기억하면 뒤에서 볼 선택 결과를 설명할 수 없다. 실행 메서드 <code>read</code>·<code>write</code>가 받는 <code>HttpInputMessage</code>와 <code>HttpOutputMessage</code>는 헤더와 스트림을 묶은 작은 인터페이스다. 각각 <code>getHeaders()</code>와 <code>getBody()</code>를 가지며, <code>getBody()</code>는 <code>InputStream</code> 또는 <code>OutputStream</code>을 돌려준다. 컨버터는 서블릿 API를 모른다. 헤더와 바이트 스트림만 안다. 그래서 같은 컨버터가 서버뿐 아니라 HTTP 클라이언트(<code>RestClient</code>, <code>RestTemplate</code>)에서도 쓰인다.</p>
+<h4>기본으로 등록되는 컨버터</h4>
+<p><code>@EnableWebMvc</code>나 부트의 자동 구성이 쓰는 <code>WebMvcConfigurationSupport</code>는 기본 컨버터 목록을 만들어 <code>RequestMappingHandlerAdapter</code>에 넣는다. 6.2.x 소스의 <code>addDefaultHttpMessageConverters</code>는 다섯 개를 무조건 넣고, 그 뒤는 클래스패스에 해당 라이브러리가 있을 때만 넣는다. Atom·RSS 피드(ROME), XML, 코틀린 직렬화, JSON, 그 밖의 Jackson 데이터 형식 순이다. JSON 라이브러리가 Jackson뿐인 환경에서 어댑터의 <code>getMessageConverters()</code>를 출력하면 여섯 개가 나온다.</p>
+<pre data-label="실행 결과(7.0.10, 컨버터 이름과 getSupportedMediaTypes())"><code class="language-text">messageConverters:
+  - ByteArrayHttpMessageConverter  [application/octet-stream, */*]
+  - StringHttpMessageConverter  [text/plain, */*]
+  - ResourceHttpMessageConverter  [*/*]
+  - ResourceRegionHttpMessageConverter  [*/*]
+  - AllEncompassingFormHttpMessageConverter  [application/x-www-form-urlencoded, multipart/form-data, multipart/mixed, multipart/related]
+  - JacksonJsonHttpMessageConverter  [application/json, application/*+json]</code></pre>
+<p>6.2.x에서는 마지막 줄이 <code>MappingJackson2HttpMessageConverter</code>이고 나머지 다섯 개의 종류와 순서는 같다. 각 컨버터가 자바 타입 쪽에서 무엇을 받는지를 함께 정리하면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>순서</th><th>컨버터</th><th>자바 타입 조건</th><th>미디어 타입 조건</th><th>쓸 때의 기본 Content-Type</th></tr></thead><tbody>
+<tr><td>1</td><td><code>ByteArrayHttpMessageConverter</code></td><td><code>byte[]</code></td><td>무엇이든(<code>*/*</code>)</td><td><code>application/octet-stream</code></td></tr>
+<tr><td>2</td><td><code>StringHttpMessageConverter</code></td><td><code>String</code></td><td>무엇이든(<code>*/*</code>)</td><td><code>text/plain</code></td></tr>
+<tr><td>3·4</td><td><code>ResourceHttpMessageConverter</code>, <code>ResourceRegionHttpMessageConverter</code></td><td><code>Resource</code>, 리소스의 일부 구간</td><td>무엇이든</td><td>리소스에서 추정</td></tr>
+<tr><td>5</td><td><code>AllEncompassingFormHttpMessageConverter</code></td><td><code>MultiValueMap</code></td><td>폼, 멀티파트</td><td>폼 계열</td></tr>
+<tr><td>6</td><td>JSON 컨버터(Jackson)</td><td>Jackson이 다룰 수 있는 타입(사실상 대부분의 객체)</td><td><code>application/json</code>, <code>application/*+json</code></td><td><code>application/json</code></td></tr>
+</tbody></table></div>
+<p>앞쪽 컨버터들은 자바 타입 조건이 좁고 미디어 타입 조건이 넓다. 맨 뒤의 JSON 컨버터는 반대로 자바 타입 조건이 넓고 미디어 타입 조건이 좁다. 이 배치가 우연이 아니라는 것을 선택 과정을 보면 알게 된다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>창구에 붙은 통역사 명단</strong><p>접수 창구에 통역사 명단이 순서대로 붙어 있다고 하자. 서류가 들어오면 창구 직원은 명단 위에서부터 "이 종류의 서류를 이 언어로 옮길 수 있습니까"라고 묻고, 처음 손든 사람에게 맡긴다. 서류의 종류가 자바 타입이고 언어가 미디어 타입이다. 비유가 맞지 않는 곳도 있다. 통역사는 내용을 이해하지만 컨버터는 형식만 바꾼다. 그리고 가장 잘하는 사람이 아니라 가장 먼저 손든 사람이 맡기 때문에, 명단의 순서가 결과를 바꾼다.</p></aside>
+
+<h3>한 층 아래: 문자가 바이트가 되는 순간과 본문의 길이</h3>
+<p>자바의 <code>String</code>은 문자의 나열이고 HTTP 본문은 바이트의 나열이다. 둘 사이에는 반드시 문자 인코딩(character encoding)이 끼어든다. 어떤 인코딩으로 바꿨는지는 <code>Content-Type</code>의 <code>charset</code> 매개변수로 상대에게 알린다. 이 결정을 내리는 것도 컨버터다. 실험의 <code>/text</code>와 <code>/text-utf8</code>은 똑같이 <code>"접수 ok"</code>를 반환하고, 뒤쪽에만 <code>produces = "text/plain;charset=UTF-8"</code>이 붙어 있다. 응답 바이트를 16진수로 함께 찍었다.</p>
+<pre data-label="실행 결과"><code class="language-text">GET /text
+    [handler] HandlerMethod text()
+    [write] StringHttpMessageConverter as text/plain
+    [postHandle] mv=null, committed=false
+    status=200
+    Content-Type: text/plain;charset=ISO-8859-1
+    Content-Length: 5
+    body(5 bytes): ?? ok
+    hex: 3f 3f 20 6f 6b
+GET /text-utf8
+    [handler] HandlerMethod textUtf8()
+    [write] StringHttpMessageConverter as text/plain;charset=UTF-8
+    [postHandle] mv=null, committed=false
+    status=200
+    Content-Type: text/plain;charset=UTF-8
+    Content-Length: 9
+    body(9 bytes): 접수 ok
+    hex: ec a0 91 ec 88 98 20 6f 6b</code></pre>
+<p>첫 응답의 본문은 5바이트이고 앞의 두 바이트가 <code>3f</code>, 곧 물음표다. <code>StringHttpMessageConverter</code>의 소스에는 <code>DEFAULT_CHARSET = StandardCharsets.ISO_8859_1</code>이라는 상수가 있다. 미디어 타입에 <code>charset</code>이 없으면 컨버터는 이 기본값으로 문자열을 인코딩하고, 헤더에도 그 이름을 적는다. ISO-8859-1에는 한글이 없으므로 "접"과 "수"는 인코딩 단계에서 대체 문자 <code>?</code>가 된다. 이 손실은 서버에서 바이트를 만드는 순간에 일어난 것이어서 브라우저의 인코딩 설정으로는 되돌릴 수 없다. 둘째 응답은 선택된 미디어 타입에 <code>charset=UTF-8</code>이 들어 있었기 때문에 "접"이 <code>ec a0 91</code> 세 바이트로, "수"가 <code>ec 88 98</code> 세 바이트로 바뀌었다.</p>
+<p>스프링 부트 애플리케이션에서 이 문제를 겪지 않는 까닭은 부트가 컨버터를 다르게 만들기 때문이다. 부트 3.5의 <code>HttpMessageConvertersAutoConfiguration</code>은 <code>server.servlet.encoding</code> 설정의 문자 집합으로 <code>StringHttpMessageConverter</code> 빈을 만들고, 그 설정의 기본값은 UTF-8이다. 부트 레퍼런스도 "기본적으로 문자열은 UTF-8로 인코딩된다"고 적는다. 부트 없이 스프링 MVC를 구성했거나 컨버터 목록을 직접 갈아 끼웠다면 실험과 같은 결과가 나올 수 있다. JSON은 사정이 다르다. <code>/parcel</code>의 응답은 <code>Content-Type: application/json</code>에 <code>charset</code>이 없었는데, Jackson 컨버터는 문자 집합이 지정되지 않으면 UTF-8로 쓴다.</p>
+<h4>Content-Length는 누가 정하는가</h4>
+<p>출력을 다시 보면 <code>/text</code>의 응답에는 <code>Content-Length</code>가 있고 <code>/parcel</code>의 응답에는 없다. 컨버터의 공통 상위 클래스 <code>AbstractHttpMessageConverter</code>는 본문을 쓰기 전에 <code>getContentLength</code>를 불러 값이 있으면 헤더에 넣는다. <code>StringHttpMessageConverter</code>는 문자열을 정해진 문자 집합으로 인코딩한 바이트 수를 돌려주고, <code>byte[]</code> 컨버터도 배열 길이를 안다. JSON 컨버터는 길이를 미리 계산하지 않는다. 객체를 스트림에 곧바로 직렬화하기 때문에 다 써 보기 전에는 길이를 모른다.</p>
+<p>길이가 정해지지 않은 응답을 어떻게 내보낼지는 서블릿 컨테이너의 몫이다. 톰캣 11.0.27의 소스에서 두 지점을 확인했다. 응답을 닫는 <code>OutputBuffer.close()</code>는 응답이 아직 커밋되지 않았고 길이가 설정되지 않았으면 버퍼에 쌓인 바이트 수를 <code>Content-Length</code>로 설정한다. 헤더를 내보내는 <code>Http11Processor.prepareResponse()</code>는 길이가 끝내 정해지지 않은 HTTP/1.1 응답에 <code>Transfer-Encoding: chunked</code>를 붙인다. 정리하면, 본문이 버퍼에 다 들어 있는 채로 응답이 끝나면 톰캣이 길이를 계산해 주고, 그 전에 누군가 <code>flush</code>를 해서 헤더가 먼저 나가 버렸다면 청크 전송이 된다.</p>
+<p>이 지점에서 스프링 버전이 갈린다. 컨버터는 쓰기를 마치면 <code>outputMessage.getBody().flush()</code>를 호출한다. 6.2.x의 <code>ServletServerHttpResponse.getBody()</code>는 서블릿의 출력 스트림을 그대로 돌려주므로 이 <code>flush</code>가 서블릿 응답까지 내려가 응답을 커밋시킨다. 길이를 계산하지 않는 JSON 컨버터가 쓴 응답이라면 그 시점에 길이가 정해져 있지 않으니 위 규칙에 따라 청크 전송이 된다. 7.0.10의 <code>getBody()</code>는 기본 설정에서 <code>flush</code>를 아래로 전달하지 않는 래퍼 스트림을 돌려준다. 실험 출력에서 <code>@ResponseBody</code> 응답의 <code>committed</code>가 <code>false</code>로 남은 까닭이다. 어느 쪽이든 클라이언트가 받는 본문 바이트는 같다. 달라지는 것은 본문의 끝을 알리는 방식이다.</p>
+
+<h3>쓰기: 응답을 맡을 컨버터는 어떻게 선택되는가</h3>
+<p>반환값을 본문으로 쓰기로 한 다음의 과정은 <code>AbstractMessageConverterMethodProcessor.writeWithMessageConverters</code> 메서드 하나에 들어 있다. <code>@ResponseBody</code>와 <code>ResponseEntity</code>가 모두 이 메서드로 모인다. 6.2.x와 7.0.10의 소스에서 같은 순서를 확인했다.</p>
+<figure class="flow-figure"><figcaption>writeWithMessageConverters의 판단 순서</figcaption><ol class="flow">
+<li><strong>이미 정해진 Content-Type이 있는가</strong><span>응답 헤더에 와일드카드 없는 Content-Type이 이미 있으면(ResponseEntity에 직접 넣은 경우 등) 그것을 그대로 쓴다. 협상을 건너뛴다.</span></li>
+<li><strong>클라이언트가 받을 수 있는 타입</strong><span>요청의 Accept 헤더에서 목록을 얻는다. 헤더가 없으면 "무엇이든(*/*)"이다.</span></li>
+<li><strong>서버가 만들 수 있는 타입</strong><span>매핑에 produces가 있으면 그 값이다. 없으면 컨버터 목록을 돌며 이 반환 타입에 canWrite(타입, null)이 true인 컨버터들의 지원 미디어 타입을 모은다.</span></li>
+<li><strong>두 목록의 교집합</strong><span>호환되는 조합을 고른다. 하나도 없는데 쓸 본문이 있으면 HttpMediaTypeNotAcceptableException, 곧 406이다.</span></li>
+<li><strong>하나로 좁히기</strong><span>구체적인 타입이 앞에 오도록 정렬하고, 와일드카드가 없는 첫 타입을 선택한다.</span></li>
+<li><strong>컨버터 고르기</strong><span>컨버터 목록을 처음부터 돌며 canWrite(타입, 선택된 미디어 타입)이 true인 첫 컨버터를 쓴다. 쓰기 직전에 ResponseBodyAdvice의 beforeBodyWrite가 호출된다.</span></li>
+</ol></figure>
+<p>컨버터 목록은 두 번 쓰인다. 3단계에서는 "이 타입으로 만들 수 있는 미디어 타입이 무엇인가"를 묻는 데 쓰이고, 6단계에서는 "그래서 누가 쓸 것인가"를 정하는 데 쓰인다. 두 번 모두 목록의 앞에서부터 돈다. 실험으로 각 단계를 건드려 보자.</p>
+<pre data-label="실행 결과"><code class="language-text">GET /text  Accept: application/json
+    [handler] HandlerMethod text()
+    [write] StringHttpMessageConverter as application/json
+    [postHandle] mv=null, committed=false
+    status=200
+    Content-Type: application/json
+    Content-Length: 9
+    body(9 bytes): 접수 ok
+GET /parcel  Accept: text/plain
+    [handler] HandlerMethod parcel()
+    status=406 (Acceptable representations: [application/json, application/*+json].)
+    Accept: application/json, application/*+json
+GET /parcel  Accept: text/html, application/json;q=0.8
+    [handler] HandlerMethod parcel()
+    [write] JacksonJsonHttpMessageConverter as application/json
+    [postHandle] mv=null, committed=false
+    status=200
+    Content-Type: application/json
+    body(27 bytes): {"code":"P-100","weight":3}</code></pre>
+<p>첫 요청이 가장 많은 것을 알려 준다. 클라이언트가 JSON을 원한다고 했고 응답의 <code>Content-Type</code>도 <code>application/json</code>인데, 본문은 따옴표 없는 <code>접수 ok</code>다. 유효한 JSON이 아니다. 과정을 따라가면 이유가 나온다. 선택된 미디어 타입은 <code>application/json</code>이다. 6단계에서 목록을 앞에서부터 돌면 <code>byte[]</code> 컨버터는 타입이 맞지 않아 넘어가고, 둘째인 <code>StringHttpMessageConverter</code>가 "타입은 <code>String</code>, 미디어 타입은 무엇이든"이라는 조건으로 손을 든다. JSON 컨버터까지 차례가 가지 않는다. 문자열 컨버터는 받은 문자열을 인코딩해 쓸 뿐 JSON 문법으로 감싸지 않는다. 본문이 9바이트인 것은 이 컨버터가 JSON 계열 미디어 타입에 한해 문자 집합이 없을 때 UTF-8을 쓰도록 되어 있기 때문이다.</p>
+<p>둘째 요청은 4단계에서 끝났다. <code>Parcel</code>을 쓸 수 있다고 답한 컨버터는 JSON 컨버터뿐이어서 서버가 만들 수 있는 타입은 <code>application/json</code>과 <code>application/*+json</code>이다. 클라이언트가 받겠다는 <code>text/plain</code>과 겹치지 않는다. 결과는 406이고, 컨트롤러 메서드는 이미 실행된 뒤라는 점에 주의하자. <code>[handler]</code> 줄이 찍혀 있다. 406은 메서드가 반환한 다음 단계에서 나는 오류다. 응답에 붙은 <code>Accept</code> 헤더는 스프링이 서버가 지원하는 타입을 알려 주려고 넣은 것이다. 셋째 요청은 클라이언트가 HTML을 가장 원하고 JSON은 가중치 0.8로 받겠다고 한 경우다. 서버가 HTML을 만들 수 없으므로 교집합에는 JSON만 남는다.</p>
+<h4>목록의 순서를 바꾸면 결과가 바뀐다</h4>
+<p>선택이 순서에 달려 있다는 것을 확인하기 위해 JSON 컨버터를 목록의 맨 앞에 하나 더 넣고 <code>/text</code>를 다시 호출했다.</p>
+<pre data-label="실행 결과(JSON 컨버터를 맨 앞에 추가)"><code class="language-text">GET /text
+    [handler] HandlerMethod text()
+    [write] JacksonJsonHttpMessageConverter as application/json
+    [postHandle] mv=null, committed=false
+    status=200
+    Content-Type: application/json
+    body(11 bytes): "접수 ok"
+GET /text  Accept: text/plain
+    [handler] HandlerMethod text()
+    [write] StringHttpMessageConverter as text/plain
+    [postHandle] mv=null, committed=false
+    status=200
+    Content-Type: text/plain;charset=ISO-8859-1
+    Content-Length: 5
+    body(5 bytes): ?? ok</code></pre>
+<p>컨트롤러 코드는 한 글자도 바꾸지 않았는데 <code>Accept</code> 없는 요청의 응답이 따옴표로 감싼 JSON 문자열 11바이트로 바뀌었다. Jackson은 <code>String</code>도 직렬화할 수 있다고 답하므로, 맨 앞에 선 JSON 컨버터가 3단계에서 <code>application/json</code>을 가장 먼저 내놓고 6단계에서도 가장 먼저 손을 든다. 기본 목록에서 타입 조건이 좁은 컨버터가 앞에, 넓은 컨버터가 뒤에 놓인 까닭이 이것이다. 넓은 컨버터가 앞에 서면 뒤의 좁은 컨버터에게는 차례가 오지 않는다. 클라이언트가 <code>Accept: text/plain</code>을 보낸 둘째 요청에서는 JSON 컨버터가 미디어 타입 조건에서 탈락해 다시 문자열 컨버터가 선택되었다. 두 조건을 함께 본다는 말의 뜻이 이것이다.</p>
+<h4>같은 메서드, 다른 표현: 컨버터를 하나 추가한다</h4>
+<p>컨버터를 직접 만들어 보면 계약이 손에 잡힌다. <code>Parcel</code>을 <code>text/csv</code>로 읽고 쓰는 컨버터를 만들어 목록의 맨 뒤에 추가했다. 상위 클래스 <code>AbstractHttpMessageConverter</code>가 미디어 타입 비교와 기본 헤더 처리를 해 주므로, 구현할 것은 타입 조건 하나와 읽기·쓰기 둘뿐이다.</p>
+<pre><code class="language-java">static class ParcelCsvConverter extends AbstractHttpMessageConverter<Parcel> {
+
+    ParcelCsvConverter() { super(StandardCharsets.UTF_8, new MediaType("text", "csv")); }
+
+    @Override
+    protected boolean supports(Class<?> clazz) { return clazz == Parcel.class; }
+
+    @Override
+    protected Parcel readInternal(Class<? extends Parcel> clazz, HttpInputMessage in) throws IOException {
+        String[] f = new String(in.getBody().readAllBytes(), StandardCharsets.UTF_8).trim().split(",");
+        return new Parcel(f[0], Integer.parseInt(f[1]));
+    }
+
+    @Override
+    protected void writeInternal(Parcel p, HttpOutputMessage out) throws IOException {
+        out.getBody().write((p.code() + "," + p.weight() + "\n").getBytes(StandardCharsets.UTF_8));
+    }
+}</code></pre>
+<pre data-label="실행 결과(CSV 컨버터를 맨 뒤에 추가)"><code class="language-text">GET /parcel
+    [handler] HandlerMethod parcel()
+    [write] JacksonJsonHttpMessageConverter as application/json
+    ...
+    body(27 bytes): {"code":"P-100","weight":3}
+GET /parcel  Accept: text/csv
+    [handler] HandlerMethod parcel()
+    [write] ParcelCsvConverter as text/csv
+    [postHandle] mv=null, committed=false
+    status=200
+    Content-Type: text/csv;charset=UTF-8
+    body(8 bytes): P-100,3
+POST /parcels  Content-Type: text/csv
+    [handler] HandlerMethod create()
+    [read ] ParcelCsvConverter -> Parcel
+    [write] JacksonJsonHttpMessageConverter as application/json
+    [postHandle] mv=null, committed=true
+    status=201
+    Location: /parcels/P-300
+    Content-Type: application/json
+    body(28 bytes): {"code":"P-300","weight":12}</code></pre>
+<p>컨트롤러는 그대로인데 같은 URL이 <code>Accept</code> 헤더에 따라 JSON으로도 CSV로도 응답한다. 같은 자원을 클라이언트가 원하는 표현(representation)으로 내려 주는 것, 이것이 「HTTP 웹 기본 지식」 권에서 본 콘텐츠 협상(content negotiation)의 서버 쪽 구현이다. <code>Accept</code>가 없을 때 JSON이 선택되는 것은 JSON 컨버터가 목록에서 CSV 컨버터보다 앞에 있기 때문이다. 셋째 요청은 읽기와 쓰기가 독립이라는 것을 보여 준다. 요청 본문은 <code>Content-Type: text/csv</code>에 따라 CSV 컨버터가 읽었고, 응답은 <code>Accept</code>가 없어서 JSON 컨버터가 썼다. 한 요청 안에서 들어오는 형식과 나가는 형식이 달라도 된다.</p>
+<x-visual id="spring-mvc1-07-converter-selection" title="반환 타입과 Accept 헤더가 컨버터 목록을 위에서 아래로 지나가며 첫 번째로 조건이 맞는 컨버터가 선택되는 과정" kind="순서도" ratio="16:9">
+<x-hint>컨버터 선택이 자바 타입과 미디어 타입 두 조건을 함께 보는 순차 탐색이며, 같은 String 반환이라도 목록 순서에 따라 다른 컨버터로 간다는 것을 보여 준다.</x-hint>
+<x-prompt>깔끔한 순서도, 흰 배경, 평면 색. 화면 왼쪽에 입력 상자 두 개를 세로로 놓는다: 위 상자 "반환 타입: String", 아래 상자 "Accept: application/json". 두 상자에서 나온 화살표가 하나로 합쳐져 화면 가운데의 세로 목록으로 들어간다. 세로 목록은 위에서 아래로 세 칸이며 각 칸은 둥근 사각형이다: 첫 칸 "byte[] 컨버터", 둘째 칸 "String 컨버터", 셋째 칸 "JSON 컨버터". 목록 왼쪽에 위에서 아래로 향하는 굵은 화살표와 라벨 "위에서부터 차례로 질문". 첫 칸 오른쪽에 빨간 X 표시와 라벨 "타입 불일치". 둘째 칸은 주황색으로 강조하고 오른쪽에 초록 체크 표시와 라벨 "타입 일치 · 미디어 타입 무엇이든". 셋째 칸은 흐린 회색으로 칠하고 오른쪽에 라벨 "차례가 오지 않음". 둘째 칸에서 오른쪽으로 화살표가 나가 화면 오른쪽 끝의 상자 "본문: 접수 ok (따옴표 없음)"으로 이어진다. 장식 없이 단순한 선.</x-prompt>
+<x-caption>컨버터는 "가장 알맞은 것"이 아니라 "조건이 맞는 첫 번째 것"이 선택된다. String 반환에 JSON을 요청해도 문자열 컨버터가 먼저 손을 든다.</x-caption>
+</x-visual>
+
+<h3>읽기: 요청 본문을 맡을 컨버터와 400·415</h3>
+<p>앞 회차에서 <code>@RequestBody</code>로 요청 본문을 받는 방법을 다뤘다. 여기서는 그때 컨버터가 어떤 규칙으로 골라지는지를 쓰기와 나란히 놓고 본다. 읽기는 쓰기보다 단순하다. 협상할 것이 없기 때문이다. 본문은 이미 클라이언트가 만든 바이트이고, 그 형식은 클라이언트가 <code>Content-Type</code> 헤더로 선언했다. 서버가 고를 수 있는 것은 "이 형식의 바이트를 이 자바 타입으로 읽어 줄 컨버터가 있는가"뿐이다. 이 과정은 <code>AbstractMessageConverterMethodArgumentResolver.readWithMessageConverters</code>에 들어 있고, 6.2.x와 7.0.10의 순서가 같다.</p>
+<figure class="flow-figure"><figcaption>readWithMessageConverters의 판단 순서</figcaption><ol class="flow">
+<li><strong>Content-Type 읽기</strong><span>헤더 값이 미디어 타입 문법에 맞지 않으면 그 자리에서 415다. 헤더가 아예 없으면 application/octet-stream으로 간주한다.</span></li>
+<li><strong>컨버터 고르기</strong><span>컨버터 목록을 앞에서부터 돌며 canRead(파라미터 타입, Content-Type)이 true인 첫 컨버터를 고른다.</span></li>
+<li><strong>본문 읽기</strong><span>본문이 한 바이트라도 있으면 RequestBodyAdvice의 beforeBodyRead, 컨버터의 read, afterBodyRead를 차례로 부른다. 본문이 비어 있으면 read를 부르지 않고 값을 null로 둔다.</span></li>
+<li><strong>손든 컨버터가 없을 때</strong><span>요청 메서드가 POST, PUT, PATCH이고, Content-Type이 있었거나 본문이 있으면 HttpMediaTypeNotSupportedException을 던진다. 415다.</span></li>
+<li><strong>필수 검사</strong><span>결과가 null인데 @RequestBody의 required가 true(기본값)이면 HttpMessageNotReadableException을 던진다. 400이다.</span></li>
+</ol></figure>
+<p>쓰기에서는 컨버터 목록을 두 번 돌았지만 읽기에서는 한 번만 돈다. 미디어 타입이 처음부터 하나로 정해져 있어서다. 그 대신 실패의 종류가 여럿이다. 형식을 읽을 컨버터가 없는 경우, 컨버터는 있는데 내용이 깨진 경우, 본문이 아예 없는 경우가 서로 다른 지점에서 서로 다른 예외가 된다. 다섯 가지 요청으로 하나씩 밟아 보자.</p>
+<pre data-label="실행 결과"><code class="language-text">POST /raw  Content-Type: application/json                 본문: {"code":"P-200","weight":7}
+    [handler] HandlerMethod raw()
+    [read ] StringHttpMessageConverter -> String
+    [write] StringHttpMessageConverter as text/plain
+    [postHandle] mv=null, committed=false
+    status=200
+    Content-Type: text/plain;charset=ISO-8859-1
+    Content-Length: 8
+    body(8 bytes): chars=27
+POST /parcels  Content-Type: text/plain                   본문: {"code":"P-200","weight":7}
+    [handler] HandlerMethod create()
+    status=415 (Content-Type 'text/plain' is not supported.)
+    Accept: application/json, application/*+json
+POST /parcels                                             본문: {"code":"P-200","weight":7}  (Content-Type 없음)
+    [handler] HandlerMethod create()
+    status=415 (Content-Type 'application/octet-stream' is not supported.)
+    Accept: application/json, application/*+json
+POST /parcels  Content-Type: application/json             본문: {"code":"P-200","weight":   (중간에 끊김)
+    [handler] HandlerMethod create()
+    status=400
+POST /parcels  Content-Type: application/json             본문 없음
+    [handler] HandlerMethod create()
+    status=400</code></pre>
+<p>첫 요청은 <code>Content-Type</code>이 JSON인데도 JSON 컨버터가 읽지 않았다. <code>raw</code> 메서드의 파라미터가 <code>@RequestBody String</code>이기 때문이다. 목록의 둘째인 문자열 컨버터가 "타입은 <code>String</code>, 미디어 타입은 무엇이든"이라는 조건으로 먼저 손을 들었고, 본문 27바이트를 해석하지 않은 채 문자열 27자로 넘겼다. 쓰기에서 본 것과 같은 현상의 읽기 쪽이다. <code>Content-Type</code>만으로 컨버터가 정해지는 것이 아니라 받는 쪽 파라미터의 자바 타입이 함께 정한다. 본문을 원문 그대로 받아 서명을 검증하거나 로그로 남겨야 할 때 이 성질을 쓴다. 문자열 컨버터가 바이트를 문자로 되돌릴 때 쓰는 문자 집합도 쓰기와 같은 규칙을 따른다. <code>Content-Type</code>에 <code>charset</code>이 있으면 그것을, 없고 JSON 계열이면 UTF-8을, 그 밖에는 컨버터의 기본 문자 집합을 쓴다.</p>
+<p>둘째 요청은 본문이 멀쩡한 JSON인데 415다. 클라이언트가 <code>text/plain</code>이라고 선언했기 때문이다. 목록을 따라가 보면 <code>byte[]</code>·문자열·리소스·폼 컨버터는 <code>Parcel</code>이라는 타입에서 탈락하고, JSON 컨버터는 타입은 받지만 미디어 타입 <code>text/plain</code>에서 탈락한다. 손든 컨버터가 없다. 서버는 본문의 내용을 들여다보고 형식을 짐작하지 않는다. 선언된 미디어 타입만 본다. 셋째 요청은 헤더가 없어서 <code>application/octet-stream</code>으로 간주되었고, 오류 문구에 그 이름이 그대로 나온다. 클라이언트가 보낸 적 없는 미디어 타입이 오류 문구에 보이면 <code>Content-Type</code> 헤더를 빠뜨린 것이다. 두 응답에 붙은 <code>Accept</code> 헤더는 이 타입을 읽을 수 있는 컨버터들의 지원 미디어 타입을 모은 것으로, 무엇을 보냈어야 하는지 알려 준다.</p>
+<p>넷째와 다섯째는 둘 다 400이지만 걸린 단계가 다르다. 넷째는 JSON 컨버터가 선택되어 <code>read</code>를 시작했고, 파서가 객체가 닫히기 전에 입력이 끝난 것을 발견했다. 컨버터는 이것을 <code>HttpMessageNotReadableException</code>으로 감싸 던진다. 다섯째는 컨버터가 선택되기는 했으나 본문이 0바이트여서 <code>read</code>가 불리지 않았고, 결과가 <code>null</code>인 채로 필수 검사에 걸렸다. 예외 메시지는 "Required request body is missing"으로 시작한다. <code>@RequestBody(required = false)</code>로 선언하면 이 경우 예외 없이 <code>null</code>이 파라미터로 들어온다.</p>
+<p>다섯 요청 모두 <code>[handler]</code> 줄은 찍혔다. 핸들러 조회는 성공했고 인터셉터의 <code>preHandle</code>도 지나갔다는 뜻이다. 그러나 실패한 네 요청에서 컨트롤러 메서드의 본문은 한 줄도 실행되지 않았다. 인자를 만들지 못했으니 호출할 수 없었던 것이다. 이 점이 앞에서 본 406과 다르다. 406은 메서드가 반환한 뒤에 나므로, 그 메서드가 저장이나 외부 호출을 했다면 그 일은 이미 일어난 상태로 클라이언트는 오류 응답을 받는다.</p>
+<aside class="note">예외가 상태 코드가 되는 자리는 어댑터 밖이다. 어댑터 안에서 던져진 예외는 <code>DispatcherServlet</code>까지 올라가고, 거기서 예외 리졸버가 처리한다. 기본으로 등록되는 <code>DefaultHandlerExceptionResolver</code>가 <code>HttpMediaTypeNotSupportedException</code>을 415로, <code>HttpMediaTypeNotAcceptableException</code>을 406으로, <code>HttpMessageNotReadableException</code>을 400으로, <code>HttpMessageNotWritableException</code>을 500으로 바꾼다. 예외 리졸버의 구조는 「스프링 MVC 2편」 권에서 다룬다.</aside>
+<h4>같은 415·406이 핸들러 조회 단계에서도 난다</h4>
+<p>앞 회차에서 본 대로 <code>@RequestMapping</code>의 <code>consumes</code>와 <code>produces</code>는 매핑 조건이다. 이 조건이 붙은 메서드에서는 컨버터까지 가기 전에, 핸들러를 찾는 단계에서 같은 상태 코드가 난다. <code>consumes = "application/json", produces = "application/json"</code>을 붙인 <code>POST /strict</code> 메서드를 만들어 호출했다.</p>
+<pre data-label="실행 결과"><code class="language-text">POST /strict  Content-Type: text/plain
+    status=415 (Content-Type 'text/plain' is not supported.)
+    Accept: application/json
+POST /strict  Content-Type: application/json  Accept: text/plain
+    status=406 (Acceptable representations: [application/json].)
+    Accept: application/json
+POST /strict  Content-Type: application/json;charset=UTF-8
+    [handler] HandlerMethod strict()
+    [read ] JacksonJsonHttpMessageConverter -> Parcel
+    [write] JacksonJsonHttpMessageConverter as application/json
+    [postHandle] mv=null, committed=false
+    status=200
+    Content-Type: application/json
+    body(27 bytes): {"code":"P-200","weight":7}</code></pre>
+<p>앞의 두 요청에는 <code>[handler]</code> 줄이 없다. <code>RequestMappingHandlerMapping</code>이 경로와 HTTP 메서드는 맞지만 미디어 타입 조건이 맞지 않는 후보만 남은 것을 보고 예외를 던졌기 때문이다. 핸들러가 정해지지 않았으니 인터셉터도, 어댑터도 실행되지 않았다. 오류에 실린 지원 목록도 다르다. 컨버터 단계의 오류는 컨버터들이 지원하는 타입을 모아서 <code>application/json, application/*+json</code>을 보여 줬지만, 여기서는 <code>consumes</code>와 <code>produces</code>에 적은 값만 나온다. 상태 코드는 같아도 어느 단계에서 났는지를 응답과 로그에서 구분할 수 있다.</p>
+<div class="table-wrap"><table><thead><tr><th>상태</th><th>나는 단계</th><th>조건</th><th>컨트롤러 메서드</th></tr></thead><tbody>
+<tr><td>415</td><td>핸들러 조회(매핑)</td><td><code>consumes</code> 조건과 요청의 <code>Content-Type</code>이 맞지 않는다</td><td>실행 안 됨</td></tr>
+<tr><td>415</td><td>인자 준비(읽기)</td><td>파라미터 타입과 <code>Content-Type</code>의 조합을 읽을 컨버터가 없다</td><td>실행 안 됨</td></tr>
+<tr><td>400</td><td>인자 준비(읽기)</td><td>컨버터가 본문을 해석하다 실패했다. 또는 필수 본문이 비어 있다</td><td>실행 안 됨</td></tr>
+<tr><td>406</td><td>핸들러 조회(매핑)</td><td><code>produces</code> 조건과 요청의 <code>Accept</code>가 맞지 않는다</td><td>실행 안 됨</td></tr>
+<tr><td>406</td><td>반환값 처리(쓰기)</td><td>반환 타입으로 만들 수 있는 미디어 타입과 <code>Accept</code>가 겹치지 않는다</td><td><b>이미 실행됨</b></td></tr>
+<tr><td>500</td><td>반환값 처리(쓰기)</td><td>반환 타입을 쓸 수 있는 컨버터가 하나도 없다(<code>HttpMessageNotWritableException</code>)</td><td>이미 실행됨</td></tr>
+</tbody></table></div>
+<p>표의 마지막 두 줄이 말하는 것은 설계에 영향을 준다. 응답 형식이 정해져 있는 API라면 <code>produces</code>를 명시해 두는 편이 낫다. 받을 수 없는 형식을 요구한 요청이 메서드에 들어오기 전에 걸러지기 때문이다. RFC 9110은 406을 "클라이언트가 협상 헤더로 밝힌 조건에 맞는 표현이 없고 서버가 기본 표현을 보낼 뜻도 없을 때"의 응답으로, 415를 "요청 내용의 형식을 대상 자원이 지원하지 않을 때"의 응답으로 정의한다(§15.5.7, §15.5.16). 스프링 MVC의 두 예외는 이 정의를 그대로 구현한 것이다.</p>
+<h4>HttpEntity로 헤더와 본문을 함께 받는다</h4>
+<p>본문과 함께 요청 헤더도 필요하면 파라미터를 <code>HttpEntity</code>로 선언한다. <code>HttpEntity<String></code>처럼 타입 인자로 본문의 타입을 적으면, 그 타입으로 위와 똑같은 <code>readWithMessageConverters</code>가 실행되고 결과가 헤더와 함께 <code>HttpEntity</code> 객체에 담긴다. 하위 타입 <code>RequestEntity</code>로 받으면 HTTP 메서드와 URL까지 들어 있다. 반환 쪽의 <code>ResponseEntity</code>도 <code>HttpEntity</code>의 하위 타입이며 상태 코드를 더 가진다. <code>HttpEntity<String></code>을 받아 <code>Content-Type</code>과 본문 길이를 돌려주는 <code>POST /echo</code>를 호출했다.</p>
+<pre data-label="실행 결과"><code class="language-text">POST /echo  Content-Type: application/json                본문: {"code":"P-200","weight":7}
+    [handler] HandlerMethod echo()
+    [read ] StringHttpMessageConverter -> String
+    [write] StringHttpMessageConverter as text/plain;charset=UTF-8
+    [postHandle] mv=null, committed=true
+    status=200
+    Content-Type: text/plain;charset=UTF-8
+    Content-Length: 31
+    body(31 bytes): type=application/json, chars=27
+POST /echo                                                본문 없음
+    [handler] HandlerMethod echo()
+    [write] StringHttpMessageConverter as text/plain;charset=UTF-8
+    [postHandle] mv=null, committed=true
+    status=200
+    Content-Type: text/plain;charset=UTF-8
+    Content-Length: 19
+    body(19 bytes): type=null, chars=-1</code></pre>
+<p>둘째 요청이 <code>@RequestBody</code>와의 차이를 보여 준다. 본문이 없는데 400이 아니라 메서드가 실행되었고, <code>getBody()</code>가 <code>null</code>이었다. <code>HttpEntity</code> 쪽에는 필수 검사가 없다. 본문의 유무를 스스로 판단해야 하는 자리에서는 이쪽이 맞고, 본문이 반드시 있어야 하는 API라면 <code>@RequestBody</code>의 필수 검사에 맡기는 편이 낫다. 응답의 <code>Content-Type</code>이 실험 메서드가 <code>ResponseEntity</code>에 넣은 값 그대로인 것도 보인다. 쓰기 순서의 첫 단계, "이미 정해진 Content-Type이 있으면 협상을 건너뛴다"가 적용된 결과다.</p>
+<x-visual id="spring-mvc1-07-status-stages" title="요청 처리의 네 단계에서 415, 400, 406이 각각 어디서 나오는지와 컨트롤러 메서드 실행 여부를 보여 주는 가로 흐름" kind="순서도" ratio="16:9">
+<x-hint>같은 상태 코드가 서로 다른 단계에서 날 수 있고, 반환값 처리 단계의 406만 컨트롤러 메서드가 이미 실행된 뒤라는 것을 보여 준다.</x-hint>
+<x-prompt>깔끔한 가로 순서도, 흰 배경, 평면 색. 왼쪽에서 오른쪽으로 네 개의 둥근 사각형이 화살표로 이어진다: "① 핸들러 조회", "② 인자 준비(읽기)", "③ 컨트롤러 메서드 실행", "④ 반환값 처리(쓰기)". 셋째 상자만 진한 남색으로 칠하고 나머지는 연한 회색. 첫째 상자 아래로 빨간 점선 화살표 두 개가 내려가 빨간 꼬리표 "415 · consumes 불일치"와 "406 · produces 불일치"에 닿는다. 둘째 상자 아래로 빨간 점선 화살표 두 개가 내려가 꼬리표 "415 · 읽을 컨버터 없음"과 "400 · 본문 해석 실패"에 닿는다. 넷째 상자 아래로 빨간 점선 화살표 하나가 내려가 꼬리표 "406 · 쓸 수 있는 형식 없음"에 닿는다. 셋째 상자와 넷째 상자 사이 위쪽에 세로 점선을 긋고 그 위에 주황색 라벨 "여기부터는 메서드가 이미 실행됨". 장식 없이 단순한 선.</x-prompt>
+<x-caption>415와 406은 두 군데에서 날 수 있다. 응답에 실린 지원 타입 목록과 컨트롤러 메서드의 실행 여부로 단계를 구분한다.</x-caption>
+</x-visual>
+
+<h3>요청 매핑 핸들러 어댑터 구조 ①: 메서드를 호출하기까지와 인자 리졸버</h3>
+<p>여기까지 본 것을 다시 묶어 보자. 뷰 이름을 받아 적는 클래스, <code>@ResponseBody</code>를 알아보는 클래스, <code>HttpServletResponse</code>를 넣어 주는 클래스, 메시지 컨버터 목록. 이들은 모두 한 객체 안에 들어 있다. <code>@RequestMapping</code> 메서드를 실행하는 핸들러 어댑터, <code>RequestMappingHandlerAdapter</code>다. 05회에서 핸들러 어댑터의 일은 <code>DispatcherServlet</code>이 핸들러의 종류를 몰라도 실행할 수 있도록 호출 방식을 맞춰 주는 것이라고 했다. 인터페이스 기반 핸들러라면 정해진 메서드 하나를 부르면 끝난다. 애노테이션 기반 컨트롤러는 사정이 다르다. 메서드마다 파라미터의 수와 타입이 다르고 반환 타입도 다르다. 어댑터가 풀어야 할 문제는 "시그니처를 미리 알 수 없는 메서드를 어떻게 호출하고, 그 결과를 어떻게 한 가지 형태로 맞추는가"다.</p>
+<p>답은 일을 둘로 쪼개 각각 목록에 맡기는 것이다. 파라미터 하나의 값을 만드는 일은 인자 리졸버(argument resolver) 목록에, 반환값 하나를 처리하는 일은 반환값 핸들러(return value handler) 목록에 맡긴다. 어댑터의 <code>invokeHandlerMethod</code>와 그것이 부르는 <code>ServletInvocableHandlerMethod.invokeAndHandle</code>의 뼈대를 소스에서 추리면 다음과 같다. 6.2.x와 7.0.10이 같은 구조다.</p>
+<pre><code class="language-java">// RequestMappingHandlerAdapter.invokeHandlerMethod → ServletInvocableHandlerMethod.invokeAndHandle
+// 실제 소스의 뼈대만 남긴 의사 코드다. 비동기 처리, 검증, 예외 로깅은 뺐다.
+
+ServletWebRequest webRequest = new ServletWebRequest(request, response);   // 요청마다 새로 만든다
+ModelAndViewContainer mavContainer = new ModelAndViewContainer();          // 요청마다 새로 만든다
+
+// 1. 파라미터마다 인자 리졸버에게 값을 만들게 한다
+Object[] args = new Object[parameters.length];
+for (int i = 0; i < parameters.length; i++) {
+    args[i] = argumentResolvers.resolveArgument(parameters[i], mavContainer, webRequest, binderFactory);
+}
+
+// 2. 리플렉션으로 컨트롤러 메서드를 호출한다
+Object returnValue = method.invoke(controllerBean, args);
+
+// 3. @ResponseStatus 가 있으면 상태 코드를 반영한다
+setResponseStatus(webRequest);
+
+// 4. 반환값 핸들러에게 반환값을 처리하게 한다
+returnValueHandlers.handleReturnValue(returnValue, returnType, mavContainer, webRequest);
+
+// 5. 컨테이너에 모인 결과로 ModelAndView 를 만든다. "처리 완료" 표시가 있으면 null 이다
+return mavContainer.isRequestHandled() ? null : new ModelAndView(mavContainer.getViewName(), mavContainer.getModel());</code></pre>
+<p>가운데의 <code>method.invoke</code>가 컨트롤러 메서드가 실제로 실행되는 한 줄이다. 그 앞은 전부 인자를 준비하는 일이고 그 뒤는 전부 결과를 해석하는 일이다. <code>ModelAndViewContainer</code>는 이 과정 내내 들고 다니는 메모지 구실을 한다. 인자 리졸버가 모델을 꺼내 주는 곳도, 반환값 핸들러가 뷰 이름을 적어 두는 곳도, "응답을 이미 다 썼다"는 표시를 남기는 곳도 이 객체다.</p>
+<h4>HandlerMethodArgumentResolver 인터페이스</h4>
+<pre><code class="language-java">public interface HandlerMethodArgumentResolver {
+
+    boolean supportsParameter(MethodParameter parameter);            // 이 파라미터를 내가 맡을 수 있는가
+
+    @Nullable
+    Object resolveArgument(MethodParameter parameter,                 // 맡았다면 값을 만들어 돌려준다
+                           @Nullable ModelAndViewContainer mavContainer,
+                           NativeWebRequest webRequest,
+                           @Nullable WebDataBinderFactory binderFactory) throws Exception;
+}</code></pre>
+<p>Javadoc의 정의는 "주어진 요청의 맥락에서 메서드 파라미터를 인자 값으로 풀어내는 전략 인터페이스"다. 모양이 메시지 컨버터와 닮았다. 질문 메서드 하나와 실행 메서드 하나다. <code>MethodParameter</code>는 파라미터 하나에 대한 리플렉션 정보를 묶은 객체로, 타입, 붙어 있는 애노테이션, 제네릭 타입 인자, 이름을 꺼낼 수 있다. 리졸버는 이것만 보고 손을 들지 말지 정한다. <code>NativeWebRequest</code>는 서블릿 요청·응답 객체를 감싼 것이고, <code>WebDataBinderFactory</code>는 문자열을 목적 타입으로 바꾸거나 객체에 값을 채워 넣을 때 쓰는 바인더를 만들어 준다.</p>
+<h4>기본 목록과 네 묶음</h4>
+<p>어댑터의 <code>getArgumentResolvers()</code>를 출력하면 실험 환경(7.0.10, 사용자 정의 리졸버 한 개 등록)에서 29개가 나온다. 소스의 <code>getDefaultArgumentResolvers</code>는 이 목록을 주석으로 네 묶음으로 나눠 만든다. 출력된 순서 그대로에 묶음과 담당을 덧붙였다.</p>
+<pre class="diagram">[애노테이션 기반] 파라미터에 붙은 애노테이션을 보고 손든다
+  1 RequestParamMethodArgumentResolver (false)      @RequestParam
+  2 RequestParamMapMethodArgumentResolver
+  3 PathVariableMethodArgumentResolver               @PathVariable
+  4 PathVariableMapMethodArgumentResolver
+  5 MatrixVariableMethodArgumentResolver
+  6 MatrixVariableMapMethodArgumentResolver
+  7 ServletModelAttributeMethodProcessor (false)     @ModelAttribute
+  8 RequestResponseBodyMethodProcessor               @RequestBody             ◀ 메시지 컨버터를 쓴다
+  9 RequestPartMethodArgumentResolver                @RequestPart
+ 10 RequestHeaderMethodArgumentResolver              @RequestHeader
+ 11 RequestHeaderMapMethodArgumentResolver
+ 12 ServletCookieValueMethodArgumentResolver         @CookieValue
+ 13 ExpressionValueMethodArgumentResolver            @Value
+ 14 SessionAttributeMethodArgumentResolver           @SessionAttribute
+ 15 RequestAttributeMethodArgumentResolver           @RequestAttribute
+
+[타입 기반] 파라미터의 타입을 보고 손든다
+ 16 ServletRequestMethodArgumentResolver             HttpServletRequest, HttpSession, InputStream, Locale ...
+ 17 ServletResponseMethodArgumentResolver            HttpServletResponse, OutputStream, Writer
+ 18 HttpEntityMethodProcessor                        HttpEntity, RequestEntity ◀ 메시지 컨버터를 쓴다
+ 19 RedirectAttributesMethodArgumentResolver
+ 20 ModelMethodProcessor                             Model
+ 21 MapMethodProcessor                               Map
+ 22 ErrorsMethodArgumentResolver                     Errors, BindingResult
+ 23 SessionStatusMethodArgumentResolver
+ 24 UriComponentsBuilderMethodArgumentResolver
+ 25 ApiVersionMethodArgumentResolver                 (7.0에서 추가. 6.2.x 목록에는 없다)
+
+[사용자 정의] WebMvcConfigurer.addArgumentResolvers 로 추가한 것
+ 26 CallerResolver
+
+[마지막 그물] 애노테이션이 없는 파라미터를 받는다
+ 27 PrincipalMethodArgumentResolver
+ 28 RequestParamMethodArgumentResolver (true)        단순 타입이면 @RequestParam 으로 취급
+ 29 ServletModelAttributeMethodProcessor (true)      그 밖이면 @ModelAttribute 로 취급</pre>
+<p>6.2.x 소스에서는 25번이 없고, 코틀린이 클래스패스에 있을 때만 그 자리에 코루틴용 리졸버가 하나 들어간다. 나머지 종류와 순서는 같다. 선택 규칙은 컨버터와 같다. 위에서부터 <code>supportsParameter</code>를 묻고 처음 <code>true</code>를 답한 리졸버가 맡는다. 그래서 이 목록의 순서를 읽으면 그동안 규칙으로 외웠던 것들이 구조로 설명된다.</p>
+<ul>
+<li><b>같은 클래스가 두 번 나온다.</b> 1번과 28번, 7번과 29번은 같은 클래스의 다른 객체다. 괄호 안의 값은 생성자 인자다. 앞의 것은 애노테이션이 붙은 파라미터만 받고, 뒤의 것은 애노테이션이 없어도 받는다. 앞 회차에서 본 "<code>@RequestParam</code>과 <code>@ModelAttribute</code>는 생략할 수 있다"는 규칙의 정체가 목록 맨 끝의 이 두 객체다. 28번은 <code>BeanUtils.isSimpleProperty</code>가 참인 타입(<code>String</code>, 숫자, 날짜 등)을 받고, 29번은 그 나머지를 받는다. 레퍼런스의 인자 표 마지막 줄 "Any other argument"가 이 동작을 적은 것이다.</li>
+<li><b>마지막 그물은 반드시 마지막이어야 한다.</b> 29번은 단순 타입이 아니면 무엇이든 받는다. 이것이 앞에 있으면 <code>Model</code>도 <code>HttpServletRequest</code>도 "요청 파라미터로 채울 객체"로 취급된다. 조건이 좁은 것을 앞에, 넓은 것을 뒤에 두는 배치는 컨버터 목록에서 본 것과 같은 원리다.</li>
+<li><b><code>HttpServletResponse</code>를 받으면 "처리 완료"가 되는 까닭.</b> 17번 리졸버의 <code>resolveArgument</code>는 응답 객체를 돌려주기 전에 <code>mavContainer.setRequestHandled(true)</code>를 부른다. 메서드가 <code>void</code>나 <code>null</code>을 반환하면 <code>invokeAndHandle</code>은 이 표시를 보고 반환값 핸들러를 부르지 않고 끝낸다. 앞의 <code>/direct</code> 실험에서 <code>ModelAndView</code>가 <code>null</code>이었던 과정이 이것이다. 메서드가 값을 반환하면 표시는 지워지고 반환값 처리가 정상대로 진행된다.</li>
+</ul>
+<h4>탐색은 메서드마다 한 번: 리졸버 캐시</h4>
+<p>요청마다 파라미터 하나에 서른 개 가까운 객체에게 차례로 묻는다면 낭비다. 실제로는 그렇지 않다. 목록을 감싼 <code>HandlerMethodArgumentResolverComposite</code>는 <code>ConcurrentHashMap</code>으로 된 캐시를 갖고 있다. 어떤 <code>MethodParameter</code>에 대해 리졸버를 한 번 찾으면 그 결과를 저장하고, 다음부터는 목록을 돌지 않고 캐시에서 꺼낸다. 컨트롤러 메서드의 시그니처는 실행 중에 바뀌지 않으므로 "이 파라미터는 누가 맡는가"의 답도 바뀌지 않는다. 이 성질 때문에 <code>supportsParameter</code>는 요청의 내용을 보고 답하면 안 된다. 인자로 요청 객체를 주지 않는 것도 그래서다.</p>
+<h4>실험: 리졸버를 하나 만들어 끼운다</h4>
+<p>접수 요청을 보낸 쪽의 정보를 <code>Caller</code>라는 레코드로 받고 싶다고 하자. 주소는 연결 정보에서, 에이전트 이름은 헤더에서 온다. 컨트롤러마다 <code>HttpServletRequest</code>를 받아 같은 코드를 되풀이하는 대신 리졸버 하나에 그 일을 모은다.</p>
+<pre><code class="language-java">record Caller(String ip, String agent) {}
+
+static class CallerResolver implements HandlerMethodArgumentResolver {
+
+    @Override
+    public boolean supportsParameter(MethodParameter parameter) {
+        supportsCalls.incrementAndGet();                         // 관찰용: 몇 번 질문받았는지 센다
+        return parameter.getParameterType() == Caller.class;     // 타입만 보고 답한다
+    }
+
+    @Override
+    public Object resolveArgument(MethodParameter parameter, ModelAndViewContainer mavContainer,
+                                  NativeWebRequest webRequest, WebDataBinderFactory binderFactory) {
+        HttpServletRequest request = webRequest.getNativeRequest(HttpServletRequest.class);
+        return new Caller(request.getRemoteAddr(), request.getHeader("User-Agent"));
+    }
+}
+
+// 설정 클래스(WebMvcConfigurer)에서 등록
+@Override
+public void addArgumentResolvers(List<HandlerMethodArgumentResolver> resolvers) {
+    resolvers.add(new CallerResolver());
+}
+
+// 컨트롤러
+@GetMapping("/who") @ResponseBody
+String who(Caller caller) { return caller.ip() + " / " + caller.agent(); }</code></pre>
+<pre data-label="실행 결과"><code class="language-text">GET /who  User-Agent: lab/1.0
+    [handler] HandlerMethod who()
+    [write] StringHttpMessageConverter as text/plain
+    ...
+    body(19 bytes): 127.0.0.1 / lab/1.0
+    supportsParameter calls so far: 1
+GET /who  User-Agent: lab/2.0
+    [handler] HandlerMethod who()
+    [write] StringHttpMessageConverter as text/plain
+    ...
+    body(19 bytes): 127.0.0.1 / lab/2.0
+    supportsParameter calls so far: 1</code></pre>
+<p>두 요청의 값은 요청마다 새로 만들어졌다(<code>127.0.0.1</code>은 Mock 요청 객체의 기본 원격 주소다). 그런데 <code>supportsParameter</code>가 불린 횟수는 두 번째 요청 뒤에도 1이다. 첫 요청에서 목록을 따라 내려오다 26번째에서 답을 얻었고, 그 답이 캐시에 들어가 둘째 요청은 묻지 않았다. 질문은 메서드의 파라미터마다 한 번, 값 만들기는 요청마다 한 번이다.</p>
+<p>이번에는 같은 컨트롤러를 그대로 두고 리졸버 등록만 뺀 채 실행했다. 실수로 설정을 빠뜨린 상황이다.</p>
+<pre data-label="실행 결과(CallerResolver를 등록하지 않음)"><code class="language-text">GET /who  User-Agent: lab/1.0
+    [handler] HandlerMethod who()
+    [write] StringHttpMessageConverter as text/plain
+    ...
+    body(11 bytes): null / null
+GET /who?ip=10.0.0.9&agent=forged
+    status=200
+    body: 10.0.0.9 / forged</code></pre>
+<p>오류가 나지 않는다. <code>Caller</code>를 맡겠다는 리졸버가 없으니 질문은 목록 끝까지 내려가고, 마지막 그물인 <code>ServletModelAttributeMethodProcessor(true)</code>가 받는다. 이 프로세서는 <code>Caller</code>를 <code>@ModelAttribute</code> 객체로 보고 요청 파라미터에서 <code>ip</code>와 <code>agent</code>를 찾아 채운다. 파라미터가 없으면 둘 다 <code>null</code>이고, 클라이언트가 쿼리 스트링에 값을 넣어 보내면 그 값이 그대로 들어간다. 서버가 연결 정보에서 읽어야 할 값을 클라이언트가 정하게 된 것이다. 사용자 정의 리졸버가 맡는 타입은 등록이 빠졌을 때 조용히 마지막 그물로 떨어진다는 점을 기억해 두자. 리졸버가 실제로 동작하는지는 테스트로 확인해야 한다.</p>
+<p>사용자 정의 리졸버가 들어가는 자리는 26번째, 곧 내장 리졸버의 애노테이션 기반·타입 기반 묶음 뒤이고 마지막 그물 앞이다. 이 위치가 할 수 있는 일의 범위를 정한다. 마지막 그물보다 앞이므로 애노테이션 없는 임의의 타입을 가로챌 수 있다. 내장 묶음보다 뒤이므로 <code>@RequestParam</code>이 붙은 파라미터나 <code>Model</code>, <code>HttpServletRequest</code> 같은 타입은 차례가 오지 않는다. <code>who2(@RequestParam String name, Model model, Caller caller)</code>라는 메서드를 호출한 뒤 횟수를 보면 1이다. 세 파라미터 중 사용자 정의 리졸버가 질문받은 것은 <code>Caller</code> 하나뿐이다. <code>addArgumentResolvers</code>의 Javadoc도 이 메서드가 내장 지원을 덮어쓰지 않으며, 내장 동작을 바꾸려면 <code>RequestMappingHandlerAdapter</code>를 직접 설정하라고 적는다.</p>
+
+<h3>요청 매핑 핸들러 어댑터 구조 ②: 반환값 핸들러 — 뷰로 갈지 본문으로 갈지</h3>
+<p>반환 쪽 인터페이스도 같은 모양이다.</p>
+<pre><code class="language-java">public interface HandlerMethodReturnValueHandler {
+
+    boolean supportsReturnType(MethodParameter returnType);          // 이 반환 타입을 내가 맡을 수 있는가
+
+    void handleReturnValue(@Nullable Object returnValue,              // 맡았다면 처리한다
+                           MethodParameter returnType,
+                           ModelAndViewContainer mavContainer,
+                           NativeWebRequest webRequest) throws Exception;
+}</code></pre>
+<p><code>handleReturnValue</code>의 반환 타입이 <code>void</code>라는 점이 눈에 띈다. 반환값 핸들러는 결과를 돌려주지 않는다. 할 수 있는 일은 두 가지다. <code>mavContainer</code>에 뷰 이름이나 모델을 적어 두거나, <code>webRequest</code>에서 응답 객체를 꺼내 직접 쓰고 <code>mavContainer.setRequestHandled(true)</code>로 표시하거나. 앞의 길이 뷰 템플릿 응답이고 뒤의 길이 메시지 바디 응답이다. 회차 처음에 본 세 갈래 중 두 갈래가 이 인터페이스의 구현체들 사이에서 갈린다.</p>
+<pre class="diagram">[타입이 뜻을 정하는 것]
+  1 ModelAndViewMethodReturnValueHandler             ModelAndView
+  2 ModelMethodProcessor                             Model
+  3 ViewMethodReturnValueHandler                     View
+  4 ResponseBodyEmitterReturnValueHandler            ResponseBodyEmitter 등 스트리밍 타입
+  5 StreamingResponseBodyReturnValueHandler          StreamingResponseBody
+  6 ResponseEntityReturnValueHandler                 HttpEntity, ResponseEntity  ◀ 메시지 컨버터를 쓴다
+  7 HttpHeadersReturnValueHandler                    HttpHeaders
+  8 CallableMethodReturnValueHandler                 Callable
+  9 DeferredResultMethodReturnValueHandler           DeferredResult 등
+ 10 AsyncTaskMethodReturnValueHandler                WebAsyncTask
+
+[애노테이션 기반]
+ 11 ServletModelAttributeMethodProcessor (false)     메서드에 @ModelAttribute
+ 12 RequestResponseBodyMethodProcessor               메서드나 클래스에 @ResponseBody  ◀ 메시지 컨버터를 쓴다
+
+[여러 뜻으로 쓰이는 타입]
+ 13 ViewNameMethodReturnValueHandler                 void, CharSequence(String)
+ 14 MapMethodProcessor                               Map
+
+[사용자 정의] WebMvcConfigurer.addReturnValueHandlers 로 추가한 것이 이 자리에 들어간다
+
+[마지막 그물]
+ 15 ServletModelAttributeMethodProcessor (true)      단순 타입이 아닌 나머지 → 모델 속성으로</pre>
+<p>실험 환경에서 출력한 15개를 소스의 묶음 주석에 맞춰 적은 것이다. 6번 <code>ResponseEntityReturnValueHandler</code>는 6.2.9에서 추가된 얇은 포장으로, 본문이 스트리밍 타입이면 4번에게, 아니면 <code>HttpEntityMethodProcessor</code>에게 넘긴다. 그 전 버전에서는 <code>HttpEntityMethodProcessor</code>가 이 자리에 직접 들어 있었다. 어느 쪽이든 일반적인 <code>ResponseEntity</code>를 처리하는 것은 <code>HttpEntityMethodProcessor</code>다.</p>
+<p>회차 처음의 질문, "똑같이 <code>String</code>을 반환하는데 무엇이 갈림을 정하는가"의 답이 12번과 13번의 순서다. <code>@ResponseBody</code>가 붙은 메서드라면 12번이 먼저 손을 들어 문자열을 본문으로 쓴다. 붙지 않았다면 12번은 지나가고 13번이 받아 뷰 이름으로 적는다. 12번이 13번보다 뒤에 있었다면 <code>@ResponseBody String</code>은 뷰 이름이 되었을 것이다. 순서가 뜻을 정하는 다른 예도 실험으로 확인했다. 둘 다 <code>@RestController</code> 클래스의 메서드다.</p>
+<pre data-label="실행 결과"><code class="language-text">GET /desk/name                 @RestController 안에서 return "parcel-list";
+    [handler] HandlerMethod name()
+    [write] StringHttpMessageConverter as text/plain
+    [postHandle] mv=null, committed=false
+    status=200
+    Content-Type: text/plain;charset=ISO-8859-1
+    Content-Length: 11
+    body(11 bytes): parcel-list
+GET /desk/view                 @RestController 안에서 return new ModelAndView("parcel-list", "count", 5);
+    [handler] HandlerMethod view()
+    [postHandle] mv=view 'parcel-list', committed=false
+    status=200
+    Content-Language: en
+    Content-Type: text/html;charset=UTF-8
+    body(30 bytes): <h1>parcel-list {count=5}</h1></code></pre>
+<p>첫 요청은 화면을 띄우려던 컨트롤러에 <code>@RestController</code>를 붙였을 때 생기는 일이다. 뷰가 그려지지 않고 뷰 이름 열한 글자가 본문으로 나간다. 둘째 요청은 "<code>@RestController</code>에서는 뷰를 쓸 수 없다"는 말이 정확하지 않다는 것을 보여 준다. <code>ModelAndView</code>를 맡는 1번이 <code>@ResponseBody</code>를 보는 12번보다 앞에 있으므로, 반환 타입이 <code>ModelAndView</code>이면 클래스에 <code>@ResponseBody</code>가 있어도 뷰가 그려진다. 같은 이유로 <code>@RestController</code>에서 <code>ResponseEntity</code>를 반환하면 6번이 먼저 받는다. 12번이 받았다면 <code>ResponseEntity</code> 객체 자체가 JSON으로 직렬화되어 나갔을 것이다. 묶음의 배치는 "타입만 봐도 뜻이 분명한 것을 먼저, 애노테이션을 봐야 하는 것을 다음에, 타입만으로는 뜻이 여럿인 것을 그 뒤에"라는 원칙을 따른다.</p>
+<h4>@ResponseBody를 빠뜨리면: 마지막 그물이 받는다</h4>
+<p>객체를 반환하면서 <code>@ResponseBody</code>도 <code>@RestController</code>도 붙이지 않은 메서드는 어떻게 될까. <code>@Controller</code> 클래스에 <code>Parcel</code>을 반환하는 <code>/forgot</code>과 <code>int</code>를 반환하는 <code>/count</code>를 만들어 호출했다.</p>
+<pre data-label="실행 결과"><code class="language-text">GET /forgot                    애노테이션 없이 return new Parcel("P-900", 1);
+    [handler] HandlerMethod forgot()
+    [postHandle] mv=view 'forgot', committed=false
+    status=200
+    Content-Language: en
+    Content-Type: text/html;charset=UTF-8
+    body(173 bytes): <h1>forgot {parcel=Parcel[code=P-900, weight=1], org.springframework.validation.BindingResult.parcel=...: 0 errors}</h1>
+GET /count                     애노테이션 없이 return 3;
+    [handler] HandlerMethod count()
+    exception: jakarta.servlet.ServletException: Request processing failed: java.lang.IllegalArgumentException: Unknown return value type: java.lang.Integer</code></pre>
+<p><code>/forgot</code>에서 <code>Parcel</code>은 1번부터 14번까지 누구의 조건에도 맞지 않아 15번 마지막 그물로 떨어졌다. 이 프로세서는 단순 타입이 아닌 반환값을 모델 속성으로 본다. 그래서 <code>Parcel</code>이 타입 이름에서 딴 <code>parcel</code>이라는 이름으로 모델에 들어갔다. 뷰 이름은 아무도 정하지 않았으므로 <code>DispatcherServlet</code>이 요청 경로에서 기본 뷰 이름 <code>forgot</code>을 만들었고, 그 이름의 뷰가 모델을 받아 그려졌다. 실험의 가짜 뷰 리졸버는 어떤 이름이든 받아 주어서 200이 나왔지만, 실제 템플릿 엔진을 쓰는 애플리케이션이라면 <code>forgot</code>이라는 템플릿을 찾으려다 뷰 단계에서 실패한다. 증상은 "템플릿을 찾을 수 없다"인데 원인은 애노테이션 하나가 빠진 것이다. API가 JSON 대신 템플릿 오류를 낸다면 이 경로를 먼저 의심하자.</p>
+<p><code>/count</code>는 마지막 그물도 받지 않는 경우다. <code>Integer</code>는 단순 타입이어서 15번의 조건에서 빠진다. 손든 핸들러가 없으면 목록을 감싼 컴포지트가 "Unknown return value type" 예외를 던진다. 레퍼런스의 반환값 표 마지막 줄이 이 두 경우를 한 문장으로 적고 있다. 다른 줄에 해당하지 않는 반환값은 모델 속성으로 취급하되, 단순 타입이면 처리되지 않은 채 남는다.</p>
+<h4>ModelAndView가 null이 되는 과정</h4>
+<p>실험 출력의 <code>[postHandle] mv=null</code>이 어디서 정해지는지도 이제 소스로 말할 수 있다. <code>RequestResponseBodyMethodProcessor.handleReturnValue</code>와 <code>HttpEntityMethodProcessor.handleReturnValue</code>는 둘 다 첫 줄에서 <code>mavContainer.setRequestHandled(true)</code>를 부르고, 그다음에 <code>writeWithMessageConverters</code>로 본문을 쓴다. 메서드 호출이 끝난 뒤 어댑터의 <code>getModelAndView</code>는 이 표시가 켜져 있으면 <code>null</code>을 돌려준다. <code>DispatcherServlet</code>은 <code>ModelAndView</code>가 <code>null</code>이면 뷰를 찾지도 그리지도 않는다. 05회의 흐름에서 "뷰 리졸버 호출"과 "뷰 렌더링" 두 단계가 통째로 빠지는 것이다. HTTP API 응답이 뷰 템플릿 응답과 갈리는 지점은 <code>DispatcherServlet</code>의 분기가 아니라 어댑터가 돌려준 값 하나다.</p>
+
+<h3>요청 매핑 핸들러 어댑터 구조 ③: 메시지 컨버터가 불리는 자리</h3>
+<p>남은 질문은 메시지 컨버터가 이 구조의 어디에 붙어 있느냐다. <code>DispatcherServlet</code>이 부르는가, 어댑터가 부르는가. 직접 확인하려고 CSV 컨버터의 <code>readInternal</code>과 <code>writeInternal</code> 안에서 호출 스택을 찍었다. <code>POST /parcels</code>에 CSV 본문을 보내고 CSV 응답을 요구한 요청 하나의 출력이다. 스택은 아래에서 위로 읽는다.</p>
+<pre data-label="실행 결과(호출 스택, 클래스.메서드만 표시)"><code class="language-text">POST /parcels  Content-Type: text/csv  Accept: text/csv
+    [handler] HandlerMethod create()
+    -- readInternal 호출 스택
+       ParcelCsvConverter.readInternal
+       AbstractHttpMessageConverter.read
+       AbstractMessageConverterMethodArgumentResolver.readWithMessageConverters
+       RequestResponseBodyMethodProcessor.readWithMessageConverters
+       RequestResponseBodyMethodProcessor.resolveArgument
+       HandlerMethodArgumentResolverComposite.resolveArgument
+       InvocableHandlerMethod.getMethodArgumentValues
+       InvocableHandlerMethod.invokeForRequest
+       ServletInvocableHandlerMethod.invokeAndHandle
+       RequestMappingHandlerAdapter.invokeHandlerMethod
+       RequestMappingHandlerAdapter.handleInternal
+       AbstractHandlerMethodAdapter.handle
+       DispatcherServlet.doDispatch
+    [read ] ParcelCsvConverter -> Parcel
+    [write] ParcelCsvConverter as text/csv
+    -- writeInternal 호출 스택
+       ParcelCsvConverter.writeInternal
+       AbstractHttpMessageConverter.write
+       AbstractMessageConverterMethodProcessor.writeWithMessageConverters
+       HttpEntityMethodProcessor.handleReturnValue
+       ResponseEntityReturnValueHandler.handleReturnValue
+       HandlerMethodReturnValueHandlerComposite.handleReturnValue
+       ServletInvocableHandlerMethod.invokeAndHandle
+       RequestMappingHandlerAdapter.invokeHandlerMethod
+       RequestMappingHandlerAdapter.handleInternal
+       AbstractHandlerMethodAdapter.handle
+       DispatcherServlet.doDispatch
+    [postHandle] mv=null, committed=true
+    status=201
+    Location: /parcels/P-300
+    Content-Type: text/csv;charset=UTF-8
+    body(9 bytes): P-300,12</code></pre>
+<p>두 스택의 아래쪽 다섯 줄, <code>doDispatch</code>부터 <code>invokeAndHandle</code>까지는 같다. 거기서 갈라진다. 읽기 스택은 <code>getMethodArgumentValues</code>를 거쳐 인자 리졸버 컴포지트로 들어가고, 그 안에서 <code>RequestResponseBodyMethodProcessor.resolveArgument</code>가 컨버터의 <code>read</code>를 부른다. 쓰기 스택은 반환값 핸들러 컴포지트로 들어가고, 그 안에서 <code>HttpEntityMethodProcessor.handleReturnValue</code>가 컨버터의 <code>write</code>를 부른다. 그 사이, 두 스택 어디에도 찍히지 않은 시점에 컨트롤러의 <code>create</code> 메서드가 실행되었다.</p>
+<p>메시지 컨버터를 부르는 것은 <code>DispatcherServlet</code>도 어댑터 자신도 아니다. 인자 리졸버 하나와 반환값 핸들러 하나가 부른다. 정확히는 두 클래스가 양쪽 일을 다 한다. <code>RequestResponseBodyMethodProcessor</code>는 인자 리졸버로서 <code>@RequestBody</code>를, 반환값 핸들러로서 <code>@ResponseBody</code>를 맡는다. <code>HttpEntityMethodProcessor</code>는 인자 리졸버로서 <code>HttpEntity</code>·<code>RequestEntity</code> 파라미터를, 반환값 핸들러로서 <code>HttpEntity</code>·<code>ResponseEntity</code> 반환을 맡는다. 이름이 Resolver나 Handler가 아니라 Processor로 끝나는 클래스들은 이렇게 두 인터페이스를 함께 구현한 것들이다. 두 클래스 모두 <code>AbstractMessageConverterMethodProcessor</code>를 상속하고, 어댑터가 이들을 만들 때 자신의 컨버터 목록을 넘겨준다.</p>
+<pre class="diagram">DispatcherServlet.doDispatch
+   │  handle(request, response, handler)
+   ▼
+RequestMappingHandlerAdapter ─────────────────────────────────────────────────────────────┐
+│                                                                                         │
+│  ① 인자 리졸버 목록                    ② 컨트롤러 메서드            ③ 반환값 핸들러 목록     │
+│  ┌───────────────────────────┐      ┌─────────────┐      ┌───────────────────────────┐  │
+│  │ @RequestParam 리졸버        │      │             │      │ ModelAndView 핸들러        │  │
+│  │ @ModelAttribute 프로세서    │ 인자  │  method     │ 반환값 │ HttpEntity 프로세서  ──┐   │  │
+│  │ @RequestBody 프로세서 ──┐   │ ───▶ │  .invoke()  │ ───▶ │ @ResponseBody 프로세서 ┤   │  │
+│  │ HttpEntity 프로세서  ───┤   │      │             │      │ 뷰 이름 핸들러          │   │  │
+│  │ ... 사용자 정의 ...     │   │      └─────────────┘      │ ... 사용자 정의 ...     │   │  │
+│  │ 마지막 그물             │   │                           │ 마지막 그물             │   │  │
+│  └────────────────────────┼───┘                           └────────────────────────┼───┘  │
+│                           │ read                                             write │      │
+│                           ▼                                                        ▼      │
+│                  ┌──────────────────────── HttpMessageConverter 목록 ───────────────────┐ │
+│                  │ byte[] · String · Resource · Form · JSON · ... 사용자 정의 ...        │ │
+│                  └─────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+   │  ModelAndView (본문을 직접 썼으면 null)
+   ▼
+DispatcherServlet: null 이 아니면 뷰 리졸버 → View.render</pre>
+<p>이 그림에서 읽어야 할 것이 하나 더 있다. 요청 데이터를 읽는 모든 길이 메시지 컨버터를 지나는 것은 아니다. <code>@RequestParam</code>과 <code>@ModelAttribute</code>를 맡는 리졸버는 컨버터 목록에 닿지 않는다. 이들은 서블릿 컨테이너가 이미 파싱해 둔 요청 파라미터(쿼리 스트링과 폼 본문)를 읽고, 문자열을 목적 타입으로 바꾸는 일은 바인더와 타입 변환 체계에 맡긴다. 메시지 컨버터는 "본문 전체를 한 덩어리로 객체와 맞바꾸는" 두 프로세서만 쓴다. JSON 요청을 <code>@ModelAttribute</code>로 받으려 하면 필드가 비는 까닭, 폼 요청을 <code>@RequestBody</code> 객체로 받으려 하면 415가 나는 까닭이 여기서 나온다. 둘은 목록에서 서로 다른 리졸버가 맡고, 그 리졸버들은 서로 다른 곳에서 데이터를 읽는다.</p>
+<div class="table-wrap"><table><thead><tr><th>파라미터 선언</th><th>맡는 리졸버</th><th>데이터의 출처</th><th>메시지 컨버터</th></tr></thead><tbody>
+<tr><td><code>@RequestParam</code>, 애노테이션 없는 단순 타입</td><td><code>RequestParamMethodArgumentResolver</code></td><td>요청 파라미터(쿼리 스트링, 폼 본문)</td><td>쓰지 않음</td></tr>
+<tr><td><code>@ModelAttribute</code>, 애노테이션 없는 객체</td><td><code>ServletModelAttributeMethodProcessor</code></td><td>요청 파라미터 여러 개</td><td>쓰지 않음</td></tr>
+<tr><td><code>@RequestBody</code></td><td><code>RequestResponseBodyMethodProcessor</code></td><td>본문 바이트 전체</td><td>쓴다</td></tr>
+<tr><td><code>HttpEntity</code>, <code>RequestEntity</code></td><td><code>HttpEntityMethodProcessor</code></td><td>헤더 + 본문 바이트 전체</td><td>쓴다</td></tr>
+</tbody></table></div>
+<x-visual id="spring-mvc1-07-adapter-structure" title="RequestMappingHandlerAdapter 안에서 인자 리졸버, 컨트롤러 메서드, 반환값 핸들러가 차례로 실행되고 두 프로세서가 메시지 컨버터 목록을 함께 쓰는 구조" kind="구조 다이어그램" ratio="16:9">
+<x-hint>어댑터 안이 '인자 준비 → 메서드 호출 → 반환값 처리' 세 칸으로 나뉘고, 메시지 컨버터는 어댑터가 직접 부르는 것이 아니라 인자 리졸버와 반환값 핸들러 중 일부가 부른다는 것을 보여 준다.</x-hint>
+<x-prompt>깔끔한 구조 다이어그램, 흰 배경, 평면 색. 화면 대부분을 차지하는 큰 둥근 사각형 테두리를 그리고 왼쪽 위에 라벨 "RequestMappingHandlerAdapter". 큰 상자 안 위쪽에 세 개의 칸을 가로로 배치한다. 왼쪽 칸(파란 계열): 제목 "인자 리졸버 목록", 안에 세로로 쌓인 작은 막대 다섯 개, 그중 셋째 막대만 주황색으로 칠하고 라벨 "@RequestBody". 가운데 칸(진한 남색): 제목 "컨트롤러 메서드". 오른쪽 칸(초록 계열): 제목 "반환값 핸들러 목록", 안에 세로로 쌓인 작은 막대 다섯 개, 그중 셋째 막대만 주황색으로 칠하고 라벨 "@ResponseBody". 왼쪽 칸에서 가운데 칸으로 화살표와 라벨 "인자", 가운데 칸에서 오른쪽 칸으로 화살표와 라벨 "반환값". 큰 상자 안 아래쪽에 가로로 긴 주황색 상자 "HttpMessageConverter 목록". 왼쪽 칸의 주황 막대에서 아래 주황 상자로 내려가는 화살표와 라벨 "read", 오른쪽 칸의 주황 막대에서 아래 주황 상자로 내려가는 화살표와 라벨 "write". 큰 상자 바깥 왼쪽에 작은 상자 "DispatcherServlet"이 있고 큰 상자로 들어가는 화살표, 큰 상자 바깥 오른쪽으로 나가는 화살표에 라벨 "ModelAndView 또는 null". 장식 없이 단순한 선.</x-prompt>
+<x-caption>메시지 컨버터는 어댑터의 세 칸 중 첫째와 셋째 칸에 있는 특정 프로세서가 부른다. 컨트롤러 메서드는 그 사이에서 리플렉션으로 한 번 호출된다.</x-caption>
+</x-visual>
+<h4>공유되는 객체와 요청마다 만들어지는 객체</h4>
+<p>이 구조를 메모리 관점에서 다시 보자. 어댑터는 스프링 컨테이너의 싱글톤 빈이고, 어댑터가 가진 리졸버 목록, 반환값 핸들러 목록, 컨버터 목록도 애플리케이션이 뜰 때 한 번 만들어진다. 이 권의 앞 회차에서 본 대로 서블릿 컨테이너는 요청마다 스레드 풀의 스레드 하나를 배정하므로, 동시에 들어온 요청들은 서로 다른 스레드에서 <b>같은</b> 리졸버 객체와 <b>같은</b> 컨버터 객체의 메서드를 실행한다. 요청마다 새로 만들어지는 것은 <code>ServletWebRequest</code>, <code>ServletInvocableHandlerMethod</code>, <code>ModelAndViewContainer</code>, 그리고 컨버터에게 넘기는 입력·출력 메시지 객체다. 이것들은 한 스레드의 호출 스택에서만 참조되므로 다른 요청과 섞이지 않는다.</p>
+<p>직접 만드는 컨버터와 리졸버도 같은 규칙 아래 놓인다. 앞의 <code>ParcelCsvConverter</code>와 <code>CallerResolver</code>에는 요청에 따라 바뀌는 필드가 없다. 읽은 본문이나 만든 객체는 모두 지역 변수에 있다가 반환된다. 만약 컨버터가 "방금 읽은 본문"을 필드에 저장해 두고 다른 메서드에서 꺼내 쓴다면, 두 요청이 겹치는 순간 한 요청의 데이터가 다른 요청의 응답에 실릴 수 있다. 실험에서 호출 횟수를 세는 데 <code>AtomicInteger</code>를 쓴 것도 같은 이유다. 싱글톤 서블릿에 상태를 두면 안 된다는 원칙이 스프링 MVC의 확장 부품에도 그대로 적용된다.</p>
+
+<h3>확장 지점 정리: 어디에 무엇을 끼우는가</h3>
+<p>지금까지 본 세 목록은 모두 열려 있다. 스프링 MVC는 <code>WebMvcConfigurer</code> 인터페이스의 콜백으로 각 목록에 손을 댈 자리를 준다. 어느 콜백이 목록의 어느 위치에 영향을 주는지가 중요하다.</p>
+<div class="table-wrap"><table><thead><tr><th>콜백(6.2.x 기준)</th><th>대상 목록</th><th>들어가는 위치</th><th>할 수 있는 것과 없는 것</th></tr></thead><tbody>
+<tr><td><code>addArgumentResolvers</code></td><td>인자 리졸버</td><td>내장 리졸버 뒤, 마지막 그물 앞</td><td>새 타입·새 애노테이션 지원은 가능. 내장 리졸버가 맡는 파라미터는 가로챌 수 없다</td></tr>
+<tr><td><code>addReturnValueHandlers</code></td><td>반환값 핸들러</td><td>내장 핸들러 뒤, 마지막 그물 앞</td><td>새 반환 타입 지원은 가능. <code>String</code>이나 <code>@ResponseBody</code> 반환은 가로챌 수 없다</td></tr>
+<tr><td><code>extendMessageConverters</code></td><td>메시지 컨버터</td><td>기본 목록이 만들어진 뒤 그 목록을 넘겨받는다</td><td>추가, 삭제, 순서 변경 모두 가능</td></tr>
+<tr><td><code>configureMessageConverters</code></td><td>메시지 컨버터</td><td>빈 목록을 넘겨받는다</td><td>하나라도 넣으면 기본 컨버터가 등록되지 않는다. 목록을 통째로 정할 때 쓴다</td></tr>
+</tbody></table></div>
+<p>실험에서 CSV 컨버터를 맨 뒤에, JSON 컨버터를 맨 앞에 넣는 데 쓴 것이 <code>extendMessageConverters</code>다. 6.2 레퍼런스는 <code>configureMessageConverters</code>가 기본값을 대체하고 <code>extendMessageConverters</code>가 구성된 목록을 마지막에 손보는 용도라고 구분한다. <code>configureMessageConverters</code>에 컨버터 하나만 넣고 끝내면 문자열 컨버터도 JSON 컨버터도 사라진다는 점에 주의하자. Spring Framework 7.0에서는 목록을 받는 이 두 메서드가 제거 예정으로 표시되었고, <code>HttpMessageConverters.ServerBuilder</code>를 받는 새 <code>configureMessageConverters</code>가 그 자리를 대신한다. 목록을 직접 만지는 대신 "JSON 컨버터를 이것으로 바꾼다", "사용자 정의 컨버터를 추가한다"를 빌더에 말하는 방식이다.</p>
+<p>스프링 부트에서는 한 단계가 더 있다. 부트 3.5 레퍼런스에 따르면 컨텍스트에 있는 <code>HttpMessageConverter</code> 빈은 모두 컨버터 목록에 추가되고, 부트가 제공하는 <code>HttpMessageConverters</code> 클래스의 빈을 선언해 컨버터를 추가하거나 바꿀 수도 있다. 부트 4.x 레퍼런스는 같은 일을 <code>ServerHttpMessageConvertersCustomizer</code> 빈으로 하도록 안내한다. 어떤 방법을 쓰든 결과를 확인하는 방법은 하나다. 이 회차의 실험처럼 <code>RequestMappingHandlerAdapter</code> 빈을 꺼내 <code>getMessageConverters()</code>를 출력해 보는 것이다. 순서가 결과를 정하는 구조에서는 "등록했다"가 아니라 "몇 번째에 있다"를 알아야 한다.</p>
+<p>본문을 읽기 직전이나 쓰기 직전에 끼어드는 자리도 있다. 실험에서 컨버터 이름을 찍는 데 쓴 <code>RequestBodyAdvice</code>와 <code>ResponseBodyAdvice</code>다. <code>@ControllerAdvice</code> 빈으로 등록하면 <code>readWithMessageConverters</code>와 <code>writeWithMessageConverters</code>가 컨버터를 고른 뒤 이 콜백을 부른다. 선택된 컨버터의 클래스와 미디어 타입이 인자로 넘어오고, 본문 객체를 다른 객체로 바꿔 돌려줄 수도 있다. 모든 API 응답을 공통 봉투 객체로 감싸는 식의 일을 컨트롤러를 고치지 않고 할 수 있는 자리다. 다만 이 콜백은 메시지 컨버터를 쓰는 길에서만 불린다. 뷰 템플릿 응답이나 정적 리소스 응답에는 적용되지 않는다.</p>
+
+<h3>흔한 오해와 함정</h3>
+<h4>"@ResponseBody를 붙이면 JSON이 나간다"</h4>
+<p><code>@ResponseBody</code>가 정하는 것은 "반환값을 메시지 컨버터로 본문에 쓴다"까지다. 어떤 형식이 될지는 반환 타입, <code>Accept</code> 헤더, 컨버터 목록의 순서가 정한다. <code>String</code>을 반환하면 기본 목록에서는 문자열 컨버터가 받아 <code>text/plain</code>으로 나가고, 클라이언트가 JSON을 요구해도 따옴표 없는 문자열이 나간다. 객체를 반환할 때 JSON이 되는 것은 그 타입을 받겠다고 손드는 컨버터가 기본 목록에서는 JSON 컨버터뿐이기 때문이다. XML 컨버터가 클래스패스에 있거나 사용자 정의 컨버터를 추가했다면 같은 메서드가 다른 형식으로 응답할 수 있다.</p>
+<h4>"컨버터는 가장 알맞은 것이 선택된다"</h4>
+<p>점수를 매겨 최선을 고르는 단계는 없다. 미디어 타입을 하나로 좁힐 때는 구체성과 가중치로 정렬하지만, 컨버터는 목록에서 조건이 맞는 첫 번째가 선택된다. 인자 리졸버와 반환값 핸들러도 같다. 그래서 세 목록 모두에서 조건이 넓은 구현체를 앞에 넣으면 뒤의 구현체들이 조용히 가려진다. 무엇을 추가했는데 동작하지 않는다면, 그것이 호출되는지보다 그 앞에서 누가 먼저 손을 들었는지를 확인하는 것이 빠르다.</p>
+<h4>"415는 본문이 잘못된 것이고 406은 URL이 잘못된 것이다"</h4>
+<p>둘 다 본문의 내용이나 URL과는 관계가 없다. 415는 요청의 <code>Content-Type</code> 선언과 서버가 읽을 수 있는 형식이 맞지 않는 것이고, 406은 요청의 <code>Accept</code> 선언과 서버가 만들 수 있는 형식이 맞지 않는 것이다. 내용이 깨진 것은 400이다. 멀쩡한 JSON을 보내고 415를 받았다면 헤더를 본다. 헤더가 없으면 <code>application/octet-stream</code>으로 간주된다는 것도 함께 기억하자.</p>
+<h4>"@RequestBody는 폼 데이터도 객체로 받아 준다"</h4>
+<p>기본 컨버터 목록의 폼 컨버터는 <code>MultiValueMap</code> 타입만 맡는다. 사용자 정의 객체를 <code>@RequestBody</code>로 선언하고 <code>application/x-www-form-urlencoded</code> 본문을 보내면, 그 조합을 읽겠다는 컨버터가 없어 415가 난다. 폼 데이터를 객체로 받는 길은 <code>@ModelAttribute</code>이고, 그 길은 메시지 컨버터가 아니라 요청 파라미터와 바인더를 쓴다. 두 애노테이션은 비슷해 보이지만 목록의 다른 칸에 있는 다른 부품이다.</p>
+<h4>"한글이 깨지면 브라우저 설정 문제다"</h4>
+<p>응답 바이트를 보면 구분된다. 본문에 <code>3f</code>가 들어 있다면 서버가 한글을 표현할 수 없는 문자 집합으로 인코딩하면서 이미 정보를 잃은 것이다. 받는 쪽에서 고칠 수 없다. 바이트는 UTF-8로 맞게 나갔는데 화면이 깨진다면 <code>Content-Type</code>의 <code>charset</code>이 빠졌거나 틀려서 받는 쪽이 다른 문자 집합으로 해석한 것이다. 앞의 경우는 컨버터의 기본 문자 집합이나 <code>produces</code>를 고치고, 뒤의 경우는 헤더를 고친다.</p>
+<h4>"사용자 정의 리졸버를 등록하면 내장 동작을 바꿀 수 있다"</h4>
+<p><code>addArgumentResolvers</code>로 넣은 리졸버는 내장 묶음 뒤에 들어간다. <code>@RequestParam</code>이 붙은 파라미터의 처리 방식을 바꾸려고 리졸버를 만들어 등록해도 질문조차 받지 못한다. 반대 방향의 함정도 있다. 등록을 빠뜨리면 오류 없이 마지막 그물로 떨어져, 서버가 채워야 할 객체가 요청 파라미터로 채워진다. 리졸버가 맡는 타입에는 전용 애노테이션을 만들어 붙이고 <code>supportsParameter</code>에서 애노테이션과 타입을 함께 검사해 두면, 적어도 코드를 읽는 사람이 그 파라미터가 특별한 경로로 채워진다는 것을 알 수 있다.</p>
+
+<h3>다른 주제와의 연결</h3>
+<p><b>HTTP 권과의 연결.</b> 이 회차의 실험은 「HTTP 웹 기본 지식」 권에서 규칙으로 배운 것들이 서버 코드의 어느 줄에서 실행되는지를 보여 준다. 조건부 요청과 304는 <code>ResourceHttpRequestHandler</code>의 수정 시각 비교였다. 콘텐츠 협상은 <code>writeWithMessageConverters</code>가 <code>Accept</code> 목록과 컨버터가 만들 수 있는 목록의 교집합을 구하는 일이었다. 표현 헤더 <code>Content-Type</code>은 읽을 때는 컨버터를 고르는 열쇠였고 쓸 때는 컨버터가 채우는 값이었다. <code>Content-Length</code>와 청크 전송은 컨버터가 길이를 미리 아는지, 그리고 응답이 언제 커밋되는지에 달려 있었다.</p>
+<p><b>다음 회차.</b> 08회에서는 세 갈래 중 뷰 템플릿 길로 실제 화면을 만든다. 컨트롤러가 문자열을 반환하고 <code>ViewNameMethodReturnValueHandler</code>가 그것을 뷰 이름으로 적는 과정은 그대로이고, 그 위에 템플릿 문법과 폼 처리, 리다이렉트가 올라간다. 13번 핸들러의 소스에는 뷰 이름이 리다이렉트를 뜻하는지 검사하는 줄이 있는데, 그 의미는 다음 회차의 PRG 패턴에서 드러난다.</p>
+<p><b>뒤의 권.</b> 이 회차에서 상태 코드가 된 예외들은 모두 <code>DispatcherServlet</code>의 예외 리졸버가 바꾼 것이다. API의 오류 응답 본문을 원하는 형식으로 만드는 방법, 인자 리졸버를 로그인 사용자 주입 같은 일에 쓰는 방법, <code>@RequestBody</code> 객체를 검증하는 방법, 그리고 요청 파라미터의 문자열을 객체로 바꾸는 타입 컨버터는 「스프링 MVC 2편」 권의 주제다. 이름이 비슷한 타입 컨버터와 메시지 컨버터를 미리 구분해 두자. 타입 컨버터는 문자열 하나를 값 하나로 바꾸며 <code>@RequestParam</code>·<code>@ModelAttribute</code> 길에서 쓰이고, 메시지 컨버터는 본문 전체를 객체와 맞바꾸며 <code>@RequestBody</code>·<code>@ResponseBody</code> 길에서 쓰인다.</p>
+<p><b>서버 밖에서.</b> <code>HttpMessageConverter</code>는 서블릿 API를 모르고 헤더와 스트림만 안다고 했다. 그래서 같은 컨버터가 HTTP 클라이언트에서도 쓰인다. 다른 서버를 호출하는 <code>RestClient</code>나 <code>RestTemplate</code>은 보낼 객체를 컨버터의 <code>write</code>로 요청 본문에 쓰고, 받은 응답 본문을 컨버터의 <code>read</code>로 객체로 바꾼다. 방향만 반대이고 "자바 타입과 미디어 타입 두 조건으로 목록에서 첫 번째를 고른다"는 규칙은 같다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p><code>RequestMappingHandlerAdapter</code>는 목록 세 개를 가진 객체다. 인자 리졸버 목록이 파라미터를 채우고, 리플렉션이 메서드를 호출하고, 반환값 핸들러 목록이 결과를 뷰 이름이나 응답 본문으로 바꾼다. 메시지 컨버터 목록은 그중 본문을 통째로 다루는 두 프로세서가 쓴다. 세 목록 모두 "앞에서부터 물어 처음 손든 것이 맡는다"는 한 가지 규칙으로 움직이고, 애노테이션의 생략 규칙, <code>@ResponseBody</code>의 효과, 406과 415의 원인은 모두 이 규칙과 목록의 순서에서 나온다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>응답 본문의 세 갈래</dt><dd>정적 리소스는 <code>ResourceHttpRequestHandler</code>가 파일 바이트를 그대로, 뷰 템플릿은 <code>ViewResolver</code>가 찾은 <code>View</code>가 모델로 만든 HTML을, HTTP API는 <code>HttpMessageConverter</code>가 반환값을 바이트로 바꿔 쓴다. 정적 리소스는 핸들러 조회 단계에서, 뷰와 메시지 바디는 어댑터의 반환값 처리 단계에서 갈린다.</dd>
+<dt>정적 리소스 핸들러의 자리</dt><dd><code>/**</code> 패턴이어도 컨트롤러를 가리지 않는다. 리소스 핸들러 매핑의 순서 값이 <code>Ordered.LOWEST_PRECEDENCE - 1</code>로 거의 맨 끝이어서, 순서 0인 <code>RequestMappingHandlerMapping</code>이 맡지 않은 요청만 받는다. 조건부 요청(304), 경로 검사, 없는 파일의 404도 이 핸들러가 처리한다.</dd>
+<dt>String 반환의 두 뜻</dt><dd>반환값 핸들러 목록에서 <code>@ResponseBody</code>를 보는 <code>RequestResponseBodyMethodProcessor</code>가 <code>ViewNameMethodReturnValueHandler</code>보다 앞에 있다. 그래서 애노테이션이 있으면 본문, 없으면 뷰 이름이 된다. <code>@RestController</code>는 <code>@Controller</code>와 <code>@ResponseBody</code>를 묶은 메타 애노테이션이다.</dd>
+<dt>HttpMessageConverter 계약</dt><dd><code>canRead</code>·<code>canWrite</code>가 자바 타입과 미디어 타입 두 조건을 함께 보고, <code>read</code>·<code>write</code>는 헤더와 바이트 스트림만 다룬다. 기본 목록은 타입 조건이 좁은 컨버터(<code>byte[]</code>, <code>String</code>)가 앞에, 넓은 JSON 컨버터가 뒤에 있다.</dd>
+<dt>쓰기 컨버터 선택</dt><dd>이미 정해진 <code>Content-Type</code>이 없으면 <code>Accept</code>와 "이 타입으로 만들 수 있는 미디어 타입"의 교집합을 구하고, 구체적인 첫 타입을 고른 뒤, 그 타입으로 <code>canWrite</code>가 참인 첫 컨버터를 쓴다. 교집합이 비면 406이며 이때 컨트롤러 메서드는 이미 실행된 뒤다.</dd>
+<dt>읽기 컨버터 선택과 400·415</dt><dd>요청의 <code>Content-Type</code>(없으면 <code>application/octet-stream</code>)과 파라미터 타입으로 <code>canRead</code>가 참인 첫 컨버터를 고른다. 없으면 415, 컨버터가 해석에 실패하거나 필수 본문이 비면 400이다. 매핑의 <code>consumes</code>·<code>produces</code> 조건이 어긋나면 같은 415·406이 핸들러 조회 단계에서 먼저 난다.</dd>
+<dt>문자 집합과 본문 길이</dt><dd><code>StringHttpMessageConverter</code>의 기본 문자 집합은 ISO-8859-1이어서 <code>charset</code> 없이 한글을 쓰면 서버에서 <code>?</code>(0x3f)로 손실된다. 스프링 부트는 이 컨버터를 UTF-8로 만든다. 길이를 미리 아는 컨버터는 <code>Content-Length</code>를 넣고, 모르는 경우는 서블릿 컨테이너가 버퍼 크기로 길이를 정하거나 청크 전송을 쓴다.</dd>
+<dt>RequestMappingHandlerAdapter의 세 목록</dt><dd>인자 리졸버 목록이 파라미터 값을 만들고, 리플렉션으로 메서드를 호출하고, 반환값 핸들러 목록이 결과를 <code>ModelAndViewContainer</code>에 적거나 응답에 직접 쓴다. 메시지 컨버터는 <code>RequestResponseBodyMethodProcessor</code>와 <code>HttpEntityMethodProcessor</code>가 읽기·쓰기 양쪽에서 부른다. 본문을 직접 썼다는 표시가 켜지면 어댑터는 <code>ModelAndView</code> 대신 <code>null</code>을 돌려준다.</dd>
+<dt>마지막 그물과 리졸버 캐시</dt><dd>애노테이션 없는 파라미터는 목록 끝의 <code>RequestParamMethodArgumentResolver(true)</code>와 <code>ServletModelAttributeMethodProcessor(true)</code>가 받는다. 사용자 정의 리졸버는 내장 묶음 뒤, 마지막 그물 앞에 들어가며, 파라미터마다 한 번 찾은 리졸버는 캐시되어 요청마다 다시 묻지 않는다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 다시 판단하면, 응답 형식이 정해진 API는 매핑에 <code>produces</code>를 적어 두는 쪽이 안전하다. 협상이 반환값 처리 단계에서 실패하면 컨트롤러 메서드는 이미 실행된 뒤라서, 저장이나 외부 호출 같은 부수 효과는 일어났는데 클라이언트는 406을 받는다. 클라이언트가 같은 요청을 다시 보내면 부수 효과가 한 번 더 일어난다. <code>produces</code>가 있으면 같은 요청이 핸들러 조회 단계에서 걸러져 메서드에 닿지 않는다. 반대로 같은 자원을 여러 형식으로 내려 줘야 하는 API라면 <code>produces</code>를 비워 두고 컨버터 목록의 협상에 맡기되, 기본 형식이 무엇이 될지는 목록의 순서가 정한다는 점을 설계에 넣어야 한다.</p>
+<p>메시지 컨버터를 손댈 때 판단을 가르는 것은 "추가했는가"가 아니라 "몇 번째에 있는가"다. 사용자 정의 컨버터를 목록 맨 앞에 넣으면 <code>Accept</code>를 보내지 않거나 <code>*/*</code>를 보내는 클라이언트의 기본 응답 형식이 바뀐다. 기존 클라이언트가 JSON을 기대하고 있었다면 배포 직후 파싱 오류가 쏟아진다. <code>configureMessageConverters</code>에 하나만 넣으면 기본 컨버터가 모두 빠진다는 것도 같은 종류의 사고다. 변경 뒤에는 <code>RequestMappingHandlerAdapter</code>의 <code>getMessageConverters()</code>를 출력해 순서를 확인하는 테스트를 두자. Spring Framework 7로 올라가면 JSON 컨버터의 클래스가 Jackson 3용으로 바뀌므로, 클래스 이름으로 컨버터를 찾아 위치를 옮기는 코드는 다시 점검해야 한다.</p>
+<p>장애를 진단할 때는 상태 코드와 함께 "컨트롤러 메서드가 실행되었는가"를 먼저 본다. 415·400이면 메서드는 실행되지 않았고 원인은 요청 헤더나 본문이다. 406이면 매핑 단계인지 반환값 단계인지를 응답에 실린 지원 타입 목록으로 구분한다. 한글이 깨졌다는 신고에는 응답 바이트를 직접 확인한다. <code>3f</code>가 보이면 서버가 이미 정보를 잃은 것이니 서버의 문자 집합을 고치고, UTF-8 바이트가 맞게 나갔다면 <code>Content-Type</code>의 <code>charset</code>을 고친다.</p>
+<p>인자 리졸버를 직접 만들 때는 등록이 빠졌을 때의 동작까지 생각해야 한다. 리졸버가 맡을 타입이 애노테이션 없는 일반 객체라면, 등록이 빠진 환경에서는 오류 없이 마지막 그물이 요청 파라미터로 그 객체를 채운다. 서버가 인증 정보나 연결 정보에서 채워야 하는 값을 클라이언트가 쿼리 스트링으로 정할 수 있게 되는 셈이다. 전용 애노테이션을 붙여 의도를 드러내고, 리졸버가 실제로 그 파라미터를 맡는지 확인하는 테스트를 함께 두는 것이 이 위험을 줄이는 방법이다.</p>
+</x-review>
+
+<x-practice>
+<li><code>@Controller</code> 클래스(부트 없이 <code>@EnableWebMvc</code>, JSON 라이브러리는 Jackson뿐)에 다음 네 메서드가 있다. 요청에는 <code>Accept</code> 헤더가 없다. 각 메서드의 반환값을 맡는 반환값 핸들러, 어댑터가 돌려주는 <code>ModelAndView</code>가 <code>null</code>인지, 응답이 어떻게 되는지 예측하라. (a) <code>@GetMapping("/a") String a() { return "parcel/detail"; }</code> (b) <code>@GetMapping("/b") @ResponseBody String b() { return "parcel/detail"; }</code> (c) <code>@GetMapping("/c") Parcel c() { return new Parcel("P-1", 1); }</code> (d) <code>@GetMapping("/d") long d() { return 1L; }</code></li>
+<li>본문의 <code>ParcelCsvConverter</code>를 <code>extendMessageConverters</code>에서 실수로 <code>converters.add(0, ...)</code>로 목록 맨 앞에 넣었다. <code>@ResponseBody Parcel</code>을 반환하는 <code>GET /parcel</code>에 (a) <code>Accept</code> 없이, (b) <code>Accept: */*</code>로, (c) <code>Accept: application/json</code>으로 요청하면 각각 어떤 컨버터가 어떤 <code>Content-Type</code>으로 쓰는가. 또 <code>@RequestBody Parcel</code>을 받는 <code>POST /parcels</code>에 <code>Content-Type: application/x-www-form-urlencoded</code> 본문 <code>code=P-1&weight=2</code>를 보내면 어떻게 되고, 오류 응답의 <code>Accept</code> 헤더에는 무엇이 실리는가.</li>
+<li>두 서버가 같은 문자열 <code>"접수 ok"</code>를 응답했다. 서버 A의 응답은 <code>Content-Type: text/plain;charset=ISO-8859-1</code>, 본문 바이트 <code>3f 3f 20 6f 6b</code>다. 서버 B의 응답은 <code>Content-Type: text/plain</code>, 본문 바이트 <code>ec a0 91 ec 88 98 20 6f 6b</code>인데, B를 받은 클라이언트 프로그램이 본문을 ISO-8859-1로 해석해 화면이 깨졌다. 두 경우의 원인이 어느 단계에서 생겼는지, 각각 무엇을 고쳐야 하는지 설명하라.</li>
+<li>요청 헤더 <code>X-Tenant</code>에서 값을 읽어 <code>record Tenant(String id)</code>를 만드는 인자 리졸버가 있고, 컨트롤러는 <code>@GetMapping("/orders") String orders(Tenant tenant)</code>로 받는다. 어떤 모듈의 설정 클래스에서 이 리졸버 등록이 빠졌다. 그 모듈에서 <code>GET /orders?id=other</code>(헤더 <code>X-Tenant: mine</code>)를 보내면 <code>tenant.id()</code>는 무엇이 되는가. 왜 오류가 나지 않는지 인자 리졸버 목록으로 설명하고, 이런 사고를 줄일 방법을 두 가지 들어라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> (a) <code>@ResponseBody</code>가 없으므로 12번 <code>RequestResponseBodyMethodProcessor</code>는 지나가고 13번 <code>ViewNameMethodReturnValueHandler</code>가 문자열을 뷰 이름으로 <code>ModelAndViewContainer</code>에 적는다. <code>ModelAndView</code>는 뷰 이름 <code>parcel/detail</code>을 가진 객체이고, <code>DispatcherServlet</code>이 뷰 리졸버로 템플릿을 찾아 렌더링한다. (b) 12번이 먼저 손을 든다. 처리 완료 표시가 켜져 <code>ModelAndView</code>는 <code>null</code>이고, 컨버터 목록에서 <code>StringHttpMessageConverter</code>가 선택되어 <code>parcel/detail</code> 열세 글자가 <code>text/plain;charset=ISO-8859-1</code>로 나간다. 부트를 쓰면 문자 집합이 UTF-8이 된다. (c) <code>Parcel</code>은 1~14번 어느 조건에도 맞지 않아 15번 마지막 그물 <code>ServletModelAttributeMethodProcessor(true)</code>가 받는다. 객체는 <code>parcel</code>이라는 이름의 모델 속성이 되고, 뷰 이름이 없으므로 <code>DispatcherServlet</code>이 요청 경로에서 기본 뷰 이름 <code>c</code>를 만든다. 그 이름의 템플릿이 없으면 뷰 단계에서 실패한다. JSON은 나가지 않는다. (d) 반환값 <code>1L</code>은 <code>Long</code>으로 박싱되어 단순 타입 판정을 받으므로 마지막 그물도 받지 않는다. 손든 핸들러가 없어 컴포지트가 "Unknown return value type" 예외를 던지고 요청은 실패한다.</p>
+<p><b>2번.</b> (a)와 (b)는 CSV 컨버터가 <code>text/csv;charset=UTF-8</code>로 <code>P-100,3</code>을 쓴다. 쓰기 3단계에서 목록을 앞에서부터 돌며 "만들 수 있는 미디어 타입"을 모으므로 <code>text/csv</code>가 <code>application/json</code>보다 앞에 놓인다. <code>Accept</code>가 없거나 <code>*/*</code>이면 모두 호환되고, <code>text/csv</code>와 <code>application/json</code>은 서로보다 구체적이라고 할 수 없어 정렬 뒤에도 순서가 유지되므로 첫 구체 타입 <code>text/csv</code>가 선택된다. 6단계에서도 CSV 컨버터가 먼저 손을 든다. (c)는 교집합에 <code>application/json</code>만 남으므로 CSV 컨버터는 미디어 타입 조건에서 탈락하고 JSON 컨버터가 <code>{"code":"P-100","weight":3}</code>을 쓴다. 이 결과는 실험 환경(7.0.10)에서 직접 확인했다. 폼 본문 요청은 415다. 폼 컨버터는 <code>MultiValueMap</code>만 맡고, CSV·JSON 컨버터는 <code>Parcel</code> 타입은 받지만 미디어 타입 <code>application/x-www-form-urlencoded</code>에서 탈락한다. 오류 응답의 <code>Accept</code> 헤더에는 <code>Parcel</code>을 읽을 수 있는 컨버터들의 지원 타입을 목록 순서대로 모은 <code>text/csv, application/json, application/*+json</code>이 실린다.</p>
+<p><b>3번.</b> 서버 A는 바이트를 만드는 순간에 정보를 잃었다. 문자열 컨버터가 <code>charset</code> 없는 미디어 타입을 받아 기본 문자 집합 ISO-8859-1로 인코딩했고, 이 문자 집합에 없는 "접", "수"가 대체 문자 <code>?</code>(0x3f)가 되었다. 받는 쪽에서 어떤 문자 집합으로 해석해도 복원할 수 없으므로 서버를 고쳐야 한다. <code>produces</code>에 <code>charset=UTF-8</code>을 적거나, 문자열 컨버터를 UTF-8로 만들어 등록한다(부트는 기본으로 그렇게 한다). 서버 B는 바이트가 UTF-8로 올바르게 나갔다. "접"이 <code>ec a0 91</code>, "수"가 <code>ec 88 98</code>이다. 문제는 헤더가 문자 집합을 알리지 않아 받는 쪽이 다른 문자 집합으로 해석한 것이다. <code>Content-Type</code>에 <code>charset=UTF-8</code>이 실리도록 응답 헤더를 고친다.</p>
+<p><b>4번.</b> <code>tenant.id()</code>는 <code>"other"</code>다. <code>Tenant</code>를 맡겠다는 리졸버가 없으므로 질문은 목록 끝까지 내려가고, 단순 타입이 아닌 파라미터를 받는 마지막 그물 <code>ServletModelAttributeMethodProcessor(true)</code>가 손을 든다. 이 프로세서는 <code>Tenant</code>를 <code>@ModelAttribute</code> 객체로 보고 요청 파라미터 <code>id</code>의 값으로 레코드를 만든다. <code>X-Tenant</code> 헤더는 아무도 읽지 않는다. 마지막 그물이 정상적으로 값을 만들었으니 예외가 날 이유가 없다. 본문의 <code>Caller</code> 실험에서 같은 일이 일어났다. 줄이는 방법은 첫째, 리졸버가 맡는 파라미터에 전용 애노테이션(예: <code>@CurrentTenant</code>)을 붙이고 <code>supportsParameter</code>에서 애노테이션과 타입을 함께 검사하는 것이다. 애노테이션만 붙어 있고 리졸버가 없으면 여전히 마지막 그물로 떨어지지만, 코드를 읽는 사람에게 특별한 경로라는 사실이 드러나고 검사하기 쉬워진다. 둘째, 모듈마다 헤더와 파라미터를 다르게 준 요청을 보내 값의 출처를 확인하는 테스트를 두는 것이다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>@RestController</code> 클래스에 <code>@GetMapping("/home") String home() { return "home"; }</code>이 있고, 템플릿 디렉터리에 <code>home.html</code>이 있다. 기본 컨버터 목록에서 <code>Accept</code> 없이 요청하면 응답은 어떻게 되는가?</q>
+<o><code>home.html</code> 템플릿이 렌더링된다</o>
+<o>본문이 따옴표 없는 <code>home</code>이고 <code>Content-Type</code>은 <code>text/plain</code> 계열이다</o>
+<o>본문이 JSON 문자열 <code>"home"</code>이다</o>
+<o>반환값을 처리할 핸들러가 없어 예외가 난다</o>
+<why><code>@RestController</code>는 클래스에 <code>@ResponseBody</code>를 붙인 것과 같다. 반환값 핸들러 목록에서 <code>@ResponseBody</code>를 보는 <code>RequestResponseBodyMethodProcessor</code>가 뷰 이름 핸들러보다 앞에 있으므로 문자열은 뷰 이름이 아니라 본문이 된다. 컨버터 목록에서는 <code>String</code>을 받는 문자열 컨버터가 JSON 컨버터보다 앞에 있어 따옴표 없이 그대로 쓴다. 템플릿을 렌더링하려면 <code>ModelAndView</code>를 반환하거나 <code>@Controller</code>를 써야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>@ResponseBody Parcel</code>을 반환하는 메서드가 반환 직전에 DB에 접수 기록을 저장한다. 매핑에 <code>produces</code>는 없다. 클라이언트가 <code>Accept: text/plain</code>으로 요청했다. 맞는 설명은?</q>
+<o>핸들러 조회 단계에서 406이 나므로 저장은 일어나지 않는다</o>
+<o>메서드가 실행되어 저장까지 끝난 뒤, 반환값 처리 단계에서 406이 난다</o>
+<o>요청 본문 형식이 맞지 않아 415가 난다</o>
+<o>문자열 컨버터가 <code>Parcel</code>의 <code>toString()</code>을 써서 200이 된다</o>
+<why><code>produces</code>가 없으므로 매핑 단계에서는 걸러지지 않는다. 협상은 반환값을 쓰는 <code>writeWithMessageConverters</code>에서 일어나고, <code>Parcel</code>을 쓸 수 있는 컨버터는 JSON 컨버터뿐이라 <code>text/plain</code>과 교집합이 없어 406이 된다. 그 시점에 메서드는 이미 실행되었다. 문자열 컨버터는 <code>String</code> 타입만 맡으므로 <code>Parcel</code>에 손을 들지 않는다. 415는 요청 본문을 읽을 때의 오류다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>문법상 올바른 JSON 본문을 <code>@RequestBody Parcel</code>을 받는 <code>POST</code> 메서드에 보냈는데 "Content-Type 'application/octet-stream' is not supported"와 함께 415를 받았다. 가장 가능성 높은 원인은?</q>
+<o>JSON 본문의 필드 이름이 레코드 컴포넌트와 달라서</o>
+<o>요청에 <code>Content-Type</code> 헤더가 없어서 <code>application/octet-stream</code>으로 간주되었고, 그 미디어 타입으로 <code>Parcel</code>을 읽을 컨버터가 없어서</o>
+<o>요청에 <code>Accept</code> 헤더가 없어서</o>
+<o><code>byte[]</code> 컨버터가 본문을 먼저 읽어 버려서</o>
+<why>읽기 과정은 <code>Content-Type</code>이 없으면 <code>application/octet-stream</code>으로 간주한다. JSON 컨버터는 타입 조건은 맞지만 미디어 타입 조건에서 탈락하고, <code>byte[]</code> 컨버터는 파라미터 타입이 <code>byte[]</code>가 아니어서 손을 들지 않는다. 손든 컨버터가 없으므로 415다. 필드 이름 불일치는 컨버터가 선택된 뒤의 문제이고, <code>Accept</code>는 응답 쪽 협상에 쓰인다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>모든 <code>@RequestParam String</code> 값의 앞뒤 공백을 지우려고 그 파라미터를 맡는 리졸버를 만들어 <code>addArgumentResolvers</code>로 등록했는데 아무 효과가 없다. 이유는?</q>
+<o>사용자 정의 리졸버는 내장 리졸버들 뒤에 들어가므로, 목록 앞쪽의 <code>RequestParamMethodArgumentResolver</code>가 먼저 손을 들어 사용자 정의 리졸버는 질문조차 받지 못한다</o>
+<o>리졸버 캐시 때문에 첫 요청에서만 동작하고 그 뒤로는 무시된다</o>
+<o>사용자 정의 리졸버는 마지막 그물 뒤에 들어가므로 아무 파라미터도 맡을 수 없다</o>
+<o>인자 리졸버는 <code>String</code> 타입을 반환할 수 없다</o>
+<why><code>addArgumentResolvers</code>로 추가한 리졸버는 애노테이션 기반·타입 기반 내장 묶음 뒤, 마지막 그물 앞에 들어간다. <code>@RequestParam</code>이 붙은 파라미터는 목록 첫 번째인 <code>RequestParamMethodArgumentResolver(false)</code>가 맡는다. 캐시는 "누가 맡는가"의 답을 저장할 뿐이고 그 답은 처음부터 내장 리졸버였다. 마지막 그물보다 앞에 있으므로 애노테이션 없는 새 타입은 맡을 수 있다. Javadoc도 내장 동작을 바꾸려면 <code>RequestMappingHandlerAdapter</code>를 직접 설정하라고 안내한다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>@ResponseBody</code> 메서드의 요청에서 뷰 리졸버가 호출되지 않는 직접적인 이유는?</q>
+<o><code>DispatcherServlet</code>이 핸들러 메서드의 <code>@ResponseBody</code> 애노테이션을 검사해 렌더링 단계를 건너뛴다</o>
+<o>메시지 컨버터가 쓰기를 마치면서 응답을 커밋하므로 뷰 리졸버가 실행될 수 없다</o>
+<o>반환값 핸들러가 <code>ModelAndViewContainer</code>에 처리 완료 표시를 남기고, 어댑터가 그 표시를 보고 <code>ModelAndView</code> 대신 <code>null</code>을 돌려준다</o>
+<o><code>@ResponseBody</code> 메서드는 <code>HttpRequestHandlerAdapter</code>가 실행하므로 뷰가 없다</o>
+<why><code>RequestResponseBodyMethodProcessor.handleReturnValue</code>는 첫 줄에서 <code>setRequestHandled(true)</code>를 부르고 본문을 쓴다. 어댑터는 이 표시가 켜져 있으면 <code>null</code>을 반환하고, <code>DispatcherServlet</code>은 <code>null</code>이면 뷰를 찾지도 그리지도 않는다. <code>DispatcherServlet</code>은 애노테이션을 보지 않는다. 커밋은 원인이 아니다. 7.0.10 실험에서는 <code>@ResponseBody</code> 응답이 <code>postHandle</code> 시점에 커밋되지 않았는데도 뷰가 그려지지 않았다. <code>HttpRequestHandlerAdapter</code>는 정적 리소스 핸들러 같은 <code>HttpRequestHandler</code>를 실행한다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>메시지 컨버터(HttpMessageConverter)</dt><dd>HTTP 요청·응답 본문과 자바 객체 사이를 변환하는 전략 인터페이스. 자바 타입과 미디어 타입 두 조건으로 읽기·쓰기 가능 여부를 답하고, 헤더와 바이트 스트림만 다루므로 서버와 HTTP 클라이언트에서 함께 쓰인다.</dd>
+<dt>미디어 타입(media type)</dt><dd><code>text/plain</code>, <code>application/json</code>처럼 본문의 형식을 나타내는 값. <code>Content-Type</code>과 <code>Accept</code> 헤더에 실리며, <code>charset</code> 같은 매개변수와 <code>*/*</code> 같은 와일드카드를 가질 수 있다.</dd>
+<dt>콘텐츠 협상(content negotiation)</dt><dd>같은 자원에 대해 클라이언트가 원하는 표현을 고르는 과정. 스프링 MVC에서는 <code>Accept</code> 목록과 반환 타입으로 만들 수 있는 미디어 타입 목록의 교집합에서 하나를 고르는 일로 구현된다.</dd>
+<dt>인자 리졸버(HandlerMethodArgumentResolver)</dt><dd>컨트롤러 메서드의 파라미터 하나에 넣을 값을 만드는 전략 인터페이스. <code>supportsParameter</code>로 맡을지 답하고 <code>resolveArgument</code>로 값을 만든다.</dd>
+<dt>반환값 핸들러(HandlerMethodReturnValueHandler)</dt><dd>컨트롤러 메서드의 반환값을 처리하는 전략 인터페이스. 뷰 이름과 모델을 <code>ModelAndViewContainer</code>에 적거나, 응답에 직접 쓰고 처리 완료 표시를 남긴다.</dd>
+<dt>ModelAndViewContainer</dt><dd>핸들러 메서드 하나를 실행하는 동안 모델, 뷰 이름, 처리 완료 표시를 담아 두는 요청 단위 객체. 어댑터는 실행이 끝나면 이것으로 <code>ModelAndView</code>를 만들거나 <code>null</code>을 돌려준다.</dd>
+<dt>정적 리소스(static resource)</dt><dd>서버가 가공하지 않고 파일의 바이트를 그대로 내려 주는 응답 대상. 스프링 MVC에서는 <code>ResourceHttpRequestHandler</code>가 처리한다.</dd>
+<dt>문자 집합(charset)</dt><dd>문자를 바이트로 바꾸는 규칙. <code>Content-Type</code>의 <code>charset</code> 매개변수로 상대에게 알리며, 표현할 수 없는 문자는 인코딩 단계에서 대체 문자로 바뀌어 정보가 사라진다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/http/converter/HttpMessageConverter.html">HttpMessageConverter Javadoc</a> — 인터페이스 정의와 여섯 메서드의 시그니처</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/web/webmvc/mvc-config/message-converters.html">Spring Framework 6.2 Reference: Message Converters</a> — <code>configureMessageConverters</code>(기본값 대체)와 <code>extendMessageConverters</code>(구성된 목록 수정)의 구분</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-controller/ann-methods/return-types.html">Spring Framework Reference: Return Values</a> — <code>void</code>, <code>String</code>, 그 밖의 반환값이 처리되는 규칙</li>
+<li><a href="https://docs.spring.io/spring-boot/3.5/reference/web/servlet.html">Spring Boot 3.5 Reference: Servlet Web Applications</a> — 정적 리소스 기본 위치, 웰컴 페이지, <code>HttpMessageConverters</code>와 UTF-8 기본값</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110.html">RFC 9110 HTTP Semantics</a> — §15.5.7 406 Not Acceptable, §15.5.16 415 Unsupported Media Type</li>
+</x-refs>

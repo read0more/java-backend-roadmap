@@ -1,0 +1,643 @@
+<x-meta>
+deck: NOT NULL·DEFAULT·UNIQUE·PRIMARY KEY·FOREIGN KEY·CHECK가 MySQL InnoDB 안에서 어떤 자료 구조와 잠금으로 강제되는지 따라가며, 애플리케이션 검사만으로는 막을 수 없는 잘못된 데이터를 데이터베이스가 어떻게 끝까지 막아 내는지 이해한다.
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li>두 트랜잭션이 "먼저 조회하고 없으면 넣는" 코드를 동시에 실행할 때 중복 행이 생기는 과정을 시간 순서로 추적하고, UNIQUE 인덱스가 있으면 두 번째 INSERT가 어디서 멈추고 어떤 오류(1062)로 끝나는지 설명할 수 있다.</li>
+<li>엄격 SQL 모드가 켜져 있을 때와 꺼져 있을 때 NOT NULL 컬럼에 값이 빠지거나 NULL이 들어오면 각각 무슨 일이 일어나는지 예측하고, 리터럴 기본값과 표현식 기본값(8.0.13 이상)의 차이를 말할 수 있다.</li>
+<li>PRIMARY KEY와 UNIQUE가 InnoDB에서 클러스터형 인덱스와 고유 보조 인덱스로 구현된다는 사실로부터, UNIQUE 컬럼에 NULL이 여러 개 들어가는 이유와 <code>UPDATE t SET id = id + 1</code>이 실패할 수 있는 이유를 설명할 수 있다.</li>
+<li>외래 키의 참조 동작(CASCADE, SET NULL, RESTRICT, NO ACTION, SET DEFAULT)이 InnoDB에서 어떻게 처리되는지 구분하고, 부모 행 하나를 지울 때 자식 테이블 여러 개에서 일어나는 일을 단계별로 추적할 수 있다.</li>
+<li>CHECK 제약 조건이 NULL을 통과시키는 이유를 3값 논리로 설명하고, 8.0.16 이전에 만든 스키마의 CHECK를 믿으면 안 되는 이유와 CHECK에 쓸 수 없는 식을 가려낼 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 데이터가 "말이 안 되는" 상태</h3>
+
+<p>도서관 대출 시스템을 하나 운영한다고 해 보자. 어느 날 통계를 뽑았더니 이상한 행들이 보인다. 존재하지 않는 회원 번호로 기록된 대출 건이 있고, 같은 이메일로 가입한 회원이 두 명 있으며, 보유 권수가 -1인 책이 있고, 반납 예정일이 대출일보다 앞선 대출 건도 있다. 이런 행 하나하나는 문법적으로는 멀쩡한 데이터다. 정수 컬럼에 정수가, 날짜 컬럼에 날짜가 들어 있다. 그런데 이 데이터가 묘사하는 세계는 현실에서 일어날 수 없는 세계다. 이런 상태를 <b>데이터 무결성(data integrity)이 깨졌다</b>고 말한다.</p>
+
+<p>무결성이 깨진 데이터가 위험한 이유는 오류가 그 자리에서 드러나지 않기 때문이다. 존재하지 않는 회원을 가리키는 대출 건은 1회차에서 본 내부 조인을 거치면 결과에서 조용히 사라진다. 대출 통계는 맞지 않게 되지만 아무도 오류 메시지를 받지 못한다. 보유 권수 -1은 "대출 가능한 책" 목록을 뽑는 <code>WHERE copies > 0</code> 조건에서 걸러지므로 화면에는 아무 문제가 없어 보인다. 잘못된 데이터는 이렇게 쿼리 결과를 조금씩 비틀면서 오래 살아남고, 발견됐을 때는 이미 그 데이터를 근거로 한 다른 데이터가 쌓여 있다. 어디까지가 오염됐는지 거꾸로 추적하는 일은 처음에 막는 일보다 훨씬 비싸다.</p>
+
+<p>그렇다면 누가 이것을 막아야 하는가. 가장 먼저 떠오르는 답은 애플리케이션이다. 회원 가입 코드가 이메일 중복을 검사하고, 대출 코드가 회원이 존재하는지 확인하면 된다. 이 생각은 절반만 맞다. 데이터베이스에 값을 쓰는 주체는 애플리케이션 하나가 아니다. 같은 데이터베이스를 쓰는 다른 서비스, 밤마다 도는 배치 작업, 운영자가 직접 실행하는 SQL, 데이터 이관 스크립트가 모두 같은 테이블에 쓴다. 애플리케이션의 검사 코드는 그 애플리케이션을 거치는 쓰기만 지킨다. 그리고 다음 절에서 보듯이, 애플리케이션 하나만 쓰는 경우에도 동시에 실행되는 요청 두 개 앞에서는 검사 코드가 뚫린다.</p>
+
+<p>그래서 관계형 데이터베이스는 데이터가 지켜야 할 규칙을 테이블 정의 안에 선언해 두고, 어떤 경로로 들어온 쓰기든 그 규칙을 어기면 거부하는 장치를 제공한다. 이것이 <b>제약 조건(constraint)</b>이다. 이 회차는 MySQL 8.0의 InnoDB를 기준으로 기본 제약 조건(NOT NULL, DEFAULT, UNIQUE, PRIMARY KEY), 외래 키 제약 조건, CHECK 제약 조건을 차례로 다루고, 각각이 엔진 내부에서 어떤 자료 구조와 잠금으로 강제되는지 한 층 아래까지 내려가 본다.</p>
+
+<h4>무결성의 세 갈래</h4>
+
+<p>데이터베이스 교재는 무결성을 보통 세 갈래로 나눈다. 이 분류는 제약 조건 각각이 무엇을 지키는지 정리하는 데 쓸모가 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>갈래</th><th>지키려는 규칙</th><th>도서관 예에서 깨진 모습</th><th>MySQL에서 쓰는 장치</th></tr></thead><tbody>
+<tr><td>개체 무결성(entity integrity)</td><td>행 하나하나를 서로 구별할 수 있어야 한다. 식별자는 비어 있거나 겹치면 안 된다.</td><td>같은 회원 번호를 가진 행이 두 개, 회원 번호가 NULL인 행</td><td>PRIMARY KEY (UNIQUE + NOT NULL)</td></tr>
+<tr><td>참조 무결성(referential integrity)</td><td>다른 행을 가리키는 값은 실제로 존재하는 행을 가리켜야 한다.</td><td>없는 회원 번호를 가진 대출 건</td><td>FOREIGN KEY</td></tr>
+<tr><td>도메인 무결성(domain integrity)</td><td>컬럼 값은 허용된 범위 안에 있어야 한다.</td><td>보유 권수 -1, 반납 예정일이 대출일보다 앞섬, 이름이 비어 있음</td><td>데이터 타입, NOT NULL, DEFAULT, CHECK</td></tr>
+</tbody></table></div>
+
+<p>여기에 하나를 더 생각할 수 있다. "같은 이메일로 두 번 가입할 수 없다"는 규칙은 식별자에 관한 규칙이 아니다. 회원 번호가 기본 키라면 이메일은 그냥 속성 하나다. 하지만 업무상 이메일은 사람을 구별하는 또 하나의 기준이므로 겹치면 안 된다. 이런 규칙은 UNIQUE 제약 조건으로 지킨다. 교재에 따라 이것을 개체 무결성의 연장으로 보기도 하고 업무 규칙(사용자 정의 무결성)으로 따로 분류하기도 한다. 이름보다 중요한 것은 어떤 규칙을 어떤 장치가 지키는지 짝을 맞추는 일이다.</p>
+
+<h3>애플리케이션 검사만으로는 왜 뚫리는가</h3>
+
+<p>이메일 중복을 애플리케이션에서 검사하는 가장 흔한 방식은 "먼저 조회하고, 없으면 넣는다"이다. 의사 코드로 쓰면 다음과 같다.</p>
+
+<pre><code class="language-java">// 회원 가입 처리 (트랜잭션 안에서 실행된다고 하자)
+long count = jdbc.queryForObject(
+        "SELECT COUNT(*) FROM member WHERE email = ?", Long.class, email);
+if (count > 0) {
+    throw new IllegalStateException("이미 가입된 이메일");
+}
+jdbc.update("INSERT INTO member (email, name) VALUES (?, ?)", email, name);</code></pre>
+
+<p>요청이 하나씩 차례로 들어오면 이 코드는 정확하게 동작한다. 문제는 같은 이메일로 가입 요청 두 개가 거의 동시에 들어올 때다. 사용자가 가입 버튼을 두 번 눌렀거나, 네트워크 재시도로 같은 요청이 두 번 도착하는 일은 흔하다. 웹 서버는 요청마다 다른 스레드에서 이 코드를 실행하고, 각 스레드는 서로 다른 DB 커넥션에서 서로 다른 트랜잭션을 연다. member 테이블에 email UNIQUE 제약이 없다고 하고 시간 순서대로 따라가 보자.</p>
+
+<pre class="diagram">시각   트랜잭션 A (스레드 1)                   트랜잭션 B (스레드 2)
+----   ------------------------------------   ------------------------------------
+t1     BEGIN
+t2     SELECT COUNT(*) ... email='kim@x.kr'
+       → 0  (아무도 없다)
+t3                                            BEGIN
+t4                                            SELECT COUNT(*) ... email='kim@x.kr'
+                                              → 0  (A의 INSERT는 아직 없다)
+t5     INSERT INTO member ... 'kim@x.kr'
+       → 성공
+t6                                            INSERT INTO member ... 'kim@x.kr'
+                                              → 성공 (막을 규칙이 없다)
+t7     COMMIT
+t8                                            COMMIT
+
+결과: email = 'kim@x.kr' 인 행이 두 개</pre>
+
+<p>t4에서 B가 0을 받는 이유를 정확히 짚어 두자. 이 시점에 A는 아직 INSERT조차 하지 않았으니 B가 볼 것이 없다. 순서를 조금 바꿔 A의 INSERT가 t4보다 먼저 일어나더라도 결과는 같다. InnoDB의 기본 격리 수준인 REPEATABLE READ에서 평범한 SELECT는 잠금을 걸지 않는 일관된 읽기(consistent nonlocking read)로 실행되고, 다른 트랜잭션이 커밋하지 않은 변경은 보지 않는다. 격리 수준과 MVCC는 8회차에서 자세히 다루므로 여기서는 "커밋되지 않은 다른 트랜잭션의 INSERT는 조회에 보이지 않는다"는 사실만 가져오면 충분하다.</p>
+
+<p>이 실패의 구조는 동시성 프로그래밍에서 말하는 "검사 후 실행(check-then-act)" 경쟁 조건과 똑같다. 검사(SELECT)와 실행(INSERT)이 원자적으로 묶여 있지 않으니, 그 사이에 다른 실행 흐름이 끼어들면 검사 결과는 실행 시점에 이미 낡은 정보가 된다. 자바에서 <code>if (!map.containsKey(k)) map.put(k, v)</code>가 여러 스레드에서 안전하지 않은 것과 같은 이유다. 자바에서는 <code>putIfAbsent</code>처럼 검사와 실행을 한 연산으로 묶은 메서드를 쓴다. 데이터베이스에서 그 역할을 하는 것이 UNIQUE 제약 조건이다. 검사가 INSERT 안에 들어가 있고, 엔진이 그 검사와 삽입을 잠금으로 보호한다.</p>
+
+<h4>UNIQUE 인덱스가 있을 때 같은 시나리오</h4>
+
+<p>이제 <code>email</code>에 UNIQUE 제약을 건다. InnoDB에서 UNIQUE 제약은 고유 인덱스(unique index)로 구현된다. 5·6회차에서 본 B+Tree 인덱스가 하나 더 생기고, 그 인덱스는 같은 키 값을 두 번 받아들이지 않는다. 같은 시나리오를 다시 따라가면 t6이 달라진다.</p>
+
+<pre class="diagram">시각   트랜잭션 A                              트랜잭션 B
+----   ------------------------------------   ------------------------------------
+t5     INSERT ... 'kim@x.kr'
+       → email 인덱스에 'kim@x.kr' 레코드 추가
+         (A가 이 레코드에 배타 잠금 X 보유)
+t6                                            INSERT ... 'kim@x.kr'
+                                              → 인덱스에서 같은 키를 발견
+                                              → 그 레코드에 공유 잠금 S 요청
+                                              → A의 X 잠금 때문에 대기
+t7     COMMIT  (A의 잠금 해제)
+                                              → S 잠금 획득, 키가 확정적으로 존재
+                                              → ERROR 1062 (23000): Duplicate entry
+                                                'kim@x.kr' for key 'member.uk_member_email'
+t8                                            (애플리케이션이 오류를 받아 처리)
+
+결과: email = 'kim@x.kr' 인 행은 하나</pre>
+
+<p>핵심은 t6이다. B의 INSERT는 인덱스에 키를 끼워 넣을 자리를 B+Tree에서 찾아 내려가다가, 같은 키를 가진 레코드가 이미 있다는 것을 발견한다. 그 레코드는 A가 넣었지만 아직 커밋하지 않은 것이다. A가 롤백할 수도 있으니 B는 지금 당장 "중복이다"라고 단정할 수 없다. 그래서 B는 그 레코드에 잠금을 요청하고 A의 결말을 기다린다. MySQL 매뉴얼은 InnoDB의 잠금 동작을 설명하면서 "중복 키 오류가 발생하면 중복된 인덱스 레코드에 공유 잠금이 설정된다"고 적고 있다(MySQL 8.0 Reference Manual, 17.7.3). A가 커밋하면 키가 확정되므로 B는 1062 오류를 받는다. A가 롤백하면 A가 넣은 레코드가 사라지므로 B는 기다리던 잠금을 얻은 뒤 자신의 INSERT를 마칠 수 있다.</p>
+
+<p>이 흐름은 실제로 확인할 수 있다. MySQL 8.0.46에서 세션 A가 <code>'race@x.kr'</code>을 넣고 커밋하지 않은 채 기다리는 동안 세션 B가 같은 이메일을 넣게 하고, 그 사이에 세 번째 세션에서 <code>performance_schema.data_locks</code>를 조회하면 다음과 같다(LOCK_DATA의 8은 그 행의 PRIMARY KEY 값이다).</p>
+
+<pre data-label="MySQL 8.0.46에서 실행"><code class="language-sql">SELECT OBJECT_NAME, INDEX_NAME, LOCK_TYPE, LOCK_MODE, LOCK_STATUS, LOCK_DATA
+FROM performance_schema.data_locks
+WHERE OBJECT_SCHEMA = 'm_db_basic_07'
+ORDER BY ENGINE_TRANSACTION_ID, LOCK_TYPE;
++-------------+-----------------+-----------+---------------+-------------+----------------+
+| OBJECT_NAME | INDEX_NAME      | LOCK_TYPE | LOCK_MODE     | LOCK_STATUS | LOCK_DATA      |
++-------------+-----------------+-----------+---------------+-------------+----------------+
+| member      | uk_member_email | RECORD    | X,REC_NOT_GAP | GRANTED     | 'race@x.kr', 8 |
+| member      | NULL            | TABLE     | IX            | GRANTED     | NULL           |
+| member      | uk_member_email | RECORD    | S             | WAITING     | 'race@x.kr', 8 |
+| member      | NULL            | TABLE     | IX            | GRANTED     | NULL           |
++-------------+-----------------+-----------+---------------+-------------+----------------+</code></pre>
+
+<p>A는 고유 인덱스 <code>uk_member_email</code>의 그 레코드에 배타 잠금(X)을 쥐고 있고, B는 같은 레코드에 공유 잠금(S)을 요청한 채 WAITING 상태다. A가 COMMIT하자 B의 INSERT는 <code>ERROR 1062 (23000): Duplicate entry 'race@x.kr' for key 'member.uk_member_email'</code>로 끝났다. 8.0.46과 8.4.13 모두 1062 메시지의 키 이름은 이처럼 <code>테이블.인덱스</code> 형태로 나온다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>화이트보드 명단과 접수 창구</strong><p>복도의 화이트보드에 이름이 없는지 보고 나서 신청서를 내러 가는 방식은, 두 사람이 동시에 화이트보드를 보면 둘 다 "아직 없다"고 판단한다. UNIQUE 제약은 신청서를 받는 창구 직원이 장부를 직접 확인하는 방식이다. 같은 이름의 신청서가 막 접수되어 처리 중이면 뒷사람은 그 처리가 끝날 때까지 창구 앞에서 기다린다. 이 비유가 깨지는 지점은 대기의 의미다. 실제 창구 직원은 판단을 미루지 않지만, InnoDB는 앞 트랜잭션이 롤백할 가능성 때문에 판정 자체를 미룬다.</p></aside>
+
+<p>이 대기에는 부작용이 있다. 매뉴얼은 같은 키를 세 세션이 동시에 넣으려 할 때 교착 상태(deadlock)가 생기는 예를 든다. 세션 1이 키 1을 넣고, 세션 2와 3이 같은 키 1을 넣으려다 각각 공유 잠금을 기다리는 상태에서 세션 1이 롤백하면, 세션 2와 3이 둘 다 공유 잠금을 얻는다. 이제 둘 다 실제로 레코드를 넣으려면 배타 잠금이 필요한데, 상대가 가진 공유 잠금 때문에 어느 쪽도 얻지 못한다. InnoDB는 이 교착 상태를 감지해 한쪽 트랜잭션을 롤백시킨다. MySQL 8.0.46에서 이 순서를 그대로 재현하면, 세션 1이 롤백한 직후 세션 3이 <code>ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction</code>을 받고 세션 2의 INSERT는 성공했다(어느 쪽이 희생되는지는 실행마다 다를 수 있다). 같은 키로 동시에 들어오는 요청이 많은 테이블(예: 멱등성 키 테이블)에서 교착 상태 오류가 보이는 것은 이 메커니즘 때문이다. 잠금의 종류와 교착 상태 처리는 8회차의 주제이므로 여기서는 "UNIQUE 검사는 잠금과 함께 일어난다"는 점만 기억해 두자.</p>
+
+<x-visual id="db-basic-07-unique-race" title="검사 후 삽입 경쟁과 UNIQUE 인덱스의 차단" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>UNIQUE 제약이 없을 때 두 트랜잭션이 모두 0건을 조회하고 모두 삽입하는 흐름과, UNIQUE 인덱스가 있을 때 두 번째 INSERT가 잠금 대기 후 1062 오류로 끝나는 흐름을 나란히 보여 준다.</x-hint>
+<x-prompt>좌우 두 패널로 된 시퀀스 다이어그램. 각 패널에 세로 생명선 세 개: "트랜잭션 A", "member 테이블", "트랜잭션 B". 왼쪽 패널 제목 "UNIQUE 없음": A와 B가 각각 테이블로 "SELECT COUNT → 0" 화살표를 보내고, 이어 각각 "INSERT" 화살표를 보내며, 테이블 쪽 아래에 빨간 상자 "같은 이메일 2행". 오른쪽 패널 제목 "UNIQUE 인덱스": A가 "INSERT" 화살표를 보내고 테이블 옆에 자물쇠 아이콘 "X 잠금", B의 "INSERT" 화살표 끝에 모래시계 아이콘 "S 잠금 대기", A에서 "COMMIT" 화살표, 그 뒤 테이블에서 B로 돌아가는 빨간 화살표 "ERROR 1062". 단순한 선 그림, 흰 배경, 파랑·회색 위주, 오류만 빨강.</x-prompt>
+<x-caption>검사와 삽입이 분리되어 있으면 동시 요청 두 개가 모두 통과한다. UNIQUE 인덱스는 검사를 INSERT 안으로 옮기고 잠금으로 보호한다.</x-caption>
+</x-visual>
+
+<p>그렇다고 애플리케이션 검사가 쓸모없다는 뜻은 아니다. 대부분의 요청은 동시에 들어오지 않으므로, 미리 조회해서 "이미 가입된 이메일입니다"라는 친절한 메시지를 보여 주는 것은 사용자 경험으로 가치가 있다. 다만 그 검사는 안내용이고, 최종 판정은 제약 조건이 내린다. 그러므로 애플리케이션은 미리 검사했더라도 INSERT가 1062로 실패하는 경우를 반드시 처리해야 한다. 두 겹의 방어가 각자 다른 일을 한다고 이해하면 된다.</p>
+
+<h3>제약 조건은 어디에 있고 언제 검사되는가</h3>
+
+<p>제약 조건은 테이블 정의의 일부다. <code>CREATE TABLE</code>이나 <code>ALTER TABLE</code>로 선언하면 MySQL의 데이터 사전(data dictionary)에 테이블 정의와 함께 저장되고, <code>SHOW CREATE TABLE</code>로 언제든 확인할 수 있다. 제약 조건이 선언적(declarative)이라는 점이 중요하다. "이메일은 겹치면 안 된다"는 사실만 적을 뿐, 언제 어떻게 검사할지는 적지 않는다. 검사 시점과 방법은 엔진이 정한다. 덕분에 INSERT, UPDATE, REPLACE, LOAD DATA처럼 데이터를 바꾸는 모든 경로에 같은 규칙이 적용되고, 새로운 쓰기 경로가 생겨도 규칙을 다시 구현할 필요가 없다.</p>
+
+<p>이 회차에서 다룰 장치를 한 표로 정리하면 다음과 같다. "구현"과 "검사 시점" 열이 이 회차에서 한 층 아래로 내려가 볼 부분이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>장치</th><th>규칙</th><th>InnoDB에서의 구현</th><th>위반 시 대표 오류</th></tr></thead><tbody>
+<tr><td>NOT NULL</td><td>값이 비어 있으면 안 된다</td><td>컬럼 속성. 행을 만들 때 값 검사</td><td>1048 <code>Column '%s' cannot be null</code>, 1364 <code>Field '%s' doesn't have a default value</code></td></tr>
+<tr><td>DEFAULT</td><td>값이 빠지면 이 값을 쓴다</td><td>컬럼 속성. 행을 만들 때 채움</td><td>(규칙 위반이 아니라 빈자리를 채우는 장치)</td></tr>
+<tr><td>UNIQUE</td><td>값이 겹치면 안 된다(NULL 제외)</td><td>고유 보조 인덱스</td><td>1062 <code>Duplicate entry '%s' for key '%s'</code></td></tr>
+<tr><td>PRIMARY KEY</td><td>UNIQUE + NOT NULL, 테이블에 하나</td><td>클러스터형 인덱스</td><td>1062, 1048</td></tr>
+<tr><td>FOREIGN KEY</td><td>참조 값은 부모 테이블에 존재해야 한다</td><td>자식·부모 양쪽 인덱스 탐색 + 공유 레코드 잠금</td><td>1452 (자식 쪽), 1451 (부모 쪽)</td></tr>
+<tr><td>CHECK</td><td>행이 조건식을 만족해야 한다</td><td>행 단위로 식을 평가(8.0.16부터)</td><td>3819 <code>Check constraint '%s' is violated.</code></td></tr>
+</tbody></table></div>
+
+<p>검사 단위도 짚어 두자. MySQL은 여러 행을 바꾸는 문장에서도 UNIQUE와 외래 키 제약을 <b>행 단위로(row-by-row)</b> 검사하고, 검사를 트랜잭션 커밋 시점으로 미루지 않는다. MySQL 매뉴얼은 SQL 표준과의 차이를 설명하는 절에서 이 점을 명시하고, 표준의 기본 동작은 문장 전체를 처리한 뒤에 검사하는 것이라고 덧붙인다(MySQL 8.0 Reference Manual, "FOREIGN KEY Constraint Differences"). 이 차이가 실제로 어떤 결과를 낳는지는 UNIQUE와 외래 키 절에서 각각 예를 들어 본다.</p>
+
+<p>그리고 검사에 실패했을 때 무엇이 되돌려지는지도 알아야 한다. InnoDB는 트랜잭션을 지원하는 엔진이므로, 엄격 모드에서 제약 위반이 일어나면 그 문장(statement) 전체가 되돌려진다. 세 행을 넣는 INSERT에서 두 번째 행이 위반하면 첫 번째 행도 남지 않는다. 다만 되돌려지는 것은 그 문장이지 트랜잭션 전체가 아니다. 같은 트랜잭션에서 앞서 실행해 성공한 문장들은 그대로 남아 있고, 이어서 COMMIT할지 ROLLBACK할지는 애플리케이션이 정한다. 스프링의 <code>@Transactional</code>이 런타임 예외를 받으면 트랜잭션 전체를 롤백하는 것은 데이터베이스가 아니라 스프링이 내리는 결정이다.</p>
+
+<h3>기본 제약 조건 1: NOT NULL과 DEFAULT</h3>
+
+<p>NULL은 "값이 없음" 또는 "알 수 없음"을 나타내는 표시다. 2·3회차에서 보았듯이 NULL과의 비교는 TRUE도 FALSE도 아닌 UNKNOWN이 되고, 이것이 외부 조인과 <code>NOT IN</code> 서브쿼리에서 예상 밖의 결과를 만든다. 컬럼이 NULL을 허용하면 그 컬럼을 쓰는 모든 쿼리가 3값 논리를 염두에 두어야 한다. 반대로 NOT NULL을 선언한 컬럼은 항상 값이 있으므로 쿼리가 단순해지고 실수할 여지가 줄어든다. 그래서 "정말로 값이 없을 수 있는가"를 컬럼마다 묻고, 아니라면 NOT NULL을 선언하는 것이 기본 자세다.</p>
+
+<p>MySQL에서 <code>NULL</code>도 <code>NOT NULL</code>도 적지 않은 컬럼은 <code>NULL</code>을 적은 것으로 취급된다(CREATE TABLE 문서). 즉 아무 말도 하지 않으면 NULL이 허용된다. 이 기본값 때문에 NOT NULL을 깜빡한 컬럼이 스키마에 쉽게 섞여 들어간다.</p>
+
+<pre><code class="language-sql">CREATE TABLE member (
+    id         BIGINT       NOT NULL AUTO_INCREMENT,
+    email      VARCHAR(100) NOT NULL,
+    name       VARCHAR(50)  NOT NULL,
+    grade      VARCHAR(10)  NOT NULL DEFAULT 'BASIC',
+    nickname   VARCHAR(50),                         -- NULL 허용(아무것도 안 적음)
+    joined_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_member_email UNIQUE (email)
+);</code></pre>
+
+<h4>값이 빠졌을 때와 NULL이 들어왔을 때</h4>
+
+<p>NOT NULL 컬럼에 문제가 생기는 경우는 두 가지다. INSERT가 그 컬럼의 값을 아예 주지 않는 경우(값이 빠짐)와, 명시적으로 NULL을 주는 경우다. 어떻게 처리되는지는 그 순간의 SQL 모드에 달려 있다. MySQL 8.0의 기본 SQL 모드는 <code>ONLY_FULL_GROUP_BY</code>, <code>STRICT_TRANS_TABLES</code>, <code>NO_ZERO_IN_DATE</code>, <code>NO_ZERO_DATE</code>, <code>ERROR_FOR_DIVISION_BY_ZERO</code>, <code>NO_ENGINE_SUBSTITUTION</code>을 포함하고, 이 중 <code>STRICT_TRANS_TABLES</code>가 엄격 SQL 모드(strict SQL mode)를 켠다. 매뉴얼에 따르면 엄격 모드는 INSERT나 UPDATE 같은 데이터 변경 문장이 잘못된 값이나 빠진 값을 만났을 때의 처리를 결정한다.</p>
+
+<p>먼저 값이 빠진 경우다. 위 member 테이블에서 <code>INSERT INTO member (email) VALUES ('kim@x.kr')</code>를 실행하면 <code>name</code>이 빠진다. <code>name</code>은 NOT NULL이고 DEFAULT가 없다. 매뉴얼의 기본값 처리 규칙에 따르면, NULL을 허용하는 컬럼에 DEFAULT를 적지 않으면 MySQL이 <code>DEFAULT NULL</code>을 붙여 정의하고, NULL을 허용하지 않는 컬럼에 DEFAULT를 적지 않으면 DEFAULT 절이 없는 채로 정의한다. 그런 컬럼의 값이 INSERT에서 빠지면 엄격 모드에서는 오류가 나고 트랜잭션 테이블의 경우 문장이 롤백된다. 이때 받는 오류가 1364 <code>Field 'name' doesn't have a default value</code>다. 엄격 모드가 아니면 MySQL은 그 컬럼을 데이터 타입의 <b>암묵적 기본값(implicit default)</b>으로 채운다. 숫자는 0, ENUM이 아닌 문자열은 빈 문자열, ENUM은 첫 번째 열거값, TIMESTAMP를 제외한 날짜·시간 타입은 그 타입의 "0" 값이다.</p>
+
+<p>다음은 NULL이 명시적으로 들어온 경우다. 매뉴얼의 예를 그대로 따라가 보자.</p>
+
+<pre data-label="MySQL 8.0.46에서 실행, 엄격 모드(기본값)"><code class="language-sql">CREATE TABLE t2 (id INT NOT NULL);
+INSERT INTO t2 (id) VALUES (1), (NULL), (3);
+-- ERROR 1048 (23000): Column 'id' cannot be null
+SELECT * FROM t2;
+-- Empty set</code></pre>
+
+<p>세 행 가운데 두 번째만 잘못되었지만 테이블은 비어 있다. 문장 하나가 원자적으로 되돌려졌기 때문이다. 같은 문장을 엄격 모드를 끈 세션(예를 들어 <code>sql_mode</code>를 빈 문자열로 둔 세션)에서 실행하면 매뉴얼의 예처럼 오류 없이 세 행이 들어가고, NULL 자리에는 INT의 암묵적 기본값 0이 저장된다. 결과는 1, 0, 3이다. MySQL 8.0.46과 8.4.13에서 실행해 보면 이때 남는 흔적은 경고 한 줄(<code>Warning (Code 1048): Column 'id' cannot be null</code>)뿐이다. 이것이 엄격 모드를 끄면 안 되는 이유를 가장 잘 보여 준다. "값을 모른다"는 정보가 "값이 0이다"라는 거짓 정보로 바뀌어 저장되고, 이후 그 0은 진짜 0과 구별할 방법이 없다. 매뉴얼도 엄격 모드를 끄는 것을 권장하지 않는다고 적는다.</p>
+
+<aside class="note"><code>INSERT IGNORE</code>와 <code>UPDATE IGNORE</code>는 엄격 모드에서도 일부 오류를 경고로 낮춘다. 매뉴얼은 IGNORE와 엄격 모드가 함께 쓰이면 IGNORE가 우선한다고 설명한다. NOT NULL 위반(ER_BAD_NULL_ERROR)도 IGNORE로 낮출 수 있는 오류에 속하므로(MySQL 8.0.46의 기본 SQL 모드에서 위 t2에 <code>INSERT IGNORE INTO t2 (id) VALUES (1), (NULL), (3)</code>을 실행하면 경고 1048과 함께 1, 0, 3이 저장된다), IGNORE는 "중복만 무시하는 옵션"이 아니라 여러 종류의 무결성 오류를 경고로 바꾸는 옵션이라는 점에 주의한다.</aside>
+
+<h4>DEFAULT: 리터럴과 표현식</h4>
+
+<p>DEFAULT는 엄밀히 말해 데이터를 거부하는 제약이 아니라 빈자리를 채우는 규칙이다. 그래도 NOT NULL과 함께 쓰면 "값은 반드시 있고, 주지 않으면 이 값이다"라는 규칙이 완성되므로 기본 제약 조건과 함께 다룬다. 위 예에서 <code>grade</code>는 값을 주지 않으면 <code>'BASIC'</code>이 된다. INSERT에서 컬럼을 생략하거나, 값 자리에 <code>DEFAULT</code> 키워드를 쓰면 기본값이 들어간다.</p>
+
+<p>MySQL 8.0.13부터 DEFAULT에 리터럴 상수뿐 아니라 표현식을 쓸 수 있다. 표현식 기본값은 괄호로 감싸 리터럴과 구별한다. 예외는 TIMESTAMP와 DATETIME 컬럼의 <code>CURRENT_TIMESTAMP</code>로, 괄호 없이 쓸 수 있다. 위 예의 <code>joined_at</code>이 그 경우다. BLOB, TEXT, GEOMETRY, JSON 타입은 값이 리터럴이더라도 표현식 형태로 써야만 기본값을 가질 수 있다. 즉 <code>b BLOB DEFAULT ('abc')</code>는 허용되고 <code>b BLOB DEFAULT 'abc'</code>는 오류다(MySQL 8.0.46·8.4.13에서 <code>ERROR 1101 (42000): BLOB, TEXT, GEOMETRY or JSON column 'b' can't have a default value</code>). 8.0.13 이전에는 이 네 타입이 기본값을 가질 수 없었다.</p>
+
+<pre><code class="language-sql">CREATE TABLE coupon (
+    id         BIGINT     NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    code       BINARY(16) NOT NULL DEFAULT (UUID_TO_BIN(UUID())),   -- 표현식 기본값
+    expires_on DATE       NOT NULL DEFAULT (CURRENT_DATE + INTERVAL 30 DAY),
+    tags       JSON       NOT NULL DEFAULT (JSON_ARRAY())            -- JSON은 괄호 필수
+);</code></pre>
+
+<p>표현식 기본값에는 리터럴, 내장 함수(결정적이든 비결정적이든), 연산자를 쓸 수 있고, 서브쿼리, 매개변수, 변수, 저장 함수는 쓸 수 없다. AUTO_INCREMENT 컬럼에 의존할 수도 없다. 다른 컬럼을 참조할 수는 있지만, 생성 컬럼이나 표현식 기본값을 가진 컬럼을 참조할 때는 테이블 정의에서 앞에 나온 컬럼만 참조할 수 있다. 하나 더 알아 둘 점은 <code>DEFAULT(컬럼명)</code> 함수다. 이 함수는 리터럴 기본값을 가진 컬럼에만 쓸 수 있고, 표현식 기본값을 가진 컬럼에는 쓸 수 없다. 표현식 기본값에 <code>NOW()</code>나 <code>UUID()</code> 같은 비결정적 함수가 들어 있으면 그 식을 평가하는 문장은 문장 기반 복제(statement-based replication)에서 안전하지 않은 것으로 취급된다는 점도 매뉴얼에 적혀 있다. 원본 서버와 복제 서버가 같은 문장을 실행해도 같은 값이 나오지 않기 때문이다.</p>
+
+<p>뒤에서 볼 CHECK 제약은 비결정적 함수를 금지하는데 DEFAULT 표현식은 허용한다. 이 대비가 흥미롭다. DEFAULT는 행이 만들어지는 순간 한 번 평가되어 값으로 굳는다. 반면 CHECK는 "이 행은 언제나 이 조건을 만족한다"는 불변식(invariant)이다. 불변식에 현재 시각이 들어가면 데이터는 그대로인데 시간이 흐르는 것만으로 참이던 조건이 거짓이 될 수 있다. 같은 표현식이 한쪽에서는 허용되고 다른 쪽에서는 금지되는 이유가 여기에 있다.</p>
+
+<h3>기본 제약 조건 2: UNIQUE와 PRIMARY KEY</h3>
+
+<p>UNIQUE와 PRIMARY KEY는 둘 다 "같은 값이 두 번 나오면 안 된다"는 규칙이고, InnoDB에서는 둘 다 인덱스로 구현된다. 이것은 우연이 아니다. 중복을 검사하려면 새 값과 같은 값이 이미 있는지 찾아야 한다. 인덱스가 없으면 행을 넣을 때마다 테이블 전체를 훑어야 하는데, 인덱스가 있으면 B+Tree를 루트에서 리프까지 한 번 내려가는 것으로 충분하다. 게다가 B+Tree에 키를 넣으려면 어차피 그 키가 들어갈 자리를 찾아야 하므로, 자리를 찾는 과정에서 같은 키가 있는지 바로 알 수 있다. 중복 검사가 삽입 경로에 거의 공짜로 얹히는 셈이다.</p>
+
+<h4>PRIMARY KEY: 클러스터형 인덱스</h4>
+
+<p>MySQL 매뉴얼은 PRIMARY KEY를 "모든 키 컬럼이 NOT NULL이어야 하는 고유 인덱스"로 정의하고, 컬럼에 NOT NULL을 명시하지 않았으면 MySQL이 암묵적으로(그리고 조용히) NOT NULL로 선언한다고 적는다. 테이블에는 PRIMARY KEY가 하나만 있을 수 있고, 그 이름은 항상 <code>PRIMARY</code>다. 개체 무결성의 두 조건, 즉 "비어 있지 않다"와 "겹치지 않는다"가 PRIMARY KEY 하나에 묶여 있다.</p>
+
+<p>InnoDB에서 PRIMARY KEY는 단순한 인덱스 이상이다. 6회차에서 보았듯이 InnoDB는 PRIMARY KEY를 클러스터형 인덱스(clustered index)로 쓴다. 테이블의 행 데이터 자체가 PRIMARY KEY 순서로 정렬된 B+Tree의 리프에 저장되고, 모든 보조 인덱스의 레코드는 인덱스 컬럼과 함께 그 행의 PRIMARY KEY 값을 담는다. 그래서 PRIMARY KEY의 유일성은 단지 업무 규칙이 아니라 저장 구조의 전제다. 같은 키를 가진 행이 둘이면 보조 인덱스가 가진 PRIMARY KEY 값으로 원래 행을 하나로 찾아갈 수 없다.</p>
+
+<p>그렇다면 PRIMARY KEY를 선언하지 않은 테이블은 어떻게 저장될까. InnoDB는 PRIMARY KEY가 없으면 모든 키 컬럼이 NOT NULL인 첫 번째 UNIQUE 인덱스를 클러스터형 인덱스로 쓴다. 그런 인덱스도 없으면 행 ID 값을 담는 숨은 컬럼 위에 <code>GEN_CLUST_INDEX</code>라는 숨은 클러스터형 인덱스를 만든다. 이 행 ID는 6바이트 필드이고 행이 삽입될 때마다 단조 증가하므로, 행은 삽입 순서대로 놓인다. 엔진은 이렇게 어떻게든 행을 구별할 식별자를 만들어 내지만, 이 숨은 행 ID는 SQL에서 쓸 수 없으므로 사용자가 행을 구별하는 데는 아무 도움이 되지 않는다. 같은 내용의 행이 두 번 들어가도 막을 수 없고, 둘 중 하나만 골라 지우기도 어렵다. 매뉴얼이 모든 테이블에 PRIMARY KEY를 정의하라고 권하고, 논리적으로 유일하고 NULL이 아닌 컬럼이 없으면 AUTO_INCREMENT 컬럼을 추가하라고 하는 이유다.</p>
+
+<p>AUTO_INCREMENT는 PRIMARY KEY 값을 엔진이 채워 주는 장치다. 테이블에 하나만 둘 수 있고, 인덱스가 있어야 하며, DEFAULT를 가질 수 없다. 인덱스가 있는 AUTO_INCREMENT 컬럼에 NULL(권장) 또는 0을 넣으면 다음 순번 값이 들어가고, 순번은 1부터 시작한다. 업무적 의미가 없는 이런 키를 대리 키(surrogate key)라고 하고, 이메일이나 ISBN처럼 업무 데이터 자체에서 나온 키를 자연 키(natural key)라고 한다. 자연 키가 있어도 대리 키를 PRIMARY KEY로 쓰고 자연 키에는 UNIQUE를 거는 설계가 흔하다. 자연 키는 업무 규칙이 바뀌면 값이 바뀔 수 있는데, PRIMARY KEY 값이 바뀌면 클러스터형 인덱스에서 행의 위치가 바뀌고 그 값을 담고 있는 모든 보조 인덱스 레코드와 외래 키 참조도 함께 바뀌어야 하기 때문이다.</p>
+
+<h4>UNIQUE와 NULL</h4>
+
+<p>UNIQUE 제약은 고유 보조 인덱스로 구현된다. 그런데 매뉴얼에는 UNIQUE 인덱스가 NULL을 담을 수 있는 컬럼에서는 NULL 값을 여러 개 허용한다는 문장이 있다(모든 스토리지 엔진에 해당). 처음 보면 이상하다. 같은 값이 두 번 나오면 안 된다면서 NULL은 여러 번 나와도 된다니.</p>
+
+<p>이것은 NULL의 의미에서 나온다. NULL은 "알 수 없는 값"이므로 NULL과 NULL을 비교한 결과는 TRUE가 아니라 UNKNOWN이다. 두 NULL이 같은 값이라고 말할 근거가 없으니 "중복"이라고 판정할 수도 없다. 예를 들어 member 테이블의 <code>nickname</code>에 UNIQUE를 걸면, 닉네임을 정한 회원끼리는 겹칠 수 없지만 닉네임을 정하지 않은(NULL인) 회원은 몇 명이든 있을 수 있다. 대부분 이것이 원하는 동작이다.</p>
+
+<p>함정은 복합 UNIQUE에서 나온다. <code>UNIQUE (library_id, isbn)</code>처럼 두 컬럼에 UNIQUE를 걸었는데 <code>isbn</code>이 NULL을 허용하면, <code>(1, NULL)</code>이라는 행을 몇 번이든 넣을 수 있다. 키의 한 부분이라도 NULL이면 그 키는 다른 어떤 키와도 같다고 판정되지 않기 때문이다. "도서관마다 ISBN 없는 책은 하나만"을 원했다면 이 제약은 그 규칙을 지키지 못한다. 그런 규칙이 필요하면 컬럼을 NOT NULL로 만들고 "없음"을 나타내는 별도의 값을 쓰거나, 규칙 자체를 다시 설계해야 한다. UNIQUE를 걸 때는 항상 "이 컬럼들이 NULL일 수 있는가"를 함께 묻는 습관을 들이자.</p>
+
+<pre class="diagram">UNIQUE (library_id, isbn), isbn NULL 허용
+
+  (1, '978-89-...-1')  ← 첫 번째 행
+  (1, '978-89-...-1')  ← 거부: 두 컬럼 모두 같은 값과 같다 → 1062
+  (1, NULL)            ← 허용
+  (1, NULL)            ← 허용: NULL = NULL 은 UNKNOWN, 중복으로 보지 않는다
+  (1, NULL)            ← 허용</pre>
+
+<h4>행 단위 검사가 만드는 함정: id = id + 1</h4>
+
+<p>앞에서 MySQL이 UNIQUE를 행 단위로 검사한다고 했다. 그 결과를 매뉴얼의 UPDATE 문서가 직접 보여 준다. 고유 인덱스가 있는 <code>id</code> 컬럼에 1과 2가 들어 있는 테이블에서 <code>UPDATE t SET id = id + 1</code>을 실행한다고 하자. 문장이 끝난 뒤의 상태는 2와 3이므로 중복이 없다. 문장 전체를 다 처리한 뒤에 검사한다면 성공해야 한다. 그러나 MySQL은 행을 하나 바꿀 때마다 검사한다. 1을 2로 먼저 바꾸는 순간 아직 바뀌지 않은 2와 겹치므로 중복 키 오류가 난다. 매뉴얼은 이 문장이 행을 갱신하는 순서에 따라 실패할 수 있다고 설명하고, 큰 값부터 갱신하도록 <code>ORDER BY id DESC</code>를 붙이라고 안내한다.</p>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행 (id INT NOT NULL PRIMARY KEY, 값 1, 2)"><code class="language-sql">-- 갱신 순서에 따라 1062 오류가 날 수 있다
+UPDATE t SET id = id + 1;
+-- ERROR 1062 (23000): Duplicate entry '2' for key 't.PRIMARY'
+-- (테이블은 1, 2 그대로)
+
+-- 큰 값부터 바꾸면 중간 상태에서도 겹치지 않는다: 2→3, 그다음 1→2
+UPDATE t SET id = id + 1 ORDER BY id DESC;
+-- 성공. 테이블은 2, 3</code></pre>
+
+<p><code>id</code>를 PRIMARY KEY가 아니라 NULL 허용 컬럼의 UNIQUE 인덱스로 두어도 같은 문장이 <code>Duplicate entry '2' for key 'tu.id'</code>(테이블 이름 tu)로 실패했다. 두 버전 모두 이 예에서는 id 오름차순으로 행을 갱신했다는 뜻이다.</p>
+
+<p>이 예는 "제약은 문장 결과에 대한 규칙"이라는 직관과 "제약은 각 행의 변경마다 검사된다"는 MySQL의 실제 동작이 어긋나는 지점을 보여 준다. 다른 데이터베이스로 옮겨 가거나 다른 데이터베이스에서 넘어올 때 이런 차이가 문제를 만든다. 무결성 규칙을 설계할 때는 최종 상태뿐 아니라 중간 상태도 규칙을 지키는지 생각해야 한다.</p>
+
+<h3>외래 키 제약 조건: 참조 무결성</h3>
+
+<p>지금까지의 제약은 모두 한 테이블 안에서 끝나는 규칙이었다. 외래 키(foreign key)는 두 테이블 사이의 규칙이다. 대출 테이블의 <code>member_id</code>는 회원 테이블의 어떤 행을 가리키는 값이고, 가리키는 행이 실제로 있어야 의미가 있다. 이때 다른 행을 가리키는 쪽(대출)을 자식 테이블(child table) 또는 참조하는 테이블(referencing table)이라 하고, 가리킴을 받는 쪽(회원)을 부모 테이블(parent table) 또는 참조되는 테이블(referenced table)이라 한다. 1회차에서 조인 조건으로 쓰던 <code>loan.member_id = member.id</code>라는 관계를 스키마에 규칙으로 못 박는 것이 외래 키다.</p>
+
+<p>이 회차의 예제 스키마를 완성하자. 앞의 member 테이블에 책, 회원 주소, 대출 테이블을 더한다. 회원 한 명을 지울 때 세 자식 테이블이 각기 다르게 반응하도록 참조 동작을 일부러 다르게 골랐다. 참조 동작의 의미는 다음 절에서 하나씩 본다.</p>
+
+<pre><code class="language-sql">CREATE TABLE book (
+    id              BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    isbn            CHAR(13)     NOT NULL,
+    title           VARCHAR(200) NOT NULL,
+    copies          INT          NOT NULL DEFAULT 1,
+    donor_member_id BIGINT,                          -- 책을 기증한 회원(없을 수 있음)
+    CONSTRAINT uk_book_isbn   UNIQUE (isbn),
+    CONSTRAINT ck_book_copies CHECK (copies >= 0),
+    CONSTRAINT fk_book_donor  FOREIGN KEY (donor_member_id)
+        REFERENCES member (id) ON DELETE SET NULL
+);
+
+CREATE TABLE member_address (
+    id        BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    member_id BIGINT       NOT NULL,
+    address   VARCHAR(200) NOT NULL,
+    CONSTRAINT fk_address_member FOREIGN KEY (member_id)
+        REFERENCES member (id) ON DELETE CASCADE
+);
+
+CREATE TABLE loan (
+    id          BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    member_id   BIGINT NOT NULL,
+    book_id     BIGINT NOT NULL,
+    loaned_on   DATE   NOT NULL,
+    due_on      DATE   NOT NULL,
+    returned_on DATE,
+    CONSTRAINT fk_loan_member FOREIGN KEY (member_id) REFERENCES member (id),
+    CONSTRAINT fk_loan_book   FOREIGN KEY (book_id)   REFERENCES book (id) ON DELETE RESTRICT,
+    CONSTRAINT ck_loan_period CHECK (due_on > loaned_on),
+    CONSTRAINT ck_loan_return CHECK (returned_on IS NULL OR returned_on >= loaned_on)
+);</code></pre>
+
+<p>외래 키가 막는 쓰기는 양방향이다. 자식 쪽에서는 존재하지 않는 부모를 가리키는 행을 넣거나, 기존 행의 참조 값을 존재하지 않는 값으로 바꾸는 것을 막는다. 이때 오류는 1452 <code>Cannot add or update a child row: a foreign key constraint fails (...)</code>다. 부모 쪽에서는 자식이 가리키고 있는 행을 지우거나 그 키 값을 바꾸는 것을 막는다(참조 동작이 RESTRICT나 NO ACTION일 때). 이때 오류는 1451 <code>Cannot delete or update a parent row: a foreign key constraint fails (...)</code>다. 괄호 안에는 어느 제약 조건이 실패했는지가 들어간다. 매뉴얼은 사용자가 부모 테이블 전부에 대한 테이블 수준 권한을 갖고 있지 않으면 부모 테이블 정보를 드러내지 않는 일반적인 메시지(ER_NO_REFERENCED_ROW, ER_ROW_IS_REFERENCED)가 대신 나간다고 적고 있다. 오류 메시지 하나에도 정보 노출을 고려한 설계가 들어 있는 셈이다.</p>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행 (데이터베이스 이름 m_db_basic_07)"><code class="language-sql">-- member에는 id 1, 2만 있다고 하자
+INSERT INTO loan (member_id, book_id, loaned_on, due_on)
+VALUES (999, 100, '2026-03-02', '2026-03-16');
+-- ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint fails
+--   (`m_db_basic_07`.`loan`, CONSTRAINT `fk_loan_member` FOREIGN KEY (`member_id`)
+--   REFERENCES `member` (`id`))</code></pre>
+
+<h4>외래 키를 만들 수 있는 조건</h4>
+
+<p>외래 키는 아무 컬럼 사이에나 걸 수 있는 것이 아니다. MySQL 8.0 매뉴얼이 정한 조건 가운데 실무에서 자주 부딪치는 것을 정리하면 다음과 같다.</p>
+
+<ul>
+<li><b>같은 스토리지 엔진, 임시 테이블 불가.</b> 부모와 자식 테이블은 같은 스토리지 엔진을 써야 하고 임시 테이블일 수 없다. InnoDB와 NDB 외의 엔진에서는 MySQL 서버가 <code>FOREIGN KEY</code> 문법을 파싱만 하고 무시한다. 스키마에 적혀 있다고 강제된다는 보장이 없다는 뜻이다.</li>
+<li><b>비슷한 데이터 타입.</b> 정수나 DECIMAL처럼 고정 정밀도 타입은 크기와 부호가 같아야 한다. 부모가 <code>BIGINT</code>인데 자식을 <code>INT</code>로 만들면 외래 키를 만들 수 없다(MySQL 8.0.46·8.4.13에서 <code>ERROR 3780 (HY000): Referencing column 'member_id' and referenced column 'id' in foreign key constraint 'badfk_ibfk_1' are incompatible.</code>). 문자열은 길이가 달라도 되지만 문자 집합(character set)과 콜레이션(collation)은 같아야 한다.</li>
+<li><b>자식 쪽 인덱스.</b> 자식 테이블에는 외래 키 컬럼이 같은 순서로 맨 앞에 오는 인덱스가 있어야 한다. 없으면 MySQL이 자동으로 만든다. 그리고 나중에 외래 키를 강제하는 데 쓸 수 있는 다른 인덱스를 만들면 자동으로 만든 인덱스가 조용히 삭제될 수 있다.</li>
+<li><b>부모 쪽 인덱스.</b> 부모 테이블에도 참조되는 컬럼이 같은 순서로 맨 앞에 오는 인덱스가 있어야 한다.</li>
+<li><b>접두사 인덱스 불가.</b> 외래 키 컬럼에는 인덱스 접두사(prefix)를 쓸 수 없다. 그래서 인덱스에 항상 접두사 길이가 필요한 BLOB과 TEXT 컬럼은 외래 키에 포함할 수 없다.</li>
+<li><b>기타.</b> InnoDB는 사용자 정의 파티셔닝을 쓰는 테이블의 외래 키를 지원하지 않는다. 가상 생성 컬럼(virtual generated column)은 외래 키로 참조할 수 없다. 한 컬럼이 자기 자신을 참조할 수는 없지만, 같은 테이블의 다른 컬럼은 참조할 수 있다.</li>
+</ul>
+
+<p>부모 쪽 조건에는 MySQL만의 사정이 있다. SQL 표준에서 외래 키가 참조하는 대상은 PRIMARY KEY나 UNIQUE 키다. 그런데 InnoDB는 참조되는 컬럼이 맨 앞에 오는 인덱스만 있으면 고유하지 않은 인덱스도 참조할 수 있게 허용해 왔다. 매뉴얼은 이것을 표준 SQL의 확장이라고 부르면서도, 고유하지 않은 키나 NULL을 담은 키를 참조할 때 UPDATE나 DELETE CASCADE의 처리가 잘 정의되어 있지 않다고 경고하고, UNIQUE(PRIMARY 포함)이면서 NOT NULL인 키만 참조하라고 권한다. MySQL 8.4 매뉴얼은 여기서 한 걸음 더 나아가 고유하지 않은 키나 부분 키를 참조하는 외래 키를 폐기 예정(deprecated)으로 표시하고, <code>restrict_fk_on_non_standard_key</code> 시스템 변수 설정과 묶어 두었으며, 향후 버전에서 지원이 제거될 것이라고 예고한다. 실제로 돌려 보면 차이가 분명하다. 고유하지 않은 인덱스 <code>INDEX (k)</code>만 있는 부모 컬럼을 참조하는 외래 키를 만들면, MySQL 8.0.46에서는 오류도 경고도 없이 만들어진다. MySQL 8.4.13에서는 <code>restrict_fk_on_non_standard_key</code>의 기본값이 ON(1)이고, 같은 문장이 <code>ERROR 6125 (HY000): Failed to add the foreign key constraint. Missing unique key for constraint 'nc_ibfk_1' in the referenced table 'np'</code>로 거부된다. 세션에서 이 변수를 OFF로 바꾸면 만들어지기는 하지만, 변수 자체가 폐기 예정이라는 경고(4166)와 고유하지 않은 키를 참조하는 외래 키가 폐기 예정이라는 경고(6124)가 붙는다. 부모의 PRIMARY KEY나 NOT NULL UNIQUE 키만 참조하는 것이 버전과 상관없이 안전한 선택이다.</p>
+
+<p>이름도 짚어 두자. <code>CONSTRAINT 이름</code>을 생략하면 이름이 자동으로 만들어진다. 매뉴얼의 예에서 child 테이블의 외래 키는 <code>child_ibfk_1</code>이라는 이름을 받는다. 자동 이름은 오류 메시지에서 어떤 관계가 깨졌는지 알아보기 어렵고, 나중에 <code>ALTER TABLE ... DROP FOREIGN KEY</code>로 지울 때도 먼저 이름을 찾아봐야 한다. <code>fk_자식_부모</code>처럼 관계가 드러나는 이름을 직접 붙이는 편이 낫다.</p>
+
+<h4>외래 키 컬럼의 NULL</h4>
+
+<p>위 스키마에서 <code>book.donor_member_id</code>는 NULL을 허용한다. 기증받지 않은 책은 기증자가 없기 때문이다. 외래 키 컬럼이 NULL이면 어떻게 검사될까. MySQL은 SQL 표준의 <code>MATCH SIMPLE</code>에 해당하는 의미를 구현한다. 외래 키 값의 전부 또는 일부가 NULL이면, 그 행은 부모 테이블에 일치하는 행이 없어도 들어갈 수 있다. 단일 컬럼 외래 키에서는 직관적이다. NULL은 "아무도 가리키지 않음"이고, 아무도 가리키지 않는 것은 참조 무결성을 어긴 것이 아니다. 이것이 선택적 관계(optional relationship)를 표현하는 방법이다. 반대로 대출은 반드시 회원이 있어야 하므로 <code>loan.member_id</code>를 NOT NULL로 선언했다. 관계가 필수인지 선택인지는 외래 키가 아니라 NOT NULL이 결정한다.</p>
+
+<p>복합 외래 키에서는 이 규칙이 함정이 된다. <code>(library_id, shelf_no)</code> 두 컬럼으로 서가 테이블을 참조하는데 <code>shelf_no</code>만 NULL인 행은, <code>library_id</code>가 존재하지 않는 도서관 번호여도 들어간다. 일부만 NULL이어도 검사를 건너뛰기 때문이다. 표준에는 이런 경우를 막는 <code>MATCH FULL</code>이 있지만, MySQL 매뉴얼은 어떤 스토리지 엔진도 MATCH 절을 인식하거나 강제하지 않는다고 적는다. 실제로 MySQL 8.0.46과 8.4.13에서 <code>MATCH FULL</code>을 붙인 복합 외래 키를 만들고 <code>(999, NULL)</code>을 넣으면, 999번 도서관이 없는데도 그대로 들어간다. 매뉴얼은 여기에 더해 MATCH 절을 명시하면 <b>같은 외래 키의 ON DELETE와 ON UPDATE 절까지 무시된다</b>고 경고한다. 다만 같은 두 버전에서 <code>MATCH FULL ON DELETE CASCADE ON UPDATE CASCADE</code>로 정의한 외래 키는 부모를 삭제·변경했을 때 CASCADE가 동작했다. <code>SHOW CREATE TABLE</code>에는 MATCH 절이 아예 나타나지 않고, <code>information_schema.REFERENTIAL_CONSTRAINTS</code>의 MATCH_OPTION에만 FULL로 남는다. 매뉴얼의 경고와 실제 동작이 이렇게 엇갈리는 이상, 어느 쪽에도 기대지 않는 편이 안전하다. MATCH 절은 쓰지 말고, 복합 외래 키의 컬럼은 모두 NOT NULL로 두는 것이 가장 단순한 방어다.</p>
+
+<h3>참조 동작: 부모가 사라질 때 자식은 어떻게 되는가</h3>
+
+<p>부모 행을 지우거나 부모의 키 값을 바꿀 때, 그 행을 가리키는 자식 행을 어떻게 할지 정하는 것이 참조 동작(referential action)이다. <code>ON DELETE</code>와 <code>ON UPDATE</code> 뒤에 각각 지정한다. MySQL 8.0 InnoDB에서의 의미는 다음과 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>참조 동작</th><th>부모 DELETE / UPDATE 시 InnoDB의 동작</th><th>쓸 만한 관계</th></tr></thead><tbody>
+<tr><td><code>CASCADE</code></td><td>자식 행도 함께 삭제하거나 자식의 외래 키 값을 함께 바꾼다.</td><td>부모 없이는 의미가 없는 부속 데이터(회원의 주소, 주문의 주문 항목)</td></tr>
+<tr><td><code>SET NULL</code></td><td>자식의 외래 키 컬럼을 NULL로 바꾼다. 자식 컬럼이 NOT NULL이면 안 된다.</td><td>선택적 관계(책의 기증자)</td></tr>
+<tr><td><code>RESTRICT</code></td><td>자식이 있으면 부모의 삭제·변경을 거부한다(1451).</td><td>독립적으로 보존해야 하는 기록(대출 이력)</td></tr>
+<tr><td><code>NO ACTION</code></td><td>InnoDB에서는 RESTRICT와 같다. 검사를 미루지 않고 즉시 거부한다.</td><td>RESTRICT와 같음</td></tr>
+<tr><td><code>SET DEFAULT</code></td><td>매뉴얼은 파서는 인식하지만 InnoDB와 NDB가 이 절이 있는 테이블 정의를 거부한다고 적는다. 그러나 MySQL 8.0.46과 8.4.13에서는 테이블 정의가 만들어지고 <code>SHOW CREATE TABLE</code>에도 그대로 남는다. 자식이 있는 부모를 삭제·변경하면 자식 컬럼의 기본값이 존재하는 부모 키여도 기본값으로 바꾸지 않고 1451로 거부한다.</td><td>쓸 수 없음(기본값으로 바꿔 주지 않는다)</td></tr>
+</tbody></table></div>
+
+<p>ON DELETE나 ON UPDATE를 적지 않으면 기본 동작은 항상 NO ACTION이다. 매뉴얼은 RESTRICT나 NO ACTION을 지정하는 것이 절을 생략하는 것과 같다고 적는다. 위 스키마의 <code>fk_loan_member</code>가 그 경우다. 표준 SQL에서 NO ACTION과 RESTRICT는 검사 시점이 다르다. NO ACTION은 검사를 뒤로 미룰 수 있는 동작으로 정의되어 있고, 실제로 NDB 엔진은 NO ACTION을 커밋 시점까지 미룬 검사로 처리한다. 그러나 InnoDB는 두 동작을 똑같이 즉시 검사한다. 다른 데이터베이스나 NDB에서의 NO ACTION 경험을 InnoDB에 그대로 가져오면 안 되는 이유다.</p>
+
+<h4>회원 한 명을 지울 때 일어나는 일</h4>
+
+<p>데이터를 넣고 실제로 추적해 보자. 회원 1(kim)은 주소 두 개를 등록했고 책 100을 기증했으며 대출 기록은 없다. 회원 2(lee)는 주소 하나를 등록했고 책 100을 빌려 간 기록이 있다.</p>
+
+<pre class="diagram">member          member_address              book                          loan
+--------        ------------------------    ---------------------------   -------------------------
+id  email       id  member_id  address      id   title  donor_member_id   id   member_id  book_id
+1   kim@x.kr    10  1          서울 ...      100  'SQL'  1                 500  2          100
+2   lee@x.kr    11  1          부산 ...
+                12  2          대전 ...
+
+fk_address_member : ON DELETE CASCADE
+fk_book_donor     : ON DELETE SET NULL
+fk_loan_member    : (생략 = NO ACTION = RESTRICT)</pre>
+
+<p><code>DELETE FROM member WHERE id = 1</code>을 실행하면 InnoDB는 member의 클러스터형 인덱스에서 id 1인 행을 찾아 배타 잠금을 건 뒤, member를 참조하는 외래 키 각각에 대해 자식 테이블을 살핀다. 매뉴얼은 InnoDB가 외래 키에 대응하는 인덱스의 레코드를 깊이 우선 탐색(depth-first search)으로 훑으며 연쇄 작업을 수행한다고 설명한다. 자식 테이블마다 일어나는 일은 이렇다.</p>
+
+<figure class="flow-figure"><figcaption>DELETE FROM member WHERE id = 1 의 처리</figcaption><ol class="flow">
+<li><strong>부모 행 찾기</strong><span>member의 PRIMARY 인덱스에서 id = 1 행을 찾고 잠근다.</span></li>
+<li><strong>member_address (CASCADE)</strong><span>member_id 인덱스에서 1을 찾아 행 10, 11을 발견하고 함께 삭제한다. 이 행들을 참조하는 자식이 또 있으면 같은 방식으로 더 내려간다.</span></li>
+<li><strong>book (SET NULL)</strong><span>donor_member_id 인덱스에서 1을 찾아 책 100을 발견하고 그 컬럼을 NULL로 바꾼다. 책 자체는 남는다.</span></li>
+<li><strong>loan (NO ACTION)</strong><span>member_id 인덱스에서 1을 찾는다. 대출 500은 회원 2의 것이므로 일치하는 행이 없다. 통과한다.</span></li>
+<li><strong>부모 행 삭제</strong><span>member 1이 삭제된다. 결과: member 1행, member_address 1행(12), book 100의 기증자는 NULL, loan은 그대로.</span></li>
+</ol></figure>
+
+<p>이번에는 <code>DELETE FROM member WHERE id = 2</code>를 실행한다. member_address 12는 CASCADE로 지워질 대상이고, loan 500은 회원 2를 가리키므로 NO ACTION 검사에 걸린다. 문장은 1451 오류로 실패한다. 이때 중요한 것은 InnoDB가 외래 키를 어떤 순서로 처리했든 결과가 같다는 점이다. 문장이 실패하면 그 문장이 한 일, 즉 이미 수행했을 수 있는 연쇄 삭제까지 모두 되돌려진다. 회원 2도, 주소 12도 그대로 남는다. 제약 위반이 일어난 문장은 반쯤 적용된 상태로 남지 않는다.</p>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행 (위 데이터에서 회원 1을 지운 뒤)"><code class="language-sql">DELETE FROM member WHERE id = 2;
+-- ERROR 1451 (23000): Cannot delete or update a parent row: a foreign key constraint fails
+--   (`m_db_basic_07`.`loan`, CONSTRAINT `fk_loan_member` FOREIGN KEY (`member_id`)
+--   REFERENCES `member` (`id`))
+SELECT (SELECT COUNT(*) FROM member) AS m, (SELECT GROUP_CONCAT(id) FROM member_address) AS a;
++------+------+
+| m    | a    |
++------+------+
+|    1 | 12   |
++------+------+</code></pre>
+
+<x-visual id="db-basic-07-cascade-tree" title="회원 삭제가 세 자식 테이블로 퍼지는 모습" kind="구조도" ratio="16:9">
+<x-hint>부모 행 하나를 지울 때 CASCADE, SET NULL, NO ACTION으로 묶인 세 자식 테이블이 각각 어떻게 반응하는지, 그리고 그 판단이 자식 테이블의 외래 키 인덱스 탐색으로 이루어진다는 것을 보여 준다.</x-hint>
+<x-prompt>왼쪽에 "member id=1" 이라고 적힌 상자 하나. 오른쪽으로 화살표 세 개가 갈라져 각각 상자로 이어진다. 위쪽 상자 "member_address" 에 화살표 라벨 "CASCADE", 상자 안의 두 행에 줄을 그어 "삭제" 표시. 가운데 상자 "book" 에 화살표 라벨 "SET NULL", 상자 안 한 칸이 회색 "NULL" 로 바뀐 모습. 아래쪽 상자 "loan" 에 화살표 라벨 "NO ACTION", 상자 옆에 초록 체크 "자식 없음 → 통과". 각 화살표가 자식 상자 옆의 작은 트리 아이콘 "외래 키 인덱스" 를 거쳐 들어가도록 그린다. 흰 배경, 단순한 평면 도식, 파랑·회색·초록.</x-prompt>
+<x-caption>부모 행 하나를 지우면 InnoDB는 자식 테이블마다 외래 키 인덱스를 탐색해 참조 동작을 적용한다. 어느 하나라도 실패하면 문장 전체가 되돌려진다.</x-caption>
+</x-visual>
+
+<h4>CASCADE의 경계</h4>
+
+<p>CASCADE는 편리하지만 몇 가지 경계가 있다. 첫째, <b>연쇄 동작은 트리거를 실행하지 않는다.</b> 매뉴얼은 연쇄된 외래 키 동작이 트리거를 활성화하지 않는다고 명시한다. member_address에 "삭제될 때 감사 로그를 남기는" DELETE 트리거를 걸어 두었더라도, 회원 삭제로 연쇄 삭제된 주소에 대해서는 그 트리거가 돌지 않는다. 트리거는 9회차에서 다루는데, 이 상호작용은 그때 다시 떠올릴 만하다.</p>
+
+<p>둘째, <b>깊이 제한이 있다.</b> 연쇄 동작은 15단계보다 깊게 중첩될 수 없다. 셋째, <b>자기 참조 테이블에서는 ON UPDATE CASCADE를 쓸 수 없다.</b> 카테고리 테이블의 <code>parent_id</code>가 같은 테이블의 <code>id</code>를 참조하는 경우를 생각해 보자. 매뉴얼에 따르면 ON UPDATE CASCADE나 ON UPDATE SET NULL이 같은 연쇄 안에서 이미 갱신한 테이블을 다시 갱신하게 되면 RESTRICT처럼 동작한다. 연쇄 갱신이 무한히 반복되는 것을 막기 위해서다. MySQL 8.0.46과 8.4.13에서 <code>parent_id</code>에 ON UPDATE CASCADE를 건 자기 참조 테이블은 만들어지지만, 자식이 있는 행의 <code>id</code>를 바꾸면 1451로 거부된다. 반면 자기 참조 ON DELETE CASCADE와 ON DELETE SET NULL은 가능하다. 상위 카테고리를 지우면 하위 카테고리가 줄줄이 지워지는 구조는 만들 수 있다는 뜻이다. 넷째, 매뉴얼은 MySQL이 외래 키를 즉시 검사하기 때문에 <b>외래 키로 자기 자신을 가리키는 행은 삭제할 수 없다</b>고 적는다. 표준처럼 문장 끝에서 검사한다면 문제가 없을 상황이 행 단위 즉시 검사 때문에 막히는 것이다. MySQL 8.0.46과 8.4.13에서 확인해 보면 이 제한은 참조 동작이 NO ACTION(생략)일 때 나타난다. <code>(1, 1)</code>처럼 자기 자신을 가리키는 행을 지우면 1451로 실패한다. 같은 행이라도 외래 키가 ON DELETE CASCADE나 ON DELETE SET NULL이면 삭제는 성공했다.</p>
+
+<p>마지막으로, CASCADE는 문장 하나가 건드리는 행의 수를 겉보기보다 훨씬 크게 만든다. <code>DELETE FROM member WHERE id = 1</code>이라는 짧은 문장이 자식과 손자 테이블에서 수천 행을 지울 수 있고, 지워지는 모든 행에 잠금이 걸린다. 어떤 관계에 CASCADE를 걸지는 "부모 없이 자식이 의미가 있는가"라는 질문으로 결정한다. 회원 없는 회원 주소는 의미가 없으니 CASCADE가 자연스럽다. 회원이 탈퇴했다고 대출 이력까지 사라지면 도서관의 장부가 맞지 않게 되므로 RESTRICT로 막고, 탈퇴는 별도의 상태 컬럼으로 처리하는 편이 낫다.</p>
+
+<h3>엔진 안에서: 외래 키 검사의 비용</h3>
+
+<p>외래 키 검사는 공짜가 아니다. 무엇을 사고 무엇을 지불하는지 정확히 알아야 쓸지 말지를 판단할 수 있다. 쓰기 종류별로 InnoDB가 추가로 하는 일을 정리해 보자.</p>
+
+<ul>
+<li><b>자식 INSERT, 자식의 외래 키 UPDATE</b>: 부모 테이블의 참조 인덱스(대개 PRIMARY KEY)에서 그 값을 찾는다. 없으면 1452. 있으면 찾은 부모 레코드에 공유 잠금을 건다.</li>
+<li><b>부모 DELETE, 부모 키 UPDATE</b>: 자식 테이블의 외래 키 인덱스에서 그 값을 찾는다. 참조 동작에 따라 거부하거나(RESTRICT, NO ACTION), 찾은 자식 행을 삭제·갱신한다(CASCADE, SET NULL). 자식 행을 바꾸면 그 행에는 배타 잠금이 걸린다.</li>
+<li><b>자식 DELETE, 부모 INSERT</b>: 참조 무결성을 깰 수 없는 방향이므로 외래 키 검사가 필요 없다.</li>
+</ul>
+
+<p>여기서 두 가지 설계가 이해된다. 첫째, 자식 쪽에 인덱스가 반드시 필요한 이유다. 부모 행 하나를 지울 때마다 "이 부모를 가리키는 자식이 있는가"를 물어야 하는데, 자식의 외래 키 컬럼에 인덱스가 없다면 이 질문에 답하기 위해 자식 테이블 전체를 훑어야 한다. MySQL이 자식 쪽 인덱스를 자동으로 만들어 주는 것은 이 때문이다. 둘째, 부모 쪽 인덱스가 필요한 이유도 같다. 자식을 넣을 때마다 부모를 찾아야 하기 때문이다.</p>
+
+<p>잠금 쪽이 더 미묘하다. 매뉴얼은 외래 키가 정의된 테이블에서 제약 검사가 필요한 INSERT, UPDATE, DELETE가 검사하려고 살펴본 레코드에 공유 레코드 잠금(shared record-level lock)을 건다고 적고, 검사가 실패한 경우에도 이 잠금을 건다고 덧붙인다. 대출 하나를 넣는 트랜잭션은 회원 행과 책 행에 공유 잠금을 쥐고, 그 트랜잭션이 끝날 때까지 놓지 않는다. 공유 잠금끼리는 충돌하지 않으므로 같은 회원으로 대출 여러 건을 동시에 넣는 것은 문제가 없다. 그러나 그 사이에 다른 트랜잭션이 그 회원 행을 지우거나 수정하려고 배타 잠금을 요청하면, 대출을 넣은 트랜잭션이 끝날 때까지 기다려야 한다.</p>
+
+<pre class="diagram">트랜잭션 A                                    트랜잭션 B
+------------------------------------------   ------------------------------------------
+INSERT INTO loan (member_id, ...) VALUES (2, ...)
+  → member PRIMARY 인덱스에서 id=2 탐색
+  → member(id=2) 레코드에 S 잠금
+  → loan 행 삽입
+                                             UPDATE member SET grade='VIP' WHERE id = 2
+                                               → member(id=2)에 X 잠금 요청
+                                               → A의 S 잠금과 충돌, 대기
+COMMIT  (S 잠금 해제)
+                                               → X 잠금 획득, UPDATE 진행</pre>
+
+<p>MySQL 8.0.46에서 이 두 트랜잭션을 실제로 겹쳐 실행하고, B가 기다리는 동안 <code>performance_schema.data_locks</code>를 조회하면 다음과 같다. A는 대출 하나를 넣었을 뿐인데 회원 2와 책 100의 PRIMARY 인덱스 레코드에 공유 잠금(S)을 쥐고 있고, B의 배타 잠금(X) 요청은 WAITING 상태다. A가 COMMIT한 뒤에야 B의 UPDATE가 끝났다.</p>
+
+<pre data-label="MySQL 8.0.46에서 실행"><code class="language-sql">+-------------+------------+-----------+---------------+-------------+-----------+
+| OBJECT_NAME | INDEX_NAME | LOCK_TYPE | LOCK_MODE     | LOCK_STATUS | LOCK_DATA |
++-------------+------------+-----------+---------------+-------------+-----------+
+| member      | PRIMARY    | RECORD    | S,REC_NOT_GAP | GRANTED     | 2         |
+| book        | PRIMARY    | RECORD    | S,REC_NOT_GAP | GRANTED     | 100       |
+| loan        | NULL       | TABLE     | IX            | GRANTED     | NULL      |
+| book        | NULL       | TABLE     | IS            | GRANTED     | NULL      |
+| member      | NULL       | TABLE     | IS            | GRANTED     | NULL      |
+| member      | PRIMARY    | RECORD    | X,REC_NOT_GAP | WAITING     | 2         |
+| member      | NULL       | TABLE     | IX            | GRANTED     | NULL      |
++-------------+------------+-----------+---------------+-------------+-----------+</code></pre>
+
+<p>왜 굳이 잠금을 걸까. 잠금이 없다면 A가 "회원 2가 있다"고 확인한 직후, A가 커밋하기 전에 B가 회원 2를 지우고 커밋할 수 있다. 그러면 A가 커밋한 순간 존재하지 않는 회원을 가리키는 대출이 생긴다. 앞에서 본 검사 후 실행 경쟁 조건이 이번에는 데이터베이스 내부에서 일어나는 것이다. 공유 잠금은 "A가 끝날 때까지 이 부모는 사라지지 않는다"는 보장을 만든다. 무결성의 대가로 동시성을 일부 내준 것이다. 부모 행이 자주 갱신되는 테이블(예: 회원 테이블의 마지막 접속 시각)이라면 자식 INSERT가 많을 때 이 대기가 눈에 띌 수 있다. 회원 테이블의 자주 바뀌는 컬럼을 별도 테이블로 분리하는 설계가 나오는 배경 가운데 하나다.</p>
+
+<p>잠금은 행에서 끝나지 않는다. 매뉴얼은 MySQL이 필요하면 외래 키로 연결된 테이블까지 메타데이터 잠금(metadata lock)을 확장한다고 적는다. 부모 테이블의 구조를 바꾸는 DDL이 자식 테이블을 쓰는 작업과도 얽힐 수 있다는 뜻이다.</p>
+
+<h4>foreign_key_checks: 검사를 끄는 스위치</h4>
+
+<p>외래 키 검사는 <code>foreign_key_checks</code> 시스템 변수로 켜고 끌 수 있고, 기본값은 켜짐이다. 매뉴얼은 이 변수를 끄는 것이 유용한 경우로 다른 테이블이 참조하는 테이블을 지울 때, 외래 키 관계가 요구하는 순서와 다른 순서로 테이블을 다시 적재할 때, LOAD DATA로 대량 적재할 때, 외래 키 관계가 있는 테이블에 ALTER TABLE을 실행할 때를 든다. 백업 파일을 복원하는 상황을 떠올리면 이해가 된다. 테이블이 알파벳 순서로 적재되는데 loan이 member보다 먼저 들어가면 모든 대출 행이 1452로 실패할 것이다.</p>
+
+<p>위험은 다시 켤 때 있다. 매뉴얼은 <code>foreign_key_checks</code>를 다시 켜도 테이블 데이터를 스캔하지 않으므로, 꺼져 있는 동안 추가된 행은 다시 켤 때 일관성 검사를 받지 않는다고 명시한다. 검사를 끈 사이에 고아 행(orphan row, 부모가 없는 자식 행)이 들어갔다면 그 행은 그대로 남고, 데이터베이스는 그 사실을 알려 주지 않는다. 검사를 꺼야 한다면 다시 켠 뒤 고아 행을 찾는 쿼리, 예를 들어 2회차의 외부 조인으로 <code>LEFT JOIN member m ON m.id = l.member_id WHERE m.id IS NULL</code>을 직접 돌려 확인해야 한다.</p>
+
+<h3>CHECK 제약 조건: 행이 지켜야 할 조건식</h3>
+
+<p>NOT NULL은 "비어 있지 않다", UNIQUE는 "겹치지 않는다", 외래 키는 "가리키는 대상이 있다"라는 정해진 모양의 규칙이다. 그 밖의 규칙, 즉 "보유 권수는 0 이상", "반납 예정일은 대출일보다 뒤", "등급은 BASIC, VIP 중 하나" 같은 규칙은 CHECK 제약 조건(CHECK constraint)으로 표현한다. CHECK는 행 하나에 대해 참·거짓을 판정하는 조건식을 테이블에 붙여 두는 장치다.</p>
+
+<h4>8.0.16 이전에는 무시되었다</h4>
+
+<p>MySQL의 CHECK에는 꼭 알아야 할 역사가 있다. 매뉴얼에 따르면 MySQL 8.0.16 이전의 CREATE TABLE은 테이블 CHECK 제약의 제한된 문법 <code>CHECK (expr)</code>을 허용하되, 그것을 <b>파싱하고 무시했다</b>. 오류도 경고도 없이 문장은 성공하지만 조건은 강제되지 않았다. 8.0.16부터 모든 스토리지 엔진에서 테이블 CHECK와 컬럼 CHECK의 핵심 기능이 동작한다. 이 사실이 실무에서 의미하는 바는 분명하다. 오래된 MySQL에서 만든 스키마에 CHECK가 적혀 있었다면, 그 기간에 들어간 데이터가 그 조건을 만족한다고 가정할 수 없다. 스키마 파일에 적힌 규칙과 엔진이 실제로 강제하는 규칙이 다를 수 있다는 교훈은 앞에서 본 비 InnoDB 엔진의 FOREIGN KEY 무시와 같은 이야기다. 지금 무엇이 강제되고 있는지는 <code>SHOW CREATE TABLE</code>로 확인한다.</p>
+
+<h4>문법과 이름</h4>
+
+<p>8.0.16 이후의 문법은 <code>[CONSTRAINT [symbol]] CHECK (expr) [[NOT] ENFORCED]</code>다. CHECK는 두 자리에 쓸 수 있다. 컬럼 정의 안에 쓰는 컬럼 제약(column constraint)은 그 컬럼만 참조할 수 있다. 컬럼 정의 밖에 쓰는 테이블 제약(table constraint)은 테이블의 어떤 컬럼이든, 여러 개라도 참조할 수 있고, 정의에서 뒤에 나오는 컬럼을 앞에서 참조하는 것도 허용된다. 반납 예정일과 대출일을 비교하는 <code>ck_loan_period</code>는 두 컬럼을 쓰므로 테이블 제약이어야 한다.</p>
+
+<p>이름을 생략하면 MySQL이 테이블 이름, 리터럴 <code>_chk_</code>, 순번(1, 2, 3, ...)을 이어 붙여 이름을 만든다. 테이블 t1의 첫 CHECK는 <code>t1_chk_1</code>이 된다. 이름에 관해 하나 더 주의할 점이 있다. MySQL에서 제약 종류마다 이름 공간(namespace)은 스키마(데이터베이스) 단위다. 그래서 CHECK 제약 이름은 스키마 안에서 유일해야 하고, 같은 스키마의 두 테이블이 같은 CHECK 이름을 가질 수 없다. book과 loan에 모두 <code>ck_positive</code>라는 이름을 붙이려 하면 두 번째 테이블을 만들 때 실패한다(MySQL 8.0.46·8.4.13에서 <code>ERROR 3822 (HY000): Duplicate check constraint name 'ck_positive'.</code>). 이름에 테이블 이름을 넣는 관례(<code>ck_book_copies</code>)가 이 충돌을 자연스럽게 피한다. 이름 길이는 최대 64자이고, 대소문자는 구별하며 악센트는 구별하지 않는다.</p>
+
+<p><code>ENFORCED</code>는 기본값이며, <code>NOT ENFORCED</code>를 지정하면 제약 정의는 만들어지지만 강제되지 않는다. 대량 이관처럼 일시적으로 검사를 미루고 싶을 때 쓸 수 있는데, foreign_key_checks에서 본 것과 같은 위험이 따른다. 강제되지 않는 동안 들어온 데이터가 조건을 만족한다는 보장은 없다.</p>
+
+<h4>NULL은 통과한다</h4>
+
+<p>CHECK에서 가장 중요한 규칙은 판정 기준이다. 매뉴얼은 조건식이 각 행에 대해 TRUE 또는 UNKNOWN(NULL 값 때문에)으로 평가되어야 하고, FALSE로 평가될 때만 위반이라고 정의한다. 즉 CHECK는 "참이어야 통과"가 아니라 "거짓이 아니면 통과"다. WHERE 절이 TRUE인 행만 고르는 것과 반대 방향이라는 점에 주의하자. WHERE는 UNKNOWN을 버리고, CHECK는 UNKNOWN을 받아들인다.</p>
+
+<pre data-label="MySQL 8.0.46·8.4.13에서 실행"><code class="language-sql">CREATE TABLE fee (
+    id            BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    amount        INT          NOT NULL,
+    discount_rate DECIMAL(3,2),                          -- NULL 허용
+    CONSTRAINT ck_fee_amount   CHECK (amount >= 0),
+    CONSTRAINT ck_fee_discount CHECK (discount_rate BETWEEN 0 AND 1)
+);
+
+INSERT INTO fee (amount, discount_rate) VALUES (1000, 0.10);   -- ① 성공
+INSERT INTO fee (amount, discount_rate) VALUES (1000, 1.50);   -- ② 실패
+-- ERROR 3819 (HY000): Check constraint 'ck_fee_discount' is violated.
+INSERT INTO fee (amount, discount_rate) VALUES (1000, NULL);   -- ③ 성공
+INSERT INTO fee (amount, discount_rate) VALUES (-500, NULL);   -- ④ 실패
+-- ERROR 3819 (HY000): Check constraint 'ck_fee_amount' is violated.</code></pre>
+
+<p>한 줄씩 따라가 보자. ①은 <code>1000 >= 0</code>이 TRUE, <code>0.10 BETWEEN 0 AND 1</code>이 TRUE이므로 통과한다. ②는 1.50이 범위를 벗어나 FALSE이므로 위반이다. ③이 핵심이다. <code>NULL BETWEEN 0 AND 1</code>은 UNKNOWN이고, UNKNOWN은 위반이 아니므로 통과한다. 할인율을 모르는 행은 들어갈 수 있다. ④는 할인율이 NULL이라 ck_fee_discount는 통과하지만 <code>-500 >= 0</code>이 FALSE라서 ck_fee_amount에 걸린다. 한 행에 CHECK가 여럿이면 모두 FALSE가 아니어야 한다.</p>
+
+<p>그러므로 "값이 반드시 있고, 범위 안에 있어야 한다"는 규칙은 CHECK만으로 표현되지 않는다. NOT NULL과 CHECK를 함께 선언해야 한다. 위 fee 테이블의 <code>amount</code>가 그렇게 되어 있다. loan 테이블의 <code>ck_loan_return</code>이 <code>returned_on IS NULL OR returned_on >= loaned_on</code>이라고 적은 것도 사실은 <code>returned_on >= loaned_on</code>만 적어도 NULL이 통과하므로 같은 효과다. 그래도 "아직 반납하지 않은 경우는 허용한다"는 의도를 식에 드러내 두면 읽는 사람이 3값 논리를 떠올릴 필요가 없다.</p>
+
+<x-visual id="db-basic-07-check-eval" title="CHECK 조건식의 세 가지 결과와 판정" kind="순서도" ratio="16:9">
+<x-hint>CHECK 조건식이 TRUE, UNKNOWN, FALSE 가운데 무엇으로 평가되는지에 따라 행이 받아들여지거나 거부되는 흐름을 WHERE 절과 대비해 보여 준다.</x-hint>
+<x-prompt>위에서 아래로 흐르는 순서도. 맨 위 상자 "행 INSERT / UPDATE". 아래 마름모 "CHECK 식 평가". 마름모에서 세 갈래 화살표: 왼쪽 "TRUE" 는 초록 상자 "통과", 가운데 "UNKNOWN (NULL)" 도 초록 상자 "통과", 오른쪽 "FALSE" 는 빨간 상자 "ERROR 3819". 그림 오른쪽 아래에 작은 비교 표: 두 열 "CHECK" 와 "WHERE", 행 "UNKNOWN" 에 대해 각각 "통과" 와 "제외". 흰 배경, 평면 도식, 초록·빨강·회색.</x-prompt>
+<x-caption>CHECK는 FALSE일 때만 거부한다. UNKNOWN을 버리는 WHERE와 반대이므로, NULL까지 막으려면 NOT NULL을 함께 선언해야 한다.</x-caption>
+</x-visual>
+
+<h4>CHECK에 쓸 수 없는 식과 그 이유</h4>
+
+<p>CHECK 식에는 제한이 많다. 매뉴얼이 정한 규칙은 다음과 같고, 금지된 구성이 있으면 테이블 정의 시점에 오류가 난다. 괄호 안의 오류 번호는 MySQL 8.0.46과 8.4.13에서 실제로 받은 것이다.</p>
+
+<ul>
+<li>일반 컬럼과 생성 컬럼은 쓸 수 있다. 단, AUTO_INCREMENT 컬럼(오류 3818)과 다른 테이블의 컬럼은 쓸 수 없다.</li>
+<li>리터럴, 결정적(deterministic) 내장 함수, 연산자는 쓸 수 있다. <code>CONNECTION_ID()</code>, <code>CURRENT_USER()</code>, <code>NOW()</code> 같은 비결정적 함수는 쓸 수 없다(오류 3814).</li>
+<li>저장 함수와 로드 가능 함수(loadable function), 저장 프로그램의 매개변수, 변수(시스템 변수, 사용자 정의 변수, 지역 변수)는 쓸 수 없다(변수는 오류 3816).</li>
+<li>서브쿼리는 쓸 수 없다(오류 3815).</li>
+<li>외래 키 참조 동작(ON UPDATE, ON DELETE)에 쓰이는 컬럼에는 CHECK를 걸 수 없고, 반대로 CHECK에 쓰인 컬럼에 참조 동작을 걸 수도 없다(오류 3823).</li>
+</ul>
+
+<p>이 목록은 외워야 할 잡다한 예외처럼 보이지만 원리 하나로 묶인다. CHECK는 행이 바뀔 때, 그 행의 값만 보고 평가된다. 그래서 그 결과는 그 행의 값만으로 결정되어야 한다. 매뉴얼이 결정적 함수를 "테이블 데이터가 같으면 여러 번 호출해도, 접속한 사용자와 상관없이 같은 결과를 내는 함수"로 정의하는 것도 같은 맥락이다. <code>CHECK (due_on > CURDATE())</code>를 허용한다고 해 보자. 오늘 넣은 행은 통과하지만, 내일이 되면 행은 그대로인데 조건이 거짓이 될 수 있다. 엔진은 시간이 흐른다고 모든 행을 다시 검사하지 않으므로, "테이블의 모든 행이 이 조건을 만족한다"는 약속이 아무도 모르게 깨진다. 서브쿼리나 다른 테이블 컬럼도 마찬가지다. 다른 테이블이 바뀌면 이 행의 조건이 거짓이 될 수 있는데, 다른 테이블이 바뀔 때 이 테이블의 CHECK는 평가되지 않는다. 테이블 사이의 규칙은 외래 키처럼 양쪽 쓰기를 모두 감시하는 별도의 장치가 필요하다.</p>
+
+<p>외래 키 참조 동작과의 충돌도 같은 원리다. CASCADE나 SET NULL은 엔진이 자식 행을 대신 바꾸는 동작인데, 그렇게 바뀐 값이 CHECK를 어기면 부모 쪽 문장을 실패시켜야 하는지 같은 복잡한 문제가 생긴다. MySQL은 두 기능이 같은 컬럼에서 만나는 것 자체를 금지하는 쪽을 택했다. 그래서 이 회차의 book 테이블은 참조 동작이 걸린 <code>donor_member_id</code>가 아니라 <code>copies</code>에만 CHECK를 걸었다.</p>
+
+<p>"반납 예정일은 오늘 이후"처럼 시간에 의존하는 규칙이 꼭 필요하다면, 그것은 불변식이 아니라 "입력 시점의 검증"이므로 애플리케이션이나 9회차에서 볼 트리거에서 처리한다. CHECK로 옮길 수 있는 것은 <code>due_on > loaned_on</code>처럼 행 안의 값끼리의 관계로 바꿔 쓸 수 있는 부분이다.</p>
+
+<h4>언제 평가되는가</h4>
+
+<p>CHECK는 INSERT, UPDATE, REPLACE, LOAD DATA, LOAD XML에서 평가되고, 조건이 FALSE면 오류가 난다. IGNORE가 붙은 문장(<code>INSERT IGNORE</code>, <code>UPDATE IGNORE</code>, <code>LOAD DATA ... IGNORE</code>, <code>LOAD XML ... IGNORE</code>)에서는 오류 대신 경고가 나고, 위반한 행의 삽입이나 갱신은 건너뛴다. 앞의 fee 테이블에 <code>INSERT IGNORE INTO fee (amount, discount_rate) VALUES (5, 0.5), (-1, 0.5), (6, 0.6)</code>을 실행하면 MySQL 8.0.46·8.4.13에서 <code>Warning (Code 3819): Check constraint 'ck_fee_amount' is violated.</code>가 나고 5와 6인 두 행만 들어간다. 조건식의 결과 타입이 컬럼의 선언 타입과 다르면 MySQL의 일반 형 변환 규칙으로 암묵적 변환이 일어나고, 변환에 실패하거나 정밀도가 손실되면 오류가 난다. 식 평가에는 평가 시점의 SQL 모드가 적용된다. 같은 CHECK도 세션의 SQL 모드에 따라 형 변환 결과가 달라질 수 있다는 뜻이므로, 엄격 모드를 끄지 말아야 할 이유가 하나 더 생긴다.</p>
+
+<h3>위반 오류를 읽는 법</h3>
+
+<p>이 회차에서 만난 오류를 한 표에 모으면 다음과 같다. 메시지의 <code>%s</code> 자리에는 실제 값, 컬럼 이름, 제약 이름이 들어간다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>번호</th><th>SQLSTATE</th><th>심벌</th><th>메시지 틀</th><th>원인</th></tr></thead><tbody>
+<tr><td>1048</td><td>23000</td><td>ER_BAD_NULL_ERROR</td><td><code>Column '%s' cannot be null</code></td><td>NOT NULL 컬럼에 NULL</td></tr>
+<tr><td>1364</td><td>HY000</td><td>ER_NO_DEFAULT_FOR_FIELD</td><td><code>Field '%s' doesn't have a default value</code></td><td>DEFAULT 없는 NOT NULL 컬럼의 값이 빠짐(엄격 모드)</td></tr>
+<tr><td>1062</td><td>23000</td><td>ER_DUP_ENTRY</td><td><code>Duplicate entry '%s' for key '%s'</code></td><td>PRIMARY KEY, UNIQUE 중복</td></tr>
+<tr><td>1452</td><td>23000</td><td>ER_NO_REFERENCED_ROW_2</td><td><code>Cannot add or update a child row: a foreign key constraint fails (%s)</code></td><td>없는 부모를 가리키는 자식</td></tr>
+<tr><td>1451</td><td>23000</td><td>ER_ROW_IS_REFERENCED_2</td><td><code>Cannot delete or update a parent row: a foreign key constraint fails (%s)</code></td><td>자식이 있는 부모의 삭제·변경</td></tr>
+<tr><td>3819</td><td>HY000</td><td>ER_CHECK_CONSTRAINT_VIOLATED</td><td><code>Check constraint '%s' is violated.</code></td><td>CHECK 식이 FALSE</td></tr>
+</tbody></table></div>
+
+<p>SQLSTATE 열을 눈여겨보자. SQLSTATE는 SQL 표준이 정한 다섯 글자 상태 코드이고, 앞 두 글자가 클래스다. 자바의 <code>java.sql.SQLIntegrityConstraintViolationException</code> Javadoc은 이 예외를 SQLSTATE 클래스 값이 23일 때(또는 벤더가 정한 조건에서) 던지는 예외로, 무결성 제약(외래 키, 기본 키, 고유 키) 위반을 나타낸다고 설명한다. 그런데 표를 보면 1048, 1062, 1451, 1452는 23000이지만 CHECK 위반 3819와 기본값 없음 1364는 HY000이다. HY000은 특정 클래스로 분류되지 않은 일반 오류를 뜻하는 코드다. 오류를 SQLSTATE 클래스 23으로만 가려내는 코드가 있다면 CHECK 위반을 무결성 위반으로 인식하지 못할 수 있다. 오류를 분류할 때는 SQLSTATE와 함께 벤더 오류 번호(<code>SQLException.getErrorCode()</code>)를 확인하는 것이 안전하다.</p>
+
+<p>스프링을 쓰면 JDBC 예외는 스프링의 데이터 접근 예외 계층으로 번역된다. 무결성 위반은 <code>DataIntegrityViolationException</code> 계열로, 그중 중복 키는 그 하위 타입인 <code>DuplicateKeyException</code>으로 받는 것이 일반적이다. 앞에서 "애플리케이션은 미리 검사했더라도 INSERT가 중복으로 실패하는 경우를 처리해야 한다"고 했는데, 스프링 애플리케이션에서 그 처리는 이 예외를 잡아 "이미 가입된 이메일"이라는 응답으로 바꾸는 일이 된다. 예외 번역의 구체적인 동작은 뒤의 스프링 DB 강의에서 다시 만난다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<h4>"UNIQUE를 걸면 NULL도 하나만 들어간다"</h4>
+<p>아니다. NULL을 허용하는 컬럼의 UNIQUE 인덱스는 NULL을 여러 개 허용한다. NULL끼리의 비교가 UNKNOWN이라 중복으로 판정할 수 없기 때문이다. 복합 UNIQUE에서 한 컬럼이라도 NULL이면 그 행은 중복 검사를 사실상 빠져나간다. "값이 없는 경우도 하나만"이 규칙이라면 NOT NULL과 함께 설계해야 한다.</p>
+
+<h4>"CHECK (x >= 0)을 걸었으니 x는 반드시 0 이상이다"</h4>
+<p>x가 NULL일 수 있다면 아니다. CHECK는 FALSE만 거부하고 UNKNOWN은 통과시킨다. "반드시 있다"는 NOT NULL의 몫이다. 또 8.0.16 이전에 만든 테이블이라면 그 CHECK는 아예 강제된 적이 없을 수 있다.</p>
+
+<h4>"NO ACTION은 커밋할 때 검사한다"</h4>
+<p>표준과 NDB에서는 그런 의미를 가질 수 있지만 InnoDB에서는 아니다. InnoDB의 NO ACTION은 RESTRICT와 똑같이 즉시, 행 단위로 검사한다. 트랜잭션 안에서 "부모를 먼저 지우고 자식을 나중에 지우면 커밋 때는 일관되니 괜찮겠지"라는 순서는 InnoDB에서 부모 삭제 시점에 1451로 실패한다. 자식을 먼저 지워야 한다.</p>
+
+<h4>"MATCH FULL을 쓰면 복합 외래 키의 NULL을 막을 수 있다"</h4>
+<p>MySQL의 어떤 스토리지 엔진도 MATCH 절을 강제하지 않는다. 8.0.46과 8.4.13에서 MATCH FULL을 붙여도 일부가 NULL인 행은 부모가 없어도 들어간다. 게다가 매뉴얼은 MATCH 절을 적으면 같은 외래 키의 ON DELETE, ON UPDATE 절까지 무시된다고 경고한다(이 두 버전에서 실행해 보면 CASCADE는 동작했다). 효과가 없고, 매뉴얼과 실제 동작조차 엇갈리는 절이니 쓰지 않는 것이 맞다.</p>
+
+<h4>"foreign_key_checks를 다시 켜면 그동안 들어온 데이터도 검사된다"</h4>
+<p>매뉴얼은 다시 켜도 테이블 데이터를 스캔하지 않는다고 명시한다. 꺼져 있는 동안 생긴 고아 행은 그대로 남는다. 다시 켠 뒤 외부 조인으로 직접 확인해야 한다.</p>
+
+<h4>"애플리케이션에서 다 검사하니 제약은 필요 없다"</h4>
+<p>이 회차의 첫 번째 시나리오가 반례다. 검사 후 실행은 동시 요청 앞에서 뚫리고, 애플리케이션을 거치지 않는 쓰기 경로는 처음부터 검사 밖에 있다. 애플리케이션 검사는 친절한 안내를, 제약 조건은 최종 판정을 맡는다. 반대 방향의 오해도 있다. 제약만 믿고 애플리케이션 검사를 없애면 사용자는 매번 데이터베이스 오류를 번역한 메시지만 받게 된다. 두 겹은 역할이 다르다.</p>
+
+<h4>"제약은 문장이 끝난 결과에 대해 검사된다"</h4>
+<p>MySQL에서 UNIQUE와 외래 키는 행 단위로 즉시 검사된다. <code>UPDATE t SET id = id + 1</code>이 순서에 따라 실패하는 것, 참조 동작이 NO ACTION인 외래 키로 자기 자신을 가리키는 행을 지울 수 없는 것이 그 결과다. 중간 상태도 규칙을 지키도록 문장을 짜야 한다.</p>
+
+<h3>다른 주제와의 연결</h3>
+
+<p>이 회차의 내용은 같은 권의 다른 회차와 촘촘히 이어진다. UNIQUE와 PRIMARY KEY가 결국 인덱스라는 사실은 5·6회차의 B+Tree, 클러스터형 인덱스와 보조 인덱스 이야기의 연장이다. 고유 인덱스와 외래 키 인덱스는 무결성 장치이면서 동시에 조회 성능에 쓰이는 인덱스이기도 하므로, 인덱스를 설계할 때 "이 인덱스를 지워도 되는가"를 판단하려면 그것이 어떤 제약을 떠받치고 있는지 먼저 봐야 한다. 중복 키 검사의 공유 잠금, 외래 키 검사의 공유 레코드 잠금, 커밋되지 않은 행이 조회에 보이지 않는 현상은 8회차의 트랜잭션, 격리 수준, 잠금, MVCC에서 원리부터 다시 다룬다. 연쇄 동작이 트리거를 실행하지 않는다는 사실과, CHECK로 표현할 수 없는 규칙을 어디서 처리할지는 9회차의 저장 프로시저, 함수, 트리거와 이어진다.</p>
+
+<p>앞으로 JPA를 배우면 엔티티의 매핑 정보로 테이블을 생성하는 기능을 만난다. <code>@Column(nullable = false)</code>나 <code>@Table</code>의 <code>uniqueConstraints</code> 같은 설정은 생성되는 DDL에 NOT NULL과 UNIQUE 제약으로 들어간다. 이때도 원리는 같다. 자바 코드의 애노테이션이 데이터를 지키는 것이 아니라, 그 애노테이션이 만들어 낸 데이터베이스의 제약이 지킨다. 스키마를 다른 도구로 관리하는 프로젝트라면 애노테이션과 실제 스키마가 어긋날 수 있으므로, 무엇이 강제되고 있는지는 결국 <code>SHOW CREATE TABLE</code>이 알려 준다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>제약 조건은 데이터가 지켜야 할 규칙을 테이블 정의에 선언해, 어떤 경로로 들어온 쓰기든 엔진이 검사하게 만드는 장치다. InnoDB에서 PRIMARY KEY와 UNIQUE는 인덱스로, 외래 키는 양쪽 인덱스 탐색과 공유 레코드 잠금으로, CHECK는 행 단위 조건식 평가로 강제된다. 검사는 행마다 즉시 일어나고, 실패한 문장은 통째로 되돌려진다. NULL은 UNIQUE의 중복 검사와 CHECK의 조건을 통과하므로 "값이 반드시 있어야 한다"는 규칙은 언제나 NOT NULL이 따로 맡는다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>데이터 무결성</dt><dd>데이터가 현실에서 가능한 상태만 담고 있는 성질이다. 개체 무결성(식별), 참조 무결성(가리키는 대상의 존재), 도메인 무결성(값의 범위)으로 나누어 생각하면 각 제약 조건의 역할이 정리된다.</dd>
+<dt>검사 후 실행 경쟁</dt><dd>조회로 중복을 확인한 뒤 삽입하는 방식은 동시 요청 두 개가 모두 통과할 수 있다. UNIQUE 제약은 검사를 INSERT 안으로 옮기고, 커밋되지 않은 같은 키를 만나면 잠금을 기다린 뒤 1062로 판정한다.</dd>
+<dt>NOT NULL과 엄격 모드</dt><dd>MySQL 8.0의 기본 SQL 모드는 STRICT_TRANS_TABLES를 포함해, NOT NULL 위반(1048)이나 기본값 없는 컬럼의 누락(1364)을 오류로 만들고 문장을 되돌린다. 엄격 모드를 끄면 암묵적 기본값(숫자 0, 빈 문자열 등)이 조용히 저장된다.</dd>
+<dt>DEFAULT</dt><dd>값이 빠졌을 때 채울 값이다. 8.0.13부터 괄호로 감싼 표현식을 쓸 수 있고, BLOB·TEXT·GEOMETRY·JSON은 표현식 형태로만 기본값을 가질 수 있다.</dd>
+<dt>PRIMARY KEY와 UNIQUE</dt><dd>둘 다 고유 인덱스로 구현된다. PRIMARY KEY는 NOT NULL이 강제되고 InnoDB의 클러스터형 인덱스가 된다. UNIQUE는 NULL을 여러 개 허용한다.</dd>
+<dt>외래 키</dt><dd>자식의 참조 값이 부모에 존재하도록 강제한다. 자식 쪽 인덱스는 자동으로 만들어지고, 검사할 때 살펴본 레코드에 공유 잠금이 걸린다. NULL이 섞인 외래 키는 검사를 건너뛴다(MATCH SIMPLE).</dd>
+<dt>참조 동작</dt><dd>CASCADE는 함께 삭제·변경, SET NULL은 자식 컬럼을 NULL로, RESTRICT와 NO ACTION은 InnoDB에서 똑같이 즉시 거부한다. SET DEFAULT는 InnoDB에서 기본값으로 바꿔 주지 않고 부모 삭제·변경을 1451로 거부하며(8.0.46·8.4.13에서 실행), 생략하면 NO ACTION이다. 연쇄 동작은 트리거를 실행하지 않고 15단계까지 중첩된다.</dd>
+<dt>CHECK</dt><dd>8.0.16부터 강제되는 행 단위 조건식이다. FALSE만 위반(3819)이고 UNKNOWN은 통과한다. 비결정적 함수, 서브쿼리, 다른 테이블의 컬럼, 변수는 쓸 수 없다.</dd>
+<dt>행 단위 즉시 검사</dt><dd>MySQL은 UNIQUE와 외래 키를 문장 끝이나 커밋이 아니라 행을 바꿀 때마다 검사한다. 그래서 갱신 순서에 따라 중간 상태에서 위반이 날 수 있다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 무결성 문제는 대개 "언젠가 생긴 이상한 데이터"로 발견된다. 이메일이 같은 회원 두 명, 부모 없는 주문 항목, 음수 재고가 그런 예다. 원인을 추적하면 애플리케이션의 검사 후 실행 코드가 동시 요청에 뚫렸거나, 배치나 수작업 SQL이 애플리케이션 검사를 우회했거나, 데이터 이관 중 foreign_key_checks를 끈 채 고아 행이 들어간 경우가 많다. 이때 해법은 같은 검사 코드를 더 꼼꼼히 짜는 것이 아니라, 규칙을 데이터베이스로 내려 모든 쓰기 경로에 같은 판정이 적용되게 하는 것이다. 이미 오염된 데이터가 있으면 제약을 거는 일 자체가 실패할 수 있으므로, 외부 조인과 GROUP BY로 위반 행을 먼저 찾아 정리하는 순서가 필요하다.</p>
+<p>외래 키를 걸지 말지는 실제로 판단이 갈리는 지점이다. 외래 키는 참조 무결성을 엔진이 보장하는 대가로 자식 쓰기마다 부모 인덱스 탐색과 공유 잠금을, 부모 삭제마다 자식 인덱스 탐색을 요구한다. 부모 행이 자주 갱신되면서 자식 삽입이 매우 많은 테이블에서는 그 잠금 대기가 문제가 될 수 있다. 또 서로 다른 데이터베이스 서버에 나뉘어 저장된 테이블 사이에는 외래 키를 걸 수 없다. 이런 조건에서는 외래 키 없이 애플리케이션과 주기적인 정합성 점검 쿼리로 참조 무결성을 관리하는 선택도 나온다. 판단 기준은 "이 관계가 깨졌을 때의 비용"과 "검사와 잠금의 비용" 가운데 무엇이 큰가다. 근거 없이 "외래 키는 느리니 쓰지 않는다"로 정하지 말고, 잠금 대기가 실제로 관측되는지부터 확인하는 편이 낫다.</p>
+<p>CASCADE는 편리함과 사고 범위가 비례한다. 운영자가 잘못된 조건으로 부모를 지웠을 때 RESTRICT라면 1451 오류로 멈추지만, CASCADE라면 자식과 손자까지 조용히 사라진다. 부모 없이 의미가 없는 부속 데이터에만 CASCADE를 쓰고, 기록으로 남아야 하는 데이터는 RESTRICT로 보호한 뒤 삭제 대신 상태 변경으로 처리하는 것이 사고를 줄이는 방향이다.</p>
+</x-review>
+
+<x-practice>
+<li>본문의 도서관 데이터(member 1·2, member_address 10·11·12, book 100의 기증자 1, loan 500은 회원 2와 책 100)에서 <code>DELETE FROM member WHERE id = 1</code>을 실행한 뒤, 다시 <code>DELETE FROM book WHERE id = 100</code>을 실행했다. 두 문장 각각의 결과와 실행 후 네 테이블의 행 수를 예측하라.</li>
+<li>고유 인덱스가 있는 <code>id</code> 컬럼에 1, 2, 3이 들어 있다. <code>UPDATE t SET id = id + 1</code>이 id 오름차순으로 행을 갱신한다고 할 때 어디서 무엇이 실패하는지 추적하고, 실패한 뒤 테이블의 상태를 말하라. 그리고 같은 목표를 달성하는 문장을 써라.</li>
+<li>누군가 loan 테이블에 <code>CONSTRAINT ck_due CHECK (due_on > CURDATE())</code>를 추가하려다 오류를 받았다. MySQL이 이것을 금지하는 이유를 "불변식"이라는 말을 써서 설명하고, 이 규칙 가운데 CHECK로 옮길 수 있는 부분과 없는 부분을 나누어라.</li>
+<li><code>CREATE TABLE t2 (id INT NOT NULL)</code>에 대해 <code>INSERT INTO t2 (id) VALUES (1), (NULL), (3)</code>을 (가) 기본 SQL 모드에서, (나) <code>sql_mode</code>가 빈 문자열인 세션에서 실행했다. 각각의 결과와 테이블 내용을 쓰고, (나)가 왜 위험한지 설명하라.</li>
+<li>트랜잭션 A가 <code>INSERT INTO loan (member_id, ...) VALUES (2, ...)</code>를 실행하고 아직 커밋하지 않았다. 이때 트랜잭션 B가 <code>DELETE FROM member WHERE id = 2</code>를 실행한다(loan에는 회원 2의 다른 대출이 없다고 하자). B는 어떻게 되는가? A가 커밋할 때와 롤백할 때로 나누어 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 첫 문장은 본문의 추적 그대로 성공한다. member_address 10, 11이 CASCADE로 삭제되고 book 100의 donor_member_id가 NULL이 되며, loan에는 회원 1을 가리키는 행이 없으므로 통과한다. 실행 후 member 1행(2), member_address 1행(12), book 1행(100, 기증자 NULL), loan 1행(500)이다. 두 번째 문장은 실패한다. loan 500이 책 100을 가리키고 fk_loan_book이 ON DELETE RESTRICT이므로 1451 오류가 나고 문장이 되돌려진다. 행 수는 그대로다. 기증자가 NULL로 바뀌었다는 사실은 이 판단과 상관없다. book을 가리키는 쪽은 loan이고, book이 member를 가리키는 관계는 이 삭제에서 검사 대상이 아니다.</p>
+<p><b>2.</b> 첫 행 1을 2로 바꾸는 순간 아직 바뀌지 않은 2와 겹쳐 1062 오류가 난다(<code>id</code>가 PRIMARY KEY인 테이블 t3로 MySQL 8.0.46·8.4.13에서 실행하면 <code>Duplicate entry '2' for key 't3.PRIMARY'</code>). MySQL은 UNIQUE를 행 단위로 즉시 검사하기 때문이다. InnoDB는 실패한 문장을 통째로 되돌리므로 테이블은 1, 2, 3 그대로다. <code>UPDATE t SET id = id + 1 ORDER BY id DESC</code>로 큰 값부터 바꾸면 3→4, 2→3, 1→2 순서가 되어 어떤 중간 상태에서도 겹치지 않는다.</p>
+<p><b>3.</b> CHECK는 "테이블의 모든 행이 언제나 이 조건을 만족한다"는 불변식이고, 엔진은 그 행이 바뀔 때만 평가한다. CURDATE()는 비결정적 함수라서 행이 그대로인데도 날짜가 바뀌면 결과가 TRUE에서 FALSE로 바뀔 수 있고, 엔진은 그 변화를 감지하지 못한다. 그래서 매뉴얼은 비결정적 함수를 CHECK에서 금지한다. MySQL 8.0.46·8.4.13에서 받는 오류는 <code>ERROR 3814 (HY000): An expression of a check constraint 'ck_due' contains disallowed function: curdate.</code>다. "반납 예정일이 대출일보다 뒤"라는 행 안의 관계는 <code>CHECK (due_on > loaned_on)</code>으로 옮길 수 있다. "입력하는 시점에 오늘 이후여야 한다"는 부분은 입력 시점의 검증이므로 애플리케이션이나 트리거가 맡아야 한다.</p>
+<p><b>4.</b> (가) 기본 모드에는 STRICT_TRANS_TABLES가 들어 있으므로 <code>ERROR 1048 (23000): Column 'id' cannot be null</code>이 나고, InnoDB 테이블에서는 문장 전체가 롤백되어 테이블이 비어 있다. (나) 엄격 모드가 아니면 NULL 자리에 INT의 암묵적 기본값 0이 들어가 1, 0, 3이 저장된다. 위험한 이유는 "값을 모른다"는 정보가 "값이 0이다"라는 거짓 값으로 바뀌어 저장되고, 이후 진짜 0과 구별할 방법이 없기 때문이다. 합계나 평균 같은 집계가 조용히 틀어진다.</p>
+<p><b>5.</b> A의 INSERT는 외래 키 검사를 위해 member(id=2) 레코드에 공유 잠금을 걸었다. B의 DELETE는 그 레코드에 배타 잠금이 필요하므로 A가 끝날 때까지 기다린다. A가 커밋하면 B는 잠금을 얻은 뒤 자식 검사를 하고, A가 넣은 대출이 회원 2를 가리키므로 fk_loan_member(NO ACTION)에 걸려 1451로 실패한다. A가 롤백하면 A의 대출은 사라지므로 B가 잠금을 얻은 뒤 자식이 없음을 확인하고 삭제에 성공한다. 어느 경우에도 "존재하지 않는 회원을 가리키는 대출"은 생기지 않는다. 공유 잠금이 검사와 커밋 사이의 틈을 막기 때문이다. MySQL 8.0.46에서 두 세션으로 실행해 보면 실제로 그렇게 된다. A가 커밋한 경우 B는 기다린 뒤 fk_loan_member를 가리키는 1451을 받았고, A가 롤백한 경우 B의 DELETE는 기다린 뒤 성공했다(회원 2의 주소 12도 CASCADE로 함께 지워졌다).</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q><code>UNIQUE (library_id, isbn)</code> 제약이 있고 <code>isbn</code>은 NULL을 허용한다. 빈 테이블에 <code>(1, NULL)</code> 행을 세 번 INSERT하면 어떻게 되는가?</q>
+<o>첫 번째만 성공하고 두 번째부터 1062 오류가 난다.</o>
+<o>UNIQUE에 포함된 컬럼은 NULL을 가질 수 없으므로 첫 번째부터 1048 오류가 난다.</o>
+<o>세 번 모두 성공한다.</o>
+<o>두 번째까지 성공하고 세 번째에서 1062 오류가 난다.</o>
+<why>UNIQUE 인덱스는 NULL을 담을 수 있는 컬럼에서 NULL 값을 여러 개 허용한다. NULL과 NULL의 비교는 UNKNOWN이라 두 키가 같다고 판정할 수 없고, 복합 키의 한 부분이라도 NULL이면 그 키는 다른 키와 중복으로 판정되지 않는다. UNIQUE가 NOT NULL을 강제하는 것은 아니므로 1048도 나지 않는다. NOT NULL을 강제하는 것은 PRIMARY KEY다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>MySQL 8.0.16 이상에서 <code>discount_rate DECIMAL(3,2)</code>(NULL 허용) 컬럼에 <code>CHECK (discount_rate BETWEEN 0 AND 1)</code>을 걸었다. <code>discount_rate</code>에 NULL을 넣는 INSERT의 결과로 옳은 것은?</q>
+<o>조건이 TRUE가 아니므로 3819 오류가 난다.</o>
+<o>조건이 UNKNOWN으로 평가되고, CHECK는 FALSE일 때만 위반이므로 성공한다.</o>
+<o>CHECK가 걸린 컬럼은 자동으로 NOT NULL이 되므로 1048 오류가 난다.</o>
+<o>엄격 모드에서는 오류, 엄격 모드가 아니면 경고와 함께 성공한다.</o>
+<why>MySQL은 CHECK 조건식이 TRUE 또는 UNKNOWN이면 통과시키고 FALSE일 때만 위반으로 본다. <code>NULL BETWEEN 0 AND 1</code>은 UNKNOWN이므로 통과한다. WHERE 절이 UNKNOWN을 버리는 것과 반대 방향이다. CHECK는 컬럼을 NOT NULL로 바꾸지 않으며, 이 판정은 SQL 모드와 무관하다. NULL까지 막으려면 NOT NULL을 따로 선언해야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>InnoDB 테이블의 외래 키를 <code>ON DELETE NO ACTION</code>으로 정의했다. 한 트랜잭션 안에서 자식이 있는 부모 행을 먼저 DELETE하고, 이어서 그 자식 행들을 DELETE한 뒤 COMMIT하려 한다. 어떻게 되는가?</q>
+<o>NO ACTION은 커밋 시점에 검사하므로 커밋 때 일관된 상태라 성공한다.</o>
+<o>부모 DELETE 시점에 자식 행이 자동으로 삭제된다.</o>
+<o>부모 DELETE 시점에 자식의 외래 키 컬럼이 NULL로 바뀐다.</o>
+<o>부모 DELETE 시점에 1451 오류가 난다. InnoDB의 NO ACTION은 RESTRICT와 같이 즉시 검사한다.</o>
+<why>매뉴얼에 따르면 InnoDB에서 NO ACTION은 RESTRICT와 같고, 관련된 자식이 있으면 부모의 삭제·변경을 즉시 거부한다. 검사를 커밋까지 미루는 것은 NDB의 NO ACTION이나 표준의 지연 검사이지 InnoDB의 동작이 아니다. 자동 삭제는 CASCADE, NULL로 바꾸는 것은 SET NULL의 동작이다. 자식을 먼저 지워야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>email</code>에 UNIQUE 인덱스가 있다. 트랜잭션 A가 <code>'kim@x.kr'</code>을 INSERT하고 커밋하지 않은 상태에서 트랜잭션 B가 같은 이메일을 INSERT했다. 이후 A가 COMMIT한다. B에게 일어나는 일로 옳은 것은?</q>
+<o>B의 INSERT는 A가 끝날 때까지 기다리다가, A가 커밋하면 1062 오류를 받는다.</o>
+<o>A의 행은 커밋 전이라 보이지 않으므로 B의 INSERT는 즉시 성공하고 중복 행이 생긴다.</o>
+<o>B의 INSERT는 즉시 1062 오류를 받는다. A가 나중에 롤백해도 결과는 같다.</o>
+<o>A가 커밋하는 순간 B의 행이 A의 행을 덮어쓴다.</o>
+<why>B는 고유 인덱스에서 A가 넣은 같은 키를 발견하지만, A가 롤백할 수도 있으므로 바로 판정하지 않고 그 레코드에 공유 잠금을 요청하며 기다린다. A가 커밋하면 키가 확정되어 B는 1062를 받고, A가 롤백하면 B의 INSERT가 진행된다. 커밋되지 않은 행이 보이지 않는 것은 잠금 없는 일관된 읽기(SELECT)의 이야기이고, 고유 인덱스 검사는 인덱스 레코드 자체와 잠금으로 이루어진다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>데이터 이관을 위해 <code>SET foreign_key_checks = 0</code>으로 자식 테이블을 먼저 적재했는데, 부모가 없는 자식 행이 몇 개 섞여 들어갔다. 이후 <code>SET foreign_key_checks = 1</code>로 다시 켰다. 무엇이 일어나는가?</q>
+<o>다시 켜는 순간 테이블을 스캔해 고아 행이 있으면 오류가 난다.</o>
+<o>다시 켜는 순간 고아 행이 자동으로 삭제된다.</o>
+<o>아무 일도 일어나지 않는다. 고아 행은 그대로 남고, 이후 새 쓰기만 검사된다.</o>
+<o>다음 번에 그 자식 테이블을 SELECT할 때 고아 행이 결과에서 제외된다.</o>
+<why>매뉴얼은 foreign_key_checks를 다시 켜도 테이블 데이터를 스캔하지 않으므로, 꺼져 있는 동안 추가된 행은 일관성 검사를 받지 않는다고 명시한다. 고아 행은 그대로 남고 엔진은 알려 주지 않는다. 다시 켠 뒤에는 부모 테이블과 외부 조인해 <code>WHERE 부모.id IS NULL</code>인 행을 직접 찾아야 한다. SELECT는 제약과 무관하게 저장된 행을 그대로 돌려준다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>제약 조건(constraint)</dt><dd>테이블 정의에 선언하는 데이터 규칙. 엔진이 모든 쓰기 경로에서 검사해 위반하는 변경을 거부한다.</dd>
+<dt>엄격 SQL 모드(strict SQL mode)</dt><dd>STRICT_TRANS_TABLES 또는 STRICT_ALL_TABLES가 켜진 상태. 잘못된 값이나 빠진 값을 조정하지 않고 오류로 처리한다. MySQL 8.0의 기본 SQL 모드에 포함되어 있다.</dd>
+<dt>암묵적 기본값(implicit default)</dt><dd>DEFAULT 절이 없을 때 데이터 타입이 정하는 값. 숫자 0, 빈 문자열, ENUM의 첫 값, 날짜 타입의 0 값 등이고 엄격 모드가 아닐 때 빠진 값을 채우는 데 쓰인다.</dd>
+<dt>클러스터형 인덱스(clustered index)</dt><dd>행 데이터를 키 순서로 리프에 저장하는 InnoDB의 기본 인덱스. PRIMARY KEY, 없으면 NOT NULL인 첫 UNIQUE 인덱스, 그것도 없으면 숨은 GEN_CLUST_INDEX가 된다.</dd>
+<dt>부모 테이블·자식 테이블(parent/child table)</dt><dd>외래 키로 참조되는 쪽이 부모, 참조하는 쪽이 자식이다. 자식의 외래 키 값은 부모의 키 값 중 하나이거나 NULL이어야 한다.</dd>
+<dt>참조 동작(referential action)</dt><dd>부모 행을 삭제하거나 키를 바꿀 때 자식 행을 어떻게 할지 정하는 ON DELETE·ON UPDATE 설정. CASCADE, SET NULL, RESTRICT, NO ACTION, SET DEFAULT가 있다.</dd>
+<dt>고아 행(orphan row)</dt><dd>존재하지 않는 부모를 가리키는 자식 행. 외래 키가 없거나 검사를 끈 동안 생긴다.</dd>
+<dt>MATCH SIMPLE</dt><dd>외래 키 값의 일부라도 NULL이면 참조 검사를 하지 않는 의미. MySQL이 구현하는 방식이며, MATCH 절 자체는 인식·강제되지 않는다.</dd>
+<dt>결정적 함수(deterministic function)</dt><dd>테이블 데이터가 같으면 언제 누가 호출해도 같은 결과를 내는 함수. CHECK 식에는 결정적 내장 함수만 쓸 수 있다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-table-foreign-keys.html">MySQL 8.0 Reference Manual — FOREIGN KEY Constraints</a> — 외래 키 생성 조건, 참조 동작, foreign_key_checks, 잠금</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/ansi-diff-foreign-keys.html">MySQL 8.0 Reference Manual — FOREIGN KEY Constraint Differences</a> — MATCH 절, NULL 처리, 행 단위 즉시 검사, 연쇄 깊이 15단계</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-table-check-constraints.html">MySQL 8.0 Reference Manual — CHECK Constraints</a> — 8.0.16 이전 동작, 문법, 이름 규칙, TRUE/UNKNOWN 통과, 식 제한</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/data-type-defaults.html">MySQL 8.0 Reference Manual — Data Type Default Values</a> — 표현식 기본값, 암묵적 기본값, 엄격 모드에서의 누락 처리</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/sql-mode.html">MySQL 8.0 Reference Manual — Server SQL Modes</a> — 기본 SQL 모드, 엄격 모드와 IGNORE</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html">MySQL 8.0 Reference Manual — Locks Set by Different SQL Statements in InnoDB</a> — 중복 키 오류의 공유 잠금, 외래 키 검사의 공유 레코드 잠금</li>
+</x-refs>

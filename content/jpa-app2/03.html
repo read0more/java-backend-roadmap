@@ -1,0 +1,583 @@
+<x-meta>
+deck: 일대다 컬렉션이 조회에 끼어드는 순간 SQL 결과의 행이 불어난다. 엔티티 노출, DTO 변환, 컬렉션 페치 조인, 페이징의 한계와 배치 페치까지 Hibernate 6.6 실험으로 행과 SQL을 직접 센다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>주문과 주문 상품처럼 일대다 컬렉션을 가진 엔티티를 DTO로 바꿀 때 실행되는 SQL의 개수를 데이터만 보고 미리 계산하고, 영속성 컨텍스트가 그 수를 어떻게 줄이는지 설명할 수 있다.</li>
+<li>컬렉션 페치 조인이 SQL 결과의 행을 몇 개로 늘리는지 그림으로 그리고, Hibernate 6가 그 행들을 엔티티 몇 개로 되돌리는지, JPQL의 distinct가 SQL과 메모리에서 각각 무슨 일을 하는지 구분할 수 있다.</li>
+<li>컬렉션 페치 조인에 페이징을 걸면 데이터베이스 대신 메모리에서 잘리는 이유를 행 단위 LIMIT의 의미로 설명하고, 경고 HHH90003004와 fail_on_pagination 설정의 차이를 말할 수 있다.</li>
+<li>둘 이상의 List 컬렉션을 함께 페치 조인할 때 MultipleBagFetchException이 나는 이유와, 페치 조인 대상에 조건을 걸었을 때 컬렉션이 DB와 어긋나는 이유를 설명할 수 있다.</li>
+<li>ToOne은 페치 조인, 컬렉션은 배치 페치로 나누는 방식에서 IN 쿼리가 몇 번 나가는지 계산하고, 그 IN 쿼리를 MySQL 옵티마이저가 어떤 접근 방식으로 처리하는지 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 컬렉션 하나가 무엇을 바꾸는가</h3>
+
+<p>앞 회차(02회)는 주문에서 회원, 주문에서 배송처럼 <b>한 건을 가리키는 연관</b>(다대일·일대일, 묶어서 ToOne이라고 부르겠다)을 따라가는 조회를 다뤘다. 그 경우 페치 조인(fetch join)으로 연관 엔티티를 한 SQL에 붙여 오면 N+1 문제가 사라지고, 결과 행의 수도 주문의 수와 같다. 주문 한 건에 회원은 하나, 배송도 하나이기 때문이다. 이번 회차는 그 옆에 <b>여러 건을 가리키는 연관</b>, 즉 주문 한 건에 딸린 주문 상품 목록(일대다 컬렉션)이 끼어든 경우를 본다.</p>
+
+<p>컬렉션이 끼면 같은 기법이 같은 결과를 내지 않는다. 페치 조인을 그대로 쓰면 SQL은 한 번이지만 결과 행이 주문 수가 아니라 주문 상품 수만큼 생긴다. 행이 불어나면 페이징이 깨지고, 컬렉션을 둘 이상 붙이면 Hibernate가 아예 쿼리를 거부하고, 조인 대상에 조건을 걸면 메모리의 컬렉션이 데이터베이스와 어긋난다. 반대로 페치 조인을 쓰지 않으면 주문마다 컬렉션을 읽는 SQL이 따로 나가서 N+1이 다시 등장한다. 이 회차는 이 갈림길을 하나씩 실험으로 확인한다.</p>
+
+<p>공개된 커리큘럼에서 이 회차가 맡는 수업 주제는 네 가지다. 엔티티를 그대로 노출하는 주문 조회(V1), 엔티티를 DTO로 변환하는 조회(V2), 컬렉션까지 페치 조인으로 최적화하는 조회(V3), 그리고 페이징과 그 한계를 넘는 방법(V3.1)이다. 이 번호는 수업 제목에 붙은 버전 번호를 그대로 따른 것이다. 같은 섹션의 뒷부분인 JPQL에서 DTO를 직접 조회하는 방식(V4~V6)과 섹션 정리는 다음 회차(04회)가, 이 모든 조회가 어느 구간에서 커넥션을 붙잡는지(OSIV)는 05회가 다룬다.</p>
+
+<p>이 회차의 실험은 모두 <b>Hibernate ORM 6.6.53.Final + H2 2.3.232 + JDK 21(Temurin 21.0.13)</b>에서 직접 실행한 결과다. Spring Boot 3.x가 기본으로 쓰는 Hibernate 6.x 계열이며, SQL 문장의 모양(별칭 이름, 페이징 구문)은 데이터베이스 방언(dialect)에 따라 달라지므로 MySQL에서는 일부 구문이 다르게 보일 수 있다. 실행된 SQL의 개수와 결과 행의 수처럼 이 회차의 논증에 쓰는 값은 방언과 무관하다.</p>
+
+<h3>실험 준비: 도메인과 SQL을 세는 장치</h3>
+
+<p>도메인은 다섯 개의 엔티티로 만든다. 회원(<code>Member</code>), 배송(<code>Delivery</code>), 상품(<code>Product</code>), 주문(<code>Order</code>), 그리고 주문과 상품을 잇는 주문 상품(<code>OrderLine</code>)이다. 주문은 회원과 배송을 ToOne으로, 주문 상품 목록을 일대다 컬렉션으로 가진다. 연관은 모두 지연 로딩(<code>FetchType.LAZY</code>)이다. 일대다 쪽(<code>@OneToMany</code>)은 JPA 기본값이 원래 LAZY이고, 다대일·일대일은 기본값이 EAGER라서 명시적으로 LAZY를 적었다.</p>
+
+<pre><code class="language-java">@Entity(name = "Order") @Table(name = "orders")   // ORDER는 SQL 예약어라 테이블 이름을 바꾼다
+public class Order {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "order_id")
+    Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "member_id")
+    Member member;
+
+    @OneToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL)
+    @JoinColumn(name = "delivery_id")
+    Delivery delivery;
+
+    @OneToMany(mappedBy = "order", cascade = CascadeType.ALL)
+    List<OrderLine> lines = new ArrayList<>();
+    // 생성자, getter 생략
+}
+
+@Entity(name = "OrderLine") @Table(name = "order_line")
+public class OrderLine {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "order_line_id")
+    Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "order_id")
+    Order order;
+
+    @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "product_id")
+    Product product;
+
+    int quantity;
+    // 생성자, getter 생략
+}
+
+@Entity(name = "Member") @Table(name = "member")
+public class Member {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "member_id")
+    Long id;
+    String name;
+
+    @OneToMany(mappedBy = "member")
+    List<Order> orders = new ArrayList<>();   // 양방향: 뒤에서 함정 실험에 쓴다
+    // ...
+}
+// Delivery(delivery_id, city), Product(product_id, name, price)는 필드 두세 개짜리 엔티티다.</code></pre>
+
+<p>데이터는 일부러 작게 넣는다. 작아야 SQL을 한 줄씩 손으로 추적할 수 있다. 회원 세 명이 각각 주문 한 건씩, 주문마다 상품 두 개씩 담았다. 단, 세 번째 주문은 첫 번째·두 번째 주문과 같은 상품을 다시 산다. 이 겹침이 뒤에서 영속성 컨텍스트의 효과를 드러낸다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>주문</th><th>회원</th><th>배송지</th><th>주문 상품(상품 × 수량)</th></tr></thead><tbody>
+<tr><td>order_id 1</td><td>kim</td><td>Seoul</td><td>line 1: P1 × 1, line 2: P2 × 2</td></tr>
+<tr><td>order_id 2</td><td>lee</td><td>Busan</td><td>line 3: P3 × 1, line 4: P4 × 1</td></tr>
+<tr><td>order_id 3</td><td>park</td><td>Daegu</td><td>line 5: P1 × 3, line 6: P3 × 1</td></tr>
+</tbody></table></div>
+
+<p>SQL의 개수는 눈으로 세지 않고 Hibernate에게 세게 한다. Hibernate에는 SQL 문자열이 JDBC로 넘어가기 직전에 그것을 보고 바꿀 수 있는 <code>StatementInspector</code>라는 확장점이 있다. 여기서는 바꾸지 않고 번호만 붙여 출력한다. Spring Boot라면 <code>spring.jpa.properties.hibernate.session_factory.statement_inspector</code>로 같은 일을 할 수 있지만, 이 실험은 스프링 없이 Hibernate의 <code>Configuration</code>으로 직접 <code>SessionFactory</code>를 만들었다.</p>
+
+<pre><code class="language-java">static int count;
+
+Configuration cfg = new Configuration();
+// addAnnotatedClass(...), H2 접속 정보, hbm2ddl 설정 ...
+cfg.setStatementInspector(sql -> {
+    count++;
+    System.out.println("SQL#" + count + ": " + sql);
+    return sql;               // 문장을 바꾸지 않고 그대로 돌려준다
+});
+SessionFactory sf = cfg.buildSessionFactory();</code></pre>
+
+<h3>V1: 엔티티를 그대로 응답으로 내보낼 때</h3>
+
+<p>가장 짧은 구현은 조회한 <code>List<Order></code>를 그대로 컨트롤러의 반환값으로 내보내는 것이다. 이 방식의 문제 가운데 API 스펙이 엔티티에 묶이는 문제, 지연 로딩 프록시를 JSON으로 바꾸지 못하는 문제는 01회·02회에서 다뤘다. 컬렉션이 끼면 여기에 두 가지가 더해진다. 하나는 직렬화기가 컬렉션을 <b>순회</b>한다는 점이고, 다른 하나는 양방향 연관이 컬렉션을 통해 <b>순환</b>을 만든다는 점이다.</p>
+
+<p>먼저 순회다. 주문을 조회한 직후 <code>order.lines</code> 필드에 들어 있는 것은 <code>ArrayList</code>가 아니다. 실험에서 <code>getClass()</code>를 찍어 보면 <code>org.hibernate.collection.spi.PersistentBag</code>이 나오고, <code>Hibernate.isInitialized(order.lines)</code>는 <code>false</code>다. Hibernate는 엔티티를 만들 때 컬렉션 필드에 자기 컬렉션 래퍼를 넣어 두고, 누군가 그 컬렉션의 내용을 요구하는 순간(<code>size()</code>, <code>iterator()</code> 등) SQL을 실행해 채운다. JSON 직렬화기는 컬렉션을 만나면 반복자로 원소를 하나씩 꺼내 쓴다. 즉 직렬화 자체가 지연 로딩을 일으키는 호출이 된다.</p>
+
+<p>이 호출이 언제 일어나느냐에 따라 결과가 갈린다. 영속성 컨텍스트가 살아 있으면 직렬화 도중에 SQL이 나가고, 이미 닫혔으면 예외가 난다. 세션을 닫은 뒤 <code>lines.size()</code>를 호출한 실험의 결과는 다음과 같다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">lines class = org.hibernate.collection.spi.PersistentBag initialized=false
+EX: org.hibernate.LazyInitializationException: failed to lazily initialize a collection of role: lab2.Lab$Order.lines: could not initialize proxy - no Session</code></pre>
+
+<p>메시지의 "role"은 Hibernate가 컬렉션을 식별하는 이름으로, 위 출력처럼 <code>엔티티 클래스의 전체 이름.필드 이름</code> 형식이다. 이 이름은 뒤에서 배치 페치를 설명할 때 다시 나온다. 같은 종류(role)의 컬렉션끼리 묶어 한 번에 읽는 것이 배치 페치이기 때문이다. 세션이 닫힌 뒤에 직렬화가 일어나는지, 열린 채로 일어나는지는 OSIV 설정이 결정하며 05회의 주제다.</p>
+
+<p>다음은 순환이다. 이 도메인에서 <code>Order.lines</code>는 <code>OrderLine</code>을 가리키고, <code>OrderLine.order</code>는 다시 <code>Order</code>를 가리킨다. 직렬화기는 객체 그래프를 필드를 따라 깊이 우선으로 내려가므로 주문 → 주문 상품 → 주문 → 주문 상품…으로 끝없이 들어간다. JPA 엔티티 대신 같은 모양의 평범한 자바 객체 두 개를 Jackson 2.21.4로 직렬화해 보면 이렇게 끝난다.</p>
+
+<pre data-label="실행 결과 (Jackson 2.21.4)"><code class="language-text">com.fasterxml.jackson.databind.JsonMappingException
+Document nesting depth (1001) exceeds the maximum allowed (1000, from `StreamWriteConstraints.getMaxNestingDepth()`) (through reference chain: j.J$Order["lines"]->java.util.ArrayList[0]->j.J$Line["order"]->j.J$Order["lines"]->...</code></pre>
+
+<p>Jackson 2.16부터 출력의 중첩 깊이에 상한(기본 1000단계)이 생겨서 이 메시지로 멈춘다. 상한이 없던 이전 버전에서는 직렬화 메서드가 자기 자신을 계속 재귀 호출하므로 스레드 스택이 바닥날 때까지 들어가고, <code>StackOverflowError</code>가 원인인 실패로 끝난다. 어느 쪽이든 원인은 같다. 객체 그래프에는 순환이 있는데 JSON은 트리라서 순환을 표현할 수 없다. 한쪽에 <code>@JsonIgnore</code>를 붙이면 순환은 끊기지만, 그것은 영속성 계층의 클래스에 화면용 애노테이션을 심는 일이다.</p>
+
+<p>엔티티를 그대로 노출하는 방식에서 지연 로딩 문제를 피하려고 직렬화 전에 컬렉션을 일부러 건드려 초기화하는 코드(이른바 강제 초기화)를 넣기도 한다. 주문마다 <code>getMember().getName()</code>을 부르고, <code>getLines()</code>를 돌면서 <code>getProduct().getName()</code>을 부르는 식이다. 이 코드는 다음 절의 DTO 변환과 <b>정확히 같은 SQL</b>을 만든다. 차이는 결과를 엔티티로 내보내느냐 DTO로 내보내느냐뿐이고, 엔티티로 내보내면 위의 순환·스펙 결합 문제가 그대로 남는다. 그래서 SQL 개수의 분석은 다음 절에서 한 번에 한다.</p>
+
+<h3>V2: 엔티티를 DTO로 바꾼다, 컬렉션까지</h3>
+
+<p>응답을 DTO로 바꿀 때 컬렉션에서 가장 흔히 하는 실수는 <b>DTO 안에 엔티티를 남기는 것</b>이다. 주문 DTO의 필드 타입을 <code>List<OrderLine></code>으로 두면 겉모양은 DTO지만 그 안의 주문 상품은 여전히 엔티티다. 직렬화기는 그 엔티티로 들어가 <code>OrderLine.order</code>의 순환과 <code>OrderLine.product</code>의 프록시를 다시 만난다. 엔티티 노출 문제는 껍데기 한 겹을 바꾼다고 사라지지 않고, 응답에 포함되는 모든 단계에서 엔티티를 DTO로 바꿔야 끝난다.</p>
+
+<pre><code class="language-java">public record OrderDto(Long orderId, String memberName, String city, List<OrderLineDto> lines) {
+    public static OrderDto from(Order o) {
+        return new OrderDto(
+                o.getId(),
+                o.getMember().getName(),          // 회원 프록시 초기화 → SQL
+                o.getDelivery().getCity(),        // 배송 프록시 초기화 → SQL
+                o.getLines().stream()             // 컬렉션 초기화 → SQL
+                        .map(OrderLineDto::from)
+                        .toList());
+    }
+}
+
+public record OrderLineDto(String productName, int quantity) {
+    public static OrderLineDto from(OrderLine line) {
+        return new OrderLineDto(
+                line.getProduct().getName(),      // 상품 프록시 초기화 → SQL (컨텍스트에 없을 때만)
+                line.getQuantity());
+    }
+}
+
+// 조회: 주문만 가져오고, 나머지는 DTO 변환이 지연 로딩으로 끌어온다
+List<OrderDto> result = em.createQuery("select o from Order o order by o.id", Order.class)
+        .getResultList().stream()
+        .map(OrderDto::from)
+        .toList();</code></pre>
+
+<p>이 코드가 만드는 SQL을 실험 데이터로 세어 보자. 실험에서는 DTO 변환과 같은 순서로 회원·배송·컬렉션·상품을 초기화하는 순회 코드를 돌렸다. 결과는 SQL 14개다.</p>
+
+<pre data-label="실행 결과 (V2, 배치 페치 없음)"><code class="language-text">SQL#1: select o1_0.order_id,o1_0.delivery_id,o1_0.member_id from orders o1_0 order by o1_0.order_id
+SQL#2: select m1_0.member_id,m1_0.name from member m1_0 where m1_0.member_id=?
+SQL#3: select d1_0.delivery_id,d1_0.city from delivery d1_0 where d1_0.delivery_id=?
+SQL#4: select l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity from order_line l1_0 where l1_0.order_id=?
+SQL#5: select p1_0.product_id,p1_0.name,p1_0.price from product p1_0 where p1_0.product_id=?
+SQL#6: select p1_0.product_id,p1_0.name,p1_0.price from product p1_0 where p1_0.product_id=?
+SQL#7: select m1_0.member_id,m1_0.name from member m1_0 where m1_0.member_id=?
+SQL#8: select d1_0.delivery_id,d1_0.city from delivery d1_0 where d1_0.delivery_id=?
+SQL#9: select l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity from order_line l1_0 where l1_0.order_id=?
+SQL#10: select p1_0.product_id,p1_0.name,p1_0.price from product p1_0 where p1_0.product_id=?
+SQL#11: select p1_0.product_id,p1_0.name,p1_0.price from product p1_0 where p1_0.product_id=?
+SQL#12: select m1_0.member_id,m1_0.name from member m1_0 where m1_0.member_id=?
+SQL#13: select d1_0.delivery_id,d1_0.city from delivery d1_0 where d1_0.delivery_id=?
+SQL#14: select l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity from order_line l1_0 where l1_0.order_id=?
+total statements = 14</code></pre>
+
+<p>한 줄씩 따라가면 규칙이 보인다. SQL#1이 주문 세 건을 가져온다. 이때 각 주문의 <code>member</code>, <code>delivery</code> 필드에는 외래 키 값(<code>member_id</code>, <code>delivery_id</code>)만 담긴 프록시가 들어가고, <code>lines</code>에는 비어 있는 <code>PersistentBag</code>이 들어간다. 주문 1을 변환하면서 회원(SQL#2), 배송(SQL#3), 주문 상품 목록(SQL#4)이 차례로 초기화된다. SQL#4가 돌아오면 주문 상품 두 개가 영속성 컨텍스트에 올라오고, 각 주문 상품의 <code>product</code> 필드에는 다시 프록시가 들어간다. 그 프록시를 건드리는 순간 P1(SQL#5), P2(SQL#6)가 읽힌다. 주문 2도 같은 패턴으로 다섯 개(SQL#7~#11)다.</p>
+
+<p>주문 3에서 패턴이 깨진다. 회원·배송·주문 상품 목록(SQL#12~#14)까지는 같지만 상품 SQL이 없다. 주문 3이 산 P1과 P3는 이미 SQL#5와 SQL#10으로 영속성 컨텍스트에 올라와 있기 때문이다. 영속성 컨텍스트는 같은 식별자의 엔티티를 한 인스턴스로 관리하므로(JPA가 보장하는 동일성), Hibernate는 SQL#14의 결과에서 <code>product_id</code>가 1과 3인 것을 보고 새 프록시를 만드는 대신 이미 있는 상품 인스턴스를 연결한다. 그래서 공식은 이렇게 된다.</p>
+
+<pre class="diagram">SQL 수 = 1                          (주문 목록)
+       + N                          (주문마다 회원; 서로 다른 회원 수만큼)
+       + N                          (주문마다 배송)
+       + N                          (주문마다 주문 상품 컬렉션)
+       + 아직 컨텍스트에 없는 서로 다른 상품 수
+
+실험: 1 + 3 + 3 + 3 + 4(P1, P2, P3, P4) = 14</pre>
+
+<p>회원 항이 "서로 다른 회원 수"인 것도 같은 이유다. 세 주문이 모두 kim의 주문이었다면 회원 SQL은 한 번이다. 이 때문에 개발 중의 작은 데이터에서는 N+1이 잘 보이지 않는다. 테스트 데이터가 같은 회원, 같은 상품을 반복해서 쓰면 SQL 수가 공식의 최악값보다 훨씬 작게 나온다. 반대로 운영 데이터에서 주문 100건이 서로 다른 회원 100명의 주문이고 주문마다 서로 다른 상품 5개를 담았다면, 같은 공식으로 1 + 100 + 100 + 100 + 500 = 801개의 SQL이 한 요청에서 나간다.</p>
+
+<p>SQL 하나하나는 기본 키나 외래 키로 찾는 가벼운 쿼리지만, 개수가 문제가 되는 이유는 쿼리 실행 시간보다 <b>왕복(round trip)</b>에 있다. JDBC의 <code>executeQuery()</code>는 요청을 보내고 결과가 돌아올 때까지 호출한 스레드를 붙잡는 동기 호출이다. 애플리케이션 서버와 데이터베이스가 다른 장비에 있으면 쿼리마다 네트워크를 한 번 왕복하고, 데이터베이스는 매번 문장을 받아 실행 계획을 고르고 결과를 만든다. 801번의 왕복은 그 시간 동안 요청 스레드 하나와 커넥션 하나를 계속 점유한다는 뜻이고, 커넥션 풀의 크기는 정해져 있으므로 이 요청이 길어질수록 다른 요청이 커넥션을 기다린다.</p>
+
+<h3>한 층 아래: 컬렉션을 조인하면 행이 불어난다</h3>
+
+<p>N+1을 없애는 첫 번째 방법은 02회에서처럼 연관을 SQL 조인으로 붙여 한 번에 가져오는 것이다. 그런데 ToOne 조인과 일대다 조인은 결과 행의 수에서 근본적으로 다르다. 관계형 데이터베이스의 조인은 조건을 만족하는 <b>행의 쌍</b>마다 결과 행을 하나 만든다. 주문 하나에 회원 행은 하나뿐이므로 <code>orders join member</code>의 결과는 주문 수와 같다. 주문 하나에 주문 상품 행은 여러 개이므로 <code>orders join order_line</code>의 결과는 주문 상품 수와 같아지고, 주문의 열 값은 주문 상품 수만큼 반복된다.</p>
+
+<pre class="diagram">orders                         order_line
+order_id  member  city         order_line_id  order_id  product  quantity
+1         kim     Seoul        1              1         P1       1
+2         lee     Busan        2              1         P2       2
+3         park    Daegu        3              2         P3       1
+                               4              2         P4       1
+                               5              3         P1       3
+                               6              3         P3       1
+
+orders ⋈ member ⋈ delivery ⋈ order_line ⋈ product  →  6행
+행  order_id  member  city   | order_line_id  product  quantity
+1   1         kim     Seoul  | 1              P1       1
+2   1         kim     Seoul  | 2              P2       2      ← 주문 1이 두 번
+3   2         lee     Busan  | 3              P3       1
+4   2         lee     Busan  | 4              P4       1      ← 주문 2가 두 번
+5   3         park    Daegu  | 5              P1       3
+6   3         park    Daegu  | 6              P3       1      ← 주문 3이 두 번
+(ORDER BY가 없으면 행의 순서는 보장되지 않는다. 읽기 쉽게 정렬해 그렸다.)</pre>
+
+<p>실험에서 같은 조인을 네이티브 SQL로 실행하면 정확히 6행이 돌아온다. 같은 테이블과 데이터를 MySQL 8.4.13과 8.0.46에 만들어 위 V3 절의 SQL을 그대로 실행해도 두 버전 모두 6행이었다. 이것이 이후 모든 문제의 출발점이다. 관계형 결과는 <b>평평한 표</b>이고, 객체 그래프는 <b>트리</b>다. 주문 세 개 아래에 주문 상품이 두 개씩 매달린 트리를 표로 펼치면 부모의 값이 자식 수만큼 복제된다. 어떤 조회 방식을 고르든 결국 이 복제를 데이터베이스가 만들어 네트워크로 보내느냐, 아니면 복제가 생기지 않게 쿼리를 나누느냐의 선택이 된다.</p>
+
+<x-visual id="jpa-app2-03-row-multiplication" title="주문 3건과 주문 상품 6건을 조인하면 결과가 6행이 되고, Hibernate가 다시 주문 3개로 묶는 과정" kind="데이터 흐름 그림" ratio="16:9">
+<x-hint>일대다 조인이 부모 행을 자식 수만큼 복제하는 모습과, Hibernate가 식별자로 같은 인스턴스를 찾아 다시 트리로 접는 모습을 한 화면에 보여 준다.</x-hint>
+<x-prompt>Three-part horizontal diagram on white background. Left: two small database tables stacked vertically, labeled "orders" (3 rows, ids 1,2,3, each row a different pastel color: blue, green, orange) and "order_line" (6 rows, two rows per color matching their order). Middle: a tall result table labeled "조인 결과 6행" with 6 rows; each row has a left colored half (order color) and a right half (line). The left halves visibly repeat: blue, blue, green, green, orange, orange. A bracket on the left side of the middle table labeled "주문 값이 반복된다". Right: three object boxes labeled "Order 1", "Order 2", "Order 3" in matching colors, each with two small child boxes labeled "OrderLine". Arrows go from each pair of same-colored rows in the middle table into one object box, with a small label on the arrows "식별자로 같은 인스턴스 재사용". A caption strip at the bottom reads "표는 평평하고 객체 그래프는 트리다". Flat vector style, no shadows, Korean labels exactly as given.</x-prompt>
+<x-caption>일대다 조인은 부모 행을 자식 수만큼 복제한다. Hibernate는 행마다 식별자를 보고 이미 만든 주문 인스턴스에 주문 상품을 붙여 다시 트리로 접는다.</x-caption>
+</x-visual>
+
+<h3>V3: 컬렉션 페치 조인 — SQL 한 번, 행 여섯 개, 주문 세 개</h3>
+
+<p>이제 주문에서 출발해 회원, 배송, 주문 상품, 상품까지 전부 페치 조인으로 붙인다. JPQL은 다음과 같고, Hibernate 6.6이 만든 SQL은 한 문장이다.</p>
+
+<pre><code class="language-sql">-- JPQL
+select o from Order o
+  join fetch o.member m
+  join fetch o.delivery d
+  join fetch o.lines l
+  join fetch l.product p
+
+-- Hibernate 6.6.53 + H2가 만든 SQL (한 줄을 읽기 쉽게 나눴다)
+select o1_0.order_id, d1_0.delivery_id, d1_0.city,
+       l1_0.order_id, l1_0.order_line_id, p1_0.product_id, p1_0.name, p1_0.price, l1_0.quantity,
+       m1_0.member_id, m1_0.name
+from orders o1_0
+join member m1_0     on m1_0.member_id = o1_0.member_id
+join delivery d1_0   on d1_0.delivery_id = o1_0.delivery_id
+join order_line l1_0 on o1_0.order_id = l1_0.order_id
+join product p1_0    on p1_0.product_id = l1_0.product_id</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">result size = 3
+total statements = 1</code></pre>
+
+<p>SQL은 한 번이고, 그 뒤 DTO 변환에서 추가 SQL은 나가지 않는다. 그런데 결과 리스트의 크기는 데이터베이스가 돌려준 행의 수 6이 아니라 3이다. 이 3이라는 숫자는 당연한 것이 아니다. Jakarta Persistence 명세(3.1, 4.4.5.3절)는 페치 조인이 대응하는 일반 조인과 <b>같은 조인 의미</b>를 가진다고 정의하고, 부서 1에 직원이 다섯 명이면 부서를 페치 조인하는 쿼리는 부서 1 엔티티에 대한 참조를 다섯 개 돌려준다는 예를 든다. 명세대로라면 이 쿼리의 결과는 주문 1, 주문 1, 주문 2, 주문 2, 주문 3, 주문 3이다.</p>
+
+<p>Hibernate 5까지는 실제로 그렇게 동작했고, 그래서 중복을 없애려고 JPQL에 <code>distinct</code>를 붙였다. Hibernate 6의 마이그레이션 가이드는 이 부분을 바꿨다고 밝힌다. 자식 컬렉션을 페치 조인할 때 같은 부모 엔티티 참조를 걸러 내려고 <code>distinct</code>를 쓸 필요가 더 이상 없으며, 중복된 엔티티는 Hibernate가 항상 걸러 낸다는 내용이다. 실험의 <code>result size = 3</code>이 바로 그 결과다. 리스트 안의 세 원소는 서로 다른 인스턴스이고, 각 주문의 <code>lines</code>에는 주문 상품이 두 개씩 들어 있다.</p>
+
+<p>그러면 <code>distinct</code>를 붙이면 무슨 일이 생길까. 실험해 보면 Hibernate 6.6은 JPQL의 <code>distinct</code>를 SQL에도 그대로 넣는다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">SQL#1: select distinct o1_0.order_id,o1_0.delivery_id,l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity,o1_0.member_id from orders o1_0 join order_line l1_0 on o1_0.order_id=l1_0.order_id
+result size = 3</code></pre>
+
+<p>SQL의 <code>DISTINCT</code>는 <b>선택한 모든 열의 값이 같은 행</b>만 하나로 합친다. 이 쿼리의 행들은 주문 열이 같아도 주문 상품 열(<code>order_line_id</code> 등)이 서로 다르므로 합쳐질 행이 하나도 없다. 데이터베이스는 6행을 그대로 돌려주고(위 SQL을 MySQL 8.4.13과 8.0.46에서 그대로 실행해도 6행이었다), 중복 제거를 위해 정렬이나 해시 같은 추가 작업만 한다. 즉 컬렉션 페치 조인에서 SQL 수준의 <code>DISTINCT</code>는 결과를 줄이지 못한다. 결과가 3이 되는 것은 Hibernate가 메모리에서 같은 주문 인스턴스를 걸러 내기 때문이고, Hibernate 6에서는 <code>distinct</code>가 없어도 그렇게 된다.</p>
+
+<aside class="note">실험에서 페치하지 않는 일반 조인(<code>select o from Order o join o.lines l</code>)도 Hibernate 6.6.53에서는 결과가 3으로 나왔다. 반면 같은 조인에서 <code>select o.id</code>처럼 스칼라 값을 고르거나 <code>select o, l</code>처럼 두 값을 고르면 6이 나왔다. 엔티티 하나만 고르는 결과는 중복 인스턴스를 걸러 내고, 값이나 튜플을 고르는 결과는 행마다 하나씩 돌려준다고 정리할 수 있다. 다만 일반 조인에 대한 이 동작은 마이그레이션 가이드에 명시된 것이 아니라 이 버전에서 관찰한 결과다.</aside>
+
+<p>Hibernate가 6행을 주문 3개로 접는 과정을 따라가 보자. 결과 처리기는 JDBC <code>ResultSet</code>을 한 행씩 읽는다. 1행에서 <code>order_id = 1</code>을 읽고 영속성 컨텍스트에서 주문 1을 찾는다. 없으므로 주문 인스턴스를 만들고 이 행의 주문 열로 채운다. 같은 행의 <code>order_line_id = 1</code>로 주문 상품 인스턴스를 만들고 주문 1의 <code>lines</code>에 넣는다. 2행에서 다시 <code>order_id = 1</code>을 읽으면 이번에는 새 인스턴스를 만들지 않고 이미 만든 주문 1을 찾아 쓰며, 주문 상품 2를 만들어 그 <code>lines</code>에 붙인다. 쿼리가 끝나면 각 주문의 컬렉션은 초기화된 상태가 된다(뒤의 실험에서 <code>Hibernate.isInitialized</code>가 <code>true</code>로 나온다). 결과 목록에 같은 주문을 두 번 넣지 않는 것이 Hibernate 6가 추가한 중복 제거다.</p>
+
+<p>이 방식의 비용은 SQL 수가 아니라 <b>전송되는 데이터의 양</b>에 있다. 주문, 회원, 배송 열은 주문 상품 수만큼 반복해서 네트워크를 건너온다. 이 실험에서는 주문당 두 번이라 차이가 없지만, 주문 하나에 주문 상품이 100개면 주문·회원·배송 열이 100번 전송되고 Hibernate는 그중 99번을 읽고 버린다. 게다가 MySQL Connector/J는 기본 설정에서 <code>ResultSet</code>을 <b>전부 받아 메모리에 저장</b>한 뒤 애플리케이션에 넘긴다(Connector/J 문서의 구현 노트). 한 행씩 흘려 받으려면 전방 전용·읽기 전용 문장에 <code>setFetchSize(Integer.MIN_VALUE)</code>를 주는 별도 설정이 필요하다. 따라서 조인으로 불어난 행은 그대로 JVM 힙을 차지한다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>컬렉션 페치 조인은 SQL을 한 번으로 줄이는 대신, 부모 행을 자식 수만큼 복제한 결과를 받는다. 결과 목록에 부모가 한 번씩만 보이는 것은 데이터베이스가 줄여 준 것이 아니라 Hibernate가 메모리에서 같은 인스턴스를 걸러 낸 결과다. 이 차이가 페이징에서 결정적인 문제가 된다.</p></aside>
+
+<h3>페치 조인의 한계 1: 페이징이 메모리로 내려온다</h3>
+
+<p>주문 목록 API는 거의 항상 페이지 단위로 잘라 준다. 컬렉션 페치 조인 쿼리에 JPA의 페이징 메서드를 그대로 붙여 보자. 주문을 한 페이지에 하나씩 보여 줄 때 두 번째 페이지, 즉 <code>setFirstResult(1).setMaxResults(1)</code>이다.</p>
+
+<pre><code class="language-java">List<Order> page = em.createQuery(
+        "select o from Order o join fetch o.lines l order by o.id", Order.class)
+        .setFirstResult(1)
+        .setMaxResults(1)
+        .getResultList();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">WARN: HHH90003004: firstResult/maxResults specified with collection fetch; applying in memory
+SQL#1: select o1_0.order_id,o1_0.delivery_id,l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity,o1_0.member_id from orders o1_0 join order_line l1_0 on o1_0.order_id=l1_0.order_id order by o1_0.order_id
+result size = 1 id=2 lines=2</code></pre>
+
+<p>결과만 보면 원하는 대로 동작했다. 두 번째 주문(id 2)이 주문 상품 두 개와 함께 돌아왔다. 그러나 SQL에 페이징 구문이 없다. 바로 뒤에 볼 ToOne 페치 조인 쿼리에서는 H2 방언이 <code>offset ? rows fetch first ? rows only</code>를 붙이는데, 여기서는 그런 구문 없이 <b>조인 결과 전체</b>를 가져왔다. 경고 메시지가 그대로 말하듯 Hibernate는 페이징을 메모리에서 적용했다. 모든 행을 읽어 모든 주문 엔티티를 만들고 컬렉션을 채운 뒤, 결과 목록에서 두 번째 원소 하나만 잘라 돌려준 것이다.</p>
+
+<p>Hibernate가 데이터베이스에 LIMIT를 넘기지 않는 이유는 LIMIT와 OFFSET이 <b>행</b>을 센다는 데 있다. 우리가 원하는 것은 "주문 두 개"인데 데이터베이스가 셀 수 있는 것은 "조인 결과 행 두 개"뿐이다. 주문을 두 개씩 끊고 싶어서 SQL에 LIMIT 2를 붙이면 앞의 두 행, 즉 주문 1의 주문 상품 두 줄만 돌아와 주문은 하나가 된다. LIMIT 3을 붙이면 주문 1은 온전하지만 주문 2는 주문 상품 하나만 딸려 온다. 더 나쁜 것은 두 번째 경우다. Hibernate는 쿼리가 끝나면 페치한 컬렉션을 "초기화됨"으로 다루므로, 주문 2의 <code>lines</code>에는 원소가 하나뿐인데도 그것이 전부인 것처럼 영속성 컨텍스트에 남는다. 데이터가 틀린 채로 정상처럼 보이는 상태다.</p>
+
+<pre class="diagram">원하는 것: 주문 기준 페이지 (페이지 크기 2)     데이터베이스가 자르는 것: 행 기준 LIMIT
+                                                  행 1  order 1 | line 1 ┐
+  page 1 = [order 1, order 2]                     행 2  order 1 | line 2 ┤ LIMIT 2 → 주문 1개뿐
+  page 2 = [order 3]                              행 3  order 2 | line 3 ┘ LIMIT 3 → 주문 2의 컬렉션이 반쪽
+                                                  행 4  order 2 | line 4
+                                                  행 5  order 3 | line 5
+                                                  행 6  order 3 | line 6</pre>
+
+<x-visual id="jpa-app2-03-paging-rows" title="행 단위 LIMIT가 주문 단위 페이지와 어긋나는 모습" kind="비교 그림" ratio="16:9">
+<x-hint>사용자가 원하는 주문 단위 페이지와, 데이터베이스가 실제로 자르는 행 단위 LIMIT가 서로 다른 경계를 가진다는 것을 보여 준다.</x-hint>
+<x-prompt>Two-column comparison on white background. Left column titled "원하는 페이지: 주문 2개" shows three order cards stacked (blue "주문 1", green "주문 2", orange "주문 3"), each card containing two small line items; a dashed box surrounds the first two cards labeled "page 1". Right column titled "SQL LIMIT 3: 행 3개" shows a six-row table, rows colored blue, blue, green, green, orange, orange; a red horizontal cut line is drawn after row 3 with label "LIMIT 3". The green card that is cut in half has a warning badge "컬렉션이 반쪽". Between the columns a large "≠" sign. Footer text: "LIMIT는 엔티티가 아니라 행을 센다". Flat vector style, Korean labels exactly as given.</x-prompt>
+<x-caption>LIMIT와 OFFSET은 조인 결과의 행을 센다. 컬렉션을 조인한 결과에서 행으로 자르면 주문의 경계와 맞지 않는다.</x-caption>
+</x-visual>
+
+<p>Jakarta Persistence 명세도 이 상황을 정의하지 않는다. 3.1 명세의 쿼리 실행 절(3.10.7)은 컬렉션에 대한 페치 조인이 있는 쿼리에 <code>setMaxResults</code>나 <code>setFirstResult</code>를 적용한 결과가 정의되지 않았다(undefined)고 적고 있다. Hibernate는 그 공백을 "정확한 결과를 위해 메모리에서 자른다"로 채우고 경고를 남긴다. 경고의 코드 HHH90003004와 문구는 위 실행 결과 그대로이며, 로그를 남기는 곳은 <code>AbstractSqmSelectionQuery</code>의 <code>errorOrLogForPaginationWithCollectionFetch</code>였다.</p>
+
+<p>이 경고는 개발 중에 놓치기 쉽다. 테스트 데이터가 작으면 전부 읽어도 빠르고 결과도 맞기 때문이다. 운영에서 주문이 10만 건이면 페이지 하나를 그리려고 10만 건과 그 주문 상품 전부를 읽는다. Connector/J가 결과 전체를 메모리에 받고, Hibernate가 그 행 전부로 엔티티를 만들어 영속성 컨텍스트에 등록한다. 앞 권에서 본 것처럼 영속성 컨텍스트는 변경 감지를 위해 엔티티마다 로딩 시점의 상태를 따로 보관하므로 메모리 사용은 엔티티 수보다 더 커진다. 그렇게 만든 것 중 한 페이지만 쓰고 나머지는 트랜잭션이 끝날 때까지 붙잡고 있다가 버린다.</p>
+
+<p>Hibernate는 이것을 경고 대신 예외로 바꾸는 설정을 제공한다. 사용자 가이드의 설정 목록에 따르면 <code>hibernate.query.fail_on_pagination_over_collection_fetch</code>는 5.2.13부터 있었고 기본값은 <code>false</code>다. 기본값에서는 예외 없이 진행되고 "끔찍한 성능의 가능성"을 사용하는 쪽에 맡긴다는 설명이 붙어 있다. 켜면 같은 쿼리가 SQL을 실행하기도 전에 실패한다.</p>
+
+<pre data-label="실행 결과 (fail_on_pagination_over_collection_fetch=true)"><code class="language-text">EX: org.hibernate.HibernateException: setFirstResult() or setMaxResults() specified with collection fetch join (in-memory pagination was about to be applied, but 'hibernate.query.fail_on_pagination_over_collection_fetch' is enabled)
+total statements = 0</code></pre>
+
+<p>Spring Boot라면 <code>spring.jpa.properties.hibernate.query.fail_on_pagination_over_collection_fetch=true</code>로 켤 수 있다. Spring Boot 문서에 따르면 <code>spring.jpa.properties.*</code> 아래의 속성은 접두사를 뗀 이름 그대로 JPA 제공자에게 전달되며, 이름을 느슨하게 맞춰 주는 바인딩(relaxed binding)을 하지 않으므로 Hibernate의 설정 이름과 철자가 정확히 같아야 한다. 경고를 로그에서 찾는 것보다 테스트가 실패하는 편이 이 문제를 훨씬 일찍 드러낸다.</p>
+
+<h3>페치 조인의 한계 2: 컬렉션은 하나만, bag은 둘 이상 안 된다</h3>
+
+<p>컬렉션 페치 조인의 두 번째 제약은 개수다. 회원에서 출발해 회원의 주문 목록, 그 주문들의 주문 상품 목록을 한 번에 페치 조인해 보자. <code>Member.orders</code>와 <code>Order.lines</code>는 둘 다 <code>List</code>로 매핑한 컬렉션이다.</p>
+
+<pre><code class="language-java">em.createQuery(
+        "select m from Member m join fetch m.orders o join fetch o.lines l", Member.class)
+        .getResultList();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">EX: java.lang.IllegalArgumentException: org.hibernate.loader.MultipleBagFetchException: cannot simultaneously fetch multiple bags: [lab.Lab$Order.lines, lab.Lab$Member.orders]
+EX: org.hibernate.loader.MultipleBagFetchException: cannot simultaneously fetch multiple bags: [lab.Lab$Order.lines, lab.Lab$Member.orders]
+total statements = 0</code></pre>
+
+<p>SQL 수가 0이라는 점이 중요하다. 이 예외는 데이터와 무관하게, JPQL을 SQL로 번역하는 단계에서 매핑 정보만 보고 던져진다. JPA의 <code>createQuery</code>는 잘못된 쿼리에 <code>IllegalArgumentException</code>을 던지도록 정해져 있어서 Hibernate의 예외가 그 안에 감싸여 나온다.</p>
+
+<p>bag이란 Hibernate가 <b>인덱스 열이 없는 List</b>를 다루는 방식이다. 사용자 가이드는 bag을 순서 없는 리스트(unordered list)라고 설명하고, bag은 중복 원소를 담을 수 있다고 적는다. 이것이 문제의 핵심이다. 두 컬렉션을 한 결과 집합으로 함께 가져오면 한 컬렉션의 원소가 다른 컬렉션의 행 수만큼 반복해서 나타난다. 중복이 허용되지 않는 Set이라면 반복된 원소를 버리면 되고, 인덱스가 있는 List라면 인덱스로 자리를 정하면 된다. 중복을 허용하고 위치 정보도 없는 bag은 반복된 원소가 "실제로 두 번 들어 있는 원소"인지 "조인 때문에 생긴 반복"인지 구분할 근거가 없다. Hibernate는 데이터가 아니라 이 매핑 타입을 보고, 틀릴 수 있는 조합을 처음부터 거부한다.</p>
+
+<p>그래서 <code>Member.orders</code>를 <code>Set<Order></code>로 바꾸면 예외는 사라진다. 실험에서 같은 쿼리가 SQL 한 번에 회원 3명을 돌려줬다. 하지만 예외가 사라졌을 뿐 행이 불어나는 문제는 그대로다. 이 실험은 회원 → 주문 → 주문 상품으로 한 줄로 이어진 컬렉션이라 행 수가 주문 상품 수(6)에 그쳤지만, 한 부모 아래 <b>나란한</b> 두 컬렉션을 함께 페치 조인하면 행 수는 곱이 된다. 주문 하나에 주문 상품 10개와 쿠폰 5개가 있다면 그 주문 한 건이 10 × 5 = 50행이 된다. 이것은 SQL 조인의 정의에서 바로 나오는 결과로, 조인 조건을 만족하는 모든 조합마다 행이 생기기 때문이다. bag 예외를 피하려고 List를 Set으로 바꾸는 것은 증상을 감출 뿐 전송량의 곱셈은 막지 못한다.</p>
+
+<aside class="note">사용자 가이드는 Envers(엔티티 변경 이력 기록) 장에서 bag을 지원하지 않는 이유를 설명하며, bag 의미가 필요할 때의 대안으로 <code>@OrderColumn</code>을 붙인 인덱스 컬렉션을 든다. 인덱스 열이 생기면 더 이상 bag이 아니다. 다만 순서 열을 테이블에 추가하고 원소를 추가·삭제할 때마다 인덱스를 관리해야 하므로, 조회 최적화만을 위해 매핑을 바꾸는 것은 대가가 크다.</aside>
+
+<h3>페치 조인의 한계 3: 페치 대상에 조건을 걸면 컬렉션이 거짓말을 한다</h3>
+
+<p>세 번째 제약은 조건이다. 수량이 2 이상인 주문 상품이 있는 주문만 보고 싶어서, 페치 조인한 컬렉션의 별칭에 조건을 걸었다고 하자.</p>
+
+<pre><code class="language-java">List<Order> orders = em.createQuery(
+        "select o from Order o join fetch o.lines l where l.quantity > 1 order by o.id", Order.class)
+        .getResultList();
+for (Order o : orders)
+    System.out.println("order " + o.id + " lines=" + o.lines.size()
+            + " initialized=" + Hibernate.isInitialized(o.lines));
+
+Order again = em.find(Order.class, 1L);          // 같은 영속성 컨텍스트에서 다시 조회
+System.out.println("find(1) same=" + (again == orders.get(0)) + " lines=" + again.lines.size());</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">order 1 lines=1 initialized=true
+order 3 lines=1 initialized=true
+find(1) same=true lines=1</code></pre>
+
+<p>주문 1에는 데이터베이스에 주문 상품이 두 개 있지만(P1 × 1, P2 × 2), 메모리의 <code>lines</code>에는 조건을 통과한 하나만 들어 있다. 그런데 컬렉션은 "초기화됨" 상태라서 Hibernate는 다시 읽을 이유가 없다고 판단한다. 같은 영속성 컨텍스트에서 <code>find</code>로 주문 1을 다시 찾아도 같은 인스턴스가 돌아오고(<code>same=true</code>), 여전히 원소는 하나다. 이 주문의 총액을 계산하는 코드가 이후에 실행되면 2,000원짜리 상품 두 개만 계산되고 1,000원짜리 한 줄은 빠진다. SQL도 예외도 없이 틀린 값이 나온다.</p>
+
+<p>명세는 이 상황을 애초에 막아 두었다. Jakarta Persistence 3.1 명세 4.4.5.3절은 페치 조인의 오른쪽에 식별 변수(별칭)를 붙이는 것을 허용하지 않으며, 그래서 페치되는 엔티티를 쿼리의 다른 곳에서 참조할 수 없다고 적는다. Hibernate는 별칭을 허용한다. 이 회차의 쿼리들도 <code>join fetch o.lines l</code>처럼 별칭을 썼다. 별칭은 그 뒤에 <code>join fetch l.product</code>처럼 페치를 한 단계 더 이어 가는 데는 안전하게 쓸 수 있지만, WHERE 절에서 페치 대상을 걸러 내는 데 쓰면 위와 같은 불일치를 만든다. 루트 엔티티를 걸러 내는 조건이 필요하면 페치 조인과 별도로 <code>exists</code> 서브쿼리를 쓰거나, 조건에 맞는 데이터만 담은 DTO를 직접 조회해야 한다. 후자가 다음 회차의 주제다.</p>
+
+<h3>V3.1: 한계를 나누어 넘는다 — ToOne은 조인, 컬렉션은 따로</h3>
+
+<p>지금까지의 관찰을 정리하면 방향이 보인다. 행을 불리는 것은 컬렉션 조인뿐이고, ToOne 조인은 행 수를 바꾸지 않는다. 그렇다면 <b>행을 불리지 않는 연관만 조인으로 붙이고, 컬렉션은 별도의 쿼리로</b> 읽으면 루트 쿼리의 행이 곧 주문이 되어 데이터베이스가 정확히 주문 단위로 페이지를 자를 수 있다. 남는 문제는 컬렉션을 따로 읽을 때 다시 생기는 N+1인데, 이것을 배치 페치가 해결한다. 이것이 페이징과 한계 돌파라는 수업 제목이 가리키는 구성이다.</p>
+
+<p>먼저 배치 페치 없이 앞 절반만 적용해 보자. 회원과 배송만 페치 조인하고 페이징을 건다.</p>
+
+<pre data-label="실행 결과 (ToOne 페치 조인 + 페이징, 배치 페치 없음)"><code class="language-text">SQL#1: select o1_0.order_id,d1_0.delivery_id,d1_0.city,m1_0.member_id,m1_0.name from orders o1_0 join member m1_0 on m1_0.member_id=o1_0.member_id join delivery d1_0 on d1_0.delivery_id=o1_0.delivery_id order by o1_0.order_id offset ? rows fetch first ? rows only
+SQL#2: select l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity from order_line l1_0 where l1_0.order_id=?
+SQL#3: select p1_0.product_id,p1_0.name,p1_0.price from product p1_0 where p1_0.product_id=?
+SQL#4: select p1_0.product_id,p1_0.name,p1_0.price from product p1_0 where p1_0.product_id=?
+SQL#5: select l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity from order_line l1_0 where l1_0.order_id=?
+SQL#6: select p1_0.product_id,p1_0.name,p1_0.price from product p1_0 where p1_0.product_id=?
+SQL#7: select p1_0.product_id,p1_0.name,p1_0.price from product p1_0 where p1_0.product_id=?
+SQL#8: select l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity from order_line l1_0 where l1_0.order_id=?
+total statements = 8</code></pre>
+
+<p>SQL#1에 페이징 구문(<code>offset ? rows fetch first ? rows only</code>)이 붙었다. H2 방언의 표준 SQL 구문이고, MySQL에서는 같은 의미가 <code>LIMIT</code> 구문으로 번역된다. 루트 쿼리의 행이 주문 하나에 정확히 한 행이므로 이 페이징은 주문 단위로 정확하다. 경고도 없다. 회원과 배송 SQL이 사라져 V2의 14개가 8개로 줄었지만, 주문마다 주문 상품 SQL(#2, #5, #8)과 상품 SQL이 여전히 따로 나간다. 1 + 주문 수(3) + 서로 다른 상품 수(4) = 8이다.</p>
+
+<h3>배치 페치: IN 하나로 N을 1로</h3>
+
+<p>이제 Hibernate 설정 <code>hibernate.default_batch_fetch_size</code>를 100으로 주고 같은 코드를 실행한다. 이 설정은 사용자 가이드 설정 목록의 Fetch 관련 항목에 있으며, 설명에 따르면 기본적으로 Hibernate는 <code>@BatchSize</code>를 명시적으로 붙인 엔티티와 컬렉션에만 배치 페치를 쓰고, 이 설정이 그 기본값을 정한다. Spring Boot에서는 <code>spring.jpa.properties.hibernate.default_batch_fetch_size=100</code>이다.</p>
+
+<pre data-label="실행 결과 (ToOne 페치 조인 + 페이징, default_batch_fetch_size=100)"><code class="language-text">SQL#1: select o1_0.order_id,d1_0.delivery_id,d1_0.city,m1_0.member_id,m1_0.name from orders o1_0 join member m1_0 on m1_0.member_id=o1_0.member_id join delivery d1_0 on d1_0.delivery_id=o1_0.delivery_id order by o1_0.order_id offset ? rows fetch first ? rows only
+SQL#2: select l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity from order_line l1_0 where l1_0.order_id in (?,?,?, ... 물음표 100개 ...)
+SQL#3: select p1_0.product_id,p1_0.name,p1_0.price from product p1_0 where p1_0.product_id in (?,?,?, ... 물음표 100개 ...)
+total statements = 3</code></pre>
+
+<p>SQL이 3개가 됐다. 주문 1의 컬렉션을 처음 건드리는 순간 Hibernate는 주문 1만이 아니라 아직 초기화되지 않은 주문 2, 주문 3의 컬렉션까지 모아 <code>order_id in (...)</code> 한 번으로 읽었다(SQL#2). 그 결과로 주문 상품 6개가 올라오면서 상품 프록시 4개가 생겼고, 첫 상품을 건드리는 순간 네 개를 한 번에 읽었다(SQL#3). 이후 주문 2, 주문 3을 변환할 때는 필요한 것이 전부 영속성 컨텍스트에 있으므로 SQL이 나가지 않는다. 주문이 3건이든 100건이든 한 페이지의 주문이 100건 이하라면 주문 상품 컬렉션을 읽는 SQL은 1개로 고정되고, 그 페이지에 나온 서로 다른 상품이 100개 이하라면 상품 SQL도 1개다. 컬렉션 쪽에서 "1 + N"이 "1 + 1"로 바뀐 것이다.</p>
+
+<p>눈에 띄는 것은 실제 키가 3개(주문)와 4개(상품)인데 IN 목록의 물음표가 둘 다 100개라는 점이다. 남는 자리에 무엇이 바인딩되는지 보려고 H2의 추적 기능(<code>TRACE_LEVEL_SYSTEM_OUT=3</code>)을 켜고 배치 크기 10으로 다시 실행했다.</p>
+
+<pre data-label="실행 결과 (H2 추적, default_batch_fetch_size=10)"><code class="language-text">select l1_0.order_id,... from order_line l1_0 where l1_0.order_id in (?,?,?,?,?,?,?,?,?,?) {1: CAST(1 AS BIGINT), 2: CAST(2 AS BIGINT), 3: CAST(3 AS BIGINT), 4: NULL, 5: NULL, 6: NULL, 7: NULL, 8: NULL, 9: NULL, 10: NULL};
+select p1_0.product_id,... from product p1_0 where p1_0.product_id in (?,?,?,?,?,?,?,?,?,?) {1: CAST(1 AS BIGINT), 2: CAST(2 AS BIGINT), 3: CAST(3 AS BIGINT), 4: CAST(4 AS BIGINT), 5: NULL, 6: NULL, 7: NULL, 8: NULL, 9: NULL, 10: NULL};</code></pre>
+
+<p>Hibernate 6.6은 이 환경에서 IN 목록을 배치 크기만큼 채우고, 실제 키가 없는 자리에는 NULL을 바인딩했다. NULL을 IN 목록에 넣어도 결과는 달라지지 않는다. SQL에서 <code>order_id = NULL</code>은 참이 아니라 UNKNOWN이고, WHERE 절은 참인 행만 통과시키기 때문이다. MySQL 8.4.13과 8.0.46에서 <code>where l1_0.order_id in (1,2,3,NULL,NULL,NULL,NULL,NULL,NULL,NULL)</code>을 실행해도 NULL 없이 쓴 것과 같은 6행이 돌아왔다. 이렇게 하면 키가 3개든 97개든 SQL 문자열이 하나로 고정된다. 같은 문자열은 JDBC 드라이버의 문장 캐시나 데이터베이스의 실행 계획 캐시에서 같은 항목으로 취급될 수 있다. 사용자 가이드는 별개의 설정인 <code>hibernate.query.in_clause_parameter_padding</code>(5.2.17부터)을 설명하면서, 실행 계획을 캐시하는 데이터베이스에서는 IN 목록 길이의 가짓수가 적을수록 캐시 적중 가능성이 높다는 같은 원리를 밝힌다. 그 설정은 일반 쿼리의 IN 파라미터를 2의 거듭제곱 개수로 채우고 남는 자리에 NULL을 바인딩한다.</p>
+
+<aside class="note">IN 목록을 만드는 구체적인 모양은 Hibernate 버전과 방언에 따라 다를 수 있다. 위 출력은 Hibernate 6.6.53과 H2 2.3.232의 조합에서 관찰한 것이다. 버전을 올린 뒤에는 SQL 로그를 한 번 직접 확인하는 편이 안전하다.</aside>
+
+<h3>배치 페치는 어떻게 키를 모으는가</h3>
+
+<p>Hibernate는 어떤 키를 IN 목록에 넣을지 어떻게 알까. 핵심은 영속성 컨텍스트가 <b>아직 초기화되지 않은 것들의 목록</b>을 들고 있다는 데 있다. <code>@BatchSize</code>의 Javadoc은 배치로 가져올 기본 키 값이 세션에 연결된, 아직 가져오지 않은 엔티티 프록시나 컬렉션들의 식별자 가운데서 선택된다고 설명한다. Hibernate 6.6 내부에서 이 목록을 관리하는 클래스는 <code>org.hibernate.engine.spi.BatchFetchQueue</code>다. 영속성 컨텍스트를 받아 만들어지고, 배치로 읽을 수 있는 엔티티 키와 컬렉션을 등록하는 메서드(<code>addBatchLoadableEntityKey</code>, <code>addBatchLoadableCollection</code>)와 배치 크기만큼 키를 모으는 메서드(<code>collectBatchLoadableCollectionKeys</code> 등)를 가지고 있다. 이름은 내부 구현이므로 버전에 따라 바뀔 수 있지만, 동작의 뼈대는 그대로 읽힌다.</p>
+
+<figure class="flow-figure"><figcaption>주문 상품 컬렉션이 배치로 초기화되는 과정 (default_batch_fetch_size = 100)</figcaption><ol class="flow">
+<li><strong>루트 조회</strong><span>주문 3건이 영속성 컨텍스트에 올라온다. 각 주문의 lines에는 초기화되지 않은 PersistentBag이 들어가고, 이 컬렉션들이 배치 대기 목록에 등록된다.</span></li>
+<li><strong>첫 접근</strong><span>주문 1의 lines를 순회하려는 순간 초기화가 필요해진다.</span></li>
+<li><strong>키 모으기</strong><span>같은 role(Order.lines)의 미초기화 컬렉션 키를 배치 크기까지 모은다. 주문 1, 2, 3의 키가 모인다.</span></li>
+<li><strong>IN 쿼리 한 번</strong><span>order_id in (1, 2, 3, NULL, …)을 실행하고, 결과 행을 order_id별로 나눠 각 컬렉션에 넣은 뒤 셋 다 초기화됨으로 바꾸고 대기 목록에서 뺀다.</span></li>
+<li><strong>연쇄</strong><span>새로 올라온 주문 상품 6개의 product 필드에 상품 프록시가 생기고, 이 프록시들이 다시 대기 목록에 등록된다. 첫 상품 접근 때 같은 방식으로 한 번에 읽힌다.</span></li>
+</ol></figure>
+
+<p>배치 크기를 2로 줄여 보면 "배치 크기까지 모은다"는 부분이 드러난다. 페이징 없이 같은 순회를 했을 때의 결과다.</p>
+
+<pre data-label="실행 결과 (default_batch_fetch_size=2)"><code class="language-text">SQL#1: select o1_0.order_id,d1_0.delivery_id,d1_0.city,m1_0.member_id,m1_0.name from orders o1_0 join member m1_0 on ... join delivery d1_0 on ... order by o1_0.order_id
+SQL#2: select l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity from order_line l1_0 where l1_0.order_id in (?,?)
+SQL#3: select p1_0.product_id,p1_0.name,p1_0.price from product p1_0 where p1_0.product_id in (?,?)
+SQL#4: select p1_0.product_id,p1_0.name,p1_0.price from product p1_0 where p1_0.product_id in (?,?)
+SQL#5: select l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity from order_line l1_0 where l1_0.order_id=?
+total statements = 5</code></pre>
+
+<p>주문 1의 컬렉션을 초기화할 때 키를 두 개까지만 모을 수 있으므로 주문 1과 주문 2의 컬렉션만 읽혔다(SQL#2). 그 결과 상품 프록시 4개(P1~P4)가 대기 목록에 올라왔고, 주문 1의 상품을 건드릴 때 두 개씩 두 번에 걸쳐 네 개가 모두 읽혔다(SQL#3, #4). 주문 3의 컬렉션은 아직 초기화되지 않은 채 남았다가, 주문 3을 순회할 때 혼자 읽혔다(SQL#5). 모을 키가 하나뿐이면 Hibernate는 IN 대신 <code>=?</code> 형태의 단건 조회를 썼다. 주문 3이 산 P1과 P3는 이미 읽혀 있으므로 상품 SQL은 더 나가지 않는다. 일반화하면, 한 role에 대해 초기화가 필요한 컬렉션이 n개이고 배치 크기가 b일 때 그 role의 SQL은 n을 b로 나눈 값의 올림만큼 나간다.</p>
+
+<p>배치 페치는 컬렉션만의 기능이 아니다. 페치 조인을 하나도 쓰지 않고 배치 크기 100으로 주문을 순회하면 SQL은 5개다. 주문 목록, 회원 IN, 배송 IN, 주문 상품 IN, 상품 IN이다. 회원과 배송처럼 ToOne으로 생긴 프록시도 같은 방식으로 모여서 읽혔다. 그런데도 V3.1에서 ToOne을 페치 조인으로 붙이는 이유는 단순하다. ToOne 조인은 행을 불리지 않으므로 페이징을 해치지 않으면서 SQL을 두 개 더 줄여 준다.</p>
+
+<p>전역 설정 대신 특정 대상에만 배치 크기를 주려면 <code>@BatchSize</code>를 쓴다. Hibernate 6.6의 이 애노테이션은 타입(클래스), 메서드, 필드에 붙일 수 있다(<code>@Target</code>이 TYPE, METHOD, FIELD). Javadoc의 예처럼 엔티티 클래스에 <code>@BatchSize(size = 100)</code>을 붙이면 그 엔티티의 미초기화 프록시를 한 번에 최대 100개까지 읽고, <code>@OneToMany</code> 컬렉션에 붙이면 그 role의 미초기화 컬렉션을 한 번에 최대 그 개수만큼 읽는다. 즉 상품 프록시의 배치 크기는 <code>OrderLine.product</code> 필드가 아니라 <code>Product</code> 클래스에 붙여야 하고, 주문 상품 컬렉션의 배치 크기는 <code>Order.lines</code> 필드에 붙인다.</p>
+
+<pre><code class="language-java">@Entity
+@BatchSize(size = 100)                 // Product 프록시를 최대 100개씩 묶어 초기화
+public class Product { /* ... */ }
+
+@Entity
+public class Order {
+    @OneToMany(mappedBy = "order")
+    @BatchSize(size = 100)             // Order.lines 컬렉션을 최대 100개씩 묶어 초기화
+    List<OrderLine> lines = new ArrayList<>();
+    // ...
+}</code></pre>
+
+<x-visual id="jpa-app2-03-batch-fetch" title="배치 페치가 미초기화 컬렉션의 키를 모아 IN 쿼리 하나로 읽는 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>애플리케이션 코드, 영속성 컨텍스트(대기 목록), 데이터베이스 세 참여자 사이에서 컬렉션 하나에 접근했을 때 세 컬렉션이 한꺼번에 채워지는 흐름을 보여 준다.</x-hint>
+<x-prompt>Sequence diagram with three vertical lifelines on white background, labeled left to right: "애플리케이션 코드", "영속성 컨텍스트", "데이터베이스". Inside the middle lifeline, draw a small box titled "미초기화 목록" containing three chips "Order 1.lines", "Order 2.lines", "Order 3.lines". Step arrows: (1) from left to middle labeled "order1.getLines() 순회"; (2) a self-arrow on middle labeled "같은 role 키를 모은다 (최대 100)"; (3) from middle to right labeled "order_id in (1, 2, 3)"; (4) dashed return arrow from right to middle labeled "주문 상품 6행"; (5) the three chips turn green with a check mark and a label "초기화됨"; (6) from left to middle labeled "order2.getLines()" with a small note "SQL 없음". Clean flat vector style, Korean labels exactly as given, numbered step circles.</x-prompt>
+<x-caption>컬렉션 하나에 처음 접근하는 순간, 같은 role의 미초기화 컬렉션들이 IN 쿼리 하나로 함께 채워진다. 이후 다른 주문의 컬렉션 접근에는 SQL이 나가지 않는다.</x-caption>
+</x-visual>
+
+<h3>데이터베이스 쪽에서 본 IN 쿼리: MySQL InnoDB 기준</h3>
+
+<p>배치 페치가 보낸 <code>where order_id in (...)</code>를 데이터베이스는 어떻게 처리할까. 먼저 인덱스다. <code>order_line.order_id</code>는 외래 키 열이다. MySQL 문서에 따르면 MySQL은 외래 키 검사를 빠르게 하려고 참조하는 테이블에 외래 키 열이 앞쪽에 오는 인덱스를 요구하며, 그런 인덱스가 없으면 자동으로 만든다. 그래서 외래 키 제약을 건 InnoDB 테이블이라면 <code>order_id</code>로 찾는 인덱스가 존재한다. 반대로 외래 키 제약 없이 스키마를 운영한다면 이 인덱스는 저절로 생기지 않으므로 직접 확인해야 한다. 인덱스가 없으면 IN 쿼리 한 번이 테이블 전체를 읽는다.</p>
+
+<p>실험 도메인의 테이블을 MySQL에 외래 키 제약과 함께 만들고(<code>CREATE TABLE order_line (..., FOREIGN KEY (order_id) REFERENCES orders(order_id), FOREIGN KEY (product_id) REFERENCES product(product_id))</code>, 인덱스는 따로 만들지 않았다) 정의를 확인하면, 외래 키 열마다 인덱스가 자동으로 생겨 있다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 같다)"><code class="language-text">mysql> SHOW CREATE TABLE order_line\G
+*************************** 1. row ***************************
+       Table: order_line
+Create Table: CREATE TABLE `order_line` (
+  `order_line_id` bigint NOT NULL AUTO_INCREMENT,
+  `order_id` bigint DEFAULT NULL,
+  `product_id` bigint DEFAULT NULL,
+  `quantity` int DEFAULT NULL,
+  PRIMARY KEY (`order_line_id`),
+  KEY `order_id` (`order_id`),
+  KEY `product_id` (`product_id`),
+  CONSTRAINT `order_line_ibfk_1` FOREIGN KEY (`order_id`) REFERENCES `orders` (`order_id`),
+  CONSTRAINT `order_line_ibfk_2` FOREIGN KEY (`product_id`) REFERENCES `product` (`product_id`)
+) ENGINE=InnoDB AUTO_INCREMENT=7 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci</code></pre>
+
+<p>MySQL 레퍼런스 매뉴얼의 범위 최적화(range optimization) 절은 <code>col IN (v1, ..., vN)</code>을 "값 하나짜리 범위"가 N개 있는 동등 범위 비교(equality range comparison)로 다룬다. 인덱스에서 이것은 B+Tree를 위에서부터 N번 내려가 각 값의 위치를 찾고, 거기서부터 같은 값을 가진 항목을 읽는 range 접근이 된다. 옵티마이저는 이 접근의 비용을 정하려고 범위마다 행 수를 추정한다. 매뉴얼에 따르면 열에 고유 인덱스가 있으면 범위마다 추정치는 1이다. 한 값에 해당하는 행은 많아야 하나이기 때문이다. 상품 배치 쿼리의 <code>product_id</code>는 기본 키라서 이 경우다. 실험 데이터(상품 4개)에서 배치 크기 10의 상품 쿼리를 EXPLAIN하면 실제 키 4개에 대해 rows가 4로 나온다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 같다)"><code class="language-text">mysql> EXPLAIN select p1_0.product_id,p1_0.name,p1_0.price from product p1_0
+    ->   where p1_0.product_id in (1,2,3,4,NULL,NULL,NULL,NULL,NULL,NULL);
++----+-------------+-------+------------+-------+---------------+---------+---------+------+------+----------+-------------+
+| id | select_type | table | partitions | type  | possible_keys | key     | key_len | ref  | rows | filtered | Extra       |
++----+-------------+-------+------------+-------+---------------+---------+---------+------+------+----------+-------------+
+|  1 | SIMPLE      | p1_0  | NULL       | range | PRIMARY       | PRIMARY | 8       | NULL |    4 |   100.00 | Using where |
++----+-------------+-------+------------+-------+---------------+---------+---------+------+------+----------+-------------+</code></pre>
+
+<p><code>order_id</code>처럼 고유하지 않은 인덱스라면 옵티마이저는 두 가지 방법 중 하나로 추정한다. 하나는 인덱스 다이브(index dive)로, 범위의 양 끝으로 인덱스를 실제로 내려가 그 사이의 행 수를 센다. 정확하지만 값이 많아지면 추정 자체가 오래 걸린다. 다른 하나는 인덱스 통계로, 덜 정확하지만 빠르다. 둘을 가르는 기준이 시스템 변수 <code>eq_range_index_dive_limit</code>이고 MySQL 8.0의 기본값은 200이다(8.0.46과 8.4.13에서 <code>SELECT @@eq_range_index_dive_limit</code>는 둘 다 200이었다). 매뉴얼은 N개의 동등 범위까지 인덱스 다이브를 허용하려면 이 값을 N + 1로 설정하라고 설명한다. 즉 기본값에서는 IN 목록의 값이 200개에 이르는 순간부터 통계 기반 추정으로 바뀐다. 배치 크기를 수백 이상으로 키우면 같은 쿼리라도 옵티마이저가 쓰는 추정 방식이 바뀐다는 점을 알아 둘 만하다.</p>
+
+<p>이 경계를 직접 확인하려고 MySQL 안에서 데이터를 늘렸다. 주문을 2,000건으로 만들고, 주문 상품은 주문 1~3에 두 줄씩, 주문 4~1000에 한 줄씩, 주문 1001~2000에 아홉 줄씩 넣어 모두 10,003행으로 치우치게 했다(<code>ANALYZE TABLE</code> 후 <code>order_id</code> 인덱스의 Cardinality는 2000). 그리고 <code>SET SESSION optimizer_trace='enabled=on'</code>을 켠 채 주문 1001부터 연속된 값 199개와 200개를 IN 목록에 넣어 EXPLAIN하고, 트레이스의 <code>index_dives_for_eq_ranges</code>와 range 접근의 추정 행 수를 뽑았다. 추정 행 수는 실행 환경과 통계에 따라 달라지는 값이다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 같은 값)"><code class="language-text">IN 목록                          index_dives_for_eq_ranges   EXPLAIN rows   실제 행 수(COUNT)
+값 199개 (1001~1199)             true                         1791           1791
+값 200개 (1001~1200)             false                         800           1800
+실제 값 3개 + NULL 197개 (200개)  true                           27             27</code></pre>
+
+<p>값이 199개일 때는 인덱스 다이브로 실제 행 수와 똑같은 1791을 추정했고, 200개가 되자 다이브를 하지 않고 통계로 800을 추정했다. 실제로는 1800행이므로 추정이 절반 아래로 빗나갔다. 이 데이터처럼 값마다 행 수가 고르지 않으면 통계 기반 추정은 평균에 가까운 값을 내므로 실제와 크게 어긋날 수 있다. 세 번째 줄은 배치 페치의 NULL 채우기를 흉내 낸 것으로, 목록 길이는 200이지만 다이브를 썼다. 이 실험에서는 NULL 자리가 동등 범위의 개수에 들어가지 않았다.</p>
+
+<p>IN 목록이 아주 길어지면 다른 한계도 있다. 범위 최적화기가 쓸 수 있는 메모리는 <code>range_optimizer_max_mem_size</code>로 제한되고, 매뉴얼에 따르면 이 한도를 넘을 것 같으면 range 접근을 포기하고 전체 테이블 스캔을 포함한 다른 방법을 고려하며, 경고 3170을 남긴다. 위와 같은 값 200개 IN 조건으로 <code>order_id, order_line_id</code>를 고르는 쿼리에서 세션 값만 <code>SET SESSION range_optimizer_max_mem_size = 5000</code>으로 낮춰 EXPLAIN하면 접근 방식이 range에서 인덱스 전체를 읽는 index로 바뀌고(rows 9952) 다음 경고가 남는다(MySQL 8.4.13에서 실행). <code>Warning (Code 3170): Memory capacity of 5000 bytes for 'range_optimizer_max_mem_size' exceeded. Range optimization was not done for this query.</code> 배치 페치의 IN 목록 길이는 배치 크기로 묶여 있으므로 이 한도에 닿는 일은 드물지만, 배치 크기를 "클수록 좋다"고 무한정 키우면 안 되는 이유 중 하나다.</p>
+
+<p>결국 배치 크기는 세 가지를 맞바꾼다. 크게 잡으면 SQL 수(왕복 수)가 줄어든다. 대신 한 번에 메모리로 올라오는 행이 많아지고, SQL 문장과 바인딩 값이 길어지고, 데이터베이스 쪽의 추정 방식과 메모리 한계에 가까워진다. 작게 잡으면 그 반대다. 한 가지 기준은 페이지 크기다. 배치 크기가 한 페이지의 루트 엔티티 수 이상이면, 그 페이지의 컬렉션 role 하나는 SQL 한 번으로 초기화된다. 그보다 크게 잡아도 이 요청에서는 이득이 없다. 상품처럼 연쇄로 생기는 프록시는 페이지 크기 × 주문당 상품 수만큼 생길 수 있으므로 같은 계산을 한 단계 더 해 봐야 한다.</p>
+
+<h3>세 방식의 비교와 다음 회차로의 연결</h3>
+
+<p>같은 데이터에서 세 방식을 나란히 놓으면 다음과 같다. 전송 행은 데이터베이스가 돌려준 결과 행의 합이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>방식</th><th>SQL 수(실험)</th><th>전송 행</th><th>DB 페이징</th><th>남는 위험</th></tr></thead><tbody>
+<tr><td>V2: DTO 변환 + 지연 로딩</td><td>14</td><td>3 + 회원 3 + 배송 3 + 주문 상품 6 + 상품 4 = 19행(14번에 나눠)</td><td>가능</td><td>N+1, 데이터에 비례하는 왕복</td></tr>
+<tr><td>V3: 컬렉션까지 페치 조인</td><td>1</td><td>6행(주문·회원·배송 열이 반복)</td><td>불가(메모리에서 자름)</td><td>메모리, bag 둘 이상 불가, 조건 걸면 컬렉션 불일치</td></tr>
+<tr><td>V3.1: ToOne 페치 조인 + 배치 페치(100)</td><td>3</td><td>주문 3 + 주문 상품 6 + 상품 4 = 13행(반복 없음)</td><td>가능</td><td>배치 크기 선택, IN 목록 길이</td></tr>
+</tbody></table></div>
+
+<p>V3.1의 전송 행이 V3보다 많아 보이지만 내용은 반대다. V3의 6행은 행마다 주문·회원·배송·주문 상품·상품의 열을 전부 담고 있고 그중 부모 쪽 열은 반복이다. V3.1은 각 테이블의 행을 한 번씩만 보낸다. 주문당 주문 상품이 많을수록, 부모 쪽 열이 넓을수록 V3.1이 전송량에서 유리해진다. 대신 SQL이 하나에서 셋으로 늘었는데, 각 경로의 대상 수가 배치 크기를 넘지 않는 한 이 수는 데이터의 양과 무관하다. V2의 문제는 SQL 수가 데이터에 비례한다는 것이었고, V3.1은 그것을 연관 경로의 수에 비례하도록 바꿨다. 대상이 배치 크기를 넘으면 경로마다 "대상 수 ÷ 배치 크기의 올림"만큼으로 늘어난다.</p>
+
+<p>세 방식 모두 엔티티를 조회한 뒤 DTO로 바꾼다는 공통점이 있다. 엔티티로 조회하면 영속성 컨텍스트의 동일성 보장과 지연 로딩, 배치 페치 같은 도구를 그대로 쓸 수 있지만, 화면에 필요 없는 열까지 전부 읽고 엔티티 인스턴스와 그 스냅샷을 만든다. 다음 회차(04회)는 반대 방향, 즉 JPQL의 <code>new</code> 연산으로 처음부터 DTO를 조회하는 방식과 그 컬렉션 버전, 그리고 한 번의 조인 결과(플랫 데이터)를 애플리케이션에서 직접 접는 방식을 다루고 섹션 전체를 정리한다. 이 회차의 모든 실험에서 DTO 변환은 트랜잭션 안에서 일어났는데, 이 변환이 컨트롤러나 뷰에서 일어날 때 커넥션이 언제까지 붙잡히는지는 05회의 OSIV에서 이어진다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>컬렉션 조인의 행 증가</dt><dd>일대다 조인은 조건을 만족하는 행의 쌍마다 결과 행을 만들므로 부모 행이 자식 수만큼 복제된다. 주문 3건과 주문 상품 6건의 조인 결과는 6행이다.</dd>
+<dt>V2의 SQL 수</dt><dd>1 + 서로 다른 회원 수 + 주문 수(배송) + 주문 수(컬렉션) + 아직 컨텍스트에 없는 서로 다른 상품 수. 영속성 컨텍스트가 이미 가진 엔티티는 다시 읽지 않는다.</dd>
+<dt>Hibernate 6의 중복 제거</dt><dd>명세상 페치 조인은 부모 참조를 행 수만큼 돌려주지만, Hibernate 6부터는 중복된 루트 엔티티를 항상 걸러 낸다. JPQL distinct는 SQL에도 들어가지만 컬렉션 조인 행은 열 값이 달라 합쳐지지 않는다.</dd>
+<dt>메모리 페이징</dt><dd>컬렉션 페치 조인에 setFirstResult/setMaxResults를 걸면 Hibernate는 SQL에 페이징을 넣지 않고 전체 결과를 읽은 뒤 메모리에서 자르며 HHH90003004 경고를 남긴다. fail_on_pagination_over_collection_fetch를 켜면 예외가 된다.</dd>
+<dt>MultipleBagFetchException</dt><dd>인덱스 없는 List(bag) 컬렉션을 둘 이상 함께 페치 조인하면 SQL 번역 단계에서 거부된다. Set으로 바꾸면 예외는 사라지지만 나란한 컬렉션의 행 곱셈은 그대로다.</dd>
+<dt>페치 대상의 조건</dt><dd>페치 조인한 컬렉션 별칭으로 WHERE를 걸면 걸러진 원소만 담긴 컬렉션이 초기화된 상태로 영속성 컨텍스트에 남아 DB와 어긋난다. 명세는 페치 조인 별칭 자체를 허용하지 않는다.</dd>
+<dt>V3.1 구성</dt><dd>행을 불리지 않는 ToOne만 페치 조인해 데이터베이스에서 주문 단위로 페이징하고, 컬렉션은 지연 로딩과 배치 페치로 IN 쿼리 한 번에 읽는다.</dd>
+<dt>배치 페치</dt><dd>미초기화 프록시나 컬렉션 하나를 초기화할 때 같은 종류의 미초기화 대상을 배치 크기까지 모아 IN 쿼리로 함께 읽는다. 전역은 hibernate.default_batch_fetch_size, 개별은 @BatchSize(엔티티 클래스 또는 컬렉션 필드).</dd>
+</x-summary>
+
+<x-review>
+<p>목록 API가 느리다는 보고를 받으면 가장 먼저 볼 것은 SQL 로그의 <b>개수와 모양</b>이다. 같은 모양의 <code>where ...=?</code> 쿼리가 결과 건수에 비례해 반복되면 N+1이고, 한 번의 쿼리가 페이지 크기와 무관하게 큰 결과를 돌려주며 HHH90003004 경고가 함께 찍혀 있으면 컬렉션 페치 조인 위의 메모리 페이징이다. 후자는 데이터가 적은 개발 환경에서는 빠르고 정확하게 동작하다가 데이터가 쌓인 뒤 응답 지연이나 힙 부족으로 드러나므로, 테스트 설정에서 <code>fail_on_pagination_over_collection_fetch</code>를 켜 두면 배포 전에 걸러 낼 수 있다.</p>
+<p>페치 조인을 고를지 배치 페치를 고를지는 페이징 여부와 컬렉션의 크기로 갈린다. 페이징이 없고 컬렉션이 작으며 한 경로만 따라간다면 컬렉션 페치 조인 한 번이 가장 단순하다. 페이징이 있거나, 컬렉션이 크거나, 나란한 컬렉션이 둘 이상이면 ToOne 페치 조인과 배치 페치의 조합이 안정적이다. 이 조합은 배치 크기 범위 안에서 SQL 수가 데이터 양이 아니라 연관 경로의 수에 묶이므로 응답 시간을 예측하기 쉽다.</p>
+<p>배치 크기는 전역 기본값으로 한 번 정해 두면 대부분의 지연 로딩이 자동으로 묶인다는 장점이 있다. 다만 기본값은 모든 엔티티와 컬렉션에 적용되므로, 특정 화면에서 IN 목록이 매우 길어지거나 한 번에 너무 많은 행이 올라온다면 그 대상에만 <code>@BatchSize</code>로 다른 값을 준다. MySQL에서는 IN 목록 길이가 <code>eq_range_index_dive_limit</code>(기본 200)를 넘는지에 따라 실행 계획 추정 방식이 바뀐다는 점도 실행 계획이 예상과 다를 때 확인할 항목이다.</p>
+</x-review>
+
+<x-practice>
+<li>실험 데이터에서 세 주문이 모두 회원 kim의 주문이고, 주문 상품은 그대로라고 하자. V2 방식(배치 페치 없음)으로 세 주문을 DTO로 바꿀 때 실행되는 SQL 수를 계산하고, 줄어든 이유를 설명하라.</li>
+<li>주문 하나에 주문 상품 3개와 쿠폰 2개가 있다. <code>Order.lines</code>와 <code>Order.coupons</code>를 둘 다 <code>Set</code>으로 매핑하고 한 쿼리로 함께 페치 조인했다. 이 주문 한 건이 SQL 결과에서 몇 행이 되는지 행 표를 그려 답하고, 두 컬렉션이 List(인덱스 없음)였다면 어떻게 되는지 설명하라.</li>
+<li>주문 25건을 한 페이지로 ToOne 페치 조인과 페이징으로 조회하고, <code>default_batch_fetch_size=10</code>에서 25건 모두의 <code>lines</code>를 순회한다. 주문 상품 컬렉션을 초기화하는 SQL은 몇 번 나가는가? 배치 크기를 25로 바꾸면 몇 번인가?</li>
+<li>다음 코드가 결제 금액을 잘못 계산하는 이유를 설명하라. <code>select o from Order o join fetch o.lines l where l.quantity > 1</code>로 주문을 읽은 뒤, 같은 트랜잭션에서 주문마다 <code>lines</code>를 돌며 수량 × 가격을 더한다.</li>
+<li>컬렉션 페치 조인 쿼리에 JPQL <code>distinct</code>를 붙였더니 SQL에도 <code>select distinct</code>가 들어갔다. 이 SQL의 결과 행 수가 왜 줄지 않는지, 그런데도 결과 리스트가 3인 이유는 무엇인지 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 회원 항이 "서로 다른 회원 수"이므로 3에서 1로 준다. 1(주문) + 1(회원 kim) + 3(배송) + 3(컬렉션) + 4(상품 P1~P4) = 12개다. 주문 1을 변환할 때 kim이 영속성 컨텍스트에 올라오고, 주문 2·3의 <code>member</code> 필드는 같은 식별자를 가리키므로 같은 인스턴스로 연결된다. 이미 초기화된 엔티티이므로 SQL이 다시 나가지 않는다. 상품 항도 같은 원리로 P1, P3의 재조회가 없다.</p>
+<p><b>2.</b> 나란한 두 컬렉션을 함께 조인하면 조건을 만족하는 모든 조합마다 행이 생기므로 3 × 2 = 6행이다. 행마다 주문 열이 반복되고, 주문 상품 하나는 쿠폰 수(2)만큼, 쿠폰 하나는 주문 상품 수(3)만큼 반복된다. Set이므로 Hibernate는 반복된 원소를 버려 컬렉션을 올바르게 만들 수 있지만 6행의 전송은 피할 수 없다. 둘 다 인덱스 없는 List라면 bag 두 개를 함께 페치하는 것이므로 SQL을 실행하기 전에 MultipleBagFetchException이 난다. bag은 중복을 허용하므로 반복이 실제 중복인지 조인 때문인지 구분할 수 없기 때문이다.</p>
+<p><b>3.</b> 한 role에 대해 초기화가 필요한 컬렉션이 25개이고 한 번에 최대 10개를 모으므로 10, 10, 5로 3번이다. 마지막 묶음은 5개뿐이지만 SQL 한 번이다. 배치 크기가 25면 첫 접근에서 25개가 모두 모여 1번이다. 배치 크기를 페이지 크기 이상으로 잡으면 role 하나당 SQL이 하나로 고정된다는 기준이 여기서 나온다.</p>
+<p><b>4.</b> 조건이 조인된 주문 상품 행을 걸러 내므로 각 주문의 <code>lines</code>에는 수량이 2 이상인 원소만 들어간다. 그런데 Hibernate는 이 컬렉션을 초기화된 것으로 표시하므로, 같은 영속성 컨텍스트 안에서는 다시 읽지 않고 걸러진 컬렉션을 계속 돌려준다. 실험에서 주문 1은 데이터베이스에 두 줄(P1 × 1, P2 × 2)이 있지만 메모리에는 P2 × 2 한 줄만 있었으므로, 합계에서 P1 × 1 = 1,000원이 빠진다. 루트를 거르는 조건은 <code>exists</code> 서브쿼리로 분리하거나 DTO 조회를 써야 한다.</p>
+<p><b>5.</b> SQL <code>DISTINCT</code>는 선택한 모든 열이 같은 행만 합친다. 컬렉션 조인 행은 주문 열이 같아도 <code>order_line_id</code> 등 주문 상품 열이 다르므로 합칠 행이 없고, 데이터베이스는 6행을 그대로 돌려준다. 결과 리스트가 3인 것은 Hibernate 6가 같은 루트 엔티티 인스턴스를 메모리에서 걸러 내기 때문이며, 마이그레이션 가이드에 따르면 Hibernate 6부터는 distinct가 없어도 항상 그렇게 한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>Hibernate 6.6에서 <code>select o from Order o join fetch o.lines</code>에 <code>setMaxResults(10)</code>을 걸었다. 무슨 일이 일어나는가?</q>
+<o>SQL에 LIMIT 10이 붙어 조인 결과의 앞 10행만 가져온다.</o>
+<o>SQL에는 페이징 구문이 없고, 전체 결과를 읽은 뒤 메모리에서 주문 10개를 잘라 내며 HHH90003004 경고를 남긴다.</o>
+<o>SQL을 실행하기 전에 MultipleBagFetchException이 발생한다.</o>
+<o>Hibernate가 주문 id만 먼저 페이징해 가져오는 서브쿼리를 자동으로 만든다.</o>
+<why>행 단위 LIMIT로는 주문의 경계를 지킬 수 없으므로 Hibernate는 SQL에 페이징을 넣지 않고 메모리에서 자른다(실험의 HHH90003004). 첫 번째 보기처럼 행으로 자르면 컬렉션이 반쪽이 될 수 있어서 Hibernate가 그렇게 하지 않는다. MultipleBagFetchException은 bag을 둘 이상 페치할 때의 예외이고, 네 번째 보기 같은 자동 변환은 실험에서 일어나지 않았다. 예외로 바꾸려면 fail_on_pagination_over_collection_fetch를 켠다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>주문 3건을 ToOne 페치 조인으로 읽은 뒤 <code>default_batch_fetch_size=2</code>에서 모든 주문의 <code>lines</code>를 순회했다. 주문 상품 컬렉션을 읽는 SQL은 몇 번이고, 왜 그런가?</q>
+<o>1번. 배치 페치는 같은 role의 컬렉션을 크기와 무관하게 전부 모은다.</o>
+<o>3번. 배치 크기가 주문 수보다 작으면 배치 페치가 꺼진다.</o>
+<o>2번. 처음 접근할 때 최대 2개(주문 1, 2)를 모아 읽고, 남은 주문 3은 나중에 접근할 때 따로 읽는다.</o>
+<o>0번. ToOne 페치 조인이 컬렉션도 함께 채운다.</o>
+<why>배치 페치는 미초기화 대상을 배치 크기까지만 모은다. 실험에서 주문 1·2의 컬렉션이 <code>in (?,?)</code> 한 번으로, 주문 3의 컬렉션이 <code>=?</code> 한 번으로 읽혀 2번이었다. 배치 크기는 상한일 뿐 기능을 끄지 않으며, ToOne 페치 조인은 컬렉션을 채우지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>Hibernate가 인덱스 없는 List 컬렉션 두 개를 함께 페치 조인하는 쿼리를 거부하는 근본 이유로 가장 알맞은 것은?</q>
+<o>bag은 중복 원소를 허용하고 위치 정보가 없어서, 조인 때문에 반복된 원소와 실제로 중복된 원소를 구분할 수 없기 때문이다.</o>
+<o>SQL은 한 문장에서 일대다 조인을 두 번 할 수 없기 때문이다.</o>
+<o>List는 영속성 컨텍스트에 등록할 수 없기 때문이다.</o>
+<o>두 컬렉션의 결과 행이 반드시 메모리 한도를 넘기 때문이다.</o>
+<why>SQL은 일대다 조인을 여러 번 할 수 있고, 실험에서도 Set으로 바꾸자 같은 조인이 실행됐다. 문제는 결과 행에서 원소의 반복을 해석하는 방법이다. Set은 반복을 버리면 되고, 인덱스가 있는 List는 인덱스로 위치를 정하지만, bag은 둘 다 할 수 없다. 그래서 Hibernate는 데이터가 아니라 매핑 타입을 보고 SQL 번역 단계에서 거부한다(실험에서 SQL 0개).</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>페치 조인한 컬렉션에 <code>where l.quantity > 1</code> 조건을 건 쿼리로 주문을 읽었다. 같은 영속성 컨텍스트에서 <code>em.find(Order.class, 1L).getLines().size()</code>는 무엇을 돌려주는가? (주문 1의 DB 주문 상품: 수량 1, 수량 2)</q>
+<o>2. find는 항상 데이터베이스에서 새로 읽기 때문이다.</o>
+<o>2. 컬렉션은 조건과 무관하게 전체가 페치되기 때문이다.</o>
+<o>LazyInitializationException이 발생한다.</o>
+<o>1. 같은 인스턴스가 돌아오고, 그 컬렉션은 걸러진 원소 하나만 담긴 채 초기화된 상태이기 때문이다.</o>
+<why>find는 영속성 컨텍스트에 같은 식별자의 엔티티가 있으면 그것을 돌려준다(실험의 same=true). 그 주문의 컬렉션은 조건을 통과한 한 줄만 담긴 채 초기화된 것으로 표시되어 있어 다시 읽히지 않는다. 트랜잭션 안이므로 지연 로딩 예외와도 무관하다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>MySQL 8.0 InnoDB에서 배치 페치가 <code>where order_id in (...)</code>에 값 250개를 넣어 보냈다. <code>order_id</code>는 고유하지 않은 인덱스가 있고 <code>eq_range_index_dive_limit</code>는 기본값이다. 옵티마이저의 행 수 추정에 대한 설명으로 맞는 것은?</q>
+<o>값마다 인덱스 다이브를 해서 250개 범위의 행 수를 정확히 센다.</o>
+<o>값의 개수가 기본값 200 이상이므로 인덱스 다이브 대신 인덱스 통계로 추정한다.</o>
+<o>고유하지 않은 인덱스이므로 범위마다 추정치를 1로 둔다.</o>
+<o>IN 목록이 100개를 넘으면 MySQL은 항상 전체 테이블 스캔을 한다.</o>
+<why>MySQL 매뉴얼에 따르면 eq_range_index_dive_limit(기본 200)는 동등 범위의 개수가 이 값에 이르면 인덱스 다이브에서 인덱스 통계로 추정 방식을 바꾸는 기준이다. 범위마다 추정치 1은 고유 인덱스일 때의 규칙이다. 전체 테이블 스캔으로의 후퇴는 range_optimizer_max_mem_size 한도를 넘는 경우 등의 이야기이고, 100이라는 고정 기준은 없다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>컬렉션 페치 조인(collection fetch join)</dt><dd>일대다 컬렉션을 JPQL의 join fetch로 루트 엔티티와 한 SQL에서 함께 읽어 컬렉션을 초기화하는 것. 결과 행이 자식 수만큼 늘어난다.</dd>
+<dt>bag</dt><dd>Hibernate에서 인덱스 열이 없는 List 매핑. 순서 없는 리스트로 중복 원소를 허용하며, 둘 이상을 함께 페치 조인할 수 없다.</dd>
+<dt>PersistentBag</dt><dd>Hibernate가 bag 컬렉션 필드에 넣는 래퍼 클래스(org.hibernate.collection.spi.PersistentBag). 내용을 처음 요구받을 때 SQL로 채운다.</dd>
+<dt>메모리 페이징(in-memory pagination)</dt><dd>데이터베이스에 페이징 구문을 보내지 않고 전체 결과를 읽은 뒤 애플리케이션 메모리에서 원하는 범위만 잘라 내는 것. Hibernate는 컬렉션 페치 조인과 페이징이 함께 쓰이면 이렇게 한다.</dd>
+<dt>배치 페치(batch fetching)</dt><dd>미초기화 엔티티 프록시나 컬렉션 하나를 초기화할 때, 같은 종류의 다른 미초기화 대상들의 키를 모아 IN 조건 하나로 함께 읽는 것.</dd>
+<dt>컬렉션 role</dt><dd>Hibernate가 컬렉션의 종류를 구분하는 이름. 엔티티 클래스 이름과 필드 이름으로 이루어지며(예: Order.lines) 배치 페치는 같은 role끼리 묶는다.</dd>
+<dt>동등 범위 비교(equality range comparison)</dt><dd>MySQL 옵티마이저가 col IN (v1, ..., vN)이나 OR로 이은 등호 비교를 값 하나짜리 범위 N개로 다루는 방식. range 접근 방법으로 처리된다.</dd>
+<dt>인덱스 다이브(index dive)</dt><dd>MySQL 옵티마이저가 범위의 양 끝으로 인덱스를 실제로 내려가 그 사이의 행 수를 추정하는 방법. 정확하지만 범위가 많으면 느려 eq_range_index_dive_limit 이상에서는 통계를 쓴다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html">Jakarta Persistence 3.1 Specification</a> — 4.4.5.3 Fetch Joins(조인 의미, 별칭 금지, 중복 참조 예), 컬렉션 페치 조인에 대한 setFirstResult/setMaxResults가 정의되지 않음</li>
+<li><a href="https://github.com/hibernate/hibernate-orm/blob/6.0/migration-guide.adoc">Hibernate ORM 6.0 Migration Guide</a> — 페치 조인 시 distinct 없이도 중복 부모 엔티티를 항상 걸러 낸다는 변경</li>
+<li><a href="https://docs.hibernate.org/orm/6.6/userguide/html_single/Hibernate_User_Guide.html">Hibernate ORM 6.6 User Guide</a> — 12.8 Batch fetching, 설정 hibernate.default_batch_fetch_size, hibernate.query.fail_on_pagination_over_collection_fetch, hibernate.query.in_clause_parameter_padding, Bags</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/range-optimization.html">MySQL 8.0 Reference Manual — Range Optimization</a> — 동등 범위 비교, 고유 인덱스의 추정치, eq_range_index_dive_limit, range_optimizer_max_mem_size</li>
+<li><a href="https://docs.spring.io/spring-boot/how-to/data-access.html">Spring Boot How-to — Data Access</a> — spring.jpa.properties.* 가 접두사를 뗀 이름으로 JPA 제공자에 전달됨</li>
+<li><a href="https://dev.mysql.com/doc/connector-j/en/connector-j-reference-implementation-notes.html">MySQL Connector/J — JDBC API Implementation Notes</a> — ResultSet을 기본적으로 전부 받아 메모리에 저장하는 동작과 스트리밍 설정</li>
+</x-refs>

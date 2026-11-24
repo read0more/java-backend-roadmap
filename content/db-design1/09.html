@@ -1,0 +1,889 @@
+<x-meta>
+deck: 쇼핑몰 논리 모델을 MySQL InnoDB 위의 실제 데이터베이스로 옮긴다. 접근 경로에서 인덱스를 끌어내고, 무엇을 역정규화할지 고르고, 테이블 정의서와 DDL을 쓰고, 카탈로그에서 ERD를 거꾸로 만들어 본 뒤, 주문과 재고와 리뷰가 실제로 맞물려 도는지 SQL로 확인한다.
+minutes: 120
+</x-meta>
+
+<x-goals>
+<li>화면과 기능 목록에서 쿼리별 접근 경로를 뽑고, 등호 조건 열 → 정렬 열 → (자동으로 붙는) 기본 키 순서로 복합 인덱스를 설계한 뒤, 그 인덱스가 외래 키 인덱스 역할까지 겸하는지 판정할 수 있다.</li>
+<li>InnoDB 보조 인덱스의 리프 항목이 무엇을 담는지로부터 커버링 인덱스, LIMIT의 조기 종료, 역방향 스캔, 정렬 단계가 생기는 조건을 쿼리 하나씩 추적해 설명할 수 있다.</li>
+<li>역정규화 후보를 "복사하는 값이 바뀌는가", "필터와 정렬을 한 테이블로 모으는가"로 평가하고, 채택한 중복을 같은 트랜잭션·원자적 갱신·복합 외래 키·점검 쿼리로 지키는 방법을 쓸 수 있다.</li>
+<li>테이블 정의서와 DDL을 같은 원본에서 나오게 만들고, INFORMATION_SCHEMA를 조회해 도구가 ERD를 자동으로 그리는 원리와 그 한계(카탈로그에 없는 규칙은 그려지지 않는다)를 설명할 수 있다.</li>
+<li>주문 생성·취소·리뷰 작성 트랜잭션을 SQL로 실행하며, 조건부 UPDATE와 행 잠금이 재고를 지키는 과정과 잠금 순서가 교착 상태를 막는 이유를 단계별로 추적할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 그림이 데이터베이스가 되려면 무엇을 더 정해야 하는가</h3>
+
+<p>앞 회차(08회)에서 물리적 모델링의 규칙을 세웠다. 논리 모델의 엔티티와 속성을 테이블과 열로 옮기는 이름 규칙, 문자·숫자·날짜 자료형을 고르는 기준, 역정규화의 뜻, 테이블 정의서라는 문서의 역할이 그 내용이다. 이번 회차는 그 규칙을 처음부터 끝까지 한 번 적용해 보는 실습이다. 대상은 작은 쇼핑몰이다. 회원이 상품을 고르고, 여러 상품을 한 번에 주문하고, 받은 상품에 리뷰를 남긴다. 규모는 작지만 물리 설계에서 판단해야 하는 지점은 거의 다 들어 있다.</p>
+
+<p>논리 모델까지 끝났는데 무엇이 더 남았는가. 논리 모델은 "어떤 사실을 어디에 한 번만 기록할 것인가"에 답한다. 그런데 데이터베이스는 그 사실을 디스크 페이지에 놓고, 요청이 올 때마다 찾아서 돌려줘야 한다. 같은 테이블 구조라도 어떤 인덱스가 있느냐에 따라 "내 주문 목록"이 페이지 몇 개를 읽고 끝나기도 하고 테이블 전체를 훑기도 한다. 같은 정보라도 어느 테이블에 복사본을 하나 더 두느냐에 따라 화면 하나를 그리는 데 드는 조인과 정렬이 달라진다. 그리고 그 복사본이 원본과 어긋나지 않게 지키는 일이 새로 생긴다. 물리 설계는 이런 결정을 구체적인 DDL로 굳히는 작업이다.</p>
+
+<p>이 회차의 순서는 실제 작업 순서를 따른다. 먼저 논리 모델과 기능 목록을 다시 정리한다(실습 시작). 기능 목록에서 쿼리를 뽑아 인덱스를 설계하고(인덱스 설계 실습), 화면이 요구하는 조회를 보고 역정규화할 곳을 고른다(역정규화 실습). 결정이 끝나면 테이블 정의서를 쓰고(쇼핑몰 테이블 정의서), DDL로 실제 데이터베이스를 만든다(쇼핑몰 DDL과 DB 만들기). 만들어진 데이터베이스에서 ERD를 거꾸로 그려 설계와 대조하고(ERD 자동 생성), 마지막으로 데이터를 넣어 주문·취소·리뷰·집계가 의도대로 도는지 확인한다(쇼핑몰 기능 확인 1, 2).</p>
+
+<p>기준은 MySQL 8.0 이상과 InnoDB 저장 엔진이다. 8.4에서 달라진 점이 있으면 따로 적는다. 이 회차에서 쓰는 쇼핑몰 모델과 데이터는 설명을 위해 새로 만든 것이다. 실행 결과로 적은 값과 오류 문구는 모두 여기서 넣은 데이터를 MySQL 8.4.13에서 실제로 실행해 확인한 것이고, 같은 스크립트를 8.0.46에서 돌려도 결과와 문구가 같았다. 데이터베이스 이름만 실습용 이름으로 바꿔 실행했으므로, 오류 문구에 나오는 스키마 이름은 <code>shop</code>으로 적었다. 실행 계획도 실제 EXPLAIN 출력을 싣지만, 비용 추정치, 통계 기반 rows, 실행 시간 같은 값은 실행 환경과 통계에 따라 달라진다.</p>
+
+<h3>물리적 모델링 실습 시작: 요구 사항, 논리 모델, 접근 경로</h3>
+
+<p>물리 설계의 입력은 두 가지다. 하나는 논리 모델이고, 다른 하나는 그 모델을 쓰는 방식, 곧 기능과 화면의 목록이다. 앞의 것은 테이블과 열과 제약을 정하고, 뒤의 것은 인덱스와 역정규화를 정한다. 논리 모델만 보고 인덱스를 정할 수는 없다. 회원 테이블에 어떤 인덱스가 필요한지는 회원을 이메일로 찾는지, 가입일 범위로 찾는지에 달려 있고, 그것은 기능 목록에만 적혀 있다. 그래서 실습은 요구 사항을 문장으로 다시 적는 데서 시작한다.</p>
+
+<pre data-label="쇼핑몰 요구 사항"><code class="language-text">S1. 회원은 이메일, 이름, 휴대전화 번호(선택)로 가입한다. 이메일은 중복될 수 없다.
+S2. 상품은 하나의 카테고리에 속한다. 카테고리는 상위 카테고리를 가질 수 있다.
+S3. 상품은 이름, 판매 가격, 재고 수량, 판매 상태(판매중, 판매중지)를 가진다.
+S4. 회원은 여러 상품을 한 번에 주문한다. 주문에는 수령인, 연락처, 우편번호, 주소를 적는다.
+    주문 상태는 주문완료, 배송중, 배송완료, 취소 중 하나다.
+S5. 주문한 상품마다 주문 당시의 상품명, 단가, 수량을 기록한다.
+    한 주문 안에서 같은 상품은 한 줄로 합친다.
+S6. 주문하면 재고가 줄고, 취소하면 다시 는다. 재고보다 많이 주문할 수 없다.
+S7. 배송이 끝난 주문상품마다 리뷰를 한 번 쓸 수 있다(평점 1~5, 내용).
+S8. 화면: 카테고리별 상품 목록(최신순 20개씩), 상품 상세와 리뷰 목록(최신순),
+    내 주문 목록(최신순), 주문 상세, 관리자용 일별 매출.</code></pre>
+
+<p>논리 모델링 단계에서 이 요구 사항은 여섯 엔티티가 된다. 회원, 카테고리, 상품, 주문, 주문상품, 리뷰다. 회원과 상품의 다대다 관계는 주문과 주문상품으로 풀렸다(05회의 연관 엔티티). 주문상품은 "주문 하나에 같은 상품 한 줄"이라는 S5의 규칙 때문에 (주문, 상품) 조합이 유일하지만, 06회에서 다룬 두 선택지 가운데 식별 관계 대신 자기 대리 키를 갖는 비식별 관계를 택하고 조합의 유일성은 유일 제약으로 따로 건다. 리뷰는 주문상품과 일대일 선택 관계다. 주문상품 하나에 리뷰는 없거나 하나이고, 리뷰는 반드시 주문상품 하나에 속한다. 카테고리는 자기 자신을 참조하는 일대다 관계를 갖는다.</p>
+
+<p>이 모델을 확정하기 전에 두 가지 판단을 짚고 넘어간다. 첫째, "품절"은 상태 값으로 저장하지 않는다. 품절은 재고 수량이 0이라는 사실에서 계산되는 값이다. 상태 열에 <code>SOLD_OUT</code>을 따로 두면 "재고 5개인데 품절" 또는 "재고 0개인데 판매중" 같은 모순된 행이 생길 수 있고, 재고를 바꾸는 모든 코드가 상태까지 함께 고쳐야 한다. 07회의 말로 하면 상태 열의 일부가 재고 수량에 함수적으로 종속되는 셈이다. 그래서 판매 상태에는 관리자가 직접 정하는 값(판매중, 판매중지)만 둔다. 둘째, 주문상품의 상품명과 단가는 상품 테이블의 상품명·가격과 같은 열처럼 보이지만 다른 사실이다. 이 판단은 역정규화 실습에서 자세히 다룬다.</p>
+
+<p>다음으로 S8의 화면과 S6의 처리를 쿼리로 바꿔 목록을 만든다. 이것을 접근 경로(access path) 목록이라고 부르자. 인덱스 설계는 이 목록 없이는 시작할 수 없다. 쿼리마다 "무엇으로 찾고(WHERE), 무엇으로 정렬하고(ORDER BY), 몇 건을 돌려주고(LIMIT), 어떤 열을 읽는가(SELECT)"를 적는다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>번호</th><th>기능</th><th>찾는 조건</th><th>정렬과 건수</th><th>빈도</th></tr></thead><tbody>
+<tr><td>Q1</td><td>로그인·가입 중복 확인</td><td>member.email = ?</td><td>1건</td><td>높음</td></tr>
+<tr><td>Q2</td><td>카테고리별 상품 목록</td><td>product.category_id = ? AND status = 'ON_SALE'</td><td>created_at 최신순, 20건</td><td>매우 높음</td></tr>
+<tr><td>Q3</td><td>상품 상세</td><td>product.product_id = ?</td><td>1건</td><td>매우 높음</td></tr>
+<tr><td>Q4</td><td>상품 리뷰 목록</td><td>상품 번호로 리뷰 찾기</td><td>작성 최신순, 20건</td><td>높음</td></tr>
+<tr><td>Q5</td><td>내 주문 목록</td><td>orders.member_id = ?</td><td>ordered_at 최신순, 10건</td><td>중간</td></tr>
+<tr><td>Q6</td><td>주문 상세</td><td>order_item.order_id = ?</td><td>그 주문의 전부</td><td>중간</td></tr>
+<tr><td>Q7</td><td>일별 매출(관리자)</td><td>orders.ordered_at 범위, 취소 제외</td><td>날짜별 집계</td><td>낮음</td></tr>
+<tr><td>Q8</td><td>주문 생성·취소의 재고 변경</td><td>product.product_id = ?</td><td>1건씩 갱신</td><td>높음</td></tr>
+</tbody></table></div>
+
+<p>빈도 열의 "높음", "낮음"은 측정값이 아니라 설계자가 업무를 보고 매긴 추정이다. 실제 서비스에서는 이 추정이 틀리는 경우가 흔하므로, 운영을 시작한 뒤에는 실제로 많이 실행되는 쿼리를 다시 확인해 인덱스를 고친다. 그래도 설계 시점에 이 표가 있어야 하는 이유는 분명하다. 인덱스는 쿼리를 위한 자료 구조이고, 쿼리를 모르고 만든 인덱스는 쓰기 비용만 늘리는 짐이 되기 쉽다.</p>
+
+<p>이 실습의 이름 규칙은 이렇게 정한다. 테이블과 열은 소문자 스네이크 케이스, 테이블 이름은 단수형, 기본 키는 <code>테이블명_id</code>다. 한 가지 예외가 주문 테이블이다. <code>ORDER</code>는 MySQL의 예약어(reserved word)라서 테이블 이름으로 쓰려면 매번 백틱으로 감싸야 한다. 매뉴얼은 예약어도 따옴표로 감싸면 식별자로 쓸 수 있다고 하지만, 감싸는 것을 한 번이라도 빠뜨린 쿼리는 문법 오류가 된다. 그래서 단수형 규칙을 깨고 <code>orders</code>로 짓는다. JPA 엔티티를 <code>Order</code>라고 짓고 테이블 이름을 따로 지정하지 않으면 같은 문제를 만나므로, 엔티티 쪽에서 <code>@Table(name = "orders")</code>처럼 이름을 정해 주는 것도 같은 이유다.</p>
+
+<pre class="diagram">쇼핑몰 논리 모델 (까마귀발 표기를 글자로 옮긴 것)
+
+  category ─┐ parent_id (자기 참조, 상위는 0..1)
+     │ 1    │
+     │ 0..N ◄┘
+     ▼
+  product  ── 1 ──────────────── 0..N ──┐
+                                        ▼
+  member ── 1 ── 0..N ──► orders ── 1 ── 1..N ──► order_item ── 1 ── 0..1 ──► review
+                                                (주문, 상품)이 유일      주문상품당 리뷰 하나
+
+  1..N 의 "최소 1"은 업무 규칙이며 외래 키로 강제되지 않는다(04회).</pre>
+
+<h3>인덱스 설계 실습 1: 쿼리에서 인덱스를 끌어내는 규칙</h3>
+
+<p>인덱스를 설계하기 전에 InnoDB가 테이블을 어떻게 저장하는지 다시 떠올리자(03회). InnoDB 테이블은 기본 키 순서로 정렬된 B+Tree 하나, 곧 클러스터형 인덱스(clustered index)이고, 행 전체가 그 리프에 들어 있다. 보조 인덱스(secondary index)는 별도의 B+Tree다. MySQL 매뉴얼은 보조 인덱스의 각 레코드가 인덱스로 지정한 열과 함께 그 행의 기본 키 열을 담는다고 설명한다. 보조 인덱스로 찾은 뒤 다른 열이 필요하면, 리프에 있는 기본 키 값으로 클러스터형 인덱스를 다시 내려가 행을 읽는다.</p>
+
+<p>이 구조에서 인덱스 설계의 첫 번째 규칙이 나온다. 복합 인덱스(composite index)는 첫 열로 정렬하고, 첫 열이 같으면 둘째 열로, 그것도 같으면 셋째 열로 정렬한 목록이다. 그러므로 첫 열에 등호 조건이 걸리면 그 값에 해당하는 항목들이 한 구간에 모여 있고, 그 구간 안에서는 둘째 열 순서로 놓여 있다. 매뉴얼의 표현으로는 인덱스 <code>(col1, col2, col3)</code>가 있으면 <code>(col1)</code>, <code>(col1, col2)</code>, <code>(col1, col2, col3)</code>로 검색할 수 있고, 맨 왼쪽부터 이어지지 않는 조합, 예를 들어 <code>col2</code>만으로는 인덱스로 찾을 수 없다. 이것이 왼쪽 접두사(leftmost prefix) 규칙이다.</p>
+
+<p>두 번째 규칙은 정렬에 관한 것이다. 매뉴얼의 ORDER BY 최적화 절은 인덱스 <code>(key_part1, key_part2)</code>가 있고 <code>WHERE key_part1 = 상수 ORDER BY key_part2</code>인 쿼리라면 인덱스로 읽은 행이 이미 <code>key_part2</code> 순서이므로 정렬을 생략할 수 있다고 설명한다. <code>DESC</code>로 정렬해도 사정은 같고, 오름차순 인덱스를 거꾸로 읽으면 된다. 반대로 인덱스로 순서를 만들 수 없으면 MySQL은 찾은 행을 따로 정렬하는 단계, 곧 filesort를 거친다. 실행 계획(EXPLAIN)의 Extra 열에 <code>Using filesort</code>가 보이면 이 단계가 있다는 뜻이다. 이 두 규칙을 합치면 복합 인덱스 열 순서의 기본형이 나온다. <b>등호 조건 열을 앞에, 정렬 열을 그 뒤에 둔다.</b></p>
+
+<p>세 번째 규칙은 InnoDB에만 해당한다. 보조 인덱스에는 기본 키가 들어 있으므로, 인덱스 <code>(member_id, ordered_at)</code>은 내부적으로 <code>(member_id, ordered_at, order_id)</code>처럼 동작한다. 매뉴얼은 이를 인덱스 확장(index extension)이라고 부르고, 옵티마이저가 확장된 보조 인덱스를 ref·range 접근, 조인과 정렬 최적화, MIN()/MAX() 최적화에 쓸 수 있다고 적는다. 이 덕분에 두 가지 이득이 생긴다. 하나는 정렬의 동률 처리다. 같은 시각에 주문이 두 건 있으면 <code>ORDER BY ordered_at DESC</code>만으로는 두 행의 순서가 정해지지 않는다. 매뉴얼의 LIMIT 최적화 절은 ORDER BY 값이 같은 행들의 순서는 실행 계획에 따라 달라질 수 있으니, 순서가 중요하면 유일한 열을 정렬 조건에 더하라고 권한다. <code>ORDER BY ordered_at DESC, order_id DESC</code>로 쓰면 순서가 하나로 정해지는데, 이 정렬도 확장된 인덱스 순서와 일치하므로 정렬 단계가 생기지 않는다. 다른 하나는 커버링(covering)이다. 기본 키 열만 더 필요하다면 클러스터형 인덱스를 다시 찾아갈 필요가 없다.</p>
+
+<p>네 번째 규칙은 외래 키다. MySQL 매뉴얼은 외래 키 검사가 테이블 전체를 훑지 않도록 외래 키 열과 참조되는 열에 인덱스를 요구한다. 참조하는 쪽(자식) 테이블에는 외래 키 열이 같은 순서로 맨 앞에 오는 인덱스가 있어야 하고, 없으면 자동으로 만들어진다. 왜 자식 쪽에 인덱스가 필요한가. 부모 행을 지우거나 키를 바꿀 때 InnoDB는 그 부모를 참조하는 자식 행이 있는지 확인해야 한다. 상품 하나를 지우려 할 때 주문상품 테이블에서 그 상품 번호를 가진 행을 찾아야 하는데, 인덱스가 없다면 주문상품 전체를 읽는 수밖에 없다. 여기서 실용적인 결론이 하나 나온다. 외래 키 열로 시작하는 복합 인덱스를 설계하면 그 인덱스가 외래 키 인덱스 역할까지 겸하므로, 외래 키만을 위한 인덱스를 따로 둘 필요가 없다.</p>
+
+<p>이 네 규칙으로 접근 경로 목록을 하나씩 처리하자.</p>
+
+<div class="table-wrap"><table><thead><tr><th>쿼리</th><th>인덱스</th><th>이유</th></tr></thead><tbody>
+<tr><td>Q1</td><td><code>member</code>: <code>UNIQUE (email)</code></td><td>중복 금지 규칙(S1)을 지키는 제약이 그대로 검색 인덱스가 된다</td></tr>
+<tr><td>Q2</td><td><code>product</code>: <code>(category_id, status, created_at)</code></td><td>등호 두 개 뒤에 정렬 열. 확장된 <code>product_id</code>가 동률을 정리한다. <code>category_id</code> 외래 키 인덱스를 겸한다</td></tr>
+<tr><td>Q3, Q8</td><td><code>product</code>: 기본 키</td><td>기본 키 등호 검색은 클러스터형 인덱스 한 번 내려가기</td></tr>
+<tr><td>Q4</td><td><code>review</code>: <code>(product_id, created_at)</code></td><td>리뷰 테이블에 상품 번호가 있어야 가능하다(역정규화 실습에서 결정)</td></tr>
+<tr><td>Q5</td><td><code>orders</code>: <code>(member_id, ordered_at)</code></td><td>등호 뒤에 정렬 열. <code>member_id</code> 외래 키 인덱스를 겸한다</td></tr>
+<tr><td>Q6</td><td><code>order_item</code>: <code>UNIQUE (order_id, product_id)</code></td><td>S5의 유일성 제약이 <code>order_id</code> 검색과 외래 키 인덱스를 겸한다</td></tr>
+<tr><td>Q7</td><td><code>orders</code>: <code>(ordered_at)</code></td><td>날짜 범위 검색. 회원 조건이 없으므로 Q5의 인덱스는 왼쪽 접두사가 맞지 않는다</td></tr>
+<tr><td>외래 키</td><td><code>order_item</code>: <code>(product_id)</code>, <code>category</code>: <code>(parent_id, name)</code></td><td>상품 삭제 시 주문상품 확인, 카테고리 삭제 시 하위 카테고리 확인</td></tr>
+</tbody></table></div>
+
+<p>Q2의 인덱스에 <code>status</code>를 넣을지는 데이터에 달린 판단이다. 판매 상태는 두 값뿐이라 선택도(selectivity)가 낮다. 그렇다면 빼도 되는가. 인덱스가 <code>(category_id, created_at)</code>이면 MySQL은 그 카테고리의 항목을 최신순으로 읽으면서 행마다 상태를 확인하고, 판매중인 행이 20개 모이면 멈춘다. 판매중지 상품이 드물다면 몇 행 더 읽는 정도로 끝나므로 이 인덱스로도 충분하다. 그러나 예를 들어 한 카테고리에 상품이 1만 개 있고 그중 9천 개가 판매중지라면, 최신 상품 대부분이 판매중지일 때 20개를 모으기 위해 수천 행을 읽고 버려야 할 수 있다. <code>status</code>를 등호 조건 열로 넣어 두면 처음부터 판매중 구간만 읽는다. 선택도가 낮은 열이라도 등호 조건으로 쓰이고 그 뒤에 정렬 열이 이어진다면 복합 인덱스 안에서는 제 몫을 한다. 낮은 선택도가 문제가 되는 것은 그 열 하나만으로 단독 인덱스를 만들 때다.</p>
+
+<h3>인덱스 설계 실습 2: B+Tree 안에서 쿼리를 따라가 보기</h3>
+
+<p>규칙이 실제로 무엇을 뜻하는지 Q5를 따라가며 확인하자. 주문 테이블에 데이터가 꽤 쌓였다고 가정하고, 보조 인덱스 <code>idx_orders_member_ordered</code>의 리프 일부를 펼쳐 보면 아래와 같다. 각 항목은 (member_id, ordered_at, order_id)이고, 마지막 값은 InnoDB가 붙인 기본 키다.</p>
+
+<pre class="diagram">idx_orders_member_ordered 리프 항목 (정렬 순서대로, 일부)
+
+   ...
+   (1, 2026-09-03 10:12:00, 105)
+   (1, 2026-10-15 08:05:00, 230)
+   (1, 2026-11-10 14:00:00, 388)   ◄── ② 여기서부터 거꾸로 읽는다
+   (2, 2026-08-21 19:40:00,  77)   ◄── ① member_id = 1 구간의 끝을 찾는다
+   (2, 2026-11-11 09:30:00, 391)
+   (3, 2026-07-30 21:00:00,  12)
+   ...
+
+   ③ 388 → 230 → 105 순서로 읽고, member_id가 1이 아닌 항목을 만나면 멈춘다.
+   ④ SELECT에 status, total_amount가 있으면 order_id로 클러스터형 인덱스를 찾아간다.</pre>
+
+<pre data-label="Q5. 내 주문 목록"><code class="language-sql">SELECT order_id, status, total_amount, ordered_at
+FROM orders
+WHERE member_id = 1
+ORDER BY ordered_at DESC, order_id DESC
+LIMIT 10;</code></pre>
+
+<p>실행을 단계별로 보자. 먼저 인덱스의 루트에서 출발해 <code>member_id = 1</code> 구간의 끝을 찾는다. 최신순으로 읽어야 하므로 구간의 마지막 항목에서 시작해 앞쪽으로 읽는다. 매뉴얼은 <code>WHERE key_part1 = 상수 ORDER BY key_part2 DESC</code> 형태도 내림차순이 없는 경우와 같은 방식으로 인덱스를 쓸 수 있다고 설명한다. 읽은 항목은 이미 (ordered_at, order_id)의 내림차순이므로 정렬 단계가 없다. 그리고 10건을 채우면 멈춘다. 매뉴얼의 LIMIT 최적화 절은 ORDER BY와 LIMIT을 함께 쓰면 MySQL이 정렬된 결과의 처음 N행을 찾는 즉시 멈추며, 정렬을 인덱스로 하는 경우 이것이 매우 빠르다고 적는다. 회원 1이 주문을 5만 건 했어도 이 쿼리가 읽는 인덱스 항목은 최대 10개 남짓이다.</p>
+
+<p>마지막 단계가 행 조회다. SELECT 목록의 <code>status</code>와 <code>total_amount</code>는 이 인덱스에 없으므로, 항목마다 <code>order_id</code>로 클러스터형 인덱스를 한 번씩 더 내려간다. 10건이면 10번이다. 만약 화면이 주문 번호와 주문 일시만 보여 준다면 어떨까. <code>SELECT order_id, ordered_at</code>은 인덱스 항목만으로 답할 수 있으므로 행 조회가 아예 없다. 실행 계획의 Extra 열에 보이는 <code>Using index</code>가 이 상태를 뜻한다. 매뉴얼은 이를 "실제 행을 읽는 추가 탐색 없이 인덱스 트리의 정보만으로 열 값을 가져오는" 전략이라고 설명한다. <code>order_id</code>를 인덱스에 직접 넣지 않았는데도 커버링이 되는 것은 앞에서 본 인덱스 확장 때문이다.</p>
+
+<x-visual id="db-design1-09-index-backward-scan" title="복합 인덱스에서 한 회원의 최신 주문을 거꾸로 읽는 과정" kind="자료 구조 그림" ratio="16:9">
+<x-hint>보조 인덱스 리프가 (member_id, ordered_at, order_id) 순서로 정렬되어 있고, member_id = 1 구간의 끝에서부터 역방향으로 읽은 뒤 order_id로 클러스터형 인덱스를 찾아가는 흐름을 보여 준다.</x-hint>
+<x-prompt>왼쪽에 B+Tree 하나를 그린다: 맨 위 작은 사각형 "루트", 그 아래 사각형 두 개 "내부 노드", 맨 아래 가로로 긴 리프 페이지 세 개. 리프 안에는 작은 칸들이 정렬되어 있고, 가운데 리프에 "(1, 09-03, 105)", "(1, 10-15, 230)", "(1, 11-10, 388)", "(2, 08-21, 77)" 네 칸을 크게 보여 준다. 루트에서 가운데 리프의 "(2, 08-21, 77)" 칸 앞까지 내려가는 파란 화살표에 "① 구간의 끝 찾기" 라벨. 리프 안에서 388 → 230 → 105 방향으로 왼쪽을 향하는 주황 곡선 화살표에 "② 역방향으로 읽기" 라벨. 오른쪽에는 두 번째 B+Tree "클러스터형 인덱스 (order_id)"를 작게 그리고, 리프 칸 "388"에서 이 트리로 가는 점선 화살표에 "③ 다른 열이 필요할 때만" 라벨. 왼쪽 트리 위에 제목 "idx_orders_member_ordered", 오른쪽 트리 위에 "PRIMARY". 배경 흰색, 선은 단정하게.</x-prompt>
+<x-caption>등호 조건 다음에 정렬 열이 오면 인덱스 구간을 순서대로 읽는 것만으로 정렬이 끝나고, LIMIT을 채우는 순간 멈춘다.</x-caption>
+</x-visual>
+
+<p>이번에는 같은 인덱스가 정렬을 해 주지 못하는 경우를 보자. 상위 카테고리 "컴퓨터 주변기기"를 누르면 하위 카테고리인 키보드(2)와 마우스(3)의 상품을 한꺼번에 최신순으로 보여 준다고 하자. 쿼리는 <code>WHERE category_id IN (2, 3) AND status = 'ON_SALE' ORDER BY created_at DESC LIMIT 20</code>이 된다. 인덱스에서 (2, 'ON_SALE') 구간과 (3, 'ON_SALE') 구간은 각각 <code>created_at</code> 순서로 정렬되어 있지만, 두 구간을 이어 붙인 결과는 <code>created_at</code> 순서가 아니다. 그래서 인덱스로 두 구간의 행을 모두 찾은 다음, 그 결과를 따로 정렬해야 한다. LIMIT 20이 있어도 정렬하려면 두 구간의 후보를 전부 읽어야 하므로, 앞 쿼리처럼 20개를 읽고 멈추는 일은 일어나지 않는다. 상위 카테고리 목록이 자주 쓰이는 화면이라면 상품에 최상위 카테고리 번호를 따로 저장하는 역정규화를 검토할 이유가 생긴다.</p>
+
+<p>범위 조건도 같은 방식으로 정렬을 깨뜨린다. 상품 목록에 가격 필터를 붙여 <code>WHERE category_id = 2 AND price BETWEEN 30000 AND 60000 ORDER BY created_at DESC</code>를 실행한다고 하자. 인덱스를 <code>(category_id, price, created_at)</code>로 만들면 가격 범위로 구간을 좁힐 수는 있지만, 그 구간 안의 항목은 가격 순서이지 등록 순서가 아니므로 정렬 단계가 생긴다. 인덱스를 <code>(category_id, created_at)</code>로 만들면 등록 순서로 읽으면서 가격을 하나씩 걸러 내야 한다. 두 조건을 한 인덱스로 동시에 만족시킬 수는 없다. 어느 쪽이 나은지는 가격 범위에 걸리는 행이 얼마나 되는지에 달려 있다. 걸러지는 행이 적으면 앞쪽(좁혀서 정렬), 많으면 뒤쪽(순서대로 읽으며 거르기)이 유리하다. 이런 쿼리는 설계 시점에 정답을 정하기보다 실제 데이터로 EXPLAIN을 확인해야 하는 대표적인 경우다.</p>
+
+<p>마지막으로 페이지 이동이다. 목록의 50페이지를 <code>LIMIT 20 OFFSET 980</code>으로 가져오면, 인덱스 순서대로 읽는다 해도 앞의 980개 항목을 읽고 버린 뒤에야 21번째 페이지에 해당하는 20개를 돌려줄 수 있다. B+Tree는 키 값으로 위치를 찾는 구조이지 "980번째 항목"으로 바로 가는 구조가 아니기 때문이다. 깊은 페이지가 자주 요청되는 화면이라면 직전 페이지의 마지막 값을 기억해 두고 그다음부터 읽는 키셋 페이지네이션(keyset pagination)을 쓴다. 조건은 <code>created_at < 직전_시각 OR (created_at = 직전_시각 AND product_id < 직전_번호)</code> 형태가 된다. 이렇게 쓰면 인덱스에서 직전 위치를 키 값으로 바로 찾아가므로 몇 페이지째든 읽는 양이 비슷하다. 다만 이 형태의 조건이 의도대로 범위 검색(range)이 되는지는 EXPLAIN으로 확인해야 한다(기능 확인 2에서 데이터를 늘려 확인한 MySQL 8.4.13의 계획은 range였다).</p>
+
+<h3>인덱스 설계 실습 3: 만들지 않을 인덱스를 고르는 일</h3>
+
+<p>인덱스를 더하는 판단만큼 중요한 것이 빼는 판단이다. 인덱스는 공짜가 아니다. <code>order_item</code>에 행 하나를 넣으면 클러스터형 인덱스 하나, 그리고 이 회차에서 설계한 보조 인덱스 셋에 각각 항목이 들어간다. B+Tree 네 개를 고치는 셈이다. 유일 인덱스라면 넣기 전에 같은 값이 있는지도 확인해야 한다. 보조 인덱스가 늘수록 버퍼 풀에서 차지하는 페이지도 늘어, 정작 자주 읽는 데이터 페이지가 밀려날 수 있다. 그래서 인덱스마다 "어떤 쿼리가 이 인덱스를 쓰는가"를 말할 수 있어야 한다.</p>
+
+<p>가장 흔한 낭비는 중복 인덱스다. 주문 테이블에 <code>(member_id, ordered_at)</code>가 있는데 <code>(member_id)</code> 인덱스를 또 만들면, 뒤의 것은 앞의 것의 왼쪽 접두사이므로 할 수 있는 일이 없다. 외래 키를 먼저 선언해 MySQL이 <code>member_id</code> 인덱스를 자동으로 만든 뒤에 복합 인덱스를 추가하는 경우를 걱정할 수 있는데, 매뉴얼에 따르면 자동으로 만든 외래 키 인덱스는 그 외래 키를 지원할 수 있는 다른 인덱스가 생기면 조용히 삭제될 수 있다. 반대로 복합 인덱스가 외래 키를 지원하는 유일한 인덱스일 때 그것을 지우려 하면, 외래 키에 필요한 인덱스라는 이유로 거부된다. 운영 중인 데이터베이스에서 중복 인덱스를 찾을 때는 <code>sys</code> 스키마의 <code>schema_redundant_indexes</code> 뷰가 도움이 된다. 이 뷰는 다른 인덱스와 겹치거나 다른 인덱스 때문에 쓸모없어진 인덱스를, 그것을 대신하는 인덱스(dominant index)와 삭제 문장까지 함께 보여 준다.</p>
+
+<p>지울지 말지 확신이 서지 않는 인덱스도 있다. MySQL 8.0의 보이지 않는 인덱스(invisible index)는 이럴 때 쓰는 기능이다. <code>ALTER TABLE orders ALTER INDEX idx_orders_ordered INVISIBLE</code>로 바꾸면 옵티마이저가 그 인덱스를 쓰지 않는다. 매뉴얼은 이것이 인덱스를 지운 효과를 되돌릴 수 있는 방식으로 시험하는 수단이라고 설명한다. 큰 테이블에서 인덱스를 지웠다가 다시 만드는 것은 비싸지만, 보이게·안 보이게 바꾸는 것은 빠른 제자리(in-place) 작업이다. 주의할 점은 보이지 않는 인덱스도 행이 바뀔 때마다 계속 갱신되고, 유일 인덱스라면 중복도 계속 막는다는 것이다. 쓰기 비용은 그대로이고 읽기에서만 빠진다. 기본 키는 보이지 않게 만들 수 없다.</p>
+
+<p>만들지 않기로 한 인덱스도 기록해 둔다. 상품명 검색은 <code>name LIKE '%키보드%'</code>처럼 앞뒤가 열린 패턴이 대부분인데, B+Tree 인덱스는 값의 앞부분부터 정렬되어 있으므로 앞이 열린 패턴으로는 구간을 찾을 수 없다. <code>name</code>에 일반 인덱스를 만들어도 이 검색은 빨라지지 않는다. MySQL에는 한국어·중국어·일본어를 위한 ngram 전문 검색 파서가 내장되어 있어 <code>FULLTEXT ... WITH PARSER ngram</code> 인덱스를 만들 수 있지만, 검색 품질과 운영 부담을 함께 따져야 하는 별도의 주제이므로 이 실습의 범위에서는 뺀다. 관리자가 주문 상태로 주문을 찾는 화면도 지금 목록에는 없으므로 <code>status</code> 인덱스를 미리 만들지 않는다. 화면이 생기면 그때 쿼리 모양을 보고 만든다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>테이블</th><th>인덱스</th><th>쓰는 쿼리</th><th>겸하는 역할</th></tr></thead><tbody>
+<tr><td>member</td><td>PRIMARY (member_id), uk_member_email (email)</td><td>Q1, 조인</td><td>이메일 중복 금지</td></tr>
+<tr><td>category</td><td>PRIMARY (category_id), uk_category_parent_name (parent_id, name)</td><td>하위 카테고리 조회</td><td>parent_id 외래 키, 형제 간 이름 중복 금지</td></tr>
+<tr><td>product</td><td>PRIMARY (product_id), idx_product_category_status_created</td><td>Q2, Q3, Q8</td><td>category_id 외래 키</td></tr>
+<tr><td>orders</td><td>PRIMARY (order_id), idx_orders_member_ordered, idx_orders_ordered</td><td>Q5, Q7</td><td>member_id 외래 키</td></tr>
+<tr><td>order_item</td><td>PRIMARY, uk_order_item_order_product, uk_order_item_id_product, idx_order_item_product</td><td>Q6, 리뷰 검증</td><td>두 외래 키, 리뷰의 복합 외래 키 참조 대상</td></tr>
+<tr><td>review</td><td>PRIMARY, uk_review_order_item, idx_review_product_created</td><td>Q4</td><td>복합 외래 키, 주문상품당 리뷰 하나</td></tr>
+</tbody></table></div>
+
+<p>표에 아직 설명하지 않은 인덱스가 둘 있다. <code>order_item</code>의 <code>uk_order_item_id_product</code>와 <code>review</code>의 <code>uk_review_order_item</code>이다. 둘 다 역정규화를 지키기 위한 장치이므로, 다음 절에서 왜 필요한지 본다.</p>
+
+<h3>역정규화 실습 1: 무엇을 복사할지 고르는 기준</h3>
+
+<p>역정규화(denormalization)는 정규화로 한 곳에 모은 사실을 일부러 다른 곳에 한 번 더 기록하는 결정이다. 얻는 것은 조회 비용의 감소이고, 잃는 것은 07회에서 본 갱신 이상(update anomaly)에 대한 방어다. 원본이 바뀌면 복사본도 함께 바꿔야 하고, 하나라도 놓치면 데이터베이스가 서로 다른 두 답을 갖게 된다. 그래서 역정규화 후보마다 두 가지를 묻는다. <b>복사하는 값이 바뀌는가</b>, 그리고 <b>복사가 없앨 비용이 정말 큰가</b>.</p>
+
+<p>첫 번째 질문은 비용 쪽이다. 한 번 기록되면 다시 바뀌지 않는 값을 복사하는 것은 싸다. 원본이 바뀌지 않으니 복사본이 어긋날 길이 처음 기록하는 순간 하나뿐이고, 그 순간만 지키면 된다. 반대로 계속 바뀌는 값을 복사하면 원본을 바꾸는 모든 경로에서 복사본을 함께 갱신해야 하고, 그 경로가 늘어날 때마다 놓칠 위험도 늘어난다. 두 번째 질문은 이득 쪽이다. 흔한 착각은 "조인은 비싸니 조인을 없애자"이다. 하지만 기본 키로 몇 건을 찾아가는 조인은 B+Tree를 몇 번 내려가는 일이라 싸다. 비싼 것은 <b>필터 조건과 정렬 조건이 서로 다른 테이블에 있어서</b> 한 인덱스로 둘을 함께 처리할 수 없을 때다. 그러면 후보를 전부 모아 정렬한 뒤에야 LIMIT을 적용할 수 있다.</p>
+
+<p>이 기준으로 쇼핑몰의 후보를 하나씩 평가하자.</p>
+
+<p><b>후보 1: 리뷰에 상품 번호를 복사한다(채택).</b> 정규화된 모델에서 리뷰는 주문상품 번호만 갖는다. 상품 번호는 주문상품을 거쳐야 알 수 있다. 이 상태에서 Q4(상품 1의 리뷰를 최신순으로 20개)를 실행하면, 먼저 <code>order_item</code>에서 상품 1의 주문상품을 모두 찾고(인기 상품이면 수만 건), 각각에 대해 리뷰가 있는지 찾아본 뒤, 찾은 리뷰를 작성 시각으로 정렬해야 한다. 필터(상품)는 주문상품에, 정렬(작성 시각)은 리뷰에 있기 때문이다. LIMIT 20이 있어도 정렬 전에 후보를 전부 모아야 하므로 일찍 멈출 수 없다. 리뷰에 <code>product_id</code>를 두면 <code>review (product_id, created_at)</code> 인덱스 하나로 필터와 정렬이 함께 끝나고, Q5에서 본 것처럼 20개를 읽고 멈춘다. 게다가 주문상품의 상품 번호는 한 번 기록되면 바뀌지 않는 값이다. 이득은 크고 비용은 작다.</p>
+
+<p><b>후보 2: 주문에 총액을 저장한다(채택).</b> 주문 총액은 주문상품의 <code>order_price × quantity</code>를 모두 더한 값이므로 저장하지 않아도 계산할 수 있다. 하지만 Q5(내 주문 목록)와 Q7(일별 매출)은 주문마다 총액이 필요하다. 저장하지 않으면 내 주문 목록 10건을 보여 줄 때마다 주문상품을 조인해 그룹별로 합해야 하고, 일별 매출은 기간 안의 모든 주문상품을 읽어야 한다. 이 쇼핑몰의 규칙에서 주문상품은 주문을 만든 뒤 바뀌지 않는다(S4~S6에는 주문 수정이 없고, 취소는 상태만 바꾼다). 따라서 총액은 주문을 만드는 트랜잭션 안에서 한 번 계산해 넣으면 이후 어긋날 경로가 없다. 만약 나중에 "주문 일부 취소"나 "수량 변경"이 생기면 이 판단을 다시 해야 한다. 그때부터 총액은 바뀌는 값이 되기 때문이다.</p>
+
+<p><b>후보 3: 상품에 리뷰 수와 평점 합계를 저장한다(채택, 비용을 감수).</b> 카테고리 목록(Q2)에 상품마다 리뷰 수와 평균 평점을 보여 준다고 하자. 저장하지 않으면 목록 20개마다 리뷰를 세고 평균을 내야 한다. 이 값은 리뷰가 달릴 때마다 바뀐다. 계속 바뀌는 값의 복사이므로 비용이 가장 큰 후보다. 그래도 목록 화면은 가장 자주 실행되는 쿼리이므로 채택하고, 대신 지키는 방법을 신중하게 정한다. 평균 평점 자체를 저장하지 않고 합계와 개수를 저장한다는 점에 주목하자. 평균은 새 리뷰가 올 때 "기존 평균 × 개수 + 새 평점"을 다시 나누어야 하고 반올림 오차가 쌓인다. 합계와 개수는 각각 더하기만 하면 되므로, 다음 절에서 볼 원자적 증가 연산으로 갱신할 수 있다. 평균은 읽을 때 <code>rating_sum / review_count</code>로 계산한다.</p>
+
+<p><b>후보 4: 주문에 회원 이름을 복사한다(기각).</b> 관리자 주문 목록에 주문자 이름을 보여 주려고 복사하는 경우다. 그러나 주문에서 회원으로 가는 조인은 기본 키 등호 조인이다. 한 화면에 20건이면 클러스터형 인덱스를 20번 내려가는 비용이다. 그리고 회원 이름은 바뀔 수 있는 값이다. 개명한 회원의 과거 주문 수만 건을 함께 고칠 것인가, 아니면 어긋난 채로 둘 것인가를 결정해야 하는 짐만 생긴다. 이득은 작고 비용은 크다. 같은 이유로 상품에 카테고리 이름을 복사하는 것도 기각한다.</p>
+
+<p><b>역정규화가 아닌 것: 주문상품의 상품명과 단가, 주문의 배송지.</b> 주문상품에 <code>product_name</code>과 <code>order_price</code>를 두는 것은 상품 테이블의 값을 복사한 것처럼 보이지만 역정규화가 아니다. <code>product.price</code>는 "지금 이 상품을 얼마에 파는가"이고, <code>order_item.order_price</code>는 "이 주문에서 이 상품을 얼마에 샀는가"다. 함수 종속성으로 말하면 앞의 것은 상품 번호가 결정하고, 뒤의 것은 주문상품 번호가 결정한다. 상품 가격이 내일 오르면 앞의 것은 바뀌어야 하고 뒤의 것은 바뀌면 안 된다. 둘이 같은 값으로 시작하는 것은 우연이다. 이것을 정규화한다며 주문상품에서 단가를 지우고 상품 테이블을 조인하게 만들면, 가격이 바뀌는 순간 과거 주문의 금액이 바뀌는 결함이 된다. 주문의 수령인과 주소도 같다. 회원의 현재 주소와 "이 주문을 보낸 주소"는 다른 사실이다(02회에서 본 시점 기준의 문제).</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>역정규화 후보는 "바뀌지 않는 값을 복사하는가"와 "필터와 정렬을 한 테이블로 모아 인덱스 하나로 끝낼 수 있게 되는가"로 평가한다. 기본 키 조인을 없애려는 역정규화는 이득이 작고, 바뀌는 값을 복사하는 역정규화는 지키는 비용이 크다. 그리고 주문 당시의 가격처럼 시점이 다른 사실은 복사본이 아니라 별개의 사실이다.</p></aside>
+
+<h3>역정규화 실습 2: 복사한 값을 지키는 방법</h3>
+
+<p>채택한 세 후보는 지키는 방법이 각각 다르다. 바뀌지 않는 값은 처음 기록하는 순간을 지키면 되고, 바뀌는 값은 바뀌는 모든 순간을 지켜야 한다.</p>
+
+<h4>리뷰의 상품 번호: 복합 외래 키로 데이터베이스가 지키게 한다</h4>
+
+<p>리뷰를 쓸 때 애플리케이션이 주문상품의 상품 번호를 읽어 그대로 넣으면 된다. 하지만 버그 하나로 다른 상품 번호가 들어가면, 그 리뷰는 엉뚱한 상품의 리뷰 목록에 나타난다. 이 어긋남을 데이터베이스가 막게 할 수 있다. 리뷰의 외래 키를 <code>order_item_id</code> 하나가 아니라 <code>(order_item_id, product_id)</code> 두 열로 선언하고, 주문상품의 <code>(order_item_id, product_id)</code>를 참조하게 하는 것이다. 그러면 리뷰의 (주문상품 번호, 상품 번호) 쌍이 주문상품 테이블에 실제로 있는 쌍이어야만 행이 들어간다. 주문상품 2번이 상품 3번이라면 (2, 1)이라는 쌍은 존재하지 않으므로 거부된다.</p>
+
+<p>이를 위해 부모인 주문상품에 <code>UNIQUE (order_item_id, product_id)</code> 인덱스를 둔다. <code>order_item_id</code>가 이미 기본 키이므로 이 조합의 유일성은 새로운 규칙이 아니다. 그런데도 인덱스가 필요한 이유는 외래 키가 참조하는 열들이 그 순서대로 맨 앞에 오는 인덱스를 MySQL이 요구하기 때문이다. 기본 키 인덱스의 키는 <code>order_item_id</code> 하나뿐이라 이 조건을 만족하지 못한다. 그렇다면 비고유 인덱스 <code>(order_item_id, product_id)</code>로도 되지 않을까. MySQL 8.0의 InnoDB는 비고유 인덱스를 참조하는 외래 키를 표준 SQL의 확장으로 허용해 왔다. 그러나 8.4 매뉴얼은 비고유 키나 부분 키를 참조하는 외래 키를 사용 중단(deprecated) 대상으로 밝히고, 이를 쓰려면 <code>restrict_fk_on_non_standard_key</code> 설정을 바꿔야 하며 향후 버전에서 지원이 사라질 것으로 예고한다. 그래서 처음부터 유일 인덱스로 만든다.</p>
+
+<p>자식인 리뷰 쪽에도 외래 키 열 <code>(order_item_id, product_id)</code>로 시작하는 인덱스가 필요하다. 여기서 "주문상품당 리뷰 하나"라는 S7의 규칙을 <code>UNIQUE (order_item_id, product_id)</code>로 선언해 두 역할을 한 인덱스에 맡긴다. 규칙은 <code>order_item_id</code>의 유일성인데 두 열 조합의 유일성으로 선언해도 되는가. 된다. 복합 외래 키 때문에 같은 <code>order_item_id</code>를 가진 리뷰는 언제나 같은 <code>product_id</code>를 갖는다. 주문상품 하나에는 상품 번호가 하나뿐이기 때문이다. 따라서 두 리뷰의 <code>order_item_id</code>가 같으면 쌍 전체가 같아지고, 쌍의 유일성이 곧 <code>order_item_id</code>의 유일성이 된다. 제약 두 개가 맞물려 하나의 규칙을 지키는 예다.</p>
+
+<h4>주문 총액: 같은 트랜잭션 안에서 한 번 계산한다</h4>
+
+<p>주문 총액은 주문과 주문상품을 넣는 바로 그 트랜잭션 안에서 계산해 넣는다. 다른 트랜잭션이 중간 상태를 보는 일은 없다. 커밋 전까지 다른 트랜잭션에게는 주문도 주문상품도 보이지 않기 때문이다. 문제는 데이터베이스의 선언적 제약으로 이 규칙을 강제할 수 없다는 점이다. <code>CHECK</code> 식에는 다른 테이블이나 서브쿼리를 쓸 수 없다(02회). 그래서 총액 같은 파생 값에는 <b>점검 쿼리</b>를 함께 만들어 둔다. 기능 확인 실습에서 실행해 볼 아래 쿼리가 그것이다. 결과가 비어 있으면 모든 주문의 총액이 주문상품의 합과 일치한다는 뜻이다. 운영에서는 이런 쿼리를 주기적으로 돌려 어긋남을 조기에 발견한다.</p>
+
+<pre data-label="점검 쿼리 1: 주문 총액"><code class="language-sql">SELECT o.order_id, o.total_amount,
+       SUM(oi.order_price * oi.quantity) AS item_sum
+FROM orders o
+JOIN order_item oi ON oi.order_id = o.order_id
+GROUP BY o.order_id, o.total_amount
+HAVING o.total_amount <> item_sum;</code></pre>
+
+<h4>리뷰 수와 평점 합계: 원자적 증가와 같은 트랜잭션</h4>
+
+<p>바뀌는 값을 지키는 첫 번째 원칙은 리뷰를 넣는 문장과 카운터를 고치는 문장을 같은 트랜잭션에 두는 것이다. 리뷰는 들어갔는데 카운터 갱신 전에 장애가 나면 둘이 어긋난다. 한 트랜잭션이면 둘 다 반영되거나 둘 다 취소된다. 두 번째 원칙은 카운터를 "읽고, 더하고, 쓰는" 방식으로 고치지 않는 것이다. 애플리케이션이 <code>SELECT review_count</code>로 7을 읽고 8을 써 넣는 방식이면, 두 트랜잭션이 동시에 7을 읽고 둘 다 8을 쓴다. 리뷰는 두 개 늘었는데 카운터는 하나만 늘었다. 이것이 잃어버린 갱신(lost update)이다. REPEATABLE READ에서 일반 <code>SELECT</code>는 트랜잭션의 스냅숏을 읽으므로 다른 트랜잭션이 막 커밋한 값을 보지 못할 수도 있다.</p>
+
+<pre><code class="language-sql">UPDATE product
+SET review_count = review_count + 1,
+    rating_sum   = rating_sum + 5
+WHERE product_id = 1;</code></pre>
+
+<p>위처럼 증가를 <code>UPDATE</code> 문 안에서 하면 문제가 사라진다. MySQL 매뉴얼은 트랜잭션의 스냅숏이 <code>SELECT</code> 문에 적용되며 DML 문에는 반드시 적용되는 것은 아니라고 설명한다. <code>UPDATE</code>는 대상 행에 배타 잠금을 걸고, 다른 트랜잭션이 커밋한 최신 버전을 읽어 그 위에 더한다. 두 번째 트랜잭션은 첫 번째가 커밋해 잠금이 풀릴 때까지 기다렸다가, 8이 된 값을 읽어 9를 쓴다.</p>
+
+<p>대신 대가가 있다. 행 잠금은 트랜잭션이 끝날 때까지 유지되고, InnoDB는 열 단위가 아니라 행 단위로 잠근다. 상품 행에는 재고도 있으므로, 인기 상품 하나에 주문(재고 감소)과 리뷰(카운터 증가)가 몰리면 서로 다른 열을 고치는데도 같은 행의 잠금을 두고 차례를 기다린다. 또 <code>updated_at</code>을 <code>ON UPDATE CURRENT_TIMESTAMP</code>로 두었다면 리뷰가 달릴 때마다 상품의 "수정 일시"가 바뀌어, 관리자가 상품 정보를 언제 고쳤는지 알 수 없게 된다. 카운터가 자주 바뀌는 서비스라면 카운터를 <code>product_review_stat(product_id, review_count, rating_sum)</code> 같은 별도 테이블로 분리하는 것이 다음 단계의 선택지다. 목록 화면은 20건을 기본 키로 조인하면 되므로 분리의 조회 비용은 작다. 이 실습에서는 단순한 형태로 상품 테이블에 두고, 이 한계를 정의서에 적어 둔다.</p>
+
+<p>카운터에도 점검 쿼리를 만든다. 원본인 리뷰 테이블에서 다시 세어 저장된 값과 비교하는 쿼리다. 어긋남이 발견되면 같은 쿼리의 결과로 카운터를 다시 계산해 덮어쓰면 된다. 원본이 남아 있는 한 역정규화된 값은 언제든 재계산할 수 있다는 점이 파생 값의 장점이다.</p>
+
+<pre data-label="점검 쿼리 2: 리뷰 카운터"><code class="language-sql">SELECT p.product_id, p.review_count, p.rating_sum,
+       COUNT(r.review_id)        AS actual_count,
+       COALESCE(SUM(r.rating), 0) AS actual_sum
+FROM product p
+LEFT JOIN review r ON r.product_id = p.product_id
+GROUP BY p.product_id, p.review_count, p.rating_sum
+HAVING p.review_count <> actual_count
+    OR p.rating_sum   <> actual_sum;</code></pre>
+
+<div class="table-wrap"><table><thead><tr><th>복사한 값</th><th>원본이 바뀌는가</th><th>지키는 방법</th><th>어긋남을 찾는 방법</th></tr></thead><tbody>
+<tr><td>review.product_id</td><td>아니요</td><td>복합 외래 키 (데이터베이스가 강제)</td><td>필요 없음</td></tr>
+<tr><td>orders.total_amount</td><td>현재 규칙에서는 아니요</td><td>생성 트랜잭션 안에서 계산</td><td>점검 쿼리 1</td></tr>
+<tr><td>product.review_count, rating_sum</td><td>예 (리뷰마다)</td><td>같은 트랜잭션, UPDATE 안의 원자적 증가</td><td>점검 쿼리 2, 재계산</td></tr>
+</tbody></table></div>
+
+<h3>쇼핑몰 테이블 정의서</h3>
+
+<p>테이블 정의서(table specification)는 물리 모델을 사람이 읽는 형태로 적은 문서다. ERD가 테이블 사이의 관계를 보여 준다면, 정의서는 테이블 하나하나의 안쪽, 곧 열의 이름과 의미, 자료형, NULL 허용 여부, 기본값, 키와 제약을 보여 준다. 개발자는 정의서를 보고 매핑 코드를 쓰고, 운영자는 데이터를 고칠 때 각 열이 무엇을 뜻하는지 정의서에서 확인한다. 정의서라는 문서의 역할은 08회에서 다루었으므로, 여기서는 열 이름, 논리명, 자료형, NULL 허용, 기본값, 키·제약, 설명의 일곱 항목으로 쇼핑몰의 여섯 테이블을 적는다. 설명 열에는 "무엇을 담는가"뿐 아니라 "무엇을 담지 않는가", "왜 이렇게 정했는가"를 짧게 적는다. 정의서를 다시 읽는 사람이 가장 궁금해하는 것이 그 이유이기 때문이다.</p>
+
+<h4>member (회원)</h4>
+<div class="table-wrap"><table><thead><tr><th>열</th><th>논리명</th><th>자료형</th><th>NULL</th><th>기본값</th><th>키·제약</th><th>설명</th></tr></thead><tbody>
+<tr><td>member_id</td><td>회원 번호</td><td>BIGINT</td><td>N</td><td>AUTO_INCREMENT</td><td>PK</td><td>대리 키</td></tr>
+<tr><td>email</td><td>이메일</td><td>VARCHAR(100)</td><td>N</td><td></td><td>UK</td><td>로그인 아이디. 콜레이션 때문에 대소문자를 구분하지 않고 유일하다</td></tr>
+<tr><td>name</td><td>이름</td><td>VARCHAR(50)</td><td>N</td><td></td><td></td><td></td></tr>
+<tr><td>phone</td><td>휴대전화 번호</td><td>VARCHAR(20)</td><td>Y</td><td>NULL</td><td></td><td>선택 입력. 숫자가 아니라 문자열(앞자리 0, 하이픈 보존)</td></tr>
+<tr><td>created_at</td><td>가입 일시</td><td>DATETIME</td><td>N</td><td>CURRENT_TIMESTAMP</td><td></td><td></td></tr>
+</tbody></table></div>
+
+<h4>category (카테고리)</h4>
+<div class="table-wrap"><table><thead><tr><th>열</th><th>논리명</th><th>자료형</th><th>NULL</th><th>기본값</th><th>키·제약</th><th>설명</th></tr></thead><tbody>
+<tr><td>category_id</td><td>카테고리 번호</td><td>BIGINT</td><td>N</td><td>AUTO_INCREMENT</td><td>PK</td><td></td></tr>
+<tr><td>parent_id</td><td>상위 카테고리 번호</td><td>BIGINT</td><td>Y</td><td>NULL</td><td>FK → category, UK(parent_id, name)</td><td>최상위 카테고리는 NULL</td></tr>
+<tr><td>name</td><td>카테고리 이름</td><td>VARCHAR(50)</td><td>N</td><td></td><td>UK(parent_id, name)</td><td>같은 상위 아래에서 이름 중복 금지. 최상위끼리의 중복은 아래 설명 참고</td></tr>
+</tbody></table></div>
+
+<h4>product (상품)</h4>
+<div class="table-wrap"><table><thead><tr><th>열</th><th>논리명</th><th>자료형</th><th>NULL</th><th>기본값</th><th>키·제약</th><th>설명</th></tr></thead><tbody>
+<tr><td>product_id</td><td>상품 번호</td><td>BIGINT</td><td>N</td><td>AUTO_INCREMENT</td><td>PK</td><td></td></tr>
+<tr><td>category_id</td><td>카테고리 번호</td><td>BIGINT</td><td>N</td><td></td><td>FK → category</td><td>idx_product_category_status_created의 첫 열</td></tr>
+<tr><td>name</td><td>상품명</td><td>VARCHAR(100)</td><td>N</td><td></td><td></td><td></td></tr>
+<tr><td>price</td><td>판매 가격</td><td>INT</td><td>N</td><td></td><td>CHECK (price >= 0)</td><td>원 단위 정수. 현재 가격이며 주문 당시 가격은 order_item에 있다</td></tr>
+<tr><td>stock_quantity</td><td>재고 수량</td><td>INT</td><td>N</td><td>0</td><td>CHECK (stock_quantity >= 0)</td><td>0이면 화면에 품절로 표시. 품절은 저장하지 않는다</td></tr>
+<tr><td>status</td><td>판매 상태</td><td>VARCHAR(20)</td><td>N</td><td>'ON_SALE'</td><td>CHECK IN ('ON_SALE', 'STOPPED')</td><td>관리자가 정하는 값만</td></tr>
+<tr><td>review_count</td><td>리뷰 수</td><td>INT</td><td>N</td><td>0</td><td></td><td>[역정규화] review에서 계산 가능. 점검 쿼리 2</td></tr>
+<tr><td>rating_sum</td><td>평점 합계</td><td>INT</td><td>N</td><td>0</td><td></td><td>[역정규화] 평균은 rating_sum / review_count로 읽을 때 계산</td></tr>
+<tr><td>created_at</td><td>등록 일시</td><td>DATETIME</td><td>N</td><td>CURRENT_TIMESTAMP</td><td></td><td>목록 정렬 기준</td></tr>
+<tr><td>updated_at</td><td>수정 일시</td><td>DATETIME</td><td>N</td><td>CURRENT_TIMESTAMP</td><td>ON UPDATE CURRENT_TIMESTAMP</td><td>재고·카운터 변경에도 바뀐다는 한계가 있다</td></tr>
+</tbody></table></div>
+
+<h4>orders (주문)</h4>
+<div class="table-wrap"><table><thead><tr><th>열</th><th>논리명</th><th>자료형</th><th>NULL</th><th>기본값</th><th>키·제약</th><th>설명</th></tr></thead><tbody>
+<tr><td>order_id</td><td>주문 번호</td><td>BIGINT</td><td>N</td><td>AUTO_INCREMENT</td><td>PK</td><td>번호에 빈틈이 생길 수 있다(기능 확인 1 참고)</td></tr>
+<tr><td>member_id</td><td>주문 회원 번호</td><td>BIGINT</td><td>N</td><td></td><td>FK → member</td><td>idx_orders_member_ordered의 첫 열</td></tr>
+<tr><td>status</td><td>주문 상태</td><td>VARCHAR(20)</td><td>N</td><td></td><td>CHECK IN ('ORDERED', 'SHIPPING', 'DELIVERED', 'CANCELED')</td><td>상태 전이는 조건부 UPDATE로 지킨다</td></tr>
+<tr><td>total_amount</td><td>주문 총액</td><td>INT</td><td>N</td><td></td><td>CHECK (total_amount >= 0)</td><td>[역정규화] SUM(order_price × quantity). 점검 쿼리 1</td></tr>
+<tr><td>receiver_name</td><td>수령인</td><td>VARCHAR(50)</td><td>N</td><td></td><td></td><td>주문 시점의 값. 회원 이름과 다른 사실</td></tr>
+<tr><td>receiver_phone</td><td>수령인 연락처</td><td>VARCHAR(20)</td><td>N</td><td></td><td></td><td></td></tr>
+<tr><td>zipcode</td><td>우편번호</td><td>CHAR(5)</td><td>N</td><td></td><td></td><td>다섯 자리로 고정된 국내 우편번호</td></tr>
+<tr><td>address</td><td>배송 주소</td><td>VARCHAR(200)</td><td>N</td><td></td><td></td><td>주문 시점의 값</td></tr>
+<tr><td>ordered_at</td><td>주문 일시</td><td>DATETIME</td><td>N</td><td>CURRENT_TIMESTAMP</td><td></td><td>목록 정렬과 매출 집계 기준</td></tr>
+</tbody></table></div>
+
+<h4>order_item (주문상품)</h4>
+<div class="table-wrap"><table><thead><tr><th>열</th><th>논리명</th><th>자료형</th><th>NULL</th><th>기본값</th><th>키·제약</th><th>설명</th></tr></thead><tbody>
+<tr><td>order_item_id</td><td>주문상품 번호</td><td>BIGINT</td><td>N</td><td>AUTO_INCREMENT</td><td>PK, UK(order_item_id, product_id)</td><td>두 번째 UK는 review의 복합 외래 키가 참조한다</td></tr>
+<tr><td>order_id</td><td>주문 번호</td><td>BIGINT</td><td>N</td><td></td><td>FK → orders, UK(order_id, product_id)</td><td></td></tr>
+<tr><td>product_id</td><td>상품 번호</td><td>BIGINT</td><td>N</td><td></td><td>FK → product</td><td>생성 후 바뀌지 않는다</td></tr>
+<tr><td>product_name</td><td>주문 당시 상품명</td><td>VARCHAR(100)</td><td>N</td><td></td><td></td><td>스냅숏. 역정규화가 아니다</td></tr>
+<tr><td>order_price</td><td>주문 당시 단가</td><td>INT</td><td>N</td><td></td><td>CHECK (order_price >= 0)</td><td>스냅숏. 역정규화가 아니다</td></tr>
+<tr><td>quantity</td><td>수량</td><td>INT</td><td>N</td><td></td><td>CHECK (quantity > 0)</td><td></td></tr>
+</tbody></table></div>
+
+<h4>review (리뷰)</h4>
+<div class="table-wrap"><table><thead><tr><th>열</th><th>논리명</th><th>자료형</th><th>NULL</th><th>기본값</th><th>키·제약</th><th>설명</th></tr></thead><tbody>
+<tr><td>review_id</td><td>리뷰 번호</td><td>BIGINT</td><td>N</td><td>AUTO_INCREMENT</td><td>PK</td><td></td></tr>
+<tr><td>order_item_id</td><td>주문상품 번호</td><td>BIGINT</td><td>N</td><td></td><td>FK(order_item_id, product_id) → order_item, UK</td><td>주문상품당 리뷰 하나</td></tr>
+<tr><td>product_id</td><td>상품 번호</td><td>BIGINT</td><td>N</td><td></td><td>위 복합 FK의 둘째 열</td><td>[역정규화] order_item.product_id의 복사. 복합 FK가 일치를 강제</td></tr>
+<tr><td>rating</td><td>평점</td><td>TINYINT</td><td>N</td><td></td><td>CHECK (rating BETWEEN 1 AND 5)</td><td></td></tr>
+<tr><td>content</td><td>리뷰 내용</td><td>VARCHAR(1000)</td><td>N</td><td></td><td></td><td></td></tr>
+<tr><td>created_at</td><td>작성 일시</td><td>DATETIME</td><td>N</td><td>CURRENT_TIMESTAMP</td><td></td><td>리뷰 목록 정렬 기준</td></tr>
+</tbody></table></div>
+
+<p>자료형은 08회에서 다룬 문자·숫자·날짜 자료형의 성질에 따라 골랐다. 대리 키는 모두 <code>BIGINT</code>(8바이트)로 통일했다. 키 자료형이 테이블마다 다르면 외래 키 열의 자료형도 따라 달라지고, 조인할 때 양쪽 자료형이 다르면 비교를 위한 형 변환이 끼어들 여지가 생긴다. 금액은 원 단위 정수이므로 <code>INT</code>(4바이트, 부호 있는 최댓값 2,147,483,647)로 두었다. 한 주문의 총액이 21억 원을 넘는 일은 이 쇼핑몰의 업무 범위 밖이라고 판단했고, 그 판단을 정의서에 적어 둔다. 소수점 아래 금액이 있는 통화를 다룬다면 <code>DECIMAL</code>이어야 한다. 평점은 1에서 5까지이므로 <code>TINYINT</code>(1바이트)로 충분하다. 상태 값은 <code>ENUM</code> 대신 <code>VARCHAR</code>와 <code>CHECK</code>를 썼다. 값 목록을 바꾸려면 둘 다 DDL을 고쳐야 하지만, <code>CHECK</code> 쪽은 저장되는 값이 문자열 그대로라 데이터를 옮기거나 다른 시스템이 읽을 때 해석이 필요 없다.</p>
+
+<p>문자열 길이는 바이트가 아니라 문자 수다. <code>utf8mb4</code>는 문자 하나에 최대 4바이트를 쓰므로 <code>VARCHAR(100)</code>의 값은 최대 400바이트가 된다. 이 값으로 만든 <code>email</code> 유일 인덱스는 InnoDB의 기본 행 형식인 DYNAMIC에서 인덱스 키 접두사 한도인 3,072바이트 안에 넉넉히 들어간다. 날짜와 시각은 <code>DATETIME</code>을 썼다. <code>TIMESTAMP</code>는 세션 시간대를 기준으로 UTC로 바꿔 저장하고 표현 범위가 2038년에서 끝나므로, 이 쇼핑몰처럼 한 시간대에서만 운영하는 서비스에서는 들어온 값을 그대로 저장하는 <code>DATETIME</code>이 해석하기 쉽다.</p>
+
+<p>정의서를 엑셀이나 위키 문서로 따로 관리하면 반드시 DDL과 어긋난다. 누군가 열 하나를 추가하는 <code>ALTER TABLE</code>을 실행하고 문서를 고치지 않으면, 그날부터 문서가 틀린다. 어긋나지 않게 하는 방법은 원본을 하나로 두는 것이다. 열의 설명을 DDL의 <code>COMMENT</code>로 적고(열 주석은 최대 1,024자, 테이블 주석은 최대 2,048자), 정의서는 데이터베이스의 카탈로그에서 생성한다. 아래 쿼리가 정의서의 표를 그대로 뽑아낸다. 이렇게 하면 정의서는 "현재 데이터베이스의 실제 모습"이 되고, 문서를 고치는 일과 스키마를 고치는 일이 같은 일이 된다.</p>
+
+<pre data-label="카탈로그에서 정의서 뽑기"><code class="language-sql">SELECT c.TABLE_NAME, t.TABLE_COMMENT,
+       c.ORDINAL_POSITION, c.COLUMN_NAME, c.COLUMN_COMMENT,
+       c.COLUMN_TYPE, c.IS_NULLABLE, c.COLUMN_DEFAULT, c.EXTRA
+FROM information_schema.COLUMNS c
+JOIN information_schema.TABLES  t
+  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+ AND t.TABLE_NAME   = c.TABLE_NAME
+WHERE c.TABLE_SCHEMA = 'shop'
+ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION;</code></pre>
+
+<h3>쇼핑몰 DDL과 DB 만들기</h3>
+
+<p>정의서의 결정을 DDL로 옮긴다. 순서에는 이유가 있다. 외래 키는 이미 있는 테이블만 참조할 수 있으므로, 참조되는 쪽(부모)부터 만든다. 회원과 카테고리가 먼저, 상품과 주문이 다음, 주문상품이 그다음, 리뷰가 마지막이다. 지울 때는 반대 순서다. 데이터베이스를 만들 때는 문자 집합과 콜레이션(collation)을 명시한다. MySQL 8.0의 서버 기본값은 <code>utf8mb4</code>와 <code>utf8mb4_0900_ai_ci</code>이지만, 기본값에 기대지 않고 적어 두어야 서버 설정이 다른 환경에서도 같은 스키마가 만들어진다.</p>
+
+<pre data-label="shop 데이터베이스 DDL"><code class="language-sql">CREATE DATABASE shop
+  DEFAULT CHARACTER SET utf8mb4
+  DEFAULT COLLATE utf8mb4_0900_ai_ci;
+
+USE shop;
+
+CREATE TABLE member (
+  member_id   BIGINT       NOT NULL AUTO_INCREMENT COMMENT '회원 번호',
+  email       VARCHAR(100) NOT NULL COMMENT '로그인 이메일. 대소문자 구분 없이 유일',
+  name        VARCHAR(50)  NOT NULL COMMENT '이름',
+  phone       VARCHAR(20)  NULL     COMMENT '휴대전화 번호. 선택 입력',
+  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '가입 일시',
+  PRIMARY KEY (member_id),
+  UNIQUE KEY uk_member_email (email)
+) ENGINE = InnoDB COMMENT = '회원';
+
+CREATE TABLE category (
+  category_id BIGINT      NOT NULL AUTO_INCREMENT COMMENT '카테고리 번호',
+  parent_id   BIGINT      NULL     COMMENT '상위 카테고리 번호. 최상위는 NULL',
+  name        VARCHAR(50) NOT NULL COMMENT '카테고리 이름',
+  PRIMARY KEY (category_id),
+  UNIQUE KEY uk_category_parent_name (parent_id, name),
+  CONSTRAINT fk_category_parent
+    FOREIGN KEY (parent_id) REFERENCES category (category_id)
+) ENGINE = InnoDB COMMENT = '상품 카테고리';
+
+CREATE TABLE product (
+  product_id     BIGINT       NOT NULL AUTO_INCREMENT COMMENT '상품 번호',
+  category_id    BIGINT       NOT NULL COMMENT '카테고리 번호',
+  name           VARCHAR(100) NOT NULL COMMENT '상품명',
+  price          INT          NOT NULL COMMENT '판매 가격(원)',
+  stock_quantity INT          NOT NULL DEFAULT 0 COMMENT '재고 수량. 0이면 품절',
+  status         VARCHAR(20)  NOT NULL DEFAULT 'ON_SALE' COMMENT '판매 상태: ON_SALE, STOPPED',
+  review_count   INT          NOT NULL DEFAULT 0 COMMENT '[역정규화] 리뷰 수',
+  rating_sum     INT          NOT NULL DEFAULT 0 COMMENT '[역정규화] 평점 합계',
+  created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '등록 일시',
+  updated_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP COMMENT '수정 일시',
+  PRIMARY KEY (product_id),
+  KEY idx_product_category_status_created (category_id, status, created_at),
+  CONSTRAINT fk_product_category
+    FOREIGN KEY (category_id) REFERENCES category (category_id),
+  CONSTRAINT chk_product_price  CHECK (price >= 0),
+  CONSTRAINT chk_product_stock  CHECK (stock_quantity >= 0),
+  CONSTRAINT chk_product_status CHECK (status IN ('ON_SALE', 'STOPPED'))
+) ENGINE = InnoDB COMMENT = '상품';
+
+CREATE TABLE orders (
+  order_id       BIGINT       NOT NULL AUTO_INCREMENT COMMENT '주문 번호',
+  member_id      BIGINT       NOT NULL COMMENT '주문 회원 번호',
+  status         VARCHAR(20)  NOT NULL COMMENT '주문 상태',
+  total_amount   INT          NOT NULL COMMENT '[역정규화] 주문 총액',
+  receiver_name  VARCHAR(50)  NOT NULL COMMENT '수령인',
+  receiver_phone VARCHAR(20)  NOT NULL COMMENT '수령인 연락처',
+  zipcode        CHAR(5)      NOT NULL COMMENT '우편번호',
+  address        VARCHAR(200) NOT NULL COMMENT '배송 주소',
+  ordered_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '주문 일시',
+  PRIMARY KEY (order_id),
+  KEY idx_orders_member_ordered (member_id, ordered_at),
+  KEY idx_orders_ordered (ordered_at),
+  CONSTRAINT fk_orders_member
+    FOREIGN KEY (member_id) REFERENCES member (member_id),
+  CONSTRAINT chk_orders_status
+    CHECK (status IN ('ORDERED', 'SHIPPING', 'DELIVERED', 'CANCELED')),
+  CONSTRAINT chk_orders_total CHECK (total_amount >= 0)
+) ENGINE = InnoDB COMMENT = '주문';
+
+CREATE TABLE order_item (
+  order_item_id BIGINT       NOT NULL AUTO_INCREMENT COMMENT '주문상품 번호',
+  order_id      BIGINT       NOT NULL COMMENT '주문 번호',
+  product_id    BIGINT       NOT NULL COMMENT '상품 번호',
+  product_name  VARCHAR(100) NOT NULL COMMENT '주문 당시 상품명',
+  order_price   INT          NOT NULL COMMENT '주문 당시 단가(원)',
+  quantity      INT          NOT NULL COMMENT '수량',
+  PRIMARY KEY (order_item_id),
+  UNIQUE KEY uk_order_item_order_product (order_id, product_id),
+  UNIQUE KEY uk_order_item_id_product (order_item_id, product_id),
+  KEY idx_order_item_product (product_id),
+  CONSTRAINT fk_order_item_orders
+    FOREIGN KEY (order_id) REFERENCES orders (order_id),
+  CONSTRAINT fk_order_item_product
+    FOREIGN KEY (product_id) REFERENCES product (product_id),
+  CONSTRAINT chk_order_item_price    CHECK (order_price >= 0),
+  CONSTRAINT chk_order_item_quantity CHECK (quantity > 0)
+) ENGINE = InnoDB COMMENT = '주문상품';
+
+CREATE TABLE review (
+  review_id     BIGINT        NOT NULL AUTO_INCREMENT COMMENT '리뷰 번호',
+  order_item_id BIGINT        NOT NULL COMMENT '리뷰 대상 주문상품 번호',
+  product_id    BIGINT        NOT NULL COMMENT '[역정규화] 상품 번호',
+  rating        TINYINT       NOT NULL COMMENT '평점 1~5',
+  content       VARCHAR(1000) NOT NULL COMMENT '리뷰 내용',
+  created_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '작성 일시',
+  PRIMARY KEY (review_id),
+  UNIQUE KEY uk_review_order_item (order_item_id, product_id),
+  KEY idx_review_product_created (product_id, created_at),
+  CONSTRAINT fk_review_order_item
+    FOREIGN KEY (order_item_id, product_id)
+    REFERENCES order_item (order_item_id, product_id),
+  CONSTRAINT chk_review_rating CHECK (rating BETWEEN 1 AND 5)
+) ENGINE = InnoDB COMMENT = '리뷰';</code></pre>
+
+<p>DDL을 실행한 뒤에는 의도한 것이 실제로 만들어졌는지 확인한다. 첫째, 외래 키 때문에 자동으로 생긴 인덱스가 없어야 한다. 이 DDL에서는 모든 외래 키가 이미 선언한 인덱스의 맨 앞 열로 지원되도록 설계했으므로, MySQL이 추가로 만들 인덱스가 없다. <code>information_schema.STATISTICS</code>를 조회하면 테이블마다 인덱스 이름과 열 순서(<code>SEQ_IN_INDEX</code>)를 볼 수 있다. 여기에 DDL에 적지 않은 인덱스가 보인다면 어떤 외래 키가 기존 인덱스로 지원되지 못했다는 뜻이다. 이 DDL을 MySQL 8.4.13과 8.0.46에서 실행하고 조회해 보면, 두 버전 모두 DDL에 적은 인덱스(기본 키 여섯 개와 보조 인덱스 열 개)만 나온다. 둘째, <code>SHOW CREATE TABLE</code>의 출력을 읽어 본다. 이것은 데이터 사전에 저장된 정의를 다시 DDL로 표현한 것이라, 생략한 기본값(엔진, 문자 집합, 콜레이션)이 어떻게 채워졌는지 보여 준다. 매뉴얼에 따르면 명시적으로 쓴 <code>ON DELETE NO ACTION</code>은 기본값이라 이 출력에 나타나지 않고, 같은 뜻의 <code>RESTRICT</code>는 나타난다.</p>
+
+<p>제약 세 가지는 동작을 정확히 알고 써야 한다. 첫째는 <code>CHECK</code>다. MySQL은 8.0.16부터 <code>CHECK</code> 제약을 실제로 검사한다. 그 이전 버전은 문법만 받아들이고 무시했으므로, 오래된 서버에서 이 DDL을 실행하면 오류 없이 만들어지지만 아무것도 막지 않는다. 또 조건이 거짓(FALSE)일 때만 위반이고, NULL 때문에 UNKNOWN이 되면 통과한다. 이 DDL에서 <code>CHECK</code>가 걸린 열은 모두 <code>NOT NULL</code>이므로 이 구멍이 없다. 둘째는 콜레이션과 유일성이다. <code>utf8mb4_0900_ai_ci</code>의 <code>ai</code>는 악센트 무시, <code>ci</code>는 대소문자 무시를 뜻한다. 그래서 <code>Hana@Example.com</code>과 <code>hana@example.com</code>은 같은 값으로 비교되고, 유일 인덱스가 두 번째 가입을 막는다. 이메일 규칙과 맞는 동작이다. 반면 UCA 9.0.0 기반 콜레이션은 NO PAD라서 끝의 공백을 다른 문자처럼 취급한다. <code>'hana@example.com '</code>(끝에 공백)은 다른 값이 되어 들어갈 수 있으므로, 애플리케이션이 입력의 앞뒤 공백을 지워서 넣어야 한다.</p>
+
+<p>셋째는 NULL이 들어가는 유일 인덱스다. 카테고리의 <code>UNIQUE (parent_id, name)</code>은 같은 상위 카테고리 아래에서 이름이 겹치지 않게 막는다. 그런데 MySQL의 유일 인덱스는 NULL을 허용하는 열에 NULL 값이 여러 번 들어가는 것을 허용한다. 최상위 카테고리는 <code>parent_id</code>가 NULL이므로, 최상위 카테고리 "컴퓨터 주변기기"를 두 번 넣어도 이 제약은 막지 못한다. NULL은 어떤 값과도, 다른 NULL과도 같다고 판정되지 않기 때문이다. 이 실습에서는 최상위 카테고리가 관리자만 만드는 몇 개뿐이므로 애플리케이션 확인으로 충분하다고 보고, 이 한계를 정의서에 적었다. 엄격하게 막아야 한다면 최상위를 가리키는 루트 행을 하나 두어 <code>parent_id</code>를 <code>NOT NULL</code>로 만드는 방법이 있다.</p>
+
+<x-visual id="db-design1-09-shop-physical-erd" title="쇼핑몰 물리 ERD: 여섯 테이블과 키, 인덱스" kind="ERD" ratio="16:9">
+<x-hint>여섯 테이블의 열, PK·FK·UK 표시, 그리고 까마귀발 관계선을 보여 준다. 리뷰와 주문상품 사이의 복합 외래 키가 두 열로 연결된다는 점이 드러나야 한다.</x-hint>
+<x-prompt>까마귀발 표기의 물리 ERD. 사각형 테이블 여섯 개를 배치한다: 왼쪽 위 "member", 가운데 위 "orders", 오른쪽 위 "order_item", 오른쪽 아래 "review", 가운데 아래 "product", 왼쪽 아래 "category". 각 사각형 위쪽 띠에 테이블 이름, 아래에 열 목록을 작은 글씨로 적고 기본 키 열 앞에 열쇠 아이콘, 외래 키 열 앞에 "FK" 표시. 관계선(모두 점선): member → orders, orders → order_item, product → order_item, category → product, category → category(자기 참조 고리), order_item → review. 부모 쪽 끝은 막대 두 개, 자식 쪽 끝은 원과 까마귀발. 단, order_item → review 선의 review 쪽 끝은 원과 막대 하나(0..1). order_item → review 선 옆에 작은 라벨 "(order_item_id, product_id)". review의 "product_id" 열과 product의 "review_count" 열 옆에 주황색 작은 태그 "역정규화". 배경 흰색, 테이블은 옅은 파란색.</x-prompt>
+<x-caption>모든 관계가 비식별 관계라 점선으로 그려진다. 리뷰는 주문상품의 두 열을 함께 참조해, 복사한 상품 번호가 원본과 같음을 데이터베이스가 보장한다.</x-caption>
+</x-visual>
+
+<h3>물리적 모델: 데이터베이스에서 ERD를 자동으로 생성하기</h3>
+
+<p>설계 도구에서 그린 ERD와 실제 데이터베이스는 시간이 지나면 어긋난다. 그래서 반대 방향, 곧 살아 있는 데이터베이스에서 ERD를 거꾸로 만들어 설계와 대조하는 작업이 필요하다. 이를 리버스 엔지니어링(reverse engineering)이라고 한다. MySQL Workbench의 매뉴얼은 MySQL 생성 스크립트나 실행 중인 MySQL 서버에 접속해 하나 이상의 데이터베이스를 가져와 리버스 엔지니어링할 수 있다고 설명한다. 다른 데이터베이스 도구들도 비슷한 기능을 제공한다. 도구마다 화면은 다르지만 원리는 같다. 도구는 데이터베이스의 메타데이터, 곧 카탈로그를 조회하고, 거기서 읽은 사실로만 그림을 그린다.</p>
+
+<p>MySQL 8.0의 카탈로그는 데이터 사전(data dictionary)이다. 테이블, 열, 인덱스, 제약의 정의가 여기에 저장된다. 사용자가 조회하는 <code>INFORMATION_SCHEMA</code>의 <code>TABLES</code>, <code>COLUMNS</code>, <code>STATISTICS</code> 같은 테이블은, 매뉴얼에 따르면 8.0부터 데이터 사전 테이블 위의 뷰로 구현되어 있다. 그래서 도구가 할 일은 SQL 몇 개를 실행하는 것이다. 관계선의 원천은 외래 키다. <code>INFORMATION_SCHEMA.KEY_COLUMN_USAGE</code>는 제약에 속한 열을 한 행씩 보여 주는데, 외래 키 제약의 행에는 참조하는 테이블과 열(<code>REFERENCED_TABLE_NAME</code>, <code>REFERENCED_COLUMN_NAME</code>)이 채워져 있다. 기본 키나 유일 제약의 행은 이 두 열이 비어 있다. 쇼핑몰 데이터베이스에 다음 쿼리를 실행해 보자.</p>
+
+<pre data-label="관계선의 원천: 외래 키 열 목록"><code class="language-sql">SELECT TABLE_NAME            AS child_table,
+       COLUMN_NAME           AS fk_column,
+       REFERENCED_TABLE_NAME AS parent_table,
+       REFERENCED_COLUMN_NAME AS parent_column,
+       CONSTRAINT_NAME,
+       ORDINAL_POSITION
+FROM information_schema.KEY_COLUMN_USAGE
+WHERE TABLE_SCHEMA = 'shop'
+  AND REFERENCED_TABLE_NAME IS NOT NULL;</code></pre>
+
+<div class="table-wrap"><table><thead><tr><th>child_table</th><th>fk_column</th><th>parent_table</th><th>parent_column</th><th>CONSTRAINT_NAME</th><th>ORDINAL_POSITION</th></tr></thead><tbody>
+<tr><td>category</td><td>parent_id</td><td>category</td><td>category_id</td><td>fk_category_parent</td><td>1</td></tr>
+<tr><td>order_item</td><td>order_id</td><td>orders</td><td>order_id</td><td>fk_order_item_orders</td><td>1</td></tr>
+<tr><td>order_item</td><td>product_id</td><td>product</td><td>product_id</td><td>fk_order_item_product</td><td>1</td></tr>
+<tr><td>orders</td><td>member_id</td><td>member</td><td>member_id</td><td>fk_orders_member</td><td>1</td></tr>
+<tr><td>product</td><td>category_id</td><td>category</td><td>category_id</td><td>fk_product_category</td><td>1</td></tr>
+<tr><td>review</td><td>order_item_id</td><td>order_item</td><td>order_item_id</td><td>fk_review_order_item</td><td>1</td></tr>
+<tr><td>review</td><td>product_id</td><td>order_item</td><td>product_id</td><td>fk_review_order_item</td><td>2</td></tr>
+</tbody></table></div>
+
+<p>결과는 일곱 행이다(표는 <code>'shop'</code> 자리에 실습용 데이터베이스 이름을 넣어 MySQL 8.4.13에서 실행한 출력이고, 8.0.46에서도 같은 순서로 나왔다. 쿼리에 <code>ORDER BY</code>가 없으므로 이 순서는 보장되지 않는다). 리뷰의 외래 키는 열이 둘이므로 두 행으로 나오고, 같은 <code>CONSTRAINT_NAME</code>과 제약 안의 위치(<code>ORDINAL_POSITION</code>)로 묶인다. 도구는 같은 제약 이름의 행들을 선 하나로 그린다. 따라서 이 데이터베이스에서 그려지는 관계선은 여섯 개다. 리뷰에서 주문상품으로 가는 선이 두 열짜리라는 사실도 그림에 드러나는데, 이것은 복합 외래 키가 준 부수 효과다. 역정규화한 <code>review.product_id</code>가 어디서 온 값인지가 문서가 아니라 스키마 자체에 기록되어 있다.</p>
+
+<p>선의 모양은 카탈로그의 다른 사실에서 추론한다. 아래 표는 도구가 쓸 수 있는 근거를 정리한 것이다. 도구마다 표시 방식은 다르지만, 근거로 쓸 수 있는 정보는 카탈로그에 있는 이것뿐이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>카탈로그에서 읽는 사실</th><th>추론할 수 있는 것</th><th>쇼핑몰의 결과</th></tr></thead><tbody>
+<tr><td>외래 키 열이 자식의 기본 키에 포함되는가</td><td>식별 관계 / 비식별 관계</td><td>모두 비식별(모든 테이블이 자기 대리 키를 가짐)</td></tr>
+<tr><td>외래 키 열이 NOT NULL인가</td><td>자식이 부모를 반드시 가져야 하는가(부모 쪽 최소 1 / 0)</td><td>category.parent_id만 NULL 허용 → 상위 카테고리는 선택</td></tr>
+<tr><td>외래 키 열 전체와 정확히 일치하는 유일 인덱스가 있는가</td><td>자식 쪽 최대가 1인가(일대일 / 일대다)</td><td>review의 UK가 외래 키 두 열과 일치 → 주문상품과 일대일</td></tr>
+<tr><td>그 밖의 유일 인덱스</td><td>관계의 최대 수에는 영향 없음</td><td>order_item의 (order_id, product_id)는 order_id만으로는 유일하지 않음 → 일대다</td></tr>
+</tbody></table></div>
+
+<p>MySQL Workbench의 EER 다이어그램은 식별 관계를 실선, 비식별 관계를 점선(broken line)으로 그리고, 기본 표기법은 까마귀발이다. 매뉴얼은 외래 키 열이 자식 테이블의 기본 키의 일부이면 실선을 쓴다고 예를 들어 설명한다. 쇼핑몰은 모든 테이블이 대리 키를 기본 키로 쓰므로 모든 관계선이 점선으로 그려진다. 06회에서 본 식별·비식별 관계의 선택이 그림에서 이렇게 드러난다.</p>
+
+<p>더 중요한 것은 그려지지 않는 것들이다. "주문에는 주문상품이 하나 이상 있다"는 규칙의 "최소 1"은 외래 키로 표현되지 않으므로(04회), 역으로 생성한 ERD에서 주문→주문상품 선의 주문상품 쪽 끝은 "0 이상"으로 그려진다. "배송이 끝난 주문상품에만 리뷰를 쓸 수 있다", "주문 총액은 주문상품 합계와 같다", "품절은 재고 0이다", "리뷰의 작성자는 그 주문의 회원이다" 같은 규칙도 카탈로그에 없으므로 그림에도 없다. 외래 키를 아예 선언하지 않는 팀이라면 결과는 더 극단적이다. 리버스 엔지니어링한 ERD는 선 하나 없이 테이블만 흩어져 있는 그림이 된다. 관계는 애플리케이션 코드 속에만 존재하게 된다. 자동 생성 ERD는 "데이터베이스가 실제로 강제하는 것"의 정확한 그림이고, 설계 문서의 전부가 아니다. 그 차이, 곧 애플리케이션이 지켜야 하는 규칙의 목록은 따로 적어 두어야 한다.</p>
+
+<p>방향을 반대로 하면 엔티티 매핑에서 DDL을 생성하는 일도 있다. 스프링 부트에서 <code>spring.jpa.hibernate.ddl-auto</code>는 <code>none</code>, <code>validate</code>, <code>update</code>, <code>create</code>, <code>create-drop</code>을 받는다. 스프링 부트 문서에 따르면 H2 같은 내장 데이터베이스를 쓰고 Flyway나 Liquibase 같은 스키마 관리 도구가 없으면 기본값이 <code>create-drop</code>이고, 그 밖의 경우에는 <code>none</code>이다. 개발 초기에 엔티티에서 테이블을 생성하는 것은 편리하지만, 이 회차의 DDL에 담긴 결정들, 곧 인덱스 열 순서, 외래 키를 겸하도록 고른 복합 인덱스, 복합 외래 키, <code>CHECK</code> 제약, 주석은 설계의 산출물이다. 운영 스키마는 검토된 DDL 스크립트로 관리하고, 엔티티 쪽은 <code>validate</code>로 매핑이 스키마와 맞는지만 확인하게 하는 구성이 원본을 하나로 지키는 방법이다.</p>
+
+<x-visual id="db-design1-09-reverse-engineering" title="DDL에서 자동 생성 ERD까지 메타데이터가 흐르는 길" kind="흐름도" ratio="16:9">
+<x-hint>DDL이 데이터 사전에 정의를 남기고, INFORMATION_SCHEMA 뷰를 통해 도구가 그것을 읽어 선과 기호를 추론하는 과정, 그리고 카탈로그에 없는 업무 규칙은 그림에 나타나지 않는다는 점을 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 가는 흐름도. 첫 상자 "CREATE TABLE ... FOREIGN KEY" (문서 아이콘), 화살표, 두 번째 상자 "데이터 사전" (원통 아이콘), 화살표, 세 번째 상자 "INFORMATION_SCHEMA 뷰" 안에 작은 칸 세 개 "KEY_COLUMN_USAGE", "COLUMNS", "STATISTICS", 화살표, 네 번째 상자 "ERD 도구" (톱니 아이콘), 화살표, 다섯 번째에 작은 ERD 그림(사각형 세 개와 점선 연결). 세 번째와 네 번째 상자 사이 화살표 위에 라벨 "외래 키 → 선, NOT NULL → 필수, UNIQUE → 일대일". 아래쪽에 회색 점선 상자 "업무 규칙: 최소 1개, 총액 = 합계, 배송완료 후 리뷰"를 두고, 이 상자에서 ERD로 가는 화살표에 빨간 X 표시와 라벨 "그려지지 않음". 배경 흰색, 차분한 파란색 계열.</x-prompt>
+<x-caption>자동 생성 ERD는 카탈로그에 기록된 제약만으로 그려진다. 선언적 제약으로 표현되지 않은 규칙은 그림에서 사라진다.</x-caption>
+</x-visual>
+
+<h3>쇼핑몰 기능 확인 1: 데이터 넣기와 주문 생성</h3>
+
+<p>이제 만든 데이터베이스가 요구 사항대로 동작하는지 SQL로 확인한다. 기능 확인의 목적은 쿼리가 돌아가는지 보는 데 그치지 않는다. 설계에서 세운 가정, 곧 제약이 무엇을 막는지, 인덱스가 어떤 쿼리를 받치는지, 역정규화한 값이 원본과 맞는지를 데이터로 검증하는 것이다. 아래 결과 값은 모두 여기서 넣은 데이터로부터 결정된다. 자동 증가 번호가 1부터 차례로 붙는 것은 빈 테이블에 다른 세션이 동시에 값을 넣지 않는 이 실습의 조건에서 그렇다.</p>
+
+<pre data-label="기본 데이터 (MySQL 8.4.13에서 실행)"><code class="language-sql">INSERT INTO member (email, name, phone) VALUES
+  ('hana@example.com', '김하나', '010-1111-2222'),   -- member_id 1
+  ('duri@example.com', '이두리', NULL);              -- member_id 2
+
+INSERT INTO category (parent_id, name) VALUES (NULL, '컴퓨터 주변기기');  -- 1
+INSERT INTO category (parent_id, name) VALUES (1, '키보드'), (1, '마우스'); -- 2, 3
+
+INSERT INTO product (category_id, name, price, stock_quantity, created_at) VALUES
+  (2, '기계식 키보드 K1', 89000, 10, '2026-11-01 10:00:00'),  -- product_id 1
+  (2, '무선 키보드 K2',   59000,  0, '2026-11-02 10:00:00'),  -- product_id 2
+  (3, '무선 마우스 M1',   25000, 30, '2026-11-03 09:00:00');  -- product_id 3
+
+-- 제약 확인: 대소문자만 다른 이메일
+INSERT INTO member (email, name) VALUES ('Hana@Example.com', '김하나2');
+-- ERROR 1062 (23000): Duplicate entry 'Hana@Example.com' for key 'member.uk_member_email'
+-- (utf8mb4_0900_ai_ci는 대소문자를 구분하지 않는다)</code></pre>
+
+<p>상품의 <code>status</code>는 넣지 않았으므로 기본값 <code>'ON_SALE'</code>이 들어간다. K2는 재고가 0이지만 판매중 상태다. 화면은 재고가 0인 것을 보고 품절로 표시한다. 상품 등록 시각은 결과를 재현할 수 있도록 직접 넣었다. 실제 서비스라면 기본값 <code>CURRENT_TIMESTAMP</code>에 맡긴다.</p>
+
+<p>주문 생성이 이 쇼핑몰에서 가장 중요한 트랜잭션이다. 회원 1이 K1 한 개와 M1 두 개를 주문한다. 순서는 재고 차감 → 가격 확인 → 주문 저장 → 주문상품 저장이다. 재고 차감을 맨 앞에 두는 이유는 실패할 가능성이 가장 높은 단계를 먼저 해서, 실패하면 아무것도 넣지 않은 채 끝내기 위해서다.</p>
+
+<pre data-label="주문 생성 트랜잭션 (MySQL 8.4.13에서 실행)"><code class="language-sql">START TRANSACTION;
+
+-- 1. 재고 차감: 상품 번호 오름차순으로, 조건부로
+UPDATE product SET stock_quantity = stock_quantity - 1
+ WHERE product_id = 1 AND status = 'ON_SALE' AND stock_quantity >= 1;  -- 1 row affected (10 → 9)
+UPDATE product SET stock_quantity = stock_quantity - 2
+ WHERE product_id = 3 AND status = 'ON_SALE' AND stock_quantity >= 2;  -- 1 row affected (30 → 28)
+-- 영향받은 행이 0인 문장이 하나라도 있으면 여기서 ROLLBACK
+
+-- 2. 가격 확인 (두 행 모두 이 트랜잭션이 배타 잠금을 쥐고 있다)
+SELECT product_id, name, price FROM product WHERE product_id IN (1, 3);
+-- (1, '기계식 키보드 K1', 89000), (3, '무선 마우스 M1', 25000)
+-- 총액 = 89000 × 1 + 25000 × 2 = 139000
+
+-- 3. 주문 저장
+INSERT INTO orders (member_id, status, total_amount, receiver_name,
+                    receiver_phone, zipcode, address, ordered_at)
+VALUES (1, 'ORDERED', 139000, '김하나', '010-1111-2222',
+        '01234', '서울시 예시구 샘플로 1', '2026-11-10 14:00:00');
+SET @order_id = LAST_INSERT_ID();   -- 1
+
+-- 4. 주문상품 저장 (주문 당시 상품명과 단가를 기록)
+INSERT INTO order_item (order_id, product_id, product_name, order_price, quantity) VALUES
+  (@order_id, 1, '기계식 키보드 K1', 89000, 1),   -- order_item_id 1
+  (@order_id, 3, '무선 마우스 M1',   25000, 2);   -- order_item_id 2
+
+COMMIT;</code></pre>
+
+<p>한 줄씩 짚어 보자. 1단계의 <code>UPDATE</code>는 재고 확인과 차감을 한 문장에서 한다. <code>WHERE</code>에 <code>stock_quantity >= 1</code>이 있으므로 재고가 부족하면 조건에 맞는 행이 없어 아무것도 바뀌지 않고, 애플리케이션은 영향받은 행 수 0을 보고 주문을 중단한다. 이 문장은 기본 키 등호 검색이므로 InnoDB는 그 행 하나에 배타 잠금을 건다. 매뉴얼은 유일 인덱스로 유일한 행을 찾는 문장에는 인덱스 레코드 잠금만 필요하다고 설명한다. 이 잠금은 커밋까지 유지된다. 2단계에서 가격을 읽을 때 두 상품 행은 이 트랜잭션이 이미 잠근 행이므로, 그 사이 다른 트랜잭션이 가격을 바꿔 커밋하는 일은 일어날 수 없다. 그리고 같은 트랜잭션의 앞선 문장이 바꾼 행은 스냅숏과 상관없이 보인다.</p>
+
+<p>3단계 뒤의 <code>LAST_INSERT_ID()</code>는 이 연결이 마지막으로 생성한 자동 증가 값을 돌려준다. 매뉴얼은 이 값이 연결(connection)마다 따로 유지되어 다른 클라이언트가 값을 생성해도 영향을 받지 않는다고 설명한다. 다만 여러 행을 한 문장으로 넣으면 첫 행의 값만 돌려주고, 4단계의 <code>order_item</code> 삽입도 자동 증가 값을 생성하므로 그 뒤에는 값이 바뀐다. 그래서 주문 번호를 사용자 변수에 옮겨 두고 썼다. JDBC에서는 같은 일을 <code>Statement.RETURN_GENERATED_KEYS</code>로 생성된 키를 받아서 한다. 4단계에서 주문상품을 넣을 때 InnoDB는 외래 키 검사를 위해 부모인 주문 행과 상품 행에 공유 잠금을 건다. 매뉴얼에 따르면 외래 키 조건을 검사해야 하는 삽입·갱신·삭제는 검사하며 확인한 레코드에 공유 레코드 잠금을 건다. 상품 행은 이미 이 트랜잭션이 배타 잠금을 쥐고 있으므로 기다림 없이 지나간다.</p>
+
+<p>같은 방식으로 회원 2가 M1 한 개를 주문했다고 하자(주문 번호 2, 주문상품 번호 3, 총액 25,000원, 주문 일시 2026-11-11 09:30:00). M1의 재고는 28에서 27이 된다. 이번에는 회원 2가 재고 0인 K2를 주문하려 한다.</p>
+
+<pre data-label="재고 부족 (MySQL 8.4.13에서 실행)"><code class="language-sql">START TRANSACTION;
+UPDATE product SET stock_quantity = stock_quantity - 1
+ WHERE product_id = 2 AND status = 'ON_SALE' AND stock_quantity >= 1;  -- 0 rows affected
+ROLLBACK;
+
+-- 조건 없이 썼다면?
+UPDATE product SET stock_quantity = stock_quantity - 1 WHERE product_id = 2;
+-- ERROR 3819 (HY000): Check constraint 'chk_product_stock' is violated.   (0 - 1 = -1)</code></pre>
+
+<p>조건부 <code>UPDATE</code>가 0행을 바꾸고 끝났으므로 주문 행은 만들어지지 않았다. 아래쪽 문장은 애플리케이션이 조건을 빠뜨린 경우다. 이때는 <code>CHECK (stock_quantity >= 0)</code>이 마지막 방어선이 되어 음수 재고를 거부한다. 조건부 <code>UPDATE</code>가 정상 경로의 판단이라면, <code>CHECK</code>는 코드에 버그가 있어도 데이터가 망가지지 않게 하는 안전망이다. 둘은 역할이 다르므로 함께 둔다.</p>
+
+<h4>동시에 두 주문이 같은 재고를 노릴 때</h4>
+
+<p>조건부 <code>UPDATE</code>가 정말로 동시 주문에서도 재고를 지키는지 따라가 보자. 이 시나리오를 위 데이터에 이어서 실행하면 이후 결과가 달라지므로, 본문의 확인을 모두 마친 뒤(K1 재고 9) 두 세션으로 따로 실행해 보았다(MySQL 8.4.13). K1의 재고가 9개일 때 트랜잭션 T1은 6개, T2는 5개를 주문한다. 합하면 11개로 재고보다 많으므로 둘 중 하나는 실패해야 한다.</p>
+
+<pre class="diagram">시각  T1 (K1 6개 주문)                         T2 (K1 5개 주문)
+───  ─────────────────────────────────────   ─────────────────────────────────────
+ t1  UPDATE ... SET stock = stock - 6
+       WHERE product_id = 1 AND stock >= 6
+     → 행 1에 배타 잠금, 9 ≥ 6 참, 9 → 3
+ t2                                           UPDATE ... SET stock = stock - 5
+                                                WHERE product_id = 1 AND stock >= 5
+                                              → 행 1의 잠금을 기다린다
+ t3  INSERT orders, order_item
+ t4  COMMIT → 잠금 해제
+ t5                                           → 잠금 획득, 최신 커밋 버전(3)을 읽음
+                                                3 ≥ 5 거짓 → 0 rows affected
+ t6                                           ROLLBACK, "재고 부족" 응답
+───  최종 재고 3, 판매 6개. 합계가 맞는다.</pre>
+
+<p>실제로 실행할 때는 T1이 차감 뒤 커밋 전에 3초 머물도록 <code>DO SLEEP(3)</code>을 넣고, 1초 뒤 T2를 시작했다. T2의 <code>UPDATE</code>는 약 2초(1.96 sec) 기다린 뒤 <code>Query OK, 0 rows affected</code>, <code>Rows matched: 0  Changed: 0</code>으로 끝났고, T2를 롤백한 뒤 K1의 재고는 3이었다. 핵심은 t5다. T2의 <code>UPDATE</code>는 스냅숏을 읽지 않는다. 앞에서 본 것처럼 DML은 다른 트랜잭션이 커밋한 최신 버전 위에서 동작하므로, 잠금을 얻은 뒤 T1이 바꿔 놓은 3을 보고 조건을 다시 판단한다. 잠금을 얻을 때까지 T2가 기다리는 시간은 T1이 커밋할 때까지이고, 그 기다림이 <code>innodb_lock_wait_timeout</code>(기본 50초)을 넘으면 잠금 대기 시간 초과 오류로 끝난다. 그래서 재고를 잠근 트랜잭션은 짧게 유지해야 한다. 결제 승인처럼 외부 시스템을 기다리는 일을 이 트랜잭션 안에 넣으면, 인기 상품의 주문이 모두 그 시간만큼 줄을 선다.</p>
+
+<p>같은 일을 "읽고 판단하고 쓰는" 방식으로 하면 어떻게 될까. T1과 T2가 각각 <code>SELECT stock_quantity</code>로 9를 읽고, 애플리케이션에서 9 ≥ 6, 9 ≥ 5를 확인한 뒤 <code>SET stock_quantity = 3</code>과 <code>SET stock_quantity = 4</code>를 쓴다. 두 번째 쓰기는 첫 번째 쓰기를 기다렸다가 덮어쓰므로 최종 재고는 4가 되고, 11개가 팔렸는데 재고는 5개만 줄었다. 잃어버린 갱신이다. 이 방식을 쓰려면 처음 읽을 때 <code>SELECT ... FOR UPDATE</code>로 잠가야 한다. 조건부 <code>UPDATE</code>는 판단과 쓰기를 한 문장에 묶어 이 문제를 구조적으로 없앤다.</p>
+
+<x-visual id="db-design1-09-stock-lock-sequence" title="두 주문 트랜잭션이 같은 상품 행의 잠금을 두고 경쟁하는 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>T1이 재고 행을 잠그고 차감하는 동안 T2가 기다리고, T1 커밋 뒤 T2가 최신 값 3을 읽어 조건이 거짓이 되는 과정을 시간 순서로 보여 준다.</x-hint>
+<x-prompt>세로 생명선 세 개의 시퀀스 다이어그램: 왼쪽 "T1", 가운데 "product 행 1 (재고)", 오른쪽 "T2". 가운데 생명선 맨 위에 "재고 9". T1에서 가운데로 화살표 "UPDATE 재고-6 (재고 ≥ 6)", 가운데 생명선에 자물쇠 아이콘과 "T1 잠금", 값 "9 → 3". T2에서 가운데로 화살표 "UPDATE 재고-5 (재고 ≥ 5)"가 자물쇠 앞에서 멈추고 모래시계 아이콘과 라벨 "대기". T1에서 "COMMIT" 화살표, 자물쇠가 열리는 아이콘. 이어서 T2 쪽에 화살표 "최신 값 3 읽기", 라벨 "3 ≥ 5 거짓 → 0행". T2 아래에 "ROLLBACK". 맨 아래 가운데 "최종 재고 3". 배경 흰색, T1은 파란색, T2는 주황색.</x-prompt>
+<x-caption>조건부 UPDATE는 잠금을 얻은 뒤 최신 커밋 값으로 조건을 다시 판단하므로, 동시 주문이 재고를 초과해 차감하지 못한다.</x-caption>
+</x-visual>
+
+<h4>잠금 순서와 교착 상태</h4>
+
+<p>주문 생성의 1단계에 "상품 번호 오름차순으로"라는 조건을 붙인 이유가 여기 있다. T1이 K1(1번)과 M1(3번)을, T2가 M1과 K1을 주문하는데 각자 장바구니에 담긴 순서대로 재고를 차감한다고 하자. T1이 1번 행을 잠그고, T2가 3번 행을 잠근다. 이어서 T1은 3번 행을, T2는 1번 행을 원한다. 서로 상대가 쥔 잠금을 기다리므로 어느 쪽도 진행할 수 없다. 교착 상태(deadlock)다. InnoDB는 이를 감지해 한쪽 트랜잭션을 롤백시키고, 롤백된 쪽은 교착 상태 오류를 받는다. MySQL 8.4.13에서 두 세션으로 이 순서를 재현하면, 두 번째 잠금을 요청한 T2가 <code>ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction</code>을 받고, T1의 3번 행 <code>UPDATE</code>는 잠깐(0.35 sec) 기다린 뒤 성공한다.</p>
+
+<p>두 트랜잭션이 모두 번호 오름차순으로 잠근다면 이 순환이 생길 수 없다. T2도 1번 행부터 잠그려 하므로, T1이 1번을 쥐고 있는 동안 T2는 아무것도 쥐지 않은 채 1번 앞에서 기다린다. T1은 3번까지 잠그고 커밋하고, 그다음 T2가 진행한다. MySQL 매뉴얼도 한 트랜잭션에서 여러 테이블이나 같은 테이블의 여러 행을 바꿀 때 매번 같은 순서로 하면 트랜잭션들이 잘 정의된 대기열을 이루어 교착 상태가 생기지 않는다고 권한다. 같은 절은 교착 상태 때문에 실패한 트랜잭션은 다시 실행할 준비를 해 두라고도 말한다. 순서를 지켜도 다른 경로의 잠금과 얽힐 수 있으므로, 재시도는 순서 규칙과 별개로 필요한 안전장치다.</p>
+
+<h4>자동 증가 번호의 빈틈</h4>
+
+<p>주문 저장(3단계)까지 성공한 뒤 4단계에서 실패하는 경우를 생각해 보자. 예를 들어 버그로 수량 0이 넘어와 <code>chk_order_item_quantity</code>에 걸렸고, 애플리케이션이 트랜잭션을 롤백했다. 주문 행은 사라지지만 그 행에 붙었던 주문 번호는 돌아오지 않는다. InnoDB 매뉴얼은 자동 증가 값을 생성한 트랜잭션이 롤백되면 그 값은 "잃어버린" 것이 되며 다시 쓰이지 않고, 그래서 자동 증가 열의 값에 빈틈이 생길 수 있다고 설명한다. 다음 주문은 그다음 번호를 받는다. 따라서 주문 번호가 3, 4, 6으로 이어진다고 해서 5번 주문이 지워졌다고 판단하면 안 되고, 주문 번호의 최댓값으로 주문 건수를 세어서도 안 된다. 대리 키는 행을 가리키는 이름일 뿐, 순번이나 개수가 아니다.</p>
+
+<h3>쇼핑몰 기능 확인 2: 조회, 리뷰, 취소, 집계, 정합성 점검</h3>
+
+<p>주문 1이 배송을 마쳤다고 하자. 상태 전이도 조건부 <code>UPDATE</code>로 한다. <code>WHERE</code>에 현재 상태를 넣어 두면 허용되지 않은 전이(예: 취소된 주문을 배송완료로)는 0행으로 끝난다.</p>
+
+<pre data-label="배송 완료와 리뷰 작성 (MySQL 8.4.13에서 실행)"><code class="language-sql">UPDATE orders SET status = 'DELIVERED'
+ WHERE order_id = 1 AND status IN ('ORDERED', 'SHIPPING');   -- 1 row affected
+
+-- 리뷰 자격 확인 (애플리케이션이 실행)
+SELECT o.member_id, o.status, oi.product_id
+FROM order_item oi
+JOIN orders o ON o.order_id = oi.order_id
+WHERE oi.order_item_id = 1;
+-- (1, 'DELIVERED', 1) → 작성자가 회원 1이고 배송 완료이므로 작성 가능
+
+START TRANSACTION;
+INSERT INTO review (order_item_id, product_id, rating, content)
+VALUES (1, 1, 5, '키감이 좋고 소음이 적다');                -- review_id 1
+UPDATE product
+   SET review_count = review_count + 1,
+       rating_sum   = rating_sum + 5
+ WHERE product_id = 1;                                    -- 0, 0 → 1, 5
+COMMIT;
+
+-- 제약 확인 1: 주문상품 2(상품 3)에 상품 1의 리뷰를 달려는 버그
+INSERT INTO review (order_item_id, product_id, rating, content)
+VALUES (2, 1, 4, '...');
+-- ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint fails
+--   (`shop`.`review`, CONSTRAINT `fk_review_order_item` FOREIGN KEY (`order_item_id`, `product_id`)
+--    REFERENCES `order_item` (`order_item_id`, `product_id`))
+--   (주문상품 테이블에 (2, 1) 쌍이 없다)
+
+-- 제약 확인 2: 같은 주문상품에 두 번째 리뷰
+INSERT INTO review (order_item_id, product_id, rating, content)
+VALUES (1, 1, 3, '...');
+-- ERROR 1062 (23000): Duplicate entry '1-1' for key 'review.uk_review_order_item'</code></pre>
+
+<p>리뷰 자격 확인 쿼리는 리뷰의 작성자가 그 주문의 회원인지와 배송 완료 여부를 본다. 이 두 규칙은 앞 절에서 본 것처럼 선언적 제약으로 표현되지 않으므로 애플리케이션이 확인한다. 반면 상품 번호의 일치와 주문상품당 리뷰 하나는 데이터베이스가 지킨다. 제약 확인 두 개가 그것을 보여 준다. 엄밀히 말하면 자격 확인과 리뷰 삽입 사이에 주문 상태가 바뀔 수 있다. 이 쇼핑몰에서는 배송 완료 이후로 가는 전이가 없으므로 문제가 되지 않지만, "반품" 같은 상태가 생기면 확인할 때 주문 행을 <code>FOR SHARE</code>나 <code>FOR UPDATE</code>로 잠그는 것을 검토해야 한다.</p>
+
+<p>이제 화면 쿼리를 실행해 보자. Q2(카테고리 2의 상품 목록)는 다음과 같다.</p>
+
+<pre data-label="Q2. 카테고리별 상품 목록"><code class="language-sql">SELECT product_id, name, price, stock_quantity, review_count, rating_sum
+FROM product
+WHERE category_id = 2 AND status = 'ON_SALE'
+ORDER BY created_at DESC, product_id DESC
+LIMIT 20;</code></pre>
+
+<div class="table-wrap"><table><thead><tr><th>product_id</th><th>name</th><th>price</th><th>stock_quantity</th><th>review_count</th><th>rating_sum</th></tr></thead><tbody>
+<tr><td>2</td><td>무선 키보드 K2</td><td>59000</td><td>0</td><td>0</td><td>0</td></tr>
+<tr><td>1</td><td>기계식 키보드 K1</td><td>89000</td><td>9</td><td>1</td><td>5</td></tr>
+</tbody></table></div>
+
+<p>K2가 먼저 나오는 것은 등록 시각이 더 늦기 때문이다. 화면은 K2의 재고 0을 보고 "품절"을, K1의 5 ÷ 1을 보고 평균 5.0을 표시한다. 이 쿼리의 <code>WHERE</code>는 인덱스 <code>(category_id, status, created_at)</code>의 앞 두 열에 등호이고, <code>ORDER BY</code>는 셋째 열과 확장된 기본 키이므로, EXPLAIN에서 확인할 것은 이 인덱스가 선택되었는지(key 열)와 Extra에 <code>Using filesort</code>가 없는지다. MySQL 8.4.13에서 상품이 세 행뿐인 지금 EXPLAIN을 실행해 보면 type <code>ref</code>, key <code>idx_product_category_status_created</code>, ref <code>const,const</code>, Extra <code>Backward index scan</code>으로, 이 인덱스를 거꾸로 읽고 filesort가 없다(8.0.46도 같다). 다만 행이 적을 때의 계획은 통계에 따라 쉽게 바뀌므로, 인덱스 설계의 효과는 데이터가 쌓인 뒤의 실행 계획으로 확인해야 한다.</p>
+
+<p>그래서 기능 확인을 모두 마친 뒤 같은 테이블에 데이터를 재귀 CTE로 늘려 실행 계획을 확인했다. 회원 1,000명, 상품 20,003개(카테고리 2와 3에 번갈아 넣고 열 개 중 하나는 판매중지, 등록 시각은 30분 간격), 주문 50,002건(회원 1의 주문 101건), 주문상품 50,003건, 리뷰 25,001건이고, <code>ANALYZE TABLE</code>로 통계를 갱신했다. 아래 표는 MySQL 8.4.13의 EXPLAIN에서 주요 열만 옮긴 것이다. rows 같은 추정치는 실행 환경과 통계에 따라 달라진다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>쿼리</th><th>type</th><th>key</th><th>rows</th><th>Extra</th></tr></thead><tbody>
+<tr><td>Q2 (카테고리 2, 판매중, 최신순 20개)</td><td>ref</td><td>idx_product_category_status_created</td><td>10010</td><td>Backward index scan</td></tr>
+<tr><td>Q2를 <code>category_id IN (2, 3)</code>으로</td><td>ALL</td><td>NULL</td><td>20021</td><td>Using where; Using filesort</td></tr>
+<tr><td>Q2의 키셋 페이지네이션 조건</td><td>range</td><td>idx_product_category_status_created</td><td>2900</td><td>Using index condition; Backward index scan</td></tr>
+<tr><td>Q5 (status, total_amount까지 읽음)</td><td>ref</td><td>idx_orders_member_ordered</td><td>101</td><td>Backward index scan</td></tr>
+<tr><td>Q5를 <code>SELECT order_id, ordered_at</code>으로</td><td>ref</td><td>idx_orders_member_ordered</td><td>101</td><td>Backward index scan; Using index</td></tr>
+<tr><td>Q4의 첫 테이블 r</td><td>ref</td><td>idx_review_product_created</td><td>1</td><td>Backward index scan</td></tr>
+<tr><td>Q4의 oi, o, m</td><td>eq_ref</td><td>PRIMARY</td><td>1</td><td>NULL</td></tr>
+<tr><td>Q7 (이틀 구간)</td><td>range</td><td>idx_orders_ordered</td><td>288</td><td>Using index condition; Using where; Using temporary; Using filesort</td></tr>
+<tr><td><code>WHERE DATE(ordered_at) = ...</code></td><td>index</td><td>idx_orders_ordered</td><td>49773</td><td>Using where; Using index</td></tr>
+</tbody></table></div>
+
+<p>Q2와 Q5는 설계대로 인덱스를 거꾸로 읽고 filesort가 없으며, Q5의 SELECT 목록을 인덱스 안의 열로 줄이면 <code>Using index</code>가 붙는다. <code>IN (2, 3)</code>으로 바꾸면 <code>Using filesort</code>가 생긴다. 이 데이터에서는 두 카테고리가 상품 전체라 옵티마이저가 인덱스 대신 테이블 전체 읽기를 골랐지만, 어느 쪽이든 따로 정렬하는 단계가 필요하다는 점은 같다. 함수로 감싼 <code>DATE(ordered_at)</code> 조건은 구간 검색(range)이 아니라 인덱스 전체를 훑는 <code>index</code>가 된다. LIMIT의 조기 종료는 EXPLAIN ANALYZE의 실제 행 수로 보인다.</p>
+
+<pre data-label="EXPLAIN ANALYZE (MySQL 8.4.13에서 실행, 위의 늘린 데이터)"><code class="language-text">-- Q5
+-> Limit: 10 row(s)  (cost=35.4 rows=10) (actual time=0.141..0.153 rows=10 loops=1)
+    -> Index lookup on orders using idx_orders_member_ordered (member_id=1) (reverse)  (cost=35.4 rows=101) (actual time=0.135..0.147 rows=10 loops=1)
+
+-- Q2
+-> Limit: 20 row(s)  (cost=1122 rows=20) (actual time=0.266..0.274 rows=20 loops=1)
+    -> Index lookup on product using idx_product_category_status_created (category_id=2, status='ON_SALE') (reverse)  (cost=1122 rows=10010) (actual time=0.265..0.273 rows=20 loops=1)
+
+-- Q2를 category_id IN (2, 3)으로
+-> Limit: 20 row(s)  (cost=2042 rows=20) (actual time=8.77..8.77 rows=20 loops=1)
+    -> Sort: product.created_at DESC, limit input to 20 row(s) per chunk  (cost=2042 rows=20021) (actual time=8.77..8.77 rows=20 loops=1)
+        -> Filter: ((product.`status` = 'ON_SALE') and (product.category_id in (2,3)))  (cost=2042 rows=20021) (actual time=0.0379..6.51 rows=18003 loops=1)
+            -> Table scan on product  (cost=2042 rows=20021) (actual time=0.0331..4.28 rows=20003 loops=1)</code></pre>
+
+<p>Q5는 회원 1의 주문 101건 가운데 인덱스 항목 10개만 읽고 멈췄고(<code>rows=10</code>), Q2도 판매중 상품 약 1만 개 가운데 20개만 읽었다. 반면 <code>IN (2, 3)</code>은 판매중 상품 18,003행을 모두 모은 뒤 정렬해 20개를 골랐다.</p>
+
+<pre data-label="Q4. 상품 리뷰 목록과 작성자"><code class="language-sql">SELECT r.review_id, r.rating, r.content, r.created_at, m.name AS writer
+FROM review r
+JOIN order_item oi ON oi.order_item_id = r.order_item_id
+JOIN orders o      ON o.order_id       = oi.order_id
+JOIN member m      ON m.member_id      = o.member_id
+WHERE r.product_id = 1
+ORDER BY r.created_at DESC, r.review_id DESC
+LIMIT 20;
+-- (1, 5, '키감이 좋고 소음이 적다', <작성 시각: 실행마다 다르다>, '김하나')</code></pre>
+
+<p>Q4는 역정규화의 효과가 드러나는 쿼리다. 필터와 정렬이 모두 리뷰 테이블에 있으므로, 옵티마이저가 리뷰를 첫 테이블로 읽는 계획을 고르면 <code>idx_review_product_created</code>를 역방향으로 읽으며 20건에서 멈출 수 있다. 매뉴얼의 ORDER BY 최적화 절은 조인에서 정렬 열이 모두 첫 번째(상수가 아닌) 테이블에 있어야 인덱스로 정렬을 해결할 수 있다고 설명하는데, 이 쿼리가 그 조건을 만족한다. 나머지 세 조인은 모두 기본 키 등호 조인이라 리뷰 한 건마다 B+Tree를 한 번씩 내려간다. 작성자 이름을 리뷰에 복사하지 않은 판단(후보 4와 같은 이유)이 여기서 비용이 크지 않음을 확인할 수 있다.</p>
+
+<p>이번에는 회원 2가 주문 2를 취소한다. 취소도 조건부 상태 전이로 시작한다. 본인의 주문이고 아직 주문완료 상태일 때만 1행이 바뀐다. 그다음 주문상품을 상품 번호 순으로 읽어 재고를 되돌린다.</p>
+
+<pre data-label="주문 취소 (MySQL 8.4.13에서 실행)"><code class="language-sql">START TRANSACTION;
+UPDATE orders SET status = 'CANCELED'
+ WHERE order_id = 2 AND member_id = 2 AND status = 'ORDERED';   -- 1 row affected
+-- 0이면 여기서 ROLLBACK (이미 취소됐거나, 배송이 시작됐거나, 남의 주문)
+
+SELECT product_id, quantity FROM order_item
+ WHERE order_id = 2 ORDER BY product_id;                         -- (3, 1)
+UPDATE product SET stock_quantity = stock_quantity + 1
+ WHERE product_id = 3;                                           -- 27 → 28
+COMMIT;</code></pre>
+
+<p>재고를 되돌리는 부분은 <code>UPDATE product p JOIN order_item oi ON ... SET p.stock_quantity = p.stock_quantity + oi.quantity WHERE oi.order_id = 2</code>처럼 다중 테이블 <code>UPDATE</code> 한 문장으로도 쓸 수 있다. 문장은 짧아지지만, 상품 행을 잠그는 순서를 애플리케이션이 아니라 실행 계획이 정하게 된다. 주문 생성이 상품 번호 오름차순으로 잠그기로 했으므로, 취소도 같은 순서를 명시적으로 지키는 쪽을 택했다. 첫 문장의 상태 조건도 중요하다. 같은 취소 요청이 두 번 들어와도 두 번째 요청은 상태가 이미 <code>CANCELED</code>라 0행이 되어 멈추므로, 재고가 두 번 늘어나지 않는다. 주문 총액은 취소해도 그대로 둔다. 주문상품이 바뀌지 않았으므로 점검 쿼리 1의 등식은 계속 성립한다.</p>
+
+<pre data-label="Q5와 Q7 (MySQL 8.4.13에서 실행)"><code class="language-sql">-- Q5. 내 주문 목록 (회원 1)
+SELECT order_id, status, total_amount, ordered_at
+FROM orders WHERE member_id = 1
+ORDER BY ordered_at DESC, order_id DESC LIMIT 10;
+-- (1, 'DELIVERED', 139000, '2026-11-10 14:00:00')
+
+-- Q7. 일별 매출 (취소 제외)
+SELECT DATE(ordered_at) AS order_date,
+       COUNT(*)          AS order_count,
+       SUM(total_amount) AS sales
+FROM orders
+WHERE ordered_at >= '2026-11-10' AND ordered_at < '2026-11-12'
+  AND status <> 'CANCELED'
+GROUP BY DATE(ordered_at)
+ORDER BY order_date;
+-- ('2026-11-10', 1, 139000)</code></pre>
+
+<p>Q7의 결과가 한 행뿐인 데 주목하자. 11월 11일에는 주문 2가 있었지만 취소되었으므로 걸러졌고, 남은 주문이 없는 날짜는 결과에 행 자체가 나오지 않는다. "매출 0원인 날"까지 보여 줘야 한다면 날짜 목록을 따로 만들어 외부 조인해야 한다. 매출 합계에 역정규화한 <code>total_amount</code>를 쓰므로 주문상품을 읽지 않는다. <code>SUM</code>은 정수 인자에 대해 <code>DECIMAL</code>을 돌려주므로 합계가 <code>INT</code>의 범위를 넘어도 결과가 넘치지 않는다.</p>
+
+<p>Q7의 날짜 조건을 <code>WHERE DATE(ordered_at) = '2026-11-10'</code>으로 쓰지 않은 이유가 있다. 인덱스 <code>idx_orders_ordered</code>에는 <code>ordered_at</code>의 값이 정렬되어 있지 <code>DATE(ordered_at)</code>의 값이 정렬되어 있는 것이 아니므로, 열을 함수로 감싸면 인덱스로 구간을 찾을 수 없다. 반쯤 열린 구간 <code>ordered_at >= 시작 AND ordered_at < 다음날</code>로 쓰면 인덱스 범위 검색이 된다. MySQL 8.0.13부터는 식의 값을 인덱싱하는 함수 기반 키 파트(functional key part)를 만들 수 있지만, 매뉴얼의 예처럼 조건에 인덱스와 같은 식을 써야 쓰이므로, 구간으로 쓸 수 있는 조건이라면 구간으로 쓰는 편이 단순하다. 기간이 길어 범위에 걸리는 주문이 많아지면 행마다 <code>status</code>와 <code>total_amount</code>를 읽으러 클러스터형 인덱스를 찾아가는 비용이 커지므로, 매뉴얼의 설명대로 옵티마이저는 인덱스 범위 검색이 테이블 전체 읽기보다 싸지 않다고 보면 전체 읽기를 고른다. 관리자 화면이 느려지면 <code>(ordered_at, status, total_amount)</code> 커버링 인덱스를 검토할 수 있지만, 주문 삽입마다 그 비용을 치른다는 점을 함께 따진다.</p>
+
+<p>마지막으로 역정규화 점검 쿼리 두 개를 실행한다. 점검 쿼리 1은 주문 1(139,000 = 89,000 × 1 + 25,000 × 2)과 주문 2(25,000 = 25,000 × 1)가 모두 일치하므로 빈 결과를 돌려준다. 점검 쿼리 2는 상품 1(리뷰 1개, 합계 5), 상품 2와 3(리뷰 0개, 합계 0)이 모두 일치하므로 역시 빈 결과다. 상품 2, 3은 리뷰가 없어 외부 조인의 <code>SUM(r.rating)</code>이 NULL이 되는데, <code>COALESCE</code>로 0으로 바꿨기 때문에 저장된 0과 비교할 수 있다. <code>COALESCE</code>를 빠뜨리면 <code>0 <> NULL</code>이 UNKNOWN이 되어 어긋남을 놓치는 점검 쿼리가 된다.</p>
+
+<pre data-label="삭제 시도 (MySQL 8.4.13에서 실행, 8.0.46도 같은 문구)"><code class="language-sql">DELETE FROM product WHERE product_id = 1;
+-- ERROR 1451 (23000): Cannot delete or update a parent row: a foreign key constraint fails
+--   (`shop`.`order_item`, CONSTRAINT `fk_order_item_product` FOREIGN KEY (`product_id`)
+--    REFERENCES `product` (`product_id`))
+--   (order_item이 상품 1을 참조한다)
+
+DELETE FROM member WHERE member_id = 2;
+-- ERROR 1451 (23000): Cannot delete or update a parent row: a foreign key constraint fails
+--   (`shop`.`orders`, CONSTRAINT `fk_orders_member` FOREIGN KEY (`member_id`)
+--    REFERENCES `member` (`member_id`))
+--   (orders가 회원 2를 참조한다)</code></pre>
+
+<p>삭제 시도는 외래 키의 기본 동작을 보여 준다. <code>ON DELETE</code>를 적지 않으면 기본은 <code>NO ACTION</code>이고, InnoDB에서는 <code>RESTRICT</code>와 같아 참조하는 자식 행이 있으면 부모 삭제가 즉시 거부된다. 상품 1을 지우려 할 때 InnoDB는 <code>idx_order_item_product</code>로 주문상품 중 상품 1을 참조하는 행을 찾는다. 외래 키 열에 인덱스를 요구하는 이유가 바로 이 검사다. 주문 기록이 있는 상품은 지우는 대신 <code>status</code>를 <code>'STOPPED'</code>로 바꿔 판매를 멈춘다. 회원 탈퇴는 이 모델에 아직 없는 기능이다. 주문 기록을 남기면서 회원 정보를 어떻게 처리할지는 별도의 설계 주제이며, 논리적 삭제(soft delete)는 로드맵의 다음 권인 데이터베이스 설계 2편의 커리큘럼에 들어 있는 주제다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>확인 항목</th><th>결과</th><th>지킨 장치</th></tr></thead><tbody>
+<tr><td>대소문자만 다른 이메일로 가입</td><td>거부</td><td>UNIQUE + ai_ci 콜레이션</td></tr>
+<tr><td>재고보다 많은 주문</td><td>0행 → 롤백</td><td>조건부 UPDATE (CHECK가 안전망)</td></tr>
+<tr><td>동시 주문 합계가 재고 초과</td><td>한쪽만 성공</td><td>행 배타 잠금 + 최신 버전 재판단</td></tr>
+<tr><td>다른 상품 번호로 리뷰</td><td>거부</td><td>복합 외래 키</td></tr>
+<tr><td>같은 주문상품에 리뷰 두 번</td><td>거부</td><td>UNIQUE (order_item_id, product_id)</td></tr>
+<tr><td>중복 취소</td><td>두 번째는 0행</td><td>상태 조건을 건 UPDATE</td></tr>
+<tr><td>주문 기록이 있는 상품 삭제</td><td>거부</td><td>외래 키 (기본 NO ACTION)</td></tr>
+<tr><td>총액·리뷰 카운터 일치</td><td>점검 쿼리 빈 결과</td><td>같은 트랜잭션, 원자적 증가</td></tr>
+</tbody></table></div>
+
+<p>모든 확인이 끝난 뒤의 상태를 정리하면, 재고는 K1 9개, K2 0개, M1 28개다. M1은 30개에서 주문 1로 2개, 주문 2로 1개가 줄었다가 취소로 1개가 돌아왔다. 주문은 두 건(1번 배송완료 139,000원, 2번 취소 25,000원), 주문상품은 세 건, 리뷰는 한 건이다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<p><b>"WHERE에 나오는 열마다 인덱스를 하나씩 만들면 된다."</b> 단일 열 인덱스 여러 개는 복합 인덱스 하나를 대신하지 못한다. <code>member_id</code> 인덱스와 <code>ordered_at</code> 인덱스가 따로 있으면, 회원 1의 주문을 최신순으로 10건 가져오는 쿼리는 한 인덱스로 회원의 주문을 모두 찾은 뒤 정렬하거나, 다른 인덱스로 최신순으로 읽으며 회원을 걸러야 한다. 등호 조건과 정렬을 한 번에 처리하는 것은 두 열이 올바른 순서로 들어간 복합 인덱스뿐이다.</p>
+
+<p><b>"선택도가 낮은 열은 인덱스에 넣으면 안 된다."</b> 단독 인덱스라면 대체로 맞다. 그러나 복합 인덱스에서 등호 조건으로 쓰이는 열은 선택도가 낮아도 구간을 좁히고, 뒤에 오는 정렬 열의 순서를 살린다. Q2의 <code>status</code>가 그 예다. 넣을지 말지는 그 값으로 걸러지는 행이 얼마나 되는지로 판단한다.</p>
+
+<p><b>"역정규화는 조인을 없애는 것이다."</b> 기본 키로 몇 건을 찾는 조인은 싸다. 역정규화가 큰 효과를 내는 곳은 필터와 정렬이 다른 테이블에 흩어져 있어 LIMIT이 일찍 멈추지 못하는 쿼리, 그리고 큰 범위를 집계하는 쿼리다. 조인을 없애려고 바뀌는 값을 복사하면 이득보다 지키는 비용이 크다.</p>
+
+<p><b>"주문상품의 상품명과 단가는 중복이니 정규화해야 한다."</b> 시점이 다른 사실이다. 함수 종속성을 따져 보면 결정자가 다르다. 이것을 지우면 상품 가격을 바꾸는 순간 과거 주문의 금액이 바뀐다.</p>
+
+<p><b>"외래 키는 성능 때문에 빼는 것이 낫다."</b> 외래 키에는 비용이 있다. 자식 열에 인덱스가 필요하고, 자식 행을 넣을 때 부모 행에 공유 잠금이 걸리며, 부모를 지울 때 자식을 찾아야 한다. 그러나 그 대가로 고아 행이 생기지 않고, 복사한 값의 일치를 강제할 수 있고, 자동 생성 ERD에 관계가 나타난다. 빼기로 한다면 이 세 가지를 무엇으로 대신할지를 함께 정해야 한다. 비용만 보고 빼면 보장도 함께 사라진다.</p>
+
+<p><b>"자동 생성한 ERD가 곧 설계 문서다."</b> 자동 생성 ERD는 데이터베이스가 강제하는 것만 보여 준다. 최소 참여 1, 상태 전이 규칙, 파생 값의 등식은 그림에 없다. 설계 문서는 ERD와 정의서에 "애플리케이션이 지키는 규칙 목록"을 더한 것이다.</p>
+
+<p><b>"주문 번호에 빈틈이 있으면 데이터가 지워진 것이다."</b> 롤백된 트랜잭션이 받은 자동 증가 값은 다시 쓰이지 않는다. 빈틈은 정상 동작이다. 건수는 <code>COUNT(*)</code>로 센다.</p>
+
+<h3>정리: 물리적 모델링 실습의 순서</h3>
+
+<p>이 회차에서 한 일을 작업 순서로 다시 놓으면 다음과 같다. 순서 자체가 하나의 방법론이다. 접근 경로를 모르고 인덱스를 정할 수 없고, 인덱스를 정하지 않고 역정규화의 이득을 평가할 수 없으며, 결정이 끝나지 않으면 정의서와 DDL을 쓸 수 없다. 그리고 만든 뒤에는 거꾸로 읽어 설계와 대조하고, 데이터로 확인한다.</p>
+
+<figure class="flow-figure"><figcaption>물리적 모델링 실습의 흐름</figcaption><ol class="flow">
+<li><strong>요구 사항과 논리 모델 재정리</strong><span>엔티티와 관계를 확정하고, 저장하지 않을 파생 값(품절)과 시점이 다른 사실(주문 당시 가격)을 구별한다</span></li>
+<li><strong>접근 경로 목록</strong><span>화면과 처리마다 WHERE, ORDER BY, LIMIT, SELECT 열과 빈도를 적는다</span></li>
+<li><strong>인덱스 설계</strong><span>등호 열 → 정렬 열 순서의 복합 인덱스, 기본 키 확장 활용, 외래 키 인덱스 겸용, 중복 인덱스 제거</span></li>
+<li><strong>역정규화</strong><span>바뀌지 않는 값인가, 필터와 정렬을 모으는가로 평가하고, 지키는 장치와 점검 쿼리를 함께 정한다</span></li>
+<li><strong>테이블 정의서와 DDL</strong><span>COMMENT를 원본으로 삼아 정의서를 카탈로그에서 생성하고, 부모부터 테이블을 만든다</span></li>
+<li><strong>ERD 역생성과 대조</strong><span>KEY_COLUMN_USAGE로 관계를 읽어 설계와 비교하고, 그림에 없는 규칙을 목록으로 남긴다</span></li>
+<li><strong>기능 확인</strong><span>트랜잭션과 제약, 동시성, 인덱스, 점검 쿼리를 실제 데이터로 검증한다</span></li>
+</ol></figure>
+
+<p>이 회차로 이 권이 끝난다. 01회에서 "스키마는 가장 오래 사는 코드"라고 했다. 이번 실습의 DDL도 그렇다. 애플리케이션 코드는 몇 번이고 다시 쓰이겠지만, 여기서 정한 키와 제약과 인덱스는 데이터가 쌓이는 순간부터 바꾸기 어려워진다. 그래서 물리 설계의 결정에는 언제나 근거를 남긴다. 어떤 쿼리를 위한 인덱스인가, 어떤 화면을 위한 역정규화이고 무엇으로 지키는가, 어떤 규칙이 데이터베이스 밖에 있는가. 그 근거가 정의서와 DDL 주석에 남아 있으면, 요구 사항이 바뀔 때 무엇을 다시 판단해야 하는지 알 수 있다. 공통 코드, 계층 구조, 변경 이력, 통계 테이블처럼 실무에서 반복해서 만나는 설계 패턴은 다음 권인 데이터베이스 설계 2편의 주제다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>접근 경로 목록</dt><dd>화면과 처리마다 찾는 조건, 정렬, 건수, 읽는 열, 빈도를 적은 목록. 인덱스와 역정규화는 이 목록에서 나온다.</dd>
+<dt>복합 인덱스의 열 순서</dt><dd>등호 조건 열을 앞에, 정렬 열을 뒤에 둔다. 왼쪽 접두사만 검색에 쓰이고, 앞 열이 범위 조건이거나 IN 목록이면 뒤 열의 순서로 정렬을 대신할 수 없다.</dd>
+<dt>인덱스 확장과 커버링</dt><dd>InnoDB 보조 인덱스의 항목에는 기본 키가 들어 있어, 옵티마이저는 인덱스를 (인덱스 열, 기본 키)로 보고 정렬의 동률 처리와 커버링에 쓴다.</dd>
+<dt>외래 키 인덱스</dt><dd>MySQL은 부모 삭제·변경 때 자식을 테이블 전체 읽기 없이 찾도록 외래 키 열이 맨 앞에 오는 인덱스를 요구한다. 외래 키 열로 시작하는 복합 인덱스가 이 역할을 겸한다.</dd>
+<dt>역정규화 평가 기준</dt><dd>복사하는 값이 바뀌지 않는가, 필터와 정렬을 한 테이블에 모아 인덱스 하나로 끝내게 하는가. 기본 키 조인만 없애는 역정규화는 이득이 작다.</dd>
+<dt>복합 외래 키로 복사본 지키기</dt><dd>복사한 열을 원본 키와 묶어 부모의 유일 인덱스를 참조하게 하면, 복사본과 원본의 일치를 데이터베이스가 강제한다.</dd>
+<dt>원자적 증가와 점검 쿼리</dt><dd>바뀌는 파생 값은 원본 변경과 같은 트랜잭션에서 UPDATE 안의 증가식으로 고치고, 원본에서 다시 계산해 비교하는 점검 쿼리를 둔다.</dd>
+<dt>조건부 UPDATE</dt><dd>판단 조건을 WHERE에 넣어 판단과 쓰기를 한 문장으로 묶는다. 잠금을 얻은 뒤 최신 커밋 값으로 조건을 다시 판단하므로 재고 초과 차감과 중복 상태 전이를 막는다.</dd>
+<dt>ERD 리버스 엔지니어링</dt><dd>도구는 INFORMATION_SCHEMA의 외래 키·NULL 허용·유일 인덱스 정보로 선과 기호를 추론한다. 카탈로그에 없는 규칙은 그려지지 않는다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 인덱스 설계가 틀어지는 가장 흔한 경로는 접근 경로 목록이 시간이 지나며 바뀌는데 인덱스는 그대로인 경우다. 출시할 때는 없던 관리자 검색 화면, 엑셀 내려받기, 배치 집계가 하나씩 늘어나고, 각각이 급하게 인덱스를 하나씩 추가한다. 몇 년 뒤에는 쓰기마다 열 개 가까운 B+Tree를 고치면서도 정작 느린 쿼리는 여전히 느리다. 주기적으로 실제 실행되는 쿼리를 모아 접근 경로 목록을 갱신하고, <code>sys.schema_redundant_indexes</code>로 겹치는 인덱스를 찾고, 지울 후보는 보이지 않는 인덱스로 바꿔 한동안 지켜본 뒤 지우는 절차가 안전하다. 새 인덱스를 추가할 때는 그 인덱스가 외래 키 인덱스를 대신할 수 있는지, 기존 인덱스의 왼쪽 접두사와 겹치는지를 먼저 본다.</p>
+<p>역정규화의 판단은 업무 규칙에 묶여 있다. 이 실습에서 주문 총액이 싼 역정규화였던 것은 "주문상품은 주문 후 바뀌지 않는다"는 규칙 때문이었다. 부분 취소나 수량 변경 기능이 추가되는 순간 총액은 바뀌는 값이 되고, 주문상품을 고치는 모든 경로에서 총액을 함께 고쳐야 한다. 기능 기획을 검토할 때 "이 기능이 기존에 바뀌지 않던 값을 바뀌게 만드는가"를 묻고, 그렇다면 그 값을 복사해 둔 곳을 정의서의 [역정규화] 표시로 찾아 함께 고쳐야 한다. 정의서에 역정규화 표시와 점검 쿼리를 남겨 두는 이유가 여기 있다.</p>
+<p>동시성 문제는 테스트 환경에서는 거의 드러나지 않는다. 한 사람이 한 번씩 클릭하는 테스트에서는 "읽고 판단하고 쓰는" 재고 차감도 잘 동작한다. 문제는 인기 상품의 할인 행사처럼 같은 행에 요청이 몰릴 때 나타나고, 그때는 재고가 음수가 되거나(CHECK가 없다면) 판매 수량과 재고 감소량이 어긋난다. 같은 행에 몰리는 경합은 잠금 대기 시간으로도 나타난다. 재고 행을 잠근 트랜잭션 안에 외부 결제 호출이나 무거운 조회를 넣지 않고, 잠그는 순서를 상품 번호 순으로 통일하고, 교착 상태로 롤백된 트랜잭션을 재시도하는 것이 기본이다. 리뷰 카운터처럼 같은 행을 고치는 다른 기능이 있다면 그 열을 별도 테이블로 분리하는 것도 경합을 줄이는 물리 설계의 선택이다.</p>
+</x-review>
+
+<x-practice>
+<li>관리자 화면에 "주문완료 상태로 3일 이상 지난 주문을 오래된 순으로 100건" 보여 주는 기능이 추가되었다. 쿼리는 <code>WHERE status = 'ORDERED' AND ordered_at < ? ORDER BY ordered_at LIMIT 100</code>이다. 인덱스 <code>(status, ordered_at)</code>과 <code>(ordered_at, status)</code> 중 무엇이 나은지, 각각에서 인덱스를 어떻게 읽게 되는지 설명하라.</li>
+<li>회원 2가 주문 2의 취소 버튼을 두 번 빠르게 눌러 취소 트랜잭션 두 개(C1, C2)가 동시에 실행되었다. 본문의 취소 트랜잭션에서 C1과 C2가 각각 무엇을 하게 되는지 시간 순서로 추적하라. 그리고 첫 문장의 WHERE를 <code>order_id = 2</code>만으로 바꾸고 "영향받은 행 수를 확인하지 않는" 코드였다면 재고가 어떻게 되는지 설명하라.</li>
+<li>리뷰 테이블에 <code>product_id</code>를 두지 않은 정규화된 설계라고 하자. "상품 1의 리뷰를 최신순으로 20개" 가져오는 쿼리를 쓰고, 왜 LIMIT 20이 있어도 20건을 읽고 멈출 수 없는지 인덱스 관점에서 설명하라.</li>
+<li>운영자가 실수로 <code>UPDATE order_item SET quantity = 3 WHERE order_item_id = 2</code>를 실행했다. 점검 쿼리 1과 점검 쿼리 2를 실행하면 각각 어떤 결과가 나오는지 값까지 예측하라. 이 실수로 어긋난 것이 하나 더 있는데 점검 쿼리로 찾을 수 없다. 무엇인가?</li>
+<li>쇼핑몰 데이터베이스를 리버스 엔지니어링한 ERD에서 (a) 실선으로 그려지는 관계, (b) 일대일로 그려지는 관계, (c) 부모 쪽이 선택(0..1)으로 그려지는 관계를 각각 고르고, 그림에 나타나지 않는 업무 규칙을 세 가지 들어라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> <code>(status, ordered_at)</code>이 낫다. 등호 조건 열 <code>status</code>가 앞에 있으므로 인덱스에서 <code>'ORDERED'</code> 구간의 시작으로 바로 가고, 그 구간 안은 <code>ordered_at</code> 순서이므로 오래된 것부터 읽으며 기준 시각에 닿거나 100건을 채우면 멈춘다. 정렬 단계도 없다. <code>(ordered_at, status)</code>는 첫 열이 범위 조건이다. 기준 시각 이전의 모든 주문을 오래된 순으로 읽으면서 항목마다 <code>status</code>를 확인해 걸러야 하므로, 오래된 주문 대부분이 배송완료라면 주문완료 100건을 모으기 위해 많은 항목을 읽고 버린다. 등호 → 범위·정렬의 순서 규칙이 그대로 적용된다.</p>
+<p><b>2.</b> C1의 <code>UPDATE orders ... WHERE order_id = 2 AND member_id = 2 AND status = 'ORDERED'</code>가 1행을 바꾸고 주문 2 행에 배타 잠금을 건다. C2의 같은 문장은 그 행의 잠금을 기다린다. C1이 재고를 27에서 28로 되돌리고 커밋하면 잠금이 풀리고, C2는 최신 커밋 버전을 읽어 <code>status</code>가 <code>'CANCELED'</code>이므로 조건이 거짓이 되어 0행으로 끝나고 롤백한다. 재고는 한 번만 늘어난다(MySQL 8.4.13에서 C1이 커밋 전에 3초 머물게 하고 두 세션으로 실행하면, C2의 <code>UPDATE</code>는 약 2초 기다린 뒤 <code>Rows matched: 0  Changed: 0</code>으로 끝났고 M1의 재고는 28이었다). WHERE가 <code>order_id = 2</code>뿐이고 행 수를 확인하지 않는 코드라면 C2도 다음 단계로 진행해 재고를 한 번 더 늘리므로, 재고가 29가 되어 실제보다 1개 많아진다. 덧붙여, 조건 없는 C2의 <code>UPDATE</code>는 이미 <code>'CANCELED'</code>인 값을 같은 값으로 바꾸려는 것이라, MySQL 서버는 "실제로 바뀐 행"을 0으로 보고한다(mysql 클라이언트에서는 <code>Query OK, 0 rows affected</code>, <code>Rows matched: 1  Changed: 0</code>). 그런데 MySQL Connector/J는 기본 설정(<code>useAffectedRows=false</code>)에서 <code>CLIENT_FOUND_ROWS</code> 플래그를 켜고 접속하므로 JDBC의 갱신 건수는 "조건에 맞은 행" 1이 된다. 같은 문장이라도 클라이언트 설정에 따라 0과 1이 갈리므로, 상태 조건을 WHERE에 넣어 맞은 행과 바뀐 행이 모두 0이 되게 하는 쪽이 판단이 흔들리지 않는다.</p>
+<p><b>3.</b> 예를 들어 <code>SELECT r.* FROM order_item oi JOIN review r ON r.order_item_id = oi.order_item_id WHERE oi.product_id = 1 ORDER BY r.created_at DESC, r.review_id DESC LIMIT 20</code>이다. 필터 열 <code>product_id</code>는 <code>order_item</code>에, 정렬 열 <code>created_at</code>은 <code>review</code>에 있으므로 두 조건을 한 인덱스로 처리할 수 없다. <code>order_item</code>의 <code>(product_id)</code> 인덱스로 상품 1의 주문상품을 모두 찾고, 각각 리뷰를 찾은 뒤, 모은 리뷰를 작성 시각으로 정렬해야 한다. 정렬 결과의 처음 20건은 후보를 모두 모은 뒤에야 알 수 있으므로 LIMIT이 읽기를 일찍 끝내지 못한다. 매뉴얼의 표현으로는 조인에서 정렬 열이 첫 번째 테이블에 있지 않아 인덱스로 정렬을 해결할 수 없는 경우다.</p>
+<p><b>4.</b> 점검 쿼리 1은 한 행을 돌려준다. 주문 1의 주문상품 합계가 89,000 × 1 + 25,000 × 3 = 164,000이 되었는데 저장된 총액은 139,000이므로 <code>(1, 139000, 164000)</code>이다. 주문 2는 그대로 일치한다. 점검 쿼리 2는 리뷰를 건드리지 않았으므로 빈 결과다. 점검 쿼리로 찾을 수 없는 어긋남은 재고다. 주문 1은 M1을 실제로 2개만 차감했는데 주문상품은 3개로 기록되어 있다. 재고는 다른 테이블에서 계산되는 파생 값이 아니라 현재 상태 그 자체이므로(입고 기록이 없는 이 모델에서는) 원본에서 다시 계산할 방법이 없다. 재고 변동을 기록하는 입출고 테이블을 두면 재고도 점검할 수 있는 파생 값이 된다.</p>
+<p><b>5.</b> (a) 없다. 모든 테이블이 대리 키를 기본 키로 쓰고 어떤 외래 키 열도 기본 키에 포함되지 않으므로 전부 비식별 관계, 곧 점선이다. (b) 리뷰 → 주문상품. 리뷰의 유일 인덱스 <code>(order_item_id, product_id)</code>가 외래 키 열과 정확히 일치하므로 주문상품 하나에 리뷰는 최대 하나다. (c) 카테고리의 자기 참조. <code>parent_id</code>만 NULL을 허용하므로 상위 카테고리가 없을 수 있다. 그림에 나타나지 않는 규칙의 예: 주문에는 주문상품이 하나 이상 있다(최소 1), 주문 총액은 주문상품의 단가 × 수량 합계와 같다, 배송 완료된 주문상품에만 리뷰를 쓸 수 있다, 리뷰 작성자는 그 주문의 회원이다, 재고가 0이면 품절이다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>InnoDB 테이블 <code>orders</code>에 인덱스 <code>(member_id, ordered_at)</code>만 있다. <code>SELECT order_id, ordered_at FROM orders WHERE member_id = 1 ORDER BY ordered_at DESC LIMIT 10</code>이 클러스터형 인덱스를 찾아가지 않고 보조 인덱스만으로 끝날 수 있는 이유는?</q>
+<o>InnoDB는 모든 보조 인덱스에 테이블의 모든 열을 복사해 둔다.</o>
+<o>InnoDB 보조 인덱스의 각 레코드에는 인덱스 열과 함께 그 행의 기본 키 열이 들어 있어, <code>order_id</code>도 인덱스에서 읽을 수 있다.</o>
+<o><code>LIMIT 10</code>이 있으면 옵티마이저는 항상 인덱스만 읽는다.</o>
+<o><code>order_id</code>는 AUTO_INCREMENT 열이라 값을 계산으로 알 수 있다.</o>
+<why>매뉴얼에 따르면 InnoDB 보조 인덱스의 레코드는 지정한 열과 함께 기본 키 열을 담는다. 그래서 SELECT 열이 (member_id, ordered_at, order_id) 안에 모두 있으면 인덱스만으로 답할 수 있다(Using index). 보조 인덱스가 모든 열을 담지는 않으며, LIMIT은 읽는 양을 줄일 뿐 읽을 위치를 바꾸지 않는다. 자동 증가 값은 빈틈이 있을 수 있어 계산으로 알 수 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>이 회차의 역정규화 중 원본과 어긋날 위험이 가장 낮은 것은 무엇이고, 왜인가?</q>
+<o><code>product.review_count</code>. UPDATE 안에서 원자적으로 증가시키기 때문이다.</o>
+<o><code>orders.total_amount</code>. 점검 쿼리가 있기 때문이다.</o>
+<o><code>review.product_id</code>. 바뀌지 않는 값의 복사이고, 복합 외래 키가 원본과의 일치를 데이터베이스 수준에서 강제하기 때문이다.</o>
+<o>세 가지 모두 같은 트랜잭션에서 쓰므로 위험이 같다.</o>
+<why>리뷰의 상품 번호는 주문상품의 상품 번호를 복사한 것인데 그 원본은 생성 후 바뀌지 않고, <code>(order_item_id, product_id)</code> 복합 외래 키가 존재하지 않는 쌍을 거부하므로 어긋난 값이 들어갈 길이 없다. 리뷰 카운터는 리뷰마다 바뀌는 값이라 갱신 경로를 하나라도 놓치면 어긋난다. 주문 총액의 점검 쿼리는 어긋남을 찾아낼 뿐 막지 못한다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>재고 9인 상품에 T1이 <code>UPDATE product SET stock_quantity = stock_quantity - 6 WHERE product_id = 1 AND stock_quantity >= 6</code>을 실행해 커밋하기 전에, T2가 같은 형태로 5개를 차감하는 문장을 실행했다. 기본 격리 수준(REPEATABLE READ)에서 T1이 커밋한 뒤 T2의 결과는?</q>
+<o>T2는 잠금을 기다렸다가 최신 커밋 값 3을 읽고, 3 ≥ 5가 거짓이므로 0행을 바꾼다.</o>
+<o>T2는 자신의 스냅숏에 있는 9를 기준으로 판단해 4로 만든다.</o>
+<o>T2는 즉시 교착 상태 오류를 받는다.</o>
+<o>T2는 -2를 쓰려다 CHECK 위반으로 실패한다.</o>
+<why>매뉴얼은 트랜잭션의 스냅숏이 SELECT에 적용되며 DML에는 반드시 적용되지 않는다고 설명한다. UPDATE는 행의 배타 잠금을 얻은 뒤 최신 커밋 버전을 기준으로 동작하므로, T2는 T1이 남긴 3으로 WHERE 조건을 판단한다. 조건이 거짓이라 아무 행도 바뀌지 않고, 음수를 쓰려는 시도 자체가 없으므로 CHECK에도 닿지 않는다. 한 행만 두고 기다리는 관계라 교착 상태도 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>MySQL이 외래 키의 자식 쪽 열에 인덱스를 요구하는(없으면 자동으로 만드는) 가장 직접적인 이유는?</q>
+<o>자식 행을 삽입할 때 부모 테이블의 기본 키를 찾기 위해서다.</o>
+<o>ERD 도구가 관계선을 그리려면 인덱스가 있어야 하기 때문이다.</o>
+<o>외래 키 열은 항상 유일해야 하므로 유일성 검사를 위해서다.</o>
+<o>부모 행을 삭제하거나 키를 바꿀 때 그 부모를 참조하는 자식 행을 테이블 전체를 읽지 않고 찾기 위해서다.</o>
+<why>매뉴얼은 외래 키 검사가 테이블 스캔 없이 빠르게 이루어지도록 외래 키와 참조되는 키에 인덱스를 요구한다고 설명한다. 자식 삽입 때 부모를 찾는 데는 부모 쪽 키 인덱스가 쓰이고, 자식 쪽 인덱스는 부모를 지우거나 바꿀 때 참조하는 자식을 찾는 데 쓰인다. ERD 도구는 인덱스가 아니라 외래 키 제약 정보를 읽는다. 외래 키 열은 일대다 관계에서 당연히 중복된다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>쇼핑몰 데이터베이스를 리버스 엔지니어링해 ERD를 만들었다. 다음 중 카탈로그 정보만으로 그림에 나타날 수 <b>없는</b> 것은?</q>
+<o>리뷰와 주문상품이 일대일 관계라는 것</o>
+<o>주문에는 주문상품이 하나 이상 있어야 한다는 것</o>
+<o>상위 카테고리가 없는 카테고리가 있을 수 있다는 것</o>
+<o>리뷰가 주문상품의 두 열을 함께 참조한다는 것</o>
+<why>일대일은 외래 키 열과 정확히 일치하는 유일 인덱스로, 선택 참여는 NULL을 허용하는 외래 키 열로, 두 열 참조는 KEY_COLUMN_USAGE의 같은 제약 이름 두 행으로 카탈로그에 기록되어 있다. 반면 "자식이 최소 하나 있어야 한다"는 규칙은 외래 키로 표현되지 않아 카탈로그에 없으므로, 자동 생성 ERD는 그 끝을 0 이상으로 그린다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>접근 경로(access path)</dt><dd>쿼리가 원하는 행에 도달하는 방법. 설계 단계에서는 기능별 조건·정렬·건수·빈도의 목록을 뜻하고, 실행 단계에서는 옵티마이저가 고른 인덱스와 읽기 방식을 뜻한다.</dd>
+<dt>왼쪽 접두사(leftmost prefix)</dt><dd>복합 인덱스의 첫 열부터 연속된 열들의 조합. MySQL은 이 조합에 대한 조건만 인덱스 검색에 쓸 수 있다.</dd>
+<dt>인덱스 확장(index extension)</dt><dd>InnoDB가 보조 인덱스 뒤에 기본 키 열을 덧붙여 저장하고, 옵티마이저가 그 열까지 검색·정렬·커버링에 활용하는 것. <code>use_index_extensions</code> 스위치로 제어한다.</dd>
+<dt>커버링 인덱스(covering index)</dt><dd>쿼리에 필요한 열이 모두 들어 있어 클러스터형 인덱스를 다시 찾아가지 않고 답할 수 있는 인덱스. EXPLAIN의 Extra에 <code>Using index</code>로 나타난다.</dd>
+<dt>filesort</dt><dd>인덱스 순서로 결과 순서를 만들 수 없을 때 MySQL이 찾은 행을 따로 정렬하는 단계. EXPLAIN의 Extra에 <code>Using filesort</code>로 나타난다.</dd>
+<dt>역정규화(denormalization)</dt><dd>조회 비용을 줄이려고 정규화된 사실을 다른 곳에 한 번 더 기록하는 결정. 복사본을 원본과 일치시키는 책임이 함께 생긴다.</dd>
+<dt>잃어버린 갱신(lost update)</dt><dd>두 트랜잭션이 같은 값을 읽고 각자 계산한 결과를 쓰면서 한쪽의 변경이 덮여 사라지는 현상. 증가식을 UPDATE 안에 쓰거나 잠금 읽기로 막는다.</dd>
+<dt>리버스 엔지니어링(reverse engineering)</dt><dd>실행 중인 데이터베이스나 생성 스크립트의 메타데이터에서 모델과 ERD를 거꾸로 만들어 내는 작업.</dd>
+<dt>데이터 사전(data dictionary)</dt><dd>MySQL 8.0에서 테이블·열·인덱스·제약의 정의를 저장하는 카탈로그. INFORMATION_SCHEMA의 여러 테이블이 그 위의 뷰로 구현된다.</dd>
+<dt>키셋 페이지네이션(keyset pagination)</dt><dd>OFFSET 대신 직전 페이지 마지막 행의 정렬 키 값 다음부터 읽는 페이지 이동 방식. 인덱스에서 위치를 키 값으로 바로 찾는다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-table-foreign-keys.html">MySQL 8.0 Reference Manual — FOREIGN KEY Constraints</a> — 외래 키 인덱스 요구와 자동 생성, NO ACTION과 RESTRICT, InnoDB의 참조 인덱스 조건</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/index-extensions.html">MySQL 8.0 Reference Manual — Use of Index Extensions</a> — 보조 인덱스에 기본 키가 덧붙는 것과 옵티마이저의 활용 범위</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/order-by-optimization.html">MySQL 8.0 Reference Manual — ORDER BY Optimization</a> — 인덱스로 정렬을 대신하는 조건과 filesort</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-consistent-read.html">MySQL 8.0 Reference Manual — Consistent Nonlocking Reads</a> — 스냅숏이 SELECT에 적용되고 DML은 최신 커밋 행을 다룬다는 설명</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/information-schema-key-column-usage-table.html">MySQL 8.0 Reference Manual — The INFORMATION_SCHEMA KEY_COLUMN_USAGE Table</a> — 외래 키 열과 참조 대상 열의 카탈로그 표현</li>
+<li><a href="https://dev.mysql.com/doc/workbench/en/wb-relationship-tools.html">MySQL Workbench Manual — The Relationship Tools</a> — 식별 관계(실선)와 비식별 관계(점선), 기본 까마귀발 표기</li>
+</x-refs>

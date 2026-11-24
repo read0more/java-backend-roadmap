@@ -1,0 +1,1252 @@
+<x-meta>
+deck: 여러 스레드가 ArrayList·HashMap에 동시에 쓰면 원소가 사라지고 예외가 나고 루프가 멈추지 않는다. synchronized 프록시가 이를 어떻게 막고 왜 병목이 되는지, ConcurrentHashMap과 CopyOnWriteArrayList가 락을 어떻게 쪼개거나 없애는지 OpenJDK 21 소스와 실험으로 따라간다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>동기화 없는 리스트의 <code>add</code>를 바이트코드 단위로 쪼개고, 두 스레드의 실행 순서를 엇갈려 추적해 원소가 덮어써지는 경우, 빈 칸(<code>null</code>)이 남는 경우, 크기가 어긋나는 경우를 각각 설명할 수 있다.</li>
+<li>인터페이스와 위임으로 synchronized 프록시를 직접 만들고, <code>Collections.synchronizedList</code>가 같은 구조(<code>mutex</code> 필드와 위임 대상 <code>c</code>)로 되어 있음을 JDK 소스에서 확인할 수 있다.</li>
+<li>메서드 하나하나가 동기화된 컬렉션에서도 확인 후 실행(check-then-act), 읽고-수정하고-쓰기, 반복(iteration)이 안전하지 않은 이유를 설명하고, 어느 객체에 락을 걸어야 하는지 판단할 수 있다.</li>
+<li><code>ConcurrentHashMap</code>이 읽기에는 락을 쓰지 않고, 빈 칸에는 CAS를, 차 있는 칸에는 첫 노드의 모니터를 쓰는 구조를 그림으로 그리고, 그 결과로 <code>size()</code>와 반복자가 어떤 보장만 하는지 말할 수 있다.</li>
+<li>읽기와 쓰기의 비율, 정렬 필요 여부, 복합 연산의 종류를 근거로 synchronized 컬렉션, <code>ConcurrentHashMap</code>, <code>CopyOnWriteArrayList</code>, <code>ConcurrentSkipListMap</code> 중 하나를 고를 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>컬렉션은 스레드를 모른다</h3>
+<p>앞 회차까지는 공유 변수 하나를 지키는 방법을 쌓아 왔다. <code>synchronized</code>와 <code>ReentrantLock</code>으로 임계 영역을 만들었고, 생산자-소비자 문제에서 스레드를 재우고 깨웠고, 지난 회차에서는 CAS(compare-and-swap)로 락 없이 값 하나를 원자적으로 바꿨다. 그런데 실제 서버 프로그램에서 여러 스레드가 함께 만지는 데이터는 <code>int</code> 하나보다 리스트나 맵인 경우가 훨씬 많다. 요청을 처리하는 스레드들이 공유 캐시 맵에 계산 결과를 넣고, 여러 작업 스레드가 결과 하나를 모으는 리스트에 항목을 추가하고, 이벤트 리스너 목록을 한쪽에서는 순회하고 다른 쪽에서는 등록한다.</p>
+<p>이때 가장 먼저 떠오르는 질문은 이것이다. <code>list.add(x)</code>나 <code>map.put(k, v)</code>처럼 메서드를 한 번 부르는 일은 원자적인가? 자바 코드에서 한 줄이니 한 번에 일어나는 일처럼 보인다. 하지만 원자적 연산(atomic operation)이란 "다른 스레드가 그 중간 상태를 볼 수도, 끼어들 수도 없는 연산"이다. 앞 회차들에서 <code>count++</code>가 읽기, 더하기, 쓰기의 세 단계로 쪼개져 있어서 원자적이지 않았던 것처럼, <code>add</code> 한 번 안에도 필드를 읽고, 배열에 쓰고, 다른 필드를 갱신하는 여러 단계가 있다. 소스 코드 한 줄이 원자적인지는 그 줄이 몇 글자인지가 아니라 안에서 몇 번의 공유 메모리 접근이 일어나는지로 결정된다.</p>
+<p>답은 API 문서에 이미 적혀 있다. <code>ArrayList</code>의 Javadoc은 굵은 글씨로 이 구현은 동기화되어 있지 않다(<i>"Note that this implementation is not synchronized."</i>)고 밝히고, 여러 스레드가 동시에 접근하면서 그중 하나라도 구조를 바꾼다면(원소를 추가·삭제하거나 내부 배열 크기를 바꾼다면) 바깥에서 동기화해야 한다고 적는다. <code>HashMap</code>, <code>LinkedList</code>, <code>TreeMap</code>의 Javadoc에도 같은 문장이 있다. <code>java.util</code>의 일반 컬렉션은 한 스레드만 쓴다는 가정에서 설계되었고, 락을 잡지 않는 대신 빠르다. 여러 스레드가 함께 쓸 때의 대책은 사용하는 쪽의 몫이다.</p>
+<p>이 회차는 그 대책을 세 단계로 쌓는다. 먼저 동기화 없는 컬렉션이 실제로 어떻게 깨지는지 직접 만든 작은 리스트와 JDK의 <code>ArrayList</code>·<code>HashMap</code>으로 확인한다. 다음으로 <code>synchronized</code>를 붙이는 방법과, 원본을 고치지 않고 바깥에서 감싸는 프록시(proxy)를 만들고, JDK의 <code>Collections.synchronizedXxx</code>가 바로 그 프록시라는 것을 소스로 확인한다. 마지막으로 그 프록시가 가진 한계(락 하나에 모든 스레드가 줄을 선다)를 측정하고, <code>java.util.concurrent</code>의 동시성 컬렉션이 이 한계를 어떤 자료구조와 어떤 락 전략으로 넘는지 OpenJDK 21 소스를 따라 내려간다.</p>
+<p>이 회차의 모든 실험은 원고를 쓰며 JDK 21(Temurin 21.0.13, macOS arm64, 논리 코어 8개)에서 직접 실행한 것이다. 스레드가 끼어드는 순서는 실행마다 달라지므로, 숫자로 된 결과는 "이번 실행에서 이렇게 나왔다"는 기록일 뿐 재현을 약속하는 값이 아니다. 실행마다 같은 결과가 나오는 부분과 달라지는 부분은 그때그때 구분해 적는다.</p>
+
+<h3>add 한 번의 내부와 두 스레드의 충돌</h3>
+<p>JDK의 <code>ArrayList</code>는 크기 조정과 수정 횟수 추적 같은 일까지 하므로, 문제의 뼈대만 보려면 더 작은 리스트가 낫다. 아래는 고정 크기 배열과 <code>size</code> 필드 하나로 된 최소한의 리스트다. 인터페이스 <code>MiniList</code>를 따로 둔 것은 뒤에서 같은 인터페이스로 동기화 버전과 프록시를 만들기 위해서다. <code>pauseMillis</code>는 배열에 저장한 직후 일부러 잠깐 쉬는 시간이다. 실제 프로그램에서는 이 틈이 수 나노초에 불과해 문제가 드물게 드러나지만, 틈을 100밀리초로 벌리면 같은 문제가 거의 매번 드러난다. 틈의 크기는 문제가 드러나는 빈도를 바꿀 뿐 문제의 존재를 바꾸지 않는다.</p>
+<pre><code class="language-java">public interface MiniList<E> {
+    void add(E e);
+    E get(int index);
+    int size();
+}</code></pre>
+<pre><code class="language-java">import java.util.Arrays;
+
+public class PlainMiniList<E> implements MiniList<E> {
+    private final Object[] elements;
+    private int size;
+    private final long pauseMillis;
+
+    public PlainMiniList(int capacity, long pauseMillis) {
+        this.elements = new Object[capacity];
+        this.pauseMillis = pauseMillis;
+    }
+
+    @Override
+    public void add(E e) {
+        elements[size] = e;      // 1) 현재 size 위치에 저장
+        pause();                 // 2) 끼어들 틈을 일부러 벌린다
+        size++;                  // 3) size 증가
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public E get(int index) {
+        return (E) elements[index];
+    }
+
+    @Override
+    public int size() {
+        return size;
+    }
+
+    private void pause() {
+        if (pauseMillis == 0) return;
+        try {
+            Thread.sleep(pauseMillis);
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    @Override
+    public String toString() {
+        return Arrays.toString(Arrays.copyOf(elements, size)) + " size=" + size;
+    }
+}</code></pre>
+<p>자바 코드로는 두 줄짜리 <code>add</code>가 바이트코드로 얼마나 잘게 쪼개지는지 <code>javap -c -p PlainMiniList.class</code>로 확인해 보자. 아래가 JDK 21의 <code>javac</code>가 만든 결과 그대로다.</p>
+<pre data-label="javap 출력"><code class="language-text">  public void add(E);
+    Code:
+       0: aload_0
+       1: getfield      #7                  // Field elements:[Ljava/lang/Object;
+       4: aload_0
+       5: getfield      #17                 // Field size:I
+       8: aload_1
+       9: aastore
+      10: aload_0
+      11: invokevirtual #21                 // Method pause:()V
+      14: aload_0
+      15: dup
+      16: getfield      #17                 // Field size:I
+      19: iconst_1
+      20: iadd
+      21: putfield      #17                 // Field size:I
+      24: return</code></pre>
+<p>눈여겨볼 곳은 <code>size</code> 필드를 <b>두 번</b> 읽는다는 점이다. 오프셋 5의 <code>getfield</code>는 "어느 칸에 저장할지"를 정하기 위해 읽고, 오프셋 16의 <code>getfield</code>는 "얼마로 늘릴지"를 정하기 위해 다시 읽는다. 오프셋 9의 <code>aastore</code>가 배열 칸에 쓰는 순간과 오프셋 21의 <code>putfield</code>가 <code>size</code>를 쓰는 순간 사이에도 틈이 있다. 단일 스레드에서는 두 번 읽은 값이 언제나 같고 두 쓰기 사이에 아무도 끼어들지 않으므로 이 틈은 의미가 없다. 여러 스레드가 같은 객체를 공유하는 순간, 이 틈 하나하나가 다른 스레드가 끼어들 수 있는 자리가 된다. 6회에서 본 임계 영역(critical section)이 바로 이 구간, 오프셋 0부터 21까지 전체다.</p>
+<p>이제 두 스레드가 같은 리스트에 동시에 하나씩 추가하게 한다. 한 스레드는 <code>"A"</code>를, 다른 스레드는 <code>"B"</code>를 넣는다. 둘 다 끝날 때까지 <code>join()</code>으로 기다린 뒤 리스트를 출력한다. 인자로 어떤 구현을 쓸지 고르게 해 두었는데, <code>sync</code>와 <code>guarded</code>는 뒤 절에서 만드는 클래스다.</p>
+<pre><code class="language-java">public class TwoWriters {
+    public static void main(String[] args) throws InterruptedException {
+        String kind = args[0];
+        MiniList<String> list = switch (kind) {
+            case "plain" -> new PlainMiniList<>(10, 100);
+            case "sync" -> new SyncMiniList<>(10, 100);
+            case "guarded" -> new GuardedMiniList<>(new PlainMiniList<>(10, 100));
+            default -> throw new IllegalArgumentException(kind);
+        };
+        Thread t1 = new Thread(() -> list.add("A"), "writer-1");
+        Thread t2 = new Thread(() -> list.add("B"), "writer-2");
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+        System.out.println(list);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (java TwoWriters plain, 다섯 번 실행)"><code class="language-text">[B, null] size=2
+[B, null] size=2
+[B, null] size=2
+[B, null] size=2
+[B, null] size=2</code></pre>
+<p>원소를 두 개 넣었고 <code>size</code>도 2인데, <code>"A"</code>는 사라졌고 두 번째 칸은 비어 있다. 이 결과가 어떻게 나오는지 시간 순서대로 한 줄씩 추적해 보자. 두 스레드는 거의 동시에 출발하고, 각자 100밀리초를 쉬는 동안 상대 스레드가 자기 단계를 진행한다.</p>
+<div class="table-wrap"><table><thead><tr><th>순서</th><th>writer-1</th><th>writer-2</th><th>elements[0..1]</th><th>size</th></tr></thead><tbody>
+<tr><td>1</td><td><code>size</code>를 읽음 → 0</td><td></td><td>[null, null]</td><td>0</td></tr>
+<tr><td>2</td><td><code>elements[0] = "A"</code></td><td></td><td>[A, null]</td><td>0</td></tr>
+<tr><td>3</td><td>100ms 대기 시작</td><td><code>size</code>를 읽음 → 0 (아직 증가 전)</td><td>[A, null]</td><td>0</td></tr>
+<tr><td>4</td><td>(대기 중)</td><td><code>elements[0] = "B"</code> — A를 덮어씀</td><td>[B, null]</td><td>0</td></tr>
+<tr><td>5</td><td>(대기 중)</td><td>100ms 대기 시작</td><td>[B, null]</td><td>0</td></tr>
+<tr><td>6</td><td><code>size</code>를 읽음 → 0, 1을 씀</td><td>(대기 중)</td><td>[B, null]</td><td>1</td></tr>
+<tr><td>7</td><td>종료</td><td><code>size</code>를 읽음 → 1, 2를 씀</td><td>[B, null]</td><td>2</td></tr>
+</tbody></table></div>
+<p>이 한 번의 실행에 세 가지 서로 다른 고장이 모두 들어 있다. 첫째는 <b>덮어쓰기</b>다. 두 스레드가 같은 <code>size</code> 값(0)을 읽었으므로 같은 칸에 썼고, 먼저 쓴 값이 사라졌다. 둘째는 <b>빈 칸</b>이다. <code>size</code>는 두 번 증가했는데 실제로 값이 들어간 칸은 하나뿐이어서, <code>size</code>가 가리키는 범위 안에 <code>null</code>이 남았다. 셋째는 이번 실행에서는 일어나지 않았지만 언제든 일어날 수 있는 <b>갱신 손실</b>이다. 6단계와 7단계의 <code>size++</code>가 서로 겹쳐 두 스레드가 모두 0을 읽고 1을 쓰면 <code>size</code>는 1이 되고, 결과는 <code>[B] size=1</code>이 된다. 또 writer-2가 먼저 칸에 쓰고 writer-1이 나중에 쓰는 순서였다면 결과는 <code>[A, null]</code>이었을 것이다. 이번 다섯 번의 실행에서 모두 B가 남은 것은 이 환경에서 그 순서가 반복되었을 뿐이고, 자바는 어느 순서도 보장하지 않는다.</p>
+<x-visual id="java-adv1-11-same-slot-race" title="두 스레드가 같은 배열 칸에 쓰는 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>두 스레드가 같은 size 값을 읽어 같은 칸에 쓰고, size는 두 번 증가해 빈 칸이 남는 과정을 시간 순서로 보여 준다.</x-hint>
+<x-prompt>가로로 긴 시퀀스 다이어그램. 왼쪽부터 세 개의 세로 생명선: "writer-1", "공유 리스트 (elements, size)", "writer-2". 위에서 아래로 시간이 흐른다. writer-1에서 가운데로 화살표 "size 읽기 = 0", 이어서 "elements[0] = A". writer-2에서 가운데로 화살표 "size 읽기 = 0", 이어서 "elements[0] = B"이며 이 화살표 옆에 빨간 표시 "덮어쓰기". 두 생명선 모두에 회색 막대로 "100ms 대기". 그 아래 writer-1에서 "size = 1", writer-2에서 "size = 2". 가운데 생명선 맨 아래에 배열 상자 두 칸 그림: 첫 칸 "B", 둘째 칸 비어 있고 "null" 라벨. 상자 옆에 "size=2". 깔끔한 기술 문서 스타일, 흰 배경, 파란색과 회색 위주, 경고는 빨간색.</x-prompt>
+<x-caption>두 스레드가 같은 size를 읽으면 같은 칸에 쓰고, size는 두 번 늘어나 빈 칸이 남는다.</x-caption>
+</x-visual>
+
+<h3>쉬지 않아도 깨진다: ArrayList와 HashMap</h3>
+<p>100밀리초 대기를 없애면 문제도 사라질까? 대기를 0으로 하고 스레드 4개가 각각 10만 개씩, 모두 40만 개를 넣어 보자. 같은 실험을 JDK의 <code>ArrayList</code>와 <code>HashMap</code>에도 해 본다. 각 스레드는 서로 겹치지 않는 정수 범위(0~99,999, 100,000~199,999, …)를 넣으므로, 맵의 키도 모두 다르다. 정상이라면 리스트의 크기와 맵의 크기는 모두 400,000이어야 한다. 스레드 안에서 예외가 나면 잡아서 모아 두고 마지막에 함께 출력한다.</p>
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+
+public class NoPauseRace {
+    static final int THREADS = 4;
+    static final int PER_THREAD = 100_000;
+
+    public static void main(String[] args) throws Exception {
+        switch (args[0]) {
+            case "mini" -> {
+                PlainMiniList<Integer> list = new PlainMiniList<>(THREADS * PER_THREAD, 0);
+                run(i -> list.add(i));
+                int nulls = 0;
+                for (int i = 0; i < list.size(); i++) if (list.get(i) == null) nulls++;
+                System.out.println("mini size=" + list.size() + " nullSlots=" + nulls);
+            }
+            case "arraylist" -> {
+                List<Integer> list = new ArrayList<>();
+                List<Throwable> errors = run(i -> list.add(i));
+                int nulls = 0;
+                for (int i = 0; i < list.size(); i++) if (list.get(i) == null) nulls++;
+                System.out.println("ArrayList size=" + list.size() + " nullSlots=" + nulls + " errors=" + errors);
+            }
+            case "hashmap" -> {
+                Map<Integer, Integer> map = new HashMap<>();
+                List<Throwable> errors = run(i -> map.put(i, i));
+                System.out.println("HashMap size=" + map.size() + " errors=" + errors);
+            }
+            case "syncmap" -> {
+                Map<Integer, Integer> map = Collections.synchronizedMap(new HashMap<>());
+                run(i -> map.put(i, i));
+                System.out.println("synchronizedMap size=" + map.size());
+            }
+            case "chm" -> {
+                Map<Integer, Integer> map = new ConcurrentHashMap<>();
+                run(i -> map.put(i, i));
+                System.out.println("ConcurrentHashMap size=" + map.size());
+            }
+            default -> throw new IllegalArgumentException(args[0]);
+        }
+    }
+
+    interface Task { void accept(int i); }
+
+    static List<Throwable> run(Task task) throws InterruptedException {
+        List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
+        Thread[] ts = new Thread[THREADS];
+        for (int t = 0; t < THREADS; t++) {
+            int base = t * PER_THREAD;
+            ts[t] = new Thread(() -> {
+                try {
+                    for (int i = 0; i < PER_THREAD; i++) task.accept(base + i);
+                } catch (Throwable e) {
+                    errors.add(e);
+                }
+            });
+        }
+        for (Thread t : ts) t.start();
+        for (Thread t : ts) t.join();
+        return errors;
+    }
+}</code></pre>
+<pre data-label="실행 결과 (여러 번 실행한 것 중 일부, 숫자는 실행마다 다르다)"><code class="language-text">mini size=274188 nullSlots=36227
+mini size=262745 nullSlots=26261
+mini size=265317 nullSlots=28086
+ArrayList size=173124 nullSlots=78 errors=[]
+ArrayList size=182569 nullSlots=1721 errors=[]
+ArrayList size=245825 nullSlots=5252 errors=[java.lang.ArrayIndexOutOfBoundsException: Index 34 out of bounds for length 33]
+ArrayList size=342308 nullSlots=840 errors=[]
+HashMap size=251902 errors=[]
+HashMap size=320587 errors=[]
+HashMap size=228675 errors=[]
+synchronizedMap size=400000
+ConcurrentHashMap size=400000</code></pre>
+<p>대기를 없앴는데도 40만 개 중 수만에서 20만 개 넘게 사라졌다. 일부러 벌린 틈이 없어도 여러 코어가 진짜로 동시에 같은 필드를 읽고 쓰기 때문이다. <code>ArrayList</code>는 열두 번 남짓 실행하는 동안 한 번 <code>ArrayIndexOutOfBoundsException</code>을 던졌다. 예외를 던진 스레드는 그 자리에서 루프를 멈추므로, 그 실행에서는 그만큼의 원소가 애초에 추가되지 않았다. 마지막 두 줄은 비교를 위한 것으로, 뒤에서 다룰 <code>Collections.synchronizedMap</code>과 <code>ConcurrentHashMap</code>은 같은 조건에서 매번 정확히 400,000을 냈다.</p>
+<h4>ArrayIndexOutOfBoundsException이 나오는 실행 순서</h4>
+<p>예외 메시지 "Index 34 out of bounds for length 33"은 길이 33인 배열의 34번 칸에 쓰려 했다는 뜻이다. 리스트는 크기가 꽉 차면 배열을 늘리는데 어떻게 이런 일이 생기는지, OpenJDK 21의 <code>ArrayList</code> 소스로 따라가 보자. 아래는 <code>src.zip</code>에 들어 있는 해당 부분이다.</p>
+<pre><code class="language-java">public boolean add(E e) {
+    modCount++;
+    add(e, elementData, size);
+    return true;
+}
+
+private void add(E e, Object[] elementData, int s) {
+    if (s == elementData.length)
+        elementData = grow();
+    elementData[s] = e;
+    size = s + 1;
+}
+
+private Object[] grow() {
+    return grow(size + 1);
+}
+
+private Object[] grow(int minCapacity) {
+    int oldCapacity = elementData.length;
+    if (oldCapacity > 0 || elementData != DEFAULTCAPACITY_EMPTY_ELEMENTDATA) {
+        int newCapacity = ArraysSupport.newLength(oldCapacity,
+                minCapacity - oldCapacity, /* minimum growth */
+                oldCapacity >> 1           /* preferred growth */);
+        return elementData = Arrays.copyOf(elementData, newCapacity);
+    } else {
+        return elementData = new Object[Math.max(DEFAULT_CAPACITY, minCapacity)];
+    }
+}</code></pre>
+<p>기본 생성자로 만든 <code>ArrayList</code>는 첫 추가 때 길이 10인 배열을 만들고, 그 뒤로는 꽉 찰 때마다 기존 길이의 절반(<code>oldCapacity >> 1</code>)만큼 늘린다. 그래서 배열 길이는 10 → 15 → 22 → 33 → 49 순서로 커진다. 예외 메시지의 33은 이 순서의 네 번째 배열이다. 공개 메서드 <code>add(E)</code>는 내부 도우미 <code>add(e, elementData, size)</code>를 부르는데, 자바는 메서드 인자를 왼쪽에서 오른쪽으로 평가하므로(JLS 15.7.4) <code>elementData</code> 필드를 먼저 읽고 <code>size</code> 필드를 그다음에 읽는다. 이 두 읽기 사이의 틈이 예외의 출발점이다. 메시지와 정확히 맞아떨어지는 실행 순서는 이렇다.</p>
+<figure class="flow-figure"><figcaption>"Index 34 out of bounds for length 33"이 만들어지는 순서</figcaption><ol class="flow">
+<li><strong>스레드 X: 배열 참조를 읽는다</strong><span><code>elementData</code> 필드에서 길이 33인 배열의 참조를 읽어 인자로 준비한다. 이때 <code>size</code>는 33 이하다.</span></li>
+<li><strong>다른 스레드들: 배열을 채우고 늘린다</strong><span>다른 스레드들이 계속 추가해 <code>size</code>가 33이 되고, <code>s == 33</code>을 본 스레드가 <code>grow()</code>로 길이 49인 새 배열을 만들어 필드를 바꾼 뒤 33번 칸에 쓰고 <code>size</code>를 34로 만든다.</span></li>
+<li><strong>스레드 X: size를 읽는다</strong><span>이제서야 <code>size</code>를 읽어 <code>s = 34</code>를 얻는다. 손에 든 배열은 여전히 길이 33인 옛 배열이다.</span></li>
+<li><strong>스레드 X: 늘리기 검사를 건너뛴다</strong><span>검사는 <code>s == elementData.length</code>, 즉 34와 33이 같은지만 본다. 같지 않으므로 <code>grow()</code>를 부르지 않는다.</span></li>
+<li><strong>스레드 X: 범위 밖에 쓴다</strong><span><code>elementData[34] = e</code>를 길이 33 배열에 실행해 JVM이 <code>ArrayIndexOutOfBoundsException</code>을 던진다. 배열 접근의 범위 검사는 JVM 명세가 <code>aastore</code> 명령에 요구하는 것이어서, 데이터 경합 속에서도 배열 밖 메모리를 덮어쓰는 일은 일어나지 않는다.</span></li>
+</ol></figure>
+<p>이 검사 <code>s == elementData.length</code>는 단일 스레드에서는 완벽하다. 한 스레드 안에서 <code>size</code>는 1씩만 늘어나므로 언젠가 반드시 배열 길이와 정확히 같아지는 순간을 지나고, 그때 배열이 늘어난다. 이 검사가 <code>>=</code>가 아니라 <code>==</code>인 것은 결함이 아니라, 클래스가 전제한 "한 스레드만 쓴다"는 조건 아래서는 둘이 같기 때문이다. 여러 스레드가 끼어들면 두 필드를 서로 다른 시점에 읽게 되고, 전제가 깨진 코드는 설계자가 고려하지 않은 상태에 놓인다.</p>
+<h4>null 칸과 사라진 원소</h4>
+<p>크기가 모자라는 것은 앞 절의 덮어쓰기로 설명된다. 두 스레드가 같은 <code>s</code>를 읽으면 같은 칸에 쓰고 둘 다 <code>size = s + 1</code>을 쓰므로, 원소 하나가 흔적 없이 사라진다. 흥미로운 차이가 하나 있다. <code>PlainMiniList</code>는 <code>size++</code>로 그 순간의 필드 값을 다시 읽어 늘리므로, 덮어쓰기가 일어나도 <code>size</code>는 두 번 늘어 빈 칸이 생긴다. 반면 <code>ArrayList</code>는 처음에 읽은 지역 변수 <code>s</code>로 <code>size = s + 1</code>을 계산하므로, 같은 덮어쓰기에서 <code>size</code>도 한 번만 늘고 빈 칸은 생기지 않는다. 그래서 <code>ArrayList</code>의 <code>null</code> 칸은 <code>PlainMiniList</code>보다 훨씬 적게(수십에서 수천 개) 나왔다.</p>
+<p>그래도 <code>ArrayList</code>에 <code>null</code> 칸이 생긴다는 것은 "<code>size</code>는 그 칸 너머로 늘었는데 그 칸에 대한 쓰기는 지금의 배열에 남지 않은" 상태가 만들어졌다는 뜻이다. 여기서 프로그램 순서만 따라가는 추적은 한계에 부딪힌다. JLS 17.4.5는 같은 변수에 대한 두 접근 중 하나가 쓰기이고 둘 사이에 happens-before 관계가 없으면 그 프로그램에 데이터 경합(data race)이 있다고 정의한다. 데이터 경합이 있는 프로그램에서 자바 메모리 모델은 한 스레드가 차례로 한 두 쓰기(배열 칸, 그다음 <code>size</code>)가 다른 스레드에게 같은 순서로 보인다고 보장하지 않는다. 다른 스레드가 늘어난 <code>size</code>는 보면서 그 칸은 아직 비어 있는 배열을 <code>grow()</code>로 복사하는 일도 허용된다. 5회에서 본 것처럼 가시성은 동기화가 만들어 주는 것이지, 시간이 지나면 저절로 생기는 것이 아니다.</p>
+<h4>HashMap: 사라지는 키, 그리고 끝나지 않는 루프</h4>
+<p><code>HashMap</code>에서 키가 사라지는 가장 단순한 경로는 <code>putVal</code>의 첫 분기에서 보인다. OpenJDK 21 소스에서 빈 버킷에 노드를 넣는 부분은 다음 두 줄이다.</p>
+<pre><code class="language-java">if ((p = tab[i = (n - 1) & hash]) == null)
+    tab[i] = newNode(hash, key, value, null);</code></pre>
+<p>읽고(<code>tab[i] == null</code>인지 확인), 판단하고, 쓰는(<code>tab[i] = ...</code>) 전형적인 확인 후 실행이다. 서로 다른 키 두 개가 같은 버킷에 들어갈 때 두 스레드가 동시에 이 분기에 들어오면, 둘 다 버킷이 비었다고 보고 각자 새 노드를 쓴다. 나중에 쓴 노드가 먼저 쓴 노드를 덮어쓰고, 먼저 들어간 키는 맵에서 사라진다. 같은 일이 연결 리스트 끝에 노드를 붙일 때도, 테이블을 두 배로 늘리며 노드를 옮길 때도 일어날 수 있다. 크기 카운터도 <code>++size</code>로 늘리므로 갱신 손실이 생긴다. 뒤에서 볼 <code>ConcurrentHashMap</code>은 바로 이 두 줄을 CAS 한 번으로 바꿔 문제를 없앤다.</p>
+<p>더 극적인 일도 있었다. <code>hashmap</code> 실험을 열 번 남짓 돌리는 동안 한 번은 프로그램이 끝나지 않았다. 2분이 지나도 멈추지 않아 <code>jstack</code>으로 스레드 덤프를 떠 보니, 한 작업 스레드가 다음 상태에 머물러 있었다.</p>
+<pre data-label="jstack 출력 일부"><code class="language-text">"Thread-1" #21 [26883] prio=5 os_prio=31 cpu=122777.03ms elapsed=123.54s ... runnable
+   java.lang.Thread.State: RUNNABLE
+	at java.util.HashMap$TreeNode.balanceInsertion(java.base@21.0.13/HashMap.java:2398)
+	at java.util.HashMap$TreeNode.treeify(java.base@21.0.13/HashMap.java:2104)
+	at java.util.HashMap.treeifyBin(java.base@21.0.13/HashMap.java:778)
+	at java.util.HashMap.putVal(java.base@21.0.13/HashMap.java:650)
+	at java.util.HashMap.put(java.base@21.0.13/HashMap.java:618)
+	at NoPauseRace.lambda$main$2(NoPauseRace.java:26)</code></pre>
+<p>경과 시간 123.5초 중 CPU 시간이 122.8초다. 이 스레드는 기다리는 것이 아니라 2분 내내 CPU 한 개를 붙잡고 계산하고 있었다(<code>ps</code>로 본 프로세스 CPU 사용률도 98%였다). 멈춘 곳은 버킷을 레드-블랙 트리로 바꾸는 <code>treeify</code> 안의 <code>balanceInsertion</code>이다. 이 메서드의 루프는 삽입한 노드에서 출발해 <code>x = xpp</code>로 할아버지 노드로 올라가기를 반복하다가, 부모가 없는 노드(루트)에 닿거나, 부모가 검은 노드이거나, 할아버지가 없으면 끝난다. 이 종료 조건은 부모 링크가 루트에서 끝나는 트리 모양을 이룬다는 전제 위에 서 있다. 동시 수정으로 부모 링크가 순환을 이루면 루프는 종료 조건을 영영 만나지 못한다. 이번 실험에서 링크의 실제 모양까지 들여다보지는 않았지만, CPU를 쓰며 2분 동안 같은 메서드에 머물렀다는 것은 이 루프가 끝나지 않았다는 뜻이다. 이 상태는 예외도 로그도 남기지 않는다. 운영 환경이었다면 "CPU 하나가 100%인데 아무 일도 안 하는" 서버로 나타났을 것이다.</p>
+<aside class="keyidea"><span>이 절의 핵심</span><p>동기화 없는 컬렉션을 여러 스레드가 수정하면 결과는 "값이 조금 틀린다"에 그치지 않는다. 원소가 사라지고, 크기와 내용이 어긋나고, 단일 스레드에서는 나올 수 없는 예외가 나고, 내부 링크가 엉켜 루프가 끝나지 않는다. 어떤 증상이 나올지는 실행마다 다르고, 증상이 나오지 않았다고 해서 안전한 것도 아니다.</p></aside>
+
+<h3>synchronized로 고치기</h3>
+<p>가장 직접적인 해결은 6회에서 배운 <code>synchronized</code>를 리스트의 메서드에 붙이는 것이다. 인스턴스 메서드에 붙인 <code>synchronized</code>는 그 메서드를 부른 객체(<code>this</code>)의 모니터 락을 잡고 들어가고 나올 때 놓는다. 같은 객체에 대해 <code>add</code>, <code>get</code>, <code>size</code> 중 어느 것을 부르든 같은 락을 다투므로, 한 스레드가 <code>add</code>의 오프셋 0부터 21까지를 실행하는 동안 다른 스레드는 그 객체의 어떤 동기화 메서드에도 들어올 수 없다.</p>
+<pre><code class="language-java">import java.util.Arrays;
+
+public class SyncMiniList<E> implements MiniList<E> {
+    private final Object[] elements;
+    private int size;
+    private final long pauseMillis;
+
+    public SyncMiniList(int capacity, long pauseMillis) {
+        this.elements = new Object[capacity];
+        this.pauseMillis = pauseMillis;
+    }
+
+    @Override
+    public synchronized void add(E e) {
+        elements[size] = e;
+        pause();
+        size++;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public synchronized E get(int index) {
+        return (E) elements[index];
+    }
+
+    @Override
+    public synchronized int size() {
+        return size;
+    }
+
+    // pause()는 PlainMiniList와 같다
+
+    @Override
+    public synchronized String toString() {
+        return Arrays.toString(Arrays.copyOf(elements, size)) + " size=" + size;
+    }
+}</code></pre>
+<pre data-label="실행 결과 (java TwoWriters sync)"><code class="language-text">[A, B] size=2
+[A, B] size=2</code></pre>
+<p>이번에는 두 원소가 모두 남았다. 먼저 락을 잡은 스레드가 저장, 대기, 증가를 모두 마칠 때까지 다른 스레드는 <code>BLOCKED</code> 상태로 기다리므로, 두 번째 스레드는 반드시 증가된 <code>size</code>를 읽는다. 어느 스레드가 먼저 락을 잡을지는 정해져 있지 않으므로 <code>[B, A]</code>가 나올 수도 있다. 보장되는 것은 순서가 아니라 "두 추가가 서로 겹치지 않는다"는 것이다.</p>
+<p><code>synchronized</code>가 주는 것은 상호 배제만이 아니다. JLS 17.4.5는 한 모니터의 해제(unlock)가 같은 모니터의 이후 모든 획득(lock)보다 happens-before라고 정한다. 그래서 첫 스레드가 락을 놓기 전에 한 모든 쓰기(배열 칸, <code>size</code>)는 다음에 락을 잡은 스레드에게 빠짐없이 보인다. 이것이 <code>get</code>과 <code>size</code>에도 <code>synchronized</code>를 붙여야 하는 이유다. 읽기 메서드가 락을 잡지 않으면 쓰기 스레드와의 사이에 happens-before 관계가 생기지 않아, 늘어난 <code>size</code>를 보지 못하거나 <code>size</code>는 보면서 배열 칸의 값은 보지 못하는 데이터 경합이 그대로 남는다. 읽기만 하니까 괜찮다는 생각은 가시성 문제를 잊은 것이다.</p>
+<p>대가도 분명하다. 이제 이 리스트에 대한 모든 연산이 한 줄로 선다. 두 스레드가 서로 다른 인덱스를 읽기만 하는 경우처럼 실제로는 충돌하지 않는 연산까지 순서대로 처리된다. 그리고 이 방식은 리스트 클래스의 소스를 직접 고쳐야 한다. <code>ArrayList</code>처럼 JDK가 제공하는 클래스에는 손을 댈 수 없고, 동기화가 필요 없는 단일 스레드 용도에도 매번 락 비용을 내게 된다. 같은 리스트 로직을 동기화 버전과 비동기화 버전으로 두 벌 유지하는 것도 바람직하지 않다.</p>
+
+<h3>고치지 않고 감싸기: 프록시</h3>
+<p>스프링 핵심 원리 고급편에서 본 프록시(proxy)를 떠올려 보자. 클라이언트는 인터페이스에만 의존하고, 실제 객체 앞에 같은 인터페이스를 구현한 대리 객체를 끼워 넣어 부가 기능을 더한다. 원본 객체는 그대로 두고 호출 경로에만 무언가를 얹는다는 점에서 데코레이터 패턴(decorator pattern)과 같은 구조다. 동기화도 부가 기능의 하나로 볼 수 있다. "이 리스트의 연산을 한 번에 한 스레드씩만 통과시킨다"는 기능을 원본 리스트 바깥에 두는 것이다.</p>
+<pre><code class="language-java">public class GuardedMiniList<E> implements MiniList<E> {
+    private final MiniList<E> target;
+
+    public GuardedMiniList(MiniList<E> target) {
+        this.target = target;
+    }
+
+    @Override
+    public synchronized void add(E e) {
+        target.add(e);
+    }
+
+    @Override
+    public synchronized E get(int index) {
+        return target.get(index);
+    }
+
+    @Override
+    public synchronized int size() {
+        return target.size();
+    }
+
+    @Override
+    public synchronized String toString() {
+        return target.toString() + " by " + getClass().getSimpleName();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (java TwoWriters guarded)"><code class="language-text">[A, B] size=2 by GuardedMiniList
+[A, B] size=2 by GuardedMiniList</code></pre>
+<p><code>GuardedMiniList</code>는 리스트 로직을 하나도 갖고 있지 않다. 모든 메서드가 자기 모니터를 잡은 채 <code>target</code>에게 위임할 뿐이다. 그런데도 동기화되지 않은 <code>PlainMiniList</code>를 감싸자 결과가 바로잡혔다. <code>javap -v</code>로 보면 프록시의 <code>add</code>에는 <code>flags: (0x0021) ACC_PUBLIC, ACC_SYNCHRONIZED</code>가 붙어 있다. 6회에서 본 것처럼 동기화 메서드는 바이트코드에 <code>monitorenter</code>를 넣는 대신 이 플래그로 표시되고, JVM이 메서드 호출과 반환 때 락을 잡고 놓는다. 위임 대상 <code>PlainMiniList</code>의 <code>add</code>는 여전히 동기화되어 있지 않지만, 그 메서드에 들어가는 길이 프록시의 락 하나로만 열려 있으므로 안쪽 코드는 사실상 한 번에 한 스레드만 실행한다.</p>
+<pre class="diagram">  클라이언트 코드                      힙
+  ────────────────           ┌──────────────────────────────┐
+  MiniList<String> list ───▶ │ GuardedMiniList  (프록시)      │
+                             │  모니터 락 ◀── 모든 메서드가 이 락을 잡는다
+                             │  target ───────────────┐      │
+                             └────────────────────────│──────┘
+                                                      ▼
+                             ┌──────────────────────────────┐
+                             │ PlainMiniList  (실제 객체)      │
+                             │  elements[], size            │
+                             │  동기화 없음 — 프록시를 거쳐야만 안전 │
+                             └──────────────────────────────┘</pre>
+<p>이 구조의 안전성에는 조건이 하나 붙는다. 모든 접근이 프록시를 거쳐야 한다. 누군가 <code>PlainMiniList</code>의 참조를 따로 쥐고 있다가 프록시를 거치지 않고 <code>add</code>를 부르면, 그 호출은 프록시의 락과 아무 관계가 없으므로 다른 스레드의 프록시 경유 호출과 그대로 경합한다. 락은 데이터에 붙어 있는 것이 아니라 코드 경로에 붙어 있다. 그래서 프록시를 만들 때는 원본 참조가 밖으로 새지 않게 생성 시점에 바로 감싸 버리는 것이 정석이다(<code>new GuardedMiniList<>(new PlainMiniList<>(...))</code>처럼 원본을 변수에 담지 않는다).</p>
+<pre class="diagram">원본 참조가 새어 나간 경우
+
+  스레드 1 ──▶ GuardedMiniList.add()  [프록시 락 획득] ──▶ PlainMiniList.add()
+                                                              ▲
+  스레드 2 ─────────────────────────────────(락 없이 직접 호출)─┘
+           두 호출이 PlainMiniList 안에서 겹친다 → 앞 절의 덮어쓰기가 다시 가능</pre>
+<p>스프링의 프록시와 비교하면 차이도 보인다. 스프링은 런타임에 리플렉션이나 바이트코드 생성으로 프록시 클래스를 만들지만, 여기서는 인터페이스의 메서드 수만큼 위임 코드를 손으로 썼다. 인터페이스에 메서드가 수십 개라면 그만큼 써야 한다. JDK는 이 수고를 대신해 컬렉션 인터페이스마다 동기화 프록시를 미리 만들어 두었다.</p>
+<x-visual id="java-adv1-11-sync-proxy" title="동기화 프록시의 객체 구조" kind="구조도" ratio="16:9">
+<x-hint>클라이언트가 인터페이스 타입으로 프록시를 참조하고, 프록시가 자기 락을 잡은 채 실제 리스트에 위임하는 구조와, 원본을 직접 호출하면 락을 우회한다는 점을 보여 준다.</x-hint>
+<x-prompt>왼쪽에 사람 아이콘 두 개 "스레드 1", "스레드 2". 가운데에 큰 상자 "동기화 프록시"가 있고 상자 위쪽에 자물쇠 아이콘과 라벨 "모니터 락 하나". 오른쪽에 상자 "실제 리스트"가 있고 그 안에 작은 배열 칸 그림과 "size". 스레드 1에서 프록시로 초록 화살표 "add()", 프록시에서 실제 리스트로 화살표 "위임". 스레드 2에서 프록시를 건너뛰고 실제 리스트로 곧장 가는 빨간 점선 화살표 "직접 호출: 락 우회". 하단에 작은 글씨 "모든 접근이 프록시를 거칠 때만 안전". 흰 배경, 단순한 플랫 다이어그램, 파란색 상자.</x-prompt>
+<x-caption>동기화 프록시는 자기 락으로 위임 경로를 지킨다. 원본을 직접 부르는 경로는 지키지 못한다.</x-caption>
+</x-visual>
+
+<h3>JDK가 만들어 둔 프록시: Collections.synchronizedXxx</h3>
+<p><code>java.util.Collections</code>에는 동기화 프록시를 만드는 정적 팩토리 메서드가 여덟 개 있다. <code>synchronizedCollection</code>, <code>synchronizedList</code>, <code>synchronizedSet</code>, <code>synchronizedSortedSet</code>, <code>synchronizedNavigableSet</code>, <code>synchronizedMap</code>, <code>synchronizedSortedMap</code>, <code>synchronizedNavigableMap</code>다. 이름은 다르지만 구조는 모두 같다. OpenJDK 21 소스에서 가장 바탕이 되는 <code>SynchronizedCollection</code>을 보자.</p>
+<pre><code class="language-java">static class SynchronizedCollection<E> implements Collection<E>, Serializable {
+    final Collection<E> c;  // Backing Collection
+    final Object mutex;     // Object on which to synchronize
+
+    SynchronizedCollection(Collection<E> c) {
+        this.c = Objects.requireNonNull(c);
+        mutex = this;
+    }
+
+    SynchronizedCollection(Collection<E> c, Object mutex) {
+        this.c = Objects.requireNonNull(c);
+        this.mutex = Objects.requireNonNull(mutex);
+    }
+
+    public int size() {
+        synchronized (mutex) {return c.size();}
+    }
+    public boolean add(E e) {
+        synchronized (mutex) {return c.add(e);}
+    }
+    public boolean remove(Object o) {
+        synchronized (mutex) {return c.remove(o);}
+    }
+    // ... contains, toArray, addAll, removeAll, clear, toString 도 같은 모양
+
+    public Iterator<E> iterator() {
+        return c.iterator(); // Must be manually synched by user!
+    }
+    @Override
+    public void forEach(Consumer<? super E> consumer) {
+        synchronized (mutex) {c.forEach(consumer);}
+    }
+    @Override
+    public Stream<E> stream() {
+        return c.stream(); // Must be manually synched by user!
+    }
+    // ...
+}</code></pre>
+<p>앞에서 손으로 만든 <code>GuardedMiniList</code>와 거의 같다. 위임 대상이 <code>c</code>이고, 락으로 쓰는 객체가 <code>mutex</code>라는 별도 필드로 빠져 있다는 점만 다르다. 생성자 하나는 <code>mutex = this</code>로 프록시 자신을 락으로 쓰고, 다른 하나는 바깥에서 받은 객체를 락으로 쓴다. 두 번째 생성자는 <code>synchronizedMap</code>의 <code>keySet()</code>, <code>values()</code>, <code>entrySet()</code> 뷰처럼 원래 프록시와 같은 락을 공유해야 하는 하위 프록시를 만들 때 쓰인다. 맵의 키 집합 뷰가 맵과 다른 락을 쓴다면 키 집합을 통한 삭제와 맵을 통한 추가가 서로를 막지 못할 것이다.</p>
+<p>소스의 주석도 놓치면 안 된다. <code>iterator()</code>, <code>spliterator()</code>, <code>stream()</code>, <code>parallelStream()</code>은 락을 잡지 않고 원본의 것을 그대로 돌려주며, 주석이 "사용자가 직접 동기화해야 한다"고 적고 있다. 반복자는 메서드 한 번으로 끝나는 연산이 아니라 <code>hasNext()</code>와 <code>next()</code>를 여러 번 부르는 긴 과정이어서, 메서드 하나를 감싸는 방식으로는 지킬 수 없기 때문이다. 반면 <code>forEach</code>와 <code>removeIf</code>는 전체 순회를 메서드 한 번 안에서 끝내므로 <code>mutex</code>를 잡은 채 실행하도록 재정의되어 있다. 이 차이는 다음 절에서 실험으로 확인한다.</p>
+<p>팩토리 메서드가 실제로 어떤 클래스의 객체를 돌려주는지 출력해 보면 다음과 같다.</p>
+<pre><code class="language-java">System.out.println(Collections.synchronizedList(new ArrayList<>()).getClass().getName());
+System.out.println(Collections.synchronizedList(new LinkedList<>()).getClass().getName());
+System.out.println(Collections.synchronizedMap(new HashMap<>()).getClass().getName());</code></pre>
+<pre data-label="실행 결과"><code class="language-text">java.util.Collections$SynchronizedRandomAccessList
+java.util.Collections$SynchronizedList
+java.util.Collections$SynchronizedMap</code></pre>
+<p><code>ArrayList</code>와 <code>LinkedList</code>가 서로 다른 클래스로 감싸진다. <code>synchronizedList</code>의 구현이 <code>list instanceof RandomAccess</code>를 검사해, 인덱스 접근이 빠른 리스트라는 표시 인터페이스(marker interface) <code>RandomAccess</code>를 프록시도 구현하도록 다른 클래스를 고르기 때문이다. 프록시가 원본의 성질을 감추지 않게 하려는 배려다. 모두 <code>Collections</code>의 중첩 클래스이고 공개되지 않은 타입이므로, 사용하는 쪽은 언제나 <code>List</code>, <code>Map</code> 같은 인터페이스 타입으로만 다룬다.</p>
+<h4>Vector와 Hashtable</h4>
+<p>자바 1.0부터 있던 <code>Vector</code>와 <code>Hashtable</code>은 프록시 없이 클래스 자체의 메서드에 <code>synchronized</code>가 붙어 있다. OpenJDK 21의 <code>Vector.add</code>는 <code>public synchronized boolean add(E e)</code>로 선언되어 있다. 앞에서 만든 <code>SyncMiniList</code>와 같은 방식이다. 두 클래스의 Javadoc은 스레드 안전성이 필요 없으면 각각 <code>ArrayList</code>와 <code>HashMap</code>을 쓰라고 권하고, <code>Hashtable</code>의 Javadoc은 더 나아가 높은 동시성이 필요하면 <code>ConcurrentHashMap</code>을 쓰라고 권한다. 동기화 방식이 클래스에 박혀 있어 단일 스레드 용도에서도 락 비용을 내야 하고, 락이 객체 하나라는 한계는 동기화 프록시와 똑같기 때문이다.</p>
+
+<h3>메서드 하나는 안전하다, 둘은 아니다</h3>
+<p>동기화 프록시가 보장하는 것은 정확히 "메서드 한 번의 호출이 다른 호출과 겹치지 않는다"까지다. 프로그램이 원하는 일은 대개 메서드 여러 번의 조합이다. 키가 없으면 넣는다, 값을 읽어 1을 더해 다시 쓴다, 처음부터 끝까지 훑는다. 이런 복합 연산(compound action)은 메서드 경계마다 락을 놓았다가 다시 잡으므로, 그 사이에 다른 스레드가 끼어들 수 있다. 맵 하나에 "hits"라는 키의 값을 스레드 4개가 10만 번씩 1씩 올리는 실험으로 확인해 보자.</p>
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+
+public class CompoundAction {
+    static final int THREADS = 4;
+    static final int PER_THREAD = 100_000;
+
+    public static void main(String[] args) throws InterruptedException {
+        Map<String, Integer> sync = Collections.synchronizedMap(new HashMap<>());
+        run(() -> {
+            Integer old = sync.get("hits");                    // 1) 읽기
+            sync.put("hits", old == null ? 1 : old + 1);       // 2) 쓰기
+        });
+        System.out.println("synchronizedMap get+put   = " + sync.get("hits"));
+
+        Map<String, Integer> sync2 = Collections.synchronizedMap(new HashMap<>());
+        run(() -> {
+            synchronized (sync2) {                             // 클라이언트 측 락
+                Integer old = sync2.get("hits");
+                sync2.put("hits", old == null ? 1 : old + 1);
+            }
+        });
+        System.out.println("synchronized(map) 블록     = " + sync2.get("hits"));
+
+        Map<String, Integer> chm = new ConcurrentHashMap<>();
+        run(() -> {
+            Integer old = chm.get("hits");
+            chm.put("hits", old == null ? 1 : old + 1);
+        });
+        System.out.println("ConcurrentHashMap get+put = " + chm.get("hits"));
+
+        ConcurrentHashMap<String, Integer> chm2 = new ConcurrentHashMap<>();
+        run(() -> chm2.merge("hits", 1, Integer::sum));
+        System.out.println("ConcurrentHashMap merge   = " + chm2.get("hits"));
+    }
+
+    static void run(Runnable body) throws InterruptedException {
+        Thread[] ts = new Thread[THREADS];
+        for (int t = 0; t < THREADS; t++) {
+            ts[t] = new Thread(() -> {
+                for (int i = 0; i < PER_THREAD; i++) body.run();
+            });
+        }
+        for (Thread t : ts) t.start();
+        for (Thread t : ts) t.join();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (세 번 실행, 기대값은 400000)"><code class="language-text">synchronizedMap get+put   = 270681
+synchronized(map) 블록     = 400000
+ConcurrentHashMap get+put = 191456
+ConcurrentHashMap merge   = 400000
+
+synchronizedMap get+put   = 238819
+synchronized(map) 블록     = 400000
+ConcurrentHashMap get+put = 155997
+ConcurrentHashMap merge   = 400000
+
+synchronizedMap get+put   = 242425
+synchronized(map) 블록     = 400000
+ConcurrentHashMap get+put = 129135
+ConcurrentHashMap merge   = 400000</code></pre>
+<p>첫 줄이 이 절의 핵심이다. <code>synchronizedMap</code>의 <code>get</code>과 <code>put</code>은 각각 완벽하게 동기화되어 있는데도 40만 번 중 13만~16만 번의 증가가 사라졌다. 두 스레드가 모두 <code>get</code>으로 100을 읽고, 락을 놓은 사이에 각자 101을 계산하고, 차례로 <code>put</code>으로 101을 쓰면 두 번의 증가가 한 번이 된다. <code>count++</code>의 갱신 손실과 똑같은 일이 이번에는 메서드 두 개 사이에서 일어난 것이다. 동시성 컬렉션인 <code>ConcurrentHashMap</code>도 같은 방식으로 쓰면 똑같이 틀린다(세 번째 줄). 컬렉션을 무엇으로 바꾸든, 여러 호출에 걸친 불변식은 컬렉션이 지켜 줄 수 없다.</p>
+<p>두 번째 줄은 클라이언트 측 락(client-side locking)이다. 복합 연산 전체를 <code>synchronized (sync2)</code>로 감싸 하나의 임계 영역으로 만들었다. 이것이 동작하는 이유는 앞에서 본 소스에 있다. <code>synchronizedMap(m)</code>은 <code>mutex = this</code>, 즉 프록시 객체 자신을 락으로 쓴다. 그래서 바깥에서 <code>synchronized (sync2)</code>로 잡은 락과 프록시 내부의 <code>synchronized (mutex)</code>가 <b>같은 모니터</b>다. 바깥 블록 안에서 <code>get</code>과 <code>put</code>을 부르면 같은 락을 한 번 더 잡게 되는데, 6회에서 본 것처럼 자바의 모니터 락은 재진입(reentrant) 가능하므로 스스로 막히지 않는다. 이 방법은 <code>Collections.synchronizedXxx</code>의 Javadoc이 문서로 약속하는 락 객체(반환된 컬렉션 자신)를 쓰기 때문에 성립한다.</p>
+<p>네 번째 줄의 <code>merge</code>는 "읽고 계산해서 쓰기" 전체를 맵 자신이 원자적으로 처리하는 메서드다. 자바 8에서 <code>Map</code> 인터페이스에 <code>putIfAbsent</code>, <code>computeIfAbsent</code>, <code>compute</code>, <code>merge</code> 같은 디폴트 메서드가 생겼는데, 디폴트 구현은 <code>get</code>과 <code>put</code>을 조합한 것이라 그 자체로는 원자적이지 않다. 그래서 OpenJDK의 <code>SynchronizedMap</code>은 이 메서드들을 모두 재정의해 <code>synchronized (mutex) {return m.merge(key, value, remappingFunction);}</code>처럼 전체를 락 하나로 감싼다. 동기화 맵을 쓸 때도 복합 연산은 이런 메서드로 표현하는 것이 클라이언트 측 락보다 실수의 여지가 적다.</p>
+<h4>반복은 가장 긴 복합 연산이다</h4>
+<p>향상된 <code>for</code> 문은 <code>iterator()</code>를 한 번 부르고 <code>hasNext()</code>와 <code>next()</code>를 원소 수만큼 부른다. 앞에서 본 대로 동기화 프록시의 <code>iterator()</code>는 원본의 반복자를 그대로 돌려주므로, 반복 도중의 어떤 호출도 락을 잡지 않는다. 한 스레드가 <code>synchronizedList</code>에 계속 추가하는 동안 다른 스레드가 반복하면 어떻게 되는지 보자.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class SyncIter {
+    public static void main(String[] args) throws InterruptedException {
+        boolean guard = args.length > 0 && args[0].equals("guard");
+        List<Integer> list = Collections.synchronizedList(new ArrayList<>());
+        for (int i = 0; i < 1000; i++) list.add(i);
+
+        Thread writer = new Thread(() -> {
+            for (int i = 0; i < 200_000; i++) list.add(i);
+        });
+        writer.start();
+
+        int rounds = 0;
+        long sum = 0;
+        try {
+            while (writer.isAlive()) {
+                if (guard) {
+                    synchronized (list) {
+                        for (int v : list) sum += v;
+                    }
+                } else {
+                    for (int v : list) sum += v;
+                }
+                rounds++;
+            }
+            System.out.println("예외 없이 " + rounds + "회 순회");
+        } catch (ConcurrentModificationException e) {
+            System.out.println(rounds + "회 순회 뒤 " + e);
+        }
+        writer.join();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">$ java SyncIter          (세 번 실행)
+0회 순회 뒤 java.util.ConcurrentModificationException
+0회 순회 뒤 java.util.ConcurrentModificationException
+0회 순회 뒤 java.util.ConcurrentModificationException
+$ java SyncIter guard
+예외 없이 699376회 순회</code></pre>
+<p>락 없이 반복한 세 번은 모두 첫 순회를 마치기도 전에 <code>ConcurrentModificationException</code>으로 끝났다. 이 예외는 <code>ArrayList</code>의 반복자가 만들어질 때 리스트의 수정 횟수(<code>modCount</code>)를 기억해 두었다가, <code>next()</code>를 부를 때마다 현재 값과 비교해 다르면 던지는 것이다. 이름에 "Concurrent"가 들어 있지만 동시성 전용 장치는 아니다. 한 스레드가 반복 도중 자기 손으로 원소를 추가해도 똑같이 던진다. 그리고 <code>ArrayList</code>의 Javadoc은 이 페일 패스트(fail-fast) 동작이 최선을 다하는(best-effort) 검사일 뿐 보장되지 않으므로, 이 예외에 의존해 정확성을 확보하는 프로그램은 잘못이며 버그를 찾는 데만 써야 한다고 명시한다. 동기화 없는 <code>modCount</code> 읽기 자체가 데이터 경합이어서, 다른 스레드의 수정을 놓치고 엉뚱한 값을 읽은 채 반복이 끝날 수도 있기 때문이다.</p>
+<p><code>synchronized (list)</code>로 반복 전체를 감싸자 예외가 사라졌다. <code>Collections.synchronizedList</code>의 Javadoc이 바로 이 형태를 요구한다. 반환된 리스트를 반복자, <code>Spliterator</code>, <code>Stream</code>으로 순회할 때는 반드시 사용자가 그 리스트에 직접 동기화해야 하고, 지키지 않으면 비결정적인 동작이 생길 수 있다고 적혀 있다. <code>synchronizedMap</code>의 Javadoc 예제는 한 가지를 더 짚는다. 키 집합 <code>s = m.keySet()</code>을 순회할 때도 락은 <code>s</code>가 아니라 <code>m</code>에 걸어야 한다. 앞에서 본 두 번째 생성자 덕분에 뷰는 맵과 같은 <code>mutex</code>를 공유하고, 그 <code>mutex</code>는 맵 프록시 자신이기 때문이다.</p>
+<p>반복 횟수 699,376회는 실행마다 달라지는 값이지만, 그 의미는 생각해 볼 만하다. 락을 잡고 반복하는 동안 쓰기 스레드는 <code>add</code>에서 막혀 있다. 반복이 길어질수록 쓰기는 그만큼 오래 기다린다. 리스트가 수십만 개라면 쓰기 스레드는 순회 한 번마다 그 시간 전체를 기다려야 한다. 순회가 잦고 리스트가 크면 이 비용은 감당하기 어려워진다. 반복 도중 원본 대신 복사본을 만들어 락 밖에서 순회하는 방법(<code>synchronized (list) { copy = new ArrayList<>(list); }</code>)도 있지만, 그것은 복사 비용과 "복사 시점 이후의 변경은 보이지 않는다"는 의미 변화를 함께 받아들이는 것이다. 이 아이디어를 자료구조 차원에서 체계화한 것이 뒤에서 볼 <code>CopyOnWriteArrayList</code>다.</p>
+<aside class="note">겉보기에는 반복이 아니지만 안에서 전체를 훑는 메서드도 있다. 동기화 리스트·셋의 <code>toString()</code>, <code>equals()</code>, <code>hashCode()</code>, <code>containsAll()</code>, <code>forEach()</code>는 OpenJDK 21에서 모두 <code>mutex</code>를 잡은 채 실행되도록 구현되어 있다. <code>new ArrayList<>(syncList)</code>로 복사하는 것도 안전한데, <code>ArrayList</code>의 복사 생성자가 원본의 <code>toArray()</code>를 한 번 부르고, 동기화 프록시의 <code>toArray()</code>는 락을 잡기 때문이다. 반면 <code>stream()</code>으로 시작하는 파이프라인과 향상된 <code>for</code> 문은 락을 잡지 않는다. 어느 쪽인지는 소스에서 그 메서드가 <code>synchronized (mutex)</code>로 감싸져 있는지로 확인할 수 있다.</aside>
+
+<h3>하나의 락이 만드는 줄</h3>
+<p>동기화 프록시의 근본적인 한계는 락이 컬렉션 전체에 하나뿐이라는 것이다. 맵에 키가 백만 개 있어도, 서로 전혀 다른 키를 다루는 두 스레드가 같은 락을 다툰다. 한 연산이 오래 걸리면 그동안 다른 모든 연산이 기다린다. 이 효과를 직접 보기 위해, 한 스레드가 <code>computeIfAbsent</code>로 "apple" 키의 값을 2초 걸려 계산하는 동안 다른 스레드가 전혀 관계없는 "banana" 키를 넣게 해 보자.</p>
+<pre><code class="language-java">import java.lang.management.*;
+import java.util.*;
+
+public class WholeLockDemo {
+    public static void main(String[] args) throws Exception {
+        Map<String, String> map = Collections.synchronizedMap(new HashMap<>());
+        Thread slow = new Thread(() -> map.computeIfAbsent("apple", k -> {
+            sleep(2000);                              // 오래 걸리는 계산
+            return "computed";
+        }), "slow");
+        Thread otherKey = new Thread(() -> map.put("banana", "fast"), "other-key");
+
+        long start = System.nanoTime();
+        slow.start();
+        Thread.sleep(200);                            // slow가 먼저 락을 잡게 한다
+        otherKey.start();
+        Thread.sleep(300);
+        ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(otherKey.threadId());
+        System.out.println("other-key 상태=" + otherKey.getState() + ", 기다리는 락=" + info.getLockName());
+        otherKey.join();
+        System.out.printf("other-key 끝: %d ms%n", (System.nanoTime() - start) / 1_000_000);
+    }
+
+    static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (밀리초 값은 실행마다 조금씩 다르다)"><code class="language-text">other-key 상태=BLOCKED, 기다리는 락=java.util.Collections$SynchronizedMap@33c7353a
+other-key 끝: 2008 ms</code></pre>
+<p>"banana"를 넣는 스레드는 "apple"과 아무 관계가 없는데도 <code>BLOCKED</code> 상태로 <code>Collections$SynchronizedMap</code> 객체의 모니터를 기다렸고, "apple"의 계산이 끝난 약 2초 뒤에야 끝났다. <code>ThreadMXBean</code>이 알려 준 락 이름이 정확히 프록시 객체다(<code>@</code> 뒤의 16진수는 식별 해시코드로, 자바가 특정 값을 보장하지 않는다). <code>SynchronizedMap.computeIfAbsent</code>가 <code>mutex</code>를 잡은 채 매핑 함수를 실행하므로, 함수가 2초 동안 도는 내내 맵 전체가 잠겨 있었던 것이다.</p>
+<p>이 실험의 2초는 극단적이지만, 같은 일이 짧은 시간 단위로 끊임없이 일어나는 것이 동기화 컬렉션을 많은 스레드가 함께 쓸 때의 모습이다. 스레드가 늘어날수록 락을 기다리는 시간의 비중이 커지고, 락을 기다리는 스레드는 1회에서 본 것처럼 블록되었다가 깨어나며 컨텍스트 스위칭 비용까지 낸다. 읽기만 하는 스레드들도 서로를 막는다. 한 번에 한 스레드만 들어갈 수 있는 문이 하나뿐이니, 코어가 몇 개든 그 문 앞의 처리량은 한 스레드의 처리량을 넘지 못한다.</p>
+<p><code>java.util.concurrent</code> 패키지 문서는 이 차이를 용어로 구분한다. <code>Hashtable</code>과 <code>Collections.synchronizedMap(new HashMap())</code>은 "synchronized" 컬렉션이고, <code>ConcurrentHashMap</code>은 "concurrent" 컬렉션이다. 동시성 컬렉션은 스레드 안전하지만 <b>단일 배타 락으로 다스려지지 않는다</b>(<i>"not governed by a single exclusion lock"</i>). 같은 문서는 synchronized 컬렉션이 쓸모 있는 경우도 적어 둔다. 컬렉션에 대한 모든 접근을 락 하나로 막아야 할 때다. 확장성을 잃는 대가로 "이 블록 안에서는 아무도 이 컬렉션을 건드릴 수 없다"는 강한 보장을 얻는 것이다. 동시성 컬렉션은 그 보장을 포기하는 대신 여러 스레드가 동시에 들어갈 수 있게 한다.</p>
+<x-visual id="java-adv1-11-lock-granularity" title="락 하나인 동기화 맵과 빈 단위로 잠그는 ConcurrentHashMap 비교" kind="비교 그림" ratio="16:9">
+<x-hint>왼쪽은 맵 전체에 자물쇠가 하나라 모든 스레드가 줄을 서는 모습, 오른쪽은 해시 테이블의 칸마다 따로 잠그고 읽기는 잠그지 않아 스레드들이 동시에 들어가는 모습을 대비한다.</x-hint>
+<x-prompt>화면을 좌우로 나눈 비교 그림. 왼쪽 제목 "synchronizedMap". 큰 상자 하나에 커다란 자물쇠 하나 "락 하나". 상자 앞에 스레드 아이콘 다섯 개가 한 줄로 서 있고 맨 앞 하나만 상자 안으로 들어가는 화살표, 나머지에는 "BLOCKED" 라벨. 오른쪽 제목 "ConcurrentHashMap". 세로로 칸이 8개인 배열(해시 테이블)이 있고, 몇몇 칸에서 노드 사슬이 오른쪽으로 뻗어 있다. 사슬이 있는 칸의 첫 노드에만 작은 자물쇠, 빈 칸에는 "CAS" 라벨. 스레드 아이콘 다섯 개가 서로 다른 칸으로 동시에 화살표를 보내고, 그중 두 개는 안경 아이콘과 함께 "읽기: 락 없음". 흰 배경, 파랑과 주황 대비, 깔끔한 인포그래픽 스타일.</x-prompt>
+<x-caption>동기화 맵은 문이 하나다. ConcurrentHashMap은 칸마다 문이 있고, 읽기는 문을 잠그지 않는다.</x-caption>
+</x-visual>
+
+<h3>동시성 컬렉션의 지도</h3>
+<p><code>java.util.concurrent</code> 패키지 문서는 큐 말고도 여러 스레드 환경을 위해 설계된 컬렉션으로 <code>ConcurrentHashMap</code>, <code>ConcurrentSkipListMap</code>, <code>ConcurrentSkipListSet</code>, <code>CopyOnWriteArrayList</code>, <code>CopyOnWriteArraySet</code>을 꼽고, 큐 쪽에서는 <code>ConcurrentLinkedQueue</code>, <code>ConcurrentLinkedDeque</code>와 <code>BlockingQueue</code> 구현들을 소개한다. 익숙한 <code>java.util</code> 컬렉션과 짝지어 보면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>인터페이스</th><th>단일 스레드용</th><th>synchronized 컬렉션</th><th>동시성 컬렉션</th><th>동시성 쪽의 핵심 전략</th></tr></thead><tbody>
+<tr><td><code>List</code></td><td><code>ArrayList</code>, <code>LinkedList</code></td><td><code>Collections.synchronizedList</code>, <code>Vector</code></td><td><code>CopyOnWriteArrayList</code></td><td>쓸 때마다 배열 전체를 복사, 읽기는 락 없음</td></tr>
+<tr><td><code>Set</code></td><td><code>HashSet</code></td><td><code>Collections.synchronizedSet</code></td><td><code>ConcurrentHashMap.newKeySet()</code>, <code>CopyOnWriteArraySet</code></td><td>해시 맵의 키 집합 / 복사 배열</td></tr>
+<tr><td><code>NavigableSet</code></td><td><code>TreeSet</code></td><td><code>Collections.synchronizedNavigableSet</code></td><td><code>ConcurrentSkipListSet</code></td><td>CAS 기반 스킵 리스트</td></tr>
+<tr><td><code>Map</code></td><td><code>HashMap</code></td><td><code>Collections.synchronizedMap</code>, <code>Hashtable</code></td><td><code>ConcurrentHashMap</code></td><td>락 없는 읽기, 빈 칸 CAS, 칸 단위 락</td></tr>
+<tr><td><code>NavigableMap</code></td><td><code>TreeMap</code></td><td><code>Collections.synchronizedNavigableMap</code></td><td><code>ConcurrentSkipListMap</code></td><td>CAS 기반 스킵 리스트</td></tr>
+<tr><td><code>Queue</code>, <code>Deque</code></td><td><code>ArrayDeque</code>, <code>LinkedList</code></td><td>(전용 팩토리 없음)</td><td><code>ConcurrentLinkedQueue</code>, <code>ConcurrentLinkedDeque</code>, <code>BlockingQueue</code> 구현들</td><td>논블로킹 연결 리스트 / 락과 조건 변수</td></tr>
+</tbody></table></div>
+<p>표에서 빈자리도 정보다. <code>LinkedHashMap</code>, <code>LinkedHashSet</code>처럼 삽입 순서를 기억하는 맵·셋의 동시성 버전은 <code>java.util.concurrent</code>에 없다. 순서가 필요하면 정렬 순서(<code>ConcurrentSkipListMap</code>)로 대신할 수 있는지 따져 보거나, 순서를 지키는 컬렉션을 동기화 프록시로 감싸 쓰는 수밖에 없다. 그리고 <code>Collections</code>에는 큐 전용 동기화 팩토리가 없다. 여러 스레드가 함께 쓰는 큐는 처음부터 동시성 큐로 설계하라는 뜻으로 읽을 수 있다.</p>
+<h4>동시성 컬렉션의 공통 계약</h4>
+<p>이 클래스들은 저마다 자료구조가 다르지만 몇 가지 약속을 공유한다. 첫째, 대부분의 반복자는 페일 패스트가 아니라 <b>약한 일관성(weakly consistent)</b>을 갖는다. 패키지 문서의 정의는 세 줄이다. 다른 연산과 동시에 진행될 수 있고, <code>ConcurrentModificationException</code>을 절대 던지지 않으며, 반복자를 만든 시점에 있던 원소는 정확히 한 번씩 순회하되 그 뒤의 변경은 반영할 수도 있고 안 할 수도 있다. "보장되지 않는 것"이 명확히 정의되어 있다는 점에서, 운에 맡기는 페일 패스트 검사와는 성격이 다르다.</p>
+<p>둘째, 메모리 일관성 효과(memory consistency effects)다. 패키지 문서는 한 스레드가 어떤 객체를 동시성 컬렉션에 넣기 전에 한 동작은, 다른 스레드가 그 원소를 컬렉션에서 꺼내거나 접근한 뒤의 동작보다 happens-before라고 정한다. 생산자 스레드가 객체의 필드를 다 채운 뒤 <code>ConcurrentHashMap</code>에 넣으면, 소비자 스레드는 그 객체를 맵에서 얻은 순간부터 채워진 필드를 볼 수 있다는 뜻이다. 그 객체의 필드에 <code>volatile</code>을 붙이지 않아도 된다. 이 보장은 "넣은 시점까지"의 쓰기에만 적용되며, 컬렉션에 넣은 뒤에 객체를 고치는 것은 별도의 동기화가 필요하다.</p>
+<p>셋째, 대부분은 <code>null</code>을 원소나 키·값으로 받지 않는다. <code>ConcurrentHashMap</code>, <code>ConcurrentSkipListMap</code>, <code>ConcurrentLinkedQueue</code> 모두 그렇고, 이유는 뒤 절에서 다룬다. 예외는 <code>CopyOnWriteArrayList</code>로, Javadoc이 <code>null</code>을 포함한 모든 원소를 허용한다고 밝힌다. 넷째, 크기를 묻는 연산이 정확하지 않거나 싸지 않을 수 있다. 동시에 바뀌고 있는 컬렉션의 "현재 크기"는 묻는 순간 이미 과거의 값이 되기 때문이다.</p>
+<h4>정렬이 필요할 때: ConcurrentSkipListMap</h4>
+<p><code>TreeMap</code>은 레드-블랙 트리라서, 삽입 하나가 트리의 회전을 일으켜 여러 노드의 링크를 한꺼번에 바꾼다. 여러 링크를 한꺼번에 바꾸는 연산은 CAS 한 번으로 원자적으로 만들 수 없으므로, 트리를 여러 스레드가 함께 고치려면 큰 범위의 락이 필요해진다. <code>ConcurrentSkipListMap</code>은 자료구조 자체를 스킵 리스트(skip list)로 바꿔 이 문제를 피한다. 스킵 리스트는 정렬된 연결 리스트 위에 원소의 일부만 연결한 "급행" 리스트를 여러 층 쌓은 구조다. 검색은 가장 위층에서 출발해 목표를 지나치기 직전까지 달린 뒤 한 층씩 내려간다. 삽입과 삭제가 바꾸는 것은 각 층에서 이웃 노드의 <code>next</code> 링크 하나씩이고, 링크 하나는 CAS로 바꿀 수 있다.</p>
+<p>Javadoc은 <code>containsKey</code>, <code>get</code>, <code>put</code>, <code>remove</code>에 대해 기대 평균 <i>log(n)</i> 시간 비용을 제공한다고 적고, 삽입·삭제·갱신·접근이 여러 스레드에서 안전하게 동시에 실행된다고 밝힌다. OpenJDK 21 소스의 구현 주석은 노드 삭제(값을 CAS로 <code>null</code>로 바꾸고, 표식 노드를 CAS로 붙이고, 앞 노드의 링크를 CAS로 건너뛰게 하는 단계)와 인덱스 층의 연결·해제를 모두 CAS로 처리한다고 설명한다. Javadoc의 몇 가지 주의도 기억해 둘 만하다. 오름차순 뷰와 그 반복자가 내림차순보다 빠르고, <code>putAll</code>, <code>equals</code>, <code>toArray</code>, <code>containsValue</code>, <code>clear</code> 같은 대량 연산은 원자적으로 수행된다는 보장이 없다. 반환되는 <code>Map.Entry</code>는 만들어진 시점의 스냅숏이라 <code>setValue</code>를 지원하지 않는다. <code>ConcurrentSkipListSet</code>은 내부에 <code>ConcurrentNavigableMap</code>을 하나 두고 그 키 집합으로 동작한다.</p>
+<h4>큐: ConcurrentLinkedQueue와 BlockingQueue</h4>
+<p><code>ConcurrentLinkedQueue</code>의 Javadoc은 이 구현이 Maged M. Michael과 Michael L. Scott의 논문에 기술된 논블로킹(non-blocking) 알고리즘을 바탕으로 한다고 밝힌다. 머리와 꼬리의 링크를 CAS로 옮기므로 어떤 스레드도 락을 잡고 다른 스레드를 막지 않는다. 대신 <code>size()</code>는 상수 시간 연산이 아니다. 원소 수를 알려면 전체를 순회해야 하고(O(n)), 순회 도중 원소가 바뀌면 부정확한 값을 낼 수 있어서 동시성 프로그램에서는 대개 쓸모가 없다고 Javadoc이 직접 경고한다. 큐가 비었을 때 기다려야 하는 생산자-소비자 구조라면 8회와 9회에서 다룬 <code>BlockingQueue</code> 구현(<code>ArrayBlockingQueue</code>, <code>LinkedBlockingQueue</code> 등)을 쓴다. 이 큐들은 다음 회차의 스레드 풀에서 작업 대기열로 다시 등장한다.</p>
+
+<h3>ConcurrentHashMap의 읽기: 락 없이 읽는다</h3>
+<p>이제 동시성 컬렉션 중 가장 많이 쓰이는 <code>ConcurrentHashMap</code> 안으로 내려가 보자. 클래스 Javadoc의 첫 문장이 설계 목표를 요약한다. 검색(retrieval)에는 완전한 동시성을, 갱신에는 높은 기대 동시성을 제공하는 해시 테이블이다. 그리고 모든 연산이 스레드 안전하지만 검색 연산은 락을 잡지 <b>않으며</b>, 테이블 전체를 잠가 모든 접근을 막는 기능은 지원하지 <b>않는다</b>고 명시한다. 소스 안의 구현 주석도 주된 설계 목표를 "동시 읽기 가능성을 유지하면서 갱신 경합을 최소화하는 것"이라고 적는다.</p>
+<p>바탕 자료구조는 <code>HashMap</code>과 같은 버킷(bin) 배열이다. OpenJDK 21에서 필드와 노드는 이렇게 선언되어 있다.</p>
+<pre><code class="language-java">transient volatile Node<K,V>[] table;          // 버킷 배열. 첫 삽입 때 2의 거듭제곱 크기로 만든다
+
+static class Node<K,V> implements Map.Entry<K,V> {
+    final int hash;
+    final K key;
+    volatile V val;
+    volatile Node<K,V> next;
+    // ...
+}
+
+static final int MOVED     = -1; // hash for forwarding nodes
+static final int TREEBIN   = -2; // hash for roots of trees
+static final int RESERVED  = -3; // hash for transient reservations
+static final int HASH_BITS = 0x7fffffff; // usable bits of normal node hash
+
+static final int spread(int h) {
+    return (h ^ (h >>> 16)) & HASH_BITS;
+}</code></pre>
+<p>노드의 <code>hash</code>와 <code>key</code>는 <code>final</code>이고, 값 <code>val</code>과 다음 노드 링크 <code>next</code>는 <code>volatile</code>이다. 키는 노드가 만들어진 뒤 바뀌지 않으므로 <code>final</code> 필드의 초기화 안전성(JLS 17.5)으로 충분하고, 값과 링크는 다른 스레드가 바꿀 수 있으므로 <code>volatile</code>로 가시성을 확보한다. <code>spread</code>는 키의 <code>hashCode()</code> 상위 16비트를 하위 16비트에 XOR로 섞는다. 버킷 인덱스는 <code>(n - 1) & hash</code>로 하위 비트만 쓰므로, 상위 비트에만 차이가 있는 해시들이 한 버킷에 몰리지 않게 하려는 것이다. 마지막의 <code>& HASH_BITS</code>는 부호 비트를 지운다. 일반 노드의 해시는 언제나 0 이상이고, 음수 해시는 트리 루트(<code>TREEBIN</code>), 리사이즈 중 옮겨진 칸의 표지(<code>MOVED</code>), 계산 중인 자리의 예약(<code>RESERVED</code>) 같은 특수 노드의 몫으로 남겨 둔 것이다.</p>
+<p>테이블은 생성자에서 만들지 않는다. 기본 생성자는 물론이고 초기 용량을 준 생성자도 크기만 계산해 두고, 첫 삽입 때 배열을 만든다. 리플렉션으로 확인해 보면(<code>--add-opens java.base/java.util.concurrent=ALL-UNNAMED</code>로 실행) <code>new ConcurrentHashMap<>()</code>의 <code>table</code>은 첫 <code>put</code> 전에는 <code>null</code>이고, 첫 <code>put</code> 뒤에 길이 16이 된다. 초기 용량 12와 16을 주면 32, 64를 주면 128이 된다. OpenJDK 21의 생성자가 <code>1.0 + initialCapacity / loadFactor</code>(기본 부하율 0.75)를 계산해 그보다 크거나 같은 2의 거듭제곱을 고르기 때문이다. 64를 주면 1 + 85.33을 정수로 버린 86, 그보다 큰 2의 거듭제곱은 128이다. 생성자의 인자가 "테이블 길이"가 아니라 "넣을 원소 수의 예상치"로 해석된다는 뜻이다.</p>
+<pre class="diagram">table (volatile Node[]) — 길이 16 예시
+
+ idx  ┌──────┐
+  0   │ null │
+  1   │  ●───┼──▶ Node(h=…, k="apple", v)  ──next──▶ null
+  2   │ null │
+  3   │  ●───┼──▶ Node(k="kiwi") ──▶ Node(k="plum") ──▶ null     (같은 칸에 충돌)
+  …   │      │
+ 10   │  ●───┼──▶ TreeBin(hash=-2) ──▶ 레드-블랙 트리의 TreeNode들   (8개 넘게 충돌)
+  …   │      │
+ 15   │  ●───┼──▶ ForwardingNode(hash=-1, nextTable=…)   (리사이즈 중 이미 옮긴 칸)
+      └──────┘
+ 일반 노드: hash ≥ 0, key final, val·next volatile
+ 특수 노드: hash < 0 → 읽기·쓰기 경로가 따로 처리</pre>
+<p>이제 <code>get</code>을 읽어 보자. 락도, CAS도 없다.</p>
+<pre><code class="language-java">public V get(Object key) {
+    Node<K,V>[] tab; Node<K,V> e, p; int n, eh; K ek;
+    int h = spread(key.hashCode());
+    if ((tab = table) != null && (n = tab.length) > 0 &&
+        (e = tabAt(tab, (n - 1) & h)) != null) {
+        if ((eh = e.hash) == h) {
+            if ((ek = e.key) == key || (ek != null && key.equals(ek)))
+                return e.val;
+        }
+        else if (eh < 0)
+            return (p = e.find(h, key)) != null ? p.val : null;
+        while ((e = e.next) != null) {
+            if (e.hash == h &&
+                ((ek = e.key) == key || (ek != null && key.equals(ek))))
+                return e.val;
+        }
+    }
+    return null;
+}
+
+static final <K,V> Node<K,V> tabAt(Node<K,V>[] tab, int i) {
+    return (Node<K,V>)U.getReferenceAcquire(tab, ((long)i << ASHIFT) + ABASE);
+}</code></pre>
+<p>흐름은 <code>HashMap.get</code>과 거의 같다. 다른 점은 버킷 배열의 칸을 <code>tab[i]</code>로 읽지 않고 <code>tabAt</code>으로 읽는다는 것이다. <code>table</code> 필드가 <code>volatile</code>이어도 그것은 "배열 참조"에 대한 것이지 배열의 각 원소에 대한 것이 아니다. 자바 언어에는 배열 원소를 <code>volatile</code>로 선언하는 문법이 없으므로, 소스 주석이 말하듯 테이블 접근에 필요한 volatile 수준의 읽기·쓰기·CAS를 <code>jdk.internal.misc.Unsafe</code>의 내장 연산으로 처리한다. <code>getReferenceAcquire</code>는 획득(acquire) 의미의 읽기로, 그 칸에 노드를 발행(publish)한 스레드가 발행 전에 한 쓰기(노드의 키, 해시, 값 초기화)를 이 읽기 이후에 볼 수 있게 해 준다. 첫 노드의 해시가 음수이면 특수 노드이므로 그 노드의 <code>find</code>에 검색을 맡긴다. 트리 칸이면 트리를 검색하고, 리사이즈로 옮겨진 칸이면 새 테이블에서 찾는다.</p>
+<p>읽기가 락 없이도 안전한 이유를 Javadoc은 이렇게 정리한다. 검색은 시작 시점에 <b>완료된</b> 가장 최근 갱신의 결과를 반영하고, 형식적으로는 어떤 키에 대한 갱신이 그 갱신된 값을 보고하는 (null이 아닌) 검색보다 happens-before다. 반대로 말하면 진행 중인 갱신이 있을 때 읽기는 그 갱신 전의 값을 볼 수 있다. 그리고 <code>putAll</code>이나 <code>clear</code> 같은 묶음 연산 도중의 읽기는 일부 항목만 들어가거나 빠진 상태를 볼 수 있다. "읽기가 쓰기를 기다리지 않는다"는 장점은 "읽기가 쓰기의 중간 결과를 볼 수도 있다"는 의미를 함께 갖는다. 키 하나 단위로는 일관되지만, 여러 키에 걸친 일관된 스냅숏은 주지 않는다.</p>
+
+<h3>ConcurrentHashMap의 쓰기: CAS와 칸 단위 락</h3>
+<p>쓰기의 중심은 <code>putVal</code>이다. 앞에서 본 <code>HashMap</code>의 "읽고 비었으면 쓰는" 두 줄이 여기서 어떻게 바뀌는지에 주목하며 읽자.</p>
+<pre><code class="language-java">final V putVal(K key, V value, boolean onlyIfAbsent) {
+    if (key == null || value == null) throw new NullPointerException();
+    int hash = spread(key.hashCode());
+    int binCount = 0;
+    for (Node<K,V>[] tab = table;;) {
+        Node<K,V> f; int n, i, fh; K fk; V fv;
+        if (tab == null || (n = tab.length) == 0)
+            tab = initTable();
+        else if ((f = tabAt(tab, i = (n - 1) & hash)) == null) {
+            if (casTabAt(tab, i, null, new Node<K,V>(hash, key, value)))
+                break;                   // no lock when adding to empty bin
+        }
+        else if ((fh = f.hash) == MOVED)
+            tab = helpTransfer(tab, f);
+        else if (onlyIfAbsent // check first node without acquiring lock
+                 && fh == hash
+                 && ((fk = f.key) == key || (fk != null && key.equals(fk)))
+                 && (fv = f.val) != null)
+            return fv;
+        else {
+            V oldVal = null;
+            synchronized (f) {
+                if (tabAt(tab, i) == f) {
+                    if (fh >= 0) {
+                        // 연결 리스트를 따라가며 같은 키면 값 교체, 끝까지 없으면 꼬리에 새 노드 연결
+                        // binCount = 지나간 노드 수
+                    }
+                    else if (f instanceof TreeBin) {
+                        // 트리에 삽입 (putTreeVal)
+                    }
+                    else if (f instanceof ReservationNode)
+                        throw new IllegalStateException("Recursive update");
+                }
+            }
+            if (binCount != 0) {
+                if (binCount >= TREEIFY_THRESHOLD)
+                    treeifyBin(tab, i);
+                if (oldVal != null)
+                    return oldVal;
+                break;
+            }
+        }
+    }
+    addCount(1L, binCount);
+    return null;
+}</code></pre>
+<figure class="flow-figure"><figcaption>ConcurrentHashMap.putVal의 경로</figcaption><ol class="flow">
+<li><strong>null 거부와 해시 계산</strong><span>키나 값이 <code>null</code>이면 바로 <code>NullPointerException</code>. 해시를 <code>spread</code>로 섞는다.</span></li>
+<li><strong>테이블이 없으면 만든다</strong><span><code>initTable()</code>은 <code>sizeCtl</code> 필드를 CAS로 -1로 바꾼 스레드 하나만 배열을 만들고, 나머지는 <code>Thread.yield()</code>로 양보하며 다시 확인한다.</span></li>
+<li><strong>빈 칸이면 CAS 한 번</strong><span><code>casTabAt(tab, i, null, 새 노드)</code>. 여전히 <code>null</code>일 때만 성공한다. 실패했다면 그 사이 다른 스레드가 먼저 넣은 것이므로, 루프를 처음부터 다시 돈다. 락이 전혀 없다.</span></li>
+<li><strong>옮겨진 칸이면 리사이즈를 돕는다</strong><span>첫 노드의 해시가 <code>MOVED</code>면 테이블이 커지는 중이다. <code>helpTransfer</code>로 이전 작업에 참여한 뒤 새 테이블에서 다시 시도한다.</span></li>
+<li><strong>차 있는 칸이면 첫 노드를 잠근다</strong><span><code>synchronized (f)</code>로 칸의 첫 노드의 모니터를 잡는다. 잡은 뒤 그 칸의 첫 노드가 여전히 <code>f</code>인지 다시 확인하고, 아니면 락을 놓고 처음부터 다시 돈다.</span></li>
+<li><strong>트리화와 개수 갱신</strong><span>지나간 노드가 8개 이상이면 <code>treeifyBin</code>을 부른다. 마지막으로 <code>addCount</code>가 원소 수를 늘리고 필요하면 리사이즈를 시작한다.</span></li>
+</ol></figure>
+<p>세 번째 단계가 <code>HashMap</code>의 두 줄을 대신한다. "비어 있는지 확인"과 "새 노드 쓰기"가 CAS 한 번으로 묶여, 두 스레드가 동시에 같은 빈 칸에 넣으려 해도 한쪽만 성공한다. 진 쪽은 덮어쓰지 않고 다시 돌아와, 이번에는 차 있는 칸의 경로로 가서 정상적으로 연결 리스트에 붙는다. 10회에서 본 CAS 재시도 루프가 자료구조 안에서 그대로 쓰이는 것이다. 소스 주석은 대부분의 키·해시 분포에서 put 연산의 압도적 다수가 이 빈 칸 경로를 탄다고 적는다.</p>
+<p>다섯 번째 단계에서 락으로 쓰는 것은 별도의 락 객체가 아니라 그 칸의 첫 노드다. 소스 주석은 그 이유를 칸마다 락 객체를 두는 공간 낭비를 피하려는 것이라고 설명하고, 락 지원은 내장 <code>synchronized</code> 모니터에 기댄다고 적는다. 6회에서 본 대로 자바의 모든 객체는 모니터로 쓸 수 있으므로, 이미 존재하는 노드 객체를 그대로 락으로 쓰면 추가 메모리가 들지 않는다. 다만 첫 노드를 잠그는 것만으로는 충분하지 않다. 락을 기다리는 사이 그 노드가 삭제되었거나 리사이즈로 칸 전체가 새 테이블로 옮겨졌을 수 있기 때문이다. 그래서 락을 잡은 직후 <code>tabAt(tab, i) == f</code>를 다시 확인한다. 새 노드는 언제나 리스트의 꼬리에 붙으므로, 한 번 첫 노드가 된 노드는 삭제되거나 칸이 무효화될 때까지 첫 노드로 남는다는 것이 이 재확인을 충분하게 만드는 불변식이다(소스 주석의 설명).</p>
+<p>칸 단위 락이 얼마나 자주 부딪힐까? 소스 주석은 해시가 무작위에 가깝고 부하율 0.75에서 크기를 늘린다고 할 때, 한 칸에 든 노드 수가 평균 약 0.5인 푸아송 분포를 따른다고 보고 그 확률을 표로 적어 두었다. 빈 칸일 확률이 약 0.61, 노드 하나일 확률이 약 0.30, 둘이 약 0.076이고, 여덟 개는 1억분의 6 수준이다. 이 가정 아래서 서로 다른 원소에 접근하는 두 스레드가 락을 다툴 확률은 대략 1 / (8 × 원소 수)라고 적는다. 원소가 많을수록 칸이 많아지고, 서로 다른 키를 다루는 스레드들은 대부분 서로 다른 칸, 즉 서로 다른 락을 잡는다. 주석은 같은 이유로 이 설계의 약점도 밝힌다. 사용자의 <code>equals()</code>나 매핑 함수가 오래 걸리면 같은 칸의 다른 갱신이 멈춘다.</p>
+<h4>실험: 같은 칸만 막힌다</h4>
+<p>앞의 <code>WholeLockDemo</code>를 <code>ConcurrentHashMap</code>으로 바꾸고, 같은 키("apple")를 건드리는 스레드와 다른 칸에 들어가는 키("banana")를 건드리는 스레드를 함께 띄워 보자. 두 키가 길이 16인 테이블에서 서로 다른 칸에 들어가는지는 <code>spread</code>와 같은 계산으로 미리 출력해 확인한다.</p>
+<pre><code class="language-java">import java.lang.management.*;
+import java.util.concurrent.*;
+
+public class BinLockDemo {
+    public static void main(String[] args) throws Exception {
+        ConcurrentHashMap<String, String> map = new ConcurrentHashMap<>();
+        map.put("warm-up", "x");                      // 테이블(길이 16)을 미리 만든다
+        System.out.println("bin(apple)=" + bin("apple") + ", bin(banana)=" + bin("banana"));
+
+        Thread slow = new Thread(() -> map.computeIfAbsent("apple", k -> {
+            sleep(2000);                              // 오래 걸리는 계산
+            return "computed";
+        }), "slow");
+        Thread sameKey = new Thread(() -> map.put("apple", "direct"), "same-key");
+        Thread otherKey = new Thread(() -> map.put("banana", "fast"), "other-key");
+
+        long start = System.nanoTime();
+        slow.start();
+        Thread.sleep(200);                            // slow가 먼저 칸을 잡게 한다
+        sameKey.start();
+        otherKey.start();
+        otherKey.join();
+        System.out.printf("other-key 끝: %d ms%n", (System.nanoTime() - start) / 1_000_000);
+        Thread.sleep(300);
+        ThreadInfo info = ManagementFactory.getThreadMXBean().getThreadInfo(sameKey.threadId());
+        System.out.println("same-key 상태=" + sameKey.getState() + ", 기다리는 락=" + info.getLockName());
+        sameKey.join();
+        System.out.printf("same-key 끝: %d ms, apple=%s%n", (System.nanoTime() - start) / 1_000_000, map.get("apple"));
+    }
+
+    static int bin(String key) {
+        int h = key.hashCode();
+        return (16 - 1) & ((h ^ (h >>> 16)) & 0x7fffffff);
+    }
+
+    static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (밀리초 값은 실행마다 다르고, 해시코드는 보장된 값이 아니다)"><code class="language-text">bin(apple)=1, bin(banana)=0
+other-key 끝: 205 ms
+same-key 상태=BLOCKED, 기다리는 락=java.util.concurrent.ConcurrentHashMap$ReservationNode@1d81eb93
+same-key 끝: 2004 ms, apple=direct</code></pre>
+<p>"banana"를 넣는 스레드는 출발하자마자 끝났다(205ms 중 200ms는 출발 전에 일부러 기다린 시간이다). 동기화 맵에서는 같은 상황에서 2초를 기다렸던 스레드다. 반면 같은 키 "apple"을 넣으려는 스레드는 <code>BLOCKED</code> 상태였고, 기다린 락은 <code>ConcurrentHashMap$ReservationNode</code>였다. <code>computeIfAbsent</code>가 빈 칸에서 계산을 시작할 때, OpenJDK 21 구현은 예약 노드 <code>r</code>을 만들어 <code>synchronized (r)</code>로 먼저 잠근 다음 <code>casTabAt(tab, i, null, r)</code>로 칸에 꽂아 둔다. 계산이 끝나면 <code>setTabAt</code>으로 진짜 노드로 바꾸고 락을 놓는다. 같은 칸에 온 <code>put</code>은 첫 노드인 예약 노드를 <code>synchronized</code>로 잡으려다 막힌 것이다. 계산이 끝난 뒤 락을 얻은 <code>put</code>은 재확인에서 첫 노드가 바뀐 것을 보고 다시 돌아 정상 경로로 값을 바꿨고, 그래서 최종 값이 <code>"direct"</code>다.</p>
+<p>이 실험은 앞의 <code>putVal</code> 코드에 있던 <code>throw new IllegalStateException("Recursive update")</code>도 설명해 준다. 매핑 함수 안에서 같은 맵의 같은 칸을 다시 고치려 하면, 그 스레드는 자신이 꽂아 둔 예약 노드를 만난다. 모니터는 재진입 가능하므로 막히지는 않지만, 예약 노드는 아직 값이 정해지지 않은 자리이므로 갱신을 진행할 수 없다. 구현은 이 상황을 감지할 수 있을 때 예외로 알린다. <code>computeIfAbsent</code>의 Javadoc이 매핑 함수는 계산 중에 이 맵을 수정해서는 안 된다고 못 박는 이유다.</p>
+
+<h3>테이블이 자랄 때, 개수를 셀 때</h3>
+<h4>트리화: 충돌이 심한 칸을 트리로</h4>
+<p>해시가 고르지 않거나 일부러 같은 해시를 가진 키가 몰리면 한 칸의 연결 리스트가 길어지고, 그 칸의 검색과 락 보유 시간이 원소 수에 비례해 늘어난다. 이를 막기 위해 한 칸의 노드 수가 기준을 넘으면 리스트를 레드-블랙 트리로 바꾼다. 관련 상수는 OpenJDK 21에서 <code>TREEIFY_THRESHOLD = 8</code>, <code>UNTREEIFY_THRESHOLD = 6</code>, <code>MIN_TREEIFY_CAPACITY = 64</code>다. 다만 테이블 길이가 64보다 작으면 트리로 바꾸는 대신 테이블을 키운다. 테이블이 작아서 생긴 충돌은 칸을 늘리면 풀리기 때문이다. 해시코드가 모두 42인 키를 넣으며 그 칸의 노드 타입을 리플렉션으로 엿보자.</p>
+<pre><code class="language-java">import java.lang.reflect.*;
+import java.util.concurrent.*;
+
+public class TreeBinPeek {
+    record Key(int id) implements Comparable<Key> {
+        @Override public int hashCode() { return 42; }          // 모든 키가 같은 해시
+        @Override public int compareTo(Key o) { return Integer.compare(id, o.id); }
+    }
+
+    public static void main(String[] args) throws Exception {
+        int capacity = Integer.parseInt(args[0]);
+        ConcurrentHashMap<Key, Integer> map = new ConcurrentHashMap<>(capacity);
+        Field tableField = ConcurrentHashMap.class.getDeclaredField("table");
+        tableField.setAccessible(true);
+        for (int i = 1; i <= 12; i++) {
+            map.put(new Key(i), i);
+            Object[] table = (Object[]) tableField.get(map);
+            int idx = (table.length - 1) & (42 ^ (42 >>> 16));
+            System.out.println("put #" + i + " table.length=" + table.length
+                    + " bin[" + idx + "]=" + table[idx].getClass().getSimpleName());
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (java --add-opens java.base/java.util.concurrent=ALL-UNNAMED TreeBinPeek 64)"><code class="language-text">put #1 table.length=128 bin[42]=Node
+...
+put #8 table.length=128 bin[42]=Node
+put #9 table.length=128 bin[42]=TreeBin
+put #10 table.length=128 bin[42]=TreeBin
+put #11 table.length=128 bin[42]=TreeBin
+put #12 table.length=128 bin[42]=TreeBin</code></pre>
+<p>9번째 키를 넣을 때 칸이 <code>TreeBin</code>으로 바뀌었다. 9번째 <code>put</code>은 기존 노드 8개를 지나 꼬리에 붙으므로 <code>binCount</code>가 8이 되고, <code>binCount >= TREEIFY_THRESHOLD</code>가 처음 참이 된다. 칸 자리에 들어가는 것은 트리 노드 자체가 아니라 해시가 <code>TREEBIN</code>(-2)인 <code>TreeBin</code> 객체이고, 소스 주석에 따르면 이 객체가 트리 노드 목록과 루트를 가리킨다. 삽입 뒤의 회전으로 루트가 바뀌어도 칸의 첫 노드인 <code>TreeBin</code>은 그대로이므로, 쓰기 스레드는 앞의 <code>putVal</code>대로 칸의 첫 노드를 잠그면 된다. 리스트와 달리 트리는 회전 도중에 읽기 스레드가 따라갈 수 없으므로, <code>TreeBin</code>은 읽기-쓰기 락을 하나 더 두어 구조를 바꾸려는 쓰기 스레드가 진행 중인 읽기 스레드를 기다리게 한다(역시 소스 주석의 설명). 같은 프로그램을 초기 용량 8로 돌리면 결과가 달라진다.</p>
+<pre data-label="실행 결과 (TreeBinPeek 8)"><code class="language-text">put #1 table.length=16 bin[10]=Node
+...
+put #8 table.length=16 bin[10]=Node
+put #9 table.length=128 bin[42]=Node
+put #10 table.length=128 bin[42]=TreeBin
+put #11 table.length=128 bin[42]=TreeBin
+put #12 table.length=128 bin[42]=TreeBin</code></pre>
+<p>테이블 길이 16에서 해시 42는 <code>42 & 15 = 10</code>번 칸에 들어간다. 9번째 <code>put</code>에서 트리화 조건이 맞았지만 테이블이 64보다 작으므로 <code>treeifyBin</code>은 대신 <code>tryPresize(32)</code>를 부른다. <code>tryPresize</code>는 목표 크기 <code>c</code>를 <code>tableSizeFor(32 + 16 + 1) = 64</code>로 잡고, 이 <code>c</code>가 현재의 확장 임계값(<code>sizeCtl</code>, 테이블 길이의 0.75배)보다 큰 동안 두 배 확장을 반복한다. 16(임계값 12) → 32(24) → 64(48) → 128(96)으로 커진 뒤, 64가 96보다 작아져 멈춘다. 그래서 테이블이 단번에 128이 되었고, 노드들은 <code>42 & 127 = 42</code>번 칸으로 옮겨졌다. 10번째 <code>put</code>에서는 테이블이 64 이상이므로 비로소 트리가 만들어졌다. 소스 주석에 따르면 트리는 해시 값을 먼저 비교하고, 같으면 키가 <code>Comparable</code>일 때 <code>compareTo</code>로 정렬하므로, 이 예처럼 해시가 모두 같아도 검색이 O(log n)으로 묶인다. 키가 <code>Comparable</code>이 아니면 같은 해시끼리는 양쪽 자식을 모두 뒤져야 할 수 있다.</p>
+<h4>협력 리사이즈: 막지 않고 돕는다</h4>
+<p>원소 수가 임계값을 넘으면 테이블을 두 배로 늘린다. 단일 스레드 <code>HashMap</code>의 리사이즈는 한 스레드가 새 배열을 만들어 모든 노드를 옮기는 작업이다. <code>ConcurrentHashMap</code>은 이 작업을 여러 스레드가 나눠 하게 만든다. 소스 주석의 설명을 따라가면 이렇다. 리사이즈를 시작한 스레드가 새 배열(<code>nextTable</code>)을 만들고, 옛 테이블의 칸들을 마지막 칸부터 앞쪽으로 하나씩 옮긴다. 다른 스레드들은 <code>transferIndex</code> 필드를 통해 작은 구간(최소 16칸, <code>MIN_TRANSFER_STRIDE</code>)을 할당받아 함께 옮긴다. 각 칸을 옮길 때는 그 칸의 락(첫 노드의 모니터)을 잡고, 옮긴 칸에는 해시가 <code>MOVED</code>인 <code>ForwardingNode</code>를 놓는다. 이 노드는 새 테이블의 참조를 들고 있다.</p>
+<p>이 표지 덕분에 리사이즈 도중에도 맵은 멈추지 않는다. 읽기 스레드가 <code>ForwardingNode</code>를 만나면 <code>find</code>가 새 테이블에서 찾는다. 쓰기 스레드가 만나면 앞의 <code>putVal</code> 네 번째 단계처럼 <code>helpTransfer</code>로 이전 작업에 손을 보탠 뒤 새 테이블에 쓴다. 기다리는 대신 도우므로, 소스 주석의 표현으로는 리사이즈가 진행될수록 전체 대기 시간이 짧아진다. 테이블 길이가 2의 거듭제곱이고 두 배씩 늘어나므로, 한 칸의 노드들은 새 테이블에서 같은 인덱스 <code>i</code>에 남거나 <code>i + n</code>으로 옮겨지는 두 갈래로만 나뉜다. 주석은 이 성질을 이용해 다음 링크가 바뀌지 않는 노드는 재사용하므로, 두 배 확장 때 평균적으로 약 6분의 1의 노드만 새로 만든다고 적는다.</p>
+<h4>과거의 설계: 세그먼트</h4>
+<p>지금의 구조는 처음부터 이랬던 것이 아니다. Java 7의 <code>ConcurrentHashMap</code> Javadoc은 갱신 동시성이 생성자의 <code>concurrencyLevel</code> 인자(기본값 16)로 조절되며, 그 수만큼의 동시 갱신을 경합 없이 허용하도록 테이블을 내부적으로 분할한다고 설명했다. Java 8의 Javadoc부터는 같은 인자를 "이전 버전과의 호환을 위해 받는 내부 크기 힌트"로만 설명한다. OpenJDK 21 소스에는 <code>Segment</code>라는 클래스가 <code>ReentrantLock</code>을 상속한 채 남아 있는데, 주석은 이것이 이전 버전에서 쓰던 보조 클래스의 축소판이며 직렬화 호환을 위해서만 선언되어 있다고 밝힌다. 고정된 개수의 구획마다 락을 두던 설계에서, 칸마다 첫 노드를 락으로 쓰고 빈 칸은 CAS로 채우는 설계로 바뀐 것이다. 이 변화로 락의 개수가 테이블 크기를 따라 늘어나게 되었다.</p>
+<h4>개수 세기: size()가 추정치인 이유</h4>
+<p>원소 수를 필드 하나에 두고 매번 CAS로 늘린다면, 모든 <code>put</code>이 그 필드 하나를 두고 경합하게 된다. 칸을 아무리 잘게 나눠도 카운터가 다시 병목이 되는 것이다. 소스 주석은 원소 수를 <code>LongAdder</code>를 특수화한 방식으로 관리한다고 설명한다. 기본 카운터 <code>baseCount</code>에 CAS로 더해 보고, 그 CAS가 실패하면(다른 스레드와 경합했다는 신호) <code>CounterCell</code> 배열 중 스레드마다 다르게 고른 셀에 더한다. 경합이 심할수록 셀이 늘어나 스레드들이 서로 다른 셀을 갱신한다. 크기를 물을 때는 합을 낸다.</p>
+<pre><code class="language-java">final long sumCount() {
+    CounterCell[] cs = counterCells;
+    long sum = baseCount;
+    if (cs != null) {
+        for (CounterCell c : cs)
+            if (c != null)
+                sum += c.value;
+    }
+    return sum;
+}</code></pre>
+<p>이 합산에는 락이 없다. 셀들을 차례로 읽는 동안 다른 스레드가 이미 읽은 셀이나 아직 읽지 않은 셀을 계속 바꾸므로, 결과는 "어느 한 순간의 정확한 크기"가 아니다. 그래서 Javadoc은 <code>size</code>, <code>isEmpty</code>, <code>containsValue</code> 같은 집계 상태 메서드의 결과는 다른 스레드가 동시에 갱신하지 않을 때만 유용하며, 그렇지 않으면 모니터링이나 추정에는 충분할 수 있어도 프로그램의 흐름 제어에는 맞지 않는다고 경고한다. <code>int</code>를 넘는 원소 수를 위해 Java 8에서 추가된 <code>mappingCount()</code>도 <code>long</code>을 돌려줄 뿐, 반환값이 추정치라는 점은 같다고 문서에 적혀 있다. 크기를 근거로 "100개가 넘으면 더 넣지 않는다" 같은 결정을 내리는 코드는, 확인과 행동 사이의 틈 때문에 어차피 원자적이지 않다는 점도 함께 기억하자.</p>
+
+<h3>sizeCtl 하나에 담긴 상태: 리사이즈를 멈춰 세우고 들여다보기</h3>
+<p>앞 절에서 협력 리사이즈를 소스 주석의 설명으로 따라갔다. 그런데 락을 쓰지 않는 스레드들이 "지금 테이블을 만드는 중인가", "리사이즈 중인가", "몇 개의 스레드가 옮기고 있는가"를 서로 어떻게 알까? 공유 상태는 결국 어떤 필드에 있어야 하고, 그 필드를 바꾸는 일은 CAS여야 한다. OpenJDK 21의 <code>ConcurrentHashMap</code>에서 그 역할을 하는 것은 <code>private transient volatile int sizeCtl</code> 필드 하나다. 이 정수 하나가 테이블의 생애 단계마다 다른 뜻을 갖고, 스레드들은 이 값을 읽어 지금 단계를 판단하고 CAS로 다음 단계를 차지한다.</p>
+<div class="table-wrap"><table><thead><tr><th>단계</th><th><code>sizeCtl</code>의 값</th><th>그 값을 쓰는 코드</th></tr></thead><tbody>
+<tr><td>테이블이 아직 없다</td><td>0(기본 생성자, 길이 16으로 만들라는 뜻) 또는 첫 테이블 길이(용량을 준 생성자)</td><td>생성자</td></tr>
+<tr><td>테이블을 만드는 중</td><td>-1</td><td><code>initTable</code>: CAS로 -1을 차지한 스레드 하나만 배열을 만든다</td></tr>
+<tr><td>평상시</td><td>다음 리사이즈를 시작할 원소 수, <code>n - (n >>> 2)</code> 곧 테이블 길이의 0.75배</td><td><code>initTable</code>, 리사이즈를 마무리하는 <code>transfer</code></td></tr>
+<tr><td>리사이즈 중</td><td><code>(resizeStamp(n) << 16) + 1 + 옮기는 스레드 수</code> (음수)</td><td><code>addCount</code>, <code>helpTransfer</code>, <code>tryPresize</code>, <code>transfer</code></td></tr>
+</tbody></table></div>
+<p>마지막 줄이 핵심이다. <code>resizeStamp(n)</code>은 <code>Integer.numberOfLeadingZeros(n) | (1 << 15)</code>다. 길이 16인 테이블이라면 앞쪽 0비트 수가 27이므로 스탬프는 27 | 32768 = 32795다. 이 값을 왼쪽으로 16비트 밀면 <code>1 << 15</code>로 켜 둔 비트가 int의 부호 비트 자리로 가므로 결과는 반드시 음수가 된다. 소스 주석이 "RESIZE_STAMP_SHIFT만큼 밀었을 때 음수여야 한다"고 적은 이유다. 그래서 <code>sizeCtl</code>은 위 16비트에 "어느 길이의 테이블을 옮기는 중인가"를, 아래 16비트에 "1 + 옮기고 있는 스레드 수"를 담는다. 리사이즈를 시작하는 스레드는 <code>sizeCtl</code>을 평상시 값에서 <code>(rs << 16) + 2</code>로 CAS하고, 돕는 스레드는 <code>sc</code>를 <code>sc + 1</code>로 CAS해 참여하며, 자기 몫을 마친 스레드는 <code>sc - 1</code>로 CAS해 빠진다. 아래 16비트가 넘치지 않도록 돕는 스레드 수의 상한 <code>MAX_RESIZERS</code>는 <code>(1 << 16) - 1</code>로 정해져 있다.</p>
+<pre class="diagram">리사이즈 중의 sizeCtl (n = 16, 스레드 하나가 옮기는 중)
+
+  비트 31                    16 15                      0
+     ┌──────────────────────┬─────────────────────────┐
+     │ 1000 0000 0001 1011  │ 0000 0000 0000 0010     │
+     └──────────────────────┴─────────────────────────┘
+       resizeStamp(16)        1 + 옮기는 스레드 수(1)
+       = 0x8000 | 27 = 32795   = 2
+     int로 읽으면 (32795 << 16) + 2 = -2145714174
+
+  돕는 스레드가 참여: sc → sc + 1     몫을 마치고 빠짐: sc → sc - 1
+  빠지는 스레드가 (sc - 2) == resizeStamp(n) << 16 을 보면 마지막 스레드
+      → 옛 테이블 전체를 한 번 더 훑은 뒤 table = nextTable, sizeCtl = 2n × 0.75</pre>
+<p>마지막 스레드를 가리는 방법도 이 인코딩에서 나온다. <code>transfer</code>에서 몫을 마친 스레드는 <code>sizeCtl</code>을 1 줄이는 CAS에 성공한 뒤, 줄이기 전 값 <code>sc</code>에 대해 <code>(sc - 2) != resizeStamp(n) << RESIZE_STAMP_SHIFT</code>이면 그냥 돌아간다. 같다면 자기가 마지막으로 남은 스레드라는 뜻이므로 <code>finishing</code>을 켜고 <code>i = n</code>으로 되돌려 옛 테이블을 처음부터 다시 훑는다(소스 주석: <i>"recheck before commit"</i>). 모든 칸이 <code>ForwardingNode</code>로 바뀌었음을 확인한 뒤에야 <code>table = nextTab</code>으로 새 테이블을 발행하고 <code>sizeCtl = (n << 1) - (n >>> 1)</code>, 즉 새 길이의 0.75배를 쓴다. 한 가지 짚어 둘 점이 있다. OpenJDK 21 소스에서 <code>sizeCtl</code> 필드 선언 위의 주석은 리사이즈 중의 값을 "-(1 + 리사이즈 중인 스레드 수)"라고 설명하지만, 실제로 <code>addCount</code>와 <code>transfer</code>가 쓰는 값은 위의 스탬프 인코딩이다. 아래 실험에서 읽은 값도 -2가 아니라 -2145714174였다. 필드 주석보다 코드를 믿어야 하는 사례다.</p>
+<p>옛 테이블을 나누는 단위도 코드에 정해져 있다. <code>transfer</code>는 한 번에 맡는 구간의 길이(stride)를 <code>(NCPU > 1) ? (n >>> 3) / NCPU : n</code>으로 계산하고, 16(<code>MIN_TRANSFER_STRIDE</code>)보다 작으면 16으로 올린다. 스레드는 <code>transferIndex</code>를 CAS로 stride만큼 줄여 구간 하나를 차지하고, 그 구간을 <b>높은 인덱스에서 낮은 인덱스 쪽으로</b> 처리한다. 빈 칸에는 락 없이 <code>casTabAt</code>으로 <code>ForwardingNode</code>를 꽂고, 노드가 있는 칸은 첫 노드를 <code>synchronized</code>로 잠근 채 노드들을 두 갈래로 나눠 새 테이블에 놓은 다음 <code>ForwardingNode</code>를 꽂는다. 논리 코어가 8개인 이 실험 환경에서 길이 16인 테이블은 stride가 16이라 구간이 하나뿐이고, 길이 1024인 테이블이라면 (1024 / 8) / 8 = 16이라 구간이 64개가 되어 여러 스레드가 나눠 맡을 수 있다.</p>
+<h4>실험: 칸 하나의 락을 쥐고 리사이즈를 멈춘다</h4>
+<p>이 상태들을 눈으로 보려면 리사이즈를 중간에 세워야 한다. 방법은 앞에서 읽은 코드에 이미 있다. <code>transfer</code>는 노드가 있는 칸을 옮기기 전에 그 칸의 첫 노드를 <code>synchronized</code>로 잠근다. 그러니 우리가 리플렉션으로 첫 노드를 꺼내 먼저 잠가 두면, 리사이즈하는 스레드는 그 칸에서 <code>BLOCKED</code>가 된다. 키 0~10의 <code>Integer</code> 11개를 넣으면 테이블 길이는 16이고 임계값은 12다. <code>Integer.hashCode()</code>는 값 자신이고 <code>spread</code>는 이렇게 작은 값을 바꾸지 않으므로, 키 k는 k번 칸에 들어간다. main 스레드가 2번 칸의 첫 노드를 잠근 채 다른 스레드에게 12번째 원소(키 11)를 넣게 한다. 내부를 들여다보는 실험일 뿐, 실제 코드에서 내부 노드를 잠그는 일은 없어야 한다.</p>
+<pre><code class="language-java">import java.lang.reflect.*;
+import java.util.concurrent.*;
+
+public class ResizeFreeze {
+    static Field f(String name) throws Exception {
+        Field fd = ConcurrentHashMap.class.getDeclaredField(name);
+        fd.setAccessible(true);
+        return fd;
+    }
+
+    public static void main(String[] args) throws Exception {
+        ConcurrentHashMap<Integer, Integer> map = new ConcurrentHashMap<>();
+        Field table = f("table"), nextTable = f("nextTable"),
+              sizeCtl = f("sizeCtl"), transferIndex = f("transferIndex");
+        System.out.println("생성 직후      sizeCtl=" + sizeCtl.get(map) + " table=" + table.get(map));
+        for (int k = 0; k <= 10; k++) map.put(k, k);           // 11개: 아직 임계값(12) 미만
+        Object[] old = (Object[]) table.get(map);
+        System.out.println("11개 넣은 뒤   sizeCtl=" + sizeCtl.get(map) + " table.length=" + old.length);
+
+        Object bin2 = old[2];                                   // 키 2가 든 칸의 첫 노드
+        Thread resizer = new Thread(() -> map.put(11, 11), "resizer");
+        synchronized (bin2) {                                   // 그 칸의 락을 main이 쥔다
+            resizer.start();                                    // 12번째 put → 리사이즈 시작
+            Thread.sleep(500);
+            int sc = (int) sizeCtl.get(map);
+            int fwd = 0; StringBuilder moved = new StringBuilder();
+            for (int i = 0; i < old.length; i++) {
+                String n = old[i] == null ? "null" : old[i].getClass().getSimpleName();
+                if (n.equals("ForwardingNode")) fwd++;
+                moved.append(i).append(':').append(n.equals("ForwardingNode") ? "F" : n.equals("Node") ? "N" : "-").append(' ');
+            }
+            System.out.println("리사이즈 정지  sizeCtl=" + sc
+                    + " (상위16비트=" + (sc >>> 16) + ", 하위16비트=" + (sc & 0xffff) + ")"
+                    + " resizeStamp(16)=" + (Integer.numberOfLeadingZeros(16) | (1 << 15)));
+            System.out.println("              transferIndex=" + transferIndex.get(map)
+                    + " nextTable.length=" + ((Object[]) nextTable.get(map)).length
+                    + " ForwardingNode 칸=" + fwd);
+            System.out.println("              옛 테이블: " + moved);
+            System.out.println("              resizer 상태=" + resizer.getState());
+            long t = System.nanoTime();
+            System.out.println("              get(11)=" + map.get(11) + " get(2)=" + map.get(2)
+                    + " put(100)->" + map.put(100, 100) + " get(100)=" + map.get(100)
+                    + " (" + (System.nanoTime() - t) / 1_000_000 + " ms)");
+        }
+        resizer.join();
+        System.out.println("락을 놓은 뒤   sizeCtl=" + sizeCtl.get(map)
+                + " table.length=" + ((Object[]) table.get(map)).length
+                + " nextTable=" + nextTable.get(map) + " size=" + map.size());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (java --add-opens java.base/java.util.concurrent=ALL-UNNAMED ResizeFreeze, 두 번 실행해 같았다)"><code class="language-text">생성 직후      sizeCtl=0 table=null
+11개 넣은 뒤   sizeCtl=12 table.length=16
+리사이즈 정지  sizeCtl=-2145714174 (상위16비트=32795, 하위16비트=2) resizeStamp(16)=32795
+              transferIndex=0 nextTable.length=32 ForwardingNode 칸=13
+              옛 테이블: 0:N 1:N 2:N 3:F 4:F 5:F 6:F 7:F 8:F 9:F 10:F 11:F 12:F 13:F 14:F 15:F
+              resizer 상태=BLOCKED
+              get(11)=11 get(2)=2 put(100)->null get(100)=100 (0 ms)
+락을 놓은 뒤   sizeCtl=24 table.length=32 nextTable=null size=13</code></pre>
+<p>한 줄씩 앞의 설명과 맞춰 보자. 생성 직후 <code>sizeCtl</code>은 0이고 테이블은 없다. 11개를 넣은 뒤에는 길이 16인 테이블이 생겼고 <code>sizeCtl</code>은 임계값 12다. resizer 스레드가 키 11을 넣으면 <code>addCount</code>가 원소 수 12를 보고 12 ≥ 12이므로 <code>sizeCtl</code>을 <code>(32795 << 16) + 2</code>로 CAS하고 <code>transfer</code>에 들어간다. 출력의 위 16비트 32795와 아래 16비트 2가 정확히 그 값이다. stride가 16이라 첫 CAS 한 번에 <code>transferIndex</code>가 16에서 0이 되었고, 길이 32인 <code>nextTable</code>이 만들어졌다. resizer는 15번 칸부터 내려오며 12~15번 빈 칸에는 CAS로, 3~11번 칸에는 락을 잡고 노드를 옮긴 뒤 <code>ForwardingNode</code>를 꽂았다. 그리고 2번 칸에서 main이 쥔 모니터에 막혀 <code>BLOCKED</code>가 되었다. 2번 칸 아래의 0, 1번 칸은 아직 차례가 오지 않아 원래 노드 그대로다.</p>
+<p>리사이즈가 멈춰 있는 동안에도 맵은 멈추지 않았다. <code>get(11)</code>은 11번 칸에서 <code>ForwardingNode</code>를 만나 그 <code>find</code>가 새 테이블에서 값을 찾았고, <code>get(2)</code>는 아직 옮겨지지 않은 옛 칸에서 바로 찾았다. 키 100은 옛 테이블에서 100 & 15 = 4번 칸으로, 이미 옮겨진 칸이다. <code>put(100)</code>은 <code>helpTransfer</code>에 들어갔지만 <code>transferIndex</code>가 이미 0이라 맡을 구간이 없으므로 돕지 않고 새 테이블을 돌려받아, 거기서 100 & 31 = 4번 칸에 넣었다. 네 연산이 모두 1밀리초 안에 끝났다. main이 락을 놓자 resizer가 2, 1, 0번 칸을 마저 옮기고, 마지막 스레드로서 옛 테이블을 다시 훑은 뒤 새 테이블을 발행했다. <code>sizeCtl</code>은 32의 0.75배인 24가 되었고 <code>nextTable</code>은 다시 <code>null</code>이다.</p>
+<p>같은 실험에서 막혀 있는 resizer의 스택을 <code>Thread.getStackTrace()</code>로 찍으면 위에서부터 <code>ConcurrentHashMap.transfer</code> ← <code>addCount</code> ← <code>putVal</code> ← <code>put</code> 순서다. 리사이즈는 별도의 백그라운드 스레드가 하는 일이 아니라, 원소 수를 임계값 너머로 밀어 올린 <code>put</code>을 부른 그 스레드가 자기 호출 안에서 하는 일이라는 뜻이다. 다른 스레드는 그 사이 옮겨진 칸을 만나거나 <code>addCount</code>에서 리사이즈 중임을 보면 남은 구간을 나눠 맡는다. 실무적으로는, 큰 맵이 자라는 동안 어떤 <code>put</code> 호출 몇 개는 평소보다 훨씬 오래 걸릴 수 있다는 뜻이다. 넣을 원소 수를 미리 안다면 앞에서 본 생성자 인자로 처음부터 충분한 테이블을 준비해 이 비용을 피할 수 있다.</p>
+
+<h3>카운터 셀의 안쪽: 프로브, 셀 수의 상한, @Contended</h3>
+<p>앞 절에서 <code>size()</code>가 <code>baseCount</code>와 <code>CounterCell</code> 배열의 합이라는 것까지 보았다. 이 절에서는 한 층 더 내려가, 스레드가 어느 셀을 고르는지, 셀이 몇 개까지 늘어나는지, 그리고 셀 객체가 왜 값 하나(<code>long</code> 8바이트)를 담는데 280바이트나 차지하는지를 확인한다. <code>CounterCell</code>의 선언 위 주석은 이 셀이 <code>LongAdder</code>와 <code>Striped64</code>에서 가져온 것이니 설명은 그쪽 내부 문서를 보라고 적고 있으므로, 아래 설명은 OpenJDK 21의 <code>ConcurrentHashMap</code> 코드와 <code>Striped64</code> 주석을 함께 근거로 한다.</p>
+<pre><code class="language-java">@jdk.internal.vm.annotation.Contended static final class CounterCell {
+    volatile long value;
+    CounterCell(long x) { value = x; }
+}</code></pre>
+<p><code>addCount</code>는 셀 배열이 아직 없으면 먼저 <code>baseCount</code>에 CAS로 더해 본다. 경합이 없는 동안에는 이것으로 끝이다. 셀 배열이 있거나 그 CAS가 실패하면 <code>cs[ThreadLocalRandom.getProbe() & m]</code>, 즉 "스레드마다 다른 정수"의 하위 비트로 셀 하나를 골라 그 셀에 CAS한다. 이 정수가 프로브(probe)로, 실체는 <code>java.lang.Thread</code>의 <code>int threadLocalRandomProbe</code> 필드다. 0이면 아직 초기화되지 않은 것이라 <code>fullAddCount</code>가 <code>ThreadLocalRandom.localInit()</code>으로 값을 정한다. 셀 CAS마저 실패하면(같은 셀을 다른 스레드와 다퉜다는 신호) <code>advanceProbe</code>가 xorshift(<code>probe ^= probe << 13; probe ^= probe >>> 17; probe ^= probe << 5;</code>)로 프로브를 바꿔 다른 셀로 옮겨 간다. <code>Striped64</code> 주석은 이를 보조 해시를 쓰는 "이중 해싱(double hashing)"이라고 부른다.</p>
+<p>셀 배열은 경합이 처음 생길 때 길이 2로 만들어지고, 충돌이 거듭되면 두 배로 늘어난다. 늘어나는 조건에는 상한이 있다. <code>fullAddCount</code>는 배열 길이 <code>n</code>이 <code>NCPU</code>(<code>Runtime.availableProcessors()</code>) 이상이면 더 늘리지 않으므로, 셀 수는 CPU 수 이상인 가장 작은 2의 거듭제곱에서 멈춘다. <code>Striped64</code> 주석은 상한의 근거를 이렇게 적는다. 스레드가 CPU보다 많더라도 각 스레드가 CPU 하나에 묶여 있다고 보면 스레드를 셀에 충돌 없이 대응시키는 완전 해시가 존재하고, 상한에 이른 뒤에는 충돌한 스레드의 프로브를 무작위로 바꿔 가며 그 대응을 찾는다는 것이다. 배열을 만들고 늘리고 빈 칸에 셀을 꽂는 일은 <code>cellsBusy</code> 필드를 CAS로 0에서 1로 바꾼 스레드만 하는 스핀 락으로 보호되고, 락을 얻지 못한 스레드는 기다리지 않고 다른 셀이나 <code>baseCount</code>를 시도한다. 스레드 수를 바꿔 가며 서로 다른 키 50만 개씩을 넣고 리플렉션으로 셀을 들여다보면 이렇다(테이블 리사이즈 잡음을 줄이려고 초기 용량 <code>1 << 22</code>로 만들었다).</p>
+<pre><code class="language-java">import java.lang.reflect.*;
+import java.util.concurrent.*;
+
+public class Cells {
+    public static void main(String[] args) throws Exception {
+        int threads = Integer.parseInt(args[0]);
+        ConcurrentHashMap<Integer, Integer> map = new ConcurrentHashMap<>(1 << 22);
+        Thread[] ts = new Thread[threads];
+        for (int t = 0; t < threads; t++) {
+            int base = t * 500_000;
+            ts[t] = new Thread(() -> { for (int i = 0; i < 500_000; i++) map.put(base + i, i); });
+        }
+        for (Thread t : ts) t.start();
+        for (Thread t : ts) t.join();
+
+        Field cellsF = ConcurrentHashMap.class.getDeclaredField("counterCells");
+        Field baseF = ConcurrentHashMap.class.getDeclaredField("baseCount");
+        cellsF.setAccessible(true); baseF.setAccessible(true);
+        Object[] cells = (Object[]) cellsF.get(map);
+        long base = (long) baseF.get(map);
+        StringBuilder sb = new StringBuilder();
+        long sum = base;
+        if (cells != null) {
+            Field v = cells.getClass().getComponentType().getDeclaredField("value");
+            v.setAccessible(true);
+            for (Object c : cells) {
+                long x = c == null ? 0 : (long) v.get(c);
+                sum += x;
+                sb.append(c == null ? "null" : String.valueOf(x)).append(' ');
+            }
+        }
+        System.out.println("threads=" + threads + " NCPU=" + Runtime.getRuntime().availableProcessors()
+                + " baseCount=" + base + " cells.length=" + (cells == null ? "null" : cells.length)
+                + " cells=[" + sb.toString().trim() + "] base+cells=" + sum + " size()=" + map.size());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (java -Xmx2g --add-opens java.base/java.util.concurrent=ALL-UNNAMED Cells 1, 8, 8, 16 — 셀별 분포와 baseCount는 실행마다 다르다)"><code class="language-text">threads=1 NCPU=8 baseCount=500000 cells.length=null cells=[] base+cells=500000 size()=500000
+threads=8 NCPU=8 baseCount=579 cells.length=8 cells=[501056 503211 504509 504698 494149 496312 496042 499444] base+cells=4000000 size()=4000000
+threads=8 NCPU=8 baseCount=661 cells.length=8 cells=[504869 503359 502669 500311 500919 497596 492462 497154] base+cells=4000000 size()=4000000
+threads=16 NCPU=8 baseCount=2184 cells.length=8 cells=[537883 1384829 720307 1289931 618156 1032787 1098906 1315017] base+cells=8000000 size()=8000000</code></pre>
+<p>스레드 하나일 때는 CAS가 실패할 일이 없으니 셀 배열이 아예 만들어지지 않았고 모든 개수가 <code>baseCount</code>에 있다. 스레드 8개일 때는 셀이 8개로 늘었고 개수는 셀에 고르게 흩어졌으며, <code>baseCount</code>에는 경합이 시작되기 전의 수백 개만 남았다. 스레드 16개에서도 셀은 8개에서 멈췄다. 어느 경우든 모든 스레드가 끝난 뒤의 합은 정확했다. <code>size()</code>가 추정치라는 앞 절의 말은 "갱신이 진행 중일 때 합을 내면"이라는 조건이 붙은 것이고, 갱신이 멈춘 뒤의 합은 셀들의 정확한 합이다.</p>
+<h4>거짓 공유와 @Contended</h4>
+<p>셀을 여러 개로 나누면 스레드들이 서로 다른 메모리 주소에 CAS하게 된다. 그런데 주소가 달라도 경합이 사라지지 않는 경우가 있다. CPU 캐시는 바이트 단위가 아니라 캐시 라인(cache line) 단위로 데이터를 들고 있고, 코어 사이의 캐시 일관성도 라인 단위로 유지된다. 이 Mac은 <code>sysctl hw.cachelinesize</code>가 128을 보고한다. 서로 다른 셀 두 개가 같은 128바이트 안에 있으면, 한 코어가 자기 셀에 쓸 때마다 다른 코어가 들고 있던 그 라인이 무효화되어, 논리적으로는 아무것도 공유하지 않는 두 스레드가 하드웨어 수준에서는 라인 하나를 두고 다투게 된다. 이것이 거짓 공유(false sharing)다. <code>@Contended</code>를 도입한 JEP 142(JDK 8)는 문제를 바로 이렇게 서술한다. 서로 다른 코어가 쓰는 메모리 위치가 같은 캐시 라인에 놓이고 그중 하나 이상이 쓰기를 할 때 생긴다는 것이다. <code>Striped64</code> 주석은 흩어져 있는 보통의 원자 변수에는 패딩이 과하지만, 배열에 담긴 원자 객체들은 메모리에 나란히 놓이기 쉬워 대개 캐시 라인을 공유하게 되므로 이런 대비가 필요하다고 적는다. 셀 배열이 바로 그 경우다.</p>
+<p>HotSpot은 이 애너테이션을 클래스를 읽을 때 처리한다. jdk21u의 <code>src/hotspot/share/classfile/classFileParser.cpp</code>는 <code>jdk.internal.vm.annotation.Contended</code>를 만나면 <code>EnableContended</code>가 꺼져 있거나, <code>RestrictContended</code>가 켜져 있는데 클래스가 특권 코드(부트·플랫폼 클래스 로더가 읽은 클래스 등)가 아니면 애너테이션을 조용히 무시한다. 두 플래그의 기본값은 각각 <code>true</code>이므로, 애플리케이션 클래스에 붙인 <code>@Contended</code>는 <code>-XX:-RestrictContended</code> 없이는 효과가 없고 <code>java.base</code>의 클래스에는 효과가 있다. 필드 배치를 정하는 <code>src/hotspot/share/classfile/fieldLayoutBuilder.cpp</code>의 <code>compute_regular_layout()</code>은 클래스 전체에 <code>@Contended</code>가 붙어 있으면 필드들 앞에 <code>ContendedPaddingWidth</code>바이트의 패딩 블록을 넣고, 필드들 뒤에도 같은 크기의 꼬리 패딩을 넣는다. <code>ContendedPaddingWidth</code>의 기본값은 128이다(<code>globals.hpp</code>, <code>-XX:+PrintFlagsFinal</code>로도 확인된다).</p>
+<p>실제 배치를 재 보자. 패딩 없는 비교용 클래스 <code>static class Plain { volatile long value; }</code>와 <code>CounterCell</code>의 <code>value</code> 필드 오프셋을 <code>sun.misc.Unsafe.objectFieldOffset</code>으로 읽고, 셀이 만들어진 프로세스에 <code>jcmd <pid> GC.class_histogram</code>을 걸어 셀 객체의 크기를 보았다(64비트, 압축 클래스 포인터가 켜진 기본 설정). 히스토그램은 클래스마다 인스턴스 수와 전체 바이트를 알려 주므로, 나누면 객체 하나의 크기가 나온다.</p>
+<pre data-label="실행 결과 (기본 설정 실행 하나와, 플래그를 바꾼 실행 두 개를 모아 적었다)"><code class="language-text">Plain.value offset=16
+CounterCell.value offset=144
+
+ num     #instances         #bytes  class name (module)
+  39:             8           2240  java.util.concurrent.ConcurrentHashMap$CounterCell (java.base@21.0.13)
+
+-Xshare:off -XX:ContendedPaddingWidth=64  →  CounterCell.value offset=80
+-Xshare:off -XX:-EnableContended          →  CounterCell.value offset=16</code></pre>
+<p>객체 헤더는 마크 워드 8바이트와 압축 클래스 포인터 4바이트로 12바이트다. <code>Plain</code>은 헤더 바로 뒤, <code>long</code>의 8바이트 정렬에 맞춘 16에 <code>value</code>가 있다. <code>CounterCell</code>은 헤더 12바이트 뒤에 128바이트 패딩이 들어가 140이 되고, 8바이트 정렬로 144에 <code>value</code>가 놓인다. 거기에 <code>value</code> 8바이트와 꼬리 패딩 128바이트를 더하면 280바이트이고, 히스토그램의 2240바이트 ÷ 8개 = 280바이트와 정확히 맞는다. 셀 하나의 값 앞뒤로 각각 128바이트, 곧 이 Mac의 캐시 라인 하나만큼의 빈 공간이 있으므로, 이웃한 셀의 <code>value</code>들은 같은 라인에 놓일 수 없다. 패딩 폭을 64로 줄이면 오프셋이 80(= 16 + 64)으로, <code>@Contended</code> 처리를 끄면 16으로 바뀐다. 이때 <code>-Xshare:off</code>가 필요했다. <code>-Xlog:class+load</code>로 보면 기본 설정에서 이 클래스는 <code>source: shared objects file</code>, 즉 기본 CDS 아카이브에서 이미 파싱된 형태로 로드되고, 그 상태에서는 패딩 플래그를 바꿔도 오프셋이 144 그대로였다.</p>
+<p>거짓 공유가 얼마나 비싼지는 간단히 재 볼 수 있다. <code>AtomicLongArray</code> 하나에서 두 스레드가 각자 자기 칸을 5천만 번씩 <code>getAndIncrement</code>하되, 두 칸의 간격을 8바이트(이웃한 칸)와 256바이트(32칸 떨어짐)로 바꿔 보았다. 두 스레드는 논리적으로 아무것도 공유하지 않는다.</p>
+<pre data-label="실행 결과 (이 Mac, 첫 회를 버리고 세 번, 밀리초 값과 그 비율은 실행과 하드웨어마다 다르다)"><code class="language-text">간격   8바이트: 1782 ms
+간격 256바이트:  918 ms
+간격   8바이트: 2020 ms
+간격 256바이트:  896 ms
+간격   8바이트: 1930 ms
+간격 256바이트:  963 ms</code></pre>
+<p>같은 일을 하는데 두 카운터가 한 캐시 라인에 있을 때 약 두 배가 걸렸다. 정확한 배수는 CPU의 캐시 구조와 일관성 프로토콜에 달려 있어 일반화할 수 없지만, 방향은 분명하다. <code>ConcurrentHashMap</code>이 8바이트짜리 값 하나에 256바이트의 패딩을 치르는 것은 이 비용을 피하기 위해서이고, 셀 수를 CPU 수로 묶고 경합이 생기기 전에는 셀을 만들지 않는 것(<code>Striped64</code> 주석: 셀이 비교적 크기 때문에 필요할 때까지 만들지 않는다)은 그 패딩의 메모리 비용을 줄이기 위해서다.</p>
+
+<h3>원자적 복합 연산과 null 금지</h3>
+<p>앞의 <code>CompoundAction</code> 실험에서 <code>synchronizedMap</code>은 클라이언트 측 락으로 복합 연산을 묶을 수 있었다. <code>ConcurrentHashMap</code>에도 같은 방법이 통할까? 두 스레드는 <code>synchronized (chm)</code> 블록 안에서 <code>get</code>과 <code>put</code>으로 1을 더하고, 다른 두 스레드는 <code>merge</code>로 1을 더하게 해 보자.</p>
+<pre><code class="language-java">import java.util.concurrent.*;
+
+public class ClientLockChm {
+    public static void main(String[] args) throws InterruptedException {
+        ConcurrentHashMap<String, Integer> chm = new ConcurrentHashMap<>();
+        chm.put("hits", 0);
+        Runnable locked = () -> {
+            for (int i = 0; i < 100_000; i++) {
+                synchronized (chm) {                       // 맵 객체의 모니터를 잡는다
+                    chm.put("hits", chm.get("hits") + 1);
+                }
+            }
+        };
+        Runnable merged = () -> {
+            for (int i = 0; i < 100_000; i++) {
+                chm.merge("hits", 1, Integer::sum);         // 맵 자신의 원자적 연산
+            }
+        };
+        Thread a = new Thread(locked), b = new Thread(locked);
+        Thread c = new Thread(merged), d = new Thread(merged);
+        a.start(); b.start(); c.start(); d.start();
+        a.join(); b.join(); c.join(); d.join();
+        System.out.println("기대값 400000, 실제 " + chm.get("hits"));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (두 번 실행)"><code class="language-text">기대값 400000, 실제 246729
+기대값 400000, 실제 243765</code></pre>
+<p>15만 번 넘게 사라졌다. <code>ConcurrentHashMap</code>의 메서드는 맵 객체의 모니터를 쓰지 않는다. <code>merge</code>가 잡는 락은 "hits"가 든 칸의 첫 노드이고, <code>synchronized (chm)</code>이 잡는 락은 맵 객체이므로 둘은 서로를 전혀 막지 않는다. 바깥 블록은 같은 블록을 쓰는 스레드끼리만 줄을 세울 뿐이다. 블록 안의 <code>get</code>과 <code>put</code> 사이에 <code>merge</code>가 끼어들어 값을 올리면, <code>put</code>이 그 증가를 덮어쓴다. Javadoc이 "테이블 전체를 잠가 모든 접근을 막는 기능을 지원하지 않는다"고 한 말의 실제 의미가 이것이다. 동기화 맵에서 통하던 클라이언트 측 락은 동시성 맵에서 통하지 않는다. 내부 락이 무엇인지가 문서화된 계약이 아니기 때문이다.</p>
+<p>그래서 동시성 맵에서 복합 연산은 맵이 제공하는 원자적 메서드로 표현해야 한다. Java 5부터 <code>ConcurrentMap</code> 인터페이스에 있던 <code>putIfAbsent(k, v)</code>, <code>remove(k, v)</code>, <code>replace(k, oldV, newV)</code>, <code>replace(k, v)</code>와, Java 8에서 추가된 <code>computeIfAbsent</code>, <code>computeIfPresent</code>, <code>compute</code>, <code>merge</code>다. <code>ConcurrentHashMap</code>의 Javadoc은 이 메서드들의 호출 전체가 원자적으로 수행된다고 명시한다. 흔한 확인 후 실행 패턴을 바꿔 쓰면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>하려는 일</th><th>틀린 조합 (틈이 있다)</th><th>원자적 표현</th></tr></thead><tbody>
+<tr><td>없으면 넣기</td><td><code>if (!m.containsKey(k)) m.put(k, v);</code></td><td><code>m.putIfAbsent(k, v)</code></td></tr>
+<tr><td>없으면 계산해서 넣기(캐시)</td><td><code>v = m.get(k); if (v == null) { v = load(k); m.put(k, v); }</code></td><td><code>m.computeIfAbsent(k, key -> load(key))</code></td></tr>
+<tr><td>카운터 증가</td><td><code>m.put(k, m.get(k) + 1)</code></td><td><code>m.merge(k, 1, Integer::sum)</code></td></tr>
+<tr><td>특정 값일 때만 교체</td><td><code>if (m.get(k).equals(a)) m.put(k, b);</code></td><td><code>m.replace(k, a, b)</code></td></tr>
+<tr><td>특정 값일 때만 삭제</td><td><code>if (m.get(k).equals(a)) m.remove(k);</code></td><td><code>m.remove(k, a)</code></td></tr>
+</tbody></table></div>
+<p>원자성의 범위는 "키 하나"라는 점을 기억해야 한다. <code>computeIfAbsent</code>는 그 키에 대한 계산과 삽입을 원자적으로 하지만, 키 A에서 값을 빼서 키 B에 더하는 이체처럼 두 키에 걸친 불변식은 지켜 주지 않는다. 또 계산 함수는 칸의 락을 잡은 채 실행되므로, 앞의 실험처럼 함수가 오래 걸리면 같은 칸을 쓰려는 다른 갱신이 기다린다. Javadoc이 계산을 짧고 단순하게 하라고 권하는 이유다. 빈도 맵(histogram)처럼 같은 키를 매우 많은 스레드가 갱신하는 경우, Javadoc은 값으로 <code>LongAdder</code>를 두고 <code>freqs.computeIfAbsent(key, k -> new LongAdder()).increment();</code>처럼 쓰는 방법을 예로 든다. 맵의 원자적 연산은 키마다 카운터 객체를 한 번만 만드는 데 쓰고, 증가 자체는 <code>LongAdder</code>가 셀을 나눠 경합 없이 처리하게 하는 분업이다.</p>
+<h4>왜 null을 받지 않는가</h4>
+<p><code>HashMap</code>은 <code>null</code> 값을 허용한다. 그 대가로 <code>get</code>의 반환값 <code>null</code>은 두 가지 뜻을 갖는다. 키가 없다는 뜻일 수도, 키에 <code>null</code>이 매핑되어 있다는 뜻일 수도 있다.</p>
+<pre><code class="language-java">Map<String, Integer> hm = new HashMap<>();
+hm.put("k", null);
+System.out.println("HashMap get(k)=" + hm.get("k") + " containsKey(k)=" + hm.containsKey("k")
+        + " get(z)=" + hm.get("z") + " containsKey(z)=" + hm.containsKey("z"));
+
+ConcurrentHashMap<String, Integer> chm = new ConcurrentHashMap<>();
+chm.put("k", null);   // NullPointerException
+chm.put(null, 1);     // NullPointerException
+chm.get(null);        // NullPointerException</code></pre>
+<pre data-label="실행 결과 (각 줄을 따로 try-catch로 감싸 실행)"><code class="language-text">HashMap get(k)=null containsKey(k)=true get(z)=null containsKey(z)=false
+CHM put(k, null) -> java.lang.NullPointerException
+CHM put(null, 1) -> java.lang.NullPointerException
+CHM get(null) -> java.lang.NullPointerException: Cannot invoke "Object.hashCode()" because "key" is null</code></pre>
+<p>단일 스레드에서는 <code>get</code>이 <code>null</code>을 돌려주면 <code>containsKey</code>를 한 번 더 불러 두 경우를 구분할 수 있다. 맵이 그 사이에 바뀌지 않기 때문이다. 여러 스레드가 함께 쓰는 맵에서는 이 두 호출 사이에 다른 스레드가 키를 넣거나 지울 수 있으므로, 두 번째 호출의 결과는 첫 번째 호출의 의미를 확정해 주지 못한다. 그렇다면 남는 정보는 반환값 하나뿐이고, 그 값이 두 가지 뜻을 가지면 안 된다. <code>ConcurrentSkipListMap</code>의 Javadoc은 대부분의 동시성 컬렉션처럼 <code>null</code> 키와 값을 허용하지 않는 이유를 일부 <code>null</code> 반환값이 원소의 부재와 확실히 구분될 수 없기 때문이라고 적는다. <code>null</code>을 금지하면 <code>get</code>, <code>putIfAbsent</code>, <code>remove</code>, <code>computeIfPresent</code>가 돌려주는 <code>null</code>은 언제나 "없었다"는 한 가지 뜻만 갖게 되고, 그 한 번의 원자적 호출만으로 판단을 끝낼 수 있다. <code>computeIfAbsent</code>의 계산 함수가 <code>null</code>을 돌려주면 매핑을 만들지 않는다는 규칙도 같은 맥락이다.</p>
+
+<h3>CopyOnWriteArrayList: 쓸 때마다 복사한다</h3>
+<p>리스트에는 해시 테이블처럼 칸을 나눌 자연스러운 경계가 없다. 원소를 끼워 넣거나 지우면 뒤의 원소가 모두 밀리고, 인덱스 하나가 다른 모든 인덱스에 영향을 준다. <code>CopyOnWriteArrayList</code>는 락을 쪼개는 대신 전혀 다른 길을 택한다. 공유되는 배열을 <b>절대 고치지 않는다</b>. 고칠 일이 생기면 새 배열을 만들어 고친 다음, 참조를 한 번에 바꿔 끼운다. OpenJDK 21의 필드와 <code>add</code>, <code>get</code>은 이렇다.</p>
+<pre><code class="language-java">final transient Object lock = new Object();
+private transient volatile Object[] array;
+
+public boolean add(E e) {
+    synchronized (lock) {
+        Object[] es = getArray();
+        int len = es.length;
+        es = Arrays.copyOf(es, len + 1);
+        es[len] = e;
+        setArray(es);
+        return true;
+    }
+}
+
+public E get(int index) {
+    return elementAt(getArray(), index);
+}</code></pre>
+<p>쓰기는 락(<code>lock</code> 객체의 모니터)을 잡는다. 쓰기끼리는 서로 겹치면 안 되기 때문이다. 락 안에서 현재 배열을 길이 하나 더 큰 새 배열로 복사하고, 마지막 칸에 원소를 넣고, <code>setArray</code>로 <code>volatile</code> 필드 <code>array</code>에 새 배열의 참조를 쓴다. 읽기는 락 없이 <code>array</code>를 읽어 그 배열의 칸을 돌려준다. JLS 17.4.5에 따라 <code>volatile</code> 필드에 대한 쓰기는 그 필드의 이후 모든 읽기보다 happens-before이므로, 새 참조를 읽은 스레드는 그 배열에 복사되고 채워진 내용 전체를 본다. 그리고 한 번 발행된 배열은 아무도 고치지 않으므로, 읽는 쪽은 그 배열을 불변 객체처럼 다룰 수 있다. 읽기와 쓰기가 서로를 전혀 막지 않는 이유다.</p>
+<p>이 구조의 진가는 반복에서 드러난다. 반복자는 만들어지는 순간의 배열 참조를 <code>snapshot</code> 필드에 담아 두고 그 배열만 훑는다. 그 뒤로 리스트가 몇 번을 바뀌든, 그것은 새 배열이 만들어지는 일이지 스냅숏 배열이 바뀌는 일이 아니다. 같은 상황을 <code>ArrayList</code>와 비교해 보자.</p>
+<pre><code class="language-java">List<String> cow = new CopyOnWriteArrayList<>(List.of("a", "b", "c"));
+Iterator<String> it = cow.iterator();
+cow.add("d");
+StringBuilder sb = new StringBuilder();
+while (it.hasNext()) sb.append(it.next());
+System.out.println("COW 반복 결과=" + sb + ", 현재 리스트=" + cow);
+try {
+    Iterator<String> it2 = cow.iterator();
+    it2.next();
+    it2.remove();
+} catch (UnsupportedOperationException e) {
+    System.out.println("COW iterator.remove -> " + e);
+}
+
+List<String> al = new ArrayList<>(List.of("a", "b", "c"));
+try {
+    for (String s : al) {
+        if (s.equals("a")) al.add("d");
+    }
+} catch (ConcurrentModificationException e) {
+    System.out.println("ArrayList 반복 중 add -> " + e);
+}</code></pre>
+<pre data-label="실행 결과 (매번 같다)"><code class="language-text">COW 반복 결과=abc, 현재 리스트=[a, b, c, d]
+COW iterator.remove -> java.lang.UnsupportedOperationException
+ArrayList 반복 중 add -> java.util.ConcurrentModificationException</code></pre>
+<p>반복자를 만든 뒤 "d"를 추가했지만 반복자는 "abc"만 보았다. 리스트 자신은 이미 네 원소를 갖고 있다. 반복자는 스냅숏을 보고 있으므로 <code>ConcurrentModificationException</code>이 날 이유가 없고, Javadoc은 이 반복자가 그 예외를 던지지 않는다고 보장한다. 대신 반복자를 통한 <code>remove</code>, <code>set</code>, <code>add</code>는 지원하지 않아 <code>UnsupportedOperationException</code>을 던진다. 스냅숏 배열을 고칠 수는 없기 때문이다. <code>ArrayList</code> 쪽은 단일 스레드에서도 결정적으로 예외가 난다. "a"를 처리하며 원소를 추가해 <code>modCount</code>가 바뀌었고, 다음 반복에서 <code>hasNext()</code>가 참(커서 1, 크기 4)이어서 <code>next()</code>를 부르는 순간 기억해 둔 수정 횟수와 달라진 것을 발견한다.</p>
+<p>대가는 쓰기다. 원소 하나를 추가할 때마다 배열 전체를 복사하므로 쓰기 한 번이 O(n)이고, 매번 옛 배열이 쓰레기가 되어 GC의 몫이 된다. 빈 리스트에 n개를 하나씩 추가하면 복사되는 원소 수의 합은 1 + 2 + … + n, 즉 O(n²)이다. Javadoc도 이 방식은 보통 너무 비싸지만 순회가 변경보다 압도적으로 많을 때, 그리고 순회를 동기화할 수 없거나 하고 싶지 않을 때 대안보다 효율적일 수 있다고 적는다. 패키지 문서도 읽기와 순회가 갱신보다 훨씬 많을 것으로 예상될 때 동기화된 <code>ArrayList</code>보다 낫다고 말한다. 전형적인 예는 이벤트 리스너 목록이다. 리스너 등록은 프로그램 시작 무렵 몇 번뿐이고, 이벤트가 생길 때마다 목록 전체를 순회한다. 순회 도중 리스너가 자기 자신을 등록 해제해도 예외 없이 지나간다. 반대로 원소가 자주 바뀌는 큰 리스트에 쓰면 복사 비용과 쓰레기가 성능을 무너뜨린다.</p>
+<p><code>CopyOnWriteArraySet</code>은 내부에 <code>CopyOnWriteArrayList</code> 하나를 두고, <code>add</code>를 <code>al.addIfAbsent(e)</code>로 구현한다. 중복 검사가 배열을 처음부터 훑는 선형 탐색이므로 <code>contains</code>와 <code>add</code>가 O(n)이다. 해시나 정렬 없이 작은 집합을 읽기 위주로 쓸 때에 맞는 구조이고, 원소가 많은 집합이라면 <code>ConcurrentHashMap.newKeySet()</code>이나 <code>ConcurrentSkipListSet</code>을 쓴다.</p>
+<x-visual id="java-adv1-11-cow-snapshot" title="CopyOnWriteArrayList의 쓰기와 스냅숏 반복" kind="메모리 구조도" ratio="16:9">
+<x-hint>쓰기 스레드가 기존 배열을 복사해 새 배열을 만들고 volatile 참조를 바꾸는 동안, 반복자는 옛 배열을 그대로 보고 있는 모습을 보여 준다.</x-hint>
+<x-prompt>왼쪽 위에 상자 "CopyOnWriteArrayList", 그 안에 필드 "array (volatile)". 이 필드에서 나온 화살표가 처음에는 회색 점선으로 "옛 배열 [a, b, c]"를 가리키고, 굵은 파란 실선으로 "새 배열 [a, b, c, d]"를 가리킨다. 옛 배열에서 새 배열로 굵은 화살표 "복사 후 d 추가 (쓰기 락 안)". 아래쪽에 "반복자" 상자가 있고 그 안의 "snapshot" 필드가 옛 배열을 가리키는 초록 화살표. 반복자 옆 말풍선 "a, b, c만 본다". 오른쪽 아래에 안경 아이콘의 "읽기 스레드"가 새 배열을 가리키며 "락 없이 읽기". 흰 배경, 플랫한 메모리 다이어그램 스타일.</x-prompt>
+<x-caption>쓰기는 새 배열을 만들어 참조를 바꾼다. 이미 만들어진 반복자는 옛 배열을 끝까지 본다.</x-caption>
+</x-visual>
+
+<h3>복사 비용을 바이트로 재기</h3>
+<p>앞에서 <code>CopyOnWriteArrayList</code>에 n개를 하나씩 추가하면 복사되는 원소 수의 합이 O(n²)이라고 했다. 이 말은 힙 할당량으로 정확히 확인할 수 있다. <code>com.sun.management.ThreadMXBean.getThreadAllocatedBytes</code>는 스레드가 힙에 할당한 누적 바이트를 돌려준다(Javadoc은 근삿값이라고 밝힌다). 같은 문자열 객체 하나만 반복해 넣어 원소 자체의 할당을 없애고, <code>ArrayList</code>와 <code>CopyOnWriteArrayList</code>에 각각 1만 개와 2만 개를 넣는 동안의 할당량을 재 보자. JIT 컴파일과 클래스 로딩의 잡음을 피하려고 같은 측정을 세 번 반복해 마지막 회만 출력한다.</p>
+<pre><code class="language-java">import java.lang.management.ManagementFactory;
+import java.util.*;
+import java.util.concurrent.*;
+
+public class CowAlloc {
+    public static void main(String[] args) {
+        var mx = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+        long tid = Thread.currentThread().threadId();
+        String x = "x";                                   // 같은 객체만 넣어 원소 할당을 없앤다
+        for (int round = 0; round < 3; round++) {         // 첫 회는 클래스 로딩 등 잡음이 섞인다
+            for (int n : new int[] {10_000, 20_000}) {
+                long b0 = mx.getThreadAllocatedBytes(tid);
+                List<String> al = new ArrayList<>();
+                for (int i = 0; i < n; i++) al.add(x);
+                long b1 = mx.getThreadAllocatedBytes(tid);
+                List<String> cow = new CopyOnWriteArrayList<>();
+                for (int i = 0; i < n; i++) cow.add(x);
+                long b2 = mx.getThreadAllocatedBytes(tid);
+                long predicted = 0;
+                for (long k = 1; k <= n; k++) predicted += (16 + 4 * k + 7) / 8 * 8;
+                if (round == 2)
+                    System.out.printf("n=%,d  ArrayList %,d B   COW %,d B   (COW 예측: 배열 합 %,d B)%n",
+                            n, b1 - b0, b2 - b1, predicted);
+            }
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (두 번 실행해 같았다)"><code class="language-text">n=10,000  ArrayList 168,968 B   COW 200,200,056 B   (COW 예측: 배열 합 200,200,000 B)
+n=20,000  ArrayList 253,304 B   COW 800,400,056 B   (COW 예측: 배열 합 800,400,000 B)</code></pre>
+<p>예측식은 HotSpot의 배열 배치에서 나온다. OpenJDK 21의 64비트 기본 설정(이 환경에서 <code>UseCompressedOops</code>와 <code>UseCompressedClassPointers</code>가 모두 켜져 있다)에서 참조 배열은 마크 워드 8바이트, 압축 클래스 포인터 4바이트, 길이 4바이트로 된 16바이트 헤더 뒤에 원소마다 4바이트 참조를 두고, 전체를 8바이트 배수로 맞춘다. <code>CopyOnWriteArrayList.add</code>는 k번째 추가 때 <code>Arrays.copyOf(es, len + 1)</code>로 길이 k인 배열을 새로 만들므로, n번 추가의 할당량은 k = 1부터 n까지 <code>align8(16 + 4k)</code>의 합이다. n = 10,000이면 200,200,000바이트이고, 측정값과의 차이 56바이트는 리스트 객체(24바이트), 생성자가 만드는 <code>lock</code> 객체(16바이트), 처음의 빈 배열 <code>new Object[0]</code>(16바이트)의 몫이다. 이 세 크기는 <code>jcmd <pid> GC.class_histogram</code>으로 따로 확인했다. 원소를 두 배로 늘리자 할당량은 정확히 네 배에 가까운 800,400,000바이트가 되었다. O(n²)이 그대로 숫자로 나타난 것이다.</p>
+<p>같은 1만 개를 <code>ArrayList</code>는 약 169KB로 넣었다. 1.5배씩 늘어나는 배열의 합은 최종 배열 크기의 상수 배에 그치기 때문이다. 리스트에 실제로 남는 것은 마지막 배열 하나(용량 14,053, 16 + 4 × 14,053 = 56,228바이트, 약 56KB)뿐이고, <code>CopyOnWriteArrayList</code>가 할당한 나머지 200MB는 다음 추가가 일어나는 순간 쓰레기가 된다. 이 쓰레기는 GC가 치워야 하고, 할당 속도가 높을수록 새 객체가 놓이는 영역이 빨리 차서 GC가 자주 일어난다. 그래서 <code>CopyOnWriteArrayList</code>에 원소를 여러 개 넣어야 한다면 <code>addAll</code>로 한 번에 넣는 편이 낫다. OpenJDK 21의 <code>addAll(Collection)</code>은 넣을 원소를 먼저 배열로 얻은 뒤(넘겨받은 것이 <code>CopyOnWriteArrayList</code>이면 그 내부 배열을, 아니면 <code>toArray()</code>의 결과를), 락 안에서 <code>Arrays.copyOf(es, len + cs.length)</code>와 <code>System.arraycopy</code>로 새 배열을 한 번만 만든다(리스트가 비어 있고 넘겨받은 것이 <code>ArrayList</code>나 <code>CopyOnWriteArrayList</code>이면 그렇게 얻은 배열을 복사 없이 그대로 쓴다). 복사가 원소마다가 아니라 호출마다 한 번 일어나는 것이다. 이 측정은 단일 스레드에서 한 것이고, 여러 스레드가 동시에 쓰면 모든 쓰기가 <code>lock</code> 하나에 줄을 서므로 복사 비용에 대기 시간까지 더해진다.</p>
+
+<h3>흔한 오해와 고르는 기준</h3>
+<p><b>"동시성 컬렉션을 쓰면 프로그램이 스레드 안전해진다."</b> 컬렉션이 지키는 것은 자기 메서드 한 번의 원자성과 자기 내부 구조의 일관성이다. <code>CompoundAction</code>의 세 번째 줄처럼 <code>ConcurrentHashMap</code>에 <code>get</code>과 <code>put</code>을 따로 부르면 <code>HashMap</code>을 동기화 프록시로 감싼 것과 똑같이 갱신이 사라진다. 맵 두 개, 또는 맵과 다른 필드 사이에 걸친 불변식(예: "주문 맵에 있는 주문은 반드시 재고 맵에서 차감되어 있다")도 컬렉션이 알 수 없다. 이런 불변식은 여전히 6·7회의 락으로 범위를 정해 지켜야 한다.</p>
+<p><b>"<code>Collections.synchronizedList</code>로 감쌌으니 for 문도 안전하다."</b> 반복자는 원본의 것이 그대로 나오고, 반복 도중 어떤 호출도 락을 잡지 않는다. Javadoc이 반복 전체를 반환된 리스트로 동기화하라고 요구하고, 실험에서는 첫 순회조차 마치지 못했다.</p>
+<p><b>"<code>ConcurrentModificationException</code>이 안 나면 동시성 문제가 없는 것이다."</b> 이 예외는 최선을 다하는 탐지일 뿐이다. <code>HashMap</code> 실험은 예외 하나 없이 키를 십만 개 단위로 잃었고, 한 번은 예외 없이 무한 루프에 빠졌다.</p>
+<p><b>"<code>ConcurrentHashMap</code>도 결국 synchronized를 쓰니 동기화 맵과 비슷하다."</b> 락의 단위가 다르다. 읽기는 락이 없고, 빈 칸에 넣기는 CAS이며, 차 있는 칸에 쓸 때만 그 칸의 첫 노드를 잠근다. <code>BinLockDemo</code>와 <code>WholeLockDemo</code>의 차이(205ms와 2008ms)가 그 차이다.</p>
+<p><b>"<code>synchronized (chm)</code>으로 복합 연산을 묶으면 된다."</b> 동기화 맵에서는 통하지만 동시성 맵에서는 통하지 않는다. 맵의 메서드가 그 모니터를 쓰지 않으므로 아무것도 막지 못한다. 원자적 메서드를 쓰거나, 정말로 여러 연산을 한 덩어리로 막아야 한다면 동시성 맵이 아니라 명시적인 락과 일반 맵을 쓴다.</p>
+<p><b>"<code>size()</code>로 흐름을 제어할 수 있다."</b> <code>ConcurrentHashMap.size()</code>는 동시 갱신 중에는 추정치이고, <code>ConcurrentLinkedQueue.size()</code>는 O(n) 순회이며 역시 부정확할 수 있다. 크기 제한이 필요하면 용량이 정해진 <code>BlockingQueue</code>나 <code>Semaphore</code>처럼 제한 자체를 원자적으로 강제하는 도구를 쓴다.</p>
+<p><b>"<code>Vector</code>와 <code>Hashtable</code>은 스레드 안전하니 괜찮다."</b> 메서드 하나 단위로만 안전하다는 점, 락이 객체 하나라는 점에서 동기화 프록시와 같은 한계를 갖는다. 두 클래스의 Javadoc 스스로 다른 클래스를 권한다.</p>
+<p>이 회차의 내용을 선택 기준으로 정리하면 다음 표가 된다.</p>
+<div class="table-wrap"><table><thead><tr><th>상황</th><th>선택</th><th>근거</th></tr></thead><tbody>
+<tr><td>한 스레드만 쓰거나, 이미 다른 락 안에서만 접근한다</td><td><code>ArrayList</code>, <code>HashMap</code> 등 일반 컬렉션</td><td>패키지 문서: 공유되지 않거나 다른 락을 쥔 상태에서만 접근하면 비동기화 컬렉션이 낫다</td></tr>
+<tr><td>여러 스레드가 키-값을 읽고 쓴다(캐시, 레지스트리, 카운터)</td><td><code>ConcurrentHashMap</code></td><td>락 없는 읽기, 칸 단위 갱신, 키 단위 원자적 연산</td></tr>
+<tr><td>정렬 순서나 범위 검색이 필요하다</td><td><code>ConcurrentSkipListMap</code> / <code>Set</code></td><td>CAS 기반 스킵 리스트, 기대 평균 log(n)</td></tr>
+<tr><td>읽기·순회가 압도적이고 쓰기는 드물다(리스너 목록)</td><td><code>CopyOnWriteArrayList</code></td><td>락 없는 읽기, 스냅숏 반복, 쓰기마다 O(n) 복사</td></tr>
+<tr><td>스레드 간에 작업을 넘긴다</td><td><code>BlockingQueue</code> 구현 / <code>ConcurrentLinkedQueue</code></td><td>기다림이 필요하면 블로킹, 아니면 논블로킹</td></tr>
+<tr><td>여러 연산을 하나로 묶어 모든 접근을 막아야 한다</td><td>동기화 프록시 + 클라이언트 측 락, 또는 명시적 락</td><td>단일 배타 락이 주는 강한 보장이 필요할 때</td></tr>
+</tbody></table></div>
+<p>다음 두 회차의 스레드 풀은 이 회차의 컬렉션 위에 서 있다. <code>ThreadPoolExecutor</code>의 생성자는 작업 대기열로 <code>BlockingQueue<Runnable></code>를 받고, 여러 작업 스레드가 낸 결과를 모을 때는 이 회차에서 본 동시성 컬렉션과 그 원자적 연산이 다시 쓰인다. 스레드 풀이 작업을 큐에 넣는 동작과 꺼내는 동작 사이에 어떤 happens-before가 성립하는지도, 오늘 본 패키지 문서의 메모리 일관성 규칙에 함께 적혀 있다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>컬렉션 메서드의 비원자성</dt><dd><code>add</code>, <code>put</code> 한 번도 내부에서는 필드 읽기, 배열 쓰기, 크기 갱신의 여러 단계다. 동기화 없이 여러 스레드가 수정하면 원소 손실, <code>null</code> 칸, 예외, 무한 루프가 생긴다.</dd>
+<dt>동기화 프록시</dt><dd>같은 인터페이스를 구현하고 모든 메서드를 락 하나로 감싸 원본에 위임하는 객체. <code>Collections.synchronizedXxx</code>가 이 구조이며, 락은 <code>mutex</code> 필드(기본은 프록시 자신)다. 원본 참조로 직접 접근하면 보호받지 못한다.</dd>
+<dt>복합 연산</dt><dd>확인 후 실행, 읽고-수정하고-쓰기, 반복처럼 메서드 여러 번에 걸친 연산. 메서드 단위 동기화로는 지켜지지 않으며, 동기화 프록시에서는 클라이언트 측 락으로, 동시성 맵에서는 원자적 메서드로 표현한다.</dd>
+<dt>synchronized와 concurrent의 구분</dt><dd>synchronized 컬렉션은 단일 배타 락으로 다스려지고, concurrent 컬렉션은 스레드 안전하지만 단일 락에 의존하지 않는다. 전자는 강한 배제를, 후자는 확장성을 준다.</dd>
+<dt>ConcurrentHashMap의 락 전략</dt><dd>읽기는 락 없이 acquire 읽기와 volatile 필드로, 빈 칸 삽입은 CAS로, 차 있는 칸의 갱신은 첫 노드의 모니터로 처리한다. 잠근 뒤 첫 노드가 그대로인지 재확인한다.</dd>
+<dt>트리화와 협력 리사이즈</dt><dd>한 칸의 노드가 8개를 넘고 테이블이 64 이상이면 칸을 <code>TreeBin</code>으로 바꾼다. 리사이즈 중 옮긴 칸에는 <code>ForwardingNode</code>를 두고, 이를 만난 쓰기 스레드는 이전 작업을 돕는다.</dd>
+<dt>약한 일관성과 추정 크기</dt><dd>동시성 컬렉션의 반복자는 <code>ConcurrentModificationException</code>을 던지지 않고 생성 시점의 원소를 한 번씩 순회하되 이후 변경은 반영이 보장되지 않는다. <code>size()</code>는 동시 갱신 중 추정치다.</dd>
+<dt>CopyOnWriteArrayList</dt><dd>쓰기 때마다 락 안에서 배열을 복사하고 volatile 참조를 교체한다. 읽기와 반복은 락이 없고 반복자는 스냅숏을 본다. 읽기가 압도적일 때만 맞는다.</dd>
+<dt>sizeCtl과 카운터 셀</dt><dd><code>sizeCtl</code> 하나가 테이블 없음·생성 중(-1)·임계값·리사이즈 중(위 16비트 스탬프, 아래 16비트 1 + 참여 스레드 수)을 나타낸다. 원소 수는 <code>@Contended</code>로 앞뒤에 패딩을 둔 셀들에 나눠 세고, 셀 수는 CPU 수 이상인 가장 작은 2의 거듭제곱에서 멈춘다.</dd>
+<dt>null 금지</dt><dd>동시성 맵에서 <code>null</code> 반환이 "없음"과 "null이 매핑됨"의 두 뜻을 가지면, 두 번째 호출로 구분할 수 없으므로 대부분의 동시성 컬렉션은 <code>null</code>을 받지 않는다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 이 회차의 지식이 가장 자주 쓰이는 곳은 "가끔 숫자가 안 맞는다", "가끔 CPU 하나가 100%가 되고 그 스레드가 안 끝난다" 같은 재현하기 어려운 장애다. 스레드 덤프에서 <code>HashMap</code>이나 <code>ArrayList</code> 내부 메서드에 RUNNABLE로 오래 머문 스레드가 보이면, 공유된 비동기화 컬렉션을 먼저 의심해야 한다. 싱글톤 빈의 필드로 선언된 <code>HashMap</code>, 정적 필드의 캐시 맵처럼 "한 번 만들어 여러 요청이 함께 쓰는" 자리가 단골이다. 이때 가장 먼저 할 일은 그 컬렉션을 <code>ConcurrentHashMap</code> 등으로 바꾸는 것이지만, 바꾼 뒤에도 그 컬렉션을 쓰는 코드에 <code>get</code> 다음 <code>put</code>, <code>containsKey</code> 다음 <code>put</code> 같은 조합이 남아 있는지 찾아 원자적 메서드로 고쳐야 문제가 끝난다.</p>
+<p>선택의 판단은 읽기와 쓰기의 비율, 그리고 "무엇을 한 덩어리로 지켜야 하는가"로 갈린다. 대부분의 공유 맵은 <code>ConcurrentHashMap</code>이 기본값이 된다. 그러나 여러 키 또는 여러 컬렉션을 한꺼번에 일관되게 바꿔야 한다면, 동시성 맵 여러 개를 조합하는 것보다 일반 컬렉션을 하나의 명시적 락으로 감싸는 편이 정확하고 단순하다. 그 락 안에서의 작업을 짧게 유지할 수 있는지가 다음 판단 기준이다. <code>CopyOnWriteArrayList</code>는 쓰기 빈도가 낮다는 가정이 깨지는 순간(예: 요청마다 원소를 추가하는 로그 목록) 복사 비용과 GC 압력으로 급격히 나빠지므로, 도입할 때 그 가정을 명시해 두는 것이 좋다.</p>
+<p><code>computeIfAbsent</code>로 캐시를 구현할 때는 계산 함수가 칸의 락을 쥔 채 실행된다는 점이 설계를 바꾼다. 함수 안에서 원격 호출이나 DB 조회처럼 오래 걸리는 일을 하면, 같은 칸에 걸린 다른 키의 갱신까지 그 시간만큼 멈춘다. 함수 안에서 같은 맵을 다시 고치면 <code>IllegalStateException("Recursive update")</code>가 나거나 진행이 막힐 수 있다. 오래 걸리는 로딩이라면 맵에는 <code>CompletableFuture</code> 같은 "미래의 값"만 원자적으로 넣고 실제 계산은 락 밖에서 하게 하는 설계를 생각할 수 있는데, 그런 설계의 바탕도 결국 이 회차의 "원자성은 키 하나, 락은 칸 하나"라는 규칙이다.</p>
+</x-review>
+
+<x-practice>
+<li><code>PlainMiniList(10, 100)</code>에 세 스레드가 각각 <code>"A"</code>, <code>"B"</code>, <code>"C"</code>를 동시에 하나씩 추가한다. (1) 결과가 <code>[C, null, null] size=3</code>이 되는 실행 순서를 시간 순서 표로 쓰라. (2) 결과가 <code>[C] size=1</code>이 되려면 바이트코드 수준에서 어떤 일이 일어나야 하는지 오프셋을 들어 설명하라.</li>
+<li>다음 코드는 여러 스레드에서 실행된다. <code>List<String> seen = Collections.synchronizedList(new ArrayList<>());</code>가 있고 각 스레드는 <code>if (!seen.contains(x)) seen.add(x);</code>를 실행한다. 중복이 생길 수 있는가? 생긴다면 그 실행 순서를 설명하고, 동기화 프록시를 유지하는 수정과 동시성 컬렉션으로 바꾸는 수정을 각각 제시하라. 두 수정의 의미 차이(순서 유지 여부)도 밝히라.</li>
+<li><code>new ConcurrentHashMap<>(12)</code>, <code>new ConcurrentHashMap<>(16)</code>, <code>new ConcurrentHashMap<>(100)</code>을 만들고 첫 <code>put</code>을 했을 때 내부 테이블 길이를 각각 구하라. OpenJDK 21 생성자의 계산식(<code>1.0 + initialCapacity / loadFactor</code>, 그보다 크거나 같은 2의 거듭제곱)을 따라 과정을 보여라.</li>
+<li><code>Map<String, List<String>> groups = new ConcurrentHashMap<>();</code>에서 여러 스레드가 <code>groups.computeIfAbsent(key, k -> new ArrayList<>()).add(value);</code>를 실행한다. 이 코드에서 원자적인 부분과 원자적이지 않은 부분을 나누고, 어떤 결과가 생길 수 있는지 설명하라. 그리고 고치는 방법을 두 가지 이상 제시하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> (1) 세 스레드가 모두 <code>size</code>를 0으로 읽는 경우다. 순서 예: A가 <code>size</code>=0을 읽고 <code>elements[0]="A"</code>, B가 <code>size</code>=0을 읽고 <code>elements[0]="B"</code>, C가 <code>size</code>=0을 읽고 <code>elements[0]="C"</code>. 셋 다 100ms 대기에 들어간 뒤 차례로 깨어나 <code>size++</code>를 겹치지 않게 실행하면 0→1→2→3이 된다. 배열의 1번, 2번 칸은 아무도 쓰지 않았으므로 <code>[C, null, null] size=3</code>이다. 마지막에 쓴 스레드가 C여야 0번 칸에 C가 남는다. (2) 칸에 쓰는 과정은 (1)과 같고, 대기 뒤의 <code>size++</code>가 모두 겹쳐야 한다. 세 스레드가 오프셋 16의 <code>getfield</code>로 모두 0을 읽고, 각자 오프셋 19~20에서 1을 계산한 뒤, 오프셋 21의 <code>putfield</code>로 1을 쓰면 <code>size</code>는 1이다. 세 번의 증가 중 두 번이 사라지는 갱신 손실이다.</p>
+<p><b>2번.</b> 생길 수 있다. <code>contains</code>와 <code>add</code>는 각각 <code>mutex</code>를 잡지만, 두 호출 사이에는 락이 풀린다. 스레드 1과 2가 모두 <code>contains("x")</code>에서 false를 받은 뒤(그 시점에 x가 없으므로 둘 다 정당한 결과다) 차례로 <code>add("x")</code>를 하면 x가 두 번 들어간다. 프록시를 유지하는 수정은 <code>synchronized (seen) { if (!seen.contains(x)) seen.add(x); }</code>로, 프록시가 <code>mutex = this</code>를 쓰므로 같은 락이고 재진입이 가능하다. 다만 <code>contains</code>가 리스트를 선형 탐색하므로 락을 쥔 시간이 원소 수에 비례한다. 동시성 컬렉션으로 바꾸려면 <code>Set<String> seen = ConcurrentHashMap.newKeySet();</code>를 쓰고 <code>seen.add(x)</code> 한 번으로 끝낸다. <code>add</code>의 반환값이 "새로 들어갔는가"를 원자적으로 알려 준다. 의미 차이는 순서다. 리스트는 처음 본 순서를 유지하지만 해시 집합은 순서를 유지하지 않는다. 순서가 필요하면 집합으로 중복을 판정하고(<code>if (seenSet.add(x))</code>) 순서는 별도의 동시성 큐에 기록하는 식으로 역할을 나눈다.</p>
+<p><b>3번.</b> 12: 1.0 + 12 / 0.75 = 17.0, 이를 정수로 바꾼 17보다 크거나 같은 2의 거듭제곱은 32다. 16: 1.0 + 16 / 0.75 = 22.33…, 정수 22, 거듭제곱 32. 100: 1.0 + 100 / 0.75 = 134.33…, 정수 134, 거듭제곱 256. 이 원고를 쓰며 12와 16은 리플렉션으로 확인했고 둘 다 32였다(64는 128). 생성자의 인자가 테이블 길이가 아니라 넣을 원소 수로 해석되어, 부하율 0.75를 고려해 그 수를 넣어도 리사이즈가 일어나지 않을 만큼의 테이블을 준비하는 것이다. 테이블은 생성자가 아니라 첫 삽입 때 만들어진다는 점도 함께 기억하자.</p>
+<p><b>4번.</b> 원자적인 부분은 <code>computeIfAbsent</code> 호출까지다. 같은 키에 대해 리스트가 두 개 만들어지는 일은 없고, 모든 스레드가 같은 <code>ArrayList</code> 인스턴스를 받는다. 원자적이지 않은 부분은 그 뒤의 <code>.add(value)</code>다. 칸의 락은 <code>computeIfAbsent</code>가 반환할 때 이미 풀렸으므로, 같은 키의 리스트에 여러 스레드가 동시에 <code>ArrayList.add</code>를 하게 되고, 이 회차 앞부분의 실험처럼 원소 손실, <code>null</code> 칸, <code>ArrayIndexOutOfBoundsException</code>이 생길 수 있다. 다른 스레드가 <code>get(key)</code>으로 받은 리스트를 순회하면 그 순회도 경합한다. 고치는 방법: (가) 값 컬렉션을 스레드 안전한 것으로 바꾼다. 쓰기가 많으면 <code>ConcurrentLinkedQueue</code>, 읽기가 많으면 <code>CopyOnWriteArrayList</code>, 혹은 <code>Collections.synchronizedList(new ArrayList<>())</code>를 <code>computeIfAbsent</code>의 계산 함수에서 만든다. (나) 추가 자체를 <code>compute(key, (k, list) -> { ... list.add(value); return list; })</code> 안에서 해 같은 키의 갱신끼리는 칸의 락으로 직렬화한다. 다만 (나)는 <code>get</code>으로 리스트를 꺼내 읽는 쪽이 락을 잡지 않으므로, 읽는 쪽까지 안전하게 하려면 함수 안에서 새 리스트를 만들어 바꿔 넣는(불변 리스트를 교체하는) 방식이어야 한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>Collections.synchronizedMap(new HashMap<>())</code>에 스레드 4개가 각각 10만 번 <code>Integer old = map.get("k"); map.put("k", old == null ? 1 : old + 1);</code>을 실행했다. 끝난 뒤 <code>map.get("k")</code>에 대해 옳은 설명은?</q>
+<o>모든 메서드가 동기화되어 있으므로 언제나 400000이다.</o>
+<o>400000보다 작을 수 있다. <code>get</code>과 <code>put</code> 사이에 락이 풀려 다른 스레드의 증가가 덮어써질 수 있기 때문이다.</o>
+<o>400000보다 클 수 있다. 같은 증가가 두 번 반영될 수 있기 때문이다.</o>
+<o>동기화 맵 안의 <code>HashMap</code>이 손상되어 <code>ConcurrentModificationException</code>이 난다.</o>
+<why>동기화 프록시는 메서드 한 번의 호출만 배타적으로 실행한다. 두 스레드가 같은 값을 <code>get</code>한 뒤 각자 1을 더해 <code>put</code>하면 증가 하나가 사라진다(실험에서 13만~16만 번 손실). 증가가 두 번 반영되는 경로는 없으므로 400000을 넘지는 않는다. 각 호출은 <code>mutex</code> 아래에서 실행되므로 내부 <code>HashMap</code>의 구조가 손상되지는 않고, 반복자를 쓰지 않았으므로 <code>ConcurrentModificationException</code>과도 관계없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>ConcurrentHashMap.putVal</code>은 칸의 첫 노드 <code>f</code>에 대해 <code>synchronized (f)</code>로 락을 잡은 직후 <code>tabAt(tab, i) == f</code>를 다시 확인한다. 이 재확인이 필요한 이유는?</q>
+<o>자바 모니터가 재진입 불가능하므로, 같은 스레드가 두 번 잠그지 않았는지 확인하려고</o>
+<o>노드의 <code>key</code> 필드가 <code>volatile</code>이 아니어서, 락을 잡은 뒤 키를 다시 읽어야 가시성이 생기므로</o>
+<o>락을 기다리는 동안 그 노드가 삭제되었거나 리사이즈로 칸이 새 테이블로 옮겨져, 잠근 객체가 더 이상 그 칸의 첫 노드가 아닐 수 있으므로</o>
+<o>빈 칸 삽입의 CAS가 실패했는지 확인하려고</o>
+<why>락으로 쓰는 것은 별도의 락 객체가 아니라 "그 순간의 첫 노드"다. 기다리는 사이 첫 노드가 바뀌었다면 엉뚱한 객체를 잠근 것이므로 다시 시도해야 한다. 새 노드는 꼬리에만 붙으므로 첫 노드는 삭제나 칸 무효화 전까지 유지되고, 그래서 이 재확인 하나로 충분하다. 자바 모니터는 재진입 가능하고, <code>key</code>는 <code>final</code>이며, CAS 실패는 별도 분기에서 루프를 다시 도는 것으로 처리된다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>List<String> list = new CopyOnWriteArrayList<>(List.of("a", "b"));</code> 다음에 <code>Iterator<String> it = list.iterator(); list.add("c"); list.remove("a");</code>를 실행하고 <code>it</code>로 끝까지 순회하면?</q>
+<o>"a", "b"를 순회하고 예외는 없다.</o>
+<o>"b", "c"를 순회하고 예외는 없다.</o>
+<o>"a", "b", "c"를 순회한다.</o>
+<o>다음 <code>next()</code>에서 <code>ConcurrentModificationException</code>이 난다.</o>
+<why>반복자는 생성 시점의 배열 참조를 스냅숏으로 들고 있다. <code>add</code>와 <code>remove</code>는 각각 새 배열을 만들어 <code>array</code> 필드를 교체할 뿐, 스냅숏 배열은 바꾸지 않는다. 따라서 반복자는 생성 시점의 "a", "b"만 보고, Javadoc이 보장하듯 <code>ConcurrentModificationException</code>을 던지지 않는다. 리스트 자신은 그 사이 <code>[b, c]</code>가 되어 있다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>두 스레드가 <code>synchronized (chm) { chm.put(k, chm.get(k) + 1); }</code>를, 다른 두 스레드가 <code>chm.merge(k, 1, Integer::sum)</code>을 실행한다(<code>chm</code>은 <code>ConcurrentHashMap</code>). 증가가 사라질 수 있는 이유로 가장 정확한 것은?</q>
+<o><code>merge</code>는 원자적이지 않기 때문이다.</o>
+<o><code>synchronized</code> 블록 안에서 <code>chm</code>의 메서드를 부르면 교착 상태가 생기기 때문이다.</o>
+<o><code>ConcurrentHashMap</code>의 <code>get</code>이 오래된 값을 캐시해 두기 때문이다.</o>
+<o><code>merge</code>가 잡는 락은 칸의 첫 노드이고 바깥 블록이 잡는 락은 맵 객체이므로, 서로를 막지 못해 블록 안의 <code>get</code>과 <code>put</code> 사이에 <code>merge</code>가 끼어들 수 있기 때문이다.</o>
+<why><code>merge</code>는 Javadoc상 원자적이며, 실험에서도 <code>merge</code>만 쓴 경우는 언제나 정확했다. 문제는 락의 정체가 다르다는 것이다. 동기화 프록시와 달리 <code>ConcurrentHashMap</code>은 맵 객체의 모니터를 쓰지 않으므로 클라이언트 측 락이 내부 연산을 배제하지 못한다. 교착 상태는 생기지 않았고(실험은 정상 종료), <code>get</code>은 값을 캐시하지 않고 매번 volatile 의미로 읽는다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>ConcurrentHashMap</code>이 <code>null</code> 값을 허용하지 않는 이유와 가장 관계 깊은 것은?</q>
+<o><code>null</code>의 해시코드를 계산할 수 없어 버킷을 정할 수 없기 때문이다.</o>
+<o>여러 스레드가 함께 쓰는 맵에서는 <code>get</code>이 돌려준 <code>null</code>이 "키 없음"인지 "null이 매핑됨"인지를 <code>containsKey</code>를 한 번 더 불러 확정할 수 없기 때문이다.</o>
+<o><code>volatile</code> 필드에는 <code>null</code>을 쓸 수 없기 때문이다.</o>
+<o><code>null</code>을 넣으면 트리화(<code>TreeBin</code>) 과정에서 비교가 불가능하기 때문이다.</o>
+<why>단일 스레드 <code>HashMap</code>은 <code>get</code> 뒤의 <code>containsKey</code>로 두 경우를 구분할 수 있지만, 동시성 맵에서는 두 호출 사이에 다른 스레드가 맵을 바꿀 수 있다. 그래서 반환값 하나가 한 가지 뜻만 갖도록 <code>null</code>을 금지한다(<code>ConcurrentSkipListMap</code> Javadoc의 설명). 값의 해시코드는 버킷 결정에 쓰이지 않고, <code>volatile</code> 필드에는 <code>null</code>을 쓸 수 있으며, 트리는 키를 비교하지 값을 비교하지 않는다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>스레드 안전(thread-safe)</dt><dd>여러 스레드가 별도의 조율 없이 동시에 호출해도 객체가 명세대로 동작하는 성질. 컬렉션의 스레드 안전은 대개 메서드 한 번 단위의 보장이다.</dd>
+<dt>복합 연산(compound action)</dt><dd>확인 후 실행, 읽고-수정하고-쓰기, 반복처럼 여러 번의 호출로 이루어진 연산. 각 호출이 원자적이어도 전체는 원자적이지 않다.</dd>
+<dt>동기화 래퍼(synchronized wrapper)</dt><dd><code>Collections.synchronizedXxx</code>가 돌려주는 프록시. 모든 메서드를 <code>mutex</code> 객체의 모니터로 감싸 원본 컬렉션에 위임한다.</dd>
+<dt>클라이언트 측 락(client-side locking)</dt><dd>컬렉션을 쓰는 쪽이 컬렉션 자신이 쓰는 것과 같은 락을 잡아 여러 호출을 하나의 임계 영역으로 묶는 기법. 락 객체가 문서로 약속된 동기화 래퍼에서만 성립한다.</dd>
+<dt>페일 패스트(fail-fast)</dt><dd>반복 도중 구조 변경을 감지하면 <code>ConcurrentModificationException</code>을 던지는 반복자의 동작. 최선을 다하는 검사일 뿐 보장이 아니며 버그 탐지용이다.</dd>
+<dt>약한 일관성(weakly consistent)</dt><dd>동시성 컬렉션 반복자의 성질. 다른 연산과 동시에 진행되고, <code>ConcurrentModificationException</code>을 던지지 않으며, 생성 시점의 원소를 정확히 한 번씩 순회하되 이후 변경의 반영은 보장하지 않는다.</dd>
+<dt>빈(bin)</dt><dd>해시 테이블 배열의 한 칸. <code>ConcurrentHashMap</code>에서는 연결 리스트, 트리(<code>TreeBin</code>), 리사이즈 표지(<code>ForwardingNode</code>), 예약 노드(<code>ReservationNode</code>) 중 하나가 놓인다.</dd>
+<dt>카피 온 라이트(copy-on-write)</dt><dd>공유 데이터를 고치는 대신 복사본을 고쳐 참조를 교체하는 전략. 읽는 쪽은 락 없이 불변 스냅숏을 보고, 쓰는 쪽이 복사 비용을 진다.</dd>
+<dt>거짓 공유(false sharing)</dt><dd>서로 다른 변수를 쓰는 스레드들이 그 변수들이 같은 캐시 라인에 놓인 탓에 라인 단위의 캐시 일관성 트래픽으로 서로를 느리게 만드는 현상. HotSpot은 <code>@Contended</code>가 붙은 JDK 클래스(기본 설정에서는 부트·플랫폼 클래스 로더가 읽은 클래스 등 특권 코드만 해당)의 필드 앞뒤에 <code>ContendedPaddingWidth</code>(기본 128)바이트의 패딩을 넣어 피한다.</dd>
+<dt>스킵 리스트(skip list)</dt><dd>정렬된 연결 리스트 위에 일부 원소만 잇는 급행 층을 여러 단 쌓은 자료구조. 링크 하나씩만 바꾸면 되므로 CAS 기반의 동시 구현에 적합하다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/package-summary.html">java.util.concurrent 패키지 요약 (Java SE 21)</a> — Concurrent Collections, 약한 일관성 반복자, 메모리 일관성 효과의 정의</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ConcurrentHashMap.html">ConcurrentHashMap Javadoc (Java SE 21)</a> — 락 없는 검색, happens-before, null 금지, size·mappingCount의 추정 성격, computeIfAbsent의 원자성과 주의</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Collections.html">Collections Javadoc (Java SE 21)</a> — synchronizedList·synchronizedMap과 반복 시 수동 동기화 요구</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CopyOnWriteArrayList.html">CopyOnWriteArrayList Javadoc (Java SE 21)</a> — 쓰기 시 복사, 스냅숏 반복자, 반복자 변경 연산 미지원</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html">JLS 21 Chapter 17 Threads and Locks</a> — §17.4.5 데이터 경합 정의, 모니터 해제·획득과 volatile 쓰기·읽기의 happens-before</li>
+<li><a href="https://docs.oracle.com/javase/7/docs/api/java/util/concurrent/ConcurrentHashMap.html">ConcurrentHashMap Javadoc (Java SE 7)</a> — concurrencyLevel로 테이블을 내부 분할하던 이전 설계의 설명</li>
+</x-refs>

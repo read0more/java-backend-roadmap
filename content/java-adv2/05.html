@@ -1,0 +1,1061 @@
+<x-meta>
+deck: java.io.File과 java.nio.file의 Path·Files를 디렉터리 엔트리, inode, 시스템 콜과 짝지어 보며 경로 해석, 심볼릭 링크, 문자 파일 읽기, 커널 안의 파일 복사를 확인한다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>파일의 이름(디렉터리 엔트리)과 실체(inode)가 분리되어 있다는 유닉스 계열 파일 시스템 모델로 하드 링크, 열린 파일의 삭제, <code>rename</code>의 원자성을 설명할 수 있다.</li>
+<li><code>java.io.File</code>의 각 메서드가 어떤 시스템 콜로 이어지는지, 그리고 실패를 <code>false</code>·<code>0</code>·<code>null</code>로 돌려주는 설계가 왜 원인을 잃어버리는지 실행 결과로 보일 수 있다.</li>
+<li><code>Path</code>·<code>Files</code>·<code>FileSystemProvider</code>의 역할 분담을 설명하고, <code>Files</code>가 던지는 예외(<code>NoSuchFileException</code>, <code>FileAlreadyExistsException</code>, <code>DirectoryNotEmptyException</code>, <code>AccessDeniedException</code>)를 원래의 오류 번호와 연결할 수 있다.</li>
+<li>절대 경로, 상대 경로, <code>user.dir</code>, <code>normalize</code>와 <code>toRealPath</code>의 차이를 심볼릭 링크가 끼어든 경로로 구분하고, 경로 이탈 검사를 올바르게 작성할 수 있다.</li>
+<li><code>Files.readString</code>·<code>readAllLines</code>·<code>lines</code>의 메모리 사용과 오류 처리 차이, 그리고 세 가지 파일 복사 방식이 데이터를 몇 번, 어디에서 복사하는지 OpenJDK 21 소스를 근거로 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 파일의 내용이 아니라 파일 그 자체</h3>
+<p>앞의 세 회차는 파일의 <b>내용</b>을 다뤘다. <code>FileInputStream</code>에 이름을 넘겨 파일을 열고, 바이트를 읽고 쓰고, 버퍼로 시스템 콜 횟수를 줄이고, 문자는 인코딩을 거쳐 바이트로 바꾸고, 객체는 직렬화 형식으로 바꿔 저장했다. 그런데 파일을 다루는 프로그램이 묻는 질문의 상당수는 내용과 상관이 없다. 이 이름의 파일이 있는가, 파일인가 디렉터리인가, 크기는 얼마이고 언제 바뀌었는가, 이름을 바꾸거나 다른 디렉터리로 옮기려면 어떻게 하는가, 디렉터리 안에 무엇이 있는가, 그리고 <code>"data/members.txt"</code>라는 상대 경로는 도대체 어디를 기준으로 한 경로인가.</p>
+<p>자바는 이 질문들에 두 번 답했다. 첫 번째 답은 JDK 1.0부터 있던 <code>java.io.File</code>이다. 두 번째 답은 Java 7에 들어온 <code>java.nio.file</code> 패키지(흔히 NIO.2라고 부른다)의 <code>Path</code>와 <code>Files</code>다. 두 번째 답이 나온 이유는 첫 번째 답의 설계에 고칠 수 없는 한계가 있었기 때문이고, 그 한계는 운영체제가 파일을 어떻게 다루는지를 알면 자연스럽게 보인다. 그래서 이 회차는 자바 API보다 한 층 아래, 운영체제가 보는 파일부터 시작한다.</p>
+<p>순서는 이렇다. 먼저 유닉스 계열 파일 시스템에서 이름과 실체가 어떻게 나뉘어 있는지 실험으로 확인한다. 그다음 <code>File</code>의 기본 기능을 각 메서드가 부르는 시스템 콜과 함께 살펴보고, <code>File</code>이 실패를 다루는 방식의 문제를 본다. 이어서 <code>Path</code>와 <code>Files</code>가 그 문제를 어떻게 풀었는지, 존재 확인과 이름 바꾸기에 숨은 경쟁 조건은 무엇인지 본다. 후반부에서는 경로 표시(절대·상대·정규·실제 경로), <code>Files</code>로 문자 파일을 읽는 세 가지 방법, 그리고 파일 복사를 빠르게 만드는 방법이 커널 안에서 무엇을 하는지 OpenJDK 21의 소스로 추적한다.</p>
+<p>이 회차의 실행 결과는 모두 macOS(APFS 파일 시스템)에서 Temurin OpenJDK 21.0.13으로 직접 돌려 얻었다. 운영체제에 따라 달라지는 부분, 특히 파일 복사 경로는 리눅스와 macOS를 나눠 적는다. Windows는 이 회차의 실험 범위에 넣지 않았다.</p>
+
+<h3>한 층 아래: 운영체제에게 파일은 이름과 실체로 나뉜다</h3>
+<p>유닉스 계열 파일 시스템에서 "파일"이라는 말은 두 가지를 가리킨다. 하나는 데이터와 메타데이터를 가진 실체이고, 다른 하나는 그 실체를 가리키는 이름이다. 실체를 inode(index node)라고 부른다. inode에는 파일 종류(일반 파일, 디렉터리, 심볼릭 링크 등), 권한 비트, 소유자, 크기, 수정 시각, 링크 수(link count), 그리고 데이터가 디스크의 어디에 있는지가 들어 있다. 눈여겨볼 점은 inode 안에 <b>이름이 없다</b>는 것이다.</p>
+<p>이름은 디렉터리가 갖고 있다. 디렉터리는 특별한 종류의 파일이고, 그 내용은 "이름 → inode 번호" 쌍의 목록, 즉 디렉터리 엔트리(directory entry)의 표다. 그래서 하나의 inode를 두 디렉터리 엔트리가 가리킬 수 있다. 이것이 하드 링크(hard link)다. inode의 링크 수는 자신을 가리키는 이름이 몇 개인지를 센다. 파일을 "삭제"하는 시스템 콜의 이름이 <code>delete</code>가 아니라 <code>unlink</code>인 이유가 여기에 있다. 이 호출은 디렉터리에서 이름 하나를 떼어 내고 링크 수를 하나 줄일 뿐이다.</p>
+<p>macOS의 APFS는 내부 자료 구조가 전통적인 유닉스 파일 시스템과 다르다. 하지만 <code>stat</code> 시스템 콜로 보이는 모습, 즉 장치 번호, inode 번호, 링크 수는 같은 모델을 따른다. 자바도 이 모델 위에서 동작하므로 실험으로 확인할 수 있다. 아래 예제는 <code>a.txt</code>를 만들고 같은 inode에 <code>b.txt</code>라는 두 번째 이름을 붙인 다음, 이름을 하나씩 지운다. <code>"unix:nlink"</code>, <code>"unix:ino"</code> 같은 속성 이름은 리눅스와 macOS의 기본 파일 시스템이 제공하는 <code>unix</code> 속성 뷰에서 읽는다.</p>
+<pre><code class="language-java">import java.io.*;
+import java.nio.file.*;
+
+public class LinkMain {
+    public static void main(String[] args) throws IOException {
+        Path a = Path.of("a.txt");
+        Path b = Path.of("b.txt");
+        Files.deleteIfExists(a);
+        Files.deleteIfExists(b);
+        Files.writeString(a, "hello");
+        Files.createLink(b, a);                 // b를 a와 같은 파일을 가리키는 두 번째 이름으로
+
+        System.out.println("isSameFile = " + Files.isSameFile(a, b));
+        System.out.println("nlink = " + Files.getAttribute(a, "unix:nlink"));
+        System.out.println("same ino = " + Files.getAttribute(a, "unix:ino").equals(Files.getAttribute(b, "unix:ino")));
+
+        Files.delete(a);                        // 이름 하나를 지운다
+        System.out.println("after delete a: exists a = " + Files.exists(a) + ", b = " + Files.readString(b));
+
+        try (InputStream in = new FileInputStream("b.txt")) {
+            Files.delete(b);                    // 마지막 이름까지 지운다
+            System.out.println("after delete b: exists b = " + Files.exists(b));
+            System.out.println("still readable = " + new String(in.readAllBytes()));
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">isSameFile = true
+nlink = 2
+same ino = true
+after delete a: exists a = false, b = hello
+after delete b: exists b = false
+still readable = hello</code></pre>
+<p>한 줄씩 보자. <code>Files.createLink(b, a)</code>는 <code>link</code> 시스템 콜로 이어져 디렉터리에 <code>b.txt → (a.txt와 같은 inode)</code> 엔트리를 추가한다. 내용을 복사하지 않으므로 두 이름의 inode 번호가 같고 링크 수는 2가 된다. <code>Files.delete(a)</code> 뒤에도 <code>b.txt</code>를 읽으면 <code>hello</code>가 나온다. 지워진 것은 이름 하나이고 실체는 그대로이기 때문이다.</p>
+<p>마지막 블록이 더 흥미롭다. <code>b.txt</code>를 스트림으로 연 상태에서 마지막 이름까지 지웠다. 이름이 사라졌으니 <code>exists</code>는 <code>false</code>다. 그런데 이미 열린 스트림으로는 여전히 내용을 읽을 수 있다. POSIX의 <code>unlink</code> 명세는 링크 수가 0이 되어도 열린 파일 디스크립터로 참조하는 프로세스가 있으면 내용의 제거를 "그런 참조가 없어질 때까지 미룬다"고 정한다. 파일을 열면 프로세스는 이름이 아니라 커널 안의 열린 파일 객체를 손에 쥔다. 자바의 <code>FileInputStream</code>이 안에 들고 있는 <code>FileDescriptor</code>가 바로 그 손잡이의 번호다. 이 규칙은 운영 환경에서 자주 마주친다. 프로세스가 쓰고 있는 거대한 로그 파일을 <code>rm</code>으로 지워도 디스크 공간이 돌아오지 않는 현상은, 이름은 지워졌지만 실체가 열린 디스크립터에 붙들려 있기 때문이다.</p>
+<pre class="diagram">  디렉터리 "."의 내용 (디렉터리 엔트리 표)
+  ┌──────────────┬─────────────┐
+  │ 이름          │ inode 번호   │
+  ├──────────────┼─────────────┤
+  │ a.txt        │ 30635714    │──┐
+  │ b.txt        │ 30635714    │──┤   inode 30635714
+  └──────────────┴─────────────┘  ├─▶ ┌──────────────────────┐
+                                  │   │ 종류: 일반 파일         │
+  프로세스의 파일 디스크립터 표          │   │ 크기: 5               │
+  ┌────┬──────────────────┐       │   │ 링크 수: 2             │──▶ 데이터 블록 "hello"
+  │ 3  │ 열린 파일(위치 0)   │───────┘   │ 권한, 소유자, 시각 …     │
+  └────┴──────────────────┘           └──────────────────────┘
+  * inode 번호는 실행 환경마다 다르다</pre>
+<x-visual id="java-adv2-05-inode-names" title="디렉터리 엔트리, inode, 파일 디스크립터의 관계" kind="개념도" ratio="16:9">
+<x-hint>이름은 디렉터리 엔트리에 있고 실체는 inode에 있으며, 두 이름과 하나의 열린 디스크립터가 같은 inode를 가리키는 모습을 보여 준다.</x-hint>
+<x-prompt>가로로 긴 개념도. 왼쪽 위에 표 모양 상자 "디렉터리 엔트리"가 있고 두 행 "a.txt"와 "b.txt"가 적혀 있다. 왼쪽 아래에 작은 표 상자 "파일 디스크립터 표"가 있고 한 행 "fd 3"이 있다. 가운데에 큰 둥근 사각형 "inode"가 있고 안에 세 줄 "크기", "링크 수: 2", "권한·시각"이 적혀 있다. 오른쪽에 디스크 모양 아이콘 "데이터 블록"이 있다. 화살표: "a.txt" 행에서 inode로, "b.txt" 행에서 inode로, "fd 3" 행에서 inode로(점선, 라벨 "열린 파일"), inode에서 데이터 블록으로. inode 상자 위쪽에 작은 말풍선 "이름은 여기에 없다". 왼쪽 위 표 옆에 작은 라벨 "unlink는 행 하나를 지운다". 평평한 벡터 스타일, 흰 배경, 요소마다 옅은 다른 색.</x-prompt>
+<x-caption>이름(디렉터리 엔트리)과 실체(inode)는 따로 있다. 마지막 이름이 지워져도 열린 디스크립터가 있으면 실체는 남는다.</x-caption>
+</x-visual>
+<p>경로 해석(path resolution)도 이 구조에서 나온다. 커널이 <code>/srv/app/data.txt</code>를 열 때는 루트 디렉터리의 엔트리 표에서 <code>srv</code>를 찾아 inode를 얻고, 그것이 디렉터리인지와 탐색 권한(디렉터리의 <code>x</code> 비트)이 있는지 확인한 뒤, 그 디렉터리의 엔트리 표에서 <code>app</code>을 찾는 식으로 한 칸씩 내려간다. 상대 경로는 출발점만 다르다. 루트가 아니라 프로세스의 현재 작업 디렉터리(current working directory)에서 출발한다. 중간에 심볼릭 링크를 만나면 링크에 적힌 경로로 갈아탄다. 이 회차 후반의 경로 표시 이야기는 전부 이 해석 과정을 자바가 어디까지 흉내 내고 어디서부터 커널에 맡기는지의 이야기다.</p>
+
+<h3>File 클래스: 경로 이름을 담은 불변 객체</h3>
+<p><code>java.io.File</code>의 Javadoc은 이 클래스를 파일과 디렉터리 경로 이름의 추상 표현(abstract pathname)이라고 소개한다. 이름에 "File"이 들어 있지만 <code>File</code> 객체는 파일이 아니다. 경로 문자열을 운영체제에 맞게 다듬어 담은 값이고, Javadoc은 이 객체가 불변(immutable)이라고, 즉 한번 만들면 나타내는 경로가 바뀌지 않는다고 명시한다. 그래서 <code>new File("temp/example.txt")</code>는 디스크에 아무 일도 일으키지 않는다. 파일 시스템에 손을 대는 것은 이 객체의 메서드를 부를 때다.</p>
+<p>아래 예제는 <code>File</code>의 대표 기능을 차례로 부른다. 실행하기 전에 작업 디렉터리에 <code>temp</code> 디렉터리를 하나 만들어 두었다.</p>
+<pre><code class="language-java">import java.io.File;
+import java.io.IOException;
+import java.util.Date;
+
+public class FileMain {
+    public static void main(String[] args) throws IOException {
+        File file = new File("temp/example.txt");
+        File directory = new File("temp/exampleDir");
+
+        System.out.println("file.exists() = " + file.exists());
+
+        boolean created = file.createNewFile();
+        System.out.println("createNewFile = " + created);
+
+        boolean dirCreated = directory.mkdir();
+        System.out.println("mkdir = " + dirCreated);
+
+        System.out.println("isFile = " + file.isFile());
+        System.out.println("isDirectory = " + directory.isDirectory());
+        System.out.println("getName = " + file.getName());
+        System.out.println("length = " + file.length());
+
+        File renamed = new File("temp/newExample.txt");
+        boolean ok = file.renameTo(renamed);
+        System.out.println("renameTo = " + ok);
+        System.out.println("old exists = " + file.exists() + ", new exists = " + renamed.exists());
+
+        long lastModified = renamed.lastModified();
+        System.out.println("lastModified = " + new Date(lastModified));
+
+        System.out.println("delete = " + renamed.delete());
+        System.out.println("delete dir = " + directory.delete());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (lastModified 값은 실행 시각에 따라 다르다)"><code class="language-text">file.exists() = false
+createNewFile = true
+mkdir = true
+isFile = true
+isDirectory = true
+getName = example.txt
+length = 0
+renameTo = true
+old exists = false, new exists = true
+lastModified = Tue Nov 17 05:43:47 KST 2026
+delete = true
+delete dir = true</code></pre>
+<p>결과는 예상대로다. 흥미로운 것은 각 메서드가 운영체제에 무엇을 요청하는가다. OpenJDK 21에서 유닉스 계열의 <code>File</code> 메서드는 <code>java.io.UnixFileSystem</code>을 거쳐 네이티브 코드(<code>UnixFileSystem_md.c</code>)로 내려간다. 그 코드를 읽으면 대응 관계가 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>File 메서드</th><th>반환 타입</th><th>아래에서 일어나는 일 (OpenJDK 21, 유닉스 계열)</th></tr></thead><tbody>
+<tr><td><code>exists</code>, <code>isFile</code>, <code>isDirectory</code></td><td><code>boolean</code></td><td><code>stat</code>으로 inode의 종류 비트를 읽는다. 호출할 때마다 한 번씩</td></tr>
+<tr><td><code>length</code>, <code>lastModified</code></td><td><code>long</code></td><td><code>stat</code>의 크기·수정 시각 필드. 실패하면 0</td></tr>
+<tr><td><code>createNewFile</code></td><td><code>boolean</code></td><td><code>open(path, O_RDWR | O_CREAT | O_EXCL, 0666)</code> 후 닫기</td></tr>
+<tr><td><code>mkdir</code></td><td><code>boolean</code></td><td><code>mkdir(path, 0777)</code></td></tr>
+<tr><td><code>renameTo</code></td><td><code>boolean</code></td><td><code>rename(from, to)</code></td></tr>
+<tr><td><code>delete</code></td><td><code>boolean</code></td><td>C 라이브러리의 <code>remove</code>(파일이면 <code>unlink</code>, 디렉터리면 <code>rmdir</code>)</td></tr>
+<tr><td><code>getName</code>, <code>getPath</code>, <code>getParent</code></td><td><code>String</code></td><td>시스템 콜 없음. 문자열 연산</td></tr>
+</tbody></table></div>
+<p><code>createNewFile</code>과 <code>mkdir</code>에 넘기는 권한 0666, 0777은 최종 권한이 아니다. 커널은 프로세스의 umask로 이 값을 걸러 낸다. umask가 흔히 쓰는 022라면 파일은 644(소유자만 쓰기), 디렉터리는 755가 된다. 그리고 <code>exists</code>, <code>isFile</code>, <code>length</code>를 연달아 부르면 <code>stat</code>이 세 번 일어난다는 점도 기억해 두자. 시스템 콜 비용 문제이기도 하지만, 그보다 세 호출 사이에 다른 프로세스가 파일을 바꿀 수 있다는 점이 더 중요하다. 뒤에서 <code>BasicFileAttributes</code>를 볼 때 다시 다룬다.</p>
+<p>같은 프로그램을 <code>temp</code> 디렉터리가 없는 곳에서 실행하면 결과가 달라진다.</p>
+<pre data-label="실행 결과 (temp 디렉터리가 없을 때)"><code class="language-text">file.exists() = false
+Exception in thread "main" java.io.IOException: No such file or directory
+	at java.base/java.io.UnixFileSystem.createFileExclusively0(Native Method)
+	at java.base/java.io.UnixFileSystem.createFileExclusively(UnixFileSystem.java:258)
+	at java.base/java.io.File.createNewFile(File.java:1045)</code></pre>
+<p><code>open</code>이 부모 디렉터리 <code>temp</code>를 찾지 못해 <code>ENOENT</code> 오류를 냈고, <code>createNewFile</code>은 이것을 <code>IOException</code>으로 바꿨다. 그런데 메시지를 보자. "No such file or directory"는 운영체제의 오류 문자열 그대로이고, <b>어느 경로가</b> 없는지는 들어 있지 않다. 이 파일 하나만 다루는 예제에서는 문제가 없지만, 경로 수십 개를 다루는 배치 작업의 로그에 이 한 줄만 남으면 원인을 찾기 어렵다. 그나마 <code>createNewFile</code>은 예외라도 던진다. 대부분의 <code>File</code> 메서드는 그러지 않는다.</p>
+
+<h3>File이 실패를 다루는 방식: false, 0, null</h3>
+<p>실패하는 상황을 일부러 만들어 보자. 이미 있는 디렉터리를 다시 만들고, 비어 있지 않은 디렉터리를 지우고, 없는 파일을 지우고, 부모가 없는 디렉터리를 만들고, 파일에 대고 목록을 달라고 하고, 없는 디렉터리로 이름을 바꾼다.</p>
+<pre><code class="language-java">import java.io.File;
+import java.io.IOException;
+import java.util.Arrays;
+
+public class FileSilent {
+    public static void main(String[] args) throws IOException {
+        File dir = new File("box");
+        System.out.println("mkdir 1 = " + dir.mkdir());
+        System.out.println("mkdir 2 = " + dir.mkdir());          // 이미 있음
+        File inner = new File("box/a.txt");
+        System.out.println("createNewFile = " + inner.createNewFile());
+        System.out.println("createNewFile again = " + inner.createNewFile());
+        System.out.println("delete box = " + dir.delete());      // 비어 있지 않음
+        System.out.println("delete ghost = " + new File("ghost.txt").delete()); // 없음
+        System.out.println("mkdir deep = " + new File("x/y/z").mkdir());   // 부모 없음
+        System.out.println("mkdirs deep = " + new File("x/y/z").mkdirs());
+        System.out.println("list on file = " + Arrays.toString(inner.list()));
+        System.out.println("list on dir = " + Arrays.toString(dir.list()));
+        System.out.println("length ghost = " + new File("ghost.txt").length());
+        System.out.println("length dir = " + (dir.length() > 0));
+        System.out.println("rename to missing dir = " + inner.renameTo(new File("nowhere/a.txt")));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (빈 디렉터리에서 실행)"><code class="language-text">mkdir 1 = true
+mkdir 2 = false
+createNewFile = true
+createNewFile again = false
+delete box = false
+delete ghost = false
+mkdir deep = false
+mkdirs deep = true
+list on file = null
+list on dir = [a.txt]
+length ghost = 0
+length dir = true
+rename to missing dir = false</code></pre>
+<p><code>false</code>가 일곱 번 나왔다. 그런데 이 일곱 개의 <code>false</code>는 원인이 모두 다르다. <code>mkdir 2</code>와 <code>createNewFile again</code>은 이미 있어서(<code>EEXIST</code>), <code>delete box</code>는 디렉터리가 비어 있지 않아서(<code>ENOTEMPTY</code>), <code>delete ghost</code>는 대상이 없어서(<code>ENOENT</code>), <code>mkdir deep</code>과 <code>rename to missing dir</code>은 경로 중간의 디렉터리가 없어서(<code>ENOENT</code>) 실패했다. 커널은 실패할 때마다 <code>errno</code>에 정확한 오류 번호를 남겼다. 하지만 네이티브 코드는 성공 여부만 보고 <code>JNI_FALSE</code>를 돌려주며, 오류 번호는 거기서 버려진다. 호출한 쪽은 "실패했다"는 사실 말고는 아무것도 알 수 없다. 권한이 없어서 실패했는지, 디스크가 가득 찼는지, 대상이 없었는지 구별할 수 없으니 적절한 복구 동작도 고를 수 없다.</p>
+<p>반환값이 <code>false</code>가 아닌 경우도 문제다. 없는 파일의 <code>length()</code>는 0이다. 크기가 0인 빈 파일과 구별되지 않는다. 디렉터리의 <code>length()</code>는 0보다 큰 값이 나왔지만, Javadoc은 경로가 디렉터리를 가리킬 때의 반환값이 명세되지 않았다(unspecified)고 적는다. 그리고 파일에 대고 <code>list()</code>를 부르면 빈 배열이 아니라 <code>null</code>이 나온다. Javadoc에 따르면 디렉터리가 아니거나 I/O 오류가 나면 <code>null</code>이다. 결과를 바로 for-each 문에 넣는 코드는 여기서 <code>NullPointerException</code>으로 죽고, 그 예외는 진짜 원인과 아무 관련 없는 줄을 가리킨다.</p>
+<p><code>renameTo</code>의 Javadoc은 이 메서드의 동작이 본질적으로 플랫폼에 의존한다고 밝힌다. 다른 파일 시스템으로는 옮기지 못할 수 있고, 원자적이지 않을 수 있고, 대상 이름의 파일이 이미 있으면 실패할 수 있으니 반환값을 반드시 확인하라는 것이다. 문서가 스스로 "결과를 믿지 말고 확인하라"고 말하는 API는 쓰는 쪽에 부담을 넘긴다. 이 밖에도 <code>File</code>에는 심볼릭 링크를 링크 자체로 다루는 방법이 없고, 소유자나 권한 비트 같은 속성을 읽을 방법이 제한적이며, <code>list()</code>는 디렉터리의 모든 이름을 한 번에 배열로 만든다. Javadoc도 <code>list()</code> 설명에서 아주 큰 디렉터리라면 <code>Files.newDirectoryStream</code>이 자원을 덜 쓸 수 있다고 안내한다.</p>
+<aside class="note"><code>File</code>은 폐기 예정(deprecated) 클래스가 아니다. 여전히 많은 API가 <code>File</code>을 받고, <code>file.toPath()</code>(Java 7부터)와 <code>path.toFile()</code>로 서로 바꿀 수 있다. 새 코드에서 파일 시스템 작업을 할 때 <code>Files</code>를 쓰고, <code>File</code>을 요구하는 오래된 API와 만날 때만 변환하면 된다.</aside>
+
+<h3>Path와 Files: 주소와 작업을 나눈 설계</h3>
+<p>NIO.2는 <code>File</code>이 한 몸에 지고 있던 역할을 셋으로 나눴다. <b><code>Path</code></b>는 경로, 즉 주소만 표현한다. <b><code>Files</code></b>는 정적 메서드만 모아 둔 클래스로, 주소를 받아 파일 시스템에 작업을 요청한다. 그리고 그 작업을 실제로 수행하는 것은 <b><code>FileSystemProvider</code></b>다. <code>Path</code>는 인터페이스이고, 어떤 파일 시스템에 속한 경로인지(<code>getFileSystem()</code>)를 안다. <code>Files.delete(path)</code>를 부르면 <code>Files</code>는 그 경로의 파일 시스템에서 provider를 꺼내 <code>provider.delete(path)</code>를 부른다. 즉 <code>Files</code>는 얇은 관문이고, 운영체제별 코드는 provider 안에 있다.</p>
+<p><code>Path</code>는 <code>Path.of("temp", "a.txt")</code>처럼 만든다. <code>Path.of</code>는 Java 11에 추가됐고, 그 전에는 <code>Paths.get</code>을 썼다. 두 메서드는 같은 일을 하는데, <code>Paths</code>의 Javadoc은 <code>Path.of</code>를 쓰라고 권하며 <code>Paths</code> 클래스가 나중에 폐기될 수 있다고 적어 두었다. 기본 파일 시스템은 <code>FileSystems.getDefault()</code>가 돌려주고, 경로 문자열을 <code>Path.of</code>에 넘기면 이 기본 파일 시스템의 경로가 만들어진다.</p>
+<p>이 분리가 단순한 코드 정리가 아니라는 것은 기본 파일 시스템이 아닌 것을 끼워 보면 드러난다. JDK에는 ZIP 파일을 하나의 파일 시스템처럼 다루는 provider가 들어 있다. 아래 예제는 ZIP 파일 안에 디렉터리와 텍스트 파일을 만들고 다시 읽는데, 쓰는 API는 지금까지와 똑같은 <code>Files</code>다.</p>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.file.*;
+import java.util.Map;
+import java.util.stream.Stream;
+
+public class ZipFsMain {
+    public static void main(String[] args) throws IOException {
+        Path zip = Path.of("archive.zip");
+        Files.deleteIfExists(zip);
+        try (FileSystem zipfs = FileSystems.newFileSystem(zip, Map.of("create", "true"))) {
+            Path inside = zipfs.getPath("/docs/hello.txt");
+            Files.createDirectories(inside.getParent());
+            Files.writeString(inside, "zip 안의 파일");
+            System.out.println("path class = " + inside.getClass().getName());
+            System.out.println("provider   = " + zipfs.provider().getScheme());
+            System.out.println("read       = " + Files.readString(inside));
+        }
+        System.out.println("default provider = " + FileSystems.getDefault().provider().getScheme()
+                + ", path class = " + Path.of("a.txt").getClass().getName());
+        try (FileSystem zipfs = FileSystems.newFileSystem(zip);
+             Stream<Path> s = Files.walk(zipfs.getPath("/"))) {
+            s.forEach(p -> System.out.println("entry: " + p));
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (macOS)"><code class="language-text">path class = jdk.nio.zipfs.ZipPath
+provider   = jar
+read       = zip 안의 파일
+default provider = file, path class = sun.nio.fs.UnixPath
+entry: /
+entry: /docs
+entry: /docs/hello.txt</code></pre>
+<p>같은 <code>Files.writeString</code> 호출이 한 번은 운영체제의 <code>write</code> 시스템 콜로, 한 번은 ZIP 항목의 압축과 기록으로 이어졌다. 기본 파일 시스템의 경로 클래스는 macOS에서 <code>sun.nio.fs.UnixPath</code>이고, ZIP 안의 경로는 <code>jdk.nio.zipfs.ZipPath</code>다. 둘 다 <code>Path</code>를 구현하므로 <code>Files</code> 입장에서는 구별할 필요가 없다. 객체지향에서 말하는 다형성이 파일 시스템 수준에 적용된 것이다. 반대로 <code>Path.toFile()</code>은 기본 provider의 경로에서만 동작하고, 다른 provider의 경로에서 부르면 <code>UnsupportedOperationException</code>을 던진다. ZIP 안의 항목은 운영체제가 아는 파일이 아니므로 <code>File</code>로 나타낼 수 없기 때문이다.</p>
+<x-visual id="java-adv2-05-nio-layers" title="Files, Path, FileSystemProvider의 계층" kind="계층 구조도" ratio="4:3">
+<x-hint>Files의 정적 메서드가 Path가 속한 파일 시스템의 provider로 요청을 넘기고, provider마다 다른 바닥(운영체제 시스템 콜, ZIP 파일)으로 내려가는 구조를 보여 준다.</x-hint>
+<x-prompt>세로 계층도. 맨 위에 넓은 상자 "Files (정적 메서드)"가 있고, 그 왼쪽 위에 작은 카드 "Path"가 화살표로 Files에 들어간다. Files 아래로 화살표 "provider()"가 내려가 두 갈래로 나뉜다. 왼쪽 상자 "기본 provider (file)" 아래에 "UnixPath"라는 작은 라벨, 그 아래 상자 "운영체제 시스템 콜"과 아이콘 "디스크". 오른쪽 상자 "ZIP provider (jar)" 아래에 "ZipPath" 라벨, 그 아래 상자 "ZIP 파일 하나". 오른쪽 여백에 세로 괄호로 provider 층을 묶어 "구현은 여기에" 라벨. 평평한 벡터 스타일, 흰 배경, 왼쪽 갈래와 오른쪽 갈래를 서로 다른 옅은 색으로.</x-prompt>
+<x-caption>Files는 관문일 뿐이고, 실제 작업은 Path가 속한 파일 시스템의 provider가 한다.</x-caption>
+</x-visual>
+
+<h3>Files로 같은 일을 다시 하면: 예외가 원인을 말한다</h3>
+<p>앞에서 <code>File</code>로 일부러 실패시킨 작업을 <code>Files</code>로 다시 해 보자. 결과를 비교하기 쉽도록 작업마다 예외를 잡아 클래스 이름과 메시지를 찍는다.</p>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.file.*;
+
+public class FilesLoud {
+    interface Op { void run() throws IOException; }
+
+    static void tryIt(String label, Op op) {
+        try {
+            op.run();
+            System.out.println(label + " -> ok");
+        } catch (IOException e) {
+            System.out.println(label + " -> " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    public static void main(String[] args) {
+        Path dir = Path.of("box");
+        Path inner = dir.resolve("a.txt");
+        tryIt("createDirectory 1", () -> Files.createDirectory(dir));
+        tryIt("createDirectory 2", () -> Files.createDirectory(dir));
+        tryIt("createFile 1", () -> Files.createFile(inner));
+        tryIt("createFile 2", () -> Files.createFile(inner));
+        tryIt("delete box", () -> Files.delete(dir));
+        tryIt("delete ghost", () -> Files.delete(Path.of("ghost.txt")));
+        tryIt("createDirectory deep", () -> Files.createDirectory(Path.of("x/y/z")));
+        tryIt("createDirectories deep", () -> Files.createDirectories(Path.of("x/y/z")));
+        tryIt("size ghost", () -> Files.size(Path.of("ghost.txt")));
+        tryIt("move to missing dir", () -> Files.move(inner, Path.of("nowhere/a.txt")));
+        tryIt("list on file", () -> { try (var s = Files.list(inner)) { s.count(); } });
+        tryIt("createFile no parent", () -> Files.createFile(Path.of("nodir/b.txt")));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (빈 디렉터리에서 실행)"><code class="language-text">createDirectory 1 -> ok
+createDirectory 2 -> FileAlreadyExistsException: box
+createFile 1 -> ok
+createFile 2 -> FileAlreadyExistsException: box/a.txt
+delete box -> DirectoryNotEmptyException: box
+delete ghost -> NoSuchFileException: ghost.txt
+createDirectory deep -> NoSuchFileException: x/y/z
+createDirectories deep -> ok
+size ghost -> NoSuchFileException: ghost.txt
+move to missing dir -> NoSuchFileException: box/a.txt -> nowhere/a.txt
+list on file -> NotDirectoryException: box/a.txt
+createFile no parent -> NoSuchFileException: nodir/b.txt</code></pre>
+<p>이번에는 실패마다 원인이 예외의 <b>타입</b>으로 드러나고, 메시지에는 문제의 경로가 들어 있다. 이동처럼 경로가 둘인 작업은 두 경로를 화살표로 이어 보여 준다. 이 예외들은 모두 <code>java.nio.file.FileSystemException</code>의 하위 클래스이고, <code>FileSystemException</code>은 <code>getFile()</code>, <code>getOtherFile()</code>, <code>getReason()</code>으로 관련 경로와 사유를 따로 꺼낼 수 있게 한다. 문자열 메시지를 파싱하지 않고도 어떤 경로에서 무슨 일이 있었는지 프로그램이 알 수 있다.</p>
+<p>원인이 살아남는 이유는 provider 구현에 있다. OpenJDK 21의 유닉스 provider는 시스템 콜이 실패하면 오류 번호를 담은 <code>UnixException</code>을 만들고, 이것을 표준 예외로 번역한다. <code>UnixException.translateToIOException</code>의 번역 규칙은 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>오류 번호 (errno)</th><th>뜻</th><th>번역된 예외</th></tr></thead><tbody>
+<tr><td><code>EACCES</code></td><td>권한 없음</td><td><code>AccessDeniedException</code></td></tr>
+<tr><td><code>ENOENT</code></td><td>경로의 어떤 구성 요소가 없음</td><td><code>NoSuchFileException</code></td></tr>
+<tr><td><code>EEXIST</code></td><td>이미 있음</td><td><code>FileAlreadyExistsException</code></td></tr>
+<tr><td><code>ELOOP</code></td><td>심볼릭 링크 단계가 너무 많음</td><td><code>FileSystemException</code>(사유에 링크 관련 문구 추가)</td></tr>
+<tr><td>그 밖의 값</td><td>디스크 가득 참 등</td><td><code>FileSystemException</code>(사유는 운영체제 오류 문자열)</td></tr>
+</tbody></table></div>
+<p>작업에 따라 더 구체적인 번역도 있다. 삭제(<code>delete</code>)는 디렉터리가 비어 있지 않아 생긴 <code>EEXIST</code>나 <code>ENOTEMPTY</code>를 <code>DirectoryNotEmptyException</code>으로, 디렉터리 목록 열기는 대상이 디렉터리가 아닐 때 <code>NotDirectoryException</code>으로 바꾼다. 실행 결과의 "createDirectory deep"이 <code>NoSuchFileException: x/y/z</code>라고 나온 것도 이 번역 규칙 때문이다. 없는 것은 <code>x</code>인데 <code>mkdir</code> 시스템 콜이 돌려준 오류는 <code>ENOENT</code> 하나뿐이고, 커널은 경로의 어느 구성 요소가 없었는지 알려 주지 않는다. 그래서 예외 메시지에는 요청한 경로 전체가 들어간다. 메시지의 경로가 "없는 파일"이 아니라 "찾다가 실패한 경로"라는 점을 알고 읽어야 한다.</p>
+<p>자주 쓰는 작업의 대응 관계를 정리하면 아래와 같다. 이름이 비슷하지만 실패 처리 방식이 다르다는 점이 핵심이다.</p>
+<div class="table-wrap"><table><thead><tr><th>작업</th><th>File</th><th>Files</th></tr></thead><tbody>
+<tr><td>파일 만들기</td><td><code>createNewFile()</code> → <code>boolean</code></td><td><code>createFile(path)</code> → 있으면 <code>FileAlreadyExistsException</code></td></tr>
+<tr><td>디렉터리 만들기</td><td><code>mkdir()</code>, <code>mkdirs()</code> → <code>boolean</code></td><td><code>createDirectory</code>, <code>createDirectories</code></td></tr>
+<tr><td>삭제</td><td><code>delete()</code> → <code>boolean</code></td><td><code>delete</code>(실패하면 예외), <code>deleteIfExists</code>(없으면 <code>false</code>)</td></tr>
+<tr><td>종류·존재</td><td><code>isFile</code>, <code>isDirectory</code>, <code>exists</code></td><td><code>isRegularFile</code>, <code>isDirectory</code>, <code>exists</code>, <code>notExists</code></td></tr>
+<tr><td>크기·시각</td><td><code>length()</code>, <code>lastModified()</code> → 실패하면 0</td><td><code>size</code>, <code>getLastModifiedTime</code> → 실패하면 예외</td></tr>
+<tr><td>이름 바꾸기·이동</td><td><code>renameTo</code> → <code>boolean</code></td><td><code>move(source, target, options...)</code></td></tr>
+<tr><td>목록</td><td><code>list()</code>, <code>listFiles()</code> → 배열 또는 <code>null</code></td><td><code>list</code>, <code>walk</code>(스트림), <code>newDirectoryStream</code></td></tr>
+</tbody></table></div>
+<p><code>Files.list</code>와 <code>Files.walk</code>는 결과를 배열이 아니라 <code>Stream</code>으로 준다. 디렉터리를 연 채로 항목을 하나씩 읽어 오므로 아주 큰 디렉터리에서도 메모리를 한꺼번에 쓰지 않는다. 대가는 그 스트림이 열린 디렉터리를 붙들고 있다는 것이다. Javadoc은 이 스트림이 열린 디렉터리에 대한 참조를 갖고 있으며 스트림을 닫아야 디렉터리가 닫힌다고 적는다. 위 예제처럼 try-with-resources로 감싸지 않으면 디렉터리를 연 파일 디스크립터가 작업이 끝난 뒤에도 회수되지 않은 채 남는다. 디스크립터는 프로세스마다 개수 제한이 있는 자원이라, 이런 누수가 쌓이면 어느 순간 파일도 소켓도 열리지 않는 장애로 이어진다.</p>
+
+<h3>존재 확인은 순간의 사진이다: exists, notExists, 그리고 원자적 생성</h3>
+<p><code>Files</code>에는 <code>exists</code>와 함께 <code>notExists</code>라는 메서드가 따로 있다. <code>!exists()</code>면 될 텐데 왜 따로 있을까. 존재 여부를 알 수 없는 경우가 있기 때문이다. 다음 실험은 디렉터리 <code>locked</code> 안에 파일을 만든 뒤 그 디렉터리의 읽기·탐색 권한을 모두 뺀다.</p>
+<pre><code class="language-java">import java.io.File;
+import java.io.IOException;
+import java.nio.file.*;
+
+public class LockedMain {
+    public static void main(String[] args) throws IOException {
+        Path locked = Path.of("locked");
+        Files.createDirectories(locked);
+        Files.writeString(locked.resolve("secret.txt"), "s");
+        new File("locked").setExecutable(false, false);   // 탐색 권한 제거
+        new File("locked").setReadable(false, false);     // 읽기 권한 제거
+
+        Path secret = locked.resolve("secret.txt");
+        System.out.println("exists = " + Files.exists(secret));
+        System.out.println("notExists = " + Files.notExists(secret));
+        System.out.println("File.exists = " + new File("locked/secret.txt").exists());
+        try {
+            Files.size(secret);
+        } catch (IOException e) {
+            System.out.println(e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+        new File("locked").setExecutable(true, false);    // 원상 복구
+        new File("locked").setReadable(true, false);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (일반 사용자 권한으로 실행)"><code class="language-text">exists = false
+notExists = false
+File.exists = false
+AccessDeniedException: locked/secret.txt</code></pre>
+<p>파일은 분명히 있다. 그러나 커널이 <code>locked/secret.txt</code>를 해석하려면 <code>locked</code> 디렉터리의 엔트리 표를 들여다봐야 하고, 그러려면 그 디렉터리의 탐색 권한이 필요하다. 권한이 없으니 <code>stat</code>은 <code>EACCES</code>로 실패한다. 이때 <code>Files.exists</code>와 <code>Files.notExists</code>는 <b>둘 다</b> <code>false</code>를 돌려준다. Javadoc은 <code>notExists</code>가 <code>exists</code>의 보수가 아니며, 존재 여부를 판단할 수 없으면 두 메서드 모두 <code>false</code>를 돌려준다고 명시한다. 즉 결과는 셋 중 하나다. 있다(<code>exists</code>가 참), 없다(<code>notExists</code>가 참), 모른다(둘 다 거짓). <code>File.exists</code>는 <code>boolean</code> 하나뿐이라 "모른다"를 "없다"와 구별하지 못한다. 진짜 원인이 필요하면 <code>Files.size</code>처럼 예외를 던지는 메서드를 부르면 된다. <code>AccessDeniedException</code>이 사실을 말해 준다. 이 실험은 루트 권한으로 실행하면 권한 검사를 건너뛰므로 결과가 다르다.</p>
+<p>더 근본적인 문제는 시간이다. <code>Files.exists</code>의 Javadoc은 이 메서드의 결과가 "즉시 낡는다(immediately outdated)"고 적는다. <code>exists</code>가 <code>true</code>를 돌려준 직후 다른 프로세스가 파일을 지울 수 있고, <code>false</code>를 돌려준 직후 다른 스레드가 파일을 만들 수 있다. 확인한 시점과 사용하는 시점 사이의 틈을 노린 결함을 TOCTOU(time-of-check to time-of-use) 경쟁 조건이라고 부른다. 다음 코드는 흔하지만 틀렸다.</p>
+<pre><code class="language-java">// 틀린 방식: 확인과 생성 사이에 틈이 있다
+if (Files.notExists(lockFile)) {
+    Files.createFile(lockFile);   // 두 프로세스가 동시에 여기까지 올 수 있다
+    // ... 내가 잠금을 얻었다고 믿고 작업한다
+}</code></pre>
+<p>두 프로세스가 거의 동시에 <code>notExists</code>를 부르면 둘 다 <code>true</code>를 받는다. 그다음 둘 다 <code>createFile</code>로 간다. 다행히 <code>Files.createFile</code>은 확인과 생성을 따로 하지 않는다. Javadoc은 파일이 있는지 확인하는 일과 없으면 만드는 일이 디렉터리에 영향을 주는 다른 모든 파일 시스템 활동에 대해 원자적인 단일 연산이라고 적는다. 구현을 보면 이유가 보인다. <code>createFile</code>은 <code>CREATE_NEW</code>와 <code>WRITE</code> 옵션으로 채널을 열었다 닫고, 유닉스 provider는 <code>CREATE_NEW</code>를 <code>open</code>의 <code>O_CREAT | O_EXCL</code> 플래그로 바꾼다. "없으면 만들고, 있으면 실패하라"는 판단을 커널이 디렉터리를 수정하는 한 번의 연산 안에서 하므로, 두 프로세스 중 정확히 하나만 성공하고 나머지는 <code>EEXIST</code>, 즉 <code>FileAlreadyExistsException</code>을 받는다. <code>File.createNewFile</code>도 앞의 표처럼 <code>O_EXCL</code>을 쓰므로 원자적이다. 다만 결과가 <code>boolean</code>이라 실패 원인을 구별하지 못할 뿐이다. 따라서 올바른 방식은 확인하지 않고 바로 시도하는 것이다.</p>
+<pre><code class="language-java">// 올바른 방식: 시도 자체가 확인이다
+try {
+    Files.createFile(lockFile);
+    // ... 여기 도달한 프로세스는 하나뿐이다
+} catch (FileAlreadyExistsException e) {
+    // 다른 누군가가 먼저 만들었다
+}</code></pre>
+<p>같은 원리가 다른 곳에도 적용된다. "읽기 전에 <code>exists</code>로 확인"하는 코드는 대부분 그냥 읽고 <code>NoSuchFileException</code>을 잡는 코드로 바꾸는 것이 낫다. 확인은 답을 주지 않고 시간만 쓰며, 확인과 사용 사이의 틈은 없앨 수 없기 때문이다. <code>exists</code>가 쓸모 있는 곳은 결과가 틀려도 해가 없는 곳, 예를 들어 화면에 "파일 없음"을 미리 표시하는 정도다.</p>
+
+<h3>이름 바꾸기와 이동: rename은 원자적이다</h3>
+<p>디렉터리 엔트리 모델로 돌아가면 이름 바꾸기가 왜 특별한지 보인다. 같은 파일 시스템 안에서 이름을 바꾸거나 다른 디렉터리로 옮기는 일은 데이터를 건드리지 않는다. 한 디렉터리의 엔트리를 지우고 다른 디렉터리에 엔트리를 만들면 끝이다. 1GB 파일이든 1바이트 파일이든 걸리는 시간이 비슷한 이유다. POSIX는 여기서 한 걸음 더 나아가 <code>rename</code>의 원자성을 요구한다. 대상 이름이 이미 있으면 그 이름은 연산 내내 다른 스레드에게 보이는 상태로 남아야 하고, 연산 전의 옛 파일이나 새 파일 중 하나를 가리켜야 한다. 중간 상태, 즉 이름이 잠깐 없어지는 순간이 다른 프로세스에게 보이지 않는다.</p>
+<p>원자성에는 조건이 있다. 엔트리만 옮기는 것은 두 이름이 같은 파일 시스템에 있을 때만 가능하다. inode 번호는 파일 시스템 안에서만 뜻이 있기 때문이다. 다른 파일 시스템으로 옮기려 하면 <code>rename</code>은 <code>EXDEV</code> 오류로 실패한다. OpenJDK 21의 <code>Files.move</code>는 이 상황을 이렇게 처리한다. <code>ATOMIC_MOVE</code> 옵션이 없으면 먼저 <code>rename</code>을 시도하고, <code>EXDEV</code>가 나면 대상에 복사한 뒤 원본을 지운다. 이 경로는 원자적이지 않으며, 큰 파일이면 복사 시간만큼 걸린다. <code>ATOMIC_MOVE</code> 옵션을 주면 <code>rename</code>만 시도하고, <code>EXDEV</code>가 나면 <code>AtomicMoveNotSupportedException</code>을 던진다. 복사로 슬쩍 대신하지 않고 "원자적으로는 할 수 없다"고 알려 주는 것이다.</p>
+<p>이 성질은 설정 파일이나 캐시 파일을 안전하게 교체하는 데 쓰인다. 파일을 제자리에서 덮어쓰면 쓰는 도중에 그 파일을 읽은 다른 프로세스는 반쯤 쓰인 내용을 본다. 대신 같은 디렉터리에 임시 파일을 만들어 내용을 다 쓴 다음 <code>rename</code>으로 원래 이름에 덮어씌우면, 읽는 쪽은 옛 내용 전체나 새 내용 전체 중 하나만 본다.</p>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.file.*;
+
+public class SafeWrite {
+    static void replaceAtomically(Path target, String content) throws IOException {
+        Path dir = target.toAbsolutePath().getParent();
+        Path temp = Files.createTempFile(dir, "tmp-", ".part");   // 같은 디렉터리 = 같은 파일 시스템
+        try {
+            Files.writeString(temp, content);
+            Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE);
+        } finally {
+            Files.deleteIfExists(temp);                            // 성공했다면 이미 없다
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+        Path config = Path.of("config.txt");
+        replaceAtomically(config, "version=1");
+        replaceAtomically(config, "version=2");
+        System.out.println(Files.readString(config));
+        try (var s = Files.list(Path.of("."))) {
+            System.out.println("leftover temp files = " + s.filter(p -> p.toString().endsWith(".part")).count());
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">version=2
+leftover temp files = 0</code></pre>
+<p>임시 파일을 대상과 <b>같은 디렉터리</b>에 만드는 것이 요점이다. 시스템 임시 디렉터리는 다른 파일 시스템일 수 있고, 그러면 <code>ATOMIC_MOVE</code>가 실패한다. 두 번째 호출에서는 <code>config.txt</code>가 이미 있다. <code>Files.move</code>의 Javadoc은 <code>ATOMIC_MOVE</code>로 옮길 때 대상이 이미 있으면 교체할지 실패할지가 구현에 달려 있다고 적는다. OpenJDK 21의 유닉스 구현은 <code>rename</code>을 그대로 부르고, POSIX <code>rename</code>은 대상을 교체하므로 결과가 <code>version=2</code>다. 한 가지 더 기억할 점이 있다. 원자성은 "다른 프로세스에게 어떻게 보이는가"에 대한 보장이지, 전원이 꺼져도 살아남는다는 보장이 아니다. 02회차에서 본 것처럼 <code>write</code>가 끝나도 데이터는 운영체제의 페이지 캐시에 있을 수 있다. 정전까지 견뎌야 한다면 이름을 바꾸기 전에 <code>FileChannel.force</code>로 임시 파일의 내용을 장치까지 내려야 한다.</p>
+
+<h3>속성을 한 번에 읽기: BasicFileAttributes와 fileKey</h3>
+<p><code>File</code>로 파일의 종류, 크기, 수정 시각을 알려면 메서드를 세 번 불러야 하고, 앞에서 본 것처럼 그때마다 <code>stat</code>이 한 번씩 일어난다. 이 방식에는 성능보다 중요한 결함이 있다. 세 값이 서로 다른 순간의 사진이라는 것이다. 첫 번째 호출과 세 번째 호출 사이에 파일이 다른 파일로 교체되면, 종류는 옛 파일의 것이고 크기는 새 파일의 것인 조합을 얻는다. <code>Files.readAttributes</code>는 <code>stat</code> 한 번으로 얻은 값을 묶어 <code>BasicFileAttributes</code> 객체 하나로 돌려준다. 한 순간의 일관된 사진이다.</p>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+
+public class AttrMain {
+    public static void main(String[] args) throws IOException {
+        Path file = Path.of("hello.txt");
+        Files.writeString(file, "Hello, 가나다");
+
+        BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
+        System.out.println("isRegularFile = " + attrs.isRegularFile());
+        System.out.println("isDirectory = " + attrs.isDirectory());
+        System.out.println("isSymbolicLink = " + attrs.isSymbolicLink());
+        System.out.println("size = " + attrs.size());
+        System.out.println("fileKey = " + attrs.fileKey());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (fileKey 값은 파일과 장치마다 다르다)"><code class="language-text">isRegularFile = true
+isDirectory = false
+isSymbolicLink = false
+size = 16
+fileKey = (dev=100000e,ino=30630409)</code></pre>
+<p>크기 16은 <code>Files.writeString</code>이 UTF-8로 인코딩한 결과다. <code>"Hello, "</code>가 7바이트, <code>"가나다"</code>가 한 글자에 3바이트씩 9바이트다. <code>fileKey</code>는 파일을 고유하게 식별하는 객체로, OpenJDK의 유닉스 구현에서는 장치 번호와 inode 번호의 쌍이다. 장치 번호는 16진수로, inode 번호는 10진수로 찍힌다. 같은 파일에 셸에서 <code>stat -f "dev=%d ino=%i" hello.txt</code>를 실행하면 <code>dev=16777230 ino=30630409</code>가 나오는데, 16진수 <code>100000e</code>가 10진수로 16777230이다. 앞에서 본 하드 링크 두 개는 이름이 달라도 <code>fileKey</code>가 같다. <code>Files.isSameFile</code>이 두 경로가 같은 파일인지 판단할 수 있는 것도 이 쌍을 비교하기 때문이다. 단, Javadoc은 <code>fileKey</code>를 제공할 수 없는 파일 시스템에서는 <code>null</code>을 돌려줄 수 있다고 정해 두었으니 항상 있다고 가정하지 않는다.</p>
+<p>속성은 뷰(view) 단위로 나뉘어 있다. 모든 파일 시스템이 지원해야 하는 <code>basic</code> 뷰, 유닉스 계열 권한을 다루는 <code>posix</code> 뷰, 그리고 OpenJDK의 유닉스 provider가 제공하는 <code>unix</code> 뷰(앞에서 쓴 <code>unix:nlink</code>, <code>unix:ino</code>) 등이 있다. 어떤 뷰를 쓸 수 있는지는 <code>FileSystems.getDefault().supportedFileAttributeViews()</code>로 확인할 수 있다. 이름 문자열로 속성을 읽는 <code>Files.getAttribute(path, "unix:nlink")</code> 같은 방식은 편하지만, 지원하지 않는 뷰를 지정하면 <code>UnsupportedOperationException</code>이 나므로 여러 운영체제에서 돌아야 하는 코드라면 <code>basic</code> 뷰에 머무는 것이 안전하다.</p>
+
+<h3>디렉터리를 읽는 일: readdir, 열린 디렉터리, 순환하는 링크</h3>
+<p>앞에서 <code>Files.list</code>와 <code>Files.walk</code>가 돌려준 스트림은 열린 디렉터리를 붙들고 있다고 했다. 무엇을 붙드는지 한 층 내려가 보자. 디렉터리의 내용은 디렉터리 엔트리 표이고, 프로그램은 이 표를 C 라이브러리의 <code>opendir</code>로 열어 <code>readdir</code>로 엔트리를 하나씩 꺼낸다. OpenJDK 21의 <code>sun.nio.fs.UnixDirectoryStream</code>이 정확히 이렇게 동작한다. 반복자의 <code>hasNext</code>가 다음 항목을 필요로 할 때마다 네이티브 <code>readdir</code>을 한 번 불러 이름 하나를 바이트 배열로 받고, <code>.</code>과 <code>..</code>이면 건너뛰고, 아니면 디렉터리 경로에 그 이름을 <code>resolve</code>한 <code>Path</code>를 돌려준다. 목록 전체를 배열로 만드는 단계가 없으므로 엔트리가 백만 개인 디렉터리도 한 번에 한 이름만 메모리에 올린다.</p>
+<p>이 구조에서 두 가지 성질이 나온다. 첫째, 순서가 정해져 있지 않다. <code>DirectoryStream</code>의 Javadoc은 반복자가 돌려주는 항목에 특정한 순서가 없다고 적는다. 순서는 파일 시스템이 엔트리를 저장한 방식에서 그대로 나오므로, 이름순이 필요하면 직접 정렬해야 한다. 둘째, 반복 도중의 변화에 대해 약하게 일관적(weakly consistent)이다. 같은 Javadoc은 반복자가 디렉터리를 얼려 두지 않으므로 스트림을 만든 뒤에 생긴 변화를 반영할 수도, 반영하지 않을 수도 있다고 정한다. 디렉터리를 읽으면서 그 디렉터리에 파일을 만들거나 지우는 코드는 새 항목을 볼지 말지를 기대할 수 없다.</p>
+<p>아래 실험은 세 가지를 확인한다. <code>Files.list</code>가 열려 있는 동안 프로세스의 디스크립터가 늘어나는지, 기본 provider가 돌려주는 디렉터리 스트림이 어떤 종류인지, 그리고 조상 디렉터리를 가리키는 링크가 있을 때 <code>Files.walk</code>가 어떻게 행동하는지다. macOS에서는 <code>/dev/fd</code> 디렉터리가 현재 프로세스의 열린 디스크립터를 이름으로 보여 주므로 그 항목 수를 센다.</p>
+<pre><code class="language-java">import java.io.*;
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.stream.Stream;
+
+public class DirMain {
+    static long openFds() {
+        String[] names = new File("/dev/fd").list();   // 이 호출도 디렉터리를 잠깐 연다
+        return names.length;
+    }
+
+    public static void main(String[] args) throws IOException {
+        Path root = Path.of("tree");
+        Files.createDirectories(root.resolve("a/b"));
+        Files.writeString(root.resolve("a/b/f.txt"), "x");
+        Path loop = root.resolve("a/b/up");
+        if (!Files.exists(loop, LinkOption.NOFOLLOW_LINKS)) {
+            Files.createSymbolicLink(loop, Path.of("../.."));      // tree/a/b/up -> tree
+        }
+
+        long before = openFds();
+        Stream<Path> s = Files.list(root);
+        long during = openFds();
+        s.close();
+        long after = openFds();
+        System.out.println("fds: before=" + before + " during=" + during + " after=" + after);
+
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(root)) {
+            System.out.println("secure = " + (ds instanceof SecureDirectoryStream));
+        }
+
+        try (Stream<Path> w = Files.walk(root)) {
+            w.forEach(p -> System.out.println("walk: " + p));
+        }
+        try (Stream<Path> w = Files.walk(root, FileVisitOption.FOLLOW_LINKS)) {
+            w.forEach(p -> System.out.println("follow: " + p));
+        } catch (UncheckedIOException e) {
+            System.out.println("follow failed: " + e.getCause());
+        }
+
+        Files.walkFileTree(root, new SimpleFileVisitor<>() {
+            @Override public FileVisitResult visitFile(Path f, BasicFileAttributes a) throws IOException {
+                Files.delete(f); System.out.println("delete file: " + f); return FileVisitResult.CONTINUE;
+            }
+            @Override public FileVisitResult postVisitDirectory(Path d, IOException e) throws IOException {
+                if (e != null) throw e;
+                Files.delete(d); System.out.println("delete dir:  " + d); return FileVisitResult.CONTINUE;
+            }
+        });
+        System.out.println("exists = " + Files.exists(root));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (macOS, 빈 디렉터리에서 실행. fds의 절대값과 walk의 항목 순서는 환경에 따라 다르다)"><code class="language-text">fds: before=5 during=6 after=5
+secure = false
+walk: tree
+walk: tree/a
+walk: tree/a/b
+walk: tree/a/b/up
+walk: tree/a/b/f.txt
+follow: tree
+follow: tree/a
+follow: tree/a/b
+follow failed: java.nio.file.FileSystemLoopException: tree/a/b/up
+delete file: tree/a/b/up
+delete file: tree/a/b/f.txt
+delete dir:  tree/a/b
+delete dir:  tree/a
+delete dir:  tree
+exists = false</code></pre>
+<p>첫 줄부터 보자. 절대값 5에는 표준 입출력과 JVM이 연 다른 파일, 그리고 <code>/dev/fd</code>를 읽는 데 잠깐 쓴 디스크립터까지 들어 있으므로 의미가 없다. 볼 것은 차이다. <code>Files.list</code>가 열린 동안 하나가 늘었고, 스트림을 닫자 원래대로 돌아왔다. 늘어난 하나가 <code>opendir</code>이 연 디렉터리의 디스크립터다. 닫지 않은 <code>Files.list</code> 스트림이 쌓이면 이 숫자가 계속 커진다.</p>
+<h4>macOS와 리눅스가 다른 디렉터리 스트림을 쓰는 이유</h4>
+<p>두 번째 줄 <code>secure = false</code>는 플랫폼마다 다르다. <code>SecureDirectoryStream</code>은 열린 디렉터리를 기준으로 파일을 열고, 속성을 읽고, 지우는 연산을 제공하는 하위 인터페이스다. Javadoc은 이 인터페이스가 파일 트리를 경쟁 없이(race-free) 다뤄야 하는 보안에 민감한 애플리케이션을 위한 것이고, 디렉터리가 열려 있는 동안 공격자가 그 디렉터리를 옮기거나 바꿔치기해도 모든 접근이 열린 디렉터리를 기준으로 이루어진다고 설명한다. 그리고 운영체제가 지원하는 경우에만 <code>newDirectoryStream</code>이 이 타입을 돌려준다고 정해 두었다. 기반이 되는 것은 경로 문자열 대신 "디렉터리 디스크립터 + 상대 이름"을 받는 <code>openat</code>, <code>fstatat</code>, <code>unlinkat</code> 같은 시스템 콜이다. 경로를 처음부터 다시 해석하지 않으므로, 앞에서 본 TOCTOU 틈 중 "중간 디렉터리가 링크로 바뀌는" 경우를 막을 수 있다.</p>
+<p>OpenJDK 21의 <code>UnixFileSystemProvider.newDirectoryStream</code>은 네이티브 계층이 <code>openat</code> 계열을 지원한다고 보고하면 디렉터리를 <code>open</code>으로 열고, 그 디스크립터를 <code>dup</code>으로 복제한 뒤, 하나는 <code>fdopendir</code>에 넘겨 <code>readdir</code>용으로, 다른 하나는 <code>openat</code>·<code>unlinkat</code>의 기준 디스크립터로 쓰는 <code>UnixSecureDirectoryStream</code>을 만든다. 지원하지 않는다고 보고하면 <code>opendir</code> 하나로 여는 일반 <code>UnixDirectoryStream</code>을 만든다. 지원 여부는 네이티브 코드(<code>UnixNativeDispatcher.c</code>)가 JVM 시작 때 <code>dlsym</code>으로 <code>openat</code>, <code>fstatat</code>, <code>unlinkat</code>, <code>renameat</code>, <code>futimesat</code>, <code>fdopendir</code>를 모두 찾았는지로 정한다. 그런데 BSD 계열 빌드(macOS 포함)에서는 이 코드가 <code>futimesat</code>을 찾는 줄 자체를 컴파일하지 않으므로 조건이 언제나 거짓이 된다. 그래서 OpenJDK 21의 macOS 빌드에서는 디렉터리 스트림이 <code>SecureDirectoryStream</code>이 아니고, 실험의 디스크립터도 하나만 늘었다. 리눅스 빌드라면 같은 소스 기준으로 <code>SecureDirectoryStream</code>이 돌아오고 열린 스트림 하나가 디스크립터 두 개를 쓴다. 리눅스 쪽은 이 환경에서 실행해 보지 않았고 소스로만 확인한 내용이다.</p>
+<h4>walk가 순환을 알아채는 방법</h4>
+<p><code>Files.walk</code>와 <code>Files.walkFileTree</code>는 같은 내부 클래스 <code>java.nio.file.FileTreeWalker</code>로 동작한다. 이 클래스는 지금 내려가 있는 디렉터리들을 스택에 쌓는데, 스택의 각 칸(<code>DirectoryNode</code>)에는 디렉터리 경로, 그 디렉터리의 <code>fileKey</code>, 그리고 그 디렉터리를 연 <code>DirectoryStream</code>이 들어 있다. 하위 디렉터리를 다 돌아야 그 칸이 빠지고 스트림이 닫히므로, 깊이 <i>d</i>까지 내려간 순간에는 디렉터리 스트림 <i>d</i>개가 동시에 열려 있다. 디스크립터 사용량이 트리의 크기가 아니라 깊이에 비례한다는 뜻이다.</p>
+<p>기본값(<code>FOLLOW_LINKS</code> 없음)에서 <code>walk</code>는 링크를 따라가지 않는다. 실행 결과에서 <code>tree/a/b/up</code>은 항목으로 한 번 보고될 뿐 그 안으로 들어가지 않았다. <code>FOLLOW_LINKS</code>를 주면 링크가 디렉터리를 가리킬 때 그 안으로 들어가야 하는데, <code>up</code>은 조상인 <code>tree</code>를 가리키므로 그대로 들어가면 끝없이 돈다. <code>FileTreeWalker.wouldLoop</code>는 들어가기 전에 대상 디렉터리의 <code>fileKey</code>를 스택에 있는 모든 조상의 <code>fileKey</code>와 비교한다. 앞 절에서 본 대로 유닉스 provider의 <code>fileKey</code>는 (장치 번호, inode 번호) 쌍이므로, 이름이 <code>tree/a/b/up</code>이어도 inode가 <code>tree</code>와 같다는 것이 드러난다. <code>Files.walkFileTree</code>의 Javadoc도 순환 감지는 디렉터리의 <code>fileKey</code>를 기록해서 하고, <code>fileKey</code>를 쓸 수 없으면 <code>isSameFile</code>로 조상과 비교하며, 순환은 <code>FileSystemLoopException</code>이라는 I/O 오류로 다룬다고 정한다. <code>walkFileTree</code>에서는 이 예외가 <code>visitFileFailed</code>로 전달되고, <code>walk</code>의 스트림에서는 다른 I/O 오류처럼 <code>UncheckedIOException</code>에 싸여 던져진다. 실행 결과의 <code>follow failed</code> 줄이 그것이다.</p>
+<p>순회 비용도 소스에서 읽힌다. <code>FileTreeWalker</code>는 항목마다 <code>Files.readAttributes</code>로 <code>BasicFileAttributes</code>를 얻어 디렉터리인지 판단한다(<code>FOLLOW_LINKS</code>가 없으면 링크를 따라가지 않는 쪽으로). 이미 읽어 둔 속성을 경로 객체에 실어 오는 <code>BasicFileAttributesHolder</code>라는 내부 인터페이스가 있지만, OpenJDK 21의 <code>UnixPath</code>는 이것을 구현하지 않는다. 그래서 유닉스 계열에서는 <code>readdir</code>로 이름을 하나 받을 때마다 속성을 읽는 시스템 콜이 한 번씩 따라온다.</p>
+<h4>디렉터리 트리를 지우는 순서</h4>
+<p><code>rmdir</code>은 빈 디렉터리만 지운다. 앞에서 <code>Files.delete(dir)</code>가 <code>DirectoryNotEmptyException</code>을 던진 것이 그 결과다. 그래서 트리를 지우려면 자식을 모두 지운 뒤에 부모를 지우는 후위 순서(post-order)가 필요하고, <code>walkFileTree</code>의 <code>postVisitDirectory</code>가 바로 그 시점, 즉 디렉터리의 모든 항목을 방문한 뒤에 불린다. 실행 결과의 삭제 순서가 파일 두 개, <code>b</code>, <code>a</code>, <code>tree</code>인 이유다. <code>up</code>은 <code>visitFile</code>에서 파일처럼 지워졌다. <code>FOLLOW_LINKS</code> 없이 돌았으므로 링크 자체의 속성이 전달됐고, <code>Files.delete</code>는 링크를 받으면 링크가 가리키는 대상이 아니라 링크 자체를 지운다. 만약 <code>FOLLOW_LINKS</code>를 켜고 같은 삭제 코드를 돌렸다면 링크를 따라 들어간 다른 디렉터리의 내용까지 지울 수 있다. 트리 삭제에 링크 따라가기를 켜지 않는 것은 취향이 아니라 안전 규칙이다.</p>
+
+<h3>경로 표시 1: 절대 경로, 상대 경로, 그리고 user.dir</h3>
+<p>경로에는 두 종류가 있다. 절대 경로(absolute path)는 루트(<code>/</code>)에서 시작하므로 그 자체로 위치가 정해진다. 상대 경로(relative path)는 어딘가를 기준으로 해석해야 위치가 정해진다. 커널에게 그 기준은 프로세스의 현재 작업 디렉터리다. 자바에서는 <code>user.dir</code> 시스템 속성이 이 역할을 한다. <code>File</code>의 Javadoc은 <code>java.io</code> 패키지의 클래스가 상대 경로를 항상 현재 사용자 디렉터리에 대해 해석하며, 이 디렉터리는 <code>user.dir</code> 속성이 가리키고 보통 JVM을 실행한 디렉터리라고 설명한다. IDE에서 실행할 때와 터미널에서 실행할 때 같은 상대 경로가 다른 파일을 가리키는 이유가 이것이다. IDE는 보통 프로젝트 루트를 작업 디렉터리로 잡고, 터미널은 사용자가 서 있던 곳에서 JVM을 띄운다.</p>
+<p>OpenJDK 21의 유닉스 구현은 JVM이 시작할 때 C 함수 <code>getcwd</code>로 운영체제에 현재 디렉터리를 물어 <code>user.dir</code>을 채운다. 그리고 <code>java.io.UnixFileSystem</code>은 생성될 때 그 값을 필드에 복사해 두고 이후 상대 경로 해석에 그 필드를 쓴다. 다음 예제는 같은 상대 경로를 여러 방식으로 표시하고, 마지막 줄에서 <code>user.dir</code>을 실행 중에 바꿔 본다.</p>
+<pre><code class="language-java">import java.io.File;
+import java.io.IOException;
+import java.nio.file.*;
+
+public class PathMain {
+    public static void main(String[] args) throws IOException {
+        System.out.println("user.dir = " + System.getProperty("user.dir"));
+
+        File file = new File("temp/../hello.txt");
+        System.out.println("getPath = " + file.getPath());
+        System.out.println("getAbsolutePath = " + file.getAbsolutePath());
+        System.out.println("getCanonicalPath = " + file.getCanonicalPath());
+
+        Path path = Path.of("temp/../hello.txt");
+        System.out.println("path = " + path);
+        System.out.println("toAbsolutePath = " + path.toAbsolutePath());
+        System.out.println("normalize = " + path.normalize());
+        System.out.println("toAbsolutePath().normalize() = " + path.toAbsolutePath().normalize());
+        System.out.println("toRealPath = " + path.toRealPath());
+
+        System.setProperty("user.dir", "/");
+        System.out.println("after setProperty: " + new File("a.txt").getAbsolutePath()
+                + " / " + Path.of("a.txt").toAbsolutePath());
+    }
+}</code></pre>
+<p>작업 디렉터리에 <code>temp</code> 디렉터리와 <code>hello.txt</code> 파일을 만들어 두고 실행했다. 실제 출력의 작업 디렉터리 부분은 <code>/private/var/folders/br/…/w4</code>처럼 길어서 아래에서는 <code>{작업}</code>으로 줄여 적었다.</p>
+<pre data-label="실행 결과 (작업 디렉터리를 {작업}으로 줄임)"><code class="language-text">user.dir = {작업}
+getPath = temp/../hello.txt
+getAbsolutePath = {작업}/temp/../hello.txt
+getCanonicalPath = {작업}/hello.txt
+path = temp/../hello.txt
+toAbsolutePath = {작업}/temp/../hello.txt
+normalize = hello.txt
+toAbsolutePath().normalize() = {작업}/hello.txt
+toRealPath = {작업}/hello.txt
+after setProperty: {작업}/a.txt / {작업}/a.txt</code></pre>
+<p>먼저 <code>user.dir</code>을 보자. 이 실습 디렉터리는 <code>mktemp -d</code>로 만들었고, <code>mktemp</code>가 알려 준 경로는 <code>/var/folders/…</code>였다. 그런데 <code>user.dir</code>은 <code>/private/var/folders/…</code>로 시작한다. macOS에서 <code>/var</code>는 <code>/private/var</code>를 가리키는 심볼릭 링크이고, 셸이 <code>cd</code>로 그 링크를 지나 들어갔어도 커널이 기억하는 현재 디렉터리는 링크가 풀린 실제 디렉터리다. JVM은 <code>getcwd</code>로 그 실제 경로를 받는다. 셸 프롬프트에 보이는 경로와 자바가 보는 경로가 다를 수 있다는 뜻이다.</p>
+<p>다음으로 세 가지 표시를 비교하자. <code>getAbsolutePath</code>와 <code>toAbsolutePath</code>는 파일 시스템을 건드리지 않는다. 상대 경로 앞에 작업 디렉터리 문자열을 붙일 뿐이라 <code>..</code>도 그대로 남는다. <code>normalize</code>도 파일 시스템을 건드리지 않고, 경로 문자열에서 <code>.</code>을 지우고 <code>이름/..</code> 쌍을 지운다. 그래서 상대 경로에 쓰면 상대 경로(<code>hello.txt</code>)가 나온다. 반면 <code>getCanonicalPath</code>와 <code>toRealPath</code>는 파일 시스템에 물어 심볼릭 링크까지 푼 경로를 만든다. 둘의 차이는 존재하지 않는 파일에서 드러난다. <code>new File("no/such/../file.txt").getCanonicalPath()</code>는 예외 없이 <code>{작업}/no/file.txt</code>로 끝나는 문자열을 돌려주지만, <code>Path.of("no/such/file.txt").toRealPath()</code>는 <code>NoSuchFileException: no/such/file.txt</code>를 던진다. <code>toRealPath</code>의 Javadoc은 이 메서드가 "존재하는 파일"의 실제 경로를 돌려주며 파일이 없으면 <code>IOException</code>을 던진다고 정한다.</p>
+<p>마지막 줄은 <code>System.setProperty("user.dir", "/")</code> 뒤의 결과다. 속성 값은 바뀌었지만 <code>File</code>과 <code>Path</code> 모두 여전히 원래 작업 디렉터리를 기준으로 해석했다. 두 구현 모두 시작할 때 읽어 둔 값을 쓰기 때문이다. 자바 표준 API에는 실행 중인 JVM 프로세스의 작업 디렉터리를 바꾸는 방법이 없다. 기준 디렉터리를 바꾸고 싶다면 속성을 고치지 말고 기준 <code>Path</code>를 변수로 들고 다니며 <code>base.resolve(...)</code>로 경로를 만든다. 자식 프로세스의 작업 디렉터리는 <code>ProcessBuilder.directory</code>로 정할 수 있다.</p>
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>파일 시스템 접근</th><th><code>..</code> 제거</th><th>심볼릭 링크 해석</th><th>파일이 없으면</th></tr></thead><tbody>
+<tr><td><code>File.getPath</code></td><td>없음</td><td>안 함</td><td>안 함</td><td>그대로 돌려줌</td></tr>
+<tr><td><code>File.getAbsolutePath</code>, <code>Path.toAbsolutePath</code></td><td>없음</td><td>안 함</td><td>안 함</td><td>그대로 돌려줌</td></tr>
+<tr><td><code>Path.normalize</code></td><td>없음</td><td>문자열로 함</td><td>안 함</td><td>그대로 돌려줌</td></tr>
+<tr><td><code>File.getCanonicalPath</code></td><td>있음</td><td>함</td><td>함(존재하는 부분까지)</td><td>예외 없이 계산</td></tr>
+<tr><td><code>Path.toRealPath</code></td><td>있음</td><td>함</td><td>함(<code>NOFOLLOW_LINKS</code>로 끌 수 있음)</td><td><code>NoSuchFileException</code></td></tr>
+</tbody></table></div>
+
+<h3>경로 표시 2: '..'과 심볼릭 링크, 그리고 경로 이탈 검사</h3>
+<p>앞의 예제에서는 <code>normalize</code>와 <code>toRealPath</code>가 같은 파일을 가리켰다. 경로 중간에 심볼릭 링크가 없었기 때문이다. 링크가 끼면 두 방법이 갈라진다. 다음 예제는 <code>real/sub</code> 디렉터리와 그것을 가리키는 링크 <code>link</code>를 만들고 <code>link/../data.txt</code>라는 경로를 두 방식으로 해석한다. 이어서 <code>Path</code>의 경로 조작 메서드도 함께 찍어 본다.</p>
+<pre><code class="language-java">import java.io.File;
+import java.io.IOException;
+import java.nio.file.*;
+
+public class LinkPath {
+    public static void main(String[] args) throws IOException {
+        // 준비: real/sub 디렉터리, link -> real/sub 심볼릭 링크
+        Files.createDirectories(Path.of("real/sub"));
+        Files.writeString(Path.of("real/data.txt"), "real 안의 data");
+        Path link = Path.of("link");
+        if (!Files.exists(link, LinkOption.NOFOLLOW_LINKS)) {
+            Files.createSymbolicLink(link, Path.of("real/sub"));
+        }
+
+        Path p = Path.of("link/../data.txt");
+        System.out.println("normalize    = " + p.normalize());
+        System.out.println("exists(normalize) = " + Files.exists(p.normalize()));
+        System.out.println("toRealPath   = " + p.toRealPath());
+        System.out.println("readString   = " + Files.readString(p));
+        System.out.println("canonical    = " + new File("link/../data.txt").getCanonicalPath());
+
+        Path base = Path.of("/srv/app");
+        System.out.println("resolve      = " + base.resolve("logs/app.log"));
+        System.out.println("resolve abs  = " + base.resolve("/etc/hosts"));
+        System.out.println("relativize   = " + base.relativize(Path.of("/srv/static/logo.png")));
+        Path q = Path.of("/srv/app/logs/app.log");
+        System.out.println("getFileName  = " + q.getFileName());
+        System.out.println("getParent    = " + q.getParent());
+        System.out.println("getRoot      = " + q.getRoot());
+        System.out.println("getNameCount = " + q.getNameCount() + ", getName(1) = " + q.getName(1));
+        System.out.println("relative parent = " + Path.of("a.txt").getParent());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (작업 디렉터리를 {작업}으로 줄임)"><code class="language-text">normalize    = data.txt
+exists(normalize) = false
+toRealPath   = {작업}/real/data.txt
+readString   = real 안의 data
+canonical    = {작업}/real/data.txt
+resolve      = /srv/app/logs/app.log
+resolve abs  = /etc/hosts
+relativize   = ../static/logo.png
+getFileName  = app.log
+getParent    = /srv/app/logs
+getRoot      = /
+getNameCount = 4, getName(1) = app
+relative parent = null</code></pre>
+<p><code>normalize</code>는 <code>link/..</code>을 글자 그대로 지워 <code>data.txt</code>를 만들었다. 작업 디렉터리에는 <code>data.txt</code>가 없으므로 <code>exists</code>는 <code>false</code>다. 그런데 같은 경로로 <code>Files.readString</code>을 부르면 <code>real</code> 안의 파일 내용이 나온다. 커널은 경로를 앞에서부터 한 칸씩 해석하기 때문이다. <code>link</code>를 만나면 링크를 따라 <code>real/sub</code>로 들어가고, 그다음 <code>..</code>은 <b>그 디렉터리의</b> 부모인 <code>real</code>로 올라간다. 그래서 실제로 열리는 파일은 <code>real/data.txt</code>다. <code>toRealPath</code>와 <code>getCanonicalPath</code>는 커널과 같은 방식으로 링크를 풀었으므로 같은 답을 냈다. <code>Path.normalize</code>의 Javadoc도 이 위험을 직접 적는다. 이 메서드는 파일 시스템에 접근하지 않으며, <code>..</code>과 그 앞의 이름을 지우면 앞의 이름이 심볼릭 링크일 때 원래와 다른 파일을 가리키는 경로가 될 수 있다는 것이다.</p>
+<x-visual id="java-adv2-05-symlink-dotdot" title="link/../data.txt를 normalize와 커널이 다르게 해석하는 모습" kind="비교 다이어그램" ratio="16:9">
+<x-hint>같은 경로 문자열을 문자열 규칙(normalize)과 커널의 한 칸씩 해석이 서로 다른 파일로 이끄는 과정을 나란히 보여 준다.</x-hint>
+<x-prompt>좌우 두 칸으로 나뉜 비교 그림. 맨 위 가운데에 큰 글씨 "link/../data.txt". 왼쪽 칸 제목 "normalize (문자열 규칙)": 경로 조각 "link"와 ".."에 빨간 취소선을 긋고 오른쪽 화살표로 "data.txt"를 가리키며, 그 아래 작업 디렉터리 폴더 아이콘 안에 회색 점선 문서 아이콘과 라벨 "없는 파일". 오른쪽 칸 제목 "커널의 해석 (한 칸씩)": 폴더 트리 그림. 작업 디렉터리 아래에 "link" (꼬불꼬불한 링크 화살표가 "real/sub" 폴더로 이어짐), "real" 폴더 안에 "sub" 폴더와 "data.txt" 문서. 숫자 원 1이 "link"에서 "sub"로, 숫자 원 2가 "sub"에서 위의 "real"로 올라가는 화살표(라벨 ".."), 숫자 원 3이 "data.txt" 문서를 가리킨다. 오른쪽 칸 하단 라벨 "toRealPath도 같은 답". 평평한 벡터 스타일, 흰 배경.</x-prompt>
+<x-caption>normalize는 글자를 지우고, 커널은 링크를 따라간 뒤에 ..을 처리한다. 링크가 끼면 두 결과가 다른 파일을 가리킨다.</x-caption>
+</x-visual>
+<p>나머지 경로 조작 메서드는 모두 파일 시스템을 건드리지 않는 순수한 경로 계산이다. <code>resolve</code>는 기준 경로 뒤에 다른 경로를 이어 붙인다. 단, 인자가 절대 경로면 Javadoc 규칙대로 인자를 그대로 돌려준다(<code>resolve abs</code>의 결과가 <code>/etc/hosts</code>). <code>relativize</code>는 반대 방향으로, 기준에서 대상까지 가는 상대 경로를 만든다. <code>getFileName</code>, <code>getParent</code>, <code>getRoot</code>, <code>getName(i)</code>는 경로를 이름 요소(name element)의 나열로 보고 부분을 꺼낸다. <code>/srv/app/logs/app.log</code>는 루트 <code>/</code>와 이름 요소 네 개(<code>srv</code>, <code>app</code>, <code>logs</code>, <code>app.log</code>)로 이루어지고, 인덱스는 루트에서 가장 가까운 요소가 0이다. 상대 경로 <code>a.txt</code>의 부모는 <code>null</code>이다. 작업 디렉터리가 부모라고 추측하지 않는다.</p>
+<p>이 구분이 실제로 중요한 곳이 경로 이탈(path traversal) 검사다. 웹 서버가 <code>public</code> 디렉터리 아래의 파일만 내주려고 한다면, 사용자가 보낸 경로가 그 디렉터리 밖으로 나가지 않는지 확인해야 한다. 먼저 문자열 비교는 쓸 수 없다. <code>"/srv/app2/secret".startsWith("/srv/app")</code>는 <code>true</code>지만, <code>Path</code>의 <code>startsWith</code>는 이름 요소 단위로 비교하므로 <code>Path.of("/srv/app2/secret").startsWith(Path.of("/srv/app"))</code>는 <code>false</code>다. 다음은 <code>normalize</code>로 검사하는 방법과 <code>toRealPath</code>로 검사하는 방법을 비교한다. 공개 디렉터리 안에 바깥의 <code>secret</code> 디렉터리를 가리키는 링크 <code>evil</code>을 하나 심어 두었다.</p>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.file.*;
+
+public class PathGuard {
+    static boolean lexicallyInside(Path base, String input) {
+        Path target = base.resolve(input).normalize();
+        return target.startsWith(base);
+    }
+
+    static boolean reallyInside(Path base, String input) throws IOException {
+        Path realBase = base.toRealPath();
+        Path real = base.resolve(input).toRealPath();     // 링크를 모두 따라간 실제 위치
+        return real.startsWith(realBase);
+    }
+
+    public static void main(String[] args) throws IOException {
+        Path base = Path.of("public").toAbsolutePath();
+        Files.createDirectories(base);
+        Files.createDirectories(Path.of("secret"));
+        Files.writeString(base.resolve("index.html"), "공개");
+        Files.writeString(Path.of("secret/key.txt"), "비밀");
+        Path evil = base.resolve("evil");
+        if (!Files.exists(evil, LinkOption.NOFOLLOW_LINKS)) {
+            Files.createSymbolicLink(evil, Path.of("../secret"));   // public/evil -> ../secret
+        }
+
+        for (String input : new String[]{"index.html", "../secret/key.txt", "/etc/hosts", "evil/key.txt"}) {
+            System.out.printf("%-18s lexical=%-5b real=%b%n",
+                    input, lexicallyInside(base, input), reallyInside(base, input));
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">index.html         lexical=true  real=true
+../secret/key.txt  lexical=false real=false
+/etc/hosts         lexical=false real=false
+evil/key.txt       lexical=true  real=false</code></pre>
+<p><code>../secret/key.txt</code>는 <code>normalize</code>만으로 걸러진다. 절대 경로 <code>/etc/hosts</code>는 <code>resolve</code>가 인자를 그대로 돌려주므로 기준 밖이 되어 역시 걸러진다. 문제는 마지막 줄이다. <code>evil/key.txt</code>에는 <code>..</code>이 하나도 없으니 문자열 검사는 통과하지만, 실제로 열리는 파일은 링크를 따라간 <code>secret/key.txt</code>다. 기준 디렉터리 안에 다른 사람이 링크를 만들 수 있는 환경이라면 <code>toRealPath</code>로 검사해야 한다. 다만 <code>toRealPath</code>는 파일이 없으면 <code>NoSuchFileException</code>을 던지므로, 그 예외를 "찾을 수 없음" 응답으로 처리하는 코드가 함께 있어야 한다. 그리고 검사와 사용 사이에 링크가 바뀌는 경우까지 막으려면, 앞에서 본 TOCTOU 문제와 똑같이 검사한 실제 경로(<code>real</code>)로 파일을 열어야 한다. 검사는 실제 경로로 하고 열기는 원래 경로로 하면 그 사이의 틈이 다시 생긴다.</p>
+
+<h3>경로 문자열이 바이트가 되는 곳: UnixPath, sun.jnu.encoding, 한글 파일 이름</h3>
+<p>지금까지 경로를 문자열로 다뤘지만 커널은 자바 문자열을 모른다. 유닉스 계열의 <code>open</code>, <code>stat</code>, <code>rename</code>이 받는 경로는 C 문자열, 즉 0 바이트(NUL)로 끝나는 바이트 나열이다. 자바의 <code>String</code>은 UTF-16 코드 단위의 나열이다. 그러니 어딘가에서 문자열이 바이트로 바뀌어야 한다. OpenJDK 21의 유닉스 provider에서 그 지점은 <code>Path</code>를 만드는 순간이다. <code>sun.nio.fs.UnixPath</code>는 경로를 <code>String</code>이 아니라 <code>private final byte[] path</code> 필드에 담는다. 생성자는 먼저 <code>normalizeAndCheck</code>로 문자열을 훑어 연속된 <code>/</code>를 하나로 줄이고 끝의 <code>/</code>를 떼며 NUL 문자가 있으면 거부한 뒤, <code>sun.jnu.encoding</code> 속성이 가리키는 문자 집합으로 인코딩한다. 이때 쓰는 내부 메서드는 대체 문자로 바꾸지 않는 인코딩(<code>getBytesNoRepl</code>)이라, 그 문자 집합으로 표현할 수 없는 문자가 있으면 <code>InvalidPathException</code>을 던진다. <code>toString</code>은 반대로 바이트를 같은 문자 집합으로 디코딩한 결과를 처음 불릴 때 만들어 둔다.</p>
+<p>이 설계의 결과를 실험으로 보자. 연속 슬래시, NUL이 섞인 이름, 그리고 macOS에서 한글 파일 이름의 유니코드 정규화(normalization)를 차례로 확인한다. 한글 음절 "한"은 완성형 코드 포인트 하나(U+D55C)로 쓸 수도 있고, 초성·중성·종성 자모 세 개(U+1112 U+1161 U+11AB)를 이어 쓸 수도 있다. 앞의 것을 NFC, 뒤의 것을 NFD 정규화 형식이라 부르고, <code>java.text.Normalizer</code>로 서로 바꿀 수 있다. 화면에는 같은 글자로 보이지만 <code>String</code>으로도, UTF-8 바이트로도 다르다.</p>
+<pre><code class="language-java">import java.io.*;
+import java.nio.file.*;
+import java.text.Normalizer;
+import java.util.HexFormat;
+import java.util.stream.Stream;
+
+public class NameMain {
+    public static void main(String[] args) throws IOException {
+        System.out.println("sun.jnu.encoding = " + System.getProperty("sun.jnu.encoding")
+                + ", file.encoding = " + System.getProperty("file.encoding"));
+
+        System.out.println("slashes = " + Path.of("a//b///c/"));
+        try {
+            Path.of("report.txt\0.jpg");
+        } catch (InvalidPathException e) {
+            System.out.println("Path NUL -> " + e.getMessage().replace("\0", "\\0"));
+        }
+        File nul = new File("report.txt\0.jpg");
+        System.out.println("File NUL exists = " + nul.exists() + ", delete = " + nul.delete());
+        try { nul.createNewFile(); } catch (IOException e) { System.out.println("File NUL createNewFile -> " + e.getMessage()); }
+
+        Files.createDirectories(Path.of("names"));
+        Files.createDirectories(Path.of("cases"));
+        String nfc = "한글.txt";
+        String nfd = Normalizer.normalize(nfc, Normalizer.Form.NFD);
+        System.out.println("nfc chars = " + nfc.length() + ", nfd chars = " + nfd.length() + ", equals = " + nfc.equals(nfd));
+        System.out.println("nfd bytes = " + HexFormat.ofDelimiter(" ").formatHex(nfd.substring(0, 1 + 1).getBytes("UTF-8")));
+        Files.writeString(Path.of("names", nfd), "NFD로 만든 파일");
+
+        try (Stream<Path> s = Files.list(Path.of("names"))) {
+            s.forEach(p -> {
+                String name = p.getFileName().toString();
+                System.out.println("listed length = " + name.length() + ", equals(nfc) = " + name.equals(nfc));
+            });
+        }
+        Path byNfc = Path.of("names", nfc);
+        System.out.println("exists(nfc) = " + Files.exists(byNfc) + ", read = " + Files.readString(byNfc));
+        System.out.println("Path equals = " + byNfc.equals(Path.of("names", nfd))
+                + ", isSameFile = " + Files.isSameFile(byNfc, Path.of("names", nfd)));
+        System.out.println("toRealPath name length = " + byNfc.toRealPath().getFileName().toString().length());
+
+        Files.writeString(Path.of("cases", "Report.TXT"), "case");
+        Path lower = Path.of("cases", "report.txt");
+        System.out.println("exists(lower) = " + Files.exists(lower)
+                + ", Path equals = " + lower.equals(Path.of("cases", "Report.TXT"))
+                + ", realName = " + lower.toRealPath().getFileName());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (macOS APFS, 빈 디렉터리에서 실행)"><code class="language-text">sun.jnu.encoding = UTF-8, file.encoding = UTF-8
+slashes = a/b/c
+Path NUL -> Nul character not allowed: report.txt\0.jpg
+File NUL exists = false, delete = false
+File NUL createNewFile -> Invalid file path
+nfc chars = 6, nfd chars = 10, equals = false
+nfd bytes = e1 84 92 e1 85 a1
+listed length = 10, equals(nfc) = false
+exists(nfc) = true, read = NFD로 만든 파일
+Path equals = false, isSameFile = true
+toRealPath name length = 10
+exists(lower) = true, Path equals = false, realName = Report.TXT</code></pre>
+<h4>NUL 문자: 커널에 닿기 전에 막는다</h4>
+<p><code>report.txt\0.jpg</code>는 고전적인 공격 문자열이다. 자바 문자열로는 끝이 <code>.jpg</code>라 확장자 검사를 통과하지만, 이것을 그대로 C 문자열로 넘기면 시스템 콜은 첫 NUL에서 문자열이 끝났다고 보고 <code>report.txt</code>를 연다. 자바에서 검사한 이름과 커널이 여는 이름이 달라지는 것이다. <code>UnixPath</code>는 생성 단계에서 <code>InvalidPathException</code>으로 이 경로를 거부한다. <code>File</code>도 NUL을 막기는 하지만 방식이 다르다. OpenJDK 21의 <code>java.io.UnixFileSystem.isInvalid</code>는 경로에 NUL이 있는지 보고, <code>File</code>의 메서드 대부분은 이 검사에 걸리면 시스템 콜을 부르지 않고 <code>false</code>나 0을 돌려준다. 예외를 던지는 메서드(<code>createNewFile</code> 등)만 <code>IOException("Invalid file path")</code>를 던진다. 실행 결과의 <code>exists = false</code>와 <code>delete = false</code>는 앞에서 본 "실패를 <code>false</code>로 돌려주는" 패턴이 여기서도 반복된 것이다. 파일이 없어서가 아니라 경로가 잘못되어서 나온 <code>false</code>다.</p>
+<h4>sun.jnu.encoding: 파일 내용이 아니라 파일 이름의 문자 집합</h4>
+<p>JEP 400(기본 문자 집합 UTF-8)은 JDK 내부에서 쓰는 문자 집합 관련 속성을 설명하면서, <code>sun.jnu.encoding</code>을 <code>java.nio.file</code> 구현이 파일 내용이 아니라 파일 이름 경로를 인코딩·디코딩할 때 쓰는 문자 집합이라고 소개한다. 같은 문서는 이 속성이 명세되지 않고 지원되지 않는(unspecified and unsupported) 내부 속성이며, macOS에서는 값이 <code>UTF-8</code>이라고 적는다. OpenJDK 21의 <code>java_props_md.c</code>를 보면 macOS 빌드는 이 값을 <code>"UTF-8"</code>로 고정하고, 그 밖의 유닉스 계열은 JVM 시작 때 <code>setlocale</code>과 <code>LC_CTYPE</code> 로캘에서 알아낸 인코딩을 그대로 넣는다. 이 실험 환경에서는 <code>-Dsun.jnu.encoding=US-ASCII</code>로 실행해도 값이 <code>UTF-8</code>로 찍혀 명령줄로 바꿀 수 없었다.</p>
+<p>이 차이가 문제가 되는 곳은 로캘이 설정되지 않은 리눅스 환경이다. JEP 400 이후 <code>file.encoding</code>의 기본값은 UTF-8이므로 기본 문자 집합을 쓰는 <code>FileReader</code> 같은 파일 내용 읽기도 로캘과 상관없이 UTF-8로 동작한다(<code>Files.readString</code>은 처음부터 문자 집합을 생략하면 UTF-8이다). 하지만 파일 이름 쪽은 여전히 로캘이 정한다. 로캘의 인코딩이 ASCII 계열이면, 위 소스 논리대로 <code>Path.of("한글.txt")</code>는 인코딩 단계에서 표현할 수 없는 문자를 만나 <code>InvalidPathException</code>("Malformed input or input contains unmappable characters")을 던진다. 내용은 잘 읽고 쓰는 프로그램이 한글 이름의 파일만 열지 못한다면 <code>sun.jnu.encoding</code> 값을 먼저 찍어 볼 일이다. 이 리눅스 시나리오는 이 환경에서 실행하지 않았고 OpenJDK 21 소스로 확인한 내용이다.</p>
+<h4>macOS의 한글 이름: 같은 파일, 다른 바이트</h4>
+<p>NFD로 바꾼 <code>"한글.txt"</code>는 10글자다. "한"과 "글"이 각각 자모 세 개로 풀렸기 때문이다. 출력의 바이트 <code>e1 84 92</code>와 <code>e1 85 a1</code>은 각각 초성 ㅎ(U+1112)과 중성 ㅏ(U+1161)의 UTF-8 인코딩이다. 이 이름으로 파일을 만들고 디렉터리를 읽으면 돌아오는 이름도 10글자이고, NFC 문자열과 <code>equals</code>로 비교하면 <code>false</code>다. 파일 시스템은 만들 때 받은 바이트를 그대로 보관했다. 그런데 NFC 이름으로 <code>exists</code>를 부르면 <code>true</code>가 나오고 내용도 읽힌다. 이 실험 환경의 APFS는 이름을 찾을 때 정규화 형식의 차이를 무시하면서도 저장할 때는 받은 형식을 보존했다. 대소문자도 같은 모습이다. <code>Report.TXT</code>로 만든 파일을 <code>report.txt</code>로 찾을 수 있지만 저장된 이름은 <code>Report.TXT</code>다.</p>
+<p>자바 쪽에서 눈여겨볼 것은 <code>Path.equals</code>다. <code>UnixPath.equals</code>는 <code>compareTo</code>로 두 경로의 <b>바이트 배열</b>을 비교하고, <code>hashCode</code>도 바이트로 계산한다. 그래서 커널이 같은 파일로 여는 두 경로가 <code>Path</code>로는 다르다(<code>Path equals = false</code>). <code>HashSet<Path></code>로 "이미 처리한 파일"을 기억하는 코드는 같은 파일을 두 번 처리할 수 있다. 같은 파일인지 알고 싶다면 <code>Files.isSameFile</code>을 쓴다. 이 메서드는 OpenJDK 21에서 두 경로의 속성을 각각 읽어 앞 절에서 본 <code>fileKey</code>를 이루는 (장치, inode) 쌍을 비교하므로 <code>true</code>를 돌려준다. 디스크에 실제로 저장된 철자가 필요하면 <code>toRealPath</code>를 쓴다. 옵션 없이 부르면(링크를 따라가는 기본값) OpenJDK 21의 <code>UnixPath.toRealPath</code>는 C 라이브러리의 <code>realpath</code>에 경로를 넘기고 그 결과를 그대로 돌려주며, 이 실험의 macOS에서는 그 결과가 저장된 철자였다. <code>NOFOLLOW_LINKS</code>를 주면 다른 길로 간다. OpenJDK 21의 macOS 파일 시스템 클래스(<code>MacOSXFileSystem</code>)는 자신이 "대소문자를 구별하지 않고 보존하는" 파일 시스템이라고 응답하고, 이 경우 <code>toRealPath</code>는 루트부터 경로 요소를 하나씩 내려가며 각 요소를 같은 디렉터리에서 <code>fileKey</code>가 같은 실제 엔트리 이름으로 바꾼다. 같은 환경에서 <code>NOFOLLOW_LINKS</code>로 따로 불러 봐도 <code>Report.TXT</code>가 돌아왔다. 실행 결과에서 NFC로 물었는데 10글자(NFD) 이름이, <code>report.txt</code>로 물었는데 <code>Report.TXT</code>가 돌아온 것이 이 동작이다.</p>
+<p><code>MacOSXFileSystem</code>에는 <code>jdk.nio.path.useNormalizationFormD</code>라는 시스템 속성도 있다. Java SE 명세에 있는 속성이 아니라 OpenJDK macOS 구현의 속성이고 기본값은 꺼져 있다. 켜면 경로를 바이트로 바꾸기 전에 비ASCII 문자가 있는 경로를 NFD로, 바이트에서 문자열로 바꿀 때는 NFC로 정규화한다. 같은 실험을 <code>-Djdk.nio.path.useNormalizationFormD=true</code>로 다시 돌리면 목록의 이름이 6글자로 나와 NFC 문자열과 <code>equals</code>가 <code>true</code>가 되고, 두 <code>Path</code>도 같은 NFD 바이트로 인코딩되므로 <code>Path equals = true</code>가 된다. 다만 플랫폼 전용 속성에 기대기보다는, 사람이 입력한 이름과 디렉터리에서 읽은 이름을 비교할 때 양쪽을 <code>Normalizer.normalize(name, Normalizer.Form.NFC)</code>로 맞춘 뒤 비교하는 쪽이 운영체제와 상관없이 동작한다.</p>
+
+<h3>Files로 문자 파일 읽기</h3>
+<p>02~03회차에서는 문자 파일을 읽으려고 <code>FileInputStream</code>을 <code>InputStreamReader</code>로 감싸고 다시 <code>BufferedReader</code>로 감쌌다. <code>Files</code>는 이 조립을 메서드 하나로 줄인 편의 메서드를 제공한다. 파일 전체를 문자열 하나로 읽는 <code>readString</code>(Java 11), 줄 목록으로 읽는 <code>readAllLines</code>, 줄을 스트림으로 읽는 <code>lines</code>(둘 다 문자 집합을 생략하는 형태는 Java 8)이다. 쓰기 쪽에는 <code>writeString</code>(Java 11)과 <code>write</code>가 있다. 세 읽기 방법은 결과의 모양만 다른 것이 아니라 메모리를 쓰는 방식과 오류가 드러나는 시점이 다르다.</p>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.charset.Charset;
+import java.nio.file.*;
+import java.util.List;
+import java.util.stream.Stream;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+
+public class ReadTextMain {
+    public static void main(String[] args) throws IOException {
+        Path path = Path.of("hello.txt");
+        String text = "abc\n가나다\n\n마지막 줄";
+        Files.writeString(path, text, UTF_8);
+        System.out.println("size = " + Files.size(path));
+
+        String all = Files.readString(path, UTF_8);
+        System.out.println("readString equals = " + all.equals(text));
+
+        List<String> lines = Files.readAllLines(path, UTF_8);
+        System.out.println("readAllLines = " + lines + " (" + lines.size() + "줄)");
+
+        try (Stream<String> stream = Files.lines(path, UTF_8)) {
+            stream.forEach(line -> System.out.println("[" + line + "]"));
+        }
+
+        Files.writeString(path, "\n추가", UTF_8, StandardOpenOption.APPEND);
+        System.out.println("after append = " + Files.readAllLines(path).size() + "줄");
+
+        Path legacy = Path.of("legacy.txt");
+        Files.write(legacy, "가나다".getBytes(Charset.forName("MS949")));
+        try {
+            Files.readString(legacy);
+        } catch (IOException e) {
+            System.out.println(e.getClass().getName() + ": " + e.getMessage());
+        }
+        System.out.println("MS949 = " + Files.readString(legacy, Charset.forName("MS949")));
+        try (Stream<String> s = Files.lines(legacy)) {
+            s.forEach(System.out::println);
+        } catch (java.io.UncheckedIOException e) {
+            System.out.println("lines: " + e.getClass().getSimpleName() + " <- " + e.getCause());
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">size = 28
+readString equals = true
+readAllLines = [abc, 가나다, , 마지막 줄] (4줄)
+[abc]
+[가나다]
+[]
+[마지막 줄]
+after append = 5줄
+java.nio.charset.MalformedInputException: Input length = 1
+MS949 = 가나다
+lines: UncheckedIOException <- java.nio.charset.MalformedInputException: Input length = 1</code></pre>
+<h4>쓰기: 기본 옵션과 추가 모드</h4>
+<p>크기 28바이트부터 확인하자. <code>"abc\n"</code>이 4바이트, <code>"가나다\n"</code>이 9+1=10바이트, 빈 줄의 <code>"\n"</code>이 1바이트, <code>"마지막 줄"</code>이 한글 네 글자 12바이트와 공백 1바이트로 13바이트다. 합하면 28이다. <code>writeString</code>은 옵션을 주지 않으면 <code>CREATE</code>, <code>TRUNCATE_EXISTING</code>, <code>WRITE</code>를 준 것처럼 동작한다고 Javadoc에 적혀 있다. 없으면 만들고, 있으면 길이를 0으로 자른 뒤 쓴다는 뜻이다. 그래서 같은 파일에 <code>writeString</code>을 두 번 부르면 두 번째 내용만 남는다. 이어 쓰려면 예제처럼 <code>StandardOpenOption.APPEND</code>를 준다. 덧붙인 <code>"\n추가"</code> 때문에 줄이 다섯 개가 됐다.</p>
+<h4>문자 집합: Files는 처음부터 UTF-8이다</h4>
+<p>문자 집합을 생략한 <code>Files.readString(path)</code>, <code>readAllLines(path)</code>, <code>lines(path)</code>, <code>writeString(path, text)</code>는 기본 문자 집합이 아니라 항상 UTF-8을 쓴다고 Javadoc에 명시되어 있다. 03회차에서 본 것처럼 <code>FileReader</code>는 JDK 18(JEP 400) 이전까지 운영체제에 따라 달라지는 기본 문자 집합을 썼다. <code>Files</code>의 이 메서드들은 그런 의존성 없이 처음부터 UTF-8로 고정되어 있었다.</p>
+<p>더 중요한 차이는 잘못된 바이트를 만났을 때다. MS949로 저장한 <code>"가나다"</code>의 첫 바이트는 <code>0xB0</code>이다. 2진수로 <code>1011 0000</code>이므로 UTF-8에서는 다른 바이트 뒤에만 올 수 있는 연속 바이트(continuation byte) 모양이다. 첫 바이트부터 규칙에 어긋나므로 디코더는 길이 1의 잘못된 입력을 보고하고, <code>readString</code>은 <code>MalformedInputException: Input length = 1</code>을 던진다. <code>new String(bytes, UTF_8)</code>이라면 이 바이트를 조용히 대체 문자(U+FFFD)로 바꿨을 것이다. 03회차의 표현으로 말하면 <code>Files</code>의 읽기 메서드는 REPLACE가 아니라 REPORT 쪽이다. 깨진 데이터를 모르고 지나치는 대신 읽는 순간 알려 준다.</p>
+<h4>readString과 readAllLines: 한 번에 전부</h4>
+<p>OpenJDK 21의 <code>readString</code>은 <code>readAllBytes</code>로 파일 전체를 <code>byte[]</code> 하나에 읽은 다음 그 배열을 문자열로 디코딩한다. 파일 크기가 <code>Integer.MAX_VALUE</code>를 넘으면 <code>readAllBytes</code>가 <code>OutOfMemoryError("Required array size too large")</code>를 던진다. 배열 길이가 <code>int</code>이므로 2GB 이상의 파일은 애초에 한 배열에 담을 수 없다. 그보다 작아도 메모리 계산이 필요하다. 디코딩하는 동안에는 바이트 배열과 결과 문자열이 동시에 힙에 있다. 자바 9부터의 압축 문자열(compact strings, JEP 254) 구현에서 <code>String</code>은 모든 문자가 Latin-1 범위면 문자당 1바이트, 아니면 UTF-16으로 문자당 2바이트를 쓴다. UTF-8로 3바이트인 한글은 문자열 안에서 2바이트가 되므로, 한글 위주의 300MB 파일을 읽으면 최종 문자열은 약 200MB다. 그런데 OpenJDK 21의 UTF-8 디코딩은 Latin-1로 담을 수 없는 문자를 만나면 UTF-16 작업 배열을 입력 바이트 수의 두 배(600MB)로 먼저 잡고, 디코딩이 끝난 뒤 실제 길이로 잘라 새 배열에 복사한다. 그래서 디코딩하는 동안에는 바이트 배열 300MB와 작업 배열 600MB가 함께 힙을 차지하고, 마지막 복사 순간에는 약 200MB짜리 결과 배열까지 더해진다.</p>
+<p><code>readAllLines</code>는 줄마다 문자열을 만들어 <code>List</code>에 담는다. 줄 끝으로 인정하는 것은 LF(<code>\n</code>), CR(<code>\r</code>), CRLF(<code>\r\n</code>) 세 가지이고, 줄 끝 문자는 결과에 들어가지 않는다. 결과에서 빈 줄이 빈 문자열(<code>""</code>)로 들어간 것을 확인하자. 줄마다 별도 <code>String</code> 객체가 생기므로 객체 헤더와 리스트 슬롯만큼 메모리가 더 든다. 두 메서드 모두 작은 설정 파일이나 테스트 데이터에는 가장 간단한 선택이지만, 크기를 모르는 외부 입력에는 위험하다.</p>
+<h4>lines: 필요한 만큼씩, 대신 닫아야 한다</h4>
+<p><code>Files.lines</code>는 파일을 열고, 스트림이 소비되는 만큼만 읽는다. Javadoc의 표현으로는 <code>readAllLines</code>와 달리 모든 줄을 <code>List</code>로 읽지 않고, 스트림이 소비될 때 지연해서(lazily) 채운다. 그래서 수 GB짜리 로그 파일에서 오류 줄만 골라 세는 일도 일정한 메모리로 할 수 있다. 대신 두 가지 대가가 있다.</p>
+<p>첫째, 스트림이 열린 파일을 붙잡고 있다. Javadoc은 반환된 스트림이 열린 파일에 대한 참조를 갖고 있고 스트림을 닫아야 파일이 닫힌다고 적으며, try-with-resources 문 안에서 써야 한다고 명시한다. <code>Stream</code>은 <code>AutoCloseable</code>이지만 대부분의 스트림은 닫을 필요가 없어서 습관적으로 닫지 않게 되는데, <code>Files.lines</code>, <code>Files.list</code>, <code>Files.walk</code>가 돌려준 스트림은 예외다. 둘째, 오류가 늦게, 다른 모양으로 드러난다. 실행 결과의 마지막 줄을 보자. MS949 파일을 <code>lines</code>로 열 때는 예외가 나지 않았다. 디코딩은 <code>forEach</code>가 첫 줄을 요구할 때 일어나고, 그때 생긴 <code>MalformedInputException</code>은 <code>UncheckedIOException</code>에 싸여 던져졌다. <code>Stream</code>의 메서드는 검사 예외를 던질 수 없기 때문이다. Javadoc도 메서드가 반환된 뒤의 I/O 오류와 잘못된 바이트는 <code>UncheckedIOException</code>으로 감싸 읽기를 일으킨 스트림 메서드에서 던진다고 정해 두었다. 그래서 <code>lines</code>를 쓰는 코드는 <code>IOException</code>(열기 실패)과 <code>UncheckedIOException</code>(읽기 실패) 두 가지를 모두 처리해야 한다.</p>
+<p>줄 단위로 읽되 스트림 API가 필요 없다면 <code>Files.newBufferedReader(path)</code>도 같은 선택지다. 03회차에서 본 <code>BufferedReader</code>를 UTF-8 디코더와 함께 돌려주며, 잘못된 바이트에서는 역시 예외를 던진다. <code>readLine</code> 반복문은 검사 예외를 그대로 던질 수 있어 오류 처리가 단순하다.</p>
+<div class="table-wrap"><table><thead><tr><th>방법</th><th>메모리</th><th>잘못된 바이트</th><th>닫기</th></tr></thead><tbody>
+<tr><td><code>readString</code></td><td>파일 전체 바이트 + 문자열</td><td>호출할 때 <code>MalformedInputException</code></td><td>메서드가 처리</td></tr>
+<tr><td><code>readAllLines</code></td><td>모든 줄의 문자열 + 리스트</td><td>호출할 때 <code>MalformedInputException</code></td><td>메서드가 처리</td></tr>
+<tr><td><code>lines</code></td><td>버퍼 크기 정도로 일정</td><td>소비할 때 <code>UncheckedIOException</code></td><td>호출한 쪽이 try-with-resources로</td></tr>
+<tr><td><code>newBufferedReader</code></td><td>버퍼 크기 정도로 일정</td><td><code>readLine</code>에서 <code>MalformedInputException</code></td><td>호출한 쪽이 try-with-resources로</td></tr>
+</tbody></table></div>
+
+<h3>Files.lines의 속: 파일을 반으로 자르는 스플리터레이터</h3>
+<p><code>Files.lines</code>와 <code>BufferedReader.lines()</code>는 둘 다 줄의 스트림을 돌려주므로 같은 것으로 보기 쉽다. 순차 스트림으로 쓸 때는 실제로 거의 같다. 차이는 <code>.parallel()</code>을 붙일 때 드러나고, 그 차이는 스트림의 원천인 스플리터레이터(spliterator)가 데이터를 어떻게 나누는지에서 나온다. 병렬 스트림은 원천의 <code>trySplit</code>을 불러 작업을 둘로 쪼개고, 쪼갠 조각을 다시 쪼개 여러 스레드에 나눠 준다. 줄의 스트림에서 문제는 "파일의 가운데 줄이 어디서 시작하는가"를 앞에서부터 읽지 않고는 알 수 없다는 점이다.</p>
+<p>OpenJDK 21의 <code>Files.lines(path, cs)</code>는 세 조건을 확인한다. 경로가 기본 파일 시스템에 속하고 문자 집합이 UTF-8, US-ASCII, ISO-8859-1 중 하나이면 <code>FileChannel</code>을 열고, 그 채널의 <code>size()</code>로 얻은 크기가 0보다 크고 <code>Integer.MAX_VALUE</code> 이하이면 <code>java.nio.file.FileChannelLinesSpliterator</code>로 스트림을 만든다. 조건 중 하나라도 어긋나면 <code>newBufferedReader(path, cs).lines()</code>와 같은 방식으로 돌아간다. 크기가 0인 경우를 빼는 이유는 소스 주석에 있다. <code>FileChannel.size()</code>가 내용이 있는 파일에 대해서도 0을 돌려주는 경우가 있기 때문이다. <code>Files.lines</code>의 Javadoc 구현 노트(implNote)는 이 세 문자 집합을 "줄 최적(line-optimal)" 문자 집합이라 부르고, 파일의 바이트를 임의 위치에서 읽어도 줄 바꿈(<code>'\n'</code>)과 캐리지 리턴(<code>'\r'</code>)의 인코딩된 바이트를 다른 문자와 구별할 수 있는 성질을 가졌다고 설명한다. UTF-8에서 이 성질이 성립하는 이유는 01회차에서 본 인코딩 규칙에 있다. 여러 바이트로 된 문자의 바이트는 선두 바이트든 연속 바이트든 최상위 비트가 1이므로, 0x0A나 0x0D라는 바이트 값은 오직 LF와 CR 자체로만 나타난다. UTF-16이라면 다른 문자의 절반이 0x0A일 수 있으니 이런 판단을 할 수 없다.</p>
+<p>아래 예제는 줄 10개짜리 파일로 스플리터레이터를 직접 꺼내 한 번 쪼개 본다. <code>Files.lines</code>가 돌려준 스트림에 중간 연산이 없으므로 <code>spliterator()</code>는 원천 스플리터레이터를 그대로 돌려준다.</p>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.charset.Charset;
+import java.nio.file.*;
+import java.util.Spliterator;
+import java.util.stream.Stream;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+
+public class LinesSplit {
+    public static void main(String[] args) throws IOException {
+        Path p = Path.of("lines.txt");
+        StringBuilder sb = new StringBuilder();
+        for (int i = 1; i <= 10; i++) sb.append("line-").append(i).append('\n');   // 9줄은 7바이트, 마지막 줄은 8바이트
+        Files.writeString(p, sb, UTF_8);
+        System.out.println("size = " + Files.size(p));
+
+        try (Stream<String> s = Files.lines(p, UTF_8)) {
+            Spliterator<String> right = s.spliterator();
+            System.out.println("class = " + right.getClass().getSimpleName());
+            System.out.println("before split: estimate = " + right.estimateSize());
+            Spliterator<String> left = right.trySplit();
+            System.out.println("left  estimate = " + left.estimateSize() + ", first = " + first(left));
+            System.out.println("right estimate = " + right.estimateSize() + ", first = " + first(right));
+        }
+        try (Stream<String> s = Files.lines(p, Charset.forName("MS949"))) {
+            System.out.println("MS949 class = " + s.spliterator().getClass().getSimpleName());
+        }
+        try (Stream<String> s = Files.lines(p, UTF_8)) {
+            System.out.println("parallel count = " + s.parallel().filter(l -> l.endsWith("0")).count());
+        }
+    }
+
+    static String first(Spliterator<String> sp) {
+        String[] box = new String[1];
+        sp.tryAdvance(l -> box[0] = l);
+        return box[0];
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">size = 71
+class = FileChannelLinesSpliterator
+before split: estimate = 71
+left  estimate = 35, first = line-1
+right estimate = 36, first = line-6
+MS949 class = IteratorSpliterator
+parallel count = 1</code></pre>
+<p>마지막 줄은 병렬로 세어도 결과가 같다는 확인이다(<code>0</code>으로 끝나는 줄은 <code>line-10</code> 하나). 이제 분할을 한 바이트씩 추적해 보자. 파일은 71바이트다. <code>line-1</code>부터 <code>line-9</code>까지는 줄 바꿈을 포함해 7바이트씩이므로 <i>k</i>번째 줄은 오프셋 7(<i>k</i>−1)에서 시작하고, <code>line-10</code>은 오프셋 63부터 8바이트다. 스플리터레이터는 처음 만들어질 때 범위 [0, 71)만 기억하고 아무것도 읽지 않는다. <code>estimateSize</code>가 줄 수가 아니라 남은 <b>바이트 수</b> 71을 돌려준 것도 그래서다. 소스 주석은 줄당 평균 문자 수로 나눌 수도 있지만 그 상수는 어차피 상쇄된다고 적어 두었다.</p>
+<p><code>trySplit</code>이 처음 불리면 파일 전체를 읽기 전용으로 메모리 매핑한다(<code>fc.map(READ_ONLY, 0, fence)</code>). 그리고 가운데 위치 <code>mid = (0 + 71) >>> 1 = 35</code>의 바이트를 본다. 오프셋 35는 <code>line-6</code>의 첫 글자 <code>l</code>이라 줄 끝이 아니다. 그러면 35의 왼쪽(34, 33, …)과 오른쪽(36, 37, …)을 번갈아 한 바이트씩 보며 가장 가까운 <code>'\n'</code>이나 <code>'\r'</code>을 찾는다. 첫 시도인 오프셋 34가 <code>line-5</code>의 줄 바꿈이므로 분할점은 그 바로 뒤인 35가 된다. 왼쪽 조각은 [0, 35)로 <code>line-1</code>~<code>line-5</code>를, 오른쪽(원래 객체)은 [35, 71)로 <code>line-6</code>~<code>line-10</code>을 맡는다. 출력의 35와 36, 그리고 각 조각의 첫 줄이 정확히 이 계산과 맞는다. 매핑한 버퍼는 분할점을 찾는 데만 쓰이고, 조각들이 참조 수(<code>AtomicInteger</code>)로 함께 공유한다.</p>
+<p>줄을 실제로 읽는 단계에서는 매핑을 쓰지 않는다. 조각이 처음 <code>tryAdvance</code>를 받으면 자기 범위만 읽는 <code>ReadableByteChannel</code>을 만들어 <code>BufferedReader</code>로 감싸는데, 이 채널은 공유된 <code>FileChannel</code>에 위치를 지정한 읽기(<code>fc.read(dst, index)</code>)를 해서 [index, fence) 범위의 바이트만 가져온다. 위치를 지정한 읽기는 채널의 현재 위치를 바꾸지 않으므로 여러 스레드의 조각이 한 채널을 동시에 써도 서로의 위치를 건드리지 않는다. 읽기가 시작되면 그 조각은 매핑 참조를 내려놓고 더는 쪼개지지 않으며, 참조 수가 0이 되면 매핑이 해제된다. 순차 스트림이라면 <code>trySplit</code>이 불리지 않으므로 매핑은 아예 일어나지 않는다. 클래스 주석도 매핑된 버퍼는 병렬 실행에만 필요하다고 적는다.</p>
+<p>MS949로 연 스트림의 원천은 <code>IteratorSpliterator</code>였다. <code>BufferedReader.lines()</code>가 줄 반복자를 <code>Spliterators.spliteratorUnknownSize</code>로 감싸 만든 것이다. 이 스플리터레이터는 파일의 구조를 모르므로 앞에서부터 줄을 읽어 배열에 담는 방식으로만 쪼갠다. OpenJDK 21에서 첫 분할은 1024개, 다음은 2048개처럼 1024씩 늘어나는 크기의 배열을 만들어 그만큼의 줄을 순차적으로 읽어 넘긴다(최대 2<sup>25</sup>개). 쪼개는 일 자체가 순차적인 읽기이고, 소스 주석에 따르면 원소 처리 비용이 배열로 옮기는 비용보다 클 때만 병렬화가 이득이다. <code>Files.lines</code>의 Javadoc이 줄 최적이 아닌 문자 집합의 스플리터레이터는 분할 성질이 나빠 병렬 성능이 나쁠 수 있다고 경고하는 이유가 이것이다. 정리하면 <code>Files.lines(path)</code>(기본 UTF-8)에 <code>parallel()</code>을 붙이면 파일이 바이트 위치로 나뉘어 각 스레드가 자기 구간을 따로 읽고, 다른 문자 집합이나 <code>BufferedReader.lines()</code>에서는 한 스레드가 읽어 나눠 주는 구조가 된다. 병렬화로 이득을 볼지는 여전히 줄마다 하는 일의 무게와 디스크 상태에 달려 있지만, 적어도 전자는 읽기 자체를 나눌 수 있는 구조다.</p>
+
+<h3>파일 복사 최적화: 바이트가 지나가는 길을 줄인다</h3>
+<p>파일 복사는 I/O 비용이 어디서 생기는지 보기에 가장 좋은 문제다. 하는 일은 단순하다. 원본의 바이트를 대상에 그대로 옮긴다. 그런데 그 바이트가 어디를 몇 번 거치느냐는 방법에 따라 크게 다르다. 200MB(209,715,200바이트) 파일을 세 가지 방법으로 복사해 보자. 네 번째 줄은 세 번째 방법에 옵션 하나를 더한 것이다.</p>
+<pre><code class="language-java">import java.io.*;
+import java.nio.file.*;
+import java.util.Arrays;
+
+public class CopyMain {
+    public static void main(String[] args) throws IOException {
+        Path src = Path.of("source.dat");
+        if (!Files.exists(src)) {
+            byte[] chunk = new byte[1024 * 1024];
+            try (OutputStream out = new BufferedOutputStream(new FileOutputStream("source.dat"))) {
+                for (int i = 0; i < 200; i++) { Arrays.fill(chunk, (byte) i); out.write(chunk); }
+            }
+        }
+        for (int round = 0; round < 3; round++) {
+            Files.deleteIfExists(Path.of("copy1.dat"));
+            Files.deleteIfExists(Path.of("copy2.dat"));
+            Files.deleteIfExists(Path.of("copy3.dat"));
+            Files.deleteIfExists(Path.of("copy4.dat"));
+
+            long t0 = System.nanoTime();
+            try (FileInputStream in = new FileInputStream("source.dat");      // 1. 전부 읽고 전부 쓰기
+                 FileOutputStream out = new FileOutputStream("copy1.dat")) {
+                byte[] all = in.readAllBytes();
+                out.write(all);
+            }
+            long t1 = System.nanoTime();
+            try (FileInputStream in = new FileInputStream("source.dat");      // 2. transferTo
+                 FileOutputStream out = new FileOutputStream("copy2.dat")) {
+                in.transferTo(out);
+            }
+            long t2 = System.nanoTime();
+            Files.copy(src, Path.of("copy3.dat"));                            // 3. Files.copy
+            long t3 = System.nanoTime();
+            Files.copy(src, Path.of("copy4.dat"), StandardCopyOption.COPY_ATTRIBUTES);
+            long t4 = System.nanoTime();
+            System.out.printf("round %d: readAllBytes %dms, transferTo %dms, Files.copy %dms, Files.copy+ATTR %dms%n",
+                    round, (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t3 - t2) / 1_000_000, (t4 - t3) / 1_000_000);
+        }
+        System.out.println("mismatch = " + Files.mismatch(src, Path.of("copy1.dat")) + " "
+                + Files.mismatch(src, Path.of("copy2.dat")) + " " + Files.mismatch(src, Path.of("copy3.dat"))
+                + " " + Files.mismatch(src, Path.of("copy4.dat")));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (macOS, APFS. 이 환경에서 한 번 측정한 값이며 ms 값은 실행마다 다르다)"><code class="language-text">round 0: readAllBytes 340ms, transferTo 210ms, Files.copy 119ms, Files.copy+ATTR 1ms
+round 1: readAllBytes 338ms, transferTo 196ms, Files.copy 226ms, Files.copy+ATTR 0ms
+round 2: readAllBytes 133ms, transferTo 107ms, Files.copy 152ms, Files.copy+ATTR 0ms
+mismatch = -1 -1 -1 -1</code></pre>
+<p><code>Files.mismatch</code>(Java 12)는 두 파일의 내용이 처음 달라지는 위치를 돌려주고, 끝까지 같으면 -1을 돌려준다. 네 사본 모두 원본과 같다. 시간을 보면 앞의 세 방법은 같은 자릿수 안에서 실행마다 순위가 바뀐다. 0회차에서는 <code>Files.copy</code>가 가장 빨랐고 2회차에서는 가장 느렸다. 원본 파일은 방금 만들어 운영체제의 페이지 캐시에 올라와 있으므로 이 측정은 디스크 속도보다 메모리 복사와 시스템 콜에 좌우되고, 캐시 상태, 운영체제가 더러운 페이지를 디스크로 내리는 시점, JIT 워밍업, 다른 프로세스가 모두 숫자를 흔든다. 그러니 이 숫자로 앞의 세 방법의 순위를 매기는 것은 의미가 없다. 반면 네 번째 줄은 세 번의 측정 모두 1ms 이하로, 다른 방법과 자릿수가 다르다. 이 차이는 측정 오차로 설명되지 않는다. 일어나는 일 자체가 다르기 때문이다. 각 방법을 소스 수준에서 따라가 보자.</p>
+<h4>방법 1: readAllBytes와 write — 바이트가 힙을 통과한다</h4>
+<p><code>FileInputStream.readAllBytes</code>는 OpenJDK 21에서 파일 길이와 현재 위치로 남은 크기를 계산해 그 크기의 <code>byte[]</code>를 힙에 만들고, <code>read(buf, off, len)</code>을 반복해 채운다. 이 <code>read</code>는 네이티브 함수 <code>readBytes</code>(<code>io_util.c</code>)로 내려간다. 이 함수는 요청 길이가 8192바이트 이하면 C 스택의 버퍼를 쓰고, 더 크면 <code>malloc(len)</code>으로 네이티브 메모리를 그만큼 할당한다. 그런 다음 <code>read</code> 시스템 콜로 커널이 페이지 캐시의 데이터를 그 네이티브 버퍼에 복사하고, JNI 함수 <code>SetByteArrayRegion</code>으로 네이티브 버퍼의 내용을 자바 배열에 다시 복사한다. 자바 힙의 배열은 GC가 옮길 수 있으므로 커널이 직접 쓰게 두지 않고 중간 버퍼를 거치는 것이다. 쓰기(<code>writeBytes</code>)는 정확히 반대 순서다. 길이가 크면 <code>malloc</code>, <code>GetByteArrayRegion</code>으로 자바 배열을 네이티브 버퍼에 복사, <code>write</code> 시스템 콜로 대상 파일의 페이지 캐시에 복사.</p>
+<p>정리하면 200MB가 CPU에 의해 네 번 복사되고(페이지 캐시 → 네이티브 → 힙 → 네이티브 → 페이지 캐시), 그동안 힙에 200MB 배열이, 네이티브 메모리에 200MB 버퍼가 잠깐씩 존재한다. 힙이 작으면 어떻게 될까. 아래는 최대 힙을 64MB로 제한하고 세 방법을 차례로 돌린 결과다.</p>
+<pre><code class="language-java">import java.io.*;
+import java.nio.file.*;
+
+public class SmallHeap {
+    public static void main(String[] args) throws IOException {
+        System.out.println("maxMemory = " + Runtime.getRuntime().maxMemory() / (1024 * 1024) + "MB");
+        try (FileInputStream in = new FileInputStream("source.dat");
+             FileOutputStream out = new FileOutputStream("copy2.dat")) {
+            System.out.println("transferTo = " + in.transferTo(out));
+        }
+        Files.copy(Path.of("source.dat"), Path.of("copy3.dat"), StandardCopyOption.REPLACE_EXISTING);
+        System.out.println("Files.copy ok");
+        try (FileInputStream in = new FileInputStream("source.dat")) {
+            byte[] all = in.readAllBytes();
+            System.out.println("readAllBytes = " + all.length);
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (java -Xmx64m SmallHeap, 200MB 원본)"><code class="language-text">maxMemory = 64MB
+transferTo = 209715200
+Files.copy ok
+Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
+	at java.base/java.io.FileInputStream.readAllBytes(FileInputStream.java:310)
+	at SmallHeap.main(SmallHeap.java:14)</code></pre>
+<p><code>transferTo</code>와 <code>Files.copy</code>는 힙 64MB로 200MB를 문제없이 옮겼고, <code>readAllBytes</code>만 배열을 만들지 못해 죽었다. 방법 1의 진짜 문제는 속도가 아니라 <b>파일 크기에 비례하는 힙</b>이다. 파일 크기를 통제할 수 없는 서버 코드에서 이 방식은 사용자 업로드 하나로 JVM 전체를 멈추게 할 수 있다. 02회차의 버퍼 방식(고정 크기 배열로 나눠 읽고 쓰기)은 힙 문제는 없지만 복사 횟수는 같다. 버퍼가 8192바이트 이하면 스택 버퍼를 쓰므로 <code>malloc</code>은 사라지지만, 커널과 자바 배열 사이를 오가는 네 번의 복사는 그대로다.</p>
+<h4>방법 2: transferTo — 바이트가 자바를 거치지 않을 수 있다</h4>
+<p><code>InputStream.transferTo(OutputStream)</code>는 Java 9에 추가됐다. <code>InputStream</code>의 기본 구현은 버퍼 하나로 읽고 쓰기를 반복하는 루프이고, OpenJDK 21에서 그 버퍼는 16384바이트다. 그런데 <code>FileInputStream</code>은 이 메서드를 재정의한다. 출력이 <code>FileOutputStream</code>이면 양쪽에서 <code>FileChannel</code>을 꺼내 <code>FileChannel.transferTo</code>에 일을 맡기고, 다 옮기지 못한 나머지가 있을 때만 기본 루프로 넘어간다.</p>
+<p><code>FileChannel.transferTo</code>의 구현(<code>sun.nio.ch.FileChannelImpl</code>)은 세 단계를 차례로 시도한다. 첫째는 커널에 직접 전송을 요청하는 경로다. 리눅스에서는 <code>copy_file_range</code>를 먼저 부르고, 지원되지 않으면 <code>sendfile</code>을 부른다. macOS에서는 <code>sendfile</code>을 부르는데, macOS의 <code>sendfile</code>은 매뉴얼 첫 줄부터 "파일을 소켓으로 보낸다"고 정의된 함수라 대상이 파일이면 실패하고 다음 단계로 넘어간다. 둘째는 메모리 매핑 경로다. 옮길 양이 16KB 이상이면 원본을 최대 8MB씩 읽기 전용으로 메모리에 매핑(<code>mmap</code>)하고, 매핑된 영역을 대상 채널에 <code>write</code>한다. 매핑은 원본의 페이지 캐시를 프로세스 주소 공간에 그대로 비춰 주는 것이므로 읽기 단계의 복사가 없다. <code>write</code> 시스템 콜이 그 영역을 대상 파일의 페이지 캐시로 복사하는 한 번만 남는다. 셋째는 앞의 두 경로가 모두 불가능할 때의 대비책으로, 8192바이트 버퍼로 읽고 쓰는 루프다.</p>
+<p>그래서 macOS에서 방법 2는 매핑 경로를 탔고, 리눅스였다면 <code>copy_file_range</code>로 커널 안에서 복사됐을 것이다. <code>copy_file_range</code>의 매뉴얼은 이 호출이 두 파일 디스크립터 사이의 커널 내 복사이며, 데이터를 커널에서 사용자 공간으로 옮기는 비용이 없다고 설명한다(리눅스 4.5에 추가). 어느 경우든 바이트는 자바 힙을 지나가지 않는다. 한 가지 함정이 있다. <code>FileInputStream.transferTo</code>의 재정의는 출력이 <code>FileOutputStream</code>인지를 <code>instanceof</code>로 확인한다. 출력을 <code>BufferedOutputStream</code>으로 감싸 넘기면 이 확인에 실패해 16KB 버퍼 루프로 돌아간다. 버퍼링이 오히려 빠른 길을 막는 경우다.</p>
+<h4>방법 3: Files.copy — 운영체제에게 복사를 맡긴다</h4>
+<p><code>Files.copy(Path, Path)</code>는 스트림을 아예 만들지 않는다. OpenJDK 21의 유닉스 구현(<code>sun.nio.fs.UnixFileSystem.copyFile</code>)은 원본을 <code>O_RDONLY</code>로, 대상을 <code>O_WRONLY | O_CREAT | O_EXCL</code>로 연다. 대상을 <code>O_EXCL</code>로 여는 것은 이미 있는 대상을 덮어쓰지 않기 위해서다(<code>REPLACE_EXISTING</code>를 주면 먼저 대상을 지운다). 그다음 플랫폼별 직접 복사를 시도한다. 리눅스는 <code>copy_file_range</code>, 안 되면 <code>sendfile</code>을 쓴다. macOS는 시스템 라이브러리의 <code>fcopyfile</code>에 <code>COPYFILE_DATA</code> 플래그로 데이터 복사를 맡긴다. 직접 복사가 지원되지 않으면 네이티브 메모리의 임시 버퍼로 <code>read</code>와 <code>write</code>를 반복하는데, 이 버퍼 크기는 두 파일 시스템의 블록 크기로 정하되 최소 16384바이트다. 어느 경로든 자바 힙에는 파일 크기만 한 배열이 생기지 않는다.</p>
+<p>네 번째 줄, <code>COPY_ATTRIBUTES</code>를 준 <code>Files.copy</code>가 1ms 이하였던 이유는 macOS 구현의 첫 단계에 있다. OpenJDK 21의 <code>BsdFileSystem.copyFile</code>은 속성 복사를 요청받았고 취소 가능한 복사가 아닐 때 데이터를 복사하는 대신 <code>clonefile</code> 시스템 콜을 먼저 시도한다. <code>clonefile</code>의 매뉴얼에 따르면 복제본은 원본과 데이터 블록을 공유하고, 이후 어느 한쪽에 쓰면 그 쓰기는 수정된 파일에만 반영된다(copy-on-write). 즉 200MB의 데이터 블록은 하나도 복사되지 않았고, 새 inode가 같은 블록을 가리키게 했을 뿐이다. 그래서 크기와 상관없이 빠르다. 파일 시스템이 복제를 지원하지 않거나(<code>ENOTSUP</code>) 두 경로가 다른 파일 시스템에 있으면(<code>EXDEV</code>) 일반 복사 경로로 넘어간다. 매뉴얼은 복제가 데이터 블록용 저장 공간을 새로 할당하지 않을 수 있어서 나중에 기존 블록을 덮어쓸 때 공간 부족(<code>ENOSPC</code>)이 날 수 있다고도 경고한다. 복사 시점이 아니라 쓰기 시점에 공간이 필요해지는 것이다. 리눅스의 <code>copy_file_range</code>도 매뉴얼에서 파일 시스템이 리플링크(reflink) 같은 "복사 가속" 기법을 쓸 기회를 준다고 설명하므로, Btrfs처럼 블록 공유를 지원하는 파일 시스템에서는 비슷한 일이 일어날 수 있다.</p>
+<pre class="diagram">  방법 1: readAllBytes + write (OpenJDK 21, 유닉스 계열)
+  디스크 → [페이지 캐시] ─read─▶ [네이티브 malloc] ─Set─▶ [자바 힙 byte[]] ─Get─▶ [네이티브 malloc] ─write─▶ [페이지 캐시] → 디스크
+                 복사 ①                    복사 ②                  복사 ③                   복사 ④
+
+  방법 2: transferTo (macOS: 매핑 경로)
+  [원본 페이지 캐시] ═mmap(복사 없음)═▶ 프로세스 주소 공간 ─write─▶ [대상 페이지 캐시]
+                                                        복사 ①
+  방법 2·3 (리눅스): copy_file_range / sendfile
+  [원본 페이지 캐시] ───────── 커널 안에서 ─────────▶ [대상 페이지 캐시]   (자바 힙, 사용자 공간 거치지 않음)
+
+  방법 3 + COPY_ATTRIBUTES (macOS APFS): clonefile
+  새 inode ──▶ 원본과 같은 데이터 블록 공유 (데이터 복사 없음, 쓰기 시점에 copy-on-write)</pre>
+<x-visual id="java-adv2-05-copy-paths" title="파일 복사 방법별로 바이트가 지나가는 길" kind="비교 다이어그램" ratio="16:9">
+<x-hint>네 가지 복사 방법이 데이터를 사용자 공간과 커널 사이에서 몇 번 옮기는지를 가로 띠 네 줄로 비교한다.</x-hint>
+<x-prompt>가로로 긴 그림, 위아래로 네 줄. 그림 가운데에 가로로 굵은 점선을 그어 위쪽을 "사용자 공간(JVM)", 아래쪽을 "커널"로 라벨링한다. 1줄 "readAllBytes + write": 아래쪽 "원본 페이지 캐시" 상자에서 위쪽 "네이티브 버퍼", "자바 힙 byte[]", "네이티브 버퍼"를 차례로 지나 다시 아래쪽 "대상 페이지 캐시"로 가는 지그재그 화살표, 화살표마다 숫자 원 1~4. 2줄 "transferTo (매핑)": 원본 페이지 캐시에서 위쪽 투명한 창 모양 "매핑된 영역"으로 점선(복사 아님), 거기서 대상 페이지 캐시로 실선 화살표 하나(숫자 원 1). 3줄 "copy_file_range": 커널 영역 안에서만 원본에서 대상으로 가는 실선 화살표 하나. 4줄 "clonefile": 커널 영역에 "새 inode"와 "원본 inode"가 같은 "데이터 블록" 상자를 함께 가리키는 화살표 두 개, 옆에 라벨 "복사 없음". 평평한 벡터 스타일, 흰 배경, 줄마다 다른 옅은 배경색.</x-prompt>
+<x-caption>빠른 복사의 핵심은 바이트를 덜 옮기는 것이다. 힙을 지나지 않고, 사용자 공간을 지나지 않고, 마지막에는 아예 옮기지 않는다.</x-caption>
+</x-visual>
+<div class="table-wrap"><table><thead><tr><th>방법</th><th>힙 사용</th><th>CPU 복사 횟수 (OpenJDK 21)</th><th>비고</th></tr></thead><tbody>
+<tr><td><code>readAllBytes</code> + <code>write</code></td><td>파일 크기만큼</td><td>4번</td><td>네이티브 메모리도 파일 크기만큼 잠깐 사용. 큰 파일에서 <code>OutOfMemoryError</code></td></tr>
+<tr><td>고정 버퍼 루프(02회차 방식)</td><td>버퍼 크기</td><td>4번</td><td>버퍼가 8192바이트 이하면 스택 버퍼 사용</td></tr>
+<tr><td><code>FileInputStream.transferTo</code></td><td>없음(직접·매핑 경로)</td><td>리눅스 커널 내 복사(사용자 공간 경유 없음), macOS 매핑 1번</td><td>출력이 <code>FileOutputStream</code>일 때만. 감싸면 16KB 루프</td></tr>
+<tr><td><code>Files.copy(Path, Path)</code></td><td>없음</td><td>리눅스 커널 내 복사, macOS <code>fcopyfile</code></td><td>대체 경로는 네이티브 버퍼로 <code>read</code>/<code>write</code></td></tr>
+<tr><td><code>Files.copy</code> + <code>COPY_ATTRIBUTES</code> (macOS)</td><td>없음</td><td>0번(<code>clonefile</code>)</td><td>APFS처럼 복제를 지원하는 파일 시스템, 같은 볼륨일 때</td></tr>
+</tbody></table></div>
+<p>결론은 단순하다. 파일에서 파일로 옮길 때는 <code>Files.copy</code>를 쓰고, 스트림을 이미 갖고 있다면 <code>transferTo</code>를 쓴다. <code>Files</code>에는 <code>Files.copy(InputStream, Path)</code>와 <code>Files.copy(Path, OutputStream)</code> 형태도 있어서 업로드된 스트림을 파일로 저장하거나 파일을 응답 스트림으로 내보낼 때 쓸 수 있다. 읽은 바이트를 변환해야 하는 경우가 아니라면, 바이트를 자바 배열로 끌어올리는 코드를 직접 쓸 이유가 없다. 자바 코드가 바이트를 만지지 않을수록 운영체제가 더 좋은 길을 고를 여지가 커진다.</p>
+
+<h3>흔한 오해와, 이 지식이 다시 쓰이는 곳</h3>
+<p><b>"<code>new File(...)</code>이나 <code>Path.of(...)</code>를 하면 파일이 생긴다."</b> 둘 다 경로 값을 만들 뿐이다. 파일 시스템은 <code>createNewFile</code>, <code>Files.createFile</code>, 스트림 열기처럼 실제 작업을 요청할 때만 바뀐다. 같은 이유로 <code>Path</code> 객체를 들고 있다고 그 파일이 계속 있다는 보장도 없다.</p>
+<p><b>"<code>exists</code>가 <code>false</code>면 파일이 없다."</b> 권한 때문에 판단하지 못했을 수도 있다. <code>Files.exists</code>와 <code>Files.notExists</code>가 둘 다 <code>false</code>면 "모른다"이다. 그리고 어떤 답이든 받는 즉시 낡는다. 확인 후 행동하지 말고, 원자적 연산(<code>createFile</code>, <code>ATOMIC_MOVE</code>)을 시도하고 예외를 처리한다.</p>
+<p><b>"<code>normalize</code>한 경로는 실제 위치다."</b> <code>normalize</code>는 문자열 계산이다. 경로에 심볼릭 링크가 있으면 커널이 여는 파일과 다른 파일을 가리킬 수 있다. 실제 위치가 필요하면 <code>toRealPath</code>를 쓴다.</p>
+<p><b>"파일을 지우면 디스크 공간이 바로 돌아온다."</b> 지우기는 이름을 떼어 내는 <code>unlink</code>다. 어떤 프로세스가 그 파일을 열고 있으면 실체는 디스크립터가 닫힐 때까지 남는다. 리눅스와 macOS에서 <code>lsof</code>로 이미 지워진 파일을 붙든 프로세스를 찾을 수 있다.</p>
+<p><b>"<code>Files.move</code>는 항상 원자적이다."</b> 같은 파일 시스템 안의 이름 바꾸기만 원자적이다. 다른 파일 시스템으로의 이동은 복사 후 삭제로 바뀐다. 원자성이 필요하면 <code>ATOMIC_MOVE</code>를 주고, 실패를 <code>AtomicMoveNotSupportedException</code>으로 받는다.</p>
+<p><b>"파일 복사는 결국 읽고 쓰는 것이니 방법은 상관없다."</b> 같은 결과를 내는 방법들이 데이터를 4번 옮기기도, 1번 옮기기도, 전혀 옮기지 않기도 한다. 그리고 그 차이는 측정보다 소스와 시스템 콜을 따라가면 더 분명하게 보인다.</p>
+<p>이 회차의 지식은 바로 다음 회차들에서 다시 쓰인다. 06~08회차의 소켓도 운영체제에게는 파일 디스크립터이고, 데이터를 주고받는 일은 같은 <code>read</code>/<code>write</code> 시스템 콜로 이루어진다. 열린 디스크립터를 닫지 않으면 자원이 새고, 프로세스당 디스크립터 수 제한에 닿으면 새 연결을 받지 못한다. <code>FileChannel.transferTo</code>의 대상이 소켓 채널이면 위의 직접 전송 경로가 <code>sendfile</code>로 이어지는데, 이것이 원래 <code>sendfile</code>이 만들어진 용도인 "파일을 소켓으로 보내기"다. 10회차와 13회차에서 HTTP 서버를 직접 만들어 파일을 응답으로 내보낼 때, 이 회차의 경로 이탈 검사와 복사 경로 이야기가 그대로 그 서버의 보안과 성능 문제가 된다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>이름과 실체</dt><dd>유닉스 계열 파일 시스템에서 이름은 디렉터리 엔트리에, 데이터와 메타데이터는 inode에 있다. 하드 링크는 같은 inode에 붙은 두 번째 이름이고, 삭제(<code>unlink</code>)는 이름 하나를 떼어 낸다. 열린 디스크립터가 있으면 실체는 남는다.</dd>
+<dt>java.io.File</dt><dd>경로 이름을 담은 불변 값이다. 메서드는 <code>stat</code>, <code>open(O_CREAT|O_EXCL)</code>, <code>mkdir</code>, <code>rename</code>, <code>remove</code> 같은 시스템 콜로 이어지지만, 실패를 <code>false</code>·<code>0</code>·<code>null</code>로 돌려줘 오류 번호를 잃는다.</dd>
+<dt>Path, Files, FileSystemProvider</dt><dd><code>Path</code>는 주소, <code>Files</code>는 작업의 관문, provider는 실제 구현이다. 같은 <code>Files</code> 호출이 기본 파일 시스템에서는 시스템 콜로, ZIP 파일 시스템에서는 ZIP 항목 처리로 이어진다.</dd>
+<dt>예외로 드러나는 원인</dt><dd><code>Files</code>는 <code>EACCES</code>, <code>ENOENT</code>, <code>EEXIST</code>를 각각 <code>AccessDeniedException</code>, <code>NoSuchFileException</code>, <code>FileAlreadyExistsException</code>으로 번역하고 메시지에 경로를 넣는다.</dd>
+<dt>존재 확인과 원자적 생성</dt><dd><code>exists</code>와 <code>notExists</code>가 둘 다 거짓이면 판단할 수 없다는 뜻이고, 결과는 즉시 낡는다. <code>createFile</code>은 <code>O_EXCL</code>로 확인과 생성을 한 번에 하므로 경쟁에서 하나만 성공한다.</dd>
+<dt>rename의 원자성</dt><dd>같은 파일 시스템 안의 이름 바꾸기는 데이터를 옮기지 않고 원자적이다. <code>Files.move</code>는 <code>EXDEV</code>면 복사 후 삭제로 바꾸고, <code>ATOMIC_MOVE</code>를 주면 대신 <code>AtomicMoveNotSupportedException</code>을 던진다.</dd>
+<dt>경로 표시</dt><dd>상대 경로는 JVM 시작 시 <code>getcwd</code>로 정해진 <code>user.dir</code> 기준이다. <code>toAbsolutePath</code>·<code>normalize</code>는 문자열 계산이고, <code>getCanonicalPath</code>·<code>toRealPath</code>는 파일 시스템에 물어 링크를 푼다. 링크가 끼면 <code>normalize</code>는 다른 파일을 가리킬 수 있다.</dd>
+<dt>경로의 바이트 표현</dt><dd>OpenJDK의 <code>UnixPath</code>는 경로를 <code>sun.jnu.encoding</code>으로 인코딩한 바이트 배열로 담고 NUL을 거부하며, <code>equals</code>도 바이트로 비교한다. macOS에서 NFC와 NFD 한글 이름은 같은 파일을 열어도 <code>Path</code>로는 다르므로 <code>isSameFile</code>이나 정규화 후 비교를 쓴다.</dd>
+<dt>디렉터리 순회</dt><dd>디렉터리 스트림은 <code>readdir</code>로 한 이름씩 지연해서 읽고 순서는 정해져 있지 않다. <code>walk</code>는 깊이만큼 디렉터리를 열어 두며, <code>FOLLOW_LINKS</code>일 때 <code>fileKey</code>로 조상과 비교해 순환을 <code>FileSystemLoopException</code>으로 알린다.</dd>
+<dt>Files로 문자 파일 읽기</dt><dd>문자 집합을 생략하면 UTF-8이고 잘못된 바이트는 예외다. <code>readString</code>·<code>readAllLines</code>는 전부를 메모리에 올리고, <code>lines</code>는 지연해서 읽는 대신 닫아야 하며 오류가 <code>UncheckedIOException</code>으로 늦게 드러난다.</dd>
+<dt>파일 복사 경로</dt><dd><code>readAllBytes</code> 방식은 힙과 네이티브 메모리를 파일 크기만큼 쓰며 네 번 복사한다. <code>transferTo</code>와 <code>Files.copy</code>는 커널 내 복사나 매핑을 쓰고, macOS에서 <code>COPY_ATTRIBUTES</code>를 주면 <code>clonefile</code>로 데이터 복사 자체가 없다.</dd>
+</x-summary>
+
+<x-review>
+<p>운영 중인 서버에서 "로그를 지웠는데 디스크 사용률이 그대로"라는 상황은 이 회차의 <code>unlink</code> 규칙으로 바로 설명된다. 로그 파일을 열고 있는 프로세스가 살아 있는 한 실체는 남는다. 이때 할 일은 파일을 더 지우는 것이 아니라 그 디스크립터를 닫게 하는 것이다. 애플리케이션을 재시작하거나, 로그 라이브러리의 재오픈 기능을 쓰거나, 처음부터 파일을 지우는 대신 길이를 0으로 자르는 방식을 고른다. 반대로 같은 성질은 장점이기도 하다. 설정 파일을 임시 파일과 <code>rename</code>으로 교체하면, 이미 옛 파일을 열고 읽는 중인 프로세스는 옛 내용을 끝까지 읽고 새로 여는 프로세스는 새 내용을 본다.</p>
+<p>파일 경로를 외부 입력으로 받는 코드는 보안 경계다. 기준 디렉터리를 절대 경로로 고정하고, 입력을 <code>resolve</code>한 뒤 이름 요소 단위의 <code>Path.startsWith</code>로 검사한다. 문자열 <code>startsWith</code>는 <code>/srv/app2</code>를 <code>/srv/app</code> 안으로 판정하는 실수를 만든다. 기준 디렉터리 안에 다른 사람이 링크를 만들 수 있다면 <code>normalize</code>로는 부족하고 <code>toRealPath</code>로 실제 위치를 확인해야 하며, 확인한 그 경로로 파일을 열어야 검사와 사용 사이의 틈이 생기지 않는다. 판단이 달라지는 조건은 "그 디렉터리에 누가 쓸 수 있는가"다.</p>
+<p>파일을 다루는 코드의 장애 분석은 예외에서 시작한다. <code>File</code>의 <code>false</code>는 원인을 남기지 않으므로, 오래된 코드에서 "가끔 파일이 안 지워진다"는 보고가 오면 먼저 <code>Files.delete</code>로 바꿔 예외를 받아 보는 것이 가장 싼 진단이다. 대용량 파일을 다루는 경로에서는 <code>readAllBytes</code>, <code>readString</code>, <code>readAllLines</code>처럼 파일 크기에 비례해 메모리를 쓰는 호출이 있는지부터 찾는다. 입력 크기를 통제할 수 없다면 <code>lines</code>나 <code>newBufferedReader</code>, 복사라면 <code>Files.copy</code>나 <code>transferTo</code>로 바꾸는 것이 성능 튜닝보다 먼저다.</p>
+</x-review>
+
+<x-practice>
+<li>작업 디렉터리에 <code>docs/v2</code> 디렉터리와 <code>docs/readme.txt</code> 파일이 있고, <code>current</code>는 <code>docs/v2</code>를 가리키는 심볼릭 링크다. <code>Path.of("current/../readme.txt")</code>에 대해 <code>normalize()</code>의 결과, <code>Files.exists(p.normalize())</code>의 결과, <code>Files.readString(p)</code>가 읽는 파일을 각각 예측하라.</li>
+<li>다음 코드는 가끔 같은 작업을 두 번 실행한다. 원인을 설명하고 고쳐라. <code>if (!Files.exists(marker)) { Files.writeString(marker, "done"); runJob(); }</code> — 이 코드가 여러 프로세스에서 동시에 실행된다고 가정한다.</li>
+<li>설정 파일 교체 코드에서 임시 파일을 <code>Files.createTempFile("cfg", ".tmp")</code>(시스템 임시 디렉터리)로 만들고 <code>Files.move(temp, target, ATOMIC_MOVE)</code>를 불렀다. 시스템 임시 디렉터리와 <code>target</code>이 서로 다른 파일 시스템에 있을 때 어떤 일이 일어나는가. <code>ATOMIC_MOVE</code>를 빼면 어떻게 달라지는가.</li>
+<li>500MB 파일을 <code>FileInputStream.readAllBytes()</code>로 읽어 <code>FileOutputStream.write(byte[])</code>로 쓰는 코드가 있다. OpenJDK 21 유닉스 계열 기준으로 데이터가 CPU에 의해 몇 번 복사되는지, 그리고 복사 도중 힙과 네이티브 메모리에 각각 최대 얼마가 잡히는지 단계별로 적어라. 같은 일을 <code>Files.copy</code>로 하면 무엇이 달라지는가.</li>
+<li>디렉터리 10,000개를 돌며 각각 <code>Files.lines(dir.resolve("data.txt")).count()</code>를 부르는 코드가 수천 번째 반복쯤에서 예외로 멈췄다. 어떤 자원이 고갈됐는지, 왜 GC가 이를 막아 주지 못하는지, 어떻게 고쳐야 하는지 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> <code>normalize()</code>는 <code>current/..</code>을 문자열로 지워 <code>readme.txt</code>를 만든다. 작업 디렉터리에는 <code>readme.txt</code>가 없으므로 <code>Files.exists(p.normalize())</code>는 <code>false</code>다. <code>Files.readString(p)</code>는 커널이 경로를 해석하므로 <code>current</code>를 따라 <code>docs/v2</code>로 들어간 뒤 <code>..</code>으로 <code>docs</code>에 올라가 <code>docs/readme.txt</code>를 읽는다. <code>p.toRealPath()</code>도 <code>{작업}/docs/readme.txt</code>를 돌려준다. 링크 뒤의 <code>..</code>은 링크가 있던 디렉터리가 아니라 링크가 가리키는 디렉터리의 부모로 간다는 것이 핵심이다.</p>
+<p><b>2.</b> <code>exists</code> 확인과 <code>writeString</code> 사이에 틈이 있는 TOCTOU 경쟁이다. 두 프로세스가 동시에 <code>exists</code>를 부르면 둘 다 <code>false</code>를 받고 둘 다 작업을 실행한다. 게다가 <code>writeString</code>은 기본 옵션이 <code>CREATE</code>와 <code>TRUNCATE_EXISTING</code>이라 파일이 있어도 실패하지 않는다. 고친 코드는 확인 없이 <code>Files.createFile(marker)</code>를 시도하고, 성공한 프로세스만 <code>runJob()</code>을 실행하며, <code>FileAlreadyExistsException</code>을 받은 프로세스는 건너뛴다. <code>createFile</code>은 <code>O_CREAT | O_EXCL</code>로 확인과 생성을 원자적으로 하므로 정확히 하나만 성공한다.</p>
+<p><b>3.</b> 서로 다른 파일 시스템 사이에서는 <code>rename</code>이 <code>EXDEV</code>로 실패하므로, <code>ATOMIC_MOVE</code>를 준 <code>Files.move</code>는 <code>AtomicMoveNotSupportedException</code>을 던진다. 설정 파일은 바뀌지 않고 임시 파일이 남는다(정리 코드가 없다면). <code>ATOMIC_MOVE</code>만 빼면 <code>target</code>이 이미 있으므로 OpenJDK 21은 <code>rename</code>을 시도하기도 전에 <code>FileAlreadyExistsException</code>을 던진다. 덮어쓰려면 <code>REPLACE_EXISTING</code>을 줘야 하고, 그러면 OpenJDK 21은 기존 <code>target</code>을 먼저 지운 뒤 <code>rename</code>이 <code>EXDEV</code>로 실패하면 대상에 복사하고 원본을 지운다. 동작은 성공하지만 그 사이 다른 프로세스는 <code>target</code>이 없거나 반쯤 쓰인 상태를 볼 수 있어 원자적 교체라는 목적이 깨진다. 해결은 임시 파일을 <code>target</code>과 같은 디렉터리에 만드는 것이다(<code>Files.createTempFile(target.toAbsolutePath().getParent(), ...)</code>).</p>
+<p><b>4.</b> 읽기: 힙에 500MB <code>byte[]</code>를 할당한다. <code>read</code>의 네이티브 구현이 요청 길이만큼 <code>malloc</code>(최대 500MB)하고, <code>read</code> 시스템 콜이 페이지 캐시에서 네이티브 버퍼로 복사(1번), <code>SetByteArrayRegion</code>이 네이티브 버퍼에서 힙 배열로 복사(2번)한 뒤 네이티브 버퍼를 해제한다. 쓰기: 다시 <code>malloc</code>(500MB), <code>GetByteArrayRegion</code>으로 힙에서 네이티브로 복사(3번), <code>write</code> 시스템 콜이 대상 페이지 캐시로 복사(4번). 최대치는 힙 500MB와 네이티브 500MB가 동시에 잡히는 순간이다(읽기 중과 쓰기 중 각각). 힙이 500MB보다 작으면 배열 할당에서 <code>OutOfMemoryError</code>가 난다. <code>Files.copy</code>는 힙 배열을 만들지 않는다. 리눅스는 <code>copy_file_range</code>로 커널 안에서 복사하고, macOS는 <code>fcopyfile</code>에 맡기며, 둘 다 안 되면 최소 16KB짜리 네이티브 임시 버퍼로 나눠 옮긴다.</p>
+<p><b>5.</b> <code>Files.lines</code>가 돌려준 스트림은 열린 파일을 붙들고 있고, <code>count()</code> 같은 종단 연산이 끝나도 스트림을 닫지 않으면 파일은 닫히지 않는다. 반복마다 파일 디스크립터가 하나씩 새다가 프로세스의 열린 파일 수 제한에 닿으면 <code>open</code>이 <code>EMFILE</code>로 실패하고, <code>Files</code>는 이를 <code>FileSystemException</code>으로 번역해 던진다. GC는 힙 메모리가 부족할 때 움직이는 것이지 디스크립터가 부족할 때 움직이지 않는다. 고칠 방법은 <code>try (Stream<String> s = Files.lines(path)) { n = s.count(); }</code>처럼 try-with-resources로 감싸는 것이다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>권한이 없는 디렉터리 안의 파일 경로에 대해 <code>Files.exists(p)</code>와 <code>Files.notExists(p)</code>가 둘 다 <code>false</code>를 돌려줬다. 올바른 해석은?</q>
+<o>파일이 없다. <code>notExists</code>의 버그다.</o>
+<o>파일이 있다. <code>exists</code>는 권한이 없으면 항상 <code>false</code>를 돌려준다.</o>
+<o>존재 여부를 판단할 수 없었다. 원인을 알려면 예외를 던지는 메서드(예: <code>Files.size</code>, <code>readAttributes</code>)를 불러 본다.</o>
+<o>파일이 심볼릭 링크다. 링크는 두 메서드 모두 <code>false</code>다.</o>
+<why>Javadoc은 <code>notExists</code>가 <code>exists</code>의 보수가 아니며 존재 여부를 판단할 수 없으면 둘 다 <code>false</code>를 돌려준다고 명시한다. 디렉터리 탐색 권한이 없으면 <code>stat</code>이 <code>EACCES</code>로 실패하므로 커널도 파일이 있는지 알려 주지 않는다. 버그가 아니라 세 번째 상태("모른다")이고, 링크는 기본적으로 따라가서 판단하므로 무조건 <code>false</code>가 되지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>link</code>가 <code>real/sub</code>를 가리키는 심볼릭 링크일 때, <code>Path.of("link/../data.txt")</code>에 대한 설명으로 옳은 것은?</q>
+<o><code>normalize()</code>와 <code>toRealPath()</code>는 항상 같은 파일을 가리킨다.</o>
+<o><code>normalize()</code>는 <code>data.txt</code>를 만들지만, 이 경로로 파일을 열면 커널은 <code>real/data.txt</code>를 연다.</o>
+<o><code>normalize()</code>는 파일 시스템에 접근해 링크를 푼 뒤 <code>..</code>을 처리한다.</o>
+<o><code>toRealPath()</code>는 파일이 없어도 경로 문자열을 계산해 돌려준다.</o>
+<why><code>normalize</code>는 파일 시스템에 접근하지 않는 문자열 계산이라 <code>link/..</code>을 지워 버린다. 커널은 앞에서부터 해석하므로 <code>link</code>를 따라 <code>real/sub</code>에 들어간 뒤 <code>..</code>으로 <code>real</code>에 간다. 그래서 두 결과가 다른 파일을 가리킬 수 있다. <code>toRealPath</code>는 존재하는 파일의 실제 경로만 돌려주고 없으면 <code>NoSuchFileException</code>을 던진다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>OpenJDK 21에서 <code>ATOMIC_MOVE</code> 없이 <code>Files.move(source, target)</code>를 불렀는데 <code>source</code>와 <code>target</code>이 서로 다른 파일 시스템에 있다. 무슨 일이 일어나는가?</q>
+<o><code>AtomicMoveNotSupportedException</code>이 난다.</o>
+<o><code>rename</code>이 커널 안에서 데이터를 옮겨 원자적으로 끝난다.</o>
+<o>하드 링크를 만든 뒤 원본 이름을 지운다.</o>
+<o><code>rename</code>이 <code>EXDEV</code>로 실패하면 대상에 복사한 다음 원본을 지운다. 이 과정은 원자적이지 않다.</o>
+<why>inode 번호는 파일 시스템 안에서만 뜻이 있으므로 다른 파일 시스템으로는 디렉터리 엔트리만 옮길 수 없고, <code>rename</code>은 <code>EXDEV</code>로 실패한다. 하드 링크도 같은 이유로 파일 시스템을 넘을 수 없다. <code>ATOMIC_MOVE</code>가 없으면 <code>Files.move</code>는 복사 후 삭제로 대신하고, <code>ATOMIC_MOVE</code>가 있을 때만 <code>AtomicMoveNotSupportedException</code>을 던진다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>최대 힙 64MB인 JVM에서 200MB 파일을 복사한다. 다음 중 <code>OutOfMemoryError</code>가 날 수 있는 방법은?</q>
+<o><code>FileInputStream.readAllBytes()</code>로 읽고 <code>FileOutputStream.write(byte[])</code>로 쓴다.</o>
+<o><code>FileInputStream.transferTo(FileOutputStream)</code></o>
+<o><code>Files.copy(Path, Path)</code></o>
+<o>8192바이트 배열로 <code>read</code>와 <code>write</code>를 반복한다.</o>
+<why><code>readAllBytes</code>는 남은 크기만큼의 배열을 힙에 한 번에 만들므로 200MB 배열을 64MB 힙에 할당하지 못한다. <code>transferTo</code>는 <code>FileChannel.transferTo</code>의 직접 전송이나 8MB 단위 매핑을 쓰고, <code>Files.copy</code>는 커널이나 네이티브 버퍼로 복사하므로 힙에 큰 배열이 생기지 않는다. 고정 버퍼 루프는 복사 횟수는 많지만 힙은 버퍼 크기만큼만 쓴다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>macOS(APFS)에서 <code>Files.copy(src, dst, COPY_ATTRIBUTES)</code>가 200MB 파일을 1ms 이하에 복사했다. 가장 정확한 설명은?</q>
+<o>원본이 페이지 캐시에 있어서 메모리 복사만 일어났기 때문이다.</o>
+<o>JIT 컴파일러가 복사 루프를 최적화했기 때문이다.</o>
+<o>OpenJDK의 macOS 구현이 <code>clonefile</code>로 원본과 데이터 블록을 공유하는 복제본을 만들어 데이터를 복사하지 않았기 때문이다.</o>
+<o><code>COPY_ATTRIBUTES</code>는 속성만 복사하고 내용은 나중에 복사하기 때문이다.</o>
+<why>OpenJDK 21의 <code>BsdFileSystem.copyFile</code>은 속성 복사를 요청받으면 먼저 <code>clonefile</code>을 시도한다. 복제본은 원본의 데이터 블록을 공유하고 이후 쓰기가 일어날 때 copy-on-write로 분리된다. 페이지 캐시에서 200MB를 메모리 복사하는 것도 이 측정에서 100ms 이상 걸렸으므로 1ms를 설명하지 못한다. <code>Files.copy</code>에는 JIT가 최적화할 자바 복사 루프가 없고, 내용은 복사본을 열면 바로 원본과 같다(<code>mismatch</code>가 -1).</why>
+</x-quiz>
+
+<x-glossary>
+<dt>inode(index node)</dt><dd>유닉스 계열 파일 시스템에서 파일의 실체를 나타내는 구조. 종류, 권한, 소유자, 크기, 시각, 링크 수, 데이터 위치를 담지만 이름은 담지 않는다.</dd>
+<dt>디렉터리 엔트리(directory entry)</dt><dd>디렉터리의 내용을 이루는 "이름 → inode 번호" 쌍. 경로 해석은 이 표를 한 단계씩 따라가는 과정이다.</dd>
+<dt>하드 링크(hard link)</dt><dd>같은 inode를 가리키는 또 하나의 디렉터리 엔트리. 같은 파일 시스템 안에서만 만들 수 있고, 링크 수가 0이 되고 열린 디스크립터가 없을 때 실체가 해제된다.</dd>
+<dt>심볼릭 링크(symbolic link)</dt><dd>다른 경로 문자열을 내용으로 가진 특수 파일. 경로 해석 중에 만나면 커널이 그 경로로 갈아탄다. 대상이 없어도 존재할 수 있다.</dd>
+<dt>파일 디스크립터(file descriptor)</dt><dd>프로세스가 연 파일(또는 소켓)을 가리키는 작은 정수. 열린 뒤에는 이름이 아니라 이 번호로 커널 안의 열린 파일 객체에 접근한다. 프로세스마다 개수 제한이 있다.</dd>
+<dt>TOCTOU(time-of-check to time-of-use)</dt><dd>상태를 확인한 시점과 그 결과를 사용하는 시점 사이에 상태가 바뀌어 생기는 경쟁 조건. 확인 대신 원자적 연산을 시도하고 실패를 처리해서 막는다.</dd>
+<dt>정규화(normalization)와 실제 경로(real path)</dt><dd><code>normalize</code>는 <code>.</code>과 <code>이름/..</code>을 문자열로 지우는 계산이고, <code>toRealPath</code>는 파일 시스템에 물어 심볼릭 링크를 모두 푼 절대 경로다.</dd>
+<dt>유니코드 정규화(NFC, NFD)</dt><dd>같은 글자를 완성형 코드 포인트 하나(NFC)로 쓸지, 분해된 문자 나열(NFD, 한글은 초성·중성·종성 자모)로 쓸지 정하는 형식. 화면에는 같아 보여도 문자열과 바이트가 다르다.</dd>
+<dt>스플리터레이터(spliterator)</dt><dd>스트림의 원천이 원소를 하나씩 내주고(<code>tryAdvance</code>) 자기 범위를 둘로 나누는(<code>trySplit</code>) 방법을 정의한 객체. 병렬 스트림의 효율은 이 분할이 얼마나 고르고 싼지에 달려 있다.</dd>
+<dt>copy-on-write 복제(clone)</dt><dd>복사본이 원본과 데이터 블록을 공유하다가 어느 한쪽에 쓰기가 일어날 때 그 부분만 새 블록으로 분리하는 방식. macOS의 <code>clonefile</code>, 리눅스 일부 파일 시스템의 리플링크가 이에 해당한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/io/File.html">Java SE 21 API: java.io.File</a> — <code>user.dir</code> 기준의 상대 경로 해석, <code>renameTo</code>의 플랫폼 의존성</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/Files.html">Java SE 21 API: java.nio.file.Files</a> — <code>createFile</code>의 원자성, <code>move</code>와 <code>ATOMIC_MOVE</code>, 읽기·쓰기 메서드의 규칙</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/Path.html">Java SE 21 API: java.nio.file.Path</a> — <code>normalize</code>와 심볼릭 링크, <code>toRealPath</code>, <code>resolve</code>의 규칙</li>
+<li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/rename.html">POSIX.1-2024: rename()</a> — 이름 바꾸기의 원자성과 <code>EXDEV</code></li>
+<li><a href="https://pubs.opengroup.org/onlinepubs/9799919799/functions/unlink.html">POSIX.1-2024: unlink()</a> — 링크 수가 0이 되어도 열린 파일의 내용 제거가 미뤄지는 규칙</li>
+<li><a href="https://man7.org/linux/man-pages/man2/copy_file_range.2.html">Linux man page: copy_file_range(2)</a> — 커널 내 파일 복사와 리플링크 같은 복사 가속</li>
+</x-refs>

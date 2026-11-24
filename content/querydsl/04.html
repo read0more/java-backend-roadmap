@@ -1,0 +1,943 @@
+<x-meta>
+deck: select 절에 놓은 식이 결과의 모양을 정하고, where 절에 놓은 식의 트리가 SQL의 모양을 정한다. 프로젝션이 DTO가 되는 경로, 동적 조건의 조립, 영속성 컨텍스트를 건너뛰는 벌크 연산, SQL 함수 호출을 Querydsl 5.1 + Hibernate 6.6 실험으로 추적한다.
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li>Querydsl의 DTO 프로젝션(bean, fields, constructor, @QueryProjection)이 모두 같은 JPQL을 만든다는 것을 근거로, DTO 객체를 실제로 만드는 주체가 누구이며 어느 시점에 리플렉션이 일어나는지 호출 스택으로 설명할 수 있다.</li>
+<li>DTO의 이름·타입·인자 순서가 어긋났을 때 오류가 컴파일 시점, 식을 만드는 시점, 결과를 변환하는 시점 중 언제 드러나는지, 혹은 오류 없이 값이 조용히 사라지는지 예측할 수 있다.</li>
+<li>BooleanBuilder와 where 다중 파라미터가 null 조건을 어떻게 건너뛰는지 Querydsl의 실제 코드 경로로 설명하고, 조건 메서드를 조합할 때 생기는 NullPointerException을 피하는 방법을 말할 수 있다.</li>
+<li>벌크 UPDATE·DELETE 뒤에 영속성 컨텍스트의 엔티티가 데이터베이스와 어긋나는 과정을 실행 순서대로 그리고, flush와 clear가 각각 무엇을 해결하는지 구분할 수 있다.</li>
+<li><code>function('replace', ...)</code> 같은 SQL 함수 호출이 JPQL, Hibernate의 함수 등록부, 데이터베이스를 거쳐 어떤 SQL이 되는지, 등록되지 않은 함수의 오류가 어디서 나는지 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: select와 where에 놓은 "식"은 어디로 가는가</h3>
+
+<p>앞 회차들에서 Querydsl 쿼리의 기본 문법을 보았다. Q 타입이라는 생성된 클래스의 필드(<code>book.title</code>)가 JPQL의 경로 표현식이 되고, <code>where</code>, <code>orderBy</code>, <code>join</code>을 메서드로 이어 붙이면 Querydsl이 그것을 JPQL 문자열로 직렬화해서 <code>EntityManager</code>에 넘긴다. 이번 회차는 그 위에서 두 가지 질문을 끝까지 따라간다.</p>
+
+<p>첫째, <b>select 절에 무엇을 놓느냐가 결과 객체의 모양을 정한다.</b> 엔티티 하나를 놓으면 엔티티가, 컬럼 하나를 놓으면 그 값이, 여러 개를 놓으면 <code>Tuple</code>이, <code>Projections.bean(...)</code>을 놓으면 DTO가 나온다. 그런데 데이터베이스가 돌려주는 것은 언제나 JDBC <code>ResultSet</code>의 행, 즉 값의 나열뿐이다. 그 행이 누구의 손을 거쳐 DTO가 되는지, 그 과정에서 리플렉션이 어떤 규칙으로 생성자와 setter와 필드를 고르는지, 규칙이 어긋나면 언제 어떤 오류가 나는지를 본다.</p>
+
+<p>둘째, <b>where 절에 놓은 조건 식의 트리가 SQL의 모양을 정한다.</b> 검색 화면처럼 조건이 있을 수도 없을 수도 있는 쿼리(동적 쿼리)에서 Querydsl은 null 조건을 건너뛰고 나머지를 <code>and</code>로 묶는다. 이 동작이 Querydsl 코드의 어디에서 일어나는지, 조건 조합마다 JPQL 문자열이 달라지는 것이 Hibernate의 쿼리 해석 캐시에 어떤 의미인지까지 내려간다. 이어서 select가 아닌 쿼리, 즉 UPDATE와 DELETE를 한 번에 실행하는 벌크 연산이 영속성 컨텍스트와 어떻게 어긋나는지, JPQL에 없는 SQL 함수를 어떻게 부르는지를 다룬다.</p>
+
+<p>공개된 커리큘럼에서 이 회차가 맡는 수업 주제는 프로젝션과 결과 반환(기본, DTO 조회, @QueryProjection), 동적 쿼리(BooleanBuilder 사용, where 다중 파라미터 사용), 수정·삭제 벌크 연산, SQL function 호출하기다. Q 타입이 애노테이션 프로세서로 생성되는 과정은 01회, 조인과 서브쿼리의 제약은 03회, 여기서 만든 동적 조건을 리포지토리와 페이징에 실제로 적용하는 일은 05회와 06회의 몫이다.</p>
+
+<p>이 회차의 실험은 모두 <b>Querydsl 5.1.0(jakarta 분류자) + Hibernate ORM 6.6.53.Final + H2 2.3.232 + JDK 21</b>에서 직접 실행했다. 스프링 없이 Hibernate의 <code>Configuration</code>으로 <code>EntityManagerFactory</code>를 만들고, 그 <code>EntityManager</code>로 <code>JPAQueryFactory</code>를 직접 생성했다. Querydsl이 만든 JPQL은 쿼리 객체의 <code>toString()</code>으로, Hibernate가 만든 SQL은 <code>hibernate.show_sql</code>로 찍었다. SQL의 별칭(<code>b1_0</code>)과 함수 렌더링은 데이터베이스 방언(dialect)에 따라 달라지므로 MySQL에서는 모양이 다를 수 있다. 내부 클래스 이름과 동작은 위 버전의 jar를 <code>javap</code>로 열어 확인한 것이며 다른 버전에서는 달라질 수 있다.</p>
+
+<h3>실험 준비: 책과 출판사</h3>
+
+<p>예제 도메인은 이 회차를 위해 새로 만든 것이다. 출판사(<code>Publisher</code>)와 책(<code>Book</code>) 두 엔티티이고, 책이 출판사를 다대일(<code>@ManyToOne</code>, 지연 로딩)로 참조한다. 이 회차의 쿼리는 대부분 <code>Book</code> 하나만 쓴다.</p>
+
+<pre><code class="language-java">@Entity
+public class Book {
+    @Id @GeneratedValue
+    private Long id;
+    private String title;
+    private String author;
+    private int price;
+    @ManyToOne(fetch = FetchType.LAZY)
+    private Publisher publisher;
+
+    protected Book() {}
+    public Book(String title, String author, int price, Publisher publisher) { /* 필드 대입 */ }
+    public void setPrice(int price) { this.price = price; }
+    // getter, toString() = "Book(title, author, price)" ...
+}
+
+@Entity
+public class Publisher {
+    @Id @GeneratedValue
+    private Long id;
+    private String name;
+    private String city;
+    // 생성자, getter ...
+}</code></pre>
+
+<p>데이터는 출판사 둘, 책 넷이다. 뒤의 실행 결과는 모두 이 표로 손으로 검산할 수 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>title</th><th>author</th><th>price</th><th>publisher</th></tr></thead><tbody>
+<tr><td>JPA Basics</td><td>kim</td><td>30000</td><td>North Press (Seoul)</td></tr>
+<tr><td>Spring Data</td><td>kim</td><td>25000</td><td>North Press (Seoul)</td></tr>
+<tr><td>Java Threads</td><td>lee</td><td>32000</td><td>River Books (Paju)</td></tr>
+<tr><td>SQL Tuning</td><td>park</td><td>28000</td><td>River Books (Paju)</td></tr>
+</tbody></table></div>
+
+<p>컨테이너 없이 띄운 실험의 뼈대는 다음과 같다. Hibernate 6의 <code>SessionFactory</code>는 <code>EntityManagerFactory</code>를 구현하므로 그대로 대입할 수 있다. <code>QBook</code>은 Querydsl 애노테이션 프로세서가 만든 Q 타입이고, 그 안의 정적 필드 <code>QBook.book</code>은 별칭이 <code>"book"</code>인 기본 인스턴스다. 그래서 아래 JPQL에는 <code>from Book book</code>이 찍힌다.</p>
+
+<pre><code class="language-java">import static exp.QBook.book;
+
+Configuration cfg = new Configuration()
+        .addAnnotatedClass(Book.class).addAnnotatedClass(Publisher.class)
+        .setProperty("hibernate.connection.url", "jdbc:h2:mem:t;DB_CLOSE_DELAY=-1")
+        .setProperty("hibernate.connection.username", "sa")
+        .setProperty("hibernate.hbm2ddl.auto", "create")
+        .setProperty("hibernate.show_sql", "true");
+EntityManagerFactory emf = cfg.buildSessionFactory();
+EntityManager em = emf.createEntityManager();
+JPAQueryFactory queryFactory = new JPAQueryFactory(em);
+
+em.getTransaction().begin();
+// 출판사 2개, 책 4개 persist ... 후
+em.flush();
+em.clear();</code></pre>
+
+<h3>프로젝션의 기본: 대상이 하나일 때와 여럿일 때</h3>
+
+<p>프로젝션(projection)은 select 절에 무엇을 가져올지 정하는 일이다. 관계 대수에서 릴레이션의 일부 속성만 뽑아내는 연산을 프로젝션이라고 부르는 데서 온 말이다. Querydsl에서는 <code>select(...)</code>에 넘기는 식이 프로젝션이고, 그 식의 타입이 곧 <code>fetch()</code>가 돌려주는 리스트의 원소 타입이다.</p>
+
+<h4>대상이 하나: 식의 타입이 그대로 결과 타입</h4>
+
+<p>책 제목만 가져와 보자. <code>book.title</code>은 <code>StringPath</code>이고, 이것은 <code>Expression<String></code>이다. 그래서 <code>select(book.title)</code>은 <code>JPAQuery<String></code>을 만들고, <code>fetch()</code>는 <code>List<String></code>을 돌려준다.</p>
+
+<pre><code class="language-java">JPAQuery<String> query = queryFactory.select(book.title).from(book);
+System.out.println("JPQL: " + query);
+List<String> titles = query.fetch();
+System.out.println(titles);</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">JPQL: select book.title
+from Book book
+Hibernate: select b1_0.title from Book b1_0
+[JPA Basics, Spring Data, Java Threads, SQL Tuning]</code></pre>
+
+<p>세 층이 한눈에 보인다. Querydsl이 만든 것은 JPQL <code>select book.title from Book book</code>이고, Hibernate가 그것을 해석해 SQL <code>select b1_0.title from Book b1_0</code>을 만들었다. 결과는 엔티티가 아니라 <code>String</code>이다. 영속성 컨텍스트는 이 쿼리에 관여하지 않는다. 식별자(id)를 가져오지 않았으니 엔티티를 만들 수도, 식별자로 1차 캐시를 찾아볼 수도 없다. order by 없이 조회했으므로 행의 순서는 보장되지 않는다. 이 실행에서는 H2가 삽입 순서대로 돌려주었을 뿐이다.</p>
+
+<h4>대상이 여럿: Tuple</h4>
+
+<p>제목과 가격을 함께 가져오면 결과 타입은 무엇이 되어야 할까. 자바에는 "<code>String</code> 하나와 <code>Integer</code> 하나의 쌍"을 나타내는 기본 타입이 없다. 순수 JPA의 <code>createQuery("select b.title, b.price from Book b")</code>는 행마다 <code>Object[]</code>를 돌려주고, 꺼내 쓰는 쪽이 인덱스와 형변환을 책임진다. Querydsl은 여기에 자기 타입인 <code>com.querydsl.core.Tuple</code>을 씌운다.</p>
+
+<pre><code class="language-java">List<Tuple> rows = queryFactory
+        .select(book.title, book.price)
+        .from(book)
+        .where(book.author.eq("kim"))
+        .fetch();
+
+for (Tuple row : rows) {
+    String title = row.get(book.title);     // 식을 열쇠로 꺼낸다
+    Integer price = row.get(book.price);
+    System.out.println(title + " / " + price + " / " + row.getClass().getName());
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select b1_0.title,b1_0.price from Book b1_0 where b1_0.author=?
+JPA Basics / 30000 / com.querydsl.core.types.QTuple$TupleImpl
+Spring Data / 25000 / com.querydsl.core.types.QTuple$TupleImpl</code></pre>
+
+<p><code>row.get(book.title)</code>의 반환 타입이 <code>String</code>이라는 점이 <code>Object[]</code>와의 차이다. <code>Tuple.get</code>의 시그니처는 <code><T> T get(Expression<T> expr)</code>이므로, 넘긴 식의 타입 매개변수가 그대로 반환 타입이 된다. 형변환은 컴파일러가 제네릭으로 대신 검사한다.</p>
+
+<p>그렇다면 <code>get</code>은 어떻게 몇 번째 값인지 알까. jar를 <code>javap</code>로 열어 보면 구조가 단순하다. select에 넘긴 식 목록으로 <code>QTuple</code>이라는 객체가 만들어지고, 이 객체는 식을 열쇠로, 위치를 값으로 하는 <code>Map<Expression<?>, Integer> bindings</code>를 갖는다. 행마다 만들어지는 <code>TupleImpl</code>은 값 배열 <code>Object[] a</code>만 들고 있고, <code>get(expr)</code>은 <code>bindings.get(expr)</code>로 위치를 찾은 다음 그 칸을 돌려준다. 따라서 열쇠가 되는 것은 식 객체의 <b>동일성</b>이 아니라 <b>동등성(<code>equals</code>)</b>이다. 실험으로 확인해 보자.</p>
+
+<pre><code class="language-java">Tuple first = rows.get(0);
+QBook sameAlias = new QBook("book");   // 별칭이 같은 다른 인스턴스
+QBook b2 = new QBook("b2");            // 별칭이 다른 인스턴스
+System.out.println(first.get(sameAlias.title));
+System.out.println(first.get(b2.title));
+System.out.println(first.get(book.author));   // select에 없던 식</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">JPA Basics
+null
+null</code></pre>
+
+<p>별칭이 같은 새 <code>QBook</code> 인스턴스로 꺼내도 값이 나온다. 경로 식은 "별칭 book의 속성 title"이라는 경로 정보로 비교되기 때문이다. 별칭이 다르면 다른 경로이므로 <code>null</code>이다. 주의할 점은 select에 없던 식으로 꺼내도 <b>예외가 아니라 null</b>이 나온다는 것이다. 오타 하나가 "값이 없는 행"처럼 보이는 버그가 될 수 있다.</p>
+
+<p><code>Tuple</code>을 어디까지 들고 다닐지는 설계 판단이다. <code>Tuple</code>은 <code>com.querydsl.core</code> 패키지의 타입이고, 꺼내려면 <code>QBook</code> 같은 Q 타입의 식이 필요하다. 서비스나 컨트롤러가 <code>Tuple</code>을 받으면 그 계층도 Querydsl과 Q 타입에 의존하게 되고, 나중에 조회 기술을 바꿀 때 영향이 리포지토리 밖으로 번진다. 그래서 <code>Tuple</code>은 리포지토리 안에서 꺼내 쓰고, 계층 밖으로는 DTO로 바꿔 내보내는 쪽이 의존 방향을 지키기 쉽다.</p>
+
+<h3>엔티티 조회와 DTO 조회는 메모리에서 무엇이 다른가</h3>
+
+<p>DTO 조회의 방법을 보기 전에, 왜 엔티티 대신 DTO로 조회하는지를 메모리 관점에서 정리해 두자. <code>selectFrom(book)</code>으로 엔티티를 조회하면 Hibernate는 행마다 다음 일을 한다.</p>
+
+<ol>
+<li>행의 식별자로 영속성 컨텍스트(1차 캐시)를 찾는다. 이미 있으면 그 인스턴스를 쓰고 행의 나머지 값은 버린다.</li>
+<li>없으면 엔티티 인스턴스를 만들고 모든 컬럼 값을 채운 뒤 영속성 컨텍스트에 등록한다.</li>
+<li>변경 감지(dirty checking)를 위해 로딩 시점의 속성 값 배열을 따로 보관한다. Hibernate 6.6의 <code>EntityEntry</code> 인터페이스에 있는 <code>getLoadedState()</code>가 돌려주는 <code>Object[]</code>가 그것이다. flush 시점에 현재 값과 이 배열을 비교해 UPDATE를 만든다.</li>
+</ol>
+
+<p>즉 엔티티 하나를 읽으면 엔티티 객체, 그 상태 사본, 영속성 컨텍스트의 맵 항목이 함께 힙에 남고, 이것들은 영속성 컨텍스트가 닫히거나 <code>clear()</code>될 때까지 가비지 컬렉션 대상이 되지 않는다. 화면에 제목과 가격만 보여 줄 목록이라면 이 비용은 쓸모가 없다. DTO 조회는 필요한 컬럼만 SELECT하고, 결과 객체를 영속성 컨텍스트에 등록하지 않는다. 그래서 변경 감지도 없고, 조회한 DTO의 값을 바꿔도 아무 SQL도 나가지 않는다. 읽기 전용 화면에 DTO 조회가 어울리는 이유가 이것이다. 반대로 조회한 뒤 상태를 바꾸어 저장해야 하는 경우에는 엔티티로 조회해야 변경 감지를 쓸 수 있다.</p>
+
+<h4>순수 JPA의 방법: JPQL의 new 연산자</h4>
+
+<p>JPA 명세에는 DTO 조회를 위한 문법이 이미 있다. select 절의 생성자 표현식(constructor expression)이다.</p>
+
+<pre><code class="language-java">List<BookDto> result = em.createQuery(
+        "select new exp.BookDto(b.title, b.price) from Book b where b.author = 'kim'",
+        BookDto.class)
+    .getResultList();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select b1_0.title,b1_0.price from Book b1_0 where b1_0.author='kim'
+[BookDto(JPA Basics, 30000), BookDto(Spring Data, 25000)]</code></pre>
+
+<p>Jakarta Persistence 3.1 명세 4.8.2절은 생성자 표현식에 쓰는 클래스가 엔티티이거나 데이터베이스에 매핑되어 있을 필요가 없고, 생성자 이름은 패키지까지 포함한 완전한 이름(fully qualified)이어야 한다고 정한다. 문자열 안에 <code>exp.BookDto</code>처럼 패키지를 적어야 하니, 패키지를 옮기거나 클래스 이름을 바꾸면 컴파일러는 아무것도 알려 주지 않고 쿼리가 실행되는 순간에야 실패한다. 참고로 이 실험의 Hibernate 6.6.53은 <code>new BookDto(...)</code>처럼 단순 이름만 적은 쿼리도 받아들였다. 하지만 명세가 요구하는 것은 완전한 이름이므로 이식성을 생각하면 패키지까지 적는다.</p>
+
+<p>이 DTO를 실제로 만드는 것은 누구일까. 실험에서 <code>BookDto</code> 생성자 안에 호출 스택을 찍는 한 줄을 넣고 실행했다(아래는 <code>exp</code>, <code>org.hibernate</code>, 리플렉션 프레임만 남긴 것이다).</p>
+
+<pre data-label="호출 스택 (JPQL new)"><code class="language-text">at exp.BookDto.<init>(BookDto.java:9)
+at java.base/jdk.internal.reflect.DirectConstructorHandleAccessor.newInstance(...)
+at java.base/java.lang.reflect.Constructor.newInstance(Constructor.java:486)
+at org.hibernate.sql.results.graph.instantiation.internal.DynamicInstantiationAssemblerConstructorImpl.assemble(...)
+at org.hibernate.sql.results.internal.StandardRowReader.readRow(StandardRowReader.java:150)
+at org.hibernate.sql.results.spi.ListResultsConsumer.read(...)
+...
+at org.hibernate.query.Query.getResultList(Query.java:120)</code></pre>
+
+<p>Hibernate의 행 읽기기(<code>StandardRowReader</code>)가 JDBC 행을 읽다가, 동적 인스턴스화(dynamic instantiation)를 담당하는 조립기가 <code>java.lang.reflect.Constructor.newInstance</code>로 생성자를 호출한다. JPQL의 <code>new</code>는 Hibernate가 해석하는 문법이고, 객체를 만드는 것도 Hibernate다. 이 사실을 기억해 두고 Querydsl의 방법과 비교해 보자.</p>
+
+<h3>Querydsl의 DTO 조회: bean, fields, constructor</h3>
+
+<p>Querydsl은 DTO 조회를 위해 <code>com.querydsl.core.types.Projections</code>라는 팩토리 클래스를 제공한다. Javadoc의 설명대로 이 클래스는 <code>FactoryExpression</code> 인스턴스를 만드는 팩토리이고, 대표적인 메서드는 세 가지다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>만드는 식</th><th>DTO에 값을 넣는 방법</th><th>DTO에 필요한 것</th></tr></thead><tbody>
+<tr><td><code>Projections.bean(T.class, ...)</code></td><td><code>QBean</code></td><td>기본 생성자로 만든 뒤 setter 호출</td><td>인자 없는 생성자, 속성 이름과 같은 setter</td></tr>
+<tr><td><code>Projections.fields(T.class, ...)</code></td><td><code>QBean</code>(필드 접근 모드)</td><td>기본 생성자로 만든 뒤 필드에 직접 대입</td><td>인자 없는 생성자, 속성 이름과 같은 필드</td></tr>
+<tr><td><code>Projections.constructor(T.class, ...)</code></td><td><code>ConstructorExpression</code></td><td>인자 타입이 맞는 생성자 호출</td><td>식의 타입·순서와 맞는 생성자</td></tr>
+</tbody></table></div>
+
+<p>실험용 DTO는 세 방식을 모두 받을 수 있게 만들었다.</p>
+
+<pre><code class="language-java">public class BookDto {
+    private String title;
+    private int price;
+
+    public BookDto() {}                        // bean, fields가 쓴다
+    public BookDto(String title, int price) {  // constructor가 쓴다
+        this.title = title;
+        this.price = price;
+    }
+    public String getTitle() { return title; }
+    public void setTitle(String title) { this.title = title; }
+    public int getPrice() { return price; }
+    public void setPrice(int price) { this.price = price; }
+    @Override public String toString() { return "BookDto(" + title + ", " + price + ")"; }
+}</code></pre>
+
+<pre><code class="language-java">List<BookDto> byBean = queryFactory
+        .select(Projections.bean(BookDto.class, book.title, book.price))
+        .from(book).where(book.author.eq("kim")).fetch();
+
+List<BookDto> byFields = queryFactory
+        .select(Projections.fields(BookDto.class, book.title, book.price))
+        .from(book).where(book.author.eq("kim")).fetch();
+
+List<BookDto> byConstructor = queryFactory
+        .select(Projections.constructor(BookDto.class, book.title, book.price))
+        .from(book).where(book.author.eq("kim")).fetch();</code></pre>
+
+<p>세 쿼리의 결과는 모두 <code>[BookDto(JPA Basics, 30000), BookDto(Spring Data, 25000)]</code>로 같다. 더 중요한 것은 세 쿼리가 만든 JPQL이다.</p>
+
+<pre data-label="세 쿼리 모두 같은 JPQL과 SQL"><code class="language-text">JPQL: select book.title, book.price
+from Book book
+where book.author = ?1
+Hibernate: select b1_0.title,b1_0.price from Book b1_0 where b1_0.author=?</code></pre>
+
+<p>JPQL에 <code>new</code>가 없다. Querydsl은 DTO 프로젝션을 JPQL의 생성자 표현식으로 옮기지 않는다. <code>FactoryExpression</code>을 직렬화할 때는 그 안의 인자 식들만 select 절에 나열한다. 데이터베이스와 Hibernate가 보기에 이것은 앞에서 본 <code>Tuple</code> 조회와 똑같은 "컬럼 두 개짜리 스칼라 조회"다. 그러면 DTO는 누가 만드는가. setter와 생성자에 호출 스택을 찍어 보았다.</p>
+
+<pre data-label="호출 스택 (Projections.bean → setTitle)"><code class="language-text">at exp.BookDto.setTitle(BookDto.java:14)
+at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(...)
+at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+at com.querydsl.core.types.QBean.newInstance(QBean.java:239)
+at com.querydsl.jpa.FactoryExpressionTransformer.transformTuple(FactoryExpressionTransformer.java:51)
+at org.hibernate.sql.results.internal.RowTransformerTupleTransformerAdapter.transformRow(...)
+at org.hibernate.sql.results.internal.StandardRowReader.readRow(StandardRowReader.java:160)
+...
+at org.hibernate.query.Query.getResultList(Query.java:120)
+at com.querydsl.jpa.impl.AbstractJPAQuery.getResultList(AbstractJPAQuery.java:191)
+at com.querydsl.jpa.impl.AbstractJPAQuery.fetch(AbstractJPAQuery.java:243)</code></pre>
+
+<pre data-label="호출 스택 (Projections.constructor → 생성자)"><code class="language-text">at exp.BookDto.<init>(BookDto.java:9)
+at java.base/java.lang.reflect.Constructor.newInstance(Constructor.java:486)
+at com.querydsl.core.types.ConstructorExpression.newInstance(ConstructorExpression.java:144)
+at com.querydsl.jpa.FactoryExpressionTransformer.transformTuple(FactoryExpressionTransformer.java:51)
+at org.hibernate.sql.results.internal.RowTransformerTupleTransformerAdapter.transformRow(...)
+at org.hibernate.sql.results.internal.StandardRowReader.readRow(StandardRowReader.java:160)
+...</code></pre>
+
+<p>스택을 아래에서 위로 읽으면 경로가 보인다. Querydsl의 <code>fetch()</code>가 JPA의 <code>getResultList()</code>를 부르고, Hibernate가 JDBC 행을 읽어 값 배열을 만든 다음, 그 배열을 <b>Querydsl이 끼워 넣은 변환기</b> <code>FactoryExpressionTransformer</code>에 넘긴다. 변환기는 <code>QBean.newInstance</code>나 <code>ConstructorExpression.newInstance</code>를 부르고, 거기서 리플렉션(<code>Method.invoke</code>, <code>Constructor.newInstance</code>)으로 DTO가 만들어진다. JPQL <code>new</code>와 비교하면 SQL은 같지만, 객체를 만드는 주체가 Hibernate의 동적 인스턴스화가 아니라 Querydsl의 <code>FactoryExpression</code>이다.</p>
+
+<h4>변환기는 언제 끼워지는가</h4>
+
+<p><code>AbstractJPAQuery.createQuery</code>의 바이트코드를 보면 순서가 이렇다. JPQL 문자열로 <code>EntityManager.createQuery</code>를 호출해 JPA <code>Query</code>를 만들고 파라미터를 바인딩한 뒤, 프로젝션이 <code>FactoryExpression</code>이면 <code>QueryHandler.transform(query, projection)</code>을 호출한다. Hibernate를 쓸 때 쓰이는 <code>HibernateHandler</code>의 <code>transform</code>은 JPA <code>Query</code>를 <code>org.hibernate.query.Query</code>로 <code>unwrap</code>한 다음 <code>setResultTransformer(new FactoryExpressionTransformer(projection))</code>을 부르고 <code>true</code>를 돌려준다. Hibernate 6.6에서 <code>setResultTransformer</code>는 deprecated 상태의 default 메서드로 남아 있고, 내부적으로 행 단위 변환기(<code>TupleTransformer</code>)를 설정한다. 스택에 보인 <code>RowTransformerTupleTransformerAdapter</code>가 그 어댑터다.</p>
+
+<p><code>transform</code>이 <code>false</code>를 돌려주는 경우, 예컨대 <code>unwrap</code>이 실패해 <code>PersistenceException</code>이 난 경우에는 Querydsl이 프로젝션을 필드에 기억해 두었다가 <code>getResultList()</code>가 끝난 뒤 결과 리스트를 한 바퀴 돌며 행마다 <code>projection.newInstance(Object[])</code>를 직접 호출한다. 어느 경로든 DTO를 만드는 코드는 <code>FactoryExpression.newInstance</code> 하나다. 단지 Hibernate의 행 읽기 루프 안에서 불리느냐, 그 루프가 끝난 뒤 Querydsl의 루프에서 불리느냐가 다르다.</p>
+
+<figure class="flow-figure"><figcaption>DTO 프로젝션 한 행이 객체가 되기까지 (Hibernate 6.6 + Querydsl 5.1)</figcaption><ol class="flow">
+<li><strong>직렬화</strong><span>Querydsl이 Projections.bean의 인자만 꺼내 "select book.title, book.price"로 직렬화한다. new는 없다.</span></li>
+<li><strong>변환기 등록</strong><span>HibernateHandler가 Hibernate Query에 FactoryExpressionTransformer를 행 변환기로 설정한다.</span></li>
+<li><strong>SQL 실행</strong><span>Hibernate가 SQL을 실행하고 StandardRowReader가 JDBC 행에서 값 배열 [title, price]를 만든다.</span></li>
+<li><strong>행 변환</strong><span>변환기가 FactoryExpression.newInstance(배열)를 호출한다.</span></li>
+<li><strong>리플렉션</strong><span>QBean은 기본 생성자 + setter/필드, ConstructorExpression은 Constructor.newInstance로 DTO를 만든다.</span></li>
+<li><strong>결과 리스트</strong><span>DTO는 영속성 컨텍스트에 등록되지 않은 평범한 객체로 리스트에 담긴다.</span></li>
+</ol></figure>
+
+<x-visual id="querydsl-04-projection-pipeline" title="DTO 프로젝션 한 행이 객체가 되는 경로" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>JPQL에는 new가 없고, Hibernate의 행 읽기 루프 안에서 Querydsl의 변환기가 리플렉션으로 DTO를 만든다는 것을 보여 준다.</x-hint>
+<x-prompt>가로로 긴 시퀀스 다이어그램. 왼쪽부터 세로 생명선 5개: "Querydsl JPAQuery", "Hibernate Query", "JDBC ResultSet", "FactoryExpressionTransformer", "BookDto". 위에서 아래로 화살표: (1) "Querydsl JPAQuery"에서 "Hibernate Query"로 "select book.title, book.price" 라벨. (2) "Querydsl JPAQuery"에서 "Hibernate Query"로 "변환기 등록" 라벨. (3) "Hibernate Query"에서 "JDBC ResultSet"으로 "SQL 실행". (4) "JDBC ResultSet"에서 "Hibernate Query"로 돌아오는 점선 화살표 "행: [JPA Basics, 30000]". (5) "Hibernate Query"에서 "FactoryExpressionTransformer"로 "newInstance(배열)". (6) "FactoryExpressionTransformer"에서 "BookDto"로 "리플렉션: 생성자 / setter". 4~6번 화살표를 감싸는 사각 틀에 "행마다 반복" 라벨. 오른쪽 아래에 작은 메모 상자 "영속성 컨텍스트에 등록되지 않음".</x-prompt>
+<x-caption>Querydsl의 DTO 프로젝션은 JPQL에서 평범한 스칼라 조회이고, 객체 생성은 Hibernate가 부르는 Querydsl 변환기 안에서 일어난다.</x-caption>
+</x-visual>
+
+<h4>bean과 fields: 이름으로 짝을 짓는다</h4>
+
+<p><code>QBean</code>은 select에 넘긴 식마다 "속성 이름"을 정한다. 식이 경로(<code>book.title</code>)면 경로의 마지막 이름(<code>title</code>)이 속성 이름이고, 별칭을 붙인 식(<code>book.title.as("name")</code>)이면 별칭이 속성 이름이다. 그리고 DTO 클래스에서 그 이름의 setter(bean 모드) 또는 필드(fields 모드)를 찾는다. 결과 행이 오면 <code>newInstance</code>가 먼저 DTO의 인자 없는 생성자로 빈 객체를 만들고, 값을 하나씩 setter나 필드로 넣는다.</p>
+
+<p>fields 모드는 <code>java.lang.reflect.Field</code>에 <code>setAccessible(true)</code>를 걸고 <code>Field.set</code>으로 값을 넣는다. 그래서 <code>private</code> 필드여도 되고 setter가 없어도 된다. 접근 제한자를 리플렉션으로 넘는 이 일은 자바 모듈 시스템이 허용하는 범위에서만 가능하다. 일반적인 애플리케이션처럼 DTO가 이름 없는 모듈(클래스패스)에 있으면 문제가 없다.</p>
+
+<h4>constructor: 타입과 순서로 짝을 짓는다</h4>
+
+<p><code>ConstructorExpression</code>은 이름을 보지 않는다. 인자 식들의 타입 배열을 만들고(<code>book.title</code>은 <code>String</code>, <code>book.price</code>는 <code>Integer</code>), Querydsl의 <code>ConstructorUtils.getConstructor</code>로 그 타입 배열을 받을 수 있는 생성자를 찾는다. <code>book.price</code>의 타입은 <code>NumberPath<Integer></code>라 <code>Integer</code>인데, <code>BookDto(String, int)</code>가 선택된 것을 보면 원시 타입과 래퍼 타입의 대응을 고려해 찾는다는 것을 알 수 있다. 생성자는 식을 만드는 시점에 한 번 찾아 두고, 행마다 <code>Constructor.newInstance</code>만 호출한다.</p>
+
+<p>그래서 DTO의 필드 이름이 엔티티와 달라도 constructor 방식은 상관없다. 대신 <b>순서와 타입</b>이 맞아야 한다. 이름으로 짝을 짓는 bean·fields와 타입·순서로 짝을 짓는 constructor는 실수했을 때의 증상도 완전히 다르다. 다음 절에서 하나씩 일부러 틀려 본다.</p>
+
+<h3>이름과 타입이 어긋날 때: 언제, 어떤 오류가 나는가</h3>
+
+<p>오류는 일찍 드러날수록 싸다. 컴파일 오류는 코드를 쓰는 순간, 식을 만드는 시점의 예외는 그 코드가 처음 실행되는 순간, 결과 변환 시점의 예외는 SQL까지 실행한 뒤에 드러난다. 가장 나쁜 것은 오류 없이 값이 조용히 사라지는 경우다. 이 회차의 실험 결과를 이 기준으로 정리하면 다음과 같다.</p>
+
+<h4>이름이 다르면 bean·fields는 조용히 건너뛴다</h4>
+
+<p>엔티티의 <code>title</code>을 DTO의 <code>name</code> 필드에 담고 싶다고 하자.</p>
+
+<pre><code class="language-java">public class UserView {
+    private String name;   // 엔티티의 title과 이름이 다르다
+    private int price;
+    // getter, toString() ...
+}
+
+queryFactory.select(Projections.fields(UserView.class, book.title, book.price))
+        .from(book).where(book.author.eq("kim")).fetch();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">[UserView(null, 30000), UserView(null, 25000)]</code></pre>
+
+<p>예외가 없다. <code>title</code>이라는 이름의 필드를 찾지 못하자 <code>QBean</code>은 그 값을 버렸다. <code>javap</code>로 보면 <code>QBean</code>에는 <code>propertyNotFound(Expression, String)</code>라는 protected 메서드가 있고, 기본 구현은 아무것도 하지 않는다. setter 모드(<code>Projections.bean</code>)도 같은 메서드를 거치므로, 이름에 맞는 setter가 없는 속성은 역시 예외 없이 건너뛰었다. 해결책은 별칭이다.</p>
+
+<pre><code class="language-java">queryFactory.select(Projections.fields(UserView.class, book.title.as("name"), book.price))
+        .from(book).where(book.author.eq("kim")).fetch();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">JPQL: select book.title as name, book.price
+from Book book
+where book.author = ?1
+Hibernate: select b1_0.title,b1_0.price from Book b1_0 where b1_0.author=?
+[UserView(JPA Basics, 30000), UserView(Spring Data, 25000)]</code></pre>
+
+<p>JPQL에는 <code>as name</code>이 붙었지만 SQL에는 별칭이 없다. 별칭은 데이터베이스가 아니라 <code>QBean</code>이 속성 이름을 정하는 데만 쓰였다는 뜻이다. 경로가 아닌 식, 예컨대 서브쿼리에는 경로 이름이 없으니 별칭을 반드시 붙여야 한다. 이때는 <code>ExpressionUtils.as(식, "별칭")</code>을 쓴다.</p>
+
+<pre><code class="language-java">QBook sub = new QBook("sub");
+queryFactory
+        .select(Projections.fields(UserView.class,
+                book.title.as("name"),
+                ExpressionUtils.as(
+                        JPAExpressions.select(sub.price.max()).from(sub), "price")))
+        .from(book).where(book.author.eq("kim")).fetch();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">JPQL: select book.title as name, (select max(sub.price)
+from Book sub) as price
+from Book book
+where book.author = ?1
+Hibernate: select b1_0.title,(select max(b2_0.price) from Book b2_0) from Book b1_0 where b1_0.author=?
+[UserView(JPA Basics, 32000), UserView(Spring Data, 32000)]</code></pre>
+
+<p>서브쿼리 별칭으로 <code>sub</code>라는 새 Q 타입 인스턴스를 만든 이유는 바깥 쿼리의 <code>book</code>과 다른 별칭이 필요해서다. 덧붙이면 Jakarta Persistence 3.1 명세 4.6.16절은 서브쿼리를 WHERE 절과 HAVING 절에서 쓸 수 있다고 정하고, 각주에서 이 버전에서는 서브쿼리가 그 두 절로 제한된다고 밝힌다. select 절 서브쿼리는 Hibernate가 HQL 확장으로 지원하는 것이고, 서브쿼리의 제약은 03회에서 자세히 다룬다.</p>
+
+<h4>타입이 다르면 식을 만드는 순간 실패한다</h4>
+
+<pre><code class="language-java">Projections.fields(BookDto.class, book.title, book.author.as("price"));
+// author(String)를 int 필드 price에 담으려 한다</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">java.lang.IllegalArgumentException: java.lang.String is not compatible with int</code></pre>
+
+<p>이 예외는 쿼리를 실행하기 전, <code>Projections.fields</code>를 호출하는 순간에 났다. <code>QBean</code>은 생성될 때 속성마다 필드(또는 setter)를 찾고 식의 타입이 대입 가능한지 검사한다. 이름이 없으면 넘어가지만, 이름이 있는데 타입이 맞지 않으면 예외를 던진다. setter 모드(<code>Projections.bean</code>)로 같은 실수를 해도 같은 메시지가 났다.</p>
+
+<h4>constructor는 인자 순서가 틀리면 식을 만드는 순간 실패한다</h4>
+
+<pre><code class="language-java">Projections.constructor(BookDto.class, book.price, book.title);          // 순서가 뒤바뀜
+Projections.constructor(BookDto.class, book.title, book.price, book.author); // 인자 하나 더</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">com.querydsl.core.types.ExpressionException: No constructor found for class exp.BookDto with parameters: [class java.lang.Integer, class java.lang.String]
+com.querydsl.core.types.ExpressionException: No constructor found for class exp.BookDto with parameters: [class java.lang.String, class java.lang.Integer, class java.lang.String]</code></pre>
+
+<p>두 경우 모두 <code>Projections.constructor</code>를 호출하는 줄에서 예외가 났다. 생성자를 식 생성 시점에 미리 찾기 때문이다. 컴파일 오류가 아니라 런타임 예외라는 점이 중요하다. 이 코드가 드물게 실행되는 분기 안에 있다면, 테스트가 그 분기를 지나가기 전까지는 아무도 모른다. 반대로 생성자 인자 두 개가 둘 다 <code>String</code>인데 순서만 바뀐 경우라면 타입 배열이 일치하므로 예외조차 나지 않고 제목과 저자가 뒤바뀐 DTO가 만들어진다. 타입으로 짝을 짓는 방식의 근본적인 한계다.</p>
+
+<h4>NULL은 원시 타입에서 0이 된다</h4>
+
+<p>데이터베이스의 NULL은 자바의 <code>null</code>로 오는데, DTO 필드가 <code>int</code>라면 어떻게 될까. 조건에 맞는 행이 없어 <code>max</code>가 NULL을 돌려주는 서브쿼리를 가격 자리에 넣고 네 방식을 모두 돌려 보았다.</p>
+
+<pre><code class="language-java">Expression<Integer> nullPrice = ExpressionUtils.as(
+        JPAExpressions.select(sub.price.max()).from(sub).where(sub.author.eq("nobody")),
+        "price");</code></pre>
+
+<div class="table-wrap"><table><thead><tr><th>방식</th><th>결과</th><th>이유(javap로 확인)</th></tr></thead><tbody>
+<tr><td><code>Projections.fields</code></td><td><code>BookDto(JPA Basics, 0)</code></td><td><code>QBean.newInstance</code>는 값이 null이면 대입을 건너뛴다. 필드는 기본값 0으로 남는다.</td></tr>
+<tr><td><code>Projections.bean</code></td><td><code>BookDto(JPA Basics, 0)</code></td><td>같은 이유로 setter를 부르지 않는다.</td></tr>
+<tr><td><code>Projections.constructor</code></td><td><code>BookDto(JPA Basics, 0)</code></td><td><code>ConstructorExpression</code>이 생성자 호출 전에 인자 변환기 목록을 거치고, 그중 원시 타입용 변환기가 null을 기본값으로 바꾼다.</td></tr>
+<tr><td><code>@QueryProjection</code></td><td><code>BookQDto(JPA Basics, 0)</code></td><td>생성된 Q 타입이 <code>ConstructorExpression</code>을 상속하므로 같다.</td></tr>
+</tbody></table></div>
+
+<p>어느 방식도 예외를 내지 않았다. "가격 정보 없음"과 "가격 0원"이 구분되지 않는다는 뜻이다. 외부 조인이나 집계처럼 NULL이 올 수 있는 컬럼을 담는 DTO 필드는 <code>Integer</code> 같은 래퍼 타입으로 선언해야 NULL이 NULL로 남는다. 이것은 Querydsl만의 문제가 아니라 원시 타입이 "값 없음"을 표현할 수 없다는 자바 타입 시스템의 성질에서 온다.</p>
+
+<h4>record는 constructor로만 담을 수 있다</h4>
+
+<p>자바 16부터 정식 기능이 된 record는 DTO로 쓰기 좋다. 하지만 Querydsl의 방식과는 궁합이 갈린다.</p>
+
+<pre><code class="language-java">public record BookRecord(String title, int price) {}
+
+queryFactory.select(Projections.constructor(BookRecord.class, book.title, book.price))...  // 성공
+queryFactory.select(Projections.fields(BookRecord.class, book.title, book.price))...       // 실패
+queryFactory.select(Projections.bean(BookRecord.class, book.title, book.price))...         // 실패</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">[BookRecord[title=JPA Basics, price=30000], BookRecord[title=Spring Data, price=25000]]
+
+Hibernate: select b1_0.title,b1_0.price from Book b1_0 where b1_0.author=?
+com.querydsl.core.types.ExpressionException: exp.BookRecord
+  원인: java.lang.InstantiationException: exp.BookRecord
+  원인: java.lang.NoSuchMethodException: exp.BookRecord.<init>()</code></pre>
+
+<p>fields와 bean은 먼저 인자 없는 생성자로 빈 객체를 만들어야 하는데 record에는 그런 생성자가 없다. 눈여겨볼 것은 시점이다. SQL이 실행된 뒤, 첫 행을 변환하는 순간에 실패했다. 그렇다면 record에 인자 없는 생성자를 하나 추가하면 어떨까. record의 다른 생성자는 표준 생성자(canonical constructor)에 위임해야 하므로 <code>public BookRecord2() { this(null, 0); }</code>처럼 쓸 수 있다.</p>
+
+<pre data-label="실행 결과 (인자 없는 생성자를 추가한 record + fields)"><code class="language-text">com.querydsl.core.types.ExpressionException: Can not set final java.lang.String field exp.BookRecord2.title to java.lang.String
+  원인: java.lang.IllegalAccessException: Can not set final java.lang.String field exp.BookRecord2.title to java.lang.String</code></pre>
+
+<p>이번에는 <code>Field.set</code>이 거부했다. JDK 21의 <code>Field.set</code> Javadoc은 final 필드에 쓰기 접근이 허용되는 조건으로 <code>setAccessible(true)</code>가 성공했을 것, 필드가 static이 아닐 것, 선언 클래스가 숨은 클래스(hidden class)가 아닐 것, 그리고 <b>선언 클래스가 record가 아닐 것</b>을 나열한다. 일반 클래스의 final 인스턴스 필드는 <code>setAccessible(true)</code> 후 리플렉션으로 바꿀 수 있지만, record의 필드는 리플렉션으로도 바꿀 수 없도록 플랫폼이 막아 둔 것이다. record의 값은 표준 생성자를 통해서만 들어간다. 그래서 record DTO에는 constructor 방식이나 다음 절의 <code>@QueryProjection</code>을 쓴다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>실수</th><th>bean / fields</th><th>constructor</th><th>@QueryProjection</th></tr></thead><tbody>
+<tr><td>속성 이름 불일치</td><td>조용히 무시(값이 빠짐)</td><td>이름을 보지 않음</td><td>이름을 보지 않음</td></tr>
+<tr><td>타입 불일치</td><td>식 생성 시 IllegalArgumentException</td><td>식 생성 시 ExpressionException</td><td>컴파일 오류</td></tr>
+<tr><td>인자 순서·개수 오류</td><td>해당 없음</td><td>식 생성 시 ExpressionException(같은 타입끼리 바뀌면 무증상)</td><td>컴파일 오류(같은 타입끼리 바뀌면 무증상)</td></tr>
+<tr><td>NULL → 원시 타입</td><td>기본값(0)</td><td>기본값(0)</td><td>기본값(0)</td></tr>
+<tr><td>인자 없는 생성자 없음(record 등)</td><td>첫 행 변환 시 ExpressionException</td><td>문제없음</td><td>문제없음</td></tr>
+</tbody></table></div>
+
+<h3>@QueryProjection: 생성자 검사를 컴파일러에게 맡기기</h3>
+
+<p>constructor 방식의 약점은 생성자 탐색이 런타임에 일어난다는 것이었다. <code>@QueryProjection</code>은 이 탐색을 컴파일 시점으로 옮긴다. DTO 생성자에 애노테이션을 붙이면, Q 타입을 만드는 바로 그 애노테이션 프로세서가 DTO용 Q 타입도 생성한다.</p>
+
+<pre><code class="language-java">import com.querydsl.core.annotations.QueryProjection;
+
+public class BookQDto {
+    private final String title;
+    private final int price;
+
+    @QueryProjection
+    public BookQDto(String title, int price) {
+        this.title = title;
+        this.price = price;
+    }
+    // toString() ...
+}</code></pre>
+
+<p>Gradle이나 Maven 없이 <code>javac</code>에 Querydsl의 JPA 애노테이션 프로세서를 직접 걸어 보았다. <code>-proc:only</code>는 컴파일 없이 애노테이션 처리만 하라는 옵션이고, <code>-s gen</code>은 생성된 소스를 둘 디렉터리다.</p>
+
+<pre><code class="language-bash">javac -proc:only \
+  -processorpath "querydsl-apt-5.1.0-jakarta.jar:querydsl-codegen-5.1.0.jar:..." \
+  -processor com.querydsl.apt.jpa.JPAAnnotationProcessor \
+  -cp "..." -s gen src/exp/*.java
+# gen/exp/QBook.java, gen/exp/QPublisher.java, gen/exp/QBookQDto.java 가 생긴다</code></pre>
+
+<p>엔티티가 아닌 <code>BookQDto</code>에 대해서도 <code>QBookQDto</code>가 생겼다. 생성된 코드는 짧다.</p>
+
+<pre data-label="gen/exp/QBookQDto.java (생성된 코드 그대로)"><code class="language-java">@Generated("com.querydsl.codegen.DefaultProjectionSerializer")
+public class QBookQDto extends ConstructorExpression<BookQDto> {
+
+    private static final long serialVersionUID = -737387768L;
+
+    public QBookQDto(com.querydsl.core.types.Expression<String> title, com.querydsl.core.types.Expression<Integer> price) {
+        super(BookQDto.class, new Class<?>[]{String.class, int.class}, title, price);
+    }
+
+}</code></pre>
+
+<p>두 가지가 눈에 띈다. 첫째, <code>QBookQDto</code>는 앞에서 본 <code>ConstructorExpression</code>을 상속한다. 런타임 동작은 <code>Projections.constructor</code>와 같다는 뜻이다. 실제로 JPQL도 <code>select book.title, book.price</code>로 똑같이 나왔고, NULL 처리도 같았다. 둘째, 생성자의 매개변수가 <code>Expression<String></code>, <code>Expression<Integer></code>로 타입이 붙어 있고, 상위 생성자에 넘기는 타입 배열은 DTO 생성자의 실제 매개변수 타입(<code>int.class</code>)이다. 애노테이션 프로세서는 컴파일 중에 DTO 생성자의 시그니처를 읽을 수 있으므로, 런타임에 생성자를 탐색할 필요 없이 정확한 타입을 코드에 박아 넣는다.</p>
+
+<p>이제 인자 순서를 틀리면 자바 컴파일러가 잡는다.</p>
+
+<pre><code class="language-java">QBookQDto wrong = new QBookQDto(book.price, book.title);</code></pre>
+
+<pre data-label="javac 출력"><code class="language-text">src2/exp/Bad.java:6: error: incompatible types: NumberPath<Integer> cannot be converted to Expression<String>
+    QBookQDto wrong = new QBookQDto(book.price, book.title);
+                                        ^</code></pre>
+
+<p>앞 절의 표에서 <code>@QueryProjection</code> 열만 "컴파일 오류"였던 이유가 이것이다. 제네릭 타입 검사는 컴파일러가 하는 일이고, <code>@QueryProjection</code>은 DTO 생성자의 시그니처를 제네릭 시그니처로 옮겨 적어 그 검사를 받게 만든다. 다만 같은 타입의 인자끼리 순서가 바뀌는 실수(<code>String</code> 두 개)는 여전히 컴파일러도 구분할 수 없다.</p>
+
+<h4>대가: DTO가 Querydsl을 안다</h4>
+
+<p>이 안전성에는 비용이 있다. <code>BookQDto</code>는 <code>com.querydsl.core.annotations.QueryProjection</code>을 import하므로 DTO가 Querydsl 라이브러리에 컴파일 의존성을 갖는다. DTO는 보통 리포지토리에서 서비스, 컨트롤러, 때로는 API 응답까지 여러 계층을 오간다. 그 모든 계층이 Querydsl jar를 클래스패스에 두어야 하고, 나중에 조회 기술을 바꾸면 DTO도 고쳐야 한다. 또 DTO 생성자를 바꿀 때마다 애노테이션 프로세서가 다시 돌아 Q 타입이 재생성되어야 한다(빌드 도구가 보통 컴파일 단계에서 자동으로 한다).</p>
+
+<p>정리하면 선택지는 "어디서 실수를 잡을 것인가"와 "의존성을 어디까지 허용할 것인가"의 교환이다. DTO를 순수한 자바 객체로 두고 싶다면 constructor 방식(혹은 record + constructor)에 테스트로 실행 경로를 확인하는 방법이 있고, 조회 전용 DTO를 리포지토리 계층 안에 가둘 수 있다면 <code>@QueryProjection</code>의 컴파일 시점 검사를 누리는 방법이 있다. 어느 쪽이든 JPQL과 SQL은 같다는 사실을 알고 고르면 된다.</p>
+
+<h3>동적 쿼리 1: BooleanBuilder</h3>
+
+<p>검색 화면을 생각해 보자. 저자 입력란과 최소 가격 입력란이 있고, 사용자는 둘 다 채울 수도, 하나만 채울 수도, 아무것도 채우지 않을 수도 있다. 조건 두 개면 조합은 네 가지, 조건 n개면 2의 n제곱 가지다. JPQL을 문자열로 이어 붙이는 방식에서는 "첫 조건 앞에는 where, 그다음부터는 and"를 직접 관리해야 하고, 공백 하나만 빠져도 실행 시점에 문법 오류가 난다. Querydsl은 조건을 문자열이 아니라 객체로 다루므로 이 문제를 객체 조립으로 바꾼다. 첫 번째 도구가 <code>BooleanBuilder</code>다.</p>
+
+<pre><code class="language-java">static BooleanBuilder searchCondition(String author, Integer minPrice) {
+    BooleanBuilder builder = new BooleanBuilder();
+    if (author != null) {
+        builder.and(book.author.eq(author));
+    }
+    if (minPrice != null) {
+        builder.and(book.price.goe(minPrice));
+    }
+    return builder;
+}
+
+List<Book> result = queryFactory
+        .selectFrom(book)
+        .where(searchCondition(author, minPrice))
+        .fetch();</code></pre>
+
+<p>네 가지 조합을 모두 실행했다. <code>getValue()</code>는 빌더가 지금까지 조립한 조건 식을 돌려주는 메서드다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">(kim, 26000)  getValue()=book.author = kim && book.price >= 26000
+  JPQL: select book from Book book where book.author = ?1 and book.price >= ?2
+  [Book(JPA Basics, kim, 30000)]
+(kim, null)   getValue()=book.author = kim
+  JPQL: select book from Book book where book.author = ?1
+  [Book(JPA Basics, kim, 30000), Book(Spring Data, kim, 25000)]
+(null, 29000) getValue()=book.price >= 29000
+  JPQL: select book from Book book where book.price >= ?1
+  [Book(JPA Basics, kim, 30000), Book(Java Threads, lee, 32000)]
+(null, null)  getValue()=null  hasValue=false
+  JPQL: select book from Book book
+  [Book(JPA Basics, kim, 30000), Book(Spring Data, kim, 25000), Book(Java Threads, lee, 32000), Book(SQL Tuning, park, 28000)]</code></pre>
+
+<p>세 가지를 읽을 수 있다. 첫째, 들어온 조건만 <code>and</code>로 묶였고 where와 and의 배치는 Querydsl이 알아서 했다. 둘째, 조건이 하나도 없을 때 빌더의 값은 <code>null</code>이고, 그 빌더를 <code>where</code>에 넘겼더니 where 절 자체가 사라졌다. 셋째, <code>getValue()</code>의 <code>toString()</code>은 <code>&&</code>를 쓰지만 JPQL에는 <code>and</code>가 나간다. 식 객체의 <code>toString()</code>은 디버깅용 기본 템플릿으로 출력되고, JPQL은 JPQL용 템플릿으로 따로 직렬화되기 때문이다. 같은 식 트리를 다른 문법으로 출력하는 것이다.</p>
+
+<h4>빌더는 가변 객체다</h4>
+
+<p><code>BooleanBuilder</code>는 이름 그대로 빌더다. 내부에 조건 식 하나(<code>Predicate</code>)를 담는 칸이 있고, <code>and(조건)</code>을 부를 때마다 그 칸의 값을 "기존 값 and 새 조건"으로 바꾼 뒤 <b>자기 자신</b>을 돌려준다. 칸이 비어 있을 때는 새 조건이 그대로 들어간다. 인자로 <code>null</code>을 넘기면 아무것도 바꾸지 않는다. 그래서 위 코드는 <code>if</code> 없이 <code>builder.and(author != null ? book.author.eq(author) : null)</code>처럼 써도 같은 결과가 된다.</p>
+
+<p>가변이라는 성질은 공유할 때 문제가 된다. 아래 실험에서 <code>alias</code>는 <code>shared</code>와 같은 객체를 가리킨다.</p>
+
+<pre><code class="language-java">BooleanBuilder shared = new BooleanBuilder(book.author.eq("kim"));
+BooleanBuilder alias = shared;
+alias.and(book.price.gt(26000));
+System.out.println(shared + "  같은 객체? " + (shared == alias));
+
+BooleanExpression e1 = book.author.eq("kim");
+BooleanExpression e2 = e1.and(book.price.gt(26000));
+System.out.println("e1=" + e1 + "  e2=" + e2);</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">book.author = kim && book.price > 26000  같은 객체? true
+e1=book.author = kim  e2=book.author = kim && book.price > 26000</code></pre>
+
+<p><code>alias</code>에 조건을 더했는데 <code>shared</code>가 바뀌었다. 힙에 빌더 객체가 하나뿐이고 두 지역 변수가 같은 참조를 들고 있기 때문이다. 공통 조건을 담은 빌더를 필드나 정적 변수에 두고 여러 쿼리가 가져다 <code>and</code>를 부르면, 앞선 요청의 조건이 뒤 요청에 누적되는 버그가 생긴다. 여러 스레드가 동시에 같은 빌더를 건드리면 데이터 경쟁(data race)까지 생긴다. 반면 <code>BooleanExpression.and</code>는 <code>e1</code>을 바꾸지 않고 새 식 <code>e2</code>를 만들어 돌려준다. 이 차이가 다음 절의 출발점이다.</p>
+
+<h3>동적 쿼리 2: where 다중 파라미터</h3>
+
+<p>두 번째 도구는 빌더를 아예 쓰지 않는다. <code>where</code> 메서드는 가변 인자 <code>where(Predicate... o)</code>로 선언되어 있어서 조건을 여러 개 받을 수 있고, 받은 조건들을 <code>and</code>로 묶는다. 그리고 <code>null</code>인 인자는 건너뛴다. 그래서 조건 하나하나를 "값이 없으면 null을 돌려주는 메서드"로 만들면 된다.</p>
+
+<pre><code class="language-java">static BooleanExpression authorEq(String author) {
+    return author != null ? book.author.eq(author) : null;
+}
+
+static BooleanExpression priceGoe(Integer minPrice) {
+    return minPrice != null ? book.price.goe(minPrice) : null;
+}
+
+List<Book> result = queryFactory
+        .selectFrom(book)
+        .where(authorEq(author), priceGoe(minPrice))
+        .fetch();</code></pre>
+
+<pre data-label="실행 결과 (네 조합의 JPQL)"><code class="language-text">(kim, 26000)  select book from Book book where book.author = ?1 and book.price >= ?2
+(kim, null)   select book from Book book where book.author = ?1
+(null, 29000) select book from Book book where book.price >= ?1
+(null, null)  select book from Book book</code></pre>
+
+<p>BooleanBuilder와 정확히 같은 JPQL이다. 두 방식은 Querydsl 안에서 같은 길로 합류한다. <code>where</code>에 넘긴 인자는 쿼리 메타데이터(<code>DefaultQueryMetadata</code>)의 <code>addWhere</code>로 하나씩 들어가는데, <code>javap</code>로 보면 이 메서드는 첫 줄에서 인자가 <code>null</code>이면 바로 반환한다. null이 아니면 <code>ExpressionUtils.extract</code>로 실제 식을 꺼낸다. <code>BooleanBuilder</code>를 넘기면 이 단계에서 빌더 안의 식(<code>getValue()</code>)이 꺼내지고, 빈 빌더라면 꺼낸 값이 <code>null</code>이라 역시 무시된다. 살아남은 조건은 기존 where 조건과 <code>and</code>로 합쳐진다.</p>
+
+<h4>조건 메서드의 진짜 장점: 이름과 재사용</h4>
+
+<p>where 다중 파라미터 방식에서 조건은 이름을 가진 메서드가 된다. <code>where(authorEq(author), priceGoe(minPrice))</code>는 쿼리가 무엇을 거르는지 메서드 이름만으로 읽힌다. BooleanBuilder 방식에서는 빌더를 만드는 메서드의 if 문을 따라 읽어야 같은 정보를 얻는다. 또 <code>authorEq</code>는 다른 쿼리의 where에도, 프로젝션만 다른 DTO 조회에도, 05회와 06회에서 다룰 count 쿼리에도 그대로 넣을 수 있다. 메서드가 돌려주는 <code>BooleanExpression</code>은 불변이므로 공유해도 앞 절의 누적 버그가 생기지 않는다.</p>
+
+<h4>조합할 때의 함정: null.and(...)</h4>
+
+<p>조건 메서드를 다시 조합해 "저자와 가격 조건을 한 번에" 같은 메서드를 만들고 싶을 수 있다. 그대로 이으면 터진다.</p>
+
+<pre><code class="language-java">BooleanExpression all = authorEq(null).and(priceGoe(26000));</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">java.lang.NullPointerException: Cannot invoke "com.querydsl.core.types.dsl.BooleanExpression.and(com.querydsl.core.types.Predicate)" because the return value of "exp.Main.authorEq(String)" is null</code></pre>
+
+<p><code>where</code>가 null을 너그럽게 받아 준다고 해서 <code>null</code>에 메서드를 호출할 수 있는 것은 아니다. <code>authorEq(null)</code>은 객체가 아니라 null 참조를 돌려주었고, 그 위에서 <code>and</code>를 호출하면 JVM은 <code>invokevirtual</code> 명령을 실행하다가 수신 객체가 null이라 <code>NullPointerException</code>을 던진다. JDK 21의 예외 메시지는 어떤 메서드의 반환값이 null이었는지까지 알려 준다.</p>
+
+<p>반대 방향은 안전하다. <code>BooleanExpression.and(Predicate right)</code>의 바이트코드를 보면 인자를 <code>ExpressionUtils.extract</code>로 꺼낸 뒤 null이면 새 식을 만들지 않고 <code>this</code>를 돌려준다. 실제로 <code>book.author.eq("kim").and(null)</code>의 결과는 <code>book.author = kim</code>이었다. 즉 왼쪽만 null이 아니면 된다. 조합 메서드를 안전하게 만드는 방법은 몇 가지가 있다.</p>
+
+<ul>
+<li>조합 메서드에서 <code>new BooleanBuilder().and(authorEq(a)).and(priceGoe(p))</code>처럼 빌더를 출발점으로 삼는다. 빌더의 <code>and</code>는 null을 무시하고, 빌더는 <code>Predicate</code>이므로 <code>where</code>에 그대로 넣을 수 있다. 매번 새 빌더를 만드니 공유 문제도 없다.</li>
+<li>조합하지 않고 <code>where(authorEq(a), priceGoe(p))</code>처럼 가변 인자로 넘긴다. 대부분의 경우 이것으로 충분하다.</li>
+<li>조건 메서드가 null 대신 "항상 참"인 식을 돌려주게 만드는 방법도 생각할 수 있지만, 그러면 JPQL에 의미 없는 조건이 남는다. null을 건너뛰는 Querydsl의 규칙을 그대로 쓰는 편이 SQL도 깔끔하다.</li>
+</ul>
+
+<h3>조건 트리와 괄호: 직렬화가 우선순위를 지키는 방법</h3>
+
+<p><code>book.author.eq("kim")</code>은 문자열이 아니라 객체다. 연산자 <code>Ops.EQ</code>와 인자 두 개(경로 <code>book.author</code>, 상수 <code>"kim"</code>)를 가진 연산 노드다. <code>and</code>와 <code>or</code>는 이런 노드 두 개를 자식으로 갖는 새 노드를 만든다. 결국 where 조건은 하나의 <b>트리</b>이고, JPQL 직렬화는 이 트리를 깊이 우선으로 순회하며 문자열을 쓰는 일이다.</p>
+
+<p>트리를 문자열로 펼칠 때 문제는 우선순위다. SQL과 JPQL에서 <code>and</code>는 <code>or</code>보다 먼저 결합한다. 그래서 트리 모양을 문자열로 정확히 옮기려면, 자식 노드의 연산자가 부모보다 약하게 결합할 때 괄호를 쳐야 한다. 실험으로 확인했다.</p>
+
+<pre><code class="language-java">BooleanExpression a = book.author.eq("kim");
+BooleanExpression b = book.author.eq("lee");
+BooleanExpression c = book.price.gt(26000);
+
+queryFactory.selectFrom(book).where(a.or(b).and(c));    // (1)
+queryFactory.selectFrom(book).where(a.or(b.and(c)));    // (2)
+queryFactory.selectFrom(book).where(a.or(b), c);        // (3)</code></pre>
+
+<pre data-label="실행 결과 (JPQL)"><code class="language-text">(1) select book from Book book where (book.author = ?1 or book.author = ?2) and book.price > ?3
+(2) select book from Book book where book.author = ?1 or book.author = ?2 and book.price > ?3
+(3) select book from Book book where (book.author = ?1 or book.author = ?2) and book.price > ?3</code></pre>
+
+<p>(1)은 트리의 뿌리가 AND이고 왼쪽 자식이 OR이다. OR이 AND보다 약하게 결합하므로 직렬화기가 왼쪽 자식을 괄호로 감쌌다. (2)는 뿌리가 OR이고 오른쪽 자식이 AND다. AND는 원래 먼저 결합하므로 괄호가 필요 없고, 실제로 붙지 않았다. 괄호 없는 문자열 <code>a or b and c</code>가 SQL에서 <code>a or (b and c)</code>로 해석되니 트리와 의미가 같다. (3)은 where 가변 인자가 <code>a.or(b)</code>와 <code>c</code>를 AND로 묶은 것이므로 (1)과 같은 트리, 같은 JPQL이 되었다.</p>
+
+<p>(1)을 실행하면 SQL은 <code>where (b1_0.author=? or b1_0.author=?) and b1_0.price>?</code>이고 결과는 <code>[Book(JPA Basics, kim, 30000), Book(Java Threads, lee, 32000)]</code>이다. kim의 책 중 26000 이하인 Spring Data와, 저자가 park인 SQL Tuning이 빠졌다. 메서드 체인을 쓸 때 "점으로 이은 순서가 곧 괄호"라는 점을 기억하면 된다. <code>a.or(b).and(c)</code>에서 <code>a.or(b)</code>가 먼저 하나의 노드가 되고, 그 노드에 <code>and(c)</code>가 걸린다. 문자열로 JPQL을 이어 붙일 때 흔히 생기는 "or 조건에 괄호를 빠뜨려 권한 조건이 무력화되는" 종류의 버그는, 조건을 트리로 조립하고 직렬화기가 괄호를 결정하는 구조에서는 생기지 않는다.</p>
+
+<pre class="diagram">  a.or(b).and(c)                    a.or(b.and(c))
+
+        AND                              OR
+       /    \                          /    \
+     OR      c                        a     AND
+    /  \                                   /   \
+   a    b                                 b     c
+
+  → (a or b) and c                  → a or b and c
+    자식 OR이 부모 AND보다 약함        자식 AND가 부모 OR보다 강함
+    → 괄호 필요                        → 괄호 불필요</pre>
+
+<x-visual id="querydsl-04-predicate-tree" title="조건 식 트리와 괄호가 붙는 규칙" kind="트리 다이어그램" ratio="16:9">
+<x-hint>메서드 체인이 만든 조건 트리 두 개를 나란히 놓고, 자식 연산자가 부모보다 약하게 결합할 때만 괄호가 붙는다는 것을 보여 준다.</x-hint>
+<x-prompt>좌우 2분할 그림. 왼쪽 위 제목 "a.or(b).and(c)", 그 아래 트리: 뿌리 원 "AND", 왼쪽 자식 원 "OR", 오른쪽 자식 사각형 "c: price > 26000", "OR"의 자식 사각형 "a: author = kim", "b: author = lee". "OR" 원 주위를 주황색 점선 괄호로 감싸고 라벨 "괄호 필요". 트리 아래 결과 상자 "(a or b) and c". 오른쪽 위 제목 "a.or(b.and(c))", 그 아래 트리: 뿌리 원 "OR", 왼쪽 자식 사각형 "a", 오른쪽 자식 원 "AND", "AND"의 자식 사각형 "b", "c". "AND" 원 옆에 회색 라벨 "괄호 불필요". 트리 아래 결과 상자 "a or b and c". 두 트리 사이 가운데 세로선. 맨 아래 공통 캡션 상자 "and가 or보다 먼저 결합한다".</x-prompt>
+<x-caption>Querydsl은 조건을 트리로 들고 있다가, 자식 연산자의 결합 순위가 부모보다 낮을 때만 괄호를 쳐서 JPQL로 펼친다.</x-caption>
+</x-visual>
+
+<h3>조건 조합의 수와 Hibernate의 쿼리 해석 캐시</h3>
+
+<p>지금까지의 JPQL을 다시 보면 값이 문자열에 들어가지 않았다. <code>book.author = ?1</code>처럼 JPA의 위치 기반 파라미터(positional parameter)가 들어가고, 실제 값 <code>"kim"</code>은 <code>Query.setParameter</code>로 따로 바인딩된다. 앞에서 문자열 JPQL에 <code>'kim'</code>을 직접 적었을 때는 SQL에도 <code>where b1_0.author='kim'</code>처럼 리터럴이 그대로 나갔던 것과 대조된다.</p>
+
+<p>이 차이는 보안(SQL 인젝션)만의 문제가 아니다. Hibernate는 JPQL(HQL) 문자열을 받으면 그것을 파싱해 의미 모델(SQM 트리)로 바꾸고 다시 SQL로 번역한다. 이 해석은 비싸므로 결과를 캐시해 두고, 같은 문자열이 다시 오면 재사용한다. 동적 쿼리에서 조건 조합마다 JPQL 문자열이 달라진다면, 캐시에는 얼마나 많은 항목이 생길까. Hibernate의 내부 캐시 객체(<code>QueryInterpretationCache</code>)에서 캐시된 HQL 해석의 수를 직접 세어 보았다.</p>
+
+<pre><code class="language-java">QueryInterpretationCache cache = emf.unwrap(SessionFactoryImplementor.class)
+        .getQueryEngine().getInterpretationCache();
+
+int base = cache.getNumberOfCachedHqlInterpretations();
+String[] authors = {"kim", null, "lee", "park", null};
+Integer[] prices  = {26000, 29000, null, 10000, null};
+for (int round = 0; round < 3; round++)          // 값을 바꿔 가며 3바퀴, 총 15회 실행
+    for (int i = 0; i < authors.length; i++)
+        queryFactory.selectFrom(book)
+                .where(authorEq(authors[i]),
+                       priceGoe(prices[i] == null ? null : prices[i] + round))
+                .fetch();
+System.out.println(cache.getNumberOfCachedHqlInterpretations() - base);
+
+base = cache.getNumberOfCachedHqlInterpretations();
+for (int p = 20000; p < 20010; p++)              // 값을 문자열에 붙인 JPQL 10회
+    em.createQuery("select b from Book b where b.price >= " + p, Book.class).getResultList();
+System.out.println(cache.getNumberOfCachedHqlInterpretations() - base);</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Querydsl 15회 실행 후 새로 캐시된 HQL 해석 수: 4
+값을 문자열로 붙인 JPQL 10회 실행 후: 10</code></pre>
+
+<p>Querydsl 쪽은 값이 매번 달랐는데도 해석이 4개만 생겼다. 조건 두 개의 있고 없음으로 만들어지는 JPQL 문자열이 정확히 네 종류(둘 다, 저자만, 가격만, 둘 다 없음)이기 때문이다. 값은 파라미터로 빠졌으므로 문자열을 바꾸지 않는다. 반면 값을 문자열에 붙인 쪽은 실행할 때마다 새 문자열이 되어 10번 실행에 10개가 쌓였다. Hibernate 6.6.53에서 이 캐시의 기본 최대 크기는 <code>QueryEngine.DEFAULT_QUERY_PLAN_MAX_COUNT</code> 상수에 정해진 2048이고, <code>hibernate.query.plan_cache_max_size</code> 설정으로 바꾼다. 값이 문자열에 섞이면 캐시가 금방 차서 쓸모 있는 항목까지 밀려나고, 매번 파싱 비용을 다시 치른다.</p>
+
+<p>따라서 동적 쿼리가 만드는 서로 다른 JPQL의 수는 "조건 조합의 수"로 상한이 정해진다. 선택 조건이 n개면 최대 2의 n제곱 가지다. 조건이 몇 개 수준이면 문제가 되지 않지만, 조건마다 정렬 방향이나 조인 여부까지 달라지면 조합이 곱으로 늘어난다는 점은 알고 있어야 한다. 이 원리는 데이터베이스 쪽에도 이어진다. 바인딩 파라미터를 쓰는 SQL은 텍스트가 같으므로 데이터베이스와 드라이버 수준의 문장 캐시(prepared statement cache)에서도 같은 문장으로 취급될 수 있다.</p>
+
+<x-visual id="querydsl-04-plan-cache" title="조건 조합과 쿼리 해석 캐시 항목의 수" kind="비교 다이어그램" ratio="16:9">
+<x-hint>값을 파라미터로 바인딩하면 캐시 항목이 조건 조합 수만큼만 생기고, 값을 문자열에 붙이면 실행 횟수만큼 생긴다는 대비를 보여 준다.</x-hint>
+<x-prompt>좌우 비교 그림. 왼쪽 패널 제목 "파라미터 바인딩 (Querydsl)". 위쪽에 실행 요청 카드 15장이 3줄로 쌓여 있고 각 카드에 작은 값 표시(예: "kim, 26000", "kim, 26001"). 아래로 깔때기 모양 화살표가 4개의 상자로 모인다: "author = ?1 and price >= ?2", "author = ?1", "price >= ?1", "조건 없음". 상자 묶음 아래 라벨 "캐시 항목 4개". 오른쪽 패널 제목 "값을 문자열에 붙임". 실행 카드 10장 각각에서 화살표가 개별 상자로 이어진다: "price >= 20000", "price >= 20001", ..., "price >= 20009". 아래 라벨 "캐시 항목 10개". 두 패널 사이 세로 구분선. 맨 아래 가운데 작은 상자 "Hibernate HQL 해석 캐시 (기본 최대 2048)".</x-prompt>
+<x-caption>동적 쿼리가 만드는 JPQL의 종류는 값이 아니라 조건 조합의 수로 정해진다.</x-caption>
+</x-visual>
+
+<h4>모든 조건이 빠지면 무슨 일이 생기는가</h4>
+
+<p>네 번째 조합(<code>null, null</code>)을 다시 보자. where 절이 사라져 테이블 전체를 읽었다. 예제 테이블은 네 행이지만 운영 테이블이 수백만 행이라면, 데이터베이스는 전체를 스캔하고, JDBC 드라이버는 그 결과를 네트워크로 받아 오고, Hibernate는 행마다 엔티티와 상태 사본을 만들어 영속성 컨텍스트에 쌓는다. 힙이 감당하지 못하면 <code>OutOfMemoryError</code>로 이어진다. Querydsl의 null 건너뛰기는 문법적으로 정확한 쿼리를 만들어 줄 뿐, 그 쿼리가 안전한지는 판단하지 않는다. 그래서 검색 쿼리에는 06회에서 다룰 페이징으로 결과 크기에 상한을 두거나, 최소한 하나의 조건을 요구하는 검증을 호출하는 쪽에 둔다.</p>
+
+<h3>수정·삭제 벌크 연산: 영속성 컨텍스트를 건너뛰는 쿼리</h3>
+
+<p>JPA에서 엔티티를 수정하는 기본 방법은 변경 감지다. 엔티티를 조회해 값을 바꾸면 flush 시점에 UPDATE가 나간다. 이 방식은 엔티티 하나당 UPDATE 하나다. "가격이 30000원 미만인 책을 모두 1000원 올린다"를 변경 감지로 하면, 대상 행을 모두 메모리로 읽어 들이고 행 수만큼 UPDATE를 보내야 한다. 벌크 연산(bulk operation)은 이것을 SQL 한 문장으로 끝낸다.</p>
+
+<pre><code class="language-java">long count = queryFactory
+        .update(book)
+        .set(book.price, book.price.add(1000))
+        .where(book.price.lt(30000))
+        .execute();
+
+long deleted = queryFactory
+        .delete(book)
+        .where(book.price.gt(50000))
+        .execute();</code></pre>
+
+<pre data-label="실행 결과 (JPQL과 SQL)"><code class="language-text">JPQL: update Book book
+set book.price = book.price + ?1
+where book.price < ?2
+Hibernate: update Book b1_0 set price=(b1_0.price+cast(? as integer)) where b1_0.price<?
+
+JPQL: delete from Book book
+where book.price > ?1
+Hibernate: delete from Book b1_0 where b1_0.price>?</code></pre>
+
+<p><code>update(book)</code>은 <code>JPAUpdateClause</code>를, <code>delete(book)</code>은 <code>JPADeleteClause</code>를 만든다. <code>set</code>에는 상수뿐 아니라 <code>book.price.add(1000)</code>이나 <code>book.price.multiply(2)</code> 같은 식도 넣을 수 있고, 이 식은 SQL에서 현재 행의 값을 읽어 계산하는 <code>price = price + ?</code>가 된다. <code>execute()</code>는 JPA의 <code>Query.executeUpdate()</code>를 호출하고, 영향받은 행 수를 <code>long</code>으로 돌려준다. H2 방언은 파라미터에 <code>cast(? as integer)</code>를 씌웠는데, 이것은 방언의 렌더링 방식이므로 MySQL에서는 다르게 나올 수 있다.</p>
+
+<p>중요한 것은 이 SQL이 <b>영속성 컨텍스트를 거치지 않고</b> 데이터베이스로 바로 간다는 점이다. Jakarta Persistence 3.1 명세 4.10절(Bulk Update and Delete Operations)은 이것을 분명히 적는다. 벌크 UPDATE는 데이터베이스의 UPDATE로 곧바로 옮겨지며 낙관적 락 검사를 건너뛰고, 영속성 컨텍스트는 벌크 UPDATE·DELETE의 결과와 동기화되지 않으며, 벌크 DELETE는 연관 엔티티로 전파(cascade)되지 않는다. 이 세 문장이 무엇을 뜻하는지 실험으로 하나씩 확인한다.</p>
+
+<h4>실행 순서 추적: 1차 캐시가 데이터베이스와 어긋나는 과정</h4>
+
+<pre><code class="language-java">List<Book> before = queryFactory.selectFrom(book).orderBy(book.price.asc()).fetch();
+System.out.println("before: " + before);
+Book spring = before.get(0);          // Spring Data, 25000
+spring.setPrice(26000);               // 아직 flush하지 않은 변경
+
+long n = queryFactory.update(book)
+        .set(book.price, book.price.add(1000))
+        .where(book.price.lt(30000))
+        .execute();
+System.out.println("변경 행 수: " + n);
+
+List<Book> after = queryFactory.selectFrom(book).orderBy(book.price.asc()).fetch();
+System.out.println("after(clear 전): " + after);
+System.out.println("같은 인스턴스? " + after.contains(spring));
+
+em.flush();
+em.clear();
+System.out.println("after(clear 후): " + queryFactory.selectFrom(book).orderBy(book.price.asc()).fetch());</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select b1_0.id,b1_0.author,b1_0.price,b1_0.publisher_id,b1_0.title from Book b1_0 order by b1_0.price
+before: [Book(Spring Data, kim, 25000), Book(SQL Tuning, park, 28000), Book(JPA Basics, kim, 30000), Book(Java Threads, lee, 32000)]
+Hibernate: update Book set author=?,price=?,publisher_id=?,title=? where id=?
+Hibernate: update Book b1_0 set price=(b1_0.price+cast(? as integer)) where b1_0.price<?
+변경 행 수: 2
+Hibernate: select b1_0.id,b1_0.author,b1_0.price,b1_0.publisher_id,b1_0.title from Book b1_0 order by b1_0.price
+after(clear 전): [Book(Spring Data, kim, 26000), Book(SQL Tuning, park, 28000), Book(JPA Basics, kim, 30000), Book(Java Threads, lee, 32000)]
+같은 인스턴스? true
+Hibernate: select b1_0.id,b1_0.author,b1_0.price,b1_0.publisher_id,b1_0.title from Book b1_0 order by b1_0.price
+after(clear 후): [Book(Spring Data, kim, 27000), Book(SQL Tuning, park, 29000), Book(JPA Basics, kim, 30000), Book(Java Threads, lee, 32000)]</code></pre>
+
+<p>한 줄씩 따라가 보자.</p>
+
+<ol>
+<li><b>첫 조회.</b> 책 네 권이 엔티티로 만들어져 영속성 컨텍스트에 들어가고, 각각의 로딩 시점 상태 사본도 함께 보관된다. 이때 메모리와 데이터베이스의 값은 같다.</li>
+<li><b><code>spring.setPrice(26000)</code>.</b> 힙의 엔티티 필드만 바뀌었다. 데이터베이스는 아직 25000이다.</li>
+<li><b><code>execute()</code>.</b> SQL이 두 개 나갔다. 먼저 <code>update Book set author=?,price=?,publisher_id=?,title=? where id=?</code>, 즉 2번의 변경을 반영하는 flush다. Hibernate의 기본 flush 모드(AUTO)에서는 쿼리를 실행하기 전에 그 결과에 영향을 줄 수 있는 대기 중 변경을 먼저 데이터베이스에 보낸다. 이 덕분에 벌크 UPDATE의 where 조건은 26000이라는 최신 값을 보고 판단했다. 이어서 벌크 UPDATE가 실행되어 Spring Data는 26000에서 27000으로, SQL Tuning은 28000에서 29000으로 바뀌었다. JPA Basics(30000)는 30000 미만이 아니므로 제외되어 변경 행 수는 2다.</li>
+<li><b>두 번째 조회.</b> SQL은 분명히 실행되었고, 데이터베이스는 27000과 29000을 돌려주었다. 그런데 결과에는 26000과 28000이 찍혔다. Hibernate는 행을 읽을 때 식별자로 영속성 컨텍스트를 먼저 찾고, 이미 관리 중인 엔티티가 있으면 <b>그 인스턴스를 그대로 돌려주고 행의 값은 버린다.</b> "같은 인스턴스? true"가 이를 보여 준다. 한 영속성 컨텍스트 안에서 같은 식별자는 같은 객체라는 동일성 보장이, 벌크 연산 뒤에는 낡은 값을 고집하는 결과가 된다.</li>
+<li><b><code>flush()</code>와 <code>clear()</code>.</b> flush는 대기 중 변경을 보내는 일이고(이 시점에는 보낼 것이 없다), clear는 영속성 컨텍스트를 비우는 일이다. 비운 뒤의 조회는 행마다 엔티티를 새로 만들므로 비로소 27000과 29000이 보인다.</li>
+</ol>
+
+<pre class="diagram">시점                         영속성 컨텍스트(힙)              데이터베이스
+---------------------------  -------------------------------  -----------------------
+1. 첫 조회                   Spring 25000 / SQL 28000          Spring 25000 / SQL 28000
+2. setPrice(26000)           Spring 26000 / SQL 28000          Spring 25000 / SQL 28000
+3a. 자동 flush               Spring 26000 / SQL 28000          Spring 26000 / SQL 28000
+3b. 벌크 UPDATE (+1000)      Spring 26000 / SQL 28000  (그대로) Spring 27000 / SQL 29000
+4. 다시 조회                 Spring 26000 / SQL 28000  (행 값 버림)  "
+5. clear 후 조회             Spring 27000 / SQL 29000          Spring 27000 / SQL 29000</pre>
+
+<x-visual id="querydsl-04-bulk-stale-context" title="벌크 UPDATE 뒤 영속성 컨텍스트와 데이터베이스의 어긋남" kind="상태 비교 다이어그램" ratio="16:9">
+<x-hint>벌크 UPDATE가 데이터베이스만 바꾸고, 이어지는 조회가 행 값을 버리고 1차 캐시의 낡은 인스턴스를 돌려준다는 것을 시간 순서로 보여 준다.</x-hint>
+<x-prompt>가로 3단계 타임라인. 각 단계마다 위쪽 상자 "영속성 컨텍스트", 아래쪽 원통 "데이터베이스". 1단계 제목 "벌크 UPDATE 전": 위 상자 안 카드 "Spring Data 26000", "SQL Tuning 28000", 아래 원통 안 같은 값. 2단계 제목 "벌크 UPDATE 직후": 위 상자는 그대로 "26000", "28000"(회색), 아래 원통은 "27000", "29000"(초록 강조), 원통으로 내려가는 굵은 화살표 라벨 "SQL 직접 실행". 3단계 제목 "다시 조회": 원통에서 위로 올라오는 화살표 "행: 27000, 29000"이 위 상자 앞에서 X 표시로 막히고 라벨 "같은 id → 기존 인스턴스 반환". 위 상자의 카드에 빨간 라벨 "낡은 값". 오른쪽 끝에 작은 상자 "해결: flush → clear".</x-prompt>
+<x-caption>벌크 연산은 영속성 컨텍스트를 거치지 않으므로, 이미 관리 중인 엔티티는 clear하기 전까지 데이터베이스와 다른 값을 들고 있다.</x-caption>
+</x-visual>
+
+<h4>낡은 엔티티가 벌크 결과를 덮어쓰는 경우</h4>
+
+<p>낡은 값을 읽는 것보다 더 위험한 것은 낡은 엔티티를 수정하는 것이다. 책 한 권을 조회한 뒤, 벌크 UPDATE로 그 책의 저자를 바꾸고, clear 없이 같은 엔티티의 가격을 수정해 flush해 보았다.</p>
+
+<pre><code class="language-java">Book b = queryFactory.selectFrom(book).where(book.title.eq("SQL Tuning")).fetchOne();
+queryFactory.update(book).set(book.author, "unknown")
+        .where(book.title.eq("SQL Tuning")).execute();   // DB: author = unknown
+b.setPrice(30000);                                       // 낡은 엔티티(author = park) 수정
+em.flush();
+em.clear();
+System.out.println(queryFactory.selectFrom(book).fetch());</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: update Book b1_0 set author=? where b1_0.title=?
+Hibernate: update Book set author=?,price=?,publisher_id=?,title=? where id=?
+[Book(SQL Tuning, park, 30000)]</code></pre>
+
+<p>벌크 UPDATE가 바꾼 <code>unknown</code>이 사라지고 <code>park</code>로 되돌아갔다. 원인은 변경 감지가 만든 UPDATE에 있다. 가격만 바꿨는데도 SQL은 <code>set author=?,price=?,publisher_id=?,title=?</code>로 모든 컬럼을 덮어썼다. Hibernate가 기본적으로 엔티티의 모든 컬럼을 갱신하는 UPDATE를 쓰기 때문이고, 그 값은 힙에 있는 낡은 엔티티에서 왔다. 벌크 연산의 결과가 예외도 경고도 없이 유실된 것이다. 벌크 연산 뒤에 <code>em.flush()</code>와 <code>em.clear()</code>를 습관처럼 붙이는 이유가 여기에 있다. 스프링 데이터 JPA의 <code>@Modifying</code>이 <code>flushAutomatically = true</code>로 실행 전 flush를, <code>clearAutomatically = true</code>로 실행 뒤 clear를 자동으로 해 준다는 것은 앞 권에서 보았다.</p>
+
+<p>clear의 대가도 알아 두어야 한다. clear는 영속성 컨텍스트의 모든 엔티티를 준영속 상태로 만든다. clear 전에 들고 있던 엔티티 참조는 더 이상 변경 감지 대상이 아니다. 아직 초기화되지 않은 지연 로딩 프록시도 마찬가지여서, 책의 <code>getPublisher()</code>로 얻어 둔 출판사 프록시에 clear 뒤 처음 접근했더니 <code>LazyInitializationException: Could not initialize proxy [exp.Publisher#1] - no session</code>이 났다. 그래서 벌크 연산은 트랜잭션의 맨 앞에서 실행하거나, 벌크 연산 직후 clear하고 필요한 엔티티를 다시 조회하는 흐름으로 짠다.</p>
+
+<h4>낙관적 락과 cascade도 건너뛴다</h4>
+
+<p>명세가 말하는 나머지 두 가지도 같은 원리에서 나온다. 엔티티에 <code>@Version</code> 필드가 있으면 변경 감지로 나가는 UPDATE는 <code>where id=? and version=?</code>로 버전을 검사하고 버전을 올린다. 벌크 UPDATE는 엔티티를 거치지 않는 SQL이므로 이 검사를 하지 않는다. 다른 트랜잭션이 들고 있는 엔티티의 버전이 그대로이니, 그 트랜잭션은 벌크 UPDATE가 있었다는 사실을 버전으로 알아챌 수 없다. 버전을 함께 올려야 한다면 <code>set</code>에 버전 컬럼을 직접 넣어야 한다.</p>
+
+<p>벌크 DELETE는 연관 엔티티로 전파되지 않는다. 책이 참조하는 출판사를 벌크로 지워 보았다.</p>
+
+<pre><code class="language-java">queryFactory.delete(publisher).where(publisher.name.eq("River Books")).execute();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: delete from Publisher p1_0 where p1_0.name=?
+org.hibernate.exception.ConstraintViolationException
+  원인: org.h2.jdbc.JdbcSQLIntegrityConstraintViolationException: Referential integrity constraint violation: "FKRB2NJMKVIO5MHE42EMPUAIPHU: PUBLIC.BOOK FOREIGN KEY(PUBLISHER_ID) REFERENCES PUBLIC.PUBLISHER(ID) ..."</code></pre>
+
+<p>Hibernate는 출판사를 참조하는 책이 있는지 보지 않고 DELETE를 그대로 보냈고, 데이터베이스의 외래 키 제약이 거부했다. 엔티티 매핑에 cascade나 <code>orphanRemoval</code>을 설정해 두었더라도, 그것은 <code>em.remove()</code>로 엔티티를 지울 때 영속성 컨텍스트가 수행하는 동작이라 벌크 DELETE와는 무관하다. 자식부터 지우는 순서는 직접 짜야 한다.</p>
+
+<h4>execute()가 돌려주는 숫자의 의미</h4>
+
+<p><code>execute()</code>의 반환값은 결국 JDBC 드라이버가 알려 주는 갱신 행 수(update count)다. 여기에는 데이터베이스별 미묘함이 있다. MySQL C API 문서에 따르면 MySQL 서버가 UPDATE에 대해 기본으로 돌려주는 affected-rows 값은 <b>실제로 값이 바뀐 행</b>의 수이고, 접속할 때 <code>CLIENT_FOUND_ROWS</code> 플래그를 주면 <b>WHERE에 일치한 행</b>의 수가 된다. 그런데 MySQL Connector/J의 <code>useAffectedRows</code> 속성은 기본값이 <code>false</code>이고, 이 속성의 설명은 "<code>CLIENT_FOUND_ROWS</code> 플래그를 설정하지 않는다"는 것이다. 즉 기본 설정의 Connector/J는 이 플래그를 설정하므로, 이미 같은 값을 가진 행에 같은 값을 넣는 UPDATE도 일치한 행으로 세어 돌려준다. 같은 SQL을 mysql 명령줄 클라이언트에서 실행했을 때 보이는 "Changed" 수와 자바에서 받은 숫자가 다를 수 있는 이유다. 반환값으로 "실제 변경이 있었는가"를 판단하는 로직이라면 이 차이를 알고 써야 한다.</p>
+
+<h3>SQL 함수 호출: JPQL에 없는 함수를 부르는 길</h3>
+
+<p>JPQL은 데이터베이스 독립적인 언어라서 표준 함수의 수가 적다. 문자열의 일부를 바꾸는 <code>replace</code> 같은 함수는 대부분의 데이터베이스에 있지만 Jakarta Persistence 3.1 명세의 표준 함수 목록에는 없다(3.2 명세에서 <code>REPLACE</code>가 표준 문자열 함수로 추가되었다). Querydsl에서 이런 함수를 부르는 일반적인 방법은 템플릿 식(template expression)이다.</p>
+
+<pre><code class="language-java">List<String> replaced = queryFactory
+        .select(Expressions.stringTemplate(
+                "function('replace', {0}, {1}, {2})", book.title, "a", "@"))
+        .from(book)
+        .fetch();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">JPQL: select function('replace', book.title, ?1, ?2)
+from Book book
+Hibernate: select replace(b1_0.title,?,?) from Book b1_0
+[JPA B@sics, Spring D@t@, J@v@ Thre@ds, SQL Tuning]</code></pre>
+
+<p>세 층을 거친 과정을 보자. <code>Expressions.stringTemplate</code>은 템플릿 문자열과 인자 목록을 받아 <code>String</code> 타입의 식을 만든다. <code>{0}</code>, <code>{1}</code>, <code>{2}</code>는 인자의 자리다. 직렬화할 때 경로 인자 <code>book.title</code>은 경로로, 식이 아닌 상수 <code>"a"</code>와 <code>"@"</code>는 파라미터 <code>?1</code>, <code>?2</code>로 바뀌어 들어갔다. 템플릿 안의 <code>'replace'</code>는 따옴표까지 문자 그대로 JPQL에 복사된다. 그 결과가 JPQL의 <code>function('replace', ...)</code>이다.</p>
+
+<p><code>function('이름', 인자...)</code>은 JPA 표준 문법이다. Hibernate 6.6의 HQL 가이드는 네이티브 함수나 사용자 정의 함수를 JPQL의 <code>function</code> 문법으로 부를 수 있다고 설명한다. Hibernate는 이름 <code>replace</code>를 자기 함수 등록부(function registry)에서 찾는다. HQL 가이드의 문자열 함수 표에는 <code>replace(str, patt, rep)</code>가 있고, JPA 표준도 ANSI SQL 표준도 아닌 함수로 표시되어 있다. Hibernate가 이 함수를 알고 있으므로, H2 방언에 맞게 <code>replace(b1_0.title,?,?)</code>로 렌더링했다. 같은 이유로 템플릿을 <code>"replace({0}, {1}, {2})"</code>처럼 <code>function</code> 없이 써도 이 실험에서는 똑같은 SQL이 나왔다. 다만 그것은 HQL 확장 문법에 기대는 것이고, <code>function(...)</code> 형식이 JPA 표준 문법이다.</p>
+
+<h4>표준 함수는 Querydsl 메서드로</h4>
+
+<p>JPQL 표준에 있는 함수는 템플릿이 필요 없다. Querydsl의 식 타입이 메서드로 제공하고, Querydsl이 JPQL 함수로 옮긴다.</p>
+
+<pre><code class="language-java">queryFactory.select(book.title).from(book)
+        .where(book.author.eq(book.author.lower()))      // 저자가 이미 소문자인 책
+        .fetch();
+
+queryFactory.select(book.title).from(book)
+        .where(book.title.eq(Expressions.stringTemplate("function('lower', {0})", book.title)))
+        .fetch();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">JPQL: select book.title
+from Book book
+where book.author = lower(book.author)
+Hibernate: select b1_0.title from Book b1_0 where b1_0.author=lower(b1_0.author)
+[JPA Basics, Spring Data, Java Threads, SQL Tuning]
+
+JPQL: select book.title
+from Book book
+where book.title = function('lower', book.title)
+Hibernate: select b1_0.title from Book b1_0 where b1_0.title=lower(b1_0.title)
+[]</code></pre>
+
+<p>첫 쿼리는 <code>lower()</code> 메서드가 JPQL <code>lower(...)</code>가 된 경우이고, 둘째는 같은 함수를 템플릿으로 부른 경우다. 두 경로 모두 같은 SQL 함수로 렌더링되었다. 모든 저자 이름이 소문자이므로 첫 쿼리는 네 권을 다 돌려주고, 모든 제목에 대문자가 있으므로 둘째 쿼리는 빈 리스트다. 차이는 타입 안전성에 있다. <code>lower()</code> 메서드는 <code>StringExpression</code>에만 있으므로 숫자 경로에 부를 수 없지만, 템플릿은 문자열이라 함수 이름의 오타도 인자 개수의 실수도 컴파일러가 잡지 못한다. 메서드가 있으면 메서드를 쓰고, 없을 때만 템플릿을 쓴다.</p>
+
+<h4>등록되지 않은 함수의 오류는 어디서 나는가</h4>
+
+<p>Hibernate가 모르는 이름을 넣으면 어떻게 될까.</p>
+
+<pre><code class="language-java">queryFactory.select(Expressions.stringTemplate("function('my_func', {0})", book.title))
+        .from(book).fetch();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">JPQL: select function('my_func', book.title)
+from Book book
+Hibernate: select my_func(b1_0.title) from Book b1_0
+org.hibernate.exception.SQLGrammarException: could not prepare statement [Function "MY_FUNC" not found; SQL statement: ...
+  원인: org.h2.jdbc.JdbcSQLSyntaxErrorException: Function "MY_FUNC" not found; SQL statement: ...</code></pre>
+
+<p>Hibernate 6.6.53은 등록부에 없는 이름을 거부하지 않고 <code>my_func(...)</code>로 SQL에 그대로 옮겼다. 오류를 낸 것은 H2였다. 드라이버가 SQL을 준비(prepare)하는 단계에서 데이터베이스가 함수를 찾지 못했고, Hibernate는 그 <code>SQLException</code>을 <code>SQLGrammarException</code>으로 감쌌다. 오타가 난 함수 이름은 JPQL 해석 단계가 아니라 데이터베이스 왕복이 일어난 뒤에야 드러난다는 뜻이다. 이 성질은 장점이기도 하다. 데이터베이스에 직접 만든 함수(저장 함수)를 별도 등록 없이 <code>function</code> 문법으로 부를 수 있다.</p>
+
+<p>함수를 정식으로 등록하는 길도 있다. HQL 가이드는 사용자 정의 함수를 <code>FunctionContributor</code> 구현으로 등록할 수 있고, 커스텀 <code>Dialect</code>가 <code>initializeFunctionRegistry()</code>를 재정의해 네이티브 함수를 추가할 수 있다고 설명한다(Hibernate 6.6의 <code>org.hibernate.boot.model.FunctionContributor</code>는 추상 메서드로 <code>contributeFunctions(FunctionContributions)</code> 하나를 가진 인터페이스다. default 메서드 <code>ordinal()</code>도 함께 있다). 등록하면 반환 타입을 Hibernate가 알게 되고, <code>function</code> 없이 HQL에서 이름으로 직접 부를 수 있다. 시작할 때 어떤 함수가 등록되었는지 보려면, 가이드의 안내대로 로그 카테고리 <code>org.hibernate.HQL_FUNCTIONS</code>를 debug로 켜면 된다.</p>
+
+<h4>함수와 인덱스</h4>
+
+<p>SQL 함수를 where 절에 쓸 때는 실행 계획을 함께 생각해야 한다. B+Tree 인덱스는 컬럼 값의 순서로 정렬되어 있다. <code>where author = ?</code>는 그 정렬을 따라 내려가 범위를 좁힐 수 있지만, <code>where lower(author) = ?</code>는 비교 대상이 컬럼 값이 아니라 함수의 결과라 컬럼 값의 정렬을 그대로 이용할 수 없다. MySQL은 8.0.13부터 식의 값을 인덱싱하는 함수 키 파트(functional key part)를 지원하는데, MySQL 매뉴얼은 이 인덱스를 쓰려면 쿼리의 식이 인덱스 정의의 식과 일치해야 한다고 설명한다. Querydsl이 만든 식이 SQL에서 정확히 어떤 함수 호출로 렌더링되는지 <code>show_sql</code>로 확인해야 하는 이유이기도 하다. 예를 들어 Querydsl의 <code>concat</code>과 <code>stringValue()</code>는 JPQL에서 <code>concat(...)</code>과 <code>str(...)</code>이 되었다가 H2의 SQL에서는 <code>||</code> 연산자와 <code>cast(... as varchar)</code>로 바뀌었다. 같은 Querydsl 코드라도 방언마다 SQL의 모양이 다르다.</p>
+
+<h3>이 회차의 지식이 다시 쓰이는 곳</h3>
+
+<p>이 회차에서 본 것은 결국 두 개의 변환 경로다. 하나는 <b>식 트리 → JPQL 문자열 → SQL</b>의 경로로, where 조건과 함수 호출이 이 길을 따라간다. Querydsl은 트리를 들고 있다가 템플릿에 따라 괄호와 파라미터를 결정하고, Hibernate는 그 문자열을 해석해 캐시하고 방언에 맞는 SQL로 렌더링한다. 다른 하나는 <b>JDBC 행 → 값 배열 → 객체</b>의 경로로, 프로젝션이 이 길을 따라간다. 엔티티라면 Hibernate가 영속성 컨텍스트를 거쳐 만들고, DTO라면 Querydsl의 <code>FactoryExpression</code>이 리플렉션으로 만든다. 벌크 연산은 첫 번째 경로만 쓰고 두 번째 경로, 즉 영속성 컨텍스트를 거치지 않는다는 점에서 특별했다.</p>
+
+<p>05회에서는 이 회차의 동적 조건과 DTO 프로젝션을 순수 JPA 리포지토리에 넣고, <code>JPAQueryFactory</code>를 스프링 빈으로 공유해도 되는 이유(트랜잭션 범위의 <code>EntityManager</code> 프록시)를 다룬다. 06회에서는 같은 조건 메서드를 페이징 쿼리와 count 쿼리에 재사용하는데, 조건을 이름 있는 <code>BooleanExpression</code> 메서드로 만들어 두는 방식이 그때 효과를 낸다. 07회의 스프링 데이터 JPA 연동 기능은 이 회차에서 본 <code>Predicate</code>를 리포지토리 메서드의 인자로 받는다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>Querydsl의 DTO 프로젝션은 JPQL에서 평범한 스칼라 조회이고, DTO는 Hibernate의 행 읽기 루프 안에서 Querydsl의 변환기가 리플렉션으로 만든다. 그래서 이름으로 짝을 짓는 bean·fields는 불일치를 조용히 넘기고, 타입으로 짝을 짓는 constructor는 런타임에, <code>@QueryProjection</code>은 컴파일 시점에 실패한다. where 조건은 불변 식 트리로 조립되며 null은 메타데이터에 들어가기 전에 버려지고, 값은 파라미터로 빠지므로 JPQL의 종류는 조건 조합 수로 제한된다. 벌크 연산은 영속성 컨텍스트를 건너뛰므로, 실행 뒤 flush·clear 없이 남은 엔티티는 낡은 값을 보여 주고 심하면 벌크 결과를 덮어쓴다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>프로젝션과 Tuple</dt><dd>select에 넘긴 식의 타입이 결과 타입이 된다. 식이 여럿이면 Querydsl은 식을 열쇠로 위치를 찾는 <code>Tuple</code>을 돌려주며, select에 없던 식으로 꺼내면 예외가 아니라 null이 나온다.</dd>
+<dt>DTO 프로젝션의 실행 경로</dt><dd>bean, fields, constructor, @QueryProjection 모두 JPQL에는 컬럼만 나열한다. Hibernate가 JDBC 행을 값 배열로 만들면 Querydsl의 <code>FactoryExpressionTransformer</code>가 리플렉션으로 DTO를 만든다.</dd>
+<dt>짝을 짓는 방식과 실패 시점</dt><dd>bean·fields는 이름으로 짝을 지어 불일치를 조용히 건너뛰고 타입 불일치는 식 생성 시 예외를 낸다. constructor는 타입·순서로 짝을 지어 식 생성 시 예외를 내며, @QueryProjection은 컴파일 오류로 잡는다.</dd>
+<dt>NULL과 record</dt><dd>NULL은 네 방식 모두에서 원시 타입 필드의 기본값(0)이 된다. record는 인자 없는 생성자가 없고 필드를 리플렉션으로 바꿀 수 없으므로 constructor 계열로만 담는다.</dd>
+<dt>BooleanBuilder</dt><dd>조건 하나를 담는 가변 빌더다. <code>and(null)</code>은 무시되고, 빈 빌더는 where에서 사라진다. 공유하면 조건이 누적된다.</dd>
+<dt>where 다중 파라미터</dt><dd>가변 인자의 null은 <code>addWhere</code>에서 버려진다. 조건을 이름 있는 <code>BooleanExpression</code> 메서드로 만들어 재사용하되, null을 돌려줄 수 있는 메서드 위에서 <code>and</code>를 호출하면 NullPointerException이 난다.</dd>
+<dt>쿼리 해석 캐시</dt><dd>Querydsl은 값을 파라미터로 바인딩하므로 동적 쿼리의 JPQL 종류는 조건 조합의 수로 제한되고, Hibernate는 같은 문자열의 해석 결과를 재사용한다(6.6.53 기본 최대 2048).</dd>
+<dt>벌크 연산</dt><dd>UPDATE·DELETE를 SQL 한 문장으로 실행하며 영속성 컨텍스트, 낙관적 락 검사, cascade를 모두 건너뛴다. 실행 뒤에는 flush와 clear로 영속성 컨텍스트를 비운다.</dd>
+<dt>SQL 함수 템플릿</dt><dd><code>Expressions.stringTemplate("function('이름', {0})", ...)</code>은 JPQL의 function 문법이 되고, Hibernate의 함수 등록부를 거쳐 방언의 SQL로 렌더링된다. 모르는 함수는 SQL로 그대로 넘어가 데이터베이스에서 실패한다.</dd>
+</x-summary>
+
+<x-review>
+<p>DTO 프로젝션 방식을 고를 때 실무에서 실제로 문제가 되는 것은 "어느 것이 더 편한가"보다 "실수가 언제 드러나는가"다. 엔티티 필드 이름을 리팩터링했는데 DTO 필드 이름은 그대로 둔 경우, fields 방식은 예외 없이 그 값만 비운 채 화면에 내보낸다. 이런 버그는 대개 사용자 신고로 발견된다. 반대로 constructor 방식은 첫 실행에서 예외가 나므로 테스트 한 번이면 잡힌다. 팀이 DTO에 Querydsl 의존성을 허용할 수 있다면 @QueryProjection이 가장 이르게 잡아 준다. 판단이 달라지는 조건은 DTO가 어느 계층까지 흘러가는가, 그리고 DTO가 API 계약처럼 외부에 노출되는가다.</p>
+
+<p>동적 쿼리에서 장애로 이어지는 패턴은 대부분 "모든 조건이 빠진 경우"다. 관리자 검색 화면에서 필터를 모두 비우고 조회를 누르면 where 없는 쿼리가 전체 테이블을 읽고, 결과가 엔티티라면 영속성 컨텍스트에 수십만 개의 객체와 상태 사본이 쌓인다. Querydsl은 이 쿼리를 정확하게 만들어 줄 뿐 막아 주지 않는다. 페이징을 강제하거나, 조건이 하나도 없을 때의 동작을 명시적으로 정하는 것은 호출하는 쪽의 책임이다. 또 값을 문자열에 이어 붙이는 코드가 섞이면 Hibernate의 해석 캐시가 값의 수만큼 늘어나 캐시 적중률이 떨어진다는 점도 성능 문제를 진단할 때 떠올릴 만하다.</p>
+
+<p>벌크 연산은 "한 문장으로 빠르다"는 장점만 보고 쓰기 쉽지만, 영속성 컨텍스트와의 관계를 놓치면 데이터가 조용히 되돌아가는 사고가 난다. 이 회차의 실험처럼 벌크 UPDATE 뒤에 같은 트랜잭션에서 낡은 엔티티를 수정하면, 전 컬럼 UPDATE가 벌크 결과를 덮어쓴다. 서비스 메서드 안에서 벌크 연산을 쓴다면 메서드의 맨 앞에 두거나, 직후에 flush·clear하고 필요한 엔티티를 다시 읽는 흐름으로 짠다. @Version으로 동시성을 관리하는 엔티티라면 벌크 UPDATE가 버전을 올리지 않는다는 점도 설계에 반영해야 한다.</p>
+</x-review>
+
+<x-practice>
+<li><code>Projections.fields(UserView.class, book.title, book.price)</code>로 조회했더니 모든 결과의 <code>name</code>이 null이었다. 예외가 나지 않은 이유를 <code>QBean</code>의 동작으로 설명하고, 고치는 방법을 두 가지 쓰라. 같은 실수를 <code>Projections.constructor</code>와 <code>@QueryProjection</code>으로 했다면 각각 어떻게 되었을지도 쓰라.</li>
+<li>다음 코드를 실행하면 어떤 JPQL where 절이 만들어지는지, 또는 어떤 예외가 나는지 예측하라. (가) <code>where(authorEq(null), priceGoe(null))</code> (나) <code>where(authorEq("kim").or(authorEq("lee")), priceGoe(26000))</code> (다) <code>where(authorEq(null).or(priceGoe(26000)))</code> (라) <code>new BooleanBuilder().and(authorEq(null)).or(priceGoe(26000))</code>를 where에 넣은 경우.</li>
+<li>Spring Data(25000), SQL Tuning(28000) 두 엔티티를 조회한 상태에서 <code>update(book).set(book.price, book.price.multiply(2)).where(book.price.lt(27000)).execute()</code>를 실행하고, clear 없이 두 엔티티를 다시 조회해 출력했다. 출력되는 가격과 데이터베이스의 실제 가격을 표로 그리고, 이어서 SQL Tuning 엔티티의 제목을 바꾸고 flush하면 데이터베이스의 가격 컬럼은 어떻게 되는지 설명하라.</li>
+<li>조건 메서드가 다섯 개인 검색 쿼리가 있다. 각 조건은 있을 수도 없을 수도 있고, 정렬은 가격 오름차순과 내림차순 중 하나를 고른다. 이 쿼리가 만들 수 있는 서로 다른 JPQL 문자열은 최대 몇 개인가. 이 개수가 Hibernate의 해석 캐시 크기와 어떤 관계인지, 사용자가 입력한 정렬 컬럼 이름을 문자열로 JPQL에 붙이도록 바꾸면 무엇이 달라지는지 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> <code>QBean</code>은 select 식마다 속성 이름(경로의 마지막 이름 <code>title</code>)을 정하고 DTO에서 같은 이름의 필드를 찾는다. <code>UserView</code>에는 <code>title</code> 필드가 없으므로 찾지 못하고, 이때 호출되는 <code>propertyNotFound</code>의 기본 구현이 아무것도 하지 않아 그 값은 버려진다. 고치는 방법은 별칭을 주는 것(<code>book.title.as("name")</code>)과 DTO 필드 이름을 <code>title</code>로 바꾸는 것이다. <code>Projections.constructor</code>는 이름을 보지 않으므로 <code>UserView</code>에 <code>(String, int)</code> 생성자가 있다면 정상 동작하고, 없다면 식을 만드는 순간 "No constructor found" 예외가 난다. <code>@QueryProjection</code>도 이름을 보지 않으며 생성자 시그니처로 생성된 Q 타입을 쓰므로, 타입이 맞으면 컴파일되고 정상 동작한다.</p>
+
+<p><b>2번.</b> (가) 두 인자가 모두 null이라 <code>addWhere</code>에서 버려지고 where 절이 없는 JPQL이 된다. (나) <code>authorEq("kim").or(authorEq("lee"))</code>가 OR 노드 하나가 되고 가격 조건과 AND로 묶이므로 <code>where (book.author = ?1 or book.author = ?2) and book.price >= ?3</code>이다. 자식 OR이 부모 AND보다 약하게 결합하므로 괄호가 붙는다. (다) <code>authorEq(null)</code>이 null을 돌려주고 그 위에서 <code>or</code>를 호출하므로 <code>NullPointerException</code>이다. <code>where</code>가 null을 너그럽게 다루는 것은 인자로 받은 null에 한해서다. (라) 빌더의 <code>and(null)</code>은 무시되어 빌더가 빈 상태로 남고, 빈 빌더에 <code>or(조건)</code>을 하면 그 조건이 그대로 값이 된다. 결과는 <code>where book.price >= ?1</code>이다.</p>
+
+<p><b>3번.</b> 벌크 UPDATE는 데이터베이스에서 27000 미만인 Spring Data만 50000으로 바꾸고(SQL Tuning 28000은 제외), 변경 행 수는 1이다. clear 없이 다시 조회하면 SQL은 실행되지만 두 엔티티 모두 이미 영속성 컨텍스트에 있으므로 행 값이 버려지고 Spring Data 25000, SQL Tuning 28000이 출력된다. 데이터베이스는 50000과 28000이다. SQL Tuning의 제목을 바꾸고 flush하면 Hibernate는 모든 컬럼을 쓰는 UPDATE를 보내고 가격 칸에는 힙의 값 28000을 넣는다. SQL Tuning은 벌크 대상이 아니었으므로 이 경우 데이터베이스의 가격은 여전히 28000으로 우연히 일치한다. 만약 Spring Data를 수정해 flush했다면 데이터베이스의 50000이 25000으로 덮어써졌을 것이다. 같은 실수가 어떤 엔티티에서는 무해하고 어떤 엔티티에서는 데이터를 되돌린다는 점이 이 버그를 찾기 어렵게 만든다.</p>
+
+<p><b>4번.</b> 조건 다섯 개의 있고 없음이 2의 5제곱 = 32가지, 정렬 방향이 2가지이므로 최대 64개다. 값은 파라미터로 바인딩되므로 사용자가 어떤 값을 넣든 JPQL 문자열은 이 64개 중 하나이고, Hibernate의 해석 캐시(6.6.53 기본 최대 2048)에 넉넉히 들어가 처음 몇 번 이후로는 해석을 재사용한다. 정렬 컬럼 이름을 사용자 입력 문자열로 JPQL에 붙이면 두 가지가 달라진다. 입력값의 종류만큼 JPQL 문자열이 늘어날 수 있어 캐시 항목 수의 상한이 사라지고, 문자열이 그대로 쿼리에 들어가므로 인젝션의 통로가 된다. 정렬 컬럼은 허용 목록에서 Q 타입의 경로(<code>book.price</code> 등)로 바꿔 넣어야 한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>queryFactory.select(Projections.constructor(BookDto.class, book.title, book.price))</code>를 Hibernate 6.6에서 실행할 때 일어나는 일로 옳은 것은?</q>
+<o>Querydsl이 JPQL <code>select new exp.BookDto(book.title, book.price)</code>를 만들고 Hibernate의 동적 인스턴스화가 생성자를 호출한다.</o>
+<o>JPQL에는 <code>book.title, book.price</code>만 나열되고, Hibernate가 행을 읽을 때 Querydsl이 설정한 변환기가 <code>Constructor.newInstance</code>로 DTO를 만든다.</o>
+<o>Querydsl이 엔티티 전체를 조회한 뒤 메모리에서 필요한 필드만 복사해 DTO를 만든다.</o>
+<o>생성자는 컴파일 시점에 결정되므로 인자 순서가 틀리면 컴파일 오류가 난다.</o>
+<why>실험에서 세 DTO 방식 모두 JPQL은 <code>select book.title, book.price</code>였고 new는 없었다. 호출 스택은 Hibernate의 <code>StandardRowReader</code> → <code>FactoryExpressionTransformer.transformTuple</code> → <code>ConstructorExpression.newInstance</code> → <code>Constructor.newInstance</code>였다. 엔티티를 조회하지 않으므로 SQL에도 두 컬럼만 나가고, 생성자 탐색은 식을 만드는 런타임에 일어나므로 순서 오류는 컴파일 오류가 아니라 <code>ExpressionException</code>이다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>DTO의 <code>int price</code> 필드에 조회 결과가 NULL인 값을 담으면 어떻게 되는가? (Querydsl 5.1.0 기준)</q>
+<o>bean과 fields는 0이 되고, constructor는 원시 타입에 null을 넣을 수 없어 <code>IllegalArgumentException</code>이 난다.</o>
+<o>네 방식 모두 <code>NullPointerException</code>이 난다.</o>
+<o>bean, fields, constructor, @QueryProjection 모두 예외 없이 0이 된다.</o>
+<o>Hibernate가 NULL 행을 결과에서 제외한다.</o>
+<why><code>QBean.newInstance</code>는 값이 null이면 대입을 건너뛰어 필드가 기본값 0으로 남는다. <code>ConstructorExpression</code>은 생성자 호출 전에 원시 타입 매개변수 자리의 null을 기본값으로 바꾸는 변환기를 거친다. @QueryProjection의 Q 타입은 <code>ConstructorExpression</code>을 상속하므로 같다. 실험에서 네 방식 모두 <code>price=0</code>이었다. 그래서 NULL을 구분해야 하는 필드는 래퍼 타입으로 선언한다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>책 엔티티 하나를 조회해 둔 상태에서 벌크 UPDATE로 그 책의 저자를 바꾸고, clear 없이 같은 엔티티의 가격을 수정해 flush했다. 데이터베이스의 저자 컬럼은 어떻게 되는가?</q>
+<o>변경 감지의 UPDATE가 모든 컬럼을 힙의 값으로 쓰므로 저자가 벌크 이전 값으로 되돌아간다.</o>
+<o>Hibernate가 벌크 UPDATE를 감지해 엔티티를 자동으로 새로 고치므로 저자는 벌크 결과대로 남는다.</o>
+<o>가격만 바뀌었으므로 UPDATE는 가격 컬럼만 쓰고 저자는 벌크 결과대로 남는다.</o>
+<o>영속성 컨텍스트와 데이터베이스가 다르므로 flush에서 <code>OptimisticLockException</code>이 난다.</o>
+<why>벌크 연산은 영속성 컨텍스트와 동기화되지 않으므로 엔티티의 저자 필드는 옛 값이다. 실험의 flush SQL은 <code>update Book set author=?,price=?,publisher_id=?,title=? where id=?</code>로 모든 컬럼을 썼고, 결과는 <code>Book(SQL Tuning, park, 30000)</code>으로 저자가 되돌아갔다. @Version이 없는 엔티티이므로 낙관적 락 예외도 없다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>저자와 최소 가격 두 조건을 where 다중 파라미터로 받는 동적 쿼리를 서로 다른 값으로 1000번 실행했다. Hibernate의 HQL 해석 캐시에 새로 생기는 항목 수의 최댓값과 그 이유로 옳은 것은?</q>
+<o>1000개. 값이 달라질 때마다 JPQL 문자열이 달라진다.</o>
+<o>2개. 조건이 두 개이기 때문이다.</o>
+<o>1개. Querydsl은 항상 같은 JPQL을 만들고 null 조건은 SQL 단계에서 제거된다.</o>
+<o>4개. 값은 파라미터로 바인딩되고, JPQL 문자열은 두 조건의 있고 없음 조합(4가지)으로만 달라진다.</o>
+<why>Querydsl은 상수를 <code>?1</code> 같은 파라미터로 직렬화하므로 값은 JPQL 문자열에 영향을 주지 않는다. null 조건은 JPQL을 만들기 전 <code>addWhere</code>에서 버려지므로 조건 조합마다 문자열이 달라진다. 실험에서 15회 실행 후 새 항목은 4개였고, 값을 문자열에 붙인 JPQL은 10회 실행에 10개가 생겼다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>Expressions.stringTemplate("function('my_func', {0})", book.title)</code>에서 <code>my_func</code>가 데이터베이스에도 Hibernate 등록부에도 없는 이름이라면, Hibernate 6.6.53 + H2에서 오류는 어디서 나는가?</q>
+<o>Querydsl이 템플릿을 직렬화할 때 알 수 없는 함수라며 예외를 던진다.</o>
+<o>Hibernate는 SQL에 <code>my_func(...)</code>를 그대로 렌더링하고, 데이터베이스가 문장을 준비하는 단계에서 함수를 찾지 못해 실패한다.</o>
+<o>Hibernate가 JPQL을 해석하는 단계에서 등록되지 않은 함수라며 <code>SemanticException</code>을 던진다.</o>
+<o>컴파일 시점에 Q 타입 생성기가 함수 이름을 검사해 오류를 낸다.</o>
+<why>실험에서 Hibernate는 <code>select my_func(b1_0.title) from Book b1_0</code>를 만들었고, H2가 <code>Function "MY_FUNC" not found</code>로 거부했다. Hibernate는 이를 <code>SQLGrammarException</code>("could not prepare statement")으로 감쌌다. 템플릿은 문자열이므로 컴파일러와 Querydsl은 함수 이름을 검사하지 않는다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>프로젝션(projection)</dt><dd>select 절에서 무엇을 가져올지 정하는 일. Querydsl에서는 <code>select</code>에 넘긴 식이 프로젝션이고, 그 식의 타입이 결과 원소의 타입이 된다.</dd>
+<dt>FactoryExpression</dt><dd>값 배열을 받아 객체를 만드는 <code>newInstance(Object...)</code>를 가진 Querydsl 식. <code>QTuple</code>, <code>QBean</code>, <code>ConstructorExpression</code>, @QueryProjection이 생성한 Q 타입이 모두 이것이다.</dd>
+<dt>생성자 표현식(constructor expression)</dt><dd>JPQL select 절의 <code>new 패키지.클래스(...)</code> 문법. JPA 명세상 클래스 이름은 완전한 이름이어야 하며, 객체는 JPA 구현체가 만든다.</dd>
+<dt>@QueryProjection</dt><dd>DTO 생성자에 붙이면 애노테이션 프로세서가 그 생성자의 시그니처를 제네릭 매개변수로 옮긴 Q 타입(<code>ConstructorExpression</code>의 하위 클래스)을 생성하는 Querydsl 애노테이션.</dd>
+<dt>BooleanBuilder</dt><dd>조건 식 하나를 담고 <code>and</code>, <code>or</code> 호출마다 그 값을 바꾸는 가변 Predicate. null 인자는 무시한다.</dd>
+<dt>벌크 연산(bulk operation)</dt><dd>여러 행을 UPDATE나 DELETE 한 문장으로 바꾸는 JPQL 연산. 영속성 컨텍스트, 낙관적 락 검사, cascade를 거치지 않는다.</dd>
+<dt>HQL 해석 캐시(query interpretation cache)</dt><dd>Hibernate가 HQL/JPQL 문자열을 해석한 결과를 보관해 같은 문자열이 다시 오면 재사용하는 캐시. 6.6.53의 기본 최대 크기는 2048이다.</dd>
+<dt>함수 등록부(function registry)</dt><dd>Hibernate가 HQL에서 쓸 수 있는 함수와 그 SQL 렌더링 방식을 모아 둔 곳. 방언과 <code>FunctionContributor</code>가 함수를 등록한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html">Jakarta Persistence 3.1 Specification</a> — 4.6.16절 서브쿼리 위치 제한, 4.8.2절 생성자 표현식(완전한 클래스 이름), 4.10절 벌크 UPDATE·DELETE와 영속성 컨텍스트·낙관적 락·cascade</li>
+<li><a href="https://javadoc.io/static/com.querydsl/querydsl-core/5.1.0/com/querydsl/core/types/Projections.html">Querydsl 5.1.0 Javadoc: Projections</a> — bean, fields, constructor, tuple 팩토리 메서드의 정의</li>
+<li><a href="https://docs.hibernate.org/orm/6.6/querylanguage/html_single/Hibernate_Query_Language.html">Hibernate ORM 6.6 Query Language Guide</a> — function 문법, replace·str 함수, FunctionContributor와 함수 등록</li>
+<li><a href="https://dev.mysql.com/doc/c-api/8.0/en/mysql-affected-rows.html">MySQL 8.0 C API: mysql_affected_rows()</a> — UPDATE의 affected rows와 CLIENT_FOUND_ROWS</li>
+<li><a href="https://dev.mysql.com/doc/connector-j/en/connector-j-connp-props-connection.html">MySQL Connector/J: Connection 설정 속성</a> — useAffectedRows의 의미와 기본값</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-index.html">MySQL 8.0 Reference Manual: CREATE INDEX</a> — 함수 키 파트(8.0.13 이상)와 인덱스 사용 조건</li>
+</x-refs>

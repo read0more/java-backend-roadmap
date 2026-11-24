@@ -1,0 +1,744 @@
+<x-meta>
+deck: 주문 목록 API 하나가 엔티티 노출, DTO 변환, 페치 조인, DTO 직접 조회를 거치며 SQL 15개에서 1개로 줄어드는 과정을 Jackson 직렬화, 프록시, 영속성 컨텍스트, DB 왕복의 수준에서 실행 결과로 따라간다.
+minutes: 100
+</x-meta>
+
+<x-goals>
+<li>엔티티를 응답으로 그대로 반환했을 때 Jackson이 객체 그래프를 순회하며 지연 로딩을 일으키고, 프록시의 <code>hibernateLazyInitializer</code> 속성과 양방향 참조 때문에 실패하는 과정을 오류 메시지의 참조 경로로 설명할 수 있다.</li>
+<li>DTO로 변환한 조회에서 실행되는 SQL 수를 "1 + 서로 다른 회원 수 + 주문 수"처럼 데이터 분포로 계산하고, 1차 캐시가 일부 쿼리를 없애는 이유를 프록시 인스턴스의 동일성으로 설명할 수 있다.</li>
+<li>페치 조인이 만드는 SQL의 SELECT 목록과 조인 종류를 읽고, 일반 조인과 페치 조인의 차이, 이미 영속성 컨텍스트에 있던 프록시가 페치 조인 뒤에도 프록시로 남는 이유를 설명할 수 있다.</li>
+<li>JPQL 생성자 표현식(<code>select new</code>)의 명세 규칙과 페치 조인을 함께 쓸 수 없는 이유를 설명하고, V3와 V4 중 무엇을 고를지 전송 컬럼, 관리 엔티티 수, 재사용성으로 판단할 수 있다.</li>
+<li>샘플 데이터를 넣는 <code>@PostConstruct</code> 메서드에 붙인 <code>@Transactional</code>이 동작하지 않는 이유를 빈 생명주기와 프록시 생성 시점으로 설명하고 안전한 대안을 고를 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 주문 목록 API 하나는 SQL 몇 개가 되는가</h3>
+
+<p>주문 목록을 돌려주는 API를 생각해 보자. 화면에는 주문 번호, 주문한 회원의 이름, 주문 시각, 주문 상태, 배송지 주소가 한 줄씩 나온다. 컨트롤러 코드는 세 줄이면 끝난다. 리포지토리에서 주문 목록을 꺼내고, 필요한 모양으로 바꿔서 반환한다. 그런데 이 세 줄이 데이터베이스에 보내는 SQL의 개수는 코드를 어떻게 쓰느냐에 따라 1개가 되기도 하고 15개가 되기도 한다. 주문이 4건뿐인 작은 데이터로 실험했을 때의 숫자다. 주문이 100건이면 같은 코드가 수백 개의 SQL을 보낸다.</p>
+
+<p>이 회차는 같은 요구사항을 네 가지 방식으로 구현하면서 그 차이가 어디에서 생기는지 따라간다. V1은 엔티티를 응답으로 그대로 반환한다. V2는 엔티티를 DTO로 변환해서 반환한다. V3는 변환은 그대로 두고 조회 쿼리에 페치 조인을 쓴다. V4는 JPQL에서 DTO를 바로 만들어 반환한다. 아래 표가 이 회차에서 직접 돌려 본 결과의 요약이다. 숫자가 왜 이렇게 나오는지가 이 회차의 내용 전부다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>버전</th><th>방식</th><th>주문 4건 조회 시 SQL 수</th><th>SELECT 컬럼 수</th><th>영속성 컨텍스트에 남는 엔티티</th></tr></thead><tbody>
+<tr><td>V1</td><td>엔티티를 그대로 JSON으로</td><td>15 (그나마 오류를 우회한 뒤)</td><td>쿼리마다 다름</td><td>주문·회원·주문상품·상품·배송 전부</td></tr>
+<tr><td>V2</td><td>엔티티 조회 후 DTO로 변환</td><td>8</td><td>쿼리마다 다름</td><td>11</td></tr>
+<tr><td>V3</td><td>페치 조인 후 DTO로 변환</td><td>1</td><td>15</td><td>11</td></tr>
+<tr><td>V4</td><td>JPQL에서 DTO로 바로 조회</td><td>1</td><td>7</td><td>0</td></tr>
+</tbody></table></div>
+
+<p>앞 권과 앞 회차에서 다룬 내용은 전제로 둔다. JPA 활용 1의 02회에서 연관관계를 모두 지연 로딩으로 두고, 지연 로딩이 엔티티를 상속한 프록시로 구현된다는 것을 보았다. 같은 권 05회에서는 영속성 컨텍스트가 요청이 끝날 때까지 살아 있는 OSIV를 만났다. 이 권 01회는 요청과 응답에 엔티티 대신 DTO를 써서 API 스펙을 엔티티에서 떼어 내야 하는 이유를 스펙 관점에서 다뤘다. 이 회차는 같은 문제를 성능과 런타임 동작의 관점에서 다시 본다. 범위는 주문에서 회원, 주문에서 배송처럼 <b>대상이 하나인 연관(ToOne)</b>까지다. 주문에서 주문상품 목록처럼 컬렉션을 따라가는 조회는 03회와 04회의 몫이고, OSIV가 커넥션을 붙잡는 문제는 05회에서 다룬다.</p>
+
+<h3>고급 편이 조회에서 시작하는 이유</h3>
+
+<p>등록과 수정은 대개 한 건을 다룬다. 회원 가입은 회원 한 행을 넣고, 주문은 주문 한 건과 그에 딸린 몇 행을 넣는다. 수정은 식별자로 엔티티 하나를 찾아 값을 바꾼다. 다루는 행의 수가 요청 하나에 묶여 있고, 어떤 SQL이 나갈지가 서비스 코드에 비교적 그대로 드러난다. 성능 문제가 생기더라도 원인이 되는 코드가 눈에 보이는 곳에 있다.</p>
+
+<p>조회는 다르다. 목록 화면 하나를 그리려면 여러 엔티티를 가로질러 읽어야 하고, 행마다 같은 일이 반복되므로 행 하나의 비용이 결과 행 수만큼 곱해진다. 더 곤란한 것은 지연 로딩이 SQL을 게터 뒤로 숨긴다는 점이다. <code>order.getMember().getName()</code>은 필드 두 개를 읽는 코드처럼 보이지만, 그 회원이 아직 로딩되지 않았다면 이 한 줄이 데이터베이스까지 다녀오는 왕복이 된다. 코드 리뷰에서는 보이지 않고, 데이터가 적은 개발 환경에서는 느리지도 않다. 운영 데이터가 쌓이고 나서야 드러난다.</p>
+
+<p>그래서 이 권의 후반부는 조회 성능을 단계적으로 다룬다. 이 회차가 ToOne 연관에서 엔티티 노출, DTO 변환, 페치 조인, DTO 직접 조회까지 네 단계를 밟고, 03회가 컬렉션을 페치 조인할 때의 행 증가와 페이징 한계, 그리고 배치 크기로 지연 로딩을 IN 쿼리로 묶는 방법을, 04회가 컬렉션까지 DTO로 직접 조회하는 방법을, 05회가 OSIV와 커넥션 점유 시간을 다룬다. 단계마다 던지는 질문은 같다. <b>어떤 객체 그래프를, 몇 번의 SQL로, 누가, 언제 읽는가.</b></p>
+
+<h3>실험 환경과 조회용 샘플 데이터</h3>
+
+<p>이 회차의 실행 결과는 모두 직접 돌려 본 것이다. 환경은 Java 21(Temurin 21.0.13), Hibernate ORM 6.6.53.Final, H2 2.3.232 메모리 데이터베이스, Jackson 2.21.4다. Hibernate는 스프링 없이 <code>SessionFactory</code>를 직접 만들어 썼고, SQL 로그는 <code>hibernate.show_sql</code>로, 실행된 문장 수는 Hibernate 통계의 <code>getPrepareStatementCount()</code>로 셌다. Jackson의 <code>ObjectMapper</code>에는 스프링 부트의 기본 설정과 비슷하게 자바 날짜·시간 모듈(<code>JavaTimeModule</code>)을 등록하고 날짜를 타임스탬프 숫자로 쓰는 기능(<code>WRITE_DATES_AS_TIMESTAMPS</code>)을 껐다. 샘플 데이터를 넣는 시점에 대한 실험만 Spring Framework 6.2.19로 따로 돌렸다.</p>
+
+<p>스프링 부트는 엔티티의 카멜 표기 이름을 밑줄 표기로 바꾸는 물리 명명 전략을 기본으로 쓰므로, 스프링 부트 애플리케이션에서는 아래 로그의 <code>OrderLine</code>, <code>orderedAt</code>이 <code>order_line</code>, <code>ordered_at</code>으로 나온다. 이 실험은 Hibernate만 썼기 때문에 이름이 그대로 나온다. 그 밖의 SQL 구조는 같다.</p>
+
+<p>엔티티는 JPA 활용 1에서 설계한 주문 도메인을 그대로 쓴다. 회원(<code>Member</code>), 주문(<code>Order</code>, 테이블 이름 <code>orders</code>), 주문상품(<code>OrderLine</code>), 배송(<code>Delivery</code>), 상품(<code>Product</code>)이다. 상품의 상속 계층(원두와 도구)은 이 회차의 질문과 관계가 없어서 실험에서는 단일 엔티티로 줄였다. 이 회차에서 중요한 부분만 다시 보면 다음과 같다.</p>
+
+<pre><code class="language-java">@Entity
+@Table(name = "orders")
+public class Order {
+
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "order_id")
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "member_id")
+    private Member member;                       // ToOne: 프록시가 들어온다
+
+    @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<OrderLine> lines = new ArrayList<>();   // 컬렉션: 03회의 주제
+
+    @OneToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL, optional = false)
+    @JoinColumn(name = "delivery_id", unique = true)
+    private Delivery delivery;                   // ToOne: 프록시가 들어온다
+
+    private LocalDateTime orderedAt;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 20)
+    private OrderStatus status;
+
+    // 생성자, addLine(), cancel() 은 JPA 활용 1과 같다
+    public Long getId() { return id; }
+    public Member getMember() { return member; }
+    public List<OrderLine> getLines() { return Collections.unmodifiableList(lines); }
+    public Delivery getDelivery() { return delivery; }
+    public LocalDateTime getOrderedAt() { return orderedAt; }
+    public OrderStatus getStatus() { return status; }
+}
+
+@Entity
+public class OrderLine {
+    // ... id, unitPrice, quantity
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "order_id")
+    private Order order;                         // 주문 ↔ 주문상품은 양방향이다
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "product_id")
+    private Product product;
+
+    public Order getOrder() { return order; }
+    public Product getProduct() { return product; }
+    // ... 나머지 게터
+}</code></pre>
+
+<p>앞 권과 달라진 점은 게터가 늘었다는 것 하나다. JSON으로 바꾸는 라이브러리는 게터를 보고 무엇을 내보낼지 정하기 때문에, V1 실험을 위해 <code>OrderLine.getOrder()</code>까지 열어 두었다. 이 게터 하나가 뒤에서 어떤 일을 일으키는지가 V1의 두 번째 벽이다.</p>
+
+<h4>조회용 샘플 데이터의 설계</h4>
+
+<p>조회 성능을 실험하려면 데이터의 <b>분포</b>가 중요하다. 회원마다 주문이 한 건씩이면 회원을 조회하는 쿼리 수와 주문 수가 같아져서, 1차 캐시가 쿼리를 줄이는 효과가 보이지 않는다. 같은 상품이 여러 주문에 들어 있지 않으면 상품 쪽도 마찬가지다. 그래서 회원 세 명이 주문 네 건을 하되 한 회원이 두 번 주문하고, 한 상품이 두 주문에 들어가도록 만들었다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>주문</th><th>회원(주소)</th><th>주문상품</th><th>주문 시각</th></tr></thead><tbody>
+<tr><td>1</td><td>김하나(서울)</td><td>에티오피아 원두 × 2</td><td>2026-11-01 10:00</td></tr>
+<tr><td>2</td><td>이두리(부산)</td><td>콜롬비아 원두 × 1</td><td>2026-11-02 10:00</td></tr>
+<tr><td>3</td><td>김하나(서울)</td><td>드리퍼 × 1</td><td>2026-11-03 10:00</td></tr>
+<tr><td>4</td><td>박세나(대전)</td><td>에티오피아 원두 × 1</td><td>2026-11-04 10:00</td></tr>
+</tbody></table></div>
+
+<p>배송지는 주문 시점의 회원 주소를 복사했다. 배송은 주문과 일대일이므로 배송 행은 주문 수와 같은 네 개다. 이 데이터를 한 트랜잭션에서 넣었을 때 Hibernate가 실행한 문장은 18개였다. 상품 3개, 회원 3개, 그리고 주문 한 건마다 다음 세 문장이 이 순서로 반복되었다.</p>
+
+<pre data-label="실행 결과 (주문 한 건분)"><code class="language-text">Hibernate: insert into Delivery (city,street,zipcode,status,delivery_id) values (?,?,?,?,default)
+Hibernate: insert into orders (delivery_id,member_id,orderedAt,status,order_id) values (?,?,?,?,default)
+Hibernate: insert into OrderLine (order_id,product_id,quantity,unitPrice,order_line_id) values (?,?,?,?,default)</code></pre>
+
+<p>코드에서는 <code>em.persist(order)</code> 한 번만 불렀다. 배송과 주문상품은 영속성 전이(cascade)로 따라 저장되었다. 순서가 흥미롭다. 배송이 주문보다 먼저, 주문상품이 주문보다 나중에 들어갔다. 외래 키가 이 순서를 요구한다. <code>orders.delivery_id</code>는 NOT NULL 외래 키이고 배송의 기본 키는 IDENTITY 전략이라 INSERT를 실행해야 값이 정해지므로, 주문 행을 넣기 전에 배송 행이 먼저 있어야 한다. 반대로 <code>OrderLine.order_id</code>는 주문의 키를 가리키므로 주문이 먼저 들어가야 한다. IDENTITY 전략에서는 키를 얻기 위해 <code>persist</code> 시점에 INSERT가 바로 실행된다는 점(JPA 기본편 03회)까지 겹쳐서, 로그에는 쓰기 지연 없이 외래 키가 요구하는 순서 그대로 문장이 찍혔다.</p>
+
+<h3>샘플 데이터를 넣는 시점: @PostConstruct와 트랜잭션 프록시</h3>
+
+<p>실제 스프링 부트 애플리케이션에서는 이 데이터를 애플리케이션이 뜰 때 넣고 싶다. 가장 먼저 떠오르는 방법은 컴포넌트를 하나 만들고, 초기화 콜백인 <code>@PostConstruct</code> 메서드에 <code>@Transactional</code>을 붙여 엔티티를 저장하는 것이다. 이 방법은 동작하지 않는다. <code>EntityManager.persist()</code>를 부르는 순간 다음 예외가 난다.</p>
+
+<pre data-label="스프링 ORM이 던지는 예외 메시지"><code class="language-text">jakarta.persistence.TransactionRequiredException:
+  No EntityManager with actual transaction available for current thread - cannot reliably process 'persist' call</code></pre>
+
+<p>스프링이 주입하는 <code>EntityManager</code>는 진짜 엔티티 매니저가 아니라, 호출될 때마다 현재 스레드에 묶인 트랜잭션의 엔티티 매니저를 찾아 위임하는 공유 프록시다(JPA 활용 1 03회). 트랜잭션이 없으니 위임할 대상이 없고, 쓰기 연산인 <code>persist</code>는 거절된다. 문제는 왜 트랜잭션이 없느냐다. 답은 빈의 생명주기에서 <b>초기화 콜백이 호출되는 시점</b>과 <b>프록시가 만들어지는 시점</b>의 순서에 있다.</p>
+
+<figure class="flow-figure"><figcaption>싱글톤 빈 하나가 만들어지는 순서 (스프링 프레임워크)</figcaption><ol class="flow">
+<li><strong>인스턴스 생성</strong><span>생성자를 호출해 원본 객체를 만든다. 생성자 주입이면 의존 빈은 이 시점에 이미 완성되어 있다.</span></li>
+<li><strong>의존관계 주입</strong><span>필드·세터 주입이 끝난다.</span></li>
+<li><strong>초기화 전 후처리</strong><span>빈 후처리기의 <code>postProcessBeforeInitialization</code>. 공통 애너테이션 후처리기가 여기서 <code>@PostConstruct</code> 메서드를 <b>원본 객체</b>에 대해 호출한다.</span></li>
+<li><strong>초기화 후 후처리</strong><span><code>postProcessAfterInitialization</code>. 자동 프록시 생성기가 <code>@Transactional</code>을 보고 원본을 감싼 CGLIB 프록시를 만들어 돌려준다.</span></li>
+<li><strong>컨테이너 등록</strong><span>컨테이너가 보관하고 다른 빈에 주입하는 것은 4단계의 프록시다.</span></li>
+</ol></figure>
+
+<p><code>@PostConstruct</code>는 3단계에서 원본 객체의 메서드로 직접 호출된다. 트랜잭션을 시작하는 코드는 4단계에서 만들어지는 프록시 안에 있으므로, 3단계의 호출은 그 코드를 지나지 않는다. 같은 클래스 안에서 자기 메서드를 부를 때 트랜잭션이 걸리지 않는 자기 호출(self-invocation) 문제와 같은 구조다. 아직 프록시가 없다는 점에서 오히려 더 근본적이다.</p>
+
+<p>스프링 6.2.19와 가짜 트랜잭션 매니저(시작·커밋 시 로그만 찍는 <code>AbstractPlatformTransactionManager</code> 구현)로 확인해 보았다. <code>SelfSeeder</code>는 <code>@PostConstruct</code> 메서드에 <code>@Transactional</code>을 직접 붙인 빈이고, <code>Seeder</code>는 <code>@PostConstruct</code>에서 다른 빈 <code>SeedService</code>의 <code>@Transactional</code> 메서드를 부르는 빈이다. 각 메서드는 <code>TransactionSynchronizationManager.isActualTransactionActive()</code>를 출력한다. 컨텍스트가 뜬 뒤에는 컨테이너에서 <code>SelfSeeder</code>를 꺼내 같은 메서드를 한 번 더 불렀다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">Seeder.init: seedService=App$SeedService$$SpringCGLIB$$0
+  [tx] begin seed.App$SeedService.insertSamples
+SeedService.insertSamples: txActive=true
+  [tx] commit
+SelfSeeder.init: txActive=false this=SelfSeeder
+selfSeeder bean class=App$SelfSeeder$$SpringCGLIB$$0
+  [tx] begin seed.App$SelfSeeder.init
+SelfSeeder.init: txActive=true this=SelfSeeder</code></pre>
+
+<p>다섯 번째 줄이 문제의 장면이다. 초기화 콜백으로 불린 <code>SelfSeeder.init</code>에서는 트랜잭션이 없다. 그런데 컨테이너에 등록된 빈의 클래스는 <code>App$SelfSeeder$$SpringCGLIB$$0</code>, 즉 프록시다. 같은 메서드를 컨텍스트가 뜬 뒤 프록시를 통해 부르면 트랜잭션이 시작된다(마지막 두 줄). 애너테이션은 무시된 것이 아니라 <b>프록시를 거치지 않은 호출에 적용될 방법이 없었던</b> 것이다.</p>
+
+<p>반면 <code>Seeder</code>에 주입된 <code>SeedService</code>는 이미 프록시였고(첫 줄), 그 메서드를 부르자 트랜잭션이 시작되었다. 생성자 주입은 의존 빈이 1~5단계를 모두 마친 뒤에야 이루어지기 때문이다. 그래서 샘플 데이터는 보통 두 개의 빈으로 나눈다. 데이터를 넣는 메서드는 트랜잭션이 걸린 별도 빈에 두고, 초기화 콜백에서는 그 빈을 부르기만 한다.</p>
+
+<pre><code class="language-java">@Component
+@Profile("local")                       // 로컬에서만. 테스트·운영 데이터베이스에 넣지 않는다
+public class SampleDataLoader {
+
+    private final SampleDataService sampleDataService;
+
+    public SampleDataLoader(SampleDataService sampleDataService) {
+        this.sampleDataService = sampleDataService;   // 주입되는 것은 이미 프록시다
+    }
+
+    @PostConstruct
+    public void load() {
+        sampleDataService.insertSamples();            // 프록시를 거치므로 트랜잭션이 시작된다
+    }
+}
+
+@Service
+@Profile("local")
+public class SampleDataService {
+
+    private final EntityManager em;
+
+    public SampleDataService(EntityManager em) { this.em = em; }
+
+    @Transactional
+    public void insertSamples() {
+        Product ethiopia = new Product("에티오피아 원두", 18000);
+        Product colombia = new Product("콜롬비아 원두", 16000);
+        Product dripper  = new Product("드리퍼", 25000);
+        em.persist(ethiopia); em.persist(colombia); em.persist(dripper);
+
+        Member kim  = new Member("김하나", new Address("서울", "율곡로 10", "03154"));
+        Member lee  = new Member("이두리", new Address("부산", "중앙대로 20", "48939"));
+        Member park = new Member("박세나", new Address("대전", "둔산로 30", "35242"));
+        em.persist(kim); em.persist(lee); em.persist(park);
+
+        order(kim,  ethiopia, 2, LocalDateTime.of(2026, 11, 1, 10, 0));
+        order(lee,  colombia, 1, LocalDateTime.of(2026, 11, 2, 10, 0));
+        order(kim,  dripper,  1, LocalDateTime.of(2026, 11, 3, 10, 0));
+        order(park, ethiopia, 1, LocalDateTime.of(2026, 11, 4, 10, 0));
+    }
+
+    private void order(Member member, Product product, int quantity, LocalDateTime at) {
+        Order order = new Order(member, new Delivery(member.getAddress()), at);
+        order.addLine(new OrderLine(product, product.getPrice(), quantity));
+        em.persist(order);                            // 배송·주문상품은 cascade로 함께 저장
+    }
+}</code></pre>
+
+<p>이 방식은 실험처럼 대부분의 경우 동작하지만, 스프링 공식 문서는 한 걸음 더 조심스럽다. "Using @Transactional" 절은 프록시가 완전히 초기화되어야 기대한 대로 동작하므로 <code>@PostConstruct</code> 같은 초기화 코드에서 이 기능에 기대지 말라고 적어 둔다. 초기화 콜백이 도는 시점에는 컨텍스트의 다른 빈들이 아직 만들어지는 중이기 때문이다. 더 안전한 자리는 컨텍스트가 완전히 준비된 뒤다. 스프링 부트의 <code>ApplicationRunner</code>(또는 <code>CommandLineRunner</code>)는 컨텍스트가 모두 새로 고쳐진 뒤 <code>SpringApplication.run()</code>이 호출해 주는 콜백이다.</p>
+
+<pre><code class="language-java">@Configuration
+@Profile("local")
+public class SampleDataConfig {
+
+    @Bean
+    ApplicationRunner sampleData(SampleDataService sampleDataService) {
+        return args -> sampleDataService.insertSamples();   // 컨텍스트가 준비된 뒤 한 번 실행
+    }
+}</code></pre>
+
+<p>어느 쪽이든 <code>@Profile</code>로 범위를 좁혀 두는 것이 중요하다. 통합 테스트도 같은 스프링 컨텍스트를 띄우므로, 범위를 정하지 않으면 테스트가 시작될 때마다 샘플 데이터가 들어가 테스트가 기대하는 행 수가 틀어진다.</p>
+
+<h3>V1: 엔티티를 그대로 반환하면, 직렬화는 객체 그래프 순회다</h3>
+
+<p>이제 첫 번째 구현이다. 주문을 모두 꺼내 엔티티 목록을 그대로 반환한다.</p>
+
+<pre><code class="language-java">@RestController
+public class OrderSummaryController {
+
+    private final OrderRepository orderRepository;
+
+    public OrderSummaryController(OrderRepository orderRepository) {
+        this.orderRepository = orderRepository;
+    }
+
+    @GetMapping("/api/v1/order-summaries")
+    public List<Order> summariesV1() {
+        return orderRepository.findAll();     // select o from Order o
+    }
+}</code></pre>
+
+<p>이 메서드가 반환한 뒤의 흐름은 스프링 MVC 편에서 보았다. 반환 값 처리기가 <code>@RestController</code>의 반환 값을 HTTP 메시지 컨버터에 넘기고, JSON 컨버터는 Jackson의 <code>ObjectMapper</code>로 객체를 JSON 바이트로 바꿔 응답 본문에 쓴다. 여기서 봐야 할 것은 마지막 단계, Jackson이 자바 객체를 JSON으로 바꾸는 방식이다.</p>
+
+<p>Jackson은 값의 <b>런타임 클래스</b>마다 직렬화기(serializer)를 하나씩 만든다. 처음 보는 클래스면 리플렉션으로 클래스를 훑어 속성(property) 목록을 만든다. 공개 게터(<code>getX()</code>, <code>isX()</code>), 공개 필드, 애너테이션이 붙은 필드가 속성이 된다. 그 목록으로 빈 직렬화기를 조립해 캐시에 넣고, 같은 클래스의 객체를 만나면 다시 쓴다. 실제 직렬화는 이 속성들을 차례로 꺼내면서 진행된다. 속성 값이 문자열이나 숫자면 바로 쓰고, 다른 객체면 그 객체의 런타임 클래스에 맞는 직렬화기를 찾아 같은 일을 재귀적으로 한다. 컬렉션이면 원소마다 반복한다.</p>
+
+<p>즉 직렬화는 <b>게터를 호출하며 객체 그래프를 깊이 우선으로 순회하는 일</b>이다. JPA 엔티티에서 게터는 평범한 메서드가 아니다. 지연 로딩 연관의 게터가 돌려주는 프록시는 메서드가 불리는 순간 데이터베이스를 조회한다. 컬렉션도 Hibernate의 영속 컬렉션이라서 처음 순회할 때 SQL이 나간다. 그러니 엔티티를 JSON으로 바꾸는 일은 Jackson이 엔티티 그래프를 따라가며 지연 로딩을 모조리 일으키는 일이 된다. Jackson은 무엇이 필요한 데이터인지 모른다. 게터가 있으면 부른다.</p>
+
+<p>이 순회가 SQL을 실행할 수 있는 것은 직렬화 시점에 영속성 컨텍스트가 아직 열려 있기 때문이다. 리포지토리 호출이 끝나 서비스의 트랜잭션은 이미 끝났지만, 스프링 부트는 기본 설정에서 OSIV를 켜 두므로(<code>spring.jpa.open-in-view</code>, 05회) 영속성 컨텍스트가 응답을 쓸 때까지 살아 있다. 이 설정을 끄면 같은 코드가 다른 방식으로 실패한다. 그 모습도 뒤에서 본다.</p>
+
+<x-visual id="jpa-app2-02-jackson-traversal" title="Jackson이 주문 엔티티 그래프를 순회하며 지연 로딩을 일으키는 모습" kind="흐름도" ratio="16:9">
+<x-hint>직렬화가 게터 호출을 따라가는 깊이 우선 순회이고, 프록시를 만나면 SQL이 나가며, 프록시가 가진 hibernateLazyInitializer 속성에서 실패한다는 것을 보여 준다.</x-hint>
+<x-prompt>Left-to-right flow diagram on a light background. Leftmost box labeled "ObjectMapper". An arrow goes to a box "Order#1 (엔티티)". From it, three branching arrows labeled "getMember()", "getLines()", "getDelivery()". The getMember() arrow leads to a dashed-outline box "Member$HibernateProxy" which has a small database cylinder icon attached with a lightning arrow labeled "SELECT member". Inside the proxy box show two rows: "name, address" (green check) and "hibernateLazyInitializer" (red X). A red callout from the red X reads "빈 객체: 직렬화 실패". The getLines() arrow leads to a box "OrderLine 목록" with its own database cylinder labeled "SELECT order_line", and from OrderLine a curved arrow labeled "getOrder()" loops back to the "Order#1 (엔티티)" box, colored orange, with a label "순환". Bottom caption area empty. Use flat style, simple sans-serif font.</x-prompt>
+<x-caption>Jackson은 게터를 따라 그래프를 내려가며 프록시를 초기화하고, 프록시 고유의 속성과 양방향 참조에서 막힌다.</x-caption>
+</x-visual>
+
+<h3>V1의 첫 번째 벽: 프록시는 직렬화할 수 있는 빈이 아니다</h3>
+
+<p>영속성 컨텍스트를 연 채로 <code>select o from Order o</code>의 결과를 Jackson에 넘겨 보았다. 먼저 첫 주문의 <code>getMember()</code>가 돌려준 객체를 리플렉션으로 들여다봤다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select o1_0.order_id,o1_0.delivery_id,o1_0.member_id,o1_0.orderedAt,o1_0.status from orders o1_0
+member class=demo.Member$HibernateProxy super=demo.Member ifaces=[interface org.hibernate.proxy.HibernateProxy, interface org.hibernate.proxy.ProxyConfiguration]
+  proxy field: private org.hibernate.proxy.ProxyConfiguration$Interceptor $$_hibernate_interceptor
+  proxy field: private static final java.lang.reflect.Method cachedValue$6DkVRLOh$4cscpe1
+  ... (같은 형태의 static Method 필드가 8개 더)
+initialized? false</code></pre>
+
+<p>주문 쿼리는 <code>orders</code> 테이블의 컬럼만 읽었다. <code>member_id</code> 값은 알지만 회원 행은 읽지 않았으므로, Hibernate는 그 식별자를 가진 프록시를 만들어 <code>member</code> 필드에 넣었다. 프록시 클래스 <code>Member$HibernateProxy</code>는 바이트 버디(Byte Buddy)가 런타임에 만든 <code>Member</code>의 하위 클래스이고, <code>HibernateProxy</code> 인터페이스를 구현하며, 인스턴스 필드는 인터셉터를 가리키는 <code>$$_hibernate_interceptor</code> 하나뿐이다. 회원의 이름이나 주소를 담는 필드는 상위 클래스 <code>Member</code>에 있지만 프록시 인스턴스에서는 비어 있다. 진짜 값은 초기화 때 인터셉터가 따로 만들어 붙잡는 대상 객체(target)에 들어간다. 이 구조는 JPA 기본편 07회에서 자세히 보았다.</p>
+
+<p>이 목록을 직렬화하자 SQL 하나가 더 나가고 예외가 났다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select m1_0.member_id,m1_0.city,m1_0.street,m1_0.zipcode,m1_0.name from Member m1_0 where m1_0.member_id=?
+com.fasterxml.jackson.databind.exc.InvalidDefinitionException: No serializer found for class org.hibernate.proxy.pojo.bytebuddy.ByteBuddyInterceptor and no properties discovered to create BeanSerializer (to avoid exception, disable SerializationFeature.FAIL_ON_EMPTY_BEANS) (through reference chain: java.util.ArrayList[0]->demo.Order["member"]->demo.Member$HibernateProxy["hibernateLazyInitializer"])
+initialized after failed serialization? true
+statements=2</code></pre>
+
+<p>오류 메시지의 마지막 괄호가 Jackson이 걸어간 길이다. 목록의 0번 원소(주문) → 그 주문의 <code>member</code> 속성 → 회원 프록시의 <code>hibernateLazyInitializer</code> 속성. Jackson이 프록시 클래스를 훑었을 때 <code>Member</code>에서 물려받은 게터 외에 <code>HibernateProxy</code> 인터페이스가 선언한 <code>getHibernateLazyInitializer()</code>도 보였고, 이것도 게터 이름 규칙에 맞으니 속성 하나로 등록되었다. 이 메서드가 돌려준 값의 런타임 클래스는 <code>ByteBuddyInterceptor</code>인데, 이 클래스에는 Jackson이 볼 수 있는 속성이 하나도 없다. 속성이 없는 객체를 만나면 Jackson은 기본적으로 예외를 던진다. 그 기본값이 메시지에 나온 <code>SerializationFeature.FAIL_ON_EMPTY_BEANS</code>이다.</p>
+
+<p>예외 전에 회원 SELECT가 한 번 나갔다는 점도 눈여겨보자. Jackson은 회원 프록시의 속성을 차례로 꺼내다가 <code>getName()</code>을 부르는 순간 프록시를 초기화했고, 그다음 <code>hibernateLazyInitializer</code>에서 실패했다. 직렬화는 실패했지만 데이터베이스 조회라는 부수 효과는 이미 일어났다. 실패 뒤에 확인한 초기화 여부가 <code>true</code>다.</p>
+
+<h4>미리 초기화해 두면 되는가</h4>
+
+<p>프록시가 초기화되지 않아서 문제라고 생각하기 쉽다. 그래서 반환 전에 루프를 돌며 <code>order.getMember().getName()</code>을 불러 강제로 초기화해 보았다. 결과는 같았다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">initialized? true class=Member$HibernateProxy
+com.fasterxml.jackson.databind.exc.InvalidDefinitionException: No serializer found for class org.hibernate.proxy.pojo.bytebuddy.ByteBuddyInterceptor ... (through reference chain: demo.Member$HibernateProxy["hibernateLazyInitializer"])</code></pre>
+
+<p>초기화는 프록시를 진짜 객체로 <b>바꿔 치우는</b> 일이 아니다. 인터셉터 안에 대상 객체를 채워 넣을 뿐이고, 주문의 <code>member</code> 필드는 여전히 같은 프록시 인스턴스를 가리킨다. 자바 객체의 클래스는 생성된 뒤 바뀌지 않으므로 Jackson이 보는 런타임 클래스도 여전히 <code>Member$HibernateProxy</code>이고, 그 클래스의 속성 목록에는 여전히 <code>hibernateLazyInitializer</code>가 있다. 초기화 여부는 이 오류와 상관이 없다.</p>
+
+<h4>영속성 컨텍스트가 닫혀 있다면</h4>
+
+<p>OSIV를 끈 환경을 흉내 내어, 세션을 닫은 뒤에 같은 목록을 직렬화해 보았다(아래에서 볼 순환 문제를 피하려고 주문상품의 <code>order</code> 속성은 제외했다).</p>
+
+<pre data-label="실행 결과"><code class="language-text">com.fasterxml.jackson.databind.JsonMappingException: Could not initialize proxy [demo.Member#1] - no session (through reference chain: java.util.ArrayList[0]->demo.Order["member"]->demo.Member$HibernateProxy["name"])</code></pre>
+
+<p>이번에는 경로의 끝이 <code>name</code>이다. Jackson이 <code>getName()</code>을 불렀고, 프록시는 초기화를 시도했지만 자신을 만든 세션이 닫혀 있어 Hibernate의 <code>LazyInitializationException</code>을 던졌다. 같은 코드가 OSIV 설정 하나에 따라 다른 이유로 실패한다는 것 자체가, 엔티티를 응답으로 내보내면 응답의 모양이 영속성 컨텍스트의 수명에 묶인다는 신호다.</p>
+<h3>V1의 두 번째 벽: 양방향 참조와 끝나지 않는 순회</h3>
+
+<p>첫 번째 벽을 넘으려고 <code>FAIL_ON_EMPTY_BEANS</code>를 꺼 보자. 스프링 부트라면 <code>spring.jackson.serialization.fail-on-empty-beans=false</code> 같은 설정 한 줄이다. 속성이 없는 객체는 이제 빈 JSON 객체 <code>{}</code>로 쓰인다. 다시 직렬화하자 다른 예외가 났다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select o1_0.order_id,o1_0.delivery_id,o1_0.member_id,o1_0.orderedAt,o1_0.status from orders o1_0
+Hibernate: select m1_0.member_id,m1_0.city,m1_0.street,m1_0.zipcode,m1_0.name from Member m1_0 where m1_0.member_id=?
+Hibernate: select l1_0.order_id,l1_0.order_line_id,l1_0.product_id,l1_0.quantity,l1_0.unitPrice from OrderLine l1_0 where l1_0.order_id=?
+com.fasterxml.jackson.databind.JsonMappingException: Document nesting depth (1001) exceeds the maximum allowed (1000, from `StreamWriteConstraints.getMaxNestingDepth()`) (through reference chain: demo.Order["lines"]->java.util.Collections$UnmodifiableList[0]->demo.OrderLine["order"]->demo.Order["lines"]->java.util.Collections$UnmodifiableList[0]->demo.OrderLine["order"]->demo.Order["lines"]-> ...
+statements=3</code></pre>
+
+<p>참조 경로가 같은 세 칸을 반복한다. 주문의 <code>lines</code> → 주문상품 → 주문상품의 <code>order</code> → 다시 주문의 <code>lines</code>. 주문과 주문상품이 서로를 참조하는 양방향 연관이고, 양쪽 모두 게터가 열려 있기 때문이다. JSON에는 "앞에서 나온 그 객체"를 가리키는 참조 개념이 없다. Jackson의 기본 직렬화는 객체 그래프를 트리로 펼쳐 쓰는 일이라서, 이미 방문한 객체를 기억하지 않는다. 그래프에 순환이 있으면 트리는 끝없이 깊어진다.</p>
+
+<p>SQL이 세 개에서 멈췄다는 점이 중요하다. 순환 경로에 새로운 데이터는 없다. 주문상품의 <code>order</code> 필드는 영속성 컨텍스트가 관리하는 바로 그 주문 인스턴스를 가리키고(영속성 컨텍스트는 같은 식별자에 하나의 인스턴스만 둔다), 그 주문의 <code>lines</code>는 이미 초기화된 같은 컬렉션이다. 메모리 안에 진짜 순환이 있고, Jackson은 그 원을 따라 계속 돈다. 데이터베이스는 더 이상 관여하지 않는다.</p>
+
+<pre class="diagram">  힙 (영속성 컨텍스트가 관리하는 인스턴스)
+
+  Order#1 ──lines──▶ PersistentBag ──[0]──▶ OrderLine#1
+     ▲                                          │
+     └──────────────────order───────────────────┘
+
+  Jackson 스레드의 스택 (아래로 자란다)
+  ┌─────────────────────────────┐
+  │ serialize(List)             │ 깊이 1
+  │  serialize(Order#1)         │ 깊이 2
+  │   serialize(lines)          │ 깊이 3
+  │    serialize(OrderLine#1)   │ 깊이 4
+  │     serialize(Order#1)      │ 깊이 5  ← 같은 객체를 다시 연다
+  │      serialize(lines)       │ ...
+  │       ...                   │ 1000을 넘는 순간 예외 (Jackson 2.16 이상)
+  └─────────────────────────────┘</pre>
+
+<p>메시지에 나온 <code>StreamWriteConstraints</code>는 Jackson 2.16에서 들어온 쓰기 제약이고, 중첩 깊이의 기본 한도가 1000이다. JSON 객체나 배열을 하나 열 때마다 깊이가 1씩 늘어나므로, 순환은 한도에 걸려 예외가 된다. 이 제약이 없는 이전 버전에서는 깊이에 한도가 없으므로 스레드 스택이 넘칠 때까지 재귀가 이어진다. 그때 Jackson은 <code>StackOverflowError</code>를 잡아 "Infinite recursion (StackOverflowError)"라는 메시지의 예외로 감싸 던진다. 어느 쪽이든 원인은 같다. 객체 그래프의 순환을 트리로 펼치려 한 것이다.</p>
+
+<p>흔한 처방은 한쪽 게터에 <code>@JsonIgnore</code>를 붙여 순환을 끊는 것이다. Jackson의 <code>@JsonIdentityInfo</code>처럼 두 번째 등장부터 식별자만 쓰게 하는 애너테이션도 있다. 둘 다 동작은 한다. 하지만 둘 다 엔티티 클래스에 JSON 표현 방식을 적어 넣는다. 엔티티는 여러 API와 화면이 함께 쓰는 도메인 모델이다. 주문 목록 API에서는 주문상품의 주문을 숨기고 싶어도, 다른 API에서는 그 정보가 필요할 수 있다. 엔티티 하나에 붙은 애너테이션으로는 API마다 다른 모양을 표현할 수 없다.</p>
+
+<h3>벽을 모두 넘은 V1: 동작하지만 쓰면 안 되는 이유</h3>
+
+<p>두 벽을 모두 넘겨 보았다. <code>FAIL_ON_EMPTY_BEANS</code>를 끄고, 주문상품의 <code>getOrder()</code>를 Jackson이 무시하도록 했다(엔티티를 고치지 않으려고 Jackson의 믹스인으로 <code>@JsonIgnore</code>를 붙였다. 엔티티에 직접 붙인 것과 효과가 같다). 첫 주문 하나의 결과는 이렇다.</p>
+
+<pre data-label="실행 결과 (첫 주문만)"><code class="language-json">[ {
+  "id" : 1,
+  "member" : {
+    "id" : 1,
+    "name" : "김하나",
+    "address" : { "city" : "서울", "street" : "율곡로 10", "zipcode" : "03154" },
+    "hibernateLazyInitializer" : { }
+  },
+  "lines" : [ {
+    "id" : 1,
+    "product" : { "id" : 1, "name" : "에티오피아 원두", "price" : 18000, "hibernateLazyInitializer" : { } },
+    "unitPrice" : 18000,
+    "quantity" : 2
+  } ],
+  "delivery" : {
+    "id" : 1,
+    "address" : { "city" : "서울", "street" : "율곡로 10", "zipcode" : "03154" },
+    "status" : "READY",
+    "hibernateLazyInitializer" : { }
+  },
+  "orderedAt" : "2026-11-01T10:00:00",
+  "status" : "ORDERED"
+} ]</code></pre>
+
+<p>응답이 나오긴 했지만 문제가 세 겹이다. 첫째, <code>"hibernateLazyInitializer" : { }</code>라는 Hibernate 내부 구현의 이름이 API 응답에 섞였다. 클라이언트가 이 필드를 보고 코드를 짜면, 지연 로딩 설정을 바꾸는 순간 그 필드가 사라지면서 클라이언트가 깨진다. 둘째, 화면은 회원 이름과 배송지만 원하는데 주문상품, 상품 가격, 회원 식별자까지 모두 나갔다. 셋째, 그것을 위해 실행된 SQL이다. 주문 네 건 전체를 직렬화하자 문장 15개가 실행되었다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>SQL</th><th>개수</th><th>이유</th></tr></thead><tbody>
+<tr><td>주문 목록</td><td>1</td><td>리포지토리의 JPQL</td></tr>
+<tr><td>회원</td><td>3</td><td>주문 4건의 회원 중 서로 다른 회원 3명(김하나는 두 번째부터 이미 초기화됨)</td></tr>
+<tr><td>주문상품 컬렉션</td><td>4</td><td>주문마다 <code>lines</code> 컬렉션 초기화</td></tr>
+<tr><td>상품</td><td>3</td><td>주문상품 4개가 가리키는 서로 다른 상품 3개</td></tr>
+<tr><td>배송</td><td>4</td><td>주문과 일대일</td></tr>
+<tr><td>합계</td><td>15</td><td>화면에 필요한 것은 이 중 주문·회원·배송뿐이다</td></tr>
+</tbody></table></div>
+
+<h4>Hibernate 모듈과 강제 초기화</h4>
+
+<p>Jackson에는 Hibernate 타입을 알아보는 데이터타입 모듈이 있다(<code>jackson-datatype-hibernate</code> 프로젝트, Hibernate 6용 아티팩트는 <code>jackson-datatype-hibernate6</code>). 이 모듈을 <code>ObjectMapper</code>에 등록하면 Jackson이 프록시를 일반 빈으로 훑지 않고 모듈의 직렬화기에 맡긴다. 모듈의 <code>FORCE_LAZY_LOADING</code> 기능은 기본값이 꺼져 있고, 꺼져 있으면 초기화되지 않은 지연 로딩 객체를 <code>null</code>로 쓴다. 켜면 강제로 로딩한 뒤 쓴다. 그래서 "모듈을 등록하고, 필요한 연관만 컨트롤러에서 미리 초기화해 두면 그것만 나간다"는 우회로가 생긴다.</p>
+
+<p>이 우회로는 첫 번째 벽만 없앤다. 응답의 모양은 여전히 엔티티의 필드 구조이고, 엔티티 필드 이름을 바꾸면 API 스펙이 바뀐다. 어떤 연관이 응답에 나올지가 "그 요청에서 누가 무엇을 초기화했는가"라는 실행 이력에 좌우된다. <code>FORCE_LAZY_LOADING</code>을 켜면 모듈이 지연 로딩 연관을 다시 모두 강제로 읽으므로, 위 표처럼 연관마다 SQL이 나가는 상태로 돌아간다. 근본 문제는 직렬화 기술이 아니라 <b>엔티티가 API 스펙의 역할을 하고 있다는 것</b>이다. 이 권 01회가 스펙 관점에서 내린 결론을 이 회차는 런타임 관점에서 다시 확인한 셈이다.</p>
+
+<h4>즉시 로딩으로 바꾸면 되는가</h4>
+
+<p>프록시가 문제라면 <code>FetchType.EAGER</code>로 바꿔 프록시가 생기지 않게 하면 되지 않을까. JPA 기본편 07회에서 확인했듯 그렇지 않다. JPQL <code>select o from Order o</code>는 쓰인 그대로 주문 테이블만 조회하는 SQL로 번역된다. 결과를 받은 뒤 Hibernate가 즉시 로딩 연관을 채우려고 회원과 배송을 따로 조회하므로, N+1이 직렬화 시점에서 조회 직후로 앞당겨질 뿐 사라지지 않는다. 게다가 회원 정보가 필요 없는 모든 조회에서도 항상 일어난다. 지연 로딩을 기본으로 두고, 함께 읽을 연관은 쿼리마다 명시하는 것이 맞다. 그 "명시"가 V3의 페치 조인이다.</p>
+
+<h3>V2: DTO로 바꾸면 스펙은 고정되고, SQL은 그대로 드러난다</h3>
+
+<p>응답 전용 DTO를 만들고, 컨트롤러에서 엔티티를 DTO로 바꿔 반환한다. 01회에서 본 것처럼 실제 API는 목록을 응답 객체로 한 번 감싸는 편이 확장에 유리하지만, 여기서는 SQL에 집중하려고 목록을 그대로 반환한다.</p>
+
+<pre><code class="language-java">public record OrderSummary(Long orderId, String buyerName, LocalDateTime orderedAt,
+                           OrderStatus status, Address deliveryAddress) {
+
+    public static OrderSummary from(Order order) {
+        return new OrderSummary(
+                order.getId(),
+                order.getMember().getName(),        // 회원 프록시 초기화 → SELECT가 나갈 수 있다
+                order.getOrderedAt(),
+                order.getStatus(),
+                order.getDelivery().getAddress());  // 배송 프록시 초기화 → SELECT가 나갈 수 있다
+    }
+}
+
+@GetMapping("/api/v2/order-summaries")
+public List<OrderSummary> summariesV2() {
+    return orderRepository.findAll().stream()   // select o from Order o
+            .map(OrderSummary::from)
+            .toList();
+}</code></pre>
+
+<p>응답의 모양이 이제 DTO의 컴포넌트로 고정되었다. 엔티티의 필드 이름이 바뀌어도 변환 코드만 고치면 응답은 그대로다. Jackson은 DTO만 보므로 프록시나 순환을 만나지 않는다. 배송지 주소는 값 타입 <code>Address</code>를 그대로 담았다. 임베디드 값 타입은 지연 로딩이나 식별자가 없는 평범한 객체라 직렬화 문제가 없지만, 이것도 도메인 타입이므로 응답 모양을 완전히 분리하고 싶다면 주소 DTO로 한 번 더 옮긴다.</p>
+
+<p>SQL은 어떻게 되었을까. 변환 루프 사이사이에 표시를 찍어 실행 순서를 그대로 보았다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select o1_0.order_id,o1_0.delivery_id,o1_0.member_id,o1_0.orderedAt,o1_0.status from orders o1_0
+-- after query: statements=1
+-- order 1
+Hibernate: select m1_0.member_id,m1_0.city,m1_0.street,m1_0.zipcode,m1_0.name from Member m1_0 where m1_0.member_id=?
+Hibernate: select d1_0.delivery_id,d1_0.city,d1_0.street,d1_0.zipcode,d1_0.status from Delivery d1_0 where d1_0.delivery_id=?
+   dto(1, 김하나, 서울)
+-- order 2
+Hibernate: select m1_0.member_id,m1_0.city,m1_0.street,m1_0.zipcode,m1_0.name from Member m1_0 where m1_0.member_id=?
+Hibernate: select d1_0.delivery_id,d1_0.city,d1_0.street,d1_0.zipcode,d1_0.status from Delivery d1_0 where d1_0.delivery_id=?
+   dto(2, 이두리, 부산)
+-- order 3
+Hibernate: select d1_0.delivery_id,d1_0.city,d1_0.street,d1_0.zipcode,d1_0.status from Delivery d1_0 where d1_0.delivery_id=?
+   dto(3, 김하나, 서울)
+-- order 4
+Hibernate: select m1_0.member_id,m1_0.city,m1_0.street,m1_0.zipcode,m1_0.name from Member m1_0 where m1_0.member_id=?
+Hibernate: select d1_0.delivery_id,d1_0.city,d1_0.street,d1_0.zipcode,d1_0.status from Delivery d1_0 where d1_0.delivery_id=?
+   dto(4, 박세나, 대전)
+statements=8 managed=11</code></pre>
+
+<p>주문 목록을 읽는 SQL 1개가 주문 4건을 돌려주었고, 그 4건 각각을 변환하면서 회원과 배송을 읽는 SQL이 추가로 나갔다. 결과 하나(1)가 추가 쿼리 여러 개(N)를 부른다는 뜻에서 이를 <b>N+1 문제</b>라고 부른다. 여기서는 ToOne 연관이 두 개라서 최악의 경우 주문 하나마다 두 개씩, 1 + 2N개가 된다.</p>
+
+<p>그런데 실제로는 8개다. 세 번째 주문에서 회원 SELECT가 빠졌다. 이유는 프록시의 동일성에 있다. 주문 목록 쿼리의 결과를 객체로 만들 때 Hibernate는 행마다 <code>member_id</code>를 보고 영속성 컨텍스트에서 그 식별자의 회원을 찾는다. 첫 행에서 <code>Member#1</code>의 프록시를 만들어 등록했으므로, 같은 <code>member_id = 1</code>을 가진 세 번째 행은 새 프록시를 만들지 않고 <b>그 프록시를 그대로</b> 받는다. 주문 1과 주문 3의 <code>member</code> 필드는 같은 인스턴스를 가리킨다. 주문 1을 변환할 때 이미 초기화되었으니, 주문 3에서 <code>getName()</code>은 SQL 없이 대상 객체의 값을 돌려준다. 배송은 주문과 일대일이라 이런 공유가 없으므로 항상 주문 수만큼 나간다.</p>
+
+<p>따라서 주문 N건, 그 안의 서로 다른 회원 M명이면 V2의 SQL 수는 1 + M + N이다. 이 실험에서는 1 + 3 + 4 = 8이다. 이 식은 두 가지를 말해 준다. 하나는 SQL 수가 코드가 아니라 <b>데이터 분포</b>에 달려 있다는 것이다. 개발 환경에서 같은 회원으로만 주문을 만들어 테스트하면 회원 쿼리는 하나뿐이라 문제가 작아 보인다. 다른 하나는 1차 캐시의 효과가 한 영속성 컨텍스트, 대개 요청 하나 안에서만 나타난다는 것이다. 다음 요청은 새 영속성 컨텍스트로 시작하므로 같은 회원을 다시 읽는다.</p>
+
+<x-visual id="jpa-app2-02-n-plus-one-sequence" title="DTO 변환 루프에서 회원과 배송을 하나씩 조회하는 N+1 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>주문 목록 SQL 하나 뒤에 주문마다 회원·배송 SELECT가 이어지고, 세 번째 주문에서는 이미 초기화된 같은 회원 프록시 덕분에 회원 SELECT가 빠지는 것을 보여 준다.</x-hint>
+<x-prompt>Sequence diagram with three vertical lifelines labeled "변환 루프", "영속성 컨텍스트", "DB". First arrow from 변환 루프 to DB labeled "주문 목록 SELECT (1)". Then four horizontal bands labeled "주문 1", "주문 2", "주문 3", "주문 4". In bands 주문 1, 주문 2, 주문 4 there are two arrows each from 영속성 컨텍스트 to DB labeled "회원 SELECT" and "배송 SELECT". In band 주문 3 there is only one arrow to DB labeled "배송 SELECT", and a short arrow from 변환 루프 to 영속성 컨텍스트 labeled "회원#1 (이미 초기화)" drawn in green, returning without reaching DB. At the bottom right a summary box reads "합계 8 = 1 + 3 + 4". Clean flat style, sans-serif font, light background.</x-prompt>
+<x-caption>V2의 SQL은 1 + 서로 다른 회원 수 + 주문 수다. 같은 회원은 같은 프록시를 공유하므로 한 번만 조회된다.</x-caption>
+</x-visual>
+
+<h3>한 층 아래: N+1의 쿼리 하나가 지나가는 길</h3>
+
+<p>N+1이 왜 느린지 말하려면 추가 쿼리 하나가 어디를 지나가는지 봐야 한다. 변환 루프의 <code>order.getMember().getName()</code> 한 줄에서 일어나는 일을 데이터베이스가 MySQL InnoDB라고 가정하고 따라가 보자.</p>
+
+<figure class="flow-figure"><figcaption>지연 로딩 한 번의 경로</figcaption><ol class="flow">
+<li><strong>프록시 메서드 호출</strong><span>프록시의 <code>getName()</code>이 인터셉터로 넘어간다. 인터셉터는 대상 객체가 없음을 보고 세션에 <code>Member#1</code>의 로딩을 요청한다.</span></li>
+<li><strong>SQL 준비</strong><span>Hibernate가 식별자로 회원 한 행을 읽는 SQL을 준비하고 <code>PreparedStatement</code>에 식별자 값을 바인딩한다.</span></li>
+<li><strong>네트워크 왕복</strong><span>JDBC 드라이버가 요청을 커넥션의 TCP 소켓으로 보내고, 요청 스레드는 응답이 올 때까지 소켓 읽기에서 기다린다.</span></li>
+<li><strong>파싱과 최적화</strong><span>MySQL 서버가 문장을 해석하고 실행 계획을 세운다. 기본 키 동등 조건이므로 접근 방식은 한 행만 읽는 <code>const</code>다.</span></li>
+<li><strong>B+Tree 탐색</strong><span>InnoDB가 클러스터형 인덱스를 루트에서 리프까지 내려가 행을 찾는다. 페이지가 버퍼 풀에 있으면 메모리에서, 없으면 디스크에서 읽는다.</span></li>
+<li><strong>결과 반환과 객체 생성</strong><span>행이 결과 패킷으로 돌아오고, Hibernate가 <code>Member</code> 객체를 만들어 영속성 컨텍스트에 등록하고 변경 감지용 스냅샷을 남긴다.</span></li>
+<li><strong>원래 호출 완료</strong><span>인터셉터가 대상 객체를 붙잡고, <code>getName()</code>을 대상 객체에 위임해 값을 돌려준다.</span></li>
+</ol></figure>
+
+<p>5단계의 일, 기본 키로 행 하나를 찾는 일은 데이터베이스가 가장 잘하는 일이다. B+Tree의 높이는 낮고, 자주 읽는 페이지는 버퍼 풀에 있다. 비싼 것은 그 앞뒤를 감싼 <b>문장마다 붙는 고정 비용</b>이다. 네트워크 왕복, 서버의 파싱과 최적화, 결과 패킷 구성, 드라이버와 Hibernate의 객체 생성이 문장 하나마다 반복된다. N+1은 작은 일을 고정 비용과 함께 N번 반복하게 만든다.</p>
+
+<p>게다가 이 왕복들은 <b>순서대로</b> 일어난다. 변환 루프는 회원 이름을 받아야 다음 줄로 넘어가므로, 요청 스레드는 왕복이 끝날 때마다 기다렸다가 다음 왕복을 시작한다. 요청 하나의 응답 시간에는 왕복 시간이 쿼리 수만큼 더해진다. 병렬로 보내면 되지 않을까 싶지만, 엔티티 매니저는 스레드에 안전하지 않고 영속성 컨텍스트는 커넥션 하나에 묶여 있으므로(JPA 활용 1 03회) 지연 로딩을 여러 스레드로 나눌 수 없다. 그 시간 동안 커넥션 풀의 커넥션 하나가 이 요청에 묶여 있다는 점도 기억해 두자. OSIV가 켜져 있으면 이 점유가 응답을 다 쓸 때까지 이어진다. 05회의 주제다.</p>
+
+<p>해결 방향은 두 가지다. 고정 비용을 치르는 문장의 수를 줄이거나, 문장 하나가 여러 행을 가져오게 하는 것이다. 이 회차의 페치 조인은 필요한 연관을 처음 쿼리에 합쳐 문장을 하나로 만든다. 03회에서 볼 배치 크기 설정은 지연 로딩을 그대로 두되 식별자 여러 개를 IN 조건으로 묶어 문장 수를 줄인다.</p>
+
+<h3>V3: 페치 조인, 한 번의 SQL로 필요한 그래프를 채운다</h3>
+
+<p>V2의 변환 코드는 그대로 두고 리포지토리의 조회만 바꾼다.</p>
+
+<pre><code class="language-java">public List<Order> findAllWithBuyerAndDelivery() {
+    return em.createQuery(
+            "select o from Order o" +
+            " join fetch o.member" +
+            " join fetch o.delivery", Order.class)
+        .getResultList();
+}
+
+@GetMapping("/api/v3/order-summaries")
+public List<OrderSummary> summariesV3() {
+    return orderRepository.findAllWithBuyerAndDelivery().stream()
+            .map(OrderSummary::from)                // 코드는 V2와 같다
+            .toList();
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select o1_0.order_id,o1_0.delivery_id,d1_0.delivery_id,d1_0.city,d1_0.street,d1_0.zipcode,d1_0.status,o1_0.member_id,m1_0.member_id,m1_0.city,m1_0.street,m1_0.zipcode,m1_0.name,o1_0.orderedAt,o1_0.status from orders o1_0 join Member m1_0 on m1_0.member_id=o1_0.member_id join Delivery d1_0 on d1_0.delivery_id=o1_0.delivery_id
+   1 Member 김하나 Delivery
+   2 Member 이두리 Delivery
+   3 Member 김하나 Delivery
+   4 Member 박세나 Delivery
+statements=1 managed=11 size=4</code></pre>
+
+<p>SQL이 하나가 되었다. 이 SQL을 읽어 보자. FROM 절에서 주문 테이블에 회원과 배송을 각각 외래 키로 조인했다. SELECT 목록에는 주문의 컬럼 5개, 배송의 컬럼 5개, 회원의 컬럼 5개, 모두 15개가 있다. 같은 의미의 값(<code>o1_0.member_id</code>와 <code>m1_0.member_id</code>)이 양쪽에서 한 번씩 나오는 것은 Hibernate가 주문 엔티티의 외래 키 값과 회원 엔티티의 식별자를 각자 읽기 때문이다. JPQL의 <code>select o</code>는 주문만 선택했지만, <code>join fetch</code>가 붙은 연관 엔티티의 컬럼이 SELECT 목록에 함께 들어왔다. 일반 조인과의 결정적인 차이가 이것이다.</p>
+
+<p>Jakarta Persistence 명세는 페치 조인을 "쿼리 실행의 부수 효과로 연관을 가져오는 것"으로 정의한다. 결과로 돌려주는 것은 여전히 주문이고, 회원과 배송은 그 주문의 연관 필드를 채우는 데 쓰인다. 출력의 두 번째 열이 그 결과다. <code>getMember().getClass()</code>가 <code>Member</code>, 즉 프록시가 아닌 진짜 엔티티 클래스다. 행을 읽을 때 회원 컬럼이 이미 있으므로 Hibernate가 프록시 대신 완성된 엔티티를 만들어 필드에 넣었다.</p>
+
+<p>결과 집합의 행이 객체로 바뀌는 과정을 그려 보면 영속성 컨텍스트가 하는 일이 보인다.</p>
+
+<pre class="diagram">결과 집합 (4행)                                 영속성 컨텍스트 (식별자 맵)
+order_id │ member_id name   │ delivery_id city
+─────────┼──────────────────┼─────────────────
+   1     │    1      김하나  │     1       서울   → Order#1 ─member─▶ Member#1 ◀──────┐
+   2     │    2      이두리  │     2       부산   → Order#2 ─member─▶ Member#2         │
+   3     │    1      김하나  │     3       서울   → Order#3 ─member──────────────────────┘
+   4     │    3      박세나  │     4       대전   → Order#4 ─member─▶ Member#3
+                                                 (각 주문은 자기 Delivery#n 도 가리킨다)
+
+  행은 4개, 회원 컬럼 값은 4번 전송되지만 Member 인스턴스는 3개다.
+  관리 엔티티: Order 4 + Member 3 + Delivery 4 = 11</pre>
+
+<p>세 번째 행에는 첫 행과 같은 회원 데이터가 다시 들어 있다. 조인 결과는 표이므로 같은 회원이 주문 수만큼 반복된다. Hibernate는 세 번째 행을 읽을 때 <code>member_id = 1</code>의 엔티티가 영속성 컨텍스트에 이미 있음을 보고 새 객체를 만들지 않는다. 그래서 관리 엔티티 수는 V2와 같은 11개다. 같은 데이터를 두 번 받는 비용은 생겼지만, ToOne 조인에서는 주문 한 행에 회원이 하나뿐이라 결과 행 수가 주문 수를 넘지 않는다. 이 성질이 V3에서 페이징이 자연스럽게 되는 이유이고, 컬렉션을 페치 조인하면 깨지는 성질이다.</p>
+
+<h4>일반 조인은 연관을 채우지 않는다</h4>
+
+<p><code>fetch</code>를 빼고 조인만 하면 어떻게 될까. 김하나의 주문만 고르려고 회원 이름으로 거른 쿼리를 실행해 보았다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select o1_0.order_id,o1_0.delivery_id,o1_0.member_id,o1_0.orderedAt,o1_0.status from orders o1_0 join Member m1_0 on m1_0.member_id=o1_0.member_id where m1_0.name=?
+size=2 member init? false statements=1</code></pre>
+
+<p>SQL에 조인은 있지만 SELECT 목록에는 주문 컬럼만 있다. 일반 조인은 WHERE 조건이나 정렬에 연관 엔티티를 쓰기 위한 것이고, 결과 객체를 채우는 데는 쓰이지 않는다. 회원은 여전히 초기화되지 않은 프록시다. 이 결과를 V2처럼 변환하면 회원과 배송 SELECT가 다시 나간다. "조인했으니 한 번에 가져왔겠지"라는 기대가 틀리는 지점이다.</p>
+
+<h4>내부 조인이 기본이다</h4>
+
+<p>명세의 문법에서 <code>JOIN FETCH</code> 앞의 조인 종류를 생략하면 내부 조인이다. 실험의 SQL도 <code>join</code>, 즉 INNER JOIN이었다. 내부 조인은 연관 대상이 없는 주문을 결과에서 빼 버린다. 이 도메인에서는 <code>member_id</code>와 <code>delivery_id</code>가 NOT NULL 외래 키라서 결과가 같지만, 값이 없을 수 있는 연관을 페치 조인한다면 <code>left join fetch</code>를 써야 한다. 실험에서 <code>left join fetch o.member</code>로 바꾸자 SQL이 <code>left join Member</code>로 바뀌었다. 성능을 위해 넣은 페치 조인이 조회 결과의 행 수를 바꾸지 않도록 조인 종류를 확인하는 습관이 필요하다.</p>
+
+<p>명세는 페치 조인의 오른쪽 대상에 별칭(식별 변수)을 붙이는 것을 허용하지 않는다. 별칭이 없으니 페치 조인한 엔티티를 WHERE 절 같은 다른 곳에서 참조할 수도 없다. Hibernate는 <code>join fetch o.member m</code>처럼 별칭을 허용하고, 실험에서도 별칭이 있든 없든 같은 SQL이 나왔다. 다른 구현체로 옮길 가능성이 있다면 위 코드처럼 별칭 없이 쓰는 편이 안전하다.</p>
+
+<h4>이미 프록시가 있다면</h4>
+
+<p>페치 조인을 하면 항상 진짜 엔티티가 들어온다고 생각하기 쉽다. 같은 영속성 컨텍스트에서 페치 조인 전에 회원 1의 프록시를 먼저 얻어 두면 결과가 달라진다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">ref class=Member$HibernateProxy init=false
+Hibernate: select o1_0.order_id, ... (위와 같은 페치 조인 SQL)
+same instance? true class=Member$HibernateProxy init=true
+statements=1</code></pre>
+
+<p><code>em.getReference(Member.class, 1L)</code>로 프록시를 먼저 만들어 두었더니, 페치 조인 뒤 주문 1의 <code>member</code>는 그 프록시와 같은 인스턴스였다. 클래스는 여전히 프록시이고, 초기화만 되어 있다. 영속성 컨텍스트는 같은 식별자에 대해 하나의 인스턴스만 돌려준다는 규칙이 페치 조인보다 우선한다. 이미 등록된 프록시가 있으면 Hibernate는 새 엔티티 객체로 바꾸지 않고, 결과 행의 데이터로 그 프록시를 초기화한다. SQL은 여전히 하나이므로 성능 문제는 아니다. 다만 "페치 조인을 했으니 <code>getClass()</code>가 엔티티 클래스겠지"라고 가정하는 코드는 틀릴 수 있다. 타입 비교에 <code>getClass()</code> 대신 <code>instanceof</code>를 써야 하는 이유(JPA 기본편 07회)가 여기서도 나온다.</p>
+
+<h4>데이터베이스 쪽에서 보면</h4>
+
+<p>MySQL은 조인을 중첩 루프로 실행할 수 있다. 옵티마이저가 주문 테이블을 먼저 읽는 순서를 고른다면, 주문 한 행마다 회원과 배송을 기본 키로 한 행씩 찾는다. MySQL의 EXPLAIN은 이런 접근을 <code>eq_ref</code>로 표시한다. 매뉴얼은 <code>eq_ref</code>를 앞 테이블의 행 조합마다 이 테이블에서 한 행을 읽는 방식이며, 조인이 PRIMARY KEY나 UNIQUE NOT NULL 인덱스의 모든 부분을 사용할 때 쓰인다고 설명한다. 흥미로운 것은 B+Tree를 탐색하는 일의 양이 V2와 거의 같다는 점이다. 오히려 V3는 김하나를 두 번 찾는다(행 1과 행 3). 달라진 것은 그 탐색들이 <b>문장 하나 안에서</b> 일어난다는 것이다. 앞 절의 고정 비용, 즉 왕복과 파싱과 최적화를 한 번만 치른다. 페치 조인이 빠른 이유는 데이터베이스가 덜 일해서가 아니라 애플리케이션과 데이터베이스가 덜 주고받아서다.</p>
+
+<h4>ToOne 페치 조인과 페이징</h4>
+
+<p>행 수가 주문 수와 같으므로 페이징도 SQL 수준에서 그대로 적용된다. 주문 번호순으로 두 번째부터 두 건을 요청했다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select o1_0.order_id, ... from orders o1_0 join Member m1_0 on m1_0.member_id=o1_0.member_id join Delivery d1_0 on d1_0.delivery_id=o1_0.delivery_id order by o1_0.order_id offset ? rows fetch first ? rows only
+ids=[2, 3] statements=1</code></pre>
+
+<p>H2 방언이라 <code>offset ... fetch first</code> 구문이 나왔고, MySQL 방언이라면 <code>LIMIT</code> 절이 된다. 어느 쪽이든 데이터베이스가 잘라서 두 행만 보낸다. ToOne 연관은 몇 개를 페치 조인해도 이 성질이 유지된다. 컬렉션을 페치 조인하면 주문 하나가 주문상품 수만큼 여러 행이 되어 SQL의 행 단위 페이징이 주문 단위 페이징과 어긋난다. 그때 Hibernate가 무엇을 하는지는 03회에서 실행 결과로 본다.</p>
+
+<x-visual id="jpa-app2-02-fetch-join-rows" title="페치 조인 결과 행이 영속성 컨텍스트의 엔티티로 바뀌는 과정" kind="개념도" ratio="16:9">
+<x-hint>조인 결과 4행이 주문 4개, 회원 3개, 배송 4개로 바뀌고, 같은 회원이 두 행에 나와도 인스턴스는 하나라는 것을 보여 준다.</x-hint>
+<x-prompt>Two-panel diagram. Left panel: a table titled "결과 집합 4행" with columns "order_id", "member_id", "name", "delivery_id", rows: 1/1/김하나/1, 2/2/이두리/2, 3/1/김하나/3, 4/3/박세나/4. Rows 1 and 3 have the member cells highlighted in the same light blue. Right panel titled "영속성 컨텍스트": four boxes "Order#1".."Order#4" in a column, three boxes "Member#1", "Member#2", "Member#3", four small boxes "Delivery#1".."Delivery#4". Arrows from each table row to its Order box. Arrows from Order#1 and Order#3 both point to the single "Member#1" box, highlighted light blue, with a label "같은 인스턴스". A footer label in the right panel reads "관리 엔티티 11개". Flat style, sans-serif font, light background.</x-prompt>
+<x-caption>페치 조인은 회원 데이터를 행마다 반복해 받지만, 영속성 컨텍스트의 식별자 맵 덕분에 회원 인스턴스는 하나씩만 만들어진다.</x-caption>
+</x-visual>
+
+<h3>V4: JPQL에서 DTO로 바로 조회</h3>
+
+<p>V3에서 엔티티 세 종류의 컬럼 15개를 읽었지만, 응답에 쓰인 값은 주문 번호, 회원 이름, 주문 시각, 주문 상태, 배송지 주소뿐이다. V4는 이 값만 골라 JPQL의 SELECT 절에서 DTO를 바로 만든다.</p>
+
+<pre><code class="language-java">package demo;   // 실험에서 쓴 패키지. 실무에서는 조회 전용 패키지를 둔다
+
+public record OrderSummaryRow(Long orderId, String buyerName, LocalDateTime orderedAt,
+                              OrderStatus status, Address deliveryAddress) {}
+
+@Repository
+public class OrderSummaryQueryRepository {
+
+    private final EntityManager em;
+
+    public OrderSummaryQueryRepository(EntityManager em) { this.em = em; }
+
+    public List<OrderSummaryRow> findSummaryRows() {
+        return em.createQuery(
+                "select new demo.OrderSummaryRow(o.id, m.name, o.orderedAt, o.status, d.address)" +
+                " from Order o" +
+                " join o.member m" +
+                " join o.delivery d", OrderSummaryRow.class)
+            .getResultList();
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select o1_0.order_id,m1_0.name,o1_0.orderedAt,o1_0.status,d1_0.city,d1_0.street,d1_0.zipcode from orders o1_0 join Member m1_0 on m1_0.member_id=o1_0.member_id join Delivery d1_0 on d1_0.delivery_id=o1_0.delivery_id
+   1 김하나 서울
+   2 이두리 부산
+   3 김하나 서울
+   4 박세나 대전
+statements=1 managed=0</code></pre>
+
+<p>FROM과 조인 조건은 V3와 같고, SELECT 목록이 7개로 줄었다. 임베디드 값 타입인 <code>d.address</code>는 구성 컬럼 세 개(<code>city</code>, <code>street</code>, <code>zipcode</code>)로 펼쳐져 SELECT에 들어갔고, Hibernate가 그 세 값으로 <code>Address</code>를 만들어 생성자의 다섯 번째 인자로 넘겼다. 생성자 인자의 타입과 순서가 SELECT 항목과 맞아야 한다. 레코드의 정식 생성자도 평범한 생성자이므로 그대로 쓸 수 있다.</p>
+
+<p>이 문법을 생성자 표현식(constructor expression)이라 한다. Jakarta Persistence 3.1 명세 4.8.2절이 정한 규칙은 세 가지다. 지정한 클래스는 엔티티이거나 데이터베이스에 매핑될 필요가 없다. 생성자 이름은 패키지까지 포함한 완전한 이름이어야 한다. 그리고 생성자 인자로 엔티티를 넘기면 그 엔티티는 관리 상태가 된다. 이 예제처럼 값만 넘기면 영속성 컨텍스트에 아무것도 등록되지 않는다. 실행 결과의 <code>managed=0</code>이 그것이다. 돌아온 DTO는 영속성 컨텍스트와 무관한 평범한 자바 객체라서, 값을 바꿔도 변경 감지가 일어나지 않고 스냅샷을 위한 메모리도 쓰지 않는다.</p>
+
+<h4>완전한 이름 규칙과 Hibernate의 예외</h4>
+
+<p>Hibernate 6.6에서 패키지 없이 <code>select new OrderSummaryRow(...)</code>라고 써 보았다. 결과는 호출 방식에 따라 달랐다. <code>createQuery(jpql, OrderSummaryRow.class)</code>처럼 같은 단순 이름의 클래스를 결과 타입으로 넘기면 문제없이 실행되었다. 결과 타입을 <code>Object.class</code>로 넘기거나 아예 넘기지 않으면 다음 예외가 났다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">org.hibernate.query.SemanticException: Could not resolve class 'OrderSummaryRow' named for instantiation [select new OrderSummaryRow(o.id, m.name, o.orderedAt, o.status, d.address) from Order o join o.member m join o.delivery d]</code></pre>
+
+<p>즉 Hibernate는 결과 타입 인자를 단서로 단순 이름을 풀어 주는 편의를 제공하지만, 명세가 보장하는 동작은 아니다. 문자열 안의 클래스 이름은 컴파일러가 확인하지 못하므로, DTO의 패키지를 옮기면 애플리케이션이 뜨거나 쿼리가 처음 실행될 때에야 오류가 드러난다. 문자열로 쓰는 생성자 표현식의 약점이다. 뒤 권의 Querydsl은 이 부분을 자바 코드로 옮긴다.</p>
+
+<h4>왜 페치 조인을 쓰지 않는가</h4>
+
+<p>V4의 조인은 <code>join fetch</code>가 아니라 일반 <code>join</code>이다. 페치 조인으로 바꿔 보면 쿼리를 만드는 단계에서 거절된다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">java.lang.IllegalArgumentException: org.hibernate.query.SemanticException: Query specified join fetching, but the owner of the fetched association was not present in the select list [SqmSingularJoin(demo.Order(o).member(m) : member)]</code></pre>
+
+<p>명세의 페치 조인 정의를 떠올리면 당연하다. 페치 조인은 쿼리 결과로 돌려주는 엔티티의 연관을 채우는 부수 효과다. 명세는 페치 조인 대상이 "쿼리 결과로 반환되는 엔티티나 임베더블이 참조하는 연관"이어야 한다고 정한다. V4의 결과는 DTO이고, 주문 엔티티는 결과로 반환되지 않으므로 채울 대상이 없다. 메시지도 같은 말을 한다. 가져올 연관의 주인(<code>o</code>)이 SELECT 목록에 없다. V4에서 조인은 필요한 컬럼을 SELECT에 넣기 위한 수단일 뿐이므로 일반 조인으로 충분하다. 일반 조인이 SELECT 목록을 바꾸지 않는다는 앞 절의 관찰과 모순되지 않는다. 일반 조인이 연관 컬럼을 가져오지 않는 것은 <code>select o</code>처럼 엔티티만 선택했을 때이고, 여기서는 <code>m.name</code>처럼 조인한 엔티티의 경로를 SELECT에 직접 적었다.</p>
+
+<h3>V3와 V4 사이에서 고르기: 무엇이 실제로 줄어드는가</h3>
+
+<p>V4가 V3보다 컬럼을 덜 읽으니 항상 낫다고 생각하기 쉽다. 두 SQL은 FROM, 조인 조건, WHERE가 같다. 데이터베이스가 행을 찾는 경로, 즉 어느 테이블을 먼저 읽고 어떤 인덱스로 몇 번 탐색하는지는 대개 같다. 무엇이 줄어드는지를 하나씩 따져 보자.</p>
+
+<div class="table-wrap"><table><thead><tr><th>관점</th><th>V3 (페치 조인 + 변환)</th><th>V4 (DTO 직접 조회)</th></tr></thead><tbody>
+<tr><td>SQL 수</td><td>1</td><td>1</td></tr>
+<tr><td>행마다 전송 컬럼</td><td>15</td><td>7</td></tr>
+<tr><td>애플리케이션이 만드는 객체</td><td>엔티티 11개 + 변경 감지용 스냅샷, 그 뒤에 DTO 4개</td><td>DTO 4개(와 주소 값 객체)</td></tr>
+<tr><td>재사용성</td><td>엔티티를 돌려주므로 여러 API가 같은 조회를 쓸 수 있다</td><td>이 응답 모양 전용이다</td></tr>
+<tr><td>리포지토리와 API의 결합</td><td>리포지토리는 엔티티만 안다</td><td>리포지토리가 API의 모양을 안다</td></tr>
+<tr><td>조회 결과 수정</td><td>엔티티라 변경 감지가 동작한다</td><td>DTO라 수정해도 반영되지 않는다</td></tr>
+</tbody></table></div>
+
+<p>첫째, 전송 컬럼. 이 예제에서는 15개와 7개의 차이지만 짧은 문자열과 숫자뿐이라 바이트 차이는 크지 않다. 차이가 의미 있어지는 것은 엔티티에 큰 텍스트 컬럼이나 많은 컬럼이 있는데 목록에는 몇 개만 필요할 때, 그리고 한 번에 읽는 행이 많을 때다. 컬럼 선택이 실행 계획 자체를 바꾸는 경우도 있다. 한 테이블에서 필요한 컬럼이 모두 어떤 보조 인덱스 안에 있으면 InnoDB는 행을 읽으러 클러스터형 인덱스로 가지 않고 인덱스만으로 답할 수 있고, EXPLAIN의 Extra에 <code>Using index</code>가 표시된다. 엔티티 전체를 읽는 V3에서는 이런 커버링 인덱스(covering index)를 기대하기 어렵다.</p>
+
+<p>둘째, 애플리케이션 메모리. V3의 엔티티 11개는 영속성 컨텍스트에 등록되고, 변경 감지를 위해 로딩 시점의 값을 복사한 스냅샷도 함께 남는다. 요청 하나에 수천 행을 읽는 화면이라면 이 비용이 커진다. 다만 이 비용만 문제라면 V4로 가지 않고 줄이는 방법도 있다. JPA 활용 1 03회에서 본 읽기 전용 트랜잭션(<code>@Transactional(readOnly = true)</code>)은 Hibernate 세션을 읽기 전용으로 두어 이 부담을 줄인다. 다만 세션을 읽기 전용으로 바꾸는 처리는 엔티티 매니저가 그 트랜잭션을 위해 새로 만들어진 경우에만 일어나고, OSIV가 열어 둔 엔티티 매니저를 재사용하는 트랜잭션에서는 일어나지 않는다(Spring Framework 6.2의 <code>HibernateJpaDialect</code> 기준).</p>
+
+<p>셋째, 설계의 결합. V3의 리포지토리 메서드는 "회원과 배송까지 함께 읽은 주문"을 돌려줄 뿐이고, 그것을 어떤 모양으로 내보낼지는 쓰는 쪽이 정한다. V4의 리포지토리 메서드는 특정 API의 응답 모양을 알고 있다. 화면에 필드 하나가 늘면 쿼리를 고쳐야 한다. 그래서 V4 같은 조회는 엔티티를 다루는 리포지토리와 섞지 않고, 화면이나 API에 맞춘 조회 전용 리포지토리와 패키지로 떼어 두는 편이 관리하기 쉽다. 핵심 도메인의 리포지토리는 엔티티의 생명주기에 집중하고, 화면 사정으로 자주 바뀌는 조회는 다른 곳에서 바뀐다.</p>
+
+<p>이것을 정리하면 판단의 순서가 생긴다. 이 강좌의 판단이며, 조건이 다르면 순서도 바뀔 수 있다.</p>
+
+<ol>
+<li>엔티티를 조회하고 DTO로 변환한다(V2). 응답 스펙이 엔티티와 분리되는 것이 먼저다.</li>
+<li>SQL 로그에서 N+1이 보이면 필요한 ToOne 연관을 페치 조인한다(V3). 대부분의 목록 조회는 여기서 충분히 빨라진다.</li>
+<li>읽는 컬럼이 넓거나 행이 많아 전송량이나 메모리가 측정으로 문제가 될 때 DTO 직접 조회로 바꾼다(V4).</li>
+<li>JPQL로 표현하기 어려운 조회는 네이티브 SQL이나 스프링 DB 편의 <code>JdbcTemplate</code>으로 직접 쓴다.</li>
+</ol>
+
+<p>순서의 근거는 "문장 수"와 "문장 하나의 크기"가 성능에 주는 영향의 차이다. N+1은 문장 수를 결과 행 수에 비례하게 만들어서 데이터가 늘수록 나빠진다. V3는 이 비례 관계를 끊는다. V3에서 V4로 가는 것은 문장 하나의 크기를 줄이는 일이라, 효과가 있더라도 대개 상수 배 수준이다. 비례 관계를 먼저 끊고, 상수는 측정한 뒤에 줄인다.</p>
+
+<x-visual id="jpa-app2-02-query-ladder" title="조회 방식을 고르는 단계: DTO 변환, 페치 조인, DTO 직접 조회, 네이티브 SQL" kind="순서도" ratio="16:9">
+<x-hint>V2에서 시작해 N+1이 보이면 V3로, 전송량·메모리가 측정으로 문제가 되면 V4로, JPQL로 안 되면 네이티브 SQL로 내려가는 계단을 보여 준다.</x-hint>
+<x-prompt>A descending staircase diagram with four steps from top-left to bottom-right. Step 1 label "V2 엔티티 조회 + DTO 변환". Step 2 label "V3 페치 조인". Step 3 label "V4 DTO 직접 조회". Step 4 label "네이티브 SQL / JdbcTemplate". Between steps, small arrow labels: from step 1 to 2 "N+1이 보이면", from step 2 to 3 "전송량·메모리가 측정으로 문제일 때", from step 3 to 4 "JPQL로 표현 불가". On the left side, a vertical arrow pointing down labeled "재사용성은 줄어든다". On the right side, a vertical arrow pointing down labeled "조회 특화 정도는 커진다". Flat style, muted colors, sans-serif font, light background.</x-prompt>
+<x-caption>문장 수를 먼저 줄이고(V3), 문장 하나의 크기는 측정한 뒤에 줄인다(V4).</x-caption>
+</x-visual>
+
+<h3>흔한 오해와 다음 회차로</h3>
+
+<p><b>"지연 로딩으로 바꿨으니 성능 문제는 해결됐다."</b> 지연 로딩은 SQL을 없애지 않고 미룬다. 미룬 SQL은 누군가 게터를 부르는 순간 실행된다. 그 누군가가 Jackson이면 응답의 모든 연관이, 변환 루프면 행마다 연관이 로딩된다. 지연 로딩은 "필요한 것만 읽을 기회"를 줄 뿐이고, 무엇을 함께 읽을지는 조회마다 페치 조인 같은 방법으로 정해야 한다.</p>
+
+<p><b>"즉시 로딩이면 N+1이 없다."</b> <code>em.find()</code>로 하나를 찾을 때는 Hibernate가 조인으로 한 번에 읽지만, JPQL은 쓰인 대로 먼저 실행된 뒤 즉시 로딩 연관을 위한 추가 SELECT가 따라 나간다. N+1이 조회 직후로 옮겨질 뿐이고, 그 연관이 필요 없는 조회에서도 항상 일어난다.</p>
+
+<p><b>"프록시를 초기화하면 진짜 객체로 바뀐다."</b> 바뀌지 않는다. 같은 프록시 인스턴스가 대상 객체를 붙잡을 뿐이고 클래스도 그대로다. 그래서 초기화된 프록시도 Jackson에게는 여전히 <code>hibernateLazyInitializer</code> 속성을 가진 객체이고, 페치 조인 전에 프록시가 있었다면 페치 조인 뒤에도 그 프록시가 돌아온다.</p>
+
+<p><b>"조인을 쓰면 연관도 함께 가져온다."</b> 일반 조인은 조건과 정렬을 위한 것이다. <code>select o</code>로 엔티티만 선택하면 조인한 테이블의 컬럼은 SELECT에 들어가지 않고 연관은 프록시로 남는다. 연관을 채우는 것은 <code>join fetch</code>뿐이다.</p>
+
+<p><b>"DTO로 직접 조회하는 V4가 항상 가장 빠르다."</b> V3와 V4는 같은 조인을 실행한다. 줄어드는 것은 전송 컬럼과 애플리케이션이 만드는 객체이고, 그 차이가 의미 있는지는 컬럼의 크기와 행 수에 달렸다. 그 대가로 리포지토리가 API 모양에 묶인다.</p>
+
+<p><b>"<code>@Transactional</code>을 붙이면 어디서 불리든 트랜잭션이 걸린다."</b> 트랜잭션은 프록시를 거친 호출에만 걸린다. 초기화 콜백은 프록시가 만들어지기 전에 원본 객체에서 호출되므로 걸리지 않는다. 같은 클래스 안의 자기 호출도 같은 이유로 걸리지 않는다.</p>
+
+<p>이 회차는 ToOne 연관만 다뤘다. 주문의 주문상품 목록까지 응답에 넣으면 상황이 달라진다. 컬렉션을 페치 조인하면 주문 한 건이 주문상품 수만큼의 행으로 늘어나 같은 주문이 여러 번 나오고, 페이징이 데이터베이스에서 이루어지지 않는다. 03회는 그 현상을 실행 결과로 확인하고, 지연 로딩을 IN 쿼리로 묶는 배치 크기 설정으로 페이징과 성능을 함께 얻는 방법을 다룬다. 04회는 컬렉션까지 DTO로 직접 조회하는 방법을, 05회는 이 회차 내내 응답 시점의 지연 로딩을 가능하게 해 준 OSIV가 커넥션을 얼마나 오래 붙잡는지를 다룬다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>직렬화는 객체 그래프 순회</dt><dd>Jackson은 런타임 클래스의 게터를 속성으로 보고 깊이 우선으로 호출한다. 엔티티를 넘기면 이 순회가 지연 로딩을 모두 일으킨다.</dd>
+<dt>프록시 직렬화 실패</dt><dd>Hibernate 프록시 클래스는 <code>HibernateProxy</code>의 <code>getHibernateLazyInitializer()</code> 때문에 속성이 없는 인터셉터 객체를 노출하고, 기본값인 <code>FAIL_ON_EMPTY_BEANS</code>에 걸린다. 초기화해도 클래스가 그대로라 결과가 같다.</dd>
+<dt>양방향 참조의 순환</dt><dd>JSON에는 참조 개념이 없어서 순환 그래프는 끝없는 트리가 된다. Jackson 2.16 이상은 중첩 깊이 1000에서, 그 이전은 스택 오버플로로 실패한다.</dd>
+<dt>N+1 문제</dt><dd>결과 N건을 돌려준 쿼리 하나 뒤에 연관을 읽는 쿼리가 행마다 따라 나가는 현상이다. ToOne 연관 두 개면 SQL은 1 + 서로 다른 회원 수 + 주문 수처럼 데이터 분포에 따라 정해진다.</dd>
+<dt>문장마다 붙는 고정 비용</dt><dd>기본 키 조회 자체는 싸지만 왕복, 파싱, 최적화, 객체 생성이 문장마다 반복되고 순서대로 일어나 응답 시간에 더해진다.</dd>
+<dt>페치 조인</dt><dd>결과로 돌려주는 엔티티의 연관을 같은 SQL의 SELECT 목록에 넣어 채운다. ToOne 연관은 행 수를 늘리지 않아 페이징이 그대로 된다. 기본은 내부 조인이다.</dd>
+<dt>생성자 표현식</dt><dd><code>select new 완전한.클래스명(...)</code>로 엔티티가 아닌 객체를 만든다. 결과는 영속성 컨텍스트가 관리하지 않으며, 페치 조인과 함께 쓸 수 없다.</dd>
+<dt>V3와 V4의 차이</dt><dd>같은 조인을 실행하고, 전송 컬럼 수와 관리 엔티티 수가 다르다. V3는 재사용성이, V4는 조회 특화가 장점이다.</dd>
+<dt>초기화 콜백과 트랜잭션</dt><dd><code>@PostConstruct</code>는 프록시가 생기기 전에 원본 객체에서 불리므로 같은 메서드의 <code>@Transactional</code>은 적용되지 않는다. 별도 빈에 위임하거나 <code>ApplicationRunner</code>를 쓴다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 N+1은 대개 "특정 API가 데이터가 많은 고객에게서만 느리다"는 증상으로 나타난다. 이 회차의 식 1 + M + N이 그 이유를 설명한다. SQL 수가 코드가 아니라 데이터 분포에 비례하므로, 개발 환경의 작은 샘플 데이터로는 드러나지 않는다. 그래서 샘플 데이터를 설계할 때부터 같은 회원의 여러 주문, 서로 다른 회원의 주문, 연관이 없는 행처럼 분포를 의도해 만들어 두고, 목록 API를 만들 때마다 SQL 로그나 Hibernate 통계로 문장 수를 세는 습관이 첫 번째 방어선이다. 문장 수가 결과 행 수와 함께 늘어나는지만 확인해도 대부분의 문제를 개발 단계에서 잡는다.</p>
+<p>판단이 달라지는 조건도 있다. 결과가 항상 한두 건인 상세 조회라면 N+1이 있어도 문장이 서너 개라 페치 조인 쿼리를 따로 만들 이유가 약하다. 반대로 목록 조회라도 연관을 실제로 화면에 쓰지 않는다면 페치 조인은 필요 없는 조인과 컬럼만 늘린다. 페치 조인은 "이 조회는 이 연관까지 함께 쓴다"는 선언이므로, 화면이 쓰는 연관과 쿼리가 가져오는 연관이 일치하는지가 기준이다.</p>
+<p>엔티티를 응답으로 내보내는 코드는 장애의 형태가 설정에 따라 바뀐다는 점에서 특히 위험하다. OSIV를 켠 상태에서는 프록시 직렬화 오류로, 끈 상태에서는 지연 로딩 예외로, Hibernate 모듈을 등록한 상태에서는 조용히 <code>null</code>이 나가는 응답으로 나타난다. 마지막 경우가 가장 찾기 어렵다. 오류 없이 필드가 비어 나가고, 그 필드가 비는지 여부는 같은 요청에서 다른 코드가 그 연관을 초기화했는지에 달려 있기 때문이다. 응답은 DTO로만 내보낸다는 규칙 하나가 이 세 가지 장애를 한꺼번에 막는다.</p>
+</x-review>
+
+<x-practice>
+<li>주문이 10건이고 그 주문들의 회원이 서로 다른 4명이다. V2 방식(지연 로딩 + DTO 변환)으로 회원 이름과 배송지를 응답할 때 실행되는 SQL 수를 구하라. 같은 데이터에서 V3로 바꾸면 몇 개인가. 회원 4명이 모두 같은 사람으로 바뀌면 V2의 수는 어떻게 되는가.</li>
+<li>엔티티를 그대로 반환하는 API에서 <code>(through reference chain: java.util.ArrayList[0]->demo.Order["delivery"]->demo.Delivery$HibernateProxy["hibernateLazyInitializer"])</code>라는 경로의 오류가 났다. 이 경로를 한 칸씩 해석하고, 동료가 제안한 "반환 전에 <code>order.getDelivery().getStatus()</code>를 불러 초기화해 두자"가 왜 해결책이 아닌지 설명하라.</li>
+<li>회원 이름으로 주문을 거르는 <code>select o from Order o join o.member m where m.name = :name</code>을 실행해 김하나의 주문 2건(이 회차의 샘플 데이터)을 얻었다. 이 결과를 V2의 <code>OrderSummary::from</code>으로 변환하면 SQL이 모두 몇 개 실행되는가. 이것을 한 개로 줄이려면 쿼리를 어떻게 바꾸는가.</li>
+<li><code>@Service</code> 클래스의 <code>@PostConstruct</code> 메서드에 <code>@Transactional</code>을 붙이고 그 안에서 <code>em.persist()</code>로 샘플 데이터를 넣었더니 <code>TransactionRequiredException</code>이 났다. 빈 생명주기의 단계를 들어 원인을 설명하고, 고치는 방법 두 가지를 제시하라.</li>
+<li>V4 쿼리를 <code>select new demo.OrderSummaryRow(...) from Order o join fetch o.member m join o.delivery d</code>로 바꾸면 무엇이 일어나는가. 명세의 페치 조인 정의로 이유를 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> V2는 주문 목록 1개 + 서로 다른 회원 4명의 회원 SELECT 4개 + 주문마다 배송 SELECT 10개로 15개다. 같은 회원의 두 번째 주문부터는 같은 프록시 인스턴스를 공유하고 이미 초기화되어 있어서 회원 SELECT가 나가지 않는다. 배송은 주문과 일대일이라 공유가 없다. V3는 회원과 배송을 페치 조인한 SQL 하나다. 회원이 모두 같은 사람이면 V2는 1 + 1 + 10 = 12개다. 회원 쪽은 줄었지만 배송 쪽 N이 그대로이므로 여전히 주문 수에 비례한다.</p>
+<p><b>2.</b> 목록의 0번 원소인 주문을 직렬화하다가, <code>delivery</code> 속성에 들어 있던 배송 프록시(<code>Delivery$HibernateProxy</code>)로 내려갔고, 그 프록시의 <code>hibernateLazyInitializer</code> 속성에서 실패했다. 이 속성은 프록시 클래스가 구현한 <code>HibernateProxy</code> 인터페이스의 게터에서 나오고, 값인 인터셉터 객체에는 Jackson이 쓸 속성이 없어 <code>FAIL_ON_EMPTY_BEANS</code>에 걸린다. 초기화는 프록시 안에 대상 객체를 채울 뿐 필드가 가리키는 인스턴스와 그 클래스를 바꾸지 않으므로, 초기화한 뒤에도 같은 속성이 보이고 같은 오류가 난다. 해결책은 엔티티 대신 DTO를 반환하는 것이다.</p>
+<p><b>3.</b> 일반 조인이라 SELECT에는 주문 컬럼만 들어가고 회원은 프록시로 남는다. 변환할 때 회원 1번을 한 번 읽고(두 주문이 같은 프록시를 공유한다), 배송 1번과 3번을 각각 읽는다. 그래서 1 + 1 + 2 = 4개다. 실험에서도 이 쿼리의 결과 2건에서 회원 프록시가 초기화되지 않은 상태였다. 한 개로 줄이려면 <code>select o from Order o join fetch o.member m join fetch o.delivery where m.name = :name</code>처럼 페치 조인을 쓴다. Hibernate 6.6에서 이 쿼리는 <code>where m1_0.name=?</code>이 붙은 페치 조인 SQL 하나로 실행되어 2건을 돌려주었고, 변환 중 추가 SQL은 없었다. 페치 조인 대상에 별칭을 붙여 WHERE에서 쓰는 것은 명세가 허용하지 않고 Hibernate가 허용하는 문법이라는 점은 기억해 둔다.</p>
+<p><b>4.</b> <code>@PostConstruct</code>는 초기화 전 후처리 단계에서 원본 객체에 대해 호출되고, <code>@Transactional</code>을 처리하는 프록시는 그다음 단계인 초기화 후 후처리에서 만들어진다. 콜백 호출은 트랜잭션 코드가 있는 프록시를 지나지 않으므로 트랜잭션이 없고, 스프링의 공유 엔티티 매니저는 트랜잭션 없는 <code>persist</code>를 거절한다. 고치는 방법은 데이터를 넣는 메서드를 별도 빈의 <code>@Transactional</code> 메서드로 옮겨 콜백에서 그 빈을 부르는 것(주입받은 빈은 이미 프록시다), 또는 컨텍스트가 준비된 뒤 실행되는 <code>ApplicationRunner</code>에서 그 메서드를 부르는 것이다. 두 경우 모두 <code>@Profile</code>로 실행 환경을 제한한다.</p>
+<p><b>5.</b> Hibernate가 쿼리를 만드는 단계에서 "Query specified join fetching, but the owner of the fetched association was not present in the select list" 예외를 던진다. 명세에서 페치 조인은 쿼리 결과로 반환되는 엔티티(나 임베더블)의 연관을 채우는 부수 효과다. 이 쿼리의 결과는 DTO이고 주문 엔티티는 반환되지 않으므로 채울 대상이 없다. 필요한 값은 SELECT 절에 경로로 직접 적으면 되므로 일반 <code>join</code>으로 바꾼다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>지연 로딩 프록시를 반환 전에 <code>getName()</code>으로 초기화해 두었는데도 Jackson 직렬화가 <code>hibernateLazyInitializer</code>에서 실패했다. 가장 정확한 이유는?</q>
+<o>초기화가 다른 트랜잭션에서 일어나 Jackson이 볼 수 없기 때문이다.</o>
+<o>초기화해도 객체는 같은 프록시 인스턴스이고 클래스가 그대로라, Jackson이 그 클래스에서 찾은 <code>getHibernateLazyInitializer()</code> 속성을 여전히 직렬화하려 하기 때문이다.</o>
+<o>Jackson은 선언 타입 <code>Member</code>의 직렬화기를 쓰는데 <code>Member</code>에 그 속성이 있기 때문이다.</o>
+<o>초기화는 컬렉션에만 적용되고 ToOne 프록시에는 적용되지 않기 때문이다.</o>
+<why>초기화는 프록시 내부의 인터셉터가 대상 객체를 붙잡는 일이고, 필드가 가리키는 인스턴스나 그 클래스는 바뀌지 않는다. Jackson은 값의 런타임 클래스(<code>Member$HibernateProxy</code>)로 직렬화기를 만들며, 이 클래스는 <code>HibernateProxy</code>를 구현하므로 <code>hibernateLazyInitializer</code> 속성이 생긴다. 보기 0은 같은 영속성 컨텍스트 안의 일이라 무관하고, 보기 2는 선언 타입이 아니라 런타임 타입이 쓰이므로 틀리며, <code>Member</code>에는 그런 게터가 없다. 보기 3은 ToOne 프록시도 초기화되므로 틀리다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>주문 6건의 회원이 서로 다른 2명이고, 배송은 주문과 일대일이다. 한 영속성 컨텍스트에서 <code>select o from Order o</code>로 조회한 뒤 각 주문의 회원 이름과 배송지를 읽어 DTO로 바꾸면 SQL은 몇 개 실행되는가?</q>
+<o>3</o>
+<o>7</o>
+<o>9</o>
+<o>13</o>
+<why>주문 목록 1개, 서로 다른 회원 2명에 대한 회원 SELECT 2개, 주문마다 배송 SELECT 6개로 1 + 2 + 6 = 9다. 같은 회원을 가리키는 주문들은 영속성 컨텍스트에서 같은 프록시를 공유하므로 처음 한 번만 조회된다. 13은 회원도 주문마다 조회된다고 본 최악의 경우(1 + 2 × 6)이고, 7은 배송 쿼리를 하나로 본 것이며, 3은 지연 로딩이 IN 쿼리로 묶였을 때에 가까운 수로 이 설정에서는 일어나지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>같은 영속성 컨텍스트에서 <code>em.getReference(Member.class, 1L)</code>로 프록시를 먼저 얻은 뒤 <code>select o from Order o join fetch o.member</code>를 실행했다. 주문 1의 <code>getMember()</code>가 돌려주는 객체에 대한 설명으로 옳은 것은?</q>
+<o>앞서 얻은 프록시와 같은 인스턴스이며, 페치 조인 결과로 초기화되어 있다.</o>
+<o>페치 조인이므로 프록시가 아닌 새 <code>Member</code> 인스턴스이고, 앞서 얻은 프록시와는 다른 객체다.</o>
+<o>앞서 얻은 프록시와 같은 인스턴스이지만 아직 초기화되지 않아 접근하면 SELECT가 한 번 더 나간다.</o>
+<o>같은 식별자에 두 객체가 생기므로 Hibernate가 예외를 던진다.</o>
+<why>영속성 컨텍스트는 같은 식별자에 하나의 인스턴스만 돌려준다. 이미 등록된 프록시가 있으면 Hibernate는 그 프록시를 결과 행의 데이터로 초기화해 연관 필드에 넣는다. 실험에서 같은 인스턴스, 클래스는 <code>Member$HibernateProxy</code>, 초기화 여부는 true였고 SQL은 페치 조인 하나뿐이었다. 보기 1은 동일성 보장을 깨는 결과라 일어나지 않고, 보기 2는 페치 조인 데이터로 이미 초기화되므로 틀리며, 보기 3의 충돌은 동일성 규칙 덕분에 생기지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>JPQL 생성자 표현식으로 DTO를 조회하면서 <code>join fetch</code>를 쓰면 Hibernate가 쿼리를 거절한다. 그 이유로 가장 알맞은 것은?</q>
+<o>생성자 표현식은 내부 조인을 지원하지 않기 때문이다.</o>
+<o>DTO 클래스가 엔티티로 매핑되어 있지 않으면 생성자 표현식을 쓸 수 없기 때문이다.</o>
+<o>페치 조인은 SQL을 두 번 실행해야 하는데 생성자 표현식은 한 번만 허용하기 때문이다.</o>
+<o>페치 조인은 결과로 반환되는 엔티티의 연관을 채우는 부수 효과인데, 결과가 DTO라 연관의 주인 엔티티가 SELECT 목록에 없기 때문이다.</o>
+<why>명세는 페치 조인 대상이 쿼리 결과로 반환되는 엔티티나 임베더블이 참조하는 연관이어야 한다고 정한다. 생성자 표현식의 결과는 DTO라서 채울 엔티티가 없고, Hibernate는 "the owner of the fetched association was not present in the select list"라며 거절한다. 보기 0은 V4가 바로 내부 조인을 쓰므로 틀리다. 보기 1은 명세가 생성자 표현식의 클래스는 엔티티일 필요가 없다고 명시하므로 틀리다. 보기 2는 페치 조인이 SQL 하나로 실행되므로 틀리다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>컴포넌트의 <code>@PostConstruct</code> 메서드에 <code>@Transactional</code>을 붙였는데 메서드 안에서 트랜잭션이 활성화되어 있지 않았다. 원인으로 옳은 것은?</q>
+<o><code>@PostConstruct</code> 메서드는 반드시 <code>private</code>이라 프록시가 가로챌 수 없기 때문이다.</o>
+<o>초기화 콜백은 빈 후처리기가 프록시를 만들기 전 단계에서 원본 객체에 대해 호출되어, 트랜잭션을 시작하는 프록시를 거치지 않기 때문이다.</o>
+<o>트랜잭션 매니저 빈이 항상 다른 모든 빈보다 늦게 만들어지기 때문이다.</o>
+<o><code>@Transactional</code>은 <code>@Service</code>가 붙은 클래스에서만 동작하기 때문이다.</o>
+<why>공통 애너테이션 후처리기가 <code>postProcessBeforeInitialization</code>에서 <code>@PostConstruct</code>를 원본 객체에 대해 호출하고, 자동 프록시 생성기는 그 뒤의 <code>postProcessAfterInitialization</code>에서 프록시를 만든다. 실험에서 콜백 중에는 <code>txActive=false</code>였지만 컨테이너에 등록된 빈은 CGLIB 프록시였고, 컨텍스트가 뜬 뒤 그 프록시로 같은 메서드를 부르자 트랜잭션이 시작되었다. 보기 0은 실험의 메서드가 public이었으므로 원인이 아니고, 보기 2는 근거가 없으며, 보기 3은 <code>@Transactional</code>이 스테레오타입과 무관하게 프록시 대상 빈에 적용되므로 틀리다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>N+1 문제(N+1 problem)</dt><dd>결과 N건을 돌려준 쿼리 하나 뒤에 각 결과의 연관을 읽는 쿼리가 따로 실행되어 문장 수가 결과 수에 비례하는 현상.</dd>
+<dt>페치 조인(fetch join)</dt><dd>쿼리 결과로 반환되는 엔티티의 연관을 같은 SQL에서 함께 읽어 채우는 JPQL 조인. 연관 엔티티의 컬럼이 SELECT 목록에 들어간다.</dd>
+<dt>생성자 표현식(constructor expression)</dt><dd>JPQL SELECT 절의 <code>NEW 완전한.클래스명(...)</code>. 엔티티가 아닌 클래스의 인스턴스를 쿼리 결과로 만든다.</dd>
+<dt>Hibernate 프록시(HibernateProxy)</dt><dd>지연 로딩을 위해 런타임에 생성되는 엔티티의 하위 클래스. 인터셉터를 통해 첫 접근 시 대상 객체를 로딩하며, 초기화 뒤에도 클래스와 인스턴스는 그대로다.</dd>
+<dt>FAIL_ON_EMPTY_BEANS</dt><dd>Jackson이 직렬화할 속성이 하나도 없는 객체를 만났을 때 예외를 던지게 하는 기능. 기본으로 켜져 있다.</dd>
+<dt>빈 후처리기(BeanPostProcessor)</dt><dd>스프링 컨테이너가 빈 초기화 전후에 호출하는 확장점. 초기화 전 단계에서 <code>@PostConstruct</code>가 호출되고, 초기화 후 단계에서 AOP 프록시가 만들어진다.</dd>
+<dt>eq_ref</dt><dd>MySQL EXPLAIN의 조인 접근 방식. 앞 테이블의 행 조합마다 기본 키나 UNIQUE NOT NULL 인덱스로 한 행을 읽는다.</dd>
+<dt>커버링 인덱스(covering index)</dt><dd>쿼리가 필요로 하는 컬럼이 모두 들어 있어 테이블 행을 읽지 않고 인덱스만으로 답할 수 있는 인덱스. EXPLAIN의 Extra에 Using index로 나타난다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html">Jakarta Persistence 3.1 Specification</a> — 4.4.5.3 Fetch Joins(반환 엔티티의 연관만 페치 가능, 별칭 금지), 4.8.2 생성자 표현식(완전한 이름, 관리 상태 규칙), FetchType.LAZY가 힌트라는 규정</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html">Spring Framework Reference: Using @Transactional</a> — 프록시 모드에서는 외부 호출만 가로채며, @PostConstruct 같은 초기화 코드에서 이 기능에 기대지 말라는 설명</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/explain-output.html">MySQL 8.0 Reference Manual: EXPLAIN Output Format</a> — eq_ref 조인 방식과 Extra의 Using index 정의</li>
+<li><a href="https://github.com/FasterXML/jackson-datatype-hibernate">jackson-datatype-hibernate (GitHub)</a> — Hibernate 버전별 Jackson 모듈 아티팩트 목록</li>
+<li><a href="https://raw.githubusercontent.com/FasterXML/jackson-datatype-hibernate/2.x/hibernate6/src/main/java/com/fasterxml/jackson/datatype/hibernate6/Hibernate6Module.java">Hibernate6Module.java (2.x 브랜치)</a> — FORCE_LAZY_LOADING의 기본값(false)과 초기화되지 않은 프록시를 null로 쓰는 동작</li>
+<li><a href="https://raw.githubusercontent.com/FasterXML/jackson-core/2.x/src/main/java/com/fasterxml/jackson/core/StreamWriteConstraints.java">StreamWriteConstraints.java (jackson-core 2.x)</a> — 2.16에서 도입된 쓰기 중첩 깊이 제한과 기본값 1000</li>
+</x-refs>

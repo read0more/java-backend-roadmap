@@ -1,0 +1,563 @@
+<x-meta>
+deck: @Transactional 한 줄 뒤에서 프록시·인터셉터·트랜잭션 매니저가 어떻게 맞물리는지, 그리고 내부 호출·초기화 시점·체크 예외처럼 그 구조 때문에 생기는 함정을 실험 로그와 소스 코드로 따라간다
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li>빈이 트랜잭션 프록시인지, 지금 코드가 실제 트랜잭션 안에서 실행 중인지를 <code>AopUtils</code>와 <code>TransactionSynchronizationManager</code>, 트랜잭션 로그로 직접 확인할 수 있다.</li>
+<li>메서드·클래스·인터페이스에 붙은 <code>@Transactional</code> 중 어느 것이 적용되는지 스프링의 탐색 순서로 설명하고, 접근 제어자와 <code>final</code>이 프록시 적용에 주는 영향을 예측할 수 있다.</li>
+<li>같은 객체 안에서 <code>this.method()</code>로 호출하면 트랜잭션이 걸리지 않는 이유를 프록시 객체와 대상 객체의 메모리 관계, <code>invokevirtual</code> 바이트코드로 설명하고 해결책을 고를 수 있다.</li>
+<li><code>@PostConstruct</code>에서 <code>@Transactional</code>이 동작하지 않는 이유를 빈 초기화 순서로 설명하고, 대안을 적용할 수 있다.</li>
+<li>예외 종류와 <code>rollbackFor</code>·<code>noRollbackFor</code> 규칙에 따라 커밋과 롤백 중 무엇이 일어날지 판정하고, 업무 예외를 커밋하는 설계의 장단점을 논할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>트랜잭션 코드는 왜 비즈니스 로직 밖으로 나가야 했나</h3>
+<p>스프링 DB 1편에서 트랜잭션 문제를 세 단계로 풀었다. 첫째, 서비스 계층이 JDBC의 <code>Connection</code>을 직접 다루지 않도록 <b>트랜잭션 추상화(transaction abstraction)</b>인 <code>PlatformTransactionManager</code>를 두었다. 이 인터페이스에는 <code>getTransaction(TransactionDefinition)</code>, <code>commit(TransactionStatus)</code>, <code>rollback(TransactionStatus)</code> 세 메서드만 있고, JDBC면 <code>DataSourceTransactionManager</code>, JPA면 <code>JpaTransactionManager</code>가 구현을 맡는다. 둘째, 같은 트랜잭션에 참여하는 저장소들이 같은 커넥션을 쓰도록 <b>트랜잭션 동기화(transaction synchronization)</b>를 두었다. 트랜잭션 매니저가 연 커넥션을 스레드에 묶어 두면, 저장소는 파라미터로 커넥션을 받지 않아도 그 스레드의 커넥션을 꺼내 쓴다. 셋째, 시작·커밋·롤백이라는 반복 코드를 <code>TransactionTemplate</code>으로 걷어 냈고, 마지막으로 그것마저 서비스 코드에서 지우기 위해 <code>@Transactional</code>과 AOP 프록시를 썼다.</p>
+<p>이번 회차는 그 마지막 단계, 즉 <b>선언적 트랜잭션(declarative transaction)</b>을 바닥까지 판다. 선언적이라는 말은 "트랜잭션을 어떻게 시작하고 끝낼지"를 코드로 쓰지 않고 "이 메서드는 트랜잭션 안에서 실행되어야 한다"는 사실만 애너테이션으로 선언한다는 뜻이다. 반대로 <code>TransactionTemplate</code>이나 트랜잭션 매니저를 직접 호출하는 방식은 <b>프로그래밍 방식 트랜잭션(programmatic transaction)</b>이라 부른다. 선언적 방식은 편하지만, 선언과 실제 동작 사이에 프록시라는 중간층이 끼어든다. 이 중간층의 구조를 모르면 "애너테이션을 붙였는데 왜 롤백이 안 되지?" 같은 질문에 답할 수 없다.</p>
+<p>이 회차에서 다룰 함정들은 모두 같은 뿌리에서 나온다. 스프링 트랜잭션은 기본 설정(프록시 모드)에서 <b>프록시 객체를 거쳐 들어온 호출만</b> 가로챈다. 내부 호출, 초기화 메서드, <code>final</code> 메서드, 접근 제어자 문제는 전부 "그 호출이 프록시를 지나갔는가"라는 질문 하나로 정리된다. 예외에 따른 커밋·롤백 규칙도 "프록시 밖으로 어떤 예외가 던져졌는가"로 결정된다. 그러니 먼저 프록시가 무엇을 하는지부터 확인하자.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>비서를 통해서만 잡히는 회의실 예약</strong><p>팀장이 "내 일정은 모두 비서를 통해 잡는다"고 정해 두면, 비서는 외부에서 오는 요청마다 회의실을 잡고(트랜잭션 시작) 회의가 끝나면 정리한다(커밋·롤백). 그런데 팀장이 자기 방에서 스스로 다음 일정을 시작하면 비서는 그 사실을 모른다. 이것이 내부 호출 문제다. 다만 비유가 깨지는 지점도 있다. 실제 프록시는 사람처럼 상황을 보고 판단하지 않는다. 어떤 메서드에 무엇을 할지는 기동 시점에 읽어 둔 애너테이션 정보로 이미 정해져 있고, 호출 시점에는 그 정보를 기계적으로 적용할 뿐이다.</p></aside>
+
+<h3>실험 환경 준비</h3>
+<p>이 회차의 실험은 데이터 접근 기술과 무관하게 트랜잭션 인프라 자체를 관찰하는 것이 목적이다. 스프링 부트 3.x 프로젝트라면 <code>spring-boot-starter-data-jpa</code>(또는 <code>spring-boot-starter-jdbc</code>)와 메모리 DB인 H2만 있으면 된다. 부트는 클래스패스에 데이터 접근 기술이 있으면 그에 맞는 트랜잭션 매니저를 빈으로 등록하고 <code>@Transactional</code> 처리를 자동 구성으로 켠다. 테스트에서는 <code>@SpringBootTest</code>로 컨텍스트를 띄우고 <code>@TestConfiguration</code>으로 실험용 빈을 등록하는 방식이 가장 간단하다.</p>
+<pre><code class="language-groovy">dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    runtimeOnly 'com.h2database:h2'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}</code></pre>
+<p>트랜잭션이 언제 시작되고 끝나는지 눈으로 보려면 로그 레벨을 올려야 한다. 트랜잭션 인터셉터는 TRACE 레벨로 "트랜잭션을 얻었다/완료했다"를 남기고, 트랜잭션 매니저는 DEBUG 레벨로 커넥션 획득, 자동 커밋 해제, 커밋·롤백을 남긴다. 부트에서는 <code>application.properties</code>에 다음처럼 쓴다. JPA를 쓰는 프로젝트면 실제로 동작하는 매니저가 <code>JpaTransactionManager</code>이므로 세 번째 줄이 필요하다.</p>
+<pre><code class="language-properties">logging.level.org.springframework.transaction.interceptor=TRACE
+logging.level.org.springframework.jdbc.datasource.DataSourceTransactionManager=DEBUG
+logging.level.org.springframework.orm.jpa.JpaTransactionManager=DEBUG</code></pre>
+<aside class="note">이 회차에 실은 실행 결과는 JDK 21에서 Spring Framework 7.0.10(부트 없이 <code>AnnotationConfigApplicationContext</code>)과 H2로 직접 돌려 얻은 것이다. 부트의 기본값을 흉내 내려고 <code>@EnableTransactionManagement(proxyTargetClass = true)</code>로 CGLIB 프록시를 쓰게 했다. 본문에서 설명하는 규칙은 기준 버전인 Spring Framework 6.2 레퍼런스 문서와 대조해 두 버전에서 같은 것만 적었다. 로그는 레벨 표시와 커넥션 문자열을 줄여서 싣는다.</aside>
+
+<h3>트랜잭션 적용 확인: 프록시인가, 지금 트랜잭션 안인가</h3>
+<p>"트랜잭션이 적용되었다"는 말은 두 가지를 따로 확인해야 한다. 하나는 <b>컨테이너에 등록된 빈이 프록시인가</b>이고, 다른 하나는 <b>메서드가 실행되는 순간 실제 트랜잭션이 활성 상태인가</b>다. 앞의 것은 기동 시점에 결정되고, 뒤의 것은 호출 시점에 결정된다. 프록시인데도 트랜잭션이 없는 경우(트랜잭션 속성이 없는 메서드, 내부 호출)가 있으므로 둘을 구분해서 봐야 한다.</p>
+<p>첫 번째 질문은 <code>AopUtils.isAopProxy(bean)</code>으로 답한다. 빈의 실제 클래스 이름을 찍어 보면 더 직관적이다. 아래 실험(Spring Framework 7.0.10)에서는 CGLIB 프록시 클래스 이름에 <code>$$SpringCGLIB$$</code>가 붙어 나온다. 두 번째 질문은 <code>TransactionSynchronizationManager.isActualTransactionActive()</code>로 답한다. 이 클래스는 DB 1편에서 본 트랜잭션 동기화 매니저다. Spring Framework 7.0.10 소스를 열어 보면 이 클래스는 커넥션 같은 자원, 트랜잭션 이름, 읽기 전용 여부, 격리 수준, 실제 트랜잭션 활성 여부를 각각 별도의 <code>ThreadLocal</code> 필드로 들고 있다. 그래서 이 메서드는 "현재 스레드에 실제 트랜잭션이 묶여 있는가"를 돌려준다. <code>isCurrentTransactionReadOnly()</code>도 같은 방식으로 현재 스레드의 읽기 전용 플래그를 알려 준다.</p>
+<p>아래는 이 회차 전체에서 쓰는 실험 코드의 뼈대다. 트랜잭션 속성이 있는 메서드와 없는 메서드를 한 클래스에 섞어 두고, 각 메서드 안에서 현재 상태를 출력한다.</p>
+<pre><code class="language-java">public class App {
+    static void log(String where) {
+        System.out.println(where + " active=" + TransactionSynchronizationManager.isActualTransactionActive()
+                + " readOnly=" + TransactionSynchronizationManager.isCurrentTransactionReadOnly());
+    }
+
+    static class CallService {
+        public void external() { log("external"); internal(); }
+        @Transactional public void internal() { log("internal"); }
+        @Transactional protected void prot() { log("protected"); }
+        @Transactional void pkg() { log("package-private"); }
+    }
+
+    @Configuration
+    @EnableTransactionManagement(proxyTargetClass = true)
+    static class Config {
+        @Bean DataSource dataSource() { return new EmbeddedDatabaseBuilder().setType(EmbeddedDatabaseType.H2).build(); }
+        @Bean PlatformTransactionManager txManager(DataSource ds) { return new DataSourceTransactionManager(ds); }
+        @Bean CallService callService() { return new CallService(); }
+        // ... 뒤에서 쓸 다른 빈들
+    }
+
+    public static void main(String[] args) {
+        var ctx = new AnnotationConfigApplicationContext(Config.class);
+        CallService cs = ctx.getBean(CallService.class);
+        System.out.println("proxy class=" + cs.getClass().getName()
+                + " aop=" + AopUtils.isAopProxy(cs) + " cglib=" + AopUtils.isCglibProxy(cs));
+        cs.external();
+        cs.internal();
+        // ...
+    }
+}</code></pre>
+<p>먼저 프록시 확인 결과와 <code>cs.internal()</code>을 바깥에서 직접 호출했을 때의 출력이다. 출력 사이사이에 트랜잭션 매니저와 인터셉터의 로그가 끼어든다.</p>
+<pre data-label="실행 결과 (Spring Framework 7.0.10)"><code class="language-text">proxy class=exp.App$CallService$$SpringCGLIB$$0 aop=true cglib=true
+DataSourceTransactionManager - Creating new transaction with name [exp.App$CallService.internal]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+DataSourceTransactionManager - Acquired Connection [...] for JDBC transaction
+DataSourceTransactionManager - Switching JDBC Connection [...] to manual commit
+TransactionInterceptor - Getting transaction for [exp.App$CallService.internal]
+internal active=true readOnly=false
+TransactionInterceptor - Completing transaction for [exp.App$CallService.internal]
+DataSourceTransactionManager - Initiating transaction commit
+DataSourceTransactionManager - Committing JDBC transaction on Connection [...]
+DataSourceTransactionManager - Releasing JDBC Connection [...] after transaction</code></pre>
+<p>로그를 한 줄씩 읽어 보자. 첫 줄은 컨테이너에서 꺼낸 객체가 <code>CallService</code>가 아니라 그 하위 클래스인 <code>CallService$$SpringCGLIB$$0</code>의 인스턴스라는 사실을 보여 준다. 그다음 "Creating new transaction with name [...]" 줄에는 트랜잭션 이름(클래스 이름과 메서드 이름)과 함께 적용된 속성이 찍힌다. 우리가 <code>@Transactional</code>에 아무 옵션도 주지 않았으므로 전파는 <code>PROPAGATION_REQUIRED</code>, 격리 수준은 <code>ISOLATION_DEFAULT</code>다. 이어서 커넥션을 얻고, "Switching ... to manual commit" 줄에서 <code>setAutoCommit(false)</code>를 호출해 DB 쪽 트랜잭션을 연다. TRACE 로그 "Getting transaction for"는 이 준비가 끝난 뒤에 찍힌다. 인터셉터가 트랜잭션 매니저에게 트랜잭션을 받아 온 다음, 그 정보를 기록하면서 로그를 남기기 때문이다. 메서드 본문이 출력한 <code>active=true</code>가 그 결과다. 메서드가 정상 반환하자 "Completing transaction for"가 찍히고, 커밋한 뒤 커넥션을 반납한다.</p>
+<p>반면 <code>cs.external()</code>을 호출하면 트랜잭션 로그가 한 줄도 나오지 않는다. <code>external()</code>에는 트랜잭션 속성이 없기 때문이다. 같은 프록시 객체라도 메서드마다 처리가 다르다는 점, 그리고 <code>external()</code> 안에서 부른 <code>internal()</code>에도 트랜잭션이 없다는 점은 뒤에서 내부 호출을 다룰 때 자세히 본다.</p>
+
+<h3>호출 하나가 지나가는 길: 프록시, 인터셉터, 트랜잭션 매니저</h3>
+<p>프록시가 언제, 누구에 의해 만들어지는지부터 보자. <code>@EnableTransactionManagement</code>(부트에서는 자동 구성이 대신 붙인다)는 두 가지를 컨테이너에 등록한다. 하나는 <b>자동 프록시 생성기(auto proxy creator)</b>다. Spring Framework 7.0.10의 <code>AutoProxyRegistrar</code>는 <code>AopConfigUtils.registerAutoProxyCreatorIfNecessary</code>를 호출해 <code>InfrastructureAdvisorAutoProxyCreator</code>를 등록하는데, 이미 AspectJ 애너테이션을 처리하는 더 강한 생성기(<code>AnnotationAwareAspectJAutoProxyCreator</code>)가 등록되어 있으면 그것을 쓴다. 자동 프록시 생성기는 빈 후처리기(<code>BeanPostProcessor</code>)이며, 스프링 핵심 원리 기본편에서 본 것처럼 컨테이너가 빈을 만들 때마다 끼어들 수 있다. 다른 하나는 <code>ProxyTransactionManagementConfiguration</code>과 그 부모 클래스 <code>AbstractTransactionManagementConfiguration</code>이 정의하는 인프라 빈들로, 트랜잭션 어드바이저 <code>BeanFactoryTransactionAttributeSourceAdvisor</code>, 그 안에 들어갈 어드바이스 <code>TransactionInterceptor</code>, 그리고 애너테이션을 읽어 트랜잭션 속성으로 바꿔 주는 <code>AnnotationTransactionAttributeSource</code>다.</p>
+<p>빈이 하나 만들어질 때마다 자동 프록시 생성기는 등록된 어드바이저들에게 "이 빈에 적용할 것이 있는가"를 묻는다. 트랜잭션 어드바이저의 포인트컷(<code>TransactionAttributeSourcePointcut</code>)은 이 질문을 그대로 속성 소스에 넘긴다. 7.0.10 소스의 <code>matches</code> 메서드는 <code>transactionAttributeSource.hasTransactionAttribute(method, targetClass)</code>를 돌려줄 뿐이다. 즉 클래스의 메서드 중 <b>하나라도</b> 트랜잭션 속성이 있으면 그 빈 전체가 프록시로 감싸진다. 감싸진 뒤 호출 시점에는 메서드별로 어드바이스 체인을 구하는데, 트랜잭션 속성이 없는 메서드는 포인트컷에 걸리지 않으므로 체인이 비고, 프록시는 대상 객체의 메서드를 그대로 호출한다. 앞의 실험에서 <code>external()</code>이 아무 로그 없이 실행된 이유가 이것이다.</p>
+<p>속성 소스는 애너테이션 분석 결과를 캐시한다. <code>AbstractFallbackTransactionAttributeSource</code>의 문서 주석은 <code>getTransactionAttribute</code>가 계산 메서드인 <code>computeTransactionAttribute</code>에 대한 "캐싱 데코레이터"라고 설명하며, 캐시 키는 메서드와 대상 클래스의 쌍(<code>MethodClassKey</code>)이다. 리플렉션으로 애너테이션을 찾는 비용은 메서드마다 처음 한 번만 치르고, 이후 호출은 맵 조회로 끝난다. 트랜잭션 속성이 "실행 중에 바뀌지 않는 메타데이터"로 취급된다는 점도 여기서 알 수 있다.</p>
+<p>이제 트랜잭션 속성이 있는 메서드를 프록시로 호출했을 때의 경로다. CGLIB 프록시는 오버라이드한 메서드에서 어드바이스 체인을 실행하고, 체인 안의 <code>TransactionInterceptor.invoke</code>는 부모 클래스 <code>TransactionAspectSupport</code>의 <code>invokeWithinTransaction</code>을 부른다. 이 메서드가 선언적 트랜잭션의 심장이다.</p>
+<figure class="flow-figure"><figcaption>invokeWithinTransaction이 하는 일 (명령형 트랜잭션 경로)</figcaption><ol class="flow">
+<li><strong>속성 조회</strong><span>캐시에서 이 메서드의 트랜잭션 속성(전파, 격리, 읽기 전용, 타임아웃, 롤백 규칙)을 꺼낸다.</span></li>
+<li><strong>트랜잭션 매니저 결정</strong><span><code>@Transactional("이름")</code>으로 지정했으면 그 빈을, 아니면 기본 트랜잭션 매니저를 쓴다.</span></li>
+<li><strong>트랜잭션 시작</strong><span><code>createTransactionIfNecessary</code>가 <code>PlatformTransactionManager.getTransaction</code>을 호출한다. JDBC라면 커넥션을 얻고 자동 커밋을 끈 뒤 스레드에 묶는다.</span></li>
+<li><strong>대상 호출</strong><span><code>invocation.proceedWithInvocation()</code>으로 실제 객체의 메서드를 실행한다.</span></li>
+<li><strong>예외 처리</strong><span>예외가 나오면 <code>completeTransactionAfterThrowing</code>이 롤백 규칙을 보고 롤백 또는 커밋한 뒤 예외를 다시 던진다.</span></li>
+<li><strong>정리와 커밋</strong><span>finally에서 이전 트랜잭션 정보를 복원하고, 정상 반환이면 <code>commitTransactionAfterReturning</code>이 커밋한다.</span></li>
+</ol></figure>
+<p>세 번째 단계에서 <code>DataSourceTransactionManager.doBegin</code>이 하는 일도 소스로 확인할 수 있다. 커넥션 풀에서 새 커넥션을 얻고, 읽기 전용이면 <code>Connection.setReadOnly(true)</code>를, 격리 수준이 기본값이 아니면 <code>setTransactionIsolation</code>을 적용한다. 커넥션이 자동 커밋 모드면 <code>setAutoCommit(false)</code>로 바꾸고 나중에 되돌리도록 표시해 둔다. 타임아웃이 있으면 커넥션 홀더에 마감 시각을 기록하고, 마지막으로 <code>TransactionSynchronizationManager.bindResource(dataSource, connectionHolder)</code>로 커넥션을 현재 스레드에 묶는다. 이후 같은 스레드에서 <code>JdbcTemplate</code>이나 <code>DataSourceUtils.getConnection</code>이 같은 <code>DataSource</code>로 커넥션을 요청하면 이 홀더의 커넥션이 나온다.</p>
+<pre class="diagram">호출자 스레드 T1
+  │ cs.internal()
+  ▼
+CallService$$SpringCGLIB$$0 (프록시)
+  │ 어드바이스 체인 = [TransactionInterceptor]
+  ▼
+TransactionInterceptor.invoke
+  └ invokeWithinTransaction
+       ├ txAttr = 캐시 조회 → PROPAGATION_REQUIRED, ISOLATION_DEFAULT
+       ├ tm.getTransaction(txAttr)
+       │    └ doBegin: getConnection → setAutoCommit(false)
+       │               → bindResource(DataSource → ConnectionHolder)  [ThreadLocal of T1]
+       ├ proceedWithInvocation ──▶ CallService.internal()  (실제 객체)
+       │                               └ 같은 T1에서 DB 접근 → 묶인 커넥션 사용
+       ├ (예외 없음) commitTransactionAfterReturning → tm.commit
+       └ 커넥션 자동 커밋 복구, unbind, 풀에 반납</pre>
+<x-visual id="spring-db2-07-proxy-call-flow" title="@Transactional 메서드 호출이 프록시와 트랜잭션 매니저를 지나는 순서" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>호출자가 프록시를 거쳐 실제 객체에 도달하는 동안 트랜잭션 시작, 커넥션 바인딩, 커밋이 어떤 순서로 일어나는지 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 다섯 개의 세로 생명선이 있는 시퀀스 다이어그램. 생명선 라벨은 차례로 "호출자", "프록시", "트랜잭션 인터셉터", "트랜잭션 매니저", "실제 객체". 맨 오른쪽 아래에 원통 모양 "DB 커넥션"을 둔다. 화살표 순서: 호출자→프록시 "internal() 호출", 프록시→트랜잭션 인터셉터 "어드바이스 실행", 트랜잭션 인터셉터→트랜잭션 매니저 "getTransaction", 트랜잭션 매니저→DB 커넥션 "setAutoCommit(false)", 트랜잭션 매니저 옆에 작은 상자 "스레드에 커넥션 바인딩", 트랜잭션 인터셉터→실제 객체 "메서드 실행", 실제 객체에서 돌아오는 점선 "정상 반환", 트랜잭션 인터셉터→트랜잭션 매니저 "commit", 트랜잭션 매니저→DB 커넥션 "커밋 후 반납". 평면적인 기술 도해 스타일, 흰 배경, 파란색과 회색 위주.</x-prompt>
+<x-caption>트랜잭션은 프록시 안의 인터셉터가 시작하고 끝낸다. 실제 객체는 이미 열린 트랜잭션 안에서 실행될 뿐이다.</x-caption>
+</x-visual>
+
+<h3>트랜잭션 적용 위치: 어느 @Transactional이 이기는가</h3>
+<p><code>@Transactional</code>은 메서드에도, 클래스에도, 인터페이스와 그 메서드에도 붙일 수 있다. 여러 곳에 붙어 있으면 어느 것이 적용될까. Spring Framework 6.2 레퍼런스는 이 규칙을 한 문장으로 요약한다. 메서드의 트랜잭션 설정을 평가할 때는 "가장 많이 파생된 위치(the most derived location)"가 우선한다. 더 구체적이고 자세한 쪽이 이긴다는 뜻이다. 이 규칙이 실제로 어떻게 구현되어 있는지는 <code>AbstractFallbackTransactionAttributeSource.computeTransactionAttribute</code>를 보면 정확히 알 수 있다.</p>
+<ol>
+<li>접근 제어자 검사: 공개 메서드만 허용하도록 설정되어 있는데 공개 메서드가 아니면 바로 "속성 없음"을 돌려준다.</li>
+<li>호출된 메서드가 인터페이스 메서드라면 대상 클래스에서 그 메서드를 구현한 <b>가장 구체적인 메서드</b>를 찾는다(<code>AopUtils.getMostSpecificMethod</code>).</li>
+<li>첫 번째 시도: 대상 클래스의 그 메서드에 붙은 애너테이션. 이 조회는 <code>AnnotatedElementUtils.findMergedAnnotationAttributes</code>를 쓰므로 그 메서드가 오버라이드하거나 구현한 상위 클래스·인터페이스의 메서드에 붙은 애너테이션도 여기서 찾는다. 그래서 클래스에 <code>@Transactional(readOnly = true)</code>가 있고 구현한 인터페이스 메서드에 <code>@Transactional</code>이 있으면 인터페이스 메서드 쪽이 이긴다(7.0.10과 6.2.19에서 <code>readOnly=false</code>로 확인).</li>
+<li>두 번째 시도: 그 메서드를 선언한 대상 클래스에 붙은 애너테이션.</li>
+<li>대상 클래스에서 찾은 메서드가 원래 메서드와 다르면(인터페이스로 호출된 경우), 원래 메서드(인터페이스 메서드)의 애너테이션, 마지막으로 인터페이스 타입의 애너테이션을 본다.</li>
+</ol>
+<p>찾는 즉시 반환하므로 앞 순서가 이긴다. 클래스에 <code>@Transactional(readOnly = true)</code>를 붙이고 쓰기 메서드에만 <code>@Transactional</code>을 다시 붙이는 흔한 패턴이 이 규칙 위에서 동작한다. 실험으로 확인해 보자.</p>
+<pre><code class="language-java">@Transactional(readOnly = true)
+static class LevelService {
+    @Transactional public void write() { log("write(method)"); }
+    public void read() { log("read(class)"); }
+}
+
+interface Greeter { @Transactional void hello(); }
+static class GreeterImpl implements Greeter { public void hello() { log("interface-annotated"); } }</code></pre>
+<pre data-label="실행 결과 (요약)"><code class="language-text">DataSourceTransactionManager - Creating new transaction with name [exp.App$LevelService.write]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+write(method) active=true readOnly=false
+DataSourceTransactionManager - Creating new transaction with name [exp.App$LevelService.read]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT,readOnly
+read(class) active=true readOnly=true
+greeter class=exp.App$GreeterImpl$$SpringCGLIB$$0
+DataSourceTransactionManager - Creating new transaction with name [exp.App$GreeterImpl.hello]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+interface-annotated active=true readOnly=false</code></pre>
+<p><code>write()</code>는 메서드에 붙은 애너테이션이 먼저 발견되어 읽기·쓰기 트랜잭션이 되었고, <code>read()</code>는 메서드에 애너테이션이 없으니 클래스의 <code>readOnly = true</code>를 받았다. 트랜잭션 이름 뒤에 붙은 <code>,readOnly</code>가 그 증거다. 여기서 주의할 점이 하나 있다. 메서드의 <code>@Transactional</code>은 클래스의 설정과 <b>합쳐지지 않는다</b>. 메서드 쪽 애너테이션이 발견되면 그것 하나로 속성이 결정되므로, 클래스에 <code>timeout = 3</code>을 주고 메서드에 <code>@Transactional</code>만 다시 붙이면 그 메서드의 타임아웃은 기본값이다. 위 탐색 코드가 "찾으면 즉시 반환"하는 구조라는 데서 바로 나오는 결론이다.</p>
+<p>인터페이스에만 애너테이션을 붙인 <code>GreeterImpl</code>도 CGLIB 프록시로 트랜잭션이 걸렸다. 레퍼런스 문서도 인터페이스 쪽 애너테이션이 인터페이스 기반 프록시와 클래스 기반 프록시 모두에서 5.0부터 동작한다고 밝힌다. 그런데도 같은 문서는 구체 클래스의 메서드에 붙이라고 권한다. 이유는 자바 언어 규칙에 있다. 자바 애너테이션은 인터페이스에서 구현 클래스로 상속되지 않는다. 스프링은 위의 탐색 코드처럼 인터페이스까지 일부러 찾아가 주지만, AspectJ 위빙 모드는 그렇게 하지 않으므로 인터페이스에 붙인 애너테이션이 조용히 무시된다. 문서의 표현대로 "롤백 상황을 테스트하기 전까지는 잘 동작하는 것처럼 보일" 수 있다.</p>
+<h4>접근 제어자와 final</h4>
+<p>탐색 순서의 첫 단계인 접근 제어자 검사는 버전에 따라 결과가 다르다. 레퍼런스 문서는 "6.0부터 클래스 기반 프록시에서는 <code>protected</code>나 패키지 접근 메서드도 기본으로 트랜잭션을 적용할 수 있다"고 적고, 인터페이스 기반 프록시(JDK 동적 프록시)에서는 트랜잭션 메서드가 항상 <code>public</code>이고 프록시된 인터페이스에 정의되어 있어야 한다고 적는다. 5.x까지는 공개 메서드에만 적용되었다. 구현을 보면 흥미롭다. <code>AnnotationTransactionAttributeSource</code>의 기본 생성자는 여전히 <code>publicMethodsOnly = true</code>로 시작하지만, <code>@EnableTransactionManagement</code>가 등록하는 설정(<code>AbstractTransactionManagementConfiguration</code>)은 "6.0부터 CGLIB 프록시의 protected 메서드를 받아들인다"는 주석과 함께 <code>new AnnotationTransactionAttributeSource(false)</code>로 만든다. 앞 실험에서 같은 패키지의 코드가 <code>prot()</code>와 <code>pkg()</code>를 호출했을 때 둘 다 <code>active=true</code>가 나온 것이 그 결과다.</p>
+<p><code>private</code> 메서드와 <code>final</code> 메서드는 버전과 무관하게 프록시가 가로챌 수 없다. CGLIB 프록시는 대상 클래스를 상속한 하위 클래스이고, 하위 클래스는 <code>private</code>과 <code>final</code> 메서드를 오버라이드할 수 없기 때문이다. 레퍼런스의 AOP 프록시 설명도 이 둘을 CGLIB의 한계로 명시한다. <code>final</code> 메서드는 단순히 트랜잭션이 빠지는 데서 끝나지 않는다. 다음 실험을 보자.</p>
+<pre><code class="language-java">static class Svc {
+    private final String name;
+    Svc(String name) { this.name = name; }
+
+    @Transactional public final void fin() {
+        System.out.println("final this=" + this.getClass().getSimpleName() + " name=" + name
+                + " active=" + TransactionSynchronizationManager.isActualTransactionActive());
+    }
+}
+// 빈 등록: @Bean Svc svc() { return new Svc("hello"); }</code></pre>
+<pre data-label="실행 결과 (Spring Framework 7.0.10)"><code class="language-text">경고: Public final method [public final void exp2.App2$Svc.fin()] cannot get proxied via CGLIB, consider removing the final marker or using interface-based JDK proxies.
+final this=App2$Svc$$SpringCGLIB$$0 name=null active=false</code></pre>
+<p>7.0.10에서는 기동할 때 <code>CglibAopProxy</code>가 WARN 레벨 경고를 남겼다. 같은 코드를 6.2.19로 돌리면 이 경고는 없고(6.2.19는 인터페이스를 구현한 <code>final</code> 메서드일 때만 WARN을 남긴다), "Final method [...] cannot get proxied via CGLIB: Calls to this method will NOT be routed to the target instance ..."라는 DEBUG 로그만 남는다. 호출 결과는 두 버전이 같고, 더 나쁘다. <code>this</code>가 실제 객체가 아니라 <b>프록시 인스턴스 자신</b>이고, <code>name</code>은 <code>"hello"</code>가 아니라 <code>null</code>이다. 프록시는 <code>fin()</code>을 오버라이드하지 못했으므로, 호출은 프록시 인스턴스에서 상속받은 원래 메서드 본문을 그대로 실행한다. 그런데 레퍼런스 문서가 밝히듯 CGLIB 프록시 인스턴스는 Objenesis로 생성자를 거치지 않고 만들어지므로 프록시 인스턴스의 필드는 초기화되지 않은 기본값이다. 주입받은 저장소 필드를 쓰는 <code>final</code> 메서드라면 트랜잭션 누락이 아니라 <code>NullPointerException</code>으로 드러난다. 코틀린처럼 클래스와 메서드가 기본으로 <code>final</code>인 언어에서 이 문제를 자주 만나는 이유다.</p>
+
+<h3>트랜잭션 AOP 주의 사항: 프록시 내부 호출 1 — 무슨 일이 일어나는가</h3>
+<p>이제 가장 유명한 함정이다. 앞 실험의 <code>CallService</code>에서 트랜잭션 속성이 없는 <code>external()</code>을 바깥에서 호출하고, <code>external()</code>이 안에서 <code>@Transactional</code>이 붙은 <code>internal()</code>을 부르면 어떻게 될까.</p>
+<pre data-label="cs.external() 실행 결과"><code class="language-text">external active=false readOnly=false
+internal active=false readOnly=false</code></pre>
+<p>트랜잭션 로그는 한 줄도 없고, <code>internal()</code> 안에서도 <code>active=false</code>다. 바깥에서 <code>cs.internal()</code>을 직접 부르면 트랜잭션이 걸렸던 바로 그 메서드인데도 그렇다. 레퍼런스 문서는 이 현상을 이렇게 설명한다. 프록시 모드에서는 프록시를 통해 들어오는 외부 호출만 가로채므로, 대상 객체 안의 메서드가 같은 대상 객체의 다른 메서드를 부르는 <b>자기 호출(self-invocation)</b>은 호출된 메서드에 <code>@Transactional</code>이 있어도 실제 트랜잭션으로 이어지지 않는다.</p>
+<p>왜 그런지 메모리와 바이트코드 수준에서 따라가 보자. 스프링 컨테이너에는 객체가 두 개 있다. 하나는 우리가 <code>new CallService()</code>로 만든 <b>실제 객체(target)</b>이고, 다른 하나는 자동 프록시 생성기가 만든 <b>프록시 객체</b>다. 컨테이너가 빈 이름 <code>callService</code>에 등록하는 것은 프록시 쪽이고, 프록시는 내부에 실제 객체의 참조를 들고 있다. CGLIB 프록시가 <code>CallService</code>의 하위 클래스라는 사실 때문에 "프록시가 곧 실제 객체"라고 착각하기 쉽지만, 스프링의 CGLIB 프록시는 상속으로 타입만 맞췄을 뿐 <b>별개의 인스턴스</b>이며 실제 일은 참조로 들고 있는 대상 객체에게 위임한다. 앞의 <code>final</code> 실험에서 프록시 인스턴스의 필드가 <code>null</code>이었던 것이 그 증거다.</p>
+<pre class="diagram">  힙(heap)
+  ┌────────────────────────────────────┐        ┌──────────────────────────────┐
+  │ CallService$$SpringCGLIB$$0 (프록시) │ target │ CallService (실제 객체)        │
+  │  - 콜백: 어드바이스 체인             │ ─────▶ │  - external(): this.internal() │
+  │  - external() 오버라이드              │        │  - internal()                 │
+  │  - internal() 오버라이드 (tx 적용)    │        └──────────────────────────────┘
+  └────────────────────────────────────┘                     ▲
+            ▲                                                │ this
+            │ 컨테이너가 주입·반환하는 참조                     │ (실제 객체 자신)
+  호출자: cs.external()
+
+  1) cs.external()  → 프록시.external(): 트랜잭션 속성 없음 → 대상 객체.external() 호출
+  2) 대상 객체.external() 안의 internal()  =  this.internal()
+     this = 실제 객체  → 프록시를 거치지 않고 CallService.internal() 실행</pre>
+<p>2번 단계에서 <code>internal()</code>이라고만 쓴 호출은 컴파일러가 <code>this.internal()</code>로 해석한다. 직접 확인해 보자. 다음 클래스를 컴파일하고 <code>javap -c</code>로 <code>external()</code>을 디스어셈블하면 이렇게 나온다.</p>
+<pre><code class="language-java">public class OrderFlow {
+    public void external() {
+        internal();
+    }
+
+    public void internal() {
+    }
+}</code></pre>
+<pre data-label="javap -c 결과 (JDK 21)"><code class="language-text">  public void external();
+    Code:
+       0: aload_0
+       1: invokevirtual #7                  // Method internal:()V
+       4: return</code></pre>
+<p><code>aload_0</code>은 지역 변수 0번 슬롯, 즉 인스턴스 메서드에서 항상 <code>this</code>가 들어 있는 자리를 오퍼랜드 스택에 올린다. 이어지는 <code>invokevirtual</code>은 스택에 있는 그 수신 객체(receiver)의 <b>실제 클래스</b>를 기준으로 호출할 메서드를 찾는다. 이것이 자바 기본편에서 본 가상 메서드 호출(virtual method invocation), 즉 동적 디스패치다. 지금 <code>external()</code>을 실행하고 있는 객체는 프록시가 아니라 실제 객체이므로 <code>this</code>는 실제 객체이고, 그 실제 클래스는 <code>CallService</code>다. 따라서 <code>CallService.internal()</code>의 본문이 곧바로 실행된다. 프록시 클래스가 <code>internal()</code>을 오버라이드해 두었더라도, 수신 객체가 프록시가 아니니 그 오버라이드는 선택될 기회가 없다.</p>
+<p>이 관점에서 보면 "프록시가 내부 호출을 놓친다"는 표현보다 "내부 호출은 애초에 프록시에게 가지 않는다"가 더 정확하다. 프록시는 자신에게 온 호출만 처리할 수 있고, 자바의 메서드 호출 규칙상 <code>this</code>로 향한 호출은 프록시에게 갈 경로가 없다. 반대로 AspectJ 위빙처럼 클래스 파일 자체의 바이트코드를 바꾸는 방식이라면 <code>internal()</code>의 본문 안에 트랜잭션 코드가 들어가므로 내부 호출도 처리된다. 프록시 방식과 위빙 방식의 차이가 정확히 이 지점에서 갈린다.</p>
+<aside class="note">반대 방향도 같은 원리다. 바깥 메서드에 <code>@Transactional</code>이 있고 안쪽 메서드에 다른 속성(예: <code>readOnly = true</code>나 다른 전파 옵션)을 붙인 경우, 안쪽 메서드의 애너테이션은 내부 호출에서 전부 무시된다. 바깥 트랜잭션은 걸려 있으므로 겉보기에는 잘 동작해서 더 늦게 발견된다. 전파 옵션이 실제로 어떻게 동작하는지는 08회에서 다룬다.</aside>
+<x-visual id="spring-db2-07-self-invocation" title="내부 호출이 프록시를 거치지 않는 이유" kind="메모리 구조도" ratio="16:9">
+<x-hint>프록시 객체와 실제 객체가 힙에 따로 있고, 외부 호출은 프록시를 지나지만 실제 객체 안의 this 호출은 프록시를 우회한다는 것을 보여 준다.</x-hint>
+<x-prompt>가로로 긴 다이어그램. 왼쪽에 사람 아이콘 "호출자". 가운데에 테두리가 굵은 파란 상자 "프록시 객체", 그 안에 작은 칸 "트랜잭션 어드바이스". 오른쪽에 초록 상자 "실제 객체", 그 안에 두 칸 "external()"과 "internal()". 호출자에서 프록시 객체로 실선 화살표 "① 외부 호출". 프록시 객체에서 실제 객체의 external() 칸으로 실선 화살표 "② 위임". 실제 객체 안에서 external() 칸이 internal() 칸으로 휘어지는 빨간 화살표 "③ this.internal()". 프록시 객체의 트랜잭션 어드바이스 칸 위에 회색 점선 원과 물음표, 라벨 "지나가지 않음". 하단에 가는 띠 라벨 "힙". 평면 기술 도해, 흰 배경.</x-prompt>
+<x-caption>this로 향한 호출은 실제 객체 안에서 끝나므로, 프록시에 있는 트랜잭션 어드바이스는 실행될 기회가 없다.</x-caption>
+</x-visual>
+
+<h3>트랜잭션 AOP 주의 사항: 프록시 내부 호출 2 — 어떻게 피하는가</h3>
+<p>원인이 "호출이 프록시를 지나가지 않는다"였으니 해결책도 하나로 모인다. <b>트랜잭션이 필요한 메서드는 반드시 프록시를 통해 호출되게 만든다.</b> Spring Framework 6.2 레퍼런스의 AOP 프록시 설명은 선택지를 선호 순서대로 제시한다. 가장 좋은 방법은 자기 호출이 일어나지 않도록 코드를 재구성하는 것이고, 대안으로 자기 자신의 참조(self reference)를 주입받아 <code>this</code> 대신 그 참조로 호출하는 방법이 있으며, 마지막 수단으로 <code>AopContext.currentProxy()</code>가 있다. 문서는 마지막 방법을 "강하게 권장하지 않는다"고 적는다. 세 방법과 AspectJ 위빙을 차례로 보자.</p>
+<h4>1. 클래스를 나눈다</h4>
+<p>트랜잭션이 필요한 부분을 별도 빈으로 옮기면, 바깥 빈은 그 빈을 주입받아 호출한다. 주입된 참조는 컨테이너가 넘겨준 프록시이므로 호출은 자연히 프록시를 지난다. 앞 실험에서 바깥 코드가 <code>cs.internal()</code>을 직접 불렀을 때 트랜잭션이 걸린 것과 같은 구조다.</p>
+<pre><code class="language-java">@Service
+public class ReportFacade {
+    private final ReportWriter writer;
+
+    public ReportFacade(ReportWriter writer) {
+        this.writer = writer;          // 컨테이너가 주입한 것은 ReportWriter의 프록시
+    }
+
+    public void publish() {
+        // 트랜잭션이 필요 없는 준비 작업 (외부 API 조회, 입력 검증 등) ...
+        writer.write();                // 다른 객체 호출 → 프록시 → 트랜잭션 시작
+    }
+}
+
+@Service
+public class ReportWriter {
+    @Transactional
+    public void write() {
+        // DB 쓰기 ...
+    }
+}</code></pre>
+<p>이 방법이 가장 권장되는 이유는 기술적인 우회가 아니라 설계의 개선이기 때문이다. 한 클래스 안에서 "트랜잭션이 필요 없는 부분"과 "필요한 부분"이 섞여 있다는 것 자체가 책임이 둘이라는 신호다. 나누고 나면 트랜잭션 경계가 클래스 경계와 일치해서 코드만 보고도 어디서 커넥션을 잡는지 알 수 있다. 위 예처럼 외부 API 호출을 트랜잭션 밖으로 빼면 커넥션을 쥐고 네트워크 응답을 기다리는 시간이 사라져 커넥션 풀에도 이롭다.</p>
+<h4>2. 자기 자신을 프록시로 다시 얻는다</h4>
+<p>클래스를 나누기 어려우면 자기 자신의 프록시 참조를 얻어 그것으로 호출한다. 생성자로 자기 자신을 주입받으면 생성 중인 빈을 다시 요구하는 순환 참조가 되므로, 호출 시점에 꺼내는 <code>ObjectProvider</code>를 쓰는 편이 안전하다. 호출 시점에는 빈 생성이 끝나 있으므로 <code>getObject()</code>는 완성된 프록시를 돌려준다.</p>
+<pre><code class="language-java">static class ReportService {
+    private final ObjectProvider<ReportService> self;
+    ReportService(ObjectProvider<ReportService> self) { this.self = self; }
+
+    public void viaProvider() { self.getObject().inner("provider"); }
+    public void viaAopContext() { ((ReportService) AopContext.currentProxy()).inner("AopContext"); }
+
+    @Transactional public void inner(String w) { log(w); }
+}
+
+@Configuration
+@EnableTransactionManagement(proxyTargetClass = true)
+@EnableAspectJAutoProxy(proxyTargetClass = true, exposeProxy = true)
+static class Config {
+    // ... DataSource, 트랜잭션 매니저
+    @Bean ReportService reportService(ObjectProvider<ReportService> p) { return new ReportService(p); }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">provider active=true
+AopContext active=true</code></pre>
+<h4>3. AopContext.currentProxy()</h4>
+<p>위 코드의 두 번째 방법은 프록시가 메서드를 실행하는 동안 자기 자신을 <code>ThreadLocal</code>에 노출해 두는 기능을 쓴다. 이 노출은 기본으로 꺼져 있어서 <code>exposeProxy = true</code>를 켜야 하고, 켜지 않은 상태에서 부르면 프록시를 찾을 수 없다는 예외가 난다. 비즈니스 코드가 스프링 AOP의 내부 구조에 직접 묶이므로 레퍼런스도 최후의 수단으로만 언급한다. 실험에서는 동작을 확인하려고 둘을 함께 실었지만, 실무에서 고른다면 1번, 그다음이 2번이다.</p>
+<h4>4. AspectJ 위빙 모드</h4>
+<p><code>@EnableTransactionManagement(mode = AdviceMode.ASPECTJ)</code>로 바꾸면 프록시 대신 AspectJ가 클래스의 바이트코드에 트랜잭션 처리를 직접 짜 넣는다. 이 방식에서는 앞에서 본 <code>aload_0</code>, <code>invokevirtual</code> 경로로 들어가도 대상 메서드의 본문 자체가 바뀌어 있으므로 내부 호출에도 트랜잭션이 걸린다. 대신 컴파일 시점 위빙이나 로드 시점 위빙(load-time weaving) 같은 별도 빌드·실행 설정이 필요하고, 앞에서 본 것처럼 인터페이스에 붙인 애너테이션은 인식되지 않는다. 대부분의 스프링 애플리케이션이 프록시 모드를 그대로 쓰는 이유가 여기에 있다.</p>
+
+<h3>트랜잭션 AOP 주의 사항: 초기화 시점</h3>
+<p>애플리케이션이 뜰 때 캐시를 채우거나 기초 데이터를 넣으려고 <code>@PostConstruct</code> 메서드에 <code>@Transactional</code>을 붙이는 경우가 있다. 결과는 트랜잭션 없음이다. 레퍼런스 문서도 프록시가 완전히 초기화되어야 기대한 동작이 나오므로 초기화 코드, 예를 들어 <code>@PostConstruct</code> 메서드에서 이 기능에 기대지 말라고 적는다. 실험의 <code>InitService</code>가 이 상황이다.</p>
+<pre><code class="language-java">static class InitService {
+    @PostConstruct @Transactional public void init() { log("@PostConstruct"); }
+    @EventListener(ContextRefreshedEvent.class) @Transactional public void ready() { log("ContextRefreshedEvent"); }
+}</code></pre>
+<pre data-label="실행 결과 (컨텍스트 기동 중 출력)"><code class="language-text">@PostConstruct active=false readOnly=false
+DataSourceTransactionManager - Creating new transaction with name [exp.App$InitService.ready]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+DataSourceTransactionManager - Acquired Connection [...] for JDBC transaction
+DataSourceTransactionManager - Switching JDBC Connection [...] to manual commit
+TransactionInterceptor - Getting transaction for [exp.App$InitService.ready]
+ContextRefreshedEvent active=true readOnly=false
+TransactionInterceptor - Completing transaction for [exp.App$InitService.ready]
+DataSourceTransactionManager - Initiating transaction commit
+...</code></pre>
+<p>이유는 빈 하나가 만들어지는 순서에 있다. Spring Framework 7.0.10의 <code>AbstractAutowireCapableBeanFactory.initializeBean</code>은 다음 순서로 진행한다. 먼저 <code>BeanNameAware</code> 같은 인식 인터페이스 콜백을 호출하고, 등록된 모든 빈 후처리기의 <code>postProcessBeforeInitialization</code>을 호출한 뒤, <code>InitializingBean.afterPropertiesSet</code>과 지정된 초기화 메서드를 호출하고, 마지막으로 모든 빈 후처리기의 <code>postProcessAfterInitialization</code>을 호출해 그 반환값을 최종 빈으로 삼는다. <code>@PostConstruct</code>는 <code>InitDestroyAnnotationBeanPostProcessor</code>(애너테이션 기반 컨텍스트에 등록되는 <code>CommonAnnotationBeanPostProcessor</code>가 이를 상속한다)가 <code>postProcessBeforeInitialization</code> 단계에서 호출한다. 반면 트랜잭션 프록시를 만드는 자동 프록시 생성기는 <code>AbstractAutoProxyCreator.postProcessAfterInitialization</code>에서 <code>wrapIfNecessary</code>를 호출해 그때 프록시를 만든다.</p>
+<div class="table-wrap"><table><thead><tr><th>단계</th><th>하는 일</th><th>이 시점의 객체</th></tr></thead><tbody>
+<tr><td>1. 인스턴스 생성</td><td>생성자 호출</td><td>실제 객체</td></tr>
+<tr><td>2. 의존관계 주입</td><td>필드·세터 주입</td><td>실제 객체</td></tr>
+<tr><td>3. 초기화 전 후처리</td><td><code>@PostConstruct</code> 메서드 호출</td><td>실제 객체 (프록시 없음)</td></tr>
+<tr><td>4. 초기화 메서드</td><td><code>afterPropertiesSet</code>, <code>initMethod</code></td><td>실제 객체 (프록시 없음)</td></tr>
+<tr><td>5. 초기화 후 후처리</td><td>자동 프록시 생성기가 프록시로 감쌈</td><td>프록시가 반환되어 컨테이너에 등록</td></tr>
+<tr><td>6. 컨텍스트 준비 완료</td><td>이벤트 발행, 리스너 호출</td><td>컨테이너에서 꺼낸 프록시</td></tr>
+</tbody></table></div>
+<p>3단계에서 <code>init()</code>은 실제 객체 위에서 직접 호출된다. 프록시는 아직 존재하지도 않으므로 트랜잭션 인터셉터가 끼어들 자리가 없다. 내부 호출 문제와 마찬가지로 "프록시를 거치지 않은 호출"의 한 형태다. 반면 6단계의 이벤트 리스너는 컨테이너가 빈을 꺼내서 호출하고, 그때 꺼내지는 것은 5단계에서 등록된 프록시다. 실험에서 <code>ready()</code>에 트랜잭션이 걸린 이유다.</p>
+<p>그래서 "기동 직후 트랜잭션 안에서 할 일"은 컨테이너 초기화가 끝난 뒤의 이벤트에 걸어야 한다. 순수 스프링이라면 컨텍스트 새로 고침이 끝났을 때 발행되는 <code>ContextRefreshedEvent</code>를, 스프링 부트라면 <code>ApplicationReadyEvent</code>를 쓴다. 부트의 Javadoc은 <code>ApplicationReadyEvent</code>를 애플리케이션이 요청을 처리할 준비가 되었음을 알리려고 "가능한 한 늦게" 발행하는 이벤트라고 설명한다.</p>
+<pre><code class="language-java">@Component
+public class CacheWarmer {
+    @EventListener(ApplicationReadyEvent.class)
+    @Transactional(readOnly = true)
+    public void warmUp() {
+        // 컨테이너 초기화가 끝난 뒤 호출된다. 이 메서드는 프록시를 통해 실행되므로 트랜잭션이 걸린다.
+    }
+}</code></pre>
+<p>꼭 <code>@PostConstruct</code>에서 처리해야 한다면 프로그래밍 방식을 쓰면 된다. 의존관계 주입이 끝난 뒤이므로 주입받은 <code>PlatformTransactionManager</code>로 만든 <code>TransactionTemplate</code>을 호출할 수 있고, 이 방식은 프록시를 거치지 않고 트랜잭션 매니저를 직접 부르므로 프록시의 존재 여부와 무관하게 동작한다. 선언적 방식이 막히는 곳에서 프로그래밍 방식이 여전히 쓸모 있는 대표적인 경우다.</p>
+<x-visual id="spring-db2-07-bean-init-timeline" title="빈 초기화 순서와 프록시가 만들어지는 시점" kind="순서도" ratio="16:9">
+<x-hint>@PostConstruct가 실행되는 시점에는 아직 프록시가 없고, 프록시는 초기화 후 후처리 단계에서 만들어진다는 것을 시간 순서로 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 흐르는 가로 타임라인. 여섯 개의 둥근 사각형이 화살표로 이어진다. 라벨은 차례로 "생성자 호출", "의존관계 주입", "@PostConstruct 실행", "초기화 메서드", "프록시 생성", "준비 완료 이벤트". 앞의 네 상자는 초록색이고 아래에 작은 라벨 "실제 객체"가 붙는다. "프록시 생성" 상자와 "준비 완료 이벤트" 상자는 파란색이고 아래에 라벨 "프록시"가 붙는다. "@PostConstruct 실행" 상자 위에 빨간 말풍선 "트랜잭션 없음", "준비 완료 이벤트" 상자 위에 파란 말풍선 "트랜잭션 적용". 평면 기술 도해, 흰 배경.</x-prompt>
+<x-caption>@PostConstruct는 프록시가 만들어지기 전에 실제 객체 위에서 실행된다.</x-caption>
+</x-visual>
+
+<h3>트랜잭션 옵션 소개</h3>
+<p><code>@Transactional</code>의 속성은 레퍼런스 문서의 표로 정리되어 있다. 옵션을 주지 않으면 전파는 <code>REQUIRED</code>, 격리 수준은 <code>DEFAULT</code>, 읽기·쓰기 트랜잭션, 타임아웃은 하부 트랜잭션 시스템의 기본값(지원하지 않으면 없음)이고, <code>RuntimeException</code>과 <code>Error</code>는 롤백, 체크 예외는 롤백하지 않는다. 각 속성이 무엇을 하는지, 그리고 그 아래에서 실제로 무슨 일이 일어나는지 보자.</p>
+<div class="table-wrap"><table><thead><tr><th>속성</th><th>타입</th><th>의미</th></tr></thead><tbody>
+<tr><td><code>value</code>, <code>transactionManager</code></td><td>String</td><td>사용할 트랜잭션 매니저의 빈 이름이나 한정자. 둘은 별칭 관계</td></tr>
+<tr><td><code>label</code></td><td>String 배열</td><td>트랜잭션에 붙이는 설명 라벨. 트랜잭션 매니저가 구현별 동작에 쓸 수 있다</td></tr>
+<tr><td><code>propagation</code></td><td>Propagation</td><td>이미 트랜잭션이 있을 때 참여할지, 새로 열지 등. 08·09회의 주제</td></tr>
+<tr><td><code>isolation</code></td><td>Isolation</td><td>격리 수준. 전파가 <code>REQUIRED</code>나 <code>REQUIRES_NEW</code>일 때만 적용</td></tr>
+<tr><td><code>timeout</code>, <code>timeoutString</code></td><td>int(초), String</td><td>타임아웃. 문자열 쪽은 플레이스홀더를 쓸 수 있다</td></tr>
+<tr><td><code>readOnly</code></td><td>boolean</td><td>읽기 전용 여부. <code>REQUIRED</code>, <code>REQUIRES_NEW</code>에서만 적용</td></tr>
+<tr><td><code>rollbackFor</code>, <code>rollbackForClassName</code></td><td>Class 배열, 문자열 패턴 배열</td><td>롤백을 일으킬 예외</td></tr>
+<tr><td><code>noRollbackFor</code>, <code>noRollbackForClassName</code></td><td>Class 배열, 문자열 패턴 배열</td><td>롤백하지 않을 예외</td></tr>
+</tbody></table></div>
+<h4>value: 트랜잭션 매니저 고르기</h4>
+<p>데이터 소스가 둘이면 트랜잭션 매니저도 둘이다. 이때 <code>@Transactional("orderTxManager")</code>처럼 빈 이름이나 한정자로 어느 매니저를 쓸지 지정한다. 지정하지 않으면 기본 트랜잭션 매니저가 쓰인다. 앞의 흐름도에서 본 "트랜잭션 매니저 결정" 단계가 이 값을 읽는다. 트랜잭션은 매니저 단위로 따로 존재하므로, 한 메서드에서 두 매니저의 자원을 함께 쓰더라도 둘이 하나의 원자적 트랜잭션으로 묶이지는 않는다는 점을 함께 기억해 두자.</p>
+<h4>isolation: 격리 수준</h4>
+<p>데이터베이스 기본편에서 본 네 가지 격리 수준(<code>READ_UNCOMMITTED</code>, <code>READ_COMMITTED</code>, <code>REPEATABLE_READ</code>, <code>SERIALIZABLE</code>)을 지정한다. 기본값 <code>DEFAULT</code>는 "스프링이 아무것도 하지 않고 DB의 기본값을 따른다"는 뜻이며, MySQL InnoDB의 기본 격리 수준은 <code>REPEATABLE READ</code>다. 기본값이 아닌 수준을 지정하면 <code>DataSourceTransactionManager</code>는 트랜잭션을 시작할 때 커넥션에 <code>setTransactionIsolation</code>을 호출하고, 끝나면 이전 값으로 되돌린 뒤 커넥션을 풀에 반납한다. 커넥션은 풀에서 재사용되므로 되돌리지 않으면 다음 사용자가 엉뚱한 격리 수준을 물려받는다. 이 속성은 새 트랜잭션을 시작할 때만 의미가 있다. 이미 진행 중인 트랜잭션에 참여하는 경우에는 바깥 트랜잭션이 이미 커넥션을 설정해 두었으므로 안쪽 설정은 적용되지 않는다.</p>
+<h4>timeout: 무엇이 언제 끊기는가</h4>
+<p>타임아웃은 초 단위다. 기본값 -1(<code>TIMEOUT_DEFAULT</code>)은 하부 트랜잭션 시스템의 기본값을 따른다는 뜻이고, <code>DataSourceTransactionManager</code>는 이 경우 따로 기본 타임아웃을 설정하지 않았다면 마감 시각을 기록하지 않는다. 흔한 오해는 지정한 시간이 지나면 스프링이 실행 중인 스레드를 멈춘다는 생각이다. 구현을 보면 그렇지 않다. <code>DataSourceTransactionManager</code>는 트랜잭션을 시작할 때 커넥션 홀더에 마감 시각(deadline)만 기록한다. 이후 <code>JdbcTemplate</code>이 SQL 문장을 만들 때마다 <code>DataSourceUtils.applyTimeout</code>을 호출하는데, 이 메서드는 남은 시간을 계산해 JDBC의 <code>Statement.setQueryTimeout</code>에 넣는다. 남은 시간을 계산하는 <code>ResourceHolderSupport.getTimeToLiveInMillis</code>는 마감이 이미 지났으면 <code>TransactionTimedOutException</code>을 던진다. 정리하면 타임아웃은 (1) 다음 SQL을 실행하려는 순간 마감이 지났는지 검사하고, (2) 실행 중인 SQL에 남은 시간만큼의 쿼리 타임아웃을 거는 두 가지 방식으로 강제된다. 자바 코드에서 오래 계산하는 동안에는 아무 일도 일어나지 않고, 그다음 DB 접근에서 예외가 난다.</p>
+<h4>readOnly: 세 층에서 일어나는 일</h4>
+<p><code>readOnly = true</code>는 하나의 플래그가 여러 층으로 전달되는 좋은 예다. 기술마다 반응이 다르므로 층별로 나눠 봐야 한다.</p>
+<ul>
+<li><b>스프링 층</b>: <code>TransactionSynchronizationManager</code>의 읽기 전용 플래그가 켜진다. 앞 실험에서 <code>read()</code>가 <code>readOnly=true</code>를 출력한 것이 이것이다. 이 플래그를 보고 동작을 바꾸는 구성 요소가 있을 수 있다.</li>
+<li><b>JPA(하이버네이트) 층</b>: Spring Framework 6.2.x 소스의 <code>HibernateJpaDialect.beginTransaction</code>은 읽기 전용 트랜잭션에서 세션의 플러시 모드를 <code>FlushMode.MANUAL</code>로 바꾼다. 커밋 시점에 자동 플러시가 일어나지 않으므로 엔티티를 수정해도 변경 감지 결과가 SQL로 나가지 않는다. 트랜잭션 범위의 엔티티 매니저라면 <code>session.setDefaultReadOnly(true)</code>도 호출해, 그 세션에서 읽은 엔티티를 기본적으로 읽기 전용으로 다루게 한다.</li>
+<li><b>JDBC 층</b>: <code>DataSourceTransactionManager</code>는 커넥션에 <code>Connection.setReadOnly(true)</code>를 호출하고, 트랜잭션이 끝나면 되돌린다. <code>enforceReadOnly</code> 속성을 켜면 트랜잭션 시작 직후 <code>SET TRANSACTION READ ONLY</code> 문장도 실행한다.</li>
+<li><b>드라이버와 DB 층</b>: MySQL Connector/J는 <code>readOnlyPropagatesToServer</code> 속성(기본값 <code>true</code>)에 따라 <code>setReadOnly()</code> 호출 시 서버 쪽 트랜잭션 접근 모드를 설정하는 문장을 보낸다. 문서는 이것이 InnoDB의 읽기 전용 최적화를 가능하게 하는 대신 왕복이 한 번 더 든다고 적는다. MySQL 8.0 매뉴얼에 따르면 InnoDB는 읽기 전용임이 알려진 트랜잭션에 트랜잭션 ID(<code>TRX_ID</code>)를 배정하는 비용을 피할 수 있고, <code>START TRANSACTION READ ONLY</code>로 시작한 트랜잭션에서 변경을 시도하면 <code>ERROR 1792 (25006): Cannot execute statement in a READ ONLY transaction.</code>이 난다.</li>
+</ul>
+<p>따라서 <code>readOnly</code>는 "성능 옵션"이기 전에 <b>의도의 선언</b>이다. 어느 층에서 실제 효과가 나는지는 기술 조합에 따라 다르다. JPA에서는 플러시가 꺼지므로 실수로 엔티티를 바꿔도 반영되지 않고, MySQL까지 전달되면 쓰기 시도가 오류로 드러난다. 같은 매뉴얼은 <code>READ ONLY</code> 없이 시작한 트랜잭션도 첫 변경이나 잠금 읽기 전까지는 읽기 전용 모드로 머문다고 적고 있으니, DB 층의 최적화만 보고 이 옵션의 가치를 과대평가하지도, 무시하지도 않는 것이 좋다.</p>
+
+<h3>예외와 트랜잭션 커밋, 롤백: 기본 규칙과 그 구현</h3>
+<p>트랜잭션 메서드에서 예외가 밖으로 던져지면 프록시는 커밋과 롤백 중 하나를 고른다. 레퍼런스 문서의 기본 규칙은 이렇다. <code>RuntimeException</code>과 그 하위 타입(언체크 예외)이 던져지면 롤백하고, <code>Error</code>도 롤백한다. 체크 예외는 기본 설정에서 롤백을 일으키지 않는다. 즉 <b>커밋한다</b>. 이 규칙의 구현은 놀랄 만큼 짧다. <code>DefaultTransactionAttribute</code>의 메서드 하나다.</p>
+<pre data-label="DefaultTransactionAttribute (Spring Framework 7.0.10)"><code class="language-java">public boolean rollbackOn(Throwable ex) {
+    return (ex instanceof RuntimeException || ex instanceof Error);
+}</code></pre>
+<p>이 판정을 쓰는 곳이 앞의 흐름도 다섯 번째 단계의 <code>completeTransactionAfterThrowing</code>이다. 일부를 생략하고 옮기면 다음과 같다.</p>
+<pre data-label="TransactionAspectSupport 발췌 (일부 생략)"><code class="language-java">protected void completeTransactionAfterThrowing(TransactionInfo txInfo, InvocationCallback invocation, Throwable ex) {
+    if (txInfo != null && txInfo.getTransactionStatus() != null) {
+        if (txInfo.transactionAttribute != null && txInfo.transactionAttribute.rollbackOn(ex)) {
+            // ...
+            txInfo.getTransactionManager().rollback(txInfo.getTransactionStatus());
+            // 롤백 자체가 실패하면 원래 예외를 로그로 남기고 롤백 쪽 예외를 던진다
+        }
+        else {
+            // We don't roll back on this exception.
+            // Will still roll back if TransactionStatus.isRollbackOnly() is true.
+            txInfo.getTransactionManager().commit(txInfo.getTransactionStatus());
+            // ...
+        }
+    }
+}</code></pre>
+<p>세 가지를 읽어 낼 수 있다. 첫째, 롤백 대상이 아닌 예외는 "아무것도 안 하는" 것이 아니라 <b>적극적으로 커밋한다</b>. 예외 직전까지 실행된 SQL은 모두 확정된다. 둘째, 커밋 경로라도 트랜잭션이 이미 롤백 전용(rollback-only)으로 표시되어 있으면 트랜잭션 매니저가 롤백한다는 주석이 있다. 이 표시가 언제 생기는지는 08회와 09회의 핵심 주제다. 셋째, 커밋이나 롤백 자체가 실패하면 원래 예외는 "Application exception overridden by ..." 로그로만 남고 호출자는 커밋·롤백 쪽 예외를 받는다. 장애 분석 때 호출자가 받은 예외만 보면 원래 원인을 놓칠 수 있다는 뜻이다. 이 메서드가 끝나면 <code>invokeWithinTransaction</code>은 원래 예외를 그대로 다시 던진다. 커밋이든 롤백이든 <b>트랜잭션 처리가 먼저 끝나고, 그다음에 예외가 호출자에게 전달된다.</b></p>
+<p>세 경우를 실험으로 확인하자. 각 메서드는 한 줄을 삽입한 뒤 예외를 던진다.</p>
+<pre><code class="language-java">static class CheckedFail extends Exception { CheckedFail(String m) { super(m); } }
+
+static class RollbackProbe {
+    final JdbcTemplate jdbc;
+    RollbackProbe(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+    @Transactional public void runtime() { insert("runtime"); throw new IllegalStateException("boom"); }
+    @Transactional public void checked() throws CheckedFail { insert("checked"); throw new CheckedFail("reject"); }
+    @Transactional(rollbackFor = CheckedFail.class)
+    public void checkedRollback() throws CheckedFail { insert("checkedRollback"); throw new CheckedFail("reject"); }
+    void insert(String k) { jdbc.update("insert into probe_log(kind) values (?)", k); }
+}</code></pre>
+<pre data-label="실행 결과 (TRACE 줄 일부 생략)"><code class="language-text">Creating new transaction with name [exp.App$RollbackProbe.runtime]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+Completing transaction for [exp.App$RollbackProbe.runtime] after exception: java.lang.IllegalStateException: boom
+Initiating transaction rollback
+Rolling back JDBC transaction on Connection [...]
+caught java.lang.IllegalStateException: boom
+Creating new transaction with name [exp.App$RollbackProbe.checked]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT
+Completing transaction for [exp.App$RollbackProbe.checked] after exception: exp.App$CheckedFail: reject
+Initiating transaction commit
+Committing JDBC transaction on Connection [...]
+caught exp.App$CheckedFail: reject
+Creating new transaction with name [exp.App$RollbackProbe.checkedRollback]: PROPAGATION_REQUIRED,ISOLATION_DEFAULT,-exp.App$CheckedFail
+Completing transaction for [exp.App$RollbackProbe.checkedRollback] after exception: exp.App$CheckedFail: reject
+Initiating transaction rollback
+Rolling back JDBC transaction on Connection [...]
+caught exp.App$CheckedFail: reject
+rows=[checked]</code></pre>
+<p>마지막 줄이 결론이다. 세 메서드 모두 한 줄씩 삽입했지만 테이블에 남은 것은 체크 예외를 기본 규칙대로 커밋한 <code>checked</code> 하나다. 세 번째 트랜잭션의 이름 뒤에 붙은 <code>-exp.App$CheckedFail</code>은 롤백 규칙의 문자열 표현으로, <code>RuleBasedTransactionAttribute</code>는 롤백 규칙에 <code>-</code>, 커밋 규칙(<code>noRollbackFor</code>)에 <code>+</code> 접두사를 쓴다. 7.0.10에서는 롤백 직전에 <code>MethodRollbackEvent</code>를 알리는 TRACE 줄이 하나 더 찍히는데 위에서는 생략했다.</p>
+<h4>규칙이 여러 개면: 가장 가까운 규칙이 이긴다</h4>
+<p><code>rollbackFor</code>와 <code>noRollbackFor</code>를 함께 쓰면 하나의 예외에 여러 규칙이 걸릴 수 있다. 레퍼런스는 "가장 강하게 일치하는 규칙이 이긴다"고만 적는데, 구현을 보면 그 의미가 정확해진다. <code>RollbackRuleAttribute.getDepth</code>는 던져진 예외 클래스에서 시작해 부모 클래스로 한 단계씩 올라가며 규칙의 타입과 같은지 비교하고, 일치한 지점까지 올라간 단계 수를 깊이로 돌려준다. <code>Throwable</code>까지 가도 못 찾으면 -1이다. <code>RuleBasedTransactionAttribute.rollbackOn</code>은 모든 규칙의 깊이를 구해 <b>가장 작은 깊이</b>, 즉 상속 계층에서 예외와 가장 가까운 규칙을 고르고, 그 규칙이 <code>noRollbackFor</code> 쪽이면 커밋, 아니면 롤백한다. 일치하는 규칙이 하나도 없으면 앞의 기본 규칙으로 돌아간다.</p>
+<pre class="diagram">@Transactional(rollbackFor = Exception.class, noRollbackFor = RefundPeriodExpiredException.class)
+
+던져진 예외: RefundPeriodExpiredException
+  깊이 0: RefundPeriodExpiredException  ← noRollbackFor 규칙 일치 (깊이 0)
+  깊이 1: Exception                      ← rollbackFor 규칙 일치 (깊이 1)
+  → 가장 작은 깊이 0의 규칙이 승리 → 커밋
+
+던져진 예외: java.io.IOException
+  깊이 0: IOException                    (규칙 없음)
+  깊이 1: Exception                      ← rollbackFor 규칙 일치 (깊이 1)
+  → 롤백</pre>
+<p>규칙을 클래스 대신 문자열로 주는 <code>rollbackForClassName</code>은 주의가 필요하다. 레퍼런스 문서에 따르면 패턴 기반 규칙은 던져진 예외의 이름이 패턴을 <b>포함하면</b> 일치로 본다. 7.0.10 소스의 <code>getDepth</code>도 <code>exceptionType.getName().contains(exceptionPattern)</code>로 비교한다. 그래서 <code>"Exception"</code>이라는 패턴은 거의 모든 예외에 일치하고, <code>"com.example.CustomException"</code>은 같은 패키지의 <code>CustomExceptionV2</code>나 중첩 클래스 <code>CustomException$AnotherException</code>에도 일치한다. 클래스 타입으로 줄 수 있으면 <code>rollbackFor</code>를 쓰는 것이 안전하다.</p>
+<h4>예외가 프록시 밖으로 나가야 판정된다</h4>
+<p>이 모든 판정은 <b>프록시 밖으로 던져진 예외</b>를 대상으로 한다. 메서드 안에서 예외를 잡아 로그만 남기고 정상 반환하면, 프록시 입장에서는 정상 종료이므로 커밋한다. 잡기 전에 실행된 SQL도 함께 확정된다. 예외를 잡되 롤백하고 싶다면 예외를 다시 던지거나, 레퍼런스가 보여 주는 대로 <code>TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()</code>를 호출한다. 다만 문서는 이 프로그래밍 방식 롤백이 코드를 스프링 트랜잭션 인프라에 강하게 묶는다며 가능하면 선언적 방식을 쓰라고 권한다.</p>
+<h4>6.2부터: 기본 규칙 자체를 바꾸기</h4>
+<p>Spring Framework 6.2부터는 기본 규칙을 전역으로 바꿀 수 있다. <code>@EnableTransactionManagement(rollbackOn = RollbackOn.ALL_EXCEPTIONS)</code>로 설정하면 체크 예외를 포함한 모든 예외에서 롤백한다. 소스를 보면 이 설정은 속성 소스에 기본 롤백 규칙(<code>RollbackRuleAttribute.ROLLBACK_ON_ALL_EXCEPTIONS</code>)을 추가하는 방식이고, 메서드에 직접 쓴 롤백 규칙은 여전히 우선한다. 이 속성의 Javadoc은 EJB 방식의 "커밋되는 업무 예외"에 의존하는 경우가 아니라면, 실수로 던져진 체크 예외에서도 일관되게 롤백되도록 이 설정으로 바꾸는 것이 바람직하고, 체크 예외를 강제하지 않는 코틀린 애플리케이션이라면 더욱 그렇다고 적는다. 체크 예외 커밋이라는 기본값이 EJB의 관례를 이어받은 것이며, 스프링 스스로도 그 기본값이 모든 애플리케이션에 맞지는 않는다고 본다는 뜻이다.</p>
+
+<h3>예외와 트랜잭션 커밋, 롤백: 활용 — 업무 예외를 커밋하는 설계</h3>
+<p>그렇다면 체크 예외는 커밋한다는 기본값은 어디에 쓰는가. 예외를 두 종류로 나눠 보면 의도가 보인다. 하나는 <b>시스템 예외</b>다. 네트워크 단절, 제약 조건 위반, 프로그래밍 오류처럼 복구할 방법이 없고, 그 시점까지의 데이터 변경을 믿을 수 없는 경우다. 다른 하나는 <b>비즈니스 예외</b>다. 시스템은 정상인데 업무 규칙상 요청을 그대로 처리할 수 없는 상황, 예를 들어 잔액 부족, 기간 만료, 재고 소진 같은 경우다. 비즈니스 예외는 예상된 결과이고, 그 사실 자체를 기록으로 남겨야 할 때가 많다. 체크 예외로 비즈니스 예외를 표현하면 호출자는 컴파일러에 의해 처리를 강제받고, 트랜잭션은 그 시점까지의 기록을 커밋한다.</p>
+<p>예제로 수강권 환불 요청을 생각해 보자. 환불 요청은 일단 기록하고, 금액이 올바르지 않으면 시스템 예외(잘못된 입력이 여기까지 들어온 것은 버그다), 구매 후 7일이 지났으면 자동 승인 대신 "담당자 검토" 상태로 남기고 호출자에게 알린다. 마지막 경우가 핵심이다. 요청 기록은 남아야 담당자가 볼 수 있으므로 롤백되면 안 된다.</p>
+<pre><code class="language-java">public class RefundPeriodExpiredException extends Exception {
+    public RefundPeriodExpiredException(String message) { super(message); }
+}
+
+public class RefundService {
+    private final RefundRepository repository;
+    public RefundService(RefundRepository repository) { this.repository = repository; }
+
+    @Transactional
+    public void request(RefundRequest r) throws RefundPeriodExpiredException {
+        repository.save(r);                                     // status = REQUESTED
+        if (r.getAmount() <= 0) {
+            throw new IllegalArgumentException("환불 금액이 올바르지 않다: " + r.getAmount());
+        }
+        if (r.getDaysSincePurchase() > 7) {
+            r.setStatus("MANUAL_REVIEW");
+            repository.updateStatus(r);
+            throw new RefundPeriodExpiredException("구매 후 7일이 지나 담당자 검토로 넘긴다");
+        }
+        r.setStatus("APPROVED");
+        repository.updateStatus(r);
+    }
+}
+
+// 저장소: JdbcTemplate으로 insert into refund_request(id, amount, status) ..., update ... set status = ? where id = ?</code></pre>
+<p>호출하는 쪽은 비즈니스 예외와 시스템 예외를 나눠 처리한다. 세 요청(정상, 기간 만료, 금액 0)을 차례로 보낸 결과다.</p>
+<pre><code class="language-java">RefundRequest[] reqs = { new RefundRequest(1, 10000, 3), new RefundRequest(2, 10000, 30), new RefundRequest(3, 0, 1) };
+for (var r : reqs) {
+    try { svc.request(r); System.out.println(r.getId() + ": 정상 처리"); }
+    catch (RefundPeriodExpiredException e) { System.out.println(r.getId() + ": 업무 예외 - " + e.getMessage()); }
+    catch (RuntimeException e) { System.out.println(r.getId() + ": 시스템 예외 - " + e.getMessage()); }
+}
+// 이후 select id, status from refund_request order by id 결과 출력</code></pre>
+<pre data-label="실행 결과"><code class="language-text">1: 정상 처리
+2: 업무 예외 - 구매 후 7일이 지나 담당자 검토로 넘긴다
+3: 시스템 예외 - 환불 금액이 올바르지 않다: 0
+id=1 status=APPROVED
+id=2 status=MANUAL_REVIEW</code></pre>
+<p>2번 요청은 예외로 끝났는데도 <code>MANUAL_REVIEW</code> 상태로 남았고, 3번 요청은 <code>save</code>로 삽입한 행까지 롤백되어 흔적이 없다. 시간 순서로 보면, 2번 요청에서 <code>RefundPeriodExpiredException</code>이 메서드를 빠져나가는 순간 프록시는 롤백 규칙을 확인하고(체크 예외, 규칙 없음 → 롤백 아님) 커밋을 끝낸 다음 예외를 다시 던진다. 호출자가 <code>catch</code> 블록에서 메시지를 출력할 때는 이미 DB에 기록이 확정되어 있다.</p>
+<div class="table-wrap"><table><thead><tr><th>요청</th><th>밖으로 나온 예외</th><th>롤백 판정</th><th>DB 결과</th></tr></thead><tbody>
+<tr><td>1 (정상)</td><td>없음</td><td>커밋</td><td>APPROVED</td></tr>
+<tr><td>2 (기간 만료)</td><td>체크 예외</td><td>기본 규칙상 롤백 아님 → 커밋</td><td>MANUAL_REVIEW</td></tr>
+<tr><td>3 (금액 0)</td><td>런타임 예외</td><td>롤백</td><td>행 없음</td></tr>
+</tbody></table></div>
+<p>이 설계에는 분명한 대가가 있다. 메서드가 다른 체크 예외(예를 들어 파일을 쓰다 난 <code>IOException</code>)도 던질 수 있다면, 그 예외 역시 기본 규칙에 따라 커밋된다. 원래 의도는 "업무 예외만 커밋"이었는데 실제 규칙은 "모든 체크 예외 커밋"이기 때문이다. 6.2의 <code>rollbackOn</code> Javadoc이 경고한 상황이 바로 이것이다. 그래서 실무에서는 다음 선택지를 의식적으로 고른다.</p>
+<ul>
+<li><b>체크 예외 + 기본 규칙</b>: 위 예제 방식. 업무 예외만 체크 예외로 던지도록 팀 규약이 지켜질 때 단순하다.</li>
+<li><b>전역 롤백 + 명시적 커밋 규칙</b>: <code>rollbackOn = ALL_EXCEPTIONS</code>로 기본을 바꾸고, 커밋해야 할 업무 예외에만 <code>noRollbackFor</code>를 붙인다. 실수로 던진 체크 예외가 커밋되는 사고를 막는다.</li>
+<li><b>예외 대신 결과 값</b>: 예상된 업무 결과를 예외가 아니라 반환 값(상태를 담은 결과 객체)으로 돌려준다. 예외가 없으니 트랜잭션은 커밋되고, 롤백 규칙을 신경 쓸 필요가 없다. "예외는 예외적인 상황에만"이라는 원칙과도 맞는다.</li>
+<li><b>런타임 업무 예외 + noRollbackFor</b>: 업무 예외를 런타임 예외로 만들고 커밋할 것에만 <code>noRollbackFor</code>를 붙인다. 호출자에게 처리를 강제하지는 못한다.</li>
+</ul>
+<p>어느 쪽이든 핵심은 같다. "예외가 났다"와 "롤백해야 한다"는 서로 다른 질문이고, 스프링은 그 둘을 예외 타입과 롤백 규칙으로 연결한다. 그 연결을 기본값에 맡길지 명시할지를 설계 시점에 결정해 두어야 장애 상황에서 데이터가 예상대로 남는다.</p>
+
+<h3>정리: 모든 함정은 프록시 경계에서 생긴다</h3>
+<p>이 회차의 내용을 하나의 표로 모으면 다음과 같다. 원인 열을 보면 대부분이 "그 호출이나 예외가 프록시 경계를 지났는가"라는 질문으로 환원된다.</p>
+<div class="table-wrap"><table><thead><tr><th>상황</th><th>결과</th><th>원인</th><th>대응</th></tr></thead><tbody>
+<tr><td>같은 클래스의 메서드를 <code>this</code>로 호출</td><td>호출된 메서드의 애너테이션 무시</td><td><code>invokevirtual</code>의 수신 객체가 실제 객체</td><td>클래스 분리, 프록시 참조로 호출</td></tr>
+<tr><td><code>@PostConstruct</code> + <code>@Transactional</code></td><td>트랜잭션 없음</td><td>프록시는 초기화 후 후처리에서 생성</td><td><code>ApplicationReadyEvent</code>, <code>TransactionTemplate</code></td></tr>
+<tr><td><code>final</code>·<code>private</code> 메서드</td><td>트랜잭션 없음, <code>final</code>은 필드가 <code>null</code></td><td>CGLIB 하위 클래스가 오버라이드 불가</td><td><code>final</code> 제거, 공개 범위 조정</td></tr>
+<tr><td>메서드와 클래스에 모두 애너테이션</td><td>메서드 쪽만 적용(합쳐지지 않음)</td><td>속성 탐색이 찾는 즉시 반환</td><td>메서드에 필요한 속성을 모두 쓴다</td></tr>
+<tr><td>체크 예외가 밖으로 던져짐</td><td>커밋</td><td><code>rollbackOn</code> 기본 규칙</td><td><code>rollbackFor</code>, 6.2의 <code>rollbackOn</code></td></tr>
+<tr><td>메서드 안에서 예외를 잡고 정상 반환</td><td>커밋</td><td>프록시는 정상 종료만 봄</td><td>다시 던지기, <code>setRollbackOnly</code></td></tr>
+</tbody></table></div>
+<p>지금까지는 트랜잭션 하나가 메서드 하나를 감싸는 경우만 봤다. 그런데 트랜잭션 메서드가 다른 빈의 트랜잭션 메서드를 호출하면 어떻게 될까. 이번 회차에서 "이미 진행 중인 트랜잭션에 참여하면 안쪽의 격리 수준과 읽기 전용 설정은 적용되지 않는다", "커밋 경로라도 롤백 전용 표시가 있으면 롤백한다"는 말이 몇 번 나왔다. 08회에서는 이 문장들의 배경인 물리 트랜잭션과 논리 트랜잭션, 전파 옵션의 기본 동작을 다루고, 09회에서는 롤백 전용 표시와 <code>UnexpectedRollbackException</code>이 실제 서비스 구조에서 어떻게 나타나는지 본다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>선언적 트랜잭션은 컨테이너가 빈을 프록시로 바꿔 끼우고, 프록시 안의 <code>TransactionInterceptor</code>가 메서드 호출 앞뒤에서 트랜잭션 매니저를 호출하는 구조다. 따라서 트랜잭션은 프록시를 지나간 호출에만 걸리고(내부 호출, 초기화 메서드, <code>final</code> 메서드는 지나가지 않는다), 커밋과 롤백은 프록시 밖으로 던져진 예외의 타입과 롤백 규칙으로 정해진다(기본은 언체크 예외와 <code>Error</code>만 롤백).</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>선언적 트랜잭션</dt><dd><code>@Transactional</code>로 트랜잭션이 필요하다는 사실만 선언하고, 시작·커밋·롤백은 프록시 안의 <code>TransactionInterceptor</code>가 트랜잭션 매니저를 호출해 처리하는 방식이다.</dd>
+<dt>프록시 생성 시점</dt><dd>자동 프록시 생성기가 빈 초기화 후 후처리(<code>postProcessAfterInitialization</code>)에서, 메서드 하나라도 트랜잭션 속성이 있는 빈을 프록시로 감싼다.</dd>
+<dt>적용 위치 우선순위</dt><dd>대상 클래스의 메서드 → 대상 클래스 → 인터페이스 메서드 → 인터페이스 순으로 찾고 처음 찾은 것 하나만 쓴다. 단, 첫 단계의 메서드 조회가 그 메서드가 구현한 인터페이스 메서드까지 함께 보므로 인터페이스 메서드의 애너테이션은 클래스 레벨 애너테이션보다 앞선다. 속성은 합쳐지지 않는다.</dd>
+<dt>접근 제어자</dt><dd>6.0부터 클래스 기반 프록시는 <code>protected</code>와 패키지 접근 메서드도 지원한다. <code>private</code>·<code>final</code> 메서드는 오버라이드할 수 없어 가로챌 수 없다.</dd>
+<dt>내부 호출</dt><dd><code>this</code>로 부른 메서드는 실제 객체에서 바로 실행되어 프록시를 지나지 않는다. 클래스를 나누거나 프록시 참조로 호출해 해결한다.</dd>
+<dt>초기화 시점</dt><dd><code>@PostConstruct</code>는 프록시가 만들어지기 전에 실제 객체에서 실행된다. 트랜잭션이 필요하면 <code>ApplicationReadyEvent</code> 리스너나 <code>TransactionTemplate</code>을 쓴다.</dd>
+<dt>readOnly</dt><dd>스프링 플래그, 하이버네이트 플러시 모드 <code>MANUAL</code>, JDBC <code>setReadOnly</code>, 드라이버와 DB의 읽기 전용 트랜잭션으로 층마다 다르게 전달되는 의도 선언이다.</dd>
+<dt>기본 롤백 규칙</dt><dd><code>RuntimeException</code>과 <code>Error</code>는 롤백, 체크 예외는 커밋한다. 롤백 규칙이 여러 개 일치하면 상속 깊이가 가장 작은 규칙이 이긴다.</dd>
+<dt>업무 예외 커밋</dt><dd>기대된 업무 상황을 체크 예외로 알리면서 그때까지의 기록을 커밋하는 설계다. 다른 체크 예외도 커밋된다는 대가가 있어 규칙을 명시하거나 결과 값으로 대신하기도 한다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 "트랜잭션이 안 걸린다"는 보고의 상당수는 프록시 경계 문제다. 장애를 조사할 때는 추측하기 전에 <code>org.springframework.transaction.interceptor</code>를 TRACE로 올려 "Getting transaction for [클래스.메서드]" 줄이 찍히는지부터 본다. 기대한 메서드 이름으로 그 줄이 없다면 원인은 트랜잭션 매니저나 DB가 아니라 호출 경로에 있다. 내부 호출이 원인이면 클래스를 나누는 편이 대부분 정답인데, 이때 외부 API 호출이나 파일 처리처럼 커넥션을 쥘 필요가 없는 작업을 트랜잭션 밖으로 빼는 기회로 삼을 수 있다. 커넥션 풀이 고갈되는 장애에서 트랜잭션 안에서 느린 외부 호출을 기다리는 코드가 자주 발견되기 때문이다.</p>
+<p>체크 예외 커밋 규칙은 판단이 갈리는 지점이다. 업무 예외를 체크 예외로 설계해 온 팀이라면 기본 규칙이 자연스럽지만, 그런 규약이 없는 팀에서는 라이브러리가 던진 체크 예외(입출력 예외 등)가 조용히 부분 커밋을 만드는 위험이 더 크다. Spring Framework 6.2 이상이라면 <code>rollbackOn = ALL_EXCEPTIONS</code>로 기본을 바꾸고 커밋할 업무 예외만 <code>noRollbackFor</code>로 명시하는 쪽이 사고 가능성을 줄인다. 코틀린 프로젝트는 컴파일러가 체크 예외를 구분해 주지 않으므로 이 설정의 가치가 더 크다.</p>
+<p><code>readOnly</code>는 조회 메서드에 습관적으로 붙이는 경우가 많은데, 효과는 기술 조합에 따라 다르다. JPA에서는 플러시가 꺼져 실수로 바뀐 엔티티가 반영되지 않는 안전장치가 되고, MySQL까지 전달되면 쓰기 시도가 오류로 드러난다. 반면 드라이버 설정에 따라 읽기 전용 설정을 위한 왕복이 추가될 수 있다. 읽기·쓰기 데이터 소스를 나누어 라우팅하는 구조에서는 이 플래그가 라우팅 판단에 쓰이기도 하므로, 붙이고 떼는 일이 단순한 표기 문제가 아니라는 점을 기억해야 한다.</p>
+</x-review>
+
+<x-practice>
+<li>클래스 <code>A</code>에 <code>@Transactional(readOnly = true)</code>가 붙은 <code>outer()</code>와 <code>@Transactional</code>(옵션 없음)이 붙은 <code>inner()</code>가 있고, <code>outer()</code>가 <code>inner()</code>를 <code>this</code>로 호출한다. 외부에서 <code>a.outer()</code>를 호출했을 때 <code>inner()</code> 안에서 <code>isActualTransactionActive()</code>와 <code>isCurrentTransactionReadOnly()</code>는 각각 무엇을 반환하는가?</li>
+<li>스프링 컨테이너에 등록된 CGLIB 프록시 객체와 실제 객체를 힙 그림으로 그리고, <code>AopContext.currentProxy()</code>로 내부 호출 문제를 피할 수 있는 이유를 그림 위에 화살표로 설명하라. <code>exposeProxy</code>가 꺼져 있으면 왜 동작하지 않는가?</li>
+<li>JDBC 기반 서비스의 <code>@Transactional</code> 메서드가 주문 행을 삽입한 뒤 재고 차감 SQL에서 <code>DataAccessException</code>이 나자, 같은 메서드 안에서 그 예외를 잡아 로그만 남기고 정상 반환했다. DB에는 무엇이 남는가? 이 동작을 롤백으로 바꾸는 방법 두 가지를 쓰라.</li>
+<li><code>@Transactional(rollbackForClassName = "Refund")</code>를 붙인 메서드에서 <code>RefundPeriodExpiredException</code>(체크 예외)과 <code>RefundGatewayError</code>(런타임 예외)가 각각 던져지면 결과는? 이 설정이 위험한 이유와 더 나은 표현을 제시하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 둘 다 <code>true</code>다. 외부 호출은 프록시를 지나므로 <code>outer()</code>의 속성(읽기 전용)으로 트랜잭션이 시작되고, 커넥션과 읽기 전용 플래그가 현재 스레드에 묶인다. <code>outer()</code>가 <code>this.inner()</code>를 부르면 실제 객체에서 바로 실행되어 <code>inner()</code>의 애너테이션은 읽히지도 않는다. 그러나 같은 스레드이므로 이미 묶여 있는 트랜잭션 안에서 실행되고, 스레드의 플래그는 여전히 읽기 전용이다. "안쪽에서 쓰기 트랜잭션을 선언했는데 쓰기가 반영되지 않는다"(JPA라면 플러시가 꺼져 있어서)는 증상으로 나타날 수 있다.</p>
+<p><b>2.</b> 힙에는 프록시 객체와 실제 객체가 따로 있고, 프록시가 실제 객체를 참조한다. 실제 객체 안의 <code>this</code>는 실제 객체를 가리키므로 <code>this.inner()</code>는 프록시로 가는 화살표가 없다. <code>exposeProxy</code>를 켜면 프록시는 메서드를 실행하는 동안 자기 참조를 <code>ThreadLocal</code>에 넣어 두고, <code>AopContext.currentProxy()</code>는 그 값을 꺼내 준다. 실제 객체에서 프록시로 되돌아가는 화살표가 하나 생기는 셈이다. 꺼져 있으면 프록시가 자신을 어디에도 노출하지 않으므로 꺼낼 값이 없고, 예외가 난다.</p>
+<p><b>3.</b> 주문 행이 커밋된다. 프록시는 메서드가 정상 반환한 것만 보므로 커밋 경로를 탄다. 재고 차감은 실패했으니 주문만 있고 재고는 그대로인 불일치가 생긴다. 롤백으로 바꾸려면 (1) 로그를 남긴 뒤 예외를 다시 던져 프록시가 런타임 예외를 보게 하거나, (2) <code>TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()</code>로 롤백 전용을 표시한다. 커밋 경로라도 롤백 전용 표시가 있으면 트랜잭션 매니저가 롤백한다. 둘 중에서는 예외를 다시 던지는 쪽이 스프링 내부 API에 덜 묶인다.</p>
+<p><b>4.</b> 패턴 규칙은 예외 이름이 패턴을 포함하면 일치하므로 두 예외 모두 <code>"Refund"</code>를 포함해 롤백 규칙에 걸린다. 체크 예외인 <code>RefundPeriodExpiredException</code>도 롤백되어, 업무 예외를 커밋하려던 의도와 정반대가 된다(런타임 예외는 어차피 롤백). 앞으로 이름에 <code>Refund</code>가 들어간 예외가 추가될 때마다 의도치 않게 규칙이 넓어진다는 점도 위험하다. 롤백하려는 타입을 <code>rollbackFor = RefundGatewayError.class</code>처럼 클래스로 지정하면 그 타입과 하위 타입에만 일치한다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>클래스에 <code>@Transactional(readOnly = true, timeout = 5)</code>가 있고, 그 클래스의 <code>save()</code> 메서드에 <code>@Transactional</code>만 붙어 있다. <code>save()</code>를 외부에서 호출했을 때 적용되는 속성은?</q>
+<o>클래스와 메서드 속성이 합쳐져 읽기 전용, 타임아웃 5초</o>
+<o>메서드 우선이지만 지정하지 않은 속성은 클래스에서 가져와 읽기·쓰기, 타임아웃 5초</o>
+<o>메서드의 애너테이션만 쓰여 읽기·쓰기, 타임아웃 기본값</o>
+<o>둘이 충돌하므로 기동 시 예외가 난다</o>
+<why>속성 탐색은 대상 클래스의 메서드부터 보고 찾는 즉시 반환한다. 메서드에 <code>@Transactional</code>이 있으면 그 애너테이션의 값(기본값 포함)만으로 속성이 결정되고 클래스 쪽은 보지 않는다. 그래서 읽기·쓰기이고 타임아웃은 기본값이다. 속성을 부분적으로 합치는 동작은 없으며, 충돌로 기동이 실패하지도 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>옵션 없는 <code>@Transactional</code> 메서드가 행을 하나 삽입한 뒤 체크 예외를 던졌다. 호출자가 예외를 잡았을 때 DB 상태는?</q>
+<o>예외가 났으므로 삽입은 롤백되었다</o>
+<o>삽입은 커밋되었고, 커밋이 끝난 뒤 예외가 호출자에게 전달되었다</o>
+<o>트랜잭션이 열린 채로 남아 호출자가 커밋 여부를 결정해야 한다</o>
+<o>호출자가 예외를 잡았기 때문에 커밋되었고, 잡지 않았다면 롤백되었다</o>
+<why><code>DefaultTransactionAttribute.rollbackOn</code>은 <code>RuntimeException</code>과 <code>Error</code>에만 <code>true</code>를 돌려주므로, 체크 예외는 <code>completeTransactionAfterThrowing</code>의 커밋 경로로 간다. 트랜잭션 처리가 끝난 뒤 원래 예외가 다시 던져진다. 호출자가 예외를 잡는지는 이미 끝난 트랜잭션과 무관하고, 트랜잭션이 열린 채로 호출자에게 넘어가지도 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>@PostConstruct</code> 메서드에 <code>@Transactional</code>을 붙여도 트랜잭션이 걸리지 않는 가장 정확한 이유는?</q>
+<o><code>@PostConstruct</code> 메서드는 별도 스레드에서 실행되어 <code>ThreadLocal</code>을 공유하지 못한다</o>
+<o>초기화 시점에는 아직 트랜잭션 매니저 빈이 만들어지지 않았다</o>
+<o><code>@PostConstruct</code>와 <code>@Transactional</code>을 함께 쓰면 스프링이 의도적으로 무시하도록 정해져 있다</o>
+<o><code>@PostConstruct</code>는 초기화 전 후처리 단계에서 실제 객체에 대해 호출되고, 프록시는 그 뒤 초기화 후 후처리 단계에서 만들어진다</o>
+<why><code>initializeBean</code>은 초기화 전 후처리(여기서 <code>@PostConstruct</code> 호출) → 초기화 메서드 → 초기화 후 후처리(여기서 자동 프록시 생성기가 프록시 생성) 순서로 진행한다. 초기화 메서드가 실행될 때 프록시는 존재하지 않으므로 트랜잭션 인터셉터가 끼어들 수 없다. 같은 스레드에서 실행되며, 트랜잭션 매니저가 있더라도 호출 경로에 프록시가 없으면 소용이 없다. 두 애너테이션의 조합을 특별히 무시하는 규칙이 있는 것도 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>@Transactional(rollbackFor = Exception.class, noRollbackFor = BusinessException.class)</code>에서, <code>BusinessException</code>을 상속한 <code>QuotaExceededException</code>(체크 예외)이 던져지면?</q>
+<o>커밋된다. <code>noRollbackFor</code> 규칙의 깊이가 1, <code>rollbackFor</code> 규칙의 깊이가 2라 더 가까운 쪽이 이긴다</o>
+<o>롤백된다. <code>rollbackFor</code>가 먼저 선언되었으므로 우선한다</o>
+<o>롤백된다. 규칙이 충돌하면 안전하게 롤백한다</o>
+<o>커밋된다. 체크 예외는 롤백 규칙과 무관하게 항상 커밋된다</o>
+<why><code>getDepth</code>는 예외 클래스에서 부모 쪽으로 올라가며 규칙 타입과 같아지는 단계 수를 센다. <code>QuotaExceededException</code>(0) → <code>BusinessException</code>(1) → <code>Exception</code>(2)이므로 <code>noRollbackFor</code>가 깊이 1로 가장 가깝고, 그 규칙이 커밋 규칙이라 커밋한다. 선언 순서나 "충돌 시 롤백" 같은 규칙은 없다. 체크 예외도 <code>rollbackFor</code>로 롤백시킬 수 있으므로 마지막 보기는 틀렸다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>스프링 부트 기본 설정에서 트랜잭션 빈의 <code>public final</code> 메서드에 <code>@Transactional</code>을 붙이고, 그 메서드 안에서 생성자로 주입받은 저장소 필드를 사용했다. 외부에서 호출하면 어떻게 되는가?</q>
+<o>CGLIB가 <code>final</code>을 무시하고 오버라이드하므로 정상적으로 트랜잭션이 걸린다</o>
+<o>프록시가 대상 객체에 위임하지만 트랜잭션만 빠진다</o>
+<o>메서드가 프록시 인스턴스 자신에서 실행되고, 프록시 인스턴스의 필드는 초기화되지 않았으므로 저장소 필드가 <code>null</code>이라 <code>NullPointerException</code>이 날 수 있다</o>
+<o>기동 시점에 빈 생성이 실패한다</o>
+<why>부트는 기본으로 CGLIB 프록시를 쓴다. CGLIB 하위 클래스는 <code>final</code> 메서드를 오버라이드할 수 없으므로 호출은 프록시 인스턴스가 상속한 원래 본문을 그대로 실행하며, 대상 객체로 위임되지 않는다. 프록시 인스턴스는 Objenesis로 생성자를 건너뛰고 만들어지므로 필드가 <code>null</code>이다. 실험에서도 <code>this</code>가 프록시 클래스이고 필드가 <code>null</code>로 나왔다. 기동은 실패하지 않고 로그만 남는다(Spring Framework 7.0.10은 WARN 경고, 부트 3.x가 쓰는 6.2.19는 DEBUG 로그).</why>
+</x-quiz>
+
+<x-glossary>
+<dt>선언적 트랜잭션(declarative transaction)</dt><dd>트랜잭션 경계를 코드가 아니라 애너테이션 같은 메타데이터로 선언하고, 프레임워크가 AOP로 적용하는 방식이다.</dd>
+<dt>트랜잭션 속성(transaction attribute)</dt><dd>전파, 격리 수준, 타임아웃, 읽기 전용, 롤백 규칙을 묶은 정보. <code>TransactionAttributeSource</code>가 애너테이션에서 읽어 메서드별로 캐시한다.</dd>
+<dt>트랜잭션 인터셉터(TransactionInterceptor)</dt><dd>트랜잭션 프록시의 어드바이스. 호출 앞뒤에서 트랜잭션 매니저로 트랜잭션을 시작하고 커밋·롤백한다.</dd>
+<dt>자동 프록시 생성기(auto proxy creator)</dt><dd>빈 후처리기로서 초기화가 끝난 빈에 적용할 어드바이저가 있으면 프록시로 바꿔 컨테이너에 등록한다.</dd>
+<dt>자기 호출(self-invocation)</dt><dd>대상 객체의 메서드가 같은 객체의 다른 메서드를 <code>this</code>로 부르는 것. 프록시를 지나지 않으므로 AOP가 적용되지 않는다.</dd>
+<dt>롤백 규칙(rollback rule)</dt><dd>어떤 예외에서 롤백 또는 커밋할지 정한 규칙. 예외 타입 또는 이름 패턴으로 정의하며, 상속 깊이가 가장 작은 규칙이 이긴다.</dd>
+<dt>롤백 전용(rollback-only)</dt><dd>트랜잭션에 표시하는 상태로, 표시된 트랜잭션은 커밋을 요청해도 롤백된다. 전파 상황에서 중요해진다.</dd>
+<dt>Objenesis</dt><dd>생성자를 호출하지 않고 객체를 만드는 라이브러리. 스프링은 CGLIB 프록시 인스턴스를 만들 때 이를 써서 대상 클래스 생성자가 두 번 실행되지 않게 한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/data-access/transaction/declarative/annotations.html">Spring Framework 6.2 Reference — Using @Transactional</a> — 기본 설정, 속성 표, 적용 위치 우선순위, 메서드 가시성, 자기 호출과 @PostConstruct 주의</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/data-access/transaction/declarative/rolling-back.html">Spring Framework 6.2 Reference — Rolling Back a Declarative Transaction</a> — 기본 롤백 규칙, 타입·패턴 기반 롤백 규칙, 프로그래밍 방식 롤백</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/core/aop/proxying.html">Spring Framework 6.2 Reference — Proxying Mechanisms</a> — CGLIB의 final·private 한계, Objenesis, 자기 호출 해결 방법</li>
+<li><a href="https://docs.spring.io/spring-boot/reference/features/aop.html">Spring Boot Reference — Aspect-Oriented Programming</a> — 부트가 기본으로 CGLIB 프록시를 쓰는 설정</li>
+<li><a href="https://docs.spring.io/spring-boot/api/java/org/springframework/boot/context/event/ApplicationReadyEvent.html">Spring Boot API — ApplicationReadyEvent</a> — 애플리케이션 준비 완료 이벤트의 정의</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-performance-ro-txn.html">MySQL 8.0 Reference Manual — Optimizing InnoDB Read-Only Transactions</a> — 읽기 전용 트랜잭션의 TRX_ID 생략과 ERROR 1792</li>
+</x-refs>

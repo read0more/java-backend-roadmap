@@ -1,0 +1,999 @@
+<x-meta>
+deck: 값이 없을 수 있다는 사실을 타입으로 드러내는 Optional을 소스 코드와 객체 배치로 해부하고, 자바의 즉시 평가 규칙에서 출발해 orElse와 orElseGet의 차이, Supplier로 만드는 지연 평가, JIT의 할당 제거와 바른 사용법까지 정리한다.
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li>null이 모든 참조 타입의 값이 될 수 있다는 JLS 규칙에서 출발해, 메서드 시그니처만으로 "결과 없음"을 알 수 없는 이유와 NPE가 언제·어디서 터지는지(Helpful NPE 메시지 포함) 설명할 수 있다.</li>
+<li><code>Optional</code>의 실제 소스(필드 하나, 공유 <code>EMPTY</code>, private 생성자)를 근거로 <code>of</code>·<code>ofNullable</code>·<code>empty</code>·<code>map</code>·<code>flatMap</code>·<code>filter</code>·<code>or</code>가 빈 값을 어떻게 전파하는지 단계별로 추적할 수 있다.</li>
+<li>JLS의 평가 순서 규칙(인자는 호출 전에 왼쪽부터 평가된다)과 바이트코드를 근거로 <code>orElse(f())</code>에서 <code>f()</code>가 언제 실행되는지 예측하고, <code>orElseGet</code>·<code>orElseThrow(Supplier)</code>·로그 메시지 공급자로 지연 평가를 설계할 수 있다.</li>
+<li>Supplier가 주는 지연 평가가 "필요할 때마다 다시 계산"하는 방식임을 실행 결과로 보이고, 람다 생성 시점에 확정되는 값과 실행 시점에 읽히는 값을 구분할 수 있다.</li>
+<li><code>Optional</code> 객체 하나의 크기와 HotSpot의 탈출 분석이 그 할당을 지우는 조건을 측정 결과로 설명하고, 반환 타입 전용·필드와 매개변수 금지·<code>==</code>와 동기화 금지 같은 사용 규칙을 근거와 함께 말할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: "값이 없음"을 누가 알려 주는가</h3>
+<p>회원 번호로 회원을 찾는 메서드 <code>Member findMember(long id)</code>가 있다고 하자. 해당 번호의 회원이 없으면 이 메서드는 무엇을 돌려줘야 할까. 자바에서 가장 오래된 답은 <code>null</code>이다. 문제는 시그니처 어디에도 "null이 나올 수 있다"는 정보가 없다는 점이다. 호출하는 쪽은 문서를 읽거나 구현을 열어 보거나, 아니면 운영 중에 <code>NullPointerException</code>을 만나고 나서야 그 사실을 안다. 컴파일러는 아무것도 경고하지 않는다. 같은 시그니처를 가진 메서드라도 어떤 것은 절대 null을 돌려주지 않고, 어떤 것은 자주 돌려준다.</p>
+<p>자바 8은 이 정보를 타입에 싣는 도구로 <code>java.util.Optional</code>을 들여왔다. 반환 타입이 <code>Optional<Member></code>라면 시그니처만 보고도 "결과가 없을 수 있다"는 사실을 알고, 값을 꺼내려면 "없을 때 무엇을 할지"를 반드시 코드로 적어야 한다. 이 회차는 먼저 null이 왜 문제가 되는지를 언어 명세와 JVM 수준에서 확인하고, <code>Optional</code>의 소스 코드를 한 줄씩 읽으며 생성·값 획득·값 처리 메서드가 실제로 무엇을 하는지 본다.</p>
+<p>후반부의 중심은 <b>즉시 평가(eager evaluation)와 지연 평가(lazy evaluation)</b>다. <code>orElse</code>와 <code>orElseGet</code>은 겉보기에 거의 같지만, 자바가 메서드 인자를 언제 계산하는지라는 언어 규칙 때문에 전혀 다르게 동작한다. 이 차이는 <code>Optional</code>만의 이야기가 아니라 로그 출력, 예외 생성, 캐시 조회, 그리고 5회에서 본 스트림의 지연 실행과 같은 뿌리를 가진다. 마지막으로 <code>Optional</code> 객체가 메모리에서 차지하는 크기, HotSpot JIT가 그 할당을 없애는 조건, 그리고 값 기반 클래스(value-based class)라는 지위에서 나오는 사용 규칙을 정리한다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p><code>Optional</code>은 참조 하나를 감싼 불변 객체이고, 감싼 참조가 null이면 "비어 있음"으로 취급한다. 그 가치는 성능이 아니라 <b>타입으로 남기는 약속</b>에 있다. 반환 타입이 <code>Optional</code>이면 호출자는 값을 꺼내기 전에 빈 경우를 처리하는 코드를 써야 한다. 그 처리 코드에 값을 넘길지(<code>orElse</code>) 코드를 넘길지(<code>orElseGet</code>)는 자바의 인자 평가 규칙 때문에 실행 결과를 바꾼다. 자바는 메서드를 부르기 전에 인자를 모두 계산하므로, "필요할 때만 계산"하려면 계산 자체를 <code>Supplier</code> 객체로 감싸 넘겨야 한다.</p></aside>
+
+<h3>null은 모든 참조 타입의 값이다</h3>
+<p>먼저 null이 타입 체계에서 어떤 자리에 있는지 보자. 자바 언어 명세(JLS) §4.1은 기본형과 참조형 말고 "특별한 null 타입(null type)"이 있다고 정의한다. 이 타입은 이름이 없어서 변수를 선언할 수 없고, 그 타입의 값은 null 참조 하나뿐이다. 그리고 null 참조는 언제나 어떤 참조 타입으로든 대입하거나 캐스팅할 수 있다. §4.10.2는 같은 사실을 하위 타입 관계로 적는다. null 타입의 직접 상위 타입은 null 타입 자신을 뺀 <b>모든 참조 타입</b>이다. 즉 <code>String</code>, <code>Member</code>, <code>List<Order></code> 같은 어떤 참조 타입이든 그 값의 집합에 null이 들어 있다.</p>
+<p>이것이 null 문제의 뿌리다. 타입이 "이 변수에는 회원이 들어 있다"고 말해도, 언어 규칙상 그 변수에는 언제든 "아무것도 아님"이 들어갈 수 있다. 컴파일러는 <code>member.address()</code>라는 호출을 보고 <code>member</code>가 null일지 판단하지 않는다. 판단할 정보가 타입에 없기 때문이다. 그래서 null 검사는 전적으로 사람의 기억과 문서에 맡겨진다. 메서드 수백 개가 서로를 부르는 시스템에서 "이 반환값이 null일 수 있는가"를 모두 기억하는 것은 불가능에 가깝다.</p>
+<p>런타임에서는 JVM이 null을 만난 순간 예외를 던진다. 자바 가상 머신 명세(JVMS)는 <code>invokevirtual</code>, <code>getfield</code>, <code>arraylength</code> 같은 명령어마다 "대상 참조가 null이면 <code>NullPointerException</code>을 던진다"고 정해 둔다. JLS §15.12.4.4도 인스턴스 메서드 호출에서 대상 참조가 null이면 그 시점에 NPE가 발생한다고 적는다. 중요한 것은 예외가 <b>null이 처음 생긴 곳이 아니라 처음 사용된 곳</b>에서 터진다는 점이다. 회원 조회 메서드가 null을 돌려준 곳과, 그 값이 서너 단계 전달된 뒤 메서드 호출에 쓰여 터진 곳은 전혀 다른 파일일 수 있다.</p>
+
+<h4>Helpful NullPointerException: JVM이 알려 주는 것</h4>
+<p>예전 NPE는 스택 트레이스의 줄 번호만 알려 줬다. 한 줄에 <code>a.b().c().d()</code>처럼 호출이 이어져 있으면 그중 무엇이 null이었는지 알 수 없었다. JEP 358(Helpful NullPointerExceptions)은 JVM이 예외가 난 바이트코드를 분석해 "무엇이 null이었는지"를 메시지에 넣도록 했다. JEP 문서에 따르면 이 기능은 JDK 14에 들어왔고 처음에는 <code>-XX:+ShowCodeDetailsInExceptionMessages</code> 옵션을 켜야 했으며, JDK 15 릴리스 노트에 따라 JDK 15부터 기본으로 켜져 있다. 직접 확인해 보자.</p>
+<pre><code class="language-java">public class Npe {
+    record Address(String city) {}
+    record Member(String name, Address address) {}
+
+    static String cityOf(Member member) {
+        return member.address().city().toUpperCase();
+    }
+
+    public static void main(String[] args) {
+        Member m = new Member("kim", null);
+        System.out.println(cityOf(m));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">Exception in thread "main" java.lang.NullPointerException: Cannot invoke "Npe$Address.city()" because the return value of "Npe$Member.address()" is null
+	at Npe.cityOf(Npe.java:6)
+	at Npe.main(Npe.java:11)</code></pre>
+<p>메시지는 "<code>Member.address()</code>의 반환값이 null이어서 <code>Address.city()</code>를 호출할 수 없다"고 정확히 짚는다. JEP 358의 설명에 따르면 JVM은 메서드의 바이트코드에 간단한 데이터 흐름 분석을 수행해, 예외가 난 <code>invokevirtual</code>이 꺼낸 피연산자 스택 슬롯에 null을 올린 명령이 무엇인지 찾아내고 그것을 소스 코드 표현으로 바꿔 적는다. 지역 변수가 null인 경우에는 조금 다르다. <code>String city = null; city.length();</code> 같은 코드를 그냥 <code>javac</code>로 컴파일하면 메시지가 <code>because "<local1>" is null</code>처럼 슬롯 번호로 나오고, <code>javac -g</code>로 디버그 정보(LocalVariableTable)를 넣어 컴파일해야 <code>because "city" is null</code>처럼 이름이 나온다. JEP 358도 클래스 파일에 디버그 정보가 있을 때만 지역 변수 이름이 출력된다고 밝힌다. <code>-XX:-ShowCodeDetailsInExceptionMessages</code>로 끄면 메시지 없이 예외 이름만 나온다.</p>
+<p>Helpful NPE는 "어디서 터졌는지"를 잘 알려 주지만 "왜 null이 거기까지 왔는지"는 알려 주지 않는다. <code>address()</code>가 null을 돌려준 것이 버그인지, 원래 주소 없는 회원이 있을 수 있는데 호출자가 그 경우를 잊은 것인지는 메시지만으로 알 수 없다. 이 판단에 필요한 정보, 곧 "이 값은 없을 수 있다"는 설계 의도를 코드에 남기는 것이 <code>Optional</code>의 역할이다.</p>
+
+<h4>null 검사로 버티는 코드의 모양</h4>
+<p>null을 반환하는 API를 안전하게 쓰려면 사용하는 쪽이 매 단계 검사해야 한다. 회원 → 주소 → 도시를 따라가는 코드는 이렇게 된다.</p>
+<pre><code class="language-java">static String cityByNullCheck(long id) {
+    Member member = members.get(id);          // 없으면 null
+    if (member != null) {
+        Address address = member.address();  // 주소 미등록이면 null
+        if (address != null) {
+            String city = address.city();     // 도시 미입력이면 null
+            if (city != null) {
+                return city;
+            }
+        }
+    }
+    return "미등록";
+}</code></pre>
+<p>이 코드는 정확하지만 두 가지 약점이 있다. 첫째, 본래 하려던 일(회원의 도시를 얻는다)이 세 겹의 <code>if</code> 안에 묻힌다. 둘째, 검사를 하나 빠뜨려도 컴파일러가 잡아 주지 않는다. 어느 단계가 null을 돌려줄 수 있는지는 여전히 사람이 알아야 한다. 뒤에서 이 코드를 <code>Optional</code>로 다시 쓰면 "단계마다 값이 없을 수 있고, 하나라도 없으면 기본값"이라는 의미가 한 줄짜리 파이프라인으로 바뀐다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>송장이 붙은 상자</strong><p>택배 상자에 아무 표시가 없으면 받는 사람은 열어 보기 전까지 안에 물건이 있는지 모른다. 빈 상자를 그대로 다음 사람에게 넘기면 결국 누군가 물건을 쓰려는 순간에야 비어 있음을 알게 된다(NPE). <code>Optional</code>은 상자 겉에 "내용물이 없을 수도 있음"이라는 표시를 붙이고, 상자를 여는 방법도 "없으면 이것을 대신 써라", "없으면 반품하라"처럼 정해진 몇 가지로 제한한다. 다만 비유가 깨지는 지점도 있다. 상자 자체(<code>Optional</code> 참조)가 null이면 표시가 아무 소용이 없다. 그래서 <code>Optional</code> 타입의 변수는 절대 null이어서는 안 된다는 규칙이 따로 붙는다.</p></aside>
+
+<h3>한 층 아래: HotSpot은 null을 어떻게 발견하고 NPE를 만드는가</h3>
+<p>JVMS는 <code>getfield</code>나 <code>invokevirtual</code>의 대상 참조가 null이면 NPE를 던진다고 <b>결과</b>만 정한다. null을 어떻게 알아낼지, 예외 객체를 언제 만들고 메시지를 언제 채울지는 구현이 정한다. 이 절은 OpenJDK 21 HotSpot의 소스(github.com/openjdk/jdk21u)와 JDK 21 실험으로 그 경로를 따라간다. 결론은 세 가지다. 첫째, HotSpot은 null 검사의 상당 부분을 비교 명령 없이 운영체제의 메모리 보호에 맡긴다. 둘째, 앞에서 본 친절한 메시지는 예외가 생길 때가 아니라 누군가 <code>getMessage()</code>를 부를 때 계산된다. 셋째, 같은 자리에서 NPE가 자주 나면 JIT가 스택 트레이스도 메시지도 없는 공용 예외 객체를 던지기 시작한다. 셋 모두 운영 중인 서버의 로그를 읽을 때 직접 부딪히는 사실이다.</p>
+<h4>암묵적 null 검사: 비교 명령 대신 페이지 폴트</h4>
+<p>필드를 읽는 기계어는 "객체 주소 + 필드 오프셋"에서 값을 읽는다. 참조가 null이면 읽으려는 주소는 0에 아주 가까운 값이 된다. macOS와 리눅스는 주소 0이 들어 있는 페이지를 프로세스에 매핑하지 않으므로 그 접근은 CPU의 페이지 폴트가 되고, 커널은 해당 스레드에 SIGSEGV나 SIGBUS 신호를 보낸다. HotSpot은 이 신호를 스스로 처리한다. 신호는 <code>signals_posix.cpp</code>의 <code>javaSignalHandler</code>가 먼저 받아 <code>JVM_HANDLE_XXX_SIGNAL</code>로 넘기고, 여기서 플랫폼별 처리 함수를 부른다. 이 실험 환경(macOS, AArch64)에서 그 함수는 <code>os_bsd_aarch64.cpp</code>의 <code>PosixSignals::pd_hotspot_signal_handler</code>다. 이 함수는 폴트 주소가 null 검사로 쓰는 범위인지 <code>MacroAssembler::uses_implicit_null_check</code>로 확인하고, 맞으면 <code>SharedRuntime::continuation_for_implicit_exception(thread, pc, IMPLICIT_NULL)</code>로 "이어서 실행할 주소"를 얻는다. 폴트가 난 명령이 인터프리터 코드 안이면 인터프리터의 NPE 던지기 진입점(<code>Interpreter::throw_NullPointerException_entry()</code>)이, JIT가 만든 컴파일된 메서드(nmethod) 안이면 그 메서드가 컴파일 때 기록해 둔 암묵적 예외 표(<code>ImplicitExceptionTable</code>)에서 찾은 주소가 돌아온다. 신호 처리기가 끝나면 스레드는 폴트가 난 명령의 다음 줄이 아니라 그 주소에서 실행을 이어 가며 NPE를 던진다.</p>
+<p>이 방식은 접근 주소가 매핑되지 않은 첫 페이지 안에 떨어질 때만 성립한다. <code>assembler.cpp</code>의 <code>MacroAssembler::needs_explicit_null_check(offset)</code>는 오프셋이 음수이거나 페이지 크기 이상이면 명시적 검사가 필요하다고 판단한다. C2는 이 판단에 따라 비교 명령을 그대로 남기고(<code>lcm.cpp</code>의 <code>PhaseCFG::implicit_null_check</code>), 인터프리터와 C1이 쓰는 <code>MacroAssembler::null_check</code>는 비교 대신 주소 "참조 + 0"을 한 번 더 읽어 폴트를 일부러 일으킨다. 이 Mac의 페이지 크기는 <code>getconf PAGESIZE</code>로 16384바이트이고, <code>Optional</code>의 <code>value</code> 필드 오프셋은 <code>Unsafe.objectFieldOffset</code>으로 재면 12다(12바이트 헤더 바로 뒤). C2는 여기에 프로파일을 더한다. <code>graphKit.cpp</code>의 <code>GraphKit::null_check_common</code>은 처음에 "null은 나오지 않는다"고 가정해 not-null 확률을 최대로 두는데, 소스 주석은 이것이 암묵적 null 검사를 만들게 하는 설정이라고 적는다. 그 지점에서 이미 null 트랩이 기록되었다면(또는 메서드 전체의 트랩 수가 문턱을 넘었다면) 확률을 낮춰 명시적 비교를 만든다. 정리하면, C2가 컴파일한 코드에서 null이 나온 적 없는 역참조에는 null 비교 명령조차 없을 수 있고, null 트랩이 기록된 지점에는 비교가 생긴다. JVMS가 정한 "null이면 NPE"라는 결과는 같지만, 그 결과에 이르는 기계 수준의 경로는 실행 이력에 따라 다르다.</p>
+<h4>Helpful NPE 메시지는 물어볼 때 만들어진다</h4>
+<p>JEP 358의 메시지는 바이트코드 분석으로 만들므로 공짜가 아니다. 그래서 JDK는 이것을 이 회차의 주제인 지연 평가로 처리한다. JDK 21의 <code>NullPointerException.java</code>를 열면 메시지용 필드 두 개와 이를 다루는 메서드가 있다(주석은 우리말로 옮기고 줄였다).</p>
+<pre><code class="language-java">// 0: 스택 미기록, 메시지 미계산 / 1: 스택 기록됨, 메시지 미계산 / 2: 메시지 계산됨
+private transient int extendedMessageState;
+private transient String extendedMessage;
+
+public synchronized Throwable fillInStackTrace() {
+    // 스택이 바뀌면 메시지 분석이 틀어지므로 덮어쓰기 전에 미리 계산한다
+    if (extendedMessageState == 0) {
+        extendedMessageState = 1;
+    } else if (extendedMessageState == 1) {
+        extendedMessage = getExtendedNPEMessage();
+        extendedMessageState = 2;
+    }
+    return super.fillInStackTrace();
+}
+
+public String getMessage() {
+    String message = super.getMessage();
+    if (message == null) {
+        synchronized(this) {
+            if (extendedMessageState == 1) {
+                extendedMessage = getExtendedNPEMessage();
+                extendedMessageState = 2;
+            }
+            return extendedMessage;
+        }
+    }
+    return message;
+}
+
+private native String getExtendedNPEMessage();</code></pre>
+<p>예외가 생성될 때(<code>Throwable</code> 생성자가 <code>fillInStackTrace()</code>를 부를 때) 일어나는 일은 상태를 0에서 1로 바꾸는 것뿐이다. 메시지는 <code>getMessage()</code>가 처음 불릴 때 네이티브 메서드로 계산되어 필드에 저장되고, 그 뒤로는 저장된 값이 돌아온다. 뒤의 "즉시 평가와 지연 평가 3"에서 "자바에서는 직접 만들어야 한다"고 할 필요에 의한 호출(call by need)이 바로 이 모양이다. 처음 필요할 때 한 번 계산하고, 결과를 기억하고, 여러 스레드가 동시에 물어볼 수 있으므로 <code>synchronized</code>로 감싼다. 그 결과 잡아서 무시하거나 메시지를 읽지 않는 NPE는 분석 비용을 치르지 않는다.</p>
+<p>네이티브 쪽은 <code>jvm.cpp</code>의 <code>JVM_GetExtendedNPEMessage</code>다. 이 함수는 <code>ShowCodeDetailsInExceptionMessages</code>가 꺼져 있으면 바로 null을 돌려주고, 아니면 예외 객체에 기록된 백트레이스에서 맨 위 메서드와 바이트코드 위치(bci)를 꺼낸다(<code>java_lang_Throwable::get_top_method_and_bci</code>). 꺼내지 못하거나 맨 위 메서드가 네이티브 메서드면 역시 null이다. 그다음 <code>bytecodeUtils.cpp</code>의 <code>BytecodeUtils::get_NPE_message_at</code>이 그 메서드의 바이트코드를 분석해 "Cannot invoke ... because ..." 문장을 만든다. 메시지의 재료가 백트레이스와 상태 필드라는 점이 다음 실험의 열쇠다.</p>
+<h4>스택도 메시지도 없는 NPE: OmitStackTraceInFastThrow</h4>
+<p>운영 서버 로그에 <code>java.lang.NullPointerException</code> 한 줄만 찍히고 스택 트레이스가 한 줄도 없는 경우가 있다. 다음 프로그램으로 재현할 수 있다. 같은 메서드에서 NPE를 계속 일으키면서, 스택이 빈 NPE가 처음 나오는 순간을 잡는다.</p>
+<pre><code class="language-java">public class FastThrow {
+    record Box(String value) {}
+
+    static int len(Box b) {
+        return b.value().length();          // b가 null이면 NPE
+    }
+
+    public static void main(String[] args) {
+        Box[] boxes = {new Box("ab"), null};
+        NullPointerException first = null;
+        for (int i = 0; i < 200_000; i++) {
+            try {
+                len(boxes[i % 2]);
+            } catch (NullPointerException e) {
+                if (first == null) {
+                    first = e;
+                    System.out.println("첫 NPE: i=" + i + ", 스택 깊이=" + e.getStackTrace().length
+                            + ", 메시지=" + e.getMessage());
+                }
+                if (e.getStackTrace().length == 0) {
+                    System.out.println("스택 없는 NPE: i=" + i + ", 메시지=" + e.getMessage());
+                    NullPointerException again = null;
+                    try { len(null); } catch (NullPointerException e2) { again = e2; }
+                    System.out.println("다음 NPE와 같은 객체인가: " + (again == e));
+                    return;
+                }
+            }
+        }
+        System.out.println("끝까지 스택이 있었다");
+    }
+}</code></pre>
+<pre data-label="실행 결과 (macOS, Temurin 21.0.13, 기본 옵션 / -XX:-OmitStackTraceInFastThrow)"><code class="language-text">첫 NPE: i=1, 스택 깊이=2, 메시지=Cannot invoke "FastThrow$Box.value()" because "<parameter1>" is null
+스택 없는 NPE: i=5355, 메시지=null
+다음 NPE와 같은 객체인가: true
+--- -XX:-OmitStackTraceInFastThrow
+첫 NPE: i=1, 스택 깊이=2, 메시지=Cannot invoke "FastThrow$Box.value()" because "<parameter1>" is null
+끝까지 스택이 있었다</code></pre>
+<p>처음 수천 번의 NPE는 정상이다(메시지의 <code><parameter1></code>은 <code>-g</code> 없이 컴파일해 매개변수 이름이 없어서 나온 것이다). 그러다 어느 순간 스택 깊이 0, 메시지 null인 NPE가 나오고, 그 뒤로 던져지는 NPE는 <b>매번 같은 객체</b>다. 그 순간은 실행마다 다르다. 세 번 실행했을 때 i=5355, 5407, 5361이었다. 원인은 C2다. <code>graphKit.cpp</code>의 <code>GraphKit::builtin_throw</code>는 null 검사 실패 경로를 만들 때, 이 지점의 예외가 "뜨겁다"고 판단하면(이 바이트코드에서 같은 이유의 트랩이 이미 기록되었거나 메서드 전체로 너무 많을 때, 또는 인라인 경로의 메서드에 예외 처리기가 있고 같은 이유의 트랩이 한 번 이상 기록되었을 때) 그리고 <code>OmitStackTraceInFastThrow</code>(기본값 true)가 켜져 있으면, 예외를 새로 만들지 않고 <code>env()->NullPointerException_instance()</code>가 돌려주는 <b>미리 만들어 둔 예외 객체</b>를 던지는 코드를 넣는다. 이때 그 객체의 메시지 필드(<code>detailMessage</code>)에 null을 쓰는 코드도 함께 넣는다. 같은 <code>switch</code> 문에서 <code>ArithmeticException</code>, <code>ArrayIndexOutOfBoundsException</code>, <code>ClassCastException</code>, <code>ArrayStoreException</code>도 같은 대우를 받는다. <code>-XX:+UnlockDiagnosticVMOptions -XX:+LogCompilation</code>으로 컴파일 로그를 남겨 보면, C2가 <code>FastThrow.len</code>을 컴파일한 작업 안에 <code><hot_throw preallocated='1' reason='null_check'/></code> 요소가 찍혀 이 결정이 실제로 내려졌음을 확인할 수 있다.</p>
+<p>미리 만든 객체는 <code>universe.cpp</code>에서 VM이 시작할 때 <code>allocate_instance</code>로 <b>할당만</b> 한 것이다. 생성자가 실행되지 않았으므로 <code>fillInStackTrace()</code>도 불린 적이 없어 백트레이스가 비어 있고, <code>extendedMessageState</code>는 기본값 0 그대로다. 앞에서 본 <code>getMessage()</code>는 상태가 1일 때만 네이티브 분석을 부르므로 null을 돌려준다. Helpful NPE 메시지가 사라진 이유가 소스 두 곳으로 설명된다. 실무에서 스택 없는 NPE를 보면 두 가지를 한다. 같은 로그에서 더 이른 시각의 같은 예외를 찾는다. 위 실험의 첫 NPE처럼, JIT가 판단을 바꾸기 전의 예외에는 스택과 메시지가 온전히 있다. 그리고 재현 환경에서는 <code>-XX:-OmitStackTraceInFastThrow</code>로 이 최적화를 끄고 실행한다. 이 실험은 "값이 없을 수 있음"을 NPE와 <code>catch</code>로 처리하는 코드가 진단 정보까지 잃을 수 있다는 것도 보여 준다. 없을 수 있는 값은 예외가 아니라 타입과 분기로 다루라는 이 회차의 주장이 진단 측면에서도 근거를 하나 더 얻는다.</p>
+
+<h3>Optional 해부: 필드 하나와 공유된 빈 객체</h3>
+<p><code>Optional</code>이 무엇인지는 소스 코드를 보면 가장 정확하다. JDK 설치 경로의 <code>lib/src.zip</code>에서 <code>java.base/java/util/Optional.java</code>를 열면(이 회차는 Temurin 21.0.13 기준) 상태를 이루는 부분은 이것이 전부다. 주석과 메서드 본문은 줄였다.</p>
+<pre><code class="language-java">@jdk.internal.ValueBased
+public final class Optional<T> {
+    private static final Optional<?> EMPTY = new Optional<>(null);
+
+    private final T value;   // null이 아니면 값, null이면 "값 없음"
+
+    private Optional(T value) {
+        this.value = value;
+    }
+
+    public static <T> Optional<T> of(T value) {
+        return new Optional<>(Objects.requireNonNull(value));
+    }
+
+    public static <T> Optional<T> ofNullable(T value) {
+        return value == null ? (Optional<T>) EMPTY
+                             : new Optional<>(value);
+    }
+
+    public static <T> Optional<T> empty() {
+        return (Optional<T>) EMPTY;
+    }
+    // ...
+}</code></pre>
+<p>읽을 거리가 몇 가지 있다. 첫째, 인스턴스 필드는 <code>final T value</code> 하나뿐이다. "값이 있음/없음"을 나타내는 별도의 boolean이 없고, <code>value</code>가 null인지로 판단한다. 그래서 <code>Optional</code>은 null을 값으로 담을 수 없다. "null이 들어 있는 Optional"과 "빈 Optional"을 구분할 방법이 구조적으로 없기 때문이다. Javadoc의 첫 문장도 "non-null 값을 담을 수도 있고 담지 않을 수도 있는 컨테이너 객체"라고 정의한다.</p>
+<p>둘째, 생성자가 private이고 클래스가 final이다. 외부에서는 정적 팩토리 메서드로만 만들 수 있고, 상속해서 동작을 바꿀 수도 없다. 필드가 final이고 값을 바꾸는 메서드가 없으므로 한 번 만든 <code>Optional</code>은 불변이다. <code>map</code>이나 <code>filter</code>는 기존 객체를 고치지 않고 새 <code>Optional</code>을 돌려주거나 자기 자신을 그대로 돌려준다.</p>
+<p>셋째, 빈 <code>Optional</code>은 클래스가 초기화될 때 한 번 만들어진 <code>EMPTY</code> 하나를 모두가 공유한다. <code>empty()</code>와 <code>ofNullable(null)</code>은 새 객체를 만들지 않고 이 정적 필드를 돌려준다. 제네릭 타입 인자는 컴파일 후 지워지므로(2회에서 본 타입 소거) <code>Optional<String></code>의 빈 값과 <code>Optional<Member></code>의 빈 값이 같은 객체여도 런타임에는 아무 문제가 없다. 다만 Javadoc은 <code>empty()</code>에 대해 "싱글턴이라는 보장은 없으니 <code>==</code>로 비교해 빈 값을 판정하지 말라"고 따로 적어 두었다. 현재 구현이 공유 객체를 쓰는 것과 API가 약속하는 것은 다르다.</p>
+<pre class="diagram">  스택(main 프레임)            힙
+  ┌──────────────┐
+  │ found   ─────┼──────▶ Optional 객체 ─────────────┐
+  │              │        [헤더 12B][value ──┐ 4B]    │  value가 가리키는 대상
+  │ notFound ────┼──┐                        └──────▶ String "서울"
+  └──────────────┘  │
+                    │     메서드 영역의 Optional 클래스
+                    │     static EMPTY ──┐
+                    │                    ▼
+                    └────────────▶ Optional 객체 (공유)
+                                   [헤더 12B][value = null]
+
+  found    = Optional.of("서울")      → 새 객체 1개 (16바이트, 아래 측정 참고)
+  notFound = Optional.empty()         → 새 객체 없음, EMPTY 참조를 받음</pre>
+
+<x-visual id="java-adv3-08-optional-memory" title="값이 있는 Optional과 공유된 EMPTY의 메모리 배치" kind="메모리 구조도" ratio="16:9">
+<x-hint>스택의 두 지역 변수가 하나는 새로 만든 Optional 객체를, 하나는 클래스의 정적 필드 EMPTY가 가리키는 공유 객체를 가리키는 모습을 보여 준다.</x-hint>
+<x-prompt>왼쪽에 세로로 긴 사각형 "스택 프레임 main"이 있고 그 안에 두 칸 "found", "notFound"가 있다. 가운데와 오른쪽은 "힙" 영역이다. "found" 칸에서 화살표가 힙의 상자 "Optional 객체"로 가고, 이 상자는 두 칸 "헤더 12바이트"와 "value"로 나뉜다. "value" 칸에서 다시 화살표가 오른쪽 상자 "String \"서울\""로 간다. 아래쪽에는 "메서드 영역: Optional 클래스" 상자가 있고 그 안에 "static EMPTY" 칸이 있다. "static EMPTY"에서 화살표가 힙의 또 다른 상자 "공유 빈 Optional"(두 칸: "헤더", "value = null")로 간다. "notFound" 칸에서도 화살표가 같은 "공유 빈 Optional" 상자로 간다. 두 화살표가 같은 상자로 모이는 점을 강조한다. 깔끔한 평면 다이어그램, 흰 배경, 파랑과 회색 계열.</x-prompt>
+<x-caption>값이 있는 Optional은 매번 새 객체지만, 빈 Optional은 현재 구현에서 클래스가 가진 EMPTY 하나를 공유한다.</x-caption>
+</x-visual>
+
+<h4>객체 하나는 몇 바이트인가</h4>
+<p>위 그림의 "16바이트"는 추측이 아니라 측정값이다. HotSpot은 <code>com.sun.management.ThreadMXBean</code>으로 현재 스레드가 지금까지 할당한 바이트 수를 알려 준다. 미리 만든 배열에 <code>Optional.of(s)</code>를 백만 번 저장하면, 배열에 저장된 객체는 메서드 밖으로 탈출하므로 JIT가 할당을 지울 수 없다. 그때 늘어난 바이트를 백만으로 나누면 객체 하나의 크기가 나온다.</p>
+<pre><code class="language-java">import java.lang.management.ManagementFactory;
+import java.util.Optional;
+
+public class AllocSize {
+    public static void main(String[] args) {
+        var mx = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+        int n = 1_000_000;
+        Object[] box = new Object[n];      // 배열은 측정 전에 미리 만든다
+        String s = "v";
+        long before = mx.getCurrentThreadAllocatedBytes();
+        for (int i = 0; i < n; i++) {
+            box[i] = Optional.of(s);       // 배열에 저장하므로 객체가 탈출한다
+        }
+        long after = mx.getCurrentThreadAllocatedBytes();
+        System.out.println("Optional 하나당 바이트 = " + (after - before) / (double) n);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (macOS, Temurin 21.0.13, 기본 옵션 / -XX:-UseCompressedOops)"><code class="language-text">Optional 하나당 바이트 = 16.000248
+Optional 하나당 바이트 = 24.00028</code></pre>
+<p>소수점 아래의 작은 값은 측정 코드 자체가 만든 할당이다. 기본 설정에서 객체 하나는 16바이트다. 64비트 HotSpot에서 객체 헤더는 마크 워드(mark word) 8바이트와 클래스 포인터로 이루어지는데, 기본으로 켜진 압축 클래스 포인터(compressed class pointers) 덕분에 클래스 포인터가 4바이트라 헤더가 12바이트가 된다. 여기에 압축 참조(compressed oops)로 4바이트가 된 <code>value</code> 필드를 더하면 정확히 16바이트다. <code>-XX:-UseCompressedOops</code>로 압축 참조를 끄면 <code>value</code>가 8바이트가 되어 12 + 8 = 20바이트이고, 객체는 8바이트 단위로 정렬되므로 24바이트가 된다. 어느 쪽이든 <code>Optional</code>로 감쌀 때마다 객체 하나와 참조 한 단계가 더해진다는 사실은 같다. 이 비용이 실제로 문제가 되는지는 뒤의 "한 층 아래" 절에서 JIT와 함께 다시 본다.</p>
+
+<h3>Optional의 생성과 값 획득</h3>
+<p>생성 방법은 세 가지다. 어느 것을 쓰느냐는 "넘기려는 값이 null일 수 있는가"에 대한 내 판단을 코드로 적는 일이다.</p>
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>인자가 값일 때</th><th>인자가 null일 때</th><th>쓰는 자리</th></tr></thead><tbody>
+<tr><td><code>Optional.of(v)</code></td><td>새 Optional</td><td>즉시 <code>NullPointerException</code></td><td>null이 아님을 확신할 때. null이면 버그이므로 바로 터지는 편이 낫다</td></tr>
+<tr><td><code>Optional.ofNullable(v)</code></td><td>새 Optional</td><td>빈 Optional(<code>EMPTY</code>)</td><td>null을 돌려주는 기존 API와의 경계. <code>Map.get</code> 결과를 감쌀 때 등</td></tr>
+<tr><td><code>Optional.empty()</code></td><td colspan="2">인자 없음. 빈 Optional</td><td>"결과 없음"을 명시적으로 돌려줄 때</td></tr>
+</tbody></table></div>
+<p><code>of</code>가 null을 받으면 내부의 <code>Objects.requireNonNull(value)</code>가 메시지 없는 NPE를 던진다. 이것은 결함이 아니라 의도다. "여기에는 반드시 값이 있다"고 믿고 <code>of</code>를 썼는데 null이 왔다면 그 믿음이 틀린 것이고, 문제를 만든 지점에서 바로 실패(fail-fast)하는 편이 null이 멀리 흘러가 엉뚱한 곳에서 터지는 것보다 원인을 찾기 쉽다. 반대로 "값이 없을 수 있다"는 것이 정상적인 상황이라면 <code>ofNullable</code>을 쓴다.</p>
+<p>값을 꺼내는 메서드는 "비어 있을 때 무엇을 하는가"로 구분된다.</p>
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>값이 있을 때</th><th>비어 있을 때</th><th>도입</th></tr></thead><tbody>
+<tr><td><code>get()</code></td><td>값 반환</td><td><code>NoSuchElementException("No value present")</code></td><td>8</td></tr>
+<tr><td><code>orElseThrow()</code></td><td>값 반환</td><td><code>get()</code>과 같은 예외</td><td>10</td></tr>
+<tr><td><code>orElseThrow(Supplier)</code></td><td>값 반환</td><td>공급자가 만든 예외를 던짐</td><td>8</td></tr>
+<tr><td><code>orElse(T other)</code></td><td>값 반환</td><td><code>other</code> 반환</td><td>8</td></tr>
+<tr><td><code>orElseGet(Supplier)</code></td><td>값 반환</td><td>공급자를 호출해 그 결과 반환</td><td>8</td></tr>
+<tr><td><code>isPresent()</code> / <code>isEmpty()</code></td><td>true / false</td><td>false / true</td><td>8 / 11</td></tr>
+</tbody></table></div>
+<p>도입 버전은 JDK 21 소스의 <code>@since</code> 태그로 확인한 것이다. <code>get()</code>과 <code>orElseThrow()</code>는 소스를 보면 본문이 글자 그대로 같다. 같은 기능을 Java 10에서 다른 이름으로 하나 더 만든 이유는 이름이 주는 인상 때문이다. <code>get()</code>이라는 이름은 "그냥 꺼낸다"처럼 읽혀 빈 경우를 잊게 만들지만, <code>orElseThrow()</code>는 "없으면 던진다"는 동작이 이름에 드러난다. JDK 21의 <code>get()</code> Javadoc에는 "이 메서드보다 <code>orElseThrow()</code>를 쓰는 편이 바람직하다(preferred alternative)"는 API 노트가 붙어 있다.</p>
+<p>아래 프로그램은 생성과 획득의 경계 사례를 모아 실행한 것이다. 출력은 결정적이다.</p>
+<pre><code class="language-java">import java.util.NoSuchElementException;
+import java.util.Optional;
+import java.util.stream.Stream;
+
+public class CreateAndGet {
+    public static void main(String[] args) {
+        Optional<String> e = Optional.empty();
+        System.out.println(e + " / " + Optional.of("a"));
+        try { Optional.of(null); }
+        catch (NullPointerException ex) { System.out.println("of(null) -> " + ex); }
+        try { e.get(); }
+        catch (NoSuchElementException ex) { System.out.println("get -> " + ex); }
+        try { e.orElseThrow(); }
+        catch (NoSuchElementException ex) { System.out.println("orElseThrow -> " + ex); }
+        System.out.println(Optional.of("a").equals(Optional.of("a")));
+        try { Stream.of((String) null, "b").findFirst(); }
+        catch (NullPointerException ex) { System.out.println("findFirst -> " + ex); }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Optional.empty / Optional[a]
+of(null) -> java.lang.NullPointerException
+get -> java.util.NoSuchElementException: No value present
+orElseThrow -> java.util.NoSuchElementException: No value present
+true
+findFirst -> java.lang.NullPointerException</code></pre>
+<p><code>toString</code>은 값이 있으면 <code>Optional[값]</code>, 없으면 <code>Optional.empty</code>를 돌려준다. <code>equals</code>는 둘 다 <code>Optional</code>이고 <code>Objects.equals(value, other.value)</code>가 참이면 같다고 판단하므로, 서로 다른 객체 두 개라도 담은 값이 같으면 같다. 마지막 줄은 스트림과의 연결 지점이다. <code>Stream.findFirst()</code>는 결과를 <code>Optional</code>로 돌려주는데, 첫 원소 자체가 null이면 "원소가 없음"과 "null 원소가 있음"을 <code>Optional</code>로 구분할 수 없으므로 NPE를 던진다. <code>Stream</code> Javadoc의 <code>findFirst</code>에도 "선택된 원소가 null이면 NullPointerException"이라고 적혀 있다. <code>Optional</code>이 null을 담지 못한다는 구조적 제약이 API 계약으로 드러난 예다.</p>
+<aside class="note"><code>isPresent()</code>로 확인한 뒤 <code>get()</code>으로 꺼내는 코드는 문법상 문제가 없지만 <code>if (x != null)</code>을 다른 글자로 쓴 것에 지나지 않는다. 검사를 빠뜨려도 컴파일러가 잡아 주지 않는다는 null의 약점도 그대로 남는다. <code>Optional</code>의 이점은 다음 절의 메서드들로 "검사와 사용을 한 번에" 할 때 나온다.</aside>
+
+<h3>Optional 값 처리: map, flatMap, filter, or, stream</h3>
+<p><code>Optional</code>의 진짜 쓰임새는 값을 꺼내지 않고 <b>안에 든 채로</b> 다루는 메서드들이다. 각 메서드의 실제 구현을 보면 규칙이 명확하다(JDK 21 소스에서 null 검사 주석만 줄였다).</p>
+<pre><code class="language-java">public <U> Optional<U> map(Function<? super T, ? extends U> mapper) {
+    Objects.requireNonNull(mapper);
+    if (isEmpty()) {
+        return empty();
+    } else {
+        return Optional.ofNullable(mapper.apply(value));
+    }
+}
+
+public <U> Optional<U> flatMap(Function<? super T, ? extends Optional<? extends U>> mapper) {
+    Objects.requireNonNull(mapper);
+    if (isEmpty()) {
+        return empty();
+    } else {
+        Optional<U> r = (Optional<U>) mapper.apply(value);
+        return Objects.requireNonNull(r);
+    }
+}
+
+public Optional<T> filter(Predicate<? super T> predicate) {
+    Objects.requireNonNull(predicate);
+    if (isEmpty()) {
+        return this;
+    } else {
+        return predicate.test(value) ? this : empty();
+    }
+}</code></pre>
+<p>세 메서드 모두 첫 번째 분기가 같다. <b>비어 있으면 함수를 호출하지 않고 빈 값을 그대로 돌려준다.</b> 이것이 "빈 값의 전파"다. 파이프라인 중간 어디에서든 값이 없어지면 그 뒤의 함수들은 한 번도 실행되지 않고 빈 값이 끝까지 흘러간다. null 검사 버전에서 <code>if</code>를 겹겹이 쓴 이유가 바로 이 동작이었는데, 그것이 메서드 안으로 들어간 것이다.</p>
+<p>두 번째 분기에는 미묘한 차이가 있다. <code>map</code>은 함수 결과를 <code>ofNullable</code>로 감싼다. 그래서 함수가 null을 돌려주면 예외 없이 빈 <code>Optional</code>이 된다. null을 돌려주는 기존 getter를 <code>map(Member::address)</code>처럼 그대로 이어 쓸 수 있는 이유가 이것이다. 반면 <code>flatMap</code>은 함수가 이미 <code>Optional</code>을 돌려준다고 가정하고 그 결과를 다시 감싸지 않는다. 함수가 <code>Optional</code> 대신 null을 돌려주면 <code>requireNonNull(r)</code>에서 NPE가 난다. <code>Optional</code>을 돌려주는 메서드가 null을 돌려주는 것은 계약 위반이기 때문이다. <code>filter</code>는 조건을 만족하면 <b>자기 자신</b>(<code>this</code>)을 돌려주므로 새 객체를 만들지 않는다.</p>
+<h4>map과 flatMap의 타입 차이</h4>
+<p>함수의 반환 타입이 이미 <code>Optional</code>인 경우 <code>map</code>을 쓰면 상자가 두 겹이 된다. <code>Member</code>에 <code>Optional<Address> findAddress()</code>라는 메서드가 있다고 하자. <code>member.map(Member::findAddress)</code>의 타입은 <code>Optional<Optional<Address>></code>이다. 이 상태로는 <code>.map(Address::city)</code>를 이어 쓸 수 없다. 바깥 상자 안에 든 것이 <code>Address</code>가 아니라 <code>Optional<Address></code>이기 때문이다. <code>flatMap(Member::findAddress)</code>는 함수가 돌려준 <code>Optional</code>을 감싸지 않고 그대로 결과로 쓰므로 타입이 <code>Optional<Address></code>로 평평하게 유지된다. 이름의 flat이 이 "한 겹 벗기기"를 뜻한다. 6회에서 본 <code>Stream.flatMap</code>이 "원소 하나를 스트림으로 바꾸고 그 스트림들을 이어 붙이는" 것과 같은 모양이다. <code>Optional</code>을 원소가 0개 또는 1개인 컬렉션으로 보면 두 <code>flatMap</code>은 같은 연산이다.</p>
+<h4>ifPresent, ifPresentOrElse, or, stream</h4>
+<p><code>ifPresent(Consumer)</code>는 값이 있을 때만 동작을 실행하고, Java 9에 추가된 <code>ifPresentOrElse(Consumer, Runnable)</code>는 없을 때 실행할 <code>Runnable</code>도 받는다. 둘 다 반환값이 없는 "끝내는" 연산이다. Java 9의 <code>or(Supplier<Optional>)</code>는 값이 있으면 자신을, 없으면 공급자가 만든 다른 <code>Optional</code>을 돌려준다. <code>orElseGet</code>이 "없으면 이 값"이라면 <code>or</code>는 "없으면 이 다른 후보를 찾아봐"이고, 결과가 여전히 <code>Optional</code>이라 파이프라인을 이어 갈 수 있다. 캐시를 먼저 보고 없으면 원본을 조회하는 식의 대체 경로를 표현할 때 쓴다. 이 공급자 역시 값이 없을 때만 호출된다.</p>
+<p>Java 9의 <code>stream()</code>은 값이 있으면 원소 하나짜리 스트림, 없으면 빈 스트림을 돌려준다. <code>Optional</code>을 원소 0~1개짜리 컬렉션으로 보는 관점을 API로 만든 것이다. 그래서 <code>Optional</code>이 섞인 스트림에서 값만 골라낼 때 <code>flatMap(Optional::stream)</code>을 쓴다.</p>
+<pre><code class="language-java">List<Integer> present = Stream.of(Optional.of(1), Optional.<Integer>empty(), Optional.of(3))
+        .flatMap(Optional::stream)
+        .toList();
+System.out.println(present);   // [1, 3]</code></pre>
+<p>세 <code>Optional</code> 중 비어 있는 것은 빈 스트림이 되어 이어 붙일 때 사라지고, 값이 있는 두 개만 남는다. <code>filter(Optional::isPresent).map(Optional::get)</code>으로 쓸 수도 있지만 <code>get()</code>을 피하고 한 단계로 끝나는 쪽이 의도를 더 잘 드러낸다.</p>
+<figure class="flow-figure"><figcaption>findMember(2).map(Member::address).map(Address::city).orElse("미등록")의 실행</figcaption><ol class="flow">
+<li><strong>findMember(2)</strong><span>Map에 회원 lee가 있다. <code>ofNullable(lee)</code> → 값이 있는 새 Optional A.</span></li>
+<li><strong>A.map(Member::address)</strong><span>A가 비어 있지 않으므로 <code>lee.address()</code> 호출 → null. <code>ofNullable(null)</code> → <code>EMPTY</code>.</span></li>
+<li><strong>EMPTY.map(Address::city)</strong><span><code>isEmpty()</code>가 참이므로 <code>Address::city</code>는 호출되지 않고 <code>empty()</code>, 즉 <code>EMPTY</code>를 그대로 돌려준다. null인 주소에 <code>city()</code>를 부르는 일이 구조적으로 일어나지 않는다.</span></li>
+<li><strong>EMPTY.orElse("미등록")</strong><span><code>value</code>가 null이므로 인자 "미등록"을 돌려준다.</span></li>
+</ol></figure>
+
+<x-visual id="java-adv3-08-map-chain" title="map 파이프라인에서 빈 값이 전파되는 두 갈래 길" kind="흐름도" ratio="16:9">
+<x-hint>값이 있는 경로는 함수를 차례로 통과하고, 어느 단계에서 null이 나오면 빈 경로로 갈아탄 뒤 남은 함수를 건너뛰어 마지막 orElse까지 가는 모습.</x-hint>
+<x-prompt>가로로 긴 두 줄의 선로 그림. 위 선로는 초록색 "값 있음", 아래 선로는 회색 "비어 있음"이다. 위 선로에 왼쪽부터 네 개의 역 상자 "findMember", "map(address)", "map(city)", "orElse"가 놓인다. "map(address)" 역에서 아래 선로로 내려가는 갈림길 화살표가 있고 그 옆에 라벨 "결과가 null"이 붙는다. 아래 선로에서는 "map(city)" 아래를 지나는 부분에 "함수 호출 안 함"이라는 라벨이 붙은 점선 우회가 있다. 두 선로가 마지막 "orElse" 역에서 만나고, 위 선로 끝에는 "값 반환", 아래 선로 끝에는 "기본값 반환" 라벨이 붙는다. 평면 인포그래픽, 흰 배경.</x-prompt>
+<x-caption>map과 filter는 비어 있으면 함수를 부르지 않고 빈 값을 그대로 넘긴다. 빈 값은 한 번 생기면 끝까지 흘러간다.</x-caption>
+</x-visual>
+
+<h3>즉시 평가와 지연 평가 1: 자바는 인자를 먼저 계산한다</h3>
+<p>이제 이 회차의 핵심인 평가 시점 문제로 들어간다. 먼저 언어 규칙부터 확인하자. JLS §15.7.4는 "메서드나 생성자 호출에서 각 인자 식은 그 오른쪽 인자 식의 어떤 부분보다도 먼저 완전히 평가되는 것처럼 보인다"고 정한다. 그리고 §15.12.4는 메서드 호출의 실행 단계를 순서대로 나열한다. 대상 참조 계산(§15.12.4.1), <b>인자 평가</b>(§15.12.4.2), 접근성 확인(§15.12.4.3), 호출할 메서드 찾기(§15.12.4.4), 그리고 마지막으로 프레임을 만들고 제어를 넘기기(§15.12.4.5)다. 호출된 메서드의 첫 줄이 실행되기 전에 인자는 이미 모두 값이 되어 있다.</p>
+<p>이렇게 인자를 먼저 값으로 만든 다음 함수에 넘기는 방식을 <b>즉시 평가</b> 또는 엄격한 평가(strict evaluation)라고 한다. 자바의 인자 전달은 값에 의한 호출(call by value)이므로, 메서드가 받는 것은 식이 아니라 식을 계산한 결과값(기본형 값 또는 참조)이다. 메서드는 그 값이 어떤 계산으로 만들어졌는지 모르고, 계산을 취소하거나 미룰 수도 없다. 이미 끝난 일이기 때문이다.</p>
+<p>이 규칙에는 예외가 정확히 세 개 있다. JLS §15.7.2는 "모든 연산자의 피연산자는 연산 자체가 수행되기 전에 완전히 평가된다"고 정하면서 조건 연산자 <code>&&</code>, <code>||</code>, <code>? :</code>만 예외로 둔다. §15.23은 <code>&&</code>가 "왼쪽 피연산자의 값이 true일 때만 오른쪽 피연산자를 평가한다"고 적는다. <code>member != null && member.isActive()</code>가 안전한 이유가 이것이다. 즉 자바의 연산자 가운데 "필요할 때만 계산"하는 것은 이 세 개뿐이고, 메서드 호출에는 그런 장치가 없다. 메서드로 지연 평가를 흉내 내려면 다른 방법이 필요하다.</p>
+<h4>바이트코드로 보는 순서</h4>
+<p><code>orElse</code>에 메서드 호출 결과를 넘기는 코드를 컴파일해 <code>javap -c</code>로 보면 규칙이 명령어 순서로 드러난다.</p>
+<pre><code class="language-java">String a = present.orElse(loadDefault());</code></pre>
+<pre data-label="javap -c 발췌"><code class="language-text">18: aload_1                // present (대상 참조)
+19: invokestatic  #37      // Method loadDefault:()Ljava/lang/String;
+22: invokevirtual #43      // Method java/util/Optional.orElse:(Ljava/lang/Object;)Ljava/lang/Object;
+25: checkcast     #47      // class java/lang/String</code></pre>
+<p>대상 참조 <code>present</code>를 피연산자 스택에 올리고(18), <code>loadDefault()</code>를 <b>먼저 호출해</b> 그 결과를 스택에 올린 다음(19), 그 둘을 가지고 <code>orElse</code>를 호출한다(22). <code>orElse</code>의 본문이 <code>value != null ? value : other</code>를 계산하는 시점에는 <code>loadDefault()</code>가 이미 끝나 있다. <code>present</code>에 값이 있어서 <code>other</code>를 쓰지 않더라도 그렇다. 반환 타입이 <code>Object</code>라서 뒤에 <code>checkcast</code>가 붙는 것은 제네릭이 소거되었기 때문이다.</p>
+<h4>대상이 null이어도 인자는 평가된다</h4>
+<p>단계 순서에서 나오는 경계 사례 하나를 보자. 대상 참조가 null인지는 §15.12.4.4(호출할 메서드 찾기)에서 확인하는데, 인자 평가는 그보다 앞선 §15.12.4.2다. 따라서 <code>null</code>인 참조에 인자가 있는 메서드를 호출하면 <b>인자가 먼저 평가된 뒤</b> NPE가 난다.</p>
+<pre><code class="language-java">public class NullTarget {
+    static String arg() { System.out.println("인자 평가"); return "x"; }
+
+    public static void main(String[] args) {
+        String target = null;
+        try {
+            target.concat(arg());
+        } catch (NullPointerException e) {
+            System.out.println("NPE: " + e.getMessage());
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">인자 평가
+NPE: Cannot invoke "String.concat(String)" because "<local1>" is null</code></pre>
+<p>바이트코드로 보면 당연한 결과다. <code>aload_1</code>로 null 참조를 스택에 올리고, <code>invokestatic arg</code>로 인자를 계산한 다음, <code>invokevirtual concat</code>을 실행하는 순간 JVM이 대상이 null임을 발견한다. 인자 계산이 부작용(로그, DB 쓰기, 카운터 증가)을 가진다면, 호출이 실패해도 그 부작용은 이미 일어난 뒤다. 즉시 평가는 "결과가 쓰이지 않아도 계산은 일어난다"는 뜻이고, 이 성질이 다음 두 절의 모든 문제의 출발점이다.</p>
+<aside class="note">위 실행 결과의 <code><local1></code>은 실제 출력 문자열이다. <code>-g</code> 없이 컴파일해 지역 변수 이름이 클래스 파일에 없기 때문에 슬롯 번호로 나왔다.</aside>
+
+<h3>즉시 평가와 지연 평가 2: 계산을 객체로 감싸 미룬다</h3>
+<p>즉시 평가가 실제로 비용이 되는 대표적인 장면은 로그다. 디버그 로그는 운영 환경에서 보통 꺼져 있다. 그런데 로그 메시지를 만드는 데 비싼 계산(큰 객체의 덤프, 문자열 연결, 직렬화)이 들어가면, 로그가 꺼져 있어도 그 계산은 인자 평가 단계에서 이미 일어난다. 메서드 안에서 "로그가 꺼져 있으니 출력하지 않겠다"고 판단하는 것은 인자가 다 만들어진 뒤다.</p>
+<pre><code class="language-java">import java.util.function.Supplier;
+
+public class LazyLog {
+    static boolean debugEnabled = false;
+
+    static void debug(String message) {
+        if (debugEnabled) {
+            System.out.println("[DEBUG] " + message);
+        }
+    }
+
+    static void debug(Supplier<String> messageSupplier) {
+        if (debugEnabled) {
+            System.out.println("[DEBUG] " + messageSupplier.get());
+        }
+    }
+
+    static String dump() {
+        System.out.println("  dump() 실행: 큰 문자열을 만든다");
+        return "상태=" + "x".repeat(10);
+    }
+
+    public static void main(String[] args) {
+        System.out.println("1) 값 전달, debug 꺼짐");
+        debug("현재 " + dump());
+
+        System.out.println("2) Supplier 전달, debug 꺼짐");
+        debug(() -> "현재 " + dump());
+
+        debugEnabled = true;
+        System.out.println("3) Supplier 전달, debug 켜짐");
+        debug(() -> "현재 " + dump());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">1) 값 전달, debug 꺼짐
+  dump() 실행: 큰 문자열을 만든다
+2) Supplier 전달, debug 꺼짐
+3) Supplier 전달, debug 켜짐
+  dump() 실행: 큰 문자열을 만든다
+[DEBUG] 현재 상태=xxxxxxxxxx</code></pre>
+<p>1번에서는 로그가 꺼져 있는데도 <code>dump()</code>가 실행된다. <code>"현재 " + dump()</code>라는 인자 식이 <code>debug</code> 호출 전에 평가되기 때문이다. 2번에서는 같은 식이 람다 본문 안에 들어가 있다. 이때 인자 평가 단계에서 계산되는 것은 <b>람다 식</b>이고, 람다 식을 평가한 결과는 <code>Supplier</code>를 구현한 객체의 참조다(1회, 4회에서 본 대로 <code>invokedynamic</code>이 이 객체를 만들어 준다). 본문 <code>"현재 " + dump()</code>는 그 객체의 <code>get()</code>이 호출될 때에야 실행된다. <code>debug</code>는 로그가 꺼져 있으면 <code>get()</code>을 부르지 않으므로 <code>dump()</code>는 한 번도 실행되지 않는다. 3번처럼 로그가 켜져 있을 때만 실행된다.</p>
+<p>정리하면, 자바에서 지연 평가를 얻는 방법은 <b>"값" 대신 "값을 만드는 코드"를 넘기는 것</b>이다. 언어가 인자를 미루어 주지 않으므로, 미루고 싶은 계산을 함수형 인터페이스의 메서드 본문으로 옮기고 그 객체를 넘긴다. 받는 쪽이 필요하다고 판단할 때 메서드를 호출해 계산을 실행한다. 2회에서 본 <code>Supplier<T></code>(인자 없이 값 하나를 돌려주는 함수)가 이 용도에 정확히 맞는 모양이다.</p>
+<h4>if 검사와 비교하기</h4>
+<p>지연 평가 없이 같은 효과를 내는 고전적인 방법은 호출하는 쪽에서 먼저 검사하는 것이다. SLF4J 같은 로깅 라이브러리를 쓰는 코드에서 <code>if (log.isDebugEnabled()) { log.debug(...); }</code> 같은 모양을 흔히 본다. 이 방법도 정확하지만 로그를 남기는 곳마다 같은 검사를 반복해야 하고, 검사 조건과 실제 로그 레벨이 어긋나는 실수(검사는 debug, 출력은 info)도 생길 수 있다. Supplier를 받는 API는 "언제 계산할지"의 판단을 그 판단에 필요한 정보를 가진 쪽(로거)으로 옮긴다.</p>
+<p>SLF4J의 <code>log.debug("상태 {}", state)</code>처럼 자리표시자(<code>{}</code>)를 쓰는 방식도 함께 짚어 두자. 이 방식은 로그가 꺼져 있을 때 <b>문자열 조립</b>을 건너뛰게 해 준다. 하지만 <code>state</code> 자리에 <code>dump()</code> 같은 메서드 호출을 쓰면 그 호출은 여전히 인자 평가 단계에서 일어난다. 자리표시자는 메시지 포맷팅을 미룰 뿐, 자바의 인자 평가 규칙을 바꾸지 못한다.</p>
+<h4>JDK 안의 지연 평가 API</h4>
+<p>자바 8은 람다와 함께 표준 라이브러리 곳곳에 Supplier를 받는 오버로드를 추가했다. 몇 가지를 JDK 21 소스로 확인해 보자.</p>
+<ul>
+<li><code>java.util.logging.Logger.log(Level, Supplier<String>)</code>(@since 1.8): 본문은 <code>if (!isLoggable(level)) return;</code>으로 시작하고, 통과한 경우에만 <code>msgSupplier.get()</code>으로 메시지를 만든다. Javadoc도 "로그 레벨상 실제로 기록될 때만 메시지를 만든다"고 설명한다. <code>fine(Supplier)</code>, <code>info(Supplier)</code> 같은 레벨별 메서드도 있다.</li>
+<li><code>Objects.requireNonNull(T obj, Supplier<String> messageSupplier)</code>(@since 1.8): 객체가 null일 때만 메시지 공급자를 호출한다. 이 메서드의 Javadoc에는 흥미로운 경고가 붙어 있다. "메시지 공급자를 만드는 비용이 문자열 메시지를 직접 만드는 비용보다 작은지 주의하라." 람다 객체를 만드는 것도 공짜가 아니므로, 메시지가 상수 문자열이라면 문자열 버전이 낫다는 뜻이다.</li>
+<li><code>Optional.orElseGet(Supplier)</code>, <code>Optional.or(Supplier)</code>, <code>Optional.orElseThrow(Supplier)</code>: 비어 있을 때만 공급자를 호출한다.</li>
+<li><code>Map.computeIfAbsent(key, Function)</code>: 키에 값이 없을 때만(키가 없거나 null에 매핑되어 있을 때) 값을 만드는 함수를 호출한다. "없으면 만들어 넣는다" 패턴의 표준형이다.</li>
+</ul>
+<p>공통점은 분명하다. 계산 결과가 쓰일지 말지를 <b>호출받는 쪽만 알 때</b>, 호출하는 쪽은 결과 대신 계산을 넘긴다. 로그가 켜져 있는지는 로거가 알고, 값이 비어 있는지는 <code>Optional</code>이 알고, 키가 있는지는 맵이 안다.</p>
+
+<x-visual id="java-adv3-08-eager-vs-lazy" title="즉시 평가와 지연 평가의 호출 순서 비교" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>값을 넘기면 호출 전에 비싼 계산이 실행되고, Supplier를 넘기면 호출받은 쪽이 필요하다고 판단한 경우에만 계산이 실행된다는 시간 순서를 비교한다.</x-hint>
+<x-prompt>좌우로 나뉜 두 개의 시퀀스 다이어그램. 각 다이어그램에는 세 개의 세로 생명선 "호출자", "debug 메서드", "dump()"가 있다. 왼쪽 제목은 "값 전달(즉시 평가)": 호출자에서 먼저 "dump()"로 화살표 "1. 인자 계산"이 가고 돌아온 뒤, 호출자에서 "debug 메서드"로 화살표 "2. 호출"이 가며, debug 메서드 안에 "로그 꺼짐 → 버림" 상자가 있다. 오른쪽 제목은 "Supplier 전달(지연 평가)": 호출자에서 "debug 메서드"로 화살표 "1. 람다 객체 전달"이 가고, debug 메서드 안에 "로그 켜짐?" 마름모가 있으며, "예"일 때만 debug 메서드에서 "dump()"로 화살표 "2. get() 호출"이 간다. "아니오" 쪽에는 "dump() 실행 안 됨" 라벨. 깔끔한 UML 스타일, 흰 배경.</x-prompt>
+<x-caption>즉시 평가에서는 계산이 호출보다 먼저 일어난다. 지연 평가에서는 계산을 쓸지 아는 쪽이 계산을 실행한다.</x-caption>
+</x-visual>
+
+<h3>즉시 평가와 지연 평가 3: 무엇이 미뤄지고 무엇이 미뤄지지 않는가</h3>
+<p>Supplier로 얻는 지연 평가를 정확히 이해하려면 "람다 식을 평가하는 시점"과 "람다 본문을 실행하는 시점"을 구분해야 한다. 람다 식 자체는 즉시 평가된다. 즉 그 줄에 도달하면 함수형 인터페이스 구현 객체가 만들어지고, 람다가 붙잡는(capture) 지역 변수의 값도 <b>그 순간</b> 객체 안에 복사된다(4회의 변수 캡처). 미뤄지는 것은 본문의 실행뿐이다. 본문이 읽는 필드나 정적 변수는 본문이 실행되는 순간의 값이다.</p>
+<pre><code class="language-java">import java.util.function.Supplier;
+
+public class CallByName {
+    static int counter = 0;
+
+    static int next() {
+        counter++;
+        System.out.println("  next() 실행, counter=" + counter);
+        return counter;
+    }
+
+    public static void main(String[] args) {
+        Supplier<Integer> s = () -> next();
+        System.out.println("Supplier 생성 직후 counter=" + counter);
+        int a = s.get();
+        int b = s.get();
+        System.out.println("a=" + a + ", b=" + b);
+
+        int base = 10;
+        Supplier<Integer> plusBase = () -> base + counter;
+        counter = 100;
+        System.out.println("plusBase.get()=" + plusBase.get());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Supplier 생성 직후 counter=0
+  next() 실행, counter=1
+  next() 실행, counter=2
+a=1, b=2
+plusBase.get()=110</code></pre>
+<p>한 줄씩 추적해 보자. <code>s</code>를 만든 직후 <code>counter</code>는 0이다. 람다 객체만 생겼고 <code>next()</code>는 실행되지 않았다. <code>s.get()</code>을 두 번 부르면 <code>next()</code>도 두 번 실행되어 <code>a</code>는 1, <code>b</code>는 2가 된다. <b>Supplier는 결과를 기억하지 않는다.</b> 부를 때마다 본문을 처음부터 다시 실행한다. 마지막 부분에서 <code>base</code>는 지역 변수이므로 람다 객체가 만들어질 때 값 10이 복사되고, <code>counter</code>는 정적 필드이므로 <code>get()</code>이 실행되는 순간의 값 100을 읽는다. 결과는 110이다.</p>
+<p>프로그래밍 언어 이론에서는 이 차이를 이름으로 구분한다. 인자를 계산하지 않고 "계산 방법"으로 넘겨 쓸 때마다 다시 계산하는 방식을 <b>이름에 의한 호출(call by name)</b>, 처음 필요할 때 한 번 계산하고 그 결과를 기억해 다시 쓰는 방식을 <b>필요에 의한 호출(call by need)</b>이라고 한다. 자바의 Supplier가 기본으로 주는 것은 전자다. 같은 공급자를 두 번 호출하는 API에 비싼 계산이나 부작용이 있는 계산을 넘기면 두 번 실행된다. <code>Optional</code>의 메서드들은 공급자를 많아야 한 번만 호출하므로 이 문제가 없지만, 직접 Supplier를 받는 API를 만든다면 "몇 번 호출하는가"도 계약에 적어야 한다.</p>
+<p>결과를 기억하는 지연 값(memoization)이 필요하면 직접 만들어야 한다. 단일 스레드라면 필드 하나에 결과를 저장해 두면 되지만, 여러 스레드가 동시에 처음 호출할 수 있다면 고급 1편에서 본 가시성과 원자성 문제가 그대로 생긴다(두 스레드가 모두 계산을 실행하거나, 덜 초기화된 값을 보는 문제). 지연 평가는 "언제 실행되는가"를 호출자의 코드 위치에서 떼어 내는 일이므로, 실행 시점이 어느 스레드에서 오는지도 함께 따져야 한다.</p>
+<h4>지연 평가가 이득이 아닌 경우</h4>
+<p>지연 평가는 "계산을 건너뛸 가능성"과 "계산 비용"이 모두 클 때 이득이다. 기본값이 상수 문자열이나 이미 계산된 지역 변수라면, 그것을 람다로 감싸 봐야 아낄 계산이 없다. 오히려 람다가 지역 변수를 붙잡으면 호출할 때마다 람다 객체가 새로 만들어질 수 있다. 4회에서 본 대로 HotSpot에서 아무것도 붙잡지 않는 람다는 같은 객체를 재사용하지만, 값을 붙잡는 람다는 평가될 때마다 그 값을 담은 새 객체가 필요하다. <code>Objects.requireNonNull</code>의 Javadoc 경고가 바로 이 점을 말한다. 그리고 이 회차 뒤쪽의 측정에서 보듯 JIT가 그런 작은 객체를 지워 줄 때도 있지만, 그것은 보장이 아니라 최적화다.</p>
+<p>스트림과의 관계도 정리해 두자. 5회에서 본 스트림의 중간 연산(<code>filter</code>, <code>map</code>)은 최종 연산이 호출될 때까지 실행되지 않고, <code>findFirst</code> 같은 단락(short-circuit) 연산은 필요한 원소만 처리하고 멈춘다. 이것도 같은 원리다. 중간 연산에 넘긴 람다는 "나중에 실행할 계산"으로 파이프라인 객체에 저장될 뿐이고, 원소를 실제로 끌어오는 최종 연산이 그 계산들을 필요한 만큼만 실행한다. 반면 <code>Optional</code>의 <code>map</code>과 <code>filter</code>는 <b>즉시</b> 실행된다. 위의 소스에서 보듯 <code>map</code>은 호출되는 순간 함수를 적용해 새 <code>Optional</code>을 돌려준다. 이름이 같다고 실행 모델까지 같은 것은 아니다. <code>Optional</code>에서 지연되는 것은 <code>orElseGet</code>·<code>or</code>·<code>orElseThrow</code>에 넘긴 공급자뿐이다.</p>
+
+<h3>필요에 의한 호출을 JVM이 해 주는 곳: 클래스 초기화</h3>
+<p>앞 절에서 Supplier는 이름에 의한 호출이고, 결과를 기억하는 필요에 의한 호출은 직접 만들어야 하며 여러 스레드가 얽히면 가시성과 원자성 문제가 생긴다고 했다. 그런데 자바에는 "처음 필요할 때 딱 한 번, 스레드 안전하게 계산한다"를 언어 명세와 JVM이 함께 보장하는 장치가 이미 있다. 클래스 초기화다. 정적 필드의 초기화 식과 <code>static</code> 블록은 클래스가 로드될 때가 아니라 <b>초기화될 때</b> 실행되고, 언제 초기화되는지는 JLS §12.4.1이 정한다. 클래스 T는 다음 중 하나가 처음 일어나기 직전에 초기화된다. T의 인스턴스 생성, T가 선언한 정적 메서드 호출, T가 선언한 정적 필드에 대입, 그리고 T가 선언한 정적 필드를 사용하는데 그 필드가 상수 변수(constant variable)가 아닐 때다. 같은 절은 일부 리플렉션 메서드도 초기화를 일으킨다고 덧붙인 뒤 "그 밖의 상황에서는 초기화되지 않는다"고 못 박는다.</p>
+<p>이 규칙으로 "처음 읽을 때 계산되는 값"을 만들 수 있다. 값을 담을 정적 필드를 작은 중첩 클래스 하나에만 두는 홀더 클래스 관용구(holder class idiom)다. 아래 프로그램은 네 스레드가 동시에 그 값을 처음 읽게 만든다.</p>
+<pre><code class="language-java">import java.util.concurrent.CountDownLatch;
+
+public class LazyHolder {
+    static String expensive() {
+        System.out.println("  expensive() 실행: " + Thread.currentThread().getName());
+        try { Thread.sleep(200); } catch (InterruptedException e) { throw new RuntimeException(e); }
+        return "설정값";
+    }
+
+    static class Holder {
+        static final String VALUE = expensive();   // 상수 변수가 아니다(메서드 호출 결과)
+    }
+
+    static String value() {
+        return Holder.VALUE;                        // 처음 읽을 때 Holder가 초기화된다
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("main 시작");
+        CountDownLatch start = new CountDownLatch(1);
+        Thread[] ts = new Thread[4];
+        for (int i = 0; i < ts.length; i++) {
+            ts[i] = new Thread(() -> {
+                try { start.await(); } catch (InterruptedException e) { return; }
+                System.out.println(Thread.currentThread().getName() + " -> " + value());
+            }, "T" + i);
+            ts[i].start();
+        }
+        System.out.println("스레드 시작, 아직 Holder 미초기화");
+        start.countDown();
+        for (Thread t : ts) t.join();
+    }
+}</code></pre>
+<p><code>VALUE</code>가 <code>"설정값"</code> 같은 상수 식으로 초기화되었다면 상수 변수가 되어, javac가 읽는 쪽에 값을 그대로 박아 넣으므로 <code>Holder</code>는 초기화조차 되지 않는다. 메서드 호출 결과이기 때문에 §12.4.1의 마지막 조건에 걸린다. <code>-Xlog:class+init=debug</code>를 붙여 실행하면 JVM이 초기화를 어떻게 처리하는지가 로그로 나온다(아래는 <code>Holder</code>와 관련된 줄과 프로그램 출력만 추린 것이다. 초기화를 맡는 스레드, 기다리는 순서, 시각은 실행마다 다르다).</p>
+<pre data-label="java -Xlog:class+init=debug LazyHolder 발췌 (macOS, Temurin 21.0.13)"><code class="language-text">main 시작
+스레드 시작, 아직 Holder 미초기화
+[0.030s][debug][class,init] Thread "T0" is initializing LazyHolder$Holder
+[0.030s][info ][class,init] 427 Initializing 'LazyHolder$Holder' (0x0000007801000c30) by thread "T0"
+[0.030s][debug][class,init] Thread "T2" waiting for initialization of LazyHolder$Holder by thread "T0"
+[0.030s][debug][class,init] Thread "T3" waiting for initialization of LazyHolder$Holder by thread "T0"
+[0.030s][debug][class,init] Thread "T1" waiting for initialization of LazyHolder$Holder by thread "T0"
+  expensive() 실행: T0
+[0.234s][debug][class,init] Thread "T0" recursively initializing LazyHolder$Holder
+[0.234s][debug][class,init] Thread "T2" found LazyHolder$Holder already initialized
+[0.234s][debug][class,init] Thread "T1" found LazyHolder$Holder already initialized
+[0.234s][debug][class,init] Thread "T3" found LazyHolder$Holder already initialized
+T0 -> 설정값
+T3 -> 설정값
+T2 -> 설정값
+T1 -> 설정값</code></pre>
+<p><code>expensive()</code>는 네 스레드 가운데 하나에서 한 번만 실행되었고, 나머지 셋은 그 결과를 받았다. 로그를 HotSpot 소스와 맞춰 보자. 초기화는 <code>instanceKlass.cpp</code>의 <code>InstanceKlass::initialize_impl</code>이 하고, 이 함수에는 JLS §12.4.2 절차의 번호가 "Step 1"부터 주석으로 달려 있다. 1단계에서 클래스마다 하나인 초기화 락(<code>init_lock()</code>)을 잡는다. 2단계에서 다른 스레드가 초기화 중이면 <code>wait_uninterruptibly</code>로 기다린다. T1~T3의 "waiting for initialization" 줄이 이것이다. 3단계는 초기화 중인 스레드가 자기 자신이면 재귀 요청으로 보고 그냥 돌아간다. T0의 "recursively initializing" 줄은 <code><clinit></code> 안의 <code>putstatic VALUE</code>가 필드 참조를 해석하면서(<code>linkResolver.cpp</code>의 <code>LinkResolver::resolve_field</code>는 정적 필드면 그 클래스의 <code>initialize</code>를 부른다) 같은 클래스의 초기화를 다시 요청한 흔적이다. 4단계는 이미 초기화되었으면 그냥 돌아가는 것으로, 기다리던 세 스레드가 깨어나 찍은 "already initialized" 줄이다. 6단계에서는 상태를 <code>being_initialized</code>로, 초기화 스레드를 자신으로 기록하고 락을 놓은 뒤 초기화 식을 실행한다. 끝나면 <code>set_initialization_state_and_notify</code>가 락을 다시 잡고 상태를 바꾼 다음 <code>notify_all</code>로 기다리던 스레드를 깨운다. 두 타임스탬프의 차이 약 200밀리초는 세 스레드가 <code>expensive()</code>의 <code>sleep</code> 동안 막혀 있었다는 뜻이다.</p>
+<p>가시성은 명세가 보장한다. JLS §12.4.2는 초기화가 이미 끝났다고 판단할 수 있으면 1단계의 락 획득을 생략하는 최적화를 허용하되, 락을 잡았다면 존재했을 모든 happens-before 관계가 그대로 유지되어야 한다는 조건을 단다. 그래서 초기화가 끝난 클래스를 본 스레드는 초기화 식이 쓴 값을 온전히 본다. 홀더 관용구에 <code>volatile</code>도 <code>synchronized</code>도 필요 없는 이유다. 초기화가 끝난 뒤의 비용도 거의 없다. OpenJDK 21 HotSpot의 <code>ciField.cpp</code>를 보면 C2는 정적 final 필드를 상수로 취급하고(<code>System.in</code>·<code>out</code>·<code>err</code> 셋만 예외), <code>ciField::constant_value()</code>는 그 필드를 선언한 클래스가 이미 초기화된 경우에만 값을 돌려준다. 즉 컴파일 시점에 <code>Holder</code>가 초기화되어 있으면 <code>Holder.VALUE</code>를 읽는 컴파일된 코드는 그 문자열 객체를 상수로 쓴다.</p>
+<p><code>Optional</code>도 같은 장치 위에 서 있다. 앞에서 본 공유 객체 <code>EMPTY</code>가 언제 만들어지는지 정적 초기화 메서드를 열어 보면 알 수 있다.</p>
+<pre data-label="javap -c -p java.util.Optional 발췌"><code class="language-text">  static {};
+    Code:
+       0: new           #2                  // class java/util/Optional
+       3: dup
+       4: aconst_null
+       5: invokespecial #23                 // Method "<init>":(Ljava/lang/Object;)V
+       8: putstatic     #1                  // Field EMPTY:Ljava/util/Optional;
+      11: return</code></pre>
+<p><code>new Optional(null)</code>을 만들어 <code>EMPTY</code>에 넣는 것이 전부다. 이 코드는 <code>Optional</code> 클래스가 초기화될 때 한 번 실행되고, <code>EMPTY</code>는 정적 final 필드이므로 그 뒤 <code>empty()</code>가 돌려주는 값은 위 규칙에 따라 C2가 상수로 다룰 수 있다.</p>
+<h4>한 번뿐인 계산: 실패도 기억된다</h4>
+<p>클래스 초기화는 결과뿐 아니라 실패도 기억한다. JLS §12.4.2에 따르면 초기화 식이 예외로 끝나면 클래스는 오류 상태(erroneous)로 표시되고, 이후의 초기화 요청은 5단계에서 <code>NoClassDefFoundError</code>를 받는다. 다시 시도하지 않는다.</p>
+<pre><code class="language-java">public class Poisoned {
+    static int attempts = 0;
+
+    static String load() {
+        attempts++;
+        throw new IllegalStateException("설정 서버 연결 실패 #" + attempts);
+    }
+
+    static class Holder {
+        static final String VALUE = load();
+    }
+
+    public static void main(String[] args) {
+        for (int i = 1; i <= 2; i++) {
+            try {
+                System.out.println(Holder.VALUE);
+            } catch (Throwable t) {
+                System.out.println(i + "번째: " + t + " / cause=" + t.getCause());
+            }
+        }
+        System.out.println("load() 호출 횟수 = " + attempts);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (Temurin 21.0.13)"><code class="language-text">1번째: java.lang.ExceptionInInitializerError / cause=java.lang.IllegalStateException: 설정 서버 연결 실패 #1
+2번째: java.lang.NoClassDefFoundError: Could not initialize class Poisoned$Holder / cause=java.lang.ExceptionInInitializerError: Exception java.lang.IllegalStateException: 설정 서버 연결 실패 #1 [in thread "main"]
+load() 호출 횟수 = 1</code></pre>
+<p>첫 접근은 원래 예외를 감싼 <code>ExceptionInInitializerError</code>를 받는다. §12.4.2는 초기화 식이 <code>Error</code>가 아닌 예외로 끝나면 그것을 <code>ExceptionInInitializerError</code>로 감싸라고 정한다. 두 번째 접근은 <code>load()</code>를 다시 부르지 않은 채 <code>NoClassDefFoundError: Could not initialize class Poisoned$Holder</code>를 받는다. JDK 21에서는 이 오류의 원인(cause)에 처음 실패의 정보가 붙는다(<code>initialize_impl</code>의 5단계가 <code>get_initialization_error</code>로 꺼낸 값을 원인으로 넣는다). 이 상태는 클래스가 언로드되기 전까지 이어진다. 그래서 홀더 관용구는 실패할 일이 없는 계산(무거운 상수 테이블, 정규식 컴파일)에는 알맞지만, 네트워크 조회처럼 일시적으로 실패하고 다시 시도해야 하는 값에는 맞지 않는다. 또 정적 필드이므로 클래스당 값 하나만 만든다. 키마다 한 번씩 계산해 기억해야 한다면 <code>ConcurrentHashMap.computeIfAbsent</code>를 쓸 수 있다. 그 Javadoc은 전체 호출이 원자적으로 수행되고, 키가 없을 때 넘긴 함수가 이 메서드 호출당 정확히 한 번 호출된다고 적는다. 앞에서 본 <code>Map.computeIfAbsent</code>와 같은 "없을 때만 계산" 계약에 동시성 보장을 더한 형태다.</p>
+
+<h3>orElse() vs orElseGet()</h3>
+<p>이제 두 메서드의 차이를 정확히 말할 수 있다. 구현은 한 줄씩이다.</p>
+<pre><code class="language-java">public T orElse(T other) {
+    return value != null ? value : other;
+}
+
+public T orElseGet(Supplier<? extends T> supplier) {
+    return value != null ? value : supplier.get();
+}</code></pre>
+<p>두 메서드의 본문은 모두 값이 있으면 <code>other</code>나 <code>supplier.get()</code>을 쓰지 않는다. 조건 연산자 <code>? :</code>는 선택된 쪽만 평가하므로 <code>orElseGet</code>에서 값이 있으면 <code>supplier.get()</code>은 호출되지 않는다. 차이는 메서드 <b>안</b>이 아니라 <b>밖</b>, 곧 인자를 만드는 단계에 있다. <code>orElse</code>의 인자 <code>other</code>는 이미 계산된 값이므로 그 값을 만드는 데 든 비용은 메서드에 들어오기 전에 치렀다. <code>orElseGet</code>의 인자는 계산을 담은 객체이므로 비용은 <code>get()</code>이 호출될 때만 치른다.</p>
+<pre><code class="language-java">import java.util.Optional;
+
+public class EvalOrder {
+    static String loadDefault() {
+        System.out.println("  loadDefault() 실행");
+        return "기본값";
+    }
+
+    public static void main(String[] args) {
+        Optional<String> present = Optional.of("찾은 값");
+        Optional<String> empty = Optional.empty();
+
+        System.out.println("[1] present.orElse");
+        String a = present.orElse(loadDefault());
+        System.out.println("  결과 = " + a);
+
+        System.out.println("[2] present.orElseGet");
+        String b = present.orElseGet(() -> loadDefault());
+        System.out.println("  결과 = " + b);
+
+        System.out.println("[3] empty.orElse");
+        String c = empty.orElse(loadDefault());
+        System.out.println("  결과 = " + c);
+
+        System.out.println("[4] empty.orElseGet");
+        String d = empty.orElseGet(EvalOrder::loadDefault);
+        System.out.println("  결과 = " + d);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[1] present.orElse
+  loadDefault() 실행
+  결과 = 찾은 값
+[2] present.orElseGet
+  결과 = 찾은 값
+[3] empty.orElse
+  loadDefault() 실행
+  결과 = 기본값
+[4] empty.orElseGet
+  loadDefault() 실행
+  결과 = 기본값</code></pre>
+<p>네 경우 중 결과가 다른 것은 없다. 다른 것은 <code>loadDefault()</code>가 실행되었는가 하나다. [1]에서는 값이 있어 기본값이 버려지는데도 <code>loadDefault()</code>가 실행되었다. [2]에서만 실행되지 않았다. 비어 있는 [3]과 [4]에서는 어차피 기본값이 필요하므로 둘 다 실행된다. 즉 <b>값이 있을 때</b>만 두 메서드의 동작이 갈린다.</p>
+<p>[2]를 바이트코드로 보면 [1]과의 차이가 명령어 하나로 드러난다.</p>
+<pre data-label="javap -c 발췌 ([2] 부분)"><code class="language-text">49: aload_1
+50: invokedynamic #55,  0   // InvokeDynamic #1:get:()Ljava/util/function/Supplier;
+55: invokevirtual #59       // Method java/util/Optional.orElseGet:(Ljava/util/function/Supplier;)Ljava/lang/Object;</code></pre>
+<p>[1]의 <code>invokestatic loadDefault</code> 자리에 <code>invokedynamic</code>이 있다. 이 명령은 <code>loadDefault</code>를 실행하지 않고 <code>Supplier</code> 객체를 만들어 스택에 올릴 뿐이다. 람다 본문은 javac가 만든 <code>private static String lambda$main$0()</code> 메서드로 따로 컴파일되어 있고(내용은 <code>invokestatic loadDefault</code> 한 줄), 이 메서드는 <code>orElseGet</code> 안에서 <code>supplier.get()</code>이 호출될 때만 실행된다. 이 람다는 아무것도 붙잡지 않으므로 HotSpot에서는 같은 <code>Supplier</code> 객체가 재사용된다. [4]의 메서드 참조 <code>EvalOrder::loadDefault</code>도 같은 구조다.</p>
+<h4>부작용이 있으면 버그가 된다</h4>
+<p>[1]이 단지 "조금 느린" 정도라면 큰 문제가 아니다. 기본값을 만드는 계산에 <b>부작용</b>이 있으면 이야기가 달라진다. 다음은 스프링 데이터 JPA의 <code>findById</code>(반환 타입이 <code>Optional<T></code>)를 쓰는 서비스에서 흔히 보는 형태를 단순화한 것이다.</p>
+<pre><code class="language-java">// 회원이 없으면 기본 회원을 만들어 저장하고 돌려주려는 의도
+Member member = memberRepository.findById(id)
+        .orElse(createAndSaveGuest(id));     // 버그: 회원이 있어도 항상 실행된다
+
+Member fixed = memberRepository.findById(id)
+        .orElseGet(() -> createAndSaveGuest(id));   // 없을 때만 실행된다</code></pre>
+<p>첫 번째 코드는 회원이 이미 있을 때도 <code>createAndSaveGuest(id)</code>를 실행한다. 반환값은 기존 회원이므로 화면상 결과는 정상처럼 보이지만, 데이터베이스에는 쓰이지 않을 게스트 회원이 계속 쌓이거나, 같은 키로 넣으려다 제약 조건 위반 예외가 나서 멀쩡한 조회 요청이 실패한다. 결과값만 확인하는 테스트로는 잡히지 않고, "값이 있는 경우"에 숨은 부작용이라 원인을 찾기도 어렵다. 같은 이유로 <code>orElse(new ArrayList<>())</code>처럼 매번 객체를 만드는 기본값, <code>orElse(remoteClient.fetchDefault())</code>처럼 네트워크를 타는 기본값은 <code>orElseGet</code>으로 바꾸는 것이 맞다.</p>
+<h4>orElseThrow(Supplier)가 공급자를 받는 이유</h4>
+<p><code>orElseThrow</code>가 예외 객체가 아니라 예외를 만드는 공급자를 받는 것도 같은 원리다. 예외 객체를 만드는 일은 생각보다 비싸다. <code>Throwable</code>의 생성자는 JDK 21 소스에서 첫 줄에 <code>fillInStackTrace()</code>를 호출하고, 이 메서드는 Javadoc 설명대로 현재 스레드의 스택 프레임 정보를 예외 객체 안에 기록한다. 호출 깊이가 깊은 서버 코드에서는 이 작업이 결코 작지 않다. 만약 <code>orElseThrow(new NotFoundException(...))</code>처럼 예외 객체를 직접 받는 API였다면, 값이 있는 정상 경로에서도 매번 스택을 기록한 예외 객체를 만들었다가 버렸을 것이다. 공급자를 받으므로 예외는 실제로 던질 때만 만들어진다. Javadoc의 API 노트가 권하는 대로 인자 없는 생성자라면 <code>IllegalStateException::new</code> 같은 생성자 참조를 넘길 수 있다.</p>
+<div class="table-wrap"><table><thead><tr><th>기본값의 성격</th><th>권장</th><th>이유</th></tr></thead><tbody>
+<tr><td>상수, 리터럴, 이미 계산된 지역 변수</td><td><code>orElse</code></td><td>아낄 계산이 없다. 람다를 만드는 편이 오히려 군더더기</td></tr>
+<tr><td>새 객체 생성, 컬렉션 생성</td><td><code>orElseGet</code></td><td>값이 있으면 버려질 할당을 피한다</td></tr>
+<tr><td>I/O, DB 조회, 원격 호출, 저장 같은 부작용</td><td><code>orElseGet</code> (필수)</td><td>값이 있을 때 부작용이 일어나면 동작 자체가 틀린다</td></tr>
+<tr><td>대체 후보도 "없을 수 있음"</td><td><code>or</code></td><td>결과가 다시 <code>Optional</code>이라 파이프라인을 이어 갈 수 있다</td></tr>
+<tr><td>값이 없으면 진행할 수 없음</td><td><code>orElseThrow(Supplier)</code></td><td>예외 생성(스택 기록)을 실패할 때만 한다</td></tr>
+</tbody></table></div>
+
+<h3>실전 활용 1: 주소 찾기</h3>
+<p>앞에서 세 겹의 <code>if</code>로 쓴 "회원의 도시 찾기"를 <code>Optional</code>로 다시 써 보자. 도메인은 그대로다. 회원은 주소가 없을 수 있고, 주소는 도시가 비어 있을 수 있다. 회원 저장소는 <code>Map</code>이라 없는 번호를 찾으면 null을 돌려준다. 이 null을 받아들이는 지점을 <b>한 곳</b>으로 모으는 것이 첫 번째 설계 결정이다.</p>
+<pre><code class="language-java">import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+
+public class AddressLookup {
+    record Address(String city, String street) {}        // city는 null일 수 있다
+    record Member(String name, Address address) {}       // address는 null일 수 있다
+
+    static final Map<Long, Member> members = new HashMap<>();
+
+    static Optional<Member> findMember(long id) {
+        return Optional.ofNullable(members.get(id));     // 경계에서 null을 Optional로 바꾼다
+    }
+
+    static String cityByNullCheck(long id) {
+        // ... 앞 절의 세 겹 if 버전과 같다
+    }
+
+    static String cityOf(long id) {
+        return findMember(id)
+                .map(Member::address)
+                .map(Address::city)
+                .orElse("미등록");
+    }
+
+    public static void main(String[] args) {
+        members.put(1L, new Member("kim", new Address("서울", "세종대로")));
+        members.put(2L, new Member("lee", null));
+        members.put(3L, new Member("park", new Address(null, "중앙로")));
+
+        for (long id = 1; id <= 4; id++) {
+            System.out.println(id + ": " + cityOf(id) + " / " + cityByNullCheck(id));
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">1: 서울 / 서울
+2: 미등록 / 미등록
+3: 미등록 / 미등록
+4: 미등록 / 미등록</code></pre>
+<p>네 경우는 각각 다른 지점에서 값이 사라진다. 1번은 끝까지 값이 있다. 2번은 <code>map(Member::address)</code>에서, 3번은 <code>map(Address::city)</code>에서 null이 나와 빈 값이 되고, 4번은 <code>findMember</code>에서부터 비어 있다. <code>cityOf</code>는 이 네 경우를 구분하는 분기 없이 같은 코드로 처리한다. 두 버전의 결과가 모두 같다는 것은 <code>map</code>의 "비어 있으면 건너뛰고, 결과가 null이면 비운다"는 규칙이 중첩 <code>if</code>와 정확히 같은 의미라는 뜻이다. 이 경우 기본값 "미등록"은 상수이므로 <code>orElse</code>가 알맞다.</p>
+<h4>getter가 Optional을 돌려준다면: flatMap</h4>
+<p>도메인 모델을 바꿀 수 있다면 "주소는 없을 수 있다"는 사실을 <code>Member</code> 자신이 타입으로 밝히게 할 수 있다. 필드는 그대로 두고 조회 메서드만 <code>Optional</code>을 돌려주게 하는 것이 일반적인 방법이다(필드를 <code>Optional</code>로 두지 않는 이유는 뒤의 베스트 프랙티스에서 본다).</p>
+<pre><code class="language-java">record Member(String name, Address address) {
+    Optional<Address> findAddress() {
+        return Optional.ofNullable(address);
+    }
+}
+
+static String cityOf(long id) {
+    return findMember(id)
+            .flatMap(Member::findAddress)        // Optional<Address>를 한 겹으로 유지
+            .map(Address::city)
+            .filter(city -> !city.isBlank())     // 빈 문자열 도시도 "미등록"으로 본다
+            .orElse("미등록");
+}</code></pre>
+<p>이제 <code>map</code> 대신 <code>flatMap</code>을 써야 한다. <code>findAddress</code>가 이미 <code>Optional</code>을 돌려주므로 <code>map</code>을 쓰면 <code>Optional<Optional<Address>></code>가 되어 다음 <code>map(Address::city)</code>가 컴파일되지 않는다. 마지막의 <code>filter</code>는 "값은 있지만 쓸모없는 값"을 빈 값으로 바꾸는 용도다. 도시가 <code>""</code>이나 공백으로 저장된 데이터가 섞여 있어도 같은 파이프라인에서 걸러진다. <code>filter</code>는 조건이 참이면 자기 자신을 돌려주므로 추가 할당도 없다.</p>
+
+<h3>실전 활용 2: 배송</h3>
+<p>두 번째 예제는 조금 더 실제 업무에 가깝다. 주문에는 배송 정보가 붙는데, 출고 전이면 배송 정보가 아직 없다(null). 배송 정보에는 상태가 있고, 취소된 배송은 "배송 정보 없음"으로 보여야 한다. 배송비는 주문 금액 3만 원 이상이면 무료이고, 존재하지 않는 주문으로 배송비를 계산하려 하면 예외여야 한다. 운송장 추적은 로컬 캐시를 먼저 보고, 없으면 택배사 시스템에 묻는다.</p>
+<pre><code class="language-java">import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+
+public class Shipping {
+    enum Status { READY, SHIPPING, DONE, CANCELED }
+    record Delivery(String trackingNo, Status status) {}
+    record Order(long id, long amount, Delivery delivery) {}   // delivery가 null이면 아직 배송 등록 전
+
+    static final Map<Long, Order> orders = new HashMap<>();
+    static final Map<String, Delivery> cache = new HashMap<>();
+
+    static Optional<Order> findOrder(long id) {
+        return Optional.ofNullable(orders.get(id));
+    }
+
+    static String deliveryMessage(long orderId) {
+        return findOrder(orderId)
+                .map(Order::delivery)
+                .filter(d -> d.status() != Status.CANCELED)
+                .map(d -> d.status() + " (" + d.trackingNo() + ")")
+                .orElse("배송 정보 없음");
+    }
+
+    static long shippingFee(long orderId) {
+        Order order = findOrder(orderId)
+                .orElseThrow(() -> new IllegalArgumentException("주문 없음: " + orderId));
+        return order.amount() >= 30_000 ? 0 : 3_000;
+    }
+
+    static Optional<Delivery> fromCache(String trackingNo) {
+        return Optional.ofNullable(cache.get(trackingNo));
+    }
+
+    static Optional<Delivery> fromCarrier(String trackingNo) {
+        System.out.println("  택배사 시스템 조회: " + trackingNo);
+        return trackingNo.startsWith("T") ? Optional.of(new Delivery(trackingNo, Status.SHIPPING))
+                                          : Optional.empty();
+    }
+
+    static Optional<Delivery> track(String trackingNo) {
+        return fromCache(trackingNo).or(() -> fromCarrier(trackingNo));
+    }
+
+    public static void main(String[] args) {
+        orders.put(10L, new Order(10L, 45_000, new Delivery("T-100", Status.SHIPPING)));
+        orders.put(11L, new Order(11L, 12_000, null));
+        orders.put(12L, new Order(12L, 8_000, new Delivery("T-102", Status.CANCELED)));
+        cache.put("T-100", orders.get(10L).delivery());
+
+        for (long id = 10; id <= 13; id++) {
+            System.out.println(id + ": " + deliveryMessage(id));
+        }
+        System.out.println("배송비 10 = " + shippingFee(10));
+        System.out.println("배송비 11 = " + shippingFee(11));
+        try {
+            shippingFee(13);
+        } catch (IllegalArgumentException e) {
+            System.out.println("예외: " + e.getMessage());
+        }
+        System.out.println("추적 T-100 -> " + track("T-100"));
+        System.out.println("추적 T-555 -> " + track("T-555"));
+        System.out.println("추적 X-1 -> " + track("X-1"));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">10: SHIPPING (T-100)
+11: 배송 정보 없음
+12: 배송 정보 없음
+13: 배송 정보 없음
+배송비 10 = 0
+배송비 11 = 3000
+예외: 주문 없음: 13
+추적 T-100 -> Optional[Delivery[trackingNo=T-100, status=SHIPPING]]
+  택배사 시스템 조회: T-555
+추적 T-555 -> Optional[Delivery[trackingNo=T-555, status=SHIPPING]]
+  택배사 시스템 조회: X-1
+추적 X-1 -> Optional.empty</code></pre>
+<p><code>deliveryMessage</code>의 네 결과를 추적해 보자. 주문 10은 배송 중이므로 끝까지 값이 남는다. 주문 11은 <code>map(Order::delivery)</code>에서 null이 나와 비고, 주문 12는 값은 있지만 <code>filter</code>의 조건(취소가 아님)을 통과하지 못해 비고, 주문 13은 처음부터 없다. 세 가지 서로 다른 "없음"이 같은 기본 메시지로 모인다. 업무상 이 셋을 구분해야 한다면(예: "출고 준비 중", "취소됨", "주문 없음") 하나의 <code>Optional</code> 파이프라인으로 뭉치지 말고 상태를 명시적으로 분기해야 한다. <code>Optional</code>은 "있다/없다" 두 상태만 표현한다. 없는 이유는 담지 못한다.</p>
+<p><code>shippingFee</code>는 "주문이 없으면 계산을 진행할 수 없다"는 의미를 <code>orElseThrow</code>로 적었다. 예외를 만드는 람다는 <code>orderId</code>를 붙잡는 캡처 람다이고, 예외 객체와 그 메시지 문자열은 주문이 없을 때(13번)만 만들어진다. 금액 비교는 꺼낸 값으로 평범하게 한다. 모든 것을 <code>map</code>으로 이어 쓸 필요는 없다. 값이 반드시 있어야 하는 지점에서 꺼내고 나면 그 뒤는 일반 코드다.</p>
+<p><code>track</code>은 <code>or</code>로 대체 경로를 만든다. T-100은 캐시에 있으므로 <code>or</code>의 공급자가 호출되지 않아 "택배사 시스템 조회" 줄이 출력되지 않는다. T-555는 캐시에 없어서 공급자가 호출되고, 택배사 쪽 결과가 그대로 반환된다. X-1은 두 곳 모두에 없어 빈 값이다. 만약 <code>or</code>가 공급자가 아니라 <code>Optional</code> 값을 받는 메서드였다면, 캐시에 있는 경우에도 택배사 조회가 매번 일어났을 것이다. 캐시의 존재 이유가 사라지는 셈이다. 이 예제 역시 지연 평가가 성능 문제가 아니라 <b>동작의 정확성</b> 문제라는 것을 보여 준다.</p>
+<aside class="note">예제의 도메인과 클래스 이름은 이 강좌에서 새로 만든 것이다. 실무에서는 <code>Map</code> 대신 리포지토리, 택배사 조회 대신 HTTP 클라이언트가 들어가지만, 경계에서 null을 <code>Optional</code>로 바꾸고 파이프라인 끝에서 한 번만 꺼내는 구조는 같다.</aside>
+
+<h3>한 층 아래: JIT는 Optional 할당을 지울 수 있는가</h3>
+<p>앞에서 <code>Optional</code> 하나가 16바이트 객체라는 것을 측정했다. <code>map</code>을 세 번 이어 쓰면 값이 있는 경로에서는 최대 네 개의 <code>Optional</code>이 생겼다 사라진다. 이것이 GC 부담이 될까. 답은 "JIT가 그 할당을 지울 수 있는가"에 달려 있다. HotSpot의 C2 컴파일러는 탈출 분석(escape analysis)으로 객체가 만들어진 메서드(인라인된 범위 포함) 밖으로 새어 나가지 않는다는 것을 증명하면, 그 객체를 힙에 할당하지 않고 필드들을 지역 변수처럼 레지스터나 스택에 두는 스칼라 치환(scalar replacement)을 한다. 이것은 JVM 명세가 보장하는 동작이 아니라 HotSpot의 최적화이므로 실험으로 확인해야 한다.</p>
+<pre><code class="language-java">import java.lang.management.ManagementFactory;
+import java.util.Optional;
+import java.util.function.ToIntFunction;
+
+public class Escape2 {
+    static String[] all = {"a", "bb", "ccc", "dddd", "eeeee"};
+    static String[] mixed = {"a", null, "ccc", null, "eeeee"};
+
+    static int ofOnly(String s)      { return Optional.of(s).get().length(); }
+    static int ofNullable(String s)  { return Optional.ofNullable(s).isPresent() ? 1 : 0; }
+
+    static void run(String label, String[] data, ToIntFunction<String> f) {
+        var mx = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+        long sum = 0, bytes = 0;
+        for (int round = 0; round < 6; round++) {          // 앞 라운드는 JIT 컴파일 준비
+            long before = mx.getCurrentThreadAllocatedBytes();
+            for (int i = 0; i < 10_000_000; i++) sum += f.applyAsInt(data[i % data.length]);
+            bytes = mx.getCurrentThreadAllocatedBytes() - before;
+        }
+        System.out.printf("%-24s 마지막 라운드 %,d bytes (sum=%d)%n", label, bytes, sum);
+    }
+
+    public static void main(String[] args) {
+        run("of(s).get()", all, Escape2::ofOnly);
+        run("ofNullable(all)", all, Escape2::ofNullable);
+        run("ofNullable(mixed)", mixed, Escape2::ofNullable);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (Temurin 21.0.13, 기본 옵션 / -XX:-DoEscapeAnalysis)"><code class="language-text">of(s).get()              마지막 라운드 0 bytes (sum=180000000)
+ofNullable(all)          마지막 라운드 0 bytes (sum=60000000)
+ofNullable(mixed)        마지막 라운드 96,000,000 bytes (sum=36000000)
+--- -XX:-DoEscapeAnalysis
+of(s).get()              마지막 라운드 160,000,000 bytes (sum=180000000)
+ofNullable(all)          마지막 라운드 160,000,000 bytes (sum=60000000)
+ofNullable(mixed)        마지막 라운드 96,000,000 bytes (sum=36000000)</code></pre>
+<p>숫자를 읽어 보자. 탈출 분석을 끈 경우 <code>of(s).get()</code>은 천만 번 호출에 1억 6천만 바이트, 정확히 호출당 16바이트를 할당한다. 탈출 분석을 켜면 0바이트다. 만들어진 <code>Optional</code>이 메서드 밖으로 나가지 않고 곧바로 <code>get()</code>으로 풀리므로 C2가 객체를 아예 만들지 않은 것이다. <code>ofNullable(all)</code>도 켜면 0바이트다. 흥미로운 것은 세 번째 줄이다. 입력의 다섯 개 중 두 개가 null인 <code>mixed</code> 배열에서는 탈출 분석을 켜도 9천 6백만 바이트가 할당되었다. 천만 번 중 null이 아닌 육백만 번 × 16바이트와 정확히 일치한다. 값이 있는 경로의 할당이 하나도 지워지지 않았다.</p>
+<p>차이는 <code>ofNullable</code>의 두 갈래가 실제로 모두 실행되느냐에 있다. <code>ofNullable</code>은 null이면 기존 객체 <code>EMPTY</code>를, 아니면 새 객체를 돌려주고, 두 결과는 같은 변수로 합쳐진다. <code>all</code> 입력에서는 null 분기가 한 번도 실행되지 않았다. HotSpot C2는 실행 프로파일에 한 번도 나타나지 않은 분기를 정상 경로로 컴파일하지 않고, 만약 그 분기에 들어서면 컴파일된 코드를 버리고 인터프리터로 돌아가는(deoptimization) 장치만 남겨 둔다. 그러면 컴파일된 코드 안에는 "새 객체" 경로 하나만 남아 스칼라 치환이 가능해진다. <code>mixed</code> 입력에서는 두 분기가 모두 살아 있어서 새로 만든 객체와 기존 객체가 한 지점에서 합쳐지고, JDK 21의 C2는 이 실험에서 그 할당을 지우지 못했다. OpenJDK에서는 이렇게 할당과 다른 값이 합쳐지는 지점(allocation merge)을 줄이려는 C2 개선이 JDK 21 이후에도 이어지고 있다(예: 2024년에 통합된 JDK-8316991 "Reduce nullable allocation merges"). 따라서 같은 실험이라도 JDK 버전에 따라 결과가 달라질 수 있다.</p>
+<p>이 실험에서 끌어낼 결론은 두 가지다. 첫째, 메서드 안에서 만들고 바로 풀어 버리는 <code>Optional</code>(반환 직후 <code>orElse</code>로 꺼내는 대부분의 사용)은 JIT가 비용을 상당 부분 없앨 수 있다. 둘째, 그것은 보장이 아니다. 인라인 깊이, 분기 프로파일, JDK 버전에 따라 할당은 남을 수 있고, 필드나 컬렉션에 저장되는 <code>Optional</code>은 탈출하므로 언제나 할당된다. 초당 수백만 번 도는 핫 루프나 수백만 개 원소를 담는 자료구조에서는 <code>Optional</code>이 실제 비용이 되며, 그런 곳에서는 null 검사나 기본형 특화 타입이 낫다. 실무 코드 대부분에서는 이 비용이 DB 조회 한 번에 비해 무시할 만하므로, <code>Optional</code>을 쓸지 말지는 성능보다 API의 의미를 기준으로 정하는 것이 맞다.</p>
+<h4>기본형 특화: OptionalInt, OptionalLong, OptionalDouble</h4>
+<p>정수 하나를 <code>Optional<Integer></code>로 감싸면 <code>Integer</code> 박싱 객체와 <code>Optional</code> 객체가 겹으로 생길 수 있다(JLS가 캐시를 요구하는 -128~127 범위의 박싱은 새 객체를 만들지 않는다). <code>OptionalInt</code>는 소스에서 보듯 <code>boolean isPresent</code>와 <code>int value</code> 두 필드를 직접 가져 박싱이 없다. 6회의 <code>IntStream.max()</code>는 <code>OptionalInt</code>를, <code>average()</code>는 <code>OptionalDouble</code>을 돌려준다. 다만 API가 작다. <code>getAsInt</code>, <code>orElse(int)</code>, <code>orElseGet(IntSupplier)</code>, <code>orElseThrow</code>, <code>ifPresent</code>, <code>ifPresentOrElse</code>, <code>stream</code>은 있지만 <code>map</code>·<code>flatMap</code>·<code>filter</code>·<code>or</code>는 없다. 값을 변환하며 이어 가려면 <code>Optional</code>로 옮기거나 꺼낸 뒤 처리해야 한다.</p>
+
+<h3>탈출 분석의 전제: 인라이닝이 Optional 체인을 한 덩어리로 만든다</h3>
+<p>앞 절의 실험은 C2가 할당을 지울 때와 못 지울 때의 차이를 분기 프로파일로 설명했다. 그보다 앞선 조건이 하나 더 있다. 탈출 분석은 C2가 <b>한 번에 컴파일하는 단위</b> 안에서만 일어난다. OpenJDK 21의 <code>escape.hpp</code>가 정의하는 탈출 상태는 세 가지다. NoEscape는 객체가 메서드나 스레드 밖으로 나가지 않고 호출의 인자로도 넘겨지지 않는 경우로, 주석에 "스칼라로 대체될 수 있다"고 적혀 있다. ArgEscape는 메서드와 스레드 밖으로 나가지는 않지만 호출의 인자로 넘겨지거나 인자가 참조하는 경우다. GlobalEscape는 메서드나 스레드 밖으로 나가는 경우다. 그런데 <code>Optional.of(s).map(f).orElse(x)</code>는 소스로 보면 메서드 호출 세 번이고, 각 호출은 <code>Optional</code>을 돌려주거나 수신 객체(호출의 0번째 인자)로 받는다. 호출이 그대로 남아 있으면 이 <code>Optional</code>들은 NoEscape가 될 수 없다. 앞 절에서 할당이 0바이트가 될 수 있었던 것은 C2가 이 호출들을 호출한 쪽 코드 안으로 펼쳐 넣는 <b>인라이닝(inlining)</b>을 먼저 했기 때문이다.</p>
+<pre><code class="language-java">import java.lang.management.ManagementFactory;
+import java.util.Optional;
+
+public class Inl {
+    static String[] data = {"a", "bb", "ccc", "dddd", "eeeee"};
+
+    static int lengthOf(String s) {
+        return Optional.of(s).map(String::length).orElse(0);
+    }
+
+    public static void main(String[] args) {
+        var mx = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+        long sum = 0, bytes = 0;
+        for (int round = 0; round < 6; round++) {
+            long before = mx.getCurrentThreadAllocatedBytes();
+            for (int i = 0; i < 10_000_000; i++) sum += lengthOf(data[i % data.length]);
+            bytes = mx.getCurrentThreadAllocatedBytes() - before;
+        }
+        System.out.printf("마지막 라운드 %,d bytes, 호출당 %.1f bytes (sum=%d)%n", bytes, bytes / 1e7, sum);
+    }
+}</code></pre>
+<p>먼저 C2가 <code>lengthOf</code>를 컴파일할 때 무엇을 인라인했는지 보자. <code>-XX:+PrintInlining</code>은 진단 옵션이라 <code>-XX:+UnlockDiagnosticVMOptions</code>가 필요하고, 여러 컴파일러 스레드의 출력이 섞이지 않도록 컴파일을 순서대로 하게 만드는 <code>-Xbatch</code>를 함께 주었다.</p>
+<pre data-label="java -Xbatch -XX:+UnlockDiagnosticVMOptions -XX:+PrintCompilation -XX:+PrintInlining Inl 발췌 (C2, 단계 4)"><code class="language-text">43   94    b  4       Inl::lengthOf (26 bytes)
+      @ 1   java.util.Optional::of (12 bytes)   inline (hot)
+        @ 5   java.util.Objects::requireNonNull (14 bytes)   force inline by annotation
+        @ 8   java.util.Optional::<init> (10 bytes)   inline (hot)
+          @ 1   java.lang.Object::<init> (1 bytes)   inline (hot)
+      @ 4   java.lang.invoke.Invokers$Holder::linkToTargetMethod (8 bytes)   force inline by annotation
+        @ 4   java.lang.invoke.LambdaForm$MH/0x000000e001000400::invoke (8 bytes)   force inline by annotation
+      @ 9   java.util.Optional::map (30 bytes)   inline (hot)
+        @ 1   java.util.Objects::requireNonNull (14 bytes)   force inline by annotation
+        @ 6   java.util.Optional::isEmpty (13 bytes)   inline (hot)
+        @ 21   Inl$$Lambda/0x000000e001000a08::apply (11 bytes)   inline (hot)
+          @ 4   java.lang.String::length (11 bytes)   inline (hot)
+            @ 6   java.lang.String::coder (15 bytes)   inline (hot)
+          @ 7   java.lang.Integer::valueOf (32 bytes)   inline (hot)
+        @ 26   java.util.Optional::ofNullable (19 bytes)   inline (hot)
+          @ 15   java.util.Optional::<init> (10 bytes)   inline (hot)
+            @ 1   java.lang.Object::<init> (1 bytes)   inline (hot)
+      @ 13   java.lang.Integer::valueOf (32 bytes)   inline (hot)
+      @ 16   java.util.Optional::orElse (16 bytes)   inline (hot)
+      @ 22   java.lang.Integer::intValue (5 bytes)   accessor</code></pre>
+<p>들여쓰기가 호출 깊이이고, <code>@</code> 뒤의 숫자는 호출이 있는 바이트코드 위치, 괄호 안은 호출되는 메서드의 바이트코드 크기다(앞쪽 공백은 줄였고, 람다 클래스의 주소는 실행마다 다르다). <code>Optional::of</code>(12바이트)와 생성자, <code>Optional::map</code>(30바이트)과 그 안의 <code>isEmpty</code>·람다의 <code>apply</code>·<code>String::length</code>·<code>ofNullable</code>, 그리고 <code>orElse</code>(16바이트)까지 모두 <code>lengthOf</code> 안으로 펼쳐졌다. <code>@ 4</code>의 <code>linkToTargetMethod</code>는 4회에서 본 <code>invokedynamic</code>이 람다 객체를 얻는 경로다. <code>-XX:+PrintFlagsFinal</code>로 보면 JDK 21 C2의 기본 한도는 <code>MaxInlineSize=35</code>(인라인할 메서드의 최대 바이트코드 크기), <code>FreqInlineSize=325</code>(자주 실행되는 메서드에 적용하는 한도, 이 AArch64 빌드의 값), <code>MaxInlineLevel=15</code>(중첩 깊이)다. <code>Optional</code>의 메서드는 모두 35바이트도 되지 않는다. 하나 더 볼 것은 <code>map</code> 아래에 <code>Optional::empty</code>가 없다는 점이다. 같은 프로그램을 <code>-Xbatch</code> 없이 돌렸을 때 C1(단계 3)이 만든 트리에는 <code>@ 12 java.util.Optional::empty</code>가 있었다. 이 실험에서 비어 있는 경로는 한 번도 실행되지 않았으므로, 앞 절에서 설명한 대로 C2는 그 분기를 정상 경로로 컴파일하지 않았다.</p>
+<p>인라이닝이 정말 전제인지 확인하려면 인라이닝만 끊어 보면 된다. <code>-XX:CompileCommand=dontinline,java.util.Optional::map</code>처럼 주면 그 메서드는 인라인되지 않는다(PrintInlining에 <code>disallowed by CompileCommand</code>로 찍힌다). 다른 조건은 그대로 두고 <code>of</code>, <code>map</code>, <code>orElse</code>를 하나씩 끊은 결과다.</p>
+<div class="table-wrap"><table><thead><tr><th>옵션 (macOS, Temurin 21.0.13)</th><th>마지막 라운드 할당</th><th>호출당</th><th>남은 Optional</th></tr></thead><tbody>
+<tr><td>기본</td><td>0 bytes</td><td>0</td><td>없음</td></tr>
+<tr><td><code>dontinline,java.util.Optional::of</code></td><td>160,000,000 bytes</td><td>16</td><td><code>of</code>가 만든 것</td></tr>
+<tr><td><code>dontinline,java.util.Optional::map</code></td><td>320,000,000 bytes</td><td>32</td><td><code>of</code>가 만든 것, <code>map</code>이 만든 것</td></tr>
+<tr><td><code>dontinline,java.util.Optional::orElse</code></td><td>160,000,000 bytes</td><td>16</td><td><code>map</code>이 만든 것</td></tr>
+</tbody></table></div>
+<p>16바이트가 <code>Optional</code> 하나라는 것은 앞에서 측정했다. 네 경우 모두 <code>sum=180000000</code>으로 결과는 같다. <code>of</code>를 끊으면 첫 <code>Optional</code>은 <code>of</code> 메서드 안에서 할당되어 반환된다. <code>lengthOf</code>의 컴파일 단위 입장에서 그것은 자기가 할당한 객체가 아니라 호출의 결과이므로 지울 방법이 없다. 반면 <code>map</code>이 만드는 두 번째 <code>Optional</code>은 인라인된 <code>orElse</code>에서 바로 풀리므로 여전히 지워진다. <code>map</code>을 끊으면 둘 다 남는다. <code>of</code>의 결과는 인라인되지 않은 <code>map</code> 호출의 수신 객체로 넘겨지므로 ArgEscape가 되고, <code>map</code>의 결과는 <code>map</code> 안에서 할당되어 반환된다. <code>orElse</code>를 끊으면 <code>of</code>의 결과는 인라인된 <code>map</code> 안에서 소비되어 지워지고, <code>map</code>의 결과는 <code>orElse</code> 호출로 넘겨져 남는다. 문자열 길이 1~5와 기본값 0은 JLS가 캐시를 요구하는 -128~127 범위라서 <code>Integer.valueOf</code>는 어느 경우에도 새 객체를 만들지 않는다.</p>
+<p>이 결과가 "JIT가 <code>Optional</code>을 알아서 지워 준다"는 말의 정확한 조건이다. <code>Optional</code>을 만들고, 받아서 변환하고, 꺼내는 호출이 <b>모두</b> 하나의 컴파일 단위 안으로 인라인되어야 한다. 그중 하나라도 인라인되지 않으면 그 경계를 넘는 <code>Optional</code>은 힙에 할당된다. 인라이닝 여부는 피호출 메서드의 바이트코드 크기, 중첩 깊이, 이미 컴파일된 코드의 크기(<code>InlineSmallCode</code>) 같은 여러 조건으로 정해지므로, 예를 들어 <code>Optional</code>을 매개변수로 받는 큰 메서드에 넘기면 그 호출이 인라인되지 않아 할당이 남을 수 있다. 베스트 프랙티스의 "매개변수로 받지 않는다"는 규칙이 설계 이유 말고도 이런 실행상의 이유를 하나 더 갖는 셈이다. 할당이 문제가 될 만한 경로라면 추측하지 말고 앞의 측정 방법이나 JFR 할당 이벤트로 확인한다.</p>
+
+<h3>값 기반 클래스: ==, 동기화, 직렬화</h3>
+<p><code>Optional</code> 클래스 선언에는 <code>@jdk.internal.ValueBased</code> 애노테이션이 붙어 있고, Javadoc은 이 클래스가 값 기반(value-based) 클래스라고 밝힌다. Java SE 21 문서의 정의에 따르면 값 기반 클래스는 final 인스턴스 필드만 갖고, <code>equals</code>·<code>hashCode</code>·<code>toString</code>을 식별자(identity)가 아니라 필드 값으로 계산하며, 같은 값의 두 인스턴스를 자유롭게 바꿔 써도 동작이 달라지지 않고, 접근 가능한 생성자를 두지 않으며, 팩토리 메서드가 "호출마다 고유한 식별자"를 약속하지 않는다. 같은 문서는 이런 클래스의 인스턴스에 대해 참조 비교(<code>==</code>), 동기화, 식별 해시, 직렬화 같은 식별자에 민감한 연산으로 두 인스턴스를 구별하려 하지 말라고 하고, "식별자 관련 동작은 향후 릴리스에서 바뀔 수 있다. 예를 들어 동기화가 실패할 수 있다"고 적는다.</p>
+<p>이 규칙이 실제로 무엇을 뜻하는지 하나씩 보자. 먼저 <code>==</code>. 현재 구현에서 <code>Optional.ofNullable(null) == Optional.empty()</code>는 <code>true</code>를 출력한다. 둘 다 같은 <code>EMPTY</code>를 돌려주기 때문이다. 그러나 <code>empty()</code>의 Javadoc이 "싱글턴이라는 보장은 없다"고 명시하므로, 이 결과에 기대는 코드는 명세가 아니라 구현에 기대는 코드다. 빈 값 판정은 <code>isEmpty()</code>로, 값 비교는 <code>equals</code>로 한다.</p>
+<p>동기화는 컴파일러와 JVM이 함께 막는다. JEP 390(Warnings for Value-Based Classes, JDK 16)은 값 기반 클래스 타입의 피연산자로 <code>synchronized</code> 문을 쓰면 javac가 경고하도록 했다. 이 경고 범주는 기본으로 켜져 있다.</p>
+<pre><code class="language-java">Optional<String> lock = Optional.of("x");
+synchronized (lock) { System.out.println("in"); }</code></pre>
+<pre data-label="javac 출력 (JDK 21)"><code class="language-text">Sync.java:5: warning: [synchronization] attempt to synchronize on an instance of a value-based class
+        synchronized (lock) { System.out.println("in"); }
+        ^
+1 warning</code></pre>
+<p>경고일 뿐 컴파일과 실행은 된다. 하지만 같은 JEP가 도입한 HotSpot 진단 옵션으로 실행하면 런타임에서도 잡을 수 있다. <code>-XX:+UnlockDiagnosticVMOptions -XX:DiagnoseSyncOnValueBasedClasses=2</code>는 <code>[valuebasedclasses] Synchronizing on object ... of klass java.util.Optional</code> 같은 로그를 남기고, <code>=1</code>은 해당 지점에서 JVM을 치명적 오류로 멈춘다. JDK 21에서 직접 실행해 두 동작을 모두 확인했다. 미래의 JDK에서 <code>Optional</code> 같은 클래스가 식별자 없는 값으로 바뀌면 모니터를 걸 객체 자체가 없어질 수 있다는 것이 이 경고의 배경이다.</p>
+<p>직렬화도 막혀 있다. <code>Optional</code>은 <code>Serializable</code>을 구현하지 않는다(<code>Serializable.class.isAssignableFrom(Optional.class)</code>는 <code>false</code>). 그래서 <code>Serializable</code> 클래스에 <code>Optional</code> 필드를 두고 <code>ObjectOutputStream</code>으로 쓰면 <code>java.io.NotSerializableException: java.util.Optional</code>이 난다. 이 역시 직접 실행해 확인한 결과다. 세션에 저장되는 객체, 원격 호출로 오가는 객체, 캐시에 직렬화되는 객체에 <code>Optional</code> 필드가 있으면 이 예외를 만난다.</p>
+
+<h3>옵셔널 베스트 프랙티스</h3>
+<p>지금까지의 원리에서 사용 규칙을 끌어내 보자. 출발점은 JDK 21 <code>Optional</code> Javadoc의 API 노트다. "<code>Optional</code>은 '결과 없음'을 나타낼 분명한 필요가 있고 null을 쓰면 오류를 일으키기 쉬운 곳에서 <b>메서드 반환 타입</b>으로 쓰는 것을 주된 의도로 한다. <code>Optional</code> 타입의 변수는 절대 그 자체로 null이어서는 안 되며 항상 <code>Optional</code> 인스턴스를 가리켜야 한다." 나머지 규칙은 대부분 이 두 문장과 앞의 구조적 사실에서 나온다.</p>
+<ol>
+<li><b>반환 타입에 쓴다.</b> "찾았는데 없을 수 있음"이 정상인 조회 메서드(<code>findById</code>, <code>findFirst</code>, <code>max</code>)가 가장 알맞은 자리다. 스프링 데이터의 <code>CrudRepository.findById</code>, 스트림의 <code>findFirst</code>·<code>max</code>, 7회의 <code>Collectors.maxBy</code>가 모두 이 형태다.</li>
+<li><b><code>Optional</code>을 반환하는 메서드는 절대 null을 반환하지 않는다.</b> 호출자는 반환값에 바로 <code>.map</code>을 부를 것이고, null이면 <code>Optional</code>을 쓴 의미가 없어지는 것은 물론 더 이상한 곳에서 NPE가 난다. 결과가 없으면 <code>Optional.empty()</code>를 돌려준다.</li>
+<li><b>필드에 두지 않는다.</b> 직렬화가 안 되고, 객체마다 16바이트와 참조 한 단계가 늘고, 필드 자체가 null인 상태(초기화 전, 역직렬화나 프레임워크가 리플렉션으로 채우는 경우)를 막지 못한다. 필드는 nullable로 두고, 앞의 <code>findAddress()</code>처럼 조회 메서드에서 <code>Optional.ofNullable(field)</code>로 감싸 내보낸다.</li>
+<li><b>매개변수로 받지 않는다.</b> <code>void send(Optional<String> memo)</code>는 호출자에게 <code>Optional.empty()</code>, <code>Optional.of(x)</code>, 그리고 여전히 가능한 <code>null</code>이라는 세 가지 "없음"을 열어 준다. 선택적 인자는 오버로드(<code>send()</code>와 <code>send(String memo)</code>)로 나누거나 nullable 매개변수를 문서화하는 편이 단순하다. 호출자가 가진 것이 <code>Optional</code>이라면 호출하기 전에 그쪽에서 풀어서 넘긴다.</li>
+<li><b>컬렉션은 <code>Optional</code>로 감싸지 않는다.</b> <code>Optional<List<Order>></code> 대신 빈 리스트를 돌려준다. 컬렉션은 이미 "원소 0개"라는 빈 상태를 표현할 수 있으므로 두 겹의 "없음"은 호출자에게 구분할 이유가 없는 경우를 하나 더 만든다. 같은 이유로 <code>List<Optional<T>></code>처럼 컬렉션의 원소로 두는 것도 피하고, 빈 원소는 담지 않는다.</li>
+<li><b><code>isPresent()</code> + <code>get()</code> 대신 의도를 드러내는 메서드를 쓴다.</b> 기본값이면 <code>orElse</code>/<code>orElseGet</code>, 필수 값이면 <code>orElseThrow</code>, 값이 있을 때만 할 일이면 <code>ifPresent</code>, 변환이면 <code>map</code>/<code>flatMap</code>/<code>filter</code>다. <code>get()</code>이 꼭 필요해 보이면 <code>orElseThrow()</code>로 바꿔 "없으면 예외"라는 사실을 드러낸다.</li>
+<li><b>기본값이 비싸거나 부작용이 있으면 <code>orElseGet</code>.</b> 앞 절의 표 그대로다.</li>
+<li><b>단순한 null 검사를 대신하려고 <code>Optional</code>을 만들지 않는다.</b> 메서드 안의 지역 변수 하나를 검사하려고 <code>Optional.ofNullable(x).ifPresent(...)</code>를 쓰는 것은 <code>if (x != null)</code>보다 읽기 어렵고 객체를 하나 더 만든다. <code>Optional</code>은 메서드 경계에서 "없을 수 있음"을 전달할 때 가치가 있다.</li>
+<li><b>기본형에는 기본형 특화 타입을, 성능 민감 경로에서는 측정 후 판단.</b> <code>OptionalInt</code> 등은 박싱을 피한다. 핫 루프에서는 앞의 실험처럼 할당이 남을 수 있으므로 프로파일러로 확인한 뒤 결정한다.</li>
+<li><b><code>==</code>와 <code>synchronized</code>를 쓰지 않는다.</b> 값 기반 클래스 규칙이다.</li>
+</ol>
+<p>경계에서의 변환도 정리해 두자. null을 돌려주는 오래된 API를 부르는 곳에서는 <code>Optional.ofNullable</code>로 감싸 안쪽 코드를 <code>Optional</code> 세계로 들인다. 반대로 null을 기대하는 API(일부 프레임워크의 콜백, 오래된 라이브러리)에 값을 넘겨야 하면 <code>orElse(null)</code>로 다시 풀어 준다. 이 두 변환을 각각 한 곳에 모아 두면, 그 사이의 코드는 null을 의식하지 않고 쓸 수 있다.</p>
+
+<h3>정리: Optional이 해결하는 것과 해결하지 않는 것</h3>
+<p><code>Optional</code>이 해결하는 문제는 "값이 없을 수 있다"는 정보가 시그니처에서 사라지는 것이다. 반환 타입이 그 정보를 싣고, 값을 꺼내는 모든 메서드가 빈 경우의 처리를 요구하므로, 호출자가 그 경우를 잊기 어렵다. 그리고 <code>map</code>·<code>flatMap</code>·<code>filter</code>로 빈 값이 자동으로 전파되므로 중첩 null 검사가 파이프라인으로 펴진다.</p>
+<p>해결하지 않는 문제도 분명하다. 자바의 타입 체계는 여전히 모든 참조 타입에 null을 허용하므로 <code>Optional</code> 변수 자체가 null일 수 있고, 컴파일러는 그것을 막지 않는다. 기존 API 대부분은 여전히 null을 돌려준다. 그리고 <code>Optional</code>은 "왜 없는지"를 담지 못한다. 이유가 중요한 실패는 예외나 별도의 결과 타입으로 표현해야 한다. 마지막으로 즉시 평가는 <code>Optional</code>과 무관한 언어 규칙이다. <code>orElse</code>의 함정은 <code>Optional</code>을 이해해서가 아니라 자바가 인자를 언제 계산하는지를 이해해야 피할 수 있다.</p>
+<p>이 회차의 지연 평가 감각은 다음 회차들에서 계속 쓰인다. 9회의 디폴트 메서드는 <code>Iterable.forEach</code>나 <code>Map.computeIfAbsent</code>처럼 함수를 받는 메서드를 기존 인터페이스에 추가한 장치이고, 10회의 병렬 스트림에서는 "람다가 언제, 어느 스레드에서 실행되는가"가 정확성 문제로 바뀐다. 11회의 함수형 프로그래밍에서는 <code>Optional</code>의 <code>map</code>·<code>flatMap</code>이 보여 준 "값을 감싼 채 함수를 이어 붙이는" 구조와 부작용 없는 함수라는 조건을 더 일반적인 원리로 정리한다. 스프링으로 돌아가면 스프링 데이터의 <code>findById</code>, 그리고 <code>ObjectProvider</code>나 트랜잭션 템플릿처럼 "필요할 때 계산하는 객체"를 넘기는 API가 모두 같은 원리 위에 있다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>null 타입</dt><dd>JLS §4.1의 이름 없는 타입으로, 모든 참조 타입의 하위 타입이다. 그래서 어떤 참조 변수에든 null이 들어갈 수 있고, 시그니처만으로는 "값이 없을 수 있음"을 알 수 없다.</dd>
+<dt>Optional의 구조</dt><dd>final 필드 <code>value</code> 하나를 가진 불변 final 클래스다. value가 null이면 비어 있음이고, 빈 값은 현재 구현에서 공유 객체 <code>EMPTY</code>를 쓴다. 그래서 null을 값으로 담을 수 없다.</dd>
+<dt>생성과 획득</dt><dd><code>of</code>는 null이면 즉시 NPE, <code>ofNullable</code>은 null이면 빈 값이다. 꺼낼 때는 비어 있을 때의 처리를 이름으로 드러내는 <code>orElse</code>·<code>orElseGet</code>·<code>orElseThrow</code>를 쓰고, <code>get()</code> 대신 같은 동작의 <code>orElseThrow()</code>(Java 10)를 쓴다.</dd>
+<dt>빈 값의 전파</dt><dd><code>map</code>·<code>flatMap</code>·<code>filter</code>는 비어 있으면 함수를 호출하지 않고 빈 값을 그대로 돌려준다. <code>map</code>은 결과를 <code>ofNullable</code>로 감싸 null을 빈 값으로 바꾸고, <code>flatMap</code>은 함수가 돌려준 Optional을 그대로 쓴다.</dd>
+<dt>즉시 평가</dt><dd>JLS §15.7.4·§15.12.4에 따라 자바는 메서드 본문을 실행하기 전에 인자를 왼쪽부터 모두 계산한다. 연산자 가운데 피연산자를 모두 계산하지 않는 예외는 <code>&&</code>, <code>||</code>, <code>? :</code>뿐이다.</dd>
+<dt>지연 평가</dt><dd>값 대신 값을 만드는 코드를 <code>Supplier</code> 같은 함수형 인터페이스 객체로 넘기고, 받는 쪽이 필요할 때만 호출하게 하는 방식이다. 람다 식 자체와 캡처한 값은 즉시 정해지고, 본문 실행만 미뤄진다.</dd>
+<dt>orElse vs orElseGet</dt><dd>값이 있을 때 <code>orElse</code>의 인자는 이미 계산되어 버려지고, <code>orElseGet</code>의 공급자는 호출되지 않는다. 기본값에 비용이나 부작용이 있으면 <code>orElseGet</code>이 필수다.</dd>
+<dt>JIT와 Optional</dt><dd>Optional 하나는 기본 설정의 HotSpot에서 16바이트다. 탈출하지 않으면 C2가 할당을 지울 수 있지만, 분기 프로파일과 버전에 따라 남을 수 있으며 필드·컬렉션에 저장된 Optional은 항상 할당된다.</dd>
+<dt>사용 규칙</dt><dd>반환 타입 전용, Optional 반환 메서드는 null 금지, 필드·매개변수·컬렉션에 쓰지 않음, 값 기반 클래스이므로 <code>==</code>·동기화 금지, Serializable이 아님.</dd>
+<dt>암묵적 null 검사와 빠른 예외</dt><dd>HotSpot은 null 참조를 통한 메모리 접근이 일으키는 SIGSEGV/SIGBUS를 신호 처리기에서 받아 NPE로 바꾼다. Helpful NPE 메시지는 <code>getMessage()</code>가 처음 불릴 때 계산된다. 같은 지점의 NPE가 잦으면 C2가 미리 만든 예외 객체를 던져 스택과 메시지가 사라지며, <code>-XX:-OmitStackTraceInFastThrow</code>로 끌 수 있다.</dd>
+<dt>클래스 초기화와 인라이닝</dt><dd>클래스는 JLS §12.4.1의 조건이 처음 일어날 때 초기화 락 아래에서 한 번만 초기화되므로 홀더 클래스로 스레드 안전한 지연 초기화를 얻는다(실패하면 다시 시도하지 않는다). C2가 Optional 할당을 지우려면 Optional을 주고받는 호출이 모두 인라인되어야 한다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 <code>Optional</code> 관련 장애는 대부분 <code>Optional</code> 자체가 아니라 평가 시점에서 나온다. "회원이 있는데도 게스트 회원 행이 계속 생긴다", "캐시 적중률은 높은데 원격 API 호출 수가 줄지 않는다", "정상 요청에서 이유 없이 유니크 제약 위반이 난다" 같은 증상을 보면 <code>orElse(부작용이 있는 호출)</code>이나 공급자가 아닌 값을 받는 대체 경로를 먼저 의심한다. 결과값은 정상이라 단위 테스트로 잡히지 않으므로, 기본값 계산에 부작용이 있는 메서드가 <code>orElse</code>의 인자로 들어가는지를 코드 리뷰 체크 항목으로 두는 편이 확실하다.</p>
+<p>API를 설계할 때의 판단 기준은 "없음이 정상적인 결과인가"다. 조회 결과가 없는 것이 흔하고 호출자가 그 경우를 다르게 처리해야 한다면 <code>Optional</code> 반환이 맞다. 반대로 없으면 진행할 수 없는 상황(필수 설정값, 방금 저장한 엔티티)이라면 <code>Optional</code>로 호출자에게 판단을 떠넘기지 말고 메서드 안에서 의미 있는 예외를 던지는 편이 낫다. 없는 이유가 여러 가지이고 호출자가 그 이유에 따라 다르게 반응해야 한다면 <code>Optional</code>은 정보를 잃는다. 그때는 예외 계층이나 상태를 담은 결과 타입을 쓴다.</p>
+<p>성능에 대한 판단은 측정에 맡긴다. 웹 요청 하나에서 DB 조회 결과를 <code>Optional</code>로 감싸는 비용은 측정할 가치도 없을 만큼 작고, JIT가 지우는 경우도 많다. 반면 수백만 개 원소를 가진 캐시 엔트리의 필드나, 초당 수천만 번 도는 계산 루프에서는 할당이 실제로 남는다는 것을 이 회차의 실험이 보여 준다. 그런 경로에서는 null과 명확한 문서화, 또는 기본형 특화 타입이 낫다. 어느 쪽이든 할당 프로파일러(JFR의 할당 이벤트 등)로 확인한 뒤 바꾼다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 코드의 출력을 순서대로 적어라. <code>static int calls = 0; static String fallback() { calls++; return "F"; }</code>가 있고, <code>Optional<String> p = Optional.of("P");</code>일 때 <code>p.orElse(fallback()); p.orElseGet(() -> fallback()); Optional.empty().or(() -> Optional.of(fallback())); System.out.println(calls);</code></li>
+<li><code>Optional.of("abc").map(s -> s.length() > 5 ? s : null).flatMap(s -> Optional.of(s.toUpperCase())).orElse("short")</code>의 결과를 구하고, 각 단계에서 <code>Optional</code>이 어떤 상태인지(값/빈 값, <code>EMPTY</code>인지 새 객체인지) 추적하라. 이어서 <code>flatMap</code>의 람다가 <code>Optional</code> 대신 <code>null</code>을 돌려주도록 바꾸면 어떤 입력에서 무엇이 일어나는지 설명하라.</li>
+<li><code>String target = null; target.equals(audit("check"));</code>에서 <code>audit</code>이 감사 로그를 DB에 쓰는 메서드라면, NPE가 난 뒤 감사 로그는 기록되어 있는가? JLS §15.12.4의 단계 순서와 바이트코드 순서로 근거를 대라.</li>
+<li>동료가 <code>class Profile implements Serializable { private Optional<String> nickname = Optional.empty(); }</code>를 만들었다. 이 설계에서 생길 수 있는 문제를 세 가지 이상 들고, 대안 코드를 제시하라.</li>
+<li><code>Supplier<List<String>> s = () -> loadFromDb();</code>를 받은 메서드가 <code>if (s.get().isEmpty()) return; for (String x : s.get()) { ... }</code>처럼 쓴다. 무엇이 문제이며, 이 회차의 어떤 개념으로 설명되는가? 고친 코드를 쓰라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 출력은 <code>2</code>다. <code>p.orElse(fallback())</code>에서는 인자가 호출 전에 평가되므로 <code>p</code>에 값이 있어도 <code>fallback()</code>이 실행되어 <code>calls</code>가 1이 된다. <code>p.orElseGet(...)</code>에서는 값이 있으므로 공급자가 호출되지 않는다. <code>Optional.empty().or(...)</code>는 비어 있으므로 공급자가 호출되고, 그 안에서 <code>fallback()</code>이 실행되어 2가 된다. 지연되는 것은 공급자 본문뿐이고 <code>orElse</code>의 인자는 지연되지 않는다는 점이 핵심이다.</p>
+<p><b>2번.</b> <code>Optional.of("abc")</code>는 값 "abc"를 가진 새 객체다. <code>map</code>의 람다는 길이 3이 5보다 크지 않으므로 null을 돌려주고, <code>map</code>은 이것을 <code>ofNullable</code>로 감싸 <code>EMPTY</code>가 된다. <code>flatMap</code>은 비어 있으므로 람다를 호출하지 않고 <code>empty()</code>(<code>EMPTY</code>)를 돌려준다. <code>orElse("short")</code>는 "short"를 반환한다. <code>flatMap</code> 람다가 null을 돌려주도록 바꾸면 이 입력에서는 아무 일도 없다. 람다가 아예 호출되지 않기 때문이다. 하지만 길이가 6 이상인 문자열이 들어오면 <code>flatMap</code>이 람다를 호출하고, 결과 null에 대해 <code>Objects.requireNonNull(r)</code>이 NPE를 던진다. 버그가 특정 입력에서만 드러나는 전형적인 예다.</p>
+<p><b>3번.</b> 기록되어 있다. JLS §15.12.4에서 인자 평가(§15.12.4.2)가 대상 참조의 null 검사(§15.12.4.4)보다 먼저다. 바이트코드도 <code>aload</code>(null 참조) → <code>ldc "check"</code> → <code>invokestatic audit</code> → <code>invokevirtual equals</code> 순서이고, NPE는 마지막 <code>invokevirtual</code>에서 JVM이 대상을 확인할 때 발생한다. 따라서 <code>audit</code>의 DB 쓰기는 이미 끝났다. 트랜잭션 안이라면 예외로 롤백될 수 있지만, 그것은 트랜잭션 경계의 문제이지 평가 순서가 막아 준 것이 아니다.</p>
+<p><b>4번.</b> (1) <code>Optional</code>은 <code>Serializable</code>이 아니므로 이 객체를 직렬화하면 <code>NotSerializableException: java.util.Optional</code>이 난다. 값이 비어 있어도 <code>EMPTY</code> 객체가 필드에 있으므로 마찬가지다. (2) 필드에 <code>null</code>이 대입될 가능성(생성자에서 빠뜨림, 리플렉션 기반 바인딩)이 남아 "Optional 변수는 null이 아니어야 한다"는 규칙이 깨질 수 있다. (3) 값이 있는 객체마다 16바이트 객체와 참조 한 단계가 늘어난다. (4) Javadoc이 의도한 용도(반환 타입)를 벗어난다. 대안은 필드를 <code>private String nickname;</code>(nullable)으로 두고 <code>public Optional<String> findNickname() { return Optional.ofNullable(nickname); }</code>처럼 조회 메서드에서만 감싸는 것이다.</p>
+<p><b>5번.</b> <code>Supplier</code>는 결과를 기억하지 않으므로 <code>s.get()</code>을 두 번 부르면 <code>loadFromDb()</code>가 두 번 실행된다(이름에 의한 호출). 쿼리가 두 번 나가고, 두 호출 사이에 데이터가 바뀌면 검사한 리스트와 순회하는 리스트가 다를 수도 있다. 지연 평가로 받은 값은 한 번만 꺼내 지역 변수에 담아 쓴다. <code>List<String> list = s.get(); if (list.isEmpty()) return; for (String x : list) { ... }</code>.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q><code>opt.orElse(compute())</code>에서 <code>opt</code>에 값이 있는데도 <code>compute()</code>가 실행되는 가장 정확한 이유는?</q>
+<o><code>orElse</code>의 구현이 값이 있는지 확인하기 전에 <code>other</code>를 먼저 읽기 때문이다.</o>
+<o>JIT 컴파일러가 최적화를 위해 <code>compute()</code>를 미리 실행하기 때문이다.</o>
+<o>자바는 메서드를 호출하기 전에 인자 식을 모두 평가하므로, <code>orElse</code>에 들어오기 전에 <code>compute()</code>가 이미 실행되기 때문이다.</o>
+<o><code>Optional</code>이 내부적으로 기본값을 캐시해 두기 위해 호출하기 때문이다.</o>
+<why>JLS §15.12.4는 인자 평가(§15.12.4.2)를 메서드 프레임 생성(§15.12.4.5)보다 앞에 둔다. 바이트코드에서도 <code>invokestatic compute</code>가 <code>invokevirtual orElse</code>보다 먼저 나온다. <code>orElse</code>의 본문은 <code>value != null ? value : other</code>로, 값이 있으면 <code>other</code>를 쓰지 않는다. 즉 메서드 안이 아니라 호출 전에 계산이 일어난다. JIT는 프로그램의 관찰 가능한 동작을 바꾸지 않으며, Optional에 기본값 캐시는 없다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>Optional.of(member).map(Member::address)</code>에서 <code>address()</code>가 null을 돌려주면 결과는?</q>
+<o><code>NullPointerException</code>이 발생한다.</o>
+<o>빈 <code>Optional</code>이 된다.</o>
+<o>값으로 null을 담은 <code>Optional</code>이 된다.</o>
+<o>컴파일 오류가 난다. <code>map</code>의 함수는 null을 돌려줄 수 없다.</o>
+<why><code>map</code>은 함수 결과를 <code>Optional.ofNullable</code>로 감싸므로 null 결과는 빈 <code>Optional</code>이 된다. <code>Optional</code>은 <code>value</code> 필드 하나로 존재 여부를 판단하므로 null을 값으로 담는 상태(2번)는 구조적으로 불가능하다. NPE(0번)는 <code>flatMap</code>의 함수가 null을 돌려줄 때 일어나는 일이다. 함수의 반환값이 null인지는 컴파일러가 판단하지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>Supplier로 지연 평가를 할 때 "즉시" 정해지는 것은?</q>
+<o>람다 본문이 호출하는 메서드의 반환값</o>
+<o>람다 본문이 읽는 정적 필드의 값</o>
+<o>람다 본문을 처음 실행한 결과. 이후 <code>get()</code>은 그 결과를 재사용한다</o>
+<o>람다 객체 자체와, 람다가 캡처한 지역 변수의 값</o>
+<why>람다 식에 도달하면 함수형 인터페이스 구현 객체가 만들어지고, 캡처한 지역 변수(사실상 final)의 값이 그 순간 복사된다. 본문은 <code>get()</code>이 호출될 때마다 실행되며, 본문이 읽는 필드는 그 순간의 값이다. Supplier는 결과를 기억하지 않으므로(이름에 의한 호출) 2번은 틀렸다. 결과 재사용이 필요하면 직접 메모이제이션을 구현해야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>Optional</code>을 엔티티나 DTO의 필드 타입으로 쓰지 말라는 규칙의 근거로 가장 거리가 먼 것은?</q>
+<o><code>Optional</code>은 제네릭 클래스라서 필드 타입으로 선언하면 컴파일 오류가 나기 때문이다.</o>
+<o><code>Optional</code>은 <code>Serializable</code>을 구현하지 않아 직렬화 시 예외가 나기 때문이다.</o>
+<o>Javadoc이 주된 용도를 메서드 반환 타입으로 밝히고 있기 때문이다.</o>
+<o>필드 자체가 null인 상태를 막지 못해 "Optional 변수는 null이 아니어야 한다"는 규칙이 깨질 수 있기 때문이다.</o>
+<why><code>Optional<String></code> 필드 선언은 문법적으로 완전히 합법이며 컴파일된다. 규칙의 근거는 직렬화 불가(1번, 직접 실행 시 <code>NotSerializableException: java.util.Optional</code>), Javadoc의 API 노트(2번), 필드가 null일 가능성(3번), 그리고 객체마다 늘어나는 할당과 간접 참조다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>JDK 21에서 <code>Optional.of(s).map(String::length).orElse(0)</code>를 도는 핫 루프는 기본 옵션에서 할당이 0바이트였지만, <code>-XX:CompileCommand=dontinline,java.util.Optional::map</code>을 주자 호출당 32바이트가 되었다(문자열 길이는 1~5). 가장 정확한 설명은?</q>
+<o><code>dontinline</code>이 그 메서드를 포함한 컴파일 단위 전체의 탈출 분석을 끄기 때문이다.</o>
+<o>인라인되지 않은 <code>map</code> 호출에 <code>of</code>의 결과가 수신 객체로 넘어가 NoEscape가 될 수 없고, <code>map</code>의 결과도 <code>map</code> 안에서 할당되어 반환되므로 16바이트 <code>Optional</code> 두 개가 지워지지 않는다.</o>
+<o><code>map</code>이 인라인되지 않으면 <code>String::length</code>의 결과가 매번 새 <code>Integer</code>로 박싱되기 때문이다.</o>
+<o>인라인되지 않은 메서드 안에서는 <code>Optional</code>이 압축 참조를 쓰지 못해 32바이트가 되기 때문이다.</o>
+<why>C2의 탈출 분석은 한 컴파일 단위 안에서 일어나며, 호출의 인자(수신 객체 포함)로 넘겨지는 객체는 ArgEscape라 스칼라 치환되지 않는다. <code>of</code>나 <code>orElse</code>만 끊었을 때는 16바이트(<code>Optional</code> 하나)만 남으므로 탈출 분석 자체가 꺼진 것이 아니다(0번 오답). 길이 1~5는 <code>Integer</code> 캐시 범위라 박싱 할당이 없다(2번 오답). 객체 크기는 인라인 여부와 무관하며 기본 설정에서 <code>Optional</code> 하나는 16바이트다(3번 오답).</why>
+</x-quiz>
+
+<x-glossary>
+<dt>Optional</dt><dd>값이 있을 수도 없을 수도 있음을 나타내는 <code>java.util</code>의 불변 컨테이너 클래스(Java 8). non-null 값 하나를 담거나 비어 있다.</dd>
+<dt>값 기반 클래스(value-based class)</dt><dd>식별자가 아니라 필드 값으로 동등성을 정하고, 같은 값의 인스턴스를 바꿔 써도 되는 클래스. <code>==</code>, 동기화, 식별 해시 같은 식별자 민감 연산을 쓰지 말아야 한다.</dd>
+<dt>즉시 평가(eager evaluation)</dt><dd>식을 만나는 즉시 값으로 계산하는 방식. 자바의 메서드 인자는 호출 전에 모두 즉시 평가된다.</dd>
+<dt>지연 평가(lazy evaluation)</dt><dd>값이 실제로 필요할 때까지 계산을 미루는 방식. 자바에서는 계산을 함수형 인터페이스 객체로 감싸 넘겨 구현한다.</dd>
+<dt>이름에 의한 호출(call by name)</dt><dd>인자를 계산 방법으로 넘기고 쓸 때마다 다시 계산하는 평가 전략. Supplier의 기본 동작이 이와 같다.</dd>
+<dt>필요에 의한 호출(call by need)</dt><dd>처음 필요할 때 한 번 계산하고 결과를 기억해 재사용하는 평가 전략. 자바에서는 메모이제이션을 직접 구현해야 한다.</dd>
+<dt>Helpful NullPointerException</dt><dd>JEP 358로 JDK 14에 들어오고 JDK 15부터 기본으로 켜진 기능. JVM이 바이트코드를 분석해 무엇이 null이었는지 예외 메시지에 적는다.</dd>
+<dt>탈출 분석(escape analysis)과 스칼라 치환(scalar replacement)</dt><dd>객체가 만들어진 범위 밖으로 나가지 않음을 증명해 힙 할당 없이 필드를 지역 값으로 다루는 HotSpot C2의 최적화. 명세가 보장하는 동작은 아니다.</dd>
+<dt>암묵적 null 검사(implicit null check)</dt><dd>비교 명령 없이, null 참조로 메모리에 접근할 때 생기는 하드웨어 폴트(SIGSEGV/SIGBUS)를 신호 처리기가 받아 NPE로 바꾸는 HotSpot의 구현 방식. 필드 오프셋이 첫 페이지 안일 때만 쓴다.</dd>
+<dt>인라이닝(inlining)</dt><dd>호출되는 메서드의 본문을 호출한 쪽 코드 안에 펼쳐 넣는 JIT 최적화. C2의 탈출 분석은 인라인된 범위 안에서만 객체가 탈출하지 않음을 증명할 수 있다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Optional.html">Java SE 21 API: java.util.Optional</a> — 메서드별 동작, 도입 버전, 반환 타입 용도에 대한 API 노트</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/doc-files/ValueBased.html">Java SE 21: Value-based Classes</a> — 값 기반 클래스의 조건과 식별자 민감 연산 금지</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html">JLS SE 21 Chapter 15</a> — §15.7 평가 순서, §15.12.4 메서드 호출의 실행 단계, §15.23 조건부 AND</li>
+<li><a href="https://openjdk.org/jeps/358">JEP 358: Helpful NullPointerExceptions</a> — NPE 상세 메시지, JDK 14 도입, 지역 변수 이름과 -g</li>
+<li><a href="https://openjdk.org/jeps/390">JEP 390: Warnings for Value-Based Classes</a> — synchronized 경고와 DiagnoseSyncOnValueBasedClasses 옵션</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.logging/java/util/logging/Logger.html">Java SE 21 API: java.util.logging.Logger</a> — Supplier로 메시지 생성을 미루는 로그 메서드</li>
+</x-refs>

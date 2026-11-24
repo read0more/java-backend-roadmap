@@ -1,0 +1,8 @@
+- 05-tx-jdbc: 2026-11-20 검수 확인 94건 · 링크 수정 5건 · 본문 수정 4건 · 전환 0건 — 링크 61개 절 대조 모두 일치, x-body 6개 코드 재실행 출력 일치(JDK 21.0.13·Spring 6.2.19·H2 2.3.232·HikariCP 6.3.3). 배경 x-see 5개 추가, 소켓 타임아웃 항목의 쿼리 타임아웃 서술을 Javadoc 범위로 좁힘
+- 01-java-core: 2026-11-20 검수 확인 97건 · 링크 수정 9건 · 본문 수정 6건 · 전환 2건 — static 컬렉션 누수와 getMessage 로그는 강의에 이미 있어 링크로 전환, Files 스트림 항목은 03 영역과 겹쳐 삭제, divide 선호 스케일과 subList 구조적 수정 정의 보정, split에 adv2/04 링크 추가
+- 02-concurrency: 2026-11-20 검수 확인 107건 · 링크 수정 2건 · 본문 수정 7건 · 전환 1건 — 링크 63개 절 전부 대조 이상 없음. CHM 가변 값 항목은 java-adv1/11 연습 4가 이미 설명해 링크로 전환. 본문 5개 코드·출력 재실행, this-escape 횟수 서술·SimpleDateFormat 고친 뒤 출력·SharedPool import 보정
+- 02-concurrency: 2026-11-20 검수 확인 104건 · 링크 수정 3건 · 본문 수정 3건 · 전환 0건 — 링크 65개 절 대조 모두 실수와 원인을 설명함. 본문 5개 코드·고친 코드·javac 경고·Spring 6.2.19 실험 전부 재실행 일치, 참고 URL 12개 인용 확인. CHM 값 리스트 잔존 수치와 풀 회수 조건 서술 보정, SimpleDateFormat에 spring-mvc2/10 링크 추가
+- 06-jpa: 2026-11-20 검수 확인 110건 · 링크 수정 2건 · 본문 수정 1건 · 전환 0건 — 링크 72개 절 대조 모두 일치, x-body 5개 코드 재실행 출력 일치(JDK 21.0.13·Hibernate 6.6.53·H2 2.3.232·Lombok 1.18.46), x-refs 10개 원문 대조. 배경 x-see 2개 추가, readOnly 서술을 직접 실행 결과로 보강
+- 04-spring: 2026-11-20 검수 확인 96건 · 링크 수정 9건 · 본문 수정 5건 · 전환 0건 — 링크 38개 절 대조 일치, x-body 8개 코드 재실행 출력 일치. PRG 항목은 03 io-no-prg와 겹쳐 삭제(25개). @Async 실행기 링크를 adv1/13 해당 절로 교체, 스레드 한도·SHA-256 서술을 Javadoc·OWASP 범위로 좁힘, 배경 링크 5개 추가
+- 03-io-net: 2026-11-20 검수 확인 162건 · 링크 수정 7건 · 본문 수정 11건 · 전환 0건 — 링크 62개 절 대조, x-body 9개 코드 재실행 출력 일치. 리플렉션 항목 삭제, 소켓·HTTP 타임아웃 항목 합침(35개). HttpClient 스레드·연결 수명을 실측으로 보정, readAllLines·DNS 리바인딩·URL deprecated 서술 수정, Referer 링크 추가
+- 추가: 2026-11-20 tx-synchronized-transactional·jpa-jdbc-mix-without-flush 항목 추가 — 전자는 본문(H2 재현: 락 해제 뒤 커밋으로 갱신 손실, 원자적 UPDATE·FOR UPDATE·버전 열로 해결), 후자는 spring-db2/06 등 링크

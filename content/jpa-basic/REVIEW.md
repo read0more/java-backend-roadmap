@@ -1,0 +1,12 @@
+- 10: 2026-11-17 확인 45건 · 수정 2건 — ListResultsConsumer 중복 제거 기준 식별자→객체 동일성(IdentityHashMap), MultipleBagFetchException 발생 시점 createQuery 아닌 getResultList로 정정
+- 02: 2026-11-17 확인 32건 · 수정 5건 — InnoDB 잠금 유지 범위를 수정·삭제한 행으로 좁힘, 락 교차참조를 스프링 데이터 JPA로, detach 전 flush는 권고가 아닌 must, stale 경고는 COMMIT 모드만, 대부분의 앱 서술 제거
+- 01: 2026-11-17 확인 38건 · 수정 3건 — 출처 없던 H2Dialect 출력 언급을 방언 객체 출력으로 명시, 시작 로그 생략 범위 라벨 보정, ByteBuddy 누락 예외를 ServiceConfigurationError(원인 NoClassDefFoundError)로 정정
+- 04: 2026-11-17 확인 24건 · 수정 7건 — persist 시점 PropertyValueException을 check_nullability 조건으로 한정, StackOverflowError 맨 위 프레임 실행마다 다름 명시, 생략한 출력 줄 밝힘
+- 03: 2026-11-17 확인 32건 · 수정 3건 — 부트 시 실패 예시 '존재하지 않는 생성기 이름'(6.6은 시퀀스 이름으로 써서 기동 성공)→@Id 없는 엔티티, @Table 속성·컬럼 순서 설정 범위를 3.1·6.6으로 좁힘
+- 07: 2026-11-17 확인 40건 · 수정 1건 — JPA 3.2 PersistenceUnitUtil 추가 메서드 목록에 Attribute를 받는 isLoaded·load 오버로드 누락 보완. 실행 결과·예외 문구·명세 절·Javadoc 인용은 Hibernate 6.6.53 재실행과 원문으로 일치 확인
+- 05: 2026-11-17 확인 50건 · 수정 2건 — 읽기 전용 지정을 뺀 일대다 실행 결과의 직원 INSERT 컬럼 순서를 실측(department_id,name,id)으로 정정, 07회에 없는 OrphanRemovalAction 등장 예고 삭제
+- 06: 2026-11-17 확인 25건 · 수정 0건 — 수정 없음. 모든 DDL·SQL·예외 문구를 Hibernate 6.6.53+H2 2.3.232로 재실행해 일치 확인, 명세 3.1·UG 6.6·MySQL 문서 인용 확인
+- 08: 2026-11-17 확인 25건 · 수정 4건 — JLS 5.1.7 캐시 보장을 상수 표현식·valueOf Javadoc으로 정정, @Embeddable 생략 가능 오기 정정, 07회를 다음 회차로 쓴 표현 2곳 정정
+- 09: 2026-11-17 확인 74건 · 수정 6건 — 인젝션 결과 2명→4명, 입력 파라미터는 WHERE·HAVING·SET에서만 사용(지원 요구 아님), 롤백 예외 목록 보완, 무접미사 리터럴 규칙은 3.2, Asset 6회 출처 정정
+- 09: 2026-11-19 MySQL 실측 9건 · 채움/수정 4건 — 페이징·NOT IN·함수 SQL을 8.4/8.0에서 확인, OFFSET 대 키셋 Handler_read 실측(10만 행) 추가
+- 06: 2026-11-19 MySQL 실측 9건 · 채움/수정 4건 — UNION ALL 파생 테이블 조건 밀어 넣기 EXPLAIN(on/off, 8.0.46·8.4.13), CHECK 위반 ERROR 3819, ERROR 1364, READ 예약어 ERROR 1064 실측 추가

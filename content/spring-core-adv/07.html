@@ -1,0 +1,656 @@
+<x-meta>
+deck: @Aspect 클래스 하나가 컨테이너 안에서 어드바이저로 바뀌어 프록시가 되는 과정을 소스와 호출 스택으로 따라가고, 핵심 기능과 부가 기능, 애스펙트, 세 가지 위빙 시점, AOP 용어를 바이트코드까지 내려가 정리한다.
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li>로그 추적기를 <code>@Aspect</code> 클래스 하나로 옮기고, 그 클래스가 <code>AnnotationAwareAspectJAutoProxyCreator</code> 안에서 <code>InstantiationModelAwarePointcutAdvisorImpl</code>과 <code>AspectJAroundAdvice</code>로 바뀌는 과정을 단계별로 설명할 수 있다.</li>
+<li>프록시 메서드 호출 한 번이 <code>JdkDynamicAopProxy</code>나 <code>CglibAopProxy</code>에서 <code>ReflectiveMethodInvocation</code>, <code>ExposeInvocationInterceptor</code>, <code>AspectJAroundAdvice</code>, <code>Method.invoke</code>를 거쳐 타깃에 닿는 호출 스택을 읽고 각 프레임의 역할을 말할 수 있다.</li>
+<li>핵심 기능과 부가 기능, 횡단 관심사가 코드에 흩어지고 뒤엉키는 모습을 예로 설명하고, 애스펙트가 무엇을 하나로 모으는지 말할 수 있다.</li>
+<li>컴파일 시점, 클래스 로딩 시점, 런타임 위빙을 구분하고, 로드 타임 위빙으로 바뀐 클래스의 바이트코드를 근거로 프록시 방식이 놓치는 조인 포인트(private 메서드, 내부 호출, 빈이 아닌 객체, static·final 메서드)를 예측할 수 있다.</li>
+<li>조인 포인트, 포인트컷, 타깃, 어드바이스, 애스펙트, 어드바이저, 위빙, AOP 프록시, 인트로덕션을 실험에서 본 값(<code>getKind()</code>, <code>getThis()</code>, <code>getTarget()</code>)과 짝지어 정의할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>여섯 회차를 지나 남은 번거로움</h3>
+<p>이 권의 로그 추적기는 지금까지 여섯 번 모양을 바꿨다. 01회에서는 요청마다 따로 있어야 할 추적 문맥을 ThreadLocal에 담았고, 02회에서는 시작·종료·예외 처리라는 뼈대를 템플릿과 콜백으로 한곳에 모았다. 03회에서는 원래 코드를 고치지 않으려고 같은 인터페이스를 구현한 프록시를 앞에 세웠고, 04회에서는 그 프록시 클래스를 JDK 동적 프록시와 CGLIB가 실행 중에 만들게 했다. 05회에서는 스프링의 <code>ProxyFactory</code>가 두 기술을 하나의 추상화로 묶으면서 "어디에 적용할 것인가"(포인트컷)와 "무엇을 할 것인가"(어드바이스)를 어드바이저라는 한 쌍으로 나눴다. 06회에서는 빈 후처리기가 컨테이너에 등록된 어드바이저를 찾아 조건에 맞는 빈을 프록시로 바꿔치기하게 했다.</p>
+<p>06회까지 오면 애플리케이션 코드에는 추적 코드가 한 줄도 남지 않는다. 남은 일은 어드바이저를 빈으로 등록하는 것뿐이다. 그런데 그 등록 코드를 다시 보면 성격이 다른 세 조각이 서로 다른 곳에 있다. 지금까지의 도구만으로 로그 추적 어드바이저를 쓰면 대략 다음과 같은 모양이 된다.</p>
+<pre><code class="language-java">// 부가 기능: MethodInterceptor 구현 클래스
+public class CallTraceInterceptor implements MethodInterceptor {
+
+    private final CallTracer tracer;
+
+    public CallTraceInterceptor(CallTracer tracer) {
+        this.tracer = tracer;
+    }
+
+    @Override
+    public Object invoke(MethodInvocation invocation) throws Throwable {
+        TraceScope scope = null;
+        try {
+            scope = tracer.begin(invocation.getMethod().getName());
+            Object result = invocation.proceed();
+            tracer.end(scope);
+            return result;
+        } catch (Exception e) {
+            tracer.fail(scope, e);
+            throw e;
+        }
+    }
+}
+
+// 적용 위치와 조립: 설정 클래스의 @Bean 메서드
+@Configuration
+public class TraceAdvisorConfig {
+
+    @Bean
+    public Advisor callTraceAdvisor(CallTracer tracer) {
+        AspectJExpressionPointcut pointcut = new AspectJExpressionPointcut();
+        pointcut.setExpression("execution(* hello.app..*(..))");
+        return new DefaultPointcutAdvisor(pointcut, new CallTraceInterceptor(tracer));
+    }
+}</code></pre>
+<p>이 코드가 틀린 것은 아니다. 다만 "어떤 부가 기능을 어디에 붙이는가"라는 하나의 결정이 인터셉터 클래스, 포인트컷 문자열, 어드바이저를 만드는 <code>@Bean</code> 메서드로 쪼개져 있다. 부가 기능이 늘어나면 문제가 커진다. 메서드 시작 전에만 할 일, 정상 반환 뒤에만 할 일, 예외가 났을 때만 할 일이 따로 있다면 그때마다 인터셉터 클래스와 어드바이저 빈이 하나씩 늘어난다. 그리고 그 셋이 실제로는 한 묶음이라는 사실은 코드 어디에도 적혀 있지 않다.</p>
+<p>이 회차의 앞부분은 이 세 조각을 애너테이션이 붙은 클래스 하나로 모으는 <code>@Aspect</code>를 다룬다. 겉으로는 새 기능처럼 보이지만, 컨테이너 안에서는 06회에서 본 것과 똑같은 어드바이저로 바뀐다. 그 변환이 어디에서 어떻게 일어나는지가 이 회차의 첫 번째 질문이다. 뒷부분에서는 한 걸음 물러나, 지금까지 만든 것을 AOP(Aspect-Oriented Programming, 관점 지향 프로그래밍)라는 이름 아래 정리한다. 부가 기능이 왜 객체지향만으로는 잘 모이지 않는지, 부가 기능을 핵심 코드에 끼워 넣는 방식에는 무엇이 있는지, 그리고 AOP 용어가 실제로 어떤 객체를 가리키는지를 본다.</p>
+<aside class="note">이 회차의 실행 결과는 원고를 쓰면서 JDK 21.0.13(Temurin), 스프링 프레임워크 6.2.19(<code>spring-aop</code>, <code>spring-context</code> 등), AspectJ 위버 1.9.25.1로 직접 돌려 얻었다. 스프링 부트 없이 <code>AnnotationConfigApplicationContext</code>로 실행했다. 본문에 인용한 스프링 내부 코드는 <code>spring-aop</code> 7.0.10 소스에서 읽었고, 같은 클래스·메서드·필드가 6.2.19 바이너리에도 있는지 <code>javap</code>로 확인했다. 내부 클래스 이름과 구조는 공개 API가 아니어서 버전에 따라 달라질 수 있다. 프록시 클래스 번호(<code>$Proxy17</code>의 17)처럼 환경마다 다른 값은 그렇다고 밝혔다.</aside>
+
+<h3>@Aspect 프록시 — 적용</h3>
+<p>앞의 세 조각을 애스펙트(aspect) 클래스 하나로 옮기면 다음과 같다. 추적기 인터페이스 <code>CallTracer</code>와 <code>TraceScope</code>는 01회에서 만든 것을 그대로 쓴다. 추적 대상 코드는 <code>hello.app</code> 패키지 아래에 있다고 하자.</p>
+<pre><code class="language-java">package hello.trace.aspect;
+
+import hello.trace.CallTracer;
+import hello.trace.TraceScope;
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+
+@Aspect
+public class CallTraceAspect {
+
+    private final CallTracer tracer;
+
+    public CallTraceAspect(CallTracer tracer) {
+        this.tracer = tracer;
+    }
+
+    @Around("execution(* hello.app..*(..))")
+    public Object trace(ProceedingJoinPoint joinPoint) throws Throwable {
+        TraceScope scope = null;
+        try {
+            scope = tracer.begin(joinPoint.getSignature().toShortString());
+            Object result = joinPoint.proceed();
+            tracer.end(scope);
+            return result;
+        } catch (Exception e) {
+            tracer.fail(scope, e);
+            throw e;
+        }
+    }
+}</code></pre>
+<pre><code class="language-java">@Configuration
+@EnableAspectJAutoProxy   // 스프링 부트라면 자동 구성이 대신 켠다
+public class AopConfig {
+
+    @Bean
+    public CallTraceAspect callTraceAspect(CallTracer tracer) {
+        return new CallTraceAspect(tracer);
+    }
+}</code></pre>
+<p>한 줄씩 보자. 클래스에 붙은 <code>@Aspect</code>는 "이 클래스는 애스펙트다"라는 표시다. import 문을 보면 이 애너테이션은 스프링이 아니라 <code>org.aspectj.lang.annotation</code> 패키지에 있다. AspectJ 프로젝트가 AspectJ 5에서 도입한 애너테이션 방식(이른바 @AspectJ 스타일)을 스프링이 그대로 받아들인 것이다. 스프링 레퍼런스는 이 관계를 분명히 적는다. 스프링은 AspectJ 5와 같은 애너테이션을 해석하고 포인트컷의 파싱과 매칭에는 AspectJ가 제공하는 라이브러리를 쓰지만, AOP 실행 자체는 여전히 순수한 스프링 AOP이며 AspectJ 컴파일러나 위버에 의존하지 않는다. 그래서 애플리케이션 클래스패스에 AspectJ의 <code>org.aspectj:aspectjweaver</code> 라이브러리(1.9 이상)가 있어야 한다. 이름에 "weaver"가 들어 있지만 여기서 쓰는 것은 애너테이션과 <code>ProceedingJoinPoint</code> 같은 API 타입, 포인트컷 표현식의 파서와 매처이고, 바이트코드를 바꾸는 위빙 기능은 쓰지 않는다.</p>
+<p>메서드에 붙은 <code>@Around("execution(* hello.app..*(..))")</code>는 두 가지를 한꺼번에 선언한다. 괄호 안의 문자열이 포인트컷이고, 메서드 본문이 어드바이스다. 06회의 설정 코드에서 <code>AspectJExpressionPointcut</code>에 <code>setExpression</code>으로 넣던 문자열이 그대로 애너테이션 속성으로 옮겨 왔다. 표현식은 "<code>hello.app</code> 패키지와 그 하위 패키지에 있는 모든 타입의, 반환 타입·이름·매개변수가 무엇이든 상관없는 모든 메서드 실행"이라는 뜻이다. 표현식 문법은 09회에서 자세히 다루므로 여기서는 이 뜻만 기억하자.</p>
+<p>어드바이스 메서드가 받는 <code>ProceedingJoinPoint</code>는 05회의 <code>MethodInvocation</code>과 같은 자리에 있다. <code>proceed()</code>를 부르면 다음 어드바이스나 실제 대상 메서드가 실행되고 그 반환값이 돌아온다. 그 앞뒤에 무엇을 하든 어드바이스의 자유지만, 그 자유에는 책임이 따른다. 스프링 레퍼런스는 어라운드 어드바이스를 "조인 포인트로 진행할지, 아니면 자기 반환값을 돌려주거나 예외를 던져 대상 메서드 실행을 건너뛸지 고르는 책임이 있는" 어드바이스로 정의한다. <code>proceed()</code> 호출을 빠뜨리면 대상 메서드는 아예 실행되지 않고, <code>return result</code> 대신 <code>return null</code>을 쓰면 호출한 쪽은 대상이 무엇을 반환했든 <code>null</code>을 받는다. 예외를 기록한 뒤 같은 객체를 다시 던지는 이유는 01회에서 본 것과 같다. 추적기는 관찰자이므로 호출 결과를 바꾸면 안 된다.</p>
+<p>두 방식을 나란히 놓으면 무엇이 어디로 옮겨 갔는지 보인다.</p>
+<div class="table-wrap"><table><thead><tr><th>역할</th><th>어드바이저를 직접 조립할 때</th><th>@Aspect로 쓸 때</th></tr></thead><tbody>
+<tr><td>적용 위치(포인트컷)</td><td><code>AspectJExpressionPointcut</code> 객체와 <code>setExpression</code></td><td><code>@Around</code>의 문자열</td></tr>
+<tr><td>부가 기능(어드바이스)</td><td><code>MethodInterceptor.invoke</code> 구현 클래스</td><td><code>@Around</code>가 붙은 메서드의 본문</td></tr>
+<tr><td>다음으로 진행</td><td><code>MethodInvocation.proceed()</code></td><td><code>ProceedingJoinPoint.proceed()</code></td></tr>
+<tr><td>둘을 묶는 단위</td><td><code>DefaultPointcutAdvisor</code>를 반환하는 <code>@Bean</code></td><td>애스펙트 클래스 자체(어드바이스 메서드 수만큼 어드바이저가 된다)</td></tr>
+<tr><td>등록</td><td>어드바이저를 빈으로</td><td>애스펙트를 빈으로</td></tr>
+</tbody></table></div>
+<p>마지막 행이 중요하다. 애스펙트는 <b>스프링 빈이어야</b> 동작한다. 위 예제처럼 <code>@Bean</code>으로 등록하거나, 컴포넌트 스캔으로 등록하려면 <code>@Aspect</code>와 함께 <code>@Component</code>를 붙여야 한다. 스프링 레퍼런스는 <code>@Aspect</code> 애너테이션만으로는 클래스패스 자동 감지에 충분하지 않다고 명시한다. <code>@Aspect</code>는 메타 애너테이션으로 <code>@Component</code>를 갖고 있지 않기 때문에, 스캔 범위 안에 <code>@Aspect</code>만 붙인 클래스를 두면 빈이 되지 않고 아무 일도 일어나지 않는다. 오류도 나지 않으므로 "애스펙트를 만들었는데 로그가 안 찍힌다"는 상황에서 가장 먼저 확인할 곳이다.</p>
+<p>설정 클래스의 <code>@EnableAspectJAutoProxy</code>는 @AspectJ 지원을 켜는 스위치다. 스프링 부트를 쓴다면 이 애너테이션을 직접 붙일 필요가 없다. 부트 3.5.16의 <code>AopAutoConfiguration</code> 소스를 보면, 클래스패스에 <code>org.aspectj.weaver.Advice</code> 클래스(즉 aspectjweaver)가 있을 때 <code>@EnableAspectJAutoProxy(proxyTargetClass = true)</code>가 붙은 내부 설정 클래스가 활성화된다. <code>spring.aop.proxy-target-class</code> 속성을 <code>false</code>로 주면 대신 <code>proxyTargetClass = false</code>인 설정이 쓰이고, <code>spring.aop.auto=false</code>면 자동 구성 전체가 꺼진다. 부트 3.x에서 aspectjweaver를 끌어오는 의존성은 <code>spring-boot-starter-aop</code>("Starter for aspect-oriented programming with Spring AOP and AspectJ")이고, 부트 4.1 문서의 스타터 목록에서는 이 자리에 <code>spring-boot-starter-aspectj</code>가 있다. aspectjweaver가 없으면 부트는 클래스 기반 프록시만 강제하는 다른 구성을 쓰는데, 이 경우 등록되는 자동 프록시 생성기는 <code>InfrastructureAdvisorAutoProxyCreator</code>여서 인프라 역할로 등록된 어드바이저 빈(트랜잭션 어드바이저 같은 것)만 처리하고 <code>@Aspect</code> 클래스는 읽지 않는다.</p>
+<aside class="note">포인트컷 범위를 정할 때 흔히 하는 실수가 있다. 표현식이 추적기 자신(<code>CallTracer</code> 구현 빈)까지 덮으면, 추적기 빈도 프록시가 되고 애스펙트에 주입되는 것도 그 프록시다. 그러면 어드바이스가 <code>tracer.begin()</code>을 부를 때마다 그 호출이 다시 어드바이스를 실행하고, 그 어드바이스가 또 <code>tracer.begin()</code>을 부른다. 원고를 쓰며 같은 구조(애스펙트가 주입받은 빈이 같은 포인트컷에 걸리는 구성)를 만들어 실행해 보니 주입된 빈의 클래스는 <code>...$$SpringCGLIB$$0</code>였고 첫 호출에서 <code>StackOverflowError</code>가 났다. 포인트컷은 업무 코드 패키지로 좁히고, 부가 기능이 쓰는 객체는 그 밖에 둔다.</aside>
+
+<h3>작은 실험 — 컨테이너 안에 무엇이 생겼나</h3>
+<p>애스펙트를 등록했을 때 컨테이너 안에서 무엇이 달라지는지 직접 보자. 로그 라이브러리 없이 돌릴 수 있도록 추적기 대신 표준 출력을 쓰는 작은 애스펙트와, 인터페이스가 있는 빈 하나와 없는 빈 하나를 준비한다.</p>
+<pre><code class="language-java">package demo.app;
+
+public interface OrderService { String order(String item); }
+
+public class OrderServiceImpl implements OrderService {
+    private final StockRepository stock;
+    public OrderServiceImpl(StockRepository stock) { this.stock = stock; }
+    @Override public String order(String item) {
+        System.out.println("  OrderServiceImpl.order(" + item + ")");
+        return stock.reserve(item);
+    }
+}
+
+public class StockRepository {
+    public String reserve(String item) {
+        System.out.println("  StockRepository.reserve(" + item + ")");
+        return check(item) ? "ok:" + item : "fail:" + item;
+    }
+    private boolean check(String item) { return !item.isEmpty(); }
+}
+// (실제로는 세 타입을 각각의 파일에 둔다)</code></pre>
+<pre><code class="language-java">package demo.aop;
+
+@Aspect
+public class TraceAspect {
+    @Around("execution(* demo.app..*(..))")
+    public Object trace(ProceedingJoinPoint joinPoint) throws Throwable {
+        System.out.println("[trace] --> " + joinPoint.getSignature());
+        try {
+            Object result = joinPoint.proceed();
+            System.out.println("[trace] <-- " + joinPoint.getSignature() + " = " + result);
+            return result;
+        } catch (Throwable e) {
+            System.out.println("[trace] <X- " + joinPoint.getSignature() + " " + e);
+            throw e;
+        }
+    }
+}
+
+@Configuration
+@EnableAspectJAutoProxy
+public class AopConfig {
+    @Bean public StockRepository stockRepository() { return new StockRepository(); }
+    @Bean public OrderService orderService(StockRepository stockRepository) {
+        return new OrderServiceImpl(stockRepository);
+    }
+    @Bean public TraceAspect traceAspect() { return new TraceAspect(); }
+}</code></pre>
+<p>실행 코드는 컨테이너를 만든 뒤, 등록된 빈 후처리기 목록과 세 빈의 실제 클래스를 출력하고, 프록시라면 <code>Advised</code> 인터페이스로 캐스팅해 붙어 있는 어드바이저를 나열한다. 마지막으로 <code>orderService.order("book")</code>을 부르고, 비교를 위해 <code>new StockRepository().reserve("pen")</code>도 부른다. 출력은 다음과 같다(빈 후처리기 목록은 클래스 이름만 남기고 줄였다).</p>
+<pre data-label="실행 결과"><code class="language-text">== bean post processors
+  ApplicationContextAwareProcessor
+  ConfigurationClassPostProcessor$ImportAwareBeanPostProcessor
+  PostProcessorRegistrationDelegate$BeanPostProcessorChecker
+  AnnotationAwareAspectJAutoProxyCreator
+  AutowiredAnnotationBeanPostProcessor
+  ApplicationListenerDetector
+== orderService : jdk.proxy2.$Proxy17 aop=true jdk=true cglib=false
+   target class = demo.app.OrderServiceImpl, proxyTargetClass=false
+   advisor: org.springframework.aop.interceptor.ExposeInvocationInterceptor.ADVISOR
+   advisor: InstantiationModelAwarePointcutAdvisor: expression [execution(* demo.app..*(..))]; advice method [public java.lang.Object demo.aop.TraceAspect.trace(org.aspectj.lang.ProceedingJoinPoint) throws java.lang.Throwable]; perClauseKind=SINGLETON
+== stockRepository : demo.app.StockRepository$$SpringCGLIB$$0 aop=true jdk=false cglib=true
+   target class = demo.app.StockRepository, proxyTargetClass=true
+   advisor: org.springframework.aop.interceptor.ExposeInvocationInterceptor.ADVISOR
+   advisor: InstantiationModelAwarePointcutAdvisor: expression [execution(* demo.app..*(..))]; ...
+== traceAspect : demo.aop.TraceAspect aop=false jdk=false cglib=false
+== call
+[trace] --> String demo.app.OrderService.order(String)
+  OrderServiceImpl.order(book)
+[trace] --> String demo.app.StockRepository.reserve(String)
+  StockRepository.reserve(book)
+[trace] <-- String demo.app.StockRepository.reserve(String) = ok:book
+[trace] <-- String demo.app.OrderService.order(String) = ok:book
+result = ok:book
+== new StockRepository() (not a bean)
+  StockRepository.reserve(pen)
+result = ok:pen</code></pre>
+<p>이 출력에서 읽을 것이 다섯 가지 있다. 첫째, 빈 후처리기 목록에 <code>AnnotationAwareAspectJAutoProxyCreator</code>가 <b>하나</b> 들어 있다. 06회에서 어드바이저 빈을 프록시로 바꿔 주던 바로 그 자동 프록시 생성기다. <code>@Aspect</code>를 처리하는 별도의 후처리기가 따로 있는 것이 아니라, 같은 생성기가 어드바이저 빈과 <code>@Aspect</code> 빈을 함께 처리한다. 이 빈의 이름은 <code>org.springframework.aop.config.internalAutoProxyCreator</code>다.</p>
+<p>둘째, 두 빈이 서로 다른 기술로 프록시가 됐다. 인터페이스를 구현한 <code>OrderServiceImpl</code>은 JDK 동적 프록시(<code>jdk.proxy2.$Proxy17</code>, 번호는 실행 환경마다 다를 수 있다)가 됐고, 인터페이스가 없는 <code>StockRepository</code>는 CGLIB가 만든 하위 클래스(<code>StockRepository$$SpringCGLIB$$0</code>)가 됐다. <code>@EnableAspectJAutoProxy</code>의 <code>proxyTargetClass</code> 기본값이 <code>false</code>이기 때문이다. 이 값이 <code>false</code>면 대상이 인터페이스를 하나 이상 구현할 때 JDK 프록시를, 그렇지 않으면 CGLIB 프록시를 쓴다. 같은 실험을 <code>@EnableAspectJAutoProxy(proxyTargetClass = true)</code>로 돌리면 <code>orderService</code>도 <code>demo.app.OrderServiceImpl$$SpringCGLIB$$0</code>이 된다. 스프링 부트의 기본값이 바로 이쪽이다.</p>
+<p>셋째, 프록시에 붙은 어드바이저는 둘이다. 하나는 우리가 쓴 <code>trace</code> 메서드가 변환된 <code>InstantiationModelAwarePointcutAdvisor</code>이고, 그 <code>toString</code>에 포인트컷 표현식과 어드바이스 메서드가 그대로 보인다. 다른 하나는 우리가 등록한 적 없는 <code>ExposeInvocationInterceptor.ADVISOR</code>이고, 목록의 맨 앞에 있다. 이 둘이 어디서 왔는지가 다음 두 절의 주제다.</p>
+<p>넷째, 애스펙트 빈 <code>traceAspect</code>는 프록시가 아니다. 이 실험에서는 애스펙트가 <code>demo.aop</code>에 있어 애초에 포인트컷에 걸리지 않지만, 애스펙트를 <code>demo.app</code> 안에 두어 자기 메서드가 자기 포인트컷에 걸리게 만든 별도 실험에서도 애스펙트 빈은 원래 클래스 그대로였고, 그 빈의 일반 메서드를 불러도 어드바이스가 실행되지 않았다. 스프링 레퍼런스도 "스프링 AOP에서 애스펙트 자신은 다른 애스펙트의 어드바이스 대상이 될 수 없고, <code>@Aspect</code>가 붙은 클래스는 자동 프록시 대상에서 제외된다"고 적는다.</p>
+<p>다섯째, <code>new StockRepository()</code>로 직접 만든 객체에는 아무것도 적용되지 않았다. 같은 클래스의 같은 메서드인데도 그렇다. 부가 기능은 클래스가 아니라 <b>컨테이너가 반환한 프록시 객체</b>에 붙어 있기 때문이다. 그리고 하나 더, <code>reserve</code> 안에서 부른 <code>private</code> 메서드 <code>check</code>는 포인트컷 표현식에 해당하는데도 로그가 찍히지 않았다. 이 두 가지는 뒤에서 위빙 방식을 비교할 때 다시 쓰는 단서다.</p>
+
+<h3>@Aspect 프록시 — 설명 ①: 자동 프록시 생성기는 하나뿐이다</h3>
+<p><code>@EnableAspectJAutoProxy</code>가 하는 일은 생각보다 작다. 이 애너테이션에는 <code>@Import(AspectJAutoProxyRegistrar.class)</code>가 붙어 있고, 속성은 <code>proxyTargetClass</code>와 <code>exposeProxy</code> 두 개뿐이며 기본값은 둘 다 <code>false</code>다. 설정 클래스를 처리하는 단계에서 <code>AspectJAutoProxyRegistrar</code>가 호출되면, 이 클래스는 <code>AopConfigUtils.registerAspectJAnnotationAutoProxyCreatorIfNecessary(registry)</code>를 부르고, 속성값에 따라 프록시 생성기의 설정 값(<code>proxyTargetClass</code>, <code>exposeProxy</code>)을 바꾼다. 결국 이 애너테이션의 본업은 <code>AnnotationAwareAspectJAutoProxyCreator</code>의 빈 정의 하나를 등록하는 것이다.</p>
+<p><code>AopConfigUtils</code>를 열어 보면 자동 프록시 생성기를 등록하는 방법이 하나로 모여 있다. 등록 메서드는 세 가지이고 각각 다른 클래스를 등록하려 한다.</p>
+<div class="table-wrap"><table><thead><tr><th>우선순위</th><th>클래스</th><th>처리하는 것</th><th>주로 등록하는 쪽</th></tr></thead><tbody>
+<tr><td>0 (가장 낮음)</td><td><code>InfrastructureAdvisorAutoProxyCreator</code></td><td>인프라 역할(<code>ROLE_INFRASTRUCTURE</code>)로 등록된 어드바이저 빈</td><td><code>AutoProxyRegistrar</code> (<code>@EnableTransactionManagement</code>, <code>@EnableCaching</code>의 프록시 모드)</td></tr>
+<tr><td>1</td><td><code>AspectJAwareAdvisorAutoProxyCreator</code></td><td>어드바이저 빈 + AspectJ 방식의 정렬</td><td>XML의 <code><aop:config></code></td></tr>
+<tr><td>2 (가장 높음)</td><td><code>AnnotationAwareAspectJAutoProxyCreator</code></td><td>위의 모든 것 + <code>@Aspect</code> 빈</td><td><code>@EnableAspectJAutoProxy</code>, <code><aop:aspectj-autoproxy/></code></td></tr>
+</tbody></table></div>
+<p>세 메서드는 모두 내부의 <code>registerOrEscalateApcAsRequired</code>로 모인다. 이 메서드는 <code>org.springframework.aop.config.internalAutoProxyCreator</code>라는 <b>고정된 이름</b>으로 빈 정의를 등록한다. 그 이름의 빈 정의가 이미 있으면 새로 만들지 않고, 이미 있는 것의 우선순위가 요청된 것보다 낮을 때만 빈 클래스 이름을 높은 쪽으로 바꾼다. 소스의 주석은 이 목록을 "escalation list", 즉 승격 목록이라고 부른다. 새로 등록할 때는 <code>order</code> 속성을 <code>Ordered.HIGHEST_PRECEDENCE</code>로 넣는다.</p>
+<p>이 설계 덕분에 트랜잭션(<code>@EnableTransactionManagement</code>)과 <code>@Aspect</code>를 함께 써도 자동 프록시 생성기는 하나만 생긴다. 트랜잭션 쪽이 먼저 <code>InfrastructureAdvisorAutoProxyCreator</code>를 등록했더라도, 뒤이어 <code>@EnableAspectJAutoProxy</code>가 처리되면 같은 이름의 빈 정의가 <code>AnnotationAwareAspectJAutoProxyCreator</code>로 승격된다. 순서가 반대여도 낮은 쪽은 높은 쪽을 끌어내리지 못한다. 생성기가 둘이었다면 한 빈이 두 번 감싸져 프록시의 프록시가 생길 수 있지만, 생성기가 하나이므로 트랜잭션 어드바이저와 우리 애스펙트의 어드바이저는 <b>한 프록시의 한 체인</b>에 함께 들어간다. 한 빈에 어드바이저가 여러 개 해당해도 프록시는 하나만 만든다는 자동 프록시 생성기의 성질이, 기능의 출처(트랜잭션 설정, 캐시 설정, 우리 애스펙트)가 달라도 유지되는 이유가 여기 있다.</p>
+
+<h3>@Aspect 프록시 — 설명 ②: 애스펙트 클래스를 어드바이저로 바꾸기</h3>
+<p>06회에서 자동 프록시 생성기는 "후보 어드바이저를 모두 찾고, 그중 이 빈에 적용할 수 있는 것을 고른 뒤, 하나라도 있으면 프록시를 만든다"는 순서로 일했다. <code>AnnotationAwareAspectJAutoProxyCreator</code>가 바꾸는 것은 그중 첫 단계, 후보를 찾는 <code>findCandidateAdvisors()</code> 하나다. 소스는 다음과 같이 짧다.</p>
+<pre><code class="language-java">// AnnotationAwareAspectJAutoProxyCreator (spring-aop)
+@Override
+protected List<Advisor> findCandidateAdvisors() {
+    // Add all the Spring advisors found according to superclass rules.
+    List<Advisor> advisors = super.findCandidateAdvisors();
+    // Build Advisors for all AspectJ aspects in the bean factory.
+    if (this.aspectJAdvisorsBuilder != null) {
+        advisors.addAll(this.aspectJAdvisorsBuilder.buildAspectJAdvisors());
+    }
+    return advisors;
+}</code></pre>
+<p>상위 클래스의 구현은 컨테이너에서 <code>Advisor</code> 타입의 빈을 모두 찾아 온다. 06회의 방식이 그대로 살아 있다. 여기에 <code>BeanFactoryAspectJAdvisorsBuilder.buildAspectJAdvisors()</code>의 결과, 즉 <code>@Aspect</code> 빈에서 만들어 낸 어드바이저들을 덧붙인다. 그러니까 @Aspect는 어드바이저와 경쟁하는 다른 메커니즘이 아니라, <b>어드바이저를 만드는 또 하나의 방법</b>이다. 변환은 다음 순서로 일어난다.</p>
+<figure class="flow-figure"><figcaption>buildAspectJAdvisors()가 처음 호출될 때</figcaption><ol class="flow">
+<li><strong>모든 빈 이름 나열</strong><span>부모 팩토리를 포함해 <code>Object</code> 타입으로 등록된 모든 빈 이름을 가져온다. 아직 객체를 만들지 않은 빈도 포함된다.</span></li>
+<li><strong>타입만 확인</strong><span><code>beanFactory.getType(beanName, false)</code>로 클래스만 알아낸다. 두 번째 인자 <code>false</code>는 "타입을 알기 위해 FactoryBean 등을 초기화하지 말라"는 뜻이다. 소스 주석은 여기서 빈을 미리 만들면 프록시 처리 없이 캐시되어 버린다고 경고한다.</span></li>
+<li><strong>애스펙트인지 판별</strong><span><code>isAspect(beanType)</code>: 클래스에 <code>@Aspect</code>가 있으면 애스펙트로 본다. ajc로 컴파일된 애스펙트(필드 이름이 <code>ajc$</code>로 시작)를 제외하는 <code>spring.aop.ajc.ignore</code> 플래그가 6.1.15부터 있지만 기본값은 <code>false</code>다.</span></li>
+<li><strong>인스턴스화 모델 확인</strong><span>보통의 애스펙트는 싱글톤 모델(<code>PerClauseKind.SINGLETON</code>)이다. 이 경우 빈 팩토리에서 애스펙트 인스턴스를 꺼내 줄 <code>BeanFactoryAspectInstanceFactory</code>를 만든다.</span></li>
+<li><strong>어드바이저 생성</strong><span><code>ReflectiveAspectJAdvisorFactory.getAdvisors(factory)</code>가 클래스의 메서드를 훑어 어드바이스 메서드마다 어드바이저 하나를 만든다.</span></li>
+<li><strong>캐시</strong><span>애스펙트 빈이 싱글톤이면 결과 목록을 빈 이름을 키로 <code>advisorsCache</code>에 넣고, 애스펙트 빈 이름 목록을 <code>volatile</code> 필드 <code>aspectBeanNames</code>에 기록한다.</span></li>
+</ol></figure>
+<p>이 첫 호출은 동기화 블록 안에서 이중 확인(double-checked locking)으로 한 번만 실행된다. <code>aspectBeanNames</code>가 채워진 뒤의 호출은 모든 빈을 다시 훑지 않고 캐시에서 어드바이저 목록을 꺼내 합치기만 한다. 첫 호출이 언제 일어나는지도 소스에서 따라갈 수 있다. 자동 프록시 생성기는 빈이 생성되기 직전(<code>postProcessBeforeInstantiation</code>)과 초기화된 직후(<code>postProcessAfterInitialization</code>)에 "이 빈은 건너뛸 대상인가"를 묻는 <code>shouldSkip</code>을 호출하는데, 상위 클래스 <code>AspectJAwareAdvisorAutoProxyCreator</code>의 <code>shouldSkip</code>이 맨 처음에 <code>findCandidateAdvisors()</code>를 부른다. 따라서 생성기가 등록된 뒤 인프라 클래스가 아닌 빈이 처음 만들어질 때 그 생성 과정에서 애스펙트 변환이 일어나고, 그 뒤로는 캐시가 쓰인다.</p>
+<p>다섯 번째 단계의 <code>getAdvisors</code>를 조금 더 들여다보자. 이 메서드는 애스펙트 클래스(상위 클래스 포함)에서 사용자가 선언한 메서드를 모으되 <code>@Pointcut</code>이 붙은 메서드는 뺀다. 그리고 모은 메서드를 어드바이스 종류 순서(<code>@Around</code>, <code>@Before</code>, <code>@After</code>, <code>@AfterReturning</code>, <code>@AfterThrowing</code>), 같은 종류 안에서는 메서드 이름 순서로 정렬한다. 소스 주석에 따르면 5.2.7 이전에는 메서드를 찾은 순서를 "애스펙트 안의 선언 순서"로 썼는데, 자바 7부터 JDK가 선언된 메서드를 소스 순서대로 돌려주지 않아 그 값을 믿을 수 없었다. 그래서 지금은 그 값을 모두 0으로 고정하고, JVM을 다시 띄워도 같은 순서가 나오도록 위의 정렬에 맡긴다. 원고를 쓰며 이름순으로는 반대가 되도록 <code>aBefore</code>(<code>@Before</code>)와 <code>zAround</code>(<code>@Around</code>)를 가진 애스펙트를 만들어 보니, 어드바이저 목록에는 <code>zAround</code>가 먼저 나왔다. 정렬된 메서드마다 <code>getAdvisor</code>를 부르고, <code>getAdvisor</code>는 메서드에서 AspectJ 애너테이션을 찾는다. 애너테이션이 없는 보통 메서드(도우미 메서드 등)는 여기서 <code>null</code>이 되어 버려진다. 애너테이션이 있으면 그 속성 문자열로 <code>AspectJExpressionPointcut</code>을 만들고, 포인트컷과 메서드를 묶어 <code>InstantiationModelAwarePointcutAdvisorImpl</code>을 만든다. 실험 출력의 <code>InstantiationModelAwarePointcutAdvisor: expression [...]; advice method [...]</code>가 바로 이 객체의 <code>toString</code>이다.</p>
+<p>어드바이저 안의 어드바이스 객체는 애너테이션 종류에 따라 정해진다. <code>ReflectiveAspectJAdvisorFactory.getAdvice</code>는 애너테이션 종류로 분기하는 <code>switch</code>문이고, 싱글톤 애스펙트라면 어드바이저 생성자에서 바로 호출된다.</p>
+<div class="table-wrap"><table><thead><tr><th>애너테이션</th><th>만들어지는 어드바이스 클래스</th><th>구현하는 스프링 AOP 인터페이스</th></tr></thead><tbody>
+<tr><td><code>@Around</code></td><td><code>AspectJAroundAdvice</code></td><td><code>MethodInterceptor</code></td></tr>
+<tr><td><code>@Before</code></td><td><code>AspectJMethodBeforeAdvice</code></td><td><code>MethodBeforeAdvice</code></td></tr>
+<tr><td><code>@After</code></td><td><code>AspectJAfterAdvice</code></td><td><code>MethodInterceptor</code>, <code>AfterAdvice</code></td></tr>
+<tr><td><code>@AfterReturning</code></td><td><code>AspectJAfterReturningAdvice</code></td><td><code>AfterReturningAdvice</code>, <code>AfterAdvice</code></td></tr>
+<tr><td><code>@AfterThrowing</code></td><td><code>AspectJAfterThrowingAdvice</code></td><td><code>MethodInterceptor</code>, <code>AfterAdvice</code></td></tr>
+<tr><td><code>@Pointcut</code></td><td>(없음, 어드바이스가 아니다)</td><td>-</td></tr>
+</tbody></table></div>
+<p>표의 셋째 열이 05회와 이어지는 지점이다. 어떤 애너테이션으로 쓰든 결과물은 05회에서 본 스프링 AOP의 어드바이스 타입이다. <code>MethodBeforeAdvice</code>와 <code>AfterReturningAdvice</code>는 <code>MethodInterceptor</code>가 아니지만, 프록시가 체인을 만들 때 <code>DefaultAdvisorAdapterRegistry</code>에 등록된 어댑터가 이것들을 인터셉터로 감싼다. 결국 프록시가 실행하는 것은 언제나 <code>MethodInterceptor</code>의 줄이다. 어드바이스 종류별 쓰임새와 순서는 08회에서 다룬다. 이 밖에 애스펙트 클래스의 필드에 <code>@DeclareParents</code>가 붙어 있으면 <code>DeclareParentsAdvisor</code>가 만들어지는데, 이것은 뒤의 용어 정리에서 볼 인트로덕션이다.</p>
+<x-visual id="spring-core-adv-07-aspect-to-advisor" title="@Aspect 클래스가 어드바이저 목록으로 바뀌는 과정" kind="흐름도" ratio="16:9">
+<x-hint>애스펙트 클래스의 메서드 각각이 포인트컷+어드바이스 한 쌍(어드바이저)으로 변환되고, 어드바이저 빈과 합쳐져 후보 목록이 된다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 깔끔한 기술 흐름도, 왼쪽에서 오른쪽으로 진행. 맨 왼쪽에 코드 카드 모양의 상자 "@Aspect CallTraceAspect"가 있고, 그 안에 세로로 세 줄이 있다: 첫 줄 "@Around trace()", 둘째 줄 "@Before check()", 셋째 줄은 흐린 회색 글씨 "helper()". 가운데에 톱니바퀴 아이콘이 붙은 둥근 상자 "ReflectiveAspectJAdvisorFactory"가 있다. 첫 줄과 둘째 줄에서 이 상자로 실선 화살표가 들어가고, 셋째 줄에서는 짧은 점선이 나와 작은 X 표시에서 끝난다. 가운데 상자의 오른쪽으로 두 개의 알약 모양 상자가 나온다. 각 알약은 왼쪽 반이 파란색 "포인트컷", 오른쪽 반이 주황색 "어드바이스"로 나뉘어 있고, 알약 위에 "어드바이저"라는 작은 라벨이 있다. 아래쪽 별도 줄에 회색 상자 "Advisor 빈"이 있고 위로 화살표가 올라간다. 두 알약과 "Advisor 빈"이 맨 오른쪽의 세로 목록 상자 "후보 어드바이저"로 모인다. 목록 상자 옆에 작은 원통 아이콘과 "캐시"라는 라벨. 파랑, 주황, 회색 위주의 단정한 색.</x-prompt>
+<x-caption>애스펙트의 어드바이스 메서드 하나가 어드바이저 하나가 되고, 애너테이션이 없는 메서드는 버려진다. 결과는 Advisor 빈과 합쳐져 후보 목록이 된다.</x-caption>
+</x-visual>
+
+<h3>@Aspect 프록시 — 설명 ③: 빈 하나가 프록시가 되는 순간</h3>
+<p>후보 어드바이저가 준비된 뒤, 각 빈이 초기화를 마치면 <code>postProcessAfterInitialization</code>이 <code>wrapIfNecessary(bean, beanName, cacheKey)</code>를 부른다. 06회에서 본 흐름에 @Aspect가 더한 것만 표시하며 따라가 보자.</p>
+<p>먼저 <code>isInfrastructureClass</code>로 프록시를 만들면 안 되는 빈을 거른다. 기본 구현은 빈 클래스가 <code>Advice</code>, <code>Pointcut</code>, <code>Advisor</code>, <code>AopInfrastructureBean</code> 중 하나의 하위 타입이면 참을 돌려준다. 부가 기능을 이루는 부품 자체에 부가 기능을 붙이면 순환이 생길 수 있기 때문이다. <code>AnnotationAwareAspectJAutoProxyCreator</code>는 이 메서드를 재정의해 <b>애스펙트 클래스도</b> 인프라로 취급한다. 소스 주석에 그 이유가 적혀 있다. 애스펙트를 프록시로 만들면 어드바이스 호출이 프록시를 거치게 되고, 애스펙트가 <code>Ordered</code> 같은 인터페이스를 구현한 경우 그 인터페이스로 JDK 프록시가 만들어져 어드바이스 메서드를 찾지 못하고 실행 중에 실패한다는 것이다. 앞의 실험에서 애스펙트 빈이 원래 클래스 그대로였던 것이 이 재정의의 결과다.</p>
+<p>다음은 <code>findEligibleAdvisors</code>다. 네 단계로 이루어진다.</p>
+<ol>
+<li><b>후보 수집</b>: 앞 절의 <code>findCandidateAdvisors()</code>. 어드바이저 빈과 애스펙트에서 변환한 어드바이저가 모두 들어 있다.</li>
+<li><b>적용 가능성 검사</b>: <code>AopUtils.canApply</code>가 어드바이저마다 포인트컷의 <code>ClassFilter</code>로 빈 클래스를 먼저 검사하고, 통과하면 그 클래스와 그 클래스가 구현한 모든 인터페이스에 선언된 메서드를 하나씩 <code>MethodMatcher</code>에 넣어 본다. <b>하나라도</b> 맞으면 그 어드바이저는 이 빈에 적용 가능하다. 포인트컷은 여기서 "프록시를 만들 것인가"를 정하는 데 한 번 쓰이고, 나중에 프록시가 호출될 때 "이 메서드에 어떤 인터셉터를 적용할 것인가"를 정하는 데 다시 쓰인다.</li>
+<li><b>목록 확장</b>: <code>extendAdvisors</code>가 <code>AspectJProxyUtils.makeAdvisorChainAspectJCapableIfNecessary</code>를 부른다. 고른 목록에 AspectJ 방식의 어드바이스가 하나라도 있으면 목록 맨 앞(인덱스 0)에 <code>ExposeInvocationInterceptor.ADVISOR</code>를 끼워 넣는다. 실험 출력에서 우리가 등록하지 않은 어드바이저가 맨 앞에 있었던 이유다.</li>
+<li><b>정렬</b>: <code>sortAdvisors</code>가 <code>AspectJPrecedenceComparator</code>로 순서를 정한다. 애스펙트 사이의 순서를 <code>@Order</code>로 정하는 방법은 08회에서 다룬다.</li>
+</ol>
+<p>결과 목록이 비어 있지 않으면 <code>createProxy</code>가 05회의 <code>ProxyFactory</code>를 만들어 타깃과 어드바이저를 넣고 프록시를 얻는다. 이때 <code>proxyTargetClass</code> 설정과 빈이 구현한 인터페이스를 보고 JDK 프록시와 CGLIB 프록시 중 하나가 정해진다. 프록시가 컨테이너에 원래 빈 대신 등록되고, 이 빈을 주입받는 모든 곳에는 프록시가 들어간다. 실험에서 <code>OrderServiceImpl</code>이 주입받은 <code>stock</code> 필드도 CGLIB 프록시였기 때문에 <code>order</code> 안에서 부른 <code>stock.reserve</code>에도 로그가 찍혔다.</p>
+<p>그렇다면 맨 앞에 끼워 넣은 <code>ExposeInvocationInterceptor</code>는 무슨 일을 할까? 소스는 단순하다.</p>
+<pre><code class="language-java">// ExposeInvocationInterceptor (spring-aop), 일부
+private static final ThreadLocal<MethodInvocation> invocation =
+        new NamedThreadLocal<>("Current AOP method invocation");
+
+@Override
+public Object invoke(MethodInvocation mi) throws Throwable {
+    MethodInvocation oldInvocation = invocation.get();
+    invocation.set(mi);
+    try {
+        return mi.proceed();
+    }
+    finally {
+        invocation.set(oldInvocation);
+    }
+}</code></pre>
+<p>01회의 ThreadLocal이 여기서 다시 나온다. 이 인터셉터는 지금 진행 중인 메서드 호출 객체를 현재 스레드의 칸에 넣고, 체인의 나머지를 실행한 뒤, <code>finally</code>에서 이전 값으로 되돌린다. 값을 지우지 않고 이전 값으로 되돌리는 이유는 호출이 중첩되기 때문이다. 실험에서 <code>order</code>의 어드바이스가 실행되는 도중에 <code>reserve</code>의 프록시 호출이 다시 이 인터셉터를 지나는데, 안쪽 호출이 끝나면 칸에는 바깥 호출의 객체가 다시 들어 있어야 한다. 이 칸을 읽는 쪽은 AspectJ 방식의 어드바이스다. <code>@Before</code> 어드바이스로 변환된 <code>AspectJMethodBeforeAdvice</code>는 <code>before(method, args, target)</code>라는 시그니처로 불리므로 <code>MethodInvocation</code>을 직접 받지 못한다. 그런데 어드바이스 메서드가 <code>JoinPoint</code>를 매개변수로 원하면 그것을 만들어 줘야 한다. 그래서 <code>AbstractAspectJAdvice.currentJoinPoint()</code>는 <code>ExposeInvocationInterceptor.currentInvocation()</code>으로 이 칸을 읽어 조인 포인트 객체를 만든다. 체인 맨 앞에 이 인터셉터가 있어야 하는 이유다.</p>
+<x-visual id="spring-core-adv-07-proxy-call-chain" title="프록시 호출 한 번이 인터셉터 체인을 지나 타깃에 닿는 과정" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>클라이언트 호출이 프록시, ReflectiveMethodInvocation, ExposeInvocationInterceptor, AspectJAroundAdvice, 애스펙트 메서드를 차례로 지나 타깃에 도착하고, 반환값이 같은 길로 돌아가는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 세로 생명선 시퀀스 다이어그램. 왼쪽부터 생명선 7개가 있고 머리 상자 라벨은 차례로 "클라이언트", "프록시 ($Proxy / $$SpringCGLIB$$)", "ReflectiveMethodInvocation", "ExposeInvocationInterceptor", "AspectJAroundAdvice", "TraceAspect.trace()", "타깃 객체"이다. 위에서 아래로 실선 화살표가 오른쪽으로 한 칸씩 이어진다: "클라이언트"에서 "프록시"로 "order(book)", "프록시"에서 "ReflectiveMethodInvocation"으로 "proceed()", 거기서 "ExposeInvocationInterceptor"로 "invoke(mi)", "ExposeInvocationInterceptor" 옆에 작은 사물함 아이콘과 "ThreadLocal에 mi 저장" 메모, 다시 "ReflectiveMethodInvocation"을 거쳐 "AspectJAroundAdvice"로 "invoke(mi)", 거기서 "TraceAspect.trace()"로 "Method.invoke", "TraceAspect.trace()"에서 "ReflectiveMethodInvocation"으로 되돌아가는 화살표 "pjp.proceed()", 마지막으로 "ReflectiveMethodInvocation"에서 "타깃 객체"로 "Method.invoke". 아래쪽에는 점선 화살표가 오른쪽에서 왼쪽으로 "ok:book" 반환값을 클라이언트까지 되돌린다. 단정한 선, 파랑과 회색 위주, 반환 화살표는 초록 점선.</x-prompt>
+<x-caption>프록시는 체인 객체에 호출을 넘기고, 체인은 인덱스를 하나씩 올리며 인터셉터를 부른다. 애스펙트의 proceed()는 그 체인을 한 칸 더 진행시킨다.</x-caption>
+</x-visual>
+
+<h3>한 층 아래 — 호출 한 번이 지나는 프레임</h3>
+<p>지금까지는 소스를 읽어 흐름을 추측했다. 실제 실행 경로를 확인하려면 어드바이스 안에서 호출 스택을 찍어 보면 된다. 앞의 <code>TraceAspect.trace</code> 첫 줄 뒤에 <code>StackWalker.getInstance(StackWalker.Option.SHOW_REFLECT_FRAMES).forEach(...)</code>로 각 프레임의 클래스와 메서드 이름을 출력하게 했다. <code>StackWalker</code>는 기본 설정에서 리플렉션 프레임을 숨기므로(<code>StackWalker</code> Javadoc), 리플렉션 호출까지 보려고 <code>SHOW_REFLECT_FRAMES</code>를 줬다. 다음은 <code>orderService.order("book")</code> 안에서 <code>stock.reserve(...)</code>가 호출되어 두 번째 어드바이스가 실행될 때의 스택이다. 위가 가장 최근 프레임이다.</p>
+<pre data-label="실행 결과 (어드바이스 안에서 찍은 스택)"><code class="language-text">[trace] --> String demo.app.StockRepository.reserve(String)
+      at demo.aop.TraceAspect.trace
+      at jdk.internal.reflect.DirectMethodHandleAccessor.invoke
+      at java.lang.reflect.Method.invoke
+      at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethodWithGivenArgs
+      at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethod
+      at org.springframework.aop.aspectj.AspectJAroundAdvice.invoke
+      at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed
+      at org.springframework.aop.interceptor.ExposeInvocationInterceptor.invoke
+      at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed
+      at org.springframework.aop.framework.CglibAopProxy$DynamicAdvisedInterceptor.intercept
+      at demo.app.StockRepository$$SpringCGLIB$$0.reserve
+      at demo.app.OrderServiceImpl.order
+      at jdk.internal.reflect.DirectMethodHandleAccessor.invoke
+      at java.lang.reflect.Method.invoke
+      at org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection
+      at org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint
+      at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed
+      at org.springframework.aop.aspectj.MethodInvocationProceedingJoinPoint.proceed
+      at demo.aop.TraceAspect.trace
+      at jdk.internal.reflect.DirectMethodHandleAccessor.invoke
+      at java.lang.reflect.Method.invoke
+      at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethodWithGivenArgs
+      at org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethod
+      at org.springframework.aop.aspectj.AspectJAroundAdvice.invoke
+      at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed
+      at org.springframework.aop.interceptor.ExposeInvocationInterceptor.invoke
+      at org.springframework.aop.framework.ReflectiveMethodInvocation.proceed
+      at org.springframework.aop.framework.JdkDynamicAopProxy.invoke
+      at jdk.proxy2.$Proxy17.order
+      at demo.spring.SpringMain.main</code></pre>
+<p>아래에서 위로 읽는다. <code>main</code>이 <code>orderService.order("book")</code>을 부르면 실제로 호출되는 것은 <code>$Proxy17.order</code>다. 04회에서 <code>javap</code>로 열어 본 것처럼 JDK 프록시 클래스의 메서드는 필드에 든 <code>InvocationHandler</code>의 <code>invoke</code>를 부르는 일만 한다. 스프링에서 그 핸들러가 <code>JdkDynamicAopProxy</code>다. 이 핸들러는 호출된 <code>Method</code>에 해당하는 인터셉터 목록을 얻는다. 목록은 프록시 설정 객체(<code>AdvisedSupport</code>)가 메서드마다 한 번 계산해 캐시해 둔다. 그리고 그 목록과 타깃, 인자를 담은 <code>ReflectiveMethodInvocation</code>을 만들어 <code>proceed()</code>를 부른다.</p>
+<p><code>ReflectiveMethodInvocation.proceed()</code>는 체인의 엔진이다. 이 객체는 "지금 몇 번째 인터셉터까지 왔는가"를 나타내는 정수 필드 <code>currentInterceptorIndex</code>를 갖고 있고, 처음 값은 -1이다. <code>proceed()</code>가 불릴 때마다 인덱스를 하나 올려 그 위치의 인터셉터를 부르고, 인덱스가 마지막에 닿은 상태에서 다시 불리면 <code>invokeJoinpoint()</code>로 타깃 메서드를 부른다. 그래서 스택에 <code>proceed</code>가 인터셉터 사이사이에 끼어 있다. 0번 인터셉터가 <code>ExposeInvocationInterceptor</code>, 1번이 우리 애스펙트를 감싼 <code>AspectJAroundAdvice</code>다. 02회의 템플릿 콜백과 비교하면, 인터셉터 하나하나가 "앞뒤 처리를 하고 가운데에서 콜백(<code>proceed</code>)을 부르는" 템플릿이고, 체인은 그런 템플릿을 여러 겹 포갠 것이다.</p>
+<p><code>AspectJAroundAdvice.invoke</code>는 받은 <code>MethodInvocation</code>을 <code>MethodInvocationProceedingJoinPoint</code>로 감싸 우리 메서드에 넘길 <code>ProceedingJoinPoint</code>를 만든다. 그다음 <code>AbstractAspectJAdvice.invokeAdviceMethodWithGivenArgs</code>가 애스펙트 인스턴스를 얻어 <code>this.aspectJAdviceMethod.invoke(aspectInstance, actualArgs)</code>로 어드바이스 메서드를 부른다. 스택의 <code>Method.invoke</code>와 <code>DirectMethodHandleAccessor.invoke</code>가 그 흔적이다. 즉 <b>애스펙트 메서드는 리플렉션으로 호출된다</b>. 04회에서 본 대로 JDK 18부터 코어 리플렉션은 메서드 핸들 위에서 구현되며(JEP 416), <code>DirectMethodHandleAccessor</code>는 그 구현에 쓰이는 JDK 내부 클래스다.</p>
+<p>어드바이스 안에서 <code>joinPoint.proceed()</code>를 부르면 <code>MethodInvocationProceedingJoinPoint.proceed</code>가 감싼 호출 객체의 복제본으로 <code>proceed()</code>를 진행한다. 이번에는 인덱스가 마지막이므로 <code>invokeJoinpoint</code> → <code>AopUtils.invokeJoinpointUsingReflection</code> → <code>Method.invoke</code>로 타깃인 <code>OrderServiceImpl.order</code>가 실행된다. 타깃 메서드 역시 리플렉션으로 불린다. 그 안의 <code>stock.reserve</code>는 주입된 CGLIB 프록시를 부르므로, 같은 구조가 한 번 더 쌓인다. 이번에는 입구가 <code>$Proxy17</code> 대신 <code>StockRepository$$SpringCGLIB$$0.reserve</code>이고, 핸들러 대신 <code>CglibAopProxy$DynamicAdvisedInterceptor.intercept</code>가 체인을 만든다. 입구만 다를 뿐 그 위의 체인은 글자 하나까지 같다. <code>ProxyFactory</code>(05회)가 두 프록시 기술을 같은 체인 구조 아래에 숨긴다는 것이 스택에서 그대로 확인된다.</p>
+<p>출력에서 놓치기 쉬운 차이가 하나 더 있다. JDK 프록시를 거친 첫 번째 로그는 시그니처가 <code>String demo.app.OrderService.order(String)</code>, 즉 <b>인터페이스</b>의 메서드로 찍혔다. JDK 프록시 클래스는 인터페이스의 <code>Method</code> 객체를 들고 핸들러를 부르기 때문이다. 같은 실험을 <code>proxyTargetClass = true</code>로 돌리면 이 줄이 <code>String demo.app.OrderServiceImpl.order(String)</code>으로 바뀐다. CGLIB 프록시는 구체 클래스의 메서드를 재정의하므로 구체 클래스의 <code>Method</code>가 넘어온다. 로그 메시지에 <code>getSignature().toShortString()</code>을 쓰면 프록시 방식에 따라 <code>OrderService.order(..)</code>와 <code>OrderServiceImpl.order(..)</code>로 달라진다는 뜻이다. 스프링 부트의 기본값을 바꾸거나, 부트 없는 테스트에서 컨텍스트를 직접 만들 때 로그 문자열이 달라지는 이유가 이것이다.</p>
+
+<h3>정리 — 로그 추적기가 걸어온 일곱 단계</h3>
+<p>@Aspect까지 오면서 로그 추적기는 한 번도 "새로운 원리"로 갈아타지 않았다. 각 단계는 앞 단계의 한계 하나를 고치면서 앞 단계를 부품으로 삼았다. 표로 정리해 보면 각 회차의 도구가 최종 구조의 어느 층에 남아 있는지 보인다.</p>
+<div class="table-wrap"><table><thead><tr><th>회차</th><th>도구</th><th>해결한 것</th><th>남긴 한계</th><th>최종 구조에서의 자리</th></tr></thead><tbody>
+<tr><td>01</td><td>ThreadLocal</td><td>싱글톤 추적기의 요청별 문맥</td><td>모든 메서드에 추적 코드</td><td><code>CallTracer</code> 구현, <code>ExposeInvocationInterceptor</code></td></tr>
+<tr><td>02</td><td>템플릿 메서드·전략·템플릿 콜백</td><td>시작·종료·예외 뼈대의 중복</td><td>호출 지점은 여전히 원본 코드 안</td><td>인터셉터와 <code>proceed()</code>의 구조</td></tr>
+<tr><td>03</td><td>프록시·데코레이터</td><td>원본 코드 수정 없이 기능 추가</td><td>클래스마다 프록시 클래스</td><td>컨테이너에 등록되는 프록시 객체</td></tr>
+<tr><td>04</td><td>JDK 동적 프록시·CGLIB</td><td>프록시 클래스 작성의 반복</td><td>기술마다 다른 API, 적용 대상 판단이 핸들러 안에</td><td><code>$Proxy</code>, <code>$$SpringCGLIB$$</code> 클래스</td></tr>
+<tr><td>05</td><td>ProxyFactory·Advisor·Pointcut·Advice</td><td>두 기술의 통합, 어디에/무엇을 분리</td><td>빈마다 프록시를 직접 만들어 등록</td><td><code>createProxy</code>가 쓰는 <code>ProxyFactory</code></td></tr>
+<tr><td>06</td><td>빈 후처리기·자동 프록시 생성기</td><td>컨테이너가 알아서 프록시로 교체</td><td>어드바이저 조립 코드가 설정에 흩어짐</td><td><code>AnnotationAwareAspectJAutoProxyCreator</code></td></tr>
+<tr><td>07</td><td>@Aspect</td><td>포인트컷과 어드바이스를 한 클래스에 선언</td><td>프록시 방식의 한계(뒤에서 다룬다)</td><td>어드바이저를 만드는 입력</td></tr>
+</tbody></table></div>
+<p>마지막 열을 위에서 아래로 읽으면 @Aspect 한 줄이 실행될 때 일어나는 일이 된다. 애스펙트 클래스가 어드바이저로 바뀌고(07), 자동 프록시 생성기가 빈마다 적용 가능한 어드바이저를 골라(06), <code>ProxyFactory</code>로(05) JDK 프록시나 CGLIB 프록시를 만들고(04), 그 프록시가 원래 빈 대신 주입되며(03), 호출이 오면 인터셉터 체인이 템플릿처럼 앞뒤를 감싸고(02), 추적 문맥은 ThreadLocal로 이어진다(01). @Aspect는 편리한 문법이지만, 그 아래에는 이 회차까지 쌓아 온 모든 층이 그대로 있다.</p>
+<p>그러면 이 구조에 붙은 이름은 무엇인가. "부가 기능을 한 곳에 모아 두고, 어디에 적용할지를 선언하면, 프레임워크가 그것을 대상 코드에 엮어 준다"는 생각 자체를 AOP라고 부른다. 지금부터는 코드에서 한 걸음 떨어져, 그 생각이 무엇을 해결하려는 것인지, 그리고 스프링이 택한 프록시 방식이 AOP의 여러 구현 방식 가운데 어디에 있는지를 본다.</p>
+
+<h3>AOP 소개 — 핵심 기능과 부가 기능</h3>
+<p>애플리케이션의 기능은 성격에 따라 둘로 나눌 수 있다. <b>핵심 기능</b>(core concern)은 그 객체가 존재하는 이유다. 대출 서비스라면 "이 회원이 이 책을 빌릴 수 있는가를 검사하고 대출 기록을 남긴다"가 핵심 기능이다. <b>부가 기능</b>은 핵심 기능을 보조하기 위해 덧붙는 기능이다. 이 권에서 계속 다룬 로그 추적이 그렇고, 실행 시간 측정, 트랜잭션의 시작과 커밋·롤백, 호출 권한 확인, 예외 변환도 그렇다. 부가 기능에는 두 가지 성질이 있다. 하나는 그것만 따로 떼어서는 의미가 없다는 것이다. 로그 추적은 추적할 메서드가 있어야 의미가 있다. 다른 하나는 특정 기능 하나에 속하지 않고 <b>여러 기능에 공통으로 걸친다</b>는 것이다. 로그 추적은 대출 기능에도, 회원 기능에도, 결제 기능에도 똑같이 필요하다.</p>
+<p>두 번째 성질 때문에 부가 기능을 횡단 관심사(cross-cutting concern)라고 부른다. 클래스들을 세로로 세워 놓고 부가 기능을 가로줄로 그으면, 가로줄 하나가 여러 클래스를 관통한다. 텍스트로 그리면 이런 모양이다.</p>
+<pre class="diagram">                    로그 추적    트랜잭션    권한 확인    │ 핵심 로직
+                  ──────────────────────────────────────┼──────────────────
+LoanController    ■                         ■           │ 대출 요청 받기
+LoanService       ■            ■                        │ 대출 규칙 검사
+MemberService     ■            ■            ■           │ 회원 등급 변경
+LoanRepository    ■                                     │ 대출 기록 저장
+                  ──────────────────────────────────────┼──────────────────
+                  ↑ 세로 한 줄(관심사 하나)이              ↑ 가로 한 줄(클래스 하나)이
+                    여러 클래스를 관통한다                    여러 관심사를 품는다</pre>
+<p>이 그림에서 문제가 두 방향으로 보인다. 세로로 읽으면 같은 관심사의 코드가 여러 클래스에 <b>흩어진다</b>(scattering). 로그 형식을 바꾸려면 ■가 있는 모든 클래스를 고쳐야 하고, 한 곳이라도 빠뜨리면 로그가 어긋난다. 가로로 읽으면 한 클래스, 한 메서드 안에 여러 관심사가 <b>뒤엉킨다</b>(tangling). 부가 기능을 핵심 코드에 직접 쓰면 메서드는 다음과 같이 된다.</p>
+<pre><code class="language-java">public Loan borrow(String memberId, String bookId) {
+    TraceScope scope = tracer.begin("LoanService.borrow()");                   // 로그 추적
+    TransactionStatus tx = txManager.getTransaction(new DefaultTransactionDefinition()); // 트랜잭션
+    try {
+        authChecker.requireMember(memberId);                                    // 권한 확인
+        Loan loan = loanPolicy.check(memberId, bookId);                         // 핵심 로직
+        loanRepository.save(loan);                                              // 핵심 로직
+        txManager.commit(tx);                                                   // 트랜잭션
+        tracer.end(scope);                                                      // 로그 추적
+        return loan;
+    } catch (RuntimeException e) {
+        txManager.rollback(tx);                                                 // 트랜잭션
+        tracer.fail(scope, e);                                                  // 로그 추적
+        throw e;
+    }
+}
+// tracer, txManager, authChecker, loanPolicy, loanRepository 필드 선언은 생략</code></pre>
+<p>열다섯 줄 남짓한 메서드에서 이 메서드만의 일은 두 줄이다. 나머지는 다른 수십 개 메서드에도 똑같이 들어 있는 줄이다. 읽는 사람은 핵심 로직을 찾으려고 부가 기능 코드를 걷어 내며 읽어야 하고, 테스트하는 사람은 대출 규칙 하나를 확인하려고 트랜잭션 관리자와 추적기를 준비해야 한다. 순서에도 함정이 숨어 있다. 위 코드에서 권한 확인이 실패하면 예외가 <code>catch</code>로 가서 롤백되고 실패 로그가 남는데, 권한 확인을 트랜잭션 시작 앞으로 옮기면 그렇지 않다. 부가 기능 사이의 순서라는 결정까지 모든 메서드에 복제되는 셈이다.</p>
+<p>객체지향의 도구로 이 문제를 풀어 보려 한 것이 01~02회다. 공통 코드를 추적기 객체로 뽑고(위임), 뼈대를 템플릿으로 모았다(템플릿 메서드, 템플릿 콜백). 그러면 부가 기능의 <b>본문</b>은 한 곳에 모인다. 하지만 "이 메서드에 로그 추적을 적용한다"는 <b>적용 결정</b>, 즉 템플릿을 호출하는 코드는 여전히 각 메서드 안에 남는다. 이것은 객체지향이 잘못되어서가 아니라, 객체지향이 프로그램을 나누는 축이 하나이기 때문이다. 클래스는 "무엇에 대한 책임인가"(대출, 회원, 결제)라는 축으로 나뉜다. 횡단 관심사는 그 축을 가로지르므로, 어떤 클래스에 담든 다른 클래스들이 그 클래스를 불러야 하고, 부르는 코드가 흩어진다.</p>
+<p>03~06회는 방향을 뒤집었다. 핵심 클래스가 부가 기능을 부르는 대신, 부가 기능 쪽이 "나는 이 클래스들의 이 메서드들 앞에 선다"고 선언하고, 컨테이너가 그 선언대로 프록시를 세웠다. 이렇게 하면 <code>LoanService</code>의 코드는 로그 추적의 존재를 전혀 모른다. 적용 결정이 핵심 코드 밖의 한 곳으로 옮겨 간 것이다. 이것이 AOP가 하려는 일의 전부다.</p>
+
+<h3>AOP 소개 — 애스펙트</h3>
+<p>스프링 레퍼런스는 AOP 장을 이렇게 시작한다. AOP는 프로그램 구조를 생각하는 또 다른 방법을 제공해 객체지향 프로그래밍(OOP)을 <b>보완</b>한다. OOP에서 모듈화의 핵심 단위는 클래스이고, AOP에서는 애스펙트(aspect)다. 애스펙트는 여러 타입과 객체에 걸치는 관심사(예: 트랜잭션 관리)를 모듈화할 수 있게 해 주며, 그런 관심사를 AOP 문헌에서는 흔히 "횡단(crosscutting)" 관심사라고 부른다.</p>
+<p>앞의 표로 말하면, 애스펙트는 세로줄 하나를 통째로 들어 한 곳에 모은 모듈이다. 그 모듈에는 두 가지 정보가 있어야 한다. 무엇을 할 것인가(어드바이스)와 어디에 할 것인가(포인트컷)다. 어디에가 빠지면 부가 기능은 아무 데도 붙지 않고, 무엇을이 빠지면 붙일 것이 없다. 05회의 어드바이저가 바로 이 둘의 최소 묶음이었다. 스프링 레퍼런스도 "스프링에서 어드바이저는 포인트컷 표현식과 연결된 어드바이스 객체 하나만 가진 애스펙트"라고 정의한다. <code>@Aspect</code> 클래스는 여기서 한 걸음 더 나가, 여러 어드바이스와 포인트컷을 한 클래스에 담을 수 있는 애스펙트다. 앞에서 본 것처럼 컨테이너 안에서는 어드바이스 메서드 수만큼의 어드바이저로 풀린다.</p>
+<p>애스펙트라는 단위가 생기면 앞의 그림이 달라진다. 로그 추적 열의 ■들이 사라지고, 그 자리에 <code>CallTraceAspect</code> 하나가 "<code>hello.app</code> 아래의 모든 메서드"라는 범위를 들고 선다. 트랜잭션 열도 마찬가지로 트랜잭션 애스펙트 하나가 된다. 실제로 스프링의 <code>@Transactional</code>은 트랜잭션 어드바이저(포인트컷은 "<code>@Transactional</code>이 붙은 메서드나 클래스", 어드바이스는 트랜잭션 인터셉터)로 구현되어 있어서, 앞에서 본 자동 프록시 생성기의 승격 덕분에 우리 애스펙트와 같은 프록시의 같은 체인에 들어간다. 스프링 레퍼런스가 AOP의 쓰임새로 가장 먼저 꼽는 것도 선언적 트랜잭션 관리다.</p>
+<p>AOP가 OOP를 대체하는 것은 아니라는 점도 짚어 두자. 애스펙트 자신도 클래스이고, 필드와 메서드를 갖고, 다른 빈을 주입받는다. 핵심 로직은 여전히 객체와 메시지로 설계한다. AOP는 객체지향의 축으로 잘 나뉘지 않는 관심사만 별도의 단위로 떼어 낼 뿐이다. 그리고 그 대가도 있다. <code>LoanService</code>의 소스만 읽어서는 그 메서드에 무엇이 덧붙는지 알 수 없다. 동작이 코드 밖에서 결정되므로, 앞의 호출 스택처럼 실행 경로에 낯선 프레임이 끼고, 포인트컷이 의도보다 넓거나 좁으면 조용히 잘못 동작한다. 애스펙트를 쓸 때는 적용 범위를 좁고 분명하게 쓰는 것이 이 대가를 줄이는 방법이다.</p>
+<p>AOP를 자바에서 가장 완전하게 구현한 것이 AspectJ다. AspectJ는 자바에 애스펙트 문법을 더한 언어이자 그 컴파일러(ajc)와 위버(weaver)를 포함하는 도구다. 처음에는 <code>aspect</code>라는 전용 키워드를 쓰는 문법만 있었고, AspectJ 5에서 일반 자바 클래스에 애너테이션을 붙여 애스펙트를 쓰는 @AspectJ 스타일이 도입됐다. 스프링이 읽는 <code>@Aspect</code>, <code>@Around</code>가 바로 그 애너테이션이다. 스프링 레퍼런스는 스프링 AOP가 AspectJ와 경쟁하려는 것이 아니며, 프록시 기반 프레임워크와 AspectJ 같은 완전한 프레임워크는 경쟁이 아니라 서로 보완하는 관계라고 설명한다. 둘의 차이는 결국 "부가 기능을 핵심 코드에 언제, 어떻게 엮는가"에서 나온다.</p>
+
+<h3>AOP 적용 방식 — 부가 기능을 언제 끼워 넣는가</h3>
+<p>애스펙트를 대상 코드에 엮는 일을 위빙(weaving)이라고 한다. 스프링 레퍼런스의 정의는 "애스펙트를 다른 애플리케이션 타입이나 객체와 연결해 어드바이스가 적용된 객체를 만드는 것"이고, 이 일은 컴파일 시점, 로드 시점, 런타임에 할 수 있으며, 스프링 AOP는 다른 순수 자바 AOP 프레임워크처럼 런타임에 위빙한다. AspectJ 개발 가이드는 AspectJ 위버가 클래스 파일을 입력으로 받아 클래스 파일을 출력한다고 설명하면서, 위빙이 일어날 수 있는 시점을 컴파일 시점, 컴파일 후(post-compile), 로드 시점 셋으로 나눈다. 자바 클래스 하나가 소스에서 실행 중인 객체가 되기까지의 길 위에 이 시점들을 올려 보면 다음과 같다.</p>
+<pre class="diagram">  .java 소스 ──javac/ajc──▶ .class 파일 ──jar──▶ 클래스 로더 ──▶ 메서드 영역의 클래스 ──new──▶ 힙의 객체
+      │                         │                     │                                         │
+  ① 컴파일 시점             ② 컴파일 후            ③ 로드 시점                                 ④ 런타임
+  ajc가 소스를 컴파일하며    ajc가 이미 만든        에이전트가 바이트 배열을                    원본 클래스는 그대로,
+  애스펙트를 엮는다          .class·jar를 엮는다     JVM에 넘기기 직전에 바꾼다                  앞에 프록시 객체를 세운다
+  └────────────── 대상 클래스의 바이트코드가 바뀐다 ──────────────┘                   └─ 바이트코드는 그대로 ─┘</pre>
+<p><b>컴파일 시점 위빙</b>은 javac 대신 AspectJ 컴파일러 ajc로 소스를 컴파일하면서 애스펙트를 엮는다. AspectJ 가이드는 이것을 가장 단순한 방법이라고 부른다. 결과로 나온 <code>.class</code> 파일에는 이미 어드바이스 호출이 들어 있으므로, 실행할 때는 특별한 설정이 필요 없다. 대신 빌드에 ajc를 넣어야 한다. <b>컴파일 후 위빙</b>(바이너리 위빙)은 이미 컴파일된 클래스 파일이나 jar를 ajc에 넣어 엮는다. 소스가 없는 라이브러리에도 적용할 수 있다.</p>
+<p><b>로드 시점 위빙</b>(load-time weaving, LTW)은 AspectJ 가이드의 표현으로 "클래스 로더가 클래스 파일을 로드하는 시점까지 미뤄 둔 바이너리 위빙"이다. JVM을 <code>-javaagent:경로/aspectjweaver.jar</code> 옵션으로 띄우면, 이 에이전트가 클래스 로딩을 가로채 바이트 배열이 클래스로 정의되기 직전에 바꾼다. 어떤 애스펙트를 어떤 클래스에 엮을지는 클래스패스의 <code>META-INF/aop.xml</code>로 정한다. 빌드는 그대로 두고 실행 방식만 바꾸면 된다는 장점이 있지만, JVM 실행 옵션을 바꿔야 한다. 스프링도 <code>@EnableLoadTimeWeaving</code>과 <code>spring-instrument</code> 에이전트로 이 방식을 지원한다.</p>
+<p><b>런타임 위빙</b>은 스프링 AOP가 쓰는 방식이고, 이 권에서 지금까지 한 것이 전부 여기에 속한다. 대상 클래스의 바이트코드는 한 글자도 바뀌지 않는다. 대신 대상과 같은 타입의 새 클래스(JDK 프록시나 CGLIB 하위 클래스)를 실행 중에 만들고, 그 인스턴스를 대상 앞에 세운다. 스프링 레퍼런스는 이 방식이 순수 자바로 구현되어 특별한 컴파일 과정이 필요 없고, 클래스 로더 계층을 제어할 필요도 없어 서블릿 컨테이너나 애플리케이션 서버에서 쓰기 알맞다고 설명한다. 그 대신 부가 기능이 붙는 것은 "프록시를 통해 들어오는 호출"뿐이다. 이 제약이 무엇을 뜻하는지는 바이트코드를 실제로 바꾸는 방식과 나란히 놓아야 잘 보인다.</p>
+<x-visual id="spring-core-adv-07-weaving-times" title="클래스의 생애 위에 놓인 네 가지 위빙 시점" kind="타임라인" ratio="16:9">
+<x-hint>소스에서 객체까지 이어지는 한 줄의 흐름 위에서, 앞의 세 시점은 클래스 자체를 바꾸고 마지막 런타임 방식은 클래스를 그대로 둔 채 앞에 프록시를 세운다는 대비를 보여 준다.</x-hint>
+<x-prompt>흰 배경의 가로 타임라인 그림. 왼쪽에서 오른쪽으로 다섯 개의 아이콘이 화살표로 이어진다: 문서 아이콘 ".java", 상자 아이콘 ".class", 깔때기 모양 "클래스 로더", 서랍장 모양 "메서드 영역", 동그란 객체 아이콘 "힙의 객체". 각 화살표 아래에 번호 원과 라벨이 있다: ".java"와 ".class" 사이에 "① 컴파일 시점 (ajc)", ".class" 아래에 "② 컴파일 후", "클래스 로더" 아래에 "③ 로드 시점 (-javaagent)", "힙의 객체" 아래에 "④ 런타임 (프록시)". ①②③ 아래에는 같은 주황색 띠가 이어져 있고 띠 안에 "클래스의 바이트코드를 바꾼다"라고 적는다. ④ 아래에는 파란색 띠가 있고 "원본은 그대로, 앞에 프록시"라고 적으며, 객체 아이콘 앞에 반투명한 방패 모양 객체가 겹쳐 서 있다. 단정한 선, 주황과 파랑의 대비.</x-prompt>
+<x-caption>①~③은 대상 클래스의 바이트코드를 바꾸고, ④(스프링 AOP)는 대상 클래스를 그대로 둔 채 앞에 프록시 객체를 세운다.</x-caption>
+</x-visual>
+
+<h3>로드 타임 위빙을 직접 돌려 보기</h3>
+<p>앞의 실험에 쓴 <code>OrderServiceImpl</code>, <code>StockRepository</code>, <code>TraceAspect</code>를 <b>한 글자도 바꾸지 않고</b> 스프링 없이 AspectJ 로드 타임 위빙으로 실행해 보자. 진입점은 객체를 <code>new</code>로 직접 만든다.</p>
+<pre><code class="language-java">package demo;
+
+import demo.app.*;
+
+public class PlainMain {
+    public static void main(String[] args) {
+        OrderService service = new OrderServiceImpl(new StockRepository());
+        System.out.println("result = " + service.order("book"));
+    }
+}</code></pre>
+<pre data-label="META-INF/aop.xml"><code class="language-xml"><aspectj>
+    <aspects>
+        <aspect name="demo.aop.TraceAspect"/>
+    </aspects>
+    <weaver options="-showWeaveInfo">
+        <include within="demo..*"/>
+        <dump within="demo..*"/>
+    </weaver>
+</aspectj></code></pre>
+<pre data-label="실행"><code class="language-bash">javac -g -d out -cp aspectjweaver-1.9.25.1.jar $(find src -name '*.java')
+java -javaagent:aspectjweaver-1.9.25.1.jar -cp "ltw:out:aspectjweaver-1.9.25.1.jar" demo.PlainMain</code></pre>
+<p><code>aop.xml</code>의 <code>aspects</code>는 엮을 애스펙트를, <code>include within</code>은 위빙 대상 클래스의 범위를 정한다. <code>-showWeaveInfo</code>는 어느 조인 포인트에 무엇을 엮었는지 보고하게 하는 옵션이고, <code>dump</code> 요소는 AspectJ 가이드의 설명대로 진단을 위해 엮인 클래스의 바이트코드를 디스크(<code>_ajdump</code> 디렉터리)에 저장하게 한다. javac에 <code>-g</code>를 준 데는 이유가 있다. 처음에 <code>-g</code> 없이 컴파일해 실행하자 위버가 "Cannot read debug info for @Aspect to handle formal binding in pointcuts (please compile with 'javac -g' ...)"라는 오류를 출력하고 아무것도 엮지 않은 채 원래대로 실행됐다. javac로 컴파일한 @AspectJ 스타일 애스펙트를 위버에 넘길 때는 디버그 정보가 필요하다는 뜻이다. 디버그 정보를 넣어 다시 실행한 출력은 다음과 같다.</p>
+<pre data-label="실행 결과"><code class="language-text">[AppClassLoader@76ed5528] weaveinfo at demo/app/OrderServiceImpl.java:6::0 Join point 'method-execution(java.lang.String demo.app.OrderServiceImpl.order(java.lang.String))' in Type 'demo.app.OrderServiceImpl' (OrderServiceImpl.java:6) advised by around advice from 'demo.aop.TraceAspect' (TraceAspect.java)
+[AppClassLoader@76ed5528] weaveinfo at demo/app/StockRepository.java:4::0 Join point 'method-execution(java.lang.String demo.app.StockRepository.reserve(java.lang.String))' in Type 'demo.app.StockRepository' (StockRepository.java:4) advised by around advice from 'demo.aop.TraceAspect' (TraceAspect.java)
+[AppClassLoader@76ed5528] weaveinfo at demo/app/StockRepository.java:7::0 Join point 'method-execution(boolean demo.app.StockRepository.check(java.lang.String))' in Type 'demo.app.StockRepository' (StockRepository.java:7) advised by around advice from 'demo.aop.TraceAspect' (TraceAspect.java)
+[trace] --> String demo.app.OrderServiceImpl.order(String)
+  OrderServiceImpl.order(book)
+[trace] --> String demo.app.StockRepository.reserve(String)
+  StockRepository.reserve(book)
+[trace] --> boolean demo.app.StockRepository.check(String)
+[trace] <-- boolean demo.app.StockRepository.check(String) = true
+[trace] <-- String demo.app.StockRepository.reserve(String) = ok:book
+[trace] <-- String demo.app.OrderServiceImpl.order(String) = ok:book
+result = ok:book</code></pre>
+<p>(<code>weaveinfo</code> 줄마다 붙는 "see also" 줄은 지웠다. <code>AppClassLoader@</code> 뒤의 값은 실행마다 다를 수 있다.) 스프링 실험과 비교하면 세 가지가 다르다. 컨테이너가 없는데도, 객체를 <code>new</code>로 만들었는데도 어드바이스가 실행됐다. <code>reserve</code>가 내부에서 부른 <code>private</code> 메서드 <code>check</code>에도 어드바이스가 실행됐다. 그리고 <code>order</code>의 시그니처가 인터페이스가 아니라 <code>OrderServiceImpl</code>로 찍혔다. 위버가 엮은 것은 "메서드 실행(method-execution)" 조인 포인트, 즉 메서드 본문이 실행되는 지점이기 때문이다. 같은 방식으로 <code>final</code> 메서드와 <code>static</code> 메서드가 있는 작은 클래스를 엮어 보니, 둘 다 어드바이스가 실행됐다. 프록시 방식이라면 <code>final</code> 메서드는 재정의할 수 없어서, <code>static</code> 메서드는 객체를 거치지 않아서 가로챌 수 없는 메서드들이다.</p>
+<h4>엮인 클래스의 바이트코드</h4>
+<p>무엇이 이것을 가능하게 했는지는 덤프된 클래스를 <code>javap</code>로 열면 보인다. 먼저 javac가 만든 원래 클래스와 위버가 바꾼 클래스의 멤버 목록이다.</p>
+<pre data-label="javap -p (원본 → 위빙 후)"><code class="language-text">// 원본 out/demo/app/StockRepository.class
+public class demo.app.StockRepository {
+  public demo.app.StockRepository();
+  public java.lang.String reserve(java.lang.String);
+  private boolean check(java.lang.String);
+}
+
+// 위빙 후 _ajdump/demo/app/StockRepository.class
+public class demo.app.StockRepository {
+  private static org.aspectj.lang.JoinPoint$StaticPart ajc$tjp_0;
+  private static org.aspectj.lang.JoinPoint$StaticPart ajc$tjp_1;
+  public demo.app.StockRepository();
+  public java.lang.String reserve(java.lang.String);
+  private boolean check(java.lang.String);
+  static {};
+  static final java.lang.String reserve_aroundBody0(demo.app.StockRepository, java.lang.String, org.aspectj.lang.JoinPoint);
+  static final boolean check_aroundBody2(demo.app.StockRepository, java.lang.String, org.aspectj.lang.JoinPoint);
+  private static void ajc$preClinit();
+}</code></pre>
+<p>클래스 이름은 그대로이고 메서드 시그니처도 그대로다. 대신 조인 포인트의 정적 정보를 담는 <code>static</code> 필드 두 개(<code>ajc$tjp_0</code>, <code>ajc$tjp_1</code>)와 원래 메서드 본문을 옮겨 담은 <code>static final</code> 메서드 두 개(<code>reserve_aroundBody0</code>, <code>check_aroundBody2</code>)가 생겼다. 덤프 디렉터리에는 <code>StockRepository$AjcClosure1</code>, <code>StockRepository$AjcClosure3</code>이라는 클래스도 새로 생겼다. 이제 <code>reserve</code> 자체의 바이트코드를 보자.</p>
+<pre data-label="javap -c (위빙 후 reserve)"><code class="language-text">public java.lang.String reserve(java.lang.String);
+  Code:
+     0: aload_1
+     1: astore_2
+     2: getstatic     #71   // Field ajc$tjp_0:Lorg/aspectj/lang/JoinPoint$StaticPart;
+     5: aload_0
+     6: aload_0
+     7: aload_2
+     8: invokestatic  #77   // Method org/aspectj/runtime/reflect/Factory.makeJP:(...)Lorg/aspectj/lang/JoinPoint;
+    11: astore_3
+    12: invokestatic  #98   // Method demo/aop/TraceAspect.aspectOf:()Ldemo/aop/TraceAspect;
+    15: iconst_3
+    16: anewarray     #2    // class java/lang/Object
+    ...                     // 배열에 this, item, 조인 포인트를 담는다
+    36: new           #82   // class demo/app/StockRepository$AjcClosure1
+    39: dup
+    40: aload         4
+    42: invokespecial #85   // Method demo/app/StockRepository$AjcClosure1."<init>":([Ljava/lang/Object;)V
+    ...
+    50: invokevirtual #92   // Method org/aspectj/runtime/internal/AroundClosure.linkClosureAndJoinPoint:(I)Lorg/aspectj/lang/ProceedingJoinPoint;
+    53: invokevirtual #102  // Method demo/aop/TraceAspect.trace:(Lorg/aspectj/lang/ProceedingJoinPoint;)Ljava/lang/Object;
+    56: checkcast     #32   // class java/lang/String
+    59: areturn</code></pre>
+<p>한 줄씩 읽으면 위빙이 무엇인지 분명해진다. 2~11번은 정적 정보(<code>ajc$tjp_0</code>)와 <code>this</code>, 인자를 묶어 <code>JoinPoint</code> 객체를 만든다. 12번은 <code>TraceAspect.aspectOf()</code>로 애스펙트 인스턴스를 얻는다. 우리가 쓴 <code>TraceAspect</code>에는 그런 메서드가 없었다. 덤프된 <code>TraceAspect</code>를 열어 보면 위버가 <code>public static TraceAspect ajc$perSingletonInstance</code> 필드와 <code>aspectOf()</code>, <code>hasAspect()</code> 메서드를 더해 두었다. 싱글톤 애스펙트 인스턴스를 스프링 컨테이너가 아니라 <b>애스펙트 클래스의 static 필드</b>가 들고 있는 것이다. 15~42번은 인자를 담은 배열로 클로저 객체 <code>StockRepository$AjcClosure1</code>을 만들고, 50번에서 그 클로저를 <code>ProceedingJoinPoint</code>로 연결한다. 53번이 우리 어드바이스 메서드 <code>trace</code>를 <b>보통의 <code>invokevirtual</code>로 직접</b> 부르는 지점이다. 리플렉션이 없다. 반환값은 <code>Object</code>이므로 56번에서 <code>String</code>으로 캐스팅해 돌려준다.</p>
+<p>원래 본문은 어디로 갔을까? <code>reserve_aroundBody0</code>를 열면 javac가 만든 원래 <code>reserve</code>의 명령어가 그대로 들어 있다. 출력 문자열을 만들어 <code>println</code>을 부르고, <code>invokevirtual check:(Ljava/lang/String;)Z</code>로 <code>check</code>를 부른 뒤, 결과에 따라 두 문자열 중 하나를 만들어 반환한다. 어드바이스가 <code>proceed()</code>를 부르면 클로저의 <code>run</code>이 이 <code>static</code> 메서드를 부른다. 여기서 중요한 것은 이 본문 안의 <code>check</code> 호출이다. 이 호출은 여전히 <code>this.check(item)</code>이고, 프록시를 거치지 않는다. 그런데도 어드바이스가 실행된 이유는 <code>check</code> <b>자신의 본문</b>이 같은 방식으로 바뀌어 있기 때문이다. 위빙은 호출하는 쪽이 아니라 실행되는 쪽, 메서드 몸통 안에 부가 기능을 심는다. 누가 어떤 참조로 부르든 몸통이 실행되면 어드바이스도 실행된다.</p>
+<h4>두 방식의 호출 스택 나란히 보기</h4>
+<p>로드 타임 위빙으로 실행하면서 어드바이스 안에서 스택을 찍으면 이렇게 나온다. <code>check</code>의 어드바이스가 실행되는 순간이다.</p>
+<pre data-label="실행 결과 (로드 타임 위빙, 어드바이스 안에서 찍은 스택)"><code class="language-text">[trace] --> boolean demo.app.StockRepository.check(String)
+      at demo.aop.TraceAspect.trace
+      at demo.app.StockRepository.check
+      at demo.app.StockRepository.reserve_aroundBody0
+      at demo.app.StockRepository$AjcClosure1.run
+      at org.aspectj.runtime.reflect.JoinPointImpl.proceed
+      at demo.aop.TraceAspect.trace
+      at demo.app.StockRepository.reserve
+      at demo.app.OrderServiceImpl.order_aroundBody0
+      at demo.app.OrderServiceImpl$AjcClosure1.run
+      at org.aspectj.runtime.reflect.JoinPointImpl.proceed
+      at demo.aop.TraceAspect.trace
+      at demo.app.OrderServiceImpl.order
+      at demo.PlainMain.main</code></pre>
+<p>스프링 쪽 스택과 비교해 보자. 스프링에서는 <code>TraceAspect.trace</code> 아래에 <code>Method.invoke</code>, <code>AspectJAroundAdvice</code>, <code>ReflectiveMethodInvocation</code>, <code>ExposeInvocationInterceptor</code>, 프록시 클래스가 쌓여 있었다. 여기서는 <code>TraceAspect.trace</code> 바로 아래가 <code>StockRepository.check</code>, 즉 <b>대상 메서드 자신</b>이다. 프록시도, 인터셉터 체인도, 리플렉션 호출도 없다. 어드바이스는 대상 클래스의 바이트코드 일부가 되었고, <code>proceed()</code>는 클로저를 거쳐 원래 본문(<code>..._aroundBody0</code>)으로 이어진다. 스프링 AOP의 프록시가 "대상 앞에 선 다른 객체"라면, 위빙된 AspectJ의 어드바이스는 "대상 안에 심어진 코드"다. 같은 <code>@Aspect</code> 클래스, 같은 포인트컷 표현식인데도 적용 결과가 달랐던 것은 이 구조의 차이 때문이다.</p>
+
+<h3>프록시 방식이 닿는 곳과 닿지 않는 곳</h3>
+<p>두 실험의 결과를 조인 포인트별로 정리하면 다음과 같다. 스프링 쪽 근거는 실험과 스프링 레퍼런스이고, AspectJ 쪽 근거는 로드 타임 위빙 실험과 스프링 레퍼런스의 포인트컷 지정자 목록이다.</p>
+<div class="table-wrap"><table><thead><tr><th>대상</th><th>스프링 AOP(런타임, 프록시)</th><th>AspectJ(바이트코드 위빙)</th></tr></thead><tbody>
+<tr><td>스프링 빈의 메서드를 다른 객체가 빈 참조로 호출</td><td>적용된다</td><td>적용된다</td></tr>
+<tr><td>같은 객체 안에서 <code>this.method()</code>로 호출</td><td>적용되지 않는다(프록시를 거치지 않는다)</td><td>적용된다(실험의 <code>check</code>)</td></tr>
+<tr><td><code>private</code> 메서드</td><td>적용되지 않는다</td><td>적용된다</td></tr>
+<tr><td><code>final</code> 메서드</td><td>적용되지 않는다(재정의할 수 없다)</td><td>적용된다(실험)</td></tr>
+<tr><td><code>static</code> 메서드</td><td>적용되지 않는다(객체를 거치지 않는다)</td><td>적용된다(실험)</td></tr>
+<tr><td>컨테이너 밖에서 <code>new</code>로 만든 객체</td><td>적용되지 않는다</td><td>적용된다(실험의 <code>PlainMain</code>)</td></tr>
+<tr><td>객체 초기화, 필드 읽기·쓰기, 예외 핸들러, 정적 초기화</td><td>조인 포인트가 아니다. 이를 고르는 <code>initialization</code>, <code>get</code>, <code>set</code>, <code>handler</code>, <code>staticinitialization</code> 지정자를 쓰면 <code>IllegalArgumentException</code></td><td>조인 포인트로 지원한다</td></tr>
+</tbody></table></div>
+<p>스프링 레퍼런스는 이 한계를 직접 밝힌다. 스프링 AOP는 현재 메서드 실행 조인 포인트(스프링 빈의 메서드 실행에 대한 어드바이스)만 지원하고, 필드 가로채기는 구현되어 있지 않다. 프록시 기반이라는 성질 때문에 대상 객체 안에서 일어나는 호출은 정의상 가로채지 않는다. JDK 프록시에서는 프록시를 통한 public 인터페이스 메서드 호출만, CGLIB에서는 프록시를 통한 public과 protected 메서드 호출(필요하면 패키지 가시성 메서드까지)만 가로챌 수 있다. 그리고 <code>final</code> 메서드는 재정의할 수 없으므로 어드바이스를 적용할 수 없다. AspectJ에는 있지만 스프링 AOP가 지원하지 않는 포인트컷 지정자(<code>call</code>, <code>get</code>, <code>set</code>, <code>preinitialization</code>, <code>staticinitialization</code>, <code>initialization</code>, <code>handler</code>, <code>adviceexecution</code>, <code>withincode</code>, <code>cflow</code>, <code>cflowbelow</code>, <code>if</code>, <code>@this</code>, <code>@withincode</code>)를 스프링 AOP가 해석하는 표현식에 쓰면 <code>IllegalArgumentException</code>이 난다.</p>
+<p>이 표의 모든 "적용되지 않는다"는 하나의 원인에서 나온다. 프록시는 <b>호출 경로</b> 위에 서는 객체이므로, 호출이 그 객체를 지나지 않으면 아무 일도 하지 않는다. <code>this.check()</code>는 프록시가 아니라 타깃 자신의 참조로 부르는 호출이고, <code>static</code> 메서드 호출에는 지나갈 객체가 없으며, <code>new</code>로 만든 객체에는 앞에 선 프록시가 없다. 반대로 바이트코드 위빙은 <b>실행되는 코드</b> 자체를 바꾸므로 호출 경로와 상관없다. 이 중 내부 호출 문제는 실무에서 가장 자주 부딪히는 함정이어서 10회에서 원인과 해결책을 따로 다룬다. JDK 프록시와 CGLIB 프록시를 고르는 일이 타입 캐스팅과 의존관계 주입에 미치는 영향도 10회에서 본다.</p>
+<p>그렇다면 왜 스프링은 기능이 적은 쪽을 기본으로 택했을까? 스프링 레퍼런스는 스프링 AOP의 목표가 가장 완전한 AOP 구현이 아니라 AOP 구현과 스프링 IoC의 긴밀한 통합이라고 말한다. 엔터프라이즈 애플리케이션에서 부가 기능이 필요한 지점, 즉 트랜잭션 경계, 보안 검사, 로그 추적, 실행 시간 측정은 대부분 서비스 객체의 public 메서드 경계다. 그 경계에 있는 객체는 거의 모두 스프링 빈이고, 다른 빈이 주입받은 참조로 호출한다. 프록시 방식은 그 경계를 정확히 덮으면서, ajc도 에이전트도 클래스 로더 설정도 요구하지 않는다. 같은 문서는 반대로 매우 잘게 나뉜 객체(대표적으로 도메인 객체)에 어드바이스를 적용하는 일은 스프링 AOP로 쉽거나 효율적으로 할 수 없고, 그런 경우에는 AspectJ가 최선이라고 말한다. 컨테이너 밖에서 <code>new</code>나 ORM이 만든 도메인 객체에 의존관계를 주입하는 스프링의 <code>@Configurable</code> 지원이 AspectJ 위빙을 요구하는 것이 그 예다.</p>
+
+<h3>AOP 용어 정리</h3>
+<p>마지막으로 지금까지 써 온 말들을 정리하자. 용어는 AspectJ에서 시작해 스프링이 이어받은 것이어서, 정의는 넓고 스프링에서의 실체는 좁은 경우가 많다. 그 차이를 실험으로 확인해 보려고 <code>StockRepository</code>의 메서드에 걸리는 애스펙트에서 <code>ProceedingJoinPoint</code>의 값을 찍어 봤다.</p>
+<pre><code class="language-java">@Around("execution(* demo.app.StockRepository.*(..))")
+public Object inspect(ProceedingJoinPoint jp) throws Throwable {
+    System.out.println("kind      = " + jp.getKind());
+    System.out.println("short     = " + jp.getSignature().toShortString());
+    System.out.println("long      = " + jp.getSignature().toLongString());
+    System.out.println("this      = " + jp.getThis().getClass().getName());
+    System.out.println("target    = " + jp.getTarget().getClass().getName());
+    System.out.println("args      = " + java.util.Arrays.toString(jp.getArgs()));
+    System.out.println("jp class  = " + jp.getClass().getName());
+    return jp.proceed();
+}</code></pre>
+<pre data-label="실행 결과 (스프링 컨테이너, StockRepository 빈의 reserve 호출)"><code class="language-text">kind      = method-execution
+short     = StockRepository.reserve(..)
+long      = public java.lang.String demo.app.StockRepository.reserve(java.lang.String)
+this      = demo.app.StockRepository$$SpringCGLIB$$0
+target    = demo.app.StockRepository
+args      = [book]
+jp class  = org.springframework.aop.aspectj.MethodInvocationProceedingJoinPoint
+  StockRepository.reserve(book)</code></pre>
+<p><code>getKind()</code>가 돌려준 <code>method-execution</code>은 이 조인 포인트의 종류이고, 스프링 AOP에서는 언제나 이 값이다. <code>getThis()</code>는 프록시를, <code>getTarget()</code>은 프록시 뒤의 원래 객체를 돌려줬다. 이 둘의 차이는 09회에서 볼 <code>this</code>, <code>target</code> 포인트컷 지정자의 차이로 그대로 이어진다. 이 값들을 옆에 두고 용어를 하나씩 정의한다. 정의 열은 스프링 레퍼런스의 "AOP Concepts" 절(어드바이저 행은 "Advisor API in Spring" 절과 스키마 기반 AOP의 "Advisors" 절)을 우리말로 옮긴 것이다.</p>
+<div class="table-wrap"><table><thead><tr><th>용어</th><th>정의</th><th>스프링에서의 실체 / 실험에서 본 것</th></tr></thead><tbody>
+<tr><td>조인 포인트(join point)</td><td>프로그램 실행 중의 한 지점. 메서드 실행이나 예외 처리 같은 것.</td><td>스프링 AOP에서는 언제나 메서드 실행이다. <code>getKind()</code> = <code>method-execution</code>.</td></tr>
+<tr><td>포인트컷(pointcut)</td><td>조인 포인트를 고르는 술어(predicate). 어드바이스는 포인트컷 표현식과 연결되어 그것이 고른 조인 포인트에서 실행된다.</td><td>기본으로 AspectJ 포인트컷 표현식 언어를 쓴다. 실체는 <code>ClassFilter</code>와 <code>MethodMatcher</code>를 가진 <code>Pointcut</code>, @Aspect에서는 <code>AspectJExpressionPointcut</code>.</td></tr>
+<tr><td>어드바이스(advice)</td><td>특정 조인 포인트에서 애스펙트가 하는 행동. around, before, after 등의 종류가 있다.</td><td>스프링을 포함한 많은 AOP 프레임워크가 어드바이스를 인터셉터로 모델링하고 조인 포인트 둘레에 인터셉터 체인을 유지한다. 실험의 <code>AspectJAroundAdvice</code>와 체인.</td></tr>
+<tr><td>애스펙트(aspect)</td><td>여러 클래스에 걸치는 관심사의 모듈화.</td><td>스키마 기반의 일반 클래스나 <code>@Aspect</code> 클래스. 실험의 <code>TraceAspect</code>.</td></tr>
+<tr><td>어드바이저(advisor)</td><td>스프링 고유 개념. 포인트컷과 연결된 어드바이스 하나만 가진 애스펙트.</td><td><code>DefaultPointcutAdvisor</code>, @Aspect에서 변환된 <code>InstantiationModelAwarePointcutAdvisorImpl</code>.</td></tr>
+<tr><td>대상 객체(target object)</td><td>하나 이상의 애스펙트가 어드바이스를 적용하는 객체. "어드바이스가 적용된 객체"라고도 한다.</td><td>스프링 AOP는 런타임 프록시로 구현되므로 대상 객체는 언제나 프록시가 감싼 객체다. <code>getTarget()</code> = <code>StockRepository</code>.</td></tr>
+<tr><td>AOP 프록시(AOP proxy)</td><td>애스펙트의 계약(어드바이스 실행 등)을 구현하려고 AOP 프레임워크가 만든 객체.</td><td>JDK 동적 프록시나 CGLIB 프록시. <code>getThis()</code> = <code>StockRepository$$SpringCGLIB$$0</code>.</td></tr>
+<tr><td>위빙(weaving)</td><td>애스펙트를 다른 애플리케이션 타입이나 객체와 연결해 어드바이스가 적용된 객체를 만드는 것. 컴파일 시점, 로드 시점, 런타임에 할 수 있다.</td><td>스프링 AOP는 런타임에 위빙한다. 실체는 자동 프록시 생성기가 프록시를 만드는 일.</td></tr>
+<tr><td>인트로덕션(introduction)</td><td>타입을 대신해 메서드나 필드를 추가로 선언하는 것. AspectJ에서는 타입 간 선언(inter-type declaration)이라고 한다.</td><td>스프링 AOP에서는 어드바이스가 적용된 객체에 새 인터페이스(와 구현)를 더할 수 있다. <code>@DeclareParents</code> 필드가 <code>DeclareParentsAdvisor</code>가 된다.</td></tr>
+</tbody></table></div>
+<p>용어를 외울 때 흔히 생기는 혼동이 둘 있다. 첫째, 조인 포인트와 포인트컷의 관계다. 조인 포인트는 "부가 기능을 붙일 수 <b>있는</b> 모든 자리"이고, 포인트컷은 그중 "실제로 붙일 자리를 고르는 조건"이다. 스프링 AOP에서 조인 포인트의 집합은 "스프링 빈 메서드의 실행"으로 이미 좁혀져 있고, 포인트컷은 그 안에서 다시 고른다. 그래서 포인트컷 표현식이 <code>private</code> 메서드나 내부 호출을 문법상 덮더라도, 그것들은 애초에 조인 포인트 집합에 없으므로 적용되지 않는다. 앞의 스프링 실험에서 <code>check</code>가 그랬다. 둘째, 애스펙트와 어드바이저의 관계다. 어드바이저는 애스펙트의 특수한 경우(어드바이스 하나, 포인트컷 하나)이고, 스프링 내부에서는 모든 애스펙트가 결국 어드바이저 목록으로 풀려 처리된다.</p>
+<h4>정리와 흔한 오해</h4>
+<p>이 회차의 뒷부분을 한 문단으로 묶으면 이렇다. 부가 기능은 객체지향의 축을 가로지르므로 코드에 흩어지고 핵심 로직과 뒤엉킨다. AOP는 그런 관심사를 애스펙트라는 단위로 모으고, "어디에"를 포인트컷으로 선언해 위빙으로 엮는다. 위빙은 컴파일 시점, 컴파일 후, 로드 시점에 바이트코드를 바꾸는 방식(AspectJ)과 런타임에 프록시를 세우는 방식(스프링 AOP)으로 나뉜다. 스프링 AOP는 조인 포인트를 스프링 빈의 메서드 실행으로 좁히는 대신, 특별한 컴파일러나 에이전트 없이 IoC 컨테이너와 하나로 동작한다.</p>
+<p>이 위에서 자주 생기는 오해를 바로잡아 두자.</p>
+<ul>
+<li><b>"<code>@Aspect</code>를 쓰면 AspectJ가 동작한다."</b> 아니다. 스프링은 AspectJ의 애너테이션과 포인트컷 파서만 빌려 쓴다. 실행은 프록시와 인터셉터 체인이 맡고, 바이트코드는 바뀌지 않는다. 그래서 포인트컷 문법이 같아도 적용 범위는 위 표만큼 다르다.</li>
+<li><b>"<code>@Aspect</code>만 붙이면 동작한다."</b> 애스펙트는 빈이어야 한다. 컴포넌트 스캔을 쓴다면 <code>@Component</code>가 함께 있어야 하고, @AspectJ 지원이 켜져 있어야 한다(부트에서는 aspectjweaver가 클래스패스에 있으면 자동으로 켜진다).</li>
+<li><b>"포인트컷에 해당하면 어떻게 호출하든 적용된다."</b> 스프링 AOP에서는 프록시를 거친 호출에만 적용된다. 내부 호출, <code>private</code> 메서드, 컨테이너 밖의 객체에는 적용되지 않는다.</li>
+<li><b>"애스펙트끼리도 서로 적용된다."</b> 스프링 AOP에서 <code>@Aspect</code> 클래스는 자동 프록시 대상에서 제외되므로 다른 애스펙트의 대상이 될 수 없다.</li>
+<li><b>"AOP는 객체지향을 대체한다."</b> 스프링 레퍼런스의 표현대로 AOP는 OOP를 보완한다. 애스펙트도 클래스이고, 핵심 로직의 설계는 여전히 객체지향의 몫이다.</li>
+</ul>
+<p>다음 회차들은 이 회차의 뼈대 위에 살을 붙인다. 08회는 <code>@Before</code>, <code>@AfterReturning</code> 같은 어드바이스 종류와 <code>@Pointcut</code>으로 포인트컷을 재사용하는 방법, 애스펙트 사이의 순서를 다루고, 09회는 <code>execution</code>을 비롯한 포인트컷 지정자의 문법을 다룬다. 10회는 이 회차의 표에서 "적용되지 않는다"로 남겨 둔 내부 호출 문제와 프록시 기술 선택의 실무적인 결과를 다룬다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>@Aspect</dt><dd>AspectJ 5가 도입한 애너테이션 방식의 애스펙트 선언. 스프링은 같은 애너테이션과 AspectJ의 포인트컷 파서를 쓰지만 실행은 순수한 스프링 AOP(프록시)가 맡는다. 애스펙트는 빈이어야 하며, 스캔으로 등록하려면 <code>@Component</code>가 필요하다.</dd>
+<dt>애스펙트에서 어드바이저로</dt><dd><code>AnnotationAwareAspectJAutoProxyCreator</code>의 <code>findCandidateAdvisors()</code>는 어드바이저 빈에 더해 <code>BeanFactoryAspectJAdvisorsBuilder</code>가 @Aspect 빈에서 만든 어드바이저를 합친다. 어드바이스 메서드 하나가 <code>AspectJExpressionPointcut</code>과 어드바이스 객체를 묶은 어드바이저 하나가 되고, 결과는 캐시된다.</dd>
+<dt>자동 프록시 생성기의 승격</dt><dd>자동 프록시 생성기는 <code>internalAutoProxyCreator</code>라는 고정 이름으로 하나만 등록되고, 트랜잭션·캐시·@Aspect 설정이 겹치면 우선순위가 높은 클래스로 승격된다. 그래서 출처가 다른 어드바이저들이 한 프록시의 한 체인에 들어간다.</dd>
+<dt>ExposeInvocationInterceptor</dt><dd>AspectJ 방식의 어드바이스가 있으면 체인 맨 앞에 추가되는 인터셉터. 현재 <code>MethodInvocation</code>을 ThreadLocal에 넣고 끝나면 이전 값으로 되돌려, <code>MethodInvocation</code>을 직접 받지 못하는 어드바이스가 조인 포인트를 만들 수 있게 한다.</dd>
+<dt>인터셉터 체인</dt><dd>프록시는 <code>ReflectiveMethodInvocation</code>을 만들어 <code>proceed()</code>를 부르고, 이 객체는 인덱스를 올리며 인터셉터를 차례로 부른 뒤 마지막에 리플렉션으로 타깃 메서드를 부른다. 애스펙트 메서드도 <code>Method.invoke</code>로 호출된다.</dd>
+<dt>핵심 기능과 부가 기능</dt><dd>핵심 기능은 객체가 존재하는 이유이고, 부가 기능은 그것을 보조하며 여러 클래스에 걸치는 횡단 관심사다. 직접 쓰면 코드가 흩어지고(scattering) 핵심 로직과 뒤엉킨다(tangling).</dd>
+<dt>위빙 시점</dt><dd>컴파일 시점(ajc), 컴파일 후(바이너리), 로드 시점(-javaagent와 aop.xml)은 대상 클래스의 바이트코드를 바꾸고, 런타임(스프링 AOP)은 원본을 그대로 둔 채 프록시를 세운다.</dd>
+<dt>프록시 방식의 한계</dt><dd>스프링 AOP의 조인 포인트는 스프링 빈 메서드의 실행뿐이고, 프록시를 거친 호출에만 적용된다. 내부 호출, private·final·static 메서드, 컨테이너 밖의 객체, 생성자와 필드 접근에는 적용되지 않는다.</dd>
+<dt>AOP 용어의 실체</dt><dd>스프링에서 조인 포인트는 메서드 실행(<code>method-execution</code>), 타깃은 프록시 뒤의 원래 객체(<code>getTarget()</code>), AOP 프록시는 JDK·CGLIB 프록시(<code>getThis()</code>), 어드바이저는 포인트컷 하나와 어드바이스 하나를 가진 애스펙트다.</dd>
+</x-summary>
+
+<x-review>
+<p>"애스펙트를 만들었는데 아무 일도 일어나지 않는다"는 문의는 거의 항상 세 가지 중 하나로 풀린다. 애스펙트가 빈으로 등록되지 않았거나(<code>@Component</code> 누락, 스캔 범위 밖), @AspectJ 지원이 꺼져 있거나(부트 없이 <code>@EnableAspectJAutoProxy</code>를 빠뜨림, 부트에서 aspectjweaver가 빠짐), 호출이 프록시를 거치지 않는 경우다. 마지막 경우는 같은 클래스 안의 메서드를 부르거나, 빈이 아닌 객체를 쓰거나, <code>private</code>·<code>final</code> 메서드에 기대한 경우다. 이 회차에서 본 확인 방법이 그대로 진단 도구가 된다. 빈을 꺼내 <code>getClass()</code>가 <code>$Proxy</code>나 <code>$$SpringCGLIB$$</code>인지 보고, 프록시라면 <code>Advised</code>로 캐스팅해 어드바이저 목록에 내 애스펙트가 있는지 확인한다. 둘 다 맞는데도 동작하지 않으면 호출 경로를 의심한다.</p>
+<p>스프링 AOP로 충분한지, AspectJ 위빙이 필요한지는 "부가 기능을 붙일 지점이 빈의 public 메서드 경계에 있는가"로 판단한다. 트랜잭션, 보안, 로그 추적, 실행 시간 측정, 재시도처럼 서비스 경계에서 일어나는 일은 프록시로 충분하고, 빌드와 실행 환경에 아무것도 더하지 않는다는 장점이 크다. 반대로 엔티티처럼 컨테이너 밖에서 대량으로 만들어지는 객체, 필드 접근, 생성자, 같은 클래스 안의 호출까지 덮어야 한다면 AspectJ 위빙을 검토해야 한다. 그 경우 빌드에 ajc를 넣을지, 실행 옵션에 에이전트를 넣을지를 운영 환경이 허용하는지부터 확인한다. 실험에서 본 것처럼 로드 타임 위빙은 설정이 조금만 어긋나도(디버그 정보 없이 컴파일 등) 위빙 없이 그대로 실행될 수 있으므로, <code>-showWeaveInfo</code>로 실제로 엮였는지를 확인하는 절차를 둔다.</p>
+<p>로그나 메트릭에 조인 포인트의 시그니처를 남기는 애스펙트라면, 프록시 방식에 따라 시그니처의 선언 타입이 인터페이스와 구현 클래스 사이에서 바뀐다는 점을 기억해 두자. 스프링 부트의 기본값(CGLIB)으로 운영하다가 <code>spring.aop.proxy-target-class=false</code>로 바꾸거나, 부트 없이 만든 테스트 컨텍스트에서 실행하면 같은 메서드가 다른 이름으로 집계될 수 있다. 메트릭 이름처럼 안정적이어야 하는 값에는 시그니처 문자열 대신 명시적인 이름(애너테이션 속성 등)을 쓰는 편이 안전하다.</p>
+</x-review>
+
+<x-practice>
+<li>본문의 스프링 실험을 <code>@EnableAspectJAutoProxy(proxyTargetClass = true)</code>로 바꿔 실행한다. <code>orderService</code> 빈의 클래스 이름과 <code>[trace] --></code> 로그 두 줄의 시그니처가 각각 어떻게 찍힐지 예측하고, 왜 첫 줄의 선언 타입이 원래 실험과 달라지는지 설명하라.</li>
+<li>어떤 애스펙트 클래스에 <code>@Around</code> 메서드 하나, <code>@Before</code> 메서드 하나, <code>@Pointcut</code> 메서드 하나, 애너테이션 없는 도우미 메서드 하나가 있다. 이 애스펙트가 적용되는 빈의 프록시를 <code>Advised</code>로 캐스팅해 <code>getAdvisors()</code>를 출력하면 어드바이저가 몇 개, 어떤 순서로 나오는가? 각 어드바이저가 어느 단계에서 만들어지는지(애스펙트 변환인지 프록시 생성인지)도 적어라. 다른 애스펙트나 어드바이저 빈은 없다고 가정한다.</li>
+<li><code>CallTraceAspect</code>의 포인트컷을 <code>execution(* hello..*(..))</code>로 넓혔더니 애플리케이션이 첫 요청에서 <code>StackOverflowError</code>로 실패했다. 추적기 구현은 <code>hello.trace</code> 패키지의 빈이다. 컨테이너가 빈을 만드는 순서와 호출 스택을 근거로 원인을 설명하고, 애스펙트 자신의 메서드는 왜 이 문제를 일으키지 않는지도 설명하라.</li>
+<li>다음 다섯 호출 각각에 대해 스프링 AOP와 AspectJ 로드 타임 위빙에서 <code>execution(* demo.app..*(..))</code> 어드바이스가 실행되는지 판단하라. (가) 컨트롤러 빈이 주입받은 서비스 빈의 public 메서드를 호출 (나) 서비스의 public 메서드가 같은 클래스의 public 메서드를 <code>this</code>로 호출 (다) 서비스가 <code>new</code>로 만든 <code>demo.app.Money</code> 객체의 메서드를 호출 (라) <code>demo.app.Strings.trim(...)</code> 같은 <code>static</code> 메서드 호출 (마) 서비스 빈의 <code>final</code> public 메서드를 다른 빈이 호출(CGLIB 프록시).</li>
+<li>한 애플리케이션에 <code>@EnableTransactionManagement</code>와 <code>@EnableAspectJAutoProxy</code>가 모두 있다. 두 설정 클래스가 어떤 순서로 처리되든 컨테이너에 등록되는 자동 프록시 생성기는 몇 개이고 어떤 클래스인가? 생성기가 두 개였다면 <code>@Transactional</code> 메서드를 가진 빈에 어떤 일이 생길 수 있었을지 추론하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> <code>orderService</code>는 <code>demo.app.OrderServiceImpl$$SpringCGLIB$$0</code>이 된다. <code>proxyTargetClass = true</code>면 인터페이스가 있어도 CGLIB로 구체 클래스의 하위 클래스를 만들기 때문이다. 로그는 <code>[trace] --> String demo.app.OrderServiceImpl.order(String)</code>과 <code>[trace] --> String demo.app.StockRepository.reserve(String)</code>로 찍힌다(원고를 쓰며 실행해 확인했다). JDK 프록시는 인터페이스의 <code>Method</code> 객체로 핸들러를 부르므로 원래 실험에서는 선언 타입이 <code>OrderService</code>였지만, CGLIB 프록시는 구체 클래스의 메서드를 재정의하므로 체인에 넘어가는 <code>Method</code>의 선언 타입이 <code>OrderServiceImpl</code>이다. <code>StockRepository</code>는 원래도 CGLIB였으므로 그대로다.</p>
+<p><b>2.</b> 세 개다. 애스펙트 변환 단계(<code>ReflectiveAspectJAdvisorFactory.getAdvisors</code>)에서 <code>@Pointcut</code> 메서드는 처음부터 후보에서 빠지고, 도우미 메서드는 AspectJ 애너테이션이 없어 <code>getAdvisor</code>가 <code>null</code>을 돌려주므로 버려진다. 남은 <code>@Around</code>와 <code>@Before</code>가 각각 <code>InstantiationModelAwarePointcutAdvisorImpl</code> 하나씩이 되고, 정렬 규칙에 따라 <code>@Around</code>가 앞선다. 프록시 생성 단계의 <code>extendAdvisors</code>가 AspectJ 어드바이스를 발견하고 맨 앞에 <code>ExposeInvocationInterceptor.ADVISOR</code>를 끼운다. 따라서 출력 순서는 <code>ExposeInvocationInterceptor.ADVISOR</code>, 어라운드 어드바이저, 비포 어드바이저가 된다. 원고를 쓰며 같은 구성(메서드 이름은 일부러 <code>aBefore</code>, <code>zAround</code>로 지었다)으로 실행해 이 세 줄을 확인했다. 마지막 두 개의 상대 순서는 같은 애스펙트 안의 어드바이스 순서 규칙에 따른 것이며, 자세한 규칙은 08회에서 다룬다.</p>
+<p><b>3.</b> 포인트컷이 <code>hello.trace</code>까지 덮으므로, 추적기 빈이 만들어질 때 자동 프록시 생성기가 이 빈에 적용할 어드바이저(우리 애스펙트)를 찾아 프록시로 바꾼다. 애스펙트 빈은 생성자로 이 추적기 빈을 주입받으므로 프록시를 받는다. 요청이 들어와 서비스 메서드의 어드바이스가 <code>tracer.begin()</code>을 부르면, 그 호출이 추적기 프록시를 지나며 같은 어드바이스를 다시 실행하고, 그 어드바이스가 또 <code>tracer.begin()</code>을 부른다. 종료 조건이 없으므로 스택이 넘친다. 애스펙트 자신은 <code>isInfrastructureClass</code> 재정의로 자동 프록시 대상에서 제외되므로 애스펙트의 메서드를 부르는 것은 이 순환을 만들지 않는다. 해결책은 포인트컷을 업무 코드 패키지로 좁히는 것이다.</p>
+<p><b>4.</b> (가) 둘 다 실행된다. 스프링에서는 주입된 참조가 프록시이고, 위빙에서는 메서드 몸통이 바뀌어 있다. (나) 스프링에서는 실행되지 않고(타깃의 <code>this</code>로 부르므로 프록시를 거치지 않는다), 위빙에서는 실행된다. (다) 스프링에서는 실행되지 않고(빈이 아니므로 프록시가 없다), 위빙에서는 <code>demo.app</code> 아래 클래스이므로 실행된다. (라) 스프링에서는 실행되지 않고(지나갈 객체가 없다), 위빙에서는 실행된다. (마) 스프링에서는 실행되지 않는다. CGLIB 하위 클래스가 <code>final</code> 메서드를 재정의할 수 없어 호출이 인터셉터에 닿지 않는다. 위빙에서는 메서드 몸통을 바꾸므로 실행된다. 다섯 경우 모두 기준은 같다. 스프링은 "호출이 프록시를 지나는가", 위빙은 "그 메서드의 몸통이 엮였는가"다.</p>
+<p><b>5.</b> 하나이고, 클래스는 <code>AnnotationAwareAspectJAutoProxyCreator</code>다. 트랜잭션 쪽 <code>AutoProxyRegistrar</code>는 <code>InfrastructureAdvisorAutoProxyCreator</code>를, <code>AspectJAutoProxyRegistrar</code>는 <code>AnnotationAwareAspectJAutoProxyCreator</code>를 요청하지만, 둘 다 <code>internalAutoProxyCreator</code>라는 같은 이름으로 등록하며 이미 있으면 우선순위가 높은 쪽으로만 바꾸기 때문이다. 생성기가 둘이었다면 각 생성기가 같은 빈을 따로 감쌀 수 있어, 트랜잭션 프록시를 다시 애스펙트 프록시가 감싸는 이중 프록시가 생길 수 있다. 그러면 체인이 둘로 나뉘어 두 부가 기능 사이의 순서를 하나의 정렬 규칙으로 정할 수 없게 된다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>컴포넌트 스캔 범위 안의 클래스에 <code>@Aspect</code>만 붙이고 <code>@Around</code> 어드바이스를 썼다. <code>@EnableAspectJAutoProxy</code>는 켜져 있다. 어드바이스가 전혀 실행되지 않는 이유로 가장 알맞은 것은?</q>
+<o>스프링 AOP는 <code>@Around</code>를 지원하지 않기 때문이다.</o>
+<o>AspectJ 컴파일러(ajc)로 컴파일하지 않았기 때문이다.</o>
+<o><code>@Aspect</code>는 컴포넌트 스캔의 감지 대상이 아니어서 애스펙트가 빈으로 등록되지 않았기 때문이다.</o>
+<o>애스펙트 클래스가 자동 프록시 대상에서 제외되기 때문이다.</o>
+<why>자동 프록시 생성기는 컨테이너의 빈 중에서 애스펙트를 찾는다. 스프링 레퍼런스는 <code>@Aspect</code>만으로는 클래스패스 자동 감지에 충분하지 않으므로 <code>@Component</code>를 따로 붙이라고 명시한다. 스프링 AOP는 <code>@Around</code>를 지원하고, ajc 없이 동작한다. 애스펙트가 자동 프록시 대상에서 제외된다는 것은 애스펙트 자신이 프록시가 되지 않는다는 뜻이지, 애스펙트의 어드바이스가 다른 빈에 적용되지 않는다는 뜻이 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>스프링 애플리케이션에서 <code>@Aspect</code>와 <code>@Around</code>를 쓸 때 AspectJ 라이브러리(aspectjweaver)가 맡는 일로 옳은 것은?</q>
+<o>클래스 로딩 시점에 대상 클래스의 바이트코드를 바꿔 어드바이스 호출을 넣는다.</o>
+<o>애너테이션 타입과 포인트컷 표현식의 파싱·매칭을 제공하고, 실행은 스프링의 프록시와 인터셉터 체인이 맡는다.</o>
+<o>컴파일 시점에 애스펙트와 대상 클래스를 엮은 <code>.class</code> 파일을 만든다.</o>
+<o>프록시 클래스를 생성한다. JDK 프록시와 CGLIB는 쓰이지 않는다.</o>
+<why>스프링 레퍼런스에 따르면 스프링은 AspectJ 5와 같은 애너테이션을 해석하고 포인트컷 파싱과 매칭에 AspectJ 라이브러리를 쓰지만, AOP 실행은 순수한 스프링 AOP이며 AspectJ 컴파일러나 위버에 의존하지 않는다. 실험에서도 대상 클래스는 그대로였고 프록시 클래스(<code>$Proxy17</code>, <code>$$SpringCGLIB$$0</code>)가 앞에 섰다. 바이트코드를 바꾸는 것은 ajc나 <code>-javaagent</code>로 위버를 따로 쓸 때의 일이다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>StockRepository</code> 빈의 public 메서드 <code>reserve</code>가 같은 클래스의 <code>private</code> 메서드 <code>check</code>를 부른다. 포인트컷 <code>execution(* demo.app..*(..))</code>는 두 메서드를 모두 덮는다. 다른 빈이 <code>reserve</code>를 한 번 부를 때, 스프링 AOP와 AspectJ 로드 타임 위빙에서 어드바이스는 각각 몇 번 실행되는가?</q>
+<o>스프링 2번, 위빙 2번</o>
+<o>스프링 1번, 위빙 1번</o>
+<o>스프링 2번, 위빙 1번</o>
+<o>스프링 1번, 위빙 2번</o>
+<why>스프링 AOP에서는 프록시를 거친 <code>reserve</code> 호출에만 어드바이스가 실행되고, <code>check</code>는 타깃 내부에서 <code>this</code>로 불리므로 프록시를 거치지 않는다. 게다가 <code>private</code> 메서드는 프록시가 가로챌 수도 없다. 로드 타임 위빙에서는 <code>reserve</code>와 <code>check</code> 각각의 몸통이 바뀌어 있으므로 누가 어떻게 부르든 두 번 실행된다. 본문의 두 실험 출력이 이것을 보여 준다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>@Aspect 어드바이스가 적용된 빈의 프록시 어드바이저 목록 맨 앞에 <code>ExposeInvocationInterceptor.ADVISOR</code>가 들어 있다. 이 인터셉터의 역할로 옳은 것은?</q>
+<o>현재 진행 중인 <code>MethodInvocation</code>을 ThreadLocal에 넣어, <code>MethodInvocation</code>을 직접 받지 못하는 AspectJ 방식 어드바이스가 조인 포인트를 만들 수 있게 한다.</o>
+<o>프록시 객체를 ThreadLocal에 노출해 <code>AopContext.currentProxy()</code>로 꺼낼 수 있게 한다.</o>
+<o>애스펙트 인스턴스를 처음 호출될 때 생성한다.</o>
+<o>포인트컷을 호출마다 다시 검사해 맞지 않는 메서드를 걸러 낸다.</o>
+<why><code>ExposeInvocationInterceptor.invoke</code>는 현재 <code>MethodInvocation</code>을 static ThreadLocal에 넣고 <code>proceed()</code>한 뒤 <code>finally</code>에서 이전 값으로 되돌린다. <code>AbstractAspectJAdvice.currentJoinPoint()</code>가 이 값을 읽어 조인 포인트를 만든다. 프록시 노출은 <code>exposeProxy</code> 설정의 일이고, 애스펙트 인스턴스는 인스턴스 팩토리가 얻으며, 포인트컷 검사는 체인을 만들 때(동적 매처라면 <code>ReflectiveMethodInvocation.proceed</code> 안에서) 이루어진다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>AOP 용어와 스프링 AOP에서의 실체를 짝지은 것 중 틀린 것은?</q>
+<o>조인 포인트 — 언제나 메서드 실행이며, <code>JoinPoint.getKind()</code>는 <code>method-execution</code>을 돌려준다.</o>
+<o>AOP 프록시 — JDK 동적 프록시나 CGLIB 프록시이며, <code>getThis()</code>가 이 객체를 돌려준다.</o>
+<o>위빙 — 스프링 AOP는 클래스 로딩 시점에 대상 클래스의 바이트코드를 바꿔 위빙한다.</o>
+<o>어드바이저 — 포인트컷 하나와 어드바이스 하나를 가진, 스프링 고유의 애스펙트 단위다.</o>
+<why>스프링 레퍼런스는 스프링 AOP가 다른 순수 자바 AOP 프레임워크처럼 런타임에 위빙한다고 명시한다. 대상 클래스의 바이트코드는 바뀌지 않고, 자동 프록시 생성기가 프록시 객체를 만들어 대상 앞에 세운다. 클래스 로딩 시점의 위빙은 AspectJ의 로드 타임 위빙이다. 나머지 보기는 본문의 실험 값(<code>method-execution</code>, <code>getThis()</code>가 <code>$$SpringCGLIB$$0</code>)과 레퍼런스의 정의에 맞는다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>애스펙트(aspect)</dt><dd>여러 클래스에 걸치는 관심사를 모듈화한 단위. 무엇을 할지(어드바이스)와 어디에 할지(포인트컷)를 함께 담는다. 스프링에서는 <code>@Aspect</code> 클래스나 스키마 기반 설정으로 선언한다.</dd>
+<dt>횡단 관심사(cross-cutting concern)</dt><dd>로그, 트랜잭션, 보안처럼 특정 기능에 속하지 않고 여러 기능에 공통으로 걸치는 관심사. 직접 구현하면 코드가 흩어지고 핵심 로직과 뒤엉킨다.</dd>
+<dt>위빙(weaving)</dt><dd>애스펙트를 대상 타입이나 객체와 연결해 어드바이스가 적용된 객체를 만드는 일. 컴파일 시점, 컴파일 후, 로드 시점, 런타임에 할 수 있다.</dd>
+<dt>로드 타임 위빙(load-time weaving)</dt><dd>클래스 로더가 클래스를 JVM에 정의하기 직전에 바이트코드를 바꿔 애스펙트를 엮는 방식. AspectJ에서는 <code>-javaagent:aspectjweaver.jar</code>와 <code>META-INF/aop.xml</code>로 설정한다.</dd>
+<dt>AnnotationAwareAspectJAutoProxyCreator</dt><dd><code>@EnableAspectJAutoProxy</code>가 등록하는 자동 프록시 생성기. 어드바이저 빈과 <code>@Aspect</code> 빈에서 만든 어드바이저를 모아 빈마다 적용 가능한 것을 고르고 프록시를 만든다.</dd>
+<dt>InstantiationModelAwarePointcutAdvisorImpl</dt><dd>@Aspect의 어드바이스 메서드 하나가 변환된 어드바이저. <code>AspectJExpressionPointcut</code>과 애너테이션 종류에 맞는 어드바이스 객체(<code>AspectJAroundAdvice</code> 등)를 묶는다.</dd>
+<dt>ProceedingJoinPoint</dt><dd>어라운드 어드바이스가 받는 조인 포인트. <code>proceed()</code>로 다음 어드바이스나 대상 메서드를 실행한다. 스프링에서는 <code>MethodInvocationProceedingJoinPoint</code>가 <code>MethodInvocation</code>을 감싸 구현한다.</dd>
+<dt>ExposeInvocationInterceptor</dt><dd>AspectJ 방식 어드바이스가 있을 때 체인 맨 앞에 추가되는 인터셉터. 현재 <code>MethodInvocation</code>을 ThreadLocal로 노출한다.</dd>
+<dt>인트로덕션(introduction)</dt><dd>대상 타입에 새 메서드나 필드, 인터페이스를 더하는 것. AspectJ에서는 타입 간 선언이라고 하고, @AspectJ에서는 <code>@DeclareParents</code>로 쓴다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/core/aop/introduction-defn.html">Spring Framework Reference — AOP Concepts</a> — 애스펙트, 조인 포인트, 어드바이스, 포인트컷, 인트로덕션, 대상 객체, AOP 프록시, 위빙의 정의와 어드바이스 종류</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/core/aop/introduction-spring-defn.html">Spring Framework Reference — Spring AOP Capabilities and Goals</a> — 메서드 실행 조인 포인트만 지원, 필드 가로채기 미구현, AspectJ와의 보완 관계</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/core/aop/ataspectj/at-aspectj.html">Spring Framework Reference — Declaring an Aspect</a> — <code>@Component</code>가 필요한 이유, 애스펙트의 자동 프록시 제외</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/core/aop/ataspectj/pointcuts.html">Spring Framework Reference — Declaring a Pointcut</a> — 프록시 기반의 한계(내부 호출, JDK·CGLIB의 가로채기 범위), 지원하지 않는 포인트컷 지정자</li>
+<li><a href="https://eclipse.dev/aspectj/doc/latest/devguide/ltw.html">AspectJ Development Environment Guide — Load-Time Weaving</a> — 세 가지 위빙 시점, <code>-javaagent</code>와 <code>META-INF/aop.xml</code>, <code>dump</code> 요소</li>
+<li><a href="https://docs.spring.io/spring-boot/3.5/reference/features/aop.html">Spring Boot 3.5 Reference — Aspect-Oriented Programming</a> — CGLIB 기본값, <code>spring.aop.proxy-target-class</code>, <code>@EnableAspectJAutoProxy</code> 자동 적용</li>
+</x-refs>

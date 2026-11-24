@@ -1,0 +1,831 @@
+<x-meta>
+deck: 객체 참조로 노드를 이어 붙이는 연결 리스트를 직접 만들면서, 삽입·삭제가 참조 대입 두 번으로 끝나는 이유와 그 대가인 순차 탐색·노드 메모리·캐시 지역성을 바이트코드와 실측으로 확인한다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>노드를 만들고 연결하는 코드를 보고 스택의 지역 변수와 힙의 노드 객체가 어떤 참조로 이어지는지 그리고, 순회 반복문의 각 회차에서 변수가 가리키는 노드를 추적할 수 있다.</li>
+<li>단일 연결 리스트의 <code>add(index, e)</code>와 <code>remove(index)</code>를 참조 대입 순서까지 정확히 구현하고, 순서를 뒤바꾸면 어떤 구조가 생기는지 설명할 수 있다.</li>
+<li>연결 리스트의 각 연산이 노드를 몇 번 건너가는지 세어 시간 복잡도를 구하고, 같은 연산의 배열 리스트 비용과 나란히 비교할 수 있다.</li>
+<li>노드 클래스를 <code>static</code> 중첩 제네릭 클래스로 두는 이유를 JLS의 <code>static</code> 중첩 클래스 규칙과 타입 소거 결과(<code>javap</code>)로 설명할 수 있다.</li>
+<li>OpenJDK 21 HotSpot에서 노드 하나가 차지하는 바이트 수를 계산하고, 배열 순회와 노드 순회가 CPU 캐시를 쓰는 방식이 어떻게 다른지 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>배열 리스트가 남긴 숙제</h3>
+<p>앞 회차에서 배열을 감싼 리스트를 만들었다. 요소를 배열 한 덩어리에 순서대로 붙여 놓았기 때문에 i번째 요소의 위치를 "배열의 시작 위치 + i × 칸 크기"라는 계산으로 바로 얻을 수 있었고, 그래서 인덱스 조회가 O(1)이었다. 끝에 추가하는 일도 빈칸이 남아 있는 동안은 대입 한 번이면 끝났다.</p>
+<p>같은 구조가 두 가지 불편을 만든다. 첫째, 순서가 곧 물리적 위치이므로 앞이나 중간에 요소를 넣거나 빼면 그 뒤의 요소를 전부 한 칸씩 옮겨야 한다. 요소가 n개인 리스트의 맨 앞에 하나를 넣는 일은 n개를 옮기는 일이다. 둘째, 배열은 한 번 만들면 길이가 바뀌지 않으므로 가득 차면 더 큰 배열을 만들어 통째로 복사해야 하고, 그렇게 늘린 뒤에는 아직 쓰지 않는 칸이 남는다.</p>
+<p>두 불편의 뿌리는 하나다. <b>순서상 이웃한 요소는 메모리에서도 이웃해야 한다</b>는 제약이다. 이 제약 덕분에 위치를 계산할 수 있었고, 이 제약 때문에 이동과 복사가 생긴다. 그렇다면 이 제약을 버리면 어떻게 될까. 요소마다 작은 객체를 따로 만들고, 그 객체가 "내 다음 차례는 저 객체다"라는 참조를 하나씩 들고 있게 하면 순서를 위치가 아니라 참조로 표현할 수 있다. 이렇게 만든 자료 구조가 연결 리스트(linked list)다.</p>
+<p>제약을 버렸으니 얻는 것과 잃는 것이 모두 있다. 중간에 끼워 넣을 때 다른 요소를 옮길 필요가 없어지고, 미리 잡아 두는 빈칸도 없어진다. 대신 i번째 요소의 위치를 계산할 수 없게 되어 처음부터 하나씩 따라가야 하고, 요소마다 딸린 객체가 메모리를 더 쓴다. 이 회차는 그 거래의 내용을 하나씩 확인한다. 먼저 노드 몇 개를 손으로 이어 보고, 그것을 리스트 클래스로 감싸 추가와 삭제를 구현하고, 제네릭을 입힌 다음, 마지막에 한 층 내려가 노드가 메모리에서 실제로 어떤 모습인지 본다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>번호 붙은 사물함과 보물찾기 쪽지</strong><p>배열은 번호가 붙은 사물함 줄이다. 17번 사물함이 어디 있는지는 걸어가 보지 않아도 안다. 연결 리스트는 보물찾기 쪽지다. 첫 쪽지에 두 번째 쪽지가 숨겨진 곳이 적혀 있고, 두 번째 쪽지에 세 번째가 적혀 있다. 다섯 번째 쪽지를 보려면 앞의 네 장을 차례로 찾아야 하지만, 중간에 새 쪽지를 끼우는 일은 쪽지 두 장의 내용만 고치면 된다. 비유가 깨지는 지점도 있다. 쪽지에는 장소가 적혀 있지만 자바의 노드에 들어 있는 것은 주소 자체가 아니라 JVM이 관리하는 참조값이고, 객체가 메모리에서 옮겨지더라도 참조는 JVM이 알아서 따라가게 해 준다.</p></aside>
+
+<h3>노드와 연결 1 — 참조 하나로 순서를 만든다</h3>
+<p>연결 리스트를 이루는 낱개의 객체를 노드(node)라고 한다. 노드가 가져야 할 것은 두 가지다. 보관할 값, 그리고 다음 노드를 가리키는 참조다.</p>
+<pre><code class="language-java">public class Node {
+    Object item;
+    Node next;
+
+    Node(Object item) {
+        this.item = item;
+    }
+}</code></pre>
+<p><code>Node</code> 클래스 안에 <code>Node</code> 타입 필드가 있다는 점이 처음에는 이상해 보인다. 노드 안에 노드가 들어 있고 그 안에 또 노드가 들어 있다면 크기가 끝없이 커질 것 같기 때문이다. 그렇지 않다. 자바에서 참조형 필드에 들어가는 것은 객체 자체가 아니라 객체를 가리키는 참조값이다. <code>next</code> 필드는 "다른 <code>Node</code> 객체 하나를 가리킬 수 있는 칸"일 뿐이고, 그 칸의 크기는 가리키는 대상과 무관하게 고정되어 있다. 따라서 <code>Node</code> 객체 하나의 크기는 참조 칸 두 개와 객체 헤더로 정해지고, 뒤에 노드가 몇 개 이어지든 변하지 않는다.</p>
+<p>생성자에서 <code>next</code>에 아무것도 넣지 않았다. 인스턴스 필드는 객체가 만들어질 때 기본값으로 초기화되고 참조형의 기본값은 <code>null</code>이므로(JLS 4.12.5), 새로 만든 노드의 <code>next</code>는 <code>null</code>이다. 이 <code>null</code>이 "내 뒤에는 아무도 없다"는 표시로 쓰인다. 이제 노드 세 개를 만들어 잇고, 처음부터 끝까지 따라가며 값을 출력해 보자.</p>
+<pre><code class="language-java">public class NodeMain1 {
+    public static void main(String[] args) {
+        Node first = new Node("A");
+        first.next = new Node("B");
+        first.next.next = new Node("C");
+
+        Node x = first;
+        while (x != null) {
+            System.out.println(x.item);
+            x = x.next;
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">A
+B
+C</code></pre>
+<p>연결하는 세 줄을 한 줄씩 따라가 보자. 첫 줄은 힙에 노드 하나를 만들고 그 참조를 지역 변수 <code>first</code>에 넣는다. 둘째 줄은 노드를 하나 더 만들고, <code>first</code>가 가리키는 노드의 <code>next</code> 칸에 그 참조를 넣는다. 셋째 줄의 <code>first.next.next</code>는 왼쪽부터 평가된다. <code>first.next</code>가 두 번째 노드의 참조로 평가되고, 그 노드의 <code>next</code> 칸에 세 번째 노드의 참조가 들어간다. 세 줄이 끝난 뒤의 메모리는 다음과 같다. <code>x01</code> 같은 이름은 설명을 위해 붙인 라벨이고 실제 주소가 아니다.</p>
+<pre class="diagram">스택(main의 지역 변수)         힙
+
+first ───────────▶ ┌─ Node x01 ──────┐      ┌─ Node x02 ──────┐      ┌─ Node x03 ──────┐
+                   │ item ──▶ "A"    │      │ item ──▶ "B"    │      │ item ──▶ "C"    │
+                   │ next ──▶ x02 ───┼────▶ │ next ──▶ x03 ───┼────▶ │ next  =  null   │
+                   └─────────────────┘      └─────────────────┘      └─────────────────┘</pre>
+<p>눈여겨볼 점이 둘 있다. 지역 변수는 <code>first</code> 하나뿐인데 노드는 셋이다. 두 번째와 세 번째 노드는 이름이 없고, 오직 앞 노드의 <code>next</code>를 통해서만 닿을 수 있다. 그리고 <code>item</code>도 참조다. 노드가 문자열 <code>"A"</code>를 품고 있는 것이 아니라 문자열 객체를 가리키고 있다. 연결 리스트에는 그래서 두 종류의 참조가 섞여 있다. 노드에서 노드로 가는 참조가 뼈대를 이루고, 노드에서 요소로 가는 참조가 값을 단다.</p>
+<x-visual id="java-mid2-04-node-chain-memory" title="지역 변수 하나에서 시작해 next 참조로 이어진 노드 세 개의 메모리 구조" kind="메모리 구조도" ratio="16:9">
+<x-hint>스택의 변수는 first 하나뿐이고, 나머지 노드는 앞 노드의 next를 통해서만 도달할 수 있다는 것. item도 참조라는 것.</x-hint>
+<x-prompt>가로로 긴 깔끔한 메모리 구조도. 왼쪽에 세로로 좁은 상자가 있고 상단 라벨은 "스택". 그 안에 작은 칸 하나가 있고 라벨은 "first". 오른쪽 넓은 영역의 상단 라벨은 "힙". 힙 안에 같은 크기의 둥근 사각형 상자 세 개가 왼쪽에서 오른쪽으로 나란히 놓여 있고, 각 상자의 제목은 "Node"이며 위아래 두 칸으로 나뉘어 위 칸 라벨은 "item", 아래 칸 라벨은 "next". "first" 칸에서 첫 번째 Node 상자로 굵은 화살표. 첫 번째 상자의 next 칸에서 두 번째 상자로, 두 번째 상자의 next 칸에서 세 번째 상자로 굵은 화살표. 세 번째 상자의 next 칸에는 "null"이라고 적고 화살표 없음. 각 상자의 item 칸에서 아래쪽으로 가는 얇은 화살표가 나와 작은 타원을 가리키며 타원 안의 글자는 각각 "A", "B", "C". 흰 배경, 파란색과 회색 위주의 평면 벡터 스타일, 장식 없음.</x-prompt>
+<x-caption>변수 first에서 출발해 next를 따라가면 모든 노드에 닿는다. 값도 노드 안에 들어 있는 것이 아니라 item 참조로 달려 있다.</x-caption>
+</x-visual>
+<p>순회하는 반복문은 연결 리스트를 다루는 모든 코드의 기본형이다. 변수 <code>x</code>가 손가락 역할을 한다. 첫 노드를 짚고, 값을 읽고, <code>x = x.next</code>로 다음 노드를 짚는다. 더 짚을 노드가 없어 <code>x</code>가 <code>null</code>이 되면 멈춘다.</p>
+<div class="table-wrap"><table><thead><tr><th>시점</th><th>x가 가리키는 것</th><th>조건 <code>x != null</code></th><th>출력</th></tr></thead><tbody>
+<tr><td>반복문 진입</td><td>x01 (A)</td><td>참</td><td>A</td></tr>
+<tr><td>1회차의 <code>x = x.next</code> 뒤</td><td>x02 (B)</td><td>참</td><td>B</td></tr>
+<tr><td>2회차의 <code>x = x.next</code> 뒤</td><td>x03 (C)</td><td>참</td><td>C</td></tr>
+<tr><td>3회차의 <code>x = x.next</code> 뒤</td><td>null</td><td>거짓</td><td>(종료)</td></tr>
+</tbody></table></div>
+<p><code>x = x.next</code>는 노드를 바꾸는 문장이 아니다. 지역 변수 <code>x</code>에 들어 있는 참조값을 다른 참조값으로 덮어쓸 뿐이고, 힙의 노드들은 그대로다. 반면 <code>x.next = ...</code>는 <code>x</code>가 가리키는 노드의 칸을 고치는 문장이어서 구조가 바뀐다. 등호 왼쪽에 변수가 오는지 필드가 오는지로 "손가락을 옮기는가, 사슬을 고치는가"가 갈린다. 연결 리스트 코드에서 생기는 버그의 상당수는 이 둘을 혼동하는 데서 나온다.</p>
+<h4>바이트코드로 본 "다음으로 가기"</h4>
+<p>배열을 도는 반복문과 노드를 도는 반복문이 기계 수준에서 어떻게 다른지 바이트코드로 확인해 두자. 개수를 세는 두 메서드를 컴파일해 <code>javap -c</code>로 열었다.</p>
+<pre><code class="language-java">public class Walk {
+    static int countNodes(Node first) {
+        int n = 0;
+        Node x = first;
+        while (x != null) {
+            n++;
+            x = x.next;
+        }
+        return n;
+    }
+
+    static int countArray(Object[] arr) {
+        int n = 0;
+        for (int i = 0; i < arr.length; i++) {
+            if (arr[i] != null) {
+                n++;
+            }
+        }
+        return n;
+    }
+}</code></pre>
+<pre data-label="javap -c Walk (반복문 부분 발췌)"><code class="language-text">static int countNodes(Node);
+   4: aload_2
+   5: ifnull        19
+   8: iinc          1, 1
+  11: aload_2
+  12: getfield      #7      // Field Node.next:LNode;
+  15: astore_2
+  16: goto          4
+
+static int countArray(java.lang.Object[]);
+   4: iload_2
+   5: aload_0
+   6: arraylength
+   7: if_icmpge     25
+  10: aload_0
+  11: iload_2
+  12: aaload
+  13: ifnull        19
+  16: iinc          1, 1
+  19: iinc          2, 1
+  22: goto          4</code></pre>
+<p>노드 쪽에서 "다음으로 가기"는 <code>aload_2</code>, <code>getfield</code>, <code>astore_2</code> 세 명령이다. <code>getfield</code>는 피연산자 스택에서 객체 참조를 꺼내고 그 객체의 필드 값을 스택에 올린다(JVMS 6.5). 다음 노드의 위치는 계산되는 것이 아니라 <b>현재 노드의 메모리에서 읽혀 나온다</b>. 배열 쪽에서 "다음으로 가기"는 <code>iinc 2, 1</code>, 곧 지역 변수 <code>i</code>에 1을 더하는 것이 전부다. 다음 칸이 어디인지는 메모리를 읽지 않아도 안다. <code>aaload</code>가 배열 참조와 인덱스를 받아 그 칸의 값을 읽을 뿐이다.</p>
+<p>지금은 사소해 보이는 이 차이가 뒤에서 두 번 돌아온다. 한 번은 시간 복잡도에서다. 위치를 계산할 수 없으니 i번째 노드에 가려면 i번 읽어야 한다. 또 한 번은 CPU 캐시에서다. 다음에 읽을 위치를 미리 알 수 있는 구조와, 지금 읽고 있는 것이 도착해야만 다음 위치를 알 수 있는 구조는 하드웨어가 대하는 방식이 다르다.</p>
+
+<h3>노드와 연결 2 — 사슬 전체를 문자열로</h3>
+<p>연결된 노드를 확인하려고 <code>System.out.println(first)</code>를 호출하면 <code>Node@15db9742</code> 같은 문자열이 나온다. <code>Object.toString()</code>의 기본 구현이 클래스 이름, <code>@</code>, 해시 코드의 16진수 표기를 이어 붙이기 때문이다. <code>@</code> 뒤의 값은 실행 환경에 따라 달라질 수 있고, 어느 쪽이든 사슬의 내용을 알려 주지 않는다. 노드에 <code>toString()</code>을 재정의해서 자기 자신부터 끝까지의 값을 한 줄로 보여 주게 하자.</p>
+<pre><code class="language-java">public class Node {
+    Object item;
+    Node next;
+
+    Node(Object item) {
+        this.item = item;
+    }
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder("[");
+        Node x = this;
+        while (x != null) {
+            sb.append(x.item);
+            if (x.next != null) {
+                sb.append("->");
+            }
+            x = x.next;
+        }
+        return sb.append("]").toString();
+    }
+}</code></pre>
+<p>앞에서 본 순회 반복문 그대로이고 시작점만 <code>this</code>로 바뀌었다. 이제 <code>System.out.println(first)</code>는 <code>[A->B->C]</code>를 출력한다. <code>System.out.println(first.next)</code>는 <code>[B->C]</code>를 출력한다. 두 번째 결과가 연결 리스트의 성질 하나를 드러낸다. 노드는 자기 뒤에 무엇이 있는지만 알고, 앞에 무엇이 있는지는 모른다. 그래서 어떤 노드의 참조를 쥐고 있다는 것은 "그 노드부터 끝까지의 사슬"을 쥐고 있다는 뜻이 된다.</p>
+<p>문자열을 <code>+=</code>로 이어 붙이지 않고 <code>StringBuilder</code>를 쓴 데는 이유가 있다. <code>String</code>은 불변이므로 <code>+=</code>는 매번 지금까지의 내용을 새 문자열로 복사한다. 노드가 n개면 복사하는 글자 수의 합이 n의 제곱에 비례해 늘어난다. <code>StringBuilder</code>는 내부 버퍼에 덧붙이기만 하므로 전체가 n에 비례한다. 앞 회차에서 본 "배열 끝에 덧붙이기"의 이점을 그대로 쓰는 셈이다.</p>
+<h4>재귀로 쓰면 더 짧지만</h4>
+<p>노드의 정의가 "값 하나와 나머지 사슬"이라는 재귀적 모양이어서, <code>toString()</code>도 재귀로 쓰고 싶어진다. 다음 구현은 짧고 세 노드에 대해서는 <code>A->B->C</code>를 올바르게 출력한다.</p>
+<pre><code class="language-java">    @Override
+    public String toString() {
+        if (next == null) {
+            return String.valueOf(item);
+        }
+        return item + "->" + next;   // next.toString()이 다시 호출된다
+    }</code></pre>
+<p>문제는 길이다. 문자열 연결식 안의 <code>next</code>는 <code>next.toString()</code> 호출로 바뀌고, 그 호출이 끝나야 바깥 호출이 문자열을 완성할 수 있다. 노드가 n개면 스택 프레임이 n개 쌓인다. 자바 가상 머신 스택의 크기에는 한도가 있고, 스레드의 계산이 허용된 것보다 큰 스택을 요구하면 JVM은 <code>StackOverflowError</code>를 던진다(JVMS 2.5.2). 노드 100만 개를 이어 놓고 이 <code>toString()</code>을 호출하면 JDK 21의 기본 설정에서 <code>StackOverflowError</code>가 났다. 몇 번째 호출에서 넘치는지는 스택 크기 설정과 프레임 크기에 따라 달라진다.</p>
+<p>여기서 얻을 규칙은 단순하다. 연결 리스트처럼 길이에 상한이 없는 구조를 따라갈 때는 반복문을 쓴다. 재귀는 깊이가 데이터 크기에 비례하지 않는 경우, 예를 들어 균형 잡힌 트리처럼 깊이가 로그로 억제되는 구조에 어울린다.</p>
+
+<h3>노드와 연결 3 — 마지막 노드, i번째 노드, 추가</h3>
+<p>노드를 직접 다루는 코드를 조금 더 써 보자. 리스트라면 최소한 "끝에 추가", "i번째 값 읽기"가 되어야 한다. 노드만으로 이 기능을 메서드로 뽑으면 다음과 같다. <code>Node</code>는 방금 만든 반복문 판 <code>toString()</code>을 가진 클래스다.</p>
+<pre><code class="language-java">public class NodeMain3 {
+    public static void main(String[] args) {
+        Node first = new Node("A");
+        add(first, "B");
+        add(first, "C");
+        System.out.println(first);
+        System.out.println(getLast(first).item);
+        System.out.println(getNode(first, 1).item);
+    }
+
+    static Node getLast(Node node) {
+        Node x = node;
+        while (x.next != null) {
+            x = x.next;
+        }
+        return x;
+    }
+
+    static Node getNode(Node node, int index) {
+        Node x = node;
+        for (int i = 0; i < index; i++) {
+            x = x.next;
+        }
+        return x;
+    }
+
+    static void add(Node node, Object item) {
+        Node last = getLast(node);
+        last.next = new Node(item);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[A->B->C]
+C
+B</code></pre>
+<p><code>getLast</code>의 반복 조건이 순회와 조금 다르다. 순회는 <code>x != null</code>인 동안 돌아 <code>x</code>가 끝을 지나쳐 <code>null</code>이 될 때 멈추고, <code>getLast</code>는 <code>x.next != null</code>인 동안 돌아 <code>x</code>가 마지막 노드를 가리킬 때 멈춘다. 마지막 노드에 무언가를 붙이려면 그 노드를 쥐고 있어야 하기 때문이다. <code>getNode</code>는 <code>x = x.next</code>를 정확히 <code>index</code>번 실행한다. 0번째는 한 번도 건너가지 않고 시작 노드 그대로다.</p>
+<p>세 메서드의 비용을 세어 보자. 노드가 n개일 때 <code>getLast</code>는 n-1번 건너간다. <code>getNode(index)</code>는 <code>index</code>번 건너간다. <code>add</code>는 <code>getLast</code>를 부르므로 n-1번 건너간 다음 대입 한 번을 한다. 새 노드를 붙이는 일 자체는 대입 한 번이지만 붙일 자리를 찾는 데 리스트 길이만큼의 일이 든다. 이 구분이 이 회차 전체를 관통한다.</p>
+<p>인덱스를 잘못 주면 어떻게 될까. 노드가 둘뿐인데 세 번 건너가도록 해 보자.</p>
+<pre><code class="language-java">public class NpeMain {
+    public static void main(String[] args) {
+        Node first = new Node("A");
+        first.next = new Node("B");
+        Node x = first;
+        for (int i = 0; i < 3; i++) {
+            x = x.next;
+        }
+        System.out.println(x.item);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (javac -g 로 컴파일)"><code class="language-text">Exception in thread "main" java.lang.NullPointerException: Cannot read field "next" because "x" is null
+	at NpeMain.main(NpeMain.java:7)</code></pre>
+<p>첫 회차에 <code>x</code>가 B 노드로, 둘째 회차에 <code>null</code>로 바뀐다. 셋째 회차에서 <code>null</code>에 대해 <code>getfield</code>를 실행하게 되고, JVMS는 이때 <code>NullPointerException</code>을 던지도록 정해 두었다. 예외 메시지가 어느 필드를 읽으려 했고 무엇이 <code>null</code>이었는지 알려 주는 것은 <a href="https://openjdk.org/jeps/358">JEP 358</a>로 JDK 14에 들어온 기능이고, JDK 21에서는 기본으로 켜져 있다. 지역 변수 이름은 클래스 파일에 디버그 정보가 있을 때만 나온다. 옵션 없이 <code>javac</code>만으로 컴파일하면 같은 자리에 <code>"<local2>"</code>처럼 지역 변수 번호가 찍힌다.</p>
+<p>이 정도면 리스트처럼 쓸 수 있을 것 같지만, 노드만으로는 해결되지 않는 문제가 셋 남는다.</p>
+<ul>
+<li><b>빈 리스트를 표현할 수 없다.</b> <code>add(first, ...)</code>는 노드가 최소 하나 있어야 동작한다. <code>first</code>가 <code>null</code>이면 <code>getLast</code>의 첫 <code>x.next</code>에서 예외가 난다.</li>
+<li><b>첫 노드가 바뀌는 연산을 메서드로 만들 수 없다.</b> 맨 앞에 노드를 끼우면 "첫 노드"가 달라진다. 그런데 자바는 인자를 값으로 전달하므로, 메서드 안에서 매개변수 <code>node</code>에 다른 참조를 대입해도 호출한 쪽의 변수 <code>first</code>는 바뀌지 않는다. 호출한 쪽이 반환값을 받아 자기 변수를 직접 고쳐야 한다.</li>
+<li><b>개수를 알려면 끝까지 세어야 한다.</b> 길이를 기억하는 곳이 어디에도 없다.</li>
+</ul>
+<p>세 문제의 답은 같다. "첫 노드가 누구인지"와 "몇 개인지"를 기억하는 객체를 하나 두고, 노드를 건드리는 모든 연산을 그 객체의 메서드로 모으는 것이다. 이 객체가 리스트다.</p>
+
+<h3>직접 구현하는 연결 리스트 1 — first와 size</h3>
+<p>리스트 객체가 가진 상태는 두 가지뿐이다. 첫 노드를 가리키는 <code>first</code>와 요소 개수 <code>size</code>다. 이 두 필드 사이에는 항상 성립해야 하는 약속, 곧 불변식(invariant)이 있다. 모든 공개 메서드는 시작할 때 이 약속이 성립한다고 가정하고, 끝날 때 다시 성립하게 만들어 놓아야 한다.</p>
+<ul>
+<li><code>size == 0</code>이면 <code>first == null</code>이고, 그 역도 성립한다.</li>
+<li><code>size</code>가 1 이상이면 <code>first</code>에서 <code>next</code>를 <code>size - 1</code>번 따라간 노드의 <code>next</code>가 <code>null</code>이다.</li>
+</ul>
+<p>먼저 끝에 추가, 조회, 변경, 검색을 구현한다. 요소 타입은 일단 <code>Object</code>로 두고 뒤에서 제네릭으로 바꾼다.</p>
+<pre><code class="language-java">import java.util.Objects;
+
+public class SingleLinkedList {
+    private Node first;
+    private int size;
+
+    public void add(Object e) {
+        Node newNode = new Node(e);
+        if (first == null) {
+            first = newNode;
+        } else {
+            Node last = getLastNode();
+            last.next = newNode;
+        }
+        size++;
+    }
+
+    public Object get(int index) {
+        return getNode(index).item;
+    }
+
+    public Object set(int index, Object element) {
+        Node x = getNode(index);
+        Object old = x.item;
+        x.item = element;
+        return old;
+    }
+
+    public int indexOf(Object o) {
+        int index = 0;
+        for (Node x = first; x != null; x = x.next) {
+            if (Objects.equals(o, x.item)) {
+                return index;
+            }
+            index++;
+        }
+        return -1;
+    }
+
+    public int size() {
+        return size;
+    }
+
+    private Node getLastNode() {
+        Node x = first;
+        while (x.next != null) {
+            x = x.next;
+        }
+        return x;
+    }
+
+    private Node getNode(int index) {
+        Objects.checkIndex(index, size);
+        Node x = first;
+        for (int i = 0; i < index; i++) {
+            x = x.next;
+        }
+        return x;
+    }
+
+    @Override
+    public String toString() {
+        return "SingleLinkedList{size=" + size + ", first=" + first + "}";
+    }
+}</code></pre>
+<pre><code class="language-java">public class ListMain1 {
+    public static void main(String[] args) {
+        SingleLinkedList list = new SingleLinkedList();
+        System.out.println(list);
+        list.add("A");
+        list.add("B");
+        list.add("C");
+        System.out.println(list);
+        System.out.println("get(1) = " + list.get(1));
+        System.out.println("indexOf(C) = " + list.indexOf("C"));
+        System.out.println("indexOf(Z) = " + list.indexOf("Z"));
+        System.out.println("set(2, Z) = " + list.set(2, "Z"));
+        System.out.println(list);
+        list.get(3);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">SingleLinkedList{size=0, first=null}
+SingleLinkedList{size=3, first=[A->B->C]}
+get(1) = B
+indexOf(C) = 2
+indexOf(Z) = -1
+set(2, Z) = C
+SingleLinkedList{size=3, first=[A->B->Z]}
+Exception in thread "main" java.lang.IndexOutOfBoundsException: Index 3 out of bounds for length 3
+	...</code></pre>
+<p><b><code>add(e)</code></b>는 두 갈래다. 비어 있으면 새 노드가 곧 첫 노드이므로 <code>first</code>에 넣는다. 비어 있지 않으면 마지막 노드를 찾아 그 <code>next</code>에 건다. 첫 갈래가 앞 절의 "빈 리스트를 표현할 수 없다"는 문제를 해결한다. <code>first</code>가 리스트 객체의 필드가 되었으므로 메서드 안에서 얼마든지 바꿀 수 있다. 두 갈래 모두 마지막에 <code>size++</code>를 실행해 불변식을 맞춘다.</p>
+<p><b><code>getNode(index)</code></b>는 이 클래스의 중심 메서드다. 조회, 변경, 그리고 뒤에 나올 중간 추가와 삭제가 모두 이것을 부른다. 본문은 앞 절의 것과 같고 맨 앞에 범위 검사가 하나 붙었다. <code>Objects.checkIndex(index, size)</code>는 Java 9에 추가된 메서드로, <code>index</code>가 0 이상 <code>size</code> 미만이 아니면 <code>IndexOutOfBoundsException</code>을 던진다. 이 검사가 없으면 <code>get(3)</code>은 세 번 건너가 <code>x</code>가 <code>null</code>이 된 뒤 <code>x.item</code>에서 <code>NullPointerException</code>을 낸다. 호출한 사람의 잘못은 "범위 밖의 인덱스"인데 드러나는 증상은 "리스트 내부의 널 참조"가 되어 원인을 찾기 어려워진다. 잘못된 입력은 구조를 건드리기 전에, 호출자가 이해할 수 있는 말로 거절하는 편이 낫다. <code>java.util.ArrayList</code>의 <code>get</code>도 같은 <code>Objects.checkIndex(index, size)</code>로 시작한다.</p>
+<p><b><code>indexOf(o)</code></b>는 처음부터 노드를 따라가며 같은 값을 찾는다. 비교에 <code>==</code>가 아니라 <code>Objects.equals</code>를 쓴 이유는 둘이다. 요소의 같음은 참조의 동일성이 아니라 <code>equals</code>가 정한 동등성으로 판단해야 하고, 리스트에는 <code>null</code>도 들어갈 수 있으므로 <code>null</code>에 대해 <code>equals</code>를 호출하는 일을 피해야 한다. <code>Objects.equals(a, b)</code>는 둘 다 <code>null</code>이면 참, 한쪽만 <code>null</code>이면 거짓, 아니면 <code>a.equals(b)</code>를 돌려준다.</p>
+<p><b><code>size()</code></b>는 필드를 돌려줄 뿐이라 O(1)이다. 그 대신 노드 수를 바꾸는 모든 메서드가 <code>size</code>를 함께 고쳐야 한다. 한 군데라도 빠뜨리면 <code>size</code>와 실제 노드 수가 어긋나고, 그 뒤의 범위 검사가 전부 틀려진다. 세는 비용을 없앤 대가로 불변식 하나를 관리하게 된 것이다. 자료 구조 설계는 대체로 이런 식의 교환이다.</p>
+
+<h3>직접 구현하는 연결 리스트 2 — 중간 추가와 삭제</h3>
+<p>배열 리스트에서 가장 비쌌던 두 연산을 구현할 차례다. 같은 클래스에 메서드 두 개를 더한다.</p>
+<pre><code class="language-java">    public void add(int index, Object e) {
+        if (index < 0 || index > size) {
+            throw new IndexOutOfBoundsException("Index: " + index + ", Size: " + size);
+        }
+        Node newNode = new Node(e);
+        if (index == 0) {
+            newNode.next = first;
+            first = newNode;
+        } else {
+            Node prev = getNode(index - 1);
+            newNode.next = prev.next;
+            prev.next = newNode;
+        }
+        size++;
+    }
+
+    public Object remove(int index) {
+        Objects.checkIndex(index, size);
+        Node removed;
+        if (index == 0) {
+            removed = first;
+            first = removed.next;
+        } else {
+            Node prev = getNode(index - 1);
+            removed = prev.next;
+            prev.next = removed.next;
+        }
+        Object item = removed.item;
+        removed.item = null;
+        removed.next = null;
+        size--;
+        return item;
+    }</code></pre>
+<pre><code class="language-java">public class ListMain2 {
+    public static void main(String[] args) {
+        SingleLinkedList list = new SingleLinkedList();
+        list.add("A");
+        list.add("B");
+        list.add("C");
+
+        list.add(0, "X");
+        System.out.println(list);
+        list.add(2, "Y");
+        System.out.println(list);
+        list.add(5, "Z");
+        System.out.println(list);
+
+        System.out.println("remove(0) = " + list.remove(0));
+        System.out.println(list);
+        System.out.println("remove(1) = " + list.remove(1));
+        System.out.println(list);
+        System.out.println("remove(3) = " + list.remove(3));
+        System.out.println(list);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">SingleLinkedList{size=4, first=[X->A->B->C]}
+SingleLinkedList{size=5, first=[X->A->Y->B->C]}
+SingleLinkedList{size=6, first=[X->A->Y->B->C->Z]}
+remove(0) = X
+SingleLinkedList{size=5, first=[A->Y->B->C->Z]}
+remove(1) = Y
+SingleLinkedList{size=4, first=[A->B->C->Z]}
+remove(3) = Z
+SingleLinkedList{size=3, first=[A->B->C]}</code></pre>
+<h4>추가: 대입 두 번, 순서가 중요하다</h4>
+<p>맨 앞에 넣는 <code>add(0, "X")</code>부터 보자. 새 노드의 <code>next</code>에 지금의 첫 노드를 걸고, <code>first</code>를 새 노드로 바꾼다. 대입 두 번이 전부이고, 기존 노드 A, B, C는 한 글자도 건드리지 않는다. 배열 리스트였다면 세 요소를 모두 한 칸씩 뒤로 밀어야 했다. 요소가 100만 개여도 연결 리스트의 맨 앞 추가는 여전히 대입 두 번이다.</p>
+<p>중간에 넣는 <code>add(2, "Y")</code>는 한 단계가 더 있다. 새 노드가 2번 자리에 들어가려면 1번 노드의 <code>next</code>가 새 노드를 가리켜야 한다. 그래서 먼저 <code>getNode(index - 1)</code>로 <b>바로 앞 노드</b>를 찾는다. 그다음은 맨 앞 추가와 같은 모양의 대입 두 번이다.</p>
+<pre class="diagram">add(2, "Y") 직전: prev = getNode(1) 은 A 노드
+
+first ─▶ [X] ─▶ [A] ─▶ [B] ─▶ [C] ─▶ null          [Y] ─▶ null
+                 ▲                                    ▲
+                prev                               newNode
+
+① newNode.next = prev.next;     새 노드가 B를 가리킨다 (A도 아직 B를 가리킨다)
+
+first ─▶ [X] ─▶ [A] ─▶ [B] ─▶ [C] ─▶ null
+                        ▲
+                 [Y] ───┘
+
+② prev.next = newNode;          A가 새 노드를 가리킨다
+
+first ─▶ [X] ─▶ [A]    [B] ─▶ [C] ─▶ null
+                 │      ▲
+                 └▶ [Y] ┘</pre>
+<p>두 대입의 순서를 바꾸면 안 된다. <code>prev.next = newNode</code>를 먼저 실행하면 그 순간 B로 가는 유일한 길이 끊긴다. 이어서 <code>newNode.next = prev.next</code>를 실행하면 <code>prev.next</code>는 이미 새 노드 자신이므로, 새 노드가 자기 자신을 가리키게 된다. 직접 실행해 보면 <code>newNode.next == newNode</code>가 <code>true</code>로 나오고, 처음부터 순회하면 새 노드에서 영원히 빠져나오지 못한다. B와 C는 어디에서도 닿을 수 없게 되어 사라진다. 규칙은 이렇게 기억하면 된다. <b>아직 쓸 참조는 덮어쓰기 전에 다른 곳에 옮겨 둔다.</b></p>
+<figure class="flow-figure"><figcaption>add(index, e)의 흐름</figcaption><ol class="flow">
+<li><strong>범위 확인</strong><span>index가 0 이상 size 이하인지 본다. size와 같은 값은 "맨 뒤에 추가"로 허용한다.</span></li>
+<li><strong>새 노드 생성</strong><span>값을 담은 노드를 만든다. 이 시점에 next는 null이고 리스트와는 아직 무관하다.</span></li>
+<li><strong>앞 노드 찾기</strong><span>index가 0이면 건너뛴다. 아니면 처음부터 index-1번 건너가 바로 앞 노드를 얻는다. 비용의 대부분이 여기서 나온다.</span></li>
+<li><strong>뒤쪽 연결</strong><span>새 노드의 next에 원래 그 자리에 있던 노드를 건다.</span></li>
+<li><strong>앞쪽 연결</strong><span>앞 노드의 next(또는 first)를 새 노드로 바꾼다. 이 순간 새 노드가 리스트에 들어온다.</span></li>
+<li><strong>size 증가</strong><span>불변식을 다시 맞춘다.</span></li>
+</ol></figure>
+<p>경계 조건 두 가지를 확인하자. <code>add(5, "Z")</code>는 크기가 5인 리스트의 맨 뒤에 넣는 호출이다. <code>getNode(4)</code>가 마지막 노드 C를 돌려주고, <code>newNode.next = prev.next</code>는 <code>null</code>을 넣고, <code>prev.next = newNode</code>가 새 노드를 끝에 건다. 특별한 분기 없이 일반 경로가 그대로 맞는다. 인덱스의 허용 범위가 조회와 다른 것도 이 때문이다. 조회와 삭제는 "있는 요소"를 가리켜야 하므로 0부터 <code>size - 1</code>까지이고, 추가는 "요소 사이의 틈"을 가리키므로 0부터 <code>size</code>까지다. 요소가 n개면 틈은 n+1개다.</p>
+<p><code>index == 0</code>만 따로 처리하는 이유도 짚어 두자. 일반 경로는 "앞 노드의 <code>next</code>"를 고친다. 그런데 첫 노드에는 앞 노드가 없고, 그 역할을 리스트 객체의 <code>first</code> 필드가 대신한다. 고칠 칸이 노드 안에 있느냐 리스트 안에 있느냐가 다를 뿐 하는 일은 같다. 값이 없는 빈 노드를 맨 앞에 하나 세워 두어 이 분기를 없애는 구현 방식도 있지만, 여기서는 구조를 있는 그대로 드러내는 쪽을 택했다.</p>
+<x-visual id="java-mid2-04-insert-two-assignments" title="연결 리스트 중간 삽입의 두 단계 참조 대입" kind="단계별 다이어그램" ratio="16:9">
+<x-hint>중간 삽입은 기존 노드를 옮기지 않고 참조 두 개만 바꾼다는 것, 그리고 새 노드의 next를 먼저 걸어야 한다는 순서.</x-hint>
+<x-prompt>세 개의 가로 띠가 위에서 아래로 쌓인 단계별 다이어그램. 각 띠의 왼쪽에 단계 라벨이 있다: "삽입 전", "① 새 노드가 뒤를 가리킨다", "② 앞 노드가 새 노드를 가리킨다". 각 띠 안에는 둥근 사각형 노드 네 개가 가로로 놓여 있고 글자는 왼쪽부터 "X", "A", "B", "C"이며 노드 사이는 오른쪽 방향 화살표로 이어진다. 첫 번째 띠에서는 A 노드 아래에 작은 라벨 "prev"가 있고, 줄에서 떨어진 아래쪽에 주황색 노드 "Y"가 따로 떠 있다. 두 번째 띠에서는 Y 노드에서 B 노드로 가는 주황색 화살표가 새로 생기고 A에서 B로 가는 화살표는 그대로 있다. 세 번째 띠에서는 A에서 B로 가던 화살표가 사라지고 A에서 Y로 가는 주황색 화살표가 생겨 X, A, Y, B, C 순서의 경로가 완성된다. 흰 배경, 평면 벡터 스타일, 기존 노드는 회색 테두리, 새 노드와 새 화살표만 주황색.</x-prompt>
+<x-caption>기존 노드는 한 칸도 움직이지 않는다. 바뀌는 것은 새 노드의 next와 앞 노드의 next, 두 개의 참조뿐이다.</x-caption>
+</x-visual>
+<h4>삭제: 건너뛰게 만든다</h4>
+<p>삭제는 추가의 거울상이다. 삭제할 노드의 앞 노드가 삭제할 노드를 건너뛰어 그다음 노드를 가리키게 하면 된다. <code>remove(1)</code>이 <code>[A->Y->B->C->Z]</code>에서 Y를 빼는 과정은 이렇다. <code>getNode(0)</code>으로 A를 얻어 <code>prev</code>에 두고, <code>prev.next</code>인 Y를 <code>removed</code>에 담아 둔 뒤, <code>prev.next = removed.next</code>로 A가 B를 가리키게 한다. 여기서도 "아직 쓸 참조는 먼저 옮겨 둔다"는 규칙이 보인다. <code>removed</code> 변수에 담아 두지 않으면 값을 돌려줄 방법이 없어진다.</p>
+<p>맨 앞 삭제는 <code>first = removed.next</code> 한 번이다. 요소가 하나뿐인 리스트에서 <code>remove(0)</code>을 부르면 <code>removed.next</code>가 <code>null</code>이므로 <code>first</code>가 <code>null</code>이 되고 <code>size</code>가 0이 되어, "비어 있으면 <code>first</code>가 <code>null</code>"이라는 불변식이 저절로 맞는다. 맨 뒤 삭제인 <code>remove(3)</code>에서는 <code>removed.next</code>가 <code>null</code>이므로 앞 노드의 <code>next</code>가 <code>null</code>이 되어 그 노드가 새 마지막 노드가 된다. 빈 리스트에서 <code>remove(0)</code>을 부르면 <code>Objects.checkIndex(0, 0)</code>이 먼저 예외를 던지므로 <code>first</code>가 <code>null</code>인 상태로 <code>removed.next</code>를 읽는 일은 생기지 않는다.</p>
+
+<h3>삭제된 노드는 어떻게 되는가 — 도달 가능성</h3>
+<p><code>remove</code>의 끝부분에 있는 두 줄, <code>removed.item = null</code>과 <code>removed.next = null</code>은 무엇을 위한 것일까. 이 질문에 답하려면 가비지 컬렉터가 무엇을 기준으로 객체를 회수하는지 알아야 한다. JLS 12.6.1은 도달 가능한(reachable) 객체를 "살아 있는 스레드가 앞으로 이어 갈 수 있는 계산에서 접근할 수 있는 객체"로 정의한다. 실행 중인 메서드의 지역 변수나 정적 필드에서 출발해 참조를 따라가 닿을 수 있으면 살아 있고, 어떤 경로로도 닿을 수 없으면 회수 대상이다.</p>
+<pre class="diagram">remove(1) 에서 prev.next = removed.next 실행 직후
+
+first ─▶ [A] ────────────▶ [B] ─▶ [C] ─▶ [Z] ─▶ null
+                            ▲
+           removed ─▶ [Y] ──┘        Y로 들어오는 참조는 지역 변수 removed 하나뿐이다.
+                                     Y에서 나가는 참조(Y → B)는 Y의 생사와 무관하다.</pre>
+<p>기준은 "누가 나를 가리키는가"이지 "내가 누구를 가리키는가"가 아니다. Y가 여전히 B를 가리키고 있어도, Y로 들어오는 경로가 없으면 Y는 도달 불가능하다. 그러니 <code>remove</code>가 끝나 지역 변수 <code>removed</code>가 사라지면 Y 노드는 <code>next</code>를 지웠든 지우지 않았든 회수 대상이 된다. 반대로 B는 A를 통해 여전히 닿으므로 Y가 가리키고 있었다는 사실과 관계없이 살아 있다. 연결 리스트에서 노드를 "지운다"는 것은 메모리를 직접 해제하는 것이 아니라, 살아 있는 쪽에서 그 노드로 가는 길을 없애는 일이다.</p>
+<p>그렇다면 필드를 <code>null</code>로 비우는 줄은 왜 넣었는가. 지금 구현에서는 없어도 결과가 같다. 다만 누군가 그 노드를 따로 쥐고 있는 상황에서는 차이가 난다. 떼어 낸 노드가 살아 있는 한 그 노드의 <code>item</code>과 <code>next</code>가 가리키는 객체들도 함께 살아 있게 되기 때문이다. <code>java.util.LinkedList</code>도 노드를 떼어 낼 때 <code>item</code>과 앞뒤 참조를 <code>null</code>로 비운다. OpenJDK 21 소스의 <code>clear()</code>에는 노드 사이의 연결을 지우는 일이 꼭 필요하지는 않지만, 버려진 노드들이 여러 세대에 걸쳐 있을 때 세대별 GC를 돕고 도달 가능한 반복자가 남아 있어도 메모리가 확실히 풀리게 한다는 주석이 달려 있다. 배열 리스트가 삭제 후 비게 된 마지막 칸에 <code>null</code>을 넣는 것(<code>ArrayList</code>의 <code>fastRemove</code>)과 같은 종류의 배려다.</p>
+<aside class="note">C처럼 메모리를 직접 해제하는 언어에서는 노드를 떼어 낸 뒤 해제를 잊으면 누수가 되고, 해제한 노드를 다시 따라가면 정의되지 않은 동작이 된다. 자바에서는 도달 가능성으로 회수가 결정되므로 두 문제가 모두 구조적으로 사라진다. 대신 "의도하지 않게 남아 있는 참조"가 누수의 형태가 된다.</aside>
+<x-visual id="java-mid2-04-remove-reachability" title="노드 삭제 후 도달 가능성으로 본 회수 대상" kind="메모리 구조도" ratio="16:9">
+<x-hint>떼어 낸 노드가 다음 노드를 여전히 가리키고 있어도, 자신에게 들어오는 참조가 없으면 회수 대상이라는 것.</x-hint>
+<x-prompt>가로로 긴 다이어그램. 위쪽 줄에 둥근 사각형 노드 네 개 "A", "B", "C", "Z"가 왼쪽에서 오른쪽으로 놓이고 오른쪽 방향 실선 화살표로 이어진다. 맨 왼쪽에는 작은 칸 "first"에서 A로 가는 화살표. A에서 B로 가는 화살표는 위로 살짝 휘어 아래쪽 노드를 건너뛰는 모양이다. A와 B 사이 아래쪽에 흐린 회색으로 칠해진 노드 "Y"가 있고, Y에서 B로 올라가는 점선 화살표가 하나 있다. Y로 들어오는 화살표는 없다. Y 옆에 라벨 "들어오는 참조 없음 → 회수 대상". Y에서 B로 가는 점선 옆에 라벨 "나가는 참조는 무관". 위쪽 줄 전체를 감싸는 옅은 초록 영역에 라벨 "first에서 도달 가능". 흰 배경, 평면 벡터 스타일.</x-prompt>
+<x-caption>회수 여부는 들어오는 경로로 결정된다. 삭제란 살아 있는 쪽에서 그 노드로 가는 길을 끊는 일이다.</x-caption>
+</x-visual>
+
+<h3>시간 복잡도 — 건너간 횟수를 센다</h3>
+<p>구현이 끝났으니 비용을 정리하자. 연결 리스트에서 비용의 단위는 "노드를 건너간 횟수", 곧 <code>x = x.next</code>가 실행된 횟수다. 요소가 n개일 때 각 연산이 몇 번 건너가는지 코드에서 그대로 읽어 낼 수 있다. 앞 회차의 배열 리스트와 나란히 놓으면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>연산</th><th>단일 연결 리스트(이 회차의 구현)</th><th>배열 리스트</th></tr></thead><tbody>
+<tr><td><code>get(i)</code>, <code>set(i, e)</code></td><td>i번 건너감 → O(n)</td><td>위치 계산 한 번 → O(1)</td></tr>
+<tr><td><code>indexOf(o)</code></td><td>최대 n개 비교 → O(n)</td><td>최대 n개 비교 → O(n)</td></tr>
+<tr><td><code>add(0, e)</code> 맨 앞 추가</td><td>대입 2번 → O(1)</td><td>n개를 한 칸씩 이동 → O(n)</td></tr>
+<tr><td><code>add(i, e)</code> 중간 추가</td><td>i-1번 건너감 + 대입 2번 → O(n)</td><td>n-i개 이동 → O(n)</td></tr>
+<tr><td><code>add(e)</code> 맨 뒤 추가</td><td>n-1번 건너감 + 대입 1번 → O(n)</td><td>분할 상환 O(1)</td></tr>
+<tr><td><code>remove(0)</code> 맨 앞 삭제</td><td>대입 1번 → O(1)</td><td>n-1개 이동 → O(n)</td></tr>
+<tr><td><code>remove(i)</code> 중간 삭제</td><td>i-1번 건너감 + 대입 1번 → O(n)</td><td>n-i-1개 이동 → O(n)</td></tr>
+<tr><td><code>remove(n-1)</code> 맨 뒤 삭제</td><td>n-2번 건너감 → O(n)</td><td>이동 없음 → O(1)</td></tr>
+<tr><td><code>size()</code></td><td>O(1)</td><td>O(1)</td></tr>
+</tbody></table></div>
+<p>표에서 읽어야 할 것은 세 가지다. 첫째, 두 구조의 강점이 정확히 반대쪽 끝에 있다. 연결 리스트는 앞쪽이 싸고 뒤로 갈수록 비싸진다. 배열 리스트는 뒤쪽이 싸고 앞으로 갈수록 비싸진다. 중간 추가는 둘 다 O(n)이지만 이유가 다르다. 연결 리스트는 자리를 <b>찾는 데</b> 시간을 쓰고 고치는 일은 상수 시간이며, 배열 리스트는 자리를 찾는 일이 상수 시간이고 <b>고치는 데</b>(요소 이동) 시간을 쓴다.</p>
+<p>둘째, "연결 리스트는 추가와 삭제가 O(1)"이라는 말은 조건이 붙은 문장이다. 정확히는 "고칠 위치의 바로 앞 노드를 이미 쥐고 있다면 O(1)"이다. 인덱스만 받아서는 그 노드를 찾는 데 O(n)이 든다. 조건 없이 O(1)인 것은 맨 앞뿐이다.</p>
+<p>셋째, 맨 뒤 추가가 O(n)이라는 점은 이 구현의 약점이다. 리스트에서 가장 자주 쓰는 연산이 <code>add(e)</code>인데, 부를 때마다 처음부터 끝까지 걸어간다. 빈 리스트에 <code>add(e)</code>를 n번 불러 n개짜리 리스트를 만드는 동안 건너간 횟수를 모두 더해 보자. k번째 호출 시점에 리스트에는 k-1개가 있고, <code>getLastNode</code>는 k-2번 건너간다(첫 호출은 0번). 합은 0 + 1 + … + (n-2) = (n-1)(n-2)/2다. 카운터를 넣어 실행해 본 값도 이 식과 일치한다.</p>
+<div class="table-wrap"><table><thead><tr><th>요소 수 n</th><th><code>add(e)</code> n번에 건너간 총 횟수</th></tr></thead><tbody>
+<tr><td>4</td><td>3</td></tr>
+<tr><td>1,000</td><td>498,501</td></tr>
+<tr><td>100,000</td><td>4,999,850,001</td></tr>
+</tbody></table></div>
+<p>요소가 100배 늘면 일은 약 1만 배 늘어난다. O(n) 연산을 n번 반복하면 O(n²)이 된다는 사실의 구체적인 모습이다. 해결책은 간단하다. 마지막 노드를 매번 찾지 말고 기억해 두면 된다.</p>
+<pre><code class="language-java">    private Node first;
+    private Node last;      // 마지막 노드를 기억한다
+    private int size;
+
+    public void add(Object e) {
+        Node newNode = new Node(e);
+        if (last == null) {
+            first = newNode;
+        } else {
+            last.next = newNode;
+        }
+        last = newNode;
+        size++;
+    }</code></pre>
+<p>이제 맨 뒤 추가는 O(1)이다. 공짜는 아니다. 불변식이 하나 늘었으므로("<code>last</code>는 항상 마지막 노드를 가리킨다") 마지막 노드가 바뀔 수 있는 모든 메서드, 곧 <code>add(index, e)</code>에서 <code>index == size</code>인 경우와 <code>remove</code>에서 마지막 노드를 지우는 경우에 <code>last</code>를 함께 고쳐야 한다. 그리고 <code>last</code>가 있어도 맨 뒤 <b>삭제</b>는 여전히 O(n)이다. 마지막 노드를 지우려면 그 앞 노드의 <code>next</code>를 <code>null</code>로 바꿔야 하는데, 단일 연결에서는 뒤에서 앞으로 가는 길이 없어 처음부터 걸어가야 한다. 이 한계가 뒤에서 볼 이중 연결의 동기다.</p>
+<h4>인덱스 반복문의 함정</h4>
+<p>배열 리스트에서 자연스러웠던 다음 코드를 연결 리스트에 그대로 쓰면 같은 종류의 O(n²)이 생긴다.</p>
+<pre><code class="language-java">for (int i = 0; i < list.size(); i++) {
+    System.out.println(list.get(i));   // 매번 first부터 다시 걸어간다
+}</code></pre>
+<p><code>get(i)</code>가 i번 건너가므로 전체는 0 + 1 + … + (n-1) = n(n-1)/2번이다. 요소가 1,000개면 499,500번이다. 클래스 내부의 <code>toString()</code>이나 <code>indexOf()</code>처럼 노드를 직접 쥐고 <code>x = x.next</code>로 한 번만 훑으면 999번이면 끝나는 일이다. 차이는 "지금 어디까지 왔는지"를 누가 기억하느냐에 있다. 인덱스 반복문에서는 아무도 기억하지 않아 매번 처음부터 다시 간다. 그렇다고 리스트 바깥의 코드에 노드를 내줄 수는 없다. 바깥에서 <code>next</code>를 고치면 불변식이 깨지기 때문이다. 현재 위치를 기억하면서 내부 구조는 숨기는 장치가 필요하고, 그것이 이 권의 마지막 회차에서 다룰 반복자(Iterator)다.</p>
+
+<h3>직접 구현하는 연결 리스트 3 — 제네릭 도입</h3>
+<p>지금까지의 리스트는 <code>Object</code>를 담는다. 이 권의 첫 회차에서 본 문제가 그대로 있다. 꺼낼 때마다 <code>(String) list.get(0)</code>처럼 캐스트해야 하고, 문자열만 담으려던 리스트에 실수로 정수를 넣어도 컴파일러가 막아 주지 않아 꺼내는 쪽에서 <code>ClassCastException</code>으로 드러난다. 타입 매개변수를 도입해 완성한다.</p>
+<pre><code class="language-java">import java.util.Objects;
+
+public class SingleLinkedList<E> {
+    private Node<E> first;
+    private int size;
+
+    private static class Node<E> {
+        E item;
+        Node<E> next;
+
+        Node(E item) {
+            this.item = item;
+        }
+    }
+
+    public void add(E e) {
+        Node<E> newNode = new Node<>(e);
+        if (first == null) {
+            first = newNode;
+        } else {
+            Node<E> last = getLastNode();
+            last.next = newNode;
+        }
+        size++;
+    }
+
+    public void add(int index, E e) {
+        if (index < 0 || index > size) {
+            throw new IndexOutOfBoundsException("Index: " + index + ", Size: " + size);
+        }
+        Node<E> newNode = new Node<>(e);
+        if (index == 0) {
+            newNode.next = first;
+            first = newNode;
+        } else {
+            Node<E> prev = getNode(index - 1);
+            newNode.next = prev.next;
+            prev.next = newNode;
+        }
+        size++;
+    }
+
+    public E get(int index) {
+        return getNode(index).item;
+    }
+
+    public E set(int index, E element) {
+        Node<E> x = getNode(index);
+        E old = x.item;
+        x.item = element;
+        return old;
+    }
+
+    public E remove(int index) {
+        Objects.checkIndex(index, size);
+        Node<E> removed;
+        if (index == 0) {
+            removed = first;
+            first = removed.next;
+        } else {
+            Node<E> prev = getNode(index - 1);
+            removed = prev.next;
+            prev.next = removed.next;
+        }
+        E item = removed.item;
+        removed.item = null;
+        removed.next = null;
+        size--;
+        return item;
+    }
+
+    public int indexOf(Object o) {
+        int index = 0;
+        for (Node<E> x = first; x != null; x = x.next) {
+            if (Objects.equals(o, x.item)) {
+                return index;
+            }
+            index++;
+        }
+        return -1;
+    }
+
+    public int size() {
+        return size;
+    }
+
+    private Node<E> getLastNode() {
+        Node<E> x = first;
+        while (x.next != null) {
+            x = x.next;
+        }
+        return x;
+    }
+
+    private Node<E> getNode(int index) {
+        Objects.checkIndex(index, size);
+        Node<E> x = first;
+        for (int i = 0; i < index; i++) {
+            x = x.next;
+        }
+        return x;
+    }
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder("[");
+        for (Node<E> x = first; x != null; x = x.next) {
+            sb.append(x.item);
+            if (x.next != null) {
+                sb.append("->");
+            }
+        }
+        return sb.append("]").toString();
+    }
+}</code></pre>
+<pre><code class="language-java">public class ListMain3 {
+    public static void main(String[] args) {
+        SingleLinkedList<String> names = new SingleLinkedList<>();
+        names.add("kim");
+        names.add("lee");
+        names.add(0, "park");
+        String head = names.get(0);
+        System.out.println(head.toUpperCase());
+        System.out.println(names);
+
+        SingleLinkedList<Integer> numbers = new SingleLinkedList<>();
+        numbers.add(10);
+        numbers.add(20);
+        int sum = numbers.get(0) + numbers.get(1);
+        System.out.println(sum);
+        System.out.println(numbers.remove(0) + " " + numbers);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">PARK
+[park->kim->lee]
+30
+10 [20]</code></pre>
+<p>알고리즘은 한 줄도 바뀌지 않았다. <code>Object</code>가 <code>E</code>로, <code>Node</code>가 <code>Node<E></code>로 바뀌었을 뿐이다. 쓰는 쪽에서는 캐스트가 사라졌고, <code>names.add(1)</code>처럼 잘못된 타입을 넣으면 컴파일러가 <code>incompatible types: int cannot be converted to String</code>이라는 오류로 막는다. 구현하면서 내린 결정 몇 가지는 설명이 필요하다.</p>
+<h4>노드를 static 중첩 클래스로 둔 이유</h4>
+<p>노드는 리스트의 구현 세부 사항이다. 바깥 코드가 노드를 직접 만들거나 <code>next</code>를 고치면 불변식을 지킬 수 없으므로, 노드 클래스를 리스트 안에 <code>private</code> 중첩 클래스로 넣어 숨겼다. 여기에 <code>static</code>을 붙였기 때문에 노드는 자기만의 타입 매개변수를 선언해야 한다. <code>static</code>을 붙이고 바깥 클래스의 <code>E</code>를 그대로 쓰려 하면 컴파일되지 않는다.</p>
+<pre><code class="language-java">public class SingleLinkedList<E> {
+    private Node first;
+
+    private static class Node {
+        E item;        // 컴파일 오류
+        Node next;
+    }
+}</code></pre>
+<pre data-label="javac 출력"><code class="language-text">SingleLinkedList.java:5: error: non-static type variable E cannot be referenced from a static context
+        E item;
+        ^</code></pre>
+<p>JLS 8.1.1.4는 <code>static</code> 중첩 클래스에서 바깥을 둘러싼 클래스의 타입 매개변수를 참조할 수 없다고 정한다. 타입 이름의 의미를 정하는 JLS 6.5.5.1도 타입 매개변수의 이름이 중첩 클래스 안에 나타나면 그 이름을 직접 둘러싼 클래스가 내부 클래스여야 한다고 요구한다. <code>javac</code>의 오류 문구는 static context라고 말하지만, JLS 8.1.3이 정의하는 정적 문맥(static context)은 <code>static</code> 메서드, <code>static</code> 필드, <code>static</code> 초기화 블록, 명시적 생성자 호출문의 안쪽을 가리키는 더 좁은 용어이고, 그 안에서도 같은 참조가 금지된다. 이유는 <code>E</code>가 인스턴스에 딸린 정보이기 때문이다. <code>SingleLinkedList<String></code> 객체의 <code>E</code>는 <code>String</code>이고 <code>SingleLinkedList<Integer></code> 객체의 <code>E</code>는 <code>Integer</code>다. <code>static</code> 중첩 클래스는 바깥 인스턴스와 연결되어 있지 않으므로(JLS 8.1.1.4) "어느 리스트의 <code>E</code>인가"를 물을 대상이 없다. 그래서 <code>Node<E></code>처럼 따로 선언한다. 노드의 <code>E</code>와 리스트의 <code>E</code>는 이름만 같은 별개의 타입 변수이고, 리스트의 필드 선언 <code>private Node<E> first</code>에서 리스트의 <code>E</code>가 노드의 타입 인자로 넘어가면서 둘이 이어진다.</p>
+<p><code>static</code>을 빼고 내부 클래스(inner class)로 만들면 바깥의 <code>E</code>를 그대로 쓸 수 있고 코드도 컴파일된다. 대신 의미가 달라진다. 내부 클래스의 인스턴스는 바깥 클래스의 인스턴스 하나와 연결된다(JLS 8.1.3). JDK 21의 <code>javac</code>로 컴파일해 <code>javap -p -s</code>로 보면 내부 클래스 판 노드의 생성자 디스크립터는 <code>(LSingleLinkedList;Ljava/lang/Object;)V</code>로, 노드를 만들 때마다 리스트 참조가 인자로 함께 넘어간다. 노드의 메서드가 바깥 리스트의 멤버를 쓰면 노드 클래스에 <code>final SingleLinkedList this$0</code>이라는 숨은 필드가 생겨 노드마다 리스트 참조를 하나씩 들고 다니게 된다. 노드는 값과 다음 노드만 알면 되고 자기가 어느 리스트에 속하는지 알 필요가 없다. 필요 없는 연결을 타입 수준에서 끊어 두는 것이 <code>static</code>의 의미이고, <code>java.util.LinkedList</code>의 노드도 <code>private static class Node<E></code>로 선언되어 있다.</p>
+<h4>타입 소거 뒤에 남는 것</h4>
+<p>앞 회차에서 본 타입 소거(type erasure)가 이 클래스에 어떻게 적용되는지 <code>javap</code>로 확인하자.</p>
+<pre data-label="javap -p -s 'SingleLinkedList$Node'"><code class="language-text">class SingleLinkedList$Node<E> {
+  E item;
+    descriptor: Ljava/lang/Object;
+  SingleLinkedList$Node<E> next;
+    descriptor: LSingleLinkedList$Node;
+  SingleLinkedList$Node(E);
+    descriptor: (Ljava/lang/Object;)V
+}</code></pre>
+<pre data-label="javap -c ListMain3 (발췌)"><code class="language-text">  28: iconst_0
+  29: invokevirtual #23     // Method SingleLinkedList.get:(I)Ljava/lang/Object;
+  32: checkcast     #27     // class java/lang/String
+  35: astore_2
+  ...
+  62: bipush        10
+  64: invokestatic  #47     // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+  67: invokevirtual #12     // Method SingleLinkedList.add:(Ljava/lang/Object;)V</code></pre>
+<p>노드의 <code>item</code> 필드는 디스크립터가 <code>Ljava/lang/Object;</code>다. 실행 중의 노드는 <code>Object</code> 버전의 노드와 모양이 같다. <code>SingleLinkedList<String></code>용 노드 클래스와 <code>SingleLinkedList<Integer></code>용 노드 클래스가 따로 생기지 않고, <code>SingleLinkedList$Node</code> 하나를 함께 쓴다. <code>get</code>도 <code>Object</code>를 돌려주며, 우리가 손으로 쓰던 캐스트는 컴파일러가 호출 지점에 <code>checkcast</code>로 넣어 주었다. 제네릭 도입으로 달라진 것은 실행 시점의 구조가 아니라 컴파일 시점의 검사다.</p>
+<p><code>numbers.add(10)</code>에서는 <code>Integer.valueOf</code> 호출이 끼어든다. 노드의 <code>item</code>은 참조이므로 <code>int</code>를 직접 담을 수 없고, 오토박싱으로 만든 <code>Integer</code> 객체의 참조를 담는다. 정수 하나를 리스트에 넣는 데 노드 객체와 <code>Integer</code> 객체가 함께 필요하다는 뜻이고, 바로 뒤에서 이 비용을 바이트 단위로 센다.</p>
+<p>마지막으로 눈에 띄지 않는 장점 하나. 배열 기반 리스트를 제네릭으로 만들 때는 <code>new E[n]</code>을 쓸 수 없어 <code>Object[]</code>를 만들고 검사되지 않는 캐스트를 감수해야 했다. 연결 리스트에는 배열이 없다. <code>new Node<>(e)</code>는 평범한 제네릭 클래스의 인스턴스 생성이어서 경고 없이 컴파일된다. <code>indexOf</code>의 매개변수를 <code>E</code>가 아니라 <code>Object</code>로 둔 것은 <code>java.util.List</code>의 <code>indexOf(Object o)</code>와 같은 선택이다. 무엇과 같은지 묻는 일에는 타입 제한이 필요 없기 때문이다.</p>
+
+<h3>한 층 아래 — 노드 하나의 크기</h3>
+<p>연결 리스트는 여분의 빈칸을 두지 않으니 메모리를 아낀다고 생각하기 쉽다. 실제로 세어 보자. 먼저 밝혀 둘 것은, 객체가 메모리에서 어떤 모양인지는 명세가 정하지 않는다는 점이다. JVMS 2.7은 자바 가상 머신이 객체의 내부 구조를 특정한 형태로 요구하지 않는다고 적고 있다. 아래 내용은 OpenJDK 21의 HotSpot, 64비트, 기본 설정에서의 이야기다.</p>
+<p>HotSpot에서 모든 객체는 헤더(header)로 시작한다. 헤더는 마크 워드(mark word)와 클래스 워드(class word)로 이루어진다. 마크 워드에는 식별 해시 코드, GC 나이, 락 상태 같은 정보가 들어가고, 클래스 워드는 그 객체의 클래스를 설명하는 메타데이터를 가리킨다. <a href="https://openjdk.org/jeps/450">JEP 450</a>의 설명에 따르면 64비트 HotSpot의 객체 헤더는 설정에 따라 96비트(12바이트)에서 128비트(16바이트)를 차지한다. 이 원고의 예제를 실행한 환경(최대 힙 4GB)에서는 <code>-XX:+PrintFlagsFinal</code>로 확인했을 때 <code>UseCompressedOops</code>와 <code>UseCompressedClassPointers</code>가 켜져 있었고 <code>ObjectAlignmentInBytes</code>는 8이었다. 이 설정에서 헤더는 12바이트, 참조 필드 하나는 4바이트이고, 객체 크기는 8의 배수로 올림된다.</p>
+<pre class="diagram">Node (item, next) — OpenJDK 21 HotSpot, 압축 참조 사용
+
+오프셋  0        8       12       16       20       24
+        ┌────────┬───────┬────────┬────────┬────────┐
+        │ 마크   │ 클래스│ item   │ next   │ 패딩   │
+        │ 워드 8 │ 워드 4│ 참조 4 │ 참조 4 │ 4      │   합계 24바이트
+        └────────┴───────┴────────┴────────┴────────┘
+          └── 헤더 12 ──┘  └─ 필드 8 ─┘   └ 8의 배수 맞춤</pre>
+<p>계산이 맞는지 실측으로 확인했다. 노드 100만 개와, 같은 요소 100만 개를 담은 <code>java.util.LinkedList</code>를 만든 뒤 <code>jcmd <pid> GC.class_histogram</code>으로 클래스별 인스턴스 수와 바이트 수를 뽑았다.</p>
+<pre data-label="jcmd GC.class_histogram (발췌, OpenJDK 21.0.13 기본 설정)"><code class="language-text"> num     #instances         #bytes  class name (module)
+   1:       1000000       24000000  Node
+   2:       1000000       24000000  java.util.LinkedList$Node (java.base@21.0.13)</code></pre>
+<p>우리가 만든 노드는 하나에 24바이트다. <code>java.util.LinkedList</code>의 노드는 앞 노드를 가리키는 참조가 하나 더 있어 12 + 4 × 3 = 24바이트로, 패딩 없이 같은 크기가 된다. 같은 프로그램을 <code>-XX:-UseCompressedOops</code>로 실행하면 참조가 8바이트가 되어 각각 32바이트, 40바이트로 늘어난다. 한편 배열 리스트의 내부 배열에서 요소 하나가 차지하는 것은 참조 칸 하나, 4바이트다. 길이 100만의 <code>Object[]</code>를 하나 만들었을 때 히스토그램에서 늘어난 양은 약 400만 바이트였다.</p>
+<div class="table-wrap"><table><thead><tr><th>구조 (OpenJDK 21 HotSpot, 압축 참조)</th><th>요소 하나당 뼈대 비용</th><th>요소 100만 개</th></tr></thead><tbody>
+<tr><td>배열 리스트의 내부 배열 칸</td><td>4바이트</td><td>약 4MB(칸 100만 개 기준)</td></tr>
+<tr><td>단일 연결 노드(item, next)</td><td>24바이트</td><td>24,000,000바이트</td></tr>
+<tr><td><code>java.util.LinkedList</code>의 노드(item, next, prev)</td><td>24바이트</td><td>24,000,000바이트</td></tr>
+</tbody></table></div>
+<p>요소 자체의 크기는 두 구조에서 같으므로 뼈대만 비교하면 노드 방식이 여섯 배다. 배열 리스트에는 쓰지 않는 여분 칸이 있을 수 있지만, 그 칸도 하나에 4바이트다. 용량이 요소 수의 여섯 배가 되지 않는 한 배열 쪽이 작다. 정수를 담는 경우에는 차이가 더 벌어진다. 같은 방법으로 재 보면 <code>Integer</code> 객체 하나는 16바이트다. <code>Integer.valueOf</code>가 캐시하는 -128부터 127 사이가 아닌 정수 100만 개를 <code>SingleLinkedList<Integer></code>에 담으면 노드 24MB에 <code>Integer</code> 16MB가 더해진다. <code>int[]</code>라면 4MB면 되는 데이터다.</p>
+<aside class="note">객체 헤더를 8바이트로 줄이는 JEP 450(Compact Object Headers)은 JDK 24에 실험 기능으로 들어갔고 JDK 21에는 없다. 이 절의 숫자는 JDK 21 기본 설정의 값이다.</aside>
+
+<h3>한 층 아래 — 메모리 지역성과 포인터 추적</h3>
+<p>크기보다 더 중요한 차이는 노드들이 메모리의 <b>어디에</b> 놓이는가다. 프로세서가 메인 메모리에서 데이터를 가져오는 일은 프로세서 내부의 연산에 비해 느리다. 그래서 프로세서는 최근에 읽은 메모리 내용을 캐시(cache)라는 작고 빠른 저장소에 복사해 두고, 같은 곳을 다시 읽을 때는 캐시에서 꺼낸다. 캐시는 바이트 하나씩이 아니라 캐시 라인(cache line)이라는 고정 크기 블록 단위로 메모리를 가져온다. 캐시 라인의 크기는 프로세서마다 다르다. x86-64 프로세서에서는 흔히 64바이트이고, 이 원고의 예제를 실행한 Apple Silicon 맥에서는 <code>sysctl hw.cachelinesize</code>가 128을 보고했다.</p>
+<p>블록 단위로 가져온다는 사실이 배열에 유리하게 작용한다. 배열의 칸들은 한 덩어리로 붙어 있으므로 칸 하나를 읽으면 같은 캐시 라인에 있는 이웃 칸들이 함께 캐시에 올라온다. 64바이트 라인이라면 4바이트 참조 16개가 한 번에 들어온다. 뒤따르는 15번의 읽기는 메인 메모리까지 가지 않는다. 이렇게 "방금 쓴 곳의 근처를 곧 다시 쓰는" 성질을 메모리 지역성(locality of reference)이라고 하고, 배열 순회는 지역성이 높은 접근의 전형이다.</p>
+<p>노드는 사정이 다르다. 노드 하나하나가 독립된 객체이고, 힙의 어디에 놓일지는 할당 시점의 상황이 정한다. HotSpot은 스레드마다 TLAB(thread-local allocation buffer)이라는 구역을 주고 그 안에서 경계 표시를 밀어 올리는 방식으로 객체를 할당한다(OpenJDK HotSpot 용어집). 그래서 한 스레드가 연달아 만든 객체는 메모리에서도 이웃하기 쉽다. 그러나 이것은 보장이 아니다. 노드를 추가하는 사이사이에 다른 객체를 만들면 그것들이 노드 사이에 끼어들고, 시간을 두고 추가한 노드는 서로 먼 곳에 놓이며, 가비지 컬렉터가 객체를 옮긴 뒤의 배치는 수집기가 정한다. 리스트의 순서와 메모리의 순서 사이에는 아무 약속이 없다.</p>
+<pre class="diagram">배열 리스트: 참조 칸이 한 덩어리로 붙어 있다
+
+  elementData ─▶ │ r0 │ r1 │ r2 │ r3 │ r4 │ r5 │ r6 │ r7 │ ...      ← 캐시 라인 하나에 여러 칸
+                 └────────── 다음 칸의 위치는 계산으로 안다 ──────────┘
+
+연결 리스트: 노드가 힙 여기저기에 있다 (순서와 위치가 무관)
+
+  first ─▶ [N0] ···············┐
+                               ▼
+         [N2] ◀───────────── [N1]          ← N1을 읽어야 N2의 위치를 안다
+           │
+           └──────────────────────────▶ [N3] ─▶ ...</pre>
+<p>흩어져 있다는 것보다 더 근본적인 차이가 있다. 앞에서 바이트코드로 본 것처럼, 배열 순회에서 다음에 읽을 위치는 지금 읽는 값과 무관하게 계산된다. 프로세서는 i번째 칸의 내용이 도착하기를 기다리지 않고 i+1번째, i+2번째 칸을 읽으러 갈 수 있고, 주소가 일정한 간격으로 늘어나는 패턴을 감지해 다음 캐시 라인을 미리 가져오는 하드웨어 프리페처(prefetcher)의 도움도 받는다. 노드 순회에서는 다음 노드의 위치가 현재 노드의 <code>next</code> 칸 <b>안에</b> 들어 있다. 현재 노드가 메모리에서 도착하기 전에는 다음에 어디를 읽어야 하는지조차 알 수 없다. 읽기가 한 줄로 꿰여 앞의 것이 끝나야 뒤의 것이 시작된다. 이런 접근 방식을 포인터 추적(pointer chasing)이라고 부른다.</p>
+<p>공정하게 짚을 점이 있다. 배열 리스트도 요소 자체는 참조로 달려 있다. <code>indexOf</code>처럼 요소마다 <code>equals</code>를 호출하는 연산은 두 구조 모두 요소 객체를 찾아가야 한다. 배열이 유리한 부분은 뼈대를 따라가는 비용이다. 그리고 이 절에서 실행 시간 수치를 제시하지 않은 것은 의도적이다. 차이의 크기는 프로세서, 데이터 크기, 힙 상태에 따라 크게 달라지므로 구조적 이유만 설명했다. 배열 리스트와 연결 리스트의 연산별 성능을 실제로 견주어 보는 일은 다음 회차에서 한다.</p>
+<x-visual id="java-mid2-04-array-vs-node-layout" title="배열의 연속 배치와 노드의 흩어진 배치를 캐시 라인과 함께 비교" kind="비교 다이어그램" ratio="16:9">
+<x-hint>배열은 캐시 라인 하나에 여러 칸이 들어가고 다음 위치를 계산할 수 있지만, 노드는 힙에 흩어져 있고 현재 노드를 읽어야 다음 위치를 안다는 대비.</x-hint>
+<x-prompt>위아래 두 패널로 나뉜 비교 다이어그램. 위 패널 제목은 "배열: 연속 배치". 가로로 긴 띠가 같은 크기의 작은 칸 16개로 나뉘어 있고, 칸 8개마다 굵은 테두리로 묶여 각 묶음 위에 라벨 "캐시 라인". 띠 위를 왼쪽에서 오른쪽으로 지나가는 곧은 화살표 하나와 라벨 "다음 위치를 계산으로 안다". 아래 패널 제목은 "연결 리스트: 흩어진 노드". 넓은 직사각형 영역(라벨 "힙") 안에 작은 사각형 노드 다섯 개가 불규칙하게 흩어져 있고 숫자 "1", "2", "3", "4", "5"가 적혀 있다. 1에서 2로, 2에서 3으로, 3에서 4로, 4에서 5로 가는 화살표가 영역을 이리저리 가로지르며 서로 교차한다. 노드 사이의 빈 공간에는 옅은 회색의 다른 객체 사각형 여러 개. 아래 패널 옆에 라벨 "읽어야 다음 위치를 안다". 흰 배경, 평면 벡터 스타일, 배열은 파란색, 노드는 주황색.</x-prompt>
+<x-caption>같은 "순서대로 읽기"라도 배열은 한 줄로 붙은 메모리를 훑고, 연결 리스트는 참조를 따라 힙을 옮겨 다닌다.</x-caption>
+</x-visual>
+
+<h3>단일 연결에서 이중 연결로 — java.util.LinkedList 미리 보기</h3>
+<p>우리가 만든 리스트는 노드가 다음 노드만 아는 단일 연결 리스트(singly linked list)다. 자바 표준 라이브러리의 <code>java.util.LinkedList</code>는 한 걸음 더 나간 구조다. Java 21 API 문서는 이 클래스를 "<code>List</code>와 <code>Deque</code> 인터페이스의 이중 연결 리스트 구현"이라고 소개한다. OpenJDK 21 소스를 보면 리스트 객체는 <code>first</code>와 <code>last</code> 두 참조를 갖고, 노드는 <code>item</code>, <code>next</code>, <code>prev</code> 세 필드를 갖는다.</p>
+<p>앞 노드를 가리키는 <code>prev</code> 하나가 더해지면 이 회차에서 확인한 약점 두 가지가 풀린다. 맨 뒤 삭제가 O(1)이 된다. <code>last.prev</code>로 바로 앞 노드를 얻을 수 있기 때문이다. 인덱스 접근도 절반으로 줄어든다. API 문서는 인덱스로 접근하는 연산이 처음과 끝 중 지정한 인덱스에 더 가까운 쪽에서부터 리스트를 따라간다고 적고 있고, 소스의 <code>node(int index)</code> 메서드는 <code>index</code>가 <code>size</code>의 절반보다 작으면 <code>first</code>에서 <code>next</code>로, 아니면 <code>last</code>에서 <code>prev</code>로 걸어간다. 그래도 한가운데 요소에 가려면 n/2번을 건너가야 하므로 인덱스 접근이 O(n)이라는 사실은 변하지 않는다.</p>
+<p>대가는 관리할 참조가 늘어난다는 것이다. 단일 연결에서 중간 삽입은 대입 두 번이었지만, 이중 연결에서는 새 노드의 <code>prev</code>와 <code>next</code>, 앞 노드의 <code>next</code>, 뒤 노드의 <code>prev</code>까지 네 군데를 맞춰야 하고, 맨 앞과 맨 뒤에서는 <code>first</code>와 <code>last</code>도 챙겨야 한다. 이 회차에서 익힌 "아직 쓸 참조는 덮어쓰기 전에 옮겨 둔다"는 규칙과 불변식을 세워 두고 메서드마다 지키는 습관이 그대로 쓰인다. <code>ArrayList</code>와 <code>LinkedList</code>를 <code>List</code> 인터페이스 아래에 놓고 비교하는 일은 다음 회차에서, 양쪽 끝에서 넣고 빼는 <code>Deque</code>로서의 쓰임은 Map, Stack, Queue를 다루는 회차에서 이어진다.</p>
+
+<h3>흔한 오해 여섯 가지</h3>
+<p><b>"연결 리스트는 삽입과 삭제가 O(1)이다."</b> 참조를 고치는 일만 O(1)이다. 인덱스로 위치를 지정하면 그 자리의 앞 노드를 찾는 데 O(n)이 든다. 조건 없이 O(1)인 것은 맨 앞(그리고 <code>last</code>를 둔 경우의 맨 뒤 추가)뿐이다. 교과서의 O(1)은 "고칠 자리의 노드를 이미 쥐고 있을 때"라는 전제를 깔고 있다.</p>
+<p><b>"빈칸이 없으니 배열보다 메모리를 덜 쓴다."</b> OpenJDK 21 기본 설정에서 노드 하나는 24바이트, 배열 칸 하나는 4바이트다. 여분 칸을 감안해도 대부분의 경우 배열 쪽이 작다. 객체마다 붙는 헤더와 정렬 패딩이 작은 객체에서는 내용물보다 커질 수 있다는 점을 기억해 둘 만하다.</p>
+<p><b>"삭제한 노드의 next를 null로 만들어야 회수된다."</b> 회수 여부는 그 노드로 들어오는 경로가 있느냐로 정해진다. 노드가 무엇을 가리키고 있는지는 그 노드의 생사와 관계없다. 필드를 비우는 것은 누군가 그 노드를 아직 쥐고 있을 때 딸린 객체까지 붙잡히지 않게 하는 방어다.</p>
+<p><b>"노드 안에 다음 노드가 들어 있다."</b> 들어 있는 것은 참조 칸 하나다. 그래서 노드의 크기는 고정이고, 한 노드를 여러 곳에서 가리킬 수도 있으며, 잘못 연결하면 자기 자신을 가리키는 순환도 만들어진다. "포함"으로 생각하면 순환이나 공유를 설명할 수 없다.</p>
+<p><b>"리스트면 다 같으니 인덱스로 돌면 된다."</b> 연결 리스트에서 <code>get(i)</code>를 반복문 안에 넣으면 전체가 O(n²)이 된다. 같은 인터페이스 뒤에 있어도 연산의 비용은 구현마다 다르다. 인터페이스는 무엇을 할 수 있는지를 약속하지 얼마나 빨리 하는지를 약속하지 않는다.</p>
+<p><b>"제네릭을 쓰면 타입별로 전용 노드가 만들어진다."</b> 타입 소거 뒤에 남는 노드 클래스는 하나이고 <code>item</code>은 <code>Object</code> 참조다. <code>SingleLinkedList<Integer></code>가 <code>int</code>를 직접 담지 못하고 <code>Integer</code> 객체를 거치는 것도 이 때문이다.</p>
+
+<h3>다른 곳에서 다시 만나는 노드</h3>
+<p>"객체가 같은 타입의 다른 객체를 가리킨다"는 구조는 연결 리스트에서 끝나지 않는다. 이 권의 뒤쪽에서 다룰 <code>HashMap</code>의 내부 클래스 <code>Node</code>에도 <code>next</code> 필드가 있다. 같은 버킷에 들어온 항목들을 이 회차의 방식 그대로 사슬로 잇는다. 해시 충돌이 많아지면 조회가 느려지는 이유를 이해하려면 사슬을 따라가는 비용이 O(길이)라는 감각이 먼저 있어야 한다.</p>
+<p>참조를 둘 가지면 트리가 된다. <code>TreeMap</code>의 항목 클래스는 <code>left</code>, <code>right</code>, <code>parent</code> 참조를 갖는다. 노드를 만들고, 참조를 고쳐 구조를 바꾸고, 불변식을 지키는 일은 연결 리스트와 같고 불변식의 내용만 더 복잡하다. 동시성으로 넘어가도 마찬가지다. 락을 기다리는 스레드들을 관리하는 <code>AbstractQueuedSynchronizer</code>의 내부 노드에도 <code>prev</code>와 <code>next</code>가 있다. 여러 스레드가 동시에 사슬을 고쳐야 하므로 이 회차에서 본 "대입 두 번"을 원자적으로 해내는 것이 그쪽의 주제가 된다.</p>
+<p>이 회차에서 리스트 바깥의 코드가 노드를 직접 만질 수 없다는 제약 때문에 인덱스 반복문이 느려지는 것을 보았다. 구조를 숨긴 채 순회의 현재 위치만 기억해 주는 반복자는 이 권의 마지막 회차에서 다룬다. 그리고 우리가 만든 <code>SingleLinkedList</code>와 앞 회차의 배열 리스트는 메서드 이름과 의미가 거의 같다. 구현은 전혀 다른데 쓰는 방법이 같다면 그 공통점을 인터페이스로 뽑아낼 수 있다. 그것이 다음 회차의 출발점이다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>연결 리스트는 순서를 메모리 위치가 아니라 참조로 표현한다. 그래서 구조를 고치는 일은 참조 대입 몇 번으로 끝나지만, 위치를 계산할 수 없어 찾아가는 데 O(n)이 들고, 요소마다 헤더가 붙은 객체가 하나씩 필요하며, 다음 위치를 알려면 현재 노드를 먼저 읽어야 해서 캐시의 도움을 덜 받는다. 빅오 표의 한 칸이 좋아 보인다는 이유로 고르는 구조가 아니라, 어느 위치의 연산이 얼마나 잦은지와 메모리가 어떻게 놓이는지를 함께 보고 고르는 구조다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>노드(node)</dt><dd>값을 가리키는 참조 <code>item</code>과 다음 노드를 가리키는 참조 <code>next</code>를 가진 객체. 필드에 들어 있는 것은 참조이므로 크기가 고정이고, 마지막 노드의 <code>next</code>는 <code>null</code>이다.</dd>
+<dt>순회의 기본형</dt><dd><code>for (x = first; x != null; x = x.next)</code>. <code>x = x.next</code>는 변수만 옮기고 <code>x.next = ...</code>는 구조를 고친다. 다음 위치는 계산이 아니라 <code>getfield</code>로 읽혀 나온다.</dd>
+<dt>리스트의 불변식</dt><dd><code>first</code>와 <code>size</code>가 항상 실제 사슬과 일치해야 한다. 비어 있으면 <code>first</code>는 <code>null</code>, 노드 수를 바꾸는 모든 메서드가 <code>size</code>를 함께 고친다.</dd>
+<dt>삽입과 삭제의 참조 대입</dt><dd>삽입은 새 노드의 <code>next</code>를 먼저 걸고 앞 노드의 <code>next</code>를 바꾼다. 순서를 뒤집으면 뒤쪽 사슬을 잃고 자기 순환이 생긴다. 삭제는 앞 노드가 대상 노드를 건너뛰게 만든다.</dd>
+<dt>도달 가능성</dt><dd>객체의 회수 여부는 살아 있는 스레드에서 그 객체로 가는 경로가 있느냐로 정해진다(JLS 12.6.1). 떼어 낸 노드가 다른 노드를 가리키고 있어도 회수를 막지 못한다.</dd>
+<dt>비용의 분해</dt><dd>연결 리스트의 연산 비용은 "자리 찾기 O(n) + 고치기 O(1)", 배열 리스트는 "자리 찾기 O(1) + 옮기기 O(n)". 연결 리스트는 앞쪽이, 배열 리스트는 뒤쪽이 싸다.</dd>
+<dt>static 중첩 제네릭 노드</dt><dd><code>static</code> 중첩 클래스에서는 바깥 클래스의 타입 매개변수를 쓸 수 없으므로 <code>Node<E></code>가 자기 타입 매개변수를 갖는다. 소거 뒤에는 노드 클래스 하나와 <code>Object</code> 타입의 <code>item</code>만 남는다.</dd>
+<dt>노드의 메모리 비용</dt><dd>OpenJDK 21 HotSpot 기본 설정에서 노드 하나는 24바이트(헤더 12 + 참조 2개 + 패딩), 배열 칸 하나는 4바이트다.</dd>
+<dt>메모리 지역성</dt><dd>배열은 이웃 칸이 같은 캐시 라인에 올라오고 다음 위치를 미리 알 수 있다. 노드는 힙에 흩어질 수 있고 현재 노드를 읽어야 다음 위치를 알 수 있다(포인터 추적).</dd>
+</x-summary>
+
+<x-review>
+<p>실무 코드에서 연결 리스트를 직접 고르는 일은 드물다. 순서 있는 컬렉션의 기본값은 배열 기반 리스트이고, 양쪽 끝에서 넣고 빼는 큐가 필요할 때도 <code>ArrayDeque</code>의 API 문서는 이 클래스가 큐로 쓰일 때 <code>LinkedList</code>보다 빠를 가능성이 높다고 적고 있다. 연결 리스트가 맞는 자리는 좁다. 이미 노드를 쥐고 있는 상태에서 그 자리에 끼우거나 빼는 일이 연산의 대부분일 때다. 인덱스나 값으로 위치를 찾아야 한다면 찾는 비용이 고치는 비용을 덮는다.</p>
+<p>이 회차의 지식이 장애 분석에 쓰이는 대표적인 경우는 "데이터가 늘자 갑자기 느려진 반복문"이다. 매개변수 타입이 <code>List</code>인 메서드 안에서 <code>get(i)</code>로 도는 코드는 배열 기반 구현이 들어오면 O(n), 연결 리스트가 들어오면 O(n²)이다. 요소가 수백 개일 때는 차이가 보이지 않다가 수만 개가 되면 드러난다. 표준 라이브러리는 이 차이를 알리기 위해 <code>RandomAccess</code>라는 표지 인터페이스를 두었다. <code>ArrayList</code>는 이것을 구현하고 <code>LinkedList</code>는 구현하지 않는다. 구현을 모르는 리스트를 순회할 때는 인덱스가 아니라 반복자나 향상된 for 문을 쓰는 것이 안전한 기본값이다.</p>
+<p>메모리 쪽 판단도 달라진다. 요소 수가 큰 컬렉션의 힙 사용량을 어림할 때 요소 자체의 크기만 세면 틀린다. 노드 기반 구조는 요소마다 헤더가 붙은 객체가 하나씩 더 있고, 그만큼 가비지 컬렉터가 따라가야 할 객체 수도 늘어난다. 힙 덤프에서 <code>LinkedList$Node</code>나 <code>HashMap$Node</code>가 인스턴스 수 상위에 보인다면 그 수에 24바이트(또는 그 클래스의 인스턴스 크기)를 곱한 값이 순수한 뼈대 비용이다.</p>
+<p>그래도 이 구조를 직접 만들어 보는 일의 가치는 줄지 않는다. 해시 테이블의 버킷, 트리, 순회 순서를 유지하는 <code>LinkedHashMap</code>(항목 전체를 관통하는 이중 연결 리스트를 유지한다), 락의 대기 큐가 모두 "노드와 참조"로 만들어져 있다. 참조 대입의 순서를 따지고, 불변식을 적어 놓고 메서드마다 지키는지 확인하는 습관은 그 구조들의 소스를 읽을 때 그대로 쓰인다.</p>
+</x-review>
+
+<x-practice>
+<li>반복문 판 <code>toString()</code>을 가진 <code>Node</code>로 다음 코드를 실행한다. 세 줄의 출력을 예측하고, 마지막 시점의 메모리 그림을 그려라.<br><code>Node a = new Node("A"); Node b = new Node("B"); Node c = new Node("C");</code><br><code>a.next = b; b.next = c;</code><br><code>Node first = b; a.next = c.next; c.next = a;</code><br><code>System.out.println(first); System.out.println(a); System.out.println(c);</code></li>
+<li>어떤 개발자가 중간 삽입을 <code>prev.next = newNode; newNode.next = prev.next;</code> 순서로 작성했다. <code>[A->C]</code>에서 A 뒤에 B를 넣는 경우, 두 문장이 끝난 뒤 각 노드의 <code>next</code>가 무엇을 가리키는지 적고, 이 리스트에 <code>toString()</code>을 호출하면 어떤 일이 생기는지, C 노드는 어떻게 되는지 설명하라.</li>
+<li>이 회차의 <code>SingleLinkedList</code>(<code>last</code> 필드 없음)에 대해 다음 세 경우에 <code>x = x.next</code>가 실행되는 횟수를 각각 구하라. (가) 빈 리스트에 <code>add(e)</code>를 5번 호출한다. (나) 요소가 5개인 리스트에서 <code>for (int i = 0; i < 5; i++) list.get(i);</code>를 실행한다. (다) 요소가 5개인 리스트에서 <code>remove(4)</code>를 호출한다.</li>
+<li><code>remove(int index)</code>에서 <code>if (index == 0)</code> 분기를 빠뜨리고 항상 <code>getNode(index - 1)</code>부터 실행하도록 작성했다. 요소가 3개인 리스트에서 <code>remove(0)</code>을 호출하면 어떤 예외가 어떤 메시지로 발생하는가. 왜 <code>NullPointerException</code>이 아닌가.</li>
+<li>OpenJDK 21 HotSpot 기본 설정(압축 참조 사용)에서 요소 50만 개를 담는다. 단일 연결 리스트의 노드가 차지하는 총 바이트 수를 구하고, 내부 배열의 용량이 75만 칸인 배열 리스트의 배열 칸이 차지하는 바이트 수와 비교하라. 배열의 용량이 몇 칸이 되어야 둘이 같아지는가. (배열 헤더는 무시한다.)</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 출력은 차례로 <code>[B->C->A]</code>, <code>[A]</code>, <code>[C->A]</code>다. 처음 두 줄의 연결로 A→B→C가 된다. <code>first = b</code>는 변수 하나가 B를 가리키게 할 뿐 구조를 바꾸지 않는다. <code>a.next = c.next</code>에서 <code>c.next</code>는 <code>null</code>이므로 A의 <code>next</code>가 <code>null</code>이 되어 A→B 연결이 끊긴다. <code>c.next = a</code>로 C가 A를 가리킨다. 최종 구조는 B→C→A→null이다. <code>toString()</code>은 호출된 노드부터 끝까지를 출력하므로 A에서 시작하면 A 하나, C에서 시작하면 C와 A가 나온다. 변수 <code>a</code>, <code>b</code>, <code>c</code>, <code>first</code> 네 개가 노드 세 개를 가리키고 있다는 점(b와 first는 같은 노드)을 그림에 표시해야 한다.</p>
+<p><b>2번.</b> 첫 문장 뒤 A의 <code>next</code>는 B다. 둘째 문장의 오른쪽 <code>prev.next</code>는 이미 B이므로 B의 <code>next</code>가 B 자신이 된다. C의 <code>next</code>는 그대로 <code>null</code>이지만 C로 들어오는 참조가 없어졌다. <code>toString()</code>은 A를 덧붙인 뒤 B로 가고, 그 뒤로는 <code>x = x.next</code>가 계속 B를 돌려주므로 <code>x</code>가 <code>null</code>이 되지 않아 반복문이 끝나지 않고 버퍼만 계속 커진다. C 노드는 어떤 살아 있는 변수에서도 닿을 수 없으므로(다른 곳에서 따로 쥐고 있지 않다면) 가비지 컬렉션 대상이 된다. 올바른 순서는 <code>newNode.next = prev.next</code>가 먼저다.</p>
+<p><b>3번.</b> (가) k번째 호출에서 <code>getLastNode</code>는 k-2번 건너간다(첫 호출은 <code>first == null</code> 분기라 0번). 0 + 0 + 1 + 2 + 3 = 6번이고, 공식 (n-1)(n-2)/2에 n=5를 넣은 값과 같다. (나) <code>get(i)</code>는 i번 건너가므로 0 + 1 + 2 + 3 + 4 = 10번이다. (다) <code>remove(4)</code>는 <code>getNode(3)</code>을 부르므로 3번이다. 마지막 요소를 지우는데도 거의 끝까지 걸어가야 한다는 점이 단일 연결의 한계다.</p>
+<p><b>4번.</b> <code>getNode(-1)</code>이 호출되고, 그 첫 줄의 <code>Objects.checkIndex(-1, 3)</code>이 <code>IndexOutOfBoundsException: Index -1 out of bounds for length 3</code>을 던진다. 범위 검사가 노드를 건드리기 전에 실행되기 때문에 <code>NullPointerException</code>까지 가지 않는다. 다만 메시지가 호출자를 헷갈리게 한다. 호출자는 0을 넘겼는데 -1이 범위를 벗어났다고 나온다. 내부 구현의 사정이 예외 메시지로 새어 나간 것이다. 첫 노드에는 "앞 노드"가 없고 그 역할을 <code>first</code> 필드가 한다는 점을 코드에 반영해야 한다.</p>
+<p><b>5번.</b> 노드는 500,000 × 24 = 12,000,000바이트다. 배열 칸은 750,000 × 4 = 3,000,000바이트로, 여분 칸 25만 개를 포함하고도 노드 쪽의 4분의 1이다. 둘이 같아지려면 배열 칸이 12,000,000 ÷ 4 = 3,000,000칸, 곧 요소 수의 여섯 배가 되어야 한다. 여분 칸이 요소 수의 다섯 배를 넘어야 비로소 연결 리스트가 작아진다는 뜻이다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>노드를 따라가는 코드에서 <code>x = x.next;</code>와 <code>x.next = y;</code>의 차이를 가장 정확히 설명한 것은?</q>
+<o>둘 다 힙에 있는 노드의 필드를 바꾸며, 앞의 것은 현재 노드를, 뒤의 것은 다음 노드를 바꾼다.</o>
+<o>앞의 것은 지역 변수 x에 담긴 참조값만 바꾸고 힙의 노드는 그대로이며, 뒤의 것은 x가 가리키는 노드의 next 칸을 바꿔 구조를 고친다.</o>
+<o>앞의 것은 x가 가리키던 노드를 리스트에서 제거하고, 뒤의 것은 노드 y를 복사해 x 뒤에 붙인다.</o>
+<o>둘은 같은 동작이고 표기만 다르다.</o>
+<why>등호 왼쪽이 지역 변수이면 변수에 담긴 참조값이 바뀔 뿐이고, 왼쪽이 필드이면 힙에 있는 객체의 칸이 바뀐다. <code>x = x.next</code>는 바이트코드로 <code>getfield</code>로 읽고 <code>astore</code>로 지역 변수에 저장하는 것이어서 어떤 노드도 수정하지 않는다. 0번은 앞의 것이 필드를 바꾼다고 한 점이 틀렸고, 2번처럼 제거나 복사가 일어나지도 않는다. 대입은 참조값을 복사할 뿐 객체를 복사하지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>요소가 n개인 단일 연결 리스트(first만 보관)에서 <code>add(index, e)</code>의 시간 복잡도가 O(n)인 이유는?</q>
+<o>새 노드를 만드는 데 걸리는 시간이 리스트 크기에 비례하기 때문이다.</o>
+<o>삽입 위치 뒤의 노드들을 한 칸씩 뒤로 옮겨야 하기 때문이다.</o>
+<o>참조를 고치는 일은 대입 두 번이지만, 고칠 자리의 바로 앞 노드를 찾기 위해 first부터 index-1번 건너가야 하기 때문이다.</o>
+<o>size 필드를 다시 계산하려면 전체 노드를 세어야 하기 때문이다.</o>
+<why>연결 리스트의 삽입은 "자리 찾기"와 "고치기"로 나뉜다. 고치기는 O(1)이지만 i번째 노드의 위치를 계산할 수 없어 찾기에 O(n)이 든다. 1번은 배열 리스트가 O(n)인 이유이고 연결 리스트에서는 기존 노드가 움직이지 않는다. 노드 생성은 리스트 크기와 무관한 상수 시간이며, <code>size</code>는 1을 더할 뿐 다시 세지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>remove</code>가 <code>prev.next = removed.next;</code>만 실행하고 <code>removed.next</code>를 null로 바꾸지 않은 채 반환했다. 떼어 낸 노드를 다른 곳에서 참조하지 않는다면, 가비지 컬렉션 관점에서 옳은 설명은?</q>
+<o>떼어 낸 노드는 자신에게 들어오는 참조가 없으므로 회수 대상이 되고, 그 노드가 가리키던 다음 노드는 리스트를 통해 여전히 도달 가능하므로 살아 있다.</o>
+<o>떼어 낸 노드가 다음 노드를 가리키고 있으므로 두 노드 모두 회수되지 않는 메모리 누수가 생긴다.</o>
+<o>떼어 낸 노드가 회수될 때 그 노드가 가리키던 다음 노드도 함께 회수되어 리스트가 깨진다.</o>
+<o>next를 null로 바꾸지 않으면 JVM이 그 노드를 리스트의 일부로 간주하므로 회수하지 않는다.</o>
+<why>JLS 12.6.1의 도달 가능성은 살아 있는 스레드에서 그 객체로 갈 수 있느냐로 정해진다. 객체가 무엇을 가리키는지는 그 객체 자신의 생사에 영향을 주지 않으므로 1번과 3번은 틀렸다. 다음 노드는 앞 노드를 거쳐 여전히 도달 가능하므로 2번처럼 함께 회수되지도 않는다. 필드를 비우는 것은 누군가 떼어 낸 노드를 따로 쥐고 있을 때 딸린 객체가 붙잡히지 않게 하려는 방어다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>SingleLinkedList<E></code> 안에 <code>private static class Node { E item; Node next; }</code>라고 쓰면 컴파일 오류가 난다. 이유로 옳은 것은?</q>
+<o>중첩 클래스는 제네릭 타입의 필드를 가질 수 없기 때문이다.</o>
+<o>타입 소거 때문에 E가 실행 시점에 사라져 필드의 크기를 정할 수 없기 때문이다.</o>
+<o>private 클래스에서는 타입 매개변수를 쓸 수 없기 때문이다.</o>
+<o>E는 바깥 클래스의 인스턴스마다 정해지는 타입 변수인데, static 중첩 클래스는 바깥 인스턴스와 연결되어 있지 않아 그 E를 참조할 수 없기 때문이다.</o>
+<why>JLS 8.1.1.4는 <code>static</code> 중첩 클래스에서 바깥을 둘러싼 클래스의 타입 매개변수를 참조하는 것을 금지하고, 컴파일러는 "non-static type variable E cannot be referenced from a static context"라고 보고한다. 해결책은 <code>Node<E></code>처럼 노드가 자기 타입 매개변수를 선언하는 것이다. 중첩 클래스도 제네릭 필드를 가질 수 있고(0번), 접근 제어자와는 무관하며(2번), 소거 뒤에 필드는 <code>Object</code> 참조가 되어 크기가 문제 되지 않는다(1번).</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>같은 개수의 요소를 처음부터 끝까지 한 번 훑을 때, 배열 기반 리스트의 뼈대 순회가 연결 리스트의 노드 순회보다 CPU 캐시를 잘 활용하는 구조적 이유로 가장 적절한 것은?</q>
+<o>배열의 요소 객체는 항상 배열 안에 직접 저장되지만 연결 리스트는 참조만 저장하기 때문이다.</o>
+<o>배열의 참조 칸은 연속된 메모리에 있어 한 캐시 라인에 여러 칸이 함께 올라오고 다음 칸의 위치를 미리 계산할 수 있지만, 노드는 힙에 흩어질 수 있고 현재 노드를 읽어야만 다음 노드의 위치를 알 수 있기 때문이다.</o>
+<o>연결 리스트는 순회할 때마다 노드를 새로 할당하기 때문이다.</o>
+<o>JVM 명세가 배열 접근을 캐시에 올리도록 요구하기 때문이다.</o>
+<why>배열은 이웃 칸이 같은 캐시 라인에 있고 주소가 일정하게 증가하므로 프로세서가 앞서 읽어 둘 수 있다. 노드 순회는 다음 주소가 현재 노드의 <code>next</code> 칸 안에 들어 있어 읽기가 한 줄로 직렬화된다. 0번은 틀렸다. 객체 배열도 요소의 참조를 담을 뿐이다. 순회는 노드를 할당하지 않으며(2번), JVMS는 객체의 내부 구조나 캐시 동작을 규정하지 않는다(3번).</why>
+</x-quiz>
+
+<x-glossary>
+<dt>노드(node)</dt><dd>연결 자료 구조를 이루는 낱개의 객체. 값(또는 값의 참조)과 다른 노드를 가리키는 참조를 가진다.</dd>
+<dt>단일 연결 리스트(singly linked list)</dt><dd>각 노드가 다음 노드 하나만 가리키는 연결 리스트. 앞에서 뒤로만 따라갈 수 있다.</dd>
+<dt>이중 연결 리스트(doubly linked list)</dt><dd>각 노드가 다음 노드와 앞 노드를 모두 가리키는 연결 리스트. <code>java.util.LinkedList</code>가 이 구조다.</dd>
+<dt>불변식(invariant)</dt><dd>객체의 상태에 대해 모든 공개 메서드의 시작과 끝에서 항상 성립해야 하는 조건. 예: <code>size</code>는 실제 노드 수와 같다.</dd>
+<dt>도달 가능성(reachability)</dt><dd>살아 있는 스레드가 참조를 따라가 그 객체에 접근할 수 있는지 여부. 도달 불가능한 객체가 가비지 컬렉션 대상이다.</dd>
+<dt>객체 헤더(object header)</dt><dd>HotSpot이 모든 객체의 앞에 두는 관리 정보. 마크 워드와 클래스 워드로 이루어지며 JDK 21의 64비트 HotSpot에서 12~16바이트다.</dd>
+<dt>압축 참조(compressed oops)</dt><dd>64비트 HotSpot에서 객체 참조를 32비트로 저장하는 방식. 켜져 있으면 참조 필드 하나가 4바이트다.</dd>
+<dt>캐시 라인(cache line)</dt><dd>CPU 캐시가 메모리를 가져오고 보관하는 고정 크기 블록. 크기는 프로세서에 따라 다르다.</dd>
+<dt>메모리 지역성(locality of reference)</dt><dd>프로그램이 최근에 접근한 위치나 그 근처를 다시 접근하는 성질. 높을수록 캐시의 효과가 크다.</dd>
+<dt>포인터 추적(pointer chasing)</dt><dd>읽어 온 값에 들어 있는 참조를 따라 다음 위치를 읽는 접근 방식. 앞의 읽기가 끝나야 다음 주소를 알 수 있다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/LinkedList.html">Java SE 21 API — java.util.LinkedList</a> — 이중 연결 리스트 구현이라는 설명과, 인덱스 접근이 가까운 쪽 끝에서 시작한다는 서술</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-12.html#jls-12.6.1">JLS §12.6.1 Implementing Finalization</a> — 도달 가능한 객체(reachable object)의 정의</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html#jls-8.1.3">JLS §8.1.3 Inner Classes and Enclosing Instances</a> — 내부 클래스의 정의, 바깥 인스턴스, 정적 문맥의 정의. <code>static</code> 중첩 클래스의 타입 매개변수 참조 금지는 같은 장의 §8.1.1.4</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-6.html#jvms-6.5.getfield">JVMS §6.5 getfield, aaload</a> — 필드 읽기와 배열 원소 읽기 명령의 동작과 NullPointerException 조건</li>
+<li><a href="https://openjdk.org/jeps/450">JEP 450: Compact Object Headers (Experimental)</a> — 64비트 HotSpot 객체 헤더의 구성과 크기(96~128비트)</li>
+<li><a href="https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html">OpenJDK HotSpot Glossary of Terms</a> — mark word, klass pointer, TLAB의 정의</li>
+</x-refs>

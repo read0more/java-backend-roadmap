@@ -1,0 +1,1070 @@
+<x-meta>
+deck: 잠든 스레드를 밖에서 깨워 멈추게 하는 인터럽트와 CPU를 내려놓는 yield를, 인터럽트 상태 비트와 HotSpot의 대기 이벤트, 운영체제의 실행 대기열까지 내려가 확인하고 프린터 예제로 적용한다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>공유 플래그만으로 스레드를 멈추면 왜 응답이 늦는지를 "잠든 스레드는 아무 코드도 실행하지 않는다"는 사실로 설명하고, 인터럽트가 그 틈을 어떻게 메우는지 실행 결과로 보여 줄 수 있다.</li>
+<li><code>interrupt()</code>, <code>isInterrupted()</code>, <code>Thread.interrupted()</code>가 인터럽트 상태를 각각 어떻게 바꾸는지, 그리고 <code>InterruptedException</code>이 던져질 때 상태가 지워진다는 사실을 코드 한 줄 단위로 추적할 수 있다.</li>
+<li>OpenJDK 21에서 <code>interrupt()</code> 호출이 <code>JVM_Interrupt</code>와 <code>JavaThread::interrupt()</code>를 거쳐 잠든 스레드의 대기 이벤트를 깨우는 경로를 그림으로 그릴 수 있다.</li>
+<li><code>InterruptedException</code>을 잡았을 때 다시 던지거나 상태를 복원해야 하는 이유를 설명하고, 인터럽트를 삼키는 코드의 결함을 찾아낼 수 있다.</li>
+<li><code>Thread.yield()</code>가 자바 스레드 상태와 운영체제 실행 대기열에서 무엇을 바꾸는지 설명하고, 바쁜 대기 루프에서 <code>yield</code>, <code>sleep</code>, <code>onSpinWait</code>의 차이와 한계를 판단할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 다른 스레드에게 "그만"이라고 말하는 방법</h3>
+<p>앞 회차에서 스레드의 생명 주기를 다뤘다. 스레드는 <code>NEW</code>로 태어나 <code>start()</code> 이후 <code>RUNNABLE</code>이 되고, 락을 기다리면 <code>BLOCKED</code>, 기한 없이 기다리면 <code>WAITING</code>, 기한을 두고 기다리면 <code>TIMED_WAITING</code>이 되며, <code>run()</code>이 끝나면 <code>TERMINATED</code>가 된다. 그리고 <code>join()</code>으로 다른 스레드가 끝나기를 기다리는 방법을 봤다. <code>join()</code>은 "네가 끝날 때까지 내가 기다리겠다"는 방향의 제어다.</p>
+<p>이번 회차는 반대 방향을 다룬다. "네가 하던 일을 그만두라"고 알리는 방법, 그리고 "지금은 내가 CPU를 쓰지 않아도 되니 다른 스레드에게 넘기겠다"고 알리는 방법이다. 앞의 것이 인터럽트(interrupt), 뒤의 것이 양보(yield)다. 둘 다 메서드 하나로 끝나는 API처럼 보이지만, 정확히 이해하려면 스레드가 "잠들어 있다"는 것이 운영체제와 JVM 안에서 무슨 상태인지까지 내려가야 한다.</p>
+<p>상황을 하나 정하자. 백그라운드 스레드가 3초마다 어떤 작업을 반복한다. 사용자가 취소 버튼을 눌렀고, main 스레드는 이 백그라운드 스레드를 멈추고 싶다. 가장 먼저 떠오르는 것은 <code>Thread</code> 클래스에 있는 <code>stop()</code> 메서드다. 그런데 Java 21에서 이 메서드를 부르면 아무 스레드도 멈추지 않고 <code>UnsupportedOperationException</code>이 던져진다. OpenJDK 21 소스의 본문은 <code>throw new UnsupportedOperationException();</code> 한 줄이고, <code>@Deprecated(since="1.2", forRemoval=true)</code>가 붙어 있다. 1.2 때부터 쓰지 말라고 했고, 지금은 아예 동작하지 않는다.</p>
+<p>이유는 Javadoc의 폐기 설명에 적혀 있다. 원래의 <code>stop()</code>은 대상 스레드에 <code>ThreadDeath</code>를 던지게 했고, 그 예외가 스택을 거슬러 올라가며 그 스레드가 잡고 있던 모든 모니터 락을 풀었다. 문제는 락이 보호하던 객체가 수정 도중이었을 수 있다는 점이다. 계좌 A에서 돈을 빼고 계좌 B에 넣는 두 줄짜리 <code>synchronized</code> 블록을 생각해 보자. 첫 줄과 둘째 줄 사이에서 스레드가 강제로 멈추면 락은 풀리지만 돈은 A에서 빠지기만 하고 B에 들어가지 않은 상태가 다른 스레드에게 그대로 보인다. 밖에서 스레드를 강제로 끊으면, 끊긴 지점이 어디인지 아무도 고를 수 없다.</p>
+<p>그래서 자바의 스레드 종료는 <b>협조적(cooperative)</b>이다. 멈추라는 요청은 밖에서 보내지만, 실제로 멈추는 것은 대상 스레드 자신이다. 대상 스레드는 자기 코드에서 "멈춰도 안전한 지점"을 골라 요청을 확인하고, 정리할 것을 정리한 뒤 <code>run()</code>에서 정상적으로 빠져나온다. 이 회차의 절반은 이 요청을 어떻게 전달하고 어떻게 확인하는지에 관한 이야기다.</p>
+
+<h3>첫 번째 시도: 공유 플래그로 멈추기</h3>
+<p>요청을 전달하는 가장 단순한 방법은 두 스레드가 함께 보는 변수 하나를 두는 것이다. 작업 스레드는 반복할 때마다 그 변수를 확인하고, main 스레드는 멈추고 싶을 때 그 값을 바꾼다. 예제마다 시각과 스레드 이름을 찍기 위해 아래의 작은 로그 클래스를 같은 디렉터리에 두고 <code>javac *.java</code>로 함께 컴파일한다고 하자.</p>
+<pre><code class="language-java">import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+
+public final class Log {
+    private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
+
+    public static void log(Object message) {
+        String now = LocalTime.now().format(TIME);
+        String name = Thread.currentThread().getName();
+        System.out.printf("%s [%7s] %s%n", now, name, message);
+    }
+}</code></pre>
+<pre><code class="language-java">public class FlagStop {
+    static volatile boolean running = true;
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            while (running) {
+                Log.log("작업 중");
+                try {
+                    Thread.sleep(3000);
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+            Log.log("자원 정리 후 종료");
+        }, "worker");
+        worker.start();
+
+        Thread.sleep(4000);
+        Log.log("running = false");
+        running = false;
+        worker.join();
+        Log.log("main 종료");
+    }
+}</code></pre>
+<pre data-label="실행 결과 (시각은 실행마다 다르다)"><code class="language-text">01:45:27.700 [ worker] 작업 중
+01:45:30.712 [ worker] 작업 중
+01:45:31.695 [   main] running = false
+01:45:33.724 [ worker] 자원 정리 후 종료
+01:45:33.725 [   main] main 종료</code></pre>
+<p>시간 순서대로 따라가 보자. 0초에 worker가 "작업 중"을 찍고 3초 동안 잔다. 3초에 깨어나 <code>running</code>을 확인하고(아직 <code>true</code>) 다시 "작업 중"을 찍고 잔다. 이번 잠은 6초까지다. 4초에 main이 <code>running</code>을 <code>false</code>로 바꾼다. 그런데 worker는 그 시각에 자고 있으므로 아무것도 확인하지 못한다. 6초에 깨어나 <code>while</code> 조건으로 돌아와서야 <code>false</code>를 보고 루프를 빠져나온다. 멈추라고 한 시각(31.695)과 실제로 멈춘 시각(33.724) 사이에 2초가 비어 있다.</p>
+<p>이 2초의 원인은 단순하다. <b>잠든 스레드는 어떤 코드도 실행하지 않는다.</b> 플래그를 확인하는 것도 코드이므로, 확인은 스레드가 깨어 있을 때만 일어난다. 잠자는 시간이 3초면 최악의 응답 지연이 3초이고, 1시간 기다리는 작업이었다면 1시간이다. 사용자 입력이나 네트워크 응답처럼 언제 끝날지 모르는 대기라면 영원히 응답하지 않을 수도 있다. 플래그 방식은 "확인할 기회"를 대상 스레드의 일정에 맡긴다는 근본적인 한계가 있다.</p>
+<p>코드에 <code>volatile</code>이 붙은 이유도 짚고 가자. 자세한 원리는 다음 회차(메모리 가시성)의 몫이지만, 이 자리에서 꼭 알아야 할 사실이 하나 있다. 자바 언어 명세 JLS §17.3은 <code>Thread.sleep</code>과 <code>Thread.yield</code>에 <b>동기화 의미가 전혀 없다</b>고 못 박는다. 컴파일러는 <code>sleep</code> 호출 전에 레지스터에 캐시한 쓰기를 공유 메모리로 내보낼 의무도, 호출 뒤에 값을 다시 읽어 올 의무도 없다. 명세는 <code>volatile</code>이 아닌 <code>done</code> 필드로 <code>while (!this.done) Thread.sleep(1000);</code>을 도는 코드를 "깨진(broken)" 예로 들고, 컴파일러가 필드를 한 번만 읽고 그 값을 계속 재사용해 루프가 끝나지 않을 수 있다고 설명한다. "자고 일어나면 새 값을 보겠지"라는 기대는 명세가 보장하지 않는다.</p>
+
+<x-visual id="java-adv1-04-flag-vs-interrupt" title="플래그 방식과 인터럽트 방식의 종료 타임라인 비교" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>플래그만 쓰면 worker가 잠에서 깰 때까지 종료 요청이 묵히고, 인터럽트를 쓰면 잠이 즉시 끊긴다는 것을 두 타임라인으로 나란히 보여 준다.</x-hint>
+<x-prompt>위아래 두 개의 가로 타임라인. 가로축은 0초에서 7초까지 눈금. 위쪽 타임라인 제목 "플래그 방식": main 레인과 worker 레인 두 줄. worker 레인에는 0~3초, 3~6초 구간에 회색 막대 "sleep(3000)". main 레인 4초 지점에서 worker 레인 쪽으로 점선 화살표 "running = false", 화살표 끝은 회색 막대 위에서 멈춤. 6초 지점 worker 레인에 빨간 점 "종료". 4초와 6초 사이에 중괄호 "응답 지연 2초". 아래쪽 타임라인 제목 "인터럽트 방식": 같은 구조인데 worker의 두 번째 회색 막대가 4초에서 잘림. main 레인 4초에서 worker로 실선 화살표 "interrupt()", 화살표가 회색 막대를 끊는 번개 모양. 4초 지점 worker 레인에 초록 점 "InterruptedException → 종료". 단순한 플랫 스타일, 흰 배경.</x-prompt>
+<x-caption>플래그는 대상 스레드가 깨어 있을 때만 읽힌다. 인터럽트는 잠 자체를 끊는다.</x-caption>
+</x-visual>
+
+<h3>인터럽트: 상태 하나와 깨우기</h3>
+<p>인터럽트는 "다른 스레드의 잠을 밖에서 끊을 수 있는 공유 플래그"라고 이해하면 출발점으로 충분하다. <code>t.interrupt()</code>를 호출하면 두 가지가 일어난다. 첫째, 스레드 <code>t</code>의 <b>인터럽트 상태(interrupt status)</b>라는 불리언 값이 <code>true</code>가 된다. 둘째, <code>t</code>가 특정한 대기 메서드 안에서 멈춰 있다면 그 대기가 끊긴다. JLS §17.2.3은 인터럽트를 이렇게 정의한다. 스레드 t가 <code>u.interrupt()</code>를 호출하면 u의 인터럽트 상태가 <code>true</code>가 되고, u가 어떤 객체의 대기 집합(wait set)에 들어 있다면 거기서 빠져나오고, 그 객체의 모니터를 다시 잡은 뒤 <code>InterruptedException</code>을 던지며 <code>wait</code>에서 돌아온다. 대기 집합과 <code>wait</code>는 생산자-소비자 회차에서 자세히 다룬다.</p>
+<p>이름 때문에 생기는 오해부터 정리하자. 자바의 인터럽트는 CPU의 하드웨어 인터럽트나 운영체제의 시그널과 관계가 없다. 대상 스레드의 실행을 그 자리에서 가로채 다른 코드를 실행시키는 장치가 아니다. 자바 인터럽트는 자바 객체(<code>Thread</code>)에 기록되는 요청이고, 그 요청에 반응하는 것은 대상 스레드가 실행하는 코드다.</p>
+<p>어떤 대기가 끊기는지는 <code>Thread.interrupt()</code>의 Javadoc이 경우를 나눠 적어 두었다.</p>
+<div class="table-wrap"><table><thead><tr><th>대상 스레드가 있는 곳</th><th>인터럽트 상태</th><th>대상 스레드가 겪는 일</th></tr></thead><tbody>
+<tr><td><code>Object.wait()</code>, <code>Thread.join()</code>(시간 인자가 있는 형태 포함), <code>Thread.sleep(long)</code>, <code>Thread.sleep(long, int)</code></td><td>지워진다(<code>false</code>)</td><td><code>InterruptedException</code>을 받고 대기에서 빠져나온다</td></tr>
+<tr><td><code>InterruptibleChannel</code>에 대한 I/O</td><td>설정된다(<code>true</code>)</td><td>채널이 닫히고 <code>ClosedByInterruptException</code>을 받는다</td></tr>
+<tr><td><code>Selector</code>의 선택 연산</td><td>설정된다(<code>true</code>)</td><td><code>wakeup()</code>을 부른 것처럼 즉시 돌아온다</td></tr>
+<tr><td>위 어느 것도 아닌 경우</td><td>설정된다(<code>true</code>)</td><td>아무 일도 일어나지 않는다. 상태만 남는다</td></tr>
+</tbody></table></div>
+<p>첫 줄이 이 회차의 핵심이다. <code>sleep</code>, <code>join</code>, <code>wait</code>처럼 <code>throws InterruptedException</code>이 선언된 메서드에서 자고 있던 스레드는 인터럽트를 받으면 즉시 깨어나 예외를 던진다. 그리고 그 순간 인터럽트 상태는 다시 <code>false</code>로 지워진다. 직접 확인해 보자.</p>
+<pre><code class="language-java">public class InterruptSleep {
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            try {
+                while (true) {
+                    Log.log("작업 중");
+                    Thread.sleep(3000);
+                }
+            } catch (InterruptedException e) {
+                Thread me = Thread.currentThread();
+                Log.log("예외 메시지 = " + e.getMessage());
+                Log.log("isInterrupted = " + me.isInterrupted());
+                Log.log("state = " + me.getState());
+            }
+            Log.log("자원 정리 후 종료");
+        }, "worker");
+        worker.start();
+
+        Thread.sleep(4000);
+        Log.log("interrupt 전 worker 상태 = " + worker.getState());
+        worker.interrupt();
+        worker.join();
+        Log.log("main 종료");
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21.0.13, 시각은 실행마다 다르다)"><code class="language-text">01:45:36.723 [ worker] 작업 중
+01:45:39.732 [ worker] 작업 중
+01:45:40.723 [   main] interrupt 전 worker 상태 = TIMED_WAITING
+01:45:40.724 [ worker] 예외 메시지 = sleep interrupted
+01:45:40.733 [ worker] isInterrupted = false
+01:45:40.733 [ worker] state = RUNNABLE
+01:45:40.734 [ worker] 자원 정리 후 종료
+01:45:40.734 [   main] main 종료</code></pre>
+<p>한 줄씩 읽어 보자. 4초 시점에 worker는 두 번째 <code>sleep(3000)</code> 안에 있고, 상태는 <code>TIMED_WAITING</code>이다. <code>Thread.State</code>의 Javadoc은 <code>TIMED_WAITING</code>이 되는 경우로 시간 인자를 준 <code>Thread.sleep</code>, <code>Object.wait</code>, <code>Thread.join</code>, <code>LockSupport.parkNanos</code>, <code>LockSupport.parkUntil</code>을 든다. main이 <code>interrupt()</code>를 호출하자 1밀리초 만에 worker가 catch 블록에 들어왔다. 플래그 방식에서 2초를 기다려야 했던 것과 비교하면 차이는 분명하다. 예외 메시지 <code>sleep interrupted</code>는 HotSpot이 예외를 만들 때 넣는 문자열이다(아래에서 소스로 확인한다).</p>
+<p>catch 블록에서 본 두 값이 중요하다. <code>isInterrupted()</code>가 <code>false</code>다. 방금 인터럽트를 받았는데 상태가 꺼져 있는 것은 Javadoc 그대로 "예외를 던질 때 인터럽트 상태를 지웠기" 때문이다. 인터럽트 요청은 예외라는 형태로 한 번 전달되었고, 상태 비트는 소비되었다. 또 하나, catch 블록 안에서 본 자기 상태는 <code>RUNNABLE</code>이다. catch 블록의 코드를 실행하려면 스레드는 CPU 위에 있어야 하므로 당연하다. 상태 전이로 쓰면 다음과 같다.</p>
+<pre class="diagram">  RUNNABLE ──sleep(3000)──▶ TIMED_WAITING
+                                │
+                 다른 스레드가 interrupt() 호출
+                                │
+                                ▼
+  RUNNABLE ◀── 대기 종료 + 인터럽트 상태 false로 지움
+     │         + InterruptedException 발생
+     │
+  catch 블록 실행 → run() 정상 종료 → TERMINATED</pre>
+<p>예외라는 형태를 택한 것에도 실익이 있다. <code>sleep</code>은 반환형이 <code>void</code>이고, 정상적으로 시간을 다 채운 경우와 중간에 끊긴 경우를 구분해 알려 줄 방법이 필요하다. 체크 예외로 만들어 두면 <code>sleep</code>을 부르는 모든 코드는 컴파일 단계에서 "끊기면 어떻게 할지"를 정하도록 강제된다. 앞 회차에서 본 대로 <code>Runnable.run()</code>은 체크 예외를 밖으로 던질 수 없으므로, <code>run()</code> 안에서 <code>sleep</code>을 부르면 반드시 그 자리에서 잡아야 한다. 그 catch 블록이 바로 "멈추라는 요청을 받았을 때의 정리 코드"가 들어갈 자리가 된다.</p>
+
+<h3>깨어 있는 스레드에 인터럽트를 걸면: isInterrupted()와 Thread.interrupted()</h3>
+<p>표의 마지막 줄, 대상 스레드가 대기 중이 아닐 때는 어떤가. 이때 인터럽트는 상태만 <code>true</code>로 바꾸고 아무것도 하지 않는다. 대상 스레드가 계산을 하고 있다면 계산은 그대로 이어진다. 그러니 계산 위주의 루프가 인터럽트에 반응하려면 스스로 상태를 확인해야 한다. 인스턴스 메서드 <code>isInterrupted()</code>가 그 용도다.</p>
+<pre><code class="language-java">public class InterruptRunning {
+    public static void main(String[] args) throws InterruptedException {
+        Thread worker = new Thread(() -> {
+            long count = 0;
+            while (!Thread.currentThread().isInterrupted()) {
+                count++; // sleep 없이 계속 계산만 한다
+            }
+            Log.log("루프 탈출, count > 0 = " + (count > 0));
+            Log.log("isInterrupted = " + Thread.currentThread().isInterrupted());
+            try {
+                Log.log("자원 정리 시작 (1초 걸림)");
+                Thread.sleep(1000);
+                Log.log("자원 정리 완료");
+            } catch (InterruptedException e) {
+                Log.log("자원 정리 실패: " + e.getMessage());
+                Log.log("isInterrupted = " + Thread.currentThread().isInterrupted());
+            }
+        }, "worker");
+        worker.start();
+
+        Thread.sleep(100);
+        Log.log("interrupt 전 worker 상태 = " + worker.getState());
+        worker.interrupt();
+        worker.join();
+        Log.log("main 종료");
+    }
+}</code></pre>
+<pre data-label="실행 결과 (시각은 실행마다 다르다)"><code class="language-text">01:45:40.919 [   main] interrupt 전 worker 상태 = RUNNABLE
+01:45:40.923 [ worker] 루프 탈출, count > 0 = true
+01:45:40.923 [ worker] isInterrupted = true
+01:45:40.923 [ worker] 자원 정리 시작 (1초 걸림)
+01:45:40.923 [ worker] 자원 정리 실패: sleep interrupted
+01:45:40.924 [ worker] isInterrupted = false
+01:45:40.924 [   main] main 종료</code></pre>
+<p>worker는 잠들지 않고 계속 계산하므로 <code>interrupt()</code> 직전 상태가 <code>RUNNABLE</code>이다. 인터럽트는 계산을 끊지 않았다. 루프가 끝난 것은 worker가 다음 반복에서 <code>isInterrupted()</code>를 보고 스스로 빠져나왔기 때문이다. 여기까지는 의도대로다.</p>
+<p>문제는 그다음이다. 루프를 빠져나온 뒤에도 인터럽트 상태는 여전히 <code>true</code>다. <code>isInterrupted()</code>는 상태를 읽기만 하고 바꾸지 않기 때문이다. 그 상태로 정리 작업에서 <code>sleep(1000)</code>을 부르자, 1초를 기다리기는커녕 들어가자마자 <code>InterruptedException</code>이 터졌다. 시각을 보면 정리 시작과 실패가 같은 밀리초다. <code>sleep</code>은 잠들기 전에 먼저 인터럽트 상태를 확인하고, 이미 <code>true</code>면 즉시 예외를 던진다. 멈추라는 요청은 이미 루프 탈출로 처리했는데, 꺼지지 않은 상태 비트가 그다음 대기까지 망쳐 놓은 것이다.</p>
+<p>이때 필요한 것이 정적 메서드 <code>Thread.interrupted()</code>다. Javadoc의 설명은 이렇다. 현재 스레드가 인터럽트되었는지 검사하고, <b>그 상태를 지운다.</b> 그래서 연속으로 두 번 부르면 두 번째는 (그 사이에 다시 인터럽트되지 않았다면) <code>false</code>를 돌려준다. 위 예제의 루프 조건만 <code>while (!Thread.interrupted())</code>로 바꾸면 결과가 달라진다.</p>
+<pre data-label="루프 조건을 Thread.interrupted()로 바꾼 실행 결과"><code class="language-text">01:45:41.095 [   main] interrupt 전 worker 상태 = RUNNABLE
+01:45:41.099 [ worker] 루프 탈출, count > 0 = true
+01:45:41.099 [ worker] isInterrupted = false
+01:45:41.100 [ worker] 자원 정리 시작 (1초 걸림)
+01:45:42.101 [ worker] 자원 정리 완료
+01:45:42.102 [   main] main 종료</code></pre>
+<p>루프 조건이 <code>true</code>를 돌려주는 바로 그 호출에서 상태가 지워졌으므로, 정리 작업의 <code>sleep(1000)</code>은 1초를 온전히 잔다. 두 메서드를 정리하면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th></th><th><code>t.isInterrupted()</code></th><th><code>Thread.interrupted()</code></th></tr></thead><tbody>
+<tr><td>종류</td><td>인스턴스 메서드</td><td>정적 메서드</td></tr>
+<tr><td>검사 대상</td><td>참조 <code>t</code>가 가리키는 스레드</td><td>이 코드를 실행하는 현재 스레드</td></tr>
+<tr><td>상태 변경</td><td>없음</td><td><code>true</code>를 읽었으면 <code>false</code>로 지움</td></tr>
+<tr><td>쓰임</td><td>다른 스레드의 상태 관찰, 상태를 남겨 두고 싶을 때</td><td>요청을 "처리했다"고 소비할 때</td></tr>
+</tbody></table></div>
+<p>OpenJDK 21 소스를 보면 두 메서드의 차이가 그대로 드러난다. 인터럽트 상태는 <code>Thread</code> 객체의 필드 <code>volatile boolean interrupted</code>이고, 소스의 주석은 이 필드를 "VM이 읽고 쓴다(read/written by VM)"고 적어 두었다. <code>isInterrupted()</code>는 <code>return interrupted;</code> 한 줄이다. <code>Thread.interrupted()</code>는 <code>currentThread().getAndClearInterrupt()</code>를 부른다.</p>
+<pre><code class="language-java">// OpenJDK 21 java.lang.Thread (발췌)
+boolean getAndClearInterrupt() {
+    boolean oldValue = interrupted;
+    // We may have been interrupted the moment after we read the field,
+    // so only clear the field if we saw that it was set and will return
+    // true; otherwise we could lose an interrupt.
+    if (oldValue) {
+        interrupted = false;
+        clearInterruptEvent();
+    }
+    return oldValue;
+}</code></pre>
+<p>주석이 짚는 경합을 따라가 보자. 만약 이 메서드가 "읽고 나서 무조건 <code>false</code>를 쓴다"면, 현재 스레드가 <code>false</code>를 읽은 직후 다른 스레드가 <code>interrupt()</code>로 <code>true</code>를 쓰고, 이어서 현재 스레드가 <code>false</code>를 덮어쓰는 순서가 가능하다. 그러면 호출자는 <code>false</code>를 받았는데 상태도 <code>false</code>가 되어, 방금 들어온 인터럽트가 흔적 없이 사라진다. <code>true</code>를 읽었을 때만 지우면, 지운 사실을 반환값 <code>true</code>로 호출자에게 반드시 알려 주므로 요청이 사라지지 않는다. 락 없이 상태 하나를 여러 스레드가 다룰 때 어떤 순서까지 고려해야 하는지 보여 주는 작은 예다. 이런 종류의 추론은 CAS 회차에서 본격적으로 다시 나온다.</p>
+<p>정적 메서드라는 점에서 생기는 함정도 하나 있다. 자바는 정적 메서드를 인스턴스 참조로 호출하는 것을 허용한다. 그래서 <code>target.interrupted()</code>라고 써도 컴파일되는데, 이것은 <code>target</code>을 검사하지 않고 <b>지금 이 코드를 실행하는 스레드</b>를 검사하고 지운다.</p>
+<pre><code class="language-java">public class StaticCall {
+    public static void main(String[] args) throws InterruptedException {
+        Thread target = new Thread(() -> {
+            try {
+                Thread.sleep(10_000);
+            } catch (InterruptedException e) {
+                // 일부러 비워 둔다
+            }
+        }, "target");
+        target.setDaemon(true);
+        target.start();
+        Thread.sleep(100);
+
+        Thread.currentThread().interrupt(); // main 자신에게 인터럽트
+        System.out.println("target.interrupted() = " + target.interrupted());
+        System.out.println("target.isInterrupted() = " + target.isInterrupted());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">target.interrupted() = true
+target.isInterrupted() = false</code></pre>
+<p>인터럽트된 것은 main인데 <code>target.interrupted()</code>가 <code>true</code>를 돌려줬다. 반환값은 main의 상태였다. <code>javac -Xlint:all</code>로 컴파일하면 "static method should be qualified by type name, Thread, instead of by an expression"이라는 경고가 나온다. 정적 메서드는 언제나 타입 이름으로 부르는 습관이 이런 실수를 막는다.</p>
+
+<h3>한 층 아래: HotSpot에서 interrupt()가 잠든 스레드를 깨우는 길</h3>
+<p>"상태를 <code>true</code>로 바꾸고 잠을 끊는다"는 설명에서 뒤쪽 절반이 어떻게 일어나는지 OpenJDK 21의 HotSpot 소스로 따라가 보자. 여기서부터는 명세가 아니라 구현이다. JLS와 Javadoc이 보장하는 것은 앞 절까지의 동작이고, 아래의 함수 이름과 구조는 OpenJDK 21(jdk21u) HotSpot의 선택이다.</p>
+<h4>자바 쪽: 필드를 쓰고 VM에 알린다</h4>
+<pre><code class="language-java">// OpenJDK 21 java.lang.Thread (발췌, 권한 검사 생략)
+public void interrupt() {
+    // ...
+    // Setting the interrupt status must be done before reading nioBlocker.
+    interrupted = true;
+    interrupt0();  // inform VM of interrupt
+
+    // thread may be blocked in an I/O operation
+    if (this != Thread.currentThread()) {
+        synchronized (interruptLock) {
+            Interruptible b = nioBlocker;
+            if (b != null) {
+                b.interrupt(this);
+            }
+        }
+    }
+}</code></pre>
+<p>세 단계다. 필드 <code>interrupted</code>에 <code>true</code>를 쓰고, 네이티브 메서드 <code>interrupt0()</code>로 VM에 알리고, 대상이 NIO 채널 I/O 중이면 그 채널 쪽 처리(<code>nioBlocker</code>)를 부른다. 마지막 부분이 Javadoc 표의 <code>InterruptibleChannel</code> 줄을 구현한다. 자바 코드에는 "잠을 깨우는" 코드가 없다. 그 일은 <code>interrupt0()</code> 너머에서 일어난다.</p>
+<h4>네이티브 연결: interrupt0 → JVM_Interrupt → JavaThread::interrupt</h4>
+<p>JDK의 <code>Thread.c</code>는 <code>Thread</code>의 네이티브 메서드를 VM 함수에 연결하는 표를 갖고 있다. 이 회차에 나오는 세 메서드는 <code>interrupt0</code> → <code>JVM_Interrupt</code>, <code>sleep0</code> → <code>JVM_Sleep</code>, <code>yield0</code> → <code>JVM_Yield</code>로 연결된다. <code>JVM_Interrupt</code>는 대상 자바 스레드가 아직 살아 있는지(VM 내부의 <code>JavaThread</code>가 있는지) 확인하고, 살아 있으면 <code>JavaThread::interrupt()</code>를 부른다. 그 본문이 핵심이다.</p>
+<pre><code class="language-text">// OpenJDK 21 src/hotspot/share/runtime/javaThread.cpp (발췌)
+void JavaThread::interrupt() {
+  // For Windows _interrupt_event
+  WINDOWS_ONLY(osthread()->set_interrupted(true);)
+
+  // For Thread.sleep
+  _SleepEvent->unpark();
+
+  // For JSR166 LockSupport.park
+  parker()->unpark();
+
+  // For ObjectMonitor and JvmtiRawMonitor
+  _ParkEvent->unpark();
+}</code></pre>
+<p>HotSpot의 자바 스레드 하나는 잠들 때 쓰는 "이벤트" 객체를 용도별로 갖고 있다. <code>Thread.sleep</code>은 <code>_SleepEvent</code>에서, <code>LockSupport.park</code>(뒤에서 볼 <code>ReentrantLock</code>과 동시성 라이브러리의 기반)는 <code>parker()</code>에서, <code>Object.wait</code>와 모니터 대기는 <code>_ParkEvent</code>에서 잔다. <code>interrupt()</code>는 대상이 지금 어느 것에서 자고 있는지 묻지 않고 <b>세 이벤트를 모두 깨운다.</b> 그 순간 자고 있지 않던 이벤트는 "신호가 와 있는" 상태로 남는다. 같은 파일의 <code>is_interrupted()</code> 주석은 이 때문에 <code>Object.wait()</code>와 <code>LockSupport.park()</code>가 드물게 가짜로 깨어나는(spurious wakeup) 일이 생길 수 있지만 그것은 허용된 동작이고 해롭지 않으며, <code>sleep</code> 쪽 이벤트는 잠들기 전에 명시적으로 초기화하므로 일찍 돌아오는 일이 없다고 적는다. <code>wait()</code>가 가짜로 깨어날 수 있다는 사실은 생산자-소비자 회차에서 "<code>wait()</code>는 반드시 조건을 다시 확인하는 루프 안에서 부른다"는 규칙의 근거로 다시 나온다.</p>
+<p>이벤트가 운영체제 수준에서 무엇인지도 확인해 두자. 리눅스와 macOS 같은 POSIX 계열에서 HotSpot의 이벤트(<code>PlatformEvent</code>, <code>os_posix.cpp</code>)는 pthread 뮤텍스와 조건 변수로 구현되어 있다. 시간을 정해 잠드는 <code>park_nanos</code>는 <code>pthread_cond_timedwait</code>를, 깨우는 <code>unpark</code>는 <code>pthread_cond_signal</code>을 부른다. 즉 자바 스레드가 <code>sleep</code> 중이라는 것은, 그 아래의 OS 스레드가 조건 변수에서 기다리느라 운영체제 스케줄러의 실행 후보에서 빠져 있다는 뜻이다. CPU를 전혀 쓰지 않는다. <code>interrupt()</code>는 그 조건 변수에 신호를 보내 OS 스레드를 실행 후보로 돌려놓는 일이다.</p>
+<h4>잠드는 쪽: JVM_Sleep과 sleep_nanos</h4>
+<pre><code class="language-text">// OpenJDK 21 src/hotspot/share/prims/jvm.cpp, JVM_Sleep (발췌)
+if (thread->is_interrupted(true) && !HAS_PENDING_EXCEPTION) {
+  THROW_MSG(vmSymbols::java_lang_InterruptedException(), "sleep interrupted");
+}
+JavaThreadSleepState jtss(thread);   // 스레드 상태를 SLEEPING으로
+if (nanos == 0) {
+  os::naked_yield();
+} else {
+  // ...
+  if (!thread->sleep_nanos(nanos)) { // interrupted
+    if (!HAS_PENDING_EXCEPTION) {
+      THROW_MSG(vmSymbols::java_lang_InterruptedException(), "sleep interrupted");
+    }
+  }
+  // ...
+}</code></pre>
+<p>앞의 실행 결과에서 본 사실 세 가지가 여기서 설명된다. 첫째, 잠들기 전에 <code>is_interrupted(true)</code>로 상태를 확인하고 이미 <code>true</code>면 곧장 예외를 던진다. 인수 <code>true</code>는 "읽으면서 지워라"라는 뜻이다. 그래서 상태가 남아 있던 스레드의 정리용 <code>sleep(1000)</code>이 즉시 실패했고, 예외를 받은 뒤 상태가 <code>false</code>였다. 둘째, 예외 메시지 <code>sleep interrupted</code>가 이 문자열이다. 셋째, 잠자는 동안 VM 내부 상태는 <code>SLEEPING</code>이고, HotSpot은 이것을 자바의 <code>Thread.State.TIMED_WAITING</code>으로 보고한다. 스레드 덤프에서는 <code>TIMED_WAITING (sleeping)</code>으로 찍힌다(<code>javaClasses.cpp</code>의 상태 이름 표).</p>
+<p>실제로 잠드는 함수 <code>JavaThread::sleep_nanos</code>는 루프로 되어 있다. 먼저 <code>_SleepEvent</code>를 초기화(reset)하고 메모리 펜스(fence)를 친다. 소스 주석은 그 이유를 "스레드 인터럽트는 자바 메모리 모델에서 happens-before 순서를 만들기 때문에 인터럽트 상태와 동기화해야 한다"고 설명한다. 그다음 반복마다 ① 인터럽트 상태를 확인해 <code>true</code>면 지우고 <code>false</code>(인터럽트됨)를 돌려주고, ② 남은 시간이 없으면 <code>true</code>(시간 다 채움)를 돌려주고, ③ 아니면 남은 시간만큼 <code>park_nanos</code>로 잔다. 깨어나면 경과 시간을 다시 계산해 ①로 돌아간다. 소스 주석에 "interruption has precedence over timing out"이라고 적혀 있듯, 시간이 다 된 것과 인터럽트가 동시에 일어났으면 인터럽트가 우선이다.</p>
+<pre class="diagram">main 스레드                                   worker 스레드 (sleep 중)
+──────────────                                ─────────────────────────
+worker.interrupt()                            JVM_Sleep
+  │ interrupted = true  (Thread 객체의 필드)     └ sleep_nanos 루프
+  │ interrupt0()                                   └ _SleepEvent.park_nanos(남은 시간)
+  ▼                                                    └ pthread_cond_timedwait (POSIX)
+JVM_Interrupt                                               ▲
+  └ JavaThread::interrupt()                                 │ 깨어남
+       ├ _SleepEvent->unpark() ── pthread_cond_signal ──────┘
+       ├ parker()->unpark()      (LockSupport.park 용)
+       └ _ParkEvent->unpark()    (Object.wait, 모니터 용)
+                                              루프 맨 위: is_interrupted(true)
+                                                → true 읽고 false로 지움
+                                              JVM_Sleep: InterruptedException
+                                                ("sleep interrupted") 던짐</pre>
+<p>이 그림에서 눈여겨볼 점은 <b>깨우는 신호와 상태 비트가 분리되어 있다</b>는 것이다. 신호(<code>unpark</code>)는 그저 잠을 끊을 뿐이고, 잠에서 깬 스레드가 "왜 깼는가"를 판단하는 근거는 언제나 상태 비트다. 그래서 신호가 먼저 오고 상태 확인이 나중에 와도, 상태가 먼저 켜지고 잠이 나중에 시작되어도 결과가 같다. 잠들기 직전에 인터럽트가 들어온 경우는 <code>JVM_Sleep</code> 첫 줄의 확인이 잡고, 잠든 뒤 들어온 경우는 <code>unpark</code>와 루프 맨 위의 확인이 잡는다. 인터럽트 요청이 그 틈새로 새어 나갈 구멍이 없다. 플래그 방식으로는 만들 수 없는 성질이다.</p>
+<h4>명세가 보장하는 것: 인터럽트의 happens-before</h4>
+<p>HotSpot이 펜스를 치는 이유가 된 명세 조항은 JLS §17.4.4에 있다. 스레드 T1이 스레드 T2를 인터럽트하면, 그 인터럽트는 다른 어떤 스레드(T2 포함)가 "T2가 인터럽트되었음"을 알아내는 지점과 동기화된다(synchronizes-with). 알아내는 방법으로 명세는 <code>InterruptedException</code>이 던져지는 것, <code>Thread.interrupted</code>나 <code>Thread.isInterrupted</code>를 호출하는 것을 든다. 결과적으로 T1이 <code>interrupt()</code>를 부르기 전에 한 쓰기는, T2가 인터럽트를 감지한 뒤의 읽기에서 보인다는 것이 보장된다.</p>
+<pre><code class="language-java">// main 스레드
+cancelReason = "사용자가 취소함";   // volatile이 아닌 일반 필드
+worker.interrupt();
+
+// worker 스레드
+try {
+    Thread.sleep(3000);
+} catch (InterruptedException e) {
+    Log.log(cancelReason);         // "사용자가 취소함"을 보는 것이 보장된다
+}</code></pre>
+<p>이 보장은 인터럽트를 감지한 경로에만 성립한다. 인터럽트와 관계없이 그냥 <code>cancelReason</code>을 읽는 다른 코드에는 아무 보장이 없다. happens-before가 정확히 무엇인지는 다음 회차에서 <code>volatile</code>과 함께 세운다. 여기서는 "인터럽트는 메모리 가시성 측면에서도 신호 역할을 한다"는 것만 기억해 두면 된다.</p>
+
+<x-visual id="java-adv1-04-hotspot-interrupt-path" title="interrupt() 호출이 HotSpot을 거쳐 잠든 스레드를 깨우는 경로" kind="계층 구조도" ratio="16:9">
+<x-hint>자바 코드, JVM 네이티브 경계, HotSpot 내부, 운영체제의 네 층을 위에서 아래로 놓고, 호출하는 스레드와 잠든 스레드 사이의 경로를 보여 준다.</x-hint>
+<x-prompt>가로로 긴 네 개의 층을 위에서 아래로 쌓은 그림. 층 이름은 왼쪽 끝에 "자바 코드", "네이티브 경계", "HotSpot", "운영체제". 왼쪽 열은 "main 스레드", 오른쪽 열은 "worker 스레드". 왼쪽 열 위에서 아래로 상자 "interrupt()" → "interrupt0()" → "JavaThread::interrupt()" 가 화살표로 이어지고, 맨 위 상자 옆에 작은 깃발 아이콘과 라벨 "interrupted = true". "JavaThread::interrupt()" 상자에서 세 갈래 화살표가 오른쪽으로 뻗어 각각 작은 상자 "_SleepEvent", "parker", "_ParkEvent"에 닿음. "_SleepEvent" 상자 아래 운영체제 층에 "조건 변수"라는 상자가 있고 그 안에 잠든 스레드 아이콘(zZ). 오른쪽 열 맨 위 자바 코드 층에 상자 "catch (InterruptedException e)". 운영체제 층의 잠든 스레드에서 위로 올라가는 굵은 화살표가 그 catch 상자로 이어짐. 플랫한 다이어그램 스타일, 층마다 연한 다른 배경색.</x-prompt>
+<x-caption>OpenJDK 21 HotSpot 기준. interrupt()는 상태 비트를 쓰고, 세 대기 이벤트를 모두 깨운다.</x-caption>
+</x-visual>
+
+<h3>인터럽트가 닿지 않는 곳</h3>
+<p>Javadoc 표의 마지막 줄은 "위 어느 경우도 아니면 상태만 설정된다"였다. 이 줄에는 계산 중인 스레드만 들어가는 것이 아니다. 무언가를 기다리고 있지만 그 기다림이 인터럽트 가능한 목록에 없는 스레드도 들어간다. 대표적인 두 가지를 실험으로 확인해 보자. 하나는 <code>synchronized</code> 블록에 들어가려고 모니터 락을 기다리는 스레드, 다른 하나는 <code>System.in.read()</code>처럼 <code>InputStream</code>으로 입력을 기다리는 스레드다.</p>
+<pre><code class="language-java">public class NotWoken {
+    static final Object lock = new Object();
+
+    public static void main(String[] args) throws Exception {
+        Thread reader = new Thread(() -> {
+            try {
+                int b = System.in.read();
+                Log.log("read 반환 = " + b + ", isInterrupted = "
+                        + Thread.currentThread().isInterrupted());
+            } catch (java.io.IOException e) {
+                Log.log("IOException " + e);
+            }
+        }, "reader");
+
+        Thread blocked = new Thread(() -> {
+            synchronized (lock) {
+                Log.log("락 획득, isInterrupted = " + Thread.currentThread().isInterrupted());
+            }
+        }, "blocked");
+
+        synchronized (lock) {
+            reader.start();
+            blocked.start();
+            Thread.sleep(300);
+            Log.log("reader 상태 = " + reader.getState());
+            Log.log("blocked 상태 = " + blocked.getState());
+            reader.interrupt();
+            blocked.interrupt();
+            Thread.sleep(1000);
+            Log.log("1초 뒤 reader 상태 = " + reader.getState());
+            Log.log("1초 뒤 blocked 상태 = " + blocked.getState());
+        }
+        blocked.join();
+        reader.join();
+        Log.log("main 종료");
+    }
+}</code></pre>
+<pre data-label="실행 결과: (sleep 3; echo x) | java NotWoken (macOS, 시각은 실행마다 다르다)"><code class="language-text">01:45:55.477 [   main] reader 상태 = RUNNABLE
+01:45:55.479 [   main] blocked 상태 = BLOCKED
+01:45:56.484 [   main] 1초 뒤 reader 상태 = RUNNABLE
+01:45:56.485 [   main] 1초 뒤 blocked 상태 = BLOCKED
+01:45:56.494 [blocked] 락 획득, isInterrupted = true
+01:45:58.123 [ reader] read 반환 = 120, isInterrupted = true
+01:45:58.124 [   main] main 종료</code></pre>
+<p>main은 <code>lock</code>을 쥔 채로 두 스레드를 시작했다. blocked 스레드는 그 락을 얻지 못해 <code>BLOCKED</code>가 된다. 인터럽트를 보내도 1초 뒤 여전히 <code>BLOCKED</code>다. 모니터 락 획득은 인터럽트로 끊을 수 있는 대기가 아니다. main이 <code>synchronized</code> 블록을 나가 락을 놓은 뒤에야 blocked가 락을 얻었고, 그때 확인한 인터럽트 상태는 <code>true</code>다. 요청은 기록되어 있었지만 대기를 끊지는 못했다. 앞에서 본 <code>JavaThread::interrupt()</code>가 모니터용 이벤트까지 깨운다는 사실과 헷갈리지 말자. 깨우는 신호를 받는 것과 대기를 그만두는 것은 다르다. 모니터 락 획득은 락을 얻기 전에는 끝나지 않는 대기이므로, 겉으로 보이는 결과는 계속 <code>BLOCKED</code>다. 락을 기다리다가도 인터럽트에 반응하고 싶다면 <code>ReentrantLock.lockInterruptibly()</code>를 써야 하는데, 이것은 <code>concurrent.Lock</code> 회차에서 다룬다.</p>
+<p>reader 스레드는 더 흥미롭다. 입력이 오지 않아 <code>read()</code> 안에서 멈춰 있는데 상태는 <code>RUNNABLE</code>이다. 운영체제의 <code>read</code> 시스템 호출에서 기다리는 스레드를 자바는 <code>RUNNABLE</code>로 보고한다. <code>Thread.State.RUNNABLE</code>의 Javadoc이 "JVM 안에서 실행 중이지만 프로세서 같은 운영체제의 다른 자원을 기다리고 있을 수 있다"고 적어 둔 그대로다. 인터럽트는 이 대기도 끊지 못했다. 셸이 3초 뒤 <code>x</code>를 보내자 그제야 <code>read()</code>가 120(<code>'x'</code>의 코드)을 돌려줬고, 인터럽트 상태는 <code>true</code>로 남아 있었다. <code>InputStream</code>은 <code>InterruptibleChannel</code>이 아니다.</p>
+<p>그러면 이런 대기는 어떻게 끝내는가. JDK 문서의 「Why are Thread.stop, Thread.suspend and Thread.resume Deprecated?」는 "인터럽트에 반응하지 않는 스레드는 어떻게 하는가"라는 질문에, 일반적으로 통하는 방법은 없고 상황에 맞는 수단을 써야 한다고 답하면서, 알려진 소켓에서 기다리는 스레드라면 그 소켓을 닫아 즉시 돌아오게 할 수 있다는 예를 든다. 대기의 종류마다 "깨우는 수단"이 따로 있다는 것을 기억해 두자. <code>sleep</code>, <code>wait</code>, <code>join</code>, <code>park</code>의 깨우는 수단이 인터럽트다.</p>
+<p>마지막으로 이미 끝난 스레드를 인터럽트하는 경우다. Javadoc은 "살아 있지 않은 스레드의 인터럽트는 아무 효과가 없어도 된다"고 하면서, 구현 노트(implNote)로 "JDK 참조 구현에서는 살아 있지 않은 스레드의 인터럽트도 요청이 있었다는 사실을 기록하고 <code>interrupted()</code>와 <code>isInterrupted()</code>로 보고한다"고 덧붙인다. 앞의 소스에서 본 대로 자바 필드에 먼저 <code>true</code>를 쓰고, <code>JVM_Interrupt</code>는 살아 있는 스레드에만 이벤트를 깨우기 때문이다. 실제로 <code>join()</code>으로 종료를 확인한 스레드에 <code>interrupt()</code>를 부른 뒤 <code>isInterrupted()</code>를 보면 OpenJDK 21에서 <code>true</code>가 나온다. 명세가 허용하는 범위 안의 구현 선택이므로, 이 값에 기대는 코드를 짜지는 말자.</p>
+
+<h3>한 층 더 아래: 시스템 호출 안에서 막힌 스레드를 채널이 꺼내는 방법</h3>
+<p>방금 <code>System.in.read()</code>에서 기다리던 스레드는 인터럽트로 깨어나지 않았다. 그런데 Javadoc 표의 둘째 줄은 <code>InterruptibleChannel</code>에 대한 I/O는 끊긴다고 했다. 두 경우 모두 스레드는 운영체제의 <code>read</code> 시스템 호출 안에서 기다린다. 앞에서 본 HotSpot의 대기 이벤트는 JVM이 만든 조건 변수라서 <code>unpark</code>로 깨울 수 있지만, 커널의 <code>read</code> 안에서 데이터를 기다리는 스레드는 그런 조건 변수에 있지 않다. <code>JavaThread::interrupt()</code>가 이벤트 세 개를 아무리 깨워도 그 스레드에는 닿지 않는다. 그러면 채널은 무슨 수로 그 스레드를 꺼내는가. 이 절의 클래스·함수 이름과 순서는 OpenJDK 21의 유닉스 계열 구현이고, 명세가 보장하는 것은 아래에 인용하는 <code>InterruptibleChannel</code> Javadoc의 동작까지다.</p>
+<p>명세부터 보자. <code>InterruptibleChannel</code>의 Javadoc은 두 문단으로 동작을 정한다. 인터럽트 가능한 채널의 I/O에서 막힌 스레드를 다른 스레드가 인터럽트하면 <b>채널이 닫히고</b>, 막힌 스레드는 <code>ClosedByInterruptException</code>을 받으며, 그 스레드의 인터럽트 상태는 <b>설정된 채로</b> 남는다. 그리고 인터럽트 상태가 이미 켜진 스레드가 채널에서 블로킹 I/O를 시작하면, 채널이 닫히고 그 스레드는 즉시 <code>ClosedByInterruptException</code>을 받으며 상태는 그대로 남는다. <code>sleep</code>과 정반대로 상태를 지우지 않는다는 점, 그리고 끊기는 것이 "이번 읽기"가 아니라 "채널 전체"라는 점이 눈에 띈다. 실험으로 확인하자.</p>
+<pre><code class="language-java">import java.nio.ByteBuffer;
+import java.nio.channels.*;
+import java.nio.file.*;
+
+public class PipeInterrupt {
+    public static void main(String[] args) throws Exception {
+        Pipe pipe = Pipe.open();
+        Pipe.SourceChannel source = pipe.source();   // 아무도 쓰지 않으므로 read는 영원히 막힌다
+
+        Thread reader = new Thread(() -> {
+            try {
+                source.read(ByteBuffer.allocate(16));
+                System.out.println("read 반환");
+            } catch (Exception e) {
+                System.out.println("reader 예외 = " + e.getClass().getName());
+                System.out.println("reader isInterrupted = " + Thread.currentThread().isInterrupted());
+            }
+        }, "reader");
+        reader.start();
+        Thread.sleep(300);
+        System.out.println("interrupt 전 reader 상태 = " + reader.getState());
+        long t0 = System.nanoTime();
+        reader.interrupt();
+        reader.join();
+        System.out.printf("interrupt -> reader 종료: %.1f ms%n", (System.nanoTime() - t0) / 1e6);
+        System.out.println("source.isOpen() = " + source.isOpen());
+        try {
+            source.read(ByteBuffer.allocate(16));
+        } catch (Exception e) {
+            System.out.println("main이 같은 채널을 읽으면 = " + e.getClass().getName());
+        }
+
+        // 이미 인터럽트된 스레드가 파일 채널을 읽는 경우
+        Path tmp = Files.createTempFile("intr", ".txt");
+        Files.writeString(tmp, "hello");
+        FileChannel fc = FileChannel.open(tmp);
+        Thread.currentThread().interrupt();
+        try {
+            fc.read(ByteBuffer.allocate(16));
+            System.out.println("파일 read 성공");
+        } catch (ClosedByInterruptException e) {
+            System.out.println("파일 read -> ClosedByInterruptException, fc.isOpen() = " + fc.isOpen()
+                + ", isInterrupted = " + Thread.currentThread().isInterrupted());
+        }
+        Files.delete(tmp);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (macOS, OpenJDK 21.0.13. 걸린 시간은 실행마다 다르다. 세 번 실행에서 3.7~6.8 ms)"><code class="language-text">interrupt 전 reader 상태 = RUNNABLE
+reader 예외 = java.nio.channels.ClosedByInterruptException
+reader isInterrupted = true
+interrupt -> reader 종료: 6.8 ms
+source.isOpen() = false
+main이 같은 채널을 읽으면 = java.nio.channels.AsynchronousCloseException
+파일 read -> ClosedByInterruptException, fc.isOpen() = false, isInterrupted = true</code></pre>
+<p>reader는 <code>System.in.read()</code> 때와 마찬가지로 시스템 호출 안에서 기다리므로 <code>RUNNABLE</code>로 보고된다. 그런데 이번에는 인터럽트를 보내자 몇 밀리초 만에 빠져나왔고, 받은 예외는 <code>ClosedByInterruptException</code>이며, 인터럽트 상태는 <code>true</code>로 남았다. 채널은 닫혔다. 그래서 인터럽트와 아무 관계없는 main이 같은 채널을 읽으려 하자 예외가 났다. 이름이 <code>AsynchronousCloseException</code>인 것은 구현의 세부 때문이다. 읽기 시작 단계의 <code>ensureOpen()</code>이 <code>ClosedChannelException</code>을 던지지만, <code>finally</code>에서 부르는 <code>end(false)</code>가 "완료되지 않았는데 채널이 닫혀 있다"를 보고 <code>AsynchronousCloseException</code>(<code>ClosedChannelException</code>의 하위 클래스)을 던져 앞의 예외를 덮어쓴다. 마지막 줄은 Javadoc의 둘째 문단이다. 파일 읽기는 막힐 일이 없는 작업인데도, 인터럽트 상태가 켜진 스레드가 시작하자 데이터를 한 바이트도 읽지 않고 채널이 닫혔다.</p>
+<h4>등록: begin()이 스레드에 "나를 닫으면 된다"고 걸어 둔다</h4>
+<p>장치의 출발점은 <code>java.nio.channels.spi.AbstractInterruptibleChannel</code>의 <code>begin()</code>/<code>end()</code> 쌍이다. 블로킹 I/O를 하는 채널 구현은 시스템 호출 직전에 <code>begin()</code>을, 직후에 <code>finally</code>에서 <code>end()</code>를 부른다. OpenJDK 21의 <code>begin()</code>은 "이 채널을 닫는" 일을 하는 <code>Interruptible</code> 객체를 만들어, 앞에서 본 <code>Thread.interrupt()</code>의 마지막 단계가 읽는 바로 그 필드, 현재 스레드의 <code>nioBlocker</code>에 걸어 둔다(<code>blockedOn</code>). 그다음 현재 스레드가 이미 인터럽트된 상태인지 확인하고, 그렇다면 그 자리에서 직접 채널을 닫는다.</p>
+<pre><code class="language-java">// OpenJDK 21 java.nio.channels.spi.AbstractInterruptibleChannel (발췌)
+protected final void begin() {
+    if (interruptor == null) {
+        interruptor = new Interruptible() {
+                public void interrupt(Thread target) {
+                    synchronized (closeLock) {
+                        if (closed)
+                            return;
+                        closed = true;
+                        interrupted = target;          // 누가 인터럽트로 닫았는지 기록
+                        try {
+                            AbstractInterruptibleChannel.this.implCloseChannel();
+                        } catch (IOException x) { }
+                    }
+                }};
+    }
+    blockedOn(interruptor);                            // Thread.nioBlocker = interruptor
+    Thread me = Thread.currentThread();
+    if (me.isInterrupted())
+        interruptor.interrupt(me);
+}
+
+protected final void end(boolean completed) throws AsynchronousCloseException {
+    blockedOn(null);
+    Thread interrupted = this.interrupted;
+    if (interrupted != null && interrupted == Thread.currentThread()) {
+        this.interrupted = null;
+        throw new ClosedByInterruptException();
+    }
+    if (!completed && closed)
+        throw new AsynchronousCloseException();
+}</code></pre>
+<p><code>begin()</code> 마지막의 자기 확인이 필요한 이유는 둘이다. 첫째, <code>Thread.interrupt()</code>는 <code>this != Thread.currentThread()</code>일 때만 <code>nioBlocker</code>를 부른다. 스스로를 인터럽트한 스레드에서는 채널이 닫히지 않으므로, 다음 I/O를 시작할 때 <code>begin()</code>이 확인해야 한다. 실험의 파일 채널이 이 경로다. 둘째, 다른 스레드의 인터럽트가 등록 직전에 도착하는 경합이다. <code>interrupt()</code>는 상태를 <code>true</code>로 쓴 뒤 <code>interruptLock</code>을 잡고 <code>nioBlocker</code>를 읽는다(소스 주석: "Setting the interrupt status must be done before reading nioBlocker"). <code>blockedOn()</code>도 같은 <code>interruptLock</code>을 잡고 <code>nioBlocker</code>를 쓰며, <code>begin()</code>은 그 뒤에 상태를 읽는다. 락을 먼저 잡은 쪽이 <code>interrupt()</code>라면 상태 쓰기가 락 해제 전에 끝났으므로 <code>begin()</code>의 상태 확인이 <code>true</code>를 본다. <code>blockedOn()</code>이 먼저라면 <code>interrupt()</code>가 등록된 <code>Interruptible</code>을 본다. 어느 순서든 둘 중 하나는 반드시 상대를 본다. 앞에서 <code>JVM_Sleep</code>이 잠들기 전에 상태를 확인하던 것과 같은 "틈 없애기"를 자바 코드로 한 것이다.</p>
+<h4>깨우기: 파일 디스크립터를 바꿔치기하고 신호를 쏜다</h4>
+<p>인터럽트를 받은 <code>Interruptible</code>은 채널의 <code>implCloseChannel()</code>을 부른다. 이 메서드의 계약(Javadoc)은 "이 채널의 I/O에서 막힌 다른 스레드가 즉시 돌아오도록 조치해야 한다"이다. 파이프의 읽기 쪽 구현인 <code>sun.nio.ch.SourceChannelImpl</code>은 블로킹 읽기를 시작할 때 읽는 스레드의 네이티브 스레드 식별자(<code>NativeThread.current()</code>, 유닉스에서는 <code>pthread_self()</code>)를 기록해 둔다. 닫기 요청이 왔을 때 진행 중인 읽기가 있으면, 소스 주석대로 파일 디스크립터를 "미리 닫고(pre-close)" 읽는 스레드에 신호를 보낸 뒤, 진짜 <code>close</code>는 읽는 스레드가 빠져나갈 때까지 미룬다. 그 두 동작이 네이티브 코드에 있다.</p>
+<ul>
+<li><b>미리 닫기:</b> <code>UnixDispatcher.c</code>는 초기화 때 <code>socketpair()</code>로 소켓 한 쌍을 만들고 한쪽을 바로 닫아, "상대가 닫힌 소켓" 하나를 <code>preCloseFD</code>로 보관해 둔다. <code>preClose0</code>은 <code>dup2(preCloseFD, fd)</code>로 채널의 fd 번호가 그 죽은 소켓을 가리키게 바꾼다. 번호는 그대로이고 가리키는 대상만 바뀐다.</li>
+<li><b>신호:</b> <code>NativeThread.c</code>의 <code>signal0</code>은 기록해 둔 스레드에 <code>pthread_kill(thread, INTERRUPT_SIGNAL)</code>을 보낸다. 신호 번호는 macOS 같은 BSD 계열에서 <code>SIGIO</code>, 리눅스에서 <code>SIGRTMAX - 2</code>다. 이 신호의 처리기는 아무것도 하지 않는 <code>nullHandler</code>이고, <code>sa_flags = 0</code>, 즉 <code>SA_RESTART</code> 없이 설치된다. macOS의 <code>sigaction(2)</code> 매뉴얼은 <code>SA_RESTART</code>를 켜야 통신 채널이나 느린 장치에서의 <code>read</code> 같은 호출이 재시작된다고 설명하고, <code>read(2)</code> 매뉴얼은 데이터가 오기 전에 신호가 전달되면 <code>EINTR</code>로 실패한다고 적는다. 처리기가 하는 일이 없어도 "신호가 왔다"는 사실만으로 커널 안의 <code>read</code>가 끝나는 것이다.</li>
+</ul>
+<p>macOS와 리눅스(<code>supportPendingSignals0()</code>이 <code>false</code>인 플랫폼)에서 <code>UnixDispatcher.implPreClose</code>는 fd 바꿔치기를 먼저 하고 신호를 나중에 보낸다. 신호가 도착했을 때 스레드가 아직 <code>read</code>에 들어가기 전이었더라도, 그 fd 번호는 이미 상대가 닫힌 소켓을 가리키므로 이어지는 <code>read</code>는 데이터를 기다리지 않고 0(EOF)을 돌려준다. 그런데 이 Mac(macOS)에서 같은 두 동작을 C로 따로 시험해 보면, 파이프 <code>read</code>에서 막힌 스레드는 신호만 보내도 -1(<code>errno</code>는 <code>EINTR</code>)로 끝나고, 신호 없이 <code>dup2</code>만 해도 그 자리에서 0을 돌려주며 끝난다. 그러니 앞의 자바 실험에서 실제로 <code>read</code>를 끝낸 것이 둘 중 어느 쪽인지는 이 실험만으로는 말할 수 없다. 다행히 어느 쪽이든 결과는 같다. 이제 읽는 쪽으로 돌아가자. 파이프의 읽기는 <code>SocketDispatcher.c</code>의 <code>read0</code>이 하고, 그 반환값을 <code>IOUtil.c</code>의 <code>convertReturnVal</code>이 바꾼다. 0이면 <code>IOS_EOF</code>(-1), <code>EINTR</code>이면 <code>IOS_INTERRUPTED</code>(-3)다. <code>SourceChannelImpl.read()</code>의 블로킹 루프는 <code>while (IOStatus.okayToRetry(n) && isOpen())</code>인데, <code>EOF</code>는 재시도할 코드가 아니고, <code>INTERRUPTED</code>는 재시도해도 되는 코드지만 채널이 이미 닫혔으므로, 어느 쪽이든 루프를 나간다. <code>finally</code>의 <code>endRead()</code>가 미뤄 둔 진짜 <code>close</code>를 하고(<code>tryFinishClose</code>), 마지막으로 <code>end()</code>가 "나를 닫은 인터럽트의 대상이 바로 나"임을 확인해 <code>ClosedByInterruptException</code>을 던진다. 이 경로 어디에도 <code>getAndClearInterrupt()</code>가 없으므로 인터럽트 상태는 켜진 채 남는다. 실험에서 본 세 가지(빠른 탈출, 예외 종류, 남은 상태)가 모두 이렇게 설명된다.</p>
+<pre class="diagram">main: reader.interrupt()                      reader: source.read(buf)
+  │ interrupted = true                          begin(): nioBlocker = 채널을 닫는 Interruptible
+  │ interrupt0()  → 대기 이벤트 3개 unpark       thread = pthread_self()
+  │                 (reader는 거기 없음)         네이티브 read(fd) ── 커널 안에서 대기
+  └ nioBlocker.interrupt(reader)                          ▲
+      └ closed = true, interrupted = reader               │
+         └ implCloseChannel()                             │
+              ├ dup2(preCloseFD, fd)  fd → 죽은 소켓 ──────┤ read가 0(EOF)으로 끝나거나
+              └ pthread_kill(reader, SIGIO) ──────────────┘ EINTR로 실패
+                                                IOS_EOF, 또는 IOS_INTERRUPTED인데 isOpen() == false → 루프 탈출
+                                                endRead(): 진짜 close(fd)
+                                                end(): ClosedByInterruptException (상태는 true 유지)</pre>
+<p>이제 <code>System.in</code>이 끊기지 않은 이유가 정확히 보인다. OpenJDK 21에서 <code>System.in</code>은 <code>FileDescriptor.in</code>의 <code>FileInputStream</code>을 감싼 <code>BufferedInputStream</code>이고, 실제 읽기를 하는 <code>FileInputStream</code>의 <code>read</code> 메서드들은 네이티브 메서드(<code>read0()</code>, <code>readBytes()</code>)를 부를 뿐 <code>begin()</code>/<code>end()</code>로 <code>nioBlocker</code>를 등록하지 않는다(그 둘레의 <code>Blocker.begin()</code>은 가상 스레드가 막힐 때 스케줄러가 캐리어 스레드를 보충하게 하는 장치이고 인터럽트와는 관계가 없다). 그래서 <code>interrupt()</code>는 상태를 켜고 HotSpot의 이벤트를 깨우는 데서 끝나고, 커널 안의 <code>read</code>에 신호를 보낼 주체가 없다. 반대로 채널 쪽의 대가도 분명하다. 인터럽트 한 번에 <b>채널 자체가 닫히므로</b>, 여러 스레드가 함께 쓰는 <code>FileChannel</code>이 있다면 그중 한 스레드를 인터럽트하는 것만으로 다른 스레드들의 I/O까지 실패한다. 실험에서 main의 읽기가 실패한 것이 그 모습이다. 인터럽트로 작업을 취소하는 스레드 풀 위에서 공유 채널을 쓸 때 이 점을 알고 있어야 한다.</p>
+
+<h3>InterruptedException을 받았을 때의 규칙: 다시 던지거나, 복원하거나</h3>
+<p>인터럽트 상태는 "누군가 이 스레드에 멈추라고 요청했다"는 정보를 담은 유일한 통로다. 그런데 <code>InterruptedException</code>이 던져지는 순간 그 통로는 비워진다. 그러니 예외를 잡은 코드가 아무것도 하지 않으면 요청이 영영 사라진다. 이것이 인터럽트 관련 버그의 가장 흔한 모양이다.</p>
+<pre><code class="language-java">public class Swallow {
+    // 나쁜 예: 인터럽트를 삼킨다
+    static void pauseSwallow(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            // 아무것도 하지 않는다
+        }
+    }
+
+    // 좋은 예: 인터럽트 상태를 복원한다
+    static void pauseRestore(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    static Thread start(String name, boolean restore) {
+        Thread t = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                if (restore) pauseRestore(500);
+                else pauseSwallow(500);
+            }
+            Log.log("멈춤");
+        }, name);
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread swallow = start("swallow", false);
+        Thread restore = start("restore", true);
+        Thread.sleep(200);
+
+        swallow.interrupt();
+        restore.interrupt();
+        swallow.join(2000);
+        restore.join(2000);
+
+        Log.log("swallow 살아 있음 = " + swallow.isAlive());
+        Log.log("restore 살아 있음 = " + restore.isAlive());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (시각은 실행마다 다르다)"><code class="language-text">01:45:53.101 [restore] 멈춤
+01:45:55.081 [   main] swallow 살아 있음 = true
+01:45:55.081 [   main] restore 살아 있음 = false</code></pre>
+<p>두 스레드는 같은 루프를 돈다. 차이는 <code>sleep</code>을 감싼 도우미 메서드 하나다. 200밀리초 시점의 인터럽트는 두 스레드 모두 <code>sleep(500)</code> 안에서 받는다. swallow 쪽은 예외가 상태를 지운 뒤 catch 블록이 아무것도 하지 않으므로, 루프 조건 <code>isInterrupted()</code>는 <code>false</code>를 보고 계속 돈다. 2초를 기다려도 살아 있다. restore 쪽은 catch 블록에서 <code>Thread.currentThread().interrupt()</code>로 상태를 다시 켜 두었으므로, 도우미 메서드를 부른 쪽의 루프 조건이 그 상태를 보고 멈춘다. (swallow 스레드는 데몬으로 만들어 main이 끝나면 JVM이 종료되게 했다.)</p>
+<p>규칙은 두 가지 중 하나다. 첫째, 내 메서드가 <code>throws InterruptedException</code>을 선언할 수 있다면 잡지 말고 그대로 던져 호출자가 판단하게 한다. 대기하는 메서드를 감싸는 라이브러리 메서드라면 대부분 이쪽이 맞다. 둘째, 시그니처 때문에 던질 수 없다면(<code>Runnable.run()</code>처럼 체크 예외를 허용하지 않는 메서드를 구현하는 경우 등) 상태를 복원한다. 앞에서 인용한 JDK 문서는 이것을 "다시 던지기(rethrow)"가 아니라 "다시 주장하기(reassert)"라고 부르며, 즉시 처리할 준비가 되지 않은 메서드가 이 예외를 잡았다면 <code>Thread.currentThread().interrupt();</code>로 "스스로를 다시 인터럽트"해야 한다고 말한다. 그렇게 하면 스레드가 다음에 대기하는 곳에서 <code>InterruptedException</code>이 다시 일어나 요청이 위로 전달된다.</p>
+<p>반대로 인터럽트를 받은 그 자리에서 요청을 "처리"하는 코드라면 복원할 필요가 없다. <code>run()</code>의 최상위에서 예외를 잡고 정리한 뒤 스레드를 끝내는 코드가 그렇다. 요청은 "멈춰라"였고, 스레드가 실제로 멈추므로 요청은 이행되었다. 앞의 <code>InterruptSleep</code>이 이 모양이다. 판단 기준은 하나다. <b>이 catch 블록이 스레드의 다음 행동을 결정할 권한을 가진 코드인가.</b> 아니라면 결정권을 가진 코드에게 상태를 넘겨야 한다.</p>
+<aside class="note">catch 블록에서 <code>throw new RuntimeException(e)</code>로 감싸 던지면 <code>run()</code>이 예외로 끝나 스레드가 종료되므로 "멈춘다"는 결과는 같다. 다만 인터럽트 상태는 이미 지워졌고, 예외는 스레드의 미처리 예외 처리기로 넘어가 스택 트레이스가 출력된다. 정상적인 취소를 오류처럼 보이게 만들므로, 취소가 예상된 흐름이라면 정리 코드로 끝내는 편이 의도를 잘 드러낸다.</aside>
+
+<h3>프린터 예제 1: 플래그로 멈추는 프린터</h3>
+<p>지금까지의 도구를 하나의 작은 프로그램에 적용해 보자. 사용자가 문서 이름을 입력하면 프린터 스레드가 하나씩 꺼내 출력한다. 출력 한 건에는 3초가 걸린다고 가정하고 <code>sleep(3000)</code>으로 흉내 낸다. 사용자가 <code>q</code>를 입력하면 프로그램을 끝낸다. main 스레드는 입력을 받아 대기열에 넣는 역할, 프린터 스레드는 대기열에서 꺼내 출력하는 역할이다. 첫 버전은 앞에서 본 플래그 방식으로 멈춘다.</p>
+<pre><code class="language-java">import java.util.Queue;
+import java.util.Scanner;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+public class PrinterV1 {
+    public static void main(String[] args) throws InterruptedException {
+        Printer printer = new Printer();
+        Thread printerThread = new Thread(printer, "printer");
+        printerThread.start();
+
+        Scanner scanner = new Scanner(System.in);
+        while (scanner.hasNextLine()) {
+            String input = scanner.nextLine();
+            if (input.equals("q")) {
+                Log.log("종료 요청");
+                printer.work = false;
+                break;
+            }
+            printer.submit(input);
+        }
+        printerThread.join();
+        Log.log("main 종료");
+    }
+
+    static class Printer implements Runnable {
+        volatile boolean work = true;
+        private final Queue<String> jobs = new ConcurrentLinkedQueue<>();
+
+        void submit(String doc) {
+            jobs.offer(doc);
+            Log.log("접수: " + doc);
+        }
+
+        @Override
+        public void run() {
+            while (work) {
+                if (jobs.isEmpty()) {
+                    continue;
+                }
+                String doc = jobs.poll();
+                Log.log("출력 시작: " + doc);
+                try {
+                    Thread.sleep(3000); // 출력에 3초 걸린다고 가정
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+                Log.log("출력 완료: " + doc);
+            }
+            Log.log("프린터 종료, 남은 문서 " + jobs.size() + "개");
+        }
+    }
+}</code></pre>
+<p>대기열로는 <code>ConcurrentLinkedQueue</code>를 썼다. main이 넣고 프린터가 꺼내므로 두 스레드가 동시에 접근하는 자료 구조가 필요하고, 일반 <code>ArrayDeque</code>나 <code>LinkedList</code>는 여러 스레드가 동시에 고치는 것을 전제로 만들어지지 않았다. 이 큐가 락 없이 어떻게 안전한지는 CAS와 동시성 컬렉션 회차에서 다룬다. 지금은 "여러 스레드가 동시에 <code>offer</code>와 <code>poll</code>을 해도 되는 큐"로만 쓴다. <code>work</code>에 <code>volatile</code>을 붙인 이유는 앞의 JLS §17.3 이야기와 같다.</p>
+<p>사람이 직접 입력하면 시각을 맞추기 어려우므로 셸에서 시간차를 두고 입력을 흘려 넣어 실행했다. doc1, 0.5초 뒤 doc2, 다시 0.5초 뒤 doc3, 그리고 3초 뒤 <code>q</code>다.</p>
+<pre data-label="실행 결과: (echo doc1; sleep 0.5; echo doc2; sleep 0.5; echo doc3; sleep 3; echo q) | java PrinterV1"><code class="language-text">01:46:37.539 [printer] 출력 시작: doc1
+01:46:37.539 [   main] 접수: doc1
+01:46:37.996 [   main] 접수: doc2
+01:46:38.513 [   main] 접수: doc3
+01:46:40.550 [printer] 출력 완료: doc1
+01:46:40.551 [printer] 출력 시작: doc2
+01:46:41.528 [   main] 종료 요청
+01:46:43.555 [printer] 출력 완료: doc2
+01:46:43.569 [printer] 프린터 종료, 남은 문서 1개
+01:46:43.570 [   main] main 종료</code></pre>
+<p>첫 두 줄의 순서가 이상해 보일 수 있다. "출력 시작"이 "접수"보다 먼저 찍혔다. <code>submit()</code>은 <code>offer</code>를 하고 나서 로그를 찍는데, 그 사이에 프린터 스레드가 큐에서 문서를 꺼내 자기 로그를 먼저 찍은 것이다. 두 스레드의 로그 순서는 실행마다 바뀔 수 있다. 같은 밀리초에 찍힌 두 줄은 동시에 일어난 일로 읽으면 된다.</p>
+<p>중요한 것은 끝부분이다. 41.528에 종료를 요청했는데, 프린터는 doc2의 출력을 끝까지 마친 43.555에야 루프 조건을 확인하고 멈췄다. 사용자는 <code>q</code>를 눌렀는데 문서가 한 장 더 나온 셈이다. 출력이 3초가 아니라 30분짜리였다면 30분을 기다려야 한다. 플래그 방식의 응답 지연이 그대로 드러난다.</p>
+<p>이 코드에는 문제가 하나 더 숨어 있다. 대기열이 비었을 때의 루프다. <code>jobs.isEmpty()</code>가 <code>true</code>면 <code>continue</code>로 곧장 <code>while (work)</code>로 돌아가 다시 <code>isEmpty()</code>를 부른다. 할 일이 없는데도 이 스레드는 쉬지 않고 같은 확인을 반복한다. 이런 형태를 <b>바쁜 대기(busy waiting)</b>라고 한다. 운영체제가 보기에 이 스레드는 언제나 실행할 준비가 된 스레드이므로 CPU 코어 하나를 계속 차지한다. 이 문제는 프린터 예제 4에서 다시 다룬다.</p>
+
+<h3>프린터 예제 2: 인터럽트 도입</h3>
+<p>응답 지연부터 고치자. 바꿀 곳은 두 군데다. main은 플래그를 내린 뒤 프린터 스레드에 인터럽트를 보낸다. 프린터는 <code>sleep</code> 중에 인터럽트를 받으면 출력을 중단하고 루프를 빠져나온다.</p>
+<pre><code class="language-java">// PrinterV2: PrinterV1에서 바뀐 부분만
+// main
+if (input.equals("q")) {
+    Log.log("종료 요청");
+    printer.work = false;
+    printerThread.interrupt();   // 추가: 자고 있으면 깨운다
+    break;
+}
+
+// Printer.run()
+while (work) {
+    if (jobs.isEmpty()) {
+        continue;
+    }
+    String doc = jobs.poll();
+    Log.log("출력 시작: " + doc);
+    try {
+        Thread.sleep(3000);
+        Log.log("출력 완료: " + doc);
+    } catch (InterruptedException e) {
+        Log.log("출력 중단: " + doc);
+        break;
+    }
+}
+Log.log("프린터 종료, 남은 문서 " + jobs.size() + "개");</code></pre>
+<pre data-label="실행 결과 (입력은 예제 1과 같다)"><code class="language-text">01:46:43.656 [printer] 출력 시작: doc1
+01:46:43.656 [   main] 접수: doc1
+01:46:44.097 [   main] 접수: doc2
+01:46:44.614 [   main] 접수: doc3
+01:46:46.668 [printer] 출력 완료: doc1
+01:46:46.669 [printer] 출력 시작: doc2
+01:46:47.632 [   main] 종료 요청
+01:46:47.634 [printer] 출력 중단: doc2
+01:46:47.643 [printer] 프린터 종료, 남은 문서 1개
+01:46:47.644 [   main] main 종료</code></pre>
+<p>종료 요청(47.632)과 출력 중단(47.634) 사이가 2밀리초다. doc2를 출력하던 <code>sleep(3000)</code>이 인터럽트로 끊겼다. "출력 완료" 로그를 try 블록 안으로 옮긴 것도 의미가 있다. 끊긴 출력을 완료로 기록하지 않기 위해서다.</p>
+<p>이 코드가 모든 시점의 종료 요청을 놓치지 않는지 따져 보자. 프린터 스레드가 있을 수 있는 위치는 크게 세 곳이다.</p>
+<ol>
+<li><b><code>sleep(3000)</code> 안에서 자는 중:</b> 인터럽트가 잠을 끊고 <code>InterruptedException</code>이 catch로 가서 <code>break</code>한다. 위 실행 결과가 이 경우다.</li>
+<li><b>빈 대기열 앞에서 바쁜 대기 중:</b> <code>work</code>가 이미 <code>false</code>이므로 다음 <code>while (work)</code> 확인에서 빠져나온다. 인터럽트 상태는 <code>true</code>로 남지만 스레드가 곧 끝나므로 문제 되지 않는다.</li>
+<li><b>문서를 꺼낸 직후, <code>sleep</code>에 들어가기 직전:</b> main이 바로 이 틈에 플래그를 내리고 인터럽트를 보냈다고 하자. 프린터는 <code>while (work)</code>를 이미 통과했으므로 플래그를 보지 못한다. 하지만 <code>sleep</code>은 잠들기 전에 인터럽트 상태부터 확인하므로(<code>JVM_Sleep</code>의 첫 확인) 3초를 자지 않고 즉시 예외를 던진다.</li>
+</ol>
+<p>세 번째 경우가 인터럽트의 진짜 가치다. 플래그만 있었다면 이 틈에 들어온 요청은 3초 뒤에야 발견된다. 인터럽트 상태는 <code>sleep</code>이 진입할 때 스스로 확인하는 값이므로, "확인과 잠들기 사이의 틈"이 없다. 앞에서 HotSpot 소스로 본 성질이 이 프로그램의 정확성을 받쳐 준다.</p>
+
+<h3>프린터 예제 3: 플래그를 걷어 내다</h3>
+<p>예제 2에는 종료 신호가 두 개 있다. <code>work</code> 플래그와 인터럽트 상태다. 그런데 인터럽트 상태 자체가 이미 "멈추라는 요청"을 뜻하는 불리언이고, 게다가 <code>sleep</code>까지 깨워 주는 불리언이다. 플래그를 따로 둘 이유가 없다. 공유 변수가 하나 줄면 두 신호가 어긋나는 경우를 생각할 필요도 사라진다.</p>
+<pre><code class="language-java">// PrinterV3: work 플래그를 없앴다
+// main
+if (input.equals("q")) {
+    Log.log("종료 요청");
+    printerThread.interrupt();   // 플래그 없이 인터럽트 하나로
+    break;
+}
+
+// Printer.run()
+@Override
+public void run() {
+    try {
+        while (!Thread.interrupted()) {
+            if (jobs.isEmpty()) {
+                continue;
+            }
+            String doc = jobs.poll();
+            Log.log("출력 시작: " + doc);
+            Thread.sleep(3000);
+            Log.log("출력 완료: " + doc);
+        }
+    } catch (InterruptedException e) {
+        Log.log("출력 도중 인터럽트");
+    }
+    Log.log("프린터 종료, 남은 문서 " + jobs.size() + "개");
+}</code></pre>
+<pre data-label="실행 결과 (입력은 예제 1과 같다)"><code class="language-text">01:46:47.730 [   main] 접수: doc1
+01:46:47.730 [printer] 출력 시작: doc1
+01:46:48.167 [   main] 접수: doc2
+01:46:48.687 [   main] 접수: doc3
+01:46:50.742 [printer] 출력 완료: doc1
+01:46:50.743 [printer] 출력 시작: doc2
+01:46:51.706 [   main] 종료 요청
+01:46:51.706 [printer] 출력 도중 인터럽트
+01:46:51.709 [printer] 프린터 종료, 남은 문서 1개
+01:46:51.710 [   main] main 종료</code></pre>
+<p>구조가 두 가지 바뀌었다. 첫째, 루프 조건이 <code>while (!Thread.interrupted())</code>다. 둘째, try-catch가 루프 바깥으로 나갔다. 둘 다 이유가 있다.</p>
+<p>try-catch의 위치부터 보자. 예제 2처럼 catch를 루프 안에 두고 싶다면 catch 블록에서 반드시 <code>break</code>하거나 상태를 복원해야 한다. 다음과 같이 쓰면 멈추지 않는 프린터가 된다.</p>
+<pre><code class="language-java">// 잘못된 예: 인터럽트를 받아도 멈추지 않는다
+while (!Thread.interrupted()) {
+    // ...
+    try {
+        Thread.sleep(3000);
+    } catch (InterruptedException e) {
+        Log.log("인터럽트!");   // break도, 상태 복원도 없다
+    }
+}</code></pre>
+<p><code>InterruptedException</code>이 던져질 때 상태는 이미 지워졌다. catch 블록이 로그만 찍고 끝나면 루프 조건 <code>Thread.interrupted()</code>는 <code>false</code>를 보고 다음 문서를 계속 출력한다. 인터럽트 요청은 로그 한 줄로 사라졌다. 앞 절의 "삼키기"와 같은 결함이다. try-catch를 루프 바깥에 두면 예외가 곧바로 루프 전체를 빠져나가므로 이런 실수를 할 여지가 구조적으로 없어진다. 인터럽트를 "이 루프 전체를 끝내라"는 뜻으로 쓴다면 그 뜻이 코드 구조에 그대로 드러나는 배치다.</p>
+<p>루프 조건에 <code>isInterrupted()</code> 대신 <code>Thread.interrupted()</code>를 쓴 이유는 루프를 나온 뒤의 상태를 맞추기 위해서다. 이 루프를 빠져나오는 길은 두 가지다. <code>sleep</code> 중에 인터럽트를 받아 예외로 나오는 길과, 빈 대기열 앞을 돌다가 루프 조건에서 나오는 길이다. 예외로 나오면 상태는 이미 지워져 있다. 루프 조건에서 <code>Thread.interrupted()</code>로 나오면 그 호출이 상태를 지운다. 어느 길로 나오든 루프 뒤에서 인터럽트 상태는 <code>false</code>이므로, 그 뒤에 <code>sleep</code>이 들어간 정리 작업을 붙여도 앞에서 본 "정리 작업이 즉시 실패하는" 문제가 생기지 않는다. 지금의 프린터처럼 루프 뒤에 대기하는 코드가 없다면 <code>isInterrupted()</code>를 써도 결과는 같다. 중요한 것은 차이를 알고 고르는 것이다.</p>
+<p>인터럽트 상태 하나로 종료 신호를 통일하면 가시성 문제도 따로 고민할 필요가 줄어든다. 인터럽트 상태 필드는 <code>volatile</code>이고, 앞에서 본 JLS §17.4.4의 규칙에 따라 인터럽트를 감지한 쪽은 인터럽트를 보낸 쪽이 그 전에 한 쓰기를 볼 수 있다. 우리가 따로 선언한 <code>volatile boolean work</code>가 하던 일을 JDK가 정의한 장치가 대신한다.</p>
+
+<h3>yield: CPU를 양보한다는 것</h3>
+<p>이제 바쁜 대기 문제로 넘어가기 전에 이 회차의 두 번째 도구를 세우자. 스케줄링의 기본부터 다시 떠올리자. 운영체제 스케줄러는 실행할 준비가 된 스레드들을 대기열에 두고, CPU 코어마다 하나씩 골라 일정 시간(타임 슬라이스) 실행시킨다. 자바의 <code>RUNNABLE</code>은 이 두 상태, 즉 "지금 코어 위에서 실행 중"과 "실행 대기열에서 차례를 기다리는 중"을 구분하지 않는다. 둘 다 <code>RUNNABLE</code>이다. <code>Thread.State.RUNNABLE</code>의 Javadoc이 "프로세서 같은 운영체제 자원을 기다리고 있을 수 있다"고 적은 것이 이 뜻이다.</p>
+<p><code>Thread.yield()</code>는 실행 중인 스레드가 "지금 내 차례를 다른 스레드에게 넘겨도 된다"고 스케줄러에게 알리는 메서드다. Javadoc의 첫 문장은 이렇다. 현재 스레드가 프로세서 사용을 양보할 의향이 있다는 스케줄러에 대한 <b>힌트</b>이며, 스케줄러는 이 힌트를 <b>무시해도 된다.</b> 이어서 yield는 CPU를 과하게 쓰는 스레드들 사이의 상대적 진행을 개선하려는 경험적(heuristic) 시도이고, 실제로 원하는 효과가 있는지 프로파일링과 벤치마크로 확인해야 하며, 이 메서드를 쓰는 것이 적절한 경우는 드물다고 적는다. 쓸모가 있을 수 있는 곳으로는 경합 조건 버그를 재현하는 디버깅·테스트와 <code>java.util.concurrent.locks</code> 패키지 같은 동시성 제어 구조의 설계를 든다.</p>
+<p>yield는 자바 스레드 상태를 바꾸지 않는다. <code>WAITING</code>이나 <code>TIMED_WAITING</code>이 되는 메서드 목록에 <code>yield</code>는 없다. 양보한 스레드는 계속 <code>RUNNABLE</code>이고, 운영체제 수준에서 "실행 중"에서 "실행 대기열의 뒤쪽"으로 옮겨질 뿐이다. 다음 차례가 오면 바로 다시 실행된다. 이 점이 <code>sleep</code>과의 결정적인 차이다. <code>sleep</code>은 스레드를 <code>TIMED_WAITING</code>으로 만들고 정한 시간 동안 실행 후보에서 아예 빼 버린다.</p>
+<h4>OpenJDK 21에서 yield가 하는 일</h4>
+<pre><code class="language-java">// OpenJDK 21 java.lang.Thread
+public static void yield() {
+    if (currentThread() instanceof VirtualThread vthread) {
+        vthread.tryYield();
+    } else {
+        yield0();
+    }
+}</code></pre>
+<p>가상 스레드(virtual thread)는 자기만의 양보 경로(<code>tryYield</code>)를 갖고, 이 회차가 다루는 플랫폼 스레드는 네이티브 메서드 <code>yield0()</code>로 간다. <code>yield0</code>는 <code>JVM_Yield</code>로 연결되고, <code>JVM_Yield</code>는 <code>os::naked_yield()</code>를 부른다. OpenJDK 21 HotSpot에서 <code>os::naked_yield()</code>는 POSIX 계열(리눅스, macOS 등, <code>os_posix.cpp</code>)에서는 <code>sched_yield()</code> 시스템 호출 한 줄이고, 윈도우(<code>os_windows.cpp</code>)에서는 <code>SwitchToThread()</code> 호출이다. 결국 자바의 yield는 운영체제의 양보 기능에 그대로 위임된다.</p>
+<p>그러니 yield가 정확히 무엇을 하는지는 운영체제가 정한다. 리눅스의 <code>sched_yield(2)</code> 매뉴얼은 이 호출이 호출한 스레드를 그 정적 우선순위의 대기열 맨 뒤로 보내고 새 스레드가 실행되게 한다고 설명한다. 그리고 주의 사항(CAVEATS)에 두 가지를 적는다. 호출한 스레드가 그 시점에 가장 높은 우선순위 목록에 혼자 있다면 호출 뒤에도 계속 실행된다. 또 <code>sched_yield()</code>는 실시간 스케줄링 정책(<code>SCHED_FIFO</code>, <code>SCHED_RR</code>)에서 쓰도록 만든 것이고, <code>SCHED_OTHER</code> 같은 비결정적 정책에서 쓰는 것은 동작이 규정되어 있지 않다. <code>sched(7)</code> 매뉴얼에 따르면 <code>SCHED_OTHER</code>는 실시간 장치가 필요 없는 모든 스레드를 위한 리눅스의 기본 시분할 정책이다. 실시간 정책을 따로 지정하지 않은 보통의 스레드라면 yield의 정확한 효과는 운영체제 문서로도 보장되지 않는다는 뜻이고, Javadoc이 "힌트"라고 부르는 이유와 맞아떨어진다.</p>
+<h4>yield와 sleep(0), 그리고 인터럽트</h4>
+<p>앞에서 본 <code>JVM_Sleep</code>에는 <code>nanos == 0</code>이면 <code>os::naked_yield()</code>를 부르는 분기가 있었다. 즉 OpenJDK 21의 플랫폼 스레드에서 <code>Thread.sleep(0)</code>은 yield와 같은 운영체제 호출로 끝난다. 하지만 둘이 같지는 않다. <code>JVM_Sleep</code>은 그 분기에 가기 전에 인터럽트 상태부터 확인한다. 직접 확인해 보자.</p>
+<pre><code class="language-java">public class SelfInterrupt {
+    public static void main(String[] args) {
+        Thread me = Thread.currentThread();
+        me.interrupt();
+        Thread.yield();
+        System.out.println("yield 후 isInterrupted = " + me.isInterrupted());
+        try {
+            Thread.sleep(0);
+            System.out.println("sleep(0) 정상 반환");
+        } catch (InterruptedException e) {
+            System.out.println("sleep(0) -> " + e.getMessage()
+                    + ", isInterrupted = " + me.isInterrupted());
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">yield 후 isInterrupted = true
+sleep(0) -> sleep interrupted, isInterrupted = false</code></pre>
+<p>yield는 인터럽트와 아무 관계가 없다. 체크 예외를 선언하지도 않고, 상태를 읽지도 지우지도 않는다. <code>sleep(0)</code>은 인터럽트된 스레드에서 즉시 예외를 던지고 상태를 지운다. 바쁜 대기 루프에 무엇을 넣을지 고를 때 이 차이가 실제로 문제가 된다. <code>sleep</code>을 넣으면 루프가 인터럽트에 반응하는 지점이 하나 더 생기고, yield를 넣으면 그렇지 않다. 다만 <code>sleep(0)</code>이 yield와 같은 운영체제 호출로 간다는 것은 HotSpot 구현이고, 명세는 그렇게 정하지 않는다.</p>
+<div class="table-wrap"><table><thead><tr><th>루프 안에 넣는 것</th><th>자바 스레드 상태</th><th>운영체제 수준에서 일어나는 일 (OpenJDK 21, POSIX)</th><th>인터럽트 반응</th></tr></thead><tbody>
+<tr><td>아무것도 없음</td><td><code>RUNNABLE</code></td><td>타임 슬라이스를 다 쓸 때까지 계속 실행</td><td>없음</td></tr>
+<tr><td><code>Thread.onSpinWait()</code></td><td><code>RUNNABLE</code></td><td>시스템 호출 없음. JVM이 CPU에 "스핀 중"이라는 힌트 명령을 낼 수 있음</td><td>없음</td></tr>
+<tr><td><code>Thread.yield()</code></td><td><code>RUNNABLE</code></td><td><code>sched_yield()</code>: 대기열 뒤로 가고, 다른 후보가 없으면 계속 실행</td><td>없음</td></tr>
+<tr><td><code>Thread.sleep(n)</code>, n &gt; 0</td><td><code>TIMED_WAITING</code></td><td>조건 변수에서 n 동안 대기. 실행 후보에서 빠짐</td><td>즉시 깨어나 <code>InterruptedException</code></td></tr>
+</tbody></table></div>
+
+<x-visual id="java-adv1-04-yield-run-queue" title="yield와 sleep이 운영체제 실행 대기열에서 스레드를 옮기는 방식" kind="개념도" ratio="16:9">
+<x-hint>CPU 코어 하나와 실행 대기열, 대기 영역을 그려, yield는 스레드를 대기열 맨 뒤로 보내고 sleep은 대기 영역으로 빼낸다는 차이를 보여 준다.</x-hint>
+<x-prompt>왼쪽에 큰 사각형 "CPU 코어", 그 안에 스레드 아이콘 "T1". 가운데에 가로로 놓인 칸 네 개짜리 줄 "실행 대기열", 칸에 "T2", "T3"가 있고 뒤 두 칸은 비어 있음. 오른쪽 아래에 점선 상자 "대기 영역 (TIMED_WAITING)". 코어의 T1에서 두 갈래 화살표: 파란 화살표는 실행 대기열 맨 뒤 빈칸으로 가며 라벨 "yield(): 대기열 맨 뒤로, RUNNABLE 유지". 주황 화살표는 대기 영역으로 가며 라벨 "sleep(n): 실행 후보에서 빠짐". 대기 영역에서 실행 대기열로 돌아오는 점선 화살표 "시간 경과 또는 interrupt()". 실행 대기열 맨 앞 T2에서 코어로 가는 화살표 "다음 차례". 아래쪽 작은 메모 "대기열에 다른 스레드가 없으면 yield한 스레드가 바로 다시 실행된다". 깔끔한 플랫 스타일.</x-prompt>
+<x-caption>yield는 차례만 넘기고 RUNNABLE에 남는다. sleep은 실행 후보에서 빠진다.</x-caption>
+</x-visual>
+
+<h3>프린터 예제 4: yield 도입, 그리고 그 한계</h3>
+<p>이제 프린터의 바쁜 대기로 돌아가자. 대기열이 비었을 때 계속 <code>isEmpty()</code>를 확인하는 대신, 확인할 때마다 한 번씩 CPU를 양보하게 바꾼다. 바뀌는 곳은 한 줄이다.</p>
+<pre><code class="language-java">// PrinterV4: PrinterV3의 run()에서 바뀐 부분만
+while (!Thread.interrupted()) {
+    if (jobs.isEmpty()) {
+        Thread.yield(); // 추가: 할 일이 없으면 양보
+        continue;
+    }
+    // ... 이하 PrinterV3와 같다
+}</code></pre>
+<pre data-label="실행 결과: (echo doc1; sleep 4; echo q) | java PrinterV4"><code class="language-text">01:46:51.780 [   main] 접수: doc1
+01:46:51.780 [printer] 출력 시작: doc1
+01:46:54.791 [printer] 출력 완료: doc1
+01:46:55.723 [   main] 종료 요청
+01:46:55.726 [printer] 프린터 종료, 남은 문서 0개
+01:46:55.726 [   main] main 종료</code></pre>
+<p>이번 실행은 일부러 대기열이 빈 상태에서 종료를 요청했다. doc1 출력이 54.791에 끝나고 55.723에 <code>q</code>가 들어올 때까지 프린터는 빈 대기열 앞에서 yield하며 돌고 있었다. 이때 인터럽트가 오면 예외는 생기지 않는다. yield는 인터럽트에 반응하지 않기 때문이다. 대신 다음 반복의 <code>Thread.interrupted()</code>가 <code>true</code>를 보고 루프가 끝난다. "출력 도중 인터럽트" 로그가 없는 것이 그 증거다. 예제 3에서 말한 "루프를 빠져나오는 두 번째 길"이 바로 이것이다.</p>
+<p>yield를 넣은 효과는 무엇일까. 프린터가 양보하면, 같은 코어를 기다리던 다른 스레드(입력을 처리할 main이나 다른 프로세스)가 차례를 더 빨리 얻을 수 있다. 하지만 기다리는 다른 스레드가 없으면 <code>sched_yield</code> 매뉴얼대로 프린터는 곧바로 다시 실행된다. 바쁜 대기는 여전히 바쁜 대기다. 이것을 숫자로 확인해 보자. 아래 프로그램은 같은 루프를 네 가지 방식으로 1초 동안 돌리고, 그 스레드가 실제로 쓴 CPU 시간을 <code>ThreadMXBean.getCurrentThreadCpuTime()</code>으로 잰다.</p>
+<pre><code class="language-java">import java.lang.management.ManagementFactory;
+
+public class SpinCost {
+    static volatile boolean stop;
+
+    public static void main(String[] args) throws InterruptedException {
+        for (String mode : new String[] {"busy", "yield", "onSpinWait", "sleep"}) {
+            stop = false;
+            long[] result = new long[2]; // [0] 반복 횟수, [1] CPU 시간(ns)
+            Thread t = new Thread(() -> {
+                long loops = 0;
+                while (!stop) {
+                    loops++;
+                    switch (mode) {
+                        case "yield" -> Thread.yield();
+                        case "onSpinWait" -> Thread.onSpinWait();
+                        case "sleep" -> {
+                            try {
+                                Thread.sleep(10);
+                            } catch (InterruptedException e) {
+                                return;
+                            }
+                        }
+                        default -> { }
+                    }
+                }
+                result[0] = loops;
+                result[1] = ManagementFactory.getThreadMXBean().getCurrentThreadCpuTime();
+            }, mode);
+            t.start();
+            Thread.sleep(1000);
+            stop = true;
+            t.join();
+            System.out.printf("%-10s 반복 %,14d회  CPU %4d ms (벽시계 약 1000 ms)%n",
+                    mode, result[0], result[1] / 1_000_000);
+        }
+    }
+}</code></pre>
+<pre data-label="한 번의 실행 예 (Apple M1, macOS, OpenJDK 21.0.13. 수치는 기계와 실행마다 다르다)"><code class="language-text">busy       반복  1,472,602,918회  CPU 1012 ms (벽시계 약 1000 ms)
+yield      반복      6,789,801회  CPU  990 ms (벽시계 약 1000 ms)
+onSpinWait 반복    479,400,333회  CPU 1007 ms (벽시계 약 1000 ms)
+sleep      반복             73회  CPU    2 ms (벽시계 약 1000 ms)</code></pre>
+<p>작업 스레드가 <code>result</code> 배열에 쓴 값을 main이 읽는 것은 <code>t.join()</code> 뒤이므로 안전하다. <code>join()</code>으로 종료를 확인한 쪽은 그 스레드의 모든 쓰기를 볼 수 있다(이 규칙도 다음 회차의 happens-before에서 정리한다). 측정값의 절대 크기는 의미가 없고 형태만 보자. 이 실행에서 바쁜 대기, yield, onSpinWait 세 방식은 모두 1초 동안 CPU를 거의 1초 썼다. 코어 하나를 통째로 붙잡았다는 뜻이다. yield는 반복 횟수를 크게 줄였다. 반복마다 시스템 호출을 하고 스케줄러를 거치므로 한 번의 반복이 훨씬 비싸졌기 때문이다. 그러나 이 기계에는 이 스레드 말고 코어를 원하는 스레드가 별로 없었으므로, 양보한 차례는 곧장 자기에게 돌아왔다. CPU를 덜 쓴 것은 <code>sleep</code>뿐이다. 반복 횟수가 100회가 아니라 73회인 것은 <code>sleep(10)</code>이 정확히 10밀리초만 자는 것이 아니기 때문이다. Javadoc의 표현대로 <code>sleep</code>은 "시스템 타이머와 스케줄러의 정밀도와 정확도에 따른다".</p>
+<p><code>Thread.onSpinWait()</code>는 Java 9에서 JEP 285로 들어온 메서드다. 호출자가 바쁜 대기 루프 안에 있다는 것을 런타임에 알리는 순수한 힌트이고, 아무것도 하지 않는 구현도 올바른 구현이다(OpenJDK 21의 자바 소스 본문은 실제로 비어 있고, <code>@IntrinsicCandidate</code>가 붙어 JIT가 대체할 수 있다). JEP 285는 동기로 x86 프로세서의 <code>PAUSE</code> 명령을 든다. 스핀 루프에 이 명령을 넣으면 스레드 사이의 왕복 지연이 줄어든다는 것이다. 즉 onSpinWait는 "CPU를 내려놓는" 도구가 아니라 "CPU를 붙잡고 기다리되 더 효율적으로 기다리는" 도구다. 측정 결과에서 CPU 시간이 그대로인 것과 맞는다. 아주 짧은 대기가 예상되어 잠들고 깨는 비용조차 아까울 때 쓰는 것이다.</p>
+<p>그러면 프린터에는 무엇이 맞는가. 문서가 언제 들어올지 모르는 상황에서 원하는 동작은 이렇다. 대기열이 비면 <b>잠들어서 CPU를 전혀 쓰지 않고</b>, 문서가 들어오는 <b>바로 그 순간 깨어난다.</b> <code>sleep(n)</code>은 앞의 것은 만족하지만, 문서가 들어와도 n이 지날 때까지 깨지 못하므로 뒤의 것을 만족하지 못한다. n을 줄이면 반응은 빨라지지만 그만큼 자주 깨어 확인하므로 다시 바쁜 대기에 가까워진다. yield와 onSpinWait는 앞의 것을 만족하지 못한다.</p>
+<p>두 조건을 함께 만족하려면 "문서를 넣는 쪽이 자고 있는 프린터를 깨우는" 장치가 필요하다. 인터럽트가 "멈추라"는 신호로 잠을 깨웠듯이, "일감이 생겼다"는 신호로 잠을 깨우는 장치다. 그것이 <code>Object.wait()</code>와 <code>notify()</code>, <code>Condition</code>, 그리고 이것들을 감싼 <code>BlockingQueue</code>다. 생산자-소비자 회차에서 이 프린터와 같은 구조를 그 도구들로 다시 만든다. 그래서 예제 4의 yield는 최종 해법이 아니라 "바쁜 대기를 조금 완화한 중간 단계"로 이해하는 것이 정확하다. Javadoc이 yield를 쓰는 것이 적절한 경우가 드물다고 한 것도 같은 맥락에서 읽을 수 있다.</p>
+
+<h3>가상 스레드에서는: 같은 API, 전혀 다른 구현</h3>
+<p>지금까지 따라간 <code>JVM_Sleep</code>, <code>_SleepEvent</code>, <code>sched_yield()</code>는 모두 플랫폼 스레드, 즉 OS 스레드 하나에 일대일로 붙은 자바 스레드의 이야기였다. 이 권의 본론도 플랫폼 스레드다. 그런데 Java 21에서는 <code>Thread.yield()</code> 소스에서 이미 본 것처럼 가상 스레드(virtual thread)라는 다른 갈래가 있고, <code>sleep</code>도 같은 갈림길을 둔다. 같은 메서드가 아래에서 완전히 다른 기계로 구현되는 모습을 보면, 앞에서 "명세"와 "HotSpot 구현"을 굳이 나눠 적은 이유가 실감 난다. 이 절의 내용은 모두 OpenJDK 21의 <code>java.lang.VirtualThread</code> 소스 기준이다.</p>
+<pre><code class="language-java">// OpenJDK 21 java.lang.Thread (발췌)
+public static void sleep(long millis) throws InterruptedException {
+    // ... 음수 검사
+    long nanos = MILLISECONDS.toNanos(millis);
+    // ... JFR 이벤트 준비(beforeSleep), afterSleep을 부르는 try-finally는 생략
+    if (currentThread() instanceof VirtualThread vthread) {
+        vthread.sleepNanos(nanos);   // 자바 코드로 구현된 잠
+    } else {
+        sleep0(nanos);               // 네이티브: JVM_Sleep
+    }
+}
+
+// OpenJDK 21 java.lang.VirtualThread (발췌)
+void sleepNanos(long nanos) throws InterruptedException {
+    if (getAndClearInterrupt())
+        throw new InterruptedException();
+    if (nanos == 0) {
+        tryYield();
+    } else {
+        try {
+            long remainingNanos = nanos;
+            long startNanos = System.nanoTime();
+            while (remainingNanos > 0) {
+                parkNanos(remainingNanos);
+                if (getAndClearInterrupt()) {
+                    throw new InterruptedException();
+                }
+                remainingNanos = nanos - (System.nanoTime() - startNanos);
+            }
+        } finally {
+            setParkPermit(true);     // 소스 주석: 자는 동안 unpark되었을 수 있다
+        }
+    }
+}</code></pre>
+<p>구조를 <code>JavaThread::sleep_nanos</code>와 나란히 놓으면 뼈대가 같다. 잠들기 전에 상태를 확인해 켜져 있으면 지우고 예외를 던진다. 남은 시간만큼 잠들고, 깨어날 때마다 먼저 인터럽트를 확인한 뒤 남은 시간을 다시 계산한다. <code>sleep(0)</code>은 양보로 바뀐다. "틈 없이 확인한다"는 성질은 그대로 지켜졌다. 다른 것은 잠드는 방법이다. <code>parkNanos</code>는 조건 변수에서 OS 스레드를 재우지 않는다. 먼저 <code>VirtualThread-unparker</code>라는 이름의 <code>ScheduledThreadPoolExecutor</code>(기본 스레드 1개, 시스템 속성 <code>jdk.unparker.maxPoolSize</code>로 조절)에 "n 나노초 뒤에 이 가상 스레드를 <code>unpark</code>하라"는 작업을 예약한다. 그다음 상태를 <code>TIMED_PARKING</code>으로 바꾸고 <code>Continuation.yield</code>로 자기 실행 스택(continuation)을 캐리어 스레드(carrier thread)에서 떼어 낸다. 캐리어 스레드는 가상 스레드를 실어 나르는 플랫폼 스레드로, 기본 스케줄러인 <code>ForkJoinPool</code>(FIFO 모드, 병렬도는 기본값이 <code>availableProcessors()</code>이고 <code>jdk.virtualThreadScheduler.parallelism</code>으로 바꿀 수 있다)의 작업 스레드다. 가상 스레드가 떨어져 나간 캐리어는 곧장 다른 가상 스레드를 실행한다. 다만 소스 주석대로, 캐리어에 고정(pinned)되어 떼어 낼 수 없는 경우에는 남은 시간 동안 캐리어 스레드 자체를 park한다(<code>parkOnCarrierThread</code>가 <code>Unsafe.park</code>를 부른다). 이때는 앞 절에서 본 HotSpot의 <code>parker</code>로 OS 스레드가 잠든다.</p>
+<p>인터럽트 쪽도 자바 코드다. <code>VirtualThread.interrupt()</code>는 <code>interrupted = true</code>를 쓰고, <code>nioBlocker</code>가 있으면 앞 절의 채널 닫기를 부르고, 가상 스레드가 캐리어에 올라가 있으면 캐리어의 인터럽트 상태도 켠 뒤(<code>setInterrupt()</code>는 <code>interrupt0()</code>으로 VM에 알린다), 마지막으로 <code>unpark()</code>를 부른다. <code>unpark()</code>는 대상이 <code>PARKED</code>나 <code>TIMED_PARKED</code>면 CAS로 상태를 <code>UNPARKED</code>로 바꾸고 continuation을 스케줄러에 다시 제출한다. 어느 캐리어가 그 작업을 집어 실행하면 가상 스레드는 <code>parkNanos</code>에서 돌아오고, <code>sleepNanos</code>의 루프가 상태를 확인해 예외를 던진다. <code>pthread_cond_signal</code>은 어디에도 없다.</p>
+<pre><code class="language-java">public class VirtualInterrupt {
+    public static void main(String[] args) throws Exception {
+        Thread vt = Thread.ofVirtual().name("vt").unstarted(() -> {
+            try {
+                Thread.sleep(10_000);
+            } catch (InterruptedException e) {
+                System.out.println("vt 예외 메시지 = " + e.getMessage());
+                System.out.println("vt isInterrupted = " + Thread.currentThread().isInterrupted());
+            }
+        });
+        vt.start();
+        Thread.sleep(200);
+        System.out.println("interrupt 전 vt 상태 = " + vt.getState());
+        vt.interrupt();
+        vt.join();
+
+        Thread pt = Thread.ofPlatform().name("pt").start(() -> {
+            try {
+                Thread.sleep(10_000);
+            } catch (InterruptedException e) {
+                System.out.println("pt 예외 메시지 = " + e.getMessage());
+            }
+        });
+        Thread.sleep(200);
+        pt.interrupt();
+        pt.join();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21.0.13)"><code class="language-text">interrupt 전 vt 상태 = TIMED_WAITING
+vt 예외 메시지 = null
+vt isInterrupted = false
+pt 예외 메시지 = sleep interrupted</code></pre>
+<p>자바 수준에서 관찰되는 것, 즉 <code>TIMED_WAITING</code> 상태, <code>InterruptedException</code>, 예외 뒤 지워진 상태는 플랫폼 스레드와 똑같다. 이것이 Javadoc이 정한 계약이기 때문이다. 다른 것은 예외 메시지다. 가상 스레드 쪽은 <code>new InterruptedException()</code>이라 메시지가 <code>null</code>이고, 플랫폼 스레드 쪽은 HotSpot이 넣은 <code>sleep interrupted</code>다. 메시지는 명세가 정하지 않은 구현 세부라는 것을 이보다 분명하게 보여 주는 예는 드물다. 예외 메시지 문자열로 분기하는 코드를 짜면 안 되는 이유다.</p>
+<p>"잠든 동안 OS 스레드를 쓰지 않는다"는 것도 실험으로 보자. 병렬도를 1로 고정하고(<code>-Djdk.virtualThreadScheduler.parallelism=1</code>) 가상 스레드 1만 개가 각각 <code>sleep(1000)</code>을 하게 한 뒤, 0.5초 시점에 상태와 플랫폼 스레드 수를 센다.</p>
+<pre><code class="language-java">import java.lang.management.ManagementFactory;
+import java.util.*;
+
+public class ManySleep {
+    public static void main(String[] args) throws Exception {
+        List<Thread> list = new ArrayList<>();
+        long t0 = System.nanoTime();
+        for (int i = 0; i < 10_000; i++) {
+            list.add(Thread.ofVirtual().start(() -> {
+                try { Thread.sleep(1000); } catch (InterruptedException e) { }
+            }));
+        }
+        Thread.sleep(500);
+        Set<String> carriers = new TreeSet<>();
+        for (Thread t : Thread.getAllStackTraces().keySet()) {   // 플랫폼 스레드만 돌려준다
+            if (t.getName().startsWith("ForkJoinPool") || t.getName().startsWith("VirtualThread")) carriers.add(t.getName());
+        }
+        System.out.println("자고 있는 가상 스레드 수 = " + list.stream().filter(t -> t.getState() == Thread.State.TIMED_WAITING).count());
+        System.out.println("JVM의 플랫폼 스레드 수 = " + ManagementFactory.getThreadMXBean().getThreadCount());
+        System.out.println("스케줄러 관련 플랫폼 스레드 = " + carriers);
+        for (Thread t : list) t.join();
+        System.out.printf("전체 소요 = %d ms%n", (System.nanoTime() - t0) / 1_000_000);
+    }
+}</code></pre>
+<pre data-label="실행 결과: java -Djdk.virtualThreadScheduler.parallelism=1 ManySleep (macOS, OpenJDK 21.0.13. 소요 시간은 실행마다 다르다)"><code class="language-text">자고 있는 가상 스레드 수 = 10000
+JVM의 플랫폼 스레드 수 = 8
+스케줄러 관련 플랫폼 스레드 = [ForkJoinPool-1-worker-1, VirtualThread-unparker]
+전체 소요 = 1034 ms</code></pre>
+<p>1만 개가 모두 <code>TIMED_WAITING</code>인데 JVM 전체의 플랫폼 스레드는 8개(main, 참조 처리, 시그널 처리 같은 JVM 기본 스레드 포함)이고, 그중 가상 스레드 스케줄링에 관련된 것은 캐리어 1개와 unparker 1개다. 캐리어가 하나뿐인데도 1만 개의 잠이 약 1초 만에 끝났다. 플랫폼 스레드로 같은 일을 하면 OS 스레드 1만 개가 각자 조건 변수에서 잠들어야 한다. 가상 스레드의 잠은 "OS 스레드를 재우는 것"이 아니라 "실행할 작업 목록에서 잠시 빠지는 것"이다.</p>
+<h4>가상 스레드의 yield는 실제로 차례를 넘긴다</h4>
+<p>yield에서 차이는 더 극적이다. 플랫폼 스레드의 yield는 <code>sched_yield()</code>라는 운영체제 힌트였고, 효과는 운영체제 문서로도 보장되지 않았다. 가상 스레드의 <code>tryYield()</code>는 상태를 <code>YIELDING</code>으로 바꾸고 <code>Continuation.yield</code>로 캐리어에서 내려온 뒤, <code>afterYield()</code>에서 상태를 <code>YIELDED</code>로 바꾸고 자기 continuation을 스케줄러에 다시 제출한다(캐리어의 로컬 작업 큐가 비어 있으면 <code>ForkJoinPool.externalSubmit</code>으로, 아니면 <code>execute</code>로). 양보한 가상 스레드는 스케줄러에 다시 제출되므로, 그사이 캐리어는 이미 제출되어 기다리던 다른 가상 스레드를 집어 실행할 수 있다. 캐리어 OS 스레드는 이 과정에서 <code>sched_yield()</code>를 부르지 않는다. 캐리어를 하나로 고정하고 두 가상 스레드가 세 번씩 기록을 남기게 해 보자.</p>
+<pre><code class="language-java">public class VirtualYield {
+    public static void main(String[] args) throws Exception {
+        boolean yield = args.length > 0;
+        StringBuffer order = new StringBuffer();
+        Runnable task = () -> {
+            String name = Thread.currentThread().getName();
+            for (int i = 1; i <= 3; i++) {
+                order.append(name).append(i).append(' ');
+                if (yield) Thread.yield();
+            }
+        };
+        Thread a = Thread.ofVirtual().name("A").unstarted(task);
+        Thread b = Thread.ofVirtual().name("B").unstarted(task);
+        a.start();
+        b.start();
+        a.join();
+        b.join();
+        System.out.println((yield ? "yield 있음: " : "yield 없음: ") + order);
+    }
+}</code></pre>
+<pre data-label="실행 결과: java -Djdk.virtualThreadScheduler.parallelism=1 VirtualYield [y] (macOS, OpenJDK 21.0.13)"><code class="language-text">yield 없음: A1 A2 A3 B1 B2 B3
+yield 있음: A1 B1 A2 B2 A3 B3</code></pre>
+<p>캐리어가 하나뿐이므로 yield가 없으면 A가 끝날 때까지 B는 캐리어를 얻지 못한다. yield를 넣으면 A가 한 번 기록할 때마다 큐의 B에게 캐리어가 넘어가 둘이 번갈아 실행된다. 이 환경에서 yield를 넣은 경우를 20번 실행해 20번 모두 같은 순서가 나왔다. 그러나 이것은 OpenJDK 21의 스케줄러 구현과 병렬도 1이라는 조건이 만든 결과이고, Javadoc은 플랫폼 스레드와 가상 스레드를 구분하지 않고 yield를 스케줄러가 무시할 수 있는 힌트라고만 정한다. 병렬도를 기본값으로 두면 A와 B가 서로 다른 캐리어에서 동시에 돌 수 있으므로 이 순서는 나오지 않을 수 있다. 뒤의 흔한 오해 목록에 나오는 "yield하면 다른 스레드가 반드시 먼저 실행된다"는 가상 스레드에서도 오해다. 다만 "yield가 실제로 무엇을 하는가"의 답은 플랫폼 스레드(<code>sched_yield</code>, 효과는 OS 재량)와 가상 스레드(스케줄러 큐에 재제출)가 완전히 다르다.</p>
+
+<h3>흔한 오해 바로잡기</h3>
+<h4>"interrupt()를 부르면 스레드가 멈춘다"</h4>
+<p>멈추지 않는다. <code>interrupt()</code>가 하는 일은 상태 비트를 켜는 것과 인터럽트 가능한 대기를 끊는 것뿐이다. 계산 중인 스레드는 계속 계산하고, 대기에서 깨어난 스레드도 <code>InterruptedException</code>을 잡아 무시하면 계속 실행된다. 멈추는 것은 대상 스레드의 코드가 그렇게 짜여 있을 때뿐이다. 이것이 이 회차 첫머리에서 말한 협조적 취소의 뜻이다.</p>
+<h4>"인터럽트하면 InterruptedException이 발생한다"</h4>
+<p>예외는 <code>sleep</code>, <code>join</code>, <code>wait</code>처럼 인터럽트를 확인하도록 정의된 메서드 안에서만, 또는 그 메서드에 들어갈 때 상태가 이미 켜져 있을 때만 발생한다. 계산 중이거나 <code>synchronized</code> 락을 기다리거나 <code>InputStream</code>에서 읽는 중이면 상태만 켜지고 예외는 없다. 예외가 생기는 지점은 대상 스레드의 코드 안이지, 인터럽트를 보낸 쪽이 아니다.</p>
+<h4>"t.interrupted()는 t의 상태를 확인한다"</h4>
+<p><code>interrupted()</code>는 정적 메서드이므로 어떤 참조로 부르든 현재 스레드를 검사하고, 게다가 상태를 지운다. 앞의 <code>StaticCall</code> 실행 결과처럼 엉뚱한 스레드의 인터럽트 요청을 소비해 버릴 수 있다. 다른 스레드를 관찰할 때는 <code>t.isInterrupted()</code>를 쓴다.</p>
+<h4>"InterruptedException은 귀찮으니 잡아서 무시해도 된다"</h4>
+<p>무시하는 순간 그 스레드에 대한 멈춤 요청이 사라진다. <code>Swallow</code> 예제의 스레드는 인터럽트를 받고도 영원히 돈다. 스레드 풀 같은 상위 구조가 인터럽트로 작업을 취소하려 할 때 이런 코드가 하나라도 있으면 취소가 동작하지 않는다. 던지거나, 복원하거나, 그 자리에서 스레드를 끝내거나 셋 중 하나를 고른다.</p>
+<h4>"sleep이나 yield를 넣으면 다른 스레드가 바꾼 값을 다시 읽는다"</h4>
+<p>JLS §17.3은 둘에 동기화 의미가 없다고 명시한다. <code>sleep</code>을 넣은 루프가 우연히 잘 동작하더라도 그것은 명세가 보장한 결과가 아니다. 여러 스레드가 함께 보는 플래그에는 <code>volatile</code>이나 다른 동기화가 필요하다. 인터럽트 상태처럼 JDK가 동기화를 보장하는 장치를 쓰면 이 고민을 덜 수 있다.</p>
+<h4>"yield하면 다른 스레드가 반드시 먼저 실행된다"</h4>
+<p>yield는 힌트이고 스케줄러는 무시해도 된다. 리눅스 매뉴얼은 같은 우선순위에 다른 후보가 없으면 호출한 스레드가 계속 실행된다고 적는다. 코어가 여러 개라면 다른 스레드는 이미 다른 코어에서 돌고 있을 수도 있다. yield에 순서를 맡기는 코드는 어떤 순서도 보장받지 못한다. 순서가 필요하면 <code>join</code>, 락, 조건 대기 같은 동기화 수단을 쓴다.</p>
+
+<h3>정리: 이 회차가 다음 회차들과 이어지는 곳</h3>
+<p>이 회차에서 세운 그림을 한 줄로 줄이면 이렇다. <b>스레드를 밖에서 멈추게 하는 안전한 방법은 요청을 남기고 깨우는 것뿐이며, 자바는 그 요청을 인터럽트 상태라는 불리언 하나와 대기 이벤트를 깨우는 신호로 구현한다.</b> 그리고 양보는 스레드 상태를 바꾸지 않는 운영체제 수준의 힌트다. 이 두 가지는 이 권의 나머지 회차에서 계속 다시 나온다.</p>
+<ul>
+<li><b>메모리 가시성:</b> 이 회차에서 "자세한 것은 다음 회차"라고 미뤄 둔 것들, 즉 플래그에 <code>volatile</code>이 필요한 이유, JLS §17.3의 "깨진 루프", 인터럽트와 <code>join</code>이 만드는 happens-before가 다음 회차의 본론이다.</li>
+<li><b>동기화와 Lock:</b> <code>synchronized</code> 락을 기다리는 <code>BLOCKED</code> 스레드는 인터럽트로 깨울 수 없었다. <code>ReentrantLock</code>은 <code>lockInterruptibly()</code>로 이 제약을 푼다. 그 아래에 있는 <code>LockSupport.park()</code>는 이 회차에서 본 <code>parker()</code> 이벤트에서 잠들고, 인터럽트로 깨어난다.</li>
+<li><b>생산자-소비자:</b> 프린터 예제 4에서 남긴 숙제인 "일감이 생기면 깨우기"를 <code>wait</code>/<code>notify</code>, <code>Condition</code>, <code>BlockingQueue</code>로 푼다. JLS §17.2.3이 말한 "대기 집합에서 빠져나와 <code>InterruptedException</code>을 던진다"는 규칙과, <code>wait()</code>의 가짜 깨어남이 그때 다시 나온다.</li>
+<li><b>스레드 풀과 Executor:</b> <code>ExecutorService.shutdownNow()</code>의 Javadoc은 실행 중인 작업을 멈추려 최선을 다할 뿐 보장하지 않으며, 일반적인 구현은 <code>Thread.interrupt</code>로 취소하므로 인터럽트에 반응하지 않는 작업은 영원히 끝나지 않을 수 있다고 적는다. <code>Future.cancel(true)</code>의 <code>mayInterruptIfRunning</code>도 같은 장치다. 이 회차에서 배운 "인터럽트에 반응하는 작업을 짜는 법"이 그대로 스레드 풀을 우아하게 종료하는 조건이 된다.</li>
+</ul>
+<aside class="keyidea"><span>이 장의 핵심</span><p>잠든 스레드는 어떤 코드도 실행하지 않으므로 공유 플래그를 확인할 수 없다. 인터럽트는 상태 비트를 켜고 <code>sleep</code>·<code>wait</code>·<code>join</code>·<code>park</code>의 대기를 깨워 이 틈을 메우며, 대기 메서드는 들어갈 때와 깨어날 때 모두 상태를 확인하므로 요청이 새어 나가지 않는다. 예외를 던질 때 상태가 지워지므로, 예외를 잡은 코드는 다시 던지거나 상태를 복원하거나 그 자리에서 스레드를 끝내야 한다. <code>yield</code>는 상태를 <code>RUNNABLE</code>로 둔 채 운영체제에 차례를 넘기겠다는 힌트일 뿐이어서, 바쁜 대기의 근본 해법은 깨워 주는 쪽이 있는 대기다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>협조적 취소</dt><dd>자바는 스레드를 밖에서 강제로 끊지 않는다. 밖에서는 요청만 보내고, 대상 스레드가 안전한 지점에서 요청을 확인해 스스로 정리하고 끝난다. Java 21의 <code>Thread.stop()</code>은 항상 <code>UnsupportedOperationException</code>을 던진다.</dd>
+<dt>플래그 방식의 한계</dt><dd>잠든 스레드는 플래그를 확인하는 코드조차 실행하지 않으므로, 최악의 응답 지연은 잠자는 시간만큼이다. 플래그에는 <code>volatile</code>이 필요하다(JLS §17.3: sleep과 yield에는 동기화 의미가 없다).</dd>
+<dt>인터럽트 상태</dt><dd>OpenJDK 21에서 <code>Thread</code>의 <code>volatile boolean interrupted</code> 필드. <code>interrupt()</code>가 켜고, <code>InterruptedException</code> 발생과 <code>Thread.interrupted()</code>가 지운다. <code>isInterrupted()</code>는 읽기만 한다.</dd>
+<dt>인터럽트로 끊기는 대기</dt><dd><code>sleep</code>, <code>join</code>, <code>wait</code>(예외), <code>LockSupport.park</code>(반환), <code>InterruptibleChannel</code> I/O, <code>Selector</code>. 모니터 락 획득(<code>BLOCKED</code>)과 <code>InputStream</code> 읽기는 끊기지 않는다.</dd>
+<dt>HotSpot의 깨우기 경로</dt><dd><code>interrupt0</code> → <code>JVM_Interrupt</code> → <code>JavaThread::interrupt()</code>가 <code>_SleepEvent</code>, <code>parker</code>, <code>_ParkEvent</code>를 모두 unpark한다. <code>JVM_Sleep</code>은 잠들기 전과 깨어난 뒤에 상태를 확인하므로 요청이 새지 않는다.</dd>
+<dt>예외 처리 규칙</dt><dd><code>InterruptedException</code>을 잡았으면 다시 던지거나, <code>Thread.currentThread().interrupt()</code>로 상태를 복원하거나, 그 자리에서 스레드를 끝낸다. 무시하면 요청이 사라진다.</dd>
+<dt>인터럽트의 happens-before</dt><dd>JLS §17.4.4: T1의 인터럽트는 T2가 인터럽트되었음을 감지하는 지점과 synchronizes-with 관계다. 인터럽트 전에 한 쓰기는 감지 후에 보인다.</dd>
+<dt>yield</dt><dd>스케줄러에 대한 힌트이고 무시될 수 있다. 상태는 <code>RUNNABLE</code>을 유지한다. OpenJDK 21 플랫폼 스레드에서는 POSIX <code>sched_yield()</code>, 윈도우 <code>SwitchToThread()</code>로 위임된다. 인터럽트와 무관하다.</dd>
+<dt>인터럽트 가능한 채널</dt><dd>OpenJDK 21에서 채널은 <code>begin()</code>으로 스레드의 <code>nioBlocker</code>에 "채널 닫기"를 걸어 두고, 인터럽트가 오면 fd를 죽은 소켓으로 <code>dup2</code>하고 신호(<code>pthread_kill</code>)를 보내 커널 안의 <code>read</code>를 끝낸다. 채널 전체가 닫히고 인터럽트 상태는 남는다.</dd>
+<dt>바쁜 대기</dt><dd>조건을 쉬지 않고 확인하는 루프. yield와 onSpinWait를 넣어도 CPU를 계속 쓴다. 근본 해법은 조건이 바뀔 때 깨워 주는 대기(wait/notify, BlockingQueue)다.</dd>
+</x-summary>
+
+<x-review>
+<p>운영 중인 서비스에서 "배포할 때 애플리케이션이 종료되지 않고 강제 종료(kill -9)될 때까지 버틴다"는 증상을 만나면, 가장 먼저 의심할 곳이 인터럽트에 반응하지 않는 작업이다. 스레드 풀의 종료 과정은 작업 스레드에 인터럽트를 보내는 방식으로 취소를 시도하는데, 작업 코드 어딘가에 <code>catch (InterruptedException e) {}</code>가 있거나, 인터럽트로 끊기지 않는 블로킹 I/O에서 기다리고 있으면 요청이 닿지 않는다. 스레드 덤프를 떠서 남아 있는 스레드가 어디에서 무슨 상태로 멈춰 있는지 보면, 이 회차에서 본 구분(<code>TIMED_WAITING (sleeping)</code>인지, <code>BLOCKED</code>인지, I/O 안의 <code>RUNNABLE</code>인지)이 원인을 바로 좁혀 준다.</p>
+<p>라이브러리나 공통 유틸리티를 만들 때는 인터럽트 정책을 호출자에게 넘기는 것이 기본이다. 대기를 포함하는 메서드라면 <code>throws InterruptedException</code>을 선언하는 것이 가장 정직하다. 시그니처를 바꿀 수 없다면 상태를 복원한다. 반대로 스레드를 직접 소유하는 코드(자기가 만든 스레드의 <code>run()</code> 최상위)만이 "인터럽트를 받으면 끝낸다"는 결정을 내릴 수 있다. 이 구분이 흐려지면 공통 코드 한 곳의 빈 catch 블록이 시스템 전체의 취소를 망가뜨린다.</p>
+<p>yield를 보면 일단 의심하는 것이 맞다. 동시성 코드에서 yield가 문제를 "해결"한 것처럼 보이면, 대개 실행 순서를 우연히 바꿔 경합 조건이 덜 드러나게 만든 것이다. 그 경우 진짜 해법은 올바른 동기화다. 바쁜 대기를 완화하려고 yield를 넣었다면 CPU 사용량을 실제로 재 보고, 대부분은 깨워 주는 대기 구조로 바꾸는 편이 낫다. 다만 대기 시간이 매우 짧다고 확신할 수 있는 저수준 동기화 코드에서는 잠들고 깨는 비용을 피하려고 짧게 스핀하는 설계가 쓰이고, 그때 <code>onSpinWait</code>가 의미를 갖는다. 판단의 기준은 "기다리는 시간이 잠들고 깨는 비용보다 짧은가"다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 코드를 main 스레드에서 실행하면 세 줄에 무엇이 출력되는지 예측하고 이유를 설명하라. <code>Thread.currentThread().interrupt(); System.out.println(Thread.interrupted()); System.out.println(Thread.interrupted()); System.out.println(Thread.currentThread().isInterrupted());</code></li>
+<li>다음 작업 스레드는 <code>interrupt()</code>를 받아도 멈추지 않는다. 원인을 인터럽트 상태의 변화로 설명하고, 두 가지 방법으로 고쳐라. <code>while (!Thread.currentThread().isInterrupted()) { try { doWork(); Thread.sleep(1000); } catch (InterruptedException e) { Log.log("인터럽트"); } }</code></li>
+<li><code>FlagStop</code>에서 worker의 잠을 <code>sleep(5000)</code>, main의 대기를 <code>sleep(7000)</code>으로 바꾸면 worker는 몇 초에 종료되는가? 같은 조건에서 플래그 대신 <code>interrupt()</code>를 쓰면 몇 초인가? 타임라인을 그려 답하라.</li>
+<li><code>PrinterV3</code>에서 프린터 스레드가 <code>Thread.interrupted()</code>로 <code>false</code>를 확인하고 <code>jobs.poll()</code>로 문서를 꺼낸 직후, <code>Thread.sleep(3000)</code>에 들어가기 직전에 main이 인터럽트를 보냈다. 이후 무슨 일이 일어나는지 HotSpot의 <code>JVM_Sleep</code> 동작에 근거해 설명하라. 같은 시점에 <code>PrinterV1</code>(플래그만 사용)이었다면 어떻게 되는가?</li>
+<li>프린터 예제 4에 yield를 넣었는데도 대기열이 빈 동안 CPU 사용률이 떨어지지 않았다. 왜 그런지 <code>sched_yield</code>의 동작으로 설명하고, CPU를 쓰지 않으면서 문서가 들어오는 즉시 반응하려면 어떤 장치가 필요한지 말하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> <code>true</code>, <code>false</code>, <code>false</code>다. 첫 <code>Thread.interrupted()</code>는 켜진 상태를 읽어 <code>true</code>를 돌려주면서 상태를 지운다(<code>getAndClearInterrupt</code>는 <code>true</code>를 읽었을 때만 지운다). 두 번째 호출은 지워진 상태를 읽으므로 <code>false</code>이고, 지울 것이 없으니 그대로 둔다. 마지막 <code>isInterrupted()</code>는 읽기만 하므로 <code>false</code>다. Javadoc의 "연속으로 두 번 부르면 두 번째는 false" 설명 그대로다.</p>
+<p><b>2번.</b> 인터럽트는 대부분 <code>sleep(1000)</code> 중에 도착한다. 이때 <code>InterruptedException</code>이 던져지면서 상태가 <code>false</code>로 지워지고, catch 블록은 로그만 찍는다. 루프 조건 <code>isInterrupted()</code>는 <code>false</code>를 보고 계속 돈다. 고치는 방법 하나는 catch 블록에서 <code>Thread.currentThread().interrupt();</code>로 상태를 복원해 루프 조건이 보게 하는 것이고, 다른 하나는 try-catch를 루프 바깥으로 옮겨 예외가 루프 전체를 빠져나가게 하는 것이다(또는 catch에서 <code>break</code>). <code>doWork()</code> 실행 중에 인터럽트가 도착하는 경우는 상태가 남아 있으므로 다음 <code>sleep</code>이 즉시 예외를 던지고, 결국 같은 catch 블록에서 같은 문제가 생긴다.</p>
+<p><b>3번.</b> 플래그 방식: worker는 0초, 5초, 10초에 깨어 플래그를 확인한다. main이 7초에 플래그를 내리므로 5초의 확인은 <code>true</code>, 10초의 확인에서 <code>false</code>를 보고 10초에 종료한다. 응답 지연 3초. 인터럽트 방식: 7초에 worker는 5초에 시작한 두 번째 잠 속에 있고, <code>interrupt()</code>가 잠을 즉시 끊으므로 7초에 종료한다(정확히는 깨우기와 스케줄링에 걸리는 아주 짧은 시간 뒤).</p>
+<p><b>4번.</b> 인터럽트는 상태를 <code>true</code>로 켜고 이벤트를 깨운다. 아직 잠들지 않았으니 깨울 대상은 없다. 프린터가 이어서 <code>Thread.sleep(3000)</code>을 부르면 <code>JVM_Sleep</code>은 잠들기 전에 <code>is_interrupted(true)</code>로 상태를 확인하고, <code>true</code>이므로 상태를 지우고 곧바로 <code>InterruptedException("sleep interrupted")</code>을 던진다. 루프 바깥의 catch가 "출력 도중 인터럽트"를 찍고 프린터가 끝난다. 3초를 기다리지 않는다. <code>PrinterV1</code>이었다면 프린터는 이미 <code>while (work)</code>를 통과했으므로 3초를 다 자고 "출력 완료"를 찍은 뒤에야 플래그를 보고 멈춘다. 확인과 잠들기 사이의 틈을 인터럽트는 메우고 플래그는 메우지 못한다.</p>
+<p><b>5번.</b> <code>sched_yield</code>는 호출한 스레드를 같은 우선순위 대기열의 뒤로 보낼 뿐, 실행 후보에서 빼지 않는다. 다른 실행 후보가 없으면 호출한 스레드가 곧바로 다시 실행되므로, 루프는 시스템 호출을 끼운 채 계속 돈다. <code>SpinCost</code>의 측정처럼 CPU 시간이 벽시계 시간과 비슷하게 나온다. 필요한 것은 대기열이 비면 실행 후보에서 빠져 잠들고(CPU 0), 문서를 넣는 쪽이 잠든 프린터를 깨워 주는 장치다. <code>Object.wait()</code>/<code>notify()</code>, <code>Condition</code>, <code>BlockingQueue.take()</code>가 그것이며 생산자-소비자 회차의 주제다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>스레드 A가 <code>Thread.sleep(5000)</code> 중일 때 스레드 B가 <code>a.interrupt()</code>를 호출했다. A의 catch 블록 첫 줄에서 <code>Thread.currentThread().isInterrupted()</code>를 부르면 무엇이 반환되는가?</q>
+<o><code>true</code>. 인터럽트를 받았으므로 상태가 켜져 있다.</o>
+<o><code>false</code>. <code>InterruptedException</code>을 던지면서 인터럽트 상태가 지워졌다.</o>
+<o>B가 <code>interrupt()</code>를 부른 직후인지 아닌지에 따라 매번 다르다.</o>
+<o><code>isInterrupted()</code>를 catch 블록에서 부르면 다시 <code>InterruptedException</code>이 발생한다.</o>
+<why><code>sleep</code>의 Javadoc은 이 예외를 던질 때 현재 스레드의 인터럽트 상태를 지운다고 명시한다. HotSpot의 <code>sleep_nanos</code>도 <code>is_interrupted(true)</code>로 읽으면서 지운다. 따라서 catch 블록에서는 <code>false</code>다(그 사이에 누군가 다시 인터럽트하지 않았다면). 결과가 실행마다 달라지지 않으며, <code>isInterrupted()</code>는 예외를 던지지 않는 단순한 읽기다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>다음 중 다른 스레드가 <code>interrupt()</code>를 호출했을 때 대기가 즉시 끝나는 경우는?</q>
+<o><code>synchronized</code> 블록에 들어가려고 모니터 락을 기다리는 <code>BLOCKED</code> 스레드</o>
+<o><code>System.in.read()</code>에서 입력을 기다리는 스레드</o>
+<o>다른 스레드에 대해 <code>join()</code>을 호출하고 기다리는 스레드</o>
+<o>긴 반복문으로 계산 중인 스레드</o>
+<why><code>interrupt()</code>의 Javadoc은 <code>wait</code>, <code>join</code>, <code>sleep</code> 중인 스레드가 <code>InterruptedException</code>을 받는다고 정한다. 모니터 락 획득은 그 목록에 없어 실험에서도 <code>BLOCKED</code>가 유지되었고, <code>InputStream</code>은 <code>InterruptibleChannel</code>이 아니어서 <code>read()</code>가 끊기지 않았다. 계산 중인 스레드는 상태만 켜지고, 코드가 직접 확인하지 않으면 계속 실행된다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>main 스레드에서 <code>worker.interrupt();</code> 다음 줄에 <code>if (worker.interrupted()) { ... }</code>라고 썼다. 이 조건식이 실제로 하는 일은?</q>
+<o>worker의 인터럽트 상태를 읽고 지운다.</o>
+<o>worker의 인터럽트 상태를 읽기만 한다.</o>
+<o>컴파일 오류가 난다. 정적 메서드는 인스턴스로 부를 수 없다.</o>
+<o>main 스레드 자신의 인터럽트 상태를 읽고, 켜져 있었다면 지운다.</o>
+<why><code>interrupted()</code>는 정적 메서드이고 현재 스레드를 검사한다. 자바는 정적 메서드를 인스턴스 참조로 부르는 것을 허용하므로 컴파일은 되며(<code>-Xlint</code>에서 경고), 참조 <code>worker</code>는 무시된다. 따라서 main의 상태를 읽고 지운다. worker의 상태를 읽기만 하려면 <code>worker.isInterrupted()</code>를 써야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>OpenJDK 21의 플랫폼 스레드에서 <code>Thread.yield()</code>에 대한 설명으로 옳은 것은?</q>
+<o>스레드 상태는 <code>RUNNABLE</code>로 유지되고, POSIX 계열에서는 <code>sched_yield()</code>로 위임되며, 다른 실행 후보가 없으면 곧바로 다시 실행될 수 있다.</o>
+<o>스레드 상태가 잠시 <code>TIMED_WAITING</code>이 되었다가 돌아온다.</o>
+<o>인터럽트 상태가 켜져 있으면 <code>InterruptedException</code>을 던진다.</o>
+<o>호출 전에 쓴 공유 변수의 값을 다른 스레드가 볼 수 있게 메모리에 반영한다.</o>
+<why><code>yield</code>는 <code>TIMED_WAITING</code>이 되는 메서드 목록에 없고, <code>JVM_Yield</code> → <code>os::naked_yield()</code> → <code>sched_yield()</code>로 이어진다. <code>sched_yield</code> 매뉴얼은 같은 우선순위에 다른 스레드가 없으면 계속 실행된다고 적는다. yield는 체크 예외를 선언하지 않고 인터럽트 상태를 건드리지 않으며(실험에서 상태가 <code>true</code>로 남았다), JLS §17.3은 yield에 동기화 의미가 없다고 명시한다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>작업 스레드가 <code>while (!stopRequested) { Thread.sleep(1000); }</code>를 돈다. <code>stopRequested</code>는 <code>volatile</code>이 아닌 필드이고 다른 스레드가 <code>true</code>로 바꾼다. JLS §17.3에 비추어 옳은 설명은?</q>
+<o><code>sleep</code>이 매번 메모리를 새로 읽게 하므로 늦어도 1초 안에 루프가 끝난다.</o>
+<o><code>sleep</code> 때문에 컴파일 오류가 난다.</o>
+<o><code>sleep</code>과 <code>yield</code>에는 동기화 의미가 없으므로, 컴파일러가 필드를 한 번만 읽고 재사용해 루프가 끝나지 않을 수 있다.</o>
+<o><code>sleep</code> 중에는 캐시가 비워지므로 <code>volatile</code>이 없어도 항상 안전하다.</o>
+<why>JLS §17.3은 바로 이 형태의 코드를 "깨진" 예로 들며, 컴파일러가 <code>sleep</code> 전후로 레지스터의 값을 내보내거나 다시 읽을 의무가 없으므로 필드를 한 번만 읽어 루프가 끝나지 않을 수 있다고 설명한다. 해결책은 <code>volatile</code> 등 동기화이며, 그 원리는 메모리 가시성 회차의 주제다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>인터럽트(interrupt)</dt><dd>한 스레드가 다른 스레드에 작업 중단을 요청하는 자바의 장치. 대상의 인터럽트 상태를 켜고, 인터럽트 가능한 대기 중이면 그 대기를 끊는다. CPU 하드웨어 인터럽트와는 관계가 없다.</dd>
+<dt>인터럽트 상태(interrupt status)</dt><dd>스레드마다 하나씩 있는 불리언 값. <code>interrupt()</code>가 켜고 <code>Thread.interrupted()</code>와 <code>InterruptedException</code> 발생이 지운다.</dd>
+<dt>InterruptedException</dt><dd><code>sleep</code>, <code>join</code>, <code>wait</code> 등이 인터럽트를 감지했을 때 던지는 체크 예외. 던져질 때 인터럽트 상태는 지워진다.</dd>
+<dt>협조적 취소(cooperative cancellation)</dt><dd>취소를 요청하는 쪽은 신호만 보내고, 대상이 안전한 지점에서 신호를 확인해 스스로 멈추는 방식.</dd>
+<dt>양보(yield)</dt><dd>실행 중인 스레드가 CPU 차례를 넘기겠다고 스케줄러에 알리는 힌트. 스레드 상태는 바뀌지 않으며 스케줄러는 무시할 수 있다.</dd>
+<dt>바쁜 대기(busy waiting)</dt><dd>조건이 만족될 때까지 잠들지 않고 반복해서 확인하는 대기. 기다리는 동안 CPU를 계속 쓴다. 스핀(spin)이라고도 한다.</dd>
+<dt>실행 대기열(run queue)</dt><dd>운영체제 스케줄러가 실행할 준비가 된 스레드를 모아 두는 자료 구조. 자바의 <code>RUNNABLE</code>은 실행 중인 스레드와 이 대기열의 스레드를 모두 포함한다.</dd>
+<dt>가짜 깨어남(spurious wakeup)</dt><dd>통지나 인터럽트, 시간 만료 없이 대기가 끝나는 현상. <code>Object.wait()</code>와 <code>LockSupport.park()</code>에서 허용되므로 조건을 루프로 다시 확인해야 한다.</dd>
+<dt>캐리어 스레드(carrier thread)</dt><dd>가상 스레드를 실어 실행하는 플랫폼 스레드. OpenJDK 21에서는 기본 스케줄러 <code>ForkJoinPool</code>의 작업 스레드이며, 가상 스레드가 <code>sleep</code>이나 <code>yield</code>로 내려오면 다른 가상 스레드를 실행한다.</dd>
+<dt>스핀 대기 힌트(Thread.onSpinWait)</dt><dd>Java 9(JEP 285)에서 추가된, 바쁜 대기 루프 안에 있음을 런타임에 알리는 메서드. CPU를 내려놓지 않으며, 아무것도 하지 않는 구현도 허용된다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Thread.html">Java SE 21 API: java.lang.Thread</a> — <code>interrupt()</code>, <code>interrupted()</code>, <code>isInterrupted()</code>, <code>sleep()</code>, <code>yield()</code>, <code>onSpinWait()</code>, <code>Thread.State</code>의 정의</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html">JLS SE 21 Chapter 17: Threads and Locks</a> — §17.2.3 인터럽트, §17.3 sleep과 yield에 동기화 의미가 없다는 규정, §17.4.4 인터럽트의 synchronizes-with</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/doc-files/threadPrimitiveDeprecation.html">Why are Thread.stop, Thread.suspend and Thread.resume Deprecated?</a> — 오래 기다리는 스레드를 interrupt로 멈추는 방법과 인터럽트 상태를 다시 주장하는 규칙</li>
+<li><a href="https://github.com/openjdk/jdk21u/blob/master/src/hotspot/share/runtime/javaThread.cpp">OpenJDK jdk21u: javaThread.cpp</a> — <code>JavaThread::interrupt()</code>, <code>is_interrupted()</code>, <code>sleep_nanos()</code>의 HotSpot 구현</li>
+<li><a href="https://man7.org/linux/man-pages/man2/sched_yield.2.html">Linux manual page: sched_yield(2)</a> — 양보의 동작과 SCHED_OTHER에서의 주의 사항</li>
+<li><a href="https://openjdk.org/jeps/285">JEP 285: Spin-Wait Hints</a> — <code>Thread.onSpinWait()</code>의 목적과 x86 PAUSE 명령</li>
+</x-refs>

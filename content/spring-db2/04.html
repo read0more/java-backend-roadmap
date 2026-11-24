@@ -1,0 +1,922 @@
+<x-meta>
+deck: SQL을 직접 쓰던 자리에서 객체와 테이블의 매핑을 선언하는 자리로 옮겨 가며, 영속성 컨텍스트·변경 감지·IDENTITY 전략과 공유 EntityManager 프록시, 그리고 JPA 예외가 스프링 예외로 바뀌는 경로를 소스 수준까지 따라간다.
+minutes: 100
+</x-meta>
+
+<x-goals>
+<li>SQL 중심 개발에서 생기는 반복·엔티티 신뢰 문제와, 객체와 관계형 데이터베이스 사이의 네 가지 패러다임 불일치(상속, 연관관계, 객체 그래프 탐색, 비교)를 예를 들어 설명할 수 있다.</li>
+<li>영속성 컨텍스트가 엔티티를 식별자별로 하나씩 보관하고 스냅샷과 비교해 변경을 찾아내는 과정을, 실행 가능한 모형 코드의 출력으로 한 줄씩 추적할 수 있다.</li>
+<li>IDENTITY 전략에서 persist 시점에 INSERT가 바로 나가는 이유와, 변경 감지 UPDATE·JPQL 조회 전 자동 플러시가 일어나는 시점을 SQL 순서로 예측할 수 있다.</li>
+<li>싱글톤 리포지토리에 주입된 EntityManager가 스레드에 묶인 실제 EntityManager로 위임하는 공유 프록시라는 것과, 트랜잭션 없이 변경 메서드를 부르면 무슨 일이 생기는지 설명할 수 있다.</li>
+<li>@Repository가 붙은 빈에서 JPA·Hibernate 예외가 DataAccessException 하위 예외로 바뀌는 경로를 후처리기, 어드바이저, 인터셉터, JpaDialect 순서로 추적하고, 바뀌지 않는 경우를 구분할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 객체를 저장하는데 왜 SQL을 매번 손으로 쓰는가</h3>
+
+<p>이 권은 같은 저장소 인터페이스를 여러 데이터 접근 기술로 구현해 보며 차이를 비교하고 있다. 01회의 JdbcTemplate은 커넥션 획득과 자원 정리, 예외 변환을 템플릿이 맡고 개발자는 SQL과 결과 매핑만 썼다. 03회의 MyBatis는 SQL을 XML로 옮기고 동적 SQL을 태그로 조립하게 해 주었다. 두 기술은 겉모습이 달라도 공통점이 하나 있다. <b>SQL은 개발자가 쓴다.</b> 도구는 그 SQL에 파라미터를 넣고 결과 행을 객체로 옮겨 줄 뿐이다. 그래서 이런 기술을 SQL 매퍼(SQL mapper)라고 부른다.</p>
+
+<p>이 회차의 JPA는 이 책임을 뒤집는다. 개발자는 "이 클래스는 저 테이블에, 이 필드는 저 컬럼에 대응한다"는 매핑만 선언하고, 저장·조회·수정·삭제에 필요한 SQL은 구현체가 만든다. 이런 방식을 객체-관계 매핑(Object-Relational Mapping, ORM)이라고 한다. 그런데 SQL을 대신 만들어 주는 것만으로는 ORM을 다 설명하지 못한다. JPA 코드에는 <code>update()</code> 메서드가 없는데도 필드 값을 바꾸면 UPDATE가 나가고, 같은 행을 두 번 조회해도 SELECT는 한 번만 나간다. 이런 동작은 SQL 생성기가 아니라 <b>객체를 기억하는 저장소</b>가 있어야 가능하다.</p>
+
+<p>이 회차는 그 저장소, 곧 영속성 컨텍스트(persistence context)를 중심에 두고 진행한다. 먼저 SQL 중심 개발이 어떤 문제를 낳는지, 객체와 테이블이 왜 서로 맞지 않는지를 본다. 다음으로 JPA가 표준과 구현으로 어떻게 나뉘는지, 영속성 컨텍스트가 무엇을 기억하는지를 실행 가능한 모형으로 확인한다. 그 뒤 스프링 부트에서 JPA를 설정하고, 엔티티와 리포지토리를 만들어 한 번의 호출에서 어떤 SQL이 언제 나가는지 추적한다. 마지막으로 JPA 예외가 스프링의 데이터 접근 예외로 바뀌는 경로를 프록시 수준에서 따라간다.</p>
+
+<aside class="note">이 회차의 예제는 도서(<code>Book</code>) 하나로 진행한다. 실험 코드는 JDK 21에서 직접 컴파일해 실행한 것이고, 스프링과 Hibernate의 내부 동작은 Spring Framework 6.1, Spring Boot 3.3, Hibernate 6.4 문서와 소스를 기준으로 확인했다.</aside>
+
+<h3>SQL 중심 개발의 문제점 1: 객체를 SQL로 옮겨 적는 일</h3>
+
+<p>JDBC든 JdbcTemplate이든 MyBatis든, SQL 매퍼로 저장소를 만들면 테이블마다 같은 일을 반복한다. 객체의 필드를 꺼내 INSERT의 파라미터로 넣고, SELECT 결과의 컬럼을 하나씩 읽어 객체의 필드에 넣고, UPDATE의 SET 절에 바뀔 수 있는 필드를 늘어놓는다. 도서, 회원, 주문 테이블이 있으면 이 일을 세 번 한다. 이 코드는 비즈니스 규칙을 하나도 담고 있지 않다. 객체 모양의 데이터를 행 모양으로, 행 모양의 데이터를 다시 객체 모양으로 옮겨 적을 뿐이다.</p>
+
+<p>반복보다 더 곤란한 것은 변경이 퍼지는 방식이다. 도서에 출판사 이름 필드 <code>publisher</code>를 추가한다고 해 보자. 자바 클래스에 필드 하나를 넣는 것으로 끝나지 않는다. INSERT의 컬럼 목록과 값 목록, SELECT의 컬럼 목록, 결과를 객체로 옮기는 매핑 코드, UPDATE의 SET 절을 모두 고쳐야 한다. 이 중 하나를 빠뜨려도 컴파일러는 아무 말을 하지 않는다. SQL은 자바 컴파일러에게 그저 문자열이기 때문이다. SELECT에서 컬럼을 빠뜨리면 조회한 객체의 <code>publisher</code>는 조용히 <code>null</code>이 되고, 이 버그는 화면에 빈칸이 보일 때에야 드러난다.</p>
+
+<pre><code class="language-java">// SQL 매퍼 방식: 필드 하나를 추가하면 문자열 네 곳을 손으로 고쳐야 한다
+String insert = "insert into book (title, price, stock_quantity, publisher) values (?, ?, ?, ?)";
+String select = "select id, title, price, stock_quantity, publisher from book where id = ?";
+String update = "update book set title = ?, price = ?, stock_quantity = ?, publisher = ? where id = ?";
+// 그리고 ResultSet에서 publisher를 읽어 객체에 넣는 매핑 코드도 고쳐야 한다</code></pre>
+
+<p>여기서 한 걸음 더 나가면 엔티티를 믿을 수 없는 문제가 생긴다. 서비스 코드가 리포지토리에서 도서를 받아 <code>book.getPublisher()</code>를 부른다고 하자. 이 값이 <code>null</code>이면 두 가지 가능성이 있다. 데이터베이스에 정말 값이 없거나, 리포지토리의 SELECT가 그 컬럼을 읽지 않았거나다. 둘 중 무엇인지 알려면 서비스 개발자가 리포지토리 안의 SQL을 열어 봐야 한다. 연관된 객체라면 더 심하다. <code>book.getAuthor()</code>가 채워져 있는지는 그 조회가 저자 테이블과 조인했는지에 달려 있다.</p>
+
+<p>계층을 나누는 이유는 아래 계층의 세부를 몰라도 위 계층을 작성할 수 있게 하기 위해서다. 그런데 객체에 무엇이 채워져 있는지가 SQL에 달려 있으면, 서비스 계층은 리포지토리의 SQL을 알아야만 안전하게 객체를 쓸 수 있다. 인터페이스로 계층을 나눠 놓아도 실제로는 SQL이라는 세부에 묶여 있는 셈이다. SQL 중심 개발에서 "진정한 의미의 계층 분할이 어렵다"는 말은 이 상황을 가리킨다.</p>
+
+<h3>SQL 중심 개발의 문제점 2: 객체와 테이블의 패러다임 불일치</h3>
+
+<p>반복과 엔티티 신뢰 문제의 뿌리는 더 깊은 곳에 있다. 객체 지향 언어와 관계형 데이터베이스는 데이터를 표현하는 사고방식, 곧 패러다임이 다르다. 객체는 상태와 행위를 캡슐화하고, 상속으로 공통점을 묶고, 참조로 다른 객체를 가리키며, 참조를 따라가는 그래프를 이룬다. 관계형 데이터베이스는 데이터를 집합(테이블)의 행으로 표현하고, 외래 키 값으로 다른 행을 가리키며, 조인으로 행들을 엮는다. 이 차이를 객체-관계 패러다임 불일치(object-relational impedance mismatch)라고 부른다. 네 가지로 나눠 보자.</p>
+
+<h4>상속</h4>
+
+<p>도서와 음반이 모두 상품이라는 공통 부모를 가진다고 하자. 자바에서는 <code>Item</code>을 상속한 <code>Book</code>과 <code>Album</code>을 만들면 된다. 테이블에는 상속이 없다. 가장 비슷한 모델은 공통 컬럼을 담은 <code>item</code> 테이블과 고유 컬럼을 담은 <code>book</code>, <code>album</code> 테이블을 같은 키로 잇는 것이다. 그러면 도서 하나를 저장할 때 INSERT를 두 번(<code>item</code>, <code>book</code>) 해야 하고, 조회할 때는 두 테이블을 조인한 뒤 결과를 하나의 <code>Book</code> 객체로 조립해야 한다. 자바 컬렉션에 넣었다면 <code>list.add(book)</code> 한 줄로 끝났을 일이다.</p>
+
+<h4>연관관계</h4>
+
+<p>객체는 참조로 관계를 표현한다. <code>book.getPublisher()</code>로 출판사 객체에 간다. 참조에는 방향이 있어서, 도서는 출판사를 알지만 출판사는 자기 도서 목록을 따로 들고 있지 않으면 도서를 모른다. 테이블은 외래 키로 관계를 표현한다. <code>book.publisher_id</code> 컬럼 하나만 있으면 도서에서 출판사로도, 출판사에서 도서로도 조인할 수 있다. 방향이 없다. 그래서 SQL 매퍼로 개발하다 보면 객체에 <code>Publisher publisher</code> 대신 <code>Long publisherId</code>를 넣는 일이 흔해진다. 테이블에 맞춘 모델링이다. 반대로 참조를 그대로 두면 저장할 때 <code>book.getPublisher().getId()</code>를 꺼내 외래 키 값으로 바꾸고, 조회할 때 두 테이블을 조인해 두 객체를 만든 뒤 참조로 이어 줘야 한다.</p>
+
+<h4>객체 그래프 탐색</h4>
+
+<p>객체는 참조를 따라 자유롭게 이동할 수 있어야 한다. <code>order.getMember().getTeam().getName()</code>처럼. 그러나 SQL 매퍼에서는 처음 실행한 SQL이 탐색 범위를 정한다. 주문과 회원만 조인해 가져왔다면 <code>getTeam()</code>은 <code>null</code>을 돌려준다. 앞 절의 엔티티 신뢰 문제가 여기서 다시 나타난다. 그렇다고 연관된 모든 객체를 처음부터 다 조인해 메모리에 올리는 것도 답이 아니다. 주문 하나를 보는데 회원, 팀, 배송, 상품 전부를 읽는 것은 낭비다. 필요할 때 그때그때 읽어 오는 방법이 필요하다.</p>
+
+<h4>비교</h4>
+
+<p>자바에서 같은 객체인지 묻는 방법은 두 가지다. 참조가 같은지 보는 동일성(identity, <code>==</code>)과 내용이 같은지 보는 동등성(equality, <code>equals()</code>)이다. 데이터베이스에서는 기본 키가 같으면 같은 행이다. SQL 매퍼로 만든 리포지토리에서 같은 기본 키로 두 번 조회하면 어떻게 될까. 조회할 때마다 결과 행으로 새 객체를 만들기 때문에 두 객체는 내용이 같아도 참조가 다르다.</p>
+
+<pre><code class="language-java">Book a = jdbcRepository.findById(1L).orElseThrow();
+Book b = jdbcRepository.findById(1L).orElseThrow();
+System.out.println(a == b);       // false: 조회할 때마다 new Book(...)
+
+List<Book> list = new ArrayList<>();
+list.add(a);
+System.out.println(list.get(0) == list.get(0));   // true: 컬렉션은 같은 참조를 돌려준다</code></pre>
+
+<p>같은 행을 가리키는 객체가 메모리에 여러 개 있으면, 한쪽을 고쳐도 다른 쪽에는 반영되지 않는다. 어느 객체가 최신 상태인지 개발자가 기억해야 한다. 자바 컬렉션처럼 "같은 키로 꺼내면 같은 객체"를 보장하려면 누군가 이미 만든 객체를 키별로 기억하고 있어야 한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>불일치</th><th>객체 쪽</th><th>테이블 쪽</th><th>SQL 매퍼에서 개발자가 하는 일</th></tr></thead><tbody>
+<tr><td>상속</td><td>extends로 공통 상태와 행위를 물려받는다</td><td>상속이 없다. 테이블을 나누고 같은 키로 잇는다</td><td>INSERT를 여러 번, 조회는 조인 후 객체로 조립</td></tr>
+<tr><td>연관관계</td><td>참조. 방향이 있다</td><td>외래 키. 방향 없이 양쪽으로 조인한다</td><td>참조를 외래 키 값으로, 조인 결과를 참조로 바꿔 끼운다</td></tr>
+<tr><td>객체 그래프 탐색</td><td>참조를 따라 어디로든 간다</td><td>처음 실행한 SQL이 가져온 범위만 있다</td><td>어디까지 채워졌는지 SQL을 열어 확인한다</td></tr>
+<tr><td>비교</td><td>==(동일성), equals(동등성)</td><td>기본 키가 같으면 같은 행</td><td>같은 행에서 나온 객체가 여러 개 생긴다</td></tr>
+</tbody></table></div>
+
+<x-visual id="spring-db2-04-paradigm-mismatch" title="객체 그래프와 테이블 구조를 나란히 놓고 본 네 가지 패러다임 불일치" kind="비교 도해" ratio="16:9">
+<x-hint>왼쪽의 객체 그래프(상속과 참조)와 오른쪽의 테이블(분리된 테이블과 외래 키)이 서로 어떻게 대응하는지, 그 사이에서 개발자가 손으로 하던 변환을 ORM이 맡는다는 것을 보여 준다.</x-hint>
+<x-prompt>좌우 2분할 도해. 왼쪽 패널 제목 "객체". 위에 둥근 상자 "Item", 그 아래로 속이 빈 삼각형 화살표로 연결된 두 상자 "Book"과 "Album"(상속). "Book" 상자에서 오른쪽 아래 상자 "Publisher"로 실선 화살표, 화살표 라벨 "참조". 오른쪽 패널 제목 "테이블". 세 개의 표 모양 상자 "item", "book", "publisher". "book"과 "item" 사이에 "같은 키" 라벨의 점선, "book"의 칸 "publisher_id"에서 "publisher" 표로 가는 화살표 라벨 "외래 키". 두 패널 사이 가운데에 세로로 긴 회색 띠 "ORM"이 있고, 띠 양쪽으로 굵은 양방향 화살표가 지나간다. 띠 아래 작은 글씨 "변환을 대신한다". 평면 기술 도해, 흰 배경, 파랑과 회색 위주.</x-prompt>
+<x-caption>객체의 상속과 참조는 테이블의 분리된 테이블과 외래 키로 옮겨져야 한다. 이 변환을 개발자 대신 해 주는 것이 ORM이다.</x-caption>
+</x-visual>
+
+<h3>ORM과 JPA: 표준 명세와 구현체</h3>
+
+<p>ORM은 이 불일치를 개발자 대신 해결해 주는 기술이다. 개발자는 객체를 객체답게 설계하고, 데이터베이스는 데이터베이스답게 설계한다. 둘 사이의 대응 관계는 매핑 정보로 선언한다. ORM은 그 매핑 정보를 보고 SQL을 만들고, JDBC로 실행하고, 결과를 객체로 조립하며, 같은 행은 같은 객체로 돌려준다. 애플리케이션 코드는 컬렉션에 넣고 꺼내듯 객체를 다룬다.</p>
+
+<p>JPA는 자바 진영의 ORM 표준 명세다. 지금 이름은 Jakarta Persistence이고, 명세 문서와 함께 <code>jakarta.persistence</code> 패키지의 인터페이스와 애너테이션으로 이루어져 있다. 명세는 "이 메서드를 부르면 이렇게 동작해야 한다"는 규칙이고, 실제로 SQL을 만들고 실행하는 코드는 구현체(provider)가 제공한다. 스프링 부트의 <code>spring-boot-starter-data-jpa</code>는 구현체로 Hibernate를 가져온다. JDBC가 표준 인터페이스이고 드라이버가 구현이었던 관계(스프링 DB 1편 01회)와 같은 구조다.</p>
+
+<p>패키지 이름은 버전에 따라 다르다. 오래된 자료에는 <code>javax.persistence</code>가 나오는데, Jakarta EE 9와 함께 나온 Jakarta Persistence 3.0부터 패키지가 <code>jakarta.persistence</code>로 바뀌었다. 이 강좌의 기준인 Spring Boot 3.x는 <code>jakarta.*</code> 네임스페이스를 쓴다. Hibernate 공식 릴리스 페이지의 호환성 표를 보면 Hibernate 6.6은 Jakarta Persistence 3.1을, Hibernate 7.x는 3.2를 구현한다. 이 회차의 코드는 두 버전에서 똑같이 동작하는 범위만 쓴다.</p>
+
+<p>JPA가 JDBC를 대체한다고 오해하기 쉽지만, JPA는 JDBC 위에 있다. 구현체는 결국 <code>Connection</code>을 얻어 <code>PreparedStatement</code>를 만들고 실행한다. 스프링 DB 1편에서 다룬 커넥션 풀, 트랜잭션, 자동 커밋, 격리 수준은 JPA를 써도 그대로 아래에서 동작한다. 바뀌는 것은 SQL을 누가 만드느냐와, 그 사이에 객체를 기억하는 층이 하나 더 생긴다는 점이다.</p>
+
+<pre class="diagram">애플리케이션 코드        em.persist(book), em.find(Book.class, 1L), book.change(...)
+        │
+        ▼
+JPA 인터페이스            jakarta.persistence.EntityManager  (명세: 규칙과 API)
+        │
+        ▼
+JPA 구현체 (Hibernate)    영속성 컨텍스트 · SQL 생성 · 변경 감지 · 결과 → 객체
+        │
+        ▼
+JDBC API                  Connection · PreparedStatement · ResultSet
+        │
+        ▼
+JDBC 드라이버 ── TCP ──▶  데이터베이스</pre>
+
+<p>JPA의 API가 던지는 예외도 이 층에 속한다. 로컬에 있는 Jakarta Persistence API JAR를 <code>javap</code>로 열어 보면 예외 계층의 뿌리가 보인다.</p>
+
+<pre><code class="language-bash">$ javap -cp jakarta.persistence-api-3.2.0.jar jakarta.persistence.PersistenceException \
+    jakarta.persistence.NoResultException jakarta.persistence.EntityExistsException | grep class</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">public class jakarta.persistence.PersistenceException extends java.lang.RuntimeException {
+public class jakarta.persistence.NoResultException extends jakarta.persistence.PersistenceException {
+public class jakarta.persistence.EntityExistsException extends jakarta.persistence.PersistenceException {</code></pre>
+
+<p>JDBC의 <code>SQLException</code>은 체크 예외였지만 JPA의 예외는 모두 <code>RuntimeException</code> 아래에 있다. 그래서 리포지토리 인터페이스에 <code>throws</code>가 새어 나오는 문제(스프링 DB 1편 06회)는 처음부터 없다. 다만 예외의 <b>타입</b>이 여전히 JPA 기술에 속한다는 문제는 남는다. 이것은 이 회차 끝의 예외 변환에서 다룬다.</p>
+
+<p>SQL 매퍼와 ORM을 나란히 놓으면 차이가 분명해진다. 어느 쪽이 우월하다는 뜻이 아니다. 무엇을 누가 책임지느냐가 다르다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>항목</th><th>SQL 매퍼 (JdbcTemplate, MyBatis)</th><th>ORM (JPA, Hibernate)</th></tr></thead><tbody>
+<tr><td>SQL 작성</td><td>개발자가 쓴다</td><td>구현체가 매핑 정보로 만든다. 필요하면 JPQL이나 네이티브 SQL을 쓴다</td></tr>
+<tr><td>매핑 단위</td><td>SQL 결과의 컬럼 → 객체 필드</td><td>엔티티 클래스 ↔ 테이블, 필드 ↔ 컬럼, 참조 ↔ 외래 키</td></tr>
+<tr><td>같은 행을 두 번 조회</td><td>객체가 두 개 생긴다</td><td>한 영속성 컨텍스트 안에서는 같은 객체</td></tr>
+<tr><td>값 변경 반영</td><td>UPDATE를 직접 실행한다</td><td>플러시 때 변경을 찾아 UPDATE를 만든다</td></tr>
+<tr><td>데이터베이스 방언</td><td>SQL에 그대로 드러난다</td><td>Hibernate의 Dialect가 생성 SQL을 데이터베이스에 맞춘다</td></tr>
+<tr><td>알아야 할 것</td><td>SQL</td><td>SQL과 함께 영속성 컨텍스트의 동작 규칙</td></tr>
+</tbody></table></div>
+
+<h3>영속성 컨텍스트: JPA가 객체를 기억하는 곳</h3>
+
+<p>Jakarta Persistence 3.1 명세 3.1절은 영속성 컨텍스트를 엔티티 인스턴스의 집합으로 정의하고, 그 안에서는 어떤 영속 엔티티 식별자에 대해서도 유일한 엔티티 인스턴스가 있다고 말한다. 같은 기본 키를 가진 <code>Book</code> 객체는 하나의 영속성 컨텍스트 안에 하나만 존재한다는 뜻이다. Hibernate 6.4 입문 가이드(5.1절)는 같은 것을 두고 영속성 컨텍스트가 일종의 캐시이며 "1차 캐시(first-level cache)"라고도 부른다고 설명한다. 컨텍스트는 식별자에서 인스턴스로 가는 유일한 대응표를 갖는다.</p>
+
+<p>애플리케이션은 <code>EntityManager</code>를 통해 영속성 컨텍스트에 접근한다. 명세 3.2절은 엔티티 인스턴스의 상태를 넷으로 나눈다.</p>
+
+<figure class="flow-figure"><figcaption>엔티티 인스턴스의 네 가지 상태 (Jakarta Persistence 3.2절)</figcaption><ol class="flow">
+<li><strong>새로운(new)</strong><span><code>new Book(...)</code>으로 막 만든 객체. 영속 식별자가 없고 영속성 컨텍스트와도 관계가 없다.</span></li>
+<li><strong>관리(managed)</strong><span><code>persist()</code>했거나 <code>find()</code>·JPQL로 조회한 객체. 영속성 컨텍스트가 식별자로 기억하고 변경을 추적한다.</span></li>
+<li><strong>준영속(detached)</strong><span>식별자는 있지만 지금 영속성 컨텍스트에 속하지 않는 객체. 컨텍스트가 닫혔거나 <code>detach()</code>·<code>clear()</code>된 경우다. 값을 바꿔도 데이터베이스에 반영되지 않는다.</span></li>
+<li><strong>삭제(removed)</strong><span><code>remove()</code>된 관리 객체. 플러시나 커밋 때 DELETE가 실행된다.</span></li>
+</ol></figure>
+
+<p>영속성 컨텍스트에 있는 변경 내용을 데이터베이스에 SQL로 보내는 일을 플러시(flush)라고 한다. 명세 3.2.2절은 새 엔티티에 <code>persist()</code>를 적용하면 그 엔티티가 관리 상태가 되고 "트랜잭션 커밋 시점이나 그 전, 또는 플러시의 결과로" 데이터베이스에 들어간다고 말한다. 3.2.4절은 영속 엔티티의 상태가 트랜잭션 커밋 때 데이터베이스와 동기화된다고 말한다. 즉 <code>persist()</code>나 값 변경이 곧바로 SQL이 된다고 보장하지 않는다. 언제 보낼지는 구현체가 정하되, 커밋할 때까지는 반드시 보낸다.</p>
+
+<p>플러시가 일어나는 시점은 세 가지다. 첫째, 트랜잭션을 커밋할 때. 둘째, 쿼리를 실행하기 전. 명세 3.10.8절은 트랜잭션 안에서 플러시 모드가 <code>FlushModeType.AUTO</code>(기본값)인 쿼리를 실행하면, 구현체가 쿼리 결과에 영향을 줄 수 있는 영속성 컨텍스트의 모든 변경을 쿼리 처리에서 보이게 할 책임이 있다고 정한다. Hibernate 입문 가이드 5.8절도 기본 설정에서 트랜잭션 커밋 때, 그리고 메모리에 있는 변경 상태가 결과에 영향을 줄 쿼리를 실행하기 전에 플러시한다고 설명한다. 셋째, 개발자가 <code>em.flush()</code>를 직접 부를 때. 플러시는 영속성 컨텍스트를 비우는 일이 아니다. 변경을 SQL로 보낼 뿐 객체는 그대로 관리 상태로 남는다.</p>
+
+<p>영속성 컨텍스트가 주는 기능은 이 "식별자별 대응표"와 "플러시"에서 모두 나온다.</p>
+
+<ul>
+<li><b>1차 캐시와 동일성 보장</b>: <code>find()</code>는 먼저 대응표를 본다. 이미 있으면 SQL 없이 그 객체를 돌려준다. 그래서 같은 컨텍스트 안에서 같은 식별자로 두 번 조회하면 <code>==</code>가 <code>true</code>다. 앞 절의 비교 불일치가 여기서 풀린다.</li>
+<li><b>쓰기 지연(transactional write-behind)</b>: 변경을 모았다가 플러시 때 보낸다. Hibernate 입문 가이드 5.4절은 <code>persist()</code>와 <code>remove()</code>가 데이터베이스에 즉시 효과를 내지 않고 SQL을 나중에 실행하도록 예약한다고 설명한다. 모아 두었기 때문에 같은 종류의 문장을 JDBC 배치로 묶어 보낼 기회도 생긴다. 단, 뒤에서 볼 IDENTITY 전략의 INSERT는 예외다.</li>
+<li><b>변경 감지(dirty checking)</b>: 관리 상태의 객체가 컨텍스트에 들어올 때의 상태를 복사해 둔다. 이것을 스냅샷이라고 부르자. 플러시 때 지금 상태와 스냅샷을 비교해 다른 객체에 대해 UPDATE를 만든다. 그래서 <code>update()</code> 메서드가 필요 없다. Hibernate 입문 가이드는 엔티티를 수정한 뒤 명시적인 작업을 할 필요가 없고, 수정은 플러시 때 자동으로 감지된다고 설명한다.</li>
+<li><b>지연 로딩(lazy loading)</b>: 연관된 객체를 실제로 사용할 때 읽어 오도록 미뤄 둘 수 있다. 앞 절의 객체 그래프 탐색 불일치에 대한 답이다. 연관관계 매핑은 이 회차의 범위를 넘으므로, 여기서는 "가짜 객체(프록시)를 먼저 넣어 두고 처음 접근할 때 SELECT한다"는 원리만 기억해 두자. 이 원리가 엔티티 클래스에 제약을 거는데, 엔티티 매핑에서 다시 본다.</li>
+</ul>
+
+<p>변경 감지가 "스냅샷과 비교"라는 것은 Hibernate의 기본 방식이다. Hibernate 6.4 사용자 가이드의 바이트코드 향상(bytecode enhancement) 장은 Hibernate가 원래 차이 비교(diff) 방식의 변경 계산만 지원했다고 설명한다. 플러시 때 컨텍스트의 엔티티를 하나씩 돌며 현재 상태를 마지막으로 알려진 데이터베이스 상태의 복사본과 비교한다. 바이트코드 향상으로 "인라인 변경 추적"을 켜면 엔티티 클래스 자체에 어떤 속성이 바뀌었는지 기록하는 코드가 들어가고, 플러시 때 비교 대신 엔티티에게 무엇이 바뀌었는지 묻는다. 특별히 설정하지 않은 스프링 부트 애플리케이션은 비교 방식으로 동작한다고 보면 된다.</p>
+
+<x-visual id="spring-db2-04-persistence-context" title="영속성 컨텍스트 내부: 식별자 대응표, 스냅샷, 쓰기 지연 SQL 저장소" kind="구조도" ratio="16:9">
+<x-hint>EntityManager 안의 영속성 컨텍스트가 식별자별 엔티티와 그 스냅샷을 나란히 보관하고, 플러시 때 둘을 비교해 UPDATE를 만들어 데이터베이스로 보내는 흐름을 보여 준다.</x-hint>
+<x-prompt>가로로 긴 구조도. 왼쪽에 작은 상자 "애플리케이션", 오른쪽 끝에 원통 "데이터베이스". 가운데에 큰 둥근 사각형 "EntityManager", 그 안에 더 큰 영역 "영속성 컨텍스트". 영속성 컨텍스트 안에 3열 표: 열 제목 "@Id", "엔티티", "스냅샷". 첫 행 "1" / 파란 상자 "Book(price=27000)" / 회색 상자 "price=30000". 둘째 행 "2" / 파란 상자 "Book" / 회색 상자 "같음". 표 아래에 세로로 쌓인 작은 상자 묶음 "쓰기 지연 SQL". 애플리케이션에서 영속성 컨텍스트로 화살표 두 개, 라벨 "find(1)"과 "price 변경". 첫 행의 파란 상자와 회색 상자 사이에 빨간 양방향 화살표 라벨 "플러시 때 비교". 비교 화살표에서 "쓰기 지연 SQL"로 화살표 라벨 "UPDATE 생성". "쓰기 지연 SQL"에서 데이터베이스로 굵은 화살표 라벨 "flush". 평면 기술 도해, 흰 배경, 파랑·회색·빨강 강조.</x-prompt>
+<x-caption>영속성 컨텍스트는 식별자별로 엔티티와 스냅샷을 함께 보관한다. 플러시 때 둘을 비교해 바뀐 엔티티에 대해서만 UPDATE를 만든다.</x-caption>
+</x-visual>
+
+<h3>모형으로 따라가 보는 영속성 컨텍스트</h3>
+
+<p>규칙을 문장으로만 외우면 "언제 어떤 SQL이 나가는가"를 예측하기 어렵다. 그래서 영속성 컨텍스트의 핵심 규칙 네 가지만 흉내 낸 모형을 직접 만들어 돌려 보자. 식별자별 대응표, 스냅샷 비교, 쿼리 전 자동 플러시, IDENTITY 방식의 즉시 INSERT다. 데이터베이스는 <code>TreeMap</code>으로 흉내 내고, SQL은 실행하는 대신 출력한다. <b>이 코드는 Hibernate가 아니다.</b> 실제 Hibernate는 엔티티마다 상태 정보를 담은 항목을 두고, 실행할 SQL을 액션 큐에 모으고, JDBC로 진짜 SQL을 보낸다. 모형은 그 골격만 보여 준다.</p>
+
+<pre><code class="language-java">import java.util.*;
+
+public class MiniJpa {
+
+    static class Book {
+        Long id;
+        String title;
+        int price;
+        protected Book() {}                          // 조회 결과로 객체를 만들 때 쓴다
+        Book(String title, int price) { this.title = title; this.price = price; }
+        Object[] state() { return new Object[]{title, price}; }
+        void load(Object[] s) { title = (String) s[0]; price = (Integer) s[1]; }
+    }
+
+    // 데이터베이스 흉내: id -> {title, price}
+    static class FakeDb {
+        final Map<Long, Object[]> rows = new TreeMap<>();
+        long seq = 0;
+        long insert(Object[] s) {
+            long id = ++seq;
+            rows.put(id, s.clone());
+            System.out.println("  SQL> insert into book (title, price) values ('" + s[0] + "', " + s[1] + ")  -- id=" + id);
+            return id;
+        }
+        Object[] select(long id) {
+            System.out.println("  SQL> select ... from book where id=" + id);
+            Object[] r = rows.get(id);
+            return r == null ? null : r.clone();
+        }
+        void update(long id, Object[] s) {
+            System.out.println("  SQL> update book set title='" + s[0] + "', price=" + s[1] + " where id=" + id);
+            rows.put(id, s.clone());
+        }
+        Map<Long, Object[]> selectWherePriceGt(int p) {
+            System.out.println("  SQL> select ... from book where price>" + p);
+            Map<Long, Object[]> result = new TreeMap<>();
+            rows.forEach((id, r) -> { if ((Integer) r[1] > p) result.put(id, r.clone()); });
+            return result;
+        }
+    }
+
+    static class MiniEntityManager {
+        final FakeDb db;
+        final Map<Long, Book> identityMap = new LinkedHashMap<>();   // 1차 캐시
+        final Map<Long, Object[]> snapshots = new HashMap<>();       // 들어올 때의 상태
+
+        MiniEntityManager(FakeDb db) { this.db = db; }
+
+        void persist(Book b) {                 // IDENTITY: 행을 넣어야 id를 안다
+            b.id = db.insert(b.state());
+            manage(b, b.state());
+        }
+
+        Book find(long id) {
+            Book cached = identityMap.get(id);
+            if (cached != null) {
+                System.out.println("  (1차 캐시 적중: id=" + id + ", SQL 없음)");
+                return cached;
+            }
+            Object[] row = db.select(id);
+            return row == null ? null : hydrate(id, row);
+        }
+
+        List<Book> findByPriceGreaterThan(int price) {
+            flush();                           // AUTO: 질의 전에 변경을 먼저 내보낸다
+            List<Book> result = new ArrayList<>();
+            db.selectWherePriceGt(price).forEach((id, row) -> {
+                Book existing = identityMap.get(id);
+                result.add(existing != null ? existing : hydrate(id, row));  // 이미 있으면 그 객체
+            });
+            return result;
+        }
+
+        void flush() {
+            for (Book b : identityMap.values()) {
+                Object[] now = b.state();
+                if (!Arrays.equals(now, snapshots.get(b.id))) {
+                    db.update(b.id, now);
+                    snapshots.put(b.id, now);
+                }
+            }
+        }
+
+        private Book hydrate(long id, Object[] row) {
+            Book b = new Book();               // 기본 생성자로 빈 객체를 만들고
+            b.id = id;
+            b.load(row);                       // 행의 값을 채운다
+            manage(b, row);
+            return b;
+        }
+
+        private void manage(Book b, Object[] state) {
+            identityMap.put(b.id, b);
+            snapshots.put(b.id, state.clone());
+        }
+    }
+
+    public static void main(String[] args) {
+        FakeDb db = new FakeDb();
+        MiniEntityManager em = new MiniEntityManager(db);
+
+        System.out.println("[1] persist");
+        Book book = new Book("JPA", 30000);
+        em.persist(book);
+        System.out.println("  book.id=" + book.id);
+
+        System.out.println("[2] find(1)");
+        Book found = em.find(1);
+        System.out.println("  found == book ? " + (found == book));
+
+        System.out.println("[3] book.price = 27000 (메서드 호출 없음)");
+        book.price = 27000;
+
+        System.out.println("[4] price > 28000 조회");
+        List<Book> list = em.findByPriceGreaterThan(28000);
+        System.out.println("  결과 " + list.size() + "건");
+
+        System.out.println("[5] book.title = \"JPA 입문\" 후 커밋");
+        book.title = "JPA 입문";
+        em.flush();
+        System.out.println("  커밋 완료");
+
+        System.out.println("[6] 새 영속성 컨텍스트에서 find(1) 두 번");
+        MiniEntityManager em2 = new MiniEntityManager(db);
+        Book x = em2.find(1);
+        Book y = em2.find(1);
+        System.out.println("  x == y ? " + (x == y) + ", x == book ? " + (x == book) + ", x.title=" + x.title + ", x.price=" + x.price);
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">[1] persist
+  SQL> insert into book (title, price) values ('JPA', 30000)  -- id=1
+  book.id=1
+[2] find(1)
+  (1차 캐시 적중: id=1, SQL 없음)
+  found == book ? true
+[3] book.price = 27000 (메서드 호출 없음)
+[4] price > 28000 조회
+  SQL> update book set title='JPA', price=27000 where id=1
+  SQL> select ... from book where price>28000
+  결과 0건
+[5] book.title = "JPA 입문" 후 커밋
+  SQL> update book set title='JPA 입문', price=27000 where id=1
+  커밋 완료
+[6] 새 영속성 컨텍스트에서 find(1) 두 번
+  SQL> select ... from book where id=1
+  (1차 캐시 적중: id=1, SQL 없음)
+  x == y ? true, x == book ? false, x.title=JPA 입문, x.price=27000</code></pre>
+
+<p>한 단계씩 추적해 보자. [1]에서 <code>persist()</code>는 곧바로 INSERT를 보낸다. 모형의 식별자가 데이터베이스 시퀀스(<code>seq</code>)에서 나오기 때문에, 행을 넣기 전에는 <code>book.id</code>를 알 수 없다. 대응표의 키가 식별자이므로 식별자 없이는 객체를 관리 상태로 넣을 수도 없다. INSERT가 끝나고 나서야 <code>identityMap</code>에 <code>1 → book</code>이, <code>snapshots</code>에 <code>1 → {"JPA", 30000}</code>이 들어간다. 이 구조가 실제 IDENTITY 전략이 즉시 INSERT하는 이유와 같다. 뒤의 리포지토리 분석에서 Hibernate 문서로 다시 확인한다.</p>
+
+<p>[2]에서 <code>find(1)</code>은 대응표에서 바로 객체를 찾는다. SQL이 나가지 않고, 돌려받은 객체는 [1]에서 만든 바로 그 객체다. <code>found == book</code>이 <code>true</code>인 것은 내용이 같아서가 아니라 참조가 같아서다. [3]에서는 필드 값만 바꾸고 아무 메서드도 부르지 않는다. 이 시점에 SQL은 없다. 데이터베이스의 행은 여전히 가격 30000이고, 메모리의 객체만 27000이다. 둘이 어긋난 상태다.</p>
+
+<p>[4]가 이 회차에서 가장 중요한 장면이다. 조회 쿼리를 실행하기 전에 <code>flush()</code>가 먼저 돈다. 스냅샷 <code>{"JPA", 30000}</code>과 현재 상태 <code>{"JPA", 27000}</code>이 다르므로 UPDATE가 나가고, 그 다음에 SELECT가 나간다. 만약 플러시 없이 SELECT를 바로 보냈다면 어떻게 될까. 데이터베이스의 행은 아직 30000이므로 "가격이 28000보다 큰 도서"로 이 행이 뽑힌다. 그런데 결과를 객체로 바꿀 때 대응표에 이미 있는 객체를 돌려주므로, 애플리케이션은 가격이 27000인 객체를 "28000보다 비싼 도서" 목록으로 받는다. 조건과 결과가 모순된다. 명세가 AUTO 플러시를 요구하는 이유가 이것이다.</p>
+
+<p>[5]의 <code>flush()</code>는 커밋에 해당한다. 제목이 바뀌었으므로 UPDATE가 하나 나간다. [4]에서 이미 가격 변경을 보내고 스냅샷을 갱신했기 때문에 가격 변경이 두 번 나가지는 않는다. 모형의 UPDATE는 바뀐 컬럼만이 아니라 두 컬럼을 모두 SET에 넣는데, 이 점도 Hibernate의 기본 동작과 닮았다. 뒤에서 다시 본다.</p>
+
+<p>[6]에서는 영속성 컨텍스트를 새로 만든다. 첫 <code>find(1)</code>은 대응표가 비어 있으므로 SELECT를 보내고, 기본 생성자로 빈 객체를 만든 뒤 행의 값을 채운다(<code>hydrate</code>). 두 번째 <code>find(1)</code>은 대응표에서 꺼낸다. <code>x == y</code>는 <code>true</code>지만 <code>x == book</code>은 <code>false</code>다. 동일성 보장은 <b>하나의 영속성 컨텍스트 안에서만</b> 성립한다. 스프링에서 영속성 컨텍스트는 보통 트랜잭션 하나와 수명이 같으므로, 서로 다른 트랜잭션에서 조회한 객체는 같은 행이라도 다른 객체다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>JPA가 하는 일 대부분은 "식별자별로 객체를 하나씩 기억하고, 들어올 때의 상태를 함께 기억한다"는 한 가지 구조에서 나온다. 1차 캐시와 동일성 보장은 대응표에서, 변경 감지는 스냅샷 비교에서, 쓰기 지연은 플러시 시점에 모아 보내는 데서 나온다. 언제 SQL이 나가는지 헷갈리면 "지금 대응표와 스냅샷은 어떤 상태인가, 지금 플러시가 일어나는가"를 물으면 된다.</p></aside>
+
+<h3>JPA 설정: 스타터 하나가 등록하는 것들</h3>
+
+<p>스프링 부트에서 JPA를 쓰려면 의존성 하나를 추가한다. 01~03회에서 JdbcTemplate과 MyBatis를 쓰던 프로젝트라면 그 의존성은 그대로 두어도 된다. 같은 <code>DataSource</code>와 트랜잭션 위에서 함께 동작하기 때문이다(이유는 이 절 끝에서 본다).</p>
+
+<pre><code class="language-groovy">dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    runtimeOnly 'com.h2database:h2'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}</code></pre>
+
+<p>Maven Central에 올라간 <code>spring-boot-starter-data-jpa</code> 3.3.5의 POM을 열어 보면 의존성은 다섯 개다. <code>spring-boot-starter-aop</code>, <code>spring-boot-starter-jdbc</code>, <code>hibernate-core</code>, <code>spring-data-jpa</code>, <code>spring-aspects</code>. JDBC 스타터가 들어 있으므로 HikariCP 커넥션 풀과 <code>spring-jdbc</code>(JdbcTemplate)도 함께 온다. JPA가 JDBC 위에 있다는 앞 절의 그림이 의존성 목록에서도 드러난다. Spring Data JPA는 05회의 주제지만, 이 스타터에 들어 있다는 사실이 이 회차의 EntityManager 주입 방식에 영향을 준다. 뒤에서 다시 본다.</p>
+
+<p>다음은 설정 파일이다. 스키마는 직접 작성한 SQL로 관리하고, Hibernate가 실행하는 SQL과 바인딩 값을 로그로 본다.</p>
+
+<pre><code class="language-properties">spring.datasource.url=jdbc:h2:tcp://localhost/~/bookstore
+spring.datasource.username=sa
+
+# 스키마는 직접 관리한다. Hibernate가 테이블을 만들거나 지우지 않게 한다
+spring.jpa.hibernate.ddl-auto=none
+
+# Hibernate가 실행하는 SQL을 로거로 남긴다
+logging.level.org.hibernate.SQL=DEBUG
+# 바인딩된 파라미터 값까지 남긴다 (Hibernate 6의 로거 이름)
+logging.level.org.hibernate.orm.jdbc.bind=TRACE</code></pre>
+
+<p>설정 하나하나에 이유가 있다. Spring Boot 3.3 속성 부록은 <code>spring.jpa.hibernate.ddl-auto</code>를 Hibernate의 <code>hibernate.hbm2ddl.auto</code>로 가는 지름길이라고 설명하고, 기본값을 "임베디드 데이터베이스를 쓰고 스키마 관리 도구가 감지되지 않으면 <code>create-drop</code>, 그 밖에는 <code>none</code>"이라고 적는다. 임베디드 H2로 테스트하는 순간 Hibernate가 엔티티를 보고 테이블을 만들었다가 지우게 된다는 뜻이다. 테이블을 SQL 스크립트로 직접 관리하는 프로젝트라면 이 값을 명시적으로 <code>none</code>으로 두는 편이 의도가 분명하다.</p>
+
+<p>SQL을 보는 방법은 두 가지다. <code>spring.jpa.show-sql=true</code>는 속성 부록의 설명대로 SQL 문장 로깅을 켜는데, 이 값은 Hibernate의 <code>hibernate.show_sql</code> 설정으로 이어져 로거가 아닌 표준 출력(<code>System.out</code>)에 SQL을 찍는다. 로그 레벨이나 출력 위치를 로깅 설정으로 제어할 수 없다는 뜻이다. 그래서 보통은 <code>org.hibernate.SQL</code> 로거를 DEBUG로 켜는 방법을 쓴다. 바인딩 값은 별도 로거에 나온다. Hibernate 5까지는 <code>org.hibernate.type.descriptor.sql</code>이었고, Hibernate 6부터는 <code>org.hibernate.orm.jdbc.bind</code>다. 오래된 블로그의 설정을 그대로 가져오면 바인딩 값이 안 보이는 이유가 이 이름 변경이다. 바인딩 값에는 비밀번호나 개인정보가 섞일 수 있으므로 운영 환경에서는 켜지 않는다.</p>
+
+<p>이 의존성과 설정만으로 스프링 부트의 자동 구성이 다음을 준비한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>등록되는 것</th><th>역할</th></tr></thead><tbody>
+<tr><td><code>DataSource</code> (HikariCP)</td><td>JDBC 스타터가 가져온 커넥션 풀. 01~03회와 같다</td></tr>
+<tr><td><code>EntityManagerFactory</code></td><td><code>LocalContainerEntityManagerFactoryBean</code>이 만든다. 엔티티 매핑 정보를 읽고 Hibernate를 초기화한, 애플리케이션 전체에 하나인 공장. 스레드 안전하다</td></tr>
+<tr><td><code>JpaTransactionManager</code></td><td><code>PlatformTransactionManager</code>의 JPA 구현. 트랜잭션을 시작할 때 <code>EntityManager</code>를 만들어 스레드에 묶는다</td></tr>
+<tr><td>공유 <code>EntityManager</code> 빈</td><td>Spring Data JPA가 등록한다. 생성자로 주입받는 그 객체다</td></tr>
+<tr><td><code>PersistenceExceptionTranslationPostProcessor</code></td><td><code>@Repository</code> 빈에 예외 변환 프록시를 씌운다. 이 회차의 마지막 주제</td></tr>
+</tbody></table></div>
+
+<p><code>persistence.xml</code>도 필요 없다. Spring Boot 3.3 레퍼런스는 전통적으로 이 파일에 엔티티 클래스를 나열했지만 스프링 부트에서는 "엔티티 스캔"을 쓴다고 설명한다. 기본으로 자동 구성 패키지(보통 <code>@SpringBootApplication</code> 클래스가 있는 패키지와 그 하위)를 훑어 <code>@Entity</code>, <code>@Embeddable</code>, <code>@MappedSuperclass</code>가 붙은 클래스를 찾는다. 위치를 바꾸려면 <code>@EntityScan</code>을 쓴다.</p>
+
+<p>트랜잭션 매니저가 <code>DataSourceTransactionManager</code>에서 <code>JpaTransactionManager</code>로 바뀐다는 점을 짚고 가자. 스프링 DB 1편 04회에서 본 트랜잭션 추상화 덕분에 서비스 코드의 <code>@Transactional</code>은 그대로다. 그러면 JdbcTemplate으로 만든 저장소는 어떻게 될까. Spring Framework 레퍼런스는 <code>JpaTransactionManager</code>가 같은 <code>DataSource</code>에 접근하는 JDBC 코드에 JPA 트랜잭션을 노출할 수 있다고 설명한다. 등록된 <code>JpaDialect</code>가 하부 JDBC <code>Connection</code>을 꺼낼 수 있어야 한다는 조건이 붙고, Hibernate용 방언은 이를 지원한다. 그래서 한 트랜잭션 안에서 JPA 코드와 JdbcTemplate 코드가 같은 커넥션, 같은 트랜잭션을 쓴다. 이 권에서 여러 기술을 섞어 쓰는 방안을 다룰 때 이 사실이 바탕이 된다.</p>
+
+<h3>JPA 적용 1: 엔티티 매핑</h3>
+
+<p>이제 도서 엔티티를 만든다. 매핑 정보는 애너테이션으로 클래스에 직접 붙인다.</p>
+
+<pre><code class="language-java">package example.bookstore.domain;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+
+@Entity
+public class Book {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "book_title", length = 100)
+    private String title;
+
+    private Integer price;
+    private Integer stockQuantity;
+
+    protected Book() {
+    }
+
+    public Book(String title, Integer price, Integer stockQuantity) {
+        this.title = title;
+        this.price = price;
+        this.stockQuantity = stockQuantity;
+    }
+
+    public void change(String title, Integer price, Integer stockQuantity) {
+        this.title = title;
+        this.price = price;
+        this.stockQuantity = stockQuantity;
+    }
+
+    public Long getId() { return id; }
+    public String getTitle() { return title; }
+    public Integer getPrice() { return price; }
+    public Integer getStockQuantity() { return stockQuantity; }
+}</code></pre>
+
+<pre><code class="language-sql">-- H2 기준. MySQL이라면 id bigint not null auto_increment
+create table book (
+    id             bigint generated by default as identity,
+    book_title     varchar(100),
+    price          integer,
+    stock_quantity integer,
+    primary key (id)
+);</code></pre>
+
+<p><code>@Entity</code>는 이 클래스가 JPA가 관리하는 엔티티라는 표시다. 엔티티 스캔이 이 애너테이션을 찾아 매핑 정보를 만든다. <code>@Id</code>는 기본 키에 대응하는 필드, 곧 영속성 컨텍스트 대응표의 키다. <code>@GeneratedValue</code>는 키 값을 누가 만드는지 정한다. 이 애너테이션의 <code>strategy</code> 기본값은 <code>AUTO</code>다(로컬 API JAR의 애너테이션 기본값을 <code>javap -v</code>로 확인했다). 여기서는 <code>IDENTITY</code>를 골랐다. 데이터베이스의 identity 또는 auto_increment 컬럼이 값을 만든다는 뜻이다. H2의 <code>generated by default as identity</code>, MySQL의 <code>auto_increment</code>가 이에 해당한다.</p>
+
+<p><code>@Column</code>은 필드와 컬럼의 대응을 바꿀 때 쓴다. 필드 이름은 <code>title</code>이지만 컬럼 이름은 <code>book_title</code>이라고 알려 준다. <code>length</code>(기본값 255)는 문자열 컬럼의 길이인데, 이 값은 Hibernate가 스키마를 생성할 때 DDL에 쓰인다. 값을 저장할 때 길이를 검사하는 기능이 아니다. 스키마를 직접 관리한다면 DDL의 <code>varchar(100)</code>과 맞춰 두는 문서 역할에 가깝다.</p>
+
+<p><code>price</code>와 <code>stockQuantity</code>에는 아무 애너테이션도 없다. JPA는 엔티티의 필드를 기본으로 모두 영속 대상으로 본다. 그런데 필드 이름은 <code>stockQuantity</code>이고 컬럼 이름은 <code>stock_quantity</code>다. 이 변환은 스프링 부트가 해 준다. Spring Boot 3.3 how-to 문서에 따르면 스프링 부트는 Hibernate의 물리 이름 전략(physical naming strategy)으로 <code>CamelCaseToUnderscoresNamingStrategy</code>를 설정한다. 점은 밑줄로, 낙타 표기(camel case)는 밑줄 구분으로 바꾸고, 테이블 이름은 소문자로 만든다. 문서의 예로 <code>TelephoneNumber</code> 엔티티는 <code>telephone_number</code> 테이블에 매핑된다. 스프링 없이 Hibernate만 쓰면 이 전략이 적용되지 않으므로 필드 이름이 그대로 컬럼 이름이 된다. 같은 엔티티가 환경에 따라 다른 컬럼을 찾는 일이 생기는 이유다.</p>
+
+<p>필드에 매핑 애너테이션을 붙이느냐 게터에 붙이느냐도 의미가 있다. 명세는 엔티티 계층에 하나의 접근 방식이 적용되고, 기본 접근 방식은 매핑 애너테이션의 위치로 정해진다고 말한다. <code>@Id</code>가 필드에 있으므로 이 엔티티는 필드 접근(field access)을 쓴다. 구현체는 리플렉션으로 필드를 직접 읽고 쓴다. 그래서 세터가 없어도 조회 결과를 채울 수 있고, 게터는 애플리케이션을 위해 있을 뿐이다. 위 엔티티가 세터 대신 의미 있는 이름의 <code>change()</code> 메서드를 둔 것도 이 덕분이다.</p>
+
+<h4>기본 생성자와 final 금지: 명세의 규칙과 그 이유</h4>
+
+<p>엔티티에는 <code>protected Book() {}</code>이라는, 애플리케이션 코드에서는 쓰지 않는 생성자가 있다. Jakarta Persistence 3.1 명세 2.1절은 엔티티 클래스가 인자 없는 생성자를 가져야 하고 그 생성자는 <code>public</code>이나 <code>protected</code>여야 한다고 정한다. 같은 절은 엔티티 클래스가 <code>final</code>이면 안 되고, 메서드나 영속 인스턴스 변수도 <code>final</code>이면 안 된다고 말한다. Hibernate 6.4 입문 가이드도 엔티티 클래스는 <code>final</code>이 아니어야 하고 <code>private</code>이 아닌 인자 없는 생성자가 있어야 한다고 적는다.</p>
+
+<p>기본 생성자가 필요한 이유는 모형의 <code>hydrate()</code>에서 이미 봤다. 조회 결과로 객체를 만들 때 구현체는 어떤 생성자에 어떤 인자를 넣어야 할지 모른다. 그래서 빈 객체를 만든 뒤 필드에 값을 채운다. 그런데 리플렉션은 접근 제한을 풀 수 있다. 실제로 확인해 보자. 다른 패키지의 <code>private</code> 생성자를 리플렉션으로 호출하는 코드다.</p>
+
+<pre><code class="language-java">// a/Book.java
+package a;
+public class Book {
+    private Long id;
+    private String title;
+    private Book() {}
+    public Book(String title) { this.title = title; }
+}
+
+// Reflect.java (기본 패키지)
+import java.lang.reflect.Constructor;
+public class Reflect {
+    public static void main(String[] args) throws Exception {
+        Constructor<a.Book> c = a.Book.class.getDeclaredConstructor();
+        try { c.newInstance(); } catch (IllegalAccessException e) { System.out.println("1: " + e.getClass().getSimpleName()); }
+        c.setAccessible(true);
+        a.Book b = c.newInstance();
+        System.out.println("2: created " + (b != null));
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">1: IllegalAccessException
+2: created true</code></pre>
+
+<p><code>setAccessible(true)</code>로 검사를 끄면 <code>private</code> 생성자도 호출된다(클래스가 이름 없는 모듈에 있어 열려 있는 경우다). 그러면 명세는 왜 <code>private</code>을 막을까. 답은 리플렉션이 아니라 <b>상속</b>에 있다. 앞에서 본 지연 로딩은 엔티티 자리에 프록시 객체를 넣어 두는 방식이고, Hibernate는 이 프록시를 엔티티 클래스를 상속한 하위 클래스로 만든다. 하위 클래스의 생성자는 반드시 부모의 생성자를 호출해야 한다. 바이트코드를 실행 중에 만들더라도 이 규칙은 같다. 같은 구조를 컴파일러에게 시켜 보면 거부 이유가 그대로 나온다.</p>
+
+<pre><code class="language-java">// b/BookProxy.java: 다른 패키지에서 Book을 상속한다
+package b;
+public class BookProxy extends a.Book {
+    public BookProxy() { super(); }
+}
+
+// b/FinalProxy.java: final 클래스를 상속한다 (a.FinalBook은 public final class)
+package b;
+public class FinalProxy extends a.FinalBook { }</code></pre>
+
+<pre data-label="컴파일 결과 (javac 21)"><code class="language-text">b/BookProxy.java:3: error: constructor Book in class Book cannot be applied to given types;
+    public BookProxy() { super(); }
+                         ^
+  required: no arguments
+  found:    no arguments
+  reason: Book() has private access in Book
+
+b/FinalProxy.java:2: error: cannot inherit from final FinalBook
+public class FinalProxy extends a.FinalBook { }
+                                 ^</code></pre>
+
+<p><code>private</code> 생성자는 하위 클래스에서 부를 수 없고, <code>final</code> 클래스는 상속 자체가 안 된다. 메서드가 <code>final</code>이면 프록시가 그 메서드를 재정의해 "처음 호출될 때 데이터를 읽어 오는" 코드를 끼워 넣을 수 없다. <code>protected</code>는 다른 패키지의 하위 클래스에서도 부를 수 있으므로 프록시 생성에 충분하면서, 애플리케이션 코드가 빈 엔티티를 함부로 만드는 것은 막아 준다. 그래서 엔티티의 기본 생성자는 보통 <code>protected</code>로 둔다.</p>
+
+<h3>JPA 적용 1: 리포지토리 개발</h3>
+
+<p>저장소 인터페이스와 검색 조건, 수정 내용을 담는 타입은 다음과 같다. 이 인터페이스는 기술에 독립적이다. JdbcTemplate으로도, MyBatis로도, JPA로도 구현할 수 있다.</p>
+
+<pre><code class="language-java">public record BookSearch(String keyword, Integer maxPrice) {}
+
+public record BookChange(String title, Integer price, Integer stockQuantity) {}
+
+public interface BookRepository {
+    Book save(Book book);
+    void update(Long bookId, BookChange change);
+    Optional<Book> findById(Long id);
+    List<Book> findAll(BookSearch search);
+}</code></pre>
+
+<p>JPA 구현은 다음과 같다.</p>
+
+<pre><code class="language-java">package example.bookstore.repository.jpa;
+
+import example.bookstore.domain.Book;
+import example.bookstore.repository.BookChange;
+import example.bookstore.repository.BookRepository;
+import example.bookstore.repository.BookSearch;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.TypedQuery;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+@Transactional
+public class JpaBookRepository implements BookRepository {
+
+    private final EntityManager em;
+
+    public JpaBookRepository(EntityManager em) {
+        this.em = em;
+    }
+
+    @Override
+    public Book save(Book book) {
+        em.persist(book);
+        return book;
+    }
+
+    @Override
+    public void update(Long bookId, BookChange change) {
+        Book book = em.find(Book.class, bookId);   // 없으면 null: 예제에서는 처리 생략
+        book.change(change.title(), change.price(), change.stockQuantity());
+    }
+
+    @Override
+    public Optional<Book> findById(Long id) {
+        Book book = em.find(Book.class, id);
+        return Optional.ofNullable(book);
+    }
+
+    @Override
+    public List<Book> findAll(BookSearch search) {
+        String keyword = search.keyword();
+        Integer maxPrice = search.maxPrice();
+
+        List<String> conditions = new ArrayList<>();
+        if (StringUtils.hasText(keyword)) {
+            conditions.add("b.title like concat('%', :keyword, '%')");
+        }
+        if (maxPrice != null) {
+            conditions.add("b.price <= :maxPrice");
+        }
+
+        String jpql = "select b from Book b";
+        if (!conditions.isEmpty()) {
+            jpql += " where " + String.join(" and ", conditions);
+        }
+
+        TypedQuery<Book> query = em.createQuery(jpql, Book.class);
+        if (StringUtils.hasText(keyword)) {
+            query.setParameter("keyword", keyword);
+        }
+        if (maxPrice != null) {
+            query.setParameter("maxPrice", maxPrice);
+        }
+        return query.getResultList();
+    }
+}</code></pre>
+
+<p>코드에 SQL이 없다. <code>save()</code>는 <code>persist()</code> 한 줄이고, <code>findById()</code>는 <code>find()</code> 한 줄이다. <code>find()</code>는 엔티티가 없으면 <code>null</code>을 돌려주므로 <code>Optional.ofNullable</code>로 감쌌다. 가장 눈에 띄는 것은 <code>update()</code>다. 엔티티를 찾아 값을 바꿀 뿐, 저장하라는 호출이 없다. 이 코드가 동작하는 이유는 바로 다음 절에서 추적한다.</p>
+
+<p><code>findAll()</code>에 처음으로 쿼리 문자열이 나온다. 이것은 SQL이 아니라 JPQL(Jakarta Persistence Query Language)이다. <code>Book</code>은 테이블 이름이 아니라 엔티티 이름이고, <code>b.title</code>은 컬럼 <code>book_title</code>이 아니라 엔티티의 필드 <code>title</code>이다. JPQL은 엔티티 객체를 대상으로 질의하고, 구현체가 매핑 정보로 이를 테이블과 컬럼을 쓰는 SQL로 번역한다. <code>:keyword</code>와 <code>:maxPrice</code>는 이름 있는 파라미터이고, 결국 JDBC의 <code>?</code> 바인딩이 되므로 SQL 인젝션에 안전하다.</p>
+
+<p>검색 조건에 따라 JPQL 문자열을 이어 붙이는 부분은 SQL 매퍼의 동적 SQL과 같은 고민을 그대로 갖고 있다. 조건이 늘면 문자열 조립과 파라미터 바인딩이 두 군데로 갈라져 서로 맞춰야 하고, 오타는 실행해야 드러난다. JPA 자체는 이 문제를 깔끔하게 풀지 못한다. 문자열 대신 자바 코드로 쿼리를 조립하는 Querydsl이 06회의 주제다.</p>
+
+<p>클래스에 붙은 <code>@Transactional</code>도 눈여겨보자. 보통 트랜잭션 경계는 서비스 계층이 정한다. 여기서는 리포지토리를 직접 호출하는 테스트에서도 변경이 반영되도록 리포지토리에 붙였다. JPA에서 데이터를 바꾸는 작업은 트랜잭션 안에서 해야 한다. 트랜잭션 없이 <code>persist()</code>를 부르면 어떻게 되는지는 공유 <code>EntityManager</code>를 다루는 절에서 소스로 확인한다. 테스트에서 이 트랜잭션을 롤백해 데이터를 격리하는 방법은 02회에서 다뤘다.</p>
+
+<h3>JPA 적용 2: 리포지토리 분석, 한 번의 호출에서 일어나는 일</h3>
+
+<p>이제 각 메서드를 호출했을 때 스프링, Hibernate, JDBC가 어떤 순서로 무엇을 하는지 따라가 보자. 먼저 <code>save()</code>다.</p>
+
+<figure class="flow-figure"><figcaption>save(new Book("JPA", 30000, 10)) 한 번의 흐름</figcaption><ol class="flow">
+<li><strong>트랜잭션 시작</strong><span><code>@Transactional</code> 프록시가 <code>JpaTransactionManager</code>에 트랜잭션을 요청한다. 트랜잭션 매니저는 <code>EntityManagerFactory</code>에서 새 <code>EntityManager</code>(새 영속성 컨텍스트)를 만들고 JPA 트랜잭션을 시작한다. 이때 JDBC 커넥션의 자동 커밋이 꺼진다. <code>EntityManager</code>는 트랜잭션 동기화 저장소를 통해 현재 스레드에 묶인다.</span></li>
+<li><strong>persist 위임</strong><span>리포지토리의 <code>em.persist(book)</code>은 주입된 공유 프록시를 거쳐, 현재 스레드에 묶인 실제 <code>EntityManager</code>의 <code>persist()</code>로 간다.</span></li>
+<li><strong>즉시 INSERT</strong><span>IDENTITY 전략이므로 Hibernate가 이 시점에 INSERT를 실행하고, 데이터베이스가 만든 키 값을 받아 <code>book.id</code>에 넣는다. 이제 <code>book</code>은 관리 상태이고 대응표와 스냅샷에 들어간다.</span></li>
+<li><strong>커밋</strong><span>메서드가 정상 반환하면 트랜잭션 매니저가 커밋한다. 커밋 직전 플러시가 일어나지만 바뀐 것이 없으므로 추가 SQL은 없다. 이어서 JDBC 커밋이 실행된다.</span></li>
+<li><strong>정리</strong><span><code>EntityManager</code>가 닫히고 스레드와의 연결이 풀린다. 커넥션은 풀로 돌아간다. 메서드가 돌려준 <code>book</code>은 이제 준영속 상태다.</span></li>
+</ol></figure>
+
+<p>3단계를 Hibernate 문서로 확인하자. Hibernate 6.4 사용자 가이드의 식별자 장은 IDENTITY 컬럼에 대해 "식별자 값을 알기 전에 엔티티 행이 물리적으로 삽입되어야 한다"고 설명하고, 그 결과 IDENTITY 생성을 쓰는 엔티티는 INSERT 문을 배치로 묶을 수 없다고 경고한다. 배치 처리 장에도 identity 식별자 생성기를 쓰면 Hibernate가 JDBC 수준의 INSERT 배치를 투명하게 끈다는 문장이 있다. 모형에서 본 그대로다. 영속성 컨텍스트는 식별자를 키로 객체를 관리하는데, IDENTITY에서는 데이터베이스가 행을 넣는 순간에야 식별자가 생긴다. 그래서 쓰기 지연의 원칙을 깨고 <code>persist()</code> 시점에 INSERT를 보낸다. 생성된 키 값은 드라이버와 데이터베이스가 지원하는 방법(JDBC의 <code>getGeneratedKeys()</code> 등)으로 받아 온다.</p>
+
+<p>이 사실은 실무 판단으로 이어진다. 도서 10만 건을 한 트랜잭션에서 <code>persist()</code>하면 IDENTITY에서는 INSERT 10만 번이 하나씩 데이터베이스를 왕복한다. <code>hibernate.jdbc.batch_size</code>를 설정해도 INSERT는 묶이지 않는다. 데이터베이스가 시퀀스를 지원하면 SEQUENCE 전략으로 키 값을 미리 받아 두고 INSERT를 플러시 때 모아 보낼 수 있다. Hibernate 사용자 가이드가 시퀀스를 지원하지 않는 데이터베이스에서만 IDENTITY를 쓰라고 권하는 이유다. 반대로 IDENTITY의 즉시 INSERT는 "<code>persist()</code> 직후 바로 ID를 쓸 수 있다"는 편리함이기도 하다. <code>save()</code>가 돌려준 객체의 <code>getId()</code>가 커밋 전에도 값을 갖는 것이 그 결과다.</p>
+
+<p>다음은 <code>update()</code>다. 스프링이 트랜잭션과 <code>EntityManager</code>를 준비하는 부분은 같으니, 영속성 컨텍스트 안에서 일어나는 일에 집중하자.</p>
+
+<pre class="diagram">update(1L, new BookChange("JPA 입문", 27000, 8))
+
+시점                     영속성 컨텍스트 (id=1)                     데이터베이스로 가는 SQL
+─────────────────────────────────────────────────────────────────────────────────────────
+트랜잭션 시작            (비어 있음)
+em.find(Book.class, 1L)  엔티티  {JPA, 30000, 10}                   SELECT ... FROM book WHERE id=?
+                         스냅샷  {JPA, 30000, 10}
+book.change(...)         엔티티  {JPA 입문, 27000, 8}               (없음)
+                         스냅샷  {JPA, 30000, 10}
+메서드 반환 → 커밋 직전   플러시: 엔티티 ≠ 스냅샷                   UPDATE book SET ... WHERE id=?
+JDBC 커밋                                                           COMMIT
+EntityManager 닫힘       (사라짐)</pre>
+
+<p><code>find()</code>는 대응표에 id 1이 없으므로 SELECT를 보내고, 결과로 엔티티를 만들면서 스냅샷을 함께 저장한다. <code>change()</code>는 순수한 자바 메서드 호출이다. 필드 세 개를 바꿀 뿐 Hibernate는 이 호출을 알지 못한다. 메서드가 반환되면 트랜잭션 프록시가 커밋을 요청하고, Hibernate는 커밋 전에 플러시하면서 엔티티와 스냅샷을 비교한다. 다르므로 UPDATE를 만들어 보낸다. 그다음 JDBC 커밋이 실행된다. "값만 바꿨는데 저장된다"는 현상의 정체는 커밋 직전의 비교다.</p>
+
+<p>UPDATE 문의 모양도 알아 두자. Hibernate의 <code>@DynamicUpdate</code> Javadoc은 이 애너테이션을 붙이면 UPDATE 문이 동적으로 만들어지고 실제로 바뀌는 컬럼만 포함한다고 설명하며, 실행 중에 SQL을 만드는 비용이 따른다고 덧붙인다. 붙이지 않은 기본 상태에서는 미리 만들어 둔 고정된 UPDATE 문을 쓰고, 그 문장은 엔티티의 컬럼을 모두 SET에 넣는다. 가격 하나만 바꿔도 제목과 재고까지 같은 값으로 다시 쓴다는 뜻이다. 문장이 하나로 고정되어 있으면 JDBC 문장 캐시와 배치에 유리하다. 컬럼이 아주 많은 테이블에서 일부만 자주 바뀐다면 <code>@DynamicUpdate</code>를 검토할 수 있다.</p>
+
+<p><code>findById()</code>는 <code>em.find()</code>로 대응표를 먼저 본다. 이 리포지토리는 메서드마다 트랜잭션이 새로 시작되고 끝나므로 영속성 컨텍스트도 메서드마다 새로 만들어진다. 따라서 리포지토리를 직접 호출하면 1차 캐시가 적중할 기회는 거의 없다. 서비스 계층에 트랜잭션을 두고 그 안에서 같은 엔티티를 여러 번 조회할 때 1차 캐시가 의미를 갖는다. 1차 캐시는 애플리케이션 전체가 공유하는 캐시가 아니라 트랜잭션 하나짜리 작업 공간이다.</p>
+
+<p><code>findAll()</code>의 JPQL은 다르게 동작한다. <code>find()</code>는 식별자 하나로 대응표를 찾을 수 있지만, "제목에 키워드가 들어간 도서"는 대응표만 보고 답할 수 없다. 그래서 JPQL 조회는 항상 SQL로 번역되어 데이터베이스에 간다. 그 전에 AUTO 플러시 규칙이 적용된다. 같은 트랜잭션에서 앞서 바꾼 엔티티가 있고 그 변경이 쿼리 결과에 영향을 줄 수 있으면 UPDATE가 먼저 나간다. 결과 행을 객체로 만들 때 대응표에 이미 같은 식별자의 객체가 있으면 새로 만들지 않고 그 객체를 돌려준다. 모형의 [4]에서 본 그대로다. JPQL은 1차 캐시를 건너뛰고 데이터베이스에 가지만, 돌려받는 객체의 동일성은 여전히 영속성 컨텍스트가 보장한다.</p>
+
+<aside class="note">JPQL이 실제로 어떤 SQL로 바뀌었는지는 <code>org.hibernate.SQL</code> 로그로 확인한다. 별칭이나 컬럼 순서 같은 생성 SQL의 세부 형식은 Hibernate 버전에 따라 다르므로, 로그를 볼 때는 문장의 종류와 순서, WHERE 조건에 집중하자.</aside>
+
+<x-visual id="spring-db2-04-shared-em-flow" title="@Transactional 프록시, JpaTransactionManager, 공유 EntityManager 프록시, 실제 EntityManager 사이의 호출 순서" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>한 번의 save 호출에서 트랜잭션 프록시가 EntityManager를 만들어 스레드에 묶고, 리포지토리의 공유 프록시가 그것을 찾아 위임하며, 커밋 때 플러시와 JDBC 커밋이 일어나는 순서를 보여 준다.</x-hint>
+<x-prompt>세로 생명선 6개의 시퀀스 다이어그램. 왼쪽부터 "호출자", "트랜잭션 프록시", "JpaTransactionManager", "리포지토리", "공유 EntityManager 프록시", "실제 EntityManager". 오른쪽 끝에 원통 "DB". 화살표 순서: 호출자 → 트랜잭션 프록시 "save()". 트랜잭션 프록시 → JpaTransactionManager "begin". JpaTransactionManager → 실제 EntityManager 점선 "생성 후 스레드에 묶음". 트랜잭션 프록시 → 리포지토리 "save()". 리포지토리 → 공유 EntityManager 프록시 "persist()". 공유 EntityManager 프록시 → 실제 EntityManager "스레드에서 찾아 위임". 실제 EntityManager → DB "INSERT". 트랜잭션 프록시 → JpaTransactionManager "commit". 실제 EntityManager → DB "flush 후 COMMIT". 시간 흐름은 위에서 아래. 평면 UML 스타일, 흰 배경, 파란 화살표, 라벨은 화살표 위에.</x-prompt>
+<x-caption>리포지토리가 쥐고 있는 것은 공유 프록시이고, 실제 영속성 컨텍스트는 트랜잭션이 시작될 때 만들어져 스레드에 묶인다.</x-caption>
+</x-visual>
+
+<h3>한 층 아래: 싱글톤에 주입된 EntityManager의 정체</h3>
+
+<p>앞의 흐름에는 의문이 하나 있다. <code>JpaBookRepository</code>는 싱글톤 빈이고, 생성자에서 받은 <code>EntityManager</code> 하나를 필드에 보관한다. 여러 요청 스레드가 동시에 이 리포지토리를 쓴다. 그런데 Spring Framework 레퍼런스는 <code>EntityManagerFactory</code> 인스턴스는 스레드 안전하지만 <code>EntityManager</code> 인스턴스는 그렇지 않다고 분명히 말한다. 영속성 컨텍스트의 대응표는 평범한 맵이고 동기화되어 있지 않다. 스레드 둘이 같은 영속성 컨텍스트를 쓰면 대응표와 스냅샷이 엉킨다. 그러면 필드에 든 이 객체는 무엇일까.</p>
+
+<p>답은 같은 레퍼런스에 있다. 주입되는 것은 "공유 EntityManager"로, 실제 트랜잭션용 <code>EntityManager</code>를 대신하는 공유되고 스레드 안전한 프록시이며, 모든 호출을 현재 트랜잭션의 <code>EntityManager</code>로 위임한다. 이 프록시를 만드는 클래스가 <code>SharedEntityManagerCreator</code>다. Spring Framework 6.1 소스에서 프록시의 <code>invoke()</code>는 먼저 <code>EntityManagerFactoryUtils.doGetTransactionalEntityManager()</code>로 현재 스레드에 묶인 <code>EntityManager</code>를 찾는다. 스프링 DB 1편 04회에서 본 트랜잭션 동기화 저장소(<code>TransactionSynchronizationManager</code>)가 커넥션 대신 <code>EntityManager</code>를 들고 있는 셈이다. 스레드마다 다른 <code>EntityManager</code>가 묶여 있으므로, 같은 프록시를 여러 스레드가 써도 각자 자기 영속성 컨텍스트로 간다.</p>
+
+<pre class="diagram">                      JpaBookRepository (싱글톤)
+                      ┌────────────────────────────┐
+                      │ em = 공유 EntityManager 프록시 │
+                      └──────────────┬─────────────┘
+                                     │ em.persist(book)
+                 ┌───────────────────┴───────────────────┐
+                 ▼                                       ▼
+   요청 스레드 A                              요청 스레드 B
+   TransactionSynchronizationManager          TransactionSynchronizationManager
+     EMF → EntityManagerHolder(EM-A)            EMF → EntityManagerHolder(EM-B)
+                 │                                       │
+                 ▼                                       ▼
+   EM-A의 영속성 컨텍스트                     EM-B의 영속성 컨텍스트
+   {1 → Book@a1}                              {1 → Book@b7}
+   커넥션 C1                                  커넥션 C2</pre>
+
+<p>스레드에 묶인 <code>EntityManager</code>가 없을 때, 곧 트랜잭션 밖에서 호출했을 때의 동작이 중요하다. 소스는 <code>joinTransaction</code>, <code>flush</code>, <code>persist</code>, <code>merge</code>, <code>remove</code>, <code>refresh</code>를 "트랜잭션이 필요한 메서드" 집합으로 정해 두고, 이 메서드들은 대상이 없으면 곧바로 <code>TransactionRequiredException</code>을 던진다. 메시지는 다음과 같이 조립된다.</p>
+
+<pre data-label="SharedEntityManagerCreator가 만드는 메시지 (persist의 경우)"><code class="language-text">No EntityManager with actual transaction available for current thread - cannot reliably process 'persist' call</code></pre>
+
+<p>나머지 메서드, 예를 들어 <code>find()</code>나 <code>createQuery()</code>는 예외를 던지지 않는다. 그 호출만을 위한 임시 <code>EntityManager</code>를 새로 만들어 실행하고 닫는다. 결과가 <code>Query</code>이면 쿼리가 실행될 때까지 <code>EntityManager</code>를 열어 두었다가 닫는다. 여기에 함정이 있다. 트랜잭션 없이 <code>update()</code>와 같은 코드를 실행하면, <code>find()</code>는 임시 영속성 컨텍스트에서 엔티티를 읽어 오고 그 컨텍스트는 바로 닫힌다. 돌려받은 엔티티는 이미 준영속 상태다. 이어서 <code>change()</code>로 값을 바꿔도 비교할 스냅샷도, 플러시할 컨텍스트도 없다. 예외도 SQL도 없이 변경이 사라진다. <code>persist()</code>는 크게 실패하는데 변경 감지는 조용히 실패하는 이유가 이 비대칭이다.</p>
+
+<p>마지막으로 생성자 주입이 어떻게 가능한지 보자. 전통적인 방법은 필드에 <code>@PersistenceContext</code>를 붙이는 것이다. 이 애너테이션은 스프링 컨테이너가 처리해 공유 <code>EntityManager</code> 프록시를 넣어 준다. 그런데 위 코드는 <code>@PersistenceContext</code> 없이 생성자로 받았다. 이것을 가능하게 하는 것은 Spring Data JPA다. Spring Data JPA 3.3의 <code>EntityManagerBeanDefinitionRegistrarPostProcessor</code>는 Javadoc에서 모든 <code>EntityManagerFactory</code> 빈 정의마다 <code>SharedEntityManagerCreator</code> 빈을 등록하며, 목적이 <code>EntityManager</code>를 생성자 인자로 자동 주입할 수 있게 하는 것이라고 밝힌다. 소스를 보면 <code>jpaSharedEM_AWC_</code> 뒤에 팩토리 빈 이름을 붙인 이름으로, <code>SharedEntityManagerCreator.createSharedEntityManager</code>를 팩토리 메서드로 쓰는 빈 정의를 만든다. 결국 두 방법 모두 같은 종류의 공유 프록시를 받는다. 스타터에 Spring Data JPA가 들어 있다는 앞 절의 사실이 여기서 쓰인다.</p>
+
+<h3>JPA 적용 3: 예외 변환</h3>
+
+<p>JPA의 예외는 런타임 예외이므로 시그니처 문제는 없다고 했다. 남은 문제는 타입이다. 서비스가 "해당 조건의 결과가 없음"을 처리하려고 <code>jakarta.persistence.NoResultException</code>을 잡으면 서비스는 JPA에 의존한다. 같은 상황에서 JdbcTemplate 구현은 스프링의 <code>EmptyResultDataAccessException</code>을 던진다. 저장소 구현을 바꾸면 서비스의 <code>catch</code> 절도 바꿔야 한다. 스프링 DB 1편 06회에서 세운 원칙, 곧 데이터 접근 예외는 기술에 독립적인 <code>DataAccessException</code> 계층으로 통일한다는 원칙이 JPA에서도 지켜지려면 누군가 변환해야 한다.</p>
+
+<p>JdbcTemplate은 템플릿 안에서 <code>SQLException</code>을 직접 잡아 변환했다. JPA 리포지토리는 <code>EntityManager</code>를 직접 부르므로 그런 템플릿이 없다. 스프링은 대신 <b>프록시</b>로 해결한다. 리포지토리 클래스에 <code>@Repository</code>를 붙이면 그 빈 앞에 예외 변환 프록시가 서고, 리포지토리 메서드 밖으로 나가는 런타임 예외를 가로채 변환한다. 경로를 하나씩 따라가 보자.</p>
+
+<ol>
+<li><b>후처리기 등록</b>: Spring Boot의 <code>PersistenceExceptionTranslationAutoConfiguration</code>이 <code>PersistenceExceptionTranslationPostProcessor</code>를 빈으로 등록한다. 조건은 <code>spring.dao.exceptiontranslation.enabled</code>가 <code>false</code>가 아닐 것(속성 부록의 기본값 <code>true</code>)이다. 이때 <code>spring.aop.proxy-target-class</code> 값을 읽어 프록시 방식을 정하는데, 속성이 없으면 <code>true</code>로 보아 클래스 기반(CGLIB) 프록시를 만든다.</li>
+<li><b>어드바이저 부착</b>: 이 후처리기의 Javadoc은 스프링의 <code>@Repository</code>가 붙은 빈에 영속성 예외 변환을 자동으로 적용하며, 그 방법으로 <code>PersistenceExceptionTranslationAdvisor</code>를 노출된 프록시에 추가한다고 설명한다. 대상 애너테이션의 기본값이 <code>Repository.class</code>로 정해져 있다.</li>
+<li><b>변환기 수집</b>: 어드바이저 안의 <code>PersistenceExceptionTranslationInterceptor</code>는 빈 팩토리에서 <code>PersistenceExceptionTranslator</code>를 구현한 빈을 모두 찾아 순서대로 <code>ChainedPersistenceExceptionTranslator</code>에 넣는다. JPA 환경에서 대표적인 변환기는 <code>EntityManagerFactory</code>를 만든 <code>LocalContainerEntityManagerFactoryBean</code>이다. 그 부모 <code>AbstractEntityManagerFactoryBean</code>의 선언부에 <code>PersistenceExceptionTranslator</code>가 들어 있다.</li>
+<li><b>방언에 위임</b>: <code>AbstractEntityManagerFactoryBean.translateExceptionIfPossible()</code>은 <code>JpaDialect</code>가 있으면 그것에, 없으면 <code>EntityManagerFactoryUtils.convertJpaAccessExceptionIfPossible()</code>에 맡긴다. Hibernate를 쓰면 방언은 <code>HibernateJpaDialect</code>다.</li>
+<li><b>Hibernate 예외 먼저</b>: <code>HibernateJpaDialect</code>는 예외가 <code>HibernateException</code>이거나, 원인이 <code>HibernateException</code>인 <code>PersistenceException</code>이면 Hibernate 전용 변환으로 보낸다. 그 밖에는 JPA 표준 예외 변환으로 넘긴다.</li>
+</ol>
+
+<p>두 변환 메서드가 실제로 무엇을 무엇으로 바꾸는지는 Spring Framework 6.1 소스에서 확인할 수 있다. 자주 만나는 것만 추리면 다음과 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>던져진 예외</th><th>변환 결과 (DataAccessException 하위)</th><th>변환하는 곳</th></tr></thead><tbody>
+<tr><td><code>NoResultException</code></td><td><code>EmptyResultDataAccessException</code></td><td>EntityManagerFactoryUtils</td></tr>
+<tr><td><code>NonUniqueResultException</code></td><td><code>IncorrectResultSizeDataAccessException</code></td><td>EntityManagerFactoryUtils</td></tr>
+<tr><td><code>EntityExistsException</code></td><td><code>DataIntegrityViolationException</code></td><td>EntityManagerFactoryUtils</td></tr>
+<tr><td><code>OptimisticLockException</code></td><td><code>JpaOptimisticLockingFailureException</code></td><td>EntityManagerFactoryUtils</td></tr>
+<tr><td><code>TransactionRequiredException</code></td><td><code>InvalidDataAccessApiUsageException</code></td><td>EntityManagerFactoryUtils</td></tr>
+<tr><td><code>IllegalArgumentException</code>, <code>IllegalStateException</code></td><td><code>InvalidDataAccessApiUsageException</code></td><td>EntityManagerFactoryUtils</td></tr>
+<tr><td>그 밖의 <code>PersistenceException</code></td><td><code>JpaSystemException</code></td><td>EntityManagerFactoryUtils</td></tr>
+<tr><td>Hibernate <code>ConstraintViolationException</code></td><td><code>DataIntegrityViolationException</code> (메시지에 SQL과 제약 이름)</td><td>HibernateJpaDialect</td></tr>
+<tr><td>Hibernate <code>SQLGrammarException</code></td><td><code>InvalidDataAccessResourceUsageException</code></td><td>HibernateJpaDialect</td></tr>
+<tr><td>Hibernate <code>JDBCConnectionException</code></td><td><code>DataAccessResourceFailureException</code></td><td>HibernateJpaDialect</td></tr>
+<tr><td>Hibernate <code>LockAcquisitionException</code></td><td><code>CannotAcquireLockException</code></td><td>HibernateJpaDialect</td></tr>
+<tr><td>위 어디에도 해당하지 않는 예외</td><td>변환하지 않음(<code>null</code>) → 원래 예외가 그대로 나간다</td><td>EntityManagerFactoryUtils</td></tr>
+</tbody></table></div>
+
+<p>표에서 두 가지를 눈여겨보자. 첫째, <code>IllegalArgumentException</code>과 <code>IllegalStateException</code>도 변환 대상이다. 소스의 주석은 JPA 명세상 구현체가 <code>PersistenceException</code> 외에 이 두 예외도 던질 수 있기 때문이라고 설명한다. 예를 들어 <code>em.find(Book.class, null)</code>처럼 잘못된 인자를 넘기면 구현체가 <code>IllegalArgumentException</code>을 던지고, 프록시를 지나며 <code>InvalidDataAccessApiUsageException</code>이 된다. 둘째, 어디에도 해당하지 않는 예외는 <code>null</code>을 돌려받아 변환하지 않는다. 소스의 주석은 이런 예외가 구현체가 아니라 사용자 코드에서 생긴 것이므로 변환하지 않는다고 설명한다.</p>
+
+<p>인터셉터에는 규칙이 하나 더 있다. Spring Framework 6.1의 <code>PersistenceExceptionTranslationInterceptor.invoke()</code>는 메서드를 실행하다 <code>RuntimeException</code>이 나면, 그 예외 타입이 <b>메서드의 <code>throws</code> 절에 선언되어 있는지</b> 먼저 본다. 선언되어 있으면 변환하지 않고 그대로 던진다(<code>alwaysTranslate</code>를 켜지 않은 기본 상태). 메서드 작성자가 "이 예외를 그대로 받겠다"고 시그니처로 약속했다면 그 약속을 존중하는 것이다. 그렇지 않으면 수집한 변환기 체인에 맡기고, 변환 결과가 없으면 원래 예외를 던진다.</p>
+
+<p>이 규칙을 JDK의 동적 프록시만으로 흉내 내 확인해 보자. JPA와 스프링의 예외 클래스를 흉내 낸 작은 클래스를 만들고, 같은 예외를 던지는 메서드 두 개 중 하나만 <code>throws</code>에 예외를 선언했다. 스프링 부트는 기본으로 CGLIB 프록시를 쓰지만, "메서드 호출을 가로채 예외를 바꾼다"는 원리는 같다.</p>
+
+<pre><code class="language-java">import java.lang.reflect.*;
+
+public class TranslateDemo {
+    // JPA 쪽 예외를 흉내 낸다
+    static class PersistenceException extends RuntimeException {
+        PersistenceException(String m) { super(m); }
+    }
+    static class NoResultException extends PersistenceException {
+        NoResultException(String m) { super(m); }
+    }
+    // 스프링 쪽 예외를 흉내 낸다
+    static class DataAccessException extends RuntimeException {
+        DataAccessException(String m, Throwable cause) { super(m, cause); }
+    }
+    static class EmptyResultDataAccessException extends DataAccessException {
+        EmptyResultDataAccessException(String m, Throwable cause) { super(m, cause); }
+    }
+
+    interface BookRepository {
+        String findTitle(long id);
+        String findTitleRaw(long id) throws NoResultException;
+    }
+
+    static class JpaBookRepository implements BookRepository {
+        public String findTitle(long id) { throw new NoResultException("no row: id=" + id); }
+        public String findTitleRaw(long id) throws NoResultException { throw new NoResultException("no row: id=" + id); }
+    }
+
+    static DataAccessException translate(RuntimeException ex) {
+        if (ex instanceof NoResultException) return new EmptyResultDataAccessException(ex.getMessage(), ex);
+        if (ex instanceof PersistenceException) return new DataAccessException(ex.getMessage(), ex);
+        return null;                                 // 모르는 예외는 바꾸지 않는다
+    }
+
+    static boolean declares(Method m, Class<?> exType) {
+        for (Class<?> declared : m.getExceptionTypes()) {
+            if (declared.isAssignableFrom(exType)) return true;
+        }
+        return false;
+    }
+
+    public static void main(String[] args) {
+        BookRepository target = new JpaBookRepository();
+        BookRepository proxy = (BookRepository) Proxy.newProxyInstance(
+                BookRepository.class.getClassLoader(),
+                new Class<?>[]{BookRepository.class},
+                (p, method, a) -> {
+                    try {
+                        return method.invoke(target, a);
+                    } catch (InvocationTargetException ite) {
+                        Throwable ex = ite.getTargetException();
+                        if (ex instanceof RuntimeException re && !declares(method, re.getClass())) {
+                            DataAccessException dae = translate(re);
+                            if (dae != null) throw dae;
+                        }
+                        throw ex;
+                    }
+                });
+
+        try {
+            proxy.findTitle(1);
+        } catch (RuntimeException e) {
+            System.out.println("findTitle    -> " + e.getClass().getSimpleName()
+                    + " (cause: " + e.getCause().getClass().getSimpleName() + ")");
+        }
+        try {
+            proxy.findTitleRaw(1);
+        } catch (RuntimeException e) {
+            System.out.println("findTitleRaw -> " + e.getClass().getSimpleName()
+                    + " (cause: " + e.getCause() + ")");
+        }
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">findTitle    -> EmptyResultDataAccessException (cause: NoResultException)
+findTitleRaw -> NoResultException (cause: null)</code></pre>
+
+<p>첫 호출은 선언되지 않은 <code>NoResultException</code>이 프록시에서 <code>EmptyResultDataAccessException</code>으로 바뀌었고, 원래 예외는 원인(cause)으로 남았다. 스프링의 변환 결과도 원인을 보존하므로 로그에서 구현체가 던진 원래 예외와 SQL 정보를 따라갈 수 있다. 두 번째 호출은 <code>throws NoResultException</code>이 선언되어 있어 그대로 통과했다. 리플렉션으로 호출한 메서드가 던진 예외는 <code>InvocationTargetException</code>에 싸여 오므로, <code>getTargetException()</code>으로 꺼낸 뒤 판단한다는 점도 실제 프록시와 같다.</p>
+
+<p>이 경로 밖에서 생기는 예외도 있다. 커밋 시점의 플러시가 대표적이다. <code>update()</code>에서 변경한 값이 유일 제약을 어기면, 그 위반은 리포지토리 메서드 안이 아니라 메서드가 반환된 뒤 커밋 직전 플러시의 UPDATE에서 드러난다. 이때는 <code>JpaTransactionManager</code>가 변환을 맡는다. Spring Framework 6.1의 <code>doCommit()</code>은 커밋 중 <code>RollbackException</code>이 나면 그 원인을 <code>JpaDialect</code>로 변환해 던지고, 변환되지 않으면 <code>TransactionSystemException</code>을 던진다. 그 밖의 <code>RuntimeException</code>은 플러시 실패로 보고 <code>DataAccessUtils.translateIfNecessary()</code>로 변환한다. 서비스는 어느 쪽이든 <code>DataAccessException</code> 계층으로 받게 된다.</p>
+
+<p>예외는 트랜잭션에도 흔적을 남긴다. Jakarta Persistence 3.1 명세 3.11절은 <code>PersistenceException</code>의 인스턴스가 던져지면, 활성 트랜잭션이 있고 영속성 컨텍스트가 그 트랜잭션에 참여한 경우 현재 트랜잭션을 롤백 전용으로 표시한다고 정한다. 예외는 넷이다. <code>NoResultException</code>, <code>NonUniqueResultException</code>, <code>QueryTimeoutException</code>, <code>LockTimeoutException</code>은 트랜잭션을 롤백 표시하지 않는다. 그러니 저장 중 생긴 JPA 예외를 서비스에서 잡아 "복구"해도, 그 트랜잭션은 이미 커밋할 수 없는 상태일 수 있다. 롤백 전용 표시가 스프링 트랜잭션 전파와 만나 <code>UnexpectedRollbackException</code>으로 이어지는 과정은 07~09회에서 자세히 다룬다.</p>
+
+<x-visual id="spring-db2-04-exception-translation" title="@Repository 빈에서 JPA 예외가 DataAccessException으로 바뀌는 경로" kind="순서도" ratio="16:9">
+<x-hint>리포지토리 메서드에서 던져진 예외가 CGLIB 프록시의 인터셉터에서 throws 선언 검사, 변환기 체인, HibernateJpaDialect, EntityManagerFactoryUtils를 거쳐 변환되거나 그대로 나가는 분기를 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 흐르는 순서도. 시작 상자 "리포지토리 메서드에서 RuntimeException". 화살표가 마름모 "throws에 선언됨?"으로 간다. "예" 화살표는 위쪽 회색 상자 "그대로 던짐"으로. "아니오" 화살표는 파란 상자 "ChainedPersistenceExceptionTranslator"로, 다시 파란 상자 "LocalContainerEntityManagerFactoryBean"으로, 다시 마름모 "Hibernate 예외?"로. "예" 화살표는 상자 "HibernateJpaDialect 변환"으로, "아니오" 화살표는 상자 "EntityManagerFactoryUtils 변환"으로. 두 상자에서 나온 화살표가 마름모 "결과 있음?"으로 모인다. "예"는 초록 상자 "DataAccessException 하위 예외", "아니오"는 회색 상자 "원래 예외". 전체를 감싸는 점선 테두리에 라벨 "@Repository 프록시". 평면 순서도 스타일, 흰 배경.</x-prompt>
+<x-caption>예외 변환은 @Repository 빈 앞의 프록시에서 일어난다. throws에 선언된 예외와, 변환기가 모르는 예외는 그대로 나간다.</x-caption>
+</x-visual>
+
+<h3>흔한 오해와 함정</h3>
+
+<p><b>"JPA를 쓰면 SQL을 몰라도 된다."</b> JPA는 SQL을 대신 쓰지만, 어떤 SQL이 몇 번 나가는지는 여전히 개발자의 책임이다. 이 회차에서만도 IDENTITY의 즉시 INSERT, 모든 컬럼을 쓰는 기본 UPDATE, JPQL 전의 자동 플러시처럼 SQL을 알아야 판단할 수 있는 동작이 여럿 나왔다. 생성된 SQL을 로그로 읽을 수 없으면 성능 문제를 찾을 수 없다. JPA를 잘 쓰는 사람은 SQL을 잘 아는 사람이다.</p>
+
+<p><b>"persist()를 부르면 INSERT가 나간다" 또는 "persist()는 INSERT를 미룬다."</b> 둘 다 반만 맞다. 명세는 커밋 시점이나 그 전, 또는 플러시 때 들어간다고만 정한다. 쓰기 지연이 원칙이지만 IDENTITY 전략에서는 식별자를 얻으려고 즉시 INSERT한다. 키 생성 전략을 바꾸면 같은 코드의 SQL 순서가 달라진다. "이 시점에 행이 이미 들어갔는가"가 중요한 코드라면 전략을 함께 확인해야 한다.</p>
+
+<p><b>"세터를 부르면 UPDATE가 나간다."</b> 세터는 평범한 자바 메서드다. UPDATE는 플러시 때 스냅샷과 비교해서 나간다. 그래서 값을 여러 번 바꿔도 플러시 전에는 UPDATE가 한 번이고, 원래 값으로 되돌리면 스냅샷과 같아져 UPDATE가 나가지 않는다. 반대로 준영속 객체의 값을 바꾸면 아무 일도 일어나지 않는다. 공유 <code>EntityManager</code>를 트랜잭션 없이 쓸 때 <code>find()</code>가 돌려주는 객체가 바로 그 준영속 객체다.</p>
+
+<p><b>"영속성 컨텍스트는 애플리케이션 캐시다."</b> 1차 캐시는 트랜잭션 하나의 작업 공간이다. 트랜잭션이 끝나면 사라지고, 다른 요청과 공유되지 않는다. 요청 A가 읽은 도서를 요청 B가 SQL 없이 꺼내 쓰는 일은 없다. 여러 트랜잭션에 걸친 캐시는 Hibernate의 2차 캐시라는 별도 기능이고, 이 회차의 범위가 아니다.</p>
+
+<p><b>"JPQL로 조회해도 1차 캐시에 있으면 SQL이 안 나간다."</b> 식별자 하나로 찾는 <code>find()</code>만 대응표로 답할 수 있다. JPQL은 조건으로 행을 고르는 질의이므로 항상 데이터베이스에 간다. 다만 돌아온 행 중 대응표에 이미 있는 식별자는 기존 객체로 바뀌므로, 같은 트랜잭션에서 미리 바꿔 둔 값이 데이터베이스 값으로 덮이지 않는다. 그 대신 AUTO 플러시가 먼저 일어나 변경이 데이터베이스에 반영된다.</p>
+
+<p><b>"예외 변환은 JPA가 해 준다."</b> 변환은 스프링의 프록시가 한다. 리포지토리에 <code>@Repository</code>가 없으면 후처리기가 그 빈을 대상으로 보지 않으므로 서비스는 JPA 예외를 그대로 받는다. <code>@Component</code>를 붙여도 빈으로 등록되기는 하지만 변환은 없다. 또 리포지토리 안에서 <code>this.findById()</code>처럼 자기 메서드를 부르면 프록시를 거치지 않는다. 변환은 프록시 경계를 넘을 때 한 번 일어난다.</p>
+
+<p><b>"내가 던진 예외는 그대로 나간다."</b> 대부분은 그렇다. 변환기가 모르는 예외는 <code>null</code>을 받아 원래대로 나간다. 그러나 <code>IllegalArgumentException</code>과 <code>IllegalStateException</code>은 예외다. <code>@Repository</code> 빈 안에서 직접 <code>throw new IllegalArgumentException("가격은 0 이상")</code>을 해도, 변환기는 그것이 구현체에서 왔는지 사용자 코드에서 왔는지 구분하지 못하므로 <code>InvalidDataAccessApiUsageException</code>으로 바꾼다. 서비스에서 <code>IllegalArgumentException</code>을 잡으려던 코드가 동작하지 않는 이유가 이것이다. 리포지토리에서 검증 실패를 알리려면 이 두 예외 대신 의미가 분명한 다른 예외를 쓰거나, 검증을 서비스나 도메인으로 옮기는 편이 낫다.</p>
+
+<p><b>"엔티티의 기본 생성자는 public이어야 한다" 또는 "private이어도 된다."</b> 명세는 <code>public</code> 또는 <code>protected</code>를 요구한다. 리플렉션만 생각하면 <code>private</code>도 호출할 수 있지만, 프록시가 하위 클래스로 만들어지려면 부모 생성자를 부를 수 있어야 한다. 같은 이유로 엔티티 클래스와 그 메서드에 <code>final</code>을 붙이지 않는다. 코틀린처럼 클래스가 기본으로 <code>final</code>인 언어에서 엔티티를 쓸 때 추가 설정이 필요한 것도 이 규칙 때문이다.</p>
+
+<h3>정리: SQL 매퍼에서 ORM으로 옮겨 오며 바뀐 것</h3>
+
+<p>이 회차의 출발점은 SQL 중심 개발의 두 문제였다. 객체를 SQL로 옮겨 적는 반복과 그 때문에 엔티티를 믿을 수 없는 문제, 그리고 그 뿌리에 있는 객체와 테이블의 패러다임 불일치다. JPA는 매핑 정보로 SQL을 만들어 반복을 없애고, 영속성 컨텍스트라는 식별자별 대응표로 비교 불일치를 풀며, 프록시를 통한 지연 로딩으로 객체 그래프 탐색 문제에 답한다.</p>
+
+<p>그 대가로 새로운 규칙을 알아야 한다. SQL이 나가는 시점은 코드의 줄이 아니라 플러시가 정한다. IDENTITY 전략은 그 원칙의 예외로 <code>persist()</code> 때 INSERT한다. 변경 감지는 관리 상태의 엔티티에만, 트랜잭션 안에서만 동작한다. 싱글톤에 주입된 <code>EntityManager</code>는 스레드에 묶인 실제 영속성 컨텍스트로 가는 공유 프록시이고, 트랜잭션이 없으면 변경 메서드는 예외를 던지고 조회는 임시 컨텍스트에서 실행된다. 예외는 <code>@Repository</code> 프록시와 트랜잭션 매니저가 <code>DataAccessException</code> 계층으로 바꾼다.</p>
+
+<p>다음 회차들과의 연결도 정리해 두자. 05회의 스프링 데이터 JPA는 이 회차의 <code>JpaBookRepository</code> 같은 구현 클래스를 인터페이스 선언만으로 만들어 준다. 그 아래에서는 이 회차의 <code>EntityManager</code>, 영속성 컨텍스트, 예외 변환이 그대로 동작한다. 06회의 Querydsl은 <code>findAll()</code>의 문자열 JPQL 조립을 자바 코드로 바꾼다. 07~09회의 트랜잭션 회차에서는 이 회차에서 본 트랜잭션 프록시, 커밋 시점의 플러시, JPA 예외가 남기는 롤백 전용 표시가 전파 규칙과 만나 어떤 결과를 내는지 다룬다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>패러다임 불일치</dt><dd>객체는 상속·참조·그래프로, 테이블은 분리된 테이블·외래 키·조인으로 데이터를 표현한다. 상속, 연관관계, 객체 그래프 탐색, 비교의 네 가지에서 둘이 맞지 않고, SQL 매퍼에서는 그 변환을 개발자가 손으로 한다.</dd>
+<dt>JPA와 Hibernate</dt><dd>JPA(Jakarta Persistence)는 jakarta.persistence 패키지의 API와 규칙을 정한 표준 명세이고, Hibernate는 그 구현체다. JPA는 JDBC를 대체하지 않고 그 위에서 SQL을 만들어 실행한다.</dd>
+<dt>영속성 컨텍스트</dt><dd>식별자별로 엔티티 인스턴스를 하나씩 보관하는 작업 공간이다. 1차 캐시와 동일성 보장은 이 대응표에서 나오며, 스프링에서는 보통 트랜잭션 하나와 수명이 같다.</dd>
+<dt>플러시와 변경 감지</dt><dd>플러시는 영속성 컨텍스트의 변경을 SQL로 보내는 일로, 커밋 때와 AUTO 모드의 쿼리 실행 전, flush() 호출 때 일어난다. Hibernate는 기본으로 플러시 때 엔티티를 스냅샷과 비교해 UPDATE를 만든다.</dd>
+<dt>IDENTITY 전략</dt><dd>데이터베이스가 행을 넣어야 식별자가 생기므로 Hibernate는 persist() 시점에 INSERT를 실행한다. 이 엔티티의 INSERT는 JDBC 배치로 묶이지 않는다.</dd>
+<dt>엔티티 클래스 규칙</dt><dd>public 또는 protected 기본 생성자가 있어야 하고, 클래스·메서드·영속 필드가 final이면 안 된다. 조회 결과로 빈 객체를 만들고, 하위 클래스 프록시를 만들기 위해서다.</dd>
+<dt>공유 EntityManager</dt><dd>싱글톤에 주입되는 EntityManager는 SharedEntityManagerCreator가 만든 스레드 안전한 프록시로, 호출마다 현재 스레드의 트랜잭션에 묶인 실제 EntityManager로 위임한다. 트랜잭션이 없으면 persist 같은 변경 메서드는 TransactionRequiredException을 던진다.</dd>
+<dt>JPA 예외 변환</dt><dd>@Repository 빈 앞의 프록시가 메서드 밖으로 나가는 런타임 예외를 HibernateJpaDialect와 EntityManagerFactoryUtils로 DataAccessException 하위 예외로 바꾼다. throws에 선언된 예외와 변환기가 모르는 예외는 그대로 나간다.</dd>
+</x-summary>
+
+<x-review>
+<p>대량 등록 작업이 예상보다 훨씬 느리다는 보고가 들어오면 먼저 키 생성 전략을 본다. IDENTITY라면 <code>hibernate.jdbc.batch_size</code>를 설정해도 INSERT는 한 건씩 데이터베이스를 왕복한다. 데이터베이스가 시퀀스를 지원하면 SEQUENCE로 바꾸는 것이 근본적인 해결이고, MySQL처럼 시퀀스가 없으면 대량 등록 경로만 JdbcTemplate의 배치 업데이트로 따로 만드는 방법이 현실적이다. 같은 트랜잭션에서 JdbcTemplate과 JPA를 섞어 쓸 수 있다는 사실(JpaTransactionManager가 같은 커넥션을 노출한다)이 이 선택을 가능하게 한다. 다만 JdbcTemplate으로 바꾼 행은 영속성 컨텍스트가 모르므로, 같은 트랜잭션에서 그 행을 엔티티로 이미 들고 있다면 오래된 값을 보게 된다는 점을 함께 판단해야 한다.</p>
+
+<p>"수정 API가 200을 돌려주는데 값이 안 바뀐다"는 장애는 대개 트랜잭션 경계 문제다. 변경 감지는 관리 상태의 엔티티에서만, 커밋 전 플러시에서만 동작한다. 트랜잭션 없이 공유 EntityManager로 조회한 엔티티는 이미 준영속이고, 값을 바꿔도 예외조차 나지 않는다. 같은 클래스 안에서 <code>@Transactional</code> 메서드를 내부 호출해 프록시를 건너뛴 경우도 증상이 같다(이 문제는 07회에서 다룬다). 이런 보고를 받으면 SQL 로그에서 UPDATE가 있었는지, 그 메서드가 정말 트랜잭션 안에서 실행됐는지부터 확인한다.</p>
+
+<p>예외 처리 설계에서는 서비스가 무엇을 잡을지 결정할 때 변환 규칙을 기준으로 삼는다. 서비스는 <code>jakarta.persistence</code>나 <code>org.hibernate</code> 예외가 아니라 <code>DataAccessException</code> 계층을 잡아야 저장소 기술을 바꿔도 코드가 버틴다. 이 원칙은 리포지토리에 <code>@Repository</code>가 있고, 메서드 <code>throws</code>에 JPA 예외를 선언하지 않았을 때만 성립한다. 또 유일 제약 위반처럼 커밋 때 드러나는 예외는 리포지토리 호출 줄이 아니라 트랜잭션이 끝나는 지점에서 던져진다. 중복 가입을 잡아 다른 이름을 제안하는 식의 복구 로직을 짜려면, 리포지토리 호출 직후 <code>flush()</code>로 제약 위반을 그 자리에서 드러내거나, 복구 단위를 별도 트랜잭션으로 나누는 설계가 필요하다. 그리고 JPA 예외가 이미 트랜잭션을 롤백 전용으로 표시했을 수 있다는 점을 잊지 않는다.</p>
+</x-review>
+
+<x-practice>
+<li>IDENTITY 전략을 쓰는 <code>Book</code>에 대해, 한 트랜잭션 안에서 다음을 순서대로 실행한다. (1) <code>em.persist(new Book("A", 10000, 1))</code> (2) 돌려받은 객체의 가격을 12000으로 바꾼다 (3) <code>em.find(Book.class, 그 id)</code> (4) JPQL <code>select b from Book b where b.price > 11000</code> 실행 (5) 가격을 다시 12000으로 설정한다(값은 그대로) (6) 커밋. 데이터베이스로 나가는 SQL을 순서대로 적어라.</li>
+<li>위 1번의 (2) 직후와 (4) 직후에 영속성 컨텍스트의 대응표와 스냅샷이 각각 어떤 값을 갖는지 표로 그려라.</li>
+<li><code>@Transactional</code>이 없는 서비스 메서드에서 <code>JpaBookRepository</code>와 같은 코드를 쓰되 리포지토리에도 <code>@Transactional</code>을 붙이지 않았다. <code>save()</code>를 부르면 무슨 일이 생기고, 예외가 서비스에 도착할 때의 타입은 무엇인가? 같은 조건에서 <code>update()</code>를 부르면 무슨 일이 생기는가?</li>
+<li><code>@Repository</code>가 붙은 리포지토리 메서드 안에서 개발자가 직접 <code>throw new IllegalStateException("재고 부족")</code>을 했다. 서비스에서 <code>catch (IllegalStateException e)</code>가 이 예외를 잡지 못하는 이유를 변환 경로에 따라 설명하고, 해결 방법을 두 가지 제시하라.</li>
+<li>엔티티 클래스를 <code>public final class Book</code>으로 선언하고 기본 생성자를 <code>private</code>으로 두었다. 명세 위반 외에, 하위 클래스 기반 프록시를 만들려 할 때 어떤 문제가 생기는지 이 회차의 컴파일 실험 결과를 근거로 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> (1)에서 IDENTITY이므로 INSERT가 즉시 나간다(가격 10000). (2)는 SQL이 없다. (3)은 대응표에 같은 id가 있으므로 SQL 없이 같은 객체를 돌려준다. (4)는 JPQL이고 AUTO 플러시 대상이므로, 먼저 플러시가 일어나 스냅샷(10000)과 현재 값(12000)이 다르다는 것이 감지되어 UPDATE가 나가고, 이어서 SELECT가 나간다. 이 SELECT의 결과 행은 대응표의 기존 객체로 바뀐다. (5)는 값이 그대로이므로 아무 일도 없다. (6)의 커밋 전 플러시에서는 (4)의 플러시가 스냅샷을 12000으로 갱신해 두었으므로 현재 값과 같아 UPDATE가 없고, COMMIT만 나간다. 순서는 INSERT → UPDATE → SELECT → COMMIT이다.</p>
+
+<p><b>2번.</b> (2) 직후: 대응표 {id → 그 객체(가격 12000)}, 스냅샷 {id → 가격 10000}. 엔티티와 스냅샷이 어긋나 있지만 아직 데이터베이스는 10000이다. (4) 직후: 대응표는 같은 객체 하나(가격 12000), 스냅샷은 플러시로 갱신되어 가격 12000. SELECT 결과로 새 객체가 생기지 않았다는 점이 핵심이다. 대응표에 같은 식별자가 있으므로 기존 객체를 결과 목록에 넣는다.</p>
+
+<p><b>3번.</b> <code>save()</code>의 <code>em.persist()</code>는 공유 프록시를 거치는데, 스레드에 묶인 <code>EntityManager</code>가 없으므로 <code>SharedEntityManagerCreator</code>가 "No EntityManager with actual transaction available for current thread - cannot reliably process 'persist' call" 메시지로 <code>TransactionRequiredException</code>을 던진다. 이 예외는 리포지토리 메서드 밖으로 나가며 <code>@Repository</code> 프록시를 지나고, <code>EntityManagerFactoryUtils</code>의 규칙에 따라 <code>InvalidDataAccessApiUsageException</code>으로 바뀌어 서비스에 도착한다. <code>update()</code>는 예외가 나지 않는다. <code>find()</code>는 트랜잭션이 필요한 메서드가 아니므로 임시 <code>EntityManager</code>에서 실행되고 그 컨텍스트는 바로 닫힌다. 돌려받은 엔티티는 준영속이므로 <code>change()</code>로 값을 바꿔도 비교할 스냅샷도 플러시도 없어, 변경이 조용히 사라진다.</p>
+
+<p><b>4번.</b> 예외가 리포지토리 메서드 밖으로 나가면 <code>PersistenceExceptionTranslationInterceptor</code>가 받는다. 메서드 <code>throws</code>에 선언되지 않았으므로 변환기 체인으로 가고, <code>LocalContainerEntityManagerFactoryBean</code> → <code>HibernateJpaDialect</code>(Hibernate 예외가 아니므로 통과) → <code>EntityManagerFactoryUtils.convertJpaAccessExceptionIfPossible()</code>에 도착한다. 이 메서드는 JPA 명세상 구현체도 던질 수 있는 <code>IllegalStateException</code>을 <code>InvalidDataAccessApiUsageException</code>으로 바꾼다. 그래서 서비스에는 다른 타입이 도착한다. 해결책은 (가) 리포지토리에서 이 두 예외 대신 의미가 분명한 별도 예외(예: 직접 만든 <code>OutOfStockException</code>)를 던지거나, (나) 재고 검증 같은 규칙을 리포지토리가 아니라 도메인이나 서비스로 옮기는 것이다. 메서드에 <code>throws IllegalStateException</code>을 선언해 변환을 피하는 방법도 있지만, 저장소 인터페이스에 그런 선언을 퍼뜨리는 것은 의도가 흐려지므로 권하지 않는다.</p>
+
+<p><b>5번.</b> 컴파일 실험에서 다른 패키지의 하위 클래스가 <code>private</code> 생성자를 <code>super()</code>로 부르려 하면 "Book() has private access in Book" 오류가 났고, <code>final</code> 클래스를 상속하면 "cannot inherit from final" 오류가 났다. 실행 중에 바이트코드로 하위 클래스를 만드는 프록시도 같은 언어·JVM 규칙을 따르므로, <code>final</code> 클래스는 상속 자체가 불가능하고 <code>private</code> 생성자는 하위 클래스 생성자에서 호출할 수 없다. 리플렉션의 <code>setAccessible(true)</code>로 빈 객체를 만드는 것은 가능하지만, 지연 로딩용 프록시는 만들 수 없다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>IDENTITY 전략을 쓰는 엔티티를 트랜잭션 안에서 em.persist()한 직후, 커밋하기 전에 일어나는 일로 옳은 것은?</q>
+<o>INSERT는 쓰기 지연 저장소에만 쌓이고 커밋 때 다른 INSERT와 함께 배치로 나간다.</o>
+<o>INSERT가 곧바로 실행되고, 데이터베이스가 만든 키 값이 엔티티의 id 필드에 들어간다.</o>
+<o>id가 없으므로 엔티티는 영속성 컨텍스트에 들어가지 못하고 커밋 때 관리 상태가 된다.</o>
+<o>INSERT와 COMMIT이 함께 실행되어 다른 트랜잭션에서도 그 행이 보인다.</o>
+<why>IDENTITY에서는 행을 넣어야 식별자가 생기고, 영속성 컨텍스트는 식별자를 키로 엔티티를 관리하므로 Hibernate는 persist() 시점에 INSERT를 실행한다. 이 때문에 INSERT 배치가 꺼진다(첫 보기 오답). INSERT 후 엔티티는 바로 관리 상태가 된다(셋째 보기 오답). INSERT는 실행됐지만 커밋은 아직이므로, 격리 수준에 따라 다른 트랜잭션에서는 보이지 않는다(넷째 보기 오답).</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>한 트랜잭션 안에서 em.find()로 읽은 도서의 가격을 바꾼 뒤, 같은 테이블을 조회하는 JPQL을 기본 플러시 모드(AUTO)로 실행했다. 데이터베이스로 나가는 SQL의 순서로 옳은 것은?</q>
+<o>SELECT(find) → SELECT(JPQL) → 커밋 때 UPDATE</o>
+<o>SELECT(find) → SELECT(JPQL)만 나가고, JPQL 결과로 가격이 데이터베이스 값으로 되돌아간다.</o>
+<o>SELECT(find) → UPDATE → SELECT(JPQL)</o>
+<o>JPQL은 1차 캐시에서 처리되므로 SELECT(find) 한 번만 나간다.</o>
+<why>명세는 AUTO 모드에서 트랜잭션 안의 쿼리를 실행할 때, 결과에 영향을 줄 수 있는 영속성 컨텍스트의 변경이 쿼리 처리에서 보이도록 구현체가 책임지게 한다. 그래서 JPQL 전에 플러시가 일어나 UPDATE가 먼저 나간다. JPQL은 대응표만으로 답할 수 없으므로 항상 데이터베이스에 가고(넷째 보기 오답), 결과 행은 대응표의 기존 객체로 바뀌므로 메모리의 값이 덮이지 않는다(둘째 보기 오답).</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>@Repository가 붙은 JPA 리포지토리에 String findTitle(Long id) throws NoResultException 메서드가 있고, 안에서 getSingleResult()가 NoResultException을 던졌다. 호출한 서비스가 받는 예외는?</q>
+<o>jakarta.persistence.NoResultException 그대로</o>
+<o>EmptyResultDataAccessException</o>
+<o>JpaSystemException</o>
+<o>UndeclaredThrowableException</o>
+<why>PersistenceExceptionTranslationInterceptor는 런타임 예외의 타입이 메서드의 throws 절에 선언되어 있으면 변환하지 않고 그대로 던진다. throws 선언이 없었다면 EntityManagerFactoryUtils가 NoResultException을 EmptyResultDataAccessException으로 바꿨을 것이다. JpaSystemException은 목록에 없는 그 밖의 PersistenceException에 쓰이고, 선언된 런타임 예외이므로 UndeclaredThrowableException으로 감쌀 이유도 없다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>싱글톤 리포지토리가 생성자로 받은 EntityManager 하나를 필드에 두고, 여러 요청 스레드가 동시에 이 리포지토리를 사용한다. 이것이 안전한 이유로 옳은 것은?</q>
+<o>EntityManager 구현이 내부적으로 모든 메서드를 synchronized로 막아 둔다.</o>
+<o>스프링이 요청마다 리포지토리 빈을 새로 만들어 주입한다.</o>
+<o>영속성 컨텍스트가 스레드별로 나뉜 ConcurrentHashMap이기 때문이다.</o>
+<o>주입된 것은 공유 프록시이고, 호출마다 현재 스레드의 트랜잭션에 묶인 실제 EntityManager를 찾아 위임한다.</o>
+<why>Spring Framework 레퍼런스는 EntityManager 인스턴스가 스레드 안전하지 않다고 말한다. 주입되는 것은 SharedEntityManagerCreator가 만든 공유 프록시로, 호출마다 트랜잭션 동기화 저장소에서 현재 스레드의 EntityManager를 찾아 위임한다. 리포지토리는 싱글톤 그대로이고(둘째 보기 오답), 실제 EntityManager가 동기화되어 있어서가 아니다(첫째, 셋째 보기 오답).</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>JPA 명세가 엔티티 클래스를 final로 선언하지 못하게 하고, 기본 생성자를 public 또는 protected로 요구하는 것과 가장 직접 관련된 구현 기법은?</q>
+<o>리플렉션으로 private 필드에 값을 넣는 필드 접근</o>
+<o>엔티티 클래스를 상속한 하위 클래스로 만드는 지연 로딩 프록시</o>
+<o>스냅샷과 현재 상태를 비교하는 변경 감지</o>
+<o>JPQL을 SQL로 번역하는 쿼리 해석기</o>
+<why>프록시가 엔티티의 하위 클래스이려면 클래스가 final이 아니어야 하고, 하위 클래스 생성자가 부모의 기본 생성자를 호출할 수 있어야 하며, 메서드를 재정의할 수 있어야 한다. 실험에서 private 생성자와 final 클래스는 하위 클래스 컴파일 단계에서 거부됐다. 필드 접근은 setAccessible로 private 필드도 다룰 수 있으므로 이 제약의 이유가 아니고, 변경 감지와 JPQL 번역은 상속과 무관하다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>ORM(Object-Relational Mapping)</dt><dd>객체와 관계형 데이터베이스 테이블의 대응을 선언해 두면, 그 정보로 SQL을 만들고 결과를 객체로 조립해 주는 기술.</dd>
+<dt>Jakarta Persistence(JPA)</dt><dd>자바의 ORM 표준 명세. jakarta.persistence 패키지의 인터페이스·애너테이션과 그 동작 규칙을 정하며, Hibernate 같은 구현체가 실제 동작을 제공한다.</dd>
+<dt>엔티티(entity)</dt><dd>@Entity가 붙어 JPA가 관리하는 클래스의 인스턴스. 식별자(@Id)로 테이블의 행 하나에 대응한다.</dd>
+<dt>영속성 컨텍스트(persistence context)</dt><dd>식별자마다 유일한 엔티티 인스턴스를 보관하는 집합. EntityManager로 접근하며 1차 캐시, 변경 감지, 쓰기 지연의 근거가 된다.</dd>
+<dt>플러시(flush)</dt><dd>영속성 컨텍스트에 쌓인 변경을 SQL로 데이터베이스에 보내는 일. 커밋 때, AUTO 모드의 쿼리 실행 전, flush() 호출 때 일어나며 컨텍스트를 비우지는 않는다.</dd>
+<dt>변경 감지(dirty checking)</dt><dd>관리 상태 엔티티의 현재 상태를 들어올 때의 스냅샷과 비교해 바뀐 엔티티에 대해 UPDATE를 만드는 기능.</dd>
+<dt>준영속(detached)</dt><dd>식별자는 있지만 현재 영속성 컨텍스트에 속하지 않은 엔티티 상태. 값을 바꿔도 데이터베이스에 반영되지 않는다.</dd>
+<dt>JPQL(Jakarta Persistence Query Language)</dt><dd>테이블과 컬럼이 아니라 엔티티와 필드를 대상으로 쓰는 질의 언어. 구현체가 매핑 정보를 이용해 SQL로 번역한다.</dd>
+<dt>공유 EntityManager(shared EntityManager)</dt><dd>스프링이 주입하는 스레드 안전한 EntityManager 프록시. 호출마다 현재 트랜잭션에 묶인 실제 EntityManager로 위임한다.</dd>
+<dt>PersistenceExceptionTranslationPostProcessor</dt><dd>@Repository 빈에 예외 변환 어드바이저를 붙이는 빈 후처리기. 등록된 PersistenceExceptionTranslator들로 런타임 예외를 DataAccessException 하위 예외로 바꾼다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html">Jakarta Persistence 3.1 Specification</a> — 2.1절 엔티티 클래스 요건, 3.1·3.2절 영속성 컨텍스트와 엔티티 상태, 3.10.8절 쿼리와 플러시 모드, 3.11절 예외와 롤백 표시</li>
+<li><a href="https://docs.hibernate.org/orm/6.4/introduction/html_single/Hibernate_Introduction.html">An Introduction to Hibernate 6 (6.4)</a> — 엔티티 클래스 요건, 영속성 컨텍스트와 1차 캐시, 플러시 시점, 자동 변경 감지</li>
+<li><a href="https://raw.githubusercontent.com/hibernate/hibernate-orm/6.4/documentation/src/main/asciidoc/userguide/chapters/domain/identifiers.adoc">Hibernate ORM 6.4 User Guide 원본: Identifiers</a> — IDENTITY 컬럼은 행을 넣어야 식별자를 알 수 있고 INSERT 배치가 불가능하다는 설명</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/data-access/orm/jpa.html">Spring Framework Reference: JPA</a> — 공유 EntityManager 프록시, EntityManager의 스레드 안전성, JpaTransactionManager의 JDBC 접근 노출</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-framework/6.1.x/spring-orm/src/main/java/org/springframework/orm/jpa/EntityManagerFactoryUtils.java">Spring Framework 6.1 소스: EntityManagerFactoryUtils</a> — convertJpaAccessExceptionIfPossible의 JPA 예외별 변환 규칙</li>
+<li><a href="https://docs.spring.io/spring-boot/3.3/how-to/data-access.html">Spring Boot 3.3 How-to: Data Access</a> — CamelCaseToUnderscoresNamingStrategy 기본 설정과 JPA 속성 구성</li>
+</x-refs>

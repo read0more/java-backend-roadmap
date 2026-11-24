@@ -1,0 +1,1000 @@
+<x-meta>
+deck: 메서드가 끝나면 사라지는 지역 변수를 힙에 남은 지역 클래스 인스턴스가 어떻게 계속 쓰는지 스택 프레임과 javap 출력으로 추적하고, 익명 클래스가 같은 구조에서 이름만 뺀 것임을 확인한다.
+minutes: 80
+</x-meta>
+
+<x-goals>
+<li>지역 클래스의 메서드가 쓰는 네 종류의 이름(자신의 지역 변수, 자신의 필드, 바깥 메서드의 지역 변수, 바깥 인스턴스의 필드)이 실행 중 각각 어디에 있는지 메모리 그림으로 그릴 수 있다.</li>
+<li><code>javap</code> 출력에서 <code>val$</code> 필드, <code>this$0</code> 필드, 생성자 디스크립터를 찾아 지역 변수 캡처가 "인스턴스 생성 시점의 값 복사"임을 설명할 수 있다.</li>
+<li>사실상 final(effectively final) 규칙을 어긴 코드에서 컴파일 오류가 보고되는 줄을 예측하고, 규칙이 없다면 어떤 불일치가 생기는지 복사본 두 개의 관점에서 설명할 수 있다.</li>
+<li>지역 클래스를 익명 클래스로, 익명 클래스를 람다로 바꿔 쓰고, 각 형태가 만드는 클래스 파일과 <code>this</code>의 의미가 어떻게 다른지 구분할 수 있다.</li>
+<li>변하는 부분이 값이 아니라 코드인 중복을 인터페이스와 익명 클래스로 분리해 메서드 인자로 넘길 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 끝난 메서드의 지역 변수를 누가 들고 있는가</h3>
+<p>앞 회차는 클래스 안에 선언하는 클래스, 곧 중첩 클래스(nested class) 가운데 클래스의 멤버 자리에 선언하는 정적 중첩 클래스와 내부 클래스를 다뤘다. 이번 회차는 남은 두 종류를 다룬다. 메서드 본문 같은 블록 안에 선언하는 지역 클래스(local class)와, 선언과 동시에 인스턴스를 만들고 이름은 붙이지 않는 익명 클래스(anonymous class)다. 자바 언어 명세(JLS) 8.1.3절은 static이 아닌 멤버 클래스, 지역 클래스(enum과 레코드를 뺀 일반 클래스), 익명 클래스를 묶어 내부 클래스(inner class)라고 정의한다.</p>
+<p>문법만 보면 새로울 것이 적다. 클래스 선언을 메서드 안으로 옮겼을 뿐이다. 그런데 선언 위치가 메서드 안이 되면 그 클래스의 코드가 메서드의 지역 변수와 매개변수를 쓸 수 있게 되고, 여기서 지금까지 배운 메모리 모델과 맞지 않아 보이는 일이 생긴다. 지역 변수는 메서드가 호출될 때 스택 프레임에 만들어지고 메서드가 끝나면 프레임과 함께 사라진다. 반면 지역 클래스로 만든 인스턴스는 힙에 있고, 메서드가 끝난 뒤에도 누군가 참조하고 있으면 계속 살아 있다. 살아남은 인스턴스가 이미 사라진 지역 변수를 읽는 코드가 컴파일되고 정상적으로 동작한다.</p>
+<p>이 회차의 앞쪽 절반은 이 현상의 설명이다. 자바 가상 머신 명세(JVMS)가 정한 프레임의 수명, 컴파일러가 클래스 파일에 넣어 두는 숨은 필드, 그 구조에서 따라 나오는 "사실상 final" 규칙을 차례로 본다. 뒤쪽 절반은 익명 클래스다. 익명 클래스는 지역 클래스와 같은 구조에서 이름만 뺀 것이므로 캡처 규칙이 그대로 적용된다. 익명 클래스가 주로 쓰이는 자리인 "코드 조각을 인자로 넘기기"를 중복 제거 과정으로 따라가고, 같은 자리를 람다가 대신할 때 컴파일 결과가 어떻게 달라지는지도 확인한다. 본문의 실행 결과, 컴파일 오류 문구, <code>javap</code> 출력은 모두 JDK 21(Temurin 21.0.13)에서 직접 실행해 확인한 것이다.</p>
+
+<h3>지역 클래스: 블록 안에서 선언하는 클래스</h3>
+<p>지역 클래스는 지역 변수와 같은 자리에 선언한다. 메서드 본문, 생성자 본문, 초기화 블록처럼 문장이 올 수 있는 블록 안이다. 선언 위치에서 나오는 규칙도 지역 변수와 닮았다(JLS 14.3, 6.3).</p>
+<ul>
+<li><b>접근 제어자를 붙일 수 없다.</b> <code>public</code>, <code>protected</code>, <code>private</code>은 선언한 곳 바깥에서 누가 볼 수 있는지를 정하는데, 지역 클래스는 애초에 블록 밖에서 이름으로 가리킬 수 없다. <code>static</code>도 붙일 수 없다. <code>abstract</code>와 <code>final</code>은 붙일 수 있다.</li>
+<li><b>유효 범위(scope)는 선언한 곳부터 그 블록의 끝까지다.</b> 자기 자신의 선언도 범위에 들어가므로 본문 안에서 자기 타입을 쓸 수 있다. 선언보다 앞선 줄에서 쓰면 <code>cannot find symbol</code> 오류가 난다.</li>
+<li><b>그 밖에는 보통 클래스와 같다.</b> 필드, 메서드, 생성자를 가질 수 있고 클래스를 상속하거나 인터페이스를 구현할 수 있다.</li>
+</ul>
+<p>블록 밖에서는 지역 클래스의 이름을 쓸 수 없으므로, 지역 클래스로 만든 객체를 메서드 밖으로 내보내려면 밖에서도 보이는 상위 타입이 필요하다. 그래서 지역 클래스는 대개 인터페이스를 구현하거나 클래스를 상속하고, 호출자는 그 상위 타입으로 객체를 받는다. 다음 예제는 가격표 문구를 만드는 객체를 지역 클래스로 정의해 인터페이스 타입으로 돌려준다.</p>
+<pre><code class="language-java">public interface Labeler {
+    String label(int price);
+}</code></pre>
+<pre><code class="language-java">public class Shop {
+    private final String currency;
+
+    public Shop(String currency) {
+        this.currency = currency;
+    }
+
+    public Labeler labeler(String prefix) {
+        int taxPercent = 10;
+
+        class TaxLabeler implements Labeler {
+            private int calls;
+
+            @Override
+            public String label(int price) {
+                calls++;
+                int total = price + price * taxPercent / 100;
+                return prefix + total + currency + " (" + calls + "번째)";
+            }
+        }
+
+        return new TaxLabeler();
+    }
+
+    public static void main(String[] args) {
+        Shop shop = new Shop("원");
+        Labeler labeler = shop.labeler("판매가 ");
+        System.out.println(labeler.label(1000));
+        System.out.println(labeler.label(25000));
+        System.out.println(labeler.getClass().getName());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">판매가 1100원 (1번째)
+판매가 27500원 (2번째)
+Shop$1TaxLabeler</code></pre>
+<p><code>label()</code> 메서드 한 곳에서 출처가 다른 네 종류의 이름을 쓰고 있다. 이 구분이 이 회차 전체의 뼈대이므로 표로 정리해 둔다.</p>
+<div class="table-wrap"><table><thead><tr><th><code>label()</code>이 쓰는 이름</th><th>선언된 곳</th><th>종류</th></tr></thead><tbody>
+<tr><td><code>price</code>, <code>total</code></td><td><code>label()</code> 자신</td><td>자신의 매개변수와 지역 변수</td></tr>
+<tr><td><code>calls</code></td><td><code>TaxLabeler</code></td><td>자신의 인스턴스 필드</td></tr>
+<tr><td><code>taxPercent</code>, <code>prefix</code></td><td>바깥 메서드 <code>labeler()</code></td><td>바깥 메서드의 지역 변수와 매개변수</td></tr>
+<tr><td><code>currency</code></td><td>바깥 클래스 <code>Shop</code></td><td>바깥 인스턴스의 필드</td></tr>
+</tbody></table></div>
+<p>첫 두 줄은 보통 클래스의 메서드가 늘 하던 일이다. 넷째 줄은 앞 회차의 내부 클래스와 같다. 인스턴스 메서드 안에서 선언한 지역 클래스는 내부 클래스이므로 바깥 인스턴스의 멤버에 접근할 수 있고, <code>private</code> 필드도 예외가 아니다. 새로운 것은 셋째 줄이다. 클래스의 메서드가 다른 메서드의 지역 변수를 읽는다.</p>
+<p>출력 셋째 줄의 <code>Shop$1TaxLabeler</code>는 이 클래스의 바이너리 이름(binary name)이다. JLS 13.1은 지역 클래스의 바이너리 이름을 "바깥 클래스의 바이너리 이름 + <code>$</code> + 숫자열 + 지역 클래스의 단순 이름"으로 정한다. 숫자가 끼는 이유는 지역 클래스의 이름이 블록 안에서만 유일하면 되기 때문이다. 한 클래스의 두 메서드가 각각 <code>Helper</code>라는 지역 클래스를 선언해도 되고, 이때 JDK 21의 <code>javac</code>는 <code>Outer$1Helper</code>와 <code>Outer$2Helper</code>라는 두 클래스 파일을 만든다. 컴파일이 끝나면 지역 클래스도 독립된 <code>.class</code> 파일 하나가 되고, JVM은 이 클래스를 다른 클래스와 같은 방식으로 로딩하고 실행한다. 어느 메서드 안에서 선언되었는지는 클래스 파일의 속성에 기록으로만 남는데, 이 기록은 뒤에서 다시 본다.</p>
+<p>하나 더 확인할 것이 있다. 지역 클래스의 선언은 실행되는 문장이 아니다. <code>labeler()</code> 메서드의 바이트코드를 보면 <code>taxPercent</code>에 10을 넣는 명령어 다음이 곧바로 <code>new</code>다.</p>
+<pre data-label="javap -p -c Shop (labeler 메서드)"><code class="language-text">public Labeler labeler(java.lang.String);
+  Code:
+     0: bipush        10
+     2: istore_2
+     3: new           #13                 // class Shop$1TaxLabeler
+     6: dup
+     7: aload_0
+     8: iload_2
+     9: aload_1
+    10: invokespecial #15                 // Method Shop$1TaxLabeler."<init>":(LShop;ILjava/lang/String;)V
+    13: areturn</code></pre>
+<p>클래스 선언에 해당하는 명령어는 없다. 클래스는 컴파일할 때 이미 만들어졌고, 실행 중에 메서드가 선언 위치를 지나가도 아무 일도 일어나지 않는다. 메서드를 백 번 호출해도 클래스는 하나이고, 호출마다 새로 생기는 것은 <code>new</code>가 만드는 인스턴스다. 7~10번 명령어에 소스에 없던 인자 세 개가 생성자로 넘어가는 것이 보이는데, 이것이 뒤에서 풀 캡처의 실체다.</p>
+<aside class="note">Java 16부터는 블록 안에 인터페이스, enum, 레코드도 선언할 수 있다(<code>javac --release 15</code>로 컴파일하면 지역 enum은 <code>enum classes must not be local</code> 오류가 난다). JLS 14.3은 이 셋이 암묵적으로 <code>static</code>이라고 정한다. 내부 클래스가 아니므로 바깥 메서드의 지역 변수를 쓸 수 없고, 쓰면 <code>non-static variable x cannot be referenced from a static context</code> 오류가 난다. 이 회차에서 말하는 지역 클래스는 일반 클래스로 선언한 것만 가리킨다.</aside>
+
+<h3>지역 변수 캡처 1: 변수와 인스턴스의 수명이 다르다</h3>
+<p>변수가 어디에 저장되는지에 따라 수명이 정해진다. 지금까지 배운 것을 한 표로 모으면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>변수의 종류</th><th>저장되는 곳</th><th>생기는 때</th><th>사라지는 때</th></tr></thead><tbody>
+<tr><td>지역 변수, 매개변수</td><td>스레드의 JVM 스택에 있는 프레임</td><td>메서드 호출</td><td>메서드 종료(정상 반환이든 예외든)</td></tr>
+<tr><td>인스턴스 필드</td><td>힙의 객체 안</td><td>객체 생성</td><td>객체가 가비지 컬렉션으로 회수될 때</td></tr>
+<tr><td>static 필드</td><td>클래스에 딸린 저장 공간</td><td>클래스 준비·초기화</td><td>클래스가 언로드될 때</td></tr>
+</tbody></table></div>
+<p>프레임(frame)의 수명은 JVMS 2.6이 정한다. 메서드가 호출될 때마다 새 프레임이 만들어지고, 그 호출이 끝나면 정상 종료든 예외로 인한 종료든 프레임이 파괴된다. 프레임은 자신만의 지역 변수 배열과 피연산자 스택을 갖는다. 그리고 JVMS 2.5.2에 따라 JVM 스택은 스레드마다 하나씩 따로 있다. 힙은 반대다. JVMS 2.5.3은 힙을 모든 스레드가 공유하는 영역으로, 모든 클래스 인스턴스와 배열이 할당되는 곳으로 정의한다. 객체는 메서드 호출의 시작과 끝에 묶여 있지 않고, 도달할 수 있는 참조가 남아 있는 한 살아 있다.</p>
+<p>이 규칙으로 앞의 <code>main()</code>을 한 줄씩 따라가 보자. 지역 변수 배열의 칸 번호는 위 바이트코드에서 읽은 것이다. 인스턴스 메서드의 0번 칸은 <code>this</code>이고, <code>labeler()</code>에서 1번 칸은 매개변수 <code>prefix</code>(<code>aload_1</code>), 2번 칸은 <code>taxPercent</code>(<code>istore_2</code>)다.</p>
+<pre class="diagram">main 스레드의 JVM 스택                           힙
+──────────────────────────────────────────────────────────────────────
+① new Shop("원")
+   [main 프레임]  shop ──────────────────────▶ Shop { currency ─▶ "원" }
+
+② shop.labeler("판매가 ") 호출 → labeler 프레임 생성
+   [labeler 프레임]
+       칸0 this ─────────────────────────────▶ (위의 Shop)
+       칸1 prefix ───────────────────────────▶ "판매가 "
+       칸2 taxPercent = 10
+   [main 프레임]
+
+③ new TaxLabeler() → 힙에 인스턴스 생성
+   [labeler 프레임] (그대로)                    TaxLabeler { calls = 0, … }
+   [main 프레임]
+
+④ labeler() 반환 → labeler 프레임 파괴
+   [main 프레임]  labeler ───────────────────▶ TaxLabeler { calls = 0, … }
+                                               칸1 prefix, 칸2 taxPercent 는 더 이상 없다
+
+⑤ labeler.label(1000) 호출 → label 프레임 생성
+   [label 프레임]
+       칸0 this ─────────────────────────────▶ (위의 TaxLabeler)
+       칸1 price = 1000
+       칸2 total = price + price * taxPercent / 100   ← taxPercent 를 어디서 읽는가
+   [main 프레임]</pre>
+<p>④에서 <code>labeler()</code>의 프레임은 파괴되었다. <code>taxPercent</code>가 들어 있던 2번 칸과 <code>prefix</code>가 들어 있던 1번 칸은 프레임과 함께 없어졌다. 그런데 ⑤에서 실행되는 <code>label()</code>의 본문에는 <code>taxPercent</code>와 <code>prefix</code>가 적혀 있고, 실행 결과는 10%를 더한 값과 "판매가 "를 정확히 출력했다.</p>
+<p>인스턴스가 사라진 프레임의 칸을 가리키고 있다가 읽는 것이 아닐까 생각할 수 있지만, JVM의 구조상 그런 일은 일어날 수 없다. 이유는 세 가지다. 첫째, 프레임은 메서드가 끝나면 파괴된다고 명세가 정하고 있으므로 가리킬 대상이 남아 있지 않다. 둘째, JVMS 2.4가 정의하는 참조(reference) 값은 클래스 인스턴스나 배열, 곧 힙의 객체를 가리키거나 <code>null</code>이다. 지역 변수 칸을 가리키는 참조라는 값의 종류는 없다. 셋째, JVMS 2.6은 한 스레드가 만든 프레임은 그 스레드에 국한되며 다른 스레드가 참조할 수 없다고 적는다. 힙의 객체는 다른 스레드로 넘겨질 수 있는데, 그 객체가 원래 스레드의 프레임 안을 들여다본다면 이 규칙이 깨진다.</p>
+<p>따라서 남는 방법은 하나다. 프레임이 살아 있는 동안 필요한 값을 프레임 밖, 곧 오래 사는 쪽인 인스턴스 안으로 옮겨 두는 것이다. 자바 컴파일러가 실제로 하는 일이 이것이고, 이 동작을 지역 변수 캡처(capture)라고 부른다.</p>
+
+<x-visual id="java-mid1-08-frame-vs-instance-lifetime" title="labeler 프레임은 반환과 함께 사라지고 TaxLabeler 인스턴스는 힙에 남는 수명 차이" kind="타임라인 다이어그램" ratio="16:9">
+<x-hint>가로축을 시간으로 두고, 스택의 labeler 프레임 수명 막대는 짧게 끝나고 힙의 TaxLabeler 인스턴스 수명 막대는 그 뒤로도 이어지는 것을 보여 준다. label() 호출 시점에는 프레임이 이미 없다는 점이 핵심이다.</x-hint>
+<x-prompt>흰 배경의 평면 벡터 타임라인 다이어그램. 가로축은 왼쪽에서 오른쪽으로 흐르는 시간 화살표이며 라벨 "시간". 위아래 두 개의 레인으로 나눈다. 위 레인 제목 "스택 (main 스레드)", 아래 레인 제목 "힙". 위 레인에는 전체 길이의 긴 회색 막대 "main 프레임"이 있고, 그 위에 가운데 구간에만 걸친 짧은 파란 막대 "labeler 프레임"이 있다. 파란 막대 안에 작은 글씨 "prefix, taxPercent = 10". 파란 막대의 오른쪽 끝에 빨간 세로선과 라벨 "반환: 프레임 파괴". 아래 레인에는 파란 막대의 중간 지점에서 시작해 화면 오른쪽 끝까지 이어지는 초록 막대 "TaxLabeler 인스턴스". 파란 막대에서 초록 막대의 시작점으로 내려가는 굵은 주황 화살표와 라벨 "new 시점에 값 복사". 빨간 세로선보다 오른쪽 시점에 위 레인에 작은 보라 막대 "label 프레임"을 그리고, 거기서 초록 막대로 내려가는 화살표에 라벨 "필드에서 읽는다".</x-prompt>
+<x-caption>지역 변수는 프레임과 함께 사라지지만 인스턴스는 힙에 남는다. label()이 실행될 때 읽을 수 있는 것은 인스턴스 안에 있는 값뿐이다.</x-caption>
+</x-visual>
+
+<h3>지역 변수 캡처 2: 컴파일러가 값을 인스턴스 필드로 복사한다</h3>
+<p>컴파일된 지역 클래스를 열어 보면 답이 그대로 들어 있다. <code>-p</code>는 private 멤버까지, <code>-s</code>는 디스크립터까지 보여 주는 옵션이다.</p>
+<pre data-label="javap -p -s -c 'Shop$1TaxLabeler' (일부)"><code class="language-text">class Shop$1TaxLabeler implements Labeler {
+  private int calls;
+    descriptor: I
+
+  final int val$taxPercent;
+    descriptor: I
+
+  final java.lang.String val$prefix;
+    descriptor: Ljava/lang/String;
+
+  final Shop this$0;
+    descriptor: LShop;
+
+  Shop$1TaxLabeler();
+    descriptor: (LShop;ILjava/lang/String;)V
+    Code:
+       0: aload_0
+       1: aload_1
+       2: putfield      #1                  // Field this$0:LShop;
+       5: aload_0
+       6: iload_2
+       7: putfield      #7                  // Field val$taxPercent:I
+      10: aload_0
+      11: aload_3
+      12: putfield      #11                 // Field val$prefix:Ljava/lang/String;
+      15: aload_0
+      16: invokespecial #15                 // Method java/lang/Object."<init>":()V
+      19: return
+
+  public java.lang.String label(int);
+    descriptor: (I)Ljava/lang/String;
+    Code:
+       // ... calls++ 생략
+      10: iload_1
+      11: iload_1
+      12: aload_0
+      13: getfield      #7                  // Field val$taxPercent:I
+      16: imul
+      17: bipush        100
+      19: idiv
+      20: iadd
+      21: istore_2
+      22: aload_0
+      23: getfield      #11                 // Field val$prefix:Ljava/lang/String;
+      26: iload_2
+      27: aload_0
+      28: getfield      #1                  // Field this$0:LShop;
+      31: getfield      #24                 // Field Shop.currency:Ljava/lang/String;
+       // ... 문자열 연결 생략
+}</code></pre>
+<p>소스에서 선언한 필드는 <code>calls</code> 하나였는데 클래스 파일에는 필드가 네 개다. 나머지 셋은 컴파일러가 만들어 넣었다.</p>
+<ul>
+<li><code>val$taxPercent</code>와 <code>val$prefix</code>: 바깥 메서드의 지역 변수 <code>taxPercent</code>와 매개변수 <code>prefix</code>의 값을 담는 필드다.</li>
+<li><code>this$0</code>: 바깥 인스턴스(<code>Shop</code>)의 참조를 담는 필드다. 앞 회차의 내부 클래스가 갖던 것과 같다.</li>
+</ul>
+<p>세 필드 모두 <code>final</code>이고, <code>javap -v</code>로 보면 <code>ACC_SYNTHETIC</code> 플래그가 붙어 있다. 합성(synthetic)은 소스 코드에 대응하는 선언이 없이 컴파일러가 만든 구성 요소라는 표시다(JLS 13.1). 생성자도 달라졌다. 소스에는 생성자를 쓰지 않았으므로 인자 없는 기본 생성자여야 할 것 같지만, 디스크립터는 <code>(LShop;ILjava/lang/String;)V</code>, 곧 <code>Shop</code> 참조, <code>int</code>, <code>String</code> 참조를 받는 생성자다. 생성자 본문은 받은 인자 셋을 세 필드에 넣고(<code>putfield</code> 세 번) 그다음에 <code>Object</code>의 생성자를 호출한다.</p>
+<p>이제 호출하는 쪽을 다시 보자. 앞 절에서 본 <code>labeler()</code>의 7~10번 명령어다. <code>aload_0</code>은 0번 칸의 <code>this</code>를, <code>iload_2</code>는 2번 칸의 <code>taxPercent</code> 값 10을, <code>aload_1</code>은 1번 칸의 <code>prefix</code> 참조를 피연산자 스택에 올린다. 그리고 <code>invokespecial</code>이 이 셋을 인자로 생성자를 호출한다. 소스의 <code>new TaxLabeler()</code>에는 인자가 없지만 컴파일된 코드는 인자 셋을 넘긴다.</p>
+<figure class="flow-figure"><figcaption>new TaxLabeler() 한 줄이 실행되는 동안 일어나는 일</figcaption><ol class="flow">
+<li><strong>객체 할당</strong><span><code>new</code> 명령어가 힙에 <code>Shop$1TaxLabeler</code> 인스턴스의 자리를 만든다. 필드는 모두 기본값(0, null)이다.</span></li>
+<li><strong>프레임에서 값 읽기</strong><span><code>labeler()</code> 프레임의 0번, 2번, 1번 칸에서 <code>this</code>, 10, "판매가 "의 참조를 읽어 피연산자 스택에 올린다. 이 시점에는 프레임이 살아 있다.</span></li>
+<li><strong>숨은 인자로 생성자 호출</strong><span>읽은 값 셋이 생성자의 인자로 복사되어 넘어간다.</span></li>
+<li><strong>필드에 저장</strong><span>생성자가 인자를 <code>this$0</code>, <code>val$taxPercent</code>, <code>val$prefix</code>에 넣는다. 값은 이제 힙의 인스턴스 안에 있다.</span></li>
+<li><strong>프레임 소멸 뒤</strong><span><code>label()</code>은 <code>getfield</code>로 자기 인스턴스의 필드를 읽는다. 사라진 프레임은 볼 필요가 없다.</span></li>
+</ol></figure>
+<p><code>label()</code>의 바이트코드가 마지막 단계를 확인해 준다. 소스에 <code>taxPercent</code>라고 쓴 자리는 <code>aload_0</code>과 <code>getfield val$taxPercent</code>로 바뀌었다. <code>this.val$taxPercent</code>를 읽는 코드다. <code>prefix</code>는 <code>this.val$prefix</code>가 되었고, <code>currency</code>는 <code>this.this$0.currency</code>가 되었다(<code>getfield</code> 두 번). 반면 자신의 매개변수 <code>price</code>는 <code>iload_1</code>, 지역 변수 <code>total</code>은 <code>istore_2</code>와 <code>iload_2</code>로, 자기 프레임의 칸을 직접 읽고 쓴다. 소스에서는 똑같이 이름 하나로 보이지만 컴파일 결과에서는 프레임의 칸과 인스턴스의 필드라는 서로 다른 것이다.</p>
+<pre class="diagram">labeler() 가 반환한 뒤의 메모리
+
+main 프레임                        힙
+┌────────────────┐
+│ shop ──────────┼────────────▶ Shop
+│                │              ┌────────────────────────┐
+│                │              │ currency ──────────────┼──▶ "원"
+│                │              └────────────────────────┘
+│                │                        ▲
+│                │                        │ this$0
+│ labeler ───────┼────────────▶ Shop$1TaxLabeler
+└────────────────┘              ┌────────────────────────┐
+                                │ this$0 (위의 Shop)      │
+                                │ val$prefix ────────────┼──▶ "판매가 "
+                                │ val$taxPercent = 10    │
+                                │ calls = 0              │
+                                └────────────────────────┘</pre>
+<p>정리하면 캡처는 "변수를 붙잡는 것"이 아니라 "인스턴스를 만드는 순간의 값을 복사해 두는 것"이다. 이 한 문장에서 세 가지 성질이 따라 나온다.</p>
+<h4>캡처는 인스턴스마다, 생성 시점에 일어난다</h4>
+<p>복사는 <code>new</code>가 실행될 때 일어나고, 복사본은 인스턴스의 필드에 들어간다. 그러므로 같은 지역 클래스로 만든 인스턴스라도 만들어진 시점의 값이 다르면 서로 다른 값을 갖는다.</p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.function.IntSupplier;
+
+public class Snapshots {
+    public static void main(String[] args) {
+        List<IntSupplier> suppliers = new ArrayList<>();
+
+        for (int i = 0; i < 3; i++) {
+            int snapshot = i * 10;
+
+            class Fixed implements IntSupplier {
+                @Override
+                public int getAsInt() {
+                    return snapshot;
+                }
+            }
+
+            suppliers.add(new Fixed());
+        }
+
+        for (IntSupplier supplier : suppliers) {
+            System.out.println(supplier.getAsInt());
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">0
+10
+20</code></pre>
+<p>클래스 <code>Fixed</code>는 하나지만 인스턴스는 세 개이고, 각 인스턴스의 <code>val$snapshot</code> 필드에는 자신이 만들어질 때의 값 0, 10, 20이 들어 있다. <code>snapshot</code>은 반복문 본문 블록 안에서 선언했으므로 반복할 때마다 새로 만들어지는 변수다. 반복문이 끝난 뒤 <code>getAsInt()</code>를 호출해도 각자 자기 복사본을 돌려준다.</p>
+<h4>참조형 변수는 참조값이 복사된다</h4>
+<p><code>prefix</code>는 <code>String</code> 타입의 변수였다. 변수에 들어 있던 것은 문자열 객체 자체가 아니라 그 객체를 가리키는 참조값이고, 복사되는 것도 참조값이다. 문자열 객체는 힙에 하나만 있고 프레임의 칸과 <code>val$prefix</code> 필드가 같은 객체를 가리켰다. 프레임이 사라지면 가리키는 쪽이 하나 줄어들 뿐 객체는 그대로다. 캡처한 것이 가변 객체라면 그 객체의 상태 변경은 양쪽에서 모두 보인다. 이 점은 뒤에서 배열을 이용한 우회를 볼 때 다시 나온다.</p>
+<h4>무엇이 필드로 만들어지는지는 쓰임에 따라 달라진다</h4>
+<p>컴파일러는 클래스 본문에서 실제로 쓴 것만 캡처한다. JDK 21의 <code>javac</code>로 몇 가지 경우를 컴파일해 <code>javap -p -s</code>로 확인한 결과는 다음과 같다. 바깥 클래스 이름은 <code>Cap</code>, 캡처하는 지역 변수는 <code>int n</code>이다.</p>
+<div class="table-wrap"><table><thead><tr><th>지역 클래스가 놓인 곳과 쓰는 것</th><th>합성 필드</th><th>생성자 디스크립터</th></tr></thead><tbody>
+<tr><td>인스턴스 메서드 안, 바깥 인스턴스 필드를 읽는다</td><td><code>this$0</code></td><td><code>(LCap;)V</code></td></tr>
+<tr><td>인스턴스 메서드 안, 지역 변수 <code>n</code>만 읽는다</td><td><code>val$n</code></td><td><code>(LCap;I)V</code></td></tr>
+<tr><td>static 메서드 안, 지역 변수 <code>n</code>을 읽는다</td><td><code>val$n</code></td><td><code>(I)V</code></td></tr>
+<tr><td>인스턴스 메서드 안, <code>final int limit = 100;</code>만 읽는다</td><td>없음</td><td><code>(LCap;)V</code></td></tr>
+</tbody></table></div>
+<p>둘째 줄이 눈에 띈다. 인스턴스 메서드 안의 지역 클래스이므로 생성자는 바깥 인스턴스를 받지만, 본문이 바깥 인스턴스를 쓰지 않으면 <code>this$0</code> 필드는 만들어지지 않는다. JDK 21에 들어 있는 <code>javac</code> 소스(<code>Lower.shouldEmitOuterThis</code>)에 따르면 클래스 파일 대상 버전이 18 이상이고, 본문이 바깥 인스턴스를 쓰지 않으며, 클래스가 직렬화 가능(serializable)하지 않을 때 이 필드를 생략한다. 같은 소스를 <code>javac --release 17</code>로 컴파일하면 <code>this$0</code> 필드가 그대로 남는 것도 확인했다. 이것은 <code>javac</code>라는 구현의 동작이고 언어 명세가 정한 것은 아니다.</p>
+<p>셋째 줄은 명세가 정한 것이다. JLS 8.1.3은 static 문맥(static 메서드, static 초기화 블록 등)에서 선언한 지역 클래스와 익명 클래스의 인스턴스에는 바로 바깥 인스턴스가 없다고 정한다. static 메서드에는 <code>this</code>가 없으니 넘겨줄 바깥 인스턴스도 없다.</p>
+<p>넷째 줄은 상수의 경우다. JLS 4.12.4는 기본형이나 <code>String</code> 타입의 <code>final</code> 변수가 상수식으로 초기화되어 있으면 상수 변수(constant variable)라고 부른다. 컴파일러는 상수 변수를 쓴 자리에 값을 직접 써넣으므로 복사해 둘 필요가 없다. 실제로 이 경우 메서드의 바이트코드에는 필드 읽기 대신 <code>bipush 100</code>이 들어간다. 반대로 맨 처음 예제의 <code>int taxPercent = 10;</code>은 <code>final</code>을 붙이지 않았으므로 상수 변수가 아니고, 그래서 <code>val$taxPercent</code> 필드가 만들어졌다.</p>
+<aside class="note"><code>val$이름</code>, <code>this$0</code>이라는 필드 이름과 생성자 인자의 순서는 <code>javac</code>의 관례다. JLS는 지역 변수를 쓸 수 있다는 것과 그 변수가 지켜야 할 조건만 정하고, 어떤 이름의 필드로 구현할지는 정하지 않는다. 소스 코드에서 이 이름들을 직접 쓸 수도 없다.</aside>
+
+<x-visual id="java-mid1-08-capture-copy" title="new 실행 시 labeler 프레임의 지역 변수 값이 인스턴스의 합성 필드로 복사되는 구조" kind="메모리 구조도" ratio="16:9">
+<x-hint>왼쪽 스택 프레임의 세 칸(this, prefix, taxPercent)에서 오른쪽 힙 인스턴스의 세 합성 필드(this$0, val$prefix, val$taxPercent)로 값이 복사되는 화살표를 보여 준다. 공유가 아니라 복사임이 드러나야 한다.</x-hint>
+<x-prompt>흰 배경의 평면 벡터 메모리 구조도. 좌우 2분할. 왼쪽 영역 제목 "스택: labeler 프레임", 오른쪽 영역 제목 "힙". 왼쪽에 세로로 쌓인 칸 세 개가 있는 상자: 위에서부터 "칸0 this", "칸1 prefix", "칸2 taxPercent = 10". 오른쪽 위에 작은 상자 "Shop"과 그 옆에 문자열 상자 "판매가 ". 오른쪽 아래에 큰 상자 "TaxLabeler 인스턴스"가 있고 그 안에 네 줄의 필드: "this$0", "val$prefix", "val$taxPercent = 10", "calls = 0". 왼쪽 칸 세 개에서 오른쪽 인스턴스의 대응하는 세 필드로 가는 주황색 점선 화살표 세 개를 그리고, 화살표 묶음 위에 라벨 "생성자 인자로 값 복사". "칸0 this"와 "this$0"에서 각각 "Shop" 상자로 가는 실선 화살표, "칸1 prefix"와 "val$prefix"에서 각각 "판매가 " 상자로 가는 실선 화살표. 왼쪽 프레임 상자 아래에 회색 글씨 "반환하면 사라진다", 오른쪽 인스턴스 상자 아래에 초록 글씨 "참조가 남아 있는 한 유지".</x-prompt>
+<x-caption>캡처는 변수 자체를 공유하는 것이 아니라 생성 시점의 값을 인스턴스의 합성 필드로 복사하는 것이다. 참조형은 참조값이 복사되어 같은 객체를 가리킨다.</x-caption>
+</x-visual>
+
+<h3>지역 변수 캡처 3: 캡처하는 변수는 사실상 final이어야 한다</h3>
+<p>캡처가 값 복사라는 사실에서 제약 하나가 나온다. JLS 8.1.3은 내부 클래스가 쓰지만 그 안에서 선언하지는 않은 지역 변수, 매개변수, 예외 매개변수는 <code>final</code>이거나 사실상 final(effectively final)이어야 한다고 정한다. 사실상 final의 정의는 JLS 4.12.4에 있다. 선언할 때 초기화한 지역 변수라면 다음 세 조건을 모두 만족할 때다.</p>
+<ul>
+<li><code>final</code>로 선언되어 있지 않다.</li>
+<li>대입식의 왼쪽에 한 번도 나오지 않는다(선언문의 초기화는 대입식이 아니다).</li>
+<li><code>++</code>, <code>--</code>의 피연산자로 한 번도 나오지 않는다.</li>
+</ul>
+<p>풀어 말하면 "<code>final</code>을 붙여도 컴파일 오류가 나지 않을 변수"다. 메서드 매개변수도 초기화된 지역 변수와 같은 기준으로 판단한다. 앞 예제의 <code>taxPercent</code>와 <code>prefix</code>는 선언 뒤 한 번도 값을 바꾸지 않았으므로 사실상 final이었다. Java SE 7 명세의 같은 절은 이런 변수를 반드시 <code>final</code>로 선언하라고 요구했고, Java SE 8 명세부터 "<code>final</code>이거나 사실상 final"로 완화되었다. 값이 바뀌지 않아야 한다는 조건 자체는 그대로다.</p>
+<p>규칙을 어기면 어떻게 되는지 보자. 지역 클래스를 선언한 뒤에 변수 값을 바꾸는 코드다.</p>
+<pre><code class="language-java">Labeler labeler() {
+    int taxPercent = 10;
+
+    class TaxLabeler implements Labeler {
+        public String label(int price) {
+            return "" + (price + price * taxPercent / 100);   // 7번째 줄
+        }
+    }
+
+    taxPercent = 20;            // 값을 바꾼다
+    return new TaxLabeler();
+}</code></pre>
+<pre data-label="javac 출력"><code class="language-text">E1.java:7: error: local variables referenced from an inner class must be final or effectively final
+                return "" + (price + price * taxPercent / 100);
+                                             ^</code></pre>
+<p>오류가 보고되는 위치를 눈여겨보자. 문제의 원인은 <code>taxPercent = 20;</code>이지만 컴파일러는 지역 클래스 안에서 그 변수를 쓴 줄을 가리킨다. 대입 때문에 <code>taxPercent</code>는 사실상 final이 아니게 되었고, 그런 변수를 내부 클래스가 썼다는 것이 위반이기 때문이다. 대입이 클래스 선언보다 앞에 있든 뒤에 있든, <code>new</code>보다 앞이든 뒤든 결과는 같다. 변수가 메서드 전체에서 한 번이라도 다시 대입되면 캡처할 수 없다. 지역 클래스 안에서 값을 바꾸려는 시도(<code>taxPercent++</code>)도 같은 오류가 난다. 오류 문구의 "inner class"는 지역 클래스와 익명 클래스를 모두 가리키고, 람다에서 같은 규칙을 어기면 문구의 해당 부분이 "a lambda expression"으로 바뀐다.</p>
+<h4>이 규칙이 없다면 생기는 일</h4>
+<p>규칙이 없다고 가정하고 위 코드가 컴파일된다고 해 보자. <code>new TaxLabeler()</code>가 실행될 때 <code>taxPercent</code>의 값은 20이므로 필드에 20이 복사된다. 이번에는 대입과 생성의 순서를 바꿔 보자. <code>new</code>를 먼저 하고 그 뒤에 <code>taxPercent = 20;</code>을 실행하면 필드에는 10이 들어 있고 프레임의 칸에는 20이 들어 있다. 소스 코드에는 <code>taxPercent</code>라는 이름이 하나뿐인데 실행 중에는 값이 다른 두 개의 저장소가 있는 것이다. 메서드 본문은 20을 보고 지역 클래스의 메서드는 10을 본다.</p>
+<p>반대 방향도 마찬가지다. 지역 클래스 안에서 <code>taxPercent++</code>를 허용한다면 바뀌는 것은 인스턴스의 복사본이고, 바깥 메서드의 변수는 그대로다. 코드를 읽는 사람은 같은 변수를 고쳤다고 생각하지만 실제로는 다른 저장소를 고친 것이다. 어느 쪽이든 조용히 틀린 결과가 나오는 프로그램이 된다.</p>
+<p>언어 설계에는 두 가지 선택지가 있었다. 하나는 변수 자체를 공유하게 만드는 것이다. 그러려면 캡처되는 지역 변수를 프레임이 아니라 힙에 두어야 하고, 그 순간 지역 변수가 다른 스레드에서도 보일 수 있게 된다. 지역 변수는 프레임 안에 있어서 다른 스레드가 접근할 수 없다는 성질, 그래서 동기화 없이 써도 안전하다는 성질이 깨진다. 다른 하나는 값 복사를 유지하되 두 복사본이 어긋날 가능성을 없애는 것이다. 값이 한 번 정해지면 바뀌지 않는 변수만 캡처하게 하면 복사본이 몇 개든 항상 같은 값이므로 복사인지 공유인지를 구별할 수 없다. 자바는 뒤쪽을 택했다. JLS 15.27.2는 같은 제약을 람다에 대해 설명하면서 이유를 한 문장으로 적어 두었다. 동적으로 변하는 지역 변수를 캡처하면 동시성 문제를 일으키기 쉬우므로 그런 변수로의 접근을 금지한다는 것이다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>회의실 화이트보드와 사진</strong><p>회의가 끝나면 화이트보드는 지워진다. 회의 뒤에도 내용이 필요한 사람은 지워지기 전에 사진을 찍어 간다. 사진을 찍은 뒤 누가 보드의 숫자를 고치면 사진과 보드가 달라지고, 사진에 낙서를 해도 보드는 그대로다. "사진을 찍힌 뒤에는 보드를 고치지 않는다"는 약속이 있으면 사진을 보든 보드를 보든 같은 내용이므로 혼란이 없다. 지역 변수가 보드, 인스턴스의 합성 필드가 사진, 사실상 final 규칙이 그 약속이다. 비유가 맞지 않는 지점도 있다. 자바의 규칙은 사진을 찍은 뒤뿐 아니라 찍기 전의 수정도 금지한다. 변수가 선언된 뒤 한 번이라도 다시 대입되면 캡처 자체가 허용되지 않는다. 컴파일러가 실행 순서를 따지지 않고 변수 하나의 성질로 단순하게 판정하기 위해서다.</p></aside>
+<h4>반복문 변수와 초기화되지 않은 변수</h4>
+<p>이 규칙이 가장 자주 걸리는 곳은 반복문이다. 기본 <code>for</code> 문의 <code>i</code>는 <code>i++</code>로 값이 바뀌므로 사실상 final이 아니다. 앞의 <code>Snapshots</code> 예제에서 <code>getAsInt()</code>가 <code>snapshot</code> 대신 <code>i</code>를 직접 돌려주게 고치면 같은 컴파일 오류가 난다. 해결 방법은 예제가 이미 보여 주었다. 반복문 본문 안에서 새 변수를 선언해 값을 옮겨 담는 것이다. 본문 블록 안에서 선언한 변수는 반복마다 새로 만들어지고 선언 뒤 바뀌지 않으므로 사실상 final이다. 향상된 <code>for</code> 문(<code>for (String s : list)</code>)의 변수는 본문에서 다시 대입하지 않는 한 그대로 캡처할 수 있다.</p>
+<p>조건이 하나 더 있다. JLS 8.1.3은 내부 클래스가 쓰는 지역 변수가 그 클래스 본문보다 앞에서 확실히 대입(definitely assigned)되어 있어야 한다고 정한다. <code>int n;</code>으로 선언만 하고 지역 클래스가 <code>n</code>을 읽게 한 뒤 그 아래에서 <code>n = 3;</code>을 하면 <code>variable n might not have been initialized</code> 오류가 난다. 복사할 값이 아직 없는 변수는 캡처할 수 없다.</p>
+<h4>규칙의 대상이 아닌 것: 필드</h4>
+<p>이 규칙은 지역 변수와 매개변수에만 적용된다. 바깥 인스턴스의 필드, static 필드, 지역 클래스 자신의 필드는 얼마든지 바꿀 수 있다. 맨 처음 예제의 <code>calls++</code>가 문제없이 동작한 이유다. 차이는 저장 위치에 있다. 필드는 힙의 객체나 클래스에 딸린 공간에 있으므로 저장소가 하나뿐이다. 지역 클래스는 바깥 인스턴스의 필드를 복사해 두지 않고 <code>this$0</code> 참조를 따라가 매번 원본을 읽는다. 복사본이 없으니 어긋날 것도 없다. 물론 여러 스레드가 그 필드를 함께 쓴다면 동기화 문제가 생기지만, 그것은 필드를 쓰는 모든 코드가 원래 지고 있던 책임이다.</p>
+<h4>배열로 감싸는 우회와 그 의미</h4>
+<p>지역 클래스 안에서 바깥 메서드의 값을 꼭 바꿔야 할 때 흔히 쓰는 방법이 있다. 값을 길이 1짜리 배열이나 별도의 객체 안에 넣는 것이다.</p>
+<pre><code class="language-java">public class Holder {
+    public static void main(String[] args) {
+        int[] counter = {0};
+
+        class Clicker implements Runnable {
+            @Override
+            public void run() {
+                counter[0]++;
+            }
+        }
+
+        Runnable clicker = new Clicker();
+        clicker.run();
+        clicker.run();
+        counter[0] += 10;
+        clicker.run();
+        System.out.println(counter[0]);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">13</code></pre>
+<p>이 코드는 규칙을 어기지 않는다. 변수 <code>counter</code>에 들어 있는 것은 배열의 참조값이고, 그 참조값은 선언 뒤 한 번도 바뀌지 않았다. <code>counter[0]++</code>는 변수 <code>counter</code>에 대입하는 것이 아니라 <code>counter</code>가 가리키는 배열의 원소를 바꾸는 것이다. 컴파일된 <code>Holder$1Clicker</code>에는 <code>final int[] val$counter</code> 필드가 있고 생성자 디스크립터는 <code>([I)V</code>다. 복사된 것은 참조값이고, 배열 객체는 힙에 하나뿐이다.</p>
+<pre class="diagram">main 프레임                          힙
+┌───────────────────┐
+│ counter ──────────┼──────────────▶ int[1] { 13 }
+│                   │                    ▲
+│ clicker ──────────┼───▶ Holder$1Clicker │
+└───────────────────┘     ┌──────────────┼─────┐
+                          │ val$counter ─┘     │
+                          └────────────────────┘
+참조값은 두 곳에 복사되어 있지만 둘 다 같은 배열을 가리킨다.</pre>
+<p>실행을 따라가면 <code>run()</code> 두 번으로 원소가 2가 되고, <code>main</code>이 10을 더해 12가 되고, 다시 <code>run()</code>으로 13이 된다. 양쪽이 같은 저장소를 보고 있으므로 어긋남이 없다. 우회의 정체는 바뀌는 상태를 프레임에서 힙으로 옮긴 것이다. 앞에서 본 설계 선택지 가운데 "변수를 힙에 두고 공유한다"를 프로그래머가 손으로 한 셈이다.</p>
+<p>그 대가도 그대로 따라온다. 힙으로 옮긴 상태는 그 객체에 도달할 수 있는 모든 스레드가 볼 수 있다. <code>clicker</code>를 다른 스레드에 넘겨 실행하면 <code>counter[0]++</code>는 동기화되지 않은 공유 변수 수정이 된다. 스레드가 하나뿐인 코드에서는 문제가 없지만, 이 우회를 쓸 때는 지역 변수가 주던 안전성을 스스로 포기했다는 것을 알고 있어야 한다. 바꿔야 할 상태가 그 객체만의 것이라면 처음 예제의 <code>calls</code>처럼 지역 클래스의 필드로 두는 편이 구조가 분명하다.</p>
+
+<x-visual id="java-mid1-08-holder-array-shared" title="배열 참조를 캡처했을 때 프레임의 변수와 인스턴스의 합성 필드가 같은 배열 객체를 가리키는 구조" kind="메모리 구조도" ratio="16:9">
+<x-hint>값(int)을 캡처한 경우에는 복사본이 둘이고 서로 독립적이지만, 배열 참조를 캡처한 경우에는 참조만 둘이고 배열 객체는 하나라는 대비를 보여 준다.</x-hint>
+<x-prompt>흰 배경의 평면 벡터 비교 다이어그램. 좌우 2분할. 왼쪽 패널 제목 "int 값을 캡처". 위쪽에 스택 칸 "taxPercent = 10", 아래쪽에 힙 인스턴스 상자 안의 필드 "val$taxPercent = 10". 둘 사이에 주황 점선 화살표와 라벨 "값 복사". 두 상자 옆에 회색 글씨 "저장소 2개". 오른쪽 패널 제목 "배열 참조를 캡처". 위쪽에 스택 칸 "counter", 아래쪽에 힙 인스턴스 상자 안의 필드 "val$counter". 패널 오른쪽에 초록색 배열 상자 "int[1] { 13 }". 스택 칸 "counter"와 필드 "val$counter"에서 각각 배열 상자로 향하는 실선 화살표 두 개. 배열 상자 옆에 초록 글씨 "저장소 1개 (힙)". 두 패널 아래 가운데에 한 줄 라벨 "바뀌는 상태는 힙에 둘 때만 공유된다".</x-prompt>
+<x-caption>기본형 값은 복사본이 따로 생기지만, 참조를 캡처하면 참조값만 복사되고 객체는 하나다. 배열 우회는 바뀌는 상태를 프레임에서 힙으로 옮기는 방법이다.</x-caption>
+</x-visual>
+
+<h3>익명 클래스: 선언과 생성을 식 하나로</h3>
+<p>처음 예제의 지역 클래스 <code>TaxLabeler</code>를 다시 보면, 이 이름이 쓰인 곳은 선언과 그 아래의 <code>new TaxLabeler()</code> 두 군데뿐이다. 한 번 선언해서 한 군데에서만 생성하는 클래스라면 이름은 두 문장을 이어 주는 역할밖에 하지 않는다. 익명 클래스는 이 두 문장을 식 하나로 합친다. <code>labeler()</code> 메서드를 익명 클래스로 다시 쓰면 다음과 같다.</p>
+<pre><code class="language-java">public Labeler labeler(String prefix) {
+    int taxPercent = 10;
+
+    return new Labeler() {
+        private int calls;
+
+        @Override
+        public String label(int price) {
+            calls++;
+            int total = price + price * taxPercent / 100;
+            return prefix + total + currency + " (" + calls + "번째)";
+        }
+    };
+}</code></pre>
+<p><code>new Labeler() { … }</code>는 인터페이스의 인스턴스를 만드는 것처럼 보이지만 그렇지 않다. 인터페이스는 인스턴스를 만들 수 없다. 이 식은 두 가지 일을 한꺼번에 한다. <code>Labeler</code>를 구현하는 이름 없는 클래스를 이 자리에서 선언하고, 그 클래스의 인스턴스를 하나 만든다. 중괄호 안은 그 클래스의 본문이다. 식이므로 끝에 세미콜론이 붙고, 값이 필요한 자리(대입의 오른쪽, <code>return</code> 뒤, 메서드 인자)라면 어디에나 쓸 수 있다.</p>
+<p>이름이 없다는 것이 실행 중에 어떻게 드러나는지 리플렉션으로 확인해 보자. <code>main()</code>을 다음과 같이 바꿔 실행한다.</p>
+<pre><code class="language-java">public static void main(String[] args) {
+    Shop shop = new Shop("원");
+    Labeler a = shop.labeler("판매가 ");
+    Labeler b = shop.labeler("할인가 ");
+    System.out.println(a.label(1000));
+    System.out.println(b.label(1000));
+
+    Class<?> type = a.getClass();
+    System.out.println(type.getName());
+    System.out.println("[" + type.getSimpleName() + "]");
+    System.out.println(type.isAnonymousClass());
+    System.out.println(type.getSuperclass() + " / " + type.getInterfaces()[0]);
+    System.out.println(type.getEnclosingMethod());
+    System.out.println(a.getClass() == b.getClass());
+    System.out.println(a == b);
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">판매가 1100원 (1번째)
+할인가 1100원 (1번째)
+Shop$1
+[]
+true
+class java.lang.Object / interface Labeler
+public Labeler Shop.labeler(java.lang.String)
+true
+false</code></pre>
+<p>셋째 줄의 <code>Shop$1</code>이 이 클래스의 바이너리 이름이다. JLS 13.1은 익명 클래스의 바이너리 이름을 "바깥 클래스의 바이너리 이름 + <code>$</code> + 숫자열"로 정한다. 지역 클래스의 이름에서 단순 이름 부분이 빠진 형태다. 소스에 이름이 없을 뿐 클래스 파일에는 이름이 있어야 하므로 컴파일러가 번호를 붙인 것이고, 컴파일하면 <code>Shop$1.class</code> 파일이 생긴다. 넷째 줄의 <code>getSimpleName()</code>은 빈 문자열을 돌려주고 다섯째 줄의 <code>isAnonymousClass()</code>는 <code>true</code>다.</p>
+<p>여섯째 줄은 이 클래스의 상위 타입을 보여 준다. 인터페이스를 지정해 익명 클래스를 만들면 상위 클래스는 <code>Object</code>이고 그 인터페이스를 구현한다. 마지막 두 줄은 클래스와 인스턴스의 수를 구분해 준다. <code>labeler()</code>를 두 번 호출해 얻은 두 객체는 클래스가 같고(<code>true</code>) 객체는 다르다(<code>false</code>). 익명 클래스 식이 실행될 때마다 새로 만들어지는 것은 인스턴스이고, 클래스는 컴파일할 때 하나 만들어진 것이 전부다. 첫 두 줄의 출력에서 두 객체가 각자의 <code>prefix</code>와 각자의 <code>calls</code>를 갖고 있는 것도 볼 수 있다.</p>
+<p><code>javap -p -s 'Shop$1'</code>로 열어 보면 필드는 <code>calls</code>, <code>val$taxPercent</code>, <code>val$prefix</code>, <code>this$0</code>이고 생성자 디스크립터는 <code>(LShop;ILjava/lang/String;)V</code>다. 지역 클래스였을 때와 한 글자도 다르지 않다. 익명 클래스는 지역 클래스와 같은 방식으로 컴파일되며, 지역 변수 캡처와 사실상 final 규칙도 똑같이 적용된다. 달라지는 것은 이름이 없어서 생기는 문법상의 제약이다(JLS 15.9.5).</p>
+<ul>
+<li><b>상위 타입은 하나만 지정한다.</b> <code>new</code> 뒤에 클래스 이름 하나 또는 인터페이스 이름 하나를 쓴다. 클래스를 상속하면서 인터페이스를 구현하거나 인터페이스 둘을 구현하는 익명 클래스는 문법으로 쓸 수 없다.</li>
+<li><b>생성자를 선언할 수 없다.</b> 생성자는 클래스 이름으로 선언하는데 이름이 없다. 대신 컴파일러가 익명 생성자를 암묵적으로 만든다(JLS 15.9.5.1). <code>new Base(인자) { … }</code>처럼 괄호 안에 쓴 인자는 상위 클래스의 생성자로 전달된다. 초기화 코드가 필요하면 필드 초기화식이나 인스턴스 초기화 블록에 쓴다.</li>
+<li><b>항상 내부 클래스다.</b> 인스턴스 메서드 안에서 만들면 바깥 인스턴스에 접근할 수 있고, static 문맥에서 만들면 바깥 인스턴스가 없다. <code>abstract</code>일 수 없고, 인스턴스 생성 식으로 선언한 익명 클래스는 <code>final</code>도 아니다. 다만 이름이 없으니 소스 코드에서 이 클래스를 상속할 방법이 없다.</li>
+<li><b>생성하는 자리가 한 곳이다.</b> 그 식이 여러 번 실행되면 인스턴스는 여러 개 만들어지지만, 다른 위치에서 같은 클래스의 인스턴스를 만들 수는 없다. 두 곳 이상에서 필요하면 이름 있는 클래스로 선언해야 한다.</li>
+<li><b>새로 추가한 멤버는 밖에서 쓰기 어렵다.</b> 변수의 타입이 상위 타입이므로 익명 클래스에서 새로 선언한 메서드는 그 변수로 호출할 수 없다. <code>Object o = new Object() { void hello() {} };</code> 뒤에 <code>o.hello()</code>를 쓰면 <code>cannot find symbol</code> 오류가 난다. 익명 클래스 본문에는 상위 타입의 메서드 구현과, 그 구현이 내부적으로 쓰는 필드·보조 메서드를 둔다.</li>
+</ul>
+
+<h3>익명 클래스 활용 1: 변하는 부분이 값이 아니라 코드일 때</h3>
+<p>익명 클래스가 실제로 쓰이는 자리를 중복 제거 과정으로 따라가 보자. 건물 점검 절차를 출력하는 두 메서드가 있다.</p>
+<pre><code class="language-java">public class Checklist0 {
+
+    static void lightsOff() {
+        System.out.println("[시작] 소등");
+        System.out.println("조명을 끈다");
+        System.out.println("[완료] 소등");
+    }
+
+    static void lockDoors() {
+        System.out.println("[시작] 잠금");
+        for (int door = 1; door <= 2; door++) {
+            System.out.println(door + "번 문을 잠근다");
+        }
+        System.out.println("[완료] 잠금");
+    }
+
+    public static void main(String[] args) {
+        lightsOff();
+        lockDoors();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[시작] 소등
+조명을 끈다
+[완료] 소등
+[시작] 잠금
+1번 문을 잠근다
+2번 문을 잠근다
+[완료] 잠금</code></pre>
+<p>두 메서드는 구조가 같다. 시작을 알리고, 일을 하고, 완료를 알린다. 점검 항목이 열 개로 늘면 시작과 완료를 출력하는 코드도 열 번 반복되고, 출력 형식을 바꾸려면 열 군데를 고쳐야 한다. 중복을 없애려면 변하지 않는 부분은 한 곳에 두고 변하는 부분만 바깥에서 받아야 한다.</p>
+<p>변하는 부분은 두 가지다. 하나는 제목("소등", "잠금")이다. 이것은 값이므로 <code>String</code> 매개변수로 받으면 된다. 다른 하나는 가운데에서 하는 일이다. 한쪽은 출력 한 줄이고 다른 쪽은 반복문이다. 이것은 값이 아니라 코드다. <code>int</code>나 <code>String</code> 매개변수로는 "반복문을 돌려라"를 전달할 수 없다. 메서드에 코드 조각을 넘길 방법이 필요하다.</p>
+<p>자바에서 메서드가 인자로 받을 수 있는 것은 기본형 값과 참조값뿐이다. 코드 자체를 넘기는 문법은 없다. 그러나 객체는 넘길 수 있고, 객체는 메서드를 갖고 있다. 실행할 코드를 메서드에 담은 객체를 만들어 그 참조를 넘기면, 받은 쪽은 그 객체의 메서드를 호출함으로써 넘겨받은 코드를 실행할 수 있다. 다형성이 이 일을 가능하게 한다.</p>
+
+<h3>익명 클래스 활용 2: 동작을 객체에 담아 넘긴다</h3>
+<p>먼저 "가운데에서 하는 일"의 형식을 인터페이스로 정한다. 받는 쪽은 이 인터페이스만 알면 된다.</p>
+<pre><code class="language-java">public interface Step {
+    void run();
+}</code></pre>
+<p>이제 변하지 않는 틀을 메서드 하나로 모으고, 변하는 코드는 <code>Step</code>을 구현한 클래스에 담는다.</p>
+<pre><code class="language-java">public class Checklist1 {
+
+    static class LightsOff implements Step {
+        @Override
+        public void run() {
+            System.out.println("조명을 끈다");
+        }
+    }
+
+    static class LockDoors implements Step {
+        @Override
+        public void run() {
+            for (int door = 1; door <= 2; door++) {
+                System.out.println(door + "번 문을 잠근다");
+            }
+        }
+    }
+
+    static void perform(String title, Step step) {
+        System.out.println("[시작] " + title);
+        step.run();
+        System.out.println("[완료] " + title);
+    }
+
+    public static void main(String[] args) {
+        perform("소등", new LightsOff());
+        perform("잠금", new LockDoors());
+    }
+}</code></pre>
+<p>실행 결과는 앞과 같다. <code>perform()</code>은 <code>step</code>이 어떤 클래스의 객체인지 모른다. <code>step.run()</code>은 인터페이스 메서드 호출이고, 실제로 어느 메서드가 실행될지는 실행 시점에 그 참조가 가리키는 객체의 클래스에 따라 정해진다. 자바 기본편에서 본 동적 디스패치 그대로다. <code>new LightsOff()</code>를 넘기면 출력 한 줄이, <code>new LockDoors()</code>를 넘기면 반복문이 틀 안에서 실행된다. 시작과 완료를 출력하는 코드는 이제 한 곳에만 있다.</p>
+<p>중복은 사라졌지만 새 불편이 생겼다. 점검 항목 하나마다 클래스 하나를 선언해야 하고, 그 클래스들은 <code>main()</code>에서 한 번씩만 쓰인다. 쓰이는 곳과 선언된 곳이 떨어져 있어서 <code>perform("소등", new LightsOff())</code>를 읽는 사람은 무슨 일을 하는지 보려면 위로 올라가 클래스를 찾아야 한다. 쓰이는 메서드 안으로 선언을 옮기면 거리가 줄어든다. 지역 클래스로 바꾸면서, 지역 변수를 쓸 수 있다는 점도 활용해 보자.</p>
+<pre><code class="language-java">public class Checklist2 {
+
+    static void perform(String title, Step step) {
+        System.out.println("[시작] " + title);
+        step.run();
+        System.out.println("[완료] " + title);
+    }
+
+    public static void main(String[] args) {
+        int floor = 3;
+
+        class LightsOff implements Step {
+            @Override
+            public void run() {
+                System.out.println(floor + "층 조명을 끈다");
+            }
+        }
+
+        class LockDoors implements Step {
+            @Override
+            public void run() {
+                for (int door = 1; door <= 2; door++) {
+                    System.out.println(floor + "층 " + door + "번 문을 잠근다");
+                }
+            }
+        }
+
+        perform("소등", new LightsOff());
+        perform("잠금", new LockDoors());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[시작] 소등
+3층 조명을 끈다
+[완료] 소등
+[시작] 잠금
+3층 1번 문을 잠근다
+3층 2번 문을 잠근다
+[완료] 잠금</code></pre>
+<p>정적 중첩 클래스였을 때는 <code>floor</code>를 쓰려면 생성자로 받아 필드에 넣는 코드를 직접 써야 했다. 지역 클래스에서는 그 일을 컴파일러가 대신한다. <code>perform()</code>의 매개변수는 여전히 <code>(String, Step)</code>뿐이고 <code>floor</code>를 받는 자리가 없는데도 틀 안에서 실행되는 코드가 <code>floor</code>를 안다. 값이 객체 안에 실려서 함께 넘어갔기 때문이다. 동작을 객체로 넘기는 방식에서 캡처가 유용한 이유가 여기에 있다. 넘겨받는 쪽의 메서드 시그니처를 바꾸지 않고도, 넘기는 쪽의 문맥에 있는 값을 코드와 함께 전달할 수 있다.</p>
+
+<h3>익명 클래스 활용 3: 이름을 지우고 인자 자리에 직접 쓴다</h3>
+<p><code>LightsOff</code>와 <code>LockDoors</code>는 선언한 바로 아래에서 한 번씩만 생성된다. 앞 절에서 본 익명 클래스의 조건에 그대로 들어맞는다. 먼저 변수에 담는 형태로 바꾸면 다음과 같다.</p>
+<pre><code class="language-java">Step lightsOff = new Step() {
+    @Override
+    public void run() {
+        System.out.println(floor + "층 조명을 끈다");
+    }
+};
+
+perform("소등", lightsOff);</code></pre>
+<p>변수 <code>lightsOff</code>도 한 번만 쓰인다. 익명 클래스 생성은 식이므로 인자 자리에 직접 쓸 수 있다. 마지막 항목 하나는 뒤에서 설명할 람다로 써 두었다.</p>
+<pre><code class="language-java">public class Checklist {
+
+    static void perform(String title, Step step) {
+        System.out.println("[시작] " + title);
+        step.run();
+        System.out.println("[완료] " + title);
+    }
+
+    public static void main(String[] args) {
+        int floor = 3;
+
+        perform("소등", new Step() {
+            @Override
+            public void run() {
+                System.out.println(floor + "층 조명을 끈다");
+            }
+        });
+
+        perform("잠금", new Step() {
+            @Override
+            public void run() {
+                for (int door = 1; door <= 2; door++) {
+                    System.out.println(floor + "층 " + door + "번 문을 잠근다");
+                }
+            }
+        });
+
+        perform("보고", () -> System.out.println(floor + "층 점검 끝"));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[시작] 소등
+3층 조명을 끈다
+[완료] 소등
+[시작] 잠금
+3층 1번 문을 잠근다
+3층 2번 문을 잠근다
+[완료] 잠금
+[시작] 보고
+3층 점검 끝
+[완료] 보고</code></pre>
+<p>이제 호출하는 줄에 제목과 할 일이 함께 적혀 있다. <code>perform("소등", …)</code>을 읽으면 무엇을 하는지가 그 자리에서 보인다. 처음 코드와 비교하면 변하지 않는 틀은 <code>perform()</code> 한 곳에, 변하는 코드는 호출하는 자리에 놓였다. 컴파일하면 <code>Checklist.class</code>, <code>Checklist$1.class</code>, <code>Checklist$2.class</code>, <code>Step.class</code> 네 파일이 나온다. 익명 클래스 둘은 소스에 나온 순서대로 번호가 붙었다. <code>javap -p -s 'Checklist$1'</code>의 결과에는 <code>final int val$floor</code> 필드와 <code>(I)V</code> 생성자가 있다. <code>main()</code>이 static 메서드이므로 바깥 인스턴스는 넘어가지 않고 <code>floor</code>의 값만 복사된다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>메서드에 코드를 넘기고 싶을 때 자바는 그 코드를 메서드로 가진 객체를 넘긴다. 지역 클래스와 익명 클래스는 그 객체의 클래스를 쓰는 자리 바로 옆에서 선언하게 해 주고, 캡처는 선언한 자리의 지역 변수 값을 객체 안에 복사해 함께 실어 보낸다. 복사이기 때문에 캡처되는 변수는 값이 바뀌지 않아야 한다.</p></aside>
+
+<h3>익명 클래스와 람다: 겉모습은 닮았지만 컴파일 결과가 다르다</h3>
+<p>마지막 항목에 쓴 <code>() -> System.out.println(floor + "층 점검 끝")</code>이 람다 식(lambda expression)이다. 추상 메서드가 하나뿐인 인터페이스, 곧 함수형 인터페이스(functional interface)가 필요한 자리에는 익명 클래스 대신 람다를 쓸 수 있다. <code>Step</code>은 추상 메서드가 <code>run()</code> 하나이므로 조건을 만족한다. 람다는 로드맵의 뒤쪽 권에서 본격적으로 다루므로 여기서는 익명 클래스와 무엇이 같고 다른지만 확인한다.</p>
+<p>같은 점은 캡처 규칙이다. 람다 본문도 <code>floor</code>를 쓰고 있고, JLS 15.27.2는 람다가 쓰는 바깥 지역 변수에 내부 클래스와 같은 조건(<code>final</code>이거나 사실상 final)을 요구한다. 다른 점은 JDK 21의 <code>javac</code>가 만드는 컴파일 결과에 있다. 앞에서 컴파일 결과로 나온 클래스 파일은 넷이었고, 람다에 해당하는 <code>Checklist$3.class</code>는 없다. <code>javap -p -c Checklist</code>로 보면 람다가 어디로 갔는지 나온다.</p>
+<pre data-label="javap -p -c Checklist (일부)"><code class="language-text">public class Checklist {
+  ...
+  public static void main(java.lang.String[]);
+    Code:
+       ...
+       4: new           #31                 // class Checklist$1
+       ...
+      17: new           #44                 // class Checklist$2
+       ...
+      30: iload_1
+      31: invokedynamic #49,  0             // InvokeDynamic #2:run:(I)LStep;
+      36: invokestatic  #36                 // Method perform:(Ljava/lang/String;LStep;)V
+       ...
+
+  private static void lambda$main$0(int);
+    ...
+}</code></pre>
+<p>익명 클래스 두 개는 <code>new</code> 명령어로 <code>Checklist$1</code>, <code>Checklist$2</code>의 인스턴스를 만든다. 람다의 자리에는 <code>new</code>가 없고 <code>invokedynamic</code>이 있다. 람다의 본문은 별도 클래스가 아니라 <code>Checklist</code> 클래스 자신의 private static 메서드 <code>lambda$main$0(int)</code>로 컴파일되었다. 캡처한 <code>floor</code>는 필드가 아니라 이 메서드의 <code>int</code> 매개변수로 전달된다. <code>invokedynamic</code> 바로 앞의 <code>iload_1</code>이 <code>floor</code>의 값을 스택에 올리는 명령어이고, 디스크립터 <code>(I)LStep;</code>은 "<code>int</code> 하나를 받아 <code>Step</code> 객체를 돌려준다"는 뜻이다. <code>javap -v</code>로 보면 이 <code>invokedynamic</code>의 부트스트랩 메서드는 <code>java.lang.invoke.LambdaMetafactory.metafactory</code>다. <code>Step</code>을 구현하는 객체를 어떻게 만들지를 컴파일 시점이 아니라 실행 시점에 이 메서드가 정한다.</p>
+<div class="table-wrap"><table><thead><tr><th>비교 항목</th><th>익명 클래스</th><th>람다</th></tr></thead><tbody>
+<tr><td>쓸 수 있는 상위 타입</td><td>클래스, 추상 클래스, 인터페이스 모두</td><td>함수형 인터페이스만</td></tr>
+<tr><td>컴파일 시 클래스 파일</td><td><code>Outer$N.class</code>가 생긴다</td><td>생기지 않는다. 본문은 바깥 클래스의 private 메서드가 된다</td></tr>
+<tr><td>객체를 만드는 명령어</td><td><code>new</code> + 생성자 호출</td><td><code>invokedynamic</code></td></tr>
+<tr><td>캡처한 값이 놓이는 곳</td><td>합성 필드 <code>val$이름</code></td><td>람다 본문 메서드의 매개변수로 전달</td></tr>
+<tr><td>자신의 필드(상태)</td><td>선언할 수 있다</td><td>선언할 수 없다</td></tr>
+<tr><td><code>this</code></td><td>익명 클래스의 인스턴스</td><td>람다를 둘러싼 메서드의 <code>this</code></td></tr>
+<tr><td>식을 다시 평가할 때</td><td>항상 새 인스턴스</td><td>새 인스턴스일 수도, 기존 인스턴스일 수도 있다</td></tr>
+</tbody></table></div>
+<p>마지막 줄은 명세의 차이다. 익명 클래스 식은 인스턴스 생성 식이므로 평가할 때마다 새 객체가 만들어진다. 람다에 대해서 JLS 15.27.4는 평가할 때마다 새 객체를 할당할 필요가 없다고 적어 구현에 재량을 준다. OpenJDK 21에서 실험해 보면 지역 변수도 <code>this</code>도 캡처하지 않는 람다 식은 두 번 평가해도 같은 객체가 나왔고(<code>==</code> 비교가 <code>true</code>), 지역 변수나 <code>this</code>를 캡처하는 람다 식은 평가마다 다른 객체가 나왔다. 그 객체의 클래스는 <code>isHidden()</code>이 <code>true</code>인 히든 클래스였다. 이것은 구현의 동작이므로 람다 객체의 동일성에 의존하는 코드를 쓰면 안 된다.</p>
+<p>표에서 보듯 람다가 익명 클래스를 전부 대신하지는 못한다. 추상 클래스를 상속해야 할 때, 구현할 메서드가 둘 이상일 때, 처음 예제의 <code>calls</code>처럼 객체가 자신만의 상태를 필드로 가져야 할 때는 익명 클래스(또는 이름 있는 클래스)가 필요하다.</p>
+
+<x-visual id="java-mid1-08-anonymous-vs-lambda-compile" title="같은 Step 구현을 익명 클래스와 람다로 썼을 때의 컴파일 결과 비교" kind="비교 다이어그램" ratio="16:9">
+<x-hint>익명 클래스는 별도 클래스 파일과 new 명령어로, 람다는 바깥 클래스의 private 메서드와 invokedynamic으로 컴파일된다는 대비를 보여 준다.</x-hint>
+<x-prompt>흰 배경의 평면 벡터 비교 다이어그램. 좌우 2분할. 왼쪽 패널 제목 "익명 클래스". 위에 소스 조각을 나타내는 코드 상자 "new Step() { ... }". 아래로 화살표 "javac". 그 아래에 파일 아이콘 두 개: "Checklist.class"와 "Checklist$1.class". "Checklist.class" 안에 작은 글씨 "new Checklist$1", "Checklist$1.class" 안에 작은 글씨 "val$floor 필드". 오른쪽 패널 제목 "람다". 위에 코드 상자 "() -> ...". 아래로 화살표 "javac". 그 아래에 파일 아이콘 하나 "Checklist.class"만 있고 안에 두 줄 "invokedynamic", "lambda$main$0(int)". 그 파일 아이콘에서 오른쪽 아래로 점선 화살표가 나가 구름 모양 상자 "실행 중에 만들어지는 객체"로 이어지고 화살표 라벨 "LambdaMetafactory". 두 패널 사이 세로 구분선.</x-prompt>
+<x-caption>익명 클래스는 컴파일할 때 클래스 파일이 따로 생기고 new로 생성된다. 람다의 본문은 바깥 클래스의 메서드가 되고, 객체는 실행 시점에 invokedynamic을 통해 얻는다.</x-caption>
+</x-visual>
+
+<h3>this와 이름 가리기: 새 클래스인가, 같은 스코프인가</h3>
+<p>익명 클래스와 람다의 차이 가운데 실제 코드에서 가장 자주 부딪히는 것은 이름이 무엇을 가리키는가다. 익명 클래스의 본문은 클래스 본문이다. 새로운 클래스가 하나 생기는 것이므로 그 안의 <code>this</code>는 익명 클래스의 인스턴스이고, 그 안에서 선언한 필드는 바깥의 같은 이름을 가린다(shadowing). 람다의 본문은 클래스 본문이 아니다. JLS 15.27.2는 람다 본문에 나오는 이름과 <code>this</code>, <code>super</code>의 의미가 람다를 둘러싼 문맥에서와 같다고 정한다.</p>
+<pre><code class="language-java">public class Scope {
+    private String name = "바깥 필드";
+
+    void show() {
+        String name = "지역 변수";
+
+        Runnable anonymous = new Runnable() {
+            private String name = "익명 클래스 필드";
+
+            @Override
+            public void run() {
+                System.out.println(name);
+                System.out.println(this.name);
+                System.out.println(Scope.this.name);
+            }
+        };
+        anonymous.run();
+
+        Runnable lambda = () -> {
+            System.out.println(name);
+            System.out.println(this.name);
+        };
+        lambda.run();
+    }
+
+    public static void main(String[] args) {
+        new Scope().show();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">익명 클래스 필드
+익명 클래스 필드
+바깥 필드
+지역 변수
+바깥 필드</code></pre>
+<p>익명 클래스의 <code>run()</code> 안에서 <code>name</code>은 가장 가까운 선언인 자신의 필드다. 지역 변수 <code>name</code>과 바깥 필드 <code>name</code>은 둘 다 가려졌다. <code>this.name</code>도 같은 필드이고, 바깥 인스턴스의 필드를 쓰려면 <code>Scope.this.name</code>이라고 한정해야 한다. 이 익명 클래스는 지역 변수 <code>name</code>을 쓰지 않으므로 캡처하지도 않는다. 실제로 <code>Scope$1</code>에는 <code>val$name</code> 필드가 없고 <code>this$0</code>만 있다.</p>
+<p>람다 안에서는 새 스코프가 생기지 않았으므로 <code>name</code>은 <code>show()</code>의 지역 변수이고, <code>this</code>는 <code>show()</code>를 실행 중인 <code>Scope</code> 인스턴스다. 그래서 <code>this.name</code>이 "바깥 필드"를 출력한다. 같은 이유로 람다 본문 안에서는 바깥 지역 변수와 같은 이름의 지역 변수를 새로 선언할 수 없다. 메서드에 <code>int x</code>가 있는데 람다 안에서 <code>int x = 2;</code>를 쓰면 <code>variable x is already defined in method m()</code> 오류가 난다. 익명 클래스의 메서드 안에서는 같은 선언이 허용된다. JLS 6.4가 지역 변수 이름의 재선언을 금지하면서 그 범위 안에 있는 클래스 선언 내부는 예외로 두기 때문이다.</p>
+<p>이 차이는 익명 클래스를 람다로 기계적으로 바꿀 때 문제가 된다. 익명 클래스 안에서 <code>this</code>를 자기 자신이라는 뜻으로 쓰고 있었다면(예를 들어 자신을 어딘가에 등록하거나 등록을 해제하는 코드) 람다로 바꾸는 순간 <code>this</code>가 바깥 객체로 바뀐다. 컴파일은 되는데 의미가 달라질 수 있다.</p>
+
+<h3>한 층 아래: 초기화 순서와 클래스 파일에 남는 기록</h3>
+<h4>캡처한 값은 상위 생성자가 실행되기 전에 채워진다</h4>
+<p>앞에서 본 생성자 바이트코드에서 합성 필드에 값을 넣는 <code>putfield</code>들이 <code>Object</code>의 생성자 호출보다 앞에 있었다. 이 순서가 눈에 보이는 차이를 만드는 경우가 있다. 상위 클래스의 생성자가 하위 클래스에서 재정의한 메서드를 호출하는 경우다.</p>
+<pre><code class="language-java">public class InitOrder {
+
+    static abstract class Part {
+        Part() {
+            System.out.println("Part 생성자: " + describe());
+        }
+
+        abstract String describe();
+    }
+
+    public static void main(String[] args) {
+        int size = 42;
+
+        Part part = new Part() {
+            private int weight = 5;
+
+            @Override
+            String describe() {
+                return "size=" + size + ", weight=" + weight;
+            }
+        };
+
+        System.out.println("생성 후: " + part.describe());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Part 생성자: size=42, weight=0
+생성 후: size=42, weight=5</code></pre>
+<pre data-label="javap -p -c 'InitOrder$1' (생성자)"><code class="language-text">InitOrder$1(int);
+  Code:
+     0: aload_0
+     1: iload_1
+     2: putfield      #1                  // Field val$size:I
+     5: aload_0
+     6: invokespecial #7                  // Method InitOrder$Part."<init>":()V
+     9: aload_0
+    10: iconst_5
+    11: putfield      #13                 // Field weight:I
+    14: return</code></pre>
+<p>생성자는 세 단계로 실행된다. 캡처한 값을 <code>val$size</code>에 넣고(0~2), 상위 클래스 <code>Part</code>의 생성자를 호출하고(6), 그 뒤에 소스에 쓴 필드 초기화 <code>weight = 5</code>를 실행한다(9~11). <code>Part</code>의 생성자가 <code>describe()</code>를 호출하는 시점은 둘째 단계 도중이다. 이때 <code>val$size</code>에는 이미 42가 들어 있지만 <code>weight</code>는 아직 기본값 0이다. 그래서 첫 줄에 <code>size=42, weight=0</code>이 출력된다.</p>
+<p>자신이 선언한 필드는 상위 생성자가 끝난 뒤에 초기화된다는 것은 자바 기본편에서 본 객체 초기화 순서 그대로다. 캡처 필드만 그보다 앞서 채워지는 것은 컴파일러가 그렇게 코드를 만들기 때문이다. 캡처한 지역 변수는 소스 코드에서 보기에 필드가 아니라 이미 값이 정해진 변수이므로, 객체의 어느 메서드가 언제 실행되든 그 값이 보여야 자연스럽다. Java 21의 소스 코드로는 상위 생성자 호출보다 앞에 문장을 둘 수 없으므로 프로그래머가 같은 순서를 직접 쓸 수는 없다. 그리고 이 예제는 생성자에서 재정의 가능한 메서드를 호출하면 하위 클래스의 필드가 초기화되기 전 상태를 보게 된다는 오래된 함정을 다시 보여 주기도 한다.</p>
+<h4>클래스 파일은 어디서 선언되었는지를 기록한다</h4>
+<p>지역 클래스와 익명 클래스는 컴파일되면 독립된 클래스 파일이 되지만, 원래 어디에 있던 클래스인지에 대한 기록은 남는다. <code>javap -v 'Shop$1'</code>의 끝부분에는 다음 속성들이 있다.</p>
+<pre data-label="javap -v 'Shop$1' (속성 일부)"><code class="language-text">EnclosingMethod: #25.#45                // Shop.labeler
+NestHost: class Shop
+InnerClasses:
+  #2;                                     // class Shop$1</code></pre>
+<p>JVMS 4.7.7은 클래스가 지역 클래스이거나 익명 클래스일 때, 그리고 그때에만 <code>EnclosingMethod</code> 속성을 가져야 한다고 정한다. 이 속성은 그 클래스를 감싸는 가장 안쪽 클래스와, 클래스가 메서드나 생성자 바로 안에 있었다면 그 메서드를 가리킨다. 앞에서 호출한 <code>getEnclosingMethod()</code>가 <code>Shop.labeler</code>를 돌려준 것은 이 기록 덕분이다. 익명 클래스를 필드 초기화식이나 초기화 블록 안에 쓴 경우에는 감싸는 메서드가 없으므로 메서드 항목이 0이 된다. <code>InnerClasses</code> 속성에도 흔적이 있다. JVMS 4.7.6은 익명 클래스의 경우 원래의 단순 이름을 가리키는 항목(<code>inner_name_index</code>)이 0이어야 한다고 정한다. 이름이 없었다는 사실이 클래스 파일에 그대로 적히는 것이다. <code>NestHost</code>는 이 클래스가 <code>Shop</code>과 같은 네스트에 속한다는 표시로, 중첩 클래스가 바깥 클래스의 <code>private</code> 멤버에 접근할 수 있게 해 주는 장치다.</p>
+<p>이 기록은 실행 흐름에는 영향을 주지 않지만 디버깅할 때 쓰인다. 예외의 스택 트레이스에는 소스의 이름이 아니라 컴파일된 이름이 찍힌다. 익명 클래스의 메서드에서 예외가 나면 <code>Trace$1.run(Trace.java:5)</code>, 지역 클래스라면 <code>Trace$1Named.run(Trace.java:7)</code>, 람다라면 <code>Trace.lambda$main$0(Trace.java:6)</code>과 같은 형태다. <code>$숫자</code>는 익명 클래스, <code>$숫자이름</code>은 지역 클래스, <code>lambda$메서드이름$숫자</code>는 그 메서드 안의 람다라는 것을 알면 스택 트레이스에서 해당 코드를 바로 찾을 수 있다.</p>
+
+<h3>흔한 오해와 함정</h3>
+<h4>"지역 클래스의 인스턴스는 메서드가 끝나면 사라진다"</h4>
+<p>"지역"이라는 말 때문에 생기는 오해다. 지역인 것은 클래스 이름의 유효 범위다. 인스턴스는 다른 모든 객체처럼 힙에 있고, 수명은 도달 가능한 참조가 있는지로만 정해진다. 메서드가 인스턴스를 반환하거나 컬렉션에 넣거나 다른 객체의 필드에 저장했다면 그 인스턴스는 메서드보다 오래 산다. 반대로 메서드 안에서만 쓰고 참조를 밖으로 내보내지 않았다면 메서드가 끝난 뒤 가비지 컬렉션 대상이 된다.</p>
+<h4>"캡처한 변수는 바깥 변수와 연결되어 있다"</h4>
+<p>연결되어 있지 않다. 생성 시점에 값이 복사되고 그 뒤로는 서로 무관한 저장소다. 연결된 것처럼 보이는 이유는 사실상 final 규칙 때문에 양쪽 값이 달라질 기회가 없어서다. 참조형 변수를 캡처했을 때 객체의 변경이 양쪽에서 보이는 것은 변수가 연결되어서가 아니라 두 참조값이 같은 객체를 가리켜서다.</p>
+<h4>"<code>final</code>을 붙여야 캡처할 수 있다"</h4>
+<p>Java SE 7까지의 규칙이다. 지금은 선언 뒤 값을 바꾸지 않기만 하면 된다. 다만 <code>final</code>을 붙이는 것이 의미 없지는 않다. 누군가 나중에 그 변수에 대입하는 코드를 추가하면, <code>final</code>이 없을 때는 멀리 떨어진 지역 클래스 안의 줄에서 오류가 나고, <code>final</code>이 있을 때는 대입한 바로 그 줄에서 오류가 난다. 또 기본형이나 <code>String</code>의 <code>final</code> 변수를 상수식으로 초기화하면 상수 변수가 되어 캡처 필드 없이 값이 직접 들어간다.</p>
+<h4>"익명 클래스 식이 실행될 때마다 클래스가 만들어진다"</h4>
+<p>클래스는 컴파일할 때 하나 만들어져 <code>.class</code> 파일로 존재한다. 식이 반복문 안에서 천 번 실행되면 인스턴스가 천 개 만들어질 뿐이다. 앞의 리플렉션 예제에서 <code>a.getClass() == b.getClass()</code>가 <code>true</code>였던 것이 그 증거다.</p>
+<h4>"익명 클래스는 바깥 객체와 상관없는 독립된 객체다"</h4>
+<p>인스턴스 메서드 안에서 만든 익명 클래스나 지역 클래스가 바깥 인스턴스의 필드나 메서드를 쓰면 <code>this$0</code> 필드에 바깥 인스턴스의 참조가 들어간다. 이 익명 객체를 오래 사는 곳(예를 들어 애플리케이션이 끝날 때까지 유지되는 리스너 목록이나 static 컬렉션)에 등록하면, 그 객체가 도달 가능한 동안 바깥 인스턴스도 <code>this$0</code>을 통해 도달 가능하므로 가비지 컬렉션으로 회수되지 않는다. 바깥 객체가 큰 데이터를 들고 있다면 등록 해제를 잊은 콜백 하나가 그 전체를 붙잡는다. 앞에서 본 것처럼 JDK 21의 <code>javac</code>(대상 버전 18 이상)는 바깥 인스턴스를 쓰지 않는 경우 이 필드를 만들지 않지만, 바깥의 필드나 메서드를 하나라도 쓰면 참조가 유지된다. 바깥 인스턴스가 필요 없다면 static 메서드에서 만들거나 정적 중첩 클래스로 선언하는 것이 의도를 분명히 드러낸다.</p>
+<h4>"람다는 익명 클래스를 짧게 쓴 문법이다"</h4>
+<p>함수형 인터페이스를 구현하는 자리에서는 서로 바꿔 쓸 수 있는 경우가 많지만 같은 것은 아니다. 컴파일 결과가 다르고(<code>new</code>와 클래스 파일 대 <code>invokedynamic</code>과 메서드), <code>this</code>와 이름의 의미가 다르고, 객체가 매번 새로 만들어지는지에 대한 보장이 다르다. 상태를 가진 익명 클래스나 <code>this</code>를 자기 자신으로 쓰는 익명 클래스는 람다로 바꾸면 동작이 달라진다.</p>
+
+<h3>다른 주제와의 연결</h3>
+<p>동작을 객체로 넘기는 방식은 자바 표준 라이브러리 전반에 쓰인다. 정렬 기준을 넘기는 <code>Comparator</code>, 스레드가 실행할 작업을 넘기는 <code>Runnable</code>, 컬렉션을 순회하는 <code>Iterator</code> 구현이 모두 같은 구조다. 틀은 라이브러리가 갖고 있고, 변하는 코드는 인터페이스를 구현한 객체로 받는다. 이 로드맵의 컬렉션과 스레드를 다루는 권에서 익명 클래스나 람다로 이 인터페이스들을 구현하는 코드를 계속 보게 된다.</p>
+<p>스레드와 만나면 이 회차의 캡처 규칙이 실질적인 의미를 갖는다. <code>Runnable</code> 객체를 다른 스레드에 넘기면 그 객체의 <code>run()</code>은 다른 스레드의 스택에서 실행된다. 캡처한 값은 객체 안에 복사되어 있으므로 원래 스레드의 프레임이 사라졌든 아니든 안전하게 읽을 수 있고, 값이 바뀌지 않으니 동기화도 필요 없다. 반면 배열이나 가변 객체의 참조를 캡처해 상태를 공유하면 두 스레드가 같은 힙 객체를 읽고 쓰게 되어, 동시성을 다루는 권에서 배울 가시성과 경쟁 조건 문제가 그대로 나타난다.</p>
+<p>스프링에서도 같은 구조를 만난다. <code>JdbcTemplate</code>은 커넥션을 얻고, SQL을 실행하고, 자원을 정리하는 틀을 갖고 있고, 결과의 한 행을 객체로 바꾸는 코드만 <code>RowMapper</code>로 받는다. <code>TransactionTemplate</code>은 트랜잭션을 시작하고 커밋하거나 롤백하는 틀 안에서 실행할 코드를 콜백으로 받는다. 이 회차의 <code>perform()</code>과 <code>Step</code>의 관계와 같다. 넘기는 콜백이 호출하는 메서드의 지역 변수를 쓸 때 사실상 final 오류를 만나게 되는 것도 같다.</p>
+<p>이 권의 다음 두 회차는 예외 처리를 다룬다. 예외가 발생했을 때 출력되는 스택 트레이스에서 <code>Shop$1.label</code>이나 <code>lambda$main$0</code> 같은 이름을 만나면, 이 회차에서 본 컴파일 결과의 이름 규칙으로 소스의 어느 코드인지 되짚을 수 있다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>지역 클래스(local class)</dt><dd>메서드 본문 같은 블록 안에서 선언하는 클래스다. 이름의 유효 범위만 블록 안이고, 컴파일하면 <code>Outer$1Name.class</code>라는 독립된 클래스 파일이 되며 인스턴스는 힙에서 다른 객체와 같은 규칙으로 산다.</dd>
+<dt>프레임과 인스턴스의 수명 차이</dt><dd>지역 변수는 스레드의 스택 프레임에 있고 메서드가 끝나면 프레임과 함께 파괴된다. 지역 클래스의 인스턴스는 힙에 있고 도달 가능한 참조가 있는 동안 유지되므로 메서드보다 오래 살 수 있다.</dd>
+<dt>지역 변수 캡처(capture)</dt><dd>지역 클래스나 익명 클래스가 바깥 메서드의 지역 변수를 쓰면 컴파일러가 합성 필드 <code>val$이름</code>과 숨은 생성자 인자를 만들고, <code>new</code>가 실행되는 순간의 값을 인스턴스 안으로 복사한다. 참조형은 참조값이 복사된다.</dd>
+<dt>사실상 final(effectively final)</dt><dd>선언 뒤 한 번도 다시 대입되지 않고 증감 연산의 대상도 되지 않는 지역 변수다. 캡처는 복사이므로 값이 바뀌면 프레임의 원본과 인스턴스의 복사본이 어긋난다. 자바는 바뀌지 않는 변수만 캡처하게 해서 이 불일치를 컴파일 시점에 막는다.</dd>
+<dt>규칙 밖에 있는 것</dt><dd>필드는 힙이나 클래스에 저장소가 하나뿐이고 <code>this$0</code>을 따라가 원본을 읽으므로 자유롭게 바꿀 수 있다. 배열이나 가변 객체의 참조를 캡처해 내용을 바꾸는 것도 허용되지만, 그 상태는 힙에 있으므로 다른 스레드와 공유될 수 있다.</dd>
+<dt>익명 클래스(anonymous class)</dt><dd>클래스 선언과 인스턴스 생성을 식 하나로 합친 것이다. 컴파일 결과는 지역 클래스와 같은 구조의 <code>Outer$N.class</code>이며 캡처 규칙도 같다. 이름이 없어서 상위 타입을 하나만 지정할 수 있고 생성자를 선언할 수 없다.</dd>
+<dt>동작을 객체로 넘기기</dt><dd>변하는 부분이 값이 아니라 코드일 때, 그 코드를 인터페이스의 메서드로 구현한 객체를 인자로 넘긴다. 받는 쪽은 틀만 갖고 인터페이스 메서드를 호출하며, 실제로 실행될 코드는 동적 디스패치로 정해진다.</dd>
+<dt>익명 클래스와 람다의 차이</dt><dd>익명 클래스는 클래스 파일이 생기고 <code>new</code>로 생성되며 본문이 새 클래스 스코프다. 람다는 본문이 바깥 클래스의 private 메서드로 컴파일되고 <code>invokedynamic</code>으로 객체를 얻으며, <code>this</code>와 이름의 의미가 둘러싼 문맥과 같다.</dd>
+<dt>클래스 파일에 남는 기록</dt><dd>지역·익명 클래스의 클래스 파일에는 <code>EnclosingMethod</code> 속성이 있어 어느 클래스의 어느 메서드 안에서 선언되었는지가 남는다. 스택 트레이스에는 <code>Outer$1</code>, <code>Outer$1Name</code>, <code>lambda$method$0</code> 같은 컴파일된 이름이 찍힌다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 다시 판단하면, 첫 번째 결정은 한 번 쓰고 말 구현을 어떤 형태로 쓸지다. 구현할 메서드가 하나뿐인 인터페이스이고 구현이 상태를 갖지 않으며 <code>this</code>를 자기 자신으로 쓸 일이 없다면 람다가 가장 짧다. 추상 클래스를 상속해야 하거나, 메서드를 둘 이상 구현해야 하거나, 호출 횟수 같은 자신만의 상태를 필드로 가져야 한다면 익명 클래스가 맞다. 같은 구현을 두 곳 이상에서 생성하거나, 본문이 길어져 호출하는 줄의 흐름을 가리거나, 단위 테스트에서 그 구현만 따로 만들어 검증하고 싶다면 이름 있는 클래스로 꺼내는 편이 낫다. 익명 클래스는 선언한 자리 밖에서는 만들 수 없기 때문이다.</p>
+<p>두 번째는 메모리 문제를 볼 때다. 애플리케이션이 끝날 때까지 유지되는 컬렉션이나 다른 객체의 리스너 목록에 익명 객체를 등록하는 코드를 보면, 그 익명 클래스 본문이 바깥 인스턴스의 필드나 메서드를 쓰는지 확인한다. 쓴다면 익명 객체의 <code>this$0</code>이 바깥 인스턴스를 붙잡고 있고, 등록을 해제하지 않는 한 바깥 인스턴스와 그것이 참조하는 모든 객체가 회수되지 않는다. 코드에는 바깥 객체를 저장한다는 문장이 어디에도 없으므로 소스만 읽어서는 놓치기 쉽다. 컴파일러가 숨은 필드를 만든다는 사실을 알고 있어야 "작은 콜백 하나가 큰 객체를 붙잡는다"는 가설을 세울 수 있다. 판단이 달라지는 조건은 수명이다. 메서드 안에서 만들어 그 메서드 안에서만 쓰는 익명 객체라면 바깥 참조를 갖고 있어도 문제가 되지 않는다.</p>
+<p>세 번째는 사실상 final 오류를 만났을 때의 대응이다. 길이 1짜리 배열로 감싸면 컴파일은 되지만, 그 전에 왜 콜백 안에서 바깥 메서드의 변수를 바꾸려 했는지를 먼저 본다. 결과를 모으려는 것이라면 콜백이 값을 반환하게 인터페이스를 바꾸고 틀 쪽에서 모으는 구조가 더 단순한 경우가 많다. 객체 하나에 속한 상태라면 그 객체의 필드로 둔다. 그래도 공유 상태가 필요하다면 그 콜백이 어느 스레드에서 실행되는지를 확인해야 한다. 같은 스레드에서 곧바로 실행되고 끝나는 콜백이면 배열 우회는 안전하다. 스레드 풀이나 다른 스레드로 넘어가는 콜백이면 그 배열은 동기화가 필요한 공유 변수이고, 컴파일러가 막아 주던 문제를 직접 책임져야 한다.</p>
+<p>마지막으로 컴파일된 이름을 어디까지 믿을지다. JDK 21의 <code>javac</code>는 익명 클래스에 소스에 나온 순서대로 번호를 붙인다. 클래스 앞쪽에 익명 클래스를 하나 추가하고 다시 컴파일하면 뒤쪽에 있던 <code>Outer$1</code>이 <code>Outer$2</code>가 된다. 스택 트레이스를 읽을 때는 이름보다 함께 찍힌 줄 번호가 정확하고, 그 스택 트레이스가 어느 빌드에서 나온 것인지를 맞춰 봐야 한다. 로그 설정이나 다른 코드에서 <code>Outer$1</code>이라는 이름을 문자열로 적어 두는 것은 소스를 조금만 고쳐도 다른 클래스를 가리키게 되므로 피한다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 프로그램의 출력 다섯 줄을 예측하라. 그리고 컴파일된 익명 클래스에 어떤 필드가 있고 생성자 디스크립터가 무엇일지 적어 보라(<code>main()</code>이 static 메서드이고 <code>counter()</code>도 static이라는 점에 유의한다).
+<pre><code class="language-java">public class Counters {
+    interface Counter {
+        int next();
+    }
+
+    static Counter counter(int start) {
+        int step = 2;
+
+        return new Counter() {
+            private int current = start;
+
+            @Override
+            public int next() {
+                current += step;
+                return current;
+            }
+        };
+    }
+
+    public static void main(String[] args) {
+        Counter a = counter(10);
+        Counter b = counter(100);
+        System.out.println(a.next());
+        System.out.println(a.next());
+        System.out.println(b.next());
+        System.out.println(a.getClass() == b.getClass());
+        System.out.println(a.getClass().getName());
+    }
+}</code></pre></li>
+<li>다음 코드는 컴파일되지 않는다. (가)와 (나) 줄에서 각각 어떤 변수 때문에 오류가 나는지, <code>unit</code>은 왜 문제가 없는지 설명하라. 그리고 배열을 쓰지 않고 "1개, 2개, 3개"를 출력한 뒤 합계 6을 출력하도록 고쳐 보라.
+<pre><code class="language-java">public class Tally {
+    public static void main(String[] args) {
+        int total = 0;
+        String unit = "개";
+
+        for (int i = 1; i <= 3; i++) {
+            Runnable printer = new Runnable() {
+                @Override
+                public void run() {
+                    System.out.println(i + unit);   // (가)
+                    total += i;                     // (나)
+                }
+            };
+            printer.run();
+        }
+
+        System.out.println(total);
+    }
+}</code></pre></li>
+<li>다음 프로그램의 출력 두 줄을 예측하고, 두 줄이 다른 이유를 "본문이 어떤 스코프에 속하는가"로 설명하라.
+<pre><code class="language-java">public class Who {
+    @Override
+    public String toString() {
+        return "Who 객체";
+    }
+
+    void show() {
+        Runnable anonymous = new Runnable() {
+            @Override
+            public void run() {
+                System.out.println(this);
+            }
+
+            @Override
+            public String toString() {
+                return "익명 객체";
+            }
+        };
+        Runnable lambda = () -> System.out.println(this);
+
+        anonymous.run();
+        lambda.run();
+    }
+
+    public static void main(String[] args) {
+        new Who().show();
+    }
+}</code></pre></li>
+<li>다음 프로그램에서 <code>main()</code>의 "이 지점"에 도달했을 때, <code>main</code>의 지역 변수에는 <code>Panel</code> 객체를 가리키는 참조가 없다. 그런데도 <code>Panel</code> 객체와 약 10MB짜리 배열은 가비지 컬렉션 대상이 아니다. static 필드 <code>LISTENERS</code>에서 출발해 배열까지 이어지는 참조 사슬을 그림으로 그리고, 사슬의 각 고리가 소스의 어느 코드에서 생겼는지 적어 보라. 익명 클래스의 <code>run()</code> 본문이 <code>clicks++</code> 대신 <code>System.out.println("클릭")</code>이었다면 무엇이 달라지는가?
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class Panel {
+    static final List<Runnable> LISTENERS = new ArrayList<>();
+
+    private final byte[] image = new byte[10_000_000];
+    private int clicks;
+
+    void register() {
+        LISTENERS.add(new Runnable() {
+            @Override
+            public void run() {
+                clicks++;
+            }
+        });
+    }
+
+    public static void main(String[] args) {
+        new Panel().register();
+        // 이 지점
+    }
+}</code></pre></li>
+<li>다음 두 메서드의 중복을 제거하라. 변하지 않는 틀을 <code>inSession(String user, Task task)</code> 메서드 하나로 모으고, 변하는 코드는 추상 메서드가 <code>run()</code> 하나인 인터페이스 <code>Task</code>의 익명 클래스로 넘긴다. <code>amount</code>는 <code>main()</code>의 지역 변수로 두고 익명 클래스가 캡처하게 한다. 출력은 원래와 같아야 한다. 다 쓴 뒤 컴파일하면 클래스 파일이 몇 개 생길지, 결제 쪽 익명 클래스의 생성자 디스크립터가 무엇일지도 예측해 보라.
+<pre><code class="language-java">public class Session0 {
+    static void pay() {
+        int amount = 3000;
+        System.out.println("kim 로그인");
+        System.out.println(amount + "원 결제");
+        System.out.println("kim 로그아웃");
+    }
+
+    static void listOrders() {
+        System.out.println("lee 로그인");
+        for (int i = 1; i <= 2; i++) {
+            System.out.println("주문 " + i + " 조회");
+        }
+        System.out.println("lee 로그아웃");
+    }
+
+    public static void main(String[] args) {
+        pay();
+        listOrders();
+    }
+}</code></pre></li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 출력은 <code>12</code>, <code>14</code>, <code>102</code>, <code>true</code>, <code>Counters$1</code>이다. <code>counter(10)</code>이 실행될 때 익명 클래스의 인스턴스가 만들어지면서 <code>start</code>의 값 10과 <code>step</code>의 값 2가 인스턴스 안으로 복사되고, 필드 초기화식 <code>current = start</code>가 복사본을 읽어 <code>current</code>를 10으로 만든다. <code>a.next()</code>를 두 번 호출하면 <code>current</code>가 12, 14가 된다. <code>b</code>는 <code>counter(100)</code>의 다른 호출에서 만들어진 별개의 인스턴스이므로 자신의 복사본 100에서 시작해 102를 돌려준다. <code>a</code>의 호출이 <code>b</code>에 영향을 주지 않는 것은 <code>current</code>가 인스턴스마다 따로 있는 필드이기 때문이다. 두 객체는 같은 익명 클래스 식에서 만들어졌으므로 클래스는 하나이고(<code>true</code>), 바이너리 이름은 바깥 클래스 이름에 <code>$1</code>이 붙은 <code>Counters$1</code>이다. <code>javap -p -s 'Counters$1'</code>로 확인한 필드는 <code>private int current</code>, <code>final int val$start</code>, <code>final int val$step</code> 셋이고 생성자 디스크립터는 <code>(II)V</code>다. static 메서드 안에서 선언했으므로 바깥 인스턴스가 없어 <code>this$0</code>과 그에 해당하는 생성자 인자가 없다. <code>step</code>은 <code>final</code>을 붙이지 않았으므로 상수 변수가 아니어서 필드로 복사되었다. <code>final int step = 2;</code>로 선언했다면 <code>val$step</code> 필드는 생기지 않고 값 2가 코드에 직접 들어간다.</p>
+<p><b>2번.</b> (가)에서는 <code>i</code> 때문에 오류가 난다. <code>i</code>는 <code>for</code> 문의 <code>i++</code>로 값이 바뀌므로 사실상 final이 아니다. (나)에서는 오류가 두 개 보고된다. 하나는 같은 이유의 <code>i</code>이고, 다른 하나는 <code>total</code>이다. <code>total += i</code>는 <code>total</code>에 대입하는 식이므로 그것만으로 <code>total</code>은 사실상 final이 아니게 된다. JDK 21의 <code>javac</code>는 세 곳 모두에 <code>local variables referenced from an inner class must be final or effectively final</code>을 출력한다. <code>unit</code>은 선언 뒤 한 번도 대입되지 않았으므로 사실상 final이고 캡처할 수 있다. 규칙이 없다면 어떤 일이 생길지도 생각해 볼 수 있다. 익명 클래스 안의 <code>total += i</code>가 바꾸는 것은 인스턴스 안의 복사본이므로, 반복이 끝난 뒤 <code>main()</code>이 출력하는 <code>total</code>은 여전히 0일 것이다. 고치는 방법은 캡처할 값을 반복문 본문 안의 새 변수에 옮겨 담고, 합계는 캡처하지 않고 바깥에서 더하는 것이다.</p>
+<pre><code class="language-java">for (int i = 1; i <= 3; i++) {
+    int count = i;
+    Runnable printer = new Runnable() {
+        @Override
+        public void run() {
+            System.out.println(count + unit);
+        }
+    };
+    printer.run();
+    total += i;
+}
+
+System.out.println(total);</code></pre>
+<p><code>count</code>는 반복마다 새로 만들어지고 선언 뒤 바뀌지 않으므로 사실상 final이다. <code>total</code>과 <code>i</code>는 이제 익명 클래스 안에서 쓰이지 않으므로 얼마든지 바꿔도 된다. 사실상 final 규칙은 캡처되는 변수에만 적용된다. 실행하면 <code>1개</code>, <code>2개</code>, <code>3개</code>, <code>6</code>이 출력된다.</p>
+<p><b>3번.</b> 출력은 <code>익명 객체</code>, <code>Who 객체</code>다. 익명 클래스의 본문은 새 클래스의 본문이므로 <code>run()</code> 안의 <code>this</code>는 그 익명 클래스의 인스턴스이고, <code>println(this)</code>는 익명 클래스가 재정의한 <code>toString()</code>을 호출한다. 람다의 본문은 새 클래스 스코프를 만들지 않는다. JLS 15.27.2에 따라 람다 본문의 <code>this</code>는 람다를 둘러싼 메서드 <code>show()</code>의 <code>this</code>, 곧 <code>Who</code> 인스턴스다. 그래서 <code>Who</code>의 <code>toString()</code>이 호출된다. 컴파일 결과로 보면 익명 클래스의 <code>run()</code>은 <code>Who$1</code>의 인스턴스 메서드이고, 람다의 본문은 <code>Who</code> 클래스 자신의 메서드로 들어가므로 그 메서드의 <code>this</code>가 <code>Who</code> 인스턴스인 것이 자연스럽다. 익명 클래스를 람다로 바꿀 때 본문에 <code>this</code>가 있으면 의미가 달라지는지 반드시 확인해야 하는 이유다.</p>
+<p><b>4번.</b> 참조 사슬은 다음과 같다.</p>
+<pre class="diagram">Panel 클래스의 static 필드 LISTENERS
+        │  (static final List<Runnable> LISTENERS = new ArrayList<>())
+        ▼
+ArrayList 객체
+        │  (LISTENERS.add(...) 가 원소로 저장)
+        ▼
+Panel$1 인스턴스 (익명 클래스)
+        │  this$0  (본문의 clicks++ 가 바깥 인스턴스를 쓰므로 컴파일러가 만든 합성 필드)
+        ▼
+Panel 인스턴스
+        │  image  (private final byte[] image = new byte[10_000_000])
+        ▼
+byte[10000000]</pre>
+<p>static 필드는 클래스가 언로드되기 전까지 유지되므로 사슬의 출발점이 계속 살아 있고, 사슬에 걸린 객체는 모두 도달 가능하다. 소스에는 <code>Panel</code> 객체를 어딘가에 저장하는 문장이 없다. 셋째 고리인 <code>this$0</code>은 익명 클래스가 바깥 인스턴스의 필드 <code>clicks</code>를 썼기 때문에 컴파일러가 만든 것이다. <code>javap -p -s 'Panel$1'</code>로 보면 <code>final Panel this$0</code> 필드와 <code>(LPanel;)V</code> 생성자가 있다. 본문이 <code>System.out.println("클릭")</code>뿐이라면 바깥 인스턴스를 쓰지 않는다. 이 경우 JDK 21의 <code>javac</code>로 컴파일하면 생성자는 여전히 <code>Panel</code>을 인자로 받지만 <code>this$0</code> 필드는 만들어지지 않는다. 사슬이 <code>Panel$1</code> 인스턴스에서 끊기므로 <code>Panel</code> 인스턴스와 배열은 <code>register()</code>가 끝난 뒤 도달할 수 없게 되어 회수 대상이 된다. 다만 필드를 생략하는 것은 <code>javac</code>의 구현 동작이고 <code>--release 17</code> 이하로 컴파일하면 필드가 남으므로, 바깥 인스턴스를 붙잡지 않는다는 것을 코드로 보장하려면 static 메서드에서 만들거나 정적 중첩 클래스로 선언한다.</p>
+<p><b>5번.</b> 예시 풀이는 다음과 같다.</p>
+<pre><code class="language-java">public class Session {
+    interface Task {
+        void run();
+    }
+
+    static void inSession(String user, Task task) {
+        System.out.println(user + " 로그인");
+        task.run();
+        System.out.println(user + " 로그아웃");
+    }
+
+    public static void main(String[] args) {
+        int amount = 3000;
+
+        inSession("kim", new Task() {
+            @Override
+            public void run() {
+                System.out.println(amount + "원 결제");
+            }
+        });
+
+        inSession("lee", new Task() {
+            @Override
+            public void run() {
+                for (int i = 1; i <= 2; i++) {
+                    System.out.println("주문 " + i + " 조회");
+                }
+            }
+        });
+    }
+}</code></pre>
+<p>변하는 부분 가운데 사용자 이름은 값이므로 <code>String</code> 매개변수로, 가운데에서 하는 일은 코드이므로 <code>Task</code> 객체로 받았다. 출력은 원래와 같은 일곱 줄이다. 클래스 파일은 <code>Session.class</code>, <code>Session$Task.class</code>, <code>Session$1.class</code>, <code>Session$2.class</code> 네 개가 생긴다. 중첩 인터페이스는 <code>$이름</code>, 익명 클래스는 소스에 나온 순서대로 <code>$1</code>, <code>$2</code>다. 결제 쪽 익명 클래스 <code>Session$1</code>은 <code>amount</code>를 캡처하므로 <code>final int val$amount</code> 필드와 <code>(I)V</code> 생성자를 갖는다. static 메서드 안이므로 바깥 인스턴스 인자는 없다. 조회 쪽 <code>Session$2</code>는 바깥의 어떤 변수도 쓰지 않으므로 합성 필드가 없고 생성자 디스크립터는 <code>()V</code>다. <code>inSession()</code>의 시그니처에는 <code>amount</code>를 받는 자리가 없는데도 결제 금액이 틀 안에서 출력되는 것은 값이 <code>Task</code> 객체 안에 실려 넘어갔기 때문이다. <code>Task</code>는 추상 메서드가 하나이므로 두 익명 클래스 모두 람다로 바꿀 수 있고, 그렇게 하면 <code>Session$1.class</code>와 <code>Session$2.class</code>는 생기지 않는다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>메서드가 반환해 프레임이 파괴된 뒤에도 지역 클래스의 인스턴스가 그 메서드의 지역 변수 값을 읽을 수 있는 이유는 무엇인가?</q>
+<o>JVM이 지역 클래스가 쓰는 지역 변수가 있는 프레임을 파괴하지 않고 힙으로 옮겨 보존하기 때문이다.</o>
+<o>인스턴스가 생성될 때 컴파일러가 만든 생성자 인자를 통해 그 시점의 값이 인스턴스의 합성 필드로 복사되기 때문이다.</o>
+<o>인스턴스가 프레임의 지역 변수 칸을 가리키는 참조를 갖고 있고, 가비지 컬렉터가 그 칸을 회수하지 않기 때문이다.</o>
+<o>지역 클래스가 쓰는 지역 변수는 컴파일러가 자동으로 static 필드로 바꾸기 때문이다.</o>
+<why>컴파일러는 지역 클래스에 <code>val$이름</code> 합성 필드와 숨은 생성자 인자를 만들고, <code>new</code>가 실행될 때 프레임에서 읽은 값을 그 필드에 넣는다. 그 뒤 메서드는 <code>getfield</code>로 자기 필드를 읽으므로 프레임이 없어도 된다. 프레임은 메서드 호출이 끝나면 파괴된다고 JVMS 2.6이 정하므로 보존되지 않는다. JVM의 참조 값은 힙의 객체를 가리키거나 null이며 지역 변수 칸을 가리키는 참조는 없다. static 필드로 바꾼다면 인스턴스마다 다른 값을 가질 수 없는데, 본문의 <code>Snapshots</code> 예제에서 세 인스턴스는 각자 0, 10, 20을 갖고 있었다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>자바가 내부 클래스와 람다에서 쓰는 바깥 지역 변수를 final이거나 사실상 final인 것으로 제한하는 근본 이유로 가장 알맞은 것은?</q>
+<o>final 변수는 JIT 컴파일러가 더 빠른 코드로 바꿀 수 있어서 성능을 위해 강제한다.</o>
+<o>지역 변수는 스택에 있어서 가비지 컬렉터가 추적할 수 없으므로, 값이 바뀌면 메모리 누수가 생긴다.</o>
+<o>캡처는 값 복사이므로 변수가 바뀔 수 있으면 프레임의 원본과 인스턴스의 복사본이 서로 다른 값을 갖게 되고, 변수 자체를 공유하게 만들면 지역 변수가 스레드에 국한된다는 성질이 깨지기 때문이다.</o>
+<o>내부 클래스는 바깥 클래스의 private 멤버에 접근할 수 없으므로 지역 변수라도 고정해 두어야 하기 때문이다.</o>
+<why>복사본이 둘인데 한쪽만 바뀌면 소스에서는 같은 이름인 변수가 실행 중에는 다른 값을 갖는다. 값이 바뀌지 않는 변수만 캡처하게 하면 복사인지 공유인지 구별할 수 없으므로 이 문제가 사라진다. 변수를 힙에 두고 공유하는 방법은 지역 변수를 다른 스레드에 노출시키며, JLS 15.27.2는 변하는 지역 변수의 캡처가 동시성 문제를 일으키기 쉽다는 점을 이유로 든다. 성능이나 메모리 누수는 이 규칙의 근거가 아니다. 내부 클래스는 바깥 클래스의 private 멤버에 접근할 수 있고, 필드에는 이 규칙이 적용되지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>int[] counter = {0};</code>을 선언하고 익명 클래스 안에서 <code>counter[0]++</code>를 실행하는 코드는 컴파일되고, 바깥 메서드에서도 바뀐 값이 보인다. 이 동작을 가장 정확하게 설명한 것은?</q>
+<o>변수 <code>counter</code>에 든 참조값은 한 번도 바뀌지 않으므로 사실상 final이고, 복사된 참조값과 원래 참조값이 힙의 같은 배열 객체를 가리키므로 원소의 변경이 양쪽에서 보인다.</o>
+<o>배열 타입의 변수에는 사실상 final 규칙이 적용되지 않도록 언어 명세가 예외를 두었다.</o>
+<o>배열을 캡처하면 컴파일러가 배열 전체를 인스턴스 안으로 깊은 복사하고, 메서드가 끝날 때 원본에 다시 써 주기 때문이다.</o>
+<o>익명 클래스가 바깥 메서드의 프레임에 있는 <code>counter</code> 칸을 직접 읽고 쓰기 때문이다.</o>
+<why><code>counter[0]++</code>는 변수 <code>counter</code>에 대입하는 것이 아니라 그 변수가 가리키는 배열의 원소를 바꾸는 것이다. 변수의 값인 참조는 그대로이므로 규칙을 어기지 않는다. 컴파일된 클래스에는 <code>final int[] val$counter</code> 필드가 있고 여기에 참조값이 복사된다. 배열 객체는 힙에 하나뿐이다. 배열에 대한 예외 규정은 없고, 깊은 복사나 다시 써 주는 동작도 없다. 다른 메서드의 프레임 칸을 읽고 쓰는 방법은 JVM에 없다. 이 우회는 바뀌는 상태를 힙으로 옮긴 것이므로 다른 스레드와 공유되면 동기화가 필요해진다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>반복문 안에 <code>new Runnable() { … }</code> 식이 하나 있고 반복문이 다섯 번 돈다. 이때 만들어지는 클래스와 인스턴스의 수는?</q>
+<o>실행 중에 클래스 5개가 만들어지고 각 클래스의 인스턴스가 1개씩 생긴다.</o>
+<o>클래스 1개, 인스턴스 1개다. 같은 식이므로 JVM이 첫 인스턴스를 재사용한다.</o>
+<o>클래스는 만들어지지 않고, 인터페이스 <code>Runnable</code>의 인스턴스 5개가 생긴다.</o>
+<o>클래스는 컴파일할 때 만들어진 1개이고, 식이 실행될 때마다 그 클래스의 새 인스턴스가 만들어져 모두 5개다.</o>
+<why>익명 클래스는 컴파일할 때 <code>Outer$1.class</code>라는 클래스 파일 하나로 만들어진다. 익명 클래스 식은 인스턴스 생성 식이므로 실행될 때마다 <code>new</code> 명령어가 새 객체를 만든다. 본문에서 <code>labeler()</code>를 두 번 호출해 얻은 두 객체의 <code>getClass()</code>가 같고 <code>==</code> 비교는 false였던 것과 같다. 평가할 때마다 새 객체를 만들 필요가 없다는 재량은 람다에 대해 JLS 15.27.4가 준 것이고 익명 클래스에는 해당하지 않는다. 인터페이스는 인스턴스를 만들 수 없으며, 만들어지는 것은 그 인터페이스를 구현한 이름 없는 클래스의 인스턴스다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>인스턴스 메서드 안에 있는 익명 클래스 <code>new Runnable() { public void run() { register(this); } }</code>를 람다 <code>() -> register(this)</code>로 바꿨다. 무엇이 달라지는가?</q>
+<o>달라지는 것이 없다. 람다는 익명 클래스를 짧게 쓴 문법이므로 컴파일 결과가 같다.</o>
+<o><code>register()</code>에 넘어가는 객체가 달라진다. 익명 클래스에서는 그 <code>Runnable</code> 객체 자신이, 람다에서는 람다를 둘러싼 메서드의 <code>this</code>인 바깥 인스턴스가 넘어간다.</o>
+<o>람다 본문에서는 <code>this</code>를 쓸 수 없으므로 항상 컴파일 오류가 난다.</o>
+<o>람다는 사실상 final 규칙의 적용을 받지 않으므로 바깥 지역 변수를 바꿀 수 있게 된다.</o>
+<why>익명 클래스의 본문은 새 클래스의 본문이어서 <code>this</code>가 익명 클래스의 인스턴스다. 람다의 본문은 새 스코프를 만들지 않으며, JLS 15.27.2에 따라 <code>this</code>의 의미가 둘러싼 문맥과 같다. 그래서 같은 <code>this</code>라는 글자가 다른 객체를 가리킨다. 바깥 클래스가 <code>register()</code>의 매개변수 타입에 맞으면 컴파일도 되므로 조용히 동작이 바뀔 수 있다. 컴파일 결과도 다르다. 익명 클래스는 별도 클래스 파일과 <code>new</code>, 람다는 바깥 클래스의 메서드와 <code>invokedynamic</code>이다. 인스턴스 메서드 안의 람다는 <code>this</code>를 쓸 수 있고, 캡처하는 지역 변수에는 익명 클래스와 같은 사실상 final 조건이 적용된다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>지역 클래스(local class)</dt><dd>블록 안에서 선언한 클래스. 이름의 유효 범위가 선언한 곳부터 블록 끝까지이며 접근 제어자와 <code>static</code>을 붙일 수 없다.</dd>
+<dt>익명 클래스(anonymous class)</dt><dd><code>new 상위타입() { 본문 }</code> 형태의 식으로 선언과 동시에 인스턴스를 만드는 이름 없는 클래스. 항상 내부 클래스다.</dd>
+<dt>내부 클래스(inner class)</dt><dd>명시적으로도 암묵적으로도 <code>static</code>이 아닌 중첩 클래스. static이 아닌 멤버 클래스, 일반 클래스로 선언한 지역 클래스, 익명 클래스가 여기에 속한다.</dd>
+<dt>지역 변수 캡처(variable capture)</dt><dd>내부 클래스나 람다가 자신을 둘러싼 메서드의 지역 변수·매개변수를 쓸 때, 그 값이 생성 시점에 복사되어 함께 보관되는 것.</dd>
+<dt>사실상 final(effectively final)</dt><dd><code>final</code>로 선언하지 않았지만 대입식의 왼쪽이나 증감 연산의 피연산자로 한 번도 나오지 않는 지역 변수. JLS 4.12.4가 정의한다.</dd>
+<dt>상수 변수(constant variable)</dt><dd>상수식으로 초기화된, 기본형 또는 <code>String</code> 타입의 <code>final</code> 변수. 컴파일러가 쓰는 자리에 값을 직접 넣으므로 캡처 필드가 필요 없다.</dd>
+<dt>합성 구성 요소(synthetic construct)</dt><dd>소스 코드에 대응하는 선언 없이 컴파일러가 만들어 넣은 필드·메서드 등. 클래스 파일에 <code>ACC_SYNTHETIC</code> 플래그로 표시된다. <code>val$이름</code>, <code>this$0</code>이 그 예다.</dd>
+<dt>바이너리 이름(binary name)</dt><dd>컴파일된 클래스가 갖는 이름. 지역 클래스는 <code>바깥$숫자이름</code>, 익명 클래스는 <code>바깥$숫자</code> 형태다.</dd>
+<dt>프레임(frame)</dt><dd>메서드 호출마다 스레드의 JVM 스택에 만들어지는 구조. 지역 변수 배열과 피연산자 스택을 가지며 호출이 끝나면 파괴된다.</dd>
+<dt>함수형 인터페이스(functional interface)</dt><dd>추상 메서드가 하나뿐인 인터페이스. 익명 클래스 대신 람다 식으로 구현할 수 있다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html#jls-8.1.3">JLS §8.1.3 Inner Classes and Enclosing Instances</a> — 내부 클래스의 정의, 캡처하는 지역 변수가 final이거나 사실상 final이어야 한다는 규칙, static 문맥의 지역·익명 클래스에는 바깥 인스턴스가 없다는 규칙</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-4.html#jls-4.12.4">JLS §4.12.4 final Variables</a> — 사실상 final과 상수 변수의 정의</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html#jls-15.9.5">JLS §15.9.5 Anonymous Class Declarations, §15.27 Lambda Expressions</a> — 익명 클래스의 성질과 익명 생성자, 람다 본문에서 this와 이름의 의미(§15.27.2), 람다 평가 시 객체 할당에 대한 규정(§15.27.4)</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-13.html#jls-13.1">JLS §13.1 The Form of a Binary</a> — 지역 클래스와 익명 클래스의 바이너리 이름, 합성(synthetic) 표시 규칙</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html#jvms-2.6">JVMS §2.5–2.6 Run-Time Data Areas, Frames</a> — 프레임의 생성과 파괴, 프레임이 스레드에 국한된다는 규정, 힙의 정의</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-4.html#jvms-4.7.7">JVMS §4.7.6–4.7.7 InnerClasses, EnclosingMethod Attributes</a> — 지역·익명 클래스가 클래스 파일에 남기는 기록</li>
+</x-refs>

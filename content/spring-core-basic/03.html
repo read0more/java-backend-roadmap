@@ -1,0 +1,942 @@
+<x-meta>
+deck: 설정 클래스가 빈 정의 등록과 인스턴스 생성 두 단계를 거쳐 객체 그래프가 되는 과정, 이름·타입 조회의 내부 동작, BeanFactory와 BeanDefinition을 실행 결과로 확인한다.
+minutes: 110
+</x-meta>
+
+<x-goals>
+<li><code>new AnnotationConfigApplicationContext(설정.class)</code> 한 줄을 리더 생성, 설정 클래스 등록, <code>refresh()</code>로 나누고, 빈 정의가 등록되는 시점과 인스턴스가 만들어지는 시점을 실행 결과에서 구분해 설명할 수 있다.</li>
+<li><code>getBeanDefinitionNames()</code>의 결과를 역할(role) 값으로 나눠 읽고, 정의 없이 등록된 싱글톤이 왜 그 목록에 없는데도 조회되는지 설명할 수 있다.</li>
+<li>이름 조회와 타입 조회가 빈 팩토리 안에서 서로 다른 연산이라는 것을 자료구조로 설명하고, <code>NoSuchBeanDefinitionException</code>, <code>NoUniqueBeanDefinitionException</code>, <code>BeanNotOfRequiredTypeException</code>이 각각 어떤 조회에서 나오는지 예측할 수 있다.</li>
+<li>부모 타입 조회가 자식 타입의 빈을 모두 후보로 삼는 이유와, <code>@Bean</code> 메서드의 선언 반환 타입이 아직 만들어지지 않은 빈의 타입 조회 결과를 바꾸는 이유를 설명할 수 있다.</li>
+<li><code>BeanFactory</code>만 썼을 때 빠지는 기능을 실험으로 보이고, XML 설정과 자바 설정이 <code>BeanDefinition</code>의 어떤 필드 차이로 표현되는지 읽을 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 설정 클래스 한 장이 어떻게 객체 그래프가 되는가</h3>
+<p>스프링 입문 권에서 컨테이너와 빈이라는 낱말을 한 번 실물에 붙여 보았다. 이 권의 01회와 02회에서는 역할과 구현을 나누고, 구현을 고르는 책임을 그것을 사용하는 코드 밖으로 빼내는 설계를 다뤘다. 그렇게 하고 나면 애플리케이션에는 "무엇을 만들어 어떻게 이을지"만 적은 설정 클래스가 하나 남는다. 이 회차는 그 설정 클래스를 스프링 컨테이너에 넘긴 다음에 일어나는 일을 다룬다.</p>
+<p>겉으로 보이는 코드는 두 줄이다. 컨테이너를 만들고, 빈을 꺼낸다. 이 두 줄을 외우면 예제는 돌아간다. 그런데 실무에서 마주치는 문제는 그 두 줄 사이에서 생긴다. 애플리케이션이 뜨다가 <code>NoUniqueBeanDefinitionException</code>으로 멈춘다. 분명히 등록했다고 생각한 빈을 컨테이너가 못 찾는다. 이런 메시지를 읽으려면 컨테이너가 무엇을 어떤 순서로 하는지, 조회 요청을 무엇과 비교하는지를 알아야 한다.</p>
+<p>그래서 이 회차는 API 목록을 외우는 대신 다음 질문의 답을 따라간다. 컨테이너의 생성자 안에서는 어떤 일이 어떤 순서로 일어나는가. 컨테이너는 빈을 어디에, 어떤 자료구조로 들고 있는가. 이름으로 찾는 것과 타입으로 찾는 것은 내부에서 같은 연산인가. <code>BeanFactory</code>와 <code>ApplicationContext</code>는 무엇이 다른가. 자바 코드와 XML이라는 전혀 다른 형식의 설정이 어떻게 같은 컨테이너에서 돌아가는가.</p>
+<aside class="note">이 회차의 실행 결과, 예외 메시지, 스택 트레이스는 원고를 쓰면서 JDK 21.0.13과 스프링 프레임워크 7.0.10(spring-context와 그 의존 라이브러리, jakarta.annotation-api 3.0.0)에서 직접 돌려 얻은 것이다. 본문이 근거로 삼는 규칙(<code>refresh()</code>의 단계, 빈 팩토리의 필드와 타입 조회 방식, 기능 비교표, <code>BeanDefinition</code>의 속성)은 이 강좌의 기준 버전인 스프링 프레임워크 6.2의 레퍼런스 문서, Javadoc, 소스에서 같은 내용을 따로 확인했다. 스택 트레이스의 줄 번호와 <code>toString()</code> 출력 형식처럼 버전에 따라 달라질 수 있는 곳은 본문에서 밝힌다.</aside>
+
+<h4>실험에 쓸 코드</h4>
+<p>예제는 알림 발송이다. 템플릿 저장소에서 문구를 찾아 발송기로 보낸다. 역할을 나타내는 인터페이스가 둘, 구현 클래스가 셋, 두 역할을 사용하는 서비스가 하나다. 객체가 언제 만들어지는지 눈으로 보려고 생성자마다 출력을 한 줄씩 넣었다. 지면을 줄이려고 한 파일에 모았고 모두 <code>notify</code> 패키지에 있다.</p>
+<pre data-label="Domain.java"><code class="language-java">package notify;
+
+interface MessageSender {
+    void send(String to, String text);
+}
+
+class EmailSender implements MessageSender {
+    EmailSender() { System.out.println("  [생성] EmailSender"); }
+    public void send(String to, String text) { System.out.println("email -> " + to + ": " + text); }
+}
+
+class SmsSender implements MessageSender {
+    SmsSender() { System.out.println("  [생성] SmsSender"); }
+    public void send(String to, String text) { System.out.println("sms -> " + to + ": " + text); }
+}
+
+interface TemplateRepository {
+    String find(String code);
+}
+
+class MemoryTemplateRepository implements TemplateRepository {
+    MemoryTemplateRepository() { System.out.println("  [생성] MemoryTemplateRepository"); }
+    public String find(String code) { return "[" + code + "] 안내"; }
+}
+
+class NotificationService {
+    private final TemplateRepository templates;
+    private final MessageSender sender;
+
+    NotificationService(TemplateRepository templates, MessageSender sender) {
+        System.out.println("  [생성] NotificationService");
+        this.templates = templates;
+        this.sender = sender;
+    }
+
+    void deliver(String to, String code) { sender.send(to, templates.find(code)); }
+}</code></pre>
+<p>설정 클래스는 세 객체를 만드는 메서드를 하나씩 가진다. <code>notificationService()</code>는 본문에서 나머지 두 메서드를 직접 불러 의존 객체를 얻는다. 메서드가 불리는 시점을 보려고 여기에도 출력을 넣었다.</p>
+<pre data-label="NotifyConfig.java"><code class="language-java">package notify;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class NotifyConfig {
+
+    @Bean
+    public NotificationService notificationService() {
+        System.out.println(" @Bean notificationService() 호출");
+        return new NotificationService(templateRepository(), messageSender());
+    }
+
+    @Bean
+    public TemplateRepository templateRepository() {
+        System.out.println(" @Bean templateRepository() 호출");
+        return new MemoryTemplateRepository();
+    }
+
+    @Bean
+    public MessageSender messageSender() {
+        System.out.println(" @Bean messageSender() 호출");
+        return new EmailSender();
+    }
+}</code></pre>
+
+<h3>스프링 컨테이너 생성: 생성자 한 줄이 하는 일</h3>
+<p>스프링 컨테이너(Spring container)는 빈을 만들고, 설정하고, 서로 이어 주는 객체다. 레퍼런스 문서는 <code>org.springframework.context.ApplicationContext</code> 인터페이스가 스프링 IoC 컨테이너를 나타내며 빈의 인스턴스화, 설정, 조립을 책임진다고 적는다. 컨테이너는 무엇을 만들어야 하는지를 설정 메타데이터(configuration metadata)를 읽어서 안다. 같은 문서에 따르면 설정 메타데이터는 애노테이션이 붙은 컴포넌트 클래스, 팩토리 메서드를 가진 설정 클래스, 외부 XML 파일, Groovy 스크립트로 표현할 수 있다.</p>
+<p><code>ApplicationContext</code>는 인터페이스이므로 <code>new</code>로 만들 수 없다. 자바 설정 클래스를 읽는 구현이 <code>AnnotationConfigApplicationContext</code>다. 생성자에 설정 클래스의 <code>Class</code> 객체를 넘기면 컨테이너가 만들어진다.</p>
+<pre data-label="CreateMain.java"><code class="language-java">package notify;
+
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+
+public class CreateMain {
+    public static void main(String[] args) {
+        System.out.println("1. 컨테이너 생성 시작");
+        AnnotationConfigApplicationContext ac = new AnnotationConfigApplicationContext(NotifyConfig.class);
+        System.out.println("2. 컨테이너 생성 끝");
+        NotificationService service = ac.getBean("notificationService", NotificationService.class);
+        System.out.println("3. 빈 조회 끝");
+        service.deliver("kim", "WELCOME");
+        ac.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">1. 컨테이너 생성 시작
+ @Bean notificationService() 호출
+ @Bean templateRepository() 호출
+  [생성] MemoryTemplateRepository
+ @Bean messageSender() 호출
+  [생성] EmailSender
+  [생성] NotificationService
+2. 컨테이너 생성 끝
+3. 빈 조회 끝
+email -> kim: [WELCOME] 안내</code></pre>
+<p>출력의 순서가 첫 번째 사실을 알려 준다. <code>[생성]</code> 줄이 전부 1번과 2번 사이에 있다. 생성자가 돌아오기 전에 세 객체는 이미 만들어졌고 서로 이어졌다. 2번과 3번 사이, 곧 <code>getBean</code>을 부르는 동안에는 아무것도 만들어지지 않았다. <code>getBean</code>은 이미 있는 객체의 참조를 돌려주었을 뿐이다.</p>
+<p>두 번째 사실은 호출 순서다. <code>notificationService()</code>가 가장 먼저 불렸고, 그 본문이 <code>templateRepository()</code>와 <code>messageSender()</code>를 부르면서 두 의존 객체가 먼저 완성됐다. <code>NotificationService</code>는 두 인자가 준비된 뒤 마지막에 만들어졌다. 자바에서 메서드 호출의 인자는 호출보다 먼저 평가되므로 당연한 순서다.</p>
+<p>세 번째 사실은 눈에 보이지 않는 쪽에 있다. <code>templateRepository()</code> 호출 줄은 한 번만 찍혔다. 설정 클래스에는 <code>templateRepository</code>라는 빈도 따로 선언되어 있으니, 컨테이너가 그 빈을 만들 차례에 메서드를 한 번 더 불렀다면 줄이 두 번 나왔어야 한다. 그렇게 되지 않았다. 빈 하나는 한 번만 만들어지고, 이미 만들어진 것은 재사용된다. 이 동작을 만드는 장치는 04회의 주제이므로 여기서는 결과만 기억해 둔다.</p>
+
+<h4>생성자를 세 조각으로 나눈다</h4>
+<p><code>AnnotationConfigApplicationContext(Class<?>... componentClasses)</code> 생성자의 본문은 세 줄이다. <code>this()</code>, <code>register(componentClasses)</code>, <code>refresh()</code>. 첫 줄의 인자 없는 생성자는 <code>AnnotatedBeanDefinitionReader</code>와 <code>ClassPathBeanDefinitionScanner</code>를 만든다. 앞의 것은 클래스를 받아 빈 정의로 등록하는 도구이고, 뒤의 것은 패키지를 훑어 컴포넌트를 찾는 도구다(05회). 이 세 호출을 직접 나눠 부르면서 그 사이에 정의의 수와 만들어진 싱글톤의 수를 세어 보자.</p>
+<pre data-label="PhaseMain.java"><code class="language-java">package notify;
+
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+
+public class PhaseMain {
+    public static void main(String[] args) {
+        AnnotationConfigApplicationContext ac = new AnnotationConfigApplicationContext();
+        System.out.println("기본 생성자 직후: 정의 " + ac.getBeanDefinitionCount()
+                + ", 싱글톤 " + ac.getBeanFactory().getSingletonCount());
+        ac.register(NotifyConfig.class);
+        System.out.println("register 직후: 정의 " + ac.getBeanDefinitionCount()
+                + ", 싱글톤 " + ac.getBeanFactory().getSingletonCount());
+        ac.refresh();
+        System.out.println("refresh 직후: 정의 " + ac.getBeanDefinitionCount()
+                + ", 싱글톤 " + ac.getBeanFactory().getSingletonCount());
+        ac.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">기본 생성자 직후: 정의 5, 싱글톤 0
+register 직후: 정의 6, 싱글톤 0
+ @Bean notificationService() 호출
+ @Bean templateRepository() 호출
+  [생성] MemoryTemplateRepository
+ @Bean messageSender() 호출
+  [생성] EmailSender
+  [생성] NotificationService
+refresh 직후: 정의 9, 싱글톤 17</code></pre>
+<p>숫자를 하나씩 읽는다. 기본 생성자만 불렀는데 정의가 이미 5개다. 리더가 만들어지면서 애노테이션 처리를 맡는 내부 빈들의 정의를 미리 등록했기 때문이다(무엇인지는 뒤에서 목록으로 본다). <code>register</code>를 부르면 정의가 하나 늘어 6이 된다. 늘어난 하나는 <code>notifyConfig</code>, 곧 설정 클래스 자신이다. 이 시점까지 싱글톤은 0개다. 객체는 하나도 만들어지지 않았고, <code>NotifyConfig</code> 안의 <code>@Bean</code> 메서드 셋도 컨테이너는 아직 모른다.</p>
+<p><code>refresh()</code>가 끝나면 정의는 9개, 싱글톤은 17개가 된다. 정의 3개가 늘었으니 <code>@Bean</code> 메서드 셋이 발견되어 등록된 것이고, 싱글톤이 0에서 17로 늘었으니 객체가 만들어진 것이다. 정의를 더 찾아내는 일과 객체를 만드는 일이 모두 <code>refresh()</code> 안에서 일어난다.</p>
+<p>여기서 이 회차 전체에 걸쳐 쓰일 구분이 나온다. 컨테이너가 다루는 것은 두 종류다. 하나는 빈 정의(bean definition), 곧 "이런 빈을 이렇게 만들라"는 설계도다. 다른 하나는 빈 인스턴스, 곧 그 설계도로 만든 실제 객체다. 위 출력에서 보듯 둘의 개수는 따로 움직인다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>스프링 컨테이너는 설정을 읽어 곧바로 객체를 만들지 않는다. 먼저 모든 설정을 빈 정의라는 한 가지 형태의 설계도로 바꿔 등록하고, 설계도가 다 모인 뒤에 그것을 보고 인스턴스를 만든다. 조회, 중복 오류, 설정 형식의 다양성은 모두 이 두 단계 구조에서 설명된다.</p></aside>
+
+<h3>refresh()를 단계로 읽는다</h3>
+<p><code>refresh()</code>는 <code>AbstractApplicationContext</code>에 있는 메서드이고, 자바 설정용 컨텍스트든 XML용 컨텍스트든 같은 코드를 쓴다. 소스에서 이 메서드가 부르는 메서드를 순서대로 옮기면 다음과 같다. 6.2와 7.0의 소스에서 순서가 같다.</p>
+<figure class="flow-figure"><figcaption>AbstractApplicationContext.refresh()가 부르는 메서드</figcaption><ol class="flow">
+<li><strong>prepareRefresh</strong><span>시작 시각과 활성 플래그를 설정하고 프로퍼티 소스를 초기화한다.</span></li>
+<li><strong>obtainFreshBeanFactory</strong><span>이 컨텍스트가 쓸 내부 빈 팩토리를 얻는다.</span></li>
+<li><strong>prepareBeanFactory</strong><span>빈 팩토리를 컨텍스트에서 쓸 수 있게 준비한다. <code>environment</code> 같은 객체를 싱글톤으로 직접 넣는다.</span></li>
+<li><strong>postProcessBeanFactory</strong><span>하위 클래스가 끼어들 수 있는 자리다.</span></li>
+<li><strong>invokeBeanFactoryPostProcessors</strong><span>빈 팩토리 후처리기를 실행한다. 설정 클래스가 분석되어 <code>@Bean</code> 메서드들이 빈 정의로 등록되는 곳이다.</span></li>
+<li><strong>registerBeanPostProcessors</strong><span>빈 생성에 끼어드는 빈 후처리기들의 인스턴스를 만들어 팩토리에 등록한다.</span></li>
+<li><strong>initMessageSource</strong><span>메시지 소스를 준비한다.</span></li>
+<li><strong>initApplicationEventMulticaster</strong><span>이벤트를 리스너에게 전달할 객체를 준비한다.</span></li>
+<li><strong>onRefresh</strong><span>하위 클래스가 특별한 빈을 초기화하는 자리다.</span></li>
+<li><strong>registerListeners</strong><span>리스너 빈을 찾아 등록한다.</span></li>
+<li><strong>finishBeanFactoryInitialization</strong><span>설정을 동결하고, 지연 초기화가 아닌 싱글톤을 전부 만든다.</span></li>
+<li><strong>finishRefresh</strong><span>생명주기 처리기를 준비하고 <code>ContextRefreshedEvent</code>를 발행한다.</span></li>
+</ol></figure>
+<p>열두 단계를 다 외울 필요는 없다. 5번과 11번, 두 곳만 붙잡으면 된다. 5번에서 빈 정의가 모두 모이고, 11번에서 그 정의로 인스턴스가 만들어진다. 앞 절의 출력에서 정의가 6에서 9로 늘어난 곳이 5번이고, <code>[생성]</code> 줄이 찍힌 곳이 11번이다.</p>
+
+<h4>증거: 싱글톤이 등록된 순서</h4>
+<p>이 순서를 소스를 읽지 않고도 확인할 방법이 있다. 빈 팩토리는 싱글톤의 이름을 등록된 순서대로 기억하고, <code>getSingletonNames()</code>로 그 순서를 돌려준다. 컨테이너를 만든 뒤 이것을 번호와 함께 출력한다.</p>
+<pre><code class="language-java">// main 메서드의 본문만 적었다
+AnnotationConfigApplicationContext ac = new AnnotationConfigApplicationContext(NotifyConfig.class);
+int i = 1;
+for (String name : ac.getBeanFactory().getSingletonNames()) {
+    System.out.println(i++ + " " + name);
+}</code></pre>
+<pre data-label="실행 결과 (생성 로그 6줄 뒤)"><code class="language-text">1 environment
+2 systemProperties
+3 systemEnvironment
+4 applicationStartup
+5 org.springframework.context.annotation.internalConfigurationAnnotationProcessor
+6 org.springframework.context.annotation.ConfigurationClassPostProcessor.importRegistry
+7 org.springframework.context.event.internalEventListenerProcessor
+8 org.springframework.context.event.internalEventListenerFactory
+9 org.springframework.context.annotation.internalAutowiredAnnotationProcessor
+10 org.springframework.context.annotation.internalCommonAnnotationProcessor
+11 messageSource
+12 applicationEventMulticaster
+13 notifyConfig
+14 templateRepository
+15 messageSender
+16 notificationService
+17 lifecycleProcessor</code></pre>
+<p>이 목록이 그대로 <code>refresh()</code>의 시간표다. 1~4번은 3단계(<code>prepareBeanFactory</code>)에서 컨텍스트가 직접 넣은 객체다. 5~8번은 5단계에서 만들어진 빈 팩토리 후처리기와 그 부속이다. 9~10번은 6단계에서 만들어진 빈 후처리기다. 11번과 12번은 7단계와 8단계의 결과다. 13~16번, 우리가 정의한 빈들은 11단계에 와서야 만들어진다. 17번은 12단계(<code>finishRefresh</code>)에서 준비되는 생명주기 처리기다. 14, 15번이 16번보다 앞에 있는 것도 앞 절에서 본 생성 순서와 맞는다.</p>
+
+<h4>5단계: 설정 클래스가 빈 정의로 풀린다</h4>
+<p>5단계의 주인공은 목록 5번의 빈, <code>ConfigurationClassPostProcessor</code>다. 이 클래스는 <code>BeanDefinitionRegistryPostProcessor</code>를 구현한다. 이름 그대로 빈 정의 레지스트리가 준비된 뒤, 일반 빈이 만들어지기 전에 불려서 정의를 더 등록할 수 있는 후처리기다. 우리가 정의한 어떤 빈보다도 먼저 인스턴스가 만들어지는 이유가 여기에 있다.</p>
+<p>이 후처리기는 레지스트리에 이미 들어 있는 정의 가운데 설정 클래스를 찾는다. 지금은 <code>notifyConfig</code> 하나다. 그 클래스의 메타데이터를 분석해 <code>@Bean</code>이 붙은 메서드마다 빈 정의를 하나씩 만들어 등록한다. 빈의 이름은 메서드 이름이다. 이때 메서드를 호출하지는 않는다. 정의에는 "<code>notifyConfig</code> 빈의 <code>notificationService</code> 메서드를 부르면 이 빈이 나온다"는 정보만 들어간다. 이 정보가 실제로 어떤 필드에 담기는지는 <code>BeanDefinition</code>을 다루는 절에서 출력해 본다.</p>
+
+<h4>11단계: 정의 목록을 돌며 getBean을 부른다</h4>
+<p>11단계의 끝에서 빈 팩토리의 <code>preInstantiateSingletons()</code>가 불린다. 이 메서드는 빈 정의의 이름 목록을 복사한 다음 앞에서부터 돌면서, 추상 정의가 아니고 싱글톤이며 지연 초기화가 아닌 빈마다 <code>getBean(이름)</code>을 부른다. 이름 목록은 등록된 순서를 유지하는 리스트이므로, 생성도 기본적으로 등록 순서를 따른다.</p>
+<p>다만 어떤 빈을 만드는 도중에 다른 빈이 필요해지면 그 빈의 생성이 사이에 끼어든다. 실험에서 루프는 <code>notifyConfig</code>를 만들고 이어서 <code>notificationService</code>를 만들려 했다. 그 팩토리 메서드가 실행되는 동안 <code>templateRepository</code>와 <code>messageSender</code>가 먼저 완성되어 싱글톤 저장소에 들어갔다. 나중에 루프가 <code>templateRepository</code>의 차례에 도달했을 때는 저장소에 이미 객체가 있으므로 곧바로 돌아온다.</p>
+<p>단계가 둘로 나뉘어 있어서 얻는 것이 두 가지 있다. 첫째, 정의가 전부 모인 뒤에 인스턴스를 만들기 때문에 설정 클래스에서 메서드를 어떤 순서로 적든 의존관계가 풀린다. 둘째, 인스턴스를 만들기 전에 정의를 읽고 고칠 틈이 생긴다. 빈 팩토리 후처리기(<code>BeanFactoryPostProcessor</code>)가 바로 그 틈에서 일하는 확장 지점이다.</p>
+<aside class="note">자바 설정에서는 객체 생성과 의존관계 연결이 한 문장에서 일어난다. <code>new NotificationService(templateRepository(), messageSender())</code>는 생성자를 부르면서 동시에 의존 객체를 넘긴다. XML이나 컴포넌트 스캔처럼 컨테이너가 직접 생성자를 고르는 방식에서도 생성자 주입이라면 마찬가지로, 컨테이너가 인자로 넣을 빈을 먼저 준비한 뒤 생성자를 한 번 호출한다. 생성 뒤에 따로 일어나는 주입(세터, 필드)은 06회에서 다룬다.</aside>
+
+<x-visual id="spring-core-basic-03-refresh-two-phases" title="refresh가 빈 정의 등록 단계와 인스턴스 생성 단계로 나뉘는 모습" kind="순서도" ratio="16:9">
+<x-hint>설정 클래스가 먼저 빈 정의(설계도)로 바뀌어 한곳에 모이고, 그다음에 정의를 보고 인스턴스가 만들어진다는 두 단계 구조를 한눈에 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 흐르는 깔끔한 순서도. 맨 왼쪽에 문서 모양 아이콘 하나, 라벨 "설정 클래스". 가운데에 넓은 상자, 제목 "1단계: 빈 정의 등록". 그 안에 설계도(청사진) 모양 카드 네 장이 세로로 쌓여 있고 카드마다 라벨 "notifyConfig", "notificationService", "templateRepository", "messageSender". 문서 아이콘에서 가운데 상자로 화살표, 화살표 위 라벨 "분석". 오른쪽에 또 하나의 넓은 상자, 제목 "2단계: 인스턴스 생성". 그 안에 둥근 객체 세 개가 있고, 위쪽 객체에서 아래 두 객체로 참조 화살표가 뻗어 있다. 가운데 상자에서 오른쪽 상자로 굵은 화살표, 화살표 위 라벨 "정의마다 getBean". 두 상자 아래를 가로지르는 긴 괄호 하나, 라벨 "refresh()". 색은 설계도 쪽은 파란 계열, 객체 쪽은 주황 계열로 구분. 흰 배경, 평면 벡터 스타일, 장식 없음.</x-prompt>
+<x-caption>정의가 다 모인 뒤에 인스턴스를 만든다. 두 단계는 모두 refresh() 안에서 일어난다.</x-caption>
+</x-visual>
+
+<p>실패했을 때의 동작도 이 메서드에 적혀 있다. 4단계부터 12단계 사이에서 예외가 나면 <code>refresh()</code>는 이미 만든 싱글톤을 파괴하고, 활성 플래그를 되돌린 다음 예외를 다시 던진다. 빈이 절반만 만들어진 컨테이너가 쓸 수 있는 상태로 남는 일은 없다. 그리고 <code>GenericApplicationContext</code> 계열은 <code>refresh()</code>를 한 번만 허용한다. 두 번째로 부르면 <code>IllegalStateException</code>이 나고, <code>close()</code>한 뒤에 <code>getBean</code>을 불러도 "has been closed already"라는 <code>IllegalStateException</code>이 난다.</p>
+<p>스레드 관점도 짚어 둔다. <code>refresh()</code>는 그것을 부른 스레드에서 실행된다. 6.2의 소스는 시작과 종료를 직렬화하는 락(<code>startupShutdownLock</code>)을 잡은 채 열두 단계를 진행한다. 이 회차의 실험에서 모든 <code>[생성]</code> 줄은 <code>main</code> 스레드가 찍은 것이다. 6.2에는 표시한 빈을 별도 스레드에서 초기화하는 선택 기능이 추가되었지만, 따로 설정하지 않으면 호출 스레드가 차례대로 만든다.</p>
+
+<h3>객체는 실제로 어떻게 만들어지는가: 호출 스택으로 본 경로</h3>
+<p>"컨테이너가 객체를 만든다"는 문장을 호출 스택으로 바꿔 보자. 빈의 생성자 안에서 예외 객체를 만들어 스택 트레이스를 출력하면, 그 생성자에 이르기까지 누가 누구를 불렀는지가 그대로 찍힌다.</p>
+<pre data-label="TraceMain.java"><code class="language-java">package notify;
+
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+public class TraceMain {
+
+    static class Traced {
+        Traced() { new Throwable("여기서 생성됨").printStackTrace(System.out); }
+    }
+
+    @Configuration
+    static class TraceConfig {
+        @Bean
+        Traced traced() { return new Traced(); }
+    }
+
+    public static void main(String[] args) {
+        new AnnotationConfigApplicationContext(TraceConfig.class).close();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (스프링 프레임워크 7.0.10, 일부 프레임 생략)"><code class="language-text">java.lang.Throwable: 여기서 생성됨
+	at notify.TraceMain$Traced.<init>(TraceMain.java:10)
+	at notify.TraceMain$TraceConfig.traced(TraceMain.java:16)
+	at notify.TraceMain$TraceConfig$$SpringCGLIB$$0.CGLIB$traced$0(<generated>)
+	... (CGLIB 내부 3프레임 생략)
+	at notify.TraceMain$TraceConfig$$SpringCGLIB$$0.traced(<generated>)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at org.springframework.beans.factory.support.SimpleInstantiationStrategy.lambda$instantiate$0(SimpleInstantiationStrategy.java:155)
+	... (인스턴스화 전략과 생성자 리졸버 5프레임 생략)
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.createBeanInstance(AbstractAutowireCapableBeanFactory.java:1190)
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.doCreateBean(AbstractAutowireCapableBeanFactory.java:563)
+	at org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.createBean(AbstractAutowireCapableBeanFactory.java:523)
+	at org.springframework.beans.factory.support.AbstractBeanFactory.lambda$doGetBean$0(AbstractBeanFactory.java:333)
+	at org.springframework.beans.factory.support.DefaultSingletonBeanRegistry.getSingleton(DefaultSingletonBeanRegistry.java:371)
+	at org.springframework.beans.factory.support.AbstractBeanFactory.doGetBean(AbstractBeanFactory.java:331)
+	at org.springframework.beans.factory.support.AbstractBeanFactory.getBean(AbstractBeanFactory.java:196)
+	... (2프레임 생략)
+	at org.springframework.beans.factory.support.DefaultListableBeanFactory.preInstantiateSingletons(DefaultListableBeanFactory.java:1121)
+	at org.springframework.context.support.AbstractApplicationContext.finishBeanFactoryInitialization(AbstractApplicationContext.java:994)
+	at org.springframework.context.support.AbstractApplicationContext.refresh(AbstractApplicationContext.java:621)
+	at org.springframework.context.annotation.AnnotationConfigApplicationContext.<init>(AnnotationConfigApplicationContext.java:92)
+	at notify.TraceMain.main(TraceMain.java:20)</code></pre>
+<p>스택은 아래에서 위로 읽는다. <code>main</code>이 컨텍스트의 생성자를 불렀고, 생성자가 <code>refresh</code>를, <code>refresh</code>가 <code>finishBeanFactoryInitialization</code>을, 그것이 <code>preInstantiateSingletons</code>를 불렀다. 앞 절에서 글로 설명한 11단계가 프레임으로 찍혀 있다. 줄 번호는 버전마다 다르지만 메서드의 연쇄는 이 형태다.</p>
+<p>여기서 세 가지를 읽어 낼 수 있다. 첫째, 컨테이너가 빈을 미리 만드는 일도 결국 <code>getBean</code> 호출이다. 우리가 부르는 <code>getBean</code>과 같은 메서드이고, 누가 먼저 부르느냐만 다르다. <code>getSingleton</code>은 저장소에 그 이름의 객체가 없으면 넘겨받은 팩토리(스택의 <code>lambda$doGetBean$0</code>)를 실행해 객체를 만들고 저장소에 넣는다. 다음 호출부터는 저장소에서 꺼내기만 한다.</p>
+<p>둘째, <code>@Bean</code> 메서드는 리플렉션(reflection)으로 호출된다. 리플렉션은 실행 중에 <code>Class</code>, <code>Method</code>, <code>Constructor</code> 같은 객체로 클래스의 구성 요소를 얻어 다루는 자바의 기능이다. 스택 가운데의 <code>java.lang.reflect.Method.invoke</code>가 그것이다. 빈 정의에는 팩토리 메서드의 이름이 문자열로 들어 있고, 컨테이너는 그 이름에 해당하는 <code>Method</code> 객체를 찾아 설정 빈 인스턴스를 대상으로 <code>invoke</code>한다. JDK 21에서 <code>Method.invoke</code>가 내부적으로 <code>DirectMethodHandleAccessor</code>를 거친다는 것도 스택에 보인다. 자바 중급 1편에서 <code>Class</code> 클래스로 처음 만난 실행 중 타입 정보가 프레임워크의 가장 안쪽에서 쓰이고 있다.</p>
+<p>셋째, <code>invoke</code>의 대상은 <code>TraceConfig</code>가 아니라 <code>TraceConfig$$SpringCGLIB$$0</code>이라는 클래스의 <code>traced()</code>다. 이 클래스가 중간에서 호출을 받아 원래 메서드로 넘긴다. 앞에서 <code>templateRepository()</code>가 한 번만 호출된 것과 관계가 있는 장치이고, 04회에서 다룬다.</p>
+<p>클래스를 직접 지정한 빈 정의라면 경로의 끝이 다르다. 팩토리 메서드가 없으므로 컨테이너가 생성자를 골라 <code>BeanUtils.instantiateClass</code>로 호출하고, 그 안에서 <code>Constructor.newInstance</code>가 불린다. 어느 쪽이든 프레임워크의 코드에 우리 클래스를 향한 <code>new</code>가 컴파일되어 들어 있는 것이 아니다. 실행 중에 메서드나 생성자의 메타데이터를 얻어 호출한다. 컨테이너가 처음 보는 클래스의 객체를 만들 수 있는 것은 이 때문이다.</p>
+
+<h4>힙에서 본 컨테이너</h4>
+<p>컨테이너는 JVM 입장에서 특별한 존재가 아니다. 힙에 있는 평범한 객체이고, 필드로 맵과 리스트를 들고 있다. 6.2와 7.0의 소스에서 필드 선언을 확인하면 구조는 다음과 같다.</p>
+<pre class="diagram">main 스레드 스택         힙(heap)
+┌──────────┐
+│ ac ──────┼──▶ AnnotationConfigApplicationContext
+└──────────┘      ├ reader, scanner                 설정을 읽는 도구
+                  └ beanFactory ──▶ DefaultListableBeanFactory
+                        ├ beanDefinitionNames  ArrayList<String>                    이름(등록 순서)
+                        ├ beanDefinitionMap    ConcurrentHashMap<String, BeanDefinition>  설계도
+                        └ singletonObjects     ConcurrentHashMap<String, Object>          완성된 객체
+                                                 │
+        "notificationService" ───────────────────┼──▶ NotificationService
+                                                 │        ├ templates ──▶ (아래 객체와 같은 객체)
+                                                 │        └ sender    ──▶ (아래 객체와 같은 객체)
+        "templateRepository"  ───────────────────┼──▶ MemoryTemplateRepository
+        "messageSender"       ───────────────────┴──▶ EmailSender</pre>
+<p><code>singletonObjects</code>는 <code>DefaultListableBeanFactory</code>가 상위 클래스 <code>DefaultSingletonBeanRegistry</code>에서 물려받은 필드다. 빈 이름을 키로, 완성된 객체를 값으로 가진다. <code>beanDefinitionMap</code>은 같은 이름을 키로 설계도를 가진다. 이름 하나에 설계도 하나와 객체 하나가 대응하는 구조다.</p>
+<p>이 그림에서 두 가지를 읽을 수 있다. 빈은 맵이 참조하고 있으므로, 컨테이너 객체에 도달할 수 있는 동안은 가비지 컬렉션의 대상이 되지 않는다. 그리고 <code>NotificationService</code>의 필드가 가리키는 객체와 맵이 <code>"templateRepository"</code>라는 이름으로 가리키는 객체는 같은 객체다. 빈을 주입한다는 것은 객체를 복사해 넣는 것이 아니라 같은 객체의 참조를 필드에 넣는 일이다.</p>
+
+<x-visual id="spring-core-basic-03-container-heap" title="힙에 놓인 스프링 컨테이너와 그 안의 두 저장소" kind="메모리 구조도" ratio="16:9">
+<x-hint>컨테이너가 힙의 평범한 객체이며, 이름으로 설계도를 찾는 맵과 이름으로 완성된 객체를 찾는 맵을 따로 가진다는 것을 보여 준다.</x-hint>
+<x-prompt>메모리 구조도. 왼쪽에 좁은 세로 상자, 제목 "스택", 그 안에 칸 하나, 라벨 "ac". 오른쪽에 큰 영역, 제목 "힙". 힙 안 위쪽에 상자 하나, 라벨 "ApplicationContext". 스택의 "ac" 칸에서 이 상자로 화살표. 그 상자에서 아래의 더 큰 상자로 화살표, 큰 상자의 라벨 "DefaultListableBeanFactory". 큰 상자 안에 표 모양 두 개가 나란히 있다. 왼쪽 표 제목 "빈 정의 맵", 행 세 개에 "notificationService", "templateRepository", "messageSender"가 적혀 있고 각 행 오른쪽에 작은 설계도 아이콘. 오른쪽 표 제목 "싱글톤 저장소", 같은 세 이름이 적힌 행 세 개, 각 행에서 힙의 오른쪽 아래에 있는 둥근 객체 세 개로 화살표. 맨 위 객체에서 나머지 두 객체로 점선 화살표 두 개, 라벨 "참조". 흰 배경, 평면 벡터 스타일, 설계도는 파란색, 객체는 주황색.</x-prompt>
+<x-caption>이름 하나에 설계도 하나와 객체 하나가 대응한다. 주입된 필드와 저장소는 같은 객체를 가리킨다.</x-caption>
+</x-visual>
+
+<h3>컨테이너에 등록된 모든 빈 조회</h3>
+<p>컨테이너에 무엇이 들어 있는지 전부 꺼내 보자. <code>getBeanDefinitionNames()</code>는 등록된 빈 정의의 이름을 배열로 돌려준다. 이름마다 정의를 얻어 역할(role) 값을 찍고, 인스턴스의 클래스 이름도 함께 찍는다. 이어서 정의의 수와 싱글톤의 수를 비교하고, 정의 없이 들어 있는 싱글톤을 골라낸다.</p>
+<pre data-label="ListMain.java"><code class="language-java">package notify;
+
+import org.springframework.beans.factory.config.BeanDefinition;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+
+public class ListMain {
+    public static void main(String[] args) {
+        AnnotationConfigApplicationContext ac = new AnnotationConfigApplicationContext(NotifyConfig.class);
+        for (String name : ac.getBeanDefinitionNames()) {
+            BeanDefinition bd = ac.getBeanDefinition(name);
+            Object bean = ac.getBean(name);
+            System.out.println("role=" + bd.getRole() + " " + name + " -> " + bean.getClass().getSimpleName());
+        }
+        System.out.println("정의 수 = " + ac.getBeanDefinitionCount());
+        System.out.println("싱글톤 수 = " + ac.getBeanFactory().getSingletonCount());
+        for (String name : ac.getBeanFactory().getSingletonNames()) {
+            if (!ac.containsBeanDefinition(name)) {
+                System.out.println("정의 없는 싱글톤: " + name);
+            }
+        }
+        ac.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (생성 로그 6줄 뒤)"><code class="language-text">role=2 org.springframework.context.annotation.internalConfigurationAnnotationProcessor -> ConfigurationClassPostProcessor
+role=2 org.springframework.context.annotation.internalAutowiredAnnotationProcessor -> AutowiredAnnotationBeanPostProcessor
+role=2 org.springframework.context.annotation.internalCommonAnnotationProcessor -> CommonAnnotationBeanPostProcessor
+role=2 org.springframework.context.event.internalEventListenerProcessor -> EventListenerMethodProcessor
+role=2 org.springframework.context.event.internalEventListenerFactory -> DefaultEventListenerFactory
+role=0 notifyConfig -> NotifyConfig$$SpringCGLIB$$0
+role=0 notificationService -> NotificationService
+role=0 templateRepository -> MemoryTemplateRepository
+role=0 messageSender -> EmailSender
+정의 수 = 9
+싱글톤 수 = 17
+정의 없는 싱글톤: environment
+정의 없는 싱글톤: systemProperties
+정의 없는 싱글톤: systemEnvironment
+정의 없는 싱글톤: applicationStartup
+정의 없는 싱글톤: org.springframework.context.annotation.ConfigurationClassPostProcessor.importRegistry
+정의 없는 싱글톤: messageSource
+정의 없는 싱글톤: applicationEventMulticaster
+정의 없는 싱글톤: lifecycleProcessor</code></pre>
+<p>정의는 9개인데 우리가 적은 것은 아래 4개뿐이다. 설정 클래스 자신도 빈이라는 점을 먼저 확인해 두자. <code>notifyConfig</code>라는 이름으로 등록되어 있고, 인스턴스의 클래스 이름 뒤에 <code>$$SpringCGLIB$$0</code>이 붙어 있다. 스택 트레이스에서 본 그 클래스다.</p>
+
+<h4>역할 값과 내부 빈</h4>
+<p><code>BeanDefinition</code>에는 역할을 나타내는 정수 힌트가 있다. Javadoc의 설명을 옮기면 <code>ROLE_APPLICATION</code>(0)은 애플리케이션의 주요 부분으로 보통 사용자가 정의한 빈이고, <code>ROLE_SUPPORT</code>(1)는 더 큰 설정의 보조 부분이며, <code>ROLE_INFRASTRUCTURE</code>(2)는 최종 사용자와 무관하게 전적으로 뒤에서 일하는 빈이다. 내가 등록한 빈만 보고 싶으면 <code>bd.getRole() == BeanDefinition.ROLE_APPLICATION</code>인 것만 고르면 된다.</p>
+<p>역할 값이 2인 다섯 개는 리더가 만들어질 때 등록된 내부 빈이다. 기본 생성자 직후에 정의가 이미 5개였던 이유가 이것이다. 각각이 하는 일은 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>빈 이름의 끝부분</th><th>클래스</th><th>맡은 일</th></tr></thead><tbody>
+<tr><td>internalConfigurationAnnotationProcessor</td><td><code>ConfigurationClassPostProcessor</code></td><td><code>@Configuration</code> 클래스를 분석해 <code>@Bean</code> 메서드 등을 빈 정의로 등록한다</td></tr>
+<tr><td>internalAutowiredAnnotationProcessor</td><td><code>AutowiredAnnotationBeanPostProcessor</code></td><td><code>@Autowired</code>, <code>@Value</code>가 붙은 곳에 의존관계와 값을 넣는다</td></tr>
+<tr><td>internalCommonAnnotationProcessor</td><td><code>CommonAnnotationBeanPostProcessor</code></td><td><code>@PostConstruct</code>, <code>@PreDestroy</code>, <code>@Resource</code>를 처리한다</td></tr>
+<tr><td>internalEventListenerProcessor</td><td><code>EventListenerMethodProcessor</code></td><td><code>@EventListener</code> 메서드를 이벤트 리스너로 등록한다</td></tr>
+<tr><td>internalEventListenerFactory</td><td><code>DefaultEventListenerFactory</code></td><td>위 처리기가 리스너 객체를 만들 때 쓰는 기본 팩토리다</td></tr>
+</tbody></table></div>
+<p>이 표가 말해 주는 것은 애노테이션이 스스로 동작하지 않는다는 사실이다. 애노테이션은 클래스 파일에 기록된 메타데이터일 뿐이고, 그것을 읽어 일을 하는 코드가 따로 있어야 한다. 스프링에서는 그 코드가 빈으로 등록되어 있다. 컨테이너의 기능 상당 부분이 컨테이너 자신이 관리하는 빈으로 구현되어 있는 셈이다. 이 점은 뒤에서 <code>BeanFactory</code>와 <code>ApplicationContext</code>를 비교할 때 결정적인 차이로 다시 나온다.</p>
+<aside class="note">내부 빈의 수는 클래스패스에 따라 달라진다. 7.0.10의 소스를 보면 <code>CommonAnnotationBeanPostProcessor</code>는 <code>jakarta.annotation.PostConstruct</code> 클래스가 클래스패스에 있을 때만 등록되고, JPA API와 스프링의 ORM 모듈이 함께 있으면 영속성 애노테이션 처리기가 하나 더 등록된다. jakarta.annotation-api를 뺀 클래스패스에서 같은 프로그램을 돌리면 내부 빈은 4개, 정의는 8개가 나온다.</aside>
+
+<h4>정의 없이 들어온 싱글톤</h4>
+<p>정의는 9개인데 싱글톤은 17개다. 차이 나는 8개가 "정의 없는 싱글톤"으로 찍힌 것들이다. 이들은 컨테이너가 <code>refresh()</code> 도중에 이미 만들어진 객체를 <code>registerSingleton(이름, 객체)</code>로 저장소에 직접 넣은 것이다. 만드는 방법을 설명할 필요가 없으니 설계도가 없다. 앞에서 본 싱글톤 등록 순서의 1~4번, 6번, 11번, 12번, 17번이 여기에 해당한다.</p>
+<p>그래서 조회 방법에 따라 보이는 범위가 다르다. <code>getBeanDefinitionNames()</code>는 설계도의 이름만 돌려주므로 <code>environment</code>는 나오지 않는다. 하지만 <code>getBean("environment")</code>는 성공한다. 이름 조회는 싱글톤 저장소를 보기 때문이다. <code>containsBeanDefinition("environment")</code>는 <code>false</code>이고 <code>containsBean("environment")</code>는 <code>true</code>다. 타입으로 조회할 때도 이 객체들은 후보에 들어간다. 뒤에서 <code>Object</code> 타입으로 전부 조회하면 정의의 수보다 많은 결과가 나오는 것을 볼 것이다.</p>
+<p>레퍼런스 문서도 이 두 가지 등록 경로를 언급한다. <code>DefaultListableBeanFactory</code>가 <code>registerSingleton(..)</code>과 <code>registerBeanDefinition(..)</code>을 지원하지만, 일반적인 애플리케이션은 빈 정의 메타데이터로 정의된 빈만 다룬다고 적는다. 우리가 쓰는 경로는 설계도를 등록하는 쪽이고, 완성품을 직접 넣는 쪽은 주로 프레임워크가 쓴다.</p>
+
+<h4>빈 이름은 어디서 오는가</h4>
+<p><code>@Bean</code> 메서드로 등록한 빈의 이름은 기본적으로 메서드 이름이다. <code>@Bean(name = "...")</code>으로 바꿀 수 있다. <code>register()</code>로 넘긴 클래스의 이름은 단순 클래스 이름의 첫 글자를 소문자로 바꾼 것이다. <code>NotifyConfig</code>가 <code>notifyConfig</code>가 된 것이 그 결과다. 레퍼런스는 이 규칙이 <code>java.beans.Introspector.decapitalize</code>와 같다고 설명한다. 따라서 첫 두 글자가 모두 대문자인 이름은 바뀌지 않는다. <code>Introspector.decapitalize("SMSSender")</code>를 실행하면 <code>SMSSender</code>가 그대로 나온다.</p>
+<p>이름은 <code>beanDefinitionMap</code>과 <code>singletonObjects</code>의 키다. 그러므로 이름 하나는 컨테이너 안에서 빈 하나만 가리킨다. 같은 이름이 두 번 등록되려 할 때의 처리는 컴포넌트 스캔과 함께 05회에서 다룬다.</p>
+
+<h3>스프링 빈 조회 - 기본: 이름으로 찾기와 타입으로 찾기</h3>
+<p>빈을 꺼내는 기본 메서드는 <code>getBean</code>이고, 인자의 조합이 세 가지다. 이름만 주는 것, 이름과 타입을 함께 주는 것, 타입만 주는 것. 같은 빈을 네 가지 방법으로 꺼내 같은 객체인지 비교하고, 실패하는 조회 세 가지의 예외도 함께 본다.</p>
+<pre data-label="LookupMain.java"><code class="language-java">package notify;
+
+import org.springframework.beans.BeansException;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+
+public class LookupMain {
+    public static void main(String[] args) {
+        AnnotationConfigApplicationContext ac = new AnnotationConfigApplicationContext(NotifyConfig.class);
+
+        Object byName = ac.getBean("templateRepository");
+        TemplateRepository byNameAndType = ac.getBean("templateRepository", TemplateRepository.class);
+        TemplateRepository byType = ac.getBean(TemplateRepository.class);
+        MemoryTemplateRepository byImplType = ac.getBean(MemoryTemplateRepository.class);
+        System.out.println(byName == byNameAndType);
+        System.out.println(byNameAndType == byType);
+        System.out.println(byType == byImplType);
+        System.out.println(ac.getType("templateRepository"));
+
+        show(() -> ac.getBean("nope"));
+        show(() -> ac.getBean(SmsSender.class));
+        show(() -> ac.getBean("templateRepository", MessageSender.class));
+        ac.close();
+    }
+
+    static void show(Runnable lookup) {
+        try {
+            lookup.run();
+        } catch (BeansException e) {
+            System.out.println(e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (생성 로그 6줄 뒤)"><code class="language-text">true
+true
+true
+class notify.MemoryTemplateRepository
+NoSuchBeanDefinitionException: No bean named 'nope' available
+NoSuchBeanDefinitionException: No qualifying bean of type 'notify.SmsSender' available
+BeanNotOfRequiredTypeException: Bean named 'templateRepository' is expected to be of type 'notify.MessageSender' but was actually of type 'notify.MemoryTemplateRepository'</code></pre>
+<p>네 가지 방법이 모두 같은 객체를 돌려주었다. 결과는 같지만, 컨테이너 안에서 일어나는 일은 이름 조회와 타입 조회가 전혀 다르다.</p>
+
+<h4>이름 조회: 해시 맵에서 한 번 꺼낸다</h4>
+<p><code>ac.getBean("templateRepository")</code>의 경로를 따라가 보자. <code>AbstractApplicationContext.getBean(String)</code>의 본문은 두 줄이다. 컨텍스트가 활성 상태인지 확인하고, <code>getBeanFactory().getBean(name)</code>으로 넘긴다. 빈 팩토리는 이름을 정리한 다음(별칭이면 원래 이름으로 바꾼다) 싱글톤 저장소에서 그 이름을 찾는다. 소스의 해당 줄은 <code>this.singletonObjects.get(beanName)</code>이고, 그 위에는 전체 싱글톤 락 없이 기존 인스턴스를 빠르게 확인한다는 주석이 달려 있다.</p>
+<p><code>singletonObjects</code>는 <code>ConcurrentHashMap</code>이다. 따라서 이미 만들어진 싱글톤의 이름 조회는 해시 맵 조회 한 번이고, 빈이 몇 개 등록되어 있든 비용이 거의 같다. 락을 잡지 않으므로 여러 요청 스레드가 동시에 <code>getBean</code>을 불러도 서로를 기다리게 하지 않는다. 스프링 입문 권에서 리포지토리의 저장소로 썼던 바로 그 자료구조가 컨테이너의 한가운데에 있다.</p>
+<p>이름만 주는 <code>getBean(String)</code>의 반환 타입은 <code>Object</code>다. 호출하는 쪽이 캐스팅해야 하고, 틀리면 <code>ClassCastException</code>이 호출 지점에서 난다. 타입을 함께 주는 <code><T> T getBean(String name, Class<T> requiredType)</code>은 <code>Class</code> 객체를 타입 정보로 받아 컨테이너가 대신 검사한다. 꺼낸 객체가 <code>requiredType.isInstance(bean)</code>을 통과하지 못하면 <code>BeanNotOfRequiredTypeException</code>을 던진다. 출력의 마지막 줄이 그 예외이고, 메시지에 기대한 타입과 실제 타입이 모두 적혀 있다. 제네릭의 타입 인자는 실행 중에 남지 않으므로(자바 중급 2편의 타입 소거) 실행 중에 검사하려면 이렇게 <code>Class</code> 객체를 값으로 넘겨야 한다.</p>
+
+<h4>타입 조회: 정의 목록을 훑는다</h4>
+<p><code>ac.getBean(TemplateRepository.class)</code>에는 이름이 없다. 빈 팩토리는 먼저 그 타입에 맞는 빈의 이름을 구해야 한다. 이 일을 하는 <code>doGetBeanNamesForType</code>은 <code>beanDefinitionNames</code> 리스트를 처음부터 끝까지 돌면서 이름마다 "이 빈은 요청한 타입에 맞는가"를 검사한다. 그다음 정의 없이 등록된 싱글톤의 이름도 같은 방식으로 검사한다. 후보 이름이 하나면 그 이름으로 빈을 꺼내고, 하나도 없으면 <code>NoSuchBeanDefinitionException</code>을 던진다. 둘 이상인 경우는 뒤의 절에서 다룬다.</p>
+<p>이름 조회가 맵 조회 한 번이었던 것과 달리 타입 조회는 선형 탐색이다. 빈이 수백 개면 수백 번의 타입 검사가 필요하다. 그래서 빈 팩토리는 결과를 캐시한다. <code>refresh()</code>의 11단계에서 설정이 동결된 뒤에는, 타입별 조회 결과를 <code>Class</code> 객체를 키로 하는 맵(<code>allBeanNamesByType</code>, <code>singletonBeanNamesByType</code>)에 넣어 둔다. 같은 타입을 다시 조회하면 이 맵에서 이름 배열을 바로 꺼낸다. 새 싱글톤이 저장소에 추가되면, 그 객체가 속하는 타입의 캐시 항목은 지워진다.</p>
+<p>타입이 맞는지는 어떻게 검사할까. 이미 만들어진 싱글톤이라면 빈 팩토리는 저장소에서 인스턴스를 꺼내 요청한 타입의 인스턴스인지 확인한다. 자바의 <code>instanceof</code>와 같은 판정이다. 그래서 <code>@Bean</code> 메서드의 반환 타입을 <code>TemplateRepository</code>로 선언했는데도 <code>getBean(MemoryTemplateRepository.class)</code>가 성공했다. 기준은 선언이 아니라 만들어진 객체의 실제 클래스다. <code>getType("templateRepository")</code>가 인터페이스가 아니라 <code>class notify.MemoryTemplateRepository</code>를 돌려준 것도 같은 이유다.</p>
+<p>성공한다고 해서 그렇게 써도 된다는 뜻은 아니다. 구현 타입으로 조회하거나 주입받는 코드는 구현 클래스에 의존한다. 01회와 02회에서 구현을 바꿀 때 사용하는 쪽 코드가 함께 바뀌던 그 문제가 조회 코드에서 되살아난다. 조회와 주입은 역할 타입으로 한다.</p>
+<div class="table-wrap"><table><thead><tr><th>상황</th><th>예외</th><th>메시지에 담기는 정보</th></tr></thead><tbody>
+<tr><td>그 이름의 빈이 없다</td><td><code>NoSuchBeanDefinitionException</code></td><td>찾은 이름</td></tr>
+<tr><td>그 타입의 빈이 없다</td><td><code>NoSuchBeanDefinitionException</code></td><td>찾은 타입</td></tr>
+<tr><td>이름은 있는데 타입이 다르다</td><td><code>BeanNotOfRequiredTypeException</code></td><td>이름, 기대한 타입, 실제 타입</td></tr>
+<tr><td>그 타입의 빈이 둘 이상이다</td><td><code>NoUniqueBeanDefinitionException</code></td><td>찾은 타입, 후보의 수와 이름</td></tr>
+</tbody></table></div>
+
+<h3>타입 예측: 아직 만들어지지 않은 빈의 타입은 어떻게 아는가</h3>
+<p>앞 절에서 타입 검사는 인스턴스의 실제 클래스를 본다고 했다. 그러면 인스턴스가 아직 없는 빈은 어떻게 될까. 지연 초기화(lazy initialization)로 표시한 빈으로 실험한다. <code>@Lazy</code>가 붙은 빈은 <code>preInstantiateSingletons()</code>가 건너뛰므로, 컨테이너 생성이 끝난 뒤에도 인스턴스가 없다.</p>
+<pre data-label="LazyConfig.java / LazyMain.java"><code class="language-java">// 두 파일을 이어 적었다. package와 import 문은 생략
+@Configuration
+public class LazyConfig {
+
+    @Bean
+    @Lazy
+    public TemplateRepository templateRepository() {
+        return new MemoryTemplateRepository();
+    }
+}
+
+public class LazyMain {
+    public static void main(String[] args) {
+        AnnotationConfigApplicationContext ac = new AnnotationConfigApplicationContext(LazyConfig.class);
+        System.out.println("컨테이너 생성 끝");
+        System.out.println(ac.getType("templateRepository"));
+        try {
+            ac.getBean(MemoryTemplateRepository.class);
+        } catch (NoSuchBeanDefinitionException e) {
+            System.out.println(e.getMessage());
+        }
+        ac.getBean(TemplateRepository.class);
+        System.out.println(ac.getType("templateRepository"));
+        System.out.println(ac.getBean(MemoryTemplateRepository.class).getClass().getSimpleName());
+        ac.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">컨테이너 생성 끝
+interface notify.TemplateRepository
+No qualifying bean of type 'notify.MemoryTemplateRepository' available
+  [생성] MemoryTemplateRepository
+class notify.MemoryTemplateRepository
+MemoryTemplateRepository</code></pre>
+<p>같은 <code>getBean(MemoryTemplateRepository.class)</code>가 한 번은 실패하고 한 번은 성공했다. 한 줄씩 따라가 보자. 컨테이너 생성이 끝났을 때 <code>[생성]</code> 줄이 없으니 인스턴스는 없다. 이때 <code>getType</code>은 <code>interface notify.TemplateRepository</code>를 돌려준다. 컨테이너가 아는 타입 정보가 빈 정의에 적힌 팩토리 메서드의 선언 반환 타입뿐이기 때문이다. 메서드 본문이 무엇을 <code>new</code>하는지는 실행해 보기 전에는 알 수 없고, 컨테이너는 본문을 분석하지 않는다.</p>
+<p>그래서 구현 타입으로 조회하면 후보가 없다. <code>TemplateRepository</code>는 <code>MemoryTemplateRepository</code>의 하위 타입이 아니므로, 예측된 타입으로는 요청을 만족시킬 수 없다. 이어서 인터페이스 타입으로 조회하면 후보가 하나 나오고, 그 순간 인스턴스가 만들어진다. 이제 저장소에 실제 객체가 있으므로 <code>getType</code>은 실제 클래스를 돌려주고, 구현 타입 조회도 성공한다. 첫 조회 때 비어 있던 캐시 항목은 싱글톤이 추가되면서 지워졌기 때문에 두 번째 조회는 다시 계산된 결과를 받는다.</p>
+<p>레퍼런스 문서는 이 동작을 직접 설명한다. <code>@Bean</code> 메서드를 인터페이스 반환 타입으로 선언하면 사전 타입 예측이 그 인터페이스로 제한되고, 전체 타입은 해당 싱글톤이 인스턴스화된 뒤에야 컨테이너에 알려진다고 한다. 지연 초기화가 아닌 싱글톤도 선언 순서대로 만들어지므로, 다른 컴포넌트가 선언되지 않은 타입으로 매칭을 시도하는 시점에 따라 결과가 달라질 수 있다고 덧붙인다. 그래서 여러 인터페이스를 구현하는 컴포넌트나 구현 타입으로 참조될 가능성이 있는 컴포넌트는 가능한 한 구체적인 반환 타입을 선언하는 편이 안전하다고 권한다.</p>
+<p>반대 방향의 실험도 해 보았다. 위 설정에서 메서드의 반환 타입만 <code>MemoryTemplateRepository</code>로 바꾸면, 컨테이너 생성 직후의 <code>getType</code>이 <code>class notify.MemoryTemplateRepository</code>를 돌려주고 첫 번째 구현 타입 조회가 바로 성공한다. 인터페이스 타입 조회도 같은 객체를 돌려준다. 선언 반환 타입이 구체적일수록 컨테이너가 미리 아는 것이 많아진다.</p>
+<p>정리하면 판단 기준은 둘이다. 그 빈을 참조하는 모든 곳이 일관되게 역할 인터페이스만 쓴다면 반환 타입을 인터페이스로 선언해도 문제가 없다. 구현 타입이나 그 빈이 구현한 다른 인터페이스로 참조하는 곳이 하나라도 있다면 반환 타입을 구체 클래스로 선언해야 시점에 따라 결과가 달라지는 일을 피할 수 있다.</p>
+
+<h3>스프링 빈 조회 - 동일한 타입이 둘 이상</h3>
+<p>역할 하나에 구현이 둘 등록되어 있으면 타입 조회는 어떻게 될까. 발송기 두 개를 모두 빈으로 등록하는 설정을 만든다. 두 메서드 모두 반환 타입은 역할 인터페이스 <code>MessageSender</code>다.</p>
+<pre data-label="SenderConfig.java / DuplicateMain.java"><code class="language-java">// 두 파일을 이어 적었다. package와 import 문은 생략
+@Configuration
+public class SenderConfig {
+
+    @Bean
+    public MessageSender emailSender() {
+        return new EmailSender();
+    }
+
+    @Bean
+    public MessageSender smsSender() {
+        return new SmsSender();
+    }
+}
+
+public class DuplicateMain {
+    public static void main(String[] args) {
+        AnnotationConfigApplicationContext ac = new AnnotationConfigApplicationContext(SenderConfig.class);
+
+        try {
+            ac.getBean(MessageSender.class);
+        } catch (NoUniqueBeanDefinitionException e) {
+            System.out.println(e.getMessage());
+            System.out.println(e.getNumberOfBeansFound() + " " + e.getBeanNamesFound());
+        }
+
+        MessageSender sms = ac.getBean("smsSender", MessageSender.class);
+        System.out.println(sms.getClass().getSimpleName());
+
+        System.out.println(Arrays.toString(ac.getBeanNamesForType(MessageSender.class)));
+        Map<String, MessageSender> senders = ac.getBeansOfType(MessageSender.class);
+        senders.forEach((name, bean) -> System.out.println(name + " = " + bean.getClass().getSimpleName()));
+
+        System.out.println(ac.getBean(SmsSender.class) == sms);
+        System.out.println(ac.getBeansOfType(Object.class).size());
+        ac.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (생성 로그 2줄 뒤)"><code class="language-text">No qualifying bean of type 'notify.MessageSender' available: expected single matching bean but found 2: emailSender,smsSender
+2 [emailSender, smsSender]
+SmsSender
+[emailSender, smsSender]
+emailSender = EmailSender
+smsSender = SmsSender
+true
+16</code></pre>
+<p><code>getBean(MessageSender.class)</code>는 <code>NoUniqueBeanDefinitionException</code>으로 실패했다. 메시지를 읽으면 원인과 해결의 실마리가 다 들어 있다. 하나를 기대했는데 둘을 찾았고, 그 둘의 이름이 <code>emailSender</code>와 <code>smsSender</code>다. 예외 객체에서 <code>getNumberOfBeansFound()</code>와 <code>getBeanNamesFound()</code>로 같은 정보를 꺼낼 수도 있다.</p>
+<p>컨테이너가 아무거나 하나를 고르지 않고 실패하는 쪽을 택한 데에는 이유가 있다. "등록 순서로 첫 번째"를 돌려주는 규칙이었다고 해 보자. 누군가 설정 클래스에서 메서드의 순서를 바꾸거나 발송기를 하나 추가하는 순간, 오류 없이 다른 발송기가 선택된다. 이메일로 나가야 할 알림이 문자로 나가는 문제를 운영 중에 발견하게 된다. 실패는 시끄럽지만 시작 시점에 드러나고, 메시지가 후보를 알려 준다.</p>
+<p>이 예외의 상위 클래스는 <code>NoSuchBeanDefinitionException</code>이다. 그러므로 <code>catch (NoSuchBeanDefinitionException e)</code>는 빈이 없는 경우와 빈이 너무 많은 경우를 함께 잡는다. 두 경우를 구분해야 한다면 하위 타입을 먼저 잡아야 한다.</p>
+
+<h4>조회하는 쪽에서 할 수 있는 일</h4>
+<p>해결 방법은 무엇을 원하느냐에 따라 갈린다. 특정한 하나가 필요하면 이름을 함께 준다. <code>getBean("smsSender", MessageSender.class)</code>는 이름으로 저장소에서 꺼낸 뒤 타입만 확인하므로 후보가 여럿이라는 문제가 생기지 않는다. 이름은 컨테이너 안에서 유일하기 때문이다.</p>
+<p>전부가 필요하면 <code>getBeansOfType</code>을 쓴다. 빈 이름을 키로, 인스턴스를 값으로 하는 <code>Map</code>이 돌아온다. 이 실행에서 순서는 빈 정의가 등록된 순서와 같았다. 이름만 필요하면 <code>getBeanNamesForType</code>이 이름 배열을 돌려준다. 발송 채널을 설정값으로 고르거나, 모든 발송기에 같은 메시지를 보내는 식의 코드가 이 조회 위에서 만들어진다.</p>
+<p>빈 팩토리는 예외를 던지기 전에 몇 가지를 더 시도한다. 소스를 보면 후보가 여럿일 때 우선(primary)으로 표시된 후보를 찾고, 없으면 우선순위가 가장 높은 후보를 찾는다. 그래도 하나로 정해지지 않으면 예외다. 이 실험의 두 빈에는 그런 표시가 없으므로 곧바로 예외가 났다. 빈에 우선 표시나 한정자를 붙여 주입 대상을 정하는 방법은 의존관계 자동 주입을 다루는 06회의 몫이다.</p>
+
+<h3>스프링 빈 조회 - 상속 관계</h3>
+<p>규칙은 한 줄이다. 부모 타입으로 조회하면 자식 타입의 빈이 모두 후보가 된다. 앞 절의 실험이 이미 그 규칙을 보여 주었다. <code>MessageSender</code>로 조회했더니 그것을 구현한 <code>EmailSender</code>와 <code>SmsSender</code>의 빈이 둘 다 걸렸다.</p>
+<p>이유는 타입 검사가 <code>instanceof</code> 판정이기 때문이다. 자바에서 <code>SmsSender</code>의 인스턴스는 <code>SmsSender</code>이면서 <code>MessageSender</code>이고 <code>Object</code>다. 타입 계층의 어느 지점에서 물어도 "맞다"고 답한다. 컨테이너는 이름 목록을 돌며 이 질문을 빈마다 던질 뿐이다. 자바 기본편에서 배운 "부모 타입의 변수는 자식 인스턴스를 참조할 수 있다"는 규칙을, 저장소 검색에 그대로 적용한 것이다.</p>
+<pre class="diagram">                      Object
+                        │
+                 MessageSender (인터페이스)
+                  ┌─────┴─────┐
+            EmailSender     SmsSender
+           "emailSender"   "smsSender"        ← 따옴표 안은 빈 이름
+
+  조회 타입              후보                        getBean(타입)의 결과
+  SmsSender.class        smsSender                   성공
+  EmailSender.class      emailSender                 성공
+  MessageSender.class    emailSender, smsSender      NoUniqueBeanDefinitionException
+  Object.class           컨테이너에 든 모든 빈       NoUniqueBeanDefinitionException</pre>
+<p>표의 첫 두 줄처럼 자식 타입으로 조회하면 후보가 하나로 줄어든다. 실험의 <code>ac.getBean(SmsSender.class) == sms</code>가 <code>true</code>였다. 이름으로 꺼낸 것과 같은 객체다. 다만 앞에서 말했듯 구현 타입으로 조회하는 코드는 구현에 묶인다.</p>
+<p>맨 아래 줄이 흥미롭다. 모든 객체는 <code>Object</code>의 인스턴스이므로 <code>Object</code> 타입으로 조회하면 컨테이너에 든 빈이 전부 나온다. 실험에서 <code>getBeansOfType(Object.class).size()</code>는 16이었다. 이 컨테이너의 빈 정의는 8개다(내부 빈 5개, <code>senderConfig</code>, 발송기 2개). 나머지 8개는 앞에서 본 정의 없는 싱글톤이다. 타입 조회가 정의 목록에 이어 직접 등록된 싱글톤도 훑는다는 것을 숫자로 확인한 셈이다.</p>
+<p>"상속 관계"라고 부르지만 <code>extends</code>만 뜻하지 않는다. 이 예제의 관계는 전부 <code>implements</code>다. 클래스 상속이든 인터페이스 구현이든, 자바의 하위 타입 관계 전체가 타입 조회의 기준이다. 인터페이스를 여러 개 구현한 빈은 그 인터페이스 각각으로 조회될 수 있다.</p>
+<p>설계 쪽에서 보면 이 절과 앞 절은 같은 이야기의 두 면이다. 역할 인터페이스 아래에 구현이 하나뿐일 때는 타입만으로 빈이 정해진다. 구현을 추가하는 순간, 곧 확장에 열려 있다는 장점을 실제로 쓰는 순간, 타입만으로는 고를 수 없게 된다. 어느 구현을 쓸지에 대한 정보가 타입 바깥의 어딘가(이름, 우선 표시, 한정자)에 있어야 한다.</p>
+
+<x-visual id="spring-core-basic-03-type-lookup-tree" title="타입 계층의 어느 지점에서 조회하느냐에 따라 달라지는 후보 빈" kind="계층도" ratio="4:3">
+<x-hint>부모 타입으로 조회하면 그 아래의 모든 빈이 후보가 되고, 자식 타입으로 조회하면 하나로 좁혀진다는 것을 타입 트리 위에 표시한다.</x-hint>
+<x-prompt>위에서 아래로 뻗는 트리 다이어그램. 맨 위 노드 라벨 "Object". 그 아래 노드 라벨 "MessageSender". 그 아래로 가지가 둘로 갈라져 왼쪽 노드 "EmailSender", 오른쪽 노드 "SmsSender". 맨 아래 두 노드 밑에는 각각 둥근 객체 아이콘이 하나씩 달려 있고 라벨 "emailSender", "smsSender". 트리 오른쪽에 돋보기 아이콘 세 개가 세로로 놓여 각각 다른 높이의 노드를 가리킨다. 맨 위 돋보기는 "Object" 노드를 가리키고 옆에 라벨 "모든 빈". 가운데 돋보기는 "MessageSender" 노드를 가리키고 옆에 라벨 "후보 2개". 아래 돋보기는 "SmsSender" 노드를 가리키고 옆에 라벨 "후보 1개". 각 돋보기가 가리키는 노드 아래의 영역이 옅은 색으로 칠해져 범위를 나타낸다. 흰 배경, 평면 벡터 스타일.</x-prompt>
+<x-caption>조회하는 타입이 트리의 위쪽일수록 후보가 늘어난다. Object로 조회하면 전부다.</x-caption>
+</x-visual>
+
+<h3>BeanFactory와 ApplicationContext</h3>
+<p>지금까지 "컨테이너"라고 뭉뚱그려 부른 것은 사실 두 겹으로 되어 있다. 스택 트레이스에 <code>AbstractApplicationContext</code>와 <code>DefaultListableBeanFactory</code>가 함께 나온 것이 그 흔적이다. 인터페이스의 상속 구조부터 본다.</p>
+<pre class="diagram">BeanFactory                    getBean, containsBean, isSingleton, getType ...
+ ├─ ListableBeanFactory        getBeanDefinitionNames, getBeanNamesForType, getBeansOfType ...
+ └─ HierarchicalBeanFactory    getParentBeanFactory ...
+
+ApplicationContext  extends  ListableBeanFactory, HierarchicalBeanFactory,
+                             EnvironmentCapable, MessageSource,
+                             ApplicationEventPublisher, ResourcePatternResolver
+        ▲
+ConfigurableApplicationContext     refresh, close ...
+        ▲
+GenericApplicationContext          필드: DefaultListableBeanFactory beanFactory
+        ▲
+AnnotationConfigApplicationContext,  GenericXmlApplicationContext</pre>
+<p><code>BeanFactory</code>는 맨 위의 인터페이스다. 이름이나 타입으로 빈을 꺼내는 메서드를 정의한다. <code>ListableBeanFactory</code>는 빈을 하나씩 꺼내는 것이 아니라 목록으로 열거하는 메서드를 더하고, <code>HierarchicalBeanFactory</code>는 부모 팩토리를 가질 수 있게 한다. <code>ApplicationContext</code>는 이 인터페이스들을 모두 상속하고, 빈 관리와 직접 관계없는 인터페이스 네 개를 더 상속한다.</p>
+
+<h4>상속하지만 위임한다</h4>
+<p>타입으로만 보면 <code>ApplicationContext</code>는 <code>BeanFactory</code>다. 그런데 구현을 보면 관계가 다르다. <code>GenericApplicationContext</code>는 <code>DefaultListableBeanFactory</code>를 필드로 가지고, 생성자에서 그것을 새로 만든다. 그리고 <code>getBean</code>을 비롯한 빈 팩토리 메서드는 그 필드에 그대로 넘긴다. 앞에서 본 <code>getBean(String)</code>의 두 줄짜리 본문이 그 위임이다.</p>
+<p>뒤의 XML 실험에는 이것을 확인하는 줄이 하나 있다. 컨텍스트에 <code>getBean("messageSender")</code>를 부른 결과와, 컨텍스트에서 꺼낸 빈 팩토리에 같은 호출을 한 결과를 <code>==</code>로 비교하면 <code>true</code>가 나온다. 빈을 실제로 보관하고 만드는 것은 <code>DefaultListableBeanFactory</code>다. <code>ApplicationContext</code>는 그것을 감싸고, 시작 절차(<code>refresh</code>)와 부가 기능을 얹는다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>엔진과 자동차</strong><p><code>BeanFactory</code>는 엔진이다. 연료를 넣고 직접 돌리면 동력은 나온다. <code>ApplicationContext</code>는 그 엔진을 얹은 자동차다. 시동 절차가 정해져 있고, 계기판과 전장품이 달려 있어서 운전자는 엔진을 직접 만지지 않는다. 비유가 깨지는 지점도 있다. 자동차는 엔진의 한 종류가 아니지만, <code>ApplicationContext</code>는 <code>BeanFactory</code> 인터페이스를 스스로 구현하고 있어서 엔진을 받는 자리에 그대로 넘길 수 있다.</p></aside>
+
+<h4>엔진만 쓰면 무엇이 빠지는가</h4>
+<p><code>DefaultListableBeanFactory</code>를 컨텍스트 없이 직접 만들어 써 보면 차이가 드러난다. A는 설정 클래스를 빈 정의로 등록한 경우이고, B는 XML 파일에서 정의를 읽어 넣은 경우다. XML 파일의 내용은 다음 절에 있고, 지금은 같은 세 빈이 정의되어 있다는 것만 알면 된다.</p>
+<pre data-label="FactoryMain.java"><code class="language-java">package notify;
+
+import org.springframework.beans.factory.support.DefaultListableBeanFactory;
+import org.springframework.beans.factory.support.RootBeanDefinition;
+import org.springframework.beans.factory.xml.XmlBeanDefinitionReader;
+import org.springframework.core.io.ClassPathResource;
+
+public class FactoryMain {
+    public static void main(String[] args) {
+        System.out.println("A. 빈 팩토리에 설정 클래스만 등록");
+        DefaultListableBeanFactory a = new DefaultListableBeanFactory();
+        a.registerBeanDefinition("notifyConfig", new RootBeanDefinition(NotifyConfig.class));
+        System.out.println(a.getBeanDefinitionCount() + " " + a.containsBean("notificationService"));
+        System.out.println(a.getBean("notifyConfig").getClass().getSimpleName());
+
+        System.out.println("B. 빈 팩토리에 XML 정의를 읽어 넣기");
+        DefaultListableBeanFactory b = new DefaultListableBeanFactory();
+        int count = new XmlBeanDefinitionReader(b).loadBeanDefinitions(new ClassPathResource("notify.xml"));
+        System.out.println("정의 " + count + ", 싱글톤 " + b.getSingletonCount());
+        System.out.println("getBean 호출");
+        b.getBean(NotificationService.class).deliver("lee", "RESET");
+        System.out.println("싱글톤 " + b.getSingletonCount());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">A. 빈 팩토리에 설정 클래스만 등록
+1 false
+NotifyConfig
+B. 빈 팩토리에 XML 정의를 읽어 넣기
+정의 3, 싱글톤 0
+getBean 호출
+  [생성] MemoryTemplateRepository
+  [생성] EmailSender
+  [생성] NotificationService
+email -> lee: [RESET] 안내
+싱글톤 3</code></pre>
+<p>A의 결과부터 본다. 정의는 1개뿐이고 <code>notificationService</code>라는 빈은 없다. 설정 객체의 클래스 이름에도 <code>$$SpringCGLIB$$0</code>이 붙지 않았다. <code>@Configuration</code>과 <code>@Bean</code>을 해석하는 <code>ConfigurationClassPostProcessor</code>가 등록되지도 실행되지도 않았으므로, 두 애노테이션은 아무 일도 일으키지 않는 표시로 남았다. 레퍼런스 문서는 <code>BeanFactory</code> API와 <code>DefaultListableBeanFactory</code>가 설정 형식이나 컴포넌트 애노테이션에 대해 아무것도 가정하지 않으며, 후처리기를 쓰려면 프로그램에서 직접 등록하거나 호출해야 한다고 설명한다.</p>
+<p>B는 생성 시점의 차이를 보여 준다. 정의 3개를 읽어 넣은 뒤에도 싱글톤은 0개다. <code>getBean</code>을 부른 순간에 세 객체가 만들어졌다. 빈 팩토리는 요청을 받아야 만든다. <code>ApplicationContext</code>가 빈을 미리 만들어 두는 것은 <code>refresh()</code>의 11단계에서 스스로 모든 싱글톤에 <code>getBean</code>을 부르기 때문이지, 빈 팩토리의 성질이 달라서가 아니다.</p>
+<p>미리 만드는 쪽에는 분명한 이점이 있다. 없는 빈을 참조했다든가, 같은 타입이 둘이라든가 하는 설정 오류가 첫 요청이 들어온 때가 아니라 애플리케이션이 뜨는 때에 드러난다. 레퍼런스 문서의 비교표는 두 인터페이스의 차이를 다음과 같이 정리한다.</p>
+<div class="table-wrap"><table><thead><tr><th>기능</th><th>BeanFactory</th><th>ApplicationContext</th></tr></thead><tbody>
+<tr><td>빈 인스턴스화와 연결</td><td>예</td><td>예</td></tr>
+<tr><td>통합된 생명주기 관리</td><td>아니오</td><td>예</td></tr>
+<tr><td><code>BeanPostProcessor</code> 자동 등록</td><td>아니오</td><td>예</td></tr>
+<tr><td><code>BeanFactoryPostProcessor</code> 자동 등록</td><td>아니오</td><td>예</td></tr>
+<tr><td>편리한 <code>MessageSource</code> 접근(국제화)</td><td>아니오</td><td>예</td></tr>
+<tr><td>내장된 <code>ApplicationEvent</code> 발행 장치</td><td>아니오</td><td>예</td></tr>
+</tbody></table></div>
+<p>표의 "자동 등록" 두 줄이 <code>refresh()</code>의 5단계와 6단계에 해당한다. 컨텍스트는 빈으로 등록된 후처리기를 스스로 찾아 실행하고 등록한다. 빈 팩토리만 쓰면 이 일을 사람이 코드로 해야 한다. 애노테이션 기반 기능이 내부 빈(후처리기)으로 구현되어 있다는 앞의 관찰과 합치면, 순수한 빈 팩토리에서 <code>@Bean</code>도 <code>@Autowired</code>도 동작하지 않는 이유가 설명된다.</p>
+
+<h4>ApplicationContext가 더하는 기능</h4>
+<p><code>ApplicationContext</code>가 추가로 상속하는 네 인터페이스는 각각 기능 하나에 대응한다.</p>
+<div class="table-wrap"><table><thead><tr><th>인터페이스</th><th>기능</th><th>대표 메서드</th></tr></thead><tbody>
+<tr><td><code>EnvironmentCapable</code></td><td>프로파일과 프로퍼티(시스템 프로퍼티, 환경 변수 등)를 담은 환경 객체 제공</td><td><code>getEnvironment()</code></td></tr>
+<tr><td><code>MessageSource</code></td><td>메시지 코드와 로케일로 문구를 찾는 국제화 지원</td><td><code>getMessage(...)</code></td></tr>
+<tr><td><code>ApplicationEventPublisher</code></td><td>이벤트를 발행해 등록된 리스너에게 전달</td><td><code>publishEvent(...)</code></td></tr>
+<tr><td><code>ResourcePatternResolver</code></td><td>위치 문자열로 파일, 클래스패스 등의 리소스를 읽음</td><td><code>getResource(...)</code>, <code>getResources(...)</code></td></tr>
+</tbody></table></div>
+<pre data-label="ExtraMain.java"><code class="language-java">package notify;
+
+import java.util.Locale;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+
+public class ExtraMain {
+    public static void main(String[] args) {
+        AnnotationConfigApplicationContext ac = new AnnotationConfigApplicationContext();
+        ac.addApplicationListener(event -> System.out.println("이벤트: " + event.getClass().getSimpleName()));
+        ac.register(NotifyConfig.class);
+        ac.refresh();
+
+        System.out.println(ac.getEnvironment().getProperty("java.specification.version"));
+        System.out.println(ac.getResource("classpath:notify.xml").exists());
+        System.out.println(ac.getMessage("greeting", null, "기본 문구", Locale.KOREAN));
+        ac.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (생성 로그 6줄 뒤)"><code class="language-text">이벤트: ContextRefreshedEvent
+21
+true
+기본 문구
+이벤트: ContextClosedEvent</code></pre>
+<p>리스너를 등록해 두었더니 <code>refresh()</code>가 끝날 때 <code>ContextRefreshedEvent</code>가, <code>close()</code>할 때 <code>ContextClosedEvent</code>가 전달됐다. 환경 객체는 JVM의 시스템 프로퍼티를 읽어 자바 버전을 돌려주었고, <code>classpath:</code> 접두어가 붙은 위치 문자열로 클래스패스의 파일을 찾았다. 메시지는 등록한 것이 없어서 기본 문구가 나왔다. 이 기능들을 실제로 수행하는 객체가 앞에서 본 정의 없는 싱글톤 <code>environment</code>, <code>messageSource</code>, <code>applicationEventMulticaster</code>다.</p>
+<p>레퍼런스 문서의 권고는 분명하다. 특별한 이유가 없으면 <code>ApplicationContext</code>를 쓰라고 한다. 애플리케이션 코드가 <code>BeanFactory</code>를 직접 만들 일은 거의 없다. 그래도 둘의 관계를 알아야 하는 이유가 있다. 빈 생성이 실패했을 때 스택 트레이스에 찍히는 클래스는 대부분 빈 팩토리 쪽의 것이기 때문이다.</p>
+
+<x-visual id="spring-core-basic-03-context-wraps-factory" title="ApplicationContext가 빈 팩토리를 감싸고 부가 기능을 더한 구조" kind="구조도" ratio="16:9">
+<x-hint>ApplicationContext가 BeanFactory 인터페이스를 구현하면서도 실제 빈 관리는 내부의 DefaultListableBeanFactory에 위임하고, 그 둘레에 네 가지 부가 기능을 가진다는 것을 보여 준다.</x-hint>
+<x-prompt>동심 구조의 구조도. 한가운데에 진한 색의 둥근 사각형, 라벨 "DefaultListableBeanFactory", 그 안에 작은 글씨 두 줄 "빈 정의 맵", "싱글톤 저장소". 그것을 감싸는 더 큰 옅은 색의 둥근 사각형, 위쪽 테두리에 라벨 "ApplicationContext". 바깥 사각형과 안쪽 사각형 사이의 띠에 네 개의 작은 배지가 네 방향으로 놓여 있다: 위 "환경", 오른쪽 "메시지", 아래 "이벤트", 왼쪽 "리소스". 구조도 왼쪽 바깥에 사람 아이콘 하나, 거기서 바깥 사각형으로 화살표, 화살표 위 라벨 "getBean". 바깥 사각형 테두리에서 가운데 사각형으로 이어지는 두 번째 화살표, 라벨 "위임". 바깥 사각형 위쪽에 둥근 화살표 아이콘과 라벨 "refresh()". 흰 배경, 평면 벡터 스타일, 안쪽은 파란색, 바깥은 옅은 회색.</x-prompt>
+<x-caption>호출은 ApplicationContext가 받지만 빈을 보관하고 만드는 일은 안쪽의 빈 팩토리가 한다.</x-caption>
+</x-visual>
+
+<h3>다양한 설정 형식 지원 - 자바 코드, XML</h3>
+<p>같은 객체 그래프를 이번에는 XML로 적는다. 자바 설정 클래스는 쓰지 않는다. 도메인 클래스는 그대로다.</p>
+<pre data-label="notify.xml (클래스패스 루트)"><code class="language-xml"><?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans
+                           https://www.springframework.org/schema/beans/spring-beans.xsd">
+
+    <bean id="notificationService" class="notify.NotificationService">
+        <constructor-arg ref="templateRepository"/>
+        <constructor-arg ref="messageSender"/>
+    </bean>
+
+    <bean id="templateRepository" class="notify.MemoryTemplateRepository"/>
+
+    <bean id="messageSender" class="notify.EmailSender"/>
+</beans></code></pre>
+<p><code>bean</code> 요소 하나가 빈 정의 하나다. <code>id</code>는 빈의 이름, <code>class</code>는 만들 클래스의 패키지를 포함한 이름이다. <code>constructor-arg</code>의 <code>ref</code>는 생성자 인자로 넣을 다른 빈의 이름이다. 이 파일을 읽는 컨텍스트가 <code>GenericXmlApplicationContext</code>다. 아래 프로그램은 XML 컨텍스트를 만들어 쓰고, 이어서 자바 설정 컨텍스트도 만들어 같은 이름의 빈 정의를 나란히 출력한다. 뒷부분의 출력은 다음 절에서 읽는다.</p>
+<pre data-label="XmlMain.java"><code class="language-java">package notify;
+
+import org.springframework.beans.factory.config.BeanDefinition;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.context.support.GenericXmlApplicationContext;
+
+public class XmlMain {
+    public static void main(String[] args) {
+        GenericXmlApplicationContext xml = new GenericXmlApplicationContext("notify.xml");
+        System.out.println("컨테이너 생성 끝");
+        xml.getBean(NotificationService.class).deliver("park", "RESET");
+        System.out.println(xml.getBeanDefinitionCount());
+        System.out.println(xml.getBean("messageSender") == xml.getBeanFactory().getBean("messageSender"));
+
+        AnnotationConfigApplicationContext java = new AnnotationConfigApplicationContext(NotifyConfig.class);
+        describe("XML ", xml.getBeanDefinition("notificationService"));
+        describe("자바", java.getBeanDefinition("notificationService"));
+        System.out.println(xml.getBeanDefinition("notificationService"));
+        System.out.println(java.getBeanDefinition("notificationService"));
+        xml.close();
+        java.close();
+    }
+
+    static void describe(String label, BeanDefinition bd) {
+        System.out.println(label + " 구현 클래스   = " + bd.getClass().getSimpleName());
+        System.out.println(label + " beanClassName = " + bd.getBeanClassName());
+        System.out.println(label + " factoryBean   = " + bd.getFactoryBeanName());
+        System.out.println(label + " factoryMethod = " + bd.getFactoryMethodName());
+        System.out.println(label + " 생성자 인자   = " + bd.getConstructorArgumentValues().getArgumentCount());
+        System.out.println(label + " scope         = '" + bd.getScope() + "', isSingleton = " + bd.isSingleton());
+    }
+}</code></pre>
+<pre data-label="실행 결과 (앞부분)"><code class="language-text">  [생성] MemoryTemplateRepository
+  [생성] EmailSender
+  [생성] NotificationService
+컨테이너 생성 끝
+email -> park: [RESET] 안내
+3
+true</code></pre>
+<p>동작은 자바 설정 때와 같다. 컨테이너 생성이 끝나기 전에 세 객체가 만들어졌고, 서비스는 주입받은 저장소와 발송기로 일했다. 다른 점이 둘 있다. 정의의 수가 9가 아니라 3이다. XML 컨텍스트는 애노테이션 처리용 내부 빈을 자동으로 등록하지 않기 때문이다. 그리고 <code>@Bean ... 호출</code> 줄이 없다. 팩토리 메서드가 없으므로 컨테이너가 직접 생성자를 골라 호출했다.</p>
+<p>생성 순서도 읽어 보자. 파일에는 <code>notificationService</code>가 가장 먼저 적혀 있지만 가장 나중에 만들어졌다. 컨테이너는 정의 순서대로 <code>notificationService</code>를 만들려다가, 생성자 인자로 넣을 <code>templateRepository</code>와 <code>messageSender</code>가 필요하다는 것을 정의에서 읽고 그 둘을 먼저 만든 것이다. 자바 설정에서는 우리가 쓴 메서드 본문이 하던 일을, 여기서는 컨테이너가 정의에 적힌 참조를 따라가며 한다.</p>
+
+<h4>문자열로 적은 클래스 이름의 대가</h4>
+<p>XML의 <code>class</code> 속성은 문자열이다. 자바 컴파일러는 이 문자열을 검사하지 않는다. <code>notify.EmailSender</code>를 <code>notify.EmialSender</code>로 잘못 적은 파일로 컨텍스트를 만들면 다음 예외가 난다.</p>
+<pre data-label="클래스 이름에 오타가 있을 때"><code class="language-text">BeanCreationException: Error creating bean with name 'notificationService' defined in class path resource [typo.xml]: Cannot resolve reference to bean 'messageSender' while setting constructor argument
+ 원인: CannotLoadBeanClassException: Cannot find class [notify.EmialSender] for bean with name 'messageSender' defined in class path resource [typo.xml]
+ 원인: ClassNotFoundException: notify.EmialSender</code></pre>
+<p>원인의 사슬을 아래에서 위로 읽으면 일어난 일이 그대로 보인다. 컨테이너는 문자열을 클래스 로더에 넘겨 클래스를 찾으려 했고 실패했다(<code>ClassNotFoundException</code>). 그래서 <code>messageSender</code> 빈의 클래스를 로딩할 수 없었고, 그 빈을 생성자 인자로 받아야 하는 <code>notificationService</code>도 만들 수 없었다. 자바 설정이었다면 <code>new EmialSender()</code>는 컴파일 단계에서 걸렸을 것이다. 자바 설정이 컴파일러의 타입 검사를 받는다는 점은 XML에 비해 분명한 장점이다.</p>
+<p>그래도 이 오류는 애플리케이션이 뜨는 시점에 드러났다. 싱글톤을 미리 만드는 덕분이다. 그리고 메시지마다 붙어 있는 <code>defined in class path resource [typo.xml]</code>이라는 문구에 주목하자. 빈 정의는 자신이 어디에서 왔는지를 기억하고 있고, 예외 메시지가 그것을 알려 준다. XML의 장점도 하나 적어 둔다. 설정이 클래스 파일 밖에 있으므로, 애플리케이션을 다시 컴파일하지 않고 파일만 바꿔서 구성을 바꿀 수 있다.</p>
+<aside class="note">XML 첫머리의 스키마 위치는 URL 모양이지만, 스프링은 이 주소로 네트워크 요청을 보내지 않는다. spring-beans 라이브러리 안의 <code>META-INF/spring.schemas</code> 파일이 그 URL을 라이브러리 안에 들어 있는 XSD 파일의 경로로 연결해 주고, 스프링의 스키마 리졸버가 이 매핑을 써서 로컬 파일을 읽는다.</aside>
+
+<h4>형식이 달라도 컨테이너가 같은 이유</h4>
+<p>자바 설정과 XML은 겉모습이 전혀 다른데 같은 빈 팩토리에서, 같은 <code>refresh()</code>로 동작했다. 중간에 형식의 차이를 흡수하는 층이 있기 때문이다. 형식마다 그것을 읽는 리더(reader)가 있고, 모든 리더는 읽은 내용을 <code>BeanDefinition</code>으로 바꿔 레지스트리에 등록한다. 빈 팩토리는 <code>BeanDefinition</code>만 본다.</p>
+<pre class="diagram">자바 설정 클래스 ──▶ AnnotatedBeanDefinitionReader ────┐
+                     (이후 ConfigurationClassPostProcessor)  │
+패키지 스캔     ──▶ ClassPathBeanDefinitionScanner ────┤
+XML 파일        ──▶ XmlBeanDefinitionReader ───────────┼──▶ BeanDefinition ──▶ 빈 팩토리
+Groovy 스크립트 ──▶ GroovyBeanDefinitionReader ────────┤     (설계도)          (레지스트리)
+코드로 직접 등록 ────────────────────────────────────────┘</pre>
+<p>컨텍스트 클래스들의 차이는 어떤 리더를 들고 있느냐에 있다. <code>AnnotationConfigApplicationContext</code>는 애노테이션 리더와 스캐너를 필드로 가진다. <code>GenericXmlApplicationContext</code>는 <code>XmlBeanDefinitionReader</code>를 필드로 가지고, 생성자에서 파일을 읽어 들인 다음 <code>refresh()</code>를 부른다. 둘 다 <code>GenericApplicationContext</code>의 하위 클래스이므로 그 뒤의 과정은 한 줄도 다르지 않다. 앞 절의 실험 B에서 본 것처럼 XML 리더는 컨텍스트 없이 빈 팩토리에 직접 붙여 쓸 수도 있다.</p>
+<p>레퍼런스 문서는 가장 유연한 방식으로 <code>GenericApplicationContext</code>에 리더를 조합해 쓰는 것을 들고, 한 컨텍스트에 여러 리더를 섞어 서로 다른 설정 원천에서 빈 정의를 읽을 수 있다고 설명한다. 같은 문서에는 XML을 읽는 <code>ClassPathXmlApplicationContext</code>와 Groovy 설정을 읽는 <code>GenericGroovyApplicationContext</code>도 나온다. 새 형식이 필요하면 리더를 하나 더 만들면 되고, 빈 팩토리는 고칠 필요가 없다.</p>
+
+<x-visual id="spring-core-basic-03-readers-to-definition" title="여러 설정 형식이 리더를 거쳐 BeanDefinition 하나로 모이는 구조" kind="구조도" ratio="16:9">
+<x-hint>자바 설정, XML, 스캔 등 서로 다른 입력이 각자의 리더를 거쳐 같은 형태의 BeanDefinition이 되고, 빈 팩토리는 그것만 본다는 깔때기 구조를 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 좁아지는 깔때기 모양의 구조도. 맨 왼쪽에 세로로 나란한 입력 아이콘 세 개: 자바 파일 아이콘(라벨 "자바 설정"), 꺾쇠 괄호가 그려진 문서 아이콘(라벨 "XML"), 폴더와 돋보기 아이콘(라벨 "컴포넌트 스캔"). 각 아이콘에서 오른쪽으로 화살표가 나가 작은 톱니바퀴 상자 세 개로 이어지고, 세 상자를 묶는 괄호 위에 라벨 "리더". 세 상자에서 나온 화살표가 한 점으로 모여 가운데의 설계도 카드 묶음으로 들어간다. 카드 묶음의 라벨 "BeanDefinition". 카드 묶음에서 오른쪽으로 굵은 화살표 하나가 나가 큰 상자로 들어간다. 큰 상자의 라벨 "빈 팩토리", 상자 안에는 둥근 객체 세 개. 화살표 위 라벨 "인스턴스 생성". 흰 배경, 평면 벡터 스타일, 입력은 회색, 설계도는 파란색, 객체는 주황색.</x-prompt>
+<x-caption>형식의 차이는 리더에서 끝난다. 빈 팩토리가 받는 것은 언제나 BeanDefinition이다.</x-caption>
+</x-visual>
+
+<h3>스프링 빈 설정 메타 정보 - BeanDefinition</h3>
+<p>리더들이 공통으로 만들어 내는 결과물이 <code>BeanDefinition</code>이다. Javadoc은 이 인터페이스가 빈 인스턴스를 기술하며, 프로퍼티 값과 생성자 인자 값, 그리고 구현체가 제공하는 추가 정보를 가진다고 설명한다. 레퍼런스 문서는 그 내용을 네 갈래로 나눈다. 만들 빈의 클래스 이름, 컨테이너 안에서의 동작 방식(스코프, 생명주기 콜백 등), 일하는 데 필요한 다른 빈에 대한 참조, 새로 만든 객체에 넣을 그 밖의 설정값이다.</p>
+<p>앞 절의 <code>XmlMain</code>이 출력한 뒷부분을 보자. 이름이 같은 <code>notificationService</code> 빈의 정의를 XML 컨텍스트와 자바 설정 컨텍스트에서 각각 꺼내 필드를 찍은 것이다.</p>
+<pre data-label="실행 결과 (뒷부분, 자바 컨텍스트의 생성 로그 6줄 뒤)"><code class="language-text">XML  구현 클래스   = GenericBeanDefinition
+XML  beanClassName = notify.NotificationService
+XML  factoryBean   = null
+XML  factoryMethod = null
+XML  생성자 인자   = 2
+XML  scope         = '', isSingleton = true
+자바 구현 클래스   = ConfigurationClassBeanDefinition
+자바 beanClassName = null
+자바 factoryBean   = notifyConfig
+자바 factoryMethod = notificationService
+자바 생성자 인자   = 0
+자바 scope         = '', isSingleton = true</code></pre>
+
+<h4>빈을 만드는 두 가지 방식</h4>
+<p>두 정의는 같은 빈을 서로 다른 방식으로 기술한다. XML 쪽에는 클래스 이름이 있고 생성자 인자가 2개 있다. "이 클래스의 생성자를 이 두 빈을 인자로 호출하라"는 뜻이다. 컨테이너는 클래스를 로딩하고, 인자에 맞는 생성자를 찾고, 참조된 빈을 준비해 생성자를 호출한다. 클래스를 직접 지정하는 방식이다.</p>
+<p>자바 설정 쪽에는 클래스 이름이 아예 없다. 대신 팩토리 빈의 이름 <code>notifyConfig</code>와 팩토리 메서드의 이름 <code>notificationService</code>가 있다. "<code>notifyConfig</code> 빈을 얻어 그 객체의 <code>notificationService</code> 메서드를 호출하면 결과가 이 빈이다"라는 뜻이다. 생성자 인자가 0개인 것도 자연스럽다. 인자를 채우는 일은 메서드 본문이 하므로 정의에 적을 것이 없다. 스택 트레이스에서 <code>createBeanInstance</code> 아래에 <code>Method.invoke</code>가 있었던 것이 이 정의를 실행한 흔적이다.</p>
+<p>이 차이를 알면 앞에서 본 두 현상의 근거가 보인다. 자바 설정으로 등록한 빈의 정의에는 클래스 이름이 없으므로, 인스턴스가 만들어지기 전에 컨테이너가 타입을 알 방법은 팩토리 메서드의 선언 반환 타입뿐이다. 타입 예측 실험의 결과가 여기서 나온다. 그리고 5단계에서 <code>@Bean</code> 메서드가 "호출되지 않고 등록만 된다"는 말은, 메서드의 이름이 정의의 필드에 문자열로 적힌다는 뜻이었다.</p>
+
+<h4>toString()으로 본 나머지 필드</h4>
+<p>정의 객체를 그대로 출력하면 더 많은 필드가 보인다. 아래는 스프링 프레임워크 7.0.10의 출력이고, 형식은 버전에 따라 조금 다를 수 있다. 첫 줄이 XML, 둘째 줄이 자바 설정의 정의다.</p>
+<pre data-label="실행 결과 (스프링 프레임워크 7.0.10)"><code class="language-text">Generic bean: class=notify.NotificationService; scope=; abstract=false; lazyInit=false; autowireMode=0; dependencyCheck=0; autowireCandidate=true; primary=false; fallback=false; factoryBeanName=null; factoryMethodName=null; initMethodNames=null; destroyMethodNames=null; defined in class path resource [notify.xml]
+Root bean: class=null; scope=; abstract=false; lazyInit=null; autowireMode=3; dependencyCheck=0; autowireCandidate=true; primary=false; fallback=false; factoryBeanName=notifyConfig; factoryMethodName=notificationService; initMethodNames=null; destroyMethodNames=[(inferred)]; defined in notify.NotifyConfig</code></pre>
+<div class="table-wrap"><table><thead><tr><th>필드</th><th>뜻</th><th>이 권에서 다시 나오는 곳</th></tr></thead><tbody>
+<tr><td><code>class</code></td><td>만들 클래스. 팩토리 메서드 방식이면 비어 있다</td><td>이 회차</td></tr>
+<tr><td><code>factoryBeanName</code>, <code>factoryMethodName</code></td><td>빈을 만들어 주는 다른 빈과 그 메서드</td><td>이 회차, 04회</td></tr>
+<tr><td><code>scope</code></td><td>빈의 스코프. 빈 문자열은 기본값이고 싱글톤으로 취급된다</td><td>04회, 08회</td></tr>
+<tr><td><code>lazyInit</code></td><td>지연 초기화 여부. 참이면 컨테이너 시작 때 만들지 않는다</td><td>이 회차</td></tr>
+<tr><td><code>autowireMode</code></td><td>자동 연결 방식. 0은 하지 않음, 3은 생성자(팩토리 메서드의 매개변수) 자동 연결</td><td>06회</td></tr>
+<tr><td><code>autowireCandidate</code>, <code>primary</code>, <code>fallback</code></td><td>같은 타입의 후보가 여럿일 때 선택에 쓰이는 표시</td><td>06회</td></tr>
+<tr><td><code>initMethodNames</code>, <code>destroyMethodNames</code></td><td>초기화와 소멸 때 부를 메서드</td><td>07회</td></tr>
+<tr><td><code>defined in ...</code></td><td>정의의 출처. 예외 메시지에 그대로 나온다</td><td>이 회차</td></tr>
+</tbody></table></div>
+<p>몇 군데를 짚는다. <code>scope</code>는 두 정의 모두 빈 문자열인데 <code>isSingleton()</code>은 <code>true</code>였다. 소스에서 빈 문자열은 기본 스코프를 나타내는 상수이고, 주석은 이것이 싱글톤과 같은 상태라고 설명한다. 따로 적지 않으면 싱글톤이라는 규칙이 이 필드에 들어 있다. <code>autowireMode</code>는 XML이 0, 자바 설정이 3이다. <code>@Bean</code> 메서드에 매개변수가 있으면 컨테이너가 타입에 맞는 빈을 찾아 넣어 주는데, 그 동작을 켜는 값이 3이다.</p>
+<p>자바 설정 쪽의 <code>destroyMethodNames=[(inferred)]</code>도 눈에 띈다. 레퍼런스 문서에 따르면 자바 설정으로 정의한 빈은 공개된 <code>close</code>나 <code>shutdown</code> 메서드가 있으면 그것이 소멸 콜백으로 자동 등록된다. "추론"이라는 표시가 그 기본 동작을 가리킨다. 자세한 내용은 07회에서 다룬다.</p>
+
+<h4>구현 클래스가 여럿인 이유</h4>
+<p><code>BeanDefinition</code>은 인터페이스이고, 정의가 어디에서 왔느냐에 따라 구현 클래스가 다르다. 이 회차의 실험에서 직접 확인한 것과 소스에서 확인한 것을 모으면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>정의의 출처</th><th>구현 클래스</th></tr></thead><tbody>
+<tr><td>XML의 <code>bean</code> 요소</td><td><code>GenericBeanDefinition</code></td></tr>
+<tr><td><code>register()</code>로 넘긴 클래스(설정 클래스 자신)</td><td><code>AnnotatedGenericBeanDefinition</code></td></tr>
+<tr><td><code>@Bean</code> 메서드</td><td><code>ConfigurationClassBeanDefinition</code>(<code>RootBeanDefinition</code>의 하위 클래스)</td></tr>
+<tr><td>컴포넌트 스캔으로 찾은 클래스</td><td><code>ScannedGenericBeanDefinition</code>(05회)</td></tr>
+</tbody></table></div>
+<p>구현이 달라도 빈 팩토리는 인터페이스가 정한 정보만 읽는다. 빈을 실제로 만들기 직전에는 정의를 <code>RootBeanDefinition</code> 형태로 병합해 쓰는데, 이때 비어 있던 기본값도 채워진다. 자바 설정 컨텍스트에서 병합된 정의를 꺼내 <code>getScope()</code>를 출력하면 빈 문자열이 아니라 <code>singleton</code>이 나온다.</p>
+
+<h4>정의를 손으로 등록한다</h4>
+<p>리더는 편의 도구일 뿐이다. 리더 없이 <code>BeanDefinition</code> 객체를 직접 만들어 등록해도 컨테이너는 똑같이 동작한다.</p>
+<pre data-label="ManualMain.java"><code class="language-java">package notify;
+
+import org.springframework.beans.factory.support.GenericBeanDefinition;
+import org.springframework.context.support.GenericApplicationContext;
+
+public class ManualMain {
+    public static void main(String[] args) {
+        GenericApplicationContext ac = new GenericApplicationContext();
+
+        GenericBeanDefinition definition = new GenericBeanDefinition();
+        definition.setBeanClass(SmsSender.class);
+        definition.setLazyInit(true);
+        ac.registerBeanDefinition("handMade", definition);
+
+        ac.registerBean("bySupplier", MessageSender.class, () -> new EmailSender());
+
+        ac.refresh();
+        System.out.println("refresh 끝");
+        System.out.println(ac.getBean("handMade").getClass().getSimpleName());
+        System.out.println(ac.getBean("bySupplier").getClass().getSimpleName());
+        ac.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">  [생성] EmailSender
+refresh 끝
+  [생성] SmsSender
+SmsSender
+EmailSender</code></pre>
+<p>애노테이션도 XML도 없다. <code>handMade</code>는 클래스와 지연 초기화 여부만 적은 정의다. <code>lazyInit</code>을 참으로 두었으므로 <code>refresh()</code> 때는 만들어지지 않고, <code>getBean</code>을 부른 때에 <code>SmsSender</code>가 만들어졌다. 필드 하나가 생성 시점을 바꾼 것이다. <code>bySupplier</code>는 객체를 만드는 함수를 정의에 직접 넣는 등록 방식이다. 지연 표시가 없으므로 <code>refresh()</code> 안에서 만들어졌다.</p>
+<p>이 추상화가 주는 것은 두 가지다. 첫째, 빈 팩토리는 <code>BeanDefinition</code>이라는 역할에만 의존하고 그것이 어떤 형식에서 왔는지는 모른다. 01회와 02회에서 애플리케이션 코드에 적용한 원칙, 곧 구체적인 것이 아니라 추상에 의존하고 확장할 때 기존 코드를 고치지 않는다는 원칙이 스프링 자신의 설계에도 들어 있다. 둘째, 정의는 객체를 만들기 전에 존재하는 데이터이므로 읽고 고칠 수 있다. Javadoc은 이 인터페이스의 주된 의도가 <code>BeanFactoryPostProcessor</code>가 프로퍼티 값과 그 밖의 빈 메타데이터를 들여다보고 수정할 수 있게 하는 것이라고 적는다.</p>
+<p>정의가 실제로 고쳐지는 모습도 확인할 수 있다. <code>PhaseMain</code>처럼 단계를 나눠 실행하면서 <code>notifyConfig</code> 정의의 <code>getBeanClassName()</code>을 찍어 보면, <code>refresh()</code> 전에는 <code>notify.NotifyConfig</code>이고 <code>refresh()</code> 뒤에는 <code>notify.NotifyConfig$$SpringCGLIB$$0</code>이다. <code>ConfigurationClassPostProcessor</code>가 인스턴스를 만들기 전에 설계도의 클래스를 바꿔 넣은 것이다. 왜 바꾸는지는 04회에서 이어진다.</p>
+
+<h3>흔한 오해 여섯 가지</h3>
+<p><b>"getBean을 부를 때 객체가 만들어진다."</b> <code>ApplicationContext</code>에서 지연 초기화가 아닌 싱글톤은 <code>refresh()</code> 안에서 이미 만들어져 있다. <code>getBean</code>은 저장소에서 꺼내 줄 뿐이다. 호출 시점에 만들어지는 것은 지연 초기화 빈, 순수한 <code>BeanFactory</code>에 등록된 빈, 그리고 싱글톤이 아닌 스코프의 빈(08회)이다.</p>
+<p><b>"getBeanDefinitionNames()가 컨테이너에 든 빈의 전부다."</b> 이 메서드는 설계도의 이름만 돌려준다. <code>environment</code>나 <code>messageSource</code>처럼 완성된 객체로 직접 등록된 싱글톤은 여기에 없지만 이름으로도 타입으로도 조회된다. 이 회차의 실험에서는 정의가 9개일 때 싱글톤이 17개였다.</p>
+<p><b>"타입 조회는 @Bean 메서드의 반환 타입과 비교한다."</b> 인스턴스가 이미 있으면 그 객체의 실제 클래스로 판정한다. 선언 반환 타입이 쓰이는 것은 인스턴스가 아직 없을 때의 예측이다. 같은 조회가 시점에 따라 성공하기도 실패하기도 하는 이유가 여기에 있다.</p>
+<p><b>"ApplicationContext는 BeanFactory를 상속했으니 스스로 빈을 보관한다."</b> 인터페이스는 상속하지만 구현은 위임한다. 빈 정의의 맵과 싱글톤 저장소는 컨텍스트가 필드로 가진 <code>DefaultListableBeanFactory</code> 안에 있다.</p>
+<p><b>"XML 설정과 자바 설정은 서로 다른 컨테이너다."</b> 다른 것은 설정을 읽는 리더다. 읽은 결과는 같은 인터페이스의 <code>BeanDefinition</code>이 되어 같은 종류의 빈 팩토리에 등록되고, 같은 <code>refresh()</code>로 인스턴스가 된다.</p>
+<p><b>"빈을 쓰려면 getBean으로 꺼내야 한다."</b> 이 회차에서 <code>getBean</code>을 계속 쓴 것은 컨테이너를 관찰하기 위해서였다. 레퍼런스 문서는 애플리케이션 코드가 이상적으로는 <code>getBean()</code>을 전혀 호출하지 않아야 하고, 그래서 스프링 API에 의존하지 않아야 한다고 적는다. 필요한 객체를 컨테이너에 물어 가져오는 방식을 의존관계 조회(dependency lookup)라고 하는데, 이렇게 하면 클래스가 무엇에 의존하는지가 생성자 시그니처에서 사라지고 코드가 컨테이너에 묶인다. 애플리케이션 코드는 필요한 것을 생성자로 주입받는다.</p>
+
+<h3>이 지식이 다시 쓰이는 곳</h3>
+<p>이 권의 남은 회차는 모두 이 회차의 구조 위에서 진행된다. 04회는 싱글톤 저장소가 "하나"를 어떻게 보장하는지, 그리고 <code>templateRepository()</code>가 왜 한 번만 호출되었는지를 설정 클래스의 CGLIB 서브클래스로 설명한다. 05회의 컴포넌트 스캔은 이 회차에서 본 스캐너가 클래스패스를 훑어 <code>ScannedGenericBeanDefinition</code>을 등록하는 과정이다. 설계도가 등록된 뒤의 일은 이 회차에서 본 것과 같다.</p>
+<p>06회의 의존관계 자동 주입은 이 회차의 타입 조회를 컨테이너가 대신 수행하는 것이다. 주입할 빈을 타입으로 찾고, 후보가 없으면 <code>NoSuchBeanDefinitionException</code>, 둘 이상이면 <code>NoUniqueBeanDefinitionException</code>이 난다. 예외의 이름과 메시지가 이 회차에서 직접 일으켜 본 것과 같으므로, 주입 실패 메시지는 "누군가 이 타입으로 조회했는데 후보가 0개 또는 여러 개였다"로 읽으면 된다. 07회의 생명주기 콜백은 <code>refresh()</code>와 <code>close()</code> 사이에 끼어드는 지점들이고, 08회의 스코프는 <code>BeanDefinition</code>의 <code>scope</code> 필드가 싱글톤이 아닐 때의 이야기다.</p>
+<p>이 권 밖에서도 같은 구조를 만난다. 스프링 부트 3.5의 소스를 보면 서블릿 웹 애플리케이션용 컨텍스트인 <code>ServletWebServerApplicationContext</code>는 <code>refresh()</code>의 <code>onRefresh</code> 단계를 재정의해 내장 웹 서버를 만든다. 이 클래스도 <code>GenericApplicationContext</code>의 후손이다. 그래서 부트 애플리케이션이 뜨다가 빈 생성에 실패했을 때의 스택 트레이스에는 이 회차에서 본 <code>refresh</code>, <code>finishBeanFactoryInitialization</code>, <code>preInstantiateSingletons</code>, <code>createBean</code>의 프레임이 나온다. 그 프레임들이 무엇을 하는 중이었는지 알면, 긴 스택에서 어느 빈의 어느 단계가 문제였는지를 짚을 수 있다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>스프링 컨테이너</dt><dd>빈을 만들고 설정하고 이어 주는 객체다. <code>ApplicationContext</code> 인터페이스로 나타내며, JVM에서는 맵과 리스트를 필드로 가진 평범한 힙 객체다.</dd>
+<dt>두 단계 구조</dt><dd>컨테이너는 먼저 모든 설정을 빈 정의로 바꿔 등록하고, 그다음 정의를 보고 인스턴스를 만든다. 두 단계 모두 <code>refresh()</code> 안에서 일어난다.</dd>
+<dt>미리 만들기</dt><dd><code>refresh()</code>의 끝에서 빈 팩토리가 정의 목록을 돌며 지연 초기화가 아닌 싱글톤마다 <code>getBean</code>을 부른다. 설정 오류가 시작 시점에 드러나는 이유다.</dd>
+<dt>이름 조회와 타입 조회</dt><dd>이름 조회는 싱글톤 저장소(<code>ConcurrentHashMap</code>)에서 한 번 꺼내는 연산이고, 타입 조회는 정의 목록을 훑으며 타입을 검사하는 선형 탐색이다. 타입 조회 결과는 타입별로 캐시된다.</dd>
+<dt>타입 판정의 기준</dt><dd>인스턴스가 있으면 그 객체의 실제 클래스로 <code>instanceof</code> 판정을 한다. 인스턴스가 없으면 정의에서 예측한 타입(자바 설정이면 팩토리 메서드의 선언 반환 타입)을 쓴다.</dd>
+<dt>둘 이상과 상속 관계</dt><dd>부모 타입으로 조회하면 자식 타입의 빈이 모두 후보다. 후보가 둘 이상이면 <code>NoUniqueBeanDefinitionException</code>이 나고, 이름을 주거나 <code>getBeansOfType</code>으로 전부 받아 해결한다.</dd>
+<dt>BeanFactory와 ApplicationContext</dt><dd><code>ApplicationContext</code>는 <code>BeanFactory</code> 인터페이스를 상속하지만 실제 빈 관리는 내부의 <code>DefaultListableBeanFactory</code>에 위임한다. 여기에 시작 절차, 후처리기 자동 등록, 환경·메시지·이벤트·리소스 기능을 더한다.</dd>
+<dt>BeanDefinition</dt><dd>빈 하나를 만드는 방법을 담은 설계도다. 클래스를 직접 지정하는 방식과 팩토리 빈·팩토리 메서드를 지정하는 방식이 있고, 스코프·지연 초기화·자동 연결 방식·출처 같은 정보를 함께 가진다.</dd>
+<dt>설정 형식의 다양성</dt><dd>자바 설정, XML, 스캔은 각자의 리더가 읽어 <code>BeanDefinition</code>으로 바꾼다. 빈 팩토리는 정의만 보므로 형식이 늘어나도 바뀌지 않는다.</dd>
+</x-summary>
+
+<x-review>
+<p>애플리케이션이 뜨다가 멈췄을 때 가장 먼저 할 일은 예외의 종류를 이 회차의 표에 대 보는 것이다. <code>NoSuchBeanDefinitionException</code>이면 "누군가 그 이름이나 타입으로 조회했는데 후보가 없었다"는 뜻이다. 원인은 셋 중 하나로 좁혀진다. 정의가 아예 등록되지 않았거나, 등록은 되었지만 다른 타입으로 선언되어 예측 타입이 맞지 않았거나, 이름이 다르다. <code>NoUniqueBeanDefinitionException</code>이면 메시지 끝의 후보 이름 목록이 곧 답의 절반이다. 메시지에 붙은 <code>defined in ...</code> 문구는 그 정의가 어느 설정 클래스나 파일에서 왔는지를 알려 주므로, 의도하지 않은 설정이 함께 읽혔는지를 바로 확인할 수 있다.</p>
+<p><code>@Bean</code> 메서드의 반환 타입을 인터페이스로 할지 구현 클래스로 할지는 취향의 문제가 아니다. 그 빈을 참조하는 모든 곳이 역할 인터페이스만 쓴다는 것이 확실하면 인터페이스로 선언해도 된다. 그 빈이 여러 인터페이스를 구현하고 있고 다른 곳에서 그 인터페이스 중 하나로 주입받는다면, 선언 타입에 없는 인터페이스는 인스턴스가 만들어지기 전까지 컨테이너에 보이지 않는다. 생성 순서에 따라 되기도 하고 안 되기도 하는 주입 오류는 재현이 어렵다. 그런 가능성이 있으면 구체 타입으로 선언하는 쪽이 안전하다.</p>
+<p>싱글톤을 미리 만드는 기본 동작은 시작 시간을 늘리지만 오류를 앞당긴다. 지연 초기화를 넓게 켜면 애플리케이션은 빨리 뜨는 대신, 설정 오류가 그 빈을 처음 쓰는 요청에서 드러난다. 개발 중의 빠른 재시작에는 도움이 될 수 있어도, 운영 환경에서는 잘못된 설정이 배포 직후가 아니라 특정 기능이 처음 호출될 때 발견된다는 대가를 치른다. 어느 쪽을 택하든 그 차이가 <code>BeanDefinition</code>의 필드 하나와 <code>preInstantiateSingletons()</code>의 조건 하나에서 나온다는 것을 알고 정해야 한다.</p>
+<p>컨텍스트를 주입받아 <code>getBean</code>으로 필요한 객체를 꺼내 쓰는 코드를 실무에서 가끔 만난다. 동작은 하지만, 그 클래스가 무엇에 의존하는지가 생성자에서 보이지 않고 테스트하려면 컨테이너나 그 대역이 필요해진다. 조회 API는 프레임워크와 맞닿는 경계의 코드, 테스트, 그리고 지금처럼 컨테이너의 상태를 진단하는 용도에 쓴다. 또 하나 기억할 것은 등록 시점이다. 레퍼런스 문서는 빈 메타데이터와 직접 넣는 싱글톤을 가능한 한 일찍 등록해야 하며, 팩토리가 사용되고 있는 도중에 새 빈을 등록하는 것은 공식적으로 지원하지 않는다고 적는다. 실행 중에 구성을 바꾸고 싶다는 요구가 나오면, 빈을 새로 등록하는 대신 이미 등록된 빈들 가운데 하나를 고르는 구조로 푸는 편이 맞다.</p>
+</x-review>
+
+<x-practice>
+<li><code>NotifyConfig</code>에서 세 <code>@Bean</code> 메서드의 선언 순서를 <code>messageSender()</code>, <code>notificationService()</code>, <code>templateRepository()</code>로 바꾸었다. 메서드 본문은 그대로다. 컨테이너를 만들 때 찍히는 여섯 줄(<code>@Bean ... 호출</code> 세 줄과 <code>[생성]</code> 세 줄)의 순서를 예측하고 이유를 설명하라.</li>
+<li>본문과 같은 클래스패스에서 <code>new AnnotationConfigApplicationContext(SenderConfig.class)</code>로 만든 컨테이너가 있다. <code>getBeanDefinitionCount()</code>의 값과 <code>getBeansOfType(Object.class).size()</code>의 값을 각각 구하고, 두 값이 다른 이유를 빈 팩토리의 자료구조로 설명하라.</li>
+<li>같은 <code>SenderConfig</code> 컨테이너에서 다음 세 호출이 각각 어떤 결과를 내는지 예측하라. (가) <code>getBean("emailSender", SmsSender.class)</code> (나) <code>getBean("sender")</code> (다) <code>try { getBean(MessageSender.class); } catch (NoSuchBeanDefinitionException e) { System.out.println("잡힘"); }</code></li>
+<li><code>LazyConfig</code>의 <code>templateRepository()</code> 반환 타입을 <code>MemoryTemplateRepository</code>로 바꾸었다. <code>@Lazy</code>는 그대로다. <code>LazyMain</code>을 다시 실행하면 출력이 어떻게 달라지는지, 빈 정의에 들어 있는 정보를 근거로 설명하라.</li>
+<li><code>SmsSender</code> 빈을 지연 초기화로 등록하는 방법이 둘 있다. XML의 <code><bean id="smsSender" class="notify.SmsSender" lazy-init="true"/></code>와, 이름이 <code>senderConfig</code>인 설정 클래스 안의 <code>@Bean @Lazy public SmsSender smsSender()</code>다. 두 경우의 <code>BeanDefinition</code>에서 <code>getBeanClassName()</code>, <code>getFactoryBeanName()</code>, <code>getFactoryMethodName()</code>, <code>isLazyInit()</code>이 각각 무엇을 돌려주는지 적어라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 출력은 <code>@Bean messageSender() 호출</code>, <code>[생성] EmailSender</code>, <code>@Bean notificationService() 호출</code>, <code>@Bean templateRepository() 호출</code>, <code>[생성] MemoryTemplateRepository</code>, <code>[생성] NotificationService</code> 순서다(직접 실행해 확인했다). 빈 정의는 메서드 선언 순서대로 등록되고, <code>preInstantiateSingletons()</code>는 그 순서로 <code>getBean</code>을 부른다. 그래서 <code>messageSender</code>가 먼저 만들어진다. 다음 차례인 <code>notificationService()</code>의 본문은 <code>templateRepository()</code>를 먼저 부르므로 저장소가 그때 만들어진다. 이어지는 <code>messageSender()</code> 호출은 이미 저장소에 있는 빈을 돌려받으므로 호출 줄도 생성 줄도 다시 찍히지 않는다. 마지막으로 루프가 <code>templateRepository</code>에 도달했을 때도 이미 만들어져 있어서 아무 출력이 없다. 선언 순서를 바꾸면 생성 순서는 바뀌지만 완성된 객체 그래프는 같다.</p>
+<p><b>2.</b> <code>getBeanDefinitionCount()</code>는 8, <code>getBeansOfType(Object.class).size()</code>는 16이다. 정의 8개는 내부 빈 5개, <code>senderConfig</code>, <code>emailSender</code>, <code>smsSender</code>다. 정의의 수는 <code>beanDefinitionMap</code>에 든 설계도의 수다. 타입 조회는 정의 이름 목록을 훑은 뒤 정의 없이 직접 등록된 싱글톤의 이름도 훑는다. <code>environment</code>, <code>systemProperties</code>, <code>systemEnvironment</code>, <code>applicationStartup</code>, <code>importRegistry</code>, <code>messageSource</code>, <code>applicationEventMulticaster</code>, <code>lifecycleProcessor</code> 8개가 여기에 해당하고, 모두 <code>Object</code>의 인스턴스이므로 후보에 든다. 8 더하기 8로 16이다. 클래스패스에 jakarta.annotation-api가 없다면 내부 빈이 하나 줄어 7과 15가 된다.</p>
+<p><b>3.</b> (가) <code>BeanNotOfRequiredTypeException</code>이 난다. 이름으로는 빈을 찾았지만 그 객체는 <code>EmailSender</code>이고 <code>SmsSender</code>의 인스턴스가 아니다. 메시지에 이름, 기대한 타입, 실제 타입이 모두 나온다. (나) <code>NoSuchBeanDefinitionException</code>이 난다. <code>sender</code>라는 이름의 빈은 없다. 이름 조회는 타입 계층을 보지 않으므로 비슷한 이름이 있어도 소용없다. (다) "잡힘"이 출력된다. <code>MessageSender</code> 타입의 후보가 둘이라 <code>NoUniqueBeanDefinitionException</code>이 던져지는데, 이 예외는 <code>NoSuchBeanDefinitionException</code>의 하위 클래스이므로 이 <code>catch</code> 절에 걸린다. 빈이 없는 경우와 많은 경우를 다르게 처리하려면 하위 타입을 먼저 잡아야 한다.</p>
+<p><b>4.</b> 첫 번째 <code>getType</code>이 <code>class notify.MemoryTemplateRepository</code>를 출력하고, 첫 번째 <code>getBean(MemoryTemplateRepository.class)</code>가 예외 없이 성공하면서 그때 <code>[생성]</code> 줄이 찍힌다. 따라서 예외 메시지 줄은 사라진다. 자바 설정으로 등록한 빈의 정의에는 클래스 이름이 없고 팩토리 메서드만 있다. 인스턴스가 없을 때 컨테이너가 쓸 수 있는 타입 정보는 그 메서드의 선언 반환 타입이다. 반환 타입이 구현 클래스가 되었으므로 예측 타입이 <code>MemoryTemplateRepository</code>가 되고, 이것은 <code>TemplateRepository</code>의 하위 타입이기도 하므로 인터페이스 타입 조회도 계속 성공한다.</p>
+<p><b>5.</b> XML의 경우 <code>getBeanClassName()</code>은 <code>notify.SmsSender</code>, <code>getFactoryBeanName()</code>과 <code>getFactoryMethodName()</code>은 <code>null</code>, <code>isLazyInit()</code>은 <code>true</code>다. 클래스를 직접 지정하는 방식이기 때문이다. 자바 설정의 경우 <code>getBeanClassName()</code>은 <code>null</code>, <code>getFactoryBeanName()</code>은 <code>senderConfig</code>, <code>getFactoryMethodName()</code>은 <code>smsSender</code>, <code>isLazyInit()</code>은 <code>true</code>다. 만드는 방법은 서로 다르게 적혀 있지만 "지연 초기화"라는 동작 설정은 같은 필드에 같은 값으로 들어간다. 빈 팩토리가 두 빈을 똑같이 다룰 수 있는 이유다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>new AnnotationConfigApplicationContext(NotifyConfig.class)</code>가 반환된 직후의 상태로 옳은 것은?</q>
+<o>빈 정의만 등록되어 있고, 각 빈의 인스턴스는 처음 <code>getBean</code>이 불릴 때 만들어진다.</o>
+<o>지연 초기화가 아닌 싱글톤 빈은 모두 만들어져 싱글톤 저장소에 들어 있고, <code>getBean</code>은 그것을 꺼내 돌려준다.</o>
+<o>설정 클래스의 <code>@Bean</code> 메서드는 아직 분석되지 않았고, 첫 조회 때 분석된다.</o>
+<o>인스턴스는 만들어졌지만 서로의 참조는 첫 사용 시점에 연결된다.</o>
+<why>생성자는 <code>refresh()</code>까지 실행한다. <code>refresh()</code>는 빈 팩토리 후처리기 단계에서 <code>@Bean</code> 메서드를 빈 정의로 등록하고, 마지막 무렵에 정의 목록을 돌며 지연 초기화가 아닌 싱글톤마다 <code>getBean</code>을 불러 인스턴스를 만든다. 실험에서 <code>[생성]</code> 줄이 모두 생성자 반환 전에 찍혔다. 요청받을 때 만드는 것은 컨텍스트 없이 쓴 순수 <code>BeanFactory</code>의 동작이다. 생성자 주입에서는 생성과 연결이 한 번의 호출이므로 "나중에 연결"되는 일도 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>@Bean @Lazy public TemplateRepository templateRepository()</code>로 등록한 빈이 있다. 컨테이너 생성 직후 <code>getBean(MemoryTemplateRepository.class)</code>가 <code>NoSuchBeanDefinitionException</code>으로 실패하는 이유로 가장 정확한 것은?</q>
+<o>지연 초기화 빈은 타입으로 조회할 수 없고 이름으로만 조회할 수 있기 때문이다.</o>
+<o>스프링은 구현 타입으로 조회하는 것을 금지하기 때문이다.</o>
+<o>인스턴스가 아직 없어서 컨테이너가 아는 타입이 팩토리 메서드의 선언 반환 타입인 <code>TemplateRepository</code>뿐이고, 이것은 요청한 타입의 하위 타입이 아니기 때문이다.</o>
+<o>타입별 조회 결과 캐시가 비어 있어서 조회 자체가 수행되지 않기 때문이다.</o>
+<why>자바 설정으로 등록한 빈의 정의에는 클래스 이름이 없고 팩토리 메서드 정보만 있다. 인스턴스가 만들어지기 전에는 선언 반환 타입으로 타입을 예측하므로, 구현 타입을 요구하는 조회에는 맞지 않는다. 인터페이스 타입으로 한 번 조회해 인스턴스가 만들어진 뒤에는 실제 클래스로 판정하므로 같은 조회가 성공한다. 지연 초기화 빈도 타입으로 조회할 수 있고, 구현 타입 조회가 금지된 것도 아니다. 캐시는 성능을 위한 것이지 조회 여부를 정하지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>getBeanDefinitionNames()</code>의 결과에 <code>environment</code>가 없는데 <code>getBean("environment")</code>는 성공한다. 이유는?</q>
+<o>이 객체는 빈 정의 없이 완성된 객체로 싱글톤 저장소에 직접 등록되었고, 이름 조회는 싱글톤 저장소를 보기 때문이다.</o>
+<o><code>getBeanDefinitionNames()</code>는 역할이 <code>ROLE_APPLICATION</code>인 정의만 돌려주기 때문이다.</o>
+<o><code>environment</code>는 부모 컨텍스트에 등록된 빈이기 때문이다.</o>
+<o><code>getBean</code>이 호출되는 순간 컨테이너가 환경 객체의 정의를 새로 등록하기 때문이다.</o>
+<why>컨텍스트는 <code>refresh()</code> 도중 환경 객체 같은 것을 <code>registerSingleton</code>으로 저장소에 직접 넣는다. 만드는 방법을 기술할 필요가 없으므로 정의가 없다. <code>getBeanDefinitionNames()</code>는 정의의 이름을 역할과 상관없이 모두 돌려준다(실험에서 role=2인 내부 빈도 나왔다). 이 실험에는 부모 컨텍스트가 없고, 조회가 정의를 새로 만들지도 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>DefaultListableBeanFactory</code>를 직접 만들어 <code>@Configuration</code> 클래스 하나만 빈 정의로 등록했다. 그 클래스의 <code>@Bean</code> 메서드로 선언한 빈이 조회되지 않는 이유는?</q>
+<o><code>DefaultListableBeanFactory</code>는 싱글톤을 지원하지 않기 때문이다.</o>
+<o><code>@Bean</code> 메서드는 XML 설정에서만 인식되기 때문이다.</o>
+<o>빈 팩토리가 빈을 요청받을 때 만들기 때문에, 설정 객체를 먼저 <code>getBean</code>으로 꺼내면 그때 등록된다.</o>
+<o><code>@Configuration</code> 클래스를 분석해 <code>@Bean</code> 메서드를 빈 정의로 등록하는 후처리기가 등록되지도 실행되지도 않았기 때문이다.</o>
+<why>애노테이션은 메타데이터일 뿐이고, 그것을 읽어 빈 정의로 바꾸는 일은 <code>ConfigurationClassPostProcessor</code>라는 빈 팩토리 후처리기가 한다. <code>ApplicationContext</code>는 이 후처리기를 내부 빈으로 등록하고 <code>refresh()</code>에서 실행하지만, 순수 빈 팩토리는 그런 일을 하지 않는다. 실험에서 설정 객체를 꺼내도 정의는 1개 그대로였고 객체는 평범한 <code>NotifyConfig</code>였다. 빈 팩토리는 싱글톤을 지원하며, <code>@Bean</code>은 자바 설정의 기능이다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>역할 인터페이스 <code>MessageSender</code>의 구현 빈이 <code>emailSender</code>, <code>smsSender</code> 둘 등록되어 있다. 다음 중 옳지 않은 것은?</q>
+<o><code>getBean(MessageSender.class)</code>는 <code>NoUniqueBeanDefinitionException</code>을 던지고, 메시지에 두 후보의 이름이 나온다.</o>
+<o><code>getBeansOfType(MessageSender.class)</code>는 두 빈을 이름과 함께 담은 맵을 돌려준다.</o>
+<o><code>getBean(Object.class)</code>는 모든 빈의 공통 부모 타입으로 조회하는 것이므로 먼저 등록된 빈 하나를 돌려준다.</o>
+<o><code>getBean("smsSender", MessageSender.class)</code>는 이름으로 하나를 특정하므로 성공한다.</o>
+<why>타입 조회는 요청한 타입의 인스턴스인 빈을 모두 후보로 삼는다. <code>Object</code>로 조회하면 컨테이너의 모든 빈이 후보가 되므로 하나로 정할 수 없고, <code>NoUniqueBeanDefinitionException</code>이 난다. 컨테이너는 등록 순서로 임의의 하나를 고르지 않는다. 나머지 셋은 실험에서 확인한 동작이다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>스프링 컨테이너(Spring container)</dt><dd>빈의 생성, 설정, 조립을 맡는 객체. <code>ApplicationContext</code> 인터페이스가 이를 나타낸다.</dd>
+<dt>빈 정의(BeanDefinition)</dt><dd>빈 하나를 어떻게 만들고 어떻게 다룰지를 담은 메타데이터 객체. 클래스 또는 팩토리 메서드, 스코프, 지연 초기화 여부, 의존 참조 등을 가진다.</dd>
+<dt>BeanFactory</dt><dd>이름이나 타입으로 빈을 꺼내는 메서드를 정의한 최상위 인터페이스. 대표 구현은 <code>DefaultListableBeanFactory</code>다.</dd>
+<dt>ApplicationContext</dt><dd><code>BeanFactory</code> 계열 인터페이스에 환경, 메시지, 이벤트, 리소스 기능을 더한 인터페이스. 구현은 내부 빈 팩토리에 빈 관리를 위임한다.</dd>
+<dt>refresh</dt><dd>컨텍스트가 설정을 읽어 빈 정의를 등록하고, 후처리기를 준비하고, 싱글톤을 만드는 시작 절차 전체를 수행하는 메서드.</dd>
+<dt>빈 팩토리 후처리기(BeanFactoryPostProcessor)</dt><dd>빈 인스턴스가 만들어지기 전에 빈 정의를 읽고 수정하거나 추가할 수 있는 확장 지점. <code>ConfigurationClassPostProcessor</code>가 대표적이다.</dd>
+<dt>팩토리 메서드(factory method)</dt><dd>호출하면 빈이 될 객체를 돌려주는 메서드. 자바 설정의 <code>@Bean</code> 메서드가 빈 정의에 이 형태로 기록된다.</dd>
+<dt>지연 초기화(lazy initialization)</dt><dd>컨테이너 시작 때가 아니라 처음 요청될 때 빈을 만드는 설정. 빈 정의의 <code>lazyInit</code> 필드로 표현된다.</dd>
+<dt>타입 예측(type prediction)</dt><dd>인스턴스가 아직 없는 빈의 타입을 빈 정의의 정보만으로 미리 판단하는 일. 자바 설정에서는 팩토리 메서드의 선언 반환 타입이 기준이 된다.</dd>
+<dt>의존관계 조회(dependency lookup)</dt><dd>필요한 객체를 주입받지 않고 컨테이너에 직접 물어 가져오는 방식. <code>getBean</code> 호출이 여기에 해당한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/core/beans/basics.html">Spring Framework Reference 6.2 — Container Overview</a> — 컨테이너의 정의, 설정 메타데이터의 형식, 컨텍스트 구현과 리더 조합, getBean 사용에 대한 권고</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/core/beans/definition.html">Spring Framework Reference 6.2 — Bean Overview</a> — BeanDefinition이 담는 메타데이터, registerSingleton과 registerBeanDefinition, 빈 이름 규칙</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/core/beans/beanfactory.html">Spring Framework Reference 6.2 — The BeanFactory API</a> — BeanFactory와 ApplicationContext의 기능 비교표와 사용 권고</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/core/beans/java/bean-annotation.html">Spring Framework Reference 6.2 — Using the @Bean Annotation</a> — 선언 반환 타입과 타입 예측, 기본 빈 이름, 소멸 메서드 추론</li>
+<li><a href="https://docs.spring.io/spring-framework/docs/6.2.x/javadoc-api/org/springframework/beans/factory/config/BeanDefinition.html">BeanDefinition Javadoc (Spring Framework 6.2)</a> — 인터페이스의 의도, 역할 상수, 접근 메서드 목록</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-framework/6.2.x/spring-context/src/main/java/org/springframework/context/support/AbstractApplicationContext.java">AbstractApplicationContext.java (spring-framework 6.2.x 소스)</a> — refresh()의 단계 순서, 직접 등록되는 싱글톤, getBean의 위임</li>
+</x-refs>

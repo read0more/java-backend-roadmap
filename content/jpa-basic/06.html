@@ -1,0 +1,871 @@
+<x-meta>
+deck: 객체의 상속을 상속이 없는 테이블로 옮기는 세 가지 전략과, 타입이 아니라 매핑 정보만 물려주는 @MappedSuperclass를 하이버네이트 6.6이 실제로 만든 DDL과 SQL로 비교한다.
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li>슈퍼타입·서브타입 모델을 조인, 단일 테이블, 구현 클래스마다 테이블 전략으로 옮겼을 때의 테이블 구조를 그리고, 전략마다 저장·조회·삭제에서 나가는 SQL을 예측할 수 있다.</li>
+<li>구분 컬럼(DTYPE)의 기본 이름·타입·길이·값이 어떻게 정해지는지 명세 근거로 설명하고, 구분 컬럼이 없는 조인 전략에서 하이버네이트가 행의 타입을 판별하는 방법을 SQL에서 짚을 수 있다.</li>
+<li>단일 테이블 전략에서 하위 클래스 필드의 NOT NULL 제약이 다른 타입의 저장을 깨뜨리는 이유와, 구현 클래스마다 테이블 전략에서 IDENTITY 키 생성을 쓸 수 없는 이유를 설명할 수 있다.</li>
+<li>조회 패턴, 하위 타입별 컬럼 수, 무결성 요구, 다른 테이블의 참조 방향을 근거로 세 전략 중 하나를 고르고 그 이유를 말할 수 있다.</li>
+<li>@MappedSuperclass와 엔티티 상속을 조회 가능 여부와 테이블 구조로 구분하고, @AttributeOverride로 컬럼을 바꿀 때 원래 속성이 사라지는 함정을 피할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 객체에는 상속이 있고 테이블에는 없다</h3>
+
+<p>1회에서 객체와 관계형 데이터베이스의 패러다임 불일치(paradigm mismatch)를 정리하면서 첫 번째로 상속을 꼽았다. 앞의 두 회차가 그중 연관관계, 곧 참조와 외래 키의 불일치를 다뤘다면, 이 회차는 남겨 두었던 상속을 정면으로 다룬다. 그리고 상속과 모양은 비슷하지만 성격이 전혀 다른 문제, 여러 엔티티가 같은 컬럼 몇 개를 공통으로 갖는 문제도 함께 다룬다.</p>
+
+<p>결제를 예로 들어 보자. 온라인 상점의 결제는 카드 결제일 수도 있고 계좌 이체일 수도 있다. 어느 쪽이든 결제 금액과 식별자는 있다. 카드 결제에는 카드사와 할부 개월 수가 더 있고, 계좌 이체에는 은행 이름과 입금자명이 더 있다. 자바로는 이 관계를 아주 자연스럽게 쓴다. 추상 클래스 <code>Payment</code>에 공통 필드를 두고, <code>CardPayment</code>와 <code>BankTransfer</code>가 그것을 상속한다. <code>Payment</code> 타입 변수에는 어느 하위 객체든 담을 수 있고, 그 변수로 메서드를 부르면 가상 메서드 호출(virtual method invocation)로 실제 객체의 구현이 실행된다.</p>
+
+<p>이것이 가능한 이유는 객체가 자기 타입을 스스로 알기 때문이다. HotSpot JVM에서는 힙에 놓인 모든 객체의 헤더에 그 객체의 클래스 메타데이터를 가리키는 포인터가 들어 있다. <code>instanceof</code>도, <code>getClass()</code>도, 가상 메서드 디스패치도 결국 이 포인터를 따라가서 답을 얻는다. 자바 기본편과 중급편에서 다룬 내용이다. 객체 세계에서 "이 결제가 카드 결제인가"는 객체를 열어 보면 바로 나오는 정보다.</p>
+
+<p>테이블에는 이런 장치가 없다. 행(row)은 자기가 어떤 종류인지 알려 주는 머리말을 갖지 않는다. 테이블은 정해진 컬럼 집합이고, 그 테이블의 모든 행은 같은 컬럼을 갖는다. "카드 결제 행에는 카드사 컬럼이 있고 계좌 이체 행에는 은행 컬럼이 있다"는 말을 테이블 하나의 정의로는 할 수 없다. 그래서 상속 구조를 테이블로 옮기려면 두 질문에 답해야 한다. 첫째, 어떤 컬럼을 어느 테이블에 둘 것인가. 둘째, 어떤 행을 읽었을 때 그것을 어느 클래스의 객체로 만들어야 하는지 무엇으로 알아낼 것인가. JPA가 제공하는 세 가지 상속관계 매핑(inheritance mapping) 전략은 이 두 질문에 대한 세 가지 다른 답이다.</p>
+
+<p>이 회차의 뒷부분에서 다룰 <code>@MappedSuperclass</code>는 다른 질문에 대한 답이다. 회원, 게시글, 주문처럼 서로 아무 타입 관계가 없는 엔티티들이 등록 시각과 수정 시각 같은 컬럼을 똑같이 갖는 경우가 많다. 이때 필요한 것은 "게시글은 일종의 공통 엔티티다" 같은 타입 관계가 아니라, 매핑 정보를 한곳에 적어 두고 여러 엔티티가 가져다 쓰는 것이다. 둘은 자바 문법으로는 똑같이 <code>extends</code>를 쓰지만 데이터베이스에 남는 결과가 완전히 다르다. 이 차이를 분명히 가르는 것이 이 회차의 두 번째 목표다.</p>
+
+<h3>슈퍼타입·서브타입 논리 모델과 세 가지 물리 모델</h3>
+
+<p>데이터 모델링에서는 결제와 카드 결제, 계좌 이체 같은 관계를 슈퍼타입·서브타입(supertype/subtype) 관계라고 부른다. 공통 속성을 가진 슈퍼타입이 있고, 각 서브타입이 자기만의 속성을 덧붙인다. 이것은 논리 모델의 개념이다. 실제 테이블로 바꾸는 물리 모델 단계에서는 이 관계를 표현하는 방법이 크게 세 가지 있고, JPA의 <code>InheritanceType</code> 열거형의 세 값이 정확히 이 세 방법에 대응한다.</p>
+
+<ul>
+<li><b>조인 전략(<code>JOINED</code>)</b>: 슈퍼타입과 각 서브타입을 각자의 테이블로 만든다. 서브타입 테이블의 기본 키가 슈퍼타입 테이블의 기본 키를 외래 키로 참조한다. 객체 하나가 테이블 두 개에 나뉘어 저장된다.</li>
+<li><b>단일 테이블 전략(<code>SINGLE_TABLE</code>)</b>: 슈퍼타입과 모든 서브타입의 컬럼을 테이블 하나에 모은다. 각 행이 어느 타입인지는 구분 컬럼(discriminator column)의 값으로 가린다.</li>
+<li><b>구현 클래스마다 테이블 전략(<code>TABLE_PER_CLASS</code>)</b>: 구체 클래스마다 테이블을 하나씩 만들고, 각 테이블에 상속받은 컬럼까지 모두 넣는다. 슈퍼타입에 해당하는 테이블은 없다.</li>
+</ul>
+
+<pre class="diagram">객체 모델                         ① JOINED
+                                  ┌─────────────┐
+   Payment (abstract)             │ Payment     │ id(PK), amount
+   ├ id, amount                   └─────▲───────┘
+   │                                    │ id = id (PK이자 FK)
+   ├─ CardPayment                 ┌─────┴───────┐  ┌──────────────┐
+   │    cardCompany,              │ CardPayment │  │ BankTransfer │
+   │    installmentMonths         │ id, cardCo..│  │ id, bankName │
+   └─ BankTransfer                └─────────────┘  └──────────────┘
+        bankName, depositor
+                                  ② SINGLE_TABLE
+                                  ┌──────────────────────────────────────────┐
+                                  │ Payment                                  │
+                                  │ id, DTYPE, amount,                       │
+                                  │ cardCompany, installmentMonths,          │
+                                  │ bankName, depositor  (하위 타입 컬럼은 NULL 허용) │
+                                  └──────────────────────────────────────────┘
+
+                                  ③ TABLE_PER_CLASS
+                                  ┌──────────────────────┐ ┌──────────────────────┐
+                                  │ CardPayment          │ │ BankTransfer         │
+                                  │ id, amount,          │ │ id, amount,          │
+                                  │ cardCompany, install.│ │ bankName, depositor  │
+                                  └──────────────────────┘ └──────────────────────┘</pre>
+
+<p>전략은 상속 계층의 최상위 엔티티, 곧 루트 엔티티(root entity)에 <code>@Inheritance(strategy = ...)</code>로 지정한다. 아무것도 지정하지 않으면 어떻게 될까. Jakarta Persistence의 <code>Inheritance</code> 애너테이션 문서는 이 애너테이션이 없거나 상속 타입을 지정하지 않으면 <code>SINGLE_TABLE</code> 전략을 쓴다고 정해 두었다. 엔티티 클래스가 다른 엔티티 클래스를 상속하기만 하면, 아무 설정을 하지 않아도 이미 단일 테이블 전략이 적용되고 있다는 뜻이다. 이 기본값을 모르고 하위 엔티티를 추가했다가 테이블 하나에 컬럼이 계속 늘어나는 것을 뒤늦게 발견하는 일이 생긴다. 뒤의 실험에서 이것도 직접 확인한다.</p>
+
+<p>세 전략의 차이를 한 표로 먼저 정리하고, 이어서 하나씩 실제 SQL로 확인한다. 표의 내용은 뒤에서 모두 실행 결과로 뒷받침한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>비교 항목</th><th>JOINED</th><th>SINGLE_TABLE</th><th>TABLE_PER_CLASS</th></tr></thead><tbody>
+<tr><td>테이블 수(하위 타입 2개)</td><td>3개</td><td>1개</td><td>2개(부모가 추상일 때)</td></tr>
+<tr><td>객체 하나 저장</td><td>INSERT 2번</td><td>INSERT 1번</td><td>INSERT 1번</td></tr>
+<tr><td>하위 타입으로 조회</td><td>부모와 inner join</td><td>구분 값 조건 추가</td><td>그 테이블 하나</td></tr>
+<tr><td>부모 타입으로 조회</td><td>모든 하위 테이블 left join</td><td>테이블 하나</td><td>모든 테이블 UNION ALL</td></tr>
+<tr><td>구분 컬럼</td><td>선택(하이버네이트는 없어도 동작)</td><td>필수(지정 안 해도 생성)</td><td>쓰지 않음</td></tr>
+<tr><td>하위 타입 컬럼의 NOT NULL</td><td>가능</td><td>불가(명세가 NULL 허용을 요구)</td><td>가능</td></tr>
+<tr><td>명세상 지원</td><td>필수</td><td>필수</td><td>선택(optional)</td></tr>
+</tbody></table></div>
+
+<x-visual id="jpa-basic-06-three-strategies" title="하나의 객체 상속 구조를 세 가지 테이블 구조로 옮긴 모습" kind="구조 비교도" ratio="16:9">
+<x-hint>왼쪽의 클래스 상속 구조 하나가 오른쪽에서 세 가지 다른 테이블 배치로 바뀌는 것을 한눈에 비교한다.</x-hint>
+<x-prompt>Clean technical diagram on white background, 16:9. Left column: a UML-style class tree with an abstract box labeled "Payment" (fields id, amount) on top and two child boxes labeled "CardPayment" and "BankTransfer" connected by hollow-triangle inheritance arrows pointing up. Right side: three horizontal panels stacked vertically, each with a small Korean title. Panel 1 titled "조인 전략": three table icons, "Payment" on top and "CardPayment", "BankTransfer" below, each child connected to the parent by an arrow labeled "PK = FK". Panel 2 titled "단일 테이블 전략": one wide table icon "Payment" with a highlighted column labeled "DTYPE" and greyed cells marked "NULL". Panel 3 titled "구현 클래스마다 테이블": two separate table icons "CardPayment" and "BankTransfer", each containing an "amount" column, with no parent table and a dashed outline where the parent would be. Thin connecting lines from the class tree to each panel. Flat colors, no shadows.</x-prompt>
+<x-caption>같은 클래스 구조라도 전략에 따라 테이블 수, 구분 컬럼의 유무, NULL이 생기는 위치가 달라진다.</x-caption>
+</x-visual>
+
+<h3>실험 준비: 결제 계층과 실행 환경</h3>
+
+<p>이 회차의 SQL은 모두 직접 실행해서 얻은 것이다. 환경은 Java 21(Temurin 21.0.13), Hibernate ORM 6.6.53.Final, 인메모리 H2 2.3.232이고, <code>hibernate.hbm2ddl.auto=create</code>로 스키마를 자동 생성하고 <code>hibernate.show_sql=true</code>로 SQL을 출력했다. 출력 앞의 <code>Hibernate:</code> 접두어는 지면을 위해 지웠다. 스프링 부트를 쓰지 않았으므로 컬럼 이름은 필드 이름 그대로다. 스프링 부트의 기본 설정이라면 <code>cardCompany</code>가 <code>card_company</code>로 바뀌는 식의 이름 변환이 추가로 일어난다.</p>
+
+<p>엔티티는 세 개다. 전략을 바꿔 가며 같은 코드를 돌리기 위해 <code>@Inheritance</code> 줄만 바꾼다. 카드사 필드에는 일부러 <code>@Column(nullable = false)</code>를 붙였다. 이것이 전략에 따라 어떻게 다른 결과를 내는지가 이 회차의 중요한 관찰 중 하나다.</p>
+
+<pre><code class="language-java">@Entity
+@Inheritance(strategy = InheritanceType.JOINED)   // 실험마다 이 줄만 바꾼다
+public abstract class Payment {
+    @Id @GeneratedValue
+    Long id;
+    long amount;
+    protected Payment() {}
+    Payment(long amount) { this.amount = amount; }
+    public Long getId() { return id; }
+}
+
+@Entity
+public class CardPayment extends Payment {
+    @Column(nullable = false)
+    String cardCompany;
+    int installmentMonths;
+    protected CardPayment() {}
+    public CardPayment(long amount, String cardCompany, int installmentMonths) {
+        super(amount); this.cardCompany = cardCompany; this.installmentMonths = installmentMonths;
+    }
+}
+
+@Entity
+public class BankTransfer extends Payment {
+    String bankName;
+    String depositor;
+    protected BankTransfer() {}
+    public BankTransfer(long amount, String bankName, String depositor) {
+        super(amount); this.bankName = bankName; this.depositor = depositor;
+    }
+}</code></pre>
+
+<p>식별자는 루트 엔티티인 <code>Payment</code>에만 선언했다. 명세는 기본 키를 엔티티 계층의 루트 엔티티나, 계층의 모든 엔티티가 상속하는 매핑된 상위 클래스에 정의하도록 요구한다. 하위 엔티티가 자기만의 <code>@Id</code>를 따로 가질 수 없다는 뜻이다. 계층 전체가 하나의 식별자 공간을 공유한다는 이 사실은 뒤에서 <code>TABLE_PER_CLASS</code>와 IDENTITY 전략의 충돌을 설명할 때 다시 쓰인다.</p>
+
+<p>실험을 돌리는 코드는 같은 패키지에 두고 필드에 직접 접근한다. 단계마다 <code>em.clear()</code>로 영속성 컨텍스트를 비워 1차 캐시가 아니라 데이터베이스에서 다시 읽게 했다. 2회에서 본 대로, 비우지 않으면 <code>em.find()</code>가 SQL 없이 1차 캐시에서 객체를 돌려주므로 관찰하려는 SQL이 나오지 않는다.</p>
+
+<pre><code class="language-java">tx.begin();
+System.out.println("== 1 persist");
+CardPayment c = new CardPayment(30000, "HANA", 3); em.persist(c);
+BankTransfer b = new BankTransfer(12000, "KB", "kim"); em.persist(b);
+em.flush(); em.clear();
+
+System.out.println("== 2 find child");
+em.find(CardPayment.class, c.id);
+em.clear();
+
+System.out.println("== 3 find parent");
+Payment fp = em.find(Payment.class, c.id);
+System.out.println("class=" + fp.getClass().getSimpleName());
+em.clear();
+
+System.out.println("== 4 jpql parent");
+List<Payment> all = em.createQuery(
+        "select p from Payment p where p.amount >= 10000", Payment.class).getResultList();
+for (Payment p : all) System.out.println(p.getClass().getSimpleName() + " " + p.amount);
+em.clear();
+
+System.out.println("== 5 jpql child");
+em.createQuery("select c from CardPayment c where c.cardCompany = 'HANA'", CardPayment.class).getResultList();
+em.clear();
+
+System.out.println("== 6 type()");
+em.createQuery("select p from Payment p where type(p) = BankTransfer", Payment.class).getResultList();
+em.clear();
+
+System.out.println("== 7 remove");
+em.remove(em.find(CardPayment.class, c.id));
+em.flush();
+tx.commit();</code></pre>
+
+<p>식별자 생성에 대해서도 미리 봐 둘 것이 있다. <code>@GeneratedValue</code>만 붙이면 하이버네이트 6은 H2에서 시퀀스를 쓰는데, 세 전략 모두에서 생성된 시퀀스는 <code>Payment_SEQ</code> 하나뿐이었다. 하위 엔티티마다 시퀀스가 생기지 않고, 루트 엔티티 이름을 딴 시퀀스 하나를 계층 전체가 나눠 쓴다. <code>increment by 50</code>의 의미, 곧 allocationSize와 시퀀스 호출 횟수의 관계는 3회에서 다뤘으므로 여기서는 시퀀스 호출 줄을 대부분 생략한다.</p>
+
+<h3>조인 전략: 타입마다 테이블을 나누고 기본 키로 잇는다</h3>
+
+<p>먼저 <code>JOINED</code>다. 하이버네이트가 만든 DDL은 다음과 같다.</p>
+
+<pre data-label="생성된 DDL (JOINED)"><code class="language-sql">create sequence Payment_SEQ start with 1 increment by 50
+create table BankTransfer (id bigint not null, bankName varchar(255), depositor varchar(255), primary key (id))
+create table CardPayment (installmentMonths integer not null, id bigint not null, cardCompany varchar(255) not null, primary key (id))
+create table Payment (amount bigint not null, id bigint not null, primary key (id))
+alter table if exists BankTransfer add constraint FKma0h8j787xm7e85ql9u44rxuj foreign key (id) references Payment
+alter table if exists CardPayment add constraint FKa14w7iwcugxs1curkuwet67nq foreign key (id) references Payment</code></pre>
+
+<p>테이블이 세 개 생겼다. 공통 필드 <code>amount</code>는 <code>Payment</code>에만 있고, 하위 타입의 필드는 각자의 테이블에만 있다. 눈여겨볼 곳은 <code>CardPayment</code>의 <code>id</code>다. 이 컬럼은 <code>CardPayment</code>의 기본 키이면서 동시에 <code>Payment(id)</code>를 참조하는 외래 키다. 카드 결제 객체 하나는 <code>Payment</code>의 행 하나와 <code>CardPayment</code>의 행 하나로 나뉘어 저장되고, 두 행은 같은 id 값으로 묶인다. 이 일대일 연결이 자바의 "<code>CardPayment</code> 객체는 <code>Payment</code>이기도 하다"를 테이블로 옮긴 모습이다.</p>
+
+<p>하위 테이블의 기본 키 컬럼 이름은 따로 지정하지 않으면 부모 테이블의 기본 키 컬럼 이름과 같다. 하이버네이트 사용자 가이드도 <code>@PrimaryKeyJoinColumn</code>을 지정하지 않으면 기본 키이자 외래 키인 컬럼이 상위 클래스의 기본 키 컬럼과 같은 이름을 갖는다고 설명한다. 기존 스키마에 맞춰 하위 테이블의 컬럼을 <code>card_payment_id</code>처럼 다르게 부르고 싶다면 하위 엔티티에 <code>@PrimaryKeyJoinColumn(name = "card_payment_id")</code>를 붙인다.</p>
+
+<p>또 하나, 하위 테이블에서는 NOT NULL 제약이 그대로 살아 있다. <code>cardCompany varchar(255) not null</code>, 그리고 기본형 <code>int</code>인 <code>installmentMonths</code>도 <code>integer not null</code>이다. <code>CardPayment</code> 테이블에는 카드 결제 행만 들어가므로 "카드 결제라면 카드사가 반드시 있다"는 규칙을 데이터베이스가 직접 지켜 줄 수 있다. 단일 테이블 전략과 비교할 때 이 점이 결정적인 차이가 된다.</p>
+
+<h4>저장: 부모 행이 먼저, 자식 행이 나중</h4>
+
+<pre data-label="== 1 persist"><code class="language-sql">select next value for Payment_SEQ
+select next value for Payment_SEQ
+insert into Payment (amount,id) values (?,?)
+insert into CardPayment (cardCompany,installmentMonths,id) values (?,?,?)
+insert into Payment (amount,id) values (?,?)
+insert into BankTransfer (bankName,depositor,id) values (?,?,?)</code></pre>
+
+<p><code>persist()</code> 두 번에 INSERT가 네 번 나갔다. 객체 하나마다 부모 테이블과 자식 테이블에 한 번씩이다. 순서는 항상 부모가 먼저다. 자식 테이블의 id가 부모 테이블의 id를 외래 키로 참조하므로, 부모 행이 없는 상태에서 자식 행을 넣으면 외래 키 제약 위반이 된다. 두 INSERT에 같은 id 값이 들어간다는 점도 중요하다. 시퀀스에서 값을 먼저 받아 객체에 채운 뒤 그 값을 두 테이블에 똑같이 쓴다.</p>
+
+<h4>하위 타입으로 조회: 부모와 inner join 한 번</h4>
+
+<pre data-label="== 2 find child"><code class="language-sql">select cp1_0.id,cp1_1.amount,cp1_0.cardCompany,cp1_0.installmentMonths
+from CardPayment cp1_0 join Payment cp1_1 on cp1_0.id=cp1_1.id
+where cp1_0.id=?</code></pre>
+
+<p><code>em.find(CardPayment.class, id)</code>는 <code>CardPayment</code>와 <code>Payment</code>를 inner join한다. 하위 타입을 콕 집어 조회했으므로 다른 하위 테이블인 <code>BankTransfer</code>는 볼 필요가 없다. <code>amount</code>는 부모 테이블에서, 나머지는 자식 테이블에서 가져온다. JPQL로 <code>select c from CardPayment c where c.cardCompany = 'HANA'</code>를 실행해도 같은 모양의 조인에 조건만 바뀐 SQL이 나왔다.</p>
+
+<h4>부모 타입으로 조회: 모든 하위 테이블을 left join</h4>
+
+<p>흥미로운 것은 부모 타입으로 조회할 때다. <code>em.find(Payment.class, id)</code>를 부르는 시점에 하이버네이트는 그 id가 카드 결제인지 계좌 이체인지 모른다. 그런데 결과로 돌려줄 객체는 <code>Payment</code>가 아니라 실제 하위 클래스의 인스턴스여야 한다. <code>Payment</code>는 추상 클래스라 인스턴스를 만들 수도 없다.</p>
+
+<pre data-label="== 3 find parent"><code class="language-sql">select p1_0.id,
+       case when p1_1.id is not null then 1 when p1_2.id is not null then 2 end,
+       p1_0.amount,p1_1.bankName,p1_1.depositor,p1_2.cardCompany,p1_2.installmentMonths
+from Payment p1_0
+     left join BankTransfer p1_1 on p1_0.id=p1_1.id
+     left join CardPayment p1_2 on p1_0.id=p1_2.id
+where p1_0.id=?</code></pre>
+<pre data-label="실행 결과"><code class="language-text">class=CardPayment</code></pre>
+
+<p>하이버네이트의 해법은 이렇다. 부모 테이블에서 시작해 모든 하위 테이블을 left join한다. 이 행이 카드 결제라면 <code>CardPayment</code> 쪽 조인만 성공하고 <code>BankTransfer</code> 쪽은 모든 컬럼이 NULL로 채워진다. 그러면 어느 하위 테이블의 id가 NULL이 아닌지를 보면 타입을 알 수 있다. 그 판별을 SQL 안에서 하는 것이 <code>case when p1_1.id is not null then 1 when p1_2.id is not null then 2 end</code>다. 결과 집합의 두 번째 컬럼에 담긴 숫자를 보고 하이버네이트가 어느 클래스의 인스턴스를 만들지 정한다. 이 1과 2는 하이버네이트가 내부적으로 하위 클래스에 붙인 번호이고, 뒤의 <code>TABLE_PER_CLASS</code> 실험에서는 같은 클래스에 다른 번호가 붙었다. 번호 자체에 의미를 두지 말고 "조인 성공 여부로 타입을 판별한다"는 구조만 기억하면 된다.</p>
+
+<p>inner join이 아니라 left join인 이유도 여기서 나온다. inner join을 쓰면 <code>BankTransfer</code>와의 조인이 실패하는 순간 카드 결제 행 전체가 결과에서 사라진다. 어느 하위 테이블에 짝이 있을지 모르니, 짝이 없어도 행을 살려 두는 left join을 써야 한다. JPQL로 <code>select p from Payment p where p.amount >= 10000</code>을 실행해도 같은 구조에 <code>where p1_0.amount>=10000</code>만 바뀐 SQL이 나갔고, 결과로 <code>CardPayment 30000</code>과 <code>BankTransfer 12000</code>이 각각 올바른 클래스로 만들어졌다.</p>
+
+<p>이 구조의 비용은 하위 타입 수에 비례한다. 하위 타입이 다섯 개면 부모 타입 조회마다 left join이 다섯 번 들어간다. 하이버네이트 사용자 가이드도 조인 전략의 다형성 질의는 여러 조인을 쓸 수 있어 많은 엔티티를 가져올 때 성능에 영향을 줄 수 있다고 적어 두었다. 명세 역시 조인 전략은 하위 클래스의 인스턴스를 만들 때 하나 이상의 조인 연산이 필요하다는 점을 이 전략의 특징으로 명시한다.</p>
+
+<x-visual id="jpa-basic-06-joined-polymorphic-load" title="조인 전략에서 부모 타입 조회가 타입을 판별하는 과정" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>em.find(Payment.class, id)가 left join과 CASE 식으로 행의 실제 타입을 판별하고 그 클래스의 객체를 만드는 흐름을 보여 준다.</x-hint>
+<x-prompt>Sequence diagram on white background, 16:9, four vertical lifelines labeled "애플리케이션", "하이버네이트", "Payment 테이블", "하위 테이블들". Arrow 1 from "애플리케이션" to "하이버네이트" labeled "em.find(Payment.class, 1)". Arrow 2 from "하이버네이트" to the two table lifelines labeled "left join 전부". Below it, a small result-row box showing three cells: "id=1", "BankTransfer.id = NULL", "CardPayment.id = 1", with the last cell highlighted green. Arrow 3 returning to "하이버네이트" labeled "CASE 결과 = CardPayment". A box beside "하이버네이트" labeled "CardPayment 객체 생성". Arrow 4 back to "애플리케이션" labeled "CardPayment 인스턴스 반환". Minimal flat style, thin black arrows, Korean labels exactly as given.</x-prompt>
+<x-caption>부모 타입으로 조회하면 어느 하위 테이블과의 조인이 성공했는지로 실제 타입을 판별한다.</x-caption>
+</x-visual>
+
+<h4>삭제: 자식 행이 먼저, 부모 행이 나중</h4>
+
+<pre data-label="== 7 remove"><code class="language-sql">select cp1_0.id,cp1_1.amount,cp1_0.cardCompany,cp1_0.installmentMonths
+from CardPayment cp1_0 join Payment cp1_1 on cp1_0.id=cp1_1.id where cp1_0.id=?
+delete from CardPayment where id=?
+delete from Payment where id=?</code></pre>
+
+<p>삭제는 저장의 거꾸로다. 자식 행이 부모 행을 참조하고 있으므로 자식을 먼저 지워야 부모를 지울 수 있다. 객체 하나를 지우는 데 DELETE가 두 번 나간다. 첫 줄의 SELECT는 <code>em.remove()</code>에 넘길 객체를 얻으려고 직접 부른 <code>em.find()</code>가 만든 것이다.</p>
+
+<h4>구분 컬럼을 추가하면 무엇이 바뀌는가</h4>
+
+<p>조인 전략에도 구분 컬럼을 둘 수 있다. 루트 엔티티에 <code>@DiscriminatorColumn</code>을 붙이고 같은 실험을 다시 돌리면 <code>Payment</code> 테이블에 컬럼 하나가 생긴다.</p>
+
+<pre data-label="@DiscriminatorColumn 추가 후"><code class="language-sql">create table Payment (amount bigint not null, id bigint not null, DTYPE varchar(31) not null, primary key (id))
+
+insert into Payment (amount,DTYPE,id) values (?,'CardPayment',?)
+insert into CardPayment (cardCompany,installmentMonths,id) values (?,?,?)
+
+-- em.find(Payment.class, id)
+select p1_0.id,p1_0.DTYPE,p1_0.amount,p1_1.bankName,p1_1.depositor,p1_2.cardCompany,p1_2.installmentMonths
+from Payment p1_0 left join BankTransfer p1_1 on p1_0.id=p1_1.id left join CardPayment p1_2 on p1_0.id=p1_2.id
+where p1_0.id=?
+
+-- select p from Payment p where type(p) = BankTransfer
+select ... from Payment p1_0 left join BankTransfer p1_1 on p1_0.id=p1_1.id left join CardPayment p1_2 on p1_0.id=p1_2.id
+where p1_0.DTYPE='BankTransfer'</code></pre>
+
+<p>달라진 것은 세 군데다. <code>Payment</code>에 <code>DTYPE varchar(31) not null</code>이 생겼고, INSERT에 <code>'CardPayment'</code>라는 문자열 리터럴이 들어갔고, 타입 판별이 CASE 식 대신 <code>p1_0.DTYPE</code> 컬럼 값으로 바뀌었다. 부모 타입 조회에서 left join이 사라지지는 않는다. 타입은 DTYPE으로 알 수 있어도 하위 클래스의 필드 값은 여전히 하위 테이블에 있기 때문이다.</p>
+
+<p>하이버네이트 사용자 가이드는 조인 전략에 구분 컬럼이 필요하지 않다고 적고 있다. 위에서 본 것처럼 조인 결과만으로 타입을 판별할 수 있기 때문이다. 그런데도 구분 컬럼을 두는 경우가 많은 이유는 데이터베이스를 JPA 밖에서 보는 사람 때문이다. 운영 중에 SQL 클라이언트로 <code>Payment</code> 테이블만 열어 본 사람, 통계를 뽑는 배치, 다른 언어로 작성된 서비스는 하이버네이트의 CASE 식을 알지 못한다. DTYPE 컬럼이 있으면 부모 테이블 하나만 봐도 행의 종류를 알 수 있다. <code>type()</code> 조건이 단순한 컬럼 비교가 되는 것도 장점이다.</p>
+
+<h3>단일 테이블 전략: 한 테이블에 모두 넣고 구분 컬럼으로 가른다</h3>
+
+<p>이번에는 <code>@Inheritance(strategy = InheritanceType.SINGLE_TABLE)</code>로 바꾼다. 구분 컬럼 애너테이션은 일부러 붙이지 않았고, <code>CardPayment</code>에만 <code>@DiscriminatorValue("CARD")</code>를 붙였다. 생성된 DDL은 다음과 같다.</p>
+
+<pre data-label="생성된 DDL (SINGLE_TABLE)"><code class="language-sql">create table Payment (installmentMonths integer, amount bigint not null, id bigint not null,
+    DTYPE varchar(31) not null, bankName varchar(255), cardCompany varchar(255) not null,
+    depositor varchar(255), primary key (id))</code></pre>
+
+<p>테이블은 하나다. 공통 컬럼과 모든 하위 타입의 컬럼이 한 테이블에 모였다. 그리고 <code>@DiscriminatorColumn</code>을 붙이지 않았는데도 <code>DTYPE varchar(31) not null</code>이 생겼다. 단일 테이블에서는 행의 종류를 알려 줄 다른 수단이 없으므로 구분 컬럼이 반드시 필요하다. <code>DiscriminatorColumn</code>의 API 문서는 이 애너테이션이 없는데 구분 컬럼이 필요한 경우 컬럼 이름은 <code>DTYPE</code>, 타입은 <code>DiscriminatorType.STRING</code>이 기본값이라고 정해 두었다. 길이 31은 이 애너테이션의 <code>length</code> 요소의 기본값이다. 애너테이션 클래스 파일을 <code>javap -v</code>로 열어 보면 <code>name</code>의 기본값 <code>"DTYPE"</code>, <code>discriminatorType</code>의 기본값 <code>STRING</code>이 <code>AnnotationDefault</code> 속성에 그대로 들어 있다.</p>
+
+<p><code>@Inheritance</code>를 아예 지우고 같은 실험을 돌려도 결과는 같았다. 앞에서 말한 대로 상속 전략을 지정하지 않으면 단일 테이블 전략이 기본값이기 때문이다. 이때 <code>CardPayment</code>의 구분 값은 <code>'CardPayment'</code>로 들어갔다.</p>
+
+<h4>구분 값은 어디서 오는가</h4>
+
+<pre data-label="== 1 persist (SINGLE_TABLE)"><code class="language-sql">insert into Payment (amount,cardCompany,installmentMonths,DTYPE,id) values (?,?,?,'CARD',?)
+insert into Payment (amount,bankName,depositor,DTYPE,id) values (?,?,?,'BankTransfer',?)</code></pre>
+
+<p><code>@DiscriminatorValue("CARD")</code>를 붙인 카드 결제는 <code>'CARD'</code>로, 아무것도 붙이지 않은 계좌 이체는 <code>'BankTransfer'</code>로 저장됐다. <code>DiscriminatorValue</code>의 API 문서는 값을 지정하지 않으면 공급자가 정한 방식으로 엔티티 타입을 나타내는 값을 만들고, 구분 타입이 <code>STRING</code>이면 기본값이 엔티티 이름이라고 정해 두었다. 엔티티 이름은 <code>@Entity(name = ...)</code>를 지정하지 않으면 패키지를 뺀 클래스 이름이다. 같은 문서는 <code>@DiscriminatorValue</code>를 구체 엔티티 클래스에만 지정할 수 있다고도 적고 있다. 인스턴스가 만들어질 수 없는 추상 클래스에는 값이 필요 없다.</p>
+
+<p>기본값인 클래스 이름을 그대로 쓰는 것은 편하지만 대가가 있다. 데이터베이스에 저장된 문자열이 자바 클래스 이름에 묶인다. 리팩터링으로 <code>BankTransfer</code>를 <code>AccountTransfer</code>로 바꾸는 순간, 이미 저장된 행의 <code>'BankTransfer'</code>는 어떤 클래스와도 맞지 않는 값이 된다. 운영 데이터가 쌓일 테이블이라면 <code>@DiscriminatorValue</code>로 클래스 이름과 무관한 짧은 코드를 명시해 두는 편이 안전하다. 이 실험에서 <code>'CARD'</code>를 쓴 것이 그런 예다.</p>
+
+<h4>하위 타입 컬럼의 NOT NULL이 다른 타입을 깨뜨린다</h4>
+
+<p>위의 DDL을 다시 보자. <code>cardCompany varchar(255) not null</code>. 카드사 필드에 붙인 <code>@Column(nullable = false)</code>가 단일 테이블에서도 그대로 NOT NULL 제약이 되었다. 그런데 이 테이블에는 계좌 이체 행도 들어간다. 계좌 이체에는 카드사가 없다. 실제로 실험은 두 번째 INSERT에서 멈췄다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">insert into Payment (amount,cardCompany,installmentMonths,DTYPE,id) values (?,?,?,'CARD',?)
+insert into Payment (amount,bankName,depositor,DTYPE,id) values (?,?,?,'BankTransfer',?)
+ERROR: NULL not allowed for column "CARDCOMPANY"; SQL statement:
+Exception in thread "main" org.hibernate.exception.ConstraintViolationException: could not execute statement [NULL not allowed for column "CARDCOMPANY"; ...]</code></pre>
+
+<p>계좌 이체를 저장하는 INSERT에는 <code>cardCompany</code> 컬럼이 아예 없다. 하이버네이트는 하위 타입마다 자기 컬럼만 담은 INSERT 문을 만들고, 빠진 컬럼은 데이터베이스가 NULL로 채운다. 그 NULL이 카드 결제를 위해 걸어 둔 NOT NULL 제약에 걸렸다. 매핑은 아무 경고 없이 통과했고 스키마도 만들어졌다. 문제는 계좌 이체를 처음 저장하는 순간에야 드러난다. 카드 결제만 테스트하면 영영 발견하지 못할 수도 있는 종류의 버그다.</p>
+
+<p>위 오류 문구는 H2의 것이다. MySQL 8.4.13과 8.0.46에서 같은 모양의 테이블(<code>cardCompany varchar(255) not null</code>)에 그 컬럼을 뺀 INSERT를 실행하면 문구가 <code>ERROR 1364 (HY000): Field 'cardCompany' doesn't have a default value</code>로 바뀐다. 기본 <code>sql_mode</code>에 들어 있는 엄격 모드(<code>STRICT_TRANS_TABLES</code>)에서는 기본값이 없는 NOT NULL 컬럼을 INSERT에서 빼면 MySQL이 그 문장을 거부한다. 문구는 달라도 계좌 이체 저장이 실패한다는 결과는 같다.</p>
+
+<p>같은 DDL에서 <code>installmentMonths integer</code>에는 NOT NULL이 붙지 않았다는 점도 비교해 볼 만하다. 조인 전략에서는 기본형 <code>int</code> 필드가 <code>integer not null</code>이 되었는데, 단일 테이블 전략에서는 NULL 허용으로 바뀌었다. 기본형이라 생긴 암묵적인 NOT NULL은 하이버네이트가 하위 타입 컬럼에서 빼 주었지만, 개발자가 <code>nullable = false</code>로 명시한 제약은 그대로 남긴 것이다. 하이버네이트 6.6.53에서 관찰한 동작이다.</p>
+
+<p>명세의 태도는 분명하다. 단일 테이블 전략을 설명하는 절은 이 전략이 하위 클래스 고유 상태에 대응하는 컬럼이 NULL을 허용할 것을 요구한다고 적고 있다. 하이버네이트 사용자 가이드도 모든 하위 클래스 컬럼이 한 테이블에 있으므로 NOT NULL 제약을 더는 쓸 수 없고, 무결성 검사를 데이터 접근 계층으로 옮기거나 CHECK 제약이나 트리거로 강제해야 한다고 설명한다. 그러니 단일 테이블 전략에서는 하위 클래스 필드에 <code>nullable = false</code>를 붙이지 않는다. 그 규칙을 지키고 싶다면 생성자에서 검사하거나, 데이터베이스 수준이라면 구분 값과 엮은 CHECK 제약을 쓴다. MySQL은 8.0.16부터 CHECK 제약을 실제로 검사하고, 그 이전 버전은 CHECK 구문을 해석만 하고 무시했다.</p>
+
+<pre><code class="language-sql">-- 카드 결제 행이라면 카드사가 반드시 있어야 한다 (MySQL 8.0.16 이상에서 검사됨)
+alter table Payment add constraint chk_card_company
+    check (DTYPE <> 'CARD' or cardCompany is not null);</code></pre>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 같다)"><code class="language-text">mysql> insert into Payment (amount,bankName,depositor,DTYPE,id) values (1000,'KB','kim','BANK',2);
+Query OK, 1 row affected
+mysql> insert into Payment (amount,installmentMonths,DTYPE,id) values (1000,3,'CARD',1);
+ERROR 3819 (HY000): Check constraint 'chk_card_company' is violated.
+mysql> insert into Payment (amount,cardCompany,installmentMonths,DTYPE,id) values (1000,'HANA',3,'CARD',1);
+Query OK, 1 row affected</code></pre>
+
+<p>이 조건은 "카드 결제가 아니거나, 카드사가 있다"로 읽는다. 구분 값이 <code>'CARD'</code>가 아닌 행은 첫 조건이 참이라 무조건 통과하고, 카드 결제 행은 두 번째 조건을 만족해야 통과한다. 조인 전략에서는 <code>CardPayment</code> 테이블의 NOT NULL 하나로 끝나던 규칙을 이렇게 손으로 다시 적어야 한다는 것, 이것이 단일 테이블 전략이 무결성 쪽에서 치르는 비용이다.</p>
+
+<h4>조회: 조인이 없다</h4>
+
+<p>카드사 필드에서 <code>nullable = false</code>를 지우고 실험을 다시 돌리면 모든 단계가 끝까지 진행된다. 나머지 SQL은 다음과 같다.</p>
+
+<pre data-label="조회와 삭제 (SINGLE_TABLE)"><code class="language-sql">-- em.find(CardPayment.class, id)
+select cp1_0.id,cp1_0.amount,cp1_0.cardCompany,cp1_0.installmentMonths
+from Payment cp1_0 where cp1_0.DTYPE='CARD' and cp1_0.id=?
+
+-- em.find(Payment.class, id)
+select p1_0.id,p1_0.DTYPE,p1_0.amount,p1_0.bankName,p1_0.depositor,p1_0.cardCompany,p1_0.installmentMonths
+from Payment p1_0 where p1_0.id=?
+
+-- select c from CardPayment c where c.cardCompany = 'HANA'
+select cp1_0.id,cp1_0.amount,cp1_0.cardCompany,cp1_0.installmentMonths
+from Payment cp1_0 where cp1_0.cardCompany='HANA' and cp1_0.DTYPE='CARD'
+
+-- select p from Payment p where type(p) = BankTransfer
+select ... from Payment p1_0 where p1_0.DTYPE='BankTransfer'
+
+-- em.remove(...)
+delete from Payment where id=?</code></pre>
+
+<p>모든 SQL이 테이블 하나에서 끝난다. 부모 타입으로 조회할 때는 조건 없이 모든 컬럼을 읽고, 읽은 행의 DTYPE 값을 보고 객체의 클래스를 정한다. 하위 타입으로 조회할 때는 <code>DTYPE='CARD'</code> 조건이 자동으로 붙는다. 이 조건이 없다면 id만 맞으면 계좌 이체 행도 카드 결제로 읽힐 수 있으니, 하위 타입 조회에서 구분 값 조건은 정확성을 위한 장치다. 저장과 삭제도 한 문장씩이다. 하이버네이트 사용자 가이드가 단일 테이블 전략을 다른 상속 전략 가운데 성능이 가장 좋다고 평가하는 이유가 테이블 하나만 접근하면 된다는 이 구조에 있다.</p>
+
+<h3>구현 클래스마다 테이블 전략: 합집합으로 부모를 흉내 낸다</h3>
+
+<p>세 번째는 <code>TABLE_PER_CLASS</code>다. 생성된 DDL부터 보자.</p>
+
+<pre data-label="생성된 DDL (TABLE_PER_CLASS)"><code class="language-sql">create sequence Payment_SEQ start with 1 increment by 50
+create table BankTransfer (amount bigint not null, id bigint not null, bankName varchar(255), depositor varchar(255), primary key (id))
+create table CardPayment (installmentMonths integer not null, amount bigint not null, id bigint not null, cardCompany varchar(255) not null, primary key (id))</code></pre>
+
+<p><code>Payment</code> 테이블이 없다. <code>Payment</code>가 추상 클래스라서 그 자체로 저장될 행이 없기 때문이다. 대신 공통 필드 <code>amount</code>가 두 테이블에 각각 들어갔다. 각 테이블이 그 클래스의 전체 상태를 갖는다는 점에서 이 전략의 이름이 나왔다. 하위 테이블마다 독립적이므로 NOT NULL 제약도 조인 전략처럼 자유롭게 쓸 수 있다. 저장도 테이블 하나에 INSERT 한 번이고, <code>em.find(CardPayment.class, id)</code>는 <code>CardPayment</code> 테이블만 읽는다. 하위 타입만 다루는 동안에는 상속이 없는 평범한 엔티티와 다를 것이 없다.</p>
+
+<p>문제는 부모 타입으로 조회할 때 시작된다. <code>Payment</code> 테이블이 없으니 "모든 결제"는 데이터베이스 어디에도 하나의 테이블로 존재하지 않는다. 하이버네이트는 모든 하위 테이블을 <code>UNION ALL</code>로 이어 붙여 그 자리에 부모 테이블을 흉내 낸 파생 테이블을 만든다.</p>
+
+<pre data-label="== 3 find parent (TABLE_PER_CLASS)"><code class="language-sql">select p1_0.id,p1_0.clazz_,p1_0.amount,p1_0.bankName,p1_0.depositor,p1_0.cardCompany,p1_0.installmentMonths
+from (select installmentMonths, amount, id, cardCompany, null as bankName, null as depositor, 1 as clazz_ from CardPayment
+      union all
+      select null as installmentMonths, amount, id, null as cardCompany, bankName, depositor, 2 as clazz_ from BankTransfer) p1_0
+where p1_0.id=?</code></pre>
+
+<p>읽는 법은 이렇다. 각 하위 테이블에서 SELECT를 하는데, 컬럼 목록을 맞추기 위해 그 테이블에 없는 컬럼은 <code>null as bankName</code>처럼 NULL로 채운다. 그리고 각 분기에 <code>1 as clazz_</code>, <code>2 as clazz_</code>처럼 상수 컬럼을 하나 더 붙여, 이 행이 어느 테이블에서 왔는지 표시한다. 이 상수가 조인 전략의 CASE 식, 단일 테이블 전략의 DTYPE과 같은 역할을 한다. 그렇게 만든 합집합 전체에 바깥쪽 <code>where p1_0.id=?</code>를 건다. 조인 전략의 CASE에서는 <code>CardPayment</code>가 2였는데 여기서는 1이다. 앞에서 말했듯 이 번호는 하이버네이트 내부의 표시일 뿐이다.</p>
+
+<p>명세는 이 전략의 단점을 직접 적고 있다. 다형적인 관계를 잘 지원하지 못하고, 엔티티 계층 전체를 대상으로 하는 질의에는 보통 SQL UNION(또는 하위 클래스마다 별도의 SQL)이 필요하다는 것이다. 그리고 결정적으로, 명세는 이 전략의 지원을 선택 사항(optional)으로 둔다. 하이버네이트는 지원하지만, JPA 구현체라면 모두 지원해야 하는 기능은 아니라는 뜻이다. 하이버네이트 사용자 가이드도 큰 클래스 계층에서는 다형성 질의가 여러 UNION을 필요로 한다는 성능상의 함의를 주의하라고 적고 있다.</p>
+
+<p>그나마 <code>type()</code>을 쓰면 하이버네이트가 필요 없는 분기를 잘라 낸다. <code>select p from Payment p where type(p) = BankTransfer</code>는 이런 SQL이 되었다.</p>
+
+<pre><code class="language-sql">select p1_0.id,p1_0.clazz_,p1_0.amount,p1_0.bankName,p1_0.depositor,p1_0.cardCompany,p1_0.installmentMonths
+from (select id, amount, null as cardCompany, null as installmentMonths, bankName, depositor, 2 as clazz_ from BankTransfer) p1_0
+where p1_0.clazz_=2</code></pre>
+
+<p>합집합에서 <code>CardPayment</code> 분기가 빠졌다. 하지만 하위 타입이 정해져 있다면 애초에 <code>select b from BankTransfer b</code>로 조회하는 것이 더 단순하다. 이 전략의 본질적인 약점은 "타입을 가리지 않고 모든 결제를 보는" 질의, 그리고 "어떤 결제든 가리킬 수 있는" 참조에서 드러난다. 예를 들어 주문 테이블이 결제를 참조하는 외래 키를 갖고 싶어도, 그 외래 키가 가리킬 단일한 <code>Payment</code> 테이블이 없다. 데이터베이스 수준에서 "주문의 결제는 반드시 존재하는 결제다"라는 참조 무결성을 선언할 대상이 사라진다.</p>
+
+<h4>IDENTITY 전략과 함께 쓸 수 없는 이유</h4>
+
+<p>이 전략에는 식별자 생성에 관한 제약도 있다. <code>@GeneratedValue(strategy = GenerationType.IDENTITY)</code>로 바꾸면 애플리케이션이 시작조차 하지 못한다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">Exception in thread "main" jakarta.persistence.PersistenceException: [PersistenceUnit: ti] Unable to build Hibernate SessionFactory
+Caused by: org.hibernate.MappingException: Cannot use identity column key generation with <union-subclass> mapping for: ti.CardPayment</code></pre>
+
+<p><code>union-subclass</code>는 하이버네이트가 이 전략을 내부적으로 부르는 이름이다. 왜 이런 제약이 있는지는 위의 UNION 쿼리로 설명할 수 있다. IDENTITY는 데이터베이스가 테이블마다 독립적으로 자동 증가 값을 매기는 방식이다. 그러면 <code>CardPayment</code>의 첫 행도 id가 1이고 <code>BankTransfer</code>의 첫 행도 id가 1이 된다. 각 테이블 안에서는 기본 키가 유일하지만, 둘을 합친 파생 테이블에서는 id가 1인 행이 두 개가 된다. 그 상태에서 <code>em.find(Payment.class, 1L)</code>은 어느 결제를 돌려줘야 할지 정할 수 없다. 엔티티 계층 전체가 하나의 식별자 공간을 공유한다는 앞의 원칙이 깨지는 것이다.</p>
+
+<p>시퀀스를 쓰면 이 문제가 없다. 실험에서 본 것처럼 계층 전체가 <code>Payment_SEQ</code> 하나에서 값을 받으므로, 카드 결제가 1을 받았다면 계좌 이체는 1을 받을 수 없다. 실제 실행에서도 카드 결제는 1, 계좌 이체는 2를 받았다. 시퀀스 객체가 없는 MySQL에서 이 전략을 쓰려면 MySQL에서 흔히 쓰는 IDENTITY 대신 다른 키 생성 방식을 골라야 한다는 뜻이기도 하다. 키 생성 전략을 고를 때 상속 전략까지 함께 봐야 하는 드문 경우다.</p>
+
+<h3>한 층 아래: 세 전략을 저장 엔진 쪽에서 보면</h3>
+
+<p>지금까지는 하이버네이트가 만든 SQL을 봤다. 이제 그 SQL을 받는 데이터베이스 쪽에서 무슨 일이 일어나는지 MySQL InnoDB를 기준으로 생각해 보자. 데이터베이스 기본편에서 다룬 대로 InnoDB 테이블의 행은 기본 키 순서로 정렬된 클러스터형 인덱스(clustered index)의 리프 페이지에 저장된다. 이 사실 하나로 세 전략의 비용 구조가 꽤 선명해진다.</p>
+
+<h4>조인 전략: 기본 키끼리의 조인</h4>
+
+<p>조인 전략의 조인 조건은 언제나 <code>자식.id = 부모.id</code>다. 양쪽 모두 기본 키이므로, 한 테이블에서 찾은 id로 다른 테이블의 클러스터형 인덱스를 따라 내려가면 바로 그 행이 있는 리프 페이지에 닿는다. 보조 인덱스를 거쳐 다시 기본 키로 찾아가는 과정도 없다. 그래서 id 하나로 객체 하나를 읽는 <code>em.find()</code> 수준에서는 조인 전략의 조인이 걱정할 만큼 비싸지 않다. 테이블 수만큼 B+Tree를 한 번씩 내려가는 비용이 더해질 뿐이다.</p>
+
+<p>비용이 커지는 것은 많은 행을 읽는 다형성 질의다. 부모 타입으로 수천 건을 조회하면 행마다 모든 하위 테이블과의 left join이 일어나고, 하위 타입이 늘어날수록 한 행을 완성하기 위해 들르는 B+Tree도 늘어난다. 저장 쪽에서는 객체 하나가 두 테이블의 클러스터형 인덱스에 각각 한 행씩 들어가므로, 페이지를 두 곳에서 수정하고 SQL 문장도 두 번 보낸다. 쓰기가 아주 많은 테이블이라면 이 차이가 의미를 가질 수 있다. 반대로 하위 타입으로만 조회하는 경우는 inner join 한 번이고, 다른 하위 테이블은 건드리지 않는다.</p>
+
+<h4>단일 테이블 전략: NULL은 공간을 거의 쓰지 않지만 행 정의는 넓어진다</h4>
+
+<p>단일 테이블 전략을 처음 보면 NULL로 가득 찬 컬럼이 공간을 낭비할 것 같다. 카드 결제 행에는 은행 컬럼이, 계좌 이체 행에는 카드 컬럼이 늘 비어 있다. 그런데 MySQL 문서에 따르면 COMPACT 행 형식에서 행 헤더의 가변 길이 부분에는 NULL 컬럼을 표시하는 비트 벡터가 있고, NULL을 허용하는 컬럼이 N개면 이 벡터는 <code>CEILING(N/8)</code>바이트를 쓰며, NULL인 컬럼은 이 비트 말고는 공간을 차지하지 않는다. MySQL 8.0의 기본 행 형식인 DYNAMIC은 COMPACT의 변형으로 저장 특성을 공유한다. NULL을 허용하는 컬럼이 9개에서 16개 사이면 행마다 2바이트의 비트 벡터가 붙는 수준이라, 저장 공간 자체는 생각보다 덜 낭비된다.</p>
+
+<p>그렇다고 넓은 테이블에 대가가 없는 것은 아니다. MySQL은 테이블의 행 크기에 65,535바이트라는 상한을 두고, 모든 컬럼의 길이 합이 이 한도를 넘을 수 없다. 이 계산에는 실제로 저장된 값이 아니라 컬럼에 선언된 최대 길이가 쓰인다. MySQL 문서의 예로, <code>utf8mb3</code> 문자 집합의 <code>VARCHAR(255)</code> 컬럼은 길이를 저장하는 2바이트를 포함해 값 하나가 최대 767바이트를 쓸 수 있다. 하위 타입이 늘어날 때마다 그 타입의 문자열 컬럼이 한 테이블에 계속 쌓이면, 어느 시점에는 테이블 정의 자체가 이 한도에 걸린다. 또 행이 넓을수록 16KB 페이지 하나에 들어가는 행 수가 줄어든다. 같은 수의 행을 스캔하는 데 더 많은 페이지를 읽게 된다는 뜻이다.</p>
+
+<p>인덱스 쪽에서도 생각할 것이 있다. 하위 타입으로 조회하면 하이버네이트가 <code>DTYPE='CARD'</code> 조건을 자동으로 붙인다. 그런데 DTYPE 컬럼의 값은 하위 타입 수만큼, 보통 몇 가지뿐이다. 이런 컬럼 하나만으로 만든 인덱스는 걸러 내는 힘이 약하다. 하위 타입별 조회가 잦다면 DTYPE 단독 인덱스보다, 실제로 자주 쓰는 조건 컬럼과 DTYPE을 함께 묶은 복합 인덱스를 실행 계획을 보며 검토하는 편이 낫다. 이 판단은 데이터베이스 기본편에서 다룬 인덱스 선택도의 원리를 그대로 적용한 것이다.</p>
+
+<h4>구현 클래스마다 테이블 전략: 파생 테이블 위의 조건</h4>
+
+<p>이 전략의 부모 타입 조회는 <code>UNION ALL</code>로 만든 파생 테이블 바깥에 <code>where p1_0.id=?</code>를 거는 모양이었다. SQL 문장만 놓고 보면 모든 하위 테이블의 모든 행을 합친 뒤 그중 하나를 고르는 형태다. 옵티마이저가 바깥 조건을 각 분기 안으로 밀어 넣어 기본 키 탐색으로 바꿔 주는지가 관건이다. 앞의 DDL대로 두 테이블을 만들고 각각 1,000행(카드 결제는 홀수 id, 계좌 이체는 짝수 id)을 넣은 뒤, 하이버네이트가 만든 부모 타입 조회를 <code>?</code> 자리에 1을 넣어 EXPLAIN으로 확인했다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 같다)"><code class="language-text">+----+-------------+-------------+------------+-------+---------------+---------+---------+-------+------+----------+--------------------------------+
+| id | select_type | table       | partitions | type  | possible_keys | key     | key_len | ref   | rows | filtered | Extra                          |
++----+-------------+-------------+------------+-------+---------------+---------+---------+-------+------+----------+--------------------------------+
+|  1 | PRIMARY     | <derived2>  | NULL       | ALL   | NULL          | NULL    | NULL    | NULL  |    2 |   100.00 | NULL                           |
+|  2 | DERIVED     | CardPayment | NULL       | const | PRIMARY       | PRIMARY | 8       | const |    1 |   100.00 | NULL                           |
+|  3 | UNION       | NULL        | NULL       | NULL  | NULL          | NULL    | NULL    | NULL  | NULL |     NULL | no matching row in const table |
++----+-------------+-------------+------------+-------+---------------+---------+---------+-------+------+----------+--------------------------------+</code></pre>
+
+<p>바깥의 <code>id=1</code>이 두 분기 안으로 들어갔다. <code>CardPayment</code> 분기는 기본 키로 한 행을 찾는 <code>const</code>가 되었고, <code>BankTransfer</code> 분기는 기본 키로 찾아본 결과 id가 1인 행이 없어 <code>no matching row in const table</code>로 끝났다. 이 최적화는 <code>optimizer_switch</code>의 <code>derived_condition_pushdown</code> 플래그가 켜져 있을 때(기본값) 일어난다. 세션에서 <code>SET SESSION optimizer_switch='derived_condition_pushdown=off'</code>로 끄고 같은 문장을 보면 SQL 문장 모양 그대로 실행된다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행, derived_condition_pushdown=off (8.0.46도 같다)"><code class="language-text">+----+-------------+--------------+------------+------+---------------+-------------+---------+-------+------+----------+-------+
+| id | select_type | table        | partitions | type | possible_keys | key         | key_len | ref   | rows | filtered | Extra |
++----+-------------+--------------+------------+------+---------------+-------------+---------+-------+------+----------+-------+
+|  1 | PRIMARY     | <derived2>   | NULL       | ref  | <auto_key0>   | <auto_key0> | 8       | const |   10 |   100.00 | NULL  |
+|  2 | DERIVED     | CardPayment  | NULL       | ALL  | NULL          | NULL        | NULL    | NULL  | 1000 |   100.00 | NULL  |
+|  3 | UNION       | BankTransfer | NULL       | ALL  | NULL          | NULL        | NULL    | NULL  | 1000 |   100.00 | NULL  |
++----+-------------+--------------+------------+------+---------------+-------------+---------+-------+------+----------+-------+</code></pre>
+
+<p>두 분기를 모두 끝까지 읽어 2,000행짜리 임시 테이블을 만든 뒤, 거기에 자동으로 만든 인덱스(<code><auto_key0></code>)로 id가 1인 행을 찾는다. 행 하나를 찾으려고 모든 하위 테이블을 통째로 읽는 셈이다. 실제로 같은 조회를 실행하고 세션의 <code>Handler_read_rnd_next</code>를 보면 밀어 넣기가 켜져 있을 때 2, 꺼져 있을 때 2002였다. rows 같은 추정치는 실행 환경과 통계에 따라 달라지지만, 분기마다 <code>const</code>가 되느냐 <code>ALL</code>이 되느냐의 차이는 그대로다. 그러니 MySQL 8.0.46과 8.4.13의 기본 설정에서는 이 형태의 부모 타입 조회가 분기마다 기본 키 탐색으로 바뀐다. 다만 다른 데이터베이스 제품이나 버전, 조건이 더 복잡한 질의에서도 그렇게 된다는 보장은 없으므로, 이 전략을 쓴다면 부모 타입 조회의 실행 계획을 직접 확인하는 습관은 여전히 필요하다. 하위 테이블 수가 늘어날수록 확인할 분기도 함께 늘어난다.</p>
+
+<h4>벌크 연산은 테이블이 여러 개일 때 복잡해진다</h4>
+
+<p>JPQL의 벌크 연산은 10회에서 본격적으로 다루지만, 상속 매핑과 얽히는 부분만 여기서 짚어 둔다. 조인 전략에서 <code>delete from Payment p where p.amount < 20000</code>을 실행하면 SQL 한 문장으로 끝나지 않는다.</p>
+
+<pre data-label="벌크 DELETE (JOINED)"><code class="language-sql">delete from CardPayment to_delete_ where to_delete_.id in (select p1_0.id from Payment p1_0 where p1_0.amount<20000)
+delete from BankTransfer to_delete_ where to_delete_.id in (select p1_0.id from Payment p1_0 where p1_0.amount<20000)
+delete from Payment p1_0 where p1_0.amount<20000</code></pre>
+
+<p>JPQL 한 줄이 DELETE 세 번이 되었다. 결제 객체 하나가 테이블 두 곳에 나뉘어 있으니, 조건에 맞는 결제를 지우려면 하위 테이블들의 행부터 지우고 부모 테이블의 행을 지워야 한다. 단건 삭제에서 본 "자식 먼저, 부모 나중"이 집합 단위로 일어난 것이다. 하위 테이블의 조건은 부모 테이블을 보는 서브쿼리로 표현했다.</p>
+
+<p>하위 테이블의 컬럼과 부모 테이블의 컬럼을 함께 바꾸는 UPDATE는 한 단계 더 복잡하다. <code>update CardPayment c set c.amount = 0, c.installmentMonths = 0 where c.cardCompany = 'HANA'</code>는 이렇게 실행되었다.</p>
+
+<pre data-label="벌크 UPDATE (JOINED)"><code class="language-sql">insert into HT_Payment(id) select cp1_0.id from CardPayment cp1_0 join Payment cp1_1 on cp1_0.id=cp1_1.id where cp1_0.cardCompany='HANA'
+update CardPayment cp1_0 set installmentMonths=0 where id in (select temptable_.id from HT_Payment temptable_)
+update Payment cp1_1 set amount=0 where id in (select temptable_.id from HT_Payment temptable_)
+delete from HT_Payment</code></pre>
+
+<p>먼저 조건에 맞는 id를 임시 테이블 <code>HT_Payment</code>에 모아 두고, 그 id 목록을 기준으로 두 테이블을 각각 갱신한 뒤 임시 테이블을 비운다. 이 실험에서는 애플리케이션 시작 때 <code>create global temporary table HT_Payment(...)</code> 같은 DDL도 함께 출력되었다. 대상 id를 먼저 고정해 두면, 첫 번째 UPDATE가 조건에 쓰인 컬럼을 바꾸더라도 두 번째 UPDATE가 같은 행들을 대상으로 삼을 수 있다. 하이버네이트 6.6에는 전역 임시 테이블 외에도 지역 임시 테이블, 영구 테이블, CTE, 인라인 방식의 다중 테이블 변경 전략 구현이 들어 있으며, 이 실험(H2)에서는 전역 임시 테이블 방식이 쓰였다. 단일 테이블 전략이라면 이런 과정 없이 UPDATE 한 문장으로 끝난다.</p>
+
+<h3>다형성 질의와 다형 연관관계</h3>
+
+<p>상속 매핑을 쓰는 이유는 결국 부모 타입으로 여러 하위 타입을 한꺼번에 다루기 위해서다. 명세는 엔티티가 상속, 다형적 연관관계(polymorphic association), 다형성 질의(polymorphic query)를 지원한다고 적는다. 다형성 질의는 이미 충분히 봤다. <code>select p from Payment p</code>는 세 전략 모두에서 카드 결제와 계좌 이체를 각자의 클래스로 돌려줬고, 차이는 그 결과를 얻는 SQL의 모양뿐이었다.</p>
+
+<p>JPQL의 <code>type()</code> 함수는 질의 안에서 엔티티의 실제 타입을 조건으로 쓰게 해 준다. 전략마다 번역 결과가 달랐다는 점을 다시 모아 보면 이렇다. 구분 컬럼이 있으면 <code>DTYPE='BankTransfer'</code> 같은 컬럼 비교가 되고, 구분 컬럼이 없는 조인 전략에서는 CASE 식을 조건으로 쓰며 해당 하위 테이블과는 inner join으로 바뀌었고, 구현 클래스마다 테이블 전략에서는 UNION의 다른 분기를 아예 잘라 냈다. 하위 타입의 필드로 조건을 걸고 싶을 때 쓰는 <code>treat()</code>를 포함해 JPQL 문법은 9회와 10회의 몫이다.</p>
+
+<p>다형 연관관계는 다른 엔티티가 부모 타입을 참조하는 것이다. 구매 기록이 "어떤 결제든" 가리킬 수 있도록 <code>Payment</code> 타입으로 연관관계를 매핑해 보자. 조인 전략에서 실험했다.</p>
+
+<pre><code class="language-java">@Entity
+public class Purchase {
+    @Id @GeneratedValue Long id;
+    @ManyToOne(fetch = FetchType.LAZY)
+    Payment payment;
+}
+
+// 카드 결제를 가진 구매 기록을 저장하고 em.clear() 한 뒤
+Purchase found = em.find(Purchase.class, p.id);
+Payment pay = found.payment;
+System.out.println("class=" + pay.getClass().getSimpleName()
+        + " instanceofCard=" + (pay instanceof CardPayment));
+Object real = org.hibernate.Hibernate.unproxy(pay);
+System.out.println("unproxied=" + real.getClass().getSimpleName());</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">select p1_0.id,p1_0.payment_id from Purchase p1_0 where p1_0.id=?
+class=Payment$HibernateProxy instanceofCard=false
+select p1_0.id,case when p1_1.id is not null then 1 when p1_2.id is not null then 2 end,p1_0.amount,p1_1.bankName,p1_1.depositor,p1_2.cardCompany,p1_2.installmentMonths from Payment p1_0 left join BankTransfer p1_1 on p1_0.id=p1_1.id left join CardPayment p1_2 on p1_0.id=p1_2.id where p1_0.id=?
+unproxied=CardPayment</code></pre>
+
+<p>실제로 저장한 것은 카드 결제인데 <code>instanceof CardPayment</code>가 거짓이다. 지연 로딩으로 설정한 연관관계에는 실제 객체 대신 프록시가 들어가는데, 구매 기록 행에는 외래 키 값만 있어서 하이버네이트는 이 시점에 그 결제가 어느 하위 타입인지 모른다. 그래서 선언된 타입인 <code>Payment</code>를 상속한 프록시를 만든다. 프록시를 실제 객체로 바꾸는 순간에야 앞에서 본 left join과 CASE 식으로 타입을 판별한다. 프록시가 어떻게 만들어지고 초기화되는지는 7회의 주제이므로, 여기서는 "다형 연관관계 너머의 객체에 <code>instanceof</code>나 하위 타입 캐스팅을 쓰면 프록시 때문에 기대와 다른 결과가 나올 수 있다"는 점만 기억해 두자. 하위 타입마다 다르게 동작해야 하는 로직은 타입을 검사해 분기하는 대신 부모 클래스의 메서드를 하위 클래스가 재정의하게 만들면, 프록시를 통해 호출해도 실제 객체의 구현이 실행된다.</p>
+
+<h3>전략을 고르는 기준</h3>
+
+<p>세 전략의 동작을 모두 봤으니 선택 기준을 정리하자. 정답이 하나로 정해진 문제는 아니고, 조회 패턴과 무결성 요구가 판단을 가른다. 다음 표는 지금까지의 관찰을 판단 기준으로 바꾼 것이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>상황</th><th>기우는 쪽</th><th>근거</th></tr></thead><tbody>
+<tr><td>하위 타입 고유 컬럼에 NOT NULL 같은 제약이 꼭 필요하다</td><td>JOINED</td><td>하위 테이블에 그 타입의 행만 있으므로 제약을 그대로 걸 수 있다</td></tr>
+<tr><td>다른 테이블이 특정 하위 타입만 참조한다(예: 할부 변경 기록은 카드 결제만 가리킨다)</td><td>JOINED</td><td>외래 키가 하위 테이블을 직접 가리킬 수 있다. 단일 테이블에서는 결제 전체 테이블을 가리킬 수밖에 없다</td></tr>
+<tr><td>하위 타입 컬럼이 몇 개 안 되고, 부모 타입 목록 조회가 대부분이다</td><td>SINGLE_TABLE</td><td>조인과 UNION 없이 테이블 하나로 끝난다</td></tr>
+<tr><td>쓰기가 매우 잦다</td><td>SINGLE_TABLE</td><td>객체 하나에 INSERT 한 번, 벌크 연산도 한 문장이다</td></tr>
+<tr><td>하위 타입이 계속 늘어난다</td><td>JOINED</td><td>새 하위 타입은 새 테이블로 추가된다. 단일 테이블은 기존 테이블에 컬럼을 계속 덧붙인다</td></tr>
+<tr><td>부모 타입으로 함께 조회할 일이 거의 없다</td><td>상속 매핑 재검토</td><td>각각 독립 엔티티로 두고 공통 컬럼만 @MappedSuperclass로 공유하는 편이 단순할 수 있다</td></tr>
+</tbody></table></div>
+
+<p>이 표에 <code>TABLE_PER_CLASS</code>가 나오지 않는 것은 의도한 것이다. 이 전략이 빛나는 경우, 곧 하위 타입끼리 독립적이고 부모 타입으로 묶어 볼 일이 없는 경우라면 상속 매핑 자체가 필요 없는 경우가 많다. 반대로 부모 타입으로 묶어 볼 일이 있다면 UNION과 참조 무결성 문제가 따라온다. 여기에 명세상 선택 지원이라는 이식성 문제와 IDENTITY 제약이 더해진다. 데이터베이스 설계자와 객체 설계자 어느 쪽의 관점에서도 다른 두 전략보다 나은 지점을 찾기 어렵다.</p>
+
+<p>실무에서 흔한 출발점은 조인 전략을 기본으로 두는 것이다. 테이블이 정규화되어 있고, 제약을 데이터베이스가 지키며, 저장 공간에 중복이 없다. 그러다 조회 성능이 중요하고 구조가 단순하면, 예를 들어 하위 타입이 두세 개이고 각자 컬럼이 한두 개뿐이며 화면이 늘 모든 타입을 섞어 목록으로 보여 준다면 단일 테이블 전략을 고른다. 어느 쪽이든 한 번 정한 전략을 나중에 바꾸는 것은 애너테이션 한 줄의 문제가 아니다. 운영 데이터를 다른 테이블 구조로 옮기는 스키마 이전 작업이 따라오므로, 처음 정할 때 조회 패턴을 충분히 따져 보는 것이 좋다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>서류 보관 방식 세 가지</strong><p>조인 전략은 공통 서류철 하나와 종류별 부속 서류철을 따로 두고 같은 접수 번호로 묶는 방식이다. 공통 정보와 종류별 정보를 함께 보려면 두 서류철을 모두 열어야 한다. 단일 테이블 전략은 모든 종류의 칸이 다 인쇄된 만능 양식 한 장에 해당 칸만 채우는 방식이다. 한 장이면 다 보이지만 빈칸이 많고, "카드사 칸은 필수"라는 규칙을 양식에 인쇄해 둘 수 없다. 구현 클래스마다 테이블 전략은 종류별 서류철만 두는 방식이라 "전체 접수 목록"을 보려면 모든 서류철을 펼쳐 합쳐야 한다. 비유가 깨지는 지점도 있다. 실제 데이터베이스에서 NULL 칸은 종이처럼 공간을 차지하지 않고 비트 하나로 표시되며, 서류철을 여는 비용은 B+Tree를 한 번 내려가는 비용이다.</p></aside>
+
+<h3>@MappedSuperclass: 타입이 아니라 매핑 정보만 물려준다</h3>
+
+<p>이제 두 번째 주제로 넘어간다. 회원 엔티티와 게시글 엔티티가 모두 등록 시각과 마지막 수정 시각을 갖는다고 하자. 둘은 서로 아무 관계가 없다. 회원을 "어떤 공통 엔티티"로 다룰 일도, 회원과 게시글을 한 목록에 섞어 조회할 일도 없다. 그저 같은 필드 두 개와 그 필드를 채우는 로직을 엔티티마다 반복해서 쓰기 싫을 뿐이다.</p>
+
+<p>이것을 엔티티 상속으로 풀면 곤란해진다. 공통 부모를 <code>@Entity</code>로 만들면 그것은 타입 관계를 선언하는 것이다. 기본값인 단일 테이블 전략이라면 회원과 게시글이 한 테이블에 들어가고, 조인 전략이라면 모든 엔티티 조회에 공통 테이블과의 조인이 붙는다. 엔티티 계층은 식별자 공간도 공유하므로 회원과 게시글이 같은 식별자 시퀀스를 나눠 쓰게 된다. 원한 것은 매핑 정보의 재사용인데 결과는 데이터 구조의 결합이다.</p>
+
+<p><code>@MappedSuperclass</code>는 이 경우를 위한 애너테이션이다. 이 애너테이션을 붙인 클래스의 매핑 정보는 그 클래스를 상속한 엔티티들에 적용되지만, 그 클래스 자신은 엔티티가 아니다. 명세는 매핑된 상위 클래스(mapped superclass)로 지정된 클래스에는 별도의 테이블이 정의되지 않는다고 적고 있다.</p>
+
+<pre><code class="language-java">@MappedSuperclass
+public abstract class BaseEntity {
+    @Column(updatable = false)
+    LocalDateTime createdAt;
+    LocalDateTime lastModifiedAt;
+
+    @PrePersist
+    void onPersist() {
+        createdAt = LocalDateTime.of(2026, 1, 1, 9, 0);
+        lastModifiedAt = createdAt;
+        System.out.println("PrePersist " + getClass().getSimpleName());
+    }
+
+    @PreUpdate
+    void onUpdate() {
+        lastModifiedAt = LocalDateTime.of(2026, 1, 2, 9, 0);
+        System.out.println("PreUpdate " + getClass().getSimpleName());
+    }
+}
+
+@Entity
+public class Member extends BaseEntity {
+    @Id @GeneratedValue Long id;
+    String name;
+}
+
+@Entity
+@AttributeOverride(name = "createdAt", column = @Column(name = "published_at"))
+public class Article extends BaseEntity {
+    @Id @GeneratedValue Long id;
+    String title;
+}</code></pre>
+
+<pre data-label="생성된 DDL"><code class="language-sql">create table Article (id bigint not null, lastModifiedAt timestamp(6), published_at timestamp(6), title varchar(255), primary key (id))
+create table Member (createdAt timestamp(6), id bigint not null, lastModifiedAt timestamp(6), name varchar(255), primary key (id))</code></pre>
+
+<p>테이블은 <code>Article</code>과 <code>Member</code> 두 개뿐이고 <code>BaseEntity</code> 테이블은 없다. <code>BaseEntity</code>의 필드는 각 엔티티의 테이블에 컬럼으로 복사되어 들어갔다. 시퀀스도 <code>Article_SEQ</code>와 <code>Member_SEQ</code>로 따로 생겼다. 데이터베이스 입장에서 두 테이블은 우연히 비슷한 컬럼을 가진 남남이다. 하이버네이트 사용자 가이드의 표현대로, 이 상속은 도메인 모델에만 보이고 각 테이블은 상위 클래스와 하위 클래스의 속성을 모두 담는다. 테이블 구조만 보면 앞의 <code>TABLE_PER_CLASS</code>와 비슷하지만, 결정적인 차이는 부모 타입이라는 것이 JPA에 존재하지 않는다는 점이다.</p>
+
+<x-visual id="jpa-basic-06-mapped-superclass" title="엔티티 상속과 @MappedSuperclass의 차이" kind="비교 다이어그램" ratio="16:9">
+<x-hint>@MappedSuperclass는 매핑 정보만 각 엔티티 테이블에 복사되고 부모 타입으로 조회할 수 없다는 것을, 엔티티 상속과 나란히 놓고 보여 준다.</x-hint>
+<x-prompt>Two-panel comparison diagram on white background, 16:9. Left panel titled "엔티티 상속": a class box "Payment @Entity" above two child class boxes, and below them a database area where a query arrow labeled "select p from Payment p" reaches all child tables. Right panel titled "@MappedSuperclass": a dashed-outline class box "BaseEntity" above two class boxes "Member" and "Article"; downward arrows labeled "컬럼 복사" from BaseEntity's fields "createdAt", "lastModifiedAt" into two separate table icons "Member" and "Article". A query arrow labeled "select b from BaseEntity b" ends in a red X mark with the label "조회 불가". No table icon exists for BaseEntity, indicated by a faint dashed empty box labeled "테이블 없음". Flat style, consistent thin lines, Korean labels exactly as given.</x-prompt>
+<x-caption>엔티티 상속은 타입 관계를, @MappedSuperclass는 매핑 정보만 물려준다.</x-caption>
+</x-visual>
+
+<h4>조회할 수 없다는 것의 의미</h4>
+
+<p>명세는 매핑된 상위 클래스가 엔티티와 달리 조회 대상이 아니며, <code>EntityManager</code>나 <code>Query</code> 연산의 인자로 넘겨서는 안 된다고 정해 두었다. 하이버네이트 6.6에서 직접 넘겨 보면 각각 다음과 같이 거부된다. 메시지의 <code>m.</code>은 실험 코드의 패키지 이름이다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">metamodel=MappedSuperclassTypeImpl persistenceType=MAPPED_SUPERCLASS
+entity(): java.lang.IllegalArgumentException: Not an entity: m.BaseEntity
+find: java.lang.IllegalArgumentException: Unable to locate entity descriptor: m.BaseEntity
+jpql: java.lang.IllegalArgumentException: org.hibernate.query.sqm.UnknownEntityException: Could not resolve root entity 'BaseEntity'</code></pre>
+
+<p>메타모델에서 <code>BaseEntity</code>는 관리 타입(managed type)으로 등록되어 있고, 그 종류는 <code>MAPPED_SUPERCLASS</code>다. 매핑 정보를 담은 타입으로는 존재하지만 엔티티 타입은 아니다. 그래서 <code>getMetamodel().entity()</code>도, <code>em.find()</code>도, JPQL의 <code>from BaseEntity</code>도 모두 실패한다. 이것이 엔티티 상속과의 본질적인 차이다. 엔티티 상속의 부모는 그 자체로 조회 대상이고 다른 엔티티가 참조할 수 있는 타입이지만, 매핑된 상위 클래스는 컴파일 시점의 코드 재사용 수단일 뿐이다. 다른 엔티티가 <code>BaseEntity</code> 타입으로 연관관계를 맺을 수도 없다.</p>
+
+<p>하나 덧붙이면, 하이버네이트는 명세에 없는 확장으로 엔티티가 아닌 클래스나 인터페이스를 대상으로 한 질의를 지원한다. 사용자 가이드의 암시적 다형성(implicit polymorphism) 항목이 이 기능을 설명한다. 실제로 패키지 이름까지 붙여 <code>select b from m.BaseEntity b</code>로 바꾸자, 하이버네이트는 <code>Article</code> 테이블과 <code>Member</code> 테이블에 SELECT를 한 번씩 따로 보내 결과를 합쳐 돌려줬다. 단순한 이름으로는 실패하고 전체 이름으로는 동작하는 하이버네이트 고유 동작이며, 명세가 금지한 사용법이라 다른 구현체로 옮길 수 없다. 이런 질의가 필요하다는 생각이 들면, 그것은 매핑 정보 공유가 아니라 진짜 타입 관계가 필요하다는 신호일 가능성이 높다.</p>
+
+<h4>추상 클래스로 만드는 이유, 엔티티가 아닌 상위 클래스</h4>
+
+<p><code>BaseEntity</code>를 <code>abstract</code>로 선언한 것은 직접 생성할 이유가 없기 때문이다. <code>new BaseEntity()</code>로 만든 객체는 어떤 테이블에도 저장할 수 없고 영속성 컨텍스트가 관리할 수도 없다. 추상 클래스로 두면 이런 의미 없는 생성을 컴파일러가 막아 준다. <code>@MappedSuperclass</code>에 <code>abstract</code>가 필수는 아니지만, 이 클래스의 용도를 코드에 드러내는 가장 간단한 방법이다.</p>
+
+<p>그렇다면 아무 애너테이션도 붙이지 않은 평범한 클래스를 상속하면 어떻게 될까. 명세는 엔티티가 엔티티가 아닌 클래스를 상속할 수 있다고 허용하면서도, 엔티티가 아닌 상위 클래스의 상태는 영속적이지 않으며 그런 상위 클래스로부터 상속받은 상태는 엔티티에서도 영속적이지 않다고 정해 두었다. 필드는 자바 객체 안에 그대로 있지만 테이블에 저장되지도, 조회 때 채워지지도 않는다는 뜻이다. 공통 필드를 테이블 컬럼으로 만들고 싶다면 <code>@MappedSuperclass</code>를 반드시 붙여야 한다. 지금까지의 세 가지 경우를 표로 정리하면 이렇다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>상위 클래스</th><th>자기 테이블</th><th>필드가 하위 테이블 컬럼이 되는가</th><th>조회·참조 대상</th></tr></thead><tbody>
+<tr><td><code>@Entity</code> (엔티티 상속)</td><td>전략에 따라 다름</td><td>전략에 따라 다름</td><td>가능</td></tr>
+<tr><td><code>@MappedSuperclass</code></td><td>없음</td><td>예, 각 엔티티 테이블에 복사</td><td>불가</td></tr>
+<tr><td>애너테이션 없는 클래스</td><td>없음</td><td>아니오, 영속 상태가 아님</td><td>불가</td></tr>
+</tbody></table></div>
+
+<h4>@AttributeOverride는 컬럼 정의를 통째로 바꾼다</h4>
+
+<p>위의 <code>Article</code>은 <code>@AttributeOverride</code>로 <code>createdAt</code>의 컬럼 이름을 <code>published_at</code>으로 바꿨다. 상속받은 매핑을 엔티티마다 조정하는 표준 방법이다. 그런데 여기에 함정이 하나 있다. 저장 후 두 엔티티의 <code>createdAt</code>과 이름 필드를 모두 바꾸고 플러시해 보자.</p>
+
+<pre><code class="language-java">Article a = new Article(); a.title = "t1"; em.persist(a);
+Member m = new Member(); m.name = "kim"; em.persist(m);
+em.flush();
+System.out.println("== change");
+a.title = "t2"; a.createdAt = LocalDateTime.of(2030, 1, 1, 0, 0);
+m.name = "lee"; m.createdAt = LocalDateTime.of(2030, 1, 1, 0, 0);
+em.flush();
+em.clear();
+Article ra = em.find(Article.class, a.id);
+Member rm = em.find(Member.class, m.id);
+System.out.println("article created=" + ra.createdAt + " modified=" + ra.lastModifiedAt);
+System.out.println("member created=" + rm.createdAt + " modified=" + rm.lastModifiedAt);</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">PrePersist Article
+PrePersist Member
+insert into Article (published_at,lastModifiedAt,title,id) values (?,?,?,?)
+insert into Member (createdAt,lastModifiedAt,name,id) values (?,?,?,?)
+== change
+PreUpdate Article
+PreUpdate Member
+update Article set published_at=?,lastModifiedAt=?,title=? where id=?
+update Member set lastModifiedAt=?,name=? where id=?
+(다시 조회하는 SELECT 두 줄 생략)
+article created=2030-01-01T00:00 modified=2026-01-02T09:00
+member created=2026-01-01T09:00 modified=2026-01-02T09:00</code></pre>
+
+<p><code>Member</code>의 UPDATE에는 <code>createdAt</code>이 없다. <code>BaseEntity</code>에 붙인 <code>@Column(updatable = false)</code>가 그대로 적용되어, 필드를 바꿔도 UPDATE 문에서 빠진 것이다. 영속성 컨텍스트를 비우고 다시 읽은 회원의 등록 시각도 처음 값인 2026년 1월 1일 그대로다. 반면 <code>Article</code>의 UPDATE에는 <code>published_at</code>이 들어 있고, 다시 읽은 게시글의 등록 시각은 2030년으로 바뀌어 있다. <code>@AttributeOverride</code>의 <code>column</code>에 준 <code>@Column(name = "published_at")</code>이 원래의 <code>@Column(updatable = false)</code>에 이름만 덧입혀진 것이 아니라, 컬럼 정의 전체를 대신했기 때문이다. <code>updatable</code>을 적지 않았으니 기본값인 <code>true</code>가 되었다. 이름을 바꾸면서 원래 속성을 지키려면 <code>@Column(name = "published_at", updatable = false)</code>처럼 필요한 속성을 다시 모두 적어야 한다.</p>
+
+<h4>콜백도 상속된다</h4>
+
+<p>실행 결과의 <code>PrePersist Article</code>, <code>PreUpdate Member</code> 줄은 <code>BaseEntity</code>에 정의한 생명주기 콜백(lifecycle callback)이 하위 엔티티마다 실행되었음을 보여 준다. INSERT보다 <code>PrePersist</code>가, UPDATE보다 <code>PreUpdate</code>가 먼저 찍힌 것도 이름 그대로다. 플러시 과정에서 변경 감지로 UPDATE 대상이 된 엔티티에 대해 SQL을 만들기 전에 <code>@PreUpdate</code>가 호출되었고, 그 안에서 바꾼 <code>lastModifiedAt</code>이 같은 UPDATE 문에 실렸다. 그래서 공통 필드와 그 필드를 채우는 규칙을 매핑된 상위 클래스 하나에 모아 둘 수 있다. 스프링 데이터 JPA의 감사(auditing) 기능은 같은 생명주기 콜백 위에서 등록자·수정자 같은 값까지 채워 주는 방식이며, 이 로드맵의 스프링 데이터 JPA 권에서 다룬다.</p>
+
+<h3>적용 연습: 알림 도메인에 상속과 공통 매핑 입히기</h3>
+
+<p>이제 두 주제를 함께 적용해 보자. 요구사항은 이렇다. 회원에게 이메일, SMS, 푸시 세 가지 경로로 알림을 보낸다. 모든 알림에는 받는 회원, 메시지, 확인 여부가 있다. 이메일 알림은 받는 주소와 제목을, SMS 알림은 전화번호를, 푸시 알림은 기기 토큰을 추가로 갖는다. 화면의 알림함은 경로를 가리지 않고 한 회원의 알림을 시간순으로 모두 보여 준다. 모든 엔티티는 등록 시각과 수정 시각을 갖는다.</p>
+
+<figure class="flow-figure"><figcaption>설계 판단의 순서</figcaption><ol class="flow">
+<li><strong>타입 관계인가, 매핑 공유인가</strong><span>알림함이 세 경로를 한 목록으로 보여 주므로 "알림"은 부모 타입으로 조회되는 진짜 타입이다. 엔티티 상속으로 간다. 등록·수정 시각은 회원과 알림이 아무 타입 관계 없이 공유하므로 @MappedSuperclass로 간다.</span></li>
+<li><strong>조회 패턴</strong><span>가장 잦은 질의는 회원 한 명의 알림 전체 목록, 곧 부모 타입 조회다. 조인이나 UNION 없이 끝나는 단일 테이블이 유리하다.</span></li>
+<li><strong>하위 타입 컬럼</strong><span>하위 타입마다 컬럼이 한두 개뿐이라 테이블이 지나치게 넓어지지 않는다.</span></li>
+<li><strong>무결성</strong><span>하위 타입 컬럼에는 nullable=false를 걸지 않고, 필수 값은 생성자에서 받는다. 데이터베이스 수준 검사가 필요하면 구분 값과 엮은 CHECK 제약을 추가한다.</span></li>
+<li><strong>구분 값</strong><span>클래스 이름에 묶이지 않도록 EMAIL, SMS, PUSH를 명시하고, 구분 컬럼 이름과 길이도 정해 둔다.</span></li>
+</ol></figure>
+
+<p>이 판단을 코드로 옮긴 것이다. 실행한 그대로이며 import 문과 패키지 선언만 생략했다.</p>
+
+<pre><code class="language-java">@MappedSuperclass
+public abstract class BaseEntity {
+
+    @Column(updatable = false)
+    private LocalDateTime createdAt;
+    private LocalDateTime lastModifiedAt;
+
+    @PrePersist
+    void onPrePersist() {
+        LocalDateTime now = LocalDateTime.now();
+        createdAt = now;
+        lastModifiedAt = now;
+    }
+
+    @PreUpdate
+    void onPreUpdate() {
+        lastModifiedAt = LocalDateTime.now();
+    }
+
+    public LocalDateTime getCreatedAt() { return createdAt; }
+    public LocalDateTime getLastModifiedAt() { return lastModifiedAt; }
+}
+
+@Entity
+public class Member extends BaseEntity {
+
+    @Id @GeneratedValue
+    private Long id;
+    private String name;
+
+    protected Member() {}
+    public Member(String name) { this.name = name; }
+    public Long getId() { return id; }
+}
+
+@Entity
+@Inheritance(strategy = InheritanceType.SINGLE_TABLE)
+@DiscriminatorColumn(name = "channel", length = 10)
+public abstract class Notification extends BaseEntity {
+
+    @Id @GeneratedValue
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "receiver_id", nullable = false)
+    private Member receiver;
+
+    @Column(nullable = false)
+    private String message;
+
+    private boolean seen;
+
+    protected Notification() {}
+    protected Notification(Member receiver, String message) {
+        this.receiver = receiver;
+        this.message = message;
+    }
+
+    public abstract String describeTarget();   // 하위 타입마다 다르게 구현
+
+    public String getMessage() { return message; }
+}
+
+@Entity
+@DiscriminatorValue("EMAIL")
+public class EmailNotification extends Notification {
+
+    private String toAddress;   // nullable=false 를 걸지 않는다
+    private String subject;
+
+    protected EmailNotification() {}
+    public EmailNotification(Member receiver, String message, String toAddress, String subject) {
+        super(receiver, message);
+        this.toAddress = toAddress;
+        this.subject = subject;
+    }
+
+    @Override
+    public String describeTarget() { return "email:" + toAddress; }
+}
+
+@Entity
+@DiscriminatorValue("SMS")
+public class SmsNotification extends Notification {
+
+    private String phoneNumber;
+
+    protected SmsNotification() {}
+    public SmsNotification(Member receiver, String message, String phoneNumber) {
+        super(receiver, message);
+        this.phoneNumber = phoneNumber;
+    }
+
+    @Override
+    public String describeTarget() { return "sms:" + phoneNumber; }
+}
+
+@Entity
+@DiscriminatorValue("PUSH")
+public class PushNotification extends Notification {
+
+    private String deviceToken;
+
+    protected PushNotification() {}
+    public PushNotification(Member receiver, String message, String deviceToken) {
+        super(receiver, message);
+        this.deviceToken = deviceToken;
+    }
+
+    @Override
+    public String describeTarget() { return "push:" + deviceToken; }
+}</code></pre>
+
+<p>회원 한 명과 세 경로의 알림을 하나씩 저장한 뒤, 영속성 컨텍스트를 비우고 알림함을 조회했다.</p>
+
+<pre><code class="language-java">List<Notification> inbox = em.createQuery(
+        "select n from Notification n where n.receiver.id = :memberId order by n.id",
+        Notification.class)
+    .setParameter("memberId", kim.getId())
+    .getResultList();
+for (Notification n : inbox) {
+    System.out.println(n.getClass().getSimpleName() + " -> " + n.describeTarget());
+}</code></pre>
+
+<pre data-label="DDL과 SQL, 실행 결과 (시퀀스 호출 생략)"><code class="language-text">create table Member (createdAt timestamp(6), id bigint not null, lastModifiedAt timestamp(6), name varchar(255), primary key (id))
+create table Notification (seen boolean not null, createdAt timestamp(6), id bigint not null, lastModifiedAt timestamp(6), receiver_id bigint not null, channel varchar(10) not null, deviceToken varchar(255), message varchar(255) not null, phoneNumber varchar(255), subject varchar(255), toAddress varchar(255), primary key (id))
+alter table if exists Notification add constraint FK5wmigmch6o1yrgdbccdcqwdcb foreign key (receiver_id) references Member
+
+insert into Member (createdAt,lastModifiedAt,name,id) values (?,?,?,?)
+insert into Notification (createdAt,lastModifiedAt,message,receiver_id,seen,subject,toAddress,channel,id) values (?,?,?,?,?,?,?,'EMAIL',?)
+insert into Notification (createdAt,lastModifiedAt,message,receiver_id,seen,phoneNumber,channel,id) values (?,?,?,?,?,?,'SMS',?)
+insert into Notification (createdAt,lastModifiedAt,message,receiver_id,seen,deviceToken,channel,id) values (?,?,?,?,?,?,'PUSH',?)
+
+select n1_0.id,n1_0.channel,n1_0.createdAt,n1_0.lastModifiedAt,n1_0.message,n1_0.receiver_id,n1_0.seen,n1_0.subject,n1_0.toAddress,n1_0.deviceToken,n1_0.phoneNumber from Notification n1_0 where n1_0.receiver_id=? order by n1_0.id
+EmailNotification -> email:kim@example.com
+SmsNotification -> sms:010-0000-0000
+PushNotification -> push:device-token-1</code></pre>
+
+<p>결과를 설계 판단과 맞춰 보자. <code>Notification</code> 테이블 하나에 세 경로의 컬럼이 모두 있고, 공통 컬럼인 <code>message</code>와 <code>receiver_id</code>, 루트 엔티티의 기본형 필드인 <code>seen</code>은 NOT NULL이 유지되었으며, 하위 타입 컬럼은 모두 NULL 허용이다. 구분 컬럼은 지정한 대로 <code>channel varchar(10) not null</code>이고, INSERT마다 그 하위 타입의 컬럼만 담긴 문장에 구분 값이 리터럴로 들어갔다. <code>BaseEntity</code>의 두 시각 컬럼은 <code>Member</code>와 <code>Notification</code> 양쪽 테이블에 각각 복사되었다. 알림함 조회는 테이블 하나에서 끝났고, 각 행은 <code>channel</code> 값에 맞는 클래스로 만들어져 <code>describeTarget()</code> 호출이 하위 클래스의 구현으로 연결되었다.</p>
+
+<p>필드 이름을 <code>read</code>가 아니라 <code>seen</code>으로 지은 데도 이유가 있다. 필드 이름은 그대로 컬럼 이름이 되는데, <code>READ</code>는 MySQL의 예약어다. MySQL 8.4.13과 8.0.46에서 <code>create table T1 (read boolean not null, id bigint primary key)</code>를 실행하면 <code>ERROR 1064 (42000): You have an error in your SQL syntax; ... near 'read boolean not null, id bigint primary key)'</code>로 실패하고, 백틱으로 감싼 <code>`read`</code>는 통과한다. H2에서는 통과하던 DDL이 MySQL에서 이렇게 실패할 수 있으므로, 상속 매핑처럼 한 테이블에 여러 클래스의 필드가 모일 때는 컬럼 이름과 예약어를 함께 살펴야 한다.</p>
+
+<p>요구사항이 바뀌면 판단도 바뀐다. 예를 들어 "SMS 발송 대행사의 응답 기록을 별도 테이블에 남기고, 그 기록이 SMS 알림만 참조해야 한다"는 요구가 추가되면, 단일 테이블에서는 그 외래 키가 <code>Notification</code> 테이블 전체를 가리키게 되어 이메일 알림을 참조하는 잘못된 행을 데이터베이스가 막지 못한다. 이때는 SMS 알림이 자기 테이블을 갖는 조인 전략이 더 나은 선택이 된다. 상속 전략은 한 번의 정답이 아니라 요구사항에 대한 응답이다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<p><b>"@DiscriminatorColumn을 안 붙이면 구분 컬럼이 없다."</b> 전략에 따라 다르다. 단일 테이블 전략에서는 붙이지 않아도 <code>DTYPE varchar(31) not null</code>이 생긴다. 구분 컬럼 없이는 이 전략이 성립하지 않기 때문이다. 하이버네이트의 조인 전략에서는 붙이지 않으면 실제로 컬럼이 없고, 대신 하위 테이블 조인 결과로 타입을 판별한다. 구현 클래스마다 테이블 전략은 구분 컬럼을 쓰지 않는다.</p>
+
+<p><b>"상속 전략을 지정하지 않았으니 상속 매핑을 안 쓰고 있다."</b> 엔티티가 다른 엔티티를 상속하는 순간 상속 매핑은 이미 동작한다. 지정하지 않은 경우의 기본값이 단일 테이블 전략일 뿐이다. <code>@Inheritance</code>를 지운 실험에서도 테이블 하나에 DTYPE이 생겼다.</p>
+
+<p><b>"조인 전략은 어떤 조회든 모든 테이블을 조인한다."</b> 모든 하위 테이블을 left join하는 것은 부모 타입으로 조회할 때다. 하위 타입으로 조회하면 그 하위 테이블과 부모 테이블만 inner join한다. 조인 전략의 성능을 걱정한다면 어떤 타입으로 조회하는 질의가 많은지부터 확인해야 한다.</p>
+
+<p><b>"단일 테이블에서도 하위 클래스 필드에 nullable=false를 걸면 된다."</b> 매핑과 스키마 생성은 통과하지만 다른 하위 타입을 저장하는 순간 실패한다. 실험에서 계좌 이체 INSERT가 <code>NULL not allowed for column "CARDCOMPANY"</code>로 실패한 것이 그 예다. 명세도 이 전략에서 하위 클래스 컬럼이 NULL을 허용할 것을 요구한다.</p>
+
+<p><b>"단일 테이블은 NULL이 많아 공간 낭비가 심하다."</b> InnoDB의 COMPACT와 DYNAMIC 행 형식에서 NULL 값은 비트 벡터의 비트 하나만 차지한다. 단일 테이블 전략의 비용은 NULL의 저장 공간보다는 행 정의가 넓어지는 것, 무결성 규칙을 데이터베이스가 직접 지킬 수 없다는 것에 있다.</p>
+
+<p><b>"@MappedSuperclass는 상속 전략의 간단한 버전이다."</b> 둘은 다른 문제를 푼다. 엔티티 상속은 타입 관계를 매핑하고, 부모 타입으로 조회하고 참조할 수 있다. 매핑된 상위 클래스는 매핑 정보를 재사용할 뿐이고, 부모 타입으로 조회하거나 참조할 수 없다. 표준 범위에서는 <code>em.find()</code>도 JPQL도 거부된다.</p>
+
+<p><b>"다형 연관관계로 가져온 객체에 instanceof를 쓰면 실제 타입을 알 수 있다."</b> 지연 로딩 연관관계에는 선언 타입을 상속한 프록시가 들어오므로, 실제로 카드 결제여도 <code>instanceof CardPayment</code>가 거짓일 수 있다. 실험에서 본 그대로다. 타입에 따른 분기는 다형성 메서드로 표현하는 편이 안전하다.</p>
+
+<h3>다른 회차와의 연결</h3>
+
+<p>이 회차에서 본 것들은 뒤의 회차에서 계속 다시 나온다. 다형 연관관계에서 만난 프록시는 7회에서 프록시가 만들어지는 방식과 초기화 시점, 그리고 지연 로딩과 즉시 로딩을 다루면서 본격적으로 설명한다. 부모 타입으로 연관관계를 즉시 로딩하면 이 회차의 left join이나 UNION이 연관된 엔티티를 읽을 때마다 붙는다는 점도 그때 다시 떠올리게 된다.</p>
+
+<p>8회의 값 타입에서는 공통 필드를 묶는 또 다른 방법인 임베디드 타입(<code>@Embeddable</code>)을 다룬다. <code>@MappedSuperclass</code>가 상속으로 매핑 정보를 물려준다면, 임베디드 타입은 객체를 필드로 포함하는 합성(composition)으로 같은 문제에 접근한다. 등록·수정 시각 같은 정보를 어느 방식으로 묶을지 그때 비교해 볼 수 있다. 9회와 10회의 JPQL에서는 <code>type()</code>과 <code>treat()</code>, 그리고 벌크 연산을 다루는데, 이 회차에서 본 것처럼 상속 전략에 따라 같은 JPQL이 전혀 다른 SQL로 번역된다는 사실이 그 설명의 바탕이 된다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>객체는 자기 타입을 스스로 알지만 행은 모른다. 그래서 상속 매핑 전략은 "컬럼을 어디에 둘 것인가"와 "행의 타입을 무엇으로 알아낼 것인가"에 대한 선택이다. 조인 전략은 테이블을 나누고 조인 성공 여부나 구분 컬럼으로, 단일 테이블 전략은 한 테이블에 모으고 구분 컬럼으로, 구현 클래스마다 테이블 전략은 UNION 분기에 붙인 상수로 타입을 알아낸다. 이 선택이 조인 수, NOT NULL 가능 여부, 외래 키를 걸 수 있는 위치, 식별자 생성 방식까지 결정한다. @MappedSuperclass는 이 질문과 무관하게 매핑 정보만 재사용하는 도구이며, 부모 타입이라는 것을 만들지 않는다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>상속관계 매핑의 두 질문</dt><dd>어떤 컬럼을 어느 테이블에 둘 것인가, 읽은 행을 어느 클래스로 만들 것인가. 세 전략은 이 두 질문에 대한 서로 다른 답이다.</dd>
+<dt>조인 전략(JOINED)</dt><dd>타입마다 테이블을 두고 하위 테이블의 기본 키가 부모 기본 키를 외래 키로 참조한다. 저장은 INSERT 두 번, 부모 타입 조회는 모든 하위 테이블 left join이며, 하위 타입 컬럼에 NOT NULL을 걸 수 있다.</dd>
+<dt>단일 테이블 전략(SINGLE_TABLE)</dt><dd>모든 컬럼을 한 테이블에 모으고 구분 컬럼으로 타입을 가른다. 조인이 없어 조회가 단순하지만 하위 타입 컬럼은 NULL을 허용해야 한다. 상속 전략을 지정하지 않으면 이 전략이 기본값이다.</dd>
+<dt>구현 클래스마다 테이블 전략(TABLE_PER_CLASS)</dt><dd>구체 클래스마다 전체 상태를 담은 테이블을 둔다. 부모 타입 조회는 UNION ALL이 되고, 부모 테이블이 없어 다형 참조의 외래 키를 걸 수 없으며, 명세상 지원이 선택 사항이다.</dd>
+<dt>구분 컬럼과 구분 값</dt><dd>지정하지 않으면 컬럼은 DTYPE, 타입은 STRING, 길이는 31이고, STRING 구분 값의 기본은 엔티티 이름이다. 클래스 이름 변경에 흔들리지 않도록 @DiscriminatorValue를 명시하는 편이 안전하다.</dd>
+<dt>IDENTITY와 TABLE_PER_CLASS</dt><dd>테이블마다 독립적으로 매긴 id는 UNION 결과에서 겹칠 수 있으므로 하이버네이트는 이 조합을 거부한다. 계층 전체가 하나의 식별자 공간을 공유해야 한다.</dd>
+<dt>@MappedSuperclass</dt><dd>매핑 정보만 하위 엔티티에 물려주는 클래스다. 자기 테이블이 없고, 엔티티가 아니므로 조회하거나 EntityManager에 넘기거나 연관관계로 참조할 수 없다.</dd>
+<dt>@AttributeOverride</dt><dd>상속받은 속성의 컬럼 매핑을 엔티티마다 바꾼다. 지정한 @Column이 원래 정의를 통째로 대신하므로 updatable 같은 속성도 다시 적어야 한다.</dd>
+</x-summary>
+
+<x-review>
+<p>상속 전략 선택이 실제로 문제가 되는 순간은 대개 처음이 아니라 몇 달 뒤다. 단일 테이블로 시작한 결제 테이블에 하위 타입이 다섯, 여섯으로 늘면서 컬럼이 수십 개가 되고, 누군가 새 하위 타입의 필드에 <code>nullable = false</code>를 걸었다가 다른 결제 수단의 저장이 운영에서 실패한다. 반대로 조인 전략으로 시작한 테이블에서 관리자 화면이 모든 결제를 페이지 단위로 조회할 때마다 하위 테이블 수만큼의 left join이 붙는다. 어느 쪽이든 원인은 애너테이션 한 줄이 만든 테이블 구조이고, 이 회차에서 본 DDL과 SQL을 떠올리면 증상에서 원인으로 바로 갈 수 있다.</p>
+<p>판단이 달라지는 조건은 비교적 분명하다. 부모 타입으로 목록을 보는 일이 대부분이고 하위 타입 컬럼이 적다면 단일 테이블 전략이 낫고, 하위 타입별 제약과 하위 타입을 직접 가리키는 외래 키가 중요하다면 조인 전략이 낫다. 부모 타입으로 함께 볼 일이 없다면 상속 매핑 자체를 의심해 보고, 공통 컬럼만 @MappedSuperclass로 공유하는 쪽을 검토한다. 구현 클래스마다 테이블 전략은 UNION, 참조 무결성, 식별자 생성, 이식성의 제약을 모두 감수할 이유가 있을 때만 고른다.</p>
+<p>한 번 운영 데이터가 쌓인 뒤에는 전략을 바꾸는 일이 데이터 이전 작업이 된다. 그래서 설계 단계에서 "이 계층을 부모 타입으로 조회하는 화면과 배치가 무엇인가", "하위 타입만 가리키는 테이블이 생길 가능성이 있는가"를 미리 물어 두는 것이 가장 값싼 대비다. 그리고 어떤 전략을 골랐든 개발 환경에서 show_sql로 실제 DDL과 SQL을 한 번 확인하는 습관이, 기본값과 숨은 제약 때문에 생기는 문제 대부분을 미리 걸러 준다.</p>
+</x-review>
+
+<x-practice>
+<li>조인 전략(구분 컬럼 없음)의 결제 계층에 <code>PointPayment</code>(필드 <code>long pointsUsed</code>)를 세 번째 하위 엔티티로 추가했다. <code>em.find(Payment.class, id)</code>가 만드는 SQL의 FROM 절에 테이블이 몇 개 등장하고 각각 어떤 조인으로 붙는지, 그리고 타입을 판별하는 CASE 식에 분기가 몇 개 생기는지 예측하라. 같은 상황에서 <code>em.find(PointPayment.class, id)</code>는 어떻게 되는가?</li>
+<li>단일 테이블 전략으로 매핑된 계층에서 <code>CardPayment</code>의 <code>cardCompany</code>에 <code>@Column(nullable = false)</code>가 붙어 있다. 카드 결제 저장 테스트는 모두 통과하는데 계좌 이체를 저장하면 예외가 난다. 원인을 DDL과 INSERT 문을 근거로 설명하고, "카드 결제라면 카드사가 반드시 있어야 한다"는 규칙을 유지하면서 문제를 고치는 방법 두 가지를 제시하라.</li>
+<li>구현 클래스마다 테이블 전략에서 IDENTITY 키 생성이 허용된다고 가정하고, 카드 결제 하나와 계좌 이체 하나를 처음으로 저장한 직후 <code>em.find(Payment.class, 1L)</code>이 만나는 문제를 UNION ALL 쿼리의 결과 행으로 설명하라. 시퀀스를 쓰면 왜 이 문제가 생기지 않는가?</li>
+<li><code>@MappedSuperclass</code>인 <code>BaseEntity</code>의 <code>createdAt</code>에는 <code>@Column(updatable = false)</code>가 있다. 어떤 엔티티는 <code>@AttributeOverride(name = "createdAt", column = @Column(name = "registered_at"))</code>로 컬럼 이름을 바꿨다. 이 엔티티에서만 등록 시각이 바뀌는 버그가 보고되었다. 원인과 수정 방법을 설명하라.</li>
+<li>사내 게시판에 공지, 일반 글, 설문 글이 있다. 목록 화면은 세 종류를 섞어 최신순으로 보여 준다. 설문 글에만 마감일과 선택지 개수가 있고, 설문 응답 테이블은 설문 글만 참조해야 한다. 상속 전략을 고르고 근거를 이 회차의 관찰로 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> FROM 절에는 <code>Payment</code>, <code>BankTransfer</code>, <code>CardPayment</code>, <code>PointPayment</code> 네 테이블이 등장하고, <code>Payment</code>를 기준으로 세 하위 테이블이 모두 left join으로 붙는다. 조회 시점에는 그 id가 어느 하위 타입인지 모르므로 모든 하위 테이블을 열어 봐야 하고, 짝이 없는 하위 테이블 때문에 행이 사라지지 않도록 inner join이 아니라 left join을 써야 한다. CASE 식은 하위 테이블마다 <code>when 하위.id is not null then 번호</code> 분기를 하나씩 가지므로 세 개가 된다. 번호는 하이버네이트 내부 표시라 어떤 값일지 미리 정할 수는 없다. <code>em.find(PointPayment.class, id)</code>는 타입이 정해져 있으므로 <code>PointPayment</code>와 <code>Payment</code>만 inner join한다. 하위 타입이 늘어도 하위 타입 조회의 비용은 늘지 않고, 부모 타입 조회의 비용만 늘어난다.</p>
+<p><b>2.</b> 단일 테이블 전략에서는 모든 하위 타입의 행이 한 테이블에 들어가므로, <code>nullable = false</code>가 만든 <code>cardCompany ... not null</code> 제약이 계좌 이체 행에도 적용된다. 하이버네이트는 계좌 이체를 저장할 때 <code>insert into Payment (amount,bankName,depositor,DTYPE,id)</code>처럼 그 타입의 컬럼만 담은 INSERT를 보내고, 빠진 <code>cardCompany</code>는 NULL이 되어 제약에 걸린다. 카드 결제만 테스트하면 드러나지 않는 이유다. 고치는 방법은 첫째, <code>nullable = false</code>를 지우고 <code>CardPayment</code> 생성자에서 카드사가 null이면 예외를 던져 애플리케이션 수준에서 규칙을 지키는 것, 둘째, 데이터베이스 수준에서 <code>check (DTYPE <> 'CARD' or cardCompany is not null)</code> 같은 CHECK 제약을 거는 것이다(MySQL은 8.0.16부터 CHECK를 검사한다). 둘을 함께 쓸 수도 있다. 하위 타입 고유 규칙이 많아 이런 CHECK가 계속 늘어난다면 조인 전략으로 바꾸는 것도 검토할 만하다.</p>
+<p><b>3.</b> IDENTITY는 테이블마다 독립적으로 자동 증가 값을 매기므로, 각 테이블의 첫 행인 카드 결제와 계좌 이체가 모두 id 1을 받는다. 부모 타입 조회는 <code>CardPayment</code>와 <code>BankTransfer</code>를 UNION ALL한 파생 테이블에 <code>where id=1</code>을 거는데, 이 파생 테이블에는 id가 1인 행이 두 개 있다. <code>em.find()</code>는 식별자 하나에 엔티티 하나를 돌려줘야 하므로 어느 쪽을 돌려줄지 정할 수 없다. 시퀀스를 쓰면 계층 전체가 <code>Payment_SEQ</code> 하나에서 값을 받으므로 한 번 나간 값이 다른 테이블에서 다시 나가지 않는다. 실험에서도 카드 결제는 1, 계좌 이체는 2를 받았다. 하이버네이트는 이 위험을 미리 막으려고 매핑 단계에서 <code>Cannot use identity column key generation with <union-subclass> mapping</code> 예외를 던진다.</p>
+<p><b>4.</b> <code>@AttributeOverride</code>의 <code>column</code>에 준 <code>@Column(name = "registered_at")</code>은 원래 <code>@Column(updatable = false)</code>에 이름만 덧붙는 것이 아니라 컬럼 정의 전체를 대신한다. 새 정의에는 <code>updatable</code>이 없으니 기본값 <code>true</code>가 되고, 이 엔티티의 UPDATE 문에만 <code>registered_at</code>이 포함된다. 실험에서 <code>Article</code>의 UPDATE에 <code>published_at</code>이 들어가고 <code>Member</code>의 UPDATE에는 <code>createdAt</code>이 빠진 것과 같은 현상이다. 수정은 <code>@Column(name = "registered_at", updatable = false)</code>처럼 원래 필요한 속성을 다시 모두 적는 것이다. 재발을 막으려면 변경 감지 후 나가는 UPDATE 문을 테스트에서 한 번 확인한다.</p>
+<p><b>5.</b> 목록 화면이 세 종류를 섞어 보여 주므로 "게시글"은 부모 타입으로 조회되는 진짜 타입이고 엔티티 상속이 맞다. 하위 타입 컬럼이 설문 글의 두 개뿐이고 목록 조회가 주된 질의라는 점은 단일 테이블 쪽을 가리킨다. 하지만 "설문 응답 테이블은 설문 글만 참조해야 한다"는 요구가 결정적이다. 단일 테이블이라면 응답 테이블의 외래 키는 게시글 테이블 전체를 가리키게 되어 공지에 달린 응답 행을 데이터베이스가 막지 못한다. 조인 전략이라면 응답 테이블의 외래 키가 설문 글 테이블을 직접 가리킬 수 있다. 목록 조회는 부모 타입 조회라 하위 테이블 left join이 붙지만, 하위 타입이 셋이고 기본 키끼리의 조인이므로 감당할 만하다. 따라서 조인 전략을 고르고, 목록 조회가 성능 문제가 되면 실행 계획을 보며 대응한다. 응답 무결성 요구가 없었다면 단일 테이블 전략이 더 단순한 답이었을 것이다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>하이버네이트 6.6에서 @DiscriminatorColumn 없이 JOINED 전략으로 매핑한 계층을 em.find(Payment.class, id)로 조회했다. 하이버네이트는 읽은 행의 실제 타입을 무엇으로 판별하는가?</q>
+<o>부모 테이블에 자동으로 추가된 DTYPE 컬럼의 값</o>
+<o>하위 테이블마다 SELECT를 따로 보내 결과가 나온 테이블</o>
+<o>모든 하위 테이블을 left join한 뒤, 어느 하위 테이블의 id가 NULL이 아닌지를 검사하는 CASE 식</o>
+<o>영속성 컨텍스트에 남아 있는 이전 조회 기록</o>
+<why>실험의 SQL은 Payment에서 BankTransfer와 CardPayment를 left join하고 case when p1_1.id is not null then 1 when p1_2.id is not null then 2 end로 타입 번호를 계산했다. 구분 컬럼은 @DiscriminatorColumn을 붙였을 때만 생겼고, 하위 테이블별 별도 SELECT는 나가지 않았다. em.clear() 후 조회했으므로 1차 캐시와도 무관하다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>엔티티 Payment와 이를 상속한 CardPayment, BankTransfer가 있고, @Inheritance와 @DiscriminatorColumn, @DiscriminatorValue를 하나도 붙이지 않았다. 스키마 자동 생성 결과로 옳은 것은?</q>
+<o>상속 전략이 지정되지 않았으므로 세 엔티티가 서로 관계없는 테이블 세 개가 된다.</o>
+<o>Payment 테이블 하나에 모든 컬럼과 DTYPE varchar(31) not null이 생기고, 구분 값으로 'CardPayment', 'BankTransfer'가 저장된다.</o>
+<o>JOINED가 기본값이므로 테이블 세 개가 생기고 구분 컬럼은 없다.</o>
+<o>구분 컬럼을 지정하지 않았으므로 매핑 오류로 애플리케이션이 시작되지 않는다.</o>
+<why>명세는 @Inheritance가 없으면 SINGLE_TABLE을 쓰도록 정하고, 구분 컬럼이 필요한데 @DiscriminatorColumn이 없으면 이름 DTYPE, 타입 STRING을 기본으로 한다. length의 기본값은 31이다. STRING 구분 값의 기본은 엔티티 이름이므로 클래스 이름이 저장된다. 실험에서 @Inheritance를 지운 경우에도 정확히 이 DDL과 INSERT가 나왔다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>TABLE_PER_CLASS 전략의 루트 엔티티에 @GeneratedValue(strategy = GenerationType.IDENTITY)를 지정하면 하이버네이트가 시작 시점에 MappingException을 던진다. 이 제약의 가장 근본적인 이유는?</q>
+<o>IDENTITY는 INSERT 후에야 id를 알 수 있어서 쓰기 지연이 불가능하기 때문에</o>
+<o>추상 클래스에는 IDENTITY 컬럼을 만들 수 없기 때문에</o>
+<o>UNION ALL 쿼리는 자동 증가 컬럼을 읽을 수 없기 때문에</o>
+<o>테이블마다 독립적으로 매긴 id가 겹칠 수 있어, 계층 전체에서 식별자 하나가 엔티티 하나를 가리킨다는 전제가 깨지기 때문에</o>
+<why>IDENTITY 값은 테이블마다 따로 증가하므로 CardPayment와 BankTransfer가 같은 id를 가질 수 있고, 부모 타입 조회의 UNION 결과에서 그 id가 두 행에 대응하게 된다. 쓰기 지연 문제는 IDENTITY 일반의 특성이지 이 전략에만 생기는 제약의 이유가 아니며, 다른 전략에서는 IDENTITY가 허용된다. UNION이 자동 증가 컬럼을 못 읽는다는 제약은 없다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>@MappedSuperclass인 BaseEntity를 Member와 Article이 상속한다. 다음 중 명세의 규칙과 하이버네이트 6.6의 실험 결과에 맞는 것은?</q>
+<o>BaseEntity 테이블은 생성되지 않고, em.find(BaseEntity.class, 1L)은 IllegalArgumentException으로 거부된다.</o>
+<o>BaseEntity 테이블이 생성되고 Member와 Article이 그 테이블을 조인해 공통 컬럼을 읽는다.</o>
+<o>select b from BaseEntity b는 Member와 Article을 UNION ALL로 합쳐 조회한다.</o>
+<o>다른 엔티티가 @ManyToOne으로 BaseEntity 타입을 참조할 수 있다.</o>
+<why>명세는 매핑된 상위 클래스에 별도 테이블이 정의되지 않으며, 조회 대상이 아니고 EntityManager나 Query 연산에 넘겨서는 안 된다고 정한다. 실험에서도 테이블은 Member와 Article만 생겼고 em.find는 Unable to locate entity descriptor로 거부되었다. 단순 이름의 JPQL은 Could not resolve root entity로 실패했다(패키지까지 붙인 이름일 때만 하이버네이트 확장으로 테이블별 SELECT가 따로 나갔다). 엔티티가 아니므로 연관관계의 대상이 될 수도 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>단일 테이블 전략의 Payment 테이블에서 계좌 이체 INSERT가 NULL not allowed for column "CARDCOMPANY"로 실패했다. 가장 정확한 원인 설명은?</q>
+<o>하이버네이트가 계좌 이체 INSERT에 cardCompany 컬럼을 빠뜨린 버그다.</o>
+<o>DTYPE 값이 잘못 들어가 계좌 이체가 카드 결제로 인식되었다.</o>
+<o>CardPayment 필드에 명시한 nullable = false가 한 테이블을 공유하는 모든 타입의 행에 적용되는 NOT NULL 제약이 되었다.</o>
+<o>기본형 int 필드인 installmentMonths가 NOT NULL이 되었기 때문이다.</o>
+<why>단일 테이블에서는 하위 타입 컬럼의 제약이 다른 타입의 행에도 적용된다. 하이버네이트는 타입마다 자기 컬럼만 담은 INSERT를 만들므로 cardCompany가 빠지는 것은 정상 동작이고, 그 NULL이 제약에 걸린 것이다. DTYPE에는 'BankTransfer'가 정상적으로 들어갔다. 실험의 DDL에서 installmentMonths는 integer로 NULL 허용이었고, 오류 메시지도 CARDCOMPANY를 가리킨다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>상속관계 매핑(inheritance mapping)</dt><dd>객체의 클래스 상속 구조를 테이블 구조로 옮기는 방법. JPA는 @Inheritance의 JOINED, SINGLE_TABLE, TABLE_PER_CLASS 세 전략을 정의한다.</dd>
+<dt>슈퍼타입·서브타입(supertype/subtype)</dt><dd>공통 속성을 가진 상위 개념과 고유 속성을 덧붙인 하위 개념으로 이루어진 논리 모델의 관계. 세 상속 전략은 이를 물리 모델로 바꾸는 세 방법에 대응한다.</dd>
+<dt>구분 컬럼(discriminator column)</dt><dd>행이 어느 하위 타입인지 나타내는 컬럼. 지정하지 않으면 이름은 DTYPE, 타입은 STRING, 길이는 31이다.</dd>
+<dt>구분 값(discriminator value)</dt><dd>구분 컬럼에 저장되는 하위 타입별 값. @DiscriminatorValue로 구체 엔티티 클래스에 지정하며, STRING 타입의 기본값은 엔티티 이름이다.</dd>
+<dt>다형성 질의(polymorphic query)</dt><dd>부모 타입을 대상으로 한 질의가 모든 하위 타입의 엔티티를 각자의 클래스로 돌려주는 것. 전략에 따라 left join, 단일 테이블 조회, UNION ALL로 번역된다.</dd>
+<dt>다형 연관관계(polymorphic association)</dt><dd>다른 엔티티가 부모 타입으로 연관관계를 맺어 어느 하위 타입이든 참조할 수 있게 한 것. 지연 로딩이면 선언 타입을 상속한 프록시가 들어온다.</dd>
+<dt>매핑된 상위 클래스(mapped superclass)</dt><dd>@MappedSuperclass를 붙여 매핑 정보만 하위 엔티티에 물려주는 클래스. 자기 테이블이 없고 엔티티가 아니므로 조회하거나 참조할 수 없다.</dd>
+<dt>속성 재정의(@AttributeOverride)</dt><dd>상속받거나 포함한 속성의 컬럼 매핑을 엔티티에서 바꾸는 애너테이션. 지정한 @Column이 원래 컬럼 정의를 통째로 대신한다.</dd>
+<dt>생명주기 콜백(lifecycle callback)</dt><dd>@PrePersist, @PreUpdate처럼 엔티티 상태 변화의 특정 시점에 호출되는 메서드. 매핑된 상위 클래스에 정의하면 하위 엔티티마다 실행된다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1">Jakarta Persistence 3.1 Specification</a> — 2.12 상속(매핑된 상위 클래스, 엔티티가 아닌 상위 클래스), 2.13 상속 매핑 전략(단일 테이블의 NULL 허용, 조인, 구현 클래스마다 테이블의 선택 지원)</li>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/apidocs/jakarta.persistence/jakarta/persistence/DiscriminatorColumn.html">Jakarta Persistence 3.1 API — DiscriminatorColumn</a> — 구분 컬럼이 없을 때의 기본 이름 DTYPE과 STRING 타입, length 요소</li>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/apidocs/jakarta.persistence/jakarta/persistence/Inheritance.html">Jakarta Persistence 3.1 API — Inheritance</a> — 상속 전략을 지정하지 않으면 SINGLE_TABLE을 쓴다는 규정</li>
+<li><a href="https://docs.hibernate.org/orm/6.6/userguide/html_single/Hibernate_User_Guide.html#entity-inheritance">Hibernate ORM 6.6 User Guide — 3.14 Inheritance</a> — MappedSuperclass, 단일 테이블의 NOT NULL 불가와 CHECK 권고, 조인 전략의 구분 컬럼 불필요, 구현 클래스마다 테이블의 UNION, 암시적 다형성</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-row-format.html">MySQL 8.0 Reference Manual — InnoDB Row Formats</a> — NULL 비트 벡터와 NULL 컬럼의 저장 공간, 기본 행 형식 DYNAMIC</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-table-check-constraints.html">MySQL 8.0 Reference Manual — CHECK Constraints</a> — 8.0.16부터 CHECK 제약을 검사한다는 내용</li>
+</x-refs>

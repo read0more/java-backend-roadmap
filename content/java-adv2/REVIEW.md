@@ -1,0 +1,26 @@
+- 11: 2026-11-17 확인 42건 · 수정 2건 — setAccessible 허용 조건에 java.base 호출자 추가, 네이티브 접근자 사용 범위를 JEP 416 서술과 OpenJDK 21 예외로 구분
+- 01: 2026-11-17 확인 42건 · 수정 2건 — Character.getName(0xAC00) 결과를 유니코드 이름이라 한 문장 정정(표준 이름은 HANGUL SYLLABLE GA), 퀴즈5 해설의 stdout.encoding 조건 보완
+- 02: 2026-11-17 확인 34건 · 수정 1건 — 10,000,000바이트를 8KB 버퍼로 쓸 때 남는 조각 6,784바이트를 5,760바이트로 정정(예제 11개 실행·OpenJDK 21 소스 대조는 모두 일치)
+- 03: 2026-11-17 확인 45건 · 수정 7건 — read() 배열 할당은 보관 문자 없을 때만(두 번에 한 번), 50바이트 계산 오류, skipLF 조건, 읽기 시간 측정값 재측정 반영
+- 04: 2026-11-17 확인 42건 · 수정 4건 — serialver 값을 재현값으로 교체, 덮어쓰기 실패 파일 크기 1414와 코드 의존 명시, 수정된 UTF-8 차이 세 가지로, newLine Javadoc 서술 정정
+- 06: 2026-11-17 확인 32건 · 수정 5건 — write/read 복사 경로를 NioSocketImpl 실제 동작으로 정정, 윈도 오류 문구 주장 삭제, RFC 6761 .invalid 서술 정밀화, hosts 줄 표현 보정
+- 05: 2026-11-17 확인 32건 · 수정 4건 — readString 디코딩 메모리(작업 배열 2배) 보정, Linux transferTo 0번→커널 내 복사, 연습3 REPLACE_EXISTING 누락, 퀴즈5 커널 루프 표현
+- 07: 2026-11-17 확인 32건 · 수정 1건 — backlog 구현 의존 문구의 출처를 ServerSocket(int) Javadoc에서 ServerSocket(int, int) Javadoc으로 바로잡음
+- 08: 2026-11-17 확인 40건 · 수정 5건 — CLOSE_WAIT·fd가 프로세스 끝까지 남는다→GC Cleaner가 닫기 전까지로 좁힘(실험 확인), SYN 재전송 131초→현재 커널 문서 기준·6.1 문서 127초 병기
+- 09: 2026-11-17 확인 32건 · 수정 3건 — 소켓 인터럽트 도입을 JEP 444→JEP 425(JDK 19 프리뷰)로, RFC 9293 SHLD-3에 반이중 닫기 조건 추가, 연습 2 해설 남은 바이트 10→9
+- 10: 2026-11-17 확인 33건 · 수정 0건 — 예제 출력(curl·서버·URLEncoder·URI·스택 트레이스) 재실행 일치, RFC 9110/9112/3986 조항·톰캣 10.1 기본값·자카르타 EE 날짜 모두 일치해 수정 없음
+- 12: 2026-11-17 확인 60건 · 수정 3건 — Retention.getAnnotations 출력을 실제 정규화 이름으로, 지역 변수·람다 매개변수 애노테이션은 기록되지 않음(JLS), 파서 흐름의 프록시 생성·보존 정책 확인 순서 바로잡음
+- 13: 2026-11-17 확인 45건 · 수정 3건 — V2 비용 목록: methodAccessor는 copy()가 넘겨줌, parameterData는 복사본마다 새로 만듦으로 정정, javap에 빈 parameter 2 항목 추가
+- 02: 2026-11-19 심화 보강 +11709자 · 검수 확인 22건 · 수정 3건 — Object.hashCode 등록 경로(RegisterNatives→javaClasses.cpp 직접), 부트로더 findNative 폴백, JFR 이벤트=호출 1회로 범위 축소
+- 01: 2026-11-19 심화 보강 +13888자 · 검수 확인 22건 · 수정 5건 — jlink 이미지 45→48MB, ISO-8859-1은 countPositives 안 거침, Latin-1 시도에 ASCII 포함, 페이지 끝 조건·as_unicode 호출 위치 정밀화
+- 05: 2026-11-19 심화 보강 +14828자 · 검수 확인 16건 · 수정 4건 — toRealPath 기본값은 realpath 호출로 정정, Files.readString 예시를 FileReader로, 순회 시간 단정 삭제, Files.lines 조건 순서 정정
+- 03: 2026-11-19 심화 보강 +11805자 · 검수 확인 14건 · 수정 4건 — count_positives 스텁 진입 조건(32바이트 이상)·decodeASCII 인라인 위치·RFC 3629 C0/C1 문장·UTF_8 주석 표 범위를 좁혀 고침
+- 04: 2026-11-19 심화 보강 +13447자 · 검수 확인 24건 · 수정 1건 — SerializationConstructorAccessorImpl 주석 설명 정정: 검증 면제는 4486457 이후 MagicAccessorImpl 계열 전체이고 이 클래스는 디버깅용으로 남음
+- 06: 2026-11-19 심화 보강 +18074자 · 검수 확인 27건 · 수정 3건 — RFC 8200 UDP 체크섬 필수는 기본 동작(RFC 6936 예외), IPv4 매핑 조건을 v4MappedAddress 요청으로 좁힘, 요약의 체크섬 정의 정정
+- 07: 2026-11-19 심화 보강 +15627자 · 검수 확인 26건 · 수정 1건 — accept 뒤 configureBlocking(newfd,true) 호출 위치를 Net.accept C가 아닌 NioSocketImpl.accept로 명시, 실험 5종 재현 일치
+- 08: 2026-11-19 심화 보강 +12998자 · 검수 확인 24건 · 수정 4건 — UnixDispatcher 로드 시점을 첫 소켓 생성으로 정정, preClose 순서 AIX 예외 명시, MaxFDLimit 실행 stderr 처리, POSIX 절 번호 판 명시
+- 09: 2026-11-19 심화 보강 +14607자 · 검수 확인 18건 · 수정 4건 — read0 설명 정밀화, LockingMode는 실험적 플래그임을 명시, 모니터 점검 로그 출처를 세이프포인트 정리로, JEP 491 보충 서술 범위 축소
+- 11: 2026-11-19 심화 보강 +15560자 · 검수 확인 14건 · 수정 3건 — isIllegalArgument의 Class.cast 건너뛰기 보충, CS 어댑터는 이름·타입으로 찾음, 사본 override는 Method.copy 기준
+- 10: 2026-11-19 심화 보강 +13818자 · 검수 확인 14건 · 수정 3건 — chunked 디코더 트레일러 null 시 NPE 수정, TE gzip 요청은 6.3절 4번상 400임을 명시, 100KB drain 실험의 RST 없는 재연결 경우 추가
+- 12: 2026-11-19 심화 보강 +12997자 · 검수 확인 22건 · 수정 2건 — @Contended만 플래그에 묶인다는 서술을 ReservedStackAccess 포함으로 정정, 요약의 부트·플랫폼 로더 한정을 기본 설정으로 좁힘
+- 13: 2026-11-19 심화 보강 +15264자 · 검수 확인 14건 · 수정 2건 — useNativeAccessor 조건에 시험용 플래그·무인자 가변 메서드 보완, isIllegalArgument 규칙에 생성자 접근자 프레임 판정 추가

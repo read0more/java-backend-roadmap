@@ -1,0 +1,703 @@
+<x-meta>
+deck: 직접 만든 프런트 컨트롤러와 DispatcherServlet을 나란히 놓고, 핸들러 매핑·핸들러 어댑터·뷰 리졸버가 요청 하나를 넘겨받는 순서를 소스와 실험 출력으로 따라간다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>요청 하나가 <code>DispatcherServlet.doDispatch</code> 안에서 핸들러 조회, 어댑터 조회, 핸들러 실행, 뷰 해석, 렌더링을 거치는 순서를 그리고, 각 단계의 인터페이스와 메서드 이름을 말할 수 있다.</li>
+<li><code>Controller</code> 인터페이스, <code>HttpRequestHandler</code>, <code>@RequestMapping</code> 메서드 세 종류의 핸들러가 각각 어떤 핸들러 매핑으로 찾아지고 어떤 핸들러 어댑터로 실행되는지 실행 로그에서 읽어 낼 수 있다.</li>
+<li>논리 뷰 이름이 <code>ViewResolver</code>를 거쳐 <code>View</code> 객체가 되고 <code>forward</code> 또는 리다이렉트로 끝나는 과정을 설명하고, "Circular view path" 오류가 나는 조건을 예측할 수 있다.</li>
+<li><code>RequestMappingHandlerMapping</code>이 기동 시점에 만드는 조회 표의 내용을 클래스·메서드 수준 <code>@RequestMapping</code>에서 계산하고, 중복 매핑·메서드 불일치·파라미터 누락이 각각 언제 어떤 결과로 드러나는지 구분할 수 있다.</li>
+<li>요청 처리 중에 공유되는 객체와 요청마다 새로 만들어지는 객체를 나누어 그리고, 컨트롤러 필드에 상태를 두면 왜 위험한지 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 스프링 MVC는 직접 만든 프런트 컨트롤러와 무엇이 같은가</h3>
+<p>앞 회차에서는 서블릿 하나가 모든 요청을 먼저 받는 프런트 컨트롤러(front controller)를 직접 만들었다. 그 서블릿은 URL로 처리할 객체를 찾고, 그 객체의 호출 방식이 제각각이어도 부를 수 있도록 어댑터(adapter)를 사이에 두었고, 컨트롤러가 돌려준 논리 이름을 실제 화면 경로로 바꿔 렌더링했다. 이 구조를 만들면서 생긴 부품마다 스프링 MVC에는 같은 역할을 하는 부품이 있다. 이 회차는 그 대응을 확인하고, 스프링의 부품이 내부에서 실제로 무엇을 하는지 소스와 실험으로 들여다본다.</p>
+<p>코드 사용법만 보면 스프링 MVC는 <code>@Controller</code>와 <code>@RequestMapping</code>을 붙이는 것으로 끝난다. 그러나 운영 중에 "왜 404인가", "왜 내 컨트롤러가 호출되지 않는가", "왜 뷰를 못 찾는가"를 판단하려면 요청이 어느 객체에서 어느 객체로 넘어가는지 알아야 한다. 이 회차가 답하려는 질문은 다음과 같다.</p>
+<ul>
+<li><code>DispatcherServlet</code>은 어떤 클래스이고, 서블릿 컨테이너는 그것을 언제 어떻게 부르는가.</li>
+<li>요청 하나를 처리하는 동안 어떤 객체들이 어떤 순서로 일을 넘겨받는가.</li>
+<li>URL에 맞는 처리 객체는 누가, 언제 만든 표에서 찾는가. 호출 방식이 다른 처리 객체를 어떻게 한 가지 방법으로 부르는가.</li>
+<li>컨트롤러가 돌려준 문자열 하나가 어떻게 화면이 되는가.</li>
+<li><code>@Controller</code>, <code>@RequestMapping</code>, <code>@GetMapping</code>, <code>Model</code>, <code>@RequestParam</code>은 위 구조의 어느 지점에 끼워지는가.</li>
+</ul>
+<p>먼저 역할의 대응부터 정리한다. 왼쪽은 프런트 컨트롤러를 직접 만들 때 필요했던 역할이고 오른쪽은 스프링 MVC에서 그 역할을 맡는 타입이다.</p>
+<div class="table-wrap"><table><thead><tr><th>직접 만든 구조에서의 역할</th><th>스프링 MVC의 타입</th><th>계약(핵심 메서드)</th></tr></thead><tbody>
+<tr><td>모든 요청을 먼저 받는 서블릿</td><td><code>DispatcherServlet</code></td><td><code>doDispatch(request, response)</code></td></tr>
+<tr><td>URL로 처리 객체를 찾는 조회 표</td><td><code>HandlerMapping</code></td><td><code>getHandler(request)</code></td></tr>
+<tr><td>호출 방식의 차이를 흡수하는 어댑터</td><td><code>HandlerAdapter</code></td><td><code>supports(handler)</code>, <code>handle(request, response, handler)</code></td></tr>
+<tr><td>뷰 이름과 모델을 함께 담는 반환 객체</td><td><code>ModelAndView</code></td><td>뷰 이름(또는 <code>View</code>)과 모델 맵</td></tr>
+<tr><td>논리 이름을 실제 화면으로 바꾸는 부분</td><td><code>ViewResolver</code></td><td><code>resolveViewName(viewName, locale)</code></td></tr>
+<tr><td>화면을 그리는 객체</td><td><code>View</code></td><td><code>render(model, request, response)</code></td></tr>
+</tbody></table></div>
+<p>스프링은 처리 객체를 컨트롤러라고 부르지 않고 핸들러(handler)라고 부른다. 컨트롤러는 핸들러의 한 종류일 뿐이고, 정적 파일을 내려 주는 객체나 함수형 라우터도 핸들러가 될 수 있기 때문이다. 이 구분은 뒤에서 어댑터를 볼 때 다시 중요해진다.</p>
+<aside class="note">이 회차의 실험은 로컬에 있는 Spring Framework 7.0.10과 <code>spring-test</code>의 Mock 서블릿 객체(<code>MockHttpServletRequest</code> 등)로 실행했다. 톰캣을 띄우지 않고 <code>DispatcherServlet</code> 객체를 직접 만들어 <code>service()</code>를 호출한 것이다. 이 강좌의 기준 버전은 Spring Framework 6.x이므로, 본문의 규칙은 6.2.x 소스와 레퍼런스 문서로 다시 확인했고 두 버전이 다른 곳은 따로 적었다.</aside>
+
+<h3>DispatcherServlet도 서블릿이다</h3>
+<p><code>DispatcherServlet</code>은 특별한 실행 환경이 아니라 <code>HttpServlet</code>을 상속한 평범한 서블릿 클래스다. 서블릿 컨테이너 입장에서는 개발자가 직접 만든 서블릿과 똑같이 객체 하나를 만들고, <code>init()</code>을 한 번 부르고, 요청이 올 때마다 작업 스레드에서 <code>service()</code>를 부른다. 상속 계층은 네 단계다.</p>
+<pre class="diagram">jakarta.servlet.http.HttpServlet     HTTP 메서드를 보고 doGet, doPost … 로 나눈다
+            ▲
+HttpServletBean                      init(): 서블릿 초기화 파라미터를 자기 프로퍼티에 넣고 initServletBean() 호출
+            ▲
+FrameworkServlet                     스프링 컨테이너(WebApplicationContext)와 연결한다
+                                     doGet, doPost … 를 전부 processRequest() 하나로 모은다
+            ▲
+DispatcherServlet                    doService() → doDispatch(): 핸들러 조회, 실행, 뷰 렌더링</pre>
+<p><code>HttpServlet</code>은 요청을 HTTP 메서드별로 흩어 놓는데, <code>FrameworkServlet</code>은 그것을 다시 한 곳으로 모은다. <code>doGet</code>, <code>doPost</code>, <code>doPut</code>, <code>doDelete</code>가 모두 <code>processRequest</code>를 호출하도록 재정의되어 있다. HTTP 메서드에 따른 분기는 서블릿 수준이 아니라 뒤에서 볼 핸들러 매핑 수준에서 하겠다는 설계다. <code>processRequest</code>는 현재 요청과 로케일 정보를 스레드 로컬(<code>RequestContextHolder</code>, <code>LocaleContextHolder</code>)에 넣어 두고 <code>doService</code>를 부른 다음, 끝나면 스레드 로컬을 원래대로 되돌린다. <code>DispatcherServlet.doService</code>는 요청 속성에 스프링 컨테이너와 로케일 리졸버 같은 객체를 넣어 둔 뒤 <code>doDispatch</code>로 넘어간다.</p>
+<p>이 경로는 추측할 필요 없이 컨트롤러 안에서 스택을 찍어 보면 그대로 나온다. 아래는 뒤에서 만들 애노테이션 컨트롤러의 메서드 안에서 <code>new Throwable().getStackTrace()</code>를 출력한 결과에서 클래스의 단순 이름과 메서드 이름만 남긴 것이다. 아래에서 위로 읽으면 호출 순서가 된다.</p>
+<pre data-label="실행 결과(스택, 위가 가장 안쪽)"><code class="language-text">    NoticeLab$PracticalNoticeController.trace
+    DirectMethodHandleAccessor.invoke
+    Method.invoke
+    InvocableHandlerMethod.doInvoke
+    InvocableHandlerMethod.invokeForRequest
+    ServletInvocableHandlerMethod.invokeAndHandle
+    RequestMappingHandlerAdapter.invokeHandlerMethod
+    RequestMappingHandlerAdapter.handleInternal
+    AbstractHandlerMethodAdapter.handle
+    DispatcherServlet.doDispatch
+    DispatcherServlet.doService
+    FrameworkServlet.processRequest
+    FrameworkServlet.doGet
+    HttpServlet.service
+    FrameworkServlet.service
+    HttpServlet.service
+    MvcLab.send
+    NoticeLab.main</code></pre>
+<p>맨 아래 두 줄은 실험 코드다. 실제 서버라면 그 자리에 톰캣의 필터 체인과 커넥터 클래스가 있다. 그 위의 <code>HttpServlet.service</code>부터 <code>DispatcherServlet.doDispatch</code>까지 일곱 프레임이 방금 설명한 상속 계층을 타고 올라가는 과정이다. <code>doDispatch</code> 위쪽은 핸들러 어댑터가 리플렉션(<code>Method.invoke</code>)으로 컨트롤러 메서드를 부르는 과정인데, 이 부분은 뒤에서 다시 본다. 눈여겨볼 점은 이 모든 프레임이 <b>하나의 스레드 스택</b> 위에 쌓여 있다는 것이다. 요청을 받은 작업 스레드가 컨트롤러 메서드까지 직접 들어가고, 중간에 다른 스레드로 넘기는 일은 없다.</p>
+<h4>스프링 부트에서는 누가 등록하는가</h4>
+<p>스프링 부트는 자동 구성으로 <code>DispatcherServlet</code>을 스프링 빈으로 만들고, <code>dispatcherServlet</code>이라는 이름으로 내장 서블릿 컨테이너에 등록한다. 매핑 경로는 <code>spring.mvc.servlet.path</code> 프로퍼티이고 기본값은 <code>/</code>다. 서블릿 명세에서 URL 패턴 <code>/</code>는 기본 서블릿(default servlet)을 뜻하며, 더 구체적인 패턴에 걸리지 않은 요청이 모두 이 서블릿으로 온다. 그래서 따로 서블릿을 등록하지 않은 부트 애플리케이션에서는 사실상 모든 요청이 <code>DispatcherServlet</code> 하나를 지난다.</p>
+<p>초기화 시점도 알아 둘 만하다. 부트의 <code>spring.mvc.servlet.load-on-startup</code> 기본값은 <code>-1</code>이다. 서블릿 명세는 이 값이 음수이면 컨테이너가 로딩 시점을 정해도 된다고 하고, 톰캣은 첫 요청이 왔을 때 서블릿의 <code>init()</code>을 부른다. 부트 애플리케이션을 띄운 뒤 첫 요청을 보내야 <code>Initializing Spring DispatcherServlet 'dispatcherServlet'</code> 로그가 찍히는 이유다. 이 회차의 실험에서도 <code>init()</code>을 직접 호출했을 때 같은 형식의 로그(<code>Initializing Servlet 'dispatcher'</code>, <code>Completed initialization in … ms</code>)가 나왔다. 소요 시간은 실행마다 다르다.</p>
+
+<h3>doDispatch: 요청 하나의 전체 경로</h3>
+<p>스프링 MVC의 구조는 <code>doDispatch</code> 메서드 하나에 들어 있다. 아래는 Spring Framework 6.2.x의 <code>DispatcherServlet.doDispatch</code>에서 멀티파트, 비동기, <code>Last-Modified</code> 처리와 예외 포장을 걷어 내고 뼈대만 옮긴 것이다. 변수 이름과 호출 순서는 원본과 같다.</p>
+<pre><code class="language-java">// DispatcherServlet.doDispatch의 뼈대 (6.2.x 소스를 줄여 옮김)
+HandlerExecutionChain mappedHandler = getHandler(processedRequest);       // ① 핸들러 조회
+if (mappedHandler == null) {
+    noHandlerFound(processedRequest, response);                           //    못 찾으면 404로 가는 길
+    return;
+}
+HandlerAdapter ha = getHandlerAdapter(mappedHandler.getHandler());        // ② 어댑터 조회
+
+if (!mappedHandler.applyPreHandle(processedRequest, response)) {          // ③ 인터셉터 preHandle
+    return;
+}
+ModelAndView mv = ha.handle(processedRequest, response, mappedHandler.getHandler());  // ④ 핸들러 실행
+
+applyDefaultViewName(processedRequest, mv);
+mappedHandler.applyPostHandle(processedRequest, response, mv);            // ⑤ 인터셉터 postHandle
+
+processDispatchResult(processedRequest, response, mappedHandler, mv, dispatchException);
+// ⑥ 예외가 있었으면 HandlerExceptionResolver로 처리 → mv가 있으면 render() → 인터셉터 afterCompletion</code></pre>
+<p>①의 <code>getHandler</code>는 등록된 <code>HandlerMapping</code> 목록을 순서대로 돌며 <code>mapping.getHandler(request)</code>를 호출하고, <code>null</code>이 아닌 첫 결과를 돌려준다. 결과 타입은 <code>HandlerExecutionChain</code>인데, 핸들러 객체 하나와 그 앞뒤에서 실행할 인터셉터 목록을 묶은 것이다. ②의 <code>getHandlerAdapter</code>는 등록된 <code>HandlerAdapter</code> 목록을 순서대로 돌며 <code>adapter.supports(handler)</code>가 <code>true</code>인 첫 어댑터를 돌려준다. 하나도 없으면 "No adapter for handler"라는 <code>ServletException</code>을 던진다. 두 메서드 모두 본문이 반복문 하나뿐이다.</p>
+<p>④에서 어댑터가 핸들러를 실행하고 <code>ModelAndView</code>를 돌려준다. 이 반환값이 <code>null</code>일 수도 있다는 점이 중요하다. 핸들러가 응답을 이미 직접 써 버렸다면 그릴 화면이 없으므로 어댑터는 <code>null</code>을 돌려주고, ⑥에서 렌더링을 건너뛴다. ⑥의 <code>processDispatchResult</code>는 <code>mv</code>가 있으면 <code>render</code>를 부른다. <code>render</code>는 뷰 이름이 있으면 <code>ViewResolver</code> 목록을 순서대로 돌며 <code>resolveViewName</code>을 호출해 <code>null</code>이 아닌 첫 <code>View</code>를 얻고, 그 <code>View</code>의 <code>render(model, request, response)</code>를 호출한다. <code>View</code>를 얻지 못하면 "Could not resolve view with name"이라는 <code>ServletException</code>이 난다.</p>
+<figure class="flow-figure"><figcaption>DispatcherServlet이 요청 하나를 처리하는 순서</figcaption><ol class="flow">
+<li><strong>핸들러 조회</strong><span>HandlerMapping 목록을 순서대로 물어 요청에 맞는 핸들러와 인터셉터 묶음(HandlerExecutionChain)을 얻는다.</span></li>
+<li><strong>어댑터 조회</strong><span>HandlerAdapter 목록에서 이 핸들러를 실행할 줄 아는(supports) 첫 어댑터를 고른다.</span></li>
+<li><strong>핸들러 실행</strong><span>어댑터가 핸들러의 실제 메서드를 호출하고 결과를 ModelAndView로 맞춰 돌려준다. 응답을 직접 썼다면 null이다.</span></li>
+<li><strong>뷰 해석</strong><span>ViewResolver 목록이 논리 뷰 이름을 View 객체로 바꾼다.</span></li>
+<li><strong>렌더링</strong><span>View가 모델을 받아 응답을 만든다. JSP라면 forward, 리다이렉트 뷰라면 302 응답이다.</span></li>
+<li><strong>마무리</strong><span>인터셉터의 afterCompletion이 불리고 스레드가 서블릿 컨테이너로 돌아간다.</span></li>
+</ol></figure>
+<p>이 순서에서 <code>DispatcherServlet</code>이 구체 클래스를 하나도 모른다는 점을 확인해 두자. 핸들러의 타입은 <code>Object</code>이고, 나머지는 전부 인터페이스다. <code>DispatcherServlet</code>은 "찾아라, 실행해라, 이름을 뷰로 바꿔라, 그려라"를 순서대로 시킬 뿐이고, 각 일을 실제로 어떻게 하는지는 목록에 들어 있는 구현체가 정한다. 「스프링 핵심 원리 기본편」에서 본 역할과 구현의 분리가 프레임워크 내부에 그대로 적용된 모습이다.</p>
+<aside class="note">7.0.10 소스에서는 순서가 조금 다르다. 인터셉터 <code>preHandle</code>을 먼저 호출하고 그다음에 어댑터를 찾으며, GET·HEAD 요청에서 <code>getLastModified</code>를 묻던 코드는 없어졌다. 핸들러 조회 → 실행 → 뷰 렌더링이라는 큰 흐름은 두 버전에서 같다.</aside>
+<x-visual id="spring-mvc1-05-dispatcher-flow" title="DispatcherServlet이 핸들러 매핑, 핸들러 어댑터, 핸들러, 뷰 리졸버, 뷰를 차례로 호출하는 요청 처리 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>요청 하나가 DispatcherServlet을 중심으로 다섯 협력 객체를 순서대로 거친다는 것, 그리고 핸들러를 직접 부르는 것은 어댑터라는 것을 보여 준다.</x-hint>
+<x-prompt>깔끔한 시퀀스 다이어그램, 흰 배경, 평면 색. 세로 생명선 여섯 개가 왼쪽부터 "DispatcherServlet", "HandlerMapping", "HandlerAdapter", "핸들러(컨트롤러)", "ViewResolver", "View" 순서로 서 있다. 맨 왼쪽 생명선은 굵은 남색 띠로 강조한다. 화살표를 위에서 아래로 순서대로 그리고 각 화살표 앞에 원 번호를 붙인다. 1번: DispatcherServlet에서 HandlerMapping으로 실선 화살표, 라벨 "1 핸들러 조회". 되돌아오는 점선 화살표에는 라벨 없이 작은 상자 아이콘. 2번: DispatcherServlet에서 HandlerAdapter로 실선 화살표, 라벨 "2 어댑터 조회". 3번: DispatcherServlet에서 HandlerAdapter로 실선 화살표, 이어서 HandlerAdapter에서 핸들러(컨트롤러)로 주황색 실선 화살표, 라벨 "3 핸들러 실행". 핸들러에서 HandlerAdapter를 거쳐 DispatcherServlet으로 돌아오는 점선 화살표, 라벨 "ModelAndView". 4번: DispatcherServlet에서 ViewResolver로 실선 화살표, 라벨 "4 뷰 이름 해석". 5번: DispatcherServlet에서 View로 실선 화살표, 라벨 "5 렌더링". View 생명선 아래에서 화면 밖 오른쪽으로 나가는 화살표, 라벨 "HTTP 응답". 장식 없이 단순한 선.</x-prompt>
+<x-caption>DispatcherServlet은 핸들러를 직접 부르지 않는다. 핸들러를 부르는 것은 어댑터이고, DispatcherServlet은 인터페이스 네 개에만 의존한다.</x-caption>
+</x-visual>
+
+<h3>전략 객체는 어디서 오는가</h3>
+<p><code>doDispatch</code>가 쓰는 목록들(<code>handlerMappings</code>, <code>handlerAdapters</code>, <code>viewResolvers</code>)은 서블릿이 초기화될 때 한 번 채워진다. <code>init()</code> 과정에서 <code>initStrategies</code>가 호출되고, 이 메서드가 <code>initHandlerMappings</code>, <code>initHandlerAdapters</code>, <code>initHandlerExceptionResolvers</code>, <code>initViewResolvers</code> 등을 차례로 부른다. 채우는 규칙은 세 종류 모두 같다.</p>
+<ol>
+<li>스프링 컨테이너에서 해당 타입(예: <code>HandlerMapping</code>)의 빈을 전부 찾는다.</li>
+<li>찾은 빈이 있으면 <code>Ordered</code>·<code>@Order</code>의 순서 값으로 정렬해 목록으로 쓴다.</li>
+<li>하나도 없으면 <code>spring-webmvc</code> jar 안의 <code>DispatcherServlet.properties</code> 파일에 적힌 기본 구현체들을 만들어 쓴다.</li>
+</ol>
+<p><code>DispatcherServlet.properties</code>는 스프링이 jar에 넣어 둔 파일로, 첫머리 주석에 "Not meant to be customized by application developers"라고 적혀 있다. 6.2.x 기준으로 핸들러 매핑의 기본값은 <code>BeanNameUrlHandlerMapping</code>, <code>RequestMappingHandlerMapping</code>, <code>RouterFunctionMapping</code> 순서이고, 핸들러 어댑터는 <code>HttpRequestHandlerAdapter</code>, <code>SimpleControllerHandlerAdapter</code>, <code>RequestMappingHandlerAdapter</code>, <code>HandlerFunctionAdapter</code> 순서이며, 뷰 리졸버는 <code>InternalResourceViewResolver</code> 하나다. MVC 관련 설정을 아무것도 하지 않은 컨테이너로 <code>DispatcherServlet</code>을 초기화한 뒤 세 목록을 출력하면 파일 내용과 똑같이 나온다.</p>
+<pre data-label="실행 결과(MVC 설정 없음)"><code class="language-text">handlerMappings:
+  - BeanNameUrlHandlerMapping
+  - RequestMappingHandlerMapping
+  - RouterFunctionMapping
+handlerAdapters:
+  - HttpRequestHandlerAdapter
+  - SimpleControllerHandlerAdapter
+  - RequestMappingHandlerAdapter
+  - HandlerFunctionAdapter
+viewResolvers:
+  - InternalResourceViewResolver</code></pre>
+<p>3번 규칙에는 함정이 있다. 기본값은 "해당 타입의 빈이 하나도 없을 때"만 쓰인다. 예를 들어 <code>HandlerMapping</code> 타입의 빈을 하나 직접 등록하면 기본 매핑 세 개는 더해지는 것이 아니라 통째로 빠진다. 타입별로 따로 판단하므로, 뷰 리졸버 빈만 등록했다면 핸들러 매핑과 어댑터는 여전히 기본값이다.</p>
+<p>실무의 애플리케이션은 이 기본값으로 돌지 않는다. <code>@EnableWebMvc</code>를 붙이면 <code>WebMvcConfigurationSupport</code>가 핸들러 매핑과 어댑터, 예외 리졸버, 뷰 리졸버를 빈으로 등록하고, 스프링 부트의 자동 구성도 같은 클래스를 상속한 설정(<code>DelegatingWebMvcConfiguration</code>의 하위 클래스)을 쓴다. 이때는 1·2번 규칙에 따라 빈들이 순서 값으로 정렬된다. <code>@EnableWebMvc</code>만 붙인 설정으로 같은 출력을 해 보면 순서가 달라진다.</p>
+<pre data-label="실행 결과(@EnableWebMvc, 7.0.10)"><code class="language-text">handlerMappings:
+  - RouterFunctionMapping
+  - RequestMappingHandlerMapping
+  - BeanNameUrlHandlerMapping
+handlerAdapters:
+  - RequestMappingHandlerAdapter
+  - HandlerFunctionAdapter
+  - HttpRequestHandlerAdapter
+  - SimpleControllerHandlerAdapter
+viewResolvers:
+  - ViewResolverComposite</code></pre>
+<p><code>WebMvcConfigurationSupport</code>의 Javadoc은 <code>RequestMappingHandlerMapping</code>을 순서 0, <code>BeanNameUrlHandlerMapping</code>을 순서 2로 등록한다고 밝힌다(6.2.x와 7.0.x 모두 같다). 순서 값이 작을수록 먼저 물어보므로, 애노테이션 기반 매핑이 빈 이름 기반 매핑보다 앞선다. 기본값 파일의 순서와 반대라는 점에 주의하자. 같은 URL을 두 방식으로 모두 등록했을 때 누가 이기는지는 어느 구성으로 돌고 있느냐에 달려 있다. 부트 애플리케이션에서는 여기에 더해 정적 리소스와 웰컴 페이지(<code>index.html</code>)를 위한 매핑이 추가로 등록된다.</p>
+
+<h3>핸들러 매핑과 핸들러 어댑터: 세 종류의 핸들러로 실험한다</h3>
+<p>핸들러 매핑과 어댑터가 왜 목록으로 여러 개 있는지는 핸들러를 여러 종류로 만들어 보면 드러난다. 스프링 MVC가 지금도 지원하는 세 가지 방식으로 핸들러를 하나씩 만든다. 도메인은 사내 공지(notice) 게시판으로 잡았다.</p>
+<pre><code class="language-java">// import 생략: jakarta.servlet.http.*, org.springframework.web.servlet.*, org.springframework.mock.web.* 등
+public class MvcLab {
+
+    // (1) 인터페이스 기반 컨트롤러: 빈 이름이 곧 URL이다
+    static class LegacyController implements org.springframework.web.servlet.mvc.Controller {
+        @Override
+        public ModelAndView handleRequest(HttpServletRequest request, HttpServletResponse response) {
+            return new ModelAndView("legacy-view");
+        }
+    }
+
+    // (2) 서블릿과 가장 비슷한 핸들러: 응답을 직접 쓰고 아무것도 반환하지 않는다
+    static class RawHandler implements HttpRequestHandler {
+        @Override
+        public void handleRequest(HttpServletRequest request, HttpServletResponse response) throws IOException {
+            response.getWriter().write("raw ok");
+        }
+    }
+
+    // (3) 애노테이션 기반 컨트롤러: 어떤 인터페이스도 구현하지 않는다
+    @Controller
+    static class NoticeController {
+        @RequestMapping("/notices")
+        public ModelAndView list() {
+            ModelAndView mv = new ModelAndView("notices");
+            mv.addObject("count", 3);
+            return mv;
+        }
+    }
+
+    @Configuration
+    static class LabConfig {
+        @Bean("/legacy") LegacyController legacyController() { return new LegacyController(); }
+        @Bean("/raw") RawHandler rawHandler() { return new RawHandler(); }
+        @Bean NoticeController noticeController() { return new NoticeController(); }
+    }
+    // ... (아래에 이어진다)
+}</code></pre>
+<p>(1)과 (2)는 빈 이름이 <code>/</code>로 시작한다. (3)은 빈 이름이 평범하고, 대신 클래스에 <code>@Controller</code>, 메서드에 <code>@RequestMapping</code>이 붙어 있다. 세 클래스는 공통 상위 타입이 없고 메서드 시그니처도 제각각이다. (1)은 <code>ModelAndView</code>를 돌려주고, (2)는 <code>void</code>이며, (3)은 메서드 이름과 파라미터를 개발자가 마음대로 정한다.</p>
+<p>선택 과정을 눈으로 보기 위해 <code>DispatcherServlet</code>을 상속해 <code>getHandler</code>, <code>getHandlerAdapter</code>, <code>resolveViewName</code>을 재정의한다. 세 메서드는 모두 <code>protected</code>로 열려 있다. <code>getHandler</code>는 원본과 같은 반복문을 돌되 매핑마다 결과를 출력하게 했다.</p>
+<pre><code class="language-java">    static class TracingDispatcherServlet extends DispatcherServlet {
+
+        TracingDispatcherServlet(AnnotationConfigWebApplicationContext context) {
+            super(context);
+        }
+
+        @Override
+        protected HandlerExecutionChain getHandler(HttpServletRequest request) throws Exception {
+            for (HandlerMapping mapping : getHandlerMappings()) {
+                HandlerExecutionChain chain = mapping.getHandler(request);
+                System.out.println("  매핑   " + mapping.getClass().getSimpleName() + " -> "
+                        + (chain == null ? "null" : describe(chain.getHandler())));
+                if (chain != null) {
+                    return chain;
+                }
+            }
+            return null;
+        }
+
+        @Override
+        protected HandlerAdapter getHandlerAdapter(Object handler) throws ServletException {
+            HandlerAdapter adapter = super.getHandlerAdapter(handler);
+            System.out.println("  어댑터 " + adapter.getClass().getSimpleName());
+            return adapter;
+        }
+
+        @Override
+        protected View resolveViewName(String viewName, Map<String, Object> model, Locale locale,
+                HttpServletRequest request) throws Exception {
+            View view = super.resolveViewName(viewName, model, locale, request);
+            System.out.println("  뷰     \"" + viewName + "\" -> " + view);
+            return view;
+        }
+
+        static String describe(Object handler) {
+            if (handler instanceof HandlerMethod hm) {
+                return "HandlerMethod[" + hm.getBeanType().getSimpleName() + "#" + hm.getMethod().getName() + "]";
+            }
+            return handler.getClass().getSimpleName();
+        }
+        // ... printStrategies(): 리플렉션으로 세 목록 필드를 읽어 클래스 이름을 출력(앞 절의 출력)
+    }
+
+    static TracingDispatcherServlet start(Class<?>... configs) throws Exception {
+        AnnotationConfigWebApplicationContext context = new AnnotationConfigWebApplicationContext();
+        context.register(configs);
+        TracingDispatcherServlet servlet = new TracingDispatcherServlet(context);
+        servlet.init(new MockServletConfig(new MockServletContext(), "dispatcher"));
+        return servlet;
+    }
+
+    static void send(DispatcherServlet servlet, MockHttpServletRequest request) {
+        System.out.println(request.getMethod() + " " + request.getRequestURI());
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        try {
+            servlet.service(request, response);
+            System.out.println("  결과   status=" + response.getStatus()
+                    + ", forward=" + response.getForwardedUrl()
+                    + ", redirect=" + response.getRedirectedUrl()
+                    + ", body=\"" + response.getContentAsString() + "\"");
+            for (String name : Collections.list(request.getAttributeNames())) {
+                if (!name.startsWith("org.springframework") && !name.startsWith("jakarta")) {
+                    System.out.println("  요청 속성 " + name + "=" + request.getAttribute(name));
+                }
+            }
+        }
+        catch (Exception ex) {
+            System.out.println("  예외   " + ex.getMessage());
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        TracingDispatcherServlet servlet = start(LabConfig.class);
+        servlet.printStrategies();
+        send(servlet, new MockHttpServletRequest("GET", "/legacy"));
+        send(servlet, new MockHttpServletRequest("GET", "/raw"));
+        send(servlet, new MockHttpServletRequest("GET", "/notices"));
+        send(servlet, new MockHttpServletRequest("GET", "/nothing"));
+    }</code></pre>
+<p><code>start</code>는 톰캣이 하는 일을 흉내 낸다. 서블릿 객체를 만들고 <code>init()</code>을 한 번 부른다. <code>send</code>는 요청·응답 객체를 만들어 <code>service()</code>를 부른다. <code>MockHttpServletResponse</code>는 <code>forward</code>나 리다이렉트가 일어났을 때 그 대상 경로를 기록해 두므로, JSP 엔진 없이도 뷰가 어디로 넘기려 했는지를 볼 수 있다. 실행 결과에서 요청 네 개 부분은 다음과 같다.</p>
+<pre data-label="실행 결과"><code class="language-text">GET /legacy
+  매핑   BeanNameUrlHandlerMapping -> LegacyController
+  어댑터 SimpleControllerHandlerAdapter
+  뷰     "legacy-view" -> org.springframework.web.servlet.view.InternalResourceView: name [legacy-view]; URL [legacy-view]
+  결과   status=200, forward=legacy-view, redirect=null, body=""
+GET /raw
+  매핑   BeanNameUrlHandlerMapping -> RawHandler
+  어댑터 HttpRequestHandlerAdapter
+  결과   status=200, forward=null, redirect=null, body="raw ok"
+GET /notices
+  매핑   BeanNameUrlHandlerMapping -> null
+  매핑   RequestMappingHandlerMapping -> HandlerMethod[NoticeController#list]
+  어댑터 RequestMappingHandlerAdapter
+  뷰     "notices" -> org.springframework.web.servlet.view.InternalResourceView: name [notices]; URL [notices]
+  예외   Circular view path [notices]: would dispatch back to the current handler URL [/notices] again. Check your ViewResolver setup! (Hint: This may be the result of an unspecified view, due to default view name generation.)
+GET /nothing
+  매핑   BeanNameUrlHandlerMapping -> null
+  매핑   RequestMappingHandlerMapping -> null
+  매핑   RouterFunctionMapping -> null
+  결과   status=404, forward=null, redirect=null, body=""</code></pre>
+<h4>출력을 한 줄씩 읽는다</h4>
+<p><code>GET /legacy</code>. 목록의 첫 매핑인 <code>BeanNameUrlHandlerMapping</code>이 바로 답을 냈다. 이 매핑은 기동 시점에 컨테이너의 빈 이름(과 별칭) 가운데 <code>/</code>로 시작하는 것을 찾아 "URL → 빈" 표에 넣어 둔다. 요청 경로 <code>/legacy</code>가 표에 있으므로 <code>LegacyController</code> 객체를 돌려주었다. 다음으로 어댑터 목록을 돈다. 첫째 <code>HttpRequestHandlerAdapter</code>의 <code>supports</code>는 <code>handler instanceof HttpRequestHandler</code>라서 거짓이고, 둘째 <code>SimpleControllerHandlerAdapter</code>의 <code>supports</code>는 <code>handler instanceof Controller</code>라서 참이다. 이 어댑터의 <code>handle</code>은 한 줄, <code>((Controller) handler).handleRequest(request, response)</code>를 그대로 돌려주는 것이 전부다.</p>
+<p><code>GET /raw</code>. 같은 매핑이 <code>RawHandler</code>를 찾았고, 이번에는 첫 어댑터 <code>HttpRequestHandlerAdapter</code>가 맡았다. 이 어댑터의 <code>handle</code>은 <code>handleRequest</code>를 호출한 뒤 <code>null</code>을 반환한다. 그래서 출력에 "뷰" 줄이 없다. <code>ModelAndView</code>가 <code>null</code>이면 <code>DispatcherServlet</code>은 뷰 해석과 렌더링을 건너뛰고, 핸들러가 직접 쓴 <code>raw ok</code>가 응답 본문이 된다. 이 방식은 옛 유물이 아니다. 스프링 MVC가 정적 리소스를 내려 줄 때 쓰는 <code>ResourceHttpRequestHandler</code>가 <code>HttpRequestHandler</code>의 구현체이고, 그 핸들러도 이 어댑터를 통해 실행된다.</p>
+<p><code>GET /notices</code>. <code>BeanNameUrlHandlerMapping</code>은 <code>/notices</code>라는 이름의 빈이 없으므로 <code>null</code>을 냈고, 둘째 <code>RequestMappingHandlerMapping</code>이 답을 냈다. 돌려준 핸들러의 타입에 주목하자. 컨트롤러 객체가 아니라 <code>HandlerMethod</code>다. <code>HandlerMethod</code>는 "어느 빈의 어느 메서드인가"를 담은 객체로, 빈과 <code>java.lang.reflect.Method</code>, 파라미터 정보를 갖고 있다. 애노테이션 방식에서 요청을 처리하는 단위는 클래스가 아니라 메서드라는 뜻이다. 어댑터 목록에서는 셋째 <code>RequestMappingHandlerAdapter</code>가 선택되었다. 이 어댑터의 <code>supports</code>는 핸들러가 <code>HandlerMethod</code>인지를 본다. 그 뒤에 난 "Circular view path" 예외는 뷰 리졸버 절에서 설명한다.</p>
+<p><code>GET /nothing</code>. 세 매핑이 모두 <code>null</code>을 냈다. <code>getHandler</code>가 <code>null</code>을 돌려주면 <code>doDispatch</code>는 <code>noHandlerFound</code>로 가고 결과는 404다. 스프링 MVC에서 404는 "핸들러 매핑 가운데 누구도 이 요청을 맡겠다고 하지 않았다"는 뜻이다. 6.1부터는 이때 <code>NoHandlerFoundException</code>을 던지는 것이 기본 동작이고(<code>throwExceptionIfNoHandlerFound</code>의 기본값이 <code>true</code>가 되고 설정 자체는 폐기 예정이 되었다), 이 예외를 예외 리졸버가 404 응답으로 바꾼다.</p>
+<h4>핸들러의 타입이 Object인 이유</h4>
+<p><code>HandlerMapping.getHandler</code>가 돌려주는 핸들러와 <code>HandlerAdapter.handle</code>이 받는 핸들러는 모두 <code>Object</code> 타입이다. 타입 안전성을 포기한 것처럼 보이지만 의도된 설계다. 만약 핸들러의 타입을 어떤 인터페이스로 고정했다면, 인터페이스를 구현하지 않는 (3) 같은 클래스는 핸들러가 될 수 없다. 스프링은 핸들러에 아무 제약도 두지 않는 대신 "이 객체를 내가 실행할 줄 안다"고 답하는 어댑터가 반드시 하나는 있어야 한다는 조건을 걸었다. 새로운 종류의 핸들러를 도입하려면 <code>DispatcherServlet</code>을 고치는 것이 아니라 매핑과 어댑터 구현체를 한 쌍 추가하면 된다. 함수형 엔드포인트용 <code>RouterFunctionMapping</code>과 <code>HandlerFunctionAdapter</code>가 그렇게 추가된 쌍이다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>여행용 멀티 어댑터</strong><p>나라마다 콘센트 모양이 다르지만 노트북 충전기는 하나다. 멀티 어댑터가 벽의 모양에 맞는 면을 내밀고 충전기에는 늘 같은 구멍을 보여 준다. 핸들러 어댑터도 핸들러마다 다른 호출 방식을 받아서 DispatcherServlet에는 늘 "handle을 부르면 ModelAndView가 나온다"는 한 가지 모양만 보여 준다. 다만 전기 어댑터는 모양만 바꾸지만 핸들러 어댑터는 일을 더 한다. 특히 RequestMappingHandlerAdapter는 메서드 파라미터에 넣을 값을 요청에서 만들어 내고 반환값을 해석하는 일까지 맡는다.</p></aside>
+<x-visual id="spring-mvc1-05-adapter-matching" title="세 종류의 핸들러가 각각 다른 핸들러 매핑으로 찾아지고 다른 핸들러 어댑터로 실행되는 대응 관계" kind="구조 다이어그램" ratio="16:9">
+<x-hint>핸들러 종류마다 짝이 되는 매핑과 어댑터가 다르지만 DispatcherServlet으로 돌아오는 결과는 한 가지 형태라는 것을 보여 준다.</x-hint>
+<x-prompt>깔끔한 구조 다이어그램, 흰 배경, 평면 색. 왼쪽 끝에 세로로 긴 남색 상자 "DispatcherServlet". 오른쪽으로 세 개의 가로 줄이 평행하게 뻗는다. 각 줄은 왼쪽부터 둥근 상자(매핑), 둥근 상자(어댑터), 각진 상자(핸들러) 순서이고 화살표로 이어진다. 첫째 줄(회색 계열): "BeanNameUrlHandlerMapping" → "SimpleControllerHandlerAdapter" → "Controller 구현체". 둘째 줄(녹색 계열): "BeanNameUrlHandlerMapping" → "HttpRequestHandlerAdapter" → "HttpRequestHandler 구현체". 셋째 줄(주황 계열, 가장 굵게): "RequestMappingHandlerMapping" → "RequestMappingHandlerAdapter" → "@RequestMapping 메서드". 각 어댑터 상자에서 DispatcherServlet으로 되돌아오는 점선 화살표를 그리고, 첫째와 셋째 줄에는 라벨 "ModelAndView", 둘째 줄에는 라벨 "null". 장식 없이 단순한 선.</x-prompt>
+<x-caption>핸들러의 호출 방식은 셋 다 다르지만 DispatcherServlet이 받는 것은 ModelAndView 또는 null뿐이다.</x-caption>
+</x-visual>
+
+<h3>RequestMappingHandlerMapping의 내부: 기동 시점에 만드는 조회 표</h3>
+<p>프런트 컨트롤러를 직접 만들 때는 생성자에서 "URL → 컨트롤러 객체" 맵에 항목을 한 줄씩 넣었다. <code>RequestMappingHandlerMapping</code>은 같은 일을 애노테이션을 읽어서 자동으로 한다. 중요한 것은 그 시점이다. 조회 표는 요청이 올 때가 아니라 이 빈이 초기화될 때(<code>afterPropertiesSet</code>) 한 번 만들어진다. 과정은 다음과 같다.</p>
+<ol>
+<li>컨테이너에 등록된 모든 빈 이름을 훑으며 각 빈의 타입을 얻는다.</li>
+<li>타입이 핸들러 후보인지 <code>isHandler</code>로 판정한다. 6.x와 7.x에서 이 메서드는 클래스에 <code>@Controller</code>가 있는지만 본다.</li>
+<li>후보 클래스의 메서드를 하나씩 살펴 <code>@RequestMapping</code>(또는 그것을 메타 애노테이션으로 가진 애노테이션)이 붙은 메서드를 고른다.</li>
+<li>메서드의 매핑 정보로 <code>RequestMappingInfo</code>를 만든다. 클래스에도 <code>@RequestMapping</code>이 있으면 클래스의 정보와 메서드의 정보를 결합한다.</li>
+<li><code>RequestMappingInfo</code>와 <code>HandlerMethod</code>(빈 이름 + <code>Method</code>)의 쌍을 내부 레지스트리에 등록한다.</li>
+</ol>
+<p><code>RequestMappingInfo</code>는 경로 하나가 아니라 조건의 묶음이다. 경로 패턴, HTTP 메서드, 요청 파라미터, 헤더, <code>Content-Type</code>(consumes), <code>Accept</code>(produces) 조건이 들어 있고, 요청이 이 조건을 모두 만족해야 그 매핑이 선택된다. 직접 만든 구조의 키가 문자열 하나였던 것과 달리, 스프링의 키는 "경로가 같아도 GET이면 이 메서드, POST면 저 메서드"를 표현할 수 있다. 각 조건의 사용법은 다음 회차에서 다룬다.</p>
+<p>레지스트리(<code>MappingRegistry</code>)에는 맵이 여러 개 있는데 그중 둘이 핵심이다. 하나는 "매핑 정보 → 등록 항목"인 <code>HashMap</code>이고, 다른 하나는 "패턴 문자가 없는 고정 경로 → 매핑 정보 목록"인 <code>pathLookup</code>이다. 요청이 오면 먼저 요청 경로를 키로 <code>pathLookup</code>을 조회한다. <code>/notices/new</code>처럼 고정된 경로라면 해시 조회 한 번으로 후보가 좁혀지고, 그 후보들에 대해서만 HTTP 메서드 같은 나머지 조건을 검사한다. 고정 경로로 찾지 못했을 때에만 등록된 매핑 전체를 돌며 패턴을 맞춰 본다. 후보가 여럿이면 더 구체적인 매핑이 이기도록 정렬해 첫째를 고른다.</p>
+<p>표를 미리 만들어 두는 설계에는 실용적인 이점이 하나 더 있다. 매핑의 잘못이 요청 시점이 아니라 기동 시점에 드러난다. 같은 조건의 매핑을 두 메서드에 붙여 보자.</p>
+<pre><code class="language-java">@Controller
+static class DupController {
+    @GetMapping("/dup") public String first() { return "a"; }
+    @GetMapping("/dup") public String second() { return "b"; }
+}</code></pre>
+<pre data-label="실행 결과(서블릿 초기화 중 예외의 근본 원인)"><code class="language-text">java.lang.IllegalStateException: Ambiguous mapping. Cannot map 'dupController' method
+Lab3$DupController#second()
+to {GET [/dup]}: There is already 'dupController' bean method
+Lab3$DupController#first() mapped.</code></pre>
+<p>요청을 한 번도 보내지 않았는데 예외가 났다. 레지스트리에 등록하는 순간 같은 <code>RequestMappingInfo</code>가 이미 있는지 검사하기 때문이다. 메시지에서 두 메서드 가운데 어느 쪽이 "이미 등록된" 쪽으로 나오는지는 리플렉션이 메서드를 돌려주는 순서에 달려 있어 고정되어 있지 않다. 부트 애플리케이션이라면 이 예외로 애플리케이션 기동이 실패한다. 운영 중 특정 URL에서만 터지는 것보다 훨씬 다루기 쉬운 실패 방식이다.</p>
+<h4>핸들러 메서드는 리플렉션으로 호출된다</h4>
+<p>앞에서 본 스택의 위쪽 절반을 다시 보자. <code>DispatcherServlet.doDispatch</code>가 <code>AbstractHandlerMethodAdapter.handle</code>을 부르고, <code>RequestMappingHandlerAdapter.invokeHandlerMethod</code>를 거쳐 <code>InvocableHandlerMethod.invokeForRequest</code>에 이른다. 이 메서드는 두 가지 일을 한다. 먼저 <code>getMethodArgumentValues</code>로 컨트롤러 메서드의 파라미터마다 넣을 값을 만들어 <code>Object[]</code> 배열에 담는다. 그다음 <code>doInvoke</code>에서 <code>method.invoke(getBean(), args)</code>를 호출한다. 스택에 찍힌 <code>Method.invoke</code>가 그 줄이다.</p>
+<p>리플렉션(reflection)은 클래스의 메서드 정보를 <code>java.lang.reflect.Method</code> 객체로 얻어, 소스 코드에 메서드 이름을 적지 않고도 호출하게 해 주는 자바 기능이다. 스프링은 컴파일 시점에 <code>PracticalNoticeController.trace</code>라는 메서드가 있는지 알 수 없으므로 이 방법 말고는 부를 길이 없다. 인터페이스 기반 컨트롤러와 견주어 보면 차이가 선명하다. <code>SimpleControllerHandlerAdapter</code>는 <code>Controller</code> 타입으로 캐스팅한 뒤 인터페이스 메서드를 평범하게 호출한다. 호출할 메서드의 이름과 시그니처가 인터페이스로 고정되어 있기 때문이다. 애노테이션 방식은 시그니처를 자유롭게 풀어 준 대가로, 어떤 메서드를 어떤 인자로 부를지를 실행 중에 계산한다. <code>Method.invoke</code> 바로 위에 보이는 <code>DirectMethodHandleAccessor</code>는 JDK 21에서 리플렉션 호출을 실제로 수행하는 JDK 내부 클래스다.</p>
+<p>정리하면 애노테이션 컨트롤러 호출의 비용 구조는 이렇다. 클래스를 훑고 애노테이션을 해석하는 무거운 일은 기동 시점에 한 번 한다. 요청 시점에는 맵 조회, 인자 배열 만들기, 리플렉션 호출을 한다. 파라미터 값을 만드는 부품(ArgumentResolver)과 반환값을 해석하는 부품(ReturnValueHandler)이 어떻게 생겼는지는 07회차의 주제다.</p>
+
+<h3>뷰 리졸버: 논리 이름에서 View 객체로</h3>
+<p>컨트롤러가 <code>"notices/list"</code> 같은 문자열을 돌려주는 이유는 직접 만든 구조에서와 같다. 컨트롤러가 <code>/WEB-INF/views/notices/list.jsp</code>라는 물리 경로를 알고 있으면, 뷰 파일의 위치나 템플릿 기술이 바뀔 때 모든 컨트롤러를 고쳐야 한다. 그래서 컨트롤러는 논리 이름만 말하고, 그 이름을 실제 화면으로 바꾸는 일은 한 곳에 모은다. 스프링은 이 일을 두 인터페이스로 나눴다. <code>ViewResolver</code>는 이름을 받아 <code>View</code> 객체를 돌려주고, <code>View</code>는 모델을 받아 응답을 만든다. 뷰 리졸버는 그리지 않고, 그리는 것은 <code>View</code>다.</p>
+<h4>InternalResourceViewResolver와 "Circular view path"</h4>
+<p>기본 뷰 리졸버인 <code>InternalResourceViewResolver</code>가 하는 일은 문자열 덧셈이다. 상위 클래스 <code>UrlBasedViewResolver</code>의 <code>buildView</code>에 <code>view.setUrl(getPrefix() + viewName + getSuffix())</code>라는 줄이 있고, 이렇게 만든 URL을 가진 <code>InternalResourceView</code> 객체를 돌려준다. 접두사와 접미사의 기본값은 빈 문자열이다. 그래서 앞 실험에서 뷰 이름 <code>notices</code>는 URL <code>notices</code>가 되었다.</p>
+<p><code>InternalResourceView</code>의 렌더링은 서블릿의 <code>RequestDispatcher.forward</code>다. URL이 상대 경로 <code>notices</code>이고 현재 요청 URI가 <code>/notices</code>이면, 상대 경로를 풀었을 때 다시 <code>/notices</code>가 된다. 그대로 <code>forward</code>하면 요청이 <code>DispatcherServlet</code>으로 되돌아와 같은 컨트롤러가 다시 실행되고, 같은 뷰 이름이 나오고, 다시 <code>forward</code>한다. 끝나지 않는 순환이다. 스프링은 <code>forward</code> 직전에 대상 경로가 현재 요청 URI와 같은지 검사해서, 같으면 "Circular view path" 예외를 던진다. <code>/legacy</code> 요청에서 뷰 이름 <code>legacy-view</code>는 풀면 <code>/legacy-view</code>여서 이 검사에 걸리지 않았을 뿐이다.</p>
+<p>이 오류는 접두사·접미사 설정 없이 뷰 이름을 URL과 같게 지었을 때, 또는 템플릿 엔진 의존성을 빼먹어서 뷰 이름을 처리할 리졸버가 <code>InternalResourceViewResolver</code>밖에 남지 않았을 때 만나게 된다. 예외 메시지의 힌트("unspecified view, due to default view name generation")는 또 다른 경우를 가리킨다. 컨트롤러가 뷰 이름을 주지 않으면 <code>applyDefaultViewName</code>이 요청 경로에서 뷰 이름을 만들어 내는데, 그 이름은 당연히 요청 경로와 같아진다.</p>
+<h4>접두사와 접미사를 주고 다시 실행한다</h4>
+<p>뷰 리졸버를 빈으로 등록한다. 앞에서 본 규칙대로 <code>ViewResolver</code> 타입 빈이 생겼으므로 기본값 대신 이 빈이 쓰인다. 리다이렉트도 함께 보려고 루트 경로를 공지 목록으로 보내는 컨트롤러를 하나 더했다.</p>
+<pre><code class="language-java">@Configuration
+static class ViewConfig {
+    @Bean
+    InternalResourceViewResolver jspViewResolver() {
+        return new InternalResourceViewResolver("/WEB-INF/views/", ".jsp");
+    }
+}
+
+@Controller
+static class HomeController {
+    @RequestMapping("/")
+    public ModelAndView home() {
+        return new ModelAndView("redirect:/notices");
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">GET /notices
+  매핑   BeanNameUrlHandlerMapping -> null
+  매핑   RequestMappingHandlerMapping -> HandlerMethod[NoticeController#list]
+  어댑터 RequestMappingHandlerAdapter
+  뷰     "notices" -> org.springframework.web.servlet.view.InternalResourceView: name [notices]; URL [/WEB-INF/views/notices.jsp]
+  결과   status=200, forward=/WEB-INF/views/notices.jsp, redirect=null, body=""
+  요청 속성 count=3
+GET /
+  매핑   BeanNameUrlHandlerMapping -> null
+  매핑   RequestMappingHandlerMapping -> HandlerMethod[HomeController#home]
+  어댑터 RequestMappingHandlerAdapter
+  뷰     "redirect:/notices" -> org.springframework.web.servlet.view.RedirectView: name [redirect:]; URL [/notices]
+  결과   status=302, forward=null, redirect=/notices, body=""</code></pre>
+<p>첫 요청에서 뷰 이름 <code>notices</code>가 URL <code>/WEB-INF/views/notices.jsp</code>인 <code>InternalResourceView</code>로 바뀌었고, 그 경로로 <code>forward</code>가 일어났다. 마지막 줄 <code>요청 속성 count=3</code>이 모델의 행방을 알려 준다. <code>InternalResourceView</code>는 <code>forward</code>하기 전에 모델 맵의 항목을 하나씩 <code>request.setAttribute(name, value)</code>로 옮긴다. JSP가 <code>${count}</code>로 값을 읽을 수 있는 것은 이 한 줄 때문이다. 직접 만든 구조에서 모델을 요청 속성으로 옮기던 코드와 같은 일이다. 뷰 파일을 <code>/WEB-INF</code> 아래에 두는 이유도 같다. 서블릿 명세상 이 디렉터리의 파일은 컨테이너가 클라이언트에게 직접 내려 주지 않으므로, 반드시 컨트롤러를 거쳐 <code>forward</code>로만 도달하게 된다.</p>
+<p>둘째 요청에서는 뷰 이름이 <code>redirect:</code>로 시작한다. <code>UrlBasedViewResolver</code>는 접두사·접미사를 붙이기 전에 이 접두어를 먼저 검사해서, 나머지 문자열을 URL로 하는 <code>RedirectView</code>를 돌려준다. <code>RedirectView</code>의 렌더링은 화면을 그리는 것이 아니라 <code>Location</code> 헤더와 함께 302 응답을 보내는 것이다. 같은 방식으로 <code>forward:</code> 접두어는 접두사·접미사를 붙이지 않은 <code>InternalResourceView</code>를 만든다. 컨트롤러는 여전히 문자열만 돌려주는데 그 문자열의 해석이 뷰 리졸버 한 곳에 모여 있다는 점이 요점이다.</p>
+<h4>뷰 리졸버가 여럿일 때, 그리고 스프링 부트에서</h4>
+<p>뷰 리졸버도 목록이다. <code>DispatcherServlet</code>은 순서대로 <code>resolveViewName</code>을 호출하고, 어떤 리졸버가 <code>null</code>을 돌려주면 "나는 모른다"는 뜻으로 보고 다음 리졸버에게 묻는다. 여기서 <code>InternalResourceViewResolver</code>의 특성이 문제가 된다. 이 리졸버는 해당 JSP 파일이 실제로 있는지 알 방법이 없다. 스프링 레퍼런스의 설명대로, JSP가 있는지 알아내는 유일한 방법은 <code>RequestDispatcher</code>로 넘겨 보는 것이기 때문이다. 그래서 이 리졸버는 어떤 이름이든 <code>View</code>를 만들어 돌려주고, 여러 리졸버를 함께 쓸 때는 반드시 맨 뒤에 두어야 한다. 한편 리졸버가 만든 <code>View</code> 객체는 뷰 이름과 로케일별로 캐시된다(<code>AbstractCachingViewResolver</code>). 같은 뷰 이름으로 들어온 다음 요청은 새 객체를 만들지 않고 캐시에 있는 <code>View</code>를 다시 쓴다.</p>
+<p>스프링 부트는 <code>spring.mvc.view.prefix</code>와 <code>spring.mvc.view.suffix</code> 프로퍼티를 읽어 <code>InternalResourceViewResolver</code>를 자동으로 등록한다. 위 <code>ViewConfig</code>와 같은 일을 프로퍼티 두 줄로 하는 셈이다. 같은 타입의 빈을 직접 등록하면 자동 등록은 물러난다. 부트는 이 밖에 <code>BeanNameViewResolver</code>(뷰 이름과 같은 이름의 <code>View</code> 빈을 찾는다)와 <code>ContentNegotiatingViewResolver</code>(스스로 뷰를 만들지 않고 다른 리졸버들에게 위임해 요청의 <code>Accept</code>에 맞는 뷰를 고른다)를 등록한다.</p>
+<p>타임리프(Thymeleaf) 스타터를 넣으면 부트가 타임리프용 뷰 리졸버를 추가로 등록한다. 기본 접두사는 <code>classpath:/templates/</code>, 접미사는 <code>.html</code>이라서 뷰 이름 <code>notices/list</code>는 <code>src/main/resources/templates/notices/list.html</code>을 가리킨다. 타임리프 뷰는 JSP처럼 다른 서블릿으로 <code>forward</code>하지 않고, 템플릿 엔진이 만든 결과를 응답에 쓴다. 컨트롤러 코드는 한 글자도 달라지지 않는다. 부트 레퍼런스는 내장 서블릿 컨테이너에서 JSP를 쓸 때 여러 제약이 있으니 가능하면 피하라고 권한다. 이 회차가 JSP 경로를 예로 든 것은 <code>forward</code>가 눈에 보여 구조를 설명하기 좋기 때문이고, 템플릿 작성은 08회차에서 다룬다.</p>
+<x-visual id="spring-mvc1-05-view-resolution" title="컨트롤러가 돌려준 뷰 이름이 접두어 검사와 접두사·접미사 결합을 거쳐 서로 다른 View 객체와 응답 방식으로 갈라지는 순서도" kind="순서도" ratio="16:9">
+<x-hint>뷰 이름 문자열 하나가 redirect: 접두어 여부에 따라 RedirectView의 302 응답과 InternalResourceView의 forward로 갈라지는 것을 보여 준다.</x-hint>
+<x-prompt>깔끔한 순서도, 흰 배경, 평면 색, 왼쪽에서 오른쪽으로 흐른다. 맨 왼쪽에 둥근 상자 "컨트롤러"에서 화살표가 나오고 화살표 위에 라벨 "뷰 이름(문자열)". 화살표는 큰 상자 "ViewResolver"로 들어간다. ViewResolver 상자 안에 마름모 하나, 라벨 "redirect: 로 시작?". 마름모에서 위쪽으로 나가는 화살표에 라벨 "예", 그 끝에 주황색 상자 "RedirectView", 거기서 오른쪽으로 화살표, 끝에 라벨 "302 + Location 헤더". 마름모에서 아래쪽으로 나가는 화살표에 라벨 "아니오", 그 끝에 작은 상자 "접두사 + 뷰 이름 + 접미사", 이어서 파란색 상자 "InternalResourceView", 거기서 오른쪽으로 화살표 두 단계: 첫 단계 라벨 "모델 → 요청 속성", 둘째 단계 라벨 "forward", 끝에 문서 아이콘과 라벨 "JSP". 장식 없이 단순한 선.</x-prompt>
+<x-caption>뷰 리졸버는 이름을 View 객체로 바꾸기만 한다. 302를 보낼지 forward할지는 만들어진 View의 종류가 정한다.</x-caption>
+</x-visual>
+
+<h3>스프링 MVC 시작하기: @Controller와 @RequestMapping</h3>
+<p>이제 애노테이션 기반 컨트롤러를 구조 위에 올려 본다. 공지 등록 폼, 공지 저장, 공지 목록 세 기능을 만든다. 첫 단계에서는 직접 만든 프레임워크의 모양을 그대로 따라, 기능마다 클래스를 하나씩 두고 <code>ModelAndView</code>를 돌려준다.</p>
+<pre><code class="language-java">// 여러 요청 스레드가 함께 쓰는 저장소. 스레드 안전한 컬렉션을 쓴다.
+static class NoticeStore {
+    private final List<String> titles = new CopyOnWriteArrayList<>(List.of("점검 안내"));
+    void add(String title) { titles.add(title); }
+    List<String> findAll() { return titles; }
+}
+
+@Controller
+static class NoticeFormController {
+    @RequestMapping("/notices/new")
+    public ModelAndView form() {
+        return new ModelAndView("notices/form");
+    }
+}
+
+@Controller
+static class NoticeSaveController {
+    private final NoticeStore store;
+    NoticeSaveController(NoticeStore store) { this.store = store; }
+
+    @RequestMapping("/notices/save")
+    public ModelAndView save(HttpServletRequest request) {
+        String title = request.getParameter("title");
+        store.add(title);
+        ModelAndView mv = new ModelAndView("notices/saved");
+        mv.addObject("title", title);
+        return mv;
+    }
+}
+
+@Controller
+static class NoticeListController {
+    private final NoticeStore store;
+    NoticeListController(NoticeStore store) { this.store = store; }
+
+    @RequestMapping("/notices")
+    public ModelAndView list() {
+        ModelAndView mv = new ModelAndView("notices/list");
+        mv.addObject("titles", store.findAll());
+        return mv;
+    }
+}</code></pre>
+<p><code>@Controller</code>는 두 가지 일을 한다. 첫째, 이 애노테이션 자체에 <code>@Component</code>가 붙어 있어서 컴포넌트 스캔의 대상이 되고 스프링 빈으로 등록된다. 둘째, 앞에서 본 <code>isHandler</code> 판정을 통과시켜 <code>RequestMappingHandlerMapping</code>이 이 클래스의 메서드를 훑게 만든다. 실험 코드에서는 스캔 대신 <code>@Bean</code> 메서드로 등록했는데, 빈이 어떤 경로로 등록되었는지는 상관없다. 매핑이 보는 것은 빈의 타입에 <code>@Controller</code>가 있는가뿐이다.</p>
+<p>둘째 역할은 버전에 따라 달랐다. Spring Framework 5.3까지는 클래스에 <code>@RequestMapping</code>만 있어도 핸들러 후보로 보았다. 6.0 릴리스 노트는 이 동작이 바뀌었음을 명시한다. 스프링 MVC와 WebFlux는 더 이상 클래스 수준 <code>@RequestMapping</code>만으로는 컨트롤러를 감지하지 않는다. <code>@Component</code>와 <code>@RequestMapping("/plain")</code>만 붙인 클래스를 빈으로 등록하고 확인해 보면 다음과 같다.</p>
+<pre data-label="실행 결과(@Controller 없이 @Component + @RequestMapping, 7.0.10)"><code class="language-text">  등록된 매핑 수 = 0
+GET /plain
+  매핑   BeanNameUrlHandlerMapping -> null
+  매핑   RequestMappingHandlerMapping -> null
+  매핑   RouterFunctionMapping -> null
+  결과   status=404, forward=null, redirect=null, body=""</code></pre>
+<p>빈은 분명히 컨테이너에 있는데 매핑 표에는 한 줄도 들어가지 않았고, 요청은 404가 된다. 오래된 프로젝트를 6.x 이상으로 올린 뒤 일부 URL만 404가 된다면 이 변경을 먼저 의심할 만하다.</p>
+<p>메서드의 <code>@RequestMapping("/notices/new")</code>는 "이 경로의 요청을 이 메서드가 처리한다"는 선언이다. HTTP 메서드를 지정하지 않았으므로 GET이든 POST든 모두 받는다. 세 컨트롤러를 등록하고 조회 표와 요청 결과를 출력한다. 표의 출력 순서는 맵을 순회한 순서라서 의미가 없다.</p>
+<pre data-label="실행 결과(일부 줄 생략)"><code class="language-text">  { [/notices/save]} -> NoticeSaveController#save
+  { [/notices]} -> NoticeListController#list
+  { [/notices/new]} -> NoticeFormController#form
+POST /notices/save
+  매핑   BeanNameUrlHandlerMapping -> null
+  매핑   RequestMappingHandlerMapping -> HandlerMethod[NoticeSaveController#save]
+  어댑터 RequestMappingHandlerAdapter
+  뷰     "notices/saved" -> org.springframework.web.servlet.view.InternalResourceView: name [notices/saved]; URL [/WEB-INF/views/notices/saved.jsp]
+  결과   status=200, forward=/WEB-INF/views/notices/saved.jsp, redirect=null, body=""
+  요청 속성 title=휴무 안내
+GET /notices
+  결과   status=200, forward=/WEB-INF/views/notices/list.jsp, redirect=null, body=""
+  요청 속성 titles=[점검 안내, 휴무 안내]
+GET /notices/save
+  결과   status=200, forward=/WEB-INF/views/notices/saved.jsp, redirect=null, body=""
+  요청 속성 title=주소창으로 저장</code></pre>
+<p>표의 각 줄에서 중괄호 안이 <code>RequestMappingInfo</code>다. 경로 앞이 비어 있는 것은 HTTP 메서드 조건이 없다는 뜻이다. 그 결과가 마지막 요청에 드러난다. <code>GET /notices/save?title=…</code>처럼 주소창에 입력한 URL로도 저장이 일어났다. 데이터를 바꾸는 기능이 GET으로 실행되는 것은 「HTTP 웹 기본 지식」에서 본 안전(safe) 메서드의 약속에 어긋난다. 이 문제는 세 번째 단계에서 고친다.</p>
+
+<h3>스프링 MVC — 컨트롤러 통합</h3>
+<p>세 클래스는 같은 저장소를 주입받고 같은 주제를 다루는데 파일이 셋으로 흩어져 있다. 직접 만든 프레임워크에서는 컨트롤러 인터페이스에 메서드가 하나뿐이라 기능 하나에 클래스 하나가 강제되었다. 스프링의 애노테이션 방식에는 그 제약이 없다. 앞에서 본 것처럼 조회 표의 값은 클래스가 아니라 <code>HandlerMethod</code>, 곧 메서드이기 때문이다. 한 클래스에 핸들러 메서드를 여러 개 두어도 표의 항목은 여전히 메서드당 하나다.</p>
+<pre><code class="language-java">@Controller
+@RequestMapping("/notices")
+static class MergedNoticeController {
+    private final NoticeStore store;
+    MergedNoticeController(NoticeStore store) { this.store = store; }
+
+    @RequestMapping("/new")
+    public ModelAndView form() {
+        return new ModelAndView("notices/form");
+    }
+
+    @RequestMapping("/save")
+    public ModelAndView save(HttpServletRequest request) {
+        String title = request.getParameter("title");
+        store.add(title);
+        ModelAndView mv = new ModelAndView("notices/saved");
+        mv.addObject("title", title);
+        return mv;
+    }
+
+    @RequestMapping
+    public ModelAndView list() {
+        ModelAndView mv = new ModelAndView("notices/list");
+        mv.addObject("titles", store.findAll());
+        return mv;
+    }
+}</code></pre>
+<pre data-label="실행 결과(조회 표)"><code class="language-text">  { [/notices/save]} -> MergedNoticeController#save
+  { [/notices]} -> MergedNoticeController#list
+  { [/notices/new]} -> MergedNoticeController#form</code></pre>
+<p>조회 표의 키는 첫 단계와 똑같고, 값의 클래스 이름만 달라졌다. 클래스에 붙인 <code>@RequestMapping("/notices")</code>와 메서드에 붙인 <code>@RequestMapping("/new")</code>가 결합되어 <code>/notices/new</code>가 되었다. 이 결합은 요청마다 일어나는 것이 아니라 기동 시점에 표를 만들 때 한 번 계산된다. 경로를 주지 않은 <code>list</code>의 <code>@RequestMapping</code>은 클래스의 경로 <code>/notices</code>를 그대로 물려받았다. 클래스 수준 애노테이션은 공통 조건을, 메서드 수준 애노테이션은 그 안에서의 세부 조건을 표현한다고 보면 된다.</p>
+<p>통합의 이점은 중복된 경로 접두사와 중복된 의존관계 주입이 한 곳으로 모인다는 것이다. 다만 한 클래스에 무엇이든 넣으라는 뜻은 아니다. 클래스 하나가 수십 개의 핸들러 메서드와 여러 저장소 의존성을 갖게 되면 응집도가 떨어진다. 같은 자원(여기서는 공지)을 다루는 요청끼리 묶는 것이 일반적인 기준이다.</p>
+
+<h3>스프링 MVC — 실용적인 방식</h3>
+<p>통합한 뒤에도 불편이 남아 있다. 모든 메서드가 <code>ModelAndView</code>를 직접 만들고, 파라미터를 꺼내려고 <code>HttpServletRequest</code>를 받고, HTTP 메서드를 가리지 않는다. 직접 만든 프레임워크에서 컨트롤러가 뷰 이름만 돌려주고 모델은 파라미터로 받도록 고쳤던 것과 같은 방향의 개선을 스프링은 이미 갖추고 있다.</p>
+<pre><code class="language-java">@Controller
+@RequestMapping("/notices")
+static class PracticalNoticeController {
+    private final NoticeStore store;
+    PracticalNoticeController(NoticeStore store) { this.store = store; }
+
+    @GetMapping("/new")
+    public String form() {
+        return "notices/form";
+    }
+
+    @PostMapping("/save")
+    public String save(@RequestParam("title") String title, Model model) {
+        store.add(title);
+        model.addAttribute("title", title);
+        return "notices/saved";
+    }
+
+    @GetMapping
+    public String list(Model model) {
+        model.addAttribute("titles", store.findAll());
+        return "notices/list";
+    }
+    // ... trace(): 앞에서 본 스택을 출력하는 @GetMapping("/trace") 메서드
+}</code></pre>
+<pre data-label="실행 결과(일부 줄 생략)"><code class="language-text">  {GET [/notices/new]} -> PracticalNoticeController#form
+  {GET [/notices]} -> PracticalNoticeController#list
+  {GET [/notices/trace]} -> PracticalNoticeController#trace
+  {POST [/notices/save]} -> PracticalNoticeController#save
+POST /notices/save
+  매핑   BeanNameUrlHandlerMapping -> null
+  매핑   RequestMappingHandlerMapping -> HandlerMethod[PracticalNoticeController#save]
+  어댑터 RequestMappingHandlerAdapter
+  뷰     "notices/saved" -> org.springframework.web.servlet.view.InternalResourceView: name [notices/saved]; URL [/WEB-INF/views/notices/saved.jsp]
+  결과   status=200, forward=/WEB-INF/views/notices/saved.jsp, redirect=null, body=""
+  요청 속성 title=휴무 안내
+GET /notices/save
+  매핑   BeanNameUrlHandlerMapping -> null
+  결과   status=405, forward=null, redirect=null, body=""
+POST /notices/save
+  매핑   BeanNameUrlHandlerMapping -> null
+  매핑   RequestMappingHandlerMapping -> HandlerMethod[PracticalNoticeController#save]
+  어댑터 RequestMappingHandlerAdapter
+  결과   status=400, forward=null, redirect=null, body=""</code></pre>
+<p>정상 요청(<code>POST /notices/save</code>, <code>title=휴무 안내</code>)의 결과는 앞 단계와 같다. 같은 뷰로 <code>forward</code>되고 모델의 <code>title</code>이 요청 속성에 실렸다. 바뀐 것은 컨트롤러 코드의 모양과, 잘못된 요청에 대한 반응이다. 요소를 하나씩 구조에 대어 본다.</p>
+<h4>String 반환과 Model 파라미터</h4>
+<p><code>DispatcherServlet</code>과 어댑터 사이의 계약은 그대로다. <code>HandlerAdapter.handle</code>은 여전히 <code>ModelAndView</code>를 돌려준다. 달라진 것은 그 객체를 누가 만드느냐다. <code>RequestMappingHandlerAdapter</code>는 핸들러 메서드를 부르기 전에 요청마다 <code>ModelAndViewContainer</code>라는 작업용 객체를 하나 만든다. 메서드 파라미터에 <code>Model</code>이 있으면 이 컨테이너가 가진 모델을 인자로 넘긴다. 그러니 컨트롤러가 <code>model.addAttribute</code>로 넣은 값은 어댑터가 쥐고 있는 컨테이너에 쌓인다. 메서드가 문자열을 반환하면 반환값 처리기(<code>ViewNameMethodReturnValueHandler</code>)가 그 문자열을 컨테이너의 뷰 이름으로 넣는다. 마지막으로 어댑터가 컨테이너의 뷰 이름과 모델로 <code>new ModelAndView(…)</code>를 만들어 <code>DispatcherServlet</code>에 돌려준다.</p>
+<p>결국 <code>ModelAndView</code>를 만드는 반복 코드가 컨트롤러에서 어댑터로 옮겨 간 것이다. 컨트롤러는 여전히 <code>ModelAndView</code>를 직접 반환해도 되고, 두 방식은 같은 애플리케이션 안에서 섞어 쓸 수 있다. 어댑터가 반환 타입마다 다른 처리기를 고르기 때문이다.</p>
+<h4>@RequestParam</h4>
+<p><code>@RequestParam("title") String title</code>은 <code>request.getParameter("title")</code>을 어댑터가 대신 호출해 그 결과를 인자로 넣어 달라는 선언이다. 쿼리 문자열의 파라미터와 HTML 폼 본문의 파라미터가 같은 방법으로 읽히는 것은 서블릿의 <code>getParameter</code>가 원래 그렇기 때문이다. 대신 호출해 주는 것 이상의 차이도 있다. 출력의 마지막 요청은 <code>title</code> 없이 보낸 POST인데 결과가 400이다. <code>@RequestParam</code>은 기본적으로 필수라서, 파라미터가 없으면 컨트롤러 메서드를 부르지 않고 예외를 던지고, 그 예외가 400 응답으로 바뀐다. 앞의 두 단계에서 같은 요청을 보내면 <code>getParameter</code>가 <code>null</code>을 돌려주고, 코드는 그 <code>null</code>을 그대로 저장한 뒤 200으로 응답했다. 검증을 직접 쓰지 않으면 조용히 잘못된 데이터가 들어가는 코드와, 선언만으로 거절되는 코드의 차이다.</p>
+<p>이름을 생략해 <code>@RequestParam String title</code>처럼 쓰는 코드를 자주 보게 된다. 이때 스프링은 파라미터의 이름을 리플렉션으로 알아내야 하는데, 자바 컴파일러는 <code>-parameters</code> 옵션을 주어야 메서드 파라미터 이름을 클래스 파일에 남긴다. 6.1 릴리스 노트에 따르면 그 전까지 디버그 정보에서 이름을 읽어 내던 <code>LocalVariableTableParameterNameDiscoverer</code>가 6.1에서 제거되었다. 옵션 없이 컴파일한 클래스에 요청을 보내면 다음 예외가 난다.</p>
+<pre data-label="실행 결과(-parameters 없이 컴파일, 7.0.10)"><code class="language-text">java.lang.IllegalArgumentException: Name for argument of type [java.lang.String] not specified, and parameter name information not available via reflection. Ensure that the compiler uses the '-parameters' flag.</code></pre>
+<p>스프링 부트의 Gradle 플러그인은 자바 컴파일 작업에 이 옵션을 넣어 주므로 부트 프로젝트를 Gradle로 빌드하면 문제가 드러나지 않는다. 빌드 방식이 달라져 옵션이 빠지면 같은 코드가 요청 시점에 실패한다. 이름을 애노테이션에 적어 두면 컴파일 옵션과 무관하게 동작한다.</p>
+<h4>@GetMapping과 @PostMapping은 합성 애노테이션이다</h4>
+<p><code>@GetMapping</code>의 선언에는 <code>@RequestMapping(method = RequestMethod.GET)</code>이 메타 애노테이션으로 붙어 있다. 4.3에서 추가된 이 애노테이션은 <code>@RequestMapping(value = "/new", method = RequestMethod.GET)</code>을 줄여 쓰는 방법이다. 그런데 자바 언어에는 "애노테이션에 붙은 애노테이션까지 찾아 준다"는 기능이 없다. 메서드에 <code>@GetMapping("/dup")</code>을 붙이고 표준 리플렉션과 스프링의 탐색을 각각 써 보면 차이가 보인다.</p>
+<pre><code class="language-java">Method m = DupController.class.getDeclaredMethod("first");
+System.out.println("isAnnotationPresent(RequestMapping) = " + m.isAnnotationPresent(RequestMapping.class));
+RequestMapping merged = AnnotatedElementUtils.findMergedAnnotation(m, RequestMapping.class);
+System.out.println("merged = path " + Arrays.toString(merged.path()) + ", method " + Arrays.toString(merged.method()));</code></pre>
+<pre data-label="실행 결과"><code class="language-text">isAnnotationPresent(RequestMapping) = false
+merged = path [/dup], method [GET]</code></pre>
+<p>표준 리플렉션은 메서드에 직접 붙은 애노테이션만 알려 주므로 <code>@RequestMapping</code>이 없다고 답한다. 스프링은 애노테이션의 애노테이션을 따라 올라가며 찾고, <code>@GetMapping</code>에 적은 <code>/dup</code>을 <code>@RequestMapping</code>의 <code>path</code> 속성으로 옮겨 합친 결과를 만들어 준다. 조회 표를 만들 때 쓰이는 것이 이 병합된 애노테이션이다. <code>@Controller</code> 안에 <code>@Component</code>가 들어 있는 것, <code>@SpringBootApplication</code> 안에 여러 애노테이션이 들어 있는 것도 같은 탐색으로 동작한다.</p>
+<p>HTTP 메서드 조건이 생기자 출력의 <code>GET /notices/save</code>가 405가 되었다. 이 요청의 추적 출력에는 <code>RequestMappingHandlerMapping</code> 줄이 없다. 매핑이 <code>null</code>을 돌려준 것이 아니라 예외를 던졌기 때문이다. 이 매핑은 조건에 맞는 항목을 찾지 못하면 "경로는 맞는데 다른 조건이 안 맞는 항목"이 있는지 한 번 더 확인하고, HTTP 메서드만 다른 항목이 있으면 <code>HttpRequestMethodNotSupportedException</code>을 던진다. 이 예외가 405 응답이 되고, 응답에는 허용되는 메서드를 알리는 <code>Allow</code> 헤더가 붙는다. 경로 자체가 없으면 <code>null</code>을 돌려주어 404가 된다. 404와 405는 같은 지점에서 갈린다.</p>
+
+<h3>한 층 아래: 공유되는 객체와 요청마다 만들어지는 객체</h3>
+<p>01회차에서 서블릿 객체는 하나뿐이고 여러 작업 스레드가 그 객체의 메서드를 동시에 실행한다는 것을 보았다. <code>DispatcherServlet</code>도 서블릿이므로 똑같다. 그러면 지금까지 등장한 객체 가운데 무엇이 모든 요청에 공유되고, 무엇이 요청마다 새로 생기는가. 앞 절의 <code>trace</code> 메서드에 요청을 두 번 보내면 두 번 모두 같은 줄이 찍힌다(주소 값 자체는 실행마다 다르다).</p>
+<pre data-label="실행 결과(같은 요청을 두 번 보냄)"><code class="language-text">  스레드 main, 컨트롤러 객체 @344f4dea
+  스레드 main, 컨트롤러 객체 @344f4dea</code></pre>
+<p>두 요청을 같은 컨트롤러 객체가 처리했다. 실험에서는 <code>service()</code>를 부른 것이 <code>main</code> 스레드라서 스레드 이름이 <code>main</code>이고, 톰캣에서는 이 자리에 작업 스레드의 이름이 찍힌다. 객체들을 수명으로 나누면 다음과 같다.</p>
+<pre class="diagram">[힙] 기동 시점에 한 번 만들어져 모든 요청 스레드가 공유
+  DispatcherServlet ─┬─ handlerMappings ── RequestMappingHandlerMapping ── 조회 표(MappingRegistry)
+                     ├─ handlerAdapters ── RequestMappingHandlerAdapter
+                     └─ viewResolvers ──── InternalResourceViewResolver ── View 캐시
+  PracticalNoticeController(싱글톤 빈) ── NoticeStore(싱글톤 빈)
+
+[요청 스레드 A의 스택]                       [요청 스레드 B의 스택]
+  doDispatch 프레임                            doDispatch 프레임
+    request, response                            request, response
+    mappedHandler → HandlerExecutionChain        mappedHandler → (A와 다른 객체)
+    mv → ModelAndView → 모델 맵                   mv → (A와 다른 객체)
+  save 프레임                                   list 프레임
+    title, model                                 model
+
+[힙] 요청마다 새로 만들어지고 요청이 끝나면 버려짐
+  HandlerExecutionChain, HandlerMethod 사본, ModelAndViewContainer, ModelAndView, 모델 맵, 인자 배열</pre>
+<p>공유되는 쪽은 전부 "요청과 무관한 것"이다. 조회 표는 기동 뒤에 읽기만 하고, 어댑터와 뷰 리졸버는 설정값만 갖고 있다. 캐시된 <code>View</code> 객체도 공유되지만 문제가 없다. <code>View.render(model, request, response)</code>의 시그니처를 보면 요청마다 달라지는 것은 전부 인자로 들어온다. 요청별 데이터를 필드에 두지 않고 호출 인자로만 흘려보내는 것, 이것이 스프링 MVC 내부가 스레드 안전을 지키는 방식이다. 요청마다 달라지는 값은 지역 변수와 파라미터로 각 스레드의 스택 프레임에 놓이고, 그 변수가 가리키는 객체는 그 스레드만 참조한다.</p>
+<p>개발자가 쓰는 컨트롤러는 공유되는 쪽에 속한다. 그래서 컨트롤러의 필드에 요청별 데이터를 두면 스프링이 지켜 온 규칙을 개발자가 깨게 된다. 예를 들어 <code>save</code> 메서드가 <code>this.lastTitle = title</code>로 필드에 값을 적어 두고 몇 줄 뒤에 그 필드를 읽어 모델에 넣는다면, 그 사이에 다른 스레드가 같은 필드에 다른 제목을 덮어쓸 수 있고, 사용자는 남이 쓴 제목이 적힌 화면을 받는다. 컨트롤러의 필드에 둘 수 있는 것은 <code>NoticeStore</code>처럼 그 자체가 스레드 안전한 협력 객체뿐이다. 예제의 <code>NoticeStore</code>가 <code>ArrayList</code>가 아니라 <code>CopyOnWriteArrayList</code>를 쓴 이유도 여기에 있다. 저장소는 싱글톤이고, 여러 스레드가 동시에 <code>add</code>와 순회를 하기 때문이다.</p>
+<x-visual id="spring-mvc1-05-shared-vs-request" title="모든 요청이 공유하는 싱글톤 객체들과 요청 스레드마다 따로 만들어지는 객체들을 나눈 메모리 구조" kind="메모리 구조 그림" ratio="16:9">
+<x-hint>DispatcherServlet, 조회 표, 컨트롤러는 하나씩만 있고 두 요청 스레드가 함께 참조하지만, ModelAndView와 모델은 스레드마다 따로 생긴다는 것을 보여 준다.</x-hint>
+<x-prompt>깔끔한 메모리 구조 그림, 흰 배경, 평면 색. 화면 위쪽 절반에 넓은 연회색 영역, 왼쪽 위에 라벨 "공유 객체(싱글톤)". 그 안에 상자 네 개를 가로로 배치: "DispatcherServlet", "매핑 조회 표", "컨트롤러", "View 캐시". 화면 아래쪽 절반을 좌우로 나눠 왼쪽에 파란 테두리 영역 "요청 스레드 A", 오른쪽에 주황 테두리 영역 "요청 스레드 B". 각 스레드 영역 안에 세로로 쌓인 스택 프레임 두 칸을 그리고 그 옆에 작은 상자 두 개 "ModelAndView", "모델"을 둔다. 스레드 A의 상자들은 파란색, 스레드 B의 상자들은 주황색으로 칠해 서로 다른 객체임을 나타낸다. 두 스레드 영역에서 위쪽 공유 영역의 "컨트롤러" 상자로 각각 화살표 하나씩, 두 화살표가 같은 상자에 모인다. 화살표 옆에 라벨 "같은 객체를 동시에 실행". 스레드 A의 스택에서 자기 "ModelAndView"로, 스레드 B의 스택에서 자기 "ModelAndView"로 짧은 화살표. 장식 없이 단순한 선.</x-prompt>
+<x-caption>프레임워크의 부품과 컨트롤러는 하나를 함께 쓰고, 요청의 데이터는 스레드마다 따로 만든다. 컨트롤러 필드에 요청 데이터를 두면 이 경계가 무너진다.</x-caption>
+</x-visual>
+
+<h3>흔한 오해와 함정</h3>
+<p><b>"컨트롤러가 요청을 받는다."</b> 서블릿 컨테이너가 부르는 것은 <code>DispatcherServlet</code> 하나다. 컨트롤러는 서블릿이 아니고 컨테이너는 그 존재를 모른다. 컨트롤러 메서드는 <code>DispatcherServlet</code>이 고른 어댑터가 리플렉션으로 부르는 평범한 메서드다. 그래서 컨트롤러 메서드에 찍은 브레이크포인트까지 요청이 오지 않는다면, 볼 곳은 컨트롤러가 아니라 그 앞 단계(필터, 핸들러 매핑, 인터셉터)다.</p>
+<p><b>"뷰 리졸버가 화면을 그린다."</b> 뷰 리졸버는 이름을 <code>View</code> 객체로 바꿀 뿐이다. "Could not resolve view"는 리졸버 단계의 실패이고, 템플릿 문법 오류나 JSP 404는 <code>View.render</code> 단계의 실패다. 두 실패는 원인도 고칠 곳도 다르다.</p>
+<p><b>"빈을 하나 등록하면 기본 구성에 더해진다."</b> <code>DispatcherServlet.properties</code>의 기본값은 해당 타입의 빈이 하나도 없을 때만 쓰인다. 비슷한 일이 한 단계 위에서도 일어난다. 스프링 부트 애플리케이션에 <code>@EnableWebMvc</code>를 붙이면 부트의 MVC 자동 구성이 통째로 빠진다. 부트 레퍼런스는 부트의 MVC 설정을 유지하면서 인터셉터나 포매터를 추가하려면 <code>@EnableWebMvc</code> 없이 <code>WebMvcConfigurer</code>를 구현한 설정 클래스를 쓰라고 안내한다.</p>
+<p><b>"HTTP 메서드가 안 맞으면 404다."</b> 경로가 없으면 404, 경로는 있는데 메서드가 다르면 405다. 클라이언트 개발자가 "404가 난다"고 할 때와 "405가 난다"고 할 때 서버에서 확인할 것이 다르다. 전자는 경로 오타나 컨트롤러 미등록(<code>@Controller</code> 누락, 컴포넌트 스캔 범위 밖)을, 후자는 <code>@GetMapping</code>과 <code>@PostMapping</code>의 선택을 본다.</p>
+<p><b>"핸들러 매핑의 우선순위는 정해져 있다."</b> 순서는 구성에 따라 다르다. 실험에서 본 것처럼 기본값 파일에서는 <code>BeanNameUrlHandlerMapping</code>이 먼저이고 <code>@EnableWebMvc</code>와 부트의 구성에서는 <code>RequestMappingHandlerMapping</code>이 먼저다. 순서를 외우기보다 "목록을 순서대로 묻고 첫 답을 쓴다"는 규칙과, 그 목록을 확인하는 방법을 아는 편이 낫다.</p>
+<p><b>"@RequestMapping만 붙여도 컨트롤러가 된다."</b> 5.3까지는 그랬고 6.0부터는 아니다. 클래스에 <code>@Controller</code>(또는 그것을 포함한 <code>@RestController</code>)가 있어야 조회 표에 들어간다.</p>
+
+<h3>다른 주제와의 연결</h3>
+<p>이 회차는 요청이 지나가는 길의 전체 모양을 보았고, 다음 회차들은 그 길의 각 구간을 확대한다. 06회차는 <code>RequestMappingInfo</code>의 조건들, 곧 경로 변수와 HTTP 메서드·파라미터·헤더·미디어 타입 조건을 다루고, 요청 데이터를 꺼내는 여러 애노테이션을 본다. 07회차는 <code>RequestMappingHandlerAdapter</code>의 안쪽을 연다. 이 회차에서 "어댑터가 인자를 만들고 반환값을 해석한다"고만 말한 부분이 ArgumentResolver와 ReturnValueHandler, 그리고 HTTP 메시지 컨버터로 구체화된다. <code>@ResponseBody</code>를 쓰면 어댑터가 응답 본문을 직접 쓰고 <code>ModelAndView</code>로 <code>null</code>을 돌려주어 뷰 렌더링이 생략되는데, 이는 이 회차의 <code>HttpRequestHandler</code> 실험에서 본 것과 같은 길이다.</p>
+<p>08회차에서는 타임리프 템플릿으로 실제 화면을 만들고, <code>redirect:</code> 뷰 이름이 왜 폼 처리에 필요한지를 PRG 패턴으로 설명한다. 「스프링 MVC 2편」으로 가면 <code>doDispatch</code>에서 스쳐 지나간 두 지점이 주제가 된다. <code>HandlerExecutionChain</code>에 담긴 인터셉터의 <code>preHandle</code>·<code>postHandle</code>·<code>afterCompletion</code>, 그리고 <code>processDispatchResult</code>에서 예외를 응답으로 바꾸는 <code>HandlerExceptionResolver</code>다. 둘 다 이 회차의 흐름도에서 자리를 찾을 수 있다.</p>
+<p>더 멀리 보면, 조회 표를 기동 시점에 만들어 두고 요청 시점에는 리플렉션으로 호출하는 방식은 스프링 전반에서 반복된다. 애노테이션을 읽어 메타데이터를 미리 계산해 두고, 실행 시점에는 그 메타데이터에 따라 대신 호출해 주는 구조는 트랜잭션이나 AOP의 프록시에서도 같은 모양으로 나타난다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>스프링 MVC는 프런트 컨트롤러 하나(DispatcherServlet)와 세 종류의 교체 가능한 목록(핸들러 매핑, 핸들러 어댑터, 뷰 리졸버)으로 이루어져 있다. 요청은 "목록을 순서대로 묻고 첫 답을 쓴다"는 같은 규칙으로 세 번 넘겨진다. @Controller와 @RequestMapping은 기동 시점에 조회 표의 항목이 되고, 요청 시점에는 어댑터가 리플렉션으로 메서드를 부른 뒤 결과를 ModelAndView로 맞춰 준다. 프레임워크의 부품과 컨트롤러는 모든 요청이 공유하고, 요청의 데이터는 호출 인자와 지역 변수로만 흐른다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>DispatcherServlet</dt><dd><code>HttpServlet</code>을 상속한 프런트 컨트롤러. <code>doDispatch</code>에서 핸들러 조회, 어댑터 조회, 핸들러 실행, 뷰 해석, 렌더링을 순서대로 지휘하고 구체 클래스에는 의존하지 않는다.</dd>
+<dt>HandlerMapping</dt><dd>요청에 맞는 핸들러와 인터셉터 묶음(<code>HandlerExecutionChain</code>)을 돌려준다. 여러 개가 목록으로 등록되고, 순서대로 물어 <code>null</code>이 아닌 첫 답이 쓰인다. 모두 <code>null</code>이면 404다.</dd>
+<dt>HandlerAdapter</dt><dd><code>supports(handler)</code>로 자신이 실행할 수 있는 핸들러인지 답하고, <code>handle</code>에서 핸들러 고유의 호출 방식을 감춘 채 <code>ModelAndView</code> 또는 <code>null</code>을 돌려준다.</dd>
+<dt>전략의 출처</dt><dd>서블릿 초기화 때 컨테이너에서 타입별 빈을 찾아 순서대로 정렬해 쓰고, 그 타입의 빈이 하나도 없을 때만 <code>DispatcherServlet.properties</code>의 기본값을 쓴다. <code>@EnableWebMvc</code>와 스프링 부트는 빈으로 등록하는 쪽이다.</dd>
+<dt>RequestMappingHandlerMapping</dt><dd>기동 시점에 <code>@Controller</code> 빈의 메서드를 훑어 <code>RequestMappingInfo</code> → <code>HandlerMethod</code> 조회 표를 만든다. 중복 매핑은 기동 시점에, 메서드 불일치(405)와 경로 없음(404)은 요청 시점에 드러난다.</dd>
+<dt>ViewResolver와 View</dt><dd>뷰 리졸버는 논리 이름을 <code>View</code> 객체로 바꾸고, <code>View</code>가 모델을 받아 응답을 만든다. <code>InternalResourceView</code>는 모델을 요청 속성에 옮긴 뒤 <code>forward</code>하고, <code>RedirectView</code>는 302를 보낸다.</dd>
+<dt>컨트롤러 통합</dt><dd>조회 표의 값은 메서드 단위(<code>HandlerMethod</code>)이므로 한 클래스에 핸들러 메서드를 여럿 둘 수 있다. 클래스 수준과 메서드 수준 <code>@RequestMapping</code>은 기동 시점에 한 번 결합된다.</dd>
+<dt>실용적인 방식</dt><dd><code>String</code> 반환, <code>Model</code>·<code>@RequestParam</code> 파라미터, <code>@GetMapping</code>·<code>@PostMapping</code>을 쓰면 <code>ModelAndView</code>를 만드는 일이 어댑터로 옮겨 간다. <code>DispatcherServlet</code>과 어댑터 사이의 계약은 변하지 않는다.</dd>
+<dt>공유와 스레드 안전</dt><dd><code>DispatcherServlet</code>, 매핑, 어댑터, 뷰 리졸버, 컨트롤러는 하나를 모든 요청 스레드가 공유한다. 요청별 데이터는 인자와 지역 변수로만 다루고 컨트롤러 필드에 두지 않는다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 다시 판단하면, 이 회차의 지식이 가장 자주 쓰이는 곳은 "요청이 어디까지 갔는가"를 가리는 장애 분석이다. 404라면 핸들러 매핑 단계에서 끝난 것이므로 조회 표에 항목이 있는지부터 본다. <code>org.springframework.web</code> 로그 레벨을 TRACE로 낮춰 기동 시 등록되는 매핑을 확인하거나 액추에이터의 매핑 엔드포인트를 보는 방법이 있다. 컨트롤러 클래스가 컴포넌트 스캔 범위 밖에 있거나 <code>@Controller</code>가 빠져 있으면 빈이 있어도 표에는 없다. 405라면 경로는 맞았다는 뜻이고, 필수 파라미터 누락으로 난 400이라면 핸들러까지는 찾았고 어댑터가 인자를 만들다 실패한 것이다. 뷰 이름을 못 찾는 오류와 "Circular view path"는 핸들러가 정상 종료한 뒤의 일이므로 컨트롤러 로직이 아니라 뷰 리졸버 구성과 템플릿 의존성을 본다.</p>
+<p>설계 판단에서는 "무엇을 구성으로 바꾸고 무엇을 건드리지 않을 것인가"가 문제다. 핸들러 매핑, 어댑터, 뷰 리졸버를 직접 빈으로 등록하면 기본값이나 자동 구성이 물러나는 규칙 때문에, 하나를 바꾸려다 전체를 잃는 일이 생긴다. 스프링 부트를 쓴다면 <code>@EnableWebMvc</code>를 붙이기 전에 <code>WebMvcConfigurer</code>로 충분한지 먼저 확인하는 것이 안전하다. 반대로 레거시 애플리케이션에서 인터페이스 기반 <code>Controller</code>와 애노테이션 컨트롤러가 섞여 있다면, 두 방식이 서로 다른 매핑·어댑터 쌍으로 공존한다는 것을 알고 있어야 같은 URL을 양쪽에 등록했을 때 누가 응답하는지 예측할 수 있다.</p>
+<p>성능 관점에서 프레임워크가 요청마다 하는 일(맵 조회, 리플렉션 호출, 작은 객체 몇 개 생성)은 컨트롤러가 호출하는 데이터베이스나 외부 API의 대기 시간에 비하면 대개 문제가 되지 않는다. 그보다 중요한 것은 이 모든 과정이 요청을 받은 작업 스레드 하나에서 동기적으로 실행된다는 사실이다. 컨트롤러 메서드가 느린 호출에서 멈춰 있으면 그 스레드는 풀로 돌아가지 못하고, 01회차에서 본 스레드 풀 고갈로 이어진다. 그리고 컨트롤러는 싱글톤이다. 코드 리뷰에서 컨트롤러나 서비스에 <code>final</code>이 아닌 필드가 보이면, 그것이 요청별 데이터가 아닌지 확인하는 습관이 동시성 버그를 가장 싸게 막는다.</p>
+</x-review>
+
+<x-practice>
+<li>MVC 설정 클래스에 다음 두 빈이 함께 등록되어 있다. 빈 이름이 <code>/reports</code>이고 <code>Controller</code> 인터페이스를 구현해 뷰 이름 <code>old/reports</code>를 돌려주는 객체, 그리고 <code>@Controller</code> 클래스 안에서 <code>@RequestMapping("/reports")</code>가 붙어 뷰 이름 <code>new/reports</code>를 돌려주는 메서드다. <code>GET /reports</code>를 보냈을 때 (가) MVC 관련 빈을 따로 등록하지 않아 <code>DispatcherServlet.properties</code>의 기본 전략으로 도는 경우와 (나) <code>@EnableWebMvc</code>를 붙인 경우에 각각 어느 뷰 이름이 나오는지, <code>getHandler</code>의 동작으로 설명하라.</li>
+<li>다음 컨트롤러가 등록되었을 때 만들어지는 조회 표의 항목을 모두 적고, 여섯 요청 <code>GET /orders</code>, <code>POST /orders</code>, <code>DELETE /orders</code>, <code>GET /orders/new</code>, <code>POST /orders/new</code>, <code>GET /orders/old</code>의 결과(호출되는 메서드 또는 상태 코드)를 예측하라. 클래스에는 <code>@Controller</code>와 <code>@RequestMapping("/orders")</code>가, 메서드 <code>list</code>에는 <code>@GetMapping</code>, <code>create</code>에는 <code>@PostMapping</code>, <code>form</code>에는 <code>@GetMapping("/new")</code>가 붙어 있다.</li>
+<li>뷰 리졸버가 접두사·접미사 없는 <code>InternalResourceViewResolver</code> 하나뿐이다. (가) <code>/reports</code>에 매핑된 메서드가 뷰 이름 <code>reports</code>를 돌려줄 때와 (나) <code>/reports/monthly</code>에 매핑된 메서드가 뷰 이름 <code>summary</code>를 돌려줄 때 각각 무슨 일이 일어나는지 설명하라. 그리고 접두사 <code>/WEB-INF/views/</code>, 접미사 <code>.jsp</code>를 설정하면 두 경우의 <code>forward</code> 대상이 무엇이 되는지 적어라.</li>
+<li>다음 컨트롤러는 혼자 테스트할 때는 잘 동작하지만 사용자가 몰리면 가끔 다른 사람의 검색어가 화면에 나온다. 원인을 메모리와 스레드 관점에서 설명하고 고쳐라.
+<pre><code class="language-java">@Controller
+public class SearchController {
+    private String keyword;
+
+    @GetMapping("/search")
+    public String search(@RequestParam("q") String q, Model model) {
+        this.keyword = q;
+        List<String> results = searchService.find(q);   // 수십 밀리초가 걸린다
+        model.addAttribute("keyword", this.keyword);
+        model.addAttribute("results", results);
+        return "search/result";
+    }
+    // ... searchService 필드와 생성자
+}</code></pre></li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> <code>getHandler</code>는 핸들러 매핑 목록을 앞에서부터 돌며 <code>null</code>이 아닌 첫 결과를 쓴다. 그러므로 답은 목록의 순서가 정한다. (가)에서는 기본값 파일의 순서대로 <code>BeanNameUrlHandlerMapping</code>이 첫째다. 이 매핑의 표에 <code>/reports</code>가 있으므로 인터페이스 기반 컨트롤러가 선택되고 뷰 이름은 <code>old/reports</code>다. <code>RequestMappingHandlerMapping</code>에는 물어보지도 않는다. (나)에서는 <code>WebMvcConfigurationSupport</code>가 <code>RequestMappingHandlerMapping</code>을 순서 0, <code>BeanNameUrlHandlerMapping</code>을 순서 2로 등록하므로 애노테이션 매핑이 먼저 답하고 뷰 이름은 <code>new/reports</code>다. 실제로 두 구성으로 실행해 보면 이 결과가 나온다. 같은 코드가 구성에 따라 다르게 동작하므로, 한 URL을 두 방식으로 등록하는 것 자체를 피해야 한다.</p>
+<p><b>2번.</b> 클래스와 메서드의 매핑이 결합되어 항목은 셋이다. <code>{GET [/orders]}</code> → <code>list</code>, <code>{POST [/orders]}</code> → <code>create</code>, <code>{GET [/orders/new]}</code> → <code>form</code>. <code>GET /orders</code>는 <code>list</code>, <code>POST /orders</code>는 <code>create</code>, <code>GET /orders/new</code>는 <code>form</code>이 호출된다. <code>DELETE /orders</code>는 경로가 같은 항목이 있지만 메서드 조건이 맞는 것이 없으므로 405이고, <code>Allow</code> 헤더에는 GET과 POST가 들어간다. <code>POST /orders/new</code>도 같은 이유로 405이며 <code>Allow</code>는 GET이다. <code>GET /orders/old</code>는 경로가 맞는 항목이 아예 없으므로 매핑이 <code>null</code>을 돌려주고 404가 된다. 경로가 맞는지 여부가 404와 405를 가른다.</p>
+<p><b>3번.</b> (가) 접두사와 접미사가 빈 문자열이므로 뷰의 URL은 <code>reports</code>다. 현재 요청 URI <code>/reports</code>를 기준으로 상대 경로를 풀면 <code>/reports</code>로 같아진다. <code>forward</code>하면 같은 핸들러로 되돌아와 끝없이 반복되므로 스프링이 <code>forward</code> 전에 "Circular view path" 예외를 던진다. (나) URL은 <code>summary</code>이고, <code>/reports/monthly</code>를 기준으로 풀면 <code>/reports/summary</code>다. 요청 URI와 다르므로 순환 검사는 통과하고 그 경로로 <code>forward</code>가 일어난다. 그 경로를 처리할 서블릿이나 핸들러가 없으면 결과는 404다. 예외 없이 엉뚱한 404가 나오므로 (가)보다 원인을 찾기 어렵다. 접두사와 접미사를 설정하면 URL은 각각 <code>/WEB-INF/views/reports.jsp</code>와 <code>/WEB-INF/views/summary.jsp</code>가 된다. 접두사가 <code>/</code>로 시작하는 절대 경로이므로 현재 요청 URI와 무관해진다.</p>
+<p><b>4번.</b> <code>SearchController</code>는 싱글톤 빈이어서 힙에 객체가 하나뿐이고, 모든 요청 스레드가 같은 객체의 <code>search</code>를 실행한다. <code>keyword</code> 필드도 하나뿐이다. 스레드 A가 <code>this.keyword = "java"</code>를 실행하고 <code>searchService.find</code>에서 기다리는 동안 스레드 B가 <code>this.keyword = "spring"</code>을 실행하면, A가 돌아와 <code>this.keyword</code>를 읽을 때 값은 <code>spring</code>이다. A의 화면에는 <code>java</code>의 검색 결과와 <code>spring</code>이라는 검색어가 함께 나온다. 혼자 테스트할 때는 두 스레드가 겹치지 않아 드러나지 않는다. 반면 파라미터 <code>q</code>와 지역 변수 <code>results</code>, 그리고 어댑터가 요청마다 새로 만들어 넘기는 <code>model</code>은 스레드마다 따로다. 고치는 방법은 필드를 없애고 <code>model.addAttribute("keyword", q)</code>로 파라미터를 직접 쓰는 것이다. 필드에 <code>volatile</code>을 붙이거나 메서드를 <code>synchronized</code>로 만드는 것은 답이 아니다. 전자는 덮어쓰기를 막지 못하고, 후자는 모든 검색 요청을 한 줄로 세워 처리량을 떨어뜨린다. 요청별 데이터는 애초에 공유할 이유가 없다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>스프링 MVC에 지금까지 없던 새로운 형태의 핸들러(특정 인터페이스를 구현하지 않고, 고유한 방식으로 호출해야 하는 객체)를 지원하려고 한다. 구조에 맞는 방법은 무엇인가?</q>
+<o><code>DispatcherServlet</code>을 상속해 <code>doDispatch</code> 안에 새 핸들러 타입을 처리하는 분기를 추가한다.</o>
+<o>요청을 그 핸들러로 연결하는 <code>HandlerMapping</code>과, 그 핸들러를 실행할 줄 아는 <code>HandlerAdapter</code>를 구현해 빈으로 등록한다.</o>
+<o>새 핸들러가 <code>ModelAndView</code>를 반환하도록 강제하면 기존 어댑터가 자동으로 실행해 준다.</o>
+<o><code>ViewResolver</code>를 새로 구현해 핸들러의 반환값을 해석하게 한다.</o>
+<why><code>DispatcherServlet</code>은 핸들러를 <code>Object</code>로만 다루고, 누가 찾고 누가 실행할지는 등록된 매핑과 어댑터 목록에 묻는다. 새 핸들러 종류는 매핑·어댑터 한 쌍을 추가하는 것으로 지원되며, 함수형 엔드포인트의 <code>RouterFunctionMapping</code>과 <code>HandlerFunctionAdapter</code>가 그런 예다. <code>doDispatch</code>를 고치는 것은 이 설계가 피하려던 방법이다. 기존 어댑터는 <code>supports</code>에서 타입을 검사하므로 반환 타입만 맞춘다고 실행해 주지 않는다. 뷰 리졸버는 핸들러 실행이 끝난 뒤의 단계다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>@PostMapping("/notices/save")</code> 메서드만 있는 애플리케이션에 <code>GET /notices/save</code>를 보내면 405가, <code>GET /notices/remove</code>를 보내면 404가 응답된다. 두 결과가 갈리는 지점에 대한 설명으로 옳은 것은?</q>
+<o>405는 톰캣이 서블릿을 호출하기 전에 판단하고, 404는 <code>DispatcherServlet</code>이 판단한다.</o>
+<o>둘 다 핸들러 어댑터가 컨트롤러 메서드를 호출하다가 실패한 결과다.</o>
+<o>둘 다 핸들러 매핑 단계에서 갈린다. 경로가 맞는 항목이 없으면 매핑이 <code>null</code>을 돌려주어 404가 되고, 경로는 맞지만 HTTP 메서드가 다른 항목이 있으면 매핑이 예외를 던져 405가 된다.</o>
+<o>405는 뷰 리졸버가 뷰를 찾지 못해서, 404는 뷰 파일이 없어서 나는 결과다.</o>
+<why><code>RequestMappingHandlerMapping</code>은 조건에 맞는 항목을 찾지 못하면 경로만 맞는 항목이 있는지 다시 확인하고, 있으면 <code>HttpRequestMethodNotSupportedException</code>을 던진다. 경로조차 맞는 것이 없으면 <code>null</code>을 돌려주고, 모든 매핑이 <code>null</code>이면 404다. 두 경우 모두 핸들러가 선택되지 않았으므로 어댑터와 뷰 리졸버는 관여하지 않는다. 톰캣은 <code>/</code>에 매핑된 <code>DispatcherServlet</code>으로 요청을 넘길 뿐 컨트롤러의 HTTP 메서드 조건을 알지 못한다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>MVC 관련 빈을 전혀 등록하지 않고 <code>DispatcherServlet</code>의 기본 전략으로 잘 돌던 애플리케이션에, 특정 URL을 처리하려고 <code>HandlerMapping</code> 구현체 하나를 빈으로 등록했다. 그 뒤로 기존 <code>@Controller</code>들의 URL이 전부 404가 되었다. 원인은 무엇인가?</q>
+<o><code>HandlerMapping</code> 타입의 빈이 하나라도 있으면 <code>DispatcherServlet.properties</code>의 기본 핸들러 매핑들이 쓰이지 않아, <code>RequestMappingHandlerMapping</code>이 목록에서 빠졌기 때문이다.</o>
+<o>새 매핑이 모든 요청에 대해 예외를 던지기 때문이다.</o>
+<o>핸들러 매핑은 애플리케이션에 하나만 존재할 수 있기 때문이다.</o>
+<o>새 매핑을 등록하면 컴포넌트 스캔이 중단되어 컨트롤러 빈이 만들어지지 않기 때문이다.</o>
+<why>초기화 때 <code>DispatcherServlet</code>은 컨테이너에서 <code>HandlerMapping</code> 빈을 찾고, 하나도 없을 때에만 기본값 파일의 구현체들을 만든다. 빈을 하나 등록하는 순간 목록은 그 빈 하나가 되고, 애노테이션 매핑을 맡던 <code>RequestMappingHandlerMapping</code>은 만들어지지 않는다. 컨트롤러 빈은 그대로 컨테이너에 있지만 조회 표를 만들 주체가 없다. 매핑은 여러 개가 공존할 수 있고, 그것이 목록으로 관리하는 이유다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>컨트롤러가 뷰 이름 <code>notices/list</code>를 돌려주고, 접두사 <code>/WEB-INF/views/</code>와 접미사 <code>.jsp</code>가 설정된 <code>InternalResourceViewResolver</code>가 등록되어 있다. 모델의 값을 요청 속성으로 옮기고 <code>RequestDispatcher.forward</code>를 호출하는 객체는 무엇인가?</q>
+<o>컨트롤러. 뷰 이름을 돌려주는 시점에 스프링이 컨트롤러 안에서 <code>forward</code>를 수행한다.</o>
+<o><code>RequestMappingHandlerAdapter</code>. 핸들러 실행과 화면 이동을 함께 맡는다.</o>
+<o><code>InternalResourceViewResolver</code>. 이름을 경로로 바꾼 뒤 바로 <code>forward</code>한다.</o>
+<o><code>InternalResourceView</code>. 뷰 리졸버가 만들어 돌려준 이 객체의 <code>render</code>가 호출될 때 수행한다.</o>
+<why>뷰 리졸버의 일은 이름을 <code>View</code> 객체로 바꾸는 데서 끝난다. <code>DispatcherServlet</code>이 그 <code>View</code>의 <code>render(model, request, response)</code>를 호출하면, <code>InternalResourceView</code>가 모델 항목을 <code>request.setAttribute</code>로 옮기고 <code>forward</code>한다. 어댑터는 <code>ModelAndView</code>를 돌려주는 것까지만 하고, 컨트롤러는 문자열을 반환한 뒤 이미 끝났다. 이 분리 덕분에 같은 컨트롤러가 <code>RedirectView</code>나 타임리프 뷰와도 그대로 동작한다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>스프링 MVC 컨트롤러에서 동시 요청이 몰려도 다른 요청의 데이터와 섞이지 않는 것은 어느 것인가?</q>
+<o>컨트롤러 클래스의 인스턴스 필드에 저장한 요청 파라미터 값</o>
+<o>컨트롤러 클래스의 <code>static</code> 필드에 저장한 현재 사용자 이름</o>
+<o>핸들러 메서드가 파라미터로 받은 <code>Model</code>에 넣은 값</o>
+<o>컨트롤러가 필드로 가진 <code>ArrayList</code>에 요청마다 추가한 값</o>
+<why>컨트롤러는 싱글톤 빈이어서 인스턴스 필드도 <code>static</code> 필드도 모든 요청 스레드가 공유한다. 필드에 둔 <code>ArrayList</code>는 공유될 뿐 아니라 스레드 안전하지도 않아 동시에 <code>add</code>하면 내용이 깨질 수 있다. 반면 <code>Model</code>은 어댑터가 요청마다 새로 만든 <code>ModelAndViewContainer</code>에 속한 객체이고, 그 참조는 해당 요청을 처리하는 스레드의 스택 프레임에만 있다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>프런트 컨트롤러(front controller)</dt><dd>모든 요청을 먼저 받아 공통 처리를 한 뒤 알맞은 처리 객체로 넘기는 단일 진입점. 스프링 MVC에서는 <code>DispatcherServlet</code>이 이 역할이다.</dd>
+<dt>핸들러(handler)</dt><dd>요청을 실제로 처리하는 객체. 타입 제약이 없어 <code>Controller</code> 구현체, <code>HttpRequestHandler</code> 구현체, <code>HandlerMethod</code>(애노테이션 메서드) 등이 모두 핸들러가 될 수 있다.</dd>
+<dt>핸들러 매핑(HandlerMapping)</dt><dd>요청을 보고 핸들러와 인터셉터 묶음을 찾아 주는 전략 인터페이스. <code>RequestMappingHandlerMapping</code>, <code>BeanNameUrlHandlerMapping</code> 등이 구현체다.</dd>
+<dt>핸들러 어댑터(HandlerAdapter)</dt><dd>핸들러 종류마다 다른 호출 방식을 감추고 <code>DispatcherServlet</code>에 한 가지 호출 방법(<code>handle</code>)을 제공하는 전략 인터페이스.</dd>
+<dt>HandlerExecutionChain</dt><dd>핸들러 하나와 그 앞뒤에서 실행할 인터셉터 목록을 묶은 객체. 핸들러 매핑의 반환값이다.</dd>
+<dt>HandlerMethod</dt><dd>애노테이션 기반 핸들러를 나타내는 객체. 어느 빈의 어느 <code>Method</code>인지와 파라미터 정보를 담는다.</dd>
+<dt>RequestMappingInfo</dt><dd><code>@RequestMapping</code>에서 만들어지는 매핑 조건의 묶음. 경로 패턴, HTTP 메서드, 파라미터, 헤더, 미디어 타입 조건을 포함하며 조회 표의 키가 된다.</dd>
+<dt>뷰 리졸버(ViewResolver)</dt><dd>논리 뷰 이름을 <code>View</code> 객체로 바꾸는 전략 인터페이스. 모른다는 뜻으로 <code>null</code>을 돌려줄 수 있고, 그러면 다음 리졸버에게 기회가 넘어간다.</dd>
+<dt>합성 애노테이션(composed annotation)</dt><dd>다른 애노테이션을 메타 애노테이션으로 포함해 그 설정을 미리 채워 둔 애노테이션. <code>@GetMapping</code>은 <code>@RequestMapping(method = GET)</code>을 포함한다. 스프링의 병합 탐색이 이를 해석한다.</dd>
+<dt>리플렉션(reflection)</dt><dd>실행 중에 클래스의 메서드·필드 정보를 객체로 얻어 조회하거나 호출하는 자바 기능. 애노테이션 컨트롤러의 메서드는 <code>Method.invoke</code>로 호출된다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-servlet/special-bean-types.html">Spring Framework Reference — Special Bean Types</a> — HandlerMapping, HandlerAdapter, ViewResolver 등 DispatcherServlet이 위임하는 빈 타입의 정의</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-servlet/sequence.html">Spring Framework Reference — Processing</a> — DispatcherServlet의 요청 처리 순서와 throwExceptionIfNoHandlerFound의 6.1 변경</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-servlet/viewresolver.html">Spring Framework Reference — View Resolution</a> — 뷰 리졸버 체인, redirect:·forward: 접두어, InternalResourceViewResolver를 마지막에 두는 이유</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-framework/6.2.x/spring-webmvc/src/main/resources/org/springframework/web/servlet/DispatcherServlet.properties">DispatcherServlet.properties (6.2.x)</a> — 전략 인터페이스별 기본 구현체와 그 순서</li>
+<li><a href="https://github.com/spring-projects/spring-framework/wiki/Spring-Framework-6.0-Release-Notes">Spring Framework 6.0 Release Notes</a> — 클래스 수준 @RequestMapping만으로는 컨트롤러를 감지하지 않게 된 변경</li>
+<li><a href="https://docs.spring.io/spring-boot/reference/web/servlet.html">Spring Boot Reference — Servlet Web Applications</a> — Spring MVC 자동 구성이 등록하는 뷰 리졸버, @EnableWebMvc와의 관계, 템플릿 엔진과 JSP 제약</li>
+</x-refs>

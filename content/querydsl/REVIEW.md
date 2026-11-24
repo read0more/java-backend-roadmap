@@ -1,0 +1,8 @@
+- 06: 2026-11-17 확인 32건 · 수정 2건 — 레거시 Impl의 @Transactional은 CGLIB가 아니라 리포지토리 프록시가 연다(로그·소스로 정정), 트랜잭션 속성 계산 순서(인터페이스 선언 먼저) 정정
+- 07: 2026-11-17 확인 32건 · 수정 9건 — 허용목록+별칭 예제(department.name도 계속 조건이 됨)·findOne 예외 경로(Querydsl 예외로 감쌈) 정정, 근거 없는 설계 의도 서술 4곳 사실로 좁힘
+- 02: 2026-11-17 확인 45건 · 수정 3건 — JPAQueryFactory.query()는 템플릿 유무로 생성자 분기 명시, NumberConversion 감싸기는 select 시점(JPAQueryMixin)으로 정정, groupBy 예제 JPQL 출력에 order by 줄 추가
+- 01: 2026-11-17 확인 39건 · 수정 4건 — @SupportedAnnotationTypes에 javax.persistence.* 추가, 레퍼런스 서문→소개 장(2곳), H2 -ifNotExists 보안 경고를 원문 범위로 좁힘
+- 03: 2026-11-17 확인 58건 · 수정 2건 — JPQLTemplates.DEFAULT 단순 case 직렬화 else ?3→else ?5(재실행 확인), join 2인자 시그니처 목록에 MapExpression 오버로드 존재 명시
+- 04: 2026-11-17 확인 45건 · 수정 5건 — 서브쿼리 제한 근거를 4.6.16절로, replace는 JPA 3.1 한정(3.2 추가), @Modifying flush/clear 속성 구분, FunctionContributor 메서드 설명 정정
+- 05: 2026-11-17 확인 32건 · 수정 3건 — 빌더 출력 순번(세·네 번째→두·세 번째) 정정, 웹·OSIV 실험이 choi 뺀 4명 데이터임을 명시
+- 02: 2026-11-19 MySQL 실측 30건 · 채움/수정 9건 — 방언 SQL(NULL 정렬 case·LIMIT)·LIKE/case filesort EXPLAIN·콜레이션·SUM DECIMAL·오프셋 EXPLAIN ANALYZE(8.0.46/8.4.13) 추가

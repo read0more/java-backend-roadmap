@@ -1,0 +1,1222 @@
+<x-meta>
+deck: 원본 코드를 한 줄도 고치지 않고 부가 기능을 끼워 넣는 자리로 프록시를 세우고, 모양이 같은 두 패턴을 의도로 가른 뒤, 인터페이스 기반·구체 클래스 기반 프록시가 JVM과 스프링 컨테이너 안에서 어떻게 움직이고 어디서 막히는지 따라간다.
+minutes: 120
+</x-meta>
+
+<x-goals>
+<li>클라이언트가 인터페이스나 상위 클래스에만 의존할 때 조립 코드만 바꿔 프록시를 끼울 수 있는 이유를, 객체 참조 그림과 <code>invokeinterface</code>·<code>invokevirtual</code>의 메서드 선택 규칙으로 설명할 수 있다.</li>
+<li>프록시 패턴과 데코레이터 패턴을 코드 모양이 아니라 의도로 구분하고, 캐시 프록시와 데코레이터 체인을 직접 만들어 실행 순서를 예측할 수 있다.</li>
+<li>인터페이스 기반 프록시로 수동 등록 빈에 로그 추적기를 붙이고, 컨테이너에는 프록시만 빈으로 남고 진짜 객체는 프록시의 필드로만 남는 구조를 그릴 수 있다.</li>
+<li>구체 클래스 기반 프록시에서 생기는 부모 생성자 호출, 쓰지 않는 부모 필드, 오버라이드 누락, <code>final</code> 제약을 JLS 규칙과 실행 결과로 설명할 수 있다.</li>
+<li>손으로 만든 프록시가 부딪히는 두 벽(프록시 클래스의 수, 컴포넌트 스캔 대상)을 짚고, 다음 회차들이 무엇을 풀어야 하는지 말할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>원본을 고치지 않고 기능을 더할 수 있는가</h3>
+<p>01회에서 만든 로그 추적기는 요청 하나를 따라가며 같은 트랜잭션 ID와 호출 깊이를 찍었다. 스레드마다 따로 보관해야 하는 상태는 <code>ThreadLocal</code>에 두었고, 스레드 풀에서 스레드가 재사용되므로 요청이 끝나면 반드시 지워야 한다는 것도 확인했다. 02회에서는 모든 메서드에 반복되던 <code>try</code>/<code>catch</code>와 시작·종료 로그 호출을 템플릿 메서드 패턴과 템플릿 콜백 패턴으로 한곳에 모았다. 반복되는 코드의 양은 크게 줄었다.</p>
+<p>그래도 한 가지는 그대로 남았다. 로그를 남기고 싶은 메서드마다 템플릿을 부르는 코드를 <b>원본 메서드 안에</b> 넣어야 한다는 점이다. 클래스가 백 개라면 백 개의 파일을 열어 고쳐야 하고, 로그를 끄고 싶을 때도 다시 백 개를 고쳐야 한다. 더 근본적인 문제는 책임이 섞인다는 것이다. 게시글을 저장하는 서비스의 소스 파일에 "저장한다"는 핵심 기능과 "얼마나 걸렸는지 기록한다"는 부가 기능이 함께 들어간다. 부가 기능의 정책이 바뀌어도 핵심 기능의 파일이 바뀐다.</p>
+<p>이 회차의 질문은 그래서 이렇다. <b>원본 클래스의 소스를 한 줄도 고치지 않고</b> 그 클래스의 메서드 앞뒤에 코드를 실행시킬 수 있는가. 이 질문에 답하려면 원본 코드 밖에서 끼어들 수 있는 자리를 찾아야 한다. 그 자리는 이미 기본편에서 익숙하게 다룬 곳에 있다. 한 객체가 다른 객체를 호출할 때, 호출하는 쪽이 들고 있는 <b>참조</b>가 무엇을 가리키는지는 호출하는 쪽이 정하지 않는다. 의존관계 주입(dependency injection)을 쓰면 그것을 정하는 것은 조립하는 쪽, 곧 설정 코드와 스프링 컨테이너다.</p>
+<p>호출하는 쪽이 인터페이스 타입의 참조만 들고 있고 그 참조에 무엇이 들어올지는 바깥에서 정한다면, 바깥에서 진짜 객체 대신 "진짜 객체를 감싼 다른 객체"를 넣어 줄 수 있다. 그 객체가 호출을 받아 앞뒤로 원하는 일을 하고 진짜 객체에 일을 넘기면, 원본 코드는 손대지 않은 채 기능이 더해진다. 이 "대신 서 있는 객체"가 이 회차의 주인공인 프록시(proxy)다. 이번 회차는 프록시를 손으로 만들어 보면서 그것이 무엇을 가능하게 하고 어디서 막히는지 확인한다. 막히는 지점이 곧 04회(동적 프록시)와 06회(빈 후처리기)의 출발점이 된다.</p>
+
+<h3>예제 프로젝트 — 빈을 등록하는 세 가지 형태</h3>
+<p>부가 기능을 붙일 대상부터 만든다. 실무의 스프링 애플리케이션을 보면 빈이 컨테이너에 들어가는 형태는 크게 세 가지다. 인터페이스와 구현 클래스를 나누고 설정 클래스의 <code>@Bean</code> 메서드로 등록하는 형태, 인터페이스 없이 구체 클래스를 <code>@Bean</code>으로 등록하는 형태, 그리고 <code>@Component</code> 계열 애너테이션을 붙여 컴포넌트 스캔으로 등록하는 형태다. 로그 추적기는 세 형태 모두에 붙을 수 있어야 하므로 예제도 세 벌을 만든다. 도메인은 게시글 등록 하나로 단순하게 잡는다. 컨트롤러가 제목을 받아 서비스에 넘기고, 서비스는 리포지토리에 저장을 맡기며, 리포지토리는 제목이 비어 있으면 예외를 던진다.</p>
+<p>프로젝트는 이 강좌의 기준대로 Java 21, 스프링 부트 3.x로 만들고 웹 스타터 하나면 충분하다.</p>
+<pre><code class="language-groovy">dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}</code></pre>
+<p>패키지는 다음처럼 나눈다. 핵심은 <code>config</code>와 <code>v1</code>, <code>v2</code>는 컴포넌트 스캔 범위 밖에 두고, <code>v3</code>만 스캔 범위 안에 둔다는 것이다. 이유는 조금 뒤에 본다.</p>
+<pre class="diagram">lab
+ ├─ ProxyApplication          @SpringBootApplication(scanBasePackages = "lab.app.v3")
+ ├─ config                    설정 클래스(스캔 대상 아님, @Import로 직접 지정)
+ ├─ trace                     로그 추적기(01회)
+ └─ app
+     ├─ v1   인터페이스 + 구현 클래스, @Bean으로 수동 등록
+     ├─ v2   구체 클래스만, @Bean으로 수동 등록
+     └─ v3   구체 클래스 + @RestController/@Service/@Repository, 컴포넌트 스캔</pre>
+
+<h4>v1: 인터페이스와 구현 클래스, 수동 등록</h4>
+<pre><code class="language-java">public interface ArticleRepositoryV1 {
+    void save(String title);
+}
+
+public class ArticleRepositoryV1Impl implements ArticleRepositoryV1 {
+    @Override
+    public void save(String title) {
+        if (title.isBlank()) {
+            throw new IllegalArgumentException("제목이 비어 있다");
+        }
+        sleep(100); // 저장에 걸리는 시간이라고 치자
+    }
+
+    private void sleep(long millis) {
+        try { Thread.sleep(millis); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
+
+public interface ArticleServiceV1 {
+    void register(String title);
+}
+
+public class ArticleServiceV1Impl implements ArticleServiceV1 {
+    private final ArticleRepositoryV1 articleRepository;
+
+    public ArticleServiceV1Impl(ArticleRepositoryV1 articleRepository) {
+        this.articleRepository = articleRepository;
+    }
+
+    @Override
+    public void register(String title) {
+        articleRepository.save(title);
+    }
+}</code></pre>
+<p>컨트롤러도 인터페이스와 구현으로 나눈다. 여기서 스프링 MVC의 규칙 하나를 만난다. 요청 매핑 애너테이션을 인터페이스에 두고 구현 클래스는 평범한 클래스로 두는데, 인터페이스에 무엇을 붙여야 스프링 MVC가 이것을 컨트롤러로 알아보는가 하는 문제다.</p>
+<pre><code class="language-java">@RestController   // 인터페이스에 붙인다. 이유는 아래에서 본다
+public interface ArticleControllerV1 {
+
+    @PostMapping("/v1/articles")
+    String register(@RequestParam("title") String title);
+
+    @GetMapping("/v1/health")
+    String health();
+}
+
+public class ArticleControllerV1Impl implements ArticleControllerV1 {
+    private final ArticleServiceV1 articleService;
+
+    public ArticleControllerV1Impl(ArticleServiceV1 articleService) {
+        this.articleService = articleService;
+    }
+
+    @Override
+    public String register(String title) {
+        articleService.register(title);
+        return "ok";
+    }
+
+    @Override
+    public String health() {
+        return "up";
+    }
+}</code></pre>
+<p>스프링 프레임워크 5.x까지는 타입 수준에 <code>@RequestMapping</code>만 붙어 있어도 컨트롤러로 인식됐다. 6.0에서 이것이 바뀌었다. 6.0 릴리스 노트는 스프링 MVC와 WebFlux가 타입 수준 <code>@RequestMapping</code>만으로는 더 이상 컨트롤러를 감지하지 않으며, 그래서 인터페이스 기반 프록시를 쓰는 웹 컨트롤러가 동작하지 않을 수 있으니 그런 컨트롤러에는 클래스 기반 프록시를 쓰고, 그렇지 않으면 인터페이스에도 <code>@Controller</code>를 붙여야 한다고 안내한다. <code>@RestController</code>는 <code>@Controller</code>를 메타 애너테이션으로 가지고 있으므로 같은 효과를 낸다. 실제로 6.2.19의 <code>RequestMappingHandlerMapping.isHandler</code>를 <code>javap</code>로 열어 보면 <code>AnnotatedElementUtils.hasAnnotation(beanType, Controller.class)</code> 호출 하나뿐이다. 타입 수준 <code>@RequestMapping</code>은 판단에 쓰이지 않는다.</p>
+<p>인터페이스에 <code>@RestController</code>를 붙이면 컴포넌트 스캔이 인터페이스를 빈으로 등록하려 하지 않을까 걱정할 수 있다. 그렇지 않다. 스캔 후보를 거르는 <code>ClassPathScanningCandidateComponentProvider.isCandidateComponent</code>는 독립적인(최상위 또는 정적 중첩) 클래스이면서 구체 클래스인 것만 통과시킨다(추상 클래스는 <code>@Lookup</code> 메서드가 있을 때만 예외). 인터페이스는 구체 클래스가 아니므로 후보가 되지 않는다.</p>
+<pre data-label="ClassPathScanningCandidateComponentProvider (spring-context 6.2.19)"><code class="language-java">protected boolean isCandidateComponent(AnnotatedBeanDefinition beanDefinition) {
+    AnnotationMetadata metadata = beanDefinition.getMetadata();
+    return (metadata.isIndependent() && (metadata.isConcrete() ||
+            (metadata.isAbstract() && metadata.hasAnnotatedMethods(Lookup.class.getName()))));
+}</code></pre>
+<p>v1은 설정 클래스로 조립한다. 지금은 프록시가 없는 원래 모습이다.</p>
+<pre><code class="language-java">@Configuration
+public class AppV1Config {
+
+    @Bean
+    public ArticleControllerV1 articleControllerV1() {
+        return new ArticleControllerV1Impl(articleServiceV1());
+    }
+
+    @Bean
+    public ArticleServiceV1 articleServiceV1() {
+        return new ArticleServiceV1Impl(articleRepositoryV1());
+    }
+
+    @Bean
+    public ArticleRepositoryV1 articleRepositoryV1() {
+        return new ArticleRepositoryV1Impl();
+    }
+}</code></pre>
+
+<h4>v2: 인터페이스 없는 구체 클래스, 수동 등록</h4>
+<pre><code class="language-java">public class ArticleRepositoryV2 {
+    public void save(String title) {
+        if (title.isBlank()) {
+            throw new IllegalArgumentException("제목이 비어 있다");
+        }
+        try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
+
+public class ArticleServiceV2 {
+    private final ArticleRepositoryV2 articleRepository;
+
+    public ArticleServiceV2(ArticleRepositoryV2 articleRepository) {
+        this.articleRepository = articleRepository;
+    }
+
+    public void register(String title) {
+        articleRepository.save(title);
+    }
+}
+
+@RestController
+public class ArticleControllerV2 {
+    private final ArticleServiceV2 articleService;
+
+    public ArticleControllerV2(ArticleServiceV2 articleService) {
+        this.articleService = articleService;
+    }
+
+    @PostMapping("/v2/articles")
+    public String register(@RequestParam("title") String title) {
+        articleService.register(title);
+        return "ok";
+    }
+
+    @GetMapping("/v2/health")
+    public String health() {
+        return "up";
+    }
+}</code></pre>
+<p>설정 클래스 <code>AppV2Config</code>는 v1과 같은 모양으로 세 객체를 <code>new</code>로 만들어 <code>@Bean</code>으로 등록한다. <code>ArticleControllerV2</code>에는 <code>@RestController</code>가 붙어 있으므로 이 패키지가 스캔 범위 안에 있으면 컴포넌트 스캔이 진짜 클래스를 빈으로 한 번 더 등록하려 한다. v2를 스캔 범위 밖에 두는 이유다.</p>
+
+<h4>v3: 컴포넌트 스캔</h4>
+<pre><code class="language-java">@Repository
+public class ArticleRepositoryV3 {
+    public void save(String title) { /* v2와 같은 내용 */ }
+}
+
+@Service
+public class ArticleServiceV3 {
+    private final ArticleRepositoryV3 articleRepository;
+
+    public ArticleServiceV3(ArticleRepositoryV3 articleRepository) {
+        this.articleRepository = articleRepository;
+    }
+
+    public void register(String title) {
+        articleRepository.save(title);
+    }
+}
+
+@RestController
+public class ArticleControllerV3 {
+    private final ArticleServiceV3 articleService;
+
+    public ArticleControllerV3(ArticleServiceV3 articleService) {
+        this.articleService = articleService;
+    }
+
+    @PostMapping("/v3/articles")
+    public String register(@RequestParam("title") String title) {
+        articleService.register(title);
+        return "ok";
+    }
+
+    @GetMapping("/v3/health")
+    public String health() {
+        return "up";
+    }
+}</code></pre>
+<p>마지막으로 애플리케이션 클래스에서 스캔 범위와 직접 가져올 설정 클래스를 지정한다. <code>@SpringBootApplication</code>의 <code>scanBasePackages</code> 속성은 컴포넌트 스캔의 시작 패키지를 정하고, <code>@Import</code>는 스캔과 상관없이 지정한 설정 클래스를 등록한다. 설정 클래스를 스캔 범위 밖에 두고 <code>@Import</code>로 고르게 하면, 뒤에서 프록시를 적용한 설정 클래스로 바꿀 때 <code>@Import</code> 한 줄만 고치면 된다.</p>
+<pre><code class="language-java">@Import({AppV1Config.class, AppV2Config.class})
+@SpringBootApplication(scanBasePackages = "lab.app.v3")
+public class ProxyApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ProxyApplication.class, args);
+    }
+}</code></pre>
+
+<h3>요구사항 추가 — 무엇을 지켜야 하는가</h3>
+<p>이제 세 벌의 예제에 로그 추적기를 붙인다. 요구사항을 분명히 적어 두자. 이 목록이 이 회차와 다음 몇 회차가 만족시켜야 하는 기준이다.</p>
+<ol>
+<li><b>원본 코드를 고치지 않는다.</b> v1, v2, v3의 컨트롤러·서비스·리포지토리 소스는 한 줄도 바꾸지 않는다. 로그 추적기를 부르는 코드도 원본에 넣지 않는다.</li>
+<li><b>특정 메서드는 로그를 남기지 않는다.</b> 상태 확인용 <code>health()</code>처럼 자주 불리고 기록할 가치가 없는 메서드는 제외할 수 있어야 한다.</li>
+<li><b>세 형태 모두에 적용한다.</b> 인터페이스가 있는 수동 등록 빈, 인터페이스가 없는 수동 등록 빈, 컴포넌트 스캔으로 등록된 빈 모두에 같은 기능이 붙어야 한다.</li>
+<li><b>로그의 모양은 01회와 같아야 한다.</b> 요청 하나가 컨트롤러에서 리포지토리까지 내려가는 동안 같은 ID로 묶이고 깊이에 따라 들여 써져야 하며, 예외가 나면 예외 로그를 남기고 예외는 원래대로 전파되어야 한다.</li>
+</ol>
+<p>1번이 가장 강한 조건이다. 01~02회의 방법은 모두 원본 메서드 안에 무언가를 넣었다. 1번을 지키려면 메서드 <b>안</b>이 아니라 메서드 <b>바깥</b>, 곧 호출하는 객체와 호출되는 객체 사이에 코드를 둘 자리가 있어야 한다. 그 자리를 만드는 기술이 프록시다.</p>
+
+<h3>프록시란 무엇인가 — 클라이언트와 서버 사이에 서는 대리인</h3>
+<p>객체 사이의 호출을 클라이언트(client)와 서버(server)라는 말로 일반화해 보자. 네트워크의 클라이언트·서버만이 아니라, 일을 요청하는 객체는 클라이언트이고 요청을 받아 처리하는 객체는 서버다. 컨트롤러가 서비스를 부를 때 컨트롤러는 클라이언트, 서비스는 서버다. 서비스가 리포지토리를 부를 때는 서비스가 클라이언트가 된다.</p>
+<p>보통은 클라이언트가 서버를 직접 호출한다. 이것을 직접 호출이라 하자. 반대로 클라이언트가 서버를 직접 부르지 않고 어떤 대리자를 통해 간접적으로 부를 수도 있다. 이 대리자를 프록시라 한다. 프록시는 받은 요청을 서버에 그대로 넘길 수도 있고, 넘기기 전후에 다른 일을 할 수도 있고, 아예 넘기지 않고 직접 응답할 수도 있다.</p>
+<pre class="diagram">직접 호출
+  Client ───────────────────────────▶ Server
+
+간접 호출
+  Client ──────▶ Proxy ─────────────▶ Server
+                  │
+                  ├ 넘기기 전에: 권한 확인, 로그 시작, 시간 측정 시작
+                  ├ 넘기지 않고: 캐시에 있으면 바로 응답, 권한 없으면 거절
+                  └ 넘긴 후에:  결과 꾸미기, 로그 종료, 시간 기록
+
+프록시 체인
+  Client ──▶ Proxy A ──▶ Proxy B ──▶ Server</pre>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>대표 번호의 비서</strong><p>부서장에게 직접 전화하는 대신 대표 번호로 걸면 비서가 받는다. 비서는 용건을 듣고 부서장에게 연결하기도 하고, 이미 메모해 둔 답이 있으면 바로 알려 주기도 하고, 권한이 없는 사람이면 연결을 거절하기도 하며, 통화가 끝나면 기록을 남기기도 한다. 전화를 건 사람은 같은 번호로 같은 방식으로 말할 뿐이다. 비유가 깨지는 지점도 있다. 비서는 자기 판단으로 무엇이든 할 수 있는 사람이지만, 객체 프록시는 서버와 <b>똑같은 메서드 목록</b>을 가진 객체여야 한다. 클라이언트는 상대가 프록시인지 서버인지 구분할 수 없어야 하기 때문이다.</p></aside>
+<p>비유의 마지막 문장이 객체 세계에서 프록시가 성립하는 조건이다. 클라이언트는 서버에 요청했는지 프록시에 요청했는지 몰라야 한다. 이것을 코드의 언어로 바꾸면 <b>프록시와 서버가 같은 타입</b>이어야 하고, 클라이언트는 <b>그 타입에만 의존</b>해야 한다는 뜻이다. 클라이언트가 <code>ArticleServiceV1Impl</code>이라는 구현 클래스 타입의 필드를 들고 있으면, 그 필드에는 <code>ArticleServiceV1Impl</code>이나 그 하위 클래스의 객체만 들어갈 수 있다. 클라이언트가 <code>ArticleServiceV1</code> 인터페이스 타입의 필드를 들고 있으면 그 인터페이스를 구현한 어떤 객체든 들어갈 수 있다. 기본편에서 다룬 다형성과 의존관계 역전 원칙(DIP)이 프록시가 설 자리를 만드는 셈이다.</p>
+<p>프록시라는 말은 네트워크에서도 쓰인다. HTTP 웹 기본 지식 권에서 본 프록시 캐시 서버는 클라이언트와 원 서버 사이에 서서 같은 HTTP 메시지를 주고받으며, 캐시가 신선하면 원 서버까지 가지 않고 응답한다. 이 회차에서 다루는 것은 같은 생각을 한 프로세스 안의 객체 사이에 적용한 것이다. 규모는 다르지만 구조는 같다. 대신 서는 쪽이 원래 상대와 같은 말을 하고, 그래서 요청하는 쪽은 아무것도 바꾸지 않아도 된다.</p>
+
+<h4>프록시가 하는 일은 두 갈래다</h4>
+<p>프록시가 중간에서 하는 일은 크게 두 갈래로 나뉜다.</p>
+<ul>
+<li><b>접근 제어(access control).</b> 서버에 대한 접근 자체를 통제한다. 권한이 없으면 서버까지 가지 않게 막고, 이미 받아 둔 결과가 있으면 서버를 부르지 않고 그 결과를 돌려주며(캐싱), 비용이 큰 서버 객체를 실제로 필요한 순간까지 만들지 않고 미룬다(지연 로딩). JPA 기본편에서 본 <code>em.getReference()</code>가 돌려주는 객체가 마지막 경우의 예다. 하이버네이트가 돌려주는 초기화되지 않은 프록시는 처음에는 식별자만 들고 있다가, 데이터가 필요한 방식으로 처음 쓰일 때 데이터베이스를 조회한다.</li>
+<li><b>부가 기능 추가.</b> 서버가 하는 일은 그대로 두고 그 위에 기능을 얹는다. 요청과 응답을 기록하고, 실행 시간을 재고, 응답 값을 변형하거나 꾸민다. 우리가 붙이려는 로그 추적기는 여기에 속한다.</li>
+</ul>
+<p>GoF의 『디자인 패턴』(1994)은 이 두 갈래를 서로 다른 패턴으로 분류했다. 프록시 패턴(Proxy pattern)의 의도는 다른 객체에 대한 접근을 제어하기 위해 그 객체의 대리자를 두는 것이고, 데코레이터 패턴(Decorator pattern)의 의도는 객체에 책임을 동적으로 덧붙이는 것, 그리고 그것을 하위 클래스를 만드는 방식보다 유연하게 하는 것이다. 두 패턴 모두 프록시라는 기술을 쓴다. 그래서 둘의 코드 모양은 거의 같다. 어떻게 다른지는 예제를 둘 다 만들어 본 뒤에 정리한다.</p>
+
+<h3>프록시 패턴 — 캐시 프록시로 접근을 제어하기</h3>
+<p>먼저 접근 제어의 대표인 캐시 프록시를 만든다. 시세를 조회하는 서버 객체가 있고, 이 조회는 원격 서버에 다녀오느라 1초가 걸린다고 하자. 같은 통화 코드를 여러 번 물어도 값이 자주 바뀌지 않는다면, 처음 한 번만 진짜 조회를 하고 그 뒤로는 받아 둔 값을 돌려주고 싶다. 조건은 같다. 시세를 쓰는 클라이언트 코드는 바꾸지 않는다.</p>
+<pre><code class="language-java">public interface QuoteSource {
+    String quote(String code);
+}
+
+public class SlowQuoteSource implements QuoteSource {
+
+    @Override
+    public String quote(String code) {
+        System.out.println("SlowQuoteSource 실행: " + code);
+        sleep(1000); // 원격 시세 서버에 다녀오는 시간이라고 치자
+        return code + "=" + (code.length() * 1250);
+    }
+
+    private void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+
+public class QuoteClient {
+
+    private final QuoteSource source;   // 인터페이스에만 의존한다
+
+    public QuoteClient(QuoteSource source) {
+        this.source = source;
+    }
+
+    public String show(String code) {
+        return "[시세] " + source.quote(code);
+    }
+}</code></pre>
+<p>프록시는 서버와 같은 인터페이스를 구현하고, 진짜 객체의 참조를 필드로 가진다. 이 필드의 이름을 흔히 타깃(target)이라 부른다. 캐시에 값이 있으면 타깃을 부르지 않고 바로 돌려주고, 없으면 타깃에 위임한 뒤 결과를 저장한다.</p>
+<pre><code class="language-java">import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class CachingQuoteSource implements QuoteSource {
+
+    private final QuoteSource target;                 // 진짜 객체(또는 다음 프록시)
+    private final Map<String, String> cache = new ConcurrentHashMap<>();
+
+    public CachingQuoteSource(QuoteSource target) {
+        this.target = target;
+    }
+
+    @Override
+    public String quote(String code) {
+        String cached = cache.get(code);
+        if (cached != null) {
+            System.out.println("CachingQuoteSource 캐시 적중: " + code);
+            return cached;
+        }
+        System.out.println("CachingQuoteSource 캐시 없음, 위임: " + code);
+        String value = target.quote(code);
+        cache.put(code, value);
+        return value;
+    }
+}
+
+public class ProxyMain {
+    public static void main(String[] args) {
+        System.out.println("== 프록시 없이 ==");
+        run(new QuoteClient(new SlowQuoteSource()));
+
+        System.out.println("== 캐시 프록시를 끼워서 ==");
+        QuoteSource real = new SlowQuoteSource();
+        QuoteSource proxy = new CachingQuoteSource(real);
+        run(new QuoteClient(proxy));
+    }
+
+    static void run(QuoteClient client) {
+        long start = System.currentTimeMillis();
+        System.out.println(client.show("KRW"));
+        System.out.println(client.show("KRW"));
+        System.out.println(client.show("KRW"));
+        long elapsed = System.currentTimeMillis() - start;
+        System.out.println("걸린 시간: 약 " + (elapsed / 1000) + "초");
+    }
+}</code></pre>
+<pre data-label="실행 결과 (JDK 21.0.13)"><code class="language-text">== 프록시 없이 ==
+SlowQuoteSource 실행: KRW
+[시세] KRW=3750
+SlowQuoteSource 실행: KRW
+[시세] KRW=3750
+SlowQuoteSource 실행: KRW
+[시세] KRW=3750
+걸린 시간: 약 3초
+== 캐시 프록시를 끼워서 ==
+CachingQuoteSource 캐시 없음, 위임: KRW
+SlowQuoteSource 실행: KRW
+[시세] KRW=3750
+CachingQuoteSource 캐시 적중: KRW
+[시세] KRW=3750
+CachingQuoteSource 캐시 적중: KRW
+[시세] KRW=3750
+걸린 시간: 약 1초</code></pre>
+<p>한 줄씩 따라가 보자. 두 번째 <code>run</code>에서 <code>QuoteClient</code>의 <code>source</code> 필드는 <code>CachingQuoteSource</code> 객체를 가리킨다. 첫 <code>show("KRW")</code>는 <code>source.quote("KRW")</code>를 부르고, 이 호출은 프록시의 <code>quote</code>로 들어간다. 캐시가 비어 있으므로 "캐시 없음, 위임"을 찍고 <code>target.quote</code>를 부른다. 여기서 비로소 <code>SlowQuoteSource</code>가 실행되어 1초를 쓰고 "KRW=3750"을 돌려준다("KRW"는 세 글자이므로 3 × 1250). 프록시는 이 값을 캐시에 넣고 돌려준다. 두 번째와 세 번째 호출은 캐시에서 값을 찾아 바로 돌려주므로 <code>SlowQuoteSource</code>는 한 번만 실행된다. 걸린 시간은 실행 환경마다 몇 밀리초씩 다르지만 초 단위로는 3초와 1초다.</p>
+<p>바뀐 것은 <code>main</code>의 조립 코드 두 줄뿐이다. <code>QuoteClient</code>와 <code>SlowQuoteSource</code>의 소스는 그대로다. 실행 중의 객체 그림을 그리면 다음과 같다.</p>
+<pre class="diagram">  힙(heap)
+
+  QuoteClient                CachingQuoteSource                SlowQuoteSource
+  ┌──────────────┐           ┌─────────────────────┐           ┌──────────────┐
+  │ source ──────┼──────────▶│ target ─────────────┼──────────▶│ (필드 없음)  │
+  └──────────────┘           │ cache ──▶ ConcurrentHashMap     └──────────────┘
+                             │           { "KRW" → "KRW=3750" }
+                             └─────────────────────┘
+
+  클라이언트가 보는 타입: QuoteSource
+  실제로 가리키는 객체:   CachingQuoteSource → 그 안의 target이 SlowQuoteSource</pre>
+<p>이 프록시는 타깃에 일을 넘기지 않는 경우가 있다는 점에서 접근 제어다. 캐시 적중이면 서버는 호출 사실조차 모른다. 권한 검사 프록시라면 권한이 없을 때 예외를 던지고 타깃을 부르지 않을 것이고, 지연 로딩 프록시라면 타깃 객체를 처음 호출되는 순간에 만들 것이다. 셋 다 "서버에 언제, 어떻게 닿을지"를 프록시가 정한다.</p>
+
+<h4>공유되는 프록시는 스레드 안전해야 한다</h4>
+<p>예제에서 캐시를 <code>HashMap</code>이 아니라 <code>ConcurrentHashMap</code>으로 둔 데는 이유가 있다. 이 프록시를 스프링 빈으로 등록하면 싱글톤이 되고, 톰캣의 여러 작업 스레드가 동시에 같은 프록시 객체의 <code>quote</code>를 부른다. 01회에서 본 것처럼 여러 스레드가 함께 쓰는 객체의 변경 가능한 필드는 동시성 문제의 원천이다. <code>HashMap</code>은 동시 수정을 전제로 만들어진 자료구조가 아니므로 여러 스레드가 동시에 <code>put</code>하면 내부 구조가 깨질 수 있다.</p>
+<p><code>ConcurrentHashMap</code>으로 바꿔도 남는 경쟁이 하나 있다. <code>get</code>으로 확인하고 없으면 타깃을 불러 <code>put</code>하는 "확인 후 실행(check-then-act)" 흐름은 두 단계로 나뉘어 있다. 두 스레드가 거의 동시에 같은 키로 들어오면 둘 다 캐시가 비었다고 보고 둘 다 타깃을 부를 수 있다. 캐시라면 대개 받아들일 만한 결과다. 같은 값을 두 번 가져와 같은 값을 두 번 넣을 뿐이다. 반드시 한 번만 불러야 한다면 <code>computeIfAbsent</code>를 쓸 수 있다. 이 메서드의 Javadoc은 호출 전체가 원자적으로 수행되고 키가 없을 때 매핑 함수가 정확히 한 번 호출된다고 보장하지만, 계산이 진행되는 동안 다른 스레드의 일부 갱신이 막힐 수 있으므로 계산은 짧고 단순해야 한다고 경고한다. 1초짜리 원격 호출을 그 안에 넣으면 이 경고에 정면으로 걸린다. 어느 쪽을 고를지는 중복 호출의 비용과 대기의 비용을 비교해서 정한다.</p>
+<p>반면 <code>target</code> 필드는 <code>final</code>이고 생성자에서 한 번 정해진 뒤 바뀌지 않는다. JLS §17.5는 생성자가 끝나 완전히 초기화된 뒤에 그 객체의 참조를 본 스레드는 <code>final</code> 필드의 올바르게 초기화된 값을 보게 된다고 보장한다. 이 회차에서 만드는 모든 프록시가 타깃과 로그 추적기를 <code>final</code> 필드로 들고, 요청마다 달라지는 상태는 필드가 아니라 <code>ThreadLocal</code>(01회)에 두는 이유다.</p>
+
+<h3>데코레이터 패턴 — 결과를 꾸미고 시간을 재는 장식들</h3>
+<p>이번에는 부가 기능 추가의 예를 만든다. 문자열을 다듬어 돌려주는 <code>Formatter</code>가 있고, 그 결과를 괄호로 감싸는 장식과 실행 시간을 재는 장식을 붙이고 싶다. 데코레이터도 프록시와 똑같이 같은 인터페이스를 구현하고, 다음 객체의 참조를 필드로 가진다. 다만 이 회차의 예에서 데코레이터들은 언제나 다음 객체를 부르고, 그 앞뒤에서 무언가를 더한다.</p>
+<pre><code class="language-java">public interface Formatter {
+    String format(String text);
+}
+
+public class PlainFormatter implements Formatter {
+    @Override
+    public String format(String text) {
+        System.out.println("PlainFormatter 실행");
+        return text;
+    }
+}
+
+public class BracketDecorator implements Formatter {
+
+    private final Formatter inner;
+
+    public BracketDecorator(Formatter inner) {
+        this.inner = inner;
+    }
+
+    @Override
+    public String format(String text) {
+        System.out.println("BracketDecorator 실행");
+        String result = inner.format(text);
+        String decorated = "<<" + result + ">>";
+        System.out.println("BracketDecorator 꾸미기 전=" + result + ", 후=" + decorated);
+        return decorated;
+    }
+}
+
+public class TimingDecorator implements Formatter {
+
+    private final Formatter inner;
+
+    public TimingDecorator(Formatter inner) {
+        this.inner = inner;
+    }
+
+    @Override
+    public String format(String text) {
+        System.out.println("TimingDecorator 실행");
+        long start = System.nanoTime();
+        String result = inner.format(text);
+        long micros = (System.nanoTime() - start) / 1_000;
+        System.out.println("TimingDecorator 종료 걸린시간=" + micros + "us");
+        return result;
+    }
+}
+
+public class DecoMain {
+    public static void main(String[] args) {
+        Formatter chain = new TimingDecorator(new BracketDecorator(new PlainFormatter()));
+        System.out.println("결과=" + chain.format("hello"));
+        System.out.println("---- 순서를 바꾸면 ----");
+        Formatter swapped = new BracketDecorator(new TimingDecorator(new PlainFormatter()));
+        System.out.println("결과=" + swapped.format("hello"));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (걸린 시간은 실행마다 다르다)"><code class="language-text">TimingDecorator 실행
+BracketDecorator 실행
+PlainFormatter 실행
+BracketDecorator 꾸미기 전=hello, 후=<<hello>>
+TimingDecorator 종료 걸린시간=10395us
+결과=<<hello>>
+---- 순서를 바꾸면 ----
+BracketDecorator 실행
+TimingDecorator 실행
+PlainFormatter 실행
+TimingDecorator 종료 걸린시간=15us
+BracketDecorator 꾸미기 전=hello, 후=<<hello>>
+결과=<<hello>></code></pre>
+<p>첫 번째 체인의 호출 흐름을 스택 프레임으로 따라가 보자. <code>main</code>이 <code>chain.format("hello")</code>를 부르면 <code>TimingDecorator.format</code> 프레임이 쌓이고, 시작 시각을 잰 뒤 <code>inner.format</code>을 부른다. 그 위에 <code>BracketDecorator.format</code> 프레임이 쌓이고, 다시 <code>inner.format</code>을 불러 <code>PlainFormatter.format</code> 프레임이 쌓인다. 가장 안쪽이 "hello"를 돌려주면 스택이 거꾸로 풀리면서 <code>BracketDecorator</code>가 괄호를 씌우고, 마지막으로 <code>TimingDecorator</code>가 걸린 시간을 찍는다. "실행" 로그는 바깥에서 안쪽 순서로, "꾸미기"와 "종료" 로그는 안쪽에서 바깥 순서로 나오는 것이 바로 이 스택 구조 때문이다.</p>
+<pre class="diagram">  호출 (스택이 쌓인다)                    반환 (스택이 풀린다)
+  main                                     main ◀── "<<hello>>"
+   └▶ TimingDecorator.format  시작 시각      ▲   TimingDecorator  종료 시각 출력
+       └▶ BracketDecorator.format            ▲   BracketDecorator "hello" → "<<hello>>"
+           └▶ PlainFormatter.format ─────────┘   PlainFormatter   "hello"</pre>
+<p>순서를 바꾼 두 번째 체인에서도 최종 결과는 같다. 그러나 측정 대상이 다르다. 바깥에 있는 데코레이터는 그 안쪽 전체를 감싸므로, <code>TimingDecorator</code>가 바깥에 있으면 괄호 씌우기까지 포함한 시간을 재고, 안쪽에 있으면 <code>PlainFormatter</code>만의 시간을 잰다. 데코레이터 체인에서 순서는 의미를 가진다. 결과를 바꾸는 장식(괄호, 압축, 암호화)끼리라면 순서에 따라 결과 자체가 달라진다. 압축한 뒤 암호화하는 것과 암호화한 뒤 압축하는 것은 다른 바이트열을 만든다.</p>
+
+<h4>첫 측정만 10밀리초가 나온 이유</h4>
+<p>실행 결과에서 첫 체인은 약 10밀리초, 두 번째 체인은 15마이크로초가 걸렸다. 같은 일을 하는데 거의 700배 차이가 난다. 체인 순서 때문이 아니다. 같은 프로그램을 세 번 실행했을 때 첫 측정은 매번 10밀리초 안팎(9.9~11.0밀리초)이었고 두 번째 측정은 매번 15마이크로초 이하였다. 원인은 바깥 체인의 <code>TimingDecorator</code>가 감싼 구간에서 <b>처음 실행되는 코드</b>가 있다는 것이다. <code>BracketDecorator</code> 안의 문자열 더하기를 <code>javap -c</code>로 보면 <code>invokedynamic</code> 명령으로 컴파일되어 있다.</p>
+<pre data-label="javap -c BracketDecorator (일부)"><code class="language-text">13: invokeinterface #27,  2   // InterfaceMethod Formatter.format:(Ljava/lang/String;)Ljava/lang/String;
+20: invokedynamic #33,  0     // InvokeDynamic #0:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+31: invokedynamic #36,  0     // InvokeDynamic #1:makeConcatWithConstants:(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;</code></pre>
+<p>JDK 21의 javac 소스(<code>com.sun.tools.javac.jvm.StringConcat</code>)를 보면, 컴파일 대상 플랫폼에 <code>StringConcatFactory</code>(JDK 9에서 추가된 클래스)가 있을 때 문자열 <code>+</code> 연산의 기본 전략은 <code>indyWithConstants</code>이고, <code>StringBuilder.append</code> 사슬을 내보내는 예전 방식은 <code>inline</code>이라는 이름으로 남아 있다. <code>StringConcatFactory</code>의 Javadoc은 이 클래스의 메서드가 문자열 연결 기능을 지원하는 <code>invokedynamic</code> 호출 지점의 부트스트랩 메서드로 쓰인다고 설명한다. JVMS §6.5의 <code>invokedynamic</code> 설명에 따르면 이 명령의 심볼릭 참조는 그 명령 하나에 대해 해석되어 <code>CallSite</code> 객체를 얻고, 그 <code>CallSite</code>는 그 명령에 "묶인다(bound)". HotSpot에서는 이 해석이 명령이 처음 실행될 때 일어나므로, 그때 부트스트랩 메서드가 호출되어 연결 코드를 만드는 비용이 한 번 들고, 그다음부터는 묶인 호출 지점을 쓴다. 실제로 같은 소스를 javac의 비표준 내부 옵션 <code>-XDstringConcat=inline</code>(<code>StringBuilder</code> 방식으로 컴파일)으로 컴파일해 다시 재 보니, 이 환경에서 첫 측정이 70마이크로초 안팎으로 내려갔다.</p>
+<p>이 관찰이 프록시 이야기에서 중요한 이유는 시간을 재는 부가 기능이 <b>자기가 감싼 모든 것</b>을 잰다는 점 때문이다. 클래스 로딩, 호출 지점 연결, 해석 실행에서 JIT 컴파일로 넘어가는 과정까지 첫 요청에는 한 번만 드는 비용이 섞인다. 로그 추적기로 애플리케이션 첫 요청의 시간이 유난히 길게 찍히는 것을 보면, 그 시간의 상당 부분이 이런 일회성 비용일 수 있다는 것을 먼저 의심해야 한다.</p>
+
+<h4>중복을 걷어 낸 추상 데코레이터</h4>
+<p>데코레이터가 늘어나면 모든 데코레이터에 "다음 객체를 들고 있는 필드와 그것을 받는 생성자"가 반복된다. 이것을 추상 클래스 하나로 올리면 GoF가 그린 데코레이터 패턴의 구조가 그대로 나온다.</p>
+<pre><code class="language-java">public abstract class FormatterDecorator implements Formatter {
+
+    protected final Formatter inner;   // 모든 데코레이터가 공통으로 갖는 "다음 객체"
+
+    protected FormatterDecorator(Formatter inner) {
+        this.inner = inner;
+    }
+}
+
+public class TrimDecorator extends FormatterDecorator {
+    public TrimDecorator(Formatter inner) { super(inner); }
+
+    @Override
+    public String format(String text) {
+        return inner.format(text.strip());
+    }
+}
+
+public class UpperDecorator extends FormatterDecorator {
+    public UpperDecorator(Formatter inner) { super(inner); }
+
+    @Override
+    public String format(String text) {
+        return inner.format(text).toUpperCase();
+    }
+}
+
+// 사용: new UpperDecorator(new TrimDecorator(text -> "[" + text + "]")).format("  hi  ")  →  "[HI]"</code></pre>
+<pre class="diagram">            ┌───────────────────────┐
+            │  «interface»          │◀─────────────────────────────┐
+            │  Formatter            │                              │ inner (다음 객체)
+            │  format(String)       │                              │
+            └───────────────────────┘                              │
+               ▲                 ▲                                 │
+   implements  │                 │ implements                      │
+ ┌─────────────┴──────┐   ┌──────┴──────────────────────┐          │
+ │ PlainFormatter     │   │ «abstract» FormatterDecorator│──────────┘
+ │ (핵심 기능)        │   │ protected final Formatter inner
+ └────────────────────┘   └──────────────────────────────┘
+                              ▲                 ▲
+                              │ extends         │ extends
+                     ┌────────┴───────┐  ┌──────┴────────┐
+                     │ TrimDecorator  │  │ UpperDecorator│
+                     └────────────────┘  └───────────────┘</pre>
+<p>추상 클래스를 두면 코드 중복이 줄어드는 것보다 더 중요한 효과가 있다. 클래스 다이어그램만 보고도 어느 것이 핵심 기능이고 어느 것이 장식인지 구분된다. <code>FormatterDecorator</code>를 상속한 것은 모두 "다른 <code>Formatter</code>를 감싸는 것"이라는 사실이 타입으로 드러난다.</p>
+
+<h4>상속 대신 조합 — JDK의 입출력 스트림</h4>
+<p>왜 하위 클래스를 만들지 않고 감싸는가. 괄호, 시간 측정, 공백 제거, 대문자화라는 네 가지 장식을 상속으로 조합하려면 필요한 조합마다 하위 클래스가 하나씩 있어야 한다. 장식이 n개면 가능한 부분집합은 2의 n제곱 개이고, 순서까지 따지면 더 많다. 감싸기 방식이면 장식 n개를 각각 한 클래스로 만들어 두고 실행 중에 원하는 순서로 끼워 맞추면 된다. 조합은 컴파일할 때가 아니라 객체를 조립할 때 정해진다. GoF가 데코레이터를 "하위 클래스를 만드는 방식보다 유연한 대안"이라고 부른 이유다.</p>
+<p>JDK의 <code>java.io</code>가 이 구조로 되어 있다. JDK 21 소스에서 <code>FilterInputStream</code>은 <code>InputStream</code>을 상속하면서 <code>protected volatile InputStream in</code> 필드로 다른 스트림을 감싸고, <code>read()</code>는 <code>return in.read();</code> 한 줄로 위임한다. 앞의 <code>FormatterDecorator</code>와 같은 자리에 있는 추상 데코레이터다. <code>BufferedInputStream</code>과 <code>DataInputStream</code>은 <code>FilterInputStream</code>을 상속한 구체 데코레이터다. 그래서 다음처럼 겹겹이 감쌀 수 있다.</p>
+<pre><code class="language-java">try (DataInputStream in = new DataInputStream(          // 기본형 값을 읽는 기능을 더한다
+        new BufferedInputStream(                        // 버퍼링을 더한다
+            new FileInputStream("data.bin")))) {         // 실제로 파일에서 바이트를 읽는 핵심
+    int version = in.readInt();
+    // ...
+}</code></pre>
+<p><code>DataInputStream</code>의 <code>readInt()</code>는 안쪽 스트림에서 4바이트를 읽어 <code>int</code>로 합치고, 안쪽의 <code>BufferedInputStream</code>은 파일 스트림에서 큰 덩어리로 읽어 둔 버퍼에서 바이트를 내준다. 맨 안쪽의 <code>FileInputStream</code>은 이 장식들의 존재를 모른다.</p>
+
+<h3>둘을 가르는 것은 모양이 아니라 의도다</h3>
+<p>두 예제를 나란히 놓으면 코드의 뼈대가 같다는 것이 보인다. 둘 다 서버와 같은 인터페이스를 구현하고, 다음 객체의 참조를 필드로 갖고, 메서드 안에서 그 참조로 위임한다. 클라이언트는 둘 다 모른다. 그런데 하나는 프록시 패턴이고 하나는 데코레이터 패턴이라고 부른다. 구분의 기준은 코드가 아니라 <b>의도</b>다.</p>
+<div class="table-wrap"><table><thead><tr><th>구분</th><th>프록시 패턴</th><th>데코레이터 패턴</th></tr></thead><tbody>
+<tr><td>의도</td><td>다른 객체에 대한 접근을 제어한다</td><td>객체에 책임(기능)을 동적으로 덧붙인다</td></tr>
+<tr><td>타깃 호출</td><td>부르지 않을 수도 있다(캐시 적중, 권한 없음), 부르는 시점을 늦출 수도 있다(지연 로딩)</td><td>보통 언제나 부르고, 그 앞뒤에서 무언가를 더한다</td></tr>
+<tr><td>결과</td><td>타깃의 결과를 그대로 돌려주거나, 타깃 대신 응답한다</td><td>타깃의 결과를 꾸미거나, 부가 작업을 하고 그대로 돌려준다</td></tr>
+<tr><td>예</td><td>캐시, 권한 검사, 지연 로딩, 원격 객체의 대리자</td><td>로그, 실행 시간 측정, 버퍼링, 응답 변환</td></tr>
+<tr><td>JDK의 예</td><td><code>Collections.unmodifiableList</code>가 돌려주는 래퍼</td><td><code>BufferedInputStream</code>, <code>DataInputStream</code></td></tr>
+</tbody></table></div>
+<p><code>Collections.unmodifiableList</code>는 접근 제어의 예로 볼 수 있다. JDK 21 소스에서 이 메서드는 받은 리스트를 <code>UnmodifiableList</code>(또는 <code>UnmodifiableRandomAccessList</code>) 객체로 감싸 돌려주는데, 그 상위의 <code>UnmodifiableCollection</code>은 감싼 컬렉션을 <code>final Collection<? extends E> c</code> 필드로 들고 조회 메서드는 <code>c</code>에 위임하며, <code>add</code>처럼 변경하는 메서드는 위임하지 않고 <code>UnsupportedOperationException</code>을 던진다. 타깃에 닿을 수 있는 호출과 닿을 수 없는 호출을 래퍼가 가른다.</p>
+<p>현실의 코드는 이 표처럼 깔끔하게 나뉘지 않는다. 캐시 프록시가 캐시 적중 횟수를 기록하는 일까지 한다면 접근 제어와 부가 기능을 동시에 하는 셈이다. 그래서 다음 두 가지를 구분해 두는 것이 실용적이다. <b>프록시</b>는 "클라이언트가 모르게 대신 서는 객체"라는 <b>기술</b>의 이름이고, <b>프록시 패턴</b>과 <b>데코레이터 패턴</b>은 그 기술을 어떤 <b>의도</b>로 쓰느냐에 붙은 이름이다. 이 기준으로 보면 우리가 만들 로그 추적기는 의도로는 데코레이터에 가깝다. 타깃을 언제나 부르고 그 앞뒤에서 기록만 하기 때문이다. 스프링을 비롯한 프레임워크 문서는 이런 객체를 의도와 상관없이 기술의 이름을 따라 프록시라고 부르고, 이 강좌도 그렇게 부른다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>프록시가 성립하는 조건은 단 하나, 클라이언트가 구체 구현이 아니라 <b>추상 타입에 의존</b>하고 그 참조에 들어갈 객체를 <b>바깥에서 정한다</b>는 것이다. 이 조건이 갖춰지면 원본의 소스를 건드리지 않고 그 앞에 몇 겹이든 객체를 세울 수 있다. 세운 객체가 접근을 통제하면 프록시 패턴, 기능을 덧붙이면 데코레이터 패턴이다.</p></aside>
+
+<h3>한 층 아래 — 프록시를 끼워도 클라이언트의 바이트코드는 그대로다</h3>
+<p>조립 코드만 바꾸면 클라이언트를 다시 컴파일하지 않아도 프록시가 끼어든다. 이것이 JVM 수준에서 어떻게 가능한지 확인해 보자. <code>QuoteClient.show</code>를 <code>javap -c</code>로 열어 본다.</p>
+<pre data-label="javap -c QuoteClient (show 메서드)"><code class="language-text">public java.lang.String show(java.lang.String);
+  Code:
+     0: aload_0
+     1: getfield      #7     // Field source:LQuoteSource;
+     4: aload_1
+     5: invokeinterface #13,  2   // InterfaceMethod QuoteSource.quote:(Ljava/lang/String;)Ljava/lang/String;
+    10: invokedynamic #19,  0     // InvokeDynamic #0:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+    15: areturn</code></pre>
+<p>바이트코드가 가리키는 것은 <code>QuoteSource.quote</code>라는 <b>인터페이스 메서드의 심볼릭 참조</b>다. 클래스 파일 어디에도 <code>SlowQuoteSource</code>나 <code>CachingQuoteSource</code>라는 이름은 없다. 실제로 어떤 코드가 실행될지는 실행할 때 정해진다. JVMS §6.5의 <code>invokeinterface</code> 설명은 피연산자 스택에 놓인 객체 참조(objectref)의 클래스를 C라 하고, C와 해석된 메서드를 기준으로 실행할 메서드를 선택한다(§5.4.6 메서드 선택)고 적는다. <code>getfield</code>로 꺼낸 <code>source</code>가 <code>SlowQuoteSource</code> 객체면 그 클래스의 <code>quote</code>가, <code>CachingQuoteSource</code> 객체면 프록시의 <code>quote</code>가 선택된다.</p>
+<p>그러니 클라이언트의 클래스 파일은 한 번 컴파일된 그대로 두고, <code>source</code> 필드에 어떤 객체가 들어가느냐만 바꾸면 된다. 그 필드에 무엇을 넣을지는 생성자 인자로 들어오므로 조립하는 쪽이 정한다. 프록시가 원본 코드를 고치지 않고 끼어들 수 있는 근거를 가장 아래에서 말하면 이것이다. <b>호출 명령은 메서드를 이름과 타입으로만 가리키고, 실제 실행할 코드는 객체의 런타임 클래스로 고른다.</b> 구체 클래스 타입으로 호출하는 <code>invokevirtual</code>도 같은 규칙을 따른다. 뒤의 구체 클래스 기반 프록시가 성립하는 근거도 이것이다.</p>
+<p>메모리 관점에서 보면 프록시는 특별한 객체가 아니다. 참조 필드 몇 개를 가진 평범한 힙 객체이고, 프록시 체인은 참조로 이어진 객체의 연결 리스트다. 호출이 일어나면 체인의 객체 수만큼 스택 프레임이 더 쌓인다. 프록시가 하나 끼면 클라이언트 프레임과 서버 프레임 사이에 프록시 프레임이 하나 더 들어가고, 서버에서 예외가 나면 스택이 풀리면서 그 예외가 프록시 프레임을 지나 클라이언트로 올라간다. 프록시가 예외를 가로채 기록하고 다시 던질 수 있는 것도, 예외 처리가 스택 프레임 단위로 일어나기 때문이다.</p>
+<pre class="diagram">  스레드의 JVM 스택 (위가 최근 프레임)
+
+  ┌───────────────────────────────┐
+  │ SlowQuoteSource.quote         │  ← 실제 일
+  ├───────────────────────────────┤
+  │ CachingQuoteSource.quote      │  ← 프록시: 캐시 확인 후 target.quote 호출
+  ├───────────────────────────────┤
+  │ QuoteClient.show              │  ← invokeinterface QuoteSource.quote
+  ├───────────────────────────────┤
+  │ ProxyMain.run                 │
+  └───────────────────────────────┘</pre>
+
+<h3>인터페이스 기반 프록시 적용 — v1에 로그 추적기 달기</h3>
+<p>이제 v1에 로그 추적기를 붙인다. 로그 추적기는 01회에서 만든 것과 같은 구조를 쓰되, 이 회차의 예제에 필요한 만큼만 다시 적는다. 시작할 때 <code>begin</code>으로 상태를 받고, 정상 종료면 <code>end</code>, 예외면 <code>exception</code>을 부르는 세 메서드짜리 인터페이스다.</p>
+<pre><code class="language-java">public record TraceStatus(String id, int level, String message, long startMillis) {
+}
+
+public interface LogTrace {
+    TraceStatus begin(String message);
+    void end(TraceStatus status);
+    void exception(TraceStatus status, Exception e);
+}
+
+public class ThreadLocalLogTrace implements LogTrace {
+
+    private record Context(String id, int level) {}
+
+    private final ThreadLocal<Context> holder = new ThreadLocal<>();
+
+    @Override
+    public TraceStatus begin(String message) {
+        Context prev = holder.get();
+        Context now = (prev == null)
+                ? new Context(UUID.randomUUID().toString().substring(0, 8), 0)
+                : new Context(prev.id(), prev.level() + 1);
+        holder.set(now);
+        System.out.println("[" + now.id() + "] " + prefix("|-->", now.level()) + message);
+        return new TraceStatus(now.id(), now.level(), message, System.currentTimeMillis());
+    }
+
+    @Override
+    public void end(TraceStatus status) {
+        complete(status, null);
+    }
+
+    @Override
+    public void exception(TraceStatus status, Exception e) {
+        complete(status, e);
+    }
+
+    private void complete(TraceStatus status, Exception e) {
+        long took = System.currentTimeMillis() - status.startMillis();
+        String head = "[" + status.id() + "] ";
+        if (e == null) {
+            System.out.println(head + prefix("|<--", status.level()) + status.message() + " time=" + took + "ms");
+        } else {
+            System.out.println(head + prefix("|<X-", status.level()) + status.message() + " time=" + took + "ms ex=" + e);
+        }
+        if (status.level() == 0) {
+            holder.remove();                       // 01회: 스레드 풀에서는 반드시 지운다
+        } else {
+            holder.set(new Context(status.id(), status.level() - 1));
+        }
+    }
+
+    private static String prefix(String arrow, int level) {
+        if (level == 0) return "";
+        return "|   ".repeat(level - 1) + arrow;
+    }
+}</code></pre>
+<p>프록시는 v1의 세 인터페이스마다 하나씩 만든다. 각 프록시는 같은 인터페이스를 구현하고, 진짜 객체와 로그 추적기를 <code>final</code> 필드로 받는다. 메서드에서는 로그를 시작하고, 타깃에 위임하고, 결과에 따라 종료나 예외 로그를 남긴다.</p>
+<pre><code class="language-java">public class ArticleRepositoryV1Proxy implements ArticleRepositoryV1 {
+    private final ArticleRepositoryV1 target;
+    private final LogTrace logTrace;
+
+    public ArticleRepositoryV1Proxy(ArticleRepositoryV1 target, LogTrace logTrace) {
+        this.target = target;
+        this.logTrace = logTrace;
+    }
+
+    @Override
+    public void save(String title) {
+        TraceStatus status = null;
+        try {
+            status = logTrace.begin("ArticleRepository.save()");
+            target.save(title);                 // 진짜 객체 호출
+            logTrace.end(status);
+        } catch (Exception e) {
+            logTrace.exception(status, e);
+            throw e;                            // 예외를 삼키지 않는다
+        }
+    }
+}
+
+public class ArticleServiceV1Proxy implements ArticleServiceV1 {
+    private final ArticleServiceV1 target;
+    private final LogTrace logTrace;
+
+    public ArticleServiceV1Proxy(ArticleServiceV1 target, LogTrace logTrace) {
+        this.target = target;
+        this.logTrace = logTrace;
+    }
+
+    @Override
+    public void register(String title) {
+        TraceStatus status = null;
+        try {
+            status = logTrace.begin("ArticleService.register()");
+            target.register(title);
+            logTrace.end(status);
+        } catch (Exception e) {
+            logTrace.exception(status, e);
+            throw e;
+        }
+    }
+}
+
+public class ArticleControllerV1Proxy implements ArticleControllerV1 {
+    private final ArticleControllerV1 target;
+    private final LogTrace logTrace;
+
+    public ArticleControllerV1Proxy(ArticleControllerV1 target, LogTrace logTrace) {
+        this.target = target;
+        this.logTrace = logTrace;
+    }
+
+    @Override
+    public String register(String title) {
+        TraceStatus status = null;
+        try {
+            status = logTrace.begin("ArticleController.register()");
+            String result = target.register(title);
+            logTrace.end(status);
+            return result;
+        } catch (Exception e) {
+            logTrace.exception(status, e);
+            throw e;
+        }
+    }
+
+    @Override
+    public String health() {
+        return target.health();    // 요구사항: 이 메서드는 로그를 남기지 않는다
+    }
+}</code></pre>
+<p>요구사항 2번은 <code>health()</code>에서 해결된다. 프록시는 인터페이스의 메서드를 하나하나 직접 구현하므로, 어떤 메서드에 로그를 남기고 어떤 메서드는 그냥 위임할지를 메서드 단위로 고를 수 있다.</p>
+<p><code>catch (Exception e)</code>로 잡은 뒤 <code>throw e;</code>로 다시 던지는 부분은 한번 짚고 넘어가자. <code>Exception</code>은 검사 예외(checked exception)의 상위 타입인데, <code>throws</code> 선언이 없는 <code>save</code>에서 이것을 던져도 컴파일된다. JLS §11.2.2는 <code>catch</code> 절의 예외 매개변수가 <code>final</code>이거나 사실상 <code>final</code>(effectively final)일 때, 그 매개변수를 던지는 <code>throw</code> 문이 던질 수 있는 예외를 "그 <code>try</code> 블록이 던질 수 있는 예외이면서 그 <code>catch</code> 절이 잡을 수 있는 것"으로 좁혀 분석한다고 정한다. <code>target.save(title)</code>와 로그 추적기 호출은 검사 예외를 선언하지 않으므로 이 <code>try</code> 블록이 던질 수 있는 것은 비검사 예외뿐이고, 그래서 <code>throw e</code>도 비검사 예외만 던지는 것으로 분석된다. 프록시가 예외를 감싸거나 바꾸지 않고 원래 예외 객체 그대로 다시 던지므로, 클라이언트는 프록시가 없을 때와 같은 예외를 받는다.</p>
+<p>조립은 새 설정 클래스가 맡는다. 원래의 <code>AppV1Config</code>는 그대로 두고, 같은 빈 이름으로 프록시를 등록하는 설정 클래스를 따로 만든다.</p>
+<pre><code class="language-java">@Configuration
+public class InterfaceProxyConfig {
+
+    @Bean
+    public ArticleControllerV1 articleControllerV1(LogTrace logTrace) {
+        ArticleControllerV1Impl target = new ArticleControllerV1Impl(articleServiceV1(logTrace));
+        return new ArticleControllerV1Proxy(target, logTrace);
+    }
+
+    @Bean
+    public ArticleServiceV1 articleServiceV1(LogTrace logTrace) {
+        ArticleServiceV1Impl target = new ArticleServiceV1Impl(articleRepositoryV1(logTrace));
+        return new ArticleServiceV1Proxy(target, logTrace);
+    }
+
+    @Bean
+    public ArticleRepositoryV1 articleRepositoryV1(LogTrace logTrace) {
+        ArticleRepositoryV1Impl target = new ArticleRepositoryV1Impl();
+        return new ArticleRepositoryV1Proxy(target, logTrace);
+    }
+}
+
+@Import({InterfaceProxyConfig.class, ConcreteProxyConfig.class})   // AppV1Config, AppV2Config 대신
+@SpringBootApplication(scanBasePackages = "lab.app.v3")
+public class ProxyApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(ProxyApplication.class, args);
+    }
+
+    @Bean
+    public LogTrace logTrace() {
+        return new ThreadLocalLogTrace();
+    }
+}</code></pre>
+<p>원래 설정과 비교하면 <code>@Bean</code> 메서드가 돌려주는 객체만 달라졌다. 전에는 구현 객체를 돌려줬고 지금은 구현 객체를 감싼 프록시를 돌려준다. 컨테이너는 <code>@Bean</code> 메서드가 돌려준 객체를 빈으로 등록하므로, 이제 <code>articleServiceV1</code>이라는 이름의 빈은 <code>ArticleServiceV1Proxy</code> 객체다. 진짜 <code>ArticleServiceV1Impl</code> 객체는 메서드 안에서 <code>new</code>로 만들어져 프록시의 생성자에 넘겨질 뿐, 컨테이너에 등록되지 않는다.</p>
+<p><code>articleControllerV1</code> 메서드 안에서 <code>articleServiceV1(logTrace)</code>를 직접 부르는 것도 눈여겨보자. 기본편에서 본 것처럼 <code>@Configuration</code> 클래스는 컨테이너가 CGLIB로 만든 하위 클래스로 바뀌어 등록되고, 그 하위 클래스가 <code>@Bean</code> 메서드 호출을 가로채 이미 등록된 빈이 있으면 그것을 돌려준다. 그래서 컨트롤러의 진짜 객체가 받는 서비스는 새로 만든 객체가 아니라 컨테이너에 등록된 <b>서비스 프록시 빈</b>이다. 실험에서 설정 클래스 빈의 클래스 이름은 <code>ProxyConfig$$SpringCGLIB$$0</code>, 상위 클래스는 <code>ProxyConfig</code>였다(실험에서는 v1과 v2의 프록시 설정을 <code>ProxyConfig</code> 하나에 두었다). 이 회차의 주제인 프록시를 스프링이 이미 설정 클래스에 쓰고 있는 셈이다.</p>
+<p>그 결과 힙에 만들어지는 객체 그래프는 다음과 같다. 프록시와 진짜 객체가 번갈아 이어진다는 점이 중요하다. 진짜 컨트롤러가 들고 있는 서비스 참조는 진짜 서비스가 아니라 서비스 프록시를 가리킨다.</p>
+<pre class="diagram">  스프링 컨테이너 (싱글톤 빈 저장소)
+  ┌──────────────────────────────────────────────────────────────┐
+  │ "articleControllerV1" ──▶ ArticleControllerV1Proxy  ─┐       │
+  │ "articleServiceV1"    ──▶ ArticleServiceV1Proxy  ◀───┼──┐    │
+  │ "articleRepositoryV1" ──▶ ArticleRepositoryV1Proxy ◀─┼──┼─┐  │
+  └──────────────────────────────────────────────────────┼──┼─┼──┘
+                                                         │  │ │
+  힙 (빈이 아닌 객체)                                     │  │ │
+                                                         ▼  │ │
+   ArticleControllerV1Impl ── articleService ───────────────┘ │
+   (ControllerProxy.target)                                   │
+   ArticleServiceV1Impl ──── articleRepository ───────────────┘
+   (ServiceProxy.target)
+   ArticleRepositoryV1Impl
+   (RepositoryProxy.target)
+
+  요청 흐름: ControllerProxy → ControllerImpl → ServiceProxy → ServiceImpl
+             → RepositoryProxy → RepositoryImpl</pre>
+<x-visual id="spring-core-adv-03-interface-proxy-graph" title="인터페이스 기반 프록시를 적용한 v1의 객체 그래프" kind="구조도" ratio="16:9">
+<x-hint>컨테이너에는 프록시 세 개만 빈으로 들어 있고, 진짜 객체 세 개는 각 프록시의 target 필드로만 연결되며, 진짜 객체가 다음 계층의 프록시 빈을 참조해 프록시와 진짜 객체가 번갈아 이어진다는 것을 보여 준다.</x-hint>
+<x-prompt>가로 16:9 구조도. 왼쪽에 큰 둥근 사각형 "스프링 컨테이너"가 있고 그 안에 세로로 세 개의 파란 상자 "컨트롤러 프록시", "서비스 프록시", "리포지토리 프록시"가 있다. 오른쪽 컨테이너 바깥 영역에 "힙"이라는 라벨이 있고 회색 상자 세 개 "진짜 컨트롤러", "진짜 서비스", "진짜 리포지토리"가 같은 높이로 놓인다. 각 파란 프록시 상자에서 같은 높이의 회색 상자로 실선 화살표가 가며 화살표 라벨은 "target"이다. "진짜 컨트롤러"에서 "서비스 프록시"로, "진짜 서비스"에서 "리포지토리 프록시"로 점선 화살표가 대각선으로 돌아간다. 맨 아래에 왼쪽에서 오른쪽으로 흐르는 굵은 화살표 하나에 "요청 흐름: 프록시 → 진짜 → 프록시 → 진짜"라고 적는다. 배경은 흰색, 선은 단순하게.</x-prompt>
+<x-caption>컨테이너에는 프록시만 빈으로 등록되고, 진짜 객체는 프록시의 필드로만 존재한다. 진짜 객체가 주입받은 것은 다음 계층의 프록시 빈이다.</x-caption>
+</x-visual>
+<p>직접 돌려 확인해 보자. 아래 결과는 원고를 쓰면서 JDK 21.0.13(Temurin), 스프링 프레임워크 6.2.19, 내장 톰캣 10.1.55에서 얻은 것이다. 스프링 부트 없이 톰캣과 <code>DispatcherServlet</code>을 코드로 띄우고 <code>@EnableWebMvc</code>로 MVC 설정을 켰으며, 컨트롤러·서비스·리포지토리·프록시 클래스는 위의 코드와 같다. 요청은 같은 프로세스에서 <code>java.net.http.HttpClient</code>로 보냈다. ID와 시간은 실행마다 다르다.</p>
+<pre data-label="실행 결과 (컨테이너 조회와 요청 세 개)"><code class="language-text">ArticleControllerV1 빈 = ArticleControllerV1Proxy
+ArticleControllerV1Impl 타입 빈 = []
+
+== POST /v1/articles title=hello ==
+[d89e7f31] ArticleController.register()
+[d89e7f31] |-->ArticleService.register()
+[d89e7f31] |   |-->ArticleRepository.save()
+[d89e7f31] |   |<--ArticleRepository.save() time=110ms
+[d89e7f31] |<--ArticleService.register() time=111ms
+[d89e7f31] ArticleController.register() time=111ms
+응답 200 ok
+== POST /v1/articles title=%20 ==
+[eabddf24] ArticleController.register()
+[eabddf24] |-->ArticleService.register()
+[eabddf24] |   |-->ArticleRepository.save()
+[eabddf24] |   |<X-ArticleRepository.save() time=0ms ex=java.lang.IllegalArgumentException: 제목이 비어 있다
+[eabddf24] |<X-ArticleService.register() time=1ms ex=java.lang.IllegalArgumentException: 제목이 비어 있다
+[eabddf24] ArticleController.register() time=1ms ex=java.lang.IllegalArgumentException: 제목이 비어 있다
+응답 500
+== GET /v1/health ==
+응답 200 up</code></pre>
+<p>결과를 읽어 보자. <code>ArticleControllerV1</code> 타입으로 조회한 빈은 프록시이고, <code>ArticleControllerV1Impl</code> 타입의 빈은 하나도 없다. 진짜 객체가 빈이 아니라는 것이 확인된다. 첫 요청에서는 세 프록시가 차례로 <code>begin</code>을 불러 깊이가 0, 1, 2로 늘었다가, 스택이 풀리면서 리포지토리, 서비스, 컨트롤러 순서로 종료 로그가 찍힌다. 앞의 데코레이터 체인과 같은 모양이다. 공백 하나(<code>%20</code>)를 제목으로 보낸 두 번째 요청에서는 리포지토리가 던진 예외가 각 프록시의 <code>catch</code>를 거치며 예외 로그를 남기고, 다시 던져져 스프링 MVC까지 올라가 500 응답이 되었다. 톰캣은 이 예외를 자기 로그에 따로 남겼다(위 출력에서는 생략). 세 번째 요청인 <code>health()</code>는 로그 없이 응답했다. 원본 v1 코드는 한 줄도 바뀌지 않았다.</p>
+<p>이 요청들은 톰캣의 작업 스레드에서 처리된다. 세 프록시 빈은 모든 요청 스레드가 함께 쓰는 싱글톤이지만 상태를 바꾸는 필드가 없다. <code>target</code>과 <code>logTrace</code>는 <code>final</code>이고, 요청마다 달라지는 트랜잭션 ID와 깊이는 <code>ThreadLocalLogTrace</code> 안의 <code>ThreadLocal</code>에 스레드별로 들어간다. 깊이 0의 호출이 끝날 때 <code>remove()</code>를 부르므로 스레드가 풀로 돌아가도 이전 요청의 상태가 남지 않는다.</p>
+
+<h4>스프링 MVC는 프록시가 된 컨트롤러를 어떻게 알아보는가</h4>
+<p>컨트롤러 빈이 프록시로 바뀌었는데도 요청이 제대로 매핑되었다. 프록시 클래스에는 <code>@RestController</code>도 <code>@PostMapping</code>도 없는데 어떻게 찾았을까. 이 질문을 파고들면 앞에서 인터페이스에 <code>@RestController</code>를 붙인 이유가 정확해진다.</p>
+<p><code>RequestMappingHandlerMapping</code>은 초기화될 때 컨테이너의 빈 이름을 돌며 <code>getType(beanName)</code>으로 빈의 타입을 얻고, 그 타입이 <code>isHandler</code>를 통과하면 그 타입의 메서드에서 요청 매핑을 찾는다. 6.2.19 소스에서 <code>AbstractBeanFactory.getType</code>은 다음 순서로 타입을 정한다. 그 이름의 싱글톤 객체가 이미 만들어져 있으면 <b>그 객체의 실제 클래스</b>를 돌려준다. 아직 만들어지지 않았으면 빈 정의로부터 타입을 <b>예측</b>하는데, <code>@Bean</code> 메서드로 정의된 빈이라면 그 메서드의 반환 타입이 기준이 된다. 그리고 <code>isHandler</code>가 쓰는 <code>AnnotatedElementUtils.hasAnnotation</code>은 Javadoc에서 말하는 "find 의미론"을 따르는데, 대상이 클래스면 인터페이스와 상위 클래스까지 뒤지고, 대상이 메서드면 인터페이스와 상위 클래스의 같은 메서드까지 뒤진다.</p>
+<p>이 두 사실을 합치면, 핸들러 매핑이 컨트롤러 빈보다 먼저 초기화되는지 나중에 초기화되는지에 따라 보는 타입이 달라진다. 실험으로 확인했다. 등록 순서를 바꿔 두 경우를 만들고, 애너테이션의 위치를 바꿔 가며 <code>/v1/articles</code>가 매핑되는지 보았다.</p>
+<div class="table-wrap"><table><thead><tr><th>컨트롤러 애너테이션의 위치</th><th>핸들러 매핑이 먼저 초기화된 경우<br>(빈 타입 = 반환 타입 <code>ArticleControllerV1</code>)</th><th>컨트롤러 빈이 먼저 만들어진 경우<br>(빈 타입 = <code>ArticleControllerV1Proxy</code>)</th></tr></thead><tbody>
+<tr><td>인터페이스에 <code>@RestController</code></td><td>매핑됨. 핸들러 메서드는 <code>ArticleControllerV1#register</code></td><td>매핑됨. 핸들러 메서드는 <code>ArticleControllerV1Proxy#register</code></td></tr>
+<tr><td>인터페이스에서 빼고 프록시 클래스에만 <code>@RestController</code></td><td>매핑 안 됨, 404</td><td>매핑됨</td></tr>
+<tr><td>인터페이스에 타입 수준 <code>@RequestMapping</code>과 <code>@ResponseBody</code>만</td><td>매핑 안 됨, 404</td><td>(실험하지 않음. <code>isHandler</code>가 <code>@Controller</code>만 보므로 순서와 무관하게 통과하지 못한다)</td></tr>
+</tbody></table></div>
+<p>인터페이스에 붙인 경우는 두 경로 모두에서 찾힌다. 예측 타입이 인터페이스 자체이면 거기서 바로 찾고, 실제 클래스가 프록시이면 find 의미론이 프록시가 구현한 인터페이스까지 올라가 찾는다. 메서드의 <code>@PostMapping</code>과 매개변수의 <code>@RequestParam("title")</code>도 마찬가지로 인터페이스 쪽 선언에서 찾힌다. 6.2.19에서는 <code>-parameters</code> 컴파일 옵션 없이 컴파일해도 두 경우 모두 <code>title</code> 값이 제대로 바인딩되었다. 프록시 클래스에만 붙인 경우는 운에 맡기는 것이다. 이 실험에서는 등록 순서 하나로 결과가 404와 200으로 갈렸다. 그러니 애너테이션은 <b><code>@Bean</code> 메서드가 반환 타입으로 선언한 인터페이스</b>에 두어야 어느 경로로 판단되든 찾힌다.</p>
+<aside class="note">핸들러 매핑이 빈 타입을 어떻게 얻는지, 빈들이 어떤 순서로 만들어지는지는 스프링 내부 구현이다. 위 내용은 6.2.19의 소스와 실험으로 확인한 것이고, 공개 API의 보장이 아니므로 버전에 따라 달라질 수 있다. 공개적으로 보장된 규칙은 6.0 릴리스 노트의 안내, 곧 "인터페이스 기반 프록시를 쓰는 컨트롤러라면 인터페이스에 <code>@Controller</code>를 붙인다"이다.</aside>
+
+<h3>구체 클래스 기반 프록시 — 인터페이스가 없을 때</h3>
+<p>v2에는 인터페이스가 없다. 클라이언트가 <code>ArticleServiceV2</code>라는 구체 클래스 타입의 필드를 들고 있으므로, 그 필드에 들어갈 수 있는 것은 <code>ArticleServiceV2</code>와 그 하위 클래스의 객체뿐이다. 그렇다면 프록시를 <b>하위 클래스</b>로 만들면 된다. 자바의 다형성은 인터페이스 구현만이 아니라 클래스 상속에도 똑같이 적용된다. 작은 예제로 먼저 확인한다.</p>
+<pre><code class="language-java">public class ReportGenerator {
+    public String generate(String month) {
+        System.out.println("ReportGenerator 실행: " + month);
+        return month + " 매출 보고서";
+    }
+}
+
+public class TimingReportGenerator extends ReportGenerator {
+
+    private final ReportGenerator target;
+
+    public TimingReportGenerator(ReportGenerator target) {
+        this.target = target;
+    }
+
+    @Override
+    public String generate(String month) {
+        System.out.println("TimingReportGenerator 실행");
+        long start = System.nanoTime();
+        String result = target.generate(month);
+        System.out.println("TimingReportGenerator 종료 (시간은 실행마다 다르다: "
+                + (System.nanoTime() - start) / 1_000 + "us)");
+        return result;
+    }
+}
+
+public class ReportClient {
+    private final ReportGenerator generator;   // 구체 클래스에 의존한다
+
+    public ReportClient(ReportGenerator generator) {
+        this.generator = generator;
+    }
+
+    public void run() {
+        System.out.println("결과=" + generator.generate("2026-10"));
+    }
+}
+
+public class ClsMain {
+    public static void main(String[] args) {
+        ReportGenerator real = new ReportGenerator();
+        new ReportClient(real).run();
+        System.out.println("----");
+        ReportGenerator proxy = new TimingReportGenerator(real);
+        new ReportClient(proxy).run();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">ReportGenerator 실행: 2026-10
+결과=2026-10 매출 보고서
+----
+TimingReportGenerator 실행
+ReportGenerator 실행: 2026-10
+TimingReportGenerator 종료 (시간은 실행마다 다르다: 26us)
+결과=2026-10 매출 보고서</code></pre>
+<p><code>ReportClient</code>는 <code>ReportGenerator</code> 타입만 알고, 두 번째 실행에서는 그 자리에 하위 클래스인 프록시가 들어갔다. 바이트코드로 보면 <code>ReportClient.run</code>은 <code>invokevirtual ReportGenerator.generate</code>를 부른다. 앞에서 본 메서드 선택 규칙에 따라 피연산자 객체의 클래스가 <code>TimingReportGenerator</code>이면 오버라이드한 메서드가 선택된다. 인터페이스 대신 상위 클래스가 "추상 타입" 역할을 한 것이다.</p>
+<pre data-label="javap -c (일부)"><code class="language-text">// ReportClient.run()
+   4: getfield      #7       // Field generator:LReportGenerator;
+   7: ldc           #19      // String 2026-10
+   9: invokevirtual #21      // Method ReportGenerator.generate:(Ljava/lang/String;)Ljava/lang/String;
+
+// TimingReportGenerator(ReportGenerator) 생성자
+   0: aload_0
+   1: invokespecial #1       // Method ReportGenerator."<init>":()V
+   4: aload_0
+   5: aload_1
+   6: putfield      #7       // Field target:LReportGenerator;
+   9: return</code></pre>
+<p>생성자의 바이트코드에서 소스에 쓰지 않은 명령 하나가 보인다. <code>invokespecial ReportGenerator."<init>"</code>, 곧 부모 클래스의 생성자 호출이다. JLS §8.8.7은 생성자 본문이 명시적 생성자 호출로 시작하지 않고 그 클래스가 <code>Object</code>가 아니면, 본문은 직접 상위 클래스의 인자 없는 생성자를 부르는 <code>super();</code>로 암묵적으로 시작한다고 정한다. 컴파일러가 그 규칙대로 호출을 넣은 것이다. <code>ReportGenerator</code>는 생성자를 선언하지 않았으므로 JLS §8.8.9에 따라 기본 생성자가 암묵적으로 선언되어 있고, 그래서 이 호출이 문제없이 컴파일되었다. 다음 절에서 이 규칙이 프록시의 발목을 잡는다.</p>
+
+<h4>위임하는 프록시와 super를 부르는 하위 클래스</h4>
+<p><code>TimingReportGenerator</code>는 상속을 했지만 부모의 <code>generate</code>를 <code>super.generate(month)</code>로 부르지 않았다. 별도의 <code>target</code> 객체에 위임했다. 상속은 <b>타입을 얻기 위해서만</b> 쓰고, 일은 감싼 객체에 넘긴 것이다. 그래서 이 프록시는 이미 만들어진 진짜 객체를 감쌀 수 있고, 프록시 위에 또 프록시를 얹을 수도 있다.</p>
+<p>반대로 <code>super.generate(month)</code>를 부르는 하위 클래스를 만들면 성격이 달라진다. 그 객체는 부가 기능과 핵심 기능을 한 객체 안에 함께 가진, 말하자면 "기능이 추가된 진짜 객체"다. 이미 존재하는 객체를 감쌀 수 없고, 하위 클래스가 되는 순간 조합이 컴파일 시점에 고정된다. 앞의 데코레이터 절에서 본 상속의 한계가 그대로 돌아온다. 스프링도 두 방식을 상황에 따라 쓴다. 6.2.19의 <code>ConfigurationClassEnhancer</code>를 보면, <code>@Configuration</code> 클래스의 CGLIB 하위 클래스는 빈을 처음 만들어야 할 때 <code>cglibMethodProxy.invokeSuper(...)</code>로 <b>부모의 <code>@Bean</code> 메서드</b>를 실행한다. 설정 클래스는 객체 하나로 충분하므로 super 호출 방식이 맞다. 반면 05회 이후에 볼 AOP 프록시는 별도의 타깃 객체를 감싸는 위임 방식이다.</p>
+
+<h3>구체 클래스 기반 프록시 적용 — v2와 생성자 문제</h3>
+<p>v2의 서비스는 리포지토리를 생성자로 받는다. 인자 없는 생성자가 없다. 이 클래스의 프록시를 하위 클래스로 만들고 생성자에서 아무것도 하지 않으면 어떻게 되는지, 작은 예제로 먼저 확인한다.</p>
+<pre><code class="language-java">public class ReportRepository {
+    public String save(String month) {
+        return month + " 저장 완료";
+    }
+}
+
+public class ReportService {
+
+    private final ReportRepository repository;
+
+    public ReportService(ReportRepository repository) {
+        System.out.println("ReportService 생성자 실행, repository=" + repository);
+        this.repository = repository;
+    }
+
+    public String publish(String month) {
+        return repository.save(month);
+    }
+
+    public String archive(String month) {
+        return repository.save(month + "(보관)");
+    }
+}
+
+public class ReportServiceProxy extends ReportService {
+
+    private final ReportService target;
+
+    public ReportServiceProxy(ReportService target) {
+        this.target = target;          // super(...) 호출이 없다
+    }
+
+    @Override
+    public String publish(String month) {
+        System.out.println("프록시: publish 전");
+        String result = target.publish(month);
+        System.out.println("프록시: publish 후");
+        return result;
+    }
+}</code></pre>
+<pre data-label="javac 출력 (JDK 21.0.13)"><code class="language-text">ReportServiceProxy.java:5: error: constructor ReportService in class ReportService cannot be applied to given types;
+    public ReportServiceProxy(ReportService target) {
+                                                    ^
+  required: ReportRepository
+  found:    no arguments
+  reason: actual and formal argument lists differ in length
+1 error</code></pre>
+<p>컴파일러는 JLS §8.8.7에 따라 <code>super();</code>를 넣으려 했는데, <code>ReportService</code>에는 인자 없는 생성자가 없다. 생성자를 하나라도 선언한 클래스에는 기본 생성자가 만들어지지 않으므로(§8.8.9) 이 호출은 성립하지 않는다. 오류 메시지의 "required: ReportRepository, found: no arguments"가 바로 그 암묵적 <code>super()</code>를 가리킨다.</p>
+<p>해결은 부모 생성자에 무언가를 넘기는 것이다. 이 프록시는 부모의 기능을 쓰지 않고 <code>target</code>에 위임할 것이므로 <code>null</code>을 넘긴다.</p>
+<pre><code class="language-java">public ReportServiceProxy(ReportService target) {
+    super(null);            // 부모 생성자를 반드시 호출해야 한다. 이 프록시는 부모의 기능을 쓰지 않는다
+    this.target = target;
+}
+
+public class CtorMain {
+    public static void main(String[] args) {
+        ReportService real = new ReportService(new ReportRepository());
+        ReportService proxy = new ReportServiceProxy(real);
+        System.out.println(proxy.publish("2026-10"));
+        System.out.println(proxy.archive("2026-09"));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (해시코드는 실행마다 다르다)"><code class="language-text">ReportService 생성자 실행, repository=ReportRepository@6d06d69c
+ReportService 생성자 실행, repository=null
+프록시: publish 전
+프록시: publish 후
+2026-10 저장 완료
+Exception in thread "main" java.lang.NullPointerException: Cannot invoke "ReportRepository.save(String)" because "this.repository" is null
+	at ReportService.archive(ReportService.java:15)
+	at CtorMain.main(CtorMain.java:6)</code></pre>
+<p>이 짧은 출력에 구체 클래스 기반 프록시의 문제가 세 가지나 들어 있다.</p>
+<p><b>첫째, 부모 생성자가 한 번 더 실행된다.</b> "ReportService 생성자 실행"이 두 번 찍혔다. 첫 번째는 진짜 객체를 만들 때, 두 번째는 프록시를 만들 때 <code>super(null)</code>이 부른 것이다. JLS §12.5가 정한 객체 생성 절차에서, 생성자는 본문을 실행하기 전에 상위 클래스의 생성자 호출을 같은 절차로 재귀적으로 먼저 처리한다. 프록시를 만드는 일은 곧 부모 클래스의 객체를 만드는 일을 포함한다. 부모 생성자가 출력만 한다면 넘어갈 수 있지만, 생성자에서 커넥션을 열거나 인자를 검증해 <code>null</code>이면 예외를 던진다면 프록시를 만드는 것 자체가 실패하거나 부작용을 낸다.</p>
+<p><b>둘째, 쓰지 않는 부모의 필드가 프록시 안에 있다.</b> JLS §12.5는 새 객체를 만들 때 그 클래스에 선언된 인스턴스 변수뿐 아니라 각 상위 클래스에 선언된 모든 인스턴스 변수를 담을 공간을 할당한다고 정한다. 프록시 객체의 필드를 리플렉션으로 상위 클래스까지 훑어 보면 이렇다.</p>
+<pre data-label="프록시 객체의 필드 (리플렉션으로 출력)"><code class="language-text">ReportServiceProxy.target = ReportService
+ReportService.repository = null</code></pre>
+<pre class="diagram">  ReportServiceProxy 객체 하나 (힙)
+  ┌──────────────────────────────────────────┐
+  │ 객체 헤더                                │
+  │ ReportService.repository = null    ◀──── 부모에게서 물려받은 칸. 쓰지 않는다
+  │ ReportServiceProxy.target ─────────────────▶ 진짜 ReportService 객체
+  └──────────────────────────────────────────┘          │
+                                                        └ repository ──▶ ReportRepository</pre>
+<p>참조 필드 하나라면 공간 낭비는 미미하다. 진짜 문제는 이 칸이 "진짜처럼 생겼지만 비어 있는 상태"라는 점이고, 그것이 셋째 문제로 이어진다.</p>
+<p><b>셋째, 오버라이드를 빠뜨린 메서드는 조용히 부모의 코드를 실행한다.</b> 프록시는 <code>publish</code>만 오버라이드하고 <code>archive</code>는 빠뜨렸다. <code>proxy.archive(...)</code>는 <code>invokevirtual</code>의 메서드 선택에 따라 프록시 클래스에서 <code>archive</code>를 찾고, 없으므로 상속받은 <code>ReportService.archive</code>를 실행한다. 이때 <code>this</code>는 프록시 객체이고, 그 객체의 <code>repository</code> 칸은 <code>super(null)</code>로 채운 <code>null</code>이다. 그래서 JDK 21이 출력한 NPE 메시지가 정확히 "<code>this.repository</code>가 null이라 <code>save</code>를 부를 수 없다"고 알려 준다. 타깃에 위임되지도 않았고, 로그도 남지 않았고, 엉뚱한 객체의 상태로 부모 코드가 돌았다.</p>
+<p>인터페이스 기반 프록시였다면 같은 실수는 컴파일 단계에서 걸린다. 인터페이스의 메서드 하나를 구현하지 않은 프록시를 컴파일하면 이렇게 나온다.</p>
+<pre data-label="javac 출력 — 인터페이스 메서드를 빠뜨린 프록시"><code class="language-text">Miss.java:5: error: ArticleServiceProxy is not abstract and does not override abstract method archive(String) in ArticleService
+class ArticleServiceProxy implements ArticleService {
+^
+1 error</code></pre>
+<p>인터페이스에는 상속받을 구현이 없으므로 컴파일러가 빈칸을 찾아낸다. 클래스 상속에서는 부모의 구현이 빈칸을 "채워 주기" 때문에 컴파일러가 아무 말도 하지 않는다. 구체 클래스 기반 프록시를 손으로 만들 때는 부모의 모든 공개 메서드를 빠짐없이 오버라이드했는지 사람이 확인해야 한다.</p>
+
+<h4>final이 막는 것</h4>
+<p>상속으로 프록시를 만드는 이상 상속을 막는 장치에 걸린다. 클래스에 <code>final</code>이 붙어 있거나, 메서드에 <code>final</code>이 붙어 있는 경우다.</p>
+<pre><code class="language-java">final class PriceCalculator {
+    public int total(int price, int qty) { return price * qty; }
+}
+class PriceCalculatorProxy extends PriceCalculator {      // 컴파일 오류
+}
+
+class Discount {
+    public final int apply(int price) { return price - 1000; }
+}
+class DiscountProxy extends Discount {
+    private final Discount target;
+    DiscountProxy(Discount target) { this.target = target; }
+    @Override
+    public int apply(int price) { return target.apply(price); }   // 컴파일 오류
+}</code></pre>
+<pre data-label="javac 출력"><code class="language-text">Sealed.java:4: error: cannot inherit from final PriceCalculator
+class PriceCalculatorProxy extends PriceCalculator {
+                                   ^
+FinalMethod.java:8: error: apply(int) in DiscountProxy cannot override apply(int) in Discount
+    public int apply(int price) { return target.apply(price); }
+               ^
+  overridden method is final</code></pre>
+<p>JLS §8.1.4는 <code>extends</code> 절이 <code>final</code> 클래스를 지명하면 컴파일 오류라고 정하고, §8.4.3.3은 <code>final</code> 메서드를 오버라이드하거나 숨기려 하면 컴파일 오류라고 정한다. 손으로 쓴 프록시라면 컴파일러가 막아 주니 차라리 낫다. 04회에서 볼, 실행 중에 바이트코드로 하위 클래스를 만드는 방식에서는 컴파일러가 없다. <code>final</code> 클래스는 하위 클래스를 만들 수 없어 프록시 생성이 실패하고, <code>final</code> 메서드는 오버라이드되지 않아 앞의 <code>archive</code>처럼 프록시를 거치지 않고 부모 코드가 그대로 실행된다. 스프링 레퍼런스의 프록시 메커니즘 절도 <code>final</code> 메서드는 오버라이드할 수 없으므로 어드바이스를 적용할 수 없다고 적는다.</p>
+
+<h4>v2에 적용하기</h4>
+<p>이 제약들을 알고 v2에 프록시를 적용한다. 세 클래스 모두 같은 모양이므로 서비스와 컨트롤러만 싣는다. 리포지토리 프록시는 부모에 인자 없는 생성자가 있으므로 <code>super(null)</code>이 필요 없다는 점만 다르다.</p>
+<pre><code class="language-java">public class ArticleServiceV2Proxy extends ArticleServiceV2 {
+    private final ArticleServiceV2 target;
+    private final LogTrace logTrace;
+
+    public ArticleServiceV2Proxy(ArticleServiceV2 target, LogTrace logTrace) {
+        super(null);   // 부모에 기본 생성자가 없으므로 아무 값이나 넘겨야 한다
+        this.target = target;
+        this.logTrace = logTrace;
+    }
+
+    @Override
+    public void register(String title) {
+        TraceStatus status = null;
+        try {
+            status = logTrace.begin("ArticleService.register()");
+            target.register(title);
+            logTrace.end(status);
+        } catch (Exception e) {
+            logTrace.exception(status, e);
+            throw e;
+        }
+    }
+}
+
+public class ArticleControllerV2Proxy extends ArticleControllerV2 {
+    private final ArticleControllerV2 target;
+    private final LogTrace logTrace;
+
+    public ArticleControllerV2Proxy(ArticleControllerV2 target, LogTrace logTrace) {
+        super(null);
+        this.target = target;
+        this.logTrace = logTrace;
+    }
+
+    @Override
+    public String register(String title) {      // 애너테이션을 다시 붙이지 않았다
+        TraceStatus status = null;
+        try {
+            status = logTrace.begin("ArticleController.register()");
+            String result = target.register(title);
+            logTrace.end(status);
+            return result;
+        } catch (Exception e) {
+            logTrace.exception(status, e);
+            throw e;
+        }
+    }
+
+    @Override
+    public String health() {
+        return target.health();
+    }
+}
+
+@Configuration
+public class ConcreteProxyConfig {
+
+    @Bean
+    public ArticleControllerV2 articleControllerV2(LogTrace logTrace) {
+        ArticleControllerV2 target = new ArticleControllerV2(articleServiceV2(logTrace));
+        return new ArticleControllerV2Proxy(target, logTrace);
+    }
+
+    @Bean
+    public ArticleServiceV2 articleServiceV2(LogTrace logTrace) {
+        ArticleServiceV2 target = new ArticleServiceV2(articleRepositoryV2(logTrace));
+        return new ArticleServiceV2Proxy(target, logTrace);
+    }
+
+    @Bean
+    public ArticleRepositoryV2 articleRepositoryV2(LogTrace logTrace) {
+        ArticleRepositoryV2 target = new ArticleRepositoryV2();
+        return new ArticleRepositoryV2Proxy(target, logTrace);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (같은 실험 환경)"><code class="language-text">ArticleControllerV2 타입 빈 = {articleControllerV2=lab.v2.ArticleControllerV2Proxy@3ae66c85}
+== POST /v2/articles title=hello ==
+[1156c38c] ArticleController.register()
+[1156c38c] |-->ArticleService.register()
+[1156c38c] |   |-->ArticleRepository.save()
+[1156c38c] |   |<--ArticleRepository.save() time=110ms
+[1156c38c] |<--ArticleService.register() time=110ms
+[1156c38c] ArticleController.register() time=110ms
+응답 200 ok
+== GET /v2/health ==
+응답 200 up</code></pre>
+<p>v1과 같은 모양의 로그가 나온다. <code>ArticleControllerV2</code> 타입으로 등록된 빈은 프록시 하나다. 이번에는 진짜 클래스와 프록시 클래스가 같은 타입 계층에 있으므로, 진짜 객체가 빈이었다면 같은 타입의 빈이 둘이 되었을 것이다. 진짜 객체를 빈으로 등록하지 않는 것은 그래서 v2에서 더 중요하다.</p>
+<p>프록시의 <code>register</code>에는 <code>@PostMapping</code>도 <code>@RequestParam</code>도 없는데 매핑과 바인딩이 되었다. 핸들러 매핑이 먼저 초기화된 이 실험에서 매핑된 핸들러 메서드는 <code>ArticleControllerV2#register</code>, 곧 <b>부모 클래스에 선언된</b> 메서드였다(빈 타입이 <code>@Bean</code> 메서드의 반환 타입 <code>ArticleControllerV2</code>로 예측되었기 때문이다). 그런데 요청이 오면 로그가 찍혔으니 실제로는 프록시의 메서드가 실행되었다. 스프링 MVC는 핸들러 메서드를 리플렉션의 <code>Method.invoke</code>로 실행하는데, 그 Javadoc은 인스턴스 메서드라면 JLS §15.12.4.4의 동적 메서드 조회로 호출되며 대상 객체의 런타임 타입에 따른 오버라이딩이 일어날 수 있다고 적는다. 부모 클래스의 <code>Method</code> 객체로 프록시 객체를 호출하면 프록시의 오버라이드가 실행되는 것이다. 컨트롤러 빈이 먼저 만들어지도록 순서를 바꾼 실험에서는 핸들러 메서드가 <code>ArticleControllerV2Proxy#register</code>로 잡혔고, 애너테이션은 find 의미론이 부모 클래스의 같은 메서드에서 찾아냈다. 어느 경로든 결과는 같았다.</p>
+
+<h3>인터페이스 기반 프록시와 클래스 기반 프록시</h3>
+<p>두 방식을 나란히 놓아 보자. 둘 다 클라이언트가 의존하는 타입의 하위 타입으로 프록시를 만든다는 점은 같다. 차이는 그 상위 타입이 인터페이스냐 클래스냐에서 나온다.</p>
+<div class="table-wrap"><table><thead><tr><th>항목</th><th>인터페이스 기반 프록시</th><th>구체 클래스 기반 프록시</th></tr></thead><tbody>
+<tr><td>전제 조건</td><td>타깃이 인터페이스를 구현하고, 클라이언트가 그 인터페이스 타입에 의존해야 한다</td><td>타깃 클래스가 <code>final</code>이 아니어야 한다. 인터페이스는 필요 없다</td></tr>
+<tr><td>생성자</td><td>상관없다. 프록시는 인터페이스만 구현한다</td><td>부모 생성자를 반드시 거친다. 인자가 필요하면 아무 값이라도 넘겨야 하고, 부모 생성자의 부작용이 프록시 생성 때도 일어난다</td></tr>
+<tr><td>객체의 모양</td><td>프록시는 자기 필드만 가진다</td><td>프록시 안에 쓰지 않는 부모의 필드가 함께 할당된다</td></tr>
+<tr><td>메서드를 빠뜨리면</td><td>컴파일 오류</td><td>컴파일되고, 부모 코드가 프록시의 빈 상태로 실행된다</td></tr>
+<tr><td><code>final</code></td><td>관계없다</td><td><code>final</code> 클래스는 프록시를 만들 수 없고, <code>final</code> 메서드는 가로챌 수 없다</td></tr>
+<tr><td>프록시를 담을 수 있는 타입</td><td>인터페이스 타입만. 프록시는 구현 클래스 타입이 아니다</td><td>타깃 클래스 타입과 그 상위 타입 전부</td></tr>
+</tbody></table></div>
+<p>마지막 줄은 실무에서 자주 문제가 된다. v1의 실행 결과에서 <code>ArticleControllerV1Impl</code> 타입의 빈이 하나도 없었다. 누군가 <code>ArticleServiceV1Impl</code> 타입으로 의존관계를 주입받으려 하면 컨테이너에서 그 타입의 빈을 찾지 못한다. 프록시는 <code>ArticleServiceV1</code>이지 <code>ArticleServiceV1Impl</code>이 아니기 때문이다. 같은 이유로 프록시 빈을 구현 클래스로 캐스팅하면 <code>ClassCastException</code>이 난다. 클래스 기반 프록시는 타깃 클래스의 하위 클래스이므로 이 문제가 없다. 스프링 AOP가 만드는 두 종류의 프록시 사이에서 이 차이가 어떻게 드러나는지는 이 권의 뒤쪽 회차에서 다시 만난다.</p>
+<p>이론적으로는 모든 객체에 인터페이스를 두는 것이 역할과 구현을 나누는 좋은 설계이고, 프록시를 붙이기에도 편하다. 하지만 구현을 바꿀 일이 사실상 없는 클래스에까지 인터페이스를 만들면 파일만 두 배가 되고 얻는 것이 적다. 실무의 판단 기준은 대체로 이렇다. 구현이 바뀔 가능성이 실제로 있는 곳(외부 시스템 연동, 저장 방식, 정책)에는 인터페이스를 두고, 그렇지 않은 곳은 구체 클래스로 둔다. 그러니 한 애플리케이션 안에 두 형태가 섞여 있고, 프록시 기술은 둘 다 다룰 수 있어야 한다.</p>
+<p>스프링이 실제로 그렇게 한다. 스프링 레퍼런스(6.2)의 프록시 메커니즘 절은, 프록시할 대상이 인터페이스를 하나 이상 구현하면 JDK 동적 프록시를 쓰고 구현한 인터페이스가 없으면 대상 타입의 하위 클래스를 실행 중에 생성하는 CGLIB 프록시를 만든다고 설명한다. 이 회차에서 손으로 만든 두 방식을 자동으로 만들어 주는 기술이 각각 그것이다. 같은 절은 CGLIB 프록시 객체가 Objenesis를 통해 생성되므로 프록시 대상의 생성자가 두 번 호출되지 않는다고도 적는다. 생성자를 거치지 않고 객체를 만드는 방법으로, 위에서 본 생성자 문제를 피해 가는 것이다. 다만 JVM이 생성자 우회를 허용하지 않으면 두 번 호출될 수 있다는 단서가 붙어 있다.</p>
+<p>같은 구도는 JPA에서도 보인다. Hibernate ORM 6.6 사용자 가이드의 "non-final 클래스를 선호하라" 절은, 엔티티의 일부를 실행 중 프록시로 지연 로딩하는 기능이 엔티티 클래스가 <code>final</code>이 아니거나, 아니면 모든 속성의 getter·setter를 선언한 인터페이스를 구현하는 것에 달려 있다고 설명한다. 같은 이유로 영속 속성의 getter·setter를 <code>final</code>로 선언하는 것도 피하라고 한다. 클래스 기반과 인터페이스 기반이라는 프록시의 두 갈래가 엔티티 설계 규칙으로 나타난 것이다.</p>
+<x-visual id="spring-core-adv-03-two-proxy-kinds" title="인터페이스 기반 프록시와 구체 클래스 기반 프록시의 타입 관계" kind="클래스 다이어그램 비교" ratio="16:9">
+<x-hint>왼쪽은 인터페이스를 진짜 객체와 프록시가 나란히 구현하는 구조, 오른쪽은 프록시가 진짜 클래스를 상속하면서 쓰지 않는 부모 필드를 품는 구조임을 대비해 보여 준다.</x-hint>
+<x-prompt>가로 16:9, 좌우 두 패널. 왼쪽 패널 제목 "인터페이스 기반": 위쪽 가운데 점선 테두리 상자 "인터페이스"가 있고, 아래쪽에 상자 두 개 "진짜 구현"과 "프록시"가 나란히 있으며 둘 다 위로 빈 삼각형 화살표(구현 관계)를 그린다. "프록시"에서 "진짜 구현"으로 실선 화살표 "target". 오른쪽 패널 제목 "구체 클래스 기반": 위쪽에 실선 상자 "진짜 클래스", 아래쪽에 상자 "프록시"가 있고 프록시에서 위로 빈 삼각형 화살표(상속). 프록시 상자 안에 회색으로 칠한 작은 칸 "물려받은 필드(null)"와 흰 칸 "target"이 있고, target 칸에서 별도의 상자 "진짜 객체"로 실선 화살표. 오른쪽 패널 아래에 경고 아이콘과 함께 "부모 생성자 호출", "final 불가" 두 라벨. 흰 배경, 단순한 선.</x-prompt>
+<x-caption>인터페이스 기반 프록시는 진짜 객체와 형제 관계이고, 구체 클래스 기반 프록시는 진짜 클래스의 자식이라 부모의 생성자와 필드를 함께 물려받는다.</x-caption>
+</x-visual>
+
+<h3>손으로 만든 프록시의 두 벽</h3>
+<p>요구사항으로 돌아가 점검해 보자. 1번(원본 무수정)과 2번(일부 메서드 제외)과 4번(로그 모양)은 v1과 v2에서 만족했다. 그러나 두 가지가 남았다.</p>
+<p><b>첫째 벽은 프록시 클래스의 수다.</b> v1과 v2에서 프록시 클래스를 여섯 개 만들었다. 실제 애플리케이션에 로그를 붙일 클래스가 백 개라면 프록시 클래스도 백 개다. 그런데 여섯 개의 프록시를 다시 보면 하는 일이 모두 같다. 로그를 시작하고, 타깃의 같은 이름 메서드를 같은 인자로 부르고, 결과에 따라 종료 또는 예외 로그를 남긴다. 다른 것은 로그 메시지에 들어가는 클래스·메서드 이름과, 호출할 메서드의 시그니처뿐이다. 02회에서 템플릿으로 모은 중복이 이번에는 클래스 단위로 다시 생긴 셈이다. "부가 기능 로직은 하나만 만들고, 그것을 적용할 프록시 클래스는 실행 중에 만들어 낼 수 없을까"가 04회의 질문이다. 메서드를 이름과 인자로 다루는 리플렉션, 인터페이스를 받아 프록시 클래스를 만들어 주는 JDK 동적 프록시, 구체 클래스의 하위 클래스를 바이트코드로 생성하는 CGLIB이 그 답이다.</p>
+<p><b>둘째 벽은 v3, 곧 컴포넌트 스캔이다.</b> v1과 v2에서 프록시를 끼울 수 있었던 것은 <code>@Bean</code> 메서드라는 자리가 있었기 때문이다. 그 메서드 안에서 진짜 객체를 만들고, 컨테이너에 넘길 객체로 프록시를 골라 돌려줄 수 있었다. 컴포넌트 스캔에는 그런 자리가 없다. 스캔이 <code>@Service</code>가 붙은 <code>ArticleServiceV3</code>를 찾으면 그 클래스 자체가 빈 정의가 되고, 컨테이너는 그 클래스의 생성자를 직접 호출해 만든 객체를 그대로 빈으로 등록한다. 우리 코드가 "만든 객체"와 "등록할 객체" 사이에 끼어들 틈이 없다. 06회의 빈 후처리기(bean post-processor)가 바로 그 틈, 객체가 만들어진 뒤 빈 저장소에 들어가기 직전의 확장 지점이다.</p>
+<pre class="diagram">  @Bean 등록 (v1, v2)                       컴포넌트 스캔 (v3)
+
+  @Bean 메서드 실행                          스캔이 클래스를 찾음
+     │ new 진짜 객체                             │ 빈 정의 = 그 클래스
+     │ new 프록시(진짜)    ◀── 우리가 고른다      │ 컨테이너가 생성자 호출
+     ▼                                           ▼
+  반환한 객체를 빈으로 등록                   만든 객체를 그대로 빈으로 등록
+                                                 (끼어들 자리 없음 → 06회)</pre>
+<p>정리하면 이 회차는 "무엇을" 해야 하는지를 확정했다. 클라이언트와 서버 사이에 같은 타입의 객체를 세우면 원본을 고치지 않고 기능을 더할 수 있다. 남은 것은 "어떻게 적게 만들고, 어떻게 자동으로 끼워 넣을 것인가"이고, 04회부터 06회까지가 그 두 질문에 차례로 답한다. 05회의 스프링 <code>ProxyFactory</code>는 JDK 동적 프록시와 CGLIB 중 무엇을 쓸지를 대신 골라 준다.</p>
+
+<h3>흔한 오해 바로잡기</h3>
+<ul>
+<li><b>"프록시는 네트워크 장비의 이름이다."</b> 네트워크의 프록시 서버도 프록시지만, 이 권에서 말하는 프록시는 한 JVM 안에서 다른 객체 대신 호출을 받는 평범한 객체다. 둘 다 "같은 말을 하는 대리자"라는 구조를 공유할 뿐이다.</li>
+<li><b>"프록시 패턴과 데코레이터 패턴은 코드 구조가 다르다."</b> 이 회차의 두 예제처럼 둘은 코드 모양이 사실상 같다. 같은 인터페이스를 구현하고 다음 객체를 감싸 위임한다. 차이는 접근을 통제하려는 것이냐, 기능을 덧붙이려는 것이냐는 의도에 있다.</li>
+<li><b>"프록시를 적용하면 객체가 하나로 합쳐진다."</b> 위임 방식의 프록시를 쓰면 객체는 늘어난다. 프록시와 진짜 객체가 따로 있고, 컨테이너에는 프록시만 빈으로 있다. 진짜 객체 타입으로 빈을 찾으면 인터페이스 기반에서는 찾을 수 없다.</li>
+<li><b>"인터페이스에 붙인 애너테이션은 상속되지 않으니 프록시에서는 무시된다."</b> 자바의 <code>@Inherited</code>는 상위 클래스의 클래스 애너테이션에만 적용되고, 그 Javadoc은 구현한 인터페이스의 애너테이션에는 효과가 없다고 명시한다. 그러나 스프링은 자바의 애너테이션 상속 규칙에 기대지 않는다. <code>AnnotatedElementUtils</code>의 find 의미론이 인터페이스와 상위 클래스를 직접 뒤지므로, 스프링 MVC는 인터페이스에 붙인 <code>@RestController</code>와 매핑 애너테이션을 찾아낸다.</li>
+<li><b>"구체 클래스 기반 프록시는 언제나 부모 생성자를 두 번 부른다."</b> 손으로 쓴 하위 클래스는 JLS 규칙상 반드시 부모 생성자를 거친다. 반면 스프링이 CGLIB으로 만드는 프록시 객체는 Objenesis로 생성자를 우회해 만들어지므로, 레퍼런스에 따르면 JVM이 우회를 허용하는 한 대상의 생성자가 두 번 호출되지 않는다.</li>
+</ul>
+</x-lecture>
+
+<x-summary>
+<dt>프록시(proxy)</dt><dd>클라이언트와 서버 사이에서 서버와 같은 타입으로 서서 호출을 대신 받는 객체다. 클라이언트가 추상 타입에 의존하고 그 참조를 바깥에서 주입받을 때만 끼어들 수 있다.</dd>
+<dt>프록시 패턴</dt><dd>프록시를 접근 제어의 의도로 쓰는 패턴이다. 캐시, 권한 검사, 지연 로딩처럼 타깃을 부를지, 언제 부를지를 프록시가 정한다.</dd>
+<dt>데코레이터 패턴</dt><dd>프록시를 기능 추가의 의도로 쓰는 패턴이다. 타깃을 부르고 그 앞뒤에서 로그, 시간 측정, 결과 꾸미기를 더하며, 체인의 순서가 의미를 가진다.</dd>
+<dt>메서드 선택</dt><dd><code>invokeinterface</code>와 <code>invokevirtual</code>은 메서드를 이름과 서술자로만 가리키고, 실행할 코드는 피연산자 객체의 런타임 클래스로 고른다. 그래서 클라이언트를 다시 컴파일하지 않고 프록시를 끼울 수 있다.</dd>
+<dt>인터페이스 기반 프록시</dt><dd>타깃과 같은 인터페이스를 구현하는 프록시다. 생성자·<code>final</code> 제약이 없고 빠뜨린 메서드는 컴파일 오류가 되지만, 구현 클래스 타입으로는 주입·캐스팅할 수 없다.</dd>
+<dt>구체 클래스 기반 프록시</dt><dd>타깃 클래스를 상속하는 프록시다. 인터페이스가 없어도 되지만 부모 생성자를 거쳐야 하고, 쓰지 않는 부모 필드를 품으며, 오버라이드를 빠뜨리면 부모 코드가 빈 상태로 실행되고, <code>final</code> 클래스·메서드에는 적용할 수 없다.</dd>
+<dt>빈으로 등록되는 것</dt><dd><code>@Bean</code> 메서드가 프록시를 돌려주면 컨테이너에는 프록시만 빈으로 들어가고, 진짜 객체는 프록시의 필드로만 존재한다.</dd>
+<dt>손으로 만든 프록시의 한계</dt><dd>대상 클래스마다 거의 같은 프록시 클래스를 만들어야 하고, 컴포넌트 스캔으로 등록되는 빈에는 끼워 넣을 자리가 없다. 04회의 동적 프록시와 06회의 빈 후처리기가 각각을 푼다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 프록시를 처음 의식하게 되는 순간은 대개 장애다. "이 메서드에 붙인 트랜잭션이나 로그가 왜 동작하지 않지?"를 따라가 보면 호출이 프록시를 거치지 않은 경우가 많다. 이 회차의 구체 클래스 기반 프록시에서 <code>archive</code>를 빠뜨렸을 때처럼, 프록시가 가로채지 못한 메서드는 아무 경고 없이 원래 코드로 실행된다. 프레임워크가 만든 프록시도 같다. <code>final</code> 메서드, 프록시를 거치지 않는 경로의 호출은 부가 기능을 건너뛴다. 원인을 찾을 때는 "지금 이 호출의 대상 객체가 프록시인가, 진짜 객체인가"를 먼저 확인하고, 디버거나 로그로 <code>getClass()</code>를 찍어 보는 것이 가장 빠르다.</p>
+<p>인터페이스를 둘지 말지는 프록시 때문에 정할 일이 아니다. 구현이 실제로 바뀔 수 있는 경계(외부 API 연동, 저장 방식, 교체 가능한 정책)에 인터페이스를 두고, 나머지는 구체 클래스로 두는 것이 보통의 판단이다. 대신 그 판단의 결과로 두 종류의 프록시가 섞인다는 것을 알고 있어야 한다. 인터페이스 기반 프록시가 적용된 빈을 구현 클래스 타입으로 주입받으려 하면 빈을 찾지 못하고, 구체 클래스 기반 프록시는 부모 생성자와 <code>final</code>에 민감하다. 어느 쪽이 적용되었는지에 따라 같은 코드가 다르게 실패한다.</p>
+<p>프록시를 직접 작성해야 할 때(외부 라이브러리 객체에 캐시나 재시도를 씌우는 경우 등)는 두 가지를 습관으로 삼는다. 첫째, 프록시는 싱글톤으로 공유되므로 변경 가능한 필드를 두지 않거나 스레드 안전하게 만들고, 요청별 상태는 메서드 지역 변수나 <code>ThreadLocal</code>에 둔다. 둘째, 예외를 잡았다면 원래 예외 그대로 다시 던져 클라이언트가 보는 계약을 바꾸지 않는다. 시간을 재는 프록시라면 첫 호출에 섞이는 클래스 로딩·호출 지점 연결 같은 일회성 비용도 함께 잰다는 점을 감안하고 숫자를 읽는다.</p>
+</x-review>
+
+<x-practice>
+<li>캐시 프록시 <code>CachingQuoteSource</code>와, 호출될 때마다 내부 카운터를 1 올리고 타깃에 위임하는 데코레이터 <code>CountingQuoteSource</code>가 있다. 조립 A는 <code>new CachingQuoteSource(new CountingQuoteSource(new SlowQuoteSource()))</code>, 조립 B는 <code>new CountingQuoteSource(new CachingQuoteSource(new SlowQuoteSource()))</code>이다. 각각에 <code>quote("USD")</code>를 세 번 부른 뒤 카운터 값과 <code>SlowQuoteSource</code>의 실행 횟수를 예측하라.</li>
+<li>인터페이스 기반 프록시를 적용한 v1 애플리케이션이 시작된 직후의 상태를 그려라. 컨테이너가 빈으로 관리하는 객체와 그렇지 않은 객체를 구분하고, <code>ArticleServiceV1Impl</code> 객체의 <code>articleRepository</code> 필드가 어느 클래스의 객체를 가리키는지 표시하라.</li>
+<li><code>ArticleServiceV2</code>에 두 메서드가 새로 추가되었다. <code>registerAll(List<String> titles)</code>는 반복문에서 <code>register(t)</code>를 부르고, <code>saveAllDirect(List<String> titles)</code>는 반복문에서 <code>articleRepository.save(t)</code>를 직접 부른다. <code>ArticleServiceV2Proxy</code>는 두 메서드를 오버라이드하지 않았다. 프록시 빈에 대해 두 메서드를 각각 호출하면 무슨 일이 일어나는지 설명하라.</li>
+<li>동료가 v1의 <code>ArticleControllerV1</code> 인터페이스에서 <code>@RestController</code>를 지우고 <code>ArticleControllerV1Proxy</code> 클래스에 붙였다. 로컬에서는 잘 동작했는데 설정 클래스의 등록 순서를 바꾼 뒤 404가 난다. 원인을 핸들러 매핑이 빈 타입을 얻는 방식으로 설명하라.</li>
+<li>외부 라이브러리의 <code>final class TaxCalculator</code>에 로그를 붙이고 싶다. 이 클래스를 쓰는 서비스는 <code>TaxCalculator</code> 타입의 필드를 갖고 있다. 이 회차에서 본 두 가지 프록시 방식이 각각 왜 바로 쓰일 수 없는지 설명하고, 원본 라이브러리를 고치지 않고 가능한 방법을 제시하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 조립 A에서는 캐시가 바깥에 있다. 첫 호출은 캐시가 비어 있어 <code>CountingQuoteSource</code>로 위임되고(카운터 1), 다시 <code>SlowQuoteSource</code>까지 내려간다(실행 1회). 두 번째와 세 번째 호출은 캐시에서 끝나므로 안쪽은 호출 사실을 모른다. 카운터 1, 실행 1회다. 조립 B에서는 카운터가 바깥에 있어 모든 호출을 센다. 카운터 3이고, 그 안의 캐시가 두 번째부터 막으므로 <code>SlowQuoteSource</code>는 1회 실행된다. 체인의 바깥에 있는 객체는 안쪽 전체를 감싸고, 접근 제어 프록시는 자기보다 안쪽에 있는 것들에 호출이 닿는 것 자체를 막는다는 점이 결과를 가른다.</p>
+<p><b>2.</b> 빈은 <code>ArticleControllerV1Proxy</code>, <code>ArticleServiceV1Proxy</code>, <code>ArticleRepositoryV1Proxy</code>, <code>ThreadLocalLogTrace</code>, 그리고 CGLIB 하위 클래스로 바뀐 설정 클래스 객체 등이다. <code>ArticleControllerV1Impl</code>, <code>ArticleServiceV1Impl</code>, <code>ArticleRepositoryV1Impl</code>은 빈이 아니고 각 프록시의 <code>target</code> 필드로만 참조된다. <code>ArticleServiceV1Impl.articleRepository</code>는 <code>ArticleRepositoryV1Proxy</code>를 가리킨다. <code>articleServiceV1</code> 빈 메서드 안에서 부른 <code>articleRepositoryV1(logTrace)</code>가 설정 클래스의 CGLIB 하위 클래스에 가로채져 컨테이너에 등록된 리포지토리 빈, 곧 프록시를 돌려주기 때문이다. 그래서 요청은 프록시와 진짜 객체를 번갈아 지난다.</p>
+<p><b>3.</b> 두 메서드 모두 프록시에 없으므로 상속받은 부모 코드가 프록시 객체(<code>this</code>)를 대상으로 실행된다. <code>registerAll</code> 자체의 로그는 남지 않는다. 그러나 반복문 안의 <code>register(t)</code>는 <code>this.register(t)</code>이고, <code>invokevirtual</code>의 메서드 선택에 따라 <code>this</code>의 클래스인 프록시의 <code>register</code>가 실행된다. 그래서 제목마다 서비스 로그가 남고 타깃에 위임되어 정상 동작한다. 깊이 0의 호출이 끝날 때마다 <code>ThreadLocal</code>을 지우므로 두 제목은 서로 다른 트랜잭션 ID로 찍힌다. 반면 <code>saveAllDirect</code>는 부모 코드가 <code>this.articleRepository</code>를 직접 쓰는데, 프록시 객체의 그 칸은 <code>super(null)</code>로 채운 <code>null</code>이므로 <code>NullPointerException</code>이 난다. 원고를 쓰며 실행해 본 결과도 그랬다. 같은 "오버라이드 누락"이라도 부모 코드가 무엇을 쓰느냐에 따라 우연히 동작하기도 하고 터지기도 한다는 것이 이 방식의 위험이다.</p>
+<p><b>4.</b> <code>RequestMappingHandlerMapping</code>은 각 빈의 타입을 <code>getType(beanName)</code>으로 얻어 <code>@Controller</code>가 있는지 본다. 그 빈이 이미 만들어져 있으면 실제 객체의 클래스(프록시 클래스)를, 아직 없으면 <code>@Bean</code> 메서드의 반환 타입(인터페이스)을 쓴다. 애너테이션이 프록시 클래스에만 있으면 컨트롤러 빈이 먼저 만들어진 경우에만 찾히고, 핸들러 매핑이 먼저 초기화되면 인터페이스에는 아무것도 없으니 컨트롤러로 인식되지 않는다. 등록 순서가 바뀌면서 후자가 된 것이다. 인터페이스, 곧 <code>@Bean</code> 메서드의 반환 타입에 <code>@RestController</code>를 두면 두 경우 모두 찾힌다.</p>
+<p><b>5.</b> 구체 클래스 기반 프록시는 <code>final</code> 클래스를 상속할 수 없으므로 불가능하다(JLS §8.1.4). 인터페이스 기반 프록시는 <code>TaxCalculator</code>가 구현한 인터페이스가 없고, 있더라도 서비스가 구체 클래스 타입에 의존하므로 다른 타입의 객체를 그 필드에 넣을 수 없다. 원본 라이브러리를 고치지 않으려면 우리 쪽에 인터페이스(예: <code>TaxPolicy</code>)를 만들고 <code>TaxCalculator</code>를 감싸 그 인터페이스를 구현하는 어댑터를 둔 뒤, 서비스가 그 인터페이스에 의존하도록 바꾼다. 그러면 어댑터 앞에 로그 프록시를 자유롭게 세울 수 있다. 이때 고치는 것은 라이브러리가 아니라 우리 서비스의 의존 타입이다. 프록시가 설 자리는 결국 "클라이언트가 추상 타입에 의존하는가"로 정해진다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>QuoteClient.show</code>의 바이트코드에는 <code>invokeinterface QuoteSource.quote</code>가 들어 있다. 이 명령이 실제로 어떤 클래스의 <code>quote</code>를 실행할지는 무엇으로 정해지는가?</q>
+<o>필드 <code>source</code>의 선언 타입인 <code>QuoteSource</code>로 컴파일 시점에 정해진다</o>
+<o>실행 시점에 피연산자 스택에 놓인 객체 참조가 가리키는 객체의 클래스로 정해진다</o>
+<o>스프링 컨테이너가 호출할 때마다 가로채서 정한다</o>
+<o>클래스 로딩 순서가 앞선 구현 클래스로 정해진다</o>
+<why>JVMS의 <code>invokeinterface</code> 설명은 objectref의 클래스 C와 해석된 메서드를 기준으로 실행할 메서드를 선택한다고 정한다. 선언 타입은 어떤 메서드 이름·서술자를 부를지만 정한다. 컨테이너는 객체를 조립할 때만 관여하고 매 호출에 끼지 않으며, 클래스 로딩 순서는 메서드 선택과 관계없다. 그래서 클라이언트를 다시 컴파일하지 않고 프록시를 끼울 수 있다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>캐시 프록시와 로그 데코레이터는 둘 다 같은 인터페이스를 구현하고 타깃을 필드로 감싸 위임한다. 둘을 프록시 패턴과 데코레이터 패턴으로 가르는 기준은 무엇인가?</q>
+<o>인터페이스를 구현하느냐 클래스를 상속하느냐</o>
+<o>타깃을 생성자로 받느냐 세터로 받느냐</o>
+<o>접근을 제어하려는 것이냐, 기능을 덧붙이려는 것이냐는 의도</o>
+<o>스프링 빈으로 등록되느냐 아니냐</o>
+<why>두 패턴은 코드 모양이 사실상 같고, 구분은 의도에 있다. 캐시 프록시는 타깃에 닿을지 말지를 통제하고(접근 제어), 로그 데코레이터는 언제나 타깃을 부르며 기록을 덧붙인다. 인터페이스냐 상속이냐는 프록시를 만드는 방식의 차이일 뿐 패턴을 가르지 않고, 주입 방식이나 빈 등록 여부도 무관하다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>구체 클래스를 상속해 만든 프록시가 부모의 공개 메서드 하나를 오버라이드하지 않았다. 프록시 객체에 그 메서드를 호출하면 어떻게 되는가?</q>
+<o>컴파일 오류가 나서 애초에 프록시를 만들 수 없다</o>
+<o>상속받은 부모의 코드가 프록시 객체를 <code>this</code>로 하여 실행되므로, 부모 생성자에 넘긴 값으로 채워진 프록시의 필드를 쓰게 된다</o>
+<o>JVM이 자동으로 <code>target</code> 필드에 위임한다</o>
+<o><code>AbstractMethodError</code>가 발생한다</o>
+<why>부모 클래스에 구현이 있으므로 컴파일러는 아무 말도 하지 않는다(인터페이스였다면 컴파일 오류). 호출되면 메서드 선택이 상속받은 부모 메서드를 고르고, 그 코드는 프록시 객체의 필드를 읽는다. 그 필드는 <code>super(null)</code> 같은 값으로 채워져 있어 NPE가 나거나 엉뚱하게 동작한다. JVM은 위임 필드의 존재를 모르며, 구현이 있으므로 <code>AbstractMethodError</code>도 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>v1처럼 <code>@Bean</code> 메서드가 <code>ArticleServiceV1Proxy</code>를 돌려주도록 설정했다. 다른 빈이 생성자에서 <code>ArticleServiceV1Impl</code> 타입으로 의존관계를 주입받으려 하면 어떻게 되는가?</q>
+<o>프록시가 주입된다. 프록시도 <code>ArticleServiceV1</code>을 구현하기 때문이다</o>
+<o>프록시 안의 진짜 객체가 꺼내져 주입된다</o>
+<o>그 타입의 빈이 없어 주입에 실패한다</o>
+<o>컨테이너가 <code>ArticleServiceV1Impl</code>을 새로 만들어 주입한다</o>
+<why>컨테이너에 등록된 것은 프록시뿐이고, 프록시는 <code>ArticleServiceV1</code> 인터페이스를 구현할 뿐 <code>ArticleServiceV1Impl</code>의 하위 타입이 아니다. 같은 구조인 컨트롤러에 대해 실험해 보아도 <code>ArticleControllerV1Impl</code> 타입의 빈은 하나도 없었다. 진짜 객체는 프록시의 필드일 뿐 빈이 아니므로 꺼내 주지 않으며, 빈이 아닌 클래스를 컨테이너가 임의로 만들지도 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>스프링 6.x에서 인터페이스 기반 프록시를 적용할 컨트롤러라면 <code>@RestController</code>(또는 <code>@Controller</code>)를 인터페이스에 붙이는 것이 안전한 이유로 가장 정확한 것은?</q>
+<o>핸들러 매핑이 판단에 쓰는 빈 타입이 <code>@Bean</code> 메서드의 반환 타입(인터페이스)일 수도, 프록시 클래스일 수도 있는데, 인터페이스에 붙이면 두 경우 모두 찾히기 때문이다</o>
+<o>자바의 <code>@Inherited</code>가 인터페이스의 애너테이션을 구현 클래스에 물려주기 때문이다</o>
+<o>컴포넌트 스캔이 인터페이스를 빈으로 등록해 주기 때문이다</o>
+<o>타입 수준 <code>@RequestMapping</code>이 인터페이스에서만 동작하기 때문이다</o>
+<why><code>getType</code>은 빈이 만들어졌으면 실제 클래스를, 아니면 예측 타입(반환 타입)을 돌려주고, <code>isHandler</code>의 <code>hasAnnotation</code>은 인터페이스와 상위 클래스까지 찾는다. 그래서 인터페이스에 둔 애너테이션은 어느 경로에서나 찾힌다. <code>@Inherited</code>는 구현한 인터페이스의 애너테이션에 효과가 없고, 컴포넌트 스캔은 인터페이스를 후보로 삼지 않으며, 6.0부터 타입 수준 <code>@RequestMapping</code>만으로는 컨트롤러로 감지되지 않는다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>프록시(proxy)</dt><dd>다른 객체 대신 호출을 받는 대리 객체. 서버와 같은 타입이어서 클라이언트가 구분하지 못한다.</dd>
+<dt>타깃(target)</dt><dd>프록시가 감싸서 최종적으로 일을 넘기는 진짜 객체. 다른 프록시일 수도 있다.</dd>
+<dt>프록시 체인(proxy chain)</dt><dd>프록시가 다른 프록시를 타깃으로 감싸 여러 겹으로 이어진 구조. 바깥 객체가 안쪽 전체를 감싼다.</dd>
+<dt>접근 제어(access control)</dt><dd>타깃에 닿을지, 언제 닿을지를 프록시가 결정하는 것. 캐시, 권한 검사, 지연 로딩이 해당한다.</dd>
+<dt>데코레이터(decorator)</dt><dd>같은 인터페이스로 객체를 감싸 책임을 덧붙이는 객체. 상속보다 유연하게 기능을 조합한다.</dd>
+<dt>메서드 선택(method selection)</dt><dd>JVMS §5.4.6. <code>invokevirtual</code>·<code>invokeinterface</code>가 객체의 런타임 클래스와 해석된 메서드로 실제 실행할 메서드를 고르는 과정.</dd>
+<dt>암묵적 상위 생성자 호출(implicit super())</dt><dd>JLS §8.8.7. 생성자가 명시적 생성자 호출로 시작하지 않으면 컴파일러가 상위 클래스의 인자 없는 생성자 호출을 넣는다.</dd>
+<dt>find 의미론(find semantics)</dt><dd>스프링 <code>AnnotatedElementUtils</code>의 탐색 방식. 클래스면 인터페이스와 상위 클래스, 메서드면 그들의 같은 메서드까지 애너테이션을 찾는다.</dd>
+<dt>Objenesis</dt><dd>생성자를 호출하지 않고 객체를 만드는 라이브러리. 스프링은 CGLIB 프록시 객체를 이것으로 만들어 대상 생성자의 이중 호출을 피한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/core/aop/proxying.html">Spring Framework 6.2 Reference — Proxying Mechanisms</a> — JDK 동적 프록시와 CGLIB 선택 기준, final 메서드 제약, Objenesis</li>
+<li><a href="https://github.com/spring-projects/spring-framework/wiki/Spring-Framework-6.0-Release-Notes">Spring Framework 6.0 Release Notes</a> — 타입 수준 @RequestMapping만으로는 컨트롤러를 감지하지 않는 변경과 인터페이스 기반 프록시 안내</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-8.html">JLS 21 Chapter 8 — Classes</a> — §8.1.4 final 클래스 상속 금지, §8.4.3.3 final 메서드, §8.8.7 암묵적 super(), §8.8.9 기본 생성자</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-12.html">JLS 21 Chapter 12 — Execution</a> — §12.5 새 객체 생성 시 상위 클래스 필드 할당과 생성자 처리 순서</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-6.html">JVMS 21 Chapter 6 — The Java Virtual Machine Instruction Set</a> — invokeinterface, invokevirtual의 메서드 선택과 invokedynamic의 호출 지점 연결</li>
+<li><a href="https://docs.hibernate.org/orm/6.6/userguide/html_single/Hibernate_User_Guide.html#entity-pojo-final">Hibernate ORM 6.6 User Guide — Prefer non-final classes</a> — 지연 로딩 프록시가 non-final 클래스나 인터페이스에 의존하는 이유</li>
+</x-refs>

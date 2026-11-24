@@ -1,0 +1,909 @@
+<x-meta>
+deck: 반복문이 섞어 쓰던 "무엇을"과 "어떻게"를 스트림이 어떻게 갈라 놓는지에서 출발해, 파이프라인 단계 객체, 지연 연산, Sink 사슬, 단락과 플래그 최적화를 OpenJDK 21 소스와 실행 추적으로 따라간다.
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li>스트림과 컬렉션의 차이(저장하지 않음, 소스를 바꾸지 않음, 지연, 무한 가능, 한 번만 소비)를 API 문서의 정의로 설명하고, 같은 스트림을 두 번 쓸 때 어디서 어떤 예외가 나는지 예측할 수 있다.</li>
+<li><code>list.stream().filter(...).map(...)</code>를 호출할 때 힙에 어떤 단계 객체가 생기고 서로 어떻게 연결되는지(<code>previousStage</code>, <code>sourceStage</code>, <code>depth</code>) 그림으로 그릴 수 있다.</li>
+<li>중간 연산만 있는 파이프라인이 왜 아무 일도 하지 않는지, 최종 연산이 호출되는 순간 Sink 사슬이 어떻게 만들어지고 원소가 한 개씩 끝까지 밀려 내려가는지 실행 순서대로 추적할 수 있다.</li>
+<li>루프 융합, 단락(<code>findFirst</code>, <code>limit</code>), 상태 있는 연산(<code>sorted</code>)의 장벽, 스트림 플래그에 의한 생략(<code>count</code>, <code>sorted</code>, <code>distinct</code>)이 각각 언제 일어나고 언제 일어나지 않는지 판정할 수 있다.</li>
+<li>최종 연산 누락, <code>peek</code>에 둔 로직, 소스 수정, 연산 순서처럼 지연 연산 때문에 생기는 함정을 실행 결과로 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 반복문은 무엇을 섞어 놓는가</h3>
+<p>앞의 네 회차에서 람다와 함수형 인터페이스, 메서드 참조를 다졌다. 3회에서는 람다를 이용해 거르기(filter)와 바꾸기(map) 같은 도구를 직접 만들어 보기도 했다. 이 회차부터 세 회에 걸쳐 그 도구들의 완성형인 스트림 API(Stream API, <code>java.util.stream</code>)를 다룬다. 이번 회차는 스트림이 무엇이고 파이프라인이 어떻게 조립되며, 왜 "지연"되어 실행되는지를 바닥까지 판다. 스트림을 만드는 여러 방법과 중간·최종 연산의 목록은 6회, <code>collect</code>와 <code>Collector</code>의 구조는 7회, 병렬 스트림은 10회의 몫이다.</p>
+<p>출발점은 평범한 문제다. 단어 목록에서 길이가 5 이상인 단어를 골라 대문자로 바꾸고, 그중 처음 두 개만 얻고 싶다. 자바 입문편 이후 우리가 가장 익숙하게 쓰는 방법은 반복문 하나에 모든 것을 넣는 것이다.</p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class Start {
+    public static void main(String[] args) {
+        List<String> words = List.of("apple", "kiwi", "banana", "fig", "cherry", "grape");
+
+        // 1) 반복문 하나에 모두 섞어 쓴 방식
+        List<String> r1 = new ArrayList<>();
+        for (String w : words) {
+            if (w.length() >= 5) {          // 거르기
+                r1.add(w.toUpperCase());    // 바꾸기 + 모으기
+                if (r1.size() == 2) break;  // 개수 제한 + 조기 종료
+            }
+        }
+
+        // 2) 단계마다 결과를 컬렉션에 담는 방식
+        List<String> longWords = new ArrayList<>();
+        for (String w : words) if (w.length() >= 5) longWords.add(w);
+        List<String> upper = new ArrayList<>();
+        for (String w : longWords) upper.add(w.toUpperCase());
+        List<String> r2 = upper.subList(0, Math.min(2, upper.size()));
+
+        System.out.println(r1);
+        System.out.println(r2);
+        System.out.println(longWords.size() + " " + upper.size());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[APPLE, BANANA]
+[APPLE, BANANA]
+4 4</code></pre>
+<p>두 방식은 같은 답을 내지만 성격이 정반대다. 1번은 효율적이다. 목록을 한 번만 돌고, 중간 결과를 담는 컬렉션이 없고, 두 개를 찾자마자 <code>break</code>로 빠져나간다. 실제로 "apple", "kiwi", "banana" 세 단어만 보고 끝난다. 대신 읽기 어렵다. 거르기, 바꾸기, 모으기, 개수 제한, 조기 종료라는 다섯 가지 생각이 중첩된 <code>if</code>와 <code>break</code> 안에 한데 엉켜 있다. 조건 하나를 바꾸거나 단계를 하나 끼워 넣으려면 엉킨 실타래를 풀어야 한다.</p>
+<p>2번은 단계가 또렷하다. 거르는 반복문, 바꾸는 반복문, 자르는 줄이 따로 있다. 대신 비효율적이다. 목록 전체를 거른 결과 4개를 <code>longWords</code>에 담고, 4개 모두를 대문자로 바꿔 <code>upper</code>에 담은 뒤에야 앞의 두 개만 쓴다. 두 개만 필요했는데 여섯 단어를 모두 검사했고, 대문자 변환도 두 번 더 했고, 중간 리스트를 두 개나 만들었다. 단어가 백만 개라면 백만 개짜리 중간 리스트가 생긴다. 목록이 끝없이 이어진다면(예를 들어 계속 생성되는 수열이라면) 2번 방식은 아예 끝나지 않는다.</p>
+<p>이 딜레마의 뿌리는 반복을 <b>누가 통제하는가</b>에 있다. 두 방식 모두 반복문을 쓰는 우리 코드가 "다음 원소를 꺼내고, 검사하고, 담고, 멈출지 정하는" 반복의 절차를 직접 통제한다. 이것을 외부 반복(external iteration)이라고 부른다. 외부 반복에서는 효율을 얻으려면 절차를 손으로 합쳐야 하고(1번), 절차를 나누면 효율을 잃는다(2번). 스트림은 반복의 통제권을 라이브러리로 넘긴다. 우리는 "무엇을" 할지만 단계별로 선언하고, "어떻게" 반복할지는 라이브러리가 정한다. 이것이 내부 반복(internal iteration)이다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>스트림의 중간 연산(<code>filter</code>, <code>map</code>, <code>limit</code> …)은 일을 하지 않는다. 호출할 때마다 "이전 단계에 이런 연산을 덧붙인다"는 설명서 한 장, 곧 새 파이프라인 단계 객체를 만들어 사슬로 이어 둘 뿐이다. 최종 연산이 호출되는 순간에야 라이브러리는 그 설명서를 거꾸로 읽어 원소를 받아 처리하는 Sink 객체들의 사슬을 조립하고, 소스의 원소를 하나씩 사슬 끝까지 밀어 넣는다. 그래서 여러 단계가 한 번의 순회로 합쳐지고(루프 융합), 필요한 만큼만 처리하고 멈출 수 있으며(단락), 소스의 성질을 미리 알면 단계 자체를 건너뛸 수도 있다. 2번처럼 단계별로 선언하면서 1번처럼 실행되는 것, 이것이 지연 연산이 존재하는 이유다.</p></aside>
+
+<h3>스트림 API 시작: 같은 문제를 스트림으로</h3>
+<p>같은 문제를 스트림으로 쓰면 이렇다. 위 <code>main</code>에 이어 붙여 실행하면 된다.</p>
+<pre><code class="language-java">List<String> r3 = words.stream()            // 소스: 리스트에서 스트림을 얻는다
+        .filter(w -> w.length() >= 5)       // 중간 연산: 거르기
+        .map(String::toUpperCase)           // 중간 연산: 바꾸기
+        .limit(2)                           // 중간 연산: 처음 두 개만
+        .toList();                          // 최종 연산: 리스트로 모으기
+System.out.println(r3);                     // [APPLE, BANANA]</code></pre>
+<p>읽기는 2번 방식처럼 단계가 하나씩 드러난다. 그런데 실행은 1번 방식과 같다. 뒤에서 실행 추적으로 확인하겠지만, 이 파이프라인은 "apple"을 거르고 바로 대문자로 바꿔 결과에 넣고, "kiwi"를 거르다 탈락시키고, "banana"를 거르고 바꿔 넣은 순간 두 개가 찼음을 알고 멈춘다. 나머지 세 단어는 쳐다보지도 않고, 중간 리스트도 만들지 않는다. <code>toList()</code>는 자바 16에 추가된 최종 연산으로, 수정할 수 없는(unmodifiable) 리스트를 돌려준다(API 문서: 변경 메서드를 부르면 항상 <code>UnsupportedOperationException</code>). 그 전 버전에서는 <code>collect(Collectors.toList())</code>를 썼다. 둘의 차이는 7회에서 다룬다.</p>
+<p>이 코드가 컴파일되면 무엇이 되는지 먼저 보자. 스트림 문법이라는 것은 따로 없다. 그저 메서드 호출의 연쇄다. 더 작은 예제로 확인한다.</p>
+<pre><code class="language-java">import java.util.List;
+
+public class Pipe {
+    static List<Integer> run(List<Integer> list) {
+        return list.stream()
+                   .filter(n -> n % 2 == 0)
+                   .map(n -> n * 10)
+                   .toList();
+    }
+}</code></pre>
+<pre data-label="javap -c -p Pipe (JDK 21, 발췌)"><code class="language-text">static java.util.List<java.lang.Integer> run(java.util.List<java.lang.Integer>);
+  Code:
+     0: aload_0
+     1: invokeinterface #7,  1   // InterfaceMethod java/util/List.stream:()Ljava/util/stream/Stream;
+     6: invokedynamic #13,  0    // InvokeDynamic #0:test:()Ljava/util/function/Predicate;
+    11: invokeinterface #17,  2  // InterfaceMethod java/util/stream/Stream.filter:(Ljava/util/function/Predicate;)Ljava/util/stream/Stream;
+    16: invokedynamic #23,  0    // InvokeDynamic #1:apply:()Ljava/util/function/Function;
+    21: invokeinterface #27,  2  // InterfaceMethod java/util/stream/Stream.map:(Ljava/util/function/Function;)Ljava/util/stream/Stream;
+    26: invokeinterface #31,  1  // InterfaceMethod java/util/stream/Stream.toList:()Ljava/util/List;
+    31: areturn
+
+private static java.lang.Integer lambda$run$1(java.lang.Integer);   // n -> n * 10
+private static boolean lambda$run$0(java.lang.Integer);             // n -> n % 2 == 0</code></pre>
+<p>바이트코드를 한 줄씩 읽어 보자. 0번에서 매개변수 <code>list</code>를 피연산자 스택에 올리고, 1번에서 <code>List.stream()</code>을 인터페이스 호출한다. 결과로 <code>Stream</code> 참조 하나가 스택에 남는다. 6번의 <code>invokedynamic</code>은 4회에서 본 대로 람다 <code>n -> n % 2 == 0</code>을 담은 <code>Predicate</code> 객체를 만든다. 이 시점에 람다 본문(<code>lambda$run$0</code>)은 실행되지 않는다. 객체만 생긴다. 11번에서 그 <code>Predicate</code>를 인자로 <code>Stream.filter</code>를 호출하면 또 다른 <code>Stream</code> 참조가 돌아온다. 16번과 21번은 같은 일을 <code>map</code>에 대해 반복하고, 26번에서야 <code>toList()</code>가 호출된다. 메서드 안에 반복문도, 원소를 다루는 명령도 없다. 반복은 전부 <code>toList()</code> 호출 안쪽, 즉 JDK 라이브러리 코드 안에서 일어난다. 내부 반복이란 바이트코드 수준에서 보면 이런 모습이다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>작업 지시서를 쓰는 사람과 공장</strong><p>외부 반복은 공장장이 직접 컨베이어 앞에 서서 물건을 하나씩 집어 검사하고 포장하는 것과 같다. 스트림은 공장장이 "불량품은 빼고, 포장지를 씌우고, 두 개만 출고" 같은 작업 지시서를 단계별로 써서 공장에 넘기는 방식이다. 지시서를 쓰는 동안에는 컨베이어가 돌지 않는다. "출고" 지시가 내려오면 공장은 지시서 전체를 보고 라인을 한 번에 구성한 뒤에야 컨베이어를 돌리고, 물건은 하나씩 검사대와 포장대를 연달아 통과한다. 두 개가 출고되면 라인을 멈춘다. 비유가 깨지는 지점도 있다. 실제 공장은 지시서를 읽고 순서를 바꾸거나 단계를 합칠 수 있지만, 스트림 라이브러리는 람다의 내용을 해석하지 못한다. 그래서 <code>filter</code>와 <code>map</code>의 순서를 바꿔 주지는 않는다. 라이브러리가 아는 것은 람다의 속이 아니라 "이 단계가 원소 수를 바꿀 수 있는가, 정렬 상태를 깨는가" 같은 단계의 성질뿐이다.</p></aside>
+
+<h3>스트림 API란: 저장하지 않는 계산의 흐름</h3>
+<p><code>java.util.stream</code> 패키지 문서는 스트림을 "원소의 흐름에 대한 함수형 연산을 지원하는 클래스들"로 소개하고, 컬렉션과 다른 점을 다섯 가지로 정리한다. 하나씩 무엇을 뜻하는지, 실제로 무엇이 그렇게 만드는지까지 보자.</p>
+<ol>
+<li><b>저장하지 않는다(No storage).</b> 문서의 표현으로 스트림은 원소를 저장하는 자료 구조가 아니라, 자료 구조·배열·생성 함수·I/O 채널 같은 소스의 원소를 계산 연산의 파이프라인으로 "실어 나르는" 것이다. 뒤에서 볼 파이프라인 단계 객체에는 원소를 담는 배열이나 리스트 필드가 없다. 단계 객체가 가진 것은 소스를 가리키는 참조, 이전·다음 단계를 가리키는 참조, 그리고 이 단계에서 할 연산(람다)이다.</li>
+<li><b>함수형이다(Functional in nature).</b> 스트림 연산은 결과를 만들 뿐 소스를 바꾸지 않는다. 컬렉션에서 얻은 스트림을 거르면 걸러진 원소가 빠진 새 스트림이 생기는 것이지, 원본 컬렉션에서 원소가 삭제되는 것이 아니다. <code>List.removeIf</code>가 리스트 자체를 고치는 것과 대비된다.</li>
+<li><b>지연을 추구한다(Laziness-seeking).</b> 거르기, 바꾸기, 중복 제거 같은 많은 연산은 지연해서 구현할 수 있고, 그 덕에 최적화 기회가 생긴다. 문서는 중간 연산(intermediate operation, 스트림을 돌려주는 연산)과 최종 연산(terminal operation, 값이나 부수 효과를 만드는 연산)을 나누고, "중간 연산은 언제나 지연된다(Intermediate operations are always lazy)"고 못 박는다.</li>
+<li><b>무한일 수 있다(Possibly unbounded).</b> 컬렉션의 크기는 유한하지만 스트림은 그렇지 않아도 된다. <code>limit(n)</code>이나 <code>findFirst()</code> 같은 단락 연산이 무한 스트림 위의 계산을 유한한 시간에 끝낼 수 있게 해 준다. 무한 스트림이 가능한 것 자체가 "저장하지 않는다"와 "지연된다"의 결과다. 저장해야 했다면 무한한 원소를 담을 수 없고, 즉시 계산해야 했다면 끝나지 않는다.</li>
+<li><b>소비된다(Consumable).</b> 스트림의 원소는 스트림의 생애 동안 한 번만 방문된다. <code>Iterator</code>처럼, 같은 원소를 다시 방문하려면 소스에서 새 스트림을 얻어야 한다.</li>
+</ol>
+<p>이 다섯 가지를 컬렉션과 나란히 놓으면 차이가 분명해진다.</p>
+<div class="table-wrap"><table><thead><tr><th>관점</th><th>컬렉션(<code>List</code>, <code>Set</code> …)</th><th>스트림(<code>Stream</code>)</th></tr></thead><tbody>
+<tr><td>정체</td><td>원소를 담는 자료 구조</td><td>소스에서 원소를 꺼내 연산을 거쳐 흘려보내는 계산의 기술(description)</td></tr>
+<tr><td>원소가 계산되는 시점</td><td>컬렉션에 넣기 전에 이미 계산되어 있다</td><td>최종 연산이 요구할 때 하나씩 계산된다</td></tr>
+<tr><td>반복</td><td>사용자가 반복을 통제한다(외부 반복: <code>for</code>, <code>Iterator</code>)</td><td>라이브러리가 반복을 통제한다(내부 반복)</td></tr>
+<tr><td>크기</td><td>유한하다</td><td>무한일 수 있다</td></tr>
+<tr><td>재사용</td><td>몇 번이든 순회할 수 있다</td><td>한 번만 순회할 수 있다</td></tr>
+<tr><td>소스 변경</td><td><code>add</code>, <code>remove</code>로 자신을 바꾼다</td><td>소스를 바꾸지 않으며, 실행 중 소스를 바꾸면 안 된다(간섭 금지)</td></tr>
+</tbody></table></div>
+<p>타입 계층도 짚어 두자. 스트림의 공통 부모는 <code>BaseStream</code>이고, 참조형 원소를 다루는 <code>Stream</code>과 기본형을 다루는 <code>IntStream</code>, <code>LongStream</code>, <code>DoubleStream</code>이 그 아래에 있다. 기본형 특화 스트림이 왜 따로 있는지는 6회에서 다룬다. <code>BaseStream</code>은 <code>AutoCloseable</code>을 확장하므로 모든 스트림에 <code>close()</code>가 있다. 다만 <code>Stream</code>의 API 문서는 컬렉션·배열·생성 함수에 기반한 대부분의 스트림은 닫을 필요가 없고, <code>Files.lines(Path)</code>처럼 I/O 채널을 소스로 하는 스트림만 try-with-resources로 닫아야 한다고 설명한다. 스트림이 "저장하지 않고 소스에서 꺼내 온다"는 성질을 생각하면 자연스럽다. 소스가 파일이라면 파이프라인이 끝날 때까지 파일이 열려 있어야 한다.</p>
+
+<h3>파이프라인 구성: 소스, 중간 연산, 최종 연산</h3>
+<p>패키지 문서의 정의로 스트림 파이프라인(stream pipeline)은 하나의 소스(컬렉션, 배열, 생성 함수, I/O 채널 등), 0개 이상의 중간 연산(<code>filter</code>, <code>map</code> 등), 하나의 최종 연산(<code>forEach</code>, <code>reduce</code> 등)으로 이루어진다. 세 부분의 역할을 정리하면 이렇다.</p>
+<div class="table-wrap"><table><thead><tr><th>부분</th><th>예</th><th>반환 타입</th><th>호출했을 때 일어나는 일</th></tr></thead><tbody>
+<tr><td>소스</td><td><code>list.stream()</code>, <code>Stream.of(...)</code>, <code>Arrays.stream(arr)</code>, <code>Stream.iterate(...)</code></td><td><code>Stream</code></td><td>소스를 감싼 첫 단계(Head) 객체를 만든다. 원소는 아직 읽지 않는다.</td></tr>
+<tr><td>중간 연산</td><td><code>filter</code>, <code>map</code>, <code>sorted</code>, <code>distinct</code>, <code>limit</code>, <code>peek</code></td><td><code>Stream</code>(새 단계)</td><td>이전 단계에 연결된 새 단계 객체를 만든다. 원소를 처리하지 않는다.</td></tr>
+<tr><td>최종 연산</td><td><code>toList</code>, <code>forEach</code>, <code>count</code>, <code>findFirst</code>, <code>anyMatch</code>, <code>collect</code>, <code>reduce</code></td><td>값, <code>Optional</code>, 또는 <code>void</code></td><td>파이프라인 전체를 실행하고, 파이프라인을 "소비됨"으로 표시한다.</td></tr>
+</tbody></table></div>
+<p>중간 연산은 다시 두 부류로 나뉜다. 패키지 문서에 따르면 상태 없는(stateless) 연산은 <code>filter</code>, <code>map</code>처럼 새 원소를 처리할 때 앞서 본 원소의 상태를 들고 있지 않아 원소마다 독립적으로 처리할 수 있는 연산이고, 상태 있는(stateful) 연산은 <code>distinct</code>, <code>sorted</code>처럼 앞서 본 원소의 상태를 새 원소 처리에 반영할 수 있는 연산이다. 또 무한 입력에서 유한한 스트림을 만들어 낼 수 있는 중간 연산(<code>limit</code>), 무한 입력에서 유한한 시간에 끝날 수 있는 최종 연산(<code>findFirst</code>, <code>anyMatch</code>)을 단락(short-circuiting) 연산이라고 부른다. 이 분류가 뒤에서 볼 최적화가 가능한지 아닌지를 가른다.</p>
+<h4>중간 연산 하나가 단계 객체 하나다</h4>
+<p>"중간 연산은 새 스트림을 돌려준다"는 말을 그대로 확인해 보자. 각 연산의 반환값을 변수에 받아 클래스 이름과 동일성을 찍는다.</p>
+<pre><code class="language-java">import java.util.List;
+import java.util.stream.Stream;
+
+public class Stages {
+    public static void main(String[] args) {
+        List<Integer> list = List.of(1, 2, 3, 4, 5, 6);
+        Stream<Integer> s0 = list.stream();
+        Stream<Integer> s1 = s0.filter(n -> n % 2 == 0);
+        Stream<Integer> s2 = s1.map(n -> n * 10);
+        Stream<Integer> s3 = s2.sorted();
+
+        System.out.println(s0.getClass().getName());
+        System.out.println(s1.getClass().getName());
+        System.out.println(s2.getClass().getName());
+        System.out.println(s3.getClass().getName());
+        System.out.println(s0 == s1);
+
+        try {
+            s0.map(n -> n);                      // 이미 filter가 붙은 s0에 또 연산을 붙인다
+        } catch (IllegalStateException e) {
+            System.out.println("ISE: " + e.getMessage());
+        }
+        System.out.println(s3.toList());
+        try {
+            s3.toList();                         // 이미 실행된 파이프라인을 다시 실행한다
+        } catch (IllegalStateException e) {
+            System.out.println("ISE2: " + e.getMessage());
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21)"><code class="language-text">java.util.stream.ReferencePipeline$Head
+java.util.stream.ReferencePipeline$2
+java.util.stream.ReferencePipeline$3
+java.util.stream.SortedOps$OfRef
+false
+ISE: stream has already been operated upon or closed
+[20, 40, 60]
+ISE2: stream has already been operated upon or closed</code></pre>
+<p>네 변수가 가리키는 객체가 모두 다르다. <code>list.stream()</code>이 돌려준 것은 <code>ReferencePipeline$Head</code>, 곧 파이프라인의 머리 단계다. <code>filter</code>는 <code>ReferencePipeline$2</code>, <code>map</code>은 <code>ReferencePipeline$3</code>을 돌려줬다. 이름의 <code>$2</code>, <code>$3</code>은 익명 클래스라는 뜻이다(번호는 컴파일러가 소스 순서대로 붙이므로 JDK 버전이 바뀌면 달라질 수 있다. 여기 결과는 OpenJDK 21 기준이다). <code>sorted</code>는 별도 클래스 <code>SortedOps$OfRef</code>의 객체다. 파이프라인은 이렇게 단계(stage) 객체들의 사슬이다.</p>
+<p>이 클래스들의 공통 조상은 <code>java.util.stream.AbstractPipeline</code>이다. OpenJDK 21 소스에서 이 클래스가 단계마다 들고 있는 핵심 필드는 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>필드</th><th>뜻</th></tr></thead><tbody>
+<tr><td><code>sourceStage</code></td><td>사슬의 머리(Head) 단계. 머리 자신은 자기 자신을 가리킨다.</td></tr>
+<tr><td><code>previousStage</code></td><td>바로 앞 단계. 머리는 <code>null</code>.</td></tr>
+<tr><td><code>nextStage</code></td><td>바로 뒤 단계. 다음 연산이 붙을 때 채워진다.</td></tr>
+<tr><td><code>depth</code></td><td>머리로부터의 거리. 머리는 0, 첫 중간 연산은 1.</td></tr>
+<tr><td><code>sourceSpliterator</code> / <code>sourceSupplier</code></td><td>소스(머리에만 있음). 원소를 꺼내는 <code>Spliterator</code> 또는 그것을 나중에 만들어 줄 <code>Supplier</code>.</td></tr>
+<tr><td><code>sourceOrOpFlags</code>, <code>combinedFlags</code></td><td>이 단계의 연산 플래그, 그리고 소스부터 이 단계까지 누적한 스트림 플래그(뒤에서 다룬다).</td></tr>
+<tr><td><code>linkedOrConsumed</code></td><td>이 단계 뒤에 이미 다른 단계가 붙었거나 최종 연산이 실행되었으면 <code>true</code>.</td></tr>
+</tbody></table></div>
+<p>중간 연산이 새 단계를 만들 때 호출되는 <code>AbstractPipeline</code>의 생성자는 하는 일이 단순하다. 먼저 앞 단계의 <code>linkedOrConsumed</code>가 이미 <code>true</code>면 <code>IllegalStateException("stream has already been operated upon or closed")</code>을 던진다. 아니면 앞 단계의 <code>linkedOrConsumed</code>를 <code>true</code>로, 앞 단계의 <code>nextStage</code>를 자신으로 설정하고, 자신의 <code>previousStage</code>, <code>sourceStage</code>, <code>depth</code>(앞 단계 + 1)를 채운 뒤 플래그를 합친다. 원소를 읽는 코드는 어디에도 없다. 위 실행 결과의 첫 번째 예외가 바로 이 생성자에서 났다. <code>s0</code>에는 이미 <code>filter</code> 단계가 붙어 있었으므로 <code>s0.map(...)</code>이 만들려던 새 단계의 생성자가 예외를 던진 것이다. 중간 연산만 호출했는데도 예외가 난다는 점에 주목하자. "같은 스트림에 두 갈래 파이프라인을 붙이는 것"을 생성 시점에 막는 장치다.</p>
+<p>두 번째 예외는 최종 연산 쪽 검사다. 최종 연산이 실행되면 마지막 단계의 <code>linkedOrConsumed</code>가 <code>true</code>가 되고, 소스의 <code>Spliterator</code> 참조는 머리 단계에서 꺼내진 뒤 <code>null</code>로 지워진다. 같은 단계에 최종 연산을 다시 부르면 <code>linkedOrConsumed</code> 검사에서 같은 문구의 예외가 난다. 패키지 문서도 "최종 연산이 수행된 뒤 스트림 파이프라인은 소비된 것으로 간주되어 다시 쓸 수 없다"고 적고 있다.</p>
+<aside class="note"><code>Stream</code>의 API 문서는 재사용을 감지하면 구현이 <code>IllegalStateException</code>을 던질 "수 있다(may)"고만 쓰고, 어떤 연산은 새 스트림 대신 자기 자신을 돌려주기 때문에 모든 재사용을 감지하지는 못할 수 있다고 덧붙인다. OpenJDK에서 <code>parallel()</code>과 <code>sequential()</code>이 그런 예로, 머리 단계의 병렬 여부만 바꾸고 <code>this</code>를 돌려준다. 예외가 안 났다고 재사용이 허용된 것은 아니다. 규칙은 "스트림은 한 번만 연산한다"이다.</aside>
+<h4>힙에 생긴 사슬</h4>
+<p>위 예제에서 <code>s3</code>까지 만든 직후, 최종 연산을 부르기 전의 메모리를 그려 보면 이렇다. 스택의 지역 변수 네 개가 힙의 단계 객체 네 개를 하나씩 가리키고, 단계 객체끼리는 앞뒤로 연결되어 있다. <code>filter</code>와 <code>map</code> 단계의 익명 클래스는 각자 넘겨받은 람다 객체(<code>Predicate</code>, <code>Function</code>)를 캡처해 들고 있다. 소스 원소를 꺼낼 <code>Spliterator</code>는 머리 단계에만 있다.</p>
+<pre class="diagram">  스택 (main 프레임)              힙
+ ┌──────────────┐
+ │ list ────────┼──▶ List.of(1,2,3,4,5,6)
+ │              │          ▲ (원소를 꺼낼 Spliterator가 이 리스트를 가리킨다)
+ │ s0 ──────────┼──▶ ┌─────────────────────────────┐
+ │              │    │ Head            depth = 0   │── sourceSpliterator ──▶ Spliterator
+ │              │    │ linkedOrConsumed = true     │
+ │              │    └───────┬──────────▲──────────┘
+ │              │   nextStage│          │previousStage
+ │ s1 ──────────┼──▶ ┌───────▼──────────┴──────────┐
+ │              │    │ ReferencePipeline$2 (filter)│── predicate ──▶ Predicate 객체(람다)
+ │              │    │ depth = 1                   │
+ │              │    └───────┬──────────▲──────────┘
+ │ s2 ──────────┼──▶ ┌───────▼──────────┴──────────┐
+ │              │    │ ReferencePipeline$3 (map)   │── mapper ──▶ Function 객체(람다)
+ │              │    │ depth = 2                   │
+ │              │    └───────┬──────────▲──────────┘
+ │ s3 ──────────┼──▶ ┌───────▼──────────┴──────────┐
+ └──────────────┘    │ SortedOps$OfRef  depth = 3  │  linkedOrConsumed = false
+                     └─────────────────────────────┘
+   모든 단계의 sourceStage ──▶ Head      원소를 담는 배열·리스트 필드는 어느 단계에도 없다</pre>
+<x-visual id="java-adv3-05-pipeline-stages" title="중간 연산마다 생기는 파이프라인 단계 객체의 사슬" kind="메모리 구조도" ratio="16:9">
+<x-hint>중간 연산을 호출할 때마다 힙에 단계 객체가 하나씩 생기고 previousStage/nextStage로 이어지며, 원소를 담는 공간은 어디에도 없다는 것을 보여 준다.</x-hint>
+<x-prompt>A clean technical memory diagram, flat vector style, white background. On the left a tall narrow box titled "스택 (main)" containing four variable slots labeled "s0", "s1", "s2", "s3". On the right, a vertical chain of four rounded rectangles in the heap region titled "힙": top box "Head (depth 0)", then "filter 단계 (depth 1)", then "map 단계 (depth 2)", then "sorted 단계 (depth 3)". Each stack slot has an arrow to its matching heap box. Between consecutive heap boxes draw a downward arrow labeled "nextStage" on the left side and an upward arrow labeled "previousStage" on the right side. From the Head box a side arrow goes to a small box labeled "Spliterator (소스)". From the filter box a side arrow to a small lambda icon box labeled "Predicate", from the map box a side arrow to "Function". At the bottom a note in gray: "원소를 담는 공간은 없다". Use blue for stage boxes, orange for lambda boxes. No more than 12 labels.</x-prompt>
+<x-caption>중간 연산은 원소를 처리하지 않고, 이전 단계에 연결된 새 단계 객체를 만들 뿐이다.</x-caption>
+</x-visual>
+<h4>소스: Spliterator가 원소를 꺼내 준다</h4>
+<p>머리 단계가 들고 있는 <code>Spliterator</code>(splittable iterator)는 스트림이 소스에서 원소를 꺼내는 통로다. <code>Collection</code> 인터페이스의 디폴트 메서드 <code>stream()</code>은 OpenJDK 21에서 <code>StreamSupport.stream(spliterator(), false)</code> 한 줄이고, <code>StreamSupport.stream</code>은 그 <code>Spliterator</code>와 거기서 뽑은 플래그로 <code>ReferencePipeline.Head</code>를 만든다. <code>ArrayList</code>는 <code>stream()</code>을 재정의하지 않으므로 이 경로를 그대로 탄다. API 문서에 따르면 <code>Spliterator</code>의 <code>tryAdvance</code>는 남은 원소가 있으면 하나에 대해 동작을 수행하고 <code>true</code>를, 없으면 <code>false</code>를 돌려주고, <code>forEachRemaining</code>은 남은 원소 전부에 대해 현재 스레드에서 순서대로 동작을 수행한다. 앞의 것은 "한 개씩, 멈출 수 있게", 뒤의 것은 "끝까지 한 번에"다. 이 두 메서드가 뒤에서 볼 단락 최적화의 갈림길이 된다. 이름에 "split"이 들어 있는 이유인 <code>trySplit</code>(원소를 둘로 나누기)은 병렬 스트림의 핵심이므로 10회에서 다룬다.</p>
+<p><code>Spliterator</code>는 자기 소스의 성질을 특성(characteristics) 비트로 알려 준다. 몇 가지 소스의 특성을 찍어 보면 다음과 같다(OpenJDK 21 실행 결과).</p>
+<pre data-label="각 소스 Spliterator의 characteristics() (OpenJDK 21에서 출력)"><code class="language-text">ArrayList  [ORDERED, SIZED, SUBSIZED]
+HashSet    [DISTINCT, SIZED]
+TreeSet    [ORDERED, DISTINCT, SORTED, SIZED]
+Stream.iterate(1, n -> n + 1)  [ORDERED, IMMUTABLE]</code></pre>
+<p><code>ArrayList</code>는 순서가 있고(ORDERED) 크기를 정확히 안다(SIZED). <code>HashSet</code>은 중복이 없고(DISTINCT) 크기를 알지만 순서는 없다. <code>TreeSet</code>은 순서, 중복 없음, 정렬됨(SORTED), 크기까지 모두 안다. 무한 수열인 <code>Stream.iterate</code>는 크기를 모른다. 이 비트들이 파이프라인의 플래그로 옮겨져 뒤에서 볼 "건너뛰기" 최적화의 근거가 된다.</p>
+
+<h3>지연 연산: 최종 연산이 없으면 아무 일도 없다</h3>
+<p>이제 이 회차의 중심 주제다. 패키지 문서는 이렇게 설명한다. <code>filter()</code> 같은 중간 연산을 실행해도 실제로 거르는 일은 일어나지 않고, 순회될 때 조건에 맞는 원소를 내놓을 새 스트림이 만들어질 뿐이며, 파이프라인 소스의 순회는 최종 연산이 실행되어야 시작된다. 이것을 지연 연산(lazy evaluation)이라고 부른다. 람다 안에 출력문을 넣어 직접 확인한다.</p>
+<pre><code class="language-java">import java.util.List;
+import java.util.stream.Stream;
+
+public class LazyDemo {
+    public static void main(String[] args) {
+        List<Integer> list = List.of(1, 2, 3, 4, 5, 6);
+        Stream<Integer> lazy = list.stream()
+                .filter(n -> { System.out.println("filter " + n); return n % 2 == 0; })
+                .map(n -> { System.out.println("map " + n); return n * 10; });
+        System.out.println("파이프라인 조립 끝");
+
+        List<Integer> result = lazy.toList();
+        System.out.println("결과 " + result);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">파이프라인 조립 끝
+filter 1
+filter 2
+map 2
+filter 3
+filter 4
+map 4
+filter 5
+filter 6
+map 6
+결과 [20, 40, 60]</code></pre>
+<p>두 가지가 드러난다. 첫째, "파이프라인 조립 끝"이 가장 먼저 찍혔다. <code>filter</code>와 <code>map</code>을 호출하는 동안 람다 본문은 한 번도 실행되지 않았다. 앞 절에서 본 대로 그 호출들은 단계 객체를 만들고 람다 객체를 그 안에 넣어 두었을 뿐이다. 람다 본문은 <code>toList()</code>가 호출된 뒤에야 실행되기 시작했다.</p>
+<p>둘째, 실행 순서가 "모든 원소를 거른 다음 모두 바꾸기"가 아니다. 1을 거르고(탈락), 2를 거르고 곧바로 2를 바꾸고, 3을 거르고(탈락), 4를 거르고 곧바로 4를 바꾼다. <b>원소 하나가 파이프라인의 끝까지 내려간 다음에 다음 원소가 출발한다.</b> 같은 일을 단계마다 리스트를 만드는 즉시(eager) 방식으로 하면 순서가 이렇게 된다.</p>
+<pre data-label="즉시 방식(단계마다 리스트를 만드는 반복문)의 실행 순서"><code class="language-text">filter 1
+filter 2
+filter 3
+filter 4
+filter 5
+filter 6
+map 2
+map 4
+map 6</code></pre>
+<p>즉시 방식은 단계 하나를 모든 원소에 대해 끝낸 뒤 다음 단계로 넘어간다. 표로 그리면 단계가 가로줄을 따라 먼저 진행되므로 "가로 방향" 처리라고 부를 수 있다. 스트림은 원소 하나가 세로로 모든 단계를 통과한 뒤 다음 원소로 넘어가는 "세로 방향" 처리다. 결과는 둘 다 <code>[20, 40, 60]</code>으로 같지만, 처리 순서가 다르면 가능한 최적화가 달라진다.</p>
+<div class="table-wrap"><table><thead><tr><th></th><th>원소 1</th><th>원소 2</th><th>원소 3</th><th>원소 4</th><th>원소 5</th><th>원소 6</th></tr></thead><tbody>
+<tr><td>filter</td><td>① 탈락</td><td>②</td><td>④ 탈락</td><td>⑤</td><td>⑦ 탈락</td><td>⑧</td></tr>
+<tr><td>map</td><td></td><td>③</td><td></td><td>⑥</td><td></td><td>⑨</td></tr>
+</tbody></table></div>
+<p>위 표의 번호는 스트림이 실제로 일을 한 순서다. 번호가 열(원소)을 따라 위에서 아래로 내려간 뒤 오른쪽으로 이동한다. 즉시 방식이었다면 번호가 첫 행을 왼쪽에서 오른쪽으로 다 채운 뒤 둘째 행으로 내려갔을 것이다. 세로 방향 처리에서는 한 원소에 대한 계산이 끝나면 그 원소의 중간 값을 더 들고 있을 필요가 없다. 그래서 단계 사이에 중간 컬렉션이 필요 없고, 원하는 결과를 얻은 순간 멈출 수도 있다.</p>
+<x-visual id="java-adv3-05-horizontal-vs-vertical" title="즉시 처리(가로)와 지연 처리(세로)의 순서 비교" kind="개념 비교 그림" ratio="16:9">
+<x-hint>같은 2행 6열 격자(행: filter, map / 열: 원소 1~6)에서 즉시 방식은 행을 먼저 채우고, 스트림은 열을 먼저 채운다는 것을 화살표 경로로 비교한다.</x-hint>
+<x-prompt>Two side-by-side panels, flat vector, white background. Each panel shows the same grid: 2 rows labeled "filter" and "map" on the left, 6 columns labeled "1" to "6" on top. Cells in the "map" row under columns 1, 3, 5 are grayed out (element was filtered out). Left panel titled "즉시 방식 (단계별 리스트)": a thick orange arrow snakes across the whole first row left to right, then drops to the second row and goes left to right; between the rows a small box labeled "중간 리스트". Right panel titled "스트림 (지연 연산)": a thick blue arrow goes down column 1 (stops at gray cell), then down column 2 through both cells, then column 3, and so on, zigzagging column by column. No intermediate list box on the right. Small caption under right panel "원소 하나가 끝까지 내려간 뒤 다음 원소". At most 12 text labels.</x-prompt>
+<x-caption>즉시 방식은 단계를 먼저 끝내고(가로), 스트림은 원소를 먼저 끝낸다(세로).</x-caption>
+</x-visual>
+<h4>소스도 늦게 묶인다: 늦은 바인딩과 간섭 금지</h4>
+<p>지연은 연산에만 해당하지 않는다. 소스의 내용이 확정되는 시점도 늦춰진다. 패키지 문서가 드는 예를 실행해 보면 이렇다.</p>
+<pre><code class="language-java">List<String> l = new ArrayList<>(List.of("one", "two"));
+Stream<String> sl = l.stream();          // 스트림을 먼저 얻고
+l.add("three");                          // 그다음 소스를 고친다
+System.out.println(sl.collect(Collectors.joining(" ")));   // one two three</code></pre>
+<p>스트림을 얻은 뒤에 추가한 "three"까지 결과에 들어간다. 이유는 <code>ArrayList</code>의 <code>Spliterator</code>가 늦은 바인딩(late-binding)이기 때문이다. API 문서는 늦은 바인딩 <code>Spliterator</code>를 "생성될 때가 아니라 처음 순회하거나, 처음 분할하거나, 처음 크기 추정을 요청받을 때 소스에 묶이는" 것으로 정의한다. OpenJDK 21의 <code>ArrayList.ArrayListSpliterator</code>는 순회 끝 위치(<code>fence</code>)와 기대 변경 횟수(<code>expectedModCount</code>)를 생성 시점에 정하지 않고 -1로 비워 두었다가, 처음 쓰일 때 그때의 <code>size</code>와 <code>modCount</code>로 채운다. <code>l.stream()</code> 시점에는 <code>Spliterator</code> 객체만 생겼고, 크기 2는 기록되지 않았다. <code>collect</code>가 순회를 시작할 때 크기를 읽으니 3이다.</p>
+<p>반대로 최종 연산이 실행되는 동안 소스를 고치면 안 된다. 패키지 문서는 이것을 간섭 금지(non-interference)라고 부르며, 소스가 동시성 컬렉션이 아니라면 파이프라인 실행 중 소스를 수정하면 예외나 잘못된 결과가 생길 수 있다고 경고한다. 순차 스트림에도 적용되는 규칙이다.</p>
+<pre><code class="language-java">List<String> l2 = new ArrayList<>(List.of("a", "b", "c"));
+l2.stream().forEach(x -> { if (x.equals("a")) l2.add("z"); });
+// java.util.ConcurrentModificationException</code></pre>
+<p>OpenJDK 21의 <code>ArrayListSpliterator.forEachRemaining</code>을 보면 이 예외가 언제 나는지 정확히 알 수 있다. 순회를 시작할 때 크기(3)와 <code>modCount</code>를 지역 변수에 잡아 두고, 배열의 0번부터 2번까지 동작을 모두 수행한 <b>다음</b> 한 번만 <code>modCount</code>를 비교한다. 소스 주석에도 성능을 위해 <code>forEach</code>에서는 검사를 끝에서 한 번만 한다고 적혀 있다. 그래서 위 코드는 "a", "b", "c" 세 원소 모두에 대해 람다를 실행하고("z"는 순회 범위 밖이다), 리스트에는 "z"가 실제로 추가된 상태에서, 마지막에 예외를 던진다. 예외가 났다고 해서 부수 효과가 일어나지 않은 것이 아니다. API 문서가 이 감지를 "최선의 노력(best-effort)"이라고 부르는 이유이기도 하다. 감지되지 않는 간섭도 있을 수 있다.</p>
+
+<h3>한 층 아래로: 최종 연산 안에서 일어나는 일</h3>
+<p>지연 연산이 어떻게 구현되는지 OpenJDK 21 소스로 따라가 보자. 핵심 부품은 <code>java.util.stream.Sink</code>라는 패키지 전용 인터페이스다. <code>Consumer</code>를 확장하며, 핵심 메서드는 네 개다(기본형 스트림용 <code>accept(int)</code> 같은 오버로드는 여기서 생략한다).</p>
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>역할</th></tr></thead><tbody>
+<tr><td><code>begin(long size)</code></td><td>원소를 받기 전에 한 번 호출된다. 보낼 원소 수를 알면 그 수, 모르면 -1.</td></tr>
+<tr><td><code>accept(T t)</code></td><td>원소 하나를 받는다. <code>Consumer.accept</code> 그 자체다.</td></tr>
+<tr><td><code>end()</code></td><td>모든 원소를 보낸 뒤 한 번 호출된다.</td></tr>
+<tr><td><code>cancellationRequested()</code></td><td>"더 이상 원소를 보내지 않아도 된다"면 <code>true</code>. 기본값은 <code>false</code>.</td></tr>
+</tbody></table></div>
+<p>각 중간 연산의 단계 클래스는 <code>opWrapSink(int flags, Sink downstream)</code>이라는 메서드를 구현한다. "아래쪽(downstream) Sink를 받아, 원소를 받으면 이 단계의 일을 한 뒤 아래쪽에 넘기는 Sink를 만들어 돌려준다"는 뜻이다. OpenJDK 21의 <code>filter</code> 단계가 만드는 Sink를 풀어 쓰면 이렇다.</p>
+<pre><code class="language-java">// ReferencePipeline.filter가 만드는 Sink (OpenJDK 21 소스를 요약)
+new Sink.ChainedReference<P_OUT, P_OUT>(downstream) {
+    public void begin(long size) {
+        downstream.begin(-1);              // 몇 개가 통과할지 모르므로 크기를 -1로 알린다
+    }
+    public void accept(P_OUT u) {
+        if (predicate.test(u))             // 캡처해 둔 Predicate로 검사하고
+            downstream.accept(u);          // 통과하면 아래쪽으로 밀어 넣는다
+    }
+};
+
+// ReferencePipeline.map이 만드는 Sink
+new Sink.ChainedReference<P_OUT, R>(downstream) {
+    public void accept(P_OUT u) {
+        downstream.accept(mapper.apply(u)); // 바꾼 값을 아래쪽으로 밀어 넣는다
+    }
+};</code></pre>
+<p><code>Sink.ChainedReference</code>는 <code>begin</code>, <code>end</code>, <code>cancellationRequested</code>를 모두 아래쪽 Sink에 그대로 전달하도록 구현된 추상 클래스다. 그래서 각 단계는 자기 일, 대개 <code>accept</code> 하나만 정의하면 된다. 최종 연산 <code>toList()</code>가 호출되면 OpenJDK 21에서는 다음 순서로 일이 진행된다.</p>
+<figure class="flow-figure"><figcaption>최종 연산 toList()가 파이프라인을 실행하는 순서 (OpenJDK 21, 순차 스트림)</figcaption><ol class="flow">
+<li><strong>소비 표시</strong><span><code>evaluateToArrayNode</code>가 마지막 단계의 <code>linkedOrConsumed</code>를 검사하고 <code>true</code>로 바꾼다. 두 번째 호출이 예외를 맞는 곳이다.</span></li>
+<li><strong>소스 꺼내기</strong><span><code>sourceSpliterator</code>가 머리 단계의 <code>Spliterator</code>를 꺼내고 머리 단계의 참조를 <code>null</code>로 지운다. 최종 연산에 자기 플래그가 있으면(예: <code>findFirst</code>의 단락 플래그) 이때 마지막 단계의 누적 플래그에 합친다. <code>toList</code>에는 없다.</span></li>
+<li><strong>Sink 사슬 조립</strong><span><code>wrapSink</code>가 마지막 단계에서 출발해 <code>previousStage</code>를 따라 머리 쪽으로 거슬러 올라가며(depth가 0이 될 때까지) 각 단계의 <code>opWrapSink</code>를 부른다. 최종 연산의 Sink를 map Sink가 감싸고, 그것을 filter Sink가 감싼다.</span></li>
+<li><strong>원소 밀어 넣기</strong><span><code>copyInto</code>가 맨 바깥 Sink에 <code>begin(크기)</code>을 부르고, <code>spliterator.forEachRemaining(sink)</code>로 원소를 하나씩 넣은 뒤 <code>end()</code>를 부른다. 단락 연산이 있으면 이 단계가 <code>copyIntoWithCancel</code>로 바뀐다.</span></li>
+<li><strong>결과 만들기</strong><span>최종 연산의 Sink(여기서는 원소를 모으는 노드 빌더)에 쌓인 것으로 결과 리스트를 만든다.</span></li>
+</ol></figure>
+<p>3단계가 이 구조의 열쇠다. 단계 객체의 사슬은 머리 → filter → map 순서로 연결되어 있지만, Sink는 거꾸로 만들어야 한다. filter Sink를 만들려면 "통과한 원소를 넘길 아래쪽"이 이미 있어야 하기 때문이다. 그래서 끝에서부터 만들고, 완성된 사슬은 filter Sink → map Sink → 최종 Sink 방향으로 원소를 밀어 보낸다. 이 사슬이 최종 연산 시점에야 만들어진다는 것이 곧 지연 연산이다. 중간 연산 호출 시점에는 "어떤 Sink를 만들지"를 아는 단계 객체만 있고, 원소를 받을 Sink는 아직 존재하지 않는다.</p>
+<h4>스택 트레이스로 확인하기</h4>
+<p>정말 그런지 실행 중의 호출 스택을 찍어 보자. <code>map</code>의 람다 안에서 예외 객체를 만들어 스택 트레이스만 출력한다(던지지는 않는다).</p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class StackDemo {
+    public static void main(String[] args) {
+        List<Integer> list = new ArrayList<>(List.of(1, 2, 3));
+        List<Integer> out = list.stream()
+                .filter(n -> n >= 2)
+                .map(n -> {
+                    if (n == 2) new Throwable("trace").printStackTrace(System.out);
+                    return n * 10;
+                })
+                .toList();
+        System.out.println(out);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21.0.13)"><code class="language-text">java.lang.Throwable: trace
+	at StackDemo.lambda$main$1(StackDemo.java:10)
+	at java.base/java.util.stream.ReferencePipeline$3$1.accept(ReferencePipeline.java:197)
+	at java.base/java.util.stream.ReferencePipeline$2$1.accept(ReferencePipeline.java:179)
+	at java.base/java.util.ArrayList$ArrayListSpliterator.forEachRemaining(ArrayList.java:1708)
+	at java.base/java.util.stream.AbstractPipeline.copyInto(AbstractPipeline.java:509)
+	at java.base/java.util.stream.AbstractPipeline.wrapAndCopyInto(AbstractPipeline.java:499)
+	at java.base/java.util.stream.AbstractPipeline.evaluate(AbstractPipeline.java:575)
+	at java.base/java.util.stream.AbstractPipeline.evaluateToArrayNode(AbstractPipeline.java:260)
+	at java.base/java.util.stream.ReferencePipeline.toArray(ReferencePipeline.java:616)
+	at java.base/java.util.stream.ReferencePipeline.toArray(ReferencePipeline.java:622)
+	at java.base/java.util.stream.ReferencePipeline.toList(ReferencePipeline.java:627)
+	at StackDemo.main(StackDemo.java:13)
+[20, 30]</code></pre>
+<p>스택 트레이스는 아래에서 위로 읽는다. 맨 아래 <code>main</code>의 13번째 줄, 곧 <code>.toList()</code>가 출발점이다. <code>toList</code>는 <code>toArray</code>를 거쳐 <code>evaluateToArrayNode</code>(1단계), <code>evaluate</code>, <code>wrapAndCopyInto</code>(3단계), <code>copyInto</code>(4단계)로 들어간다. <code>copyInto</code>가 부른 것은 <code>ArrayList$ArrayListSpliterator.forEachRemaining</code>이다. 반복문은 바로 여기, JDK의 <code>ArrayList</code> 코드 안에 있다. 우리 코드에는 반복문이 없었다는 바이트코드 관찰과 맞아떨어진다.</p>
+<p><code>forEachRemaining</code>이 원소 2를 넘긴 상대는 <code>ReferencePipeline$2$1.accept</code>, 즉 <code>filter</code> 단계(<code>$2</code>)가 만든 익명 Sink(<code>$1</code>)다. 그 179번째 줄은 조건을 통과한 원소를 아래쪽에 넘기는 <code>downstream.accept(u)</code>이고, 그 호출이 <code>ReferencePipeline$3$1.accept</code>, 곧 <code>map</code> 단계의 Sink로 들어갔다. 그 197번째 줄 <code>downstream.accept(mapper.apply(u))</code>에서 <code>mapper.apply</code>가 우리 람다 <code>lambda$main$1</code>을 불렀다. filter 람다(<code>lambda$main$0</code>)가 스택에 없는 이유는 이미 <code>true</code>를 반환하고 끝났기 때문이다. 원소 하나가 Sink에서 Sink로 중첩된 메서드 호출을 타고 내려가는 모습, 앞에서 본 "세로 방향" 처리가 호출 스택에 그대로 찍혀 있다.</p>
+<x-visual id="java-adv3-05-sink-chain" title="최종 연산이 조립한 Sink 사슬로 원소가 밀려 내려가는 모습" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>최종 연산 시점에 단계 사슬을 거꾸로 읽어 Sink 사슬이 만들어지고, Spliterator가 원소를 하나씩 filter Sink → map Sink → 최종 Sink로 밀어 넣는 순서를 보여 준다.</x-hint>
+<x-prompt>A sequence diagram, flat vector, white background, five vertical lifelines from left to right labeled "toList()", "Spliterator", "filter Sink", "map Sink", "결과 Sink". At the top, a dashed bracket labeled "① 거꾸로 조립: wrapSink" spans from the right lifeline to the filter lifeline with small arrows pointing right-to-left. Below it, solid arrows: from "toList()" to "Spliterator" labeled "forEachRemaining". Then from Spliterator to filter Sink labeled "accept(1)" with a short return marked "탈락" in gray. Next "accept(2)" from Spliterator to filter Sink, continuing filter Sink → map Sink "accept(2)", map Sink → 결과 Sink "accept(20)". Repeat pattern faintly for element 3 and 4. Use blue arrows for element flow, gray for rejected. Keep labels under 12.</x-prompt>
+<x-caption>Sink 사슬은 최종 연산 때 끝에서부터 만들어지고, 원소는 사슬을 따라 하나씩 끝까지 밀려 내려간다.</x-caption>
+</x-visual>
+
+<h3>직접 만들어 보는 작은 지연 파이프라인</h3>
+<p>JDK의 실제 구현은 기본형 특화, 병렬 실행, 플래그 처리 때문에 복잡하다. 뼈대만 남기면 생각보다 작다. 아래 코드는 JDK의 구조를 흉내 낸, <code>main</code>까지 합쳐 70줄 남짓한 파이프라인이다. 단계 객체가 원소를 처리하지 않고 "아래쪽 Sink를 받아 이 단계의 Sink를 만드는 함수"만 들고 있다는 점, 그 함수들이 최종 연산에서야 실행된다는 점에 집중해서 읽어 보자.</p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+
+public class MiniPipe {
+
+    // 원소를 하나씩 "밀어 넣는" 수신자. JDK의 java.util.stream.Sink를 흉내 낸 것이다.
+    interface Sink<T> extends Consumer<T> {
+        default boolean cancellationRequested() { return false; }
+    }
+
+    // S: 소스 원소 타입, T: 이 단계가 내보내는 원소 타입
+    static final class Pipe<S, T> {
+        private final List<S> source;
+        private final Function<Sink<T>, Sink<S>> wrap; // 아래쪽 Sink를 받아 소스 쪽 Sink를 만든다
+
+        private Pipe(List<S> source, Function<Sink<T>, Sink<S>> wrap) {
+            this.source = source;
+            this.wrap = wrap;
+        }
+
+        static <S> Pipe<S, S> of(List<S> source) {
+            return new Pipe<>(source, sink -> sink);
+        }
+
+        Pipe<S, T> filter(Predicate<T> predicate) {
+            return new Pipe<>(source, down -> wrap.apply(new Sink<T>() {
+                public void accept(T t) { if (predicate.test(t)) down.accept(t); }
+                public boolean cancellationRequested() { return down.cancellationRequested(); }
+            }));
+        }
+
+        <R> Pipe<S, R> map(Function<T, R> mapper) {
+            return new Pipe<S, R>(source, down -> wrap.apply(new Sink<T>() {
+                public void accept(T t) { down.accept(mapper.apply(t)); }
+                public boolean cancellationRequested() { return down.cancellationRequested(); }
+            }));
+        }
+
+        Pipe<S, T> limit(long max) {
+            return new Pipe<>(source, down -> wrap.apply(new Sink<T>() {
+                long remaining = max;
+                public void accept(T t) { if (remaining > 0) { remaining--; down.accept(t); } }
+                public boolean cancellationRequested() { return remaining == 0 || down.cancellationRequested(); }
+            }));
+        }
+
+        // 최종 연산: 여기서 처음으로 Sink 사슬이 만들어지고 소스를 순회한다
+        List<T> toList() {
+            List<T> result = new ArrayList<>();
+            Sink<S> head = wrap.apply(result::add);
+            for (S s : source) {
+                if (head.cancellationRequested()) break;
+                head.accept(s);
+            }
+            return result;
+        }
+    }
+
+    public static void main(String[] args) {
+        Pipe<Integer, Integer> p = Pipe.of(List.of(1, 2, 3, 4, 5, 6))
+            .filter(n -> { System.out.println("filter " + n); return n % 2 == 0; })
+            .map(n -> { System.out.println("map " + n); return n * 10; })
+            .limit(2);
+        System.out.println("파이프라인 조립 끝");
+        System.out.println(p.toList());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">파이프라인 조립 끝
+filter 1
+filter 2
+map 2
+filter 3
+filter 4
+map 4
+[20, 40]</code></pre>
+<p>같은 파이프라인을 JDK 스트림(<code>Stream.of(1, 2, 3, 4, 5, 6).filter(...).map(...).limit(2).toList()</code>)으로 실행해도 "filter"와 "map" 줄의 순서와 개수, 결과 <code>[20, 40]</code>까지 똑같이 나온다. 코드를 따라가 보자. <code>Pipe.of</code>는 "받은 Sink를 그대로 돌려주는" 항등 함수를 가진 머리 단계다. <code>filter</code>는 새 <code>Pipe</code>를 만들면서 함수 <code>down -> wrap.apply(filterSink(down))</code>을 넣는다. 즉 "아래쪽 Sink를 받으면, 그것을 감싼 filter Sink를 만들고, 그 filter Sink를 이전 단계의 wrap에 넘긴다". <code>map</code>과 <code>limit</code>도 똑같은 모양이다. 이 시점까지 만들어진 것은 함수 객체(람다)뿐이고, Sink는 하나도 없다. 그래서 "파이프라인 조립 끝"이 가장 먼저 찍힌다.</p>
+<p><code>toList()</code>에서 <code>wrap.apply(result::add)</code>를 부르는 순간 연쇄가 풀린다. limit 단계의 wrap이 결과 Sink를 감싼 limit Sink를 만들어 map 단계의 wrap에 넘기고, map 단계의 wrap이 그것을 감싼 map Sink를 만들어 filter 단계의 wrap에 넘기고, filter 단계가 filter Sink를 만들어 머리의 항등 함수에 넘긴다. 마지막 단계부터 머리 쪽으로 거슬러 올라가며 Sink를 만드는 것, JDK의 <code>wrapSink</code>와 똑같은 순서다. 반환된 <code>head</code>는 filter Sink이고, 반복문은 소스 원소를 하나씩 거기에 밀어 넣는다. 4를 넣었을 때 limit Sink의 <code>remaining</code>이 0이 되고, 다음 바퀴의 <code>head.cancellationRequested()</code>가 filter → map → limit으로 전달되어 <code>true</code>가 되므로 반복이 멈춘다. 5와 6은 꺼내지도 않는다.</p>
+<div class="table-wrap"><table><thead><tr><th>MiniPipe</th><th>OpenJDK 21</th></tr></thead><tbody>
+<tr><td><code>Pipe</code> 객체 하나</td><td><code>AbstractPipeline</code> 단계 객체 하나</td></tr>
+<tr><td>생성자에 넘기는 <code>wrap</code> 함수</td><td>각 단계의 <code>opWrapSink</code> + <code>previousStage</code> 연결</td></tr>
+<tr><td><code>toList</code> 안의 <code>wrap.apply(result::add)</code></td><td><code>wrapSink</code>: 마지막 단계에서 머리 쪽으로 Sink 조립</td></tr>
+<tr><td><code>for</code> + <code>cancellationRequested</code> 검사</td><td><code>copyInto</code> / <code>copyIntoWithCancel</code></td></tr>
+<tr><td>(없음)</td><td><code>begin</code>/<code>end</code>, 재사용 검사, 스트림 플래그, 기본형 특화, 병렬 실행</td></tr>
+</tbody></table></div>
+<p>JDK와 다른 점도 하나 있다. MiniPipe는 원소마다 언제나 <code>cancellationRequested()</code>를 묻지만, JDK는 파이프라인에 단락 연산이 있을 때만 그렇게 하고, 없으면 묻지 않고 <code>forEachRemaining</code>으로 한 번에 순회한다. 묻는 일 자체도 비용이기 때문이다. 이 구분은 단락을 다루는 절에서 다시 본다.</p>
+
+<h3>지연 연산과 최적화 1: 루프 융합과 연산 순서</h3>
+<p>패키지 문서는 지연 처리의 이점을 이렇게 요약한다. filter-map-sum 같은 파이프라인에서 거르기, 바꾸기, 합하기를 최소한의 중간 상태로 데이터에 대한 한 번의 통과로 합칠(fused) 수 있고, 필요하지 않을 때 모든 데이터를 검사하지 않을 수 있다. 첫 번째 이점을 루프 융합(loop fusion)이라고 부른다. 단계가 몇 개든 소스는 한 번만 순회되고, 원소 하나가 Sink 사슬을 통과하는 동안 단계 사이에 원소를 쌓아 둘 곳이 없다.</p>
+<p>즉시 방식과 비교해 무엇을 아끼는지 구체적으로 세어 보자. 원소가 N개이고 상태 없는 단계가 k개라고 하자. 단계마다 리스트를 만드는 즉시 방식은 단계 경계마다 중간 리스트를 하나씩 만들고, 각 리스트는 그 단계를 통과한 원소 수만큼 커진다. 원소 수가 줄지 않는 <code>map</code>만 이어진다면 최대 N칸짜리 리스트가 k개 생기는 셈이다(앞 리스트는 다음 단계가 끝나면 가비지가 되지만, 적어도 두 개는 동시에 살아 있다). 스트림은 상태 없는 단계만 있다면 단계 수와 관계없이 단계 사이에 원소를 쌓지 않는다. 최종 결과를 담는 공간만 필요하다. 단계 수만큼 생기는 것은 Sink 객체 k개뿐이고, 이것은 N과 상관없는 고정 비용이다. 이 차이는 실행 시간보다 메모리와 GC 부담에서 더 분명하게 드러난다. 중간 리스트는 만들어졌다가 곧 버려지는 객체이고, 할당이 많을수록 GC가 치워야 할 일도 늘어난다.</p>
+<aside class="note">이 회차는 스트림과 반복문의 속도를 수치로 비교하지 않는다. 결과는 JIT 컴파일 여부, 원소 수, 람다 호출의 인라이닝 같은 조건에 크게 좌우되고, 신뢰할 만한 비교는 JMH 같은 도구로 따로 측정해야 한다. 여기서 말하는 것은 구조적 사실뿐이다. 스트림은 단계마다 단계 객체와 Sink 객체, 그리고 원소마다 인터페이스 메서드 호출을 거치는 비용을 치르고, 그 대가로 중간 컬렉션과 불필요한 계산을 없앤다.</aside>
+<h4>순서는 라이브러리가 바꿔 주지 않는다</h4>
+<p>루프 융합이 공짜로 모든 낭비를 없애 주지는 않는다. 다음 두 파이프라인은 같은 결과를 내지만 <code>map</code>의 호출 횟수가 다르다.</p>
+<pre><code class="language-java">int[] calls = new int[2];
+List<String> a = Stream.of("a", "bb", "ccc", "dddd", "eeeee")
+        .map(s -> { calls[0]++; return s.toUpperCase(); })   // 먼저 바꾸고
+        .filter(s -> s.length() >= 4)                         // 나중에 거른다
+        .toList();
+List<String> b = Stream.of("a", "bb", "ccc", "dddd", "eeeee")
+        .filter(s -> s.length() >= 4)                         // 먼저 거르고
+        .map(s -> { calls[1]++; return s.toUpperCase(); })   // 나중에 바꾼다
+        .toList();
+System.out.println(a + " " + b + " mapCalls=" + calls[0] + "," + calls[1]);
+// [DDDD, EEEEE] [DDDD, EEEEE] mapCalls=5,2</code></pre>
+<p>먼저 바꾸면 다섯 원소 모두를 대문자로 바꾼 뒤 세 개를 버린다. 먼저 거르면 살아남은 두 원소만 바꾼다. 데이터베이스의 옵티마이저는 SQL의 WHERE 조건을 조인보다 먼저 적용하는 식으로 연산 순서를 바꿔 주지만, 스트림 라이브러리는 그러지 않는다. 이유는 앞에서 본 구조에 있다. <code>wrapSink</code>는 단계 사슬을 선언된 순서 그대로 감쌀 뿐이고, 라이브러리 입장에서 <code>filter</code>와 <code>map</code>에 넘어온 람다는 내용을 들여다볼 수 없는 객체다. <code>map</code>이 원소를 어떻게 바꾸는지 모르니 <code>filter</code>를 앞으로 옮겨도 결과가 같은지 판단할 수 없다. 연산 순서의 책임은 파이프라인을 쓰는 사람에게 있다. 원소 수를 줄이는 연산(<code>filter</code>, <code>limit</code>, <code>distinct</code>)은 가능한 한 앞에, 비싼 변환은 뒤에 둔다.</p>
+
+<h3>지연 연산과 최적화 2: 단락, 필요한 만큼만 처리하고 멈추기</h3>
+<p>두 번째 이점은 필요한 만큼만 보는 것이다. 첫 번째 짝수를 찾아 10배 하는 파이프라인을 실행해 보자.</p>
+<pre><code class="language-java">Optional<Integer> first = List.of(1, 2, 3, 4, 5, 6).stream()
+        .filter(n -> { System.out.println("filter " + n); return n % 2 == 0; })
+        .map(n -> { System.out.println("map " + n); return n * 10; })
+        .findFirst();
+System.out.println("found " + first);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">filter 1
+filter 2
+map 2
+found Optional[20]</code></pre>
+<p>여섯 원소 중 두 개만 보고 끝났다. 3부터 6까지는 <code>filter</code>조차 거치지 않았다. 세로 방향 처리 덕분에 2가 결과 Sink에 도착한 시점에 다른 원소는 아직 출발하지 않았고, 라이브러리는 거기서 순회를 멈출 수 있다. <code>findFirst</code>가 돌려준 <code>Optional</code>은 8회에서 다룬다.</p>
+<p>OpenJDK 21에서 이 멈춤은 이렇게 구현된다. <code>findFirst</code>, <code>findAny</code>, <code>anyMatch</code>·<code>allMatch</code>·<code>noneMatch</code>, 그리고 <code>limit</code>과 <code>takeWhile</code>(자바 9)은 자기 연산 플래그에 <code>SHORT_CIRCUIT</code> 비트를 세운다. 최종 연산의 플래그는 실행 직전에 마지막 단계의 누적 플래그에 합쳐진다. <code>copyInto</code>는 이 비트를 보고 길을 나눈다. 비트가 없으면 <code>begin</code> → <code>forEachRemaining</code> → <code>end</code>로 한 번에 끝까지 순회하고, 비트가 있으면 <code>copyIntoWithCancel</code>로 가서 머리 단계의 <code>forEachWithCancel</code>을 부른다. 그 본체는 한 줄이다.</p>
+<pre><code class="language-java">// ReferencePipeline.forEachWithCancel (OpenJDK 21)
+do { } while (!(cancelled = sink.cancellationRequested()) && spliterator.tryAdvance(sink));</code></pre>
+<p>원소를 하나 꺼내기(<code>tryAdvance</code>) 전에 매번 Sink 사슬에 "그만해도 되는가"를 묻는다. 이 질문은 <code>Sink.ChainedReference</code>의 기본 구현을 따라 filter Sink → map Sink → 최종 Sink로 전달된다. <code>findFirst</code>의 Sink는 값을 하나 받은 순간부터 <code>cancellationRequested()</code>에 <code>true</code>를 답한다. <code>limit(n)</code>의 Sink는 남은 개수가 0이 되면 <code>true</code>를 답한다. 그 답이 사슬을 거슬러 올라오면 반복이 멈춘다. 앞에서 만든 MiniPipe가 한 일과 같다.</p>
+<h4>무한 스트림이 끝나는 이유와 끝나지 않는 경우</h4>
+<p>단락은 무한 스트림을 다룰 수 있게 해 준다. <code>Stream.iterate(1, n -> n + 1)</code>은 1, 2, 3, … 을 끝없이 만들어 내는 소스다.</p>
+<pre><code class="language-java">List<Integer> multiplesOf3 = Stream.iterate(1, n -> n + 1)
+        .filter(n -> n % 3 == 0)
+        .limit(3)
+        .toList();
+System.out.println(multiplesOf3);   // [3, 6, 9]</code></pre>
+<p>추적해 보면 소스는 1부터 9까지 아홉 개만 만든다. 3, 6이 통과할 때마다 <code>limit</code> Sink의 남은 개수가 2, 1로 줄고, 9가 통과해 0이 되면 다음 바퀴의 <code>cancellationRequested()</code>가 <code>true</code>를 돌려준다. 10은 만들어지지 않는다. 즉시 방식이었다면 첫 단계에서 무한 수열 전체를 리스트에 담으려다 끝나지 않았을 것이다.</p>
+<p>하지만 패키지 문서가 강조하듯 파이프라인에 단락 연산이 있다는 것은 무한 스트림 처리가 유한 시간에 끝나기 위한 <b>필요조건일 뿐 충분조건은 아니다</b>. 다음 코드는 <code>findFirst</code>가 있어도 끝나지 않는다.</p>
+<pre><code class="language-java">Stream.generate(() -> "x")          // "x"를 끝없이 만든다
+      .filter(String::isEmpty)       // 빈 문자열만 통과 → 아무것도 통과하지 못한다
+      .findFirst();                  // 첫 원소가 영원히 오지 않는다</code></pre>
+<p><code>findFirst</code>의 Sink는 값을 받아야 멈춤을 요청하는데, <code>filter</code>가 모든 원소를 막으므로 값이 끝내 도착하지 않는다. 데몬 스레드에서 이 코드를 돌리고 2초 뒤에 확인해 보면 여전히 실행 중이다. 단락은 "멈출 수 있는 기회"를 줄 뿐, 그 기회가 오는지는 데이터와 조건에 달려 있다.</p>
+
+<h3>지연 연산과 최적화 3: 상태 있는 연산은 장벽이다</h3>
+<p>세로 방향 처리에는 예외가 있다. <code>sorted</code>는 원소 하나만 보고는 그 원소를 내보낼 수 없다. 패키지 문서의 말대로 스트림의 모든 원소를 보기 전에는 정렬 결과를 하나도 만들 수 없다. 출력으로 확인한다.</p>
+<pre><code class="language-java">List<Integer> sorted = Stream.of(3, 1, 2)
+        .peek(n -> System.out.println("before " + n))
+        .sorted()
+        .peek(n -> System.out.println("after " + n))
+        .toList();
+System.out.println(sorted);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">before 3
+before 1
+before 2
+after 1
+after 2
+after 3
+[1, 2, 3]</code></pre>
+<p><code>sorted</code> 앞의 단계는 모든 원소를 먼저 통과시키고, <code>sorted</code> 뒤의 단계는 그다음에야 일한다. OpenJDK 21의 정렬 Sink(<code>SortedOps.RefSortingSink</code>, 크기를 알면 배열을 쓰는 <code>SizedRefSortingSink</code>)를 보면 이유가 보인다. <code>begin</code>에서 버퍼(리스트 또는 배열)를 만들고, <code>accept</code>는 원소를 버퍼에 넣기만 하고 아래쪽에 아무것도 넘기지 않는다. <code>end</code>가 호출되어야 버퍼를 정렬하고, 그제야 아래쪽 Sink에 <code>begin</code>을 부른 뒤 원소를 차례로 <code>accept</code>로 넘기고 <code>end</code>를 부른다. 하나의 Sink 사슬이 정렬 단계를 경계로 "모으기 구간"과 "내보내기 구간" 둘로 나뉘는 것이다. 이런 연산을 장벽(barrier)이라고 생각하면 된다. 장벽 앞에서는 루프 융합이 유지되지만 장벽에서 모든 원소가 버퍼에 쌓이므로, 정렬 단계는 원소 수만큼의 메모리를 쓴다.</p>
+<x-visual id="java-adv3-05-sorted-barrier" title="sorted 단계가 파이프라인을 두 구간으로 나누는 모습" kind="흐름도" ratio="16:9">
+<x-hint>sorted 앞에서는 원소가 하나씩 내려와 버퍼에 쌓이기만 하고, 소스가 끝나 end()가 호출된 뒤에야 정렬된 원소가 아래 단계로 흘러간다는 것을 보여 준다.</x-hint>
+<x-prompt>A horizontal flow diagram, flat vector, white background. Left section labeled "모으기 구간": three small numbered tokens "3", "1", "2" travel one by one from a box "소스" through a box "peek(before)" into a bucket-shaped container labeled "정렬 버퍼". A thick vertical dashed wall in the middle labeled "장벽: end()에서 정렬". Right section labeled "내보내기 구간": tokens "1", "2", "3" in sorted order leave the bucket and pass through a box "peek(after)" into a box "결과". A small timeline arrow at the bottom from left to right labeled "시간". Blue tokens, orange wall. Maximum 12 labels.</x-prompt>
+<x-caption>sorted는 소스가 끝날 때까지 원소를 모은 뒤에야 아래 단계로 내보낸다.</x-caption>
+</x-visual>
+<h4>장벽 뒤의 단락은 장벽 앞을 줄이지 못한다</h4>
+<p>정렬 뒤에 <code>findFirst</code>를 두면 어떻게 될까.</p>
+<pre><code class="language-java">Optional<Integer> min = Stream.of(3, 1, 2)
+        .peek(n -> System.out.println("before " + n))
+        .sorted()
+        .peek(n -> System.out.println("after " + n))
+        .findFirst();
+System.out.println(min);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">before 3
+before 1
+before 2
+after 1
+Optional[1]</code></pre>
+<p>"before"는 세 번 모두 찍혔고 "after"는 한 번만 찍혔다. 가장 작은 원소가 무엇인지는 모든 원소를 본 뒤에야 알 수 있으니 장벽 앞은 끝까지 돌아야 한다. OpenJDK 21의 정렬 Sink는 이를 이렇게 처리한다. 정렬 Sink의 <code>cancellationRequested()</code>는 언제나 <code>false</code>를 돌려주므로 위쪽 순회는 멈추지 않는다. 대신 "누군가 멈춤 여부를 물었다"는 사실(<code>cancellationRequestedCalled</code>)을 기록해 둔다. 이 질문은 파이프라인에 단락 연산이 있을 때만 오기 때문이다. <code>end</code>에서 정렬된 원소를 내보낼 때 이 기록이 있으면 원소마다 아래쪽의 <code>cancellationRequested()</code>를 확인하고 <code>true</code>가 되면 그만 보낸다. 그래서 "after 1" 뒤에 멈췄다.</p>
+<p>이 구조에서 바로 나오는 결론이 있다. 무한 스트림 뒤의 <code>sorted</code>는 끝나지 않는다. <code>Stream.iterate(1, n -> n + 1).sorted().limit(3)</code>은 <code>limit</code>이 뒤에 있어도 정렬 Sink가 멈춤 요청을 위로 전달하지 않으므로 소스를 끝없이 버퍼에 모으기만 한다. 반대로 <code>Stream.iterate(1, n -> n + 1).limit(3).sorted()</code>는 <code>limit</code>이 먼저 원소를 세 개로 자르므로 <code>[1, 2, 3]</code>을 내고 끝난다. 상태 있는 연산과 단락 연산의 상대 위치가 결과를 가른다.</p>
+<p>모든 상태 있는 연산이 완전한 장벽은 아니다. <code>distinct</code>도 상태 있는 연산이지만, OpenJDK 21의 순차 구현은 본 적 있는 원소를 <code>HashSet</code>에 기록하면서 처음 보는 원소는 곧바로 아래쪽에 넘긴다. 원소를 붙잡아 두지 않으므로 세로 방향 처리가 유지되고, 뒤에 <code>limit</code>이 있으면 무한 스트림에서도 멈출 수 있다. 다만 기록하는 집합은 서로 다른 원소 수만큼 커진다. "상태 있음"은 "앞서 본 원소의 정보를 들고 있다"는 뜻이고, 그 정보가 전부인지(sorted) 일부인지(distinct)는 연산마다 다르다.</p>
+
+<h3>지연 연산과 최적화 4: 스트림 플래그로 일을 건너뛰기</h3>
+<p>지연 연산이 주는 마지막 기회는 실행 전에 파이프라인 전체를 볼 수 있다는 점이다. 즉시 방식에서는 <code>filter</code>가 실행될 때 뒤에 무엇이 올지 모른다. 지연 방식에서는 최종 연산이 호출되는 순간 소스부터 최종 연산까지가 모두 확정되어 있다. OpenJDK 21은 이 정보를 스트림 플래그(<code>StreamOpFlag</code>)로 요약한다. 여기서 볼 플래그는 다섯 가지다(OpenJDK 21에는 <code>skip</code>·<code>limit</code>이 세우는 <code>SIZE_ADJUSTING</code>까지 여섯 가지가 정의되어 있다).</p>
+<div class="table-wrap"><table><thead><tr><th>플래그</th><th>뜻</th><th>예</th></tr></thead><tbody>
+<tr><td><code>DISTINCT</code></td><td>원소에 중복이 없다</td><td><code>HashSet</code>, <code>TreeSet</code> 소스 / <code>distinct()</code>가 세운다</td></tr>
+<tr><td><code>SORTED</code></td><td>원소가 자연 순서로 정렬되어 있다</td><td><code>TreeSet</code> 소스 / <code>sorted()</code>가 세운다</td></tr>
+<tr><td><code>ORDERED</code></td><td>원소에 정해진 만남 순서(encounter order)가 있다</td><td><code>List</code>, 배열, <code>TreeSet</code> 소스</td></tr>
+<tr><td><code>SIZED</code></td><td>원소 수를 정확히 안다</td><td>대부분의 컬렉션 소스 / <code>filter</code>가 지운다</td></tr>
+<tr><td><code>SHORT_CIRCUIT</code></td><td>단락 연산이 있다</td><td><code>limit</code>, <code>findFirst</code>, <code>anyMatch</code>가 세운다</td></tr>
+</tbody></table></div>
+<p><code>StreamOpFlag</code>의 소스 주석에 따르면 <code>SHORT_CIRCUIT</code>(과 <code>SIZE_ADJUSTING</code>)을 뺀 네 플래그는 <code>Spliterator</code>의 같은 이름 특성에서 나온다. 앞에서 찍어 본 특성이 머리 단계의 플래그가 되는 것이다. 각 중간 연산은 자기가 보존하지 못하는 성질의 플래그를 지우고, 보장하는 성질의 플래그를 세운다. 소스에서 확인한 몇 가지를 정리하면 이렇다.</p>
+<ul>
+<li><code>filter</code>: <code>NOT_SIZED</code>. 몇 개가 통과할지 모르므로 크기 정보를 지운다(앞에서 본 filter Sink가 <code>downstream.begin(-1)</code>을 부르는 것도 같은 이유다).</li>
+<li><code>map</code>: <code>NOT_SORTED | NOT_DISTINCT</code>. 바뀐 값이 여전히 정렬되어 있는지, 중복이 없는지 알 수 없다. 원소 수는 그대로이므로 <code>SIZED</code>는 남긴다.</li>
+<li><code>sorted()</code>: <code>IS_ORDERED | IS_SORTED</code>. <code>sorted(comparator)</code>는 <code>IS_ORDERED | NOT_SORTED</code>다. <code>SORTED</code> 플래그는 자연 순서 정렬만 뜻하기 때문이다.</li>
+<li><code>distinct()</code>: <code>IS_DISTINCT | NOT_SIZED</code>.</li>
+</ul>
+<p>실제로 <code>TreeSet</code> 스트림에 <code>map</code>을 붙이고 특성을 찍으면 <code>[ORDERED, SIZED]</code>만 남고, <code>List</code> 스트림에 <code>filter</code>를 붙이면 <code>[ORDERED]</code>만 남는다. 이 플래그를 이용해 OpenJDK 21이 일을 건너뛰는 경우를 세 가지 확인해 보자.</p>
+<h4>이미 정렬된 소스의 sorted()</h4>
+<p>비교 횟수를 세는 클래스를 만들어 <code>TreeSet</code> 스트림을 정렬해 본다.</p>
+<pre><code class="language-java">import java.util.List;
+import java.util.TreeSet;
+
+public class Sorted {
+    static int compares = 0;
+
+    record Box(int v) implements Comparable<Box> {
+        public int compareTo(Box o) {
+            compares++;
+            return Integer.compare(v, o.v);
+        }
+    }
+
+    public static void main(String[] args) {
+        TreeSet<Box> set = new TreeSet<>(List.of(new Box(3), new Box(1), new Box(2)));
+        compares = 0;
+        System.out.println(set.stream().sorted().toList() + " compares=" + compares);
+
+        List<Box> plain = List.of(new Box(3), new Box(1), new Box(2));
+        compares = 0;
+        System.out.println(plain.stream().sorted().toList() + " compares=" + compares);
+
+        compares = 0;
+        System.out.println(set.stream().map(b -> b).sorted().toList() + " compares=" + compares);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21)"><code class="language-text">[Box[v=1], Box[v=2], Box[v=3]] compares=0
+[Box[v=1], Box[v=2], Box[v=3]] compares=4
+[Box[v=1], Box[v=2], Box[v=3]] compares=2</code></pre>
+<p><code>TreeSet</code> 스트림의 <code>sorted()</code>는 비교를 한 번도 하지 않았다. <code>SortedOps.OfRef.opWrapSink</code>는 위쪽 플래그에 <code>SORTED</code>가 있고 자기도 자연 순서 정렬이면 받은 Sink를 그대로 돌려준다. 정렬 Sink를 아예 만들지 않으니 장벽도 생기지 않는다. <code>List</code> 소스는 정렬되어 있다는 보장이 없으므로 실제로 정렬했다. 세 번째 줄이 흥미롭다. 원소를 그대로 돌려주는 <code>map(b -> b)</code> 하나를 끼웠을 뿐인데 정렬이 다시 일어났다. 라이브러리는 이 람다가 항등 함수인지 알 수 없으므로 <code>map</code>은 무조건 <code>SORTED</code>를 지운다. 이미 정렬된 원소를 다시 정렬하느라 비교를 두 번 했다(비교 횟수 자체는 정렬 알고리즘 구현에 따라 다르다. 중요한 것은 0인지 아닌지다).</p>
+<h4>중복이 없는 소스의 distinct()</h4>
+<p><code>DistinctOps</code>의 <code>opWrapSink</code>도 같은 방식이다. 위쪽 플래그에 <code>DISTINCT</code>가 있으면(예: <code>HashSet</code> 소스) 받은 Sink를 그대로 돌려주어 <code>HashSet</code>을 만들지 않는다. <code>SORTED</code>만 있으면 정렬된 입력에서는 중복이 이웃해 있다는 점을 이용해 집합 대신 "바로 앞 원소" 하나만 기억하는 Sink를 쓴다. 둘 다 아니면 앞에서 본 <code>HashSet</code> 기반 Sink를 쓴다.</p>
+<h4>크기를 아는 소스의 count()</h4>
+<pre><code class="language-java">List<Integer> list = List.of(1, 2, 3, 4, 5, 6);
+long c1 = list.stream().peek(n -> System.out.println("peek " + n)).count();
+long c2 = list.stream().peek(n -> System.out.println("peek2 " + n)).map(n -> n + 1).count();
+long c3 = list.stream().filter(n -> n > 4).peek(n -> System.out.println("peek3 " + n)).count();
+System.out.println(c1 + " " + c2 + " " + c3);</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21)"><code class="language-text">peek3 5
+peek3 6
+6 6 2</code></pre>
+<p>첫 두 파이프라인에서는 <code>peek</code>이 한 번도 실행되지 않았다. <code>map</code>의 람다도 실행되지 않았다. OpenJDK 21의 <code>count()</code>(<code>ReduceOps.makeRefCounting</code>)는 실행 전에 파이프라인의 출력 크기를 정확히 알 수 있는지 먼저 묻고, 알 수 있으면 원소를 하나도 꺼내지 않고 그 크기를 돌려준다. <code>peek</code>과 <code>map</code>은 원소 수를 바꾸지 않으므로 <code>SIZED</code>가 살아 있고, 답은 리스트의 크기 6이다. 세 번째 파이프라인은 <code>filter</code>가 <code>SIZED</code>를 지웠으므로 실제로 순회해서 세야 했다. 이 동작은 구현의 선택이지만 API 문서가 허용한 것이다. 자바 9부터 <code>count()</code>의 API 문서에는 "소스에서 바로 개수를 계산할 수 있으면 구현은 파이프라인을 실행하지 않을 수 있고, 그 경우 소스 원소를 순회하지도 중간 연산을 평가하지도 않는다"는 API Note가 붙어 있고, 자바 8의 문서에는 이 문장이 없다. 같은 코드가 자바 8과 이후 버전에서 다른 출력을 낼 수 있다는 뜻이다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>지연 연산이 주는 최적화는 세 겹이다. 단계를 한 번의 순회로 합치는 융합, 필요한 결과가 나오면 멈추는 단락, 그리고 실행 전에 파이프라인 전체의 성질(플래그)을 보고 단계 자체를 생략하는 것. 셋 다 "최종 연산 전까지 아무것도 하지 않는다"는 한 가지 결정에서 나온다. 반대로 라이브러리는 람다의 내용을 모르므로 연산 순서를 바꾸지 않고, 상태 있는 연산의 장벽을 없애지 못한다. 이 둘은 파이프라인을 쓰는 사람의 몫이다.</p></aside>
+
+<h3>한 층 더 아래: 스트림 플래그는 2비트씩 묶인 정수 하나다</h3>
+<p>앞 절에서 "<code>map</code>이 <code>SORTED</code>를 지운다", "<code>sorted()</code>가 <code>SORTED</code>를 세운다"고 말했다. 이 말이 실제로 무엇을 하는지, 곧 플래그가 메모리에서 어떤 모양이고 단계를 지날 때 어떤 계산으로 합쳐지는지를 OpenJDK 21의 <code>java.util.stream.StreamOpFlag</code> 소스로 확인해 보자. 결론부터 말하면 단계마다 들고 있는 플래그는 <code>int</code> 하나이고, 성질 하나가 그 안의 2비트를 차지한다.</p>
+<p>왜 1비트가 아니라 2비트인가. <code>StreamOpFlag</code>의 소스 주석이 이유를 설명한다. 소스를 기술할 때는 "이 성질이 있다"만 말하면 되지만, 연산을 기술할 때는 그 성질을 "보존한다", "새로 세운다(inject)", "지운다(clear)" 중 무엇인지 말해야 한다. 세 가지 이상의 상태를 담으려면 성질마다 2비트가 필요하다. 소스에 정의된 비트 패턴은 셋이다.</p>
+<div class="table-wrap"><table><thead><tr><th>2비트 값</th><th>소스의 상수 이름</th><th>뜻</th><th>코드에서 만드는 상수</th></tr></thead><tbody>
+<tr><td><code>01</code></td><td><code>SET_BITS</code></td><td>성질이 있다 / 성질을 세운다</td><td><code>IS_SORTED</code>, <code>IS_SIZED</code> …</td></tr>
+<tr><td><code>10</code></td><td><code>CLEAR_BITS</code></td><td>성질을 지운다</td><td><code>NOT_SORTED</code>, <code>NOT_SIZED</code> …</td></tr>
+<tr><td><code>11</code></td><td><code>PRESERVE_BITS</code></td><td>보존한다(앞 단계의 값을 그대로 둔다)</td><td>마스크 계산에 쓰인다</td></tr>
+<tr><td><code>00</code></td><td>(없음)</td><td>연산이 이 성질에 대해 아무 말도 하지 않는다</td><td></td></tr>
+</tbody></table></div>
+<p>각 성질의 자리는 enum 생성자에 넘기는 위치 번호에 2를 곱한 비트다. <code>DISTINCT</code>는 위치 0, <code>SORTED</code>는 1, <code>ORDERED</code>는 2, <code>SIZED</code>는 3, <code>SHORT_CIRCUIT</code>은 12, <code>SIZE_ADJUSTING</code>은 13이다. 그래서 "성질이 있다"(<code>01</code>)를 그 자리에 놓은 값은 <code>DISTINCT</code> <code>0x1</code>, <code>SORTED</code> <code>0x4</code>, <code>ORDERED</code> <code>0x10</code>, <code>SIZED</code> <code>0x40</code>, <code>SHORT_CIRCUIT</code> <code>0x01000000</code>, <code>SIZE_ADJUSTING</code> <code>0x04000000</code>가 된다. 여기서 눈여겨볼 점이 있다. 앞의 네 값은 <code>Spliterator</code> 인터페이스의 특성 상수와 똑같다. 실제로 <code>Spliterator.DISTINCT</code>, <code>SORTED</code>, <code>ORDERED</code>, <code>SIZED</code>를 출력하면 <code>0x1</code>, <code>0x4</code>, <code>0x10</code>, <code>0x40</code>이 나온다. <code>Spliterator</code>의 특성 상수는 모두 짝수 비트에 놓여 있고, 스트림 플래그는 각 상수 바로 위의 홀수 비트를 "지운다" 표시로 쓴다. 덕분에 <code>Spliterator</code> 특성을 스트림 플래그로 바꾸는 <code>StreamOpFlag.fromCharacteristics</code>는 비트를 옮기는 계산 없이 마스크와 AND 한 번으로 끝난다. 소스 주석에는 위치 4~7(<code>0x100</code>, <code>0x400</code>, <code>0x1000</code>, <code>0x4000</code>)을 <code>Spliterator</code>의 <code>NONNULL</code>, <code>IMMUTABLE</code>, <code>CONCURRENT</code>, <code>SUBSIZED</code> 자리로 일부러 비워 두었다는 설명도 있다.</p>
+<h4>합치는 규칙: 말한 연산이 이기고, 침묵하면 보존된다</h4>
+<p>단계가 붙을 때 <code>AbstractPipeline</code>의 생성자는 <code>combinedFlags = StreamOpFlag.combineOpFlags(opFlags, previousStage.combinedFlags)</code>를 계산한다. 그 본체는 다음 두 메서드다.</p>
+<pre><code class="language-java">// java.util.stream.StreamOpFlag (OpenJDK 21)
+private static int getMask(int flags) {
+    return (flags == 0)
+           ? FLAG_MASK
+           : ~(flags | ((FLAG_MASK_IS & flags) << 1) | ((FLAG_MASK_NOT & flags) >> 1));
+}
+
+static int combineOpFlags(int newStreamOrOpFlags, int prevCombOpFlags) {
+    return (prevCombOpFlags & StreamOpFlag.getMask(newStreamOrOpFlags)) | newStreamOrOpFlags;
+}</code></pre>
+<p><code>getMask</code>는 새 연산이 <code>01</code>이나 <code>10</code>을 적어 둔 2비트 칸을 <code>11</code>로 채운 뒤 전체를 뒤집는다(<code>11</code>로 채우는 계산은 <code>FLAG_MASK_IS</code>·<code>FLAG_MASK_NOT</code>가 덮는 네 스트림 성질 칸에만 적용된다. <code>SHORT_CIRCUIT</code>·<code>SIZE_ADJUSTING</code> 칸은 세운 비트만 꺼지지만, 이 두 성질에는 <code>10</code>이 쓰이지 않으므로 결과는 같다). 그러면 새 연산이 무언가를 말한 칸은 <code>00</code>, 아무 말도 하지 않은 칸은 <code>11</code>인 마스크가 된다. <code>combineOpFlags</code>는 이전 누적값을 이 마스크와 AND 해서 새 연산이 말한 칸만 비운 뒤, 새 연산의 비트를 OR로 써 넣는다. 결과는 단순하다. 연산이 세우거나 지운 성질은 그 값으로 덮어쓰이고, 언급하지 않은 성질은 앞 단계의 값이 그대로 남는다. 파이프라인 전체로 보면 "그 성질에 대해 마지막으로 말한 연산이 이긴다".</p>
+<p>머리 단계는 조금 다르게 시작한다. 생성자는 <code>combinedFlags = (~(sourceOrOpFlags << 1)) & StreamOpFlag.INITIAL_OPS_VALUE</code>를 계산한다(소스 주석에 <code>combineOpFlags(sourceFlags, INITIAL_OPS_VALUE)</code>를 최적화한 식이라고 적혀 있다). <code>INITIAL_OPS_VALUE</code>는 네 가지 스트림 성질 칸이 모두 <code>11</code>인 값이다. 소스에 있는 성질은 왼쪽으로 한 칸 민 뒤 뒤집어 그 칸의 "지운다" 비트를 끄므로 <code>01</code>이 되고, 소스에 없는 성질은 <code>11</code>로 남는다. 성질을 판정하는 <code>isKnown(flags)</code>는 <code>(flags & preserve) == set</code>, 즉 그 칸이 정확히 <code>01</code>일 때만 참이다. 그러니 머리 단계의 <code>11</code>은 "보존"이라기보다 "알 수 없음"으로 읽으면 된다.</p>
+<p>규칙을 실제 값으로 확인해 보자. <code>AbstractPipeline</code>은 패키지 전용 클래스이므로 실험용으로 <code>--add-opens</code>를 주고 리플렉션으로 각 단계의 <code>sourceOrOpFlags</code>(이 단계 자신의 플래그)와 <code>combinedFlags</code>(누적값)를 읽는다. 내부 필드를 읽는 것은 구조를 관찰하기 위한 실험일 뿐, 실제 코드에서 할 일은 아니다.</p>
+<pre><code class="language-java">import java.lang.reflect.Field;
+import java.util.*;
+import java.util.stream.*;
+
+public class Flags {
+    static final String[] NAMES = {"DISTINCT", "SORTED", "ORDERED", "SIZED"};
+
+    static String decode(int combined) {               // 2비트 칸을 하나씩 읽는다
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < NAMES.length; i++) {
+            int two = (combined >>> (i * 2)) & 0b11;
+            String s = switch (two) { case 0b01 -> "IS"; case 0b10 -> "NOT"; case 0b11 -> "PRESERVE"; default -> "00"; };
+            sb.append(NAMES[i]).append('=').append(s).append(' ');
+        }
+        int sc = (combined >>> 24) & 0b11;                // SHORT_CIRCUIT은 위치 12 → 비트 24
+        sb.append("SHORT_CIRCUIT=").append(sc == 1 ? "IS" : "00");
+        return sb.toString();
+    }
+
+    static void dump(Stream<?> last) throws Exception {
+        Class<?> ap = Class.forName("java.util.stream.AbstractPipeline");
+        Field prev = ap.getDeclaredField("previousStage"); prev.setAccessible(true);
+        Field comb = ap.getDeclaredField("combinedFlags"); comb.setAccessible(true);
+        Field own = ap.getDeclaredField("sourceOrOpFlags"); own.setAccessible(true);
+        Deque<Object> stages = new ArrayDeque<>();
+        for (Object p = last; p != null; p = prev.get(p)) stages.push(p);   // 머리부터 출력하려고 뒤집는다
+        for (Object p : stages) {
+            int c = comb.getInt(p), o = own.getInt(p);
+            System.out.printf("%-26s own=0x%08x combined=0x%08x  %s%n",
+                p.getClass().getName().replace("java.util.stream.", ""), o, c, decode(c));
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        TreeSet<Integer> ts = new TreeSet<>(List.of(3, 1, 2));
+        dump(ts.stream().map(x -> x).filter(x -> x > 0).sorted());
+        System.out.println();
+        dump(new ArrayList<>(List.of(1, 2, 3)).stream().filter(x -> x > 0).limit(2));
+    }
+}</code></pre>
+<pre data-label="java --add-opens java.base/java.util.stream=ALL-UNNAMED Flags (OpenJDK 21.0.13)"><code class="language-text">ReferencePipeline$Head     own=0x00000055 combined=0x00000055  DISTINCT=IS SORTED=IS ORDERED=IS SIZED=IS SHORT_CIRCUIT=00
+ReferencePipeline$3        own=0x0000000a combined=0x0000005a  DISTINCT=NOT SORTED=NOT ORDERED=IS SIZED=IS SHORT_CIRCUIT=00
+ReferencePipeline$2        own=0x00000080 combined=0x0000009a  DISTINCT=NOT SORTED=NOT ORDERED=IS SIZED=NOT SHORT_CIRCUIT=00
+SortedOps$OfRef            own=0x00000014 combined=0x00000096  DISTINCT=NOT SORTED=IS ORDERED=IS SIZED=NOT SHORT_CIRCUIT=00
+
+ReferencePipeline$Head     own=0x00000050 combined=0x0000005f  DISTINCT=PRESERVE SORTED=PRESERVE ORDERED=IS SIZED=IS SHORT_CIRCUIT=00
+ReferencePipeline$2        own=0x00000080 combined=0x0000009f  DISTINCT=PRESERVE SORTED=PRESERVE ORDERED=IS SIZED=NOT SHORT_CIRCUIT=00
+SliceOps$1                 own=0x05000000 combined=0x0500009f  DISTINCT=PRESERVE SORTED=PRESERVE ORDERED=IS SIZED=NOT SHORT_CIRCUIT=IS</code></pre>
+<p>첫 파이프라인을 한 줄씩 따라가 보자. <code>TreeSet</code> 소스의 머리는 <code>0x55</code>, 이진수로 <code>01 01 01 01</code>이다. 네 성질이 모두 "있다"다. <code>map</code> 단계 자신의 값 <code>0x0a</code>는 <code>NOT_DISTINCT</code>(<code>0x2</code>)와 <code>NOT_SORTED</code>(<code>0x8</code>)의 합이고, 합친 결과 <code>0x5a</code>에서 <code>DISTINCT</code>와 <code>SORTED</code> 칸만 <code>10</code>으로 바뀌었다. <code>ORDERED</code>와 <code>SIZED</code> 칸에 대해 <code>map</code>은 침묵했으므로 <code>01</code>이 그대로 남았다. <code>filter</code>의 <code>0x80</code>은 <code>NOT_SIZED</code> 하나이고, 결과 <code>0x9a</code>에서 <code>SIZED</code> 칸만 <code>10</code>이 되었다. 마지막 <code>sorted()</code>의 <code>0x14</code>는 <code>IS_SORTED</code>(<code>0x4</code>)와 <code>IS_ORDERED</code>(<code>0x10</code>)로, <code>map</code>이 지웠던 <code>SORTED</code> 칸을 다시 <code>01</code>로 덮어썼다(<code>0x96</code>). 앞 절에서 말로 정리한 규칙이 비트 연산 그대로 일어나고 있다.</p>
+<p>두 번째 파이프라인에서는 <code>ArrayList</code> 소스가 <code>DISTINCT</code>와 <code>SORTED</code>를 갖지 않으므로 머리의 그 칸이 <code>11</code>이다. <code>limit(2)</code> 단계 자신의 값 <code>0x05000000</code>은 <code>IS_SHORT_CIRCUIT</code>(<code>0x01000000</code>)과 <code>IS_SIZE_ADJUSTING</code>(<code>0x04000000</code>)의 합이다. OpenJDK 21의 <code>SliceOps.flags(limit)</code>가 돌려주는 값이 정확히 이것이다. <code>limit</code>은 <code>SIZED</code>를 지우지 않는다는 점에 주목하자. 이 결과는 바로 아래에서 다시 쓴다.</p>
+<p>이 누적값을 읽는 곳은 최종 연산 시점이다. <code>wrapSink</code>의 반복문 본문은 <code>sink = p.opWrapSink(p.previousStage.combinedFlags, sink);</code>다. 단계마다 "바로 앞 단계까지의 누적 플래그"를 넘겨받고, 정렬 단계는 그 값으로 <code>StreamOpFlag.SORTED.isKnown(flags) && isNaturalSort</code>를 검사해 참이면 받은 Sink를 그대로 돌려준다. 앞 절에서 본 "<code>TreeSet</code> 스트림의 <code>sorted()</code>는 비교를 하지 않는다"는 최적화는, 실행 시점에 보면 정수 AND 한 번과 비교 한 번이다. 플래그는 중간 연산을 호출할 때 이미 계산되어 단계 객체에 저장되어 있으므로, 최종 연산은 그것을 읽기만 하면 된다.</p>
+<h4>플래그 규칙에서 바로 나오는 두 가지 결과</h4>
+<p>첫째, 비교자(<code>Comparator</code>)를 가진 <code>TreeSet</code>은 <code>SORTED</code> 플래그를 주지 않는다. <code>fromCharacteristics(Spliterator)</code>는 <code>Spliterator</code>에 <code>SORTED</code> 특성이 있어도 <code>getComparator()</code>가 <code>null</code>이 아니면 그 비트를 빼고 변환한다. 소스 주석은 그 이유로 비교자끼리 동일성(identity) 이상의 동등성을 비교하는 것을 믿을 수 없다는 점을 든다. 스트림의 <code>SORTED</code> 플래그는 "자연 순서로 정렬됨" 하나만 뜻하기 때문이다. 그래서 자연 순서와 똑같이 동작하는 <code>Comparator.naturalOrder()</code>를 명시해 만든 <code>TreeSet</code>도 생략 대상이 되지 못한다.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class Cmp {
+    static int compares = 0;
+    record Box(int v) implements Comparable<Box> {
+        public int compareTo(Box o) { compares++; return Integer.compare(v, o.v); }
+    }
+    public static void main(String[] args) {
+        TreeSet<Box> a = new TreeSet<>();                            // 비교자 없음(자연 순서)
+        TreeSet<Box> b = new TreeSet<>(Comparator.naturalOrder());   // 자연 순서를 비교자로 명시
+        for (int v : new int[]{3, 1, 2}) { a.add(new Box(v)); b.add(new Box(v)); }
+        compares = 0;
+        System.out.println("no comparator:      " + a.stream().sorted().toList() + " compares=" + compares);
+        compares = 0;
+        System.out.println("naturalOrder():     " + b.stream().sorted().toList() + " compares=" + compares);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21.0.13)"><code class="language-text">no comparator:      [Box[v=1], Box[v=2], Box[v=3]] compares=0
+naturalOrder():     [Box[v=1], Box[v=2], Box[v=3]] compares=2</code></pre>
+<p>둘째, <code>limit</code>과 <code>skip</code>은 <code>SIZED</code>를 지우지 않고 <code>SIZE_ADJUSTING</code>을 세운다. 그 덕에 크기를 아는 소스 뒤의 <code>limit</code>·<code>skip</code>은 <code>count()</code>의 생략을 막지 않는다. OpenJDK 21의 <code>count()</code>는 <code>exactOutputSizeIfKnown</code>을 부르는데, 이 메서드는 <code>SIZED</code>가 확실하면 소스의 정확한 크기를 얻고, <code>SIZE_ADJUSTING</code>도 서 있고 순차 스트림이면 머리 다음 단계부터 끝까지 각 단계의 <code>exactOutputSize(size)</code>를 차례로 적용한다. <code>SliceOps</code>의 단계는 이 메서드에서 건너뛸 개수와 최대 개수로 크기를 다시 계산한다.</p>
+<pre><code class="language-java">List<Integer> list = List.of(1, 2, 3, 4, 5, 6);
+long a = list.stream().peek(n -> System.out.println("A " + n)).limit(2).count();
+long b = list.stream().peek(n -> System.out.println("B " + n)).skip(4).count();
+System.out.println(a + " " + b);</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21.0.13)"><code class="language-text">2 2</code></pre>
+<p><code>peek</code>이 한 줄도 출력하지 않았다. 6에서 <code>limit(2)</code>를 적용해 2, <code>skip(4)</code>를 적용해 2를 계산했을 뿐 원소는 하나도 꺼내지 않았다. 앞의 함정 절에서 <code>peek</code>에 로직을 두지 말라고 한 이유가 하나 더 늘어난 셈이다. 같은 <code>peek</code>이 <code>filter</code> 뒤에서는 실행되고, <code>limit</code> 뒤에서는 실행되지 않는다. 이 차이는 람다의 내용이 아니라 단계마다 2비트씩 적힌 플래그가 결정한다.</p>
+
+<h3>한 층 더 아래: HotSpot은 Sink 사슬을 어떻게 실행하는가</h3>
+<p>앞에서 스트림의 원소당 비용을 "인터페이스 메서드 호출"이라고 불렀다. 이번에는 그 호출이 JVM 안에서 실제로 어떻게 처리되는지 본다. 먼저 호출이 바이트코드 어디에 있는지부터 확인한다. <code>javap</code>로 <code>filter</code> 단계의 Sink 클래스를 열어 보면 다음과 같다.</p>
+<pre data-label="javap -c -p --module java.base 'java.util.stream.ReferencePipeline$2$1' (OpenJDK 21.0.13, 발췌)"><code class="language-text">public void accept(P_OUT);
+  Code:
+     0: aload_0
+     1: getfield      #1    // Field this$1:Ljava/util/stream/ReferencePipeline$2;
+     4: getfield      #25   // Field java/util/stream/ReferencePipeline$2.val$predicate:Ljava/util/function/Predicate;
+     7: aload_1
+     8: invokeinterface #31,  2   // InterfaceMethod java/util/function/Predicate.test:(Ljava/lang/Object;)Z
+    13: ifeq          26
+    16: aload_0
+    17: getfield      #13   // Field downstream:Ljava/util/stream/Sink;
+    20: aload_1
+    21: invokeinterface #37,  2   // InterfaceMethod java/util/stream/Sink.accept:(Ljava/lang/Object;)V
+    26: return</code></pre>
+<p>1번과 4번의 <code>getfield</code> 두 개가 앞에서 그린 메모리 그림을 그대로 보여 준다. Sink는 자기를 만든 단계 객체(<code>this$1</code>, 익명 클래스 <code>ReferencePipeline$2</code>)를 참조하고, <code>filter</code>에 넘긴 람다는 그 단계 객체가 캡처해 둔 합성 필드 <code>val$predicate</code>에 들어 있다. 그리고 원소 하나마다 인터페이스 호출이 두 번 있다. 8번 위치(bci 8)의 <code>Predicate.test</code>와 21번 위치(bci 21)의 <code>Sink.accept</code>다. <code>ArrayListSpliterator.forEachRemaining</code>의 반복문 안에도 95번 위치에 <code>Consumer.accept</code> 호출이 있다. 이 세 호출 모두 받는 객체의 실제 클래스가 실행 중에야 정해지므로, 바이트코드만 보고는 어떤 메서드가 불릴지 알 수 없다.</p>
+<h4>타입 프로파일과 프로파일 기반 인라이닝</h4>
+<p>OpenJDK 21 HotSpot의 단계별 컴파일(tiered compilation)은 <code>compilationPolicy.hpp</code>의 주석대로 다섯 단계를 쓴다. 0은 인터프리터, 1~3은 C1 컴파일러(3은 모든 프로파일을 수집하는 코드), 4는 프로파일을 근거로 최적화하는 C2 컴파일러다. 0단계와 3단계에서 실행되는 동안 메서드마다 붙은 MethodData 객체(MDO)에 프로파일이 쌓인다. 가상·인터페이스 호출 지점에는 <code>ReceiverTypeData</code>가 붙어 그 지점에서 실제로 받은 객체의 클래스를 기록하는데, 기록할 수 있는 클래스 수(<code>row_limit()</code>)는 <code>TypeProfileWidth</code>이고 이 실험 환경(macOS, OpenJDK 21.0.13)에서 <code>-XX:+PrintFlagsFinal</code>로 확인한 기본값은 2다.</p>
+<p>C2가 호출을 만나면 <code>src/hotspot/share/opto/doCall.cpp</code>의 <code>Compile::call_generator</code>가 그 프로파일을 읽는다. 받은 클래스가 하나뿐이거나(monomorphic), 한 클래스가 전체의 <code>TypeProfileMajorReceiverPercent</code>(기본 90%) 이상이거나, 둘뿐이고 <code>UseBimorphicInlining</code>(기본 켜짐)이면, 그 클래스의 메서드를 호출 자리에 펼쳐 넣는다(인라이닝). 이때 "받는 객체가 정말 그 클래스인가"를 검사하는 코드가 앞에 붙는다. 클래스가 하나나 둘이었던 경우 검사가 실패하는 경로는 uncommon trap, 곧 컴파일된 코드를 버리고 인터프리터로 돌아가는 역최적화(deoptimization)로 만들어진다. 어느 조건에도 맞지 않으면 C2는 인라이닝을 포기하고 보통의 가상 호출을 만들며, 진단 출력에 <code>virtual call</code>이라고 적는다.</p>
+<p>이 회차의 주제에서 중요한 사실은 <b>프로파일이 어디에 붙어 있는가</b>다. <code>call_generator</code>는 <code>caller = jvms->method()</code>, 곧 호출 명령이 들어 있는 메서드를 잡고 <code>caller->call_profile_at_bci(bci)</code>로 그 메서드의 MDO에서 해당 위치의 기록을 읽는다. 프로파일은 "어떤 파이프라인의 filter인가"가 아니라 "<code>ReferencePipeline$2$1.accept</code>의 bci 21"에 붙어 있다. JVM 안에서 참조형 스트림의 모든 <code>filter</code> 단계가 같은 클래스의 같은 메서드를 쓰므로, 프로그램 어디에서든 <code>filter</code> 뒤에 무엇이 붙었는지가 이 한 곳에 섞여 기록된다.</p>
+<h4>실험: 같은 파이프라인, 다른 인라이닝</h4>
+<p>JIT의 판단은 <code>-XX:+UnlockDiagnosticVMOptions</code>와 함께 쓰는 진단 옵션으로 볼 수 있다. 아래 <code>run</code>은 원소 1,000개짜리 <code>ArrayList</code>에 <code>filter → map → count</code>를 실행한다(<code>filter</code>가 <code>SIZED</code>를 지우므로 <code>count</code>가 실제로 순회한다). 인자를 주면 <code>run</code>보다 먼저, <code>filter</code> 뒤에 서로 다른 단계가 붙은 파이프라인 다섯 가지를 2,000번씩 실행한다.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class Hot {
+    static long run(List<Integer> list) {
+        return list.stream().filter(n -> (n & 1) == 0).map(n -> n + 1).count();
+    }
+    static void pollute(List<Integer> list) {
+        // filter 뒤에 서로 다른 Sink가 오는 파이프라인들
+        list.stream().filter(n -> n > 0).peek(n -> {}).count();
+        list.stream().filter(n -> n > 0).sorted().count();
+        list.stream().filter(n -> n > 0).distinct().count();
+        list.stream().filter(n -> n > 0).limit(1000).count();
+        list.stream().filter(n -> n > 0).skip(1).count();
+    }
+    public static void main(String[] args) {
+        List<Integer> list = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) list.add(i);
+        if (args.length > 0) for (int i = 0; i < 2000; i++) pollute(list);
+        long s = 0;
+        for (int i = 0; i < 20000; i++) s += run(list);
+        System.out.println(s);
+    }
+}</code></pre>
+<pre><code class="language-bash">java -Xbatch -XX:+UnlockDiagnosticVMOptions -XX:CompileCommand=quiet \
+     '-XX:CompileCommand=PrintInlining,java.util.ArrayList$ArrayListSpliterator::forEachRemaining' \
+     -XX:+PrintCompilation Hot        # 두 번째 실행은 끝에 인자 x를 붙인다</code></pre>
+<p><code>-Xbatch</code>는 컴파일을 백그라운드가 아니라 실행을 멈추고 하게 해서 출력이 섞이지 않게 하고, <code>CompileCommand=PrintInlining</code>은 반복문이 들어 있는 <code>forEachRemaining</code>을 컴파일할 때의 인라이닝 결정만 출력하게 한다. 인자 없이 실행했을 때, C2(4단계)가 <code>forEachRemaining</code>을 컴파일하며 내린 결정은 이렇다.</p>
+<pre data-label="인자 없이 실행: forEachRemaining의 C2 인라이닝 트리 (OpenJDK 21.0.13, 발췌)"><code class="language-text">@ 95   java.util.stream.ReferencePipeline$2$1::accept (27 bytes)   inline (hot)
+ \-> TypeProfile (40960/40960 counts) = java/util/stream/ReferencePipeline$2$1
+  @ 8   Hot$$Lambda/0x0000008001000a08::test (8 bytes)   inline (hot)
+   \-> TypeProfile (5120/5120 counts) = Hot$$Lambda+0x0000008001000a08
+    @ 4   Hot::lambda$run$0 (15 bytes)   inline (hot)
+  @ 21   java.util.stream.ReferencePipeline$3$1::accept (23 bytes)   inline (hot)
+   \-> TypeProfile (2560/2560 counts) = java/util/stream/ReferencePipeline$3$1
+    @ 12   Hot$$Lambda/0x0000008001000c58::apply (8 bytes)   inline (hot)
+     \-> TypeProfile (2432/2432 counts) = Hot$$Lambda+0x0000008001000c58
+      @ 4   Hot::lambda$run$1 (10 bytes)   inline (hot)
+        @ 6   java.lang.Integer::valueOf (32 bytes)   inline (hot)
+    @ 17   java.util.stream.ReduceOps$CountingSink$OfRef::accept (11 bytes)   inline (hot)
+     \-> TypeProfile (2432/2432 counts) = java/util/stream/ReduceOps$CountingSink$OfRef</code></pre>
+<p>들여쓰기가 곧 인라이닝의 중첩이다. <code>forEachRemaining</code>의 bci 95에서 filter Sink가, 그 안의 bci 8에서 filter 람다와 그 본문(<code>lambda$run$0</code>)이, bci 21에서 map Sink가, 그 안에서 map 람다와 최종 Sink인 <code>CountingSink</code>까지 모두 펼쳐졌다. 각 줄의 <code>TypeProfile (n/n counts)</code>는 그 지점에서 기록된 클래스가 하나뿐이었다는 뜻이다. 앞에서 스택 트레이스로 본 "Sink에서 Sink로 이어지는 중첩 호출"이, C2가 컴파일한 코드에서는 하나의 컴파일 단위로 합쳐진 것이다. map 람다 아래의 <code>Integer::valueOf</code>는 원소마다 <code>Integer</code> 객체를 만들 수 있는 박싱 호출로, 기본형 특화 스트림이 따로 있는 이유와 이어진다(6회). 카운트 값과 <code>Lambda/0x…</code> 주소는 실행마다 달라질 수 있다.</p>
+<pre data-label="인자 x를 주고 실행: 같은 forEachRemaining의 C2 인라이닝 트리 (OpenJDK 21.0.13, 발췌)"><code class="language-text">@ 95   java.util.stream.ReferencePipeline$2$1::accept (27 bytes)   inline (hot)
+ \-> TypeProfile (40960/40960 counts) = java/util/stream/ReferencePipeline$2$1
+  @ 8   java.util.function.Predicate::test (0 bytes)   virtual call
+  @ 21   java.util.stream.Sink::accept (10 bytes)   virtual call</code></pre>
+<p><code>run</code>의 코드는 한 글자도 바뀌지 않았는데 결과가 달라졌다. 다섯 가지 파이프라인이 모두 <code>filter</code>로 시작하므로 bci 95에는 여전히 filter Sink 한 종류만 기록되어 filter Sink 자체는 인라이닝되었다. 하지만 그 안의 bci 8을 지나간 람다 클래스는 다섯 가지, bci 21을 지나간 Sink 클래스는 네 가지다. <code>peek</code>·<code>sorted</code>·<code>distinct</code>의 Sink가 하나씩이고, <code>limit</code>과 <code>skip</code>은 둘 다 <code>SliceOps.makeRef</code>가 만드는 같은 Sink 클래스(<code>SliceOps$1$1</code>)를 쓴다. 프로파일 칸은 두 개뿐이어서 나머지는 클래스 없이 횟수로만 남고, <code>ciMethod::call_profile_at_bci</code>는 이런 지점을 단일·이중 타입으로 판정하지 않는다. 90%를 넘는 다수도 없으니 C2는 두 호출을 <code>virtual call</code>로 남겼다. 이 컴파일이 일어난 시점에 <code>run</code>은 아직 한 번도 실행되지 않았다. <code>run</code>의 람다가 인라이닝되지 못한 것은 <code>run</code> 때문이 아니라, 같은 호출 지점을 먼저 지나간 다른 파이프라인들 때문이다.</p>
+<h4>프로파일이 나중에 바뀌면: 역최적화</h4>
+<p>순서를 바꿔, <code>run</code>을 먼저 2만 번 실행해 단일 타입으로 컴파일되게 한 뒤 다른 모양의 파이프라인을 섞으면 어떻게 될까. <code>main</code>만 바꾼 <code>Phase</code> 클래스를 <code>-Xbatch -XX:+PrintCompilation -Xlog:deoptimization=debug</code>로 실행했다.</p>
+<pre><code class="language-java">import java.util.*;
+
+public class Phase {
+    public static void main(String[] args) {
+        List<Integer> list = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) list.add(i);
+        long s = 0;
+        for (int i = 0; i < 20000; i++) s += Hot.run(list);
+        System.out.println("=== 1단계 끝: 이제 다른 모양의 파이프라인을 섞는다");
+        for (int i = 0; i < 2000; i++) Hot.pollute(list);
+        System.out.println("=== 2단계 끝");
+        for (int i = 0; i < 20000; i++) s += Hot.run(list);
+        System.out.println(s);
+    }
+}</code></pre>
+<pre data-label="-Xlog:deoptimization=debug 출력 발췌 (OpenJDK 21.0.13, 시각·cid·pc 주소는 실행마다 다르다)"><code class="language-text">35   60    b  4       java.util.ArrayList$ArrayListSpliterator::forEachRemaining (127 bytes)
+=== 1단계 끝: 이제 다른 모양의 파이프라인을 섞는다
+[0.148s][debug][deoptimization] cid=  60     level=4 java.util.stream.ReferencePipeline$2$1.accept(Ljava/lang/Object;)V trap_bci=8 class_check maybe_recompile ...
+[0.150s][debug][deoptimization] cid=  59 osr level=4 java.util.stream.ReferencePipeline$2$1.accept(Ljava/lang/Object;)V trap_bci=8 osr_bci=81 class_check maybe_recompile ...
+149   59 %     4       java.util.ArrayList$ArrayListSpliterator::forEachRemaining @ 81 (127 bytes)   made not entrant
+151   60       4       java.util.ArrayList$ArrayListSpliterator::forEachRemaining (127 bytes)   made not entrant</code></pre>
+<p><code>cid= 60</code>은 컴파일 번호 60, 곧 1단계에서 C2가 만든 <code>forEachRemaining</code>이다. 로그는 그 안에 인라이닝된 <code>ReferencePipeline$2$1.accept</code>의 bci 8, 바로 <code>Predicate.test</code> 호출 앞의 클래스 검사(<code>class_check</code>)에서 트랩이 났다고 적는다. 1단계에서는 filter 람다가 한 종류뿐이었으므로 C2가 "이 클래스일 것"이라고 가정하고 본문을 펼쳐 넣었는데, 2단계의 새 람다가 그 가정을 깼다. <code>doCall.cpp</code>가 단일·이중 타입 호출의 실패 경로를 uncommon trap으로 만든다고 했던 바로 그 경로다. 처리 방침 <code>maybe_recompile</code>대로 해당 컴파일 코드는 <code>made not entrant</code>, 즉 더 이상 진입하지 못하게 표시되고 실행은 인터프리터나 낮은 단계 코드로 돌아간다. 번호 59는 반복문 도중에 들어가는 OSR(on-stack replacement) 컴파일본이고(<code>%</code> 표시와 <code>osr_bci=81</code>), 같은 이유로 버려졌다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>스트림의 단계 클래스(<code>ReferencePipeline$2$1</code> 같은 Sink)는 JVM 전체에서 하나씩이고, HotSpot의 타입 프로파일은 그 클래스의 메서드 안 호출 위치마다 하나씩 붙는다. 그래서 같은 파이프라인 코드라도 프로그램의 다른 곳에서 어떤 파이프라인이 실행되었는지에 따라 Sink 사슬이 반복문 안으로 모두 인라이닝되기도 하고, 인터페이스 호출로 남기도 하며, 실행 도중 가정이 깨져 역최적화되기도 한다. 파이프라인 하나만 따로 떼어 잰 결과가 실제 애플리케이션 안의 동작과 다를 수 있는 구조적 이유가 여기에 있다. 이 실험은 인라이닝 결정만 보여 줄 뿐, 그것이 실행 시간에 얼마의 차이를 만드는지는 측정하지 않았다(이 환경에는 기계어를 볼 hsdis도 없다).</p></aside>
+
+<h3>흔한 오해와 함정</h3>
+<h4>함정 1: 최종 연산을 빠뜨린 파이프라인</h4>
+<p>지연 연산을 모르면 가장 먼저 만나는 버그다.</p>
+<pre><code class="language-java">orders.stream()
+      .filter(o -> o.isPaid())
+      .map(o -> { o.markShipped(); return o; });   // 최종 연산이 없다 → 아무 주문도 처리되지 않는다</code></pre>
+<p>컴파일도 되고 예외도 나지 않는다. 그런데 <code>markShipped()</code>는 한 번도 호출되지 않는다. 단계 객체 두 개가 만들어졌다가 참조를 잃고 가비지가 될 뿐이다. 원소마다 부수 효과를 일으키는 것이 목적이라면 <code>map</code>이 아니라 최종 연산 <code>forEach</code>를 써야 한다. 더 나아가 상태를 바꾸는 일 자체를 스트림 밖의 평범한 반복문으로 두는 편이 의도가 분명할 때가 많다. 스트림 연산에 넘기는 동작은 부수 효과가 없을수록 안전하다는 점은 11회에서 다시 다룬다.</p>
+<h4>함정 2: peek에 로직을 두기</h4>
+<p><code>peek</code>의 API 문서는 이 메서드가 "주로 디버깅을 지원하기 위해 존재한다"고 밝히고, 단락 연산이나 <code>count()</code>의 예처럼 구현이 원소 생산의 일부나 전부를 생략할 수 있는 경우에는 그 원소들에 대해 동작이 호출되지 않는다고 적는다. 앞에서 본 대로 <code>list.stream().peek(...).count()</code>에서 <code>peek</code>은 자바 21에서 한 번도 실행되지 않는다. 로그를 남기거나 값을 저장하는 로직을 <code>peek</code>에 두면 같은 코드가 최종 연산이나 자바 버전에 따라 실행되기도 하고 안 되기도 한다.</p>
+<h4>함정 3: "중간 연산마다 컬렉션 전체를 한 번씩 돈다"</h4>
+<p>스트림을 즉시 방식의 반복문 여러 개로 머릿속에 번역하는 오해다. 그렇게 생각하면 "<code>filter</code>와 <code>map</code>을 나누면 두 번 도니 느리다"는 결론이 나오고, 단계를 억지로 한 람다에 합치는 코드가 나온다. 실제로는 앞에서 실행 추적과 스택 트레이스로 확인했듯 상태 없는 단계들은 한 번의 순회로 융합된다. 단계를 나누는 비용은 Sink 객체 하나와 원소당 메서드 호출 한 번이다.</p>
+<h4>함정 4: 스트림을 변수에 담아 두 번 쓰기</h4>
+<p>스트림을 컬렉션처럼 생각하면 "필터링된 스트림을 변수에 담아 두고 개수도 세고 목록도 얻자"는 코드를 쓰게 된다. 두 번째 최종 연산에서 <code>IllegalStateException</code>이 난다. 같은 데이터를 여러 번 쓰려면 결과를 컬렉션으로 모아 두거나, 스트림을 만드는 코드를 <code>Supplier</code>로 감싸 필요할 때마다 새 스트림을 얻어야 한다. 스트림은 "데이터"가 아니라 "한 번 실행되는 계산"이다.</p>
+<h4>함정 5: 람다 안에서 소스나 바깥 상태를 바꾸기</h4>
+<p>간섭 금지 규칙은 순차 스트림에도 적용된다. 앞에서 본 것처럼 <code>ArrayList</code> 소스를 실행 중에 고치면 <code>ConcurrentModificationException</code>이 나는데, 그 예외는 람다가 모든 원소에 대해 실행되고 리스트가 이미 바뀐 뒤에 난다. 바깥의 리스트나 카운터를 람다 안에서 바꾸는 것도 위험하다. 패키지 문서는 결과가 파이프라인 실행 중 바뀔 수 있는 상태에 의존하는 상태 있는 람다(stateful lambda)를 쓰면 결과가 비결정적이거나 틀릴 수 있다고 경고한다. 순차 스트림에서는 우연히 맞게 동작하더라도 <code>parallel()</code> 한 번으로 깨진다(10회).</p>
+<h4>함정 6: "스트림이 반복문보다 항상 빠르다(또는 느리다)"</h4>
+<p>둘 다 근거 없는 일반화다. 스트림은 단계 객체, Sink 객체, 원소당 인터페이스 호출이라는 고정 비용을 치르고, 그 대가로 중간 컬렉션 제거, 단락, 플래그 기반 생략을 얻는다. 원소가 몇 개 안 되는 간단한 합산이라면 고정 비용이 더 눈에 띌 수 있고, 큰 데이터에서 앞쪽 몇 개만 필요하다면 단락의 이득이 압도적일 수 있다. 성능이 중요하다면 추측하지 말고 측정한다. 그 전에 이 회차에서 본 구조, 곧 순서, 장벽, 단락의 위치를 먼저 점검하는 것이 훨씬 큰 차이를 만든다.</p>
+
+<h3>정리: 다른 주제와의 연결</h3>
+<p>이 회차에서 세운 그림은 남은 스트림 회차 전체의 바탕이다. 6회에서 다룰 다양한 생성 방법(배열, 범위, 무한 생성)은 결국 머리 단계에 어떤 <code>Spliterator</code>와 플래그를 넣느냐의 차이이고, 수많은 중간·최종 연산은 각각 어떤 Sink를 만들고 어떤 플래그를 세우거나 지우느냐의 차이다. 7회의 <code>collect</code>와 <code>Collector</code>는 최종 Sink가 결과를 "어떻게 모으는가"를 사용자가 정의하게 해 주는 장치다. 8회의 <code>Optional</code>은 <code>findFirst</code>처럼 결과가 없을 수도 있는 최종 연산의 반환 타입으로 이미 등장했다. 10회의 병렬 스트림은 같은 단계 사슬을 그대로 두고, <code>Spliterator.trySplit</code>으로 소스를 나눠 여러 스레드에서 Sink 사슬을 실행하는 방식이다. 이 회차의 <code>evaluate</code>가 <code>isParallel()</code>에 따라 <code>evaluateSequential</code>과 <code>evaluateParallel</code>로 갈라지던 곳이 그 입구다.</p>
+<p>스트림 밖에서도 같은 생각을 만난다. 스프링 핵심 원리 고급편에서 본 프록시 체인과 인터셉터 체인은 "호출을 받아 자기 일을 하고 다음에 넘기는 객체의 사슬"이라는 점에서 Sink 사슬과 구조가 같다. SQL이 "무엇을" 원하는지만 선언하고 실행 방법은 옵티마이저에 맡기는 것도 내부 반복과 같은 방향의 생각이다. 다만 앞에서 본 대로 스트림 라이브러리는 데이터베이스 옵티마이저처럼 연산을 재배치하지 않는다는 차이를 기억해 두자. 다음 회차에서는 이 구조 위에서 실제로 쓰게 될 스트림 생성 방법과 중간·최종 연산들을 하나씩 살펴본다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>내부 반복(internal iteration)</dt><dd>반복의 절차를 사용자 코드가 아니라 라이브러리가 통제하는 방식. 사용자는 단계별로 "무엇을" 할지만 선언하고, 실제 반복문은 <code>Spliterator.forEachRemaining</code> 같은 JDK 코드 안에서 돈다.</dd>
+<dt>스트림의 다섯 성질</dt><dd>저장하지 않고, 소스를 바꾸지 않으며, 지연을 추구하고, 무한일 수 있으며, 한 번만 소비된다(<code>java.util.stream</code> 패키지 문서).</dd>
+<dt>파이프라인 단계</dt><dd>소스는 <code>Head</code> 단계, 중간 연산은 각각 새 단계 객체를 만들고 <code>previousStage</code>/<code>nextStage</code>로 연결된다. 단계에는 원소를 담는 공간이 없다.</dd>
+<dt>재사용 검사</dt><dd>단계에 이미 다음 단계가 붙었거나 최종 연산이 실행되면 <code>linkedOrConsumed</code>가 <code>true</code>가 되고, 그 단계에 다시 연산하면 "stream has already been operated upon or closed" 예외가 난다(중간 연산 호출 시점에도 난다).</dd>
+<dt>지연 연산</dt><dd>중간 연산은 언제나 지연되며, 소스 순회는 최종 연산이 실행되어야 시작된다. 원소 하나가 모든 단계를 통과한 뒤 다음 원소가 출발하는 세로 방향 처리다.</dd>
+<dt>Sink 사슬</dt><dd>최종 연산 시점에 <code>wrapSink</code>가 마지막 단계부터 머리 쪽으로 거슬러 올라가며 각 단계의 <code>opWrapSink</code>로 만든 수신자 사슬. 원소는 <code>accept</code> 호출을 타고 끝까지 밀려 내려간다.</dd>
+<dt>단락(short-circuiting)</dt><dd><code>limit</code>, <code>findFirst</code>, <code>anyMatch</code> 등이 있으면 원소마다 <code>cancellationRequested()</code>를 묻고 <code>tryAdvance</code>로 하나씩 꺼내며, 필요한 결과가 나오면 멈춘다. 무한 스트림 종료의 필요조건일 뿐 충분조건은 아니다.</dd>
+<dt>상태 있는 연산과 장벽</dt><dd><code>sorted</code>는 모든 원소를 버퍼에 모은 뒤 <code>end()</code>에서 정렬해 내보내므로 파이프라인을 두 구간으로 나누고, 뒤쪽의 단락이 앞쪽 순회를 줄이지 못한다.</dd>
+<dt>스트림 플래그</dt><dd>DISTINCT, SORTED, ORDERED, SIZED, SHORT_CIRCUIT 등(OpenJDK 21에는 SIZE_ADJUSTING도 있다). 소스 <code>Spliterator</code>의 특성에서 시작해 연산마다 세우거나 지우며, OpenJDK는 이를 근거로 <code>sorted</code>, <code>distinct</code>, <code>count</code>의 실제 작업을 생략할 수 있다.</dd>
+<dt>플래그의 2비트 인코딩</dt><dd>OpenJDK 21에서 성질 하나는 <code>int</code> 안의 2비트(01 세움, 10 지움, 11 보존)를 차지하고, <code>combineOpFlags</code>가 단계마다 "말한 연산은 덮어쓰고 침묵하면 보존"하도록 합친다. DISTINCT·SORTED·ORDERED·SIZED의 세움 비트 자리는 <code>Spliterator</code> 특성 상수와 같다.</dd>
+<dt>타입 프로파일과 Sink 인라이닝</dt><dd>HotSpot C2는 호출 위치마다 기록된 수신 클래스가 하나나 둘이거나 한 클래스가 90% 이상이면 Sink와 람다를 반복문 안으로 인라이닝하고, 그렇지 않으면 가상 호출로 남긴다. 프로파일은 파이프라인이 아니라 <code>ReferencePipeline$2$1.accept</code> 같은 공유 메서드의 bci에 붙으므로 다른 파이프라인의 실행이 결과를 바꾼다.</dd>
+</x-summary>
+
+<x-review>
+<p>지연 연산은 장애 분석에서 자주 등장한다. "분명히 코드를 썼는데 저장이 안 된다"는 문의를 따라가 보면 최종 연산 없이 <code>map</code> 안에서 저장 메서드를 부르는 파이프라인인 경우가 있다. 반대로 "로그는 테스트에서 찍혔는데 운영에서는 안 찍힌다"는 현상이 <code>peek</code>과 <code>count()</code>의 조합이나, 파이프라인 중간의 <code>findFirst</code> 같은 단락 때문에 생기기도 한다. 이런 현상을 만나면 먼저 "이 람다는 언제, 몇 번 실행되는가"를 Sink 사슬과 플래그 관점에서 따져 본다. 부수 효과가 있는 코드를 스트림 연산에 넣지 않는 것이 가장 확실한 예방이다.</p>
+<p>메모리 문제도 같은 시각으로 본다. 큰 데이터를 스트림으로 처리하면서 중간 컬렉션이 없으니 메모리가 안전하다고 생각했는데 힙이 부족해졌다면, 파이프라인에 <code>sorted</code> 같은 장벽이 있는지, 최종 연산이 결과를 통째로 모으는지 확인한다. 장벽은 그 지점까지의 원소 전부를 버퍼에 담는다. 파일이나 DB 커서처럼 큰 소스라면 정렬을 소스 쪽(예: SQL의 ORDER BY)에 맡기고 스트림에서는 상태 없는 연산만 쓰는 편이 낫다. 무한 소스나 매우 큰 소스 뒤에 <code>sorted</code>를 두면 결과가 영원히 나오지 않을 수 있다는 점도 같은 원리다.</p>
+<p>판단이 달라지는 조건도 있다. 원소가 적고 단계가 하나뿐인 단순 반복이라면 스트림의 고정 비용과 반복문의 단순함을 비교해 반복문을 택해도 된다. 반대로 단계가 여러 개이고 앞쪽 일부만 필요한 경우, 무한하거나 지연 생성되는 소스를 다루는 경우에는 스트림의 지연과 단락이 직접 구현하기 어려운 이득을 준다. 어느 쪽이든 성능이 쟁점이라면 측정으로 결정하고, 그 전에 연산 순서와 장벽의 위치를 먼저 점검한다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 코드의 출력을 정확히 예측하라. <code>List.of(5, 8, 12, 3, 20).stream().peek(n -> System.out.println("peek " + n)).filter(n -> n > 6).map(n -> n / 2).limit(2).toList()</code>의 결과도 함께 적는다. 3과 20에 대해 <code>peek</code>이 실행되는지, 그 이유를 OpenJDK의 <code>copyIntoWithCancel</code> 동작으로 설명하라.</li>
+<li><code>Stream.of("a", "bb", "ccc").map(String::length).filter(n -> n > 1).toList()</code>에 대해 (1) 최종 연산 직전 힙의 단계 객체 사슬(클래스 이름, depth)과 (2) 최종 연산이 조립하는 Sink 사슬(원소가 지나가는 순서)을 각각 그려라. 두 사슬이 조립되는 방향이 왜 반대인지 설명하라.</li>
+<li>동료가 "주문 목록에서 결제된 주문을 배송 처리한다"며 <code>orders.stream().filter(Order::isPaid).map(o -> { o.markShipped(); return o; });</code>를 작성했고, 테스트에서 배송 처리가 하나도 되지 않았다. 원인을 설명하고, 고친 코드 두 가지(스트림을 쓰는 것과 쓰지 않는 것)를 제시하라.</li>
+<li><code>List.of(1, 2, 3, 4).stream().peek(n -> System.out.println("A " + n)).count()</code>와 <code>List.of(1, 2, 3, 4).stream().filter(n -> true).peek(n -> System.out.println("B " + n)).count()</code>를 자바 21에서 실행했을 때의 출력을 예측하고, 두 결과가 다른 이유를 스트림 플래그로 설명하라. 자바 8에서는 어떻게 될 수 있는지도 적어라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 출력은 <code>peek 5</code>, <code>peek 8</code>, <code>peek 12</code> 세 줄이고 결과는 <code>[4, 6]</code>이다. 5는 <code>peek</code>을 지나 <code>filter</code>에서 탈락한다. 8은 통과해 4가 되고 <code>limit</code>의 남은 개수가 1이 된다. 12는 통과해 6이 되고 남은 개수가 0이 된다. 파이프라인에 <code>limit</code>이 있으므로 <code>SHORT_CIRCUIT</code> 플래그가 서 있고, <code>copyInto</code>는 <code>copyIntoWithCancel</code>로 가서 <code>tryAdvance</code> 전에 매번 <code>cancellationRequested()</code>를 묻는다. 12를 처리한 다음 바퀴에서 이 질문이 peek → filter → map → limit Sink로 전달되고, limit Sink가 남은 개수 0을 보고 <code>true</code>를 답하므로 3은 꺼내지지 않는다. 따라서 3과 20에 대해서는 <code>peek</code>도 실행되지 않는다. 즉시 방식이었다면 다섯 원소 모두 "peek"이 찍혔을 것이다.</p>
+<p><b>2번.</b> (1) 단계 사슬: <code>ReferencePipeline$Head</code>(depth 0) → <code>map</code>의 익명 단계(depth 1, OpenJDK 21에서는 <code>ReferencePipeline$3</code>) → <code>filter</code>의 익명 단계(depth 2, <code>ReferencePipeline$2</code>). 각 단계는 <code>previousStage</code>/<code>nextStage</code>로 이어지고 모두 <code>sourceStage</code>로 머리를 가리킨다. (2) Sink 사슬: 원소는 map Sink → filter Sink → 결과 Sink 순으로 지나간다. "a"는 1로 바뀐 뒤 filter에서 탈락, "bb"는 2로 바뀌어 통과, "ccc"는 3으로 바뀌어 통과하므로 결과는 <code>[2, 3]</code>이다. 조립 방향이 반대인 이유: 단계는 연산을 호출한 순서대로 앞에서 뒤로 붙지만, Sink는 만들 때 "원소를 넘길 아래쪽 Sink"가 이미 있어야 하므로 <code>wrapSink</code>가 마지막 단계부터 머리 쪽으로 거슬러 올라가며 만든다. 완성된 Sink 사슬은 원소를 앞에서 뒤로 흘려보낸다.</p>
+<p><b>3번.</b> 최종 연산이 없다. <code>filter</code>와 <code>map</code>은 단계 객체만 만들고, 소스 순회는 최종 연산이 실행되어야 시작되므로 <code>markShipped()</code>는 한 번도 호출되지 않는다. 컴파일 오류나 예외도 없어서 발견이 늦다. 스트림을 쓴다면 부수 효과를 위한 최종 연산 <code>forEach</code>를 쓴다: <code>orders.stream().filter(Order::isPaid).forEach(Order::markShipped);</code>. 쓰지 않는다면 <code>for (Order o : orders) if (o.isPaid()) o.markShipped();</code>처럼 평범한 반복문으로 상태 변경임을 드러낸다. 어느 쪽이든 <code>map</code>은 값을 "바꾸어 내보내는" 연산이지 부수 효과를 위한 자리가 아니다.</p>
+<p><b>4번.</b> 첫 번째는 아무것도 출력하지 않고 4를 돌려준다. 두 번째는 <code>B 1</code>부터 <code>B 4</code>까지 네 줄을 출력하고 4를 돌려준다. <code>List</code> 소스는 <code>SIZED</code>이고 <code>peek</code>은 원소 수를 바꾸지 않으므로 첫 파이프라인은 출력 크기를 미리 알 수 있다. OpenJDK의 <code>count()</code>는 이 경우 원소를 꺼내지 않고 크기를 바로 돌려준다. 두 번째 파이프라인은 <code>filter</code>가 (조건이 항상 참이라도) <code>NOT_SIZED</code>로 크기 정보를 지우므로 실제로 순회해서 세야 하고, 그 과정에서 <code>peek</code>이 실행된다. 자바 8의 <code>count()</code> 문서에는 파이프라인을 생략할 수 있다는 API Note가 없고, 자바 9부터 생겼다. 그러므로 자바 8에서는 첫 번째 코드도 네 줄을 출력할 수 있다. 같은 코드의 출력이 버전에 따라 달라질 수 있다는 것이 <code>peek</code>에 로직을 두면 안 되는 이유다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>Stream<Integer> s = List.of(1, 2, 3).stream().filter(n -> { System.out.println(n); return true; });</code> 한 줄만 실행했다. 무엇이 출력되는가?</q>
+<o>1, 2, 3이 한 줄씩 출력된다.</o>
+<o>아무것도 출력되지 않는다.</o>
+<o>1만 출력된다. 스트림은 첫 원소만 미리 평가한다.</o>
+<o>컴파일 오류가 난다. 최종 연산 없는 스트림은 변수에 담을 수 없다.</o>
+<why>중간 연산은 언제나 지연된다. <code>filter</code> 호출은 람다 객체를 담은 새 단계 객체를 만들 뿐이고, 소스 순회와 람다 실행은 최종 연산이 호출되어야 시작된다. 첫 원소를 미리 평가하는 규칙은 없고, 최종 연산 없는 스트림을 변수에 담는 것은 아무 문제 없다(이 회차의 LazyDemo가 그렇게 했다).</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>Stream<Integer> s0 = list.stream(); Stream<Integer> s1 = s0.filter(n -> n > 0); Stream<Integer> s2 = s0.map(n -> n * 2);</code>를 OpenJDK 21에서 실행하면 어떻게 되는가?</q>
+<o>정상 실행된다. 한 소스에서 두 갈래 파이프라인을 만들 수 있다.</o>
+<o>정상 실행되지만 나중에 <code>s1</code>이나 <code>s2</code>에 최종 연산을 부를 때 예외가 난다.</o>
+<o><code>s0.map(...)</code>을 호출하는 순간 <code>IllegalStateException</code>이 난다.</o>
+<o><code>s0.filter(...)</code>를 호출하는 순간 예외가 난다.</o>
+<why>새 단계를 만드는 <code>AbstractPipeline</code> 생성자는 앞 단계의 <code>linkedOrConsumed</code>를 검사하고 설정한다. <code>filter</code>가 붙으면서 <code>s0</code>은 이미 연결된 상태가 되었으므로, <code>map</code>이 만들려는 두 번째 단계의 생성자가 "stream has already been operated upon or closed" 예외를 던진다. 최종 연산까지 기다리지 않는다. 같은 소스로 두 파이프라인을 만들려면 <code>list.stream()</code>을 두 번 호출해야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>Stream.of(3, 1, 2).peek(n -> System.out.println("before " + n)).sorted().findFirst()</code>에서 "before"는 몇 번 출력되는가?</q>
+<o>3번. sorted는 모든 원소를 받은 뒤에야 정렬해 내보낼 수 있다.</o>
+<o>1번. findFirst는 단락 연산이므로 첫 원소만 꺼낸다.</o>
+<o>2번. 정렬 알고리즘이 최솟값을 찾는 즉시 멈춘다.</o>
+<o>0번. findFirst가 소스의 첫 원소 3을 바로 돌려준다.</o>
+<why>sorted는 장벽이다. 정렬 Sink는 <code>accept</code>에서 원소를 버퍼에 쌓기만 하고, <code>cancellationRequested()</code>에 언제나 <code>false</code>를 답해 위쪽 순회를 멈추지 않는다. 최솟값은 모든 원소를 봐야 알 수 있기 때문이다. 단락은 장벽 뒤에서만 효과가 있어서, <code>end()</code>에서 정렬된 원소를 내보낼 때 첫 원소 1만 내보내고 멈춘다. 결과는 <code>Optional[1]</code>이다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>다음 중 유한한 시간 안에 결과를 내고 끝나는 것은?</q>
+<o><code>Stream.iterate(1, n -> n + 1).sorted().limit(3).toList()</code></o>
+<o><code>Stream.generate(() -> "x").filter(String::isEmpty).findFirst()</code></o>
+<o><code>Stream.iterate(1, n -> n + 1).limit(3).sorted().toList()</code></o>
+<o><code>Stream.iterate(1, n -> n + 1).map(n -> n * 2).toList()</code></o>
+<why>세 번째는 <code>limit(3)</code>이 장벽 앞에서 원소를 세 개로 자르므로 정렬 Sink가 1, 2, 3만 받고 <code>[1, 2, 3]</code>을 낸다. 첫 번째는 장벽(<code>sorted</code>)이 멈춤 요청을 위로 전달하지 않아 무한 소스를 끝없이 모은다. 두 번째는 단락 연산이 있지만 조건을 통과하는 원소가 없어 멈출 기회가 오지 않는다(단락은 필요조건일 뿐 충분조건이 아니다). 네 번째는 단락 연산이 없어 무한 소스를 끝까지 순회하려 한다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>OpenJDK 21에서 <code>TreeSet</code> 스트림에 <code>sorted()</code>를 붙이면 비교가 한 번도 일어나지 않지만, <code>map(x -> x)</code>를 사이에 끼우면 다시 정렬한다. 그 이유로 가장 정확한 것은?</q>
+<o><code>map</code>은 상태 있는 연산이라 정렬 상태를 저장하지 못한다.</o>
+<o>JIT 컴파일러가 항등 람다를 인라인하지 못해서 최적화가 꺼진다.</o>
+<o><code>TreeSet</code>의 <code>Spliterator</code>는 <code>map</code>이 붙으면 늦은 바인딩을 포기한다.</o>
+<o>라이브러리는 람다의 내용을 알 수 없으므로 <code>map</code>은 언제나 SORTED 플래그를 지우고, 정렬 단계는 위쪽에 SORTED가 없으면 실제로 정렬한다.</o>
+<why>최적화는 람다 분석이 아니라 스트림 플래그에 근거한다. <code>TreeSet</code> 소스는 SORTED 특성을 가지므로 <code>sorted()</code>의 <code>opWrapSink</code>는 받은 Sink를 그대로 돌려준다. <code>map</code>은 <code>NOT_SORTED | NOT_DISTINCT</code>로 정렬 정보를 지우는데, 넘어온 함수가 항등인지 순서를 보존하는지 알 방법이 없기 때문이다. <code>map</code>은 상태 없는 연산이고, JIT이나 늦은 바인딩과는 관계가 없다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>스트림 파이프라인(stream pipeline)</dt><dd>소스 하나, 0개 이상의 중간 연산, 최종 연산 하나로 이루어진 계산. OpenJDK에서는 <code>AbstractPipeline</code> 단계 객체들의 연결 리스트로 표현된다.</dd>
+<dt>중간 연산(intermediate operation)</dt><dd>새 스트림을 돌려주는 연산. 언제나 지연되며, 호출 시점에는 단계 객체만 만든다.</dd>
+<dt>최종 연산(terminal operation)</dt><dd>값이나 부수 효과를 만들고 파이프라인을 소비하는 연산. 이 연산이 호출되어야 소스 순회가 시작된다.</dd>
+<dt>지연 연산(lazy evaluation)</dt><dd>결과가 실제로 필요해질 때까지 계산을 미루는 것. 스트림에서는 최종 연산 전까지 원소를 처리하지 않는다.</dd>
+<dt>Spliterator</dt><dd>소스의 원소를 하나씩(<code>tryAdvance</code>) 또는 한꺼번에(<code>forEachRemaining</code>) 꺼내 주고, 병렬 처리를 위해 둘로 나눌 수 있는(<code>trySplit</code>) 반복자. 소스의 성질을 특성 비트로 알려 준다.</dd>
+<dt>늦은 바인딩(late-binding)</dt><dd><code>Spliterator</code>가 생성 시점이 아니라 첫 순회·분할·크기 추정 시점에 소스에 묶이는 성질. 최종 연산 전에 한 소스 변경이 결과에 반영되는 이유다.</dd>
+<dt>Sink</dt><dd>OpenJDK 스트림 구현의 패키지 전용 인터페이스. <code>begin</code>, <code>accept</code>, <code>end</code>, <code>cancellationRequested</code>로 원소를 받아 다음 Sink에 넘기는 수신자 사슬을 이룬다.</dd>
+<dt>단락 연산(short-circuiting operation)</dt><dd>무한 입력에서 유한한 스트림을 만들 수 있는 중간 연산(<code>limit</code>)이나 유한한 시간에 끝날 수 있는 최종 연산(<code>findFirst</code>, <code>anyMatch</code>).</dd>
+<dt>간섭 금지(non-interference)</dt><dd>동시성 컬렉션이 아닌 소스를 파이프라인 실행 중에 수정하지 않아야 한다는 규칙. 순차 스트림에도 적용된다.</dd>
+<dt>타입 프로파일(type profile)</dt><dd>HotSpot이 인터프리터와 C1 프로파일링 코드에서 가상·인터페이스 호출 위치마다 MethodData에 기록하는 실제 수신 객체의 클래스와 횟수. C2가 인라이닝 여부를 정하는 근거이며, 가정이 깨지면 역최적화가 일어난다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/package-summary.html">java.util.stream 패키지 문서 (Java SE 21)</a> — 스트림과 컬렉션의 차이, 파이프라인 구성, 중간 연산의 지연, 상태 있는/없는 연산, 단락, 간섭 금지와 늦은 바인딩 예제</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/Stream.html">Stream (Java SE 21 API)</a> — 재사용 시 IllegalStateException, close와 I/O 소스, toList(자바 16), count와 peek의 API Note</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Spliterator.html">Spliterator (Java SE 21 API)</a> — 늦은 바인딩의 정의, 바인딩 후 fail-fast, tryAdvance와 forEachRemaining</li>
+<li><a href="https://docs.oracle.com/javase/9/docs/api/java/util/stream/Stream.html">Stream (Java SE 9 API)</a> — count()에 파이프라인 생략을 허용하는 API Note가 붙은 버전</li>
+<li><a href="https://docs.oracle.com/javase/8/docs/api/java/util/stream/Stream.html">Stream (Java SE 8 API)</a> — count()에 해당 API Note가 없는 버전(비교용)</li>
+<li><a href="https://github.com/openjdk/jdk21u/blob/master/src/hotspot/share/opto/doCall.cpp">HotSpot opto/doCall.cpp (OpenJDK 21u)</a> — Compile::call_generator의 타입 프로파일 기반 인라이닝(단일·이중 타입, TypeProfileMajorReceiverPercent, uncommon trap, virtual call)</li>
+</x-refs>

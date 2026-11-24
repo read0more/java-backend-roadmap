@@ -1,0 +1,1255 @@
+<x-meta>
+deck: 핵심 기능을 감싼 부가 기능 코드를 한곳으로 모으는 세 가지 방법인 템플릿 메서드, 전략, 템플릿 콜백을 상속·위임·람다가 바이트코드와 JVM에서 실제로 어떻게 동작하는지와 함께 따라간다.
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li>부가 기능 코드가 핵심 기능을 앞뒤와 예외 처리로 감싸는 구조에서 메서드 추출만으로는 중복을 없앨 수 없는 이유를 설명하고, 변하는 부분과 변하지 않는 부분을 나눌 수 있다.</li>
+<li>템플릿 메서드 패턴에서 부모의 <code>this.call()</code>이 invokevirtual과 메서드 선택 규칙을 거쳐 자식 클래스의 코드로 가는 과정을 javap 출력으로 추적하고, 상속에서 오는 제약을 구체적으로 열거할 수 있다.</li>
+<li>익명 내부 클래스와 람다가 각각 무엇으로 컴파일되는지(<code>Outer$1.class</code>, invokedynamic과 숨은 클래스) 구분하고, effectively final 규칙과 <code>this</code>의 의미가 왜 그렇게 정해졌는지 설명할 수 있다.</li>
+<li>전략을 필드로 주입하는 방식과 실행할 때 파라미터로 넘기는 방식의 차이를 스레드 스택과 힙 그림으로 설명하고, 싱글톤 빈에서 어느 쪽이 안전한지 판단할 수 있다.</li>
+<li>템플릿 콜백 패턴으로 로그 추적기를 다시 쓰고, <code>TransactionTemplate</code>과 <code>JdbcTemplate</code>의 소스에서 자원 획득 → 콜백 실행 → 예외 처리·정리라는 같은 뼈대를 찾아낼 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 한 줄짜리 핵심 기능을 열 줄이 감싸고 있다</h3>
+
+<p>01회에서 로그 추적기를 만들어 컨트롤러·서비스·리포지토리의 메서드마다 붙였고, 동시에 들어온 요청들이 추적 깊이 정보를 서로 덮어쓰는 문제를 <code>ThreadLocal</code>로 풀었다. 기능은 이제 원하는 대로 동작한다. 그런데 추적기를 붙인 코드를 다시 열어 보면 다른 종류의 문제가 보인다. 이 회차는 그 문제, 즉 <b>모든 메서드에 똑같이 들어간 부가 코드를 어떻게 한곳으로 모을 것인가</b>를 다룬다.</p>
+
+<p>이 회차의 예제는 도서 대출 흐름이다. 컨트롤러가 대출 요청을 받고, 서비스가 업무 규칙을 처리하고, 리포지토리가 대출 기록을 저장한다. 추적기는 아래의 최소 인터페이스로 본다. 이름과 시그니처는 이 회차의 설명을 위해 정한 것이며, 01회에서 만든 구현과 세부가 다를 수 있다.</p>
+
+<pre><code class="language-java">public interface Tracer {
+    Span begin(String message);          // 시작 로그를 남기고 진행 정보를 돌려준다
+    void end(Span span);                 // 정상 종료 로그(소요 시간 포함)
+    void fail(Span span, Exception e);   // 예외 종료 로그
+}
+
+// 한 구간의 진행 정보: 트랜잭션 번호, 호출 깊이, 메시지, 시작 시각
+public record Span(long txId, int depth, String message, long startNanos) {
+}</code></pre>
+
+<p>이 회차의 예제를 직접 돌려 볼 수 있도록 최소 구현도 하나 붙인다. 깊이와 트랜잭션 번호를 스레드마다 따로 두기 위해 <code>ThreadLocal</code>을 쓰고, 가장 바깥 구간이 끝나면 <code>remove()</code>로 비운다. 스레드 풀에서 <code>remove()</code>를 빠뜨리면 무엇이 새는지는 01회의 주제였다.</p>
+
+<pre><code class="language-java">import java.util.concurrent.atomic.AtomicLong;
+
+public class ConsoleTracer implements Tracer {
+
+    private static final AtomicLong TX_SEQ = new AtomicLong();
+    private final ThreadLocal<long[]> context = new ThreadLocal<>(); // {txId, depth}
+
+    @Override
+    public Span begin(String message) {
+        long[] ctx = context.get();
+        if (ctx == null) {
+            ctx = new long[]{TX_SEQ.incrementAndGet(), -1};
+            context.set(ctx);
+        }
+        ctx[1]++;
+        Span span = new Span(ctx[0], (int) ctx[1], message, System.nanoTime());
+        System.out.println("[tx=" + span.txId() + "] " + "  ".repeat(span.depth()) + "→ " + message);
+        return span;
+    }
+
+    @Override
+    public void end(Span span) {
+        long ms = (System.nanoTime() - span.startNanos()) / 1_000_000;
+        System.out.println("[tx=" + span.txId() + "] " + "  ".repeat(span.depth())
+                + "← " + span.message() + " (" + ms + "ms)");
+        release(span);
+    }
+
+    @Override
+    public void fail(Span span, Exception e) {
+        System.out.println("[tx=" + span.txId() + "] " + "  ".repeat(span.depth())
+                + "x " + span.message() + " " + e);
+        release(span);
+    }
+
+    private void release(Span span) {
+        if (span.depth() == 0) {
+            context.remove();          // 가장 바깥 구간이 끝나면 스레드에서 지운다
+        } else {
+            context.get()[1]--;
+        }
+    }
+}</code></pre>
+
+<p>이 추적기를 서비스 메서드 하나에 붙이면 다음과 같이 된다.</p>
+
+<pre><code class="language-java">public class LoanServiceV0 {
+
+    private final LoanRepositoryV0 loanRepository;
+    private final Tracer tracer;
+
+    public LoanServiceV0(LoanRepositoryV0 loanRepository, Tracer tracer) {
+        this.loanRepository = loanRepository;
+        this.tracer = tracer;
+    }
+
+    public void borrow(String bookId) {
+        Span span = tracer.begin("LoanServiceV0.borrow()");
+        try {
+            loanRepository.save(bookId);      // 핵심 기능은 이 한 줄
+            tracer.end(span);
+        } catch (Exception e) {
+            tracer.fail(span, e);
+            throw e;                          // 예외를 먹지 않고 다시 던진다
+        }
+    }
+}</code></pre>
+
+<p>메서드 본문은 아홉 줄인데 대출이라는 업무와 관련된 줄은 하나뿐이다. 나머지 여덟 줄은 추적을 위한 것이다. 이렇게 그 메서드가 존재하는 이유가 되는 코드를 <b>핵심 기능(core concern)</b>, 핵심 기능을 보조하기 위해 덧붙인 코드를 <b>부가 기능</b>이라고 부르자. 부가 기능은 컨트롤러에도, 리포지토리에도, 다른 서비스의 모든 메서드에도 같은 모양으로 들어간다. 이렇게 여러 모듈을 가로질러 반복되는 관심사를 횡단 관심사(cross-cutting concern)라고 하며, 이 권의 후반부(07회 이후)에서 다룰 AOP가 정면으로 다루는 대상이다. 이 회차는 그보다 한참 앞 단계, 순수한 자바 객체 설계만으로 어디까지 정리할 수 있는지를 본다.</p>
+
+<p>예를 들어 추적 대상 메서드가 백 개라면 위의 여덟 줄이 백 벌 생긴다. 로그에 사용자 번호를 넣기로 하면, 또는 실패 로그를 남긴 뒤 예외를 감싸서 던지기로 하면 백 군데를 모두 고쳐야 한다. 한 군데라도 빠뜨리면 그 메서드만 다르게 동작한다. 단일 책임 원칙(Single Responsibility Principle)을 "클래스가 변경되는 이유는 하나여야 한다"로 읽으면, 지금의 <code>borrow()</code>는 대출 규칙이 바뀔 때도, 로그 형식이 바뀔 때도 고쳐야 하므로 변경 이유가 둘이다.</p>
+
+<h4>메서드 추출로는 왜 안 되는가</h4>
+
+<p>코드가 중복되면 가장 먼저 떠오르는 처방은 메서드 추출(extract method)이다. 반복되는 문장들을 메서드 하나로 옮기고, 원래 자리에서는 그 메서드를 호출한다. 그런데 메서드 추출은 반복되는 부분이 <b>연속된 문장 덩어리</b>일 때 통한다. 위 코드에서 반복되는 부분은 하나의 덩어리가 아니다. 핵심 기능의 앞(<code>begin</code>), 뒤(<code>end</code>), 그리고 예외 경로(<code>fail</code>과 재던지기)로 세 조각 나 있고, 그 조각들을 <code>try</code>/<code>catch</code>라는 구조가 묶고 있다. 변하는 부분이 변하지 않는 부분의 한가운데에 끼어 있는 것이다.</p>
+
+<pre class="diagram">  변하지 않는 부분          Span span = tracer.begin(...);
+                             try {
+  변하는 부분  ───────────▶      loanRepository.save(bookId);
+                                 tracer.end(span);
+  변하지 않는 부분           } catch (Exception e) {
+                                 tracer.fail(span, e);
+                                 throw e;
+                             }</pre>
+
+<p><code>begin</code> 호출과 <code>end</code> 호출을 각각 작은 메서드로 뺄 수는 있다. 하지만 "앞에서 시작하고, 가운데를 실행하고, 성공하면 종료를 남기고, 실패하면 실패를 남긴 뒤 다시 던진다"는 <b>모양 자체</b>는 여전히 메서드마다 남는다. 이 모양을 한곳에 두려면 그 모양을 가진 메서드 하나가 "가운데에 들어갈 코드"를 인자로 받아야 한다. 자바의 메서드는 값을 인자로 받지 문장을 받지 않는다. 그래서 코드를 넘기려면 코드를 <b>객체의 메서드</b>로 포장해야 하고, 방법은 크게 두 가지다.</p>
+
+<ul>
+<li><b>상속</b>: 뼈대를 가진 부모 클래스가 구멍을 추상 메서드로 남기고, 자식 클래스가 그 구멍을 채운다. 템플릿 메서드 패턴이다.</li>
+<li><b>위임</b>: 뼈대를 가진 객체가 구멍에 들어갈 코드를 다른 객체로 받아서 호출한다. 그 객체를 필드로 받아 두면 전략 패턴, 실행할 때마다 인자로 받으면 템플릿 콜백 패턴이다.</li>
+</ul>
+
+<p>자바 8의 람다는 두 번째 방법을 짧게 쓰는 문법이다. 다만 겉모양만 짧아진 것이 아니라 컴파일 결과와 실행 시점의 동작도 익명 클래스와 다르다. 이 회차는 세 패턴을 차례로 만들면서 각 단계에서 JVM이 실제로 무엇을 하는지 한 층씩 내려가 본다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>변하는 것과 변하지 않는 것을 분리한다. 변하지 않는 뼈대(시작, try/catch, 종료와 실패 처리)는 한곳에 두고, 변하는 핵심 기능은 각자의 자리에 둔다. 변하는 부분이 뼈대의 한가운데에 끼어 있기 때문에, 그 부분을 "끼워 넣을 수 있는 코드 조각", 즉 객체로 만드는 것이 이 회차 세 패턴의 공통 과제다.</p></aside>
+
+<h3>템플릿 메서드 패턴: 부모가 뼈대를, 자식이 구멍을 맡는다</h3>
+
+<p>로그 추적기에 바로 적용하기 전에 더 작은 예로 구조를 보자. 두 작업이 있고, 둘 다 실행 시간을 재서 출력해야 한다.</p>
+
+<pre><code class="language-java">public class TimingBefore {
+
+    public static void main(String[] args) {
+        sendMail();
+        chargeFee();
+    }
+
+    static void sendMail() {
+        long start = System.nanoTime();
+        System.out.println("메일 발송");                 // 핵심 기능
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+        System.out.println("sendMail 소요 시간=" + elapsedMs + "ms");
+    }
+
+    static void chargeFee() {
+        long start = System.nanoTime();
+        System.out.println("요금 청구");                 // 핵심 기능
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+        System.out.println("chargeFee 소요 시간=" + elapsedMs + "ms");
+    }
+}</code></pre>
+
+<p>두 메서드는 가운데 한 줄만 다르다. 시간을 재는 앞뒤는 변하지 않는 부분이고, 가운데는 변하는 부분이다. 템플릿 메서드 패턴(Template Method pattern)은 변하지 않는 부분을 부모 클래스의 메서드 하나에 모으고, 변하는 부분을 추상 메서드로 비워 둔다. 이 뼈대를 가진 메서드를 템플릿 메서드라고 부른다.</p>
+
+<pre><code class="language-java">public abstract class TimedTemplate {
+
+    public final void execute() {
+        long start = System.nanoTime();
+        call();                                        // 변하는 부분
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+        System.out.println(getClass().getName() + " 소요 시간=" + elapsedMs + "ms");
+    }
+
+    protected abstract void call();
+}
+
+public class SendMailTask extends TimedTemplate {
+    @Override
+    protected void call() {
+        System.out.println("메일 발송");
+    }
+}
+
+public class ChargeFeeTask extends TimedTemplate {
+    @Override
+    protected void call() {
+        System.out.println("요금 청구");
+    }
+}</code></pre>
+
+<pre><code class="language-java">TimedTemplate t1 = new SendMailTask();
+t1.execute();
+TimedTemplate t2 = new ChargeFeeTask();
+t2.execute();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">메일 발송
+SendMailTask 소요 시간=0ms
+요금 청구
+ChargeFeeTask 소요 시간=0ms</code></pre>
+
+<p>소요 시간은 실행마다 다를 수 있다(작업이 너무 짧아 대개 0ms로 나온다). 출력에서 확인할 것은 두 가지다. 첫째, 시간을 재는 코드는 <code>TimedTemplate</code> 한 곳에만 있는데 두 작업 모두 측정된다. 둘째, 같은 <code>execute()</code> 코드 안의 <code>getClass().getName()</code>이 객체마다 다른 이름을 돌려준다. <code>getClass()</code>는 변수의 선언 타입이 아니라 <b>객체가 실제로 만들어진 클래스</b>를 돌려주기 때문이다.</p>
+
+<figure class="flow-figure"><figcaption>t1.execute() 한 번의 실행 흐름</figcaption><ol class="flow">
+<li><strong>객체 생성</strong><span><code>new SendMailTask()</code>가 힙에 객체를 만든다. 생성자 연쇄에 따라 <code>TimedTemplate</code>의 생성자와 <code>Object</code>의 생성자가 먼저 실행된다.</span></li>
+<li><strong>템플릿 메서드 호출</strong><span>변수 <code>t1</code>의 타입은 <code>TimedTemplate</code>이고 <code>execute()</code>는 <code>TimedTemplate</code>에 정의된 <code>final</code> 메서드다. 그 코드가 실행된다.</span></li>
+<li><strong>앞부분</strong><span>시작 시각을 지역 변수 <code>start</code>에 기록한다. 이 변수는 <code>execute()</code>의 스택 프레임에 있다.</span></li>
+<li><strong>구멍 호출</strong><span><code>call()</code>은 <code>this.call()</code>이다. <code>this</code>가 가리키는 객체의 실제 클래스가 <code>SendMailTask</code>이므로 <code>SendMailTask.call()</code>이 실행되어 "메일 발송"을 출력한다.</span></li>
+<li><strong>뒷부분</strong><span>제어가 <code>execute()</code>로 돌아와 경과 시간을 계산하고, 실제 클래스 이름과 함께 출력한다.</span></li>
+</ol></figure>
+
+<p>템플릿 메서드에 붙인 <code>final</code>은 장식이 아니다. 자식 클래스가 뼈대 자체를 재정의해 버리면 "변하지 않는 부분을 한곳에 둔다"는 목적이 깨진다. JLS §8.4.3.3에 따라 <code>final</code> 메서드는 재정의할 수 없으므로, 자식이 <code>execute()</code>를 재정의하려 하면 컴파일러가 막는다.</p>
+
+<pre data-label="컴파일 오류 (JDK 21 javac)"><code class="language-text">Ovr.java:2: error: execute() in Ovr cannot override execute() in TimedTemplate
+    @Override public void execute() {}
+                          ^
+  overridden method is final</code></pre>
+
+<p>구멍인 <code>call()</code>은 <code>protected</code>로 두었다. 바깥 코드가 뼈대를 건너뛰고 <code>call()</code>을 직접 부르는 일을 줄이려는 의도다. 다만 자바의 <code>protected</code>는 하위 클래스뿐 아니라 <b>같은 패키지</b>의 모든 코드에도 열려 있으므로(JLS §6.6.1), 완전한 차단은 아니라는 점을 기억해 두자.</p>
+
+<pre class="diagram">                 TimedTemplate  (abstract)
+                 ├─ execute()  public final   ← 변하지 않는 뼈대: 시간 측정과 출력
+                 └─ call()     protected abstract ← 비워 둔 구멍
+                          ▲
+                          │ extends
+              ┌───────────┴───────────┐
+        SendMailTask             ChargeFeeTask
+        call(): "메일 발송"       call(): "요금 청구"
+
+  호출 방향:  클라이언트 ──▶ execute() (부모 코드) ──▶ call() (자식 코드)</pre>
+
+<x-visual id="spring-core-adv-02-template-method-flow" title="템플릿 메서드 패턴의 구조와 호출 방향" kind="클래스 다이어그램과 시퀀스" ratio="16:9">
+<x-hint>부모 클래스가 뼈대 메서드를 갖고 자식 클래스가 구멍만 채우며, 실행 중에는 부모의 코드가 자식의 코드를 부른다는 방향을 한눈에 보여 준다.</x-hint>
+<x-prompt>왼쪽 절반은 UML 스타일 클래스 다이어그램. 맨 위에 상자 "TimedTemplate (추상)"이 있고 안에 두 줄 "execute() final"과 "call() abstract"가 있다. "call() abstract" 줄은 점선 테두리의 빈 칸처럼 표현한다. 아래에 상자 두 개 "SendMailTask"와 "ChargeFeeTask"가 있고 각각 속이 빈 삼각형 화살표로 부모를 가리킨다(상속). 각 자식 상자에는 "call(): 메일 발송", "call(): 요금 청구"라고 적는다. 오른쪽 절반은 세로 시퀀스 다이어그램. 생명선 세 개 "클라이언트", "execute() (부모 코드)", "call() (자식 코드)". 화살표 1: 클라이언트에서 execute로 "execute()". 화살표 2: execute 자기 자신에게 "시작 시각 기록". 화살표 3: execute에서 call로 "this.call()". 화살표 4: call에서 execute로 점선 반환. 화살표 5: execute 자기 자신에게 "소요 시간 출력". 오른쪽 위에 작은 말풍선 "부모가 자식을 부른다". 깔끔한 평면 스타일, 흰 배경, 파란색과 회색 계열.</x-prompt>
+<x-caption>뼈대(execute)는 부모에, 구멍(call)은 자식에 있다. 실행 중에는 부모의 코드가 자식의 코드를 호출한다.</x-caption>
+</x-visual>
+
+<h3>한 층 아래: this.call()은 어떻게 자식의 코드에 도착하는가</h3>
+
+<p><code>TimedTemplate</code>을 컴파일할 때 javac는 <code>SendMailTask</code>가 존재한다는 사실조차 모른다. 그런데도 <code>execute()</code> 안의 <code>call()</code>은 실행 중에 <code>SendMailTask.call()</code>로 간다. 이 연결이 언제, 무엇을 기준으로 정해지는지 바이트코드에서 확인해 보자. <code>javap -c -p TimedTemplate</code>의 출력에서 <code>execute()</code> 부분이다(JDK 21 javac).</p>
+
+<pre data-label="javap -c -p TimedTemplate (일부)"><code class="language-text">  public final void execute();
+    Code:
+       0: invokestatic  #7                  // Method java/lang/System.nanoTime:()J
+       3: lstore_1
+       4: aload_0
+       5: invokevirtual #13                 // Method call:()V
+       8: invokestatic  #7                  // Method java/lang/System.nanoTime:()J
+      11: lload_1
+      12: lsub
+      13: ldc2_w        #18                 // long 1000000l
+      16: ldiv
+      17: lstore_3
+      18: getstatic     #20                 // Field java/lang/System.out:Ljava/io/PrintStream;
+      21: aload_0
+      22: invokevirtual #24                 // Method java/lang/Object.getClass:()Ljava/lang/Class;
+      ...
+
+  protected abstract void call();</code></pre>
+
+<p>한 줄씩 읽어 보자. 인스턴스 메서드의 지역 변수 0번 칸에는 항상 <code>this</code>가 들어 있다. <code>lstore_1</code>은 <code>nanoTime()</code>의 결과(long)를 1번 칸(<code>start</code>)에 저장한다. long은 두 칸을 차지하므로 다음 지역 변수 <code>elapsedMs</code>는 3번 칸(<code>lstore_3</code>)에 들어간다. 핵심은 4~5번 오프셋이다. <code>aload_0</code>이 <code>this</code>를 피연산자 스택에 올리고, <code>invokevirtual #13</code>이 상수 풀 13번이 가리키는 메서드 <code>TimedTemplate.call:()V</code>를 호출한다. 바이트코드에 적힌 것은 "<code>TimedTemplate</code>의 <code>call</code>"이라는 <b>기호 참조(symbolic reference)</b>뿐이고, 그 메서드는 추상 메서드라 본문이 없다.</p>
+
+<p>JVM 명세는 invokevirtual의 동작을 두 단계로 나눈다. 먼저 <b>해석(resolution)</b>: 기호 참조 <code>TimedTemplate.call:()V</code>를 실제 메서드 선언에 연결한다. 이 결과는 호출 지점마다 한 번 정해진다. 다음은 <b>선택(selection)</b>으로, 호출이 일어날 때마다 수행된다. JVMS §5.4.6은 invokevirtual과 invokeinterface에서 실행할 메서드를 "스택 위 객체의 실행 시점 타입"과 "해석된 메서드"를 기준으로 고른다고 정한다. 규칙은 이렇다. 객체의 실제 클래스 C가 해석된 메서드를 재정의할 수 있는 선언을 갖고 있으면 그것을 고르고, 없으면 C의 직접 상위 클래스, 그 상위 클래스… 순으로 올라가며 찾는다.</p>
+
+<p>이 규칙을 예제에 대입하면, <code>t1.execute()</code>에서 <code>this</code>는 <code>SendMailTask</code> 객체이므로 C는 <code>SendMailTask</code>다. <code>SendMailTask</code>가 <code>call()</code>을 선언하고 있으므로 선택은 거기서 끝난다. 같은 바이트코드가 <code>t2.execute()</code>에서는 <code>ChargeFeeTask.call()</code>을 고른다. <b>코드는 하나인데 실행되는 메서드는 수신 객체마다 다르다.</b> 이것이 가상 메서드 호출(virtual method invocation)이고, 템플릿 메서드 패턴은 이 메커니즘 위에 서 있다. 부모의 코드가 자식의 코드를 "알지 못한 채로" 부를 수 있는 이유는 결정을 컴파일 시점이 아니라 실행 시점, 그것도 객체가 가진 클래스 정보로 미루기 때문이다.</p>
+
+<p>명세는 무엇을 골라야 하는지만 정하고 어떻게 빨리 고를지는 구현에 맡긴다. HotSpot은 매 호출마다 상위 클래스를 거슬러 올라가며 이름을 비교하지 않는다. 클래스를 로드하고 링크하는 과정에서 클래스마다 가상 메서드 테이블(vtable)을 만들어 두는데, 자식 클래스의 테이블은 부모 테이블의 칸 배열을 그대로 물려받고, 재정의한 메서드는 같은 칸 번호의 내용을 자기 메서드로 바꾸고, 새로 추가한 가상 메서드는 뒤에 칸을 덧붙인다. 그러면 <code>call()</code>은 <code>TimedTemplate</code>을 상속한 모든 클래스에서 같은 칸 번호를 갖게 되고, 호출은 "객체 헤더의 클래스 포인터 → 그 클래스의 vtable → 정해진 칸"이라는 몇 번의 메모리 읽기로 끝난다.</p>
+
+<pre class="diagram">  힙                                   메타스페이스 (HotSpot의 클래스 메타데이터)
+
+  SendMailTask 객체                    SendMailTask 클래스 정보
+  ┌──────────────────┐                 ┌───────────────────────────────┐
+  │ 마크 워드         │                 │ ...                           │
+  │ 클래스 포인터 ────┼──────────────▶  │ vtable                        │
+  │ (필드 없음)       │                 │  [0..] Object의 가상 메서드들 │
+  └──────────────────┘                 │  [k]   call → SendMailTask.call│ ← 부모의 같은 칸을 덮어씀
+                                       └───────────────────────────────┘
+  ChargeFeeTask 객체                   ChargeFeeTask 클래스 정보
+  ┌──────────────────┐                 ┌───────────────────────────────┐
+  │ 클래스 포인터 ────┼──────────────▶  │  [k]   call → ChargeFeeTask.call│
+  └──────────────────┘                 └───────────────────────────────┘
+
+  execute() 안의 invokevirtual call:()V
+    = "this의 클래스 포인터를 따라가 vtable의 k번 칸에 있는 메서드를 실행"</pre>
+
+<p>위 그림의 객체 헤더(마크 워드와 클래스 포인터)와 vtable은 HotSpot의 구현이지 JVMS가 정한 구조가 아니다. 명세가 보장하는 것은 §5.4.6의 선택 결과뿐이다. 한편 <code>execute()</code>는 <code>final</code>이므로 어떤 하위 클래스에서도 선택 결과가 바뀌지 않는다. 그래서 실행 엔진은 이 호출을 수신 객체의 타입과 상관없이 하나의 메서드로 고정해도 된다. 또 HotSpot의 JIT 컴파일러는 실행 중에 호출 지점마다 실제로 들어온 수신 타입을 기록하는데, 한 지점에서 한두 가지 타입만 관찰되면 타입 검사를 앞에 두고 그 메서드 본문을 호출 지점에 인라인할 수 있다. 템플릿 메서드의 구멍 호출이 "가상 호출이라 느리다"고 단정할 수 없는 이유다.</p>
+
+<x-visual id="spring-core-adv-02-vtable-dispatch" title="invokevirtual이 vtable을 거쳐 자식 메서드를 고르는 과정" kind="메모리 구조도" ratio="16:9">
+<x-hint>같은 바이트코드 한 줄이 객체의 클래스 포인터와 vtable 칸을 따라가 객체마다 다른 메서드에 도착한다는 것을 보여 준다.</x-hint>
+<x-prompt>왼쪽에 세로로 긴 상자 "execute() 바이트코드"가 있고 그 안에 한 줄 "invokevirtual call:()V"가 강조되어 있다. 가운데에 힙 영역을 나타내는 둥근 사각형 "힙"이 있고 그 안에 작은 객체 상자 두 개 "SendMailTask 객체", "ChargeFeeTask 객체"가 있다. 각 객체 상자에는 "클래스 포인터" 칸이 있다. 오른쪽에 영역 "메타스페이스"가 있고 그 안에 표 두 개 "SendMailTask vtable", "ChargeFeeTask vtable"이 있다. 각 표의 같은 높이의 칸이 "k번 칸"으로 강조되어 있고, 첫 표의 k번 칸에는 "SendMailTask.call", 두 번째 표의 k번 칸에는 "ChargeFeeTask.call"이 적혀 있다. 화살표: 바이트코드 줄에서 "this"라는 라벨로 각 객체로 점선, 각 객체의 클래스 포인터에서 해당 vtable로 실선, vtable의 k번 칸에서 오른쪽 끝의 메서드 코드 상자로 실선. 아래쪽에 작은 주석 "HotSpot 구현 기준". 평면 스타일, 흰 배경.</x-prompt>
+<x-caption>바이트코드에는 TimedTemplate.call이라는 기호 참조만 있다. 실제로 실행할 메서드는 호출할 때마다 객체의 클래스에서 고른다.</x-caption>
+</x-visual>
+
+<h3>익명 내부 클래스: 자식 클래스를 쓰는 자리에서 만든다</h3>
+
+<p>템플릿 메서드 패턴에는 불편한 점이 하나 있다. 구멍을 채우는 방법이 하나 늘 때마다 클래스 파일이 하나 는다. <code>SendMailTask</code>, <code>ChargeFeeTask</code>처럼 한 번만 쓰고 말 클래스를 위해 이름을 짓고 파일을 만드는 것은 번거롭다. 익명 내부 클래스(anonymous inner class)를 쓰면 클래스 선언과 객체 생성을 쓰는 자리에서 한 번에 할 수 있다.</p>
+
+<pre><code class="language-java">public class TemplateMain {
+
+    private final String owner = String.valueOf("batch");
+
+    public static void main(String[] args) {
+        String target = "user-42";
+        TimedTemplate t = new TimedTemplate() {
+            @Override
+            protected void call() {
+                System.out.println("요금 청구: " + target);   // 지역 변수를 쓴다
+            }
+        };
+        t.execute();
+        System.out.println("getName=" + t.getClass().getName()
+                + ", getSimpleName=[" + t.getClass().getSimpleName() + "]"
+                + ", isAnonymous=" + t.getClass().isAnonymousClass());
+        new TemplateMain().run();
+    }
+
+    void run() {
+        TimedTemplate a = new TimedTemplate() {
+            @Override
+            protected void call() {
+                System.out.println("정산: " + owner);          // 바깥 객체의 필드를 쓴다
+            }
+        };
+        a.execute();
+        TimedTemplate b = new TimedTemplate() {
+            @Override
+            protected void call() {
+                System.out.println("고정 작업");               // 바깥의 아무것도 쓰지 않는다
+            }
+        };
+        b.execute();
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (소요 시간은 실행마다 다를 수 있다)"><code class="language-text">요금 청구: user-42
+TemplateMain$1 소요 시간=0ms
+getName=TemplateMain$1, getSimpleName=[], isAnonymous=true
+정산: batch
+TemplateMain$2 소요 시간=0ms
+고정 작업
+TemplateMain$3 소요 시간=0ms</code></pre>
+
+<p>익명 클래스는 소스에 이름이 없을 뿐, 컴파일하면 보통의 클래스 파일이 된다. 위 소스를 컴파일하면 <code>TemplateMain.class</code> 외에 <code>TemplateMain$1.class</code>, <code>TemplateMain$2.class</code>, <code>TemplateMain$3.class</code>가 생긴다. JLS §13.1은 익명 클래스의 바이너리 이름을 "바로 바깥 클래스의 바이너리 이름 + <code>$</code> + 비어 있지 않은 숫자열"로 정한다. 그래서 <code>getName()</code>은 <code>TemplateMain$1</code>을 돌려주고, 소스상의 이름이 없으므로 <code>getSimpleName()</code>은 빈 문자열을 돌려준다. 로그나 예외 스택 트레이스에 <code>$1</code>, <code>$2</code>가 찍혀 있으면 그것은 익명 클래스다. javac는 소스에 나타나는 순서대로 번호를 붙이므로(위 실행 결과가 그렇다), 앞쪽에 익명 클래스를 하나 추가하면 뒤의 번호가 모두 밀린다는 점도 알아 두자.</p>
+
+<h4>익명 클래스는 바깥의 무엇을, 어떻게 가지고 가는가</h4>
+
+<p>익명 클래스의 <code>call()</code>은 <code>main</code>의 지역 변수 <code>target</code>을 쓴다. 그런데 <code>call()</code>은 <code>main</code>과 다른 메서드이고, 실행될 때 자기만의 스택 프레임을 갖는다. 다른 메서드의 지역 변수를 어떻게 읽는 것일까? <code>javap -c -p</code>로 세 클래스를 열어 보면 답이 나온다(JDK 21 javac).</p>
+
+<pre data-label="javap -c -p 'TemplateMain$1' (일부)"><code class="language-text">class TemplateMain$1 extends TimedTemplate {
+  final java.lang.String val$target;
+
+  TemplateMain$1(java.lang.String);
+    Code:
+       0: aload_0
+       1: aload_1
+       2: putfield      #1                  // Field val$target:Ljava/lang/String;
+       5: aload_0
+       6: invokespecial #7                  // Method TimedTemplate."<init>":()V
+       9: return
+
+  protected void call();
+    Code:
+       0: getstatic     #13                 // Field java/lang/System.out:Ljava/io/PrintStream;
+       3: aload_0
+       4: getfield      #1                  // Field val$target:Ljava/lang/String;
+       ...</code></pre>
+
+<pre data-label="javap -p 'TemplateMain$2', 'TemplateMain$3'"><code class="language-text">class TemplateMain$2 extends TimedTemplate {
+  final TemplateMain this$0;
+  TemplateMain$2(TemplateMain);
+  protected void call();
+}
+class TemplateMain$3 extends TimedTemplate {
+  TemplateMain$3(TemplateMain);
+  protected void call();
+}</code></pre>
+
+<p>javac는 익명 클래스에 <code>val$target</code>이라는 <code>final</code> 필드를 만들고, 생성자 인자로 <code>target</code>의 <b>값</b>을 받아 그 필드에 복사한다. <code>call()</code>이 읽는 것은 <code>main</code>의 지역 변수가 아니라 자기 객체의 필드다. 이것을 변수 포획(capture)이라고 한다. 생성자 바이트코드를 보면 <code>putfield</code>로 포획한 값을 저장한 <b>다음에</b> 부모 생성자(<code>TimedTemplate."<init>"</code>)를 부른다. 부모 생성자가 혹시 재정의된 메서드를 부르더라도 포획한 값이 이미 채워져 있도록 순서를 잡은 것이다.</p>
+
+<p><code>TemplateMain$2</code>는 바깥 객체의 필드 <code>owner</code>를 쓰므로 바깥 객체 참조를 <code>this$0</code> 필드에 저장하고, <code>owner</code>는 <code>this$0.owner</code>로 읽는다. <code>TemplateMain$3</code>은 바깥의 아무것도 쓰지 않는데, JDK 21 javac로 컴파일하면 생성자 인자로 바깥 객체를 받기는 하지만 필드에는 저장하지 않는다. 예전 javac는 쓰지 않아도 <code>this$0</code> 필드를 만들었고, JDK 18에 들어간 변경(JDK-8271623, "Omit enclosing instance fields from inner classes that don't use it")으로 바뀐 동작이다. 이것은 명세가 아니라 컴파일러 구현의 선택이므로 기대고 설계하지는 말자. 바깥 객체를 쓰는 익명 객체를 캐시나 다른 스레드에 넘기면, 익명 객체가 살아 있는 동안 바깥 객체도 가비지 컬렉션 대상이 되지 않는다는 사실이 더 중요하다.</p>
+
+<p>예제의 <code>owner</code> 필드를 <code>"batch"</code>가 아니라 <code>String.valueOf("batch")</code>로 초기화한 데에도 이유가 있다. <code>private final String owner = "batch";</code>처럼 상수 식으로 초기화한 <code>final</code> 필드는 JLS §4.12.4의 상수 변수(constant variable)가 되어, 읽는 자리마다 값이 직접 박혀 컴파일된다. 그러면 익명 클래스가 바깥 객체를 참조할 필요가 없어져 <code>this$0</code>도 생기지 않는다. 바이트코드를 관찰할 때는 이런 컴파일 시점 최적화가 결과를 바꾸지 않는지 확인해야 한다.</p>
+
+<h4>effectively final 규칙은 복사에서 나온다</h4>
+
+<p>포획이 "복사"라는 사실에서 규칙 하나가 자연스럽게 나온다. 익명 객체를 만든 뒤에 원래 지역 변수를 바꾸면, 지역 변수와 익명 객체의 필드가 서로 다른 값을 갖게 된다. 프로그래머는 같은 변수라고 생각하는데 실제로는 두 벌이 된다. 그래서 자바는 내부 클래스나 람다가 쓰는 바깥 지역 변수가 <code>final</code>이거나, 선언 뒤에 다시 대입되지 않는 사실상 final(effectively final, JLS §4.12.4)이기를 요구한다.</p>
+
+<pre><code class="language-java">int count = 0;
+Runnable r = new Runnable() {
+    public void run() { System.out.println(count); }
+};
+count++;     // 이 줄 때문에 count는 effectively final이 아니다</code></pre>
+
+<pre data-label="컴파일 오류 (JDK 21 javac)"><code class="language-text">E3.java:5: error: local variables referenced from an inner class must be final or effectively final
+            public void run() { System.out.println(count); }
+                                                   ^</code></pre>
+
+<p>왜 복사할 수밖에 없는가도 짚어 두자. 지역 변수는 그 메서드의 스택 프레임에 있고, 메서드가 끝나면 프레임과 함께 사라진다. 반면 익명 객체는 힙에 있고, 필드에 저장되거나 다른 스레드에 넘겨져서 만든 메서드보다 오래 살 수 있다. JVM에는 다른 메서드의 프레임 안 지역 변수를 가리키는 참조라는 것이 없다. 따라서 객체가 그 값을 계속 쓰려면 복사해 갖고 있어야 한다. JLS §15.27.2는 람다에 대해 같은 제한을 설명하면서, 계속 바뀌는 지역 변수를 포획하면 동시성 문제를 일으킬 가능성이 높기 때문이라고 이유를 밝힌다. 지역 변수는 원래 한 스레드의 스택에만 있어 안전한데, 포획을 통해 여러 스레드가 공유하는 힙 객체로 새어 나가기 때문이다.</p>
+
+<h3>로그 추적기에 템플릿 메서드 적용하기</h3>
+
+<p>이제 로그 추적기에 적용한다. 변하지 않는 부분은 "<code>begin</code> → 핵심 기능 → 성공이면 <code>end</code>, 실패면 <code>fail</code> 후 재던지기"이고, 변하는 부분은 핵심 기능과 그 반환값이다. 메서드마다 반환 타입이 다르므로 제네릭 타입 매개변수 <code>T</code>로 받는다.</p>
+
+<pre><code class="language-java">public abstract class TraceTemplateBase<T> {
+
+    private final Tracer tracer;
+
+    protected TraceTemplateBase(Tracer tracer) {
+        this.tracer = tracer;
+    }
+
+    public final T execute(String message) {
+        Span span = tracer.begin(message);
+        try {
+            T result = call();            // 변하는 부분: 핵심 기능
+            tracer.end(span);
+            return result;
+        } catch (Exception e) {
+            tracer.fail(span, e);
+            throw e;
+        }
+    }
+
+    protected abstract T call();
+}</code></pre>
+
+<p>세 계층에 적용한 코드다. 반환값이 없는 메서드는 타입 인자로 <code>Void</code>를 주고 <code>return null;</code>로 끝낸다. <code>void</code>는 타입이 아니라서 타입 인자로 쓸 수 없고, <code>java.lang.Void</code>는 인스턴스를 만들 수 없는 클래스라서 그 타입의 값으로는 <code>null</code>만 가능하기 때문이다.</p>
+
+<pre><code class="language-java">public class LoanRepositoryV1 {
+
+    private final Tracer tracer;
+
+    public LoanRepositoryV1(Tracer tracer) {
+        this.tracer = tracer;
+    }
+
+    public void save(String bookId) {
+        new TraceTemplateBase<Void>(tracer) {
+            @Override
+            protected Void call() {
+                if (bookId.equals("lost")) {
+                    throw new IllegalStateException("분실된 도서");
+                }
+                sleep(10);                     // 저장에 시간이 걸린다고 가정
+                return null;
+            }
+        }.execute("LoanRepositoryV1.save()");
+    }
+
+    static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+
+public class LoanServiceV1 {
+
+    private final LoanRepositoryV1 loanRepository;
+    private final Tracer tracer;
+
+    public LoanServiceV1(LoanRepositoryV1 loanRepository, Tracer tracer) {
+        this.loanRepository = loanRepository;
+        this.tracer = tracer;
+    }
+
+    public void borrow(String bookId) {
+        new TraceTemplateBase<Void>(tracer) {
+            @Override
+            protected Void call() {
+                loanRepository.save(bookId);
+                return null;
+            }
+        }.execute("LoanServiceV1.borrow()");
+    }
+}
+
+public class LoanControllerV1 {
+
+    private final LoanServiceV1 loanService;
+    private final Tracer tracer;
+
+    public LoanControllerV1(LoanServiceV1 loanService, Tracer tracer) {
+        this.loanService = loanService;
+        this.tracer = tracer;
+    }
+
+    public String borrow(String bookId) {
+        TraceTemplateBase<String> template = new TraceTemplateBase<>(tracer) {
+            @Override
+            protected String call() {
+                loanService.borrow(bookId);
+                return "ok";
+            }
+        };
+        return template.execute("LoanControllerV1.borrow()");
+    }
+}</code></pre>
+
+<p>스프링 애플리케이션이라면 세 클래스는 각각 <code>@RestController</code>, <code>@Service</code>, <code>@Repository</code>가 붙은 빈이고 생성자 주입으로 연결될 것이다. 여기서는 스프링 없이 돌려 볼 수 있도록 직접 조립한다.</p>
+
+<pre><code class="language-java">Tracer tracer = new ConsoleTracer();
+LoanControllerV1 controller = new LoanControllerV1(
+        new LoanServiceV1(new LoanRepositoryV1(tracer), tracer), tracer);
+
+System.out.println(controller.borrow("b-100"));
+try {
+    controller.borrow("lost");
+} catch (IllegalStateException e) {
+    System.out.println("호출자가 받은 예외: " + e.getMessage());
+}</code></pre>
+
+<pre data-label="실행 결과 (괄호 안의 시간은 실행마다 다르다)"><code class="language-text">[tx=1] → LoanControllerV1.borrow()
+[tx=1]   → LoanServiceV1.borrow()
+[tx=1]     → LoanRepositoryV1.save()
+[tx=1]     ← LoanRepositoryV1.save() (15ms)
+[tx=1]   ← LoanServiceV1.borrow() (20ms)
+[tx=1] ← LoanControllerV1.borrow() (31ms)
+ok
+[tx=2] → LoanControllerV1.borrow()
+[tx=2]   → LoanServiceV1.borrow()
+[tx=2]     → LoanRepositoryV1.save()
+[tx=2]     x LoanRepositoryV1.save() java.lang.IllegalStateException: 분실된 도서
+[tx=2]   x LoanServiceV1.borrow() java.lang.IllegalStateException: 분실된 도서
+[tx=2] x LoanControllerV1.borrow() java.lang.IllegalStateException: 분실된 도서
+호출자가 받은 예외: 분실된 도서</code></pre>
+
+<p>실패한 요청을 추적해 보자. 리포지토리의 익명 객체 <code>call()</code>이 예외를 던지면, 리포지토리용 템플릿의 <code>catch</code>가 실패 로그를 남기고 같은 예외를 다시 던진다. 그 예외는 서비스용 템플릿의 <code>try</code> 안에서 일어난 셈이므로 서비스 템플릿의 <code>catch</code>가 다시 실패 로그를 남기고 던지고, 컨트롤러에서도 같은 일이 반복된다. 세 템플릿 객체는 서로를 모르지만, 호출 스택이 중첩되어 있기 때문에 예외가 바깥으로 전파되면서 각 층의 <code>catch</code>를 차례로 지나간다. 마지막에 호출자는 원래의 <code>IllegalStateException</code>을 그대로 받는다. 추적기가 예외를 먹거나 바꾸지 않는다는 점이 중요하다. 부가 기능은 핵심 기능의 결과를 바꾸어서는 안 된다.</p>
+
+<h4>throw e는 왜 throws 절 없이 컴파일되는가</h4>
+
+<p><code>execute()</code>는 <code>catch (Exception e)</code>로 잡은 <code>e</code>를 다시 던지는데 메서드 선언에 <code>throws Exception</code>이 없다. <code>Exception</code>은 검사 예외(checked exception)의 상위 타입이니 컴파일 오류가 나야 할 것 같지만 그렇지 않다. JLS §11.2.2는 <code>final</code>이거나 effectively final인 <code>catch</code> 매개변수를 다시 던지는 <code>throw</code> 문이 던질 수 있는 예외를 "그 <code>try</code> 블록이 던질 수 있는 예외 중 이 <code>catch</code>가 잡는 것"으로 좁혀서 분석하도록 정한다(자바 7에서 들어온, 흔히 더 정밀한 재던지기라 부르는 규칙). <code>try</code> 블록 안의 <code>tracer.end()</code>와 <code>call()</code>은 검사 예외를 선언하지 않았으므로, 이 블록이 던질 수 있는 것은 비검사 예외뿐이다. 그래서 <code>throw e</code>도 비검사 예외만 던지는 것으로 분석되고, <code>throws</code> 절이 필요 없다.</p>
+
+<p>거꾸로 구멍 메서드를 <code>protected abstract T call() throws Exception;</code>으로 선언하면 <code>try</code> 블록이 <code>Exception</code>을 던질 수 있게 되므로, 같은 <code>throw e</code>에서 다음 오류가 난다. 구멍의 시그니처에 검사 예외를 넣을지는 템플릿 전체의 시그니처를 바꾸는 설계 결정이다. 뒤에서 스프링의 콜백 인터페이스들이 이 결정을 각자 다르게 내렸다는 것을 보게 된다.</p>
+
+<pre data-label="컴파일 오류 (같은 구조인 뒤의 TraceTemplate에서 구멍이 throws Exception을 선언한 경우, JDK 21 javac)"><code class="language-text">TraceTemplate.java:17: error: unreported exception Exception; must be caught or declared to be thrown
+            throw e;
+            ^</code></pre>
+
+<h4>익명 클래스와 다이아몬드</h4>
+
+<p>컨트롤러 코드의 <code>new TraceTemplateBase<>(tracer) { ... }</code>처럼 익명 클래스에 다이아몬드(<code><></code>)를 쓰는 것은 자바 9부터 허용된다. 같은 코드를 <code>--release 8</code>로 컴파일하면 javac가 <code>'<>' with anonymous inner classes is not supported in -source 8</code>이라는 이유와 함께 거부한다. JEP 213의 설명에 따르면, 익명 클래스는 컴파일러가 실제로 클래스 파일을 만들어야 하는데 다이아몬드로 추론된 타입이 클래스 파일의 시그니처 속성으로 표현할 수 없는 타입일 수 있어서 자바 7에서는 금지했고, 자바 9에서 추론된 타입이 소스에 적을 수 있는(denotable) 타입일 때에 한해 허용했다. 일반 생성자 호출의 다이아몬드보다 익명 클래스의 다이아몬드가 늦게 들어온 이유가 여기에 있다.</p>
+
+<p>결과를 평가해 보자. 로그 형식을 바꾸려면 이제 <code>TraceTemplateBase</code> 한 곳만 고치면 된다. 단일 책임 원칙의 관점에서 추적의 변경 이유는 한 클래스로 모였다. 하지만 각 메서드에는 여전히 익명 클래스 선언, <code>@Override</code>, 메서드 시그니처, <code>return null;</code> 같은 의식(ceremony)이 일곱 줄 정도 남는다. 그리고 그보다 근본적인 문제들이 상속이라는 선택 자체에서 나온다. 그것을 보기 전에 이 패턴의 정의부터 정리하자.</p>
+
+<h3>템플릿 메서드 패턴의 정의, 그리고 이미 써 온 템플릿 메서드들</h3>
+
+<p>템플릿 메서드 패턴은 GoF(Gamma, Helm, Johnson, Vlissides)의 『Design Patterns』(1994)에 실린 행위 패턴 중 하나다. 그 책이 밝힌 의도를 풀어 쓰면 이렇다. <b>한 연산 안에 알고리즘의 골격을 정의하고, 일부 단계를 하위 클래스로 미룬다. 하위 클래스는 알고리즘의 구조를 바꾸지 않고 특정 단계만 다시 정의할 수 있다.</b> 지금까지 만든 것과 정확히 같다. 골격은 <code>execute()</code>, 미룬 단계는 <code>call()</code>이다.</p>
+
+<p>같은 책은 하위 클래스가 채우는 단계를 두 종류로 나눈다. 하나는 반드시 구현해야 하는 추상 연산(primitive operation)이고, 다른 하나는 기본 동작을 갖고 있어 필요할 때만 재정의하는 훅 연산(hook operation)이다. 훅은 흔히 아무것도 하지 않는 빈 메서드로 둔다. 예컨대 <code>TraceTemplateBase</code>에 <code>protected void afterSuccess(T result) {}</code> 같은 빈 메서드를 두고 <code>end()</code> 직전에 부르면, 대부분의 자식은 무시하고 일부 자식만 결과를 검사하는 데 쓸 수 있다. 추상 메서드는 "반드시 채워야 하는 구멍", 훅은 "원하면 끼워 넣을 수 있는 자리"다.</p>
+
+<p>이 패턴에서 제어의 방향을 다시 보자. 보통의 재사용에서는 내 코드가 라이브러리를 부른다. 템플릿 메서드에서는 부모(재사용되는 쪽)의 코드가 자식(재사용하는 쪽)의 코드를 부른다. 흐름의 주도권이 뒤집혀 있는 것이다. 이 역전된 제어 구조에는 "우리에게 전화하지 마세요, 우리가 전화하겠습니다"라는 할리우드 원칙(Hollywood principle)이라는 별명이 붙어 있다. 스프링을 "프레임워크"라고 부를 때의 핵심도 이것이다. 우리가 작성한 컨트롤러 메서드는 우리가 부르지 않는다. 프레임워크의 골격 코드가 적절한 때에 부른다.</p>
+
+<h4>JDK와 서블릿, 스프링 안의 템플릿 메서드</h4>
+
+<p>이 패턴은 이미 여러 번 써 왔다. <code>java.util.AbstractList</code>의 Javadoc은 수정할 수 없는 리스트를 만들려면 이 클래스를 상속해 <code>get(int)</code>와 <code>size()</code>만 구현하면 된다고 설명한다. 반복자, <code>contains</code>, <code>indexOf</code>, <code>subList</code>, <code>toString</code> 같은 나머지 기능은 모두 이 두 구멍 위에 지어진 골격이다. 직접 확인해 보자.</p>
+
+<pre><code class="language-java">import java.util.AbstractList;
+
+public class Squares extends AbstractList<Integer> {
+
+    private final int size;
+
+    public Squares(int size) {
+        this.size = size;
+    }
+
+    @Override
+    public Integer get(int index) {          // 구멍 1
+        System.out.println("  get(" + index + ")");
+        return index * index;
+    }
+
+    @Override
+    public int size() {                      // 구멍 2
+        return size;
+    }
+
+    public static void main(String[] args) {
+        Squares squares = new Squares(4);
+        System.out.println("contains(4) = " + squares.contains(4));
+        System.out.println("indexOf(9) = " + squares.indexOf(9));
+        System.out.println("subList(1, 3) = " + squares.subList(1, 3));
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">  get(0)
+  get(1)
+  get(2)
+contains(4) = true
+  get(0)
+  get(1)
+  get(2)
+  get(3)
+indexOf(9) = 3
+  get(1)
+  get(2)
+subList(1, 3) = [1, 4]</code></pre>
+
+<p><code>contains</code>, <code>indexOf</code>, <code>subList</code>의 문자열 변환은 한 줄도 작성하지 않았는데, 출력을 보면 모두 우리가 구현한 <code>get()</code>을 불러 가며 동작한다. <code>"contains(4) = " + squares.contains(4)</code>에서 <code>contains</code>가 문자열 연결보다 먼저 평가되므로 <code>get</code> 로그가 결과 줄보다 먼저 찍힌다. <code>contains(4)</code>는 앞에서부터 찾다가 <code>get(2)</code>가 4를 돌려주자 멈췄다.</p>
+
+<p>입출력에도 같은 구조가 있다. <code>java.io.InputStream</code>의 Javadoc은 <code>read(byte[], int, int)</code>의 기본 구현이 한 바이트를 읽는 추상 메서드 <code>read()</code>를 반복해서 부른다고 적고 있다. 하위 클래스는 <code>read()</code>만 구현하면 배열 단위 읽기를 공짜로 얻고, 더 효율적으로 할 수 있으면 배열 단위 메서드도 재정의한다. 서블릿에서는 <code>HttpServlet</code>이 대표적이다. Jakarta Servlet의 <code>HttpServlet</code> Javadoc은 <code>protected service(HttpServletRequest, HttpServletResponse)</code>가 표준 HTTP 요청을 받아 <code>doGet</code>, <code>doPost</code> 같은 <code>doXxx</code> 메서드로 나누어 보낸다고 설명하고, 하위 클래스는 그중 적어도 하나를 재정의해야 하며 <code>service</code>를 재정의할 이유는 거의 없다고 적는다. 골격은 재정의하지 말고 구멍만 채우라는 템플릿 메서드의 사용 설명서 그대로다.</p>
+
+<p>스프링 MVC의 <code>FrameworkServlet</code>(Spring Framework 6.2 소스 기준)도 같다. <code>doGet</code>, <code>doPost</code>, <code>doPut</code>, <code>doDelete</code>를 <code>final</code>로 재정의해 모두 <code>final</code> 메서드 <code>processRequest()</code>로 모으고, 이 메서드가 요청 처리의 골격을 맡는다. 시작 시각을 기록하고, 로케일과 요청 속성을 스레드에 묶어 두는 홀더(<code>LocaleContextHolder</code>, <code>RequestContextHolder</code>)를 설정한 뒤, 추상 메서드 <code>doService()</code>를 부르고, <code>finally</code>에서 홀더를 이전 상태로 되돌리고 요청 처리 이벤트를 발행한다. <code>doService()</code>라는 구멍을 채우는 자식이 <code>DispatcherServlet</code>이다. 스레드에 묶은 상태를 <code>finally</code>에서 반드시 되돌리는 부분은 01회의 <code>ThreadLocal</code> 정리 규칙이 프레임워크 코드 안에서 템플릿의 "변하지 않는 부분"으로 들어가 있는 예다. 정리 코드를 각 컨트롤러에 맡기지 않고 골격에 두었기 때문에 누구도 빠뜨릴 수 없다.</p>
+
+<h3>상속이 치르는 대가</h3>
+
+<p>템플릿 메서드 패턴은 중복을 한곳에 모았지만, 그 수단이 상속이라는 데서 오는 비용이 있다. 하나씩 따져 보자.</p>
+
+<p><b>첫째, 자식은 쓰지도 않는 부모에 강하게 묶인다.</b> <code>LoanRepositoryV1</code> 안의 익명 클래스는 <code>TraceTemplateBase</code>를 <code>extends</code>한다. 이 익명 클래스가 부모로부터 실제로 원하는 것은 "누군가 내 <code>call()</code>을 불러 주는 것"뿐인데, 상속은 부모의 필드(<code>tracer</code>), 생성자 시그니처, 모든 메서드를 통째로 물려받는다. 컴파일된 <code>LoanRepositoryV1$1.class</code>는 상위 클래스로 <code>TraceTemplateBase</code>를 이름으로 기록하고, 부모 생성자를 직접 호출하는 바이트코드를 갖는다. 부모에 추상 메서드가 하나 추가되면 모든 자식이 컴파일 오류가 나고, 부모 생성자의 인자가 바뀌면 모든 익명 클래스 생성 식을 고쳐야 한다. 부모의 내부 구현이 바뀌어 어떤 메서드가 다른 메서드를 부르는 순서가 달라지면, 그 메서드를 재정의한 자식의 동작이 조용히 바뀔 수도 있다. 흔히 깨지기 쉬운 기반 클래스(fragile base class) 문제라고 부르는 현상이다.</p>
+
+<p><b>둘째, 부모는 하나뿐이다.</b> 자바 클래스는 하나의 클래스만 상속할 수 있다(JLS §8.1.4). 시간 측정 템플릿과 추적 템플릿을 둘 다 적용하고 싶어도 익명 클래스 하나가 두 부모를 가질 수는 없다. 하나를 다른 하나 안에 다시 감싸야 한다. 또 이미 다른 클래스를 상속하고 있는 클래스는 템플릿의 자식이 될 수 없다.</p>
+
+<p><b>셋째, 부모의 생성자에서 템플릿 메서드를 부르면 반쯤 만들어진 자식이 실행된다.</b> JLS §12.5가 정한 객체 생성 순서에서 상위 클래스 생성자는 하위 클래스의 인스턴스 변수 초기화보다 먼저 실행된다. 그런데 그 사이에 호출된 가상 메서드는 이미 자식의 재정의 버전으로 선택된다(앞에서 본 §5.4.6의 선택은 생성 중인 객체에도 똑같이 적용된다). 그래서 부모 생성자가 템플릿 메서드를 부르면, 자식의 구멍 메서드는 자기 필드가 아직 기본값(<code>null</code>, <code>0</code>)인 상태에서 실행된다. 앞에서 익명 클래스의 생성자가 포획한 값을 부모 생성자 호출 <b>전에</b> 저장하던 것은 이 위험을 javac가 스스로 피하는 장치였다. 직접 작성한 필드는 그런 보호를 받지 못한다(연습 문제 4에서 확인한다).</p>
+
+<p><b>넷째, 람다를 쓸 수 없다.</b> 구멍이 메서드 하나뿐이니 람다로 채우고 싶어진다. 하지만 컴파일러는 거부한다.</p>
+
+<pre><code class="language-java">TimedTemplate t = () -> System.out.println("x");</code></pre>
+
+<pre data-label="컴파일 오류 (JDK 21 javac)"><code class="language-text">E1.java:3: error: incompatible types: TimedTemplate is not a functional interface
+        TimedTemplate t = () -> System.out.println("x");
+                          ^</code></pre>
+
+<p>JLS §9.8은 함수형 인터페이스(functional interface)를 "sealed로 선언되지 않았고 <code>Object</code>의 메서드를 제외하면 추상 메서드가 하나뿐인 <b>인터페이스</b>"로 정의하고, 람다 식의 대상 타입은 함수형 인터페이스여야 한다. 추상 메서드가 하나뿐이어도 추상 <b>클래스</b>는 해당되지 않는다. 이유는 람다의 구현 방식에 있다. 뒤에서 보겠지만 람다 객체는 실행 시점에 만들어지는 클래스의 인스턴스이고, 그 클래스는 <code>Object</code>를 상속하고 대상 인터페이스를 구현한다. 추상 클래스를 대상으로 하려면 그 클래스의 생성자 인자, 필드 초기화, 생성자 안의 부수 효과를 어떻게 처리할지 정해야 하는데, 인터페이스에는 그런 것이 없다.</p>
+
+<p><b>다섯째, 익명 클래스마다 클래스가 하나씩 생긴다.</b> 템플릿을 쓰는 자리가 백 군데면 클래스 파일도 백 개가 생기고, 실행 중에 쓰이면 각각 로딩되어 메타스페이스에 클래스 메타데이터가 올라간다. 큰 비용은 아니지만 공짜도 아니다.</p>
+
+<p>이 다섯 가지는 모두 "구멍을 채우는 코드"와 "뼈대 코드"가 <code>extends</code>라는 한 줄로 같은 객체 안에 합쳐졌기 때문에 생긴다. 해결책은 둘을 서로 다른 객체로 떼어 놓고, 뼈대 객체가 구멍 객체를 인터페이스를 통해서만 부르게 하는 것이다. 상속(inheritance) 대신 위임(delegation), 흔히 하는 말로 "상속보다 합성(composition)"이다.</p>
+
+<h3>전략 패턴: 구멍을 상속 대신 위임으로 채운다</h3>
+
+<p>전략 패턴(Strategy pattern)은 변하지 않는 뼈대를 컨텍스트(Context)라는 객체에 두고, 변하는 부분을 전략(Strategy)이라는 인터페이스로 분리한다. 컨텍스트는 전략 인터페이스에만 의존하고, 실제 전략 객체는 바깥에서 받아 쓴다. GoF가 밝힌 의도를 풀어 쓰면, 알고리즘군을 정의하고 각각을 캡슐화해 서로 바꿔 쓸 수 있게 만들며, 그렇게 해서 알고리즘을 사용하는 클라이언트와 독립적으로 알고리즘을 바꿀 수 있게 한다는 것이다.</p>
+
+<pre><code class="language-java">public interface Strategy {
+    void call();
+}
+
+public class FieldContext {
+
+    private final Strategy strategy;
+
+    public FieldContext(Strategy strategy) {      // 전략을 생성자로 받아 필드에 둔다
+        this.strategy = strategy;
+    }
+
+    public void execute() {
+        long start = System.nanoTime();
+        strategy.call();                               // 위임
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+        System.out.println("소요 시간=" + elapsedMs + "ms");
+    }
+}
+
+public class SendMailStrategy implements Strategy {
+    @Override
+    public void call() {
+        System.out.println("메일 발송");
+    }
+}</code></pre>
+
+<pre><code class="language-java">FieldContext context1 = new FieldContext(new SendMailStrategy());
+context1.execute();
+
+FieldContext context2 = new FieldContext(new Strategy() {
+    @Override
+    public void call() {
+        System.out.println("요금 청구");
+    }
+});
+context2.execute();</code></pre>
+
+<pre data-label="실행 결과 (소요 시간은 실행마다 다를 수 있다)"><code class="language-text">메일 발송
+소요 시간=0ms
+요금 청구
+소요 시간=0ms</code></pre>
+
+<p>템플릿 메서드와 비교하면 무엇이 달라졌는가. <code>SendMailStrategy</code>는 <code>FieldContext</code>를 전혀 모른다. 아무것도 상속하지 않고 메서드 하나짜리 인터페이스만 구현한다. <code>FieldContext</code>도 <code>SendMailStrategy</code>를 모르고 <code>Strategy</code> 인터페이스만 안다. 둘을 잇는 것은 바깥의 조립 코드다. 컨텍스트의 생성자 인자가 바뀌어도 전략 구현은 영향을 받지 않고, 전략 하나가 다른 클래스를 상속하고 있어도 상관없으며, 한 클래스가 여러 전략 인터페이스를 동시에 구현할 수도 있다.</p>
+
+<pre class="diagram">  템플릿 메서드 (상속)                     전략 (위임)
+
+  TimedTemplate                            FieldContext ──────────▶ «interface» Strategy
+   execute()  ── this.call() ──┐            execute()   strategy.call()      call()
+   call() abstract             │                                              ▲
+        ▲ extends              │                                              │ implements
+  SendMailTask ◀───────────────┘                                       SendMailStrategy
+   call()                                                               call()
+
+  한 객체 안에서 부모 코드가 자식 코드를 부른다    두 객체가 인터페이스 하나로만 연결된다</pre>
+
+<p>이 구조는 스프링 핵심 원리 기본편에서 본 의존관계 주입(dependency injection) 그대로다. 컨텍스트가 빈이고, 전략이 주입되는 의존 객체다. 스프링 컨테이너가 애플리케이션을 띄울 때 빈들을 조립해 두고, 그 뒤 요청이 오면 조립된 객체 그래프가 실행된다. 이 방식을 <b>선 조립, 후 실행</b>이라고 부르자. 조립은 시작할 때 한 번 일어나고, 실행 중에는 전략이 바뀌지 않는다.</p>
+
+<h4>바이트코드에서 본 위임: invokeinterface</h4>
+
+<pre data-label="javap -c FieldContext (execute 일부)"><code class="language-text">  public void execute();
+    Code:
+       0: invokestatic  #13                 // Method java/lang/System.nanoTime:()J
+       3: lstore_1
+       4: aload_0
+       5: getfield      #7                  // Field strategy:LStrategy;
+       8: invokeinterface #19,  1           // InterfaceMethod Strategy.call:()V
+      ...</code></pre>
+
+<p>템플릿 메서드에서는 <code>aload_0</code>(<code>this</code>)에 대해 <code>invokevirtual</code>을 했다. 여기서는 <code>this</code>의 필드 <code>strategy</code>를 꺼내(<code>getfield</code>) 그 객체에 대해 <code>invokeinterface</code>를 한다. 수신 객체가 내가 아니라 <b>다른 객체</b>라는 점이 상속과 위임의 차이가 바이트코드에 드러난 모습이다. 실행할 메서드의 선택 규칙은 같은 JVMS §5.4.6을 따른다. 수신 객체의 실제 클래스(<code>SendMailStrategy</code>)에서 <code>call()</code>을 찾는다.</p>
+
+<p>HotSpot에서 인터페이스 호출은 앞에서 본 vtable만으로는 처리할 수 없다. 클래스 상속은 한 줄로 이어지므로 같은 메서드가 모든 하위 클래스에서 같은 vtable 칸을 가질 수 있지만, 인터페이스는 서로 관계없는 여러 클래스가 각자의 상속 계층 안에서 구현하므로 모든 구현 클래스에 공통인 칸 번호를 정할 수 없다. 그래서 HotSpot은 클래스마다 구현한 인터페이스별 메서드 표(itable)를 따로 두고, 호출 시 해당 인터페이스의 표를 찾은 뒤 그 안의 칸을 쓴다. 다만 앞에서 말한 JIT의 수신 타입 기록과 인라인은 인터페이스 호출에도 적용되므로, 한 호출 지점에 들어오는 구현이 한두 가지라면 실제 비용 차이는 크지 않다.</p>
+
+<h3>람다로 전략 넘기기, 그리고 람다의 정체</h3>
+
+<p><code>Strategy</code>는 추상 메서드가 하나뿐인 인터페이스, 즉 함수형 인터페이스다. 그러니 익명 클래스 대신 람다를 쓸 수 있다. 템플릿 메서드에서는 막혔던 길이 위임으로 바꾸자 열린 것이다.</p>
+
+<pre><code class="language-java">FieldContext context = new FieldContext(() -> System.out.println("메일 발송"));
+context.execute();</code></pre>
+
+<p>람다는 익명 클래스의 줄임말처럼 보이지만 컴파일 결과는 전혀 다르다. 지역 변수를 하나 포획하는 작은 예제로 확인해 보자.</p>
+
+<pre><code class="language-java">public class One {
+    public static void main(String[] args) {
+        String who = args.length > 0 ? args[0] : "guest";
+        new ParamContext().execute(() -> System.out.println("hello " + who));
+    }
+}</code></pre>
+
+<p>(<code>ParamContext</code>는 다음 절에서 볼, 전략을 인자로 받는 컨텍스트다. 여기서는 람다가 어떻게 만들어지는지만 본다.) 컴파일하면 <code>One.class</code> 하나만 생긴다. <code>One$1.class</code> 같은 파일은 없다. <code>javap -c -p One</code>의 결과다.</p>
+
+<pre data-label="javap -c -p One (JDK 21 javac)"><code class="language-text">  public static void main(java.lang.String[]);
+    Code:
+       ...
+      13: astore_1
+      14: new           #9                  // class ParamContext
+      17: dup
+      18: invokespecial #11                 // Method ParamContext."<init>":()V
+      21: aload_1
+      22: invokedynamic #12,  0             // InvokeDynamic #0:call:(Ljava/lang/String;)LStrategy;
+      27: invokevirtual #16                 // Method ParamContext.execute:(LStrategy;)V
+      30: return
+
+  private static void lambda$main$0(java.lang.String);
+    Code:
+       0: getstatic     #20                 // Field java/lang/System.out:Ljava/io/PrintStream;
+       3: aload_0
+       4: invokedynamic #26,  0             // InvokeDynamic #1:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+       9: invokevirtual #30                 // Method java/io/PrintStream.println:(Ljava/lang/String;)V
+      12: return</code></pre>
+
+<pre data-label="javap -v One (BootstrapMethods 일부)"><code class="language-text">BootstrapMethods:
+  0: #55 REF_invokeStatic java/lang/invoke/LambdaMetafactory.metafactory:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;
+    Method arguments:
+      #49 ()V
+      #50 REF_invokeStatic One.lambda$main$0:(Ljava/lang/String;)V
+      #49 ()V</code></pre>
+
+<p>세 가지가 보인다. 첫째, 람다의 본문은 <code>One</code> 클래스 안의 <code>private static</code> 메서드 <code>lambda$main$0(String)</code>으로 옮겨졌다. 포획한 변수 <code>who</code>는 이 메서드의 매개변수가 되었다. 둘째, 람다 식이 있던 자리에는 <code>invokedynamic</code> 명령 하나가 있다. 이 명령의 설명자 <code>(Ljava/lang/String;)LStrategy;</code>는 "<code>String</code> 하나를 받아 <code>Strategy</code> 객체를 돌려준다"는 뜻이다. 즉 이 명령은 람다를 <b>실행</b>하는 것이 아니라 람다 <b>객체를 만든다</b>. 셋째, 이 <code>invokedynamic</code>이 처음 실행될 때 무엇을 할지는 <code>BootstrapMethods</code> 속성에 적혀 있다. 부트스트랩 메서드는 <code>LambdaMetafactory.metafactory</code>이고, 인자로 "구현할 메서드의 모양 <code>()V</code>"와 "실제 본문이 있는 메서드 <code>lambda$main$0</code>"을 넘긴다.</p>
+
+<figure class="flow-figure"><figcaption>invokedynamic 람다 생성 지점이 처음 실행될 때와 그 뒤</figcaption><ol class="flow">
+<li><strong>최초 실행: 부트스트랩</strong><span>JVM이 이 호출 지점에 아직 연결된 대상이 없음을 보고 부트스트랩 메서드 <code>LambdaMetafactory.metafactory</code>를 호출한다. 인자로 호출자 클래스의 조회 권한(<code>Lookup</code>), 메서드 이름 <code>call</code>, 설명자, 그리고 BootstrapMethods에 적힌 정적 인자들이 넘어간다.</span></li>
+<li><strong>클래스 생성</strong><span><code>LambdaMetafactory</code>가 <code>Strategy</code>를 구현하는 클래스를 실행 중에 바이트코드로 만들어 정의한다. JDK 15 이상에서는 숨은 클래스(hidden class, JEP 371)로 정의된다.</span></li>
+<li><strong>호출 지점 연결</strong><span>그 클래스의 인스턴스를 만드는 방법을 담은 <code>CallSite</code>를 돌려주고, JVM은 이 <code>invokedynamic</code> 지점을 그것에 영구히 연결한다.</span></li>
+<li><strong>두 번째 실행부터</strong><span>부트스트랩 없이 연결된 대상을 바로 실행해 람다 객체를 얻는다. 포획한 값(<code>who</code>)은 그때마다 인자로 넘어가 새 객체의 필드에 담긴다.</span></li>
+<li><strong>람다 호출</strong><span><code>strategy.call()</code>이 생성된 클래스의 <code>call()</code>을 실행하고, 그것이 필드에 담긴 값을 꺼내 <code>One.lambda$main$0(String)</code>을 부른다.</span></li>
+</ol></figure>
+
+<p>실행 중에 만들어진 클래스를 직접 볼 수도 있다. JDK 21에서 진단용 시스템 프로퍼티 <code>-Djdk.invoke.LambdaMetafactory.dumpProxyClassFiles=true</code>를 주고 실행하면 현재 디렉터리의 <code>DUMP_LAMBDA_PROXY_CLASS_FILES</code> 아래에 생성된 클래스가 파일로 저장된다. 그것을 javap로 열면 다음과 같다.</p>
+
+<pre data-label="javap -p -c (덤프된 람다 클래스, JDK 21)"><code class="language-text">final class One$$Lambda implements Strategy {
+  private final java.lang.String arg$1;
+
+  private One$$Lambda(java.lang.String);
+    Code:
+       0: aload_0
+       1: invokespecial #13                 // Method java/lang/Object."<init>":()V
+       4: aload_0
+       5: aload_1
+       6: putfield      #15                 // Field arg$1:Ljava/lang/String;
+       9: return
+
+  public void call();
+    Code:
+       0: aload_0
+       1: getfield      #15                 // Field arg$1:Ljava/lang/String;
+       4: invokestatic  #21                 // Method One.lambda$main$0:(Ljava/lang/String;)V
+       7: return
+}</code></pre>
+
+<p>결국 람다 객체도 "인터페이스를 구현하고, 포획한 값을 <code>final</code> 필드에 담는 클래스의 인스턴스"다. 익명 클래스의 <code>val$target</code>과 이 클래스의 <code>arg$1</code>은 같은 역할을 한다. 그래서 람다에도 같은 effectively final 규칙이 적용되고, 오류 문구만 <code>local variables referenced from a lambda expression must be final or effectively final</code>로 다르다. 차이는 그 클래스가 <b>언제, 누구에 의해</b> 만들어지느냐다. 익명 클래스는 javac가 컴파일할 때 클래스 파일로 만들고, 람다의 클래스는 JDK 라이브러리(<code>LambdaMetafactory</code>)가 실행할 때 메모리 안에서 만든다. 람다 본문 자체는 원래 클래스의 <code>private</code> 메서드로 남아 있으므로, 람다 본문이 바깥 클래스의 <code>private</code> 멤버에 접근해도 접근자 메서드가 필요 없다.</p>
+
+<h4>숨은 클래스와 객체의 정체성</h4>
+
+<p>실행 중에 <code>getClass()</code>로 람다 객체의 클래스를 보면 이름이 특이하다. 아래는 이 회차의 실험에서 얻은 출력이다(HotSpot JDK 21). 이름 뒤의 <code>/0x...</code> 부분은 JVM이 붙이는 것이고 실행 환경마다 다를 수 있다.</p>
+
+<pre><code class="language-java">for (int i = 0; i < 3; i++) {
+    Strategy s = () -> System.out.println("고정");          // 아무것도 포획하지 않는다
+    System.out.println("비캡처 " + i + ": " + System.identityHashCode(s) + " " + s.getClass().getName());
+}
+for (int i = 0; i < 3; i++) {
+    int n = i;
+    Strategy s = () -> System.out.println("캡처 " + n);      // n을 포획한다
+    System.out.println("캡처 " + i + ": " + System.identityHashCode(s) + " " + s.getClass().getName());
+}
+Strategy s = () -> {};
+System.out.println("isHidden=" + s.getClass().isHidden());
+try {
+    Class.forName(s.getClass().getName());                  // 이름으로 찾아본다
+} catch (ClassNotFoundException e) {
+    System.out.println("Class.forName 실패: " + e);
+}
+// 위 코드는 StrategyMain 클래스의 main 메서드 안에 있다</code></pre>
+
+<pre data-label="실행 결과 (해시 값과 /0x... 부분은 실행마다 다를 수 있다)"><code class="language-text">비캡처 0: 1580066828 StrategyMain$$Lambda/0x0000008001003430
+비캡처 1: 1580066828 StrategyMain$$Lambda/0x0000008001003430
+비캡처 2: 1580066828 StrategyMain$$Lambda/0x0000008001003430
+캡처 0: 1175962212 StrategyMain$$Lambda/0x0000008001003650
+캡처 1: 918221580 StrategyMain$$Lambda/0x0000008001003650
+캡처 2: 2055281021 StrategyMain$$Lambda/0x0000008001003650
+isHidden=true
+Class.forName 실패: java.lang.ClassNotFoundException: StrategyMain$$Lambda/0x0000008001003870</code></pre>
+
+<p>관찰한 사실을 정리하면 이렇다. 같은 람다 식에서 나온 객체들은 같은 클래스의 인스턴스다. 클래스는 람다 식(정확히는 <code>invokedynamic</code> 호출 지점)마다 하나다. 아무것도 포획하지 않는 람다는 반복해서 평가해도 <b>같은 객체</b>가 돌아왔고, 값을 포획하는 람다는 평가할 때마다 <b>새 객체</b>가 만들어졌다. 포획한 값이 없으면 객체마다 다를 상태가 없으므로 하나를 만들어 재사용해도 되기 때문이다. 그리고 이 클래스는 <code>isHidden()</code>이 <code>true</code>인 숨은 클래스이고, 이름으로 찾을 수 없다. JEP 371은 숨은 클래스가 바이트코드 링크 과정에서도, <code>Class::forName</code>이나 <code>ClassLoader::loadClass</code>를 쓰는 프로그램에서도 발견되지 않는다고 정한다. 다만 숨은 클래스라고 해서 람다 객체와 함께 사라지는 것은 아니다. OpenJDK 21의 <code>InnerClassLambdaMetafactory</code>는 람다 클래스를 <code>STRONG</code> 옵션으로 정의하는데, <code>Lookup.ClassOption.STRONG</code>의 Javadoc에 따르면 이런 숨은 클래스는 보통 클래스처럼 정의한 클래스 로더에 도달할 수 없게 되어야만 언로드될 수 있다.</p>
+
+<p>여기서 조심할 것은 "비캡처 람다는 싱글턴이다"를 규칙으로 외우는 것이다. JLS §15.27.4는 람다 식을 평가하면 새 인스턴스가 할당될 수도 있고 기존 인스턴스가 참조될 수도 있다고만 정하고, 따라서 람다 평가 결과의 정체성(identity)은 예측할 수 없으며 <code>==</code> 비교, 객체 락, <code>System.identityHashCode</code> 같은 정체성에 민감한 연산은 구현마다, 심지어 같은 구현에서도 평가할 때마다 다른 결과를 낼 수 있다고 명시한다. 위 출력은 HotSpot JDK 21의 동작일 뿐이다. 람다 객체로 <code>synchronized</code>를 걸거나 <code>==</code>로 같은 전략인지 판단하는 코드는 명세상 근거가 없다.</p>
+
+<h4>this는 누구인가</h4>
+
+<p>익명 클래스와 람다의 차이가 가장 직접적으로 드러나는 곳은 <code>this</code>다. 익명 클래스는 진짜 클래스의 본문이므로 그 안의 <code>this</code>는 익명 객체 자신이다. 반면 람다 본문은 새 클래스의 본문이 아니라 바깥 메서드 본문의 일부로 취급된다. JLS §15.8.3은 람다 본문의 <code>this</code>가 둘러싼 문맥의 <code>this</code>와 같은 값이라고 정한다.</p>
+
+<pre><code class="language-java">public class This {
+    @Override public String toString() { return "바깥 This 객체"; }
+
+    void run() {
+        Runnable lambda = () -> System.out.println("람다의 this = " + this);
+        Runnable anon = new Runnable() {
+            public void run() { System.out.println("익명 클래스의 this = " + this.getClass().getName()); }
+        };
+        lambda.run();
+        anon.run();
+    }
+
+    public static void main(String[] a) { new This().run(); }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">람다의 this = 바깥 This 객체
+익명 클래스의 this = This$1</code></pre>
+
+<p>바이트코드도 이 규칙을 따른다. 인스턴스 메서드 안에서 바깥 객체의 필드를 쓰는 람다는 본문이 <code>private static</code>이 아니라 <code>private</code> 인스턴스 메서드(<code>lambda$make$0()</code> 같은 이름)로 만들어지고, <code>invokedynamic</code>의 설명자에 바깥 객체가 인자로 들어간다(<code>(LInst;)Ljava/lang/Runnable;</code>). 즉 바깥 <code>this</code>를 포획한다. 람다가 필드 하나만 읽어도 바깥 객체 전체를 붙잡는다는 뜻이므로, 그런 람다를 오래 사는 곳에 넘길 때는 익명 클래스의 <code>this$0</code>과 같은 주의가 필요하다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>구분</th><th>익명 내부 클래스</th><th>람다</th></tr></thead><tbody>
+<tr><td>대상 타입</td><td>클래스(추상 클래스 포함)나 인터페이스</td><td>함수형 인터페이스만(JLS §9.8)</td></tr>
+<tr><td>클래스가 만들어지는 때</td><td>컴파일할 때, <code>Outer$1.class</code> 파일로</td><td>호출 지점이 처음 실행될 때, <code>LambdaMetafactory</code>가 메모리 안에서(숨은 클래스)</td></tr>
+<tr><td>본문의 위치</td><td>익명 클래스의 메서드</td><td>바깥 클래스의 <code>private</code> 메서드 <code>lambda$...</code></td></tr>
+<tr><td>포획한 값</td><td>익명 클래스의 <code>final</code> 필드(<code>val$x</code>, <code>this$0</code>)</td><td>생성된 클래스의 <code>final</code> 필드(<code>arg$1</code> 등)</td></tr>
+<tr><td><code>this</code></td><td>익명 객체 자신</td><td>둘러싼 문맥의 <code>this</code>(JLS §15.8.3)</td></tr>
+<tr><td>평가할 때마다 새 객체인가</td><td>항상 새 객체(<code>new</code>)</td><td>명세상 예측할 수 없음(JLS §15.27.4)</td></tr>
+</tbody></table></div>
+
+<x-visual id="spring-core-adv-02-lambda-bootstrap" title="람다 식이 invokedynamic과 LambdaMetafactory를 거쳐 객체가 되는 과정" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>컴파일 시점에는 본문 메서드와 invokedynamic만 생기고, 실행 시점의 첫 호출에서 부트스트랩이 숨은 클래스를 만들어 호출 지점에 연결한다는 두 단계를 구분해 보여 준다.</x-hint>
+<x-prompt>위아래 두 단으로 나뉜 그림. 위 단 제목 "컴파일 시점 (javac)": 왼쪽에 소스 코드 상자 "() -> println(\"hello \" + who)"가 있고 화살표가 오른쪽의 클래스 파일 상자 "One.class"로 간다. One.class 안에는 세 칸 "invokedynamic call", "private static lambda$main$0(String)", "BootstrapMethods: LambdaMetafactory.metafactory"가 있다. 아래 단 제목 "실행 시점 (JVM)": 생명선 네 개 "main()", "invokedynamic 호출 지점", "LambdaMetafactory", "숨은 클래스 One$$Lambda". 화살표 1: main에서 호출 지점으로 "처음 실행". 화살표 2: 호출 지점에서 LambdaMetafactory로 "부트스트랩". 화살표 3: LambdaMetafactory에서 숨은 클래스로 "클래스 생성". 화살표 4: LambdaMetafactory에서 호출 지점으로 점선 "CallSite 연결". 화살표 5: 호출 지점에서 main으로 점선 "람다 객체 (arg$1 = who)". 오른쪽 아래에 작은 상자 "call() → lambda$main$0(arg$1)". 평면 스타일, 흰 배경, 컴파일 단은 회색, 실행 단은 파란색 톤.</x-prompt>
+<x-caption>람다 본문은 원래 클래스의 private 메서드가 되고, 그 메서드를 부르는 클래스는 실행 중 처음 필요할 때 만들어진다.</x-caption>
+</x-visual>
+
+<h3>전략을 필드에 둘 것인가, 실행할 때 넘길 것인가</h3>
+
+<p><code>FieldContext</code>는 전략을 생성자로 받아 필드에 둔다. 조립이 끝나면 전략은 바뀌지 않는다. 다른 전략으로 실행하려면 컨텍스트를 새로 만들어야 한다. 이번에는 전략을 필드가 아니라 <code>execute()</code>의 인자로 받아 보자.</p>
+
+<pre><code class="language-java">public class ParamContext {
+
+    public void execute(Strategy strategy) {           // 실행할 때 전략을 받는다
+        long start = System.nanoTime();
+        strategy.call();
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+        System.out.println("소요 시간=" + elapsedMs + "ms");
+    }
+}</code></pre>
+
+<pre><code class="language-java">ParamContext context = new ParamContext();
+context.execute(() -> System.out.println("메일 발송"));
+context.execute(() -> System.out.println("요금 청구"));</code></pre>
+
+<p>컨텍스트 하나로 매번 다른 전략을 실행한다. <code>ParamContext</code>에는 필드가 하나도 없다. 이것이 사소해 보이지만 멀티스레드 환경에서는 결정적인 차이다. 스프링 빈은 기본이 싱글톤 스코프이므로, 컨텍스트를 빈으로 등록하면 그 객체 하나를 요청을 처리하는 모든 스레드(톰캣이라면 요청 처리 스레드 풀의 스레드들)가 동시에 쓴다.</p>
+
+<p>전략을 바꾸기 위해 필드 방식에 세터를 달았다고 해 보자.</p>
+
+<pre><code class="language-java">// 싱글톤으로 공유되는 객체에 이렇게 하면 안 된다
+public class MutableContext {
+
+    private Strategy strategy;
+
+    public void setStrategy(Strategy strategy) {
+        this.strategy = strategy;
+    }
+
+    public void execute() {
+        long start = System.nanoTime();
+        strategy.call();
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+        System.out.println("소요 시간=" + elapsedMs + "ms");
+    }
+}</code></pre>
+
+<p>스레드 A가 <code>setStrategy(a)</code>를 부르고, <code>execute()</code>를 부르기 직전에 스레드 B가 <code>setStrategy(b)</code>를 부르면, A는 B의 전략을 실행한다. <code>strategy</code> 필드는 힙에 있는 하나의 객체 안에 있고, 모든 스레드가 같은 칸을 읽고 쓰기 때문이다. 01회에서 추적 깊이를 공유 필드에 두었을 때 생긴 문제와 같은 구조이고, 동기화 없이 공유 필드를 읽고 쓰면 실행 순서 문제에 더해 한 스레드의 쓰기가 다른 스레드에 언제 보이는지(가시성)도 보장되지 않는다. 이 가시성 문제는 로드맵 뒤쪽의 자바 고급 1편에서 자바 메모리 모델로 자세히 다룬다.</p>
+
+<p>파라미터 방식에서는 전략 참조가 어디에 있는가? <code>execute(Strategy strategy)</code>의 <code>strategy</code>는 매개변수, 즉 지역 변수다. 호출한 스레드의 스택에 새로 만들어진 <code>execute()</code> 프레임의 지역 변수 칸에 들어간다. 스레드마다 스택이 따로이므로 A의 프레임과 B의 프레임은 같은 컨텍스트 객체의 같은 메서드를 실행하면서도 서로의 전략을 볼 수 없다. 공유되는 것은 필드가 없는 컨텍스트 객체와 메서드 코드뿐이다. <b>변하는 것을 객체의 상태(필드)가 아니라 실행의 흐름(스택)에 실어 보내면, 공유 객체는 무상태가 되고 스레드 안전해진다.</b></p>
+
+<pre class="diagram">  스레드 A의 스택                 힙                            스레드 B의 스택
+  ┌──────────────────────┐                                      ┌──────────────────────┐
+  │ execute() 프레임      │      ┌─────────────────────┐         │ execute() 프레임      │
+  │  this ───────────────┼────▶ │ ParamContext 객체    │ ◀───────┼─ this                │
+  │  strategy ──┐        │      │ (필드 없음)          │         │  strategy ──┐        │
+  │  start = ...│        │      └─────────────────────┘         │  start = ...│        │
+  └─────────────┼────────┘                                      └─────────────┼────────┘
+                ▼                                                             ▼
+        람다 객체 a ("메일 발송")                                    람다 객체 b ("요금 청구")
+
+  공유되는 것: 상태 없는 ParamContext 객체 하나       스레드마다 따로인 것: 프레임, strategy, start</pre>
+
+<p>물론 무상태 컨텍스트가 모든 것을 해결하지는 않는다. 람다가 포획한 객체 자체가 여러 스레드에서 공유되는 가변 객체라면 그 객체의 동시성 문제는 그대로 남는다. 파라미터 방식이 보장하는 것은 "컨텍스트가 어느 전략을 실행할지 헷갈리지 않는다"까지다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>구분</th><th>필드에 두는 전략</th><th>파라미터로 넘기는 전략</th></tr></thead><tbody>
+<tr><td>전략이 정해지는 때</td><td>컨텍스트를 조립할 때(선 조립, 후 실행)</td><td><code>execute()</code>를 호출할 때마다</td></tr>
+<tr><td>전략 참조의 위치</td><td>힙의 컨텍스트 객체 필드</td><td>호출 스레드의 스택 프레임</td></tr>
+<tr><td>다른 전략으로 실행하려면</td><td>컨텍스트를 새로 만든다</td><td>인자만 바꾼다</td></tr>
+<tr><td>호출하는 쪽의 부담</td><td>실행할 때 전략을 신경 쓰지 않는다</td><td>호출할 때마다 전략을 넘겨야 한다</td></tr>
+<tr><td>잘 맞는 경우</td><td>애플리케이션 시작 시 정해져 바뀌지 않는 정책(예: 할인 정책, 저장소 구현)</td><td>호출마다 달라지는 코드 조각(예: 각 메서드의 핵심 기능)</td></tr>
+</tbody></table></div>
+
+<p>로그 추적기에 필요한 것은 어느 쪽인가. 변하는 부분은 "각 메서드의 핵심 기능"이고 메서드마다 다르다. 필드 방식이라면 메서드마다 컨텍스트 객체를 따로 만들어야 한다. 파라미터 방식이라면 추적 컨텍스트 하나를 빈으로 두고 모든 메서드가 공유하면서, 각자 자기 핵심 기능을 넘기면 된다. 답은 파라미터 방식이다.</p>
+
+<x-visual id="spring-core-adv-02-field-vs-param-strategy" title="필드에 둔 전략과 파라미터로 넘긴 전략의 메모리 위치 비교" kind="메모리 구조도" ratio="16:9">
+<x-hint>필드 방식에서는 두 스레드가 힙의 같은 필드 칸을 덮어쓰고, 파라미터 방식에서는 각 스레드의 스택 프레임에 전략 참조가 따로 있다는 대비를 보여 준다.</x-hint>
+<x-prompt>좌우로 나뉜 비교 그림. 왼쪽 제목 "필드에 둔 전략", 오른쪽 제목 "파라미터로 넘긴 전략". 왼쪽: 위쪽에 스레드 두 개를 세로 막대 "스레드 A 스택", "스레드 B 스택"으로 그리고, 가운데 아래 힙 영역에 객체 상자 "MutableContext"가 있으며 그 안에 칸 하나 "strategy 필드"가 빨간 테두리로 강조되어 있다. 두 스레드에서 같은 칸으로 화살표가 들어가고 라벨은 각각 "setStrategy(a)", "setStrategy(b)". 칸 옆에 경고 표시와 라벨 "덮어쓰기 경쟁". 오른쪽: 같은 두 스레드 스택 막대 안에 각각 프레임 상자 "execute() 프레임"이 있고 그 안에 칸 "strategy"가 있다. 각 칸에서 서로 다른 객체 "람다 a", "람다 b"로 화살표. 힙 가운데의 객체 상자 "ParamContext (필드 없음)"로 두 프레임의 "this" 화살표가 모인다. 오른쪽 아래 초록 체크 표시와 라벨 "무상태 공유". 평면 스타일, 흰 배경.</x-prompt>
+<x-caption>변하는 부분을 공유 객체의 필드에 두면 스레드끼리 경쟁하고, 실행 흐름(스택)에 실어 보내면 공유 객체는 무상태가 된다.</x-caption>
+</x-visual>
+
+<h3>템플릿 콜백 패턴</h3>
+
+<p>콜백(callback)은 다른 코드에 인자로 넘겨져, 그 코드가 적절한 때에 실행해 주기를 기대하는 실행 가능한 코드 조각을 말한다. 내가 직접 부르는 것이 아니라, 받은 쪽이 나중에 "다시 불러 주기(call back)" 때문에 붙은 이름이다. 콜백을 받은 메서드가 반환하기 전에 콜백을 실행하면 동기 콜백, 메서드는 먼저 반환하고 나중에(다른 스레드에서일 수도 있다) 실행하면 비동기 콜백이라고 한다. <code>CompletableFuture.thenApply</code>에 넘기는 함수는 비동기 콜백의 예이고, 이 회차에서 다루는 것은 모두 동기 콜백이다. 템플릿의 <code>execute()</code>가 반환하기 전에 콜백이 실행되고 끝난다.</p>
+
+<p>앞 절의 <code>ParamContext</code>가 바로 이 구조다. 컨텍스트가 변하지 않는 뼈대(템플릿)를 갖고, 변하는 부분을 실행할 때 인자(콜백)로 받는다. 스프링 안에서는 이런 방식을 템플릿 콜백 패턴이라고 부르고, <code>JdbcTemplate</code>, <code>TransactionTemplate</code>, <code>RestTemplate</code>처럼 이름이 <code>XxxTemplate</code>인 클래스들이 이 구조로 만들어져 있다. GoF 책의 23개 패턴 목록에 있는 이름은 아니다. GoF의 용어로는 "전략을 실행 시점에 파라미터로 넘기는 전략 패턴"이고, 컨텍스트를 템플릿, 전략을 콜백이라고 바꿔 부른 것이다.</p>
+
+<pre class="diagram">  전략 패턴의 이름          템플릿 콜백 패턴의 이름          로그 추적기에서
+  ─────────────────         ───────────────────────          ─────────────────────
+  Context                   Template                         TraceTemplate
+  Strategy (인자로 전달)    Callback                         TraceCallback<T>
+  execute(strategy)         execute(callback)                execute(message, callback)</pre>
+
+<p>이름을 템플릿 "메서드"와 혼동하지 말자. 템플릿 메서드 패턴은 상속으로, 템플릿 콜백 패턴은 위임으로 구멍을 채운다. 둘에 "템플릿"이라는 말이 공통으로 들어간 것은 둘 다 "변하지 않는 뼈대"를 가리키기 때문이다.</p>
+
+<h3>로그 추적기에 템플릿 콜백 적용하기</h3>
+
+<p>콜백 인터페이스와 템플릿을 만든다. 콜백은 핵심 기능의 반환값을 돌려줘야 하므로 제네릭 인터페이스로 만들고, 템플릿의 <code>execute</code>는 제네릭 메서드로 만든다.</p>
+
+<pre><code class="language-java">@FunctionalInterface
+public interface TraceCallback<T> {
+    T call();
+}
+
+public class TraceTemplate {
+
+    private final Tracer tracer;
+
+    public TraceTemplate(Tracer tracer) {
+        this.tracer = tracer;
+    }
+
+    public <T> T execute(String message, TraceCallback<T> callback) {
+        Span span = tracer.begin(message);
+        try {
+            T result = callback.call();   // 콜백: 넘겨받은 코드를 여기서 실행한다
+            tracer.end(span);
+            return result;
+        } catch (Exception e) {
+            tracer.fail(span, e);
+            throw e;
+        }
+    }
+}</code></pre>
+
+<p><code>@FunctionalInterface</code>는 없어도 람다를 쓸 수 있다. 이 애노테이션은 "이 인터페이스는 함수형 인터페이스로 쓰려는 것"이라는 의도를 밝히고, 누가 실수로 추상 메서드를 하나 더 추가하면 컴파일 오류가 나게 한다. 콜백 인터페이스처럼 람다로 쓰일 것이 확실한 인터페이스에 붙여 두면, 인터페이스를 고치는 사람이 람다를 쓰는 수많은 호출 지점을 한꺼번에 깨뜨리는 일을 막을 수 있다.</p>
+
+<p><code>TraceTemplate</code>의 필드는 생성자에서 정해지는 <code>tracer</code> 하나뿐이고, 실행 중에는 바뀌지 않는다. 앞 절에서 본 무상태 컨텍스트다. 그래서 스프링에서는 <code>TraceTemplate</code>을 빈 하나로 등록해 모든 계층이 주입받아 공유하면 된다. 깊이와 트랜잭션 번호 같은 실행별 상태는 <code>Tracer</code> 구현 안의 <code>ThreadLocal</code>(스레드마다 따로)과 <code>execute()</code>의 지역 변수 <code>span</code>(호출마다 따로)에 있다.</p>
+
+<pre><code class="language-java">class LoanRepositoryV2 {
+
+    private final TraceTemplate template;
+
+    LoanRepositoryV2(TraceTemplate template) {
+        this.template = template;
+    }
+
+    void save(String bookId) {
+        template.execute("LoanRepositoryV2.save()", () -> {
+            if (bookId.equals("lost")) {
+                throw new IllegalStateException("분실된 도서");
+            }
+            LoanRepositoryV1.sleep(10);
+            return null;
+        });
+    }
+}
+
+class LoanServiceV2 {
+
+    private final LoanRepositoryV2 loanRepository;
+    private final TraceTemplate template;
+
+    LoanServiceV2(LoanRepositoryV2 loanRepository, TraceTemplate template) {
+        this.loanRepository = loanRepository;
+        this.template = template;
+    }
+
+    void borrow(String bookId) {
+        template.execute("LoanServiceV2.borrow()", () -> {
+            loanRepository.save(bookId);
+            return null;
+        });
+    }
+}
+
+class LoanControllerV2 {
+
+    private final LoanServiceV2 loanService;
+    private final TraceTemplate template;
+
+    LoanControllerV2(LoanServiceV2 loanService, TraceTemplate template) {
+        this.loanService = loanService;
+        this.template = template;
+    }
+
+    String borrow(String bookId) {
+        return template.execute("LoanControllerV2.borrow()", () -> {
+            loanService.borrow(bookId);
+            return "ok";
+        });
+    }
+}</code></pre>
+
+<pre><code class="language-java">TraceTemplate template = new TraceTemplate(new ConsoleTracer());
+LoanControllerV2 controller = new LoanControllerV2(
+        new LoanServiceV2(new LoanRepositoryV2(template), template), template);
+
+System.out.println(controller.borrow("b-200"));
+try {
+    controller.borrow("lost");
+} catch (IllegalStateException e) {
+    System.out.println("호출자가 받은 예외: " + e.getMessage());
+}</code></pre>
+
+<pre data-label="실행 결과 (괄호 안의 시간은 실행마다 다르다)"><code class="language-text">[tx=1] → LoanControllerV2.borrow()
+[tx=1]   → LoanServiceV2.borrow()
+[tx=1]     → LoanRepositoryV2.save()
+[tx=1]     ← LoanRepositoryV2.save() (15ms)
+[tx=1]   ← LoanServiceV2.borrow() (15ms)
+[tx=1] ← LoanControllerV2.borrow() (15ms)
+ok
+[tx=2] → LoanControllerV2.borrow()
+[tx=2]   → LoanServiceV2.borrow()
+[tx=2]     → LoanRepositoryV2.save()
+[tx=2]     x LoanRepositoryV2.save() java.lang.IllegalStateException: 분실된 도서
+[tx=2]   x LoanServiceV2.borrow() java.lang.IllegalStateException: 분실된 도서
+[tx=2] x LoanControllerV2.borrow() java.lang.IllegalStateException: 분실된 도서
+호출자가 받은 예외: 분실된 도서</code></pre>
+
+<p>출력은 템플릿 메서드 버전과 같은 형태이고, 각 메서드의 부가 코드는 "<code>template.execute(이름, () -> { ... });</code>"라는 한 겹으로 줄었다. 익명 클래스 선언, <code>@Override</code>, 메서드 시그니처가 사라졌다. 컴파일하면 <code>LoanRepositoryV1$1.class</code> 같은 파일도 생기지 않는다.</p>
+
+<h4>타입 추론과 Void</h4>
+
+<p><code>execute</code>의 타입 매개변수 <code>T</code>는 호출할 때 명시하지 않았다. 컴파일러가 람다의 반환문에서 추론한다. 컨트롤러의 람다는 <code>"ok"</code>를 반환하므로 <code>T</code>는 <code>String</code>이 되고, <code>execute</code>의 반환 타입도 <code>String</code>이 되어 <code>return template.execute(...)</code>가 그대로 컴파일된다. 서비스의 람다는 반환문이 <code>return null;</code>뿐이고 호출하는 쪽도 결과를 쓰지 않으므로 <code>T</code>는 <code>Object</code>로 추론된다. 반환값이 없는 콜백을 위해 <code>Runnable</code>을 받는 오버로드를 따로 둘 수도 있지만, 그러면 같은 이름의 메서드에 람다를 넘길 때 어느 오버로드인지 판단하는 규칙이 끼어든다. 한 가지 콜백 타입에 <code>return null;</code>을 쓰는 쪽이 단순하다.</p>
+
+<h4>검사 예외는 콜백 시그니처가 정한다</h4>
+
+<p>파일을 읽는 코드를 추적해 보려고 하면 문제가 생긴다.</p>
+
+<pre><code class="language-java">String read(TraceTemplate template, Path path) {
+    return template.execute("read", () -> Files.readString(path));
+}</code></pre>
+
+<pre data-label="컴파일 오류 (JDK 21 javac)"><code class="language-text">Io.java:4: error: unreported exception IOException; must be caught or declared to be thrown
+        return template.execute("read", () -> Files.readString(path));
+                                                              ^</code></pre>
+
+<p>람다 본문은 결국 <code>TraceCallback.call()</code>의 구현이다. <code>call()</code>이 검사 예외를 선언하지 않았으므로 그 구현인 람다 본문도 검사 예외를 밖으로 던질 수 없다. 방법은 세 가지다. 람다 안에서 잡아 비검사 예외로 감싸거나, 콜백 시그니처를 <code>T call() throws Exception;</code>으로 바꾸거나, 검사 예외를 받는 콜백 타입을 따로 둔다. 시그니처를 바꾸면 앞에서 본 대로 템플릿의 <code>throw e</code>가 컴파일되지 않으므로 템플릿도 <code>throws Exception</code>을 선언해야 하고, 그러면 이번에는 템플릿을 부르는 모든 메서드가 <code>Exception</code>을 처리해야 한다. <code>java.util.concurrent.Callable</code>의 <code>call()</code>이 <code>throws Exception</code>을 선언한 것은 이 선택의 한쪽 끝이다.</p>
+
+<p>스프링의 콜백 인터페이스들도 이 결정을 각자 다르게 내렸다. <code>TransactionCallback</code>의 <code>doInTransaction(TransactionStatus)</code>은 검사 예외를 선언하지 않고 <code>@FunctionalInterface</code>가 붙어 있다. 반면 <code>JdbcTemplate</code>이 받는 <code>ConnectionCallback</code>의 <code>doInConnection(Connection)</code>은 <code>throws SQLException, DataAccessException</code>을 선언한다. JDBC 코드는 거의 모든 메서드가 <code>SQLException</code>을 던지므로 콜백 안에서 그것을 그대로 던지게 해 주고, 템플릿이 받아서 스프링의 <code>DataAccessException</code> 계층으로 변환해 준다. 콜백 시그니처의 <code>throws</code> 절은 "예외 처리라는 변하지 않는 부분을 누가 맡는가"를 정하는 자리다.</p>
+
+<h4>호출 스택으로 본 템플릿 콜백</h4>
+
+<p>서비스 계층의 람다가 실행되는 순간의 스택을 위에서 아래로(나중에 호출된 프레임이 아래) 그려 보면, 템플릿과 콜백이 서로를 어떻게 감싸는지 보인다. 서비스의 람다는 인스턴스 필드 <code>loanRepository</code>를 쓰므로 바깥 <code>this</code>를 포획하고, 본문은 <code>LoanServiceV2</code>의 <code>private</code> 인스턴스 메서드가 된다. javap로 보면 <code>private java.lang.Object lambda$borrow$0(java.lang.String)</code>이고, <code>invokedynamic</code>의 설명자는 <code>(LLoanServiceV2;Ljava/lang/String;)LTraceCallback;</code>로 바깥 객체와 <code>bookId</code>를 함께 받는다. 반환 타입이 <code>Object</code>인 것은 앞에서 말한 대로 <code>T</code>가 <code>Object</code>로 추론되었기 때문이다. 반면 리포지토리의 람다는 <code>bookId</code>만 쓰므로 <code>private static</code> 메서드 <code>lambda$save$0(String)</code>이 된다.</p>
+
+<pre class="diagram">  LoanControllerV2.borrow           (컨트롤러 메서드)
+   └ TraceTemplate.execute          (span = 컨트롤러 구간)
+      └ [숨은 클래스].call
+         └ LoanControllerV2.lambda$borrow$0
+            └ LoanServiceV2.borrow
+               └ TraceTemplate.execute          (span = 서비스 구간)
+                  └ [숨은 클래스].call
+                     └ LoanServiceV2.lambda$borrow$0      ← 지금 여기
+                        └ LoanRepositoryV2.save  ...
+
+  같은 TraceTemplate 객체의 execute 프레임이 두 개 쌓여 있고, 각 프레임은 자기 span을 갖는다.</pre>
+
+<p>같은 템플릿 객체의 같은 메서드가 한 스레드의 스택에 여러 번 쌓여 있어도 문제가 없는 이유가 바로 앞 절의 내용이다. 구간마다 달라야 하는 <code>span</code>은 각 <code>execute</code> 프레임의 지역 변수에 있고, 템플릿 객체에는 바뀌는 상태가 없다.</p>
+
+<h3>스프링 안의 템플릿 콜백: TransactionTemplate과 JdbcTemplate</h3>
+
+<p>스프링 DB 1편과 2편에서 쓴 두 템플릿을 이 회차의 눈으로 다시 보자. 아래는 Spring Framework 6.2의 <code>TransactionTemplate.execute()</code>에서 구조만 간추린 것이다(트랜잭션 매니저가 콜백 실행을 직접 맡겠다고 하는 특수한 경우의 분기는 뺐다).</p>
+
+<pre><code class="language-java">// TransactionTemplate.execute()의 구조 (Spring Framework 6.2 소스에서 간추림)
+public <T> T execute(TransactionCallback<T> action) throws TransactionException {
+    TransactionStatus status = this.transactionManager.getTransaction(this);   // 앞부분: 트랜잭션 시작
+    T result;
+    try {
+        result = action.doInTransaction(status);                               // 콜백
+    }
+    catch (RuntimeException | Error ex) {
+        rollbackOnException(status, ex);                                        // 예외 경로: 롤백 후 재던지기
+        throw ex;
+    }
+    catch (Throwable ex) {
+        rollbackOnException(status, ex);
+        throw new UndeclaredThrowableException(ex, "TransactionCallback threw undeclared checked exception");
+    }
+    this.transactionManager.commit(status);                                     // 뒷부분: 커밋
+    return result;
+}</code></pre>
+
+<p>우리의 <code>TraceTemplate</code>과 모양이 같다. <code>begin</code> 대신 <code>getTransaction</code>, <code>end</code> 대신 <code>commit</code>, <code>fail</code> 대신 <code>rollbackOnException</code>이 들어갔을 뿐이다. <code>RuntimeException</code>과 <code>Error</code>는 롤백한 뒤 그대로 다시 던진다. <code>doInTransaction</code>은 검사 예외를 선언하지 않았는데도 <code>Throwable</code>을 한 번 더 잡는 것은, 선언되지 않은 검사 예외가 콜백에서 새어 나오는 경우(예외 메시지가 그 상황을 가리킨다)까지 롤백하고, 호출자에게는 비검사 예외인 <code>UndeclaredThrowableException</code>으로 감싸 전달하기 위해서다. 자바 컴파일러의 검사 예외 규칙은 javac가 강제하는 것이지 JVM이 강제하는 것이 아니어서, 다른 JVM 언어로 작성된 콜백 등은 선언 없이 검사 예외를 던질 수 있다.</p>
+
+<pre><code class="language-java">// transactionTemplate, loanRepository, stockRepository, bookId, memberId는 주변에 준비되어 있다고 가정한다
+Long loanId = transactionTemplate.execute(status -> {
+    Long id = loanRepository.insert(bookId, memberId);   // 핵심 기능
+    stockRepository.decrease(bookId);
+    return id;
+});</code></pre>
+
+<p>사용하는 쪽은 트랜잭션의 시작·커밋·롤백 코드를 한 줄도 쓰지 않는다. 그리고 이 람다는 <code>execute()</code>가 반환하기 전에, 같은 스레드에서 실행된다. 이 점이 중요하다. 스프링의 트랜잭션 동기화는 현재 트랜잭션의 커넥션을 스레드에 묶어 두는데(<code>DataSourceUtils</code>의 Javadoc은 현재 스레드에 묶인 커넥션을 인식한다고 설명한다), 동기 콜백이므로 콜백 안의 리포지토리 코드가 같은 스레드에서 그 커넥션을 찾아 쓸 수 있다. 콜백 안에서 다른 스레드로 작업을 넘기면 그 작업은 이 트랜잭션의 커넥션을 보지 못한다.</p>
+
+<p><code>JdbcTemplate</code>은 콜백이 여러 겹으로 겹친 예다. <code>query(String sql, RowMapper<T> rowMapper)</code>를 부르면 내부에서 다음 순서로 감싸진다(Spring Framework 6.2 소스 기준).</p>
+
+<figure class="flow-figure"><figcaption>jdbcTemplate.query(sql, rowMapper) 한 번의 내부 흐름</figcaption><ol class="flow">
+<li><strong>RowMapper를 결과 집합 콜백으로 감싼다</strong><span><code>query(sql, rowMapper)</code>는 <code>RowMapper</code>를 <code>RowMapperResultSetExtractor</code>로 감싸 <code>query(sql, ResultSetExtractor)</code>에 넘긴다. 이 추출기의 <code>extractData()</code>는 <code>while (rs.next())</code> 루프를 돌며 행마다 <code>rowMapper.mapRow(rs, rowNum++)</code>를 부르고 결과를 리스트에 모은다.</span></li>
+<li><strong>문장 콜백을 만든다</strong><span><code>query(sql, ResultSetExtractor)</code>는 메서드 안에 지역 클래스 <code>QueryStatementCallback</code>을 선언한다. 그 <code>doInStatement(Statement)</code>는 <code>executeQuery(sql)</code>로 결과 집합을 얻어 추출기에 넘기고, <code>finally</code>에서 결과 집합을 닫는다.</span></li>
+<li><strong>뼈대 실행</strong><span><code>execute(StatementCallback, true)</code>가 커넥션을 얻고(<code>DataSourceUtils.getConnection</code>), <code>Statement</code>를 만들어 설정을 적용한 뒤 콜백을 부른다.</span></li>
+<li><strong>예외 변환</strong><span><code>SQLException</code>이 나면 문장을 닫고 커넥션을 먼저 반납한 뒤 <code>translateException</code>으로 스프링의 데이터 접근 예외로 바꿔 던진다.</span></li>
+<li><strong>정리</strong><span><code>finally</code>에서 문장을 닫고 커넥션을 반납한다(<code>DataSourceUtils.releaseConnection</code>). 트랜잭션에 묶인 커넥션이라면 실제로 닫지 않고 트랜잭션이 끝날 때까지 남겨 둔다.</span></li>
+</ol></figure>
+
+<p>여기서 <code>RowMapper</code>는 우리가 넘기는 가장 안쪽 콜백이고, <code>RowMapperResultSetExtractor</code>와 <code>QueryStatementCallback</code>은 스프링이 자기 내부에서 만들어 넘기는 콜백이다. 바깥 템플릿이 커넥션과 문장을, 가운데 콜백이 결과 집합을, 가장 안쪽 콜백이 한 행을 맡는다. 자원의 수명이 짧은 것일수록 안쪽에 있다. 우리가 작성하는 <code>mapRow</code>는 몇 번 불릴지, 언제 불릴지 스스로 정하지 않는다. 행이 열 개면 템플릿이 열 번 부른다. 할리우드 원칙이 데이터 접근 계층에서 구현된 모습이고, JDBC 연결을 직접 다루던 시절의 <code>try</code>/<code>catch</code>/<code>finally</code> 반복을 이 구조가 한곳으로 모았다. 스프링 자신도 콜백을 지역 클래스로 만들어 넘긴다는 점(<code>QueryStatementCallback</code>)도 눈여겨보자. 이 콜백은 <code>StatementCallback</code>과 함께 <code>SqlProvider</code>도 구현해 SQL 문자열을 돌려주는 두 번째 메서드(<code>getSql()</code>)까지 가지므로 람다로는 만들 수 없고 클래스여야 한다. 함수형 인터페이스는 메서드가 하나일 때만 람다로 쓸 수 있다.</p>
+
+<h3>정리: 세 방법을 한 표로, 그리고 남은 문제</h3>
+
+<div class="table-wrap"><table><thead><tr><th>구분</th><th>템플릿 메서드</th><th>전략(필드)</th><th>템플릿 콜백(전략을 파라미터로)</th></tr></thead><tbody>
+<tr><td>변하는 부분을 채우는 수단</td><td>상속, 추상 메서드 재정의</td><td>위임, 생성자로 받은 객체</td><td>위임, 실행할 때 받은 객체</td></tr>
+<tr><td>바이트코드의 구멍 호출</td><td><code>aload_0</code> + <code>invokevirtual</code></td><td><code>getfield</code> + <code>invokeinterface</code></td><td>지역 변수 + <code>invokeinterface</code></td></tr>
+<tr><td>람다 사용</td><td>불가(대상이 클래스)</td><td>가능</td><td>가능</td></tr>
+<tr><td>뼈대와 구멍의 결합</td><td>컴파일 시점의 <code>extends</code></td><td>인터페이스 하나</td><td>인터페이스 하나</td></tr>
+<tr><td>싱글톤으로 공유할 때</td><td>템플릿 객체가 곧 구멍이라 공유 단위가 아님</td><td>전략을 바꾸지 않으면 안전</td><td>무상태라 안전</td></tr>
+<tr><td>JDK·스프링의 예</td><td><code>AbstractList</code>, <code>HttpServlet</code>, <code>FrameworkServlet</code></td><td>주입받는 의존 객체 전반</td><td><code>JdbcTemplate</code>, <code>TransactionTemplate</code></td></tr>
+</tbody></table></div>
+
+<p>세 방법은 같은 원칙의 다른 구현이다. 변하지 않는 뼈대를 한곳에 두고, 변하는 부분을 끼워 넣을 수 있는 코드 조각으로 만든다. 그 코드 조각을 상속으로 주입하느냐, 객체로 건네느냐, 건넨다면 언제 건네느냐가 다를 뿐이다. 로그 추적기에는 무상태 템플릿 하나를 공유하면서 메서드마다 다른 핵심 기능을 넘기는 템플릿 콜백이 가장 잘 맞았다.</p>
+
+<p>그래도 해결되지 않은 것이 있다. 지금의 코드는 여전히 <b>모든 대상 메서드를 고쳐야</b> 한다. 컨트롤러·서비스·리포지토리의 메서드마다 핵심 기능을 <code>template.execute(...)</code>로 감싸는 코드를 넣어야 하고, 추적 대상 클래스가 백 개면 백 개를 수정해야 한다. 부가 기능의 "내용"은 한곳에 모았지만, 부가 기능을 "적용하는 코드"는 여전히 흩어져 있다. 원본 코드를 한 줄도 건드리지 않고 부가 기능을 붙이려면 호출하는 쪽과 호출되는 쪽 사이에 다른 객체를 끼워 넣어야 한다. 다음 03회의 프록시 패턴과 데코레이터 패턴이 그 출발점이고, 04회부터는 그 프록시를 클래스마다 손으로 만들지 않는 방법(동적 프록시, 스프링의 프록시 팩토리, 빈 후처리기, 스프링 AOP)으로 이어진다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>변하는 것과 변하지 않는 것의 분리</dt><dd>부가 기능 코드는 핵심 기능의 앞뒤와 예외 경로를 감싸므로 메서드 추출만으로는 모을 수 없다. 뼈대를 한곳에 두고 가운데에 들어갈 코드를 객체로 넘기는 것이 세 패턴의 공통 해법이다.</dd>
+<dt>템플릿 메서드 패턴</dt><dd>부모 클래스의 <code>final</code> 메서드가 알고리즘의 골격을 갖고, 변하는 단계를 추상 메서드로 남겨 자식이 재정의한다. 부모의 코드가 자식의 코드를 부르는 역전된 제어 구조다.</dd>
+<dt>invokevirtual과 메서드 선택</dt><dd>바이트코드에는 <code>TimedTemplate.call</code> 같은 기호 참조만 있고, 실행할 메서드는 호출 때마다 수신 객체의 실제 클래스에서 고른다(JVMS §5.4.6). HotSpot은 이를 vtable 칸 번호로 빠르게 처리한다.</dd>
+<dt>상속의 대가</dt><dd>자식이 부모의 필드·생성자·메서드에 통째로 묶이고, 부모는 하나뿐이며, 생성자에서의 가상 호출 함정이 있고, 대상이 클래스라 람다를 쓸 수 없다.</dd>
+<dt>전략 패턴</dt><dd>뼈대를 가진 컨텍스트가 전략 인터페이스에만 의존하고 실제 전략은 바깥에서 받는다. 필드로 받으면 선 조립 후 실행, 파라미터로 받으면 호출마다 다른 전략을 쓸 수 있다.</dd>
+<dt>변수 포획과 effectively final</dt><dd>익명 클래스와 람다는 바깥 지역 변수의 값을 자기 필드에 복사해 간다. 복사본과 원본이 갈라지지 않도록 포획 대상은 final이거나 사실상 final이어야 한다.</dd>
+<dt>람다의 구현</dt><dd>본문은 바깥 클래스의 private 메서드가 되고, 람다 식 자리는 invokedynamic이 된다. 처음 실행될 때 LambdaMetafactory가 인터페이스를 구현하는 숨은 클래스를 만들고, 평가 결과 객체의 정체성은 명세상 예측할 수 없다.</dd>
+<dt>템플릿 콜백 패턴</dt><dd>전략을 실행 시점에 인자로 넘기는 전략 패턴을 스프링에서 부르는 이름이다. 템플릿이 무상태가 되어 싱글톤으로 공유할 수 있고, JdbcTemplate과 TransactionTemplate이 이 구조다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 "공통 처리"를 만들 일이 생기면 먼저 그 공통 처리가 핵심 코드의 어디에 붙는지 본다. 앞이나 뒤에만 붙는다면 메서드 추출이나 필터·인터셉터 같은 기존 확장 지점으로 충분하다. 핵심 코드를 감싸야 한다면(시작과 종료, 예외 시 롤백, 자원 획득과 반납) 템플릿 콜백이 가장 먼저 검토할 형태다. 이때 템플릿을 무상태로 만들어 싱글톤 빈으로 공유할 수 있는지, 실행별 상태는 지역 변수나 콜백 인자로 흘러가는지 확인하는 것이 핵심 점검 항목이다. 템플릿에 실행별 상태를 필드로 두는 순간 동시 요청에서 01회의 문제가 그대로 돌아온다.</p>
+<p>콜백 인터페이스를 설계할 때는 시그니처가 곧 계약이다. 검사 예외를 허용할지(<code>ConnectionCallback</code>처럼), 막을지(<code>TransactionCallback</code>처럼)에 따라 호출하는 쪽의 코드 모양이 달라진다. 반환값이 필요한지, 콜백이 같은 스레드에서 동기로 실행된다고 보장할 수 있는지도 정해야 한다. 트랜잭션처럼 스레드에 묶인 자원을 쓰는 템플릿에서 콜백 안의 작업을 다른 스레드로 넘기면, 콜백 코드는 템플릿이 준비한 자원을 보지 못한다. "콜백은 템플릿이 반환하기 전에 같은 스레드에서 끝난다"는 가정이 깨지는 코드를 리뷰에서 찾아내야 하는 이유다.</p>
+<p>템플릿 메서드 패턴이 나쁜 것은 아니다. 프레임워크가 확장 지점을 제공할 때, 특히 구멍이 여러 개이고 그 사이의 호출 순서와 기본 동작(훅)을 프레임워크가 엄격히 통제해야 할 때는 여전히 유효하다. <code>HttpServlet</code>, <code>AbstractList</code>, <code>FrameworkServlet</code>이 그런 예다. 판단 기준은 "구멍을 채우는 쪽이 부모의 다른 것을 얼마나 필요로 하는가"다. 구멍이 하나이고 부모의 다른 기능이 필요 없다면 위임과 람다가 낫다. 그리고 어느 쪽이든 대상 코드마다 적용 코드를 넣어야 한다는 한계는 남으므로, 적용 대상이 많아지면 03회 이후의 프록시와 AOP로 넘어갈 시점이다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 두 코드 조각 중 컴파일되는 것을 고르고, 컴파일되는 쪽의 실행 결과를 적어라. 컴파일되지 않는 쪽은 오류 이유를 JLS의 규칙으로 설명하라. (가) <code>for (String name : List.of("a", "b", "c")) { tasks.add(() -> System.out.println(name)); }</code> 뒤에 <code>tasks.forEach(Runnable::run);</code> (나) <code>for (int i = 0; i < 3; i++) { tasks.add(() -> System.out.println(i)); }</code> (<code>tasks</code>는 <code>List<Runnable></code>)</li>
+<li>한 소스 파일 <code>Outer.java</code> 안에 익명 클래스 2개와 람다 3개가 있다. 컴파일 직후 생기는 클래스 파일의 이름과 개수를 적고, 프로그램이 람다 3개를 모두 실행한 시점에 JVM 안에 추가로 생기는 클래스가 무엇인지, 그 클래스를 <code>Class.forName</code>으로 찾을 수 있는지 설명하라.</li>
+<li>싱글톤으로 공유되는 <code>MutableContext</code>(본문의 세터가 있는 버전)에 대해 다음 순서로 일이 일어났다. 스레드 A: <code>setStrategy(a)</code> → 스레드 B: <code>setStrategy(b)</code> → 스레드 A: <code>execute()</code> → 스레드 B: <code>execute()</code>. 각 스레드에서 어느 전략이 실행되는지 쓰고, 이 문제를 없애도록 <code>MutableContext</code>를 고쳐라. 고친 뒤에 스택과 힙에 무엇이 있는지 그림으로 그려라.</li>
+<li>다음 코드의 실행 결과를 예측하고, 왜 그런지 객체 생성 순서로 설명하라. <code>abstract class Report { Report() { render(); } final void render() { System.out.println("머리글"); body(); System.out.println("바닥글"); } protected abstract void body(); }</code> / <code>class SalesReport extends Report { private final String region = String.valueOf("서울"); private int count = 3; protected void body() { System.out.println("지역=" + region + ", 건수=" + count); } }</code> / <code>main</code>에서 <code>SalesReport r = new SalesReport(); r.render();</code></li>
+<li><code>TraceCallback</code>을 <code>T call() throws Exception;</code>으로 바꾸었다. 본문의 <code>TraceTemplate</code>에서 컴파일 오류가 나는 줄과 이유를 쓰고, 호출하는 쪽에 검사 예외 처리를 강요하지 않으면서 오류를 없애는 방법 두 가지를 제시하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> (가)만 컴파일된다. 실행 결과는 <code>a</code>, <code>b</code>, <code>c</code>가 한 줄씩 찍힌다. JLS §15.27.2의 설명대로 향상된 for 문의 변수는 반복마다 별개의 변수로 취급되어 각 변수가 다시 대입되지 않으므로 사실상 final이다. 람다 세 개는 각자 다른 <code>name</code> 값을 복사해 간다. (나)의 <code>i</code>는 하나의 변수이고 <code>i++</code>로 계속 다시 대입되므로 사실상 final이 아니다. javac는 <code>local variables referenced from a lambda expression must be final or effectively final</code>로 거부한다. 고치려면 루프 안에서 <code>int n = i;</code>처럼 새 지역 변수에 복사해 그것을 포획한다.</p>
+<p><b>2.</b> 컴파일 직후에는 <code>Outer.class</code>, <code>Outer$1.class</code>, <code>Outer$2.class</code>의 3개가 생긴다. 람다는 클래스 파일을 만들지 않고, 본문이 <code>Outer</code> 안의 <code>private</code> 메서드 <code>lambda$...</code>로 들어가며 람다 자리에는 <code>invokedynamic</code>이 놓인다. 실행 중 각 람다의 <code>invokedynamic</code> 지점이 처음 실행될 때 <code>LambdaMetafactory</code>가 지점마다 하나씩, 모두 3개의 숨은 클래스(<code>Outer$$Lambda/0x...</code> 형태의 이름, 뒷부분은 실행마다 다를 수 있음)를 만든다. 숨은 클래스는 JEP 371에 따라 <code>Class.forName</code>이나 <code>ClassLoader.loadClass</code>로 찾을 수 없다. 이름을 얻어 <code>Class.forName</code>에 넘기면 <code>ClassNotFoundException</code>이 난다.</p>
+<p><b>3.</b> 두 스레드 모두 b를 실행한다. <code>strategy</code> 필드는 힙의 객체 하나에 있는 칸 하나이고, A가 실행하기 전에 B가 덮어썼기 때문이다(동기화가 없으므로 A가 B의 쓰기를 언제 보게 되는지도 보장되지 않는다. 다른 순서와 타이밍에서는 A가 a를 실행할 수도 있다는 뜻이고, 결과가 실행 타이밍에 달려 있다는 것 자체가 버그다). 고치는 방법은 필드와 세터를 없애고 <code>execute(Strategy strategy)</code>처럼 파라미터로 받는 것이다. 그러면 힙에는 필드 없는 컨텍스트 객체 하나만 있고, 각 스레드의 스택에 있는 <code>execute()</code> 프레임의 지역 변수 칸이 각자 자기 전략(a 또는 b)을 가리킨다.</p>
+<p><b>4.</b> 출력은 "머리글 / 지역=null, 건수=0 / 바닥글 / 머리글 / 지역=서울, 건수=3 / 바닥글"이다(실제로 JDK 21에서 이렇게 나온다). JLS §12.5에 따라 <code>new SalesReport()</code>는 먼저 상위 클래스 생성자 <code>Report()</code>를 실행하고, 그것이 끝난 뒤에야 <code>SalesReport</code>의 인스턴스 변수 초기화(<code>region</code>, <code>count</code>)를 실행한다. <code>Report()</code> 안의 <code>render()</code>가 부르는 <code>body()</code>는 객체의 실제 클래스 기준으로 선택되므로 <code>SalesReport.body()</code>가 실행되지만, 그 시점의 필드는 아직 기본값 <code>null</code>과 <code>0</code>이다. 두 번째 <code>render()</code>는 생성이 끝난 뒤라 정상 값이 나온다. <code>region</code>을 상수 식 <code>"서울"</code>로 초기화했다면 상수 변수가 되어 읽는 자리에 값이 박혀 컴파일되므로 첫 줄에도 "서울"이 찍힌다. 그래서 일부러 <code>String.valueOf</code>를 썼다.</p>
+<p><b>5.</b> 오류는 <code>catch</code> 블록의 <code>throw e;</code>에서 난다. <code>try</code> 블록의 <code>callback.call()</code>이 <code>Exception</code>을 던질 수 있게 되어, JLS §11.2.2의 정밀한 재던지기 분석으로도 <code>throw e</code>가 검사 예외 <code>Exception</code>을 던질 수 있다고 판단되기 때문이다(<code>unreported exception Exception; must be caught or declared to be thrown</code>). 첫째 방법: <code>catch</code>에서 <code>RuntimeException</code>이면 그대로 던지고, 그렇지 않으면 <code>new RuntimeException(e)</code>(또는 전용 비검사 예외)로 감싸 던진다. <code>TransactionTemplate</code>이 <code>UndeclaredThrowableException</code>으로 감싸는 것과 같은 방식이다. 둘째 방법: 콜백 시그니처를 원래대로 검사 예외 없이 두고, 검사 예외가 필요한 코드는 람다 안에서 잡아 비검사 예외로 바꾸게 한다. 어느 쪽이든 템플릿의 <code>execute</code>는 검사 예외를 선언하지 않으므로 호출하는 쪽은 처리를 강요받지 않는다. 대신 원래 예외는 원인(cause)으로 보존해야 디버깅할 때 잃지 않는다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>TraceTemplateBase<T></code>는 추상 메서드가 <code>call()</code> 하나뿐인데도 <code>TraceTemplateBase<String> t = () -> "ok";</code>가 컴파일되지 않는다. 가장 정확한 이유는?</q>
+<o><code>call()</code>이 <code>protected</code>라서 람다가 접근할 수 없다.</o>
+<o>람다의 대상 타입은 함수형 인터페이스여야 하는데, 함수형 인터페이스는 인터페이스로만 정의되며 추상 클래스는 해당하지 않는다.</o>
+<o>제네릭 클래스는 람다의 대상 타입이 될 수 없다.</o>
+<o><code>final</code> 메서드 <code>execute()</code>가 있는 타입은 람다로 구현할 수 없다.</o>
+<why>JLS §9.8은 함수형 인터페이스를 추상 메서드가 하나인 인터페이스로 정의하고, javac는 <code>is not a functional interface</code>로 거부한다. 접근 제한자는 원인이 아니고, <code>TraceCallback<T></code>처럼 제네릭 인터페이스는 람다 대상이 될 수 있다. 인터페이스라면 default 메서드가 있어도 상관없으므로 다른 메서드의 존재 자체도 원인이 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>TimedTemplate.execute()</code>의 바이트코드에 있는 <code>invokevirtual #13 // Method call:()V</code>가 실행될 때 실제로 실행할 메서드는 무엇으로 정해지는가?</q>
+<o>컴파일 시점에 javac가 하위 클래스 목록을 보고 정해 상수 풀에 기록해 둔다.</o>
+<o>변수의 선언 타입(<code>TimedTemplate</code>)에 정의된 메서드가 실행되며, 추상 메서드이므로 <code>AbstractMethodError</code>가 난다.</o>
+<o>피연산자 스택에 있는 수신 객체(<code>this</code>)의 실행 시점 클래스에서 시작해 상위 클래스 방향으로 재정의 선언을 찾아 고른다.</o>
+<o>처음 호출될 때 한 번 정해지고, 이후에는 다른 하위 클래스 객체가 와도 같은 메서드가 실행된다.</o>
+<why>JVMS §5.4.6의 메서드 선택은 수신 객체의 실행 시점 타입과 해석된 메서드를 기준으로 호출마다 이루어진다. javac는 하위 클래스를 모르고 기호 참조만 남긴다. 해석은 한 번이지만 선택은 수신 객체에 따라 달라지므로, 같은 바이트코드가 객체마다 다른 <code>call()</code>을 실행한다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>추적 템플릿을 스프링 싱글톤 빈 하나로 등록해 여러 요청 스레드가 동시에 쓰게 하려 한다. 스레드 안전성 관점에서 가장 알맞은 설계는?</q>
+<o>템플릿에는 바뀌지 않는 의존 객체만 두고, 핵심 기능은 <code>execute(message, callback)</code>의 인자로 받으며, 구간별 상태는 <code>execute()</code>의 지역 변수에 둔다.</o>
+<o>템플릿에 <code>setCallback()</code>을 두고, 각 메서드가 콜백을 설정한 다음 <code>execute()</code>를 부른다.</o>
+<o>템플릿에 현재 구간 정보를 담는 인스턴스 필드를 두고 <code>execute()</code> 시작 시 갱신한다.</o>
+<o>메서드마다 <code>TraceTemplateBase</code>의 익명 하위 클래스를 싱글톤 빈으로 하나씩 등록한다.</o>
+<why>파라미터로 받은 콜백과 지역 변수는 호출 스레드의 스택 프레임에 있으므로 스레드끼리 섞이지 않고, 템플릿 객체는 무상태가 된다. 세터나 인스턴스 필드는 힙의 공유 칸이라 동시 요청이 서로 덮어쓴다. 익명 하위 클래스를 빈으로 등록하는 방식은 동작은 하더라도 메서드마다 빈이 생겨 공유라는 목적에 맞지 않고, 핵심 기능 코드가 빈 정의로 흩어진다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>HotSpot JDK 21에서 아무것도 포획하지 않는 람다를 루프 안에서 세 번 평가했더니 <code>System.identityHashCode</code> 값이 세 번 모두 같았다. 이 관찰에 대한 설명으로 옳은 것은?</q>
+<o>JLS가 비포획 람다는 항상 같은 인스턴스를 돌려준다고 보장하므로 <code>==</code> 비교로 같은 전략인지 판단해도 된다.</o>
+<o>람다는 컴파일 시점에 <code>Outer$1.class</code>로 만들어지고 static 필드에 저장되기 때문이다.</o>
+<o>identityHashCode는 클래스마다 하나의 값을 돌려주기 때문에 객체가 달라도 같다.</o>
+<o>구현이 상태 없는 람다 객체를 재사용한 결과일 뿐이며, JLS §15.27.4는 평가 결과의 정체성을 예측할 수 없다고 정하므로 이에 의존하면 안 된다.</o>
+<why>JLS §15.27.4는 새 인스턴스를 만들 수도, 기존 인스턴스를 참조할 수도 있다고만 정하고, 정체성에 민감한 연산의 결과가 구현이나 평가마다 다를 수 있다고 명시한다. 람다는 클래스 파일이 아니라 실행 중 LambdaMetafactory가 만든 숨은 클래스로 구현된다. identityHashCode는 객체마다의 값이며, 실제로 포획 람다는 평가마다 다른 값을 보였다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>jdbcTemplate.query("select ...", rowMapper)</code>의 결과 행이 10개일 때, 다음 중 옳은 것은? (Spring Framework 6.2 기준)</q>
+<o>우리 코드가 <code>ResultSet</code>을 돌며 <code>mapRow</code>를 10번 부르고, 커넥션 반납도 우리가 해야 한다.</o>
+<o>템플릿 쪽 코드(<code>RowMapperResultSetExtractor</code>)가 <code>rs.next()</code> 루프에서 <code>mapRow</code>를 10번 부르고, 커넥션 획득·반납과 <code>SQLException</code> 변환은 <code>execute</code>의 뼈대가 맡는다.</o>
+<o><code>mapRow</code>는 결과 전체에 대해 한 번 불리고, 우리가 루프를 돌아야 한다.</o>
+<o><code>mapRow</code>는 별도 스레드에서 비동기로 불리므로 트랜잭션의 커넥션을 볼 수 없다.</o>
+<why>소스에서 <code>query(sql, RowMapper)</code>는 <code>RowMapperResultSetExtractor</code>로 감싸고, 그 <code>extractData</code>가 <code>while (rs.next())</code>로 행마다 <code>mapRow(rs, rowNum++)</code>를 부른다. 커넥션 획득과 반납, 예외 변환은 <code>execute(StatementCallback, true)</code>의 뼈대에 있다. 콜백은 모두 같은 스레드에서 동기로 실행된다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>템플릿 메서드 패턴(Template Method pattern)</dt><dd>상위 클래스의 메서드에 알고리즘의 골격을 두고, 변하는 단계를 하위 클래스가 재정의하도록 추상 메서드나 훅 메서드로 남기는 패턴.</dd>
+<dt>훅 메서드(hook method)</dt><dd>기본 동작(흔히 빈 구현)을 가진 채로 골격에서 호출되어, 하위 클래스가 원할 때만 재정의하는 메서드.</dd>
+<dt>전략 패턴(Strategy pattern)</dt><dd>변하는 알고리즘을 인터페이스 뒤의 객체로 분리하고, 그것을 사용하는 컨텍스트가 인터페이스에만 의존하게 해 알고리즘을 바꿔 끼울 수 있게 하는 패턴.</dd>
+<dt>콜백(callback)</dt><dd>다른 코드에 인자로 넘겨져 그 코드가 적절한 때에 실행해 주는 코드 조각. 받은 메서드가 반환하기 전에 실행되면 동기 콜백이다.</dd>
+<dt>가상 메서드 호출(virtual method invocation)</dt><dd>실행할 메서드를 컴파일 시점이 아니라 실행 시점에 수신 객체의 실제 클래스로 고르는 호출. 바이트코드의 invokevirtual과 invokeinterface가 해당한다.</dd>
+<dt>변수 포획(variable capture)</dt><dd>익명 클래스나 람다가 바깥 지역 변수의 값, 또는 바깥 객체 참조를 자기 필드로 복사해 가는 것.</dd>
+<dt>사실상 final(effectively final)</dt><dd><code>final</code>로 선언하지 않았어도 초기화 후 다시 대입되지 않는 변수. 내부 클래스와 람다는 이런 변수만 포획할 수 있다(JLS §4.12.4).</dd>
+<dt>invokedynamic</dt><dd>처음 실행될 때 부트스트랩 메서드를 호출해 실제 동작을 연결하는 바이트코드 명령. 람다 객체 생성과 문자열 연결에 쓰인다.</dd>
+<dt>숨은 클래스(hidden class)</dt><dd>프레임워크가 실행 중에 정의하는 클래스로, 이름으로 발견되지 않아 <code>Class.forName</code>으로 찾을 수 없다. JDK 15(JEP 371)에서 도입되었고 람다 클래스가 이것으로 만들어진다.</dd>
+<dt>함수형 인터페이스(functional interface)</dt><dd>Object의 메서드를 제외하고 추상 메서드가 하나뿐인, sealed가 아닌 인터페이스. 람다 식과 메서드 참조의 대상 타입이 된다(JLS §9.8).</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-5.html#jvms-5.4.6">JVMS (Java SE 21) §5.4.6 Method Selection</a> — invokevirtual·invokeinterface가 수신 객체의 실행 시점 타입으로 메서드를 고르는 규칙</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html#jls-15.27">JLS (Java SE 21) §15.27 Lambda Expressions</a> — 포획 변수의 effectively final 규칙과 그 이유(§15.27.2), 람다 평가 결과의 정체성(§15.27.4)</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-11.html#jls-11.2.2">JLS (Java SE 21) §11.2.2 Exception Analysis of Statements</a> — catch 매개변수를 다시 던질 때의 정밀한 예외 분석</li>
+<li><a href="https://openjdk.org/jeps/371">JEP 371: Hidden Classes</a> — LambdaMetafactory가 람다 본문을 위한 숨은 클래스를 정의하며, 숨은 클래스는 Class::forName으로 발견되지 않는다</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-framework/6.2.x/spring-tx/src/main/java/org/springframework/transaction/support/TransactionTemplate.java">Spring Framework 6.2 TransactionTemplate 소스</a> — execute()의 트랜잭션 시작, 콜백, 롤백·커밋 구조</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-framework/6.2.x/spring-jdbc/src/main/java/org/springframework/jdbc/core/JdbcTemplate.java">Spring Framework 6.2 JdbcTemplate 소스</a> — execute(StatementCallback)의 뼈대와 query()가 콜백을 겹겹이 감싸는 방식</li>
+</x-refs>

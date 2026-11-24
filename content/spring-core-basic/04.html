@@ -1,0 +1,820 @@
+<x-meta>
+deck: 요청마다 객체를 새로 만들 때의 문제에서 출발해 싱글톤 패턴의 한계, 스프링의 싱글톤 레지스트리, 무상태 설계, @Configuration을 CGLIB 자식 클래스로 바꾸는 바이트코드 조작까지 따라간다.
+minutes: 100
+</x-meta>
+
+<x-goals>
+<li>순수 자바 설정 클래스가 호출될 때마다 새 객체 그래프를 만든다는 것을 실행 결과로 확인하고, 객체를 공유해야 하는 이유를 정확성과 비용 두 측면에서 설명할 수 있다.</li>
+<li>싱글톤 패턴을 구현하고, 인스턴스가 한 번만 만들어지는 근거를 클래스 초기화 규칙(JLS §12.4)과 <code>static {}</code> 바이트코드로 설명하며, 이 패턴이 DIP·테스트·클래스 로더 면에서 치르는 값을 코드로 짚을 수 있다.</li>
+<li>스프링 컨테이너가 싱글톤을 보관하는 자료구조(<code>singletonObjects</code>)와 <code>getBean</code>이 그것을 읽는 경로를 그리고, 스프링의 싱글톤이 "컨테이너마다, 빈 정의마다 하나"라는 범위를 실행 결과로 보일 수 있다.</li>
+<li>필드에 요청별 값을 저장하는 싱글톤 빈에서 두 스레드의 값이 섞이는 과정을 힙과 스택 프레임으로 추적하고, 지역 변수와 반환값을 쓰는 무상태 코드로 고칠 수 있다.</li>
+<li><code>@Configuration</code> 클래스가 언제 어떤 자식 클래스로 바뀌는지, 그 자식이 <code>@Bean</code> 메서드 호출을 어떤 기준으로 가로채는지 설명하고, <code>@Configuration</code>이 없거나 <code>proxyBeanMethods = false</code>일 때의 결과를 예측할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>객체를 몇 개 만들 것인가</h3>
+<p>02회에서는 어떤 구현 객체를 만들어 누구에게 넘길지 결정하는 일을 설정 클래스 한 곳에 모았고, 03회에서는 그 설정을 읽어 객체를 만들고 이름으로 찾아 주는 스프링 컨테이너를 보았다. 두 회차가 다룬 질문은 "누가 객체를 만들고 연결하는가"였다. 이 회차의 질문은 그 다음이다. 그렇게 만든 객체는 <b>몇 개</b>인가.</p>
+<p>사소해 보이지만 답에 따라 프로그램의 성질이 달라진다. 요청마다 새 객체를 만들면 객체끼리 서로 영향을 주지 않는 대신, 함께 봐야 할 데이터가 공유되지 않고 만들고 버리는 비용이 요청 수에 비례해 늘어난다. 하나만 만들어 함께 쓰면 그 비용은 사라지지만 수백 개의 요청 스레드가 같은 객체의 같은 필드에 동시에 닿는다. 스프링은 기본값으로 후자를 택했고, 그 선택이 서비스 클래스를 작성하는 방식에 조건을 건다.</p>
+<p>이 회차는 다섯 단계로 간다. 먼저 요청마다 새로 만드는 방식이 왜 곤란한지 실행해서 확인한다. 다음으로 자바만으로 "하나"를 보장하는 싱글톤 패턴과, 그 패턴이 JVM의 클래스 초기화 규칙에 기대는 방식을 본다. 패턴의 비용을 따진 뒤에는 같은 보장을 클래스 밖으로 옮긴 스프링의 싱글톤 레지스트리를 소스 수준에서 따라간다. 이어서 객체가 하나일 때 필드에 무엇을 두면 안 되는지를 힙과 스택으로 설명하고, 마지막으로 <code>@Configuration</code> 클래스에서 자바 문법대로라면 일어날 수 없는 일이 왜 일어나는지를 생성된 바이트코드까지 열어 확인한다.</p>
+<aside class="note">이 회차의 실행 결과와 바이트코드는 원고를 쓰면서 JDK 21.0.13(Temurin)에서 직접 돌려 얻은 것이다. 스프링 실험에는 스프링 프레임워크 7.0.10을 썼고, 본문이 근거로 삼는 규칙(싱글톤 스코프의 정의, 즉시 초기화, 싱글톤 캐시의 자료구조, <code>@Configuration</code>의 CGLIB 처리와 제약, <code>proxyBeanMethods</code>)은 이 강좌의 기준 버전인 6.2의 레퍼런스 문서·Javadoc·소스에서 같은 내용을 따로 확인했다. 본문에 나오는 스프링 내부 클래스와 필드 이름은 공개 API가 아니므로 버전에 따라 달라질 수 있다.</aside>
+
+<h3>웹 애플리케이션과 싱글톤 — 요청마다 새로 만들면 생기는 일</h3>
+<p>웹 애플리케이션은 혼자 쓰는 프로그램과 한 가지가 다르다. 사용자가 여럿이고, 그들이 같은 시각에 요청을 보낸다. 스프링 입문 03회에서 본 것처럼 서블릿 컨테이너는 스레드 풀을 두고 들어오는 요청마다 스레드 하나를 배정하므로, 같은 순간에 여러 스레드가 같은 서비스 코드를 실행한다. 그렇다면 각 요청이 쓸 서비스 객체를 어떻게 마련할지 정해야 한다.</p>
+<p>가장 단순한 답은 "필요할 때마다 만든다"이다. 스프링 없이 자바만으로 쓴 설정 클래스가 정확히 그렇게 동작한다. 도서관의 대출과 검색을 예로 작은 객체 그래프를 만들어 보자. 리포지토리 하나를 서비스 둘이 함께 쓰는 구조다.</p>
+<pre><code class="language-java">public interface BookRepository {
+    void save(String isbn, String title);
+    String findTitle(String isbn);
+}
+
+public class MemoryBookRepository implements BookRepository {
+    private final Map<String, String> store = new ConcurrentHashMap<>();
+
+    public MemoryBookRepository() {
+        System.out.println("  new MemoryBookRepository()");
+    }
+
+    @Override public void save(String isbn, String title) { store.put(isbn, title); }
+    @Override public String findTitle(String isbn) { return store.get(isbn); }
+}
+
+public class LoanService {
+    private final BookRepository bookRepository;
+
+    public LoanService(BookRepository bookRepository) {
+        this.bookRepository = bookRepository;
+    }
+
+    public BookRepository getBookRepository() { return bookRepository; }   // 실험용
+}
+
+public class SearchService {
+    private final BookRepository bookRepository;
+
+    public SearchService(BookRepository bookRepository) {
+        this.bookRepository = bookRepository;
+    }
+
+    public BookRepository getBookRepository() { return bookRepository; }   // 실험용
+}
+
+public class LibraryConfig {
+    public BookRepository bookRepository() {
+        System.out.println("call LibraryConfig.bookRepository()");
+        return new MemoryBookRepository();
+    }
+
+    public LoanService loanService() {
+        System.out.println("call LibraryConfig.loanService()");
+        return new LoanService(bookRepository());
+    }
+
+    public SearchService searchService() {
+        System.out.println("call LibraryConfig.searchService()");
+        return new SearchService(bookRepository());
+    }
+}</code></pre>
+<p>이 설정 클래스에 세 번의 요청이 들어왔다고 하고, 요청마다 필요한 서비스를 꺼내 본다.</p>
+<pre><code class="language-java">public class PlainMain {
+    public static void main(String[] args) {
+        LibraryConfig config = new LibraryConfig();
+
+        LoanService loan = config.loanService();          // 요청 1: 대출
+        SearchService search = config.searchService();    // 요청 2: 검색
+        System.out.println("same repository? "
+                + (loan.getBookRepository() == search.getBookRepository()));
+
+        LoanService loan2 = config.loanService();         // 요청 3: 대출
+        System.out.println("same service? " + (loan == loan2));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">call LibraryConfig.loanService()
+call LibraryConfig.bookRepository()
+  new MemoryBookRepository()
+call LibraryConfig.searchService()
+call LibraryConfig.bookRepository()
+  new MemoryBookRepository()
+same repository? false
+call LibraryConfig.loanService()
+call LibraryConfig.bookRepository()
+  new MemoryBookRepository()
+same service? false</code></pre>
+<p>결과는 자바 문법 그대로다. 메서드 본문에 <code>new</code>가 있으므로 호출할 때마다 힙에 새 객체가 생긴다. 요청 세 번에 서비스 객체 셋과 리포지토리 객체 셋, 모두 여섯 개가 만들어졌다. 두 <code>==</code> 비교는 참조가 같은 객체를 가리키는지 묻는 것이므로 둘 다 <code>false</code>다.</p>
+<pre class="diagram">요청 1 ──▶ LoanService@1   ──▶ MemoryBookRepository@1 { store: {} }
+요청 2 ──▶ SearchService@1 ──▶ MemoryBookRepository@2 { store: {} }
+요청 3 ──▶ LoanService@2   ──▶ MemoryBookRepository@3 { store: {} }
+
+요청이 끝나면 각 줄의 객체는 아무도 가리키지 않게 되어 가비지 컬렉션 대상이 된다.</pre>
+<h4>첫째 문제는 정확성이다</h4>
+<p>비용보다 먼저 봐야 할 것이 있다. 이 구조에서는 프로그램이 틀리게 동작한다. 요청 1이 <code>MemoryBookRepository@1</code>의 맵에 책을 저장해도 요청 2의 검색은 <code>MemoryBookRepository@2</code>의 빈 맵을 본다. 저장소가 메모리가 아니라 데이터베이스라면 데이터는 DB에 있으니 괜찮아 보이지만, 그때는 커넥션 풀이 같은 자리에 선다. 커넥션 풀은 만들어 둔 연결을 여러 요청이 돌려 쓰게 하려는 물건이라, 요청마다 풀을 새로 만들면 풀의 의미가 없어진다. 캐시, 설정 값을 읽어 둔 객체, 외부 API 클라이언트도 같다. 여러 요청이 <b>같은 것</b>을 봐야 하는 객체가 애플리케이션에는 반드시 있다.</p>
+<h4>둘째 문제는 만들고 버리는 비용이다</h4>
+<p>공유할 데이터가 없는 서비스 객체라도 요청마다 만들면 그만큼 힙에 쓰레기가 쌓인다. 얼마나 쌓이는지 직접 재 보았다. 서비스 하나와 리포지토리 하나로 된 작은 그래프를 요청마다 새로 만드는 경우와 한 번 만든 것을 계속 쓰는 경우를, 요청 5천만 건으로 비교한다.</p>
+<pre><code class="language-java">public class AllocMain {
+    static class Repo {
+        private final Map<String, String> store = new HashMap<>();
+        Repo() { store.put("isbn-1", "title"); }
+        String find(String isbn) { return store.get(isbn); }
+    }
+    static class Service {
+        private final Repo repo;
+        Service(Repo repo) { this.repo = repo; }
+        int handle(String isbn) { return repo.find(isbn).length(); }
+    }
+    static Service newGraph() { return new Service(new Repo()); }
+
+    public static void main(String[] args) {
+        boolean perRequest = args[0].equals("per-request");
+        Service shared = newGraph();
+        long sum = 0;
+        for (int i = 0; i < 50_000_000; i++) {
+            Service s = perRequest ? newGraph() : shared;   // 요청 하나에 해당
+            sum += s.handle("isbn-1");
+        }
+        long count = 0;
+        for (GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+            count += gc.getCollectionCount();
+        }
+        System.out.println(args[0] + ": sum=" + sum + ", GC 횟수=" + count);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (java -Xmx256m, G1, Apple M1)"><code class="language-text">per-request: sum=250000000, GC 횟수=51
+shared: sum=250000000, GC 횟수=0</code></pre>
+<p>같은 일을 했는데 한쪽은 가비지 컬렉션이 51번 돌았고 다른 쪽은 한 번도 돌지 않았다. 횟수는 힙 크기와 수집기 종류, JIT 컴파일러의 최적화에 따라 달라지므로 51이라는 숫자 자체에는 의미가 없다. 의미가 있는 것은 방향이다. <code>-Xlog:gc</code>로 로그를 켜면 <code>Pause Young (Normal) (G1 Evacuation Pause) 153M->1M(256M)</code> 같은 줄이 반복되는데, 153MB를 채운 객체 가운데 1MB만 살아남았다는 뜻이다. 요청마다 만든 객체는 요청이 끝나는 즉시 전부 쓰레기가 된다.</p>
+<p>이 결과를 과장해서 읽으면 안 된다. HotSpot은 기본 설정에서 스레드별 할당 버퍼(TLAB, <code>-XX:+UseTLAB</code>)를 써서 객체 할당 자체를 싸게 처리하고, 금방 죽는 객체를 치우는 일은 세대별 수집기가 가장 잘하는 일이다. 객체 두 개짜리 그래프를 요청마다 만드는 정도로 서비스가 멈추지는 않는다. 다만 실제 애플리케이션의 객체 그래프는 두 개가 아니라 수백 개의 서비스·리포지토리·설정 객체로 이루어지고, 그중에는 생성자에서 파일을 읽거나 네트워크 연결을 맺는 것도 있다. 요청 수에 비례해 늘어나는 이 비용을 낼 이유가 없다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>요청마다 객체를 새로 만드는 방식은 공유해야 할 데이터를 공유하지 못해 틀리게 동작하고, 공유할 데이터가 없는 객체에 대해서도 요청 수에 비례하는 생성·수거 비용을 낸다. 그래서 서비스 객체는 하나만 만들어 모든 요청이 함께 쓰게 한다. 남는 질문은 둘이다. "하나"를 누가 어떻게 보장할 것인가, 그리고 하나뿐인 객체를 여러 스레드가 함께 써도 안전하려면 무엇을 지켜야 하는가.</p></aside>
+
+<x-visual id="spring-core-basic-04-per-request-vs-shared" title="요청마다 객체 그래프를 새로 만드는 구조와 객체 그래프 하나를 공유하는 구조의 비교" kind="구조 비교도" ratio="16:9">
+<x-hint>왼쪽은 요청 셋이 각자 서비스와 리포지토리를 따로 갖는 모습, 오른쪽은 요청 셋이 서비스 하나와 리포지토리 하나를 함께 가리키는 모습을 나란히 보여 준다.</x-hint>
+<x-prompt>깔끔한 평면 벡터 스타일의 좌우 비교 다이어그램, 흰 배경. 왼쪽 패널 제목 "요청마다 새로 생성". 왼쪽 패널에는 위에서 아래로 세 줄이 있고, 각 줄은 왼쪽의 작은 사람 아이콘(라벨 "요청 1", "요청 2", "요청 3")에서 오른쪽으로 화살표가 나가 둥근 사각형 "서비스"에 닿고, 다시 화살표가 둥근 원통 "저장소"에 닿는다. 세 줄의 서비스와 저장소는 서로 다른 색조로 그려 각각 다른 객체임을 보인다. 왼쪽 패널 아래에 회색 휴지통 아이콘과 라벨 "요청이 끝나면 전부 쓰레기". 오른쪽 패널 제목 "하나를 공유". 오른쪽 패널에는 같은 세 사람 아이콘("요청 1", "요청 2", "요청 3")에서 나온 화살표 세 개가 가운데의 둥근 사각형 "서비스" 하나로 모이고, 그 서비스에서 화살표 하나가 원통 "저장소" 하나로 간다. 오른쪽 패널 아래에 라벨 "객체 수는 요청 수와 무관". 두 패널 사이에 가는 세로 구분선. 글자는 한국어, 산세리프, 선명하게.</x-prompt>
+<x-caption>요청마다 객체 그래프를 만들면 저장소가 요청별로 갈라지고 요청이 끝날 때마다 전부 버려진다. 공유하면 객체 수가 요청 수와 무관해진다.</x-caption>
+</x-visual>
+
+<h3>싱글톤 패턴 — 클래스가 스스로 하나임을 보장한다</h3>
+<p>객체를 하나만 두려면 누군가 "두 번째 <code>new</code>"를 막아야 한다. 싱글톤 패턴(singleton pattern)은 그 책임을 클래스 자신에게 준다. 클래스가 자기 인스턴스를 직접 하나 만들어 쥐고, 바깥에서는 생성자를 부를 수 없게 한 뒤, 쥐고 있는 인스턴스를 돌려주는 정적 메서드만 열어 둔다.</p>
+<pre><code class="language-java">public class Registry {
+    private static final Registry INSTANCE = new Registry();   // (1) 하나를 만들어 정적 필드에 둔다
+
+    private Registry() {                                        // (2) 밖에서는 new를 쓸 수 없다
+        System.out.println("Registry 생성");
+    }
+
+    public static Registry getInstance() {                      // (3) 유일한 접근 통로
+        return INSTANCE;
+    }
+}
+
+public class RegistryMain {
+    public static void main(String[] args) {
+        System.out.println("main 시작");
+        Registry a = Registry.getInstance();
+        Registry b = Registry.getInstance();
+        System.out.println("a == b ? " + (a == b));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">main 시작
+Registry 생성
+a == b ? true</code></pre>
+<p>장치는 세 개다. <code>private</code> 생성자는 다른 클래스의 <code>new Registry()</code>를 컴파일 오류로 만든다. <code>static final</code> 필드는 인스턴스를 클래스에 딸린 저장 공간 한 칸에 묶어 둔다. 정적 메서드 <code>getInstance()</code>는 그 칸의 참조를 복사해 돌려줄 뿐 새로 만들지 않는다. 그래서 몇 번을 불러도 같은 객체가 나온다.</p>
+<h4>JVM이 한 번만 만든다는 것을 어떻게 보장하는가</h4>
+<p>코드에는 <code>synchronized</code>도 락도 없다. 그런데도 여러 스레드가 동시에 <code>getInstance()</code>를 처음 부르는 상황에서 인스턴스가 둘 만들어지지 않는다. 근거는 언어 명세의 클래스 초기화 규칙에 있다. 먼저 컴파일된 모습을 보자.</p>
+<pre data-label="javap -p -c Registry (일부)"><code class="language-text">  public static Registry getInstance();
+    Code:
+       0: getstatic     #21                 // Field INSTANCE:LRegistry;
+       3: areturn
+
+  static {};
+    Code:
+       0: new           #22                 // class Registry
+       3: dup
+       4: invokespecial #27                 // Method "<init>":()V
+       7: putstatic     #21                 // Field INSTANCE:LRegistry;
+      10: return</code></pre>
+<p>필드 선언에 붙어 있던 <code>new Registry()</code>는 컴파일러가 만든 클래스 초기화 메서드(<code>static {}</code>, 클래스 파일에서의 이름은 <code><clinit></code>) 안으로 옮겨졌다. 객체를 만들고(<code>new</code>, <code>invokespecial</code>) 정적 필드에 넣는(<code>putstatic</code>) 일은 이 메서드가 실행될 때 일어난다. 그러면 이 메서드는 언제, 몇 번 실행되는가.</p>
+<p><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-12.html">JLS §12.4.1</a>은 클래스가 초기화되는 시점을 정해 둔다. 그 클래스의 인스턴스가 만들어질 때, 그 클래스가 선언한 정적 메서드가 호출될 때, 정적 필드에 값이 대입될 때, 상수 변수가 아닌 정적 필드가 사용될 때다. 실행 결과에서 "main 시작"이 "Registry 생성"보다 먼저 찍힌 이유가 여기에 있다. JVM이 시작할 때가 아니라 <code>main</code>이 <code>Registry.getInstance()</code>를 처음 부르는 순간에 <code>Registry</code>가 초기화되었다.</p>
+<p>같은 절의 §12.4.2는 초기화 절차를 정한다. 클래스마다 고유한 초기화 락이 있고, 초기화를 시작하려는 스레드는 먼저 이 락을 얻는다. 다른 스레드가 이미 초기화를 진행하고 있으면 락을 놓고 그 초기화가 끝났다는 통지를 받을 때까지 기다린다. 따라서 스레드 열 개가 동시에 <code>getInstance()</code>를 처음 불러도 <code>static {}</code>을 실행하는 스레드는 하나뿐이고, 나머지 아홉은 그 실행이 끝난 뒤에야 <code>getstatic</code>으로 넘어간다. 이 패턴에서 "한 번만"을 보장하는 것은 프로그래머가 쓴 코드가 아니라 JVM의 클래스 초기화 절차다.</p>
+<h4>지연 초기화를 직접 구현하면 그 보장이 사라진다</h4>
+<p>인스턴스를 처음 요청받을 때 만들겠다고 다음처럼 쓰는 경우가 많다. 클래스 초기화에 기대지 않고 <code>null</code> 검사로 직접 판단하는 방식이다.</p>
+<pre><code class="language-java">public class LazyRegistry {
+    static final AtomicInteger CREATED = new AtomicInteger();   // 생성 횟수를 세는 실험용 카운터
+    private static LazyRegistry instance;
+
+    private LazyRegistry() {
+        CREATED.incrementAndGet();
+    }
+
+    public static LazyRegistry getInstance() {
+        if (instance == null) {              // (1) 검사
+            instance = new LazyRegistry();   // (2) 생성과 대입
+        }
+        return instance;
+    }
+}</code></pre>
+<p>(1)과 (2) 사이에는 아무 보호가 없다. 스레드 A가 (1)에서 <code>null</code>을 보고 (2)로 들어가 객체를 만드는 동안, 스레드 B도 (1)에서 아직 <code>null</code>인 필드를 본다. 둘 다 (2)를 실행하므로 객체가 둘 만들어지고, 나중에 대입한 쪽이 필드를 덮어쓴다. A는 자기가 만든 객체를, B는 자기가 만든 객체를 돌려받아 서로 다른 "싱글톤"을 쓰게 된다. 스레드 넷이 동시에 <code>getInstance()</code>를 부르는 실험을 10만 회 반복해 생성 횟수가 2 이상인 회차를 세었더니 세 번의 실행에서 각각 3,546회, 3,428회, 2,952회가 나왔다. 이 수치는 실행마다, 기계마다 다르다. 0이 아니라는 점만 확인하면 된다.</p>
+<p>고치는 방법은 여럿이다. <code>getInstance()</code>에 <code>synchronized</code>를 붙여 한 번에 한 스레드만 들어오게 하면 안전하지만, 인스턴스가 만들어진 뒤의 모든 호출도 락을 거친다. 검사를 락 밖에서 한 번, 락 안에서 한 번 하는 이중 검사 락(double-checked locking)은 필드를 <code>volatile</code>로 선언해야만 올바르다. 이 도구들의 원리는 자바 고급 1편에서 다룬다. 지금 쓸 수 있는 가장 간단한 방법은 다시 클래스 초기화에 기대는 것이다. 인스턴스를 중첩 클래스의 정적 필드에 두면, 그 중첩 클래스가 처음 쓰일 때 JVM이 한 번만 초기화해 준다.</p>
+<pre><code class="language-java">public class HolderRegistry {
+    private HolderRegistry() { }
+
+    private static class Holder {
+        static final HolderRegistry INSTANCE = new HolderRegistry();
+    }
+
+    public static HolderRegistry getInstance() {
+        return Holder.INSTANCE;      // Holder 클래스는 이 줄이 처음 실행될 때 초기화된다
+    }
+}</code></pre>
+
+<h3>싱글톤 패턴이 치르는 값</h3>
+<p>싱글톤 패턴은 "하나"를 확실히 보장한다. 대신 그 보장을 클래스의 구조에 새겨 넣기 때문에, 02회에서 애써 지킨 설계 원칙 몇 가지를 내준다. 하나씩 코드로 본다.</p>
+<h4>쓰는 쪽이 구체 클래스에 묶인다</h4>
+<p>리포지토리를 싱글톤 패턴으로 만들었다면 서비스는 그것을 이렇게 얻는다.</p>
+<pre><code class="language-java">public class LoanService {
+    private final BookRepository bookRepository = MemoryBookRepository.getInstance();
+    // ...
+}</code></pre>
+<p>필드 타입은 인터페이스지만 오른쪽에 구현 클래스의 이름이 적혀 있다. 정적 메서드 호출은 바이트코드에서 <code>invokestatic</code>이 되고, 호출 대상인 <code>MemoryBookRepository</code>가 <code>LoanService</code>의 상수 풀에 이름으로 기록된다. 인스턴스 메서드처럼 실행 시점의 객체 타입에 따라 대상이 달라지는 일이 없다. 저장소를 다른 구현으로 바꾸려면 <code>LoanService</code>의 소스를 고쳐 다시 컴파일해야 한다. 구현이 아니라 추상에 의존하라는 DIP를 어겼고, 그 결과 확장할 때 기존 코드를 고쳐야 하니 OCP도 어긴다. 02회에서 설정 클래스를 따로 둔 이유가 바로 이 한 줄을 서비스에서 없애는 것이었다.</p>
+<h4>테스트에서 바꿔 끼울 수 없고, 상태가 테스트 사이에 남는다</h4>
+<p>서비스가 리포지토리를 스스로 가져오므로 테스트가 가짜 리포지토리를 넣어 줄 통로가 없다. 또 인스턴스가 정적 필드에 매여 있어 JVM이 살아 있는 동안 계속 남는다. 스프링 입문 03회에서 본 것처럼 JUnit은 테스트 메서드마다 테스트 클래스의 인스턴스를 새로 만들지만 정적 필드는 그대로이므로, 앞 테스트가 싱글톤에 남긴 데이터가 뒤 테스트의 결과를 바꾼다.</p>
+<h4>private 생성자가 상속을 막는다</h4>
+<p>자식 클래스의 생성자는 부모 생성자를 호출해야 하는데 부모의 생성자가 <code>private</code>뿐이면 다른 파일에서는 자식 클래스를 선언할 수 없다. 당장은 아쉬울 것이 없어 보이지만, 이 회차 뒷부분에서 보듯 스프링은 어떤 클래스의 자식 클래스를 실행 중에 만들어 기능을 덧붙이는 기법을 쓴다. 생성자를 잠가 둔 클래스에는 그 기법을 적용할 수 없다.</p>
+<h4>"하나"의 범위가 생각보다 좁거나 깨질 수 있다</h4>
+<p><code>private</code>은 컴파일러와 JVM의 접근 검사일 뿐이어서 리플렉션으로 넘을 수 있다. 앞의 <code>RegistryMain</code>에 세 줄을 더해 보자(<code>main</code>에 <code>throws Exception</code>이 필요하다).</p>
+<pre><code class="language-java">Constructor<Registry> ctor = Registry.class.getDeclaredConstructor();
+ctor.setAccessible(true);            // 접근 검사를 끈다
+Registry c = ctor.newInstance();
+System.out.println("a == c ? " + (a == c));</code></pre>
+<pre data-label="실행 결과 (추가된 부분)"><code class="language-text">Registry 생성
+a == c ? false</code></pre>
+<p>더 근본적인 한계도 있다. 정적 필드는 클래스에 딸린 것이고, JVM에서 클래스는 이름만으로 정해지지 않는다. <a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-5.html">JVMS §5.3</a>은 클래스가 생성된 뒤에는 이진 이름과 그것을 정의한 클래스 로더의 쌍으로 결정된다고 규정한다. 같은 <code>Registry.class</code> 파일을 서로 다른 클래스 로더 둘이 읽으면 JVM 안에 <code>Registry</code>라는 이름의 클래스가 둘 생기고, 정적 필드도 둘, 인스턴스도 둘이 된다.</p>
+<pre><code class="language-java">public class LoaderMain {
+    public static void main(String[] args) throws Exception {
+        URL[] where = { Path.of(args[0]).toUri().toURL() };   // Registry.class가 있는 디렉터리
+
+        try (URLClassLoader l1 = new URLClassLoader(where, null);
+             URLClassLoader l2 = new URLClassLoader(where, null)) {
+            Class<?> c1 = l1.loadClass("Registry");
+            Class<?> c2 = l2.loadClass("Registry");
+            Object s1 = c1.getMethod("getInstance").invoke(null);
+            Object s2 = c2.getMethod("getInstance").invoke(null);
+
+            System.out.println("같은 이름?   " + c1.getName().equals(c2.getName()));
+            System.out.println("같은 클래스? " + (c1 == c2));
+            System.out.println("같은 객체?   " + (s1 == s2));
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Registry 생성
+Registry 생성
+같은 이름?   true
+같은 클래스? false
+같은 객체?   false</code></pre>
+<p>싱글톤 패턴이 보장하는 것은 정확히 말해 "클래스 로더 하나에 인스턴스 하나"다. 클래스 로더가 하나뿐인 작은 프로그램에서는 "JVM에 하나"와 같은 말이지만, 한 JVM에 클래스 로더를 여럿 두는 환경에서는 그렇지 않다. 반대 방향의 불편도 있다. 같은 클래스의 객체를 용도별로 두 개 두고 싶어지는 순간(예컨대 주 저장소와 보관용 저장소) 패턴 자체를 걷어 내야 하고, <code>getInstance()</code>를 부르던 모든 곳을 고쳐야 한다.</p>
+<div class="table-wrap"><table><thead><tr><th>싱글톤 패턴이 요구하는 것</th><th>그 때문에 잃는 것</th></tr></thead><tbody>
+<tr><td>클래스마다 정적 필드·private 생성자·정적 접근 메서드를 반복해서 쓴다</td><td>업무와 무관한 코드가 클래스마다 붙는다</td></tr>
+<tr><td>쓰는 쪽이 <code>구체클래스.getInstance()</code>를 호출한다</td><td>DIP와 OCP. 구현을 바꾸려면 쓰는 쪽을 고쳐야 한다</td></tr>
+<tr><td>인스턴스가 정적 필드에 매인다</td><td>테스트에서 대역으로 바꾸기 어렵고, 테스트 사이에 상태가 남는다</td></tr>
+<tr><td>생성자가 private이다</td><td>자식 클래스를 만들 수 없다</td></tr>
+<tr><td>개수가 클래스 구조에 고정된다</td><td>같은 클래스의 객체를 둘 이상 두는 설계로 바꾸기 어렵다. 범위는 클래스 로더 단위다</td></tr>
+</tbody></table></div>
+
+<h3>싱글톤 컨테이너 — "하나"를 보장하는 책임을 클래스 밖으로 옮긴다</h3>
+<p>스프링 컨테이너는 같은 목표를 다른 방법으로 이룬다. 클래스는 평범하게 둔다. 생성자는 <code>public</code>이고 정적 필드도 <code>getInstance()</code>도 없다. 대신 객체를 만드는 쪽인 컨테이너가 <b>한 번만 만들고, 만든 것을 보관해 두었다가 같은 것을 돌려준다.</b> 앞의 <code>LibraryConfig</code>에 애너테이션 두 가지만 붙여 스프링에 넘겨 보자. 메서드 본문은 한 글자도 바꾸지 않는다.</p>
+<pre><code class="language-java">@Configuration
+public class LibraryConfig {
+
+    @Bean
+    public BookRepository bookRepository() {
+        System.out.println("call LibraryConfig.bookRepository()");
+        return new MemoryBookRepository();
+    }
+
+    @Bean
+    public LoanService loanService() {
+        System.out.println("call LibraryConfig.loanService()");
+        return new LoanService(bookRepository());
+    }
+
+    @Bean
+    public SearchService searchService() {
+        System.out.println("call LibraryConfig.searchService()");
+        return new SearchService(bookRepository());
+    }
+}
+
+public class SpringMain {
+    public static void main(String[] args) {
+        System.out.println("--- before context");
+        AnnotationConfigApplicationContext ac =
+                new AnnotationConfigApplicationContext(LibraryConfig.class);
+        System.out.println("--- context ready");
+
+        LoanService loan = ac.getBean(LoanService.class);
+        SearchService search = ac.getBean(SearchService.class);
+        BookRepository repo = ac.getBean(BookRepository.class);
+
+        System.out.println("loan == loan again?        " + (loan == ac.getBean("loanService")));
+        System.out.println("loan.repo == search.repo?  "
+                + (loan.getBookRepository() == search.getBookRepository()));
+        System.out.println("loan.repo == bean repo?    " + (loan.getBookRepository() == repo));
+        ac.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">--- before context
+call LibraryConfig.bookRepository()
+  new MemoryBookRepository()
+call LibraryConfig.loanService()
+call LibraryConfig.searchService()
+--- context ready
+loan == loan again?        true
+loan.repo == search.repo?  true
+loan.repo == bean repo?    true</code></pre>
+<p>세 가지를 읽어 낼 수 있다. 첫째, 같은 빈을 두 번 조회하면 같은 객체가 나온다. 둘째, 객체는 "context ready"가 찍히기 전, 즉 컨테이너를 만드는 동안 이미 다 만들어졌고 그 뒤의 <code>getBean</code>은 아무것도 만들지 않았다. 셋째, 순수 자바로 돌렸을 때 세 번 찍히던 <code>new MemoryBookRepository()</code>가 한 번만 찍혔고 두 서비스가 같은 리포지토리를 가리킨다. 첫째와 둘째는 이 절에서, 셋째는 뒤의 <code>@Configuration</code> 절에서 설명한다.</p>
+<h4>싱글톤 레지스트리의 실체</h4>
+<p>"보관해 둔다"는 말의 실체는 맵 하나다. <code>AnnotationConfigApplicationContext</code>가 내부에 두는 빈 팩터리인 <code>DefaultListableBeanFactory</code>는 <code>DefaultSingletonBeanRegistry</code>를 상속하고, 그 클래스에 다음 필드가 있다.</p>
+<pre><code class="language-java">/** Cache of singleton objects: bean name to bean instance. */
+private final Map<String, Object> singletonObjects = new ConcurrentHashMap<>(256);</code></pre>
+<p>키는 빈 이름, 값은 완성된 빈 객체다. 레퍼런스 문서가 싱글톤 스코프를 설명하면서 "이 하나의 인스턴스는 싱글톤 빈들의 캐시에 저장되고, 그 이름의 빈에 대한 이후의 모든 요청과 참조는 캐시된 객체를 돌려받는다"고 한 그 캐시가 이 맵이다. 이렇게 객체를 이름으로 등록해 두고 하나만 유지해 주는 구조를 싱글톤 레지스트리(singleton registry)라고 부른다. 실험이 끝난 시점의 모습을 그리면 다음과 같다.</p>
+<pre class="diagram">DefaultListableBeanFactory (DefaultSingletonBeanRegistry를 상속)
+└─ singletonObjects : ConcurrentHashMap<String, Object>
+     "libraryConfig"   ──▶ 설정 클래스의 인스턴스
+     "bookRepository"  ──▶ MemoryBookRepository ◀───────────┐ ◀─────────┐
+     "loanService"     ──▶ LoanService   { bookRepository ──┘ }         │
+     "searchService"   ──▶ SearchService { bookRepository ──────────────┘ }
+     "environment", "messageSource", ... ──▶ 컨테이너 자신이 쓰는 객체들</pre>
+<p>맵에 무엇이 들어 있는지는 공개 API로 확인할 수 있다. <code>ac.getBeanFactory().getSingletonNames()</code>를 출력하면 우리가 등록한 네 개 말고도 <code>environment</code>, <code>systemProperties</code>, <code>messageSource</code>, <code>applicationEventMulticaster</code>, 그리고 설정 클래스를 해석하는 <code>ConfigurationClassPostProcessor</code>(빈 이름은 <code>org.springframework.context.annotation.internalConfigurationAnnotationProcessor</code>) 같은 내부 부품이 함께 나온다. 이 실험에서는 모두 16개였다. 컨테이너는 자기 자신의 부품도 같은 레지스트리에 싱글톤으로 넣어 관리한다.</p>
+<p><code>getBean</code>이 이 맵을 읽는 경로는 짧다.</p>
+<figure class="flow-figure"><figcaption>getBean이 싱글톤을 돌려주기까지</figcaption><ol class="flow">
+<li><strong>이름 결정</strong><span>타입으로 조회했다면 그 타입에 맞는 빈 이름을 먼저 찾는다. 이후의 조회는 모두 이름 기준이다.</span></li>
+<li><strong>캐시 조회</strong><span><code>singletonObjects.get(beanName)</code>을 락 없이 실행한다. 값이 있으면 그대로 반환하고 끝난다.</span></li>
+<li><strong>없으면 생성 경로</strong><span>빈 정의의 스코프가 싱글톤이면 싱글톤 생성용 락을 잡고 맵을 다시 확인한 뒤, 빈 정의대로 객체를 만들고 의존관계를 채운다.</span></li>
+<li><strong>등록</strong><span>완성된 객체를 <code>putIfAbsent</code>로 맵에 넣는다. 같은 이름에 이미 다른 객체가 있으면 예외를 던진다.</span></li>
+<li><strong>이후의 모든 조회</strong><span>두 번째 단계에서 끝난다. 객체는 다시 만들어지지 않는다.</span></li>
+</ol></figure>
+<p>싱글톤 패턴과 견주면 책임의 위치가 옮겨졌을 뿐 장치는 같다. 패턴에서 정적 필드가 하던 "보관"을 맵이 하고, 클래스 초기화 락이 하던 "한 번만 생성"을 컨테이너의 생성 락과 <code>putIfAbsent</code>가 한다. 조회 쪽이 락 없이 동작할 수 있는 것은 맵이 <code>ConcurrentHashMap</code>이기 때문이다. 스프링 입문 03회에서 리포지토리의 저장소로 썼던 그 맵으로, 여러 스레드가 동시에 읽고 써도 내부 구조가 깨지지 않게 만들어져 있고 조회에는 락을 쓰지 않는다.</p>
+<aside class="note">생성 경로의 세부는 버전마다 다르다. 6.2와 7.0의 소스에서 생성용 락은 <code>ReentrantLock</code> 타입의 <code>singletonLock</code> 필드이고, 순환 참조를 풀기 위한 보조 맵(<code>earlySingletonObjects</code>, <code>singletonFactories</code>)이 함께 쓰인다. "완성된 싱글톤은 <code>singletonObjects</code>에 이름으로 저장되고, 조회는 먼저 이 맵을 본다"는 뼈대만 기억하면 충분하다.</aside>
+
+<x-visual id="spring-core-basic-04-singleton-registry" title="스프링 컨테이너의 싱글톤 레지스트리가 빈 이름으로 객체를 하나씩 보관하고 여러 조회가 같은 객체를 받는 구조" kind="구조도" ratio="16:9">
+<x-hint>컨테이너 안의 맵(빈 이름 → 객체)과, 서로 다른 세 곳의 조회가 같은 객체 하나를 가리키게 되는 모습을 보여 준다.</x-hint>
+<x-prompt>깔끔한 평면 벡터 스타일의 구조도, 흰 배경. 가운데에 큰 둥근 사각형이 있고 위쪽에 라벨 "스프링 컨테이너". 그 안 왼쪽에 2열 표 모양의 상자가 있고 표 제목은 "싱글톤 레지스트리 (이름 → 객체)". 표의 행은 세 개로, 왼쪽 칸에 각각 "bookRepository", "loanService", "searchService"라고 적혀 있다. 각 행의 오른쪽 칸에서 화살표가 나가 컨테이너 안 오른쪽에 있는 객체 상자 세 개를 가리킨다. 객체 상자의 라벨은 위에서부터 "MemoryBookRepository 객체", "LoanService 객체", "SearchService 객체". "LoanService 객체"와 "SearchService 객체"에서 각각 점선 화살표가 나와 "MemoryBookRepository 객체" 하나를 가리킨다. 컨테이너 바깥 왼쪽에는 작은 말풍선 세 개가 세로로 놓여 있고 각각 "getBean ①", "getBean ②", "getBean ③"이라고 적혀 있으며, 세 말풍선에서 나온 화살표가 모두 표의 "loanService" 행으로 모인다. 그림 아래에 한 줄 라벨 "몇 번을 조회해도 같은 객체". 글자는 한국어와 영문 식별자, 산세리프, 선명하게.</x-prompt>
+<x-caption>컨테이너는 완성된 빈을 이름으로 맵에 넣어 두고, 같은 이름의 조회에는 언제나 그 객체를 돌려준다.</x-caption>
+</x-visual>
+
+<h4>언제 만들어지는가 — 시작할 때 전부</h4>
+<p>실행 결과에서 객체 생성 로그가 "context ready"보다 앞에 찍혔다. 싱글톤 패턴의 정적 필드는 클래스가 처음 쓰일 때 초기화되었지만, 스프링의 <code>ApplicationContext</code>는 기본적으로 시작하면서 싱글톤을 모두 만든다. 컨테이너의 <code>refresh()</code>는 빈 정의를 다 읽고 난 뒤쪽 단계에서 <code>preInstantiateSingletons()</code>를 불러, 등록된 빈 정의를 차례로 돌며 추상이 아니고 싱글톤 스코프인 것마다 빈을 생성한다(지연 초기화로 표시한 빈은 건너뛴다).</p>
+<p>레퍼런스 문서는 이유를 이렇게 적는다. 설정이나 주변 환경의 오류가 몇 시간, 며칠 뒤가 아니라 즉시 드러나기 때문에 이 사전 생성이 대체로 바람직하다는 것이다. 의존하는 빈이 없거나 생성자에서 예외가 나는 문제를 첫 사용자 요청이 아니라 배포 직후 기동 단계에서 만나게 된다. 첫 요청이 객체 생성 비용을 떠안지 않는다는 이점도 따라온다.</p>
+<h4>"하나"의 범위 — 컨테이너마다, 빈 정의마다</h4>
+<p>스프링의 싱글톤은 "클래스에 하나"가 아니다. 레퍼런스 문서는 GoF의 싱글톤이 클래스 로더당 특정 클래스의 인스턴스를 하나로 고정하는 것과 달리 스프링 싱글톤의 범위는 <b>컨테이너당, 빈당</b>(per-container and per-bean)이라고 설명한다. 레지스트리의 키가 클래스가 아니라 빈 이름이고, 레지스트리 자체가 컨테이너마다 따로 있으니 당연한 결과다. 같은 클래스로 빈 정의를 둘 만들고 컨테이너도 둘 띄워 확인한다.</p>
+<pre><code class="language-java">public class ScopeMain {
+    @Configuration
+    static class TwoRepoConfig {
+        @Bean BookRepository mainRepository() { return new MemoryBookRepository(); }
+        @Bean BookRepository archiveRepository() { return new MemoryBookRepository(); }
+    }
+
+    public static void main(String[] args) {
+        var ac1 = new AnnotationConfigApplicationContext(TwoRepoConfig.class);
+        var ac2 = new AnnotationConfigApplicationContext(TwoRepoConfig.class);
+
+        Object main1 = ac1.getBean("mainRepository");
+        Object archive1 = ac1.getBean("archiveRepository");
+        Object main2 = ac2.getBean("mainRepository");
+
+        System.out.println("같은 컨테이너, 같은 이름:   " + (main1 == ac1.getBean("mainRepository")));
+        System.out.println("같은 컨테이너, 다른 이름:   " + (main1 == archive1));
+        System.out.println("다른 컨테이너, 같은 이름:   " + (main1 == main2));
+        ac1.close();
+        ac2.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과 (생성자 로그 네 줄은 생략)"><code class="language-text">같은 컨테이너, 같은 이름:   true
+같은 컨테이너, 다른 이름:   false
+다른 컨테이너, 같은 이름:   false</code></pre>
+<p><code>MemoryBookRepository</code> 객체는 JVM 안에 넷이다. 그래도 각각은 자기 컨테이너에서 자기 이름으로는 유일하다. 싱글톤 패턴에서 불가능했던 "같은 클래스의 객체를 용도별로 둘"이 빈 정의를 하나 더 쓰는 것으로 끝난다.</p>
+<div class="table-wrap"><table><thead><tr><th>비교 항목</th><th>싱글톤 패턴</th><th>스프링 싱글톤 빈</th></tr></thead><tbody>
+<tr><td>"하나"의 단위</td><td>클래스 로더당 클래스 하나</td><td>컨테이너당 빈 정의 하나</td></tr>
+<tr><td>보장하는 주체</td><td>클래스 자신 + JVM의 클래스 초기화</td><td>컨테이너의 싱글톤 레지스트리</td></tr>
+<tr><td>클래스에 필요한 코드</td><td>정적 필드, private 생성자, 정적 메서드</td><td>없음. 평범한 클래스</td></tr>
+<tr><td>쓰는 쪽이 아는 것</td><td>구체 클래스 이름</td><td>주입받은 인터페이스 타입</td></tr>
+<tr><td>테스트에서 교체</td><td>어렵다</td><td>생성자에 다른 구현을 넘기면 된다</td></tr>
+<tr><td>생성 시점</td><td>클래스가 처음 쓰일 때</td><td>기본은 컨테이너 시작 시</td></tr>
+</tbody></table></div>
+<h4>요청을 처리할 때는 레지스트리를 거치지 않는다</h4>
+<p>맵 조회가 요청마다 일어난다고 생각하기 쉽지만 그렇지 않다. 컨테이너는 시작할 때 <code>LoanService</code>를 만들면서 생성자에 리포지토리 참조를 넘겼고, 그 참조는 <code>LoanService</code> 객체의 <code>final</code> 필드에 들어갔다. 이후 요청 스레드가 서비스의 메서드를 실행하며 리포지토리를 쓸 때 일어나는 일은 필드 읽기(<code>getfield</code>)와 메서드 호출(<code>invokeinterface</code>)뿐이다. 싱글톤 레지스트리는 조립할 때 쓰는 장부이고, 조립이 끝난 뒤의 객체들은 서로를 직접 가리킨다.</p>
+<p>시작할 때 한 스레드가 만든 객체를 나중에 다른 스레드들이 읽어도 값이 제대로 보이는가 하는 의문이 남는다. 자바 언어 명세의 메모리 모델(Java Memory Model)은 한 스레드가 쓴 값이 다른 스레드의 읽기에 보인다고 보장되는 조건을 정해 두는데, 싱글톤 빈은 두 가지 조건에 걸린다. <a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html">JLS §17.5</a>에 따르면 생성자가 끝난 뒤에야 객체의 참조를 볼 수 있었던 스레드는 그 객체의 <code>final</code> 필드에 대해 올바르게 초기화된 값을 본다. 또 <code>java.util.concurrent</code> 패키지 문서는 한 스레드가 객체를 동시성 컬렉션에 넣기 전에 한 동작이, 다른 스레드가 그 원소를 컬렉션에서 꺼낸 뒤에 하는 동작보다 먼저 일어난 것으로 보장된다고(happens-before) 명시한다. 싱글톤 레지스트리가 바로 그런 컬렉션이다. 이 규칙들의 전체 그림은 자바 고급 1편의 몫이고, 여기서는 06회에서 다룰 생성자 주입과 <code>final</code> 필드가 이 가시성 보장과도 맞닿아 있다는 것만 짚어 둔다.</p>
+
+<h3>싱글톤 방식의 주의점 — 객체가 하나면 필드도 하나다</h3>
+<p>여기까지의 결론은 "서비스 객체는 하나이고 모든 요청 스레드가 그것을 함께 쓴다"이다. 이 문장에서 곧바로 따라 나오는 사실이 있다. 객체가 하나면 그 객체의 인스턴스 필드도 메모리에 한 칸씩만 있다. 어느 스레드가 그 칸에 쓴 값은 다른 모든 스레드에게 보이고, 다른 스레드가 덮어쓸 수 있다.</p>
+<p>거리에 따라 요금을 계산하는 서비스를 예로 든다. 계산한 요금을 필드에 넣어 두고 나중에 꺼내 가게 만든 코드다.</p>
+<pre><code class="language-java">public class FareService {
+    private int fare;                      // 인스턴스 필드: 힙의 객체 안에 한 칸
+
+    public void calculate(String passenger, int km) {
+        this.fare = 1_500 + km * 100;      // 요청마다 달라지는 값을 필드에 쓴다
+    }
+
+    public int getFare() {
+        return fare;
+    }
+}</code></pre>
+<p>스레드 하나로 테스트하면 아무 문제가 없다. <code>calculate("A", 5)</code>를 부르고 <code>getFare()</code>를 부르면 2,000이 나온다. 요청 스레드 둘이 이 객체 하나를 함께 쓰면 달라진다. 실행 순서를 재현할 수 있도록 "A가 계산한 뒤, A가 읽기 전에 B가 계산한다"는 순서를 고정해 돌려 본다. <code>CountDownLatch</code>는 다른 스레드가 <code>countDown()</code>을 부를 때까지 <code>await()</code>를 부른 스레드를 세워 두는 도구이고, 여기서는 그 순서를 강제하는 용도로만 쓴다. <code>new Thread(() -> { ... }, "request-A")</code>는 중괄호 안의 코드 조각(람다)을 그 이름의 새 스레드에서 실행하게 한다.</p>
+<pre><code class="language-java">public class FareMain {
+    public static void main(String[] args) throws Exception {
+        FareService service = new FareService();           // 객체는 하나
+        CountDownLatch aCalculated = new CountDownLatch(1);
+        CountDownLatch bCalculated = new CountDownLatch(1);
+
+        Thread a = new Thread(() -> {
+            service.calculate("A", 5);                     // A의 요금은 2,000원이어야 한다
+            aCalculated.countDown();
+            await(bCalculated);                            // 그 사이 B가 끼어든다
+            System.out.println("A가 읽은 요금 = " + service.getFare());
+        }, "request-A");
+
+        Thread b = new Thread(() -> {
+            await(aCalculated);
+            service.calculate("B", 40);                    // B의 요금은 5,500원
+            bCalculated.countDown();
+            System.out.println("B가 읽은 요금 = " + service.getFare());
+        }, "request-B");
+
+        a.start(); b.start();
+        a.join(); b.join();
+    }
+
+    private static void await(CountDownLatch latch) {
+        try { latch.await(); } catch (InterruptedException e) { throw new IllegalStateException(e); }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (두 줄의 순서는 실행마다 다를 수 있다)"><code class="language-text">A가 읽은 요금 = 5500
+B가 읽은 요금 = 5500</code></pre>
+<p>승객 A는 5km를 탔는데 5,500원을 청구받았다. 코드 어디에도 문법 오류나 예외는 없다. 시간 순서대로 따라가면 원인이 보인다.</p>
+<div class="table-wrap"><table><thead><tr><th>순서</th><th>request-A 스레드</th><th>request-B 스레드</th><th>힙에 있는 fare 필드</th></tr></thead><tbody>
+<tr><td>1</td><td><code>calculate("A", 5)</code> → 2000을 필드에 쓴다</td><td>대기</td><td>2000</td></tr>
+<tr><td>2</td><td>대기</td><td><code>calculate("B", 40)</code> → 5500을 필드에 쓴다</td><td>5500</td></tr>
+<tr><td>3</td><td><code>getFare()</code> → 필드를 읽는다</td><td><code>getFare()</code> → 필드를 읽는다</td><td>5500</td></tr>
+</tbody></table></div>
+<p>실험에서는 래치로 순서를 고정했지만 실제 서버에서는 이 순서가 우연히 생긴다. 두 요청의 처리 구간이 겹칠 때만 나타나고 다시 시도하면 사라지므로 테스트로는 잡히지 않다가 운영 중에 "가끔 다른 사람의 값이 보인다"는 형태로 드러난다. 금액, 사용자 식별자, 권한 같은 값에서 이런 일이 생기면 단순한 버그가 아니라 사고다.</p>
+<h4>힙과 스택으로 보면</h4>
+<p>왜 필드는 섞이고 지역 변수는 섞이지 않는지는 JVM의 메모리 구조가 답한다. <a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html">JVMS §2.5.3</a>은 힙이 모든 JVM 스레드가 공유하는 영역이라고 규정하고, §2.5.2는 스레드마다 자기만의 JVM 스택이 있다고 규정한다. §2.6에 따르면 메서드를 호출할 때마다 프레임이 새로 만들어지고, 한 스레드가 만든 프레임은 그 스레드에 속하며 다른 스레드가 참조할 수 없다. 지역 변수와 매개변수는 이 프레임 안의 지역 변수 배열에 놓인다.</p>
+<pre class="diagram">request-A의 스택                  힙 (모든 스레드가 공유)            request-B의 스택
+┌──────────────────────┐        ┌───────────────────────┐        ┌──────────────────────┐
+│ calculate 프레임     │        │ FareService 객체      │        │ calculate 프레임     │
+│  this ───────────────┼───────▶│   fare : [ 한 칸 ]    │◀───────┼─ this                │
+│  passenger = "A"     │        └───────────────────────┘        │  passenger = "B"     │
+│  km = 5              │                                         │  km = 40             │
+└──────────────────────┘                                         └──────────────────────┘
+ passenger, km은 스레드마다 따로         fare는 두 스레드가 같은 칸에 쓴다</pre>
+<p>두 스레드의 <code>this</code>는 같은 객체를 가리킨다. <code>passenger</code>와 <code>km</code>은 프레임마다 따로 있어서 A의 5와 B의 40이 섞일 일이 없지만, <code>this.fare</code>는 힙의 한 칸이다. 바이트코드에서도 차이가 드러난다. 필드에 쓰는 버전은 계산 결과를 <code>putfield</code>로 힙의 객체에 내보낸다.</p>
+<pre data-label="javap -c FareService.calculate"><code class="language-text">       0: aload_0
+       1: sipush        1500
+       4: iload_2
+       5: bipush        100
+       7: imul
+       8: iadd
+       9: putfield      #7                  // Field fare:I
+      12: return</code></pre>
+
+<x-visual id="spring-core-basic-04-shared-field-race" title="두 요청 스레드의 스택 프레임이 힙에 있는 싱글톤 객체의 필드 한 칸을 함께 쓰는 모습" kind="메모리 구조도" ratio="16:9">
+<x-hint>스레드별 스택의 지역 변수는 따로 있고, 힙에 있는 서비스 객체의 필드는 하나라서 두 스레드의 쓰기가 같은 칸으로 향한다는 것을 보여 준다.</x-hint>
+<x-prompt>깔끔한 평면 벡터 스타일의 메모리 구조도, 흰 배경, 세 영역이 가로로 나란히 있다. 왼쪽 영역 제목 "요청 스레드 A의 스택": 세로로 긴 상자 안에 프레임 하나가 있고 그 안에 세 줄 "this", "km = 5", "승객 = A". 오른쪽 영역 제목 "요청 스레드 B의 스택": 같은 모양의 프레임에 "this", "km = 40", "승객 = B". 가운데 영역 제목 "힙 (공유)": 둥근 사각형 하나에 라벨 "FareService 객체", 그 안에 강조색 테두리의 작은 칸 하나와 라벨 "fare (한 칸)". 왼쪽 프레임의 "this"에서 가운데 객체로 화살표, 오른쪽 프레임의 "this"에서도 가운데 객체로 화살표. 왼쪽에서 fare 칸으로 향하는 굵은 화살표에 라벨 "① 2000 쓰기", 오른쪽에서 fare 칸으로 향하는 굵은 화살표에 라벨 "② 5500 쓰기". fare 칸 아래에 작은 경고 표시와 라벨 "나중에 쓴 값만 남는다". 글자는 한국어, 산세리프, 선명하게.</x-prompt>
+<x-caption>지역 변수는 스레드마다 자기 프레임에 따로 있지만, 싱글톤 객체의 필드는 힙에 한 칸뿐이어서 두 스레드가 같은 칸에 쓴다.</x-caption>
+</x-visual>
+
+<h4>무상태로 고친다</h4>
+<p>해법은 요청마다 달라지는 값을 힙의 공유 객체에 두지 않는 것이다. 계산 결과를 지역 변수에 담아 반환값으로 돌려주면 값은 호출한 스레드의 프레임 밖으로 나가지 않는다.</p>
+<pre><code class="language-java">public class StatelessFareService {
+    public int calculate(String passenger, int km) {
+        int fare = 1_500 + km * 100;       // 지역 변수: 호출한 스레드의 스택 프레임 안
+        return fare;
+    }
+}</code></pre>
+<pre data-label="javap -c StatelessFareService.calculate"><code class="language-text">       0: sipush        1500
+       3: iload_2
+       4: bipush        100
+       6: imul
+       7: iadd
+       8: istore_3
+       9: iload_3
+      10: ireturn</code></pre>
+<p><code>putfield</code>가 있던 자리에 <code>istore_3</code>이 왔다. 프레임의 지역 변수 3번 칸에 저장했다가 다시 꺼내 반환한다. 힙에는 아무것도 쓰지 않으므로 스레드가 몇 개이든 서로의 값을 볼 방법이 없다. 호출하는 쪽도 <code>int fare = service.calculate("A", 5);</code>처럼 자기 지역 변수로 받는다. 이렇게 특정 호출에 속한 값을 객체 안에 남기지 않는 설계를 무상태(stateless)라고 한다. 레퍼런스 문서도 상태가 있는 빈에는 프로토타입 스코프를, 상태가 없는 빈에는 싱글톤 스코프를 쓰라고 원칙을 적어 둔다.</p>
+<h4>필드에 둬도 되는 것과 안 되는 것</h4>
+<p>무상태가 "필드가 하나도 없어야 한다"는 뜻은 아니다. 앞의 <code>LoanService</code>에는 <code>bookRepository</code> 필드가 있지만 문제가 없다. 기준은 그 값이 누구의 것인가, 그리고 요청을 처리하는 동안 바뀌는가다.</p>
+<div class="table-wrap"><table><thead><tr><th>필드의 종류</th><th>예</th><th>싱글톤 빈에 둬도 되는가</th></tr></thead><tbody>
+<tr><td>시작할 때 주입되고 바뀌지 않는 의존 객체</td><td><code>private final BookRepository bookRepository</code></td><td>된다. 모든 요청이 같은 값을 읽기만 한다</td></tr>
+<tr><td>시작할 때 정해지는 설정 값</td><td>기본 요금, 타임아웃, 불변 객체</td><td>된다. 읽기 전용이다</td></tr>
+<tr><td>모든 요청이 함께 써야 하는 공유 데이터</td><td>캐시, 통계 카운터, 메모리 저장소</td><td>공유가 목적이므로 둘 수 있다. 다만 스레드 안전한 자료구조로 지켜야 한다</td></tr>
+<tr><td>특정 요청·특정 사용자에 속한 값</td><td>계산 중인 금액, 현재 사용자, 처리 중인 주문</td><td>안 된다. 지역 변수·매개변수·반환값으로 다룬다</td></tr>
+</tbody></table></div>
+<p>셋째 줄은 조건부다. 공유가 목적인 데이터는 필드에 둘 수밖에 없지만 평범한 <code>long</code>이나 <code>HashMap</code>으로는 안 된다. 스레드 여덟 개가 각각 10만 번씩 카운터를 올리는 실험에서 <code>long</code> 필드에 <code>hits++</code>를 한 쪽은 세 번의 실행에서 322,755, 194,282, 601,539가 나왔고(실행마다 다르다) <code>AtomicLong.incrementAndGet()</code>을 쓴 쪽은 매번 800,000이었다. 앞에서 <code>MemoryBookRepository</code>의 저장소를 <code>ConcurrentHashMap</code>으로 선언한 것도 같은 이유다. 읽고 더하고 쓰는 세 동작 사이에 다른 스레드가 끼어드는 과정은 스프링 입문 03회에서 <code>++sequence</code>의 바이트코드로 보았으므로 반복하지 않는다.</p>
+<p>요청별 데이터를 메서드 사이에서 넘겨야 한다면 매개변수와 반환값으로 넘기는 것이 기본이다. 값이 여러 개면 요청마다 새로 만드는 작은 객체에 담아 넘긴다. 그 객체는 호출 스레드의 지역 변수에서만 참조되므로 힙에 있어도 다른 스레드에게 보이지 않는다. 스레드마다 값을 따로 보관하는 <code>ThreadLocal</code>, HTTP 요청마다 빈을 따로 만들어 주는 요청 스코프도 도구로 있다. 요청 스코프는 08회에서 다룬다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>창구 직원 한 명과 책상 위 메모지</strong><p>은행 창구에 직원이 한 명 있고 손님 여러 명이 번갈아 말을 건다고 하자. 직원이 손님 A의 금액을 책상 위 메모지 한 장에 적어 두었는데, A가 서류를 꺼내는 사이 손님 B의 금액을 같은 메모지에 덮어 적으면 A에게 B의 금액을 불러 주게 된다. 직원이 금액을 메모지에 적지 않고 각 손님의 신청서에 적어 손님에게 돌려주면 섞일 일이 없다. 직원이 싱글톤 빈, 메모지가 인스턴스 필드, 신청서가 지역 변수와 반환값이다. 비유가 깨지는 지점은 속도다. 사람 직원은 한 번에 한 손님과만 말하지만 싱글톤 객체의 메서드는 여러 스레드가 같은 순간에 실제로 동시에 실행한다. 객체가 "바쁘다"는 개념이 없으므로 줄을 세우고 싶다면 락으로 직접 세워야 한다.</p></aside>
+
+<h3>@Configuration과 싱글톤 — 자바 코드대로라면 세 번 호출되어야 한다</h3>
+<p>싱글톤 컨테이너 절에서 미뤄 둔 관찰로 돌아간다. <code>LibraryConfig</code>의 소스를 다시 읽어 보면 <code>bookRepository()</code>를 부르는 곳이 세 군데다. 컨테이너가 <code>bookRepository</code> 빈을 만들려고 한 번, <code>loanService()</code>의 본문에서 한 번, <code>searchService()</code>의 본문에서 한 번. 메서드 본문에는 <code>new MemoryBookRepository()</code>가 있으니 자바 언어의 규칙대로라면 객체가 셋 만들어져야 한다. 실제로 같은 클래스를 스프링 없이 호출한 <code>PlainMain</code>에서는 호출할 때마다 새 객체가 나왔다.</p>
+<div class="table-wrap"><table><thead><tr><th>관찰한 것</th><th>순수 자바로 호출</th><th>스프링 컨테이너에 등록</th></tr></thead><tbody>
+<tr><td><code>call LibraryConfig.bookRepository()</code> 출력</td><td>서비스 메서드를 부를 때마다 한 번</td><td>전체에서 한 번</td></tr>
+<tr><td><code>new MemoryBookRepository()</code> 실행</td><td>호출마다</td><td>한 번</td></tr>
+<tr><td>두 서비스가 가진 리포지토리</td><td>서로 다른 객체</td><td>같은 객체, 그리고 컨테이너의 빈과도 같은 객체</td></tr>
+</tbody></table></div>
+<p>클래스 파일은 두 실험에서 같은 것을 썼다. 스프링이 <code>LibraryConfig.class</code>를 고쳐 쓴 것도 아니고 컴파일러가 애너테이션을 보고 다른 코드를 낸 것도 아니다. 그런데 <code>loanService()</code> 안의 <code>bookRepository()</code>라는 같은 호출식이 한쪽에서는 새 객체를 만들고 다른 쪽에서는 이미 있는 객체를 돌려준다. 자바에서 같은 호출식이 다른 코드를 실행하게 되는 길은 하나다. 호출받는 객체의 실제 클래스가 다르고, 그 클래스가 메서드를 오버라이딩한 경우다. 그렇다면 컨테이너 안에 있는 설정 객체의 클래스를 확인해 보면 된다. <code>SpringMain</code>에 몇 줄을 더한다(실험 코드는 모두 <code>lib</code> 패키지에 두었다).</p>
+<pre><code class="language-java">LibraryConfig config = ac.getBean(LibraryConfig.class);
+System.out.println("config class      = " + config.getClass().getName());
+System.out.println("config superclass = " + config.getClass().getSuperclass().getName());
+for (Class<?> i : config.getClass().getInterfaces()) {
+    System.out.println("config interface  = " + i.getName());
+}
+System.out.println("config.bookRepository() == repo? " + (config.bookRepository() == repo));</code></pre>
+<pre data-label="실행 결과 (추가된 부분)"><code class="language-text">config class      = lib.LibraryConfig$$SpringCGLIB$$0
+config superclass = lib.LibraryConfig
+config interface  = org.springframework.context.annotation.ConfigurationClassEnhancer$EnhancedConfiguration
+config.bookRepository() == repo? true</code></pre>
+<p><code>LibraryConfig</code> 타입으로 조회했는데 돌아온 객체의 클래스는 <code>LibraryConfig$$SpringCGLIB$$0</code>이다. 우리가 쓴 적도 컴파일한 적도 없는 클래스이고, <code>LibraryConfig</code>를 상속한다. 자식 클래스의 객체는 부모 타입으로 조회되므로 <code>getBean(LibraryConfig.class)</code>가 성공한 것이다. 마지막 줄도 눈여겨볼 만하다. 설정 객체의 <code>bookRepository()</code>를 바깥에서 직접 불러도 새 객체가 아니라 컨테이너의 빈이 돌아온다.</p>
+
+<h3>@Configuration과 바이트코드 조작 — 설정 클래스의 자식이 대신 등록된다</h3>
+<p>레퍼런스 문서는 이 동작을 두 문장으로 설명한다. 모든 <code>@Configuration</code> 클래스는 시작 시점에 CGLIB으로 서브클래싱되고, 그 자식 클래스의 메서드는 부모 메서드를 불러 새 인스턴스를 만들기 전에 먼저 컨테이너에 캐시된 빈이 있는지 확인한다. CGLIB은 실행 중에 바이트코드를 만들어 새 클래스를 정의하는 라이브러리다. 스프링은 이것을 <code>org.springframework.cglib</code> 패키지로 옮겨 <code>spring-core</code> JAR 안에 넣어 두었으므로 따로 의존성을 추가할 필요가 없다. 이 절에서는 그 두 문장을 풀어, 누가 언제 클래스를 바꾸고 만들어진 클래스가 어떻게 생겼으며 무엇을 기준으로 판단하는지를 차례로 본다.</p>
+<h4>누가 언제 바꾸는가</h4>
+<p>03회에서 컨테이너가 객체를 만들기 전에 먼저 빈 정의(BeanDefinition)를 모은다는 것을 보았다. 교체는 그 두 단계 사이, 즉 빈 정의는 다 모였지만 빈 객체는 아직 하나도 만들어지지 않은 시점에 일어난다. 이 시점에 끼어들어 빈 정의를 손볼 수 있는 확장 지점이 빈 팩터리 후처리기(<code>BeanFactoryPostProcessor</code>)이고, 설정 클래스를 담당하는 후처리기가 앞에서 싱글톤 목록에 보였던 <code>ConfigurationClassPostProcessor</code>다.</p>
+<figure class="flow-figure"><figcaption>컨테이너 시작부터 설정 클래스가 자식으로 바뀌기까지</figcaption><ol class="flow">
+<li><strong>설정 클래스 등록</strong><span><code>new AnnotationConfigApplicationContext(LibraryConfig.class)</code>가 <code>LibraryConfig</code>를 빈 정의로 등록한다. 이때의 빈 클래스는 원본이다.</span></li>
+<li><strong>설정 클래스 해석</strong><span><code>refresh()</code>가 빈 팩터리 후처리기를 실행한다. <code>ConfigurationClassPostProcessor</code>가 <code>@Bean</code> 메서드를 읽어 메서드마다 빈 정의를 하나씩 등록한다. 각 정의에는 "<code>libraryConfig</code> 빈의 <code>bookRepository</code> 메서드를 불러서 만든다"는 정보가 담긴다.</span></li>
+<li><strong>자식 클래스 생성</strong><span>같은 후처리기가 <code>ConfigurationClassEnhancer</code>를 써서 <code>LibraryConfig</code>를 상속하는 클래스의 바이트코드를 만들고 JVM에 클래스로 정의한다.</span></li>
+<li><strong>빈 정의 교체</strong><span><code>libraryConfig</code> 빈 정의의 클래스를 원본에서 방금 만든 자식 클래스로 바꾼다.</span></li>
+<li><strong>싱글톤 생성</strong><span>컨테이너가 <code>libraryConfig</code> 빈을 만들 때 자식 클래스의 인스턴스가 생긴다. 이후 <code>@Bean</code> 메서드는 모두 이 인스턴스를 대상으로 호출된다.</span></li>
+</ol></figure>
+<p>빈 정의를 직접 꺼내 보면 이 흐름의 결과가 남아 있다. <code>ac.getBeanDefinition("bookRepository")</code>의 <code>getFactoryBeanName()</code>은 <code>libraryConfig</code>, <code>getFactoryMethodName()</code>은 <code>bookRepository</code>를 돌려주고, <code>ac.getBeanDefinition("libraryConfig").getBeanClassName()</code>은 <code>lib.LibraryConfig$$SpringCGLIB$$0</code>을 돌려준다. 원본 <code>LibraryConfig</code>의 인스턴스는 컨테이너 안에서 한 번도 만들어지지 않는다.</p>
+<p>클래스 파일이 디스크에 없는데 어떻게 클래스가 생기는가. JVM에게 클래스는 클래스 파일 형식에 맞는 바이트 배열이면 되고, 그 배열이 파일에서 왔는지 메모리에서 방금 만들어졌는지는 따지지 않는다. CGLIB은 부모 클래스의 메서드 목록을 읽어 자식 클래스의 바이트코드를 바이트 배열로 조립한 뒤 JVM에 넘겨 클래스로 정의한다. 스프링이 포함한 CGLIB의 소스를 보면 이때 JDK 9부터 있는 <code>MethodHandles.Lookup.defineClass</code>를 우선 쓰고, 안 되면 <code>ClassLoader.defineClass</code>로 물러선다. 이름은 원본 이름 뒤에 <code>$$SpringCGLIB$$</code>와 일련번호를 붙여 짓는다.</p>
+<h4>만들어진 클래스를 들여다본다</h4>
+<p>메모리에만 있는 클래스지만 꺼내 볼 방법이 있다. 시스템 프로퍼티 <code>cglib.debugLocation</code>에 디렉터리를 지정하고 실행하면 CGLIB이 만든 바이트 배열을 그 디렉터리에 <code>.class</code> 파일로 떨군다. 그 파일을 <code>javap</code>로 열었다.</p>
+<pre data-label="java -Dcglib.debugLocation=dump ... 후 javap -p (일부, 줄바꿈 정리)"><code class="language-text">public class lib.LibraryConfig$$SpringCGLIB$$0 extends lib.LibraryConfig
+    implements org.springframework.context.annotation.ConfigurationClassEnhancer$EnhancedConfiguration {
+  private org.springframework.cglib.proxy.MethodInterceptor CGLIB$CALLBACK_0;
+  private org.springframework.cglib.proxy.MethodInterceptor CGLIB$CALLBACK_1;
+  private org.springframework.cglib.proxy.NoOp CGLIB$CALLBACK_2;
+  public org.springframework.beans.factory.BeanFactory $$beanFactory;
+
+  final lib.LoanService CGLIB$loanService$0();
+  public final lib.LoanService loanService();
+  final lib.BookRepository CGLIB$bookRepository$1();
+  public final lib.BookRepository bookRepository();
+  final lib.SearchService CGLIB$searchService$2();
+  public final lib.SearchService searchService();
+  public final void setBeanFactory(org.springframework.beans.factory.BeanFactory)
+      throws org.springframework.beans.BeansException;
+  // 정적 필드와 보조 메서드는 생략
+}</code></pre>
+<p>읽을 것은 네 가지다. 첫째, <code>extends lib.LibraryConfig</code>. 실제로 자식 클래스다. 둘째, <code>$$beanFactory</code> 필드. 이 설정 객체가 속한 컨테이너를 가리킨다. 자식 클래스가 구현하는 <code>EnhancedConfiguration</code>은 <code>BeanFactoryAware</code>를 확장한 인터페이스여서 컨테이너가 설정 객체를 만들어 초기화하는 과정에서 <code>setBeanFactory(...)</code>를 불러 주고, 그때 이 필드가 채워진다. 셋째, 우리가 쓴 세 <code>@Bean</code> 메서드가 같은 이름과 시그니처로 다시 선언되어 있다. 오버라이딩이다. 넷째, 각 메서드 옆에 <code>CGLIB$loanService$0</code>처럼 낯선 이름의 메서드가 하나씩 더 있다. 오버라이딩한 메서드와 그 짝의 바이트코드를 보면 역할이 드러난다.</p>
+<pre data-label="javap -p -c (loanService 관련 부분, 앞쪽의 콜백 바인딩 코드와 주석의 긴 시그니처는 줄였다)"><code class="language-text">  public final lib.LoanService loanService();
+    Code:
+      ...
+      21: aload_0
+      22: getstatic     #49    // Field CGLIB$loanService$0$Method:Ljava/lang/reflect/Method;
+      25: getstatic     #51    // Field CGLIB$emptyArgs:[Ljava/lang/Object;
+      28: getstatic     #53    // Field CGLIB$loanService$0$Proxy:Lorg/springframework/cglib/proxy/MethodProxy;
+      31: invokeinterface #59,  5    // InterfaceMethod org/springframework/cglib/proxy/MethodInterceptor.intercept
+      36: checkcast     #61    // class lib/LoanService
+      39: areturn
+
+  final lib.LoanService CGLIB$loanService$0();
+    Code:
+       0: aload_0
+       1: invokespecial #41    // Method lib/LibraryConfig.loanService:()Llib/LoanService;
+       4: areturn</code></pre>
+<p>오버라이딩한 <code>loanService()</code>는 직접 아무 일도 하지 않는다. 자기 자신(<code>aload_0</code>), 호출된 메서드를 나타내는 <code>Method</code> 객체, 인자 배열, 그리고 부모 메서드로 가는 통로(<code>MethodProxy</code>)를 스택에 쌓아 인터셉터의 <code>intercept(...)</code>에 넘기고, 인터셉터가 돌려준 것을 그대로 반환한다. 짝 메서드 <code>CGLIB$loanService$0()</code>의 본문은 <code>invokespecial LibraryConfig.loanService</code> 한 줄, 자바로 쓰면 <code>super.loanService()</code>다. 인터셉터가 "원본을 실행하라"고 결정했을 때 타는 통로가 이것이다. 전체를 자바 문법으로 풀어 쓰면 다음과 같은 모양이다.</p>
+<pre data-label="생성된 클래스를 자바로 풀어 쓴 모습 (개념 표현)"><code class="language-text">public class LibraryConfig$$SpringCGLIB$$0 extends LibraryConfig implements EnhancedConfiguration {
+
+    public BeanFactory $$beanFactory;               // 이 설정 객체가 속한 컨테이너
+    private MethodInterceptor CGLIB$CALLBACK_0;     // @Bean 메서드 담당 인터셉터
+
+    @Override
+    public final LoanService loanService() {
+        return (LoanService) CGLIB$CALLBACK_0.intercept(this, loanService의 Method, 빈 인자 배열, 부모 호출 통로);
+    }
+
+    final LoanService CGLIB$loanService$0() {       // 부모의 원본으로 가는 통로
+        return super.loanService();
+    }
+
+    // bookRepository(), searchService()도 같은 모양
+}</code></pre>
+<h4>가로채기가 가능한 이유 — 자기 메서드 호출도 가상 호출이다</h4>
+<p>자식 클래스가 메서드를 오버라이딩했다고 해도, 문제의 호출은 부모 클래스 <code>LibraryConfig</code>의 메서드 본문 안에 있다. 부모의 코드가 자식의 메서드로 들어가는 이유는 원본 <code>loanService()</code>의 바이트코드에 있다.</p>
+<pre data-label="javap -c lib.LibraryConfig (loanService 뒷부분)"><code class="language-text">       8: new           #26                 // class lib/LoanService
+      11: dup
+      12: aload_0
+      13: invokevirtual #28                 // Method bookRepository:()Llib/BookRepository;
+      16: invokespecial #34                 // Method lib/LoanService."<init>":(Llib/BookRepository;)V
+      19: areturn</code></pre>
+<p>소스의 <code>bookRepository()</code>는 <code>this.bookRepository()</code>를 줄여 쓴 것이다. 컴파일러는 <code>this</code>를 스택에 올리고(<code>aload_0</code>) <code>invokevirtual</code>을 낸다. 자바 기본편에서 다형성을 배울 때 본 그 명령이다. <code>invokevirtual</code>은 컴파일 시점의 타입이 아니라 스택에 놓인 객체의 실제 클래스에서 출발해 실행할 메서드를 고른다. 컨테이너 안에서 <code>this</code>는 자식 클래스의 인스턴스이므로, 부모의 코드에 적힌 <code>invokevirtual bookRepository</code>는 자식이 오버라이딩한 <code>bookRepository()</code>를 실행한다. 원본 클래스 파일을 한 바이트도 고치지 않고 동작을 바꿀 수 있는 것은 이 호출이 처음부터 실행 시점에 결정되도록 컴파일되어 있기 때문이다.</p>
+<p>자식 클래스 방식이어야 하는 이유도 여기서 나온다. 원본 객체를 따로 두고 그 앞에 대리 객체를 세워 호출을 넘겨주는 구조였다면, 원본 객체의 메서드 안에서 <code>this</code>는 원본 자신이고 자기 메서드 호출은 대리 객체를 거치지 않는다. 뒤 권에서 배울 스프링 AOP의 프록시가 그런 구조여서, 같은 객체 안의 메서드를 직접 부르면 프록시의 부가 기능이 적용되지 않는다는 제약이 있다. <code>@Configuration</code>의 경우는 원본 객체가 따로 없고 자식 클래스의 인스턴스가 곧 설정 객체이므로 자기 호출까지 가로챈다.</p>
+<h4>인터셉터는 무엇을 보고 판단하는가</h4>
+<p>오버라이딩한 메서드가 호출을 넘기는 인터셉터는 <code>ConfigurationClassEnhancer</code> 안의 <code>BeanMethodInterceptor</code>다. 하는 일의 뼈대는 분기 하나다.</p>
+<pre data-label="BeanMethodInterceptor.intercept의 뼈대 (의사 코드)"><code class="language-text">intercept(설정객체, 호출된 @Bean 메서드, 인자, 부모 호출 통로):
+    beanFactory = 설정객체의 $$beanFactory 필드
+    beanName    = 그 @Bean 메서드가 정의하는 빈의 이름
+
+    if (지금 컨테이너가 바로 이 메서드를 불러 빈을 만드는 중인가?)
+        return 부모 호출 통로로 원본 메서드 실행          // 여기서만 new가 일어난다
+    else
+        return beanFactory.getBean(beanName)              // 레지스트리에 있는 것을 돌려준다</code></pre>
+<p>조건문의 판단 근거는 스레드별 기록이다. 컨테이너는 <code>@Bean</code> 메서드를 리플렉션으로 부르기 직전에 그 <code>Method</code>를 <code>ThreadLocal</code> 변수(<code>SimpleInstantiationStrategy</code>의 <code>currentlyInvokedFactoryMethod</code>)에 적어 두고, 호출이 끝나면 이전 값으로 되돌린다. <code>ThreadLocal</code>은 스레드마다 값을 따로 갖는 변수여서 "지금 이 스레드가 어느 팩터리 메서드를 실행하는 중인가"를 기록하기에 알맞다. 인터셉터는 방금 가로챈 메서드의 이름과 매개변수 타입이 그 기록과 같은지 비교한다. 같으면 컨테이너가 빈을 만들려고 부른 것이고, 다르면 다른 <code>@Bean</code> 메서드의 본문이나 바깥 코드가 부른 것이다.</p>
+<p>이 규칙으로 <code>LibraryConfig</code>의 시작 과정을 한 단계씩 따라가 본다. 컨테이너는 빈 정의가 등록된 순서인 <code>libraryConfig</code>, <code>bookRepository</code>, <code>loanService</code>, <code>searchService</code> 순으로 싱글톤을 만든다.</p>
+<div class="table-wrap"><table><thead><tr><th>단계</th><th>누가 무엇을 호출하는가</th><th>스레드에 기록된 팩터리 메서드</th><th>인터셉터의 판단</th><th>결과</th></tr></thead><tbody>
+<tr><td>1</td><td>컨테이너가 <code>bookRepository</code> 빈을 만들려고 설정 객체의 <code>bookRepository()</code>를 리플렉션으로 호출</td><td><code>bookRepository</code></td><td>기록과 같다 → 원본 실행</td><td>로그 한 줄, <code>new MemoryBookRepository()</code>, 레지스트리에 등록</td></tr>
+<tr><td>2</td><td>컨테이너가 <code>loanService</code> 빈을 만들려고 <code>loanService()</code>를 호출</td><td><code>loanService</code></td><td>기록과 같다 → 원본 실행</td><td>로그 한 줄, 원본 본문 진입</td></tr>
+<tr><td>3</td><td>원본 <code>loanService()</code> 본문의 <code>this.bookRepository()</code></td><td><code>loanService</code> (그대로)</td><td>기록과 다르다 → <code>getBean("bookRepository")</code></td><td>1단계에서 등록된 객체를 반환. 원본 <code>bookRepository()</code>는 실행되지 않는다</td></tr>
+<tr><td>4</td><td>컨테이너가 <code>searchService()</code>를 호출하고, 그 본문이 <code>this.bookRepository()</code>를 호출</td><td><code>searchService</code></td><td>2, 3단계와 같다</td><td>같은 리포지토리 객체가 주입된다</td></tr>
+</tbody></table></div>
+<p>실행 결과에서 <code>call LibraryConfig.bookRepository()</code>가 한 번만 찍힌 이유가 3단계다. 자식의 <code>bookRepository()</code>는 호출되었지만 인터셉터가 원본으로 내려보내지 않았으므로 원본 본문의 <code>println</code>과 <code>new</code>가 실행되지 않았다. 1단계에서 컨테이너가 리플렉션으로 호출할 때 자식의 메서드가 실행되는 것도 같은 원리다. <code>Method.invoke</code>의 Javadoc은 인스턴스 메서드를 호출할 때 대상 객체의 실행 시점 타입에 따른 오버라이딩이 적용된다고 적고 있다.</p>
+<p>선언 순서를 바꾸면 어떻게 되는지도 확인했다. <code>loanService()</code>, <code>searchService()</code>, <code>bookRepository()</code> 순으로 선언한 설정 클래스에서는 출력이 다음과 같다.</p>
+<pre data-label="실행 결과 (bookRepository()를 맨 뒤에 선언한 경우)"><code class="language-text">call OrderConfig.loanService()
+call OrderConfig.bookRepository()
+  new MemoryBookRepository()
+call OrderConfig.searchService()</code></pre>
+<p>이번에는 <code>loanService</code>가 먼저 만들어진다. 원본 <code>loanService()</code>가 <code>this.bookRepository()</code>를 부르면 인터셉터는 기록(<code>loanService</code>)과 다르다고 보고 <code>getBean("bookRepository")</code>를 부른다. 레지스트리에 아직 그 빈이 없으므로 컨테이너가 그 자리에서 만들기 시작한다. 기록을 <code>bookRepository</code>로 바꾸고 설정 객체의 <code>bookRepository()</code>를 호출하면, 이번에는 기록과 같으므로 원본이 실행되어 객체가 만들어지고 등록된다. 호출이 끝나면 기록은 <code>loanService</code>로 되돌아가고 <code>loanService()</code>의 본문이 이어진다. 선언 순서와 무관하게 리포지토리는 한 번만 만들어진다. 어느 메서드가 먼저 불리든 "레지스트리에 없으면 컨테이너가 만들고, 있으면 그것을 준다"는 규칙이 같기 때문이다.</p>
+<aside class="note">실제 인터셉터에는 분기가 더 있다. 호출된 메서드가 <code>FactoryBean</code>을 만드는 경우와 스코프 프록시가 걸린 빈의 경우를 따로 처리한다. 또 <code>getBean</code>이 돌려준 객체가 메서드의 반환 타입과 맞지 않으면 예외를 던진다. 싱글톤이 아닌 스코프의 빈이라면 <code>getBean</code>이 그 스코프의 규칙대로 객체를 돌려준다. 스코프는 08회에서 다룬다.</aside>
+
+<x-visual id="spring-core-basic-04-cglib-intercept" title="컨테이너가 loanService 빈을 만드는 동안 CGLIB 자식 클래스가 bookRepository 호출을 가로채 레지스트리의 빈을 돌려주는 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>컨테이너의 호출은 원본 메서드로 내려가고, 원본 메서드 안의 자기 호출은 인터셉터가 레지스트리 조회로 바꾼다는 두 갈래를 한 그림에서 보여 준다.</x-hint>
+<x-prompt>깔끔한 평면 벡터 스타일의 시퀀스 다이어그램, 흰 배경. 위쪽에 참여자 상자 네 개가 왼쪽부터 "컨테이너", "설정 객체 (CGLIB 자식)", "LibraryConfig 원본 코드", "싱글톤 레지스트리" 순으로 놓이고 각 상자에서 아래로 생명선이 내려온다. 위에서 아래로 번호가 붙은 화살표: ① "컨테이너"에서 "설정 객체 (CGLIB 자식)"로 실선 화살표, 라벨 "loanService() 호출". ② "설정 객체 (CGLIB 자식)"에서 "LibraryConfig 원본 코드"로 실선 화살표, 라벨 "컨테이너의 호출 → 원본 실행". ③ "LibraryConfig 원본 코드"에서 "설정 객체 (CGLIB 자식)"로 되돌아가는 굵은 강조색 화살표, 라벨 "this.bookRepository()". ④ "설정 객체 (CGLIB 자식)"에서 "싱글톤 레지스트리"로 실선 화살표, 라벨 "getBean(bookRepository)". ⑤ "싱글톤 레지스트리"에서 "LibraryConfig 원본 코드"로 점선 화살표, 라벨 "이미 있는 객체 반환". ⑥ "LibraryConfig 원본 코드"에서 "컨테이너"로 점선 화살표, 라벨 "LoanService 완성". ③번 화살표 옆에 작은 메모 상자 "원본의 new는 실행되지 않는다". 글자는 한국어와 영문 식별자, 산세리프, 선명하게.</x-prompt>
+<x-caption>컨테이너가 부른 호출은 원본 메서드로 내려가고, 원본 본문 안에서 다른 @Bean 메서드를 부르는 호출은 레지스트리 조회로 바뀐다.</x-caption>
+</x-visual>
+
+<h3>프록시가 없으면 — 라이트 모드와 proxyBeanMethods</h3>
+<p>자식 클래스가 이 모든 일을 한다면, 자식 클래스가 만들어지지 않을 때는 어떻게 되는가. <code>LibraryConfig</code>에서 <code>@Configuration</code>만 지우고 <code>@Bean</code>은 그대로 둔 <code>LiteConfig</code>를 만들어 같은 방식으로 컨테이너에 넘겼다.</p>
+<pre data-label="실행 결과 (@Configuration을 지운 LiteConfig)"><code class="language-text">call LiteConfig.bookRepository()
+  new MemoryBookRepository()
+call LiteConfig.loanService()
+call LiteConfig.bookRepository()
+  new MemoryBookRepository()
+call LiteConfig.searchService()
+call LiteConfig.bookRepository()
+  new MemoryBookRepository()
+config class = lib.LiteConfig
+loan.repo == bean repo?   false
+loan.repo == search.repo? false</code></pre>
+<p>예외도 경고도 없이 시작된다. <code>@Bean</code> 메서드 셋은 여전히 빈으로 등록되고, 각 빈은 레지스트리에 하나씩 들어간다. 달라진 것은 설정 객체의 클래스가 원본 <code>LiteConfig</code>라는 점 하나다. 가로챌 자식이 없으니 <code>loanService()</code> 안의 <code>bookRepository()</code>는 평범한 자바 메서드 호출이 되어 새 객체를 만든다. 리포지토리가 셋 생겼고, 그중 컨테이너가 아는 것은 첫 번째뿐이다. 두 서비스 안에 들어간 나머지 둘은 레지스트리에 없는 객체다. 대출 서비스로 저장한 책이 검색 서비스에서도, <code>getBean(BookRepository.class)</code>로 꺼낸 리포지토리에서도 보이지 않는다. 이 회차 첫머리에서 본 문제가 스프링 안에서 조용히 되살아난 것이다.</p>
+<p>레퍼런스 문서는 <code>@Configuration</code>이 없는 클래스의 <code>@Bean</code> 메서드, 그리고 <code>@Configuration(proxyBeanMethods = false)</code>로 선언한 클래스의 <code>@Bean</code> 메서드가 처리되는 방식을 "라이트(lite) 모드"라고 부른다. 이 모드의 <code>@Bean</code> 메서드는 특별한 실행 시점 처리가 없는 일반적인 팩터리 메서드이고, 자바 코드에서 직접 부르면 가로채지지 않아 매번 새 인스턴스가 만들어진다고 적혀 있다. 자식 클래스를 만드는 기본 방식은 이와 구분해 풀(full) 모드라고 한다.</p>
+<h4>proxyBeanMethods = false와 매개변수 주입</h4>
+<p><code>proxyBeanMethods</code>는 스프링 프레임워크 5.2에서 <code>@Configuration</code>에 추가된 속성이고 기본값은 <code>true</code>다. <code>false</code>로 두면 자식 클래스를 만들지 않는다. 그 대신 <code>@Bean</code> 메서드끼리 직접 부르지 말고, 필요한 빈을 메서드의 매개변수로 받아야 한다.</p>
+<pre><code class="language-java">@Configuration(proxyBeanMethods = false)
+public class NoProxyConfig {
+
+    @Bean
+    public BookRepository bookRepository() {
+        System.out.println("call NoProxyConfig.bookRepository()");
+        return new MemoryBookRepository();
+    }
+
+    @Bean
+    public LoanService loanService(BookRepository bookRepository) {       // 컨테이너가 인자를 채운다
+        System.out.println("call NoProxyConfig.loanService(repo)");
+        return new LoanService(bookRepository);
+    }
+
+    @Bean
+    public SearchService searchService(BookRepository bookRepository) {
+        System.out.println("call NoProxyConfig.searchService(repo)");
+        return new SearchService(bookRepository);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">call NoProxyConfig.bookRepository()
+  new MemoryBookRepository()
+call NoProxyConfig.loanService(repo)
+call NoProxyConfig.searchService(repo)
+config class = lib.NoProxyConfig
+loan.repo == bean repo?   true
+loan.repo == search.repo? true</code></pre>
+<p>설정 객체는 원본 클래스 그대로인데 리포지토리는 하나다. 컨테이너가 <code>loanService(...)</code>를 호출하기 전에 매개변수 타입에 맞는 빈을 레지스트리에서 찾아 인자로 넣어 주기 때문이다. 메서드 본문에는 다른 <code>@Bean</code> 메서드를 부르는 코드가 아예 없으므로 가로챌 것도 없다. 이 방식은 풀 모드에서도 똑같이 동작한다. 레퍼런스 문서는 자식 클래스를 만들지 않는 만큼 부담과 차지하는 공간이 줄어든다는 점을 이 방식의 부수 효과로 든다. 스프링 부트가 제공하는 자동 구성 클래스에 붙는 <code>@AutoConfiguration</code>(스프링 부트 2.7부터)도 <code>proxyBeanMethods</code>가 항상 <code>false</code>인 <code>@Configuration</code>이다.</p>
+<h4>상속으로 구현했기 때문에 생기는 제약</h4>
+<p>풀 모드의 가로채기는 오버라이딩에 기대므로, 자바에서 오버라이딩할 수 없는 것은 가로챌 수 없다. 각 경우를 실제로 돌려 확인했다.</p>
+<div class="table-wrap"><table><thead><tr><th>선언</th><th>결과</th><th>이유</th></tr></thead><tbody>
+<tr><td><code>@Configuration public final class</code></td><td>시작 실패: <code>@Configuration class 'FinalConfig' may not be final. Remove the final modifier to continue.</code></td><td><code>final</code> 클래스는 상속할 수 없다</td></tr>
+<tr><td><code>@Bean public final ...</code> 또는 <code>private</code> 메서드</td><td>시작 실패: <code>@Bean method 'bookRepository' must not be private or final; change the method's modifiers to continue.</code></td><td><code>final</code>·<code>private</code> 메서드는 오버라이딩할 수 없다</td></tr>
+<tr><td>생성자가 <code>private</code>뿐인 설정 클래스</td><td>시작 실패: <code>No visible constructors in class lib.PrivateCtorConfig</code></td><td>자식의 생성자가 부를 부모 생성자가 없다</td></tr>
+<tr><td><code>@Bean public static ...</code></td><td>시작은 된다. 그러나 다른 <code>@Bean</code> 메서드가 이 메서드를 직접 부르면 새 객체가 만들어진다</td><td>정적 메서드는 객체가 아니라 클래스에 묶여 있어 오버라이딩 대상이 아니다</td></tr>
+<tr><td><code>@Configuration(proxyBeanMethods = false) public final class</code></td><td>정상 시작</td><td>자식 클래스를 만들지 않으므로 제약이 없다</td></tr>
+</tbody></table></div>
+<p>앞의 세 줄은 스프링이 시작 시점에 검사해서 알려 주므로 놓칠 일이 없다. 조심할 것은 넷째 줄이다. 정적 <code>@Bean</code> 메서드를 가진 설정 클래스로 실험하면 설정 객체의 클래스는 <code>StaticConfig$$SpringCGLIB$$0</code>으로 바뀌지만, <code>loanService()</code>가 정적 <code>bookRepository()</code>를 부를 때마다 새 리포지토리가 만들어지고 서비스가 가진 것과 컨테이너의 빈이 서로 다른 객체가 된다. 레퍼런스 문서도 정적 <code>@Bean</code> 메서드에 대한 호출은 <code>@Configuration</code> 클래스 안에서도 가로채지지 않는다고 명시한다. 싱글톤 패턴 절에서 <code>private</code> 생성자가 상속을 막는다고 한 것이 여기서 실제 제약으로 돌아온다.</p>
+
+<h3>흔한 오해 다섯 가지</h3>
+<ul>
+<li><b>"스프링 빈은 JVM에 하나만 있다."</b> 범위는 컨테이너 하나, 빈 정의 하나다. 같은 클래스로 빈 정의를 둘 쓰면 객체가 둘이고, 컨테이너를 둘 띄우면 각자 따로 갖는다. 서버 프로세스를 여러 대 띄운 서비스라면 프로세스마다 컨테이너가 있으므로 "싱글톤 빈의 필드에 둔 카운터"는 서버마다 따로 센다.</li>
+<li><b>"싱글톤 빈은 스레드 안전하다."</b> 컨테이너가 보장하는 것은 객체가 한 번만 만들어지고 안전하게 공개된다는 것까지다. 그 객체의 필드를 여러 스레드가 고쳐 써도 되는지는 클래스를 쓴 사람이 책임진다. 오히려 싱글톤이기 때문에 모든 필드가 공유 자원이 된다.</li>
+<li><b>"무상태란 필드가 없다는 뜻이다."</b> 주입받은 의존 객체나 설정 값처럼 시작할 때 정해지고 바뀌지 않는 필드는 상태로 치지 않는다. 문제 되는 것은 특정 요청에 속한 값을 요청 처리 중에 필드에 쓰는 것이다.</li>
+<li><b>"@Bean만 붙이면 @Configuration은 있으나 없으나 같다."</b> 빈으로 등록되는 것까지는 같다. <code>@Bean</code> 메서드끼리 직접 호출하는 순간 달라진다. 풀 모드에서는 같은 빈이, 라이트 모드에서는 컨테이너가 모르는 새 객체가 나온다.</li>
+<li><b>"CGLIB 프록시가 요청마다 끼어들어 느려진다."</b> 자식 클래스로 바뀌는 것은 설정 클래스뿐이다. 싱글톤 목록에서 본 것처럼 <code>bookRepository</code> 빈의 클래스는 <code>MemoryBookRepository</code> 그대로이고 <code>LoanService</code>는 그 객체를 직접 가리킨다. 인터셉터가 동작하는 때는 누군가 설정 객체의 <code>@Bean</code> 메서드를 부를 때, 곧 대부분 시작할 때뿐이다.</li>
+</ul>
+
+<h3>다른 곳에서 다시 만나는 것</h3>
+<p>이 회차의 내용은 이 권의 나머지 회차가 딛고 서는 바닥이다. 05회의 컴포넌트 스캔은 설정 클래스에 <code>@Bean</code> 메서드를 쓰는 대신 클래스에 붙은 애너테이션을 찾아 빈 정의를 만드는데, 그렇게 등록된 빈도 기본 스코프는 싱글톤이고 같은 레지스트리에 들어간다. 06회의 생성자 주입은 싱글톤 빈의 의존 객체를 <code>final</code> 필드로 고정해, 이 회차에서 말한 "시작할 때 정해지고 바뀌지 않는 필드"를 문법으로 강제한다. 07회의 생명주기 콜백은 빈이 만들어져 의존관계 주입이 끝난 뒤와 컨테이너가 닫힐 때 호출되는 메서드를 다루고, 08회는 싱글톤이 아닌 스코프와, 싱글톤 빈이 수명이 더 짧은 빈을 주입받을 때 생기는 문제를 다룬다. 08회의 해법 가운데 하나가 다시 CGLIB으로 만든 자식 클래스다.</p>
+<p>권 밖으로 나가도 같은 구조가 반복된다. 스프링 MVC의 컨트롤러는 싱글톤 빈이므로 요청 데이터를 컨트롤러의 필드에 두면 이 회차의 <code>FareService</code>와 똑같이 깨진다. 스프링 핵심 원리 고급편에서 배울 AOP와, 스프링 DB 편에서 배울 선언적 트랜잭션은 빈을 감싸는 프록시로 동작하는데, 그 프록시를 만드는 수단 가운데 하나가 이 회차에서 본 CGLIB의 자식 클래스 생성이다. 그때 "클래스나 메서드가 <code>final</code>이면 적용되지 않는다", "같은 객체 안의 메서드 호출에는 적용되지 않는다" 같은 제약을 만나면, 상속과 <code>invokevirtual</code>이라는 이 회차의 설명으로 돌아오면 된다. 락, <code>volatile</code>, 원자적 연산, <code>ThreadLocal</code>의 원리는 자바 고급 1편에서 바닥부터 다시 다룬다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>요청마다 객체를 만드는 방식의 문제</dt><dd>저장소·커넥션 풀·캐시처럼 함께 봐야 할 객체가 요청별로 갈라져 틀리게 동작하고, 공유할 것이 없는 객체도 요청 수에 비례해 만들어지고 버려진다.</dd>
+<dt>싱글톤 패턴</dt><dd>private 생성자, 정적 필드, 정적 접근 메서드로 클래스가 스스로 인스턴스를 하나로 제한한다. 정적 필드 초기화 방식이 락 없이 안전한 것은 JVM이 클래스 초기화를 클래스별 초기화 락으로 한 번만 실행하기 때문이다(JLS §12.4).</dd>
+<dt>싱글톤 패턴의 비용</dt><dd>쓰는 쪽이 구체 클래스에 의존해 DIP·OCP를 어기고, 테스트에서 교체하기 어렵고, 상속이 막히며, "하나"의 범위는 클래스 로더 단위이고 리플렉션으로 깨진다.</dd>
+<dt>싱글톤 레지스트리</dt><dd>스프링 컨테이너는 완성된 빈을 빈 이름을 키로 하는 <code>ConcurrentHashMap</code>(<code>singletonObjects</code>)에 보관하고 같은 이름의 조회에는 그 객체를 돌려준다. 클래스는 평범하게 두고 "하나"의 보장을 컨테이너가 맡는다.</dd>
+<dt>스프링 싱글톤의 범위와 생성 시점</dt><dd>컨테이너마다, 빈 정의마다 하나다. <code>ApplicationContext</code>는 기본적으로 시작할 때 싱글톤을 모두 만들어 설정 오류를 기동 단계에서 드러낸다.</dd>
+<dt>무상태 설계</dt><dd>싱글톤 객체의 필드는 힙에 한 칸뿐이어서 모든 요청 스레드가 공유한다. 요청별 값은 스레드마다 따로 있는 스택 프레임의 지역 변수·매개변수·반환값으로 다루고, 필드에는 바뀌지 않는 의존 객체와 설정 값만 둔다.</dd>
+<dt>@Configuration과 CGLIB</dt><dd>빈 객체를 만들기 전에 <code>ConfigurationClassPostProcessor</code>가 설정 클래스를 상속한 자식 클래스를 생성해 빈 정의의 클래스를 바꾼다. 자식은 <code>@Bean</code> 메서드를 오버라이딩해, 컨테이너가 부른 호출만 원본으로 보내고 나머지는 <code>getBean</code>으로 돌린다.</dd>
+<dt>라이트 모드</dt><dd><code>@Configuration</code>이 없거나 <code>proxyBeanMethods = false</code>이면 자식 클래스가 없어 <code>@Bean</code> 메서드끼리의 직접 호출이 평범한 자바 호출이 된다. 이때는 의존 빈을 메서드 매개변수로 받아야 한다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 "가끔 다른 사용자의 값이 보인다", "부하가 걸릴 때만 금액이 틀린다"는 제보를 받으면 가장 먼저 의심할 곳이 싱글톤 빈의 필드다. 컨트롤러·서비스·리포지토리 클래스에서 <code>final</code>이 아닌 인스턴스 필드를 찾고, 그 필드에 값을 쓰는 코드가 요청 처리 경로에 있는지 본다. 값을 쓰지 않더라도 스레드 안전하지 않다고 문서에 적힌 객체를 필드에 두고 여러 요청이 함께 쓰는 경우도 같은 종류의 문제다. 이런 버그는 단일 스레드 테스트를 전부 통과하므로 코드 리뷰에서 "이 필드는 누구의 값인가"를 묻는 습관으로 막는 편이 훨씬 싸다.</p>
+<p>상태가 정말 필요할 때는 그 상태의 범위를 먼저 정한다. 한 요청 안에서만 필요하면 매개변수와 반환값으로 넘기거나 요청마다 새 객체를 만든다. 한 서버 프로세스 안에서 모든 요청이 공유해야 하면 싱글톤 빈의 필드에 두되 스레드 안전한 자료구조를 쓴다. 서버 여러 대가 공유해야 하면 싱글톤 빈의 필드로는 해결되지 않는다. 스프링의 싱글톤은 컨테이너 단위이므로 서버가 세 대면 그 필드도 셋이다. 이 경우 상태는 데이터베이스 같은 외부 저장소로 나가야 한다. "싱글톤이니까 하나"라는 생각으로 메모리 카운터나 메모리 캐시에 정합성이 필요한 값을 두었다가 서버를 늘리면서 문제가 되는 일이 흔하다.</p>
+<p><code>@Configuration</code>의 풀 모드와 라이트 모드는 편의와 제약의 교환이다. 풀 모드는 메서드 호출로 의존관계를 표현할 수 있어 읽기 쉽지만 시작할 때 클래스를 하나 더 생성하고, 클래스와 메서드에 <code>final</code>을 쓸 수 없다. <code>proxyBeanMethods = false</code>는 그 비용과 제약을 없애는 대신 "<code>@Bean</code> 메서드를 직접 부르지 않는다"는 규율을 사람에게 맡긴다. 어느 쪽을 택하든 의존 빈을 메서드 매개변수로 받는 방식은 두 모드에서 똑같이 올바르게 동작하므로, 팀의 설정 클래스를 이 방식으로 통일해 두면 모드를 바꿔도 동작이 달라지지 않는다. 설정 클래스에서 <code>@Configuration</code>을 실수로 빠뜨려도 오류 없이 기동된다는 점은 기억해 둘 만하다. 같은 타입의 객체가 둘 이상 만들어진 흔적(생성자 로그가 두 번 찍힌다, 저장한 데이터가 다른 빈에서 보이지 않는다)이 보이면 설정 객체의 <code>getClass()</code>를 찍어 보는 것이 가장 빠른 진단이다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 설정 클래스로 컨테이너를 시작할 때 <code>table</code>이 몇 번 출력되는지, 그리고 <code>QuoteService</code> 생성자가 받은 두 인자가 같은 객체인지 세 경우에 대해 답하라. (가) 아래 코드 그대로, (나) <code>@Configuration</code>을 지우고 클래스를 직접 컨테이너에 등록한 경우, (다) <code>@Configuration</code>은 두고 <code>priceTable()</code>에 <code>static</code>을 붙인 경우.
+<pre><code class="language-java">@Configuration
+class PriceConfig {
+    @Bean PriceTable priceTable() { System.out.println("table"); return new PriceTable(); }
+    @Bean QuoteService quoteService() { return new QuoteService(priceTable(), priceTable()); }
+    @Bean InvoiceService invoiceService() { return new InvoiceService(priceTable()); }
+}</code></pre></li>
+<li>아래 클래스가 싱글톤 빈으로 등록되어 있다. 요청 스레드 A가 <code>begin("kim")</code>과 <code>issue()</code>를, 요청 스레드 B가 <code>begin("lee")</code>와 <code>issue()</code>를 차례로 호출한다. A의 <code>issue()</code>가 돌려줄 수 있는 값을 모두 적고, 잘못된 값이 나오는 실행 순서를 힙의 필드 값 변화와 함께 표로 그려라. 그런 다음 무상태로 고쳐라.
+<pre><code class="language-java">public class CouponService {
+    private String currentUser;
+    public void begin(String user) { this.currentUser = user; }
+    public String issue() { return currentUser + "-COUPON"; }
+}</code></pre></li>
+<li>본문의 <code>LazyRegistry.getInstance()</code>에서 스레드 둘이 서로 다른 인스턴스를 돌려받게 되는 실행 순서를 (1) 검사, (2) 생성과 대입의 단계 이름으로 적어라. 그리고 <code>private static final Registry INSTANCE = new Registry();</code> 방식에서는 같은 일이 일어나지 않는 이유를 클래스 초기화 절차로 설명하라. 이 방식에서 인스턴스가 만들어지는 정확한 시점도 함께 답하라.</li>
+<li>같은 클래스 <code>MemoryBookRepository</code>를 반환하는 <code>@Bean</code> 메서드 둘(<code>mainRepository</code>, <code>archiveRepository</code>)이 있는 설정 클래스로 컨테이너를 세 개 만들었다. JVM 안에 <code>MemoryBookRepository</code> 객체는 몇 개인가? 싱글톤 패턴으로 만든 <code>Registry</code>를 이 세 컨테이너의 빈들이 함께 쓴다면 <code>Registry</code> 객체는 몇 개인가? 두 답이 다른 이유를 "하나의 단위"로 설명하라.</li>
+<li>동료가 설정 클래스를 <code>@Configuration public final class AppSettings</code>로 선언했더니 애플리케이션이 시작되지 않는다고 한다. 어떤 메시지가 나오며 왜 그런 제약이 있는지 설명하고, <code>final</code>을 유지하면서 시작되게 하는 방법과 그때 지켜야 할 규칙을 적어라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> (가) 한 번 출력되고 두 인자는 같은 객체다. 컨테이너가 <code>priceTable</code> 빈을 만들 때만 원본 메서드가 실행되고, <code>quoteService()</code>와 <code>invoiceService()</code> 본문의 호출 세 번은 자식 클래스의 인터셉터가 <code>getBean("priceTable")</code>로 돌린다. (나) 네 번 출력되고 두 인자는 다른 객체다. 자식 클래스가 없으므로 컨테이너의 호출 한 번, <code>quoteService()</code> 안의 두 번, <code>invoiceService()</code> 안의 한 번이 모두 원본을 실행한다. (다) 역시 네 번 출력되고 두 인자는 다른 객체다. 설정 클래스는 자식으로 바뀌지만 정적 메서드는 오버라이딩할 수 없어 가로채지지 않는다. 세 경우 모두 직접 실행해 확인한 결과다.</p>
+<p><b>2.</b> A의 <code>issue()</code>는 <code>kim-COUPON</code> 또는 <code>lee-COUPON</code>을 돌려줄 수 있다. 잘못된 값이 나오는 순서는 다음과 같다. ① A가 <code>begin("kim")</code> → 필드는 kim. ② B가 <code>begin("lee")</code> → 필드는 lee. ③ A가 <code>issue()</code> → 필드를 읽어 <code>lee-COUPON</code>. ④ B가 <code>issue()</code> → <code>lee-COUPON</code>. 두 스레드의 <code>this</code>가 힙의 같은 객체를 가리키고 <code>currentUser</code>는 그 객체 안에 한 칸뿐이기 때문이다. 고치려면 필드를 없애고 값을 매개변수로 받는다: <code>public String issue(String user) { return user + "-COUPON"; }</code>. <code>user</code>는 호출한 스레드의 스택 프레임에 놓이므로 다른 스레드가 볼 수 없다. (동기화 없이 필드를 읽고 쓰는 코드에서는 가시성 문제도 따로 있지만, 여기서 묻는 것은 덮어쓰기다.)</p>
+<p><b>3.</b> A가 (1)에서 <code>null</code>을 본다 → B가 (1)에서 <code>null</code>을 본다 → A가 (2)에서 객체 X를 만들어 대입하고 X를 반환 → B가 (2)에서 객체 Y를 만들어 대입하고 Y를 반환. 검사와 대입 사이에 다른 스레드가 검사를 통과할 수 있기 때문이다. 정적 필드 초기화 방식에서는 <code>new Registry()</code>가 클래스 초기화 메서드 안에 있고, JLS §12.4.2에 따라 클래스 초기화는 클래스별 초기화 락을 얻은 스레드 하나만 실행하며 다른 스레드는 그 초기화가 끝날 때까지 기다린다. 인스턴스가 만들어지는 시점은 JVM 시작 시가 아니라 <code>Registry</code>가 처음 초기화되는 때, 본문 예제에서는 <code>Registry.getInstance()</code>가 처음 호출되는 순간이다(JLS §12.4.1: 정적 메서드 호출은 초기화를 일으킨다).</p>
+<p><b>4.</b> <code>MemoryBookRepository</code>는 6개다. 스프링 싱글톤의 단위는 "컨테이너 하나 안의 빈 정의 하나"이고 3 × 2 = 6이다. <code>Registry</code>는 (세 컨테이너의 클래스가 같은 클래스 로더로 로드되었다면) 1개다. 싱글톤 패턴의 단위는 "클래스 로더 하나 안의 클래스 하나"이고 컨테이너가 몇 개인지는 관계가 없다. 정적 필드는 컨테이너가 아니라 클래스에 딸려 있기 때문이다.</p>
+<p><b>5.</b> <code>@Configuration class 'AppSettings' may not be final. Remove the final modifier to continue.</code>라는 설정 오류로 시작이 실패한다. 기본(풀) 모드에서 스프링은 설정 클래스를 상속한 자식 클래스를 만들어 <code>@Bean</code> 메서드를 오버라이딩하는데, <code>final</code> 클래스는 상속할 수 없기 때문이다. <code>final</code>을 유지하려면 <code>@Configuration(proxyBeanMethods = false)</code>로 선언한다. 이때는 자식 클래스가 만들어지지 않으므로 <code>@Bean</code> 메서드 안에서 다른 <code>@Bean</code> 메서드를 직접 호출하면 안 되고, 필요한 빈을 메서드 매개변수로 받아야 한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>스프링의 싱글톤 스코프 빈에서 "인스턴스가 하나"라는 말의 범위로 옳은 것은?</q>
+<o>JVM 전체에서 클래스마다 하나</o>
+<o>컨테이너 하나 안에서 빈 정의마다 하나</o>
+<o>클래스 로더마다 클래스 하나에 하나</o>
+<o>요청 스레드마다 하나</o>
+<why>싱글톤 레지스트리는 컨테이너마다 따로 있고 키가 빈 이름이므로, 범위는 컨테이너당·빈 정의당이다. 같은 클래스로 빈 정의를 둘 만들면 객체도 둘이고, 컨테이너를 둘 띄우면 각자 따로 만든다. "클래스 로더마다 클래스에 하나"는 싱글톤 패턴의 범위이고, 스레드마다 하나인 것은 스택 프레임이나 ThreadLocal의 성질이다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>싱글톤 빈으로 등록된 서비스 클래스의 필드 가운데, 동시에 들어온 두 요청의 값이 섞일 수 있는 것은?</q>
+<o><code>private final BookRepository bookRepository;</code> (생성자에서 주입)</o>
+<o><code>private final int baseFare;</code> (생성자에서 설정 값으로 초기화)</o>
+<o><code>private int fare;</code> (요청을 처리하는 메서드가 계산 결과를 대입)</o>
+<o><code>private static final int FARE_PER_KM = 100;</code></o>
+<why>싱글톤 객체의 인스턴스 필드는 힙에 한 칸뿐이고 모든 요청 스레드가 공유한다. 요청 처리 중에 값을 쓰는 필드는 다른 스레드가 덮어쓸 수 있다. 나머지 셋은 시작할 때 정해진 뒤 읽기만 하므로 공유되어도 문제가 없다. 지역 변수였다면 스레드마다 따로 있는 스택 프레임에 놓여 섞이지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>@Configuration</code> 클래스의 <code>loanService()</code> 본문이 <code>bookRepository()</code>를 직접 호출해도 새 객체가 아니라 컨테이너의 빈이 돌아오는 이유는?</q>
+<o>컨테이너에 등록된 설정 객체가 설정 클래스를 상속한 자식 클래스의 인스턴스이고, <code>this.bookRepository()</code>는 실행 시점의 클래스로 대상을 정하는 <code>invokevirtual</code>이어서 자식이 오버라이딩한 메서드가 실행되기 때문이다</o>
+<o>자바 컴파일러가 <code>@Bean</code> 애너테이션을 보고 메서드가 한 번만 실행되도록 바이트코드를 다르게 만들기 때문이다</o>
+<o>JVM이 인자가 같은 메서드 호출의 결과를 자동으로 캐시하기 때문이다</o>
+<o>스프링이 시작할 때 설정 클래스의 <code>.class</code> 파일을 고쳐서 디스크에 다시 저장하기 때문이다</o>
+<why>원본 클래스 파일은 그대로다. 스프링은 원본을 상속한 클래스를 실행 중에 생성해 빈 정의의 클래스를 바꾸고, 그 자식이 <code>@Bean</code> 메서드를 오버라이딩한다. 부모 코드 안의 자기 호출도 <code>invokevirtual</code>이므로 자식의 메서드로 들어가고, 인터셉터가 컨테이너의 호출이 아니라고 판단해 <code>getBean</code>으로 돌린다. 컴파일러와 JVM은 이런 일을 하지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>@Configuration</code>을 붙이지 않은 클래스에 <code>@Bean</code> 메서드들을 두고 컨테이너에 등록했다. <code>loanService()</code>가 본문에서 <code>bookRepository()</code>를 직접 호출한다면 어떤 일이 일어나는가?</q>
+<o>시작할 때 "@Configuration이 필요하다"는 예외가 난다</o>
+<o><code>@Bean</code> 메서드가 빈으로 등록되지 않는다</o>
+<o>풀 모드와 똑같이 컨테이너의 <code>bookRepository</code> 빈이 주입된다</o>
+<o>오류 없이 시작되지만, <code>LoanService</code>가 가진 리포지토리는 컨테이너가 관리하는 <code>bookRepository</code> 빈과 다른 객체다</o>
+<why>라이트 모드에서는 자식 클래스가 만들어지지 않으므로 <code>@Bean</code> 메서드끼리의 직접 호출은 평범한 자바 호출이고 매번 새 객체를 만든다. 빈 등록 자체는 정상이고 경고도 없어서 알아차리기 어렵다. 라이트 모드에서는 의존 빈을 메서드 매개변수로 받아야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>private static final Registry INSTANCE = new Registry();</code>로 만든 싱글톤이 <code>synchronized</code> 없이도 여러 스레드에서 한 번만 생성되는 근거는?</q>
+<o><code>private</code> 생성자는 JVM이 한 번만 호출되도록 제한하기 때문이다</o>
+<o>정적 필드 초기화 코드는 클래스 초기화 때 실행되고, JVM은 클래스 초기화를 클래스별 초기화 락으로 보호해 한 스레드만 실행하게 하기 때문이다</o>
+<o><code>static final</code> 필드는 컴파일 시점에 객체가 만들어져 클래스 파일에 저장되기 때문이다</o>
+<o><code>getInstance()</code>가 정적 메서드라서 한 번에 한 스레드만 실행할 수 있기 때문이다</o>
+<why>필드 초기화식은 컴파일러가 클래스 초기화 메서드에 넣는다. JLS §12.4.2는 클래스마다 고유한 초기화 락을 두고, 이미 다른 스레드가 초기화 중이면 끝날 때까지 기다리도록 정한다. <code>private</code>은 접근 검사일 뿐 호출 횟수를 제한하지 않고(리플렉션으로 다시 호출할 수 있다), 객체는 실행 중에 힙에 만들어지며, 정적 메서드는 여러 스레드가 동시에 실행할 수 있다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>싱글톤 패턴(singleton pattern)</dt><dd>클래스가 자기 인스턴스를 하나만 만들도록 스스로 제한하는 설계 패턴. private 생성자와 정적 필드, 정적 접근 메서드로 구현한다.</dd>
+<dt>클래스 초기화(class initialization)</dt><dd>정적 필드의 초기화식과 static 블록을 실행하는 단계. 클래스가 처음 쓰일 때 한 번, 클래스별 초기화 락의 보호 아래 실행된다.</dd>
+<dt>싱글톤 레지스트리(singleton registry)</dt><dd>객체를 이름으로 등록해 두고 이름마다 하나의 인스턴스만 유지하는 저장소. 스프링에서는 <code>DefaultSingletonBeanRegistry</code>가 이 역할을 한다.</dd>
+<dt>싱글톤 스코프(singleton scope)</dt><dd>스프링 빈의 기본 스코프. 컨테이너 하나 안에서 빈 정의 하나에 인스턴스 하나가 만들어져 공유된다.</dd>
+<dt>사전 인스턴스화(pre-instantiation)</dt><dd><code>ApplicationContext</code>가 시작하는 동안 지연 초기화가 아닌 싱글톤 빈을 모두 만들어 두는 동작.</dd>
+<dt>무상태(stateless)</dt><dd>특정 호출이나 특정 클라이언트에 속한 값을 객체의 필드에 남기지 않는 설계. 요청별 값은 지역 변수·매개변수·반환값으로 다룬다.</dd>
+<dt>CGLIB</dt><dd>실행 중에 바이트코드를 만들어 기존 클래스의 자식 클래스를 정의하는 라이브러리. 스프링은 <code>org.springframework.cglib</code> 패키지로 <code>spring-core</code>에 포함한다.</dd>
+<dt>풀 모드와 라이트 모드(full / lite mode)</dt><dd><code>@Bean</code> 메서드가 처리되는 두 방식. 풀 모드는 설정 클래스의 CGLIB 자식이 <code>@Bean</code> 메서드 호출을 컨테이너로 돌리고, 라이트 모드는 그런 처리 없이 평범한 팩터리 메서드로 다룬다.</dd>
+<dt>빈 팩터리 후처리기(BeanFactoryPostProcessor)</dt><dd>빈 정의가 모인 뒤, 빈 객체가 만들어지기 전에 빈 정의를 고칠 수 있는 확장 지점. 설정 클래스의 해석과 자식 클래스 교체가 여기서 일어난다.</dd>
+<dt>스레드 로컬(ThreadLocal)</dt><dd>스레드마다 값을 따로 갖는 변수. 스프링은 지금 호출 중인 팩터리 메서드를 여기에 기록해 <code>@Bean</code> 메서드 호출의 출처를 구분한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/core/beans/factory-scopes.html">Spring Framework Reference — Bean Scopes</a> — 싱글톤 스코프의 정의, GoF 싱글톤과의 차이(per-container and per-bean), 상태 유무에 따른 스코프 선택</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/core/beans/java/configuration-annotation.html">Spring Framework Reference — Using the @Configuration annotation</a> — @Configuration 클래스의 CGLIB 서브클래싱과 그에 따른 제약</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/6.2/core/beans/java/basic-concepts.html">Spring Framework Reference — Basic Concepts: @Bean and @Configuration</a> — 풀 모드와 라이트 모드, 라이트 모드에서의 @Bean 메서드 직접 호출</li>
+<li><a href="https://docs.spring.io/spring-framework/docs/6.2.x/javadoc-api/org/springframework/context/annotation/Configuration.html">Configuration (Spring Framework 6.2 API)</a> — proxyBeanMethods 속성(5.2부터, 기본값 true)과 설정 클래스 작성 제약</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-12.html">JLS §12.4 Initialization of Classes and Interfaces</a> — 클래스가 초기화되는 시점과 초기화 락을 쓰는 절차</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html">JVMS §2.5–2.6 Run-Time Data Areas, Frames</a> — 스레드별 JVM 스택과 공유 힙, 프레임과 지역 변수</li>
+</x-refs>

@@ -1,0 +1,834 @@
+<x-meta>
+deck: 인덱스가 있는데도 풀 테이블 스캔을 고르는 이유를 MySQL 옵티마이저의 비용 상수와 계산식으로 직접 따라가고, 인덱스 다이브·InnoDB 통계·히스토그램이 행 수 추정과 조인 순서를 어떻게 바꾸는지 엔진 소스 수준에서 살펴본다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>같은 쿼리가 조건 값과 버퍼 풀 상태에 따라 인덱스 레인지 스캔과 풀 테이블 스캔 사이를 오가는 이유를 페이지 읽기 비용과 행 평가 비용으로 계산해 보이고, 옵티마이저 트레이스의 <code>range_analysis</code>에서 그 비교를 찾아 읽을 수 있다.</li>
+<li>인덱스 다이브와 인덱스 통계(<code>n_diff_pfxNN</code>, 키당 행 수)가 각각 어떤 상황에서 쓰이는지 구분하고, <code>mysql.innodb_table_stats</code>와 <code>mysql.innodb_index_stats</code>를 조회해 옵티마이저가 보고 있는 숫자를 확인할 수 있다.</li>
+<li>통계가 낡았거나 표본이 부족해 추정이 빗나간 상황을 알아보고 <code>ANALYZE TABLE</code>, 표본 페이지 수 조정, 테이블별 통계 옵션으로 대응할 수 있다.</li>
+<li>히스토그램을 만들고 <code>COLUMN_STATISTICS</code>의 버킷에서 등호·범위 조건의 선택도를 손으로 계산해 EXPLAIN의 <code>filtered</code>와 맞춰 볼 수 있다.</li>
+<li>히스토그램이 실행 계획을 바꾸는 경로(조건 필터링 → 선행 행 수 → 조인 순서)와 바꾸지 못하는 경우를 구분해 히스토그램을 만들 열을 고를 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 인덱스를 만들었는데 왜 안 탈까</h3>
+
+<p>인덱스를 공부하고 나면 누구나 한 번은 이런 일을 겪는다. 느린 쿼리의 WHERE 절에 쓰인 열에 인덱스를 만들었다. 그런데 EXPLAIN을 다시 떠 보니 <code>type</code>은 여전히 <code>ALL</code>이고, <code>possible_keys</code>에는 방금 만든 인덱스 이름이 버젓이 찍혀 있는데 <code>key</code>는 비어 있다. 옵티마이저가 인덱스를 몰라서 안 쓴 것이 아니다. 인덱스가 있다는 것을 알고, 써 볼 수 있다는 것도 알고, 그 위에서 <b>쓰지 않는 쪽이 더 싸다고 계산했다</b>는 뜻이다. 이번 회차는 그 계산을 끝까지 따라간다.</p>
+
+<p>이번 회차에서도 앞 회차들처럼 가상의 <code>orders</code> 테이블을 쓴다. 숫자는 계산을 따라가기 위해 이 원고에서 정한 가정이며 어떤 서버에서 잰 값이 아니다. 다만 이 가정대로 테이블을 실제로 만들어(100만 행, 날짜는 2024-11-17부터 2년 동안 고르게, 회원 100,000명에 10건씩, <code>memo</code>는 절반이 NULL이고 나머지는 190자, <code>status</code>는 뒤의 분포 표 그대로) MySQL 8.0.46과 8.4.13에서 돌려 본 출력은 라벨에 버전을 밝혀 함께 싣는다. 이렇게 만든 테이블의 클러스터형 인덱스는 10,029페이지로 가정과 거의 같았다. 실측 출력의 비용, 통계 기반 <code>rows</code>, 메모리 적중률 같은 값은 실행 환경과 통계에 따라 달라진다.</p>
+
+<pre><code class="language-sql">CREATE TABLE orders (
+  id         BIGINT       NOT NULL AUTO_INCREMENT,
+  member_id  BIGINT       NOT NULL,
+  status     VARCHAR(20)  NOT NULL,   -- PENDING, PAID, SHIPPED, DELIVERED, CANCELLED
+  amount     INT          NOT NULL,
+  ordered_at DATETIME     NOT NULL,
+  memo       VARCHAR(200) NULL,
+  PRIMARY KEY (id),
+  KEY idx_orders_member (member_id),
+  KEY idx_orders_ordered_at (ordered_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;</code></pre>
+
+<div class="table-wrap"><table><thead><tr><th>항목</th><th>가정한 값</th></tr></thead><tbody>
+<tr><td>전체 행 수</td><td>1,000,000 (최근 2년, 날짜별로 고르게 분포 — 하루 약 1,370행)</td></tr>
+<tr><td>클러스터형 인덱스 리프 페이지</td><td>약 10,000 (한 페이지에 평균 100행)</td></tr>
+<tr><td>회원 수와 회원당 주문</td><td>회원 100,000명, 회원당 평균 10건</td></tr>
+</tbody></table></div>
+
+<p>이제 거의 같은 모양의 쿼리 두 개를 생각한다. 하나는 어제 하루치 주문을, 다른 하나는 최근 6개월치 주문을 가져온다.</p>
+
+<pre><code class="language-sql">-- (A) 하루치: 약 1,370행
+SELECT * FROM orders
+WHERE ordered_at >= '2026-11-16' AND ordered_at < '2026-11-17';
+
+-- (B) 6개월치: 약 250,000행
+SELECT * FROM orders
+WHERE ordered_at >= '2026-05-17' AND ordered_at < '2026-11-17';</code></pre>
+
+<p>이 회차 뒤쪽에서 직접 할 비용 계산을 따르면, 버퍼 풀이 차가운 상태에서 (A)는 인덱스로 범위를 읽고, (B)는 같은 인덱스를 후보로 보고도 테이블 전체를 훑는다. 가정대로 만든 테이블에서 실제로 EXPLAIN을 떠 보면 그대로 나온다. 실측 서버의 버퍼 풀(128MB)은 이 테이블보다 작아, 뒤의 트레이스에서 보듯 메모리 적중률이 0에 가깝게 잡힌 상태였다. 실제로 (A)를 만족하는 행은 1,369개, (B)를 만족하는 행은 252,054개(약 25%)다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 rows가 991515인 것 말고는 같다)"><code class="language-text">-- (A)
++----+-------------+--------+------------+-------+-----------------------+-----------------------+---------+------+------+----------+-----------------------+
+| id | select_type | table  | partitions | type  | possible_keys         | key                   | key_len | ref  | rows | filtered | Extra                 |
++----+-------------+--------+------------+-------+-----------------------+-----------------------+---------+------+------+----------+-----------------------+
+|  1 | SIMPLE      | orders | NULL       | range | idx_orders_ordered_at | idx_orders_ordered_at | 5       | NULL | 1369 |   100.00 | Using index condition |
++----+-------------+--------+------------+-------+-----------------------+-----------------------+---------+------+------+----------+-----------------------+
+-- (B)
++----+-------------+--------+------------+------+-----------------------+------+---------+------+--------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys         | key  | key_len | ref  | rows   | filtered | Extra       |
++----+-------------+--------+------------+------+-----------------------+------+---------+------+--------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ALL  | idx_orders_ordered_at | NULL | NULL    | NULL | 991016 |    50.00 | Using where |
++----+-------------+--------+------------+------+-----------------------+------+---------+------+--------+----------+-------------+</code></pre>
+
+<p>(B)의 <code>rows</code> 991016은 통계상 테이블 행 수이고, <code>filtered</code> 50.00은 레인지 옵티마이저가 인덱스로 추정한 행 수 495,508을 그 행 수로 나눈 비율이다. 실제로는 약 25%인 범위를 옵티마이저가 정확히 절반으로 보고 있는데, 그 이유는 뒤의 인덱스 다이브 절에서 본다.</p>
+
+<p>여기서 두 종류의 "인덱스를 안 탄다"를 먼저 갈라 두어야 한다. 04회에서 본 것처럼 <code>possible_keys</code>가 NULL이면 옵티마이저는 애초에 그 인덱스를 쓸 수 있는 길을 찾지 못한 것이다. 이것은 비용 문제가 아니라 <b>쓸 수 없는</b> 문제다. 대표적인 원인은 다음과 같다.</p>
+
+<ul>
+<li><b>인덱스 열에 대한 조건이 없다.</b> WHERE나 ON에 인덱스 열을 제한하는 조건이 아예 없거나, 복합 인덱스의 첫 열을 건너뛰었다(스킵 스캔은 08회의 주제다).</li>
+<li><b>열이 변환된 뒤에 비교된다.</b> <code>DATE(ordered_at) = '2026-11-16'</code>처럼 열을 함수로 감싸면 인덱스에 정렬되어 있는 값은 <code>ordered_at</code>이지 <code>DATE(ordered_at)</code>가 아니므로 B+Tree를 따라 내려갈 기준이 없다. 함수 기반 인덱스는 09회에서 다룬다.</li>
+<li><b>타입이 어긋난다.</b> MySQL 매뉴얼의 타입 변환 절은 문자열 열을 숫자와 비교하면 그 열의 인덱스로 값을 빠르게 찾을 수 없다고 적고, 그 이유로 <code>'1'</code>, <code>' 1'</code>, <code>'1a'</code>처럼 숫자 1로 바뀌는 문자열이 여럿이라는 점을 든다. 문자열과 숫자의 비교는 두 값을 부동소수점 수로 바꿔 비교하기 때문에, 인덱스의 문자열 정렬 순서가 비교 순서와 맞지 않는다.</li>
+<li><b>조인 열의 문자 집합이 다르다.</b> 매뉴얼은 <code>utf8mb4</code> 열과 <code>latin1</code> 열을 비교하면 인덱스를 쓸 수 없다고 적는다. 조인 열은 같은 타입, 같은 크기, 같은 문자 집합으로 맞추는 것이 원칙이다.</li>
+</ul>
+
+<p>반면 (B)처럼 <code>possible_keys</code>에는 후보가 있는데 <code>key</code>가 NULL이면 사정이 다르다. 옵티마이저는 인덱스를 쓰는 계획과 쓰지 않는 계획을 모두 세웠고, 둘에 값을 매겨 비교했고, 테이블 전체를 읽는 쪽이 더 싸다고 판단했다. 매뉴얼의 "풀 테이블 스캔 피하기" 절은 MySQL이 풀 테이블 스캔을 고르는 경우를 네 가지로 정리하는데, 나머지 셋이 모두 이 비용 판단에 해당한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>매뉴얼이 드는 경우</th><th>이 회차에서 설명하는 원리</th></tr></thead><tbody>
+<tr><td>테이블이 아주 작아서(보통 10행 미만, 짧은 행) 키 조회보다 스캔이 빠르다</td><td>B+Tree를 내려가는 비용이 페이지 한두 개를 훑는 비용보다 크다</td></tr>
+<tr><td>WHERE·ON에 인덱스 열을 쓸 수 있는 제한 조건이 없다</td><td>후보 자체가 없다(<code>possible_keys</code> NULL)</td></tr>
+<tr><td>인덱스 열과 비교한 상수가 테이블의 너무 큰 부분을 덮는다고 옵티마이저가 계산했다</td><td>인덱스 다이브로 행 수를 추정하고 비용을 비교한 결과</td></tr>
+<tr><td>카디널리티가 낮은 키를 다른 열을 통해 쓰게 되어, 키 조회가 많이 필요하다고 가정했다</td><td>인덱스 통계(키당 평균 행 수)로 추정한 결과</td></tr>
+</tbody></table></div>
+
+<p>그러니 "인덱스를 만들었는데 왜 안 탈까"에 대한 정확한 답은 질문을 둘로 나누는 데서 시작한다. 쓸 수 없는가, 쓸 수 있지만 비싸다고 보았는가. 뒤쪽이라면 다시 둘로 나뉜다. 정말로 비싼가, 아니면 옵티마이저가 <b>잘못 추정해서</b> 비싸다고 믿고 있는가. 앞쪽이면 옵티마이저가 옳고 인덱스 설계나 쿼리를 바꿔야 한다. 뒤쪽이면 옵티마이저에게 더 나은 숫자를 주어야 하며, 이번 회차의 나머지 절반인 통계와 히스토그램이 바로 그 숫자다.</p>
+
+<h3>인덱스로 읽는 일과 테이블을 훑는 일의 크기</h3>
+
+<p>옵티마이저가 왜 그런 계산을 하는지 이해하려면 두 방식이 InnoDB 안에서 하는 일의 크기를 먼저 세어 보아야 한다. 06회에서 본 것처럼 InnoDB 테이블은 기본 키 순서로 정렬된 클러스터형 인덱스 그 자체이고, 행 전체는 그 리프 페이지에 들어 있다. 세컨더리 인덱스의 리프에는 인덱스 열의 값과 기본 키 값만 있다. 따라서 <code>idx_orders_ordered_at</code>으로 <code>SELECT *</code>를 처리하는 과정은 이렇다.</p>
+
+<ol>
+<li>세컨더리 인덱스의 루트에서 출발해 범위의 시작 키가 있는 리프 페이지까지 내려간다.</li>
+<li>리프에서 항목 하나를 읽으면 그 안의 기본 키 값을 꺼낸다.</li>
+<li>그 기본 키로 클러스터형 인덱스를 루트부터 다시 내려가 행이 든 리프 페이지를 찾는다.</li>
+<li>세컨더리 인덱스의 다음 항목으로 가서 2~3을 반복하고, 범위가 끝나면 멈춘다.</li>
+</ol>
+
+<p>핵심은 3번이 <b>행마다</b> 일어난다는 점이다. 세컨더리 인덱스는 <code>ordered_at</code> 순서로 정렬되어 있지만, 같은 시각대 주문의 기본 키가 클러스터형 인덱스에서 어느 페이지에 있는지는 그 순서와 무관하다. 이 예제처럼 <code>AUTO_INCREMENT</code> 기본 키와 주문 시각이 대체로 함께 증가한다면 운이 좋은 편이지만, 일반적으로는 서로 다른 페이지를 이리저리 찾아다니는 접근, 곧 랜덤 접근이 된다. 반대로 풀 테이블 스캔은 클러스터형 인덱스의 맨 왼쪽 리프에서 시작해 리프끼리 이어진 연결 리스트를 따라 오른쪽으로 걸어간다. 페이지 하나를 읽을 때마다 행 100개를 한꺼번에 얻고, 디스크에서 읽을 때는 이어진 페이지를 미리 읽어 들이기도 좋다.</p>
+
+<pre class="diagram">풀 테이블 스캔                          세컨더리 인덱스 + 룩업
+(클러스터형 인덱스 리프를 차례로)        (항목마다 클러스터형 인덱스를 다시 내려감)
+
+ [p1]->[p2]->[p3]-> ... ->[p10000]       idx 리프: (11-16 00:01, id=873210) (11-16 00:01, id=873214) ...
+  100   100   100          100 행                         |                      |
+                                                          v                      v
+ 페이지 10,000개를 읽으면 끝               PK 루트 -> 내부 -> 리프 p8733    PK 루트 -> 내부 -> 리프 p8733
+                                          (행 1개마다 한 번의 하강, 페이지는 겹칠 수도 아닐 수도)</pre>
+
+<p>가정한 숫자로 세어 보자. 풀 테이블 스캔은 몇 행을 원하든 페이지 10,000개를 읽는다. 인덱스 경로는 조건을 만족하는 행의 수만큼 클러스터형 인덱스를 내려간다. 조건이 1%인 10,000행이면 룩업 10,000번이다. 페이지 10,000개 순차 읽기와 비슷한 크기다. 조건이 30%인 300,000행이면 룩업이 300,000번이고, 이것은 테이블 전체를 30번 훑는 것과 같은 횟수의 페이지 접근이다. 같은 페이지를 여러 번 찾아가더라도 버퍼 풀에 이미 있다면 디스크 I/O는 없겠지만, 루트에서 리프까지 내려가며 페이지를 찾고 래치를 잡는 일은 매번 반복된다.</p>
+
+<p>MySQL 매뉴얼의 인덱스 사용 절도 같은 이야기를 한다. 작은 테이블이나, 보고서 쿼리처럼 행의 대부분을 처리하는 큰 테이블에서는 인덱스가 덜 중요하며, 쿼리가 대부분의 행에 접근해야 할 때는 인덱스를 거치는 것보다 순차로 읽는 편이 빠르다고 적는다. 그렇다면 "대부분"은 몇 퍼센트인가. 이 질문에 고정된 답은 없다. 답은 페이지 하나에 행이 몇 개 들어 있는지, 페이지가 메모리에 있는지 디스크에 있는지, 그리고 옵티마이저가 그 둘을 어떤 값으로 계산하는지에 달려 있다. 이제 그 계산 자체를 보자.</p>
+
+<x-visual id="db-perf-10-scan-vs-lookup" title="풀 테이블 스캔과 세컨더리 인덱스 룩업이 접근하는 페이지" kind="비교 다이어그램" ratio="16:9">
+<x-hint>풀 스캔은 리프 페이지를 왼쪽에서 오른쪽으로 한 번씩 읽고, 세컨더리 인덱스 경로는 항목마다 클러스터형 인덱스를 위에서부터 다시 내려간다는 차이를 보여 준다.</x-hint>
+<x-prompt>A two-panel technical diagram on a white background. Left panel titled "풀 테이블 스캔": a row of 8 rectangular leaf pages connected by right-pointing arrows, each page labeled "100행", with a single long arrow underneath labeled "순차 읽기". Right panel titled "세컨더리 인덱스 + 룩업": at the top, a horizontal strip of small boxes labeled "세컨더리 인덱스 리프"; from three of those boxes, curved arrows go down into a separate tree drawn below (a triangle-shaped B+Tree with a root box labeled "PK 루트", two inner boxes, and a row of leaf pages). Each curved arrow enters the root and then zigzags down to a different leaf page, with the arrows labeled "행마다 하강". Use blue for the left panel and orange for the right panel. A caption bar at the bottom reads "읽는 행이 많아질수록 오른쪽의 하강 횟수가 늘어난다".</x-prompt>
+<x-caption>풀 스캔은 페이지 수만큼, 인덱스 경로는 행 수만큼 일한다. 어느 쪽이 싼지는 둘의 비율로 정해진다.</x-caption>
+</x-visual>
+
+<h3>비용 기반 옵티마이저: 후보를 세우고 값을 매긴다</h3>
+
+<p>쿼리를 실행할 방법을 고르는 방식에는 크게 두 가지가 있다. 규칙 기반(rule-based) 방식은 "인덱스가 있으면 인덱스를 쓴다", "등호 조건이 범위 조건보다 우선한다" 같은 고정된 우선순위로 계획을 고른다. 데이터가 어떻게 생겼는지는 보지 않는다. 비용 기반 옵티마이저(cost-based optimizer)는 가능한 계획 후보를 세우고, 각 후보를 실행하는 데 드는 일의 양을 추정해 비용(cost)이라는 하나의 숫자로 바꾼 다음, 가장 작은 것을 고른다. MySQL의 옵티마이저는 비용 기반이다. 그래서 같은 SQL이라도 데이터의 양과 분포, 조건에 들어온 값에 따라 계획이 달라진다. 앞의 (A)와 (B)가 다른 계획을 받은 것도 SQL이 달라서가 아니라 상수 값이 덮는 범위가 달라서다.</p>
+
+<p>비용 계산에는 세 가지 재료가 들어간다.</p>
+
+<ol>
+<li><b>행 수 추정.</b> 이 접근 방법으로 몇 행을 읽게 되는가, 그중 몇 행이 조건을 통과해 다음 단계로 넘어가는가. 인덱스 다이브, InnoDB 통계, 히스토그램, 그리고 정보가 없을 때의 기본 추정치가 여기에 쓰인다.</li>
+<li><b>비용 상수.</b> 페이지 하나를 읽는 일, 행 하나에 조건을 평가하는 일, 키 하나를 비교하는 일에 각각 몇 점을 매길 것인가.</li>
+<li><b>접근 방법별 계산식.</b> 풀 스캔, 인덱스 레인지 스캔, 커버링 인덱스 스캔, 조인의 ref 접근이 각각 페이지를 몇 개 읽는다고 볼 것인가. 이 식의 일부는 서버 계층이, 일부는 스토리지 엔진(InnoDB)이 제공한다.</li>
+</ol>
+
+<p>셋 중 가장 자주 틀리는 것은 첫 번째다. 비용 상수와 계산식은 버전이 같으면 늘 같지만, 행 수 추정은 데이터와 통계의 상태에 따라 달라진다. 옵티마이저가 엉뚱한 계획을 골랐을 때 계산식이 틀린 경우보다 계산식에 들어간 행 수가 틀린 경우가 훨씬 많다. 이 점은 이 회차 내내 반복해서 확인하게 된다.</p>
+
+<figure class="flow-figure"><figcaption>한 문장이 실행 계획이 되기까지 (MySQL 8.0 기본 옵티마이저)</figcaption><ol class="flow">
+<li><strong>준비</strong><span>파싱된 문장을 정리한다. 상수 조건을 접고, 조건을 표준 형태로 바꾸고, 서브쿼리 변환을 시도한다.</span></li>
+<li><strong>테이블별 행 수 추정</strong><span>상수와 비교하는 인덱스 조건이 있으면 레인지 옵티마이저가 인덱스 다이브로 범위의 행 수를 구하고, 풀 스캔·레인지·커버링 스캔의 비용을 비교한다.</span></li>
+<li><strong>조인 순서 탐색</strong><span>테이블을 놓는 순서마다 각 테이블의 최선 접근 방법(ref, eq_ref, range, scan)을 고르고, 앞 테이블에서 넘어오는 행 수에 비용을 곱해 누적한다.</span></li>
+<li><strong>계획 확정과 후처리</strong><span>가장 싼 순서를 고른 뒤 정렬·그룹핑 방식, 인덱스 순서 이용 여부 같은 나머지 결정을 한다.</span></li>
+<li><strong>실행</strong><span>확정된 계획을 이터레이터 트리로 만들어 실행한다(03회).</span></li>
+</ol></figure>
+
+<h3>비용 상수: 무엇에 몇 점을 매기는가</h3>
+
+<p>MySQL은 비용 계산에 쓰는 기본 단가를 비용 모델(cost model)이라는 이름으로 노출한다. 값은 서버에 컴파일되어 있고, <code>mysql</code> 시스템 데이터베이스의 두 테이블 <code>server_cost</code>와 <code>engine_cost</code>로 덮어쓸 수 있다. 서버 계층이 하는 일의 단가는 <code>server_cost</code>에, 스토리지 엔진이 블록을 읽는 단가는 <code>engine_cost</code>에 있다. 매뉴얼은 각 상수의 의미를 설명하지만 기본값을 숫자로 적어 두지는 않고, 컴파일된 기본값이 각 테이블의 <code>default_value</code> 열에 들어 있다고 설명한다. 아래 표의 기본값은 MySQL 소스의 <code>sql/opt_costconstants.cc</code>(8.0)와 <code>sql/opt_costconstants.h</code>(8.4)에서 확인한 값이며, 두 버전에서 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>테이블</th><th>상수</th><th>기본값</th><th>의미</th></tr></thead><tbody>
+<tr><td>server_cost</td><td><code>row_evaluate_cost</code></td><td>0.1</td><td>행 하나에 조건을 평가하는 비용. 키우면 많은 행을 살피는 계획(풀 스캔)이 상대적으로 비싸진다.</td></tr>
+<tr><td>server_cost</td><td><code>key_compare_cost</code></td><td>0.05</td><td>키 하나를 비교하는 비용. 정렬(filesort)처럼 비교가 많은 계획에 영향을 준다.</td></tr>
+<tr><td>server_cost</td><td><code>memory_temptable_create_cost</code></td><td>1.0</td><td>메모리 내부 임시 테이블을 만드는 비용</td></tr>
+<tr><td>server_cost</td><td><code>memory_temptable_row_cost</code></td><td>0.1</td><td>메모리 내부 임시 테이블에 행 하나를 쓰거나 읽는 비용</td></tr>
+<tr><td>server_cost</td><td><code>disk_temptable_create_cost</code></td><td>20.0</td><td>디스크 내부 임시 테이블을 만드는 비용</td></tr>
+<tr><td>server_cost</td><td><code>disk_temptable_row_cost</code></td><td>0.5</td><td>디스크 내부 임시 테이블의 행 하나 비용</td></tr>
+<tr><td>engine_cost</td><td><code>io_block_read_cost</code></td><td>1.0</td><td>인덱스나 데이터 블록 하나를 디스크에서 읽는 비용</td></tr>
+<tr><td>engine_cost</td><td><code>memory_block_read_cost</code></td><td>0.25</td><td>같은 블록을 메모리 버퍼(InnoDB 버퍼 풀)에서 읽는 비용</td></tr>
+</tbody></table></div>
+
+<p>비용에는 단위가 없다. "밀리초"도 "I/O 횟수"도 아니고, 디스크 블록 하나를 읽는 일을 1로 놓은 상대 점수일 뿐이다. 이 표를 읽는 감각은 이렇다. 행 하나를 평가하는 일(0.1)은 디스크 블록 하나(1.0)의 10분의 1이고, 메모리에 있는 블록 하나(0.25)의 절반에 조금 못 미친다. 따라서 행 100개가 든 페이지 하나를 풀 스캔하면 페이지 읽기 1.0에 행 평가 10.0이 붙어, 행 평가가 읽기보다 열 배 큰 몫을 차지한다. 풀 스캔이 비싼 이유는 페이지를 읽어서만이 아니라 그 안의 모든 행에 조건을 대 보아야 하기 때문이기도 하다.</p>
+
+<p>현재 값과 기본값은 이렇게 본다. <code>cost_value</code>가 NULL이면 컴파일된 기본값을 쓴다는 뜻이다.</p>
+
+<pre><code class="language-sql">SELECT cost_name, cost_value, default_value FROM mysql.server_cost;
+SELECT engine_name, device_type, cost_name, cost_value, default_value
+FROM mysql.engine_cost;</code></pre>
+
+<pre data-label="MySQL 8.4.13에서 실행 (8.0.46도 같다)"><code class="language-text">+------------------------------+------------+---------------+
+| cost_name                    | cost_value | default_value |
++------------------------------+------------+---------------+
+| disk_temptable_create_cost   |       NULL |            20 |
+| disk_temptable_row_cost      |       NULL |           0.5 |
+| key_compare_cost             |       NULL |          0.05 |
+| memory_temptable_create_cost |       NULL |             1 |
+| memory_temptable_row_cost    |       NULL |           0.1 |
+| row_evaluate_cost            |       NULL |           0.1 |
++------------------------------+------------+---------------+
++-------------+-------------+------------------------+------------+---------------+
+| engine_name | device_type | cost_name              | cost_value | default_value |
++-------------+-------------+------------------------+------------+---------------+
+| default     |           0 | io_block_read_cost     |       NULL |             1 |
+| default     |           0 | memory_block_read_cost |       NULL |          0.25 |
++-------------+-------------+------------------------+------------+---------------+</code></pre>
+
+<p>값을 바꾸려면 행을 수정한 뒤 <code>FLUSH OPTIMIZER_COSTS</code>를 실행한다. 매뉴얼에 따르면 각 세션은 <b>세션이 시작될 때의</b> 비용 값을 쓰므로, 바뀐 값은 그 뒤에 연결한 세션부터 적용된다. 커넥션 풀을 쓰는 애플리케이션이라면 풀이 커넥션을 새로 맺기 전까지 이전 값으로 계속 계획을 세운다는 뜻이다. 비용 테이블은 서버 인스턴스마다 따로이며 복제되지 않는다. <code>engine_cost</code>의 <code>device_type</code> 열은 HDD와 SSD처럼 장치별로 값을 달리하려고 만든 자리지만 매뉴얼은 현재 쓰이지 않으며 0만 허용된다고 적는다.</p>
+
+<pre><code class="language-sql">-- 모든 엔진의 디스크 블록 읽기 비용을 두 배로
+UPDATE mysql.engine_cost
+SET cost_value = 2.0
+WHERE cost_name = 'io_block_read_cost';
+FLUSH OPTIMIZER_COSTS;
+
+-- 기본값으로 되돌리기
+UPDATE mysql.engine_cost
+SET cost_value = NULL
+WHERE cost_name = 'io_block_read_cost';
+FLUSH OPTIMIZER_COSTS;</code></pre>
+
+<aside class="note">매뉴얼은 값을 바꾸고 싶다면 두 배 또는 절반으로 바꿔 효과를 재 보라고 권하고, 바꿨을 때 쓸모 있는 결과가 나올 가능성이 가장 큰 것은 두 블록 읽기 비용이라고 적는다. 비용 상수는 서버의 모든 쿼리에 영향을 주므로, 쿼리 하나를 고치려고 건드릴 대상이 아니다. 대부분의 계획 문제는 상수가 아니라 행 수 추정에서 생긴다.</aside>
+
+<h3>계산식 따라가기: 풀 스캔 대 세컨더리 인덱스 레인지</h3>
+
+<p>이제 (A)와 (B)에서 옵티마이저가 실제로 무엇을 비교하는지 식으로 쓴다. 아래 식은 MySQL 8.0 소스의 <code>sql/range_optimizer/range_optimizer.cc</code>, <code>sql/handler.cc</code>, <code>sql/opt_costmodel.cc</code>, <code>storage/innobase/handler/ha_innodb.cc</code>에서 읽은 것이고, 8.4 소스에서도 같은 부분을 확인했다. 기본 옵티마이저 기준이며, 매뉴얼이 보장하는 동작이 아니라 구현이라는 점을 밝혀 둔다.</p>
+
+<p><b>페이지 하나의 읽기 비용.</b> 옵티마이저는 페이지를 읽을 때 그것이 버퍼 풀에 있을지 디스크에 있을지 미리 알 수 없으므로 비율로 섞는다. InnoDB는 인덱스마다 "그 인덱스의 리프 페이지 중 지금 버퍼 풀에 올라와 있는 페이지 수 ÷ 통계상 리프 페이지 수"를 계산해(1을 넘으면 1로 자른다) 서버에 알려 준다. 이 비율을 메모리 적중률 <i>m</i>이라고 하면 페이지 하나의 비용은 다음과 같다.</p>
+
+<pre><code class="language-text">페이지 읽기 비용 = m × memory_block_read_cost + (1 − m) × io_block_read_cost
+               = m × 0.25 + (1 − m) × 1.0
+   m = 0 (전부 디스크) → 1.0
+   m = 1 (전부 메모리) → 0.25</code></pre>
+
+<p><b>풀 테이블 스캔.</b> InnoDB가 알려 주는 스캔 시간은 클러스터형 인덱스의 페이지 수다. 레인지 옵티마이저는 이것에 페이지 읽기 비용을 곱하고, 모든 행의 평가 비용과 작은 상수를 더한다.</p>
+
+<pre><code class="language-text">풀 스캔 비용 = (클러스터형 인덱스 페이지 수 × 페이지 읽기 비용 + 1.1)
+            + (행 수 × row_evaluate_cost + 1)</code></pre>
+
+<p>흥미로운 것은 InnoDB 소스의 <code>ha_innobase::scan_time()</code>에 붙은 주석이다. 물리적으로는 순차 읽기가 랜덤 읽기보다 훨씬 싸므로 페이지 수를 10으로 나누는 편이 현실적이겠지만, MySQL이 인덱스 검색보다 테이블 스캔을 지나치게 선호하는 경향이 있어 일부러 순차 읽기를 랜덤 읽기와 같은 비용으로 친다는 내용이다. 즉 이 모형에서 풀 스캔의 페이지 읽기는 할인받지 않는다.</p>
+
+<p><b>커버링이 아닌 세컨더리 인덱스 레인지.</b> 기본 키가 아닌 인덱스에 대해 InnoDB는 서버의 기본 구현을 그대로 쓰는데, 그 구현은 "범위 수 + 행 수"를 읽기 횟수로 본다. 범위마다 인덱스를 한 번 내려가고, <b>찾은 행마다 페이지를 한 번 읽는다</b>고 보는 것이다. 앞 절에서 센 "행마다 클러스터형 인덱스를 다시 내려간다"는 사실이 식에 그대로 들어가 있다.</p>
+
+<pre><code class="language-text">레인지 비용 = (범위 수 + 행 수) × 페이지 읽기 비용
+           + (행 수 × row_evaluate_cost + 0.01)</code></pre>
+
+<p>가정한 테이블에 숫자를 넣어 보자. 행 1,000,000개, 클러스터형 인덱스 10,000페이지, 범위는 1개다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>계산</th><th>버퍼 풀이 차가울 때 (m = 0)</th><th>버퍼 풀에 다 있을 때 (m = 1)</th></tr></thead><tbody>
+<tr><td>풀 스캔</td><td>10,000 × 1.0 + 1.1 + 100,000 + 1 = <b>110,002.1</b></td><td>10,000 × 0.25 + 1.1 + 100,000 + 1 = <b>102,502.1</b></td></tr>
+<tr><td>레인지, n행</td><td>(1 + n) × 1.0 + 0.1n + 0.01 = 1.1n + 1.01</td><td>(1 + n) × 0.25 + 0.1n + 0.01 = 0.35n + 0.26</td></tr>
+<tr><td>(A) n = 1,370</td><td>1,508.01 → 레인지</td><td>479.76 → 레인지</td></tr>
+<tr><td>(B) n = 250,000</td><td>275,001.01 → <b>풀 스캔</b></td><td>87,500.26 → <b>레인지</b></td></tr>
+<tr><td>두 비용이 같아지는 n</td><td>약 100,001행 (전체의 약 10%)</td><td>약 292,862행 (전체의 약 29%)</td></tr>
+</tbody></table></div>
+
+<p>이 표에서 세 가지를 읽을 수 있다. 첫째, (A)처럼 덮는 범위가 좁으면 어느 경우든 인덱스가 압도적으로 싸다. 둘째, 경계는 "몇 퍼센트"라는 고정된 값이 아니다. 같은 테이블에서도 버퍼 풀 상태에 따라 경계가 10%에서 29%까지 움직이고, 한 페이지에 들어가는 행 수가 달라지면 또 움직인다. 행이 넓어 한 페이지에 20행만 들어간다면 같은 100만 행이 50,000페이지가 되어 풀 스캔 비용이 커지고 경계도 올라간다. 인터넷에서 흔히 보는 "선택도가 몇 % 이하일 때 인덱스를 탄다"는 말은 특정 조건에서 이 식을 풀어 본 근사치일 뿐이다.</p>
+
+<p>셋째가 가장 놀랍다. (B)는 <b>같은 쿼리, 같은 데이터</b>인데 버퍼 풀이 차가울 때는 풀 스캔, 데워진 뒤에는 레인지로 계획이 바뀔 수 있다. 매뉴얼의 비용 모델 절도 두 블록 읽기 비용이 다르면 같은 쿼리의 계획이 실행 사이에 바뀔 수 있다고, 데이터가 버퍼 풀에 올라오기 전과 후에 다른 계획을 고를 수 있다고 적고 있다. 서버를 재시작한 직후에만 어떤 보고서 쿼리가 느리다거나, 낮과 밤에 같은 쿼리의 실행 계획이 다르다는 보고를 받았다면 이 경로를 의심해 볼 수 있다. 이 차가운·데워진 버퍼 풀 사이의 계획 변화는 버퍼 풀을 비우거나 키우는 서버 전역 조작이 필요해, 이 원고의 실측에서는 재현하지 않았다.</p>
+
+<p><b>커버링 인덱스라면.</b> 08회에서 본 커버링 인덱스는 클러스터형 인덱스로 돌아가지 않으므로 식이 완전히 달라진다. 서버의 기본 구현은 인덱스 블록이 절반만 차 있다고 보수적으로 가정하고, 블록 하나에 들어가는 항목 수를 "블록 크기 ÷ 2 ÷ (키 길이 + 기본 키 길이) + 1"로 잡아 읽을 행 수를 그 값으로 나눈 만큼만 블록을 읽는다고 계산한다. 키가 짧으면 블록 하나에 수백 항목이 들어가므로, 같은 25만 행이라도 읽는 블록 수가 25만이 아니라 수백에서 수천 단위가 된다. 커버링 여부가 계획을 뒤집는 이유가 이 차이다.</p>
+
+<x-visual id="db-perf-10-cost-crossover" title="선택한 행 수에 따른 풀 스캔과 레인지 비용의 교차" kind="그래프" ratio="16:9">
+<x-hint>가로축은 조건이 덮는 행 수, 세로축은 비용이다. 풀 스캔은 수평선, 레인지는 기울어진 직선이며 버퍼 풀 상태에 따라 교차점이 움직인다는 것을 보여 준다.</x-hint>
+<x-prompt>A clean line chart on a white background. X-axis labeled "조건이 덮는 행 수" with ticks at 0, 100,000, 200,000, 300,000. Y-axis labeled "비용" with ticks at 0, 100,000, 200,000, 300,000. Two nearly horizontal dashed lines: a dark blue one at about 110,000 labeled "풀 스캔 (차가운 버퍼 풀)" and a light blue one at about 102,500 labeled "풀 스캔 (데워진 버퍼 풀)". Two solid straight lines starting near the origin: a dark orange steep line with slope 1.1 labeled "레인지 (차가운 버퍼 풀)" crossing the dark blue line at x=100,000, and a light orange gentler line with slope 0.35 labeled "레인지 (데워진 버퍼 풀)" crossing the light blue line at about x=293,000. Mark the two crossing points with small circles and labels "약 10%" and "약 29%". Add a vertical dotted line at x=250,000 labeled "6개월 조회".</x-prompt>
+<x-caption>같은 6개월 조회가 버퍼 풀 상태에 따라 교차점의 서로 다른 쪽에 놓인다. 숫자는 이 원고의 가정으로 계산한 값이다.</x-caption>
+</x-visual>
+
+<aside class="note">이 절의 식은 레인지 옵티마이저가 "풀 스캔 대 인덱스 범위"를 비교하는 부분이다. 조인 순서를 정하는 단계의 ref 접근 비용에는 <code>max_seeks_for_key</code> 같은 상한 처리가 더 붙는 등 식이 더 복잡하다. 매뉴얼은 이 변수를 1000으로 두면 어떤 키 스캔도 키 탐색을 1,000번보다 많이 일으키지 않는다고 옵티마이저에게 가정하게 하여 인덱스 쪽으로 기울일 수 있다고 소개한다.</aside>
+
+<h3>옵티마이저 트레이스로 비교 장면 보기</h3>
+
+<p>EXPLAIN은 이긴 계획만 보여 준다. 진 계획이 얼마였는지, 왜 졌는지는 보여 주지 않는다. 비교 과정 전체를 보려면 옵티마이저 트레이스(optimizer trace)를 켠다. 매뉴얼이 안내하는 사용법은 단순하다. 세션 변수로 트레이스를 켜고, 문장을 실행하고, <code>INFORMATION_SCHEMA.OPTIMIZER_TRACE</code> 테이블을 조회하고, 끝나면 끈다. 트레이스는 현재 세션에서 실행한 문장만 볼 수 있다.</p>
+
+<pre><code class="language-sql">SET optimizer_trace = "enabled=on";
+
+SELECT * FROM orders
+WHERE ordered_at >= '2026-05-17' AND ordered_at < '2026-11-17';
+
+SELECT QUERY, TRACE, MISSING_BYTES_BEYOND_MAX_MEM_SIZE
+FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE;
+
+SET optimizer_trace = "enabled=off";</code></pre>
+
+<p><code>TRACE</code> 열은 JSON이다. 트레이스는 <code>optimizer_trace_max_mem_size</code>가 정한 메모리 한도 안에서만 기록되고, 한도를 넘으면 잘린 채 남으며 잘린 바이트 수가 <code>MISSING_BYTES_BEYOND_MAX_MEM_SIZE</code>에 나온다. 이 값이 0이 아니면 한도를 늘려 다시 실행해야 한다. 앞 절의 비교가 들어 있는 곳은 <code>rows_estimation</code> 아래의 <code>range_analysis</code>다. 아래는 (B)를 실행한 트레이스에서 <code>range_analysis</code>만 잘라 낸 것이다. 이 절과 관계없는 <code>setup_range_conditions</code>, <code>group_index_skip_scan</code>, <code>skip_scan_range</code>, <code>analyzing_roworder_intersect</code> 항목은 뺐고, 나머지는 줄바꿈만 줄였을 뿐 서버가 낸 순서와 값 그대로다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (트레이스 발췌)"><code class="language-json">"range_analysis": {
+  "table_scan": {
+    "rows": 991016,
+    "cost": 105384
+  },
+  "potential_range_indexes": [
+    { "index": "PRIMARY", "usable": false, "cause": "not_applicable" },
+    { "index": "idx_orders_member", "usable": false, "cause": "not_applicable" },
+    { "index": "idx_orders_ordered_at", "usable": true, "key_parts": ["ordered_at", "id"] }
+  ],
+  "analyzing_range_alternatives": {
+    "range_scan_alternatives": [
+      {
+        "index": "idx_orders_ordered_at",
+        "ranges": [
+          "'2026-05-17 00:00:00' <= ordered_at < '2026-11-17 00:00:00'"
+        ],
+        "index_dives_for_eq_ranges": true,
+        "rowid_ordered": false,
+        "using_mrr": true,
+        "index_only": false,
+        "in_memory": 0.000877193,
+        "rows": 495508,
+        "cost": 283595,
+        "chosen": false,
+        "cause": "cost"
+      }
+    ]
+  }
+}</code></pre>
+
+<p>한 줄씩 읽어 보자. <code>table_scan</code>은 비교의 기준선이다. 풀 스캔의 행 수와 비용이 먼저 계산되고, 이후의 모든 후보는 이 값보다 싸야 채택된다. <code>potential_range_indexes</code>는 레인지 접근 후보로 검토한 인덱스 목록이다. 이 조건과 관계없는 인덱스는 <code>not_applicable</code>로 빠지고, 후보가 된 인덱스에는 사용할 수 있는 키 파트가 나온다. <code>key_parts</code>에 우리가 정의하지 않은 <code>id</code>가 붙어 있는 것은 06회에서 본 대로 InnoDB 세컨더리 인덱스의 리프에 기본 키가 덧붙어 있기 때문이다.</p>
+
+<p><code>range_scan_alternatives</code>의 항목 하나가 후보 하나다. <code>index_only</code>가 false라는 것은 커버링이 아니어서 행마다 클러스터형 인덱스로 돌아가야 한다는 뜻이다. <code>in_memory</code>는 그 인덱스의 메모리 적중률 추정치로, 이 실행에서는 0에 가까웠다. <code>rows</code>는 인덱스 다이브로 구한 행 수, <code>cost</code>는 그 행 수로 계산한 비용이며, 기준선 105,384보다 크므로 <code>"chosen": false, "cause": "cost"</code>로 탈락했다. 이 실행에서는 <code>using_mrr</code>가 true다. 기본 방식 대신 Multi-Range Read(EXPLAIN의 <code>Using MRR</code>)로 읽는 비용이 더 싸게 계산되어 그 비용이 실렸다는 뜻이므로, 283,595는 앞 절의 식에 그대로 맞지 않는다. 세션에서 <code>SET SESSION optimizer_switch = 'mrr=off'</code>로 MRR을 끄고 같은 쿼리를 다시 돌린 실행에서는 <code>table_scan</code> 비용 109,029, 레인지 후보는 <code>using_mrr</code> false, <code>in_memory</code> 0.0122807, <code>rows</code> 495,508, <code>cost</code> 539,956이었다. 풀 스캔 비용에서 거꾸로 구한 페이지 읽기 비용 약 0.99를 앞 절의 식에 넣으면 (1 + 495,508) × 0.99 + 49,550.8 + 0.01 ≈ 540,100으로, 트레이스의 값과 거의 같다. 어떤 후보가 채택되면 그 아래에 <code>chosen_range_access_summary</code>가 나타난다. <code>index_dives_for_eq_ranges</code>는 다음 절에서 다룰 인덱스 다이브를 썼는지(true) 통계로 대신했는지(false)를 알려 준다.</p>
+
+<p>조인이 있는 쿼리라면 트레이스의 <code>considered_execution_plans</code>를 함께 본다. 테이블 순서마다 <code>plan_prefix</code>(이미 놓은 테이블들), 이번에 놓을 테이블의 <code>best_access_path</code>와 그 안의 <code>considered_access_paths</code>(ref, eq_ref, range, scan 각각의 <code>rows</code>, <code>cost</code>, <code>chosen</code>), 그리고 그 순서까지의 누적값 <code>rows_for_plan</code>과 <code>cost_for_plan</code>이 나온다. 이 회차 뒤쪽의 히스토그램 예제에서 이 부분을 다시 본다.</p>
+
+<p>트레이스까지 볼 필요가 없을 때는 <code>EXPLAIN FORMAT=JSON</code>의 <code>cost_info</code>로 이긴 계획의 비용을 볼 수 있다. MySQL 8.0 소스(<code>sql/opt_explain_json.cc</code>)에 정의된 키 이름은 쿼리 전체 비용 <code>query_cost</code>, 테이블별 읽기 비용 <code>read_cost</code>, 조건 평가 비용 <code>eval_cost</code>, 그 테이블까지의 누적 비용 <code>prefix_cost</code>이고, 행 수는 <code>rows_examined_per_scan</code>과 <code>rows_produced_per_join</code>으로 나온다. 모두 앞에서 본 비용 상수 단위의 숫자다.</p>
+
+<h3>행 수 추정 1: 인덱스 다이브</h3>
+
+<p>앞의 계산은 (B)가 25만 행을 덮는다는 숫자에서 출발했다. 옵티마이저는 그 숫자를 어디서 얻었을까. 상수와 비교하는 인덱스 조건이 있으면 레인지 옵티마이저는 스토리지 엔진에 "이 인덱스에서 이 범위에 몇 행이 있는가"를 묻는다. 서버 쪽 함수 이름을 따 <code>records_in_range</code>라고 부르는 이 질문에 InnoDB는 B+Tree를 실제로 내려가 보고 답한다. 이것을 인덱스 다이브(index dive)라고 한다. 매뉴얼은 범위의 양쪽 끝에서 한 번씩 다이브해 그 사이의 행 수를 추정치로 쓴다고 설명하며, <code>col IN (10, 20, 30)</code>이면 등호 범위가 세 개이므로 범위마다 두 번씩 다이브한다고 예를 든다.</p>
+
+<p>InnoDB가 이 추정을 어떻게 하는지는 MySQL 8.0 소스 <code>storage/innobase/btr/btr0cur.cc</code>의 <code>btr_estimate_n_rows_in_range</code> 계열 함수에 있다. 동작을 순서대로 정리하면 이렇다.</p>
+
+<ol>
+<li>범위의 왼쪽 경계 키로 루트에서 리프까지 내려가며, 층마다 어느 페이지의 몇 번째 레코드를 지났는지 경로를 기록한다. 오른쪽 경계 키로도 똑같이 한 번 더 내려간다.</li>
+<li>두 경로를 위에서부터 비교한다. 두 경로가 같은 페이지를 지나는 동안에는 그 페이지 안에서 두 위치 사이의 레코드 수를 센다.</li>
+<li>두 경로가 서로 다른 페이지로 갈라진 층부터는, 왼쪽 경계 페이지에서 오른쪽으로 페이지를 읽어 가며 레코드를 센다. 최대 10페이지 안에 오른쪽 경계 페이지에 닿으면 그 층의 개수는 <b>정확한 값</b>이다.</li>
+<li>10페이지 안에 닿지 못하면 읽은 페이지들의 평균 레코드 수에 "위 층에서 센 두 경계 사이의 페이지 수"를 곱해 추정한다. 이때부터 값은 <b>근사치</b>가 된다.</li>
+<li>근사치이고 트리 높이가 2 이상이면 결과에 2를 곱한다. 소스 주석은 이 알고리즘이 과소 추정하는 경향이 있어서라고 적는다.</li>
+<li>근사치가 테이블 통계상 행 수의 절반을 넘으면 절반으로 자른다.</li>
+<li>InnoDB의 <code>records_in_range</code>는 결과가 0이면 1을 돌려준다. 소스 주석은 옵티마이저가 0을 정확한 값으로 믿고 빈 결과로 처리할 수 있는데 추정의 정확성은 보장되지 않으며, 잠금 읽기라면 넥스트 키 락을 걸기 위해서라도 실제로 검색해야 하기 때문이라고 설명한다.</li>
+</ol>
+
+<pre class="diagram">                 [루트]                      왼쪽 경계 '2026-05-17'   오른쪽 경계 '2026-11-17'
+                /      \                         경로 L                   경로 R
+          [내부 a]    [내부 b]        층 2:  루트의 3번째 자식       루트의 7번째 자식   → 갈라짐
+          / | \        / | \          층 1:  a의 12번째 리프부터 오른쪽으로 최대 10페이지 읽기
+      [리프] ... [리프] ... [리프]           → 10페이지 안에 R에 닿으면 정확히 셈
+                                             → 못 닿으면 평균 레코드 수 × 사이 페이지 수 (근사)</pre>
+
+<p>이 동작에서 실무에 쓸모 있는 결론이 몇 가지 나온다. 첫째, 다이브는 <b>지금 트리의 실제 모습</b>을 본다. 통계 테이블이 며칠 묵었든 상관없이, 좁은 범위는 거의 정확하게, 넓은 범위는 대략적으로 센다. 그래서 상수 조건으로 인덱스 범위를 읽는 단일 테이블 쿼리는 통계가 낡아도 비교적 덜 흔들린다. 둘째, 넓은 범위에서 EXPLAIN의 <code>rows</code>가 테이블 전체 행 수의 정확히 절반 근처로 나온다면 6번의 상한에 걸린 근사치일 수 있다. 앞의 (B)가 바로 그 경우다. 실제로는 252,054행인 범위의 추정이 통계상 행 수 991,016의 정확히 절반인 495,508로 나왔다(MySQL 8.4.13. 8.0.46에서도 <code>filtered</code>가 50.00으로 같았다). 그래서 (B)의 <code>filtered</code>가 25가 아니라 50이 되었다. 셋째, 다이브는 공짜가 아니다. 범위 하나에 B+Tree 하강 두 번과 페이지 몇 개를 읽는다. 범위가 수천 개면 계획을 세우는 데만 상당한 시간이 든다.</p>
+
+<p>세 번째 문제 때문에 등호 범위가 많을 때는 다이브 대신 통계를 쓰는 장치가 있다. 시스템 변수 <code>eq_range_index_dive_limit</code>(기본값 200)는 <code>col IN (v1, ..., vN)</code>이나 같은 열에 대한 등호 OR 목록처럼 비고유 인덱스로 찾는 등호 범위가 몇 개 이상이면 다이브를 그만두고 인덱스 통계를 쓸지 정한다. 매뉴얼의 설명대로 등호 범위가 이 값 이상이면 통계를 쓰므로, N개까지 다이브를 허용하려면 N + 1로 설정해야 하고, 0으로 두면 개수와 무관하게 항상 다이브한다. 기본값이면 값 199개짜리 IN 목록까지는 다이브하고 200개부터는 통계를 쓴다. 통계를 쓸 때의 추정은 "범위 수 × 키당 평균 행 수"다. 트레이스에서 <code>index_dives_for_eq_ranges</code>가 false로 바뀌는 지점이 이것이다. 회원마다 주문이 정확히 10건인 실측 테이블에서 <code>member_id IN (1, ..., N)</code>을 EXPLAIN해 보면(MySQL 8.4.13), 값 199개일 때는 <code>index_dives_for_eq_ranges</code>가 true에 <code>rows</code> 1,990(실제와 같음), 값 200개일 때는 false에 <code>rows</code> 1,800이었다. 뒤쪽은 다이브 없이 통계로 어림한 값이라 실제 2,000과 어긋난다.</p>
+
+<p>MySQL 8.0에는 다이브 자체를 건너뛰는 경우도 있다. 매뉴얼에 따르면 단일 테이블 쿼리이고, 인덱스 하나를 지정한 <code>FORCE INDEX</code>가 있고, 그 인덱스가 고유 인덱스나 FULLTEXT가 아니며, 서브쿼리와 <code>DISTINCT</code>·<code>GROUP BY</code>·<code>ORDER BY</code>가 없으면 다이브를 생략한다. 어차피 인덱스를 쓰도록 강제했으니 다이브로 얻을 것이 없다는 이유다. 이때 트레이스에는 <code>"index_dives_for_range_access": "skipped_due_to_force_index"</code>가 나온다. MySQL 8.4.13에서 (B)에 <code>FORCE INDEX (idx_orders_ordered_at)</code>를 붙여 보면 이 문구와 함께 레인지 후보의 <code>rows</code>와 <code>cost</code>가 <code>"not applicable"</code>로 찍히고, EXPLAIN의 <code>rows</code>는 1로 나온다. 다이브를 하지 않았으니 행 수 추정이 없는 것이다.</p>
+
+<x-visual id="db-perf-10-index-dive" title="인덱스 다이브: 두 경계로 B+Tree를 내려가 사이의 행 수를 센다" kind="구조 다이어그램" ratio="16:9">
+<x-hint>범위의 왼쪽 경계와 오른쪽 경계로 각각 루트에서 리프까지 내려가는 두 경로, 경로가 갈라지는 층, 그리고 그 층에서 최대 10페이지를 읽어 세는 동작을 보여 준다.</x-hint>
+<x-prompt>A B+Tree diagram on a white background: one root box at the top, three inner node boxes in the middle, and a row of twelve leaf page boxes at the bottom connected left-to-right by thin arrows. Draw two bold descending paths from the root: a green path labeled "왼쪽 경계 다이브" ending at the 3rd leaf, and a purple path labeled "오른쪽 경계 다이브" ending at the 10th leaf. Mark the inner level where the two paths separate with a small red star and the label "경로가 갈라지는 층". Along the leaf row, shade leaves 3 through 7 in light green and add a bracket under them labeled "최대 10페이지까지 세기". Shade leaves 8 to 10 in light gray with a bracket labeled "평균 × 페이지 수로 추정". In the top right corner, a small box reads "결과: 정확한 값 또는 근사치".</x-prompt>
+<x-caption>좁은 범위는 경계 페이지 사이를 직접 세어 정확하게, 넓은 범위는 일부만 읽고 비례로 늘려 근사한다.</x-caption>
+</x-visual>
+
+<h3>행 수 추정 2: InnoDB 테이블 통계</h3>
+
+<p>다이브는 비교할 값을 계획 시점에 알 때만 할 수 있다. 다음 조인에서 <code>orders</code>를 <code>idx_orders_member</code>로 찾아 들어가는 경우를 생각해 보자.</p>
+
+<pre><code class="language-sql">SELECT m.name, o.id, o.amount
+FROM members m
+JOIN orders o ON o.member_id = m.id
+WHERE m.grade = 'VIP';</code></pre>
+
+<p><code>o.member_id</code>와 비교할 값은 <code>members</code>에서 읽은 행마다 달라지며, 계획을 세우는 시점에는 하나도 정해져 있지 않다. 따라서 "회원 한 명당 주문이 몇 건인가"는 다이브가 아니라 미리 모아 둔 통계로 추정해야 한다. 이 값을 키당 행 수(records per key)라고 하며, InnoDB는 <b>통계상 행 수 ÷ 그 키 접두사의 고유값 개수</b>로 계산한다(<code>ha_innodb.cc</code>의 <code>innodb_rec_per_key</code>). 같은 통계는 앞 절의 등호 범위가 <code>eq_range_index_dive_limit</code>를 넘을 때에도 쓰이고, 풀 스캔 비용의 "행 수"와 "클러스터형 인덱스 페이지 수"도 통계에서 온다. 통계는 거의 모든 계획의 바닥에 깔려 있는 셈이다.</p>
+
+<p>MySQL 8.0에서 InnoDB는 기본적으로 통계를 디스크에 영구 저장한다. 매뉴얼에 따르면 <code>innodb_stats_persistent</code>가 기본으로 켜져 있어 통계가 서버를 재시작해도 유지되고, 그 내용은 <code>mysql</code> 데이터베이스의 두 테이블에 들어 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>테이블</th><th>주요 열</th><th>뜻</th></tr></thead><tbody>
+<tr><td rowspan="3"><code>innodb_table_stats</code> (테이블당 1행)</td><td><code>n_rows</code></td><td>테이블의 행 수(추정)</td></tr>
+<tr><td><code>clustered_index_size</code></td><td>기본 키 인덱스의 크기(페이지 수)</td></tr>
+<tr><td><code>sum_of_other_index_sizes</code></td><td>나머지 인덱스 크기의 합(페이지 수)</td></tr>
+<tr><td rowspan="3"><code>innodb_index_stats</code> (인덱스당 여러 행)</td><td><code>stat_name</code> = <code>n_diff_pfxNN</code></td><td>인덱스 앞쪽 NN개 열 조합의 고유값 개수(추정). <code>stat_description</code>에 센 열 목록이 나온다.</td></tr>
+<tr><td><code>stat_name</code> = <code>n_leaf_pages</code></td><td>리프 페이지 수</td></tr>
+<tr><td><code>stat_name</code> = <code>size</code></td><td>인덱스 전체 페이지 수</td></tr>
+</tbody></table></div>
+
+<pre><code class="language-sql">SELECT index_name, stat_name, stat_value, sample_size, stat_description
+FROM mysql.innodb_index_stats
+WHERE database_name = 'shop' AND table_name = 'orders'
+  AND stat_name LIKE 'n_diff%';</code></pre>
+
+<pre data-label="MySQL 8.4.13에서 실행 (데이터베이스 이름만 m_db_perf_10으로 바꿈)"><code class="language-text">+-----------------------+--------------+------------+-------------+------------------+
+| index_name            | stat_name    | stat_value | sample_size | stat_description |
++-----------------------+--------------+------------+-------------+------------------+
+| PRIMARY               | n_diff_pfx01 |     991016 |          20 | id               |
+| idx_orders_member     | n_diff_pfx01 |      99123 |          20 | member_id        |
+| idx_orders_member     | n_diff_pfx02 |     997990 |          20 | member_id,id     |
+| idx_orders_ordered_at | n_diff_pfx01 |     999780 |          20 | ordered_at       |
+| idx_orders_ordered_at | n_diff_pfx02 |     999780 |          20 | ordered_at,id    |
++-----------------------+--------------+------------+-------------+------------------+</code></pre>
+
+<p><code>idx_orders_member</code>는 열 하나로 만든 인덱스인데 <code>n_diff_pfx</code> 행이 두 개다. 매뉴얼은 비고유 인덱스에는 InnoDB가 기본 키 열을 덧붙이므로 그 열까지 포함한 접두사마다 행이 생긴다고 설명한다. 고유 인덱스에는 기본 키가 덧붙지 않으므로 정의한 열 수만큼만 행이 생긴다. 실제 행은 정확히 1,000,000개, 회원은 100,000명인데 통계는 991,016과 99,123으로 조금씩 빗나가 있다. 표본 20페이지로 추정한 값이기 때문이다. 실측에서도 적재 직후 <code>ANALYZE TABLE</code>을 실행했을 때의 <code>n_rows</code>는 989,520이었고, 데이터를 바꾸지 않았는데 잠시 뒤 백그라운드 자동 재계산이 돌고 나서는 991,016이 되었다. 여기서 키당 행 수를 구하면 <code>member_id</code> 하나로는 991,016 ÷ 99,123 ≈ 10행, <code>(member_id, id)</code>로는 약 1행이다. 옵티마이저가 조인에서 "회원 한 명당 주문 10건"이라고 추정하는 근거가 바로 이 10이다. 뒤의 조인 트레이스에는 이 값이 9.99784로, EXPLAIN의 <code>rows</code> 열에는 9로 찍힌다.</p>
+
+<p><code>n_rows</code>도 사실은 따로 센 값이 아니다. MySQL 8.0 소스(<code>dict0stats.cc</code>)에서 영구 통계를 계산할 때 테이블 행 수는 클러스터형 인덱스의 마지막 고유 키 접두사의 <code>n_diff</code>, 즉 "기본 키 고유값 개수의 추정치"로 정해진다. 그 추정은 인덱스마다 일부 페이지만 표본으로 읽어 얻는다. 표본 페이지 수는 <code>innodb_stats_persistent_sample_pages</code>(기본 20)로 정하며, 매뉴얼은 <code>ANALYZE TABLE</code>이 각 인덱스 트리에 무작위 다이브를 해 카디널리티를 추정하므로 같은 테이블에 여러 번 실행해도 결과가 다를 수 있다고 적는다. 100만 행, 1만 페이지짜리 인덱스에서 20페이지만 보고 전체를 추정한다는 것을 기억해 두자. 고르게 분포한 데이터라면 충분하지만, 값이 한쪽에 몰려 있으면 표본이 그 모양을 놓칠 수 있다.</p>
+
+<p>같은 숫자는 다른 창구로도 보인다. <code>SHOW INDEX</code>의 <code>Cardinality</code>와 <code>INFORMATION_SCHEMA.STATISTICS.CARDINALITY</code>는 고유값 개수 추정치를, <code>INFORMATION_SCHEMA.TABLES.TABLE_ROWS</code>는 행 수 추정치를 보여 준다. 다만 MySQL 8.0의 <code>INFORMATION_SCHEMA</code>는 이런 통계 열을 캐시해 두고 <code>information_schema_stats_expiry</code>(기본 86,400초, 24시간)가 지나야 새로 가져온다. 이 변수를 0으로 두면 스토리지 엔진에서 바로 최신 값을 가져오고, <code>ANALYZE TABLE</code>을 실행하면 그 테이블의 캐시 값이 갱신된다. 통계를 바꾼 뒤 <code>SHOW INDEX</code>의 숫자가 그대로라고 해서 옵티마이저가 옛 숫자를 쓰는 것은 아니다. 옵티마이저가 쓰는 값을 직접 보려면 <code>mysql.innodb_*_stats</code>를 조회하는 편이 확실하다.</p>
+
+<h3>통계는 언제 갱신되고, 언제 틀리는가</h3>
+
+<p>영구 통계는 다음 세 경로로 다시 계산된다.</p>
+
+<ul>
+<li><b>자동 재계산.</b> <code>innodb_stats_auto_recalc</code>(기본 켜짐)가 켜져 있으면 테이블 행의 10%를 넘게 바뀌었을 때 통계를 다시 계산한다. 매뉴얼은 이 재계산이 백그라운드에서 <b>비동기로</b> 일어나며, 10%를 넘는 DML 직후 곧바로 갱신되지 않고 몇 초 늦을 수 있다고 적는다. MySQL 8.0 소스에서는 행이 바뀔 때마다 테이블의 변경 카운터를 올리다가 통계상 행 수의 10분의 1을 넘으면 그 테이블을 재계산 대기열에 넣고, 백그라운드 스레드는 같은 테이블을 직전 재계산 뒤 10초 안에는 다시 계산하지 않고 대기열에 되돌려 둔다. 자동 재계산 결과는 복제되지 않으므로 소스와 복제본의 통계가 서로 다를 수 있다.</li>
+<li><b><code>ANALYZE TABLE</code>.</b> 동기적으로, 즉 문장이 끝날 때까지 통계를 다시 계산한다. 분석하는 동안 InnoDB 테이블에는 읽기 잠금이 걸린다. 매뉴얼은 예전에는 이 문장이 플러시 잠금을 필요로 해 뒤따르는 작업이 기다려야 했는데 MySQL 8.0.24부터는 그렇지 않다고 적는다. 기본적으로 바이너리 로그에 기록되어 복제본에서도 실행되며, <code>NO_WRITE_TO_BINLOG</code>(또는 <code>LOCAL</code>)로 막을 수 있다.</li>
+<li><b>인덱스 추가, 열 추가·삭제.</b> 매뉴얼에 따르면 이때는 <code>innodb_stats_auto_recalc</code> 설정과 무관하게 인덱스 통계가 계산된다.</li>
+</ul>
+
+<p>테이블마다 다르게 둘 수도 있다. <code>CREATE TABLE</code>이나 <code>ALTER TABLE</code>의 테이블 옵션 <code>STATS_PERSISTENT</code>, <code>STATS_AUTO_RECALC</code>, <code>STATS_SAMPLE_PAGES</code>는 각각 영구 통계 사용 여부, 자동 재계산 여부, 표본 페이지 수를 그 테이블에만 적용한다.</p>
+
+<pre><code class="language-sql">-- 분포가 치우친 큰 테이블만 표본을 늘린다
+ALTER TABLE orders STATS_SAMPLE_PAGES = 200;
+ANALYZE TABLE orders;</code></pre>
+
+<p>그러면 통계는 언제 틀리는가. 원리로부터 세 가지 상황을 꼽을 수 있다.</p>
+
+<p><b>첫째, 대량 변경 직후.</b> 비어 있던 테이블에 대량 적재를 마친 직후나, 대규모 삭제 직후에는 자동 재계산이 아직 돌지 않았을 수 있다. 빈 테이블에 데이터를 채우는 동안에는 자동 재계산이 행 수의 증가를 몇 초씩 늦게 뒤따라가므로, 적재 직후의 통계는 마지막 재계산 시점의 모습에 머물러 있을 수 있다. 이 상태에서 조인 쿼리가 계획을 세우면 행 수와 키당 행 수가 실제와 다른 값으로 계산된다. 대량 작업 뒤에 <code>ANALYZE TABLE</code>을 실행하는 습관이 필요한 이유다.</p>
+
+<p><b>둘째, 10%에 못 미치는 변화가 쌓일 때.</b> 1억 행 테이블에 하루 100만 행씩 쌓이면 9일 동안은 자동 재계산 조건에 닿지 않는다. 앞 절에서 본 대로 상수 범위 조건은 다이브가 현재 트리를 보므로 크게 흔들리지 않지만, 키당 행 수에 기대는 조인과 긴 IN 목록은 그 사이의 변화를 모른다.</p>
+
+<p><b>셋째, 표본이 분포를 놓칠 때.</b> 키당 행 수는 평균이다. 대부분의 회원은 주문이 10건 안팎인데 도매 회원 몇 명이 수만 건씩 가지고 있다면 평균 10은 "보통 회원"에게는 맞고 그 몇 명에게는 크게 틀린다. 조인에서 어떤 회원이 들어올지는 계획 시점에 모르므로 이 문제는 통계를 아무리 새로 고쳐도 사라지지 않는다. 고유값 개수 자체가 표본 20페이지로 부정확하게 잡히는 경우도 있다. 매뉴얼은 추정이 부정확하다고 의심되면 <code>SELECT DISTINCT</code>로 센 실제 카디널리티와 <code>innodb_index_stats</code>의 값을 비교해 보고, 차이가 크면 표본 페이지 수를 늘리되 너무 크게 하면 <code>ANALYZE TABLE</code>이 느려진다고 안내한다.</p>
+
+<aside class="note">매뉴얼은 <code>innodb_table_stats</code>와 <code>innodb_index_stats</code>를 직접 수정해 데이터를 바꾸지 않고 다른 계획을 시험해 볼 수 있으며, 수정한 뒤에는 <code>FLUSH TABLE 테이블명</code>으로 새 통계를 읽어 들이게 하라고 적는다. 운영 서버에서 쓸 기법은 아니지만, 운영과 같은 통계를 시험 서버에 옮겨 "운영에서만 나오는 계획"을 재현하는 데 유용하다.</aside>
+
+<h3>히스토그램 1: 왜 필요한가</h3>
+
+<p>지금까지 본 추정 재료는 모두 <b>인덱스</b>에 붙어 있었다. 다이브는 인덱스 트리를 내려가고, 영구 통계는 인덱스마다 고유값 개수를 센다. 그러면 인덱스가 없는 열에 걸린 조건은 어떻게 추정할까. 예를 들어 <code>orders.status</code>에는 인덱스가 없다. 옵티마이저는 <code>status = 'CANCELLED'</code>를 만족하는 행이 얼마나 될지 알 길이 없다.</p>
+
+<p>이때 쓰이는 것이 03회에서 잠깐 본 기본 추정치다. MySQL 8.0 소스의 <code>sql/item.h</code>에는 등호 조건에 0.1, 부등호(크다·작다) 조건에 0.3333, <code>BETWEEN</code>에 0.1111이라는 상수가 정의되어 있고(8.4 소스에서도 같다), 각 비교 연산의 필터링 계산 함수는 히스토그램이 없으면 이 값으로 돌아간다. 등호의 경우 정확히는 <code>max(1 ÷ 테이블 행 수, 0.1)</code>이고, 열 타입이 가질 수 있는 값의 수가 정해져 있으면 그것을 반영한다. 소스(<code>Item_field::get_cond_filter_default_probability</code>)를 보면 <code>ENUM</code>이면 정의된 값의 수, <code>BIT(N)</code>이면 2의 N제곱을 고유값 수의 상한으로 써서, 값이 네 개인 <code>ENUM</code> 열의 등호는 <code>max(1/4, 0.1)</code> = 0.25로 추정한다. <code><></code>는 1에서 등호 추정치를 뺀 값이다. 결국 히스토그램이 없는 <code>VARCHAR</code> 열의 <code>status = 'CANCELLED'</code>는 어떤 값을 넣든 10%, <code>status <> 'DELIVERED'</code>는 90%로 추정된다.</p>
+
+<p>실제 분포가 아래와 같다고 해 보자.</p>
+
+<div class="table-wrap"><table><thead><tr><th>status</th><th>실제 행 수</th><th>실제 비율</th><th>기본 추정 (등호)</th><th>추정 오차</th></tr></thead><tbody>
+<tr><td>DELIVERED</td><td>900,000</td><td>90%</td><td>10%</td><td>9배 과소</td></tr>
+<tr><td>SHIPPED</td><td>50,000</td><td>5%</td><td>10%</td><td>2배 과대</td></tr>
+<tr><td>PAID</td><td>40,000</td><td>4%</td><td>10%</td><td>2.5배 과대</td></tr>
+<tr><td>PENDING</td><td>8,000</td><td>0.8%</td><td>10%</td><td>12.5배 과대</td></tr>
+<tr><td>CANCELLED</td><td>2,000</td><td>0.2%</td><td>10%</td><td>50배 과대</td></tr>
+</tbody></table></div>
+
+<p>주문 상태처럼 값 몇 개에 데이터가 크게 쏠린 열은 실무에서 아주 흔하다. 그리고 바로 그런 열의 드문 값, 즉 취소 주문이나 미결제 주문이 운영 쿼리의 조건으로 자주 쓰인다. 기본 추정치는 이런 쏠림(skew)을 전혀 모른다.</p>
+
+<p>이 추정치가 어디에 쓰이는지도 정확히 알아야 한다. 풀 테이블 스캔은 조건이 무엇이든 모든 행을 읽으므로, 이 10%는 "몇 행을 읽는가"가 아니라 "읽은 행 중 몇 행이 조건을 통과해 다음 단계로 넘어가는가"를 추정하는 데 쓰인다. EXPLAIN의 <code>filtered</code> 열이 바로 이 값이다. 매뉴얼의 조건 필터링(condition filtering) 절은 조인에서 한 테이블이 다음 테이블로 넘기는 행을 선행 행(prefix rows)이라 부르고, 그 수를 <code>rows × filtered</code>로 추정한다고 설명한다. 선행 행이 1,000이면 다음 테이블에 대한 접근이 1,000번 일어난다고 계산하므로, <code>filtered</code>가 50배 틀리면 다음 테이블의 비용도 50배 틀린다.</p>
+
+<p>그렇다면 <code>status</code>에 인덱스를 만들면 되지 않을까. 인덱스를 만들면 다이브가 가능해져 추정 문제는 풀린다. 하지만 매뉴얼이 정리한 대로 인덱스는 데이터가 바뀔 때마다 함께 갱신되어야 하는 반면, 히스토그램은 요청할 때만 만들어지므로 데이터 변경에 아무 부담을 주지 않는다. 대신 다음에 다시 만들 때까지 점점 낡아 간다. 게다가 앞의 비용 계산을 떠올리면, 값의 90%가 DELIVERED인 열의 인덱스는 DELIVERED 조회에는 거의 쓰이지 않고 드문 값에만 쓰인다. 쓰기 부담을 감수하며 인덱스를 만들 만큼 그 조회가 중요하지 않다면, 필요한 것은 인덱스가 아니라 <b>분포에 대한 정보</b>뿐이다. 히스토그램(histogram)이 그 정보다. 매뉴얼도 히스토그램 통계는 주로 인덱스가 없는 열에 유용하다고 적고 있다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>색인 없는 책과 목차의 쪽수</strong><p>인덱스는 책 뒤의 색인과 같다. 낱말마다 정확한 쪽 번호가 적혀 있어 찾아가기도, 몇 군데 나오는지 세기도 쉽지만, 원고를 고칠 때마다 색인도 고쳐야 한다. 히스토그램은 목차에 적힌 장별 쪽수 범위와 비슷하다. "3장이 전체의 40%"라는 것은 알려 주지만 특정 낱말이 어디 있는지는 알려 주지 않으며, 원고를 고쳐도 목차는 저절로 바뀌지 않는다. 다만 이 비유는 히스토그램이 데이터를 찾아가는 데 전혀 쓰이지 않는다는 점에서 깨진다. 목차는 펼칠 곳을 알려 주지만, 히스토그램은 오직 옵티마이저의 어림셈에만 쓰인다.</p></aside>
+
+<h3>히스토그램 2: 만들고, 확인하고, 지우기</h3>
+
+<p>히스토그램은 <code>ANALYZE TABLE</code>의 확장 문법으로 만든다. 한 문장에는 테이블 하나만 쓸 수 있고, 열은 여러 개를 줄 수 있다.</p>
+
+<pre><code class="language-sql">ANALYZE TABLE orders UPDATE HISTOGRAM ON status;
+ANALYZE TABLE orders UPDATE HISTOGRAM ON status, amount WITH 64 BUCKETS;
+ANALYZE TABLE orders DROP HISTOGRAM ON amount;</code></pre>
+
+<pre data-label="MySQL 8.4.13에서 실행 (세 문장 차례로)"><code class="language-text">+---------------------+-----------+----------+---------------------------------------------------+
+| Table               | Op        | Msg_type | Msg_text                                          |
++---------------------+-----------+----------+---------------------------------------------------+
+| m_db_perf_10.orders | histogram | status   | Histogram statistics created for column 'status'. |
++---------------------+-----------+----------+---------------------------------------------------+
++---------------------+-----------+----------+---------------------------------------------------+
+| Table               | Op        | Msg_type | Msg_text                                          |
++---------------------+-----------+----------+---------------------------------------------------+
+| m_db_perf_10.orders | histogram | status   | Histogram statistics created for column 'amount'. |
+| m_db_perf_10.orders | histogram | status   | Histogram statistics created for column 'status'. |
++---------------------+-----------+----------+---------------------------------------------------+
++---------------------+-----------+----------+---------------------------------------------------+
+| Table               | Op        | Msg_type | Msg_text                                          |
++---------------------+-----------+----------+---------------------------------------------------+
+| m_db_perf_10.orders | histogram | status   | Histogram statistics removed for column 'amount'. |
++---------------------+-----------+----------+---------------------------------------------------+</code></pre>
+
+<p>매뉴얼이 정한 규칙을 정리하면 다음과 같다.</p>
+
+<ul>
+<li><code>WITH N BUCKETS</code>의 N은 1부터 1024까지이고, 생략하면 버킷 100개다.</li>
+<li>히스토그램 관리 문장은 이름을 준 열에만 영향을 준다. 다른 열의 히스토그램은 그대로 남는다.</li>
+<li>암호화된 테이블(통계를 통해 데이터가 드러나지 않도록)과 <code>TEMPORARY</code> 테이블에는 만들 수 없다. 공간 데이터 타입과 <code>JSON</code> 열에도 만들 수 없다. 저장·가상 생성 열에는 만들 수 있다.</li>
+<li>단일 열 고유 인덱스가 걸린 열에는 만들 수 없다. 그런 열의 등호 조건은 언제나 최대 1행이므로 분포 정보가 필요 없다.</li>
+<li>테이블을 지우면 히스토그램도 지워지고, <code>RENAME TABLE</code>은 히스토그램을 새 이름으로 옮긴다. 열을 지우거나 바꾸는 <code>ALTER TABLE</code>은 그 열의 히스토그램을 지운다. <code>CONVERT TO CHARACTER SET</code>은 문자 열의 히스토그램을 지운다.</li>
+<li>키 분포를 다시 계산하는 일반 <code>ANALYZE TABLE</code>(히스토그램 절이 없는 것)은 기존 히스토그램에 영향을 주지 않는다.</li>
+</ul>
+
+<p>만든 히스토그램은 데이터 사전에 저장되며, <code>INFORMATION_SCHEMA.COLUMN_STATISTICS</code> 뷰로 읽는다. 이 뷰의 열은 <code>SCHEMA_NAME</code>, <code>TABLE_NAME</code>, <code>COLUMN_NAME</code>, 그리고 JSON 값인 <code>HISTOGRAM</code>이다.</p>
+
+<pre><code class="language-sql">SELECT COLUMN_NAME,
+       HISTOGRAM->>'$."histogram-type"'          AS type,
+       JSON_LENGTH(HISTOGRAM->'$.buckets')       AS buckets,
+       HISTOGRAM->>'$."sampling-rate"'           AS sampling_rate,
+       HISTOGRAM->>'$."last-updated"'            AS last_updated
+FROM INFORMATION_SCHEMA.COLUMN_STATISTICS
+WHERE SCHEMA_NAME = 'shop' AND TABLE_NAME = 'orders';
+
+SELECT JSON_PRETTY(HISTOGRAM)
+FROM INFORMATION_SCHEMA.COLUMN_STATISTICS
+WHERE SCHEMA_NAME = 'shop' AND TABLE_NAME = 'orders' AND COLUMN_NAME = 'status';</code></pre>
+
+<p>앞의 분포에서 <code>status</code> 히스토그램을 만들면 다음과 같은 모양이 된다. 고유값이 5개로 버킷 수(100)보다 적으므로 싱글턴(singleton) 히스토그램이다. <code>sampling-rate</code>는 데이터 크기에 따라 1보다 작을 수 있고, 그러면 빈도도 근사치가 된다. 실측 테이블에서 기본 설정 그대로 만들었을 때는 <code>sampling-rate</code>가 0.0615였고 CANCELLED의 누적 빈도도 0.0019031처럼 근사치였다. 아래 출력은 세션에서 <code>SET SESSION histogram_generation_max_mem_size = 400000000</code>으로 한도를 올려 표본 없이 전부 읽게 한 뒤 만든 것이다.</p>
+
+<pre data-label="COLUMN_STATISTICS.HISTOGRAM, MySQL 8.4.13에서 실행 (JSON_PRETTY 결과)"><code class="language-json">{
+  "buckets": [
+    [
+      "base64:type254:Q0FOQ0VMTEVE",
+      0.002
+    ],
+    [
+      "base64:type254:REVMSVZFUkVE",
+      0.902
+    ],
+    [
+      "base64:type254:UEFJRA==",
+      0.942
+    ],
+    [
+      "base64:type254:UEVORElORw==",
+      0.95
+    ],
+    [
+      "base64:type254:U0hJUFBFRA==",
+      1.0
+    ]
+  ],
+  "data-type": "string",
+  "auto-update": false,
+  "null-values": 0.0,
+  "collation-id": 255,
+  "last-updated": "2026-11-19 04:06:30.968745",
+  "sampling-rate": 1.0,
+  "histogram-type": "singleton",
+  "number-of-buckets-specified": 100
+}</code></pre>
+
+<p>MySQL 8.0.46에서 같은 조건으로 만들면 버킷과 다른 키의 값은 같고 <code>auto-update</code> 키만 없다.</p>
+
+<p>문자열 값이 <code>base64:type254:...</code>로 보이는 데는 이유가 있다. MySQL 8.0 소스(<code>sql/histograms/histogram.cc</code>)의 주석에 따르면 히스토그램을 저장할 때 문자열 값은 필드 타입 <code>MYSQL_TYPE_STRING</code>(254)의 불투명(opaque) JSON 값으로 바뀌고, 이것을 일반 JSON 문자열로 내보낼 때 <code>base64:typeN:인코딩된_데이터</code> 형식이 된다. 첫 버킷을 사람이 읽을 수 있게 풀어 보면 이렇다.</p>
+
+<pre><code class="language-sql">SELECT CONVERT(FROM_BASE64('Q0FOQ0VMTEVE') USING utf8mb4);   -- CANCELLED</code></pre>
+
+<p>버킷들은 콜레이션 순서(여기서는 <code>utf8mb4_0900_ai_ci</code>, ID 255)로 정렬되어 CANCELLED, DELIVERED, PAID, PENDING, SHIPPED 순으로 놓인다. 각 키의 뜻은 매뉴얼에 정의되어 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>키</th><th>뜻</th></tr></thead><tbody>
+<tr><td><code>buckets</code></td><td>버킷 배열. 모양은 히스토그램 종류에 따라 다르다.</td></tr>
+<tr><td><code>null-values</code></td><td>NULL인 값의 비율(0.0~1.0). 0이면 NULL이 없다.</td></tr>
+<tr><td><code>last-updated</code></td><td>히스토그램을 만든 시각(UTC)</td></tr>
+<tr><td><code>sampling-rate</code></td><td>표본으로 읽은 데이터의 비율. 1이면 표본 없이 전부 읽었다.</td></tr>
+<tr><td><code>histogram-type</code></td><td><code>singleton</code> 또는 <code>equi-height</code></td></tr>
+<tr><td><code>number-of-buckets-specified</code></td><td>만들 때 지정한 버킷 수</td></tr>
+<tr><td><code>data-type</code></td><td><code>int</code>, <code>uint</code>, <code>double</code>, <code>decimal</code>, <code>datetime</code>, <code>string</code> 중 하나</td></tr>
+<tr><td><code>collation-id</code></td><td>값의 콜레이션 ID. 주로 문자열일 때 의미가 있다.</td></tr>
+<tr><td><code>auto-update</code></td><td>뒤에서 볼 <code>AUTO UPDATE</code>로 만든 히스토그램인지(true/false). 실측에서 8.4.13 출력에만 있었고 8.0.46 출력에는 없었다.</td></tr>
+</tbody></table></div>
+
+<p>버전에 따라 늘어난 기능이 둘 있다. 매뉴얼에 따르면 MySQL 8.0.31부터 <code>UPDATE HISTOGRAM ON 열 USING DATA 'json'</code>으로, <code>COLUMN_STATISTICS</code>에서 보이는 것과 같은 형식의 JSON을 직접 넣어 히스토그램을 설정할 수 있다(한 번에 열 하나). 운영 서버의 히스토그램을 시험 서버로 그대로 옮겨 계획을 재현할 때 쓸 수 있다. 또 MySQL 8.4 매뉴얼의 <code>ANALYZE TABLE</code> 문법에는 <code>WITH N BUCKETS</code> 뒤에 <code>{MANUAL | AUTO} UPDATE</code> 절이 있다. <code>AUTO UPDATE</code>를 주면 그 테이블에 <code>ANALYZE TABLE</code>을 실행할 때와 InnoDB 백그라운드 스레드가 영구 통계를 다시 계산할 때 히스토그램도 함께 갱신된다. 기본값은 <code>MANUAL UPDATE</code>이며, 8.0 매뉴얼의 같은 문법에는 이 절이 없다. 실측에서도 8.4.13은 <code>WITH 10 BUCKETS AUTO UPDATE</code>를 받아들여 <code>auto-update</code>가 true인 히스토그램을 만들었고, 8.0.46은 <code>near 'AUTO UPDATE'</code> 구문 오류(ERROR 1064)를 냈다. 이 절이 들어온 정확한 버전은 확인하지 못했다. 또 8.4.13에서 <code>USING DATA</code>로 넣는 JSON에 <code>auto-update</code> 키가 없으면 <code>Missing attribute at '$."auto-update"'.</code> 오류로 거부되었고, 8.0.46은 그 키 없이도 받아들였다.</p>
+
+<h3>히스토그램 3: 버킷에서 선택도를 계산하는 법</h3>
+
+<p>히스토그램이 생겼다고 옵티마이저가 쿼리마다 데이터를 다시 보는 것은 아니다. 버킷 배열만 보고 산수를 한다. 그 산수를 직접 해 보면 EXPLAIN의 <code>filtered</code>를 손으로 맞출 수 있다. 매뉴얼에 따르면 히스토그램은 열과 <b>상수</b>를 비교하는 조건, 곧 <code>=</code>, <code><></code>, <code>!=</code>, 크다·작다 비교, <code>IS NULL</code>, <code>IS NOT NULL</code>, <code>BETWEEN</code>, <code>NOT BETWEEN</code>, <code>IN</code>, <code>NOT IN</code>에 쓰인다. <code>ABS(-34)</code>처럼 상수로 계산되는 함수도 상수로 친다. 반대로 <code>o.member_id = m.id</code>처럼 다른 열과 비교하는 조건에는 쓰이지 않는다.</p>
+
+<h4>싱글턴 히스토그램</h4>
+
+<p>고유값 개수가 지정한 버킷 수 이하이면 값 하나가 버킷 하나를 차지하는 싱글턴 히스토그램이 된다. 버킷은 <code>[값, 누적 빈도]</code>이며, 매뉴얼의 설명대로 누적 빈도 0.25는 그 열 값의 25%가 버킷 값 이하라는 뜻이다. 그러므로 어떤 값의 빈도는 자기 누적 빈도에서 바로 앞 버킷의 누적 빈도를 뺀 값이다. 앞의 예시에서 계산하면 다음과 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>조건</th><th>히스토그램 계산</th><th>filtered (히스토그램 있음)</th><th>filtered (없음)</th></tr></thead><tbody>
+<tr><td><code>status = 'CANCELLED'</code></td><td>0.002 (첫 버킷)</td><td>0.20</td><td>10.00</td></tr>
+<tr><td><code>status = 'PAID'</code></td><td>0.942 − 0.902 = 0.04</td><td>4.00</td><td>10.00</td></tr>
+<tr><td><code>status <> 'DELIVERED'</code></td><td>NULL이 아닌 비율 1.0 − 0.9 = 0.1</td><td>10.00</td><td>90.00</td></tr>
+<tr><td><code>status = 'REFUNDED'</code></td><td>버킷에 없음 → 0 → 하한 0.001</td><td>0.10</td><td>10.00</td></tr>
+</tbody></table></div>
+
+<p>마지막 줄의 하한은 설명이 필요하다. MySQL 8.0과 8.4의 현재 소스(<code>Histogram::get_selectivity</code>)는 히스토그램으로 계산한 선택도가 0.001보다 작으면 0.001을 돌려준다. 주석이 드는 이유는 넷이다. 표본을 뜨다가 어떤 값을 놓치거나 빈도를 과소평가할 수 있고, 표본의 최솟값·최댓값 근처의 범위를 놓치기 쉽고, 버킷 내부의 어림셈이 아주 작은 값을 낼 수 있고, 히스토그램이 낡았을 수 있다는 것이다. 특히 마지막 경우는 실무에서 자주 만난다. 날짜 열처럼 새 값이 계속 최댓값 너머에 쌓이는 열은, 히스토그램을 만든 뒤에 들어온 값이 모두 "버킷에 없는 값"이 된다.</p>
+
+<p>EXPLAIN으로 확인하면 단일 테이블 풀 스캔에서도 <code>filtered</code>가 바뀌는 것을 볼 수 있다. 매뉴얼은 EXPLAIN 출력에서는 마지막 테이블을 포함한 모든 테이블에 필터링 효과를 계산한다고 적는다.</p>
+
+<pre data-label="EXPLAIN SELECT * FROM orders WHERE status = 'CANCELLED', MySQL 8.4.13에서 실행"><code class="language-text">-- 히스토그램 없음
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key  | key_len | ref  | rows   | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 991016 |    10.00 | Using where |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+-- 히스토그램 있음 (표본 없이 만든 것)
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+| id | select_type | table  | partitions | type | possible_keys | key  | key_len | ref  | rows   | filtered | Extra       |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+
+|  1 | SIMPLE      | orders | NULL       | ALL  | NULL          | NULL | NULL    | NULL | 991016 |     0.20 | Using where |
++----+-------------+--------+------------+------+---------------+------+---------+------+--------+----------+-------------+</code></pre>
+
+<p>위 표의 나머지 조건도 같은 히스토그램으로 EXPLAIN하면 <code>status = 'PAID'</code>는 4.00, <code>status <> 'DELIVERED'</code>는 10.00, <code>status = 'REFUNDED'</code>는 0.10으로 손 계산과 같았다(8.4.13, 8.0.46 모두). 히스토그램이 없을 때 <code><> 'DELIVERED'</code>는 90.00이었다. 기본 설정의 표본 히스토그램(<code>sampling-rate</code> 0.0615)으로는 CANCELLED 0.19, PAID 3.89, <code><> 'DELIVERED'</code> 9.77처럼 표본 오차만큼 어긋났다.</p>
+
+<h4>등높이 히스토그램</h4>
+
+<p>고유값이 버킷 수보다 많으면 버킷 하나가 값의 구간을 맡는 등높이(equi-height) 히스토그램이 된다. 버킷은 <code>[하한, 상한, 누적 빈도, 구간 안의 고유값 수]</code> 네 값으로 이루어지며, 하한과 상한은 둘 다 구간에 포함된다. 이름 그대로 버킷마다 담기는 행의 비율이 대체로 같도록 경계를 잡는다. 설명을 위해 <code>amount</code> 열에 버킷 4개짜리 히스토그램을 만들었고 결과가 다음과 같다고 하자.</p>
+
+<pre data-label="amount 히스토그램의 buckets (예시, WITH 4 BUCKETS)"><code class="language-json">[
+  [1000,  9900,   0.25, 90],
+  [10000, 19900,  0.5,  100],
+  [20000, 49900,  0.75, 300],
+  [50000, 143900, 1.0,  940]
+]</code></pre>
+
+<p>MySQL 8.0 소스(<code>sql/histograms/equi_height.cc</code>, <code>equi_height_bucket.cc</code>)에서 등높이 히스토그램의 계산은 이렇다. 등호는 값이 든 버킷의 빈도를 그 버킷의 고유값 수로 나눈다. 버킷 안에서는 모든 고유값이 같은 빈도를 가진다고 가정하는 것이다. 범위 조건은 앞 버킷들의 누적 빈도에, 값이 든 버킷의 빈도 중 값의 위치에 비례하는 몫을 더한다. 정수 열에서 그 위치는 <code>(값 − 하한) ÷ (상한 − 하한 + 1)</code>로 계산한다.</p>
+
+<pre><code class="language-text">amount = 15000
+  → 둘째 버킷 [10000, 19900], 버킷 빈도 = 0.5 − 0.25 = 0.25
+  → 0.25 ÷ 고유값 100 = 0.0025                    filtered 0.25 (없으면 10.00)
+
+amount < 25000
+  → 셋째 버킷 [20000, 49900] 안에 있음, 앞 버킷들의 누적 = 0.5
+  → 버킷 빈도 0.25 × (25000 − 20000) ÷ (49900 − 20000 + 1)
+    = 0.25 × 5000 ÷ 29901 ≈ 0.0418
+  → 0.5 + 0.0418 ≈ 0.5418                         filtered 54.18 (없으면 33.33)</code></pre>
+
+<p>이 손 계산은 서버로 확인할 수 있다. 앞에서 본 <code>USING DATA</code>로 위의 버킷 4개를 <code>amount</code> 히스토그램에 그대로 넣고 EXPLAIN을 떠 보면, MySQL 8.0.46과 8.4.13 모두 <code>amount = 15000</code>은 <code>filtered</code> 0.25, <code>amount < 25000</code>은 54.18이 나왔다. 8.4.13에서 히스토그램을 지우면 각각 10.00과 33.33으로 돌아갔다.</p>
+
+<p>등높이 히스토그램의 정밀도는 버킷 수에 달려 있다. 버킷 하나가 행의 약 1/N을 맡으므로, 그보다 좁은 구간의 분포는 "버킷 안은 고르다"는 가정으로 뭉개진다. 한 버킷 안에 아주 흔한 값 하나와 드문 값 여럿이 섞여 있으면, 등호 추정은 흔한 값에 대해서는 과소, 드문 값에 대해서는 과대가 된다. 값의 종류가 버킷 수 이하인 열이라면 버킷 수를 그만큼 주어 싱글턴으로 만드는 편이 정확하다. 버킷이 최대 1024개이므로, 고유값이 1024개 이하인 상태 코드·등급·카테고리 같은 열은 값마다 정확한 빈도를 담을 수 있다.</p>
+
+<p>NULL은 버킷에 들어가지 않고 <code>null-values</code> 비율로 따로 기록된다. 소스에서 <code>IS NULL</code>의 선택도는 이 비율 그대로, <code>IS NOT NULL</code>은 1에서 이 비율을 뺀 값이다. 그래서 <code><></code>의 계산에도 "1.0"이 아니라 "NULL이 아닌 비율"이 쓰였다.</p>
+
+<p><b>표본 추출.</b> 히스토그램을 만들 때 데이터를 전부 읽는다는 보장은 없다. 매뉴얼에 따르면 <code>histogram_generation_max_mem_size</code>(기본 20,000,000바이트)가 히스토그램 생성에 쓸 메모리의 상한이며, 읽어 들일 데이터가 이를 넘을 것으로 추정되면 전부 읽는 대신 테이블 전체에 고르게 퍼진 표본을 읽는다. 표본은 페이지 단위로 뜨는 <code>SYSTEM</code> 샘플링이고, MySQL 8.0.19부터는 InnoDB가 자체 샘플링을 제공해 풀 테이블 스캔 없이 표본을 읽는다. 실제로 쓰인 비율이 <code>sampling-rate</code>에 남는다. 매뉴얼은 <code>INFORMATION_SCHEMA.INNODB_METRICS</code>의 <code>sampled_pages_read</code>와 <code>sampled_pages_skipped</code> 카운터로 샘플링을 관찰할 수 있다고 안내한다.</p>
+
+<x-visual id="db-perf-10-histogram-buckets" title="싱글턴 히스토그램과 등높이 히스토그램의 버킷" kind="비교 다이어그램" ratio="16:9">
+<x-hint>싱글턴은 값마다 막대 하나, 등높이는 구간마다 비슷한 높이의 막대 하나라는 차이와, 각 버킷에 적힌 숫자의 의미를 보여 준다.</x-hint>
+<x-prompt>A two-panel chart on a white background. Left panel titled "싱글턴": five vertical bars of very different heights with x-axis labels "CANCELLED", "DELIVERED", "PAID", "PENDING", "SHIPPED"; the DELIVERED bar is by far the tallest (90%), CANCELLED the shortest (0.2%). Above the bars, a thin rising step line labeled "누적 빈도" ending at 1.0. Right panel titled "등높이": four adjacent bars of equal height (each 25%) but different widths over a numeric x-axis labeled "amount", with boundaries at 1000, 10000, 20000, 50000, 143900; inside each bar write the distinct count "90", "100", "300", "940". Highlight the third bar and draw a vertical dashed line inside it at 25000 labeled "값의 위치에 비례해 일부만 셈". Bottom caption strip: "버킷 하나 = 값 하나" under the left panel and "버킷 하나 = 구간 하나" under the right panel.</x-prompt>
+<x-caption>싱글턴은 값별 빈도를 그대로 담고, 등높이는 구간별 빈도와 고유값 수만 담아 버킷 안을 고르다고 가정한다.</x-caption>
+</x-visual>
+
+<h3>히스토그램 4: 실행 계획을 바꾸는 경로</h3>
+
+<p>히스토그램을 만들었는데 EXPLAIN의 <code>filtered</code>만 바뀌고 계획은 그대로인 경우가 많다. 이것은 고장이 아니라 설계다. 히스토그램이 들어가는 자리를 정확히 보면 이유가 보인다. MySQL 8.0 소스의 <code>calculate_condition_filter</code>(<code>sql/sql_planner.cc</code>)는 테이블 하나의 필터링 비율을 다음 순서로 계산한다.</p>
+
+<ol>
+<li>선택된 접근 방법(ref나 range)이 이미 사용한 열의 조건은 빼 둔다. 그 조건의 효과는 접근 방법의 <code>rows</code>에 이미 들어 있기 때문이다.</li>
+<li>남은 조건 중 레인지 옵티마이저가 <b>다른 인덱스로 행 수를 추정해 둔</b> 열이 있으면 그 추정치(그 인덱스의 범위 행 수 ÷ 테이블 행 수)를 쓴다. 소스 주석은 레인지 옵티마이저가 인덱스 통계보다 정확하기 때문이라고 적는다.</li>
+<li>그래도 남은 조건마다 히스토그램이 있으면 히스토그램으로, 없으면 기본 추정치로 비율을 구해 곱한다. 다만 <code>열 = 상수</code> 조건에서 그 열이 어떤 인덱스의 첫 열이면 히스토그램보다 그 인덱스의 키당 행 수를 먼저 쓴다(<code>Item_equal::get_filtering_effect</code>).</li>
+<li>결과가 1 ÷ 테이블 행 수보다 작아지지 않도록 하한을 둔다.</li>
+</ol>
+
+<p>매뉴얼의 표현으로는 옵티마이저가 히스토그램보다 레인지 옵티마이저의 행 추정을 우선하며, 레인지 옵티마이저가 적용된다고 판단하면 히스토그램을 쓰지 않는다. 인덱스가 있는 열에 히스토그램을 만들어도 대개 효과가 없는 이유가 2번이다. 그리고 히스토그램의 결과물은 오직 이 필터링 비율, 곧 "이 테이블이 다음 단계로 넘기는 행의 수"다. 이 테이블을 <b>어떻게 읽을지</b>는 바꾸지 않는다.</p>
+
+<p>필터링 비율이 계획에 영향을 주려면 그 비율을 쓰는 다음 단계가 있어야 한다. 같은 소스 함수의 주석과 조건문을 보면 필터링 계산은 기능이 켜져 있고(<code>optimizer_switch</code>의 <code>condition_fanout_filter</code>, 기본 켜짐) 다음 중 하나에 해당할 때만 한다. 조인 버퍼를 쓸 수 있는 스캔일 때, 그 테이블이 조인 순서의 마지막이 아닐 때, 서브쿼리 안일 때, 세미조인이 있을 때, <code>ORDER BY</code>나 <code>GROUP BY</code>와 <code>LIMIT</code>이 함께 있을 때, EXPLAIN일 때, <code>max_join_size</code>가 걸려 있을 때다. 주석은 단일 테이블 쿼리에서도 필터링 결과가 정렬할 행 수를 통해 계획에 영향을 줄 수 있지만 단일 테이블 최적화의 성능이 중요해 지금은 무시한다고 밝힌다. 정리하면, LIMIT 없는 단일 테이블 쿼리에서 히스토그램은 EXPLAIN의 숫자를 정확하게 만들 뿐 계획은 바꾸지 않는다. 히스토그램이 진짜로 일하는 곳은 <b>조인 순서</b>다.</p>
+
+<h4>조인 순서가 뒤집히는 계산</h4>
+
+<p>회원 테이블을 하나 더 두고 다음 쿼리를 생각한다. <code>members</code>는 100,000행, 클러스터형 인덱스 1,000페이지이고, <code>grade</code> 열(<code>VARCHAR</code>)에는 인덱스가 없으며 실제로 VIP가 30%다. <code>orders.status</code>의 분포는 앞의 표와 같다.</p>
+
+<pre><code class="language-sql">SELECT m.name, o.id, o.amount
+FROM members m
+JOIN orders o ON o.member_id = m.id
+WHERE m.grade = 'VIP'
+  AND o.status = 'CANCELLED';</code></pre>
+
+<p>후보 순서는 둘이다. 계획 A는 <code>members</code>를 훑어 VIP를 고른 뒤 회원마다 <code>idx_orders_member</code>로 주문을 찾는다. 계획 B는 <code>orders</code>를 훑어 취소 주문을 고른 뒤 주문마다 <code>members</code>의 기본 키로 회원을 찾는다. 두 계획의 비용을 앞 절의 단가로 <b>단순화해</b> 어림해 보자. 버퍼 풀은 차갑다고 보고(페이지 1.0), 인덱스로 가져오는 행 하나마다 페이지 하나와 평가 0.1을 매긴다. 실제 옵티마이저의 ref 비용 계산에는 탐색 횟수 상한, 메모리 적중률, 조인 버퍼 같은 요소가 더 들어가므로 아래 숫자가 트레이스의 숫자와 같지는 않다. 보려는 것은 숫자 자체가 아니라 <b>필터링 비율이 비용에 곱해지는 구조</b>다.</p>
+
+<ul>
+<li><code>members</code> 풀 스캔: 1,000 + 100,000 × 0.1 = 11,000</li>
+<li><code>orders</code> 풀 스캔: 10,000 + 1,000,000 × 0.1 = 110,000</li>
+<li>회원 한 명의 주문을 <code>idx_orders_member</code>로 찾기: 키당 행 수 10 → 10 × 1.0 + 10 × 0.1 = 11</li>
+<li>주문 하나의 회원을 기본 키로 찾기: 1 × 1.0 + 0.1 = 1.1</li>
+</ul>
+
+<div class="table-wrap"><table><thead><tr><th>히스토그램</th><th>VIP 추정</th><th>CANCELLED 추정</th><th>계획 A (m → o)</th><th>계획 B (o → m)</th><th>고르는 계획</th></tr></thead><tbody>
+<tr><td>없음</td><td>10% → 10,000명</td><td>10% → 100,000건</td><td>11,000 + 10,000 × 11 = 121,000</td><td>110,000 + 100,000 × 1.1 = 220,000</td><td>A</td></tr>
+<tr><td>status만</td><td>10% → 10,000명</td><td>0.2% → 2,000건</td><td>121,000</td><td>110,000 + 2,000 × 1.1 = 112,200</td><td>B</td></tr>
+<tr><td>grade만</td><td>30% → 30,000명</td><td>10% → 100,000건</td><td>11,000 + 30,000 × 11 = 341,000</td><td>220,000</td><td>B</td></tr>
+<tr><td>둘 다</td><td>30% → 30,000명</td><td>0.2% → 2,000건</td><td>341,000</td><td>112,200</td><td>B</td></tr>
+</tbody></table></div>
+
+<p>실제 분포는 마지막 줄이다. 히스토그램이 없으면 옵티마이저는 VIP를 실제의 3분의 1로, 취소 주문을 실제의 50배로 보고 계획 A를 고른다. 그러나 실제로 A를 실행하면 VIP 30,000명마다 주문 10건씩, 모두 300,000건의 주문을 인덱스로 찾아 클러스터형 인덱스를 300,000번 내려간 뒤 그중 0.2%만 남긴다. 같은 모형으로 341,000점의 일이다. B는 주문 테이블을 한 번 훑고 2,000건에 대해서만 회원을 찾으므로 112,200점이다. 둘째와 셋째 줄이 보여 주듯 히스토그램 하나만 있어도 계획이 뒤집히는데, 둘째 줄은 121,000 대 112,200으로 차이가 작아 데이터가 조금만 달라도 다시 뒤집힐 수 있다는 점도 눈여겨볼 만하다.</p>
+
+<p>실제 옵티마이저로도 확인해 보자. <code>members</code>를 100,000행(<code>name</code> 100자, <code>grade</code>는 VIP 30%·GOLD 30%·NORMAL 40%)으로 만들고 앞의 <code>orders</code>와 함께 MySQL 8.4.13에서 네 경우를 EXPLAIN한 뒤, 트레이스의 <code>cost_for_plan</code>으로 두 순서의 누적 비용을 읽었다. 히스토그램은 세션에서 메모리 한도를 올려 표본 없이 만들었다. 비용은 실행 환경과 버퍼 풀 상태에 따라 달라진다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>히스토그램 (MySQL 8.4.13)</th><th>계획 A (m → o) 누적 비용</th><th>계획 B (o → m) 누적 비용</th><th>고른 계획</th></tr></thead><tbody>
+<tr><td>없음</td><td>119,258</td><td>143,815</td><td>A</td></tr>
+<tr><td>status만</td><td>89,533.6</td><td>첫 테이블 <code>orders</code> 스캔만으로 106,099가 되어 A를 넘으므로 탐색 중단(<code>pruned_by_cost</code>)</td><td>A</td></tr>
+<tr><td>grade만</td><td>274,998</td><td>141,710</td><td>B</td></tr>
+<tr><td>둘 다</td><td>234,758</td><td>106,902</td><td>B</td></tr>
+</tbody></table></div>
+
+<p>없음·grade만·둘 다는 단순화 모형과 같은 계획이 골라졌다. 다른 것은 status만인 둘째 줄이다. 실제 옵티마이저는 회원 한 명의 주문을 찾는 ref 비용을 (89,533.6 − 10,410.8) ÷ 9,921.4 ≈ 8.0으로, 모형의 11보다 작게 계산했고, 그래서 A가 남았다. 반면 히스토그램을 기본 메모리 한도로 만들어 표본에서 얻은 빈도로 <code>filtered</code>가 0.17로 잡힌 앞선 실행에서는 같은 status만 경우에 B가 골라졌다. 차이가 작은 경우는 이처럼 실행마다 뒤집힐 수 있다. MySQL 8.0.46에서 히스토그램 둘 다를 만든 경우도 A 236,836 대 B 106,439로 B를 골랐다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행"><code class="language-text">-- 히스토그램 없음
++----+-------------+-------+------------+------+-------------------+-------------------+---------+-------------------+-------+----------+-------------+
+| id | select_type | table | partitions | type | possible_keys     | key               | key_len | ref               | rows  | filtered | Extra       |
++----+-------------+-------+------------+------+-------------------+-------------------+---------+-------------------+-------+----------+-------------+
+|  1 | SIMPLE      | m     | NULL       | ALL  | PRIMARY           | NULL              | NULL    | NULL              | 99214 |    10.00 | Using where |
+|  1 | SIMPLE      | o     | NULL       | ref  | idx_orders_member | idx_orders_member | 8       | m_db_perf_10.m.id |     9 |    10.00 | Using where |
++----+-------------+-------+------------+------+-------------------+-------------------+---------+-------------------+-------+----------+-------------+
+-- 히스토그램 둘 다
++----+-------------+-------+------------+--------+-------------------+---------+---------+--------------------------+--------+----------+-------------+
+| id | select_type | table | partitions | type   | possible_keys     | key     | key_len | ref                      | rows   | filtered | Extra       |
++----+-------------+-------+------------+--------+-------------------+---------+---------+--------------------------+--------+----------+-------------+
+|  1 | SIMPLE      | o     | NULL       | ALL    | idx_orders_member | NULL    | NULL    | NULL                     | 991016 |     0.20 | Using where |
+|  1 | SIMPLE      | m     | NULL       | eq_ref | PRIMARY           | PRIMARY | 8       | m_db_perf_10.o.member_id |      1 |    30.00 | Using where |
++----+-------------+-------+------------+--------+-------------------+---------+---------+--------------------------+--------+----------+-------------+</code></pre>
+
+<p>트레이스에서는 <code>considered_execution_plans</code> 아래, 각 테이블의 <code>considered_access_paths</code>에 <code>filtering_effect</code> 배열이 나타난다. 히스토그램이 쓰였다면 그 배열의 항목마다 조건(<code>condition</code>)과 히스토그램 선택도(<code>histogram_selectivity</code>)가 기록되고(<code>sql/item_cmpfunc.cc</code>), 곱한 결과가 <code>final_filtering_effect</code>, 그것을 반영한 행 수가 <code>resulting_rows</code>로 나온다. 이 값이 그 순서의 <code>rows_for_plan</code>이 되어 다음 테이블의 비용에 곱해진다. 조인 알고리즘 자체(중첩 루프 조인, 해시 조인)와 조인의 랜덤 접근 진단은 11회에서 다룬다.</p>
+
+<pre data-label="MySQL 8.4.13에서 실행 (트레이스 발췌, 히스토그램 둘 다일 때 계획 B의 첫 테이블)"><code class="language-json">"considered_access_paths": [
+  {
+    "access_type": "ref",
+    "index": "idx_orders_member",
+    "usable": false,
+    "chosen": false
+  },
+  {
+    "rows_to_scan": 991016,
+    "filtering_effect": [
+      {
+        "condition": "(`o`.`status` = 'CANCELLED')",
+        "histogram_selectivity": 0.002
+      }
+    ],
+    "final_filtering_effect": 0.002,
+    "access_type": "scan",
+    "resulting_rows": 1982.03,
+    "cost": 109130,
+    "chosen": true
+  }
+]</code></pre>
+
+<p>8.0.46의 트레이스도 <code>filtering_effect</code> 항목의 모양이 같았다. 이 실행에서 <code>orders</code>를 먼저 놓은 순서의 <code>rows_for_plan</code>은 1982.03이었고, 그 뒤에 <code>members</code>를 붙인 누적 비용이 109,824로 반대 순서(337,467)보다 작아 B가 골라졌다. 앞의 표와 숫자가 다른 것은 버퍼 풀 상태가 다른 별도 실행이기 때문이다.</p>
+
+<x-visual id="db-perf-10-join-order-flip" title="히스토그램이 선행 행 수를 바꿔 조인 순서를 뒤집는 과정" kind="흐름도" ratio="16:9">
+<x-hint>히스토그램 없을 때와 있을 때의 두 조인 순서를 나란히 놓고, 첫 테이블에서 넘어가는 선행 행 수가 두 번째 테이블의 접근 횟수를 결정한다는 것을 보여 준다.</x-hint>
+<x-prompt>A side-by-side flow diagram on a white background with two columns. Left column titled "히스토그램 없음": a box "members 스캔" with an arrow labeled "추정 10,000명" pointing to a box "orders 인덱스 조회 × 10,000"; at the bottom a gray tag "실제로는 30,000명 → 조회 300,000건". Right column titled "히스토그램 있음": a box "orders 스캔" with an arrow labeled "추정 2,000건" pointing to a box "members 기본 키 조회 × 2,000"; at the bottom a green tag "추정과 실제가 일치". Between the columns, a small funnel icon labeled "filtered = 선행 행 수를 정하는 비율". Use thick arrows whose width is proportional to the row counts.</x-prompt>
+<x-caption>히스토그램은 테이블을 읽는 방법이 아니라 다음 테이블로 넘어가는 행 수의 추정을 바꾸고, 그 차이가 조인 순서를 바꾼다.</x-caption>
+</x-visual>
+
+<h3>운영에서 판단하기: 낡은 숫자, 흔한 오해, 진단 순서</h3>
+
+<p><b>히스토그램은 저절로 새로워지지 않는다.</b> 8.0에서 히스토그램은 <code>ANALYZE TABLE ... UPDATE HISTOGRAM</code>을 다시 실행할 때만 갱신된다. 영구 통계의 10% 자동 재계산과도 무관하다. 8.4라면 <code>AUTO UPDATE</code>를 줄 수 있지만 기본값은 여전히 수동이다. 분포가 천천히 바뀌는 상태 코드라면 주기적으로 다시 만드는 것으로 충분하지만, 앞에서 본 대로 날짜처럼 새 값이 범위 끝에 계속 쌓이는 열은 금방 낡아 새 값들이 하한 0.001로 추정된다. 이런 열은 히스토그램보다 인덱스와 다이브가 어울린다. 히스토그램 생성도 데이터를 읽는 작업이고, 분석하는 동안 테이블에 읽기 잠금이 걸리며, 일반 <code>ANALYZE TABLE</code>처럼 기본적으로 복제본에도 전달된다는 점을 운영 일정에 반영한다.</p>
+
+<p><b>히스토그램을 만들 열 고르기.</b> 원리로부터 기준을 세우면 이렇다. 인덱스가 없고, 상수와 비교하는 조건에 자주 쓰이고, 값이 한쪽에 쏠려 있고, 그 조건이 <b>조인 쿼리</b>나 <code>ORDER BY ... LIMIT</code> 쿼리에 들어 있는 열이 가장 큰 효과를 본다. 조인 키 열(<code>o.member_id = m.id</code>)은 상수와 비교하지 않으므로 히스토그램이 쓰이지 않고, 쓸 만한 인덱스가 있는 열은 레인지 추정이 우선하며, 단일 열 고유 인덱스 열에는 아예 만들 수 없다. 또 03회에서 본 것처럼 옵티마이저는 조건별 비율을 서로 독립이라고 보고 곱하므로, <code>city = '서울' AND district = '강남구'</code>처럼 서로 얽힌 열은 각 열의 히스토그램이 정확해도 곱한 결과가 틀린다.</p>
+
+<p>흔한 오해를 몇 가지 바로잡아 두자.</p>
+
+<ul>
+<li><b>"인덱스는 항상 빠르다."</b> 커버링이 아닌 세컨더리 인덱스는 행마다 클러스터형 인덱스를 다시 내려간다. 덮는 행이 많아지면 풀 스캔이 실제로도 더 싸며, 옵티마이저가 풀 스캔을 고른 것은 대개 옳은 판단이다.</li>
+<li><b>"카디널리티가 낮은 열에는 인덱스가 소용없다."</b> 평균으로는 맞지만 분포가 쏠려 있으면 틀린다. 상태 값 다섯 개짜리 열에서도 0.2%짜리 값을 찾는 조건은 인덱스가 아주 잘 듣는다. 다이브가 값마다 범위를 직접 세기 때문에 옵티마이저도 그 차이를 안다. 낮은 카디널리티가 문제가 되는 것은 조인처럼 통계의 평균을 쓸 수밖에 없는 경우다.</li>
+<li><b>"계획이 이상하면 힌트로 고친다."</b> 힌트(09회)는 지금의 데이터에 맞춘 고정된 답이다. 추정이 틀려서 생긴 문제라면 통계나 히스토그램으로 추정을 바로잡는 것이 데이터가 바뀌어도 계속 맞는 해결책이다. 힌트는 추정을 바로잡을 방법이 없을 때 쓰는 마지막 수단이다.</li>
+<li><b>"히스토그램을 만들면 그 열의 조회가 빨라진다."</b> 히스토그램은 데이터를 찾는 데 전혀 쓰이지 않는다. 바뀌는 것은 옵티마이저의 어림셈뿐이고, 어림셈이 바뀌어 더 나은 계획이 골라질 때에만 빨라진다.</li>
+<li><b>"<code>ANALYZE TABLE</code>은 테이블 전체를 읽는 무거운 작업이다."</b> 키 분포 분석은 인덱스마다 표본 페이지(기본 20개)만 읽는다. 히스토그램 생성도 메모리 한도를 넘으면 표본을 쓰고, 8.0.19부터 InnoDB는 풀 스캔 없이 표본을 읽는다. 물론 읽기 잠금과 복제 전파는 고려해야 한다.</li>
+</ul>
+
+<figure class="flow-figure"><figcaption>"인덱스를 안 탄다"를 진단하는 순서</figcaption><ol class="flow">
+<li><strong>쓸 수 있는가</strong><span><code>possible_keys</code>가 NULL이면 비용 문제가 아니다. 함수로 감싼 열, 타입·문자 집합 불일치, 첫 열이 빠진 복합 인덱스를 찾는다.</span></li>
+<li><strong>추정이 맞는가</strong><span>EXPLAIN ANALYZE(03회)로 예상 행 수와 실제 행 수를 비교한다. 자릿수가 다르면 추정의 출처를 찾는다.</span></li>
+<li><strong>추정의 출처는 무엇인가</strong><span>상수 범위면 다이브, 조인·긴 IN 목록이면 영구 통계, 인덱스 없는 열이면 히스토그램 또는 기본값이다. 트레이스의 <code>index_dives_for_eq_ranges</code>, <code>filtering_effect</code>로 확인한다.</span></li>
+<li><strong>숫자를 바로잡는다</strong><span><code>ANALYZE TABLE</code>, <code>STATS_SAMPLE_PAGES</code> 조정, 히스토그램 생성·갱신. 그 뒤 계획을 다시 본다.</span></li>
+<li><strong>추정이 맞는데도 비싸면</strong><span>옵티마이저가 옳다. 커버링 인덱스(08회), 인덱스 설계, 쿼리 재작성으로 일 자체를 줄인다. 힌트는 마지막이다.</span></li>
+</ol></figure>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>MySQL 옵티마이저는 "읽을 페이지 수 × 페이지 비용 + 살필 행 수 × 행 비용"을 후보마다 계산해 가장 작은 것을 고른다. 계산식과 비용 상수는 고정되어 있으므로 계획을 좌우하는 것은 행 수 추정이다. 상수 범위는 인덱스 다이브가 현재 트리를 직접 세고, 값을 모르는 조인과 긴 IN 목록은 표본으로 구한 영구 통계의 평균을 쓰며, 인덱스 없는 열은 히스토그램이 없으면 10%·33%·11% 같은 기본값으로 짐작한다. 히스토그램은 그 짐작을 실제 분포로 바꾸어 조인의 선행 행 수와 조인 순서를 바로잡는다. 인덱스를 안 탄다면 먼저 쓸 수 있는지, 다음으로 추정이 맞는지를 묻는다.</p></aside>
+
+<p>다음 11회에서는 이 회차에서 비용의 바탕이 된 선행 행 수와 내부 테이블 접근이 실제 조인 알고리즘에서 어떻게 일하는지, 조인의 랜덤 접근을 어떻게 진단하고 커버링 인덱스로 줄이는지 본다. 12회의 정렬·페이징·그룹핑에서도 옵티마이저는 이번에 본 비용 계산으로 "인덱스 순서로 읽을지, 읽고 나서 정렬할지"를 저울질한다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>비용 기반 옵티마이저</dt><dd>가능한 실행 계획마다 행 수 추정과 비용 상수로 비용을 계산해 가장 작은 계획을 고른다. 같은 SQL도 데이터 분포, 상수 값, 버퍼 풀 상태에 따라 다른 계획을 받는다.</dd>
+<dt>비용 상수</dt><dd><code>mysql.server_cost</code>와 <code>mysql.engine_cost</code>로 노출되는 단가. 기본값은 디스크 블록 읽기 1.0, 메모리 블록 읽기 0.25, 행 평가 0.1, 키 비교 0.05 등이며, 바꾸면 <code>FLUSH OPTIMIZER_COSTS</code> 뒤 새 세션부터 적용된다.</dd>
+<dt>풀 스캔 대 레인지</dt><dd>InnoDB 기준으로 풀 스캔은 클러스터형 인덱스 페이지 수만큼, 비커버링 세컨더리 레인지는 "범위 수 + 행 수"만큼 페이지를 읽는다고 계산한다. 그래서 경계는 고정된 퍼센트가 아니라 페이지당 행 수와 메모리 적중률로 정해진다.</dd>
+<dt>인덱스 다이브</dt><dd>범위 양 끝으로 B+Tree를 내려가 사이의 행 수를 센다. 경계가 10페이지 안이면 정확하고 아니면 비례 추정이며, 근사치는 테이블 행 수의 절반에서 자른다. 등호 범위가 <code>eq_range_index_dive_limit</code>(기본 200) 이상이면 통계로 대신한다.</dd>
+<dt>InnoDB 영구 통계</dt><dd><code>innodb_table_stats</code>(행 수, 페이지 수)와 <code>innodb_index_stats</code>(<code>n_diff_pfxNN</code> 등)에 저장되며, 인덱스마다 표본 20페이지로 추정한다. 10% 넘게 바뀌면 비동기로 재계산되고, <code>ANALYZE TABLE</code>은 동기로 재계산한다.</dd>
+<dt>키당 행 수</dt><dd>통계상 행 수 ÷ 접두사 고유값 수. 조인처럼 비교 값을 계획 시점에 모를 때 쓰이는 평균이라, 분포가 쏠린 키에서는 특정 값에 대해 크게 틀릴 수 있다.</dd>
+<dt>기본 추정치</dt><dd>통계도 히스토그램도 없는 조건에는 등호 0.1, 부등호 0.3333, <code>BETWEEN</code> 0.1111을 쓴다. ENUM·BIT 열은 가능한 값의 수를 반영한다.</dd>
+<dt>히스토그램</dt><dd><code>ANALYZE TABLE ... UPDATE HISTOGRAM</code>으로 만드는 열 값 분포. 고유값이 버킷 수 이하면 싱글턴, 많으면 등높이가 되며, 상수 비교 조건의 필터링 비율에만 쓰인다. 기본적으로 수동 갱신이다.</dd>
+<dt>조건 필터링</dt><dd>접근 방법이 쓰지 않은 조건으로 다음 테이블에 넘길 행 수를 추정하는 과정. EXPLAIN의 <code>filtered</code>이며, 히스토그램이 계획을 바꾸는 유일한 통로라 조인 순서에서 효과가 가장 크다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 "인덱스를 만들었는데 안 탄다"는 보고의 상당수는 옵티마이저가 옳은 경우다. 관리자 화면의 기간 검색처럼 덮는 범위가 넓은 쿼리에서 비커버링 인덱스는 행마다 클러스터형 인덱스로 돌아가므로, 풀 스캔이 실제로 더 빠르다. 이때 <code>FORCE INDEX</code>로 인덱스를 강제하면 측정해 보기 전까지는 빨라진 것처럼 느껴질 뿐이다. 판단의 출발점은 EXPLAIN ANALYZE로 예상 행 수가 실제와 맞는지 보는 것이다. 맞는데도 풀 스캔이라면 일 자체를 줄여야 하고, 기간을 쪼개거나 필요한 열만 담은 커버링 인덱스를 설계하는 방향으로 간다.</p>
+<p>반대로 같은 쿼리의 계획이 날마다, 혹은 서버마다 달라진다는 보고는 추정 쪽 문제일 가능성이 크다. 확인할 것은 세 가지다. 대량 적재나 삭제 뒤에 통계가 따라오지 못했는가(<code>innodb_table_stats.last_update</code>와 <code>n_rows</code>), 복제본마다 자동 재계산 결과가 달라 계획이 갈렸는가, 버퍼 풀이 차가운 시점에만 다른 계획이 나오는가. 앞의 둘은 <code>ANALYZE TABLE</code>과 테이블별 표본 수 조정으로, 마지막은 비용 상수가 아니라 쿼리와 인덱스 설계로 대응하는 것이 보통이다. 비용 상수를 바꾸는 것은 서버의 모든 쿼리를 움직이는 일이므로 마지막 선택지로 남겨 둔다.</p>
+<p>히스토그램은 조인이 많은 보고서·정산 쿼리에서 가장 값지다. 인덱스가 없는 상태·유형·등급 열에 쏠린 분포가 있고, 그 열이 조인의 한쪽 테이블을 걸러 내는 조건으로 쓰인다면 히스토그램 하나로 조인 순서가 바로잡힐 수 있다. 다만 만들고 끝이 아니라, 분포가 바뀌는 주기에 맞춰 다시 만드는 운영 절차가 함께 있어야 한다. 8.4로 올렸다면 <code>AUTO UPDATE</code>로 이 부담을 줄일 수 있다. 그리고 새 값이 계속 범위 끝에 쌓이는 열, 조인 키, 서로 얽힌 열 조합처럼 히스토그램이 구조적으로 도울 수 없는 경우를 구분해 두면, 히스토그램을 만들고도 계획이 그대로인 상황에서 헤매지 않는다.</p>
+</x-review>
+
+<x-practice>
+<li>행 2,000,000개, 클러스터형 인덱스 25,000페이지인 테이블이 있다. 커버링이 아닌 세컨더리 인덱스로 300,000행을 읽는 범위 조건(범위 1개)에 대해, 이 회차의 식으로 풀 스캔과 레인지의 비용을 (1) 버퍼 풀이 차가울 때(m = 0)와 (2) 모두 메모리에 있을 때(m = 1) 각각 계산하고 어느 계획이 골라질지 말하라. (3) 차가운 상태에서 두 비용이 같아지는 행 수를 구하라.</li>
+<li>기본 키가 <code>id</code>인 4,000,000행 테이블에 비고유 인덱스 <code>idx_cs(customer_id, status)</code>가 있다. <code>innodb_index_stats</code>에 이 인덱스의 <code>n_diff_pfx01</code> = 50,000, <code>n_diff_pfx02</code> = 120,000, <code>n_diff_pfx03</code> = 4,000,000이 있다. (1) 열이 두 개인 인덱스에 왜 행이 세 개인가. (2) 조인에서 <code>t.customer_id = c.id</code>로 이 인덱스를 쓸 때와 <code>t.customer_id = c.id AND t.status = 'PAID'</code>로 쓸 때 옵티마이저가 추정하는 키당 행 수는 각각 얼마인가. (3) 같은 인덱스로 <code>WHERE customer_id = 7</code>을 실행한 EXPLAIN의 <code>rows</code>가 (2)의 첫 값과 크게 다를 수 있는 이유는 무엇인가.</li>
+<li>이 회차의 <code>status</code> 싱글턴 히스토그램(누적 빈도 0.002, 0.902, 0.942, 0.95, 1.0, NULL 없음)이 있을 때 다음 조건을 단일 테이블 EXPLAIN으로 보면 <code>filtered</code>가 얼마로 나올지 계산하고, 히스토그램이 없을 때의 값과 비교하라. (1) <code>status = 'SHIPPED'</code> (2) <code>status <> 'CANCELLED'</code> (3) <code>status = 'ON_HOLD'</code></li>
+<li>이 회차의 <code>amount</code> 등높이 히스토그램(버킷 <code>[1000, 9900, 0.25, 90]</code>, <code>[10000, 19900, 0.5, 100]</code>, <code>[20000, 49900, 0.75, 300]</code>, <code>[50000, 143900, 1.0, 940]</code>)에서 (1) <code>amount = 30000</code>과 (2) <code>amount < 35000</code>의 선택도를 계산하라. (1)의 결과에 주의하라.</li>
+<li>동료가 <code>SELECT * FROM orders WHERE status = 'CANCELLED' AND memo IS NOT NULL</code>이 느리다며 <code>status</code>에 히스토그램을 만들었다. EXPLAIN의 <code>filtered</code>는 바뀌었는데 계획(<code>ALL</code>)과 실행 시간은 그대로다. 왜 그런지 설명하고, 이 쿼리를 빠르게 하는 방법과, 같은 히스토그램이 계획을 바꿀 수 있는 쿼리 모양을 하나씩 제시하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> (1) 차가울 때 풀 스캔은 25,000 × 1.0 + 1.1 + 2,000,000 × 0.1 + 1 = 225,002.1이고, 레인지는 (1 + 300,000) × 1.0 + 300,000 × 0.1 + 0.01 = 330,001.01이다. 레인지가 더 비싸므로 풀 스캔이 골라진다. (2) 모두 메모리에 있으면 풀 스캔은 25,000 × 0.25 + 1.1 + 200,001 = 206,252.1, 레인지는 300,001 × 0.25 + 30,000.01 = 105,000.26이므로 레인지가 골라진다. 페이지 읽기 비용이 4분의 1로 줄 때 레인지는 행마다 붙는 페이지 비용이 크게 줄지만, 풀 스캔은 행 평가 비용 200,000이 그대로 남기 때문이다. (3) 1.1n + 1.01 = 225,002.1을 풀면 n ≈ 204,546행, 전체의 약 10.2%다.</p>
+<p><b>2번.</b> (1) 비고유 세컨더리 인덱스에는 InnoDB가 기본 키 <code>id</code>를 덧붙이므로 <code>(customer_id)</code>, <code>(customer_id, status)</code>, <code>(customer_id, status, id)</code> 세 접두사의 고유값 수가 기록된다. 마지막 값이 행 수와 같은 것은 기본 키가 붙으면 모든 항목이 유일해지기 때문이다. (2) 키당 행 수는 행 수 ÷ 고유값 수이므로 4,000,000 ÷ 50,000 = 80행, 4,000,000 ÷ 120,000 ≈ 33.3행이다. (3) <code>customer_id = 7</code>은 상수이므로 옵티마이저가 통계 대신 인덱스 다이브로 그 고객의 범위를 직접 센다. 고객 7의 주문이 평균보다 훨씬 많거나 적다면 다이브 결과는 평균 80과 크게 다르다. 통계의 평균은 값을 모를 때만 쓰인다.</p>
+<p><b>3번.</b> (1) SHIPPED의 빈도는 1.0 − 0.95 = 0.05이므로 5.00이다. 히스토그램이 없으면 10.00이다. (2) <code><></code>는 NULL이 아닌 비율에서 등호 선택도를 빼므로 1.0 − 0.002 = 0.998, 곧 99.80이다. 없으면 1 − 0.1 = 0.9로 90.00이다. (3) ON_HOLD는 어느 버킷에도 없으므로 계산값은 0이지만 하한 0.001이 적용되어 0.10이다. 없으면 10.00이다. 하한이 있는 이유는 표본이 드문 값을 놓쳤거나 히스토그램이 낡아 새 값이 생겼을 가능성 때문이다.</p>
+<p><b>4번.</b> (1) 30000은 셋째 버킷 [20000, 49900]에 들어가며, 버킷 빈도 0.75 − 0.5 = 0.25를 고유값 300으로 나누면 약 0.00083이다. 이것은 하한 0.001보다 작으므로 선택도는 0.001(filtered 0.10)이 된다. (2) 35000도 셋째 버킷 안이다. 앞 버킷의 누적 0.5에 0.25 × (35000 − 20000) ÷ (49900 − 20000 + 1) = 0.25 × 15000 ÷ 29901 ≈ 0.1254를 더해 약 0.6254, filtered 약 62.54다. 히스토그램이 없었다면 각각 10.00과 33.33이다. MySQL 8.4.13에서 <code>USING DATA</code>로 이 버킷을 넣고 EXPLAIN하면 <code>filtered</code>가 0.10과 62.54로 나온다.</p>
+<p><b>5번.</b> 단일 테이블 쿼리에는 필터링 비율을 받아 쓸 다음 테이블이 없고, LIMIT도 없으므로 실제 계획 수립에서는 필터링 계산이 생략된다. EXPLAIN은 모든 테이블에 필터링을 계산해 보여 주므로 숫자만 바뀐 것이다. <code>status</code>에 인덱스가 없는 한 이 쿼리는 어떻게든 테이블 전체를 읽어야 하며, 히스토그램은 읽는 방법을 바꾸지 못한다. 빠르게 하려면 취소 주문이 0.2%뿐이므로 <code>status</code>(또는 <code>status</code>를 앞에 둔 복합 인덱스)에 인덱스를 만들어 다이브와 레인지 접근이 가능하게 해야 한다. 같은 히스토그램이 계획을 바꾸는 예는 이 회차의 <code>members</code>와 <code>orders</code> 조인처럼, <code>orders</code>의 선행 행 수가 조인 순서를 좌우하는 쿼리다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>인덱스도 히스토그램도 없는 <code>VARCHAR</code> 열 <code>channel</code>에 대해 <code>EXPLAIN SELECT * FROM t WHERE channel = 'APP'</code>(행 100만)을 실행했다. <code>filtered</code>는 얼마로 나오겠는가?</q>
+<o>100.00 — 인덱스가 없으면 필터링을 계산하지 않는다</o>
+<o>33.33 — 문자열 조건에는 부등호 추정치가 쓰인다</o>
+<o>10.00 — 등호 조건의 기본 추정치 0.1이 쓰인다</o>
+<o>실제 비율 — EXPLAIN이 표본을 읽어 계산한다</o>
+<why>등호의 기본 추정치는 max(1 ÷ 행 수, 0.1)이고 행이 100만이면 0.1이다. EXPLAIN은 마지막 테이블에도 필터링을 계산해 보여 주므로 100.00이 아니다. 33.33은 크다·작다 비교의 기본값이며, EXPLAIN은 데이터를 표본으로 읽지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>다음 중 옵티마이저가 인덱스 다이브가 아니라 인덱스 통계(키당 행 수)로 행 수를 추정하는 경우는?</q>
+<o><code>WHERE ordered_at BETWEEN '2026-11-01' AND '2026-11-07'</code>의 레인지 추정</o>
+<o><code>WHERE member_id IN (3, 7, 11)</code>, 기본 설정</o>
+<o><code>JOIN orders o ON o.member_id = m.id</code>에서 <code>orders</code>를 ref로 찾는 비용 추정</o>
+<o>기본 키 등호 조건 <code>WHERE id = 42</code></o>
+<why>조인의 ref 접근은 비교 값이 앞 테이블의 행마다 달라 계획 시점에 정해져 있지 않으므로 다이브할 수 없고, 통계상 행 수 ÷ 고유값 수의 평균을 쓴다. 상수 범위와 값 3개짜리 IN 목록(기본 한도 200 미만)은 다이브로 추정한다. 기본 키 등호는 고유 인덱스이므로 최대 1행으로 본다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>통계를 바꾸지 않았는데도, 서버 재시작 직후에는 풀 스캔이던 쿼리가 몇 시간 뒤에는 인덱스 레인지 스캔으로 실행된다. 이 회차의 내용으로 가장 잘 설명하는 것은?</q>
+<o>재시작하면 영구 통계가 사라졌다가 다시 계산되기 때문이다</o>
+<o>InnoDB가 알려 주는 메모리 적중률이 올라가 페이지 읽기 비용이 1.0에서 0.25 쪽으로 내려가면서, 행마다 페이지를 읽는 레인지 계획이 상대적으로 싸졌기 때문이다</o>
+<o>쿼리 캐시가 채워져 실행 계획이 재사용되기 때문이다</o>
+<o>재시작 직후에는 비용 상수 테이블을 읽지 못해 규칙 기반 옵티마이저가 쓰이기 때문이다</o>
+<why>페이지 읽기 비용은 메모리 적중률로 0.25와 1.0을 섞은 값이다. 레인지 비용은 행 수만큼의 페이지 읽기에 비례하므로 적중률이 오르면 크게 줄지만, 풀 스캔은 행 평가 비용이 그대로 남아 덜 준다. 매뉴얼도 버퍼 풀 상태에 따라 계획이 바뀔 수 있다고 적는다. 영구 통계는 재시작해도 유지되고, MySQL 8.0에는 쿼리 캐시가 없으며, 비용 상수는 서버 시작 때 읽힌다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>ordered_at</code>에 인덱스가 있는데 같은 열에 히스토그램도 만들었다. <code>WHERE ordered_at >= '2026-11-01'</code> 조건의 추정에 대한 설명으로 옳은 것은?</q>
+<o>히스토그램이 다이브를 대신하므로 계획 수립이 빨라진다</o>
+<o>히스토그램과 다이브 결과의 평균을 쓴다</o>
+<o>히스토그램 덕분에 인덱스를 읽는 속도가 빨라진다</o>
+<o>레인지 옵티마이저의 추정이 우선하므로 이 조건에는 히스토그램이 쓰이지 않는다</o>
+<why>매뉴얼은 레인지 옵티마이저가 적용되면 히스토그램 통계를 쓰지 않는다고 적고, 소스에서도 레인지 옵티마이저가 추정한 열은 필터링 계산에서 그 추정을 먼저 쓴다. 히스토그램은 데이터를 읽는 데 쓰이지 않으므로 인덱스 속도와도 무관하다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>MySQL 8.0에서 <code>status</code> 히스토그램을 만든 뒤 석 달 동안 상태 분포가 크게 바뀌었다. 별다른 작업을 하지 않았다면 히스토그램은 어떻게 되어 있는가?</q>
+<o>만든 시점의 분포 그대로다. <code>ANALYZE TABLE ... UPDATE HISTOGRAM</code>을 다시 실행해야 바뀐다</o>
+<o>행의 10%가 바뀔 때마다 영구 통계와 함께 자동으로 갱신되어 있다</o>
+<o>분포가 바뀌면 히스토그램이 자동으로 삭제되어 기본 추정치로 돌아간다</o>
+<o>일반 <code>ANALYZE TABLE orders</code>를 실행했다면 함께 갱신되어 있다</o>
+<why>8.0의 히스토그램은 요청할 때만 만들어지고 갱신된다. 10% 자동 재계산은 인덱스 통계에 대한 것이고, 히스토그램 절이 없는 <code>ANALYZE TABLE</code>은 기존 히스토그램에 영향을 주지 않는다. 8.4의 <code>AUTO UPDATE</code>를 지정한 경우에만 통계 재계산과 함께 갱신된다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>비용 기반 옵티마이저(cost-based optimizer)</dt><dd>실행 계획 후보마다 예상 작업량을 비용으로 계산해 가장 싼 계획을 고르는 옵티마이저. 고정된 우선순위로 고르는 규칙 기반 방식과 대비된다.</dd>
+<dt>비용 모델(cost model)</dt><dd>비용 계산에 쓰는 단가의 집합. MySQL에서는 <code>mysql.server_cost</code>와 <code>mysql.engine_cost</code>로 조회·변경한다.</dd>
+<dt>인덱스 다이브(index dive)</dt><dd>범위의 양 끝 키로 B+Tree를 실제로 내려가 그 사이의 행 수를 세거나 추정하는 일. 상수 조건의 레인지 추정에 쓰인다.</dd>
+<dt>카디널리티(cardinality)</dt><dd>인덱스 열(또는 접두사)의 고유값 개수. InnoDB는 표본 페이지로 추정해 <code>n_diff_pfxNN</code>으로 저장한다.</dd>
+<dt>키당 행 수(records per key)</dt><dd>통계상 행 수를 고유값 개수로 나눈 평균. 비교 값을 모르는 조인의 ref 접근 등에서 쓰인다.</dd>
+<dt>영구 통계(persistent statistics)</dt><dd>InnoDB가 <code>mysql.innodb_table_stats</code>와 <code>mysql.innodb_index_stats</code>에 저장해 재시작 뒤에도 유지하는 옵티마이저 통계.</dd>
+<dt>히스토그램(histogram)</dt><dd>열 값의 분포를 버킷으로 요약한 통계. MySQL에는 싱글턴과 등높이 두 종류가 있으며 데이터 사전에 저장된다.</dd>
+<dt>선택도(selectivity)</dt><dd>조건을 만족하는 행의 비율(0~1). EXPLAIN의 <code>filtered</code>는 이를 퍼센트로 나타낸 값이다.</dd>
+<dt>조건 필터링(condition filtering)</dt><dd>접근 방법이 쓰지 않은 조건으로 다음 테이블에 넘길 선행 행 수를 줄여 추정하는 과정. <code>condition_fanout_filter</code>로 켜고 끈다.</dd>
+<dt>옵티마이저 트레이스(optimizer trace)</dt><dd>옵티마이저가 검토한 후보와 비용, 탈락 이유를 JSON으로 기록하는 기능. <code>INFORMATION_SCHEMA.OPTIMIZER_TRACE</code>로 읽는다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/cost-model.html">MySQL 8.0 Reference Manual — The Optimizer Cost Model</a> — 비용 상수 테이블의 구조, 변경 방법, 메모리·디스크 블록 비용과 계획 변화</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-persistent-stats.html">MySQL 8.0 Reference Manual — Configuring Persistent Optimizer Statistics Parameters</a> — 영구 통계 테이블, 자동 재계산 10%, 표본 페이지, n_diff_pfx와 덧붙는 기본 키</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/optimizer-statistics.html">MySQL 8.0 Reference Manual — Optimizer Statistics</a> — 히스토그램의 종류, 버킷과 JSON 키, 사용되는 조건, 인덱스와의 관계</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/analyze-table.html">MySQL 8.0 Reference Manual — ANALYZE TABLE Statement</a> — 히스토그램 생성·삭제 문법, 버킷 수, 제약, 샘플링, USING DATA</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/range-optimization.html">MySQL 8.0 Reference Manual — Range Optimization</a> — 인덱스 다이브와 인덱스 통계, eq_range_index_dive_limit, FORCE INDEX의 다이브 생략</li>
+<li><a href="https://raw.githubusercontent.com/mysql/mysql-server/8.0/storage/innobase/handler/ha_innodb.cc">MySQL 8.0 소스 — ha_innodb.cc</a> — InnoDB의 scan_time, read_time, records_in_range, 메모리 적중률 추정 구현</li>
+</x-refs>

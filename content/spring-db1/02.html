@@ -1,0 +1,790 @@
+<x-meta>
+deck: 커넥션 하나를 새로 열 때 네트워크와 DB 서버가 치르는 비용에서 출발해, 커넥션 풀이 그 비용을 미리 치러 두는 방식과 DataSource가 커넥션 얻는 방법을 감추는 방식을 HikariCP 소스와 실행 로그로 따라간다.
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li>DriverManager로 커넥션을 매번 새로 열 때 클라이언트, 네트워크, DB 서버에서 생기는 일(TCP 연결, 프로토콜 핸드셰이크와 인증, 서버 쪽 세션과 스레드, 닫을 때 남는 TIME_WAIT 소켓)을 차례대로 말하고, 커넥션 풀이 그중 무엇을 아끼고 무엇은 아끼지 못하는지 구분할 수 있다.</li>
+<li>javax.sql.DataSource가 "커넥션을 얻는 방법"을 감춘 인터페이스라는 것을 설명하고, DriverManagerDataSource와 HikariDataSource가 같은 getConnection과 close 호출에 실제로는 전혀 다른 일을 한다는 것을 실행 결과로 보일 수 있다.</li>
+<li>HikariCP 로그를 읽고 풀이 언제 시작되는지, 첫 커넥션은 어느 스레드가 만들고 나머지는 어느 스레드가 채우는지, 반납된 커넥션이 어떻게 같은 물리 커넥션으로 다시 나가는지 추적할 수 있다.</li>
+<li>풀이 바닥났을 때 요청 스레드가 connectionTimeout 동안 기다리다 예외를 받는 과정, 그리고 반납할 때 커밋되지 않은 트랜잭션이 롤백되고 autoCommit 같은 상태가 초기화되는 이유를 HikariCP 소스로 설명할 수 있다.</li>
+<li>리포지토리가 DataSource 인터페이스에만 의존하도록 고치고, 풀 크기와 커넥션 수명을 정할 때 따져야 할 조건(DB 서버의 연결 한도, DB와 인프라의 유휴 연결 제한, 스레드와 커넥션의 비율)을 말할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 커넥션은 왜 비싸고, 누가 대신 들고 있어야 하는가</h3>
+
+<p>앞 회차에서는 <code>DriverManager.getConnection</code>이 등록된 드라이버를 찾아 <code>connect</code>를 부르고, 드라이버가 데이터베이스 서버와 TCP 연결을 맺고 프로토콜 핸드셰이크와 인증을 거쳐 서버 쪽에 세션을 만든다는 것을 따라갔다. 그리고 등록·조회·수정·삭제 메서드마다 커넥션을 열고, 쓰고, 닫았다. 예제로는 충분했지만 실제 서비스로 옮기면 문제가 생긴다. 웹 애플리케이션은 요청 하나마다 SQL을 몇 번씩 실행하고, 동시에 수십 개의 요청을 처리한다. 요청마다 커넥션을 새로 열고 닫으면, 앞 회차에서 본 그 긴 준비 과정을 요청 수만큼 되풀이하게 된다.</p>
+
+<p>이 회차가 답할 질문은 다섯 가지다. 첫째, 커넥션 하나를 새로 만드는 데 정확히 무엇이 드는가. 둘째, 커넥션 풀(connection pool)은 그 비용을 어떻게 피하고, 그 대가로 무엇을 떠안는가. 셋째, 커넥션을 얻는 방법이 DriverManager에서 풀로 바뀔 때 애플리케이션 코드는 왜 바뀌지 않아도 되는가. 이것이 <code>DataSource</code>라는 인터페이스가 존재하는 이유다. 넷째, 실제 풀 구현체인 HikariCP는 안에서 어떤 스레드가 무엇을 하고, 커넥션을 빌려주고 돌려받을 때 어떤 자료구조를 쓰는가. 다섯째, 이것을 앞 회차의 리포지토리에 적용하면 무엇이 달라지는가.</p>
+
+<p>실험 환경을 먼저 밝혀 둔다. 자바는 Temurin 21.0.13이고, 데이터베이스는 앞 회차에서 만든 H2 2.4.240 서버의 <code>bankdb</code>(계좌 번호와 잔액만 있는 <code>account</code> 테이블)다. 서버는 별도 프로세스로 <code>org.h2.tools.Server -tcp</code>를 띄웠다. 풀은 HikariCP 7.0.2, 스프링 쪽 클래스는 Spring JDBC 7.0.10을 썼다. 이 강좌의 기준인 Spring Boot 3.x가 관리하는 HikariCP 버전과는 다를 수 있으므로, 로그 문구나 내부 스레드 이름처럼 버전에 따라 달라질 수 있는 부분에는 "7.0.2 기준"이라고 적는다. 기본값은 HikariCP README와 7.0.2 소스 양쪽에서 확인한 것만 쓴다. 실행 결과에 나오는 시각, 걸린 시간, 객체의 해시 값은 실행할 때마다 다르다.</p>
+
+<h3>커넥션 하나를 새로 만드는 데 드는 것</h3>
+
+<p>커넥션을 "얻는다"는 말은 가볍게 들리지만, 실제로는 세 곳에서 일이 일어난다. 애플리케이션 JVM 안에서는 드라이버가 소켓을 만들고 프로토콜 객체를 준비한다. 네트워크에서는 TCP 연결이 맺어진다. RFC 9293은 "three-way handshake"를 연결을 맺는 절차로 정의한다. 클라이언트가 SYN을 보내고, 서버가 SYN과 ACK를 함께 돌려주고, 클라이언트가 다시 ACK를 보낸다. 이 왕복이 끝나야 비로소 바이트를 주고받을 수 있다. 그다음에는 데이터베이스 프로토콜 차례다. MySQL이라면 서버가 먼저 인사 패킷을 보내고, 클라이언트가 사용자 이름과 인증 정보를 담아 응답하고, 서버가 인증 결과를 돌려준다. TLS를 쓴다면 그 사이에 암호화 협상 왕복이 더 끼어든다.</p>
+
+<p>데이터베이스 서버 쪽에서도 일이 생긴다. MySQL 8.0 매뉴얼의 "Connection Interfaces" 절은 연결 관리 스레드가 클라이언트 연결마다 그 연결 전용 스레드를 붙이고, 그 스레드가 인증과 요청 처리를 맡는다고 설명한다. 새 스레드를 만드는 비용을 줄이려고 먼저 스레드 캐시(<code>thread_cache_size</code>)를 확인하고, 연결이 끝나면 캐시에 자리가 있을 때 스레드를 캐시로 돌려보낸다. 같은 절은 이 모델에서 "연결된 클라이언트 수만큼 스레드가 있다"고 하고, 스레드마다 스택 같은 서버와 커널 자원이 든다고 적는다. 즉 커넥션 하나는 애플리케이션 쪽의 소켓 하나와 객체 몇 개에 그치지 않는다. 데이터베이스 서버 안에서 스레드 하나와 세션 상태(현재 사용자, 기본 스키마, 자동 커밋 여부, 트랜잭션 격리 수준 같은 것)를 차지한다.</p>
+
+<p>H2 서버도 같은 구조다. H2 TCP 서버를 같은 JVM 안에서 띄우고 커넥션 네 개를 연 다음 스레드 이름을 출력해 보면, 접속을 받는 <code>H2 TCP Server (tcp://localhost:9092)</code> 스레드 하나 외에 <code>... thread-1</code>부터 <code>... thread-4</code>까지 접속마다 스레드가 하나씩 생겨 있다. 데이터베이스 엔진마다 세부는 다르지만 "커넥션 하나가 서버의 실행 단위 하나와 세션 하나를 붙잡는다"는 구도는 이 두 제품에서 직접 확인된다.</p>
+
+<pre class="diagram">애플리케이션 JVM                 네트워크                  DB 서버
+-----------------               ------------              --------------------
+getConnection()
+  Driver.connect()
+  소켓 생성 ---------- SYN ------------------------------>  연결 관리 스레드가 수락
+            <-------- SYN + ACK ----------------------------
+            ---------- ACK ------------------------------>  (TCP 연결 성립)
+            <-------- 서버 인사(버전, 인증 방식, 난수) ------  전용 스레드 배정(캐시 또는 새로 생성)
+            ---------- 사용자, 인증 응답 ------------------>  인증 확인
+            <-------- 인증 결과 ----------------------------  세션 상태 생성
+  Connection 객체 반환
+... SQL 실행 ...
+close()     ---------- 종료 명령, FIN/ACK ---------------->  세션 정리, 스레드 반환
+            (먼저 닫은 쪽 소켓은 TIME_WAIT로 남는다)</pre>
+
+<p>닫을 때도 공짜가 아니다. TCP 연결을 먼저 닫은 쪽(active close)은 곧바로 사라지지 않고 TIME_WAIT 상태로 남는다. RFC 9293은 먼저 닫은 쪽이 2×MSL(Maximum Segment Lifetime) 동안 TIME-WAIT에 머물러야 한다(MUST-13)고 정하고, 이 상태가 상대가 마지막 ACK를 받았음을 확신하고 이전 연결의 지연된 세그먼트가 새 연결을 방해하지 않게 하려는 것이라고 설명한다. 명세는 MSL을 2분으로 잡지만 이것이 "공학적 선택"이라고 덧붙이며, 실제 운영체제가 쓰는 값은 구현마다 다르다.</p>
+
+<p>직접 확인해 보자. 아래 코드는 커넥션을 열고 <code>select 1</code>을 한 번 실행하고 닫는 일을 20번 되풀이한다. 앞 회차의 방식 그대로다.</p>
+
+<pre><code class="language-java">for (int i = 0; i < 20; i++) {
+    try (Connection c = DriverManager.getConnection("jdbc:h2:tcp://localhost/~/bankdb", "sa", "")) {
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("select 1")) {
+            rs.next();
+        }
+    }
+}</code></pre>
+
+<p>프로그램이 끝난 직후 macOS에서 <code>netstat -an -p tcp</code>로 9092 포트의 소켓 상태를 세면 다음과 같았다.</p>
+
+<pre data-label="실행 결과 (netstat 집계)"><code class="language-text">   1 LISTEN
+  20 TIME_WAIT
+tcp4  0  0  127.0.0.1.9092   127.0.0.1.55925   TIME_WAIT
+tcp4  0  0  127.0.0.1.9092   127.0.0.1.55926   TIME_WAIT
+...</code></pre>
+
+<p>스무 번 연결했으니 TIME_WAIT 소켓이 스무 개다. 이 실행에서는 로컬 주소가 <code>127.0.0.1.9092</code>, 즉 서버 쪽 소켓이 TIME_WAIT에 남았다. H2 2.4.240 서버가 연결을 먼저 닫았다는 뜻이다. 어느 쪽이 TIME_WAIT를 떠안는지는 어느 쪽이 먼저 닫느냐에 달려 있어서 데이터베이스 제품과 드라이버에 따라 다를 수 있다. 중요한 것은 연결을 짧게 쓰고 버리는 패턴이 연결마다 수명이 다한 소켓을 한동안 남긴다는 점이다. 요청이 몰리는 서버에서 이런 소켓이 쌓이면 포트와 커널 자원을 잡아먹는다.</p>
+
+<p>여기서 "커넥션 하나를 여는 데 몇 밀리초가 걸린다" 같은 수치는 적지 않는다. 네트워크 왕복 시간, 인증 방식, TLS 여부, 서버 부하에 따라 크게 달라지기 때문이다. 같은 컴퓨터 안의 H2처럼 가장 유리한 조건에서도 이 과정은 여러 번의 네트워크 왕복과 서버 쪽 자원 할당을 포함한다. 반면 이미 열린 커넥션을 메모리에서 꺼내 주는 일은 네트워크를 전혀 타지 않는다. 이 구조적인 차이가 이 회차 전체의 출발점이다.</p>
+
+<x-visual id="spring-db1-02-connection-cost" title="커넥션을 새로 여는 경우와 풀에서 빌리는 경우의 비교" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>새 커넥션은 TCP 핸드셰이크, DB 인증, 서버 스레드 배정까지 여러 왕복을 거치지만, 풀에서 빌리는 것은 애플리케이션 메모리 안에서 끝난다는 대비를 보여 준다.</x-hint>
+<x-prompt>Two-panel sequence diagram side by side. Left panel titled "새 커넥션 열기": three vertical lifelines labeled "애플리케이션", "네트워크", "DB 서버". Arrows going right and back in order: "SYN", "SYN+ACK", "ACK", "서버 인사", "인증 응답", "인증 결과". On the DB server lifeline a small box labeled "전용 스레드·세션 생성". At the bottom a dashed box labeled "TIME_WAIT" next to the closing arrow "close". Right panel titled "풀에서 빌리기": only one lifeline labeled "애플리케이션" with a rounded rectangle labeled "커넥션 풀" containing four small connector icons; a short curved arrow from the pool to the application labeled "getConnection". No network arrows on the right panel. Flat vector style, thin lines, muted blue and gray.</x-prompt>
+<x-caption>왼쪽은 요청마다 치러야 하는 비용, 오른쪽은 그 비용을 미리 치러 둔 뒤 빌리기만 하는 경우다.</x-caption>
+</x-visual>
+
+<h3>커넥션 풀 이해: 비용을 미리 치르고 계속 다시 쓴다</h3>
+
+<p>커넥션 풀의 아이디어는 단순하다. 애플리케이션이 시작될 때(또는 처음 필요할 때) 커넥션을 미리 몇 개 만들어 보관해 둔다. 이 커넥션들은 TCP 연결, 인증, 서버 세션 생성을 이미 마친 상태다. 애플리케이션 코드가 커넥션을 달라고 하면 풀은 보관 중인 것 하나를 "사용 중"으로 표시하고 내준다. 코드가 일을 마치고 <code>close()</code>를 부르면 풀은 물리 연결을 끊지 않고 "사용 가능"으로 되돌려 다음 요청에 다시 내준다. 연결을 맺고 끊는 비용은 풀이 커넥션을 처음 만들 때와 수명이 다해 버릴 때만 치르고, 그 사이의 수많은 요청은 빌리고 돌려주는 비용만 낸다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>렌터카 영업소</strong><p>렌터카 회사는 손님이 올 때마다 차를 사서 번호판을 달고 보험에 가입하지 않는다. 등록을 마친 차를 미리 주차장에 세워 두고, 손님이 오면 열쇠만 건넨다. 손님이 반납하면 차를 폐차하지 않고 청소하고 연료를 채운 뒤 다음 손님에게 내준다. 차가 모두 나가 있으면 새 손님은 카운터에서 기다리다가, 일정 시간이 지나도 차가 돌아오지 않으면 포기하고 돌아간다. 커넥션 풀의 대여, 반납, 상태 초기화, 대기, 대기 시간 초과가 모두 이 그림에 들어 있다. 비유가 깨지는 지점도 있다. 렌터카는 며칠 단위로 빌리지만 커넥션은 보통 수 밀리초에서 수백 밀리초 빌린다. 또 HikariCP는 방금 반납한 손님이 다시 오면 그 손님이 탔던 차를 먼저 찾아 주는데, 이런 영업소는 흔하지 않다. 이 동작은 뒤에서 소스로 본다.</p></aside>
+
+<figure class="flow-figure"><figcaption>커넥션 풀에서 커넥션 하나의 일생</figcaption><ol class="flow">
+<li><strong>생성</strong><span>풀이 드라이버로 물리 커넥션을 연다. TCP 연결, 인증, 서버 세션 생성이 이때 한 번 일어난다.</span></li>
+<li><strong>유휴(idle)</strong><span>풀 안에서 사용 가능 상태로 기다린다. 오래 쉬면 정리되거나 살아 있는지 점검받는다.</span></li>
+<li><strong>대여(active)</strong><span>getConnection 호출에 응해 사용 중 상태로 바뀐다. 애플리케이션은 원본 대신 감싼 객체(프록시)를 받는다.</span></li>
+<li><strong>반납</strong><span>애플리케이션이 close를 부르면 풀이 상태를 초기화하고 다시 유휴 상태로 돌린다. 물리 연결은 그대로다.</span></li>
+<li><strong>폐기</strong><span>최대 수명이 지났거나 죽은 것으로 판정되면 풀이 물리 연결을 닫고, 필요하면 새 커넥션으로 채운다.</span></li>
+</ol></figure>
+
+<p>풀이 아끼는 것과 아끼지 못하는 것을 구분해 두자. 풀이 아끼는 것은 커넥션 획득 비용이다. SQL을 파싱하고 실행하고 결과를 보내는 비용은 풀이 있든 없든 똑같다. 느린 쿼리는 풀을 써도 느리다. 대신 풀에는 획득 비용 절감보다 덜 알려진 두 번째 역할이 있다. 바로 데이터베이스로 향하는 동시 연결 수의 상한이 된다는 점이다. 풀의 최대 크기가 10이면 그 애플리케이션 인스턴스는 아무리 요청이 몰려도 데이터베이스에 10개를 넘는 연결을 열지 않는다. 남는 요청은 애플리케이션 안에서 줄을 선다.</p>
+
+<p>이 상한은 데이터베이스를 보호한다. MySQL은 동시에 받아 주는 클라이언트 연결 수를 <code>max_connections</code> 시스템 변수로 제한하고, 이를 넘으면 클라이언트는 "Too many connections" 오류를 받는다. MySQL 매뉴얼에 따르면 서버는 실제로 <code>max_connections</code>보다 하나 더 받아 주는데, 그 하나는 <code>CONNECTION_ADMIN</code> 권한(또는 사용 중단 예정인 <code>SUPER</code> 권한)이 있는 계정을 위해 남겨 둔 자리다. 관리자가 접속해 상황을 수습할 수 있게 하려는 것이다. 풀 없이 요청마다 연결을 열면 트래픽이 몰리는 순간 연결 수가 요청 수를 그대로 따라가 이 한도에 부딪힌다. 풀을 쓰면 애플리케이션 인스턴스 수 곱하기 풀 크기가 연결 수의 상한이 되므로 미리 계산할 수 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>관점</th><th>요청마다 새 커넥션</th><th>커넥션 풀</th></tr></thead><tbody>
+<tr><td>커넥션 획득 비용</td><td>매번 TCP 연결, 인증, 세션 생성</td><td>풀이 커넥션을 처음 만들 때만. 이후에는 메모리에서 꺼내기</td></tr>
+<tr><td>DB 동시 연결 수</td><td>동시 요청 수만큼 늘어난다</td><td>풀 최대 크기에서 멈춘다</td></tr>
+<tr><td>닫을 때</td><td>물리 연결 종료, TIME_WAIT 소켓 발생</td><td>풀에 반납, 물리 연결 유지</td></tr>
+<tr><td>요청이 몰릴 때</td><td>DB 연결 한도 초과 오류 가능</td><td>애플리케이션 안에서 대기, 시간 초과 시 예외</td></tr>
+<tr><td>새로 생기는 책임</td><td>없음</td><td>풀 크기, 커넥션 수명, 반납 시 상태 초기화, 누수 감시</td></tr>
+</tbody></table></div>
+
+<p>마지막 행이 풀의 대가다. 커넥션을 오래 들고 있으면 데이터베이스나 네트워크 장비가 오래 쉰 연결을 끊어 버릴 수 있다. 앞 사람이 바꿔 놓은 세션 상태(자동 커밋 끔, 읽기 전용, 격리 수준)가 다음 사람에게 넘어가면 안 된다. 커넥션을 빌려 가고 돌려주지 않는 코드가 있으면 풀이 서서히 말라 간다. 이 회차 후반부는 이 책임들을 HikariCP가 어떻게 지는지 소스로 확인한다.</p>
+
+<p>자바 진영의 대표적인 풀 구현으로는 HikariCP, Tomcat JDBC Pool, Apache Commons DBCP2, Oracle UCP가 있다. Spring Boot 3.5 레퍼런스는 풀 구현을 고르는 순서를 이렇게 적는다. HikariCP가 있으면 성능과 동시성 때문에 항상 HikariCP를 고른다. 없으면 Tomcat 풀, 그다음 DBCP2, 셋 다 없으면 Oracle UCP를 쓴다. 그리고 <code>spring-boot-starter-jdbc</code>나 <code>spring-boot-starter-data-jpa</code>를 쓰면 HikariCP 의존성이 자동으로 따라온다. 그래서 스프링 부트 애플리케이션에서 별다른 설정 없이 쓰는 풀은 대개 HikariCP다. 이 선택 알고리즘을 건너뛰고 싶으면 <code>spring.datasource.type</code>에 구현 클래스를 지정한다.</p>
+
+<h3>DataSource 이해: 커넥션을 얻는 방법을 감추는 인터페이스</h3>
+
+<p>이제 두 번째 문제다. 앞 회차의 코드는 커넥션이 필요할 때 <code>DriverManager.getConnection(URL, USERNAME, PASSWORD)</code>를 직접 불렀다. 여기에 HikariCP를 도입하려면 이 호출을 HikariCP의 클래스를 쓰는 코드로 바꿔야 한다. 나중에 DBCP2로 바꾸면 또 바꿔야 한다. 풀 구현마다 설정 방법과 클래스가 다르기 때문이다. 커넥션을 쓰는 코드는 수십 곳에 흩어져 있는데, "커넥션을 어디서 어떻게 얻는가"라는 결정이 그 수십 곳에 박혀 있는 셈이다. 스프링 핵심 원리 기본편에서 본 구도와 같다. 구현이 바뀔 때마다 클라이언트 코드가 바뀐다면 클라이언트가 구현에 의존하고 있는 것이다.</p>
+
+<p>자바 표준은 이 문제의 답을 이미 갖고 있다. <code>javax.sql.DataSource</code> 인터페이스다. JDK 21 소스의 Javadoc 첫 문장은 DataSource를 "이 DataSource 객체가 나타내는 물리적 데이터 소스에 대한 커넥션의 팩토리"라고 정의하고, DriverManager의 대안으로서 커넥션을 얻는 데 선호되는 수단이라고 적는다. 핵심 메서드는 하나다.</p>
+
+<pre data-label="javax.sql.DataSource (JDK 21, 일부)"><code class="language-java">public interface DataSource extends CommonDataSource, Wrapper {
+
+    Connection getConnection() throws SQLException;
+
+    Connection getConnection(String username, String password) throws SQLException;
+
+    // ... getLogWriter, setLoginTimeout 등 CommonDataSource에서 온 메서드
+}</code></pre>
+
+<p>인자 없는 <code>getConnection()</code>에 주목하자. URL도 사용자 이름도 받지 않는다. 그 정보는 DataSource 객체를 만들 때 이미 넣어 두었기 때문이다. 이것이 DataSource가 가져온 가장 큰 변화다. 커넥션을 얻는 일이 <b>설정</b>과 <b>사용</b> 두 단계로 나뉜다. 설정은 애플리케이션이 시작될 때 한곳에서 한 번 한다. 어떤 구현을 쓸지, URL과 계정은 무엇인지, 풀 크기는 몇인지를 정해 DataSource 객체를 만든다. 사용은 커넥션이 필요한 모든 곳에서 <code>dataSource.getConnection()</code> 한 줄로 한다. 사용하는 쪽은 그 뒤에 풀이 있는지, 몇 개짜리인지, 어느 데이터베이스인지 모른다.</p>
+
+<p>같은 Javadoc은 구현이 세 종류라고 설명한다. 표준 Connection 객체를 만들어 주는 기본 구현(basic implementation), 커넥션 풀링에 자동으로 참여하는 Connection을 만들어 주는 커넥션 풀링 구현(connection pooling implementation), 분산 트랜잭션에 쓸 수 있는 Connection을 만들어 주는 분산 트랜잭션 구현(distributed transaction implementation)이다. 또 기본 구현이 돌려주는 커넥션은 DriverManager로 얻은 커넥션과 똑같다고 적는다. 이 회차의 두 예제가 정확히 앞의 두 종류에 해당한다. 스프링의 <code>DriverManagerDataSource</code>는 기본 구현이고, <code>HikariDataSource</code>는 풀링 구현이다.</p>
+
+<p>여기서 하나 짚어 둘 것이 있다. <code>DriverManager</code>는 DataSource를 구현하지 않는다. DriverManager는 정적 메서드만 가진 클래스이고, 커넥션을 얻을 때마다 URL과 계정을 인자로 받는다. 그래서 DriverManager 방식으로 커넥션을 얻으면서도 코드는 DataSource에 의존하게 하려면, DriverManager를 DataSource 모양으로 감싸 주는 어댑터가 필요하다. 스프링이 제공하는 <code>DriverManagerDataSource</code>가 그 어댑터다.</p>
+
+<pre class="diagram">                 애플리케이션 코드 (리포지토리 등)
+                              |
+                              |  getConnection() / close()
+                              v
+                 +---------------------------+
+                 |  javax.sql.DataSource     |   <- 코드는 여기에만 의존
+                 +---------------------------+
+                    ^                       ^
+                    | 구현                   | 구현
+   +--------------------------+   +---------------------------+
+   | DriverManagerDataSource  |   | HikariDataSource          |
+   | (스프링, 기본 구현)        |   | (HikariCP, 풀링 구현)       |
+   | 호출마다 DriverManager로  |   | 미리 만든 커넥션을 빌려줌    |
+   | 새 물리 커넥션을 연다      |   | close()는 반납              |
+   +--------------------------+   +---------------------------+
+                    |                       |
+                    v                       v
+               JDBC 드라이버  ---------  DB 서버</pre>
+
+<p>JDBC는 풀링 자체에 대한 모델도 정해 두었다. <code>javax.sql.PooledConnection</code>의 Javadoc에 따르면 풀링을 할 때 애플리케이션이 받는 Connection은 물리 연결을 나타내는 PooledConnection에 대한 "핸들(handle)"이고, 애플리케이션이 그 핸들에 <code>close</code>를 부르면 풀 관리자가 통지를 받아 핸들을 무효로 만들고 물리 연결을 풀로 되돌린다. 그래서 애플리케이션이 커넥션을 닫으면 물리 연결은 닫히지 않고 재활용된다. HikariCP는 이 인터페이스들을 거치는 대신 자기만의 프록시 클래스로 같은 일을 하지만, "애플리케이션이 받는 것은 핸들이고, 핸들을 닫으면 물리 연결은 풀로 돌아간다"는 개념은 그대로다. 예제 2에서 이 핸들을 직접 출력해 본다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>벽의 콘센트</strong><p>전기 제품은 벽 콘센트의 규격만 알면 된다. 전기가 발전소에서 오는지, 건물의 비상 발전기에서 오는지, 태양광 배터리에서 오는지 몰라도 플러그를 꽂으면 돌아간다. DataSource는 커넥션의 콘센트다. 리포지토리는 <code>getConnection()</code>이라는 규격만 알고, 커넥션이 새로 만들어진 것인지 풀에서 꺼낸 것인지 모른다. 비유가 깨지는 지점은 반납이다. 콘센트에서 플러그를 뽑는 일은 어느 전원이든 같지만, <code>close()</code>는 DataSource 구현에 따라 물리 연결을 끊기도 하고(DriverManagerDataSource) 풀에 돌려주기도 한다(HikariDataSource). 같은 규격 뒤에서 의미가 달라지므로, 사용하는 쪽은 "빌린 것은 반드시 close한다"는 규칙 하나만 지키면 된다.</p></aside>
+
+<x-visual id="spring-db1-02-datasource-abstraction" title="DataSource 인터페이스와 두 구현" kind="구조도" ratio="16:9">
+<x-hint>리포지토리는 DataSource 인터페이스에만 의존하고, 그 뒤에 DriverManagerDataSource나 HikariDataSource가 교체되어 꽂힌다는 구조를 보여 준다.</x-hint>
+<x-prompt>Layered structure diagram. Top: a rounded box labeled "리포지토리". A downward arrow labeled "getConnection()" to a horizontal bar labeled "DataSource 인터페이스". Below the bar, two boxes side by side connected upward with hollow-triangle arrows (implements): left box labeled "DriverManagerDataSource" with a small note "호출마다 새 연결", right box labeled "HikariDataSource" with a small note "풀에서 대여". Under the right box, a container labeled "커넥션 풀" with five small connector icons. Both boxes have arrows down to a cylinder labeled "DB 서버". On the left side of the DataSource bar, a gear icon labeled "설정: URL, 계정, 풀 크기". Flat vector, thin lines, two accent colors.</x-prompt>
+<x-caption>설정은 DataSource를 만들 때 한 번, 사용은 getConnection 한 줄. 구현을 바꿔도 리포지토리는 바뀌지 않는다.</x-caption>
+</x-visual>
+
+<h3>DataSource 예제 1: DriverManager와 DriverManagerDataSource</h3>
+
+<p>먼저 DriverManager를 직접 쓰는 방식과, 같은 일을 DataSource 모양으로 하는 <code>DriverManagerDataSource</code>를 나란히 놓아 보자. 두 방식 모두 커넥션을 두 개씩 얻고, DataSource 쪽은 커넥션 하나를 닫은 뒤 다시 하나를 얻는다.</p>
+
+<pre><code class="language-java">import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import javax.sql.DataSource;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
+
+public class DataSourceExample1 {
+    static final String URL = "jdbc:h2:tcp://localhost/~/bankdb";
+    static final String USERNAME = "sa";
+    static final String PASSWORD = "";
+
+    public static void main(String[] args) throws SQLException {
+        // (1) DriverManager: 커넥션을 얻을 때마다 접속 정보를 넘긴다
+        Connection c1 = DriverManager.getConnection(URL, USERNAME, PASSWORD);
+        Connection c2 = DriverManager.getConnection(URL, USERNAME, PASSWORD);
+        print("c1", c1);
+        print("c2", c2);
+
+        // (2) DriverManagerDataSource: 접속 정보는 객체를 만들 때 한 번만 넘긴다
+        DataSource dataSource = new DriverManagerDataSource(URL, USERNAME, PASSWORD);
+        Connection c3 = dataSource.getConnection();
+        Connection c4 = dataSource.getConnection();
+        print("c3", c3);
+        print("c4", c4);
+
+        c3.close();
+        System.out.println("c3.isClosed() = " + c3.isClosed());
+        Connection c5 = dataSource.getConnection();
+        print("c5", c5);
+
+        c1.close(); c2.close(); c4.close(); c5.close();
+    }
+
+    static void print(String name, Connection con) {
+        System.out.println(name + " = " + con + " / " + con.getClass().getSimpleName());
+    }
+}</code></pre>
+
+<p>클래스패스에 H2 드라이버, Spring JDBC와 그 의존 라이브러리, 그리고 로그를 보기 위해 Logback을 넣고 실행했다. Logback은 설정 파일이 없으면 DEBUG 수준까지 콘솔에 찍으므로 스프링이 남기는 디버그 로그도 함께 보인다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">c1 = conn0: url=jdbc:h2:tcp://localhost/~/bankdb user=SA / JdbcConnection
+c2 = conn1: url=jdbc:h2:tcp://localhost/~/bankdb user=SA / JdbcConnection
+19:48:31.053 [main] DEBUG ...DriverManagerDataSource -- Creating new JDBC DriverManager Connection to [jdbc:h2:tcp://localhost/~/bankdb]
+19:48:31.056 [main] DEBUG ...DriverManagerDataSource -- Creating new JDBC DriverManager Connection to [jdbc:h2:tcp://localhost/~/bankdb]
+c3 = conn2: url=jdbc:h2:tcp://localhost/~/bankdb user=SA / JdbcConnection
+c4 = conn3: url=jdbc:h2:tcp://localhost/~/bankdb user=SA / JdbcConnection
+c3.isClosed() = true
+19:48:31.060 [main] DEBUG ...DriverManagerDataSource -- Creating new JDBC DriverManager Connection to [jdbc:h2:tcp://localhost/~/bankdb]
+c5 = conn4: url=jdbc:h2:tcp://localhost/~/bankdb user=SA / JdbcConnection</code></pre>
+
+<p>한 줄씩 읽어 보자. <code>conn0</code>, <code>conn1</code> 같은 이름은 H2 드라이버가 붙인 것이다. H2 소스의 <code>TraceObject</code>는 객체 종류별 일련번호를 정적 <code>AtomicIntegerArray</code>에 두고 하나씩 증가시킨다. 그래서 같은 JVM 안에서 만들어진 JDBC 커넥션 객체마다 0부터 번호가 붙는다. 다섯 번 얻었더니 <code>conn0</code>부터 <code>conn4</code>까지 다섯 개의 서로 다른 커넥션이 나왔다. 클래스 이름은 모두 H2의 <code>JdbcConnection</code>이다. DriverManagerDataSource가 돌려준 것도 감싼 객체가 아니라 드라이버의 커넥션 그 자체다. Javadoc이 말한 "기본 구현이 돌려주는 커넥션은 DriverManager로 얻은 것과 같다"가 그대로 보인다.</p>
+
+<p>스프링의 디버그 로그 "Creating new JDBC DriverManager Connection"은 DataSource에서 커넥션을 얻을 때마다 한 번씩, 모두 세 번 찍혔다. Spring JDBC 7.0.10 소스를 따라가면 이유가 분명하다. <code>getConnection()</code>은 부모 클래스 <code>AbstractDriverBasedDataSource</code>에서 <code>getConnectionFromDriver(username, password)</code>를 부르고, 이 메서드는 사용자 이름과 비밀번호를 <code>Properties</code>에 담아 <code>getConnectionFromDriver(props)</code>로 넘긴다. DriverManagerDataSource가 구현한 이 메서드는 위의 디버그 로그를 남긴 뒤 <code>getConnectionFromDriverManager(url, props)</code>를 부르고, 그 메서드 본문은 <code>return DriverManager.getConnection(url, props);</code> 한 줄이다. 결국 하는 일은 (1)번 방식과 똑같고, 접속 정보를 어디서 받느냐만 다르다.</p>
+
+<p><code>c3.close()</code> 다음 줄도 눈여겨보자. 닫은 뒤 다시 얻은 <code>c5</code>는 <code>conn2</code>가 아니라 새 번호 <code>conn4</code>다. DriverManagerDataSource의 커넥션은 그냥 드라이버의 커넥션이므로 <code>close()</code>가 물리 연결을 닫는다. 프로세스가 <code>c1</code>, <code>c2</code>, <code>c4</code>, <code>c5</code>를 들고 있을 때 <code>lsof</code>로 이 프로세스의 TCP 소켓을 보면 9092 포트로 향하는 ESTABLISHED 소켓이 정확히 4개다. 커넥션 객체 하나가 TCP 연결 하나와 짝을 이루고, 닫으면 연결도 사라진다. Spring JDBC Javadoc도 이 클래스에 대해 굵은 글씨로 "실제 커넥션 풀이 아니다(not an actual connection pool)"라고 적고, 풀이 있다고 가정한 <code>Connection.close()</code> 호출은 커넥션을 그냥 닫는다고 설명한다. 그리고 현대적인 풀이 필요하면 HikariCP를 고려하라고 권한다.</p>
+
+<p>그렇다면 DriverManagerDataSource를 쓸 이유는 무엇인가. 커넥션 획득 비용은 DriverManager와 똑같다. 달라진 것은 코드의 모양이다. (1)번 방식은 커넥션을 얻는 모든 곳이 URL과 계정을 알아야 한다. (2)번 방식에서는 DataSource를 만드는 한 곳만 그 정보를 알고, 커넥션을 쓰는 곳은 <code>dataSource.getConnection()</code>만 부른다. 이렇게 사용하는 쪽이 DataSource 인터페이스에만 의존하게 만들어 두면, 다음 예제처럼 DataSource를 만드는 한 곳만 HikariCP로 바꿔서 풀을 도입할 수 있다. 테스트나 단순한 독립 실행 환경에서 풀 없이 DataSource가 필요할 때도 이 클래스가 쓰인다.</p>
+
+<h3>DataSource 예제 2: HikariCP 커넥션 풀</h3>
+
+<p>이번에는 DataSource 구현을 <code>HikariDataSource</code>로 바꾼다. 풀의 최대 크기는 10, 풀 이름은 로그에서 알아보기 쉽게 <code>MyPool</code>로 정했다. 커넥션 두 개를 빌린 직후와 1초 뒤의 풀 상태를 비교하고, 하나를 반납한 뒤 다시 빌렸을 때 무엇이 나오는지 본다. <code>HikariPoolMXBean</code>은 HikariCP가 풀 상태를 조회하라고 열어 둔 인터페이스로, 전체, 사용 중, 유휴 커넥션 수를 알려 준다.</p>
+
+<pre><code class="language-java">import java.sql.Connection;
+import java.sql.SQLException;
+import com.zaxxer.hikari.HikariDataSource;
+import com.zaxxer.hikari.HikariPoolMXBean;
+
+public class DataSourceExample2 {
+    public static void main(String[] args) throws SQLException, InterruptedException {
+        HikariDataSource dataSource = new HikariDataSource();
+        dataSource.setJdbcUrl("jdbc:h2:tcp://localhost/~/bankdb");
+        dataSource.setUsername("sa");
+        dataSource.setPassword("");
+        dataSource.setMaximumPoolSize(10);
+        dataSource.setPoolName("MyPool");
+        System.out.println("풀 시작 전: " + dataSource.getHikariPoolMXBean());
+
+        Connection con1 = dataSource.getConnection();
+        Connection con2 = dataSource.getConnection();
+        System.out.println("con1 = " + con1);
+        System.out.println("con2 = " + con2);
+
+        HikariPoolMXBean pool = dataSource.getHikariPoolMXBean();
+        System.out.println("직후: " + stats(pool));
+        Thread.sleep(1000);
+        System.out.println("1초 뒤: " + stats(pool));
+
+        Connection physical = con1.unwrap(Connection.class);
+        con1.close();
+        System.out.println("con1.isClosed() = " + con1.isClosed()
+                + ", physical.isClosed() = " + physical.isClosed());
+        Connection con3 = dataSource.getConnection();
+        System.out.println("con3 = " + con3);
+        System.out.println("같은 물리 커넥션? " + (con3.unwrap(Connection.class) == physical)
+                + ", 같은 프록시? " + (con3 == con1));
+
+        con2.close();
+        con3.close();
+        dataSource.close();
+    }
+
+    static String stats(HikariPoolMXBean p) {
+        return "total=" + p.getTotalConnections() + ", active=" + p.getActiveConnections()
+                + ", idle=" + p.getIdleConnections();
+    }
+}</code></pre>
+
+<p>실행 결과는 길다. HikariCP는 풀을 시작할 때 모든 설정값을 DEBUG 로그로 한 줄씩 찍고, 커넥션을 만들 때마다 "Attempting to create/setup new connection"과 "Established new connection"을 남긴다. 아래는 그 줄들을 빼고, 로거 이름을 줄인 것이다.</p>
+
+<pre data-label="실행 결과 (일부 생략)"><code class="language-text">풀 시작 전: null
+19:48:34.304 [main] INFO  HikariDataSource -- MyPool - Starting...
+19:48:34.308 [main] DEBUG DriverDataSource -- Loaded driver with class name org.h2.Driver for jdbcUrl=jdbc:h2:tcp://localhost/~/bankdb
+19:48:34.373 [main] INFO  HikariPool -- MyPool - Added connection conn0: url=jdbc:h2:tcp://localhost/~/bankdb user=SA
+19:48:34.378 [main] INFO  HikariDataSource -- MyPool - Start completed.
+19:48:34.382 [MyPool:connection-adder] DEBUG HikariPool -- MyPool - Added connection conn1: url=... user=SA
+con1 = HikariProxyConnection@439904756 wrapping conn0: url=jdbc:h2:tcp://localhost/~/bankdb user=SA
+con2 = HikariProxyConnection@242355057 wrapping conn1: url=jdbc:h2:tcp://localhost/~/bankdb user=SA
+직후: total=2, active=2, idle=0
+19:48:34.488 [MyPool:housekeeper] DEBUG HikariPool -- MyPool - Pool stats (total=2/10, idle=0/10, active=2, waiting=0)
+19:48:34.492 [MyPool:connection-adder] DEBUG HikariPool -- MyPool - Added connection conn2: url=... user=SA
+19:48:34.523 [MyPool:connection-adder] DEBUG HikariPool -- MyPool - After adding stats (total=3/10, idle=1/10, active=2, waiting=0)
+19:48:34.527 [MyPool:connection-adder] DEBUG HikariPool -- MyPool - Added connection conn3: url=... user=SA
+...  (conn4 ~ conn8 같은 형태로 반복)
+19:48:34.796 [MyPool:connection-adder] DEBUG HikariPool -- MyPool - Added connection conn9: url=... user=SA
+19:48:34.826 [MyPool:connection-adder] DEBUG HikariPool -- MyPool - After adding stats (total=10/10, idle=8/10, active=2, waiting=0)
+19:48:34.827 [MyPool:connection-adder] DEBUG HikariPool -- MyPool - Connection not added, stats (total=10/10, idle=8/10, active=2, waiting=0)
+19:48:34.827 [MyPool:connection-adder] DEBUG HikariPool -- MyPool - Connection not added, stats (total=10/10, idle=8/10, active=2, waiting=0)
+1초 뒤: total=10, active=2, idle=8
+con1.isClosed() = true, physical.isClosed() = false
+con3 = HikariProxyConnection@520232556 wrapping conn0: url=jdbc:h2:tcp://localhost/~/bankdb user=SA
+같은 물리 커넥션? true, 같은 프록시? false
+19:48:35.413 [main] INFO  HikariDataSource -- MyPool - Shutdown initiated...
+19:48:35.415 [MyPool:connection-closer] DEBUG PoolBase -- MyPool - Closing connection conn0: ... (connection evicted)
+...  (conn1 ~ conn9 닫기)
+19:48:35.430 [main] INFO  HikariDataSource -- MyPool - Shutdown completed.</code></pre>
+
+<p>이 출력에는 HikariCP의 동작이 거의 다 들어 있다. 순서대로 따라가 보자.</p>
+
+<h4>1. 풀은 언제 시작되는가</h4>
+
+<p>첫 줄 "풀 시작 전: null"은 <code>getHikariPoolMXBean()</code>이 null을 돌려줬다는 뜻이다. 기본 생성자로 HikariDataSource를 만들고 setter로 설정했을 때는 아직 풀이 없다. HikariCP 7.0.2 소스에서 <code>HikariDataSource.getConnection()</code>을 보면, 풀 필드가 비어 있으면 <code>synchronized</code> 블록 안에서 한 번 더 확인한 뒤 그때 <code>new HikariPool(this)</code>로 풀을 만든다. 이 풀 필드는 <code>volatile</code>로 선언되어 있다. 스프링 핵심 원리 기본편에서 싱글톤을 다룰 때 본 이중 확인 잠금(double-checked locking) 그대로다. 락 없이 먼저 읽어 보고, 비어 있을 때만 락을 잡고 다시 확인해 한 번만 만든다. <code>volatile</code>이 없으면 다른 스레드가 생성이 끝나지 않은 객체의 참조를 볼 수 있으므로 이 패턴에는 <code>volatile</code>이 꼭 필요하다. 반면 <code>new HikariDataSource(config)</code>처럼 <code>HikariConfig</code>를 받는 생성자는 생성자 안에서 바로 풀을 시작한다. 그래서 같은 HikariCP라도 만드는 방법에 따라 첫 커넥션 연결이 애플리케이션 시작 시점에 일어나기도 하고, 첫 요청 시점에 일어나기도 한다.</p>
+
+<h4>2. 첫 커넥션은 호출한 스레드가 직접 만든다</h4>
+
+<p>"Starting..." 다음 줄의 스레드 이름은 <code>[main]</code>이다. 첫 커넥션 <code>conn0</code>은 풀의 백그라운드 스레드가 아니라 <code>getConnection</code>을 부른 main 스레드가 만들었다. HikariPool 생성자가 <code>checkFailFast()</code>를 부르기 때문이다. <code>initializationFailTimeout</code> 설정이 기본값 1처럼 0보다 크면 이 메서드는 그 자리에서 커넥션 하나를 만들어 보고, 성공하면 풀에 넣고, 끝내 실패하면 <code>PoolInitializationException</code>을 던진다. README는 이 설정을 풀이 첫 커넥션을 얻지 못할 때 "빨리 실패(fail fast)"할지를 정하는 것이라고 설명한다. 데이터베이스 주소가 틀렸거나 서버가 내려가 있으면 애플리케이션이 조용히 뜬 뒤 첫 요청에서야 터지는 대신 시작 시점에 실패하게 하려는 것이다.</p>
+
+<h4>3. 두 번째 커넥션은 기다리는 동안 다른 스레드가 만든다</h4>
+
+<p><code>con1</code>은 방금 만든 <code>conn0</code>을 받았다. <code>con2</code>를 요청했을 때는 유휴 커넥션이 없다. 이때 요청 스레드는 직접 커넥션을 만들지 않는다. 풀에 "커넥션이 하나 더 필요하다"고 알리고 기다린다. 그 알림을 받은 <code>MyPool:connection-adder</code> 스레드가 <code>conn1</code>을 만들어 기다리던 main 스레드에 넘겨준다. 로그에서 <code>conn1</code>을 추가한 스레드가 <code>[MyPool:connection-adder]</code>이고, 그 직후 <code>con2</code>가 <code>conn1</code>을 감싸고 있는 것이 그 증거다. 이 전달에 쓰이는 자료구조는 뒤에서 소스로 본다.</p>
+
+<h4>4. 나머지는 하우스키퍼가 채운다</h4>
+
+<p>"직후" 시점의 풀은 <code>total=2</code>다. 최대 크기를 10으로 정했다고 처음부터 10개가 생기는 것은 아니다. 약 100밀리초 뒤 <code>MyPool:housekeeper</code> 스레드가 "Pool stats"를 찍고, 그 뒤로 connection-adder가 <code>conn2</code>부터 <code>conn9</code>까지 하나씩 만든다. 7.0.2 소스에서 하우스키퍼는 <code>scheduleWithFixedDelay(new HouseKeeper(), 100L, housekeepingPeriodMs, MILLISECONDS)</code>로 예약된다. 처음 100밀리초 뒤에 돌고, 그 뒤로는 <code>housekeepingPeriodMs</code>(기본 30초) 간격으로 돈다. 하우스키퍼는 오래 쉰 커넥션을 정리한 다음 <code>fillPool</code>을 부른다. <code>fillPool</code>은 유휴 커넥션 수가 <code>minimumIdle</code>보다 적고 전체가 최대 크기보다 적으면, 모자란 만큼 커넥션 생성 작업을 connection-adder에 넘긴다.</p>
+
+<p>여기서 <code>minimumIdle</code>을 설정하지 않았다는 점이 중요하다. 로그 맨 앞에 찍힌 설정 목록에는 <code>minimumIdle.....10</code>이 나온다. README의 기본값 표에 따르면 <code>minimumIdle</code>의 기본값은 "maximumPoolSize와 같다". 그래서 유휴 0개인 상태에서 하우스키퍼는 10 − 0 = 10개의 생성 작업을 넘겼다. 생성 작업은 실행될 때마다 "아직 만들어야 하는가"를 다시 확인한다. 8개를 만들어 전체가 10에 이르자, 남은 두 작업은 만들지 않고 "Connection not added"를 남기고 끝났다. 로그의 마지막 두 줄이 그것이다.</p>
+
+<p>커넥션이 약 40밀리초 간격으로 하나씩 생긴 것도 소스로 설명된다. 7.0.2의 connection-adder는 스레드가 하나뿐인 실행기(코어 1, 최대 1)이고, 생성 작업 <code>PoolEntryCreator</code>는 커넥션 하나를 만들어 넣은 뒤 <code>quietlySleep(30L)</code>로 30밀리초를 쉰다. 데이터베이스에 연결 요청을 한꺼번에 쏟아붓지 않으려는 것이다. 커넥션을 채우는 일을 별도 스레드에 맡긴 이유도 여기서 보인다. 애플리케이션 스레드는 첫 커넥션과, 유휴 커넥션이 하나도 없을 때를 빼면 커넥션 생성 비용을 직접 치르지 않는다. "1초 뒤" 시점에 <code>total=10, active=2, idle=8</code>이 된 것은 그 사이 백그라운드에서 풀이 다 찼다는 뜻이다. 이때 프로세스의 TCP 소켓을 <code>lsof</code>로 세면 9092 포트로 향하는 ESTABLISHED 소켓이 10개다. 애플리케이션은 커넥션을 두 개만 쓰고 있지만, 데이터베이스 서버에는 이미 연결 10개와 세션 10개가 열려 있다.</p>
+
+<h4>5. 받은 것은 커넥션이 아니라 커넥션을 감싼 프록시다</h4>
+
+<p><code>con1</code>을 출력하면 <code>HikariProxyConnection@439904756 wrapping conn0: ...</code>이 나온다. 애플리케이션이 받은 객체의 클래스는 H2의 <code>JdbcConnection</code>이 아니라 HikariCP의 <code>HikariProxyConnection</code>이고, 그 안에 실제 드라이버 커넥션 <code>conn0</code>을 품고 있다. 이 문자열은 7.0.2의 <code>ProxyConnection.toString()</code>이 클래스 이름, <code>System.identityHashCode</code>, " wrapping ", 감싼 커넥션을 이어 붙여 만든다. <code>HikariProxyConnection</code>은 HikariCP jar 안에 이미 컴파일된 클래스로 들어 있고, 소스에는 이런 프록시 클래스들을 만들어 내는 <code>JavassistProxyFactory</code>가 있다. 실행 중에 JDK 동적 프록시를 만드는 방식이 아니다.</p>
+
+<p><code>con1.close()</code> 뒤의 결과가 이 회차에서 가장 중요한 한 줄이다. <code>con1.isClosed()</code>는 true인데 <code>unwrap</code>으로 꺼내 둔 물리 커넥션의 <code>isClosed()</code>는 false다. 프록시만 닫혔고 물리 연결은 살아 있다. 그리고 다시 빌린 <code>con3</code>은 <code>conn0</code>을 감싸고 있다. 같은 물리 커넥션이 다시 나온 것이다. 하지만 <code>con3 == con1</code>은 false다. 빌릴 때마다 새 프록시 객체를 만들어 준다. 반납된 프록시는 다시 쓸 수 없게 막혀 있으므로, 반납한 뒤에 옛 참조로 SQL을 실행하려는 실수는 새 대여자의 작업과 섞이지 않고 예외로 끝난다. PooledConnection Javadoc이 말한 "핸들"의 실체가 이 프록시다.</p>
+
+<p>마지막으로 <code>dataSource.close()</code>를 부르자 "Shutdown initiated..."와 함께 <code>MyPool:connection-closer</code> 스레드가 <code>conn0</code>부터 <code>conn9</code>까지 물리 커넥션을 하나씩 닫았다. 풀의 커넥션은 애플리케이션이 아니라 풀이 닫는다. 스프링 부트 애플리케이션에서는 컨테이너가 종료될 때 DataSource 빈을 닫으면서 이 일이 일어난다.</p>
+
+<aside class="note">스레드 이름 <code>MyPool:connection-adder</code>, <code>MyPool:housekeeper</code>, <code>MyPool:connection-closer</code>는 HikariCP 7.0.2 소스의 명명 방식이다. 다른 버전에서는 이름 형식이 다를 수 있으므로, 로그를 읽을 때는 이름보다 "요청 스레드, 생성 스레드, 정리 스레드, 닫기 스레드"라는 역할을 기억하자. 풀 이름을 지정하지 않으면 HikariConfig가 <code>HikariPool-1</code>처럼 JVM 안에서 증가하는 번호를 붙여 이름을 만든다.</aside>
+
+<x-visual id="spring-db1-02-pool-threads" title="HikariCP 풀이 시작되고 채워지는 과정" kind="타임라인" ratio="16:9">
+<x-hint>main 스레드가 첫 커넥션을 직접 만들고, 두 번째는 connection-adder가 만들어 넘겨주며, 하우스키퍼가 100ms 뒤 minimumIdle까지 채우는 시간 순서를 보여 준다.</x-hint>
+<x-prompt>Horizontal timeline with three swim lanes labeled from top to bottom: "main", "connection-adder", "housekeeper". Time axis at the bottom labeled "시간". In the "main" lane: a box "getConnection #1" followed by a filled box labeled "conn0 생성 (fail fast)", then a box "getConnection #2" with a dotted waiting segment labeled "대기". In the "connection-adder" lane: a box labeled "conn1 생성" whose arrow points up into the end of the main lane waiting segment, labeled "넘겨주기". Further right, a mark on the "housekeeper" lane labeled "100ms 후 첫 실행" with an arrow down to the adder lane, followed by a row of eight small boxes labeled "conn2" through "conn9" spaced evenly with small gaps labeled "30ms". At the far right a badge "total=10". Flat vector, thin lines, three lane colors.</x-prompt>
+<x-caption>요청 스레드는 첫 커넥션과 유휴 커넥션이 없을 때만 기다리고, 나머지 커넥션은 백그라운드에서 채워진다.</x-caption>
+</x-visual>
+
+<h3>풀 안을 들여다보기: 빌리기와 돌려주기의 자료구조</h3>
+
+<p>예제 2에서 반납한 <code>conn0</code>이 바로 다음 대여에서 다시 나왔다. 우연이 아니다. HikariCP가 커넥션을 보관하는 자료구조인 <code>ConcurrentBag</code>이 그렇게 설계되어 있다. 풀 안의 커넥션 하나는 <code>PoolEntry</code> 객체로 표현되고, 각 엔트리는 사용 가능(<code>STATE_NOT_IN_USE</code>), 사용 중(<code>STATE_IN_USE</code>) 같은 상태 값을 가진다. 엔트리를 빌린다는 것은 이 상태를 "사용 가능"에서 "사용 중"으로 바꾸는 데 성공한다는 뜻이고, 이 전환은 락이 아니라 CAS(compare-and-set)로 한다. 여러 스레드가 같은 엔트리를 동시에 노려도 상태를 바꾸는 데 성공하는 스레드는 하나뿐이다.</p>
+
+<p>7.0.2 소스의 <code>ConcurrentBag</code>에는 엔트리를 담는 그릇이 세 개 있다. 모든 엔트리를 담는 공유 목록 <code>sharedList</code>(<code>CopyOnWriteArrayList</code>), 스레드마다 따로 가진 목록 <code>threadLocalList</code>(<code>ThreadLocal</code>), 그리고 기다리는 스레드에 엔트리를 직접 건네는 <code>handoffQueue</code>(공정 모드 <code>SynchronousQueue</code>)다. 빌리는 메서드 <code>borrow</code>는 이 순서로 찾는다. 아래는 소스의 흐름만 남기고 줄인 것이다.</p>
+
+<pre data-label="ConcurrentBag.borrow (HikariCP 7.0.2를 줄여 옮김)"><code class="language-java">T borrow(long timeout, TimeUnit unit) throws InterruptedException {
+    // 1) 이 스레드가 최근에 반납한 엔트리부터 (뒤에서부터)
+    var list = threadLocalList.get();
+    for (int i = list.size() - 1; i >= 0; i--) {
+        T entry = list.remove(i);
+        if (entry != null && entry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) return entry;
+    }
+    int waiting = waiters.incrementAndGet();
+    try {
+        // 2) 공유 목록을 훑으며 사용 가능한 것을 CAS로 잡는다
+        for (T entry : sharedList) {
+            if (entry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) return entry;
+        }
+        // 3) 없으면 "하나 더 만들어 달라"고 알리고, 건네받기를 기다린다
+        listener.addBagItem(waiting);
+        // handoffQueue.poll(남은 시간)을 반복. 시간이 다 되면 null
+        // ...
+        return null;
+    } finally {
+        waiters.decrementAndGet();
+    }
+}</code></pre>
+
+<p>첫 단계가 스레드 로컬 목록이다. 돌려주는 메서드 <code>requite</code>를 보면 이유가 보인다. 반납할 때 엔트리의 상태를 "사용 가능"으로 바꾸고, 기다리는 스레드가 있으면 <code>handoffQueue</code>로 직접 건네려고 시도한다. 기다리는 스레드가 없으면 그 엔트리를 반납한 스레드의 스레드 로컬 목록에 넣는다(목록이 16개 미만일 때). 그래서 같은 스레드가 다시 빌리면 공유 목록을 훑기 전에 자기가 방금 돌려준 엔트리를 먼저 찾는다. 예제 2의 main 스레드가 <code>conn0</code>을 반납하고 다시 빌렸을 때 <code>conn0</code>이 나온 것이 이 경로다. 하나의 요청을 처리하는 스레드가 짧은 간격으로 커넥션을 여러 번 빌리고 돌려주는 패턴에서는 공유 목록에서 다른 스레드와 경쟁하지 않고 바로 찾을 확률이 높다.</p>
+
+<p>스레드 로컬 목록에 들어 있다고 그 엔트리가 그 스레드의 소유가 되는 것은 아니다. 엔트리는 여전히 공유 목록에도 들어 있고, 다른 스레드가 공유 목록을 훑다가 CAS에 먼저 성공하면 그 스레드가 가져간다. 그러면 원래 스레드는 자기 목록에서 꺼낸 엔트리의 CAS에 실패하고 다음 후보로 넘어간다. 스레드 로컬 목록은 "이 스레드가 최근에 쓴 것"이라는 힌트를 담은 캐시일 뿐이고, 정확성은 언제나 엔트리의 상태와 CAS가 보장한다. 이 차이는 4회차에서 중요해진다. 트랜잭션을 위해 "한 스레드가 같은 커넥션을 계속 쓰게 하는" 장치는 풀이 아니라 스프링의 트랜잭션 동기화가 따로 맡는다.</p>
+
+<p>세 번째 단계의 <code>handoffQueue</code>는 용량이 없는 큐다. <code>SynchronousQueue</code>는 넣는 쪽과 꺼내는 쪽이 만나야만 전달이 일어난다. 기다리는 스레드는 <code>poll(남은 시간)</code>으로 잠들어 있고, 새 커넥션을 만든 connection-adder나 커넥션을 반납한 다른 스레드가 <code>offer</code>로 엔트리를 내밀면 그 순간 대기자 하나가 받아 깨어난다. 공정 모드로 만들었으므로 먼저 기다리기 시작한 스레드가 먼저 받는다. 예제 2에서 <code>con2</code>가 <code>conn1</code>을 받은 것이 이 경로였다. 대기 시간이 다 되도록 아무도 건네주지 않으면 <code>borrow</code>는 null을 돌려주고, 풀은 시간 초과 예외를 만든다.</p>
+
+<p>빌린 엔트리를 그대로 내주기 전에 한 단계가 더 있다. 7.0.2의 <code>HikariPool.getConnection</code>은 엔트리가 마지막으로 쓰인 지 <code>aliveBypassWindowMs</code>(기본 500밀리초)보다 오래되었으면 커넥션이 살아 있는지 점검한다. 점검은 JDBC 4의 <code>Connection.isValid(초)</code>를 쓰고, <code>connectionTestQuery</code>를 설정했다면 그 쿼리를 실행한다. 죽은 것으로 판정되면 그 커넥션을 닫고 남은 시간 안에서 다른 엔트리를 다시 빌린다. 방금 반납된 커넥션은 점검 없이 바로 나가고, 오래 쉰 커넥션만 점검 비용을 치르는 절충이다.</p>
+
+<x-visual id="spring-db1-02-concurrentbag" title="ConcurrentBag에서 커넥션을 빌리는 세 단계" kind="순서도" ratio="16:9">
+<x-hint>스레드 로컬 목록, 공유 목록, 핸드오프 큐 순서로 찾고, 각 단계에서 CAS로 상태를 바꿔야 대여가 성립한다는 흐름을 보여 준다.</x-hint>
+<x-prompt>Flowchart from left to right. Start node labeled "getConnection". First diamond labeled "내 스레드 로컬 목록에 있나?" with "예" arrow to a small box "CAS 성공 → 대여". "아니오" arrow to second diamond labeled "공유 목록에 사용 가능?" with "예" arrow to the same "CAS 성공 → 대여" box. "아니오" arrow to a box labeled "생성 요청 (connection-adder)" then to a box labeled "핸드오프 큐에서 대기". From the waiting box two arrows: one labeled "건네받음" to "CAS 성공 → 대여", another labeled "시간 초과" to a red-outlined box "SQLTransientConnectionException". Below, a separate small loop arrow from a box "close() = 반납" back to "핸드오프 큐" labeled "대기자 있으면" and to "스레드 로컬 목록" labeled "없으면". Flat vector, thin lines.</x-prompt>
+<x-caption>대여는 언제나 엔트리 상태의 CAS 성공으로 확정된다. 스레드 로컬 목록은 소유가 아니라 힌트다.</x-caption>
+</x-visual>
+
+<h3>close()는 닫지 않는다: 반납할 때 일어나는 일</h3>
+
+<p>애플리케이션이 프록시의 <code>close()</code>를 부르면 7.0.2의 <code>ProxyConnection.close()</code>는 이 순서로 일한다. 먼저 이 커넥션으로 만든 Statement 가운데 아직 닫히지 않은 것을 닫는다. 누수 감시 작업을 취소한다. 커밋 상태가 "더럽고" 자동 커밋이 꺼져 있으면 <code>rollback()</code>을 부른다. 애플리케이션이 바꾼 세션 설정이 있으면 원래 값으로 되돌린다. 경고를 지운다. 그리고 감싸던 커넥션 참조를 "닫힌 커넥션"을 뜻하는 특수 객체로 바꾼 뒤 엔트리를 풀에 돌려준다. 이후 이 프록시로 메서드를 부르면 그 특수 객체가 <code>"Connection is closed"</code>라는 <code>SQLException</code>을 던진다.</p>
+
+<p>"커밋 상태가 더럽다"는 표시는 프록시가 스스로 관리한다. 자동 커밋이 꺼진 상태에서 Statement로 SQL을 실행하면 <code>markCommitStateDirty()</code>가 표시를 켜고, <code>commit()</code>이나 <code>rollback()</code>이 끝나면 끈다. 세션 설정의 변경도 프록시가 기억한다. 프록시의 <code>setAutoCommit</code>, <code>setReadOnly</code>, <code>setTransactionIsolation</code>, <code>setCatalog</code>, <code>setSchema</code>, <code>setNetworkTimeout</code>을 부르면 해당 비트가 켜지고, 반납할 때 <code>resetConnectionState</code>가 켜진 항목 가운데 풀의 기본값과 달라진 것만 되돌린다. 실제로 확인해 보자. 풀 크기를 1로 두고, 첫 대여자가 자동 커밋을 끄고 행을 하나 넣은 뒤 커밋하지 않고 닫는다. 두 번째 대여자는 같은 물리 커넥션을 받아 그 행이 있는지 센다.</p>
+
+<pre><code class="language-java">HikariDataSource ds = new HikariDataSource();
+ds.setJdbcUrl("jdbc:h2:tcp://localhost/~/bankdb");
+ds.setUsername("sa");
+ds.setPassword("");
+ds.setMaximumPoolSize(1);
+
+try (Connection con = ds.getConnection()) {
+    con.setAutoCommit(false);
+    try (PreparedStatement ps = con.prepareStatement("insert into account values ('B-1', 500)")) {
+        ps.executeUpdate();
+    }
+    System.out.println("inserted, not committed, closing");
+}   // commit 없이 close
+
+try (Connection con = ds.getConnection();
+     Statement st = con.createStatement();
+     ResultSet rs = st.executeQuery("select count(*) from account where account_id = 'B-1'")) {
+    rs.next();
+    System.out.println("autoCommit=" + con.getAutoCommit() + ", count=" + rs.getInt(1));
+}
+ds.close();</code></pre>
+
+<pre data-label="실행 결과 (일부 생략)"><code class="language-text">[main] INFO  HikariPool -- HikariPool-1 - Added connection conn0: url=jdbc:h2:tcp://localhost/~/bankdb user=SA
+inserted, not committed, closing
+[main] DEBUG ProxyConnection -- HikariPool-1 - Executed rollback on connection conn0: ... due to dirty commit state on close().
+[main] DEBUG PoolBase -- HikariPool-1 - Reset (autoCommit) on connection conn0: ...
+autoCommit=true, count=0</code></pre>
+
+<p>풀 이름을 정하지 않았으므로 <code>HikariPool-1</code>이 붙었다. 첫 대여자가 닫을 때 HikariCP는 커밋되지 않은 작업을 롤백했고, 꺼져 있던 자동 커밋을 다시 켰다. 그래서 같은 <code>conn0</code>을 받은 두 번째 대여자는 자동 커밋이 켜진 깨끗한 세션을 받았고, 넣다 만 행은 보이지 않는다. 만약 풀이 이 일을 하지 않았다면 어떻게 되었을까. 두 번째 대여자는 자동 커밋이 꺼진 세션, 즉 앞사람의 트랜잭션이 열린 채로 남은 세션을 받는다. 그 상태에서 자기 작업을 하고 커밋하면 앞사람이 버린 insert까지 함께 커밋된다. 서로 무관한 두 요청의 작업이 한 트랜잭션으로 묶이는 것이다.</p>
+
+<p>JDBC 명세는 이 상황을 정해 두지 않았다. <code>Connection.close()</code>의 Javadoc은 close를 부르기 전에 활성 트랜잭션을 명시적으로 커밋하거나 롤백할 것을 "강하게 권장"하고, 활성 트랜잭션이 있는 상태에서 close를 부르면 결과는 구현이 정한다(implementation-defined)고 적는다. DriverManagerDataSource처럼 물리 연결을 닫는 경우에는 드라이버와 데이터베이스가 정한 대로 처리되고, 풀은 물리 연결을 닫지 않으므로 스스로 정리 책임을 진다. HikariCP가 반납 시 롤백하는 것은 안전망이지 정상 경로가 아니다. 트랜잭션을 시작한 코드는 자기 손으로 커밋하거나 롤백해야 한다. 자동 커밋과 트랜잭션은 다음 회차의 주제다.</p>
+
+<h3>풀이 바닥나면: 대기, 시간 초과, 누수</h3>
+
+<p>풀의 커넥션이 모두 사용 중일 때 새 요청은 어떻게 되는가. 풀 크기를 2로 줄이고 <code>connectionTimeout</code>을 500밀리초로 두어 직접 바닥을 내 보자. <code>connectionTimeout</code>은 README가 "클라이언트가 커넥션을 기다리는 최대 밀리초"라고 설명하는 설정으로, 기본값은 30000(30초)이고 허용되는 최솟값은 250밀리초다. 두 개를 빌려 쥔 채로 세 번째를 요청하고, 그다음에는 별도 스레드가 기다리는 동안 하나를 반납한다.</p>
+
+<pre><code class="language-java">HikariDataSource ds = new HikariDataSource();
+ds.setJdbcUrl("jdbc:h2:tcp://localhost/~/bankdb");
+ds.setUsername("sa");
+ds.setPassword("");
+ds.setMaximumPoolSize(2);
+ds.setConnectionTimeout(500);
+ds.setPoolName("SmallPool");
+
+Connection a = ds.getConnection();
+Connection b = ds.getConnection();
+long start = System.nanoTime();
+try {
+    Connection c = ds.getConnection();          // 세 번째: 남은 커넥션이 없다
+} catch (SQLException e) {
+    long ms = (System.nanoTime() - start) / 1_000_000;
+    System.out.println(e.getClass().getName());
+    System.out.println(e.getMessage());
+    System.out.println("waited about " + ms + "ms");
+}
+
+Thread t = new Thread(() -> {
+    try (Connection c = ds.getConnection()) {   // 기다리는 스레드
+        System.out.println("waiter got: " + c);
+    } catch (SQLException e) {
+        System.out.println("waiter failed: " + e.getMessage());
+    }
+}, "waiter");
+t.start();
+Thread.sleep(100);
+System.out.println("waiting threads=" + ds.getHikariPoolMXBean().getThreadsAwaitingConnection());
+a.setAutoCommit(false);
+a.close();                                      // 반납하면 기다리던 스레드가 받는다
+t.join();
+b.close();
+ds.close();</code></pre>
+
+<pre data-label="실행 결과 (일부 생략, 밀리초 값은 실행마다 다르다)"><code class="language-text">[main] INFO  HikariPool -- SmallPool - Added connection conn0: ...
+[SmallPool:connection-adder] DEBUG HikariPool -- SmallPool - Added connection conn1: ...
+[SmallPool:connection-adder] DEBUG HikariPool -- SmallPool - Connection not added, stats (total=2/2, idle=0/2, active=2, waiting=1)
+[SmallPool:housekeeper] DEBUG HikariPool -- SmallPool - Pool stats (total=2/2, idle=0/2, active=2, waiting=1)
+[main] DEBUG HikariPool -- SmallPool - Timeout failure stats (total=2/2, idle=0/2, active=2, waiting=0)
+java.sql.SQLTransientConnectionException
+SmallPool - Connection is not available, request timed out after 512ms (total=2, active=2, idle=0, waiting=0)
+waited about 522ms
+[SmallPool:connection-adder] DEBUG HikariPool -- SmallPool - Connection not added, stats (total=2/2, idle=0/2, active=2, waiting=1)
+waiting threads=1
+[main] DEBUG PoolBase -- SmallPool - Reset (autoCommit) on connection conn0: ...
+waiter got: HikariProxyConnection@1428088139 wrapping conn0: ...</code></pre>
+
+<p>세 번째 요청은 공유 목록에서 사용 가능한 엔트리를 찾지 못하고 생성 요청을 보냈지만, connection-adder는 전체가 이미 최대 크기(2/2)라서 "Connection not added"를 남기고 아무것도 만들지 않았다. 이때 로그의 <code>waiting=1</code>이 main 스레드다. main은 핸드오프 큐에서 약 500밀리초를 기다린 뒤 <code>java.sql.SQLTransientConnectionException</code>을 받았다. 예외 메시지에는 풀 이름, 기다린 시간, 그 순간의 풀 상태가 들어 있다. 메시지 안에서는 <code>waiting=0</code>인데, 7.0.2 소스에서 메시지를 만드는 시점에는 이 스레드가 이미 <code>borrow</code>의 <code>finally</code>에서 대기자 수를 줄인 뒤이기 때문이다. 예외 타입 이름의 "Transient"는 JDBC가 정한 분류로, 같은 작업을 다시 시도하면 성공할 수도 있는 일시적인 실패라는 뜻이다.</p>
+
+<p>두 번째 실험에서는 waiter 스레드가 기다리는 동안(<code>waiting threads=1</code>) main이 <code>a</code>를 반납했다. 반납 경로의 <code>requite</code>는 대기자가 있으므로 엔트리를 핸드오프 큐로 건넸고, waiter는 <code>conn0</code>을 받았다. 반납 직전에 <code>a.setAutoCommit(false)</code>를 불러 두었기 때문에 "Reset (autoCommit)" 로그가 찍혔다. SQL은 실행하지 않았으므로 커밋 상태는 더럽지 않았고, 롤백 로그는 없다. 기다리던 스레드가 받은 커넥션은 앞 대여자의 설정이 지워진 상태다.</p>
+
+<p>이 실험을 웹 애플리케이션으로 옮겨 보자. 요청을 처리하는 서블릿 컨테이너의 스레드가 커넥션 풀보다 많고, 커넥션을 오래 쥐는 작업(느린 쿼리, 트랜잭션 안의 외부 API 호출)이 몰리면 풀이 바닥난다. 그 뒤로 들어온 요청 스레드는 기본값 기준 최대 30초 동안 커넥션을 기다리며 잠든다. 그동안 그 스레드들은 다른 요청을 처리하지 못하므로, 데이터베이스와 상관없는 요청까지 처리할 스레드가 모자라기 시작한다. 장애 분석에서 "DB는 한가한데 애플리케이션이 멈췄다"는 현상이 자주 이렇게 생긴다. 이때 풀의 <code>active</code>와 <code>waiting</code> 값이 가장 먼저 볼 지표다.</p>
+
+<p>풀이 마르는 또 하나의 원인은 커넥션 누수(connection leak)다. 예외가 나는 경로에서 <code>close()</code>를 빠뜨리면 그 커넥션은 영영 반납되지 않는다. 풀 입장에서는 계속 "사용 중"이므로 누수가 쌓일수록 실제로 쓸 수 있는 커넥션이 줄고, 결국 위와 똑같은 시간 초과가 난다. HikariCP에는 이를 찾는 <code>leakDetectionThreshold</code> 설정이 있다. 예제 2의 설정 목록에 찍힌 기본값은 0(꺼짐)이다. 값을 주면 커넥션을 빌릴 때 그 시간 뒤에 실행될 감시 작업을 하우스키핑 실행기에 예약하고, 그 전에 반납되면 취소한다. 시간이 지나도 반납되지 않으면 7.0.2 소스 기준으로 "Connection leak detection triggered for ..." 경고와 함께 커넥션을 빌린 시점의 스택 트레이스를 로그에 남긴다. 어느 코드가 빌려 갔는지 알려 주는 것이다. 7.0.2의 설정 검증 코드는 이 값이 2000밀리초보다 작거나 <code>maxLifetime</code>보다 크면 경고를 남기고 기능을 끈다.</p>
+
+<h3>커넥션의 수명: idleTimeout, maxLifetime, keepaliveTime</h3>
+
+<p>풀은 커넥션을 오래 들고 있는다. 그런데 연결의 반대편은 영원히 기다려 주지 않는다. MySQL 매뉴얼의 "MySQL server has gone away" 절은 기본 설정에서 서버가 아무 일도 없는 연결을 8시간 뒤에 닫는다고 설명하고, 이 시간을 <code>wait_timeout</code> 변수로 바꿀 수 있다고 적는다. 그리고 이 오류의 가장 흔한 원인이 서버가 시간 초과로 연결을 닫은 것이라고 한다. 서버가 이미 닫은 연결을 풀이 모르고 애플리케이션에 내주면, 애플리케이션은 첫 SQL을 보내는 순간 실패한다. 데이터베이스만 연결을 끊는 것도 아니다. 그 사이의 인프라에도 연결 시간 제한이 있을 수 있다. 그래서 풀은 커넥션의 수명을 스스로 관리한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>설정</th><th>기본값</th><th>하는 일</th></tr></thead><tbody>
+<tr><td><code>maximumPoolSize</code></td><td>10</td><td>유휴와 사용 중을 합친 풀의 최대 크기</td></tr>
+<tr><td><code>minimumIdle</code></td><td>maximumPoolSize와 같음</td><td>풀이 유지하려는 최소 유휴 커넥션 수</td></tr>
+<tr><td><code>connectionTimeout</code></td><td>30000ms (30초)</td><td>커넥션을 기다리는 최대 시간. 최솟값 250ms</td></tr>
+<tr><td><code>idleTimeout</code></td><td>600000ms (10분)</td><td>커넥션이 풀에서 유휴 상태로 머물 수 있는 최대 시간</td></tr>
+<tr><td><code>maxLifetime</code></td><td>1800000ms (30분)</td><td>풀 안 커넥션의 최대 수명. 최솟값 30000ms</td></tr>
+<tr><td><code>keepaliveTime</code></td><td>120000ms (2분)</td><td>유휴 커넥션을 살려 두려고 점검하는 주기</td></tr>
+<tr><td><code>initializationFailTimeout</code></td><td>1</td><td>첫 커넥션을 얻지 못하면 풀 시작을 실패시킬지</td></tr>
+<tr><td><code>autoCommit</code></td><td>true</td><td>풀이 내주는 커넥션의 기본 자동 커밋 여부</td></tr>
+</tbody></table></div>
+
+<p>표의 기본값은 HikariCP README의 설정 설명과 7.0.2 소스의 <code>HikariConfig</code> 상수에서 함께 확인한 것이다. 예제 2의 설정 로그에도 <code>connectionTimeout...30000</code>, <code>idleTimeout...600000</code>, <code>maxLifetime...1800000</code>, <code>keepaliveTime...120000</code>이 그대로 찍혀 있다.</p>
+
+<p><code>idleTimeout</code>은 남는 커넥션을 줄이는 장치다. 하우스키퍼가 돌 때 유휴 상태로 이 시간을 넘긴 커넥션을 닫는데, 7.0.2 소스에서는 <code>minimumIdle</code>이 <code>maximumPoolSize</code>보다 작을 때만 이 정리를 하고, 그때도 <code>minimumIdle</code> 아래로는 줄이지 않는다. 기본 설정처럼 두 값이 같으면 풀은 크기가 고정되고 유휴 정리는 일어나지 않는다. README는 최고 성능과 갑작스러운 요청 증가에 대한 반응성을 위해 <code>minimumIdle</code>을 설정하지 말고 HikariCP가 고정 크기 풀로 동작하게 하라고 권한다. 요청이 몰린 순간 커넥션을 새로 만드느라 기다리는 일을 없애려는 것이다.</p>
+
+<p><code>maxLifetime</code>은 데이터베이스와 인프라의 시간 제한에 대한 대비다. README는 이 값을 설정할 것을 "강하게 권장"하며, 데이터베이스나 인프라가 정한 연결 시간 제한보다 몇 초 짧아야 한다고 적는다. 수명이 다한 커넥션이라도 사용 중이면 회수하지 않고, 반납된 뒤에 제거한다. README는 또 풀 전체가 한꺼번에 죽는 일(mass-extinction)을 피하려고 커넥션마다 약간씩 수명을 줄인다고 설명하는데, 7.0.2 소스에서는 <code>maxLifetime</code>이 10초보다 크면 최대 25%까지 무작위로 줄인다. 같은 시각에 만든 커넥션 10개가 정확히 30분 뒤에 동시에 교체되면 그 순간 요청들이 새 커넥션 생성을 기다리게 되기 때문이다.</p>
+
+<p><code>keepaliveTime</code>은 유휴 커넥션이 살아 있는지 주기적으로 점검하는 주기다. 7.0.2 소스는 커넥션마다 이 주기에서 최대 20%를 무작위로 뺀 간격으로 점검 작업을 예약한다. 이것도 점검이 한 시각에 몰리지 않게 하려는 것이다. 앞 절에서 본 "500밀리초 넘게 쉰 커넥션은 빌려줄 때 점검한다"는 규칙과 합치면, HikariCP는 쉬는 동안의 주기적 점검과 내주기 직전의 점검이라는 두 겹으로 죽은 커넥션을 걸러 낸다. 그래도 커넥션은 사용 도중에 끊길 수 있다. 데이터베이스가 재시작되거나 네트워크가 끊기면 이미 빌려 간 커넥션의 SQL은 실패한다. 풀은 그 예외를 보고 커넥션을 폐기할 뿐, 실패한 작업을 대신 재시도해 주지는 않는다.</p>
+
+<h3>풀 크기는 어떻게 정하는가</h3>
+
+<p>풀이 바닥나는 것을 보면 풀을 크게 잡고 싶어진다. 하지만 HikariCP 위키의 "About Pool Sizing" 문서는 반대 방향을 가리킨다. 문서의 논리는 이렇다. CPU 코어 하나는 한 번에 한 스레드만 실행한다. 디스크와 네트워크를 무시하면 코어가 8개인 서버에서 데이터베이스가 동시에 처리할 수 있는 일은 8개이고, 그보다 많으면 문맥 교환(context switching) 비용 때문에 오히려 느려진다. 문서는 스레드 수가 CPU 코어 수를 넘으면 스레드를 더할수록 빨라지는 것이 아니라 느려진다고 적는다. 현실에서는 디스크 I/O와 네트워크 대기가 있으므로 코어 수보다 조금 많은 연결이 이득이지만, 그 이득에는 한계가 있다.</p>
+
+<p>그래서 문서는 출발점으로 다음 공식을 제시한다. 활성 커넥션 수는 <code>(core_count * 2) + effective_spindle_count</code> 근처여야 한다. <code>core_count</code>는 데이터베이스 서버의 코어 수이고 하이퍼스레딩 스레드는 세지 않는다. <code>effective_spindle_count</code>는 활성 데이터가 모두 메모리에 캐시되어 있으면 0이고, 캐시 적중률이 떨어질수록 커진다. 예를 들어 하이퍼스레딩을 빼고 코어 4개인 DB 서버에 활성 데이터가 모두 캐시되어 있다면 4 × 2 + 0 = 8이 출발점이다. 문서는 이것을 정답이 아니라 시험해 볼 출발점이라고 분명히 하고, 결론으로 많아야 수십 개 정도의 작은 풀을 두고 나머지 애플리케이션 스레드는 풀에서 커넥션을 기다리며 막혀 있게 하라고 권한다. 앞 절의 대기를 실패가 아니라 정상적인 줄서기로 보는 관점이다.</p>
+
+<p>같은 문서에는 반대 방향의 하한도 있다. 스레드 하나가 커넥션 하나를 쥔 채 두 번째 커넥션을 요청하는 코드가 있으면 풀 교착(pool deadlock)이 생길 수 있다. 풀 크기가 4이고 스레드 4개가 각각 하나씩 쥔 채 두 번째를 기다리면, 아무도 반납하지 않으므로 모두 <code>connectionTimeout</code>까지 기다리다 실패한다. 문서는 이를 피하는 최소 크기를 <code>Tn x (Cm - 1) + 1</code>로 적는다. <code>Tn</code>은 최대 스레드 수, <code>Cm</code>은 한 스레드가 동시에 쥐는 최대 커넥션 수다. 스레드 8개가 각자 최대 2개를 동시에 쥔다면 8 × (2 − 1) + 1 = 9개가 있어야 적어도 한 스레드는 두 번째 커넥션을 얻어 일을 끝내고 반납할 수 있다. 문서는 이것이 교착을 피하는 최소 크기일 뿐 최적의 크기는 아니라고 덧붙인다. 더 좋은 해법은 한 스레드가 커넥션을 동시에 두 개 쥐지 않도록 코드를 고치는 것이다.</p>
+
+<p>데이터베이스 쪽의 계산도 빼놓을 수 없다. 풀 크기는 애플리케이션 인스턴스 하나의 값이다. 같은 데이터베이스에 인스턴스 여러 대가 붙으면 인스턴스 수 × 풀 크기만큼의 연결이 데이터베이스에 열린다. 고정 크기 풀이라면 애플리케이션이 한가해도 이 연결들은 항상 열려 있다. 이 합이 MySQL의 <code>max_connections</code> 같은 서버 한도를 넘으면 새 인스턴스가 뜨면서 커넥션을 채우는 순간 "Too many connections"가 난다. 배포 중에 옛 인스턴스와 새 인스턴스가 잠시 함께 떠 있는 시간도 계산에 넣어야 한다. 그리고 MySQL처럼 연결마다 서버 스레드를 붙이는 구조에서는 열린 연결 수가 곧 서버의 스레드 수이므로, 연결을 넉넉히 열어 두는 것 자체가 서버 자원을 쓴다.</p>
+
+<h3>DataSource 적용: 리포지토리가 DataSource에만 의존하게</h3>
+
+<p>이제 배운 것을 리포지토리에 적용한다. 앞 회차의 리포지토리는 메서드마다 DriverManager로 커넥션을 직접 얻었다. 이번에는 생성자로 <code>DataSource</code>를 받고, 커넥션이 필요할 때 <code>dataSource.getConnection()</code>만 부른다. 자원 정리는 스프링의 <code>JdbcUtils</code>에 맡긴다. 계좌를 저장하고, 잔액을 조회하고, 삭제하는 세 메서드만 둔다.</p>
+
+<pre><code class="language-java">package app;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.NoSuchElementException;
+import javax.sql.DataSource;
+import org.springframework.jdbc.support.JdbcUtils;
+
+public class AccountRepository {
+
+    private final DataSource dataSource;
+
+    public AccountRepository(DataSource dataSource) {
+        this.dataSource = dataSource;
+    }
+
+    public void save(String accountId, int balance) throws SQLException {
+        String sql = "insert into account(account_id, balance) values (?, ?)";
+        Connection con = null;
+        PreparedStatement pstmt = null;
+        try {
+            con = getConnection();
+            pstmt = con.prepareStatement(sql);
+            pstmt.setString(1, accountId);
+            pstmt.setInt(2, balance);
+            pstmt.executeUpdate();
+        } finally {
+            close(con, pstmt, null);
+        }
+    }
+
+    public int findBalance(String accountId) throws SQLException {
+        String sql = "select balance from account where account_id = ?";
+        Connection con = null;
+        PreparedStatement pstmt = null;
+        ResultSet rs = null;
+        try {
+            con = getConnection();
+            pstmt = con.prepareStatement(sql);
+            pstmt.setString(1, accountId);
+            rs = pstmt.executeQuery();
+            if (rs.next()) {
+                return rs.getInt("balance");
+            }
+            throw new NoSuchElementException("account not found: " + accountId);
+        } finally {
+            close(con, pstmt, rs);
+        }
+    }
+
+    public void delete(String accountId) throws SQLException {
+        String sql = "delete from account where account_id = ?";
+        Connection con = null;
+        PreparedStatement pstmt = null;
+        try {
+            con = getConnection();
+            pstmt = con.prepareStatement(sql);
+            pstmt.setString(1, accountId);
+            pstmt.executeUpdate();
+        } finally {
+            close(con, pstmt, null);
+        }
+    }
+
+    private Connection getConnection() throws SQLException {
+        Connection con = dataSource.getConnection();
+        System.out.println("get connection=" + con + ", class=" + con.getClass().getSimpleName());
+        return con;
+    }
+
+    private void close(Connection con, PreparedStatement pstmt, ResultSet rs) {
+        JdbcUtils.closeResultSet(rs);
+        JdbcUtils.closeStatement(pstmt);
+        JdbcUtils.closeConnection(con);
+    }
+}</code></pre>
+
+<p>이 클래스의 어디에도 URL, 계정, DriverManager, HikariCP가 없다. 리포지토리가 아는 것은 <code>javax.sql.DataSource</code>라는 표준 인터페이스뿐이다. <code>close</code> 메서드는 결과 집합, 문장, 커넥션 순서로 닫는다. 얻은 순서의 역순이다. Spring JDBC 7.0.10 소스의 <code>JdbcUtils.closeConnection</code>은 인자가 null이면 아무것도 하지 않고, <code>close()</code>가 <code>SQLException</code>을 던지면 디버그 로그만 남기고 삼킨다. 드라이버가 런타임 예외나 오류를 던지는 경우까지 잡아 로그로 남긴다(소스 주석은 "JDBC 드라이버를 믿지 않는다"고 적는다). 그래서 앞 자원의 정리가 실패해도 뒤 자원의 정리가 계속 진행된다. 이 정리 코드의 반복은 6회차의 <code>JdbcTemplate</code>이 없앤다.</p>
+
+<p>이 리포지토리를 두 가지 DataSource로 실행해 본다. 실행 코드는 DataSource를 만드는 부분만 다르다.</p>
+
+<pre><code class="language-java">package app;
+
+import javax.sql.DataSource;
+import com.zaxxer.hikari.HikariDataSource;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
+
+public class RepositoryMain {
+    static final String URL = "jdbc:h2:tcp://localhost/~/bankdb";
+
+    public static void main(String[] args) throws Exception {
+        DataSource dataSource;
+        if (args[0].equals("driver")) {
+            dataSource = new DriverManagerDataSource(URL, "sa", "");
+        } else {
+            HikariDataSource hikari = new HikariDataSource();
+            hikari.setJdbcUrl(URL);
+            hikari.setUsername("sa");
+            hikari.setPassword("");
+            dataSource = hikari;
+        }
+
+        AccountRepository repository = new AccountRepository(dataSource);
+        repository.save("A-100", 10000);
+        System.out.println("balance=" + repository.findBalance("A-100"));
+        repository.delete("A-100");
+
+        if (dataSource instanceof HikariDataSource hikari) {
+            hikari.close();
+        }
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (driver, 로그 없이)"><code class="language-text">get connection=conn0: url=jdbc:h2:tcp://localhost/~/bankdb user=SA, class=JdbcConnection
+get connection=conn1: url=jdbc:h2:tcp://localhost/~/bankdb user=SA, class=JdbcConnection
+balance=10000
+get connection=conn2: url=jdbc:h2:tcp://localhost/~/bankdb user=SA, class=JdbcConnection</code></pre>
+
+<pre data-label="실행 결과 (hikari, 로그 없이)"><code class="language-text">get connection=HikariProxyConnection@1418428263 wrapping conn0: url=jdbc:h2:tcp://localhost/~/bankdb user=SA, class=HikariProxyConnection
+get connection=HikariProxyConnection@1037324811 wrapping conn0: url=jdbc:h2:tcp://localhost/~/bankdb user=SA, class=HikariProxyConnection
+balance=10000
+get connection=HikariProxyConnection@1022308509 wrapping conn0: url=jdbc:h2:tcp://localhost/~/bankdb user=SA, class=HikariProxyConnection</code></pre>
+
+<p>리포지토리 코드는 한 글자도 바뀌지 않았는데 바닥에서 일어나는 일은 완전히 다르다. DriverManagerDataSource에서는 메서드 세 번이 물리 커넥션 세 개(<code>conn0</code>, <code>conn1</code>, <code>conn2</code>)를 열고 닫았다. TCP 연결과 인증을 세 번 했다는 뜻이다. HikariDataSource에서는 세 번 모두 <code>conn0</code>이 나왔다. 앞 절의 <code>ConcurrentBag</code>을 떠올리면 이유가 보인다. main 스레드 하나가 순서대로 빌리고 반납했으므로, 매번 자기 스레드 로컬 목록에서 방금 반납한 <code>conn0</code>을 다시 찾았다. 백그라운드에서 나머지 커넥션이 채워지는 중이었더라도 결과는 같다. 프록시 객체의 해시 값은 매번 다르다. 빌릴 때마다 새 핸들이 만들어진다는 것을 다시 확인할 수 있다.</p>
+
+<p>스프링 애플리케이션에서는 이 조립을 컨테이너가 한다. DataSource를 빈으로 등록하고 리포지토리가 생성자로 받게 하면, 스프링 핵심 원리 기본편에서 본 생성자 주입 그대로다. 스프링 부트를 쓰면 DataSource 빈을 직접 만들 필요도 없다. Spring Boot 레퍼런스에 따르면 <code>spring.datasource.url</code>로 URL을 지정하고(지정하지 않으면 임베디드 데이터베이스를 자동 구성하려 한다), 앞에서 본 선택 알고리즘에 따라 HikariCP로 DataSource를 만든다. 풀에 특화된 설정은 구현별 접두사로 준다.</p>
+
+<pre data-label="application.properties"><code class="language-properties">spring.datasource.url=jdbc:h2:tcp://localhost/~/bankdb
+spring.datasource.username=sa
+spring.datasource.password=
+spring.datasource.hikari.maximum-pool-size=10
+spring.datasource.hikari.pool-name=MyPool</code></pre>
+
+<p>레퍼런스는 <code>spring.datasource.hikari.*</code>, <code>spring.datasource.tomcat.*</code>, <code>spring.datasource.dbcp2.*</code>, <code>spring.datasource.oracleucp.*</code> 같은 구현별 접두사로 세부 설정을 조정할 수 있다고 적고, 각 설정의 의미는 풀 구현의 문서를 보라고 안내한다. 위의 <code>maximum-pool-size</code>는 HikariCP의 <code>maximumPoolSize</code> 설정을 스프링 부트 속성 이름 규칙으로 쓴 것이다. 설정 값이 한곳에 모이고 리포지토리는 DataSource만 받으므로, 풀 크기를 바꾸든 풀 구현을 바꾸든 리포지토리 코드는 그대로다.</p>
+
+<p>그런데 이 리포지토리에는 아직 큰 한계가 있다. 메서드마다 커넥션을 따로 빌린다. 풀에서는 우연히 같은 물리 커넥션이 나왔지만 그것은 스레드 로컬 힌트 덕분일 뿐 보장이 아니고, 무엇보다 메서드마다 <code>close()</code>로 반납한다. "계좌 A에서 빼고 계좌 B에 더하기"를 한 트랜잭션으로 묶으려면 두 메서드가 같은 커넥션을 써야 하고, 그 사이에 반납하면 안 된다. 트랜잭션이 무엇이고 왜 커넥션 단위인지는 3회차에서, 스프링이 이 문제를 트랜잭션 동기화와 트랜잭션 매니저로 어떻게 푸는지는 4회차에서 다룬다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<h4>"풀에서 받은 커넥션을 close하면 연결이 끊긴다"</h4>
+
+<p>닫히는 것은 프록시뿐이다. 예제 2에서 <code>con1.isClosed()</code>는 true, 물리 커넥션의 <code>isClosed()</code>는 false였다. 이 오해는 반대 방향의 실수로 이어지기도 한다. "어차피 풀이 관리하니까 close를 안 해도 된다"는 생각이다. close를 하지 않으면 풀은 그 커넥션을 영원히 사용 중으로 본다. 그것이 누수다. 풀을 쓰든 안 쓰든 빌린 커넥션은 반드시 닫는다. 의미가 "끊기"에서 "반납"으로 바뀌었을 뿐이다.</p>
+
+<h4>"DriverManagerDataSource도 DataSource니까 풀이다"</h4>
+
+<p>DataSource는 커넥션을 얻는 방법을 감춘 인터페이스일 뿐 풀을 뜻하지 않는다. Javadoc이 말한 세 종류 중 기본 구현은 풀링을 하지 않는다. 스프링의 Javadoc도 DriverManagerDataSource가 실제 풀이 아니라고 굵게 적고, 호출마다 새 커넥션을 만든다고 설명한다. 예제 1에서 <code>conn0</code>부터 <code>conn4</code>까지 다섯 번 새로 열린 것을 보았다.</p>
+
+<h4>"풀을 크게 잡을수록 빠르다"</h4>
+
+<p>풀 크기는 데이터베이스가 동시에 처리하는 작업 수의 상한이다. 데이터베이스 서버의 코어와 디스크가 감당할 수 있는 수를 넘기면 문맥 교환과 경합 때문에 처리량이 오히려 떨어질 수 있다고 HikariCP 위키는 설명한다. 거기에 인스턴스 수만큼 곱해진 연결이 데이터베이스의 연결 한도와 서버 스레드를 잡아먹는다. 커넥션 부족을 겪을 때는 크기를 늘리기 전에 커넥션을 오래 쥐는 원인(느린 쿼리, 트랜잭션 안의 외부 호출, 누수)부터 찾는 것이 순서다.</p>
+
+<h4>"스레드 로컬을 쓰니 커넥션이 스레드에 묶인다"</h4>
+
+<p>HikariCP의 스레드 로컬 목록은 최근에 반납한 엔트리를 먼저 찾아보는 힌트다. 반납된 엔트리는 공유 목록에도 그대로 있고, 다른 스레드가 CAS에 먼저 성공하면 가져간다. 한 스레드가 같은 커넥션을 계속 쓰는 것이 필요하다면(트랜잭션) 풀이 아닌 다른 장치가 그것을 보장해야 한다. 스프링에서는 4회차의 트랜잭션 동기화 매니저가 그 일을 한다. 이름에 똑같이 ThreadLocal이 들어가지만 하는 일은 다르다.</p>
+
+<h4>"풀에서 꺼낸 커넥션은 항상 살아 있다"</h4>
+
+<p>HikariCP는 쉬는 동안의 주기적 점검(<code>keepaliveTime</code>)과 500밀리초 넘게 쉰 커넥션을 내주기 전의 점검으로 죽은 커넥션을 걸러 내지만, 빌려 간 뒤에 데이터베이스가 재시작되거나 네트워크가 끊기는 것까지 막을 수는 없다. 또 데이터베이스나 인프라의 연결 시간 제한보다 <code>maxLifetime</code>이 길면 점검 사이의 틈에서 끊긴 커넥션을 만날 수 있다. README가 <code>maxLifetime</code>을 그런 제한보다 몇 초 짧게 두라고 권하는 이유다.</p>
+
+<h4>"커밋하지 않고 닫아도 풀이 알아서 해 준다"</h4>
+
+<p>HikariCP 7.0.2는 실제로 롤백해 준다. 하지만 JDBC 명세는 활성 트랜잭션이 있는 상태의 close 결과를 구현에 맡겼고, 풀 구현이나 설정이 바뀌면 동작도 바뀔 수 있다. 무엇보다 커밋을 빠뜨린 코드는 풀의 롤백 덕분에 조용히 데이터를 잃는다. 트랜잭션은 시작한 코드가 끝내야 한다.</p>
+
+<h3>정리: 다음 회차로 가져갈 것</h3>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>커넥션 하나는 TCP 연결, 인증, 데이터베이스 서버의 세션과 스레드를 붙잡는 비싼 자원이다. 커넥션 풀은 이 비용을 미리 치러 둔 커넥션을 빌려주고 돌려받으며, 동시에 데이터베이스로 향하는 연결 수의 상한 역할을 한다. DataSource는 "커넥션을 어떻게 얻는가"를 인터페이스 뒤로 감춰서, 설정은 한곳에서 하고 사용하는 코드는 getConnection과 close만 알게 한다. 같은 close가 DriverManagerDataSource에서는 연결 종료, HikariDataSource에서는 상태 초기화 후 반납이다.</p></aside>
+
+<ul>
+<li>커넥션을 새로 여는 비용은 여러 번의 네트워크 왕복과 서버 쪽 자원 할당이고, 닫을 때는 먼저 닫은 쪽에 TIME_WAIT 소켓이 남는다. 풀은 이 비용을 커넥션 생성과 폐기 때로 몰아 둔다.</li>
+<li>HikariCP는 첫 커넥션을 호출 스레드에서 만들어 빨리 실패하게 하고, 나머지는 connection-adder 스레드가 하우스키퍼의 요청에 따라 <code>minimumIdle</code>(기본값은 최대 크기와 같음)까지 채운다.</li>
+<li>대여는 스레드 로컬 목록, 공유 목록, 핸드오프 큐 순서로 찾고 CAS로 확정한다. 풀이 바닥나면 <code>connectionTimeout</code>(기본 30초)까지 기다린 뒤 <code>SQLTransientConnectionException</code>을 던진다.</li>
+<li>반납할 때 HikariCP는 커밋되지 않은 작업을 롤백하고 바뀐 세션 설정을 되돌린다. 이것은 안전망이고, 트랜잭션은 코드가 끝내야 한다.</li>
+<li>풀 크기는 작게 시작해 측정으로 조정하고, 인스턴스 수 × 풀 크기가 데이터베이스 한도 안에 들어오는지, <code>maxLifetime</code>이 데이터베이스와 인프라의 시간 제한보다 짧은지 확인한다.</li>
+</ul>
+
+<p>다음 회차는 이 커넥션 위에서 트랜잭션을 다룬다. 자동 커밋을 끄고 여러 SQL을 하나의 원자적 작업으로 묶는 일, 데이터베이스 세션과 커넥션의 관계, 그리고 락이 동시에 들어온 트랜잭션들을 어떻게 줄 세우는지를 본다. 이 회차에서 본 "반납할 때 롤백되는 커넥션"과 "메서드마다 따로 빌리는 리포지토리"가 그 회차의 출발점이 된다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>커넥션 획득 비용</dt><dd>TCP 3-way handshake, 데이터베이스 프로토콜 핸드셰이크와 인증, 서버 쪽 세션과 스레드 배정을 포함한다. 닫을 때는 먼저 닫은 쪽에 TIME_WAIT 소켓이 2×MSL 동안 남는다.</dd>
+<dt>커넥션 풀</dt><dd>미리 만든 물리 커넥션을 보관했다가 빌려주고 돌려받아 획득 비용을 재사용으로 바꾸는 장치. 데이터베이스로 향하는 동시 연결 수의 상한 역할도 한다.</dd>
+<dt>DataSource</dt><dd>커넥션을 얻는 방법을 감춘 javax.sql 표준 인터페이스. 설정은 객체를 만들 때 한 번, 사용은 getConnection 한 줄로 분리한다. 기본 구현, 풀링 구현, 분산 트랜잭션 구현이 있다.</dd>
+<dt>DriverManagerDataSource</dt><dd>DriverManager를 DataSource 모양으로 감싼 스프링의 기본 구현. 호출마다 새 물리 커넥션을 열고, close는 연결을 끊는다. 풀이 아니다.</dd>
+<dt>HikariDataSource와 프록시 커넥션</dt><dd>HikariCP의 풀링 구현. 빌릴 때마다 물리 커넥션을 감싼 새 HikariProxyConnection을 주고, 그 close는 상태를 초기화한 뒤 풀에 반납한다.</dd>
+<dt>ConcurrentBag</dt><dd>HikariCP가 커넥션을 보관하는 자료구조. 스레드 로컬 목록, 공유 목록, 핸드오프 큐 순서로 찾고 엔트리 상태의 CAS로 대여를 확정한다.</dd>
+<dt>connectionTimeout과 풀 고갈</dt><dd>사용 가능한 커넥션이 없으면 최대 connectionTimeout(기본 30초)까지 기다린 뒤 SQLTransientConnectionException을 던진다. 누수와 긴 점유가 주된 원인이다.</dd>
+<dt>커넥션 수명 설정</dt><dd>idleTimeout은 남는 유휴 커넥션을 정리하고, maxLifetime은 DB와 인프라의 시간 제한보다 짧게 커넥션을 교체하며, keepaliveTime은 유휴 커넥션을 주기적으로 점검한다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 커넥션 풀이 문제로 떠오르는 순간은 대개 "Connection is not available, request timed out" 예외가 쏟아질 때다. 이때 가장 먼저 할 일은 풀 크기를 늘리는 것이 아니라 예외 메시지와 풀 지표의 total, active, idle, waiting을 읽는 것이다. active가 최대 크기에 붙어 있고 데이터베이스 쪽에서 실행 중인 쿼리가 거의 없다면, 커넥션을 빌려 놓고 SQL 외의 일(외부 API 호출, 파일 처리, 긴 계산)을 하는 코드나 반납을 빠뜨린 누수를 의심한다. leakDetectionThreshold를 켜면 빌려 간 위치의 스택 트레이스를 얻을 수 있다. 반대로 데이터베이스에서 느린 쿼리가 줄줄이 돌고 있다면 풀은 증상일 뿐이고, 원인은 쿼리와 인덱스다. 이 경우 풀을 늘리면 데이터베이스에 더 많은 동시 작업을 밀어 넣어 상황을 악화시킬 수 있다.</p>
+<p>풀 크기와 수명 설정은 애플리케이션 혼자 정하는 값이 아니다. 인스턴스 수, 배포 중 겹치는 인스턴스, 배치 작업이나 관리 도구가 여는 연결까지 합쳐 데이터베이스의 연결 한도 안에 들어와야 한다. 데이터베이스의 유휴 연결 시간 제한이나 중간 네트워크 장비의 제한이 바뀌면 maxLifetime도 함께 다시 봐야 한다. 이런 값이 어긋나면 평소에는 멀쩡하다가 한가한 시간 뒤의 첫 요청이나 트래픽이 몰린 순간에만 장애가 나서 재현이 어렵다. 설정을 바꿀 때는 HikariCP가 시작할 때 DEBUG로 찍는 설정 목록으로 실제 적용된 값을 확인하는 습관이 도움이 된다.</p>
+<p>판단이 달라지는 조건도 있다. 요청이 드물고 인스턴스가 많은 환경에서는 고정 크기 풀이 데이터베이스에 쓰지 않는 연결을 대량으로 열어 두게 되므로 minimumIdle을 낮춰 유휴 커넥션을 줄이는 쪽이 나을 수 있다. 반대로 요청이 갑자기 몰리는 서비스라면 README의 권고대로 고정 크기 풀이 커넥션 생성 대기를 없애 준다. 어느 쪽이든 측정 없이 공식만으로 정한 값은 출발점일 뿐이다.</p>
+</x-review>
+
+<x-practice>
+<li>예제 1의 <code>DataSourceExample1</code>에서 <code>c3.close()</code>를 지우고 실행하면 <code>c5</code>는 어떤 이름(<code>connN</code>)으로 출력될지, 그리고 프로그램이 <code>c5</code>를 얻은 직후 이 프로세스에 9092 포트로 향하는 ESTABLISHED 소켓이 몇 개일지 예측하라.</li>
+<li>HikariDataSource의 <code>maximumPoolSize</code>를 3으로 두고 <code>minimumIdle</code>은 설정하지 않았다. 애플리케이션이 시작 후 처음으로 <code>getConnection()</code>을 한 번 부르고 커넥션을 쥔 채 2초를 기다렸다. 그 시점의 total, active, idle 값을 예측하고, 각 커넥션을 어느 스레드가 만들었는지 설명하라.</li>
+<li>어떤 서비스 메서드는 커넥션 하나로 주문을 읽은 상태에서 감사 로그를 쓰려고 두 번째 커넥션을 빌린다. 요청 처리 스레드는 최대 20개이고 풀 크기는 10이다. 트래픽이 몰렸을 때 무슨 일이 생길 수 있는지 설명하고, HikariCP 위키의 식으로 교착을 피하는 최소 풀 크기를 구하라. 그리고 풀 크기를 늘리는 것 말고 더 나은 해법을 제시하라.</li>
+<li>풀 크기 1인 HikariCP에서 스레드 A가 <code>setAutoCommit(false)</code> 후 <code>update</code>를 실행하고 커밋 없이 <code>close()</code>했다. 이어서 스레드 B가 같은 풀에서 커넥션을 빌려 <code>getAutoCommit()</code>을 부르고 A가 수정한 행을 조회한다. B가 보게 될 값과 그 이유를 7.0.2의 <code>ProxyConnection.close()</code> 순서로 설명하라. 풀 없이 DriverManagerDataSource를 썼다면 무엇이 달라지는가.</li>
+<li>DBA가 데이터베이스의 유휴 연결 제한을 10분으로 줄였는데 애플리케이션의 HikariCP 설정은 기본값 그대로다. 이른 아침 첫 요청들에서 간헐적으로 연결 오류가 난다면 어떤 설정이 어떻게 어긋난 것인지 README의 권고를 근거로 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> <code>c3</code>을 닫지 않아도 DriverManagerDataSource는 호출마다 새 커넥션을 연다. H2 드라이버는 JVM 안에서 만든 커넥션마다 번호를 하나씩 올리므로 <code>c1</code>부터 <code>c4</code>가 <code>conn0</code>부터 <code>conn3</code>, <code>c5</code>는 <code>conn4</code>로 원래 실행과 같다. 달라지는 것은 열려 있는 연결 수다. <code>c1</code>부터 <code>c5</code>까지 다섯 개가 모두 열린 상태이므로 ESTABLISHED 소켓은 5개다. 원래 실행에서 4개였던 것은 <code>c3</code>을 닫아 그 TCP 연결이 끊겼기 때문이다. 번호가 재사용되지 않는다는 점, 그리고 커넥션 객체 하나가 TCP 연결 하나와 짝을 이룬다는 점이 핵심이다.</p>
+<p><b>2.</b> <code>minimumIdle</code>을 설정하지 않았으므로 기본값은 <code>maximumPoolSize</code>와 같은 3이다. 첫 <code>getConnection()</code>이 풀을 시작하고, <code>checkFailFast</code>가 호출 스레드(main)에서 첫 커넥션을 만든다. main은 그 커넥션을 빌린다. 약 100밀리초 뒤 하우스키퍼가 돌아 유휴 0개가 최소 유휴 3개보다 적고 전체 1개가 최대 3개보다 적으므로 생성 작업을 넘기고, connection-adder 스레드가 커넥션을 하나씩(7.0.2에서는 추가 후 30밀리초씩 쉬며) 만든다. 전체가 최대 크기 3에 이르면 더 만들지 않는다. 따라서 2초 뒤에는 total=3, active=1, idle=2다. 유휴 3개를 채우려 해도 최대 크기가 3이므로 유휴는 2개에서 멈춘다.</p>
+<p><b>3.</b> 스레드 10개가 각자 첫 커넥션을 쥔 상태에서 동시에 두 번째를 요청하면 풀에 남은 것이 없고, 아무도 첫 커넥션을 반납하지 않으므로 모두 <code>connectionTimeout</code>(기본 30초)까지 기다리다 예외를 받는다. 풀 교착이다. 위키의 식 <code>Tn x (Cm - 1) + 1</code>에 Tn=20, Cm=2를 넣으면 20 × 1 + 1 = 21이 최소 크기다. 하지만 21개는 데이터베이스 입장에서 근거 없는 큰 값일 수 있다. 더 나은 해법은 한 스레드가 커넥션을 두 개 동시에 쥐지 않게 하는 것이다. 감사 로그를 같은 커넥션으로 쓰거나, 첫 커넥션을 반납한 뒤에 쓰거나, 요청 처리 후 별도 경로로 기록하는 식이다.</p>
+<p><b>4.</b> A가 <code>update</code>를 실행할 때 자동 커밋이 꺼져 있었으므로 프록시가 커밋 상태를 "더럽다"고 표시했다. A의 <code>close()</code>는 Statement를 정리한 뒤 이 표시와 자동 커밋 꺼짐을 보고 <code>rollback()</code>을 부르고, 자동 커밋 비트가 켜져 있으므로 <code>resetConnectionState</code>가 자동 커밋을 풀 기본값 true로 되돌린 다음 반납한다. 그래서 B는 <code>getAutoCommit()</code>에서 true를 보고, 행은 수정 전 값으로 보인다. DriverManagerDataSource라면 A의 close가 물리 연결을 끊는다. 활성 트랜잭션이 있는 상태에서 close한 결과는 JDBC가 구현에 맡긴 영역이라 드라이버와 데이터베이스에 따라 정해지고, B는 어차피 새 물리 커넥션을 받으므로 A의 세션 설정을 물려받지는 않는다.</p>
+<p><b>5.</b> 기본 <code>maxLifetime</code>은 30분이고, 유휴 커넥션은 그 전에 데이터베이스의 10분 제한에 걸려 서버 쪽에서 끊길 수 있다. 밤사이 쉬던 커넥션을 풀이 내주면 빌려 주기 전 점검이나 주기적 점검으로 걸러지지 않은 경우 첫 SQL에서 실패한다. README는 <code>maxLifetime</code>을 데이터베이스나 인프라가 정한 연결 시간 제한보다 몇 초 짧게 두라고 강하게 권한다. 따라서 데이터베이스의 제한이 바뀌었다면 <code>maxLifetime</code>을 10분보다 몇 초 짧게 다시 정해, 데이터베이스가 끊기 전에 풀이 먼저 커넥션을 교체하게 해야 한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>스프링의 DriverManagerDataSource에서 얻은 커넥션에 close()를 부르면 어떻게 되는가?</q>
+<o>커넥션이 내부 풀에 반납되어 다음 getConnection에서 다시 나온다</o>
+<o>물리 커넥션이 닫히고, 다음 getConnection은 새 물리 커넥션을 연다</o>
+<o>프록시만 닫히고 물리 커넥션은 열린 채 남는다</o>
+<o>DriverManager가 커넥션을 캐시해 두었다가 같은 URL 요청에 재사용한다</o>
+<why>DriverManagerDataSource는 호출마다 DriverManager.getConnection(url, props)를 불러 드라이버의 커넥션을 그대로 돌려주는 기본 구현이다. 감싼 객체가 없으므로 close는 물리 연결을 끊는다. 예제 1에서 c3을 닫은 뒤 얻은 c5가 새 번호 conn4였던 것이 그 증거다. 반납과 프록시는 HikariDataSource의 동작이고, DriverManager는 커넥션을 캐시하지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>maximumPoolSize만 10으로 설정한 HikariDataSource에서 커넥션 2개를 빌린 채 1초를 기다렸다. 풀의 total이 10이 된 이유로 가장 정확한 것은?</q>
+<o>getConnection을 부를 때마다 풀이 커넥션을 5개씩 미리 만들기 때문이다</o>
+<o>HikariCP는 풀을 시작하는 생성자 안에서 최대 크기만큼 동기적으로 만들기 때문이다</o>
+<o>minimumIdle의 기본값이 maximumPoolSize와 같아서, 하우스키퍼가 유휴 커넥션을 10개 목표로 채우다가 최대 크기에서 멈췄기 때문이다</o>
+<o>H2 서버가 연결을 받을 때마다 여분의 연결을 자동으로 열어 주기 때문이다</o>
+<why>README의 기본값 표에서 minimumIdle은 maximumPoolSize와 같다. 하우스키퍼는 유휴 수가 minimumIdle보다 적고 전체가 최대보다 적으면 생성 작업을 connection-adder에 넘긴다. 생성 작업은 전체가 최대 크기 10에 이르면 멈추므로 total=10, active=2, idle=8이 된다. 시작 시점에 동기적으로 만드는 것은 fail fast용 첫 커넥션 하나뿐이다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>HikariCP에서 같은 스레드가 커넥션을 반납하고 곧바로 다시 빌리면 대개 같은 물리 커넥션이 나온다. 이 동작에 대한 설명으로 옳은 것은?</q>
+<o>반납한 엔트리를 그 스레드의 스레드 로컬 목록에 넣어 두고 다음 대여에서 먼저 찾지만, 엔트리는 공유 목록에도 있어서 다른 스레드가 CAS로 먼저 가져갈 수 있다</o>
+<o>커넥션이 처음 빌린 스레드에 영구히 배정되므로 다른 스레드는 그 커넥션을 받을 수 없다</o>
+<o>반납된 커넥션은 공유 목록에서 빠지고 그 스레드만 접근할 수 있는 목록으로 옮겨진다</o>
+<o>트랜잭션을 유지하기 위해 HikariCP가 스레드와 커넥션의 대응을 보장한다</o>
+<why>7.0.2의 requite는 대기자가 없으면 엔트리를 반납한 스레드의 스레드 로컬 목록에 추가할 뿐, 공유 목록에서 빼지 않는다. 대여의 확정은 언제나 엔트리 상태의 CAS다. 그래서 스레드 로컬 목록은 소유가 아니라 힌트이고, 트랜잭션을 위해 한 스레드가 같은 커넥션을 쓰게 하는 일은 풀이 아니라 스프링의 트랜잭션 동기화가 맡는다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>풀의 커넥션이 모두 사용 중일 때 새 getConnection 호출에 대한 HikariCP의 동작으로 옳은 것은?</q>
+<o>최대 크기를 무시하고 임시 커넥션을 하나 더 만들어 준다</o>
+<o>즉시 null을 돌려준다</o>
+<o>사용 중인 커넥션 중 가장 오래된 것을 강제로 회수해 넘겨준다</o>
+<o>생성 요청을 보내지만 최대 크기라 만들어지지 않으면, connectionTimeout까지 핸드오프 큐에서 기다리다 SQLTransientConnectionException을 던진다</o>
+<why>실험에서 maximumPoolSize=2, connectionTimeout=500ms일 때 세 번째 요청은 "Connection not added" 로그 뒤 약 500ms를 기다리고 "Connection is not available, request timed out after ...ms" 예외를 받았다. 기다리는 동안 다른 스레드가 반납하면 핸드오프 큐로 그 커넥션을 받는다. 사용 중인 커넥션은 maxLifetime이 지나도 강제로 회수하지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>HikariCP 위키 "About Pool Sizing"의 관점에서, 데이터베이스 서버의 CPU 코어 수를 훨씬 넘는 큰 풀이 처리량을 높이지 못하는 주된 이유는?</q>
+<o>JDBC 명세가 커넥션 수를 CPU 코어 수로 제한하기 때문이다</o>
+<o>한 코어는 한 번에 한 스레드만 실행하므로, 동시 작업이 코어와 I/O가 감당하는 수를 넘으면 문맥 교환과 경합 비용만 늘기 때문이다</o>
+<o>커넥션이 많으면 TCP 3-way handshake가 매 쿼리마다 다시 일어나기 때문이다</o>
+<o>HikariCP가 코어 수보다 많은 커넥션을 자동으로 닫기 때문이다</o>
+<why>위키는 디스크와 네트워크를 무시하면 코어 수만큼의 동시 작업이 상한이고, 스레드가 코어 수를 넘으면 더할수록 느려진다고 설명한다. 그래서 (core_count * 2) + effective_spindle_count를 출발점으로 제시하고, 작은 풀과 그 앞에서 기다리는 스레드를 권한다. 풀의 커넥션은 이미 연결된 상태이므로 쿼리마다 handshake가 일어나지는 않는다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>커넥션 풀 (Connection Pool)</dt><dd>미리 연결을 맺어 둔 물리 커넥션들을 보관하고 빌려주고 돌려받는 구성 요소. 획득 비용을 줄이고 데이터베이스로 향하는 동시 연결 수를 제한한다.</dd>
+<dt>데이터소스 (DataSource)</dt><dd>javax.sql 패키지의 표준 인터페이스로, 물리적 데이터 소스에 대한 커넥션의 팩토리. 접속 정보와 풀 설정을 감추고 getConnection만 노출한다.</dd>
+<dt>물리 커넥션과 프록시 커넥션 (Physical / Proxy Connection)</dt><dd>물리 커넥션은 드라이버가 만든 실제 연결이고, 프록시 커넥션은 풀이 그것을 감싸 애플리케이션에 주는 핸들이다. 프록시의 close는 반납을 뜻한다.</dd>
+<dt>유휴 커넥션 (Idle Connection)</dt><dd>풀 안에서 빌려 가기를 기다리는 커넥션. HikariCP는 minimumIdle, idleTimeout, keepaliveTime으로 그 수와 상태를 관리한다.</dd>
+<dt>TIME_WAIT</dt><dd>TCP 연결을 먼저 닫은 쪽이 2×MSL 동안 머무는 상태. 상대가 마지막 ACK를 받았음을 확인하고 지연된 세그먼트가 새 연결에 끼어들지 않게 한다(RFC 9293).</dd>
+<dt>핸드오프 큐 (Handoff Queue)</dt><dd>HikariCP의 ConcurrentBag이 기다리는 스레드에 커넥션을 직접 건네는 데 쓰는 SynchronousQueue. 용량이 없어 넣는 쪽과 받는 쪽이 만나야 전달된다.</dd>
+<dt>커넥션 누수 (Connection Leak)</dt><dd>빌린 커넥션을 반납하지 않는 버그. 풀이 서서히 말라 결국 대기 시간 초과로 이어진다. HikariCP의 leakDetectionThreshold로 빌린 위치를 찾을 수 있다.</dd>
+<dt>빠른 실패 (Fail Fast)</dt><dd>문제가 있으면 나중이 아니라 즉시 실패하게 하는 설계. HikariCP는 initializationFailTimeout에 따라 풀 시작 시 첫 커넥션을 만들어 보고, 실패하면 시작을 중단한다.</dd>
+<dt>이중 확인 잠금 (Double-Checked Locking)</dt><dd>락 없이 먼저 확인하고 필요할 때만 락을 잡아 다시 확인하는 지연 초기화 기법. 필드가 volatile이어야 올바르다. HikariDataSource가 풀을 지연 시작할 때 쓴다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://github.com/brettwooldridge/HikariCP">HikariCP README</a> — 설정 항목의 의미와 기본값, maxLifetime과 minimumIdle에 대한 권고</li>
+<li><a href="https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing">HikariCP Wiki: About Pool Sizing</a> — 풀 크기 출발점 공식과 풀 교착을 피하는 최소 크기</li>
+<li><a href="https://docs.spring.io/spring-boot/3.5/reference/data/sql.html">Spring Boot 3.5 Reference: SQL Databases</a> — 커넥션 풀 선택 순서, spring.datasource.hikari.* 접두사, 임베디드 DB 자동 구성</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/connection-interfaces.html">MySQL 8.0 Reference Manual: Connection Interfaces</a> — 연결마다 전용 스레드를 배정하는 모델과 스레드 캐시</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/gone-away.html">MySQL 8.0 Reference Manual: MySQL server has gone away</a> — 유휴 연결을 8시간 뒤 닫는 기본 동작과 wait_timeout</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9293.html">RFC 9293: Transmission Control Protocol</a> — three-way handshake, TIME-WAIT와 2×MSL</li>
+</x-refs>

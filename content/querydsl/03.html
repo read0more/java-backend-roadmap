@@ -1,0 +1,816 @@
+<x-meta>
+deck: 조인, on 절, 페치 조인, 서브 쿼리, case 식, 상수와 문자 더하기가 Querydsl 안에서 어떤 JPQL로 직렬화되고, Hibernate 6.6이 그것을 어떤 SQL로 바꾸며, DB가 그 SQL을 어떻게 계산하는지 실행 로그로 따라간다.
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li><code>join(연관 경로, 별칭)</code>이 만드는 JPQL과 SQL을 읽고, 별칭 Q 타입의 제네릭이 잘못된 조인을 컴파일 시점에 막는 원리를 설명할 수 있다.</li>
+<li>외부 조인에서 on 절 조건과 where 절 조건이 다른 결과를 내는 이유를 행 단위로 추적하고, 내부 조인에서는 둘이 같은 결과를 내는 이유를 옵티마이저의 변환 규칙으로 설명할 수 있다.</li>
+<li>페치 조인과 일반 조인이 같은 SQL 조인을 쓰면서도 영속성 컨텍스트에 남기는 결과가 어떻게 다른지, 페치 조인에 on 절이나 컬렉션 필터를 붙이면 무엇이 깨지는지 실행 결과로 보여 줄 수 있다.</li>
+<li>서브 쿼리에 별도 별칭이 필요한 이유를 JPQL 식별 변수의 범위 규칙과 Querydsl 경로의 동등성으로 설명하고, from 절 서브 쿼리를 Querydsl JPA로 쓸 수 없는 이유를 명세와 API 시그니처로 말할 수 있다.</li>
+<li>case 식, 상수, 문자 더하기가 각각 JPQL의 리터럴, 바인딩 파라미터, 자바 쪽 후처리 중 어디로 가는지 생성된 JPQL을 보고 판별할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 엔티티 둘을 엮는 순간 무엇이 달라지는가</h3>
+
+<p>02회에서는 엔티티 하나 안에서 조건을 걸고, 결과를 꺼내고, 정렬하고, 페이징하고, 집계하는 문법을 다뤘다. 쿼리의 대상이 테이블 하나일 때는 Querydsl 코드와 실행되는 SQL이 거의 일대일로 겹쳐 보인다. 그런데 실제 화면은 거의 언제나 둘 이상의 엔티티를 함께 보여 준다. 직원 목록에는 부서 이름이 붙고, 부서 목록에는 소속 인원이 붙고, "자기 부서에서 나이가 가장 많은 직원" 같은 조건은 같은 테이블을 두 번 읽어야 한다. 엔티티 둘을 엮는 순간부터 코드 한 줄이 만들어 내는 SQL은 눈에 보이는 것보다 훨씬 많은 결정을 담게 된다.</p>
+
+<p>이 회차는 그 결정들을 하나씩 드러낸다. 다룰 문법은 기본 조인, on 절, 페치 조인, 서브 쿼리, case 식, 상수와 문자 더하기다. 각 문법마다 세 층을 차례로 내려간다. 첫째 층은 Querydsl 코드가 만들어 내는 JPQL 문자열이다. 둘째 층은 Hibernate가 그 JPQL을 번역한 SQL이다. 셋째 층은 데이터베이스가 그 SQL을 실제로 계산하는 방식이다. "Querydsl을 쓰면 SQL을 몰라도 된다"는 말은 이 회차의 주제에서 가장 크게 틀린다. on 절 하나의 위치, 별칭 하나의 이름이 결과 행의 개수를 바꾸기 때문이다.</p>
+
+<p>이 회차의 모든 실험은 JDK 21.0.13, Querydsl 5.1.0(<code>querydsl-jpa</code>의 <code>jakarta</code> 분류자 jar), Hibernate ORM 6.6.53.Final, H2 2.3.232 인메모리 데이터베이스에서 실행했다. 스프링 없이 <code>persistence.xml</code>로 <code>EntityManagerFactory</code>를 만들고, 그 위에 <code>JPAQueryFactory</code>를 얹었다. JPQL은 쿼리 객체의 <code>toString()</code>으로, SQL은 <code>hibernate.show_sql</code>과 <code>hibernate.format_sql</code> 설정으로 출력했다. Querydsl 내부 동작에 대한 서술은 같은 버전의 jar를 <code>javap</code>로 열어 확인한 것이다. MySQL의 동작을 말할 때는 MySQL 8.0 Reference Manual의 해당 절을 근거로 삼고, 그때마다 "MySQL 기준"이라고 밝힌다.</p>
+
+<p>예제 도메인은 이 회차의 설명에 필요한 만큼만 만든 최소 모델이다. 직원(<code>Employee</code>)은 이름, 나이, 소속 부서를 갖고, 부서(<code>Department</code>)는 이름과 함께 부서장의 이름을 문자열로 갖는다. 부서장 이름을 연관관계가 아니라 문자열로 둔 것은 일부러다. "연관관계로 매핑되지 않은 값으로 두 엔티티를 엮는" 세타 조인과 on 절 조인을 보여 주기 위해서다.</p>
+
+<pre><code class="language-java">@Entity
+public class Department {
+    @Id @GeneratedValue
+    private Long id;
+    private String name;
+    private String managerName;              // 부서장 이름(연관관계가 아닌 그냥 문자열)
+
+    @OneToMany(mappedBy = "department")
+    private List<Employee> employees = new ArrayList<>();
+
+    protected Department() {}
+    public Department(String name, String managerName) {
+        this.name = name;
+        this.managerName = managerName;
+    }
+    // getter 생략
+}
+
+@Entity
+public class Employee {
+    @Id @GeneratedValue
+    private Long id;
+    private String name;
+    private int age;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "department_id")
+    private Department department;
+
+    protected Employee() {}
+    public Employee(String name, int age, Department department) {
+        this.name = name;
+        this.age = age;
+        this.department = department;
+    }
+    // getter 생략
+}</code></pre>
+<p>데이터는 부서 셋, 직원 다섯이다. 인사 부서에는 직원이 없고, 직원 jung에게는 부서가 없다. 이 두 "짝 없는" 행이 이 회차 내내 내부 조인과 외부 조인, on과 where의 차이를 드러내는 시험지 역할을 한다. 부서장 이름 han에 해당하는 직원도 일부러 넣지 않았다.</p>
+
+<pre><code class="language-java">import static demo.QDepartment.department;
+import static demo.QEmployee.employee;
+
+EntityManagerFactory emf = Persistence.createEntityManagerFactory("demo");
+EntityManager em = emf.createEntityManager();
+JPAQueryFactory qf = new JPAQueryFactory(em);
+
+em.getTransaction().begin();
+Department dev = new Department("개발", "lee");
+Department sales = new Department("영업", "choi");
+Department hr = new Department("인사", "han");
+em.persist(dev); em.persist(sales); em.persist(hr);
+em.persist(new Employee("kim", 25, dev));
+em.persist(new Employee("lee", 31, dev));
+em.persist(new Employee("park", 28, sales));
+em.persist(new Employee("choi", 40, sales));
+em.persist(new Employee("jung", 35, null));   // 부서 없음
+em.flush();
+em.clear();                                   // 이후 조회가 1차 캐시가 아니라 DB에서 오도록</code></pre>
+
+<div class="table-wrap"><table><thead><tr><th>직원</th><th>나이</th><th>부서</th><th></th><th>부서</th><th>managerName</th></tr></thead><tbody>
+<tr><td>kim</td><td>25</td><td>개발</td><td></td><td>개발</td><td>lee</td></tr>
+<tr><td>lee</td><td>31</td><td>개발</td><td></td><td>영업</td><td>choi</td></tr>
+<tr><td>park</td><td>28</td><td>영업</td><td></td><td>인사</td><td>han</td></tr>
+<tr><td>choi</td><td>40</td><td>영업</td><td></td><td></td><td></td></tr>
+<tr><td>jung</td><td>35</td><td>(없음)</td><td></td><td></td><td></td></tr>
+</tbody></table></div>
+
+<p>아래에 나오는 결과 목록은 모두 위 데이터로 실제 실행한 출력이다. 단, 쿼리에 <code>orderBy</code>가 없는 경우 SQL에도 <code>ORDER BY</code>가 없으므로 행의 순서는 데이터베이스가 보장하지 않는다. 보이는 순서는 이번 실행의 순서일 뿐이다. 다음 회차(04회)에서 프로젝션과 동적 쿼리를 다루므로, 이 회차에서는 결과를 엔티티와 <code>Tuple</code>로만 받는다.</p>
+
+<h3>조인을 바닥부터: DB는 두 테이블을 어떻게 엮는가</h3>
+
+<p>Querydsl의 조인 문법을 보기 전에, 그 문법이 결국 도달하는 SQL 조인이 무엇을 계산하는지부터 정리한다. 개념적으로 조인은 두 테이블의 카티션 곱(Cartesian product) 위에 거는 필터다. 직원 5행과 부서 3행을 엮으면 가능한 조합은 15개이고, 조인 조건은 그 15개 중 어떤 조합을 남길지 정한다. 내부 조인(inner join)은 조건을 만족하는 조합만 남긴다. 왼쪽 외부 조인(left outer join)은 여기에 한 가지를 더한다. 왼쪽 테이블의 행 중 조건을 만족하는 짝이 하나도 없는 행을, 오른쪽 열을 모두 NULL로 채워(NULL-complemented) 결과에 남긴다. 외부 조인의 본질은 "왼쪽 행은 하나도 잃지 않는다"는 약속이다.</p>
+
+<p>물론 데이터베이스가 실제로 15개 조합을 다 만들지는 않는다. MySQL Reference Manual의 "Nested-Loop Join Algorithms" 절은 MySQL이 테이블 간 조인을 중첩 루프(nested-loop) 알고리즘이나 그 변형으로 실행한다고 설명한다. 바깥 테이블에서 행을 하나 읽을 때마다 안쪽 테이블에서 짝을 찾는 방식이다. 안쪽 테이블에서 조인 조건 열에 인덱스를 쓸 수 있으면 짝 찾기는 B+Tree 탐색 한 번이 되고, 쓸 수 없으면 다른 전략이 필요하다. 같은 문서에 따르면 MySQL 8.0.18부터는 인덱스를 쓸 수 없는 동등 조인(equi-join)에 해시 조인(hash join)을 쓰고, 8.0.20부터는 이전의 블록 중첩 루프(BNL)를 아예 쓰지 않고 해시 조인으로 대체했다.</p>
+
+<pre class="diagram">직원 LEFT JOIN 부서 ON 부서.id = 직원.department_id 를 중첩 루프로 계산할 때
+
+for (직원 행 e : Employee) {                 // 바깥 테이블: 보존되는 쪽
+    found = false
+    for (부서 행 d : Department 에서 id = e.department_id 인 행) {   // PK 인덱스 탐색
+        if (ON 조건 전체가 참) { 출력(e, d); found = true }
+    }
+    if (!found) 출력(e, NULL)                  // 외부 조인만 하는 일: NULL로 채워 보존
+}
+WHERE 조건은 이렇게 만들어진 행 위에서 따로 평가된다</pre>
+
+<p>이 그림에서 두 가지를 기억해 두자. 첫째, 외부 조인에서 on 조건은 "짝을 찾는 기준"이고, 짝을 못 찾으면 행이 NULL과 함께 살아남는다. 둘째, where 조건은 조인이 끝난 행 위에서 평가되므로 NULL로 채워진 행도 걸러 낼 수 있다. 뒤에서 on 절과 where 절의 차이를 다룰 때 이 두 사실이 그대로 쓰인다.</p>
+
+<p>조인 순서에도 비대칭이 있다. MySQL Reference Manual의 "Outer Join Simplification" 절은 옵티마이저가 외부 조인에 대해서는 바깥(보존되는) 테이블을 안쪽 테이블보다 먼저 읽는 계획만 고려한다고 적는다. 중첩 루프로 외부 조인을 실행하려면 그 순서여야 하기 때문이다. 반면 내부 조인은 어느 쪽을 먼저 읽어도 결과가 같으므로, 같은 절은 <code>T1 INNER JOIN T2 ON P(T1,T2)</code> 형태의 내부 조인이 <code>T1, T2</code> 목록으로 바뀌고 조건 <code>P</code>는 WHERE 조건에 합쳐진다고 설명한다. 내부 조인의 on과 where는 옵티마이저에게 구별되지 않는다는 뜻이다. 이 사실도 뒤에서 다시 쓴다.</p>
+
+<h3>기본 조인: join(연관 경로, 별칭)</h3>
+
+<p>Querydsl의 기본 조인은 두 개의 인자를 받는다. 첫 번째는 "어느 연관관계를 따라갈 것인가"를 나타내는 경로이고, 두 번째는 "조인된 쪽 엔티티를 이 쿼리 안에서 무엇이라고 부를 것인가"를 나타내는 별칭이다. 개발 부서 직원을 조회하는 쿼리로 시작한다.</p>
+
+<pre><code class="language-java">JPAQuery<Employee> q = qf.selectFrom(employee)
+        .join(employee.department, department)
+        .where(department.name.eq("개발"));
+List<Employee> result = q.fetch();</code></pre>
+
+<pre data-label="생성된 JPQL"><code class="language-text">select employee
+from Employee employee
+  inner join employee.department as department
+where department.name = ?1</code></pre>
+
+<pre data-label="Hibernate가 실행한 SQL"><code class="language-sql">select e1_0.id, e1_0.age, e1_0.department_id, e1_0.name
+from Employee e1_0
+join Department d1_0
+    on d1_0.id=e1_0.department_id
+where d1_0.name=?</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">kim
+lee</code></pre>
+
+<p>세 출력을 나란히 놓고 읽어 보자. JPQL의 <code>inner join employee.department as department</code>는 Querydsl 코드의 두 인자를 그대로 옮긴 것이다. 경로 <code>employee.department</code>가 조인 대상이 되고, 별칭 Q 타입이 가진 이름 <code>department</code>가 <code>as</code> 뒤의 식별 변수(identification variable)가 된다. 그리고 SQL에는 우리가 어디에도 쓰지 않은 <code>on d1_0.id=e1_0.department_id</code>가 나타난다. 이 조건은 <code>@ManyToOne</code>과 <code>@JoinColumn(name = "department_id")</code> 매핑에서 Hibernate가 만든 것이다. JPQL은 객체 그래프를 경로로 탐색하는 언어이고, 경로를 따라가는 조인의 조건은 매핑이 공급한다. 개발자는 "어떤 연관을 따라갈지"만 말하고 "어떤 외래 키로 엮을지"는 말하지 않는다.</p>
+
+<p>JPQL의 <code>?1</code>도 눈여겨보자. 문자열 <code>"개발"</code>은 JPQL 본문에 들어가지 않고, 위치 기반 파라미터(positional parameter)로 바인딩되었다. Querydsl의 직렬화기는 쿼리 안에서 만나는 상수를 목록으로 모으면서 그 자리에 <code>?1</code>, <code>?2</code> 같은 번호를 쓴다. 쿼리 객체는 실행 시점에 그 목록을 <code>Query.setParameter</code>로 넘긴다(<code>AbstractJPAQuery</code>의 바이트코드에서 <code>JPQLSerializer.getConstants()</code>를 꺼내 <code>JPAUtil.setConstants</code>에 넘기는 호출을 확인할 수 있다). 사용자의 입력이 SQL 문법의 일부가 될 수 없으니 SQL 주입이 막히고, 파라미터 값만 다른 쿼리는 같은 JPQL 문자열을 공유한다.</p>
+
+<h4>별칭의 제네릭이 막아 주는 실수</h4>
+
+<p><code>JPAQueryBase</code>의 조인 메서드 시그니처를 <code>javap</code>로 열어 보면 두 인자형 조인 중 엔티티 경로와 컬렉션 경로를 받는 것은 이렇게 생겼다(맵 경로를 받는 <code>MapExpression</code> 오버로드도 따로 있다).</p>
+
+<pre><code class="language-java">public <P> Q join(EntityPath<P> target, Path<P> alias);
+public <P> Q join(CollectionExpression<?, P> target, Path<P> alias);</code></pre>
+
+<p>타입 변수 <code>P</code>가 두 인자를 묶는다. <code>employee.department</code>는 <code>QDepartment</code>, 즉 <code>EntityPath<Department></code>이므로 별칭도 <code>Path<Department></code>여야 한다. 컬렉션 연관 <code>department.employees</code>는 원소 타입이 <code>Employee</code>인 <code>CollectionExpression</code>이므로 별칭은 <code>Path<Employee></code>여야 한다. 일부러 틀려 보면 컴파일러가 바로 거부한다.</p>
+
+<pre><code class="language-java">qf.selectFrom(employee).join(employee.department, new QEmployee("x"));</code></pre>
+
+<pre data-label="javac 오류(발췌)"><code class="language-text">error: no suitable method found for join(QDepartment,QEmployee)
+    method JPAQueryBase.<P#4>join(EntityPath<P#4>,Path<P#4>) is not applicable
+      (inference variable P#4 has incompatible equality constraints Employee,Department)</code></pre>
+
+<p>문자열로 JPQL을 쓸 때 같은 실수를 하면 애플리케이션을 띄우고 그 쿼리를 실행하는 순간에야 알 수 있다. Querydsl은 연관관계의 대상 타입을 Q 타입의 제네릭 인자로 옮겨 두었기 때문에, 이 종류의 오류를 자바 컴파일러의 타입 추론 단계로 끌어올린다. 01회에서 본 애노테이션 프로세서가 엔티티의 필드 타입을 읽어 Q 타입을 생성하는 이유가 바로 이것이다.</p>
+
+<h4>별칭의 이름은 어디서 오는가</h4>
+
+<p>JPQL에 찍힌 <code>employee</code>라는 식별 변수는 Q 타입 기본 인스턴스의 생성자 인자에서 온다. 애노테이션 프로세서가 생성한 <code>QEmployee</code>에는 <code>public static final QEmployee employee = new QEmployee("employee");</code>라는 필드가 있고, 이 생성자 인자 문자열이 곧 JPQL의 별칭이다. 같은 프로세서로 이름이 <code>Member</code>와 <code>Order</code>인 엔티티를 만들어 보면 기본 인스턴스가 각각 <code>new QMember("member1")</code>, <code>new QOrder("order1")</code>로 생성된다. Jakarta Persistence 3.1 명세 4.4.1절의 예약어(reserved identifier) 목록에 <code>MEMBER</code>와 <code>ORDER</code>가 들어 있고, 같은 절은 예약어를 식별 변수로 쓸 수 없다고 정한다. Querydsl 쪽에도 같은 목록이 있다. <code>querydsl-codegen</code>의 <code>Keywords.JPA</code> 컬렉션에 <code>MEMBER</code>와 <code>ORDER</code>가 들어 있고, JPA용 애노테이션 프로세서 설정인 <code>JPAConfiguration</code>이 이 클래스를 참조한다. 생성기는 기본 인스턴스의 이름이 이 예약어와 겹치면 뒤에 1을 붙여 피한다.</p>
+
+<aside class="note">명세 4.4.2절은 식별 변수가 대소문자를 구분하지 않으며 같은 영속성 유닛의 엔티티 이름과 같아서는 안 된다고도 적는다. 이 규칙대로라면 엔티티 <code>Employee</code>의 별칭 <code>employee</code>는 엄밀히 이식성이 없는 이름이다. Hibernate 6.6.53은 이 쿼리를 문제없이 받아들였지만, 다른 JPA 구현체에서 같은 결과를 장담할 근거는 명세에 없다. 별칭이 신경 쓰이면 <code>new QEmployee("e")</code>처럼 직접 이름을 지어 쓰면 된다.</aside>
+
+<p>조인 메서드는 <code>join</code>(= <code>innerJoin</code>), <code>leftJoin</code>, <code>rightJoin</code>이 있다. 외부 조인으로 바꾸면 부서가 없는 jung이 NULL과 함께 살아남는다.</p>
+
+<pre><code class="language-java">qf.select(employee.name, department.name)
+  .from(employee)
+  .leftJoin(employee.department, department)
+  .fetch();</code></pre>
+
+<pre data-label="SQL과 실행 결과"><code class="language-text">select e1_0.name, d1_0.name
+from Employee e1_0
+left join Department d1_0 on d1_0.id=e1_0.department_id
+
+[kim, 개발]
+[lee, 개발]
+[park, 영업]
+[choi, 영업]
+[jung, null]</code></pre>
+
+<p>Querydsl이 이 조인 정보를 어떻게 들고 있는지도 한 번 보아 두자. 쿼리의 메타데이터를 담는 <code>DefaultQueryMetadata</code>에는 확정된 조인 목록(<code>List<JoinExpression> joins</code>)과 별도로, 지금 만들고 있는 조인의 대상·종류·조건·플래그를 담는 필드(<code>joinTarget</code>, <code>joinType</code>, <code>joinCondition</code>, <code>joinFlags</code>)가 있다. 새 조인을 추가하는 <code>addJoin</code>은 먼저 <code>addLastJoin()</code>을 불러 이전 조인을 <code>JoinExpression</code>으로 확정한 뒤 새 대상과 종류를 기록한다. 그래서 <code>on(...)</code>과 <code>fetchJoin()</code>은 언제나 <b>가장 최근에 선언한 조인</b>에 붙는다. 메서드 체인의 순서가 곧 의미다.</p>
+
+<h4>묵시적 조인: 경로 표현식이 만드는 내부 조인</h4>
+
+<p>조인을 명시하지 않아도 경로를 두 단계 이상 따라가면 조인이 생긴다. <code>employee.department.name</code>처럼 연관을 거쳐 필드에 닿는 경로가 그렇다. 이것을 묵시적 조인(implicit join)이라 한다.</p>
+
+<pre><code class="language-java">qf.select(employee.name, employee.department.name)
+  .from(employee)
+  .fetch();</code></pre>
+
+<pre data-label="JPQL, SQL, 실행 결과"><code class="language-text">select employee.name, employee.department.name
+from Employee employee
+
+select e1_0.name, d1_0.name
+from Employee e1_0
+join Department d1_0 on d1_0.id=e1_0.department_id
+
+[kim, 개발]
+[lee, 개발]
+[park, 영업]
+[choi, 영업]</code></pre>
+
+<p>jung이 사라졌다. select 절에 부서 이름을 하나 추가했을 뿐인데 결과 행이 줄어든 것이다. Hibernate 6.6 Query Language Guide의 "Implicit association joins" 절은 묵시적 조인이 항상 내부 조인으로 취급되고, 같은 묵시적 조인이 여러 번 나와도 같은 SQL 조인 하나를 가리킨다고 적는다. 부서가 없는 직원도 목록에 있어야 한다면 묵시적 조인을 쓰지 말고 <code>leftJoin(employee.department, department)</code>로 명시한 뒤 <code>department.name</code>을 선택해야 한다. 경로 표현식은 편리하지만 "조인의 종류"라는 결정을 프레임워크에 넘긴다는 점을 기억해 두자.</p>
+
+<h3>세타 조인: 연관관계 없이 값으로 엮기</h3>
+
+<p>연관관계로 매핑되지 않은 두 엔티티도 값이 같다는 조건만으로 엮을 수 있다. 직원 이름과 부서의 부서장 이름이 같은 조합, 즉 "각 부서의 부서장인 직원"을 찾아 보자. <code>from</code>에 엔티티 둘을 나열하고 조건을 where에 쓴다. 이런 조인을 세타 조인(theta join)이라 부른다.</p>
+
+<pre><code class="language-java">qf.select(employee.name, department.name)
+  .from(employee, department)
+  .where(employee.name.eq(department.managerName))
+  .fetch();</code></pre>
+
+<pre data-label="JPQL, SQL, 실행 결과"><code class="language-text">select employee.name, department.name
+from Employee employee, Department department
+where employee.name = department.managerName
+
+select e1_0.name, d1_0.name
+from Employee e1_0, Department d1_0
+where e1_0.name=d1_0.managerName
+
+[lee, 개발]
+[choi, 영업]</code></pre>
+
+<p>SQL은 쉼표로 테이블을 나열하는 형태다. 의미상으로는 직원 5행과 부서 3행의 조합 15개를 만들고, 그중 이름 조건을 만족하는 (lee, 개발)과 (choi, 영업)만 남긴 것이다. 앞에서 본 대로 MySQL 옵티마이저는 내부 조인을 쉼표 목록과 WHERE 조건으로 바꿔 다루므로, 이 쿼리는 실행 계획 관점에서 on 조건을 가진 내부 조인과 같은 부류다. 조건 열에 인덱스가 없으면 MySQL 8.0.18 이상은 해시 조인을 고려할 수 있다.</p>
+
+<p>세타 조인에는 분명한 한계가 있다. 쉼표 조인에는 "짝이 없는 행도 남겨라"라고 말할 자리가 없다. 부서장 han이 직원 목록에 없는 인사 부서는 결과에서 그냥 사라진다. 부서 목록을 기준으로 부서장이 있으면 이름을, 없으면 NULL을 보여 주고 싶다면 외부 조인이 필요하고, 외부 조인의 조건은 on 절에 써야 한다. 그래서 다음 두 절은 on 절이다.</p>
+
+<h3>on 절 ①: 외부 조인에서 조인 대상 거르기</h3>
+
+<p>on 절은 JPA 2.1에서 추가되었다(명세의 <code>Join.on</code> 메서드에 <code>@since 2.1</code>이 붙어 있다). 첫 번째 용도는 조인 대상을 줄이는 것이다. 모든 직원을 보여 주되, 부서 정보는 개발 부서일 때만 붙이고 싶다고 하자. 같은 조건을 on에 쓴 쿼리와 where에 쓴 쿼리를 나란히 실행해 본다.</p>
+
+<pre><code class="language-java">// (A) 조건을 on 절에
+qf.select(employee.name, department.name)
+  .from(employee)
+  .leftJoin(employee.department, department).on(department.name.eq("개발"))
+  .fetch();
+
+// (B) 같은 조건을 where 절에
+qf.select(employee.name, department.name)
+  .from(employee)
+  .leftJoin(employee.department, department)
+  .where(department.name.eq("개발"))
+  .fetch();</code></pre>
+
+<pre data-label="(A)의 JPQL과 SQL"><code class="language-text">select employee.name, department.name
+from Employee employee
+  left join employee.department as department with department.name = ?1
+
+select e1_0.name, d1_0.name
+from Employee e1_0
+left join Department d1_0
+    on d1_0.id=e1_0.department_id
+    and d1_0.name=?</code></pre>
+
+<pre data-label="(B)의 SQL"><code class="language-sql">select e1_0.name, d1_0.name
+from Employee e1_0
+left join Department d1_0
+    on d1_0.id=e1_0.department_id
+where d1_0.name=?</code></pre>
+
+<div class="table-wrap"><table><thead><tr><th>직원</th><th>(A) on 절</th><th>(B) where 절</th></tr></thead><tbody>
+<tr><td>kim</td><td>[kim, 개발]</td><td>[kim, 개발]</td></tr>
+<tr><td>lee</td><td>[lee, 개발]</td><td>[lee, 개발]</td></tr>
+<tr><td>park</td><td>[park, null]</td><td>(없음)</td></tr>
+<tr><td>choi</td><td>[choi, null]</td><td>(없음)</td></tr>
+<tr><td>jung</td><td>[jung, null]</td><td>(없음)</td></tr>
+</tbody></table></div>
+
+<p>먼저 JPQL의 낯선 키워드부터 설명한다. Querydsl 코드는 <code>on</code>인데 JPQL에는 <code>with</code>가 찍혔다. <code>new JPAQueryFactory(em)</code>은 <code>EntityManager</code>의 구현체를 보고 JPQL 템플릿을 고르는데, 이번 실험에서 고른 템플릿은 <code>Hibernate5Templates</code>였다(Hibernate 6.6인데도 그렇다). 이 클래스의 <code>isWithForOn()</code>은 <code>true</code>를 반환하고, <code>JPQLSerializer</code>는 이 값을 보고 조인 조건 앞에 <code>with</code>를 쓴다. 표준 템플릿인 <code>JPQLTemplates.DEFAULT</code>를 넘겨 <code>new JPAQueryFactory(JPQLTemplates.DEFAULT, em)</code>으로 만들면 같은 코드가 <code>on department.name = ?1</code>로 직렬화되는 것을 확인했다. Hibernate 6.6 Query Language Guide는 <code>with</code>가 Hibernate 고유의 키워드이고 JPQL은 <code>on</code>을 쓴다고 밝히면서, 둘 중 어느 쪽으로 쓴 조건이든 생성된 SQL의 on 절에 추가된다고 설명한다. SQL을 보면 실제로 외래 키 조건 뒤에 <code>and d1_0.name=?</code>가 붙었다.</p>
+
+<p>이제 두 결과가 왜 다른지 행 단위로 추적한다. (A)에서 on 조건은 <code>d1_0.id=e1_0.department_id and d1_0.name='개발'</code> 전체다. 앞의 중첩 루프 그림대로 직원 한 명씩 짝을 찾는다. kim과 lee는 개발 부서와 짝이 맞는다. park의 부서는 영업이라 외래 키 조건은 맞지만 이름 조건이 틀리므로 짝이 없다. 외부 조인은 짝이 없는 왼쪽 행을 버리지 않으므로 park은 <code>[park, null]</code>로 남는다. choi도 같고, jung은 애초에 부서가 없어 짝이 없다. 그래서 (A)는 다섯 행이다.</p>
+
+<p>(B)에서 on 조건은 외래 키 조건뿐이다. 조인 단계가 끝난 중간 결과는 <code>[kim, 개발]</code>, <code>[lee, 개발]</code>, <code>[park, 영업]</code>, <code>[choi, 영업]</code>, <code>[jung, null]</code> 다섯 행이다. 그다음 where 조건 <code>d1_0.name='개발'</code>이 이 다섯 행 위에서 평가된다. park과 choi는 거짓이고, jung의 부서 이름은 NULL이므로 비교 결과는 참도 거짓도 아닌 UNKNOWN이다. WHERE는 참인 행만 통과시키므로 셋 다 사라진다. 결국 (B)는 외부 조인을 썼는데도 내부 조인과 같은 결과를 낸다.</p>
+
+<p>MySQL은 이 상황을 아예 규칙으로 갖고 있다. "Outer Join Simplification" 절에 따르면 WHERE 조건이 null 거부(null-rejected) 조건, 즉 NULL로 채워진 행에 대해 항상 FALSE나 UNKNOWN이 되는 조건이면 옵티마이저는 외부 조인을 내부 조인으로 바꾼다. 문서가 드는 예에는 <code>T2.B IS NOT NULL</code>, <code>T2.B > 3</code> 같은 조건이 있고, (B)의 <code>d1_0.name = ?</code>도 같은 부류다. 결과가 같을 뿐 아니라 실행 계획에서도 내부 조인이 된다. 코드에 <code>leftJoin</code>이라고 써 놓고 where에서 조인 대상 열을 비교하는 쿼리는, 읽는 사람에게 "부서 없는 직원도 나온다"는 잘못된 인상을 준다.</p>
+
+<p>내부 조인이라면 이야기가 단순하다. 같은 조건을 <code>join(...).on(...)</code>으로 쓰면 SQL은 <code>join Department d1_0 on d1_0.id=e1_0.department_id and d1_0.name=?</code>가 되고, 결과는 <code>[kim, 개발]</code>, <code>[lee, 개발]</code> 두 행으로 where 버전과 같다. 내부 조인은 짝이 없는 행을 어차피 버리므로 조건을 어느 단계에서 적용하든 남는 행이 같고, 앞에서 본 대로 MySQL은 내부 조인의 on 조건을 WHERE로 옮겨 다룬다. 정리하면 이렇다. 내부 조인이면 익숙한 where 절을 쓰고, 외부 조인에서 "조인 대상만" 줄이고 왼쪽 행은 그대로 보존하고 싶을 때 on 절을 쓴다.</p>
+
+<p>on 절은 외래 키 조건을 대체하지 않고 거기에 더해진다는 점도 확인해 두자. 연관 경로로 조인하면서 on에 연관과 무관한 조건을 쓰면 두 조건이 <code>and</code>로 묶인다.</p>
+
+<pre><code class="language-java">qf.select(employee.name, department.name)
+  .from(employee)
+  .leftJoin(employee.department, department).on(employee.name.eq(department.managerName))
+  .fetch();</code></pre>
+
+<pre data-label="SQL과 실행 결과"><code class="language-text">left join Department d1_0
+    on d1_0.id=e1_0.department_id
+    and e1_0.name=d1_0.managerName
+
+[kim, null]
+[lee, 개발]
+[park, null]
+[choi, 영업]
+[jung, null]</code></pre>
+
+<p>"자기 부서의 부서장인 경우에만 부서 이름을 붙인다"는 의미가 되었다. 의도한 것이 "부서장 이름으로 부서를 찾는다"였다면 이 쿼리는 틀렸다. 그 의도에는 외래 키 조건이 끼어들면 안 되고, 그것이 다음 절의 주제다.</p>
+
+<x-visual id="querydsl-03-on-vs-where" title="외부 조인에서 on 조건과 where 조건이 적용되는 단계" kind="단계 비교 다이어그램" ratio="16:9">
+<x-hint>같은 조건을 on에 두면 조인 단계에서 짝 찾기 기준이 되어 왼쪽 행이 NULL로 보존되고, where에 두면 조인이 끝난 뒤 NULL 행까지 걸러져 내부 조인과 같아진다는 것을 두 경로로 보여 준다.</x-hint>
+<x-prompt>가로로 두 개의 레인이 있는 다이어그램. 위 레인 제목 "on 절에 조건", 아래 레인 제목 "where 절에 조건". 각 레인은 왼쪽에서 오른쪽으로 세 개의 상자: "직원 5행" → "LEFT JOIN 단계" → "최종 결과". 위 레인의 "LEFT JOIN 단계" 상자 안에 "짝 찾기: FK 일치 AND 부서명='개발'"이라고 쓰고, 최종 결과 상자에 다섯 줄 "kim 개발 / lee 개발 / park NULL / choi NULL / jung NULL"을 표시하되 NULL 칸은 회색. 아래 레인은 "LEFT JOIN 단계" 상자 안에 "짝 찾기: FK 일치만", 그 뒤에 추가 상자 "WHERE 부서명='개발'"이 있고 거기서 park, choi, jung 행에 빨간 X 표시, 최종 결과 상자에는 "kim 개발 / lee 개발" 두 줄만. 아래 레인 하단에 작은 주석 "null 거부 조건 → 내부 조인으로 단순화". 평면적인 기술 다이어그램 스타일, 흰 배경.</x-prompt>
+<x-caption>on 조건은 짝을 찾는 기준이라 왼쪽 행을 보존하고, where 조건은 조인 결과 전체를 거르므로 NULL로 채워진 행까지 제거한다.</x-caption>
+</x-visual>
+
+<h3>on 절 ②: 연관관계 없는 엔티티를 외부 조인하기</h3>
+
+<p>on 절의 두 번째 용도는 연관관계가 없는 엔티티를 조인하는 것이다. 세타 조인으로는 할 수 없었던 "모든 부서를 보여 주고, 부서장 이름과 같은 이름의 직원이 있으면 붙이기"를 해 보자. 핵심은 조인 메서드에 인자를 하나만 주는 것이다.</p>
+
+<pre><code class="language-java">qf.select(department.name, employee.name)
+  .from(department)
+  .leftJoin(employee).on(employee.name.eq(department.managerName))
+  .fetch();</code></pre>
+
+<pre data-label="JPQL, SQL, 실행 결과"><code class="language-text">select department.name, employee.name
+from Department department
+  left join Employee employee with employee.name = department.managerName
+
+select d1_0.name, e1_0.name
+from Department d1_0
+left join Employee e1_0
+    on e1_0.name=d1_0.managerName
+
+[개발, lee]
+[영업, choi]
+[인사, null]</code></pre>
+
+<p>앞 절의 마지막 예제와 비교하면 차이가 선명하다. 그때는 <code>leftJoin(employee.department, department)</code>로 연관 경로를 주었기 때문에 JPQL이 <code>left join employee.department</code>가 되었고, Hibernate가 매핑에서 외래 키 조건을 꺼내 붙였다. 이번에는 <code>leftJoin(employee)</code>로 루트 엔티티 경로 하나만 주었다. 그러자 JPQL이 엔티티 이름으로 조인하는 <code>left join Employee employee</code>가 되었고, SQL의 on에는 우리가 쓴 조건만 있다. 인사 부서는 짝이 없어 <code>[인사, null]</code>로 보존되었다. 같은 <code>join(EntityPath<P>)</code> 오버로드가 인자에 따라 두 가지 다른 조인이 되는 것인데, 직렬화기가 구분하는 기준은 경로에 부모가 있느냐다. <code>employee.department</code>는 부모 경로 <code>employee</code>를 가진 연관 경로이고, <code>QEmployee.employee</code>는 부모가 없는 루트 경로다.</p>
+
+<p>이 문법이 표준인지는 명세 버전에 따라 답이 다르다. Jakarta Persistence 3.1의 조인 문법은 <code>join ::= join_spec join_association_path_expression [AS] identification_variable [join_condition]</code>이어서, 조인 대상은 반드시 연관 경로여야 한다. 엔티티 이름으로 조인하는 문법은 3.2에서 <code>range_join ::= join_spec range_variable_declaration [join_condition]</code>으로 추가되었다. 이번 실험의 Hibernate 6.6.53은 <code>jakarta.persistence-api</code> 3.1.0에 의존하므로, 여기서 동작한 것은 Hibernate의 HQL 확장이다. Hibernate 6.6 Query Language Guide는 이것을 "explicit root join"이라 부르고 SQL의 ANSI 조인처럼 동작한다고 설명한다. 참고로 Hibernate ORM 7.2.24는 <code>jakarta.persistence-api</code> 3.2.0에 의존한다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>사내 전화번호부와 명함첩</strong><p>연관 경로 조인은 사내 전화번호부에서 "이 사람의 소속 팀"을 찾는 일과 같다. 소속 팀 칸이 이미 인쇄되어 있으니(외래 키) 따로 기준을 말할 필요가 없다. 연관 없는 엔티티 조인은 명함첩과 전화번호부를 나란히 펴 놓고 "이름이 같은 사람"을 짝짓는 일이다. 짝짓는 기준을 내가 직접 정해야 하고, 그 기준을 말하는 자리가 on 절이다. 비유가 깨지는 지점도 있다. 사람은 이름이 같으면 동명이인을 의심하지만 SQL은 의심하지 않는다. 이름이 같은 직원이 둘이면 부서 한 행이 두 행으로 불어난다.</p></aside>
+
+<h3>페치 조인: 같은 SQL 조인, 다른 결과</h3>
+
+<p>지금까지의 조인은 조회 결과의 "행"을 결정했다. 페치 조인(fetch join)은 결과의 행이 아니라 "결과로 돌아온 엔티티 객체가 무엇을 들고 있는가"를 결정한다. 차이를 보려면 페치 조인이 없을 때 무슨 일이 생기는지부터 봐야 한다. 직원 전체를 조회한 뒤 각자의 부서 이름을 출력해 보자.</p>
+
+<pre><code class="language-java">em.clear();
+List<Employee> list = qf.selectFrom(employee).fetch();
+for (Employee e : list) {
+    System.out.println("-- access " + e.getName());
+    Department d = e.getDepartment();
+    System.out.println(e.getName() + " " + (d == null ? null : d.getName()));
+}</code></pre>
+
+<pre data-label="실행 로그(SQL은 요약)"><code class="language-text">select e1_0.id, e1_0.age, e1_0.department_id, e1_0.name from Employee e1_0
+-- access kim
+select d1_0.id, d1_0.managerName, d1_0.name from Department d1_0 where d1_0.id=?
+kim 개발
+-- access lee
+lee 개발
+-- access park
+select d1_0.id, d1_0.managerName, d1_0.name from Department d1_0 where d1_0.id=?
+park 영업
+-- access choi
+choi 영업
+-- access jung
+jung null</code></pre>
+
+<p>첫 SQL은 직원 테이블만 읽었고 부서 열은 가져오지 않았다. <code>FetchType.LAZY</code>이므로 Hibernate는 <code>department_id</code> 값만 보고 부서 자리에 프록시 객체를 넣어 둔다. 이 프록시의 클래스를 출력해 보면 <code>demo.Department$HibernateProxy</code>이고, <code>PersistenceUnitUtil.isLoaded</code>는 <code>false</code>를 돌려준다. kim의 부서 이름을 읽는 순간 프록시가 초기화되며 두 번째 SQL이 나간다. lee는 kim과 같은 개발 부서이므로 SQL이 나가지 않는다. 영속성 컨텍스트는 식별자 하나에 객체 하나만 두기 때문에, 같은 <code>department_id</code>를 가진 직원들은 같은 프록시를 공유하고 그 프록시는 이미 초기화되었다. park에서 영업 부서를 위해 SQL이 한 번 더 나간다. 결국 SQL은 1 + (서로 다른 부서 수) = 3번이다. 직원 1,000명이 서로 다른 부서 200곳에 흩어져 있다면 201번이 된다. 이것이 JPA 활용 권에서 다룬 N+1 문제다.</p>
+
+<p>페치 조인을 쓰면 이렇게 된다. 일반 조인 뒤에 <code>fetchJoin()</code>을 붙인다.</p>
+
+<pre><code class="language-java">em.clear();
+Employee kim = qf.selectFrom(employee)
+        .join(employee.department, department).fetchJoin()
+        .where(employee.name.eq("kim"))
+        .fetchOne();</code></pre>
+
+<pre data-label="JPQL, SQL, 확인 결과"><code class="language-text">select employee
+from Employee employee
+  inner join fetch employee.department as department
+where employee.name = ?1
+
+select e1_0.id, e1_0.age,
+       d1_0.id, d1_0.managerName, d1_0.name,
+       e1_0.name
+from Employee e1_0
+join Department d1_0 on d1_0.id=e1_0.department_id
+where e1_0.name=?
+
+class=demo.Department loaded=true</code></pre>
+
+<p>SQL의 조인 부분은 기본 조인 절에서 본 것과 글자 하나 다르지 않다. 달라진 것은 select 목록이다. 일반 조인의 SQL은 <code>e1_0.*</code>만 가져왔지만 페치 조인의 SQL은 <code>d1_0.id</code>, <code>d1_0.managerName</code>, <code>d1_0.name</code>까지 가져온다. Hibernate는 결과 행 하나에서 직원 엔티티와 부서 엔티티를 함께 만들어 둘 다 영속성 컨텍스트에 등록하고, 직원의 <code>department</code> 필드에 프록시가 아닌 실제 <code>Department</code> 객체를 넣는다. 출력된 클래스 이름이 <code>demo.Department</code>이고 <code>isLoaded</code>가 <code>true</code>인 이유다. 이후 <code>kim.getDepartment().getName()</code>은 SQL 없이 메모리에서 끝난다.</p>
+
+<p>명세 4.4.5.3절은 페치 조인을 "쿼리 실행의 부수 효과로 연관이나 요소 컬렉션을 가져오게 하는 것"이라고 정의한다. 조회 대상(select 절)은 여전히 <code>employee</code> 하나이고, 부서는 그 부수 효과로 채워질 뿐이다. 같은 절은 페치 조인의 오른쪽에 식별 변수를 지정하는 것을 허용하지 않는다고도 적는데, Querydsl은 별칭을 받아 <code>as department</code>를 출력하고 Hibernate는 이를 받아들인다. Hibernate 가이드도 페치 조인된 엔티티에는 중첩 페치 조인을 위한 경우가 아니면 식별 변수를 붙이지 않는 것이 가장 좋다고 권한다. 이유는 다음 절에서 실험으로 본다.</p>
+
+<p>페치 조인에도 내부와 외부의 구분이 그대로 적용된다. <code>join(...).fetchJoin()</code>은 내부 조인이므로 부서 없는 jung은 결과에서 빠진다. 직원 전체가 필요하면 <code>leftJoin(employee.department, department).fetchJoin()</code>을 쓴다. 이때 JPQL은 <code>left join fetch employee.department as department</code>, SQL은 <code>left join Department d1_0 on d1_0.id=e1_0.department_id</code>가 되고, 다섯 명이 모두 SQL 한 번으로 조회된다. 이번 실행에서 jung의 부서는 <code>null</code>로 출력되었다. Querydsl 내부에서 <code>fetchJoin()</code>은 <code>JPAQueryMixin.fetchJoin()</code>을 거쳐 <code>addJoinFlag(FETCH)</code>를 호출하고, 이 플래그는 앞에서 본 "지금 만들고 있는 조인"의 <code>joinFlags</code>에 들어간다. 그래서 <code>fetchJoin()</code>은 반드시 페치할 조인 바로 뒤에 써야 한다.</p>
+
+<x-visual id="querydsl-03-fetch-join-context" title="일반 조인과 페치 조인이 영속성 컨텍스트에 남기는 것" kind="메모리 구조 비교" ratio="16:9">
+<x-hint>두 쿼리의 SQL 조인은 같지만, 일반 조인 뒤에는 직원 객체의 department 필드가 초기화되지 않은 프록시를 가리키고, 페치 조인 뒤에는 실제 부서 엔티티를 가리킨다는 것을 나란히 보여 준다.</x-hint>
+<x-prompt>좌우 2분할 그림. 왼쪽 제목 "일반 조인 / 조인 없음", 오른쪽 제목 "페치 조인". 각 쪽 위에는 SQL 결과 행을 나타내는 표 막대가 있는데, 왼쪽은 "Employee 열만", 오른쪽은 "Employee 열 + Department 열"이라고 라벨. 아래에는 "영속성 컨텍스트"라는 큰 둥근 사각형. 왼쪽 영속성 컨텍스트 안에 "Employee kim" 객체 상자가 있고 그 department 필드에서 점선 화살표가 "Department$HibernateProxy (미초기화)"라는 회색 상자로 향한다. 오른쪽 영속성 컨텍스트 안에는 "Employee kim" 상자와 "Department 개발" 상자가 모두 실선으로 있고 department 필드에서 실선 화살표가 "Department 개발"로 향한다. 왼쪽 하단 주석 "getName() 시 추가 SQL", 오른쪽 하단 주석 "추가 SQL 없음". 깔끔한 기술 다이어그램, 흰 배경.</x-prompt>
+<x-caption>SQL의 조인 구문은 같아도, 페치 조인은 select 목록에 연관 엔티티의 열을 포함시키고 그 엔티티를 영속성 컨텍스트에 함께 등록한다.</x-caption>
+</x-visual>
+
+<h3>페치 조인의 경계: on 절, 컬렉션 필터, 중복, 페이징</h3>
+
+<p>페치 조인은 강력한 만큼 경계가 분명하다. 첫 번째 경계는 on 절이다. 개발 부서만 페치하려고 <code>fetchJoin()</code> 뒤에 on을 붙여 보면 실행 시점에 예외가 난다.</p>
+
+<pre><code class="language-java">qf.selectFrom(employee)
+  .join(employee.department, department).fetchJoin()
+  .on(department.name.eq("개발"))
+  .fetch();</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">java.lang.IllegalArgumentException: org.hibernate.query.SemanticException:
+Fetch join has a 'with' clause (use a filter instead) [select employee
+from Employee employee
+  inner join fetch employee.department as department with department.name = ?1]</code></pre>
+
+<p>Querydsl은 컴파일도 직렬화도 막지 않았다. 거부한 것은 Hibernate가 HQL을 해석하는 단계다. 같은 버전에서 HQL을 직접 써서 <code>with</code> 대신 <code>on</code>으로 바꿔 보아도 같은 <code>SemanticException</code>이 났다. 명세의 문법을 보면 이 거부는 자연스럽다. Jakarta Persistence 3.1의 <code>fetch_join ::= join_spec FETCH join_association_path_expression</code>에는 일반 조인과 달리 <code>[join_condition]</code>이 없다. 3.2의 문법도 이 부분은 같다.</p>
+
+<p>두 번째 경계는 컬렉션 페치 조인에 거는 필터다. on은 막혔지만 where는 막히지 않는다. 부서를 조회하면서 직원 컬렉션을 페치하고, where로 30세 초과 직원만 남겨 보자.</p>
+
+<pre><code class="language-java">em.clear();
+List<Department> r = qf.selectFrom(department)
+        .join(department.employees, employee).fetchJoin()
+        .where(employee.age.gt(30))
+        .fetch();
+r.forEach(d -> System.out.println(d.getName() + " size=" + d.getEmployees().size()));
+Department again = em.find(Department.class, r.get(0).getId());
+System.out.println("em.find same=" + (again == r.get(0)) + " size=" + again.getEmployees().size());</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">개발 size=1
+영업 size=1
+em.find same=true size=1</code></pre>
+
+<p>개발 부서에는 kim과 lee 두 명이 있지만, 컬렉션에는 lee 한 명만 들어 있다. 문제는 이 컬렉션이 "필터링된 결과"라는 표시 없이 엔티티의 <code>employees</code> 필드에 초기화된 상태로 들어간다는 것이다. 그 뒤에 <code>em.find</code>로 같은 부서를 다시 찾으면 영속성 컨텍스트에 있는 같은 객체가 돌아오고(<code>same=true</code>), 컬렉션 크기는 여전히 1이다. 이 예제의 <code>employees</code>는 <code>mappedBy</code> 쪽이라 컬렉션 자체가 DB에 쓰이지는 않지만, 같은 영속성 컨텍스트 안에서 이 컬렉션을 읽는 모든 코드는 개발 부서 인원이 1명이라는 잘못된 사실을 보게 된다. Hibernate 6.6 Query Language Guide가 페치 조인된 엔티티에 제약을 거는 것을 "HQL이 막지는 않지만 대개 나쁜 생각"이라고 하는 이유가 이것이다. 일부 직원만 필요하면 엔티티 그래프가 아니라 직원을 조회 대상으로 삼거나, 04회에서 다룰 DTO 프로젝션을 쓰는 것이 맞다.</p>
+
+<p>세 번째 경계는 컬렉션 페치 조인이 만드는 중복이다. 필터 없이 부서와 직원 컬렉션을 페치 조인하면 SQL 결과는 직원 수만큼인 4행(kim, lee, park, choi)이고, 각 행에 부서 열이 반복된다. 명세 4.4.5.3절은 이 상황에서 부서 엔티티 참조가 직원 수만큼 반복해서 반환된다고 설명한다. 그런데 Hibernate 6.6.53에서 실행해 보면 <code>fetch()</code>가 돌려준 리스트의 크기는 2이고 개발과 영업이 한 번씩만 들어 있다. Hibernate 6.6 Query Language Guide의 "Duplicate removal" 절은 Hibernate 6부터 페치 조인으로 생긴 중복 결과를 엔티티를 만든 뒤 메모리에서 자동으로 제거하며, 이 목적으로 <code>distinct</code>를 쓸 필요가 없다고 밝힌다. 거꾸로 말하면 Hibernate 6 이전에는 이 중복을 개발자가 직접 제거해야 했다는 뜻이다.</p>
+
+<p>네 번째 경계는 페이징이다. 02회에서 본 <code>offset</code>과 <code>limit</code>를 컬렉션 페치 조인에 붙이면 Hibernate는 다음 경고를 남긴다.</p>
+
+<pre data-label="실행 로그"><code class="language-text">WARN: HHH90003004: firstResult/maxResults specified with collection fetch; applying in memory</code></pre>
+
+<p>이어서 실행된 SQL에는 행 수 제한이 전혀 없었다. 데이터베이스에서 조인 결과 전체를 가져온 뒤 메모리에서 잘라 낸다는 뜻이다. SQL의 행 단위 페이징은 "직원 행"을 자르는데, 사용자가 원하는 것은 "부서 엔티티"를 자르는 것이라 SQL로는 정확히 표현할 수 없기 때문이다. 이번 실행의 결과 크기는 요청한 대로 1이었지만, 부서가 수만 개라면 그 전부가 메모리로 올라온다. 이 문제를 피하는 배치 페치 크기 같은 대안은 JPA 활용 권에서 다뤘다. 마지막으로, 명세와 Hibernate 가이드 모두 페치 조인을 서브 쿼리 안에서 쓰는 것을 허용하지 않는다. 서브 쿼리의 결과는 엔티티 그래프가 아니라 값이기 때문이다.</p>
+<h3>서브 쿼리: JPAExpressions와 두 번째 별칭</h3>
+
+<p>서브 쿼리(subquery)는 쿼리 안에 들어간 또 하나의 쿼리다. "나이가 가장 많은 직원"을 찾으려면 먼저 최대 나이를 구하고, 그 값과 같은 직원을 골라야 한다. 두 단계를 한 SQL로 표현하는 수단이 서브 쿼리다. Querydsl에서는 <code>JPAExpressions</code>의 정적 메서드로 서브 쿼리를 만들고, 서브 쿼리 안에서 쓸 Q 타입은 바깥과 다른 별칭으로 새로 만든다.</p>
+
+<pre><code class="language-java">QEmployee sub = new QEmployee("sub");
+
+qf.selectFrom(employee)
+  .where(employee.age.eq(
+          JPAExpressions.select(sub.age.max()).from(sub)))
+  .fetch();</code></pre>
+
+<pre data-label="JPQL, SQL, 실행 결과"><code class="language-text">select employee
+from Employee employee
+where employee.age = (select max(sub.age)
+from Employee sub)
+
+select e1_0.id, e1_0.age, e1_0.department_id, e1_0.name
+from Employee e1_0
+where e1_0.age=(
+    select max(e2_0.age) from Employee e2_0
+)
+
+choi 40</code></pre>
+
+<p><code>JPAExpressions.select(...)</code>가 돌려주는 것은 실행할 수 있는 쿼리가 아니다. 반환 타입은 <code>JPQLQuery<T></code>이지만 실제 클래스를 출력하면 <code>com.querydsl.jpa.JPASubQuery</code>이고, 이 객체는 <code>SubQueryExpression</code>을 구현한다. <code>EntityManager</code>를 갖고 있지 않으므로 직접 <code>fetch()</code>를 부르면 <code>UnsupportedOperationException</code>이 난다(실행해서 확인했다). 서브 쿼리 객체는 바깥 쿼리의 where 절 표현식 트리에 끼워 넣는 "부품"이다. 바깥 쿼리를 직렬화할 때 <code>JPQLSerializer</code>가 이 부품을 만나면 괄호로 감싼 JPQL 조각으로 바꾸고, 서브 쿼리 안의 상수도 바깥 쿼리와 같은 파라미터 목록에 이어서 번호를 매긴다. 바깥 where에 <code>employee.name.ne("x")</code>를 함께 걸어 보면 바깥 조건이 <code>?1</code>, 서브 쿼리 조건이 <code>?2</code>로 직렬화된다.</p>
+
+<p>비교 연산자에 따라 서브 쿼리의 결과가 몇 행이어야 하는지가 정해진다. <code>eq</code>, <code>goe</code>, <code>gt</code> 같은 단일 값 비교의 오른쪽에는 정확히 한 값을 내는 서브 쿼리가 와야 하고, 여러 값을 내는 서브 쿼리에는 <code>in</code>을 쓴다. 두 예를 더 실행해 보자.</p>
+
+<pre><code class="language-java">// 평균 나이 이상인 직원
+qf.selectFrom(employee)
+  .where(employee.age.goe(JPAExpressions.select(sub.age.avg()).from(sub)))
+  .fetch();
+
+// 30세 초과인 직원들의 나이 목록에 포함되는 나이를 가진 직원
+qf.selectFrom(employee)
+  .where(employee.age.in(JPAExpressions.select(sub.age).from(sub).where(sub.age.gt(30))))
+  .fetch();</code></pre>
+
+<pre data-label="SQL(서브 쿼리 부분)과 실행 결과"><code class="language-text">where e1_0.age>=(select avg(cast(e2_0.age as float(53))) from Employee e2_0)
+choi 40
+jung 35
+
+where e1_0.age in (select e2_0.age from Employee e2_0 where e2_0.age>?)
+lee 31
+choi 40
+jung 35</code></pre>
+
+<p>평균 쿼리의 SQL에는 우리가 쓰지 않은 <code>cast(... as float(53))</code>가 있다. 명세 4.8.5절은 <code>AVG</code>의 결과 타입을 <code>Double</code>로 정하고, Hibernate는 H2용 SQL을 만들면서 정수 열인 나이를 <code>float(53)</code>, 즉 배정밀도 부동소수 타입으로 변환해 평균을 구하게 했다. 나이 합계는 25 + 31 + 28 + 40 + 35 = 159이고 평균은 31.8이다. 31.8 이상인 직원은 choi(40)와 jung(35)이고, lee(31)는 빠진다. 만약 평균이 정수로 잘려 31이 되었다면 lee도 결과에 들어갔을 것이다. 타입 하나가 결과 행을 바꾸는 예다.</p>
+
+<h4>상관 서브 쿼리: 바깥 행을 참조하는 서브 쿼리</h4>
+
+<p>"자기 부서에서 나이가 가장 많은 직원"은 서브 쿼리가 바깥 쿼리의 현재 행을 참조해야 한다. 이런 서브 쿼리를 상관 서브 쿼리(correlated subquery)라 한다.</p>
+
+<pre><code class="language-java">qf.selectFrom(employee)
+  .where(employee.age.eq(
+          JPAExpressions.select(sub.age.max())
+                        .from(sub)
+                        .where(sub.department.eq(employee.department))))
+  .fetch();</code></pre>
+
+<pre data-label="SQL과 실행 결과"><code class="language-text">where e1_0.age=(
+    select max(e2_0.age) from Employee e2_0
+    where e2_0.department_id=e1_0.department_id
+)
+
+lee 31
+choi 40</code></pre>
+
+<p>서브 쿼리의 <code>e1_0.department_id</code>가 바깥 쿼리의 별칭을 가리킨다. 의미상으로는 바깥 직원 행마다 서브 쿼리를 다시 평가한다. kim(개발)의 차례에는 개발 부서의 최대 나이 31을 구하고 25와 비교하므로 탈락한다. lee는 31 = 31로 통과한다. park과 choi는 영업 부서의 최대 나이 40과 비교되어 choi만 통과한다. jung의 차례에는 서브 쿼리의 조건이 <code>e2_0.department_id = NULL</code>이 되는데, NULL과의 비교는 UNKNOWN이므로 서브 쿼리는 아무 행도 고르지 못하고, 행이 없는 집합의 <code>max</code>는 NULL이다. 바깥 조건 <code>35 = NULL</code>도 UNKNOWN이라 jung은 빠진다. "의미상 행마다 다시 평가한다"는 것은 결과를 정의하는 방식이고, 실제 실행 계획은 옵티마이저가 정한다. MySQL은 <code>IN</code>과 <code>EXISTS</code> 서브 쿼리를 세미 조인(semijoin)으로 변환해 테이블 풀아웃, 중복 제거, 첫 일치 같은 전략 중에서 고를 수 있다고 MySQL 8.0 Reference Manual의 "Optimizing IN and EXISTS Subquery Predicates with Semijoin Transformations" 절이 설명한다. 실제 계획은 <code>EXPLAIN</code>으로 확인해야 한다.</p>
+
+<h4>왜 별칭을 새로 만들어야 하는가</h4>
+
+<p>이제 처음의 규칙, "서브 쿼리 안에서는 다른 별칭의 Q 타입을 쓴다"로 돌아가 보자. 바깥과 같은 <code>employee</code>를 서브 쿼리에 그대로 쓰면 어떻게 될까.</p>
+
+<pre><code class="language-java">qf.selectFrom(employee)
+  .where(employee.age.eq(JPAExpressions.select(employee.age.max()).from(employee)))
+  .fetch();</code></pre>
+
+<pre data-label="JPQL, SQL, 실행 결과"><code class="language-text">select employee
+from Employee employee
+where employee.age = (select max(employee.age)
+from Employee employee)
+
+where e1_0.age=(select max(e2_0.age) from Employee e2_0)
+
+choi 40</code></pre>
+
+<p>오류 없이 같은 결과가 나왔다. 명세 4.4.2절의 범위 규칙 때문이다. 명세는 식별 변수가 그것을 선언한 쿼리(또는 서브 쿼리)에 속하고, 같은 이름의 식별 변수를 따로 선언하지 않은 하위 서브 쿼리에서도 보인다고 정한다. 서브 쿼리가 <code>from Employee employee</code>로 같은 이름을 다시 선언했으므로, 서브 쿼리 안의 <code>employee</code>는 바깥 것을 가린(shadow) 새 변수다. Hibernate가 서브 쿼리 쪽에 별도의 SQL 별칭 <code>e2_0</code>을 붙인 것이 그 증거다. 최대 나이를 구하는 쿼리는 원래 바깥 행을 참조하지 않으므로 우연히 결과가 맞았다.</p>
+
+<p>문제는 상관 서브 쿼리다. 위의 "부서별 최대 나이" 조건 <code>sub.department.eq(employee.department)</code>를 별칭 하나로 쓰려고 하면, 서브 쿼리 안의 <code>employee.department</code>는 가려진 안쪽 변수를 가리키므로 "안쪽 직원의 부서 = 안쪽 직원의 부서"라는 무의미한 조건이 된다. 그리고 Querydsl의 수준에서도 둘을 구별할 방법이 없다. 경로 객체의 동등성은 별칭 문자열로 정해진다. <code>new QEmployee("employee").equals(QEmployee.employee)</code>를 실행하면 <code>true</code>이고 해시 코드도 같다. 같은 별칭을 가진 두 경로는 Querydsl에게 같은 경로이고, 직렬화하면 같은 문자열이 된다. 바깥 행과 안쪽 행을 구별하는 유일한 수단이 이름이므로, 서브 쿼리용 Q 타입을 <code>new QEmployee("sub")</code>처럼 다른 이름으로 만들어야 한다.</p>
+
+<h3>서브 쿼리의 제약: select 절은 되고 from 절은 안 되는 이유</h3>
+
+<p>Jakarta Persistence 3.1 명세 4.6.16절의 첫 문장은 서브 쿼리를 WHERE 절이나 HAVING 절에서 쓸 수 있다는 것이고, 각주는 이 버전에서 서브 쿼리를 WHERE와 HAVING으로 제한하며 FROM 절 서브 쿼리는 이후 버전에서 고려하겠다고 덧붙인다. Jakarta Persistence 3.2 명세에서도 서브 쿼리 절(4.6.12)의 첫 문장은 같다. 표준 JPQL만 놓고 보면 select 절 서브 쿼리도, from 절 서브 쿼리도 없다.</p>
+
+<p>Hibernate는 여기서 표준보다 넓다. select 절에 서브 쿼리를 넣은 Querydsl 쿼리를 실행해 보면 문제없이 동작한다.</p>
+
+<pre><code class="language-java">qf.select(employee.name, JPAExpressions.select(sub.age.avg()).from(sub))
+  .from(employee)
+  .fetch();</code></pre>
+
+<pre data-label="SQL과 실행 결과"><code class="language-text">select e1_0.name,
+       (select avg(cast(e2_0.age as float(53))) from Employee e2_0)
+from Employee e1_0
+
+[kim, 31.8]
+[lee, 31.8]
+[park, 31.8]
+[choi, 31.8]
+[jung, 31.8]</code></pre>
+
+<p>Hibernate 6의 HQL은 from 절 서브 쿼리도 지원한다. Hibernate 6.6 Query Language Guide는 from 절에 오는 비상관 서브 쿼리를 "derived root"라 부르고, 조인 절에도 서브 쿼리를 둘 수 있다고 설명한다. 같은 버전에서 <code>select e.name, x.n from Employee e join (select d.name as n, d.id as i from Department d) x on x.i = e.department.id</code>라는 HQL을 직접 실행해 보면 예외 없이 실행된다.</p>
+
+<p>그런데도 Querydsl JPA로는 from 절 서브 쿼리를 쓸 수 없다. 이유는 API 시그니처에 있다. <code>JPAQueryBase</code>의 <code>from</code>은 <code>from(EntityPath<?>)</code>과 <code>from(EntityPath<?>...)</code>뿐이고, 조인 메서드의 대상도 <code>EntityPath</code>, <code>CollectionExpression</code>, <code>MapExpression</code>뿐이다. 서브 쿼리 객체(<code>SubQueryExpression</code>)를 넣을 자리가 타입 수준에서 없다. select 절 서브 쿼리처럼 Hibernate가 받아 주는 비표준 문법 중 일부는 Querydsl로도 표현되지만, from 절 서브 쿼리는 Querydsl 5.1 JPA 모듈의 API로 표현할 수단 자체가 없다.</p>
+
+<p>그래서 SQL로 인라인 뷰를 쓰던 쿼리를 옮길 때는 다른 길을 찾아야 한다. 첫째, 많은 인라인 뷰는 조인이나 where 절 서브 쿼리로 다시 쓸 수 있다. 앞의 "부서별 최대 나이" 예제도 SQL로는 부서별 최대 나이를 인라인 뷰로 만들어 조인하는 방식으로 쓸 수 있지만, 상관 서브 쿼리 하나로 같은 결과를 냈다. 둘째, 쿼리를 둘로 나눠 첫 쿼리의 결과를 두 번째 쿼리의 조건으로 넘길 수 있다. 셋째, 정말로 데이터베이스 고유 기능이 필요하면 네이티브 SQL을 쓴다. 그리고 인라인 뷰가 화면에 보여 줄 모양을 만들기 위한 것이라면, 그 일이 데이터베이스에서 해야 할 일인지부터 다시 생각해 볼 만하다. 이 판단 기준은 바로 다음 절의 case 식에도 그대로 쓰인다.</p>
+
+<h3>Case 문: 조건을 값으로 바꾸기</h3>
+
+<p>case 식은 조건에 따라 다른 값을 내는 식이다. Querydsl에는 두 가지 형태가 있다. 값이 같은지만 비교하는 단순한 경우는 경로에서 바로 <code>when</code>을 시작하고, 범위나 복합 조건이 필요하면 <code>CaseBuilder</code>를 쓴다.</p>
+
+<pre><code class="language-java">// 단순 형태: 값이 같은지 비교
+qf.select(employee.name,
+          employee.age.when(25).then("스물다섯")
+                      .when(40).then("마흔")
+                      .otherwise("기타"))
+  .from(employee)
+  .fetch();
+
+// CaseBuilder: 임의의 조건
+qf.select(employee.name,
+          new CaseBuilder()
+              .when(employee.age.between(20, 29)).then("20대")
+              .when(employee.age.between(30, 39)).then("30대")
+              .otherwise("기타"))
+  .from(employee)
+  .fetch();</code></pre>
+
+<pre data-label="첫 번째 쿼리의 JPQL과 실행 결과"><code class="language-text">select employee.name, case when employee.age = ?1 then ?2 when employee.age = ?3 then ?4 else '기타' end
+from Employee employee
+
+[kim, 스물다섯]
+[lee, 기타]
+[park, 기타]
+[choi, 마흔]
+[jung, 기타]</code></pre>
+
+<pre data-label="두 번째 쿼리의 SQL과 실행 결과"><code class="language-text">select e1_0.name,
+    case
+        when (e1_0.age between ? and ?) then cast(? as varchar)
+        when (e1_0.age between ? and ?) then cast(? as varchar)
+        else '기타'
+    end
+from Employee e1_0
+
+[kim, 20대]
+[lee, 30대]
+[park, 20대]
+[choi, 기타]
+[jung, 30대]</code></pre>
+
+<p>명세 4.6.17.4절의 문법을 보면 두 형태가 모두 정의되어 있다. <code>general_case_expression ::= CASE when_clause {when_clause}* ELSE scalar_expression END</code>와 <code>simple_case_expression ::= CASE case_operand simple_when_clause {simple_when_clause}* ELSE scalar_expression END</code>다. 두 문법 모두 <code>ELSE</code>가 대괄호 없이 필수라는 점을 보자. SQL에서는 ELSE를 생략하면 NULL이 되지만, JPQL 문법은 ELSE를 요구한다. Querydsl의 타입이 이 규칙을 그대로 강제한다. <code>CaseBuilder.when(...)</code>은 <code>CaseWhen</code>을, 그 <code>then(...)</code>은 <code>Cases</code>를 돌려주는데, <code>javap</code>로 보면 <code>Cases</code>는 <code>Expression</code>을 상속하지 않는 추상 클래스이고 <code>Expression</code> 타입(<code>Q extends Expression<A></code>)을 돌려주는 메서드는 <code>otherwise</code>뿐이다. <code>otherwise</code>를 빠뜨린 case 식은 select 절에 넣을 수 있는 타입이 아니므로 컴파일되지 않는다. 단순 형태의 <code>CaseForEqBuilder</code>도 같은 구조다. 참고로 Querydsl은 단순 형태도 JPQL로는 <code>case when employee.age = ?1 then ...</code>처럼 일반 형태로 직렬화했다.</p>
+
+<p>JPQL을 다시 보면 이상한 점이 하나 있다. <code>then</code> 뒤의 값들은 <code>?2</code>, <code>?4</code>처럼 파라미터인데, <code>else</code> 뒤의 <code>'기타'</code>만 리터럴로 박혀 있다. 이유는 직렬화기에 있다. <code>JPQLSerializer</code>는 연산자가 <code>CASE_ELSE</code>나 <code>CASE_EQ_ELSE</code>일 때 <code>inCaseOperation</code> 플래그를 켜고, 이 플래그가 켜진 상태에서 템플릿의 <code>isCaseWithLiterals()</code>가 <code>true</code>이면 상수를 파라미터 대신 리터럴로 쓴다. <code>HQLTemplates</code>(그리고 그것을 상속한 <code>Hibernate5Templates</code>)는 이 값이 <code>true</code>다. <code>JPQLTemplates.DEFAULT</code>로 같은 쿼리를 직렬화하면 <code>else ?5</code>가 되는 것을 확인했다. 템플릿이 데이터베이스와 구현체의 사정에 맞춰 같은 표현식 트리를 다른 문자열로 바꾸는 장치라는 것이 여기서도 보인다. SQL 쪽에서 <code>then</code> 자리의 파라미터에 붙은 <code>cast(? as varchar)</code>는 Hibernate가 H2용 SQL을 만들면서 파라미터의 타입을 명시한 결과다. JPQL에는 없던 것이 SQL 번역 단계에서 생겼다.</p>
+
+<h4>case 식으로 정렬하기</h4>
+
+<p>case 식은 select 절뿐 아니라 order by 절에도 쓸 수 있다. 30대를 먼저, 20대를 다음, 나머지를 마지막에 보여 주고, 같은 그룹 안에서는 나이 내림차순으로 정렬해 보자. case 식을 변수에 담아 select와 order by에서 함께 쓴다.</p>
+
+<pre><code class="language-java">NumberExpression<Integer> rank = new CaseBuilder()
+        .when(employee.age.between(30, 39)).then(1)
+        .when(employee.age.between(20, 29)).then(2)
+        .otherwise(3);
+
+qf.select(employee.name, employee.age, rank)
+  .from(employee)
+  .orderBy(rank.asc(), employee.age.desc())
+  .fetch();</code></pre>
+
+<pre data-label="JPQL과 실행 결과"><code class="language-text">select employee.name, employee.age, case when (employee.age between ?1 and ?2) then ?3 when (employee.age between ?4 and ?5) then ?6 else 3 end
+from Employee employee
+order by case when (employee.age between ?7 and ?8) then ?9 when (employee.age between ?10 and ?11) then ?12 else 3 end asc, employee.age desc
+
+[jung, 35, 1]
+[lee, 31, 1]
+[park, 28, 2]
+[kim, 25, 2]
+[choi, 40, 3]</code></pre>
+
+<p>결과부터 추적하자. jung(35)과 lee(31)는 30대라 순위 1이고, 같은 순위 안에서 나이 내림차순이므로 jung이 먼저다. park(28)과 kim(25)이 순위 2, choi(40)는 어느 조건에도 맞지 않아 순위 3이다. 이번에는 정렬 기준이 있으므로 이 순서는 데이터베이스가 보장한다. JPQL을 보면 자바에서는 <code>rank</code> 변수 하나였지만 문자열에서는 case 식이 select와 order by에 두 번 나오고, 파라미터 번호도 <code>?1</code>~<code>?6</code>과 <code>?7</code>~<code>?12</code>로 따로 매겨졌다. 직렬화기는 표현식 트리의 노드를 만날 때마다 문자열을 새로 쓰기 때문이다. 같은 객체를 재사용한 것은 자바 코드의 중복을 줄였을 뿐, SQL에서 계산이 한 번으로 줄어든다는 뜻은 아니다.</p>
+
+<p>데이터베이스 쪽 비용도 생각해 두자. MySQL 8.0 Reference Manual의 "ORDER BY Optimization" 절은 인덱스로 ORDER BY를 처리할 수 없는 경우로 "인덱스 열 이름이 아닌 항을 포함한 표현식으로 정렬하는 경우"(<code>ORDER BY ABS(key)</code> 같은 예)를 들고, 그럴 때는 행을 읽어 따로 정렬하는 filesort를 수행한다고 설명한다. case 식으로 정렬하면 이 경우에 해당한다. 그래서 판단 기준은 이렇다. "20대", "30대" 같은 표시용 라벨은 조회한 나이를 가지고 애플리케이션에서 바꾸는 편이 데이터베이스 부하도 적고 화면 요구가 바뀔 때 고치기도 쉽다. 반대로 case 식의 결과가 정렬, 그룹핑, 필터처럼 데이터베이스 안의 다른 연산에 쓰여야 한다면 데이터베이스에서 계산할 수밖에 없다. 예를 들어 순위로 정렬한 뒤 상위 10행만 페이징해야 한다면, 정렬이 LIMIT보다 먼저 일어나야 하므로 애플리케이션으로 미룰 수 없다.</p>
+
+<h3>상수와 문자 더하기</h3>
+
+<p>조회 결과에 고정된 값을 함께 붙이고 싶을 때는 <code>Expressions.constant</code>를 쓴다. 흥미로운 것은 이 상수가 어디로 가느냐다.</p>
+
+<pre><code class="language-java">List<Tuple> rows = qf.select(employee.name, Expressions.constant("X"))
+        .from(employee)
+        .where(employee.name.eq("kim"))
+        .fetch();
+Tuple t = rows.get(0);
+System.out.println(t + " " + t.get(1, String.class));</code></pre>
+
+<pre data-label="JPQL, SQL, 실행 결과"><code class="language-text">select employee.name
+from Employee employee
+where employee.name = ?1
+
+select e1_0.name from Employee e1_0 where e1_0.name=?
+
+[kim, X] X</code></pre>
+
+<p>JPQL에도 SQL에도 <code>"X"</code>가 없다. 그런데 결과 <code>Tuple</code>의 두 번째 칸에는 <code>X</code>가 들어 있다. 이 값은 데이터베이스를 다녀오지 않았다. Querydsl이 쿼리를 보내기 전에 상수를 빼 두었다가, 결과가 돌아온 뒤 자바 쪽에서 다시 끼워 넣은 것이다.</p>
+
+<p>과정을 바이트코드로 추적해 보자. 프로젝션을 등록할 때 <code>JPAQueryMixin.convert</code>가 <code>Conversions.convert</code>를 부르고, 이 메서드는 <code>Tuple</code> 같은 팩토리 표현식(<code>FactoryExpression</code>)의 인자 중에 상수가 있으면 전체를 <code>ConstantHidingExpression</code>으로 감싼다. 이 클래스는 생성 시점에 원래 인자 목록을 훑으며 상수가 아닌 인자만 새 목록(<code>args</code>)에 담고, 원래 위치마다 상수 값 또는 빈칸(null)을 담은 배열(<code>template</code>)을 만든다. 직렬화기는 <code>getArgs()</code>로 상수가 빠진 목록만 보므로 JPQL의 select 절에는 <code>employee.name</code>만 남는다. 결과 행이 돌아오면 <code>newInstance</code>가 <code>template</code>을 복사한 뒤 빈칸을 데이터베이스에서 온 값으로 왼쪽부터 채운다.</p>
+
+<pre class="diagram">select(employee.name, constant("X"))
+
+등록 시:  원래 인자  [ employee.name , "X" ]
+          args      [ employee.name ]              → JPQL: select employee.name
+          template  [ null          , "X" ]
+
+조회 후:  DB 결과   [ "kim" ]
+          newInstance: template 복사 → [ null, "X" ]
+                       빈칸 채우기   → [ "kim", "X" ]  → Tuple [kim, X]</pre>
+
+<p>따라서 상수는 데이터베이스에서 아무 비용도 들지 않지만, 데이터베이스 안의 연산에 참여하지도 않는다. 상수를 다른 식의 피연산자로 쓰면 그 상수는 파라미터나 리터럴로 JPQL에 들어간다. 앞의 case 식에서 <code>then</code> 값이 <code>?2</code>로, <code>else</code> 값이 <code>'기타'</code>로 들어간 것이 그 예다. 상수를 숨기는 처리는 프로젝션의 인자 자리에 상수가 "그대로" 놓였을 때만 일어난다.</p>
+
+<p>문자 더하기는 <code>concat</code>으로 한다. 이름 뒤에 밑줄과 나이를 붙여 <code>kim_25</code>를 만들어 보자. 나이는 정수이므로 문자열로 바꿔야 한다.</p>
+
+<pre><code class="language-java">qf.select(employee.name.concat("_").concat(employee.age.stringValue()))
+  .from(employee)
+  .where(employee.name.eq("kim"))
+  .fetch();</code></pre>
+
+<pre data-label="JPQL, SQL, 실행 결과"><code class="language-text">select concat(concat(employee.name,?1),str(employee.age))
+from Employee employee
+where employee.name = ?2
+
+select ((e1_0.name||?)||cast(e1_0.age as varchar))
+from Employee e1_0
+where e1_0.name=?
+
+kim_25</code></pre>
+
+<p>세 층이 각자 다른 일을 했다. Querydsl은 메서드 체인을 그대로 중첩된 <code>concat</code> 두 개로 직렬화했고, <code>stringValue()</code>를 <code>str(...)</code>로 바꿨다. 명세의 <code>CONCAT</code>은 <code>CONCAT(string_expression, string_expression {, string_expression}*)</code>로 문자열 식만 받으므로 정수 나이는 먼저 문자열로 변환되어야 한다. 그런데 <code>str</code>은 표준 JPQL 함수가 아니다. Hibernate 6.6 Query Language Guide의 함수 표에서 <code>str()</code>은 "문자열로 변환"하는 함수로 나오며 JPA 표준 함수가 아닌 것(✖)으로 표시되어 있다. HQL 확장이라는 뜻이다. 마지막으로 Hibernate는 H2 방언에 맞춰 <code>concat</code>을 <code>||</code> 연산자로, <code>str</code>을 <code>cast(... as varchar)</code>로 번역했다. 같은 JPQL이 다른 방언에서는 다른 SQL이 될 수 있다는 점이 여기서 드러난다. <code>stringValue()</code>는 <code>LiteralExpression</code>에 정의되어 있고 열거형 경로의 <code>EnumExpression</code>도 이를 상속하므로, 열거형 값을 문자열로 다룰 때도 같은 방법을 쓸 수 있다.</p>
+
+<p>문자 더하기에는 NULL 함정이 있다. 명세는 함수식의 인자 중 하나라도 NULL이면 결과도 NULL(unknown)이라고 정한다. 실제로 <code>employee.name.concat(department.name)</code>을 외부 조인 결과에 적용해 보면 kim개발, lee개발, park영업, choi영업에 이어 jung의 행은 <code>jungnull</code>이 아니라 <code>null</code>로 나온다. 이름까지 통째로 사라지는 것이다. 빈 문자열로 대체하려면 <code>coalesce</code>로 감싼 뒤 이어 붙여야 한다.</p>
+
+<h3>한 층 아래: 표현식 트리가 SQL이 되기까지</h3>
+
+<p>이 회차에서 본 모든 문법은 같은 길을 지나 데이터베이스에 닿는다. 길을 한 번에 정리해 두면, 어떤 오류가 어느 단계에서 잡히는지, 어떤 결과가 어느 단계에서 결정되는지 판단할 수 있다.</p>
+
+<figure class="flow-figure"><figcaption>Querydsl 쿼리 한 번이 실행되는 경로</figcaption><ol class="flow">
+<li><strong>표현식 트리 조립</strong><span>Q 타입의 경로와 연산 메서드가 표현식 객체를 만들고, <code>DefaultQueryMetadata</code>가 조인 목록(<code>JoinExpression</code>: 종류, 대상, 조건, 플래그), where 조건, 프로젝션을 보관한다. 별칭 타입이 맞지 않는 조인, <code>otherwise</code> 없는 case 식은 이 단계에서 컴파일 오류가 된다.</span></li>
+<li><strong>프로젝션 변환</strong><span><code>JPAQueryMixin.convert</code>가 프로젝션을 손본다. 상수가 섞인 팩토리 표현식은 <code>ConstantHidingExpression</code>으로 감싸진다.</span></li>
+<li><strong>JPQL 직렬화</strong><span><code>JPQLSerializer</code>가 템플릿(이번 실험에서는 <code>Hibernate5Templates</code>)을 참고해 트리를 문자열로 바꾼다. 상수는 목록으로 모으고 <code>?1</code>, <code>?2</code>로 표시한다. <code>with</code>와 <code>on</code>, case의 else 리터럴 같은 차이가 여기서 정해진다.</span></li>
+<li><strong>쿼리 생성과 바인딩</strong><span><code>EntityManager.createQuery(JPQL)</code>로 쿼리를 만들고 상수 목록을 위치 파라미터에 바인딩한다.</span></li>
+<li><strong>HQL 해석과 SQL 번역</strong><span>Hibernate가 문자열을 해석하며 의미를 검사한다. 페치 조인의 on 절 같은 오류는 <code>SemanticException</code>으로 여기서 거부된다. 통과하면 방언에 맞는 SQL을 만든다(H2에서는 <code>||</code>, <code>cast(... as float(53))</code>).</span></li>
+<li><strong>실행과 결과 조립</strong><span>JDBC로 SQL을 실행하고, 결과 행에서 엔티티를 만들어 영속성 컨텍스트에 등록하거나(페치 조인), 값으로 <code>Tuple</code>을 만든다. 숨겨 둔 상수는 이때 다시 끼워진다. 컬렉션 페치 조인의 중복 제거와 메모리 페이징도 이 단계의 일이다.</span></li>
+</ol></figure>
+
+<x-visual id="querydsl-03-query-pipeline" title="Querydsl 코드가 JPQL과 SQL을 거쳐 결과 객체가 되는 경로" kind="파이프라인 다이어그램" ratio="16:9">
+<x-hint>여섯 단계를 왼쪽에서 오른쪽으로 놓고, 각 단계 아래에 그 단계에서 잡히는 오류나 결정되는 것을 작은 꼬리표로 붙인다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 이어지는 6개의 둥근 상자와 화살표. 상자 라벨은 순서대로 "표현식 트리", "프로젝션 변환", "JPQL 직렬화", "쿼리 생성·바인딩", "HQL 해석·SQL 번역", "실행·결과 조립". 첫 두 상자는 파란색 영역 "Querydsl", 셋째 상자는 파란색과 초록색 경계, 넷째부터 다섯째는 초록색 영역 "Hibernate", 여섯째 상자 아래에 회색 원통 "DB". 상자 아래 작은 꼬리표: 첫째 아래 "컴파일 오류: 별칭 타입", 셋째 아래 "with / on 결정", 다섯째 아래 "SemanticException", 여섯째 아래 "상수 다시 끼우기". 깔끔한 평면 기술 도식, 흰 배경.</x-prompt>
+<x-caption>같은 Querydsl 코드라도 오류와 결과는 서로 다른 단계에서 결정된다. 컴파일러, Querydsl 직렬화기, Hibernate 해석기, 데이터베이스가 각자 한 몫씩 맡는다.</x-caption>
+</x-visual>
+
+<h3>흔한 오해와 함정</h3>
+
+<p><b>"on과 where는 위치만 다른 같은 필터다."</b> 내부 조인에서만 맞는 말이다. 외부 조인에서 on은 짝을 찾는 기준이고 where는 조인 결과 전체를 거르는 필터다. 조인 대상 열에 거는 where 조건은 대개 null 거부 조건이어서 외부 조인을 내부 조인으로 바꿔 버린다. MySQL은 실제로 실행 계획을 그렇게 단순화한다.</p>
+
+<p><b>"페치 조인은 SQL 조인의 한 종류다."</b> SQL의 조인 구문은 일반 조인과 같다. 페치 조인이 바꾸는 것은 select 목록에 연관 엔티티의 열을 넣는 것과, 그 열로 엔티티를 만들어 영속성 컨텍스트에 등록하고 연관 필드를 채우는 것이다. 그래서 on 절처럼 "일부만 가져오는" 개념이 페치 조인과 맞지 않는다.</p>
+
+<p><b>"경로로 연관을 따라가면 편하고 결과도 같다."</b> 묵시적 조인은 항상 내부 조인이다. select 절에 <code>employee.department.name</code>을 넣는 것만으로 부서 없는 직원이 결과에서 사라진다. 결과 행의 범위가 중요한 쿼리에서는 조인을 명시한다.</p>
+
+<p><b>"서브 쿼리 별칭은 바깥과 같아도 된다."</b> 비상관 서브 쿼리에서는 명세의 가림 규칙 덕분에 우연히 동작한다. 상관 서브 쿼리에서는 바깥 행을 가리킬 방법이 사라지고, Querydsl에서 같은 별칭의 경로는 <code>equals</code>까지 같은 객체로 취급된다. 서브 쿼리용 Q 타입은 항상 새 이름으로 만든다.</p>
+
+<p><b>"컬렉션 페치 조인에는 <code>distinct</code>가 필요하다."</b> Hibernate 6부터는 중복된 루트 엔티티를 메모리에서 자동으로 제거한다. 다만 컬렉션 페치 조인과 페이징을 함께 쓰면 SQL에 행 수 제한이 붙지 않고 메모리에서 잘라 낸다는 경고가 남는다는 점은 그대로다.</p>
+
+<p><b>"<code>Expressions.constant</code>는 SQL에 상수를 넣는다."</b> 프로젝션 인자로 그대로 쓴 상수는 JPQL에서 빠지고 결과를 받은 뒤 자바 쪽에서 채워진다. 데이터베이스 안의 계산에 상수를 참여시키려면 다른 식의 피연산자로 써야 한다.</p>
+
+<p>이 회차의 내용은 이 권의 남은 회차에서 계속 쓰인다. 04회의 프로젝션은 <code>Tuple</code> 대신 DTO로 결과를 받는 방법을 다루는데, 프로젝션을 등록할 때 거치는 변환 단계는 이 회차에서 본 <code>ConstantHidingExpression</code>과 같은 자리다. 05회와 06회에서 리포지토리에 Querydsl을 결합할 때는 조인과 페치 조인의 선택, 그리고 컬렉션 페치 조인과 페이징의 충돌이 count 쿼리 최적화와 함께 다시 등장한다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>기본 조인</dt><dd><code>join(연관 경로, 별칭)</code>은 JPQL의 <code>join 경로 as 별칭</code>이 되고, 외래 키 조건은 매핑에서 Hibernate가 만든다. 별칭의 제네릭 타입이 연관 대상 타입과 맞지 않으면 컴파일되지 않는다.</dd>
+<dt>묵시적 조인</dt><dd><code>employee.department.name</code>처럼 연관을 거치는 경로는 항상 내부 조인을 만든다. select 절에 넣기만 해도 짝 없는 행이 사라진다.</dd>
+<dt>세타 조인</dt><dd><code>from</code>에 엔티티를 나열하고 where로 엮는 조인. 연관관계 없이 값으로 엮을 수 있지만 외부 조인이 불가능하다.</dd>
+<dt>on 절</dt><dd>외부 조인에서 짝을 찾는 기준이 되어 왼쪽 행을 보존한 채 조인 대상만 줄인다. 내부 조인에서는 where와 결과가 같다. Hibernate 템플릿에서는 JPQL에 <code>with</code>로 출력된다.</dd>
+<dt>연관관계 없는 엔티티 조인</dt><dd><code>leftJoin(루트 경로).on(조건)</code>. 외래 키 조건 없이 on 조건만으로 엮는다. JPA 3.1에서는 Hibernate 확장, 3.2에서 표준 문법이 되었다.</dd>
+<dt>페치 조인</dt><dd>SQL 조인 구문은 같고, select 목록에 연관 엔티티 열을 넣어 엔티티를 함께 만들고 영속성 컨텍스트에 등록한다. on 절은 거부되고, 컬렉션 필터는 불완전한 컬렉션을 남긴다.</dd>
+<dt>서브 쿼리</dt><dd><code>JPAExpressions</code>로 만든 <code>JPASubQuery</code>는 실행할 수 없는 표현식 부품이다. 바깥과 다른 별칭이 필요하고, 표준은 where·having 절만 허용하며 Querydsl JPA는 from 절 서브 쿼리를 지원하지 않는다.</dd>
+<dt>case 식</dt><dd>단순 형태와 <code>CaseBuilder</code>가 있고, JPQL 문법처럼 else가 필수라 <code>otherwise</code>가 없으면 컴파일되지 않는다. order by에 쓰면 인덱스 정렬을 쓸 수 없다.</dd>
+<dt>상수와 문자 더하기</dt><dd>프로젝션의 상수는 <code>ConstantHidingExpression</code>이 JPQL에서 빼고 결과에 다시 끼운다. <code>concat</code>과 <code>stringValue()</code>는 <code>concat</code>, <code>str</code>로 직렬화되어 방언에 맞는 SQL이 된다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 가장 자주 마주치는 장애는 "목록에서 일부 데이터가 안 보인다"는 신고다. 원인을 쫓아가면 상당수가 이 회차의 내용으로 설명된다. 누군가 select 절에 연관 엔티티의 필드를 하나 추가해 묵시적 내부 조인이 생겼거나, <code>leftJoin</code>을 써 놓고 조인 대상의 조건을 where에 넣었거나, 페치 조인을 <code>join</code>으로 걸어 연관이 없는 행이 빠진 경우다. 이런 신고를 받으면 Querydsl 코드를 눈으로 읽기보다 실행된 SQL을 로그로 확인하고, 조인의 종류와 조건의 위치를 먼저 본다. 코드의 메서드 이름이 아니라 SQL이 사실이다.</p>
+<p>성능 문제에서는 판단이 데이터의 모양에 따라 달라진다. 다대일 연관을 화면마다 함께 보여 준다면 페치 조인이 N+1을 없애는 가장 직접적인 수단이다. 반면 일대다 컬렉션을 페치 조인하면서 페이징이 필요하다면, Hibernate가 경고하는 메모리 페이징 대신 컬렉션은 배치 페치로 따로 읽는 편이 안전하다. 같은 "연관 데이터를 함께 가져온다"는 요구라도 연관의 방향과 페이징 여부가 선택을 바꾼다.</p>
+<p>서브 쿼리와 case 식은 "데이터베이스에서 할 일인가"를 묻게 만든다. 정렬, 필터, 페이징의 입력이 되는 값은 데이터베이스에서 계산해야 하지만, 화면에 보여 줄 라벨이나 문자열 조합은 애플리케이션에서 처리하는 편이 데이터베이스 부하를 줄이고 변경에도 강하다. from 절 서브 쿼리가 필요해 보이는 쿼리는 조인이나 where 절 서브 쿼리로 다시 쓸 수 있는지, 쿼리를 둘로 나누는 것이 더 단순하지 않은지를 먼저 검토하고, 그래도 안 되면 네이티브 SQL을 쓰는 것이 Querydsl JPA의 한계 안에서 내릴 수 있는 현실적인 판단이다.</p>
+</x-review>
+
+<x-practice>
+<li>본문의 데이터(개발: kim 25, lee 31 / 영업: park 28, choi 40 / 인사: 직원 없음 / jung 35는 부서 없음)로 <code>qf.select(department.name, employee.name).from(department).leftJoin(department.employees, employee).on(employee.age.goe(30)).fetch()</code>의 결과 행을 모두 적어라. 그리고 <code>on</code>을 <code>where</code>로 바꾸면 결과가 어떻게 달라지는지 이유와 함께 설명하라.</li>
+<li>페치 조인 없이 <code>qf.selectFrom(employee).fetch()</code>로 직원 다섯 명을 조회한 뒤 반복문에서 각자의 부서 이름을 출력한다. 실행되는 SQL의 총 횟수를 구하고, 직원이 서로 다른 부서 다섯 곳에 한 명씩 흩어져 있었다면 몇 번이 되는지도 구하라. 횟수가 직원 수가 아니라 다른 값에 비례하는 이유를 영속성 컨텍스트로 설명하라.</li>
+<li>동료가 직원 목록 화면에 부서 이름을 추가하려고 기존 쿼리 <code>qf.select(employee.name).from(employee)</code>를 <code>qf.select(employee.name, employee.department.name).from(employee)</code>로 바꿨더니 화면에서 jung이 사라졌다. 원인을 Hibernate의 규칙으로 설명하고, jung이 다시 나오도록 쿼리를 고쳐라.</li>
+<li>"자기 부서의 평균 나이보다 나이가 많은 직원"을 Querydsl 서브 쿼리로 작성하고, 본문 데이터에서 결과를 예측하라. 부서가 없는 jung이 결과에 포함되는지, 그 이유가 무엇인지도 SQL의 NULL 규칙으로 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> on 버전의 SQL은 <code>left join Employee e1_0 on d1_0.id=e1_0.department_id and e1_0.age>=?</code>가 된다. 개발 부서는 kim(25)이 조건에 맞지 않지만 lee(31)가 맞으므로 <code>[개발, lee]</code> 한 행이다. 짝이 하나라도 있으면 NULL로 채운 행은 만들어지지 않는다는 점에 주의한다. 영업은 choi만 맞아 <code>[영업, choi]</code>, 인사는 직원이 아예 없어 <code>[인사, null]</code>이다. 실제로 실행해도 이 세 행이 나왔다. where로 옮기면 조인 단계의 중간 결과는 <code>[개발, kim]</code>, <code>[개발, lee]</code>, <code>[영업, park]</code>, <code>[영업, choi]</code>, <code>[인사, null]</code>이고, where의 <code>age >= 30</code>이 kim과 park을 거짓으로, 인사 행을 UNKNOWN으로 판정해 <code>[개발, lee]</code>, <code>[영업, choi]</code> 두 행만 남는다. 인사 부서가 사라지는 것이 차이이며, 이 where 조건은 null 거부 조건이므로 외부 조인이 내부 조인과 같아진다.</p>
+<p><b>2번.</b> 직원 조회 1번에, kim에서 개발 부서 프록시 초기화 1번, park에서 영업 부서 프록시 초기화 1번으로 총 3번이다. lee와 choi는 이미 초기화된 같은 프록시를 공유하고, jung은 부서가 없어 SQL이 없다. 다섯 부서에 한 명씩이었다면 1 + 5 = 6번이다. 영속성 컨텍스트는 식별자 하나당 객체 하나를 유지하므로, 같은 <code>department_id</code>를 가진 직원들은 같은 프록시를 받는다. 그래서 추가 SQL의 횟수는 직원 수가 아니라 "서로 다른 부서의 수"에 비례한다.</p>
+<p><b>3번.</b> <code>employee.department.name</code>은 묵시적 조인을 만들고, Hibernate 6.6 가이드에 따르면 묵시적 조인은 항상 내부 조인이다. 부서가 없는 jung은 내부 조인에서 짝이 없어 제거된다. 조인을 명시해 외부 조인으로 바꾼다: <code>qf.select(employee.name, department.name).from(employee).leftJoin(employee.department, department).fetch()</code>. 이러면 jung이 <code>[jung, null]</code>로 나온다.</p>
+<p><b>4번.</b> <code>QEmployee sub = new QEmployee("sub"); qf.selectFrom(employee).where(employee.age.gt(JPAExpressions.select(sub.age.avg()).from(sub).where(sub.department.eq(employee.department)))).fetch();</code> 개발 부서의 평균은 (25 + 31) / 2 = 28이므로 lee(31)만, 영업 부서의 평균은 (28 + 40) / 2 = 34이므로 choi(40)만 해당한다. jung의 차례에는 서브 쿼리 조건이 <code>e2_0.department_id = NULL</code>이 되어 UNKNOWN이므로 어떤 행도 고르지 못하고, 빈 집합의 <code>avg</code>는 NULL이다. 바깥 조건 <code>35 > NULL</code>도 UNKNOWN이라 jung은 결과에 없다. 실제 실행 결과도 lee 31, choi 40 두 명이었다. 별칭을 <code>sub</code>로 따로 만들지 않으면 서브 쿼리 안의 부서 비교가 안쪽 행끼리의 비교가 되어 상관 조건을 표현할 수 없다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>직원 다섯 명 중 세 명만 '개발' 부서이고 한 명은 부서가 없다. <code>qf.select(employee.name, department.name).from(employee).leftJoin(employee.department, department).where(department.name.eq("개발")).fetch()</code>는 몇 행을 반환하는가?</q>
+<o>5행. leftJoin이므로 모든 직원이 보존되고 개발이 아닌 직원은 부서가 null로 나온다.</o>
+<o>3행. where 조건이 조인 결과 전체에 적용되어 부서 이름이 null이거나 개발이 아닌 행이 모두 제거된다.</o>
+<o>4행. 부서가 없는 직원은 left join으로 보존되고, 개발이 아닌 부서 직원만 제거된다.</o>
+<o>컴파일 오류. leftJoin 뒤에는 where가 아니라 on을 써야 한다.</o>
+<why>where 조건은 조인이 끝난 행 위에서 평가된다. 개발이 아닌 부서는 거짓, 부서가 없는 행은 NULL 비교라 UNKNOWN이 되어 모두 제거되므로 개발 부서 직원 3행만 남는다. 이 조건은 null 거부 조건이어서 외부 조인이 사실상 내부 조인이 된다. 5행이 나오려면 조건을 on에 써야 한다. where와 on은 둘 다 문법상 허용되므로 컴파일 오류는 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>같은 <code>Employee</code>와 <code>Department</code>를 일반 내부 조인으로 조회할 때와 <code>fetchJoin()</code>을 붙여 조회할 때, Hibernate 6.6이 만드는 SQL의 차이로 옳은 것은?</q>
+<o>페치 조인은 SQL에서 별도의 FETCH JOIN 구문으로 실행된다.</o>
+<o>페치 조인은 조인 없이 연관 테이블을 따로 한 번 더 조회한다.</o>
+<o>조인 구문은 같고, 페치 조인의 select 목록에 연관 엔티티의 열이 추가된다.</o>
+<o>SQL은 완전히 같고, 차이는 Hibernate가 결과를 캐시하는 방식뿐이다.</o>
+<why>실행 로그에서 두 SQL의 <code>join Department d1_0 on d1_0.id=e1_0.department_id</code>는 같았다. 페치 조인의 SQL만 select 목록에 <code>d1_0.id</code>, <code>d1_0.managerName</code>, <code>d1_0.name</code>을 포함했고, Hibernate는 이 열로 부서 엔티티를 만들어 직원의 연관 필드에 넣었다. SQL에 FETCH라는 키워드는 없으며, 별도 조회는 페치 조인이 없을 때 프록시 초기화로 생기는 일이다. select 목록이 다르므로 SQL이 완전히 같다는 보기도 틀리다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>상관 서브 쿼리를 작성하면서 바깥 쿼리와 같은 <code>QEmployee.employee</code>를 서브 쿼리 안에서도 썼다. 의도대로 동작하지 않는 근본 이유는?</q>
+<o>JPQL에서 서브 쿼리가 같은 이름의 식별 변수를 선언하면 바깥 변수가 가려지고, Querydsl에서도 같은 별칭의 경로는 같은 경로로 취급되어 바깥 행을 가리킬 방법이 없다.</o>
+<o>Querydsl이 같은 Q 타입 인스턴스를 두 번 쓰는 것을 컴파일 시점에 금지한다.</o>
+<o>Hibernate가 같은 별칭을 발견하면 SemanticException을 던진다.</o>
+<o>서브 쿼리는 원래 바깥 쿼리를 참조할 수 없으므로 별칭과 무관하게 상관 서브 쿼리는 불가능하다.</o>
+<why>명세 4.4.2절에 따라 식별 변수는 같은 이름을 선언하지 않은 하위 서브 쿼리에서만 보인다. 서브 쿼리가 <code>from Employee employee</code>로 다시 선언하면 안쪽 이름이 바깥을 가린다. Querydsl에서 <code>new QEmployee("employee").equals(QEmployee.employee)</code>는 true이므로 코드 수준에서도 둘을 구별할 수 없다. 실험에서 같은 별칭의 비상관 서브 쿼리는 컴파일도 실행도 성공했으므로 두 번째와 세 번째 보기는 틀렸고, <code>sub</code> 별칭을 쓴 상관 서브 쿼리가 실제로 동작했으므로 네 번째도 틀렸다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>qf.select(employee.name, Expressions.constant("X")).from(employee).fetch()</code>에서 결과 <code>Tuple</code>의 두 번째 값 <code>"X"</code>는 어떻게 채워지는가?</q>
+<o>JPQL의 select 절에 <code>?1</code> 파라미터로 들어가 데이터베이스가 그대로 돌려준다.</o>
+<o>JPQL의 select 절에 리터럴 <code>'X'</code>로 들어간다.</o>
+<o>Hibernate가 SQL을 만들 때 방언에 맞는 상수 표현으로 바꿔 넣는다.</o>
+<o>Querydsl이 JPQL에서 상수를 빼 두었다가 결과 행을 받은 뒤 자바 쪽에서 해당 위치에 다시 넣는다.</o>
+<why>생성된 JPQL은 <code>select employee.name from Employee employee</code>였고 SQL에도 X가 없었다. 프로젝션을 등록할 때 <code>Conversions.convert</code>가 상수를 포함한 팩토리 표현식을 <code>ConstantHidingExpression</code>으로 감싸, 직렬화에는 상수가 빠진 인자 목록만 넘기고 <code>newInstance</code>에서 상수 자리를 채운다. 앞의 세 보기는 상수가 다른 식의 피연산자일 때 일어날 수 있는 일이지만, 이 경우에는 해당하지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>Querydsl 5.1 JPA 모듈로 "부서별 최대 나이를 인라인 뷰로 만든 뒤 직원과 조인"하는 SQL을 그대로 옮기려 했지만 방법이 없었다. 가장 정확한 설명은?</q>
+<o>Hibernate 6.6의 HQL이 from 절 서브 쿼리를 지원하지 않기 때문이다.</o>
+<o>JPQL 표준은 서브 쿼리를 where와 having 절로 제한하고, Querydsl JPA의 <code>from</code>과 조인 메서드는 엔티티·컬렉션·맵 경로만 받아 서브 쿼리를 넣을 자리가 없기 때문이다.</o>
+<o>Querydsl이 서브 쿼리를 아예 지원하지 않기 때문이다.</o>
+<o>H2 데이터베이스가 인라인 뷰를 지원하지 않기 때문이다.</o>
+<why>Jakarta Persistence 3.1과 3.2 모두 서브 쿼리를 WHERE와 HAVING 절에서 쓸 수 있다고 정한다. <code>JPAQueryBase.from</code>은 <code>EntityPath</code>만 받으므로 <code>SubQueryExpression</code>을 넣을 수 없다. Hibernate 6.6 HQL은 derived root로 from 절 서브 쿼리를 지원하고 실제로 실행되었으므로 첫 보기는 틀렸다. Querydsl은 <code>JPAExpressions</code>로 where·select 절 서브 쿼리를 지원하므로 세 번째도 틀렸다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>식별 변수(identification variable)</dt><dd>JPQL의 from 절에서 선언하는 별칭. 선언한 쿼리와, 같은 이름을 다시 선언하지 않은 하위 서브 쿼리에서 보인다. Querydsl에서는 Q 타입 생성자에 준 문자열이 식별 변수가 된다.</dd>
+<dt>외부 조인(outer join)</dt><dd>조인 조건을 만족하는 짝이 없는 행도 상대 쪽 열을 NULL로 채워 결과에 남기는 조인. 왼쪽 외부 조인은 왼쪽 테이블의 모든 행을 보존한다.</dd>
+<dt>null 거부 조건(null-rejected condition)</dt><dd>외부 조인이 NULL로 채운 행에 대해 항상 FALSE나 UNKNOWN이 되는 조건. MySQL은 WHERE 조건이 이런 조건이면 외부 조인을 내부 조인으로 바꾼다.</dd>
+<dt>묵시적 조인(implicit join)</dt><dd>조인을 선언하지 않고 연관을 거치는 경로 표현식으로 생기는 조인. Hibernate에서는 항상 내부 조인이다.</dd>
+<dt>페치 조인(fetch join)</dt><dd>쿼리 실행의 부수 효과로 연관 엔티티나 컬렉션을 함께 가져오는 조인. SQL의 select 목록에 연관 엔티티의 열을 포함시키고 그 엔티티를 영속성 컨텍스트에 등록한다.</dd>
+<dt>상관 서브 쿼리(correlated subquery)</dt><dd>바깥 쿼리의 현재 행을 참조하는 서브 쿼리. 의미상 바깥 행마다 다시 평가된다.</dd>
+<dt>세미 조인(semijoin)</dt><dd>짝이 있는지만 따지고 짝의 개수만큼 행을 늘리지 않는 조인 연산. MySQL은 IN과 EXISTS 서브 쿼리를 세미 조인으로 변환해 여러 실행 전략 중에서 고른다.</dd>
+<dt>JPQL 템플릿(JPQLTemplates)</dt><dd>Querydsl 직렬화기가 연산자를 문자열로 바꿀 때 참고하는 규칙 모음. <code>Hibernate5Templates</code>는 조인 조건에 <code>with</code>를 쓰고 case의 else 상수를 리터럴로 쓴다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html">Jakarta Persistence 3.1 Specification</a> — 4.4.1 예약어, 4.4.2 식별 변수 범위, 4.4.5 조인과 페치 조인 문법, 4.6.16 서브 쿼리 위치 제한, 4.6.17 CONCAT과 CASE 문법</li>
+<li><a href="https://jakarta.ee/specifications/persistence/3.2/jakarta-persistence-spec-3.2.html">Jakarta Persistence 3.2 Specification</a> — <code>range_join</code>으로 추가된 엔티티 조인 문법과 서브 쿼리 위치 규칙</li>
+<li><a href="https://docs.jboss.org/hibernate/orm/6.6/querylanguage/html_single/Hibernate_Query_Language.html">Hibernate ORM 6.6 Query Language Guide</a> — with와 on, explicit root join, 묵시적 조인, 페치 조인 제약, derived root, 중복 제거, str() 함수</li>
+<li><a href="http://querydsl.com/static/querydsl/5.0.0/reference/html_single/">Querydsl Reference Guide</a> — 조인 사용법(2.1.7), JPAExpressions 서브 쿼리(2.1.13), CaseBuilder(3.1.4)</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/outer-join-simplification.html">MySQL 8.0 Reference Manual — Outer Join Simplification</a> — 내부 조인의 ON을 WHERE로 옮기는 변환과 null 거부 조건에 의한 외부 조인 단순화</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/nested-loop-joins.html">MySQL 8.0 Reference Manual — Nested-Loop Join Algorithms</a> — 중첩 루프 조인과 해시 조인으로의 대체 시점</li>
+</x-refs>

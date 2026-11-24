@@ -1,0 +1,1197 @@
+<x-meta>
+deck: 생산자와 소비자를 한 대기 집합에 섞어 두면 같은 편을 깨우는 헛깨어남과 영구 대기가 생긴다. Lock과 Condition으로 대기 공간을 나누고, AQS의 조건 대기열과 BlockingQueue 내부까지 내려가 확인한다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>wait/notify로 만든 버퍼를 ReentrantLock과 Condition으로 옮겨 쓰고, <code>await()</code>가 락을 원자적으로 놓았다가 보유 횟수까지 되돌려 놓고 돌아온다는 것을 실험으로 보일 수 있다.</li>
+<li>조건 하나에 생산자와 소비자를 함께 기다리게 할 때 생기는 헛깨어남과 영구 대기를 실행 추적으로 재현하고, <code>notFull</code>/<code>notEmpty</code> 두 조건으로 나누면 왜 사라지는지 설명할 수 있다.</li>
+<li>synchronized의 진입 대기(<code>BLOCKED</code>)와 대기 집합(<code>WAITING</code>), ReentrantLock의 락 대기열과 조건 대기열(둘 다 <code>WAITING</code>)을 구분하고, 스레드 덤프에서 각각을 찾아낼 수 있다.</li>
+<li>OpenJDK 21의 <code>AbstractQueuedSynchronizer</code> 소스를 근거로 <code>signal()</code>이 스레드를 바로 깨우지 않고 조건 대기열의 노드를 락 대기열로 옮기기만 한다는 것을 설명할 수 있다.</li>
+<li>BlockingQueue의 네 가지 메서드 형태(예외, 특별한 값, 대기, 시간 제한)를 상황에 맞게 고르고, ArrayBlockingQueue와 LinkedBlockingQueue의 내부 락 구조 차이를 말할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 대기실 하나에 두 종류의 손님</h3>
+<p>앞 회차에서는 크기가 정해진 버퍼를 사이에 두고 생산자 스레드와 소비자 스레드가 데이터를 주고받는 생산자 소비자 문제(producer-consumer problem)를 다뤘다. <code>Object</code>의 <code>wait()</code>와 <code>notify()</code>로 "버퍼가 가득 차면 생산자가 기다리고, 비면 소비자가 기다리는" 구조를 만들었다. 그 구조는 동작하지만 근본적인 제약을 하나 안고 있다. JLS 17.2는 모든 객체가 모니터와 함께 대기 집합(wait set)을 하나 가진다고 정한다. 객체당 하나뿐이므로, 가득 찬 버퍼 앞에서 기다리는 생산자와 빈 버퍼 앞에서 기다리는 소비자가 같은 집합에 섞여 들어간다.</p>
+<p>섞여 있으면 깨우는 쪽이 상대를 고를 수 없다. 생산자가 데이터를 넣고 <code>notify()</code>를 부를 때 정말 깨우고 싶은 것은 소비자다. 하지만 JLS 17.2.2는 <code>notify</code>가 대기 집합에서 어느 스레드를 고를지 아무것도 보장하지 않는다. 생산자가 생산자를 깨우면, 깨어난 생산자는 버퍼가 여전히 가득 찬 것을 보고 다시 잠든다. CPU 시간과 컨텍스트 스위칭만 쓰고 일은 하나도 하지 않은 셈이다. <code>notifyAll()</code>로 모두 깨우면 정확성은 지킬 수 있지만, 한 자리가 비었을 뿐인데 기다리던 스레드 전부가 깨어나 락을 두고 다투고 대부분 다시 잠든다.</p>
+<p>이 회차는 이 제약을 푸는 과정을 따라간다. 먼저 synchronized와 wait/notify를 <code>ReentrantLock</code>과 <code>Condition</code>으로 그대로 옮긴다(조건 하나). 그 상태에서 헛깨어남을 실행 로그로 세어 보고, 조건 하나가 낭비를 넘어 프로그램 전체를 멈추게 할 수도 있다는 것을 재현한다. 다음으로 조건을 둘로 나눠 생산자 대기 공간과 소비자 대기 공간을 분리한다. 그 뒤 스레드가 "기다린다"고 할 때 실제로 어디에서 어떤 상태로 기다리는지를 synchronized와 ReentrantLock 양쪽에서 정리하고, 마지막으로 이 모든 것을 이미 구현해 둔 <code>java.util.concurrent</code>의 <code>BlockingQueue</code>로 넘어간다.</p>
+<p>실험은 이전 회차들과 같은 환경(JDK 21, Temurin 21.0.13, macOS arm64)에서 돌렸다. 아래 출력은 모두 그 실행에서 옮긴 것이다. 실행마다 달라질 수 있는 부분은 그때마다 밝힌다.</p>
+
+<h3>예제 4: wait/notify를 Lock과 Condition으로 옮기기</h3>
+<p>버퍼 구현을 여러 개 바꿔 끼우며 비교할 것이므로 공통 인터페이스부터 둔다. <code>put()</code>은 데이터를 넣고, 버퍼가 가득 찼으면 자리가 날 때까지 기다린다. <code>take()</code>는 데이터를 꺼내고, 비어 있으면 데이터가 들어올 때까지 기다린다. 기다리는 도중에 인터럽트를 받을 수 있으므로 두 메서드 모두 <code>InterruptedException</code>을 던진다고 선언한다. 대기 중에 받은 인터럽트를 삼키지 않고 호출자에게 넘기는 것이 기본 규칙이라는 점은 4회차에서 다뤘다. 로그는 스레드 이름을 앞에 붙여 찍는 작은 도우미로 남긴다.</p>
+<pre><code class="language-java">public interface Buffer {
+    void put(String data) throws InterruptedException;
+    String take() throws InterruptedException;
+}</code></pre>
+<pre><code class="language-java">public final class Log {
+    private Log() {}
+    public static void log(String msg) {
+        System.out.println("[" + Thread.currentThread().getName() + "] " + msg);
+    }
+    public static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}</code></pre>
+<p>첫 구현은 wait/notify 버전을 한 줄씩 대응시켜 옮긴 것이다. synchronized 대신 <code>ReentrantLock</code>을, 객체의 대기 집합 대신 <code>lock.newCondition()</code>이 돌려준 <code>Condition</code> 하나를 쓴다. 버퍼 자체는 <code>ArrayDeque</code>이고, 용량은 생성자에서 받는다.</p>
+<pre><code class="language-java">import java.util.ArrayDeque;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class OneConditionBuffer implements Buffer {
+    private final Lock lock = new ReentrantLock();
+    private final Condition condition = lock.newCondition();
+    private final ArrayDeque<String> queue = new ArrayDeque<>();
+    private final int capacity;
+
+    public OneConditionBuffer(int capacity) {
+        this.capacity = capacity;
+    }
+
+    @Override
+    public void put(String data) throws InterruptedException {
+        lock.lock();
+        try {
+            while (queue.size() == capacity) {
+                Log.log("put 대기: 가득 참 " + queue);
+                condition.await();
+                Log.log("put 깨어남 " + queue);
+            }
+            queue.offer(data);
+            Log.log("put 저장: " + data + " -> signal() " + queue);
+            condition.signal();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public String take() throws InterruptedException {
+        lock.lock();
+        try {
+            while (queue.isEmpty()) {
+                Log.log("take 대기: 비어 있음 " + queue);
+                condition.await();
+                Log.log("take 깨어남 " + queue);
+            }
+            String data = queue.poll();
+            Log.log("take 획득: " + data + " -> signal() " + queue);
+            condition.signal();
+            return data;
+        } finally {
+            lock.unlock();
+        }
+    }
+}</code></pre>
+<p>두 방식의 대응 관계를 표로 정리하면 다음과 같다. 마지막 두 줄은 각각 JLS 17.2.2와 <code>ReentrantLock.newCondition()</code>의 Javadoc에 적힌 내용이다.</p>
+<div class="table-wrap"><table><thead><tr><th>모니터 방식</th><th>Lock과 Condition 방식</th></tr></thead><tbody>
+<tr><td><code>synchronized (this) { ... }</code></td><td><code>lock.lock(); try { ... } finally { lock.unlock(); }</code></td></tr>
+<tr><td><code>this.wait()</code></td><td><code>condition.await()</code></td></tr>
+<tr><td><code>this.notify()</code></td><td><code>condition.signal()</code></td></tr>
+<tr><td><code>this.notifyAll()</code></td><td><code>condition.signalAll()</code></td></tr>
+<tr><td>대기 집합은 객체당 하나</td><td><code>newCondition()</code>을 부를 때마다 하나씩</td></tr>
+<tr><td>모니터를 쥐지 않고 부르면 <code>IllegalMonitorStateException</code></td><td>락을 쥐지 않고 부르면 <code>IllegalMonitorStateException</code></td></tr>
+<tr><td><code>notify()</code>가 고르는 스레드는 정해져 있지 않다</td><td>ReentrantLock의 조건은 FIFO 순서로 신호를 보낸다</td></tr>
+</tbody></table></div>
+<p><code>Condition</code> 인터페이스 Javadoc의 첫 문장이 이 관계를 그대로 설명한다. Condition은 Object의 모니터 메서드(<code>wait</code>, <code>notify</code>, <code>notifyAll</code>)를 별도의 객체로 떼어 내, 한 객체가 대기 집합을 여러 개 가진 것과 같은 효과를 낸다. 락 쪽에서 <code>Lock</code>이 synchronized를 대신하듯, 대기 쪽에서는 <code>Condition</code>이 모니터 메서드를 대신한다. Condition은 혼자 만들 수 없고 반드시 어떤 Lock의 <code>newCondition()</code>으로만 얻는다. 조건을 검사하는 데 쓰는 상태(여기서는 <code>queue</code>)는 여러 스레드가 함께 보는 값이라 락으로 보호해야 하므로, 조건은 처음부터 특정 락에 묶여 태어난다.</p>
+<p>코드에서 눈여겨볼 곳은 두 군데다. 첫째, <code>await()</code>는 반드시 <code>while</code> 안에서 부른다. 깨어났다고 해서 기다리던 조건이 참이라는 보장이 없기 때문인데, 이유가 여러 가지라 뒤에서 한 절을 따로 쓴다. 둘째, <code>unlock()</code>은 <code>finally</code>에 둔다. <code>await()</code>가 <code>InterruptedException</code>을 던지며 빠져나갈 때도 락을 놓아야 하기 때문이다. 그런데 이 코드가 맞으려면 <code>await()</code>가 예외를 던지는 순간에도 락을 다시 쥔 상태여야 한다. 락을 쥐지 않은 채 <code>unlock()</code>을 부르면 그 자체가 <code>IllegalMonitorStateException</code>이기 때문이다. 다음 절에서 이 약속을 하나씩 확인한다.</p>
+
+<h3>await()가 지키는 약속</h3>
+<p><code>Lock.newCondition()</code>의 Javadoc은 <code>await()</code>를 이렇게 요약한다. 조건에서 기다리기 전에 현재 스레드가 락을 쥐고 있어야 하고, <code>await()</code>는 기다리기 전에 락을 원자적으로 놓았다가 돌아오기 전에 다시 얻는다. <code>ReentrantLock.newCondition()</code>의 Javadoc은 구체적인 약속을 더한다. 락을 쥐지 않은 채 대기 메서드나 신호 메서드를 부르면 <code>IllegalMonitorStateException</code>이 난다. 대기 메서드는 락을 놓고, 돌아오기 전에 다시 얻으며, 그때 락 보유 횟수(hold count)를 호출 당시의 값으로 되돌린다. 기다리는 동안 인터럽트되면 대기가 끝나고 <code>InterruptedException</code>이 던져지며 인터럽트 상태는 지워진다. 기다리는 스레드는 FIFO 순서로 신호를 받는다.</p>
+<p>"원자적으로 놓는다"는 말부터 보자. 만약 락을 놓는 일과 대기 목록에 들어가는 일이 따로 일어난다면, 소비자가 버퍼가 빈 것을 확인하고 락을 놓은 직후, 대기 목록에 이름을 올리기 직전에 생산자가 들어와 데이터를 넣고 <code>signal()</code>을 부를 수 있다. 그 순간 대기 목록은 비어 있으므로 신호는 아무에게도 가지 않는다. 소비자는 그 뒤에 대기 목록에 들어가 데이터가 있는데도 잠든다. 이것을 잃어버린 깨우기(lost wake-up)라고 한다. <code>await()</code>는 대기 목록에 먼저 등록하고 나서 락을 놓으므로, 락이 풀린 뒤에 실행되는 <code>signal()</code>은 반드시 이 스레드를 본다. 뒤에서 볼 OpenJDK 소스의 <code>enableWait()</code>가 정확히 이 순서로 되어 있다.</p>
+<p>나머지 약속은 직접 실행해 확인할 수 있다. 아래 프로그램은 먼저 락 없이 <code>await()</code>를 부른다. 그다음 락을 두 번 재진입한 상태에서 <code>awaitNanos()</code>로 0.5초 기다리고, 그사이 다른 스레드가 <code>tryLock()</code>을 시도한다.</p>
+<pre><code class="language-java">import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class HoldCountMain {
+    public static void main(String[] args) throws InterruptedException {
+        ReentrantLock lock = new ReentrantLock();
+        Condition cond = lock.newCondition();
+
+        try {
+            cond.await();                         // 락 없이 호출
+        } catch (IllegalMonitorStateException e) {
+            System.out.println("락 없이 await -> " + e);
+        }
+
+        lock.lock();
+        lock.lock();                              // 재진입: 보유 횟수 2
+        try {
+            System.out.println("await 전 보유 횟수=" + lock.getHoldCount());
+            Thread other = new Thread(() -> {
+                try { Thread.sleep(100); } catch (InterruptedException e) { return; }
+                boolean got = lock.tryLock();     // main이 await 중일 때 시도
+                System.out.println("await 중 다른 스레드의 tryLock()=" + got);
+                if (got) lock.unlock();
+            });
+            other.start();
+            long left = cond.awaitNanos(TimeUnit.MILLISECONDS.toNanos(500));
+            other.join();
+            System.out.println("await 후 보유 횟수=" + lock.getHoldCount()
+                    + ", 시간 초과=" + (left <= 0));
+        } finally {
+            lock.unlock();
+            lock.unlock();
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">락 없이 await -> java.lang.IllegalMonitorStateException
+await 전 보유 횟수=2
+await 중 다른 스레드의 tryLock()=true
+await 후 보유 횟수=2, 시간 초과=true</code></pre>
+<p>락 없이 부른 <code>await()</code>는 기다리지도 않고 즉시 <code>IllegalMonitorStateException</code>으로 실패한다. 락을 두 번 쥔 상태에서 <code>await()</code>로 들어가자 다른 스레드의 <code>tryLock()</code>이 성공했다. 보유 횟수가 2였는데도 락이 완전히 풀렸다는 뜻이다. 만약 <code>await()</code>가 보유 횟수를 하나만 줄였다면 락은 여전히 main의 것이고 다른 스레드는 들어올 수 없었다. 그렇게 되면 신호를 보내 줄 스레드도 들어올 수 없으니, 시간 제한 없이 <code>await()</code>한 스레드라면 영원히 기다렸을 것이다. 시간 초과로 돌아온 뒤 보유 횟수는 다시 2가 되었으므로 <code>finally</code>의 <code>unlock()</code> 두 번이 정확히 맞아떨어진다.</p>
+<p>synchronized의 <code>wait()</code>도 같은 규칙을 따른다. JLS 17.2.1은 <code>wait</code>를 부른 스레드 t에 대해, t가 객체 m에 대해 수행했지만 아직 짝이 맞는 unlock이 없는 lock 행동의 수를 n이라 하고, t가 m의 대기 집합에 들어가며 n번의 unlock 행동을 수행한다고 정의한다. 대기 집합에서 빠져나온 뒤에는 n번의 lock 행동을 수행한다. 재진입 횟수만큼 모두 풀고, 돌아올 때 모두 되찾는다는 점에서 두 방식은 같다.</p>
+<p><code>awaitNanos()</code>가 돌려주는 값은 남은 대기 시간의 추정치이고, 0 이하이면 시간이 다 된 것이다. Condition의 Javadoc은 이 값을 루프에서 다시 넘겨, 조건이 거짓인 채로 여러 번 깨어나도 전체 대기 시간이 지정한 시간을 넘지 않게 쓰는 형태를 예시로 든다. 뒤에서 볼 <code>ArrayBlockingQueue.offer(e, timeout, unit)</code>가 이 형태를 그대로 쓴다. 이 밖에 인터럽트에 반응하지 않는 <code>awaitUninterruptibly()</code>, 절대 시각까지 기다리는 <code>awaitUntil(Date)</code>, 시간과 단위를 받는 <code>await(long, TimeUnit)</code>이 있다. 모니터 방식에는 시간 제한 <code>wait(long)</code>은 있어도 인터럽트를 무시하는 대기는 없다는 점이 다르다.</p>
+
+<h3>예제 4 실행: 같은 편을 깨우는 헛깨어남</h3>
+<p>실험 드라이버는 용량 2인 버퍼에 생산자 4개(p1~p4)와 소비자 4개(c1~c4)를 붙인다. 스레드는 100ms 간격으로 하나씩 시작해서, 각 스레드가 버퍼에 도착하는 순서를 사실상 고정한다. 생산자 pN은 <code>"dataN"</code>을 한 번 넣고, 소비자는 한 번 꺼내고 끝난다. 한 무리를 다 시작하고 나면 그때까지 만든 모든 스레드의 상태를 한 줄로 찍는다. 첫 번째 인자로 버퍼 구현을, 두 번째 인자로 어느 쪽을 먼저 출발시킬지를 고른다.</p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+
+public class BufferMain {
+    public static void main(String[] args) throws InterruptedException {
+        Buffer buffer = switch (args[0]) {
+            case "one" -> new OneConditionBuffer(2);
+            case "two" -> new TwoConditionBuffer(2);
+            default -> new BlockingQueueBuffer(2);
+        };
+        boolean consumerFirst = args[1].equals("consumer");
+        List<Thread> threads = new ArrayList<>();
+        if (consumerFirst) {
+            start(threads, "c", 4, i -> () -> buffer.take());
+            start(threads, "p", 4, i -> () -> buffer.put("data" + i));
+        } else {
+            start(threads, "p", 4, i -> () -> buffer.put("data" + i));
+            start(threads, "c", 4, i -> () -> buffer.take());
+        }
+        for (Thread t : threads) t.join();
+        System.out.println("끝");
+    }
+
+    interface Task { void run() throws InterruptedException; }
+    interface TaskFactory { Task create(int i); }
+
+    static void start(List<Thread> threads, String prefix, int n, TaskFactory f) {
+        System.out.println("== " + prefix + " 스레드 시작");
+        for (int i = 1; i <= n; i++) {
+            Task task = f.create(i);
+            Thread t = new Thread(() -> {
+                try { task.run(); } catch (InterruptedException e) { Log.log("인터럽트"); }
+            }, prefix + i);
+            threads.add(t);
+            t.start();
+            Log.sleep(100);
+        }
+        StringBuilder sb = new StringBuilder("== 상태:");
+        for (Thread t : threads) sb.append(' ').append(t.getName()).append('=').append(t.getState());
+        System.out.println(sb);
+    }
+}</code></pre>
+<p>버퍼 안의 로그는 모두 락을 쥔 상태에서 찍으므로, 로그 순서가 곧 임계 영역에 들어간 순서다. 그래서 아래 출력은 같은 프로그램을 세 번 돌렸을 때 세 번 모두 바이트 단위로 같았다(100ms 간격이 깨질 만큼 기계가 바쁘면 달라질 수 있다). 먼저 소비자를 먼저 출발시킨 경우다.</p>
+<pre data-label="실행 결과: java BufferMain one consumer"><code class="language-text">== c 스레드 시작
+[c1] take 대기: 비어 있음 []
+[c2] take 대기: 비어 있음 []
+[c3] take 대기: 비어 있음 []
+[c4] take 대기: 비어 있음 []
+== 상태: c1=WAITING c2=WAITING c3=WAITING c4=WAITING
+== p 스레드 시작
+[p1] put 저장: data1 -> signal() [data1]
+[c1] take 깨어남 [data1]
+[c1] take 획득: data1 -> signal() []
+[c2] take 깨어남 []
+[c2] take 대기: 비어 있음 []
+[p2] put 저장: data2 -> signal() [data2]
+[c3] take 깨어남 [data2]
+[c3] take 획득: data2 -> signal() []
+[c4] take 깨어남 []
+[c4] take 대기: 비어 있음 []
+[p3] put 저장: data3 -> signal() [data3]
+[c2] take 깨어남 [data3]
+[c2] take 획득: data3 -> signal() []
+[c4] take 깨어남 []
+[c4] take 대기: 비어 있음 []
+[p4] put 저장: data4 -> signal() [data4]
+[c4] take 깨어남 [data4]
+[c4] take 획득: data4 -> signal() []
+== 상태: c1=TERMINATED c2=TERMINATED c3=TERMINATED c4=TERMINATED p1=TERMINATED p2=TERMINATED p3=TERMINATED p4=TERMINATED
+끝</code></pre>
+<p>조건 대기열(condition queue)에 누가 어떤 순서로 서 있는지를 적어 가며 따라가 보자. ReentrantLock의 조건은 FIFO로 신호를 보내므로 <code>signal()</code>은 항상 가장 오래 기다린 스레드를 고른다.</p>
+<ol>
+<li>c1~c4가 차례로 와서 빈 버퍼를 보고 <code>await()</code>한다. 조건 대기열은 [c1, c2, c3, c4]이고, main이 찍은 상태는 넷 다 <code>WAITING</code>이다.</li>
+<li>p1이 data1을 넣고 <code>signal()</code>한다. 맨 앞의 c1이 신호를 받는다. 대기열은 [c2, c3, c4]가 된다.</li>
+<li>p1이 락을 놓자 c1이 락을 다시 얻고 깨어난다. data1을 꺼낸 c1도 규칙대로 <code>signal()</code>을 부르는데, 조건이 하나뿐이라 신호는 맨 앞의 c2에게 간다. 소비자가 소비자를 깨웠다. 대기열은 [c3, c4].</li>
+<li>c2는 깨어났지만 버퍼는 비어 있다. <code>while</code> 조건을 다시 검사하고 <code>await()</code>로 돌아간다. 다시 기다리는 스레드는 대기열의 맨 뒤에 붙으므로 대기열은 [c3, c4, c2]가 된다.</li>
+<li>p2가 data2를 넣고 c3을 깨운다. c3이 data2를 꺼내고 c4를 깨운다. c4는 빈 버퍼를 보고 다시 잔다. 대기열은 [c2, c4].</li>
+<li>p3이 data3을 넣고 c2를 깨운다. c2가 꺼내고 c4를 깨운다. c4는 또 잔다. 대기열은 [c4].</li>
+<li>p4가 data4를 넣고 c4를 깨운다. c4가 마침내 data4를 꺼낸다. 이때 c4가 부른 <code>signal()</code>은 대기열이 비어 있으므로 아무 일도 하지 않는다. 신호는 쌓아 두는 것이 아니라서, 기다리는 스레드가 없을 때 보낸 신호는 그냥 사라진다.</li>
+</ol>
+<p>로그에서 "깨어남" 바로 다음 줄이 같은 스레드의 "대기"인 곳이 헛깨어남이다. c2가 한 번, c4가 두 번, 모두 세 번이다. 헛깨어남 한 번마다 park되어 있던 스레드를 운영체제 수준에서 깨우고, 그 스레드가 코어를 받을 때까지 기다리고, 락을 다시 얻고, 조건을 검사하고, 대기열에 다시 등록하고, 락을 놓고 다시 잠드는 비용을 치른다. 최종 결과는 맞지만 그 사이에 한 일은 없다.</p>
+<p>생산자를 먼저 출발시키면 반대 방향의 낭비가 보인다.</p>
+<pre data-label="실행 결과: java BufferMain one producer"><code class="language-text">== p 스레드 시작
+[p1] put 저장: data1 -> signal() [data1]
+[p2] put 저장: data2 -> signal() [data1, data2]
+[p3] put 대기: 가득 참 [data1, data2]
+[p4] put 대기: 가득 참 [data1, data2]
+== 상태: p1=TERMINATED p2=TERMINATED p3=WAITING p4=WAITING
+== c 스레드 시작
+[c1] take 획득: data1 -> signal() [data2]
+[p3] put 깨어남 [data2]
+[p3] put 저장: data3 -> signal() [data2, data3]
+[p4] put 깨어남 [data2, data3]
+[p4] put 대기: 가득 참 [data2, data3]
+[c2] take 획득: data2 -> signal() [data3]
+[p4] put 깨어남 [data3]
+[p4] put 저장: data4 -> signal() [data3, data4]
+[c3] take 획득: data3 -> signal() [data4]
+[c4] take 획득: data4 -> signal() []
+== 상태: p1=TERMINATED p2=TERMINATED p3=TERMINATED p4=TERMINATED c1=TERMINATED c2=TERMINATED c3=TERMINATED c4=TERMINATED
+끝</code></pre>
+<p>p1과 p2가 버퍼를 채우고, p3과 p4는 가득 찬 버퍼 앞에서 기다린다(대기열 [p3, p4]). p1과 p2가 부른 <code>signal()</code>은 대기열이 비어 있어서 아무 일도 하지 않았다. c1이 data1을 꺼내고 p3을 깨운다. 여기까지는 의도대로다. 그런데 p3이 data3을 넣고 부른 <code>signal()</code>은 소비자가 아니라 대기열에 남은 p4에게 간다. p4는 여전히 가득 찬 버퍼를 보고 다시 잠든다. 생산자가 생산자를 깨운 헛깨어남이 한 번 있다. c2가 data2를 꺼내며 보낸 신호가 p4에게 가서야 p4가 data4를 넣는다.</p>
+<p>Lock과 Condition으로 옮겼다고 해서 이 낭비가 줄지는 않았다. 조건 하나는 객체의 대기 집합 하나와 구조가 같기 때문이다. 바뀐 것은 신호를 받을 스레드가 "임의"에서 "가장 오래 기다린 스레드"로 정해졌다는 것뿐이고, 그 덕분에 위 추적을 결정적으로 할 수 있었다.</p>
+
+<h3>조건 하나가 프로그램을 멈추게 하는 경우</h3>
+<p>헛깨어남이 낭비에서 그친다면 성능 문제일 뿐이다. 그러나 조건 하나에 <code>signal()</code>을 쓰면 더 나쁜 일이 생길 수 있다. 신호 하나가 엉뚱한 스레드에게 소비되면, 정작 깨어나야 할 스레드는 아무도 깨워 주지 않는 상태로 남는다. 다음 프로그램은 용량 1인 버퍼 앞에 소비자 둘을 먼저 세워 두고, 생산자 하나가 데이터 두 개를 연달아 넣는다. 데이터 두 개에 소비자 둘이므로 수가 맞고, 정상이라면 모두 끝나야 한다. 1초 뒤 상태를 찍고, 끝나지 않은 스레드는 인터럽트로 정리한다.</p>
+<pre><code class="language-java">public class StuckMain {
+    public static void main(String[] args) throws InterruptedException {
+        Buffer buffer = args[0].equals("one") ? new OneConditionBuffer(1) : new TwoConditionBuffer(1);
+        Thread c1 = new Thread(() -> take(buffer), "c1");
+        Thread c2 = new Thread(() -> take(buffer), "c2");
+        Thread p1 = new Thread(() -> {
+            try {
+                buffer.put("a");
+                buffer.put("b");           // 곧바로 두 번째 put
+            } catch (InterruptedException e) {
+                Log.log("인터럽트로 종료");
+            }
+        }, "p1");
+        c1.start(); Thread.sleep(100);
+        c2.start(); Thread.sleep(100);
+        p1.start();
+        Thread.sleep(1000);
+        System.out.println("1초 뒤: c1=" + c1.getState() + " c2=" + c2.getState() + " p1=" + p1.getState());
+        c1.interrupt(); c2.interrupt(); p1.interrupt();
+    }
+
+    static void take(Buffer buffer) {
+        try {
+            buffer.take();
+        } catch (InterruptedException e) {
+            Log.log("인터럽트로 종료");
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과: java StuckMain one"><code class="language-text">[c1] take 대기: 비어 있음 []
+[c2] take 대기: 비어 있음 []
+[p1] put 저장: a -> signal() [a]
+[p1] put 대기: 가득 참 [a]
+[c1] take 깨어남 [a]
+[c1] take 획득: a -> signal() []
+[c2] take 깨어남 []
+[c2] take 대기: 비어 있음 []
+1초 뒤: c1=TERMINATED c2=WAITING p1=WAITING
+[c2] 인터럽트로 종료
+[p1] 인터럽트로 종료</code></pre>
+<p>1초가 지나도 c2와 p1은 <code>WAITING</code>이다. 버퍼는 비어 있어서 생산자는 넣을 수 있고, 넣을 데이터 b도 남아 있다. 그런데 둘 다 상대가 깨워 주기를 기다리며 잠들어 있다. main이 인터럽트를 걸지 않았다면 이 프로그램은 끝나지 않는다. 추적은 이렇다.</p>
+<ol>
+<li>c1과 c2가 빈 버퍼에서 대기한다. 조건 대기열은 [c1, c2].</li>
+<li>p1이 a를 넣고 <code>signal()</code>한다. c1이 조건 대기열에서 빠져 락을 기다리는 줄로 옮겨진다. 조건 대기열은 [c2].</li>
+<li>p1이 <code>unlock()</code>하고 곧바로 두 번째 <code>put()</code>의 <code>lock()</code>을 부른다. c1은 깨우기 신호를 받았지만 아직 코어에 올라오기 전이고, 이미 실행 중인 p1이 비어 있는 락을 먼저 잡는다. 버퍼가 가득 찼으므로 p1은 <code>await()</code>한다. 조건 대기열은 [c2, p1].</li>
+<li>이제 c1이 락을 얻어 a를 꺼내고 <code>signal()</code>한다. 신호는 맨 앞의 c2에게 간다. 조건 대기열은 [p1]. c1은 할 일을 마치고 끝난다.</li>
+<li>c2가 깨어나지만 버퍼는 비어 있다. 다시 <code>await()</code>한다. 조건 대기열은 [p1, c2].</li>
+<li>남은 두 스레드가 모두 조건 대기열에 있다. <code>signal()</code>을 불러 줄 스레드가 더 이상 없다.</li>
+</ol>
+<p>4단계에서 c1이 보낸 신호는 "자리가 났다"는 소식이었으니 원래 p1에게 가야 했다. 그런데 같은 대기열 앞쪽에 소비자 c2가 서 있었고, 신호는 c2에게 소비된 뒤 사라졌다. 이 기계에서 20번 반복해 20번 모두 같은 상태로 멈췄다. 다만 3단계에서 p1이 c1보다 먼저 락을 잡는 것은 스케줄링에 달린 일이다. c1이 먼저 락을 잡으면 c1이 a를 꺼낸 뒤 버퍼가 비어 있는 상태에서 p1이 b를 넣게 되어 정상 종료한다. 중요한 것은 이 프로그램이 "멈출 수 있다"는 사실이고, 멈춤이 환경과 부하에 따라 가끔만 일어난다는 점이 이런 버그를 더 찾기 어렵게 만든다. 3단계처럼 줄을 서 있던 스레드보다 방금 도착한 스레드가 락을 먼저 잡는 현상을 끼어들기(barging)라고 하는데, <code>while</code>을 다루는 절에서 다시 나온다.</p>
+<p>wait/notify 버전도 같은 구조이므로 같은 위험을 안고 있다. 해결책은 두 가지다. 하나는 <code>signal()</code> 대신 <code>signalAll()</code>(모니터라면 <code>notifyAll()</code>)로 모두 깨우는 것이다. 모두 깨우면 그중 조건이 맞는 스레드가 적어도 하나는 진행하므로 멈추지는 않지만, 헛깨어남은 더 많아진다. 다른 하나는 기다리는 이유별로 대기 공간을 나누는 것이다. 객체의 대기 집합으로는 불가능했던 이 방법을 Condition이 가능하게 한다.</p>
+
+<x-visual id="java-adv1-09-one-vs-two-conditions" title="조건 하나와 조건 둘의 대기 공간 비교" kind="비교 다이어그램" ratio="16:9">
+<x-hint>왼쪽은 생산자와 소비자가 한 줄로 섞여 있어 신호가 같은 편에게 가는 모습, 오른쪽은 대기 공간이 둘로 나뉘어 신호의 방향이 고정된 모습을 보여 준다.</x-hint>
+<x-prompt>가로로 두 패널을 나란히 그린다. 두 패널 모두 가운데 위쪽에 자물쇠 아이콘 하나와 "ReentrantLock" 라벨, 그 아래 칸 두 개짜리 버퍼 상자("버퍼 용량 2")가 있다. 왼쪽 패널 제목은 "조건 하나". 버퍼 아래에 사람 모양 아이콘이 한 줄로 늘어서 있는데 파란 생산자(P)와 주황 소비자(C)가 섞여 있다: C, C, P, C. 줄 위에 "condition 대기열" 라벨. 버퍼에서 나온 굽은 화살표("signal()")가 줄의 맨 앞 주황 C에 닿는데, 그 C 옆에 물음표와 "같은 편을 깨움" 라벨을 붙인다. 오른쪽 패널 제목은 "조건 둘". 버퍼 아래에 줄이 두 개 있다: 왼쪽 줄은 파란 P만("notFull 대기열"), 오른쪽 줄은 주황 C만("notEmpty 대기열"). 생산자 쪽에서 나온 화살표("put 후 notEmpty.signal()")가 주황 줄의 맨 앞으로, 소비자 쪽에서 나온 화살표("take 후 notFull.signal()")가 파란 줄의 맨 앞으로 간다. 깔끔한 평면 일러스트, 흰 배경.</x-prompt>
+<x-caption>조건이 하나면 신호가 같은 편에게 갈 수 있고, 둘로 나누면 신호의 방향이 코드에 고정된다.</x-caption>
+</x-visual>
+
+<h3>예제 5: 생산자 대기 공간과 소비자 대기 공간 분리</h3>
+<p>생산자는 "버퍼가 가득 차 있지 않음"을, 소비자는 "버퍼가 비어 있지 않음"을 기다린다. 기다리는 술어(predicate)가 둘이므로 조건 객체도 둘을 만든다. 이름은 기다리는 술어를 따라 <code>notFull</code>과 <code>notEmpty</code>라고 붙인다. Condition의 Javadoc 예제와 <code>ArrayBlockingQueue</code> 소스가 쓰는 이름이기도 하다. 조건의 이름을 "누가 기다리는가"(생산자 조건, 소비자 조건)로 지어도 동작은 같지만, "무엇이 참이 되기를 기다리는가"로 지으면 <code>await()</code>와 <code>signal()</code>을 어디에 둘지가 이름에서 바로 읽힌다. 가득 차 있으면 <code>notFull</code>에서 기다리고, 한 칸을 비웠으면 <code>notFull</code>이 참이 되었으니 그쪽에 신호를 보낸다.</p>
+<pre><code class="language-java">import java.util.ArrayDeque;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class TwoConditionBuffer implements Buffer {
+    private final Lock lock = new ReentrantLock();
+    private final Condition notFull = lock.newCondition();   // 생산자가 기다리는 곳
+    private final Condition notEmpty = lock.newCondition();  // 소비자가 기다리는 곳
+    private final ArrayDeque<String> queue = new ArrayDeque<>();
+    private final int capacity;
+
+    public TwoConditionBuffer(int capacity) {
+        this.capacity = capacity;
+    }
+
+    @Override
+    public void put(String data) throws InterruptedException {
+        lock.lock();
+        try {
+            while (queue.size() == capacity) {
+                Log.log("put 대기: 가득 참 " + queue);
+                notFull.await();
+                Log.log("put 깨어남 " + queue);
+            }
+            queue.offer(data);
+            Log.log("put 저장: " + data + " -> notEmpty.signal() " + queue);
+            notEmpty.signal();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public String take() throws InterruptedException {
+        lock.lock();
+        try {
+            while (queue.isEmpty()) {
+                Log.log("take 대기: 비어 있음 " + queue);
+                notEmpty.await();
+                Log.log("take 깨어남 " + queue);
+            }
+            String data = queue.poll();
+            Log.log("take 획득: " + data + " -> notFull.signal() " + queue);
+            notFull.signal();
+            return data;
+        } finally {
+            lock.unlock();
+        }
+    }
+}</code></pre>
+<p>바뀐 것은 네 줄이다. 생산자는 <code>notFull</code>에서 기다리고, 데이터를 넣은 뒤에는 <code>notEmpty</code>에 신호를 보낸다. 소비자는 <code>notEmpty</code>에서 기다리고, 데이터를 꺼낸 뒤에는 <code>notFull</code>에 신호를 보낸다. 두 조건은 같은 락에서 나왔으므로 상호 배제는 여전히 락 하나가 맡고, 나뉜 것은 대기 공간뿐이다. 이렇게 하면 신호의 방향이 코드에 고정된다. 생산자의 신호는 소비자 대기 공간에만 가고, 소비자의 신호는 생산자 대기 공간에만 간다.</p>
+<pre class="diagram">                ReentrantLock lock  (상호 배제는 하나)
+        ┌───────────────────────────────────────────┐
+        │   queue  [ data | data ]   capacity = 2     │
+        └───────────────────────────────────────────┘
+   notFull 조건 대기열              notEmpty 조건 대기열
+   (가득 차서 기다리는 생산자만)     (비어서 기다리는 소비자만)
+   firstWaiter → [p3] → [p4]        firstWaiter → [c1] → [c2]
+
+   put()  성공 → notEmpty.signal() → notEmpty의 맨 앞 소비자
+   take() 성공 → notFull.signal()  → notFull의 맨 앞 생산자</pre>
+<p>조건이 둘이어도 락은 하나라는 점이 중요하다. <code>notFull.await()</code>로 잠든 생산자가 놓는 락과, <code>notEmpty.await()</code>로 잠든 소비자가 놓는 락은 같은 락이다. 그래서 버퍼의 상태(<code>queue</code>)를 읽고 쓰는 코드는 언제나 한 번에 한 스레드만 실행하고, 조건 검사와 대기 등록 사이에 다른 스레드가 끼어들 틈도 없다. 서로 다른 락에서 나온 조건을 섞어 쓰면 이 보장이 사라진다. <code>await()</code>는 자기 조건이 묶인 락만 놓기 때문이다.</p>
+
+<h3>예제 5 분석: 신호가 갈 곳을 안다</h3>
+<p>같은 드라이버로 <code>two</code>를 골라 실행한다. 이번에도 세 번 실행해 세 번 같은 출력을 얻었다.</p>
+<pre data-label="실행 결과: java BufferMain two consumer"><code class="language-text">== c 스레드 시작
+[c1] take 대기: 비어 있음 []
+[c2] take 대기: 비어 있음 []
+[c3] take 대기: 비어 있음 []
+[c4] take 대기: 비어 있음 []
+== 상태: c1=WAITING c2=WAITING c3=WAITING c4=WAITING
+== p 스레드 시작
+[p1] put 저장: data1 -> notEmpty.signal() [data1]
+[c1] take 깨어남 [data1]
+[c1] take 획득: data1 -> notFull.signal() []
+[p2] put 저장: data2 -> notEmpty.signal() [data2]
+[c2] take 깨어남 [data2]
+[c2] take 획득: data2 -> notFull.signal() []
+[p3] put 저장: data3 -> notEmpty.signal() [data3]
+[c3] take 깨어남 [data3]
+[c3] take 획득: data3 -> notFull.signal() []
+[p4] put 저장: data4 -> notEmpty.signal() [data4]
+[c4] take 깨어남 [data4]
+[c4] take 획득: data4 -> notFull.signal() []
+== 상태: c1=TERMINATED c2=TERMINATED c3=TERMINATED c4=TERMINATED p1=TERMINATED p2=TERMINATED p3=TERMINATED p4=TERMINATED
+끝</code></pre>
+<p>소비자 넷은 모두 <code>notEmpty</code>에서 기다린다(대기열 [c1, c2, c3, c4]). p1이 data1을 넣고 <code>notEmpty.signal()</code>을 부르면 c1이 깨어나 data1을 가져간다. c1이 부른 <code>notFull.signal()</code>은 생산자 대기열로 가는데, 그 대기열은 비어 있으므로 아무 일도 하지 않는다. 조건이 하나였다면 이 신호가 c2를 헛되이 깨웠을 것이다. 이후 p2~p4도 같은 모양으로 반복되고, "깨어남" 다음 줄은 언제나 "획득"이다.</p>
+<pre data-label="실행 결과: java BufferMain two producer"><code class="language-text">== p 스레드 시작
+[p1] put 저장: data1 -> notEmpty.signal() [data1]
+[p2] put 저장: data2 -> notEmpty.signal() [data1, data2]
+[p3] put 대기: 가득 참 [data1, data2]
+[p4] put 대기: 가득 참 [data1, data2]
+== 상태: p1=TERMINATED p2=TERMINATED p3=WAITING p4=WAITING
+== c 스레드 시작
+[c1] take 획득: data1 -> notFull.signal() [data2]
+[p3] put 깨어남 [data2]
+[p3] put 저장: data3 -> notEmpty.signal() [data2, data3]
+[c2] take 획득: data2 -> notFull.signal() [data3]
+[p4] put 깨어남 [data3]
+[p4] put 저장: data4 -> notEmpty.signal() [data3, data4]
+[c3] take 획득: data3 -> notFull.signal() [data4]
+[c4] take 획득: data4 -> notFull.signal() []
+== 상태: p1=TERMINATED p2=TERMINATED p3=TERMINATED p4=TERMINATED c1=TERMINATED c2=TERMINATED c3=TERMINATED c4=TERMINATED
+끝</code></pre>
+<p>생산자 쪽도 같다. p3이 data3을 넣고 보낸 신호는 <code>notEmpty</code>로 가므로 p4를 건드리지 않는다. p4는 c2가 한 칸을 비우고 보낸 <code>notFull.signal()</code>을 받고서야 깨어나고, 깨어났을 때는 반드시 자리가 있다. 앞에서 멈췄던 <code>StuckMain</code>도 <code>two</code>로 돌리면 끝까지 진행한다.</p>
+<pre data-label="실행 결과: java StuckMain two"><code class="language-text">[c1] take 대기: 비어 있음 []
+[c2] take 대기: 비어 있음 []
+[p1] put 저장: a -> notEmpty.signal() [a]
+[p1] put 대기: 가득 참 [a]
+[c1] take 깨어남 [a]
+[c1] take 획득: a -> notFull.signal() []
+[p1] put 깨어남 []
+[p1] put 저장: b -> notEmpty.signal() [b]
+[c2] take 깨어남 [b]
+[c2] take 획득: b -> notFull.signal() []
+1초 뒤: c1=TERMINATED c2=TERMINATED p1=TERMINATED</code></pre>
+<p>p1이 끼어들어 두 번째 <code>put()</code>에서 대기하는 데까지는 조건 하나일 때와 똑같다. 차이는 c1이 a를 꺼낸 뒤의 신호에 있다. 그 신호는 <code>notFull</code>로 가고, 거기에는 p1만 있다. p1이 b를 넣고 보낸 신호는 <code>notEmpty</code>로 가고, 거기에는 c2만 있다. 신호가 같은 편에게 소비될 길이 구조적으로 막혔다.</p>
+<div class="table-wrap"><table><thead><tr><th>시나리오</th><th>조건 하나(<code>signal</code>)</th><th>조건 둘(<code>signal</code>)</th></tr></thead><tbody>
+<tr><td>소비자 먼저, 용량 2, 4대4</td><td>헛깨어남 3회</td><td>0회</td></tr>
+<tr><td>생산자 먼저, 용량 2, 4대4</td><td>헛깨어남 1회</td><td>0회</td></tr>
+<tr><td>용량 1, 소비자 2, 생산자 1(두 번 put)</td><td>c2, p1 영구 대기(이 기계에서 20회 중 20회)</td><td>정상 종료</td></tr>
+</tbody></table></div>
+<p>여기서 <code>signalAll()</code>이 아니라 <code>signal()</code> 하나로 충분한 이유를 짚어 두자. 두 가지가 성립하기 때문이다. 첫째, 한 조건 대기열에서 기다리는 스레드는 모두 같은 술어를 기다린다. <code>notEmpty</code>에는 소비자만 있고, 그중 누가 깨어나도 데이터가 있으면 진행할 수 있다. 둘째, 상태 변화 한 번이 진행시킬 수 있는 스레드는 많아야 하나다. 데이터 하나가 들어오면 그것을 가져갈 소비자는 하나뿐이고, 한 칸이 비면 그 칸을 채울 생산자도 하나뿐이다. 이 두 조건이 맞으면 신호 하나를 받은 스레드가 반드시 일을 할 수 있으므로, 신호를 여러 개 보낼 이유도, 신호가 엉뚱한 곳에서 사라질 위험도 없다.</p>
+<p>둘 중 하나라도 깨지면 판단이 달라진다. 예를 들어 데이터 여러 개를 한 번에 넣는 <code>putAll()</code>을 추가하면, 상태 변화 한 번이 소비자 여러 명을 진행시킬 수 있게 된다. 그때 <code>signal()</code>을 한 번만 부르면 기다리던 소비자 중 하나만 깨어나고, 나머지는 데이터가 있는데도 잔다. 넣은 개수만큼 <code>signal()</code>을 부르거나, <code>signalAll()</code>을 쓰거나, 깨어난 스레드가 남은 데이터를 보고 다음 스레드를 깨우게(신호 연쇄) 해야 한다. 뒤에서 볼 <code>LinkedBlockingQueue</code>가 바로 이 신호 연쇄를 쓴다.</p>
+
+<h3>한 층 아래: ConditionObject는 대기열 두 개를 오간다</h3>
+<p>지금까지 "신호를 받으면 락을 기다리는 줄로 옮겨진다"고 말했다. 이것이 비유가 아니라 실제 자료 구조의 이동이라는 것을 OpenJDK 21 소스로 확인해 보자. <code>ReentrantLock</code>은 내부에 <code>AbstractQueuedSynchronizer</code>(AQS)를 상속한 <code>Sync</code> 객체를 두고 모든 일을 거기에 맡긴다. AQS는 세 가지를 가진다. 락 상태를 나타내는 <code>volatile int state</code>(ReentrantLock에서는 0이면 풀림, 양수면 보유 횟수), 현재 주인 스레드, 그리고 락을 얻지 못해 기다리는 스레드들의 노드를 잇는 대기열(이하 락 대기열, AQS 문서의 sync queue)이다. 락 대기열은 <code>head</code>와 <code>tail</code>을 가진 양방향 연결 리스트이고, 노드는 <code>prev</code>, <code>next</code>, 대기 스레드(<code>waiter</code>), 상태(<code>status</code>)를 가진다. 7회차에서 본 <code>lock()</code>이 실패했을 때 스레드가 들어가 <code>LockSupport.park()</code>로 잠드는 곳이 여기다.</p>
+<p><code>newCondition()</code>은 AQS의 내부 클래스 <code>ConditionObject</code>를 새로 만들어 돌려준다. ConditionObject는 <code>firstWaiter</code>와 <code>lastWaiter</code>만 가진 단방향 연결 리스트, 즉 조건 대기열이다. 노드는 <code>ConditionNode</code>이고 다음 노드를 <code>nextWaiter</code>로 가리킨다. 조건을 둘 만들면 조건 대기열이 둘 생기고, 락 대기열은 여전히 하나다. 상태 비트로는 <code>WAITING</code>(1)과 <code>COND</code>(2)가 쓰인다. <code>COND</code> 비트가 켜져 있으면 "아직 조건 대기열에서 신호를 기다리는 중"이라는 뜻이다.</p>
+<p><code>await()</code>의 핵심은 대기 등록과 락 해제를 담당하는 <code>enableWait()</code>다. 아래는 OpenJDK 21 소스에서 그 본체만 발췌한 것이다.</p>
+<pre data-label="OpenJDK 21 AbstractQueuedSynchronizer.ConditionObject.enableWait() 발췌"><code class="language-java">if (isHeldExclusively()) {
+    node.waiter = Thread.currentThread();
+    node.setStatusRelaxed(COND | WAITING);
+    ConditionNode last = lastWaiter;
+    if (last == null)
+        firstWaiter = node;
+    else
+        last.nextWaiter = node;
+    lastWaiter = node;
+    int savedState = getState();
+    if (release(savedState))
+        return savedState;
+}
+node.status = CANCELLED; // lock not held or inconsistent
+throw new IllegalMonitorStateException();</code></pre>
+<p>순서가 앞에서 말한 그대로다. 락을 쥐고 있는지 확인하고(아니면 <code>IllegalMonitorStateException</code>), 노드를 조건 대기열의 꼬리에 붙인 다음, 현재 <code>state</code>를 통째로 저장하고 그 값만큼 <code>release()</code>한다. 보유 횟수가 2였다면 <code>release(2)</code>로 한 번에 0이 된다. 대기 등록이 락 해제보다 먼저이고, 둘 다 락을 쥔 상태에서 일어나므로 잃어버린 깨우기가 생길 수 없다. 저장한 <code>savedState</code>는 나중에 락을 다시 얻을 때 그대로 쓰이고, 그래서 보유 횟수가 복원된다. 이후 <code>await()</code>는 <code>LockSupport.setCurrentBlocker(this)</code>로 "이 조건 객체 때문에 멈춘다"는 표시를 남기고, 노드가 락 대기열로 옮겨질 때까지 park를 반복한다. 깨어나면 <code>reacquire(node, savedState)</code>로 락을 다시 얻는다.</p>
+<pre data-label="OpenJDK 21 AbstractQueuedSynchronizer.ConditionObject.doSignal() 발췌"><code class="language-java">while (first != null) {
+    ConditionNode next = first.nextWaiter;
+    if ((firstWaiter = next) == null)
+        lastWaiter = null;
+    else
+        first.nextWaiter = null; // GC assistance
+    if ((first.getAndUnsetStatus(COND) & COND) != 0) {
+        enqueue(first);
+        if (!all)
+            break;
+    }
+    first = next;
+}</code></pre>
+<p><code>signal()</code>은 락 보유를 확인한 뒤 <code>doSignal(firstWaiter, false)</code>를 부른다. 맨 앞 노드를 조건 대기열에서 떼어 내고, <code>COND</code> 비트를 원자적으로 끈다. 비트가 켜져 있었다면(아직 기다리던 노드라면) <code>enqueue()</code>로 그 노드를 락 대기열의 꼬리에 CAS로 연결하고 멈춘다. <code>signalAll()</code>은 같은 일을 대기열 끝까지 반복한다. 여기서 눈여겨볼 것이 두 가지 있다.</p>
+<ul>
+<li><b><code>signal()</code>은 보통 스레드를 깨우지 않는다.</b> <code>enqueue()</code>는 앞 노드가 취소된 상태이거나 메모리 부족 같은 예외적인 경우에만 <code>unpark</code>를 부른다. 평소에는 노드를 옮기기만 하고, 신호를 받은 스레드는 계속 잠들어 있다. 그 스레드를 실제로 깨우는 것은 나중에 락 주인이 <code>unlock()</code>할 때다. <code>release()</code>가 <code>state</code>를 0으로 만든 뒤 <code>signalNext(head)</code>로 락 대기열 맨 앞 노드의 스레드를 <code>unpark</code>한다. 신호를 보낸 스레드가 아직 락을 쥐고 있으니 지금 깨워 봐야 다시 락을 기다릴 뿐이므로, 이 설계는 쓸데없는 깨우기를 하나 줄인다.</li>
+<li><b>이미 빠져나간 노드는 건너뛴다.</b> 인터럽트로 대기를 포기한 스레드는 스스로 <code>COND</code> 비트를 끈다. <code>doSignal()</code>은 비트가 이미 꺼진 노드를 만나면 옮기지 않고 다음 노드로 넘어가므로, 신호가 떠난 스레드에게 낭비되지 않고 아직 기다리는 스레드에게 간다.</li>
+</ul>
+<figure class="flow-figure"><figcaption>await → signal → unlock에서 노드가 움직이는 길 (OpenJDK 21)</figcaption><ol class="flow">
+<li><strong>await(): 조건 대기열에 등록</strong><span>ConditionNode를 만들어 조건 대기열 꼬리에 붙이고, state를 저장한 뒤 그만큼 release한다. setCurrentBlocker(조건 객체) 후 park.</span></li>
+<li><strong>signal(): 노드 이동</strong><span>조건 대기열 맨 앞 노드를 떼어 COND 비트를 끄고 락 대기열 꼬리에 CAS로 붙인다. 이 시점에 스레드는 여전히 잠들어 있다.</span></li>
+<li><strong>unlock(): 락 대기열 맨 앞을 깨움</strong><span>tryRelease로 state가 0이 되면 signalNext(head)가 head 다음 노드의 스레드를 unpark한다.</span></li>
+<li><strong>await() 복귀: 락 재획득</strong><span>깨어난 스레드는 자기 노드가 락 대기열에 있음을 확인하고 reacquire(node, savedState)로 락을 얻는다. 실패하면 락 대기열에서 다시 park한다.</span></li>
+<li><strong>while 재검사</strong><span>락을 쥔 채 await()에서 돌아와 조건을 다시 검사한다. 거짓이면 1단계로 돌아간다.</span></li>
+</ol></figure>
+<p>이 이동을 바깥에서 관찰할 수 있다. <code>ReentrantLock</code>은 감시용 메서드로 <code>getQueueLength()</code>(락 대기열에 있는 스레드 수의 추정치)와 <code>getWaitQueueLength(Condition)</code>(그 조건에서 기다리는 스레드 수의 추정치)를 준다. 뒤의 절에서 쓸 실험에서, 락을 쥔 스레드가 <code>signal()</code> 전후에 이 두 값을 찍었다. 락 대기열에는 <code>lock()</code>에서 막힌 스레드 하나가, 조건 대기열에는 <code>await()</code> 중인 스레드 하나가 있던 상황이다.</p>
+<pre data-label="signal() 전후의 두 대기열"><code class="language-text">[Lock] signal 전: condWaiter=WAITING lockEntrant=WAITING 락 대기열=1 조건 대기열=1
+[Lock] signal 후: condWaiter=WAITING lockEntrant=WAITING 락 대기열=2 조건 대기열=0</code></pre>
+<p><code>signal()</code> 한 번에 조건 대기열이 1에서 0으로, 락 대기열이 1에서 2로 바뀌었다. 신호를 받은 condWaiter의 상태는 여전히 <code>WAITING</code>이다. 이 시점에 뜬 스레드 덤프에서도 condWaiter는 여전히 <code>ConditionObject</code>를 이유로 park되어 있다고 나온다. 노드는 옮겨졌지만 스레드는 아직 한 번도 깨어나지 않았으므로, 멈출 때 남긴 표시가 그대로 남아 있는 것이다. 락 대기열의 순서는 lockEntrant가 먼저이고 condWaiter가 뒤이므로, 락이 풀리면 lockEntrant가 먼저 깨어난다.</p>
+
+<x-visual id="java-adv1-09-signal-transfer" title="signal()이 노드를 조건 대기열에서 락 대기열로 옮기는 과정" kind="자료 구조 다이어그램" ratio="16:9">
+<x-hint>ReentrantLock 안의 락 대기열(양방향)과 ConditionObject의 조건 대기열(단방향) 두 줄을 그리고, signal() 때 노드 하나가 아래 줄에서 위 줄 꼬리로 옮겨지는 것을 보여 준다.</x-hint>
+<x-prompt>위아래 두 줄의 연결 리스트를 그린다. 위 줄 제목 "락 대기열 (AQS sync queue)": 왼쪽에 회색 상자 "head", 그 오른쪽에 노드 상자 "lockEntrant"가 양방향 화살표로 이어지고, 맨 오른쪽 끝에 점선 상자 자리가 비어 있다. 위 줄 왼쪽 위에 자물쇠 아이콘과 "state=1, owner=lockHolder" 라벨. 아래 줄 제목 "조건 대기열 (ConditionObject)": "firstWaiter" 라벨이 노드 상자 "condWaiter"를 가리키고 노드 사이는 한쪽 방향 화살표("nextWaiter")만 있다. 아래 줄의 condWaiter 노드에서 위 줄 꼬리의 빈 점선 자리로 굵은 굽은 화살표를 그리고 "signal(): COND 비트 끄고 tail에 연결" 라벨을 붙인다. 오른쪽 아래 구석에 작은 메모 상자 "아직 park 상태 — unlock() 때 깨어남". 노드 안에는 잠든 스레드를 뜻하는 작은 달 아이콘. 평면 일러스트, 흰 배경, 파란색과 회색 위주.</x-prompt>
+<x-caption>signal()은 스레드를 깨우지 않고 노드를 락 대기열로 옮긴다. 실제 깨우기는 unlock()이 한다.</x-caption>
+</x-visual>
+
+<h3>스레드의 대기: 어디에서, 어떤 상태로 기다리는가</h3>
+<p>지금까지 "기다린다"는 말이 적어도 네 가지 다른 장소를 가리켰다. 모니터에 들어가려고 기다리는 것, 모니터의 대기 집합에서 기다리는 것, ReentrantLock을 얻으려고 기다리는 것, 조건에서 기다리는 것이다. 이 넷은 들어가는 계기, 빠져나오는 계기, <code>Thread.State</code>, 스레드 덤프에 보이는 모습이 모두 다르다. 운영 중인 서버에서 스레드가 멈췄을 때 덤프를 읽어 원인을 찾으려면 이 구분이 필요하다. 한 프로그램으로 네 장소를 모두 만들어 보자.</p>
+<pre><code class="language-java">import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class WaitPlacesMain {
+    static final Object monitor = new Object();
+    static final ReentrantLock lock = new ReentrantLock();
+    static final Condition cond = lock.newCondition();
+
+    public static void main(String[] args) throws Exception {
+        // 1) synchronized 쪽
+        Thread waiter = new Thread(() -> {
+            synchronized (monitor) {
+                try { monitor.wait(); } catch (InterruptedException e) { }
+            }
+        }, "monWaiter");
+        waiter.start();
+        Thread.sleep(100);                       // waiter가 wait()로 들어갈 시간
+
+        Thread holder = new Thread(() -> {
+            synchronized (monitor) {
+                Log.sleep(1000);                  // 모니터를 쥔 채로 1초
+                monitor.notify();                 // 아직 모니터를 쥔 채로 깨운다
+                Log.sleep(1000);                  // 깨운 뒤에도 1초 더 쥐고 있다
+            }
+        }, "monHolder");
+        holder.start();
+        Thread.sleep(100);
+        Thread blocked = new Thread(() -> {
+            synchronized (monitor) { }
+        }, "monEntrant");
+        blocked.start();
+        Thread.sleep(100);
+        System.out.println("[모니터] notify 전: monWaiter=" + waiter.getState()
+                + " monEntrant=" + blocked.getState());
+        Thread.sleep(1000);                       // holder가 notify를 마친 뒤
+        System.out.println("[모니터] notify 후: monWaiter=" + waiter.getState()
+                + " monEntrant=" + blocked.getState());
+        holder.join(); waiter.join(); blocked.join();
+
+        // 2) ReentrantLock + Condition 쪽
+        Thread cWaiter = new Thread(() -> {
+            lock.lock();
+            try { cond.await(); } catch (InterruptedException e) { } finally { lock.unlock(); }
+        }, "condWaiter");
+        Thread lEntrant = new Thread(() -> {
+            lock.lock();
+            lock.unlock();
+        }, "lockEntrant");
+        Thread lHolder = new Thread(() -> {
+            lock.lock();
+            try {
+                Log.sleep(1000);
+                report("signal 전", cWaiter, lEntrant);
+                cond.signal();
+                report("signal 후", cWaiter, lEntrant);
+                Log.sleep(1000);
+            } finally { lock.unlock(); }
+        }, "lockHolder");
+        cWaiter.start();
+        Thread.sleep(100);
+        lHolder.start();
+        Thread.sleep(100);
+        lEntrant.start();
+        lHolder.join(); cWaiter.join(); lEntrant.join();
+    }
+
+    static void report(String when, Thread cWaiter, Thread lEntrant) {
+        // lockHolder가 락을 쥔 채로 부른다. getWaitQueueLength는 락 보유자만 부를 수 있다.
+        System.out.println("[Lock] " + when + ": condWaiter=" + cWaiter.getState()
+                + " lockEntrant=" + lEntrant.getState()
+                + " 락 대기열=" + lock.getQueueLength()
+                + " 조건 대기열=" + lock.getWaitQueueLength(cond));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[모니터] notify 전: monWaiter=WAITING monEntrant=BLOCKED
+[모니터] notify 후: monWaiter=BLOCKED monEntrant=BLOCKED
+[Lock] signal 전: condWaiter=WAITING lockEntrant=WAITING 락 대기열=1 조건 대기열=1
+[Lock] signal 후: condWaiter=WAITING lockEntrant=WAITING 락 대기열=2 조건 대기열=0</code></pre>
+<p><code>getWaitQueueLength()</code>를 main에서 부르지 않고 락을 쥔 lockHolder 안에서 부른 데는 이유가 있다. 이 메서드는 락을 쥔 스레드만 부를 수 있어서, main이 부르려면 먼저 락을 얻어야 한다. 그러면 main은 lockHolder가 락을 놓을 때까지 기다리게 되고, 그때는 이미 관찰하려던 상태가 지나가 버린다. 감시용 메서드조차 동기화 규칙 안에 있다는 것을 보여 주는 작은 예다.</p>
+<p>모니터 쪽부터 읽자. notify 전에 <code>monWaiter</code>는 <code>WAITING</code>, <code>monEntrant</code>는 <code>BLOCKED</code>다. 하나는 대기 집합에, 하나는 진입 대기에 있다. notify 후에 <code>monWaiter</code>가 <code>BLOCKED</code>로 바뀌었다. 대기 집합에서는 빠져나왔지만 monHolder가 아직 모니터를 1초 더 쥐고 있으므로, 이제는 모니터에 다시 들어가려고 기다린다. <code>Thread.State.BLOCKED</code>의 Javadoc 정의가 정확히 이 두 경우를 포함한다. 모니터 락을 기다리며 막힌 상태로, synchronized 블록이나 메서드에 들어가거나, <code>Object.wait</code>를 부른 뒤 다시 들어가려는 경우다. 같은 시점에 jstack으로 뜬 덤프(주소와 일부 프레임은 줄였다)는 이 차이를 문구로 보여 준다.</p>
+<pre data-label="스레드 덤프 발췌 (모니터 쪽)"><code class="language-text">"monWaiter" ... in Object.wait()
+   java.lang.Thread.State: WAITING (on object monitor)
+	at java.lang.Object.wait0(java.base@21.0.13/Native Method)
+	- waiting on <0x00000070106163f0> (a java.lang.Object)
+	...
+"monEntrant" ... waiting for monitor entry
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	...
+	- waiting to lock <0x00000070106163f0> (a java.lang.Object)
+
+(notify 후)
+"monWaiter" ... in Object.wait()
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at java.lang.Object.wait0(java.base@21.0.13/Native Method)
+	- waiting to re-lock in wait() <0x00000070106163f0> (a java.lang.Object)</code></pre>
+<p>"waiting on"은 대기 집합에서 통지를 기다리는 중, "waiting to lock"은 모니터 진입을 기다리는 중, "waiting to re-lock in wait()"는 통지를 받고 모니터를 다시 얻으려는 중이다. HotSpot의 <code>ObjectMonitor</code>(OpenJDK 21의 <code>objectMonitor.hpp</code>)는 이 구분을 필드로 가지고 있다. <code>_WaitSet</code>은 소스 주석 그대로 모니터에서 <code>wait()</code> 중인 스레드의 연결 리스트이고, <code>_cxq</code>는 진입하다 막힌 지 얼마 안 된 스레드의 연결 리스트, <code>_EntryList</code>는 진입이나 재진입에서 막힌 스레드들이다. JLS가 말하는 대기 집합은 <code>_WaitSet</code>으로 구현되고, 진입 대기는 <code>_cxq</code>와 <code>_EntryList</code> 두 리스트로 나뉘어 있다. 이 리스트들 사이에서 스레드를 어떤 순서로 옮기는지는 HotSpot 내부 정책이고 명세가 보장하는 것이 아니므로, 프로그램이 그 순서에 기대서는 안 된다.</p>
+<p>ReentrantLock 쪽은 다르다. 락을 기다리는 <code>lockEntrant</code>도, 조건에서 기다리는 <code>condWaiter</code>도 <code>WAITING</code>이다. 신호를 받아 락 대기열로 옮겨진 뒤에도 <code>WAITING</code>이다. 둘 다 결국 <code>LockSupport.park()</code>로 멈추고, <code>Thread.State.WAITING</code>의 Javadoc은 이 상태에 들어가는 메서드로 <code>LockSupport.park</code>를 명시한다. ReentrantLock은 JVM이 아니라 자바 코드(AQS)로 짠 락이라서, JVM이 보기에는 "어떤 객체 때문에 park된 스레드"일 뿐이다. 그래서 <code>BLOCKED</code>는 오직 모니터 락에만 쓰이는 상태다.</p>
+<pre data-label="스레드 덤프 발췌 (ReentrantLock 쪽, signal 전)"><code class="language-text">"condWaiter" ... waiting on condition
+   java.lang.Thread.State: WAITING (parking)
+	at jdk.internal.misc.Unsafe.park(java.base@21.0.13/Native Method)
+	- parking to wait for  <0x00000070106164f0> (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+	at java.util.concurrent.locks.LockSupport.park(java.base@21.0.13/LockSupport.java:371)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionNode.block(java.base@21.0.13/AbstractQueuedSynchronizer.java:519)
+	at java.util.concurrent.ForkJoinPool.unmanagedBlock(java.base@21.0.13/ForkJoinPool.java:3780)
+	at java.util.concurrent.ForkJoinPool.managedBlock(java.base@21.0.13/ForkJoinPool.java:3725)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await(java.base@21.0.13/AbstractQueuedSynchronizer.java:1746)
+	...
+"lockEntrant" ... waiting on condition
+   java.lang.Thread.State: WAITING (parking)
+	at jdk.internal.misc.Unsafe.park(java.base@21.0.13/Native Method)
+	- parking to wait for  <0x00000070106164d0> (a java.util.concurrent.locks.ReentrantLock$NonfairSync)
+	at java.util.concurrent.locks.LockSupport.park(java.base@21.0.13/LockSupport.java:221)
+	at java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire(java.base@21.0.13/AbstractQueuedSynchronizer.java:788)
+	...
+	at java.util.concurrent.locks.ReentrantLock.lock(java.base@21.0.13/ReentrantLock.java:322)</code></pre>
+<p>둘을 가르는 단서는 "parking to wait for" 뒤에 적힌 블로커(blocker) 객체의 클래스다. <code>ReentrantLock$NonfairSync</code>면 락 대기열에서 락을 기다리는 중이고, <code>AbstractQueuedSynchronizer$ConditionObject</code>면 조건 대기열에서 신호를 기다리는 중이다. 블로커는 앞에서 본 <code>LockSupport.setCurrentBlocker(this)</code>나 <code>park(blocker)</code>로 남긴 표시다. 스레드 이름 줄의 "waiting on condition"이라는 머리말은 조건 대기를 뜻하지 않는다는 점에 주의하자. 이 덤프에서 그 머리말은 조건과 무관하게 락만 기다리는 lockEntrant에도, 모니터 쪽 덤프에서 <code>Thread.sleep()</code> 중이던 monHolder(<code>TIMED_WAITING (sleeping)</code>)에도 똑같이 붙어 있었다. 덤프에서 <code>BLOCKED</code>만 찾아서는 ReentrantLock 경합을 하나도 찾지 못한다. 그리고 앞 절에서 말한 대로, 신호를 받은 직후 condWaiter의 덤프는 같은 <code>ConditionObject</code> 블로커를 보여 준다. 덤프만으로는 "신호를 받고 락을 기다리는 중"과 "아직 신호를 못 받은 중"을 구분할 수 없다.</p>
+<div class="table-wrap"><table><thead><tr><th>대기 장소</th><th>들어가는 계기</th><th>Thread.State</th><th>덤프의 표시</th><th>나오는 계기</th></tr></thead><tbody>
+<tr><td>모니터 진입 대기 (HotSpot <code>_cxq</code>/<code>_EntryList</code>)</td><td>synchronized 진입 시 다른 스레드가 모니터를 쥠</td><td><code>BLOCKED</code></td><td>waiting to lock</td><td>모니터가 풀리고 경쟁에서 이김</td></tr>
+<tr><td>모니터 대기 집합 (HotSpot <code>_WaitSet</code>)</td><td><code>wait()</code></td><td><code>WAITING</code> / 시간 제한이면 <code>TIMED_WAITING</code></td><td>waiting on</td><td>notify, notifyAll, 인터럽트, 시간 초과, 가짜 깨어남</td></tr>
+<tr><td>wait 후 재진입 대기</td><td>대기 집합에서 빠져나옴</td><td><code>BLOCKED</code></td><td>waiting to re-lock in wait()</td><td>모니터 획득</td></tr>
+<tr><td>AQS 락 대기열</td><td><code>lock()</code> 실패, 또는 signal로 옮겨짐</td><td><code>WAITING</code> (parking)</td><td>parking to wait for ...Sync 또는 ...ConditionObject</td><td><code>unlock()</code>의 <code>signalNext</code>로 깨어나 획득</td></tr>
+<tr><td>조건 대기열</td><td><code>await()</code></td><td><code>WAITING</code> / <code>awaitNanos</code> 등은 <code>TIMED_WAITING</code></td><td>parking to wait for ...ConditionObject</td><td>signal, signalAll, 인터럽트, 시간 초과, 가짜 깨어남</td></tr>
+</tbody></table></div>
+<p>모니터 쪽과 AQS 쪽은 구조가 닮았다. 진입 대기에 해당하는 것이 락 대기열이고, 대기 집합에 해당하는 것이 조건 대기열이다. 다른 점은 셋이다. 첫째, 대기 집합은 객체당 하나지만 조건 대기열은 원하는 만큼 만들 수 있다. 둘째, 락을 기다리는 동안의 인터럽트 처리다. synchronized 진입 대기는 인터럽트로 빠져나올 수 없지만, AQS 쪽은 <code>lockInterruptibly()</code>를 쓰면 락 대기 중에도 인터럽트로 빠져나올 수 있다. 셋째, 위에서 본 대로 상태 이름이 다르다. 시간 제한 대기는 <code>awaitNanos()</code>가 내부에서 <code>LockSupport.parkNanos()</code>를 쓰므로 <code>TIMED_WAITING</code>으로 보인다.</p>
+
+<x-visual id="java-adv1-09-wait-places" title="synchronized와 ReentrantLock의 대기 장소와 스레드 상태" kind="구조도" ratio="16:9">
+<x-hint>왼쪽은 모니터(진입 대기와 대기 집합), 오른쪽은 AQS(락 대기열과 조건 대기열 둘)를 같은 모양으로 배치해, 스레드가 어디를 거쳐 가고 각 장소에서 어떤 Thread.State인지 보여 준다.</x-hint>
+<x-prompt>좌우 두 패널. 왼쪽 패널 제목 "synchronized (모니터)": 가운데에 문이 달린 방("임계 영역, 주인 1명"), 문 앞에 줄 하나("진입 대기", 빨간 태그 "BLOCKED"), 방 옆에 대기실 하나("대기 집합 wait set", 노란 태그 "WAITING"). 방에서 대기실로 화살표 "wait()", 대기실에서 문 앞 줄로 화살표 "notify() 후 재진입" 그리고 그 줄 옆에 빨간 태그 "BLOCKED". 오른쪽 패널 제목 "ReentrantLock + Condition (AQS)": 같은 모양의 방과 문, 문 앞 줄("락 대기열", 노란 태그 "WAITING"), 방 옆에 대기실 두 개("notFull 조건 대기열", "notEmpty 조건 대기열", 둘 다 노란 태그 "WAITING"). 방에서 각 대기실로 화살표 "await()", 각 대기실에서 문 앞 줄로 화살표 "signal()". 사람 아이콘을 줄과 대기실에 몇 명씩 배치. 평면 일러스트, 흰 배경.</x-prompt>
+<x-caption>모니터의 진입 대기와 대기 집합은 AQS의 락 대기열과 조건 대기열에 대응한다. BLOCKED는 모니터에만 쓰인다.</x-caption>
+</x-visual>
+
+<h3>덤프에 보인 ForkJoinPool 프레임: 조건 대기는 ManagedBlocker다</h3>
+<p>앞 절의 condWaiter 덤프를 다시 보면 이상한 줄이 둘 있다. condWaiter는 <code>new Thread()</code>로 만든 평범한 플랫폼 스레드이고 ForkJoinPool과는 아무 관계가 없다. 그런데 <code>ConditionObject.await</code>와 <code>ConditionNode.block</code> 사이에 <code>ForkJoinPool.managedBlock</code>과 <code>ForkJoinPool.unmanagedBlock</code> 프레임이 끼어 있다. 같은 덤프에서 락을 기다리던 lockEntrant의 스택에는 이 프레임이 없다. 조건에서 기다릴 때만 ForkJoinPool을 거쳐 잠드는 것이다. 이유는 OpenJDK 21의 AQS 소스에 있다.</p>
+<p>조건 대기열의 노드 <code>ConditionNode</code>는 단순한 자료 구조가 아니라 <code>ForkJoinPool.ManagedBlocker</code> 인터페이스를 구현한다. 소스 주석은 그 목적을, Condition을 ForkJoinPool 안에서 쓰더라도 고정 크기 풀이 고갈될 위험이 없게 하는 것이라고 적는다. 그리고 이 장치는 시간 제한 없는 조건 대기에만 쓸 수 있고 시간 제한 버전에는 쓰지 않는다고 덧붙인다. ManagedBlocker는 메서드가 둘뿐인 인터페이스다. <code>isReleasable()</code>은 더 기다릴 필요가 없으면 true를 돌려주고, <code>block()</code>은 필요하면 현재 스레드를 막는다. ConditionNode의 구현은 다음이 전부다.</p>
+<pre data-label="OpenJDK 21 AbstractQueuedSynchronizer.ConditionNode 발췌"><code class="language-java">static final class ConditionNode extends Node
+    implements ForkJoinPool.ManagedBlocker {
+    ConditionNode nextWaiter;            // link to next waiting node
+
+    public final boolean isReleasable() {
+        return status <= 1 || Thread.currentThread().isInterrupted();
+    }
+
+    public final boolean block() {
+        while (!isReleasable()) LockSupport.park();
+        return true;
+    }
+}</code></pre>
+<p><code>status <= 1</code>은 <code>COND</code> 비트(값 2)가 꺼졌다는 뜻이다. 앞에서 본 대로 이 비트는 signal로 락 대기열에 옮겨지거나 인터럽트로 대기를 취소할 때 꺼지므로, 그때부터는 조건 대기열에서 더 기다릴 이유가 없다. 시간 제한 없는 <code>await()</code>와 <code>awaitUninterruptibly()</code>는 노드를 등록하고 락을 놓은 뒤 <code>LockSupport.park()</code>를 직접 부르지 않고 <code>ForkJoinPool.managedBlock(node)</code>에 대기를 맡긴다. <code>managedBlock()</code>은 먼저 현재 스레드가 <code>ForkJoinWorkerThread</code>인지 본다. 아니면 <code>unmanagedBlock()</code>으로 가서 <code>isReleasable()</code>과 <code>block()</code>이 모두 거짓인 동안 반복할 뿐이다. ForkJoinPool의 Javadoc도 풀 밖에서 부르면 이 메서드가 <code>while (!blocker.isReleasable()) if (blocker.block()) break;</code>와 동작이 같다고 적는다. 평범한 스레드에게는 결국 park 루프 하나이고, 덤프의 두 프레임은 이 경로를 지나간 흔적이다. 반면 <code>awaitNanos()</code> 같은 시간 제한 버전은 <code>LockSupport.parkNanos()</code>를(<code>awaitUntil()</code>은 <code>parkUntil()</code>을) 직접 부르고, lockEntrant가 지나간 <code>acquire()</code>도 park를 직접 부르므로 이 프레임이 없다.</p>
+<p>현재 스레드가 ForkJoinPool의 작업 스레드이면 이야기가 달라진다. <code>managedBlock()</code>은 풀의 <code>compensatedBlock()</code>으로 가고, 여기서 <code>tryCompensate()</code>가 상황에 따라 쉬고 있는 작업 스레드를 깨우거나, 새 작업 스레드를 만들거나, 풀이 세는 활성 스레드 수를 하나 줄인 다음에야 <code>block()</code>으로 잠든다. Javadoc의 표현으로, 현재 스레드가 막혀 있는 동안 충분한 병렬도(parallelism)를 보장하려고 필요하면 예비 스레드를 활성화한다. ForkJoinPool은 정해진 병렬도만큼의 스레드로 작업을 돌리는 풀이라서, 작업 하나가 큐 앞에서 기다리며 스레드를 붙잡으면 그만큼 일할 스레드가 줄기 때문이다. 직접 확인해 보자. 병렬도 2인 ForkJoinPool에 작업 6개를 넣고, 작업마다 2초 가까이 막히게 하되 막히는 방법을 네 가지로 바꿔 가며, 0.5초 뒤에 시작한 작업 수와 풀의 스레드 수를 센다.</p>
+<pre><code class="language-java">import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class FjpBlockMain {
+    public static void main(String[] args) throws Exception {
+        for (String kind : new String[] {"take", "poll", "sleep", "wait"}) {
+            ForkJoinPool pool = new ForkJoinPool(2);
+            BlockingQueue<String> q = new ArrayBlockingQueue<>(1);   // 계속 비어 있다
+            Object mon = new Object();
+            AtomicInteger started = new AtomicInteger();
+            for (int i = 0; i < 6; i++) {
+                pool.execute(() -> {
+                    started.incrementAndGet();
+                    try {
+                        switch (kind) {
+                            case "take" -> q.take();                         // 시간 제한 없는 조건 대기
+                            case "sleep" -> Thread.sleep(2000);
+                            case "poll" -> q.poll(2, TimeUnit.SECONDS);      // 시간 제한 조건 대기
+                            default -> { synchronized (mon) { mon.wait(2000); } }
+                        }
+                    } catch (InterruptedException e) { }
+                });
+            }
+            Thread.sleep(500);
+            System.out.println(kind + ": 시작한 작업=" + started.get()
+                    + " 풀 스레드 수=" + pool.getPoolSize()
+                    + " parallelism=" + pool.getParallelism());
+            pool.shutdownNow();
+            pool.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (세 번 실행해 세 번 같았다)"><code class="language-text">take: 시작한 작업=6 풀 스레드 수=7 parallelism=2
+poll: 시작한 작업=2 풀 스레드 수=2 parallelism=2
+sleep: 시작한 작업=2 풀 스레드 수=2 parallelism=2
+wait: 시작한 작업=2 풀 스레드 수=2 parallelism=2</code></pre>
+<p><code>take()</code>로 기다린 경우에만 작업 6개가 모두 시작했고, 풀의 스레드가 병렬도 2를 넘어 7개로 늘었다. 같은 상황(take 작업 6개)을 따로 만들어 0.5초 뒤 풀 스레드마다 스택을 훑어보니, worker-1부터 worker-6까지는 모두 <code>WAITING</code>으로 <code>ArrayBlockingQueue.take</code> 안에 있었고, worker-7은 <code>TIMED_WAITING</code>으로 일감을 기다리는 <code>ForkJoinPool.awaitWork</code> 안에 있었다. 막힌 작업이 생길 때마다 보충 스레드가 생겼고, 마지막 보충 스레드는 남은 일감이 없어 쉬는 중이다. 같은 큐에서 같은 이유로 기다리는데도 시간 제한이 있는 <code>poll(2, SECONDS)</code>는 보충을 받지 못해 작업 2개만 시작했다. 앞의 소스 주석 그대로다. <code>Thread.sleep()</code>과 synchronized 안의 <code>wait(2000)</code>도 이 실험에서는 보충이 없었다. 이 실험의 네 가지 대기 가운데 풀이 "이 스레드가 곧 막힌다"는 것을 알아챈 것은 ManagedBlocker를 거친 대기뿐이고(풀 안에서 이런 보충을 받는 경로로는 이 밖에 <code>ForkJoinTask.join()</code>이 거치는 <code>helpJoin()</code> 등이 있다), 나머지 대기는 풀이 보기에 작업 스레드가 그냥 오래 일하는 것과 구별되지 않는다.</p>
+<p>이 차이는 실무와 닿아 있다. <code>CompletableFuture.supplyAsync()</code>나 병렬 스트림이 기본으로 쓰는 공통 풀(common pool)도 ForkJoinPool이다. 그 안에서 <code>take()</code>로 기다리면 풀은 보충 스레드를 만들며 계속 돌아가지만 보충에는 한도가 있다. 공통 풀의 한도는 ForkJoinPool Javadoc에 적힌 시스템 속성 <code>java.util.concurrent.ForkJoinPool.common.maximumSpares</code>로 정하고 기본값은 256이다. 한도에 닿으면 <code>tryCompensate()</code>가 <code>RejectedExecutionException</code>("Thread limit exceeded replacing blocked worker")을 던진다. <code>await()</code>는 이 예외를 잡아 <code>rejected</code> 표시를 남기고, 그 뒤로는 보충 없이 <code>node.block()</code>으로 그냥 잠든다. 조건 대기가 예외로 실패하지는 않지만 보충도 더는 없다는 뜻이다. 반대로 시간 제한 대기나 <code>sleep()</code>처럼 보충을 받지 못하는 대기를 공통 풀의 작업 안에서 하면, 위 실험의 <code>poll</code> 줄처럼 막힌 작업 수만큼 풀의 병렬도가 그대로 줄고 다른 작업은 시작조차 못 한다. 그래서 블로킹 대기가 많은 작업은 보충 장치에 기대기보다 그 용도로 크기를 정한 스레드 풀(12회)에 맡기는 편이 동작을 예측하기 쉽다.</p>
+
+<h3>while이어야 하는 이유: 가짜 깨어남, 끼어들기, 인터럽트</h3>
+<p>조건을 둘로 나눠 신호가 갈 곳을 정했으니 이제 <code>while</code> 대신 <code>if</code>로 충분하지 않을까. 그렇지 않다. 깨어난 스레드가 조건을 다시 검사해야 하는 이유는 신호의 방향과 무관한 곳에도 있다.</p>
+<p>첫째는 가짜 깨어남(spurious wake-up)이다. JLS 17.2.1은 구현이 아무 지시 없이 스레드를 대기 집합에서 꺼내는 것을 허용한다(권장하지는 않는다)고 적고, 바로 이어 그래서 <code>wait</code>는 기다리는 논리 조건이 성립할 때만 끝나는 루프 안에서만 써야 한다고 덧붙인다. Condition의 Javadoc도 기반 플랫폼의 의미에 대한 양보로 가짜 깨어남이 허용된다고 하고, 구현이 그 가능성을 없앨 수는 있지만 프로그래머는 항상 일어날 수 있다고 가정하고 루프에서 기다리라고 권한다. 특정 구현에서 거의 일어나지 않는다는 것은 이 규칙을 어겨도 된다는 근거가 되지 않는다. 명세가 허용하는 일은 다른 JVM, 다른 운영체제, 다른 버전에서 일어날 수 있다.</p>
+<p>둘째는 끼어들기다. <code>new ReentrantLock()</code>은 비공정(nonfair) 락이다. OpenJDK 21의 <code>NonfairSync.initialTryLock()</code>은 첫 시도에서 대기열을 보지 않고 곧바로 <code>state</code>를 0에서 1로 CAS한다(소스 주석이 "first attempt is unguarded"라고 적는다). 그래서 다음 순서가 가능하다. 생산자가 데이터 하나를 넣고 <code>notEmpty.signal()</code>로 소비자 A를 락 대기열로 옮긴 뒤 락을 놓는다. A가 깨어나 코어에 오르기 전에, 방금 도착한 소비자 B가 <code>take()</code>의 <code>lock()</code>에서 비어 있는 락을 CAS로 잡는다. B는 버퍼가 비어 있지 않으니 기다리지 않고 데이터를 가져간다. 그다음 A가 락을 얻는다. 신호는 정확히 소비자에게 갔지만, A가 락을 얻었을 때 데이터는 이미 없다. <code>if</code>였다면 A는 검사 없이 <code>queue.poll()</code>로 내려가 <code>null</code>을 꺼내 돌려준다. <code>while</code>이면 A는 다시 기다린다. 앞의 <code>StuckMain</code>에서 p1이 c1보다 먼저 락을 다시 잡은 것도 같은 끼어들기였다.</p>
+<p>공정(fair) 락을 쓰면 끼어들기는 막힌다. <code>new ReentrantLock(true)</code>가 만드는 <code>FairSync.initialTryLock()</code>은 락이 풀려 있어도 대기열에 스레드가 있으면(<code>hasQueuedThreads()</code>) CAS를 시도하지 않는다. <code>ArrayBlockingQueue</code>도 생성자의 <code>fair</code> 인자로 같은 선택을 준다. 그 Javadoc은 공정성이 일반적으로 처리량을 낮추지만 편차를 줄이고 기아를 막는다고 적는다. 하지만 공정 락을 써도 <code>while</code>은 필요하다. 가짜 깨어남은 공정성과 무관하고, <code>signalAll()</code>로 여러 스레드를 깨우면 그중 첫 번째만 조건을 만족할 수 있기 때문이다.</p>
+<p>셋째는 인터럽트와 신호가 겹치는 경우다. OpenJDK 21의 <code>await()</code>는 기다리는 도중 인터럽트를 감지하면 자기 노드의 <code>COND</code> 비트를 직접 끄려고 시도한다. 성공하면(아직 신호를 받기 전이면) 대기를 취소한 것이고, 락을 다시 얻은 다음 <code>InterruptedException</code>을 던진다. 실패하면(신호가 먼저 와서 비트가 이미 꺼졌으면) 신호를 받은 것으로 치고 정상 반환하되, 인터럽트 상태를 다시 켜 둔다. 어느 경우든 <code>await()</code>에서 나올 때 락은 쥐어져 있으므로 <code>finally</code>의 <code>unlock()</code>이 안전하다. 그리고 앞에서 본 대로 <code>doSignal()</code>은 비트가 이미 꺼진 노드를 건너뛰므로, 인터럽트로 떠난 스레드 때문에 신호가 사라지지 않는다. JLS 17.2.1이 <code>wait</code>에 대해 요구하는 것도 같다. 인터럽트와 통지가 함께 일어나면 둘 사이에 순서가 정해져야 하고, 인터럽트가 먼저로 간주되면 그 통지는 대기 집합의 다른 스레드가 받아야 한다.</p>
+<aside class="note">정상 반환했지만 인터럽트 상태가 켜진 채로 돌아오는 경우가 있으므로, <code>await()</code> 뒤의 코드가 인터럽트를 확인해야 한다면 <code>Thread.currentThread().isInterrupted()</code>를 직접 봐야 한다. 그 경우 다음 <code>await()</code>는 시작하자마자 <code>InterruptedException</code>을 던진다(OpenJDK 21의 <code>await()</code>는 맨 처음에 <code>Thread.interrupted()</code>를 검사한다).</aside>
+
+<h3>규모를 키워 세어 보기: signalAll, 조건 분리, 공정 락</h3>
+<p>앞의 실행 추적은 스레드 몇 개로 헛깨어남을 하나씩 셌다. 스레드가 많아지면 이 비용이 어떻게 자라는지, 그리고 앞 절에서 말한 "신호와 락 재획득 사이의 틈"이 실제로 얼마나 자주 열리는지 세어 보자. 아래 버퍼는 <code>await()</code>를 부른 횟수와, 깨어났는데 조건이 여전히 거짓이라 다시 기다린 횟수(헛깨어남)를 센다. 두 카운터는 락 안에서만 바꾸므로 따로 동기화할 필요가 없다. 용량을 1로 두어 거의 모든 연산이 한 번은 기다리게 했다. 모드 <code>all</code>은 조건 하나에 <code>signalAll()</code>로, 앞에서 영구 대기를 피하는 첫 번째 해결책으로 소개한 방식이다. 모드 <code>two</code>는 예제 5와 같은 조건 둘에 <code>signal()</code>이다.</p>
+<pre><code class="language-java">import java.util.ArrayDeque;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class WakeCountMain {
+    static final class CountingBuffer {
+        final ReentrantLock lock = new ReentrantLock(Boolean.getBoolean("fair"));
+        final Condition notFull, notEmpty;
+        final boolean one;
+        final ArrayDeque<Integer> q = new ArrayDeque<>();
+        final int capacity;
+        long awaits, futile;   // 락 안에서만 바꾼다
+
+        CountingBuffer(int capacity, boolean one) {
+            this.capacity = capacity;
+            this.one = one;
+            notFull = lock.newCondition();
+            notEmpty = one ? notFull : lock.newCondition();   // all 모드는 조건 하나를 함께 쓴다
+        }
+
+        void put(int x) throws InterruptedException {
+            lock.lock();
+            try {
+                boolean woke = false;
+                while (q.size() == capacity) {
+                    if (woke) futile++;            // 깨어났는데 아직 가득 차 있다
+                    awaits++;
+                    notFull.await();
+                    woke = true;
+                }
+                q.offer(x);
+                if (one) notEmpty.signalAll(); else notEmpty.signal();
+            } finally { lock.unlock(); }
+        }
+
+        int take() throws InterruptedException {
+            lock.lock();
+            try {
+                boolean woke = false;
+                while (q.isEmpty()) {
+                    if (woke) futile++;            // 깨어났는데 아직 비어 있다
+                    awaits++;
+                    notEmpty.await();
+                    woke = true;
+                }
+                int x = q.poll();
+                if (one) notFull.signalAll(); else notFull.signal();
+                return x;
+            } finally { lock.unlock(); }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        boolean one = args[0].equals("all");
+        int threads = Integer.parseInt(args[1]);   // 생산자 수 = 소비자 수
+        int perThread = 20_000;
+        CountingBuffer b = new CountingBuffer(1, one);
+        Thread[] ts = new Thread[threads * 2];
+        for (int i = 0; i < threads; i++) {
+            ts[i] = new Thread(() -> { try { for (int k = 0; k < perThread; k++) b.put(k); } catch (InterruptedException e) {} });
+            ts[threads + i] = new Thread(() -> { try { for (int k = 0; k < perThread; k++) b.take(); } catch (InterruptedException e) {} });
+        }
+        long t0 = System.nanoTime();
+        for (Thread t : ts) t.start();
+        for (Thread t : ts) t.join();
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        System.out.printf("%s 생산자·소비자 각 %d개, 원소 %d개: await 호출=%d, 헛깨어남=%d, %dms%n",
+                one ? "조건 하나+signalAll" : "조건 둘+signal", threads, threads * perThread, b.awaits, b.futile, ms);
+    }
+}</code></pre>
+<p>생산자와 소비자를 각각 1개, 4개, 16개로 늘려 가며 두 모드를 번갈아 돌렸다. 이 기계는 코어가 8개다. 아래 표의 수는 모두 실행마다 달라진다. 특히 시간은 같은 설정에서도 실행마다 두세 배씩 달랐으므로 벤치마크로 읽으면 안 되고, 자릿수와 방향만 본다.</p>
+<div class="table-wrap"><table><thead><tr><th>생산자·소비자 각</th><th>원소 수</th><th>조건 하나 + signalAll: await / 헛깨어남</th><th>조건 둘 + signal: await / 헛깨어남</th></tr></thead><tbody>
+<tr><td>1</td><td>20,000</td><td>39,992 / 0 (115ms)</td><td>39,944 / 0 (180ms)</td></tr>
+<tr><td>4</td><td>80,000</td><td>463,461 / 303,486 (1,105ms)</td><td>159,987 / 11 (338ms)</td></tr>
+<tr><td>16</td><td>320,000</td><td>1,930,270 / 1,290,318 (3,836ms)</td><td>639,988 / 24 (1,271ms)</td></tr>
+<tr><td>16 (다시 두 번)</td><td>320,000</td><td>2,655,390 / 2,015,508, 4,351,375 / 3,711,514</td><td>639,611 / 686, 639,726 / 443</td></tr>
+</tbody></table></div>
+<p>세 가지가 읽힌다. 첫째, 생산자와 소비자가 하나씩이면 두 방식에 차이가 없다. 반대편에서 기다리는 스레드가 늘 하나뿐이라 <code>signalAll()</code>도 정확히 그 하나를 깨운다. await 호출이 원소 수의 거의 두 배인 것은 용량이 1이라 넣기와 꺼내기가 대부분 한 번씩 기다렸기 때문이다. 둘째, 스레드가 늘면 <code>signalAll()</code> 쪽의 헛깨어남이 await 호출의 대부분을 차지하고, 원소 하나당 await 호출이 6번 안팎에서 13번 남짓까지 늘어난다. 조건이 하나라서 <code>signalAll()</code>이 같은 편 생산자와 반대편 소비자를 가리지 않고 모두 락 대기열로 옮기는데, 상태 변화 한 번으로 진행할 수 있는 스레드는 하나뿐이기 때문이다. 이 기계에서 돌린 스레드 4개 이상의 실행에서는 모두 <code>signalAll()</code> 쪽이 세 배 안팎 오래 걸렸다. 셋째, 조건을 둘로 나누면 await 호출이 원소당 두 번으로 떨어지지만 헛깨어남이 0은 아니다. 11번에서 686번까지, 신호를 받은 스레드가 락을 다시 얻기 전에 다른 소비자(또는 생산자)가 먼저 락을 잡아 상태를 바꾼 경우다. 명세가 허용하는 가짜 깨어남이 섞였을 수도 있지만 어느 쪽이든 결론은 같다. 앞 절에서 조건을 나눠도 <code>while</code>이 필요하다고 한 것이 실제로 수십만 번 중 수백 번 꼴로 일어난다.</p>
+<p>그렇다면 공정 락으로 그 틈을 막을 수 있을까. 같은 프로그램을 <code>-Dfair=true</code>로 돌려 <code>new ReentrantLock(true)</code>를 쓰게 하자 결과는 반대로 나왔다.</p>
+<pre data-label="실행 결과: java -Dfair=true WakeCountMain two N (수는 실행마다 다르다)"><code class="language-text">조건 둘+signal 생산자·소비자 각 16개, 원소 320000개: await 호출=463485, 헛깨어남=463401, 2258ms
+조건 둘+signal 생산자·소비자 각 16개, 원소 320000개: await 호출=473585, 헛깨어남=473419, 2688ms
+조건 둘+signal 생산자·소비자 각 16개, 원소 320000개: await 호출=457504, 헛깨어남=457428, 2317ms
+조건 둘+signal 생산자·소비자 각 4개, 원소 80000개: await 호출=136812, 헛깨어남=136778, 681ms
+조건 둘+signal 생산자·소비자 각 1개, 원소 20000개: await 호출=27, 헛깨어남=0, 84ms</code></pre>
+<p>스레드가 여럿이면 await 호출의 거의 전부가 헛깨어남으로 이어졌다. 이것은 소스에서 따라가면 설명된다. <code>doSignal()</code>의 <code>enqueue()</code>는 신호받은 노드를 락 대기열의 <b>꼬리</b>에 붙인다. 경합이 심하면 락 대기열에는 이미 <code>lock()</code>에서 기다리는 스레드들이 서 있고, 그중에는 다음 <code>take()</code>를 하려고 줄을 선 다른 소비자도 있다. 공정 락은 새로 도착한 스레드의 끼어들기를 막고 대기열 순서대로 락을 주므로, 신호받은 소비자보다 앞에 선 소비자가 먼저 락을 얻어 방금 들어온 원소를 가져간다. 신호받은 소비자가 마침내 락을 얻었을 때 버퍼는 비어 있다. 공정성이 보장하는 것은 락을 얻는 순서이지, 신호를 받은 스레드가 그 신호의 원인이 된 원소를 차지하는 것이 아니다. 앞에서 공정 락을 써도 <code>while</code>은 필요하다고 한 이유가 여기서 한 번 더 확인된다. 생산자와 소비자가 하나씩일 때 await가 27번에 그친 것은 이 실행에서 나온 값이고, 그 원인까지는 여기서 확인하지 않았다.</p>
+
+<h3>중간 정리: 생산자 소비자 문제를 푸는 단계</h3>
+<p>여기까지 오는 길을 한 표로 정리한다. 위 두 줄은 동기화 도구 없이 생각할 수 있는 접근이고, 나머지는 앞 회차와 이 회차에서 다룬 도구다. 각 단계는 앞 단계의 문제 하나를 해결하고, 그 과정에서 다음 문제를 드러낸다.</p>
+<div class="table-wrap"><table><thead><tr><th>접근</th><th>버퍼가 가득 차거나 비었을 때</th><th>남는 문제</th></tr></thead><tbody>
+<tr><td>기다리지 않음</td><td>데이터를 버리거나 빈손으로 돌아간다</td><td>데이터 유실, 소비자의 헛걸음</td></tr>
+<tr><td>락을 쥔 채 잠깐 자고 다시 확인</td><td>임계 영역 안에서 sleep 반복</td><td>락을 쥐고 자므로 상대가 들어와 상태를 바꿀 수 없다. 진행 불가</td></tr>
+<tr><td>synchronized + wait/notify</td><td>락을 놓고 대기 집합에서 잠든다</td><td>대기 집합이 하나라 생산자·소비자가 섞인다. 통지 대상이 임의다. 헛깨어남, 멈춤 위험</td></tr>
+<tr><td>Lock + Condition 하나</td><td>락을 놓고 조건 대기열에서 잠든다</td><td>구조는 위와 같다. 신호 순서가 FIFO로 정해졌을 뿐이다</td></tr>
+<tr><td>Lock + Condition 둘</td><td><code>notFull</code>/<code>notEmpty</code>에서 따로 잠든다</td><td>신호 방향이 고정. <code>signal()</code> 하나로 충분. 끼어들기·가짜 깨어남 때문에 <code>while</code>은 여전히 필요</td></tr>
+<tr><td>BlockingQueue</td><td>라이브러리가 내부에서 위와 같은 일을 한다</td><td>직접 짤 필요가 없다</td></tr>
+</tbody></table></div>
+<aside class="keyidea"><span>이 장의 핵심</span><p>기다림을 올바르게 만드는 데는 세 가지가 필요하다. 조건 검사와 대기 등록이 같은 락 아래에서 원자적으로 일어나야 하고(await가 대기열에 먼저 등록한 뒤 락을 놓는 이유), 깨어난 뒤에는 조건을 다시 검사해야 하며(while), 신호는 그 신호로 진행할 수 있는 스레드에게 가야 한다(조건 분리). 앞의 두 가지는 wait/notify로도 지킬 수 있지만, 세 번째는 대기 공간을 여러 개 만들 수 있는 Condition이 있어야 깔끔하게 지킬 수 있다.</p></aside>
+
+<h3>예제 6: BlockingQueue로 바꾸기</h3>
+<p>지금까지 손으로 만든 <code>TwoConditionBuffer</code>는 사실 표준 라이브러리에 이미 있다. Condition의 Javadoc은 자신의 예제(두 조건을 쓰는 한정 버퍼) 바로 뒤에, <code>ArrayBlockingQueue</code>가 이 기능을 제공하므로 이 예제 클래스를 직접 구현할 이유가 없다고 적어 두었다. <code>java.util.concurrent.BlockingQueue</code>는 가져올 때 큐가 비어 있으면 비지 않을 때까지, 넣을 때 큐가 가득 차 있으면 자리가 날 때까지 기다리는 연산을 추가로 지원하는 <code>Queue</code>다. 버퍼 구현을 이것으로 바꾸면 락도 조건도 직접 다룰 필요가 없다.</p>
+<pre><code class="language-java">import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+
+public class BlockingQueueBuffer implements Buffer {
+    private final BlockingQueue<String> queue;
+
+    public BlockingQueueBuffer(int capacity) {
+        this.queue = new ArrayBlockingQueue<>(capacity);
+    }
+
+    @Override
+    public void put(String data) throws InterruptedException {
+        queue.put(data);
+        Log.log("put 저장: " + data + " " + queue);
+    }
+
+    @Override
+    public String take() throws InterruptedException {
+        String data = queue.take();
+        Log.log("take 획득: " + data + " " + queue);
+        return data;
+    }
+}</code></pre>
+<p>같은 드라이버에서 세 번째 구현을 골라 실행한다. 이번에는 "대기"와 "깨어남" 로그가 없다. 기다림은 <code>put()</code>과 <code>take()</code> 안에서 일어나기 때문이다. 대신 main이 찍은 상태 줄이 기다림을 보여 준다. 소비자를 먼저 출발시키면 c1~c4가 모두 <code>WAITING</code>이고, 생산자를 먼저 출발시키면 p3과 p4가 <code>WAITING</code>이다. 아래는 각각 한 번의 실행 결과다.</p>
+<pre data-label="실행 결과: java BufferMain bq producer (한 번의 실행)"><code class="language-text">== p 스레드 시작
+[p1] put 저장: data1 [data1]
+[p2] put 저장: data2 [data1, data2]
+== 상태: p1=TERMINATED p2=TERMINATED p3=WAITING p4=WAITING
+== c 스레드 시작
+[p3] put 저장: data3 [data2, data3]
+[c1] take 획득: data1 [data2]
+[c2] take 획득: data2 [data3]
+[p4] put 저장: data4 [data3, data4]
+[c3] take 획득: data3 [data4]
+[c4] take 획득: data4 []
+== 상태: p1=TERMINATED p2=TERMINATED p3=TERMINATED p4=TERMINATED c1=TERMINATED c2=TERMINATED c3=TERMINATED c4=TERMINATED
+끝</code></pre>
+<pre data-label="실행 결과: java BufferMain bq consumer (한 번의 실행)"><code class="language-text">== c 스레드 시작
+== 상태: c1=WAITING c2=WAITING c3=WAITING c4=WAITING
+== p 스레드 시작
+[p1] put 저장: data1 []
+[c1] take 획득: data1 []
+[c2] take 획득: data2 []
+[p2] put 저장: data2 [data2]
+[p3] put 저장: data3 [data3]
+[c3] take 획득: data3 []
+[c4] take 획득: data4 []
+[p4] put 저장: data4 [data4]
+== 상태: c1=TERMINATED c2=TERMINATED c3=TERMINATED c4=TERMINATED p1=TERMINATED p2=TERMINATED p3=TERMINATED p4=TERMINATED
+끝</code></pre>
+<p>결과 자체는 맞다. 데이터 넷이 모두 한 번씩 소비되었고 모든 스레드가 끝났다. 그런데 로그가 이상해 보인다. 첫 번째 출력에서 "[p3] put 저장: data3"이 "[c1] take 획득: data1"보다 먼저 찍혔지만, 버퍼가 가득 차 있었으므로 실제로는 c1이 먼저 꺼내야 p3이 넣을 수 있다. 두 번째 출력의 "[p1] put 저장: data1 []"은 data1을 넣었다면서 버퍼가 비어 있다고 말한다. "[c2] take 획득: data2"가 "[p2] put 저장: data2"보다 먼저 찍힌 곳도 있다. 이 버퍼 구현에서는 로그를 <code>put()</code>/<code>take()</code>가 끝나고 락이 풀린 뒤에 찍기 때문이다.</p>
+<p>락 밖에서 찍는 로그 한 줄 사이에는 다른 스레드의 일이 얼마든지 끼어들 수 있다. "[p1] put 저장: data1 []"은 p1이 data1을 넣고 락을 놓은 직후, 로그 문자열을 만들려고 <code>queue.toString()</code>을 부르기 전에 c1이 data1을 가져간 경우다. 첫 번째 출력의 앞뒤가 바뀐 두 줄은 반대 경우다. c1이 data1을 꺼낸 뒤 문자열 "[data2]"까지 만들었지만 <code>println</code>에 도달하기 전에, p3이 깨어나 data3을 넣고 자기 로그를 먼저 출력했다. 로그 문자열이 만들어진 시점, 출력된 시점, 실제 연산이 일어난 시점이 모두 다르다. 이런 출력은 실행마다 달라지고, 실제로 같은 명령을 세 번 돌리면 세 번 다른 출력이 나왔다. 예제 4와 5의 출력이 매번 같았던 것은 로그를 락 안에서 찍었기 때문이다. 동시성 코드의 로그 순서를 사건의 순서로 읽으려면, 그 로그가 어떤 동기화 아래에서 찍혔는지부터 확인해야 한다.</p>
+<p>로그를 큐 안에서 찍을 수 없다는 것 말고는, 이 버퍼는 <code>TwoConditionBuffer</code>와 같은 성질을 가진다. 그 이유는 뒤에서 <code>ArrayBlockingQueue</code>의 소스를 열어 보면 분명해진다. 그 전에 BlockingQueue가 제공하는 메서드 전체를 정리하자.</p>
+
+<h3>BlockingQueue의 네 가지 형태: 기능 설명과 확인</h3>
+<p>BlockingQueue의 Javadoc은 메서드를 네 가지 형태로 나눈다. 당장 수행할 수 없는 연산(가득 찬 큐에 넣기, 빈 큐에서 꺼내기)을 어떻게 처리하느냐에 따른 구분이다. 하나는 예외를 던지고, 하나는 특별한 값(<code>null</code>이나 <code>false</code>)을 돌려주고, 하나는 될 때까지 현재 스레드를 무기한 막고, 하나는 정해진 시간까지만 막고 포기한다.</p>
+<div class="table-wrap"><table><thead><tr><th></th><th>예외를 던짐</th><th>특별한 값</th><th>대기</th><th>시간 제한</th></tr></thead><tbody>
+<tr><td>넣기</td><td><code>add(e)</code></td><td><code>offer(e)</code></td><td><code>put(e)</code></td><td><code>offer(e, time, unit)</code></td></tr>
+<tr><td>꺼내기</td><td><code>remove()</code></td><td><code>poll()</code></td><td><code>take()</code></td><td><code>poll(time, unit)</code></td></tr>
+<tr><td>보기</td><td><code>element()</code></td><td><code>peek()</code></td><td>해당 없음</td><td>해당 없음</td></tr>
+</tbody></table></div>
+<p>같은 문서는 몇 가지 규칙을 더 정한다. BlockingQueue는 <code>null</code> 원소를 받지 않는다. <code>null</code>은 <code>poll()</code>이 실패를 알리는 표시로 쓰이기 때문이다. 용량 제한이 있을 수 있고, <code>remainingCapacity()</code>로 막히지 않고 더 넣을 수 있는 수를 알 수 있다(제한이 없는 구현은 <code>Integer.MAX_VALUE</code>를 돌려준다). 큐 연산 하나하나는 내부 락이나 다른 동시성 제어로 원자적이지만, <code>addAll</code> 같은 대량 컬렉션 연산은 구현이 따로 밝히지 않는 한 원자적이지 않다. 그리고 BlockingQueue는 "더 이상 넣지 않는다"를 알리는 닫기(close)나 종료(shutdown) 연산을 기본으로 지원하지 않는다. 문서가 드는 흔한 방법은 생산자가 특별한 종료 표시 객체(end-of-stream 또는 독약 객체 poison object)를 넣고, 소비자가 그것을 꺼내면 끝내는 것이다.</p>
+<p>네 형태를 모두 실행해 확인해 보자. 용량 2인 <code>ArrayBlockingQueue</code>를 가득 채운 뒤 넣기 네 형태를 시험하고, 다시 비운 뒤 꺼내기와 보기를 시험한다. <code>put()</code>은 무기한 기다리므로 다른 스레드에서 부르고 인터럽트로 깨운다.</p>
+<pre><code class="language-java">import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
+
+public class BqMethodsMain {
+    public static void main(String[] args) throws InterruptedException {
+        BlockingQueue<String> q = new ArrayBlockingQueue<>(2);
+        q.add("A");
+        q.add("B");
+        System.out.println("가득 찬 큐: " + q + ", 남은 자리=" + q.remainingCapacity());
+
+        try {
+            q.add("C");
+        } catch (IllegalStateException e) {
+            System.out.println("add    -> " + e);
+        }
+        System.out.println("offer  -> " + q.offer("C"));
+        long start = System.nanoTime();
+        System.out.println("offer(e, 1초) -> " + q.offer("C", 1, TimeUnit.SECONDS)
+                + " (" + elapsedMs(start) + "ms 뒤)");
+
+        Thread putter = new Thread(() -> {
+            try {
+                q.put("C");
+                System.out.println("put    -> 반환(여기에 오면 안 된다)");
+            } catch (InterruptedException e) {
+                System.out.println("put    -> " + e + ", interrupted=" + Thread.currentThread().isInterrupted());
+            }
+        }, "putter");
+        putter.start();
+        Thread.sleep(500);
+        System.out.println("put 중인 스레드 상태: " + putter.getState());
+        putter.interrupt();
+        putter.join();
+
+        System.out.println("element -> " + q.element() + ", peek -> " + q.peek());
+        System.out.println("remove -> " + q.remove() + ", poll -> " + q.poll() + ", 큐=" + q);
+        try {
+            q.remove();
+        } catch (Exception e) {
+            System.out.println("remove(빈 큐) -> " + e);
+        }
+        try {
+            q.element();
+        } catch (Exception e) {
+            System.out.println("element(빈 큐) -> " + e);
+        }
+        System.out.println("poll(빈 큐) -> " + q.poll() + ", peek(빈 큐) -> " + q.peek());
+        start = System.nanoTime();
+        System.out.println("poll(1초) -> " + q.poll(1, TimeUnit.SECONDS) + " (" + elapsedMs(start) + "ms 뒤)");
+        try {
+            q.offer(null);
+        } catch (NullPointerException e) {
+            System.out.println("offer(null) -> " + e);
+        }
+    }
+
+    static long elapsedMs(long start) {
+        return (System.nanoTime() - start) / 1_000_000;
+    }
+}</code></pre>
+<pre data-label="실행 결과 (ms 값은 실행마다 다르다)"><code class="language-text">가득 찬 큐: [A, B], 남은 자리=0
+add    -> java.lang.IllegalStateException: Queue full
+offer  -> false
+offer(e, 1초) -> false (1012ms 뒤)
+put 중인 스레드 상태: WAITING
+put    -> java.lang.InterruptedException, interrupted=false
+element -> A, peek -> A
+remove -> A, poll -> B, 큐=[]
+remove(빈 큐) -> java.util.NoSuchElementException
+element(빈 큐) -> java.util.NoSuchElementException
+poll(빈 큐) -> null, peek(빈 큐) -> null
+poll(1초) -> null (1003ms 뒤)
+offer(null) -> java.lang.NullPointerException</code></pre>
+<p>한 줄씩 읽어 보자. 가득 찬 큐에 <code>add()</code>를 부르면 <code>IllegalStateException: Queue full</code>이 난다. 이 메시지는 <code>ArrayBlockingQueue</code>가 아니라 상위 클래스 <code>AbstractQueue.add()</code>에 있다. <code>AbstractQueue.add()</code>는 <code>offer()</code>를 부르고 <code>false</code>가 나오면 이 예외를 던지는 것이 전부다. <code>remove()</code>와 <code>element()</code>도 같은 식으로 각각 <code>poll()</code>과 <code>peek()</code>를 부르고 <code>null</code>이면 <code>NoSuchElementException</code>을 던진다. 예외 형태는 특별한 값 형태 위에 얹은 얇은 포장이다.</p>
+<p><code>offer()</code>는 기다리지 않고 바로 <code>false</code>를 돌려준다. <code>offer(e, 1, SECONDS)</code>는 약 1초 기다렸다가 <code>false</code>를 돌려준다(이 실행에서 1012ms였고, 이 값은 실행마다 다르다). <code>put()</code>을 부른 스레드는 0.5초 뒤 <code>WAITING</code>이었다. <code>notFull</code> 조건에서 park된 것이다. 인터럽트를 걸자 <code>InterruptedException</code>으로 빠져나왔고, catch 안에서 본 인터럽트 상태는 <code>false</code>였다. 예외를 던지면서 인터럽트 상태를 지운다는 규칙 그대로다. 그리고 큐에는 C가 들어가지 않았다. 다음 줄에서 <code>element()</code>와 <code>peek()</code>가 맨 앞의 A를 꺼내지 않고 보여 주고, <code>remove()</code>와 <code>poll()</code>이 A와 B를 꺼낸다.</p>
+<p>빈 큐에서 <code>remove()</code>와 <code>element()</code>는 <code>NoSuchElementException</code>을, <code>poll()</code>과 <code>peek()</code>은 <code>null</code>을 돌려준다. <code>poll(1, SECONDS)</code>는 약 1초 기다린 뒤 <code>null</code>이다. 마지막으로 <code>offer(null)</code>은 <code>NullPointerException</code>이다. <code>ArrayBlockingQueue</code>의 넣기 메서드는 첫 줄에서 <code>Objects.requireNonNull(e)</code>를 부른다. <code>null</code>을 허용하면 <code>poll()</code>이 돌려준 <code>null</code>이 "비어 있음"인지 "null 원소"인지 구분할 수 없으므로 이 금지는 필연이다.</p>
+<p>네 형태 중 무엇을 고를지는 "기다릴 수 없을 때 무엇을 해야 하는가"에 달려 있다. 파이프라인의 단계처럼 기다리는 것이 자연스러운 곳에서는 <code>put()</code>/<code>take()</code>를 쓴다. 요청을 받는 스레드처럼 기다리면 안 되는 곳에서는 <code>offer()</code>로 시도하고 <code>false</code>면 거절하거나 다른 길로 보낸다. 잠깐은 기다려도 되지만 무한정은 안 되는 곳에서는 시간 제한 형태를 쓴다. 큐가 가득 차거나 비는 것이 프로그램 논리상 일어나면 안 되는 일이라면 예외 형태가 그 버그를 즉시 드러낸다. 또 하나, BlockingQueue의 Javadoc은 메모리 일관성 효과를 명시한다. 한 스레드에서 원소를 큐에 넣기 전에 한 동작은, 다른 스레드가 그 원소를 큐에서 꺼내거나 접근한 이후의 동작보다 happens-before다. 생산자가 객체를 완전히 만든 뒤 넣었다면, 소비자는 그 객체의 필드를 <code>volatile</code>이나 추가 동기화 없이 안전하게 읽을 수 있다는 뜻이다.</p>
+<p>표준 라이브러리에서 BlockingQueue를 구현한 클래스는 Javadoc 기준으로 <code>ArrayBlockingQueue</code>, <code>LinkedBlockingQueue</code>, <code>LinkedBlockingDeque</code>, <code>PriorityBlockingQueue</code>, <code>DelayQueue</code>, <code>SynchronousQueue</code>, <code>LinkedTransferQueue</code>가 있다. 이 회차에서는 생산자 소비자 버퍼로 가장 흔히 쓰는 앞의 두 클래스의 내부를 본다.</p>
+
+<h3>한 층 아래: ArrayBlockingQueue와 LinkedBlockingQueue</h3>
+<p><code>ArrayBlockingQueue</code>를 열어 보면 예제 5와 거의 같은 코드가 나온다. 필드는 원소 배열 <code>items</code>, 다음에 꺼낼 위치 <code>takeIndex</code>, 다음에 넣을 위치 <code>putIndex</code>, 원소 수 <code>count</code>, 그리고 <code>ReentrantLock lock</code>과 그 락에서 만든 두 조건 <code>notEmpty</code>, <code>notFull</code>이다. 생성자는 <code>new ReentrantLock(fair)</code>로 락을 만들고 <code>lock.newCondition()</code>을 두 번 부른다. 용량을 받는 생성자는 <code>fair</code>를 <code>false</code>로 넘긴다. 아래는 OpenJDK 21 소스에서 <code>put()</code>, <code>take()</code>와 그 안에서 부르는 <code>enqueue()</code>, <code>dequeue()</code>의 핵심만 발췌한 것이다.</p>
+<pre data-label="OpenJDK 21 ArrayBlockingQueue 발췌"><code class="language-java">public void put(E e) throws InterruptedException {
+    Objects.requireNonNull(e);
+    final ReentrantLock lock = this.lock;
+    lock.lockInterruptibly();
+    try {
+        while (count == items.length)
+            notFull.await();
+        enqueue(e);
+    } finally {
+        lock.unlock();
+    }
+}
+
+private void enqueue(E e) {
+    final Object[] items = this.items;
+    items[putIndex] = e;
+    if (++putIndex == items.length) putIndex = 0;
+    count++;
+    notEmpty.signal();
+}
+
+// take()는 대칭이다: while (count == 0) notEmpty.await(); return dequeue();
+// dequeue()는 items[takeIndex]를 꺼내 null로 지우고 takeIndex를 한 칸 돌린 뒤
+// count--, notFull.signal() 한다.</code></pre>
+<p>예제 5와 달라진 점은 세 가지뿐이다. 첫째, 버퍼가 <code>ArrayDeque</code>가 아니라 고정 크기 배열을 원형으로 쓰는 링 버퍼(ring buffer)다. 인덱스가 배열 끝에 닿으면 0으로 돌아가므로 원소를 옮기지 않고도 FIFO가 된다. 꺼낸 칸은 <code>null</code>로 지워 가비지 컬렉터가 그 객체를 회수할 수 있게 한다. 둘째, <code>put()</code>과 <code>take()</code>는 <code>lock()</code>이 아니라 <code>lockInterruptibly()</code>로 락을 얻는다. <code>InterruptedException</code>을 던지기로 선언한 메서드이므로 락을 기다리는 단계에서도 인터럽트에 응답하게 한 것이다. 반면 <code>offer(e)</code>와 <code>poll()</code>은 그 예외를 선언하지 않는 메서드라 <code>lock()</code>을 쓰고, 가득 찼거나 비었으면 기다리지 않고 바로 <code>false</code>나 <code>null</code>을 돌려준다. 셋째, 시간 제한 형태는 Condition 문서의 예시대로 <code>awaitNanos()</code>의 반환값을 루프에서 다시 넘긴다. <code>offer(e, timeout, unit)</code>는 <code>while (count == items.length)</code> 안에서 남은 나노초가 0 이하이면 <code>false</code>를 돌려주고, 아니면 <code>nanos = notFull.awaitNanos(nanos)</code>로 다시 기다린다.</p>
+<pre class="diagram">ArrayBlockingQueue(4) 의 링 버퍼
+
+  인덱스:     0        1        2        3
+  items:  [ null ] [ "d2" ] [ "d3" ] [ null ]
+                      ▲                 ▲
+                  takeIndex=1       putIndex=3        count=2
+
+  put("d4")  → items[3]="d4", putIndex=3+1=4 → 0 으로 돌아감, count=3, notEmpty.signal()
+  take()     → items[1] 꺼내고 null, takeIndex=2, count=2, notFull.signal()</pre>
+<p><code>LinkedBlockingQueue</code>는 구조가 다르다. 연결 노드로 원소를 담고, 용량을 주지 않으면 용량이 <code>Integer.MAX_VALUE</code>다(Javadoc). 원소를 넣을 때마다 노드를 새로 만든다. 가장 큰 차이는 락이 둘이라는 점이다. 소스 주석은 이것을 "two lock queue" 알고리즘의 변형이라고 설명한다. 넣기는 <code>putLock</code>과 그 조건 <code>notFull</code>이, 꺼내기는 <code>takeLock</code>과 그 조건 <code>notEmpty</code>가 맡는다. 두 쪽이 함께 보는 원소 수 <code>count</code>는 <code>AtomicInteger</code>여서 대부분의 경우 두 락을 모두 잡지 않아도 된다. 큐의 머리와 꼬리를 서로 다른 락이 지키므로 생산자와 소비자가 동시에 임계 영역에 있을 수 있다.</p>
+<pre data-label="OpenJDK 21 LinkedBlockingQueue.put() 발췌"><code class="language-java">putLock.lockInterruptibly();
+try {
+    while (count.get() == capacity) {
+        notFull.await();
+    }
+    enqueue(node);
+    c = count.getAndIncrement();
+    if (c + 1 < capacity)
+        notFull.signal();
+} finally {
+    putLock.unlock();
+}
+if (c == 0)
+    signalNotEmpty();</code></pre>
+<p>락이 둘이면 문제가 하나 생긴다. <code>notEmpty</code>는 <code>takeLock</code>에서 만든 조건이므로, <code>putLock</code>만 쥔 생산자는 거기에 신호를 보낼 수 없다(락을 쥐지 않고 <code>signal()</code>을 부르면 <code>IllegalMonitorStateException</code>이다). 그래서 생산자는 <code>putLock</code>을 놓은 뒤, 자기가 넣기 전의 원소 수 <code>c</code>가 0이었을 때만, 즉 큐가 비어 있다가 막 하나가 생겼을 때만 <code>signalNotEmpty()</code>로 <code>takeLock</code>을 잡고 <code>notEmpty.signal()</code>을 부른다. 큐가 이미 비어 있지 않았다면 기다리는 소비자가 없거나 이미 깨워진 소비자가 있다고 보고 상대 락을 잡지 않는다. 대신 신호 연쇄(cascading notifies)를 쓴다. 생산자는 넣은 뒤에도 자리가 남았으면(<code>c + 1 < capacity</code>는 코드 안의 표현이다) 같은 쪽의 다른 생산자에게 <code>notFull.signal()</code>을 보내고, 소비자도 꺼낸 뒤 원소가 더 남았으면 다른 소비자에게 <code>notEmpty.signal()</code>을 보낸다. 소스 주석 표현으로, 넣기가 꺼내기를 적어도 하나 가능하게 만들었음을 알아채면 꺼내는 쪽에 신호를 보내고, 그 소비자는 신호 이후 원소가 더 들어왔으면 다른 소비자에게 신호를 넘긴다. 앞에서 <code>signal()</code> 하나로 부족한 경우의 대책으로 말한 바로 그 방법이다.</p>
+<p>둘 중 무엇이 빠른지는 상황에 따라 다르다. <code>LinkedBlockingQueue</code>의 Javadoc은 연결 큐가 배열 기반 큐보다 대체로 처리량이 높지만, 대부분의 동시성 애플리케이션에서 성능 예측성이 떨어진다고 적는다. 배열 큐는 생성할 때 배열을 한 번 잡고 끝이지만, 연결 큐는 넣을 때마다 노드 객체를 만들고 그 객체가 가비지가 된다. 수치로 단정하지 말고, 필요하면 실제 부하로 측정해서 고르는 것이 맞다. 확실한 차이는 용량이다. 용량을 주지 않은 <code>LinkedBlockingQueue</code>는 사실상 무한하므로, 생산자가 소비자보다 빠르면 <code>put()</code>이 막히지 않고 원소가 메모리를 채울 때까지 쌓인다. 생산자 소비자 문제에서 버퍼에 한계를 두는 이유(빠른 쪽을 느린 쪽에 맞춰 늦추는 배압 back pressure)가 사라지는 것이다.</p>
+
+<x-visual id="java-adv1-09-abq-vs-lbq" title="ArrayBlockingQueue와 LinkedBlockingQueue의 락 구조" kind="구조 비교도" ratio="16:9">
+<x-hint>ArrayBlockingQueue는 락 하나에 조건 둘, LinkedBlockingQueue는 머리와 꼬리에 락이 하나씩 있고 원소 수를 AtomicInteger로 공유한다는 것을 나란히 보여 준다.</x-hint>
+<x-prompt>좌우 두 패널. 왼쪽 제목 "ArrayBlockingQueue": 칸 6개짜리 원형 고리(링 버퍼)를 그리고 칸 몇 개에 데이터 블록을 채운다. 고리 위에 화살표 두 개 "takeIndex", "putIndex". 고리 전체를 감싸는 큰 자물쇠 하나 "lock (하나)". 자물쇠 아래에 작은 대기실 두 개 "notFull", "notEmpty". 오른쪽 제목 "LinkedBlockingQueue": 왼쪽에서 오른쪽으로 이어진 노드 상자 4개(연결 리스트). 맨 앞 노드 쪽에 자물쇠 "takeLock"과 대기실 "notEmpty", 맨 뒤 노드 쪽에 자물쇠 "putLock"과 대기실 "notFull". 리스트 위 가운데에 카운터 아이콘 "count (AtomicInteger)". putLock 쪽에서 takeLock 쪽 대기실로 점선 화살표 "비었다가 1개가 되면 signalNotEmpty()". 평면 일러스트, 흰 배경.</x-prompt>
+<x-caption>ArrayBlockingQueue는 락 하나에 조건 둘, LinkedBlockingQueue는 넣기와 꺼내기에 락을 하나씩 둔다.</x-caption>
+</x-visual>
+
+<h3>락이 둘인데 원소가 보이는 이유: 더미 노드와 count의 happens-before</h3>
+<p>LinkedBlockingQueue에는 앞 절에서 그냥 넘어간 질문이 둘 남아 있다. 생산자는 <code>putLock</code>만, 소비자는 <code>takeLock</code>만 쥔다. <code>Lock</code>의 Javadoc은 모든 Lock 구현이 내장 모니터 락과 같은 메모리 동기화 의미를 지켜야 한다고 정하는데, JLS 17.4.4에서 그 의미는 "모니터 m의 unlock은 같은 m에 대한 이후의 모든 lock과 동기화된다(synchronizes-with)"이다. 같은 락끼리만 성립하는 관계라서, 서로 다른 락을 쥔 생산자와 소비자 사이에는 락만으로는 happens-before가 생기지 않는다. 그렇다면 첫째, 생산자가 <code>putLock</code> 아래에서 만든 노드와 그 안의 원소를 <code>takeLock</code>만 쥔 소비자는 무엇을 근거로 온전히 읽는가. 둘째, 두 스레드가 같은 연결 리스트를 동시에 고치는데 왜 서로의 쓰기를 망가뜨리지 않는가. 둘째 질문부터 자료 구조의 모양으로 답하고, 첫째 질문은 JLS 17.4의 규칙을 한 줄씩 적용해 답한다.</p>
+<p>OpenJDK 21의 LinkedBlockingQueue는 처음부터 원소가 없는 노드 하나를 만들어 둔다. 생성자가 <code>last = head = new Node<E>(null)</code>을 실행하고, 필드 주석은 <code>head.item == null</code>과 <code>last.next == null</code>을 불변식으로 적어 둔다. 맨 앞 노드는 원소를 담지 않는 더미(dummy, 보초 노드 sentinel)이고, 실제 첫 원소는 <code>head.next</code>에 있다. 넣기와 꺼내기는 다음 두 메서드가 전부다.</p>
+<pre data-label="OpenJDK 21 LinkedBlockingQueue.enqueue() / dequeue() 발췌"><code class="language-java">private void enqueue(Node<E> node) {
+    // assert putLock.isHeldByCurrentThread();
+    // assert last.next == null;
+    last = last.next = node;
+}
+
+private E dequeue() {
+    // assert takeLock.isHeldByCurrentThread();
+    // assert head.item == null;
+    Node<E> h = head;
+    Node<E> first = h.next;
+    h.next = h; // help GC
+    head = first;
+    E x = first.item;
+    first.item = null;
+    return x;
+}</code></pre>
+<p>꺼내기는 첫 원소 노드를 떼어 내지 않는다. 원소만 빼 가고(<code>first.item = null</code>), 그 노드를 새 더미로 삼아 <code>head</code>를 한 칸 옮긴다. 옛 더미는 <code>next</code>가 자기 자신을 가리키게 만든다. 소스 주석에 따르면 이 자기 연결(self-link)은 "다음 노드는 head.next"라는 뜻으로, 꺼낸 노드가 그 뒤의 새 노드들을 계속 붙잡지 않게 하면서도 약하게 일관된(weakly consistent) 반복자가 길을 잃지 않게 하려는 장치다. 주석은 꺼낸 노드가 새 노드를 계속 가리키면 세대별 GC가 오래된 노드와 새 노드 사이의 연결을 처리하기 어려워진다는 점도 이유로 든다. 실제로 그렇게 되는지 리플렉션으로 내부를 들여다보자(<code>--add-opens java.base/java.util.concurrent=ALL-UNNAMED</code>로 실행해야 private 필드를 열 수 있다).</p>
+<pre><code class="language-java">import java.lang.reflect.Field;
+import java.util.concurrent.LinkedBlockingQueue;
+
+public class LbqNodesMain {
+    static Field HEAD, LAST, ITEM, NEXT;
+
+    public static void main(String[] args) throws Exception {
+        HEAD = LinkedBlockingQueue.class.getDeclaredField("head");
+        LAST = LinkedBlockingQueue.class.getDeclaredField("last");
+        Class<?> node = Class.forName("java.util.concurrent.LinkedBlockingQueue$Node");
+        ITEM = node.getDeclaredField("item");
+        NEXT = node.getDeclaredField("next");
+        for (Field f : new Field[] {HEAD, LAST, ITEM, NEXT}) f.setAccessible(true);
+
+        LinkedBlockingQueue<String> q = new LinkedBlockingQueue<>(4);
+        print("빈 큐", q);
+        q.put("a");
+        q.put("b");
+        print("a, b 넣은 뒤", q);
+        Object oldHead = HEAD.get(q);
+        System.out.println("take() -> " + q.take());
+        print("take 한 번 뒤", q);
+        System.out.println("  옛 head.next == 옛 head ? " + (NEXT.get(oldHead) == oldHead));
+    }
+
+    static void print(String when, LinkedBlockingQueue<String> q) throws Exception {
+        Object head = HEAD.get(q), last = LAST.get(q);
+        StringBuilder sb = new StringBuilder(when + ": head");
+        for (Object n = head; n != null; n = NEXT.get(n)) {
+            sb.append(" -> [item=").append(ITEM.get(n)).append(']');
+        }
+        System.out.println(sb + "   head==last ? " + (head == last));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">빈 큐: head -> [item=null]   head==last ? true
+a, b 넣은 뒤: head -> [item=null] -> [item=a] -> [item=b]   head==last ? false
+take() -> a
+take 한 번 뒤: head -> [item=null] -> [item=b]   head==last ? false
+  옛 head.next == 옛 head ? true</code></pre>
+<p>빈 큐에도 노드가 하나 있고 그것이 <code>head</code>이자 <code>last</code>다. a를 꺼낸 뒤 맨 앞 노드는 다시 <code>item=null</code>인데, 이것은 원래 a를 담고 있던 노드가 원소를 비우고 새 더미가 된 것이다. 옛 더미의 <code>next</code>는 자기 자신을 가리킨다. 이 모양 덕분에 두 쪽이 손대는 필드가 겹치지 않는다. 생산자는 <code>last</code>와 <code>last.next</code>만 쓰고, 소비자는 <code>head</code>, 옛 더미의 <code>next</code>, 새 더미의 <code>item</code>만 쓴다. 소비자가 꺼내는 것은 원소가 하나 이상 있을 때뿐이므로 그때의 더미는 <code>last</code>가 아니고, 생산자가 쓰는 <code>last.next</code>와 소비자가 쓰는 <code>h.next</code>는 언제나 다른 노드의 필드다. 큐가 비어 더미가 곧 <code>last</code>인 순간에도 소비자는 그 노드의 <code>next</code>를 쓰지 않는다. 더미 노드가 없다면 빈 큐에서 첫 원소를 넣을 때 생산자가 <code>head</code>까지 고쳐야 해서 두 락의 영역이 겹친다.</p>
+<pre class="diagram">  takeLock 쪽이 쓰는 것                         putLock 쪽이 쓰는 것
+  head, 옛 head.next(자기 연결), 새 head.item     last, last.next
+        │                                              │
+        ▼                                              ▼
+     head ──▶ [item=null] ──▶ [item=a] ──▶ [item=b] ◀── last
+              (더미)
+                         count : AtomicInteger  ← 양쪽이 함께 읽고 쓰는 유일한 값</pre>
+<p>필드가 겹치지 않는다고 해서 가시성 문제가 사라지지는 않는다. 생산자가 쓴 <code>last.next</code>는 곧 소비자가 읽을 <code>head.next</code>이고, 생산자가 생성자에서 쓴 <code>item</code>을 소비자가 읽는다. 쓰기와 읽기가 서로 다른 스레드에서 같은 변수에 일어나므로, JLS 17.4.5의 정의대로 happens-before로 순서가 잡히지 않으면 데이터 경합(data race)이고 소비자는 <code>null</code>이나 덜 만들어진 노드를 볼 수 있다. 그 순서를 만드는 것이 <code>count</code>다. 소스 주석은 이렇게 설명한다. 원소를 넣을 때마다 <code>putLock</code>을 쥐고 <code>count</code>를 갱신하며, 이후의 읽는 쪽은 <code>takeLock</code>을 쥐고 <code>n = count.get()</code>을 읽음으로써 처음 n개 원소의 가시성을 얻는다. 빈 큐에 생산자 P가 x를 넣고 소비자 C가 꺼내는 경우에 JLS 17.4의 규칙을 하나씩 적용해 보자.</p>
+<ol>
+<li><b>P의 행동.</b> w1: <code>new Node(x)</code>의 생성자가 <code>node.item = x</code>를 쓴다. w2: <code>enqueue()</code>가 더미의 <code>next</code>에 node를 쓴다. w3: <code>count.getAndIncrement()</code>가 0을 1로 바꾼다. <code>AtomicInteger.getAndIncrement()</code>의 Javadoc은 메모리 효과가 <code>VarHandle.getAndAdd</code>와 같다고 하고, <code>getAndAdd</code>는 값을 <code>setVolatile</code>의 의미로 쓰고 이전 값을 <code>getVolatile</code>의 의미로 읽는다. 즉 w3은 volatile 쓰기다.</li>
+<li><b>C의 행동.</b> r1: <code>take()</code>의 <code>while (count.get() == 0)</code>에서 <code>count.get()</code>이 1을 읽는다. <code>get()</code>의 메모리 효과는 <code>getVolatile</code>이므로 r1은 volatile 읽기다. r2: <code>dequeue()</code>가 <code>head.next</code>를 읽는다. r3: <code>first.item</code>을 읽는다.</li>
+<li><b>프로그램 순서.</b> 같은 스레드 안의 행동은 프로그램 순서대로 happens-before다(JLS 17.4.5). 그래서 w1 → w2 → w3, r1 → r2 → r3이다.</li>
+<li><b>동기화 관계.</b> JLS 17.4.4는 volatile 변수에 대한 쓰기가 같은 변수에 대한 이후의 모든 읽기와 동기화된다고 정한다. r1이 w3이 쓴 값 1을 읽었으므로 w3은 r1과 동기화되고, 따라서 w3 → r1이다.</li>
+<li><b>이행성.</b> w1 → w2 → w3 → r1 → r2 → r3. w2가 r2보다, w1이 r3보다 happens-before이므로 C는 <code>head.next</code>에서 P가 연결한 노드를, 그 <code>item</code>에서 x를 본다.</li>
+</ol>
+<p>생산자가 여럿이어도 같다. 생산자들은 모두 <code>putLock</code>으로 줄을 서므로 앞 생산자의 unlock과 다음 생산자의 lock 사이에 happens-before가 생기고, 마지막 생산자의 <code>getAndIncrement()</code>까지 하나의 사슬로 이어진다. 소비자가 <code>count.get()</code>에서 n을 읽었다면 그 n개 원소를 넣은 쓰기들이 모두 그 읽기보다 앞선다. 소스 주석의 "처음 n개 원소의 가시성"이 바로 이 뜻이다. 거꾸로 소비자가 <code>count</code>를 보지 않고 <code>head.next</code>부터 읽었다면 w2와 r2 사이에는 아무 관계가 없다. 같은 일을 하는 <code>ArrayBlockingQueue</code>의 <code>count</code>가 평범한 <code>int</code>인데 LinkedBlockingQueue의 <code>count</code>만 <code>AtomicInteger</code>인 이유가 여기 있다. 락이 하나면 그 락이 모든 순서를 정해 주지만, 락이 둘이면 두 락이 함께 보는 변수 하나가 두 영역을 잇는 다리 노릇을 해야 한다. 7회차에서 본 라이브러리 락의 happens-before도 결국 AQS의 <code>volatile int state</code>를 쓰고 읽는 데서 나왔으니, 여기서는 같은 원리를 락 대신 카운터에 직접 쓴 셈이다. BlockingQueue Javadoc이 약속하는 "넣기 전의 행동은 꺼낸 뒤의 행동보다 happens-before"라는 메모리 일관성 효과를, LinkedBlockingQueue는 이렇게 두 락과 카운터 하나로 지킨다.</p>
+
+<h3>흔한 오해와 함정</h3>
+<p><b>"signal()을 부르면 그 스레드가 바로 실행된다."</b> 아니다. 앞에서 소스와 실험으로 본 대로 <code>signal()</code>은 노드를 락 대기열로 옮길 뿐이고, 신호를 보낸 스레드는 계속 락을 쥐고 실행한다. 신호를 받은 스레드는 락이 풀린 뒤에야 깨어나고, 비공정 락이라면 그때도 다른 스레드에게 락을 빼앗길 수 있다. 그래서 <code>signal()</code>을 임계 영역의 맨 앞에 두든 맨 뒤에 두든 정확성에는 차이가 없다. 신호를 받은 쪽은 어차피 락이 풀린 다음 조건을 다시 검사한다.</p>
+<p><b>"Condition에 wait()와 notify()를 불러도 된다."</b> 컴파일은 된다. <code>Condition</code>도 <code>Object</code>이므로 <code>wait()</code>와 <code>notify()</code>를 물려받기 때문이다. 하지만 그것은 조건 객체 자신의 모니터를 쓰는 것이어서 ReentrantLock이나 그 조건 대기열과 아무 관계가 없다. ReentrantLock을 쥔 채 <code>cond.wait()</code>를 부르면 그 객체의 모니터는 쥐고 있지 않으므로 이 환경에서 <code>java.lang.IllegalMonitorStateException: current thread is not owner</code>가 났다. Condition의 Javadoc도 혼란을 피하려면 Condition 인스턴스를 이렇게 쓰지 말라고 권한다. 자동 완성으로 <code>await</code> 대신 <code>wait</code>를 고르는 실수가 실제로 흔하다.</p>
+<p><b>"락 경합은 스레드 덤프에서 BLOCKED로 보인다."</b> synchronized에만 맞는 말이다. ReentrantLock을 포함한 <code>java.util.concurrent</code>의 락을 기다리는 스레드는 <code>WAITING (parking)</code>이다. 서버가 멈춘 것 같아서 덤프를 떴는데 <code>BLOCKED</code>가 하나도 없다고 락 문제가 아니라고 결론 내리면 안 된다. "parking to wait for" 뒤의 블로커 클래스를 보고, 같은 락 객체 주소를 기다리는 스레드가 몇 개인지 세어야 한다.</p>
+<p><b>"조건을 둘로 나눴으니 if로 충분하다."</b> 아니다. 조건 분리는 신호가 엉뚱한 편에게 가는 것을 막을 뿐이다. 신호를 받은 스레드가 락을 다시 얻기 전에 끼어든 스레드가 상태를 바꿀 수 있고, 가짜 깨어남은 명세가 허용한다. 표준 라이브러리의 <code>ArrayBlockingQueue</code>도 조건을 둘로 나눴지만 <code>while (count == items.length) notFull.await();</code>처럼 반드시 루프로 기다린다.</p>
+<p><b>"BlockingQueue의 메서드가 스레드 안전하니 조합도 안전하다."</b> 메서드 하나하나는 원자적이지만, 두 호출 사이는 아니다. <code>if (q.remainingCapacity() > 0) q.put(x);</code>는 검사와 행동 사이에 다른 생산자가 자리를 채울 수 있으므로 "막히지 않는다"를 보장하지 못한다. 그런 의도라면 <code>offer(x)</code>의 반환값을 써야 한다. <code>if (!q.isEmpty()) q.remove();</code>도 다른 소비자 때문에 예외가 날 수 있으니 <code>poll()</code>을 쓴다. 6회차의 검사 후 행동(check-then-act) 경합 조건이 큐 위에서 다시 나타나는 것이다. Javadoc이 밝히듯 <code>addAll</code> 같은 대량 연산도 원자적이지 않아서 일부만 넣고 예외가 날 수 있다.</p>
+<p><b>"로그에 찍힌 순서가 일어난 순서다."</b> 예제 6에서 본 대로, 락 밖에서 찍은 로그는 사건의 순서를 보장하지 않는다. 상태를 기록하는 문자열이 만들어진 시점과 출력된 시점 사이에도 다른 스레드가 끼어든다. 동시성 버그를 로그로 추적할 때는 로그가 어떤 동기화 아래에서 찍혔는지부터 확인해야 한다.</p>
+
+<h3>이 지식이 다시 쓰이는 곳</h3>
+<p>가장 가까운 곳은 이 권의 12회와 13회에서 다룰 스레드 풀이다. <code>ThreadPoolExecutor</code>는 작업을 <code>BlockingQueue<Runnable></code> 타입의 <code>workQueue</code>에 담는다. OpenJDK 21 소스에서 작업을 제출하는 <code>execute()</code>는 <code>workQueue.offer(command)</code>로 기다리지 않고 넣기를 시도하고, 작업 스레드가 다음 작업을 가져오는 <code>getTask()</code>는 상황에 따라 <code>workQueue.poll(keepAliveTime, ...)</code>이나 <code>workQueue.take()</code>를 부른다. 이 회차의 네 가지 형태 중 어느 것을 어디에 썼는지가 스레드 풀의 동작(큐가 가득 차면 어떻게 되는가, 일 없는 스레드는 언제 사라지는가)을 결정한다. <code>Executors.newFixedThreadPool(n)</code>이 용량을 주지 않은 <code>new LinkedBlockingQueue<Runnable>()</code>를 쓴다는 것, 즉 작업이 무한히 쌓일 수 있다는 것도 그때 다시 본다.</p>
+<p>10회의 CAS는 이 회차에서 블랙박스로 둔 부분을 연다. AQS의 <code>state</code> 변경, 락 대기열 꼬리에 노드를 붙이는 <code>casTail</code>, 비공정 락의 첫 시도가 모두 CAS다. 락 없이 원자적으로 값을 바꾸는 이 연산이 락 자체를 만드는 재료라는 것이 그 회차의 주제다. 11회의 동시성 컬렉션에서는 BlockingQueue 외의 동시성 컬렉션이 락 하나로 전체를 감싸지 않고 어떻게 스레드 안전을 얻는지 본다. 이 권 밖으로 나가면, 메시지 큐나 로그 수집기처럼 생산 속도와 소비 속도가 다른 두 구성 요소를 잇는 곳마다 한정 버퍼와 배압이라는 같은 구조가 다시 나온다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>Condition</dt><dd>Object의 wait/notify/notifyAll을 별도 객체로 떼어 낸 것. 하나의 Lock에서 <code>newCondition()</code>으로 여러 개를 만들어, 한 락에 대기 공간을 여러 개 둘 수 있다.</dd>
+<dt>await()의 약속</dt><dd>락을 쥔 채로만 부를 수 있고(아니면 IllegalMonitorStateException), 대기열에 먼저 등록한 뒤 락을 보유 횟수만큼 모두 놓으며, 돌아올 때는 락을 다시 얻고 보유 횟수를 복원한다.</dd>
+<dt>헛깨어남과 영구 대기</dt><dd>조건 하나에 생산자와 소비자가 섞이면 신호가 같은 편에게 가서 헛되이 깨우고, 신호가 엉뚱한 스레드에게 소비되면 남은 스레드가 영원히 기다릴 수 있다.</dd>
+<dt>대기 공간 분리</dt><dd>생산자는 notFull, 소비자는 notEmpty에서 기다리고, 넣은 쪽은 notEmpty에, 꺼낸 쪽은 notFull에 신호를 보낸다. 신호의 방향이 고정되어 signal() 하나로 충분하다.</dd>
+<dt>signal()의 실제 동작</dt><dd>OpenJDK 21 AQS에서 signal()은 조건 대기열 맨 앞 노드를 락 대기열로 옮길 뿐 보통 스레드를 깨우지 않는다. 실제 깨우기는 unlock()의 signalNext()가 한다.</dd>
+<dt>네 가지 대기 장소</dt><dd>모니터 진입 대기와 wait 후 재진입 대기는 BLOCKED, 대기 집합은 WAITING이다. AQS의 락 대기열과 조건 대기열은 둘 다 WAITING (parking)이고 덤프의 블로커 클래스로 구분한다.</dd>
+<dt>while 재검사</dt><dd>가짜 깨어남, 비공정 락의 끼어들기, signalAll 때문에 깨어난 스레드는 조건을 반드시 다시 검사해야 한다. 조건을 나눠도 마찬가지다.</dd>
+<dt>BlockingQueue 네 형태</dt><dd>당장 할 수 없는 넣기·꺼내기를 예외(add/remove/element), 특별한 값(offer/poll/peek), 무기한 대기(put/take), 시간 제한(offer/poll with timeout)으로 처리한다. null은 받지 않는다.</dd>
+<dt>ArrayBlockingQueue와 LinkedBlockingQueue</dt><dd>전자는 락 하나와 조건 둘, 링 버퍼로 예제 5와 같은 구조다. 후자는 putLock/takeLock 두 락과 AtomicInteger count, 신호 연쇄를 쓰며 기본 용량이 Integer.MAX_VALUE다.</dd>
+<dt>락이 둘인 큐의 가시성</dt><dd>LinkedBlockingQueue는 더미 노드로 두 락이 쓰는 필드를 나누고, 생산자의 count.getAndIncrement()(volatile 쓰기)와 소비자의 count.get()(volatile 읽기) 사이의 synchronizes-with로 노드와 원소의 가시성을 얻는다.</dd>
+</x-summary>
+
+<x-review>
+<p>운영 중인 서비스에서 처리량이 갑자기 0이 되고 CPU도 거의 쓰지 않는다면, 스레드가 모두 어딘가에서 기다리고 있다는 뜻이다. 이때 스레드 덤프를 뜨고 가장 먼저 할 일은 각 스레드가 네 가지 대기 장소 중 어디에 있는지 분류하는 것이다. <code>BLOCKED</code>와 "waiting to lock"이면 모니터 경합, "parking to wait for ...Sync"면 j.u.c 락 경합, "parking to wait for ...ConditionObject"면 어떤 조건을 기다리는 중이다. 마지막 경우라면 그 조건에 신호를 보내 줄 스레드가 살아 있는지, 그 스레드는 지금 어디에 있는지를 따라가야 한다. 이 회차의 <code>StuckMain</code>처럼 신호를 보낼 스레드가 모두 같은 대기열에 들어가 있는 상황은 덤프에 교착 상태(deadlock)로 표시되지 않는다. 서로의 락을 쥐고 기다리는 것이 아니기 때문이다.</p>
+<p>직접 조건 변수를 다룰 일은 생각보다 적다. 생산자 소비자 버퍼가 필요하면 BlockingQueue를 쓰고, 스레드 사이에 작업을 넘기려면 스레드 풀을 쓰는 것이 기본이다. 그래도 이 원리를 알아야 하는 이유는 라이브러리를 고를 때 판단이 필요하기 때문이다. 용량을 주지 않은 LinkedBlockingQueue는 배압이 없어 메모리를 다 쓸 때까지 쌓인다. 요청 스레드에서 <code>put()</code>을 부르면 큐가 가득 찼을 때 요청 스레드가 무기한 막혀 결국 서버 전체의 요청 처리 스레드가 고갈될 수 있다. 그런 곳에는 <code>offer()</code>나 시간 제한 형태를 쓰고 실패를 명시적으로 처리해야 한다.</p>
+<p>직접 조건 변수를 짜야 한다면 세 가지를 확인한다. 기다리는 술어마다 조건을 따로 두었는가. 모든 대기가 <code>while</code> 안에 있는가. <code>signal()</code>을 쓴 곳마다 "이 조건에서 기다리는 스레드는 모두 같은 술어를 기다리고, 이 상태 변화는 많아야 한 스레드만 진행시킨다"가 성립하는가. 마지막이 성립하지 않으면 <code>signalAll()</code>이나 신호 연쇄가 필요하다. 공정 락은 기아가 실제로 문제일 때만 고려한다. Javadoc이 말하듯 공정성은 처리량을 낮추고, 공정 락을 써도 while은 여전히 필요하다.</p>
+</x-review>
+
+<x-practice>
+<li>용량 1인 <code>OneConditionBuffer</code>에 소비자 c1, c2, c3을 100ms 간격으로 먼저 출발시키고, 그다음 생산자 p1, p2, p3(각각 data1~data3을 한 번 넣음)을 100ms 간격으로 출발시킨다. 조건 대기열의 내용을 단계마다 적으며 로그를 예측하고, 헛깨어남이 몇 번, 어느 스레드에게 일어나는지 답하라.</li>
+<li>어떤 서버의 스레드 덤프에서 스레드 A는 <code>WAITING (parking)</code>이고 "parking to wait for ... (a java.util.concurrent.locks.ReentrantLock$NonfairSync)", 스레드 B는 <code>WAITING (parking)</code>이고 "parking to wait for ... (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)", 스레드 C는 <code>BLOCKED</code>이고 "waiting to re-lock in wait()"이다. 세 스레드가 각각 무엇을 기다리고 있고, 무엇이 일어나야 진행하는지 설명하라.</li>
+<li><code>TwoConditionBuffer.take()</code>의 <code>while (queue.isEmpty())</code>를 <code>if</code>로 바꿨다. 비공정 락을 쓰는 이 버퍼에서 <code>take()</code>가 <code>null</code>을 돌려주는 실행 순서를 한 줄씩 구성하라.</li>
+<li><code>TwoConditionBuffer</code>에 리스트를 받아 원소를 한꺼번에 넣는 <code>putAll(List<String> items)</code>를 추가하려 한다(남은 자리가 리스트 크기 이상이 될 때까지 기다렸다가 모두 넣는다). 넣은 뒤 <code>notEmpty.signal()</code>을 한 번만 부르면 어떤 문제가 생기는지, 어떻게 고쳐야 하는지 설명하라.</li>
+<li>웹 요청을 처리하는 스레드가 작업을 용량 100인 <code>ArrayBlockingQueue</code>에 넣고, 별도의 작업 스레드들이 꺼내 처리한다. 작업 스레드가 느려져 큐가 가득 찼을 때, 요청 스레드가 <code>put()</code>, <code>offer(e)</code>, <code>offer(e, 200, MILLISECONDS)</code>를 쓰는 경우 각각 서버 전체에 어떤 일이 일어나는지 비교하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> c1~c3이 빈 버퍼에서 대기해 조건 대기열은 [c1, c2, c3]이다. p1이 data1을 넣고 c1에게 신호를 보낸다([c2, c3]). c1이 data1을 꺼내고 보낸 신호는 c2에게 간다([c3]). c2는 빈 버퍼를 보고 다시 대기해 맨 뒤에 붙는다([c3, c2]). p2가 data2를 넣고 c3에게 신호를 보낸다([c2]). c3이 data2를 꺼내고 c2에게 신호를 보낸다([]). c2는 또 빈 버퍼를 보고 대기한다([c2]). p3이 data3을 넣고 c2에게 신호를 보내고, c2가 data3을 꺼낸다. 이때 c2의 신호는 대기열이 비어 있어 사라진다. 헛깨어남은 두 번이고 둘 다 c2다. 실제로 이 환경에서 실행하면 로그가 정확히 이 순서로 나왔다. 다시 기다리는 스레드가 대기열 맨 뒤로 가기 때문에 같은 스레드가 거듭 헛깨어남을 겪는다는 점이 포인트다.</p>
+<p><b>2번.</b> A는 ReentrantLock(비공정)의 락 대기열에서 락을 기다린다. 락 주인이 <code>unlock()</code>해서 A가 대기열 맨 앞이 되면 깨어나 락을 얻는다. B는 어떤 조건의 조건 대기열에서 신호를 기다리거나, 이미 신호를 받아 락 대기열로 옮겨졌지만 아직 한 번도 깨어나지 않은 상태다. 덤프만으로는 둘을 구분할 수 없다(<code>getWaitQueueLength()</code> 같은 감시 메서드가 필요하다). 신호를 받지 않았다면 누군가 그 조건에 <code>signal()</code>/<code>signalAll()</code>을 불러야 하고, 그 뒤 락이 풀려야 진행한다. C는 <code>wait()</code>에서 통지(또는 인터럽트, 시간 초과)를 받아 대기 집합에서는 나왔지만, 모니터를 다시 얻지 못해 막혀 있다. 지금 모니터를 쥔 스레드가 synchronized 블록을 빠져나가야 진행한다.</p>
+<p><b>3번.</b> 데이터가 없는 상태에서 소비자 A가 <code>notEmpty.await()</code>로 기다린다. 생산자 P가 데이터 x를 넣고 <code>notEmpty.signal()</code>로 A를 락 대기열로 옮긴 뒤 <code>unlock()</code>하고, 이것이 A를 unpark한다. A가 코어를 받기 전에 새 소비자 B가 <code>take()</code>의 <code>lock()</code>을 부르고, 비공정 락의 첫 시도(대기열을 보지 않는 CAS)로 락을 잡는다. B는 버퍼에 x가 있으니 기다리지 않고 x를 꺼낸 뒤 <code>unlock()</code>한다. 이제 A가 락을 얻어 <code>await()</code>에서 돌아온다. <code>if</code>였으므로 조건을 다시 검사하지 않고 <code>queue.poll()</code>로 내려가고, 빈 <code>ArrayDeque</code>의 <code>poll()</code>은 <code>null</code>을 돌려주므로 <code>take()</code>가 <code>null</code>을 반환한다. 신호는 정확히 소비자에게 갔지만, 신호와 락 재획득 사이에 상태가 바뀐 것이다.</p>
+<p><b>4번.</b> <code>putAll()</code>로 원소 k개를 넣으면 기다리던 소비자 k명이 진행할 수 있다. 그런데 <code>signal()</code>을 한 번만 부르면 그중 한 명만 락 대기열로 옮겨지고, 나머지 소비자는 데이터가 있는데도 다른 넣기가 일어날 때까지 계속 잔다. 더 넣는 생산자가 없으면 영원히 잔다. 상태 변화 한 번이 여러 스레드를 진행시킬 수 있게 되었으므로 "signal 하나로 충분하다"의 두 번째 전제가 깨진 것이다. 넣은 개수만큼 <code>signal()</code>을 부르거나, <code>signalAll()</code>을 쓰거나, <code>take()</code>에서 꺼낸 뒤 버퍼에 원소가 남아 있으면 <code>notEmpty.signal()</code>을 한 번 더 부르는 신호 연쇄를 넣어 고친다. 마지막 방법이 LinkedBlockingQueue가 쓰는 방식이다.</p>
+<p><b>5번.</b> <code>put()</code>이면 요청 스레드가 자리가 날 때까지 무기한 막힌다. 요청이 계속 들어오면 요청 처리 스레드가 하나씩 막혀 결국 모두 <code>WAITING</code>이 되고, 서버는 새 요청을 전혀 받지 못한다. 처리가 느려지는 문제가 서버 전체의 응답 불능으로 번진다. <code>offer(e)</code>면 가득 찼을 때 즉시 <code>false</code>를 받으므로, 요청 스레드는 바로 "지금은 처리할 수 없음" 같은 응답을 보내고 다음 요청으로 넘어간다. 일부 요청은 실패하지만 서버는 살아 있다. <code>offer(e, 200, MILLISECONDS)</code>는 둘 사이다. 순간적인 폭주는 200ms 안에 자리가 나면 흡수하고, 지속적인 과부하에서는 요청마다 최대 200ms를 쓰고 실패한다. 어느 쪽이든 실패를 명시적으로 다루는 코드가 필요하다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>스레드 L이 ReentrantLock을 쥔 채 <code>cond.signal()</code>을 부르고, 그 뒤에도 1초 동안 락을 놓지 않는다. 신호를 받은 스레드 W는 그 1초 동안 어떤 상태이고 어디에 있는가? (OpenJDK 21)</q>
+<o>RUNNABLE. signal()이 W를 즉시 깨워 실행시킨다.</o>
+<o>BLOCKED. 모니터 진입 대기처럼 락을 기다린다.</o>
+<o>WAITING. 노드가 조건 대기열에서 락 대기열로 옮겨졌고, 스레드는 아직 park된 채다.</o>
+<o>WAITING. 노드는 여전히 조건 대기열에 있고, L이 unlock()할 때 비로소 락 대기열로 옮겨진다.</o>
+<why>signal()은 doSignal()로 맨 앞 노드를 조건 대기열에서 떼어 락 대기열 꼬리에 붙인다. 이것은 signal() 호출 시점에 일어나고(실험에서 getWaitQueueLength가 1에서 0으로, getQueueLength가 1에서 2로 바뀌었다), 보통 unpark는 하지 않으므로 W는 WAITING인 채 잠들어 있다. 실제로 깨우는 것은 L의 unlock()이다. BLOCKED는 모니터 락에만 쓰이는 상태다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>ReentrantLock을 두 번 재진입해 보유 횟수가 2인 스레드가 <code>cond.await()</code>를 부른다. 다른 스레드는 이 동안 같은 락을 얻을 수 있는가?</q>
+<o>얻을 수 없다. await()는 보유 횟수를 1만 줄이므로 락은 여전히 첫 스레드의 것이다.</o>
+<o>얻을 수 있다. await()는 보유 횟수만큼 락을 모두 놓고, 돌아올 때 다시 얻으며 보유 횟수를 2로 복원한다.</o>
+<o>얻을 수 있지만, await()에서 돌아온 뒤 보유 횟수는 1이 되므로 unlock()을 한 번만 불러야 한다.</o>
+<o>재진입 상태에서 await()를 부르면 IllegalMonitorStateException이 난다.</o>
+<why>enableWait()는 getState()로 현재 보유 횟수 전체를 저장하고 그만큼 release()한 뒤, 돌아올 때 같은 값으로 reacquire한다. 실험에서 await 중 다른 스레드의 tryLock()이 true였고, 돌아온 뒤 getHoldCount()는 2였다. 보유 횟수를 하나만 줄였다면 신호를 보낼 스레드도 들어올 수 없어 영원히 기다리게 된다. JLS 17.2.1의 wait도 n번 unlock, n번 lock으로 같은 규칙을 정한다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>조건 하나에 생산자와 소비자를 함께 기다리게 하고 signal()을 쓰는 버퍼에서, 모든 스레드가 버퍼에 일할 거리가 있는데도 영원히 기다리는 상황이 생길 수 있는 근본 원인은?</q>
+<o>ReentrantLock의 조건이 신호를 FIFO로 보내기 때문이다. 임의로 보내면 생기지 않는다.</o>
+<o>await()가 락을 원자적으로 놓지 않아 신호를 놓치기 때문이다.</o>
+<o>signal()을 락을 쥔 채로 불러야 하기 때문이다.</o>
+<o>신호 하나가 그 신호로 진행할 수 없는 같은 편 스레드에게 소비되고, 그 스레드는 다시 잠들 뿐 신호를 넘기지 않아, 진행할 수 있는 스레드에게 신호가 전달되지 않기 때문이다.</o>
+<why>StuckMain에서 c1이 보낸 "자리가 났다"는 신호가 p1이 아닌 c2에게 갔고, c2는 빈 버퍼를 보고 다시 잠들었다. 남은 p1과 c2를 깨울 스레드가 없어 둘 다 영원히 기다렸다. 신호 순서가 FIFO든 임의든 이 위험은 같다(notify도 마찬가지). await()는 대기열에 먼저 등록한 뒤 락을 놓으므로 잃어버린 깨우기 때문이 아니다. 해결책은 대기 공간 분리 또는 signalAll이다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>웹 요청 스레드가 작업을 용량이 정해진 BlockingQueue에 넣는다. 큐가 가득 찼을 때 요청 스레드가 기다리지 않고 즉시 거절 응답을 보내야 한다면 어떤 메서드가 맞는가?</q>
+<o><code>put(e)</code></o>
+<o><code>offer(e)</code></o>
+<o><code>add(e)</code></o>
+<o><code>offer(e, time, unit)</code></o>
+<why>offer(e)는 가득 찼을 때 기다리지 않고 false를 돌려주므로 반환값으로 거절을 처리하면 된다. put(e)는 자리가 날 때까지 무기한 막혀 요청 스레드 고갈로 이어질 수 있다. add(e)도 즉시 실패하지만 IllegalStateException을 던지는 형태라 "가득 찬 것이 비정상인" 상황에 맞는 선택이다. 내부적으로 AbstractQueue.add()는 offer()가 false일 때 예외를 던지는 포장일 뿐이다. offer(e, time, unit)는 정해진 시간까지는 기다린다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>ArrayBlockingQueue처럼 notFull/notEmpty 두 조건으로 대기 공간을 나눈 버퍼에서도 await()를 while 루프 안에서 불러야 하는 이유로 가장 정확한 것은?</q>
+<o>가짜 깨어남이 명세상 허용되고, 비공정 락에서는 신호를 받은 스레드가 락을 다시 얻기 전에 새로 도착한 스레드가 끼어들어 상태를 바꿀 수 있기 때문이다.</o>
+<o>signal()이 FIFO가 아니라 임의의 스레드를 깨우기 때문이다.</o>
+<o>조건이 둘이면 생산자 신호가 생산자에게 갈 수 있기 때문이다.</o>
+<o>while이 아니면 await()가 락을 놓지 않기 때문이다.</o>
+<why>조건 분리는 신호의 방향을 고정할 뿐, 신호와 락 재획득 사이의 틈을 없애지 못한다. 비공정 락의 첫 시도는 대기열을 보지 않는 CAS여서 끼어들기가 가능하고, JLS 17.2.1과 Condition 문서는 가짜 깨어남을 허용한다. ReentrantLock의 조건은 FIFO로 신호를 보내며, 조건이 둘이면 생산자 신호는 소비자 대기열로만 간다. await()가 락을 놓는 것은 루프와 무관하다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>조건 변수(condition variable)</dt><dd>어떤 상태 조건이 참이 될 때까지 스레드를 기다리게 하고, 다른 스레드가 통지할 수 있게 하는 대기 공간. 자바에서는 객체의 대기 집합과 <code>java.util.concurrent.locks.Condition</code>이 이 역할을 한다.</dd>
+<dt>조건 대기열(condition queue)</dt><dd>Condition에서 await() 중인 스레드들의 줄. OpenJDK 21 AQS에서는 ConditionObject의 firstWaiter/lastWaiter로 잇는 단방향 연결 리스트다.</dd>
+<dt>락 대기열(sync queue)</dt><dd>AQS 기반 락을 얻지 못한 스레드들의 줄. head와 tail을 가진 양방향 연결 리스트이고, signal()로 옮겨진 노드도 여기에 붙는다.</dd>
+<dt>헛깨어남(futile wake-up)</dt><dd>깨어났지만 기다리던 조건이 여전히 거짓이라 아무 일도 못 하고 다시 잠드는 것. 이 강좌에서 쓰는 말로, 조건 하나에 다른 술어를 기다리는 스레드가 섞일 때 많이 생긴다.</dd>
+<dt>가짜 깨어남(spurious wake-up)</dt><dd>notify/signal이나 인터럽트, 시간 초과 없이 구현이 스레드를 대기에서 꺼내는 것. JLS 17.2.1과 Condition 문서가 허용하므로 대기는 항상 루프 안에서 한다.</dd>
+<dt>잃어버린 깨우기(lost wake-up)</dt><dd>대기 등록보다 신호가 먼저 일어나 신호가 아무에게도 가지 않고, 늦게 등록한 스레드가 조건이 참인데도 잠드는 것. 조건 검사와 대기 등록을 같은 락 아래에서 원자적으로 하면 막힌다.</dd>
+<dt>끼어들기(barging)</dt><dd>락 대기열에서 기다리던 스레드보다 방금 도착한 스레드가 락을 먼저 얻는 것. ReentrantLock의 비공정 모드는 첫 시도에서 대기열을 보지 않고 CAS하므로 허용된다.</dd>
+<dt>BlockingQueue</dt><dd>빈 큐에서 꺼낼 때와 가득 찬 큐에 넣을 때 기다리는 연산을 추가로 제공하는 Queue. 예외·특별한 값·대기·시간 제한의 네 가지 형태가 있고 null을 받지 않는다.</dd>
+<dt>독약 객체(poison object)</dt><dd>BlockingQueue에 닫기 연산이 없으므로, 생산자가 "더 이상 없음"을 알리려고 넣는 특별한 원소. 소비자가 꺼내면 종료한다.</dd>
+<dt>ManagedBlocker</dt><dd>ForkJoinPool에 "이 작업이 곧 막힌다"고 알리는 인터페이스(isReleasable, block). OpenJDK 21에서 AQS의 ConditionNode가 구현하므로, 풀의 작업 스레드가 시간 제한 없는 await()로 기다리면 풀이 필요에 따라 쉬는 스레드를 깨우거나 새 스레드를 만들어 병렬도를 유지하려 한다.</dd>
+<dt>배압(back pressure)</dt><dd>소비가 생산보다 느릴 때 버퍼의 한계가 생산자를 막아 속도를 맞추는 효과. 용량 없는 큐를 쓰면 사라지고 원소가 메모리에 쌓인다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html">JLS 21 Chapter 17. Threads and Locks</a> — 17.2 대기 집합과 통지(wait의 n번 unlock/lock, 가짜 깨어남, notify 대상 비보장), 17.4.5 happens-before</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/Condition.html">Condition (Java SE 21 API)</a> — 객체당 여러 대기 집합, 원자적 락 해제, 가짜 깨어남과 루프 대기, awaitNanos 사용 형태</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/Lock.html">Lock (Java SE 21 API)</a> — newCondition()의 대기 규칙, 모니터 락과 같은 메모리 동기화 의미</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/BlockingQueue.html">BlockingQueue (Java SE 21 API)</a> — 네 가지 메서드 형태, null 금지, 종료 연산 부재, 메모리 일관성 효과, 구현 클래스 목록</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ArrayBlockingQueue.html">ArrayBlockingQueue (Java SE 21 API)</a> — 배열 기반 한정 버퍼, 공정성 정책과 처리량의 관계</li>
+<li><a href="https://raw.githubusercontent.com/openjdk/jdk21u/master/src/hotspot/share/runtime/objectMonitor.hpp">OpenJDK 21u objectMonitor.hpp</a> — HotSpot ObjectMonitor의 _WaitSet, _cxq, _EntryList 필드와 주석</li>
+</x-refs>

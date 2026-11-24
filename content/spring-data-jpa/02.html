@@ -1,0 +1,683 @@
+<x-meta>
+deck: 엔티티마다 복사되던 순수 JPA 리포지토리를 인터페이스 선언 하나로 바꾸고, 그 인터페이스가 스캔과 프록시를 거쳐 SimpleJpaRepository에 닿는 길과 공통 메서드가 실제로 내보내는 SQL을 확인한다.
+minutes: 80
+</x-meta>
+
+<x-goals>
+<li>EntityManager만으로 리포지토리를 직접 작성하고, 엔티티가 늘어날 때 그대로 복사되는 부분과 실제로 달라지는 부분(엔티티 클래스와 식별자 타입)을 구분해 말할 수 있다.</li>
+<li>제네릭 타입 변수 <code>T</code>로는 엔티티 클래스를 얻을 수 없는 이유(타입 소거)와, 스프링 데이터가 <code>JpaRepository<Member, Long></code>이라는 선언에서 <code>Member</code>와 <code>Long</code>을 읽어 내는 경로(클래스 파일의 Signature 속성)를 설명할 수 있다.</li>
+<li>스프링 부트와 순수 스프링 설정에서 리포지토리 인터페이스가 어느 패키지에서, 어떤 필터로 발견되어 <code>JpaRepositoryFactoryBean</code> 빈 정의가 되고, 다시 JDK 동적 프록시가 되는지 순서대로 설명할 수 있다.</li>
+<li>공통 인터페이스의 계층(<code>Repository</code>, <code>CrudRepository</code>, <code>ListCrudRepository</code>, <code>PagingAndSortingRepository</code>, <code>JpaRepository</code>)을 그리고, 각 메서드가 EntityManager의 어떤 호출과 어떤 SQL로 이어지는지 실행 로그로 확인할 수 있다.</li>
+<li><code>deleteAll</code>과 <code>deleteAllInBatch</code>, <code>findById</code>와 <code>getReferenceById</code>처럼 이름이 비슷한 메서드의 차이를 영속성 컨텍스트와 트랜잭션 경계의 관점에서 판단할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 두 번째 리포지토리를 쓸 때 무엇을 복사하는가</h3>
+
+<p>JPA를 다룬 앞의 권들에서 리포지토리는 늘 같은 모양이었다. 클래스에 <code>@Repository</code>를 붙이고, <code>EntityManager</code>를 주입받고, <code>persist</code>, <code>find</code>, <code>remove</code>, 그리고 JPQL 몇 줄로 저장·조회·삭제를 구현했다. 엔티티가 하나일 때는 이 방식에 불만이 없다. 문제는 두 번째, 세 번째 엔티티가 생길 때 드러난다. 회원 리포지토리를 다 쓰고 팀 리포지토리를 만들려고 하면 손이 가장 먼저 하는 일은 회원 리포지토리를 통째로 복사하는 것이다.</p>
+
+<p>복사가 나쁜 이유는 단순히 지루해서가 아니다. 복사된 코드는 같은 결함도 함께 복사한다. 삭제 메서드에 준영속 엔티티를 넘기면 예외가 나는 문제를 회원 리포지토리에서 고쳤다면, 팀 리포지토리와 주문 리포지토리에서도 같은 수정을 기억해서 해야 한다. 엔티티가 스무 개라면 스무 번이다. 공통 코드가 한곳에 모여 있지 않으면 수정의 비용은 엔티티 수에 비례해 커진다.</p>
+
+<p>스프링 데이터 JPA의 공통 인터페이스는 이 반복을 없애는 장치다. 그런데 "인터페이스만 선언하면 구현이 생긴다"는 설명은 결과만 말해 줄 뿐 과정을 말해 주지 않는다. 이 회차는 과정을 따라간다. 먼저 순수 JPA로 리포지토리 두 개를 만들어 무엇이 반복되는지 눈으로 확인한다. 다음으로 그 반복을 직접 공통화해 보다가 자바의 타입 소거(type erasure)라는 벽에 부딪힌다. 그 벽을 스프링 데이터가 어떻게 넘는지 본 뒤, 공통 인터페이스를 설정하고 적용하고, 마지막으로 인터페이스 계층과 메서드 하나하나가 실제로 하는 일을 실행 로그로 분석한다.</p>
+
+<p>이 회차의 모든 실험은 Spring Boot 3.5.16, Spring Framework 6.2.19, Spring Data JPA 3.5.13, Hibernate ORM 6.6.53.Final, H2 인메모리 데이터베이스, JDK 21에서 실행했다. 클래스 내부 동작에 대한 서술은 같은 버전의 jar를 <code>javap</code>로 열어 확인한 것이다. 예제 도메인은 설명에 필요한 만큼만 만든 최소 모델로, 식별자와 이름 필드 하나씩만 가진 <code>Member</code>와 <code>Team</code> 두 엔티티다.</p>
+
+<h3>순수 JPA 기반 리포지토리 만들기</h3>
+
+<p>출발점은 스프링 데이터 없이 <code>EntityManager</code>만으로 만든 리포지토리다. 엔티티부터 보자. 식별자는 <code>@GeneratedValue</code>로 생성하고, 이름을 바꾸는 메서드를 하나 둔다. 세터를 열지 않고 의도가 드러나는 변경 메서드를 두는 이유는 JPA 활용 권에서 다뤘다.</p>
+
+<pre><code class="language-java">@Entity
+public class Member {
+    @Id @GeneratedValue
+    private Long id;
+    private String username;
+
+    protected Member() {}                       // JPA 명세가 요구하는 기본 생성자
+    public Member(String username) { this.username = username; }
+
+    public Long getId() { return id; }
+    public String getUsername() { return username; }
+    public void changeUsername(String username) { this.username = username; }
+}</code></pre>
+
+<p>리포지토리는 다섯 가지 일을 한다. 저장, 삭제, 전체 조회, 식별자로 단건 조회, 개수 세기다.</p>
+
+<pre><code class="language-java">@Repository
+public class MemberJpaRepository {
+    @PersistenceContext
+    private EntityManager em;
+
+    public Member save(Member member) { em.persist(member); return member; }
+    public void delete(Member member) { em.remove(member); }
+    public List<Member> findAll() {
+        return em.createQuery("select m from Member m", Member.class).getResultList();
+    }
+    public Optional<Member> findById(Long id) { return Optional.ofNullable(em.find(Member.class, id)); }
+    public long count() {
+        return em.createQuery("select count(m) from Member m", Long.class).getSingleResult();
+    }
+}</code></pre>
+
+<p>각 메서드가 EntityManager의 어느 기능에 기대는지 짚어 두자. 이 대응 관계가 나중에 스프링 데이터의 구현체를 읽을 때 그대로 다시 나온다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>EntityManager 호출</th><th>영속성 컨텍스트에서 일어나는 일</th><th>SQL이 나가는 시점</th></tr></thead><tbody>
+<tr><td><code>save</code></td><td><code>persist</code></td><td>엔티티를 영속 상태로 만들고 1차 캐시에 넣는다. 시퀀스 전략이면 이때 식별자를 받아 온다.</td><td>INSERT는 쓰기 지연 저장소에 쌓였다가 플러시 때</td></tr>
+<tr><td><code>delete</code></td><td><code>remove</code></td><td>엔티티를 삭제 예정(removed) 상태로 바꾼다. 준영속(detached) 엔티티를 넘기면 <code>IllegalArgumentException</code></td><td>DELETE는 플러시 때</td></tr>
+<tr><td><code>findById</code></td><td><code>find</code></td><td>1차 캐시를 먼저 보고, 없을 때만 DB를 조회한 뒤 결과를 1차 캐시에 넣는다</td><td>캐시에 없을 때 즉시 SELECT</td></tr>
+<tr><td><code>findAll</code>, <code>count</code></td><td><code>createQuery</code></td><td>JPQL은 1차 캐시를 거치지 않고 항상 SQL로 번역된다. 실행 전에 자동 플러시가 일어날 수 있다</td><td>즉시 SELECT</td></tr>
+</tbody></table></div>
+
+<p>표에 "수정" 메서드가 없다는 점이 눈에 띈다. 빠뜨린 것이 아니다. JPA에서 수정은 트랜잭션 안에서 영속 상태 엔티티의 필드를 바꾸는 것으로 끝난다. 플러시 시점에 하이버네이트가 엔티티를 처음 읽었을 때 떠 둔 스냅샷과 현재 값을 비교해 UPDATE를 만든다. 이것이 변경 감지(dirty checking)다. 그래서 순수 JPA 리포지토리에도, 뒤에서 볼 스프링 데이터의 공통 인터페이스에도 <code>update</code>라는 메서드는 없다.</p>
+
+<p>이 리포지토리가 실제로 어떤 SQL을 어떤 순서로 내보내는지 테스트로 확인하자. 테스트 메서드에 트랜잭션을 걸었으므로 테스트가 끝나면 롤백된다.</p>
+
+<pre><code class="language-java">@SpringBootTest
+@Transactional
+class MemberRepositoryTest {
+
+    @Autowired MemberJpaRepository memberJpaRepository;
+
+    @Test
+    void pureJpaCrud() {
+        Member member1 = memberJpaRepository.save(new Member("member1"));
+        Member member2 = memberJpaRepository.save(new Member("member2"));
+
+        assertThat(memberJpaRepository.findById(member1.getId()).get()).isSameAs(member1);
+        assertThat(memberJpaRepository.findAll()).hasSize(2);
+        assertThat(memberJpaRepository.count()).isEqualTo(2);
+
+        memberJpaRepository.delete(member1);
+        memberJpaRepository.delete(member2);
+        assertThat(memberJpaRepository.count()).isEqualTo(0);
+    }
+}</code></pre>
+
+<pre data-label="실행 로그 (spring.jpa.show-sql=true, 시퀀스 호출 줄은 생략)"><code class="language-text">Hibernate: insert into member (username,id) values (?,?)
+Hibernate: insert into member (username,id) values (?,?)
+Hibernate: select m1_0.id,m1_0.username from member m1_0
+Hibernate: select count(m1_0.id) from member m1_0
+Hibernate: delete from member where id=?
+Hibernate: delete from member where id=?
+Hibernate: select count(m1_0.id) from member m1_0</code></pre>
+
+<p>로그를 코드와 한 줄씩 맞춰 보자. 두 번의 <code>save</code>는 <code>persist</code>만 호출하므로 INSERT를 바로 내보내지 않는다. 그다음 <code>findById</code>에는 대응하는 SELECT가 없다. 방금 저장한 엔티티가 1차 캐시에 있으므로 <code>em.find</code>는 DB에 가지 않고 캐시에 있는 바로 그 객체를 돌려준다. <code>isSameAs</code> 단언이 통과하는 이유가 이것이다. 두 INSERT는 <code>findAll</code>의 JPQL이 실행되기 직전에 나간다. 하이버네이트의 기본 플러시 모드(AUTO)는 실행할 JPQL이 조회하는 테이블에 아직 반영되지 않은 변경이 쌓여 있으면 실행 직전에 쓰기 지연 저장소를 비우기 때문이다. 플러시를 하지 않으면 DB에는 아직 행이 없으므로 <code>findAll</code>이 빈 목록을 돌려주게 된다. 두 DELETE도 같은 이유로 마지막 <code>count</code>의 JPQL 직전에 나간다.</p>
+
+<h3>반복을 해부하기: 무엇이 같고 무엇이 다른가</h3>
+
+<p>이제 팀 리포지토리를 만든다. 예상대로 회원 리포지토리를 복사해 이름만 바꾸면 끝난다.</p>
+
+<pre><code class="language-java">@Repository
+public class TeamJpaRepository {
+    @PersistenceContext
+    private EntityManager em;
+
+    public Team save(Team team) { em.persist(team); return team; }
+    public void delete(Team team) { em.remove(team); }
+    public List<Team> findAll() {
+        return em.createQuery("select t from Team t", Team.class).getResultList();
+    }
+    public Optional<Team> findById(Long id) { return Optional.ofNullable(em.find(Team.class, id)); }
+    public long count() {
+        return em.createQuery("select count(t) from Team t", Long.class).getSingleResult();
+    }
+}</code></pre>
+
+<p>두 클래스를 나란히 놓고 달라진 글자만 골라내면 세 종류다. 첫째, 메서드 시그니처에 등장하는 타입 이름(<code>Member</code>와 <code>Team</code>). 둘째, <code>em.find</code>와 <code>createQuery</code>에 넘기는 클래스 리터럴(<code>Member.class</code>와 <code>Team.class</code>). 셋째, JPQL 문자열 안의 엔티티 이름(<code>"Member"</code>와 <code>"Team"</code>). 그런데 셋째는 둘째에서 계산할 수 있다. 엔티티 이름은 기본적으로 클래스의 단순 이름이기 때문이다. 식별자 타입(<code>Long</code>)까지 더하면, 결국 달라지는 정보는 <b>엔티티 클래스</b>와 <b>식별자 타입</b> 두 가지뿐이다.</p>
+
+<p>이 관찰이 이 회차 전체의 열쇠다. 실행 시점에 "이 리포지토리가 다루는 엔티티 클래스"를 알 수만 있다면 나머지 코드는 모든 엔티티에 대해 똑같다. 그렇다면 공통 코드를 한 클래스에 두고 엔티티 클래스만 바꿔 끼우면 된다. 직접 해 보자.</p>
+
+<h3>직접 공통화해 보기: 제네릭 베이스 클래스와 타입 소거</h3>
+
+<p>가장 먼저 떠오르는 방법은 타입 변수를 쓰는 추상 클래스다. 엔티티 타입을 <code>T</code>, 식별자 타입을 <code>ID</code>로 두고, <code>em.find(T.class, id)</code>처럼 쓰고 싶다. 그런데 이 코드는 컴파일되지 않는다.</p>
+
+<pre><code class="language-java">class GenericRepo<T> {
+    Class<?> domain() { return T.class; }
+}</code></pre>
+
+<pre data-label="javac 21 출력"><code class="language-text">Erasure.java:8: error: cannot select from a type variable
+    Class<?> domain() { return T.class; }
+                                ^
+1 error</code></pre>
+
+<p>이유는 자바 제네릭의 구현 방식에 있다. 자바 언어 명세(JLS §4.6)는 컴파일러가 제네릭 타입을 지우는 규칙, 곧 타입 소거를 정의한다. 타입 변수는 그 상한(bound)으로, 매개변수화된 타입은 원시 타입(raw type)으로 바뀐다. 상한을 적지 않은 <code>T</code>의 상한은 <code>Object</code>다. 그래서 바이트코드 수준에서 <code>GenericRepo<Member></code>와 <code>GenericRepo<Team></code>은 같은 클래스 하나이고, 그 클래스의 코드 안에는 "지금 <code>T</code>가 무엇인지"를 담은 값이 어디에도 없다. <code>T.class</code>는 존재하지 않는 값을 달라는 요청이므로 컴파일러가 거부한다.</p>
+
+<p>소거는 객체에도 흔적을 남기지 않는다. 다음 실험이 그것을 보여 준다.</p>
+
+<pre><code class="language-java">List<String> list = new ArrayList<>();
+System.out.println(Arrays.toString(list.getClass().getTypeParameters()));
+System.out.println(list.getClass() == new ArrayList<Integer>().getClass());</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">[E]
+true</code></pre>
+
+<p>객체가 아는 것은 자기 클래스가 <code>E</code>라는 타입 변수를 선언했다는 사실뿐이고, 그 <code>E</code>가 이번에 <code>String</code>이었다는 정보는 없다. HotSpot 기준으로 힙에 있는 <code>ArrayList</code> 객체의 헤더가 가리키는 클래스 메타데이터는 <code>ArrayList<String></code>이든 <code>ArrayList<Integer></code>이든 같은 하나다.</p>
+
+<p>그래서 직접 공통화하려면 엔티티 클래스를 값으로 넘겨받아야 한다. <code>Class<T></code> 객체를 생성자 인자로 받는 방법, 흔히 타입 토큰(type token)이라 부르는 방법이다.</p>
+
+<pre><code class="language-java">public abstract class JpaGenericRepository<T, ID> {
+    protected final EntityManager em;
+    private final Class<T> domainClass;          // 소거된 T 대신 값으로 들고 있는 엔티티 클래스
+
+    protected JpaGenericRepository(EntityManager em, Class<T> domainClass) {
+        this.em = em;
+        this.domainClass = domainClass;
+    }
+
+    public T save(T entity) { em.persist(entity); return entity; }
+    public void delete(T entity) { em.remove(entity); }
+    public Optional<T> findById(ID id) { return Optional.ofNullable(em.find(domainClass, id)); }
+    public List<T> findAll() {
+        String jpql = "select e from " + domainClass.getSimpleName() + " e";
+        return em.createQuery(jpql, domainClass).getResultList();
+    }
+    public long count() {
+        String jpql = "select count(e) from " + domainClass.getSimpleName() + " e";
+        return em.createQuery(jpql, Long.class).getSingleResult();
+    }
+}</code></pre>
+
+<p>이제 회원 리포지토리는 <code>JpaGenericRepository<Member, Long></code>을 상속하고 생성자에서 <code>super(em, Member.class)</code>만 호출하면 된다. 꽤 좋아졌지만 여전히 엔티티마다 클래스 하나를 만들어야 하고, 그 클래스를 빈으로 등록하고, 트랜잭션과 예외 변환을 어떻게 걸지도 각자 정해야 한다. 그리고 <code>Member</code>라는 정보를 <code>extends JpaGenericRepository<Member, Long></code>에 한 번, <code>Member.class</code>에 또 한 번, 두 번 적고 있다. 같은 정보를 두 번 적는다는 것은 둘이 어긋날 수 있다는 뜻이다.</p>
+
+<h4>소거되지 않는 곳: 선언에 남는 Signature 속성</h4>
+
+<p>여기서 질문을 바꿔 보자. 객체에서는 타입 인자가 지워진다. 그렇다면 <b>클래스 선언</b>에서는 어떨까. <code>interface MemberRepo extends Repo<String, Long></code>처럼 상위 타입에 구체적인 타입 인자를 적어 넣은 선언을 컴파일한 뒤 <code>javap -v</code>로 열어 보면 답이 나온다.</p>
+
+<pre data-label="javap -v MemberRepo (발췌)"><code class="language-text">interface MemberRepo extends Repo<java.lang.String, java.lang.Long>
+   #7 = Utf8               Signature
+   #8 = Utf8               Ljava/lang/Object;LRepo<Ljava/lang/String;Ljava/lang/Long;>;
+Signature: #8                           // Ljava/lang/Object;LRepo<Ljava/lang/String;Ljava/lang/Long;>;</code></pre>
+
+<p>클래스 파일에는 Signature라는 속성이 있다(JVMS §4.7.9). 바이트코드 실행에는 쓰이지 않지만, 소스에 적힌 제네릭 선언을 그대로 보존해 리플렉션과 컴파일러가 읽을 수 있게 한다. 위의 문자열은 "<code>MemberRepo</code>의 상위 클래스는 <code>Object</code>이고, 상위 인터페이스는 <code>String</code>과 <code>Long</code>으로 매개변수화된 <code>Repo</code>다"라는 뜻이다. 자바 리플렉션 API는 이 속성을 <code>getGenericInterfaces()</code>로 돌려준다.</p>
+
+<pre><code class="language-java">ParameterizedType p = (ParameterizedType) MemberRepo.class.getGenericInterfaces()[0];
+System.out.println(p.getRawType());
+System.out.println(Arrays.toString(p.getActualTypeArguments()));</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">interface Repo
+[class java.lang.String, class java.lang.Long]</code></pre>
+
+<p>정리하면 이렇다. 타입 인자는 <b>객체</b>에서는 지워지지만, 어떤 타입이 자신의 상위 타입을 <b>구체적인 타입 인자로 선언</b>했다면 그 선언은 클래스 파일에 남는다. 그러니 엔티티 클래스를 알아내는 가장 확실한 방법은 객체를 들여다보는 것이 아니라, "<code>Member</code>를 타입 인자로 박아 넣은 선언"을 하나 받아서 그 Signature를 읽는 것이다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>스프링 데이터 JPA의 리포지토리 인터페이스 <code>interface MemberRepository extends JpaRepository<Member, Long></code>은 바로 그 "타입 인자를 박아 넣은 선언"이다. 스프링 데이터는 이 인터페이스의 Signature를 읽어 엔티티 클래스와 식별자 타입을 알아내고, 그 정보로 공통 구현체 하나를 엔티티마다 따로 만들어 붙인다. 개발자가 <code>Member</code>를 적는 곳은 한 번뿐이다.</p></aside>
+
+<p>실제로 스프링 데이터 커먼즈 3.5.13의 <code>DefaultRepositoryMetadata</code> 생성자를 <code>javap -c</code>로 읽으면 이 일을 하는 코드가 그대로 보인다. 리포지토리 인터페이스로 <code>TypeInformation.of(repositoryInterface)</code>를 만들고, <code>getRequiredSuperTypeInformation(Repository.class)</code>로 <code>Repository</code>까지 거슬러 올라간 상위 타입 정보를 얻은 뒤, <code>getTypeArguments()</code>의 0번을 도메인 타입, 1번을 식별자 타입으로 삼는다. 해석하지 못하면 <code>"Could not resolve domain type of %s"</code>라는 메시지로 실패하도록 되어 있다. 이 회차의 실험 애플리케이션에서 리포지토리 팩토리 빈이 들고 있는 메타데이터를 꺼내 보면 다음과 같이 나온다.</p>
+
+<pre data-label="실험 출력"><code class="language-text">generic ifaces = [org.springframework.data.jpa.repository.JpaRepository<demo.Member, java.lang.Long>]
+domainType = demo.Member, idType = java.lang.Long</code></pre>
+
+<x-visual id="spring-data-jpa-02-erasure-signature" title="객체에서는 지워지고 선언에는 남는 제네릭 타입 정보" kind="개념 비교 그림" ratio="16:9">
+<x-hint>왼쪽은 힙의 ArrayList 객체 두 개가 같은 클래스 메타데이터 하나를 가리키는 모습, 오른쪽은 MemberRepository 클래스 파일 안의 Signature 속성에 Member와 Long이 남아 있고 스프링 데이터가 그것을 읽어 가는 모습을 대비한다.</x-hint>
+<x-prompt>A two-panel technical illustration on a white background, flat style. Left panel titled "객체: 타입 인자가 지워진다": two small rounded boxes labeled "new ArrayList<String>()" and "new ArrayList<Integer>()" in a region labeled "힙", both with arrows pointing to one shared box labeled "ArrayList 클래스 메타데이터". Right panel titled "선언: Signature 속성에 남는다": a document-shaped box labeled "MemberRepository.class" containing a highlighted strip labeled "Signature: JpaRepository<Member, Long>". A magnifying glass icon labeled "스프링 데이터가 읽는다" reads that strip, and an arrow goes from it to two tags labeled "도메인 타입 = Member" and "식별자 타입 = Long". Use blue for the left panel and green for the right panel.</x-prompt>
+<x-caption>객체는 자신이 어떤 타입 인자로 만들어졌는지 모르지만, 타입 인자를 박아 넣은 인터페이스 선언은 클래스 파일에 그 정보를 남긴다.</x-caption>
+</x-visual>
+
+<h3>공통 인터페이스 설정: @EnableJpaRepositories와 스프링 부트의 자동 구성</h3>
+
+<p>스프링 데이터 JPA가 리포지토리 인터페이스를 찾아 구현을 붙이려면 먼저 "어디서 찾을지"를 알아야 한다. 스프링 부트 없이 순수 스프링으로 구성한다면 설정 클래스에 <code>@EnableJpaRepositories</code>를 붙인다.</p>
+
+<pre><code class="language-java">@Configuration
+@EnableJpaRepositories(basePackages = "demo.repository")
+@EnableTransactionManagement
+class JpaConfig {
+    // EntityManagerFactory, DataSource, PlatformTransactionManager 빈 정의 ...
+}</code></pre>
+
+<p>스프링 데이터 JPA 레퍼런스는 기본 패키지를 지정하지 않으면 설정 클래스가 있는 패키지를 쓴다고 설명한다. 이 애너테이션에는 패키지 외에도 리포지토리 생성 방식을 정하는 속성이 많다. Spring Data JPA 3.5.13의 클래스 파일에서 각 속성의 기본값(AnnotationDefault)을 읽으면 다음과 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>속성</th><th>기본값</th><th>의미와 다루는 회차</th></tr></thead><tbody>
+<tr><td><code>basePackages</code></td><td>빈 배열</td><td>비어 있으면 애너테이션이 붙은 설정 클래스의 패키지</td></tr>
+<tr><td><code>entityManagerFactoryRef</code></td><td><code>"entityManagerFactory"</code></td><td>리포지토리가 쓸 <code>EntityManagerFactory</code> 빈 이름</td></tr>
+<tr><td><code>transactionManagerRef</code></td><td><code>"transactionManager"</code></td><td>리포지토리 트랜잭션에 쓸 트랜잭션 매니저 빈 이름</td></tr>
+<tr><td><code>enableDefaultTransactions</code></td><td><code>true</code></td><td>공통 구현체의 기본 트랜잭션 설정을 적용할지 여부(06회차)</td></tr>
+<tr><td><code>queryLookupStrategy</code></td><td><code>CREATE_IF_NOT_FOUND</code></td><td>쿼리 메서드의 쿼리를 찾고 만드는 전략(03회차)</td></tr>
+<tr><td><code>repositoryImplementationPostfix</code></td><td><code>"Impl"</code></td><td>사용자 정의 구현 클래스를 찾는 접미사(05회차)</td></tr>
+<tr><td><code>repositoryFactoryBeanClass</code></td><td><code>JpaRepositoryFactoryBean</code></td><td>인터페이스 하나마다 등록되는 팩토리 빈의 클래스</td></tr>
+<tr><td><code>considerNestedRepositories</code></td><td><code>false</code></td><td>다른 클래스 안에 중첩 선언된 리포지토리 인터페이스도 찾을지 여부</td></tr>
+<tr><td><code>bootstrapMode</code></td><td><code>DEFAULT</code></td><td>리포지토리 빈을 언제 초기화할지</td></tr>
+</tbody></table></div>
+
+<p>스프링 부트를 쓰면 이 애너테이션을 직접 붙이지 않아도 된다. 자동 구성 클래스 <code>JpaRepositoriesAutoConfiguration</code>이 대신 붙여 주기 때문이다. Spring Boot 3.5.16의 이 클래스를 <code>javap -v</code>로 열면 적용 조건이 애너테이션으로 붙어 있다.</p>
+
+<pre data-label="JpaRepositoriesAutoConfiguration의 클래스 애너테이션 (Spring Boot 3.5.16)"><code class="language-text">@AutoConfiguration(after = { HibernateJpaAutoConfiguration.class, TaskExecutionAutoConfiguration.class })
+@ConditionalOnBean(DataSource.class)
+@ConditionalOnClass(JpaRepository.class)
+@ConditionalOnMissingBean({ JpaRepositoryFactoryBean.class, JpaRepositoryConfigExtension.class })
+@ConditionalOnBooleanProperty(name = "spring.data.jpa.repositories.enabled", matchIfMissing = true)
+@Import(JpaRepositoriesImportSelector.class)</code></pre>
+
+<p>조건을 하나씩 읽어 보자. <code>DataSource</code> 빈이 있어야 하고, 클래스패스에 <code>JpaRepository</code>가 있어야 하며(스프링 데이터 JPA 스타터를 넣었다는 뜻이다), <code>spring.data.jpa.repositories.enabled</code> 속성이 꺼져 있지 않아야 한다. 눈여겨볼 것은 <code>@ConditionalOnMissingBean</code>이다. 개발자가 직접 <code>@EnableJpaRepositories</code>를 붙여 리포지토리를 등록하면 <code>JpaRepositoryFactoryBean</code> 빈이 생기므로, 자동 구성은 물러난다. 둘이 겹쳐 같은 리포지토리를 두 번 등록하는 일이 없도록 한 장치다.</p>
+
+<p>그러면 자동 구성은 어느 패키지를 뒤지는가. 임포트되는 등록기 <code>JpaRepositoriesRegistrar</code>는 내부에 <code>@EnableJpaRepositories</code>가 붙은 설정 클래스(<code>EnableJpaRepositoriesConfiguration</code>)를 하나 품고 있고, 기본 패키지는 상위 클래스 <code>AbstractRepositoryConfigurationSourceSupport</code>의 <code>getBasePackages()</code>가 정한다. 바이트코드에서 이 메서드는 <code>AutoConfigurationPackages.get(beanFactory)</code>를 호출한다. 자동 구성 패키지는 <code>@SpringBootApplication</code>에 들어 있는 <code>@AutoConfigurationPackage</code>가 등록하는 패키지, 곧 메인 클래스가 있는 패키지다. 스프링 부트 레퍼런스도 자동 구성을 쓰면 "자동 구성 패키지에서 리포지토리를 찾는다"고 적고 있다. 실험 애플리케이션에서 이 값을 출력하면 메인 클래스의 패키지 하나가 나온다.</p>
+
+<pre data-label="실험 출력"><code class="language-text">autoconfig packages = [demo]</code></pre>
+
+<p>여기서 실무적인 결론이 하나 나온다. 리포지토리 인터페이스를 메인 클래스 패키지의 바깥(예를 들어 형제 패키지)에 두면 스캔 대상이 아니므로 빈이 생기지 않고, 그 리포지토리를 주입받는 쪽에서 빈을 찾지 못해 애플리케이션 시작이 실패한다. 이때는 패키지 구조를 고치거나 <code>@EnableJpaRepositories(basePackages = ...)</code>로 위치를 직접 지정해야 한다. 엔티티 스캔도 같은 자동 구성 패키지를 기준으로 하므로(레퍼런스의 Entity Classes 절), 엔티티를 바깥에 두었다면 <code>@EntityScan</code>도 함께 필요하다.</p>
+
+<p>부트스트랩 모드도 짚어 두자. 스프링 부트 3.5.16의 설정 메타데이터에서 <code>spring.data.jpa.repositories.bootstrap-mode</code>의 기본값은 <code>default</code>다. 스프링 데이터 JPA 레퍼런스는 기본 모드에서 리포지토리가 싱글톤으로 즉시 초기화되고, 이 과정에서 검증과 메타데이터 분석을 위해 이미 <code>EntityManager</code>와 상호작용한다고 설명한다. 그래서 리포지토리 선언에 문제가 있으면 첫 호출 때가 아니라 애플리케이션 시작 시점에 실패한다. 뒤에서 <code>@NoRepositoryBean</code>을 빠뜨린 실험이 시작 단계에서 실패하는 것도 이 때문이다. <code>deferred</code>와 <code>lazy</code>는 이 초기화를 뒤로 미루는 모드다.</p>
+
+<h3>한 층 아래 1: 구현 클래스 없는 인터페이스가 빈 정의가 되기까지</h3>
+
+<p>스프링의 일반적인 컴포넌트 스캔은 인터페이스를 빈으로 만들지 않는다. <code>ClassPathScanningCandidateComponentProvider</code>의 기본 후보 판정은 독립적인 구체 클래스를 요구하기 때문이다. 인터페이스는 <code>new</code>로 만들 수 없으니 당연하다. 스프링 데이터는 이 스캐너를 상속한 <code>RepositoryComponentProvider</code>로 자기만의 규칙을 적용한다. Spring Data Commons 3.5.13의 바이트코드에서 읽은 규칙은 다음과 같다.</p>
+
+<ul>
+<li><b>포함 필터 두 개</b>: <code>Repository</code>를 상속한 인터페이스를 고르는 <code>InterfaceTypeFilter(Repository.class)</code>, 그리고 <code>@RepositoryDefinition</code>이 붙은 타입을 고르는 <code>AnnotationTypeFilter</code>.</li>
+<li><b>제외 필터 하나</b>: <code>@NoRepositoryBean</code>이 붙은 타입은 후보에서 뺀다.</li>
+<li><b>후보 판정 재정의</b>: <code>isCandidateComponent</code>는 클래스 이름이 <code>org.springframework.data.repository.Repository</code> 자신인 경우를 걸러 내고, 다른 클래스 안에 중첩된 인터페이스는 <code>considerNestedRepositories</code>가 켜져 있을 때만 받아들인다.</li>
+</ul>
+
+<p>스캔이 클래스를 읽는 방식도 알아 둘 만하다. 스프링 프레임워크 6.2.19의 <code>SimpleMetadataReader</code>는 스프링이 내장한 ASM의 <code>ClassReader</code>로 <code>.class</code> 파일의 바이트를 직접 해석한다. 즉 스캔 단계에서는 후보 클래스를 JVM에 로드하지 않고, 클래스 파일에 적힌 애너테이션과 상위 타입 이름 같은 메타데이터만 읽는다. 패키지 아래 수백 개의 클래스를 훑어도 정적 초기화 블록이 실행되거나 메타스페이스에 클래스가 쌓이지 않는 이유다.</p>
+
+<p>후보로 뽑힌 인터페이스마다 <code>RepositoryConfigurationDelegate</code>가 빈 정의(<code>BeanDefinition</code>)를 하나씩 등록한다. 핵심은 이 빈 정의의 클래스가 인터페이스 자신이 아니라는 점이다. 실험 애플리케이션에서 <code>memberRepository</code> 빈 정의를 꺼내 보면 다음과 같다.</p>
+
+<pre data-label="실험 출력"><code class="language-text">beanClassName = org.springframework.data.jpa.repository.support.JpaRepositoryFactoryBean
+ctor arg value = demo.MemberRepository
+&memberRepository = org.springframework.data.jpa.repository.support.JpaRepositoryFactoryBean
+repo class = jdk.proxy2.$Proxy96</code></pre>
+
+<p>빈 정의의 클래스는 <code>JpaRepositoryFactoryBean</code>이고, 생성자 인자 0번에 리포지토리 인터페이스의 이름이 들어 있다. 빈 이름은 인터페이스의 단순 이름을 소문자로 시작하게 바꾼 <code>memberRepository</code>다. <code>JpaRepositoryFactoryBean</code>은 스프링의 <code>FactoryBean</code>이다. 스프링 컨테이너는 <code>FactoryBean</code> 타입의 빈을 만나면, 그 이름으로 빈을 요청받았을 때 팩토리 자신이 아니라 팩토리의 <code>getObject()</code>가 돌려준 객체를 내준다. 팩토리 자체가 필요하면 이름 앞에 <code>&</code>를 붙여 요청한다. 위 출력에서 <code>&memberRepository</code>로는 팩토리 빈이, <code>memberRepository</code>로는 JDK 동적 프록시가 나온 것이 그 결과다.</p>
+
+<p>팩토리 빈이 프록시를 만드는 시점은 초기화 콜백 <code>afterPropertiesSet()</code>이다. 이 경로는 실패하는 리포지토리를 일부러 만들어 보면 스택 트레이스로 정확히 드러난다(뒤의 <code>@NoRepositoryBean</code> 실험). 아래에서 위로 읽으면 다음 순서다.</p>
+
+<pre data-label="스택 트레이스에서 추린 호출 경로 (아래에서 위로 실행)"><code class="language-text">org.hibernate...JpaMetamodelImpl.managedType
+org.springframework.data.jpa.repository.support.JpaMetamodelEntityInformation.<init>
+org.springframework.data.jpa.repository.support.JpaEntityInformationSupport.getEntityInformation
+org.springframework.data.jpa.repository.support.JpaRepositoryFactory.getTargetRepository
+org.springframework.data.repository.core.support.RepositoryFactorySupport.getRepository
+org.springframework.data.repository.core.support.RepositoryFactoryBeanSupport.afterPropertiesSet
+org.springframework.data.jpa.repository.support.JpaRepositoryFactoryBean.afterPropertiesSet
+org.springframework.beans.factory.support.AbstractAutowireCapableBeanFactory.invokeInitMethods</code></pre>
+
+<p>스프링 컨테이너가 빈 초기화 메서드를 호출하면, 팩토리 빈은 <code>RepositoryFactorySupport.getRepository()</code>로 리포지토리를 만든다. 이 과정에서 JPA 모듈의 <code>JpaRepositoryFactory.getTargetRepository()</code>가 프록시 뒤에 둘 실제 객체를 만드는데, 그 전에 앞에서 본 메타데이터의 도메인 타입으로 하이버네이트 메타모델에 엔티티 정보를 묻는다(<code>JpaMetamodelEntityInformation</code>). 식별자 속성이 무엇인지, 엔티티 이름이 무엇인지 같은 정보가 여기서 모인다. 그렇게 만들어진 대상 객체가 <code>SimpleJpaRepository</code>이고, <code>ProxyFactory</code>가 이 대상과 인터셉터들을 묶어 프록시를 만든다. 프록시 안에서 인터셉터들이 호출을 어떤 순서로 처리하는지는 스프링 DB 2편에서 자세히 따라갔으므로, 여기서는 결과물을 열어 보는 데 집중한다.</p>
+
+<figure class="flow-figure"><figcaption>리포지토리 인터페이스 하나가 주입 가능한 빈이 되기까지 (스프링 부트 3.5.16 기준)</figcaption><ol class="flow">
+<li><strong>자동 구성 조건 평가</strong><span>JpaRepositoriesAutoConfiguration의 조건이 맞으면 JpaRepositoriesRegistrar가 임포트된다. 기본 패키지는 AutoConfigurationPackages에서 가져온다.</span></li>
+<li><strong>클래스 파일 스캔</strong><span>RepositoryComponentProvider가 ASM으로 .class 파일을 읽어 Repository를 상속한 인터페이스를 고른다. @NoRepositoryBean은 제외한다.</span></li>
+<li><strong>빈 정의 등록</strong><span>인터페이스마다 클래스가 JpaRepositoryFactoryBean이고 생성자 인자가 인터페이스 이름인 빈 정의를 memberRepository 같은 이름으로 등록한다.</span></li>
+<li><strong>팩토리 빈 초기화</strong><span>afterPropertiesSet에서 인터페이스의 Signature로 도메인 타입과 식별자 타입을 읽고, 하이버네이트 메타모델에서 엔티티 정보를 얻는다.</span></li>
+<li><strong>대상과 프록시 조립</strong><span>SimpleJpaRepository를 대상으로, 트랜잭션·예외 변환·쿼리 실행 인터셉터를 어드바이스로 묶은 JDK 동적 프록시를 만든다.</span></li>
+<li><strong>주입</strong><span>memberRepository라는 이름이나 MemberRepository 타입으로 요청하면 컨테이너가 팩토리의 getObject() 결과, 곧 프록시를 내준다.</span></li>
+</ol></figure>
+
+<h3>공통 인터페이스 적용: 리포지토리를 인터페이스 한 줄로 바꾸기</h3>
+
+<p>이제 순수 JPA 리포지토리 두 개를 스프링 데이터 JPA로 바꾼다. 코드는 이것이 전부다.</p>
+
+<pre><code class="language-java">public interface MemberRepository extends JpaRepository<Member, Long> {
+}
+
+public interface TeamRepository extends JpaRepository<Team, Long> {
+}</code></pre>
+
+<p>구현 클래스도, <code>@Repository</code>도, <code>EntityManager</code> 주입도 없다. 첫 번째 타입 인자는 엔티티 타입, 두 번째는 그 엔티티의 식별자 타입이다. 앞 절에서 본 대로 이 두 인자가 Signature 속성에 남고, 스프링 데이터가 그것을 읽는다. 식별자 타입은 엔티티의 <code>@Id</code> 필드 타입과 맞춰야 한다. <code>Member</code>의 식별자가 <code>Long</code>이므로 <code>Long</code>이다.</p>
+
+<p>앞의 테스트를 그대로 옮겨 스프링 데이터 리포지토리로 실행해 보자. 같은 테스트가 통과한다면 공통 인터페이스가 순수 JPA 리포지토리를 대신할 수 있다는 뜻이다. SQL이 어디서 나가는지 보려고 구분선을 출력하게 했다.</p>
+
+<pre><code class="language-java">@Autowired MemberRepository memberRepository;
+
+@Test
+void springDataCrud() {
+    Member member1 = memberRepository.save(new Member("member1"));
+    Member member2 = memberRepository.save(new Member("member2"));
+
+    assertThat(memberRepository.findById(member1.getId()).get()).isSameAs(member1);
+    List<Member> all = memberRepository.findAll();
+    assertThat(all).hasSize(2);
+    System.out.println("--- before count");
+    assertThat(memberRepository.count()).isEqualTo(2);
+
+    memberRepository.delete(member1);
+    memberRepository.delete(member2);
+    System.out.println("--- before count2");
+    assertThat(memberRepository.count()).isEqualTo(0);
+    System.out.println("--- end");
+}</code></pre>
+
+<pre data-label="실행 로그 (시퀀스 호출 줄은 생략)"><code class="language-text">Hibernate: insert into member (username,id) values (?,?)
+Hibernate: insert into member (username,id) values (?,?)
+Hibernate: select m1_0.id,m1_0.username from member m1_0
+--- before count
+Hibernate: select count(*) from member m1_0
+--- before count2
+Hibernate: delete from member where id=?
+Hibernate: delete from member where id=?
+Hibernate: select count(*) from member m1_0
+--- end</code></pre>
+
+<p>흐름은 순수 JPA 버전과 똑같다. 저장은 쓰기 지연되었다가 <code>findAll</code>의 JPQL 직전에 플러시되고, <code>findById</code>는 1차 캐시에서 같은 객체를 돌려주며(<code>isSameAs</code> 통과), 삭제는 다음 JPQL 직전에 플러시된다. 테스트 메서드의 트랜잭션 안에서 리포지토리 메서드들이 호출되었으므로 모두 하나의 영속성 컨텍스트를 공유했기 때문이다. 리포지토리 메서드에도 트랜잭션 설정이 붙어 있지만, 이미 진행 중인 트랜잭션이 있으면 기본 전파 속성(<code>REQUIRED</code>)에 따라 거기에 참여할 뿐 새로 시작하지 않는다.</p>
+
+<p>달라진 곳은 한 줄이다. 직접 쓴 JPQL <code>select count(m) from Member m</code>은 <code>count(m1_0.id)</code>가 되었고, 스프링 데이터의 <code>count()</code>는 <code>count(*)</code>가 되었다. 이유는 <code>SimpleJpaRepository</code>가 JPQL을 만드는 방식에 있다. Spring Data JPA 3.5.13의 <code>QueryUtils</code>에는 <code>COUNT_QUERY_STRING = "select count(%s) from %s x"</code>라는 상수가 있고, 첫 번째 자리에는 JPA 구현체마다 다른 자리표시자가 들어간다. 하이버네이트용 <code>PersistenceProvider</code>의 <code>getCountQueryPlaceholder()</code>는 <code>"*"</code>를 돌려준다. 그래서 실제로 실행되는 JPQL은 <code>select count(*) from Member x</code>이고, 하이버네이트는 이것을 그대로 <code>count(*)</code>로 번역한다. 두 쿼리의 결과는 같다. 식별자 컬럼은 NULL일 수 없으므로 <code>count(id)</code>와 <code>count(*)</code>는 같은 행 수를 센다.</p>
+
+<h3>프록시를 열어 보기: 클래스, 인터페이스, 대상, 어드바이스</h3>
+
+<p>주입받은 <code>memberRepository</code>가 정확히 무엇인지 실험 애플리케이션에서 출력해 보았다. 스프링 AOP의 <code>Advised</code> 인터페이스로 캐스팅하면 프록시가 감싼 대상과 어드바이스 목록을 꺼낼 수 있다.</p>
+
+<pre data-label="실험 출력 (프록시 클래스 이름의 번호는 실행 환경마다 다를 수 있다)"><code class="language-text">repo class = jdk.proxy2.$Proxy96
+isJdkDynamicProxy = true
+interfaces = [interface demo.MemberRepository,
+              interface org.springframework.data.repository.Repository,
+              interface org.springframework.transaction.interceptor.TransactionalProxy,
+              interface org.springframework.aop.framework.Advised,
+              interface org.springframework.core.DecoratingProxy]
+target = org.springframework.data.jpa.repository.support.SimpleJpaRepository
+  advice: ...CrudMethodMetadataPostProcessor$CrudMethodMetadataPopulatingMethodInterceptor
+  advice: org.springframework.dao.support.PersistenceExceptionTranslationInterceptor
+  advice: org.springframework.transaction.interceptor.TransactionInterceptor
+  advice: org.springframework.data.projection.DefaultMethodInvokingMethodInterceptor
+  advice: org.springframework.data.repository.core.support.QueryExecutorMethodInterceptor
+  advice: ...RepositoryFactorySupport$ImplementationMethodExecutionInterceptor
+  advice: org.springframework.dao.support.PersistenceExceptionTranslationInterceptor</code></pre>
+
+<p>클래스 이름 <code>jdk.proxy2.$Proxy96</code>은 JDK가 실행 중에 생성한 프록시 클래스라는 뜻이다. JDK 동적 프록시는 지정한 인터페이스들을 구현하는 클래스를 런타임에 바이트코드로 만들어 정의하고, 그 클래스의 모든 메서드는 하나의 <code>InvocationHandler</code>로 위임된다. 스프링 AOP에서는 <code>JdkDynamicAopProxy</code>가 이 핸들러 역할을 하며 어드바이스 체인을 실행한다. 번호는 프록시 클래스가 생성된 순서에 따라 붙으므로 애플리케이션 구성이 바뀌면 달라진다. 이름에 의미를 두면 안 된다.</p>
+
+<p>프록시가 구현한 인터페이스 다섯 개를 보자. <code>MemberRepository</code>는 우리가 선언한 것이고, <code>Repository</code>와 <code>TransactionalProxy</code>는 리포지토리 팩토리가 붙인 표식이다. <code>TransactionalProxy</code>는 <code>SpringProxy</code>를 상속한 마커 인터페이스로, 이 객체가 이미 트랜잭션 처리를 갖춘 프록시라는 사실을 스프링 트랜잭션 인프라에 알린다. <code>Advised</code>와 <code>DecoratingProxy</code>는 스프링 AOP의 <code>ProxyFactory</code>가 기본으로 덧붙이는 인터페이스로, 위 실험처럼 프록시의 설정과 원래 대상 클래스를 조회할 수 있게 해 준다.</p>
+
+<p>대상은 <code>SimpleJpaRepository</code>다. <code>MemberRepository</code>에도 <code>TeamRepository</code>에도 같은 클래스의 인스턴스가 하나씩 따로 만들어져 들어간다. 인스턴스마다 생성자에서 받은 엔티티 정보(<code>JpaEntityInformation</code>)와 <code>EntityManager</code>를 필드로 들고 있으므로, 한 클래스가 엔티티마다 다르게 동작한다. 앞에서 직접 만든 <code>JpaGenericRepository</code>가 <code>Class<T></code> 필드를 들고 있던 것과 같은 구조다. 다른 점은 그 클래스 정보를 개발자가 아니라 프레임워크가 인터페이스 선언에서 읽어 채운다는 것이다.</p>
+
+<p>어드바이스 목록에는 예외 변환 인터셉터(<code>PersistenceExceptionTranslationInterceptor</code>)가 두 번 나온다. 첫 번째는 리포지토리 팩토리가 프록시를 조립할 때 넣은 것이다. 마지막 것은 어디서 왔을까. 같은 애플리케이션을 <code>spring.dao.exceptiontranslation.enabled=false</code>로 실행하면 컨텍스트에서 <code>PersistenceExceptionTranslationPostProcessor</code> 빈이 사라지고, 어드바이스 목록도 마지막 줄 없이 여섯 개로 줄어든다. 즉 마지막 인터셉터는 스프링 부트가 등록한 빈 후처리기가 완성된 프록시에 덧붙인 것이다. 이 후처리기는 <code>@Repository</code>가 붙은 빈을 대상으로 하는데, <code>javap -v</code>로 보면 <code>SimpleJpaRepository</code> 클래스 자체에 <code>@Repository</code>가 붙어 있다. 어느 쪽이든 결론은 하나다. 리포지토리 인터페이스에 <code>@Repository</code>를 붙이지 않아도 JPA 예외는 스프링의 <code>DataAccessException</code> 계층으로 변환된다. 인터페이스에 그 애너테이션을 붙이는 것은 아무것도 더하지 않는다.</p>
+
+<x-visual id="spring-data-jpa-02-proxy-anatomy" title="memberRepository 빈의 해부도: 팩토리 빈, 프록시, 대상" kind="구조 다이어그램" ratio="16:9">
+<x-hint>스프링 컨테이너 안에 이름이 다른 두 진입점(memberRepository와 &amp;memberRepository)이 있고, 하나는 팩토리 빈을, 하나는 팩토리가 만든 JDK 프록시를 가리키며, 프록시 안의 어드바이스 체인 끝에 SimpleJpaRepository가 있는 구조를 보여 준다.</x-hint>
+<x-prompt>A structural diagram on a white background, flat technical style. A large rounded rectangle labeled "스프링 컨테이너". Inside, on the left, two name tags stacked vertically: "memberRepository" and "&memberRepository". The tag "&memberRepository" has an arrow to a box labeled "JpaRepositoryFactoryBean". A dashed arrow labeled "getObject()" goes from that box to a large box on the right labeled "JDK 동적 프록시 ($Proxy)". The tag "memberRepository" has an arrow directly to the proxy box. Inside the proxy box, a vertical stack of thin bars labeled from top to bottom: "예외 변환", "트랜잭션", "쿼리 실행", "구현 위임". Below the stack, a solid box labeled "SimpleJpaRepository" with two small tags attached: "엔티티 정보: Member" and "EntityManager". Keep labels in Korean exactly as given.</x-prompt>
+<x-caption>빈 이름으로는 프록시가, 이름 앞에 &amp;를 붙이면 팩토리 빈이 나온다. 프록시의 어드바이스 체인 끝에 엔티티마다 따로 만든 SimpleJpaRepository가 있다.</x-caption>
+</x-visual>
+
+<h3>공통 인터페이스 분석 1: 계층 구조와 모듈의 경계</h3>
+
+<p><code>JpaRepository</code>를 상속하면 수십 개의 메서드가 생긴다. 이 메서드들은 한 인터페이스에 다 들어 있지 않고 여러 층에 나뉘어 있다. Spring Data 3.5.13(Commons와 JPA)의 클래스 파일을 <code>javap</code>로 열어 상속 관계를 그리면 다음과 같다.</p>
+
+<pre class="diagram">                    Repository<T, ID>                       ── spring-data-commons
+                    (메서드 없음: 마커 인터페이스)            org.springframework.data.repository
+           ┌──────────────┴───────────────┐
+  CrudRepository<T, ID>          PagingAndSortingRepository<T, ID>
+  save, findById, existsById,    findAll(Sort), findAll(Pageable)
+  findAll, findAllById, count,
+  delete, deleteById, deleteAll...
+           │                              │
+  ListCrudRepository<T, ID>      ListPagingAndSortingRepository<T, ID>     QueryByExampleExecutor<T>
+  (Iterable 대신 List 반환)       (Iterable 대신 List 반환)                  findOne(Example), ...
+           └──────────────┬───────────────┘                                      │
+                    JpaRepository<T, ID>  ◀──────────────────────────────────────┘
+                    flush, saveAndFlush, saveAllAndFlush,                ── spring-data-jpa
+                    deleteAllInBatch, deleteAllByIdInBatch,               org.springframework.data.jpa.repository
+                    getReferenceById, findAll(Example) ...
+                           │
+                    MemberRepository  ── 개발자가 선언 (도메인 타입 Member, 식별자 Long)</pre>
+
+<p>맨 위의 <code>Repository</code>에는 메서드가 하나도 없다. 레퍼런스는 이 인터페이스를 "다룰 타입을 붙잡고, 이것을 상속한 인터페이스를 찾아내는 데 쓰이는 마커 인터페이스"라고 설명한다. 앞 절의 스캔 필터가 바로 이 인터페이스를 기준으로 후보를 골랐다. 엔티티 타입과 식별자 타입이라는 두 타입 인자도 여기서 처음 선언된다.</p>
+
+<p><code>CrudRepository</code>는 저장소 종류와 무관한 기본 CRUD를 정의한다. 3.5.13에서 추상 메서드는 <code>save</code>, <code>saveAll</code>, <code>findById</code>, <code>existsById</code>, <code>findAll</code>, <code>findAllById</code>, <code>count</code>, <code>deleteById</code>, <code>delete</code>, <code>deleteAllById</code>, <code>deleteAll(Iterable)</code>, <code>deleteAll()</code>의 열두 개다. 여러 건을 돌려주는 메서드의 반환 타입은 <code>Iterable</code>이다. <code>ListCrudRepository</code>의 Javadoc에 적힌 <code>@since 3.0</code>대로 버전 3.0부터 <code>ListCrudRepository</code>가 추가되어, 같은 메서드를 <code>List</code>로 돌려받을 수 있다. <code>JpaRepository</code>는 <code>ListCrudRepository</code>를 상속하므로 <code>findAll()</code>의 반환 타입이 <code>List</code>다. 실험에서 실제 반환 객체는 <code>java.util.ArrayList</code>였다.</p>
+
+<p>페이징 쪽 계층에서 눈여겨볼 것은 <code>PagingAndSortingRepository</code>가 <code>CrudRepository</code>가 아니라 <code>Repository</code>를 바로 상속한다는 점이다. 3.5.13의 클래스 파일에서 이 인터페이스의 상위 타입은 <code>Repository</code> 하나뿐이다. 따라서 페이징과 정렬만 상속한 리포지토리에는 <code>save</code>가 생기지 않는다. CRUD와 페이징을 모두 원하면 둘을 함께 상속해야 하고, <code>JpaRepository</code>는 실제로 <code>ListCrudRepository</code>와 <code>ListPagingAndSortingRepository</code>를 모두 상속한다. 페이징의 동작 원리와 count 쿼리는 04회차에서 다룬다.</p>
+
+<p>두 모듈의 경계도 중요하다. <code>Repository</code>부터 <code>ListPagingAndSortingRepository</code>까지는 spring-data-commons의 <code>org.springframework.data.repository</code> 패키지에, <code>QueryByExampleExecutor</code>는 같은 모듈의 하위 패키지 <code>org.springframework.data.repository.query</code>에 있다. 이 모듈은 JPA만이 아니라 MongoDB, Redis 같은 다른 저장소 모듈이 함께 쓰는 공통 기반이다. 그래서 여기 있는 메서드는 어떤 저장소에서도 의미가 통하는 것들뿐이다. 반면 <code>JpaRepository</code>는 spring-data-jpa의 <code>org.springframework.data.jpa.repository</code> 패키지에 있고, 여기에만 있는 메서드는 모두 JPA 고유의 개념에 기대고 있다. <code>flush</code>와 <code>saveAndFlush</code>는 쓰기 지연 저장소를 비우는 영속성 컨텍스트의 개념이고, <code>getReferenceById</code>는 <code>EntityManager.getReference</code>가 돌려주는 프록시 참조의 개념이며, <code>deleteAllInBatch</code>는 JPQL 벌크 연산의 개념이다. 메서드가 어느 인터페이스에 있는지를 보면 그 메서드가 저장소 일반의 약속인지 JPA에 묶인 약속인지 알 수 있다.</p>
+
+<p>이 경계는 클래스패스에 저장소 모듈이 둘 이상 있을 때 실제로 쓰인다. 레퍼런스에 따르면 스프링 데이터는 여러 저장소 모듈을 감지하면 엄격한(strict) 설정 모드에 들어가고, 리포지토리가 모듈 전용 인터페이스(예를 들어 <code>JpaRepository</code>)를 상속했는지, 또는 도메인 클래스에 모듈 전용 애너테이션(예를 들어 <code>@Entity</code>)이 붙었는지를 보고 어느 모듈이 그 리포지토리를 맡을지 정한다. <code>Repository</code>나 <code>CrudRepository</code>만 상속한 리포지토리는 인터페이스만으로는 어느 모듈에 묶일지 구분되지 않는다.</p>
+
+<h4>바이트코드에 숨은 메서드: 공변 반환 타입과 브리지 메서드</h4>
+
+<p><code>ListCrudRepository</code>는 <code>CrudRepository</code>의 <code>Iterable<T> findAll()</code>을 <code>List<T> findAll()</code>로 재선언한다. 자바는 오버라이딩할 때 반환 타입을 하위 타입으로 좁히는 것(공변 반환 타입)을 허용한다. 그런데 JVM은 메서드를 이름과 디스크립터(매개변수 타입과 반환 타입을 모두 포함한 문자열)로 식별한다. JVM 입장에서 <code>()Ljava/lang/Iterable;</code>과 <code>()Ljava/util/List;</code>는 서로 다른 메서드다. 그래서 컴파일러는 둘을 잇는 메서드를 하나 더 만든다. <code>javap -v</code>로 확인하면 이렇다.</p>
+
+<pre data-label="javap -v -c ListCrudRepository (Spring Data Commons 3.5.13, 발췌)"><code class="language-text">public default java.lang.Iterable findAll();
+  descriptor: ()Ljava/lang/Iterable;
+  flags: (0x1041) ACC_PUBLIC, ACC_BRIDGE, ACC_SYNTHETIC
+  Code:
+     0: aload_0
+     1: invokeinterface #7,  1   // InterfaceMethod findAll:()Ljava/util/List;
+     6: areturn</code></pre>
+
+<p>소스에는 없던 <code>default</code> 메서드가 <code>ACC_BRIDGE</code>, <code>ACC_SYNTHETIC</code> 표시를 달고 생겼다. 이 브리지 메서드는 <code>List</code>를 돌려주는 진짜 <code>findAll()</code>을 호출해 그 결과를 그대로 반환할 뿐이다. 덕분에 <code>CrudRepository</code> 타입의 참조로 <code>findAll()</code>을 호출하는 오래된 코드도 같은 구현에 도달한다. 실험에서 프록시 클래스가 선언한 <code>findAll</code> 메서드를 리플렉션으로 세어 보면 반환 타입이 <code>Iterable</code>인 것과 <code>List</code>인 것 두 개가 나오고, <code>CrudRepository</code> 타입 변수로 <code>findAll()</code>을 호출해도 SELECT는 한 번만 나가며 결과는 <code>ArrayList</code>였다. 3.5.13의 <code>JpaRepository</code>와 <code>ListCrudRepository</code>를 <code>javap</code>로 열면 소스에 적은 적 없는 <code>public default</code> 메서드가 여럿 보이는데, 폐기 예정인 <code>JpaRepository.deleteInBatch</code> 하나를 빼면 모두 이런 브리지 메서드다.</p>
+
+<h3>공통 인터페이스 분석 2: 메서드 하나가 실제로 하는 일</h3>
+
+<p>이제 공통 메서드가 내부에서 무엇을 호출하는지 하나씩 본다. 아래 표의 가운데 열은 Spring Data JPA 3.5.13의 <code>SimpleJpaRepository</code> 바이트코드를 <code>javap -c</code>로 읽은 것이고, 오른쪽 열은 실험에서 실제로 기록된 SQL이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>SimpleJpaRepository 내부</th><th>실험에서 나간 SQL</th></tr></thead><tbody>
+<tr><td><code>save(entity)</code></td><td>엔티티 정보의 <code>isNew(entity)</code>가 참이면 <code>em.persist</code> 후 그 객체를 반환, 거짓이면 <code>em.merge</code>의 반환값을 반환</td><td>새 엔티티면 INSERT(플러시 때)</td></tr>
+<tr><td><code>findById(id)</code></td><td><code>em.find(domainClass, id)</code>를 <code>Optional.ofNullable</code>로 감싼다. 락 모드나 힌트 메타데이터가 있으면 그것을 넘기는 <code>find</code> 오버로드를 쓴다</td><td><code>select ... from member m1_0 where m1_0.id=?</code></td></tr>
+<tr><td><code>getReferenceById(id)</code></td><td><code>em.getReference(domainClass, id)</code></td><td>호출 시점에는 없음</td></tr>
+<tr><td><code>existsById(id)</code></td><td>식별자 속성이 있으면 count JPQL을 만들어 실행, 없으면 <code>findById(id).isPresent()</code></td><td><code>select count(*) from member m1_0 where m1_0.id=?</code></td></tr>
+<tr><td><code>count()</code></td><td><code>select count(*) from Member x</code></td><td><code>select count(*) from member m1_0</code></td></tr>
+<tr><td><code>findAll()</code></td><td>Criteria 쿼리로 전체 조회</td><td><code>select m1_0.id,m1_0.username from member m1_0</code></td></tr>
+<tr><td><code>deleteById(id)</code></td><td><code>findById(id).ifPresent(this::delete)</code></td><td>SELECT 후, 있으면 DELETE</td></tr>
+<tr><td><code>delete(entity)</code></td><td>새 엔티티면 아무것도 안 함. <code>em.contains</code>면 <code>remove</code>, 아니면 <code>find</code>로 다시 읽어 있을 때만 <code>remove(merge(entity))</code></td><td>상황에 따라 SELECT, DELETE</td></tr>
+<tr><td><code>deleteAll()</code></td><td><code>findAll()</code>로 전부 읽고 하나씩 <code>delete</code></td><td>SELECT 1번 + DELETE N번</td></tr>
+<tr><td><code>deleteAllInBatch()</code></td><td>JPQL <code>delete from Member x</code>를 <code>executeUpdate</code></td><td><code>delete from member m1_0</code> 1번</td></tr>
+</tbody></table></div>
+
+<p><code>save</code>의 <code>isNew</code> 판단, 곧 식별자와 버전 필드를 보고 새 엔티티인지 정하는 규칙과 <code>Persistable</code>로 그 판단을 바꾸는 방법은 06회차의 주제다. 이 회차에서는 <code>save</code>가 <code>persist</code>와 <code>merge</code> 둘 중 하나로 갈라진다는 사실만 기억하면 된다. 나머지 메서드 가운데 이름 때문에 오해하기 쉬운 것들을 실험으로 따라가 보자.</p>
+
+<h4>findById와 getReferenceById: 지금 읽는가, 나중에 읽는가</h4>
+
+<p><code>findById</code>는 <code>em.find</code>이므로 영속성 컨텍스트에 엔티티가 없으면 즉시 SELECT를 실행하고, 행이 없으면 <code>Optional.empty()</code>를 돌려준다. 실험에서 없는 식별자 999로 호출한 결과는 <code>Optional.empty</code>였다. 반면 <code>getReferenceById</code>는 <code>em.getReference</code>이므로 DB에 가지 않고 프록시 객체를 돌려줄 수 있다. 트랜잭션 안에서 다음 코드를 실행했다.</p>
+
+<pre><code class="language-java">tx.executeWithoutResult(s -> {
+    Member ref = repo.getReferenceById(id1);
+    System.out.println("ref class = " + ref.getClass().getName());
+    System.out.println("ref id = " + ref.getId());
+    System.out.println("before username access");
+    System.out.println("ref username = " + ref.getUsername());
+});</code></pre>
+
+<pre data-label="실행 결과 (Hibernate 6.6.53.Final)"><code class="language-text">ref class = demo.Member$HibernateProxy
+ref id = 1
+before username access
+Hibernate: select m1_0.id,m1_0.username from member m1_0 where m1_0.id=?
+ref username = memberA</code></pre>
+
+<p>반환된 객체의 클래스는 하이버네이트가 <code>Member</code>를 상속해 만든 프록시 클래스다. 프록시는 식별자를 이미 알고 있으므로 <code>getId()</code>에는 SQL이 필요 없다. SELECT는 식별자가 아닌 필드에 처음 접근하는 <code>getUsername()</code>에서야 나간다. 이 지연 때문에 두 가지 결과가 생긴다. 첫째, 존재하지 않는 식별자로 참조를 얻어도 그 순간에는 아무 일도 일어나지 않고, 처음 접근할 때 예외가 난다. 실험에서는 <code>jakarta.persistence.EntityNotFoundException: Unable to find demo.Member with id 999</code>였다. <code>JpaRepository</code>의 Javadoc도 구현에 따라 거의 항상 인스턴스를 돌려주고 첫 접근 때 <code>EntityNotFoundException</code>을 던질 가능성이 높다고 적고 있다. 둘째, 트랜잭션 밖에서 참조를 얻고 나중에 접근하면 초기화할 영속성 컨텍스트가 이미 닫혀 있다. 실험 결과는 <code>org.hibernate.LazyInitializationException: Could not initialize proxy [demo.Member#1] - no session</code>이었다.</p>
+
+<p>그럼 <code>getReferenceById</code>는 어디에 쓰는가. 엔티티의 내용은 필요 없고 식별자만으로 연관관계를 걸고 싶을 때다. 예를 들어 주문을 만들면서 회원 식별자만 알고 있다면, 회원을 조회하지 않고 참조만 얻어 외래 키를 채울 수 있다. 외래 키 컬럼에 들어갈 값은 식별자뿐이므로 프록시로 충분하다. 존재 여부를 확인해야 하는 곳에서는 쓰면 안 된다. 같은 역할의 <code>getOne</code>과 <code>getById</code>는 3.5.13에서 <code>@Deprecated</code>이고, 바이트코드를 보면 둘 다 내부에서 <code>getReferenceById</code>를 호출할 뿐이다. Javadoc에 따르면 <code>getReferenceById</code>는 2.7부터 있다.</p>
+
+<h4>deleteById와 delete: 없는 것을 지우면</h4>
+
+<p><code>deleteById(999L)</code>를 실행하면 SELECT 한 번만 나가고 예외 없이 끝난다. 바이트코드가 <code>findById(id).ifPresent(this::delete)</code>이기 때문이다. <code>CrudRepository</code>의 Javadoc도 엔티티를 찾지 못하면 조용히 무시한다고 명시한다. 삭제 결과를 확인해야 하는 업무라면 반환값이 없는 이 메서드 대신 먼저 조회해 존재를 확인하는 코드를 직접 써야 한다.</p>
+
+<p><code>delete(entity)</code>는 순수 JPA의 <code>em.remove</code>보다 너그럽다. <code>em.remove</code>는 준영속 엔티티를 받으면 <code>IllegalArgumentException</code>을 던지지만, <code>SimpleJpaRepository.delete</code>는 먼저 <code>em.contains(entity)</code>로 영속 상태인지 확인하고, 아니면 같은 식별자로 <code>em.find</code>를 해 본다. 행이 있으면 <code>em.merge</code>로 영속 상태의 인스턴스를 얻어 그것을 <code>remove</code>한다. 트랜잭션 밖에서 읽어 온 준영속 엔티티를 넘긴 실험의 로그가 이 순서를 보여 준다.</p>
+
+<pre data-label="실행 로그: 준영속 엔티티 삭제"><code class="language-text">Hibernate: select m1_0.id,m1_0.username from member m1_0 where m1_0.id=?   ← 테스트 코드의 findById (첫 트랜잭션)
+Hibernate: select m1_0.id,m1_0.username from member m1_0 where m1_0.id=?   ← delete 안의 em.find (두 번째 트랜잭션)
+Hibernate: delete from member where id=?                                  ← merge로 얻은 영속 인스턴스를 remove, 커밋 때 플러시</code></pre>
+
+<p><code>em.find</code>가 이미 같은 식별자의 엔티티를 영속성 컨텍스트에 올려 두었으므로, 이어지는 <code>merge</code>는 추가 SELECT 없이 그 인스턴스에 준영속 객체의 값을 복사한다. 만약 <code>find</code>가 <code>null</code>을 돌려주면(다른 트랜잭션이 이미 지웠다면) 아무것도 하지 않고 끝난다.</p>
+
+<h4>deleteAll과 deleteAllInBatch: 엔티티 단위인가, SQL 한 방인가</h4>
+
+<p>이름만 보면 둘 다 "전부 지운다"지만 동작은 완전히 다르다. 행 네 개가 있는 상태에서 <code>deleteAll()</code>, 다시 행 세 개를 넣고 <code>deleteAllInBatch()</code>를 실행한 로그다.</p>
+
+<pre data-label="실행 로그"><code class="language-text">-- deleteAll
+Hibernate: select m1_0.id,m1_0.username from member m1_0
+Hibernate: delete from member where id=?
+Hibernate: delete from member where id=?
+Hibernate: delete from member where id=?
+Hibernate: delete from member where id=?
+-- deleteAllInBatch
+Hibernate: delete from member m1_0</code></pre>
+
+<p><code>deleteAll()</code>은 모든 엔티티를 메모리로 읽어 영속성 컨텍스트에 올린 다음 하나씩 <code>remove</code>한다. 행이 N개면 SELECT 1번에 DELETE N번이고, N개의 엔티티 객체와 그 스냅샷이 힙에 올라간다. 대신 엔티티 단위로 지우므로 <code>cascade</code> 설정과 엔티티 생명주기 콜백(<code>@PreRemove</code> 등)이 모두 동작한다. <code>deleteAllInBatch()</code>는 영속성 컨텍스트를 거치지 않고 JPQL 벌크 DELETE를 한 번 실행한다. <code>QueryUtils</code>의 상수 <code>DELETE_ALL_QUERY_STRING = "delete from %s x"</code>에 엔티티 이름을 넣은 것이다. 빠르지만 대가가 있다. <code>JpaRepository</code>의 Javadoc은 엔티티 목록을 받는 <code>deleteAllInBatch(Iterable)</code>에 대해, 이런 배치 삭제가 JPA의 1차 캐시와 DB를 어긋나게 남기며 cascade 의미를 따르지 않고 생명주기 이벤트도 발생시키지 않는다고 경고한다. 인자 없는 <code>deleteAllInBatch()</code>도 같은 JPQL 벌크 DELETE이므로 사정이 같다. 이미 영속성 컨텍스트에 올라와 있던 엔티티는 DB에서 사라진 뒤에도 메모리에 그대로 남는다. 벌크 연산과 영속성 컨텍스트의 이 어긋남은 04회차의 벌크성 수정 쿼리에서 다시 다룬다.</p>
+
+<h4>count와 existsById: 행을 가져오지 않고 세기</h4>
+
+<p><code>count()</code>는 앞에서 본 <code>select count(*) from Member x</code>다. <code>existsById</code>는 3.5.13에서 엔티티를 읽어 오지 않고 <code>where</code> 조건을 붙인 count 쿼리를 실행한 뒤 결과가 0보다 큰지 본다. 실험 로그는 <code>select count(*) from member m1_0 where m1_0.id=?</code>였다. 엔티티 전체를 영속성 컨텍스트에 올리는 <code>findById(id).isPresent()</code>보다 가볍다. 다만 이 쿼리는 1차 캐시를 보지 않으므로, 같은 트랜잭션에서 방금 <code>persist</code>했지만 아직 플러시되지 않은 엔티티가 있다면 그 결과는 자동 플러시 여부에 좌우된다. 하이버네이트의 기본 AUTO 플러시 모드에서는 JPQL 실행 전에 플러시가 일어난다는 점을 앞의 테스트에서 확인했다.</p>
+
+<x-visual id="spring-data-jpa-02-delete-comparison" title="deleteAll과 deleteAllInBatch의 경로 비교" kind="흐름 비교 다이어그램" ratio="16:9">
+<x-hint>위쪽 경로는 DB에서 모든 행을 읽어 영속성 컨텍스트에 올린 뒤 엔티티마다 DELETE를 보내고, 아래쪽 경로는 영속성 컨텍스트를 건너뛰어 DELETE 한 번을 보내는 차이를 보여 준다.</x-hint>
+<x-prompt>A comparison diagram with two horizontal lanes on a white background, flat style. Each lane has three columns: a box "리포지토리" on the left, a box "영속성 컨텍스트" in the middle, and a database cylinder "DB" on the right. Top lane titled "deleteAll()": an arrow from "리포지토리" to "DB" labeled "SELECT 1번", then four small entity cards appearing inside "영속성 컨텍스트", then four thin arrows from the cards to "DB" each labeled "DELETE". A small note under the lane: "cascade, 콜백 동작". Bottom lane titled "deleteAllInBatch()": one thick arrow from "리포지토리" that curves around the "영속성 컨텍스트" box without entering it and reaches "DB", labeled "DELETE 1번". A small note under the lane: "1차 캐시와 DB 불일치 가능". Use orange for the top lane arrows and purple for the bottom lane arrow.</x-prompt>
+<x-caption>deleteAll은 엔티티 단위로 읽고 지우며, deleteAllInBatch는 영속성 컨텍스트를 건너뛰어 SQL 한 번으로 지운다.</x-caption>
+</x-visual>
+
+<h3>호출 하나가 트랜잭션 하나: 리포지토리 메서드의 경계</h3>
+
+<p>지금까지의 실험 가운데 일부는 트랜잭션 밖에서 리포지토리를 호출했다. 그래도 저장과 삭제가 DB에 반영되었다. 리포지토리 메서드 자체에 트랜잭션이 걸려 있기 때문이다. 3.5.13의 <code>SimpleJpaRepository</code> 클래스에는 <code>@Transactional(readOnly = true)</code>가 붙어 있고, <code>save</code>, <code>saveAll</code>, <code>delete</code>, <code>deleteById</code>, <code>deleteAll</code>, <code>deleteAllInBatch</code>, <code>flush</code> 같은 변경 메서드에는 속성 없는 <code>@Transactional</code>이 다시 붙어 있다. 이 설정이 어떤 이유로 이렇게 되어 있고 읽기 전용이 무엇을 바꾸는지는 06회차의 구현체 분석에서 자세히 본다. 여기서는 이 설정이 만드는 결과 하나만 실험으로 확인한다.</p>
+
+<pre><code class="language-java">// 트랜잭션 밖
+Member x = repo.findById(id1).get();
+Member y = repo.findById(id1).get();
+System.out.println("outside tx same? " + (x == y));
+
+// 트랜잭션 안
+tx.executeWithoutResult(s -> {
+    Member p = repo.findById(id1).get();
+    Member q = repo.findById(id1).get();
+    System.out.println("inside tx same? " + (p == q));
+});</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">Hibernate: select m1_0.id,m1_0.username from member m1_0 where m1_0.id=?
+Hibernate: select m1_0.id,m1_0.username from member m1_0 where m1_0.id=?
+outside tx same? false
+Hibernate: select m1_0.id,m1_0.username from member m1_0 where m1_0.id=?
+inside tx same? true</code></pre>
+
+<p>트랜잭션 밖에서는 같은 식별자를 두 번 조회했는데 SELECT가 두 번 나가고 서로 다른 객체가 나왔다. 호출마다 프록시의 트랜잭션 인터셉터가 트랜잭션을 새로 시작하고, <code>JpaTransactionManager</code>가 그 트랜잭션을 위해 <code>EntityManager</code>를 새로 만들었다가 트랜잭션이 끝날 때 닫기 때문이다. 영속성 컨텍스트가 호출마다 새로 생기고 사라지니 1차 캐시가 공유될 수 없다. 반환된 엔티티는 이미 닫힌 영속성 컨텍스트에서 나온 준영속 상태다. 트랜잭션 안에서는 두 호출이 바깥 트랜잭션에 참여해 하나의 영속성 컨텍스트를 공유하므로 SELECT는 한 번이고 같은 객체가 나온다.</p>
+
+<p>이 차이는 변경 감지에서 그대로 결과의 차이가 된다. 트랜잭션 밖에서 <code>findById</code>로 꺼낸 엔티티의 이름을 바꾸고 다시 조회하면 바뀌기 전 값이 나온다. 변경을 감지할 영속성 컨텍스트가 이미 없기 때문이다. 같은 일을 트랜잭션 안에서 하면 커밋 때 <code>update member set username=? where id=?</code>가 나가고 다시 조회한 값이 바뀌어 있다. 실험의 출력은 각각 <code>reloaded = before</code>와 <code>reloaded2 = after</code>였다. 서비스 계층에 트랜잭션을 두어야 한다는 규칙은 스프링 데이터 JPA를 쓴다고 사라지지 않는다. 오히려 리포지토리 메서드마다 트랜잭션이 따로 걸려 있다는 사실 때문에, 서비스에 트랜잭션이 없으면 메서드 호출 사이에서 영속성 컨텍스트가 끊긴다는 점을 더 분명히 의식해야 한다.</p>
+
+<h3>필요한 메서드만 드러내기: Repository 직접 상속과 @NoRepositoryBean</h3>
+
+<p><code>JpaRepository</code>를 상속하면 삭제 메서드까지 모두 열린다. 읽기 전용이어야 할 엔티티라면 <code>deleteAllInBatch</code> 같은 메서드가 리포지토리에 있다는 것 자체가 위험이다. 레퍼런스는 메서드를 골라서 노출하고 싶으면 <code>Repository</code>를 상속하고 <code>CrudRepository</code>의 메서드 중 원하는 것만 자기 인터페이스에 옮겨 적으라고 안내한다. 여러 리포지토리가 공유할 중간 인터페이스를 만들 때는 <code>@NoRepositoryBean</code>을 붙인다.</p>
+
+<pre><code class="language-java">@NoRepositoryBean
+interface ReadOnlyRepository<T, ID> extends Repository<T, ID> {
+    Optional<T> findById(ID id);
+    List<T> findAll();
+    long count();
+}
+
+public interface MemberReadRepository extends ReadOnlyRepository<Member, Long> {
+}</code></pre>
+
+<p>실험 애플리케이션에서 이 리포지토리를 호출하면 <code>findAll</code>, <code>count</code>, <code>findById</code>가 각각 <code>SimpleJpaRepository</code>와 똑같은 SQL을 낸다(<code>count</code>도 <code>select count(*) from member m1_0</code>였다). 선언한 메서드의 시그니처가 공통 구현체의 메서드와 일치하므로 쿼리 메서드로 해석되지 않고 구현체로 위임된 것이다. <code>MemberReadRepository.class.getMethods()</code>에 <code>save</code>는 없다. 컨텍스트의 <code>Repository</code> 타입 빈 이름을 출력하면 <code>teamRepository</code>, <code>memberReadRepository</code>, <code>memberRepository</code>가 나오고 <code>ReadOnlyRepository</code>는 없다. 제외 필터가 동작한 것이다.</p>
+
+<p>그렇다면 <code>@NoRepositoryBean</code>을 빠뜨리면 어떻게 될까. 별도 패키지에 다음 인터페이스 하나만 두고 애플리케이션을 시작해 보았다.</p>
+
+<pre><code class="language-java">public interface BaseRepository<T, ID> extends JpaRepository<T, ID> {
+}</code></pre>
+
+<pre data-label="애플리케이션 시작 실패 (원인 부분)"><code class="language-text">org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'baseRepository'
+  defined in bad.BaseRepository defined in @EnableJpaRepositories declared on
+  JpaRepositoriesRegistrar.EnableJpaRepositoriesConfiguration: Not a managed type: class java.lang.Object
+Caused by: java.lang.IllegalArgumentException: Not a managed type: class java.lang.Object</code></pre>
+
+<p>이 메시지는 이 회차의 앞부분과 정확히 이어진다. <code>BaseRepository</code>는 <code>Repository</code>를 상속한 인터페이스이므로 스캔 필터에 걸렸고, 빈 정의가 등록되었다. 팩토리 빈이 초기화되며 Signature에서 도메인 타입을 읽으려 했지만, 이 선언의 타입 인자는 구체적인 클래스가 아니라 타입 변수 <code>T</code> 그대로다. 해석할 실제 타입이 없으니 <code>T</code>는 그 상한인 <code>Object</code>로 처리되었고, 하이버네이트 메타모델에 <code>Object</code>라는 엔티티가 있을 리 없으므로 실패했다. 레퍼런스도 <code>@NoRepositoryBean</code>이 필요한 이유를 "여전히 제네릭 타입 변수를 포함하고 있어 엔티티를 결정할 수 없기 때문"이라고 설명한다. 기본 부트스트랩 모드에서는 리포지토리를 즉시 초기화하므로 이 실패가 첫 호출이 아니라 시작 단계에서 드러난다.</p>
+
+<p>인터페이스를 상속하지 않고 싶다면 <code>@RepositoryDefinition</code>을 쓸 수도 있다. 이 애너테이션의 속성은 <code>domainClass</code>와 <code>idClass</code> 두 개로, 상속 선언 대신 애너테이션 속성으로 엔티티 타입과 식별자 타입을 알려 준다. 스캔의 두 번째 포함 필터가 바로 이 애너테이션을 찾는 것이었다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<ul>
+<li><b>"리포지토리 인터페이스에 <code>@Repository</code>를 붙여야 예외가 변환된다."</b> 그렇지 않다. 실험에서 본 대로 리포지토리 팩토리가 예외 변환 인터셉터를 프록시에 넣고, 스프링 부트의 빈 후처리기가 하나를 더 붙인다. 컴포넌트 스캔 대상이 되게 하려는 의도라면 그것도 필요 없다. 리포지토리는 컴포넌트 스캔이 아니라 스프링 데이터 자신의 스캔으로 등록된다.</li>
+<li><b>"값을 바꾼 뒤 <code>save</code>를 불러야 UPDATE가 나간다."</b> 트랜잭션 안의 영속 엔티티라면 변경 감지로 충분하다. 반대로 트랜잭션 밖에서 꺼낸 준영속 엔티티는 값을 바꿔도 반영되지 않는다. 이 경우 <code>save</code>를 부르면 <code>merge</code>로 반영되지만, 그것은 변경 감지가 아니라 병합이며 병합의 함정(값이 없는 필드가 null로 덮이는 문제)을 그대로 가진다.</li>
+<li><b>"<code>deleteAll()</code>은 DELETE 한 번이다."</b> 행 수만큼 DELETE가 나가고 그 전에 전체를 읽는다. SQL 한 번이 필요하면 <code>deleteAllInBatch()</code>이지만, 그 대가로 1차 캐시와 DB가 어긋날 수 있고 cascade와 콜백이 동작하지 않는다.</li>
+<li><b>"<code>getReferenceById</code>로 존재 여부를 확인할 수 있다."</b> 호출 시점에는 DB에 가지 않으므로 없는 식별자에도 객체가 나온다. 예외는 처음 필드에 접근할 때, 트랜잭션 밖이라면 <code>LazyInitializationException</code>의 모습으로 나온다.</li>
+<li><b>"<code>deleteById</code>는 대상이 없으면 예외를 던진다."</b> 3.5.13은 조용히 넘어간다. Javadoc이 이 동작을 명시한다.</li>
+<li><b>"리포지토리 인터페이스는 프로젝트 어디에 두어도 찾아진다."</b> 스프링 부트에서는 자동 구성 패키지, 곧 메인 클래스의 패키지와 그 하위만 찾는다.</li>
+<li><b>"프록시 클래스 이름으로 리포지토리를 구분할 수 있다."</b> <code>$Proxy96</code>의 번호는 생성 순서일 뿐이다. 대상 클래스가 필요하면 <code>AopUtils.getTargetClass</code>나 <code>Advised</code>로 꺼내야 한다.</li>
+</ul>
+
+<h3>이 회차의 지식이 다시 쓰이는 곳</h3>
+
+<p>이 회차에서 프록시 안의 갈림길은 한쪽만 따라갔다. 공통 메서드는 마지막 인터셉터를 거쳐 <code>SimpleJpaRepository</code>에 도착한다. 다른 쪽 갈래, 곧 <code>findByUsername</code>처럼 공통 구현체에 없는 메서드를 쿼리 실행 인터셉터가 메서드 이름이나 <code>@Query</code>로 처리하는 길은 03회차에서 다룬다. 이 회차에서 <code>@EnableJpaRepositories</code>의 기본값으로 본 <code>CREATE_IF_NOT_FOUND</code>가 그때 다시 나온다.</p>
+
+<p>계층 그림의 <code>PagingAndSortingRepository</code>와 <code>findAll(Pageable)</code>, 그리고 <code>deleteAllInBatch</code>에서 본 벌크 연산과 영속성 컨텍스트의 어긋남은 04회차의 페이징과 벌크성 수정 쿼리로 이어진다. 기본 설정 표의 <code>repositoryImplementationPostfix = "Impl"</code>은 05회차의 사용자 정의 리포지토리가 구현 조각을 찾는 규칙이다. 그리고 이 회차에서 "06회차에서 다룬다"고 미뤄 둔 두 가지, <code>SimpleJpaRepository</code>의 트랜잭션 설정과 <code>save</code>의 새 엔티티 판단은 06회차에서 구현체의 소스를 직접 읽으며 정리한다.</p>
+
+<p>더 넓게 보면 이 회차의 기법은 스프링 생태계 곳곳에서 반복된다. 클래스 파일을 로드하지 않고 메타데이터만 읽는 스캔, <code>FactoryBean</code>으로 복잡한 객체 생성을 감추는 등록, 인터페이스만 있는 타입을 JDK 동적 프록시로 구현하는 방식은 스프링 핵심 원리 고급편에서 프록시와 빈 후처리기를 다룰 때 일반적인 형태로 다시 만난다. 그리고 타입 소거를 피해 선언의 Signature에서 타입 인자를 읽는 기법은 스프링이 제네릭 타입으로 빈을 주입하거나 메시지 컨버터가 <code>List<Member></code> 같은 타입을 다룰 때도 쓰이는 같은 원리다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>순수 JPA 리포지토리의 반복</dt><dd>EntityManager로 직접 쓴 리포지토리는 엔티티마다 거의 같다. 달라지는 정보는 엔티티 클래스와 식별자 타입 두 가지뿐이며, 엔티티 이름도 클래스에서 계산된다.</dd>
+<dt>타입 소거와 Signature 속성</dt><dd>타입 인자는 객체에서 지워지므로 <code>T.class</code>는 컴파일되지 않는다. 하지만 상위 타입을 구체적인 타입 인자로 선언하면 그 선언은 클래스 파일의 Signature 속성에 남고, 스프링 데이터는 리포지토리 인터페이스에서 이것을 읽어 도메인 타입과 식별자 타입을 얻는다.</dd>
+<dt>설정과 기본 패키지</dt><dd>순수 스프링에서는 <code>@EnableJpaRepositories</code>를 붙이고, 패키지를 생략하면 설정 클래스의 패키지를 쓴다. 스프링 부트는 <code>JpaRepositoriesAutoConfiguration</code>이 자동 구성 패키지(메인 클래스의 패키지)를 기준으로 같은 일을 한다.</dd>
+<dt>스캔과 빈 정의</dt><dd><code>RepositoryComponentProvider</code>가 ASM으로 클래스 파일을 읽어 <code>Repository</code> 상속 인터페이스와 <code>@RepositoryDefinition</code>을 고르고 <code>@NoRepositoryBean</code>을 뺀다. 인터페이스마다 클래스가 <code>JpaRepositoryFactoryBean</code>인 빈 정의가 등록된다.</dd>
+<dt>프록시의 정체</dt><dd>주입되는 객체는 <code>SimpleJpaRepository</code>를 대상으로 하는 JDK 동적 프록시다. 예외 변환과 트랜잭션 인터셉터가 이미 들어 있으므로 인터페이스에 <code>@Repository</code>를 붙일 필요가 없다.</dd>
+<dt>인터페이스 계층</dt><dd><code>Repository</code>(마커) 아래에 <code>CrudRepository</code>와 <code>PagingAndSortingRepository</code>가 나란히 있고, 3.0부터 각각의 <code>List</code> 반환 버전이 있다. <code>JpaRepository</code>는 이들을 모두 상속하고 flush, 배치 삭제, 참조 조회 같은 JPA 고유 메서드를 더한다.</dd>
+<dt>이름이 비슷한 메서드의 차이</dt><dd><code>findById</code>는 즉시 조회, <code>getReferenceById</code>는 프록시 참조를 돌려준다. <code>deleteAll</code>은 읽고 하나씩 지우며, <code>deleteAllInBatch</code>는 영속성 컨텍스트를 건너뛴 벌크 DELETE 한 번이다. <code>deleteById</code>는 대상이 없으면 조용히 넘어간다.</dd>
+<dt>호출 하나가 트랜잭션 하나</dt><dd>공통 구현체에 트랜잭션이 걸려 있어 트랜잭션 밖의 호출은 매번 새 영속성 컨텍스트에서 실행된다. 그래서 같은 식별자도 다른 객체로 나오고, 꺼낸 엔티티의 변경은 감지되지 않는다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 이 회차의 지식이 가장 먼저 쓰이는 곳은 "리포지토리 빈을 찾을 수 없다"는 시작 실패다. 멀티 모듈 프로젝트에서 리포지토리를 공용 모듈의 다른 패키지로 옮기거나, 메인 클래스를 하위 패키지로 옮긴 직후에 자주 생긴다. 원인은 거의 항상 자동 구성 패키지와 리포지토리 위치의 불일치다. 이때 <code>@EnableJpaRepositories</code>를 추가하면 자동 구성이 물러나므로, 엔티티 스캔(<code>@EntityScan</code>)도 함께 맞춰야 한다는 점까지 한 번에 판단할 수 있어야 한다. 반대로 "Not a managed type" 같은 메시지를 보면 도메인 타입 해석이 실패한 것이므로, 공통 부모 인터페이스에 <code>@NoRepositoryBean</code>이 빠졌는지, 엔티티가 엔티티 스캔 범위 안에 있는지를 먼저 본다.</p>
+
+<p>두 번째는 대량 삭제의 선택이다. 관리 화면에서 "전체 삭제"를 <code>deleteAll()</code>로 구현하면 행이 몇 개일 때는 아무 문제가 없다가, 수십만 행이 쌓인 운영 환경에서 전체를 메모리로 읽고 행마다 DELETE를 보내며 트랜잭션이 길어진다. 그렇다고 무조건 <code>deleteAllInBatch()</code>로 바꾸면 자식 엔티티의 cascade 삭제나 <code>@PreRemove</code>에 걸어 둔 감사 로그가 조용히 빠진다. 판단 기준은 "엔티티 단위의 부수 효과가 필요한가"이다. 필요하다면 엔티티 단위 삭제를 나누어 실행하고, 필요 없다면 벌크 삭제를 쓰되 같은 트랜잭션에서 이미 읽은 엔티티가 영속성 컨텍스트에 남는다는 점을 처리해야 한다.</p>
+
+<p>세 번째는 트랜잭션 경계다. 스프링 데이터 JPA를 처음 쓰면 리포지토리 메서드가 알아서 트랜잭션을 거니 서비스의 <code>@Transactional</code>을 빼도 된다고 생각하기 쉽다. 저장 한 번, 조회 한 번처럼 단일 호출로 끝나는 일이라면 실제로 동작한다. 그러나 조회한 엔티티를 바꾸는 순간 변경이 사라지고, 두 번의 저장 중 두 번째가 실패하면 첫 번째는 이미 커밋된 뒤다. 리포지토리 메서드 하나하나가 트랜잭션 하나라는 사실은 편의가 아니라 경계에 대한 정보로 읽어야 한다. 여러 리포지토리 호출이 하나의 업무 규칙을 이루면 그 묶음의 경계는 서비스가 정한다.</p>
+</x-review>
+
+<x-practice>
+<li>트랜잭션이 없는 서비스 메서드에서 <code>Member a = memberRepository.findById(1L).get();</code>과 <code>Member b = memberRepository.findById(1L).get();</code>를 연달아 실행한다. <code>a == b</code>의 결과와 실행되는 SELECT의 개수를 예측하고, 서비스 메서드에 <code>@Transactional</code>을 붙이면 둘이 어떻게 바뀌는지 영속성 컨텍스트의 수명으로 설명하라.</li>
+<li>다음 코드는 회원 이름이 바뀌지 않는다는 버그 보고를 받았다. <code>public void rename(Long id, String name) { Member m = memberRepository.findById(id).get(); m.changeUsername(name); }</code> (클래스와 메서드에 <code>@Transactional</code> 없음). 원인을 설명하고, 변경 감지로 반영되게 하는 수정과 그 수정이 왜 동작하는지 써라.</li>
+<li>스프링 부트 애플리케이션에서 <code>ctx.getBean("memberRepository")</code>와 <code>ctx.getBean("&memberRepository")</code>가 각각 어떤 클래스의 객체를 돌려주는지, 그리고 <code>memberRepository.save(...)</code> 호출이 최종적으로 어느 클래스의 어떤 메서드에서 <code>EntityManager</code>의 어떤 메서드로 이어지는지 그림으로 그려라.</li>
+<li>공통 부모 인터페이스 <code>interface BaseRepository<T, ID> extends JpaRepository<T, ID></code>에 <code>@NoRepositoryBean</code>을 붙이지 않았을 때 시작 단계에서 <code>Not a managed type: class java.lang.Object</code>가 나는 과정을 스캔, 빈 정의 등록, 팩토리 빈 초기화의 순서로 설명하라. 왜 하필 <code>Object</code>인가?</li>
+<li>회원 행이 1,000개인 테이블에서 같은 트랜잭션 안에 <code>findAll()</code>을 한 번 실행한 뒤 <code>deleteAll()</code>을 호출하는 경우와 <code>deleteAllInBatch()</code>를 호출하는 경우, 각각 실행되는 SQL의 개수와 호출 직후 영속성 컨텍스트에 남아 있는 엔티티의 상태를 비교하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> <code>a == b</code>는 <code>false</code>이고 SELECT는 두 번 나간다. 서비스에 트랜잭션이 없으면 각 <code>findById</code> 호출이 리포지토리 프록시의 트랜잭션 인터셉터에서 각자 트랜잭션을 시작한다. <code>JpaTransactionManager</code>는 트랜잭션마다 새 <code>EntityManager</code>를 만들고 끝날 때 닫으므로, 두 호출은 서로 다른 영속성 컨텍스트에서 실행된다. 1차 캐시가 공유되지 않으니 두 번 다 DB에 가고, 서로 다른 인스턴스가 나온다. 서비스에 <code>@Transactional</code>을 붙이면 두 호출이 기본 전파 속성 <code>REQUIRED</code>로 바깥 트랜잭션에 참여하고 하나의 영속성 컨텍스트를 공유한다. 두 번째 <code>findById</code>는 <code>em.find</code>가 1차 캐시에서 첫 번째 객체를 돌려주므로 SELECT는 한 번, <code>a == b</code>는 <code>true</code>다. 이 회차의 실험에서 각각 <code>outside tx same? false</code>와 <code>inside tx same? true</code>로 확인했다.</p>
+<p><b>2.</b> <code>findById</code>의 트랜잭션은 리포지토리 메서드가 반환될 때 끝나고, 그 영속성 컨텍스트도 닫힌다. 돌아온 <code>m</code>은 준영속 상태이므로 <code>changeUsername</code>으로 필드를 바꿔도 스냅샷과 비교해 UPDATE를 만들 주체가 없다. 수정은 <code>rename</code> 메서드(또는 서비스 클래스)에 <code>@Transactional</code>을 붙이는 것이다. 그러면 <code>findById</code>가 서비스의 트랜잭션에 참여해 같은 영속성 컨텍스트에서 엔티티를 읽고, 필드 변경 후 메서드가 끝나 커밋될 때 플러시가 일어나며 변경 감지가 <code>update member set username=? where id=?</code>를 만든다. 실험에서 트랜잭션 밖의 변경은 <code>reloaded = before</code>, 안의 변경은 <code>reloaded2 = after</code>였다. <code>save(m)</code>를 추가로 호출하는 것도 반영은 되지만 그것은 <code>merge</code>에 의한 병합이며 변경 감지가 아니다.</p>
+<p><b>3.</b> <code>getBean("memberRepository")</code>는 <code>JpaRepositoryFactoryBean.getObject()</code>가 돌려준 JDK 동적 프록시(<code>jdk.proxy2.$Proxy96</code> 같은 이름, 번호는 환경마다 다름)를, <code>getBean("&memberRepository")</code>는 <code>JpaRepositoryFactoryBean</code> 자신을 돌려준다. <code>save</code> 호출은 프록시의 <code>InvocationHandler</code>(<code>JdkDynamicAopProxy</code>)로 들어가 어드바이스 체인을 차례로 지난다. 예외 변환, 트랜잭션(여기서 트랜잭션이 없으면 새로 시작), 기본 메서드 처리, 쿼리 실행 인터셉터(쿼리 메서드가 아니므로 통과), 구현 위임 인터셉터를 거쳐 대상인 <code>SimpleJpaRepository.save</code>에 도착한다. 그 안에서 <code>isNew</code>가 참이면 <code>EntityManager.persist</code>, 거짓이면 <code>EntityManager.merge</code>로 이어진다. 그림에는 컨테이너, 두 이름, 팩토리 빈, 프록시, 체인, 대상과 그 대상이 들고 있는 엔티티 정보와 <code>EntityManager</code>가 들어가야 한다.</p>
+<p><b>4.</b> <code>BaseRepository</code>는 <code>Repository</code>를 상속한 인터페이스이므로 <code>RepositoryComponentProvider</code>의 포함 필터에 걸린다. <code>@NoRepositoryBean</code>이 없으니 제외 필터에도 걸리지 않는다. 그래서 <code>baseRepository</code>라는 이름으로 클래스가 <code>JpaRepositoryFactoryBean</code>인 빈 정의가 등록된다. 기본 부트스트랩 모드에서 컨테이너가 이 빈을 즉시 초기화하면 <code>afterPropertiesSet</code>이 <code>getRepository</code>를 호출하고, 메타데이터가 인터페이스의 Signature에서 도메인 타입을 읽으려 한다. 그런데 이 선언에서 <code>JpaRepository</code>의 타입 인자는 구체 클래스가 아니라 타입 변수 <code>T</code>다. 구체적인 타입이 정해진 적이 없으므로 <code>T</code>는 그 상한인 <code>Object</code>로 해석된다. 상한을 적지 않은 타입 변수의 상한은 <code>Object</code>다. 이어서 <code>JpaMetamodelEntityInformation</code>이 하이버네이트 메타모델에 <code>Object</code>의 정보를 묻고, 그런 엔티티는 없으므로 <code>IllegalArgumentException: Not a managed type: class java.lang.Object</code>가 난다.</p>
+<p><b>5.</b> <code>deleteAll()</code>은 내부에서 <code>findAll()</code>을 다시 호출하므로 SELECT 1번이 나가고(앞의 <code>findAll()</code>까지 치면 2번), 1,000개의 엔티티를 하나씩 <code>remove</code>하므로 플러시 때 DELETE가 1,000번 나간다. 호출 직후 엔티티들은 영속성 컨텍스트 안에서 삭제 예정 상태이고, 플러시가 끝나면 컨텍스트에서 제거된다. <code>deleteAllInBatch()</code>는 <code>delete from member m1_0</code> 한 번으로 끝난다. 그러나 영속성 컨텍스트를 거치지 않으므로 앞의 <code>findAll()</code>로 올라온 1,000개의 엔티티는 DB에서 지워진 뒤에도 영속성 컨텍스트에 관리 상태로 그대로 남는다. 같은 트랜잭션에서 그 엔티티를 <code>findById</code>로 다시 찾으면 1차 캐시에서 이미 지워진 엔티티가 나온다. Javadoc이 경고하는 1차 캐시와 DB의 불일치가 이것이며, 필요하면 벌크 삭제 뒤에 영속성 컨텍스트를 비워야 한다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>스프링 데이터 JPA가 <code>interface MemberRepository extends JpaRepository<Member, Long></code>을 보고 도메인 타입이 <code>Member</code>임을 알아내는 방법으로 옳은 것은?</q>
+<o>프록시 객체를 만든 뒤 그 객체의 런타임 타입 인자를 읽는다.</o>
+<o>개발자가 <code>application.properties</code>에 엔티티 클래스 이름을 적어 두어야 한다.</o>
+<o>리포지토리 인터페이스의 클래스 파일에 남은 Signature 속성(제네릭 상위 타입 선언)을 리플렉션으로 읽는다.</o>
+<o>인터페이스 이름에서 <code>Repository</code>를 뗀 <code>Member</code>를 엔티티 이름으로 추측한다.</o>
+<why>타입 인자는 객체에서 지워지므로 객체(프록시든 무엇이든)를 들여다봐서는 알 수 없다. 그러나 상위 타입을 구체적인 타입 인자로 선언하면 그 선언은 클래스 파일의 Signature 속성에 남는다. 스프링 데이터의 <code>DefaultRepositoryMetadata</code>는 인터페이스에서 <code>Repository</code>까지 거슬러 올라간 상위 타입 정보의 타입 인자를 읽는다. 별도 설정은 필요 없고, 인터페이스 이름은 빈 이름을 정할 뿐 엔티티 타입 결정과 무관하다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>스프링 부트 3.5 애플리케이션에서 <code>memberRepository</code> 빈에 대한 설명으로 옳은 것은?</q>
+<o>빈 정의의 클래스가 <code>SimpleJpaRepository</code>이고, 주입되는 객체도 <code>SimpleJpaRepository</code> 인스턴스다.</o>
+<o>빈 정의의 클래스는 <code>JpaRepositoryFactoryBean</code>이고, 이름으로 요청하면 팩토리가 만든 JDK 동적 프록시가 나온다.</o>
+<o>컴포넌트 스캔이 인터페이스에 붙은 <code>@Repository</code>를 보고 등록한 빈이다.</o>
+<o>스프링 데이터가 컴파일 시점에 <code>MemberRepositoryImpl</code> 소스를 생성해 등록한 빈이다.</o>
+<why>실험에서 빈 정의의 클래스는 <code>JpaRepositoryFactoryBean</code>, 생성자 인자는 인터페이스 이름이었다. <code>FactoryBean</code>이므로 이름으로 요청하면 <code>getObject()</code>의 결과인 프록시(<code>jdk.proxy2.$Proxy...</code>)가 나오고, <code>SimpleJpaRepository</code>는 그 프록시의 대상일 뿐이다. 등록은 컴포넌트 스캔이 아니라 스프링 데이터의 <code>RepositoryComponentProvider</code>가 하며 <code>@Repository</code>는 필요 없다. 소스 생성은 일어나지 않는다. 프록시는 실행 시점에 만들어진다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>트랜잭션 안에서 존재하지 않는 식별자 999로 <code>memberRepository.getReferenceById(999L)</code>를 호출했다(Hibernate 6.6 기준). 언제 무엇이 일어나는가?</q>
+<o>호출 즉시 SELECT가 실행되고 <code>null</code>이 반환된다.</o>
+<o>호출 즉시 SELECT가 실행되고 <code>Optional.empty()</code>가 반환된다.</o>
+<o>호출 즉시 <code>EmptyResultDataAccessException</code>이 발생한다.</o>
+<o>프록시가 반환되고, 식별자가 아닌 필드에 처음 접근할 때 SELECT가 실행되며 <code>EntityNotFoundException</code>이 발생한다.</o>
+<why><code>getReferenceById</code>는 <code>em.getReference</code>를 호출하며, 하이버네이트는 DB에 가지 않고 식별자만 아는 프록시를 돌려준다. 실험에서 <code>getId()</code>에는 SQL이 없었고, 다른 필드에 처음 접근할 때 SELECT가 나간 뒤 행이 없으므로 <code>EntityNotFoundException: Unable to find demo.Member with id 999</code>가 발생했다. <code>Optional.empty()</code>는 <code>findById</code>의 동작이다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>Spring Data 3.5에서 <code>interface MemberPagingRepository extends PagingAndSortingRepository<Member, Long></code>만 선언했다. 이 리포지토리에 대한 설명으로 옳은 것은?</q>
+<o><code>findAll(Pageable)</code>과 <code>findAll(Sort)</code>는 있지만 <code>save</code>나 <code>findById</code>는 없다.</o>
+<o><code>PagingAndSortingRepository</code>가 <code>CrudRepository</code>를 상속하므로 <code>save</code>도 함께 생긴다.</o>
+<o><code>JpaRepository</code>를 상속하지 않았으므로 페이징 메서드가 동작하지 않는다.</o>
+<o><code>findAll()</code>의 반환 타입이 <code>List</code>다.</o>
+<why>3.5.13의 클래스 파일에서 <code>PagingAndSortingRepository</code>의 상위 타입은 <code>Repository</code> 하나뿐이다. 따라서 CRUD 메서드는 딸려 오지 않으며, 필요하면 <code>CrudRepository</code>(또는 <code>ListCrudRepository</code>)를 함께 상속해야 한다. 공통 메서드는 <code>SimpleJpaRepository</code>가 구현하므로 <code>JpaRepository</code>를 상속하지 않아도 동작한다. 인자 없는 <code>findAll()</code>은 이 인터페이스에 선언되어 있지 않다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>스프링 부트 애플리케이션의 메인 클래스가 <code>com.example.app</code> 패키지에 있고, 리포지토리 인터페이스를 <code>com.example.repo</code> 패키지에 두었다. 별도 설정이 없을 때 일어나는 일로 옳은 것은?</q>
+<o>스프링 데이터는 클래스패스 전체를 스캔하므로 문제없이 주입된다.</o>
+<o>리포지토리 빈은 등록되지만 트랜잭션이 적용되지 않는다.</o>
+<o>자동 구성 패키지(<code>com.example.app</code>) 밖이므로 리포지토리가 스캔되지 않고, 그것을 주입받는 쪽에서 빈을 찾지 못해 시작이 실패한다.</o>
+<o>리포지토리 인터페이스에 <code>@Repository</code>를 붙이면 컴포넌트 스캔으로 구현 없이 등록된다.</o>
+<why>스프링 부트의 <code>JpaRepositoriesAutoConfiguration</code>은 <code>AutoConfigurationPackages</code>가 돌려주는 패키지, 곧 메인 클래스의 패키지와 그 하위만 스캔한다. 형제 패키지는 범위 밖이다. 컴포넌트 스캔은 구현 없는 인터페이스를 빈으로 만들지 못하므로 <code>@Repository</code>는 해결책이 아니다. <code>@EnableJpaRepositories(basePackages = ...)</code>로 위치를 지정하거나 패키지 구조를 바꿔야 하며, 엔티티도 밖에 있다면 <code>@EntityScan</code>이 필요하다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>공통 인터페이스(common repository interface)</dt><dd>스프링 데이터가 제공하는 <code>CrudRepository</code>, <code>JpaRepository</code> 같은 인터페이스. 상속만 하면 공통 구현체 <code>SimpleJpaRepository</code>가 그 메서드를 구현한다.</dd>
+<dt>타입 소거(type erasure)</dt><dd>컴파일러가 제네릭 타입 정보를 지우는 규칙(JLS §4.6). 타입 변수는 상한으로, 매개변수화된 타입은 원시 타입으로 바뀌므로 실행 중인 객체는 자신의 타입 인자를 모른다.</dd>
+<dt>Signature 속성(Signature attribute)</dt><dd>클래스 파일에 제네릭 선언을 보존하는 속성(JVMS §4.7.9). 실행에는 쓰이지 않지만 리플렉션의 <code>getGenericInterfaces()</code> 등이 이것을 읽는다.</dd>
+<dt>FactoryBean</dt><dd>스프링 컨테이너에 등록되어 자신 대신 <code>getObject()</code>가 만든 객체를 빈으로 내주는 객체. 팩토리 자신은 빈 이름 앞에 <code>&</code>를 붙여 얻는다.</dd>
+<dt>자동 구성 패키지(auto-configuration package)</dt><dd><code>@AutoConfigurationPackage</code>가 등록한 패키지. 스프링 부트에서는 보통 <code>@SpringBootApplication</code>이 붙은 메인 클래스의 패키지이며, 리포지토리와 엔티티 스캔의 기준이 된다.</dd>
+<dt>JDK 동적 프록시(JDK dynamic proxy)</dt><dd>지정한 인터페이스들을 구현하는 클래스를 런타임에 생성하고 모든 호출을 <code>InvocationHandler</code>로 넘기는 JDK 기능. 스프링 데이터 리포지토리 프록시가 이 방식으로 만들어진다.</dd>
+<dt>브리지 메서드(bridge method)</dt><dd>공변 반환 타입이나 제네릭 오버라이딩 때문에 디스크립터가 달라진 메서드를 잇기 위해 컴파일러가 생성하는 합성 메서드. <code>ACC_BRIDGE</code>, <code>ACC_SYNTHETIC</code> 플래그가 붙는다.</dd>
+<dt>마커 인터페이스(marker interface)</dt><dd>메서드 없이 타입 표식으로만 쓰이는 인터페이스. 스프링 데이터의 <code>Repository</code>는 다룰 타입을 붙잡고 스캔 대상을 고르는 데 쓰인다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-data/jpa/reference/repositories/core-concepts.html">Spring Data JPA Reference — Core concepts</a> — <code>Repository</code>, <code>CrudRepository</code>, <code>ListCrudRepository</code>, <code>PagingAndSortingRepository</code>의 역할</li>
+<li><a href="https://docs.spring.io/spring-data/jpa/reference/repositories/definition.html">Spring Data JPA Reference — Defining Repository Interfaces</a> — 메서드 선택적 노출, <code>@NoRepositoryBean</code>, <code>@RepositoryDefinition</code>, 다중 모듈의 strict 모드</li>
+<li><a href="https://docs.spring.io/spring-data/jpa/reference/repositories/create-instances.html">Spring Data JPA Reference — Creating Repository Instances</a> — <code>@EnableJpaRepositories</code>의 기본 패키지, 부트스트랩 모드</li>
+<li><a href="https://docs.spring.io/spring-boot/3.5/reference/data/sql.html">Spring Boot 3.5 Reference — SQL Databases</a> — 자동 구성 패키지에서의 리포지토리·엔티티 스캔, <code>spring.data.jpa.repositories.bootstrap-mode</code></li>
+<li><a href="https://docs.spring.io/spring-data/commons/docs/current/api/org/springframework/data/repository/CrudRepository.html">CrudRepository Javadoc</a> — <code>deleteById</code>가 대상이 없을 때 조용히 무시한다는 명시</li>
+<li><a href="https://docs.spring.io/spring-data/jpa/docs/current/api/org/springframework/data/jpa/repository/JpaRepository.html">JpaRepository Javadoc</a> — <code>getReferenceById</code>와 <code>EntityNotFoundException</code>, <code>deleteAllInBatch(Iterable)</code>의 1차 캐시 불일치 경고</li>
+</x-refs>

@@ -1,0 +1,744 @@
+<x-meta>
+deck: 연산자를 기호 암기가 아니라 규칙으로 읽는다. 숫자 승격, 정수 나눗셈과 오버플로, 우선순위와 평가 순서의 차이, 단락 평가를 바이트코드와 비트 수준에서 확인한다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>식 하나를 보고 연산자가 묶이는 방식(우선순위·결합 방향)과 피연산자가 평가되는 순서(왼쪽에서 오른쪽)를 구분해 설명하고, 부수 효과가 있는 식의 결과를 추적할 수 있다.</li>
+<li>이항 숫자 승격 규칙으로 식의 결과 타입을 판정하고, <code>5 / 2</code>나 <code>byte + byte</code>, <code>1000 * 60 * 60 * 24 * 30</code>의 결과를 예측할 수 있다.</li>
+<li>정수 오버플로가 비트 수준에서 어떻게 일어나는지, 정수와 실수에서 0으로 나누기의 결과가 왜 다른지 설명할 수 있다.</li>
+<li><code>i++</code>와 <code>++i</code>, <code>i = i++</code>를 바이트코드(iinc)로 추적해 결과를 설명할 수 있다.</li>
+<li><code>&&</code>와 <code>||</code>의 단락 평가가 분기 명령으로 구현된다는 것을 설명하고, <code>&</code>와의 차이가 문제가 되는 코드를 가려낼 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>식 하나에 숨은 질문들</h3>
+<p>변수에 값을 담을 수 있게 되었으니 이제 그 값으로 계산을 한다. 계산을 적는 방법은 수학에서 쓰던 것과 거의 같아서 처음에는 배울 것이 없어 보인다.</p>
+
+<pre><code class="language-java">int result = a + b * c;</code></pre>
+
+<p>그런데 이 한 줄을 컴파일러와 JVM의 입장에서 보면 답해야 할 질문이 넷이나 된다. 첫째, <code>+</code>와 <code>*</code> 가운데 어느 것이 먼저 묶이는가. 둘째, <code>a</code>, <code>b</code>, <code>c</code>의 값은 어떤 순서로 읽히는가. 첫째와 둘째는 같은 질문처럼 보이지만 다른 질문이고, 이 회차에서 가장 공들여 구분할 부분이다. 셋째, <code>a</code>가 int이고 <code>b</code>가 long이라면 결과는 무슨 타입인가. 넷째, 결과가 그 타입이 담을 수 있는 범위를 넘으면 무슨 일이 일어나는가.</p>
+
+<p>용어부터 정리한다. <code>+</code>, <code>*</code>, <code>=</code>처럼 계산을 나타내는 기호를 <b>연산자</b>(operator), 연산의 대상이 되는 값을 <b>피연산자</b>(operand)라고 한다. 피연산자가 하나인 연산자(<code>-a</code>, <code>!flag</code>, <code>i++</code>)를 단항 연산자, 둘인 연산자(<code>a + b</code>)를 이항 연산자라고 부른다. 연산자와 피연산자를 조합해 값 하나를 만들어 내는 코드 조각이 <b>식</b>(expression)이다. 자바는 정적 타입 언어이므로 모든 식은 값뿐 아니라 컴파일 시점에 정해지는 타입도 갖는다.</p>
+
+<p>식 가운데에는 값을 계산하는 것 말고 다른 일을 하는 것이 있다. <code>x = 5</code>는 변수의 내용을 바꾸고, <code>i++</code>도 그렇고, 메서드 호출은 화면에 글자를 찍을 수도 있다. 값을 만들어 내는 것 외에 프로그램의 상태를 바꾸는 이런 작용을 <b>부수 효과</b>(side effect)라고 한다. 부수 효과가 없는 식은 어떤 순서로 계산해도 결과가 같지만, 부수 효과가 있으면 순서가 결과를 바꾼다. 평가 순서라는 주제가 중요한 이유가 여기에 있다.</p>
+
+<h3>산술 연산자 — 스택 위에서 계산된다</h3>
+<p>산술 연산자는 다섯 가지다. 더하기 <code>+</code>, 빼기 <code>-</code>, 곱하기 <code>*</code>, 나누기 <code>/</code>, 나머지 <code>%</code>다.</p>
+
+<pre><code class="language-java">public class Arith {
+    public static void main(String[] args) {
+        int a = 7;
+        int b = 2;
+        System.out.println(a + b);   // 9
+        System.out.println(a - b);   // 5
+        System.out.println(a * b);   // 14
+        System.out.println(a / b);   // 3
+        System.out.println(a % b);   // 1
+    }
+}</code></pre>
+
+<p>넷째 줄의 결과가 3.5가 아니라 3이라는 점은 잠시 뒤에 다루고, 먼저 이 계산이 JVM 안에서 어떻게 수행되는지를 본다. 1회에서 JVM이 피연산자 스택에 값을 쌓고 꺼내며 계산하는 스택 기반 기계라고 했다. 세 값을 받아 <code>a + b * c</code>를 돌려주는 메서드를 컴파일하면 이렇게 된다.</p>
+
+<pre><code class="language-java">static int calc(int a, int b, int c) {
+    return a + b * c;
+}</code></pre>
+
+<pre data-label="javap -c 출력"><code class="language-text">  static int calc(int, int, int);
+    Code:
+       0: iload_0
+       1: iload_1
+       2: iload_2
+       3: imul
+       4: iadd
+       5: ireturn</code></pre>
+
+<p><code>imul</code>은 스택 맨 위의 int 두 개를 꺼내 곱한 결과를 쌓고, <code>iadd</code>는 두 개를 꺼내 더한 결과를 쌓는다. <code>calc(2, 3, 4)</code>를 호출했다고 하고 따라가 보자.</p>
+
+<div class="table-wrap"><table><thead><tr><th>위치</th><th>명령어</th><th>하는 일</th><th>실행 후 피연산자 스택(오른쪽이 맨 위)</th></tr></thead><tbody>
+<tr><td>0</td><td>iload_0</td><td>a의 값을 쌓는다</td><td>2</td></tr>
+<tr><td>1</td><td>iload_1</td><td>b의 값을 쌓는다</td><td>2, 3</td></tr>
+<tr><td>2</td><td>iload_2</td><td>c의 값을 쌓는다</td><td>2, 3, 4</td></tr>
+<tr><td>3</td><td>imul</td><td>3과 4를 꺼내 곱한다</td><td>2, 12</td></tr>
+<tr><td>4</td><td>iadd</td><td>2와 12를 꺼내 더한다</td><td>14</td></tr>
+<tr><td>5</td><td>ireturn</td><td>맨 위의 값을 반환한다</td><td>—</td></tr>
+</tbody></table></div>
+
+<p>곱셈이 덧셈보다 먼저라는 수학의 약속이 명령어의 순서로 표현되어 있다. 괄호를 넣어 <code>(a + b) * c</code>로 바꾸면 바이트코드는 <code>iload_0, iload_1, iadd, iload_2, imul</code>이 된다. 바이트코드에는 괄호도 우선순위도 없다. 컴파일러가 식의 구조를 분석해 "어떤 연산을 언제 실행할지"를 명령어의 나열로 풀어 놓았을 뿐이다. 그리고 두 경우 모두 변수의 값은 a, b, c의 순서, 곧 소스에 적힌 왼쪽에서 오른쪽 순서로 스택에 올라갔다는 점을 눈여겨봐 두자. 이 관찰이 뒤에서 평가 순서를 다룰 때 다시 나온다.</p>
+
+<p>2회에서 본 대로 연산 명령은 타입마다 따로 있다. int 덧셈은 <code>iadd</code>, long은 <code>ladd</code>, float은 <code>fadd</code>, double은 <code>dadd</code>다. 빼기(<code>isub</code>), 곱하기(<code>imul</code>), 나누기(<code>idiv</code>), 나머지(<code>irem</code>), 부호 반전(<code>ineg</code>)도 같은 방식이다. 컴파일러는 피연산자의 타입을 보고 이 가운데 하나를 고른다. 피연산자의 타입이 서로 다르면 어떻게 고르는지가 다음 주제다.</p>
+
+<p>그 전에 한 가지. 피연산자가 모두 리터럴이면 계산은 실행할 때가 아니라 컴파일할 때 끝난다. <code>int x = 1 + 2 * 3;</code>을 컴파일하면 바이트코드는 <code>bipush 7</code>과 저장 명령뿐이고 덧셈과 곱셈 명령은 나오지 않는다. JLS §15.29는 리터럴과 연산자만으로 이루어져 컴파일 시점에 값이 정해지는 식을 상수식(constant expression)으로 정의하고, 컴파일러는 그 값을 미리 계산해 클래스 파일에 넣는다. <code>60 * 60 * 24</code>처럼 의미가 드러나게 풀어 써도 실행 비용이 들지 않는 이유다.</p>
+
+<h3>이항 숫자 승격 — 계산하기 전에 타입을 맞춘다</h3>
+<p>명령어가 타입마다 따로 있으므로, int와 long을 더하려면 먼저 둘을 같은 타입으로 만들어야 한다. 자바는 산술 연산을 하기 전에 피연산자의 타입을 자동으로 맞추는데, 이 규칙을 <b>이항 숫자 승격</b>(binary numeric promotion)이라고 한다. JLS §5.6이 정한 규칙은 위에서부터 차례로 적용하는 네 단계다.</p>
+
+<ol>
+<li>피연산자 가운데 double이 있으면 다른 쪽을 double로 바꾼다.</li>
+<li>그렇지 않고 float이 있으면 다른 쪽을 float으로 바꾼다.</li>
+<li>그렇지 않고 long이 있으면 다른 쪽을 long으로 바꾼다.</li>
+<li>그 어느 것도 아니면 <b>양쪽을 모두 int로 바꾼다.</b></li>
+</ol>
+
+<p>앞의 세 단계는 "더 넓은 타입 쪽으로 맞춘다"는 직관과 같다. 초보자를 놀라게 하는 것은 넷째 단계다. 피연산자가 byte, short, char뿐이어도 연산은 int로 이루어지고 결과도 int다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>식</th><th>피연산자의 타입</th><th>승격 후</th><th>결과의 타입과 값</th></tr></thead><tbody>
+<tr><td>5 / 2</td><td>int, int</td><td>int, int</td><td>int 2</td></tr>
+<tr><td>5 / 2.0</td><td>int, double</td><td>double, double</td><td>double 2.5</td></tr>
+<tr><td>10 + 3L</td><td>int, long</td><td>long, long</td><td>long 13</td></tr>
+<tr><td>'a' + 1</td><td>char, int</td><td>int, int</td><td>int 98</td></tr>
+<tr><td>x + y (둘 다 byte)</td><td>byte, byte</td><td>int, int</td><td>int</td></tr>
+</tbody></table></div>
+
+<p>바이트코드에서 승격은 변환 명령으로 나타난다. int와 long을 더하는 메서드를 보면 int 값을 스택에 올린 직후 <code>i2l</code>(int를 long으로)이 끼어들고, 그 뒤에 long 덧셈 <code>ladd</code>가 온다.</p>
+
+<pre data-label="static long promote(int a, long b) { return a + b; } 의 바이트코드"><code class="language-text">       0: iload_0
+       1: i2l
+       2: lload_1
+       3: ladd
+       4: lreturn</code></pre>
+
+<p>byte 두 개를 더하는 메서드는 어떨까. 매개변수가 byte인데도 바이트코드는 <code>iload_0, iload_1, iadd</code>로, int 두 개를 더할 때와 한 글자도 다르지 않다. JVM에는 byte끼리 더하는 명령이 아예 없기 때문이다. JVM 명세는 byte, short, char, boolean 타입의 값에 대한 연산 대부분이 int용 명령어로 수행된다고 설명한다(JVMS §2.11.1). 언어의 넷째 규칙은 기계의 이 구조를 그대로 반영한 것이다. 그 결과가 다음 컴파일 오류다.</p>
+
+<pre><code class="language-java">byte x = 10;
+byte y = 20;
+byte z = x + y;   // 컴파일 오류
+int w = x + y;    // 정상: 30</code></pre>
+
+<pre data-label="javac 출력"><code class="language-text">T.java:3: error: incompatible types: possible lossy conversion from int to byte
+        byte x = 10; byte y = 20; byte z = x + y;
+                                             ^</code></pre>
+
+<p><code>x + y</code>는 int 타입의 식이고, int를 byte 변수에 넣는 것은 값을 잃을 수 있는 변환이므로 자동으로는 되지 않는다. 2회에서 <code>byte b = 100;</code>이 되었던 것은 오른쪽이 컴파일러가 값을 아는 상수였기 때문이다. 변수끼리의 덧셈은 실행해 봐야 값을 알 수 있으므로 그 예외에 해당하지 않는다.</p>
+
+<p>승격에서 가장 흔한 실수는 "승격은 식 전체가 아니라 연산자 하나마다 따로 일어난다"는 점을 놓치는 것이다. 다음 세 줄을 보자.</p>
+
+<pre><code class="language-java">System.out.println(1 / 2 + 1 / 2.0);     // 0.5
+
+int sum = 7;
+int count = 2;
+double avg = sum / count;
+System.out.println(avg);                 // 3.0
+
+long ms = 1000 * 60 * 60 * 24 * 30;
+System.out.println(ms);                  // -1702967296</code></pre>
+
+<p>첫 줄에서 <code>1 / 2</code>는 두 피연산자가 모두 int이므로 int 나눗셈이고 결과는 0이다. 옆에 double이 있다는 사실은 이 나눗셈에 영향을 주지 않는다. <code>1 / 2.0</code>은 double 나눗셈이라 0.5이고, 마지막 덧셈에서 int 0이 double로 승격되어 0.0 + 0.5가 된다. 둘째 예도 같은 원리다. <code>sum / count</code>는 int 나눗셈으로 3이 된 다음에야 double 변수에 대입되면서 3.0으로 바뀐다. 결과를 담는 변수의 타입은 오른쪽 식의 계산 방식에 영향을 주지 않는다. 3.5를 얻으려면 나눗셈이 일어나기 전에 한쪽을 double로 만들어야 한다. <code>sum / 2.0</code>처럼 쓰거나, 6회에서 배울 형변환으로 <code>(double) sum / count</code>라고 쓴다.</p>
+
+<p>셋째 예는 한 달을 밀리초로 구하려던 코드다. 결과를 long 변수에 담았는데도 음수가 나왔다. 오른쪽의 다섯 숫자가 모두 int 리터럴이어서 곱셈이 전부 int로 수행되었고, 수학적 결과 2,592,000,000이 int의 최댓값 2,147,483,647을 넘었기 때문이다. 이미 망가진 int 값이 마지막에 long으로 넓혀져 대입되었을 뿐이다. 맨 앞 숫자를 <code>1000L</code>로 바꾸면 첫 곱셈부터 long으로 승격되어 올바른 값 2592000000이 나온다. 접미사는 맨 앞에 붙여야 안전하다. 곱셈은 왼쪽부터 차례로 수행되므로, <code>1000 * 60 * 60 * 24 * 30 * 12L</code>처럼 마지막에만 L을 붙이면 그 앞의 int 곱셈에서 이미 값이 깨진다(이 식의 결과는 -20435607552다). 범위를 넘었을 때 정확히 어떤 값이 되는지는 정수 오버플로에서 다룬다.</p>
+
+<h3>정수 나눗셈과 나머지</h3>
+<p>정수끼리의 나눗셈은 정수를 결과로 낸다. JLS §15.17.2의 규정은 "정수 나눗셈은 0을 향해 반올림한다"는 것이다. 소수점 아래를 버린다고 기억해도 양수에서는 같지만, 음수에서 차이가 난다. 0을 향한다는 것은 음수의 몫이 더 작은 쪽(-4)이 아니라 0에 가까운 쪽(-3)이 된다는 뜻이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>식</th><th>결과</th><th>설명</th></tr></thead><tbody>
+<tr><td>7 / 2</td><td>3</td><td>3.5에서 0 쪽으로</td></tr>
+<tr><td>-7 / 2</td><td>-3</td><td>-3.5에서 0 쪽으로(-4가 아니다)</td></tr>
+<tr><td>7 % 2</td><td>1</td><td>7 = 3 × 2 + 1</td></tr>
+<tr><td>-7 % 2</td><td>-1</td><td>-7 = (-3) × 2 + (-1)</td></tr>
+<tr><td>7 % -2</td><td>1</td><td>7 = (-3) × (-2) + 1</td></tr>
+<tr><td>-7 % -2</td><td>-1</td><td>-7 = 3 × (-2) + (-1)</td></tr>
+</tbody></table></div>
+
+<p>나머지 연산자 <code>%</code>의 결과는 나눗셈과 짝을 이루도록 정의되어 있다. JLS §15.17.3은 <code>(a/b)*b + (a%b)</code>가 언제나 <code>a</code>와 같도록 나머지를 정한다. 몫이 0을 향해 정해지므로 나머지는 그 차이를 메우는 값이 되고, 그 결과 나머지의 부호는 나누어지는 수(왼쪽 피연산자)의 부호를 따른다. 표의 아래 네 줄이 그것을 보여 준다. 오른쪽 피연산자의 부호는 결과의 부호에 영향을 주지 않는다.</p>
+
+<p>이 성질은 실제 버그로 이어진다. 홀수인지 검사하려고 <code>n % 2 == 1</code>이라고 쓰면 음수 홀수에서 틀린다. <code>-7 % 2</code>는 1이 아니라 -1이기 때문이다. <code>n % 2 != 0</code>이라고 써야 부호와 무관하게 맞는다. 순환하는 위치를 구할 때도 마찬가지다. 길이가 5인 목록에서 "한 칸 앞"을 구하려고 <code>(index - 1) % 5</code>를 쓰면 index가 0일 때 4가 아니라 -1이 나온다. 수학에서 말하는 나머지, 곧 항상 0 이상인 값이 필요하면 <code>Math.floorMod</code>를 쓴다. <code>Math.floorMod(-1, 5)</code>는 4이고 <code>Math.floorMod(-7, 2)</code>는 1이다. API 문서는 floorMod의 결과가 나누는 수와 같은 부호를 갖는다고 설명한다. 짝이 되는 <code>Math.floorDiv(-7, 2)</code>는 -4다.</p>
+
+<p>정수를 0으로 나누면 어떻게 될까. 결과를 표현할 정수가 없으므로 JVM은 예외를 던진다.</p>
+
+<pre><code class="language-java">public class DivZero {
+    public static void main(String[] args) {
+        int total = 100;
+        int count = 0;
+        System.out.println("계산 시작");
+        System.out.println(total / count);
+        System.out.println("계산 끝");
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">계산 시작
+Exception in thread "main" java.lang.ArithmeticException: / by zero
+	at DivZero.main(DivZero.java:6)</code></pre>
+
+<p>이것은 컴파일 오류가 아니라 실행 중에 나는 오류다. 프로그램은 5번 줄까지 정상적으로 실행되다가 6번 줄의 <code>idiv</code> 명령에서 멈췄고, "계산 끝"은 출력되지 않았다. JVM 명세는 <code>idiv</code>와 <code>irem</code>이 나누는 수가 0일 때 ArithmeticException을 던진다고 규정한다. 메시지 끝의 <code>DivZero.java:6</code>은 1회에서 본 LineNumberTable에서 나온 줄 번호다. 나누는 수를 리터럴 0으로 쓴 <code>7 / 0</code>조차 컴파일은 되고 실행할 때 예외가 난다. 상수식은 정상적으로 값을 내는 식이어야 하는데 이 식은 그렇지 않아서, 컴파일러가 미리 계산하지 않고 실행 시점으로 넘기기 때문이다.</p>
+
+<p>실수의 나눗셈은 전혀 다르게 행동한다. 2회에서 부동소수점에는 무한대와 NaN이라는 특별한 값이 있다고 했다. 실수 나눗셈은 0으로 나누어도 예외를 던지지 않고 그 값들을 결과로 낸다(JLS §15.17.2).</p>
+
+<pre><code class="language-java">System.out.println(1.0 / 0);     // Infinity
+System.out.println(-1.0 / 0);    // -Infinity
+System.out.println(0.0 / 0);     // NaN
+System.out.println(7.5 % 2);     // 1.5  (나머지 연산은 실수에도 쓸 수 있다)</code></pre>
+
+<p>정수에는 "결과 없음"을 나타낼 비트 패턴이 없지만 실수에는 있다는 차이가 동작의 차이로 이어진 것이다. 편리해 보이지만 위험한 면이 있다. 정수의 0 나누기는 그 자리에서 프로그램을 멈춰 문제를 드러내는 반면, 실수의 0 나누기는 조용히 Infinity나 NaN을 만들어 내고 그 값이 이후의 계산에 계속 섞여 들어간다. 곱셈과 나눗셈에 대해 JLS는 피연산자 가운데 하나라도 NaN이면 결과가 NaN이라고 규정하고, <code>NaN + 1</code>이나 <code>NaN * 0</code>도 실행해 보면 NaN이다. 화면에 NaN이 찍혔을 때는 이미 원인이 된 줄에서 멀리 와 있다. 평균을 구하는 코드처럼 나누는 수가 0일 수 있는 곳에서는 나누기 전에 직접 검사해야 한다.</p>
+
+<h3>정수 오버플로 — 넘친 비트는 버려진다</h3>
+<p>2회에서 int의 최댓값 <code>0111…1</code>에 1을 더하면 비트로는 <code>1000…0</code>, 곧 최솟값이 된다고 미리 말해 두었다. 이제 확인해 보자.</p>
+
+<pre><code class="language-java">System.out.println(Integer.MAX_VALUE + 1);   // -2147483648
+System.out.println(Integer.MIN_VALUE - 1);   // 2147483647
+System.out.println(46340 * 46340);           // 2147395600
+System.out.println(46341 * 46341);           // -2147479015
+System.out.println(65536 * 65536);           // 0</code></pre>
+
+<p>오류는 나지 않는다. 틀린 값이 조용히 나온다. 계산 결과가 타입의 범위를 넘는 것을 <b>오버플로</b>(overflow)라고 하며, 자바의 정수 연산은 오버플로를 어떤 방식으로도 알리지 않는다(JLS §4.2.2). 그렇다고 결과가 제멋대로인 것은 아니다. JLS §15.18.2는 결과를 정확히 규정한다. 정수 덧셈이 오버플로하면 결과는 수학적인 합을 충분히 큰 2의 보수 형식으로 나타냈을 때의 하위 비트들이다. int라면 아래 32비트만 남기고 그 위는 버린다는 뜻이다.</p>
+
+<pre class="diagram">  Integer.MAX_VALUE     0111 1111 1111 1111 1111 1111 1111 1111   ( 2147483647)
++                 1     0000 0000 0000 0000 0000 0000 0000 0001
+  ─────────────────────────────────────────────────────────────
+                        1000 0000 0000 0000 0000 0000 0000 0000   (-2147483648)
+
+  65536 × 65536 = 2의 32제곱
+                      1 0000 0000 0000 0000 0000 0000 0000 0000   (33비트가 필요하다)
+                        └───────── 아래 32비트만 남는다 ─────────┘ → 0</pre>
+
+<p>첫 번째 계산에서 CPU는 평범한 이진수 덧셈을 했을 뿐이다. 올림이 맨 왼쪽 자리까지 번져서 최상위 비트가 1이 되었고, 2의 보수에서 최상위 비트가 1이면 음수이므로 결과가 최솟값으로 읽힌다. 두 번째 계산의 수학적 결과는 33번째 비트만 1인 수인데, 그 비트가 버려지니 남는 것은 0이다. 46341의 제곱은 2,147,488,281로 int 최댓값을 살짝 넘고, 여기서 2<sup>32</sup>를 뺀 값 -2,147,479,015가 결과가 된다. 일반적으로 int 연산의 결과는 수학적 결과에 2<sup>32</sup>의 배수를 더하거나 빼서 int 범위 안으로 들어오게 만든 값이다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>여섯 자리 주행 거리계</strong><p>자동차의 기계식 주행 거리계가 여섯 자리라면 999999 다음은 000000이다. 일곱 번째 자리가 없으니 올림이 사라지고 숫자가 한 바퀴 돈다. int도 32비트라는 정해진 자릿수 안에서 한 바퀴 도는 숫자판이다. 다른 점은 숫자판의 이음매가 있는 곳이다. 거리계는 최댓값에서 0으로 넘어가지만, 2의 보수 정수는 가장 큰 양수에서 가장 작은 음수로 넘어간다. 그리고 거리계는 한 방향으로만 돌지만 정수는 뺄셈으로 반대 방향으로도 넘어간다.</p></aside>
+
+<p>오버플로가 위험한 것은 결과가 항상 음수로 드러나지는 않기 때문이다. 다음 코드는 하루와 일 년을 밀리초로 구한다.</p>
+
+<pre><code class="language-java">long dayMillis = 24 * 60 * 60 * 1000;
+long yearMillis = 365 * 24 * 60 * 60 * 1000;
+System.out.println(dayMillis);    // 86400000
+System.out.println(yearMillis);   // 1471228928</code></pre>
+
+<p>첫 줄은 맞다. 둘째 줄의 올바른 값은 31,536,000,000인데 1,471,228,928이 나왔다. 음수가 아니어서 얼핏 그럴듯해 보이는 틀린 값이다. 31,536,000,000에서 2<sup>32</sup>(4,294,967,296)을 일곱 번 빼면 이 값이 된다. 이런 버그는 테스트에서 작은 값으로는 드러나지 않다가 운영 데이터가 커진 뒤에야 나타난다.</p>
+
+<p>널리 알려진 또 다른 예는 두 수의 중간값이다. <code>(lo + hi) / 2</code>는 두 값이 각각 int 범위 안에 있어도 합이 범위를 넘을 수 있다.</p>
+
+<pre><code class="language-java">int lo = 2_000_000_000;
+int hi = 2_100_000_000;
+System.out.println((lo + hi) / 2);         // -97483648
+System.out.println(lo + (hi - lo) / 2);    // 2050000000</code></pre>
+
+<p>둘째 방식은 차이를 먼저 구해 절반을 더하므로 중간 결과가 범위를 넘지 않는다. 큰 배열에서 가운데 위치를 구하는 코드가 이 문제를 갖고 있으면 배열이 충분히 커졌을 때 음수 위치로 접근하게 된다.</p>
+
+<p>부호를 바꾸는 연산에도 오버플로가 있다. 2의 보수는 음수가 하나 더 많아서 <code>Integer.MIN_VALUE</code>(-2147483648)에 대응하는 양수가 없다. 그래서 <code>-Integer.MIN_VALUE</code>는 다시 <code>Integer.MIN_VALUE</code>이고, 절댓값을 구하는 <code>Math.abs(Integer.MIN_VALUE)</code>도 음수 -2147483648을 돌려준다. API 문서에 그렇게 명시되어 있다. 정수 나눗셈의 <code>Integer.MIN_VALUE / -1</code>도 같은 경우다. JLS §15.17.2는 이때 오버플로가 일어나 결과가 나누어지는 수와 같아지며 예외는 던져지지 않는다고 규정한다. "절댓값은 음수가 아니다"라는 가정이 깨지는 유일한 입력이 있다는 사실은 기억해 둘 만하다.</p>
+
+<p>대비책은 세 가지다. 첫째, 값이 커질 수 있으면 처음부터 long으로 계산한다. 리터럴에는 <code>L</code>을 붙여 첫 연산부터 long이 되게 한다. 둘째, 넘치면 안 되는 계산에는 검사하는 메서드를 쓴다. <code>Math.addExact</code>, <code>Math.multiplyExact</code> 등은 결과가 범위를 넘으면 틀린 값을 돌려주는 대신 ArithmeticException을 던진다. <code>Math.addExact(2_000_000_000, 2_000_000_000)</code>은 "integer overflow"라는 메시지의 예외로 끝난다. 셋째, 중간값 예처럼 식의 순서를 바꿔 중간 결과가 넘치지 않게 한다. 참고로 실수의 오버플로는 정수와 다르게 한 바퀴 돌지 않고 무한대가 된다. <code>1e308 * 10</code>은 <code>Infinity</code>다.</p>
+
+<x-visual id="java-intro-03-int-overflow-wheel" title="int 값이 원형 숫자판 위에서 최댓값을 넘으면 최솟값으로 넘어가는 모습" kind="개념도" ratio="1:1">
+<x-hint>32비트 정수가 직선이 아니라 원 위에 놓여 있어서, 최댓값에서 1을 더하면 이음매를 지나 최솟값이 된다는 것을 보여 준다.</x-hint>
+<x-prompt>큰 원 하나를 숫자판처럼 그린 개념도. 원의 맨 위 지점에 눈금과 라벨 "0". 시계 방향으로 가면서 오른쪽 지점에 라벨 "1073741824", 맨 아래 지점 바로 오른쪽에 라벨 "2147483647 (최댓값)", 맨 아래 지점 바로 왼쪽에 라벨 "-2147483648 (최솟값)", 왼쪽 지점에 라벨 "-1073741824", 맨 위 바로 왼쪽에 라벨 "-1". 원의 오른쪽 반은 파란색 호(양수), 왼쪽 반은 주황색 호(음수). 맨 아래의 최댓값과 최솟값 사이에 굵은 빨간 점선으로 이음매를 표시하고, 최댓값에서 최솟값으로 넘어가는 짧은 굽은 화살표와 라벨 "+1". 원 안쪽에 시계 방향 화살표와 라벨 "더하기", 반시계 방향 화살표와 라벨 "빼기". 흰 배경, 평면 벡터, 글자는 선명하게.</x-prompt>
+<x-caption>정수는 정해진 비트 수 안에서 한 바퀴 돈다. 이음매는 최댓값과 최솟값 사이에 있다.</x-caption>
+</x-visual>
+
+<h3>문자열 더하기</h3>
+<p><code>+</code>는 숫자만 더하는 연산자가 아니다. JLS §15.18.1은 피연산자 가운데 하나라도 String이면 <code>+</code>가 문자열 연결(string concatenation)이 되고, String이 아닌 쪽은 문자열로 변환된다고 규정한다. 같은 기호가 피연산자의 타입에 따라 전혀 다른 연산이 되는 것이다. 어느 쪽 연산인지는 실행 중이 아니라 컴파일할 때 타입을 보고 정해진다.</p>
+
+<pre><code class="language-java">System.out.println("a" + 1 + 2);        // a12
+System.out.println(1 + 2 + "a");        // 3a
+System.out.println("합: " + 1 + 2);      // 합: 12
+System.out.println("합: " + (1 + 2));    // 합: 3
+System.out.println('a' + 1);            // 98
+System.out.println("" + 'a' + 1);       // a1
+System.out.println('a' + 'b' + "c");    // 195c
+System.out.println("x" + null + true + 1.0);   // xnulltrue1.0</code></pre>
+
+<p>이 결과들은 두 가지 사실만으로 모두 설명된다. 하나는 <code>+</code>가 왼쪽부터 차례로 묶인다는 것이고, 다른 하나는 각 <code>+</code>가 자기의 두 피연산자 타입만 보고 덧셈인지 연결인지를 정한다는 것이다. <code>"a" + 1 + 2</code>는 <code>("a" + 1) + 2</code>다. 첫 <code>+</code>는 String과 int이므로 연결이어서 "a1"이 되고, 둘째 <code>+</code>는 String "a1"과 int이므로 다시 연결이어서 "a12"다. <code>1 + 2 + "a"</code>는 <code>(1 + 2) + "a"</code>다. 첫 <code>+</code>는 int와 int이므로 덧셈이어서 3이고, 그다음에야 연결이 일어나 "3a"가 된다.</p>
+
+<p>문자(char)가 섞이면 한 번 더 주의해야 한다. char는 정수형이므로 <code>'a' + 1</code>은 승격 규칙에 따라 int 덧셈이고 결과는 98이다. <code>'a' + 'b' + "c"</code>에서도 첫 <code>+</code>는 char와 char라서 97 + 98 = 195라는 int가 되고, 그 뒤에 "c"가 붙어 "195c"가 된다. 문자들을 이어 붙이려 했다면 맨 앞에 빈 문자열을 두어 첫 연산부터 연결이 되게 해야 한다. 마지막 줄은 어떤 타입이든 문자열로 변환된다는 것을 보여 준다. null은 "null"이라는 네 글자가 되고, boolean과 실수도 각자의 문자열 표현으로 바뀐다(JLS §5.1.11).</p>
+
+<p>문자열 연결은 바이트코드에서 덧셈 명령이 되지 않는다. 문자열은 객체이고 JVM에는 문자열을 잇는 명령이 없기 때문이다. 변수가 섞인 연결식을 컴파일해 보자.</p>
+
+<pre><code class="language-java">static String concat(String name, int age) {
+    return "이름: " + name + ", 나이: " + age;
+}</code></pre>
+
+<pre data-label="javap -c 출력"><code class="language-text">       0: aload_0
+       1: iload_1
+       2: invokedynamic #7,  0              // InvokeDynamic #0:makeConcatWithConstants:(Ljava/lang/String;I)Ljava/lang/String;
+       7: areturn</code></pre>
+
+<p>변수 두 개의 값만 스택에 올리고 <code>invokedynamic</code>이라는 호출 명령 하나로 끝난다. <code>javap -v</code>로 더 들여다보면 이 호출에 <code>이름: \u0001, 나이: \u0001</code>이라는 틀이 딸려 있다. 고정된 글자는 틀에 적어 두고, 변수가 들어갈 자리만 표시해 둔 것이다. 실제로 문자열을 조립하는 일은 JDK 라이브러리의 <code>StringConcatFactory</code>가 실행 시점에 맡는다. 이 방식은 JDK 9에서 도입되었다(JEP 280). 그 전의 javac는 <code>StringBuilder</code> 객체를 만들어 <code>append</code>를 연달아 호출하는 코드를 생성했다. JEP 280은 연결 방식을 라이브러리 쪽에 둠으로써 나중에 javac가 내는 바이트코드를 바꾸지 않고도 연결 성능을 개선할 수 있게 하려는 것이 목적이라고 밝힌다. 소스 코드의 <code>+</code>는 그대로인데 그 아래의 구현은 버전에 따라 달라져 온 셈이다.</p>
+
+<p>리터럴끼리의 연결은 사정이 다르다. <code>"a" + 1 + 2</code>는 상수식이므로 컴파일러가 미리 "a12"로 만들어 상수 풀에 넣고, 바이트코드에는 <code>ldc</code> 하나만 남는다. 반면 변수가 섞인 연결은 실행할 때마다 새 String 객체를 만든다(JLS §15.18.1). 한두 번의 연결에서는 신경 쓸 일이 아니지만, 반복문 안에서 문자열에 계속 덧붙이면 매번 새 객체가 만들어진다. 이 문제와 <code>StringBuilder</code>는 자바 중급 1편의 String 회차에서 다룬다.</p>
+
+<h3>연산자 우선순위와 결합 방향 — 식을 묶는 규칙</h3>
+<p>연산자가 여럿인 식에서 어느 연산자가 어느 피연산자를 차지하는지를 정하는 규칙이 <b>우선순위</b>(precedence)다. <code>3 + 4 * 2</code>에서 가운데의 4는 <code>+</code>의 오른쪽 피연산자일 수도, <code>*</code>의 왼쪽 피연산자일 수도 있다. <code>*</code>의 우선순위가 더 높으므로 4는 <code>*</code>에 묶이고, 식은 <code>3 + (4 * 2)</code>로 해석되어 11이 된다. 우선순위는 "보이지 않는 괄호를 어디에 칠 것인가"의 규칙이다.</p>
+
+<p>JLS에는 우선순위 표가 따로 없다. JLS §15.2는 연산자 사이의 우선순위가 문법 생성 규칙의 계층으로 관리된다고 적는다. 우선순위가 식의 문법 정의 속에 구조로 들어 있다는 뜻이다. 오라클의 자바 튜토리얼이 이것을 표로 정리해 두었는데, 위에 있을수록 우선순위가 높고 같은 줄의 연산자는 우선순위가 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>순위</th><th>분류</th><th>연산자</th></tr></thead><tbody>
+<tr><td>1</td><td>후위</td><td>expr++ expr--</td></tr>
+<tr><td>2</td><td>단항</td><td>++expr --expr +expr -expr ~ !</td></tr>
+<tr><td>3</td><td>곱셈류</td><td>* / %</td></tr>
+<tr><td>4</td><td>덧셈류</td><td>+ -</td></tr>
+<tr><td>5</td><td>시프트</td><td>&lt;&lt; &gt;&gt; &gt;&gt;&gt;</td></tr>
+<tr><td>6</td><td>관계</td><td>&lt; &gt; &lt;= &gt;= instanceof</td></tr>
+<tr><td>7</td><td>동등</td><td>== !=</td></tr>
+<tr><td>8</td><td>비트 AND</td><td>&amp;</td></tr>
+<tr><td>9</td><td>비트 XOR</td><td>^</td></tr>
+<tr><td>10</td><td>비트 OR</td><td>|</td></tr>
+<tr><td>11</td><td>논리 AND</td><td>&amp;&amp;</td></tr>
+<tr><td>12</td><td>논리 OR</td><td>||</td></tr>
+<tr><td>13</td><td>삼항</td><td>? :</td></tr>
+<tr><td>14</td><td>대입</td><td>= += -= *= /= %= &amp;= ^= |= &lt;&lt;= &gt;&gt;= &gt;&gt;&gt;=</td></tr>
+</tbody></table></div>
+
+<p>열네 줄을 다 외울 필요는 없다. 큰 흐름만 잡으면 된다. 단항 연산자가 가장 높고, 그다음이 산술(곱셈류가 덧셈류보다 높다), 그다음이 비교, 그다음이 논리(<code>&&</code>가 <code>||</code>보다 높다), 맨 마지막이 대입이다. 이 순서 덕분에 자연스럽게 쓴 식이 기대대로 묶인다. <code>x + 1 > y && y > 0</code>은 괄호 없이도 <code>((x + 1) > y) && (y > 0)</code>으로 해석된다. 산술로 값을 구하고, 그 값을 비교하고, 비교 결과를 논리로 엮는 순서다. 대입이 가장 낮으므로 <code>boolean ok = x + 1 > y && y > 0;</code>에서 오른쪽 전체가 계산된 뒤에 대입된다.</p>
+
+<p>우선순위가 같은 연산자가 나란히 있을 때는 <b>결합 방향</b>(associativity)이 묶는 순서를 정한다. 이항 연산자는 대입 연산자를 빼고 모두 왼쪽부터 묶인다. <code>10 - 3 - 2</code>는 <code>(10 - 3) - 2</code>이므로 5이고, 오른쪽부터 묶은 <code>10 - (3 - 2)</code>의 9가 아니다. 앞 절의 문자열 연결이 왼쪽부터 진행된 것도 같은 규칙이다. 대입 연산자만 오른쪽부터 묶인다. <code>a = b = c</code>는 <code>a = (b = c)</code>다.</p>
+
+<p>우선순위를 잘못 짐작하기 쉬운 곳이 몇 군데 있다.</p>
+
+<pre><code class="language-java">boolean a = true, b = false, c = false;
+System.out.println(a || b && c);      // true   : a || (b && c)
+System.out.println((a || b) && c);    // false
+
+int n = 3;
+System.out.println(-n * 2 + 1);       // -5     : ((-n) * 2) + 1
+
+int v = 5;
+// System.out.println(1 < v < 10);    // 컴파일 오류</code></pre>
+
+<p>첫 예에서 <code>&&</code>가 <code>||</code>보다 먼저 묶인다는 것을 모르면 결과를 반대로 예측한다. 마지막 예는 수학의 표기 <code>1 &lt; v &lt; 10</code>을 그대로 옮긴 것인데, 자바에서는 <code>(1 &lt; v) &lt; 10</code>으로 묶인다. 왼쪽 비교의 결과는 boolean이고 boolean과 int는 크기를 비교할 수 없으므로 컴파일러가 "bad operand types for binary operator"라는 오류를 낸다. 범위 검사는 <code>1 &lt; v && v &lt; 10</code>처럼 두 비교를 논리 연산자로 이어야 한다.</p>
+
+<p>실무적인 결론은 간단하다. 산술, 비교, 논리, 대입의 큰 순서만 믿고, 그 밖의 조합에는 괄호를 쓴다. 괄호는 컴파일 결과를 바꾸지 않는다. 앞에서 본 대로 바이트코드에는 괄호가 없고 명령어의 순서만 있기 때문이다. 필요 없는 괄호 한 쌍의 비용은 0이고, 우선순위를 잘못 읽은 버그의 비용은 크다.</p>
+
+<h3>평가 순서 — 우선순위와는 다른 이야기</h3>
+<p>이제 이 회차에서 가장 중요한 구분을 할 차례다. 우선순위는 "어떤 연산자가 어떤 피연산자와 묶이는가"를 정한다. 그것은 "피연산자의 값이 어떤 순서로 구해지는가"와는 별개의 질문이다. 많은 사람이 "곱셈의 우선순위가 높으니 곱셈 쪽이 먼저 계산된다"고 뭉뚱그려 이해하는데, 다음 프로그램이 그 이해를 깬다.</p>
+
+<pre><code class="language-java">public class Order {
+    static int a() { System.out.print("a "); return 1; }
+    static int b() { System.out.print("b "); return 2; }
+    static int c() { System.out.print("c "); return 3; }
+
+    public static void main(String[] args) {
+        int r = a() + b() * c();
+        System.out.println("= " + r);
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">a b c = 7</code></pre>
+
+<p>결과 7은 <code>1 + (2 * 3)</code>이므로 곱셈이 먼저 묶인 것이 맞다. 그런데 메서드가 호출된 순서는 a, b, c다. 곱셈의 피연산자인 <code>b()</code>와 <code>c()</code>가 <code>a()</code>보다 먼저 호출되지 않았다. 바이트코드를 보면 이유가 분명하다.</p>
+
+<pre data-label="javap -c 출력(main의 앞부분)"><code class="language-text">       0: invokestatic  #25                 // Method a:()I
+       3: invokestatic  #31                 // Method b:()I
+       6: invokestatic  #34                 // Method c:()I
+       9: imul
+      10: iadd
+      11: istore_1</code></pre>
+
+<p>세 메서드를 소스에 적힌 순서대로 호출해 반환값을 스택에 쌓고, 그다음에 곱하고, 그다음에 더한다. 앞에서 <code>a + b * c</code>의 바이트코드가 변수를 a, b, c 순서로 스택에 올렸던 것과 같은 모양이다. 우선순위는 <code>imul</code>이 <code>iadd</code>보다 앞에 온다는 데에 반영되어 있고, 피연산자를 준비하는 순서에는 영향을 주지 않았다.</p>
+
+<p>이것은 컴파일러의 재량이 아니라 언어의 보장이다. JLS §15.7은 자바가 연산자의 피연산자를 특정한 평가 순서, 곧 왼쪽에서 오른쪽으로 평가하는 것처럼 보이도록 보장한다고 적는다. 이어지는 소절들이 내용을 구체화한다.</p>
+
+<ul>
+<li>이항 연산자의 왼쪽 피연산자는 오른쪽 피연산자의 어떤 부분보다도 먼저 완전히 평가된다(§15.7.1).</li>
+<li>연산 자체는 피연산자가 모두 평가된 뒤에 수행된다. 예외는 <code>&&</code>, <code>||</code>, <code>? :</code>뿐이다(§15.7.2).</li>
+<li>괄호와 우선순위가 지시하는 연산의 순서는 지켜진다(§15.7.3).</li>
+<li>메서드 호출의 인자들도 왼쪽부터 차례로 평가된다(§15.7.4).</li>
+</ul>
+
+<p>명세에 실린 예제가 이 규칙의 의미를 잘 보여 준다. 피연산자 안에서 변수를 바꾸는 식이다.</p>
+
+<pre><code class="language-java">int i = 2;
+int j = (i = 3) * i;
+System.out.println(j);    // 9
+
+int k = 2;
+int m = k * (k = 3);
+System.out.println(m);    // 6</code></pre>
+
+<p>첫 식에서 왼쪽 피연산자 <code>(i = 3)</code>이 먼저 평가된다. i에 3이 대입되고 이 피연산자의 값은 3이다. 그다음 오른쪽 피연산자 <code>i</code>를 읽으면 이미 3이다. 그래서 3 × 3 = 9다. JLS는 이 식의 결과가 6이 되는 것은 허용되지 않는다고 명시한다. 둘째 식은 좌우를 바꾼 것이다. 왼쪽 피연산자 <code>k</code>를 먼저 읽어 2를 얻고, 그 뒤에 오른쪽의 대입이 실행되어 2 × 3 = 6이 된다. 괄호가 있다고 해서 괄호 안이 먼저 실행되는 것이 아니다. 괄호는 묶는 방식을 정할 뿐이고, 평가는 여전히 왼쪽부터다.</p>
+
+<p>두 규칙의 역할을 정리하면 이렇다.</p>
+
+<div class="table-wrap"><table><thead><tr><th></th><th>우선순위·결합 방향</th><th>평가 순서</th></tr></thead><tbody>
+<tr><td>정하는 것</td><td>연산자와 피연산자가 묶이는 구조</td><td>피연산자의 값을 구하는 시간 순서</td></tr>
+<tr><td>규칙</td><td>우선순위 표, 같으면 결합 방향</td><td>언제나 왼쪽에서 오른쪽</td></tr>
+<tr><td>괄호의 영향</td><td>바뀐다</td><td>바뀌지 않는다</td></tr>
+<tr><td>결과에 영향을 주는 경우</td><td>항상</td><td>피연산자에 부수 효과가 있거나 예외가 날 때</td></tr>
+</tbody></table></div>
+
+<p>평가 순서가 눈에 보이는 것은 피연산자에 부수 효과가 있을 때다. 변수 대입, 증감, 화면 출력이나 데이터 변경을 하는 메서드 호출이 그렇다. 예외도 마찬가지다. <code>a() / b()</code>에서 <code>a()</code>가 예외를 던지면 <code>b()</code>는 호출되지 않는다. 왼쪽 피연산자의 평가가 갑자기 끝나면 오른쪽은 평가되지 않은 것처럼 보여야 한다는 것이 명세의 요구다.</p>
+
+<p>명세는 이 보장을 준 뒤에 곧바로 충고를 덧붙인다. 코드가 이 규칙에 결정적으로 의존하지 않는 편이 좋고, 식 하나에 부수 효과는 많아야 하나, 그것도 가장 바깥 연산으로 두면 코드가 대개 더 명확해진다는 것이다. 규칙을 아는 목적은 <code>(i = 3) * i</code> 같은 코드를 쓰기 위해서가 아니라, 그런 코드를 만났을 때 결과를 정확히 읽고 풀어 쓰기 위해서다.</p>
+
+<p>같은 절에는 실수에 관한 중요한 문장도 있다. 정수의 덧셈과 곱셈은 결합 법칙이 성립하지만, 실수 계산은 수학적으로는 결합 법칙이 성립해 보여도 계산상으로는 그렇지 않을 수 있으므로 컴파일러가 순서를 바꿔서는 안 된다는 것이다. 2회에서 본 반올림 때문이다. <code>(0.1 + 0.2) + 0.3</code>은 0.6000000000000001이고 <code>0.1 + (0.2 + 0.3)</code>은 0.6이다. 실수에서는 더하는 순서가 결과를 바꾸고, 자바는 소스에 적힌 순서를 그대로 지킨다.</p>
+
+<x-visual id="java-intro-03-precedence-vs-order" title="a() + b() * c()의 식 트리: 묶이는 구조와 평가되는 순서의 차이" kind="식 트리 다이어그램" ratio="16:9">
+<x-hint>우선순위가 정하는 트리의 모양과, 왼쪽에서 오른쪽으로 진행되는 피연산자 평가 순서 번호를 한 그림에 겹쳐 보여 준다.</x-hint>
+<x-prompt>가운데에 식 트리를 그린다. 맨 위 노드 "+". 그 왼쪽 자식은 잎 노드 "a()". 오른쪽 자식은 노드 "*" 이고, "*" 의 왼쪽 자식은 잎 노드 "b()", 오른쪽 자식은 잎 노드 "c()". 연산자 노드는 원, 잎 노드는 둥근 사각형. 각 잎 노드 옆에 번호 배지를 붙인다: "a()" 옆에 "①", "b()" 옆에 "②", "c()" 옆에 "③". 연산자 노드 옆에도 배지: "*" 옆에 "④", "+" 옆에 "⑤". 트리 왼쪽에 설명 상자 "트리의 모양 = 우선순위가 정한다", 트리 오른쪽에 설명 상자 "번호 = 평가 순서, 왼쪽에서 오른쪽". 트리 아래에 작은 터미널 창과 그 안의 글자 "a b c = 7". 흰 배경, 평면 벡터, 연산자 노드는 주황, 잎 노드는 파랑, 번호 배지는 진한 회색.</x-prompt>
+<x-caption>우선순위는 트리의 모양을 정하고, 평가는 잎을 왼쪽부터 방문한다.</x-caption>
+</x-visual>
+
+<h3>증감 연산자 — 값을 읽는 시점과 바꾸는 시점</h3>
+<p><code>++</code>는 변수의 값을 1 늘리고 <code>--</code>는 1 줄인다. 이 연산자는 식이기도 하므로 값을 갖는데, 그 값이 연산자를 변수 앞에 두느냐 뒤에 두느냐에 따라 다르다. 뒤에 붙이는 후위(postfix) 형태 <code>i++</code>의 값은 새 값이 저장되기 <b>전</b>의 변수 값이고(JLS §15.14.2), 앞에 붙이는 전위(prefix) 형태 <code>++i</code>의 값은 새 값이 저장된 <b>후</b>의 변수 값이다(JLS §15.15.1). 변수가 1 늘어나는 것은 두 경우 모두 같다.</p>
+
+<pre><code class="language-java">int q = 5;
+int q1 = q++;    // q1 = 5, q = 6
+int q2 = ++q;    // q = 7, q2 = 7
+System.out.println(q + " " + q1 + " " + q2);    // 7 5 7</code></pre>
+
+<p>바이트코드로 보면 "전"과 "후"가 명령어의 순서로 나타난다. 매개변수 i(0번 칸)를 증가시키며 그 식의 값을 j(1번 칸)에 넣는 두 메서드다.</p>
+
+<pre data-label="int j = i++; 와 int j = ++i; 의 바이트코드"><code class="language-text">  int j = i++;                         int j = ++i;
+       0: iload_0                           0: iinc          0, 1
+       1: iinc          0, 1                3: iload_0
+       4: istore_1                          4: istore_1</code></pre>
+
+<p><code>iinc 0, 1</code>은 지역 변수 0번 칸의 값을 1만큼 늘리는 명령이다. JVM 명세의 설명대로 이 명령은 피연산자 스택을 건드리지 않고 칸의 값을 직접 바꾼다. 후위 형태는 먼저 현재 값을 스택에 복사해 두고(<code>iload_0</code>) 그다음에 칸을 늘린다. 스택에 올라간 것은 늘리기 전의 값이다. 전위 형태는 칸을 먼저 늘리고 그다음에 읽는다. 두 코드의 차이는 명령 두 개의 순서뿐이다.</p>
+
+<p>이 그림으로 유명한 수수께끼를 풀 수 있다.</p>
+
+<pre><code class="language-java">int i = 5;
+i = i++;
+System.out.println(i);    // 5</code></pre>
+
+<pre data-label="i = i++; 의 바이트코드(i는 0번 칸)"><code class="language-text">       0: iload_0          // 스택: 5        칸: 5
+       1: iinc          0, 1   // 스택: 5        칸: 6
+       4: istore_0         // 스택: 비어 있음  칸: 5</code></pre>
+
+<p>6이 될 것 같지만 5다. 오른쪽 식 <code>i++</code>의 값은 증가 전의 값 5이고, 그 값이 스택에 올라간다. 그다음 칸이 6으로 늘어난다. 마지막으로 대입이 실행되어 스택에 있던 5가 칸에 덮어써진다. 증가는 분명히 일어났지만 바로 뒤의 대입이 지워 버렸다. 평가 순서 규칙을 그대로 적용한 결과이기도 하다. 대입은 오른쪽 식의 평가가 (부수 효과까지 포함해) 완전히 끝난 뒤에 수행된다.</p>
+
+<p>한 식에 증감이 여러 번 나오면 왼쪽에서 오른쪽으로 하나씩 따라가면 된다.</p>
+
+<pre><code class="language-java">int a = 5;
+int b = a++ + ++a;
+System.out.println(a + " " + b);    // 7 12</code></pre>
+
+<p>왼쪽 피연산자 <code>a++</code>의 값은 5이고 a는 6이 된다. 오른쪽 피연산자 <code>++a</code>는 a를 7로 만들고 그 값 7을 낸다. 5 + 7 = 12다. 답을 구할 수는 있지만, 이런 식을 실제 코드에 쓰면 읽는 사람마다 이 추적을 되풀이해야 한다. 명세의 충고대로 증감 연산자는 그 자체로 한 문장이 되게 쓰는 것이 좋다.</p>
+
+<p>증감을 독립된 문장으로 쓰면 전위와 후위의 차이는 사라진다. 식의 값을 아무도 쓰지 않기 때문이다. <code>i++;</code>, <code>++i;</code>, <code>i += 1;</code> 세 문장을 컴파일하면 모두 <code>iinc 0, 1</code> 한 명령이 된다. "전위가 후위보다 빠르다"는 말은 적어도 int 변수를 한 문장으로 증가시키는 경우에는 근거가 없다. 바이트코드가 같다.</p>
+
+<p>증감 연산자는 int가 아닌 타입에도 쓸 수 있고, 그때는 숨은 변환이 따라온다. JLS §15.14.2는 1과 변수의 값에 이항 숫자 승격을 적용해 더한 다음, 필요하면 그 합을 변수의 타입으로 좁혀서 저장한다고 규정한다.</p>
+
+<pre><code class="language-java">byte bt = 127;
+bt++;
+System.out.println(bt);    // -128
+
+char ch = 'a';
+ch++;
+System.out.println(ch);    // b
+
+double dd = 1.5;
+dd++;
+System.out.println(dd);    // 2.5</code></pre>
+
+<p><code>bt = bt + 1</code>은 앞에서 본 대로 컴파일되지 않지만 <code>bt++</code>는 된다. int로 계산한 128을 byte로 좁히는 변환이 연산자 안에 포함되어 있기 때문이다. 좁히면서 아래 8비트 <code>10000000</code>만 남으므로 결과는 -128이다. byte에서도 오버플로는 같은 방식으로, 조용히 일어난다.</p>
+
+<h3>비교 연산자 — 결과는 boolean, 구현은 분기</h3>
+<p>비교 연산자는 여섯 가지다. 같다 <code>==</code>, 다르다 <code>!=</code>, 크다 <code>&gt;</code>, 작다 <code>&lt;</code>, 크거나 같다 <code>&gt;=</code>, 작거나 같다 <code>&lt;=</code>다. 결과는 언제나 boolean 타입의 true 또는 false다. 비교할 때도 산술 연산과 똑같이 이항 숫자 승격이 먼저 적용된다(JLS §15.20.1, §15.21.1).</p>
+
+<pre><code class="language-java">System.out.println(10 == 10.0);    // true  : int 10이 double 10.0으로 승격된 뒤 비교
+System.out.println('a' == 97);     // true  : char가 int로 승격된 뒤 비교
+System.out.println(7 / 2 == 3);    // true  : 산술이 비교보다 먼저 묶인다</code></pre>
+
+<p>바이트코드 수준에서 비교는 뜻밖의 모습을 하고 있다. 두 int를 비교해 boolean을 돌려주는 메서드를 보자.</p>
+
+<pre><code class="language-java">static boolean less(int a, int b) {
+    return a < b;
+}</code></pre>
+
+<pre data-label="javap -c 출력"><code class="language-text">       0: iload_0
+       1: iload_1
+       2: if_icmpge     9
+       5: iconst_1
+       6: goto          10
+       9: iconst_0
+      10: ireturn</code></pre>
+
+<p>"두 값을 비교해 true나 false를 스택에 쌓는" 명령은 없다. 대신 <code>if_icmpge 9</code>가 있다. 스택의 두 int를 꺼내 첫째가 둘째보다 크거나 같으면 위치 9로 건너뛰라는 조건 분기 명령이다. 건너뛰지 않으면(a가 b보다 작으면) 다음 줄의 <code>iconst_1</code>이 실행되어 1, 곧 true가 쌓이고 <code>goto 10</code>으로 끝으로 간다. 건너뛰면 <code>iconst_0</code>이 실행되어 0, 곧 false가 쌓인다. JVM에서 int의 비교는 "값을 만드는 연산"이 아니라 "실행 위치를 바꾸는 분기"이고, boolean 값이 필요하면 분기의 양쪽에서 1이나 0을 쌓아 만들어 낸다. 조건이 <code>&lt;</code>인데 명령은 반대인 <code>ge</code>(크거나 같으면)인 점도 눈에 띈다. 컴파일러가 "조건이 거짓이면 건너뛴다"는 형태로 번역했기 때문이다. 다음 회차의 if 문이 정확히 이 분기 명령으로 만들어진다.</p>
+
+<p>실수의 비교에는 2회에서 본 부동소수점의 성질이 그대로 따라온다.</p>
+
+<pre><code class="language-java">System.out.println(0.1 + 0.2 == 0.3);                    // false
+System.out.println(Math.abs(0.1 + 0.2 - 0.3) < 1e-9);    // true
+
+double nan = 0.0 / 0;
+System.out.println(nan == nan);    // false
+System.out.println(nan != nan);    // true
+System.out.println(nan > 1);       // false
+System.out.println(nan <= 1);      // false
+System.out.println(0.0 == -0.0);   // true</code></pre>
+
+<p>계산 결과인 실수를 <code>==</code>로 비교하면 반올림 오차 때문에 기대와 다른 답이 나온다. 실수는 두 값의 차이가 충분히 작은지로 비교한다. 허용 오차를 얼마로 잡을지는 다루는 값의 크기에 따라 정해야 한다. NaN은 더 특이하다. JLS §15.21.1에 따르면 피연산자 가운데 하나라도 NaN이면 <code>==</code>의 결과는 false이고 <code>!=</code>의 결과는 true다. NaN은 자기 자신과도 같지 않다. 크기 비교는 모두 false다(§15.20.1). 그래서 실수에서는 <code>!(x > 1)</code>과 <code>x <= 1</code>이 같은 뜻이 아니다. x가 NaN이면 앞의 것은 true이고 뒤의 것은 false다. 어떤 값이 NaN인지 확인할 때는 <code>Double.isNaN(x)</code>를 쓴다.</p>
+
+<p>승격이 비교 결과를 바꾸는 경우도 있다. <code>16777217 == 16777216f</code>는 true다. 왼쪽의 int가 float으로 승격되는데, 2회에서 본 대로 float은 16777217을 표현하지 못해 16777216.0이 되기 때문이다. int에서 float으로의 변환은 자동으로 일어나지만 정밀도를 잃을 수 있다(JLS §5.1.2).</p>
+
+<p>마지막으로 <code>=</code>과 <code>==</code>의 혼동이다. 조건 자리에 <code>if (x = 5)</code>라고 쓰면 자바는 컴파일 오류를 낸다. 대입식 <code>x = 5</code>의 타입은 int이고, 조건에는 boolean만 올 수 있기 때문이다. 다만 변수가 boolean이면 이 방어막이 통하지 않는다. <code>if (flag = true)</code>는 컴파일되고, flag에 true를 대입한 뒤 항상 본문을 실행한다. boolean 변수는 <code>== true</code>와 비교하지 말고 <code>if (flag)</code>처럼 그대로 쓰면 이 실수가 생길 자리가 없다. 그리고 문자열을 <code>==</code>로 비교하면 내용이 아니라 같은 객체를 가리키는지를 비교한다(JLS §15.21.3). 문자열의 내용 비교에는 <code>equals</code> 메서드를 쓴다. 그 이유는 참조를 배운 뒤 자바 기본편과 중급 1편에서 자세히 다룬다.</p>
+
+<h3>논리 연산자와 단락 평가</h3>
+<p>논리 연산자는 boolean 값을 받아 boolean 값을 낸다. 그리고(AND) <code>&&</code>는 양쪽이 모두 true일 때만 true다. 또는(OR) <code>||</code>는 한쪽이라도 true면 true다. 부정(NOT) <code>!</code>은 true와 false를 뒤집는다. 배타적 논리합(XOR) <code>^</code>는 양쪽이 서로 다를 때 true다.</p>
+
+<p><code>&&</code>와 <code>||</code>에는 다른 연산자에 없는 성질이 있다. 왼쪽 피연산자만으로 결과가 정해지면 오른쪽을 아예 평가하지 않는다. JLS §15.23은 <code>&&</code>가 왼쪽 피연산자의 값이 true일 때만 오른쪽 피연산자를 평가한다고 규정하고, §15.24는 <code>||</code>가 왼쪽이 false일 때만 오른쪽을 평가한다고 규정한다. 왼쪽이 false인 AND는 오른쪽이 무엇이든 false이고, 왼쪽이 true인 OR는 오른쪽이 무엇이든 true이기 때문이다. 이것을 <b>단락 평가</b>(short-circuit evaluation)라고 한다. 앞 절에서 "모든 피연산자가 평가된 뒤에 연산이 수행된다"는 규칙의 예외로 <code>&&</code>와 <code>||</code>가 꼽혔던 이유다.</p>
+
+<pre><code class="language-java">public class ShortCircuit {
+    static boolean check(String name, boolean value) {
+        System.out.print(name + " ");
+        return value;
+    }
+
+    public static void main(String[] args) {
+        System.out.println("-> " + (check("A", false) && check("B", true)));
+        System.out.println("-> " + (check("A", true) || check("B", true)));
+        System.out.println("-> " + (check("A", false) & check("B", true)));
+        System.out.println("-> " + (check("A", true) || check("B", false) && check("C", false)));
+        System.out.println("-> " + (check("A", false) || check("B", true) && check("C", false)));
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">A -> false
+A -> true
+A B -> false
+A -> true
+A B C -> false</code></pre>
+
+<p><code>check</code>는 자기 이름을 출력하고 주어진 값을 돌려주므로, 출력된 이름이 곧 평가된 피연산자다. 첫 줄에서 A가 false이니 B는 호출되지 않았다. 둘째 줄에서 A가 true이니 B는 호출되지 않았다. 셋째 줄은 <code>&&</code> 대신 <code>&</code>를 썼다. boolean에 쓰는 <code>&</code>와 <code>|</code>도 논리 AND와 OR이지만 단락 평가를 하지 않아서, A가 false인데도 B가 호출되었다. 넷째와 다섯째 줄은 우선순위와 단락 평가가 함께 작용하는 모습이다. 식은 <code>A || (B && C)</code>로 묶인다. A가 true면 오른쪽 덩어리 전체를 건너뛰고, A가 false면 그때 B와 C를 차례로 평가한다.</p>
+
+<p>단락 평가가 어떻게 구현되는지는 바이트코드가 보여 준다.</p>
+
+<pre data-label="return a && b; 와 return a & b; 의 바이트코드(a, b는 boolean 매개변수)"><code class="language-text">  a && b                               a & b
+       0: iload_0                           0: iload_0
+       1: ifeq          12                  1: iload_1
+       4: iload_1                           2: iand
+       5: ifeq          12                  3: ireturn
+       8: iconst_1
+       9: goto          13
+      12: iconst_0
+      13: ireturn</code></pre>
+
+<p>오른쪽의 <code>&</code>는 두 값을 모두 스택에 올린 뒤 <code>iand</code>라는 연산 명령으로 계산한다. 왼쪽의 <code>&&</code>에는 AND 연산 명령이 없다. <code>ifeq 12</code>는 스택 맨 위의 값이 0(false)이면 위치 12로 건너뛰라는 분기다. a가 false면 곧장 12로 가서 false를 쌓는다. b를 읽는 명령(위치 4)은 실행되지 않고 지나간다. <code>&&</code>는 계산이라기보다 제어 흐름이다. "오른쪽을 평가하지 않는다"는 말은 오른쪽 피연산자에 해당하는 명령어들을 분기로 건너뛴다는 뜻이다.</p>
+
+<p>단락 평가는 성능을 위한 잔재주가 아니라 프로그램의 올바름을 떠받치는 장치다. 가장 흔한 쓰임은 "앞의 조건이 성립할 때만 뒤의 식이 안전한" 경우다.</p>
+
+<pre><code class="language-java">String s = null;
+System.out.println(s != null && s.length() > 0);   // false
+System.out.println(s != null & s.length() > 0);    // NullPointerException
+
+int x = 0;
+System.out.println(x != 0 && 10 / x > 1);          // false
+System.out.println(x != 0 & 10 / x > 1);           // ArithmeticException: / by zero</code></pre>
+
+<p>(주석은 각 줄을 따로 실행했을 때의 결과다.) 변수 s가 아무 객체도 가리키지 않을 때(null) <code>s.length()</code>를 호출하면 예외가 난다. <code>&&</code>를 쓰면 왼쪽 검사가 false인 순간 오른쪽은 실행되지 않으므로 안전하다. 기호 하나를 빼서 <code>&</code>로 쓰면 양쪽이 모두 평가되어 프로그램이 죽는다. OpenJDK 21에서 이때의 예외 메시지는 <code>Cannot invoke "String.length()" because "<local1>" is null</code>이다. 변수 이름 s 대신 <code><local1></code>이라고 나오는 것은 2회에서 본 대로, 디버깅 정보 없이 컴파일한 클래스 파일에는 "1번 칸"이라는 번호만 남아 있기 때문이다. 둘째 쌍은 0으로 나누기를 같은 방식으로 막는 예다. 이런 코드에서 조건의 순서는 바꿀 수 없다. 보호하는 조건이 반드시 왼쪽에 와야 한다.</p>
+
+<p>반대로 단락 평가 때문에 생기는 함정도 있다. 오른쪽 피연산자에 부수 효과가 있으면 그 효과가 일어날 수도, 일어나지 않을 수도 있게 된다.</p>
+
+<pre><code class="language-java">int cnt = 0;
+boolean t = (cnt > 0) && (cnt++ > 0);    // 왼쪽이 false: cnt++ 는 실행되지 않는다
+boolean u = (cnt == 0) | (cnt++ > 0);    // | 는 양쪽 다 평가: cnt++ 가 실행된다
+System.out.println(cnt + " " + t + " " + u);    // 1 false true</code></pre>
+
+<p>조건식 안에서 변수를 바꾸거나 상태를 변경하는 메서드를 호출하면, 그 변경이 실행되는지가 앞 조건의 값에 달리게 된다. 조건식에는 값을 읽기만 하는 식을 두고, 상태를 바꾸는 일은 별도의 문장으로 빼는 것이 안전하다.</p>
+
+<x-visual id="java-intro-03-short-circuit-flow" title="A와 B의 논리곱에서 A가 거짓이면 B를 건너뛰는 단락 평가의 흐름" kind="순서도" ratio="16:9">
+<x-hint>논리 AND 연산자가 연산이 아니라 분기로 실행된다는 것, A가 거짓이면 B를 평가하는 단계를 지나치지 않고 곧바로 결과 false로 간다는 것을 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 흐르는 순서도. 시작 상자 "A 평가". 그 오른쪽에 마름모 "A가 true인가?". 마름모에서 오른쪽으로 나가는 화살표 라벨 "예" 가 상자 "B 평가"로 이어지고, 다시 마름모 "B가 true인가?"로 이어진다. 두 번째 마름모에서 오른쪽 화살표 라벨 "예" 가 초록색 결과 상자 "결과 true"로 간다. 첫 번째 마름모에서 아래로 나가는 화살표 라벨 "아니오" 는 "B 평가" 상자 아래를 지나 빨간색 결과 상자 "결과 false"로 길게 이어진다. 이 긴 화살표 위에 강조 라벨 "B를 건너뛴다". 두 번째 마름모에서 아래로 나가는 화살표 라벨 "아니오" 도 같은 "결과 false" 상자로 합쳐진다. "B 평가" 상자는 점선 테두리로 그려 실행되지 않을 수 있음을 나타낸다. 흰 배경, 평면 벡터, 얇은 선.</x-prompt>
+<x-caption>단락 평가는 오른쪽 피연산자의 명령어를 분기로 건너뛰는 것이다.</x-caption>
+</x-visual>
+
+<h3>대입 연산자와 복합 대입 — 숨어 있는 형변환</h3>
+<p>대입 <code>=</code>도 연산자이고, 대입식에도 값이 있다. JLS §15.26은 대입식의 결과가 대입이 일어난 뒤의 변수 값이라고 규정한다. 그리고 대입 연산자는 오른쪽부터 묶인다. 이 두 가지 덕분에 연쇄 대입이 가능하다.</p>
+
+<pre><code class="language-java">int x, y, z;
+x = y = z = 7;    // x = (y = (z = 7))</code></pre>
+
+<pre data-label="x = y = z = 7; 의 바이트코드(x, y, z는 0, 1, 2번 칸)"><code class="language-text">       0: bipush        7
+       2: dup
+       3: istore_2
+       4: dup
+       5: istore_1
+       6: istore_0</code></pre>
+
+<p><code>dup</code>은 스택 맨 위의 값을 하나 더 복제하는 명령이다. 7을 쌓고, 복제해서 하나를 z에 저장하고, 남은 하나를 다시 복제해서 y에 저장하고, 마지막 하나를 x에 저장한다. "대입식의 값"이 실제로는 스택에 남겨 둔 복제본이라는 것을 볼 수 있다. 가장 오른쪽의 z부터 저장되는 순서도 결합 방향 그대로다.</p>
+
+<p>연산과 대입을 합친 <b>복합 대입 연산자</b>(compound assignment operator)도 있다. <code>+=</code>, <code>-=</code>, <code>*=</code>, <code>/=</code>, <code>%=</code>와 비트 연산용 여섯 개가 있어서, 단순 대입 <code>=</code>까지 합쳐 대입 연산자는 모두 열두 개다. <code>x += 3</code>은 <code>x = x + 3</code>과 같다고 흔히 설명하지만, 정확한 정의는 조금 다르다. JLS §15.26.2는 <code>E1 op= E2</code>가 <code>E1 = (T)((E1) op (E2))</code>와 같다고 규정한다. 여기서 T는 E1의 타입이고, E1은 한 번만 평가된다. 차이는 가운데의 <code>(T)</code>, 곧 왼쪽 변수의 타입으로 되돌리는 형변환이 들어 있다는 것이다.</p>
+
+<pre><code class="language-java">byte b = 10;
+b += 5;              // 정상: b = (byte)(b + 5)  → 15
+// b = b + 5;        // 컴파일 오류: int를 byte에 넣을 수 없다
+b += 120;            // 15 + 120 = 135 → byte로 좁혀져 -121
+System.out.println(b);    // -121
+
+int i = 10;
+i += 3.7;            // i = (int)(i + 3.7) = (int) 13.7
+System.out.println(i);    // 13</code></pre>
+
+<pre data-label="b += 5; 와 i += 3.7; 의 바이트코드(변수는 0번 칸)"><code class="language-text">  b += 5;  (b는 byte)                  i += 3.7;  (i는 int)
+       0: iload_0                           0: iload_0
+       1: iconst_5                          1: i2d
+       2: iadd                              2: ldc2_w        #42    // double 3.7d
+       3: i2b                               5: dadd
+       4: istore_0                          6: d2i
+                                            7: istore_0</code></pre>
+
+<p>소스에 쓰지 않은 변환 명령이 바이트코드에 들어 있다. 왼쪽에서는 int로 더한 뒤 <code>i2b</code>(int를 byte로)가 결과를 좁힌다. 오른쪽에서는 i를 double로 승격해(<code>i2d</code>) 3.7과 더한 다음 <code>d2i</code>(double을 int로)가 소수점 아래를 버린다. 명세가 직접 드는 예도 같은 모양이다. <code>short x = 3; x += 4.6;</code>의 결과로 x는 7이 된다.</p>
+
+<p>복합 대입은 편리한 만큼 조심해야 한다. <code>=</code>로 썼다면 컴파일러가 "값을 잃을 수 있는 변환"이라고 막아 주었을 코드가 복합 대입에서는 경고 없이 통과한다. <code>b += 120</code>이 조용히 -121을 만든 것이 그 예다. int 변수에 실수를 누적하는 코드도 같은 문제를 갖는다. <code>int total = 0;</code>에 <code>total += 0.5;</code>를 두 번 실행해도 total은 0이다. 매번 0.5가 더해진 뒤 곧바로 소수점 아래가 버려지기 때문이다. 복합 대입의 왼쪽 변수 타입이 오른쪽 값을 담기에 충분한지는 프로그래머가 직접 확인해야 한다.</p>
+
+<p>"E1은 한 번만 평가된다"는 조건과 앞에서 본 평가 순서 규칙이 만나는 예도 하나 보자. JLS §15.7.1은 복합 대입에서 왼쪽 피연산자의 평가에 "그 변수의 값을 꺼내 저장해 두는 것"이 포함된다고 규정한다.</p>
+
+<pre><code class="language-java">int w = 3;
+w += w++ * 2;
+System.out.println(w);    // 9</code></pre>
+
+<p>먼저 왼쪽 w의 값 3이 저장된다. 그다음 오른쪽이 평가된다. <code>w++</code>의 값은 3이고 w는 4가 되며, 3 × 2 = 6이다. 마지막으로 저장해 둔 3과 6을 더한 9가 w에 대입된다. 중간에 4가 되었던 흔적은 남지 않는다. 이 역시 쓰라고 보여 주는 코드가 아니라, 규칙을 적용하면 어떤 식이든 결과가 하나로 정해진다는 것을 확인하는 예다.</p>
+
+<h3>비트 연산자와 시프트 — 비트 수준의 계산</h3>
+<p>정수를 숫자가 아니라 비트의 나열로 다루는 연산자들이 있다. 입문 단계에서 자주 쓰지는 않지만, 2회에서 본 2의 보수 표현이 연산에서 어떻게 드러나는지를 확인하는 데 좋고, 뒤에서 해시나 권한 플래그 같은 주제에서 다시 만나게 된다. 비트 논리 연산자는 두 정수의 같은 자리 비트끼리 연산한다.</p>
+
+<pre class="diagram">   5      = 0000 0101
+   3      = 0000 0011
+   ──────────────────────────────────────────────
+   5 & 3  = 0000 0001  =  1    (둘 다 1인 자리만 1)
+   5 | 3  = 0000 0111  =  7    (하나라도 1인 자리는 1)
+   5 ^ 3  = 0000 0110  =  6    (서로 다른 자리만 1)
+  ~5      = 1111 1010  = -6    (모든 비트를 뒤집는다. 실제로는 32비트)</pre>
+
+<p><code>~5</code>가 -6인 것은 2의 보수의 성질에서 나온다. 2회에서 부호를 바꾸려면 비트를 뒤집고 1을 더한다고 했다. 곧 <code>-x</code>는 <code>~x + 1</code>이고, 뒤집기만 한 <code>~x</code>는 <code>-x - 1</code>이다. JLS §15.15.5도 모든 경우에 <code>~x</code>가 <code>(-x)-1</code>과 같다고 적는다. 바이트코드에서 <code>~a</code>는 <code>iload, iconst_m1, ixor</code>가 된다. JVM에는 비트를 뒤집는 전용 명령이 없어서, 모든 비트가 1인 값 -1과 XOR하는 것으로 뒤집기를 구현한다.</p>
+
+<p>같은 기호 <code>&</code>, <code>|</code>, <code>^</code>가 피연산자의 타입에 따라 두 가지 역할을 한다는 점을 정리해 두자. 피연산자가 정수면 비트 연산이고(JLS §15.22.1), boolean이면 앞 절에서 본 단락 평가 없는 논리 연산이다(§15.22.2). 문자열 연결의 <code>+</code>처럼, 연산의 종류는 컴파일할 때 타입으로 정해진다.</p>
+
+<p>비트 연산의 대표적인 쓰임은 여러 개의 예/아니오 정보를 정수 하나에 담는 것이다. 각 비트를 하나의 스위치로 쓴다.</p>
+
+<pre><code class="language-java">int READ = 1, WRITE = 2, EXEC = 4;    // 이진수 001, 010, 100
+int perm = READ | WRITE;              // 011 : 두 스위치를 켠다
+System.out.println(perm);                     // 3
+System.out.println((perm & WRITE) != 0);      // true  : WRITE 비트가 켜져 있는가
+System.out.println((perm & EXEC) != 0);       // false
+perm = perm & ~WRITE;                 // WRITE 비트만 끈다
+System.out.println(perm);                     // 1</code></pre>
+
+<p>여기서 괄호 <code>(perm & WRITE) != 0</code>은 꼭 필요하다. 우선순위 표에서 <code>&</code>는 <code>==</code>와 <code>!=</code>보다 낮다. 괄호 없이 <code>x & 1 == 0</code>이라고 쓰면 <code>x & (1 == 0)</code>으로 묶여 int와 boolean을 <code>&</code>하는 식이 되고, 컴파일 오류가 난다. 비트 연산자를 비교와 섞을 때는 항상 괄호를 쓴다.</p>
+
+<p>시프트 연산자는 비트 전체를 왼쪽이나 오른쪽으로 민다. 세 가지가 있다(JLS §15.19).</p>
+
+<pre class="diagram">  -8        = 1111 1111 1111 1111 1111 1111 1111 1000
+  -8 >> 1   = 1111 1111 1111 1111 1111 1111 1111 1100   = -4          (왼쪽을 부호 비트로 채운다)
+  -8 >>> 1  = 0111 1111 1111 1111 1111 1111 1111 1100   = 2147483644  (왼쪽을 0으로 채운다)
+   1 << 3   = 0000 0000 0000 0000 0000 0000 0000 1000   = 8           (오른쪽을 0으로 채운다)</pre>
+
+<p>왼쪽 시프트 <code>n &lt;&lt; s</code>는 2의 s제곱을 곱하는 것과 같고, 명세는 오버플로가 일어나도 그렇다고 적는다. <code>1 &lt;&lt; 31</code>은 최상위 비트만 1인 값, 곧 <code>Integer.MIN_VALUE</code>다. 오른쪽 시프트는 두 종류다. <code>&gt;&gt;</code>는 빈 왼쪽 자리를 원래의 부호 비트로 채워 부호를 유지하고, <code>&gt;&gt;&gt;</code>는 0으로 채운다. 양수에서는 둘의 결과가 같고 음수에서 갈린다. 오버플로 절에서 본 중간값 문제를 <code>(lo + hi) &gt;&gt;&gt; 1</code>로 풀 수 있는 것도 이 차이 덕분이다. 두 값이 모두 0 이상이면 합은 2<sup>32</sup>보다 작으므로, 합이 넘쳐 음수로 읽히더라도 32비트 자체는 올바른 합을 담고 있다. 0을 채우며 오른쪽으로 한 칸 밀면 올바른 중간값 2050000000이 나온다.</p>
+
+<p>시프트에는 알아 둘 세부 사항이 둘 있다. 첫째, <code>&gt;&gt; 1</code>은 2로 나누는 것과 음수에서 다르다. 명세는 <code>n &gt;&gt; s</code>의 결과가 n을 2의 s제곱으로 나눈 값의 바닥(floor), 곧 작은 쪽으로 내린 값이라고 규정한다. <code>-7 &gt;&gt; 1</code>은 -4인데 <code>-7 / 2</code>는 0을 향해 버리므로 -3이다. 둘째, 미는 칸 수는 그대로 쓰이지 않는다. 왼쪽 피연산자가 int면 오른쪽 피연산자의 아래 5비트만 쓰여서 실제 이동 거리는 항상 0에서 31 사이다(long이면 아래 6비트, 0에서 63). 그래서 <code>1 &lt;&lt; 32</code>는 0이 아니라 1이고, <code>1 &lt;&lt; 33</code>은 2다. 32칸을 밀어 모든 비트를 밀어내려던 코드는 아무것도 밀지 않는다. 큰 값을 만들려면 <code>1L &lt;&lt; 32</code>처럼 long으로 시작해야 한다. 이 식의 값은 4294967296이다.</p>
+
+<h3>흔한 오해 바로잡기, 그리고 다음 회차</h3>
+<p><b>"우선순위가 높은 연산자의 피연산자가 먼저 평가된다."</b> 우선순위는 묶는 구조를 정할 뿐이다. 피연산자는 우선순위나 괄호와 무관하게 왼쪽에서 오른쪽으로 평가된다. <code>a() + b() * c()</code>에서 호출 순서는 a, b, c다.</p>
+
+<p><b>"정수 계산이 범위를 넘으면 오류가 난다."</b> 정수의 덧셈, 뺄셈, 곱셈은 예외를 던지지 않는다. 넘친 윗자리 비트를 버린 값을 조용히 결과로 낸다. 정수 연산에서 예외가 나는 것은 0으로 나누거나 나머지를 구할 때뿐이다.</p>
+
+<p><b>"결과를 double 변수에 넣으면 실수 나눗셈이 된다."</b> 나눗셈의 종류는 두 피연산자의 타입으로 정해진다. <code>double avg = 7 / 2;</code>의 avg는 3.0이다.</p>
+
+<p><b>"% 의 결과는 항상 0 이상이다."</b> 나머지의 부호는 왼쪽 피연산자를 따른다. <code>-7 % 2</code>는 -1이다.</p>
+
+<p><b>"&와 &&는 같은 연산이고 &&가 조금 빠를 뿐이다."</b> <code>&&</code>와 <code>||</code>는 오른쪽 피연산자를 건너뛸 수 있는 제어 흐름이다. null 검사나 0 검사처럼 오른쪽의 안전이 왼쪽 조건에 달린 코드에서는 둘의 차이가 정상 동작과 예외의 차이다.</p>
+
+<p><b>"x += y는 x = x + y의 줄임말일 뿐이다."</b> 복합 대입에는 왼쪽 변수의 타입으로 되돌리는 형변환이 들어 있다. 그래서 <code>=</code>로는 컴파일되지 않는 코드가 컴파일되고, 값이 조용히 잘릴 수 있다.</p>
+
+<p><b>"++i가 i++보다 빠르다."</b> 식의 값을 쓰지 않는 독립된 문장에서 둘은 같은 <code>iinc</code> 명령이 된다. 차이는 그 식의 값을 다른 계산에 쓸 때의 "언제 읽은 값이냐"뿐이다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>식을 읽을 때는 세 가지를 차례로 묻는다. 어떻게 묶이는가(우선순위와 결합 방향), 어떤 순서로 평가되는가(언제나 왼쪽에서 오른쪽, 단 &&와 ||는 오른쪽을 건너뛸 수 있다), 결과의 타입과 범위는 무엇인가(이항 숫자 승격, 그리고 범위를 넘으면 윗자리 비트가 버려진다). 연산자의 동작은 모두 명세가 하나의 결과로 정해 두었고, 그 결과는 바이트코드에서 확인할 수 있다.</p></aside>
+
+<p>이 회차에서 비교 연산자가 조건 분기 명령으로, <code>&&</code>가 건너뛰기로 구현된다는 것을 봤다. 값을 계산하다 보니 어느새 "실행 위치를 바꾸는" 명령을 만난 것이다. 다음 회차의 조건문은 이 분기를 프로그래머가 직접 다루는 문법이다. <code>if (a &lt; b) { … }</code>는 오늘 본 <code>if_icmpge</code>로 본문을 건너뛰는 코드가 되고, 조건식에 쓰는 비교와 논리 연산자의 규칙은 오늘 배운 그대로 적용된다.</p>
+
+<p>이 회차의 내용은 뒤의 강좌에서도 계속 바닥에 깔린다. 정수 오버플로와 정수 나눗셈은 페이지 수 계산, 시간 계산, 통계 집계 코드에서 실제 장애의 원인이 된다. 단락 평가는 null 검사 관용구의 근거다. 비트 연산과 나머지 연산은 자바 중급 2편에서 해시 테이블이 키를 저장할 위치를 정하는 방법을 배울 때 다시 나온다. 문자열 연결이 내부에서 무엇으로 바뀌는지는 자바 중급 1편의 String 회차에서 이어진다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>이항 숫자 승격</dt><dd>산술·비교 연산 전에 피연산자의 타입을 맞춘다. double, float, long 순으로 있으면 그 타입으로, 없으면 양쪽 모두 int로 바꾼다. byte + byte의 결과가 int인 이유다. 승격은 연산자마다 따로 일어난다.</dd>
+<dt>정수 나눗셈과 나머지</dt><dd>정수 나눗셈은 0을 향해 버리고, 나머지는 (a/b)*b + (a%b) == a가 되도록 정해져 부호가 왼쪽 피연산자를 따른다. 정수를 0으로 나누면 ArithmeticException, 실수는 예외 없이 Infinity나 NaN이 된다.</dd>
+<dt>정수 오버플로</dt><dd>결과가 범위를 넘으면 예외 없이 아래 32비트(long은 64비트)만 남는다. 최댓값에 1을 더하면 최솟값이 된다. long으로 계산하거나 Math.addExact 같은 검사 메서드로 막는다.</dd>
+<dt>문자열 연결</dt><dd>피연산자 하나가 String이면 +는 연결이 되고 다른 쪽은 문자열로 변환된다. 왼쪽부터 묶이므로 1 + 2 + "a"는 "3a", "a" + 1 + 2는 "a12"다. JDK 9부터는 invokedynamic 호출로 컴파일된다.</dd>
+<dt>우선순위와 결합 방향</dt><dd>연산자와 피연산자가 묶이는 구조를 정한다. 단항, 산술, 비교, 논리, 대입의 순서로 낮아지고, 같은 순위는 왼쪽부터(대입만 오른쪽부터) 묶인다. 헷갈리면 괄호를 쓴다.</dd>
+<dt>평가 순서</dt><dd>피연산자는 우선순위·괄호와 무관하게 왼쪽에서 오른쪽으로 평가된다(JLS §15.7). 부수 효과나 예외가 있을 때 결과에 드러난다. 식 하나에 부수 효과는 하나만 두는 것이 좋다.</dd>
+<dt>증감 연산자</dt><dd>i++의 값은 증가 전, ++i의 값은 증가 후의 값이다. 지역 int 변수의 증감은 iinc 명령으로 칸을 직접 바꾼다. 독립된 문장으로 쓰면 둘의 바이트코드는 같다.</dd>
+<dt>단락 평가</dt><dd>&&는 왼쪽이 false면, ||는 왼쪽이 true면 오른쪽을 평가하지 않는다. 연산 명령이 아니라 분기 명령으로 구현된다. &와 |는 항상 양쪽을 평가한다.</dd>
+<dt>복합 대입</dt><dd>E1 op= E2는 E1 = (T)((E1) op (E2))와 같다. 왼쪽 변수의 타입으로 되돌리는 형변환이 숨어 있어 값이 조용히 잘릴 수 있다.</dd>
+</x-summary>
+
+<x-review>
+<p>정수 오버플로는 운영 환경에서 가장 발견하기 어려운 종류의 버그다. 예외도 로그도 없이 틀린 숫자가 저장되고, 테스트 데이터의 크기에서는 재현되지 않는다. 시간을 밀리초로 환산하는 코드, 건수와 단가를 곱하는 코드, 페이지 번호와 페이지 크기를 곱해 시작 위치를 구하는 코드, 누적 합계를 구하는 코드가 대표적인 발생 지점이다. 판단 기준은 "입력이 가장 커졌을 때 중간 결과가 21억을 넘을 수 있는가"다. 넘을 수 있으면 long으로 계산하되 첫 피연산자부터 long이 되게 하고, 넘어서는 안 되는 값(금액, 재고 수량)이라면 Math.addExact나 Math.multiplyExact로 넘치는 순간 예외가 나게 하는 편이 틀린 값을 저장하는 것보다 낫다.</p>
+<p>정수 나눗셈은 비율과 평균을 구하는 코드에서 문제를 일으킨다. 30 / 100 * 200은 0이고 30 * 200 / 100은 60이다. 나눗셈을 먼저 하면 소수점 아래가 버려진 뒤라 되살릴 수 없다. 정수로만 계산해야 한다면 곱셈을 먼저 하되 그 곱이 오버플로하지 않는지를 함께 따져야 하고, 그렇지 않다면 한쪽을 실수로 바꿔 계산한다. 나누는 수가 0이 될 수 있는 곳(조회 결과가 0건일 때의 평균 등)은 정수라면 예외로, 실수라면 NaN으로 이어지므로 나누기 전에 분기해야 한다. 실수의 경우 예외가 나지 않기 때문에 NaN이 화면이나 데이터베이스까지 흘러가서야 발견되는 일이 많다.</p>
+<p>단락 평가는 조건의 순서에 의미를 부여한다. 보호 조건(null인가, 비어 있는가, 0인가)은 반드시 왼쪽에, 그 조건이 성립해야 안전한 식은 오른쪽에 둔다. 비용이 큰 검사(데이터베이스 조회, 원격 호출)는 값싼 검사 뒤에 두면 필요할 때만 실행된다. 다만 오른쪽 피연산자에 상태를 바꾸는 호출을 두면 그 호출이 실행될지가 왼쪽 값에 달리게 되어, 나중에 조건의 순서를 바꾸는 리팩터링이 동작을 바꿔 버린다. 조건식은 읽기만 하게 유지한다. boolean 식에 & 나 | 가 쓰인 코드를 리뷰에서 만나면 의도된 것인지 반드시 묻는다.</p>
+<p>평가 순서와 증감 연산자에 관한 지식은 쓰기 위한 것이 아니라 읽기 위한 것이다. i = i++ 나 a++ + ++a 같은 식은 결과가 명세로 정해져 있지만, 읽는 사람이 매번 추적해야 하는 코드는 그 자체로 결함이다. 자바 명세조차 평가 순서에 결정적으로 의존하지 말라고 권한다. 실무 코드에서는 증감을 독립된 문장으로 쓰고, 한 식 안에서 같은 변수를 읽으면서 동시에 바꾸지 않는다. 복합 대입도 왼쪽이 int나 long이고 오른쪽이 같은 종류일 때만 쓰면 숨은 형변환이 문제를 일으킬 일이 없다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 두 줄의 출력을 예측하고, 각 <code>+</code>가 덧셈인지 문자열 연결인지를 왼쪽부터 차례로 밝혀라. <pre><code class="language-java">System.out.println(1 + 2 + "3" + 4 + 5);
+System.out.println('a' + 1 + "b");</code></pre></li>
+<li>다음 코드를 실행한 뒤 <code>a</code>와 <code>b</code>의 값을 구하라. 피연산자가 평가되는 순서대로 a의 값이 어떻게 변하는지 적어 보라. <pre><code class="language-java">int a = 3;
+int b = a++ * 2 + --a;</code></pre></li>
+<li>다음 코드의 두 출력 가운데 하나는 틀린 값이다. 어느 것이 왜 틀렸는지 설명하고, 고친 코드를 써라. 틀린 값이 음수가 아닌 이유도 설명해 보라. <pre><code class="language-java">long dayMillis = 24 * 60 * 60 * 1000;
+long yearMillis = 365 * 24 * 60 * 60 * 1000;
+System.out.println(dayMillis);
+System.out.println(yearMillis);</code></pre></li>
+<li><code>int x = 0;</code>일 때 <code>boolean r = (x != 0) && (10 / x > 1);</code>은 정상적으로 false가 되지만 <code>&&</code>를 <code>&</code>로 바꾸면 예외가 난다. 두 경우에 실행되는 명령의 차이로 이유를 설명하라.</li>
+<li><code>byte b = 100; b += 100; System.out.println(b);</code>의 출력을 구하고 그 값이 나오는 과정을 비트로 설명하라. <code>b = b + 100;</code>이라고 쓰면 왜 컴파일되지 않는지도 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 첫 줄은 <code>3345</code>다. 왼쪽부터 묶으면 <code>(((1 + 2) + "3") + 4) + 5</code>다. 첫 <code>+</code>는 int와 int라서 덧셈이고 3이 된다. 둘째 <code>+</code>는 int와 String이라서 연결이고 "33"이 된다. 그 뒤로는 왼쪽이 String이므로 모두 연결이어서 "334", "3345"가 된다. 한번 String이 되면 그 오른쪽의 <code>+</code>는 전부 연결이다. 둘째 줄은 <code>98b</code>다. 첫 <code>+</code>는 char와 int이므로 이항 숫자 승격으로 int 덧셈이 되어 97 + 1 = 98이고, 둘째 <code>+</code>에서 "b"와 연결된다. 문자 a 뒤에 붙이려는 의도였다면 <code>"" + 'a' + 1 + "b"</code>처럼 첫 연산부터 연결이 되게 해야 한다.</p>
+<p><b>2.</b> a = 3, b = 9다. 식은 <code>(a++ * 2) + (--a)</code>로 묶이고, 평가는 왼쪽부터다. 먼저 <code>a++</code>: 값은 3, a는 4가 된다. 다음 리터럴 2. 곱셈 3 × 2 = 6. 다음 <code>--a</code>: a를 3으로 줄이고 값은 3. 덧셈 6 + 3 = 9. a는 4가 되었다가 다시 3으로 돌아왔다. 곱셈의 우선순위가 높다고 해서 <code>--a</code>보다 나중에 평가되는 것이 아니라, 곱셈의 피연산자들이 왼쪽에 있어서 먼저 평가된 것이다.</p>
+<p><b>3.</b> 틀린 것은 yearMillis다. 출력은 86400000과 1471228928이다. 오른쪽 식의 리터럴이 모두 int이므로 곱셈이 int로 수행된다. 하루는 86,400,000으로 int 범위 안이지만 일 년은 31,536,000,000으로 범위를 넘는다. 결과는 수학적 값의 아래 32비트이고, 이는 31,536,000,000에서 2의 32제곱(4,294,967,296)을 일곱 번 뺀 1,471,228,928이다. 아래 32비트의 최상위 비트가 우연히 0이었기 때문에 양수로 보일 뿐이다. 오버플로의 결과가 항상 음수인 것은 아니다. 고치려면 첫 피연산자를 long으로 만든다: <code>long yearMillis = 365L * 24 * 60 * 60 * 1000;</code> 이렇게 하면 첫 곱셈부터 long으로 승격되어 31536000000이 나온다. 변수의 타입이 long인 것만으로는 소용이 없다. 대입은 계산이 끝난 뒤에 일어난다.</p>
+<p><b>4.</b> <code>&&</code>는 분기로 컴파일된다. 왼쪽 <code>x != 0</code>의 결과가 false이면 오른쪽 피연산자에 해당하는 명령들, 곧 x를 읽어 10을 나누는 <code>idiv</code>와 비교를 건너뛰어 곧바로 false를 결과로 낸다. <code>idiv</code>가 실행되지 않으므로 예외가 날 수 없다. <code>&</code>는 두 피연산자를 모두 계산해 스택에 올린 뒤 <code>iand</code>로 합치는 연산이다. 왼쪽이 false여도 오른쪽의 <code>10 / x</code>가 실행되고, x가 0이므로 <code>idiv</code>가 ArithmeticException(/ by zero)을 던진다.</p>
+<p><b>5.</b> 출력은 <code>-56</code>이다. <code>b += 100</code>은 <code>b = (byte)(b + 100)</code>이다. b가 int로 승격되어 100 + 100 = 200이 계산된다. 200은 이진수로 <code>1100 1000</code>(128 + 64 + 8)이고, int 32비트 가운데 아래 8비트만 남기면 <code>11001000</code>이다. byte에서 최상위 비트의 자릿값은 -128이므로 -128 + 64 + 8 = -56이다. <code>b = b + 100;</code>은 오른쪽 식 <code>b + 100</code>의 타입이 승격 규칙에 따라 int이고, int를 byte 변수에 대입하는 것은 값을 잃을 수 있는 변환이라 형변환 없이 허용되지 않는다. 복합 대입은 그 형변환을 연산자 안에 포함하고 있어서 컴파일되지만, 그만큼 값이 잘리는 것을 알려 주지도 않는다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>int r = f() + g() * h();</code>에서 세 메서드가 호출되는 순서로 옳은 것은?</q>
+<o>g, h, f — 곱셈의 우선순위가 높으므로 곱셈의 피연산자가 먼저 평가된다.</o>
+<o>f, g, h — 피연산자는 우선순위와 무관하게 왼쪽에서 오른쪽으로 평가된다.</o>
+<o>정해져 있지 않다 — 컴파일러와 JVM에 따라 달라진다.</o>
+<o>h, g, f — 스택 기계는 오른쪽 피연산자부터 쌓는다.</o>
+<why>JLS §15.7은 피연산자가 왼쪽에서 오른쪽으로 평가되는 것처럼 보이도록 보장한다. 우선순위는 g()와 h()의 결과가 먼저 곱해진다는 것, 곧 연산이 묶이는 구조만 정한다. 바이트코드도 f, g, h를 차례로 호출해 스택에 쌓은 뒤 imul, iadd를 실행한다. 이 순서는 명세가 정한 것이어서 구현에 따라 달라지지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>int i = 5; i = i++;</code>를 실행한 뒤 <code>i</code>의 값과 그 이유로 옳은 것은?</q>
+<o>6 — i++가 i를 6으로 만들고 대입은 같은 값을 다시 넣기 때문이다.</o>
+<o>7 — 증가가 두 번 일어나기 때문이다.</o>
+<o>5 — i++의 값(증가 전의 5)이 먼저 스택에 올라가고, 칸이 6으로 늘어난 뒤, 대입이 스택의 5를 칸에 덮어쓰기 때문이다.</o>
+<o>컴파일 오류 — 같은 변수를 한 식에서 두 번 바꿀 수 없다.</o>
+<why>바이트코드는 iload(5를 스택에), iinc(칸을 6으로), istore(스택의 5를 칸에)의 순서다. 후위 증가식의 값은 증가 전의 값이고, 대입은 오른쪽 식의 평가가 부수 효과까지 끝난 뒤에 수행된다. 증가는 일어나지만 곧바로 덮어써진다. 자바는 이런 식을 금지하지 않으며 결과는 명세로 정해져 있다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>Integer.MAX_VALUE + 1</code>의 결과에 대한 설명으로 옳은 것은?</q>
+<o>예외 없이 Integer.MIN_VALUE가 된다. 수학적 합의 아래 32비트만 남기 때문이다.</o>
+<o>ArithmeticException이 발생한다.</o>
+<o>자동으로 long으로 바뀌어 2147483648이 된다.</o>
+<o>Integer.MAX_VALUE에 머문다. 정수는 최댓값에서 더 커지지 않는다.</o>
+<why>두 피연산자가 int이므로 int 덧셈(iadd)이고, 정수 연산은 오버플로를 알리지 않는다. 0111…1에 1을 더한 비트열 1000…0은 2의 보수에서 최솟값이다. 결과 타입은 피연산자의 타입으로 정해지므로 저절로 long이 되지 않는다. 넘침을 예외로 알고 싶으면 Math.addExact를 쓴다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>s != null && s.length() > 0</code>이 s가 null일 때도 안전한 이유는?</q>
+<o>JVM이 null에 대한 메서드 호출을 자동으로 무시하기 때문이다.</o>
+<o>&&가 &보다 우선순위가 높아서 null 검사가 먼저 계산되기 때문이다.</o>
+<o>컴파일러가 s.length()를 미리 계산해 상수로 바꿔 두기 때문이다.</o>
+<o>&&는 왼쪽이 false이면 오른쪽 피연산자의 명령을 분기로 건너뛰어, s.length()가 아예 실행되지 않기 때문이다.</o>
+<why>JLS §15.23에 따라 &&는 왼쪽 값이 true일 때만 오른쪽을 평가한다. 바이트코드에서는 왼쪽 검사 뒤에 조건 분기가 있어 오른쪽 코드를 지나친다. &로 바꾸면 양쪽이 모두 평가되어 NullPointerException이 난다. null에 대한 메서드 호출은 무시되지 않고 예외가 되며, 이 문제는 우선순위가 아니라 평가 여부의 문제다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>byte b = 10;</code>일 때 <code>b += 5;</code>는 컴파일되고 <code>b = b + 5;</code>는 컴파일되지 않는 이유는?</q>
+<o>+=는 byte 전용 덧셈 명령을 쓰고, +는 int 전용 명령을 쓰기 때문이다.</o>
+<o>b + 5는 이항 숫자 승격으로 int 타입이 되어 byte에 그냥 넣을 수 없지만, 복합 대입은 왼쪽 변수의 타입으로 바꾸는 형변환을 포함하기 때문이다.</o>
+<o>+=는 오른쪽이 리터럴일 때만 허용되는 특별 문법이기 때문이다.</o>
+<o>b = b + 5에서는 b가 두 번 평가되어 값이 달라질 수 있기 때문이다.</o>
+<why>JLS §15.26.2는 E1 op= E2를 E1 = (T)((E1) op (E2))로 정의한다. b += 5의 바이트코드에는 iadd 뒤에 i2b가 들어 있다. JVM에는 byte 덧셈 명령이 없고 두 경우 모두 int로 더한다. 차이는 결과를 byte로 좁히는 변환을 컴파일러가 넣어 주느냐뿐이다. 그 대가로 b += 120처럼 범위를 넘는 경우에도 경고 없이 값이 잘린다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>피연산자(operand)</dt><dd>연산자가 계산의 대상으로 삼는 값. a + b에서 a와 b. 피연산자 자체가 다시 식일 수 있다.</dd>
+<dt>부수 효과(side effect)</dt><dd>식이 값을 내는 것 외에 프로그램의 상태를 바꾸는 작용. 대입, 증감, 출력이나 데이터 변경을 하는 메서드 호출이 해당한다.</dd>
+<dt>이항 숫자 승격(binary numeric promotion)</dt><dd>이항 연산의 두 피연산자를 계산 전에 같은 타입으로 맞추는 규칙. double, float, long 순으로 맞추고 없으면 둘 다 int가 된다(JLS §5.6).</dd>
+<dt>오버플로(overflow)</dt><dd>연산 결과가 타입의 범위를 넘는 것. 자바의 정수 연산은 예외 없이 결과의 하위 비트만 남긴다.</dd>
+<dt>우선순위(precedence)</dt><dd>서로 다른 연산자가 섞였을 때 어느 연산자가 피연산자를 먼저 차지하는지를 정하는 규칙. 식이 묶이는 구조를 결정한다.</dd>
+<dt>결합 방향(associativity)</dt><dd>우선순위가 같은 연산자가 나란히 있을 때 묶는 방향. 대입 연산자는 오른쪽부터, 나머지 이항 연산자는 왼쪽부터다.</dd>
+<dt>평가 순서(evaluation order)</dt><dd>피연산자의 값이 구해지는 시간 순서. 자바는 왼쪽에서 오른쪽을 보장한다(JLS §15.7).</dd>
+<dt>단락 평가(short-circuit evaluation)</dt><dd>&&와 ||가 왼쪽 피연산자만으로 결과가 정해지면 오른쪽 피연산자를 평가하지 않는 것.</dd>
+<dt>복합 대입 연산자(compound assignment operator)</dt><dd>+=, -=처럼 연산과 대입을 합친 연산자. 결과를 왼쪽 변수의 타입으로 바꾸는 형변환을 포함한다.</dd>
+<dt>상수식(constant expression)</dt><dd>리터럴과 연산자 등으로만 이루어져 컴파일 시점에 값이 정해지는 식. 컴파일러가 미리 계산해 클래스 파일에 넣는다(JLS §15.29).</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html">JLS 15장 Expressions</a> — 평가 순서(§15.7), 증감(§15.14.2, §15.15.1), 나눗셈·나머지(§15.17), 문자열 연결과 오버플로(§15.18), 시프트(§15.19), 비교(§15.20~21), 단락 평가(§15.23~24), 복합 대입(§15.26.2)</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-5.html">JLS §5.6 Numeric Contexts</a> — 숫자 승격 규칙과 이항 숫자 승격의 정의</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-6.html">JVMS 6장 The Java Virtual Machine Instruction Set</a> — iadd, idiv, irem, iinc, if_icmp 계열, dcmp 계열 명령어의 정의</li>
+<li><a href="https://docs.oracle.com/javase/tutorial/java/nutsandbolts/operators.html">The Java Tutorials — Operators</a> — 연산자 우선순위 표</li>
+<li><a href="https://openjdk.org/jeps/280">JEP 280: Indify String Concatenation</a> — JDK 9에서 문자열 연결의 바이트코드를 invokedynamic으로 바꾼 배경</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Math.html">Math (Java SE 21 API)</a> — addExact, multiplyExact, floorMod, floorDiv, abs의 명세</li>
+</x-refs>

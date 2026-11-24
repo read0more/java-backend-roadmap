@@ -1,0 +1,11 @@
+- 02: 2026-11-18 확인 41건 · 수정 2건 — String이 네 규칙을 갖춘 클래스라는 서술을 hash 캐시 필드는 final 아님(OpenJDK 21)으로 정정, final 대입 허용 위치에 선언·초기화 블록 추가
+- 01: 2026-11-18 확인 62건 · 수정 3건 — Object 변수로 열한 개 메서드 호출 가능 서술을 protected(clone·finalize) 제외로 정정, String.valueOf 상수 풀 번호·String.java 줄 번호를 Temurin 21.0.13 기준으로 한정
+- 03: 2026-11-18 확인 58건 · 수정 2건 — length() 구현을 value.length >> coder 에서 실제 소스 value.length >> coder() 로 정정, String(String) 생성자가 대입하는 필드에 hashIsZero 추가(Temurin 21.0.13 소스)
+- 04: 2026-11-18 확인 49건 · 수정 3건 — 컴파일 오류 캐럿 위치를 실제 javac 출력으로, compare/compareTo 반환값을 Javadoc 규약(음수·0·양수)과 구현(-1·0·1)으로 구분, Math.round의 long 반환을 double 인자로 한정
+- 05: 2026-11-18 확인 52건 · 수정 2건 — 연습 5 해설의 배열 수 4개를 OpenJDK 21 기준 5개(valueOf가 values() 복제본을 Class에 보관)로 정정, SwitchMap의 NoSuchFieldError 서술을 실험으로 확인한 동작으로 좁힘
+- 06: 2026-11-18 확인 62건 · 수정 4건 — STRICT yyyy 예외 메시지의 필드 나열 순서 고정 인용 제거(실행마다 다름), ZoneOffset 필드 서술·인자 없는 now() 범위 좁힘, 오프셋 저장 이유를 효과 서술로 변경
+- 07: 2026-11-18 확인 58건 · 수정 3건 — 네스트 결정 시점 서술에 JVMS 5.4.4의 API 선결정 예외 반영, InnerClasses 복원 용도를 접근 플래그 항목으로 한정, 튜토리얼 인용을 합성 필드에서 합성 요소로 정정
+- 09: 2026-11-18 확인 48건 · 수정 5건 — Div 스택 트레이스 행 번호 7→8, Throwable 생성자를 public 생성자로 한정, 타입 추론→타입 인자, RuntimeException 이름 유래 서술을 JLS 11.1.1 표현으로 교체, LineNumberTable이 발췌에서 생략됨을 명시
+- 07: 2026-11-18 확인 48건 · 수정 0건 — 수정 없음. 예제 16개·오류 문구·javap 발췌(release 8/17/18/21)를 JDK 21.0.13에서 재실행, JLS/JVMS/JEP 181·395/JDK 18 릴리스 노트/JDK 소스 대조 모두 일치
+- 08: 2026-11-18 확인 46건 · 수정 1건 — 람다 동일성 실험 서술을 좁힘: 지역 변수 미캡처 람다는 같은 객체 → this도 캡처하지 않을 때만 같은 객체(this 캡처 시 매번 새 객체, JDK 21.0.13 실행 확인)
+- 10: 2026-11-18 확인 73건 · 수정 4건 — 스택 트레이스 Main.java:59→43(실행값), finally return 바이트코드 설명(athrow 미생성)과 퀴즈 해설 정정, 자원 변수 범위 근거 JLS 6.3 명시

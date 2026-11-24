@@ -1,0 +1,807 @@
+<x-meta>
+deck: 서비스에 남은 SQLException 의존을 런타임 예외 전환으로 끊고, 스프링 예외 변환기와 DataAccessException 계층, JdbcTemplate의 템플릿 콜백 구조를 소스 수준까지 따라간다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>인터페이스를 구현한 메서드가 체크 예외를 마음대로 던질 수 없는 이유를 JLS 규칙과 실제 컴파일 오류로 설명하고, throws 절이 클래스 파일의 Exceptions 속성에 기록될 뿐 JVM은 그것을 강제하지 않는다는 사실을 javap로 확인할 수 있다.</li>
+<li>SQLException을 원인(cause)을 보존한 런타임 예외로 감싸 던지고, 원인을 빠뜨렸을 때 스택 트레이스에서 무엇이 사라지는지 실행 결과로 보여 줄 수 있다.</li>
+<li>SQLException이 담은 세 가지 정보(메시지, SQLState, 제조사 오류 코드)를 구분하고, 키 중복처럼 복구할 수 있는 실패만 골라 별도 예외로 바꿔 서비스에서 복구하는 코드를 작성할 수 있다.</li>
+<li>스프링의 세 가지 SQLExceptionTranslator가 SQLException을 DataAccessException 하위 예외로 바꾸는 경로를 Spring Framework 6.0 이후의 기본값 기준으로 추적하고, 변환 결과가 null인 경우를 처리할 수 있다.</li>
+<li>JdbcTemplate이 커넥션 획득, 문장 준비, 예외 변환, 자원 반납을 템플릿 쪽으로 가져가는 구조를 소스로 설명하고, 트랜잭션 동기화와 함께 같은 커넥션을 쓴다는 것을 실행으로 확인할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 서비스는 아직 JDBC를 알고 있다</h3>
+
+<p>이 권은 지금까지 데이터 접근 코드를 한 겹씩 정리해 왔다. 04회에서는 트랜잭션 매니저와 트랜잭션 동기화, <code>@Transactional</code>로 서비스 계층에서 커넥션과 트랜잭션을 다루는 코드를 걷어 냈다. 05회에서는 자바 예외의 기본 규칙, 즉 체크 예외는 잡거나 던진다고 선언해야 하고 언체크 예외는 그럴 필요가 없다는 것과 각각을 언제 쓰는지 정리했다. 이 회차는 그 두 결과를 합쳐서 남은 문제를 푼다.</p>
+
+<p>트랜잭션 코드를 걷어 낸 서비스가 어떤 모습인지 다시 보자. 계좌 이체 서비스라고 하면 대략 이렇다. 비즈니스 로직만 남았지만 시그니처에 <code>throws SQLException</code>이 붙어 있다. 리포지토리 메서드가 JDBC의 체크 예외인 <code>SQLException</code>을 던지기 때문에, 서비스도 그것을 잡거나 다시 던진다고 선언해야 한다. 서비스는 그 예외로 할 수 있는 일이 없는데도 그렇다.</p>
+
+<pre><code class="language-java">public class TransferService {
+
+    private final JdbcAccountRepository repository;   // 구체 클래스에 의존
+
+    @Transactional
+    public void transfer(String fromId, String toId, int amount) throws SQLException {
+        Account from = repository.findById(fromId);
+        Account to = repository.findById(toId);
+        repository.update(fromId, from.balance() - amount);
+        repository.update(toId, to.balance() + amount);
+    }
+}</code></pre>
+
+<p>이 코드에 남은 문제는 세 가지다. 첫째, 서비스가 <code>java.sql.SQLException</code>이라는 JDBC 전용 타입을 알고 있다. 데이터 접근 기술을 JPA로 바꾸면 이 시그니처가 의미를 잃는다. 둘째, 같은 실패라도 데이터베이스마다 다른 번호로 알려 준다. "이미 있는 키를 넣었다"는 상황을 H2는 23505번으로, MySQL은 1062번으로 알린다. 서비스가 특정 실패를 골라 복구하려면 그 번호를 알아야 하는데, 그러면 서비스가 데이터베이스 제조사에까지 묶인다. 셋째, 리포지토리의 메서드마다 커넥션을 얻고, 문장을 준비하고, 예외를 잡고, 자원을 닫는 같은 코드가 반복된다.</p>
+
+<p>이 회차는 이 세 문제를 차례로 푼다. 첫 번째는 체크 예외를 런타임 예외로 바꿔 던지는 예외 전환으로, 두 번째는 스프링의 데이터 접근 예외 계층과 예외 변환기로, 세 번째는 <code>JdbcTemplate</code>으로 푼다. 각 단계에서 코드만 바꾸는 것이 아니라 그 아래에서 일어나는 일을 확인한다. 컴파일러가 체크 예외를 어떻게 강제하는지, 예외를 감쌀 때 바이트코드와 스택 트레이스에 무엇이 남는지, 스프링이 어떤 정보를 보고 예외를 분류하는지, 템플릿이 커넥션을 언제 얻고 언제 놓는지다.</p>
+
+<p>실험 환경을 밝혀 둔다. 이 회차의 실행 결과는 JDK 21.0.13(Temurin), H2 2.4.240, Spring Framework 7.0.9 jar로 직접 실행해 얻었다. 이 강좌의 기준 버전은 Spring Framework 6.x이므로, 이 회차에서 소스를 인용하는 핵심 동작(기본 예외 변환기의 선택, 키 중복 판정, <code>JdbcTemplate</code>의 실행 흐름)은 Spring Framework 6.1.x 브랜치의 소스와도 대조해 같은 것을 확인했다. 예제의 테이블은 01회와 같은 <code>account(account_id varchar(10) primary key, balance integer not null)</code>이고, 도메인 객체는 다음 레코드 하나다.</p>
+
+<pre><code class="language-java">public record Account(String accountId, int balance) {}</code></pre>
+
+<h3>체크 예외와 인터페이스: 시그니처로 새어 나오는 기술</h3>
+
+<p>서비스가 구체 클래스 <code>JdbcAccountRepository</code>에 의존하는 문제부터 보자. 스프링 핵심 원리에서 다룬 대로, 구현을 바꿀 수 있게 하려면 서비스는 역할, 즉 인터페이스에 의존해야 한다. 그래서 리포지토리 인터페이스를 하나 만든다. 이 인터페이스에는 데이터 접근 기술에 관한 단어가 하나도 없다. 계좌를 저장하고, 찾고, 잔액을 바꾸고, 지운다는 역할만 있다.</p>
+
+<pre><code class="language-java">public interface AccountRepository {
+    Account save(Account account);
+    Account findById(String accountId);
+    void update(String accountId, int balance);
+    void delete(String accountId);
+}</code></pre>
+
+<p>이제 JDBC로 이 인터페이스를 구현해 보자. JDBC 메서드는 거의 모두 <code>SQLException</code>을 던진다. 01회에서 작성한 코드처럼 그 예외를 메서드 밖으로 던지려고 <code>throws SQLException</code>을 붙이면 컴파일이 되지 않는다. 다음은 그 상황을 최소한으로 줄인 코드와 javac 21이 실제로 낸 오류다.</p>
+
+<pre><code class="language-java">interface AccountRepository {
+    void save(String id, int balance);
+}
+
+class JdbcAccountRepository implements AccountRepository {
+    @Override
+    public void save(String id, int balance) throws SQLException {
+        throw new SQLException("boom");
+    }
+}</code></pre>
+
+<pre data-label="javac 21 출력"><code class="language-text">Repo.java:7: error: save(String,int) in JdbcAccountRepository cannot implement save(String,int) in AccountRepository
+    public void save(String id, int balance) throws SQLException {
+                ^
+  overridden method does not throw SQLException
+1 error</code></pre>
+
+<p>이 오류의 근거는 Java 언어 명세(JLS) 11.2절이다. 명세는 재정의(overriding)하는 메서드의 throws 절이, 재정의되는 메서드가 자신의 throws 절로 허락하지 않은 체크 예외를 던진다고 선언할 수 없다고 정한다(상세 규칙은 8.4.8.3절). 인터페이스의 추상 메서드를 구현하는 것도 재정의이므로 같은 규칙이 적용된다. 구현 메서드는 인터페이스가 선언한 체크 예외와 그 하위 타입만 던질 수 있다. 선언을 줄이거나 아예 빼는 것은 자유지만 늘리는 것은 안 된다.</p>
+
+<p>이 규칙이 왜 필요한지는 호출하는 쪽에서 보면 분명하다. 서비스는 <code>AccountRepository</code> 타입의 변수로 <code>save</code>를 호출한다. 컴파일러는 그 변수에 실제로 어떤 구현 객체가 들어올지 모른다. 컴파일러가 아는 것은 인터페이스의 선언뿐이고, 그 선언에 체크 예외가 없으니 호출하는 쪽에 <code>try-catch</code>를 요구하지 않는다. 그런데 구현이 몰래 <code>SQLException</code>을 던질 수 있다면, "처리하지 않은 체크 예외가 없다"는 컴파일러의 보증이 깨진다. 그래서 명세는 구현 쪽의 선언을 막는다. 이것은 리스코프 치환 원칙을 예외에 적용한 것으로 볼 수 있다. 상위 타입의 약속보다 더 많은 실패를 하위 타입이 만들어 내면 안 된다.</p>
+
+<p>그러면 남은 길은 인터페이스에 <code>throws SQLException</code>을 붙이는 것이다. 컴파일은 된다. 그러나 이 순간 인터페이스가 <code>java.sql</code> 패키지에 의존하게 된다. 기술에 대해 아무것도 몰라야 할 역할 정의에 JDBC 전용 타입이 박힌다. 나중에 JPA로 구현을 하나 더 만든다고 하자. JPA 구현은 <code>SQLException</code>을 던질 일이 없다. 그래도 인터페이스에 선언이 남아 있으니 서비스는 계속 <code>SQLException</code>을 잡거나 던져야 한다. 파일에 저장하는 구현을 만들어 <code>IOException</code>을 던지게 하려면 인터페이스를 다시 고쳐야 하고, 인터페이스를 쓰는 모든 코드가 함께 고쳐진다. 인터페이스를 둔 목적, 즉 구현을 바꿔도 사용하는 쪽이 영향을 받지 않게 하는 것이 체크 예외 하나 때문에 무너진다.</p>
+
+<h4>throws Exception이라는 탈출구가 더 나쁜 이유</h4>
+
+<p>인터페이스에 <code>throws Exception</code>을 선언하면 어떤 구현이든 어떤 체크 예외든 던질 수 있으니 문제가 풀린 것처럼 보인다. 실제로는 더 나빠진다. <code>Exception</code>은 모든 체크 예외의 상위 타입이므로, 이 선언은 "무엇이든 실패할 수 있다"는 말과 같다. 호출하는 쪽은 어떤 예외가 올지 알 수 없으니 <code>catch (Exception e)</code>로 한꺼번에 받거나 자기도 <code>throws Exception</code>을 선언한다. 그렇게 위로 올라갈수록 시그니처마다 <code>throws Exception</code>이 퍼진다.</p>
+
+<p>더 큰 문제는 컴파일러가 더 이상 아무것도 도와주지 못한다는 점이다. 체크 예외의 존재 이유는 "이 메서드는 이런 실패를 할 수 있으니 처리를 결정하라"고 컴파일 시점에 알려 주는 것이다. <code>Exception</code>으로 뭉뚱그리면 그 정보가 사라진다. 게다가 <code>catch (Exception e)</code>는 <code>RuntimeException</code>까지 잡는다. <code>RuntimeException</code>은 <code>Exception</code>의 하위 클래스이기 때문이다. 그래서 데이터베이스 오류를 처리하려고 쓴 catch 블록이 코드의 버그로 생긴 <code>NullPointerException</code>까지 삼켜 버리는 일이 생긴다. 체크 예외를 정확히 선언하는 것보다도, 아예 런타임 예외로 바꾸는 것보다도 나쁜 선택이다.</p>
+
+<x-visual id="spring-db1-06-exception-leak" title="체크 예외가 인터페이스를 거쳐 서비스까지 새어 나오는 의존 관계와, 예외 전환 뒤의 의존 관계" kind="의존 관계 비교도" ratio="16:9">
+<x-hint>왼쪽은 SQLException이 리포지토리 구현에서 인터페이스와 서비스로 번지는 모습, 오른쪽은 구현 안에서 런타임 예외로 바뀌어 인터페이스와 서비스가 java.sql에서 자유로워진 모습을 대비한다.</x-hint>
+<x-prompt>좌우 2분할 비교 다이어그램. 왼쪽 패널 제목 "전환 전". 위에서 아래로 상자 세 개: "서비스", "AccountRepository 인터페이스", "JDBC 구현". 맨 아래 상자 옆에 빨간 칩 "SQLException". 빨간 칩에서 위쪽 두 상자까지 빨간 점선 화살표가 올라가며, 두 상자 모두 오른쪽 위에 작은 빨간 태그 "throws SQLException"이 붙어 있다. 오른쪽 패널 제목 "전환 후". 같은 상자 세 개를 같은 위치에 둔다. 맨 아래 "JDBC 구현" 상자 안쪽에서 빨간 칩 "SQLException"이 회색 화살표를 따라 파란 칩 "런타임 예외"로 바뀐다. 위쪽 두 상자에는 태그가 없고 초록색 테두리. 파란 칩에서 서비스 상자 오른쪽 옆으로 가는 가는 파란 화살표 하나, 라벨 "필요할 때만 잡는다". 평면 기술 도해 스타일, 흰 배경.</x-prompt>
+<x-caption>체크 예외는 선언을 타고 위로 번진다. 구현 안에서 런타임 예외로 바꾸면 인터페이스와 서비스는 기술에서 자유로워진다.</x-caption>
+</x-visual>
+
+<h3>한 층 아래: throws 절은 JVM에게 무엇인가</h3>
+
+<p>체크 예외 규칙이 이렇게 엄격하다면, JVM도 실행할 때 이 규칙을 검사할까. 클래스 파일을 열어 보면 답이 나온다. <code>throws SQLException</code>을 선언한 인터페이스를 컴파일하고 <code>javap -v</code>로 보면 메서드 정보에 다음과 같은 항목이 붙어 있다.</p>
+
+<pre data-label="javap -v CheckedRepo (일부, javac 21)"><code class="language-text">  public abstract void save(java.lang.String, int) throws java.sql.SQLException;
+    descriptor: (Ljava/lang/String;I)V
+    flags: (0x0401) ACC_PUBLIC, ACC_ABSTRACT
+    Exceptions:
+      throws java.sql.SQLException</code></pre>
+
+<p>눈여겨볼 것은 메서드 서술자(descriptor) <code>(Ljava/lang/String;I)V</code>에 예외가 들어 있지 않다는 점이다. JVM이 메서드를 찾고 연결할 때 쓰는 것은 이름과 서술자다. throws 절은 서술자와 별개로 <code>Exceptions</code>라는 속성(attribute)에 따로 기록된다. 그래서 throws 절만 다른 두 메서드는 JVM이 보기에 같은 메서드다.</p>
+
+<p>JVM 명세(JVMS) 4.7.5절은 <code>Exceptions</code> 속성이 메서드가 던질 수 있는 체크 예외를 나타낸다고 정의하고, 메서드가 예외를 던져도 되는 조건 세 가지(<code>RuntimeException</code>의 하위 타입, <code>Error</code>의 하위 타입, 이 속성에 적힌 예외의 하위 타입)를 나열한 뒤, 이 요구 사항은 JVM이 강제하지 않으며 컴파일 시점에만 강제된다고 밝힌다. JLS 11.2절도 같은 내용을 언어 쪽에서 말한다. 예외 처리기의 존재를 검사하는 것은 컴파일 시점 검사(compile-time checking)이고, 언체크 예외 클래스는 그 검사에서 빠진다. 즉 체크 예외는 컴파일러와 개발자 사이의 계약이다. 실행 중의 JVM에게 <code>SQLException</code>은 <code>RuntimeException</code>과 똑같이 그냥 던져지는 <code>Throwable</code> 객체다.</p>
+
+<p>이 사실은 예외 전환을 이해하는 데 중요하다. 체크 예외를 런타임 예외로 바꾼다고 해서 실행 시점의 비용 구조나 전파 방식이 달라지는 것이 아니다. 바뀌는 것은 컴파일러가 호출하는 쪽에 처리를 요구하느냐 마느냐, 그리고 시그니처에 무엇이 새어 나오느냐뿐이다. 예외를 잡아서 다른 예외로 감싸 던지는 코드가 바이트코드로 어떻게 되는지도 보자. 다음은 <code>SQLException</code>을 잡아 런타임 예외로 감싸는 짧은 메서드다.</p>
+
+<pre><code class="language-java">static void wrapped() {
+    try {
+        lowLevel();                       // throws SQLException
+    } catch (SQLException e) {
+        throw new MyDbException(e);
+    }
+}</code></pre>
+
+<pre data-label="javap -c (wrapped 메서드, javac 21)"><code class="language-text">  static void wrapped();
+    Code:
+       0: invokestatic  #16                 // Method lowLevel:()V
+       3: goto          16
+       6: astore_0
+       7: new           #21                 // class MyDbException
+      10: dup
+      11: aload_0
+      12: invokespecial #23                 // Method MyDbException."<init>":(Ljava/lang/Throwable;)V
+      15: athrow
+      16: return
+    Exception table:
+       from    to  target type
+           0     3     6   Class java/sql/SQLException</code></pre>
+
+<p>한 줄씩 따라가 보자. 정상 흐름에서는 0번에서 <code>lowLevel</code>을 호출하고, 3번의 <code>goto</code>로 16번 <code>return</code>에 간다. catch 블록의 코드(6~15번)는 정상 흐름에서는 실행되지 않는다. <code>try</code> 블록은 바이트코드 명령으로 존재하지 않고, 아래쪽의 예외 테이블(exception table) 한 줄로만 존재한다. "0번 이상 3번 미만에서 <code>SQLException</code>(또는 그 하위 타입)이 던져지면 6번으로 가라"는 뜻이다.</p>
+
+<p><code>lowLevel</code> 안에서 <code>SQLException</code>이 던져지면 JVM은 그 메서드에 처리기가 없으므로 프레임을 버리고 호출자인 <code>wrapped</code>로 돌아와, 예외가 발생한 위치(0번 호출 명령)를 예외 테이블과 맞춰 본다. 범위와 타입이 맞으니 피연산자 스택을 비우고 예외 객체의 참조만 올려놓은 채 6번으로 점프한다. 6번 <code>astore_0</code>가 그 참조를 지역 변수 0번, 즉 소스의 <code>e</code>에 저장한다. 7번 <code>new</code>가 힙에 <code>MyDbException</code> 객체를 할당하고, <code>dup</code>으로 참조를 복제한 뒤, <code>aload_0</code>으로 원래 예외 참조를 올리고, 12번에서 <code>Throwable</code>을 받는 생성자를 호출한다. 15번 <code>athrow</code>가 새 예외를 던진다. 이 지점부터 <code>wrapped</code>의 호출자는 <code>SQLException</code>이 아니라 <code>MyDbException</code>을 받는다.</p>
+
+<pre class="diagram">  예외가 던져진 순간의 힙
+
+  wrapped() 프레임                         힙
+  ┌──────────────────┐
+  │ 지역 변수 0 (e) ──┼──────────────▶  SQLException 객체
+  └──────────────────┘                   ├ detailMessage = "Unique index ..."
+                                         ├ SQLState = "23505"
+  athrow 로 던져지는 참조 ─────────────▶  MyDbException 객체
+                                         ├ detailMessage = "java.sql.SQLException: Unique ..."
+                                         ├ cause ──────────▶ (위의 SQLException 객체)
+                                         └ stackTrace = wrapped, main ...</pre>
+
+<p>새 예외 객체는 원래 예외 객체를 <code>cause</code> 필드로 가리킨다. 원래 예외가 복사되는 것이 아니라 참조로 연결된다는 점을 기억해 두자. 또 <code>Throwable</code>의 생성자는 <code>fillInStackTrace()</code>를 호출해 생성 시점의 스택 정보를 기록한다(<code>Throwable</code> Javadoc). 그래서 감싼 예외는 자기가 만들어진 위치의 스택을, 원래 예외는 원래 실패한 위치의 스택을 따로 갖는다. 이 두 스택이 아래에서 볼 스택 트레이스의 두 덩어리가 된다.</p>
+
+<h3>런타임 예외 적용: 감싸서 던지고 원인은 반드시 남긴다</h3>
+
+<p>방향이 정해졌다. 리포지토리 구현 안에서 <code>SQLException</code>을 잡아 런타임 예외로 감싸 던진다. 인터페이스와 서비스는 체크 예외를 선언할 필요가 없어진다. 먼저 데이터 접근 실패를 나타낼 런타임 예외를 하나 만든다. 이름은 이 회차에서 임의로 정한 것이다.</p>
+
+<pre><code class="language-java">public class MyDbException extends RuntimeException {
+    public MyDbException() { super(); }
+    public MyDbException(String message) { super(message); }
+    public MyDbException(String message, Throwable cause) { super(message, cause); }
+    public MyDbException(Throwable cause) { super(cause); }
+}</code></pre>
+
+<p>생성자 네 개는 <code>RuntimeException</code>이 가진 생성자를 그대로 연결한 것이다. 이 중 원인(cause)을 받는 두 생성자가 핵심이다. 원인을 받는 생성자는 Java 1.4에서 예외 연쇄(exception chaining)와 함께 들어왔다(<code>Throwable(Throwable cause)</code>의 <code>@since 1.4</code>). <code>Throwable(Throwable cause)</code> 생성자는 상세 메시지를 따로 받지 않고 원인의 <code>toString()</code>을 메시지로 쓴다고 Javadoc이 정해 두었다. 그래서 위 힙 그림에서 <code>MyDbException</code>의 메시지가 <code>"java.sql.SQLException: ..."</code>으로 시작한 것이다.</p>
+
+<p>이제 리포지토리 구현의 <code>save</code>는 다음과 같다. 04회에서 본 대로 커넥션은 <code>DataSourceUtils.getConnection</code>으로 얻고 <code>DataSourceUtils.releaseConnection</code>으로 돌려준다. 그래야 트랜잭션 동기화 매니저가 스레드에 묶어 둔 트랜잭션 커넥션을 같이 쓴다. 문장을 닫을 때는 스프링의 <code>JdbcUtils.closeStatement</code>를 썼다. 이 메서드는 null을 넘겨도 되고, 닫다가 난 예외를 로그로만 남기고 밖으로 던지지 않는다.</p>
+
+<pre><code class="language-java">public class JdbcAccountRepositoryV1 implements AccountRepository {
+
+    private final DataSource dataSource;
+
+    public JdbcAccountRepositoryV1(DataSource dataSource) {
+        this.dataSource = dataSource;
+    }
+
+    @Override
+    public Account save(Account account) {          // throws 절이 없다
+        String sql = "insert into account(account_id, balance) values (?, ?)";
+        Connection con = null;
+        PreparedStatement pstmt = null;
+        try {
+            con = DataSourceUtils.getConnection(dataSource);
+            pstmt = con.prepareStatement(sql);
+            pstmt.setString(1, account.accountId());
+            pstmt.setInt(2, account.balance());
+            pstmt.executeUpdate();
+            return account;
+        } catch (SQLException e) {
+            throw new MyDbException(e);             // 원인을 넘긴다
+        } finally {
+            JdbcUtils.closeStatement(pstmt);
+            DataSourceUtils.releaseConnection(con, dataSource);
+        }
+    }
+    // findById, update, delete도 같은 모양: catch (SQLException e) { throw new MyDbException(e); }
+}</code></pre>
+
+<p>이 클래스는 <code>implements AccountRepository</code>로 컴파일된다. 구현 메서드에 throws 절이 없으니 앞의 규칙에 걸리지 않는다. 서비스도 <code>throws SQLException</code>을 지운다. 서비스의 필드 타입은 <code>AccountRepository</code> 인터페이스가 되고, 서비스 코드 어디에도 <code>java.sql</code>이 남지 않는다. 데이터베이스가 응답하지 않거나 SQL이 틀리는 것처럼 서비스가 어떻게 해 볼 수 없는 실패는 <code>MyDbException</code>으로 서비스를 그냥 지나쳐 올라가고, 결국 웹 계층의 공통 예외 처리(스프링 MVC 2편에서 다룬 오류 페이지와 API 예외 처리)에서 한곳에 모여 로그를 남기고 응답을 만든다.</p>
+
+<h4>원인 예외를 빠뜨리면 무엇이 사라지는가</h4>
+
+<p>예외를 감쌀 때 가장 흔한 실수는 원인을 넘기지 않는 것이다. 두 가지 감싸기를 나란히 실행해 보자. 하나는 원인을 넘기고, 하나는 원래 예외의 메시지만 옮긴다.</p>
+
+<pre><code class="language-java">static void lowLevel() throws SQLException {
+    throw new SQLException("Unique index or primary key violation", "23505", 23505);
+}
+
+static void wrapped() {
+    try { lowLevel(); }
+    catch (SQLException e) { throw new MyDbException(e); }                 // 원인 보존
+}
+
+static void lost() {
+    try { lowLevel(); }
+    catch (SQLException e) { throw new MyDbException(e.getMessage(), null); } // 원인 유실
+}</code></pre>
+
+<pre data-label="실행 결과 (printStackTrace, JDK 21)"><code class="language-text">MyDbException: java.sql.SQLException: Unique index or primary key violation
+	at Ex.wrapped(Ex.java:15)
+	at Ex.main(Ex.java:22)
+Caused by: java.sql.SQLException: Unique index or primary key violation
+	at Ex.lowLevel(Ex.java:11)
+	at Ex.wrapped(Ex.java:14)
+	... 1 more
+-----
+MyDbException: Unique index or primary key violation
+	at Ex.lost(Ex.java:19)
+	at Ex.main(Ex.java:24)</code></pre>
+
+<p>위쪽 결과는 두 덩어리다. 첫 덩어리는 <code>MyDbException</code>이 만들어진 위치(15번 줄)의 스택이고, <code>Caused by:</code> 아래 둘째 덩어리는 원래 <code>SQLException</code>이 만들어진 위치(11번 줄)의 스택이다. <code>... 1 more</code>는 둘째 덩어리의 나머지 프레임(<code>main</code>)이 첫 덩어리와 같아서 생략했다는 뜻이다. <code>Throwable.printStackTrace</code>의 Javadoc이 이 생략 규칙을 설명한다.</p>
+
+<p>아래쪽 결과에는 <code>Caused by:</code>가 없다. 메시지 문자열은 남았지만, 원래 예외의 타입, SQLState, 제조사 오류 코드, 그리고 실패가 실제로 일어난 위치가 모두 사라졌다. 실제 장애에서 이 차이는 결정적이다. 데이터베이스 드라이버의 예외에는 어느 SQL의 어느 제약 조건이 깨졌는지, 커넥션이 왜 끊겼는지 같은 정보가 들어 있다. 원인을 버리면 로그에는 "데이터베이스 오류"라는 말만 남고 원인을 추적할 방법이 없다. 예외를 전환할 때는 반드시 원인을 생성자에 넘긴다. 이 규칙은 아래에서 볼 스프링의 예외 변환기도 그대로 지킨다.</p>
+
+<h4>언체크 예외는 문서로 남긴다</h4>
+
+<p>런타임 예외로 바꾸면 컴파일러가 더 이상 "이 메서드는 이런 실패를 할 수 있다"고 알려 주지 않는다. 그 정보는 이제 사람이 남겨야 한다. 인터페이스 메서드의 Javadoc에 <code>@throws</code>로 어떤 런타임 예외가 어떤 상황에서 나오는지 적어 두면, 복구가 필요한 쪽이 그것을 보고 골라 잡을 수 있다. 자바 표준 라이브러리도 같은 방식을 쓴다. 예를 들어 <code>List.get</code>은 언체크 예외인 <code>IndexOutOfBoundsException</code>을 Javadoc의 <code>@throws</code>로 알린다.</p>
+
+<h3>데이터 접근 예외 직접 만들기: 복구할 수 있는 실패를 골라 낸다</h3>
+
+<p>모든 데이터 접근 실패가 복구할 수 없는 것은 아니다. 계좌를 개설할 때 고객이 원하는 계좌 번호를 직접 고를 수 있다고 하자. 이미 누가 쓰고 있는 번호라면 <code>account_id</code>의 기본 키 제약 조건에 걸려 <code>insert</code>가 실패한다. 이것은 시스템 장애가 아니라 예상할 수 있는 업무 상황이고, 서비스는 다른 번호를 만들어 다시 시도하는 식으로 복구할 수 있다. 이런 실패는 <code>MyDbException</code> 하나로 뭉뚱그리면 안 되고, 서비스가 따로 잡을 수 있게 골라 내야 한다.</p>
+
+<p>골라 내려면 무엇을 보고 판단해야 할까. H2에 이미 있는 키를 넣고, 드라이버가 던진 예외를 들여다보자.</p>
+
+<pre data-label="실행 결과 (H2 2.4.240, 중복 키 insert)"><code class="language-text">class=org.h2.jdbc.JdbcSQLIntegrityConstraintViolationException
+errorCode=23505 sqlState=23505
+msg=Unique index or primary key violation: "PUBLIC.CONSTRAINT_E INDEX PUBLIC.PRIMARY_KEY_E ON PUBLIC.ACCOUNT(ACCOUNT_ID) VALUES ( /* 1 */ 'A1' )"; SQL statement:
+insert into account(account_id, balance) values (?, ?) [23505-240]</code></pre>
+
+<p><code>SQLException</code>은 판단에 쓸 수 있는 정보를 세 가지 담고 있다. 첫째는 사람이 읽는 메시지(<code>getMessage()</code>)다. 형식이 정해져 있지 않고 드라이버 버전에 따라 바뀔 수 있으므로 프로그램이 분기 조건으로 쓰기에는 부적합하다. 둘째는 SQLState(<code>getSQLState()</code>)다. <code>SQLException</code>의 Javadoc에 따르면 이 문자열은 X/Open SQLSTATE 관례나 SQL:2003 관례를 따르며, 드라이버가 어느 쪽을 쓰는지는 <code>DatabaseMetaData.getSQLStateType()</code>으로 알 수 있다. H2 드라이버는 이 메서드에 2(<code>DatabaseMetaData.sqlStateSQL</code>)를 돌려주었다. 셋째는 제조사 오류 코드(<code>getErrorCode()</code>)로, Javadoc 표현대로 데이터베이스 제조사마다 고유한 번호다.</p>
+
+<p>SQLState는 다섯 글자이고 앞 두 글자가 분류(class)를 나타낸다. JDK의 <code>SQLIntegrityConstraintViolationException</code> Javadoc은 이 예외가 SQLState 분류 값이 '23'일 때(또는 제조사가 정한 조건에서) 던져지며, 외래 키·기본 키·유일 키 같은 무결성 제약 조건이 깨졌다는 뜻이라고 설명한다. 같은 방식으로 '42'는 SQL 문법 위반(<code>SQLSyntaxErrorException</code>), '40'은 교착 상태 등으로 데이터베이스가 문장을 자동 롤백한 경우(<code>SQLTransactionRollbackException</code>)다. 그러나 분류 값만으로는 "기본 키 중복"과 "외래 키 위반"을 구분할 수 없고, 세부 값은 데이터베이스마다 다르다. 아래 표가 그 차이를 보여 준다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>데이터베이스</th><th>키 중복 시 제조사 오류 코드</th><th>SQLState</th><th>확인한 곳</th></tr></thead><tbody>
+<tr><td>H2 2.4.240</td><td>23505</td><td>23505</td><td>직접 실행</td></tr>
+<tr><td>MySQL 8.0</td><td>1062 (<code>ER_DUP_ENTRY</code>)</td><td>23000</td><td>MySQL 8.0 Server Error Reference</td></tr>
+</tbody></table></div>
+
+<p>H2는 오류 코드와 SQLState가 같은 23505이지만 MySQL은 오류 코드가 1062이고 SQLState는 분류 수준의 23000이다. MySQL에서는 SQLState만 보고서는 키 중복과 다른 무결성 위반을 가를 수 없고 오류 코드까지 봐야 한다. 결국 "키 중복"을 정확히 알아내려면 데이터베이스마다 다른 규칙을 알아야 한다.</p>
+
+<h4>JDBC 4의 SQLException 하위 클래스</h4>
+
+<p>드라이버가 던진 예외의 클래스 계층도 단서가 된다. 실험에서 출력한 H2 예외의 상위 클래스 사슬은 다음과 같았다.</p>
+
+<pre data-label="실행 결과 (상위 클래스 사슬)"><code class="language-text">org.h2.jdbc.JdbcSQLIntegrityConstraintViolationException
+ -> java.sql.SQLIntegrityConstraintViolationException
+ -> java.sql.SQLNonTransientException
+ -> java.sql.SQLException -> java.lang.Exception -> java.lang.Throwable</code></pre>
+
+<p><code>SQLNonTransientException</code>, <code>SQLIntegrityConstraintViolationException</code> 같은 하위 클래스는 Java 6(JDBC 4.0)에서 <code>java.sql</code>에 들어왔다(각 클래스의 <code>@since 1.6</code>). 큰 갈래는 셋이고, JDK Javadoc이 각각의 의미를 정해 두었다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>JDBC 예외(Java 6+)</th><th>Javadoc이 정한 의미</th><th>대표 하위 클래스</th></tr></thead><tbody>
+<tr><td><code>SQLNonTransientException</code></td><td>원인을 고치지 않는 한 같은 작업을 다시 해도 실패한다</td><td><code>SQLIntegrityConstraintViolationException</code>(분류 23), <code>SQLSyntaxErrorException</code>(분류 42), <code>SQLDataException</code></td></tr>
+<tr><td><code>SQLTransientException</code></td><td>애플리케이션의 개입 없이 다시 시도하면 성공할 수 있다</td><td><code>SQLTransactionRollbackException</code>(분류 40), <code>SQLTimeoutException</code></td></tr>
+<tr><td><code>SQLRecoverableException</code></td><td>애플리케이션이 복구 절차를 밟고 트랜잭션 전체를 다시 시도하면 성공할 수 있다. 최소한 현재 커넥션을 닫고 새 커넥션을 얻어야 한다</td><td>(드라이버마다 다름)</td></tr>
+</tbody></table></div>
+
+<p>이 계층은 유용하지만 한계가 있다. 이 하위 클래스들은 여전히 <code>SQLException</code>의 하위 타입, 즉 체크 예외이고 JDBC 전용이다. 서비스가 이것을 잡으면 다시 JDBC에 묶인다. 또 계층에 "키 중복"이라는 전용 타입은 없다. <code>SQLIntegrityConstraintViolationException</code>은 키 중복, 외래 키 위반, NOT NULL 위반을 모두 포함한다. 드라이버가 이 하위 클래스를 얼마나 정확히 쓰는지도 Javadoc 표현대로 "제조사가 정한 조건"에 달려 있다.</p>
+
+<h4>키 중복만 골라 내는 예외</h4>
+
+<p>일단 우리 힘으로 해결해 보자. <code>MyDbException</code>을 상속한 예외를 하나 더 만든다. 상속을 쓰는 이유는 분류를 계층으로 표현하기 위해서다. 키 중복을 따로 처리하고 싶은 쪽은 <code>MyDuplicateKeyException</code>을 잡고, 데이터 접근 실패를 한꺼번에 처리하고 싶은 쪽은 <code>MyDbException</code>을 잡으면 키 중복까지 함께 잡힌다.</p>
+
+<pre><code class="language-java">public class MyDuplicateKeyException extends MyDbException {
+    public MyDuplicateKeyException(Throwable cause) {
+        super(cause);
+    }
+}</code></pre>
+
+<p>리포지토리는 <code>SQLException</code>의 오류 코드를 보고 어느 예외로 바꿀지 정한다. H2의 키 중복 코드는 23505다.</p>
+
+<pre><code class="language-java">    private static final int H2_DUPLICATE_KEY = 23505;   // H2 전용 오류 번호
+
+    @Override
+    public Account save(Account account) {
+        String sql = "insert into account(account_id, balance) values (?, ?)";
+        Connection con = null;
+        PreparedStatement pstmt = null;
+        try {
+            con = DataSourceUtils.getConnection(dataSource);
+            pstmt = con.prepareStatement(sql);
+            pstmt.setString(1, account.accountId());
+            pstmt.setInt(2, account.balance());
+            pstmt.executeUpdate();
+            return account;
+        } catch (SQLException e) {
+            if (e.getErrorCode() == H2_DUPLICATE_KEY) {
+                throw new MyDuplicateKeyException(e);
+            }
+            throw new MyDbException(e);
+        } finally {
+            JdbcUtils.closeStatement(pstmt);
+            DataSourceUtils.releaseConnection(con, dataSource);
+        }
+    }</code></pre>
+
+<p>서비스는 <code>MyDuplicateKeyException</code>만 잡아서 복구한다. 이 예외는 JDBC 타입이 아니라 우리가 만든 런타임 예외이므로, 서비스는 여전히 <code>java.sql</code>을 모른다. 복구할 수 없는 다른 실패(<code>MyDbException</code>)는 잡지 않고 흘려보낸다.</p>
+
+<pre><code class="language-java">public class AccountOpenService {
+
+    private final AccountRepository repository;
+
+    public AccountOpenService(AccountRepository repository) {
+        this.repository = repository;
+    }
+
+    public String open(String wantedId, int initialBalance) {
+        try {
+            repository.save(new Account(wantedId, initialBalance));
+            System.out.println("개설 성공: " + wantedId);
+            return wantedId;
+        } catch (MyDuplicateKeyException e) {
+            System.out.println("중복 번호: " + wantedId + " → 새 번호로 재시도");
+            String retryId = wantedId + "_1";
+            repository.save(new Account(retryId, initialBalance));
+            System.out.println("개설 성공: " + retryId);
+            return retryId;
+        }
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (A1을 1000원으로 개설한 뒤 같은 번호로 2000원 개설 시도)"><code class="language-text">개설 성공: A1
+중복 번호: A1 → 새 번호로 재시도
+개설 성공: A1_1
+Account[accountId=A1_1, balance=2000]</code></pre>
+
+<p>새 번호를 만드는 규칙은 설명을 위해 일부러 단순하게 했다(<code>_1</code>을 붙인다). 실제로는 재시도 횟수를 제한하고, 새 번호도 중복될 수 있다는 점을 고려해야 한다. 한 가지 더 확인할 것은 트랜잭션 안에서 이런 복구가 가능한가다. H2에서 트랜잭션 안에 행 하나를 넣고, 중복 키로 실패한 뒤, 그 예외를 잡아 다른 키로 다시 넣고 커밋했더니 세 행(먼저 넣은 행, 원래 있던 행, 재시도한 행)이 모두 남았다. 실패한 문장 하나만 무효가 되고 트랜잭션은 계속 쓸 수 있었다는 뜻이다. MySQL InnoDB도 문서에서 중복 키 오류는 그 SQL 문장을 롤백한다고 밝힌다(IGNORE 옵션을 쓰지 않은 경우). 반면 InnoDB는 교착 상태가 나면 트랜잭션 전체를 롤백한다고 같은 문서에 적혀 있으므로, 어떤 실패 뒤에 같은 트랜잭션을 계속 쓸 수 있는지는 실패의 종류와 데이터베이스에 따라 다르다.</p>
+
+<h4>직접 만든 예외 계층의 한계</h4>
+
+<p>서비스는 깨끗해졌지만 리포지토리를 보면 문제가 그대로 옮겨 왔을 뿐이다. <code>H2_DUPLICATE_KEY = 23505</code>는 H2 전용 번호다. 데이터베이스를 MySQL로 바꾸면 이 상수를 1062로 바꾸고, 판단 기준도 SQLState가 아니라 오류 코드여야 한다는 것을 다시 확인해야 한다. 키 중복만이 아니다. SQL 문법 오류, 락 획득 실패, 질의 시간 초과, 커넥션 끊김처럼 골라 내고 싶은 실패는 수십 가지이고, 각각에 대해 데이터베이스마다 다른 번호를 알아야 한다. 그 번호 목록을 리포지토리마다, 프로젝트마다 다시 만드는 것은 낭비이고 틀리기도 쉽다.</p>
+
+<p>필요한 것은 두 가지다. 하나는 기술과 데이터베이스에 독립적인 예외 계층, 즉 "키 중복", "문법 오류", "락 획득 실패" 같은 의미를 담은 런타임 예외 묶음이다. 다른 하나는 데이터베이스별 번호를 그 의미로 바꿔 주는 변환표와 변환기다. 스프링은 이 두 가지를 모두 제공한다.</p>
+
+<h3>스프링 예외 추상화 이해: DataAccessException 계층</h3>
+
+<p>스프링은 데이터 접근 실패를 나타내는 예외 계층을 제공한다. 뿌리는 <code>org.springframework.dao.DataAccessException</code>이다. 이 클래스의 Javadoc은 계층의 목적을, 사용 중인 데이터 접근 API의 세부(예를 들어 JDBC)를 몰라도 사용자 코드가 실패의 종류를 찾아 처리할 수 있게 하는 것이라고 밝힌다. 그 예로 JDBC를 쓰는지 모르고도 낙관적 락 실패에 대응할 수 있다는 것을 든다. 또 이 클래스가 런타임 예외이므로, 실패를 치명적인 것으로 보는 대부분의 경우에는 사용자 코드가 잡을 필요가 없다고 적는다. 앞에서 우리가 직접 만든 <code>MyDbException</code>과 같은 생각을, 훨씬 많은 경우에 대해 미리 정리해 둔 것이다.</p>
+
+<p>Spring Framework 7.0.9에서 대표적인 예외들의 상위 클래스 사슬을 리플렉션으로 출력해 정리하면 다음과 같다. 모든 예외가 <code>NestedRuntimeException</code>을 거쳐 <code>RuntimeException</code>에 이른다. 즉 전부 언체크 예외다.</p>
+
+<pre class="diagram">RuntimeException
+ └ NestedRuntimeException                       (spring-core)
+    └ DataAccessException                        (org.springframework.dao, spring-tx jar)
+       ├ NonTransientDataAccessException          원인을 고치기 전에는 다시 해도 실패
+       │  ├ DataIntegrityViolationException
+       │  │  └ DuplicateKeyException                  키 중복
+       │  ├ InvalidDataAccessResourceUsageException
+       │  │  └ BadSqlGrammarException (jdbc)           SQL 문법 오류
+       │  ├ DataRetrievalFailureException
+       │  │  └ IncorrectResultSizeDataAccessException
+       │  │     └ EmptyResultDataAccessException       결과가 0건
+       │  ├ NonTransientDataAccessResourceException
+       │  │  └ DataAccessResourceFailureException      자원(커넥션 등) 실패
+       │  └ UncategorizedDataAccessException
+       │     └ UncategorizedSQLException (jdbc)        분류하지 못함
+       ├ TransientDataAccessException             다시 하면 성공할 수 있음
+       │  ├ QueryTimeoutException
+       │  ├ TransientDataAccessResourceException
+       │  └ ConcurrencyFailureException
+       │     ├ OptimisticLockingFailureException
+       │     └ PessimisticLockingFailureException
+       │        └ CannotAcquireLockException
+       └ RecoverableDataAccessException           복구 절차 후 재시도하면 성공할 수 있음</pre>
+
+<p>세 갈래의 이름이 낯익을 것이다. 앞에서 본 JDBC 4의 <code>SQLNonTransientException</code>, <code>SQLTransientException</code>, <code>SQLRecoverableException</code>과 짝을 이룬다. 실제로 스프링 Javadoc의 설명도 거의 같다. <code>NonTransientDataAccessException</code>은 원인을 고치지 않는 한 같은 작업을 다시 해도 실패하는 예외의 뿌리, <code>TransientDataAccessException</code>은 애플리케이션의 개입 없이 다시 시도하면 성공할 수 있는 예외의 뿌리, <code>RecoverableDataAccessException</code>은 복구 절차를 밟고 트랜잭션 전체를 다시 시도하면 성공할 수 있는 예외다. 다른 점은 스프링 쪽이 런타임 예외이고, JDBC뿐 아니라 JPA 같은 다른 기술의 예외도 같은 계층으로 받는다는 것이다.</p>
+
+<p>이 분류는 실무에서 재시도 정책을 정하는 기준이 된다. <code>TransientDataAccessException</code> 계열은 같은 작업을 잠시 뒤에 다시 해 볼 가치가 있다. 락을 얻지 못했거나(<code>CannotAcquireLockException</code>) 질의 시간이 초과된(<code>QueryTimeoutException</code>) 경우다. <code>NonTransientDataAccessException</code> 계열은 다시 해도 소용이 없다. SQL 문법이 틀렸다면(<code>BadSqlGrammarException</code>) 몇 번을 다시 보내도 틀린다. 이때 필요한 것은 재시도가 아니라 코드 수정이다. 키 중복(<code>DuplicateKeyException</code>)도 같은 값으로 다시 넣으면 또 실패하지만, 값을 바꾸면 성공하므로 업무 로직에서 복구할 수 있는 대표적인 예외다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>스프링 예외</th><th>뜻</th><th>대표적인 원인</th><th>서비스의 일반적인 대응</th></tr></thead><tbody>
+<tr><td><code>DuplicateKeyException</code></td><td>기본 키나 유일 제약 위반</td><td>이미 있는 키로 insert/update</td><td>값을 바꿔 다시 시도하거나 사용자에게 알린다</td></tr>
+<tr><td><code>DataIntegrityViolationException</code></td><td>무결성 제약 위반 전반</td><td>외래 키 위반, NOT NULL 위반, 값이 열 크기를 넘음</td><td>입력 검증 누락을 의심한다</td></tr>
+<tr><td><code>BadSqlGrammarException</code></td><td>SQL 문법·객체 이름 오류</td><td>오타, 없는 테이블이나 열</td><td>잡지 않는다. 코드를 고친다</td></tr>
+<tr><td><code>EmptyResultDataAccessException</code></td><td>정확히 1건을 기대했는데 0건</td><td>없는 키로 단건 조회</td><td>"없음"을 업무 의미로 바꾸거나 그대로 실패시킨다</td></tr>
+<tr><td><code>CannotAcquireLockException</code></td><td>락을 얻지 못함</td><td>락 대기 시간 초과</td><td>재시도 정책의 대상</td></tr>
+<tr><td><code>UncategorizedSQLException</code></td><td>어느 분류에도 들지 않음</td><td>변환표에 없는 오류</td><td>원인 예외의 코드를 보고 분석한다</td></tr>
+</tbody></table></div>
+
+<p>원인 정보는 어떻게 될까. 스프링 레퍼런스의 DAO 지원 장은 이 예외들이 원래 예외를 감싸므로 무엇이 잘못되었는지에 관한 정보를 잃을 위험이 없다고 설명한다. 앞에서 우리가 지킨 규칙과 같다. 실제로 변환된 <code>DuplicateKeyException</code>의 <code>getCause()</code>는 H2가 던진 바로 그 <code>SQLException</code> 객체였다(참조 비교로 확인했다). <code>NestedRuntimeException</code>은 원인 사슬의 맨 아래를 꺼내는 <code>getRootCause()</code>와, 그것이 없으면 자기 자신을 돌려주는 <code>getMostSpecificCause()</code>도 제공한다. 실험에서 <code>getRootCause()</code>는 <code>org.h2.jdbc.JdbcSQLIntegrityConstraintViolationException</code>을 돌려주었다.</p>
+
+<p>사소해 보이지만 중요한 사실이 하나 있다. <code>DataAccessException</code>과 그 하위 예외 대부분은 <code>spring-jdbc</code>가 아니라 <code>spring-tx</code> 모듈의 <code>org.springframework.dao</code> 패키지에 있다. <code>BadSqlGrammarException</code>, <code>UncategorizedSQLException</code>처럼 JDBC에만 해당하는 것만 <code>org.springframework.jdbc</code> 패키지에 있다. 서비스가 <code>org.springframework.dao</code>의 예외만 잡는다면, 서비스는 스프링의 데이터 접근 추상화에는 의존하지만 JDBC에는 의존하지 않는다.</p>
+
+<x-visual id="spring-db1-06-dae-hierarchy" title="DataAccessException 계층과 JDBC 4 예외 계층의 대응" kind="계층 구조도" ratio="16:9">
+<x-hint>스프링 예외 계층의 세 갈래(비일시적, 일시적, 복구 가능)가 JDBC 4 SQLException 하위 클래스의 세 갈래와 짝을 이룬다는 것과, 대표 하위 예외가 어디에 매달리는지 보여 준다.</x-hint>
+<x-prompt>트리 형태의 계층 구조도. 맨 위 회색 상자 "RuntimeException", 그 아래 파란 상자 "DataAccessException". 그 아래 세 갈래로 나뉜 파란 상자 "NonTransient", "Transient", "Recoverable". "NonTransient" 아래에 작은 상자 세 개 "DuplicateKeyException", "BadSqlGrammarException", "EmptyResultDataAccessException". "Transient" 아래에 작은 상자 두 개 "QueryTimeoutException", "CannotAcquireLockException". 그림 오른쪽 끝에 세로로 회색 띠를 두고 그 안에 "SQLNonTransientException", "SQLTransientException", "SQLRecoverableException" 세 칩을 각각 같은 높이의 스프링 상자와 점선으로 잇는다. 회색 띠 위에 라벨 "JDBC 4 (체크 예외)", 파란 트리 위에 라벨 "스프링 (런타임 예외)". 평면 기술 도해, 흰 배경, 파랑과 회색.</x-prompt>
+<x-caption>스프링의 세 갈래는 JDBC 4의 세 갈래와 같은 기준으로 나뉘지만 런타임 예외이고 기술에 독립적이다.</x-caption>
+</x-visual>
+
+<h3>예외 변환기: SQLException이 DataAccessException이 되는 경로</h3>
+
+<p>계층이 있어도 누군가 <code>SQLException</code>을 보고 알맞은 하위 예외를 골라야 한다. 그 일을 하는 것이 <code>org.springframework.jdbc.support.SQLExceptionTranslator</code> 인터페이스다. 메서드는 하나다. <code>translate(String task, String sql, SQLException ex)</code>는 어떤 작업 중이었는지, 어떤 SQL이었는지, 어떤 예외였는지를 받아 <code>DataAccessException</code>을 돌려준다. Javadoc은 특정한 변환을 적용할 수 없으면 null을 돌려준다고 명시한다. 이 null은 뒤에서 함정이 된다.</p>
+
+<p>스프링에는 판단 기준이 다른 구현 세 가지가 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>변환기</th><th>판단 기준</th><th>분류하지 못했을 때</th></tr></thead><tbody>
+<tr><td><code>SQLErrorCodeSQLExceptionTranslator</code></td><td>제조사 오류 코드. 데이터베이스 제품 이름으로 고른 변환표(<code>sql-error-codes.xml</code>)와 비교</td><td><code>SQLExceptionSubclassTranslator</code>에 넘긴다</td></tr>
+<tr><td><code>SQLExceptionSubclassTranslator</code></td><td>드라이버가 던진 JDBC 4 하위 클래스 타입, 일부 경우 SQLState와 오류 코드를 추가로 확인</td><td><code>SQLStateSQLExceptionTranslator</code>에 넘긴다</td></tr>
+<tr><td><code>SQLStateSQLExceptionTranslator</code></td><td>SQLState의 앞 두 글자(분류 값)</td><td>null</td></tr>
+</tbody></table></div>
+
+<h4>오류 코드 변환기와 sql-error-codes.xml</h4>
+
+<p>가장 정밀한 것은 오류 코드 변환기다. 이 변환기는 <code>DataSource</code>에서 커넥션을 얻어 <code>DatabaseMetaData.getDatabaseProductName()</code>으로 데이터베이스 제품 이름을 알아낸다(H2 드라이버는 "H2"를 돌려주었다). 그리고 <code>SQLErrorCodesFactory</code>가 읽어 둔 변환표에서 그 이름에 맞는 항목을 찾는다. 기본 변환표는 <code>spring-jdbc</code> jar 안의 <code>org/springframework/jdbc/support/sql-error-codes.xml</code>이고, 클래스패스 루트에 같은 이름의 파일을 두면 그 내용으로 덮어쓸 수 있다. 팩토리는 한 번 알아낸 결과를 <code>DataSource</code>별로 캐시해 두므로 메타데이터 조회는 처음 한 번만 일어난다. 다음은 그 파일에서 H2와 MySQL 항목의 일부다.</p>
+
+<pre data-label="sql-error-codes.xml (spring-jdbc 7.0.10, 일부)"><code class="language-xml"><bean id="H2" class="org.springframework.jdbc.support.SQLErrorCodes">
+    <property name="badSqlGrammarCodes">
+        <value>42000,42001,42101,42102,42111,42112,42121,42122,42132</value>
+    </property>
+    <property name="duplicateKeyCodes">
+        <value>23001,23505</value>
+    </property>
+    <!-- ... -->
+</bean>
+<bean id="MySQL" class="org.springframework.jdbc.support.SQLErrorCodes">
+    <property name="databaseProductNames">
+        <list><value>MySQL</value><value>MariaDB</value></list>
+    </property>
+    <property name="badSqlGrammarCodes"><value>1054,1064,1146</value></property>
+    <property name="duplicateKeyCodes"><value>1062</value></property>
+    <property name="cannotAcquireLockCodes"><value>1205,3572</value></property>
+    <!-- ... -->
+</bean></code></pre>
+
+<p>우리가 리포지토리에 상수로 박았던 H2의 23505와 MySQL의 1062가 여기에 이미 들어 있다. 변환기는 오류 코드를 문자열로 만들어 문법 오류 코드 목록, 잘못된 결과 집합 접근 코드 목록, 키 중복 코드 목록, 무결성 위반 코드 목록, 권한 거부 코드 목록, 그다음 자원 실패와 락 관련 코드 목록의 순서로 비교하고, 처음 맞는 목록의 예외를 만든다. 데이터베이스에 따라서는 오류 코드 대신 SQLState로 비교하도록 표시된 항목도 있다(예: PostgreSQL 항목의 <code>useSqlStateForTranslation</code>). 어느 목록에도 없으면 다음 변환기에 넘긴다.</p>
+
+<h4>Spring Framework 6.0 이후의 기본값</h4>
+
+<p>그러면 <code>JdbcTemplate</code>은 이 중 무엇을 쓸까. 이 부분은 버전에 따라 다르므로 소스로 확인했다. <code>JdbcTemplate</code>의 상위 클래스 <code>JdbcAccessor</code>의 <code>getExceptionTranslator()</code>는, 따로 설정한 변환기가 없으면 처음 필요할 때 다음 규칙으로 하나를 만들어 필드에 저장한다. 사용자가 클래스패스 루트에 <code>sql-error-codes.xml</code>을 두었으면 <code>SQLErrorCodeSQLExceptionTranslator</code>를, 그렇지 않으면 <code>SQLExceptionSubclassTranslator</code>를 만든다. Spring Framework 6.1.x 브랜치의 소스도 같다.</p>
+
+<pre data-label="JdbcAccessor.getExceptionTranslator (Spring Framework 7.0.10 소스, 일부)"><code class="language-java">if (SQLErrorCodeSQLExceptionTranslator.hasUserProvidedErrorCodesFile()) {
+    exceptionTranslator = new SQLErrorCodeSQLExceptionTranslator(obtainDataSource());
+}
+else {
+    exceptionTranslator = new SQLExceptionSubclassTranslator();
+}</code></pre>
+
+<p><code>SQLExceptionSubclassTranslator</code>의 Javadoc과 스프링 레퍼런스는 6.0부터 이것이 기본 변환기라고 밝힌다. 레퍼런스는 이전 동작과의 호환이 필요하면 오류 코드 변환기를 직접 쓰는 것을 고려하라고 안내한다. 실험에서도 아무 설정 없이 만든 <code>JdbcTemplate</code>의 <code>getExceptionTranslator()</code>는 <code>SQLExceptionSubclassTranslator</code>였다. 따라서 "스프링은 sql-error-codes.xml로 오류 코드를 변환한다"는 설명은 Spring Framework 6.0 이후의 기본 동작으로는 정확하지 않다. 기본 경로는 드라이버가 던진 예외의 타입을 먼저 본다.</p>
+
+<p>기본 변환기인 <code>SQLExceptionSubclassTranslator</code>의 판단을 소스에서 따라가 보자. 예외가 <code>SQLTransientException</code> 계열이면 <code>SQLTransientConnectionException</code>은 <code>TransientDataAccessResourceException</code>으로, <code>SQLTimeoutException</code>은 <code>QueryTimeoutException</code>으로 바꾼다. <code>SQLNonTransientException</code> 계열이면 <code>SQLSyntaxErrorException</code>은 <code>BadSqlGrammarException</code>으로, <code>SQLDataException</code>은 <code>DataIntegrityViolationException</code>으로 바꾼다. <code>SQLIntegrityConstraintViolationException</code>일 때는 한 번 더 확인한다. SQLState가 "23505"이거나, SQLState가 "23000"이면서 오류 코드가 알려진 키 중복 번호(소스의 목록에 Oracle 1, MySQL/MariaDB 1062, MS SQL Server 2601·2627 등이 있다)이면 <code>DuplicateKeyException</code>을, 아니면 <code>DataIntegrityViolationException</code>을 만든다. 이 키 중복 확인은 6.0.3에서 SQLState "23505" 확인으로 처음 들어왔고 6.0.4에서 "23000"과 오류 코드 확인이 더해졌다. 6.0.0~6.0.2의 기본 변환기는 <code>SQLIntegrityConstraintViolationException</code>을 모두 <code>DataIntegrityViolationException</code>으로 바꾼다. 어느 경우에도 해당하지 않으면 SQLState의 분류 값을 보는 <code>SQLStateSQLExceptionTranslator</code>에 넘긴다.</p>
+
+<figure class="flow-figure"><figcaption>JdbcTemplate이 SQLException을 DataAccessException으로 바꾸는 경로 (Spring Framework 6.0.4 이후 기본값)</figcaption><ol class="flow">
+<li><strong>SQLException 발생</strong><span>드라이버가 JDBC 4 하위 클래스(예: SQLIntegrityConstraintViolationException)로 던진다.</span></li>
+<li><strong>변환기 결정</strong><span>클래스패스 루트에 sql-error-codes.xml이 있으면 오류 코드 변환기, 없으면 하위 클래스 변환기를 쓴다. 처음 한 번 정해 캐시한다.</span></li>
+<li><strong>하위 클래스 판단</strong><span>예외 타입으로 분류하고, 무결성 위반이면 SQLState와 오류 코드로 키 중복인지 한 번 더 본다.</span></li>
+<li><strong>SQLState 판단</strong><span>타입으로 분류하지 못하면 SQLState 앞 두 글자(42, 23, 40, 08 등)로 분류한다.</span></li>
+<li><strong>최후의 보루</strong><span>그래도 null이면 JdbcTemplate이 UncategorizedSQLException으로 감싼다. 어느 경우든 원래 SQLException이 cause로 남는다.</span></li>
+</ol></figure>
+
+<p>세 변환기에 같은 예외를 넣어 결과를 비교해 보았다. H2의 키 중복 예외와 문법 오류 예외(<code>selec * from account</code>를 준비하다 난 <code>JdbcSQLSyntaxErrorException</code>, 오류 코드와 SQLState 모두 42001)를 각각 넣었다.</p>
+
+<pre data-label="실행 결과 (H2 2.4.240, Spring Framework 7.0.9)"><code class="language-text">SQLErrorCodeSQLExceptionTranslator: dup=DuplicateKeyException bad=BadSqlGrammarException
+SQLExceptionSubclassTranslator: dup=DuplicateKeyException bad=BadSqlGrammarException
+SQLStateSQLExceptionTranslator: dup=DuplicateKeyException bad=BadSqlGrammarException
+default translator=SQLExceptionSubclassTranslator</code></pre>
+
+<p>H2처럼 드라이버가 JDBC 4 하위 클래스와 표준 SQLState를 성실하게 채우는 경우에는 세 변환기의 결과가 같다. 결과가 갈리는 것은 드라이버가 일반 <code>SQLException</code>을 던지거나, SQLState가 분류 수준의 값뿐인 경우다. 예를 들어 SQLState가 "23000"인데 오류 코드가 위 목록에 없는 데이터베이스라면, 기본 변환기는 <code>DuplicateKeyException</code> 대신 상위의 <code>DataIntegrityViolationException</code>을 돌려준다. 오류 코드 변환기는 변환표에 그 번호가 있는 한 정확히 <code>DuplicateKeyException</code>을 돌려준다.</p>
+
+<x-visual id="spring-db1-06-translator-flow" title="SQLException이 예외 변환기 사슬을 거쳐 DataAccessException이 되는 흐름" kind="순서도" ratio="16:9">
+<x-hint>기본 변환기 선택 분기와, 하위 클래스 변환기에서 SQLState 변환기로 넘어가는 대체 경로, 마지막의 UncategorizedSQLException을 한눈에 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 흐르는 순서도. 맨 왼쪽 빨간 칩 "SQLException". 오른쪽으로 화살표가 마름모 "sql-error-codes.xml 있음?"에 닿는다. 위쪽 갈래(라벨 "예")는 상자 "오류 코드 변환기"로, 아래쪽 갈래(라벨 "아니오, 기본")는 상자 "하위 클래스 변환기"로 간다. "오류 코드 변환기"에서 아래로 점선 화살표가 "하위 클래스 변환기"로 내려간다(라벨 "못 찾으면"). "하위 클래스 변환기"에서 오른쪽 상자 "SQLState 변환기"로 점선 화살표(라벨 "못 찾으면"). 세 변환기 상자 모두에서 맨 오른쪽 파란 칩 "DataAccessException 하위 예외"로 실선 화살표. "SQLState 변환기"에서 아래로 점선 화살표가 회색 칩 "UncategorizedSQLException"으로 간다(라벨 "null"). 평면 기술 도해, 흰 배경.</x-prompt>
+<x-caption>기본 경로는 예외 타입 → SQLState 순서로 판단하고, 끝까지 분류하지 못하면 JdbcTemplate이 UncategorizedSQLException으로 감싼다.</x-caption>
+</x-visual>
+
+<h3>스프링 예외 추상화 적용: 리포지토리와 서비스</h3>
+
+<p>이제 직접 만든 예외 대신 스프링의 예외 변환기를 리포지토리에 적용한다. 바뀌는 곳은 catch 블록 하나다. 오류 코드 상수도, <code>MyDbException</code>과 <code>MyDuplicateKeyException</code>도 필요 없다. 변환기는 만든 뒤 내부 상태가 바뀌지 않으므로 필드에 하나 만들어 두고 계속 쓴다. 여기서는 6.0 이후의 기본값과 같은 <code>SQLExceptionSubclassTranslator</code>를 썼다. 오류 코드 기반으로 하고 싶다면 <code>new SQLErrorCodeSQLExceptionTranslator(dataSource)</code>로 바꾸면 된다.</p>
+
+<pre><code class="language-java">public class JdbcAccountRepositoryV2 implements AccountRepository {
+
+    private final DataSource dataSource;
+    private final SQLExceptionTranslator translator = new SQLExceptionSubclassTranslator();
+
+    public JdbcAccountRepositoryV2(DataSource dataSource) {
+        this.dataSource = dataSource;
+    }
+
+    @Override
+    public Account save(Account account) {
+        String sql = "insert into account(account_id, balance) values (?, ?)";
+        Connection con = null;
+        PreparedStatement pstmt = null;
+        try {
+            con = DataSourceUtils.getConnection(dataSource);
+            pstmt = con.prepareStatement(sql);
+            pstmt.setString(1, account.accountId());
+            pstmt.setInt(2, account.balance());
+            pstmt.executeUpdate();
+            return account;
+        } catch (SQLException e) {
+            throw translate("save", sql, e);
+        } finally {
+            JdbcUtils.closeStatement(pstmt);
+            DataSourceUtils.releaseConnection(con, dataSource);
+        }
+    }
+
+    private DataAccessException translate(String task, String sql, SQLException e) {
+        DataAccessException dae = translator.translate(task, sql, e);
+        return (dae != null ? dae : new UncategorizedSQLException(task, sql, e));
+    }
+    // findById, update, delete도 catch 블록에서 translate(...)를 던진다
+}</code></pre>
+
+<p><code>translate</code> 도우미 메서드가 null을 확인하는 이유가 있다. 변환기가 분류하지 못하면 null을 돌려준다고 했다. 이 확인 없이 <code>throw translator.translate(...)</code>라고 쓰면, null을 던지려 할 때 자바는 <code>NullPointerException</code>을 대신 던진다(JLS 14.18절의 throw 문 규칙). 원래의 <code>SQLException</code>은 그대로 사라진다. SQLState도 오류 코드도 없는 <code>new SQLException("odd")</code>를 기본 변환기에 넣고 바로 던져 본 결과다.</p>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">java.lang.NullPointerException: Cannot throw exception because the return value of "org.springframework.jdbc.support.SQLExceptionTranslator.translate(String, String, java.sql.SQLException)" is null</code></pre>
+
+<p>세 변환기 모두 이 예외와 <code>SQLState</code>가 "ZZ999"인 예외에 대해 null을 돌려주었다. <code>JdbcTemplate</code>은 이 경우를 스스로 처리한다. 내부의 <code>translateException</code> 메서드가 변환 결과가 null이면 <code>UncategorizedSQLException</code>으로 감싸기 때문이다(6.1.x 소스도 같다). 위 리포지토리의 도우미 메서드는 그 처리를 그대로 흉내 낸 것이다. 같은 예외를 <code>JdbcTemplate</code>을 통해 던지게 하면 다음과 같이 원래의 SQLState와 오류 코드가 메시지에 남는다.</p>
+
+<pre data-label="실행 결과 (JdbcTemplate을 거친 분류 불가 예외)"><code class="language-text">UncategorizedSQLException / ConnectionCallback; uncategorized SQLException; SQL state [ZZ999]; error code [99999]; odd</code></pre>
+
+<p>서비스는 이제 스프링의 예외를 잡는다. <code>MyDuplicateKeyException</code> 자리에 <code>org.springframework.dao.DuplicateKeyException</code>이 들어갈 뿐 구조는 같다.</p>
+
+<pre><code class="language-java">public String open(String wantedId, int initialBalance) {
+    try {
+        repository.save(new Account(wantedId, initialBalance));
+        return wantedId;
+    } catch (DuplicateKeyException e) {          // org.springframework.dao
+        String retryId = wantedId + "_1";
+        repository.save(new Account(retryId, initialBalance));
+        return retryId;
+    }
+}</code></pre>
+
+<p>이 서비스가 의존하는 것을 다시 세어 보자. 도메인 객체 <code>Account</code>, 역할 인터페이스 <code>AccountRepository</code>, 그리고 스프링의 데이터 접근 예외 <code>DuplicateKeyException</code>이다. <code>java.sql</code>은 없고, H2나 MySQL의 오류 번호도 없다. 리포지토리 구현을 JPA로 바꾸어도 스프링이 JPA 예외를 같은 계층으로 변환해 주는 한(스프링 레퍼런스는 JPA와 Hibernate 예외도 같은 계층으로 변환된다고 설명한다) 이 서비스는 그대로다. 대신 서비스가 스프링의 예외 타입에 의존하게 되었다. 이것은 의식적인 선택이다. 스프링이라는 기반 기술에 대한 의존은 받아들이고, 그 위에서 바뀔 수 있는 데이터 접근 기술과 데이터베이스에 대한 의존은 끊는 것이다. 그것조차 싫다면 서비스용 예외를 따로 정의하고 리포지토리에서 한 번 더 바꿀 수 있지만, 그만큼 코드와 관리 비용이 늘어난다.</p>
+
+<p>변환기는 다른 무결성 위반도 같은 방식으로 분류한다. <code>varchar(10)</code> 열에 12자 계좌 번호를 넣었더니 H2는 <code>JdbcSQLDataException</code>(SQLState 22001, 값이 너무 김)을 던졌고, 기본 변환기는 이것을 <code>SQLDataException</code> 규칙에 따라 <code>DataIntegrityViolationException</code>으로 바꾸었다. <code>DuplicateKeyException</code>이 아니므로 위 서비스의 catch 블록에는 걸리지 않고 위로 올라간다. 복구할 수 있는 실패와 없는 실패가 타입으로 갈린 것이다.</p>
+
+<h3>JDBC 반복 문제 해결: JdbcTemplate</h3>
+
+<p>남은 것은 반복이다. <code>JdbcAccountRepositoryV2</code>의 <code>save</code>를 다시 보면, 이 메서드만의 내용은 SQL 문자열과 두 개의 파라미터 바인딩뿐이다. 나머지는 모든 메서드에서 똑같다. 반복되는 일을 순서대로 적으면 다음과 같다.</p>
+
+<ol>
+<li>트랜잭션 동기화를 고려해 커넥션을 얻는다(<code>DataSourceUtils.getConnection</code>).</li>
+<li>SQL로 <code>PreparedStatement</code>를 준비한다.</li>
+<li>파라미터를 바인딩한다. <b>(메서드마다 다름)</b></li>
+<li>문장을 실행한다.</li>
+<li>결과 집합이 있으면 한 행씩 객체로 바꾼다. <b>(메서드마다 다름)</b></li>
+<li><code>SQLException</code>을 잡아 <code>DataAccessException</code>으로 변환한다.</li>
+<li>결과 집합과 문장을 닫는다.</li>
+<li>커넥션을 돌려준다(<code>DataSourceUtils.releaseConnection</code>).</li>
+</ol>
+
+<p>여덟 단계 중 메서드마다 다른 것은 SQL과 3번, 5번뿐이다. 이런 구조를 푸는 고전적인 방법이 템플릿 메서드 패턴(template method pattern)이고, 상속 대신 변하는 부분을 객체(콜백)로 넘기도록 바꾼 것이 템플릿 콜백 패턴(template callback pattern)이다. 변하지 않는 흐름은 템플릿이 쥐고, 변하는 부분만 호출하는 쪽이 콜백으로 넘긴다. 스프링의 <code>JdbcTemplate</code>이 정확히 이 구조다. 레퍼런스는 <code>JdbcTemplate</code>이 SQL 질의와 갱신을 실행하고, <code>ResultSet</code>을 반복하며, JDBC 예외를 잡아 <code>org.springframework.dao</code> 패키지의 예외 계층으로 변환하고, 자원의 생성과 해제를 맡아 커넥션을 닫는 것을 잊는 것 같은 흔한 실수를 막아 준다고 설명한다.</p>
+
+<p><code>JdbcTemplate</code>으로 리포지토리를 다시 쓰면 다음과 같다. 생성자에서 <code>DataSource</code>로 템플릿을 만들고, 각 메서드는 SQL과 파라미터, 그리고 조회의 경우 행을 객체로 바꾸는 <code>RowMapper</code>만 넘긴다.</p>
+
+<pre><code class="language-java">public class JdbcAccountRepositoryV3 implements AccountRepository {
+
+    private final JdbcTemplate template;
+
+    public JdbcAccountRepositoryV3(DataSource dataSource) {
+        this.template = new JdbcTemplate(dataSource);
+    }
+
+    @Override
+    public Account save(Account account) {
+        String sql = "insert into account(account_id, balance) values (?, ?)";
+        template.update(sql, account.accountId(), account.balance());
+        return account;
+    }
+
+    @Override
+    public Account findById(String accountId) {
+        String sql = "select account_id, balance from account where account_id = ?";
+        return template.queryForObject(sql, accountRowMapper(), accountId);
+    }
+
+    @Override
+    public void update(String accountId, int balance) {
+        String sql = "update account set balance = ? where account_id = ?";
+        template.update(sql, balance, accountId);
+    }
+
+    @Override
+    public void delete(String accountId) {
+        String sql = "delete from account where account_id = ?";
+        template.update(sql, accountId);
+    }
+
+    private RowMapper<Account> accountRowMapper() {
+        return (rs, rowNum) -> new Account(rs.getString("account_id"), rs.getInt("balance"));
+    }
+}</code></pre>
+
+<p><code>try</code>도 <code>catch</code>도 <code>finally</code>도 없다. 그런데도 커넥션은 트랜잭션 동기화를 거쳐 얻어지고, 문장은 닫히고, 예외는 변환된다. <code>RowMapper</code>는 함수형 인터페이스이고 메서드 <code>mapRow(ResultSet rs, int rowNum)</code> 하나를 가진다. 템플릿이 결과 집합의 커서를 한 행씩 옮기면서 각 행에 대해 이 콜백을 부르고, 돌아온 객체들을 모은다. 01회에서 직접 쓴 <code>while (rs.next())</code> 반복이 템플릿 안으로 들어간 것이다. 다음은 이 리포지토리를 실행한 결과다.</p>
+
+<pre><code class="language-java">AccountRepository repo = new JdbcAccountRepositoryV3(dataSource);
+repo.save(new Account("A1", 1000));
+repo.update("A1", 1500);
+System.out.println(repo.findById("A1"));
+try {
+    repo.save(new Account("A1", 1));
+} catch (DuplicateKeyException e) {
+    System.out.println(e.getClass().getName());
+    System.out.println("root cause: " + e.getRootCause().getClass().getName());
+}
+repo.delete("A1");
+try {
+    repo.findById("A1");
+} catch (EmptyResultDataAccessException e) {
+    System.out.println(e.getClass().getSimpleName() + ": " + e.getMessage());
+}</code></pre>
+
+<pre data-label="실행 결과 (H2 2.4.240, Spring Framework 7.0.9)"><code class="language-text">Account[accountId=A1, balance=1500]
+org.springframework.dao.DuplicateKeyException
+root cause: org.h2.jdbc.JdbcSQLIntegrityConstraintViolationException
+EmptyResultDataAccessException: Incorrect result size: expected 1, actual 0</code></pre>
+
+<h4>템플릿 안에서 일어나는 일: update 한 번의 실행 추적</h4>
+
+<p><code>template.update(sql, "A1", 1000)</code> 한 줄이 무엇을 하는지 소스를 따라가 보자(Spring Framework 7.0.10 소스, 6.1.x와 구조가 같다). 가변 인자를 받는 <code>update</code>는 인자 배열을 <code>PreparedStatementSetter</code>로 감싸고, SQL은 <code>PreparedStatementCreator</code>로 감싼다. 그다음 <code>update(PreparedStatementCreator, PreparedStatementSetter)</code>가 "세터로 값을 바인딩하고 <code>executeUpdate()</code>를 호출해 영향받은 행 수를 돌려준다"는 콜백을 람다로 만들어 핵심 메서드 <code>execute(psc, action, true)</code>에 넘긴다. 그 핵심 메서드의 뼈대는 다음과 같다.</p>
+
+<pre data-label="JdbcTemplate.execute(PreparedStatementCreator, PreparedStatementCallback, boolean) 요약"><code class="language-java">Connection con = DataSourceUtils.getConnection(obtainDataSource());   // ① 커넥션
+PreparedStatement ps = null;
+try {
+    ps = psc.createPreparedStatement(con);       // ② 문장 준비
+    applyStatementSettings(ps);                  //    fetchSize, maxRows, queryTimeout 적용
+    T result = action.doInPreparedStatement(ps); // ③ 콜백: 바인딩 + 실행
+    handleWarnings(ps);
+    return result;
+}
+catch (SQLException ex) {
+    // ... 문장을 닫고 커넥션을 먼저 돌려준 뒤
+    JdbcUtils.closeStatement(ps);
+    DataSourceUtils.releaseConnection(con, getDataSource());
+    con = null;
+    throw translateException("PreparedStatementCallback", sql, ex);  // ④ 예외 변환
+}
+finally {
+    JdbcUtils.closeStatement(ps);                // ⑤ 자원 정리
+    DataSourceUtils.releaseConnection(con, getDataSource());
+}</code></pre>
+
+<p>① 커넥션은 <code>DataSourceUtils.getConnection</code>으로 얻는다. 04회에서 본 대로 이 메서드는 먼저 <code>TransactionSynchronizationManager</code>에서 현재 스레드에 묶인 <code>ConnectionHolder</code>를 찾고, 있으면 그 커넥션을 돌려준다. 없을 때만 <code>DataSource</code>에서 새로 얻는다. ③에서 콜백이 실행되고, 정상이면 ⑤에서 문장을 닫고 커넥션을 돌려준다. <code>releaseConnection</code>도 같은 확인을 한다. 돌려받은 커넥션이 스레드에 묶인 트랜잭션 커넥션이면 닫지 않고 홀더의 참조 횟수만 줄인다(소스의 주석: "It's the transactional Connection: Don't close it."). 트랜잭션 커넥션이 아니면 닫는데, 커넥션 풀이 준 커넥션이라면 이 "닫기"는 02회에서 본 대로 풀에 반납하는 것이다.</p>
+
+<p>④의 catch 블록에는 눈여겨볼 순서가 있다. 예외를 변환하기 전에 문장을 닫고 커넥션부터 돌려준다. 소스의 주석은 그 이유를, 예외 변환기가 아직 초기화되지 않은 경우의 커넥션 풀 교착(deadlock) 가능성을 피하기 위해서라고 적는다. 오류 코드 변환기를 쓰는 경우를 생각하면 이해가 된다. <code>JdbcTemplate</code>은 기본적으로 변환기를 처음 필요할 때, 즉 첫 예외가 났을 때 만든다(<code>JdbcAccessor</code>의 <code>lazyInit</code> 기본값이 true다). 오류 코드 변환기는 만들어지는 시점에 데이터베이스 제품 이름을 알아내려고 <code>DataSource</code>에서 커넥션을 하나 더 얻는다. 풀의 커넥션이 모두 사용 중이고 그중 하나를 지금 이 스레드가 쥐고 있다면, 변환기는 커넥션을 기다리고 이 스레드는 변환이 끝나야 커넥션을 놓는다. 서로를 기다리는 상태가 된다. 커넥션을 먼저 놓으면 이 고리가 끊긴다. 커넥션 풀의 크기가 작을수록 의미가 커지는 세부다.</p>
+
+<p>조회 쪽도 같은 핵심 메서드를 지난다. <code>queryForObject(sql, rowMapper, args)</code>는 결과를 모으는 <code>RowMapperResultSetExtractor</code>로 질의를 실행해 리스트를 얻은 뒤, <code>DataAccessUtils.nullableSingleResult</code>에 넘긴다. 이 메서드는 리스트가 비어 있으면 <code>EmptyResultDataAccessException(1)</code>을, 두 건 이상이면 <code>IncorrectResultSizeDataAccessException(1, 실제 건수)</code>를 던지고, 정확히 한 건일 때만 그 값을 돌려준다. 그래서 위 실행 결과의 메시지가 "expected 1, actual 0"이었다. 두 행이 있는 테이블에서 조건 없이 <code>queryForObject</code>를 호출했을 때는 "Incorrect result size: expected 1, actual 2"가 나왔다. 결과가 0건일 때 null이 아니라 예외가 나온다는 점은 리포지토리 설계에 영향을 준다. "없을 수도 있는" 조회라면 이 예외를 잡아 <code>Optional.empty()</code>로 바꾸거나, <code>query</code>로 리스트를 받아 비었는지 확인하는 식으로 의미를 분명히 해 두는 것이 좋다.</p>
+
+<x-visual id="spring-db1-06-jdbctemplate-sequence" title="JdbcTemplate.update 한 번의 템플릿 콜백 시퀀스" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>리포지토리, JdbcTemplate, DataSourceUtils(트랜잭션 동기화), 콜백, 드라이버 사이에서 커넥션 획득, 콜백 실행, 예외 변환, 자원 반납이 어떤 순서로 일어나는지 보여 준다.</x-hint>
+<x-prompt>세로 생명선 다섯 개를 가진 시퀀스 다이어그램. 왼쪽부터 "리포지토리", "JdbcTemplate", "DataSourceUtils", "콜백(람다)", "JDBC 드라이버". 1번 화살표 리포지토리→JdbcTemplate 라벨 "update(sql, args)". 2번 JdbcTemplate→DataSourceUtils 라벨 "getConnection". DataSourceUtils 옆에 작은 메모 상자 "스레드에 묶인 트랜잭션 커넥션 우선". 3번 JdbcTemplate→JDBC 드라이버 라벨 "prepareStatement". 4번 JdbcTemplate→콜백 라벨 "doInPreparedStatement". 5번 콜백→JDBC 드라이버 라벨 "바인딩 + executeUpdate". 6번 점선 반환 화살표 JDBC 드라이버→JdbcTemplate. 그 아래 회색 분기 상자(alt) 안에 빨간 화살표 라벨 "SQLException → 예외 변환" 이 JdbcTemplate에서 리포지토리로 돌아간다. 마지막 7번 JdbcTemplate→DataSourceUtils 라벨 "releaseConnection". 평면 기술 도해 스타일, 흰 배경, 파랑과 회색, 오류 경로만 빨강.</x-prompt>
+<x-caption>변하지 않는 흐름(커넥션, 문장, 예외 변환, 반납)은 템플릿이 쥐고, 변하는 부분(바인딩, 실행, 행 매핑)만 콜백으로 들어온다.</x-caption>
+</x-visual>
+
+<h4>트랜잭션과 함께 쓰기, 그리고 스레드 안전성</h4>
+
+<p>템플릿이 <code>DataSourceUtils</code>를 거쳐 커넥션을 얻는다는 것은 04회의 트랜잭션 매니저와 그대로 맞물린다는 뜻이다. 실행으로 확인해 보자. <code>DataSourceTransactionManager</code>와 <code>TransactionTemplate</code>으로 트랜잭션을 열고, 그 안에서 <code>JdbcAccountRepositoryV3</code>로 두 행을 넣고 개수를 센 뒤, 일부러 중복 키를 넣어 예외를 냈다.</p>
+
+<pre><code class="language-java">TransactionTemplate tx = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+try {
+    tx.executeWithoutResult(status -> {
+        repo.save(new Account("B1", 100));
+        repo.save(new Account("B2", 200));
+        System.out.println("in tx count=" + template.queryForObject("select count(*) from account", Integer.class));
+        repo.save(new Account("B1", 300));   // DuplicateKeyException
+    });
+} catch (DuplicateKeyException e) {
+    System.out.println("rolled back by " + e.getClass().getSimpleName());
+}
+System.out.println("after tx count=" + template.queryForObject("select count(*) from account", Integer.class));</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">in tx count=2
+rolled back by DuplicateKeyException
+after tx count=0</code></pre>
+
+<p>트랜잭션 안에서 센 개수가 2라는 것은, 개수를 센 질의가 아직 커밋되지 않은 두 행을 볼 수 있는 커넥션, 즉 두 <code>insert</code>와 같은 커넥션에서 실행되었다는 뜻이다. 이 실험의 <code>DriverManagerDataSource</code>는 호출할 때마다 새 커넥션을 만드는데도 그랬으니, 템플릿들이 트랜잭션 동기화로 같은 커넥션을 받아 쓴 것이다. 콜백에서 <code>DuplicateKeyException</code>이 나오자 <code>TransactionTemplate</code>은 트랜잭션을 롤백하고 예외를 그대로 다시 던졌으며, 끝난 뒤 개수는 0이었다. 예외 전환은 선언적 트랜잭션에서 더 중요하다. <code>@Transactional</code>의 기본 롤백 규칙(<code>DefaultTransactionAttribute.rollbackOn</code>)은 <code>RuntimeException</code>과 <code>Error</code>일 때만 롤백하고, 체크 예외는 롤백 대상으로 보지 않는다. 데이터 접근 실패가 <code>SQLException</code> 그대로 올라왔다면 별도 설정(<code>rollbackFor</code>) 없이는 롤백되지 않았을 것이다. 예외를 런타임 예외인 <code>DataAccessException</code>으로 바꿔 두면 데이터 접근 실패가 기본 규칙만으로 롤백을 일으킨다.</p>
+
+<p><code>JdbcTemplate</code> 객체 하나를 여러 스레드가 함께 써도 될까. 레퍼런스는 <code>JdbcTemplate</code> 인스턴스가 설정이 끝난 뒤에는 스레드 안전하므로, 하나를 만들어 여러 DAO나 리포지토리에 공유해도 된다고 밝힌다. 위 <code>execute</code> 코드를 보면 이유가 보인다. 커넥션과 문장은 메서드의 지역 변수이고 호출마다 새로 얻는다. 템플릿이 필드로 갖는 것은 <code>DataSource</code>와 fetch size 같은 설정값, 그리고 한 번 정해지면 바뀌지 않는 예외 변환기 정도다. 스레드마다 다른 트랜잭션 커넥션은 템플릿이 아니라 트랜잭션 동기화 매니저의 <code>ThreadLocal</code>에 있다.</p>
+
+<p>스프링 부트를 쓰면 <code>JdbcTemplate</code>을 직접 만들 필요도 없다. 스프링 부트 레퍼런스에 따르면 <code>JdbcTemplate</code>과 <code>NamedParameterJdbcTemplate</code>은 자동 구성되므로 빈에 바로 주입받아 쓸 수 있고, 일부 설정은 <code>spring.jdbc.template.*</code> 속성(예: <code>spring.jdbc.template.max-rows</code>)으로 바꿀 수 있다. 이 회차처럼 리포지토리 생성자에서 <code>new JdbcTemplate(dataSource)</code>로 만들어도 무방하다. 템플릿은 가벼운 객체이고 커넥션을 미리 잡아 두지 않기 때문이다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<p><b>"런타임 예외로 바꾸면 예외 처리를 하지 않아도 된다."</b> 바뀐 것은 처리를 강제하느냐이지 처리가 필요하냐가 아니다. 키 중복처럼 복구할 수 있는 실패는 여전히 누군가 골라 잡아야 하고, 복구할 수 없는 실패는 공통 예외 처리에서 로그를 남기고 적절한 응답으로 바꿔야 한다. 런타임 예외 전환은 처리할 수 없는 계층이 억지로 시그니처를 오염시키지 않게 해 줄 뿐이다. 오히려 컴파일러의 도움이 없어지므로 어떤 예외가 어디서 나오는지 문서로 남기는 책임이 커진다.</p>
+
+<p><b>"DuplicateKeyException은 키 중복이면 항상 나온다."</b> 어떤 예외가 나오는지는 변환기와 드라이버에 달려 있다. 6.0.4 이후의 기본 변환기는 드라이버가 <code>SQLIntegrityConstraintViolationException</code>을 던지고, SQLState가 23505이거나 23000이면서 오류 코드가 알려진 번호일 때 <code>DuplicateKeyException</code>을 만든다. 조건이 맞지 않으면 상위 타입인 <code>DataIntegrityViolationException</code>이 나온다. 스프링의 <code>DuplicateKeyException</code> Javadoc도 더 넓은 범위의 제약 위반을 포함하는 <code>DataIntegrityViolationException</code>을 처리하는 것을 고려하라고 권한다. 정확한 분류가 중요하다면 사용하는 데이터베이스와 드라이버 조합에서 실제로 어떤 예외가 나오는지 테스트로 고정해 두는 것이 안전하다. 클래스패스 루트에 <code>sql-error-codes.xml</code>을 두는 순간 기본 변환기가 오류 코드 변환기로 바뀐다는 점도 기억해 두자. 의도하지 않은 파일 하나가 변환 결과를 바꿀 수 있다.</p>
+
+<p><b>"예외 변환기의 translate는 항상 예외를 돌려준다."</b> null을 돌려줄 수 있다. 앞에서 본 것처럼 <code>throw translator.translate(...)</code>는 그 경우 원래 예외를 잃고 <code>NullPointerException</code>을 던진다. 변환기를 직접 쓸 때는 <code>JdbcTemplate</code>처럼 null을 <code>UncategorizedSQLException</code>으로 감싸는 처리를 함께 둔다.</p>
+
+<p><b>"예외를 잡았으니 트랜잭션은 안전하다."</b> <code>@Transactional</code> 서비스 안에서 <code>DataAccessException</code>을 잡고 아무 일 없다는 듯 계속하면, 그 예외는 트랜잭션 프록시까지 올라가지 않는다. 프록시는 정상 종료로 보고 커밋한다. 실패한 문장의 효과는 데이터베이스가 문장 단위로 되돌렸더라도, 그 앞의 다른 변경은 커밋된다. 위의 계좌 개설처럼 복구가 업무적으로 완결되는 경우에만 잡고, 그렇지 않으면 다시 던지거나 잡지 않는다. 어떤 실패 뒤에 트랜잭션을 계속 쓸 수 있는지도 데이터베이스마다 다르다는 점은 앞에서 MySQL InnoDB 문서로 확인했다.</p>
+
+<p><b>"스택 트레이스는 맨 위만 보면 된다."</b> 맨 위는 마지막으로 감싼 예외다. 스프링 예외의 메시지에도 원래 메시지가 이어 붙지만(<code>save; SQL [insert ...]; Unique index or primary key violation ...</code>처럼 작업 이름, SQL, 원래 메시지 순서), 원래 예외의 타입과 발생 위치는 <code>Caused by:</code> 아래에 있다. 장애를 분석할 때는 맨 아래의 <code>Caused by:</code>, 즉 근본 원인부터 읽는다.</p>
+
+<h3>정리: 이 권이 도착한 곳</h3>
+
+<p>이 회차의 수업 주제를 되짚으면 이렇다. 체크 예외는 인터페이스의 시그니처를 통해 기술을 새어 나오게 하고(체크 예외와 인터페이스), 구현 안에서 원인을 보존한 런타임 예외로 감싸면 그 누수가 멈춘다(런타임 예외 적용). 복구할 수 있는 실패는 별도 예외로 골라 내야 하지만 직접 하면 데이터베이스별 번호에 묶이고(데이터 접근 예외 직접 만들기), 스프링은 기술 독립적인 <code>DataAccessException</code> 계층과 변환기로 그 일을 대신한다(스프링 예외 추상화 이해와 적용). 마지막으로 <code>JdbcTemplate</code>이 반복되는 JDBC 흐름을 템플릿으로 가져가면서 예외 변환과 트랜잭션 동기화까지 함께 처리한다(JDBC 반복 문제 해결).</p>
+
+<p>이 권 전체로 넓혀 보면, 처음에 서비스가 짊어지고 있던 데이터 접근의 짐이 한 회차씩 아래로 내려갔다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>회차</th><th>서비스에서 걷어 낸 것</th><th>대신 맡은 것</th></tr></thead><tbody>
+<tr><td>01 JDBC 이해</td><td>데이터베이스별 통신 방식</td><td>JDBC 표준 인터페이스와 드라이버</td></tr>
+<tr><td>02 커넥션 풀과 데이터소스</td><td>커넥션 생성 비용과 획득 방식</td><td>커넥션 풀, <code>DataSource</code></td></tr>
+<tr><td>03 트랜잭션 이해</td><td>(문제 제기) 트랜잭션은 커넥션 단위다</td><td>데이터베이스 세션과 커밋·롤백</td></tr>
+<tr><td>04 트랜잭션 문제 해결</td><td>커넥션 전달, 커밋·롤백 코드</td><td>트랜잭션 매니저, 동기화, <code>@Transactional</code></td></tr>
+<tr><td>05 자바 예외 이해</td><td>(원칙) 체크·언체크의 쓰임</td><td>예외 처리 규칙</td></tr>
+<tr><td>06 예외 처리, 반복</td><td><code>SQLException</code> 의존, 오류 번호, 반복 코드</td><td>예외 전환, <code>DataAccessException</code>과 변환기, <code>JdbcTemplate</code></td></tr>
+</tbody></table></div>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>예외는 그것을 처리할 수 있는 곳까지만 올라가야 하고, 그 과정에서 원인 정보는 하나도 잃지 않아야 한다. 체크 예외는 컴파일러만 아는 계약이어서 처리할 수 없는 계층의 시그니처까지 기술을 끌고 올라간다. 리포지토리 구현 안에서 원인을 보존한 런타임 예외로 바꾸면 그 누수가 멈추고, 스프링의 변환기가 데이터베이스마다 다른 오류 번호를 "키 중복", "문법 오류", "락 실패" 같은 기술 독립적인 의미로 바꾼다. JdbcTemplate은 이 변환과 자원 정리, 트랜잭션 동기화를 템플릿 안에 묶어 리포지토리에는 SQL과 매핑만 남긴다.</p></aside>
+
+<p>다음 권인 스프링 DB 2편은 이 바닥 위에서 데이터 접근 기술 자체를 바꿔 끼운다. 이 권의 <code>JdbcTemplate</code>을 출발점으로 MyBatis, JPA, 스프링 데이터 JPA, Querydsl을 비교하고, JPA 예외가 어떻게 같은 <code>DataAccessException</code> 계층으로 변환되는지도 다룬다. 서비스가 <code>AccountRepository</code> 인터페이스와 스프링 예외에만 의존하게 만들어 둔 이 회차의 결과가, 그때 구현을 바꿔 끼워도 서비스가 흔들리지 않는 이유가 된다. 스프링 레퍼런스가 리포지토리에 예외 변환을 보장하는 가장 좋은 방법으로 <code>@Repository</code> 애너테이션을 권하는 것도 그 맥락에서 다시 만나게 된다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>체크 예외와 인터페이스</dt><dd>구현 메서드는 인터페이스가 선언하지 않은 체크 예외를 던질 수 없다(JLS 11.2, 8.4.8.3). 인터페이스에 <code>throws SQLException</code>을 붙이면 역할 정의가 JDBC에 묶이고, <code>throws Exception</code>은 컴파일러의 도움까지 없앤다.</dd>
+<dt>Exceptions 속성</dt><dd>throws 절은 메서드 서술자가 아니라 클래스 파일의 Exceptions 속성에 기록된다. JVMS 4.7.5는 이 요구 사항이 JVM에서 강제되지 않고 컴파일 시점에만 강제된다고 밝힌다.</dd>
+<dt>예외 전환과 원인 보존</dt><dd>리포지토리 구현 안에서 <code>SQLException</code>을 런타임 예외로 감싸 던진다. 원인을 생성자에 넘겨야 스택 트레이스의 <code>Caused by:</code>와 SQLState, 오류 코드가 남는다.</dd>
+<dt>SQLException의 세 가지 정보</dt><dd>메시지, SQLState(앞 두 글자가 분류), 제조사 오류 코드. 키 중복은 H2에서 23505/23505, MySQL에서 1062/23000으로 데이터베이스마다 다르다.</dd>
+<dt>DataAccessException 계층</dt><dd>스프링의 기술 독립적인 런타임 예외 계층. 비일시적, 일시적, 복구 가능의 세 갈래가 JDBC 4 예외의 세 갈래와 짝을 이루며 재시도 판단의 기준이 된다.</dd>
+<dt>예외 변환기</dt><dd>오류 코드(sql-error-codes.xml), JDBC 4 하위 클래스, SQLState를 각각 기준으로 하는 세 구현이 사슬로 이어진다. Spring Framework 6.0부터 기본은 하위 클래스 변환기이고, 클래스패스 루트에 sql-error-codes.xml이 있으면 오류 코드 변환기를 쓴다.</dd>
+<dt>translate의 null</dt><dd>변환기는 분류하지 못하면 null을 돌려준다. 직접 쓸 때는 <code>UncategorizedSQLException</code>으로 감싸야 하며, JdbcTemplate은 이를 스스로 한다.</dd>
+<dt>JdbcTemplate</dt><dd>커넥션 획득(트랜잭션 동기화 포함), 문장 준비, 예외 변환, 자원 정리를 템플릿이 맡고 SQL, 파라미터, RowMapper만 콜백으로 받는 템플릿 콜백 구조. 설정 후에는 스레드 안전하다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 예외 전환이 가장 크게 드러나는 곳은 장애 분석이다. 운영 로그에 "데이터베이스 오류" 한 줄만 남고 원인을 찾지 못하는 사고의 상당수는 어딘가에서 예외를 감싸며 원인을 버린 코드에서 시작된다. 코드 리뷰에서 catch 블록을 볼 때 "원래 예외를 생성자에 넘겼는가"와 "잡고 나서 정말 복구했는가, 아니면 삼켰는가" 두 가지를 확인하는 습관이 이 회차에서 얻을 가장 실용적인 기준이다. <code>@Transactional</code> 안에서 데이터 접근 예외를 잡고 계속 진행하는 코드는 특히 의심해야 한다. 예외가 프록시까지 올라가지 않으면 트랜잭션은 커밋된다.</p>
+
+<p>어떤 예외를 잡을지는 데이터베이스와 드라이버 조합에 따라 판단이 달라진다. H2로 테스트하고 MySQL로 운영한다면, 같은 키 중복이 테스트에서는 <code>DuplicateKeyException</code>으로 나오는데 운영에서는 다른 타입으로 나오는 일이 없는지 운영과 같은 데이터베이스로 한 번은 확인해야 한다. 기본 변환기는 드라이버가 던지는 예외 타입과 SQLState를 믿고, 오류 코드 변환기는 변환표를 믿는다. 정밀한 분류가 업무 로직의 분기 조건이 된다면 상위 타입(<code>DataIntegrityViolationException</code>)으로 넓게 잡을지, 변환표를 직접 관리할지를 의식적으로 정한다. 스프링 버전을 올릴 때도 이 부분은 회귀 테스트의 대상이다. 5.x에서 6.x로 넘어오며 기본 변환기가 바뀐 것이 그 예다.</p>
+
+<p>재시도 정책도 이 계층 위에서 설계한다. 일시적 예외 계열(락 획득 실패, 질의 시간 초과)은 짧은 간격으로 몇 번 다시 시도할 만하지만, 재시도는 트랜잭션 전체 단위여야 한다. MySQL InnoDB에서 교착 상태는 트랜잭션 전체를 롤백시키므로, 실패한 문장 하나만 다시 보내는 재시도는 의미가 없다. 반대로 비일시적 예외에 재시도를 걸면 같은 실패를 여러 번 반복하며 데이터베이스 부하만 키운다. 예외의 분류가 곧 운영 정책의 분류라는 점을 기억해 두자.</p>
+</x-review>
+
+<x-practice>
+<li>인터페이스 <code>interface Loader { String load(String key) throws IOException; }</code>가 있다. 이를 구현하는 메서드의 throws 절이 (a) <code>throws FileNotFoundException</code>, (b) <code>throws SQLException</code>, (c) throws 절 없이 본문에서 <code>throw new IllegalStateException()</code>, (d) <code>throws Exception</code>일 때 각각 컴파일되는지 판단하고, JLS의 어느 규칙 때문인지 설명하라.</li>
+<li>리포지토리의 catch 블록이 <code>throw new MyDbException("save failed", e);</code>일 때와 <code>throw new MyDbException("save failed");</code>일 때, <code>printStackTrace()</code> 출력의 첫 줄과 <code>Caused by:</code> 유무가 어떻게 다른지 예측하라. 앞의 경우 첫 줄의 메시지는 무엇인가.</li>
+<li>Spring Framework 6.0.4 이후의 6.x에서 클래스패스 루트에 sql-error-codes.xml이 없다. MySQL 드라이버가 <code>SQLIntegrityConstraintViolationException</code>을 던졌고, (a) SQLState가 23000이고 오류 코드가 1062인 경우, (b) SQLState가 23000이고 오류 코드가 1452인 경우 JdbcTemplate이 던지는 스프링 예외는 각각 무엇인가. 판단 근거를 변환기의 소스 흐름으로 설명하라.</li>
+<li>운영 로그에 가끔 <code>NullPointerException: Cannot throw exception because the return value of "...SQLExceptionTranslator.translate(...)" is null</code>이 찍힌다. 리포지토리 코드는 <code>catch (SQLException e) { throw translator.translate("find", sql, e); }</code>이다. 원인과 고치는 방법을 설명하고, 고치기 전까지 로그에서 무엇을 잃고 있었는지 말하라.</li>
+<li><code>template.queryForObject("select balance from account where owner = ?", Integer.class, "kim")</code>을 실행한다. 조건에 맞는 행이 0개, 1개, 3개일 때 각각 어떤 결과가 나오는지 예측하고, 이 메서드로 "없을 수도 있는 조회"를 구현할 때의 설계 선택지를 두 가지 들어라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> (a) 컴파일된다. <code>FileNotFoundException</code>은 <code>IOException</code>의 하위 클래스이므로 재정의되는 메서드가 허락한 범위 안이다. (b) 컴파일 오류다. <code>SQLException</code>은 <code>IOException</code>과 무관한 체크 예외이고, JLS 11.2(상세는 8.4.8.3)는 재정의하는 메서드가 재정의되는 메서드가 허락하지 않은 체크 예외를 던진다고 선언하는 것을 금지한다. javac는 "overridden method does not throw SQLException"을 낸다. (c) 컴파일된다. <code>IllegalStateException</code>은 <code>RuntimeException</code>의 하위 클래스, 즉 언체크 예외라 이 검사에서 빠진다. throws 절을 생략하는 것 자체도 선언을 줄이는 것이라 허용된다. (d) 컴파일 오류다. <code>Exception</code>은 <code>IOException</code>보다 넓은 체크 예외 타입이다.</p>
+<p><b>2.</b> 앞의 경우 첫 줄은 <code>MyDbException: save failed</code>이고, 그 아래 <code>MyDbException</code>의 스택이 나온 뒤 <code>Caused by: java.sql.SQLException: ...</code>과 원래 예외의 스택이 이어진다. 메시지를 직접 넘겼으므로 원인의 <code>toString()</code>이 메시지가 되지 않는다(그것은 원인만 받는 생성자의 동작이다). 뒤의 경우 첫 줄은 같지만 <code>Caused by:</code>가 없다. 원래 예외의 타입, SQLState, 오류 코드, 발생 위치를 모두 잃는다.</p>
+<p><b>3.</b> 기본 변환기는 <code>SQLExceptionSubclassTranslator</code>다(<code>JdbcAccessor.getExceptionTranslator</code>가 사용자 제공 sql-error-codes.xml이 없으면 이것을 만든다). 예외가 <code>SQLNonTransientException</code> 계열의 <code>SQLIntegrityConstraintViolationException</code>이므로 키 중복 여부를 확인한다. (a) SQLState가 23000이고 1062가 키 중복 번호 목록에 있으므로 <code>DuplicateKeyException</code>이다. (b) 1452는 그 목록에 없으므로 <code>DataIntegrityViolationException</code>이다. 어느 쪽이든 원래 <code>SQLException</code>이 cause로 남는다.</p>
+<p><b>4.</b> <code>SQLExceptionTranslator.translate</code>는 분류할 수 없으면 null을 돌려준다. <code>throw null</code>을 실행하면 자바는 <code>NullPointerException</code>을 대신 던진다(JLS 14.18). 그래서 분류되지 않는 드물게 나오는 SQL 오류마다 원래 <code>SQLException</code>이 버려지고 NPE만 남았다. 고치려면 결과가 null일 때 <code>new UncategorizedSQLException(task, sql, e)</code>로 감싸 던진다. <code>JdbcTemplate.translateException</code>이 하는 일과 같다. 그동안 잃은 것은 원래 예외의 메시지, SQLState, 제조사 오류 코드, 발생 위치 전부다.</p>
+<p><b>5.</b> 0개면 <code>EmptyResultDataAccessException</code>("Incorrect result size: expected 1, actual 0"), 1개면 그 값, 3개면 <code>IncorrectResultSizeDataAccessException</code>("expected 1, actual 3")이 나온다. 내부에서 결과 리스트를 <code>DataAccessUtils.nullableSingleResult</code>에 넘기기 때문이다. 선택지는 (가) <code>EmptyResultDataAccessException</code>을 잡아 <code>Optional.empty()</code>로 바꾸는 것, (나) <code>query</code>로 리스트를 받아 비었으면 빈 결과, 하나면 그 값으로 처리하는 것이다. 여러 건이 나오면 안 되는 조회라면 3개일 때의 예외는 데이터 문제를 알려 주는 신호이므로 삼키지 않는다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>체크 예외와 JVM의 관계에 대한 설명으로 옳은 것은?</q>
+<o>throws 절은 메서드 서술자에 포함되므로, throws 절이 다른 두 메서드는 JVM에서 서로 다른 메서드다.</o>
+<o>throws 절은 클래스 파일의 Exceptions 속성에 기록되며, JVM은 이를 실행 중에 강제하지 않는다.</o>
+<o>JVM은 메서드가 선언하지 않은 체크 예외를 던지면 VerifyError를 낸다.</o>
+<o>체크 예외를 런타임 예외로 바꾸면 예외 객체를 만드는 비용이 줄어든다.</o>
+<why>javap -v로 보면 서술자 <code>(Ljava/lang/String;I)V</code>에는 예외가 없고, throws 절은 별도의 Exceptions 속성에 있다. JVMS 4.7.5는 이 요구 사항이 JVM에서 강제되지 않고 컴파일 시점에만 강제된다고 밝힌다. 따라서 0번과 2번은 틀렸다. 3번도 틀렸다. 실행 중의 JVM에게 체크와 언체크의 차이는 없으며 둘 다 <code>Throwable</code> 객체를 만들고 스택을 채운다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>Spring Framework 6.x 애플리케이션의 클래스패스 루트에 sql-error-codes.xml이 없다. 변환기를 따로 설정하지 않은 JdbcTemplate이 SQLException을 변환할 때 쓰는 변환기는?</q>
+<o>SQLErrorCodeSQLExceptionTranslator. spring-jdbc jar 안의 기본 sql-error-codes.xml을 항상 쓰기 때문이다.</o>
+<o>SQLStateSQLExceptionTranslator. SQLState가 표준이기 때문이다.</o>
+<o>SQLExceptionSubclassTranslator. 분류하지 못하면 SQLStateSQLExceptionTranslator로 넘긴다.</o>
+<o>변환기가 없으므로 모든 예외가 UncategorizedSQLException이 된다.</o>
+<why><code>JdbcAccessor.getExceptionTranslator()</code>는 사용자가 클래스패스 루트에 sql-error-codes.xml을 둔 경우에만 오류 코드 변환기를 만들고, 그렇지 않으면 <code>SQLExceptionSubclassTranslator</code>를 만든다. 레퍼런스와 Javadoc도 6.0부터 이것이 기본이라고 밝힌다. 이 변환기의 대체 변환기가 SQLState 변환기다. UncategorizedSQLException은 사슬 전체가 null을 돌려줄 때만 쓰인다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>JdbcTemplate의 execute는 SQLException을 잡으면 예외를 변환하기 전에 문장을 닫고 커넥션부터 돌려준다. 그 이유로 가장 알맞은 것은?</q>
+<o>변환기가 처음 만들어질 때 데이터베이스 메타데이터를 얻으려고 커넥션을 하나 더 얻을 수 있어, 풀의 커넥션을 쥔 채 기다리는 교착을 피하려는 것이다.</o>
+<o>커넥션을 닫아야 데이터베이스가 SQLState를 채워 주기 때문이다.</o>
+<o>예외 변환이 끝나면 커넥션 객체가 가비지 컬렉션되어 닫을 수 없기 때문이다.</o>
+<o>트랜잭션을 즉시 롤백하기 위해서다.</o>
+<why>소스 주석은 예외 변환기가 아직 초기화되지 않은 경우의 커넥션 풀 교착 가능성을 피하려는 것이라고 적는다. JdbcTemplate은 기본적으로 변환기를 첫 예외 때 만들고, 오류 코드 변환기는 만들어질 때 제품 이름을 알아내려고 커넥션을 얻는다. 풀이 바닥난 상태에서 커넥션을 쥔 채 기다리면 서로를 기다리게 된다. 트랜잭션 커넥션이라면 releaseConnection은 닫지 않고 참조 횟수만 줄이므로 롤백과는 관계가 없다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>@Transactional</code> 서비스 메서드 안에서 리포지토리가 데이터 접근 실패를 알리는 방식과 기본 롤백 동작의 조합으로 옳은 것은?</q>
+<o>리포지토리가 SQLException을 그대로 던지면, 기본 설정에서도 트랜잭션은 롤백된다.</o>
+<o>리포지토리가 DataAccessException을 던져도 서비스가 잡아서 로그만 남기면 트랜잭션은 롤백된다.</o>
+<o>DataAccessException은 체크 예외이므로 rollbackFor를 지정해야 롤백된다.</o>
+<o>리포지토리가 DataAccessException을 던지고 서비스가 잡지 않으면, 기본 규칙만으로 트랜잭션이 롤백된다.</o>
+<why>기본 롤백 규칙(<code>DefaultTransactionAttribute.rollbackOn</code>)은 RuntimeException과 Error일 때만 롤백한다. DataAccessException은 런타임 예외이므로 프록시까지 올라가면 롤백된다(3번). SQLException은 체크 예외라 기본 설정에서는 롤백 대상이 아니다(0번 오답). 서비스가 예외를 잡아 삼키면 프록시는 정상 종료로 보고 커밋한다(1번 오답). DataAccessException은 NestedRuntimeException을 거쳐 RuntimeException을 상속한다(2번 오답).</why>
+</x-quiz>
+
+<x-glossary>
+<dt>예외 전환(exception translation)</dt><dd>하위 계층의 예외를 잡아 상위 계층에 맞는 다른 예외로 바꿔 던지는 것. 원래 예외를 원인(cause)으로 넘겨 정보를 보존한다.</dd>
+<dt>예외 연쇄(exception chaining)</dt><dd>예외 객체가 <code>cause</code>로 다른 예외 객체를 가리키는 구조. Java 1.4에서 <code>Throwable</code>의 원인 생성자와 함께 들어왔고, 스택 트레이스의 <code>Caused by:</code>로 출력된다.</dd>
+<dt>Exceptions 속성(Exceptions attribute)</dt><dd>클래스 파일에서 메서드의 throws 절을 기록하는 속성(JVMS 4.7.5). 컴파일러와 도구가 쓰며 JVM은 실행 중에 강제하지 않는다.</dd>
+<dt>SQLState</dt><dd>X/Open 또는 SQL:2003 관례를 따르는 다섯 글자 오류 코드. 앞 두 글자가 분류이며 '23'은 무결성 제약 위반, '42'는 문법 위반이다.</dd>
+<dt>제조사 오류 코드(vendor error code)</dt><dd><code>SQLException.getErrorCode()</code>가 돌려주는 데이터베이스 제조사 고유 번호. 키 중복이 H2에서는 23505, MySQL에서는 1062다.</dd>
+<dt>DataAccessException</dt><dd>스프링 데이터 접근 예외 계층의 뿌리인 런타임 예외. <code>org.springframework.dao</code> 패키지(spring-tx 모듈)에 있으며 데이터 접근 기술에 독립적이다.</dd>
+<dt>SQLExceptionTranslator</dt><dd>SQLException을 DataAccessException으로 바꾸는 스프링 인터페이스. 분류할 수 없으면 null을 돌려준다.</dd>
+<dt>템플릿 콜백 패턴(template callback pattern)</dt><dd>변하지 않는 흐름은 템플릿 객체가 쥐고, 변하는 부분만 호출하는 쪽이 콜백 객체로 넘기는 구조. JdbcTemplate과 RowMapper가 대표적인 예다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/data-access/jdbc/core.html">Spring Framework Reference — Using the JDBC Core Classes</a> — JdbcTemplate이 하는 일, 스레드 안전성, 6.0 이후 기본 SQLExceptionTranslator</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/data-access/dao.html">Spring Framework Reference — DAO Support</a> — 일관된 예외 계층, 원래 예외의 보존, @Repository와 예외 변환</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-11.html">JLS (Java SE 21) Chapter 11. Exceptions</a> — 체크·언체크 예외의 정의, 컴파일 시점 검사, 재정의 메서드의 throws 절 제한</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-4.html">JVMS (Java SE 21) Chapter 4. The class File Format</a> — §4.7.5 Exceptions 속성과 JVM이 이를 강제하지 않는다는 규정</li>
+<li><a href="https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html">MySQL 8.0 Server Error Message Reference</a> — 오류 1062(ER_DUP_ENTRY)와 SQLSTATE 23000</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-error-handling.html">MySQL 8.0 Reference Manual — InnoDB Error Handling</a> — 중복 키 오류는 문장을, 교착 상태는 트랜잭션 전체를 롤백한다는 규정</li>
+</x-refs>

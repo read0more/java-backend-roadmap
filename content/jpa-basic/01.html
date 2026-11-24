@@ -1,0 +1,610 @@
+<x-meta>
+deck: JDBC로 객체를 저장할 때 왜 같은 코드가 반복되고 객체 모델이 무너지는지에서 출발해, JPA 표준과 하이버네이트가 JDBC 위 어디에서 SQL을 만들고 부트스트랩되는지를 실행 로그와 스택 트레이스로 따라간다.
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li>객체 모델과 테이블 모델 사이의 네 가지 불일치(상속, 연관관계, 객체 그래프 탐색, 비교)를 JVM 힙의 참조와 외래 키·조인의 차이로 설명하고, JDBC 코드에서 그 불일치가 어떤 반복 코드로 나타나는지 예를 들 수 있다.</li>
+<li>JPA가 명세(인터페이스 묶음)이고 하이버네이트가 그 구현이라는 관계를, <code>EntityManagerFactory</code>의 실제 클래스와 JPQL 실행 스택 트레이스에서 JDBC <code>PreparedStatement</code>가 호출되는 지점을 근거로 보여 줄 수 있다.</li>
+<li><code>persistence.xml</code>의 각 설정을 표준 속성과 하이버네이트 전용 속성으로 나누고, 방언(Dialect) 자동 감지와 엔티티 클래스 등록·스캔 규칙을 실행 결과로 설명할 수 있다.</li>
+<li><code>Persistence.createEntityManagerFactory</code> 한 줄에서 일어나는 부트스트랩 순서(프로바이더 탐색, 설정 파일 탐색, 커넥션과 방언 결정, 메타모델 구축, 스키마 생성)를 로그 순서와 맞춰 말할 수 있다.</li>
+<li><code>EntityManagerFactory</code>와 <code>EntityManager</code>의 수명·스레드 규칙을 지키는 CRUD 코드를 쓰고, 실행 로그에서 INSERT·SELECT·UPDATE·DELETE가 각각 언제 나가는지 예측할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 객체를 데이터베이스에 "저장한다"는 말의 무게</h3>
+
+<p>자바 프로그램이 다루는 데이터는 JVM 힙(heap)에 놓인 객체들이다. 객체는 필드를 갖고, 필드는 기본형 값이거나 다른 객체를 가리키는 참조다. 프로그램이 끝나면 힙은 사라지므로, 오래 남겨야 하는 데이터는 어딘가에 저장해야 한다. 현실의 선택지는 대부분 관계형 데이터베이스(relational database)다. 문제는 관계형 데이터베이스가 객체를 모른다는 데 있다. 데이터베이스가 아는 것은 테이블, 행, 컬럼, 기본 키와 외래 키, 그리고 그것을 다루는 SQL뿐이다.</p>
+
+<p>그래서 "객체를 저장한다"는 말은 실제로는 번역 작업이다. 힙에 있는 객체를 쪼개 INSERT 문의 파라미터로 바꾸고, 반대로 SELECT 결과의 행과 컬럼을 모아 다시 객체를 조립한다. 앞선 권(스프링 DB 1편·2편)에서 JDBC, <code>JdbcTemplate</code>, MyBatis로 이 번역을 직접 해 봤고, JPA 활용 1편에서는 스프링 부트 위에서 JPA로 애플리케이션을 만들어 봤다. 이번 권은 방향을 바꿔 스프링을 걷어 내고 JPA 그 자체를 본다. 스프링 없이 JPA를 띄우면, 스프링 부트가 대신 해 주던 일(설정 파일 읽기, 커넥션 준비, 트랜잭션 시작과 종료)이 코드에 그대로 드러나기 때문이다.</p>
+
+<p>이번 권은 열 개의 회차로 되어 있다. 이 회차가 JPA가 왜 필요한지와 가장 작은 JPA 애플리케이션을 다루고, 02회가 영속성 컨텍스트의 내부 동작(1차 캐시, 쓰기 지연, 변경 감지, 플러시)을, 03회가 엔티티와 테이블 매핑과 기본 키 생성 전략을, 04·05회가 연관관계 매핑을, 06회가 상속 매핑을, 07회가 프록시와 지연 로딩을, 08회가 값 타입을, 09·10회가 JPQL을 다룬다. 이 회차에서 잠깐 보이는 동작들(커밋 때 INSERT가 나가는 것, 같은 엔티티를 두 번 조회해도 SELECT가 한 번인 것)은 02회에서 바닥까지 판다. 여기서는 "그런 일이 실제로 일어난다"는 것을 로그로 확인하는 데서 멈춘다.</p>
+
+<p>이 회차의 모든 실행 결과는 직접 돌려 얻었다. 환경은 JDK 21.0.13(Temurin), 하이버네이트 ORM 6.6.53.Final, Jakarta Persistence API 3.1.0, H2 2.3.232이다. 빌드 도구 없이 <code>javac</code>와 <code>java</code>로 클래스패스를 직접 구성해 돌렸으므로, 스프링 부트도 커넥션 풀 라이브러리도 끼어 있지 않다. 예제 도메인은 이 회차를 위해 새로 만든 도서(<code>Book</code>) 엔티티 하나다.</p>
+
+<h3>SQL 중심 개발: 같은 일을 객체 수만큼 반복한다</h3>
+
+<p>JDBC로 도서를 저장하고 조회하는 코드를 떠올려 보자. 저장할 때는 SQL 문자열을 쓰고, <code>PreparedStatement</code>를 얻고, 객체의 게터를 하나씩 불러 파라미터 자리에 넣는다. 조회할 때는 SQL을 실행해 <code>ResultSet</code>을 받고, 컬럼을 하나씩 꺼내 생성자나 세터로 객체를 채운다. 아래는 조회 쪽만 쓴 예다.</p>
+
+<pre><code class="language-java">static Book findById(Connection con, long id) throws SQLException {
+    try (PreparedStatement ps = con.prepareStatement(
+            "select id, title, price from book where id = ?")) {
+        ps.setLong(1, id);
+        try (ResultSet rs = ps.executeQuery()) {
+            if (!rs.next()) return null;
+            return new Book(rs.getLong("id"), rs.getString("title"), rs.getInt("price"));
+        }
+    }
+}</code></pre>
+
+<p>이 코드에서 도메인에 관한 정보는 "도서는 id, title, price를 갖는다"는 한 가지뿐인데, 그 정보가 세 군데에 흩어져 있다. SQL 문자열의 컬럼 목록, <code>rs.getXxx</code> 호출들, 그리고 <code>Book</code> 클래스의 필드다. 저장, 수정, 삭제, 목록 조회 메서드에도 같은 정보가 반복된다. 도메인 객체가 열 개면 이 작업도 열 번 반복된다. 스프링 DB 2편의 <code>JdbcTemplate</code>이나 MyBatis는 커넥션과 예외 처리 같은 공통 부분을 덜어 주었지만, "어떤 컬럼을 어떤 필드에 넣는가"라는 번역 자체는 여전히 개발자가 쓴다.</p>
+
+<p>요구 사항이 바뀌면 문제가 더 분명해진다. 도서에 출판일(<code>publishedAt</code>) 필드를 추가한다고 하자. 클래스에 필드를 하나 추가하는 것으로 끝나지 않는다. INSERT 문에 컬럼과 파라미터를 추가하고, 모든 SELECT 문의 컬럼 목록에 추가하고, 매핑 코드에 <code>rs.getObject("published_at", LocalDate.class)</code>를 추가하고, UPDATE 문에도 추가해야 한다. 하나라도 빠뜨리면 컴파일러는 아무 말도 하지 않는다. SQL은 자바 컴파일러 입장에서 그냥 문자열이기 때문이다. 오타 하나, 빠진 컬럼 하나는 그 SQL이 실제로 실행되는 순간에야 <code>SQLException</code>으로, 더 나쁘게는 조용히 비어 있는 필드로 드러난다.</p>
+
+<p>더 미묘한 문제는 계층 사이의 신뢰다. 서비스 계층이 DAO(Data Access Object)에서 <code>Book</code>을 받았을 때, 그 객체의 어느 필드가 채워져 있는지는 DAO가 실행한 SQL이 정한다. 도서와 출판사를 조인했다면 <code>book.getPublisher()</code>가 채워져 있고, 조인하지 않았다면 <code>null</code>이다. 서비스 코드만 봐서는 알 수 없고, DAO의 SQL을 열어 봐야 안다. 물리적으로는 계층을 나눴지만 논리적으로는 서비스 계층이 DAO의 SQL에 묶여 있는 셈이다. 결국 "객체를 다룬다"고 생각하며 코드를 쓰지만 실제로는 SQL에 맞춰 객체 모양을 정하게 된다. 이것을 흔히 SQL 중심적인 개발이라고 부른다.</p>
+
+<h3>패러다임 불일치 1: 상속</h3>
+
+<p>객체 지향과 관계형 모델은 서로 다른 목표에서 출발했다. 객체 지향은 데이터와 그 데이터를 다루는 동작을 함께 묶고, 상속·다형성·캡슐화로 복잡성을 관리한다. 관계형 모델은 데이터를 중복 없이 정규화된 표로 나누고, 집합 연산으로 질의한다. 두 모델이 데이터를 바라보는 방식이 달라서 생기는 간극을 패러다임 불일치(object-relational impedance mismatch)라고 한다. 이 간극은 네 군데에서 가장 뚜렷하게 드러난다. 상속, 연관관계, 객체 그래프 탐색, 그리고 비교다.</p>
+
+<p>먼저 상속이다. 결제(<code>Payment</code>)라는 추상 클래스 아래에 카드 결제(<code>CardPayment</code>)와 계좌 이체(<code>BankTransferPayment</code>)가 있다고 하자. 공통 필드(금액, 결제 시각)는 부모에, 고유 필드(카드 번호 끝자리, 은행 코드)는 자식에 있다. 자바에서는 <code>Payment p = new CardPayment(...)</code>처럼 부모 타입으로 다루면서 실제 객체의 메서드가 호출되는 다형성을 공짜로 얻는다.</p>
+
+<p>테이블에는 상속이라는 개념이 없다. 가장 가까운 모델링 기법은 슈퍼타입·서브타입 관계다. 공통 컬럼을 <code>PAYMENT</code> 테이블에, 고유 컬럼을 <code>CARD_PAYMENT</code>와 <code>BANK_TRANSFER_PAYMENT</code> 테이블에 두고, 자식 테이블의 기본 키가 부모 테이블의 기본 키를 외래 키로 참조하게 한다. 그리고 부모 테이블에 "이 행이 어느 자식인지"를 나타내는 구분 컬럼을 둔다.</p>
+
+<pre class="diagram">객체 모델                              테이블 모델(슈퍼타입-서브타입)
+
+      Payment (abstract)               PAYMENT
+      - amount                         ID (PK) | AMOUNT | PAID_AT | DTYPE
+      - paidAt                              ▲                     ▲
+         ▲            ▲                     │ PK = FK             │ PK = FK
+         │            │              CARD_PAYMENT          BANK_TRANSFER_PAYMENT
+ CardPayment   BankTransferPayment   ID (PK,FK) | LAST4    ID (PK,FK) | BANK_CODE
+ - last4       - bankCode</pre>
+
+<p>이제 카드 결제 하나를 저장하려면 SQL이 두 개 필요하다. <code>PAYMENT</code>에 공통 컬럼과 구분 값 <code>'CARD'</code>를 넣는 INSERT, 그리고 <code>CARD_PAYMENT</code>에 같은 ID와 고유 컬럼을 넣는 INSERT다. 조회할 때는 두 테이블을 조인하고, 구분 컬럼을 보고 어떤 자식 클래스의 인스턴스를 만들지 결정하는 코드를 써야 한다. "결제 전체를 조회해 다형적으로 다루기"는 모든 자식 테이블을 외부 조인하고 행마다 분기하는 코드가 된다. 자바 컬렉션에 넣을 때는 <code>list.add(cardPayment)</code> 한 줄이던 일이 두 개의 INSERT와 분기 로직으로 불어난다. JPA는 이 번역을 상속 매핑 전략으로 대신하는데, 전략마다 테이블 구조와 SQL이 어떻게 달라지는지는 06회에서 다룬다.</p>
+
+<h3>패러다임 불일치 2: 연관관계는 참조이고, 테이블은 외래 키다</h3>
+
+<p>객체는 다른 객체를 참조(reference)로 가리킨다. JLS(Java Language Specification) §4.3.1은 참조 값(reference value)을 객체를 가리키는 포인터라고 정의한다. 도서가 출판사를 가진다면 <code>Book</code> 객체의 <code>publisher</code> 필드에는 힙 어딘가에 있는 <code>Publisher</code> 객체를 가리키는 참조가 들어 있다. 이 참조를 따라가는 비용은 메모리 접근 한 번이고, 따라갈 수 있는 방향은 참조가 있는 쪽뿐이다. <code>Book</code>에서 <code>Publisher</code>로는 갈 수 있지만, <code>Publisher</code>에 도서 목록 필드를 따로 두지 않는 한 반대 방향으로는 갈 수 없다.</p>
+
+<p>테이블은 연관관계를 외래 키(foreign key)라는 값으로 표현한다. <code>BOOK</code> 테이블의 <code>PUBLISHER_ID</code> 컬럼에는 출판사 행의 기본 키 값이 들어 있다. 이것은 포인터가 아니라 그냥 숫자다. 이 숫자로 상대 행을 찾으려면 조인(join)을 해야 하고, 조인은 방향이 없다. <code>BOOK JOIN PUBLISHER ON BOOK.PUBLISHER_ID = PUBLISHER.ID</code>로 도서에서 출판사를 찾을 수 있고, 똑같은 조건으로 출판사에서 도서들을 찾을 수도 있다. 외래 키 하나가 양방향을 모두 표현한다.</p>
+
+<pre class="diagram">JVM 힙                                     데이터베이스
+
+ Book 객체                                  BOOK
+ ┌───────────────────────┐                 ID | TITLE          | PUBLISHER_ID
+ │ id        = 1         │                 ---+----------------+-------------
+ │ title     = "객체와 테이블"│                  1 | 객체와 테이블     | 10
+ │ publisher = ●─────────┼──┐                                     │ (값)
+ └───────────────────────┘  │ (참조: 포인터)                         ▼ 조인 조건으로 찾는다
+                            ▼                PUBLISHER
+                 Publisher 객체              ID | NAME
+                 ┌─────────────────┐         ---+------------
+                 │ id   = 10       │         10 | 가나출판
+                 │ name = "가나출판" │
+                 └─────────────────┘
+ 방향: Book → Publisher 한쪽만                방향: 없음(조인은 양쪽 모두 가능)</pre>
+
+<p>그래서 객체 모델을 그대로 지키려 하면 번역 코드가 생긴다. 저장할 때는 <code>book.getPublisher().getId()</code>를 꺼내 <code>PUBLISHER_ID</code> 파라미터에 넣어야 한다. 조회할 때는 두 테이블을 조인한 결과 한 행에서 도서 컬럼으로 <code>Book</code>을, 출판사 컬럼으로 <code>Publisher</code>를 만든 뒤 <code>book.setPublisher(publisher)</code>로 연결해야 한다. 이 번거로움을 피하려고 <code>Book</code>에 아예 <code>Long publisherId</code> 필드를 두는 경우가 많다. 그러면 SQL은 쉬워지지만, 객체에서 출판사로 가려면 다시 DAO를 불러야 하므로 객체 모델이 테이블 모델로 끌려 내려간다. JPA에서 "외래 키를 누가 관리하는가"라는 연관관계의 주인 개념은 바로 이 비대칭(객체는 참조가 둘, 테이블은 외래 키가 하나)에서 나온다. 04회의 주제다.</p>
+
+<x-visual id="jpa-basic-01-reference-vs-fk" title="객체 참조와 외래 키의 차이" kind="개념 비교 그림" ratio="16:9">
+<x-hint>왼쪽은 JVM 힙의 두 객체가 화살표(참조)로 한 방향 연결된 모습, 오른쪽은 두 테이블이 외래 키 값과 조인으로 양방향 연결되는 모습을 나란히 보여 준다.</x-hint>
+<x-prompt>A clean two-panel technical illustration on a white background, flat style. Left panel titled "JVM 힙": two rounded rectangles representing objects. The upper one is labeled "Book 객체" and contains three rows "id = 1", "title", "publisher". From the "publisher" row a solid dark arrow points down to the lower rectangle labeled "Publisher 객체" (rows "id = 10", "name"). Next to the arrow a small tag reads "참조(포인터)". Under the panel a caption reads "한 방향". Right panel titled "데이터베이스": two tables drawn as grids. The upper table is "BOOK" with columns ID, TITLE, PUBLISHER_ID and one row 1, ..., 10; the cell "10" is highlighted. The lower table is "PUBLISHER" with columns ID, NAME and one row 10, .... A double-headed dashed line connects the highlighted "10" to the PUBLISHER ID cell, with a tag "외래 키 + 조인". Under the panel a caption reads "방향 없음". Use muted blue for objects, muted green for tables. Labels exactly as quoted, no other text.</x-prompt>
+<x-caption>객체는 참조로 한 방향을 가리키고, 테이블은 외래 키 값과 조인으로 양쪽 모두를 찾는다.</x-caption>
+</x-visual>
+
+<h3>패러다임 불일치 3: 객체 그래프를 어디까지 탐색할 수 있는가</h3>
+
+<p>객체는 참조를 따라 마음대로 이동할 수 있어야 한다. 도서에서 출판사로, 출판사에서 담당자로, 담당자에서 연락처로 <code>book.getPublisher().getManager().getContact()</code>처럼 이어지는 것을 객체 그래프 탐색(object graph navigation)이라고 한다. 힙 위의 객체라면 이 탐색은 언제나 가능하다. 참조가 <code>null</code>이 아닌 한 그 끝에는 반드시 객체가 있다.</p>
+
+<p>SQL로 객체를 채우는 방식에서는 탐색할 수 있는 범위가 처음 실행한 SQL에서 정해진다. 도서와 출판사만 조인해 객체를 만들었다면 <code>book.getPublisher()</code>까지는 되지만 <code>getManager()</code>는 <code>null</code>이다. 그렇다고 처음부터 연결된 모든 테이블을 조인하면 쓰지도 않을 데이터를 매번 대량으로 읽는다. 결국 DAO에 <code>findBook</code>, <code>findBookWithPublisher</code>, <code>findBookWithPublisherAndManager</code>처럼 탐색 범위별 메서드가 늘어나고, 앞에서 본 계층 간 신뢰 문제가 다시 나타난다.</p>
+
+<p>JPA는 이 문제를 "실제로 참조를 따라가는 순간에 필요한 SQL을 실행한다"는 방식으로 푼다. 연관된 객체 자리에 진짜 객체 대신 프록시(proxy)라는 대리 객체를 두고, 프록시의 메서드가 처음 호출될 때 SELECT를 실행해 진짜 데이터를 채운다. 이것을 지연 로딩(lazy loading)이라고 한다. 반대로 함께 쓸 것이 확실하면 처음부터 조인해서 가져오는 즉시 로딩(eager loading)도 고를 수 있다. 프록시가 바이트코드 수준에서 어떻게 만들어지고, 지연 로딩이 왜 N+1 문제로 이어지는지는 07회에서 다룬다. 지금은 "탐색 범위를 SQL이 아니라 실행 시점의 접근이 정하게 바꾼다"는 아이디어만 잡아 두면 된다.</p>
+
+<h3>패러다임 불일치 4: 비교, 같은 행에서 만든 두 객체는 같은가</h3>
+
+<p>자바에서 두 참조를 <code>==</code>로 비교하면 같은 객체를 가리키는지(동일성, identity)를 따진다(JLS §15.21.3). 값이 같은지(동등성, equality)는 <code>equals()</code>로 따진다. 컬렉션에서 같은 원소를 두 번 꺼내면 같은 객체가 나오므로 <code>list.get(0) == list.get(0)</code>은 언제나 참이다. 데이터베이스에서 행의 정체성은 기본 키가 정한다. 같은 기본 키를 가진 행은 같은 행이다.</p>
+
+<p>그렇다면 JDBC로 같은 기본 키의 행을 두 번 조회해 만든 두 객체는 같을까? 위의 <code>findById</code>를 두 번 부르는 실험을 해 보자.</p>
+
+<pre><code class="language-java">Book a = findById(con, 1L);
+Book b = findById(con, 1L);
+System.out.println("a == b      : " + (a == b));
+System.out.println("same values : " + (a.id == b.id && a.title.equals(b.title)));</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">a == b      : false
+same values : true</code></pre>
+
+<p>결과는 당연하다. <code>findById</code>는 호출될 때마다 <code>new Book(...)</code>을 실행하므로 힙에 객체가 두 개 생긴다. 값은 같지만 서로 다른 객체다. 데이터베이스에서는 한 행인데 메모리에서는 두 객체가 되는 것이다. 이 차이는 실제 버그로 이어진다. 한 객체의 가격을 바꾸고 다른 객체를 저장하면 변경이 사라진다. 두 객체를 <code>HashSet</code>에 넣으면 <code>equals</code>와 <code>hashCode</code>를 재정의하지 않은 한 두 원소로 들어간다. 같은 행을 가리키는 객체가 여러 개 떠다니면 "어느 쪽이 최신 상태인가"를 개발자가 추적해야 한다.</p>
+
+<p>JPA 명세는 이 문제에 대해 분명한 규칙을 정한다. 영속성 컨텍스트(persistence context) 안에서는 하나의 영속 엔티티 식별자에 대해 엔티티 인스턴스가 하나뿐이다. 명세 §3.1의 표현으로는 "for any persistent entity identity there is a unique entity instance"다. 같은 <code>EntityManager</code>로 같은 기본 키의 엔티티를 두 번 조회하면 같은 인스턴스가 돌아오고, 두 번째 조회는 데이터베이스까지 가지 않는다. 뒤에서 실제 로그로 확인한다. 이 보장이 성립하는 범위(같은 영속성 컨텍스트 안)와 성립하지 않는 범위(서로 다른 <code>EntityManager</code> 사이)를 정확히 구분하는 것이 02회의 출발점이다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>객체는 참조로 연결된 그래프이고, 테이블은 키 값으로 연결된 집합이다. 상속, 연관관계의 방향, 탐색 범위, 동일성이라는 네 지점에서 두 모델이 어긋나며, SQL 중심 개발에서는 이 어긋남을 메우는 번역 코드를 개발자가 매번 손으로 쓴다. JPA가 맡는 일은 이 번역을 표준화된 규칙으로 대신하는 것이다.</p></aside>
+
+<h3>JPA는 무엇인가: 표준 명세와 구현체</h3>
+
+<p>ORM(Object-Relational Mapping)은 객체와 관계형 데이터베이스 사이의 번역을 프레임워크가 대신하는 기술을 통칭한다. 개발자는 객체 모델을 설계하고 "이 클래스는 이 테이블, 이 필드는 이 컬럼"이라는 매핑 정보를 주며, 프레임워크가 그 정보를 보고 SQL을 만들고 결과를 객체로 조립한다. JPA는 자바 진영의 ORM 표준이다. 원래 이름은 Java Persistence API였고, 지금 이름은 Jakarta Persistence다.</p>
+
+<p>중요한 점은 JPA가 라이브러리가 아니라 명세(specification)라는 것이다. <code>jakarta.persistence-api</code> jar를 열어 보면 <code>EntityManager</code>, <code>EntityManagerFactory</code>, <code>EntityTransaction</code> 같은 인터페이스와 <code>@Entity</code>, <code>@Id</code> 같은 애너테이션, 그리고 부트스트랩용 <code>Persistence</code> 클래스 정도만 있다. SQL을 만드는 코드, 커넥션을 다루는 코드는 한 줄도 없다. 그 일은 명세를 구현한 영속성 프로바이더(persistence provider)가 한다. 하이버네이트(Hibernate)와 이클립스링크(EclipseLink)가 대표적인 구현체다. 애플리케이션 코드는 표준 인터페이스에만 의존하고, 실행 시점에 어떤 구현체가 클래스패스에 있느냐에 따라 실제 동작하는 코드가 정해진다. JDBC가 <code>java.sql.Connection</code> 인터페이스와 데이터베이스별 드라이버로 나뉘는 구조와 같다.</p>
+
+<p>실제로 이 회차의 실험에서 <code>Persistence.createEntityManagerFactory</code>가 돌려준 객체와 거기서 얻은 <code>EntityManager</code>의 클래스를 출력하면 다음과 같다.</p>
+
+<pre data-label="실행 결과"><code class="language-text">emf class = org.hibernate.internal.SessionFactoryImpl
+em class  = org.hibernate.internal.SessionImpl</code></pre>
+
+<p>코드에는 <code>EntityManagerFactory</code>와 <code>EntityManager</code>라는 표준 타입만 썼지만 실제 객체는 하이버네이트의 <code>SessionFactoryImpl</code>과 <code>SessionImpl</code>이다. <code>javap</code>로 하이버네이트의 인터페이스를 보면 <code>org.hibernate.SessionFactory</code>가 <code>jakarta.persistence.EntityManagerFactory</code>를, <code>org.hibernate.Session</code>이 <code>jakarta.persistence.EntityManager</code>를 상속한다. 하이버네이트 사용자 가이드도 <code>EntityManagerFactory</code>를 <code>SessionFactory</code>의 Jakarta Persistence 대응물로, <code>Session</code>을 <code>EntityManager</code>로 표현되는 객체로 설명한다. 표준 인터페이스 위에 하이버네이트 고유 기능을 더한 확장이 얹혀 있고, 필요하면 <code>emf.unwrap(SessionFactory.class)</code>처럼 꺼내 쓸 수 있다.</p>
+
+<p>명세의 역사를 간단히 짚어 두면 버전 번호와 패키지 이름이 왜 그런지 이해된다. 아래 표의 날짜는 JCP(Java Community Process)와 Eclipse Foundation의 명세 페이지에서 확인한 것이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>버전</th><th>근거가 된 명세 과정</th><th>시기와 플랫폼</th><th>패키지</th></tr></thead><tbody>
+<tr><td>1.0</td><td>JSR 220(Enterprise JavaBeans 3.0)의 일부</td><td>최종 릴리스 2006년 5월</td><td><code>javax.persistence</code></td></tr>
+<tr><td>2.0</td><td>JSR 317(Java Persistence 2.0)</td><td>최종 릴리스 2009년 12월</td><td><code>javax.persistence</code></td></tr>
+<tr><td>2.1 / 2.2</td><td>JSR 338</td><td>2.1 최종 릴리스 2013년 5월, 2.2 유지보수 릴리스 2017년</td><td><code>javax.persistence</code></td></tr>
+<tr><td>3.0</td><td>Jakarta EE 명세 과정</td><td>Jakarta EE 9용(명세 위원회 투표 2020년 10월 완료)</td><td><code>jakarta.persistence</code></td></tr>
+<tr><td>3.1 / 3.2</td><td>Jakarta EE 명세 과정</td><td>3.1은 Jakarta EE 10용, 3.2는 Jakarta EE 11용</td><td><code>jakarta.persistence</code></td></tr>
+</tbody></table></div>
+
+<p>3.0에서 바뀐 것은 기능이 아니라 이름이다. 자바 EE가 Eclipse Foundation으로 옮겨 가 Jakarta EE가 되면서 패키지가 <code>javax.persistence</code>에서 <code>jakarta.persistence</code>로, 설정 속성의 접두어가 <code>javax.persistence.</code>에서 <code>jakarta.persistence.</code>로 바뀌었다. 자바에서 애너테이션은 완전한 이름(fully qualified name)으로 구별되는 타입이므로, <code>javax.persistence.Entity</code>와 <code>jakarta.persistence.Entity</code>는 이름만 비슷한 별개의 타입이다. 이 권의 기준인 하이버네이트 6.6은 Jakarta Persistence 3.1을 구현하고 자바 11 이상에서 동작한다(하이버네이트 ORM 릴리스 페이지의 호환성 표 기준). 스프링 부트 3.x가 <code>jakarta.*</code>를 쓰는 것도 같은 이유다.</p>
+
+<h3>JPA는 어디에서 동작하는가: JDBC 위의 한 층</h3>
+
+<p>JPA를 쓴다고 JDBC가 사라지는 것은 아니다. JPA 구현체는 애플리케이션과 JDBC 사이에 있는 한 층이다. 애플리케이션이 <code>em.persist(book)</code>를 부르면 하이버네이트는 <code>Book</code> 클래스의 매핑 정보를 보고 INSERT 문을 만들고, 엔티티에서 값을 꺼내 파라미터로 묶은 뒤, JDBC의 <code>PreparedStatement</code>로 실행한다. 조회는 반대 방향이다. SELECT 문을 만들어 실행하고, 돌아온 <code>ResultSet</code>의 컬럼을 읽어 엔티티 인스턴스를 만들고 필드를 채운다. 앞의 JDBC 코드에서 개발자가 손으로 하던 일을 그대로 하되, 매핑 정보를 근거로 자동으로 할 뿐이다.</p>
+
+<figure class="flow-figure"><figcaption>em.persist(book)부터 데이터베이스까지</figcaption><ol class="flow">
+<li><strong>애플리케이션</strong><span>표준 인터페이스 <code>EntityManager</code>의 <code>persist</code>를 호출한다. SQL은 쓰지 않는다.</span></li>
+<li><strong>JPA 구현체(하이버네이트)</strong><span>엔티티 클래스의 매핑 메타데이터를 보고 INSERT 문과 파라미터 바인딩 순서를 정한다. 방언이 데이터베이스별 SQL 문법을 정한다.</span></li>
+<li><strong>JDBC API</strong><span><code>Connection.prepareStatement</code>로 문장을 준비하고 파라미터를 바인딩해 실행한다. 로그의 <code>?</code>는 이 바인딩 자리다.</span></li>
+<li><strong>JDBC 드라이버와 데이터베이스</strong><span>드라이버가 SQL을 네트워크 프로토콜(또는 H2 같은 내장 DB라면 같은 프로세스 안의 호출)로 전달하고, DB가 파싱·실행한 결과를 돌려준다.</span></li>
+</ol></figure>
+
+<p>이 경로는 스택 트레이스로 직접 볼 수 있다. 뒤의 방언 실험에서 H2에 MySQL용 방언을 지정했더니 테이블 생성 DDL이 H2 문법에 맞지 않아 실패했고, 그 상태에서 JPQL 쿼리를 실행하자 "테이블이 없다"는 예외가 올라오면서 호출 경로가 고스란히 찍혔다. 아래는 실제로 받은 스택 트레이스에서 프레임 몇 개를 골라 아래(먼저 호출된 쪽)부터 위로 정리한 것이다. 줄 번호는 하이버네이트 6.6.53.Final, H2 2.3.232 기준이다.</p>
+
+<pre data-label="스택 트레이스 발췌 (호출 순서대로 재배열)"><code class="language-text">hello.DialectDemo.main                                   ← 애플리케이션: query.getResultList()
+org.hibernate.query.spi.AbstractSelectionQuery.list      ← 하이버네이트: 쿼리 객체
+org.hibernate.query.sqm.internal.QuerySqmImpl.doList
+org.hibernate.sql.exec.spi.JdbcSelectExecutor.list       ← 하이버네이트: SQL 실행기
+org.hibernate.sql.results.jdbc.internal.DeferredResultSetAccess.executeQuery
+org.hibernate.sql.exec.internal.StandardStatementCreator.createStatement
+org.hibernate.engine.jdbc.internal.StatementPreparerImpl.prepareQueryStatement
+org.hibernate.engine.jdbc.internal.StatementPreparerImpl$4.doPrepare
+org.h2.jdbc.JdbcConnection.prepareStatement              ← JDBC 드라이버(java.sql.Connection 구현)
+org.h2.jdbc.JdbcPreparedStatement.<init>
+org.h2.engine.SessionLocal.prepareCommand                ← H2 엔진: SQL 파싱</code></pre>
+
+<p>하이버네이트의 <code>StatementPreparerImpl</code>이 호출하는 대상은 H2의 <code>JdbcConnection.prepareStatement</code>, 즉 <code>java.sql.Connection</code> 인터페이스의 구현이다. JPA 구현체 역시 결국 JDBC 표준 API를 부르는 클라이언트라는 뜻이다. 예외 쪽도 흥미롭다. 맨 아래에서 H2가 던진 것은 <code>org.h2.jdbc.JdbcSQLSyntaxErrorException</code>(JDBC의 <code>SQLException</code> 계열)인데, 애플리케이션이 받은 것은 <code>org.hibernate.exception.SQLGrammarException</code>이었고 원래 예외는 그 원인(cause)으로 들어 있었다. 하이버네이트의 <code>SqlExceptionHelper</code>와 <code>StandardSQLExceptionConverter</code>가 검사 예외인 <code>SQLException</code>을 자신의 런타임 예외 계층으로 변환한 것이다. 스프링 DB 1편에서 본 예외 추상화(<code>SQLException</code>을 데이터 접근 예외로 바꾸는 것)와 같은 발상이 JPA 구현체 안에도 들어 있다.</p>
+
+<x-visual id="jpa-basic-01-jpa-layer" title="애플리케이션, JPA, JDBC, 데이터베이스의 계층" kind="계층 구조도" ratio="16:9">
+<x-hint>JPA 구현체가 애플리케이션과 JDBC API 사이에 놓인 한 층이라는 것, 저장과 조회 때 SQL과 객체가 어느 방향으로 오가는지를 보여 준다.</x-hint>
+<x-prompt>A vertical layered architecture diagram, flat vector style, white background. Four stacked horizontal boxes from top to bottom: "애플리케이션" (light blue), "JPA (하이버네이트)" (light orange, slightly larger), "JDBC API" (light gray), "데이터베이스" (light green, drawn as a cylinder). On the left side, a downward arrow passes through the layers labeled "persist(book)" at the top and "INSERT SQL" between JPA and JDBC. On the right side, an upward arrow labeled "ResultSet" between database and JPA and "Book 객체" between JPA and application. Inside the JPA box, two small tags: "매핑 정보" and "방언". Exactly these labels, no other text, clean thin lines.</x-prompt>
+<x-caption>JPA 구현체는 매핑 정보와 방언을 근거로 SQL을 만들고, 실행은 JDBC API에 맡긴다.</x-caption>
+</x-visual>
+
+<h3>왜 JPA를 쓰는가: 얻는 것과 얻지 못하는 것</h3>
+
+<p>JPA를 쓰면 저장·조회·삭제는 <code>persist</code>, <code>find</code>, <code>remove</code> 메서드 호출이 된다. 수정에는 아예 전용 메서드가 없다. <code>EntityManager</code> 인터페이스에는 <code>update</code>라는 메서드가 존재하지 않는다. 트랜잭션 안에서 조회한 엔티티의 필드 값을 바꾸면 커밋 시점에 구현체가 변경을 감지해 UPDATE 문을 만든다. 자바 컬렉션에서 꺼낸 객체의 값을 바꾸면 컬렉션 안의 객체도 바뀌어 있는 것과 같은 감각으로 데이터베이스를 다루도록 설계한 것이다. 이것이 생산성 측면의 이점이다.</p>
+
+<p>유지보수 측면에서는 앞에서 본 "필드 하나 추가하면 SQL 네 군데를 고쳐야 하는" 문제가 줄어든다. 엔티티에 필드를 추가하면 구현체가 매핑 메타데이터를 다시 만들고, INSERT·SELECT·UPDATE 문에 그 컬럼을 넣는다. 실제로 뒤의 실행 로그에서 하이버네이트가 만든 UPDATE 문은 바뀐 필드만이 아니라 매핑된 모든 컬럼(<code>price=?, title=?</code>)을 갱신했다. 매핑 정보에서 문장을 기계적으로 만들기 때문에 필드를 추가하면 문장에도 자동으로 들어간다. 바뀐 컬럼만 갱신하도록 바꾸는 하이버네이트 전용 애너테이션(<code>@DynamicUpdate</code>)도 있지만 기본 동작은 이렇다.</p>
+
+<p>패러다임 불일치의 네 지점은 각각 JPA의 기능에 대응한다. 상속은 상속 매핑 전략(06회)이, 연관관계는 참조를 외래 키로 번역하는 연관관계 매핑(04·05회)이, 객체 그래프 탐색은 프록시와 지연 로딩(07회)이, 비교는 영속성 컨텍스트의 동일성 보장(02회)이 맡는다. 이번 권의 목차가 사실상 "불일치를 하나씩 메우는 순서"인 셈이다.</p>
+
+<p>JPA라는 층이 하나 끼면 느려지지 않느냐는 질문도 자연스럽다. 층이 있다는 것은 반대로 애플리케이션과 데이터베이스 사이에서 무언가를 할 자리가 생긴다는 뜻이기도 하다. 대표적인 것이 세 가지다. 첫째, 같은 영속성 컨텍스트 안에서 같은 엔티티를 다시 조회하면 SQL을 보내지 않고 이미 가진 인스턴스를 돌려준다(1차 캐시와 동일성 보장). 둘째, <code>persist</code>를 호출할 때마다 INSERT를 보내지 않고 모아 두었다가 플러시 시점에 보낸다(트랜잭션을 지원하는 쓰기 지연). 이렇게 모아 두면 하이버네이트의 <code>hibernate.jdbc.batch_size</code> 설정과 함께 JDBC 배치로 한 번에 보낼 수도 있다. 셋째, 연관된 객체를 실제로 쓸 때까지 조회를 미룬다(지연 로딩). 앞의 두 가지는 이 회차의 실행 로그에서도 모습이 보인다.</p>
+
+<p>마지막으로 데이터 접근 추상화와 벤더 독립성이다. 같은 JPQL이라도 연결된 데이터베이스에 따라 다른 SQL이 만들어진다. 이것은 방언(Dialect)이라는 구성 요소 덕분인데, 뒤에서 실제로 다섯 가지 방언의 SQL을 비교한다.</p>
+
+<p>얻지 못하는 것도 분명히 해 두자. JPA는 SQL을 몰라도 되게 해 주는 기술이 아니다. 구현체가 만든 SQL이 의도와 다르게 많이 나가거나(07회의 N+1 문제가 대표적이다), 데이터베이스가 그 SQL을 비효율적으로 실행할 수 있다. 그것을 알아채려면 로그에 찍힌 SQL을 읽고, 실행 계획과 인덱스를 따질 수 있어야 한다. 데이터베이스 입문·기본편에서 다룬 내용이 JPA를 쓰면서 필요 없어지는 것이 아니라 오히려 진단 도구가 된다. 또 수많은 행을 한 번에 갱신하는 작업이나 복잡한 통계 쿼리는 엔티티 단위로 다루는 것보다 JPQL 벌크 연산(10회)이나 네이티브 SQL이 맞는 경우가 많다.</p>
+
+<h3>Hello JPA 1: 프로젝트 구성과 persistence.xml</h3>
+
+<p>스프링 없이 JPA를 쓰는 데 필요한 의존성은 두 개다. JPA 구현체인 하이버네이트와 JDBC 드라이버(여기서는 H2)다. Gradle로 쓰면 다음과 같다. 하이버네이트 6부터 그룹 ID는 <code>org.hibernate.orm</code>이다. Maven이라면 같은 좌표를 <code>dependency</code> 요소로 쓰면 된다.</p>
+
+<pre><code class="language-groovy">dependencies {
+    implementation 'org.hibernate.orm:hibernate-core:6.6.53.Final'
+    runtimeOnly 'com.h2database:h2:2.3.232'
+}</code></pre>
+
+<p><code>jakarta.persistence-api</code>를 따로 적지 않아도 되는 이유는 전이 의존성(transitive dependency) 때문이다. <code>hibernate-core-6.6.53.Final.pom</code>을 열어 보면 <code>jakarta.persistence-api</code> 3.1.0, <code>jakarta.transaction-api</code> 2.0.1, <code>jboss-logging</code>, <code>hibernate-commons-annotations</code>, <code>jandex</code>, <code>classmate</code>, <code>byte-buddy</code> 1.17.8, JAXB(<code>jakarta.xml.bind-api</code>, <code>jaxb-runtime</code>), <code>jakarta.inject-api</code>, <code>antlr4-runtime</code> 4.13.2가 의존성으로 선언되어 있다. 이 중 둘은 이번 권에서 다시 만난다. Byte Buddy는 실행 중에 클래스를 만들어 내는 바이트코드 생성 라이브러리로, 지연 로딩용 프록시 클래스를 만들 때 쓰인다(07회). ANTLR은 문법 정의로부터 파서를 생성하는 도구로, 하이버네이트의 JPQL/HQL 파서 <code>org.hibernate.grammars.hql.HqlParser</code>를 <code>javap</code>로 보면 <code>org.antlr.v4.runtime.Parser</code>를 상속한다(09회). 이 회차의 실험은 빌드 도구 없이 로컬 캐시에 있던 jar로 클래스패스를 직접 만들었기 때문에, 일부 의존성(Byte Buddy 1.18.3 등)은 POM에 적힌 것보다 새 버전이었다.</p>
+
+<p>다음은 설정 파일이다. Java SE 환경에서 JPA는 클래스패스의 <code>META-INF/persistence.xml</code>에서 설정을 읽는다. 하이버네이트 입문 가이드도 이 파일을 영속성 아카이브의 <code>META-INF</code> 디렉터리에 둔다고 설명한다. 이 회차에서 쓴 파일은 다음과 같다.</p>
+
+<pre><code class="language-xml"><?xml version="1.0" encoding="UTF-8"?>
+<persistence version="3.0"
+             xmlns="https://jakarta.ee/xml/ns/persistence"
+             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             xsi:schemaLocation="https://jakarta.ee/xml/ns/persistence https://jakarta.ee/xml/ns/persistence/persistence_3_0.xsd">
+    <persistence-unit name="library">
+        <class>hello.Book</class>
+        <properties>
+            <!-- 표준 속성: 어떤 구현체든 이해한다 -->
+            <property name="jakarta.persistence.jdbc.driver" value="org.h2.Driver"/>
+            <property name="jakarta.persistence.jdbc.url" value="jdbc:h2:mem:library"/>
+            <property name="jakarta.persistence.jdbc.user" value="sa"/>
+            <property name="jakarta.persistence.jdbc.password" value=""/>
+            <!-- 하이버네이트 전용 속성 -->
+            <property name="hibernate.show_sql" value="true"/>
+            <property name="hibernate.format_sql" value="true"/>
+            <property name="hibernate.hbm2ddl.auto" value="create"/>
+        </properties>
+    </persistence-unit>
+</persistence></code></pre>
+
+<p>바깥 요소 <code>persistence</code>의 네임스페이스는 <code>https://jakarta.ee/xml/ns/persistence</code>이고 버전은 3.0 스키마를 가리킨다. 하이버네이트 6.6 입문 가이드의 예제도 같은 <code>persistence_3_0.xsd</code>를 쓴다. 그 안의 <code>persistence-unit</code>이 영속성 유닛(persistence unit)이다. 영속성 유닛은 "하나의 데이터베이스에 대해, 어떤 엔티티 클래스들을, 어떤 설정으로 관리할 것인가"를 묶은 이름 붙은 단위이고, 코드에서는 이 이름(<code>library</code>)으로 <code>EntityManagerFactory</code>를 만든다. 데이터베이스가 두 개라면 영속성 유닛도 보통 두 개다.</p>
+
+<p>속성은 두 종류로 나뉜다. <code>jakarta.persistence.</code>로 시작하는 것은 명세가 정한 표준 속성이라 어떤 구현체든 같은 의미로 읽는다. 드라이버 클래스, JDBC URL, 사용자, 비밀번호가 여기에 해당한다. <code>hibernate.</code>로 시작하는 것은 하이버네이트만 이해하는 속성이다. <code>hibernate.show_sql</code>은 실행하는 SQL을 표준 출력에 찍고(로그 앞에 붙는 <code>Hibernate:</code>가 그 표시다), <code>hibernate.format_sql</code>은 그 SQL을 여러 줄로 정렬해 보여 준다. <code>hibernate.hbm2ddl.auto=create</code>는 시작할 때 매핑 정보로부터 테이블을 지우고 다시 만든다. 실습용 설정이며, 이 값들의 차이와 운영 환경에서 조심할 점은 엔티티 매핑을 다루는 03회에서 본다. 구현체를 이클립스링크로 바꾸면 표준 속성은 그대로 두고 <code>hibernate.*</code> 속성만 그 구현체의 것으로 바꾸면 된다.</p>
+
+<p>JDBC URL <code>jdbc:h2:mem:library</code>는 H2를 같은 JVM 프로세스 안의 메모리 데이터베이스로 띄운다. 별도 서버 없이 실습할 수 있어 편하지만, H2의 메모리 데이터베이스는 기본적으로 마지막 커넥션이 닫히면 내용과 함께 사라진다. 이 실험에서 여러 <code>EntityManager</code>에 걸쳐 데이터가 유지된 것은 하이버네이트 내장 커넥션 풀이 커넥션을 열어 둔 채 유지했기 때문이다(시작 로그의 <code>Minimum pool size: 1</code>). 하이버네이트 입문 가이드는 이 내장 풀이 운영용이 아니라고 분명히 적고 있고, 실제로 시작 로그에도 <code>HHH10001002: Using built-in connection pool (not intended for production use)</code>라는 경고가 찍힌다. 스프링 부트 환경에서는 HikariCP 같은 커넥션 풀이 <code>DataSource</code>로 들어가므로 이 경고가 보이지 않는다.</p>
+
+<h4>엔티티 클래스 목록: 나열할 것인가, 스캔에 맡길 것인가</h4>
+
+<p><code>class</code> 요소는 이 영속성 유닛이 관리할 엔티티 클래스를 나열한다. 그런데 하이버네이트는 나열하지 않은 클래스도 찾아낸다. 실험으로 확인해 보았다. <code>class</code> 요소를 하나도 두지 않은 영속성 유닛을 만들고 <code>emf.getMetamodel().getEntities()</code>를 출력하니, 같은 클래스 디렉터리에 있던 엔티티 두 개가 모두 등록되어 있었다. 더 눈여겨볼 것은 <code>class</code> 요소로 <code>hello.Book</code> 하나만 나열한 <code>library</code> 유닛도, 같은 디렉터리에 다른 엔티티(<code>hello2.Card</code>)를 추가하자 그 테이블까지 만들었다는 점이다. 하이버네이트 6.6.53이 영속성 유닛의 루트(이 실험에서는 <code>META-INF</code>를 담은 클래스 디렉터리)를 스캔해 <code>@Entity</code>가 붙은 클래스를 추가로 찾았기 때문이다. 반면 <code>exclude-unlisted-classes</code> 요소를 <code>true</code>로 둔 유닛에서는 나열한 클래스의 테이블만 만들어졌다.</p>
+
+<pre data-label="실행 결과 (영속성 유닛별 생성 DDL과 등록 엔티티)"><code class="language-text">== class 요소 없음
+create table Book (price integer not null, id bigint not null, title varchar(255), primary key (id))
+create table Card (id bigint not null, name varchar(255), primary key (id))
+entities = [Card, Book]
+
+== class 요소에 hello2.Card만, exclude-unlisted-classes = true
+create table Card (id bigint not null, name varchar(255), primary key (id))</code></pre>
+
+<p>스캔은 편하지만, 어떤 클래스가 등록될지가 "어떤 jar나 디렉터리에 무엇이 들어 있는가"에 따라 달라진다는 뜻이기도 하다. 테스트용 엔티티가 섞여 들어가거나, 패키징 방식이 바뀌어 엔티티가 빠지는 일이 생길 수 있다. 순수 Java SE에서 JPA를 쓴다면 엔티티를 명시적으로 나열하고 <code>exclude-unlisted-classes</code>를 <code>true</code>로 두는 쪽이 결과를 예측하기 쉽다. 스프링 부트는 이 파일 대신 엔티티 스캔 패키지를 정해 영속성 유닛 정보를 코드로 만들어 넘기므로, 스프링 환경에서는 이 고민을 부트가 대신한다.</p>
+
+<h3>방언: 같은 JPQL, 다른 SQL</h3>
+
+<p>관계형 데이터베이스는 모두 SQL을 쓰지만 세부 문법은 제각각이다. 가변 길이 문자열 타입은 대부분 <code>VARCHAR</code>지만 오라클은 <code>VARCHAR2</code>를 쓴다. 문자열의 일부를 자르는 함수는 <code>SUBSTRING</code>인 곳도 있고 <code>SUBSTR</code>인 곳도 있다. 결과의 일부만 가져오는 페이징 문법은 차이가 가장 크다. SQL 표준에 없는 기능이나 표준과 다른 문법을 데이터베이스별로 흡수하는 하이버네이트의 구성 요소가 방언(<code>org.hibernate.dialect.Dialect</code>)이다.</p>
+
+<p>방언이 실제로 무엇을 바꾸는지 보려고, 같은 엔티티와 같은 JPQL에 대해 방언만 바꿔 가며 하이버네이트가 만드는 SQL을 받아 보았다. JPQL은 <code>select substring(b.title, 1, 3) from Book b order by b.id</code>에 <code>setFirstResult(20)</code>, <code>setMaxResults(10)</code>을 붙인 것이다. H2가 아닌 방언은 <code>hibernate.dialect</code>로 클래스를 지정하고, <code>hibernate.boot.allow_jdbc_metadata_access=false</code>와 <code>jakarta.persistence.database-major-version</code>으로 데이터베이스에 묻지 않고 해당 버전을 쓰게 했다. 실제 연결은 H2였으므로 H2 문법과 다른 SQL은 실행 단계에서 실패했다. 아래 표는 실제 데이터베이스에서 돌린 결과가 아니라 하이버네이트 6.6.53이 만든 SQL 문자열이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>방언(버전)</th><th>생성된 DDL의 컬럼 타입</th><th>생성된 조회 SQL의 핵심</th></tr></thead><tbody>
+<tr><td><code>H2Dialect</code>(자동 감지, 2.3.232)</td><td><code>integer</code>, <code>bigint</code>, <code>varchar(255)</code></td><td><code>substring(...)</code>, <code>offset ? rows fetch first ? rows only</code></td></tr>
+<tr><td><code>MySQLDialect</code>(8.0)</td><td><code>integer</code>, <code>bigint</code>, <code>varchar(255)</code>, 끝에 <code>engine=InnoDB</code></td><td><code>substring(...)</code>, <code>limit ?,?</code></td></tr>
+<tr><td><code>OracleDialect</code>(19)</td><td><code>number(10,0)</code>, <code>number(19,0)</code>, <code>varchar2(255 char)</code></td><td><code>substr(...)</code>, <code>offset ? rows fetch first ? rows only</code></td></tr>
+<tr><td><code>PostgreSQLDialect</code>(16)</td><td><code>integer</code>, <code>bigint</code>, <code>varchar(255)</code></td><td><code>substr(...)</code>, <code>offset ? rows fetch first ? rows only</code></td></tr>
+<tr><td><code>SQLServerDialect</code>(16)</td><td><code>int</code>, <code>bigint</code>, <code>varchar(255)</code></td><td><code>substring(...)</code>, <code>offset ? rows fetch first ? rows only</code></td></tr>
+</tbody></table></div>
+
+<p>JPQL에는 <code>substring</code>이라고 썼지만 오라클·PostgreSQL 방언은 <code>substr</code>로 바꿨다. 페이징은 MySQL 방언만 <code>limit ?,?</code>를 썼고 나머지는 SQL 표준의 <code>OFFSET ... FETCH FIRST</code> 형태를 썼다. 자바의 <code>int</code> 필드는 오라클 방언에서 <code>number(10,0)</code>, <code>Long</code> 필드는 <code>number(19,0)</code>이 되었다. 개발자가 바꾼 것은 설정 한 줄뿐이고 애플리케이션 코드는 그대로다. MySQL 방언이 만든 DDL 끝의 <code>engine=InnoDB</code>는 H2가 이해하지 못해 테이블 생성이 실패했는데, 앞 절의 스택 트레이스가 바로 그 뒤에 실행한 쿼리에서 나온 것이다.</p>
+
+<p>하이버네이트 6에서 방언은 보통 설정할 필요가 없다. 하이버네이트 입문 가이드는 올바른 방언이 자동으로 결정된다고 설명한다. 시작할 때 JDBC 커넥션을 하나 얻어 <code>DatabaseMetaData</code>로 제품 이름과 버전을 묻고, 그에 맞는 방언과 버전을 고른다. 시작 로그의 <code>Database version: 2.3.232</code>와, 실험에서 팩토리가 쓰는 방언 객체를 출력해 얻은 <code>org.hibernate.dialect.H2Dialect, version: 2.3.232</code>가 그 결과다. 오히려 표준 방언을 굳이 지정하면 경고가 나온다. MySQL 방언을 지정했을 때 실제로 받은 경고는 <code>HHH90000025: MySQLDialect does not need to be specified explicitly using 'hibernate.dialect' (remove the property setting and it will be selected by default)</code>였다. 하이버네이트 5까지는 <code>MySQL8Dialect</code>처럼 버전이 이름에 붙은 방언 클래스를 골라 지정하는 것이 흔했기 때문에, 예전 설정을 옮겨 올 때 이 경고를 자주 만난다.</p>
+
+<h3>Hello JPA 2: Persistence.createEntityManagerFactory 한 줄에서 일어나는 일</h3>
+
+<p>애플리케이션 코드의 첫 줄은 <code>Persistence.createEntityManagerFactory("library")</code>다. 이 한 줄은 JPA 애플리케이션에서 손꼽히게 무거운 호출이고, 실패하면 애플리케이션 전체가 시작하지 못한다. 그 안에서 무슨 일이 일어나는지 단계별로 따라가 보자. 근거는 <code>javap</code>로 본 바이트코드, jar 안의 서비스 파일, 실행 로그, 그리고 의존성을 빠뜨렸을 때 받은 스택 트레이스다.</p>
+
+<figure class="flow-figure"><figcaption>EntityManagerFactory가 만들어지는 순서 (하이버네이트 6.6.53 기준)</figcaption><ol class="flow">
+<li><strong>프로바이더 찾기</strong><span><code>Persistence</code>가 <code>PersistenceProviderResolverHolder</code>의 기본 리졸버에게 구현체를 묻는다. 기본 리졸버는 현재 스레드의 컨텍스트 클래스 로더로 <code>ServiceLoader.load(PersistenceProvider.class, ...)</code>를 호출한다. 하이버네이트 jar의 <code>META-INF/services/jakarta.persistence.spi.PersistenceProvider</code> 파일에 적힌 <code>org.hibernate.jpa.HibernatePersistenceProvider</code>가 이렇게 발견된다.</span></li>
+<li><strong>설정 파일 찾기</strong><span>프로바이더가 클래스패스에서 <code>META-INF/persistence.xml</code> 자원을 모두 찾고(<code>PersistenceXmlParser</code>가 <code>ClassLoaderService.locateResources</code>를 호출한다), 이름이 <code>library</code>인 영속성 유닛을 고른다. 로그의 <code>HHH000204: Processing PersistenceUnitInfo [name: library]</code>가 이 단계다.</span></li>
+<li><strong>서비스 준비</strong><span>커넥션 제공자를 정한다. 별도 풀 설정이 없으므로 내장 풀(<code>DriverManagerConnectionProviderImpl</code>)이 선택되고 경고가 찍힌다. H2 드라이버는 <code>DriverManager</code>가 H2 jar의 <code>META-INF/services/java.sql.Driver</code>(내용 <code>org.h2.Driver</code>)로 찾는다.</span></li>
+<li><strong>방언 결정</strong><span>커넥션을 얻어 데이터베이스 메타데이터를 읽고 방언과 버전을 정한다. <code>HHH10001005: Database info</code> 로그가 이 단계다.</span></li>
+<li><strong>메타모델 구축</strong><span>나열되거나 스캔된 엔티티 클래스의 애너테이션을 읽어 매핑 메타데이터를 만들고, 엔티티마다 SQL을 만들 준비를 한다.</span></li>
+<li><strong>SessionFactory 생성과 스키마 처리</strong><span><code>SessionFactoryImpl</code>이 만들어지고, <code>hbm2ddl.auto</code> 설정에 따라 DROP·CREATE DDL이 실행된다.</span></li>
+</ol></figure>
+
+<p>1단계는 자바 중급 2편이나 스프링 핵심 원리에서 본 "인터페이스와 구현의 분리"가 실행 시점에 어떻게 연결되는지를 보여 주는 좋은 예다. <code>jakarta.persistence-api</code> jar는 하이버네이트를 전혀 모른다. 컴파일 시점에는 어떤 구현체에도 의존하지 않고, 실행 시점에 <code>ServiceLoader</code>가 클래스패스의 jar들에서 서비스 파일을 읽어 구현 클래스 이름을 알아낸 뒤 리플렉션으로 인스턴스를 만든다. 3단계의 JDBC 드라이버 등록도 같은 <code>ServiceLoader</code> 메커니즘이다. 그래서 <code>jakarta.persistence.jdbc.driver</code> 속성을 빼도 URL만 맞으면 H2 드라이버가 잡힌다. 실제로 드라이버 속성 없이 만든 영속성 유닛도 정상적으로 시작했다.</p>
+
+<p>실행 로그에서 INFO와 경고만 순서대로 뽑으면 위의 단계와 그대로 겹친다.</p>
+
+<pre data-label="실행 결과 (시작 로그, 시각 줄과 HHH10001501 줄 생략)"><code class="language-text">INFO: HHH000204: Processing PersistenceUnitInfo [name: library]
+INFO: HHH000412: Hibernate ORM core version 6.6.53.Final
+INFO: HHH000026: Second-level cache disabled
+WARN: HHH10001002: Using built-in connection pool (not intended for production use)
+INFO: HHH10001005: Database info:
+	Database JDBC URL [jdbc:h2:mem:library]
+	Database driver: org.h2.Driver
+	Database version: 2.3.232
+	Autocommit mode: false
+	Isolation level: undefined/unknown
+	Minimum pool size: 1
+	Maximum pool size: 20
+INFO: HHH000489: No JTA platform available (set 'hibernate.transaction.jta.platform' to enable JTA platform integration)
+Hibernate:
+    drop table if exists Book cascade
+Hibernate:
+    create table Book (
+        price integer not null,
+        id bigint not null,
+        title varchar(255),
+        primary key (id)
+    )</code></pre>
+
+<p>처음 이 실험을 돌렸을 때는 클래스패스에 Byte Buddy jar가 빠져 있었다. 그때 받은 예외의 스택 트레이스가 내부 구조를 그대로 보여 준다. 호출은 <code>Persistence.createEntityManagerFactory</code> → <code>HibernatePersistenceProvider.createEntityManagerFactory</code> → <code>EntityManagerFactoryBuilderImpl.build</code> → <code>MetadataImpl.getSessionFactoryBuilder</code> → <code>SessionFactoryBuilderImpl</code> 생성자 → <code>StandardServiceRegistryImpl.initiateService</code> → <code>BytecodeProviderInitiator</code> 순서였고, 바이트코드 제공자를 <code>ServiceLoader</code>로 불러오다 <code>java.util.ServiceConfigurationError</code>로 실패했고, 그 원인은 <code>NoClassDefFoundError: net/bytebuddy/matcher/ElementMatcher</code>였다. 이 오류가 커넥션과 방언 로그가 다 찍힌 뒤에 났다는 점도 기억해 둘 만하다. 의존성 누락은 클래스가 처음 필요해지는 순간에야 드러나므로, 시작 로그가 어디까지 진행했는지가 원인을 좁히는 단서가 된다.</p>
+
+<p>이 과정이 비싼 이유는 분명하다. 클래스패스를 뒤져 설정과 엔티티를 찾고, 데이터베이스에 접속해 메타데이터를 읽고, 모든 엔티티의 애너테이션을 해석해 메타모델을 만들고, 커넥션 풀을 준비한다. 하이버네이트 사용자 가이드는 <code>SessionFactory</code>를 스레드 안전하고 불변인 객체이자 만들기 매우 비싼 객체로 설명하며, 데이터베이스 하나당 하나만 두라고 권한다. 반대로 <code>Session</code>, 즉 <code>EntityManager</code>는 하나의 작업 단위(unit of work)를 표현하는 단일 스레드용의 수명이 짧은 객체다. 정리하면 <code>EntityManagerFactory</code>는 애플리케이션 시작 시 하나 만들어 끝까지 공유하고, <code>EntityManager</code>는 요청이나 트랜잭션 하나마다 만들어 쓰고 닫으며 스레드 사이에 공유하지 않는다.</p>
+
+<x-visual id="jpa-basic-01-bootstrap" title="EntityManagerFactory 부트스트랩 순서" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>Persistence 클래스에서 시작해 ServiceLoader, persistence.xml, 데이터베이스 메타데이터를 거쳐 SessionFactoryImpl이 만들어지는 순서를 보여 준다.</x-hint>
+<x-prompt>A horizontal sequence diagram, flat style, white background, six lifelines from left to right labeled "애플리케이션", "Persistence", "ServiceLoader", "HibernatePersistenceProvider", "persistence.xml", "데이터베이스". Numbered arrows top to bottom: 1 from 애플리케이션 to Persistence labeled "createEntityManagerFactory"; 2 from Persistence to ServiceLoader labeled "프로바이더 탐색"; 3 from ServiceLoader back to Persistence; 4 from Persistence to HibernatePersistenceProvider; 5 from HibernatePersistenceProvider to persistence.xml labeled "유닛 읽기"; 6 from HibernatePersistenceProvider to 데이터베이스 labeled "방언 결정"; 7 a self-arrow on HibernatePersistenceProvider labeled "메타모델 구축"; 8 a return arrow to 애플리케이션 labeled "SessionFactoryImpl". Thin dark lines, small numbered circles on each arrow, labels exactly as quoted.</x-prompt>
+<x-caption>createEntityManagerFactory 한 줄 안에서 프로바이더 탐색, 설정 읽기, 방언 결정, 메타모델 구축이 차례로 일어난다.</x-caption>
+</x-visual>
+
+<h3>Hello JPA 3: 엔티티와 CRUD, 그리고 SQL이 나가는 시점</h3>
+
+<p>엔티티 클래스부터 보자. <code>@Entity</code>는 이 클래스가 JPA가 관리할 엔티티라는 표시이고, <code>@Id</code>는 기본 키에 매핑되는 필드를 지정한다. 테이블 이름과 컬럼 이름을 따로 지정하지 않았으므로 클래스 이름과 필드 이름이 그대로 쓰인다. 기본 키 값은 일단 직접 넣는다. 데이터베이스가 키를 만들게 하는 생성 전략은 03회에서 다룬다.</p>
+
+<pre><code class="language-java">package hello;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+
+@Entity
+public class Book {
+    @Id
+    private Long id;
+    private String title;
+    private int price;
+
+    protected Book() {}                       // JPA가 리플렉션으로 쓰는 생성자
+
+    public Book(Long id, String title, int price) {
+        this.id = id;
+        this.title = title;
+        this.price = price;
+    }
+
+    public Long getId() { return id; }
+    public String getTitle() { return title; }
+    public int getPrice() { return price; }
+    public void changePrice(int price) { this.price = price; }
+}</code></pre>
+
+<p>이 클래스는 명세가 정한 엔티티 조건을 지킨다. 명세 §2.1은 엔티티 클래스에 인자 없는 생성자가 있어야 하고, 그 생성자는 <code>public</code>이나 <code>protected</code>여야 하며, 클래스는 <code>final</code>이면 안 되고, 메서드나 영속 필드도 <code>final</code>이면 안 된다고 정한다. 이유는 구현체가 엔티티를 다루는 방식에 있다. 조회 결과로 엔티티를 만들 때 구현체는 어떤 생성자에 어떤 인자를 넘겨야 할지 알 수 없으므로, 인자 없는 생성자로 빈 인스턴스를 먼저 만든 뒤 필드를 채운다. 지연 로딩용 프록시는 엔티티 클래스를 상속한 클래스를 실행 중에 만들어 메서드를 가로채므로, 클래스나 메서드가 <code>final</code>이면 상속과 재정의가 막힌다(07회). 생성자를 <code>protected</code>로 둔 것은 "애플리케이션 코드는 쓰지 말라"는 의도를 드러내면서 명세 조건도 지키기 위해서다.</p>
+
+<p>필드에 접근하는 방식도 정해져 있다. 명세 §2.3.1은 엔티티의 기본 접근 방식(access type)이 매핑 애너테이션이 놓인 위치로 결정된다고 정한다. 이 예제처럼 <code>@Id</code>를 필드에 붙이면 필드 접근이 되어, 구현체가 게터·세터를 거치지 않고 필드에 직접 값을 읽고 쓴다. 그래서 <code>Book</code>에 세터가 하나도 없어도, 필드가 <code>private</code>이어도 조회 결과를 채울 수 있다.</p>
+
+<p>이제 애플리케이션 코드다. 세 개의 <code>EntityManager</code>로 저장, 조회와 수정, JPQL 조회와 삭제를 차례로 실행한다.</p>
+
+<pre><code class="language-java">package hello;
+
+import jakarta.persistence.*;
+import java.util.List;
+
+public class Main {
+    public static void main(String[] args) {
+        EntityManagerFactory emf = Persistence.createEntityManagerFactory("library");
+
+        EntityManager em = emf.createEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        tx.begin();
+        try {
+            em.persist(new Book(1L, "객체와 테이블", 30000));
+            em.persist(new Book(2L, "트랜잭션의 이해", 28000));
+            System.out.println("--- persist 호출 끝, commit 직전 ---");
+            tx.commit();
+            System.out.println("--- commit 끝 ---");
+        } catch (Exception e) {
+            tx.rollback();
+            throw e;
+        } finally {
+            em.close();
+        }
+
+        EntityManager em2 = emf.createEntityManager();
+        em2.getTransaction().begin();
+        Book a = em2.find(Book.class, 1L);
+        Book b = em2.find(Book.class, 1L);
+        System.out.println("a == b : " + (a == b));
+        a.changePrice(25000);
+        System.out.println("--- 값 변경 후 commit 직전 ---");
+        em2.getTransaction().commit();
+        em2.close();
+
+        EntityManager em3 = emf.createEntityManager();
+        em3.getTransaction().begin();
+        List<Book> page = em3.createQuery(
+                "select b from Book b where b.price >= :min order by b.price desc", Book.class)
+                .setParameter("min", 20000)
+                .setFirstResult(0)
+                .setMaxResults(10)
+                .getResultList();
+        for (Book book : page) System.out.println(book.getTitle() + " / " + book.getPrice());
+        em3.remove(em3.find(Book.class, 2L));
+        em3.getTransaction().commit();
+        em3.close();
+
+        emf.close();
+    }
+}</code></pre>
+
+<p>첫 번째 블록이 기본 틀이다. <code>EntityManager</code>를 만들고, 트랜잭션을 시작하고, 작업이 끝나면 커밋하고, 예외가 나면 롤백하고, 어떤 경우든 <code>finally</code>에서 닫는다. Java SE의 영속성 유닛은 따로 지정하지 않으면 리소스 로컬(RESOURCE_LOCAL) 트랜잭션을 쓰는데, 이때 <code>EntityTransaction</code>은 결국 JDBC 커넥션의 트랜잭션이다. 시작 로그의 <code>Autocommit mode: false</code>처럼 자동 커밋을 끈 커넥션에서 작업하고, <code>commit()</code>이 커넥션의 커밋으로 이어진다. 두 번째와 세 번째 블록은 지면을 아끼려고 예외 처리를 생략했지만 실제 코드라면 같은 틀을 써야 한다. 스프링을 쓰면 이 반복을 <code>@Transactional</code>과 컨테이너가 관리하는 <code>EntityManager</code>가 대신한다. 스프링이 주입하는 것은 현재 트랜잭션에 묶인 실제 <code>EntityManager</code>로 호출을 넘겨 주는 프록시라서, 여러 스레드가 같은 필드를 써도 각자 자기 트랜잭션의 <code>EntityManager</code>를 쓰게 된다.</p>
+
+<p>실행 결과에서 시작 로그를 빼고 나머지를 보자.</p>
+
+<pre data-label="실행 결과 (시작 로그 이후)"><code class="language-text">--- persist 호출 끝, commit 직전 ---
+Hibernate:
+    insert
+    into
+        Book
+        (price, title, id)
+    values
+        (?, ?, ?)
+Hibernate:
+    insert
+    into
+        Book
+        (price, title, id)
+    values
+        (?, ?, ?)
+--- commit 끝 ---
+Hibernate:
+    select
+        b1_0.id,
+        b1_0.price,
+        b1_0.title
+    from
+        Book b1_0
+    where
+        b1_0.id=?
+a == b : true
+--- 값 변경 후 commit 직전 ---
+Hibernate:
+    update
+        Book
+    set
+        price=?,
+        title=?
+    where
+        id=?
+Hibernate:
+    select
+        b1_0.id,
+        b1_0.price,
+        b1_0.title
+    from
+        Book b1_0
+    where
+        b1_0.price>=?
+    order by
+        b1_0.price desc
+    offset
+        ? rows
+    fetch
+        first ? rows only
+트랜잭션의 이해 / 28000
+객체와 테이블 / 25000
+Hibernate:
+    delete
+    from
+        Book
+    where
+        id=?</code></pre>
+
+<p>한 줄씩 추적해 보자. 첫째, <code>persist</code>를 두 번 호출했지만 "commit 직전" 표시가 찍힐 때까지 INSERT는 하나도 나가지 않았다. 두 INSERT는 <code>commit()</code> 안에서 나갔다. <code>persist</code>는 엔티티를 영속성 컨텍스트에 등록할 뿐이고, SQL은 커밋 직전의 플러시(flush) 때 만들어져 전송된다. 기본 키를 애플리케이션이 직접 넣었으므로 키를 얻으려고 INSERT를 서두를 이유도 없다. 데이터베이스가 키를 만드는 IDENTITY 전략이라면 사정이 달라지는데, 03회에서 본다.</p>
+
+<p>둘째, <code>find</code>를 두 번 호출했지만 SELECT는 한 번이다. 두 번째 <code>find</code>는 영속성 컨텍스트에 이미 있는 인스턴스를 돌려주었고, 그래서 <code>a == b</code>가 <code>true</code>다. 앞에서 JDBC로 같은 행을 두 번 읽었을 때 <code>false</code>가 나온 것과 비교해 보자. 명세 §3.1이 말한 "식별자 하나에 인스턴스 하나" 규칙이 실제로 지켜지는 모습이다. 다만 이것은 같은 <code>EntityManager</code> 안에서만 성립한다. <code>em2</code>와 <code>em3</code>가 같은 행을 조회하면 서로 다른 인스턴스를 받는다.</p>
+
+<p>셋째, <code>changePrice(25000)</code>는 순수한 자바 필드 대입이다. 그 시점에 SQL은 나가지 않았고, 커밋할 때 UPDATE가 나갔다. 하이버네이트는 엔티티를 처음 읽어 올 때의 상태를 기억해 두었다가 플러시 때 현재 상태와 비교해 달라진 엔티티의 UPDATE를 만든다. 이것이 변경 감지(dirty checking)이고, 어떤 스냅샷을 어떻게 비교하는지는 02회의 중심 주제다.</p>
+
+<p>넷째, JPQL 조회는 조건과 정렬, 페이징을 모두 SQL로 번역했다. <code>setFirstResult(0)</code>이었는데도 H2 방언은 <code>offset ? rows</code>를 포함한 SQL을 만들었다. 결과는 가격이 높은 순서로 "트랜잭션의 이해 / 28000"이 먼저, 앞에서 25000으로 바꾼 "객체와 테이블"이 다음에 나왔다. 마지막으로 <code>remove</code>로 지운 엔티티의 DELETE도 커밋 때 나갔다.</p>
+
+<p>사소해 보이지만 눈여겨볼 점이 하나 더 있다. 생성된 <code>create table Book</code>의 컬럼 순서는 <code>price, id, title</code>로, 클래스에 선언한 순서(<code>id, title, price</code>)와 다르다. INSERT의 컬럼 순서도 <code>price, title, id</code>다. 컬럼 순서는 하이버네이트가 정하는 것이고 이 버전에서는 선언 순서를 따르지 않았다. 자동 생성된 스키마를 운영 DDL로 그대로 쓰거나, 컬럼 순서에 기대는 SQL을 따로 작성하는 일은 피하는 것이 좋다.</p>
+
+<h4>JPQL: 테이블이 아니라 엔티티에 묻는다</h4>
+
+<p>앞의 쿼리 <code>select b from Book b where b.price >= :min order by b.price desc</code>에서 <code>Book</code>은 테이블 이름이 아니라 엔티티 이름이고, <code>b.price</code>는 컬럼이 아니라 엔티티의 속성이다. 테이블 이름을 <code>BOOKS</code>로 바꾸고 컬럼 이름을 <code>BOOK_PRICE</code>로 바꿔도 매핑 정보만 고치면 이 JPQL은 그대로다. <code>em.find</code>는 기본 키 하나로 엔티티 하나를 찾을 때만 쓸 수 있으므로, 조건으로 여러 엔티티를 찾으려면 이렇게 엔티티 객체를 대상으로 하는 쿼리 언어가 필요하다.</p>
+
+<p>하이버네이트 6에서 JPQL 문자열은 ANTLR로 만든 파서가 해석하고, 해석된 쿼리 모델이 방언을 거쳐 SQL로 렌더링된다. 스택 트레이스에 <code>QuerySqmImpl</code>이 보인 것이 그 쿼리 객체다. 그래서 같은 JPQL에서 방언에 따라 <code>substring</code>과 <code>substr</code>, <code>limit</code>와 <code>offset ... fetch</code>가 갈렸다. 파라미터 <code>:min</code>은 문자열에 값이 끼워 넣어지는 것이 아니라 SQL의 <code>?</code> 자리에 JDBC 바인딩으로 들어간다. SQL 인젝션 방어와 문장 재사용이라는 <code>PreparedStatement</code>의 이점이 JPQL에서도 그대로 유지되는 이유다. 문법의 세부는 09·10회에서 다룬다.</p>
+
+<h3>흔한 함정: 실험으로 확인한 네 가지</h3>
+
+<h4>트랜잭션 밖의 persist는 조용히 사라진다</h4>
+
+<p>트랜잭션을 시작하지 않고 <code>persist</code>를 부르면 어떻게 될까? 많은 사람이 즉시 예외가 날 것이라고 예상한다. 직접 해 보았다.</p>
+
+<pre><code class="language-java">EntityManager em = emf.createEntityManager();
+em.persist(new Book(10L, "트랜잭션 밖", 1000));          // 예외 없음
+System.out.println(em.contains(em.find(Book.class, 10L)));
+try {
+    em.flush();
+} catch (Exception e) {
+    System.out.println(e.getClass().getName() + ": " + e.getMessage());
+}
+em.close();
+System.out.println(emf.createEntityManager().find(Book.class, 10L));</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">true
+jakarta.persistence.TransactionRequiredException: no transaction is in progress
+null</code></pre>
+
+<p><code>persist</code>는 예외 없이 끝났고 엔티티는 영속성 컨텍스트에 들어갔다(<code>contains</code>가 <code>true</code>). 그러나 <code>flush</code>를 부르자 <code>TransactionRequiredException</code>이 났고, <code>EntityManager</code>를 닫은 뒤 다른 <code>EntityManager</code>로 찾으니 <code>null</code>이었다. INSERT는 한 번도 나가지 않았다. 명세 §3.1은 트랜잭션 범위 영속성 컨텍스트(컨테이너가 관리하는 경우)에서 <code>persist</code>, <code>merge</code>, <code>remove</code>, <code>refresh</code>를 트랜잭션 없이 부르면 <code>TransactionRequiredException</code>을 던지도록 정하지만, 이 예제처럼 애플리케이션이 직접 만든 <code>EntityManager</code>에서는 <code>persist</code> 자체는 받아들여졌다. 저장이 "안 된 것"이 아니라 "아직 안 된 것"이라서 오류 없이 데이터가 사라질 수 있다. 데이터를 바꾸는 작업은 반드시 트랜잭션 안에서 한다는 규칙은 이런 이유로 예외가 아니라 습관으로 지켜야 한다.</p>
+
+<h4>기본 생성자가 없으면 조회할 때 터진다</h4>
+
+<p>인자 없는 생성자가 없는 엔티티(<code>Card</code>)로도 실험했다. 하이버네이트는 시작할 때 실패하지 않고 <code>HHH000182: No default (no-argument) constructor for class: hello2.Card (class must be instantiated by Interceptor)</code>라는 INFO 로그만 남겼다. 저장도 성공해 INSERT가 나갔다. 저장은 애플리케이션이 이미 만든 인스턴스에서 값을 읽기만 하면 되기 때문이다. 실패는 다른 <code>EntityManager</code>로 조회할 때 일어났다. SELECT가 나간 다음 <code>org.hibernate.InstantiationException: No default constructor for entity 'hello2.Card'</code>가 났다. 결과 행으로 인스턴스를 만들 차례가 되어서야 생성자가 필요해진 것이다. 저장 테스트만 통과하고 조회 경로가 없는 상태라면 이 문제를 늦게 발견할 수 있다.</p>
+
+<h4>EntityManagerFactory를 요청마다 만들지 않는다</h4>
+
+<p>앞에서 본 부트스트랩 전 과정(클래스패스 탐색, 메타데이터 해석, 커넥션 풀 준비)이 <code>createEntityManagerFactory</code>를 부를 때마다 반복된다. 요청마다 만들면 응답이 느려지는 것은 물론이고, 각 팩토리가 자기 커넥션 풀을 갖기 때문에 닫지 않으면 데이터베이스 커넥션이 계속 늘어난다. 팩토리는 하나 만들어 공유하고, 애플리케이션이 끝날 때 <code>close()</code>한다.</p>
+
+<h4>EntityManager를 스레드 사이에 공유하지 않는다</h4>
+
+<p>반대로 <code>EntityManager</code>를 싱글톤 필드에 하나 두고 여러 스레드가 쓰게 하면 안 된다. 하이버네이트 사용자 가이드가 말하듯 <code>Session</code>은 단일 스레드용 객체다. 영속성 컨텍스트는 내부에 엔티티를 담아 두는 맵과 변경 추적 정보를 가지는데, 여러 스레드가 동시에 바꾸면 자바 중급편에서 본 동시성 문제가 그대로 생긴다. 게다가 한 스레드의 커밋이 다른 스레드가 바꾼 엔티티까지 함께 플러시하는, 트랜잭션 경계가 무너진 상황이 된다. 스프링이 주입하는 <code>EntityManager</code>가 스레드 사이에 공유되어도 안전한 것은 앞에서 말한 대로 트랜잭션별 실제 객체로 위임하는 프록시이기 때문이다.</p>
+
+<p>이 회차에서 세운 그림을 정리하면 이렇다. 객체와 테이블은 상속, 연관관계, 그래프 탐색, 비교에서 어긋나고, JPA는 그 번역을 표준 규칙으로 대신한다. JPA는 명세이고 하이버네이트가 구현이며, 구현은 JDBC 위에서 방언을 통해 데이터베이스별 SQL을 만든다. 실행은 <code>EntityManagerFactory</code> 하나와 작업마다의 <code>EntityManager</code>, 그리고 트랜잭션이라는 틀 안에서 이루어진다. 다음 02회는 이 회차의 로그에서 본 이상한 장면들, 즉 커밋 때 몰려 나간 INSERT, 한 번만 나간 SELECT, 메서드 호출 없이 나간 UPDATE가 영속성 컨텍스트 안에서 어떻게 일어나는지를 끝까지 따라간다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>패러다임 불일치</dt><dd>객체는 참조로 연결된 그래프이고 테이블은 키 값으로 연결된 집합이라서 상속, 연관관계의 방향, 객체 그래프 탐색 범위, 동일성 비교에서 어긋난다. SQL 중심 개발에서는 이 번역 코드를 개발자가 매번 쓴다.</dd>
+<dt>JPA와 구현체</dt><dd>JPA(Jakarta Persistence)는 인터페이스와 애너테이션으로 된 명세이고, 하이버네이트 같은 영속성 프로바이더가 SQL 생성과 실행을 구현한다. 실험에서 <code>EntityManagerFactory</code>의 실제 클래스는 <code>SessionFactoryImpl</code>이었다.</dd>
+<dt>JDBC 위의 한 층</dt><dd>JPA 구현체는 매핑 정보로 SQL을 만들고 실행은 JDBC <code>Connection.prepareStatement</code>에 맡긴다. 드라이버의 <code>SQLException</code>은 하이버네이트 예외로 변환되어 올라온다.</dd>
+<dt>javax에서 jakarta로</dt><dd>Jakarta Persistence 3.0부터 패키지와 속성 접두어가 <code>jakarta.persistence</code>로 바뀌었다. 하이버네이트 6.6은 3.1을 구현한다.</dd>
+<dt>persistence.xml과 영속성 유닛</dt><dd><code>META-INF/persistence.xml</code>의 영속성 유닛은 데이터베이스 하나와 관리할 엔티티, 설정을 묶은 이름 붙은 단위다. <code>jakarta.persistence.*</code>는 표준 속성, <code>hibernate.*</code>는 구현체 전용 속성이다.</dd>
+<dt>방언</dt><dd>데이터베이스별 타입, 함수, 페이징 문법 차이를 흡수하는 구성 요소다. 하이버네이트 6은 JDBC 메타데이터로 방언을 자동 결정하며, 표준 방언을 지정하면 불필요하다는 경고를 낸다.</dd>
+<dt>부트스트랩</dt><dd><code>createEntityManagerFactory</code>는 ServiceLoader로 프로바이더를 찾고, 설정 파일을 읽고, 커넥션과 방언을 정하고, 메타모델을 만들고, 스키마를 처리한다. 비싸므로 애플리케이션당 하나만 만든다.</dd>
+<dt>EntityManager와 트랜잭션</dt><dd><code>EntityManager</code>는 작업 단위마다 만들고 닫는 단일 스레드용 객체다. 데이터 변경은 트랜잭션 안에서 해야 하며, 트랜잭션 밖의 <code>persist</code>는 예외 없이 받아들여져도 DB에 반영되지 않을 수 있다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 JPA 문제를 진단할 때 가장 먼저 보는 것은 로그에 찍힌 SQL이다. 이 회차에서 본 것처럼 <code>persist</code>와 INSERT, 필드 대입과 UPDATE 사이에는 시간 차이가 있다. "저장 코드를 실행했는데 DB에 없다"는 신고가 오면 트랜잭션이 정말 시작되고 커밋되었는지부터 확인해야 하고, "조회 한 번에 SQL이 수십 개 나간다"는 신고가 오면 연관관계 탐색이 어디서 SQL을 일으키는지를 봐야 한다. 둘 다 JPA가 SQL을 언제 만드는지 알아야 풀린다. 운영 환경에서는 <code>hibernate.show_sql</code>처럼 표준 출력에 찍는 방식 대신 로깅 프레임워크의 로거 레벨로 SQL과 바인딩 값을 확인하는 것이 일반적이다.</p>
+<p>방언 설정은 하이버네이트 버전을 올릴 때 자주 손대게 된다. 하이버네이트 5 시절 설정에 남아 있는 <code>hibernate.dialect</code>는 6에서 대개 지워도 되고, 남겨 두면 HHH90000025 같은 경고가 난다. 반대로 방언을 명시해야 하는 경우도 있다. 직접 확장한 방언 클래스를 쓰는 경우, 그리고 시작 시점에 데이터베이스에 접속할 수 없거나 접속하지 않게 하고 싶은 경우다. 이 회차의 실험에서 <code>hibernate.boot.allow_jdbc_metadata_access=false</code>와 버전 속성을 주자 하이버네이트는 데이터베이스에 묻지 않고 지정한 버전(로그의 <code>Database version: 8.0</code>)으로 방언을 구성했다. 이렇게 하면 실제 DB 버전과 어긋난 SQL이 만들어질 수 있으므로 버전 값을 정확히 관리해야 한다.</p>
+<p><code>javax</code>와 <code>jakarta</code>의 차이는 오래된 라이브러리를 섞을 때 문제를 일으킨다. 하이버네이트 6이 매핑 정보로 읽는 것은 <code>jakarta.persistence</code> 패키지의 애너테이션이다. 스프링 부트 2와 하이버네이트 5 시절의 코드나 라이브러리에 남은 <code>javax.persistence</code> 애너테이션은 이름이 다른 별개의 타입이므로 하이버네이트 6의 매핑 정보가 되지 못한다. 마이그레이션할 때는 import 문을 일괄로 확인하고, 함께 쓰는 라이브러리가 어느 네임스페이스를 쓰는지도 확인해야 한다.</p>
+<p>JPA를 쓸지 말지는 이분법이 아니다. 도메인 모델을 중심으로 엔티티 단위로 읽고 쓰는 부분은 JPA가 번역 코드를 크게 줄여 주지만, 대량 데이터 처리나 복잡한 통계 쿼리는 JPQL 벌크 연산, 네이티브 SQL, 또는 스프링 DB 2편에서 본 <code>JdbcTemplate</code>이나 MyBatis가 더 맞을 수 있다. 같은 애플리케이션 안에서 섞어 쓰는 것도 흔하며, 이때는 JPA의 영속성 컨텍스트에 남아 있는 상태와 직접 실행한 SQL의 결과가 어긋나지 않도록 플러시 시점을 의식해야 한다. 그 감각은 02회에서 만든다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 코드를 하나의 <code>EntityManager</code>, 하나의 트랜잭션에서 실행한다. <code>persist(new Book(5L, "A", 1000))</code> → <code>find(Book.class, 5L)</code> → <code>find(Book.class, 5L)</code> → <code>changePrice(2000)</code> → <code>commit()</code>. 기본 키를 직접 넣는 이 회차의 <code>Book</code> 매핑과 하이버네이트 6.6을 가정할 때, 어떤 SQL이 몇 개, 어느 시점에 나가는지 예측하라. INSERT 하나만 나가는지, UPDATE도 나가는지 이유와 함께 설명하라.</li>
+<li>결제(<code>Payment</code>) 추상 클래스와 그 자식 <code>CardPayment</code>, <code>BankTransferPayment</code>를 이 회차의 슈퍼타입·서브타입 테이블로 저장한다고 하자. JDBC로 <code>CardPayment</code> 하나를 저장할 때 필요한 SQL과, ID로 결제 하나를 조회해 올바른 자식 타입의 객체를 만들 때 필요한 SQL과 분기 로직을 적어 보라.</li>
+<li>동료가 H2 메모리 DB로 테스트하는 프로젝트의 <code>persistence.xml</code>에 <code>hibernate.dialect=org.hibernate.dialect.MySQLDialect</code>를 넣었더니 시작 로그에 경고가 나고, 테이블 생성 DDL이 실패하고, 이어서 조회에서 "테이블이 없다"는 예외가 났다. 각 증상의 원인을 이 회차의 실험 결과로 설명하고, 어떻게 고쳐야 하는지 말하라.</li>
+<li>아래 스택 트레이스 발췌에서 각 줄이 "애플리케이션", "JPA 구현체", "JDBC 드라이버", "데이터베이스 엔진" 중 어디에 속하는지 분류하고, 애플리케이션이 받은 예외 타입이 무엇일지 말하라. <code>QuerySqmImpl.doList</code> / <code>StatementPreparerImpl.prepareQueryStatement</code> / <code>JdbcConnection.prepareStatement</code> / <code>SessionLocal.prepareCommand</code> / <code>DialectDemo.main</code></li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 직접 돌려 보면 커밋 시점에 INSERT 하나와 UPDATE 하나, 모두 두 개가 나가고 SELECT는 나가지 않는다. INSERT만 나가리라고 예상하기 쉽지만 그렇지 않다. 두 번의 <code>find</code>는 영속성 컨텍스트에 이미 있는 같은 인스턴스를 돌려주므로 SQL이 없다. 하이버네이트의 바인딩 로그(<code>org.hibernate.orm.jdbc.bind</code> 로거를 TRACE로 켠 것)를 보면 INSERT에는 <code>persist</code> 시점의 가격 1000이, 이어지는 UPDATE에는 2000이 바인딩되었다. <code>persist</code> 시점의 상태가 INSERT할 값이자 변경 감지의 비교 기준이 되었고, 플러시 때 현재 값 2000이 그 기준과 달라 UPDATE가 추가된 것이다. 같은 결과를 SQL 하나로 얻으려면 값을 다 정한 뒤에 <code>persist</code>하면 된다. 이 문제의 요점은 "메서드 호출 순서와 SQL의 순서·개수가 일치하지 않으며, 그 관계는 영속성 컨텍스트가 상태를 언제 기록하는지에 달려 있다"는 것이고, 그 기록 시점이 02회의 주제다.</p>
+<p><b>2.</b> 저장에는 INSERT 두 개가 필요하다. <code>insert into PAYMENT (ID, AMOUNT, PAID_AT, DTYPE) values (?, ?, ?, 'CARD')</code>와 <code>insert into CARD_PAYMENT (ID, LAST4) values (?, ?)</code>다. 두 문장은 같은 트랜잭션에 있어야 하고, 자식 테이블의 ID가 부모 테이블의 ID를 외래 키로 참조하므로 부모를 먼저 넣는다. 조회는 <code>select ... from PAYMENT p left join CARD_PAYMENT c on c.ID = p.ID left join BANK_TRANSFER_PAYMENT t on t.ID = p.ID where p.ID = ?</code>처럼 모든 자식 테이블을 외부 조인하고, 결과의 <code>DTYPE</code>(또는 어느 쪽 자식 컬럼이 null이 아닌지)을 보고 <code>new CardPayment(...)</code>와 <code>new BankTransferPayment(...)</code> 중 하나를 고르는 분기 코드를 쓴다. 자식 타입이 늘어나면 조인과 분기도 함께 늘어난다는 점이 상속 불일치의 비용이다.</p>
+<p><b>3.</b> 경고는 하이버네이트 6이 방언을 자동으로 정할 수 있는데 표준 방언을 굳이 지정했기 때문에 나는 HHH90000025다. DDL 실패는 MySQL 방언이 테이블 생성문 끝에 <code>engine=InnoDB</code>를 붙였고 H2가 그 문법을 이해하지 못했기 때문이다. DDL 실패는 시작을 막지 않으므로 애플리케이션은 떴지만 테이블이 없는 상태가 되었고, 그래서 조회에서 "테이블이 없다"는 예외가 원인 예외로 들어간 <code>SQLGrammarException</code>이 났다. 해결책은 <code>hibernate.dialect</code> 속성을 지우는 것이다. 그러면 하이버네이트가 접속한 H2의 메타데이터를 보고 <code>H2Dialect</code>를 고른다. 운영 DB가 MySQL이고 테스트에서 MySQL 문법을 검증하고 싶다면, H2에 다른 방언을 덮어씌우는 대신 실제 MySQL로 테스트하는 편이 정확하다.</p>
+<p><b>4.</b> <code>DialectDemo.main</code>은 애플리케이션, <code>QuerySqmImpl.doList</code>와 <code>StatementPreparerImpl.prepareQueryStatement</code>는 JPA 구현체(하이버네이트), <code>JdbcConnection.prepareStatement</code>는 JDBC 드라이버(H2의 <code>java.sql.Connection</code> 구현), <code>SessionLocal.prepareCommand</code>는 데이터베이스 엔진(H2가 SQL을 파싱하는 곳)이다. 애플리케이션이 받는 예외는 드라이버의 <code>JdbcSQLSyntaxErrorException</code>이 아니라 하이버네이트가 변환한 <code>org.hibernate.exception.SQLGrammarException</code>이며, 원래 예외는 <code>getCause()</code>로 꺼낼 수 있다. 하이버네이트 6의 예외는 <code>jakarta.persistence.PersistenceException</code> 계열이므로 표준 타입으로 잡을 수도 있다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>JDBC로 같은 기본 키의 행을 두 번 조회해 만든 객체 <code>a</code>, <code>b</code>와, 하나의 <code>EntityManager</code>로 같은 기본 키의 엔티티를 두 번 <code>find</code>한 <code>c</code>, <code>d</code>가 있다. 옳은 설명은?</q>
+<o><code>a == b</code>와 <code>c == d</code> 모두 <code>true</code>다. 데이터베이스의 같은 행이기 때문이다.</o>
+<o><code>a == b</code>는 <code>false</code>, <code>c == d</code>는 <code>true</code>다. 영속성 컨텍스트는 식별자 하나에 인스턴스 하나를 유지하고 두 번째 조회에서 SQL을 보내지 않는다.</o>
+<o><code>a == b</code>는 <code>false</code>, <code>c == d</code>도 <code>false</code>지만 <code>c.equals(d)</code>는 하이버네이트가 자동으로 <code>true</code>로 만들어 준다.</o>
+<o><code>c == d</code>가 <code>true</code>인 것은 두 번째 <code>find</code>가 SELECT를 다시 실행한 뒤 첫 번째 객체의 필드를 덮어쓰기 때문이다.</o>
+<why>JDBC 코드는 호출할 때마다 <code>new</code>로 객체를 만들므로 값이 같아도 다른 인스턴스다. 명세 §3.1은 영속성 컨텍스트 안에서 영속 엔티티 식별자마다 인스턴스가 하나뿐이라고 정하고, 실험에서 두 번째 <code>find</code>는 SQL 없이 같은 인스턴스를 돌려주었다. 하이버네이트는 <code>equals</code>를 자동으로 만들어 주지 않으며(3번), 두 번째 조회에서 SELECT는 나가지 않았다(4번).</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>Java SE에서 <code>emf.createEntityManager()</code>로 직접 만든 <code>EntityManager</code>에 트랜잭션을 시작하지 않고 <code>persist</code>를 호출한 뒤 <code>flush</code>를 호출했다. 하이버네이트 6.6.53에서 확인한 동작은?</q>
+<o><code>persist</code> 호출 즉시 <code>TransactionRequiredException</code>이 난다.</o>
+<o><code>persist</code>가 즉시 INSERT를 실행하고 자동 커밋되어 데이터가 남는다.</o>
+<o><code>persist</code>는 예외 없이 끝나 엔티티가 관리 상태가 되지만, <code>flush</code>에서 <code>TransactionRequiredException</code>이 나고 데이터는 DB에 남지 않는다.</o>
+<o><code>persist</code>와 <code>flush</code> 모두 성공하고, <code>close()</code> 때 커밋된다.</o>
+<why>실험에서 <code>persist</code> 후 <code>contains</code>는 <code>true</code>였고 <code>flush</code>는 "no transaction is in progress" 메시지의 <code>TransactionRequiredException</code>을 던졌으며, 다른 <code>EntityManager</code>로 조회하니 <code>null</code>이었다. 명세가 트랜잭션 없는 <code>persist</code>에 예외를 요구하는 것은 트랜잭션 범위 영속성 컨텍스트의 경우이므로 1번은 이 상황에 맞지 않는다. INSERT는 한 번도 나가지 않았으므로 2번과 4번은 틀리다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>같은 JPQL 페이징 쿼리가 MySQL 방언에서는 <code>limit ?,?</code>로, 오라클·PostgreSQL·H2 방언에서는 <code>offset ? rows fetch first ? rows only</code>로 번역되었다. 이 차이를 만드는 것과 그 설정에 대한 설명으로 옳은 것은?</q>
+<o>하이버네이트의 <code>Dialect</code>가 만든다. 하이버네이트 6은 보통 JDBC 메타데이터로 방언을 자동 결정하므로 <code>hibernate.dialect</code>를 지정하지 않아도 된다.</o>
+<o>JDBC 드라이버가 받은 JPQL을 데이터베이스 문법으로 바꾼다.</o>
+<o>JPA 명세가 데이터베이스별 페이징 SQL을 정해 두었고, 구현체는 그대로 출력한다.</o>
+<o>데이터베이스가 JPQL을 직접 해석하므로 애플리케이션에서는 차이가 생기지 않는다.</o>
+<why>드라이버와 데이터베이스는 JPQL을 모르고 하이버네이트가 만든 SQL만 받는다(2번, 4번 오답). 명세는 JPQL과 페이징 API(<code>setFirstResult</code>, <code>setMaxResults</code>)를 정할 뿐, 데이터베이스별 SQL은 구현체의 방언이 만든다(3번 오답). 하이버네이트 입문 가이드는 방언이 자동 결정된다고 설명하며, 표준 방언을 지정하면 HHH90000025 경고가 났다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>인자 없는 생성자가 없는 엔티티를 하이버네이트 6.6.53으로 실험했다. 문제가 실제로 드러난 시점과 그 이유로 옳은 것은?</q>
+<o>컴파일할 때. <code>@Entity</code> 애너테이션 처리기가 생성자를 검사한다.</o>
+<o><code>createEntityManagerFactory</code> 때. 메타모델 구축이 예외로 중단된다.</o>
+<o><code>persist</code> 때. 저장하려면 구현체가 복사본 인스턴스를 만들어야 한다.</o>
+<o>다른 <code>EntityManager</code>로 조회할 때. 결과 행으로 인스턴스를 만들려면 인자 없는 생성자가 필요하다.</o>
+<why>시작 시점에는 HHH000182 INFO 로그만 남았고, 저장은 애플리케이션이 만든 인스턴스에서 값을 읽기만 하므로 성공했다. 조회에서 SELECT가 나간 뒤 결과로 인스턴스를 만들 차례가 되자 <code>InstantiationException: No default constructor for entity</code>가 났다. 명세 §2.1이 <code>public</code>이나 <code>protected</code>인 인자 없는 생성자를 요구하는 이유가 바로 이 단계 때문이다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>ORM(Object-Relational Mapping)</dt><dd>객체와 관계형 데이터베이스 테이블 사이의 변환을 매핑 정보에 따라 프레임워크가 대신하는 기술이다.</dd>
+<dt>패러다임 불일치(object-relational impedance mismatch)</dt><dd>객체 모델과 관계형 모델이 상속, 연관관계, 그래프 탐색, 동일성을 다루는 방식이 달라서 생기는 간극이다.</dd>
+<dt>영속성 프로바이더(persistence provider)</dt><dd>JPA 명세를 구현한 라이브러리다. 하이버네이트, 이클립스링크가 해당하며 <code>ServiceLoader</code>로 발견된다.</dd>
+<dt>영속성 유닛(persistence unit)</dt><dd>하나의 데이터베이스에 대해 관리할 엔티티 클래스와 설정을 묶은 이름 붙은 단위로, <code>persistence.xml</code>에 정의한다.</dd>
+<dt>엔티티 매니저 팩토리(EntityManagerFactory)</dt><dd>영속성 유닛 하나에서 만들어지는 스레드 안전한 팩토리다. 만들기 비싸므로 애플리케이션당 하나를 공유한다. 하이버네이트에서는 <code>SessionFactory</code>다.</dd>
+<dt>엔티티 매니저(EntityManager)</dt><dd>엔티티를 저장·조회·삭제하고 쿼리를 만드는 단일 스레드용 객체로, 작업 단위마다 만들고 닫는다. 하이버네이트에서는 <code>Session</code>이다.</dd>
+<dt>영속성 컨텍스트(persistence context)</dt><dd>엔티티 인스턴스를 관리하는 집합으로, 영속 엔티티 식별자마다 인스턴스를 하나만 둔다. 02회의 주제다.</dd>
+<dt>방언(Dialect)</dt><dd>데이터베이스별 타입, 함수, 페이징 같은 SQL 문법 차이를 흡수하는 하이버네이트 구성 요소다.</dd>
+<dt>JPQL(Jakarta Persistence Query Language)</dt><dd>테이블이 아니라 엔티티와 그 속성을 대상으로 쓰는 쿼리 언어로, 구현체가 방언에 맞는 SQL로 번역한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1">Jakarta Persistence 3.1 Specification</a> — §2.1 엔티티 클래스 요건, §2.3.1 기본 접근 방식, §3.1 EntityManager와 영속성 컨텍스트의 인스턴스 유일성, 트랜잭션 요구</li>
+<li><a href="https://jakarta.ee/specifications/persistence/">Jakarta Persistence 명세 목록</a> — 2.2부터 4.0까지의 버전과 대응 Jakarta EE 플랫폼</li>
+<li><a href="https://jcp.org/en/jsr/detail?id=338">JSR 338: Java Persistence 2.2</a> — JPA 2.1 최종 릴리스와 2.2 유지보수 릴리스 일정</li>
+<li><a href="https://docs.hibernate.org/orm/6.6/introduction/html_single/Hibernate_Introduction.html">An Introduction to Hibernate 6 (6.6)</a> — persistence.xml 위치와 예제, 표준 JDBC 속성, 방언 자동 결정, 내장 커넥션 풀 경고</li>
+<li><a href="https://docs.hibernate.org/orm/6.6/userguide/html_single/Hibernate_User_Guide.html">Hibernate ORM 6.6 User Guide</a> — SessionFactory와 Session의 성격, EntityManagerFactory와의 대응</li>
+<li><a href="https://hibernate.org/orm/releases/6.6/">Hibernate ORM 6.6 릴리스</a> — 지원 자바 버전과 Jakarta Persistence 3.1 호환성</li>
+</x-refs>

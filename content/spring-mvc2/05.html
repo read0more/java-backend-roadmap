@@ -1,0 +1,705 @@
+<x-meta>
+deck: 필드에 붙인 애노테이션이 클래스 파일에 기록되고, 검증 엔진이 그것을 읽어 위반을 만들고, 스프링이 그 위반을 BindingResult의 FieldError로 옮기기까지를 따라가며 groups와 폼 객체 분리, @RequestBody 검증의 차이를 설명한다.
+minutes: 110
+</x-meta>
+
+<x-goals>
+<li>Jakarta Validation(명세)과 Hibernate Validator(구현)의 관계를 설명하고, 스프링 부트가 검증기를 만들어 모든 <code>WebDataBinder</code>에 넣기까지의 경로를 클래스 이름 순서로 말할 수 있다.</li>
+<li>애노테이션 하나가 클래스 파일의 어느 속성에 기록되고, 리플렉션으로 어떻게 읽혀 제약 검사가 되는지 <code>javap</code> 출력과 함께 설명할 수 있다.</li>
+<li>Bean Validation 위반 하나가 어떤 오류 코드, 메시지 코드 목록, 메시지 인자(<code>{0}</code>, <code>{1}</code>, <code>{2}</code>)를 갖게 되는지 손으로 써 보고, 화면에 나올 메시지를 예측할 수 있다.</li>
+<li>등록과 수정의 검증 규칙이 다를 때 groups와 폼 전송 객체 분리가 각각 어떻게 문제를 푸는지, 그리고 왜 실무에서 후자를 고르는지 바인딩 보안까지 포함해 설명할 수 있다.</li>
+<li><code>@ModelAttribute</code>와 <code>@RequestBody</code>에서 타입 오류와 검증 오류가 각각 어느 단계에서 어떻게 끝나는지 구분할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>규칙을 코드가 아니라 선언으로: Bean Validation이 푸는 문제</h3>
+<p>04회에서 만든 상품 검증기를 떠올려 보자. 이름이 비었는지, 가격이 100원 이상 5,000,000원 이하인지, 수량이 1개 이상 999개 이하인지를 <code>if</code> 문으로 하나씩 확인하고, 실패하면 <code>rejectValue</code>로 오류를 등록했다. 동작은 정확했지만 코드를 다시 읽으면 대부분이 같은 모양의 반복이다. "이 필드는 비어 있으면 안 된다", "이 필드는 이 범위 안에 있어야 한다"는 규칙은 사실 필드에 대한 정보인데, 그 정보가 필드 선언과 멀리 떨어진 다른 클래스의 메서드 안에 흩어져 있다. 필드를 하나 추가하면 검증기도 함께 고쳐야 하고, 그것을 잊어도 컴파일러는 아무 말도 하지 않는다.</p>
+<p>Bean Validation은 이 규칙을 필드 옆에 애노테이션으로 선언하자는 생각에서 출발한다. <code>@NotBlank</code>를 붙이면 "비어 있으면 안 된다", <code>@Max(999)</code>를 붙이면 "999 이하여야 한다"가 된다. 선언은 데이터일 뿐 스스로 아무것도 검사하지 않는다. 검사는 이 선언을 읽어 해석하는 별도의 엔진, 즉 검증기(validator)가 한다. 코드로 쓰던 규칙이 메타데이터(metadata)로 바뀌고, 메타데이터를 실행하는 일은 범용 엔진이 맡는 구조다. 스프링이 <code>@Transactional</code>이나 <code>@RequestMapping</code>을 다루는 방식과 같은 계열이다.</p>
+<p>이 구조가 주는 이득은 반복 제거만이 아니다. 규칙이 데이터이므로 여러 계층이 같은 규칙을 공유할 수 있다. 웹 계층의 바인딩 직후 검증, 서비스 메서드의 인자 검증, JPA 엔티티를 저장하기 직전의 검증이 모두 같은 애노테이션을 읽는다. 오류 메시지도 규칙과 함께 표준화된다. 모든 구현이 <code>@NotBlank</code>를 같은 의미로 해석하도록 명세가 정해 두었기 때문에, 구현체를 바꿔도 규칙의 의미는 달라지지 않는다.</p>
+<p>대가도 있다. 애노테이션으로 표현하기 쉬운 것은 필드 하나만 보면 판단할 수 있는 규칙이다. "가격 × 수량은 50,000,000원 이하"처럼 여러 필드를 함께 봐야 하는 규칙, "등록할 때와 수정할 때 규칙이 다르다" 같은 상황 의존적인 규칙은 선언 하나로 깔끔하게 표현되지 않는다. 이 회차의 후반부는 거의 이 한계를 다루는 데 쓰인다. 먼저 엔진이 어떻게 생겼는지부터 보자.</p>
+
+<h3>명세와 구현: jakarta.validation과 Hibernate Validator</h3>
+<p>Bean Validation은 라이브러리 이름이 아니라 자바 진영의 표준 명세(specification) 이름이다. 명세는 애노테이션(<code>@NotNull</code>, <code>@Max</code> 등), 인터페이스(<code>Validator</code>, <code>ConstraintValidator</code>, <code>ConstraintViolation</code>), 그리고 그것들이 어떻게 동작해야 하는지를 문서로 정한다. 처음에는 Java EE의 JSR(Java Specification Request)로 만들어졌고, 스프링 소스 곳곳에 남아 있는 "JSR-303"이라는 이름이 그 첫 버전을 가리킨다. Java EE가 이클립스 재단으로 옮겨 Jakarta EE가 된 뒤로는 Jakarta Bean Validation이라는 이름으로 이어졌다. Jakarta EE 9에 해당하는 3.0에서 패키지가 <code>javax.validation</code>에서 <code>jakarta.validation</code>으로 바뀌었고, Jakarta EE 11에 해당하는 버전은 Jakarta Validation 3.1이다. Spring Framework 6과 Spring Boot 3은 <code>jakarta.*</code> 네임스페이스를 쓰므로 <code>import jakarta.validation.constraints.NotBlank</code>로 시작한다.</p>
+<p>명세는 실행되지 않는다. 실행되는 것은 구현체(provider)다. 사실상 표준 구현은 Hibernate Validator이고, Hibernate Validator 8.0이 Jakarta Bean Validation 3.0의 참조 구현(reference implementation)이다. 이름에 Hibernate가 들어 있지만 JPA나 ORM과는 별개의 라이브러리다. 의존성을 나눠 보면 이렇다.</p>
+<div class="table-wrap"><table><thead><tr><th>의존성</th><th>담긴 것</th><th>역할</th></tr></thead><tbody>
+<tr><td><code>jakarta.validation-api</code></td><td><code>@NotNull</code>, <code>@Max</code>, <code>Validator</code> 인터페이스 등</td><td>명세. 규칙을 선언하고 검증기를 부르는 API</td></tr>
+<tr><td><code>hibernate-validator</code></td><td>각 제약의 실제 검사 코드, 메시지 번역 파일, 추가 제약(<code>@Range</code>, <code>@ScriptAssert</code> 등)</td><td>구현. 선언을 읽고 실행하는 엔진</td></tr>
+<tr><td>EL 구현(예: <code>tomcat-embed-el</code>)</td><td>Jakarta Expression Language 해석기</td><td>메시지 안의 <code>${...}</code> 식을 평가. Hibernate Validator가 메시지 보간에 요구한다</td></tr>
+</tbody></table></div>
+<p>스프링 부트에서는 <code>spring-boot-starter-validation</code> 하나를 추가하면 이 셋이 함께 들어온다. Spring Boot 3.3의 스타터는 <code>hibernate-validator</code>와 <code>tomcat-embed-el</code>에 의존하고, 이 버전이 관리하는 <code>jakarta.validation-api</code>는 3.0.2이고, <code>hibernate-validator</code>는 3.3.0에서 8.0.1.Final, 이후 패치 릴리스(예: 3.3.13)에서 8.0.2.Final이다. 웹 스타터에는 검증 스타터가 포함되어 있지 않으므로 직접 추가해야 한다.</p>
+<pre data-label="build.gradle"><code class="language-groovy">dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-thymeleaf'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+}</code></pre>
+<p>애플리케이션 코드는 가능하면 명세의 API에만 의존한다. 위반 결과를 받는 타입도, 대부분의 애노테이션도 <code>jakarta.validation</code> 패키지에 있다. 다만 <code>org.hibernate.validator.constraints</code> 패키지의 <code>@Range</code>처럼 구현체 전용 애노테이션도 편해서 자주 쓰인다. 이것을 쓰는 순간 그 코드는 Hibernate Validator에 묶인다는 점만 알고 쓰면 된다. 이 회차는 비교를 위해 일부러 둘을 섞어 쓴다.</p>
+<aside class="note">명세의 API만 있고 구현체가 없으면 검증기를 만들 수 없다. <code>Validation.buildDefaultValidatorFactory()</code>는 클래스패스에서 <code>META-INF/services/jakarta.validation.spi.ValidationProvider</code> 파일을 찾아 구현체를 고르는데, 이것은 자바 표준의 서비스 로더(<code>ServiceLoader</code>) 방식이다. 스프링 부트의 검증 자동 구성도 바로 이 파일이 클래스패스에 있는지를 조건으로 건다.</aside>
+
+<h3>스프링 없이 검증기 직접 돌려 보기</h3>
+<p>스프링에 연결하기 전에 엔진만 따로 돌려 보면 스프링이 어디서부터 끼어드는지가 분명해진다. 상품 클래스에 규칙을 선언한다. 04회와 같은 규칙이다. 가격에는 Hibernate Validator의 <code>@Range</code>를, 수량에는 표준의 <code>@Min</code>, <code>@Max</code>를 썼다.</p>
+<pre data-label="Product.java"><code class="language-java">import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import org.hibernate.validator.constraints.Range;
+
+public class Product {
+
+    private Long id;
+
+    @NotBlank
+    private String name;
+
+    @NotNull
+    @Range(min = 100, max = 5_000_000)
+    private Integer price;
+
+    @NotNull
+    @Min(1)
+    @Max(999)
+    private Integer quantity;
+
+    public Product() {
+    }
+
+    // getter, setter ...
+}</code></pre>
+<p>검증기를 만들고 객체 하나를 검사하는 코드는 다음과 같다. <code>ValidatorFactory</code>는 <code>AutoCloseable</code>을 구현하므로 try-with-resources로 닫을 수 있다.</p>
+<pre data-label="BeanValidationBasics.java"><code class="language-java">import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validation;
+import jakarta.validation.Validator;
+import jakarta.validation.ValidatorFactory;
+import java.util.Set;
+
+public class BeanValidationBasics {
+    public static void main(String[] args) {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+
+            Product product = new Product();
+            product.setName("   ");      // 공백만 있다
+            product.setPrice(10);        // 범위 밖
+            product.setQuantity(null);   // 비어 있다
+
+            Set<ConstraintViolation<Product>> violations = validator.validate(product);
+            for (ConstraintViolation<Product> v : violations) {
+                System.out.println(v.getPropertyPath() + " | " + v.getInvalidValue() + " | " + v.getMessage());
+            }
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (JVM 기본 로캘이 한국어일 때, 줄 순서는 실행마다 다를 수 있다)"><code class="language-text">name |     | 공백일 수 없습니다
+price | 10 | 100에서 5000000 사이여야 합니다
+quantity | null | 널이어서는 안됩니다</code></pre>
+<p>결과를 한 줄씩 읽어 보자. 위반 하나는 <code>ConstraintViolation</code> 객체 하나다. 여기에는 어느 경로의 값이 어긋났는지(<code>getPropertyPath()</code>), 그 값이 무엇이었는지(<code>getInvalidValue()</code>), 어떤 제약이 어긋났는지(<code>getConstraintDescriptor()</code>), 사람이 읽을 메시지(<code>getMessage()</code>)가 들어 있다. 이 네 가지가 뒤에서 스프링이 <code>FieldError</code>를 만들 때 쓰는 재료 전부다.</p>
+<p><code>validate</code>의 반환 타입은 <code>Set</code>이다. <code>Set</code> 인터페이스는 순회 순서를 약속하지 않고, 명세도 반환되는 위반의 순서를 정하지 않는다. 그래서 위 출력의 줄 순서는 보장되지 않는다. 화면에 오류를 보여 줄 때 순서가 중요하다면 위반 목록의 순서에 기대지 말고 템플릿에서 필드별로 꺼내야 한다. 실제로 타임리프의 <code>th:errors="*{name}"</code>는 필드 이름으로 오류를 찾으므로 순서와 무관하다.</p>
+<p>메시지는 두 가지를 알려 준다. 첫째, Hibernate Validator는 언어별 기본 메시지 파일을 갖고 있다. <code>@NotBlank</code>의 <code>message</code> 속성 기본값은 <code>{jakarta.validation.constraints.NotBlank.message}</code>라는 키이고, 한국어 파일(<code>ValidationMessages_ko.properties</code>)에서 이 키가 "공백일 수 없습니다"로 풀렸다. 스프링 없이 실행하면 메시지 파일을 고르는 로캘은 JVM 기본 로캘(<code>Locale.getDefault()</code>)이다. 영어 로캘에서 같은 코드를 돌리면 영어 메시지가 나온다. 둘째, <code>@Range</code>의 메시지 템플릿 <code>{min}에서 {max} 사이여야 합니다</code>의 <code>{min}</code>, <code>{max}</code>는 같은 이름의 애노테이션 속성 값으로 치환되었다. 이때 숫자는 <code>toString()</code>으로 문자열이 되므로 천 단위 구분 기호가 없는 <code>5000000</code>이 된다. 뒤에서 스프링의 메시지 소스가 같은 값을 <code>5,000,000</code>으로 찍는 것과 대비된다.</p>
+<p>Hibernate Validator 문서는 메시지 보간(message interpolation)의 순서를 이렇게 정리한다. 먼저 <code>{...}</code> 안의 이름을 애플리케이션의 <code>ValidationMessages</code> 번들에서 찾고, 다음으로 구현체에 내장된 표준 메시지 번들에서 찾고, 그래도 남은 것은 같은 이름의 애노테이션 속성 값으로 바꾸며, 마지막으로 <code>${...}</code> 식을 EL로 평가한다. EL 구현이 의존성에 필요한 이유가 이 마지막 단계다.</p>
+<aside class="keyidea"><span>여기까지의 핵심</span><p>검증 엔진의 입력은 "객체 하나와 검사할 그룹 목록"이고, 출력은 "위반의 집합"이다. 엔진은 BindingResult도, 오류 코드도, errors.properties도 모른다. 그것들은 전부 스프링이 이 출력을 받아 04회의 구조로 옮기면서 생긴다.</p></aside>
+
+<h3>한 층 아래: 애노테이션은 클래스 파일 어디에 있고, 엔진은 그것을 어떻게 읽는가</h3>
+<p>애노테이션은 주석이 아니다. 컴파일러는 애노테이션을 클래스 파일에 기록하고, JVM은 그것을 리플렉션 API로 꺼내 준다. 다만 모든 애노테이션이 실행 중에 보이는 것은 아니다. 애노테이션 타입에 붙은 <code>@Retention</code>이 그 수명을 정한다. <code>SOURCE</code>는 컴파일러만 보고 버리고, <code>CLASS</code>는 클래스 파일에 기록하지만 실행 중 리플렉션에는 보이지 않으며, <code>RUNTIME</code>이어야 리플렉션으로 읽힌다. 검증 애노테이션은 모두 <code>RUNTIME</code>이다. 그렇지 않으면 실행 중인 엔진이 규칙을 읽을 방법이 없다.</p>
+<p>이것을 눈으로 확인하기 위해 Bean Validation 라이브러리 없이 JDK만으로 작은 검증 엔진을 만들어 보자. 실제 Hibernate Validator의 구조를 흉내 낸 것이 아니라, "애노테이션을 읽어 규칙을 실행한다"는 원리만 떼어 낸 실험이다. 일부러 <code>CLASS</code> 수명의 애노테이션도 하나 섞었다.</p>
+<pre data-label="MiniValidator.java (JDK 21에서 실행)"><code class="language-java">import java.lang.annotation.*;
+import java.lang.reflect.Field;
+import java.util.*;
+
+@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.FIELD)
+@interface MyNotBlank { String message() default "공백일 수 없습니다"; }
+
+@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.FIELD)
+@interface MyRange { long min(); long max(); String message() default "범위를 벗어났습니다"; }
+
+@Retention(RetentionPolicy.CLASS) @Target(ElementType.FIELD)
+@interface InvisibleRule { }
+
+class Product {
+    @MyNotBlank String name;
+    @MyRange(min = 100, max = 5_000_000) Integer price;
+    @MyRange(min = 1, max = 999) @InvisibleRule Integer quantity;
+    Product(String name, Integer price, Integer quantity) {
+        this.name = name; this.price = price; this.quantity = quantity;
+    }
+}
+
+public class MiniValidator {
+    static List<String> validate(Object target) throws IllegalAccessException {
+        List<String> violations = new ArrayList<>();
+        Field[] fields = target.getClass().getDeclaredFields();
+        Arrays.sort(fields, Comparator.comparing(Field::getName)); // 순서를 고정한다
+        for (Field f : fields) {
+            f.setAccessible(true);
+            Object value = f.get(target);
+            MyNotBlank nb = f.getAnnotation(MyNotBlank.class);
+            if (nb != null && (value == null || value.toString().isBlank())) {
+                violations.add(f.getName() + ": " + nb.message());
+            }
+            MyRange r = f.getAnnotation(MyRange.class);
+            if (r != null && value != null) { // null은 범위 검사 대상이 아니다
+                long v = ((Number) value).longValue();
+                if (v < r.min() || v > r.max()) {
+                    violations.add(f.getName() + "=" + value + ": " + r.message());
+                }
+            }
+            System.out.println(f.getName() + " annotations=" + f.getDeclaredAnnotations().length);
+        }
+        return violations;
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println(validate(new Product("  ", 10, null)));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">name annotations=1
+price annotations=1
+quantity annotations=1
+[name: 공백일 수 없습니다, price=10: 범위를 벗어났습니다]</code></pre>
+<p>세 가지를 관찰할 수 있다. 첫째, <code>quantity</code>에는 애노테이션이 두 개 붙어 있지만 리플렉션은 하나만 돌려준다. <code>@InvisibleRule</code>은 <code>CLASS</code> 수명이라 실행 중에는 보이지 않는다. 둘째, <code>quantity</code>는 <code>null</code>인데 범위 위반이 나오지 않았다. <code>null</code>은 범위 검사 대상이 아니라고 코드에 적었기 때문이다. 이것은 실제 Bean Validation 명세의 규칙이기도 하다. 셋째, <code>getDeclaredFields()</code>의 반환 순서는 Javadoc상 정해져 있지 않으므로 출력 순서를 고정하려고 이름순으로 정렬했다. 실제 엔진의 위반 순서가 보장되지 않는 것과 같은 맥락이다.</p>
+<p>컴파일된 클래스 파일을 <code>javap -v -p Product.class</code>로 열어 보면 애노테이션이 어디에 기록되는지 보인다.</p>
+<pre data-label="javap -v -p Product.class 중 quantity 필드 부분"><code class="language-text">  java.lang.Integer quantity;
+    descriptor: Ljava/lang/Integer;
+    flags: (0x0000)
+    RuntimeVisibleAnnotations:
+      0: #22(#23=J#29,#26=J#31)
+        MyRange(
+          min=1l
+          max=999l
+        )
+    RuntimeInvisibleAnnotations:
+      0: #34()
+        InvisibleRule</code></pre>
+<p><code>RUNTIME</code> 애노테이션은 필드 정보의 <code>RuntimeVisibleAnnotations</code> 속성에, <code>CLASS</code> 애노테이션은 <code>RuntimeInvisibleAnnotations</code> 속성에 들어간다. JVM은 클래스를 로딩할 때 앞의 것만 리플렉션으로 노출한다. <code>#22</code>, <code>#23</code> 같은 번호는 상수 풀(constant pool) 항목을 가리키는데, <code>#22</code>는 애노테이션 타입 <code>LMyRange;</code>, <code>#23</code>은 속성 이름 <code>min</code>, <code>#29</code>는 <code>long</code> 상수 <code>1</code>이다. 즉 <code>@MyRange(min = 1, max = 999)</code>라는 선언은 "타입 이름과 (속성 이름, 상수) 쌍의 목록"으로 직렬화되어 클래스 파일에 들어간다. 사용 지점에 적지 않은 <code>message</code>는 여기에 없다. 기본값은 애노테이션 타입 쪽 클래스 파일, 곧 <code>MyRange.class</code>의 <code>message()</code> 메서드에 <code>AnnotationDefault</code> 속성으로 한 번만 기록되고, 리플렉션이 값을 돌려줄 때 채워진다.</p>
+<p>실제 엔진이 하는 일도 뼈대는 같다. 차이는 규모와 일반성에 있다. Bean Validation 애노테이션에는 <code>@Constraint(validatedBy = ...)</code>라는 메타 애노테이션이 붙어 "이 제약은 어떤 <code>ConstraintValidator</code> 구현이 검사하는가"를 알려 준다. 표준 제약은 명세가 규칙만 정하고 검사 코드는 구현체가 제공하므로 <code>validatedBy</code>가 비어 있고, 구현체가 내부에서 짝을 맞춘다. 직접 만드는 제약은 여기에 검사 클래스를 적는다. 엔진은 클래스의 필드와 게터와 클래스 자체에 붙은 제약을 모아 메타데이터를 만들고, 각 제약에 맞는 검사기를 골라 값과 함께 호출한다.</p>
+<p>값을 읽는 방법도 명세가 정해 두었다. 필드에 붙인 제약은 엔진이 필드에 직접 접근해 값을 읽고, 게터에 붙인 제약은 게터를 호출해 그 반환값을 검사한다(명세 5.1.2절). 게터가 계산된 값을 돌려주거나 지연 로딩 프록시처럼 동작하는 객체라면 두 방식의 결과가 다를 수 있으므로 한 클래스 안에서는 한 방식으로 통일하는 편이 안전하다. 또 <code>Validator</code> 구현은 스레드 안전해야 한다고 명세의 Javadoc이 요구한다. 그래서 요청마다 검증기를 새로 만들 필요가 없고, 스프링은 애플리케이션 전체에서 하나를 공유한다.</p>
+
+<h4>null은 누구의 책임인가</h4>
+<p>실험에서 일부러 흉내 낸 규칙을 실제 명세로 확인해 두자. <code>@Max</code>의 Javadoc은 지원 타입(<code>BigDecimal</code>, <code>BigInteger</code>, <code>byte</code>, <code>short</code>, <code>int</code>, <code>long</code>과 각각의 래퍼)을 나열한 뒤 "null elements are considered valid"라고 적는다. <code>@Min</code>, <code>@Size</code>, <code>@Pattern</code> 같은 대부분의 표준 제약이 같은 태도를 갖는다. 명세는 "값의 내용 검사"와 "값의 존재 검사"를 분리하는 것을 좋은 설계로 보고, 존재 검사는 <code>@NotNull</code> 계열에 맡긴다. 그래서 가격 필드에 <code>@NotNull</code>과 <code>@Range</code>를 함께 붙였다. <code>@Range</code>만 붙였다면 가격 칸을 비운 요청이 검증을 통과한다.</p>
+<p>문자열과 컬렉션에서 "비어 있음"을 다루는 세 제약은 기준이 다르다.</p>
+<div class="table-wrap"><table><thead><tr><th>제약</th><th>거부하는 값</th><th>지원 타입</th></tr></thead><tbody>
+<tr><td><code>@NotNull</code></td><td><code>null</code></td><td>모든 타입</td></tr>
+<tr><td><code>@NotEmpty</code></td><td><code>null</code>, 길이(크기)가 0인 값</td><td><code>CharSequence</code>, <code>Collection</code>, <code>Map</code>, 배열</td></tr>
+<tr><td><code>@NotBlank</code></td><td><code>null</code>, 공백이 아닌 문자가 하나도 없는 값</td><td><code>CharSequence</code></td></tr>
+</tbody></table></div>
+<p><code>"   "</code>은 <code>@NotEmpty</code>를 통과하지만 <code>@NotBlank</code>는 통과하지 못한다. Hibernate Validator 8.0의 검사기(<code>NotBlankValidator</code>)는 문자열을 <code>trim()</code>한 뒤 길이가 0보다 큰지로 판정한다. 상품 이름처럼 사람이 입력하는 문자열에는 대개 <code>@NotBlank</code>가 맞다.</p>
+<p>표준 제약을 조합해 새 제약을 만들 수도 있다. Hibernate Validator의 <code>@Range</code>가 그 예다. 소스를 보면 <code>@Range</code> 애노테이션 타입 자체에 <code>@Min(0)</code>, <code>@Max(Long.MAX_VALUE)</code>, <code>@ReportAsSingleViolation</code>이 붙어 있고, <code>min</code>, <code>max</code> 속성이 <code>@OverridesAttribute</code>로 각각 <code>@Min</code>과 <code>@Max</code>의 <code>value</code>를 덮어쓴다. 검사는 <code>@Min</code>과 <code>@Max</code>가 하고, <code>@ReportAsSingleViolation</code> 때문에 둘 중 무엇이 실패하든 위반은 <code>@Range</code>의 것 하나로 보고된다. 구성 요소가 <code>@Min</code>, <code>@Max</code>이니 <code>null</code>을 허용하는 성질도 그대로 물려받는다.</p>
+
+<h3>스프링에 연결하기: 검증기가 모든 WebDataBinder에 들어가는 경로</h3>
+<p>이제 같은 <code>Product</code>를 컨트롤러에서 검증하게 하자. 04회에서 만든 상품 컨트롤러를 복사해 새 버전을 만들되, 직접 만든 <code>ProductValidator</code>와 그것을 등록하던 <code>@InitBinder</code>는 지운다. 컨트롤러의 등록 메서드는 거의 그대로다.</p>
+<pre data-label="ProductControllerV3.java"><code class="language-java">@Controller
+@RequestMapping("/v3/products")
+public class ProductControllerV3 {
+
+    private final ProductRepository productRepository;
+
+    public ProductControllerV3(ProductRepository productRepository) {
+        this.productRepository = productRepository;
+    }
+
+    @PostMapping("/add")
+    public String add(@Validated @ModelAttribute Product product, BindingResult bindingResult,
+                      RedirectAttributes redirectAttributes) {
+        if (bindingResult.hasErrors()) {
+            return "v3/products/addForm";
+        }
+        Product saved = productRepository.save(product);
+        redirectAttributes.addAttribute("productId", saved.getId());
+        return "redirect:/v3/products/{productId}";
+    }
+
+    // 목록, 상세, 등록 폼, 수정 ...
+}</code></pre>
+<p>검증기를 등록하는 코드가 한 줄도 없는데 <code>@NotBlank</code>가 동작한다. 누가 검증기를 바인더에 넣었는지 추적해 보자. 출발점은 스프링 부트의 자동 구성이다. Spring Boot 3.3의 <code>ValidationAutoConfiguration</code>은 클래스패스에 <code>jakarta.validation.executable.ExecutableValidator</code>가 있고 <code>META-INF/services/jakarta.validation.spi.ValidationProvider</code> 리소스가 있을 때만 동작한다. 앞의 것은 명세 API가 있다는 뜻이고, 뒤의 것은 구현체가 있다는 뜻이다. 조건이 맞으면 <code>jakarta.validation.Validator</code> 빈이 따로 없을 때 <code>defaultValidator</code>라는 이름으로 스프링의 <code>LocalValidatorFactoryBean</code>을 등록한다.</p>
+<p><code>LocalValidatorFactoryBean</code>은 이중 신분을 가진 객체다. 안에 Bean Validation의 <code>ValidatorFactory</code>와 <code>Validator</code>를 품고 있으면서, 스프링의 <code>org.springframework.validation.Validator</code> 인터페이스도 구현한다. 이 연결 고리가 <code>SpringValidatorAdapter</code>다. 04회에서 직접 만든 검증기가 구현했던 바로 그 스프링 인터페이스(<code>supports</code>, <code>validate(Object, Errors)</code>)를 구현하면서, 실제 검사는 안에 품은 Bean Validation 검증기에 위임하고 결과를 <code>Errors</code>에 옮겨 적는다. 스프링 쪽에서 보면 Bean Validation도 그냥 검증기 하나일 뿐이다.</p>
+<p>다음은 스프링 MVC 쪽이다. 스프링 MVC 설정 클래스는 <code>mvcValidator</code>라는 빈으로 "모든 바인더에 넣을 전역 검증기"를 정한다. Spring Framework의 기본 구현은 <code>WebMvcConfigurer.getValidator()</code>가 돌려준 검증기가 있으면 그것을, 없고 클래스패스에 Bean Validation이 있으면 <code>OptionalValidatorFactoryBean</code>을 쓴다. 스프링 부트는 이 메서드를 재정의한다. 역시 <code>WebMvcConfigurer.getValidator()</code>가 돌려준 것이 있으면 그것을 감싸 쓰고, 없으면 컨텍스트에 이미 있는 <code>jakarta.validation.Validator</code> 빈, 곧 앞의 <code>defaultValidator</code>를 찾아 <code>ValidatorAdapter</code>로 감싸 쓴다. 이 전역 검증기는 바인더를 초기화하는 <code>ConfigurableWebBindingInitializer</code>에 들어가고, 이 초기화기는 요청마다 새로 만들어지는 모든 <code>WebDataBinder</code>에 대해 <code>supports</code>가 참이면 <code>binder.setValidator(전역 검증기)</code>를 호출한다. <code>SpringValidatorAdapter.supports</code>는 안에 Bean Validation 검증기가 있으면 타입을 묻지 않고 참을 돌려주므로, 결국 모든 바인더가 Bean Validation 검증기를 갖게 된다.</p>
+<figure class="flow-figure"><figcaption>@Validated 파라미터 하나가 검증되기까지 (Spring Boot 3.x, Spring Framework 6.x)</figcaption><ol class="flow">
+<li><strong>시작 시: 검증기 생성</strong><span><code>ValidationAutoConfiguration</code>이 <code>LocalValidatorFactoryBean</code>(<code>defaultValidator</code>)을 만든다. 안에 Hibernate Validator의 <code>Validator</code>가 있다.</span></li>
+<li><strong>시작 시: 전역 검증기 지정</strong><span>부트가 재정의한 <code>mvcValidator()</code>가 그 빈을 <code>ValidatorAdapter</code>로 감싸 MVC의 전역 검증기로 삼고, <code>ConfigurableWebBindingInitializer</code>에 넣는다.</span></li>
+<li><strong>요청 시: 바인더 생성</strong><span><code>@ModelAttribute</code> 인자를 해석하며 <code>WebDataBinder</code>를 만들고, 초기화기가 <code>setValidator</code>로 전역 검증기를 넣는다. 그다음 <code>@InitBinder</code> 메서드가 호출된다.</span></li>
+<li><strong>요청 시: 바인딩</strong><span>요청 파라미터를 객체에 대입한다. 타입 변환에 실패하면 <code>typeMismatch</code> <code>FieldError</code>가 <code>BindingResult</code>에 쌓인다.</span></li>
+<li><strong>요청 시: 검증</strong><span>파라미터에 <code>@Validated</code>나 <code>@Valid</code>가 있으면 <code>binder.validate(hints)</code>가 검증기를 호출한다. <code>SpringValidatorAdapter</code>가 Bean Validation을 실행하고 위반을 <code>FieldError</code>/<code>ObjectError</code>로 바꿔 같은 <code>BindingResult</code>에 넣는다.</span></li>
+<li><strong>요청 시: 컨트롤러 호출 또는 예외</strong><span>바로 뒤에 <code>BindingResult</code> 파라미터가 있으면 컨트롤러가 호출되고, 없으면 오류가 있을 때 <code>MethodArgumentNotValidException</code>이 던져진다(04회).</span></li>
+</ol></figure>
+<x-visual id="spring-mvc2-05-validation-pipeline" title="Bean Validation이 스프링 MVC 요청 처리에 끼어드는 지점" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>애플리케이션 시작 시 검증기가 만들어져 전역 검증기로 지정되고, 요청마다 바인더에 들어가 바인딩 뒤에 실행되어 위반이 FieldError로 바뀌는 흐름을 보여 준다.</x-hint>
+<x-prompt>A clean two-lane sequence diagram on a white background. Top lane labeled "애플리케이션 시작" contains three boxes left to right connected by arrows: "LocalValidatorFactoryBean" (with a small inner box labeled "Hibernate Validator"), "mvcValidator (ValidatorAdapter)", "ConfigurableWebBindingInitializer". Bottom lane labeled "요청 하나" contains five boxes left to right connected by arrows: "WebDataBinder 생성", "바인딩", "binder.validate()", "SpringValidatorAdapter", "BindingResult". A dashed arrow goes from "ConfigurableWebBindingInitializer" down to "WebDataBinder 생성" labeled "setValidator". Under "SpringValidatorAdapter" draw a small arrow labeled "ConstraintViolation → FieldError" pointing into "BindingResult". Under "바인딩" a small red note labeled "typeMismatch" also pointing into "BindingResult". Flat vector style, muted blue and gray, no 3D.</x-prompt>
+<x-caption>검증기는 시작할 때 한 번 만들어져 모든 요청의 바인더가 공유하고, 바인딩 오류와 검증 오류는 같은 BindingResult에 모인다.</x-caption>
+</x-visual>
+<p>이 경로를 알면 자주 겪는 두 가지 현상이 설명된다. 하나는 <code>@InitBinder</code>에서 04회처럼 <code>binder.addValidators(productValidator)</code>로 직접 만든 검증기를 추가하면 Bean Validation과 직접 만든 검증기가 둘 다 실행된다는 것이다. <code>addValidators</code>는 목록에 덧붙이고, <code>DataBinder.validate</code>는 목록의 모든 검증기를 같은 <code>BindingResult</code>로 차례로 호출한다. 반대로 <code>binder.setValidator(productValidator)</code>를 쓰면 <code>setValidator</code>가 목록을 비운 뒤 하나만 넣으므로 그 바인더에서는 Bean Validation이 빠진다. 다른 하나는 <code>WebMvcConfigurer</code>를 구현해 <code>getValidator()</code>로 검증기를 돌려주면 스프링 부트가 그것을 전역 검증기로 쓰므로 애노테이션 검증이 애플리케이션 전체에서 사라진다는 것이다. 둘 다 오류 없이 조용히 일어난다.</p>
+<aside class="note">위 클래스 이름과 조건은 Spring Boot 3.3 소스 기준이다. Spring Boot 4.x에서는 검증 자동 구성이 별도 모듈로 옮겨져 패키지가 바뀌었지만(<code>org.springframework.boot.validation.autoconfigure</code>), <code>mvcValidator()</code>가 <code>getValidator()</code> 결과를 먼저 쓰고 없으면 기존 검증기 빈을 감싸는 구조는 Boot 4.1 소스에서도 같다.</aside>
+
+<h3>바인딩에 실패한 필드는 검증 결과에서 빠진다</h3>
+<p>04회에서 바인딩과 검증은 같은 <code>BindingResult</code>를 공유한다고 했다. 그러면 가격 칸에 <code>abc</code>를 넣었을 때는 어떻게 될까. 바인딩 단계에서 <code>"abc"</code>를 <code>Integer</code>로 바꾸지 못해 <code>typeMismatch</code> 오류가 등록되고, 가격 필드는 대입되지 않은 채 <code>null</code>로 남는다. 이어서 검증이 실행되면 <code>@NotNull</code>이 붙은 가격이 <code>null</code>이니 위반이 하나 더 생긴다. 사용자는 "숫자를 입력하세요"와 "값을 입력하세요"를 동시에 보게 될 것 같다. 실제로는 그렇지 않다.</p>
+<p>이유는 <code>SpringValidatorAdapter</code>가 위반을 옮겨 적는 메서드 <code>processConstraintViolations</code>에 있다. Spring Framework 7.0 소스는 먼저 <code>BindingResult</code>의 모든 오류를 훑어 <code>isBindingFailure()</code>가 참인 <code>FieldError</code>의 필드 이름을 모아 두고, 위반 하나하나에 대해 그 필드가 목록에 있으면 건너뛴다. 소스의 주석은 이것을 "바인딩이 성공한 필드에 대해서만" 위반을 오류로 바꾼다고 설명한다. Spring Framework 6.1 소스는 필드별로 <code>errors.getFieldError(field)</code>를 꺼내 그것이 바인딩 실패가 아닐 때만 진행하는 형태로 같은 일을 한다. 엔진은 객체 전체를 검사하지만, 스프링이 결과를 옮겨 적으며 걸러 내는 것이다.</p>
+<pre data-label="SpringValidatorAdapter.processConstraintViolations (Spring Framework 7.0, 일부)"><code class="language-java">Set<String> failedFields = new HashSet<>();
+if (errors.hasErrors()) {
+    for (ObjectError error : errors.getAllErrors()) {
+        if (error instanceof FieldError fieldError && fieldError.isBindingFailure()) {
+            failedFields.add(fieldError.getField());
+        }
+    }
+}
+for (ConstraintViolation<Object> violation : violations) {
+    String field = determineField(violation);
+    if (!failedFields.contains(field)) {
+        // 오류 코드, 인자, 거절된 값을 정해 FieldError 또는 ObjectError를 만든다 ...
+    }
+}</code></pre>
+<p>요청별로 어떤 오류가 남는지 정리하면 다음과 같다. 빈 문자열이 <code>null</code>이 되는 것은 스프링의 문자열-숫자 변환기(<code>StringToNumberConverterFactory</code>)가 빈 문자열에 대해 예외 대신 <code>null</code>을 돌려주기 때문이다. 그래서 빈 칸은 타입 오류가 아니라 <code>@NotNull</code> 위반이 된다.</p>
+<div class="table-wrap"><table><thead><tr><th>price 파라미터</th><th>바인딩 결과</th><th>Bean Validation 위반</th><th>BindingResult에 남는 오류</th></tr></thead><tbody>
+<tr><td><code>1000</code></td><td>1000 대입</td><td>없음</td><td>없음</td></tr>
+<tr><td><code>10</code></td><td>10 대입</td><td><code>@Range</code></td><td><code>Range</code> 오류 1개</td></tr>
+<tr><td>빈 문자열</td><td><code>null</code> 대입(변환 성공)</td><td><code>@NotNull</code></td><td><code>NotNull</code> 오류 1개</td></tr>
+<tr><td><code>abc</code></td><td>대입 실패, <code>null</code>로 남음</td><td><code>@NotNull</code>(엔진은 만든다)</td><td><code>typeMismatch</code> 오류 1개(위반은 버려짐)</td></tr>
+</tbody></table></div>
+<p>이 규칙은 원리상 자연스럽다. 타입 변환에 실패한 필드의 값은 사용자가 보낸 값이 아니라 객체의 초깃값이다. 그 초깃값을 검사한 결과는 사용자의 입력에 대해 아무것도 말해 주지 않는다. 사용자에게 의미 있는 오류는 "숫자가 아니다" 하나뿐이다. 반대로 타입 오류가 없는 필드의 검증은 그대로 진행되므로, 가격에 <code>abc</code>를 넣고 이름도 비웠다면 가격의 <code>typeMismatch</code>와 이름의 <code>NotBlank</code>가 함께 남는다. 한 번의 제출로 고칠 것을 모두 알려 주는 셈이다. 이 "필드 단위 바인딩, 필드 단위 걸러 내기"가 뒤에서 볼 <code>@RequestBody</code>와 가장 크게 다른 점이다.</p>
+
+<h3>오류 코드: 애노테이션 이름이 코드가 되고, 속성이 인자가 된다</h3>
+<p><code>SpringValidatorAdapter</code>가 위반 하나를 <code>FieldError</code>로 바꿀 때 정해야 하는 것은 04회에서 <code>rejectValue</code>에 넘기던 것과 같다. 필드 이름, 거절된 값, 오류 코드, 메시지 인자, 기본 메시지다. 각각을 어디서 가져오는지 소스로 확인하면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>FieldError의 항목</th><th>가져오는 곳</th><th>예: 가격 10</th></tr></thead><tbody>
+<tr><td>필드 이름</td><td>위반의 속성 경로(<code>determineField</code>)</td><td><code>price</code></td></tr>
+<tr><td>거절된 값</td><td>위반의 <code>getInvalidValue()</code>(경로가 중첩된 경우 등은 <code>BindingResult</code>에서 다시 읽음)</td><td><code>10</code></td></tr>
+<tr><td>오류 코드</td><td>제약 애노테이션 타입의 단순 이름(<code>getSimpleName()</code>)</td><td><code>Range</code></td></tr>
+<tr><td>메시지 코드 목록</td><td>오류 코드를 <code>MessageCodesResolver</code>에 넣은 결과</td><td><code>Range.product.price</code> 외 3개</td></tr>
+<tr><td>메시지 인자</td><td>필드 이름 + 애노테이션 속성(이름순)</td><td><code>[price, 5000000, 100]</code></td></tr>
+<tr><td>기본 메시지</td><td>위반의 <code>getMessage()</code>(Bean Validation이 보간한 문장)</td><td><code>100에서 5000000 사이여야 합니다</code></td></tr>
+</tbody></table></div>
+<p>오류 코드가 애노테이션의 단순 이름이라는 점이 핵심이다. <code>determineErrorCode</code>는 제약 디스크립터에서 애노테이션 타입을 꺼내 <code>getSimpleName()</code>을 돌려줄 뿐이다. 04회에서 <code>rejectValue("price", "range", ...)</code>처럼 직접 고르던 문자열 자리에 <code>Range</code>, <code>NotBlank</code>, <code>NotNull</code>, <code>Min</code>, <code>Max</code>가 들어간다. 패키지는 버려지므로 <code>jakarta.validation.constraints.NotBlank</code>와 직접 만든 <code>com.example.NotBlank</code>는 같은 오류 코드를 갖는다.</p>
+<p>이 코드는 04회의 <code>DefaultMessageCodesResolver</code>를 그대로 거친다. 객체 이름이 <code>product</code>이고 필드가 <code>name</code>(타입 <code>String</code>)인 <code>NotBlank</code> 위반이라면 메시지 코드 목록은 구체적인 것부터 다음 네 개다.</p>
+<pre class="diagram">NotBlank.product.name        ← 오류코드.객체이름.필드
+NotBlank.name                ← 오류코드.필드
+NotBlank.java.lang.String    ← 오류코드.필드타입
+NotBlank                     ← 오류코드</pre>
+<p>메시지 인자는 조금 더 들여다볼 가치가 있다. <code>getArgumentsForConstraint</code>는 첫 번째 인자로 필드 이름 자체를 넣는데, 문자열이 아니라 <code>DefaultMessageSourceResolvable</code>로 넣는다. 그 코드 목록은 <code>{"product.price", "price"}</code>이고 기본 메시지는 <code>"price"</code>다. 그다음 애노테이션의 속성 중 <code>message</code>, <code>groups</code>, <code>payload</code>를 뺀 나머지를 <code>TreeMap</code>에 넣어 이름의 알파벳순으로 덧붙인다. <code>@Range</code>의 속성은 <code>min</code>과 <code>max</code>이고 알파벳순으로는 <code>max</code>가 먼저이므로, 인자 배열은 <code>{0}</code>=필드, <code>{1}</code>=max, <code>{2}</code>=min이 된다. 직관과 반대로 <code>{1}</code>이 최댓값이다. <code>@Max(999)</code>의 속성은 <code>value</code> 하나이므로 <code>{1}</code>=999다. <code>@NotBlank</code>처럼 고유 속성이 없는 제약은 <code>{0}</code>만 있다.</p>
+
+<h3>메시지가 골라지는 순서: errors.properties, 그리고 Bean Validation의 기본 메시지</h3>
+<p>04회의 <code>errors.properties</code>에 Bean Validation용 메시지를 추가해 보자. 범용 메시지는 오류 코드 하나짜리 키로, 특정 필드에만 쓸 문구는 가장 구체적인 키로 적는다. 필드 이름을 사람이 읽는 말로 바꾸는 키도 함께 둔다.</p>
+<pre data-label="errors.properties (추가분)"><code class="language-properties">#==ObjectError==
+totalPriceMax=가격 × 수량은 {0}원 이하여야 합니다. 현재 값 = {1}
+
+#==FieldError: 범용==
+NotBlank={0}을(를) 입력하세요.
+NotNull={0}을(를) 입력하세요.
+Range={0}은(는) {2} 이상 {1} 이하여야 합니다.
+Min={0}은(는) {1} 이상이어야 합니다.
+Max={0}은(는) {1} 이하여야 합니다.
+
+#==FieldError: 구체적==
+NotBlank.product.name=상품 이름을 입력하세요.
+
+#==필드 이름==
+product.price=가격
+product.quantity=수량</code></pre>
+<p>가격에 <code>10</code>을 넣고 제출했을 때 화면에 나올 문장을 추적해 보자. 타임리프의 <code>th:errors</code>는 오류 객체를 스프링의 <code>MessageSource</code>에 넘기고, <code>AbstractMessageSource.getMessage(MessageSourceResolvable, Locale)</code>가 다음 순서로 일한다.</p>
+<ol>
+<li>코드 목록 <code>Range.product.price</code>, <code>Range.price</code>, <code>Range.java.lang.Integer</code>, <code>Range</code>를 차례로 찾는다. 네 번째 <code>Range</code>에서 <code>{0}은(는) {2} 이상 {1} 이하여야 합니다.</code>를 찾는다.</li>
+<li>인자를 해석한다. <code>resolveArguments</code>는 인자 중 <code>MessageSourceResolvable</code>인 것을 다시 메시지로 푼다. 첫 인자의 코드 <code>product.price</code>가 파일에 있으므로 <code>{0}</code>은 <code>가격</code>이 된다. 그 키가 없었다면 다음 코드 <code>price</code>를 찾고, 그것도 없으면 기본 메시지인 필드 이름 <code>price</code>가 그대로 쓰인다.</li>
+<li><code>java.text.MessageFormat</code>으로 문장을 만든다. <code>Long</code> 인자는 로캘의 숫자 형식으로 찍힌다.</li>
+</ol>
+<pre data-label="JDK 21에서 같은 형식을 직접 적용한 결과 (Locale.KOREA)"><code class="language-text">가격은(는) 100 이상 5,000,000 이하여야 합니다.</code></pre>
+<p>Bean Validation 자체의 메시지가 <code>5000000</code>이었던 것과 달리 여기서는 <code>5,000,000</code>이 된다. 한쪽은 Hibernate Validator가 속성 값을 <code>toString()</code>으로 바꾼 것이고, 다른 쪽은 <code>MessageFormat</code>이 숫자 인자를 <code>NumberFormat</code>으로 포맷한 것이다. 같은 숫자가 어느 메시지 체계를 거치느냐에 따라 다르게 보인다는 사실은 화면 문구를 다듬을 때 쓸모가 있다.</p>
+<p>이름 칸을 비웠다면 첫 코드 <code>NotBlank.product.name</code>이 바로 찾아져 <code>상품 이름을 입력하세요.</code>가 나온다. 범용 <code>NotBlank</code>는 이 필드에서는 쓰이지 않는다. 04회에서 본 "구체적인 것이 이긴다"는 규칙 그대로다.</p>
+<p>네 코드 중 어느 것도 파일에 없다면 어떻게 될까. 04회에서는 기본 메시지도 없으면 렌더링 중에 <code>NoSuchMessageException</code>이 난다고 했다. Bean Validation에서 온 오류는 사정이 다르다. 기본 메시지 자리에 Bean Validation이 보간한 문장, 즉 <code>getMessage()</code>의 결과가 들어 있기 때문이다. <code>errors.properties</code>에 아무것도 적지 않아도 "공백일 수 없습니다" 같은 문장이 나오는 이유가 이것이다. 스프링은 이 기본 메시지에 <code>{0}</code>이라는 문자열이 들어 있을 때만 <code>MessageFormat</code>으로 한 번 더 렌더링하고, 아니면 그대로 쓴다(<code>requiresMessageFormat</code>). 그러니 애노테이션의 <code>message</code> 속성에 직접 쓴 문장도 통한다. 예를 들어 <code>@NotBlank(message = "이름은 필수입니다")</code>라고 쓰면 <code>errors.properties</code>에 해당 코드가 없을 때 이 문장이 보인다. 우선순위는 언제나 <code>errors.properties</code>의 코드 목록이 먼저다.</p>
+<div class="table-wrap"><table><thead><tr><th>우선순위</th><th>출처</th><th>예</th></tr></thead><tbody>
+<tr><td>1</td><td><code>MessageSource</code>에서 코드 목록을 구체적인 것부터 탐색</td><td><code>NotBlank.product.name</code> → … → <code>NotBlank</code></td></tr>
+<tr><td>2</td><td>애노테이션의 <code>message</code> 속성에 직접 쓴 문장(Bean Validation이 보간)</td><td><code>@NotBlank(message = "이름은 필수입니다")</code></td></tr>
+<tr><td>3</td><td>구현체의 기본 메시지 번들(Bean Validation이 보간)</td><td><code>공백일 수 없습니다</code></td></tr>
+</tbody></table></div>
+<h4>기본 메시지의 언어는 누가 정하는가</h4>
+<p>스프링 없이 실행했을 때 Hibernate Validator는 JVM 기본 로캘로 메시지 파일을 골랐다. 웹 애플리케이션에서 이 방식이면 서버가 어느 나라에 있느냐에 따라 모든 사용자가 같은 언어의 메시지를 받는다. 스프링의 <code>LocalValidatorFactoryBean</code>은 이것을 고치기 위해 메시지 보간기를 <code>LocaleContextMessageInterpolator</code>로 감싼다. 이 감싸개는 보간할 때마다 <code>LocaleContextHolder.getLocale()</code>, 곧 현재 스레드에 묶인 로캘을 넘긴다. <code>DispatcherServlet</code>은 요청을 처리하는 동안 03회에서 본 <code>LocaleResolver</code>가 정한 로캘을 이 스레드 로컬에 넣어 두므로, 기본 메시지도 요청의 <code>Accept-Language</code>를 따른다. 검증이 요청 처리 스레드 안에서 동기적으로 실행되기 때문에 성립하는 구조다.</p>
+<p>스프링 부트는 한 겹을 더 씌운다. 부트 2.6부터 <code>MessageInterpolatorFactory</code>에 애플리케이션의 <code>MessageSource</code>를 넘길 수 있게 되었고, 자동 구성은 애플리케이션 컨텍스트를 넘긴다. 그러면 보간기가 <code>MessageSourceMessageInterpolator</code>로 감싸져, 메시지 템플릿 안의 <code>{이름}</code>을 먼저 스프링의 메시지 소스에서 찾아 치환하고, 찾지 못한 자리는 그대로 남겨 Hibernate Validator에 넘긴다. 따라서 <code>@NotBlank(message = "{product.name.required}")</code>처럼 쓰고 그 키를 <code>messages.properties</code>에 두는 방식도 동작한다. 다만 이것은 기본 메시지를 만드는 경로이고, 1순위인 <code>errors.properties</code>의 코드 탐색과는 별개라는 점을 구분해 두자.</p>
+<h3>오브젝트 오류: @ScriptAssert의 한계와 대안</h3>
+<p>필드 하나로 판단할 수 없는 규칙, "가격 × 수량은 50,000,000원 이하"를 Bean Validation으로 표현해 보자. 제약은 필드뿐 아니라 클래스에도 붙일 수 있다. 클래스 수준 제약(class-level constraint)은 객체 전체를 입력으로 받는다. Hibernate Validator는 이런 용도로 <code>@ScriptAssert</code>를 제공한다. 클래스에 붙이고 검사할 식을 문자열로 적는다.</p>
+<pre data-label="@ScriptAssert를 붙인 Product"><code class="language-java">@ScriptAssert(lang = "javascript",
+              script = "_this.price * _this.quantity <= 50000000",
+              message = "가격 × 수량은 50,000,000원 이하여야 합니다")
+public class Product {
+    // ...
+}</code></pre>
+<p><code>_this</code>는 검사 대상 객체를 스크립트 안에서 부르는 별칭(<code>alias</code> 속성)이다. 이 위반은 특정 필드가 아니라 객체 자체에 대한 것이므로 속성 경로가 비어 있다. <code>SpringValidatorAdapter</code>는 경로가 빈 위반을 만나면 <code>FieldError</code> 대신 <code>ObjectError</code>를 만든다. 오류 코드는 역시 애노테이션 이름 <code>ScriptAssert</code>이고, 메시지 코드는 <code>ScriptAssert.product</code>, <code>ScriptAssert</code> 두 개다.</p>
+<p>문제는 이 코드를 Java 21에서 실행하면 생긴다. Hibernate Validator 문서에 따르면 <code>@ScriptAssert</code>를 쓰려면 JSR 223(Java Scripting API) 구현, 곧 해당 언어의 스크립트 엔진이 클래스패스에 있어야 한다. JDK 8부터 들어 있던 자바스크립트 엔진 Nashorn은 JDK 15에서 제거되었다(JEP 372). 스크립팅 API인 <code>java.scripting</code> 모듈은 남아 있지만 엔진은 없다. JDK 21에서 직접 확인해 보면 다음과 같다.</p>
+<pre data-label="ScriptEngines.java"><code class="language-java">import javax.script.ScriptEngineManager;
+
+public class ScriptEngines {
+    public static void main(String[] args) {
+        ScriptEngineManager m = new ScriptEngineManager();
+        System.out.println("engines=" + m.getEngineFactories().size());
+        System.out.println("javascript=" + m.getEngineByName("javascript"));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (Temurin 21.0.13)"><code class="language-text">engines=0
+javascript=null</code></pre>
+<p>엔진이 없으면 Hibernate Validator의 <code>@ScriptAssert</code> 검사기는 <code>initialize</code> 단계에서 스크립트 평가기를 얻지 못하고 예외를 던진다. 이것은 위반이 아니다. 위반은 <code>BindingResult</code>에 담겨 화면에 돌아가지만, 예외는 검증 호출을 뚫고 올라가 요청 전체를 실패시킨다. 별도의 예외 처리가 없다면 사용자는 폼 대신 서버 오류 화면을 본다. GraalJS 같은 엔진을 따로 추가하면 동작하게 만들 수는 있지만, 그렇게 해도 남는 약점이 있다. 식이 문자열이라 컴파일러가 검사하지 못하고, 필드 이름을 바꾸는 리팩터링에서 빠지며, 검증 대상 객체마다 스크립트를 평가하는 비용이 든다. 오류가 객체 전체에 대한 것이라 특정 칸 옆에 표시하기도 어렵다.</p>
+<p>대안은 두 가지다. 첫째, 여러 필드를 묶는 규칙은 자바 코드로 쓴다. 바인딩과 애노테이션 검증이 끝난 뒤 컨트롤러에서 직접 확인하고 <code>reject</code>로 객체 오류를 등록한다. 04회에서 썼던 방식 그대로이고, 같은 <code>BindingResult</code>에 쌓이므로 화면 쪽은 바뀌지 않는다.</p>
+<pre data-label="컨트롤러에서 객체 오류 등록"><code class="language-java">@PostMapping("/add")
+public String add(@Validated @ModelAttribute Product product, BindingResult bindingResult,
+                  RedirectAttributes redirectAttributes) {
+    if (product.getPrice() != null && product.getQuantity() != null) {
+        long total = (long) product.getPrice() * product.getQuantity();
+        if (total > 50_000_000L) {
+            bindingResult.reject("totalPriceMax", new Object[]{50_000_000L, total}, null);
+        }
+    }
+    if (bindingResult.hasErrors()) {
+        return "v3/products/addForm";
+    }
+    // 저장, 리다이렉트 ...
+}</code></pre>
+<p><code>(long)</code> 변환은 04회에서 본 이유 그대로다. <code>Integer</code> 두 개를 그냥 곱하면 언박싱된 <code>int</code> 곱셈이 되고, 가격 4,300,000원에 수량 999개처럼 두 필드 검증을 모두 통과하는 값도 곱이 <code>int</code> 범위를 넘는다. JDK 21에서 <code>Integer</code> 4,300,000과 999를 그대로 곱하면 4,295,700,000이 아니라 732,704가 나오고, 이 값은 상한보다 작으니 검사를 통과해 버린다. 필드 제약이 각각 지켜져도 조합에서 깨지는 규칙이 바로 객체 검증의 영역이고, 이런 산술의 경계는 애노테이션이 대신 챙겨 주지 않는다.</p>
+<p>둘째, 규칙을 재사용해야 한다면 클래스 수준 제약을 직접 만든다. 명세가 정한 형식대로 <code>message</code>, <code>groups</code>, <code>payload</code> 세 속성을 갖춘 애노테이션을 선언하고, <code>@Constraint(validatedBy = ...)</code>로 검사 클래스를 연결한다.</p>
+<pre data-label="직접 만든 클래스 수준 제약"><code class="language-java">@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Constraint(validatedBy = TotalPriceLimitValidator.class)
+public @interface TotalPriceLimit {
+    String message() default "가격 × 수량이 상한을 넘습니다";
+    Class<?>[] groups() default {};
+    Class<? extends Payload>[] payload() default {};
+    long limit();
+}
+
+public class TotalPriceLimitValidator implements ConstraintValidator<TotalPriceLimit, Product> {
+
+    private long limit;
+
+    @Override
+    public void initialize(TotalPriceLimit annotation) {
+        this.limit = annotation.limit();
+    }
+
+    @Override
+    public boolean isValid(Product product, ConstraintValidatorContext context) {
+        if (product == null || product.getPrice() == null || product.getQuantity() == null) {
+            return true; // 값의 존재는 @NotNull의 몫이다
+        }
+        return (long) product.getPrice() * product.getQuantity() <= limit;
+    }
+}</code></pre>
+<p><code>Product</code>에 <code>@TotalPriceLimit(limit = 50_000_000)</code>을 붙이면 이 규칙은 컴파일되는 자바 코드가 되고, 오류 코드는 <code>TotalPriceLimit</code>, 메시지 인자는 <code>{0}</code>=객체 이름 <code>product</code>를 코드로 갖는 resolvable(필드가 없으므로 기본 메시지는 빈 문자열), <code>{1}</code>=<code>limit</code>가 된다. <code>null</code>일 때 참을 돌려준 것은 앞에서 본 명세의 관례를 따른 것이다. 존재 검사까지 이 검사기가 떠안으면 같은 빈 칸에 대해 오류가 두 개 나온다. 어느 쪽을 택하든 원칙은 같다. 필드 하나로 판단하는 규칙은 애노테이션에, 여러 필드나 외부 상태(데이터베이스의 재고, 다른 사용자의 상태)가 얽힌 규칙은 자바 코드에 둔다. 외부 상태를 보는 규칙은 검증기 안에서 저장소를 호출하기 시작하면 검증 시점과 트랜잭션 경계가 얽히므로 서비스 계층에서 다루는 편이 낫다.</p>
+
+<h3>수정 화면에 적용하면 드러나는 한계</h3>
+<p>상품 수정에도 같은 검증을 적용해 보자. 수정 폼은 상품 ID를 숨은 필드로 갖고, 컨트롤러는 <code>@Validated @ModelAttribute Product product</code>로 받는다. 등록과 똑같이 동작한다. 그런데 요구 사항이 하나 추가된다고 하자.</p>
+<ul>
+<li>수정할 때는 상품 ID가 반드시 있어야 한다. 없으면 어느 상품을 고칠지 알 수 없다.</li>
+<li>수정할 때는 수량을 0으로 바꿀 수 있어야 한다. 품절 상태로 돌리기 위해서다. 등록할 때는 여전히 1개 이상이어야 한다.</li>
+</ul>
+<p><code>Product</code> 클래스 하나에 이 규칙을 넣으려 하면 바로 막힌다. <code>id</code>에 <code>@NotNull</code>을 붙이면 등록이 항상 실패한다. 등록 시점의 상품에는 아직 ID가 없기 때문이다. ID는 저장소가 저장하면서 붙인다. 수량의 <code>@Min(1)</code>을 <code>@Min(0)</code>으로 바꾸면 등록의 규칙이 무너진다. 애노테이션은 필드에 붙어 있고 필드는 하나인데, 그 필드에 요구하는 규칙이 상황에 따라 둘이다. 선언적 검증의 약점이 정확히 여기서 드러난다. 선언은 "언제"를 모른다.</p>
+<div class="table-wrap"><table><thead><tr><th>필드</th><th>등록</th><th>수정</th></tr></thead><tbody>
+<tr><td>id</td><td>없음(저장 시 부여)</td><td>필수</td></tr>
+<tr><td>name</td><td>공백 불가</td><td>공백 불가</td></tr>
+<tr><td>price</td><td>필수, 100 ~ 5,000,000</td><td>필수, 100 ~ 5,000,000</td></tr>
+<tr><td>quantity</td><td>필수, 1 ~ 999</td><td>필수, 0 ~ 999</td></tr>
+</tbody></table></div>
+<p>해결책은 두 갈래다. 하나는 같은 객체에 규칙을 여러 벌 선언해 두고 "이번에는 이 벌을 검사하라"고 알려 주는 방법, 곧 검증 그룹이다. 다른 하나는 등록과 수정이 서로 다른 객체를 받게 하는 방법, 곧 폼 전송 객체 분리다. 차례로 보자.</p>
+
+<h3>groups: 같은 객체에 상황별 규칙을 나눠 담기</h3>
+<p>그룹(group)은 제약에 붙이는 꼬리표다. 명세에서 그룹은 그냥 자바 인터페이스이고, 몸체가 비어 있어도 된다. 타입 이름을 꼬리표로 쓰기 위해 인터페이스를 빌리는 것이다. 제약마다 <code>groups</code> 속성으로 어느 그룹에 속하는지 적고, 검증할 때 그룹을 지정하면 그 그룹에 속한 제약만 검사된다.</p>
+<pre data-label="그룹을 나눈 Product"><code class="language-java">public interface SaveCheck {
+}
+
+public interface UpdateCheck {
+}
+
+public class Product {
+
+    @NotNull(groups = UpdateCheck.class)
+    private Long id;
+
+    @NotBlank(groups = {SaveCheck.class, UpdateCheck.class})
+    private String name;
+
+    @NotNull(groups = {SaveCheck.class, UpdateCheck.class})
+    @Range(min = 100, max = 5_000_000, groups = {SaveCheck.class, UpdateCheck.class})
+    private Integer price;
+
+    @NotNull(groups = {SaveCheck.class, UpdateCheck.class})
+    @Range(min = 1, max = 999, groups = SaveCheck.class)
+    @Range(min = 0, max = 999, groups = UpdateCheck.class)
+    private Integer quantity;
+
+    // ...
+}</code></pre>
+<p>수량에 <code>@Range</code>가 두 번 붙은 것에 주목하자. 자바는 기본적으로 같은 애노테이션을 한 위치에 두 번 붙이는 것을 허용하지 않지만, 애노테이션 타입이 <code>@Repeatable</code>로 선언되어 있으면 허용한다. Hibernate Validator의 <code>@Range</code>는 <code>@Repeatable(List.class)</code>로 선언되어 있어, 컴파일러가 두 개의 <code>@Range</code>를 컨테이너 애노테이션 <code>@Range.List</code> 하나로 묶어 클래스 파일에 기록한다. 그룹이 다른 같은 종류의 제약을 한 필드에 거는 것은 이 기능 덕분이다.</p>
+<p>컨트롤러에서는 <code>@Validated</code>의 값으로 그룹을 넘긴다.</p>
+<pre data-label="그룹을 지정한 컨트롤러"><code class="language-java">@PostMapping("/add")
+public String add(@Validated(SaveCheck.class) @ModelAttribute Product product,
+                  BindingResult bindingResult, RedirectAttributes redirectAttributes) {
+    // ...
+}
+
+@PostMapping("/{productId}/edit")
+public String edit(@PathVariable Long productId,
+                   @Validated(UpdateCheck.class) @ModelAttribute Product product,
+                   BindingResult bindingResult) {
+    // ...
+}</code></pre>
+<p>이 그룹 정보가 엔진까지 내려가는 길을 소스로 따라가 보자. 인자 해석기의 <code>validateIfApplicable</code>은 파라미터의 애노테이션을 하나씩 <code>ValidationAnnotationUtils.determineValidationHints</code>에 넣는다. 이 메서드는 애노테이션이 스프링의 <code>@Validated</code>면 그 <code>value()</code>, 즉 그룹 클래스 배열을 "검증 힌트"로 돌려준다. 애노테이션이 <code>jakarta.validation.Valid</code>면 빈 배열을 돌려준다. <code>@Valid</code>에는 그룹을 적을 속성이 아예 없다. 힌트는 <code>binder.validate(hints)</code>로 넘어가고, <code>DataBinder.validate</code>는 힌트가 비어 있지 않고 검증기가 <code>SmartValidator</code>면 <code>validate(target, errors, hints)</code>를, 아니면 힌트 없는 <code>validate(target, errors)</code>를 부른다. <code>SpringValidatorAdapter</code>는 힌트 중 <code>Class</code>인 것만 골라 그룹 배열로 만들고 Bean Validation의 <code>validator.validate(target, groups)</code>를 호출한다.</p>
+<pre class="diagram">@Validated(UpdateCheck.class)
+   │ determineValidationHints → [UpdateCheck.class]
+   ▼
+binder.validate([UpdateCheck.class])
+   │ SmartValidator 이므로 힌트를 넘긴다
+   ▼
+SpringValidatorAdapter.validate(product, bindingResult, UpdateCheck.class)
+   │ asValidationGroups → Class[]{UpdateCheck.class}
+   ▼
+jakarta.validation.Validator.validate(product, UpdateCheck.class)
+   │ UpdateCheck 그룹에 속한 제약만 검사
+   ▼
+Set<ConstraintViolation> → FieldError / ObjectError</pre>
+<p>그룹을 지정하지 않은 경우는 어떨까. 명세는 그룹을 적지 않은 제약이 <code>jakarta.validation.groups.Default</code> 그룹에 속한다고 정하고, <code>validate</code>에 그룹을 넘기지 않으면 <code>Default</code>를 검사한다고 정한다. <code>@Valid</code>와 값 없는 <code>@Validated</code>가 바로 이 경우다. 앞 절까지 그룹 없이 쓴 모든 제약은 <code>Default</code> 그룹이었다.</p>
+<h4>Default 그룹이 빠지는 함정</h4>
+<p>여기서 실무에서 자주 나는 실수가 생긴다. 그룹을 지정해 검증하면 그 그룹의 제약<b>만</b> 검사된다. <code>Default</code>는 자동으로 포함되지 않는다. 위 <code>Product</code>에 나중에 누군가 <code>@NotBlank private String category;</code>를 그룹 없이 추가했다고 하자. 이 제약은 <code>Default</code> 그룹이므로 <code>@Validated(SaveCheck.class)</code>로 검증하는 등록 화면에서는 검사되지 않는다. 컴파일 오류도 경고도 없고, 분류를 비운 상품이 저장된다.</p>
+<p>명세가 주는 해결책은 그룹 상속이다. 그룹 인터페이스가 다른 그룹 인터페이스를 상속하면, 상위 그룹의 제약도 하위 그룹의 일부로 취급된다(명세 5.4.1절). 따라서 <code>public interface SaveCheck extends Default {}</code>로 선언하면 <code>SaveCheck</code>로 검증할 때 그룹 없이 쓴 제약도 함께 검사된다. 그룹을 쓰기로 했다면 이렇게 선언해 두는 편이 안전하다.</p>
+<p>그룹은 검사 순서를 정하는 데도 쓰인다. <code>@GroupSequence({Cheap.class, Expensive.class})</code>처럼 그룹의 순서를 선언하면 앞 그룹에서 위반이 하나라도 나오면 뒤 그룹은 검사하지 않는다(명세 5.4.2절). 형식 검사를 먼저 하고, 비용이 큰 검사는 형식이 맞을 때만 하는 식이다. 클래스에 <code>@GroupSequence</code>를 붙이면 그 클래스의 <code>Default</code> 그룹을 이 순서로 재정의할 수도 있다고 Hibernate Validator 문서가 설명한다.</p>
+<p>그룹은 문제를 풀지만 비용이 크다. 필드마다 <code>groups</code> 속성이 붙어 선언이 길어지고, 어떤 상황에 어떤 규칙이 적용되는지 알려면 그룹 이름을 따라 클래스 전체를 읽어야 한다. 무엇보다 그룹은 "규칙이 상황마다 다르다"는 증상만 다룬다. 등록 요청과 수정 요청은 규칙만 다른 것이 아니라 <b>받는 데이터 자체가 다르다</b>. 등록에는 ID가 없고, 실무의 수정 화면은 등록 화면보다 필드가 적거나 많은 경우가 흔하다. 이 차이를 하나의 클래스로 덮는 한 그룹은 계속 늘어난다.</p>
+
+<h3>폼 전송 객체 분리: 요청마다 다른 객체를 받는다</h3>
+<p>두 번째 해결책은 웹 요청을 받는 객체를 도메인 객체와 분리하는 것이다. 등록 폼이 보내는 데이터를 받는 <code>ProductSaveForm</code>, 수정 폼이 보내는 데이터를 받는 <code>ProductUpdateForm</code>을 따로 만들고, 각자에 그 요청의 규칙만 선언한다. 그룹이 필요 없어진다.</p>
+<pre data-label="ProductSaveForm.java, ProductUpdateForm.java"><code class="language-java">public class ProductSaveForm {
+
+    @NotBlank
+    private String name;
+
+    @NotNull
+    @Range(min = 100, max = 5_000_000)
+    private Integer price;
+
+    @NotNull
+    @Range(min = 1, max = 999)
+    private Integer quantity;
+
+    // getter, setter ...
+}
+
+public class ProductUpdateForm {
+
+    @NotBlank
+    private String name;
+
+    @NotNull
+    @Range(min = 100, max = 5_000_000)
+    private Integer price;
+
+    @NotNull
+    @Range(min = 0, max = 999)
+    private Integer quantity;
+
+    // getter, setter ...
+}</code></pre>
+<p>수정 폼에 <code>id</code>가 없는 것은 의도한 것이다. 고칠 상품은 URL(<code>/products/{productId}/edit</code>)이 이미 가리키고 있다. 그룹을 쓸 때 "수정 시 ID 필수"라는 규칙이 필요했던 이유는 한 객체가 두 가지 요청을 다 받아야 했기 때문이고, 요청마다 객체가 생기면 그 규칙 자체가 사라진다. 컨트롤러는 폼 객체를 받아 검증한 뒤 도메인 객체로 옮긴다.</p>
+<pre data-label="ProductControllerV4.java"><code class="language-java">@Controller
+@RequestMapping("/v4/products")
+public class ProductControllerV4 {
+
+    private final ProductRepository productRepository;
+
+    public ProductControllerV4(ProductRepository productRepository) {
+        this.productRepository = productRepository;
+    }
+
+    @PostMapping("/add")
+    public String add(@Validated @ModelAttribute("product") ProductSaveForm form,
+                      BindingResult bindingResult, RedirectAttributes redirectAttributes) {
+        checkTotalPrice(form.getPrice(), form.getQuantity(), bindingResult);
+        if (bindingResult.hasErrors()) {
+            return "v4/products/addForm";
+        }
+        Product product = new Product(form.getName(), form.getPrice(), form.getQuantity());
+        Product saved = productRepository.save(product);
+        redirectAttributes.addAttribute("productId", saved.getId());
+        return "redirect:/v4/products/{productId}";
+    }
+
+    @PostMapping("/{productId}/edit")
+    public String edit(@PathVariable Long productId,
+                       @Validated @ModelAttribute("product") ProductUpdateForm form,
+                       BindingResult bindingResult) {
+        checkTotalPrice(form.getPrice(), form.getQuantity(), bindingResult);
+        if (bindingResult.hasErrors()) {
+            return "v4/products/editForm";
+        }
+        productRepository.update(productId, form.getName(), form.getPrice(), form.getQuantity());
+        return "redirect:/v4/products/{productId}";
+    }
+
+    private void checkTotalPrice(Integer price, Integer quantity, BindingResult bindingResult) {
+        if (price == null || quantity == null) {
+            return;
+        }
+        long total = (long) price * quantity;
+        if (total > 50_000_000L) {
+            bindingResult.reject("totalPriceMax", new Object[]{50_000_000L, total}, null);
+        }
+    }
+
+    // 목록, 상세, 등록 폼, 수정 폼 ...
+}</code></pre>
+<h4>@ModelAttribute("product")의 이름이 지키는 것</h4>
+<p><code>@ModelAttribute</code>에 이름을 주지 않으면 모델 속성 이름은 파라미터 타입의 단순 이름을 소문자로 시작하게 바꾼 <code>productSaveForm</code>이 된다. 이 이름은 두 군데에 영향을 준다. 하나는 템플릿이다. 02회에서 만든 폼 템플릿이 <code>th:object="${product}"</code>를 쓰고 있다면 모델에서 그 이름을 찾지 못한다. 다른 하나는 메시지 코드다. 메시지 코드의 가운데 토막은 객체 이름이므로, 이름이 바뀌면 <code>NotBlank.product.name</code> 대신 <code>NotBlank.productSaveForm.name</code>이 만들어지고 <code>errors.properties</code>에 적어 둔 구체적인 문구가 조용히 범용 문구로 바뀐다. 필드 이름 키 <code>product.price</code>도 <code>productSaveForm.price</code>로 찾게 된다. 이름을 명시하면 둘 다 그대로 유지된다.</p>
+<h4>분리가 지키는 더 중요한 것: 바인딩 범위</h4>
+<p>폼 객체 분리의 가장 중요한 이유는 검증 규칙이 아니라 보안에 있다. 데이터 바인딩은 신뢰할 수 없는 입력을 애플리케이션 객체에 대입하는 일이다. <code>WebDataBinder</code>는 요청 파라미터 이름과 같은 이름의 쓰기 가능한 속성이 있으면 값을 넣는다. 화면에 그 입력 칸이 있는지는 상관하지 않는다. 브라우저를 거치지 않는 요청은 04회에서 본 것처럼 어떤 파라미터든 보낼 수 있다.</p>
+<p>도메인 객체 <code>Product</code>를 직접 받는 V3 수정 컨트롤러를 생각해 보자. 상품에 관리자만 바꿀 수 있는 <code>discountRate</code> 같은 필드가 있고 세터가 열려 있다면, 수정 요청에 <code>discountRate=90</code>을 덧붙이는 것만으로 그 값이 객체에 들어간다. 저장소가 그 객체를 통째로 저장한다면 화면에 없는 필드가 바뀐다. 이런 공격을 대량 할당(mass assignment) 또는 과다 게시(over-posting)라고 부른다. 숨은 필드 <code>id</code>도 마찬가지다. 공격자가 <code>id</code>를 다른 상품 번호로 바꿔 보내고 저장소가 <code>product.getId()</code>로 갱신 대상을 찾는다면 남의 상품이 고쳐진다.</p>
+<p>스프링 문서의 데이터 바인딩 장은 이 위험을 직접 다룬다. JPA 엔티티 같은 도메인 객체는 예상 입력보다 속성이 많아서 대개 웹 바인딩에 안전하지 않다고 설명하고, 안전한 설계로 두 가지를 권한다. 생성자가 입력을 자연스럽게 제한하는 불변 객체, 그리고 예상 입력에 맞춰 설계한 전용 객체다. 전용 객체는 가변이어도 바인딩을 예상 입력으로 제한하므로 안전하다고 적는다. 도메인 객체를 꼭 바인딩해야 한다면 <code>@InitBinder</code>에서 <code>setAllowedFields</code>로 허용할 필드를 나열하라고 권하고, 금지 목록(<code>setDisallowedFields</code>)은 필드가 늘어날 때 빠뜨리기 쉬워 취약하다고 본다. 폼 전송 객체 분리는 이 권고의 "전용 객체"에 해당한다. <code>ProductSaveForm</code>에는 <code>discountRate</code>도 <code>id</code>도 없으므로, 그런 이름의 파라미터가 와도 대입할 곳이 없다. <code>DataBinder</code>는 기본적으로 대상에 없는 필드를 오류 없이 무시한다.</p>
+<x-visual id="spring-mvc2-05-form-object-separation" title="폼 전송 객체를 거쳐 도메인 객체로 가는 데이터 흐름" kind="구조도" ratio="16:9">
+<x-hint>요청 파라미터가 폼 객체에만 바인딩되고, 검증을 통과한 값만 컨트롤러 코드가 골라 도메인 객체로 옮기며, 폼에 없는 파라미터는 버려지는 모습을 보여 준다.</x-hint>
+<x-prompt>Left: a stack of request parameter tags labeled "name", "price", "quantity", and one red tag labeled "discountRate=90". Middle: a box labeled "ProductSaveForm" with three slots "name", "price", "quantity" and a small badge "@NotBlank @Range". Arrows from the three normal tags go into the matching slots; the red tag's arrow stops at the box edge and falls into a small bin labeled "대상 없음, 무시". Below the middle box a checkpoint gate labeled "Bean Validation". Right: a box labeled "Product (도메인)" with an arrow from the form box labeled "컨트롤러가 값을 옮긴다". Clean flat vector diagram, white background, blue and gray tones, red only for the rejected tag.</x-prompt>
+<x-caption>폼 객체는 받을 수 있는 입력의 목록이다. 목록에 없는 파라미터는 도메인 객체에 닿을 길이 없다.</x-caption>
+</x-visual>
+<p>대가는 코드량이다. 비슷한 클래스가 늘고, 폼에서 도메인으로, 수정 화면을 그릴 때는 도메인에서 폼으로 값을 옮기는 코드가 생긴다. 그래도 실무에서 분리를 택하는 이유는 각 클래스가 하나의 요청만 책임지기 때문이다. 등록 화면에 필드가 하나 추가되면 <code>ProductSaveForm</code>만 바뀌고, 그 변경이 수정 요청의 규칙이나 도메인 객체의 불변식에 번지지 않는다. 도메인 객체는 웹 화면의 사정에서 풀려나 생성자와 메서드로 자기 불변식을 지키는 데 집중할 수 있다. 변환 코드를 어디에 둘지(컨트롤러, 폼 객체의 메서드, 별도 변환기)는 팀의 선택이지만, 도메인 객체가 폼 객체를 알게 만드는 방향은 피한다. 의존이 웹 계층에서 도메인 쪽으로만 흐르게 하기 위해서다.</p>
+
+<h3>HTTP 메시지 컨버터와 Bean Validation: @RequestBody는 무엇이 다른가</h3>
+<p>Bean Validation은 HTML 폼만을 위한 것이 아니다. JSON 요청 본문을 받는 API에서도 같은 애노테이션, 같은 <code>@Validated</code>를 쓴다.</p>
+<pre data-label="ProductApiController.java"><code class="language-java">@RestController
+@RequestMapping("/api/products")
+public class ProductApiController {
+
+    @PostMapping
+    public Object add(@RequestBody @Validated ProductSaveForm form, BindingResult bindingResult) {
+        if (bindingResult.hasErrors()) {
+            return bindingResult.getAllErrors();
+        }
+        // 저장 ...
+        return form;
+    }
+}</code></pre>
+<p>세 가지 요청을 보내 보자.</p>
+<pre data-label="세 가지 요청"><code class="language-bash"># 1) 정상
+curl -i -X POST http://localhost:8080/api/products -H 'Content-Type: application/json' \
+     -d '{"name":"키보드","price":30000,"quantity":10}'
+
+# 2) 타입 오류: price에 숫자가 아닌 문자열
+curl -i -X POST http://localhost:8080/api/products -H 'Content-Type: application/json' \
+     -d '{"name":"키보드","price":"abc","quantity":10}'
+
+# 3) 검증 오류: 타입은 맞지만 규칙 위반
+curl -i -X POST http://localhost:8080/api/products -H 'Content-Type: application/json' \
+     -d '{"name":"키보드","price":10,"quantity":10}'</code></pre>
+<p>1번은 컨트롤러가 호출되고 폼 객체가 JSON으로 돌아간다. 3번도 컨트롤러가 호출되고 <code>bindingResult</code>에 <code>Range</code> 오류 하나가 들어 있다. 문제는 2번이다. 이 요청은 컨트롤러에 도달하지 않고 400으로 끝난다. <code>BindingResult</code> 파라미터가 있는데도 그렇다. 폼 요청에서 가격에 <code>abc</code>를 넣었을 때 컨트롤러가 호출되어 <code>typeMismatch</code>를 받던 것과 정반대다.</p>
+<p>차이는 객체가 만들어지는 방식에서 온다. <code>@RequestBody</code> 인자는 <code>RequestResponseBodyMethodProcessor</code>가 해석한다. 이 클래스의 <code>resolveArgument</code>는 먼저 <code>readWithMessageConverters</code>로 요청 본문 전체를 객체 하나로 읽는다. JSON이라면 Jackson이 본문을 파싱하면서 객체를 만든다. 그 <b>다음에야</b> 읽어 낸 객체를 대상으로 바인더를 만들고, <code>@Validated</code>가 있으면 검증하고, 오류가 있는데 바로 뒤에 <code>BindingResult</code>가 없으면 <code>MethodArgumentNotValidException</code>을 던진다. 2번에서 Jackson은 <code>"abc"</code>를 <code>Integer</code>로 바꾸지 못해 예외를 던지고, Spring Framework 6.1의 Jackson 컨버터(<code>AbstractJackson2HttpMessageConverter</code>)는 파싱 계열 예외를 <code>HttpMessageNotReadableException</code>으로 바꿔 던진다. 바인더도 <code>BindingResult</code>도 아직 만들어지기 전이므로 오류를 담을 그릇이 없다. 예외는 핸들러 밖으로 나가고, 스프링 MVC의 기본 예외 처리가 400 응답으로 바꾼다.</p>
+<figure class="flow-figure"><figcaption>같은 입력, 다른 결말</figcaption><ol class="flow">
+<li><strong>@ModelAttribute: 필드 단위</strong><span>객체를 먼저 만들고 파라미터를 필드마다 하나씩 대입한다. 한 필드의 변환 실패는 그 필드의 <code>typeMismatch</code> 오류가 될 뿐, 나머지 필드의 바인딩과 검증은 계속된다. 컨트롤러는 호출된다.</span></li>
+<li><strong>@RequestBody: 객체 단위</strong><span>메시지 컨버터가 본문 전체를 한 번에 객체로 만든다. 어느 한 필드라도 변환에 실패하면 객체 자체가 만들어지지 않고 <code>HttpMessageNotReadableException</code>으로 끝난다. 검증은 실행되지 않고 컨트롤러도 호출되지 않는다.</span></li>
+<li><strong>둘 다: 객체가 만들어진 뒤</strong><span><code>@Validated</code>가 있으면 같은 <code>SpringValidatorAdapter</code>가 같은 방식으로 위반을 <code>FieldError</code>로 바꾼다. 오류 코드, 메시지 코드, 인자 규칙도 같다.</span></li>
+</ol></figure>
+<x-visual id="spring-mvc2-05-modelattribute-vs-requestbody" title="@ModelAttribute와 @RequestBody의 타입 오류 처리 비교" kind="비교 다이어그램" ratio="16:9">
+<x-hint>두 레인을 나란히 두고, 같은 잘못된 가격 입력이 위 레인에서는 typeMismatch 오류가 되어 컨트롤러까지 가고, 아래 레인에서는 메시지 컨버터 단계에서 예외로 끝나는 모습을 대비한다.</x-hint>
+<x-prompt>Two horizontal lanes on a white background. Top lane labeled "@ModelAttribute": boxes "객체 생성" → "필드별 바인딩" → "검증" → "컨트롤러 호출"; inside "필드별 바인딩" a small orange tag "price: typeMismatch" drops into a tray labeled "BindingResult" that travels along to "컨트롤러 호출". Bottom lane labeled "@RequestBody": boxes "HttpMessageConverter (JSON 전체 읽기)" → "검증" → "컨트롤러 호출"; the first box has a red lightning icon and a red arrow going down out of the lane to a box labeled "HttpMessageNotReadableException → 400"; the remaining boxes "검증" and "컨트롤러 호출" are grayed out. Flat vector style, muted colors.</x-prompt>
+<x-caption>@ModelAttribute는 필드 하나의 실패를 오류 값으로 남기고, @RequestBody는 객체를 만들지 못하면 검증 단계에 들어가지 못한다.</x-caption>
+</x-visual>
+<p>3번 요청에서 객체 이름은 무엇일까. <code>@RequestBody</code>에는 이름을 지정할 속성이 없으므로 스프링이 파라미터 타입으로 이름을 정한다(<code>Conventions.getVariableNameForParameter</code>). 이 예에서는 <code>productSaveForm</code>이고, 메시지 코드는 <code>Range.productSaveForm.price</code>, <code>Range.price</code>, <code>Range.java.lang.Integer</code>, <code>Range</code>가 된다. 그리고 <code>bindingResult.getAllErrors()</code>를 그대로 반환하면 Jackson이 <code>FieldError</code> 객체의 게터들을 직렬화하므로 오류 코드 목록, 인자 배열, 기본 메시지 같은 스프링 내부 구조가 응답에 그대로 노출된다. 실제 API에서는 클라이언트와 합의한 오류 응답 형식을 따로 만들어 필요한 것만 담는다. 그 형식과 2번 같은 예외를 일관된 JSON으로 바꾸는 방법은 09회의 주제다.</p>
+<p>JSON 요청에서도 폼 객체 분리의 보안 논리는 그대로 성립한다. Jackson도 JSON의 속성 이름과 같은 이름의 속성이 있으면 값을 넣으므로, 도메인 객체를 <code>@RequestBody</code>로 직접 받으면 같은 대량 할당 위험이 생긴다. 요청 전용 객체를 두는 이유가 화면 폼보다 오히려 더 크다. API는 처음부터 브라우저가 아닌 클라이언트를 상대하기 때문이다.</p>
+<h4>Spring Framework 6.1의 메서드 검증</h4>
+<p>지금까지의 검증은 "인자 하나를 만든 뒤 그 인자를 검증"하는 방식이었다. Spring Framework 6.1부터는 컨트롤러 메서드 자체를 검증하는 내장 메서드 검증(method validation)도 지원한다. 스프링 문서에 따르면 <code>@Min</code>, <code>@NotBlank</code> 같은 제약 애노테이션이 메서드 파라미터에 직접 붙어 있을 때 메서드 검증이 적용되고, 이때는 인자별 검증을 대신해 <code>@Valid</code>가 붙은 객체 인자까지 함께 검증한다. 실패는 <code>MethodArgumentNotValidException</code>이 아니라 <code>HandlerMethodValidationException</code>으로 드러난다. <code>@Valid</code>는 제약 애노테이션이 아니므로 그것만으로는 메서드 검증을 일으키지 않는다. 예를 들어 <code>@RequestParam @Min(1) int page</code> 같은 파라미터가 하나라도 있으면 그 메서드의 검증 방식과 예외 타입이 바뀐다는 점만 기억해 두자. 이 내장 지원을 쓰려면 컨트롤러 클래스에 붙인 <code>@Validated</code>는 제거해야 한다고 문서가 안내한다. 클래스 수준 <code>@Validated</code>는 AOP 프록시로 메서드를 검증하는 별도의 방식이기 때문이다.</p>
+
+<h3>흔한 오해와 함정, 그리고 다른 회차와의 연결</h3>
+<ul>
+<li><b>"애노테이션을 붙였으니 검증된다."</b> 애노테이션은 데이터일 뿐이다. 파라미터에 <code>@Validated</code>나 <code>@Valid</code>가 없으면 아무도 읽지 않는다. 검증 스타터가 없으면 구현체가 없어 자동 구성 자체가 동작하지 않는다.</li>
+<li><b>"@Range만 있으면 빈 값도 걸러진다."</b> 대부분의 표준 제약은 <code>null</code>을 유효로 본다. 존재 검사는 <code>@NotNull</code>, <code>@NotBlank</code>, <code>@NotEmpty</code>의 몫이다. 빈 문자열은 숫자 필드에서 <code>null</code>이 된다.</li>
+<li><b>"타입 오류가 나면 @NotNull 오류도 함께 나온다."</b> 엔진은 위반을 만들지만 스프링이 바인딩에 실패한 필드의 위반을 버린다. 남는 것은 <code>typeMismatch</code> 하나다.</li>
+<li><b>"<code>{1}</code>은 최솟값이다."</b> 인자는 속성 이름의 알파벳순이다. <code>@Range</code>에서 <code>{1}</code>은 <code>max</code>, <code>{2}</code>는 <code>min</code>이다.</li>
+<li><b>"그룹을 지정해도 그룹 없는 제약은 검사된다."</b> 지정한 그룹만 검사된다. 그룹 없는 제약까지 포함하려면 그룹 인터페이스가 <code>Default</code>를 상속하게 한다.</li>
+<li><b>"@InitBinder에 검증기를 등록해도 Bean Validation은 그대로다."</b> <code>addValidators</code>면 그렇지만 <code>setValidator</code>는 기존 검증기를 지운다. <code>WebMvcConfigurer.getValidator()</code>는 애플리케이션 전체의 애노테이션 검증을 대체한다.</li>
+<li><b>"@RequestBody 뒤에 BindingResult를 두면 모든 오류를 받는다."</b> 객체가 만들어진 뒤의 검증 오류만 받는다. JSON 파싱이나 타입 변환 실패는 <code>HttpMessageNotReadableException</code>으로 컨트롤러 밖에서 끝난다.</li>
+<li><b>"@ScriptAssert로 객체 검증을 하면 된다."</b> Java 15 이후 JDK에는 자바스크립트 엔진이 없다. 엔진이 없으면 위반이 아니라 예외가 난다. 객체 검증은 자바 코드나 직접 만든 클래스 수준 제약으로 한다.</li>
+</ul>
+<p>이 회차까지 오면 검증의 구조는 하나로 정리된다. 바인딩이 만든 오류든, 직접 만든 검증기가 만든 오류든, Bean Validation이 만든 오류든 모두 같은 <code>BindingResult</code>에 같은 모양의 <code>FieldError</code>/<code>ObjectError</code>로 쌓이고, 같은 메시지 코드 체계로 풀린다. Bean Validation은 그 오류를 만들어 내는 공급자가 하나 더 생긴 것이다. 06회와 07회는 로그인 상태를 쿠키와 세션, 필터와 인터셉터로 다루는데, 로그인 폼 역시 이 회차의 폼 객체와 검증을 그대로 쓴다. <code>BindingResult</code> 없이 던져지는 <code>MethodArgumentNotValidException</code>, 2번 요청의 <code>HttpMessageNotReadableException</code>, 메서드 검증의 <code>HandlerMethodValidationException</code>이 어떤 경로로 오류 화면이나 JSON 응답이 되는지는 08회와 09회에서 예외 처리 흐름으로 이어진다. 빈 문자열을 <code>null</code>로 만든 변환기와 <code>"abc"</code>에서 실패한 변환 단계 자체는 10회의 타입 컨버터에서 다룬다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>Bean Validation(Jakarta Validation)</dt><dd>검증 규칙을 애노테이션으로 선언하고 범용 엔진이 실행하게 하는 자바 표준 명세다. Jakarta EE 9에 해당하는 3.0부터 패키지가 <code>jakarta.validation</code>이며, 대표 구현은 Hibernate Validator다.</dd>
+<dt>애노테이션의 수명</dt><dd>검증 애노테이션은 <code>RUNTIME</code> 수명이라 클래스 파일의 <code>RuntimeVisibleAnnotations</code> 속성에 기록되고, 엔진은 리플렉션으로 이를 읽어 필드는 직접, 게터는 호출해서 값을 검사한다.</dd>
+<dt>null 처리 관례</dt><dd><code>@Max</code>, <code>@Min</code>, <code>@Range</code> 같은 내용 검사 제약은 <code>null</code>을 유효로 보며, 존재 검사는 <code>@NotNull</code>, <code>@NotBlank</code>, <code>@NotEmpty</code>가 맡는다.</dd>
+<dt>스프링 통합 경로</dt><dd>부트가 만든 <code>LocalValidatorFactoryBean</code>이 MVC 전역 검증기가 되어 모든 <code>WebDataBinder</code>에 들어가고, <code>@Validated</code>/<code>@Valid</code>가 붙은 인자만 바인딩 뒤에 검증된다. <code>SpringValidatorAdapter</code>가 위반을 <code>FieldError</code>/<code>ObjectError</code>로 바꾼다.</dd>
+<dt>바인딩 실패 필드 제외</dt><dd>타입 변환에 실패한 필드에 대한 Bean Validation 위반은 버려지므로, 그 필드에는 <code>typeMismatch</code> 오류만 남는다.</dd>
+<dt>오류 코드와 인자</dt><dd>오류 코드는 애노테이션의 단순 이름이고, 메시지 인자는 <code>{0}</code>=필드(다시 메시지로 해석됨), 그 뒤로 애노테이션 속성을 이름의 알파벳순으로 둔다. 메시지는 <code>errors.properties</code>의 코드 목록이 먼저, Bean Validation이 보간한 문장이 기본값이다.</dd>
+<dt>검증 그룹</dt><dd>제약에 인터페이스로 꼬리표를 붙이고 <code>@Validated(그룹.class)</code>로 그 그룹만 검사한다. 지정한 그룹에 <code>Default</code>는 자동으로 포함되지 않으며, <code>@Valid</code>는 그룹을 지정할 수 없다.</dd>
+<dt>폼 전송 객체 분리</dt><dd>요청마다 전용 객체를 받아 검증한 뒤 도메인으로 옮긴다. 규칙 충돌을 없애고, 화면에 없는 필드가 바인딩되는 대량 할당을 구조적으로 막는다.</dd>
+<dt>@RequestBody 검증</dt><dd>메시지 컨버터가 객체 전체를 먼저 만들므로, 타입 오류는 검증 전에 <code>HttpMessageNotReadableException</code>으로 끝나고 검증 오류만 <code>BindingResult</code>로 받을 수 있다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 검증 관련 장애는 대개 "규칙을 잘못 썼다"보다 "규칙이 실행되지 않았다"에서 나온다. <code>@Validated</code>를 빠뜨린 파라미터, 그룹을 지정하면서 <code>Default</code>를 상속하지 않은 그룹 인터페이스, <code>@InitBinder</code>의 <code>setValidator</code> 한 줄, 공용 설정의 <code>getValidator()</code> 재정의가 모두 오류 없이 검증을 꺼 버린다. 그래서 검증을 추가할 때는 성공 경로가 아니라 실패 경로를 테스트로 확인해야 한다. 빈 값, 범위 밖 값, 숫자 자리에 문자를 넣은 요청을 실제로 보내 보고 응답에 기대한 오류 코드가 있는지 보는 테스트 몇 개가 이 회차에서 본 함정을 대부분 잡는다.</p>
+<p>그룹과 폼 객체 분리 중 무엇을 고를지는 요청의 모양이 얼마나 다른지로 판단한다. 같은 데이터에 규칙만 미세하게 다르다면 그룹으로 버틸 수 있지만, 받는 필드가 다르거나 앞으로 달라질 가능성이 보이면 분리하는 편이 장기적으로 싸다. 특히 엔티티를 그대로 <code>@ModelAttribute</code>나 <code>@RequestBody</code>로 받는 코드는 기능이 아니라 보안의 관점에서 다시 봐야 한다. 엔티티에 필드가 추가되는 순간 그 필드는 모든 바인딩 지점에서 외부 입력에 열린다. 코드 리뷰에서 "이 객체에 바인딩될 수 있는 필드가 무엇인가"를 묻는 습관이 대량 할당을 막는다.</p>
+<p>API를 설계할 때는 오류의 종류를 클라이언트가 구분할 수 있게 해야 한다. 같은 400이라도 JSON 파싱 실패(<code>HttpMessageNotReadableException</code>), 객체 검증 실패(<code>MethodArgumentNotValidException</code>), 메서드 파라미터 검증 실패(<code>HandlerMethodValidationException</code>)는 서로 다른 단계에서 다른 예외로 나온다. 이 셋을 한 형식의 응답으로 모으되 어떤 필드가 왜 실패했는지를 담는 일이 09회의 과제이고, 그 재료가 이 회차에서 본 <code>FieldError</code>의 코드와 인자다. 반대로 <code>@ScriptAssert</code>처럼 실행 환경(JDK 버전, 스크립트 엔진)에 따라 위반 대신 예외를 내는 장치는 장애의 원인을 검증이 아닌 곳으로 보이게 만들므로, 객체 검증은 컴파일되는 코드로 두는 편이 운영에서 덜 놀랍다.</p>
+</x-review>
+
+<x-practice>
+<li>가격 필드에 <code>@NotNull</code> 없이 <code>@Range(min = 100, max = 5_000_000)</code>만 붙어 있다. <code>@Validated @ModelAttribute Product product, BindingResult bindingResult</code>로 받는 컨트롤러에 <code>price=</code>(빈 값)와 <code>price=abc</code>를 각각 보냈을 때 <code>BindingResult</code>에 남는 오류와 저장 여부를 예측하고 이유를 설명하라.</li>
+<li><code>errors.properties</code>에 <code>Range={0}: {1} ~ {2}</code>와 <code>product.price=가격</code>이 있다. 가격 10을 보냈을 때 화면에 표시될 문장을 쓰고, 의도대로 "최솟값 ~ 최댓값" 순서로 고쳐라.</li>
+<li><code>public interface SaveCheck {}</code>로 그룹을 정의하고 등록 메서드에 <code>@Validated(SaveCheck.class)</code>를 쓰는 코드에, 누군가 <code>@NotBlank private String category;</code>를 그룹 없이 추가했다. 분류를 비운 등록 요청의 결과를 예측하고, 그룹 인터페이스 선언 한 줄만 고쳐 해결하라.</li>
+<li>같은 값 <code>name=</code>(빈 값), <code>price=abc</code>, <code>quantity=1</code>을 (가) <code>@ModelAttribute</code> 폼 요청으로, (나) <code>{"name":"","price":"abc","quantity":1}</code> JSON 본문으로 <code>@RequestBody</code>에 보냈다. 두 메서드 모두 바로 뒤에 <code>BindingResult</code>가 있다. 각각 컨트롤러가 호출되는지, 호출된다면 어떤 오류가 들어 있는지 단계별로 설명하라.</li>
+<li>공용 설정 클래스에 <code>WebMvcConfigurer</code>를 구현하고 <code>getValidator()</code>에서 04회의 <code>ProductValidator</code>를 돌려주도록 바꿨더니, 회원 가입 폼의 <code>@NotBlank</code>가 동작하지 않는다는 보고가 들어왔다. 스프링 부트의 <code>mvcValidator()</code> 동작으로 원인을 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 빈 값은 스프링의 문자열-숫자 변환기가 <code>null</code>로 바꾸므로 바인딩은 성공하고 가격은 <code>null</code>이다. <code>@Range</code>는 <code>@Min</code>, <code>@Max</code>로 구성되어 <code>null</code>을 유효로 보므로 위반이 없다. 오류가 없으니 <code>hasErrors()</code>는 거짓이고 가격 없는 상품이 저장된다(저장소나 DB 제약이 막지 않는 한). <code>abc</code>는 변환에 실패해 <code>typeMismatch</code> 오류가 남고 폼으로 돌아간다. 빈 값을 막으려면 <code>@NotNull</code>을 함께 붙여야 한다.</p>
+<p><b>2.</b> 인자는 <code>{0}</code>=필드, 그다음 속성 이름의 알파벳순이다. <code>max</code>가 <code>min</code>보다 앞이므로 <code>{1}</code>=5000000, <code>{2}</code>=100이다. <code>{0}</code>은 <code>product.price</code> 키로 풀려 "가격"이 되고, <code>MessageFormat</code>이 숫자를 로캘 형식으로 찍어 "가격: 5,000,000 ~ 100"이 표시된다. <code>Range={0}: {2} ~ {1}</code>로 바꾸면 "가격: 100 ~ 5,000,000"이 된다.</p>
+<p><b>3.</b> 그룹 없는 <code>@NotBlank</code>는 <code>Default</code> 그룹에 속하고, <code>SaveCheck</code>로 검증하면 <code>SaveCheck</code>에 속한 제약만 검사되므로 분류가 비어도 오류가 없고 저장된다. <code>public interface SaveCheck extends Default {}</code>로 바꾸면 그룹 상속 규칙에 따라 <code>Default</code>의 제약이 <code>SaveCheck</code>의 일부가 되어 함께 검사된다.</p>
+<p><b>4.</b> (가) 객체를 만든 뒤 파라미터를 필드별로 대입한다. <code>name</code>에는 빈 문자열이, <code>quantity</code>에는 1이 들어가고, <code>price</code>는 변환에 실패해 <code>typeMismatch</code>가 등록된다. 이어 검증이 실행되어 <code>name</code>의 <code>NotBlank</code> 위반은 <code>FieldError</code>가 되고, <code>price</code>의 <code>NotNull</code> 위반은 바인딩 실패 필드라 버려진다. 컨트롤러는 호출되고 오류는 <code>typeMismatch</code>(price)와 <code>NotBlank</code>(name) 두 개다. (나) 메시지 컨버터가 본문 전체를 객체로 만들다가 <code>"abc"</code>에서 실패해 <code>HttpMessageNotReadableException</code>이 난다. 바인더가 만들어지기 전이므로 <code>BindingResult</code>는 쓰이지 않고, 검증도 실행되지 않으며, 컨트롤러는 호출되지 않은 채 400이 된다. 이름이 비었다는 사실은 이 응답에서 알 수 없다.</p>
+<p><b>5.</b> 스프링 부트의 <code>mvcValidator()</code>는 <code>WebMvcConfigurer.getValidator()</code>가 돌려준 검증기가 있으면 그것을 전역 검증기로 쓰고, 없을 때만 컨텍스트의 Bean Validation 검증기를 찾는다. 이제 모든 바인더의 전역 검증기가 <code>ProductValidator</code>가 되었고, <code>ConfigurableWebBindingInitializer</code>는 <code>supports</code>가 참인 바인더에만 검증기를 넣으므로 회원 가입 폼의 바인더에는 검증기가 아예 없다. 애노테이션을 읽을 엔진이 없으니 <code>@NotBlank</code>도 실행되지 않는다. <code>ProductValidator</code>는 <code>@InitBinder("product")</code>에서 <code>addValidators</code>로 해당 바인더에만 추가해야 한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>가격 필드에 <code>@NotNull @Range(min = 100, max = 5_000_000)</code>이 있고, 폼에서 <code>price=abc</code>가 왔다. 다른 필드는 모두 정상이다. 컨트롤러가 받은 <code>BindingResult</code>의 가격 필드 오류는?</q>
+<o><code>typeMismatch</code>와 <code>NotNull</code> 두 개</o>
+<o><code>typeMismatch</code> 하나</o>
+<o><code>NotNull</code> 하나</o>
+<o>오류 없이 컨트롤러가 호출되지 않고 400이 된다</o>
+<why>바인딩 단계에서 변환에 실패해 <code>typeMismatch</code>가 바인딩 실패로 등록된다. Bean Validation 엔진은 <code>null</code>인 가격에 대해 <code>NotNull</code> 위반을 만들지만, <code>SpringValidatorAdapter</code>가 바인딩에 실패한 필드의 위반을 버리므로 남지 않는다. <code>BindingResult</code>가 바로 뒤에 있으므로 컨트롤러는 호출된다. <code>@Range</code>는 <code>null</code>을 유효로 보므로 처음부터 위반이 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>@Range(min = 100, max = 5_000_000)</code> 위반으로 만들어진 <code>FieldError</code>의 메시지 인자에서 <code>{1}</code>에 해당하는 값은?</q>
+<o>필드 이름 <code>price</code></o>
+<o>최솟값 100</o>
+<o>최댓값 5000000</o>
+<o>거절된 값</o>
+<why>스프링은 <code>{0}</code>에 필드 이름을 담은 resolvable을 두고, 이어서 <code>message</code>, <code>groups</code>, <code>payload</code>를 뺀 애노테이션 속성을 <code>TreeMap</code>으로 이름순 정렬해 붙인다. <code>max</code>가 <code>min</code>보다 알파벳순으로 앞이므로 <code>{1}</code>은 최댓값이다. 거절된 값은 메시지 인자에 들어가지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>@Validated(UpdateCheck.class)</code>로 검증하는데, <code>UpdateCheck</code>는 아무것도 상속하지 않는 빈 인터페이스다. 그룹을 지정하지 않은 <code>@NotBlank</code> 제약은 어떻게 되는가?</q>
+<o>검사되지 않는다</o>
+<o>항상 검사된다. 그룹이 없으면 모든 그룹에 속한다</o>
+<o>UpdateCheck 검사가 통과한 뒤에 이어서 검사된다</o>
+<o>그룹이 없는 제약과 그룹을 섞으면 시작할 때 예외가 난다</o>
+<why>그룹을 적지 않은 제약은 <code>Default</code> 그룹에 속한다. 그룹을 지정해 검증하면 그 그룹(과 그 그룹이 상속하는 그룹)의 제약만 검사된다. <code>UpdateCheck</code>가 <code>Default</code>를 상속하지 않으므로 이 제약은 빠진다. 앞 그룹이 통과한 뒤 다음 그룹을 검사하는 것은 <code>@GroupSequence</code>를 선언했을 때의 동작이다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>@RequestBody @Validated ProductSaveForm form, BindingResult bindingResult</code>인 메서드에 <code>{"price":"abc"}</code>가 담긴 JSON이 왔다. 무슨 일이 일어나는가?</q>
+<o>컨트롤러가 호출되고 <code>bindingResult</code>에 <code>typeMismatch</code>가 들어 있다</o>
+<o>컨트롤러가 호출되고 <code>bindingResult</code>에 <code>NotNull</code>이 들어 있다</o>
+<o>검증이 실행된 뒤 <code>MethodArgumentNotValidException</code>이 난다</o>
+<o>메시지 컨버터가 객체를 만들지 못해 <code>HttpMessageNotReadableException</code>이 나고 컨트롤러는 호출되지 않는다</o>
+<why><code>RequestResponseBodyMethodProcessor</code>는 본문을 먼저 메시지 컨버터로 읽어 객체를 만들고, 그 다음에 바인더를 만들어 검증한다. Jackson이 <code>"abc"</code>를 <code>Integer</code>로 바꾸지 못하면 컨버터가 <code>HttpMessageNotReadableException</code>을 던지므로 바인더와 <code>BindingResult</code>가 만들어지기 전에 처리가 끝난다. <code>MethodArgumentNotValidException</code>은 객체가 만들어진 뒤 검증 오류가 있고 <code>BindingResult</code> 파라미터가 없을 때의 예외다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>errors.properties</code>에 <code>NotBlank</code> 관련 키가 하나도 없고, 필드에는 <code>@NotBlank(message = "이름은 필수입니다")</code>가 붙어 있다. 이름을 비워 제출하면 화면에 무엇이 나오는가?</q>
+<o>메시지를 찾지 못해 렌더링 중 <code>NoSuchMessageException</code>이 난다</o>
+<o>이름은 필수입니다</o>
+<o>공백일 수 없습니다</o>
+<o>오류 코드 <code>NotBlank</code>가 그대로 나온다</o>
+<why>스프링은 먼저 메시지 코드 목록을 <code>MessageSource</code>에서 찾고, 하나도 없으면 오류의 기본 메시지를 쓴다. Bean Validation에서 온 오류의 기본 메시지는 위반의 <code>getMessage()</code>, 곧 애노테이션의 <code>message</code> 속성을 보간한 결과이므로 "이름은 필수입니다"가 나온다. 구현체 기본 문구("공백일 수 없습니다")는 <code>message</code> 속성을 지정하지 않았을 때의 기본값이다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>Jakarta Validation (Bean Validation)</dt><dd>검증 규칙을 애노테이션으로 선언하고 검사하는 방법을 정한 자바 표준 명세. 애노테이션, <code>Validator</code> 등의 API와 동작 규칙을 정하며, 실행은 구현체가 한다.</dd>
+<dt>Hibernate Validator</dt><dd>Jakarta Validation의 참조 구현. 표준 제약의 검사 코드와 언어별 기본 메시지, <code>@Range</code> 같은 추가 제약을 제공한다. Hibernate ORM과는 별개의 라이브러리다.</dd>
+<dt>제약 위반(ConstraintViolation)</dt><dd>검증 엔진이 돌려주는 위반 하나. 속성 경로, 잘못된 값, 어긴 제약의 디스크립터, 보간된 메시지를 담는다.</dd>
+<dt>제약 검사기(ConstraintValidator)</dt><dd>제약 애노테이션 하나의 실제 검사 로직을 구현하는 인터페이스. <code>@Constraint(validatedBy = ...)</code>로 애노테이션과 연결된다.</dd>
+<dt>메시지 보간(message interpolation)</dt><dd>제약의 메시지 템플릿에서 <code>{...}</code> 자리를 메시지 번들이나 애노테이션 속성 값으로, <code>${...}</code> 자리를 EL 식의 결과로 바꿔 최종 문장을 만드는 과정.</dd>
+<dt>검증 그룹(validation group)</dt><dd>제약에 붙이는 꼬리표 역할의 인터페이스. 검증 시 지정한 그룹의 제약만 검사하며, 그룹을 적지 않은 제약은 <code>Default</code> 그룹에 속한다.</dd>
+<dt>SpringValidatorAdapter</dt><dd>Bean Validation 검증기를 스프링의 <code>Validator</code>/<code>SmartValidator</code>로 감싸, 위반을 <code>FieldError</code>와 <code>ObjectError</code>로 옮기는 스프링 클래스. <code>LocalValidatorFactoryBean</code>의 상위 클래스다.</dd>
+<dt>대량 할당(mass assignment, over-posting)</dt><dd>화면에 없는 필드의 값을 요청에 끼워 넣어, 바인딩이 그 값을 객체에 대입하게 만드는 공격. 요청 전용 객체나 허용 필드 목록으로 막는다.</dd>
+<dt>메서드 검증(method validation)</dt><dd>객체 하나가 아니라 메서드의 파라미터와 반환값에 붙은 제약을 검사하는 방식. Spring Framework 6.1부터 컨트롤러 메서드에 내장 지원되며 실패 시 <code>HandlerMethodValidationException</code>이 난다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://jakarta.ee/specifications/bean-validation/3.0/jakarta-bean-validation-spec-3.0.html">Jakarta Bean Validation 3.0 Specification</a> — 기본 그룹, 그룹 상속(5.4.1), 그룹 시퀀스(5.4.2), 필드·속성 접근(5.1.2)</li>
+<li><a href="https://jakarta.ee/specifications/bean-validation/3.0/apidocs/jakarta/validation/constraints/Max.html">Jakarta Validation 3.0 API: @Max</a> — 지원 타입과 null을 유효로 보는 규칙</li>
+<li><a href="https://docs.hibernate.org/validator/8.0/reference/en-US/html_single/">Hibernate Validator 8.0 Reference Guide</a> — 메시지 보간 순서, EL 요구 사항, @Range와 @ScriptAssert, 그룹과 제약 조합</li>
+<li><a href="https://raw.githubusercontent.com/spring-projects/spring-framework/6.1.x/spring-context/src/main/java/org/springframework/validation/beanvalidation/SpringValidatorAdapter.java">Spring Framework 6.1 SpringValidatorAdapter 소스</a> — 바인딩 실패 필드 제외, 오류 코드와 인자 결정</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-controller/ann-validation.html">Spring MVC Reference: Validation</a> — 인자별 검증과 메서드 검증, 두 예외의 차이</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-data-binding.html">Spring MVC Reference: Data Binding</a> — 안전한 모델 설계, 전용 객체와 allowedFields</li>
+</x-refs>

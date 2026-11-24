@@ -1,0 +1,878 @@
+<x-meta>
+deck: 부모의 기본 키를 자식의 기본 키 안에 넣는 식별 관계와 일반 외래 키로만 두는 비식별 관계를 일대다·일대일·다대다에서 비교하고, InnoDB 저장 구조까지 내려가 성능과 변경 비용을 따진 뒤 실전 논리 ERD를 완성한다.
+minutes: 120
+</x-meta>
+
+<x-goals>
+<li>두 테이블의 DDL을 보고 관계가 식별 관계인지 비식별 관계인지, 비식별이라면 필수인지 선택인지 판정하고 ERD에 실선과 점선으로 표기할 수 있다.</li>
+<li>식별 관계가 여러 단계 이어질 때 기본 키가 어떻게 자라는지 추적하고, 부모 키 변경과 요구 사항 변경이 자손 테이블에 남기는 비용을 행 단위로 계산할 수 있다.</li>
+<li>같은 조회를 두 설계에서 SQL로 써 보고, InnoDB의 클러스터형 인덱스와 보조 인덱스 구조로부터 조인 수, 읽는 페이지, 삽입 위치, 인덱스 크기의 차이를 설명할 수 있다.</li>
+<li>일대일과 다대다 관계를 식별 관계(공유 기본 키, 복합 기본 키)와 비식별 관계(외래 키와 UNIQUE, 대리 키와 UNIQUE)로 각각 DDL로 쓰고, 요구 사항이 바뀔 때 어느 쪽이 버티는지 판단할 수 있다.</li>
+<li>요구 사항에서 출발해 모든 관계에 대해 식별 여부, NULL 허용, UNIQUE를 결정한 논리 ERD와 DDL을 완성하고, 각 업무 규칙이 어느 제약에 새겨졌는지 대응시킬 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 부모의 키를 자식의 이름 안에 넣을 것인가</h3>
+
+<p>03회에서 행을 가리키는 값인 키를 정했고, 04회와 05회에서 카디널리티와 참여도에 따라 외래 키를 어느 테이블에 둘지, 다대다 관계를 연결 테이블로 어떻게 풀지를 정했다. 관계를 테이블로 옮기는 규칙은 거의 다 갖춰졌다. 그런데 관계 하나를 옮길 때마다 아직 답하지 않은 질문이 하나 남는다. 자식 테이블로 내려온 부모의 기본 키를 <b>자식의 기본 키 안에 넣을 것인가, 아니면 기본 키 밖의 일반 열로만 둘 것인가</b>. 이 회차는 이 질문 하나를 일대다, 일대일, 다대다 각각에서 끝까지 따라간다.</p>
+
+<p>주문과 주문 항목으로 질문을 구체화해 보자. 주문 항목 테이블에는 그 항목이 어느 주문에 속하는지를 나타내는 <code>order_id</code>가 반드시 있어야 한다. 이 열을 다루는 길은 둘이다. 첫째는 <code>order_id</code>에 "주문 안에서의 순번"인 <code>line_no</code>를 붙여 <code>(order_id, line_no)</code>를 기본 키로 삼는 길이다. 이렇게 하면 주문 항목은 "100번 주문의 2번째 줄"처럼 부모를 거쳐서만 이름이 붙는다. 둘째는 주문 항목에 자기만의 번호 <code>order_item_id</code>를 주고, <code>order_id</code>는 기본 키 밖의 외래 키 열로 두는 길이다. 이때 주문 항목은 "주문 항목 1052번"이라는 독립된 이름을 갖고, 어느 주문에 속하는지는 여러 속성 가운데 하나가 된다. 앞의 방식을 <b>식별 관계(identifying relationship)</b>, 뒤의 방식을 <b>비식별 관계(non-identifying relationship)</b>라고 부른다.</p>
+
+<p>두 설계는 같은 사실을 담고, 같은 질문에 답할 수 있다. 그래서 처음 테이블을 만들 때는 차이가 잘 보이지 않는다. 차이는 시간이 지나면서 드러난다. 식별 관계가 여러 단계 이어지면 기본 키가 아래로 내려갈수록 길어진다. 부모의 키가 바뀌거나 자식이 다른 부모로 옮겨 가야 하는 요구가 생기면 자손 전체의 기본 키를 고쳐야 한다. 그리고 저장 엔진이 행을 디스크에 놓는 순서가 기본 키로 정해지기 때문에, 같은 조회라도 읽는 페이지 수와 삽입이 일어나는 위치가 달라진다. 반대로 식별 관계만이 주는 이점도 있다. 조상의 키로 손자 테이블을 조인 없이 바로 조회할 수 있고, 같은 부모의 자식들이 디스크에서 한곳에 모인다.</p>
+
+<p>이 회차의 흐름은 이렇다. 먼저 식별 관계와 비식별 관계를 정확히 정의하고, 필수·선택이라는 다른 축과 섞지 않도록 구분한다. 다음으로 일대다 관계에서 두 설계를 DDL로 나란히 세우고, 식별 관계가 깊어질 때 생기는 문제를 행 단위로 추적한다. 이어서 같은 조회를 두 설계의 SQL로 쓰고, MySQL InnoDB가 두 설계를 어떻게 저장하는지 내려가서 성능 차이가 어디서 오는지 본다. 그다음 일대일과 다대다 관계에서 같은 비교를 반복하고, 오늘날 설계가 비식별 관계와 대리 키를 기본값으로 삼는 이유와 그 기본값에서 벗어나야 할 때를 정리한다. 마지막 두 단락은 실습이다. 요구 사항에서 출발해 모든 관계를 결정하고 논리 ERD와 DDL을 완성한다.</p>
+
+<p>설명의 기준은 MySQL 8.0 이상과 InnoDB 저장 엔진이다. 식별 관계와 비식별 관계라는 구분 자체는 논리 모델의 개념이라 제품에 묶이지 않지만, 외래 키에 인덱스가 자동으로 생기는지, 기본 키가 행의 물리적 순서를 정하는지는 제품마다 다르다. 그런 문장에는 "InnoDB에서는"이라는 범위를 붙인다. 정규화는 07회, 자료형과 인덱스의 물리 설계는 08회와 09회의 몫이므로 여기서는 필요한 만큼만 끌어온다.</p>
+
+<h3>식별 관계와 비식별 관계: 부모의 키가 어디에 자리 잡는가</h3>
+
+<p>관계를 테이블로 옮기면 부모의 기본 키가 자식 테이블로 복사되어 외래 키가 된다. 04회에서 본 대로 일대다라면 "다" 쪽에 외래 키가 놓인다. 여기까지는 두 관계가 똑같다. 갈림길은 그다음이다. 복사되어 내려온 외래 키 열이 자식의 기본 키를 이루는 열 가운데 하나가 되면 식별 관계이고, 기본 키에 들어가지 않고 일반 열로 남으면 비식별 관계다. MySQL Workbench 매뉴얼은 식별 관계를 "부모 없이는 자식 테이블의 행을 유일하게 식별할 수 없는 관계"라고 정의한다. 자식의 이름표 안에 부모의 이름표가 들어 있다는 뜻이다.</p>
+
+<p>이 정의에는 두 가지 서로 다른 의존이 겹쳐 있다. 하나는 <b>존재 의존(existence dependency)</b>으로, 부모 없이 자식이 존재할 수 있느냐는 질문이다. 다른 하나는 <b>식별 의존(identification dependency)</b>으로, 자식을 가리키는 이름에 부모가 들어가느냐는 질문이다. 식별 관계는 두 질문 모두에 "예"다. 기본 키를 이루는 열은 NULL을 가질 수 없으므로(MySQL은 기본 키 열을 명시하지 않아도 <code>NOT NULL</code>로 만든다), 부모 키가 기본 키에 들어가면 자식은 반드시 부모를 가져야 한다. 비식별 관계는 식별 의존이 없다. 존재 의존은 외래 키 열의 NULL 허용 여부로 따로 정한다. 외래 키 열이 <code>NOT NULL</code>이면 필수 비식별 관계, NULL을 허용하면 선택 비식별 관계다.</p>
+
+<p>이 구분은 04회의 참여도와 직접 이어진다. 참여도는 "자식 쪽에서 부모가 반드시 있어야 하는가"를 묻고, 그 답은 외래 키의 NULL 허용으로 표현된다. 식별 관계냐 아니냐는 그와 별개로 "부모 키를 자식의 기본 키에 넣느냐"를 묻는다. 그래서 세 가지 조합이 생긴다. 식별 관계는 항상 필수다. 비식별 관계는 필수일 수도 선택일 수도 있다. "식별은 필수, 비식별은 선택"이라고 외우면 틀린다. 실제 설계에서 가장 흔한 형태는 필수 비식별 관계, 곧 기본 키는 따로 있고 외래 키는 <code>NOT NULL</code>인 관계다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>형태</th><th>부모 키의 위치</th><th>외래 키의 NULL</th><th>부모 없는 자식</th><th>자식을 다른 부모로 옮기기</th><th>예</th></tr></thead><tbody>
+<tr><td>식별 관계</td><td>자식 기본 키의 일부 또는 전부</td><td>불가(기본 키 열)</td><td>불가</td><td>자식의 기본 키를 바꿔야 함</td><td><code>order_item(order_id, line_no)</code></td></tr>
+<tr><td>필수 비식별 관계</td><td>기본 키 밖의 일반 열</td><td><code>NOT NULL</code></td><td>불가</td><td>외래 키 값 한 칸 수정</td><td><code>orders.member_id</code></td></tr>
+<tr><td>선택 비식별 관계</td><td>기본 키 밖의 일반 열</td><td>NULL 허용</td><td>가능</td><td>외래 키 값 한 칸 수정</td><td><code>category.parent_id</code>(최상위 카테고리는 NULL)</td></tr>
+</tbody></table></div>
+
+<p>개체-관계(ER) 모델의 용어로 보면 식별 관계는 <b>약한 엔티티(weak entity)</b>를 테이블로 옮긴 모양이다. 약한 엔티티는 자기 속성만으로는 인스턴스를 구별할 수 없고, 소유 엔티티(owner)의 식별자에 자기의 <b>부분 식별자(partial key, discriminator)</b>를 더해야 구별되는 엔티티다. 주문 항목의 <code>line_no</code>는 "한 주문 안에서만" 유일하다. 1이라는 순번은 100번 주문에도 101번 주문에도 있다. 그래서 <code>line_no</code> 혼자서는 키가 될 수 없고 <code>order_id</code>와 합쳐야 키가 된다. 반대로 주문 항목에 <code>order_item_id</code>라는 대리 키를 주는 것은 약한 엔티티에 독립된 식별자를 주어 강한 엔티티로 바꾸는 일이다. 이 관점은 설계 판단을 단순하게 만든다. "이 자식에게 독립된 이름이 필요한가"를 물으면 된다.</p>
+
+<p>ERD에서는 두 관계를 선의 모양으로 구별한다. MySQL Workbench 매뉴얼은 식별 관계를 테이블 사이의 실선으로, 비식별 관계를 끊어진 선(점선)으로 그린다고 적고 있다. Workbench의 관계 도구도 이 구분을 그대로 따라서, 일대일 비식별, 일대다 비식별, 일대일 식별, 일대다 식별 도구가 따로 있고, 다대다 도구는 식별 관계 하나뿐이다. 다대다 도구로 두 테이블을 이으면 연결 테이블이 생기고, 그 기본 키는 두 원래 테이블의 기본 키를 합친 복합 키가 된다. 이 회차의 텍스트 그림도 같은 관례를 쓴다. 실선은 <code>───</code>, 점선은 <code>┄┄┄</code>로 그리고, 기본 키 열에는 <code>PK</code>, 외래 키 열에는 <code>FK</code>를 붙인다.</p>
+
+<pre class="diagram">식별 관계 (실선): 부모 키가 자식의 PK 안으로 들어간다
+
+  orders                          order_item
+  +------------------+            +------------------+
+  | PK  order_id     |───────────<| PK,FK order_id   |
+  |     ordered_at   |            | PK    line_no    |
+  +------------------+            |       quantity   |
+                                  +------------------+
+
+비식별 관계 (점선): 부모 키는 자식의 일반 열로 남는다
+
+  orders                          order_item
+  +------------------+            +------------------+
+  | PK  order_id     |┄┄┄┄┄┄┄┄┄┄┄<| PK  order_item_id|
+  |     ordered_at   |            | FK  order_id     |
+  +------------------+            |     quantity     |
+                                  +------------------+
+  (< 는 "다" 쪽, 까마귀발 표기의 갈퀴 자리)</pre>
+
+<x-visual id="db-design1-06-identifying-vs-nonidentifying" title="식별 관계와 비식별 관계의 ERD 표기 비교" kind="ERD 비교 그림" ratio="16:9">
+<x-hint>같은 주문-주문 항목 관계를 위에는 식별 관계(실선), 아래에는 비식별 관계(점선)로 그려, 부모 키가 자식의 기본 키 칸 안에 들어가는지 밖에 있는지를 한눈에 비교한다.</x-hint>
+<x-prompt>Clean flat ERD diagram on a white background, two rows. Top row titled "식별 관계": left box "orders" with a PK row "order_id"; right box "order_item" whose key section (shaded, top part of the box) contains two rows "order_id (PK, FK)" and "line_no (PK)", and a lower section with "quantity". A SOLID line connects the boxes with a crow's foot at the order_item end; a small arrow shows "order_id" being copied from the orders box INTO the shaded key section of order_item. Bottom row titled "비식별 관계": same two boxes, but order_item's shaded key section contains only "order_item_id (PK)", and "order_id (FK)" sits in the lower unshaded section. A DASHED line connects them with a crow's foot at the order_item end; the copy arrow lands in the lower section. Labels in Korean exactly: "식별 관계", "비식별 관계", "부모 키가 기본 키 안으로", "부모 키는 일반 열로". Use two muted colors, no 3D, no gradients.</x-prompt>
+<x-caption>식별 관계는 부모의 키가 자식의 기본 키 칸 안으로, 비식별 관계는 기본 키 밖의 일반 열로 들어간다. 선의 모양(실선과 점선)이 이 차이를 나타낸다.</x-caption>
+</x-visual>
+
+<h3>일대다(1:N): 주문과 주문 항목을 두 방식으로 옮기기</h3>
+
+<p>가장 흔한 일대다 관계부터 두 설계를 나란히 세운다. 주문(<code>orders</code>)은 회원과 주문 일시를 갖고, 주문 항목은 상품과 수량과 주문 당시 가격을 갖는다. 테이블 이름을 <code>order</code>가 아니라 <code>orders</code>로 쓰는 이유는 <code>ORDER</code>가 MySQL의 예약어이기 때문이다. 아래 DDL에서 회원과 상품을 가리키는 외래 키 제약은 이 비교와 상관이 없어 생략했다.</p>
+
+<pre><code class="language-sql">CREATE TABLE orders (
+    order_id    BIGINT    NOT NULL AUTO_INCREMENT,
+    member_id   BIGINT    NOT NULL,
+    ordered_at  DATETIME  NOT NULL,
+    PRIMARY KEY (order_id)
+    -- 회원 외래 키 제약은 생략
+);
+
+-- 설계 A: 식별 관계. 부모 키 order_id가 기본 키의 첫 열이 된다
+CREATE TABLE order_item (
+    order_id     BIGINT  NOT NULL,
+    line_no      INT     NOT NULL,          -- 주문 안에서의 순번(부분 식별자)
+    product_id   BIGINT  NOT NULL,
+    quantity     INT     NOT NULL,
+    order_price  INT     NOT NULL,
+    PRIMARY KEY (order_id, line_no),
+    CONSTRAINT fk_order_item_order
+        FOREIGN KEY (order_id) REFERENCES orders (order_id)
+);</code></pre>
+
+<pre><code class="language-sql">-- 설계 B: 필수 비식별 관계. 자기 대리 키를 갖고 order_id는 NOT NULL 외래 키
+CREATE TABLE order_item (
+    order_item_id  BIGINT  NOT NULL AUTO_INCREMENT,
+    order_id       BIGINT  NOT NULL,
+    product_id     BIGINT  NOT NULL,
+    quantity       INT     NOT NULL,
+    order_price    INT     NOT NULL,
+    PRIMARY KEY (order_item_id),
+    CONSTRAINT fk_order_item_order
+        FOREIGN KEY (order_id) REFERENCES orders (order_id)
+);</code></pre>
+
+<p>두 설계에 같은 사실을 넣어 보자. 100번 주문에 상품 7을 2개, 상품 9를 1개 담았고, 101번 주문에 상품 7을 5개 담았다. 설계 A의 행은 <code>(100, 1, 7, 2)</code>, <code>(100, 2, 9, 1)</code>, <code>(101, 1, 7, 5)</code>가 되고, 설계 B의 행은 <code>(1, 100, 7, 2)</code>, <code>(2, 100, 9, 1)</code>, <code>(3, 101, 7, 5)</code>가 된다. 담긴 정보는 같다. 다른 것은 "이 행을 무엇으로 부르는가"다. 설계 A에서 두 번째 행의 이름은 <code>(100, 2)</code>이고, 설계 B에서는 <code>2</code>다. 이 차이가 아래 네 가지 결과로 이어진다.</p>
+
+<h4>첫째, 유일성 규칙이 키에 새겨지는 방식</h4>
+
+<p>설계 A의 기본 키는 "한 주문 안에서 순번은 겹치지 않는다"는 규칙을 그대로 표현한다. 100번 주문에 순번 2가 두 번 들어가려 하면 기본 키 위반으로 거부된다. 설계 B의 기본 키는 "주문 항목 번호는 테이블 전체에서 겹치지 않는다"는 사실만 말한다. 순번이 업무적으로 필요하다면 설계 B에도 <code>line_no</code> 열을 두고 <code>UNIQUE (order_id, line_no)</code> 제약을 따로 걸어야 한다. 규칙이 사라지는 것이 아니라 기본 키에서 UNIQUE 제약으로 자리를 옮기는 것이다. 이 구분은 03회의 "대리 키를 기본 키로, 자연 키는 UNIQUE로"와 같은 구조다.</p>
+
+<h4>둘째, 외래 키를 위한 인덱스</h4>
+
+<p>MySQL 매뉴얼은 외래 키 검사가 테이블 전체를 읽지 않도록 참조하는 쪽 테이블에 외래 키 열이 <b>맨 앞 열로 같은 순서로</b> 들어 있는 인덱스를 요구하고, 그런 인덱스가 없으면 자동으로 만든다고 적는다. 설계 A에서는 기본 키 <code>(order_id, line_no)</code>가 <code>order_id</code>로 시작하므로 이 조건을 기본 키가 이미 만족한다. 별도 인덱스가 생기지 않는다. 설계 B에는 <code>order_id</code>로 시작하는 인덱스가 없으므로 외래 키를 선언하는 순간 <code>order_id</code> 인덱스가 하나 더 만들어진다. 같은 관계를 표현하는 데 설계 A는 B+Tree 하나, 설계 B는 B+Tree 두 개를 쓴다. 이 차이가 성능에 어떤 의미인지는 InnoDB 단락에서 다시 본다.</p>
+
+<h4>셋째, 순번을 누가 매기는가</h4>
+
+<p>설계 B의 <code>order_item_id</code>는 <code>AUTO_INCREMENT</code>가 매긴다. 설계 A의 <code>line_no</code>는 사정이 다르다. 순번은 주문마다 1부터 다시 세야 하는데, InnoDB의 <code>AUTO_INCREMENT</code> 열은 어떤 인덱스의 첫 열이거나 유일한 열이어야 한다(MySQL 매뉴얼은 그래야 인덱스로 <code>SELECT MAX(ai_col)</code>에 해당하는 조회를 할 수 있다고 설명한다). <code>line_no</code>는 기본 키의 두 번째 열이라 이 조건을 만족하지 못한다. 실제로 InnoDB 테이블에 <code>PRIMARY KEY (g, n)</code>을 두고 두 번째 열 <code>n</code>에 <code>AUTO_INCREMENT</code>를 붙이면, MySQL 8.0.46과 8.4.13 모두 <code>ERROR 1075 (42000): Incorrect table definition; there can be only one auto column and it must be defined as a key</code>로 테이블 생성을 거부한다. MySQL 매뉴얼에 따르면 그룹별로 1부터 세는 동작, 곧 다중 열 인덱스의 두 번째 열에 <code>AUTO_INCREMENT</code>를 붙여 접두 열 값마다 <code>MAX + 1</code>을 매기는 동작은 MyISAM 테이블에서 쓸 수 있는 기능으로 설명되어 있고, InnoDB에는 그런 그룹별 카운터가 없다. 결국 순번은 애플리케이션이 매겨야 한다.</p>
+
+<p>애플리케이션이 <code>SELECT COALESCE(MAX(line_no), 0) + 1 FROM order_item WHERE order_id = 100</code>으로 다음 순번을 구한다고 해 보자. 두 트랜잭션이 같은 주문에 동시에 항목을 추가하면, 둘 다 같은 최댓값을 읽고 같은 <code>(100, 3)</code>을 넣으려 한다. 기본 키가 둘 중 하나만 받아들이므로 나머지 하나는 중복 키 오류를 받는다. InnoDB의 REPEATABLE READ에서 평범한 <code>SELECT</code>는 잠금 없는 일관된 읽기(consistent nonlocking read)라서 서로를 막지 않기 때문이다(데이터베이스 기본편에서 본 MVCC). 이를 막으려면 같은 부모에 대한 순번 발급을 직렬화해야 한다. 부모 행을 <code>SELECT ... FOR UPDATE</code>로 먼저 잠그고, 최댓값도 스냅숏이 아니라 최신 커밋 값을 읽는 잠금 읽기로 구하거나, 부모 테이블에 "마지막 순번" 열을 두고 그 행을 잠근 채 증가시키는 식이다. 주문 항목처럼 주문을 만들 때 한 트랜잭션에서 한꺼번에 넣는 자식이라면 이 경쟁이 거의 생기지 않지만, 댓글처럼 여러 사용자가 아무 때나 덧붙이는 자식이라면 반드시 다뤄야 하는 문제다. 비식별 관계에서는 이 일을 <code>AUTO_INCREMENT</code>가 대신한다.</p>
+
+<h4>넷째, 이 자식을 다시 가리키는 테이블</h4>
+
+<p>주문 항목을 다시 참조하는 테이블이 생긴다고 해 보자. 리뷰, 반품, 교환 같은 것들이다. 설계 B에서 리뷰는 <code>order_item_id</code> 한 열만 가지면 된다. 설계 A에서는 주문 항목의 기본 키 전체, 곧 <code>(order_id, line_no)</code> 두 열을 가져야 하고, 리뷰를 다시 식별 관계로 만들면 리뷰의 기본 키는 그 두 열을 품은 채 시작한다. 한 단계에서는 열 하나 차이지만, 이 차이는 단계마다 누적된다. 다음 단락에서 이것이 어디까지 자라는지 본다.</p>
+
+<h3>식별 관계의 문제점: 키는 아래로 내려가며 자란다</h3>
+
+<p>세 단계 이상의 계층을 식별 관계로만 이어 보자. 게시판(<code>board</code>) 아래에 게시글(<code>post</code>), 게시글 아래에 댓글(<code>post_comment</code>), 댓글마다 회원이 누르는 좋아요(<code>comment_like</code>)가 있다. 게시글 번호는 게시판마다 1부터, 댓글 번호는 게시글마다 1부터 센다고 하자. 이름표 안에 부모의 이름표를 넣는 규칙을 그대로 따르면 DDL은 다음과 같다.</p>
+
+<pre><code class="language-sql">CREATE TABLE board (
+    board_id  INT          NOT NULL,
+    name      VARCHAR(50)  NOT NULL,
+    PRIMARY KEY (board_id)
+);
+
+CREATE TABLE post (
+    board_id  INT           NOT NULL,
+    post_no   INT           NOT NULL,       -- 게시판 안에서의 글 번호
+    title     VARCHAR(200)  NOT NULL,
+    PRIMARY KEY (board_id, post_no),
+    FOREIGN KEY (board_id) REFERENCES board (board_id)
+);
+
+CREATE TABLE post_comment (
+    board_id    INT            NOT NULL,
+    post_no     INT            NOT NULL,
+    comment_no  INT            NOT NULL,    -- 글 안에서의 댓글 번호
+    member_id   BIGINT         NOT NULL,
+    content     VARCHAR(1000)  NOT NULL,
+    PRIMARY KEY (board_id, post_no, comment_no),
+    FOREIGN KEY (board_id, post_no) REFERENCES post (board_id, post_no)
+);
+
+CREATE TABLE comment_like (
+    board_id    INT     NOT NULL,
+    post_no     INT     NOT NULL,
+    comment_no  INT     NOT NULL,
+    member_id   BIGINT  NOT NULL,
+    PRIMARY KEY (board_id, post_no, comment_no, member_id),
+    FOREIGN KEY (board_id, post_no, comment_no)
+        REFERENCES post_comment (board_id, post_no, comment_no)
+    -- 회원 외래 키 제약은 생략
+);</code></pre>
+
+<p>기본 키의 열 수를 단계별로 세면 1, 2, 3, 4다. 단계가 하나 내려갈 때마다 부모의 키 전체를 물려받고 자기 부분 식별자를 하나 더 붙이기 때문이다. 좋아요는 댓글과 회원 사이의 다대다 관계를 푼 연결 테이블이므로, 댓글의 키 세 열에 회원 키 한 열이 더해져 네 열이 되었다. 같은 계층을 비식별 관계와 대리 키로 만들면 모든 테이블의 기본 키가 한 열이고, 외래 키도 모두 한 열이다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>테이블</th><th>식별 관계의 기본 키</th><th>바이트(INT 4, BIGINT 8)</th><th>비식별 관계의 기본 키</th><th>바이트</th></tr></thead><tbody>
+<tr><td><code>board</code></td><td><code>(board_id)</code></td><td>4</td><td><code>(board_id)</code></td><td>4</td></tr>
+<tr><td><code>post</code></td><td><code>(board_id, post_no)</code></td><td>8</td><td><code>(post_id)</code></td><td>8</td></tr>
+<tr><td><code>post_comment</code></td><td><code>(board_id, post_no, comment_no)</code></td><td>12</td><td><code>(comment_id)</code></td><td>8</td></tr>
+<tr><td><code>comment_like</code></td><td><code>(board_id, post_no, comment_no, member_id)</code></td><td>20</td><td><code>(comment_like_id)</code></td><td>8</td></tr>
+</tbody></table></div>
+
+<p>바이트 수만 보면 차이가 그리 커 보이지 않는다. 이 예제가 정수 열만 쓰기 때문이다. 게시판을 <code>'notice'</code>, <code>'free'</code> 같은 문자열 코드로 식별하는 자연 키를 썼다면, 그 문자열이 모든 자손 테이블의 기본 키와 모든 보조 인덱스 항목에 복사된다. 그러나 이 계층에서 더 큰 비용은 바이트가 아니라 <b>열의 개수</b>와 <b>값이 바뀔 때의 파급</b>에서 나온다. 아래 세 가지를 차례로 보자.</p>
+
+<h4>문제 1: 조인 조건이 길어지고, 하나를 빠뜨려도 오류가 나지 않는다</h4>
+
+<p>댓글과 좋아요를 조인하려면 세 열을 모두 맞춰야 한다. 열 하나를 빠뜨리면 SQL은 오류를 내지 않고 틀린 결과를 낸다. 데이터가 이렇다고 하자. 1번 게시판 1번 글의 1번 댓글에 좋아요가 2개, 2번 게시판 1번 글의 1번 댓글에 좋아요가 3개 있다. 1번 게시판의 그 댓글에 달린 좋아요를 세려는데 <code>board_id</code> 조건을 빠뜨렸다.</p>
+
+<pre><code class="language-sql">SELECT COUNT(*)
+FROM post_comment c
+JOIN comment_like l
+  ON l.post_no    = c.post_no
+ AND l.comment_no = c.comment_no          -- board_id 조건을 빠뜨렸다
+WHERE c.board_id = 1 AND c.post_no = 1 AND c.comment_no = 1;</code></pre>
+
+<p>한 줄씩 따라가 보자. <code>WHERE</code> 조건으로 <code>c</code>는 <code>(1, 1, 1)</code> 한 행으로 좁혀진다. 이 행과 조인할 <code>l</code>의 조건은 "<code>post_no</code>가 1이고 <code>comment_no</code>가 1"뿐이다. 1번 게시판의 좋아요 2개와 2번 게시판의 좋아요 3개가 모두 이 조건을 만족하므로 결과는 2가 아니라 5다. 게시판마다 글 번호를 1부터 세는 설계에서는 <code>(post_no, comment_no)</code>가 게시판마다 반복되므로 이런 일이 실제로 일어난다. 대리 키를 쓰는 설계에서는 조인 조건이 <code>l.comment_id = c.comment_id</code> 하나뿐이라 이런 종류의 실수가 생길 자리 자체가 없다.</p>
+
+<h4>문제 2: 부모의 키가 바뀌면 자손 전체의 키가 바뀐다</h4>
+
+<p>"글을 다른 게시판으로 옮긴다"는 기능이 생겼다고 하자. 1번 게시판의 7번 글을 2번 게시판으로 옮긴다. 식별 관계에서 글의 기본 키는 <code>(board_id, post_no)</code>이므로 글을 옮기는 것은 기본 키를 바꾸는 일이다. 게다가 2번 게시판에 이미 7번 글이 있다면 <code>(2, 7)</code>을 쓸 수 없으므로 2번 게시판에서 새 글 번호를 받아야 한다. 이 글에 댓글이 3개 있고 각 댓글에 좋아요가 2개, 0개, 4개 있다면, 기본 키가 바뀌어야 하는 행은 글 1행, 댓글 3행, 좋아요 6행으로 모두 10행이다. 외래 키에 <code>ON UPDATE CASCADE</code>를 걸어 두면 MySQL이 부모의 키 변경을 자식에게 자동으로 전파하지만, 전파된다고 비용이 사라지는 것은 아니다. 열 개의 행 모두 기본 키 값이 바뀐다.</p>
+
+<p>InnoDB에서 기본 키 값이 바뀐다는 것의 의미는 무겁다. 행은 기본 키 순서로 정렬된 클러스터형 인덱스에 저장되므로, 기본 키가 바뀐 행은 B+Tree에서 다른 자리로 옮겨 가야 한다. 또 모든 보조 인덱스 항목은 행을 찾기 위해 기본 키 값을 품고 있으므로, 그 행을 가리키는 보조 인덱스 항목도 모두 고쳐야 한다. 비식별 관계라면 같은 기능은 <code>UPDATE post SET board_id = 2 WHERE post_id = 1234</code> 한 문장, 한 행, 한 열의 수정으로 끝난다. 댓글과 좋아요는 <code>post_id</code>로 글을 가리키고 있으므로 손댈 필요가 없다. 글이 어느 게시판에 있는지는 글의 속성일 뿐, 댓글의 이름에 들어 있지 않기 때문이다.</p>
+
+<h4>문제 3: 요구 사항이 바뀌면 키의 정의가 바뀐다</h4>
+
+<p>키는 "이 행이 무엇인가"에 대한 정의라서, 식별 관계는 업무 구조를 기본 키에 굳혀 넣는다. 계층이 바뀌는 요구, 예를 들어 "게시판 두 개를 하나로 합친다", "댓글을 다른 글로 옮긴다", "글이 여러 게시판에 동시에 걸린다"는 요구가 생기면 그때마다 기본 키의 정의가 흔들린다. 마지막 요구는 특히 치명적이다. 글과 게시판이 일대다에서 다대다로 바뀌면 글의 기본 키에서 <code>board_id</code>를 빼야 하는데, 그러면 <code>post_no</code>만으로는 글을 구별할 수 없으므로(게시판마다 1부터 셌다) 글에 새 식별자를 만들어야 하고, 그 아래 모든 테이블의 기본 키와 외래 키를 다시 만들어야 한다. 비식별 관계였다면 <code>post.board_id</code>를 연결 테이블로 옮기는 변경으로 끝나고 댓글과 좋아요는 그대로다.</p>
+
+<p>자연 키와 식별 관계가 만나면 이 문제가 더 잦아진다. 03회에서 본 것처럼 자연 키는 현실이 바뀌면 같이 바뀐다. 게시판을 <code>'notice'</code> 같은 코드로 식별하고 그 코드를 식별 관계로 자손에게 물려주었다면, 코드 이름을 바꾸는 사소한 결정 하나가 모든 자손 테이블의 기본 키 변경이 된다. 정리하면 식별 관계의 비용은 "부모의 키가 영원히 바뀌지 않고, 자식이 영원히 그 부모에만 속한다"는 가정이 깨질 때 청구된다. 그 가정이 정말 영원한지 확신할 수 있는 관계는 생각보다 적다.</p>
+
+<x-visual id="db-design1-06-key-propagation" title="식별 관계 계층에서 기본 키가 자라는 모습" kind="비교 다이어그램" ratio="16:9">
+<x-hint>게시판, 게시글, 댓글, 좋아요 네 단계를 왼쪽은 식별 관계로, 오른쪽은 비식별 관계로 쌓아, 왼쪽에서는 아래로 갈수록 기본 키 열이 하나씩 늘고 오른쪽은 항상 한 열임을 보여 준다.</x-hint>
+<x-prompt>Two vertical stacks of four table boxes side by side on a white background. Left stack titled "식별 관계": boxes from top to bottom labeled "board", "post", "post_comment", "comment_like"; inside each box a shaded key band showing the key columns as small colored blocks: board has 1 block "board_id"; post has 2 blocks "board_id","post_no"; post_comment has 3 blocks adding "comment_no"; comment_like has 4 blocks adding "member_id". Inherited blocks keep the same color as in the parent so the viewer sees the parent's key flowing down. Solid lines connect the boxes. Right stack titled "비식별 관계": same four boxes, each with exactly one key block ("board_id", "post_id", "comment_id", "comment_like_id") and one unshaded FK row pointing to the parent; dashed lines connect them. A bracket on the far left reads "기본 키 열 1 → 4". Korean labels exactly: "식별 관계", "비식별 관계", "기본 키 열 1 → 4". Flat style, no 3D.</x-prompt>
+<x-caption>식별 관계는 단계마다 부모의 키 전체를 물려받아 기본 키가 자라고, 비식별 관계는 모든 테이블이 한 열짜리 기본 키와 한 열짜리 외래 키를 쓴다.</x-caption>
+</x-visual>
+
+<h3>SQL 쿼리로 비교하기: 조인이 줄어드는 곳과 늘어나는 곳</h3>
+
+<p>식별 관계에 비용만 있는 것은 아니다. 같은 계층을 비식별 관계로 다시 만들고 몇 가지 조회를 두 설계에서 나란히 써 보면 식별 관계가 무엇을 사 주는지도 보인다. 비식별 설계의 DDL은 다음과 같다. 좋아요 테이블에는 "회원 한 명이 같은 댓글에 좋아요를 두 번 누를 수 없다"는 규칙을 UNIQUE로 따로 걸었다. 식별 설계에서는 이 규칙을 기본 키가 표현하고 있었다.</p>
+
+<pre><code class="language-sql">CREATE TABLE post (
+    post_id   BIGINT        NOT NULL AUTO_INCREMENT,
+    board_id  INT           NOT NULL,
+    title     VARCHAR(200)  NOT NULL,
+    PRIMARY KEY (post_id),
+    FOREIGN KEY (board_id) REFERENCES board (board_id)
+);
+
+CREATE TABLE post_comment (
+    comment_id  BIGINT         NOT NULL AUTO_INCREMENT,
+    post_id     BIGINT         NOT NULL,
+    member_id   BIGINT         NOT NULL,
+    content     VARCHAR(1000)  NOT NULL,
+    PRIMARY KEY (comment_id),
+    FOREIGN KEY (post_id) REFERENCES post (post_id)
+);
+
+CREATE TABLE comment_like (
+    comment_like_id  BIGINT  NOT NULL AUTO_INCREMENT,
+    comment_id       BIGINT  NOT NULL,
+    member_id        BIGINT  NOT NULL,
+    PRIMARY KEY (comment_like_id),
+    UNIQUE KEY uk_comment_like (comment_id, member_id),
+    FOREIGN KEY (comment_id) REFERENCES post_comment (comment_id)
+);</code></pre>
+
+<p><b>조회 1: 한 글의 댓글 목록.</b> 바로 위 부모의 키를 알고 있을 때는 두 설계 모두 테이블 하나로 끝난다. 식별 설계는 <code>WHERE board_id = 1 AND post_no = 7 ORDER BY comment_no</code>, 비식별 설계는 <code>WHERE post_id = 1234 ORDER BY comment_id</code>다. SQL의 길이는 비슷하다. 차이는 SQL이 아니라 엔진이 이 조회를 처리하는 방식에서 나는데, 다음 단락의 주제다.</p>
+
+<p><b>조회 2: 한 게시판의 댓글 수.</b> 여기서 처음으로 큰 차이가 난다. 식별 설계의 댓글 테이블에는 <code>board_id</code>가 기본 키의 첫 열로 들어 있으므로 조인 없이 바로 셀 수 있다. 비식별 설계의 댓글은 <code>post_id</code>만 알고 있으므로 글 테이블을 거쳐야 한다.</p>
+
+<pre><code class="language-sql">-- 식별 설계: 조상의 키가 손자에게 들어 있다
+SELECT COUNT(*) FROM post_comment WHERE board_id = 1;
+
+-- 비식별 설계: 한 단계를 거슬러 올라가야 한다
+SELECT COUNT(*)
+FROM post_comment c
+JOIN post p ON p.post_id = c.post_id
+WHERE p.board_id = 1;</code></pre>
+
+<p>식별 설계의 쿼리는 기본 키 <code>(board_id, post_no, comment_no)</code>의 맨 앞 열 하나로 범위를 좁힌다. MySQL 매뉴얼의 다중 열 인덱스 설명대로 인덱스의 왼쪽 접두(leftmost prefix)는 검색에 쓸 수 있으므로, 이 조회는 클러스터형 인덱스에서 <code>board_id = 1</code>인 구간만 읽어 처리할 수 있다. 좋아요 수를 게시판 단위로 세는 조회라면 차이가 한 단계 더 벌어진다. 식별 설계는 <code>comment_like</code> 한 테이블에서 <code>WHERE board_id = 1</code>로 끝나지만, 비식별 설계는 좋아요에서 댓글로, 댓글에서 글로 두 번 조인해야 한다. 식별 관계는 <b>조상의 키로 후손을 찾는 조회</b>에서 조인을 없애 준다.</p>
+
+<p><b>조회 3: 좋아요 목록과 함께 댓글 내용 보기.</b> 이번에는 반대다. 바로 위 부모와 조인할 때, 식별 설계는 키 전체를 맞춰야 하므로 조인 조건이 세 줄이고, 비식별 설계는 한 줄이다. 앞에서 본 대로 세 줄 가운데 하나를 빠뜨려도 오류가 나지 않는다. 계층이 깊을수록, 조인하는 테이블이 많을수록 조건은 길어지고 실수할 자리도 늘어난다.</p>
+
+<pre><code class="language-sql">-- 식별 설계: 부모의 키 전체를 맞춘다
+SELECT c.content, l.member_id
+FROM comment_like l
+JOIN post_comment c
+  ON c.board_id   = l.board_id
+ AND c.post_no    = l.post_no
+ AND c.comment_no = l.comment_no
+WHERE l.member_id = 42;
+
+-- 비식별 설계: 한 열이면 된다
+SELECT c.content, l.member_id
+FROM comment_like l
+JOIN post_comment c ON c.comment_id = l.comment_id
+WHERE l.member_id = 42;</code></pre>
+
+<p><b>조회 4: 회원 42가 쓴 댓글 목록.</b> 계층을 따라가지 않는 조회는 두 설계 모두 <code>member_id</code>에 보조 인덱스가 필요하다. SQL은 같다. 차이는 그 보조 인덱스의 크기다. InnoDB의 보조 인덱스 항목은 행을 찾기 위해 기본 키 값을 함께 저장하므로, 식별 설계의 <code>member_id</code> 인덱스 항목에는 <code>(board_id, post_no, comment_no)</code> 세 열이, 비식별 설계에서는 <code>comment_id</code> 한 열이 붙는다.</p>
+
+<p>정리하면 식별 관계는 조상의 키를 후손에게 미리 복사해 두는 설계다. 그래서 조상의 키로 후손을 거르는 조회가 조인 없이 끝나고, 대신 바로 위 부모와 조인할 때 조건이 길어지며 모든 보조 인덱스가 넓어진다. 비식별 관계에서 "게시판별 댓글 수" 같은 조회가 성능 문제로 떠오르면 <code>post_comment</code>에 <code>board_id</code>를 복사해 두는 방법이 있는데, 이것은 기본 키 구조를 건드리지 않고 필요한 열만 내려 주는 반정규화(denormalization)이고 08회 이후의 주제다. 어느 쪽이 유리한지는 SQL을 보고 결정할 수 없고, 그 조회가 얼마나 자주 실행되는지와 엔진이 그것을 어떻게 처리하는지를 함께 봐야 한다.</p>
+
+<h3>한 층 아래: InnoDB가 두 설계를 디스크에 놓는 방식</h3>
+
+<p>성능 차이의 원인은 저장 엔진의 구조에 있다. 03회에서 본 내용을 네 문장으로 상기하자. InnoDB에서 기본 키는 클러스터형 인덱스(clustered index)이고, 행 전체가 이 B+Tree의 리프 페이지에 기본 키 순서로 저장된다. 보조 인덱스(secondary index)의 각 항목은 인덱스 열과 함께 그 행의 기본 키 열을 담고 있고, InnoDB는 이 기본 키 값으로 클러스터형 인덱스를 다시 검색해 행을 찾는다. 인덱스 페이지의 기본 크기는 16KB다. 그리고 MySQL 매뉴얼은 InnoDB가 보조 인덱스 뒤에 기본 키 열을 자동으로 덧붙여 확장한다고 설명한다(index extension). 예를 들어 기본 키가 <code>(i1, i2)</code>인 테이블의 보조 인덱스 <code>(d)</code>는 내부적으로 <code>(d, i1, i2)</code>처럼 다뤄진다.</p>
+
+<h4>같은 부모의 자식이 한곳에 모이는가</h4>
+
+<p>조회 1, 곧 한 글의 댓글 목록을 엔진의 눈으로 다시 보자. 식별 설계에서 댓글의 클러스터형 인덱스는 <code>(board_id, post_no, comment_no)</code> 순서로 정렬되어 있다. 1번 게시판 7번 글의 댓글은 언제 쓰였든 <code>(1, 7, 1)</code>, <code>(1, 7, 2)</code>, <code>(1, 7, 3)</code>처럼 리프 페이지에 나란히 놓인다. 엔진은 B+Tree를 한 번 내려가 <code>(1, 7)</code>로 시작하는 첫 항목을 찾고, 거기서부터 리프를 순서대로 읽다가 <code>(1, 8)</code>이 나오면 멈춘다. 행 전체가 리프에 있으므로 추가 조회가 없고, 결과는 이미 <code>comment_no</code> 순서라 정렬도 필요 없다. 읽는 페이지는 그 글의 댓글 행들이 실제로 차지하는 만큼의 연속된 리프 페이지뿐이다.</p>
+
+<p>비식별 설계에서 댓글의 클러스터형 인덱스는 <code>comment_id</code> 순서, 곧 <code>AUTO_INCREMENT</code>가 번호를 매긴 순서이자 대략 작성 시간 순서로 정렬되어 있다. 1234번 글에 사흘에 걸쳐 댓글이 달렸다면, 그 사이 다른 글들에 달린 수많은 댓글이 번호를 나눠 가졌을 것이므로 1234번 글의 댓글은 클러스터형 인덱스 여기저기에 흩어진다. 엔진은 먼저 외래 키 때문에 만들어진 <code>post_id</code> 보조 인덱스에서 <code>post_id = 1234</code> 구간을 읽는다. 인덱스 확장 덕분에 이 구간의 항목은 <code>(1234, 501)</code>, <code>(1234, 877)</code>, <code>(1234, 2310)</code>처럼 <code>comment_id</code> 순서로 정렬되어 있어서 <code>ORDER BY comment_id</code>는 추가 정렬 없이 처리될 수 있다. 그러나 <code>content</code>를 읽으려면 각 <code>comment_id</code>로 클러스터형 인덱스를 루트부터 다시 내려가야 하고, 흩어진 댓글이 N개라면 최악의 경우 서로 다른 리프 페이지 N개를 읽게 된다.</p>
+
+<pre class="diagram">[식별 설계] post_comment 클러스터형 인덱스 리프 (PK 순서)
+  ... | (1,6,9) (1,7,1) (1,7,2) (1,7,3) | (1,7,4) (1,8,1) (1,8,2) ... | ...
+                └──── 글 (1,7)의 댓글이 이어져 있다 ────┘
+        → 한 번 내려가서 옆으로 읽으면 끝
+
+[비식별 설계] post_id 보조 인덱스 리프            post_comment 클러스터형 인덱스 리프
+  ... (1234,501) (1234,877) (1234,2310) ...          (comment_id 순서 ≈ 작성 순서)
+           │           │            │               page A: ... 500 [501] 502 ...
+           │           │            └─────────────▶ page C: ... 2309 [2310] 2311 ...
+           │           └──────────────────────────▶ page B: ... 876 [877] 878 ...
+           └──────────────────────────────────────▶ page A
+        → 항목마다 루트부터 다시 내려가 서로 다른 페이지를 읽는다</pre>
+
+<p>이 차이에는 중요한 조건이 붙는다. 자식이 부모와 함께 한꺼번에 만들어지는 경우에는 차이가 거의 없다. 주문 항목은 주문을 만들 때 한 트랜잭션에서 함께 들어가므로, 대리 키를 써도 같은 주문의 항목들이 연속된 번호를 받아 같은 리프 페이지에 모인다. 차이가 커지는 것은 자식이 <b>시간에 걸쳐 쌓이고</b>, 조회가 <b>부모 단위로</b> 일어나는 경우다. 게시글의 댓글, 회원별 주문 이력, 장비별 측정값 같은 데이터가 그렇다. 또 버퍼 풀에 그 페이지들이 이미 올라와 있다면 디스크를 읽지 않으므로 차이는 메모리 접근 횟수 정도로 줄어든다. 식별 관계의 "모아 두기" 효과는 데이터가 버퍼 풀보다 크고 부모 단위 조회가 잦을 때 의미가 있다.</p>
+
+<h4>새 행이 어디에 들어가는가</h4>
+
+<p>모아 두기에는 대가가 있다. 식별 설계에서 오래된 글 <code>(1, 7)</code>에 새 댓글이 달리면, 그 행은 클러스터형 인덱스의 끝이 아니라 <code>(1, 7, 4)</code> 바로 뒤, 곧 인덱스 중간에 들어가야 한다. 그 리프 페이지에 자리가 없으면 페이지를 둘로 나누는 페이지 분할(page split)이 일어난다. MySQL 매뉴얼은 InnoDB가 클러스터형 인덱스에 새 레코드를 넣을 때 앞으로의 삽입과 수정을 위해 페이지의 1/16을 비워 두려 하며, 레코드가 순차적으로(오름차순이든 내림차순이든) 삽입되면 페이지가 약 15/16까지 차고, 무작위 순서로 삽입되면 1/2에서 15/16 사이로 찬다고 설명한다. 여러 글에 댓글이 고루 달리는 상황은 클러스터형 인덱스 입장에서 무작위에 가까운 삽입이다.</p>
+
+<p>비식별 설계에서는 <code>comment_id</code>가 계속 증가하므로 새 댓글 행은 항상 클러스터형 인덱스의 오른쪽 끝에 붙는다. 순차 삽입이라 페이지가 촘촘하게 찬다. 그렇다고 중간 삽입이 사라진 것은 아니다. <code>post_id</code> 보조 인덱스에는 새 항목 <code>(1234, 9001)</code>이 1234 구간의 끝, 곧 인덱스 중간에 들어간다. 달라진 점은 중간 삽입을 겪는 대상이다. 식별 설계에서는 <code>content</code>까지 담은 넓은 행 전체가, 비식별 설계에서는 <code>(post_id, comment_id)</code> 16바이트짜리 좁은 항목이 중간에 끼어든다. 무작위 삽입의 부담을 좁은 인덱스로 옮긴 셈이다.</p>
+
+<h4>모든 보조 인덱스가 기본 키를 짊어진다</h4>
+
+<p>MySQL 매뉴얼은 기본 키가 길면 보조 인덱스가 더 많은 공간을 쓰므로 짧은 기본 키가 유리하다고 적는다. 식별 설계의 댓글 테이블에 <code>member_id</code> 인덱스와 작성 시각 인덱스를 만들면, 두 인덱스의 모든 항목이 12바이트짜리 <code>(board_id, post_no, comment_no)</code>를 짊어진다. 좋아요 테이블이라면 20바이트다. 비식별 설계라면 각 항목에 8바이트 <code>comment_id</code>가 붙는다. 행이 수억 개로 늘면 이 차이가 인덱스 전체 크기의 차이가 되고, 버퍼 풀에 올라갈 수 있는 인덱스의 양이 그만큼 줄어든다.</p>
+
+<p>반대 방향의 계산도 공정하게 해 두자. 식별 설계는 기본 키의 접두가 외래 키 인덱스 역할을 하므로 외래 키마다 따로 인덱스를 만들 필요가 없다. 비식별 설계는 외래 키마다 InnoDB가 인덱스를 만든다. 댓글 테이블 하나만 보면 식별 설계는 B+Tree 하나, 비식별 설계는 클러스터형 인덱스와 <code>post_id</code> 인덱스 두 개다. 인덱스가 하나 적다는 것은 삽입마다 고쳐야 할 B+Tree가 하나 적다는 뜻이기도 하다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>항목</th><th>식별 관계 (복합 기본 키)</th><th>비식별 관계 (대리 키)</th></tr></thead><tbody>
+<tr><td>부모 단위 조회의 지역성</td><td>같은 부모의 자식이 클러스터형 인덱스에 연속 저장</td><td>보조 인덱스 범위 읽기 후 행마다 클러스터형 인덱스 재검색</td></tr>
+<tr><td>조상 키로 후손 조회</td><td>조인 없이 기본 키 접두로 처리</td><td>계층을 거슬러 조인</td></tr>
+<tr><td>새 행의 삽입 위치</td><td>클러스터형 인덱스 중간(무작위에 가까움)</td><td>클러스터형 인덱스 끝(순차), 외래 키 인덱스는 중간</td></tr>
+<tr><td>보조 인덱스 항목 크기</td><td>기본 키 전체(여러 열)가 붙음</td><td>대리 키 한 열이 붙음</td></tr>
+<tr><td>외래 키용 인덱스</td><td>기본 키 접두가 대신함</td><td>외래 키마다 하나씩 생성</td></tr>
+<tr><td>부모 키 변경, 부모 이동</td><td>자손 전체의 기본 키 변경</td><td>외래 키 한 칸 수정</td></tr>
+</tbody></table></div>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>InnoDB에서 식별 관계는 "같은 부모의 자식을 디스크에서 한곳에 모아 두겠다"는 선택이다. 그 대가로 키가 넓어지고, 새 행이 인덱스 중간에 들어가며, 부모의 키와 소속이 바뀌지 않는다는 가정에 묶인다. 비식별 관계는 그 반대의 거래다. 어느 거래가 이익인지는 데이터가 쌓이는 방식과 가장 자주 실행되는 조회가 정한다.</p></aside>
+
+<x-visual id="db-design1-06-clustered-locality" title="식별 설계와 비식별 설계에서 한 글의 댓글을 읽는 경로" kind="저장 구조 그림" ratio="16:9">
+<x-hint>왼쪽은 복합 기본 키 클러스터형 인덱스에서 한 글의 댓글이 연속된 리프에 모여 한 번에 읽히는 모습, 오른쪽은 보조 인덱스를 거쳐 흩어진 리프 페이지를 하나씩 찾아가는 모습을 보여 준다.</x-hint>
+<x-prompt>Side-by-side B+Tree illustration on a white background. Left panel titled "식별 설계": one B+Tree (root, two internal nodes, a row of leaf pages). In the leaf row, four consecutive cells labeled "(1,7,1)", "(1,7,2)", "(1,7,3)", "(1,7,4)" are highlighted in one color; a single arrow goes down from the root to the first highlighted cell, then a short horizontal arrow sweeps across the highlighted cells. Caption under the panel: "한 번 내려가서 옆으로 읽기". Right panel titled "비식별 설계": a small B+Tree labeled "post_id 보조 인덱스" whose leaf row shows three adjacent cells "(1234,501)", "(1234,877)", "(1234,2310)"; next to it a larger B+Tree labeled "클러스터형 인덱스" with many leaf pages; three separate arrows go from the three secondary-index cells, each descending from the clustered root to a different, widely separated leaf page where cells "501", "877", "2310" are highlighted. Caption: "항목마다 다시 내려가기". Korean labels exactly as given. Flat style, two accent colors.</x-prompt>
+<x-caption>식별 설계는 같은 글의 댓글이 클러스터형 인덱스에 연속해 있어 한 번의 범위 읽기로 끝나고, 비식별 설계는 보조 인덱스를 읽은 뒤 흩어진 리프 페이지를 하나씩 찾아간다.</x-caption>
+</x-visual>
+
+<h3>일대일(1:1): 공유 기본 키와 외래 키 + UNIQUE</h3>
+
+<p>일대일 관계에서도 같은 갈림길이 있다. 회원(<code>member</code>)과 회원 상세(<code>member_detail</code>)를 예로 들자. 회원 상세에는 자기소개처럼 길고 드물게 쓰이는 열이 들어 있고, 회원 한 명에게 상세는 없거나 하나다. 05회에서 본 대로 일대일 관계의 외래 키는 어느 쪽에 두어도 되지만, 대개 나중에 만들어지거나 없을 수도 있는 쪽, 여기서는 회원 상세 쪽에 둔다. 외래 키를 회원 상세에 두기로 했다면 이제 그 외래 키를 기본 키로 쓸지 정해야 한다.</p>
+
+<pre><code class="language-sql">CREATE TABLE member (
+    member_id  BIGINT        NOT NULL AUTO_INCREMENT,
+    email      VARCHAR(255)  NOT NULL,
+    name       VARCHAR(50)   NOT NULL,
+    PRIMARY KEY (member_id),
+    UNIQUE KEY uk_member_email (email)
+);
+
+-- 설계 A: 식별 관계. 외래 키가 곧 기본 키다(공유 기본 키)
+CREATE TABLE member_detail (
+    member_id     BIGINT         NOT NULL,
+    introduction  VARCHAR(1000)  NULL,
+    PRIMARY KEY (member_id),
+    CONSTRAINT fk_member_detail_member
+        FOREIGN KEY (member_id) REFERENCES member (member_id)
+);</code></pre>
+
+<pre><code class="language-sql">-- 설계 B: 비식별 관계. 자기 대리 키 + NOT NULL 외래 키 + UNIQUE
+CREATE TABLE member_detail (
+    member_detail_id  BIGINT         NOT NULL AUTO_INCREMENT,
+    member_id         BIGINT         NOT NULL,
+    introduction      VARCHAR(1000)  NULL,
+    PRIMARY KEY (member_detail_id),
+    UNIQUE KEY uk_member_detail_member (member_id),
+    CONSTRAINT fk_member_detail_member
+        FOREIGN KEY (member_id) REFERENCES member (member_id)
+);</code></pre>
+
+<p>설계 A에서 자식의 기본 키는 부모의 기본 키와 같은 값이다. 이런 형태를 <b>공유 기본 키(shared primary key)</b>라고 부른다. 일대일이라는 규칙, 곧 "회원 한 명에게 상세는 최대 하나"를 기본 키가 저절로 지킨다. 같은 <code>member_id</code>로 두 번째 행을 넣으면 기본 키 위반이다. 외래 키 인덱스도 기본 키가 대신한다. 두 테이블의 행은 같은 키 값으로 1:1 대응하므로, 회원 화면에서 상세를 함께 읽을 때 두 클러스터형 인덱스를 같은 키로 한 번씩 찾으면 된다.</p>
+
+<p>설계 B에서 일대일이라는 규칙을 지키는 것은 기본 키가 아니라 <code>uk_member_detail_member</code>라는 UNIQUE 제약이다. 이 제약을 빠뜨리면 무슨 일이 생기는지 정확히 알아 두어야 한다. 외래 키 제약은 "가리키는 회원이 존재한다"만 검사하고, 몇 개의 행이 같은 회원을 가리키는지는 검사하지 않는다. MySQL이 외래 키 때문에 자동으로 만드는 인덱스도 일반 인덱스라서 중복을 막지 않는다. 결국 UNIQUE가 없는 설계 B는 오류 하나 없이 일대다 관계로 동작한다. 화면에서 "상세 저장" 버튼을 두 번 누르면 상세 행이 두 개 생기고, 이후 조회는 어느 행을 보여 줄지 몰라 엉뚱한 값을 낸다. 또 외래 키 열이 NULL을 허용하는 선택적 일대일이라면, MySQL 매뉴얼대로 UNIQUE 인덱스는 NULL을 여러 개 허용하므로 부모 없는 행은 몇 개든 들어갈 수 있다는 점도 함께 기억하자. UNIQUE 인덱스는 <code>member_id</code>로 시작하므로 외래 키 인덱스 역할도 겸하고, 따로 인덱스가 자동 생성되지는 않는다.</p>
+
+<h4>요구 사항이 바뀔 때: 일대일이 일대다가 되는 순간</h4>
+
+<p>일대일 관계에서 식별과 비식별의 차이가 가장 크게 드러나는 것은 관계의 카디널리티 자체가 바뀔 때다. 주문(<code>orders</code>)과 배송(<code>delivery</code>)이 일대일이라고 하자. 주문 하나에 배송 정보 하나가 결제 후 만들어진다. 식별 관계로 만들면 <code>delivery</code>의 기본 키는 <code>order_id</code>이고, 배송 추적 기록 같은 하위 테이블은 <code>order_id</code>로 배송을 가리킨다. 그런데 어느 날 "한 주문을 여러 상자로 나눠 보낸다"는 요구가 생긴다. 주문과 배송은 일대다가 되고, <code>order_id</code>만으로는 배송을 구별할 수 없다. 배송의 기본 키를 <code>(order_id, delivery_seq)</code>나 대리 키로 다시 정의해야 하고, 배송을 가리키던 모든 하위 테이블의 외래 키도 다시 만들어야 한다.</p>
+
+<p>비식별 관계로 만들었다면 <code>delivery</code>는 처음부터 <code>delivery_id</code>를 기본 키로 갖고 <code>order_id</code>에 UNIQUE가 걸려 있다. 일대일을 일대다로 바꾸는 일은 그 UNIQUE를 일반 인덱스로 바꾸는 것으로 끝난다. 외래 키는 <code>order_id</code>로 시작하는 인덱스를 요구하므로, 일반 인덱스를 먼저 만든 뒤 UNIQUE 인덱스를 지운다. 순서를 바꿔 UNIQUE부터 지우면 MySQL 8.0.46과 8.4.13 모두 <code>ERROR 1553 (HY000): Cannot drop index 'uk_delivery_order': needed in a foreign key constraint</code>로 거부한다. 배송 추적 기록은 처음부터 <code>delivery_id</code>로 배송을 가리키고 있었으므로 손댈 필요가 없다.</p>
+
+<pre><code class="language-sql">-- 일대일 → 일대다: 외래 키가 쓸 일반 인덱스를 먼저 만들고 UNIQUE를 지운다
+ALTER TABLE delivery ADD INDEX idx_delivery_order (order_id);
+ALTER TABLE delivery DROP INDEX uk_delivery_order;</code></pre>
+
+<p>그렇다면 공유 기본 키는 언제 맞는가. 자식이 사실상 <b>같은 엔티티를 세로로 나눈 조각</b>일 때다. 회원 상세는 회원이라는 하나의 엔티티에서 드물게 쓰이는 긴 열을 떼어 낸 것이라, 회원과 생명 주기가 같고, 다른 회원에게 옮겨 갈 일이 없으며, 한 회원에게 둘 이상 생길 이유도 없다. 이런 관계는 일대다로 바뀔 위험이 거의 없으므로 공유 기본 키가 주는 단순함, 곧 별도 키와 별도 UNIQUE가 필요 없고 두 테이블을 같은 키로 찾는다는 장점을 그대로 누릴 수 있다. 반면 배송처럼 독자적인 업무 흐름(출고, 배송 중, 배송 완료)을 갖고 자라날 여지가 있는 엔티티는 비식별 관계가 안전하다. 판단 기준은 "이 자식이 부모의 일부인가, 부모와 연결된 별개의 사물인가"다.</p>
+
+<p>JPA를 쓴다면 공유 기본 키는 Jakarta Persistence 명세의 파생 식별자(derived identity)로 매핑한다. 명세 2.4.1절은 엔티티의 식별자가 다른 엔티티, 곧 부모 엔티티의 식별자에서 파생될 수 있다고 정의하고, 그 의존 엔티티는 부모에 대한 다대일 또는 일대일 관계의 주인이다. <code>@MapsId</code>는 이 관계 속성이 기본 키 값을 제공한다는 표시다.</p>
+
+<pre><code class="language-java">@Entity
+@Table(name = "member_detail")
+public class MemberDetail {
+    @Id
+    @Column(name = "member_id")
+    private Long id;          // 값은 아래 연관관계에서 온다
+
+    @MapsId
+    @OneToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "member_id")
+    private Member member;
+
+    private String introduction;
+
+    protected MemberDetail() {}
+
+    public MemberDetail(Member member, String introduction) {
+        this.member = member;
+        this.introduction = introduction;
+    }
+}</code></pre>
+
+<p>이 클래스는 <code>jakarta.persistence-api</code> 3.1 위에서 JDK 21로 컴파일해 확인했다. <code>id</code> 필드에 값을 넣는 코드가 어디에도 없다는 점이 핵심이다. <code>@MapsId</code>가 붙은 <code>member</code>가 기본 키를 제공하므로, 영속성 제공자가 <code>member</code>의 식별자를 <code>id</code>에 채운다. 테이블에는 <code>member_id</code> 열 하나만 생기고, 그 열이 기본 키이자 외래 키다.</p>
+
+<h3>다대다(M:N) 1: 연결 테이블을 식별 관계로 — 복합 기본 키</h3>
+
+<p>05회에서 다대다 관계는 관계형 테이블로 직접 표현할 수 없어 두 일대다 관계와 연결 테이블(associative table)로 푼다고 했다. 연결 테이블은 양쪽 부모의 기본 키를 외래 키로 갖는다. 여기서 다시 갈림길이 나온다. 두 외래 키를 합쳐 기본 키로 삼으면 연결 테이블은 양쪽 부모 모두와 식별 관계를 맺는다. 연결 테이블에 자기 대리 키를 주면 양쪽 모두와 비식별 관계가 된다. 앞에서 본 대로 MySQL Workbench의 다대다 도구는 앞의 방식, 곧 두 부모의 기본 키를 합친 복합 기본 키를 가진 연결 테이블을 만든다.</p>
+
+<p>상품과 카테고리를 예로 들자. 상품 하나는 여러 카테고리에 속할 수 있고, 카테고리 하나에는 여러 상품이 있다. 연결 테이블 <code>product_category</code>에는 "어느 상품이 어느 카테고리에 속한다"는 사실만 있고 다른 속성은 없다.</p>
+
+<pre><code class="language-sql">CREATE TABLE product_category (
+    product_id   BIGINT  NOT NULL,
+    category_id  BIGINT  NOT NULL,
+    PRIMARY KEY (product_id, category_id),
+    -- 선언하지 않아도 외래 키 때문에 자동으로 생기지만 의도를 드러내려고 적는다
+    KEY idx_product_category_category (category_id),
+    CONSTRAINT fk_product_category_product
+        FOREIGN KEY (product_id) REFERENCES product (product_id),
+    CONSTRAINT fk_product_category_category
+        FOREIGN KEY (category_id) REFERENCES category (category_id)
+);</code></pre>
+
+<p>이 설계가 하는 일을 하나씩 짚어 보자. 첫째, 기본 키가 중복된 쌍을 막는다. 같은 상품을 같은 카테고리에 두 번 연결하려 하면 기본 키 위반이다. "한 쌍은 한 번만"이라는 규칙을 별도 제약 없이 키가 표현한다. 둘째, 상품 쪽 외래 키 인덱스는 기본 키가 대신한다. <code>(product_id, category_id)</code>가 <code>product_id</code>로 시작하기 때문이다. 셋째, 카테고리 쪽 외래 키에는 <code>category_id</code>로 시작하는 인덱스가 필요하므로 <code>idx_product_category_category</code>가 있다(선언하지 않았다면 MySQL이 자동으로 만든다).</p>
+
+<p>넷째가 흥미롭다. InnoDB의 인덱스 확장 때문에 <code>(category_id)</code> 보조 인덱스는 내부적으로 <code>(category_id, product_id)</code>처럼 다뤄진다. 따라서 이 테이블에는 같은 쌍들을 서로 반대 순서로 정렬한 B+Tree 두 개가 있는 셈이다. "상품 7이 속한 카테고리들"은 클러스터형 인덱스의 <code>product_id = 7</code> 구간을 읽고, "카테고리 3에 속한 상품들"은 보조 인덱스의 <code>category_id = 3</code> 구간을 읽는다. 뒤의 조회가 <code>SELECT product_id FROM product_category WHERE category_id = 3</code>이라면 필요한 열이 모두 보조 인덱스 항목 안에 있으므로 클러스터형 인덱스를 다시 찾아갈 필요도 없다. 인덱스만으로 답하는 커버링 인덱스(covering index)다. 연결 테이블에는 키 말고 다른 열이 없으므로 두 B+Tree 모두 얇다.</p>
+
+<p>복합 기본 키의 열 순서는 어느 방향의 조회가 더 많은지로 정한다. 왼쪽 접두 규칙 때문에 기본 키의 첫 열 방향 조회는 클러스터형 인덱스로, 반대 방향 조회는 보조 인덱스로 처리된다. 순수한 연결 테이블에서는 두 방향 모두 사실상 커버링이 되므로 순서의 영향이 작지만, 연결 테이블에 열이 하나라도 붙으면 기본 키 방향 조회만 행을 바로 읽을 수 있다는 차이가 생긴다.</p>
+
+<p>같은 테이블을 대리 키로 만들면 어떻게 될까. <code>product_category_id</code>가 클러스터형 인덱스가 되고, 중복 쌍을 막으려면 <code>UNIQUE (product_id, category_id)</code>가 필요하며, 이 UNIQUE 인덱스가 상품 쪽 외래 키 인덱스를 겸하고, 카테고리 쪽 외래 키를 위해 <code>(category_id)</code> 인덱스가 하나 더 생긴다. B+Tree가 둘에서 셋으로 늘고, 대리 키 자체는 어떤 조회에도 쓰이지 않는다. 순수한 연결 테이블에서는 식별 관계가 더 단순하고 더 작다.</p>
+
+<h3>다대다(M:N) 2: 연결 테이블이 엔티티로 자랄 때</h3>
+
+<p>문제는 연결 테이블이 "순수한" 상태로 남지 않는 경우가 많다는 데 있다. 주문과 상품의 다대다 관계를 연결 테이블로 풀었다고 하자. 처음 요구는 "한 주문에 같은 상품은 한 줄"이었으므로 <code>order_product(order_id, product_id)</code>를 기본 키로 삼고 수량 열 하나를 두었다. 그 뒤 요구 사항이 차례로 덧붙는다.</p>
+
+<ol>
+<li><b>같은 쌍이 두 번 생긴다.</b> 같은 상품을 선물 포장 여부만 다르게 두 줄 담을 수 있어야 한다. <code>(order_id, product_id)</code>는 더 이상 유일하지 않으므로 기본 키 정의가 깨진다. 기본 키에 순번 열을 더하든 대리 키로 바꾸든, 기본 키를 다시 정의해야 한다.</li>
+<li><b>관계가 속성과 상태를 갖는다.</b> 주문 당시 가격, 항목별 상태(취소, 반품 요청, 반품 완료)가 붙는다. 연결 테이블은 이제 "주문 항목"이라는 독립된 사건(event) 엔티티다.</li>
+<li><b>다른 테이블이 이 관계를 가리킨다.</b> 리뷰와 반품이 주문 항목 하나를 가리켜야 한다. 복합 기본 키라면 리뷰와 반품은 두세 열짜리 외래 키를 갖고, 그 아래로 다시 키가 자란다.</li>
+</ol>
+
+<p>이런 변화는 드문 예외가 아니다. 연결 테이블이 표현하는 관계가 시간 속에서 일어나는 <b>사건</b>, 곧 구매, 수강 신청, 예약, 대출 같은 것이라면 같은 쌍이 반복되고(재구매, 재수강, 재예약), 사건마다 상태와 시각이 붙고, 사건을 다시 가리키는 테이블이 생긴다. 반대로 관계가 <b>분류나 소속</b>, 곧 상품의 카테고리, 게시글의 태그, 사용자의 역할 같은 것이라면 같은 쌍이 두 번 생길 이유가 없고 관계 자체에 속성도 거의 붙지 않는다.</p>
+
+<p>사건형 연결 테이블은 처음부터 대리 키를 주고 두 부모와 비식별 관계로 만드는 편이 안전하다. 이때 놓치기 쉬운 것이 유일성 규칙의 자리다. 업무 규칙이 같은 쌍의 중복을 금지한다면, 대리 키를 기본 키로 삼은 순간 그 규칙을 표현할 곳이 사라지므로 UNIQUE를 반드시 따로 걸어야 한다. 반대로 규칙이 중복을 허용한다면 UNIQUE를 걸지 않는다. 규칙이 바뀌면 UNIQUE를 추가하거나 지우면 되고, 기본 키와 그것을 참조하는 테이블은 그대로다.</p>
+
+<pre><code class="language-sql">-- 사건형 연결 테이블: 대리 키 + 두 외래 키
+CREATE TABLE order_item (
+    order_item_id  BIGINT   NOT NULL AUTO_INCREMENT,
+    order_id       BIGINT   NOT NULL,
+    product_id     BIGINT   NOT NULL,
+    quantity       INT      NOT NULL,
+    order_price    INT      NOT NULL,
+    gift_wrap      BOOLEAN  NOT NULL,
+    PRIMARY KEY (order_item_id),
+    -- "한 주문에 같은 상품은 한 줄" 규칙이 있다면 아래 줄을 넣는다. 이 요구에서는 넣지 않는다
+    -- UNIQUE KEY uk_order_item (order_id, product_id),
+    CONSTRAINT fk_order_item_order
+        FOREIGN KEY (order_id) REFERENCES orders (order_id),
+    CONSTRAINT fk_order_item_product
+        FOREIGN KEY (product_id) REFERENCES product (product_id)
+);</code></pre>
+
+<p>UNIQUE를 빠뜨렸을 때의 증상은 일대일에서 본 것과 같다. 찜하기 테이블 <code>wish(wish_id, member_id, product_id)</code>를 대리 키로 만들고 UNIQUE를 잊었다면, 사용자가 찜 버튼을 빠르게 두 번 누를 때 같은 쌍이 두 행 생긴다. "찜한 사람 수"가 부풀고, 찜 취소는 한 행만 지워 상품이 여전히 찜된 상태로 남는다. <code>UNIQUE (member_id, product_id)</code>가 있으면 두 번째 삽입은 중복 키 오류가 되고, 애플리케이션은 그 오류를 "이미 찜함"으로 해석하면 된다. 찜하기처럼 순수한 연결 관계라면 처음부터 <code>(member_id, product_id)</code>를 기본 키로 삼는 식별 관계도 좋은 선택이다.</p>
+
+<p>연결 테이블을 설계할 때 물을 질문을 정리하면 네 가지다. 같은 쌍이 두 번 이상 생길 수 있는가. 관계 자체가 속성이나 상태를 갖는가. 다른 테이블이 이 관계 하나를 가리키는가. 이 관계를 API나 URL에 하나의 이름으로 노출해야 하는가. 네 질문 모두에 "아니요"이고 앞으로도 그럴 것이 분명하면 복합 기본 키의 식별 관계가 단순하고 작다. 하나라도 "예"이거나 그렇게 될 가능성이 보이면 대리 키와 비식별 관계, 그리고 규칙이 요구하는 만큼의 UNIQUE로 간다.</p>
+
+<h3>현대적인 설계 트렌드: 비식별 관계와 대리 키를 기본값으로</h3>
+
+<p>지금까지의 비교를 모으면, 요즘 설계에서 비식별 관계와 대리 키를 기본값으로 두고 식별 관계는 이유가 있을 때만 쓰는 까닭이 보인다. 그 이유는 취향이 아니라 몇 가지 구체적인 힘이다.</p>
+
+<p><b>첫째, 변경에 강하다.</b> 대리 키는 의미가 없으므로 바뀔 이유가 없고, 부모가 바뀌거나 소속이 바뀌는 것은 외래 키 한 칸의 수정으로 끝난다. 일대일이 일대다로, 일대다가 다대다로 바뀌는 요구도 UNIQUE 하나를 지우거나 외래 키를 연결 테이블로 옮기는 국지적 변경이 된다. 식별 관계에서는 같은 변경이 기본 키의 재정의가 되고, 그 키를 물려받은 자손 전체로 번진다. 스키마는 애플리케이션 코드보다 오래 살고 고치기 어렵다는 01회의 이야기를 떠올리면, 변경의 범위를 좁혀 주는 설계에 가산점을 주는 것이 합리적이다.</p>
+
+<p><b>둘째, 모든 관계가 같은 모양이다.</b> 기본 키도 한 열, 외래 키도 한 열이므로 조인 조건은 항상 한 줄이고, 열을 빠뜨리는 실수가 생길 자리가 없다. 테이블이 수십 개로 늘어도 "<code>xxx_id</code>로 가리킨다"는 규칙 하나로 모델 전체를 읽을 수 있다. 식별자 발급도 균일하다. 모든 테이블이 <code>AUTO_INCREMENT</code>나 같은 방식의 키 생성기로 번호를 받으므로, 앞에서 본 "부모별 순번을 경쟁 없이 매기는" 문제가 사라진다.</p>
+
+<p><b>셋째, 애플리케이션 코드가 단순하다.</b> JPA에서 복합 기본 키를 쓰려면 Jakarta Persistence 명세 2.4절의 규칙을 따르는 기본 키 클래스가 필요하다. 그 클래스는 public이고 public 기본 생성자가 있어야 하며, 직렬화 가능해야 하고, <code>equals</code>와 <code>hashCode</code>를 정의해야 하며, <code>@EmbeddedId</code>나 <code>@IdClass</code>로 지정한다. 식별 관계라면 부모의 키를 받아 오는 <code>@MapsId</code>도 붙는다. 같은 주문 항목을 두 방식으로 매핑한 코드를 비교해 보자. 같은 패키지에서 함께 컴파일하려고 비식별 쪽 클래스 이름을 <code>OrderLine</code>으로 달리했다.</p>
+
+<pre><code class="language-java">// 식별 관계: 기본 키 클래스 + @EmbeddedId + @MapsId
+@Embeddable
+public class OrderItemId implements Serializable {
+    private Long orderId;   // 부모 키에서 온 부분
+    private Integer lineNo; // 부모 안에서의 순번
+
+    public OrderItemId() {}
+
+    public OrderItemId(Long orderId, Integer lineNo) {
+        this.orderId = orderId;
+        this.lineNo = lineNo;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof OrderItemId other)) return false;
+        return Objects.equals(orderId, other.orderId)
+                && Objects.equals(lineNo, other.lineNo);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(orderId, lineNo);
+    }
+}
+
+@Entity
+@Table(name = "order_item")
+public class OrderItem {
+    @EmbeddedId
+    private OrderItemId id;
+
+    @MapsId("orderId")                 // id.orderId 값을 이 연관관계에서 가져온다
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "order_id")
+    private Order order;
+
+    private int quantity;
+
+    protected OrderItem() {}
+
+    public OrderItem(Order order, int lineNo, int quantity) {
+        this.id = new OrderItemId(null, lineNo); // orderId는 @MapsId가 채운다
+        this.order = order;
+        this.quantity = quantity;
+    }
+}</code></pre>
+
+<pre><code class="language-java">// 비식별 관계: 생성되는 단일 키 + 평범한 @ManyToOne
+@Entity
+@Table(name = "order_line")
+public class OrderLine {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "order_line_id")
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "order_id", nullable = false)
+    private Order order;
+
+    private int quantity;
+
+    protected OrderLine() {}
+}</code></pre>
+
+<p>두 코드 모두 <code>jakarta.persistence-api</code> 3.1과 JDK 21로 컴파일해 확인했다(import 문과 <code>Order</code> 엔티티는 생략). 식별 관계 쪽은 키 클래스 하나와 키 값을 조립하는 코드가 더 들어가고, 계층이 한 단계 깊어질 때마다 부모의 키 클래스를 품은 새 키 클래스가 생긴다. 스프링 데이터 JPA를 함께 쓴다면 하나가 더 있다. 스프링 데이터 JPA 참조 문서에 따르면 <code>save()</code>는 엔티티가 새것이면 <code>persist</code>를, 아니면 <code>merge</code>를 호출하고, 기본 전략은 (non-primitive 버전 속성이 없을 때) 식별자 속성이 <code>null</code>인지로 새것인지 판단한다. 위의 <code>OrderItem</code>처럼 키 객체를 직접 만들어 넣는 엔티티는 식별자가 <code>null</code>이 아니므로 새 엔티티로 판단되지 않고 <code>merge</code> 경로를 탄다. 문서는 기본 전략 대신 쓸 수 있는 방법으로, 엔티티가 <code>Persistable</code>을 구현해 <code>isNew()</code>로 새것 여부를 직접 알려 주는 전략을 안내한다.</p>
+
+<p><b>넷째, 외부에 노출하기 쉽다.</b> 웹 API의 경로와 메시지에서 자원은 하나의 식별자로 가리키는 것이 자연스럽다. 비식별 설계의 댓글은 <code>/comments/1052</code>로 가리킬 수 있지만, 식별 설계의 댓글은 <code>/boards/1/posts/7/comments/3</code>처럼 조상의 키를 모두 실어야 한다. 앞의 방식은 댓글이 다른 글로 옮겨 가도 주소가 바뀌지 않는다.</p>
+
+<h4>그래도 식별 관계가 맞는 곳</h4>
+
+<p>기본값은 기본값일 뿐이다. 다음 경우에는 식별 관계가 더 나은 답일 수 있다. 첫째, 속성 없는 분류형 연결 테이블이다. 상품과 카테고리, 게시글과 태그처럼 같은 쌍이 반복될 이유가 없는 관계에서는 복합 기본 키가 중복을 막고 B+Tree 수도 적다. 둘째, 같은 엔티티를 세로로 나눈 일대일 관계의 공유 기본 키다. 셋째, 자식이 부모의 일부로만 의미가 있고, 시간에 걸쳐 쌓이며, 거의 항상 부모 단위로 읽히는 데이터다. 이때는 InnoDB에서 같은 부모의 자식이 한곳에 모이는 지역성이 실제 이득이 된다. 단, 그 대가로 넓은 키와 중간 삽입을 받아들이는 것이므로 접근 패턴을 확인한 뒤에 고른다.</p>
+
+<p>넷째, 복합 키가 "같은 부모 아래"라는 제약을 외래 키로 표현할 수 있다는 점도 기억해 둘 만하다. 교환 기록이 "같은 주문 안의 두 주문 항목"을 가리켜야 한다고 하자. 주문 항목이 <code>(order_id, line_no)</code>로 식별된다면 교환 테이블이 <code>order_id</code> 열 하나를 두 외래 키가 함께 쓰도록 만들어, 두 항목이 같은 주문에 속한다는 사실을 데이터베이스가 보장하게 할 수 있다.</p>
+
+<pre><code class="language-sql">CREATE TABLE item_exchange (
+    order_id      BIGINT  NOT NULL,
+    exchange_no   INT     NOT NULL,
+    from_line_no  INT     NOT NULL,
+    to_line_no    INT     NOT NULL,
+    PRIMARY KEY (order_id, exchange_no),
+    -- 두 외래 키가 order_id를 공유하므로 두 항목은 반드시 같은 주문에 속한다
+    FOREIGN KEY (order_id, from_line_no) REFERENCES order_item (order_id, line_no),
+    FOREIGN KEY (order_id, to_line_no)   REFERENCES order_item (order_id, line_no)
+);</code></pre>
+
+<p>대리 키 설계라면 교환 테이블이 <code>from_item_id</code>와 <code>to_item_id</code>만 가지므로, 두 항목이 서로 다른 주문에 속하는 행도 외래 키 검사를 통과한다. 대리 키 설계에서 같은 보장을 얻으려면 <code>order_item</code>에 <code>UNIQUE (order_id, order_item_id)</code>를 추가하고 교환 테이블에도 <code>order_id</code>를 두어 복합 외래 키로 그 UNIQUE를 참조하게 하면 된다. InnoDB는 참조되는 쪽에 그 열들이 같은 순서로 맨 앞에 오는 인덱스만 있으면 기본 키가 아닌 열 묶음도 외래 키로 참조할 수 있게 허용한다. 식별 관계의 장점 가운데 일부는 이렇게 대리 키 설계에서도 필요한 곳에만 골라 가져올 수 있다.</p>
+
+<h3>흔한 오해와 함정</h3>
+
+<p><b>오해 1: "식별 관계는 필수 관계, 비식별 관계는 선택 관계다."</b> 두 축을 섞은 것이다. 필수와 선택은 참여도, 곧 외래 키 열의 NULL 허용으로 정해진다. 식별 관계는 기본 키 열이 NULL일 수 없으므로 언제나 필수지만, 비식별 관계도 외래 키를 <code>NOT NULL</code>로 두면 필수다. 실제로 가장 흔한 관계가 필수 비식별 관계다. 이 오해가 위험한 이유는 "자식이 부모 없이 존재하면 안 된다"는 요구를 보고 식별 관계로 가야 한다고 결론 내리게 만들기 때문이다. 그 요구는 <code>NOT NULL</code> 하나로 충분하다.</p>
+
+<p><b>오해 2: "비식별 관계는 외래 키 제약을 걸지 않는 관계다."</b> 식별 여부는 부모 키가 기본 키에 들어가느냐의 문제이고, 외래 키 제약을 선언하느냐는 다른 결정이다. 비식별 관계에도 외래 키 제약을 걸 수 있고, 이 회차의 비식별 예제는 모두 걸었다. 외래 키 제약을 물리적으로 선언할지 말지는 무결성 검사 비용, 데이터 이관 방식 같은 물리 설계의 판단이라 08회에서 다룬다.</p>
+
+<p><b>오해 3: "대리 키를 쓰면 업무 규칙의 유일성은 신경 쓰지 않아도 된다."</b> 반대다. 대리 키는 유일성 규칙을 표현하지 않는다. 식별 관계의 복합 기본 키가 저절로 지키던 규칙(한 쌍은 한 번만, 부모당 하나만)은 대리 키로 바꾸는 순간 UNIQUE 제약으로 옮겨 적어야 한다. 이 회차에서 본 1:1의 중복 상세 행, 찜하기의 중복 행은 모두 이 옮겨 적기를 잊어서 생긴다.</p>
+
+<p><b>오해 4: "복합 키 조인에서 조건 하나를 빠뜨리면 오류가 난다."</b> 나지 않는다. SQL에서 조인 조건은 그냥 조건이라, 빠진 열이 있으면 더 많은 행이 짝지어질 뿐이다. 게시판마다 글 번호를 1부터 세는 설계에서 <code>board_id</code>를 빠뜨리면 다른 게시판의 같은 번호 글이 섞인다. 결과가 틀려도 형식은 멀쩡하므로 테스트 데이터가 한 게시판에만 있으면 발견되지도 않는다.</p>
+
+<p><b>오해 5: "식별 관계는 조인이 적으니 항상 빠르다" 또는 "복합 키는 항상 느리다."</b> 둘 다 조건을 빼먹은 말이다. 식별 관계는 조상 키로 후손을 찾는 조회와 부모 단위로 모아 읽는 조회에서 유리하고, 보조 인덱스 크기와 삽입 위치, 바로 위 부모와의 조인에서 불리하다. InnoDB에서 어느 쪽이 빠른지는 데이터가 쌓이는 순서, 가장 잦은 조회, 버퍼 풀에 들어가는 데이터의 양이 정한다.</p>
+
+<p><b>함정: 자기 참조 관계를 식별 관계로 만들려는 시도.</b> 카테고리의 상위 카테고리처럼 같은 테이블을 가리키는 관계는 식별 관계로 만들 수 없다. 자식의 기본 키에 부모의 기본 키 전체를 넣어야 하는데, 부모도 같은 테이블의 행이라 다시 그 부모의 키를 품고 있어야 하고, 최상위 행은 부모가 없다. 깊이마다 키의 길이가 달라지므로 고정된 열로 표현할 수 없다. 자기 참조는 언제나 비식별 관계이고, 최상위 행이 있으므로 대개 선택 비식별 관계다.</p>
+
+<h3>실전 논리적 모델링 1: 요구 사항에서 관계 목록까지</h3>
+
+<p>이제 이 권에서 쌓은 도구를 모두 써서 하나의 작은 모델을 처음부터 끝까지 논리 모델로 옮겨 보자. 도메인은 작은 온라인 상점이다. 02회에서 한 것처럼 요구 사항 문장에서 출발해 엔티티와 관계를 찾고, 이번 회차에서는 그 개념 모델을 테이블, 키, 외래 키, 제약으로 옮긴다. 요구 사항은 다음과 같다.</p>
+
+<ol>
+<li>회원은 이메일로 가입한다. 이메일은 회원마다 달라야 한다. 이름과 가입 일시를 기록한다.</li>
+<li>회원은 원하면 자기소개와 프로필 이미지 경로를 등록할 수 있다. 이 정보는 회원 정보 화면에서만 쓰인다.</li>
+<li>상품은 이름, 가격, 재고 수량을 가진다. 상품은 하나 이상의 카테고리에 속할 수 있고, 카테고리에는 여러 상품이 있다.</li>
+<li>카테고리는 계층을 이룬다. 최상위 카테고리에는 상위 카테고리가 없다.</li>
+<li>회원은 주문을 여러 번 할 수 있다. 주문에는 주문 일시와 상태가 있다.</li>
+<li>주문에는 상품을 여러 줄 담을 수 있다. 같은 상품을 선물 포장 여부만 다르게 두 줄 담을 수도 있다. 줄마다 수량과 주문 당시 가격을 기록한다.</li>
+<li>주문마다 배송 정보(받는 사람, 주소, 배송 상태)가 결제 후에 하나 만들어진다.</li>
+<li>회원은 구매한 주문 항목마다 리뷰를 하나까지 쓸 수 있다. 리뷰에는 평점과 내용, 작성 일시가 있다.</li>
+</ol>
+
+<p>문장에서 엔티티를 고르면 회원, 회원 상세, 상품, 카테고리, 주문, 주문 항목, 배송, 리뷰다. 회원 상세는 요구 2에서 나온다. 회원의 속성으로 둘 수도 있지만, 선택적이고 길며 한 화면에서만 쓰인다는 점에서 세로로 떼어 낼 후보다. 주문 항목은 요구 6에서 나오는 주문과 상품 사이의 다대다 관계를 풀어낸 것이고, 수량과 주문 당시 가격을 가지며 요구 8에서 리뷰의 대상이 되므로 처음부터 엔티티로 다룬다. 다음으로 관계마다 04회와 05회의 도구로 카디널리티와 참여도를 정한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>관계</th><th>카디널리티</th><th>참여도(자식 쪽 / 부모 쪽)</th><th>근거가 된 요구</th></tr></thead><tbody>
+<tr><td>회원 — 회원 상세</td><td>1 : 1</td><td>상세는 반드시 회원이 있다 / 회원은 상세가 없어도 된다</td><td>2</td></tr>
+<tr><td>회원 — 주문</td><td>1 : N</td><td>주문은 반드시 회원이 있다 / 회원은 주문이 없어도 된다</td><td>5</td></tr>
+<tr><td>주문 — 주문 항목</td><td>1 : N</td><td>항목은 반드시 주문이 있다 / 주문은 항목이 하나 이상</td><td>6</td></tr>
+<tr><td>상품 — 주문 항목</td><td>1 : N</td><td>항목은 반드시 상품이 있다 / 상품은 주문되지 않아도 된다</td><td>6</td></tr>
+<tr><td>주문 — 배송</td><td>1 : 1</td><td>배송은 반드시 주문이 있다 / 결제 전 주문은 배송이 없다</td><td>7</td></tr>
+<tr><td>주문 항목 — 리뷰</td><td>1 : 1</td><td>리뷰는 반드시 주문 항목이 있다 / 항목은 리뷰가 없어도 된다</td><td>8</td></tr>
+<tr><td>상품 — 카테고리</td><td>M : N</td><td>상품은 카테고리가 하나 이상 / 카테고리는 상품이 없어도 된다</td><td>3</td></tr>
+<tr><td>카테고리 — 카테고리(상위)</td><td>1 : N</td><td>최상위는 상위가 없다 / 하위가 없어도 된다</td><td>4</td></tr>
+</tbody></table></div>
+
+<p>논리 모델로 옮기는 순서는 다음 흐름을 따른다. 순서가 중요한 이유는 뒤 단계의 결정이 앞 단계의 결과에 기대기 때문이다. 외래 키는 부모의 기본 키를 복사하는 것이므로 기본 키가 먼저 정해져야 하고, 식별 여부는 외래 키의 위치가 정해진 다음에야 물을 수 있다.</p>
+
+<figure class="flow-figure"><figcaption>개념 모델을 논리 모델로 옮기는 순서</figcaption><ol class="flow">
+<li><strong>엔티티를 테이블로</strong><span>엔티티마다 테이블 하나. 이름은 소문자와 밑줄로 쓰고, <code>ORDER</code>처럼 예약어와 겹치면 <code>orders</code>로 피한다.</span></li>
+<li><strong>기본 키 정하기</strong><span>기본값은 <code>BIGINT AUTO_INCREMENT</code> 대리 키. 이메일 같은 자연 키는 UNIQUE로 남긴다(03회).</span></li>
+<li><strong>외래 키 위치 정하기</strong><span>1:N은 N 쪽, 1:1은 나중에 생기거나 선택적인 쪽, M:N은 연결 테이블(04·05회).</span></li>
+<li><strong>식별 여부 정하기</strong><span>자식이 부모의 일부인가, 독립된 사물인가. 연결 테이블은 분류형인가 사건형인가.</span></li>
+<li><strong>NULL과 UNIQUE 정하기</strong><span>자식 쪽 필수 참여는 <code>NOT NULL</code>, 1:1은 외래 키에 UNIQUE, 업무 규칙의 유일성은 UNIQUE.</span></li>
+<li><strong>제약으로 표현 못 하는 규칙 적어 두기</strong><span>"주문에는 항목이 하나 이상"처럼 부모 쪽 필수 참여는 외래 키로 강제할 수 없으므로 애플리케이션의 책임으로 기록한다.</span></li>
+</ol></figure>
+
+<h3>실전 논리적 모델링 2: 관계마다 결정하고 ERD로 그리기</h3>
+
+<p>앞의 흐름대로 관계 하나하나를 결정한다. 이 표가 이 실습의 본체다. 각 행의 "근거"가 이 회차에서 비교한 내용 가운데 어느 것에 기대는지 확인하며 읽자.</p>
+
+<div class="table-wrap"><table><thead><tr><th>관계</th><th>외래 키</th><th>선택</th><th>근거</th></tr></thead><tbody>
+<tr><td>회원 — 회원 상세</td><td><code>member_detail.member_id</code></td><td>식별(공유 기본 키)</td><td>회원을 세로로 나눈 조각. 생명 주기가 같고, 다른 회원으로 옮겨 가거나 1:N이 될 이유가 없다.</td></tr>
+<tr><td>회원 — 주문</td><td><code>orders.member_id NOT NULL</code></td><td>필수 비식별</td><td>주문은 배송, 주문 항목이 가리키는 독립된 사물이고, 주문 번호는 고객에게 노출된다.</td></tr>
+<tr><td>주문 — 주문 항목</td><td><code>order_item.order_id NOT NULL</code></td><td>필수 비식별</td><td>사건형 연결 테이블. 같은 상품 두 줄이 허용되고, 리뷰가 항목 하나를 가리킨다.</td></tr>
+<tr><td>상품 — 주문 항목</td><td><code>order_item.product_id NOT NULL</code></td><td>필수 비식별</td><td>위와 같다. 주문 당시 가격을 항목에 따로 기록한다.</td></tr>
+<tr><td>주문 — 배송</td><td><code>delivery.order_id NOT NULL UNIQUE</code></td><td>필수 비식별 + UNIQUE</td><td>배송은 독자적인 상태 흐름을 갖고, 분할 배송 요구가 생기면 UNIQUE만 풀면 된다.</td></tr>
+<tr><td>주문 항목 — 리뷰</td><td><code>review.order_item_id NOT NULL UNIQUE</code></td><td>필수 비식별 + UNIQUE</td><td>"항목당 리뷰 하나"는 UNIQUE가, "구매한 항목에만"은 <code>NOT NULL</code> 외래 키가 지킨다.</td></tr>
+<tr><td>상품 — 카테고리</td><td><code>product_category</code>의 두 열</td><td>식별(복합 기본 키) 두 개</td><td>분류형 연결 테이블. 속성이 없고, 같은 쌍이 두 번 생길 이유가 없다.</td></tr>
+<tr><td>카테고리 — 상위 카테고리</td><td><code>category.parent_id NULL</code></td><td>선택 비식별</td><td>자기 참조는 식별 관계가 될 수 없고, 최상위 카테고리는 상위가 없다.</td></tr>
+</tbody></table></div>
+
+<p>이 결정을 텍스트 ERD로 그린다. 실선(<code>───</code>)은 식별 관계, 점선(<code>┄┄┄</code>)은 비식별 관계이고, 줄 끝의 괄호는 카디널리티와 참여도다. <code>NN</code>은 <code>NOT NULL</code>, <code>UQ</code>는 UNIQUE를 뜻한다.</p>
+
+<pre class="diagram">member  [PK member_id, UQ email]
+ ├──────── member_detail   [PK,FK member_id]                        (1 : 0..1)
+ └┄┄┄┄┄┄┄┄ orders          [PK order_id, FK member_id NN]           (1 : 0..N)
+             ├┄┄┄┄┄┄┄┄ order_item  [PK order_item_id,
+             │                      FK order_id NN, FK product_id NN] (1 : 1..N)
+             │           └┄┄┄┄┄┄┄┄ review  [PK review_id,
+             │                              FK order_item_id NN UQ]   (1 : 0..1)
+             └┄┄┄┄┄┄┄┄ delivery    [PK delivery_id, FK order_id NN UQ] (1 : 0..1)
+
+product [PK product_id]
+ ├┄┄┄┄┄┄┄┄ order_item                                               (1 : 0..N)
+ └──────── product_category [PK,FK product_id, PK,FK category_id]   (1 : 1..N)
+                 │
+category [PK category_id, FK parent_id NULL]
+ ├───────────────┘  (category 1 : 0..N product_category)
+ └┄┄┄┄┄┄┄┄ category (자기 참조, 상위 → 하위)                         (1 : 0..N)</pre>
+
+<p>ERD를 DDL로 옮기면 다음과 같다. 자료형과 길이는 08회에서 저장 크기와 함께 다시 따질 것이므로 여기서는 잠정적인 값이다. 테이블은 부모가 먼저 만들어지도록 순서를 맞췄다. 외래 키는 이미 존재하는 테이블만 참조할 수 있기 때문이다.</p>
+
+<pre><code class="language-sql">CREATE TABLE member (
+    member_id  BIGINT        NOT NULL AUTO_INCREMENT,
+    email      VARCHAR(255)  NOT NULL,
+    name       VARCHAR(50)   NOT NULL,
+    joined_at  DATETIME      NOT NULL,
+    PRIMARY KEY (member_id),
+    UNIQUE KEY uk_member_email (email)
+);
+
+CREATE TABLE member_detail (
+    member_id     BIGINT         NOT NULL,      -- 기본 키이자 외래 키(공유 기본 키)
+    introduction  VARCHAR(1000)  NULL,
+    image_path    VARCHAR(500)   NULL,
+    PRIMARY KEY (member_id),
+    CONSTRAINT fk_member_detail_member
+        FOREIGN KEY (member_id) REFERENCES member (member_id)
+);
+
+CREATE TABLE category (
+    category_id  BIGINT       NOT NULL AUTO_INCREMENT,
+    parent_id    BIGINT       NULL,             -- 선택 비식별(자기 참조)
+    name         VARCHAR(50)  NOT NULL,
+    PRIMARY KEY (category_id),
+    CONSTRAINT fk_category_parent
+        FOREIGN KEY (parent_id) REFERENCES category (category_id)
+);
+
+CREATE TABLE product (
+    product_id      BIGINT        NOT NULL AUTO_INCREMENT,
+    name            VARCHAR(100)  NOT NULL,
+    price           INT           NOT NULL,
+    stock_quantity  INT           NOT NULL,
+    PRIMARY KEY (product_id)
+);
+
+CREATE TABLE product_category (
+    product_id   BIGINT  NOT NULL,
+    category_id  BIGINT  NOT NULL,
+    PRIMARY KEY (product_id, category_id),      -- 식별 관계 두 개
+    KEY idx_product_category_category (category_id),
+    CONSTRAINT fk_product_category_product
+        FOREIGN KEY (product_id) REFERENCES product (product_id),
+    CONSTRAINT fk_product_category_category
+        FOREIGN KEY (category_id) REFERENCES category (category_id)
+);
+
+CREATE TABLE orders (
+    order_id    BIGINT       NOT NULL AUTO_INCREMENT,
+    member_id   BIGINT       NOT NULL,          -- 필수 비식별
+    ordered_at  DATETIME     NOT NULL,
+    status      VARCHAR(20)  NOT NULL,
+    PRIMARY KEY (order_id),
+    CONSTRAINT fk_orders_member
+        FOREIGN KEY (member_id) REFERENCES member (member_id)
+);
+
+CREATE TABLE order_item (
+    order_item_id  BIGINT   NOT NULL AUTO_INCREMENT,
+    order_id       BIGINT   NOT NULL,
+    product_id     BIGINT   NOT NULL,
+    quantity       INT      NOT NULL,
+    order_price    INT      NOT NULL,           -- 주문 당시 가격
+    gift_wrap      BOOLEAN  NOT NULL,
+    PRIMARY KEY (order_item_id),
+    CONSTRAINT fk_order_item_order
+        FOREIGN KEY (order_id) REFERENCES orders (order_id),
+    CONSTRAINT fk_order_item_product
+        FOREIGN KEY (product_id) REFERENCES product (product_id)
+);
+
+CREATE TABLE delivery (
+    delivery_id  BIGINT        NOT NULL AUTO_INCREMENT,
+    order_id     BIGINT        NOT NULL,
+    receiver     VARCHAR(50)   NOT NULL,
+    address      VARCHAR(255)  NOT NULL,
+    status       VARCHAR(20)   NOT NULL,
+    PRIMARY KEY (delivery_id),
+    UNIQUE KEY uk_delivery_order (order_id),    -- 1:1을 지키는 제약
+    CONSTRAINT fk_delivery_order
+        FOREIGN KEY (order_id) REFERENCES orders (order_id)
+);
+
+CREATE TABLE review (
+    review_id      BIGINT         NOT NULL AUTO_INCREMENT,
+    order_item_id  BIGINT         NOT NULL,
+    rating         TINYINT        NOT NULL,
+    content        VARCHAR(2000)  NOT NULL,
+    created_at     DATETIME       NOT NULL,
+    PRIMARY KEY (review_id),
+    UNIQUE KEY uk_review_order_item (order_item_id),  -- 항목당 리뷰 하나
+    CONSTRAINT fk_review_order_item
+        FOREIGN KEY (order_item_id) REFERENCES order_item (order_item_id)
+);</code></pre>
+
+<p>마지막으로 거꾸로 검증한다. 요구 사항 문장 하나하나가 모델의 어디에 새겨졌는지 대응시켜 보는 것이다. 어떤 규칙이 어디에도 대응하지 않는다면 그 규칙은 모델에서 사라진 것이고, 누군가 애플리케이션 코드로 지켜야 한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>요구 사항의 규칙</th><th>새겨진 곳</th></tr></thead><tbody>
+<tr><td>이메일은 회원마다 달라야 한다</td><td><code>uk_member_email</code></td></tr>
+<tr><td>회원 상세는 회원당 최대 하나</td><td><code>member_detail</code>의 기본 키(공유 기본 키)</td></tr>
+<tr><td>주문은 반드시 회원의 것</td><td><code>orders.member_id NOT NULL</code> + <code>fk_orders_member</code></td></tr>
+<tr><td>같은 상품을 한 주문에 두 줄 담을 수 있다</td><td><code>order_item</code>에 <code>(order_id, product_id)</code> UNIQUE를 두지 않음</td></tr>
+<tr><td>배송은 주문당 하나</td><td><code>uk_delivery_order</code></td></tr>
+<tr><td>리뷰는 구매한 항목에만, 항목당 하나</td><td><code>review.order_item_id NOT NULL</code> + 외래 키, <code>uk_review_order_item</code></td></tr>
+<tr><td>상품-카테고리 연결은 중복되지 않는다</td><td><code>product_category</code>의 복합 기본 키</td></tr>
+<tr><td>주문에는 항목이 하나 이상</td><td>제약으로 표현 불가: 주문 생성 트랜잭션에서 애플리케이션이 보장</td></tr>
+<tr><td>상품은 카테고리가 하나 이상</td><td>제약으로 표현 불가: 상품 등록 로직에서 애플리케이션이 보장</td></tr>
+<tr><td>리뷰 작성자는 그 항목을 구매한 회원</td><td>모델이 경로(<code>review</code> → <code>order_item</code> → <code>orders.member_id</code>)로 표현. 작성자를 따로 저장하지 않으므로 어긋날 수 없다</td></tr>
+</tbody></table></div>
+
+<p>마지막 행은 짚고 넘어갈 만하다. 리뷰 테이블에 <code>member_id</code>를 두지 않았으므로 "회원 42의 리뷰 목록"을 구하려면 <code>review</code>, <code>order_item</code>, <code>orders</code> 세 테이블을 조인해야 한다. 대신 리뷰 작성자와 구매자가 어긋나는 데이터는 원천적으로 생길 수 없다. 이 조회가 자주 실행되어 조인 비용이 문제가 되면 <code>review</code>에 <code>member_id</code>를 복사해 두는 반정규화를 검토할 수 있는데, 그때는 두 값이 어긋나지 않도록 지키는 책임도 함께 떠안는다. 이 균형은 07회의 정규화와 08회의 물리 설계에서 다시 다룬다.</p>
+
+<x-visual id="db-design1-06-practice-erd" title="실습: 온라인 상점의 논리 ERD" kind="ERD" ratio="16:9">
+<x-hint>실습에서 완성한 아홉 개 테이블의 논리 ERD. 식별 관계는 실선, 비식별 관계는 점선으로 그리고, 공유 기본 키와 복합 기본 키, UNIQUE 외래 키가 어디에 있는지 보여 준다.</x-hint>
+<x-prompt>Crow's foot ERD on a white background with nine table boxes, each box showing the table name in a header and key columns with "PK", "FK", "UQ" tags. Layout: top-left "member" (PK member_id, UQ email); to its right "member_detail" (PK,FK member_id) connected by a SOLID line, one-to-zero-or-one. Below member: "orders" (PK order_id, FK member_id) connected by a DASHED line, one-to-many. Right of orders: "delivery" (PK delivery_id, FK order_id UQ) DASHED, one-to-zero-or-one. Below orders: "order_item" (PK order_item_id, FK order_id, FK product_id) DASHED, one-to-many. Right of order_item: "review" (PK review_id, FK order_item_id UQ) DASHED, one-to-zero-or-one. Bottom-left: "product" (PK product_id) DASHED to order_item one-to-many, and SOLID to "product_category" (PK,FK product_id; PK,FK category_id). Bottom-right: "category" (PK category_id, FK parent_id) SOLID to product_category one-to-many, and a DASHED self-loop on category. Legend box in a corner with Korean text exactly: "실선 = 식별 관계", "점선 = 비식별 관계". Flat style, two colors, no 3D.</x-prompt>
+<x-caption>실습에서 완성한 논리 ERD. 식별 관계는 회원 상세의 공유 기본 키와 상품-카테고리 연결 테이블 두 곳뿐이고, 나머지는 대리 키와 비식별 관계다.</x-caption>
+</x-visual>
+
+<h3>정리: 관계 하나를 옮길 때 묻는 순서</h3>
+
+<p>이 회차에서 본 판단을 질문의 순서로 압축하면 다음과 같다. 외래 키의 위치가 정해졌다는 전제에서 시작한다.</p>
+
+<figure class="flow-figure"><figcaption>식별 관계와 비식별 관계를 고르는 질문</figcaption><ol class="flow">
+<li><strong>자기 참조인가?</strong><span>그렇다면 비식별 관계뿐이다. 최상위 행이 있으면 선택 비식별.</span></li>
+<li><strong>순수한 분류형 연결 테이블인가?</strong><span>같은 쌍이 반복되지 않고, 속성도 없고, 아무도 이 관계를 가리키지 않는다면 복합 기본 키의 식별 관계.</span></li>
+<li><strong>같은 엔티티를 세로로 나눈 1:1인가?</strong><span>생명 주기가 같고 1:N이 될 이유가 없다면 공유 기본 키의 식별 관계.</span></li>
+<li><strong>부모 단위로 모아 읽는 지역성이 결정적인가?</strong><span>시간에 걸쳐 쌓이고 거의 항상 부모 단위로 읽으며 부모가 바뀌지 않는다면 식별 관계를 검토한다. 넓은 키와 중간 삽입을 감수하는지 확인한다.</span></li>
+<li><strong>그 밖의 모든 경우</strong><span>대리 키 + 비식별 관계. 참여도로 <code>NOT NULL</code>을 정하고, 식별 관계가 지켜 주던 유일성은 UNIQUE로 옮겨 적는다.</span></li>
+</ol></figure>
+
+<p>식별 관계와 비식별 관계의 선택은 "부모의 키를 자식의 이름에 넣을 것인가"라는 하나의 질문이고, 그 답은 저장 엔진의 물리 구조와 요구 사항의 변화 가능성 사이에서 정해진다. 논리 모델링은 이것으로 끝난다. 다음 07회는 이렇게 만든 테이블 안의 열들이 서로 어떤 종속 관계를 갖는지, 곧 함수 종속성과 정규화로 모델을 다시 검증한다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>식별 관계</dt><dd>부모의 기본 키가 자식의 기본 키의 일부 또는 전부가 되는 관계. 자식은 부모 없이 식별될 수 없고, 기본 키 열은 NULL일 수 없으므로 언제나 필수 관계다. ERD에서는 실선으로 그린다.</dd>
+<dt>비식별 관계</dt><dd>부모의 기본 키가 자식의 일반 열(외래 키)로만 들어가는 관계. 외래 키가 <code>NOT NULL</code>이면 필수, NULL을 허용하면 선택 비식별 관계다. ERD에서는 점선으로 그린다.</dd>
+<dt>키의 전파</dt><dd>식별 관계가 이어지면 자식은 부모의 키 전체를 물려받아 단계마다 기본 키 열이 늘고, 부모 키 변경이나 소속 변경이 자손 전체의 기본 키 변경으로 번진다.</dd>
+<dt>조회의 차이</dt><dd>식별 관계는 조상의 키로 후손을 찾는 조회에서 조인을 없애 주지만, 바로 위 부모와의 조인 조건이 길어지고 열 하나를 빠뜨려도 오류 없이 틀린 결과가 나온다.</dd>
+<dt>InnoDB에서의 차이</dt><dd>복합 기본 키는 같은 부모의 자식을 클러스터형 인덱스에 연속 저장해 부모 단위 조회를 빠르게 하고 외래 키 인덱스를 겸하지만, 모든 보조 인덱스를 넓히고 새 행을 인덱스 중간에 넣는다.</dd>
+<dt>일대일의 두 형태</dt><dd>공유 기본 키(식별)는 기본 키가 1:1을 지키고, 외래 키 + UNIQUE(비식별)는 UNIQUE가 1:1을 지킨다. UNIQUE를 빠뜨리면 오류 없이 1:N이 된다.</dd>
+<dt>연결 테이블의 두 형태</dt><dd>분류형 연결 테이블은 복합 기본 키의 식별 관계가 단순하고 작다. 같은 쌍이 반복되거나 상태를 갖거나 다른 테이블이 가리키는 사건형 연결 테이블은 대리 키와 비식별 관계, 필요한 만큼의 UNIQUE로 만든다.</dd>
+<dt>현대적인 기본값</dt><dd>변경에 강하고, 모든 관계가 한 열로 균일하며, ORM 매핑과 API 노출이 단순하기 때문에 대리 키와 비식별 관계를 기본으로 두고, 식별 관계는 이유가 분명한 곳에만 쓴다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 이 판단이 문제가 되는 순간은 대개 설계할 때가 아니라 몇 년 뒤 요구 사항이 바뀔 때다. "글을 다른 게시판으로 옮기기", "분할 배송", "재수강 허용" 같은 기능 요청이 들어왔을 때, 비식별 관계로 만든 모델에서는 외래 키 한 칸의 수정이나 UNIQUE 하나의 제거로 끝나는 일이, 식별 관계로 만든 모델에서는 기본 키 재정의와 자손 테이블 전체의 데이터 이관이 된다. 이관 중에는 기본 키가 바뀐 행이 클러스터형 인덱스에서 자리를 옮기고 보조 인덱스가 모두 갱신되므로, 큰 테이블이라면 작업 시간과 잠금 범위를 따로 계획해야 한다. 식별 관계를 고를 때는 "이 부모와 자식의 관계가 이 시스템의 수명 동안 바뀌지 않는다"는 가정에 서명하는 것이라고 생각하면 판단이 신중해진다.</p>
+<p>반대로 식별 관계를 피하느라 놓치는 것도 있다. 대리 키로 바꾸면서 유일성 규칙을 UNIQUE로 옮겨 적지 않아 중복 데이터가 쌓이는 장애가 가장 흔하다. 일대일 테이블의 중복 행, 찜하기나 팔로우 같은 연결 테이블의 중복 행은 대개 버튼을 두 번 누르거나 재시도 로직이 요청을 두 번 보낼 때 생기고, 발견되었을 때는 어느 행이 진짜인지 가려내는 데이터 정리가 필요하다. 테이블을 대리 키로 만들 때마다 "이 테이블에서 겹치면 안 되는 값의 조합은 무엇인가"를 묻고 그 답을 UNIQUE로 적는 습관이 이 장애를 막는다.</p>
+<p>성능 관점의 판단은 데이터가 쌓이는 방식과 조회 패턴에 달려 있다. 댓글, 이력, 측정값처럼 시간에 걸쳐 쌓이고 부모 단위로 읽히는 대용량 테이블에서 "부모별 목록" 조회가 느리다면, 복합 기본 키로 같은 부모의 행을 모으는 설계가 InnoDB에서 실제 이득을 줄 수 있다. 다만 그 결정은 실행 계획과 버퍼 풀 적중률을 본 뒤에, 넓어지는 보조 인덱스와 중간 삽입의 비용을 함께 계산해서 내린다. 커버링 인덱스나 반정규화처럼 기본 키 구조를 건드리지 않고 같은 효과를 얻는 길이 있는지도 먼저 살핀다. 이 도구들은 08회와 09회의 물리 설계에서 이어진다.</p>
+</x-review>
+
+<x-practice>
+<li>다음 네 테이블에서 부모와의 관계가 식별 관계인지, 필수 비식별인지, 선택 비식별인지 판정하고, 카디널리티(1:1 또는 1:N)도 말하라. (A) <code>coupon_use(coupon_id BIGINT NOT NULL, used_at DATETIME NOT NULL, PRIMARY KEY (coupon_id), FOREIGN KEY (coupon_id) REFERENCES coupon (coupon_id))</code> (B) <code>attachment(attachment_id BIGINT NOT NULL, post_id BIGINT NULL, PRIMARY KEY (attachment_id), FOREIGN KEY (post_id) REFERENCES post (post_id))</code> (C) <code>seat(theater_id INT NOT NULL, seat_no INT NOT NULL, PRIMARY KEY (theater_id, seat_no), FOREIGN KEY (theater_id) REFERENCES theater (theater_id))</code> (D) <code>profile(profile_id BIGINT NOT NULL, member_id BIGINT NOT NULL, PRIMARY KEY (profile_id), UNIQUE (member_id), FOREIGN KEY (member_id) REFERENCES member (member_id))</code></li>
+<li>식별 관계로 만든 <code>post_comment(board_id, post_no, comment_no)</code>와 <code>comment_like(board_id, post_no, comment_no, member_id)</code>에 다음 데이터가 있다. 댓글 <code>(1, 3, 2)</code>에 회원 10, 11의 좋아요, 댓글 <code>(2, 3, 2)</code>에 회원 10, 12, 13의 좋아요, 댓글 <code>(1, 4, 2)</code>에 회원 11의 좋아요. 다음 쿼리의 결과를 예측하고, 올바른 결과와 다른 이유를 설명하라. <code>SELECT COUNT(*) FROM post_comment c JOIN comment_like l ON l.board_id = c.board_id AND l.comment_no = c.comment_no WHERE c.board_id = 1 AND c.post_no = 3 AND c.comment_no = 2</code></li>
+<li>식별 관계 계층(게시판 → 글 → 댓글 → 좋아요)에서 1번 게시판의 7번 글을 2번 게시판으로 옮긴다. 2번 게시판에는 이미 7번 글이 있다. 옮길 글에는 댓글이 4개 있고, 각 댓글의 좋아요는 3, 0, 5, 1개다. 기본 키 값이 바뀌어야 하는 행은 모두 몇 개인가? 같은 계층을 비식별 관계와 대리 키로 만들었다면 몇 개인가? 2번 게시판에 7번 글이 이미 있다는 사실은 식별 설계에서 어떤 추가 문제를 만드는가?</li>
+<li>수강 신청 테이블이 <code>enrollment(member_id, course_id)</code>를 기본 키로 하는 식별 관계로 만들어져 있다. 새 요구 사항은 두 가지다. 같은 회원이 같은 강의를 다시 신청할 수 있어야 하고(재수강), 수강 신청 한 건마다 수료증(<code>certificate</code>)이 최대 하나 발급된다. 두 테이블의 DDL을 다시 설계하고, 각 요구가 어느 제약에 새겨졌는지 설명하라.</li>
+<li>InnoDB에서 <code>product_category</code>를 (가) <code>PRIMARY KEY (product_id, category_id)</code>와 두 외래 키로 만든 경우와 (나) <code>product_category_id</code> 대리 키, <code>UNIQUE (product_id, category_id)</code>, 두 외래 키로 만든 경우에 대해, 각각 몇 개의 B+Tree가 생기는지와 각 B+Tree의 항목이 실제로 담는 열을 적어라. 그리고 <code>SELECT product_id FROM product_category WHERE category_id = 3</code>을 두 설계가 어떤 인덱스로 처리할 수 있는지 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> (A)는 외래 키 <code>coupon_id</code>가 곧 기본 키이므로 식별 관계이고, 쿠폰 하나에 사용 기록이 최대 하나인 1:1(공유 기본 키)이다. (B)는 <code>post_id</code>가 기본 키 밖에 있고 NULL을 허용하므로 선택 비식별 관계, UNIQUE가 없으니 1:N이다. 글에 붙지 않은 첨부 파일(임시 업로드 같은)이 존재할 수 있다는 뜻이다. (C)는 <code>theater_id</code>가 기본 키의 첫 열이므로 식별 관계이고, 극장 하나에 좌석이 여럿인 1:N이다. <code>seat_no</code>는 극장 안에서만 유일한 부분 식별자다. (D)는 <code>member_id</code>가 기본 키 밖의 <code>NOT NULL</code> 외래 키이므로 필수 비식별 관계이고, UNIQUE가 있으므로 1:1이다. UNIQUE가 없었다면 같은 DDL이 1:N이 된다.</p>
+<p><b>2번.</b> 결과는 3이다. <code>c</code>는 <code>(1, 3, 2)</code> 한 행으로 좁혀지고, 조인 조건은 "<code>board_id</code>가 1이고 <code>comment_no</code>가 2"뿐이라 <code>post_no</code>를 확인하지 않는다. 그래서 <code>(1, 3, 2)</code>의 좋아요 2개(회원 10, 11)와 <code>(1, 4, 2)</code>의 좋아요 1개(회원 11)가 모두 짝지어진다. <code>(2, 3, 2)</code>의 좋아요는 <code>board_id</code>가 달라 제외된다. 올바른 결과는 2이고, <code>AND l.post_no = c.post_no</code>를 더해야 한다. 복합 키 조인에서 열 하나를 빠뜨리면 오류 없이 결과가 부풀고, 글 번호와 댓글 번호를 부모마다 1부터 세는 설계에서는 그런 우연한 일치가 흔하다.</p>
+<p><b>3번.</b> 식별 설계에서는 글 1행, 댓글 4행, 좋아요 3 + 0 + 5 + 1 = 9행, 모두 14행의 기본 키가 바뀐다. 각 행은 InnoDB 클러스터형 인덱스에서 새 위치로 옮겨 가고, 그 행들을 가리키는 보조 인덱스 항목도 모두 고쳐진다. 비식별 설계에서는 <code>post.board_id</code> 한 칸을 고치는 1행이다. 2번 게시판에 이미 7번 글이 있으므로 식별 설계에서는 <code>(2, 7)</code>을 쓸 수 없고, 2번 게시판의 새 글 번호를 경쟁 없이 발급받아야 한다. 또 글 번호가 바뀌면 사용자에게 노출된 글 주소(예: 게시판과 글 번호로 만든 URL)도 바뀐다.</p>
+<p><b>4번.</b> 재수강을 허용하면 <code>(member_id, course_id)</code>는 더 이상 유일하지 않으므로 기본 키가 될 수 없다. 수강 신청은 사건형 연결 테이블이므로 대리 키로 바꾼다. <code>enrollment(enrollment_id BIGINT AUTO_INCREMENT PRIMARY KEY, member_id BIGINT NOT NULL, course_id BIGINT NOT NULL, enrolled_at DATETIME NOT NULL, 두 외래 키)</code>로 만들고, 재수강을 허용하므로 <code>(member_id, course_id)</code>에는 UNIQUE를 걸지 않는다(일반 인덱스는 조회용으로 둘 수 있다). 수료증은 <code>certificate(certificate_id BIGINT AUTO_INCREMENT PRIMARY KEY, enrollment_id BIGINT NOT NULL, issued_at DATETIME NOT NULL, UNIQUE (enrollment_id), FOREIGN KEY (enrollment_id) REFERENCES enrollment (enrollment_id))</code>로 만든다. "신청 한 건마다 최대 하나"는 UNIQUE가, "신청 없이 수료증 없음"은 <code>NOT NULL</code> 외래 키가 지킨다. 수료증을 <code>enrollment_id</code>를 기본 키로 하는 공유 기본 키로 만들어도 규칙은 지켜지지만, 수료증 재발급 이력 같은 요구가 생기면 1:N으로 바뀔 여지가 있으므로 비식별 쪽이 안전하다. 원래 설계를 유지하려면 <code>(member_id, course_id, attempt_no)</code>처럼 기본 키에 회차를 넣는 방법도 있으나, 회차 번호를 경쟁 없이 매기는 문제와 수료증이 세 열짜리 외래 키를 가져야 하는 문제가 따라온다.</p>
+<p><b>5번.</b> (가)는 B+Tree 두 개다. 클러스터형 인덱스는 <code>(product_id, category_id)</code> 순서이고, 카테고리 외래 키를 위한 <code>(category_id)</code> 보조 인덱스는 기본 키가 덧붙어 <code>(category_id, product_id)</code>를 담는다. 상품 외래 키는 기본 키의 접두가 대신한다. (나)는 세 개다. 클러스터형 인덱스 <code>(product_category_id)</code>와 행 전체, UNIQUE 인덱스 <code>(product_id, category_id)</code>와 덧붙은 <code>product_category_id</code>(상품 외래 키 인덱스를 겸함), 자동 생성되는 <code>(category_id)</code> 인덱스와 덧붙은 <code>product_category_id</code>다. 주어진 조회를 (가)는 <code>(category_id)</code> 보조 인덱스만 읽고 답한다. 항목에 <code>product_id</code>가 들어 있기 때문이다. (나)의 <code>(category_id)</code> 인덱스 항목에는 <code>product_category_id</code>만 붙어 있어서 <code>product_id</code>를 얻으려면 항목마다 클러스터형 인덱스를 다시 찾아가야 한다. 순수 연결 테이블에서 대리 키는 B+Tree 하나와 재검색을 더할 뿐 어떤 조회에도 쓰이지 않는다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>다음 중 식별 관계와 비식별 관계에 대한 설명으로 옳은 것은?</q>
+<o>식별 관계는 필수 관계를, 비식별 관계는 선택 관계를 뜻한다.</o>
+<o>비식별 관계에서도 외래 키 열을 NOT NULL로 두면 자식은 부모 없이 존재할 수 없다.</o>
+<o>비식별 관계는 외래 키 제약을 선언하지 않는 관계를 말한다.</o>
+<o>식별 관계의 외래 키 열은 NULL을 허용하도록 만들 수 있다.</o>
+<why>필수와 선택은 외래 키의 NULL 허용으로 정해지는 참여도의 문제이고, 식별 여부는 부모 키가 자식의 기본 키에 들어가느냐의 문제다. 비식별 관계도 NOT NULL 외래 키로 필수가 될 수 있다. 식별 관계는 외래 키가 기본 키의 일부라서 NULL일 수 없으므로 마지막 보기는 틀렸고, 외래 키 제약의 선언 여부는 식별 여부와 무관하다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>여러 글에 댓글이 오랜 기간에 걸쳐 고르게 달리는 서비스가 있다. InnoDB에서 댓글 테이블을 (가) 기본 키 <code>(board_id, post_no, comment_no)</code>로, (나) 기본 키 <code>comment_id</code>와 <code>post_id</code> 보조 인덱스로 만들었다. "한 글의 댓글을 내용과 함께 모두 읽는" 조회에서 (가)가 읽는 페이지가 적은 주된 이유는?</q>
+<o>복합 기본 키는 B+Tree의 높이를 낮추기 때문이다.</o>
+<o>식별 관계에서는 외래 키 검사가 생략되기 때문이다.</o>
+<o>같은 글의 댓글 행이 클러스터형 인덱스의 연속된 리프에 저장되어, 보조 인덱스를 거쳐 행마다 다시 찾아가는 과정이 필요 없기 때문이다.</o>
+<o>복합 기본 키는 보조 인덱스 항목을 더 작게 만들기 때문이다.</o>
+<why>InnoDB는 행을 기본 키 순서로 클러스터형 인덱스에 저장하므로 (가)에서는 같은 글의 댓글이 작성 시점과 상관없이 나란히 놓인다. (나)는 보조 인덱스에서 comment_id 목록을 얻은 뒤 흩어진 리프 페이지를 하나씩 찾아가야 한다. 복합 기본 키는 오히려 보조 인덱스 항목을 넓히고, 외래 키 검사는 조회가 아니라 쓰기 때 일어난다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>member_detail(member_detail_id PK, member_id BIGINT NOT NULL, FOREIGN KEY (member_id) REFERENCES member (member_id))</code>로 일대일 관계를 만들고 UNIQUE를 걸지 않았다. 같은 회원으로 두 번째 상세 행을 넣으면 MySQL InnoDB에서 무슨 일이 일어나는가?</q>
+<o>오류 없이 들어가고, 관계는 사실상 일대다로 동작한다.</o>
+<o>외래 키 제약 위반으로 거부된다.</o>
+<o>외래 키 때문에 자동으로 만들어진 인덱스가 UNIQUE라서 중복 키 오류가 난다.</o>
+<o>기본 키가 대리 키이므로 member_id 값이 NULL로 바뀌어 들어간다.</o>
+<why>외래 키 제약은 가리키는 부모 행이 있는지만 검사하고, 몇 개의 자식이 같은 부모를 가리키는지는 검사하지 않는다. 외래 키를 위해 자동으로 만들어지는 인덱스도 일반 인덱스다. 비식별 일대일에서 1:1을 지키는 것은 외래 키 열의 UNIQUE 제약뿐이다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>enrollment(member_id, course_id)</code>를 기본 키로 하는 수강 신청 테이블에 "같은 회원이 같은 강의를 다시 신청할 수 있다"는 요구가 추가되었다. 가장 적절한 변경은?</q>
+<o>기본 키는 그대로 두고 애플리케이션의 중복 검사만 끈다.</o>
+<o><code>(member_id, course_id)</code>에 UNIQUE 제약을 추가한다.</o>
+<o>두 외래 키 제약을 제거한다.</o>
+<o>대리 키를 기본 키로 두고, 두 외래 키는 유지하며, <code>(member_id, course_id)</code>에는 UNIQUE를 걸지 않는다.</o>
+<why>기본 키 <code>(member_id, course_id)</code>가 있는 한 같은 쌍의 두 번째 행은 데이터베이스가 거부하므로 애플리케이션 검사를 꺼도 소용없고, UNIQUE를 추가하는 것은 같은 제약을 하나 더 거는 것이다. 외래 키 제거는 무결성만 잃는다. 수강 신청은 반복될 수 있는 사건이므로 대리 키로 식별하고, 중복을 허용하는 규칙에 맞게 UNIQUE를 두지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>InnoDB에서 <code>product_category(product_id, category_id)</code>를 복합 기본 키로 만들고 <code>category_id</code>에 외래 키를 걸었다. <code>SELECT product_id FROM product_category WHERE category_id = 3</code>은 어떻게 처리될 수 있는가?</q>
+<o>기본 키의 첫 열이 product_id이므로 테이블 전체를 읽어야 한다.</o>
+<o>외래 키 때문에 존재하는 category_id 보조 인덱스의 항목에 기본 키 열(product_id)이 함께 들어 있으므로, 그 인덱스만 읽고 답할 수 있다.</o>
+<o>조회할 때마다 클러스터형 인덱스를 category_id 순서로 다시 정렬한다.</o>
+<o>다대다 연결 테이블에서는 역방향 조회에 인덱스를 쓸 수 없다.</o>
+<why>MySQL은 참조하는 쪽 테이블에 외래 키 열로 시작하는 인덱스를 요구하고 없으면 만든다. InnoDB는 보조 인덱스 뒤에 기본 키 열을 덧붙이므로 (category_id) 인덱스는 사실상 (category_id, product_id)이고, 조회에 필요한 열이 모두 들어 있어 클러스터형 인덱스를 찾아갈 필요가 없다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>식별 관계(identifying relationship)</dt><dd>부모의 기본 키가 자식의 기본 키의 일부 또는 전부가 되는 관계. 자식은 부모를 통해서만 식별된다.</dd>
+<dt>비식별 관계(non-identifying relationship)</dt><dd>부모의 기본 키가 자식의 기본 키 밖의 일반 열(외래 키)로 들어가는 관계. 외래 키의 NULL 허용 여부에 따라 필수 또는 선택이 된다.</dd>
+<dt>존재 의존(existence dependency)</dt><dd>자식이 부모 없이 존재할 수 없는 성질. 외래 키 열의 NOT NULL로 표현되며 식별 관계와 필수 비식별 관계 모두 이 성질을 가진다.</dd>
+<dt>약한 엔티티(weak entity)</dt><dd>자기 속성만으로는 식별되지 않고 소유 엔티티의 식별자와 자기의 부분 식별자를 합쳐야 식별되는 엔티티. 테이블로 옮기면 식별 관계가 된다.</dd>
+<dt>부분 식별자(partial key)</dt><dd>약한 엔티티 안에서 같은 소유자 아래에서만 유일한 속성. 주문 안의 순번, 극장 안의 좌석 번호 같은 것.</dd>
+<dt>공유 기본 키(shared primary key)</dt><dd>일대일 관계에서 자식의 기본 키가 부모의 기본 키와 같은 값이자 외래 키인 형태. JPA에서는 <code>@MapsId</code>로 매핑한다.</dd>
+<dt>연결 테이블(associative table)</dt><dd>다대다 관계를 두 일대다 관계로 풀기 위해 두 부모의 키를 외래 키로 갖는 테이블. 복합 기본 키(식별)나 대리 키(비식별)로 만든다.</dd>
+<dt>인덱스 확장(index extension)</dt><dd>InnoDB가 보조 인덱스 뒤에 기본 키 열을 자동으로 덧붙이는 동작. 옵티마이저는 <code>optimizer_switch</code>의 <code>use_index_extensions</code>(기본 활성)로 이를 활용한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/workbench/en/wb-relationship-tools.html">MySQL Workbench Manual — The Relationship Tools</a> — 식별 관계의 정의와 실선·점선 표기, 관계 도구의 종류</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-table-foreign-keys.html">MySQL 8.0 Reference Manual — FOREIGN KEY Constraints</a> — 외래 키 인덱스 요구와 자동 생성, 참조 동작(CASCADE, NO ACTION)</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-index-types.html">MySQL 8.0 Reference Manual — Clustered and Secondary Indexes</a> — 기본 키와 클러스터형 인덱스, 보조 인덱스가 기본 키 열을 담는 구조</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/index-extensions.html">MySQL 8.0 Reference Manual — Use of Index Extensions</a> — 보조 인덱스에 기본 키 열이 덧붙는 동작</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-physical-structure.html">MySQL 8.0 Reference Manual — The Physical Structure of an InnoDB Index</a> — 페이지의 1/16 여유 공간과 삽입 순서에 따른 페이지 채움률, 16KB 페이지</li>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html">Jakarta Persistence 3.1 Specification</a> — 2.4절 복합 기본 키 클래스 규칙, 2.4.1절 파생 식별자와 MapsId</li>
+</x-refs>

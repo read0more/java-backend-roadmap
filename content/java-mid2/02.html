@@ -1,0 +1,867 @@
+<x-meta>
+deck: 타입 매개변수에 상한을 두면 무엇이 달라지는지에서 출발해 제네릭 메서드의 추론, 와일드카드의 공변·반공변, 타입 소거와 브리지 메서드까지 컴파일 오류 문구와 바이트코드로 확인한다.
+minutes: 100
+</x-meta>
+
+<x-goals>
+<li>경계 없는 <code>T</code>로는 <code>Object</code>의 메서드만 호출할 수 있는 이유를 JLS 4.4의 규칙으로 설명하고, <code>T extends Shape</code>가 클래스 내부와 사용 지점에서 각각 무엇을 바꾸는지 말할 수 있다.</li>
+<li>제네릭 메서드 호출에서 컴파일러가 타입 인자를 추론하는 과정을 인자와 대입 대상에서 나오는 제약으로 추적하고, 추론 실패 오류 문구를 읽을 수 있다.</li>
+<li><code>List<Rect></code>가 <code>List<Shape></code>의 하위 타입이 아닌 이유를 반례로 보이고, <code>? extends</code>와 <code>? super</code>로 선언한 변수에서 읽기와 쓰기가 어디까지 허용되는지 판정할 수 있다.</li>
+<li>주어진 제네릭 선언의 소거 결과(필드와 메서드의 디스크립터)와 컴파일러가 <code>checkcast</code>를 넣는 위치를 손으로 적고 <code>javap</code> 출력과 맞춰 볼 수 있다.</li>
+<li>브리지 메서드가 생기는 조건과 하는 일을 설명하고, 로 타입 때문에 생긴 힙 오염이 어느 줄에서 <code>ClassCastException</code>으로 드러나는지 예측할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>타입 변수에 대해 컴파일러가 아는 것</h3>
+<p>앞 회차에서 제네릭 타입을 만들었다. 클래스 이름 뒤에 <code><T></code>를 붙여 타입 매개변수(type parameter)를 선언하고, 쓰는 쪽에서 <code>ArrayList<String></code>처럼 타입 인자(type argument)를 넣는다. 그러면 컴파일러가 넣는 값의 타입을 검사하고, 꺼내는 자리에 필요한 캐스트를 대신 넣어 준다. 여기까지는 제네릭 타입을 <b>바깥에서</b> 쓰는 사람의 이야기였다.</p>
+<p>이 회차는 방향을 바꿔 제네릭 타입을 <b>안에서</b> 만드는 사람의 자리에 선다. 클래스 본문에서 <code>T</code> 타입의 변수를 손에 쥐었을 때 그것으로 무엇을 할 수 있는가. <code>T</code>가 무엇이 될지는 쓰는 사람이 정하므로, 본문을 컴파일하는 시점의 컴파일러는 <code>T</code>에 대해 아는 것이 거의 없다. 아는 것이 없으면 허용할 수 있는 연산도 없다. 제네릭을 조금만 깊이 쓰려고 하면 곧바로 이 벽에 부딪힌다.</p>
+<p>이 회차에서 다루는 네 가지는 모두 이 벽과 관련이 있다. <b>타입 매개변수 제한</b>은 컴파일러에게 <code>T</code>에 대한 지식을 더 주는 방법이다. <b>제네릭 메서드</b>는 타입 매개변수를 클래스가 아니라 메서드 하나에 붙여 호출할 때마다 타입 인자를 정하게 한다. <b>와일드카드</b>는 반대로 "타입 인자가 무엇인지 모른다"는 사실을 타입으로 적는 방법이다. 마지막으로 <b>타입 소거</b>는 컴파일러가 이 모든 검사를 끝낸 뒤 클래스 파일에 무엇을 남기고 무엇을 지우는지에 대한 규칙이다.</p>
+<p>용어를 먼저 맞춰 둔다. 이 회차에서는 다음 다섯 단어를 구분해서 쓴다.</p>
+<div class="table-wrap"><table><thead><tr><th>용어</th><th>예</th><th>뜻</th></tr></thead><tbody>
+<tr><td>제네릭 타입(generic type)</td><td><code>class Holder<T></code></td><td>타입 매개변수를 선언한 클래스나 인터페이스</td></tr>
+<tr><td>타입 변수(type variable)</td><td><code>T</code></td><td>선언 안에서 타입 자리에 쓰는 이름. 타입 매개변수로 선언된다</td></tr>
+<tr><td>타입 인자(type argument)</td><td><code>Rect</code></td><td>사용하는 쪽에서 타입 변수 자리에 넣는 타입</td></tr>
+<tr><td>매개변수화 타입(parameterized type)</td><td><code>Holder<Rect></code></td><td>제네릭 타입에 타입 인자를 넣어 만든 타입</td></tr>
+<tr><td>로 타입(raw type)</td><td><code>Holder</code></td><td>타입 인자 없이 쓴 제네릭 타입의 이름</td></tr>
+</tbody></table></div>
+<p>예제는 처음부터 끝까지 도형 세 개를 쓴다. 넓이를 계산할 수 있는 추상 클래스 <code>Shape</code>와, 그 하위 클래스인 사각형 <code>Rect</code>, 삼각형 <code>Tri</code>다. 실행 결과가 정수로 떨어지도록 넓이는 <code>int</code>로 계산한다. <code>Rect</code>에만 <code>width()</code> 메서드가 하나 더 있다는 점을 기억해 두자. 반환된 객체가 정말 <code>Rect</code> 타입으로 다뤄지는지 확인할 때 쓴다.</p>
+<pre><code class="language-java">abstract class Shape {
+    abstract int area();
+    String name() { return getClass().getSimpleName(); }
+}
+
+class Rect extends Shape {
+    private final int w, h;
+    Rect(int w, int h) { this.w = w; this.h = h; }
+    int area() { return w * h; }
+    int width() { return w; }          // Rect에만 있는 메서드
+}
+
+class Tri extends Shape {
+    private final int base, height;
+    Tri(int base, int height) { this.base = base; this.height = height; }
+    int area() { return base * height / 2; }
+}</code></pre>
+
+<h3>출발점: 타입마다 만든 클래스와 다형성 시도</h3>
+<p>만들려는 것은 도형 하나를 담아 두는 보관함이다. 요구 사항은 세 가지다. 도형을 넣을 수 있고(<code>put</code>), 담긴 도형의 넓이를 알려 주고(<code>areaOf</code>), 다른 도형을 받아 담긴 도형과 비교한 뒤 넓이가 더 큰 쪽을 돌려준다(<code>larger</code>). 뒤의 두 메서드가 중요하다. <code>areaOf</code>는 담긴 객체의 메서드를 호출해야 하고, <code>larger</code>는 담긴 것과 같은 타입의 객체를 돌려줘야 한다.</p>
+<h4>타입마다 클래스를 만든다</h4>
+<p>가장 단순한 방법은 사각형용 보관함과 삼각형용 보관함을 따로 만드는 것이다.</p>
+<pre><code class="language-java">class RectHolder {
+    private Rect item;
+    void put(Rect item) { this.item = item; }
+    int areaOf() { return item.area(); }
+    Rect larger(Rect other) { return item.area() >= other.area() ? item : other; }
+}
+// TriHolder는 위 코드에서 Rect를 Tri로 바꾼 것과 같다.</code></pre>
+<p>이 방식은 타입에 관해서는 흠이 없다. <code>RectHolder</code>에 삼각형을 넣으려 하면 컴파일 오류가 나고, <code>larger</code>가 돌려준 값은 캐스트 없이 <code>Rect</code> 변수에 담긴다. 문제는 두 클래스의 본문이 타입 이름만 빼고 글자 하나까지 같다는 것이다. 도형이 열 종류가 되면 같은 코드를 열 번 복사해야 하고, 비교 규칙을 바꾸려면 열 군데를 고쳐야 한다.</p>
+<h4>다형성으로 하나로 합친다</h4>
+<p>두 타입에는 공통 상위 타입 <code>Shape</code>가 있고, 보관함이 쓰는 메서드 <code>area()</code>는 <code>Shape</code>에 선언되어 있다. 그러면 <code>Rect</code> 자리에 <code>Shape</code>를 적은 클래스 하나로 충분해 보인다.</p>
+<pre><code class="language-java">class ShapeHolder {
+    private Shape item;
+    void put(Shape item) { this.item = item; }
+    int areaOf() { return item.area(); }
+    Shape larger(Shape other) { return item.area() >= other.area() ? item : other; }
+}</code></pre>
+<p>코드는 한 벌로 줄었다. 대신 타입에 관한 약속 두 가지가 사라졌다. 사각형 전용으로 쓰려던 보관함을 다음과 같이 사용해 보자.</p>
+<pre><code class="language-java">ShapeHolder rectHolder = new ShapeHolder();
+rectHolder.put(new Rect(4, 5));
+rectHolder.put(new Tri(6, 4));                      // ① 사각형 보관함에 삼각형이 들어간다
+Rect r = rectHolder.larger(new Rect(2, 3));         // ② 컴파일 오류</code></pre>
+<p>①은 아무 경고 없이 컴파일된다. <code>put</code>의 매개변수 타입이 <code>Shape</code>이고 <code>Tri</code>는 <code>Shape</code>이기 때문이다. 변수 이름을 <code>rectHolder</code>라고 지은 것은 사람끼리의 약속일 뿐 컴파일러는 알지 못한다. ②는 반대 방향의 문제다. <code>larger</code>의 반환 타입이 <code>Shape</code>이므로 컴파일러는 <code>incompatible types: Shape cannot be converted to Rect</code>라는 오류를 낸다. 호출하는 사람은 사각형이 돌아올 것이라고 믿지만 그 믿음을 타입으로 적을 방법이 없다.</p>
+<p>②를 통과하려면 다운캐스트를 직접 적어야 한다. 그리고 그 캐스트는 ① 때문에 실패한다.</p>
+<pre><code class="language-java">Rect r = (Rect) rectHolder.larger(new Rect(2, 3));  // 컴파일은 된다
+System.out.println(r.width());</code></pre>
+<pre data-label="실행 결과 (OpenJDK 21)"><code class="language-text">Exception in thread "main" java.lang.ClassCastException: class Tri cannot be cast to class Rect (Tri and Rect are in unnamed module of loader 'app')</code></pre>
+<p>한 줄씩 따라가 보자. 두 번째 <code>put</code>이 <code>item</code>을 넓이 12인 삼각형으로 바꿔 놓았다. <code>larger</code>는 12와 인자의 넓이 6을 비교해 <code>item</code>, 곧 삼각형을 돌려준다. 캐스트 연산은 실행 시점에 객체의 실제 클래스를 확인하므로 <code>Tri</code>를 <code>Rect</code>로 바꾸려는 순간 예외가 난다. 잘못은 삼각형을 넣은 줄에서 일어났는데, 프로그램은 꺼내는 줄에서 죽는다.</p>
+<div class="table-wrap"><table><thead><tr><th>방식</th><th>코드 재사용</th><th>잘못된 타입을 넣을 때</th><th>꺼낸 값의 타입</th></tr></thead><tbody>
+<tr><td>타입마다 클래스</td><td>없음. 타입 수만큼 복사</td><td>컴파일 오류</td><td>정확한 타입. 캐스트 불필요</td></tr>
+<tr><td>상위 타입으로 통일</td><td>있음</td><td>통과. 실행 중에야 드러남</td><td><code>Shape</code>. 다운캐스트 필요</td></tr>
+</tbody></table></div>
+<p>원하는 것은 첫 줄의 타입 안전성과 둘째 줄의 재사용을 함께 얻는 것이다. 앞 회차에서 배운 대로라면 답은 제네릭이다.</p>
+
+<h3>제네릭을 도입했는데 컴파일되지 않는다</h3>
+<p><code>Shape</code> 자리를 타입 매개변수 <code>T</code>로 바꾼다.</p>
+<pre><code class="language-java">class Holder<T> {
+    private T item;
+    void put(T item) { this.item = item; }
+    int areaOf() { return item.area(); }
+    T larger(T other) { return item.area() >= other.area() ? item : other; }
+}</code></pre>
+<pre data-label="javac 출력 (세 군데 가운데 첫 번째)"><code class="language-text">Holder.java:4: error: cannot find symbol
+    int areaOf() { return item.area(); }
+                              ^
+  symbol:   method area()
+  location: variable item of type T
+  where T is a type-variable:
+    T extends Object declared in class Holder</code></pre>
+<p>오류 문구의 마지막 줄이 원인을 말해 준다. 컴파일러는 <code>T</code>를 <code>T extends Object</code>로 보고 있다. JLS 4.4는 타입 매개변수로 선언된 모든 타입 변수에 경계(bound)가 있고, 경계를 적지 않으면 <code>Object</code>로 간주한다고 정한다. 그리고 타입 변수의 멤버는 그 경계 타입의 멤버다. 따라서 경계가 <code>Object</code>인 <code>T</code> 타입의 변수로 호출할 수 있는 메서드는 <code>toString()</code>, <code>equals()</code>, <code>hashCode()</code>, <code>getClass()</code>처럼 <code>Object</code>에 선언된 것뿐이다. <code>area()</code>는 거기에 없다.</p>
+<p>컴파일러가 이렇게 엄격한 데에는 이유가 있다. <code>Holder<T></code>의 본문은 타입 인자가 정해지기 전에, 선언된 자리에서 한 번만 검사된다. 그 검사는 앞으로 누가 어떤 타입 인자를 넣더라도 성립해야 한다. <code>Holder<Rect></code>라면 <code>item.area()</code>가 말이 되지만 <code>Holder<String></code>이나 <code>Holder<Integer></code>에서는 말이 되지 않는다. 그리고 지금의 선언은 그런 사용을 막지 않는다.</p>
+<pre><code class="language-java">Holder<Integer> h = new Holder<>();   // 경계 없는 Holder<T>라면 허용된다
+h.put(10);                            // "도형 보관함"에 정수가 들어간다</code></pre>
+<p>그래서 이 실패에는 두 얼굴이 있다. 클래스 안에서는 <code>T</code>의 메서드를 부를 수 없고, 클래스 밖에서는 도형이 아닌 타입을 타입 인자로 넣을 수 있다. 둘은 같은 원인에서 나온다. 선언이 <code>T</code>에 대해 아무것도 약속하지 않았기 때문에, 컴파일러는 안쪽에서는 아무것도 믿을 수 없고 바깥쪽에서는 아무것도 막을 수 없다.</p>
+<aside class="note">경계 없는 <code>T</code>가 쓸모없다는 뜻은 아니다. 담아 두었다가 돌려주기만 하는 컨테이너는 원소의 메서드를 부를 일이 없으므로 <code>Object</code>의 멤버만으로 충분하다. <code>ArrayList<E></code>가 그런 경우다. 경계가 필요해지는 것은 제네릭 코드가 원소에게 일을 시켜야 할 때다.</aside>
+
+<h3>타입 매개변수 제한: 상한 경계</h3>
+<p>부족한 것은 "<code>T</code>는 도형이다"라는 약속 하나다. 타입 매개변수 선언에 <code>extends</code>를 붙여 그 약속을 적는다. 이것을 상한 경계(upper bound)라고 하고, 경계가 붙은 타입 매개변수를 한정된 타입 매개변수(bounded type parameter)라고 한다.</p>
+<pre><code class="language-java">class Holder<T extends Shape> {
+    private T item;
+    void put(T item) { this.item = item; }
+    int areaOf() { return item.area(); }
+    T larger(T other) { return item.area() >= other.area() ? item : other; }
+}</code></pre>
+<p>본문은 한 글자도 바뀌지 않았고 선언부의 <code>extends Shape</code>만 추가되었다. 이제 컴파일된다. 사용하는 코드와 결과는 다음과 같다.</p>
+<pre><code class="language-java">public class Main {
+    public static void main(String[] args) {
+        Holder<Rect> rectHolder = new Holder<>();
+        rectHolder.put(new Rect(4, 5));
+        System.out.println(rectHolder.areaOf());
+        Rect r = rectHolder.larger(new Rect(2, 3));   // 캐스트 없이 Rect
+        System.out.println(r.width());
+
+        Holder<Tri> triHolder = new Holder<>();
+        triHolder.put(new Tri(6, 4));
+        Tri t = triHolder.larger(new Tri(10, 4));
+        System.out.println(t.name() + " " + t.area());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">20
+4
+Tri 20</code></pre>
+<p>첫 줄은 4×5 사각형의 넓이다. 둘째 줄에서 <code>larger</code>는 넓이 20과 6을 비교해 담겨 있던 사각형을 돌려주고, 그 반환값에 곧바로 <code>width()</code>를 호출할 수 있다. 셋째 줄에서는 담긴 삼각형(넓이 12)보다 인자로 준 삼각형(넓이 20)이 크므로 인자가 돌아온다.</p>
+<p>경계 하나가 세 가지를 바꿨다.</p>
+<ol>
+<li><b>클래스 안쪽.</b> <code>T</code>의 경계가 <code>Shape</code>가 되었으므로 <code>T</code> 타입 변수의 멤버는 <code>Shape</code>의 멤버다. <code>item.area()</code>와 <code>item.name()</code>을 호출할 수 있다. <code>Rect</code>에만 있는 <code>width()</code>는 여전히 호출할 수 없다. <code>T</code>가 <code>Tri</code>일 수도 있기 때문이다.</li>
+<li><b>클래스 바깥쪽.</b> 타입 인자는 경계의 하위 타입이어야 한다. <code>Holder<Rect></code>, <code>Holder<Tri></code>, 그리고 경계 자신인 <code>Holder<Shape></code>는 되고 <code>Holder<Integer></code>는 안 된다.</li>
+<li><b>타입 인자별 검사는 그대로.</b> <code>Holder<Rect></code>의 <code>put</code>은 <code>Rect</code>만 받고 <code>larger</code>는 <code>Rect</code>를 돌려준다. 다형성 버전이 잃었던 두 약속이 돌아왔다.</li>
+</ol>
+<pre><code class="language-java">Holder<Integer> h1 = new Holder<>();   // 오류 ①
+Holder<Rect> h2 = new Holder<>();
+h2.put(new Tri(6, 4));                 // 오류 ②</code></pre>
+<pre data-label="javac 출력 (요약)"><code class="language-text">error: type argument Integer is not within bounds of type-variable T
+error: incompatible types: Tri cannot be converted to Rect</code></pre>
+<p>문법에서 두 가지를 짚어 둔다. 첫째, 경계에 쓰는 키워드는 경계가 클래스든 인터페이스든 <code>extends</code>다. <code>T extends Comparable<T></code>처럼 인터페이스를 경계로 둘 때도 <code>implements</code>라고 쓰지 않는다. 여기서 <code>extends</code>는 "하위 타입이다"라는 뜻으로 읽으면 된다. 둘째, 경계는 여러 개를 <code>&</code>로 이어 적을 수 있다. <code>T extends Shape & Comparable<T></code>는 "도형이면서 자기 자신과 비교할 수 있는 타입"이다. JLS 4.4는 클래스 타입이나 타입 변수는 첫 자리에만 올 수 있다고 정한다. 그러니 클래스가 있으면 맨 앞에 적고 인터페이스를 뒤에 잇는다. 경계가 여러 개일 때 <code>T</code>의 멤버는 그 타입들을 모두 합친 교차 타입(intersection type)의 멤버다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>지원 자격을 적은 채용 공고</strong><p>경계 없는 <code>T</code>는 "누구나 지원 가능"이라고 적힌 공고와 같다. 누가 올지 모르니 맡길 수 있는 일은 누구나 할 수 있는 일뿐이다. "운전면허 소지자"라고 자격을 적으면 지원자는 줄어들지만, 뽑힌 사람에게 운전을 맡길 수 있다. 경계는 받아들이는 타입을 좁히는 대가로 그 타입에게 시킬 수 있는 일을 넓힌다. 비유가 맞지 않는 지점도 있다. 공고의 자격 심사는 지원할 때마다 하지만, 제네릭 클래스의 본문 검사는 선언 시점에 한 번만 하고 타입 인자가 경계 안에 있는지만 사용할 때마다 확인한다.</p></aside>
+<h4>경계는 클래스 파일에 어떻게 남는가</h4>
+<p>여기서 한 층 내려가 보자. <code>javap -p -s -c Holder</code>로 클래스 파일을 열면 <code>T</code>라는 이름은 타입 자리에서 사라지고 그 자리에 <code>Shape</code>가 들어가 있다.</p>
+<pre data-label="javap -p -s -c Holder (경계가 Shape일 때, 발췌)"><code class="language-text">class Holder<T extends Shape> {
+  private T item;
+    descriptor: LShape;
+
+  void put(T);
+    descriptor: (LShape;)V
+
+  int areaOf();
+    descriptor: ()I
+    Code:
+       0: aload_0
+       1: getfield      #7                  // Field item:LShape;
+       4: invokevirtual #13                 // Method Shape.area:()I
+       7: ireturn
+
+  T larger(T);
+    descriptor: (LShape;)LShape;
+}</code></pre>
+<p><code>descriptor</code>는 JVM이 필드와 메서드의 타입을 식별하는 데 쓰는 문자열이다. 필드 <code>item</code>의 디스크립터는 <code>LShape;</code>, 곧 <code>Shape</code> 타입의 참조다. <code>areaOf</code>의 본문은 <code>Shape.area</code>를 <code>invokevirtual</code>로 호출한다. 경계가 없던 버전을 같은 방법으로 열면 같은 자리에 <code>Ljava/lang/Object;</code>가 적혀 있다. 컴파일러가 타입 변수를 그 경계로 바꿔서 클래스 파일을 만든다는 뜻이다. 이것이 뒤에서 다룰 타입 소거의 한 조각이다.</p>
+<p>사용하는 쪽의 바이트코드도 본다. <code>Rect r = rectHolder.larger(new Rect(2, 3));</code> 한 줄은 다음 명령으로 번역된다.</p>
+<pre data-label="javap -c Main (발췌)"><code class="language-text">      41: invokevirtual #35                 // Method Holder.larger:(LShape;)LShape;
+      44: checkcast     #10                 // class Rect
+      47: astore_2</code></pre>
+<p><code>larger</code>가 돌려주는 값의 타입은 클래스 파일 수준에서는 <code>Shape</code>다. 그것을 <code>Rect</code> 변수에 넣기 위해 컴파일러가 <code>checkcast Rect</code>를 끼워 넣었다. 다형성 버전에서 사람이 손으로 적던 <code>(Rect)</code>와 같은 명령이다. 차이는 누가 적었느냐와 실패할 수 있느냐에 있다. 손으로 적은 캐스트는 누군가 삼각형을 넣어 두었으면 실패한다. 컴파일러가 넣은 캐스트는, 컴파일러가 이 보관함에 <code>Rect</code>만 들어가도록 모든 <code>put</code> 호출을 검사해 두었기 때문에 실패하지 않는다. 이 보장이 깨지는 예외적인 길은 뒤에서 로 타입과 힙 오염을 다룰 때 본다.</p>
+<pre class="diagram">소스 (컴파일러가 검사하는 것)             클래스 파일 (JVM이 실행하는 것)
+───────────────────────────────────      ───────────────────────────────────────────
+class Holder<T extends Shape> {          class Holder {
+    private T item;                          Shape item;                 // LShape;
+    void put(T item)                         void  put(Shape)            // (LShape;)V
+    T larger(T other)                        Shape larger(Shape)         // (LShape;)LShape;
+}                                        }
+
+Holder<Rect> h = new Holder<>();         new Holder
+h.put(new Rect(4, 5));                   invokevirtual Holder.put:(LShape;)V
+Rect r = h.larger(new Rect(2, 3));       invokevirtual Holder.larger:(LShape;)LShape;
+                                         checkcast Rect               ← 컴파일러가 삽입</pre>
+
+<x-visual id="java-mid2-02-bound-to-classfile" title="상한 경계가 있는 제네릭 클래스의 소스와 클래스 파일 비교" kind="비교 다이어그램" ratio="16:9">
+<x-hint>소스에서는 T로 적힌 자리가 클래스 파일에서는 경계 타입 Shape로 바뀌고, 사용 지점에는 컴파일러가 checkcast를 넣는다는 대응을 좌우로 나란히 보여 준다.</x-hint>
+<x-prompt>흰 배경의 깔끔한 기술 다이어그램. 화면을 좌우 두 칸으로 나눈다. 왼쪽 칸 제목 "소스: 컴파일러가 검사", 오른쪽 칸 제목 "클래스 파일: JVM이 실행". 왼쪽 칸 위쪽에 둥근 상자 하나가 있고 안에 세 줄: "class Holder&lt;T extends Shape&gt;", "T item", "T larger(T other)". 오른쪽 칸 위쪽에 같은 크기의 둥근 상자가 있고 안에 세 줄: "class Holder", "Shape item", "Shape larger(Shape)". 왼쪽 상자의 글자 T 세 개를 주황색으로 칠하고, 각 T에서 오른쪽 상자의 대응하는 Shape로 가는 얇은 주황 화살표를 그린다. 화살표 묶음 위에 라벨 "타입 변수를 경계로 바꾼다". 왼쪽 칸 아래쪽에 코드 한 줄 상자 "Rect r = h.larger(new Rect(2, 3));". 오른쪽 칸 아래쪽에 세로로 쌓인 작은 상자 두 개: "invokevirtual Holder.larger" 와 "checkcast Rect". "checkcast Rect" 상자만 파란색 테두리로 강조하고 옆에 말풍선 "컴파일러가 삽입". 왼쪽 아래 코드 상자에서 오른쪽 아래 두 상자로 회색 화살표. 색은 주황과 파랑 두 가지만 쓰고 선은 얇게.</x-prompt>
+<x-caption>타입 변수는 클래스 파일에서 경계 타입으로 바뀌고, 정확한 타입이 필요한 사용 지점에는 캐스트가 들어간다.</x-caption>
+</x-visual>
+
+<h3>제네릭 메서드</h3>
+<p>지금까지는 타입 매개변수를 클래스에 선언했다. 타입 매개변수는 메서드 하나에만 선언할 수도 있다. JLS 8.4.4는 타입 변수를 하나 이상 선언한 메서드를 제네릭 메서드(generic method)라고 정의한다. 타입 매개변수 목록은 반환 타입 <b>앞</b>에 적는다.</p>
+<pre><code class="language-java">class ShapeUtil {
+    static <T> T first(T a, T b) { return a; }
+
+    static <T extends Shape> T larger(T a, T b) {
+        return a.area() >= b.area() ? a : b;
+    }
+}</code></pre>
+<p><code>static <T> T first(T a, T b)</code>를 왼쪽부터 읽으면 이렇다. <code><T></code>는 "이 메서드는 타입 매개변수 <code>T</code>를 선언한다"는 뜻이고, 그 뒤의 <code>T</code>는 반환 타입이며, 괄호 안의 두 <code>T</code>는 매개변수 타입이다. 선언과 사용이 같은 글자라서 처음에는 헷갈리지만, 꺾쇠 안에 있는 것만 선언이다. <code>larger</code>처럼 제네릭 메서드의 타입 매개변수에도 경계를 둘 수 있고, 효과는 클래스에서와 같다.</p>
+<p>제네릭 타입과 제네릭 메서드는 타입 인자가 정해지는 시점이 다르다. 제네릭 타입의 타입 인자는 <code>Holder<Rect></code>라고 타입을 적는 순간 정해지고, 그 변수로 하는 모든 호출에 똑같이 적용된다. 제네릭 메서드의 타입 인자는 <b>호출할 때마다</b> 따로 정해진다. 같은 <code>larger</code>를 한 번은 <code>T = Rect</code>로, 다음 줄에서는 <code>T = Tri</code>로 호출할 수 있다.</p>
+<h4>명시적 타입 인자와 타입 추론</h4>
+<p>호출할 때 타입 인자를 직접 적으려면 메서드 이름 바로 앞에 꺾쇠를 둔다. 대부분은 적지 않아도 된다. JLS 8.4.4의 표현대로 타입 인자는 추론될 수 있는 경우가 많기 때문이다. 컴파일러가 인자의 타입과 결과를 받는 쪽의 타입을 보고 타입 인자를 정하는 것을 타입 추론(type inference)이라고 하며, 규칙은 JLS 18장에 있다.</p>
+<pre><code class="language-java">Rect r1 = ShapeUtil.<Rect>larger(new Rect(1, 1), new Rect(2, 3));  // 명시
+Rect r2 = ShapeUtil.larger(new Rect(4, 5), new Rect(2, 3));        // 추론: T = Rect
+Shape s = ShapeUtil.larger(new Rect(4, 5), new Tri(10, 10));       // 추론: T = Shape
+System.out.println(r1.width() + " " + r2.width() + " " + s.name());</code></pre>
+<pre data-label="실행 결과"><code class="language-text">2 4 Tri</code></pre>
+<p>세 번째 호출이 추론의 동작을 잘 보여 준다. 인자가 <code>Rect</code>와 <code>Tri</code>이므로 <code>T</code>는 둘 모두의 상위 타입이어야 한다. 선언된 경계 때문에 <code>T</code>는 <code>Shape</code>의 하위 타입이어야 하고, 결과를 <code>Shape</code> 변수에 넣으므로 그 점에서도 <code>Shape</code>의 하위 타입이어야 한다. 이 조건을 모두 만족하는 타입은 <code>Shape</code>다. 넓이 20과 50을 비교해 삼각형이 돌아오므로 <code>Tri</code>가 출력된다.</p>
+<p>같은 호출의 결과를 <code>Rect</code> 변수에 받으려 하면 조건이 서로 충돌한다. 컴파일러는 모은 제약을 그대로 보여 준다.</p>
+<pre><code class="language-java">Rect bad = ShapeUtil.larger(new Rect(4, 5), new Tri(10, 10));</code></pre>
+<pre data-label="javac 출력"><code class="language-text">error: incompatible types: inference variable T has incompatible bounds
+        Rect bad = ShapeUtil.larger(new Rect(4, 5), new Tri(10, 10));
+                                   ^
+    upper bounds: Rect,Shape
+    lower bounds: Tri,Rect
+  where T is a type-variable:
+    T extends Shape declared in method <T>larger(T,T)</code></pre>
+<p>읽는 법은 이렇다. <code>lower bounds</code>는 "<code>T</code>는 적어도 이 타입들의 상위 타입이어야 한다"는 제약으로, 인자 <code>Tri</code>와 <code>Rect</code>에서 나왔다. <code>upper bounds</code>는 "<code>T</code>는 이 타입들의 하위 타입이어야 한다"는 제약으로, 대입 대상 <code>Rect</code>와 선언된 경계 <code>Shape</code>에서 나왔다. <code>Tri</code>의 상위 타입이면서 <code>Rect</code>의 하위 타입인 타입은 없으므로 추론이 실패한다. 도형이 아닌 것을 넘기는 <code>ShapeUtil.larger(1, 2)</code>도 같은 형식으로 거절된다. 이때는 상한이 <code>Shape</code>, 하한이 <code>Integer</code>라고 나온다.</p>
+<aside class="note">"두 인자의 타입이 다르면 <code>first(T a, T b)</code>를 호출할 수 없다"고 생각하기 쉽지만 그렇지 않다. <code>ShapeUtil.first(1, "a")</code>는 컴파일된다. 컴파일러가 <code>Integer</code>와 <code>String</code>의 공통 상위 타입을 찾아 <code>T</code>로 삼기 때문이다. 두 인자가 같은 타입이기를 강제하고 싶다면 타입 매개변수만으로는 부족하고, 결과를 받는 쪽의 타입이나 경계로 제약을 더해야 한다.</aside>
+<h4>static 메서드는 클래스의 타입 매개변수를 쓸 수 없다</h4>
+<p>제네릭 클래스 안에 <code>static</code> 메서드를 두고 클래스의 <code>T</code>를 쓰려 하면 컴파일되지 않는다.</p>
+<pre><code class="language-java">class Cell<T> {
+    private T value;
+    static T shared;                       // 오류
+    static T make() { return null; }       // 오류
+    static <U> U pass(U u) { return u; }   // 된다: 메서드가 자기 타입 매개변수를 선언
+}</code></pre>
+<pre data-label="javac 출력"><code class="language-text">error: non-static type variable T cannot be referenced from a static context</code></pre>
+<p>이유는 타입 인자가 어디에 붙는지를 생각하면 나온다. 클래스의 <code>T</code>는 <code>Cell<String></code> 타입의 변수, <code>Cell<Integer></code> 타입의 변수처럼 <b>매개변수화 타입마다</b> 다르게 정해진다. 반면 <code>static</code> 멤버는 인스턴스와 무관하게 클래스에 하나만 있다. JLS 8.1.2는 한 제네릭 클래스에서 나온 모든 매개변수화 타입이 실행 시점에 같은 클래스 하나를 공유한다고 적는다. <code>Cell.make()</code>라고 호출하는 자리에는 <code>T</code>를 정해 줄 타입 인자가 없다. 그래서 <code>static</code> 메서드가 타입 매개변수를 쓰려면 스스로 선언한 제네릭 메서드여야 한다.</p>
+<p>인스턴스 메서드는 둘 다 쓸 수 있다. 클래스의 타입 매개변수도 보이고, 자기만의 타입 매개변수도 추가로 선언할 수 있다. JDK의 <code>Collection<E></code>에 있는 <code><T> T[] toArray(T[] a)</code>가 그 예다. <code>E</code>는 컬렉션이 만들어질 때 정해진 원소 타입이고, <code>T</code>는 <code>toArray</code>를 호출할 때마다 넘긴 배열에 따라 정해진다.</p>
+<p>한 가지 함정이 있다. 메서드가 선언한 타입 매개변수의 이름이 클래스의 것과 같으면, 메서드 안에서는 메서드의 것이 클래스의 것을 가린다.</p>
+<pre><code class="language-java">class Cell<T> {
+    private T value;
+    <T> void assign(T t) { value = t; }   // 이 T는 클래스의 T가 아니다
+}</code></pre>
+<pre data-label="javac 출력"><code class="language-text">error: incompatible types: T#1 cannot be converted to T#2
+  where T#1,T#2 are type-variables:
+    T#1 extends Object declared in method <T#1>assign(T#1)
+    T#2 extends Object declared in class Cell</code></pre>
+<p>컴파일러가 이름 뒤에 <code>#1</code>, <code>#2</code>를 붙여 두 <code>T</code>가 서로 다른 타입 변수임을 알려 준다. 이런 혼동을 피하려면 메서드의 타입 매개변수에는 클래스의 것과 다른 글자를 쓴다.</p>
+<h4>호출 지점의 바이트코드</h4>
+<p>제네릭 메서드도 클래스 파일에서는 경계로 바뀐다. <code>first</code>의 디스크립터는 <code>(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;</code>이고 <code>larger</code>는 <code>(LShape;LShape;)LShape;</code>다. 호출하는 쪽은 다음과 같다.</p>
+<pre data-label="명시 호출과 추론 호출의 바이트코드 (발췌)"><code class="language-text">// Rect r1 = ShapeUtil.<Rect>larger(new Rect(1, 1), new Rect(2, 3));
+      18: invokestatic  #12                 // Method ShapeUtil.larger:(LShape;LShape;)LShape;
+      21: checkcast     #7                  // class Rect
+
+// Rect r2 = ShapeUtil.larger(new Rect(4, 5), new Rect(2, 3));
+      43: invokestatic  #12                 // Method ShapeUtil.larger:(LShape;LShape;)LShape;
+      46: checkcast     #7                  // class Rect</code></pre>
+<p>두 호출의 명령이 같다. 소스에 적은 <code><Rect></code>는 바이트코드 어디에도 남지 않는다. "타입 인자"라는 이름 때문에 메서드에 무언가가 전달된다고 생각하기 쉽지만, 타입 인자는 실행 시점에 넘어가는 값이 아니다. 컴파일러가 타입 검사를 하고 <code>checkcast</code>를 넣을 타입을 정하는 데만 쓰이고 사라진다. 결과를 <code>Shape</code> 변수에 받는 세 번째 호출에는 <code>checkcast</code>도 없다. 반환값의 클래스 파일상 타입이 이미 <code>Shape</code>이기 때문이다.</p>
+
+<h3>제네릭 메서드 활용: 경계와 비교</h3>
+<p>제네릭 메서드가 가장 흔히 쓰이는 곳은 "인자의 타입과 반환 타입 사이의 관계"를 적어야 하는 유틸리티다. 두 값 가운데 큰 쪽을 돌려주는 메서드를 보자. 크기를 비교하려면 원소가 <code>compareTo</code>를 가져야 하므로 경계가 필요하다.</p>
+<pre><code class="language-java">static <T extends Comparable<T>> T max(T a, T b) {
+    return a.compareTo(b) >= 0 ? a : b;
+}</code></pre>
+<p>경계 <code>T extends Comparable<T></code> 안에 <code>T</code> 자신이 다시 나온다. 이것은 순환 오류가 아니라 "<code>T</code>는 <code>T</code>끼리 비교할 수 있는 타입"이라는 조건이다. <code>String</code>은 <code>Comparable<String></code>을 구현하고 <code>Integer</code>는 <code>Comparable<Integer></code>를 구현하므로 둘 다 이 경계를 만족한다.</p>
+<pre><code class="language-java">String m = ShapeUtil.max("apple", "banana");   // T = String
+Integer i = ShapeUtil.max(3, 7);               // T = Integer
+System.out.println(m + " " + i);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">banana 7</code></pre>
+<p>이 선언이 막아 주는 것을 확인해 보자. <code>ShapeUtil.max(1, "a")</code>는 컴파일되지 않는다. 앞의 <code>first(1, "a")</code>와 달리 이번에는 경계가 있어서, <code>Integer</code>와 <code>String</code>을 함께 담으면서 자기 자신과 비교 가능한 <code>T</code>를 찾을 수 없기 때문이다. 타입 매개변수의 경계가 타입 추론의 제약으로 작동해 의미 없는 비교를 컴파일 시점에 걸러 낸 것이다.</p>
+<p>두 번째 호출의 바이트코드에는 <code>Integer.valueOf</code>가 두 번 나온다. 타입 인자는 참조 타입이어야 하므로(JLS 4.5.1) 기본형 <code>3</code>과 <code>7</code>은 호출 전에 <code>Integer</code> 객체로 박싱된다. <code>Holder<int></code>처럼 기본형을 타입 인자로 직접 쓰면 <code>unexpected type</code>, <code>required: reference</code>, <code>found: int</code>라는 오류가 난다. 클래스 파일에서 <code>T</code> 자리가 <code>Object</code>나 경계 타입의 참조로 바뀐다는 것을 떠올리면, 참조가 아닌 값이 그 자리에 들어갈 수 없다는 것도 자연스럽다.</p>
+<h4>제네릭 타입으로 할 것인가, 제네릭 메서드로 할 것인가</h4>
+<p>둘 가운데 무엇을 고를지는 타입 매개변수가 무엇에 묶여야 하는지로 정한다. <code>Holder<T></code>의 <code>T</code>는 필드 <code>item</code>의 타입이다. 객체가 살아 있는 동안 <code>put</code>과 <code>larger</code>가 같은 <code>T</code>를 써야 하므로 타입 매개변수가 객체의 상태에 묶여 있다. 이런 경우는 제네릭 타입이다. 반면 <code>max</code>는 상태가 없고, 한 번의 호출 안에서 두 인자와 반환값의 타입이 같다는 것만 표현하면 된다. 이런 경우는 제네릭 메서드다.</p>
+<p>둘을 섞을 수도 있다. 제네릭 클래스의 인스턴스 메서드가 클래스의 <code>T</code>와 관계없는 타입을 한 번의 호출에서만 필요로 한다면 그 메서드에만 타입 매개변수를 추가한다. 타입 매개변수의 범위는 가능한 한 좁게 잡는 편이 읽기 쉽다. 클래스 전체에 <code><T, U, V></code>를 선언해 놓고 메서드 하나에서만 <code>V</code>를 쓰면, 그 클래스를 쓰는 모든 곳에서 의미 없는 세 번째 타입 인자를 적어야 한다.</p>
+
+<h3>제네릭 타입은 무공변이다</h3>
+<p>이제 방향을 바꿔 제네릭 타입을 매개변수로 <b>받는</b> 메서드를 쓴다. 도형 리스트를 받아 넓이의 합을 구하는 메서드다.</p>
+<pre><code class="language-java">static int totalArea(List<Shape> shapes) {
+    int sum = 0;
+    for (Shape s : shapes) sum += s.area();
+    return sum;
+}
+
+List<Rect> rects = new ArrayList<>();
+rects.add(new Rect(4, 5));
+totalArea(rects);        // 컴파일 오류</code></pre>
+<pre data-label="javac 출력"><code class="language-text">error: incompatible types: List<Rect> cannot be converted to List<Shape></code></pre>
+<p><code>Rect</code>는 <code>Shape</code>의 하위 타입인데 <code>List<Rect></code>는 <code>List<Shape></code>의 하위 타입이 아니다. 처음 보면 불합리하게 느껴지지만 이유가 있다. 이 변환이 허용된다고 가정하고 한 줄씩 따라가 보자.</p>
+<pre><code class="language-java">List<Rect> rects = new ArrayList<>();
+List<Shape> shapes = rects;        // 허용된다고 가정한다
+shapes.add(new Tri(6, 4));         // List<Shape>에 Tri를 넣는 것은 정당하다
+Rect r = rects.get(0);             // Rect 리스트에서 Tri가 나온다</code></pre>
+<p>둘째 줄 이후 <code>rects</code>와 <code>shapes</code>는 힙의 같은 리스트 객체를 가리킨다. 셋째 줄은 <code>List<Shape></code>의 규칙으로는 아무 문제가 없다. 그런데 그 결과 <code>List<Rect></code>라고 선언한 리스트 안에 삼각형이 들어간다. 넷째 줄에서 컴파일러가 믿고 넣은 캐스트가 실패한다. 다형성 버전의 보관함에서 본 것과 같은 사고다. 읽기만 한다면 <code>List<Rect></code>를 <code>List<Shape></code>로 다뤄도 안전하지만, <code>List</code>에는 쓰는 메서드가 있으므로 컴파일러는 변환 자체를 막는다.</p>
+<p>이 성질에는 이름이 있다. 타입 <code>A</code>가 <code>B</code>의 하위 타입일 때 <code>G<A></code>도 <code>G<B></code>의 하위 타입이면 <code>G</code>는 공변(covariant)이다. 방향이 뒤집혀 <code>G<B></code>가 <code>G<A></code>의 하위 타입이면 반공변(contravariant)이고, 어느 쪽도 아니면 무공변(invariant)이다. 자바의 제네릭 타입은 타입 인자가 구체적인 타입일 때 무공변이다. JLS 4.10.2가 정한 <code>List<Rect></code>의 상위 타입 목록에는 <code>Collection<Rect></code>와 로 타입 <code>List</code>는 있지만 <code>List<Shape></code>는 없다.</p>
+<h4>배열은 다른 선택을 했다</h4>
+<p>자바의 배열은 공변이다. <code>String[]</code>은 <code>Object[]</code>의 하위 타입이다. 그러면 방금 본 사고가 배열에서는 실제로 일어날 수 있어야 한다.</p>
+<pre><code class="language-java">Object[] objs = new String[1];     // 배열은 공변이라 허용된다
+objs[0] = 1;                       // 컴파일된다</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Exception in thread "main" java.lang.ArrayStoreException: java.lang.Integer</code></pre>
+<p>컴파일은 되고 실행 중에 <code>ArrayStoreException</code>이 난다. <a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-10.html">JLS 10.5</a>는 참조 타입 배열의 원소에 값을 대입할 때마다 그 값이 배열의 원소 타입에 대입 가능한지 실행 시점에 검사한다고 정한다. 이 검사가 가능한 것은 배열 객체가 자신의 원소 타입을 실행 시점에 알고 있기 때문이다. <code>new String[1]</code>로 만든 객체는 변수의 타입이 <code>Object[]</code>여도 스스로 <code>String[]</code>임을 안다.</p>
+<p>두 설계를 나란히 놓으면 이렇다. 배열은 공변을 허용하고 그 대가로 저장할 때마다 실행 시점 검사를 한다. 제네릭은 실행 시점 검사를 할 수 없어서 컴파일 시점에 변환을 막는다. 제네릭이 실행 시점 검사를 할 수 없는 이유는 <code>ArrayList<Rect></code>로 만든 객체가 자기 원소 타입이 <code>Rect</code>라는 사실을 갖고 있지 않기 때문이다. 이 사실은 타입 소거에서 확인한다. 그 전에, 무공변 때문에 생긴 불편을 푸는 도구부터 본다.</p>
+
+<h3>와일드카드 1: 상한 와일드카드와 캡처</h3>
+<p><code>totalArea</code>가 받고 싶은 것을 정확히 적으면 "<code>Shape</code>의 리스트"가 아니라 "<code>Shape</code>이거나 그 하위 타입인 어떤 타입의 리스트"다. 이것을 적는 방법은 두 가지다. 첫째는 앞에서 배운 제네릭 메서드다.</p>
+<pre><code class="language-java">static <T extends Shape> int totalArea(List<T> shapes) {
+    int sum = 0;
+    for (T s : shapes) sum += s.area();
+    return sum;
+}</code></pre>
+<p>호출할 때마다 <code>T</code>가 <code>Rect</code>, <code>Tri</code>, <code>Shape</code>로 추론되므로 세 종류의 리스트를 모두 받는다. 그런데 이 선언에서 <code>T</code>가 하는 일을 보면 굳이 이름을 붙일 이유가 없다. <code>T</code>는 매개변수 타입에 한 번 나올 뿐 다른 매개변수나 반환 타입과 묶이지 않는다. 본문에서도 <code>Shape</code>의 메서드만 쓴다. "무엇이든 좋으니 <code>Shape</code>의 하위 타입"이라는 뜻만 전하면 되는 자리다.</p>
+<p>둘째 방법은 이름을 붙이지 않고 그 뜻만 적는 것이다. 타입 인자 자리에 물음표를 쓴다.</p>
+<pre><code class="language-java">static int totalArea(List<? extends Shape> shapes) {
+    int sum = 0;
+    for (Shape s : shapes) sum += s.area();
+    return sum;
+}
+
+List<Rect> rects = new ArrayList<>(List.of(new Rect(4, 5), new Rect(2, 3)));
+List<Tri> tris = new ArrayList<>(List.of(new Tri(6, 4)));
+List<Shape> mixed = List.of(new Rect(1, 1), new Tri(2, 2));
+System.out.println(totalArea(rects) + " " + totalArea(tris) + " " + totalArea(mixed));</code></pre>
+<pre data-label="실행 결과"><code class="language-text">26 12 3</code></pre>
+<p><code>?</code>를 와일드카드(wildcard)라고 한다. <code>? extends Shape</code>는 "<code>Shape</code>의 하위 타입인 어떤 타입. 구체적으로 무엇인지는 모른다"로 읽고, 상한 와일드카드(upper bounded wildcard)라고 부른다. 세 호출이 모두 컴파일되고, 넓이의 합은 20+6, 12, 1+2다.</p>
+<p>와일드카드는 타입 매개변수가 아니라 타입 인자라는 점을 분명히 해 두자. 타입 매개변수 <code>T</code>는 선언하는 쪽이 만드는 이름이고, 와일드카드는 사용하는 쪽이 <code>List<...></code>의 꺾쇠 안에 적는 것이다. 그래서 <code>class Box<? extends Shape> { }</code>는 <code><identifier> expected</code>라는 문법 오류가 된다. 객체를 만드는 식에도 쓸 수 없다. <code>new ArrayList<? extends Shape>()</code>는 <code>unexpected type</code>, <code>required: class or interface without bounds</code>라는 오류를 낸다. 와일드카드는 "모르는 타입"을 뜻하므로, 이미 만들어진 객체를 가리키는 변수·매개변수·필드의 타입에 쓰는 표기다.</p>
+<h4>읽을 수 있는 것과 쓸 수 없는 것</h4>
+<p><code>List<? extends Shape></code> 타입의 변수로 무엇을 할 수 있는지 네 줄로 확인한다.</p>
+<pre><code class="language-java">static void probe(List<? extends Shape> shapes) {
+    Shape s = shapes.get(0);        // ① 된다
+    Rect r = shapes.get(0);         // ② 오류
+    shapes.add(new Rect(1, 1));     // ③ 오류
+    shapes.add(null);               // ④ 된다
+}</code></pre>
+<pre data-label="javac 출력 (②와 ③, 발췌)"><code class="language-text">error: incompatible types: CAP#1 cannot be converted to Rect
+        Rect r = shapes.get(0);
+                           ^
+error: incompatible types: Rect cannot be converted to CAP#1
+        shapes.add(new Rect(1, 1));
+                   ^
+  where CAP#1 is a fresh type-variable:
+    CAP#1 extends Shape from capture of ? extends Shape</code></pre>
+<p>오류 문구에 <code>CAP#1</code>이라는 낯선 이름이 나온다. 컴파일러는 와일드카드가 든 타입의 식을 검사할 때 <code>?</code> 자리에 이름 없는 새 타입 변수를 하나 만들어 넣는다. JLS 5.1.10은 이것을 캡처 변환(capture conversion)이라고 부른다. <code>List<? extends Shape></code>는 검사하는 동안 <code>List<CAP#1></code>로 다뤄지고, <code>CAP#1</code>은 "상한이 <code>Shape</code>인, 정체를 모르는 타입 하나"다. 문구의 <code>fresh type-variable</code>이 이 새 타입 변수이고, <code>CAP#1 extends Shape</code>가 그 상한이다.</p>
+<p>네 줄을 <code>List<CAP#1></code>의 눈으로 다시 읽어 보자. <code>get</code>의 반환 타입은 <code>CAP#1</code>이다. <code>CAP#1</code>이 무엇이든 <code>Shape</code>의 하위 타입이므로 ①은 된다. <code>Rect</code>의 하위 타입이라는 보장은 없으므로 ②는 안 된다. <code>add</code>의 매개변수 타입도 <code>CAP#1</code>이다. <code>Rect</code>가 <code>CAP#1</code>의 하위 타입인지는 알 수 없다. <code>CAP#1</code>의 정체가 <code>Tri</code>일 수도 있기 때문이다. 그래서 ③은 거절된다. ④의 <code>null</code>은 어떤 참조 타입의 변수에도 넣을 수 있는 값이라서 통과한다.</p>
+<p>③을 막는 이유는 앞 장의 반례와 같다. 이 메서드에 <code>List<Tri></code>를 넘긴 호출자가 있다면 ③은 삼각형 리스트에 사각형을 넣는 코드가 된다. 메서드 본문은 한 번만 검사되므로 가능한 모든 인자에 대해 안전한 연산만 허용된다. 그 대가로 얻은 것이 <code>List<Rect></code>와 <code>List<Tri></code>를 모두 받는 유연함이다. <code>List<? extends Shape></code>는 원소 타입의 값을 넣지 않겠다고 약속하고 공변을 얻은 타입이라고 볼 수 있다.</p>
+<aside class="note"><code>? extends</code>를 "읽기 전용 리스트"로 외우면 절반만 맞다. 막히는 것은 매개변수 타입이 캡처된 타입 변수인 메서드에 값을 넘기는 일이다. <code>shapes.remove(0)</code>이나 <code>shapes.clear()</code>는 원소 타입의 값을 받지 않으므로 그대로 컴파일된다. 리스트를 변경하지 못하게 하려는 목적이라면 와일드카드가 아니라 <code>List.copyOf</code> 같은 불변 리스트를 써야 한다.</aside>
+<h4>비한정 와일드카드</h4>
+<p><code>?</code>만 쓰면 비한정 와일드카드(unbounded wildcard)다. JLS 4.5.1은 <code>? extends Object</code>가 <code>?</code>와 같다고 적는다. 따라서 규칙은 상한 와일드카드와 같고 상한만 <code>Object</code>다. <code>List<?></code>에서 꺼낸 값은 <code>Object</code>로만 받을 수 있고, <code>null</code> 말고는 넣을 수 없다. 원소가 무엇이든 상관없는 코드에 맞는다. <code>size()</code>처럼 원소 타입과 무관한 메서드나, <code>toString()</code>처럼 <code>Object</code>에 있는 메서드만 쓰는 경우다.</p>
+<pre><code class="language-java">static void printAll(List<?> list) {
+    for (Object o : list) System.out.print(o + " ");
+    System.out.println();
+}
+
+printAll(List.of(1, "a", 2.5));     // 1 a 2.5</code></pre>
+<p>모양이 비슷한 세 타입을 구분해야 한다. <code>List<Object></code>는 "무엇이든 담을 수 있는 리스트"라는 구체적인 타입 하나다. 무공변이므로 <code>List<String></code>을 받지 못하고, <code>List<Object> lo = new ArrayList<String>();</code>은 <code>incompatible types: ArrayList<String> cannot be converted to List<Object></code>로 거절된다. <code>List<?></code>는 "원소 타입을 모르는 리스트"다. 어떤 리스트든 받는 대신 넣기를 포기한다. 타입 인자를 아예 적지 않은 <code>List</code>는 로 타입이고, 타입 검사를 끈 것에 가깝다. 로 타입은 뒤에서 힙 오염과 함께 다시 본다.</p>
+<div class="table-wrap"><table><thead><tr><th>매개변수 타입</th><th>받을 수 있는 인자</th><th>꺼낸 값의 타입</th><th><code>add</code>에 넘길 수 있는 값</th></tr></thead><tbody>
+<tr><td><code>List<Object></code></td><td><code>List<Object></code>만</td><td><code>Object</code></td><td>모든 객체</td></tr>
+<tr><td><code>List<?></code></td><td>모든 <code>List<X></code></td><td><code>Object</code></td><td><code>null</code>만</td></tr>
+<tr><td><code>List</code> (로 타입)</td><td>모든 리스트</td><td><code>Object</code></td><td>모든 객체. 컴파일러는 경고만 낸다</td></tr>
+</tbody></table></div>
+<aside class="note">타입 매개변수에 경계가 선언되어 있으면 비한정 와일드카드의 캡처도 그 경계를 상한으로 갖는다(JLS 5.1.10). 그래서 <code>Holder<T extends Shape></code>에 대한 <code>Holder<?></code> 변수 <code>h</code>에서 <code>h.larger(null)</code>의 결과는 <code>Object</code>가 아니라 <code>Shape</code> 변수에 받을 수 있다.</aside>
+<h4>캡처에 이름 붙이기: 도우미 메서드</h4>
+<p>캡처가 실제로 문제를 일으키는 예를 하나 본다. 리스트의 두 원소 자리를 바꾸는 메서드는 원소 타입을 알 필요가 없으니 <code>List<?></code>로 받고 싶다.</p>
+<pre><code class="language-java">static void swap(List<?> list, int i, int j) {
+    list.set(i, list.get(j));       // 오류
+}</code></pre>
+<pre data-label="javac -Xdiags:verbose 출력 (발췌)"><code class="language-text">error: method set in interface List<E> cannot be applied to given types;
+  required: int,CAP#1
+  found:    int,CAP#2
+  where CAP#1,CAP#2 are fresh type-variables:
+    CAP#1 extends Object from capture of ?
+    CAP#2 extends Object from capture of ?</code></pre>
+<p>같은 리스트에서 꺼내 같은 리스트에 넣는데도 거절된다. 이유는 캡처가 식마다 따로 일어나기 때문이다. <code>list.set(...)</code>의 <code>list</code>는 <code>List<CAP#1></code>로, <code>list.get(j)</code>의 <code>list</code>는 <code>List<CAP#2></code>로 캡처된다. 사람은 두 <code>list</code>가 같은 변수라는 것을 알지만, 타입 검사는 식의 타입만 보고 <code>CAP#1</code>과 <code>CAP#2</code>를 서로 관계없는 타입으로 취급한다.</p>
+<p>해결책은 그 모르는 타입에 이름을 붙여 주는 것이다. 제네릭 메서드를 하나 두고 넘기면 된다.</p>
+<pre><code class="language-java">static void swap(List<?> list, int i, int j) {
+    swapHelper(list, i, j);
+}
+
+private static <E> void swapHelper(List<E> list, int i, int j) {
+    E tmp = list.get(i);
+    list.set(i, list.get(j));
+    list.set(j, tmp);
+}
+
+List<String> names = new ArrayList<>(List.of("a", "b", "c"));
+swap(names, 0, 2);
+System.out.println(names);          // [c, b, a]</code></pre>
+<p><code>swapHelper(list, i, j)</code>를 호출하는 순간 <code>list</code>가 <code>List<CAP#1></code>로 한 번 캡처되고, 컴파일러는 <code>E = CAP#1</code>로 추론한다. 도우미 메서드 안에서는 리스트에서 꺼낸 값도, 리스트에 넣는 값도 같은 이름 <code>E</code>로 묶여 있으므로 검사를 통과한다. 이 예는 와일드카드와 제네릭 메서드의 관계를 잘 보여 준다. 와일드카드는 이름 없는 타입 변수이고, 제네릭 메서드의 타입 매개변수는 이름 있는 타입 변수다.</p>
+<h4>제네릭 메서드와 와일드카드 가운데 고르기</h4>
+<p>둘 다 가능한 자리에서는 타입에 이름이 필요한지로 정한다. 타입이 시그니처에 한 번만 나오고 본문에서도 이름으로 부를 일이 없으면 와일드카드가 간결하다. 반대로 매개변수와 반환 타입, 또는 두 매개변수가 "같은 타입"이라는 관계를 표현해야 하면 이름이 필요하므로 제네릭 메서드를 쓴다. 넓이가 가장 큰 도형을 돌려주는 메서드가 그 예다.</p>
+<pre><code class="language-java">static <T extends Shape> T largest(List<T> shapes) {
+    T best = shapes.get(0);
+    for (T s : shapes) if (s.area() > best.area()) best = s;
+    return best;
+}
+
+Rect big = largest(rects);          // T = Rect. 캐스트 없이 Rect로 받는다
+System.out.println(big.width());    // 4</code></pre>
+<p>이 메서드를 <code>static Shape largest(List<? extends Shape> shapes)</code>로 선언해도 동작은 같다. 하지만 <code>List<Rect></code>를 넘겨도 돌아오는 타입이 <code>Shape</code>여서 호출자가 다시 다운캐스트를 해야 한다. 들어간 리스트의 원소 타입과 나오는 값의 타입이 같다는 정보는 이름 <code>T</code>로만 적을 수 있다.</p>
+
+<h3>와일드카드 2: 하한 와일드카드와 PECS</h3>
+<p>이번에는 반대 방향의 메서드다. 리스트에서 꺼내 쓰는 것이 아니라, 받은 리스트에 사각형을 채워 넣는다.</p>
+<pre><code class="language-java">static void addUnitRects(List<Rect> dst, int n) {
+    for (int i = 0; i < n; i++) dst.add(new Rect(1, 1));
+}</code></pre>
+<p>이 선언은 <code>List<Rect></code>만 받는다. 그런데 사각형을 넣는 일은 <code>List<Shape></code>에 해도, <code>List<Object></code>에 해도 안전하다. 그 리스트들은 원래 사각형을 받아 주는 리스트이기 때문이다. 무공변 때문에 받지 못할 뿐이다. <code>List<? extends Rect></code>로 바꾸는 것은 답이 아니다. 방금 본 대로 그 타입에는 <code>add</code>를 할 수 없다. 필요한 것은 방향이 반대인 조건, 곧 "<code>Rect</code>이거나 그 상위 타입인 어떤 타입의 리스트"다. <code>super</code>로 적고 하한 와일드카드(lower bounded wildcard)라고 부른다.</p>
+<pre><code class="language-java">static void addUnitRects(List<? super Rect> dst, int n) {
+    for (int i = 0; i < n; i++) dst.add(new Rect(1, 1));
+}
+
+List<Rect> r0 = new ArrayList<>();
+List<Shape> s0 = new ArrayList<>();
+List<Object> o0 = new ArrayList<>();
+addUnitRects(r0, 1);
+addUnitRects(s0, 2);
+addUnitRects(o0, 3);
+System.out.println(r0.size() + " " + s0.size() + " " + o0.size());   // 1 2 3</code></pre>
+<p>세 리스트를 모두 받는다. 삼각형 리스트는 받지 않는다. <code>List<Tri></code> 타입의 변수를 넘기면 <code>incompatible types: List<Tri> cannot be converted to List<? super Rect></code>가 난다. <code>Tri</code>는 <code>Rect</code>의 상위 타입이 아니기 때문이다. 이 타입의 변수로 할 수 있는 일을 다시 네 줄로 확인한다.</p>
+<pre><code class="language-java">static void probe(List<? super Rect> dst) {
+    dst.add(new Rect(1, 1));     // ① 된다
+    dst.add(new Tri(1, 1));      // ② 오류
+    Object o = dst.get(0);       // ③ 된다
+    Rect r = dst.get(0);         // ④ 오류
+}</code></pre>
+<pre data-label="javac 출력 (②와 ④, 발췌)"><code class="language-text">error: incompatible types: Tri cannot be converted to CAP#1
+error: incompatible types: CAP#1 cannot be converted to Rect
+  where CAP#1 is a fresh type-variable:
+    CAP#1 extends Object super: Rect from capture of ? super Rect</code></pre>
+<p>이번 캡처에는 정보가 두 개 붙어 있다. <code>CAP#1 extends Object super: Rect</code>는 상한이 <code>Object</code>이고 하한이 <code>Rect</code>라는 뜻이다. JLS 5.1.10의 규칙 그대로다. <code>? super B</code>를 캡처한 타입 변수는 하한으로 <code>B</code>를 갖는다. <code>CAP#1</code>이 무엇이든 <code>Rect</code>의 상위 타입이므로 <code>Rect</code> 값은 <code>CAP#1</code> 자리에 넣을 수 있다(①). <code>Tri</code>는 그렇다는 보장이 없다(②). 꺼낼 때 쓸 수 있는 정보는 상한뿐인데 상한이 <code>Object</code>이므로 <code>Object</code>로만 받을 수 있다(③, ④).</p>
+<p>여기에 흔한 오해가 하나 있다. "<code>? super Rect</code>이니 <code>Rect</code>의 상위 타입인 <code>Shape</code> 객체를 넣을 수 있다"는 생각이다. 그렇지 않다. <code>Shape</code> 타입의 변수를 <code>dst.add</code>에 넘기면 <code>incompatible types: Shape cannot be converted to CAP#1</code>이 난다. <code>super</code>가 제한하는 것은 넣는 값의 타입이 아니라 <b>리스트의 타입 인자</b>다. <code>dst</code>가 실제로는 <code>List<Rect></code>일 수 있고, 거기에 임의의 <code>Shape</code>를 넣으면 안 된다. 넣을 수 있는 값은 어떤 경우에도 안전한 것, 곧 <code>Rect</code>와 그 하위 타입의 값이다.</p>
+<p>지금까지 나온 네 가지 리스트 타입을 한 표로 모은다.</p>
+<div class="table-wrap"><table><thead><tr><th>변수의 타입</th><th>가리킬 수 있는 리스트</th><th><code>get</code>으로 받는 타입</th><th><code>add</code>에 넘길 수 있는 값</th></tr></thead><tbody>
+<tr><td><code>List<Shape></code></td><td><code>List<Shape></code>만</td><td><code>Shape</code></td><td><code>Shape</code>와 하위 타입</td></tr>
+<tr><td><code>List<? extends Shape></code></td><td><code>List<Shape></code>, <code>List<Rect></code>, <code>List<Tri></code></td><td><code>Shape</code></td><td><code>null</code>만</td></tr>
+<tr><td><code>List<? super Rect></code></td><td><code>List<Rect></code>, <code>List<Shape></code>, <code>List<Object></code></td><td><code>Object</code></td><td><code>Rect</code>와 하위 타입</td></tr>
+<tr><td><code>List<?></code></td><td>모든 <code>List<X></code></td><td><code>Object</code></td><td><code>null</code>만</td></tr>
+</tbody></table></div>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>분리수거함에 붙은 라벨</strong><p>페트병 전용함, 플라스틱함, 일반 쓰레기통이 있다고 하자. "페트병을 받아 주는 통"이라는 조건(<code>? super 페트병</code>)에는 세 통이 모두 맞는다. 어느 통인지 몰라도 페트병은 안심하고 넣을 수 있다. 대신 그 통에서 꺼낸 것이 페트병이라는 보장은 없다. 반대로 "플라스틱류만 들어 있는 통"이라는 조건(<code>? extends 플라스틱</code>)에는 페트병 전용함과 플라스틱함이 맞는다. 꺼낸 것이 플라스틱인 것은 확실하지만, 어느 통인지 모르니 비닐을 넣으면 페트병 전용함의 규칙을 깰 수 있다. 비유가 맞지 않는 지점은 라벨이다. 실제 수거함은 라벨을 읽으면 되지만, 컴파일러는 메서드 본문을 검사할 때 앞으로 넘어올 리스트의 타입 인자를 볼 수 없다. 그리고 뒤에서 보듯 실행 중인 리스트 객체에는 그 라벨이 아예 붙어 있지 않다.</p></aside>
+<h4>공변과 반공변, 그리고 하위 타입 관계</h4>
+<p>두 와일드카드는 무공변인 제네릭 타입에 변성을 주는 장치다. <code>Rect</code>가 <code>Shape</code>의 하위 타입일 때 <code>List<Rect></code>는 <code>List<? extends Shape></code>의 하위 타입이다. 타입 인자의 방향과 리스트 타입의 방향이 같으므로 공변이다. 한편 <code>List<Shape></code>는 <code>List<? super Rect></code>의 하위 타입이다. 방향이 뒤집혔으므로 반공변이다. JLS 4.5.1은 이 관계를 타입 인자의 포함(containment) 규칙으로 정한다. 핵심 네 줄은 다음과 같다. <code><:</code>는 "하위 타입이다", <code><=</code>는 "포함된다"는 기호다.</p>
+<pre class="diagram">T  <=  ? extends T                     구체 타입은 자신을 상한으로 하는 와일드카드에 포함된다
+T  <=  ? super T                       구체 타입은 자신을 하한으로 하는 와일드카드에 포함된다
+? extends T  <=  ? extends S           단, T <: S 일 때   (같은 방향: 공변)
+? super T    <=  ? super S             단, S <: T 일 때   (반대 방향: 반공변)</pre>
+<p>이 규칙으로 어떤 값을 어떤 변수에 넣을 수 있는지를 모두 판정할 수 있다. 아래 표에서 ○는 대입이 컴파일된다는 뜻이다.</p>
+<div class="table-wrap"><table><thead><tr><th>값 ＼ 변수</th><th><code>List<Shape></code></th><th><code>List<? extends Shape></code></th><th><code>List<? super Rect></code></th><th><code>List<? super Shape></code></th><th><code>List<?></code></th></tr></thead><tbody>
+<tr><td><code>List<Rect></code></td><td>✕</td><td>○</td><td>○</td><td>✕</td><td>○</td></tr>
+<tr><td><code>List<Shape></code></td><td>○</td><td>○</td><td>○</td><td>○</td><td>○</td></tr>
+<tr><td><code>List<Object></code></td><td>✕</td><td>✕</td><td>○</td><td>○</td><td>○</td></tr>
+</tbody></table></div>
+<pre class="diagram">화살표는 "하위 타입 → 상위 타입" (왼쪽 값을 오른쪽 변수에 넣을 수 있다)
+
+공변 사슬     List<Rect>  →  List<? extends Rect>  →  List<? extends Shape>  →  List<?>
+반공변 사슬   List<Shape> →  List<? super Shape>   →  List<? super Rect>     →  List<?>
+
+사슬 사이     List<Rect>  →  List<? super Rect>
+              List<Shape> →  List<? extends Shape></pre>
+
+<x-visual id="java-mid2-02-wildcard-subtyping" title="와일드카드 리스트 타입 사이의 하위 타입 관계" kind="계층 다이어그램" ratio="16:9">
+<x-hint>구체적인 리스트 타입이 아래에, 와일드카드 타입이 위에 놓이는 격자 구조. extends 쪽은 타입 인자와 같은 방향, super 쪽은 반대 방향으로 올라간다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 깔끔한 타입 계층 다이어그램. 맨 위 가운데에 둥근 상자 "List&lt;?&gt;". 그 아래 줄 왼쪽에 파란 테두리 상자 "List&lt;? extends Shape&gt;", 오른쪽에 주황 테두리 상자 "List&lt;? super Rect&gt;". 그 아래 줄 왼쪽 끝에 파란 테두리 상자 "List&lt;? extends Rect&gt;", 오른쪽 끝에 주황 테두리 상자 "List&lt;? super Shape&gt;". 맨 아래 줄에 회색으로 채운 상자 두 개: 왼쪽 "List&lt;Rect&gt;", 오른쪽 "List&lt;Shape&gt;". 화살표는 모두 아래에서 위로 향하는 얇은 실선: "List&lt;Rect&gt;"에서 "List&lt;? extends Rect&gt;"로, "List&lt;? extends Rect&gt;"에서 "List&lt;? extends Shape&gt;"로, "List&lt;Shape&gt;"에서 "List&lt;? extends Shape&gt;"로, "List&lt;Shape&gt;"에서 "List&lt;? super Shape&gt;"로, "List&lt;? super Shape&gt;"에서 "List&lt;? super Rect&gt;"로, "List&lt;Rect&gt;"에서 "List&lt;? super Rect&gt;"로, 둘째 줄의 두 상자에서 "List&lt;?&gt;"로. 왼쪽 가장자리에 파란 글씨 라벨 "공변: 꺼내기 전용", 오른쪽 가장자리에 주황 글씨 라벨 "반공변: 넣기 전용". 그림 아래쪽에 작은 글씨 "화살표: 하위 타입에서 상위 타입으로". 색은 파랑, 주황, 회색만 쓴다.</x-prompt>
+<x-caption>구체 타입 인자를 가진 리스트는 서로 무관하고, 와일드카드 타입이 그 위에서 공통 상위 타입 역할을 한다.</x-caption>
+</x-visual>
+
+<h4>PECS: 데이터가 흐르는 방향으로 고른다</h4>
+<p>두 와일드카드를 한 메서드에 함께 쓰면 쓰임새가 분명해진다. 한 리스트의 원소를 다른 리스트에 복사하는 메서드다.</p>
+<pre><code class="language-java">static <T> void copy(List<? super T> dst, List<? extends T> src) {
+    for (T t : src) dst.add(t);
+}
+
+List<Shape> all = new ArrayList<>();
+copy(all, rects);                   // rects: Rect(4,5), Rect(2,3)
+copy(all, tris);                    // tris: Tri(6,4)
+System.out.println(all.size() + " " + totalArea(all));   // 3 38</code></pre>
+<p><code>src</code>는 값을 내주기만 한다. 꺼낸 값을 <code>T</code>로 받을 수 있으면 충분하므로 <code>? extends T</code>다. <code>dst</code>는 값을 받기만 한다. <code>T</code>를 넣을 수 있으면 충분하므로 <code>? super T</code>다. 첫 호출에서 컴파일러가 모으는 제약은 "<code>List<Shape></code>가 <code>List<? super T></code>에 맞아야 하니 <code>T</code>는 <code>Shape</code>의 하위 타입", "<code>List<Rect></code>가 <code>List<? extends T></code>에 맞아야 하니 <code>T</code>는 <code>Rect</code>의 상위 타입"이다. <code>Rect</code>도 <code>Shape</code>도 이 조건에 맞으므로 호출이 성립한다. 두 매개변수를 모두 <code>List<T></code>로 선언했다면 <code>T</code>가 <code>Rect</code>이면서 동시에 <code>Shape</code>여야 해서 이 호출은 컴파일되지 않는다.</p>
+<p>이 선택 기준에는 PECS라는 이름이 붙어 있다. 조슈아 블로크가 Effective Java에서 소개한 암기법으로, producer-extends, consumer-super의 머리글자다. 메서드 입장에서 값을 <b>내주는</b> 매개변수(생산자)에는 <code>extends</code>를, 값을 <b>받아 가는</b> 매개변수(소비자)에는 <code>super</code>를 쓴다. 오라클의 자바 튜토리얼은 같은 내용을 "in" 변수와 "out" 변수라는 말로 설명하고 두 가지를 덧붙인다. 한 매개변수를 읽기와 쓰기에 모두 쓴다면 와일드카드를 쓰지 않는다. 그리고 반환 타입에는 와일드카드를 쓰지 않는 것이 좋다. 호출자가 받은 값을 다룰 때 와일드카드의 제약을 떠안기 때문이다.</p>
+<figure class="flow-figure"><figcaption>copy(dst, src) 안에서 값이 흐르는 방향</figcaption><ol class="flow">
+<li><strong>src: 생산자</strong><span><code>List<? extends T></code>. 원소를 꺼내 <code>T</code>로 받는다. 넣지는 않는다.</span></li>
+<li><strong>T 타입의 값</strong><span>메서드 본문이 손에 쥐는 값. 꺼낸 쪽과 넣는 쪽을 잇는 이름이다.</span></li>
+<li><strong>dst: 소비자</strong><span><code>List<? super T></code>. <code>T</code>를 받아 넣는다. 꺼내 쓰지는 않는다.</span></li>
+</ol></figure>
+
+<x-visual id="java-mid2-02-pecs-flow" title="PECS: 생산자 리스트에서 소비자 리스트로 값이 흐르는 그림" kind="흐름 다이어그램" ratio="16:9">
+<x-hint>값을 내주는 리스트에는 extends, 값을 받는 리스트에는 super를 쓴다는 것을 왼쪽에서 오른쪽으로 흐르는 화살표 하나로 보여 준다.</x-hint>
+<x-prompt>흰 배경의 가로로 긴 흐름 다이어그램. 왼쪽에 파란 테두리의 큰 상자, 제목 "src: List&lt;? extends T&gt;", 상자 안에 작은 사각형 아이콘 두 개와 삼각형 아이콘 한 개. 상자 아래 라벨 "생산자: 꺼내기만 한다". 오른쪽에 주황 테두리의 큰 상자, 제목 "dst: List&lt;? super T&gt;", 상자 안은 비어 있고 점선으로 빈 칸 세 개만 그린다. 상자 아래 라벨 "소비자: 넣기만 한다". 두 상자 사이 가운데에 원 하나, 안에 글자 "T". 왼쪽 상자에서 원으로 가는 굵은 파란 화살표, 화살표 위 라벨 "get". 원에서 오른쪽 상자로 가는 굵은 주황 화살표, 화살표 위 라벨 "add". 그림 맨 위에 작은 제목 "copy(dst, src)". 그림 맨 아래 가운데에 회색 글씨 "Producer-Extends, Consumer-Super". 색은 파랑과 주황, 회색만 쓴다.</x-prompt>
+<x-caption>메서드가 값을 꺼내는 매개변수에는 extends, 값을 넣는 매개변수에는 super를 쓴다.</x-caption>
+</x-visual>
+
+<p>JDK의 API는 이 규칙으로 선언되어 있다. OpenJDK 21의 소스에서 몇 개를 옮기면 다음과 같다.</p>
+<pre><code class="language-java">// java.util.Collections
+public static <T> void copy(List<? super T> dest, List<? extends T> src)
+public static <T extends Object & Comparable<? super T>> T max(Collection<? extends T> coll)
+
+// java.util.Collection<E>, java.util.List<E>
+boolean addAll(Collection<? extends E> c);
+default boolean removeIf(Predicate<? super E> filter)
+default void sort(Comparator<? super E> c)</code></pre>
+<p><code>addAll</code>의 인자는 원소를 내주는 쪽이므로 <code>extends</code>다. <code>sort</code>의 비교자와 <code>removeIf</code>의 조건은 원소를 받아서 판단하는 쪽이므로 <code>super</code>다. 비교자 예를 직접 돌려 보면 반공변이 왜 자연스러운지 알 수 있다.</p>
+<pre><code class="language-java">Comparator<Shape> byArea = (a, b) -> Integer.compare(a.area(), b.area());
+
+List<Rect> three = new ArrayList<>(List.of(new Rect(4, 5), new Rect(2, 3), new Rect(1, 1)));
+three.sort(byArea);                 // Comparator<Shape>를 List<Rect>의 정렬에 쓴다
+System.out.println(three.get(0).area() + " " + three.get(2).area());   // 1 20</code></pre>
+<p><code>List<Rect></code>의 <code>sort</code>는 <code>Comparator<? super Rect></code>를 받는다. <code>Comparator<Shape></code>는 임의의 두 도형을 비교할 수 있으니 두 사각형도 당연히 비교할 수 있다. 더 넓은 입력을 다룰 줄 아는 비교자는 더 좁은 입력이 필요한 자리에 쓸 수 있다. 값을 받아서 쓰는 쪽의 타입은 입력 타입에 대해 반공변인 것이 자연스럽다. <code>sort</code>가 <code>Comparator<E></code>로 선언되어 있었다면 넓이 비교자를 도형 종류마다 다시 만들어야 했을 것이다.</p>
+<p>문법에 관해 하나 더 적는다. 하한은 와일드카드에만 쓸 수 있다. 타입 매개변수 선언에 <code><T super Rect></code>라고 적으면 javac는 <code>> expected</code>라는 문법 오류를 낸다. JLS 4.4의 문법이 타입 매개변수의 경계로 <code>extends</code>만 두고 있기 때문이다. 또 자바에서는 변성을 타입을 <b>선언하는 곳</b>이 아니라 <b>사용하는 곳</b>에서 정한다. 같은 <code>List</code>가 어떤 메서드의 매개변수에서는 공변으로, 다른 메서드의 매개변수에서는 반공변으로 쓰일 수 있는 까닭이다.</p>
+
+<h3>타입 소거: 컴파일러가 지우는 것과 남기는 것</h3>
+<p>지금까지 바이트코드에서 본 것을 모으면 세 가지다. 클래스 파일에서 <code>T</code>가 경계 타입으로 바뀌어 있었다. 호출할 때 적은 타입 인자 <code><Rect></code>는 흔적 없이 사라졌다. 정확한 타입이 필요한 자리에는 컴파일러가 <code>checkcast</code>를 넣었다. 이 세 가지는 하나의 규칙에서 나온다. 타입 소거(type erasure)다. 한국어 자료에서는 타입 이레이저라고 음역해 쓰기도 한다.</p>
+<p>JLS 4.6은 타입 소거를 타입에서 타입으로 가는 대응으로 정의한다. 매개변수화 타입과 타입 변수를 쓰는 타입을, 그것들을 쓰지 않는 타입으로 바꾸는 규칙이다.</p>
+<div class="table-wrap"><table><thead><tr><th>소스에 적은 타입</th><th>소거 결과</th><th>JLS 4.6의 규칙</th></tr></thead><tbody>
+<tr><td><code>Holder<Rect></code>, <code>List<? extends Shape></code></td><td><code>Holder</code>, <code>List</code></td><td>매개변수화 타입은 타입 인자를 뗀다</td></tr>
+<tr><td><code>T</code> (경계 없음)</td><td><code>Object</code></td><td rowspan="3">타입 변수는 가장 왼쪽 경계의 소거로 바뀐다</td></tr>
+<tr><td><code>T extends Shape</code></td><td><code>Shape</code></td></tr>
+<tr><td><code>T extends Shape & Comparable<T></code></td><td><code>Shape</code></td></tr>
+<tr><td><code>T[]</code>, <code>List<String>[]</code></td><td><code>Object[]</code>, <code>List[]</code></td><td>배열은 원소 타입을 소거한 배열이 된다</td></tr>
+<tr><td><code>int</code>, <code>String</code>, <code>Shape</code></td><td>그대로</td><td>그 밖의 타입은 자기 자신이다</td></tr>
+</tbody></table></div>
+<p>메서드와 생성자의 시그니처도 같은 방식으로 소거된다. 이름은 그대로 두고 매개변수 타입을 하나씩 소거한다. 앞에서 본 <code>larger(T)</code>의 디스크립터가 <code>(LShape;)LShape;</code>였던 것, <code>totalArea(List<? extends Shape>)</code>의 디스크립터가 <code>(Ljava/util/List;)I</code>가 되는 것이 이 규칙의 결과다.</p>
+<p>오라클의 자바 튜토리얼은 컴파일러가 제네릭을 구현하려고 하는 일을 세 가지로 정리한다. 타입 매개변수를 경계 또는 <code>Object</code>로 바꾼다. 타입 안전성을 지키는 데 필요한 캐스트를 넣는다. 제네릭 타입을 확장한 클래스에서 다형성이 유지되도록 브리지 메서드를 만든다. 앞의 둘은 이미 바이트코드로 확인했고, 셋째는 뒤의 브리지 메서드 장에서 본다. 튜토리얼은 이어서 타입 소거 덕분에 매개변수화 타입마다 새 클래스가 만들어지지 않는다고 적는다.</p>
+<p>왜 이런 방식을 택했는지는 제네릭이 들어온 시점을 보면 짐작할 수 있다. 제네릭은 Java 5에서 추가되었고, 그때는 이미 타입 인자 없이 <code>List</code>, <code>Map</code>을 쓰는 코드와 라이브러리가 널리 쓰이고 있었다. 소거 방식에서는 <code>List<String></code>을 쓰는 새 코드와 <code>List</code>를 쓰는 옛 코드가 같은 클래스 파일, 같은 객체를 주고받는다. JVM의 명령도 바뀔 필요가 없다. <code>new</code>, <code>checkcast</code>, <code>instanceof</code>가 받는 것은 여전히 클래스 이름이고 <code>ArrayList<Rect></code> 같은 매개변수화 타입이 아니다. JLS 4.8이 로 타입을 "레거시 코드와의 호환성을 위한 양보로만 허용된다"고 적은 것도 같은 맥락이다.</p>
+<h4>클래스는 하나, 객체에는 타입 인자가 없다</h4>
+<p>소거의 가장 직접적인 결과는 <code>ArrayList<Rect></code>와 <code>ArrayList<Tri></code>가 실행 시점에 같은 클래스라는 것이다.</p>
+<pre><code class="language-java">List<Rect> rects = new ArrayList<>();
+List<Tri> tris = new ArrayList<>();
+System.out.println(rects.getClass() == tris.getClass());   // true
+System.out.println(rects.getClass().getName());            // java.util.ArrayList</code></pre>
+<p>힙에 놓인 <code>ArrayList</code> 객체를 들여다보면 이유가 분명하다. OpenJDK 21의 <code>ArrayList</code>는 원소를 <code>Object[] elementData</code> 필드에 담고 개수를 <code>int size</code>에 둔다. 객체 어디에도 "이 리스트의 원소 타입은 <code>Rect</code>다"라고 기록하는 필드가 없다. <code>List<Rect></code>라는 정보는 그 객체를 가리키는 <b>변수의 타입</b>으로, 컴파일러의 머릿속에만 있다. 배열은 다르다. <code>new Rect[2]</code>로 만든 객체의 클래스는 <code>Rect[]</code>이고, 원소 타입이 클래스 자체에 들어 있다.</p>
+<pre class="diagram">지역 변수 (타입은 컴파일러만 안다)        힙 (실행 시점에 실제로 있는 것)
+
+List<Rect> rects ──────────▶ ArrayList 객체 ─────클래스─────┐
+                               elementData ─▶ Object[] { Rect, Rect }        ├─▶ java.util.ArrayList
+List<Tri>  tris  ──────────▶ ArrayList 객체 ─────클래스─────┘      (클래스는 하나뿐)
+                               elementData ─▶ Object[] { Tri }
+
+Rect[]     arr   ──────────▶ 배열 객체 ───────────클래스──────────▶ Rect[]
+                               { Rect, Rect }                          (원소 타입을 스스로 안다)</pre>
+<p>앞에서 미뤄 둔 질문의 답이 여기에 있다. 배열은 자기 원소 타입을 알기 때문에 저장할 때마다 검사해 <code>ArrayStoreException</code>을 던질 수 있다. <code>ArrayList</code> 객체는 원소 타입을 모르기 때문에 그런 검사를 할 수 없다. 그래서 제네릭은 공변을 실행 시점 검사로 받쳐 줄 수 없고, 컴파일 시점에 무공변과 와일드카드 규칙으로 막는 길을 택했다.</p>
+<p>리스트를 쓰는 코드의 바이트코드를 보면 검사가 어디에 있고 어디에 없는지가 드러난다.</p>
+<pre data-label="javap -c (발췌)"><code class="language-text">// rects.add(new Rect(4, 5));
+      18: invokeinterface #21,  2           // InterfaceMethod java/util/List.add:(Ljava/lang/Object;)Z
+
+// Rect r = rects.get(0);
+      26: invokeinterface #27,  2           // InterfaceMethod java/util/List.get:(I)Ljava/lang/Object;
+      31: checkcast     #16                 // class Rect
+
+// Object o = rects.get(0);
+      37: invokeinterface #27,  2           // InterfaceMethod java/util/List.get:(I)Ljava/lang/Object;
+      42: astore_3</code></pre>
+<p><code>add</code>는 <code>Object</code>를 받는다. 넣는 순간 실행 시점에 하는 검사는 없다. 넣는 쪽을 지키는 것은 컴파일러의 타입 검사 하나뿐이다. <code>get</code>은 <code>Object</code>를 돌려주고, <code>Rect</code> 변수에 받는 줄에만 <code>checkcast Rect</code>가 붙는다. <code>Object</code> 변수에 받는 줄에는 캐스트가 없다. 컴파일러는 소거된 타입만으로는 부족한 자리에만 캐스트를 넣는다. 이 사실은 뒤에서 힙 오염이 어디에서 터지는지를 예측할 때 그대로 쓰인다.</p>
+<h4>가장 왼쪽 경계가 클래스 파일을 정한다</h4>
+<p>경계가 여러 개인 타입 변수의 소거는 <b>가장 왼쪽</b> 경계다. 경계의 순서가 의미에는 영향을 주지 않지만 클래스 파일은 바꾼다.</p>
+<pre><code class="language-java">static <T extends Shape & Comparable<T>> T maxShape(T a, T b) {
+    return a.compareTo(b) >= 0 ? a : b;
+}</code></pre>
+<pre data-label="javap -s -c (발췌)"><code class="language-text">  static <T extends Shape & java.lang.Comparable<T>> T maxShape(T, T);
+    descriptor: (LShape;LShape;)LShape;
+    Code:
+       0: aload_0
+       1: checkcast     #7                  // class java/lang/Comparable
+       4: aload_1
+       5: invokeinterface #9,  2            // InterfaceMethod java/lang/Comparable.compareTo:(Ljava/lang/Object;)I</code></pre>
+<p>디스크립터에는 왼쪽 경계 <code>Shape</code>만 남았다. 본문에서 <code>compareTo</code>를 부르려면 <code>Comparable</code>이 필요한데, 소거된 매개변수 타입 <code>Shape</code>에는 그 메서드가 없다. 그래서 컴파일러가 메서드 <b>안쪽</b>에 <code>checkcast Comparable</code>을 넣었다. 경계를 <code>T extends Comparable<T> & java.io.Serializable</code>처럼 <code>Comparable</code>이 왼쪽에 오게 적으면 디스크립터가 <code>(Ljava/lang/Comparable;Ljava/lang/Comparable;)Ljava/lang/Comparable;</code>이 되고 이 캐스트는 사라진다.</p>
+<p>JDK에 이 규칙을 일부러 이용한 선언이 있다. 위에서 본 <code>Collections.max</code>의 경계 <code>T extends Object & Comparable<? super T></code>다. <code>Object &</code>는 의미상 군더더기지만, 가장 왼쪽 경계를 <code>Object</code>로 만들어 소거된 반환 타입을 <code>Object</code>로 고정한다. <code>javap -s</code>로 확인하면 디스크립터가 <code>(Ljava/util/Collection;)Ljava/lang/Object;</code>다. 오라클 튜토리얼의 <a href="https://docs.oracle.com/javase/tutorial/extra/generics/convert.html">레거시 코드 변환</a> 장은 이유를 이렇게 설명한다. 제네릭 이전의 <code>max</code>가 <code>Object</code>를 반환했고, 이미 컴파일된 옛 클래스 파일들이 그 시그니처에 의존하고 있었다. 소거 결과는 소스가 아니라 바이너리 호환성의 문제라는 점을 보여 주는 사례다.</p>
+<h4>지워지지 않고 남는 것: Signature 속성</h4>
+<p>여기서 의문이 하나 생긴다. 타입 변수가 다 지워졌다면 <code>javap</code>는 어떻게 <code>class Holder<T extends Shape></code>라고 출력했을까. 다른 소스 파일을 컴파일할 때 컴파일러는 <code>Holder.class</code>만 보고 어떻게 <code>Holder<Integer></code>를 거절할까. 답은 클래스 파일의 <code>Signature</code> 속성이다. JVMS 4.7.9는 선언에 타입 변수나 매개변수화 타입을 쓴 클래스, 인터페이스, 생성자, 메서드, 필드에 대해 자바 컴파일러가 반드시 시그니처를 내보내야 한다고 정한다.</p>
+<pre data-label="javap -v Holder (발췌)"><code class="language-text">  void put(T);
+    descriptor: (LShape;)V
+    Signature: #25                          // (TT;)V
+
+  T larger(T);
+    descriptor: (LShape;)LShape;
+    Signature: #30                          // (TT;)TT;
+
+Signature: #31                          // <T:LShape;>Ljava/lang/Object;</code></pre>
+<p>한 메서드에 정보가 두 벌 있다. <code>descriptor</code>는 소거된 타입이고, 메서드를 찾아 호출하는 데 쓰인다. <code>Signature</code>는 소거 전의 제네릭 선언이다. <code>TT;</code>는 "타입 변수 <code>T</code>"를, 맨 아래 줄의 <code><T:LShape;></code>는 "타입 매개변수 <code>T</code>, 경계는 <code>Shape</code>"를 뜻한다. 이 속성을 읽는 쪽은 이 클래스를 참조하는 코드를 컴파일하는 컴파일러와 리플렉션 API다.</p>
+<pre><code class="language-java">import java.lang.reflect.TypeVariable;
+import java.util.*;
+
+public class RF {
+    static List<Rect> field;
+
+    public static void main(String[] args) throws Exception {
+        TypeVariable<?> tv = Holder.class.getTypeParameters()[0];
+        System.out.println(tv.getName() + " " + tv.getBounds()[0]);
+        System.out.println(RF.class.getDeclaredField("field").getType());
+        System.out.println(RF.class.getDeclaredField("field").getGenericType());
+        System.out.println(new ArrayList<Rect>().getClass().getGenericSuperclass());
+        Object anon = new ArrayList<Rect>() { };
+        System.out.println(anon.getClass().getGenericSuperclass());
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">T class Shape
+interface java.util.List
+java.util.List<Rect>
+java.util.AbstractList<E>
+java.util.ArrayList<Rect></code></pre>
+<p>첫 줄은 <code>Holder</code>의 타입 매개변수와 경계가 실행 중에도 읽힌다는 것을 보여 준다. 둘째와 셋째 줄은 같은 필드의 두 얼굴이다. <code>getType()</code>은 소거된 타입 <code>List</code>를, <code>getGenericType()</code>은 선언에 적힌 <code>List<Rect></code>를 돌려준다. 넷째 줄이 중요하다. <code>new ArrayList<Rect>()</code>로 만든 <b>객체</b>에게 물으면 <code>Rect</code>는 어디에도 없고, <code>ArrayList</code> 클래스의 선언에 적힌 <code>AbstractList<E></code>만 나온다.</p>
+<p>정리하면 이렇다. 지워지는 것은 "이 객체가 어떤 타입 인자로 만들어졌는가"이고, 남는 것은 "이 선언에 어떤 제네릭 타입이 적혀 있는가"다. 다섯째 줄은 이 차이를 이용한다. <code>new ArrayList<Rect>() { }</code>는 중괄호 때문에 익명 클래스 선언이 된다. 그 익명 클래스의 상위 타입이 <code>ArrayList<Rect></code>라는 것은 선언의 일부이므로 <code>Signature</code> 속성에 기록되고, 리플렉션으로 읽힌다. 스프링의 <a href="https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/core/ParameterizedTypeReference.html"><code>ParameterizedTypeReference</code></a>가 사용할 때 하위 클래스(보통 익명 클래스)를 만들도록 요구하는 이유가 이것이다. Javadoc은 제네릭 타입을 포착해 실행 시점까지 유지하려면 하위 클래스를 만들어야 한다고 적는다.</p>
+
+<h3>소거 때문에 할 수 없는 것</h3>
+<p>타입 인자가 실행 시점에 없다는 사실에서 제네릭의 제약들이 따라 나온다. 따로 외울 목록이 아니다. "이 코드를 실행하려면 JVM이 <code>T</code>가 무엇인지 알아야 하는가"라는 질문 하나로 판정할 수 있다. 다음은 제네릭 클래스 <code>Maker<T></code> 안팎에서 시도했을 때 OpenJDK 21의 javac가 내는 오류다.</p>
+<div class="table-wrap"><table><thead><tr><th>시도한 코드</th><th>javac 오류</th><th>실행하려면 알아야 하는 것</th></tr></thead><tbody>
+<tr><td><code>new T()</code></td><td><code>unexpected type</code>, <code>required: class</code>, <code>found: type parameter T</code></td><td>어느 클래스의 객체를 만들지</td></tr>
+<tr><td><code>new T[n]</code></td><td><code>generic array creation</code></td><td>배열 객체에 기록할 원소 타입</td></tr>
+<tr><td><code>o instanceof T</code></td><td><code>Object cannot be safely cast to T</code></td><td>비교할 클래스</td></tr>
+<tr><td><code>T.class</code></td><td><code>cannot select from a type variable</code></td><td><code>T</code>에 해당하는 <code>Class</code> 객체</td></tr>
+<tr><td><code>o instanceof List<String></code> (<code>o</code>는 <code>Object</code>)</td><td><code>Object cannot be safely cast to List<String></code></td><td>객체가 만들어질 때의 타입 인자</td></tr>
+<tr><td><code>new List<String>[3]</code></td><td><code>generic array creation</code></td><td>저장 검사에 쓸 원소 타입 <code>List<String></code></td></tr>
+<tr><td><code>void f(List<String> l)</code>과 <code>void f(List<Integer> l)</code>을 함께 선언</td><td><code>name clash: f(List<Integer>) and f(List<String>) have the same erasure</code></td><td>두 메서드를 구분할 서로 다른 디스크립터</td></tr>
+<tr><td><code>class MyEx<T> extends Exception</code></td><td><code>a generic class may not extend java.lang.Throwable</code></td><td><code>catch</code>가 구분할 타입 인자</td></tr>
+</tbody></table></div>
+<p>위의 넷은 <code>T</code> 자체가 필요한 경우다. <code>new</code> 명령은 만들 클래스를, <code>instanceof</code>는 비교할 클래스를 피연산자로 받는다. 소거된 코드에는 <code>T</code> 자리에 넣을 클래스가 없다. 경계 타입 <code>Object</code>로 대신하면 <code>new T()</code>는 언제나 <code>Object</code>를 만들고 <code>instanceof T</code>는 <code>null</code>이 아닌 한 언제나 참이 되어, 적은 사람의 의도와 전혀 다른 프로그램이 된다. 컴파일러는 그런 코드를 만드느니 거절한다.</p>
+<p>아래 넷은 타입 인자가 필요한 경우다. 배열은 저장할 때마다 원소 타입을 검사하는데, <code>List<String>[]</code>의 원소 타입 가운데 실행 시점에 남는 것은 <code>List</code>뿐이다. 이런 배열을 허용하면 <code>List<Integer></code>를 넣어도 <code>ArrayStoreException</code>이 나지 않아, 배열이 약속한 실행 시점 검사가 구멍 난다. 오버로드의 경우는 더 단순하다. 두 <code>f</code>는 소거하면 둘 다 <code>f(List)</code>가 되어 클래스 파일에서 구분되지 않는다. 예외도 마찬가지다. 던져진 예외를 어느 <code>catch</code>가 받을지는 실행 시점에 예외 객체의 클래스로 정하는데, <code>MyEx<String></code>과 <code>MyEx<Integer></code>는 같은 클래스다.</p>
+<h4>실체화 가능 타입</h4>
+<p>JLS 4.7은 타입 정보가 실행 시점에 온전히 남는 타입을 실체화 가능 타입(reifiable type)이라고 부르고 목록을 든다. 제네릭이 아닌 클래스와 인터페이스, 기본형, 로 타입, 타입 인자가 모두 비한정 와일드카드인 매개변수화 타입, 그리고 원소 타입이 실체화 가능한 배열이다. <code>String</code>, <code>int</code>, <code>List</code>, <code>List<?></code>, <code>String[]</code>은 실체화 가능하고 <code>T</code>, <code>List<String></code>, <code>List<? extends Shape></code>는 그렇지 않다. <code>List<?></code>가 목록에 든 이유는 지워질 정보가 애초에 없기 때문이다.</p>
+<p>그래서 <code>o instanceof List<?></code>와 <code>new List<?>[3]</code>은 컴파일된다. Java 21의 <code>instanceof</code>는 한 걸음 더 나아가, 캐스트가 안전하다는 것을 컴파일러가 정적으로 보일 수 있으면 매개변수화 타입도 받는다. 변수 <code>l</code>의 타입이 <code>List<String></code>일 때 <code>l instanceof ArrayList<String></code>은 컴파일된다. 실행 시점에 확인할 것은 "<code>ArrayList</code>인가" 하나뿐이고, 타입 인자 <code>String</code>은 변수의 타입에서 이미 알려져 있기 때문이다.</p>
+<h4>(T) 캐스트는 실행 시점에 아무 일도 하지 않는다</h4>
+<p>금지되지 않고 경고만 나는 것이 하나 있다. 타입 변수로의 캐스트다.</p>
+<pre><code class="language-java">class Caster<T> {
+    T cast(Object o) { return (T) o; }     // warning: [unchecked] unchecked cast
+}
+
+Caster<String> cs = new Caster<>();
+String bad = cs.cast(42);                  // 예외는 이 줄에서 난다</code></pre>
+<pre data-label="javap -c Caster (발췌)"><code class="language-text">  T cast(java.lang.Object);
+    Code:
+       0: aload_1
+       1: areturn</code></pre>
+<p><code>cast</code>의 바이트코드에는 <code>checkcast</code>가 없다. 인자를 그대로 돌려줄 뿐이다. <code>T</code>의 소거가 <code>Object</code>이므로 검사할 것이 없기 때문이다. 정수 42는 아무 제지 없이 <code>cast</code>를 통과하고, <code>ClassCastException</code>은 호출한 쪽의 <code>String bad = ...</code> 줄에서 난다. 거기에 컴파일러가 넣은 <code>checkcast String</code>이 있기 때문이다. 소스의 <code>(T)</code>는 캐스트처럼 보이지만 컴파일러에게 "내가 책임진다"고 말하는 표시일 뿐이다. 컴파일러가 내는 <code>unchecked</code> 경고는 "이 캐스트는 실행 시점에 검사되지 않는다"는 뜻이다.</p>
+<p>이 경고를 감수하고 쓰는 정당한 자리도 있다. OpenJDK 21의 <code>ArrayList</code>는 원소를 <code>Object[]</code>에 담아 두고, 꺼낼 때 <code>return (E) elementData[index];</code>로 돌려준다. <code>new E[n]</code>을 만들 수 없으니 택한 방식이다. 이 캐스트가 안전한 근거는 실행 시점 검사가 아니라 클래스의 구조에 있다. 배열 필드는 <code>java.util</code> 패키지 밖에 공개되어 있지 않고, 원소가 들어가는 길은 <code>E</code>를 받는 메서드뿐이다. 다음 회차에서 배열 기반 리스트를 직접 만들 때 이 구조를 다시 만난다.</p>
+<h4>없는 정보는 값으로 넘겨받는다</h4>
+<p><code>new T()</code>가 정말 필요하다면, 실행 시점에 없는 정보를 호출자가 값으로 건네주면 된다. 객체를 만드는 방법을 함수로 받거나 <code>Class<T></code> 객체를 받는다.</p>
+<pre><code class="language-java">class Maker<T> {
+    private final Supplier<T> factory;
+    Maker(Supplier<T> factory) { this.factory = factory; }
+    T create() { return factory.get(); }
+}
+
+Maker<StringBuilder> m = new Maker<>(StringBuilder::new);
+System.out.println(m.create().append("ok"));    // ok</code></pre>
+<p>타입 인자 <code>StringBuilder</code>는 컴파일이 끝나면 사라지지만 생성자 참조 <code>StringBuilder::new</code>는 객체로 남아 실행 시점에 전달된다. 뒤에 나오는 <code>Collections.checkedList(list, Rect.class)</code>나 리플렉션 기반 라이브러리가 <code>Class</code> 객체를 인자로 요구하는 것도 같은 이유다. 타입 인자는 컴파일러에게 하는 말이고, <code>Class</code> 객체는 JVM에게 하는 말이다.</p>
+
+<h3>브리지 메서드</h3>
+<p>소거가 만드는 문제가 하나 더 있다. 제네릭 인터페이스를 구체적인 타입 인자로 구현할 때 생긴다. 넓이로 도형을 비교하는 비교자를 클래스로 만들어 보자. 파일의 줄 번호가 뒤에서 필요하므로 파일 전체를 적는다.</p>
+<pre data-label="AreaOrder.java"><code class="language-java">import java.util.Comparator;
+
+class AreaOrder implements Comparator<Shape> {
+    @Override
+    public int compare(Shape a, Shape b) {
+        return Integer.compare(a.area(), b.area());
+    }
+}</code></pre>
+<p>소스 수준에서는 문제가 없다. <code>Comparator<T></code>의 <code>compare(T, T)</code>에 <code>T = Shape</code>를 넣으면 <code>compare(Shape, Shape)</code>이고, <code>AreaOrder</code>가 바로 그 메서드를 구현했다. 클래스 파일 수준에서는 이야기가 다르다. <code>Comparator</code> 인터페이스의 메서드는 소거되어 디스크립터가 <code>(Ljava/lang/Object;Ljava/lang/Object;)I</code>다. <code>AreaOrder</code>에 적은 메서드의 디스크립터는 <code>(LShape;LShape;)I</code>다. 이름은 같지만 디스크립터가 다르다.</p>
+<p>JVM에게 이 둘은 다른 메서드다. JVMS 5.4.5는 한 인스턴스 메서드가 다른 메서드를 오버라이드할 수 있는 조건의 첫째로 "이름과 디스크립터가 같을 것"을 든다. 그리고 비교자를 호출하는 코드는 인터페이스를 보고 컴파일되었으므로 <code>invokeinterface Comparator.compare:(Ljava/lang/Object;Ljava/lang/Object;)I</code>로 호출한다. JVM은 실제 객체의 클래스 <code>AreaOrder</code>에서 그 이름과 디스크립터를 가진 메서드를 찾는다(JVMS 5.4.6). 소스에 적은 메서드만 있다면 찾을 것이 없다. JVM의 눈에는 <code>AreaOrder</code>가 인터페이스의 <code>compare</code>를 구현하지 않은 클래스가 된다.</p>
+<p>컴파일러는 이 틈을 메서드 하나를 더 만들어 메운다. 브리지 메서드(bridge method)다.</p>
+<pre data-label="javap -p -v AreaOrder (발췌)"><code class="language-text">  public int compare(Shape, Shape);
+    descriptor: (LShape;LShape;)I
+    flags: (0x0001) ACC_PUBLIC
+
+  public int compare(java.lang.Object, java.lang.Object);
+    descriptor: (Ljava/lang/Object;Ljava/lang/Object;)I
+    flags: (0x1041) ACC_PUBLIC, ACC_BRIDGE, ACC_SYNTHETIC
+    Code:
+       0: aload_0
+       1: aload_1
+       2: checkcast     #8                  // class Shape
+       5: aload_2
+       6: checkcast     #8                  // class Shape
+       9: invokevirtual #19                 // Method compare:(LShape;LShape;)I
+      12: ireturn
+      LineNumberTable:
+        line 3: 0</code></pre>
+<p>소스에 한 번 적은 <code>compare</code>가 클래스 파일에는 둘 있다. 둘째가 컴파일러가 만든 것이다. 하는 일은 두 인자를 <code>Shape</code>로 캐스트해서 첫째 메서드에 넘기는 것이 전부다. 자바 소스로 옮기면 <code>public int compare(Object a, Object b) { return compare((Shape) a, (Shape) b); }</code>에 해당한다. 플래그 두 개가 이 메서드의 출신을 말해 준다. JVMS 4.6의 표에서 <code>ACC_BRIDGE</code>는 "컴파일러가 생성한 브리지 메서드", <code>ACC_SYNTHETIC</code>은 "소스 코드에 없음"이다.</p>
+<figure class="flow-figure"><figcaption>Comparator&lt;Shape&gt; 타입 변수로 compare를 호출할 때</figcaption><ol class="flow">
+<li><strong>호출 지점</strong><span><code>invokeinterface Comparator.compare:(Object,Object)I</code>. 호출하는 코드는 소거된 인터페이스 메서드만 안다.</span></li>
+<li><strong>메서드 선택</strong><span>JVM이 객체의 실제 클래스 <code>AreaOrder</code>에서 이름과 디스크립터가 같은 메서드를 찾는다. 브리지 메서드가 선택된다.</span></li>
+<li><strong>브리지 메서드</strong><span>두 인자에 <code>checkcast Shape</code>를 하고 <code>compare(Shape, Shape)</code>을 <code>invokevirtual</code>로 호출한다.</span></li>
+<li><strong>작성한 메서드</strong><span><code>Integer.compare(a.area(), b.area())</code>를 실행해 결과를 돌려준다.</span></li>
+</ol></figure>
+
+<x-visual id="java-mid2-02-bridge-method" title="브리지 메서드를 거쳐 실제 compare 메서드가 호출되는 과정" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>호출자는 소거된 시그니처로 호출하고, 컴파일러가 만든 브리지 메서드가 캐스트 후 개발자가 작성한 메서드로 넘겨 준다는 두 단계 호출을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 깔끔한 시퀀스 다이어그램. 위쪽에 세 개의 참여자 상자를 가로로 나란히 둔다. 왼쪽 "호출자 (sort 등)", 가운데 주황 점선 테두리 상자 "AreaOrder.compare(Object, Object)", 오른쪽 파란 실선 테두리 상자 "AreaOrder.compare(Shape, Shape)". 가운데 상자 위에 작은 주황 꼬리표 "브리지: 컴파일러가 생성", 오른쪽 상자 위에 작은 파란 꼬리표 "소스에 작성". 각 상자 아래로 세로 생명선. 첫 번째 화살표: 왼쪽 생명선에서 가운데 생명선으로, 라벨 "invokeinterface compare(Object, Object)". 가운데 생명선 위에 작은 활성 막대와 옆 메모 "checkcast Shape × 2". 두 번째 화살표: 가운데 생명선에서 오른쪽 생명선으로, 라벨 "invokevirtual compare(Shape, Shape)". 세 번째 화살표: 오른쪽에서 가운데로 점선, 라벨 "int". 네 번째 화살표: 가운데에서 왼쪽으로 점선, 라벨 "int". 색은 주황과 파랑, 회색만 쓰고 선은 얇게.</x-prompt>
+<x-caption>호출자는 소거된 시그니처를 호출하고, 브리지 메서드가 인자를 캐스트해 작성한 메서드로 넘긴다.</x-caption>
+</x-visual>
+
+<p>리플렉션으로 보면 메서드가 실제로 둘이다. <code>AreaOrder.class.getDeclaredMethods()</code>의 각 원소에 <code>isBridge()</code>와 <code>isSynthetic()</code>을 물으면 다음과 같이 나온다. 이 배열의 순서는 정해져 있지 않다고 Javadoc이 밝히고 있으므로 줄의 순서는 달라질 수 있다.</p>
+<pre data-label="실행 결과"><code class="language-text">public int AreaOrder.compare(Shape,Shape) bridge=false synthetic=false
+public int AreaOrder.compare(java.lang.Object,java.lang.Object) bridge=true synthetic=true</code></pre>
+<p>브리지 메서드 안의 <code>checkcast</code>는 평소에는 실패할 일이 없다. <code>Comparator<Shape></code> 타입의 변수로 호출하면 컴파일러가 인자를 검사하기 때문이다. 로 타입으로 호출하면 그 검사가 꺼지고, 브리지 메서드가 실행 시점의 마지막 방어선이 된다.</p>
+<pre><code class="language-java">Comparator<Shape> c = new AreaOrder();
+System.out.println(c.compare(new Rect(4, 5), new Tri(6, 4)));    // 1
+
+Comparator raw = new AreaOrder();                                // 로 타입
+System.out.println(raw.compare(new Rect(1, 1), "문자열"));        // 경고만 나고 컴파일된다</code></pre>
+<pre data-label="실행 결과 (둘째 호출, 첫 프레임까지)"><code class="language-text">Exception in thread "main" java.lang.ClassCastException: class java.lang.String cannot be cast to class Shape (java.lang.String is in module java.base of loader 'bootstrap'; Shape is in unnamed module of loader 'app')
+	at AreaOrder.compare(AreaOrder.java:3)</code></pre>
+<p>스택 트레이스의 첫 프레임을 보자. 메서드 이름은 <code>AreaOrder.compare</code>인데 줄 번호가 3이다. <code>AreaOrder.java</code>의 3번째 줄은 메서드 본문이 아니라 <code>class AreaOrder implements Comparator<Shape> {</code>, 곧 클래스 선언이다. 위 <code>javap</code> 출력의 <code>LineNumberTable</code>에서 보았듯이 OpenJDK 21의 javac는 브리지 메서드의 줄 번호를 클래스 선언 줄로 기록한다. 예외는 작성한 <code>compare(Shape, Shape)</code>에 들어가기도 전에, 브리지 메서드의 <code>checkcast</code>에서 났다. 스택 트레이스에 메서드 이름과 클래스 선언 줄이 함께 찍혀 있으면 브리지 메서드를 떠올리면 된다.</p>
+<p>브리지 메서드는 제네릭에만 쓰이는 장치가 아니다. 오버라이드하면서 반환 타입을 하위 타입으로 좁히는 공변 반환에서도 같은 일이 일어난다. 상위 클래스에 <code>Shape make()</code>가 있고 하위 클래스가 <code>Rect make()</code>로 오버라이드하면, 하위 클래스의 클래스 파일에는 디스크립터가 <code>()LRect;</code>인 작성한 메서드와 디스크립터가 <code>()LShape;</code>이고 <code>ACC_BRIDGE, ACC_SYNTHETIC</code>이 붙은 메서드가 함께 들어간다. 디스크립터에는 반환 타입이 포함되므로(JVMS 4.3.3) JVM에게는 둘이 서로 다른 메서드이기 때문이다. 두 경우의 공통점은 "소스의 오버라이드 규칙"과 "JVM의 오버라이드 규칙" 사이에 틈이 있고, 컴파일러가 메서드를 하나 더 만들어 그 틈을 잇는다는 것이다.</p>
+
+<h3>로 타입과 힙 오염</h3>
+<p>상한 경계를 다룰 때 "컴파일러가 넣은 캐스트는 실패하지 않는다"고 했고, 그 보장이 깨지는 길이 있다고 예고했다. 그 길이 로 타입이다. 타입 인자 없이 <code>Holder</code>라고만 쓰면 제네릭 이전의 타입처럼 다뤄진다. JLS 4.8은 로 타입의 인스턴스 메서드와 필드의 타입이 제네릭 선언에 있는 타입의 <b>소거</b>라고 정한다. 로 타입 <code>Holder</code>의 <code>put</code>은 <code>put(Shape)</code>이고 <code>larger</code>는 <code>Shape larger(Shape)</code>다.</p>
+<pre><code class="language-java">Holder<Rect> rectHolder = new Holder<>();
+rectHolder.put(new Rect(4, 5));
+
+Holder raw = rectHolder;                        // ① 로 타입 변수가 같은 객체를 가리킨다
+raw.put(new Tri(6, 4));                         // ② 경고만 나고 컴파일된다
+
+System.out.println(rectHolder.areaOf());        // ③
+Shape s = rectHolder.larger(new Rect(2, 3));    // ④
+System.out.println(s.name());
+Rect r = rectHolder.larger(new Rect(2, 3));     // ⑤
+System.out.println(r.width());</code></pre>
+<pre data-label="javac -Xlint:unchecked 출력 (발췌)"><code class="language-text">warning: [unchecked] unchecked call to put(T) as a member of the raw type Holder
+        raw.put(new Tri(6, 4));
+               ^</code></pre>
+<pre data-label="실행 결과"><code class="language-text">12
+Tri
+Exception in thread "main" java.lang.ClassCastException: class Tri cannot be cast to class Rect (Tri and Rect are in unnamed module of loader 'app')</code></pre>
+<p>②에서 삼각형이 사각형 보관함에 들어갔다. 로 타입의 <code>put</code>은 <code>Shape</code>를 받으므로 컴파일러가 막을 근거가 없다. 대신 경고를 낸다. <code>-Xlint:unchecked</code> 옵션 없이 컴파일하면 이 경고는 <code>Note: ... uses unchecked or unsafe operations.</code>라는 안내문으로 줄어 나온다. 이 시점에 <code>Holder<Rect></code> 타입의 변수 <code>rectHolder</code>가 <code>Tri</code>를 담은 객체를 가리키게 되었다. JLS 4.12.2는 매개변수화 타입의 변수가 그 타입이 아닌 객체를 가리키는 상황을 힙 오염(heap pollution)이라고 부른다.</p>
+<p>이후 세 줄이 흥미롭다. ③은 정상으로 12를 출력한다. <code>areaOf</code>의 바이트코드는 <code>Shape.area</code>를 호출할 뿐이고 <code>Rect</code>인지 확인하는 명령이 없다. ④도 정상이다. <code>larger</code>가 클래스 파일상 <code>Shape</code>를 돌려주고 받는 변수도 <code>Shape</code>이므로 <code>checkcast</code>가 없다. 넓이 12와 6을 비교해 담겨 있던 삼각형이 돌아오고 <code>Tri</code>가 출력된다. ⑤에서 비로소 예외가 난다. 같은 호출인데 받는 변수가 <code>Rect</code>여서 컴파일러가 <code>checkcast Rect</code>를 넣었기 때문이다.</p>
+<p>이 추적에서 두 가지를 얻는다. 첫째, 힙 오염은 일어난 줄에서 드러나지 않는다. 잘못은 ②에서 일어났지만 예외는 ⑤에서 나고, 스택 트레이스에는 ⑤만 찍힌다. 오염된 객체는 예외 없이 프로그램 안을 멀리 돌아다닐 수 있다. 둘째, 예외가 나는 자리는 예측할 수 있다. 컴파일러가 <code>checkcast</code>를 넣은 자리, 곧 소거된 타입보다 구체적인 타입이 필요한 자리다. 소스에 캐스트가 없는 줄에서 <code>ClassCastException</code>이 났다면 그 줄에 컴파일러가 넣은 캐스트가 있다는 뜻이고, 원인은 그보다 앞선 어딘가의 로 타입이나 검사되지 않는 캐스트다.</p>
+<p>JLS 4.12.2는 힙 오염이 일어날 수 있는 조건도 적는다. 프로그램이 로 타입과 관련해 컴파일 시점 <code>unchecked</code> 경고를 일으키는 연산을 했거나, 실체화 불가능한 원소 타입의 배열을 로 타입 또는 제네릭이 아닌 상위 타입의 배열 변수로 가리킨 경우뿐이다. 실무적인 결론은 분명하다. <code>unchecked</code> 경고는 "여기서부터는 컴파일러가 타입 안전성을 보증하지 않는다"는 경계 표시다. 프로그램 전체에 그런 연산이 없다면 컴파일러가 넣은 캐스트는 실패하지 않는다. 경고를 <code>@SuppressWarnings</code>로 가렸거나 경고가 난 채로 컴파일된 코드를 함께 쓰고 있다면 보증은 거기서 끊긴다.</p>
+<p>원소 타입을 신경 쓰지 않는 코드를 쓸 때 로 타입 대신 써야 하는 것이 비한정 와일드카드다. 위 코드의 ①과 ②를 <code>Holder<?> any = rectHolder; any.put(new Tri(6, 4));</code>로 바꾸면 <code>incompatible types: Tri cannot be converted to CAP#1</code>이라는 컴파일 오류가 된다. 둘 다 "타입 인자를 모른다"는 뜻이지만, 와일드카드는 모르니까 넣기를 막고 로 타입은 모르니까 검사를 끈다. JLS 4.8은 제네릭 도입 이후에 작성하는 코드에서 로 타입을 쓰는 것을 강하게 만류한다고 적고 있다.</p>
+<aside class="note">오염이 어디서 시작되는지 찾기 어려울 때는 넣는 순간에 검사하는 래퍼가 도움이 된다. <code>Collections.checkedList(new ArrayList<>(), Rect.class)</code>가 돌려주는 리스트는 원소를 넣을 때마다 <code>Class</code> 객체로 타입을 확인한다. 로 타입을 거쳐 <code>Tri</code>를 넣으면 꺼낼 때가 아니라 넣는 줄에서 <code>ClassCastException: Attempt to insert class Tri element into collection with element type class Rect</code>가 난다.</aside>
+
+<h3>이 지식이 다시 쓰이는 곳</h3>
+<p>이 권의 남은 회차는 컬렉션 프레임워크다. 거기서 읽게 될 선언은 이 회차의 문법으로 적혀 있다. 다음 회차에서 직접 만드는 배열 기반 리스트는 <code>Object[]</code>에 원소를 담고 꺼낼 때 <code>(E)</code>로 캐스트하는 구조이고, 그 캐스트가 왜 경고를 내는지, 왜 안전한지는 방금 본 대로다. 정렬을 다루는 마지막 회차의 <code>Comparator<? super E></code>는 하한 와일드카드이고, 스트림의 <code><R> Stream<R> map(Function<? super T, ? extends R> mapper)</code>는 PECS를 함수 타입에 적용한 선언이다. 함수는 입력을 소비하고 출력을 생산하므로 입력에 <code>super</code>, 출력에 <code>extends</code>가 붙는다.</p>
+<p>프레임워크를 볼 때는 "선언에 적힌 제네릭 정보는 남는다"는 사실이 쓰인다. 클래스가 <code>implements Comparator<Shape></code>라고 선언했다면 그 타입 인자는 <code>Signature</code> 속성에 기록되어 리플렉션으로 읽힌다. 스프링 데이터에서 <code>JpaRepository<Member, Long></code>을 상속한 인터페이스만 선언해도 프레임워크가 엔티티 타입을 알아낼 수 있는 바탕이 이것이다. 반대로 객체에서 타입 인자를 알아낼 수 없다는 사실은 <code>ParameterizedTypeReference</code>처럼 익명 클래스를 만들어 타입을 선언에 적어 넣는 관용구를 낳았다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>제네릭은 컴파일러와 맺는 계약이다. 경계는 타입 변수에 대해 컴파일러가 믿어도 되는 것을 늘리고, 와일드카드는 모르는 타입 인자에 대해 안전한 연산만 남긴다. 계약의 검사가 끝나면 컴파일러는 타입 변수를 경계로 바꾸고, 필요한 자리에 <code>checkcast</code>를 넣고, 디스크립터가 어긋나는 자리에 브리지 메서드를 만든다. 실행 중인 객체에는 타입 인자가 없다. 그래서 타입 인자가 필요한 연산은 금지되고, 로 타입으로 계약을 우회하면 그 결과는 컴파일러가 넣어 둔 캐스트에서 뒤늦게 드러난다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>타입 변수의 경계</dt><dd>타입 변수의 멤버는 경계 타입의 멤버다(JLS 4.4). 경계를 적지 않으면 <code>Object</code>이므로 <code>Object</code>의 메서드만 부를 수 있다. <code>T extends Shape</code>는 본문에서 <code>Shape</code>의 메서드를 쓸 수 있게 하고, 타입 인자를 <code>Shape</code>의 하위 타입으로 제한한다.</dd>
+<dt>제네릭 메서드와 타입 추론</dt><dd>타입 매개변수를 메서드에 선언하면 호출할 때마다 타입 인자가 정해진다. 컴파일러는 인자 타입에서 하한을, 대입 대상과 선언된 경계에서 상한을 모아 추론하고, 조건이 충돌하면 그 제약들을 오류 문구에 보여 준다. 타입 인자는 실행 시점에 전달되는 값이 아니다.</dd>
+<dt>무공변</dt><dd><code>Rect</code>가 <code>Shape</code>의 하위 타입이어도 <code>List<Rect></code>는 <code>List<Shape></code>의 하위 타입이 아니다. 허용하면 <code>List<Shape></code> 변수를 통해 사각형 리스트에 삼각형을 넣을 수 있기 때문이다. 배열은 공변을 허용하고 저장할 때마다 실행 시점 검사를 한다.</dd>
+<dt>상한 와일드카드와 캡처</dt><dd><code>List<? extends Shape></code>는 <code>Shape</code>의 하위 타입을 원소로 하는 모든 리스트를 받는다. 컴파일러는 <code>?</code>를 이름 없는 타입 변수로 캡처한다. 꺼낸 값은 <code>Shape</code>로 받을 수 있고, 원소 타입의 값은 <code>null</code> 말고는 넣을 수 없다.</dd>
+<dt>하한 와일드카드와 PECS</dt><dd><code>List<? super Rect></code>는 <code>Rect</code>의 상위 타입을 원소로 하는 리스트를 받는다. <code>Rect</code>를 넣을 수 있고 꺼낸 값은 <code>Object</code>다. 값을 내주는 매개변수에는 <code>extends</code>, 값을 받는 매개변수에는 <code>super</code>를 쓴다.</dd>
+<dt>타입 소거</dt><dd>컴파일러는 매개변수화 타입에서 타입 인자를 떼고 타입 변수를 가장 왼쪽 경계로 바꿔 클래스 파일을 만든다(JLS 4.6). <code>ArrayList<Rect></code>와 <code>ArrayList<Tri></code>는 실행 시점에 같은 클래스이고, 객체에는 타입 인자가 기록되지 않는다.</dd>
+<dt>컴파일러가 넣는 캐스트</dt><dd>소거된 타입보다 구체적인 타입이 필요한 자리에만 <code>checkcast</code>가 들어간다. 넣는 쪽에는 실행 시점 검사가 없고, 소스의 <code>(T)</code> 캐스트는 경계 타입에 대한 검사밖에 하지 않는다.</dd>
+<dt>Signature 속성과 실체화 가능 타입</dt><dd>선언에 적힌 제네릭 정보는 <code>Signature</code> 속성으로 클래스 파일에 남아 컴파일러와 리플렉션이 읽는다. 실행 시점에 온전히 남는 타입만 <code>instanceof</code>와 배열 생성에 쓸 수 있고, <code>new T()</code>, <code>new T[n]</code>, <code>T.class</code>는 금지된다.</dd>
+<dt>브리지 메서드와 힙 오염</dt><dd>소거 후 디스크립터가 어긋나는 오버라이드를 잇기 위해 컴파일러가 <code>ACC_BRIDGE</code> 메서드를 만든다. 로 타입으로 타입 검사를 우회하면 매개변수화 타입의 변수가 다른 타입의 객체를 가리키는 힙 오염이 생기고, 예외는 나중에 <code>checkcast</code>가 있는 줄에서 난다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 와일드카드를 직접 적을 일이 가장 많은 곳은 여러 팀이 쓰는 공용 API의 매개변수다. 컬렉션을 받아 읽기만 하는 메서드를 <code>List<Shape></code>로 선언하면 <code>List<Rect></code>를 가진 호출자는 리스트를 복사해야 한다. <code>Collection<? extends Shape></code>로 받으면 그 불편이 없다. 콜백이나 비교자를 받는 매개변수에는 <code>? super</code>를 붙여 더 일반적인 구현을 재사용할 수 있게 한다. 반대로 한 클래스 안에서만 쓰는 private 메서드에까지 와일드카드를 두를 필요는 없다. 읽는 사람의 부담이 늘 뿐이다. 반환 타입에는 쓰지 않는다. <code>List<? extends Shape></code>를 돌려받은 호출자는 그 리스트에 아무것도 넣지 못하고, 그 타입을 다시 자기 메서드의 시그니처에 옮겨 적어야 한다.</p>
+<p><code>unchecked</code> 경고는 하나씩 판단해야 한다. 새로 쓰는 코드에서 로 타입 때문에 나는 경고는 타입 인자를 적어 없앤다. 타입 변수로의 캐스트처럼 구조상 피할 수 없는 경고는, 안전한 이유를 설명할 수 있을 때에만 <code>@SuppressWarnings("unchecked")</code>를 가장 좁은 범위에 붙이고 이유를 주석으로 남긴다. 캐스트가 보이지 않는 줄에서 <code>ClassCastException</code>이 났다는 장애 보고를 받으면 그 줄을 고치려 하지 말고 오염원을 찾는다. 후보는 로 타입, 검사되지 않는 캐스트, 그리고 타입 정보 없이 역직렬화한 결과를 매개변수화 타입 변수에 담은 코드다. <code>List<Member>.class</code>라는 표현이 문법에 없어서 <code>List.class</code>로 받는 자리가 흔한 출발점이고, 스프링에서 그 자리에 <code>ParameterizedTypeReference</code>를 쓰는 이유도 같다.</p>
+<p>소거는 API 설계에도 제약을 건다. <code>save(List<Member>)</code>와 <code>save(List<Order>)</code>를 오버로드로 둘 수 없으니 메서드 이름을 다르게 지어야 한다. 제네릭 예외 클래스로 오류 종류를 구분하는 설계는 불가능하다. 실행 시점에 타입에 따라 분기해야 하면 <code>Class<T></code>나 팩토리 함수를 인자로 받는다. 이 가운데 어느 것도 요령이 아니라 "객체는 타입 인자를 모른다"에서 곧바로 나오는 결론이다.</p>
+<p>리플렉션으로 메서드를 훑는 코드를 쓰거나 디버깅할 때는 브리지 메서드를 염두에 둔다. 제네릭 인터페이스를 구현한 클래스의 <code>getDeclaredMethods()</code>에는 이름이 같은 메서드가 둘 나올 수 있다. 스프링의 <code>BridgeMethodResolver</code> Javadoc은 메서드의 애너테이션을 찾을 때 브리지 메서드인지 확인하고 원래 메서드를 찾는 것이 좋다고 적는다. 스택 트레이스에서 클래스 선언 줄을 가리키는 프레임을 만났을 때, 그리고 프로파일러에 같은 이름의 메서드가 두 번 보일 때도 같은 지식이 쓰인다.</p>
+</x-review>
+
+<x-practice>
+<li><code>Rect</code>와 <code>Tri</code>가 <code>Shape</code>의 하위 클래스일 때, 다음 아홉 줄 가운데 컴파일되는 줄과 오류가 나는 줄을 가르고 이유를 적어라. 앞줄에서 오류가 난 변수는 선언된 것으로 치고 나머지 줄을 판단한다.
+<pre><code class="language-java">List<? extends Shape> a = new ArrayList<Rect>();   // (1)
+List<? super Rect> b = new ArrayList<Shape>();     // (2)
+List<? super Shape> c = new ArrayList<Rect>();     // (3)
+List<? extends Shape> d = b;                       // (4)
+List<?> e = b;                                     // (5)
+a.add(new Rect(1, 1));                             // (6)
+b.add(new Rect(1, 1));                             // (7)
+Shape s1 = a.get(0);                               // (8)
+Shape s2 = b.get(0);                               // (9)</code></pre></li>
+<li>다음 클래스를 컴파일했을 때 두 필드와 두 메서드의 디스크립터를 손으로 적어라. 그리고 <code>map</code>과 <code>maxKey</code>의 본문 가운데 컴파일러가 <code>checkcast</code>를 넣는 곳이 있는지, 있다면 어떤 타입으로 넣는지 답하라.
+<pre><code class="language-java">class Pair<K extends Comparable<K>, V> {
+    K key;
+    V value;
+
+    <R extends Shape> R map(Function<? super V, ? extends R> f) {
+        return f.apply(value);
+    }
+
+    K maxKey(Pair<K, ?> other) {
+        return key.compareTo(other.key) >= 0 ? key : other.key;
+    }
+}</code></pre></li>
+<li>다음 코드는 경고와 함께 컴파일된다. (가)부터 (마)까지 차례로 실행될 때 무엇이 출력되고 어느 줄에서 어떤 예외가 나는지 예측하라. 예외가 그 줄에서 나고 그 앞줄에서는 나지 않는 이유를 바이트코드 관점에서 설명하라.
+<pre><code class="language-java">List<Integer> ints = new ArrayList<>();
+ints.add(42);
+List raw = ints;
+List<String> strs = raw;
+
+System.out.println(strs.size());      // (가)
+Object o = strs.get(0);               // (나)
+System.out.println(o);                // (다)
+System.out.println(strs.get(0));      // (라)
+String s = strs.get(0);               // (마)</code></pre></li>
+<li>다음 클래스의 클래스 파일에는 <code>compareTo</code>라는 이름의 메서드가 몇 개 들어 있는가. 각각의 디스크립터를 적어라. 이어지는 두 출력문이 각각 어떻게 되는지, 예외가 난다면 어느 메서드 안에서 나는지 설명하라.
+<pre><code class="language-java">class Len implements Comparable<Len> {
+    final int v;
+    Len(int v) { this.v = v; }
+    public int compareTo(Len o) { return Integer.compare(v, o.v); }
+}
+
+Comparable raw = new Len(1);
+System.out.println(raw.compareTo(new Len(2)));
+System.out.println(raw.compareTo("x"));</code></pre></li>
+<li>다음 메서드는 <code>src</code>의 원소를 모두 <code>dst</code>로 옮긴다. <code>List<Rect> rects</code>와 <code>List<Shape> shapes</code>에 대해 <code>drain(rects, shapes)</code>를 호출하면 컴파일되지 않는다. 이유를 타입 추론의 제약으로 설명하고, 본문을 바꾸지 않고 이 호출이 되도록 시그니처를 고쳐라. 고친 뒤에도 본문의 <code>dst.addAll(src)</code>와 <code>src.clear()</code>가 컴파일되는 이유도 적어라.
+<pre><code class="language-java">static <T> void drain(List<T> src, List<T> dst) {
+    dst.addAll(src);
+    src.clear();
+}</code></pre></li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 컴파일되는 줄은 (1), (2), (5), (7), (8)이고 오류는 (3), (4), (6), (9)다. (1)은 <code>Rect</code>가 <code>Shape</code>의 하위 타입이므로 <code>Rect <= ? extends Shape</code>가 성립한다. (2)는 <code>Shape</code>가 <code>Rect</code>의 상위 타입이므로 <code>Shape <= ? super Rect</code>가 성립한다. (3)은 <code>Rect</code>가 <code>Shape</code>의 상위 타입이 아니어서 안 된다. 허용되면 <code>c.add(new Tri(1, 1))</code>로 사각형 리스트에 삼각형이 들어간다. (4)에서 <code>b</code>가 가리키는 것은 <code>List<Object></code>일 수도 있으므로 "<code>Shape</code>의 하위 타입의 리스트"라고 볼 수 없다. (5)의 <code>List<?></code>는 모든 리스트를 받는다. (6)은 <code>a</code>가 <code>List<Tri></code>일 수 있어 거절되고, (7)은 <code>b</code>가 무엇이든 <code>Rect</code>를 받아 주는 리스트이므로 된다. (8)은 상한 <code>Shape</code>로 받는 것이니 되고, (9)는 <code>? super Rect</code>에서 꺼낸 값의 상한이 <code>Object</code>뿐이라 <code>Shape</code>로 받을 수 없다.</p>
+<p><b>2번.</b> <code>key</code>는 <code>Ljava/lang/Comparable;</code>, <code>value</code>는 <code>Ljava/lang/Object;</code>다. <code>K</code>의 가장 왼쪽 경계가 <code>Comparable<K></code>이고 그 소거가 <code>Comparable</code>이며, <code>V</code>는 경계가 없어 <code>Object</code>다. <code>map</code>은 <code>(Ljava/util/function/Function;)LShape;</code>다. 매개변수화 타입 <code>Function<? super V, ? extends R></code>은 <code>Function</code>으로, <code>R</code>은 경계 <code>Shape</code>로 소거된다. <code>maxKey</code>는 <code>(LPair;)Ljava/lang/Comparable;</code>이다. <code>checkcast</code>는 <code>map</code>에 하나 들어간다. 소거된 <code>Function.apply</code>는 <code>Object</code>를 돌려주는데 <code>map</code>의 소거된 반환 타입은 <code>Shape</code>이므로 <code>return</code> 앞에 <code>checkcast Shape</code>가 필요하다. <code>maxKey</code>에는 없다. <code>key</code> 필드의 타입이 이미 <code>Comparable</code>이어서 <code>compareTo</code>를 바로 호출할 수 있고, 반환 타입도 <code>Comparable</code>이기 때문이다.</p>
+<p><b>3번.</b> <code>1</code>과 <code>42</code>가 출력된 뒤 (라)에서 <code>ClassCastException</code>(<code>Integer</code>를 <code>String</code>으로 캐스트할 수 없다)이 난다. (마)는 실행되지 않는다. (가)의 <code>size()</code>는 원소 타입과 무관하다. (나)는 <code>List.get</code>이 돌려준 <code>Object</code>를 <code>Object</code> 변수에 넣으므로 컴파일러가 캐스트를 넣지 않는다. (다)는 <code>println(Object)</code>를 호출해 정수의 문자열 표현을 찍는다. (라)가 함정이다. 컴파일러가 보기에 <code>strs.get(0)</code>의 타입은 <code>String</code>이므로 오버로드 가운데 <code>println(String)</code>이 선택되고, 그 인자로 넘기기 위해 <code>checkcast String</code>이 들어간다. 힙 오염은 <code>List<String> strs = raw;</code>에서 일어났지만 예외는 컴파일러가 캐스트를 넣은 첫 줄에서 난다.</p>
+<p><b>4번.</b> 둘이다. 작성한 <code>compareTo(Len)</code>의 디스크립터는 <code>(LLen;)I</code>이고, 컴파일러가 만든 브리지 메서드 <code>compareTo(Object)</code>의 디스크립터는 <code>(Ljava/lang/Object;)I</code>다. 소거된 <code>Comparable.compareTo</code>의 디스크립터가 <code>(Ljava/lang/Object;)I</code>이므로, JVM이 오버라이드로 인정할 같은 디스크립터의 메서드가 필요하다. 첫 출력문은 <code>-1</code>을 찍는다. 로 타입으로 호출하면 <code>invokeinterface</code>가 브리지 메서드를 선택하고, 브리지가 인자를 <code>Len</code>으로 캐스트해 작성한 메서드를 부른다. 둘째 출력문은 <code>ClassCastException</code>(<code>String</code>을 <code>Len</code>으로 캐스트할 수 없다)을 낸다. 예외는 작성한 <code>compareTo(Len)</code>에 들어가기 전에 브리지 메서드의 <code>checkcast Len</code>에서 나고, 스택 트레이스의 줄 번호는 <code>Len</code> 클래스의 선언 줄을 가리킨다.</p>
+<p><b>5번.</b> <code>src</code>가 <code>List<T></code>이므로 <code>T = Rect</code>여야 하고, <code>dst</code>가 <code>List<T></code>이므로 <code>T = Shape</code>여야 한다. 제네릭 타입은 무공변이라 두 조건이 모두 "같다"는 제약이고, 둘을 동시에 만족하는 <code>T</code>가 없다. javac는 <code>inference variable T has incompatible equality constraints Shape,Rect</code>라고 알려 준다. <code>src</code>는 값을 내주고 <code>dst</code>는 값을 받으므로 시그니처를 <code>static <T> void drain(List<? extends T> src, List<? super T> dst)</code>로 고친다. 그러면 제약이 "<code>Rect</code>는 <code>T</code>의 하위 타입", "<code>Shape</code>는 <code>T</code>의 상위 타입"으로 느슨해져 호출이 성립한다. 본문의 <code>addAll</code>은 <code>Collection<? extends E></code>를 받는다. <code>dst</code>의 원소 타입은 <code>T</code>의 상위 타입이고 <code>src</code>의 원소 타입은 <code>T</code>의 하위 타입이므로, <code>src</code>는 "<code>dst</code> 원소 타입의 하위 타입을 담은 컬렉션"이라는 조건에 맞는다. <code>clear()</code>는 원소 타입의 값을 인자로 받지 않으므로 <code>? extends</code> 리스트에서도 호출할 수 있다. 실행하면 <code>rects</code>는 비고 <code>shapes</code>에 원소가 옮겨진다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>경계 없이 선언한 <code>class Holder<T></code>의 본문에서 <code>item.area()</code>가 컴파일되지 않는다. 프로그램 전체에서 이 클래스를 <code>Holder<Rect></code>로만 쓰고 있어도 마찬가지다. 이유로 옳은 것은?</q>
+<o>타입 인자가 실행 시점에 지워지므로 JVM이 <code>area()</code>를 찾지 못해서다.</o>
+<o>본문은 타입 인자가 정해지기 전에 선언 자리에서 한 번 검사되고, 그때 <code>T</code>의 멤버는 경계 <code>Object</code>의 멤버뿐이어서다.</o>
+<o>제네릭 클래스의 필드에는 메서드를 호출할 수 없고 값을 저장하고 꺼내는 일만 허용되어서다.</o>
+<o><code>area()</code>가 추상 메서드라서 타입 변수를 통해서는 호출할 수 없어서다.</o>
+<why>제네릭 클래스의 본문은 사용 지점마다 다시 검사되지 않는다. 선언 자리에서 한 번, 가능한 모든 타입 인자에 대해 성립해야 하는 방식으로 검사된다. JLS 4.4에 따라 경계를 적지 않은 타입 변수의 경계는 <code>Object</code>이고 그 멤버만 쓸 수 있다. 실제 사용이 <code>Holder<Rect></code>뿐이라는 사실은 검사에 반영되지 않는다. 소거를 원인으로 든 보기는 순서가 뒤바뀌었다. 이것은 컴파일 오류이고 소거는 컴파일러의 검사가 끝난 뒤의 일이다. 필드에 메서드를 호출할 수 없다거나 추상 메서드라서 안 된다는 규칙은 없다. <code>T extends Shape</code>로 경계를 주면 같은 호출이 컴파일된다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>매개변수 <code>List<? extends Shape> shapes</code>에 대해 <code>shapes.add(new Rect(1, 1))</code>이 컴파일 오류인 이유로 옳은 것은?</q>
+<o><code>? extends</code>로 선언한 리스트는 불변 객체가 되어 어떤 변경 메서드도 호출할 수 없기 때문이다.</o>
+<o><code>Rect</code>가 상한 <code>Shape</code>의 하위 타입이 아니기 때문이다.</o>
+<o><code>shapes</code>가 실제로는 <code>List<Tri></code>일 수 있고, 컴파일러는 <code>Rect</code>가 캡처된 타입 변수의 하위 타입임을 보일 수 없기 때문이다.</o>
+<o>허용하면 실행 시점에 <code>ArrayStoreException</code>이 나므로 컴파일러가 미리 막는 것이다.</o>
+<why>컴파일러는 <code>?</code>를 상한이 <code>Shape</code>인 새 타입 변수(<code>CAP#1</code>)로 캡처하고, <code>add</code>의 매개변수 타입은 그 타입 변수가 된다. <code>CAP#1</code>의 정체가 <code>Tri</code>일 수 있으므로 <code>Rect</code>를 넘길 수 없다. 리스트가 불변이 되는 것은 아니다. <code>clear()</code>나 <code>remove(0)</code>은 호출되고 <code>add(null)</code>도 컴파일된다. <code>Rect</code>는 <code>Shape</code>의 하위 타입이 맞다. <code>ArrayStoreException</code>은 배열의 이야기다. 제네릭 리스트에는 넣을 때 하는 실행 시점 검사가 없고, 바로 그래서 컴파일 시점에 막는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>다음 가운데 실행 시점에 리플렉션으로도 알아낼 수 <b>없는</b> 것은?</q>
+<o><code>class Holder<T extends Shape></code>에서 타입 매개변수 <code>T</code>의 경계가 <code>Shape</code>라는 것</o>
+<o>필드 선언 <code>static List<Rect> field;</code>에 적힌 타입 인자가 <code>Rect</code>라는 것</o>
+<o><code>new ArrayList<Rect>()</code>로 만든 리스트 객체의 원소 타입이 <code>Rect</code>라는 것</o>
+<o><code>new ArrayList<Rect>() { }</code>로 만든 익명 클래스의 상위 타입이 <code>ArrayList<Rect></code>라는 것</o>
+<why>소거로 사라지는 것은 객체가 어떤 타입 인자로 만들어졌는가이다. <code>ArrayList</code> 객체에는 원소 타입을 기록하는 곳이 없고, 그 객체의 클래스는 타입 인자와 무관하게 <code>java.util.ArrayList</code> 하나다. 나머지 셋은 모두 선언에 적힌 정보다. 컴파일러가 <code>Signature</code> 속성으로 클래스 파일에 남기므로 <code>getTypeParameters()</code>, <code>getGenericType()</code>, <code>getGenericSuperclass()</code>로 읽을 수 있다. 중괄호가 붙은 <code>new ArrayList<Rect>() { }</code>는 익명 클래스를 선언하는 식이고, 그 상위 타입은 선언의 일부라는 점에서 중괄호 없는 식과 다르다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>class AreaOrder implements Comparator<Shape></code>에 <code>compare(Shape, Shape)</code> 하나만 적었는데 클래스 파일에는 <code>compare(Object, Object)</code>가 추가로 들어 있다. 컴파일러가 이 메서드를 만드는 이유는?</q>
+<o>소거된 인터페이스 메서드의 디스크립터가 <code>(Object, Object)</code>이고, JVM은 이름과 디스크립터가 같은 메서드만 오버라이드로 보기 때문이다.</o>
+<o>로 타입으로 호출하는 옛 코드를 위해 타입 검사를 건너뛰는 빠른 경로를 제공하기 위해서다.</o>
+<o><code>Shape</code> 타입의 인자를 <code>Object</code>로 박싱해 넘겨야 하기 때문이다.</o>
+<o>리플렉션이 제네릭 타입 정보를 읽을 수 있도록 원래 시그니처를 보존하기 위해서다.</o>
+<why>호출하는 쪽은 인터페이스를 보고 <code>invokeinterface Comparator.compare:(Ljava/lang/Object;Ljava/lang/Object;)I</code>로 컴파일된다. JVM은 실제 클래스에서 이름과 디스크립터가 같은 메서드를 선택하는데(JVMS 5.4.5, 5.4.6), 작성한 메서드의 디스크립터는 <code>(LShape;LShape;)I</code>여서 맞지 않는다. 브리지 메서드가 그 디스크립터로 호출을 받아 인자를 캐스트한 뒤 작성한 메서드로 넘긴다. 검사를 건너뛰는 경로라는 설명은 반대다. 브리지 메서드는 <code>checkcast</code>를 한다. 박싱은 기본형과 래퍼 사이의 변환이고 참조 타입끼리인 여기와는 무관하다. 리플렉션을 위해 제네릭 시그니처를 보존하는 일은 <code>Signature</code> 속성이 한다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>힙 오염으로 <code>List<String> strs</code>의 0번 원소가 <code>Integer</code> 객체가 되었다. 다음 가운데 <code>ClassCastException</code>이 나지 <b>않는</b> 줄은?</q>
+<o><code>String s = strs.get(0);</code></o>
+<o><code>Object o = strs.get(0);</code></o>
+<o><code>int n = strs.get(0).length();</code></o>
+<o><code>System.out.println(strs.get(0));</code></o>
+<why>소거된 <code>List.get</code>은 <code>Object</code>를 돌려준다. 컴파일러는 그보다 구체적인 타입이 필요한 자리에만 <code>checkcast String</code>을 넣는다. <code>Object</code> 변수에 받는 줄에는 캐스트가 없으므로 예외도 없다. <code>String</code> 변수에 대입하는 줄과 <code>length()</code>를 호출하는 줄에는 <code>String</code>이 필요해서 캐스트가 들어간다. <code>println</code>에 넘기는 줄은 컴파일러가 식의 타입 <code>String</code>을 보고 <code>println(String)</code> 오버로드를 고르므로 역시 캐스트가 들어간다. 예외가 나는 자리는 오염이 일어난 자리가 아니라 컴파일러가 캐스트를 넣은 자리다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>상한 경계(upper bound)</dt><dd>타입 매개변수 선언에 <code>extends</code>로 적는 제약. 타입 인자를 그 타입의 하위 타입으로 제한하고, 본문에서 경계 타입의 멤버를 쓸 수 있게 한다.</dd>
+<dt>제네릭 메서드(generic method)</dt><dd>반환 타입 앞에 자기 타입 매개변수를 선언한 메서드. 타입 인자는 호출할 때마다 명시하거나 추론으로 정해진다.</dd>
+<dt>무공변(invariance)</dt><dd>타입 인자 사이의 하위 타입 관계가 제네릭 타입 사이로 이어지지 않는 성질. <code>List<Rect></code>와 <code>List<Shape></code>는 서로 하위 타입이 아니다.</dd>
+<dt>와일드카드(wildcard)</dt><dd>타입 인자 자리에 쓰는 <code>?</code>. 모르는 타입을 뜻하며 <code>? extends T</code>(상한), <code>? super T</code>(하한), <code>?</code>(비한정) 세 형태가 있다.</dd>
+<dt>캡처 변환(capture conversion)</dt><dd>컴파일러가 와일드카드 타입 인자를 경계가 붙은 새 타입 변수로 바꿔 놓고 검사하는 것(JLS 5.1.10). 오류 문구에 <code>CAP#1</code>로 나타난다.</dd>
+<dt>PECS</dt><dd>producer-extends, consumer-super. 메서드에 값을 내주는 매개변수에는 <code>? extends</code>, 값을 받아 가는 매개변수에는 <code>? super</code>를 쓴다는 선택 기준.</dd>
+<dt>타입 소거(type erasure)</dt><dd>매개변수화 타입에서 타입 인자를 떼고 타입 변수를 가장 왼쪽 경계로 바꾸는 대응(JLS 4.6). 클래스 파일의 디스크립터는 소거된 타입으로 적힌다.</dd>
+<dt>실체화 가능 타입(reifiable type)</dt><dd>타입 정보가 실행 시점에 온전히 남는 타입(JLS 4.7). 제네릭이 아닌 타입, 로 타입, <code>List<?></code>, 기본형과 그 배열 등이 해당한다.</dd>
+<dt>브리지 메서드(bridge method)</dt><dd>소거나 공변 반환 때문에 디스크립터가 달라진 오버라이드를 잇기 위해 컴파일러가 만드는 합성 메서드. <code>ACC_BRIDGE</code>와 <code>ACC_SYNTHETIC</code> 플래그가 붙는다.</dd>
+<dt>힙 오염(heap pollution)</dt><dd>매개변수화 타입의 변수가 그 타입이 아닌 객체를 가리키는 상황(JLS 4.12.2). 로 타입이나 검사되지 않는 캐스트에서 생기고, 나중에 컴파일러가 넣은 캐스트에서 예외로 드러난다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-4.html">JLS §4 Types, Values, and Variables</a> — 타입 변수의 경계(4.4), 와일드카드와 포함 규칙(4.5.1), 타입 소거(4.6), 실체화 가능 타입(4.7), 로 타입(4.8), 힙 오염(4.12.2)</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-5.html">JLS §5.1.10 Capture Conversion</a> — 와일드카드를 새 타입 변수로 바꾸는 규칙과 그 상한·하한</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-4.html">JVMS §4 The class File Format</a> — 메서드 디스크립터(4.3.3), <code>ACC_BRIDGE</code>·<code>ACC_SYNTHETIC</code> 플래그(4.6), <code>Signature</code> 속성(4.7.9)</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-5.html">JVMS §5.4.5 Method Overriding, §5.4.6 Method Selection</a> — JVM이 이름과 디스크립터로 오버라이드와 호출 대상을 정하는 규칙</li>
+<li><a href="https://docs.oracle.com/javase/tutorial/java/generics/erasure.html">The Java Tutorials — Type Erasure</a> — 컴파일러가 소거로 하는 세 가지 일. 이어지는 <a href="https://docs.oracle.com/javase/tutorial/java/generics/bridgeMethods.html">Effects of Type Erasure and Bridge Methods</a>에 브리지 메서드의 예가 있다</li>
+<li><a href="https://docs.oracle.com/javase/tutorial/java/generics/wildcardGuidelines.html">The Java Tutorials — Guidelines for Wildcard Use</a> — "in"/"out" 변수에 따른 와일드카드 선택 기준과 반환 타입에 대한 권고</li>
+</x-refs>

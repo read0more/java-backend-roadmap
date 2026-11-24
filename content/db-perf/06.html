@@ -1,0 +1,747 @@
+<x-meta>
+deck: InnoDB에서는 테이블이 곧 기본 키 B+Tree라는 사실에서 출발해 PK 설계, 세컨더리 인덱스의 이중 탐색과 커버링, 랜덤·순차 I/O의 비용을 페이지 단위로 따지고 세 DBMS의 저장 철학을 비교한다.
+minutes: 110
+</x-meta>
+
+<x-goals>
+<li>InnoDB가 클러스터드 인덱스를 고르는 세 단계 규칙과 리프 레코드에 들어 있는 내용을 설명하고, 기본 키 검색과 세컨더리 인덱스 검색이 각각 B+Tree를 몇 번 내려가는지 셀 수 있다.</li>
+<li>순차 PK와 랜덤 PK에서 페이지 분할 지점이 어떻게 정해지는지 InnoDB의 분할 휴리스틱으로 추적하고, 그 차이가 페이지 채움률, 버퍼 풀 작업 집합, 세컨더리 인덱스 크기에 주는 영향을 근거로 기본 키를 설계할 수 있다.</li>
+<li>세컨더리 인덱스 리프에 기본 키가 붙는다는 사실로부터 커버링 인덱스, 인덱스 확장, 정렬 생략이 가능한 쿼리를 판별하고 EXPLAIN의 <code>Using index</code>와 <code>key_len</code>으로 확인할 수 있다.</li>
+<li>세컨더리 인덱스로 여러 행을 읽을 때 랜덤 접근이 페이지 접근 수를 얼마나 늘리는지 계산하고, 인덱스 순서와 기본 키 순서의 상관관계에 따라 같은 행 수라도 비용이 크게 달라지는 것을 실험으로 확인할 수 있다.</li>
+<li>InnoDB, Oracle, PostgreSQL이 행을 가리키는 주소로 무엇을 쓰는지 비교하고, 각 설계가 읽기와 쓰기 중 어디에서 비용을 치르는지 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 똑같이 "인덱스를 탔는데" 비용은 왜 다른가</h3>
+
+<p>지난 회차에서 B+Tree를 바닥부터 세웠다. 루트에서 리프까지 내려가는 탐색, 리프끼리 이어진 연결 리스트, 페이지가 가득 찰 때 일어나는 분할까지 봤다. 그런데 그때는 "인덱스 하나"만 놓고 이야기했다. 실제 InnoDB 테이블에는 B+Tree가 여러 개 있고, 그중 하나는 특별하다. 행 데이터 자체를 담은 트리가 하나 있고, 나머지 트리들은 그 트리를 다시 찾아가기 위한 이정표만 담는다. 이 회차는 이 두 종류의 트리, 곧 <b>클러스터드 인덱스(clustered index)</b>와 <b>세컨더리 인덱스(secondary index)</b>의 관계를 다룬다.</p>
+
+<p>왜 이 구분이 성능에서 결정적인지 예를 들어 보자. 01회에서 만든 <code>orders</code> 테이블(100만 행, 기본 키 <code>order_id</code>)에 <code>member_id</code> 인덱스를 하나 만들었다고 하자. 다음 세 쿼리는 모두 EXPLAIN에서 "인덱스를 쓴다"고 나온다.</p>
+
+<pre><code class="language-sql">-- (가) 기본 키로 한 행
+SELECT * FROM orders WHERE order_id = 99991;
+
+-- (나) 세컨더리 인덱스로 10행
+SELECT * FROM orders WHERE member_id = 1;
+
+-- (다) 세컨더리 인덱스만으로 10행
+SELECT order_id FROM orders WHERE member_id = 1;</code></pre>
+
+<p>(나)는 (가)보다 행이 10배 많으니 10배쯤 일한다고 생각하기 쉽다. 실제로는 (나)가 하는 일의 구조가 (가)와 다르다. 인덱스 트리를 한 번 내려간 뒤, 찾은 10개의 항목마다 <b>다른 트리를 처음부터 다시 내려간다</b>. 반면 (다)는 (나)와 똑같은 인덱스를 쓰면서도 두 번째 트리를 한 번도 건드리지 않는다. 그리고 범위를 넓혀 <code>member_id BETWEEN 1 AND 1000</code>처럼 테이블의 1%만 고르는 조건을 걸면, 인덱스를 쓰는 쪽이 테이블 전체를 처음부터 끝까지 읽는 쪽보다 더 많은 페이지를 건드리는 일이 벌어진다. 이 회차의 목표는 이 세 가지 현상을 모두 페이지 단위로 설명하는 것이다.</p>
+
+<p>순서는 이렇다. 먼저 클러스터드 인덱스가 무엇이고 InnoDB가 어떤 열로 그것을 만드는지 본다. 이어서 기본 키 값이 순서대로 들어올 때와 무작위로 들어올 때 트리가 어떻게 다르게 자라는지를 분할 알고리즘 수준에서 추적하고, 이를 바탕으로 실무에서 기본 키를 고르는 기준을 세운다. 다음으로 세컨더리 인덱스의 리프에 무엇이 들어 있는지, 그로부터 커버링 인덱스가 어떻게 가능해지는지 본다. 마지막으로 랜덤 I/O와 순차 I/O의 비용 차이를 이론과 실습으로 확인하고, MySQL·Oracle·PostgreSQL이 같은 문제를 어떻게 다르게 풀었는지 비교한다. 설명의 기준은 MySQL 8.0 이상의 InnoDB이고, 내부 구현을 근거로 드는 문장에는 "8.4 소스 기준"이라고 밝힌다. 정렬 생략은 07회, 인덱스 컨디션 푸시다운(ICP)과 커버링 인덱스의 응용은 08회, MRR은 09회, 옵티마이저의 비용 계산은 10회에서 자세히 다룬다.</p>
+
+<h3>클러스터드 인덱스 1: InnoDB에서는 테이블이 곧 인덱스다</h3>
+
+<p>행을 디스크에 저장하는 방식은 크게 두 가지다. 첫째는 <b>힙(heap)</b> 방식이다. 행을 빈 공간이 있는 아무 곳에나 넣고, 인덱스는 따로 만들어 "이 키 값을 가진 행은 몇 번 블록의 몇 번째 슬롯에 있다"는 물리 주소를 기록한다. 테이블 데이터와 인덱스가 완전히 분리되어 있고, 모든 인덱스가 동등하다. 둘째는 <b>인덱스 구성(index-organized)</b> 방식이다. 행 전체를 B+Tree의 리프에 키 순서대로 넣는다. 인덱스와 테이블이 따로 있는 것이 아니라 하나의 트리가 곧 테이블이다.</p>
+
+<p>InnoDB는 언제나 두 번째 방식을 쓴다. MySQL 용어집은 클러스터드 인덱스를 "기본 키 인덱스를 가리키는 InnoDB 용어"로 정의하고, InnoDB 테이블 저장소가 기본 키 열의 값을 기준으로 구성된다고 설명한다. 같은 항목에 Oracle 데이터베이스에서는 이런 형태의 테이블을 인덱스 구성 테이블(index-organized table)이라 부른다는 설명도 붙어 있다. "클러스터드(clustered)"라는 말은 기본 키 값이 가까운 행들이 같은 리프 페이지에 모여(clustered) 있다는 뜻이다. 01회에서 <code>information_schema.TABLES</code>의 <code>DATA_LENGTH</code>가 클러스터드 인덱스의 크기라고 했던 것도 이 때문이다. InnoDB 테이블의 데이터 크기와 클러스터드 인덱스의 크기는 같은 말이다.</p>
+
+<h4>리프 레코드와 비리프 레코드에 들어 있는 것</h4>
+
+<p>01회에서 <code>orders</code>의 클러스터드 인덱스 리프 레코드를 바이트 단위로 분해했다. 다시 정리하면, 리프 레코드 하나에는 레코드 헤더, 기본 키 <code>order_id</code>, 숨은 열 두 개, 그리고 나머지 모든 열이 들어 있다. MySQL 매뉴얼의 다중 버전 동시성 제어 설명에 따르면 InnoDB는 각 행에 세 개의 필드를 덧붙인다. 마지막으로 행을 삽입하거나 갱신한 트랜잭션의 ID를 담는 6바이트 <code>DB_TRX_ID</code>, 언두 로그 레코드를 가리키는 7바이트 롤 포인터 <code>DB_ROLL_PTR</code>, 그리고 기본 키가 없을 때만 쓰이는 6바이트 <code>DB_ROW_ID</code>다. 반면 리프가 아닌 페이지(루트와 중간 노드)에는 행 데이터가 없다. 비리프 레코드는 "이 키 값부터는 이 자식 페이지로 가라"는 노드 포인터로, 키 값과 자식 페이지 번호만 담는다.</p>
+
+<pre class="diagram">orders 의 클러스터드 인덱스 (B+Tree 하나 = 테이블 전체)
+
+                     [루트: 1 | 220001 | 440001 | ...]       ← 노드 포인터만
+                    /            |              \
+      [중간: 1 | 226 | 451 ...]  [중간: ...]   [중간: ...]   ← 노드 포인터만
+        /        |        \
+ [리프 p1]  ⇄  [리프 p2]  ⇄  [리프 p3]  ⇄ ...                ← 행 전체
+ order_id=1     order_id=226   order_id=451
+  DB_TRX_ID      ...
+  DB_ROLL_PTR
+  member_id, status, amount, ordered_at, memo
+ order_id=2
+  ...</pre>
+
+<p>위 그림의 숫자는 01회의 어림(리프 한 페이지에 약 225행)을 따른 예시다. 01회의 어림대로 리프 페이지가 4,400여 개라면 트리의 높이는 얼마일까. 비리프 레코드는 레코드 헤더 5바이트, <code>order_id</code> 8바이트, 자식 페이지 번호 4바이트로 이루어지므로 20바이트가 채 되지 않는다. 16KB 페이지 하나에 노드 포인터가 수백 개 이상 들어가므로, 리프 4,400여 개를 가리키는 데는 중간 노드 몇 개면 충분하고 그 위에 루트 하나가 있으면 된다. 즉 <code>orders</code>의 클러스터드 인덱스는 루트, 중간, 리프의 3층이다. 01회처럼 <code>mysql.innodb_index_stats</code>에서 <code>size</code>와 <code>n_leaf_pages</code>를 비교해 볼 수도 있다. 다만 8.4 소스 기준으로 <code>size</code>는 비리프용과 리프용 두 세그먼트에 예약된 페이지 수이고 <code>n_leaf_pages</code>는 리프 세그먼트에서 실제로 쓰이는 페이지 수이므로, 두 값의 차이에는 비리프 페이지 말고도 예약만 되고 아직 쓰이지 않은 페이지가 들어 있다. 차이를 그대로 비리프 페이지 수로 읽으면 안 된다.</p>
+
+<p>이 회차를 위해 01회의 생성 규칙 그대로 <code>orders</code>를 MySQL 8.4.13과 8.0.46에서 다시 만들어 보니, <code>PRIMARY</code>의 <code>n_leaf_pages</code>는 두 버전 모두 5,046(<code>size</code> 5,096)으로 01회에 적힌 4,467보다 많았다. 페이지당 평균 약 198행이다. 이때 버퍼 풀에 올라온 리프 페이지의 <code>information_schema.INNODB_BUFFER_PAGE</code>를 보면 페이지당 레코드 데이터가 평균 약 15,064바이트로 페이지는 15/16 가까이 차 있었다. 그러니 어림과의 차이는 채움률이 아니라 레코드 하나의 실제 크기(15,064 ÷ 198 ≈ 76바이트)가 01회의 어림(약 67.5바이트)보다 큰 데서 온다. 이 회차의 페이지 번호 계산은 01회와 맞추기 위해 225행 어림을 그대로 쓰지만, 실제 리프는 그보다 10%쯤 많다는 것을 염두에 두자.</p>
+
+<h4>기본 키로 한 행 찾기, 기본 키 범위 읽기</h4>
+
+<p>쿼리 (가) <code>WHERE order_id = 99991</code>을 추적해 보자. 루트 페이지에서 이진 탐색으로 99991이 속한 자식을 고르고, 중간 페이지에서 다시 자식을 고르고, 리프 페이지에서 99991 레코드를 찾는다. 페이지 접근은 세 번이고, 리프에 도착한 순간 행의 모든 열이 거기 있다. 매뉴얼은 이 점을 이렇게 설명한다. 클러스터드 인덱스로 행에 접근하는 것은 인덱스 검색이 행 데이터를 담은 페이지로 곧장 이어지기 때문에 빠르고, 테이블이 크면 인덱스 레코드와 행 데이터를 다른 페이지에 저장하는 방식에 비해 디스크 I/O를 한 번 아끼는 경우가 많다.</p>
+
+<p>기본 키 범위를 읽을 때는 이 구조의 장점이 더 커진다. <code>WHERE order_id BETWEEN 100001 AND 101000</code>은 리프에서 100001을 한 번 찾은 뒤 리프 안의 다음 레코드, 페이지가 끝나면 연결 리스트로 이어진 다음 리프 페이지로 옮겨 가며 1,000행을 읽는다. 한 페이지에 약 225행이 있다면 1,000행은 대여섯 개의 연속된 리프 페이지에 들어 있다. 트리를 내려가는 일은 처음 한 번뿐이고, 그 뒤로는 페이지 하나를 가져올 때마다 행 수백 개를 얻는다. 기본 키가 가까운 행이 물리적으로도 가까이 모여 있다는 것, 이것이 클러스터드 인덱스가 주는 가장 큰 이득이다.</p>
+
+<h4>InnoDB가 클러스터드 인덱스를 고르는 규칙</h4>
+
+<p>InnoDB 테이블은 클러스터드 인덱스가 없을 수 없다. 행을 담을 트리가 반드시 하나 있어야 하기 때문이다. 그래서 매뉴얼은 클러스터드 인덱스를 고르는 규칙을 세 단계로 정해 두었다.</p>
+
+<ol>
+<li><code>PRIMARY KEY</code>를 정의하면 그것을 클러스터드 인덱스로 쓴다.</li>
+<li><code>PRIMARY KEY</code>가 없으면, 모든 키 열이 <code>NOT NULL</code>로 정의된 첫 번째 <code>UNIQUE</code> 인덱스를 클러스터드 인덱스로 쓴다.</li>
+<li>둘 다 없으면 행 ID 값을 담는 합성 열 위에 <code>GEN_CLUST_INDEX</code>라는 숨은 클러스터드 인덱스를 만든다. 행 ID는 6바이트 필드이고 새 행이 삽입될 때마다 단조 증가하므로, 행은 삽입된 순서대로 정렬된다.</li>
+</ol>
+
+<p>두 번째 규칙은 의외의 결과를 낳는다. 다음 테이블을 보자.</p>
+
+<pre><code class="language-sql">CREATE TABLE account (
+  email      VARCHAR(100) NOT NULL,
+  nickname   VARCHAR(30)  NOT NULL,
+  created_at DATETIME     NOT NULL,
+  UNIQUE KEY uk_account_email (email)
+) ENGINE = InnoDB;</code></pre>
+
+<p>기본 키를 선언하지 않았으니 "기본 키 없는 테이블"처럼 보이지만, <code>uk_account_email</code>이 NOT NULL 열 하나로 된 유니크 인덱스이므로 InnoDB는 이것을 클러스터드 인덱스로 쓴다. 이 테이블의 행은 이메일 문자열 순서로 리프에 정렬된다. 가입은 이메일의 알파벳 순서와 무관하게 일어나므로 새 행은 트리의 아무 곳에나 들어가고, 뒤에서 볼 랜덤 삽입의 비용을 그대로 치른다. 만약 <code>email</code>이 NULL을 허용했다면 이 인덱스는 후보가 되지 못하고, 세 번째 규칙에 따라 숨은 행 ID가 클러스터드 키가 된다. MySQL 8.4.13에서 두 경우를 모두 만들어 <code>information_schema.INNODB_INDEXES</code>를 보면 확인할 수 있다. 위 테이블에서는 <code>uk_account_email</code>의 <code>TYPE</code>이 3(클러스터드이면서 유니크)이고, <code>email</code>을 NULL 허용으로 바꾼 테이블에서는 <code>TYPE</code> 1인 <code>GEN_CLUST_INDEX</code>가 따로 생기고 <code>uk_account_email</code>은 <code>TYPE</code> 2(유니크 세컨더리)가 된다.</p>
+
+<p>세 번째 규칙의 숨은 인덱스도 문제가 있다. 행 ID는 쿼리에서 쓸 수 없는 숨은 값이라, 행을 가리키는 키가 있는데도 애플리케이션은 그 키로 행을 찾을 수 없다. 모든 조회는 세컨더리 인덱스를 거치거나 풀 스캔이 된다. 이런 사고를 막기 위해 MySQL 8.0.30부터는 <code>sql_generate_invisible_primary_key</code> 변수를 <code>ON</code>으로 두면 기본 키 없이 만든 InnoDB 테이블에 <code>my_row_id</code>라는 이름의 <code>BIGINT UNSIGNED NOT NULL AUTO_INCREMENT</code> 보이지 않는(invisible) 열을 기본 키로 자동 추가한다. 이 변수의 기본값은 <code>OFF</code>다. 보이지 않는 열은 <code>SELECT *</code>에 나타나지 않지만 이름을 적으면 조회할 수 있으므로, 숨은 행 ID와 달리 쓸 수 있는 키가 된다. 매뉴얼의 결론은 분명하다. 모든 테이블에 기본 키를 정의해야 하고, 논리적으로 유일하면서 NULL이 아닌 열이 없으면 자동 증가 열을 추가하라는 것이다.</p>
+
+<x-visual id="db-perf-06-clustered-tree" title="InnoDB 클러스터드 인덱스: 리프에 행 전체가 들어 있는 B+Tree" kind="구조도" ratio="16:9">
+<x-hint>클러스터드 인덱스의 비리프 페이지에는 키와 자식 페이지 번호만, 리프 페이지에는 행 전체가 기본 키 순서로 들어 있고 리프끼리 양방향으로 연결되어 있음을 보여 준다.</x-hint>
+<x-prompt>A clean technical diagram of a three-level B+Tree, white background, flat style. Top: one root box labeled "루트 페이지" containing small key cells "1", "220001", "440001". Middle row: three boxes labeled "중간 페이지" with key cells, connected from the root by downward arrows. Bottom row: five wide boxes labeled "리프 페이지" connected left-to-right by double-headed horizontal arrows labeled "이전/다음 페이지". Inside each leaf box, draw stacked row records; zoom into the first leaf with a callout showing one record's fields in order: "order_id", "DB_TRX_ID", "DB_ROLL_PTR", "member_id", "status", "amount", "ordered_at", "memo". Put a bracket on the right side spanning the root and middle rows labeled "키 + 자식 페이지 번호만", and another bracket spanning the leaf row labeled "행 전체(기본 키 순서)". Title at the top: "클러스터드 인덱스 = 테이블". Use blue for internal pages and green for leaf pages.</x-prompt>
+<x-caption>InnoDB 테이블은 기본 키로 정렬된 B+Tree 하나다. 행의 모든 열은 리프에만 있다.</x-caption>
+</x-visual>
+
+<h3>클러스터드 인덱스 2: 순차 PK와 랜덤 PK</h3>
+
+<p>행이 기본 키 순서로 리프에 정렬되어 있다는 것은 새 행이 들어갈 자리가 기본 키 값으로 정해진다는 뜻이다. 힙 테이블은 빈 공간이 있는 곳 어디에나 행을 넣으면 되지만, 클러스터드 인덱스는 그 키 값이 속한 바로 그 리프 페이지에 넣어야 한다. 그래서 기본 키 값이 어떤 순서로 만들어지느냐가 삽입 성능과 테이블 크기를 좌우한다.</p>
+
+<p>기본 키가 <code>AUTO_INCREMENT</code>처럼 계속 커지는 값이면 새 행은 언제나 트리의 가장 오른쪽 리프에 들어간다. 반대로 UUID 버전 4처럼 무작위로 만든 값이면 새 행은 트리의 모든 리프에 고르게 흩어져 들어간다. 이 차이가 페이지 분할에서 어떻게 드러나는지, 그리고 분할 말고도 무엇이 달라지는지 차례로 보자.</p>
+
+<h4>분할 지점은 어떻게 정해지는가: InnoDB의 순차 삽입 휴리스틱</h4>
+
+<p>05회에서 본 교과서의 B+Tree는 가득 찬 노드를 가운데에서 둘로 나눈다. 그런데 오른쪽 끝에만 계속 삽입하는 경우 가운데 분할은 낭비다. 왼쪽 절반은 다시는 새 행을 받지 않을 페이지인데 반만 채운 채 남겨 두게 되고, 테이블 전체가 반쯤 빈 페이지들로 채워진다. InnoDB는 이를 피하려고 삽입 패턴을 감지한다. 8.4 소스 기준으로 <code>storage/innobase/btr/btr0btr.cc</code>의 <code>btr_page_split_and_insert()</code>는 분할 지점을 다음 순서로 정한다.</p>
+
+<ol>
+<li><b>오른쪽으로 수렴하는 삽입인가</b>(<code>btr_page_get_split_rec_to_right()</code>). 각 페이지 헤더에는 그 페이지에 마지막으로 삽입된 레코드의 위치(<code>PAGE_LAST_INSERT</code>)가 기록되어 있다. 새 레코드가 들어갈 자리가 바로 직전 삽입 레코드의 다음이면, 소스의 주석 표현대로 "같은 페이지에서 직전 삽입 바로 뒤에 들어오면 순차 삽입 패턴이 있다고 가정"한다. 이때 삽입 지점이 페이지의 마지막 레코드 뒤라면 <b>새 레코드만 새 페이지로 보내고 기존 레코드는 하나도 옮기지 않는다</b>. 삽입 지점 뒤에 레코드가 두 개 이상 남아 있으면 그중 하나만 남기고 나머지를 새 페이지로 보낸다.</li>
+<li><b>왼쪽으로 수렴하는 삽입인가</b>(<code>btr_page_get_split_rec_to_left()</code>). 직전 삽입 레코드가 새 레코드 자리의 바로 다음이면, 값이 점점 작아지는 내림차순 삽입으로 보고 삽입 지점에서 나눈다.</li>
+<li><b>둘 다 아니면</b> 페이지의 가운데 레코드(<code>page_get_middle_rec()</code>)를 기준으로 나눈다. 레코드의 절반이 새 페이지로 옮겨 간다.</li>
+</ol>
+
+<p>매뉴얼은 이 동작의 결과를 이렇게 적고 있다. 클러스터드 인덱스에 새 레코드를 넣을 때 InnoDB는 이후의 삽입과 갱신을 위해 페이지의 1/16을 비워 두려 하고, 인덱스 레코드가 오름차순이든 내림차순이든 순차적으로 삽입되면 인덱스 페이지는 약 15/16까지 차며, 무작위 순서로 삽입되면 페이지는 1/2에서 15/16 사이로 찬다. 순차 삽입에서 페이지가 거의 꽉 차는 것은 1번 규칙 덕분이고, 랜덤 삽입에서 절반만 찬 페이지가 생기는 것은 3번 규칙의 결과다.</p>
+
+<h4>작은 페이지로 직접 추적하기</h4>
+
+<p>원리를 손으로 확인하기 위해 페이지 하나에 레코드가 네 개만 들어간다고 단순화하자(1/16 여유 공간은 무시한다). 먼저 키 1부터 12까지 순서대로 넣는다. 1~4는 첫 페이지에 들어간다. 5가 들어올 때 페이지가 가득 차 있고, 5의 자리는 직전 삽입 레코드 4의 바로 뒤이자 페이지의 끝이다. 1번 규칙에 따라 새 페이지에 5만 넣고 첫 페이지는 그대로 둔다. 같은 일이 9에서 한 번 더 일어나고, 최종 결과는 <code>[1 2 3 4] [5 6 7 8] [9 10 11 12]</code>의 세 페이지다. 모든 페이지가 가득 차 있고, 분할하면서 옮긴 레코드는 하나도 없다.</p>
+
+<p>이번에는 같은 12개의 키를 6, 1, 11, 3, 9, 12, 2, 8, 5, 10, 4, 7 순서로 넣는다. 가운데 분할은 앞 두 개를 남기고 뒤 두 개를 새 페이지로 옮긴다고 단순화한다.</p>
+
+<pre data-label="추적"><code class="language-text">삽입  일어난 일                     페이지 상태
+6     삽입                          [6]
+1     삽입                          [1 6]
+11    삽입                          [1 6 11]
+3     삽입                          [1 3 6 11]
+9     가득 참, 직전 삽입(3) 뒤 아님 → 가운데 분할
+                                    [1 3] [6 9 11]
+12    삽입                          [1 3] [6 9 11 12]
+2     삽입                          [1 2 3] [6 9 11 12]
+8     가득 참, 직전 삽입(12) 뒤 아님 → 가운데 분할
+                                    [1 2 3] [6 8 9] [11 12]
+5     삽입 (6보다 작으므로 첫 페이지) [1 2 3 5] [6 8 9] [11 12]
+10    삽입                          [1 2 3 5] [6 8 9 10] [11 12]
+4     가득 참 → 3 앞에서 분할        [1 2] [3 4 5] [6 8 9 10] [11 12]
+7     가득 참, 직전 삽입(10) 뒤 아님 → 가운데 분할
+                                    [1 2] [3 4 5] [6 7 8] [9 10] [11 12]</code></pre>
+
+<p>같은 12개의 레코드가 이번에는 다섯 페이지를 차지한다. 페이지 칸 20개 중 12개만 쓰였으니 평균 채움률은 60%이고, 분할이 네 번 일어나는 동안 레코드가 여러 번 옮겨졌다. 4를 넣을 때는 직전 삽입이 5였고 4의 자리가 5의 바로 앞이므로 실제 InnoDB라면 2번 규칙(왼쪽 수렴)이 적용되어 3 앞에서 나누지만, 이 경우에는 가운데 분할과 결과가 같다. 페이지 크기가 16KB이고 레코드가 수백 개씩 들어가는 실제 상황에서도 원리는 같다. 무작위 삽입은 가운데 분할을 반복해서 반쯤 빈 페이지를 계속 만들어 내고, 그 페이지들은 이후 삽입으로 조금씩 채워지다가 다시 갈라진다. 그래서 채움률이 1/2과 15/16 사이를 오간다.</p>
+
+<x-visual id="db-perf-06-split-seq-vs-rand" title="순차 삽입과 랜덤 삽입에서의 페이지 분할 비교" kind="비교 그림" ratio="16:9">
+<x-hint>순차 삽입은 오른쪽 끝에서 새 레코드만 새 페이지로 보내 기존 페이지를 가득 찬 채로 두고, 랜덤 삽입은 가운데 분할로 반쯤 빈 페이지를 여러 개 만든다는 것을 나란히 보여 준다.</x-hint>
+<x-prompt>Two-panel comparison diagram, left and right, white background, flat technical style. Left panel titled "순차 PK 삽입": a row of three full page boxes, each with four filled slots containing numbers 1-4, 5-8, 9-12; a new record "13" shown arriving at the far right with an arrow into a fresh empty page; caption under the panel "새 레코드만 새 페이지로". Right panel titled "랜덤 PK 삽입": a full page box with slots "6 8 9 10" being cut in the middle by a dashed scissors line, with an arrow showing the right half "9 10" moving into a new page box; below, a row of five page boxes with partially filled slots "1 2", "3 4 5", "6 7 8", "9 10", "11 12" with empty slots shaded light gray; caption "가운데 분할 → 반쯤 빈 페이지". Use green for filled slots and light gray for empty slots. Small label at the bottom: "약 15/16 채움" under the left, "1/2 ~ 15/16 채움" under the right.</x-prompt>
+<x-caption>순차 삽입은 분할 때 레코드를 옮기지 않고, 랜덤 삽입은 가운데 분할로 빈 공간을 남긴다.</x-caption>
+</x-visual>
+
+<h4>채움률 말고도 달라지는 것</h4>
+
+<p>페이지가 덜 차면 같은 행 수에 더 많은 페이지가 필요하다. 이것이 첫 번째 비용이다. 디스크 공간도 늘지만 더 중요한 것은 버퍼 풀이다. 버퍼 풀은 페이지 단위로 데이터를 담으므로, 페이지의 절반이 비어 있으면 같은 메모리에 담기는 행이 그만큼 줄어든다. 풀 스캔과 기본 키 범위 스캔도 읽어야 할 페이지가 늘어난다.</p>
+
+<p>두 번째 비용은 <b>작업 집합(working set)</b>이다. 순차 삽입에서 쓰기가 일어나는 리프는 오른쪽 끝의 한 페이지와 그 위의 몇몇 비리프 페이지뿐이다. 이 페이지들은 쉬지 않고 쓰이므로 항상 버퍼 풀에 있다. 랜덤 삽입에서는 모든 리프가 삽입 대상이다. 테이블이 버퍼 풀보다 작을 때는 큰 차이가 없지만, 테이블이 버퍼 풀보다 커지면 삽입할 리프 페이지가 버퍼 풀에 없을 확률이 높아지고, 그때마다 삽입 하나가 디스크에서 무작위 페이지 하나를 읽어 오는 랜덤 읽기를 일으킨다. 읽어 온 페이지는 다른 쿼리가 쓰던 페이지를 밀어낸다. 또 변경된 페이지(dirty page)가 트리 전체에 흩어지므로, 나중에 디스크로 내려 써야 할 페이지 수도 많아진다. 순차 삽입에서는 한 페이지에 수백 행이 모인 뒤 한 번 쓰이면 되지만, 랜덤 삽입에서는 페이지마다 몇 행씩만 바뀐 채로 쓰여야 한다.</p>
+
+<p>세 번째 비용은 분할 자체의 일이다. 가운데 분할은 새 페이지를 할당하고, 레코드의 절반을 옮기고, 부모 페이지에 노드 포인터를 추가한다. 부모가 가득 차 있으면 부모도 분할된다. 이 모든 변경이 리두 로그에 기록된다. 순차 삽입의 분할은 레코드를 옮기지 않으므로 이 일이 훨씬 적다.</p>
+
+<p>네 번째 비용은 눈에 덜 띈다. 리프 페이지의 <b>논리적 순서와 물리적 위치</b>가 어긋난다. 분할로 새 페이지를 할당할 때 InnoDB는 원래 페이지 바로 다음 번호를 희망 위치(소스의 <code>hint_page_no = page_no + 1</code>, 왼쪽 수렴 분할에서는 바로 앞 번호인 <code>page_no - 1</code>)로 요청하지만, 이것은 힌트일 뿐이라 그 자리가 이미 쓰이고 있으면 다른 곳의 페이지를 받는다. 순차 삽입으로 자란 테이블은 리프 연결 리스트의 순서와 파일 안의 페이지 번호 순서가 대체로 일치하지만, 랜덤 삽입으로 자란 테이블은 리프 연결 리스트를 따라가면 파일 안을 이리저리 뛰어다니게 된다. 그러면 기본 키 범위 스캔조차 디스크 입장에서는 순차가 아닌 읽기가 되고, 뒤에서 볼 선행 읽기(read-ahead)의 효과도 줄어든다.</p>
+
+<h4>UUID는 왜 문제가 되고, 어떻게 고치는가</h4>
+
+<p>UUID(Universally Unique Identifier)는 128비트 식별자다. 여러 서버가 서로 조율하지 않고도 겹치지 않는 값을 만들 수 있어서 분산 환경의 식별자로 자주 쓰인다. 문제는 UUID의 종류에 따라 값의 순서가 생성 순서와 전혀 관계없다는 점이다. 무작위 비트로 만드는 버전 4는 말 그대로 무작위이고, UUID를 새로 정의한 RFC 9562(2024년 5월, RFC 4122를 대체)도 동기 설명에서 시간 순서가 없는 UUIDv4 같은 버전은 데이터베이스 인덱스 지역성(locality)이 나쁘다고 적고 있다.</p>
+
+<p>MySQL의 <code>UUID()</code> 함수는 시간 기반인 버전 1 값을 돌려준다. 매뉴얼에 따르면 <code>aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee</code> 형식에서 앞의 세 부분은 타임스탬프의 low, middle, high 부분으로 만들어진다. 시간 기반이니 순서대로 증가할 것 같지만, 문자열(또는 바이트)의 맨 앞에 오는 것이 타임스탬프의 <b>가장 빨리 변하는 낮은 자리</b>다. 바이트를 앞에서부터 비교하는 인덱스 입장에서는 시간 순서와 정렬 순서가 일치하지 않는다. 이를 위해 MySQL 8.0은 <code>UUID_TO_BIN(uuid, swap_flag)</code>을 제공한다. 두 번째 인자가 1이면 time-low 부분과 time-high 부분(첫째와 셋째 16진수 묶음)을 맞바꿔, 매뉴얼의 표현으로 "더 빨리 변하는 부분을 오른쪽으로 옮겨" 인덱스 효율을 높인다. 매뉴얼의 예에서 <code>'6ccd780c-baba-1026-9564-5b8c656024db'</code>는 바꾸지 않으면 <code>6CCD780CBABA102695645B8C656024DB</code>, 바꾸면 <code>1026BABA6CCD780C95645B8C656024DB</code>가 된다. 매뉴얼은 이 교환이 버전 1 형식을 전제로 하며 다른 방식으로 만든 UUID에는 이득이 없다고 덧붙인다. 되돌릴 때는 같은 플래그로 <code>BIN_TO_UUID(bin, 1)</code>을 쓴다.</p>
+
+<p>RFC 9562가 새로 정의한 버전 7은 이 문제를 형식 자체에서 해결한다. UUIDv7의 처음 48비트는 유닉스 에포크 기준 밀리초 타임스탬프(big-endian)이고, 이어서 버전 4비트, 무작위 12비트, 변형(variant) 2비트, 무작위 62비트가 온다. 시간이 앞자리에 big-endian으로 놓여 있으므로 바이트 순서가 대략 생성 순서를 따른다. 타임스탬프 뒤의 비트를 모두 무작위로 채우는 구현이라면 같은 밀리초 안에서는 순서가 섞이고(RFC 9562 6.2절은 카운터 등으로 같은 밀리초 안의 단조성을 보장하는 방법을 선택 사항으로 제시한다), 여러 서버가 만든 값은 서로 엇갈리지만, 모든 새 값이 트리의 오른쪽 끝 근처에 모인다는 점에서 순차 삽입에 가까운 성질을 얻는다.</p>
+
+<p>저장 형식도 중요하다. UUID를 하이픈이 들어간 문자열로 <code>CHAR(36)</code>에 저장하면 ASCII 문자 36개이므로 값만 36바이트다. <code>BINARY(16)</code>에 이진 값으로 저장하면 16바이트이고, <code>BIGINT</code>는 8바이트다. 이 크기 차이는 클러스터드 인덱스보다 세컨더리 인덱스에서 몇 배로 불어나는데, 그 이유는 세컨더리 인덱스를 다룰 때 보게 된다.</p>
+
+<h4>실습: 순차 키와 랜덤 키로 같은 데이터를 넣어 비교하기</h4>
+
+<p>삽입 순서만의 효과를 보려면 키의 크기를 같게 맞춰야 한다. 두 테이블 모두 기본 키를 <code>BINARY(16)</code>으로 두고, 한쪽은 순서대로 증가하는 16바이트 값을, 다른 쪽은 <code>MD5</code> 해시로 만든 무작위처럼 흩어진 16바이트 값을 넣는다. MD5를 쓰는 이유는 같은 n에서 항상 같은 값이 나와 실험을 반복할 수 있기 때문이다.</p>
+
+<pre><code class="language-sql">CREATE TABLE pk_seq (
+  id      BINARY(16)   NOT NULL,
+  n       INT          NOT NULL,
+  payload VARCHAR(100) NOT NULL,
+  PRIMARY KEY (id)
+) ENGINE = InnoDB;
+
+CREATE TABLE pk_rand LIKE pk_seq;
+
+-- 페이지 분할 카운터는 기본적으로 꺼져 있다
+SET GLOBAL innodb_monitor_enable = 'index_page_splits';
+SELECT name, count FROM information_schema.INNODB_METRICS
+WHERE name = 'index_page_splits';          -- 시작 값 기록
+
+SET SESSION cte_max_recursion_depth = 500000;
+
+INSERT INTO pk_seq (id, n, payload)
+WITH RECURSIVE seq (n) AS (
+  SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 500000
+)
+SELECT UNHEX(LPAD(HEX(n), 32, '0')), n, REPEAT('x', 100)
+FROM seq ORDER BY n;
+
+SELECT name, count FROM information_schema.INNODB_METRICS
+WHERE name = 'index_page_splits';          -- 순차 삽입 뒤의 값
+
+INSERT INTO pk_rand (id, n, payload)
+WITH RECURSIVE seq (n) AS (
+  SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 500000
+)
+SELECT UNHEX(MD5(n)), n, REPEAT('x', 100)
+FROM seq ORDER BY n;
+
+SELECT name, count FROM information_schema.INNODB_METRICS
+WHERE name = 'index_page_splits';          -- 랜덤 삽입 뒤의 값
+
+ANALYZE TABLE pk_seq, pk_rand;
+SELECT table_name, stat_name, stat_value
+FROM mysql.innodb_index_stats
+WHERE database_name = DATABASE()
+  AND table_name IN ('pk_seq', 'pk_rand')
+  AND index_name = 'PRIMARY'
+  AND stat_name IN ('n_leaf_pages', 'size');</code></pre>
+
+<p><code>LPAD(HEX(n), 32, '0')</code>은 n을 32자리 16진수 문자열로 만들고, <code>UNHEX</code>가 그것을 16바이트 이진 값으로 바꾼다. 앞자리가 0으로 채워진 big-endian 값이므로 바이트 순서가 곧 n의 순서다. <code>UNHEX(MD5(n))</code>도 16바이트지만 n이 1 늘 때마다 값이 키 공간 전체로 튄다. 두 INSERT 모두 <code>ORDER BY n</code>으로 삽입 순서를 고정했으므로, 첫 번째는 키의 오름차순으로, 두 번째는 키 기준으로 무작위 순서로 들어간다. <code>INNODB_METRICS</code>의 <code>index_page_splits</code>는 매뉴얼의 카운터 목록에 있는 항목으로 기본 상태는 꺼져 있으므로 먼저 켜야 한다. 이 카운터는 서버 전체의 분할 수이므로 다른 작업이 없는 실습 서버에서 앞뒤 값의 차이를 읽는다.</p>
+
+<p>MySQL 8.4.13에서 두 INSERT와 <code>ANALYZE TABLE</code>까지 실행한 뒤의 통계는 다음과 같았다. 페이지 수는 실행 환경에 따라 조금씩 달라질 수 있다.</p>
+
+<pre data-label="실행 결과 (MySQL 8.4.13)"><code class="language-text">+------------+--------------+------------+
+| table_name | stat_name    | stat_value |
++------------+--------------+------------+
+| pk_rand    | n_leaf_pages |       6513 |
+| pk_rand    | size         |       7473 |
+| pk_seq     | n_leaf_pages |       4588 |
+| pk_seq     | size         |       4649 |
++------------+--------------+------------+</code></pre>
+
+<p>같은 50만 행인데 랜덤 쪽 리프가 6,513페이지로 순차 쪽 4,588페이지의 약 1.42배다. 두 테이블의 행 내용은 키 값만 다를 뿐 크기가 같으므로, 리프 페이지 수의 차이가 곧 채움률의 차이다. 랜덤 쪽 페이지는 평균적으로 순차 쪽의 약 70%(4,588 ÷ 6,513)만 찬 셈이고, 순차 쪽이 15/16 가까이 찼다면 이는 매뉴얼이 말한 1/2~15/16 범위 안에 든다. 분할 횟수는 이 실행에서 재지 않았다. 실행한 서버를 다른 작업과 함께 쓰고 있어서 <code>SET GLOBAL</code>로 <code>index_page_splits</code> 카운터를 켤 수 없었고, 켜더라도 서버 전체 값이라 다른 작업의 분할이 섞이기 때문이다. 다른 작업이 없는 실습 서버라면 위 스크립트대로 카운터를 켜고 앞뒤 값의 차이를 읽으면 된다. 이어서 <code>OPTIMIZE TABLE pk_rand</code>를 실행하고 통계를 다시 보자. MySQL 8.4.13에서는 <code>Table does not support optimize, doing recreate + analyze instead</code>라는 note와 함께 <code>OK</code>가 나오고, 다시 본 <code>pk_rand</code>의 <code>n_leaf_pages</code>는 <code>pk_seq</code>와 똑같은 4,588(<code>size</code>는 5,289)이 되었다. InnoDB에서 이 명령은 테이블을 재구성(rebuild)하는데, 재구성은 매뉴얼이 정렬된 인덱스 빌드(sorted index build)라고 부르는 방식으로 이루어진다. 레코드를 정렬한 뒤 오른쪽 끝 리프에 차례로 채우는 상향식(bottom-up) 적재이므로, 랜덤 키 테이블도 재구성 직후에는 순차 삽입한 것처럼 빽빽해진다. 다만 그 뒤로 다시 랜덤 삽입이 계속되면 가운데 분할이 재개된다. 재구성은 증상을 잠시 없앨 뿐 원인을 고치지는 못한다.</p>
+
+<h3>클러스터드 인덱스 3: 실무 PK 설계</h3>
+
+<p>지금까지 본 원리를 기본 키를 고르는 기준으로 옮겨 보자. 기본 키는 테이블의 물리 구조 그 자체이고, 뒤에서 보듯 모든 세컨더리 인덱스에 복사된다. 그래서 InnoDB에서 기본 키 선택은 다른 어떤 인덱스 선택보다 무겁다. 용어집의 클러스터드 인덱스 항목도 가장 성능이 중요한 쿼리를 기준으로 기본 키 열을 신중하게 고르라고 권한다.</p>
+
+<h4>기준 1: 짧아야 한다</h4>
+
+<p>매뉴얼은 기본 키가 길면 세컨더리 인덱스가 더 많은 공간을 쓰므로 짧은 기본 키가 유리하다고 적는다. 계산해 보면 이 말의 무게가 보인다. 100만 행 테이블에 세컨더리 인덱스가 세 개 있다고 하자. 세컨더리 인덱스 레코드마다 기본 키가 한 벌씩 들어가므로, 기본 키가 <code>BIGINT</code>(8바이트)일 때와 <code>CHAR(36)</code> 문자열 UUID(36바이트)일 때의 차이는 레코드당 28바이트, 전체로는 28 × 3 × 1,000,000 = 84,000,000바이트, 약 80MB다. 페이지 여유 공간과 분할로 인한 빈 공간을 빼고 순수한 값만 센 것이다. 이 80MB는 디스크만 차지하는 것이 아니라 버퍼 풀에서도 다른 데이터가 들어갈 자리를 빼앗는다. 세컨더리 인덱스 페이지 하나에 담기는 레코드 수가 줄어 인덱스를 탈 때 읽는 페이지 수도 늘어난다.</p>
+
+<h4>기준 2: 단조 증가해야 한다</h4>
+
+<p>앞 절의 내용 그대로다. 새 키가 항상 오른쪽 끝에 붙으면 페이지가 약 15/16까지 차고, 분할 때 레코드를 옮기지 않고, 쓰기 작업 집합이 오른쪽 끝 몇 페이지로 좁혀진다. <code>AUTO_INCREMENT</code>가 기본 선택인 이유가 이것이다. 단, 자동 증가 값은 "증가"를 약속할 뿐 "연속"을 약속하지 않는다. 매뉴얼에 따르면 모든 잠금 모드에서 자동 증가 값을 만든 트랜잭션이 롤백되면 그 값은 사라지고 다시 쓰이지 않으며, 따라서 열 값에 빈틈이 생길 수 있다. MySQL 8.4의 기본 잠금 모드(<code>innodb_autoinc_lock_mode=2</code>, interleaved)에서는 동시에 실행되는 대량 삽입 사이에서도 빈틈이 생길 수 있다. 주문 번호에 빈틈이 없어야 한다는 업무 규칙이 있다면 자동 증가 기본 키에 그 일을 맡기면 안 된다.</p>
+
+<h4>기준 3: 바뀌지 않아야 한다</h4>
+
+<p>기본 키 값을 바꾸는 UPDATE는 InnoDB에서 특별한 경로를 탄다. 8.4 소스 기준으로 <code>row0upd.cc</code>의 <code>row_upd_clust_rec_by_insert()</code>는 "클러스터드 인덱스 레코드에 삭제 표시를 하고 갱신된 버전의 레코드를 인덱스에 삽입하는" 함수이고, 주석은 이 함수가 클러스터드 인덱스 레코드의 정렬 필드(ordering fields)가 바뀔 때 쓰인다고 밝힌다. 키가 바뀌면 행이 트리 안에서 있어야 할 자리가 바뀌므로 제자리 갱신이 불가능하고, 옛 자리에 삭제 표시를 한 뒤 새 자리에 삽입하는 것이다. 여기서 끝나지 않는다. 모든 세컨더리 인덱스 레코드가 기본 키 값을 담고 있으므로, 세컨더리 인덱스마다 옛 레코드에 삭제 표시를 하고 새 레코드를 넣어야 한다. 매뉴얼의 MVCC 설명대로 세컨더리 인덱스 레코드는 제자리에서 갱신되지 않기 때문이다. 세컨더리 인덱스가 세 개인 테이블에서 기본 키 하나를 바꾸면 B+Tree 네 개에 각각 삭제 표시와 삽입이 일어나고, 삭제 표시된 레코드들은 나중에 퍼지(purge)가 치운다. 용어집이 클러스터드 인덱스 열을 수정하는 것은 비싼 작업이니 거의 또는 전혀 갱신되지 않는 열을 기본 키로 고르라고 하는 이유다.</p>
+
+<h4>기준 4: 업무 의미가 없는 대리 키를 기본으로</h4>
+
+<p>이메일, 전화번호, 주민등록번호 같은 자연 키(natural key)는 세 기준을 모두 어기기 쉽다. 문자열이라 길고, 생성 순서와 값의 순서가 무관하며, 업무 규칙이 바뀌면 값이 바뀐다(이메일 변경, 번호 이동). 그래서 실무의 기본형은 의미 없는 <code>BIGINT AUTO_INCREMENT</code> 대리 키(surrogate key)를 기본 키로 두고, 자연 키에는 <code>UNIQUE</code> 세컨더리 인덱스를 거는 것이다. 앞의 <code>account</code> 테이블이라면 <code>account_id BIGINT AUTO_INCREMENT PRIMARY KEY</code>를 추가하고 <code>uk_account_email</code>은 그대로 두면 된다. 그러면 이메일로 찾는 조회는 세컨더리 인덱스와 클러스터드 인덱스를 한 번씩 내려가는 비용이 생기지만, 삽입은 오른쪽 끝에 붙고 이메일 변경은 세컨더리 인덱스 하나만 고치면 된다.</p>
+
+<h4>기준이 충돌할 때: 복합 기본 키와 분산 식별자</h4>
+
+<p>대리 키가 늘 정답은 아니다. 클러스터드 인덱스의 본질은 "기본 키가 가까운 행이 물리적으로 모인다"는 것이므로, 가장 중요한 조회가 어떤 부모 단위로 묶여 있다면 기본 키를 그 단위로 구성하는 선택지가 있다. 예를 들어 "회원별 주문 목록"이 압도적으로 중요한 시스템에서 기본 키를 <code>(member_id, order_seq)</code>로 두면 한 회원의 주문이 같은 리프 페이지에 모이고, 회원의 주문 목록 조회가 기본 키 범위 스캔 한 번이 된다. 대가도 분명하다. 새 주문은 회원별 위치에 들어가므로 삽입이 트리 전체에 흩어지고(랜덤 삽입의 비용), 기본 키가 두 열 16바이트가 되어 모든 세컨더리 인덱스가 커지며, 주문 하나를 가리키는 외래 키도 두 열이 된다. 어느 쪽이 나은지는 읽기와 쓰기의 비중, 테이블이 버퍼 풀에 들어가는지에 달려 있다.</p>
+
+<p>여러 서버나 클라이언트가 중앙 조율 없이 식별자를 만들어야 하는 경우, 또는 식별자를 외부에 노출할 때 순번이 드러나는 것을 피하고 싶은 경우에는 UUID가 필요해진다. 이때의 선택지는 다음과 같다. 첫째, 시간 순서를 갖는 UUIDv7을 애플리케이션에서 만들어 <code>BINARY(16)</code>으로 저장한다. 둘째, MySQL의 <code>UUID()</code>를 쓴다면 <code>UUID_TO_BIN(UUID(), 1)</code>로 시간 부분을 앞으로 옮겨 저장한다. 셋째, 내부 기본 키는 <code>BIGINT AUTO_INCREMENT</code>로 유지하고, 외부에 보여 줄 공개 식별자를 별도 열에 두고 <code>UNIQUE</code> 인덱스를 건다. 세 번째 방법은 세컨더리 인덱스 하나를 추가로 유지해야 하지만, 다른 모든 세컨더리 인덱스가 8바이트 기본 키를 쓰게 된다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>기본 키 형태</th><th>값 크기</th><th>삽입 위치</th><th>주의할 점</th></tr></thead><tbody>
+<tr><td><code>BIGINT AUTO_INCREMENT</code></td><td>8바이트</td><td>오른쪽 끝</td><td>값에 빈틈이 생길 수 있다. 생성이 DB 한 곳에 묶인다.</td></tr>
+<tr><td>UUIDv4, <code>BINARY(16)</code></td><td>16바이트</td><td>트리 전체에 무작위</td><td>가운데 분할, 넓은 작업 집합, 리프 순서와 물리 순서의 어긋남</td></tr>
+<tr><td><code>UUID()</code>를 <code>UUID_TO_BIN(u, 1)</code>로</td><td>16바이트</td><td>대체로 오른쪽 끝</td><td>읽을 때 <code>BIN_TO_UUID(b, 1)</code>로 같은 플래그를 써야 한다.</td></tr>
+<tr><td>UUIDv7, <code>BINARY(16)</code></td><td>16바이트</td><td>대체로 오른쪽 끝</td><td>같은 밀리초 안의 순서는 생성 구현에 따라 섞일 수 있다. 애플리케이션에서 생성한다.</td></tr>
+<tr><td>UUID 문자열, <code>CHAR(36)</code></td><td>36바이트</td><td>형식에 따라 다름</td><td>모든 세컨더리 인덱스가 36바이트씩 커진다.</td></tr>
+<tr><td>자연 키(이메일 등)</td><td>가변</td><td>트리 전체에 무작위</td><td>길고, 바뀔 수 있다. 변경은 모든 인덱스를 고친다.</td></tr>
+<tr><td>복합 키 <code>(부모, 순번)</code></td><td>열 크기의 합</td><td>부모별 위치</td><td>부모 단위 조회가 순차가 되는 대신 삽입이 흩어진다.</td></tr>
+</tbody></table></div>
+
+<h4>JPA로 이어지는 지점</h4>
+
+<p>JPA에서 <code>@GeneratedValue(strategy = GenerationType.IDENTITY)</code>는 MySQL의 <code>AUTO_INCREMENT</code>에 기본 키 생성을 맡긴다. InnoDB 입장에서는 가장 좋은 형태지만 애플리케이션 쪽에 비용이 하나 있다. Hibernate ORM 사용자 가이드의 IDENTITY 절은 이 방식에서 식별자 값을 알려면 엔티티의 행이 먼저 물리적으로 삽입되어야 하고, 그래서 Hibernate가 IDENTITY 생성을 쓰는 엔티티의 INSERT 문을 배치로 묶을 수 없다고 설명한다. 영속성 컨텍스트가 <code>persist()</code> 시점에 식별자를 알아야 하므로 INSERT를 즉시 하나씩 보내야 하는 것이다. 대량 삽입이 중요한 엔티티라면 이 제약과 앞의 저장 구조 이득을 함께 놓고 판단해야 한다. 반대로 UUID를 애플리케이션에서 만들어 넣으면 배치는 가능하지만, 그 UUID가 어떤 형식인지가 InnoDB의 삽입 비용을 결정한다는 것을 잊으면 안 된다.</p>
+
+<h3>세컨더리 인덱스 1: 리프에는 기본 키가 들어 있다</h3>
+
+<p>클러스터드 인덱스가 아닌 모든 인덱스를 세컨더리 인덱스라 부른다. 매뉴얼의 정의는 짧고 정확하다. InnoDB에서 세컨더리 인덱스의 각 레코드는 세컨더리 인덱스로 지정한 열과 함께 그 행의 <b>기본 키 열</b>을 담고 있으며, InnoDB는 이 기본 키 값으로 클러스터드 인덱스에서 행을 찾는다. 행의 물리 주소가 아니라 기본 키라는 논리적인 값이 행을 가리키는 포인터 역할을 한다.</p>
+
+<p>실습에 쓸 인덱스를 만들어 보자. 이 회차의 실습이 끝나면 지울 것이다.</p>
+
+<pre><code class="language-sql">CREATE INDEX idx_orders_member_id ON orders (member_id);</code></pre>
+
+<p>우리는 <code>member_id</code> 열 하나로 인덱스를 만들었지만, InnoDB 내부에서 이 인덱스는 <code>(member_id, order_id)</code> 두 열짜리다. 8.4 소스 기준으로 <code>dict0dict.cc</code>의 <code>dict_index_build_internal_non_clust()</code>는 "클러스터드 인덱스 항목을 유일하게 결정하는 데 필요한 열"을 세컨더리 인덱스 뒤에 덧붙인다. 이때 세컨더리 인덱스에 이미 (접두사가 아닌) 온전한 형태로 들어 있는 열은 건너뛴다. 그리고 유니크가 아닌 세컨더리 인덱스에서는 덧붙인 기본 키 열까지를 유일성을 판단하는 열 수(<code>n_uniq</code>)에 포함시킨다. 그 결과 유니크가 아닌 세컨더리 인덱스도 내부적으로는 모든 항목이 서로 다르고, 같은 <code>member_id</code> 안에서는 <code>order_id</code> 순서로 정렬된다. 유니크 세컨더리 인덱스라면 유일성은 사용자가 지정한 열만으로 판단하지만, 기본 키 열은 똑같이 레코드에 붙어 저장된다.</p>
+
+<pre class="diagram">idx_orders_member_id 의 리프 (내부적으로는 (member_id, order_id) 순서)
+
+ ... | (1, 99991) (1, 199982) (1, 299973) ... (1, 999910) | (2, 15594) (2, 115585) ... | ...
+         │            │
+         │            └─ order_id=199982 로 클러스터드 인덱스를 다시 검색
+         └─ order_id=99991 로 클러스터드 인덱스를 다시 검색
+
+레코드 하나 = 레코드 헤더 5바이트 + member_id 8바이트 + order_id 8바이트</pre>
+
+<p>01회에서 계산했듯 회원 1번의 주문은 주문 번호 99991, 199982, …, 999910의 10건이고, 회원 2번의 주문은 15594, 115585, …, 915513의 10건이다. 세컨더리 인덱스 리프에서는 이 항목들이 나란히 붙어 있다. 레코드 하나가 21바이트 남짓이므로 한 페이지에 수백 개가 들어가고, 01회와 같은 방식으로 어림하면 100만 항목은 리프 1,400페이지 안팎이고, MySQL 8.4.13에서 이 인덱스를 만든 직후 확인한 <code>n_leaf_pages</code>는 1,325였다. 클러스터드 인덱스(실측 5,046페이지)의 4분의 1 정도다. 세컨더리 인덱스가 얼마나 작은지는 뒤에서 커버링 인덱스와 <code>COUNT(*)</code>를 설명할 때 다시 쓴다.</p>
+
+<h4>세컨더리 인덱스로 행을 찾는 과정</h4>
+
+<p>쿼리 (나) <code>SELECT * FROM orders WHERE member_id = 1</code>을 한 단계씩 추적한다.</p>
+
+<figure class="flow-figure"><figcaption>세컨더리 인덱스를 거쳐 행을 읽는 과정</figcaption><ol class="flow">
+<li><strong>세컨더리 인덱스 탐색</strong><span><code>idx_orders_member_id</code>의 루트에서 리프까지 내려가 <code>member_id = 1</code>인 첫 항목 <code>(1, 99991)</code>을 찾는다. 페이지 접근 3회 안팎.</span></li>
+<li><strong>클러스터드 인덱스 탐색</strong><span>항목에서 <code>order_id = 99991</code>을 꺼내 클러스터드 인덱스의 루트에서 리프까지 내려가 행 전체를 읽는다. 페이지 접근 3회.</span></li>
+<li><strong>다음 세컨더리 항목</strong><span>세컨더리 인덱스 리프에서 다음 항목 <code>(1, 199982)</code>으로 옮긴다. 대개 같은 페이지 안이므로 새 페이지 접근이 없다.</span></li>
+<li><strong>2~3 반복</strong><span>항목마다 클러스터드 인덱스를 처음부터 다시 내려간다. 10번 반복된다.</span></li>
+<li><strong>종료</strong><span><code>(2, 15594)</code>를 만나 <code>member_id</code>가 1이 아니므로 멈춘다.</span></li>
+</ol></figure>
+
+<p>페이지 접근을 세면 세컨더리 인덱스 쪽이 3회 남짓, 클러스터드 인덱스 쪽이 10 × 3 = 30회다. 클러스터드 인덱스의 루트와 중간 페이지는 모든 조회가 지나가므로 거의 항상 버퍼 풀에 있다. 실질적인 비용은 10번의 클러스터드 리프 페이지 접근이다. 그리고 이 10개의 리프는 서로 다른 페이지다. 한 페이지에 약 225행이 있다는 01회의 어림을 쓰면 주문 99991은 445번째 리프, 199982는 889번째 리프, 그 뒤로 1334, 1778, 2223, 2667, 3111, 3556, 4000, 4445번째 리프에 있다. 리프 연결 리스트에서 서로 400페이지 넘게 떨어져 있다. 이것이 세컨더리 인덱스 조회의 본질이다. 세컨더리 인덱스 안에서는 찾는 항목들이 붙어 있어도, 그 항목들이 가리키는 행은 기본 키 순서에 따라 테이블 곳곳에 흩어져 있을 수 있다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>도서관의 주제별 색인 카드</strong><p>도서관 서가가 청구 기호 순서로 꽂혀 있다고 하자. 이것이 클러스터드 인덱스다. 주제별 색인 카드 상자는 세컨더리 인덱스다. "데이터베이스" 주제의 카드는 상자 안에 나란히 있지만, 카드에 적힌 것은 책의 위치(몇 층 몇 번째 칸)가 아니라 청구 기호다. 카드 10장을 찾았다면 청구 기호를 들고 서가 안내판에서부터 10번 길을 찾아가야 하고, 책들은 서가 여기저기에 흩어져 있다. 이 비유가 깨지는 지점은 "왜 위치를 적지 않았느냐"다. 실제 도서관은 책을 옮길 일이 드물지만, InnoDB의 행은 페이지 분할 때마다 옮겨 다닌다. 다음 절이 이 이야기다.</p></aside>
+
+<h4>왜 물리 주소가 아니라 기본 키를 담는가</h4>
+
+<p>세컨더리 인덱스가 행의 물리 주소(페이지 번호와 페이지 안의 위치)를 담는다면 클러스터드 인덱스를 다시 내려갈 필요 없이 리프 페이지로 바로 갈 수 있다. InnoDB가 그렇게 하지 않는 이유는 앞에서 본 페이지 분할에 있다. 클러스터드 인덱스는 키 순서를 지켜야 하므로, 가운데 분할이 일어날 때마다 레코드의 절반이 새 페이지로 옮겨 간다. 페이지 재구성으로 페이지 안의 위치가 바뀌기도 한다. 세컨더리 인덱스가 물리 주소를 담고 있다면 행이 움직일 때마다 그 행을 가리키는 모든 세컨더리 인덱스 항목을 찾아 고쳐야 한다. 분할 한 번에 레코드 수백 개가 옮겨 가고 세컨더리 인덱스가 여럿이라면 이 일은 감당하기 어렵다.</p>
+
+<p>기본 키는 행이 어느 페이지로 옮겨 가든 변하지 않는다. 그래서 세컨더리 인덱스는 행의 이동에 전혀 영향을 받지 않는다. Oracle 문서도 인덱스 구성 테이블에 대해 같은 논리를 편다. 인덱스 구성 테이블의 행은 삽입으로 인해 블록 안이나 블록 사이에서 움직일 수 있어 영구적인 물리 주소가 없으므로, 기본 키에 기반한 논리 rowid를 쓴다는 것이다. 이 설계의 대가가 방금 본 이중 탐색이다. InnoDB는 쓰기(행 이동) 쪽의 비용을 없애고 그 대가를 읽기(세컨더리 인덱스 조회) 쪽에서 치르는 선택을 했다.</p>
+
+<h4>숫자로 보이는 것과 보이지 않는 것</h4>
+
+<p>세컨더리 인덱스 조회의 비용을 관찰할 때 주의할 점이 하나 있다. 세션 상태 변수 <code>Handler_read_key</code>, <code>Handler_read_next</code> 같은 Handler 카운터는 MySQL 서버 계층이 스토리지 엔진에 "인덱스에서 처음 항목을 찾아라", "다음 항목을 달라"고 요청한 횟수를 센다. 세컨더리 인덱스 항목에서 기본 키를 꺼내 클러스터드 인덱스를 다시 내려가는 일은 InnoDB가 하나의 요청을 처리하는 도중에 내부에서 하는 일이므로, 별도의 Handler 요청으로 잡히지 않는다. 즉 Handler 카운터만 보면 (나)와 (다)가 같은 양의 일을 한 것처럼 보인다. 실제 페이지 접근 차이를 보려면 InnoDB 쪽 지표(버퍼 풀 읽기 요청 수)나 실행 시간을 함께 봐야 한다. 이 차이는 뒤의 실습에서 직접 확인한다.</p>
+
+<h4>인덱스 확장: 옵티마이저도 기본 키 열을 안다</h4>
+
+<p>세컨더리 인덱스 뒤에 기본 키가 붙어 있다는 사실은 저장 구조에서 끝나지 않고 옵티마이저의 계획 선택에도 쓰인다. 매뉴얼은 이것을 인덱스 확장(index extensions)이라 부른다. InnoDB는 각 세컨더리 인덱스 뒤에 기본 키 열을 덧붙여 확장하고, 옵티마이저는 인덱스를 어떻게 쓸지 정할 때 이 기본 키 열까지 고려한다. 매뉴얼에 따르면 확장된 세컨더리 인덱스는 <code>ref</code>, <code>range</code>, <code>index_merge</code> 접근, 느슨한 인덱스 스캔(Loose Index Scan), 조인과 정렬 최적화, <code>MIN()</code>/<code>MAX()</code> 최적화에 쓰일 수 있다. 이 기능은 <code>optimizer_switch</code>의 <code>use_index_extensions</code> 플래그로 켜고 끄며 기본값은 켜짐이다.</p>
+
+<pre><code class="language-sql">-- (1) 세컨더리 인덱스의 두 번째 열처럼 order_id 조건을 쓴다
+EXPLAIN SELECT order_id FROM orders
+WHERE member_id = 1 AND order_id > 500000;
+
+-- (2) 같은 회원 안에서는 order_id 순서가 이미 정렬되어 있다
+EXPLAIN SELECT order_id, member_id FROM orders
+WHERE member_id = 1 ORDER BY order_id DESC LIMIT 3;</code></pre>
+
+<p>(1)에서 확인할 것은 <code>key_len</code>이다. <code>member_id</code>와 <code>order_id</code>는 모두 NOT NULL인 <code>BIGINT</code>로 각각 8바이트이므로, 옵티마이저가 인덱스 확장을 써서 두 열을 모두 범위 조건에 썼다면 <code>key_len</code>이 16으로 나온다. <code>member_id</code>만 썼다면 8이다. 매뉴얼의 예제에서도 확장을 끄면 <code>key_len</code>이 4, 켜면 8로 나오고, <code>ref</code>가 <code>const</code>에서 <code>const,const</code>로 바뀐다. (2)는 세컨더리 인덱스가 <code>(member_id, order_id)</code> 순서로 정렬되어 있으므로 <code>member_id = 1</code> 구간을 거꾸로 읽기만 하면 <code>order_id</code> 내림차순이 되어, 실행 계획의 Extra에 <code>Using filesort</code>가 나타나지 않는다. 정렬을 인덱스로 없애는 원리는 07회의 주제다.</p>
+
+<pre data-label="실행 계획 (MySQL 8.4.13에서 실행, 일부 열만. rows는 통계에 따라 다르다)"><code class="language-text">-- (1)
+| type  | key                  | key_len | ref  | rows | Extra                            |
+| range | idx_orders_member_id | 16      | NULL |    5 | Using where; Using index         |
+
+-- (1)을 SET SESSION optimizer_switch = 'use_index_extensions=off' 뒤에 다시 실행
+| type  | key                  | key_len | ref   | rows | Extra                           |
+| ref   | idx_orders_member_id | 8       | const |   10 | Using where; Using index        |
+
+-- (2)
+| type  | key                  | key_len | ref   | rows | Extra                            |
+| ref   | idx_orders_member_id | 8       | const |   10 | Backward index scan; Using index |</code></pre>
+
+<p>(1)은 기본 설정에서 <code>key_len</code> 16의 range 접근이고, 인덱스 확장을 끄면 <code>member_id</code>만 쓰는 <code>ref</code> 접근(<code>key_len</code> 8, <code>ref</code> <code>const</code>)으로 바뀌어 <code>order_id</code> 조건은 인덱스 항목을 읽은 뒤에 거른다. (2)에는 <code>Using filesort</code> 대신 인덱스를 거꾸로 읽는다는 <code>Backward index scan</code>이 나타난다.</p>
+
+<h3>세컨더리 인덱스 2: 커버링 인덱스</h3>
+
+<p>쿼리 (다) <code>SELECT order_id FROM orders WHERE member_id = 1</code>로 돌아가자. 이 쿼리가 필요로 하는 열은 조건의 <code>member_id</code>와 결과의 <code>order_id</code>뿐이다. 그런데 <code>idx_orders_member_id</code>의 리프 항목은 바로 <code>(member_id, order_id)</code>다. 세컨더리 인덱스 리프에서 필요한 값을 모두 얻었으므로 클러스터드 인덱스를 내려갈 이유가 없다. 앞의 추적에서 2단계가 통째로 사라지고, 페이지 접근은 세컨더리 인덱스의 3회 남짓만 남는다.</p>
+
+<p>이처럼 쿼리가 필요로 하는 모든 열을 담고 있어 테이블(클러스터드 인덱스)을 읽지 않고 인덱스만으로 답할 수 있는 인덱스를 <b>커버링 인덱스(covering index)</b>라 한다. MySQL 용어집은 커버링 인덱스를 쿼리가 가져오는 모든 열을 포함한 인덱스로 정의하고, 인덱스 값을 행을 찾아가는 포인터로 쓰는 대신 인덱스 구조에서 값을 돌려주어 디스크 I/O를 아낀다고 설명한다. 같은 항목에 InnoDB 세컨더리 인덱스는 기본 키 열도 포함하므로 InnoDB가 MyISAM보다 더 많은 인덱스에 이 기법을 적용할 수 있다는 설명이 붙어 있다. 기본 키가 공짜로 따라온다는 사실이 커버링의 범위를 넓히는 것이다.</p>
+
+<p>"필요로 하는 모든 열"에는 SELECT 목록만이 아니라 WHERE, ORDER BY, GROUP BY, 조인 조건에 나오는 열이 모두 포함된다. 실행 계획에서는 Extra 열의 <code>Using index</code>가 커버링을 알려 준다. 몇 가지 쿼리로 판별 연습을 해 보자.</p>
+
+<div class="table-wrap"><table><thead><tr><th>쿼리 (인덱스: <code>idx_orders_member_id</code>)</th><th>필요한 열</th><th>커버링?</th></tr></thead><tbody>
+<tr><td><code>SELECT order_id FROM orders WHERE member_id = 1</code></td><td>member_id, order_id</td><td>예</td></tr>
+<tr><td><code>SELECT COUNT(*) FROM orders WHERE member_id BETWEEN 1 AND 1000</code></td><td>member_id</td><td>예</td></tr>
+<tr><td><code>SELECT member_id, MAX(order_id) FROM orders GROUP BY member_id</code></td><td>member_id, order_id</td><td>예</td></tr>
+<tr><td><code>SELECT order_id, status FROM orders WHERE member_id = 1</code></td><td>member_id, order_id, status</td><td>아니요 (status)</td></tr>
+<tr><td><code>SELECT order_id FROM orders WHERE member_id = 1 AND amount > 50000</code></td><td>member_id, order_id, amount</td><td>아니요 (amount)</td></tr>
+<tr><td><code>SELECT * FROM orders WHERE member_id = 1</code></td><td>모든 열</td><td>아니요</td></tr>
+</tbody></table></div>
+
+<p>MySQL 8.4.13에서 여섯 쿼리를 EXPLAIN해 보면 표와 같다. "예"인 첫째와 둘째 쿼리의 Extra에는 <code>Using index</code>(둘째는 <code>Using where; Using index</code>)가, 셋째에는 <code>Using index for group-by</code>가 나타난다. 셋째의 표시는 회원별 최댓값만 골라 읽는 느슨한 인덱스 스캔이 커버링으로 일어난다는 뜻이다. "아니요"인 넷째와 여섯째는 Extra가 비어 있고(<code>NULL</code>), 다섯째는 <code>Using where</code>뿐이다.</p>
+
+<p>네 번째 쿼리를 커버링으로 만들려면 인덱스를 <code>(member_id, status)</code>로 만들면 된다. 내부적으로는 <code>(member_id, status, order_id)</code>가 되어 세 열이 모두 들어 있다. 다섯 번째 쿼리에서 <code>amount</code> 조건은 인덱스로 거를 수 없으므로 일치하는 세컨더리 항목마다 클러스터드 인덱스로 가서 <code>amount</code>를 확인해야 한다. 인덱스에 없는 열에 대한 조건을 어디서 평가하느냐, 그리고 인덱스에 있는 열의 조건을 클러스터드 인덱스로 가기 전에 평가하는 ICP는 08회에서 다룬다.</p>
+
+<h4>인덱스 풀 스캔도 커버링이면 싸다</h4>
+
+<p>실행 계획의 <code>type</code>이 <code>index</code>이고 Extra가 <code>Using index</code>라면, 세컨더리 인덱스의 리프 전체를 처음부터 끝까지 읽는 인덱스 풀 스캔이 커버링으로 일어난다는 뜻이다. "풀 스캔"이라는 말에 놀랄 필요는 없다. 세컨더리 인덱스는 클러스터드 인덱스보다 훨씬 작기 때문이다. <code>orders</code>에서 세컨더리 인덱스 리프는 실측 1,325페이지, 클러스터드 인덱스 리프는 5,046페이지였다(MySQL 8.4.13). 매뉴얼은 <code>COUNT(*)</code>에 대해 정확히 이 점을 이용한다고 적고 있다. InnoDB는 인덱스나 옵티마이저 힌트가 다른 인덱스를 지정하지 않는 한 가장 작은 세컨더리 인덱스를 훑어서 <code>SELECT COUNT(*)</code>를 처리하고, 세컨더리 인덱스가 없을 때만 클러스터드 인덱스를 스캔한다. 일반적인 B+Tree 세컨더리 인덱스는 테이블의 모든 행에 대해 항목을 하나씩 갖고 있으므로(NULL 값도 인덱스에 들어간다), 어느 인덱스를 세어도 행 수는 같고 가장 작은 인덱스를 세는 것이 가장 싸다. MySQL 8.4.13에서 <code>idx_orders_member_id</code>만 있는 상태로 <code>EXPLAIN SELECT COUNT(*) FROM orders</code>를 실행하면 <code>type</code>이 <code>index</code>, <code>key</code>가 <code>idx_orders_member_id</code>, Extra가 <code>Using index</code>로 나온다.</p>
+
+<h4>커버링이 깨지는 순간: MVCC와 세컨더리 인덱스</h4>
+
+<p>커버링 인덱스에는 실행 계획에 드러나지 않는 예외가 있다. 클러스터드 인덱스 레코드에는 <code>DB_TRX_ID</code>와 <code>DB_ROLL_PTR</code>이 있어서, 읽는 트랜잭션이 이 행의 어느 버전을 봐야 하는지 판단하고 필요하면 언두 로그로 옛 버전을 재구성할 수 있다. 그런데 매뉴얼의 MVCC 설명에 따르면 세컨더리 인덱스 레코드에는 이런 숨은 시스템 열이 없고 제자리 갱신도 되지 않는다. 세컨더리 인덱스 열이 갱신되면 옛 레코드에 삭제 표시를 하고 새 레코드를 넣으며, 삭제 표시된 레코드는 나중에 퍼지된다.</p>
+
+<p>그러면 세컨더리 인덱스 레코드만 보고는 "이 항목이 내 트랜잭션에 보이는가"를 판단할 수 없는 경우가 생긴다. 8.4 소스 기준으로 세컨더리 인덱스 페이지 헤더에는 그 페이지를 수정했을 수 있는 가장 큰 트랜잭션 ID(<code>PAGE_MAX_TRX_ID</code>)가 기록되어 있어서, 페이지 단위로만 "최근에 바뀌었는지"를 알 수 있다. 매뉴얼은 결과를 이렇게 정리한다. 세컨더리 인덱스 레코드에 삭제 표시가 되어 있거나 세컨더리 인덱스 페이지가 더 새로운 트랜잭션에 의해 갱신되었다면 커버링 인덱스 기법은 쓰이지 않고, InnoDB는 인덱스 구조에서 값을 돌려주는 대신 클러스터드 인덱스에서 레코드를 찾는다. 클러스터드 인덱스에서 <code>DB_TRX_ID</code>를 확인하고, 읽는 트랜잭션이 시작된 뒤에 수정된 레코드라면 언두 로그에서 알맞은 버전을 가져온다.</p>
+
+<p>실무적인 의미는 이렇다. 쓰기가 몰리는 테이블에서 최근에 바뀐 페이지를 읽는 커버링 쿼리는, 실행 계획에 <code>Using index</code>가 찍혀 있어도 실행 중에 일부 항목에 대해 클러스터드 인덱스를 방문한다. 실행 계획은 실행 전에 정해지는 정적인 정보이고, 이 판단은 실행 중에 페이지와 레코드마다 내려진다. 그래서 같은 커버링 쿼리라도 조용한 시간과 쓰기가 많은 시간의 비용이 다를 수 있다.</p>
+
+<h4>커버링의 대가</h4>
+
+<p>커버링 인덱스를 만들려고 인덱스에 열을 추가하면 인덱스 레코드가 커진다. 페이지당 항목 수가 줄고, 인덱스가 버퍼 풀을 더 차지하고, 그 열을 갱신하는 모든 UPDATE가 이제 인덱스 갱신(옛 레코드 삭제 표시와 새 레코드 삽입)이 된다. 예를 들어 <code>status</code>를 인덱스에 넣으면 주문 상태가 바뀔 때마다 세컨더리 인덱스에도 쓰기가 일어난다. 커버링은 "자주 실행되는 중요한 조회"를 위해 "그 열의 쓰기 비용과 공간"을 지불하는 거래다.</p>
+
+<p>JPA를 쓸 때는 이 거래가 더 분명하게 보인다. 엔티티를 조회하면 Hibernate는 엔티티의 모든 매핑 열을 SELECT하므로, 그 모든 열을 담은 인덱스가 아닌 한 커버링이 되지 않는다. 목록 화면처럼 일부 열만 필요한 곳에서 DTO 프로젝션으로 필요한 열만 고르거나, 존재 여부와 개수만 확인하는 쿼리를 따로 쓰면 커버링 인덱스의 이득을 받을 수 있다. 커버링 인덱스로 기본 키만 먼저 좁힌 뒤 필요한 행만 클러스터드 인덱스에서 읽는 응용(지연 조인)은 08회와 12회에서 다룬다.</p>
+
+<h3>세컨더리 인덱스 3: 실무 활용</h3>
+
+<p>세컨더리 인덱스의 구조를 알았으니 실무에서 인덱스를 만들고 지울 때 쓰는 판단 기준을 그 구조에서 끌어내 보자. 아래의 판단들은 모두 "세컨더리 인덱스 = 키 열 + 기본 키를 담은 별도의 B+Tree"라는 한 문장에서 나온다.</p>
+
+<h4>판단 1: 세컨더리 인덱스는 적은 행을 찾을 때 빛난다</h4>
+
+<p>커버링이 아닌 세컨더리 인덱스 조회의 비용은 대략 "세컨더리 인덱스에서 읽은 항목 수 × 클러스터드 인덱스 탐색 한 번"이다. 찾는 행이 10개라면 탐색 10번은 아무것도 아니지만, 10만 개라면 클러스터드 인덱스를 10만 번 내려간다. 반면 풀 스캔의 비용은 조건과 무관하게 테이블의 페이지 수로 정해진다. 그래서 조건에 맞는 행의 비율이 커질수록 어느 지점에서 두 비용이 뒤집힌다. 그 지점이 어디인지는 다음 절에서 계산해 보고, 옵티마이저가 그것을 어떻게 추정하는지는 10회에서 다룬다. 실무에서 기억할 것은 "인덱스가 있는데 왜 안 타지?"라는 질문의 상당수가 이 계산에서 나온다는 점이다. 옵티마이저가 인덱스를 외면했다면, 일치하는 행이 많아 클러스터드 인덱스 탐색을 반복하는 것보다 풀 스캔이 싸다고 판단했을 가능성을 먼저 생각해야 한다.</p>
+
+<h4>판단 2: 인덱스 하나는 쓰기 하나를 더 만든다</h4>
+
+<p>행을 하나 삽입하면 클러스터드 인덱스에 레코드 하나, 그리고 세컨더리 인덱스마다 레코드 하나가 들어간다. 세컨더리 인덱스가 다섯 개면 B+Tree 여섯 개에 삽입이 일어난다. 게다가 세컨더리 인덱스의 키는 대개 단조 증가하지 않는다. <code>member_id</code> 인덱스라면 주문이 들어오는 순서와 회원 번호는 무관하므로, 세컨더리 인덱스 쪽 삽입은 앞에서 본 랜덤 삽입의 성질을 그대로 갖는다. 기본 키를 아무리 잘 골라도 세컨더리 인덱스는 랜덤 삽입을 피할 수 없다. 행을 삭제하면 모든 인덱스에 삭제 표시가 필요하고, 인덱스에 들어 있는 열을 갱신하면 그 인덱스에 삭제 표시와 삽입이 일어난다. 인덱스에 들어 있지 않은 열만 갱신하면 클러스터드 인덱스만 바뀐다.</p>
+
+<p>InnoDB는 세컨더리 인덱스의 랜덤 쓰기를 줄이려고 체인지 버퍼(change buffer)를 두었다. 매뉴얼에 따르면 세컨더리 인덱스는 클러스터드 인덱스와 달리 대개 유니크하지 않고 삽입이 비교적 무작위 순서로 일어나므로, 변경할 세컨더리 인덱스 페이지가 버퍼 풀에 없을 때 변경 내용을 체인지 버퍼에 기록해 두었다가 나중에 그 페이지가 다른 이유로 버퍼 풀에 올라올 때 합친다. 이렇게 하면 세컨더리 인덱스 페이지를 디스크에서 읽어 오는 상당한 랜덤 I/O를 피할 수 있다. 다만 기본 설정이 버전마다 다르다. <code>innodb_change_buffering</code>의 기본값은 MySQL 8.0 매뉴얼에서 <code>all</code>이고, MySQL 8.4 매뉴얼에서는 <code>none</code>이다. 8.4를 기본 설정으로 쓴다면 세컨더리 인덱스를 변경할 때마다 해당 페이지가 버퍼 풀에 있어야 하고, 없으면 읽어 와야 한다. 버퍼 풀보다 큰 테이블에 세컨더리 인덱스를 늘릴 때 이 차이를 염두에 둬야 한다.</p>
+
+<h4>판단 3: 유니크 인덱스는 쓰기 때 반드시 읽는다</h4>
+
+<p>유니크 세컨더리 인덱스에 행을 넣으려면 같은 키가 이미 있는지 확인해야 하고, 확인하려면 그 키가 들어갈 인덱스 페이지를 읽어야 한다. 즉 유니크 인덱스에 대한 삽입은 변경을 미뤄 둘 수 없고 페이지 읽기를 동반한다. 유니크 제약은 데이터 무결성을 위한 것이므로 필요하면 당연히 걸어야 하지만, "조회 성능을 위해" 유니크 인덱스를 고를 이유는 없다. 조회 성능만 놓고 보면 유니크 인덱스와 일반 인덱스의 차이는 일치하는 항목이 하나라는 것을 옵티마이저가 미리 안다는 점 정도다.</p>
+
+<h4>판단 4: 기본 키를 인덱스 끝에 적을 필요는 없지만, 정렬 순서는 알아야 한다</h4>
+
+<p>앞에서 본 소스대로 InnoDB는 세컨더리 인덱스에 이미 들어 있는 기본 키 열을 다시 덧붙이지 않는다. 그래서 <code>INDEX (member_id, order_id)</code>라고 적든 <code>INDEX (member_id)</code>라고 적든 내부 구조는 같다. 기본 키 열을 명시적으로 적는 것이 의미가 있는 경우는 그 열을 맨 끝이 아닌 다른 위치에 두고 싶을 때다.</p>
+
+<p>여기서 함정이 하나 생긴다. <code>INDEX (member_id)</code>와 <code>INDEX (member_id, status)</code>가 함께 있으면, 앞의 것은 뒤의 것의 왼쪽 접두사이므로 중복처럼 보인다. 실제로 sys 스키마의 <code>schema_redundant_indexes</code> 뷰는 이런 관계의 인덱스를 중복 후보로 보여 준다. MySQL 8.4.13에서 두 인덱스를 함께 만들면 이 뷰는 <code>idx_orders_member_id</code>(<code>member_id</code>)를 <code>redundant_index_name</code>으로, <code>(member_id, status)</code> 인덱스를 <code>dominant_index_name</code>으로 보여 주고, <code>sql_drop_index</code> 열에 앞의 것을 지우는 <code>ALTER TABLE ... DROP INDEX</code> 문까지 만들어 준다. 그런데 내부 구조를 펼치면 두 인덱스는 <code>(member_id, order_id)</code>와 <code>(member_id, status, order_id)</code>다. 앞의 것은 같은 회원 안에서 <code>order_id</code> 순서로 정렬되어 있지만, 뒤의 것은 <code>status</code> 순서로 먼저 정렬되어 있다. <code>WHERE member_id = ? ORDER BY order_id DESC LIMIT 20</code> 같은 "회원의 최근 주문" 쿼리가 앞의 인덱스 덕분에 정렬 없이 처리되고 있었다면, "중복"이라며 지우는 순간 이 쿼리에 정렬 단계가 생긴다. 인덱스를 지우기 전에는 그 인덱스가 기본 키까지 포함해 어떤 순서를 제공하고 있었는지 확인해야 한다.</p>
+
+<h4>판단 5: 인덱스 크기는 손으로 어림할 수 있다</h4>
+
+<p>세컨더리 인덱스 리프 레코드 하나의 크기는 레코드 헤더 5바이트에 키 열 값, 기본 키 열 값, NULL 허용 열이 있으면 NULL 비트맵, 가변 길이 열이 있으면 길이 정보를 더한 값이다. 여기에 행 수를 곱하고, 순차 적재라면 15/16, 랜덤 삽입으로 자랐다면 그보다 낮은 채움률로 나누면 리프 크기를 어림할 수 있다. <code>idx_orders_member_id</code>는 21바이트 남짓 × 100만 행이라 20MB를 조금 넘는 수준이다. MySQL 8.4.13에서 <code>CREATE INDEX</code>로 만든 직후의 <code>n_leaf_pages</code>는 1,325, 곧 약 21.7MB였다. 같은 인덱스를 가진 빈 테이블에 100만 행을 기본 키 순서로 <code>INSERT ... SELECT</code> 하며 인덱스가 행 삽입과 함께 자라게 하면 <code>n_leaf_pages</code>는 2,048이었다. <code>member_id</code> 순서로는 무작위인 삽입이 판단 2에서 말한 랜덤 삽입의 채움률을 그대로 보여 준 것이다. 이 어림을 <code>mysql.innodb_index_stats</code>의 <code>n_leaf_pages</code>와 비교하는 습관을 들이면, 인덱스 하나를 추가할 때 버퍼 풀이 얼마나 더 필요한지 감각이 생긴다.</p>
+
+<h4>판단 6: 쓰이지 않는 인덱스는 비용만 남긴다</h4>
+
+<p>판단 2의 쓰기 비용은 인덱스가 조회에 쓰이든 안 쓰이든 똑같이 든다. sys 스키마의 <code>schema_unused_indexes</code> 뷰는 Performance Schema가 수집한 인덱스 사용 기록을 바탕으로 쓰이지 않은 인덱스를 보여 준다. 다만 이 기록은 서버가 시작된 뒤의 것이므로, 월말 정산처럼 드물게 실행되는 쿼리가 쓰는 인덱스는 재시작 직후에는 "안 쓰임"으로 보일 수 있다. 인덱스를 지우기 전에 충분히 긴 기간의 기록을 봐야 하는 이유다.</p>
+
+<h3>랜덤 I/O와 순차 I/O 1: 이론</h3>
+
+<p>지금까지 "랜덤 접근"과 "순차 접근"이라는 말을 여러 번 썼다. 이 절에서는 두 말이 정확히 무엇을 뜻하고, 왜 비용이 다른지를 저장 장치에서 버퍼 풀까지 층마다 정리한다.</p>
+
+<h4>읽기의 단위는 행이 아니라 페이지다</h4>
+
+<p>InnoDB가 디스크와 버퍼 풀 사이에서 주고받는 최소 단위는 페이지(기본 16KB)다. 67바이트짜리 행 하나가 필요해도 16KB 페이지 전체를 읽어야 한다. 그러므로 읽기의 비용은 "읽은 행 수"가 아니라 "접근한 페이지 수"와 "그 페이지들이 디스크에서 얼마나 연속해 있느냐"로 정해진다. 순차 접근은 한 페이지를 가져와 그 안의 행 수백 개를 차례로 다 쓰는 것이다. 페이지 하나를 가져오는 비용이 행 225개에 나눠진다. 랜덤 접근은 행 하나를 위해 페이지 하나를 가져오고, 다음 행을 위해 또 다른 페이지를 가져오는 것이다. 페이지 하나의 비용이 행 하나에 고스란히 실린다.</p>
+
+<h4>저장 장치 층: 기계적 지연과 요청 단위의 비용</h4>
+
+<p>회전하는 디스크(HDD)에서는 이 차이가 물리적으로 드러난다. 원하는 데이터를 읽으려면 헤드를 해당 트랙으로 옮기고(탐색, seek), 원하는 섹터가 헤드 밑으로 돌아올 때까지 기다려야 한다(회전 지연). 7,200rpm 디스크는 한 바퀴에 60 ÷ 7,200초, 약 8.3ms가 걸리므로 회전 지연만 평균 반 바퀴, 약 4.2ms다. 이 지연은 요청마다 치르는 고정 비용이다. 연속된 영역을 한 번에 읽으면 고정 비용을 한 번만 치르고 나머지는 디스크가 도는 대로 쏟아져 들어오지만, 흩어진 페이지를 하나씩 읽으면 페이지마다 고정 비용을 치른다.</p>
+
+<p>SSD에는 움직이는 부품이 없어서 랜덤 읽기의 고정 비용이 HDD보다 훨씬 작다. 그래서 SSD에서는 랜덤과 순차의 격차가 크게 줄어든다. 그러나 격차가 없어지는 것은 아니다. 요청 하나를 처리하는 데는 여전히 운영체제와 장치 쪽의 처리 비용이 들고, 큰 연속 영역을 한 번에 요청하면 그 비용을 여러 페이지에 나눠 낼 수 있다. 더 근본적으로, 행 하나를 위해 16KB를 읽는 증폭은 저장 장치의 종류와 무관하게 남는다. 225행이 들어 있는 페이지를 행 하나 때문에 읽고 버리기를 반복하면, 같은 행 수를 순차로 읽을 때보다 수백 배의 바이트를 옮기게 된다.</p>
+
+<h4>InnoDB 층: 익스텐트와 선행 읽기</h4>
+
+<p>InnoDB는 순차 접근을 더 싸게 만드는 장치를 갖고 있다. 테이블스페이스의 공간은 익스텐트(extent) 단위로 관리되는데, 용어집에 따르면 기본 페이지 크기 16KB에서 익스텐트는 64페이지, 1MB다. 순차로 자란 클러스터드 인덱스의 리프들은 같은 익스텐트 안에 번호 순서대로 놓이는 경향이 있다. 그리고 InnoDB는 이 연속성을 이용하는 선행 읽기(read-ahead)를 한다. 매뉴얼에 따르면 선행 읽기 요청은 곧 필요할 것으로 예상되는 여러 페이지를 비동기로 버퍼 풀에 미리 가져오는 I/O 요청이며, 한 익스텐트의 모든 페이지를 가져온다.</p>
+
+<ul>
+<li><b>선형 선행 읽기(linear read-ahead)</b>: 버퍼 풀의 페이지들이 순차적으로 접근되는 것을 보고 곧 필요할 페이지를 예측한다. <code>innodb_read_ahead_threshold</code>(기본값 56, 범위 0~64) 이상의 페이지를 한 익스텐트에서 순차로 읽으면 다음 익스텐트 전체에 대한 비동기 읽기를 시작한다. 0이면 꺼진다.</li>
+<li><b>무작위 선행 읽기(random read-ahead)</b>: 읽은 순서와 무관하게 같은 익스텐트의 연속된 13개 페이지가 버퍼 풀에 있으면 나머지 페이지를 미리 가져온다. <code>innodb_random_read_ahead</code>의 기본값은 <code>OFF</code>다.</li>
+</ul>
+
+<p>풀 스캔이나 기본 키 범위 스캔처럼 리프를 차례로 읽는 작업은 선형 선행 읽기 덕분에 쿼리가 다음 익스텐트에 도착하기 전에 페이지가 이미 버퍼 풀에 올라와 있을 수 있다. 반면 세컨더리 인덱스를 거쳐 클러스터드 인덱스의 리프를 하나씩 찾아가는 접근은 순서가 없으므로 선행 읽기가 도와줄 수 없다. 페이지가 버퍼 풀에 없으면 쿼리는 그 자리에서 동기 읽기를 기다린다. 선행 읽기의 효과는 <code>Innodb_buffer_pool_read_ahead</code>, <code>Innodb_buffer_pool_read_ahead_evicted</code>(미리 읽었지만 쓰이지 않고 밀려난 페이지), <code>Innodb_buffer_pool_read_ahead_rnd</code> 상태 변수로 관찰할 수 있다.</p>
+
+<h4>버퍼 풀 층: 모두 메모리에 있어도 랜덤은 비싸다</h4>
+
+<p>01회에서 봤듯 실습 데이터는 기본 설정의 버퍼 풀(128MB)에 다 들어간다. 그러면 랜덤과 순차의 차이가 사라질까. 줄어들 뿐 사라지지 않는다. 버퍼 풀 안에서도 페이지에 접근하려면 페이지 번호로 버퍼 풀의 해시 테이블을 찾고, 페이지에 래치를 걸고, 페이지 안에서 이진 탐색으로 레코드를 찾아야 한다. 클러스터드 인덱스를 한 번 내려가는 것은 이 일을 높이만큼(<code>orders</code>라면 세 번) 하는 것이다. 순차 스캔에서는 같은 페이지 안의 다음 레코드로 옮겨 가는 것이 포인터 하나를 따라가는 일이고, 페이지를 바꿀 때만 이 비용이 든다. 메모리 안에서도 행당 비용의 구조는 그대로다.</p>
+
+<h4>우리 데이터로 계산하기: 1%의 행이 100%의 페이지에 있다</h4>
+
+<p>이제 실제 숫자를 넣어 보자. 01회의 생성 규칙에서 주문 n의 회원 번호는 <code>MOD(n × 7919, 99991) + 1</code>이므로, 회원 번호 구간에 속하는 주문 번호를 정확히 계산할 수 있다. 여기에 "한 리프 페이지에 225행"이라는 01회의 어림을 더하면 주문 번호로 리프 페이지 번호도 알 수 있다(페이지 번호 = (주문 번호 − 1) ÷ 225의 몫 + 1). 아래 표는 이 규칙으로 계산한 값이다. 행 수는 생성 규칙만으로 정해지는 정확한 값이고(MySQL 8.4.13에서 만든 테이블에 <code>COUNT(*)</code>로 확인했다), 페이지 수는 225행 어림에 따른 값이다. 실측 리프 수 5,046에 맞춰 페이지당 198행으로 다시 계산하면 네 조건의 페이지 수는 1,000, 2,065, 3,088, 5,051이 되어, 회원 1~1000번의 주문은 여전히 사실상 모든 리프에 흩어진다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>조건</th><th>일치하는 행</th><th>행이 흩어진 리프 페이지(어림)</th><th>전체 리프 대비</th></tr></thead><tbody>
+<tr><td><code>member_id BETWEEN 1 AND 100</code></td><td>1,000</td><td>1,000</td><td>약 22%</td></tr>
+<tr><td><code>member_id BETWEEN 1 AND 300</code></td><td>3,000</td><td>1,954</td><td>약 44%</td></tr>
+<tr><td><code>member_id BETWEEN 1 AND 500</code></td><td>5,000</td><td>2,849</td><td>약 64%</td></tr>
+<tr><td><code>member_id BETWEEN 1 AND 1000</code></td><td>10,001</td><td>4,445</td><td>100%</td></tr>
+</tbody></table></div>
+
+<p>회원 1~1000번의 주문은 10,001건(회원 950번은 주문이 11건이다)으로 전체의 1%다. 그런데 이 1%의 행이 리프 4,445페이지 전부에 흩어져 있다. 세컨더리 인덱스로 이 행들을 읽으면 클러스터드 인덱스를 10,001번 내려가고, 그 과정에서 모든 리프 페이지를 평균 두 번 이상 방문한다. 방문 순서는 회원 번호 순서이므로 같은 페이지를 다시 방문할 때까지 사이에 수천 개의 다른 페이지를 거친다. 페이지 접근 횟수로 세면 클러스터드 쪽만 약 10,001 × 3 = 3만 회다. 같은 결과를 풀 스캔으로 얻으면 리프 4,445페이지를 한 번씩, 그것도 연결 리스트 순서대로 읽는다.</p>
+
+<p>테이블이 버퍼 풀에 다 들어 있다면 이 차이는 "페이지 접근 3만 번 대 4,400여 번"이라는 CPU 일의 차이다. 다만 풀 스캔은 그 페이지들에 든 100만 행을 모두 꺼내 조건을 평가해야 하므로 CPU 일로 따지면 풀 스캔 쪽도 가볍지 않다. 뒤의 실습에서 데이터가 모두 버퍼 풀에 있을 때 재 보면 인덱스 경로가 풀 스캔보다 훨씬 빨랐다. 테이블이 버퍼 풀보다 훨씬 크다면 차이는 극적이 된다. 풀 스캔은 70개 남짓한 익스텐트를 선행 읽기의 도움을 받아 순서대로 읽지만, 세컨더리 인덱스 경로는 최소 4,445번의 랜덤 읽기를 하고, 다시 방문할 때 페이지가 이미 밀려났다면 10,001번에 가까운 랜덤 읽기를 한다. 테이블의 1%를 고르는 조건인데도 인덱스가 풀 스캔보다 불리할 수 있다는 것, 이것이 이 회차 첫머리의 세 번째 질문에 대한 답이다.</p>
+
+<x-visual id="db-perf-06-random-vs-sequential" title="세컨더리 인덱스 경로의 랜덤 접근과 풀 스캔의 순차 접근" kind="비교 그림" ratio="16:9">
+<x-hint>세컨더리 인덱스 리프에서는 붙어 있는 항목들이 클러스터드 인덱스의 멀리 떨어진 리프 페이지들을 가리켜 화살표가 교차하며 튀고, 풀 스캔은 리프를 왼쪽에서 오른쪽으로 한 번씩 훑는다는 대비를 보여 준다.</x-hint>
+<x-prompt>Two horizontal bands on a white background, technical flat style. Top band labeled "세컨더리 인덱스 리프": a compact row of small cells "(1, 99991)", "(1, 199982)", "(1, 299973)", "(2, 15594)", "(2, 115585)". Bottom band labeled "클러스터드 인덱스 리프": a long row of about twenty page boxes numbered left to right, a few of them labeled "p70", "p445", "p514", "p889", "p1334". Draw orange curved arrows from each top cell down to a different, far-apart page box in the bottom row, crossing each other, labeled "랜덤 접근: 행마다 트리를 다시 탐색". Under the bottom row, draw one long straight green arrow running left to right across all page boxes labeled "풀 스캔: 리프를 순서대로 한 번씩". In the bottom-right corner, a small box labeled "익스텐트 = 64페이지(1MB), 선행 읽기 단위". Keep it uncluttered.</x-prompt>
+<x-caption>세컨더리 인덱스에서 붙어 있는 항목도 클러스터드 인덱스에서는 멀리 떨어진 페이지를 가리킬 수 있다.</x-caption>
+</x-visual>
+
+<h4>같은 행 수, 다른 비용: 상관관계가 결정한다</h4>
+
+<p>그렇다면 세컨더리 인덱스 경로는 언제나 랜덤일까. 그렇지 않다. 01회의 생성 규칙에서 <code>ordered_at</code>은 <code>'2023-01-01' + n × 63초</code>로, 주문 번호와 같은 순서로 증가한다. <code>ordered_at</code>에 세컨더리 인덱스를 만들고 하루치, 예를 들어 <code>ordered_at >= '2023-01-02' AND ordered_at < '2023-01-03'</code>를 조회한다고 하자. 86,400초를 63초로 나누면 하루에 약 1,371건이 있다. 정확히 계산하면 이 날의 주문은 n × 63이 86,400 이상 172,800 미만인 n, 곧 주문 번호 1,372부터 2,742까지의 1,371건이다. 세컨더리 인덱스가 주는 기본 키가 1372, 1373, 1374, …처럼 연속이므로 클러스터드 인덱스 탐색은 매번 같은 리프 페이지에 도착하고, 페이지가 바뀌는 것은 225건마다 한 번이다. 이 1,371건은 리프 7페이지에 들어 있다.</p>
+
+<p>비교를 위해 행 수가 거의 같은 회원 조건을 보자. <code>member_id BETWEEN 1 AND 137</code>은 1,370건이다. 그런데 이 행들은 리프 1,215페이지에 흩어져 있다. 행 수는 같은데 접근하는 서로 다른 리프 페이지 수가 7 대 1,215, 170배 넘게 차이 난다. 두 쿼리는 똑같이 "세컨더리 인덱스 range 스캔 후 클러스터드 인덱스 탐색"이라는 실행 계획을 갖지만, 비용은 전혀 다르다.</p>
+
+<p>차이를 만드는 것은 <b>세컨더리 인덱스의 순서와 기본 키 순서 사이의 상관관계</b>다. Oracle은 이것을 인덱스 클러스터링 팩터(index clustering factor)라는 통계로 관리하는데, Oracle 문서는 이를 인덱스 값에 대한 행 순서의 정도를 재는 값으로 정의하고, 순서가 잘 맞을수록 값이 작아진다고 설명한다. InnoDB에서 이 상관관계는 기본 키를 무엇으로 정했느냐에 직접 달려 있다. <code>AUTO_INCREMENT</code> 기본 키 테이블에서는 생성 시각, 생성 순서와 상관된 열들(가입일, 주문 시각, 로그 시각)의 세컨더리 인덱스가 거의 순차 접근이 되고, 회원 번호나 상품 번호처럼 생성 순서와 무관한 열의 인덱스는 랜덤 접근이 된다. 클러스터드 인덱스의 키를 고르는 일은 어떤 세컨더리 인덱스가 싸고 어떤 세컨더리 인덱스가 비쌀지를 함께 고르는 일이다.</p>
+
+<h3>랜덤 I/O와 순차 I/O 2: 실습</h3>
+
+<p>이론을 실행으로 확인한다. 실습 데이터가 버퍼 풀에 다 들어가는 환경이므로 디스크 I/O의 차이보다는 페이지 접근 횟수와 실행 시간의 차이가 보일 것이다. 아래에 싣는 출력은 MySQL 8.4.13(데이터 디렉터리를 메모리에 둔 Docker 컨테이너, 버퍼 풀 기본값 128MB)에서 버퍼 풀을 데운 뒤 같은 쿼리를 세 번씩 실행한 것이다. 실행 시간과 비용·rows 추정치는 실행 환경과 통계에 따라 달라지므로, 숫자 자체보다 무엇을 어떤 순서로 재고 결과를 어떻게 해석하는지에 집중하자.</p>
+
+<h4>준비</h4>
+
+<pre><code class="language-sql">-- idx_orders_member_id 는 앞에서 만들었다
+CREATE INDEX idx_orders_ordered_at ON orders (ordered_at);
+ANALYZE TABLE orders;
+
+-- 같은 쿼리를 여러 번 실행해 버퍼 풀을 데운 뒤 측정한다
+SELECT COUNT(*) FROM orders;</code></pre>
+
+<h4>실험 1: 회원 1~1000번, 인덱스 경로와 풀 스캔</h4>
+
+<pre><code class="language-sql">-- (A) 세컨더리 인덱스 강제
+EXPLAIN ANALYZE
+SELECT * FROM orders FORCE INDEX (idx_orders_member_id)
+WHERE member_id BETWEEN 1 AND 1000;
+
+-- (B) 세컨더리 인덱스 금지: 풀 스캔
+EXPLAIN ANALYZE
+SELECT * FROM orders IGNORE INDEX (idx_orders_member_id)
+WHERE member_id BETWEEN 1 AND 1000;
+
+-- (C) 같은 조건, 커버링
+EXPLAIN ANALYZE
+SELECT member_id, order_id FROM orders
+WHERE member_id BETWEEN 1 AND 1000;</code></pre>
+
+<pre data-label="EXPLAIN ANALYZE (MySQL 8.4.13에서 실행, 세 번 중 한 번)"><code class="language-text">-- (A)
+-> Index range scan on orders using idx_orders_member_id over (1 <= member_id <= 1000), with index condition: (orders.member_id between 1 and 1000)  (cost=0.71 rows=1) (actual time=0.0221..13.9 rows=10001 loops=1)
+
+-- (B)
+-> Filter: (orders.member_id between 1 and 1000)  (cost=100781 rows=110552) (actual time=0.0284..226 rows=10001 loops=1)
+    -> Table scan on orders  (cost=100781 rows=995071) (actual time=0.022..180 rows=1e+6 loops=1)
+
+-- (C)
+-> Filter: (orders.member_id between 1 and 1000)  (cost=3750 rows=18564) (actual time=0.104..1.71 rows=10001 loops=1)
+    -> Covering index range scan on orders using idx_orders_member_id over (1 <= member_id <= 1000)  (cost=3750 rows=18564) (actual time=0.103..1.16 rows=10001 loops=1)</code></pre>
+
+<p>세 쿼리 모두 결과 행 수는 10,001이다. EXPLAIN ANALYZE 출력에서 확인할 것은 세 가지다. 첫째, 맨 위 노드의 실제 행 수가 10,001로 같은지. 둘째, (B)의 테이블 스캔 노드가 실제로 100만 행(<code>rows=1e+6</code>)을 읽고 그중 10,001행만 필터를 통과시키는지. 셋째, 각 쿼리의 실제 시간이다. 세 번 실행한 마지막 행의 시간은 (A)가 약 14ms(첫 실행만 31.9ms), (B)가 약 225ms, (C)가 약 1.7ms였다. 데이터가 모두 버퍼 풀에 있는 이 환경에서는 (A)가 클러스터드 인덱스를 10,001번 내려가면서도 100만 행을 꺼내 평가하는 (B)보다 16배쯤 빨랐다. 클러스터드 인덱스 재탐색의 비용은 (A)와 (C)의 차이, 곧 같은 10,001개 항목을 읽으면서 8배쯤 벌어진 시간에서 보인다. 앞에서 말한 "인덱스가 풀 스캔보다 불리할 수 있다"는 상황은 페이지를 디스크에서 읽어야 할 때 드러나는 것이고, 이 실습 환경에서는 재현되지 않았다. 참고로 힌트 없이 <code>EXPLAIN</code>하면 옵티마이저도 이 조건에 <code>idx_orders_member_id</code>를 고른다(<code>type</code> range, rows 18564, Extra <code>Using index condition</code>). (A)의 <code>with index condition</code>은 08회에서 다룰 ICP 표시이고, FORCE INDEX를 붙인 (A)의 추정치 <code>rows=1</code>은 힌트 없는 계획의 추정치와 다르지만 이 회차에서는 원인을 따지지 않고 actual 값만 본다.</p>
+
+<h4>실험 2: Handler 카운터와 버퍼 풀 읽기 요청을 함께 보기</h4>
+
+<p>앞에서 Handler 카운터는 클러스터드 인덱스 재탐색을 세지 못한다고 했다. 이것을 확인하려면 쿼리 전후로 두 종류의 카운터를 읽는다. 버퍼 풀 읽기 요청 수는 서버 전체 값이므로 다른 작업이 없는 실습 서버에서 차이를 본다.</p>
+
+<pre><code class="language-sql">FLUSH STATUS;   -- 세션 Handler 카운터 초기화
+SELECT variable_value INTO @rr_before
+FROM performance_schema.global_status
+WHERE variable_name = 'Innodb_buffer_pool_read_requests';
+
+SELECT SUM(amount) FROM orders FORCE INDEX (idx_orders_member_id)
+WHERE member_id BETWEEN 1 AND 1000;
+
+SHOW SESSION STATUS LIKE 'Handler_read%';
+SELECT variable_value - @rr_before AS read_requests
+FROM performance_schema.global_status
+WHERE variable_name = 'Innodb_buffer_pool_read_requests';</code></pre>
+
+<p>결과 행을 화면에 쏟아내지 않도록 <code>SUM(amount)</code>을 썼다. <code>amount</code>는 인덱스에 없으므로 행마다 클러스터드 인덱스를 방문해야 하는, (A)와 같은 접근 경로다. 같은 측정을 <code>IGNORE INDEX</code>로 바꿔 풀 스캔에 대해서도 하고, <code>SUM(amount)</code>를 <code>COUNT(*)</code>로 바꿔 커버링 경로에 대해서도 한다. MySQL 8.4.13에서 새로 접속한 세션에서 쿼리 하나만 실행하고 <code>SHOW SESSION STATUS LIKE 'Handler_read%'</code>를 보면, 인덱스 경로는 <code>Handler_read_key</code> 1, <code>Handler_read_next</code> 10,001이고 나머지는 0이었다. 풀 스캔은 <code>Handler_read_first</code> 1, <code>Handler_read_key</code> 1, <code>Handler_read_rnd_next</code> 1,000,001이었고, 커버링 경로(<code>COUNT(*)</code>)는 인덱스 경로와 똑같이 <code>Handler_read_key</code> 1, <code>Handler_read_next</code> 10,001이었다. 해석의 요점은 이렇다. 인덱스 경로의 <code>Handler_read_next</code>는 풀 스캔의 <code>Handler_read_rnd_next</code>보다 100배쯤 작다. Handler 카운터만 보면 인덱스 경로가 100분의 1의 일을 한 것처럼 보인다. 그러나 버퍼 풀 읽기 요청 수는 이 비율을 따르지 않는다. 인덱스 경로의 읽기 요청에는 10,001번의 클러스터드 인덱스 탐색이 들어 있기 때문이다. 그리고 커버링 경로(<code>COUNT(*)</code>)는 Handler 카운터가 인덱스 경로와 같은데도 읽기 요청 수는 크게 작다. "서버 계층이 본 일"과 "스토리지 엔진이 실제로 한 일"이 다를 수 있다는 것, 그리고 그 차이가 바로 클러스터드 인덱스 재탐색이라는 것을 숫자로 확인하는 실험이다. 이 회차의 실행 서버는 다른 작업과 함께 쓰고 있어 서버 전체 값인 <code>Innodb_buffer_pool_read_requests</code>의 차이를 깨끗하게 잴 수 없었으므로, 버퍼 풀 읽기 요청 수는 숫자를 싣지 않았다. 대신 Handler 카운터가 똑같은 인덱스 경로 (A)와 커버링 경로 (C)의 실행 시간이 실험 1에서 약 14ms와 약 1.7ms로 벌어졌다는 것이 같은 차이를 보여 준다.</p>
+
+<h4>실험 3: 같은 행 수, 다른 상관관계</h4>
+
+<pre><code class="language-sql">-- (D) 생성 순서와 상관된 인덱스: 1,371행, 리프 약 7페이지
+EXPLAIN ANALYZE
+SELECT SUM(amount) FROM orders FORCE INDEX (idx_orders_ordered_at)
+WHERE ordered_at >= '2023-01-02' AND ordered_at < '2023-01-03';
+
+-- (E) 생성 순서와 무관한 인덱스: 1,370행, 리프 약 1,215페이지
+EXPLAIN ANALYZE
+SELECT SUM(amount) FROM orders FORCE INDEX (idx_orders_member_id)
+WHERE member_id BETWEEN 1 AND 137;</code></pre>
+
+<pre data-label="EXPLAIN ANALYZE (MySQL 8.4.13에서 실행, 세 번 중 한 번)"><code class="language-text">-- (D)
+-> Aggregate: sum(orders.amount)  (cost=754 rows=1) (actual time=1.26..1.26 rows=1 loops=1)
+    -> Index range scan on orders using idx_orders_ordered_at over ('2023-01-02 00:00:00' <= ordered_at < '2023-01-03 00:00:00'), with index condition: ((orders.ordered_at >= TIMESTAMP'2023-01-02 00:00:00') and (orders.ordered_at < TIMESTAMP'2023-01-03 00:00:00'))  (cost=617 rows=1371) (actual time=0.188..1.18 rows=1371 loops=1)
+
+-- (E)
+-> Aggregate: sum(orders.amount)  (cost=754 rows=1) (actual time=2.03..2.03 rows=1 loops=1)
+    -> Index range scan on orders using idx_orders_member_id over (1 <= member_id <= 137), with index condition: (orders.member_id between 1 and 137)  (cost=617 rows=1370) (actual time=0.234..1.98 rows=1370 loops=1)</code></pre>
+
+<p>두 쿼리의 실행 계획 모양은 같다. 세컨더리 인덱스 range 스캔에서 1,371행 또는 1,370행을 읽고, 행마다 클러스터드 인덱스를 탐색한다. 옵티마이저의 비용 추정도 둘 다 754로 같다. 실행 시간을 비교하면 (D)가 (E)보다 빠르다. 위 실행 뒤 두 번 더 실행했을 때도 (D)는 약 1.0ms, (E)는 약 2.0ms로 (D)가 두 배쯤 빨랐다. 서로 다른 리프 수 7 대 1,215(225행 어림)라는 170배의 차이가 시간에는 두 배로만 나타난 것은, 두 쿼리가 클러스터드 인덱스를 내려가는 횟수는 1,370여 번으로 같고 다른 것은 접근의 지역성뿐이기 때문이다. 데이터가 모두 버퍼 풀에 있으므로 차이는 디스크가 아니라 페이지 접근의 지역성에서 나온다. (D)의 클러스터드 탐색은 연속된 기본 키를 찾으므로 직전에 접근한 리프 페이지와 그 위의 비리프 페이지들이 CPU 캐시에도 남아 있을 가능성이 높고, (E)는 탐색마다 다른 페이지로 간다. 버퍼 풀이 테이블보다 작은 운영 환경이라면 (E)는 페이지마다 디스크 읽기를 일으킬 수 있고 (D)는 몇 페이지만 읽으면 되므로, 이 차이는 훨씬 커진다.</p>
+
+<aside class="note">디스크 읽기까지 포함한 차이를 보고 싶다면 버퍼 풀을 비운 상태에서 측정해야 한다. 이때 서버를 재시작하는 것만으로는 부족할 수 있다. MySQL은 기본 설정에서 종료할 때 버퍼 풀의 페이지 목록을 저장하고(<code>innodb_buffer_pool_dump_at_shutdown</code>) 시작할 때 그 페이지들을 다시 읽어 들이기(<code>innodb_buffer_pool_load_at_startup</code>) 때문이다. 실습 서버라면 두 설정을 끄고 재시작한 뒤, <code>Innodb_buffer_pool_reads</code>(버퍼 풀에 없어 디스크에서 읽은 횟수)의 증가량을 함께 기록한다.</aside>
+
+<h4>정리하고 원래 상태로 돌리기</h4>
+
+<pre><code class="language-sql">DROP INDEX idx_orders_member_id ON orders;
+DROP INDEX idx_orders_ordered_at ON orders;
+DROP TABLE pk_seq, pk_rand;
+SET GLOBAL innodb_monitor_disable = 'index_page_splits';</code></pre>
+
+<p>다음 회차들은 각자 필요한 인덱스를 다시 만든다. 실습 테이블을 기본 키만 있는 상태로 되돌려 두면, 다른 회차의 실험에서 이 회차의 인덱스가 의도치 않게 계획 선택에 끼어드는 일을 막을 수 있다.</p>
+
+<h3>MySQL, Oracle, PostgreSQL 설계 철학</h3>
+
+<p>지금까지 본 InnoDB의 구조는 여러 가능한 설계 중 하나다. 세 데이터베이스를 나란히 놓으면 "행을 가리키는 주소로 무엇을 쓰느냐"라는 하나의 질문에 각자 다른 답을 냈고, 그 답에 따라 비용을 치르는 자리가 달라졌다는 것이 보인다.</p>
+
+<h4>MySQL InnoDB: 테이블은 언제나 기본 키 트리</h4>
+
+<p>InnoDB에는 선택지가 없다. 모든 테이블이 클러스터드 인덱스이고, 세컨더리 인덱스는 기본 키라는 <b>논리 주소</b>로 행을 가리킨다. 기본 키 조회와 기본 키 범위 조회가 한 번의 트리 탐색으로 끝나고, 행이 페이지 분할로 움직여도 세컨더리 인덱스를 고칠 필요가 없다. 대가는 세컨더리 인덱스 조회의 이중 탐색, 모든 세컨더리 인덱스로 복제되는 기본 키의 크기, 그리고 기본 키 삽입 순서에 민감한 저장 구조다. 이 회차에서 본 거의 모든 실무 기준이 이 대가를 줄이는 방법이다.</p>
+
+<h4>Oracle: 힙이 기본, 인덱스 구성 테이블은 선택</h4>
+
+<p>Oracle의 기본 테이블은 힙 구성 테이블(heap-organized table)이다. Oracle 문서의 표현으로는 힙 구성 테이블은 행을 들어갈 수 있는 곳에 넣는다. B-tree 인덱스의 리프 블록에는 인덱스된 값과 함께 실제 행의 위치를 찾는 데 쓰는 rowid가 들어 있다. rowid는 <b>물리 주소</b>이므로 인덱스에서 테이블 블록으로 곧장 갈 수 있다. 문서는 힙 테이블에서 세컨더리 인덱스를 통한 접근이 인덱스 스캔과 행이 든 데이터 블록을 가져오는 추가 I/O 한 번으로 이루어진다고 적는다. 기본 키 인덱스도 다른 인덱스와 똑같이 별도의 구조이므로 기본 키 선택이 테이블의 물리 구조를 정하지 않는다.</p>
+
+<p>Oracle은 InnoDB와 같은 구조도 선택지로 제공한다. 인덱스 구성 테이블(index-organized table)은 문서의 정의로 B-tree 인덱스 구조의 변형에 저장된 테이블이고, 기본 키 제약을 반드시 정의해야 한다. 인덱스 구성 테이블 위의 세컨더리 인덱스는 InnoDB처럼 기본 키 기반의 논리 rowid를 쓰는데, 여기에 흥미로운 장치가 하나 있다. 논리 rowid에는 항목이 처음 만들어졌을 때의 물리 rowid인 물리적 추측(physical guess)이 들어 있어서, 추측이 맞으면 기본 키 탐색을 건너뛰고 리프 블록으로 바로 들어가고, 행이 옮겨 가서 추측이 틀렸으면 잘못된 블록을 읽은 뒤 기본 키로 다시 탐색한다. 논리 주소의 안정성과 물리 주소의 빠름을 함께 얻으려는 절충이다.</p>
+
+<h4>PostgreSQL: 모든 인덱스가 세컨더리</h4>
+
+<p>PostgreSQL 문서는 이 점을 한 문장으로 말한다. PostgreSQL의 모든 인덱스는 세컨더리 인덱스이며, 각 인덱스는 PostgreSQL 용어로 힙이라 부르는 테이블의 주 데이터 영역과 따로 저장된다. 인덱스 항목은 행 버전의 물리적 위치(시스템 열 <code>ctid</code>로 볼 수 있다)를 가리킨다. 문서는 그 결과도 숨기지 않는다. 일반 인덱스 스캔에서는 행마다 인덱스와 힙 양쪽에서 데이터를 가져와야 하고, 주어진 조건에 맞는 인덱스 항목들은 인덱스 안에서 대개 가까이 있지만 그 항목들이 가리키는 행은 힙의 어디에든 있을 수 있으므로, 힙 접근은 많은 랜덤 접근을 수반한다. 우리가 InnoDB에서 본 세컨더리 인덱스의 랜덤 접근 문제가 PostgreSQL에서는 모든 인덱스, 기본 키 인덱스에까지 해당하는 셈이다.</p>
+
+<p>물리 주소를 쓰는 대가는 쓰기 쪽에서 나타난다. PostgreSQL의 UPDATE는 행의 새 버전을 테이블에 추가하는데, 문서에 따르면 이때 갱신된 행마다 새 인덱스 항목이 필요할 수 있다. 행의 새 버전은 새 물리 위치를 갖기 때문이다. 이를 줄이는 것이 HOT(Heap-Only Tuples) 최적화다. 갱신이 인덱스가 참조하는 열을 바꾸지 않고(요약 인덱스인 BRIN은 예외), 옛 행이 있는 페이지에 새 버전을 담을 공간이 있으면, 새 인덱스 항목 없이 같은 페이지 안에서 옛 버전이 새 버전을 가리키게 한다. 행의 물리 위치를 고정하기 위해 "같은 페이지 안에 머문다"는 조건을 붙인 것이다.</p>
+
+<p>PostgreSQL에도 InnoDB의 클러스터드 인덱스를 흉내 내는 명령이 있다. <code>CLUSTER</code>는 지정한 인덱스 순서대로 테이블을 물리적으로 재배열한다. 그러나 문서가 분명히 말하듯 클러스터링은 일회성 작업이라, 이후에 갱신되는 행은 인덱스 순서를 따르지 않는다. 실행하는 동안에는 <code>ACCESS EXCLUSIVE</code> 잠금을 잡아 읽기와 쓰기를 모두 막는다. 커버링도 다르게 동작한다. PostgreSQL의 인덱스 전용 스캔(index-only scan)은 인덱스 항목을 찾은 뒤 해당 힙 페이지의 가시성 맵(visibility map) 비트를 확인하고, 비트가 켜져 있을 때만 힙을 방문하지 않는다. 행 버전의 가시성 정보가 힙에만 있기 때문이며, 앞에서 본 InnoDB 세컨더리 인덱스의 MVCC 예외와 같은 뿌리의 문제다. 키가 아닌 열을 인덱스에 실어 커버링을 만드는 <code>INCLUDE</code> 절도 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>항목</th><th>MySQL InnoDB</th><th>Oracle (기본: 힙)</th><th>PostgreSQL</th></tr></thead><tbody>
+<tr><td>테이블 저장 방식</td><td>항상 기본 키 B+Tree (클러스터드)</td><td>힙, 선택적으로 인덱스 구성 테이블</td><td>힙</td></tr>
+<tr><td>인덱스가 행을 가리키는 값</td><td>기본 키 (논리 주소)</td><td>rowid (물리 주소)</td><td>행 버전의 물리 위치 (<code>ctid</code>)</td></tr>
+<tr><td>세컨더리 인덱스 조회</td><td>세컨더리 탐색 + 클러스터드 탐색</td><td>인덱스 탐색 + 블록 I/O 한 번</td><td>인덱스 탐색 + 힙 접근</td></tr>
+<tr><td>기본 키 범위 조회</td><td>리프를 순서대로, 순차</td><td>다른 인덱스와 같음</td><td>다른 인덱스와 같음 (<code>CLUSTER</code> 직후는 예외)</td></tr>
+<tr><td>행이 움직일 때</td><td>세컨더리 인덱스 수정 불필요</td><td>힙 행은 이주해도 rowid 유지</td><td>새 버전마다 인덱스 항목, HOT이면 생략</td></tr>
+<tr><td>설계의 무게 중심</td><td>기본 키 선택</td><td>인덱스와 클러스터링 팩터</td><td>갱신 패턴과 VACUUM, HOT</td></tr>
+</tbody></table></div>
+
+<p>표의 "행이 움직일 때" 칸의 Oracle 항목은 Oracle 문서의 인덱스 구성 테이블 설명에서 "인덱스 구성 테이블의 행은 힙 구성 테이블의 행처럼 이주(migrate)하지 않는다"고 대비한 데서 온다. 힙 행은 갱신으로 블록에 들어가지 않게 되면 다른 블록으로 옮겨지지만 rowid는 그대로 두어, 인덱스를 고치지 않는 대신 원래 블록을 거쳐 가는 추가 접근이 생긴다.</p>
+
+<p>세 설계 중 무엇이 우월하다고 말할 수는 없다. 물리 주소는 읽기에서 한 번의 점프로 끝나지만 행이 움직이는 순간 그 주소를 유지하는 비용이 생긴다. 논리 주소는 행의 이동에 무심하지만 읽을 때마다 한 번 더 찾아가야 한다. InnoDB를 쓴다는 것은 기본 키 순서의 지역성을 최대로 활용하는 대신 기본 키 설계에 많은 책임을 지는 쪽을 택했다는 뜻이다. 다른 데이터베이스에서 옮겨 온 경험칙("기본 키는 아무거나 괜찮다", "UUID 기본 키도 문제없었다")이 InnoDB에서 그대로 통하지 않는 이유가 여기 있다.</p>
+
+<x-visual id="db-perf-06-three-dbms" title="InnoDB, Oracle, PostgreSQL의 행 주소 방식 비교" kind="비교 그림" ratio="16:9">
+<x-hint>세 데이터베이스에서 인덱스가 행을 가리키는 방식(기본 키로 다시 탐색, rowid로 블록 직행, ctid로 힙 직행)을 세 칸으로 나란히 보여 준다.</x-hint>
+<x-prompt>Three-column comparison diagram, white background, clean flat style. Column 1 titled "MySQL InnoDB": a small tree labeled "세컨더리 인덱스" whose leaf holds a cell "키 + 기본 키", with an arrow labeled "기본 키로 다시 탐색" pointing to a larger tree labeled "클러스터드 인덱스(행 전체)". Column 2 titled "Oracle(힙)": a tree labeled "B-tree 인덱스" whose leaf holds "키 + rowid", with a straight arrow labeled "rowid로 블록 직행" pointing to an unordered stack of blocks labeled "힙 테이블". Column 3 titled "PostgreSQL": a tree labeled "인덱스" whose leaf holds "키 + ctid", with a straight arrow labeled "ctid로 힙 직행" to an unordered stack of pages labeled "힙". Use the same colors for index trees (blue) and table storage (green) across all three columns so the difference in arrow length and target is easy to compare.</x-prompt>
+<x-caption>InnoDB는 논리 주소(기본 키), Oracle 힙 테이블과 PostgreSQL은 물리 주소로 행을 가리킨다.</x-caption>
+</x-visual>
+
+<h3>흔한 오해와 함정</h3>
+
+<h4>"클러스터드 인덱스니까 디스크에 기본 키 순서로 빈틈없이 저장되어 있다"</h4>
+
+<p>클러스터드 인덱스가 보장하는 것은 리프 레코드의 <b>논리적</b> 순서다. 리프 페이지들은 연결 리스트로 기본 키 순서대로 이어져 있지만, 각 페이지가 파일 안의 어디에 놓이는지는 할당 시점의 사정에 달려 있다. 순차 삽입으로 자란 테이블은 논리 순서와 물리 위치가 대체로 일치하지만, 랜덤 삽입으로 분할이 반복된 테이블은 리프를 순서대로 따라가도 파일 안에서는 이리저리 뛴다. 페이지 안에서도 레코드는 물리적으로 정렬되어 있지 않고 레코드끼리의 연결로 순서를 유지한다는 것은 05회에서 봤다.</p>
+
+<h4>"세컨더리 인덱스는 행의 주소를 가리킨다"</h4>
+
+<p>다른 데이터베이스나 교과서의 일반적인 설명에서 온 오해다. InnoDB 세컨더리 인덱스는 기본 키 값을 담고, 행을 찾으려면 클러스터드 인덱스를 처음부터 다시 내려간다. 이 차이를 모르면 "인덱스로 찾은 행 10개"의 비용을 10번의 페이지 읽기로 어림하게 되는데, 실제로는 10번의 트리 탐색이다.</p>
+
+<h4>"인덱스를 타면 풀 스캔보다 빠르다"</h4>
+
+<p>일치하는 행이 적을 때만 그렇다. 우리 데이터에서 테이블의 1%를 고르는 조건이 리프 페이지 100%를 건드렸다. 인덱스의 이득은 "읽을 행 수를 줄이는 것"이지만, 커버링이 아닌 세컨더리 인덱스는 "행마다 랜덤 접근"이라는 비용을 새로 만든다. 행 수가 줄어드는 이득이 이 비용보다 클 때만 인덱스가 이긴다.</p>
+
+<h4>"EXPLAIN에 Using index가 있으면 테이블은 절대 읽지 않는다"</h4>
+
+<p>계획 단계에서는 그렇다. 실행 중에는 세컨더리 인덱스 레코드에 삭제 표시가 있거나 페이지가 더 새로운 트랜잭션에 의해 갱신되었으면 InnoDB가 클러스터드 인덱스를 방문한다. 쓰기가 많은 테이블에서 커버링 쿼리의 성능이 시간대에 따라 출렁인다면 이 동작을 의심해 볼 수 있다. 또 <code>Using index</code>와 <code>Using index condition</code>은 다른 말이다. 뒤의 것은 ICP로, 08회에서 다룬다.</p>
+
+<h4>"기본 키가 없으면 인덱스 없는 테이블이다"</h4>
+
+<p>InnoDB 테이블은 클러스터드 인덱스 없이 존재할 수 없다. 기본 키가 없으면 NOT NULL 유니크 인덱스가, 그것도 없으면 숨은 행 ID가 클러스터드 키가 된다. 첫 번째 경우에는 의도치 않게 유니크 열 순서로 테이블이 정렬되고, 두 번째 경우에는 쓸 수 없는 키가 테이블을 정렬한다. 어느 쪽도 설계한 결과가 아니다.</p>
+
+<h4>"UUID 기본 키는 무조건 나쁘다"</h4>
+
+<p>문제는 UUID라는 이름이 아니라 값의 순서와 크기다. 무작위 UUIDv4를 36바이트 문자열로 저장하면 이 회차에서 본 비용(가운데 분할, 넓은 작업 집합, 커지는 세컨더리 인덱스)을 모두 치른다. 시간 순서를 갖는 UUIDv7이나 <code>UUID_TO_BIN(UUID(), 1)</code>을 <code>BINARY(16)</code>으로 저장하면 삽입 위치 문제의 대부분이 사라지고, 남는 것은 8바이트 대 16바이트의 크기 차이다. 분산 생성이 꼭 필요하다면 이 크기 차이는 감수할 만한 비용일 수 있다.</p>
+
+<h4>"COUNT(*)는 기본 키로 센다"</h4>
+
+<p>매뉴얼에 따르면 InnoDB는 힌트가 없는 한 가장 작은 세컨더리 인덱스를 훑어 <code>COUNT(*)</code>를 처리한다. 세컨더리 인덱스는 행 전체가 아니라 키와 기본 키만 담으므로 클러스터드 인덱스보다 훨씬 작기 때문이다. <code>COUNT(*)</code>의 실행 계획에 기본 키가 아닌 인덱스가 나타나는 것은 정상이다.</p>
+
+<h3>정리: 하나의 사실에서 모든 판단이 나온다</h3>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>InnoDB 테이블은 기본 키로 정렬된 B+Tree 하나이고, 세컨더리 인덱스는 키와 기본 키만 담은 별도의 B+Tree다. 기본 키 순서가 곧 행의 물리적 지역성이므로, 기본 키는 짧고 단조 증가하며 바뀌지 않아야 한다. 세컨더리 인덱스로 행을 읽으면 항목마다 클러스터드 인덱스를 다시 내려가는 랜덤 접근이 생기고, 그 비용은 세컨더리 키 순서와 기본 키 순서의 상관관계로 정해진다. 쿼리가 필요한 열이 모두 세컨더리 인덱스(기본 키 포함)에 있으면 이 재탐색이 사라지는데, 이것이 커버링 인덱스다.</p></aside>
+
+<p>이 회차의 내용을 한 번에 꿰어 보면 다음과 같다. 클러스터드 인덱스의 정의(행이 기본 키 순서로 리프에 있다)에서 순차 PK와 랜덤 PK의 차이가 나왔고, 그 차이에서 PK 설계 기준(짧게, 단조 증가, 불변, 대리 키)이 나왔다. 세컨더리 인덱스의 정의(리프에 기본 키가 있다)에서 이중 탐색의 비용, 행 이동에 강한 구조, 커버링 인덱스, 인덱스 확장이 나왔다. 그리고 이중 탐색이 페이지 단위로 어떤 접근 패턴을 만드는지 따지면서 랜덤 I/O와 순차 I/O의 차이, 1%의 행이 100%의 페이지를 건드리는 현상, 상관관계에 따라 같은 계획이 접근하는 리프 페이지 수가 170배 달라지는 현상을 설명했다. 마지막으로 다른 데이터베이스가 같은 문제를 물리 주소로 풀면서 다른 곳에서 비용을 치르는 모습을 봤다.</p>
+
+<p>다음 회차들은 이 구조 위에서 움직인다. 07회는 세컨더리 인덱스의 정렬 순서(기본 키 포함)를 이용해 filesort를 없애고 LIMIT으로 일찍 멈추는 법을, 08회는 클러스터드 인덱스 재탐색 전에 조건을 거르는 ICP와 커버링 인덱스의 응용을, 09회는 세컨더리 인덱스에서 모은 기본 키를 정렬해 랜덤 접근을 순차에 가깝게 바꾸는 MRR을 다룬다. 10회의 옵티마이저 비용 모델은 이 회차에서 손으로 한 계산, 곧 "클러스터드 탐색 몇 번 대 페이지 몇 개"를 옵티마이저가 어떻게 추정하는지에 대한 이야기다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>클러스터드 인덱스</dt><dd>행 전체를 기본 키 순서로 리프에 담은 B+Tree로, InnoDB에서는 테이블 그 자체다. 기본 키, NOT NULL 유니크 인덱스, 숨은 6바이트 행 ID 순으로 키가 정해진다.</dd>
+<dt>순차 PK와 랜덤 PK</dt><dd>순차 삽입은 오른쪽 끝에서 새 레코드만 새 페이지로 보내 페이지가 약 15/16까지 차고, 랜덤 삽입은 가운데 분할로 1/2~15/16 사이의 페이지와 넓은 쓰기 작업 집합을 만든다.</dd>
+<dt>PK 설계 기준</dt><dd>짧게(모든 세컨더리 인덱스에 복제), 단조 증가(삽입 지역성), 불변(변경 시 삭제 표시와 재삽입, 모든 세컨더리 인덱스 수정), 업무 의미 없는 대리 키가 기본형이다.</dd>
+<dt>세컨더리 인덱스</dt><dd>키 열과 기본 키 열을 담은 별도의 B+Tree다. 행을 찾으려면 기본 키로 클러스터드 인덱스를 다시 내려가며, 기본 키가 논리 주소이므로 행이 움직여도 고칠 필요가 없다.</dd>
+<dt>인덱스 확장</dt><dd>옵티마이저가 세컨더리 인덱스 뒤에 붙은 기본 키 열을 ref, range, 정렬, MIN/MAX 최적화 등에 활용하는 기능으로, <code>use_index_extensions</code>로 제어한다.</dd>
+<dt>커버링 인덱스</dt><dd>쿼리에 필요한 모든 열이 세컨더리 인덱스(기본 키 포함)에 있어 클러스터드 인덱스를 방문하지 않는 경우다. Extra의 <code>Using index</code>로 확인하며, 삭제 표시나 최근 갱신된 페이지에서는 실행 중에 클러스터드 인덱스를 방문한다.</dd>
+<dt>랜덤 I/O와 순차 I/O</dt><dd>읽기 단위가 16KB 페이지이므로 순차 접근은 페이지 하나의 비용을 수백 행에 나누고, 랜덤 접근은 행마다 페이지와 트리 탐색 비용을 치른다. 선행 읽기는 순차 접근만 돕는다.</dd>
+<dt>상관관계</dt><dd>세컨더리 키 순서와 기본 키 순서가 맞으면 같은 실행 계획이라도 접근하는 페이지가 적다. 우리 데이터에서 같은 1,370여 행이 7페이지 또는 1,215페이지에 있었다.</dd>
+</x-summary>
+
+<x-review>
+<p>신규 테이블을 설계할 때 가장 먼저 내리는 결정이 기본 키이고, InnoDB에서는 이 결정이 되돌리기 가장 어렵다. 기본 키를 바꾸면 테이블 전체가 재구성되고 모든 세컨더리 인덱스가 다시 만들어지며, 그 키를 참조하는 외래 키와 애플리케이션 코드도 함께 바뀐다. 그래서 "일단 UUID 문자열로 시작하고 나중에 바꾸자"는 계획은 실제로는 잘 실행되지 않는다. 처음부터 <code>BIGINT AUTO_INCREMENT</code>를 기본으로 두고, 분산 생성이나 외부 노출이 요구될 때만 UUIDv7 <code>BINARY(16)</code> 또는 공개 식별자 열을 따로 두는 방식을 검토하는 것이 안전하다. 판단이 달라지는 조건은 테이블 크기와 버퍼 풀의 관계다. 테이블이 버퍼 풀 안에 넉넉히 들어가는 동안은 랜덤 PK의 비용이 잘 드러나지 않다가, 데이터가 버퍼 풀을 넘어서는 시점에 삽입 지연과 디스크 읽기가 한꺼번에 늘어난다.</p>
+
+<p>장애 대응에서 이 지식이 쓰이는 전형적인 장면은 "인덱스를 탔는데 느리다"는 보고다. 실행 계획에 인덱스가 찍혀 있어도 그것이 커버링인지, 일치하는 행이 몇 개인지, 그 행들의 기본 키가 얼마나 흩어져 있는지를 봐야 한다. EXPLAIN ANALYZE에서 세컨더리 인덱스 노드가 수만 행을 돌려주고 있다면 그 수만큼 클러스터드 인덱스 탐색이 일어나고 있다. 해결책은 상황에 따라 다르다. 필요한 열을 인덱스에 넣어 커버링으로 만들거나, 조건을 좁혀 행 수를 줄이거나, 기본 키를 먼저 좁힌 뒤 행을 읽는 형태로 쿼리를 바꾸거나, 아예 풀 스캔이 나은 경우임을 받아들인다.</p>
+
+<p>인덱스를 추가하거나 정리할 때는 쓰기 비용과 정렬 순서를 함께 본다. 인덱스 하나는 모든 INSERT와 DELETE, 그리고 인덱스 열을 바꾸는 UPDATE에 B+Tree 하나만큼의 일을 더하고, MySQL 8.4 기본 설정에서는 체인지 버퍼가 그 랜덤 쓰기를 흡수해 주지 않는다. 반대로 "중복 인덱스"를 지울 때는 그 인덱스가 기본 키까지 포함해 어떤 정렬 순서를 제공하고 있었는지 확인해야 한다. 같은 회원 안에서 주문 번호 순서를 주던 인덱스를 지우면, 아무도 예상하지 못한 쿼리에 정렬 단계가 생길 수 있다.</p>
+</x-review>
+
+<x-practice>
+<li>인덱스 <code>idx_orders_member_id</code>가 있을 때 <code>SELECT * FROM orders WHERE member_id IN (1, 2, 3)</code>을 실행한다. 회원 2번의 주문 번호는 15594, 115585, 215576, 315567, 415558, 515549, 615540, 715531, 815522, 915513이고, 회원 3번은 31188, 131179, 231170, 331161, 431152, 531143, 631134, 731125, 831116, 931107이다(회원 1번은 본문 참고). 한 리프에 225행이 있다고 가정하고, 클러스터드 인덱스에서 서로 다른 리프 페이지를 몇 개 방문하는지, 클러스터드 인덱스를 몇 번 내려가는지 구하라. 같은 조건으로 <code>SELECT member_id, order_id</code>만 조회하면 무엇이 달라지는가?</li>
+<li>한 페이지에 레코드가 4개 들어간다고 하고, 키 8, 7, 6, 5, 4, 3, 2, 1을 이 순서(내림차순)로 넣는다. InnoDB의 분할 규칙 세 가지 중 어느 것이 적용되며, 최종 페이지 상태는 어떻게 되는가? 이 결과가 매뉴얼의 "오름차순이든 내림차순이든 순차 삽입이면 약 15/16까지 찬다"는 설명과 어떻게 연결되는지 설명하라.</li>
+<li>5,000만 행의 <code>payment</code> 테이블이 기본 키로 UUIDv4 문자열 <code>CHAR(36)</code>을 쓰고 세컨더리 인덱스 4개를 갖고 있다. 기본 키를 <code>BIGINT</code>로 바꾸면 세컨더리 인덱스에서 순수한 값만 몇 바이트가 줄어드는지 계산하라. 그리고 크기 말고 이 테이블이 겪고 있을 문제를 두 가지 이상, 이 회차의 원리로 설명하라.</li>
+<li><code>orders</code>에 <code>INDEX (member_id, status)</code>만 있다고 하자. 다음 쿼리 각각이 클러스터드 인덱스를 방문하지 않고 답할 수 있는지 판단하고 이유를 쓰라. (가) <code>SELECT status, COUNT(*) FROM orders WHERE member_id = 7 GROUP BY status</code> (나) <code>SELECT MAX(order_id) FROM orders WHERE member_id = 7 AND status = 'PAID'</code> (다) <code>SELECT order_id, amount FROM orders WHERE member_id = 7</code> (라) <code>SELECT order_id FROM orders WHERE status = 'CANCELED'</code></li>
+<li>본문의 실험 3에서 (D)와 (E)는 실행 계획의 모양이 같다. 만약 01회의 데이터 생성 규칙에서 <code>ordered_at</code>을 주문 번호와 무관한 무작위 시각으로 만들었다면 (D)의 비용은 어떻게 변할지 예측하고, 그 이유를 기본 키 순서와의 상관관계로 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 페이지 번호는 (주문 번호 − 1) ÷ 225의 몫 + 1이다. 회원 1번의 주문은 445, 889, 1334, 1778, 2223, 2667, 3111, 3556, 4000, 4445번 리프에, 회원 2번은 70, 514, 959, 1403, 1847, 2292, 2736, 3181, 3625, 4069번 리프에, 회원 3번은 139, 584, 1028, 1472, 1917, 2361, 2806, 3250, 3694, 4139번 리프에 있다. 30개가 모두 다르므로 서로 다른 리프 30개를 방문하고, 클러스터드 인덱스를 30번 내려간다(높이가 3이면 페이지 접근 90회, 그중 루트와 중간 페이지는 대개 버퍼 풀에 있다). 세컨더리 인덱스 쪽은 IN 목록의 값마다 해당 구간을 찾으므로 세 번 탐색하고, 각 구간의 항목은 한두 페이지 안에 붙어 있다. <code>SELECT member_id, order_id</code>로 바꾸면 필요한 열이 모두 세컨더리 인덱스 리프에 있으므로 커버링이 되어 클러스터드 인덱스 방문 30번이 모두 사라지고, 실행 계획 Extra에 <code>Using index</code>가 나타난다.</p>
+<p><b>2.</b> 8, 7, 6, 5는 첫 페이지 <code>[5 6 7 8]</code>에 들어간다. 4를 넣을 때 페이지가 가득 차 있고, 직전 삽입 레코드 5가 4의 자리 바로 다음에 있으므로 2번 규칙(왼쪽 수렴)이 적용된다. 삽입 지점에서 나누므로 기존 네 레코드는 한쪽에 그대로 남고 4는 새 페이지에 홀로 들어간다. 이어서 3, 2, 1은 4가 있는 페이지에 차례로 들어가 최종 상태는 <code>[1 2 3 4] [5 6 7 8]</code>이다. 가운데 분할이 한 번도 일어나지 않아 모든 페이지가 가득 찬다. 매뉴얼이 오름차순과 내림차순을 모두 "순차"로 묶은 것은 InnoDB가 오른쪽 수렴과 왼쪽 수렴을 모두 감지하기 때문이다(실제로는 1/16의 여유를 두므로 "약 15/16"이 된다).</p>
+<p><b>3.</b> 줄어드는 바이트는 (36 − 8) × 4 × 50,000,000 = 5,600,000,000바이트, 약 5.6GB다. 페이지의 빈 공간과 분할로 인한 여유 공간을 빼고 값만 센 것이므로 실제 차이는 더 크다. 크기 외의 문제로는 첫째, 무작위 키라서 삽입이 클러스터드 인덱스 전체에 흩어지고 가운데 분할로 페이지가 1/2~15/16로 차며, 같은 데이터에 더 많은 페이지와 버퍼 풀을 쓴다. 둘째, 테이블이 버퍼 풀보다 크면 삽입마다 무작위 리프 페이지를 디스크에서 읽어야 하고 변경된 페이지가 트리 전체에 흩어져 쓰기량이 늘어난다. 셋째, 분할이 반복되어 리프의 논리 순서와 물리 위치가 어긋나므로 기본 키 범위 스캔도 디스크에서는 순차가 아니게 된다. 넷째, 생성 순서와 상관된 열(결제 시각 등)의 세컨더리 인덱스조차 기본 키 순서와 상관이 없어져, 시간 범위 조회가 랜덤 접근이 된다.</p>
+<p><b>4.</b> 인덱스는 내부적으로 <code>(member_id, status, order_id)</code>다. (가)는 member_id와 status만 필요하므로 커버링이다. (나)는 member_id, status, order_id만 필요하므로 커버링이고, 더 나아가 두 등호 조건 아래에서 order_id가 정렬되어 있으므로 인덱스 확장 덕분에 해당 구간의 마지막 항목 하나만 보면 최댓값을 얻을 수 있다. MySQL 8.4.13에서 EXPLAIN하면 Extra가 <code>Select tables optimized away</code>로, 최적화 단계에서 인덱스로 값을 바로 찾아 실행할 때 테이블을 읽을 일이 남지 않는다. (다)는 amount가 인덱스에 없으므로 일치하는 항목마다 클러스터드 인덱스를 방문해야 한다. (라)는 선두 열 member_id에 조건이 없어 status로 구간을 찾을 수는 없지만, 필요한 열(status, order_id)이 모두 인덱스에 있으므로 세컨더리 인덱스 전체를 훑는 커버링 인덱스 풀 스캔(<code>type: index</code>, <code>Using index</code>)으로 답할 수는 있다. 옵티마이저가 이 방법과 클러스터드 인덱스 풀 스캔 중 무엇을 고를지는 비용 추정에 달려 있다. MySQL 8.4.13에서 이 인덱스만 둔 <code>orders</code>로 확인하면 커버링 인덱스 풀 스캔(<code>type: index</code>, Extra <code>Using where; Using index</code>)이 선택되었고, (가)는 <code>Using index</code>, (다)는 Extra가 비어 있었다. 선두 열 없이 인덱스를 쓰는 다른 방법인 스킵 스캔은 08회에서 다룬다.</p>
+<p><b>5.</b> <code>ordered_at</code>이 무작위라면 하루치 1,371건의 주문 번호는 테이블 전체에 흩어진다. 세컨더리 인덱스 안에서는 여전히 하루치 항목이 붙어 있지만, 그 항목들이 담은 기본 키는 연속이 아니므로 클러스터드 인덱스 탐색이 매번 다른 리프로 간다. 그러면 (D)도 (E)처럼 약 1,200개 이상의 서로 다른 리프 페이지를 방문하게 되어 비용이 (E) 수준으로 올라간다. 실행 계획의 모양과 행 수는 그대로인데 비용만 바뀌는 것이며, 이 차이를 만드는 것은 세컨더리 키 순서와 기본 키 순서 사이의 상관관계(Oracle 용어로는 클러스터링 팩터)다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>다음 InnoDB 테이블에서 클러스터드 인덱스의 키는 무엇인가? <code>CREATE TABLE t (a INT NULL, b VARCHAR(20) NOT NULL, c INT NOT NULL, UNIQUE KEY uk_a (a), UNIQUE KEY uk_b (b), KEY k_c (c))</code></q>
+<o>숨은 6바이트 행 ID(GEN_CLUST_INDEX)</o>
+<o><code>uk_a</code>의 열 a</o>
+<o><code>uk_b</code>의 열 b</o>
+<o><code>k_c</code>의 열 c</o>
+<why>기본 키가 없으면 InnoDB는 모든 키 열이 NOT NULL로 정의된 첫 번째 UNIQUE 인덱스를 클러스터드 인덱스로 쓴다. <code>uk_a</code>는 순서상 먼저지만 a가 NULL을 허용하므로 후보가 아니고, NOT NULL인 <code>uk_b</code>가 선택된다. <code>k_c</code>는 유니크가 아니므로 후보가 아니며, 숨은 행 ID는 적합한 유니크 인덱스가 하나도 없을 때만 쓰인다. MySQL 8.4.13에서 이 테이블을 만들어 <code>information_schema.INNODB_INDEXES</code>를 보면 <code>uk_b</code>의 <code>TYPE</code>이 3(클러스터드이면서 유니크)이고, <code>uk_a</code>는 2, <code>k_c</code>는 0이다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>orders</code>(기본 키 <code>order_id</code>)에 <code>INDEX (member_id)</code>만 있다. 클러스터드 인덱스를 방문하지 않고 처리할 수 있는 쿼리는?</q>
+<o><code>SELECT status FROM orders WHERE member_id = 1</code></o>
+<o><code>SELECT order_id, member_id FROM orders WHERE member_id = 1</code></o>
+<o><code>SELECT * FROM orders WHERE member_id = 1</code></o>
+<o><code>SELECT order_id FROM orders WHERE member_id = 1 AND amount = 1000</code></o>
+<why>InnoDB 세컨더리 인덱스 리프는 <code>(member_id, order_id)</code>를 담으므로 두 열만 필요한 쿼리는 커버링이다. status, 모든 열, amount 조건이 필요한 나머지 쿼리는 인덱스에 없는 열 때문에 일치하는 항목마다 클러스터드 인덱스를 다시 탐색해야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>InnoDB 세컨더리 인덱스가 행의 물리 주소 대신 기본 키 값을 담는 이유로 가장 알맞은 것은?</q>
+<o>기본 키가 물리 주소보다 항상 짧기 때문에</o>
+<o>세컨더리 인덱스 조회 때 트리 탐색 횟수를 줄이기 위해</o>
+<o>세컨더리 인덱스가 유니크하지 않을 수 있기 때문에</o>
+<o>페이지 분할로 행이 다른 페이지로 옮겨 가도 세컨더리 인덱스를 고치지 않기 위해</o>
+<why>클러스터드 인덱스는 키 순서를 지키기 위해 분할 때 레코드를 새 페이지로 옮긴다. 물리 주소를 담았다면 행이 옮겨 갈 때마다 모든 세컨더리 인덱스 항목을 고쳐야 한다. 기본 키는 행이 어디로 가든 변하지 않는다. 기본 키는 짧을 수도 길 수도 있고, 이 설계는 오히려 조회 때 클러스터드 인덱스를 한 번 더 내려가게 만든다. 유니크하지 않은 인덱스의 항목 구분은 기본 키를 붙인 결과로 얻는 성질이지 주된 이유가 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>AUTO_INCREMENT</code> 기본 키 테이블에 행을 계속 넣을 때 리프 페이지가 약 15/16까지 차는 이유는?</q>
+<o>새 레코드가 직전 삽입 바로 뒤에 오면 InnoDB가 순차 패턴으로 보고 삽입 지점에서 분할해, 기존 레코드를 옮기지 않고 새 레코드만 새 페이지로 보내기 때문이다.</o>
+<o>InnoDB가 분할할 때마다 페이지를 정확히 15:1로 나누기 때문이다.</o>
+<o>체인지 버퍼가 클러스터드 인덱스 삽입을 모아 두었다가 한 번에 적용하기 때문이다.</o>
+<o><code>innodb_fill_factor</code>가 모든 삽입에 적용되어 페이지를 15/16에서 멈추게 하기 때문이다.</o>
+<why>InnoDB는 페이지 헤더의 마지막 삽입 위치를 보고 오른쪽(또는 왼쪽)으로 수렴하는 삽입을 감지하면 삽입 지점에서 나눈다. 그래서 꽉 찬 페이지는 그대로 남는다. 체인지 버퍼는 세컨더리 인덱스 페이지에만 쓰이고, <code>innodb_fill_factor</code>는 정렬된 인덱스 빌드(인덱스 생성·재구성)에 쓰이는 설정이다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>회원 1~1000번 조건이 <code>orders</code> 100만 행 중 1%만 고르는데도, 세컨더리 인덱스로 읽는 쪽이 풀 스캔보다 불리할 수 있는 근본 이유는?</q>
+<o>세컨더리 인덱스 자체가 클러스터드 인덱스보다 크기 때문이다.</o>
+<o>세컨더리 인덱스를 쓰면 Handler 카운터가 더 많이 증가하기 때문이다.</o>
+<o>일치하는 행마다 클러스터드 인덱스를 다시 탐색하는데, 그 행들이 거의 모든 리프 페이지에 흩어져 있어 페이지 접근이 행 수만큼 생기고 순서도 무작위이기 때문이다.</o>
+<o>풀 스캔은 디스크를 읽지 않기 때문이다.</o>
+<why>1%의 행 10,001건이 리프 4,445페이지 전부에 흩어져 있어, 인덱스 경로는 클러스터드 인덱스를 10,001번 무작위 순서로 탐색한다. 풀 스캔은 같은 페이지들을 순서대로 한 번씩 읽고 선행 읽기의 도움도 받는다. 세컨더리 인덱스는 클러스터드 인덱스보다 작고, Handler 카운터는 오히려 인덱스 경로 쪽이 훨씬 작게 나온다(재탐색을 세지 않으므로). 풀 스캔도 페이지가 버퍼 풀에 없으면 디스크를 읽는다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>클러스터드 인덱스(clustered index)</dt><dd>행 전체를 키 순서로 리프에 저장한 인덱스. InnoDB에서는 기본 키 인덱스이며 테이블 그 자체다. Oracle에서는 인덱스 구성 테이블이라 부른다.</dd>
+<dt>세컨더리 인덱스(secondary index)</dt><dd>클러스터드 인덱스가 아닌 인덱스. InnoDB에서는 지정한 열과 기본 키 열을 담고, 기본 키로 클러스터드 인덱스를 다시 찾아 행을 읽는다.</dd>
+<dt>커버링 인덱스(covering index)</dt><dd>쿼리에 필요한 모든 열을 담고 있어 테이블(클러스터드 인덱스)을 방문하지 않고 답할 수 있는 인덱스. EXPLAIN Extra의 <code>Using index</code>로 나타난다.</dd>
+<dt>인덱스 확장(index extensions)</dt><dd>InnoDB가 세컨더리 인덱스 뒤에 기본 키 열을 덧붙이고, 옵티마이저가 그 열을 접근 방법과 정렬 최적화에 활용하는 것.</dd>
+<dt>페이지 분할(page split)</dt><dd>가득 찬 페이지에 레코드를 넣을 때 새 페이지를 할당해 레코드를 나누는 일. InnoDB는 순차 삽입을 감지하면 삽입 지점에서, 아니면 가운데에서 나눈다.</dd>
+<dt>대리 키(surrogate key)</dt><dd>업무 의미가 없이 행을 식별하기 위해 만든 키. 자동 증가 정수가 대표적이며, 자연 키보다 짧고 바뀌지 않는다.</dd>
+<dt>익스텐트(extent)</dt><dd>테이블스페이스 안의 연속된 페이지 묶음. 16KB 페이지에서 64페이지(1MB)이며 선행 읽기의 단위다.</dd>
+<dt>선행 읽기(read-ahead)</dt><dd>곧 필요할 것으로 예상되는 익스텐트의 페이지들을 비동기로 버퍼 풀에 미리 읽어 오는 것. 기본으로는 순차 접근을 감지하는 선형 선행 읽기만 켜져 있다.</dd>
+<dt>힙 구성 테이블(heap-organized table)</dt><dd>행을 들어갈 수 있는 곳에 넣고, 인덱스는 행의 물리 주소(rowid, ctid)를 가리키는 저장 방식. Oracle의 기본 테이블과 PostgreSQL의 테이블이 이 방식이다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-index-types.html">MySQL 8.4 Reference Manual — Clustered and Secondary Indexes</a> — 클러스터드 인덱스 선택 규칙, 세컨더리 인덱스가 기본 키를 담는다는 정의, 짧은 기본 키 권고</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-physical-structure.html">MySQL 8.4 Reference Manual — The Physical Structure of an InnoDB Index</a> — 순차 삽입 약 15/16, 랜덤 삽입 1/2~15/16 채움, MERGE_THRESHOLD</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.4/en/index-extensions.html">MySQL 8.4 Reference Manual — Use of Index Extensions</a> — 세컨더리 인덱스에 덧붙는 기본 키 열과 옵티마이저의 활용</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html">MySQL 8.4 Reference Manual — InnoDB Multi-Versioning</a> — 숨은 열의 크기, 세컨더리 인덱스와 MVCC, 커버링 기법이 쓰이지 않는 조건</li>
+<li><a href="https://www.postgresql.org/docs/current/indexes-index-only-scans.html">PostgreSQL Documentation — Index-Only Scans and Covering Indexes</a> — 모든 인덱스가 세컨더리 인덱스라는 설명, 힙 랜덤 접근, 가시성 맵</li>
+<li><a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/cncpt/indexes-and-index-organized-tables.html">Oracle Database 19c Concepts — Indexes and Index-Organized Tables</a> — 힙과 인덱스 구성 테이블, rowid, 논리 rowid와 물리적 추측, 클러스터링 팩터</li>
+</x-refs>

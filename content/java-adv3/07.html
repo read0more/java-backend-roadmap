@@ -1,0 +1,817 @@
+<x-meta>
+deck: 스트림의 결과를 그릇에 담는 가변 리덕션을 Collector의 네 함수와 세 특성으로 분해하고, groupingBy와 다운스트림 컬렉터가 OpenJDK 21 안에서 중간 그릇을 만들고 바꿔 끼우는 과정을 실행 추적으로 따라간다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li><code>reduce</code>와 <code>collect</code>의 차이를 "값을 바꿔 끼우는가, 그릇의 상태를 바꾸는가"로 설명하고, 세 인자 <code>collect</code>의 supplier·accumulator·combiner가 순차·병렬 실행에서 각각 몇 번 불리는지 예측할 수 있다.</li>
+<li><code>Collector<T, A, R></code>의 네 함수와 세 특성을 읽고, <code>Stream.collect</code>가 순차·병렬·동시 리덕션 중 어느 경로를 타며 언제 finisher를 건너뛰는지 OpenJDK 21 소스로 설명할 수 있다.</li>
+<li><code>Collectors.toList()</code>, <code>Stream.toList()</code>, <code>toUnmodifiableList()</code>, <code>toMap()</code>의 차이(가변성, null 허용, 중복 키)를 실행 결과로 예측하고 상황에 맞는 것을 고를 수 있다.</li>
+<li><code>groupingBy</code>가 키마다 다운스트림 그릇을 만들고 마지막에 finisher로 값을 바꿔 끼우는 과정을 메모리 그림으로 그리고, mapping·filtering·flatMapping·collectingAndThen·partitioningBy·teeing을 조합해 다단계 집계를 작성할 수 있다.</li>
+<li>컬렉터를 쓰다 만나는 컴파일 오류(<code>Long</code>과 <code>Integer</code>의 불일치, 와일드카드 캡처, <code>IntStream</code>의 <code>collect</code>)를 읽고 원인을 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 스트림의 끝에서 무엇을 만들어 내는가</h3>
+<p>앞 회차들에서 본 것처럼 스트림 파이프라인은 중간 연산을 쌓아 두기만 하고, 종단 연산(terminal operation)이 호출되는 순간 원소를 하나씩 끌어당기며 실행된다. 종단 연산은 파이프라인의 끝에서 "무엇을 만들어 낼지"를 정한다. <code>forEach</code>는 아무것도 만들지 않고 부수 효과만 일으키고, <code>count</code>나 <code>reduce</code>는 값 하나를 만든다. 그런데 실무 코드에서 가장 자주 쓰는 종단 연산은 결과를 리스트, 집합, 맵, 통계값 같은 <b>그릇</b>에 담아 내는 일이다. 주문 목록을 도시별로 묶고, 고객별 합계를 맵으로 만들고, 이름을 쉼표로 이어 붙이는 일이 모두 여기에 속한다.</p>
+<p>이 일을 앞 회차에서 본 <code>reduce</code>로 할 수 있을까? <code>reduce(identity, accumulator)</code>는 "지금까지의 결과"와 "다음 원소"를 받아 <b>새 결과</b>를 돌려주는 함수를 반복 적용한다. 정수의 합처럼 결과가 작은 불변 값이면 이 방식이 자연스럽다. 하지만 결과가 문자열이나 리스트처럼 원소를 계속 쌓아 가는 그릇이면 문제가 생긴다. 문자열을 <code>reduce("", (x, y) -> x + y)</code>로 이어 붙이면 단계마다 지금까지의 문자열 전체를 복사한 새 <code>String</code>이 만들어진다. 길이 1인 문자열 n개를 이으면 복사되는 글자 수가 1 + 2 + … + n, 곧 n의 제곱에 비례한다. 자바 API 문서의 <code>java.util.stream</code> 패키지 설명도 같은 예를 들며 결과를 <code>StringBuilder</code> 같은 가변 그릇에 쌓는 편이 더 효율적이라고 말한다.</p>
+<p>그렇다면 <code>reduce</code>의 identity 자리에 <code>new ArrayList<>()</code>를 넣고 accumulator에서 <code>add</code>한 뒤 같은 리스트를 돌려주면 어떨까? 순차 실행에서는 결과가 맞게 나오지만 <code>reduce</code>의 계약을 어긴 코드다. OpenJDK 21의 <code>ReduceOps</code>를 보면 <code>reduce</code>를 실행하는 싱크(sink)는 시작할 때 <code>state = seed</code>, 곧 우리가 넘긴 identity 객체 <b>그 자체</b>를 상태로 잡는다. 병렬 실행에서는 데이터 조각마다 싱크가 하나씩 만들어지는데, 그 모든 싱크가 같은 <code>ArrayList</code> 객체에서 출발한다. 여러 스레드가 스레드 안전하지 않은 리스트 하나를 동시에 고치게 되는 것이다. identity는 "결합해도 아무것도 바꾸지 않는 값"이어야 하는데, 고쳐지는 순간 identity가 아니게 된다.</p>
+<p>그래서 스트림 API는 별도의 종단 연산을 둔다. 결과를 바꿔 끼우는 대신 <b>그릇의 상태를 고치는</b> 리덕션, 곧 가변 리덕션(mutable reduction)이다. 이름은 <code>collect</code>이고, 그 전략을 재사용할 수 있는 객체로 포장한 것이 <code>Collector</code>, 자주 쓰는 컬렉터를 모아 둔 유틸리티 클래스가 <code>Collectors</code>다. 이 회차는 세 인자 <code>collect</code>에서 출발해 <code>Collector</code> 인터페이스를 분해하고, <code>collect</code>가 JDK 안에서 어떤 경로로 실행되는지 소스로 확인한 다음, 컬렉션·맵·통계값을 만드는 기본 컬렉터와 <code>groupingBy</code>·<code>partitioningBy</code> 같은 다운스트림 컬렉터(downstream collector)를 차례로 다룬다. <code>maxBy</code>가 돌려주는 <code>Optional</code>의 자세한 사용법은 8회, 병렬 스트림과 포크/조인의 내부는 10회에서 다루므로 여기서는 컬렉터에 필요한 만큼만 짚는다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>컬렉터는 "그릇을 만드는 함수(supplier), 원소 하나를 그릇에 넣는 함수(accumulator), 두 그릇을 합치는 함수(combiner), 그릇을 최종 결과로 바꾸는 함수(finisher)"의 묶음에 특성(characteristics) 표시를 붙인 객체다. <code>reduce</code>가 매 단계 새 값을 만들어 바꿔 끼운다면, <code>collect</code>는 데이터 조각마다 새 그릇을 하나씩 만들어 그 안을 고친다. 그릇이 조각마다 따로 있기 때문에 병렬에서도 동기화 없이 안전하다. <code>groupingBy</code> 같은 다운스트림 컬렉터는 이 네 함수를 감싸고 바꿔 끼워 더 큰 컬렉터를 조립하는 함수일 뿐이다.</p></aside>
+
+<h4>실습 환경과 예제 데이터</h4>
+<p>본문의 실행 결과, javac 오류 문구, javap 출력, JDK 소스 인용은 모두 macOS에서 Temurin JDK 21.0.13으로 직접 실행하고 JDK에 들어 있는 <code>lib/src.zip</code>을 열어 확인한 것이다. JDK 클래스의 내부 구현(어떤 그릇 클래스를 쓰는지, 어떤 순서로 함수를 부르는지)은 API 명세가 보장하는 것이 아니라 OpenJDK 21의 구현이므로 해당 위치마다 그렇게 밝힌다. 한글이 섞인 출력이 터미널에서 깨지면 <code>java -Dstdout.encoding=UTF-8</code>로 실행한다.</p>
+<p>예제는 주문 데이터 일곱 건을 공통으로 쓴다. 레코드(record)는 자바 16부터 정식 기능이며, 필드를 읽는 메서드(<code>customer()</code> 등)와 <code>toString</code>을 컴파일러가 만들어 준다. 아래 코드 조각들은 모두 이 선언이 있다고 가정하고, <code>import static java.util.stream.Collectors.*;</code>로 <code>Collectors</code>의 정적 메서드를 짧게 부른다.</p>
+<pre><code class="language-java">import java.util.*;
+import java.util.stream.*;
+import static java.util.stream.Collectors.*;
+
+public class OrderData {
+    record Order(String customer, String city, String category, int amount) {}
+
+    static final List<Order> ORDERS = List.of(
+        new Order("민수", "서울", "도서", 12000),
+        new Order("지영", "부산", "전자", 250000),
+        new Order("민수", "서울", "전자", 89000),
+        new Order("현우", "대구", "도서", 18000),
+        new Order("지영", "부산", "식품", 32000),
+        new Order("서연", "서울", "식품", 15000),
+        new Order("현우", "대구", "전자", 120000)
+    );
+    // ... 이후 예제는 main 안에 쓴다
+}</code></pre>
+
+<h3>가변 리덕션의 뼈대: 세 인자 collect</h3>
+<p><code>Stream</code>에는 <code>collect</code>가 두 개 있다. 먼저 함수 세 개를 직접 받는 형태부터 보자. 시그니처는 <code><R> R collect(Supplier<R> supplier, BiConsumer<R, ? super T> accumulator, BiConsumer<R, R> combiner)</code>다. Javadoc은 이 연산의 결과가 아래 반복문과 같다고 정의한다.</p>
+<pre data-label="Stream.collect의 Javadoc이 정한 의미"><code class="language-java">R result = supplier.get();
+for (T element : this stream)
+    accumulator.accept(result, element);
+return result;</code></pre>
+<p>세 함수의 역할을 하나씩 보자. supplier는 빈 결과 그릇(result container)을 만든다. accumulator는 그릇과 원소 하나를 받아 그 원소를 그릇에 반영한다. 반환 타입이 <code>void</code>인 <code>BiConsumer</code>라는 점이 핵심이다. <code>reduce</code>의 accumulator는 새 결과를 <b>돌려줘야</b> 하지만, <code>collect</code>의 accumulator는 아무것도 돌려주지 않고 받은 그릇을 <b>고친다</b>. 세 번째 combiner는 부분 결과 그릇 두 개를 받아 두 번째 그릇의 내용을 첫 번째 그릇에 접어 넣는다(fold). 반복문 정의에는 combiner가 등장하지 않는다. combiner는 병렬 실행에서 데이터를 나눠 각자 만든 그릇을 합칠 때만 쓰인다.</p>
+<pre><code class="language-java">ArrayList<String> names = ORDERS.stream()
+    .map(Order::customer)
+    .collect(ArrayList::new, ArrayList::add, ArrayList::addAll);
+System.out.println(names);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[민수, 지영, 민수, 현우, 지영, 서연, 현우]</code></pre>
+<p>메서드 참조 세 개가 각각 어느 함수형 인터페이스로 타깃 타이핑되는지 따져 보면 4회에서 본 메서드 참조 규칙을 그대로 복습할 수 있다. <code>ArrayList::new</code>는 인자 없는 생성자 참조로 <code>Supplier<ArrayList<String>></code>가 된다. <code>ArrayList::add</code>는 "임의 객체의 인스턴스 메서드 참조"라서 첫 번째 인자(그릇)가 수신 객체, 두 번째 인자(원소)가 <code>add</code>의 인자가 된다. <code>add</code>는 <code>boolean</code>을 돌려주지만 타깃 함수 타입이 <code>void</code>를 돌려주므로 반환값은 버려진다. <code>ArrayList::addAll</code>도 같은 방식으로 <code>BiConsumer<ArrayList<String>, ArrayList<String>></code>가 되어 "오른쪽 리스트를 왼쪽 리스트에 모두 넣는다"는 combiner가 된다.</p>
+<p>combiner가 <code>BiConsumer</code>라는 사실에도 의미가 있다. 반환값이 없으니 합친 결과는 반드시 <b>첫 번째 그릇</b>에 남아야 한다. Javadoc도 combiner가 두 번째 그릇의 원소를 첫 번째 그릇에 접어 넣어야 한다고 명시한다. 뒤에서 볼 <code>Collector</code>의 combiner는 <code>BinaryOperator<A></code>라서 두 그릇 중 어느 쪽이든 돌려줄 수 있고, 그 덕분에 "작은 쪽을 큰 쪽에 붓는" 최적화가 가능해진다. 같은 개념의 함수인데 시그니처가 다른 이유가 여기에 있다.</p>
+<aside class="note">기본형 스트림(<code>IntStream</code>, <code>LongStream</code>, <code>DoubleStream</code>)에는 <code>Collector</code>를 받는 <code>collect</code>가 없고, <code>collect(Supplier, ObjIntConsumer, BiConsumer)</code> 같은 세 인자 형태만 있다. 컬렉터를 쓰려면 <code>boxed()</code>로 참조형 스트림으로 바꿔야 한다. 이 경우의 컴파일 오류는 뒤의 "타입으로 읽는 컬렉터"에서 직접 본다.</aside>
+
+<h3>Collector 인터페이스: 네 함수와 세 특성</h3>
+<p>세 인자 <code>collect</code>는 쓸 때마다 함수 세 개를 새로 적어야 한다. "리스트로 모으기", "도시별로 묶기" 같은 전략을 이름 붙여 재사용하고, 그 전략끼리 조립하려면 함수 묶음을 하나의 객체로 포장해야 한다. 그 포장이 <code>java.util.stream.Collector</code>다. OpenJDK 21 소스에서 주석을 걷어 내면 인터페이스의 몸체는 다음과 같다.</p>
+<pre data-label="java.util.stream.Collector (주석 제거, 정적 팩터리 생략)"><code class="language-java">public interface Collector<T, A, R> {
+    Supplier<A> supplier();
+    BiConsumer<A, T> accumulator();
+    BinaryOperator<A> combiner();
+    Function<A, R> finisher();
+    Set<Characteristics> characteristics();
+
+    enum Characteristics {
+        CONCURRENT,
+        UNORDERED,
+        IDENTITY_FINISH
+    }
+    // ... static of(...) 팩터리 두 개
+}</code></pre>
+<p>타입 매개변수 세 개의 뜻부터 정확히 잡아 두자. <code>T</code>는 입력 원소의 타입, <code>A</code>는 누적에 쓰는 가변 그릇의 타입(accumulation type), <code>R</code>은 최종 결과 타입이다. Javadoc은 <code>A</code>에 대해 "흔히 구현 세부로 숨겨진다(often hidden as an implementation detail)"고 적는다. 실제로 <code>Collectors</code>의 메서드들은 반환 타입을 <code>Collector<T, ?, R></code>처럼 가운데를 물음표로 선언한다. 사용하는 쪽은 "무엇을 넣으면 무엇이 나오는가"만 알면 되고, 중간에 어떤 그릇을 쓰는지는 몰라도 된다는 설계다.</p>
+<p>네 함수 가운데 세 개는 세 인자 <code>collect</code>와 같다. 새로 생긴 것이 finisher다. 그릇 타입과 결과 타입이 다를 수 있기 때문이다. 문자열 연결은 <code>StringBuilder</code>에 쌓고 마지막에 <code>String</code>으로 바꾸고, 평균은 합계와 개수를 쌓은 뒤 마지막에 나눗셈을 한다. 그릇이 곧 결과인 경우(리스트로 모으기)에는 finisher가 항등 함수가 된다.</p>
+<p>특성(characteristics)은 리덕션을 실행하는 쪽에 주는 힌트다. 세 가지가 있다.</p>
+<div class="table-wrap"><table><thead><tr><th>특성</th><th>뜻</th><th>실행하는 쪽이 얻는 것</th></tr></thead><tbody>
+<tr><td><code>IDENTITY_FINISH</code></td><td>finisher가 항등 함수이고, 그릇 <code>A</code>를 <code>R</code>로 검사 없이 캐스팅해도 된다</td><td>finisher 호출을 건너뛴다</td></tr>
+<tr><td><code>UNORDERED</code></td><td>결과가 입력 원소의 만남 순서(encounter order)를 보존하지 않는다</td><td>순서를 지키기 위한 제약을 풀 수 있다</td></tr>
+<tr><td><code>CONCURRENT</code></td><td>여러 스레드가 그릇 하나에 accumulator를 동시에 호출해도 된다</td><td>병렬일 때 그릇을 하나만 만들어 공유하는 동시 리덕션이 가능하다</td></tr>
+</tbody></table></div>
+<p><code>Collector</code>의 Javadoc은 순차 실행과 병렬 실행의 결과가 같아지도록 두 가지 제약을 요구한다. 항등 제약(identity constraint)은 부분 결과 <code>a</code>를 빈 그릇과 합쳐도 같은 결과여야 한다는 것, 곧 <code>combiner.apply(a, supplier.get())</code>가 <code>a</code>와 동등해야 한다는 것이다. 결합 제약(associativity constraint)은 계산을 나눠서 해도 결과가 같아야 한다는 것이다. 원소 <code>t1</code>, <code>t2</code>를 한 그릇에 차례로 넣은 결과와, 각자 다른 그릇에 넣은 뒤 combiner로 합친 결과가 finisher를 거친 뒤 같아야 한다. 이 두 제약이 지켜지면 실행하는 쪽은 데이터를 마음대로 쪼개고 합칠 수 있다.</p>
+<p>반대 방향의 약속도 있다. <code>Stream.collect</code>처럼 컬렉터를 실행하는 라이브러리는 supplier·accumulator·combiner가 만든 결과를 다시 accumulator·combiner·finisher에 넘기거나 호출자에게 돌려주는 것 말고는 아무 일도 하지 않아야 하고, 한 번 combiner나 finisher에 넘긴 그릇을 다시 accumulator에 넘기지 않아야 한다. 또 동시성(CONCURRENT)이 없는 컬렉터라면 각 그릇은 한 번에 한 스레드에만 갇혀(serially thread-confined) 있어야 한다. Javadoc은 이 덕분에 컬렉터가 따로 동기화를 구현하지 않아도 병렬 수집이 가능하다고 설명한다. 컬렉터를 쓰는 우리가 <code>ArrayList</code>처럼 스레드 안전하지 않은 그릇을 마음 놓고 쓸 수 있는 근거가 바로 이 약속이다.</p>
+
+<h4>Collector.of로 직접 만들고 호출 순서 관찰하기</h4>
+<p>인터페이스를 직접 구현해도 되지만 보통은 정적 팩터리 <code>Collector.of</code>를 쓴다. 두 가지 형태가 있다. 함수 세 개만 받는 <code>of(supplier, accumulator, combiner, characteristics...)</code>는 그릇이 곧 결과인 컬렉터를 만들고, OpenJDK 21 소스를 보면 넘긴 특성에 <code>IDENTITY_FINISH</code>를 <b>항상 더한다</b>. finisher까지 받는 <code>of(supplier, accumulator, combiner, finisher, characteristics...)</code>는 넘긴 특성만 그대로 쓴다. 각 함수가 언제 불리는지 눈으로 보기 위해, 호출될 때마다 한 줄씩 출력하는 컬렉터를 만들어 보자.</p>
+<pre><code class="language-java">Collector<String, List<String>, String> logging = Collector.of(
+    () -> { System.out.println("  supplier"); return new ArrayList<>(); },
+    (acc, s) -> { System.out.println("  accumulator(" + acc + ", " + s + ")"); acc.add(s); },
+    (a, b) -> { System.out.println("  combiner"); a.addAll(b); return a; },
+    acc -> { System.out.println("  finisher(" + acc + ")"); return String.join("/", acc); }
+);
+System.out.println("start");
+String r = Stream.of("a", "b", "c").collect(logging);
+System.out.println("result=" + r + " characteristics=" + logging.characteristics());</code></pre>
+<pre data-label="실행 결과"><code class="language-text">start
+  supplier
+  accumulator([], a)
+  accumulator([a], b)
+  accumulator([a, b], c)
+  finisher([a, b, c])
+result=a/b/c characteristics=[]</code></pre>
+<p>출력을 한 줄씩 추적하면 Javadoc의 반복문 정의와 정확히 일치한다. 순차 스트림에서 supplier는 한 번, accumulator는 원소마다 한 번, finisher는 마지막에 한 번 불렸고 combiner는 한 번도 불리지 않았다. 그릇은 하나뿐이니 합칠 상대가 없다. 특성을 넘기지 않았으므로 다섯 인자 <code>of</code>는 빈 집합을 특성으로 쓴다. 같은 컬렉터를 <code>parallel()</code> 스트림에 쓰면 supplier가 여러 번, combiner가 여러 번 불리는데, 그 횟수는 다음 절에서 실행 경로를 본 뒤에 설명한다.</p>
+
+<h3>collect의 실행 경로: OpenJDK 21 소스로 따라가기</h3>
+<p>컬렉터는 함수 묶음일 뿐이고, 그 함수들을 언제 몇 번 부를지는 <code>Stream.collect</code>의 구현이 정한다. 우리가 다루는 객체 스트림의 실제 클래스는 <code>java.util.stream.ReferencePipeline</code>이다. OpenJDK 21의 <code>collect(Collector)</code> 구현은 열다섯 줄 남짓이다.</p>
+<pre data-label="ReferencePipeline.collect (OpenJDK 21)"><code class="language-java">public final <R, A> R collect(Collector<? super P_OUT, A, R> collector) {
+    A container;
+    if (isParallel()
+            && (collector.characteristics().contains(Collector.Characteristics.CONCURRENT))
+            && (!isOrdered() || collector.characteristics().contains(Collector.Characteristics.UNORDERED))) {
+        container = collector.supplier().get();
+        BiConsumer<A, ? super P_OUT> accumulator = collector.accumulator();
+        forEach(u -> accumulator.accept(container, u));
+    }
+    else {
+        container = evaluate(ReduceOps.makeRef(collector));
+    }
+    return collector.characteristics().contains(Collector.Characteristics.IDENTITY_FINISH)
+           ? (R) container
+           : collector.finisher().apply(container);
+}</code></pre>
+<p>분기는 두 갈래다. 첫 번째 갈래는 동시 리덕션(concurrent reduction)이다. 스트림이 병렬이고, 컬렉터가 <code>CONCURRENT</code>이며, 스트림에 순서가 없거나 컬렉터가 <code>UNORDERED</code>일 때만 탄다. 이때는 supplier를 <b>딱 한 번</b> 불러 그릇을 하나 만들고, 병렬 <code>forEach</code>로 모든 스레드가 그 그릇 하나에 accumulator를 호출한다. combiner는 쓰이지 않는다. 그래서 그릇 자체가 동시 접근에 안전해야 하고(<code>ConcurrentHashMap</code> 같은), 원소가 들어가는 순서는 결정되지 않는다. 세 조건은 <code>java.util.stream</code> 패키지 문서의 "동시 리덕션" 설명과 같다.</p>
+<p>나머지는 모두 두 번째 갈래로 간다. <code>ReduceOps.makeRef(collector)</code>는 컬렉터의 세 함수를 꺼내 "리듀싱 싱크(ReducingSink)"라는 지역 클래스를 만든다. 싱크는 OpenJDK 스트림 구현에서 파이프라인의 각 단계가 원소를 다음 단계로 밀어 넣을 때 쓰는 내부 인터페이스 <code>Sink</code>(<code>Consumer</code>를 확장한다)의 구현이다.</p>
+<pre data-label="ReduceOps.makeRef(Collector) 안의 싱크 (OpenJDK 21, 발췌)"><code class="language-java">class ReducingSink extends Box<I>
+        implements AccumulatingSink<T, I, ReducingSink> {
+    @Override
+    public void begin(long size) {
+        state = supplier.get();          // 그릇을 새로 만든다
+    }
+
+    @Override
+    public void accept(T t) {
+        accumulator.accept(state, t);    // 그릇을 고친다
+    }
+
+    @Override
+    public void combine(ReducingSink other) {
+        state = combiner.apply(state, other.state);
+    }
+}</code></pre>
+<p>이 회차의 첫 절에서 본 <code>reduce</code>용 싱크와 나란히 놓으면 두 연산의 차이가 코드 한 줄로 드러난다. <code>reduce</code>의 싱크는 <code>begin</code>에서 <code>state = seed</code>로 우리가 넘긴 identity 객체를 그대로 상태로 삼고, <code>accept</code>에서 <code>state = reducer.apply(state, t)</code>로 상태를 <b>바꿔 끼운다</b>. <code>collect</code>의 싱크는 <code>begin</code>에서 supplier로 <b>새 그릇</b>을 만들고, <code>accept</code>에서 상태 변수는 그대로 둔 채 그 그릇의 <b>내용을 고친다</b>. 싱크가 여러 개 만들어지는 병렬 실행에서 이 차이는 "모두가 같은 객체를 고친다"와 "각자 자기 그릇을 고친다"의 차이가 된다.</p>
+<p>순차 실행이면 <code>evaluateSequential</code>이 싱크를 <b>하나</b> 만들고 <code>wrapAndCopyInto</code>로 소스의 원소를 파이프라인 단계들을 거쳐 그 싱크에 흘려보낸다. <code>begin</code>이 한 번 불리므로 supplier도 한 번이고, <code>combine</code>은 불리지 않는다. 앞의 로그가 그 결과다. 병렬 실행이면 <code>evaluateParallel</code>이 <code>ReduceTask</code>를 만든다. 이 작업은 포크/조인 프레임워크 위에서 스플리터레이터(spliterator)를 <code>trySplit</code>으로 거듭 쪼개 작업 트리를 만들고, 잎(leaf) 작업마다 <code>op.makeSink()</code>로 새 싱크를 만들어 자기 몫의 원소를 처리한다. 잎이 아닌 작업은 두 자식이 끝나면 <code>onCompletion</code>에서 왼쪽 자식의 결과에 오른쪽 자식의 결과를 <code>combine</code>한다. 이진 트리에서 잎이 n개면 안쪽 노드는 n-1개이므로, supplier는 잎 수만큼, combiner는 그보다 하나 적게 불린다.</p>
+<pre><code class="language-java">AtomicInteger sup = new AtomicInteger(), comb = new AtomicInteger();
+Collector<Integer, List<Integer>, List<Integer>> c = Collector.of(
+    () -> { sup.incrementAndGet(); return new ArrayList<>(); },
+    List::add,
+    (x, y) -> { comb.incrementAndGet(); x.addAll(y); return x; });
+List<Integer> r = IntStream.range(0, 1000).boxed().parallel().collect(c);
+System.out.println(r.equals(IntStream.range(0, 1000).boxed().toList())
+    + " sup=" + sup + " comb=" + comb);</code></pre>
+<pre data-label="실행 결과 (8코어 macOS, 횟수는 환경마다 다르다)"><code class="language-text">true sup=32 comb=31</code></pre>
+<p>supplier 32번, combiner 31번은 이 컴퓨터에서 나온 숫자다. 작업을 몇 조각으로 나눌지는 공용 풀의 병렬성(parallelism)과 데이터 크기에서 정해지므로 코어 수가 다르면 숫자가 달라진다. 달라지지 않는 것은 두 가지다. combiner 횟수는 supplier 횟수보다 하나 적고, 결과 리스트는 순차 실행과 같은 순서의 0부터 999까지다. 순서가 보존되는 것은 순서 있는(ORDERED) 스플리터레이터의 <code>trySplit</code>이 앞부분을 떼어 왼쪽 자식에게 주고, <code>ReduceTask</code>가 언제나 <b>왼쪽 결과에 오른쪽 결과를</b> 합치기 때문이다. 이 컬렉터는 <code>UNORDERED</code>가 아니므로 실행하는 쪽은 만남 순서를 지켜 합친다.</p>
+<p>마지막 줄의 삼항 연산자도 중요하다. 컬렉터가 <code>IDENTITY_FINISH</code>를 가지면 finisher를 부르지 않고 그릇을 <code>(R) container</code>로 캐스팅해 돌려준다. 제네릭은 소거(erasure)되므로 이 캐스팅은 실행 시점에 아무것도 검사하지 않는 비검사 캐스팅(unchecked cast)이다. 그렇다면 특성을 거짓으로 붙이면 어떻게 될까? 그릇은 <code>StringBuilder</code>, 결과는 <code>String</code>인 컬렉터에 <code>IDENTITY_FINISH</code>를 붙여 보자.</p>
+<pre><code class="language-java">Collector<String, StringBuilder, String> liar = Collector.of(
+    StringBuilder::new, StringBuilder::append,
+    (a, b) -> a.append(b),
+    sb -> { System.out.println("  finisher called"); return sb.toString(); },
+    Collector.Characteristics.IDENTITY_FINISH);
+try {
+    String s = Stream.of("x", "y").collect(liar);
+    System.out.println(s);
+} catch (ClassCastException e) {
+    System.out.println(e.getMessage());
+}
+Object o = Stream.of("x", "y").collect(liar);
+System.out.println("object result class=" + o.getClass().getName());</code></pre>
+<pre data-label="실행 결과"><code class="language-text">class java.lang.StringBuilder cannot be cast to class java.lang.String (java.lang.StringBuilder and java.lang.String are in module java.base of loader 'bootstrap')
+object result class=java.lang.StringBuilder</code></pre>
+<p>"finisher called"는 한 번도 출력되지 않았다. 특성을 믿고 finisher를 건너뛴 것이다. 흥미로운 것은 예외가 터진 위치다. <code>collect</code> 안의 <code>(R) container</code>는 소거 후 아무 검사도 하지 않으므로 <code>StringBuilder</code>가 그대로 빠져나온다. 예외는 <b>호출한 쪽</b>에서 난다. 결과를 <code>String</code> 변수에 담는 메서드를 javap로 보면 컴파일러가 넣은 <code>checkcast</code>가 보이고, <code>Object</code> 변수에 담는 메서드에는 그 명령이 없다. 그래서 두 번째 호출은 예외 없이 <code>StringBuilder</code>를 돌려준다.</p>
+<pre data-label="javap -c (String으로 받는 메서드와 Object로 받는 메서드)"><code class="language-text">static java.lang.String s(java.util.stream.Stream<java.lang.String>, java.util.stream.Collector<java.lang.String, ?, java.lang.String>);
+  Code:
+     0: aload_0
+     1: aload_1
+     2: invokeinterface #7,  2   // InterfaceMethod java/util/stream/Stream.collect:(Ljava/util/stream/Collector;)Ljava/lang/Object;
+     7: checkcast     #13        // class java/lang/String
+    10: areturn
+static java.lang.Object o(java.util.stream.Stream<java.lang.String>, java.util.stream.Collector<java.lang.String, ?, java.lang.String>);
+  Code:
+     0: aload_0
+     1: aload_1
+     2: invokeinterface #7,  2   // InterfaceMethod java/util/stream/Stream.collect:(Ljava/util/stream/Collector;)Ljava/lang/Object;
+     7: areturn</code></pre>
+<p>바이트코드 수준에서 <code>Stream.collect</code>의 반환 타입은 <code>Object</code>다. 제네릭 타입 <code>R</code>은 컴파일러의 타입 검사에만 존재하고, 실제 타입 확인은 값을 구체 타입으로 쓰는 지점에 컴파일러가 넣는 <code>checkcast</code>가 맡는다. 특성은 이렇게 실행 경로를 실제로 바꾸는 약속이므로, 직접 컬렉터를 만들 때는 사실인 특성만 붙여야 한다.</p>
+<figure class="flow-figure"><figcaption>stream.collect(collector) 한 번이 실행되는 순서 (OpenJDK 21)</figcaption><ol class="flow">
+<li><strong>경로 선택</strong><span>병렬이고 CONCURRENT이며 (순서 없음 또는 UNORDERED)이면 동시 리덕션, 아니면 ReduceOps.makeRef로 리듀스 연산을 만든다</span></li>
+<li><strong>그릇 생성</strong><span>순차는 싱크 하나의 begin에서 supplier 1회, 병렬은 잎 작업마다 새 싱크와 새 그릇, 동시 리덕션은 공유 그릇 1개</span></li>
+<li><strong>누적</strong><span>원소마다 accept가 accumulator를 호출해 자기 그릇을 고친다</span></li>
+<li><strong>합치기</strong><span>병렬일 때만 onCompletion에서 왼쪽 결과에 오른쪽 결과를 combiner로 합친다</span></li>
+<li><strong>마무리</strong><span>IDENTITY_FINISH면 그릇을 그대로 (R)로 캐스팅, 아니면 finisher를 한 번 호출한다</span></li>
+</ol></figure>
+<x-visual id="java-adv3-07-collect-paths" title="순차·병렬·동시 리덕션에서 컬렉터 함수가 불리는 모습" kind="실행 흐름도" ratio="16:9">
+<x-hint>같은 컬렉터가 세 가지 실행 경로에서 그릇을 몇 개 만들고 combiner를 어디서 부르는지 한눈에 비교한다.</x-hint>
+<x-prompt>가로로 3개의 패널을 나란히 배치한 기술 다이어그램, 흰 배경, 플랫한 선 스타일. 왼쪽 패널 제목 "순차": 위에서 아래로 원소 아이콘 5개가 화살표를 따라 하나의 그릇(둥근 사각형, 라벨 "그릇 1개")으로 들어가고, 그 아래 "finisher" 상자로 이어진다. 가운데 패널 제목 "병렬": 위쪽에 데이터 막대가 4조각으로 쪼개지고, 각 조각 아래에 작은 그릇 4개가 있으며, 그릇 둘씩 아래로 모여 "combiner" 마름모 2개, 다시 둘이 모여 "combiner" 마름모 1개, 그 아래 "finisher" 상자로 이어지는 역삼각형 트리. 오른쪽 패널 제목 "동시 리덕션": 스레드 아이콘 4개에서 화살표가 모두 가운데의 큰 그릇 하나(라벨 "공유 그릇")로 들어가며, 그릇 옆에 "ConcurrentHashMap" 라벨이 있고 combiner는 없다. 각 패널 아래에 작은 회색 글씨로 "supplier 1회", "supplier = 잎 수", "supplier 1회"를 적는다.</x-prompt>
+<x-caption>같은 컬렉터라도 실행 경로에 따라 그릇의 수와 combiner 호출이 달라진다. 순서를 지키는 병렬 실행은 언제나 왼쪽에 오른쪽을 합친다.</x-caption>
+</x-visual>
+<p>한 가지 더, <code>ReduceOps.makeRef(collector)</code>가 만드는 연산은 <code>getOpFlags()</code>에서 컬렉터가 <code>UNORDERED</code>면 <code>StreamOpFlag.NOT_ORDERED</code> 플래그를 돌려준다. 종단 연산이 "나는 순서를 신경 쓰지 않는다"고 파이프라인에 알리는 것이다. 이 플래그가 병렬 실행에서 어떤 최적화로 이어지는지는 10회에서 병렬 스트림과 함께 본다.</p>
+
+<h3>컬렉터 1: 컬렉션으로 모으기</h3>
+<p>이제 <code>Collectors</code>가 제공하는 기성 컬렉터를 보자. 가장 기본은 원소를 컬렉션에 그대로 담는 컬렉터들이다. OpenJDK 21 소스에서 <code>toList()</code>의 구현은 한 문장이다.</p>
+<pre data-label="Collectors.toList (OpenJDK 21)"><code class="language-java">public static <T>
+Collector<T, ?, List<T>> toList() {
+    return new CollectorImpl<>(ArrayList::new, List::add,
+                               (left, right) -> { left.addAll(right); return left; },
+                               CH_ID);
+}</code></pre>
+<p><code>CollectorImpl</code>은 <code>Collectors</code> 안의 패키지 전용 레코드로, 네 함수와 특성 집합을 필드로 갖고 <code>Collector</code>를 구현한다. finisher를 받지 않는 생성자는 항등 캐스팅 함수를 채워 넣는다. <code>CH_ID</code>는 <code>IDENTITY_FINISH</code> 하나만 담은 불변 집합이다. 그러니 <code>toList()</code>는 "새 <code>ArrayList</code>를 만들고, 원소마다 <code>add</code>하고, 병렬이면 왼쪽에 오른쪽을 <code>addAll</code>하고, 그릇을 그대로 결과로 돌려주는" 컬렉터다. 그런데 Javadoc은 이 구현을 약속하지 않는다. "반환되는 <code>List</code>의 타입, 가변성, 직렬화 가능성, 스레드 안전성에 대해 아무것도 보장하지 않는다"고 적고, 더 많은 제어가 필요하면 <code>toCollection(Supplier)</code>를 쓰라고 한다.</p>
+<p>리스트로 모으는 방법은 세 가지가 더 있다. 자바 10에 들어온 <code>Collectors.toUnmodifiableList()</code>, 자바 16에 들어온 <code>Stream.toList()</code>, 그리고 그릇 종류를 직접 고르는 <code>toCollection(ArrayList::new)</code>다. 차이를 실행으로 확인해 보자.</p>
+<pre><code class="language-java">List<String> a = Stream.of("p", "q").collect(Collectors.toList());
+List<String> b = Stream.of("p", "q").toList();
+List<String> c = Stream.of("p", "q").collect(Collectors.toUnmodifiableList());
+System.out.println(a.getClass().getName() + " / " + b.getClass().getName() + " / " + c.getClass().getName());
+a.add("r");                                   // 성공: [p, q, r]
+try { b.add("r"); }
+catch (UnsupportedOperationException e) { System.out.println("b.add -> UnsupportedOperationException"); }
+System.out.println(Stream.of("p", null).toList());                   // null 허용
+try { Stream.of("p", null).collect(Collectors.toUnmodifiableList()); }
+catch (NullPointerException e) { System.out.println("toUnmodifiableList null -> NPE"); }</code></pre>
+<pre data-label="실행 결과"><code class="language-text">java.util.ArrayList / java.util.ImmutableCollections$ListN / java.util.ImmutableCollections$List12
+b.add -> UnsupportedOperationException
+[p, null]
+toUnmodifiableList null -> NPE</code></pre>
+<div class="table-wrap"><table><thead><tr><th>방법</th><th>도입</th><th>수정 가능</th><th>null 원소</th><th>OpenJDK 21의 실제 클래스</th></tr></thead><tbody>
+<tr><td><code>collect(Collectors.toList())</code></td><td>8</td><td>명세상 보장 없음(구현은 가능)</td><td>허용</td><td><code>ArrayList</code></td></tr>
+<tr><td><code>collect(Collectors.toUnmodifiableList())</code></td><td>10</td><td>불가</td><td><code>NullPointerException</code></td><td><code>ImmutableCollections</code>의 <code>List12</code> 또는 <code>ListN</code></td></tr>
+<tr><td><code>stream.toList()</code></td><td>16</td><td>불가</td><td>허용</td><td><code>ImmutableCollections$ListN</code></td></tr>
+<tr><td><code>collect(toCollection(ArrayList::new))</code></td><td>8</td><td>가능(직접 고른 타입)</td><td>그릇 타입이 정한다</td><td>넘긴 supplier가 만든 것</td></tr>
+</tbody></table></div>
+<p>표의 마지막 열은 명세가 아니라 이번 실행에서 <code>getClass()</code>로 본 구현이다. 원소 두 개를 담은 <code>toUnmodifiableList()</code>는 원소 한두 개짜리 전용 클래스 <code>List12</code>를 썼고, <code>Stream.toList()</code>는 같은 원소 수에서도 <code>ListN</code>을 썼다. 이유는 소스에 있다. <code>toUnmodifiableList()</code>는 <code>ArrayList</code>에 모은 뒤 finisher에서 <code>listFromTrustedArray</code>로 불변 리스트를 만드는데, 이 경로는 null을 허용하지 않고 크기에 따라 전용 클래스를 고른다. <code>Stream.toList()</code>는 <code>ReferencePipeline</code>에서 재정의되어 <b>컬렉터를 아예 쓰지 않고</b> <code>toArray()</code>로 배열을 만든 다음 <code>listFromTrustedArrayNullsAllowed</code>로 감싼다. null을 허용해야 하므로 null을 받을 수 있는 <code>ListN</code>을 쓴다. 인터페이스의 디폴트 구현은 <code>Collections.unmodifiableList(new ArrayList<>(Arrays.asList(this.toArray())))</code>과 같은 결과를 내도록 정해져 있다.</p>
+<p>그래서 선택 기준은 이렇게 정리된다. 결과를 읽기만 할 것이면 <code>Stream.toList()</code>가 가장 짧고, null이 섞일 수 있는 데이터에도 쓸 수 있다. null이 들어오는 것 자체를 버그로 보고 즉시 실패하게 하고 싶으면 <code>toUnmodifiableList()</code>를 쓴다. 결과에 원소를 더 추가해야 하면 <code>Collectors.toList()</code>가 지금 구현상 <code>ArrayList</code>를 주더라도 명세가 보장하지 않으므로 <code>toCollection(ArrayList::new)</code>로 의도를 드러내는 편이 안전하다. <code>java.util.stream</code> 패키지 문서가 드는 예처럼 <code>forEach</code> 안에서 바깥 <code>ArrayList</code>에 <code>add</code>하는 코드는 이 셋 중 하나로 바꿔야 한다. 그 코드는 병렬에서 스레드 안전하지 않은 리스트 하나를 여러 스레드가 고치게 만든다.</p>
+<p>집합 쪽도 같은 구조다. <code>toSet()</code>은 <code>HashSet</code>을 그릇으로 쓰고 특성은 <code>UNORDERED</code>와 <code>IDENTITY_FINISH</code>다. 이 컬렉터의 combiner는 조금 다르다. OpenJDK 21 구현은 두 집합의 크기를 비교해 <b>작은 쪽을 큰 쪽에 붓고, 큰 쪽을 돌려준다</b>. combiner가 <code>BinaryOperator</code>라서 어느 그릇이든 결과가 될 수 있기에 가능한 최적화다. 순서가 의미 없는 집합이라 왼쪽·오른쪽을 바꿔도 결과가 동등하다. <code>toUnmodifiableSet()</code>은 마지막에 <code>Set.of(set.toArray())</code>로 불변 집합을 만들고, 정렬된 집합이 필요하면 <code>toCollection(TreeSet::new)</code>을 쓴다.</p>
+
+<h3>컬렉터 1 (계속): toMap과 중복 키</h3>
+<p>원소 하나를 키와 값 한 쌍으로 바꿔 맵에 담는 컬렉터가 <code>toMap</code>이다. 인자는 키를 뽑는 함수(keyMapper)와 값을 뽑는 함수(valueMapper)다. 주문 데이터로 "고객 → 주문 금액" 맵을 만들어 보자. 민수는 주문이 두 건이다.</p>
+<pre><code class="language-java">try {
+    ORDERS.stream().collect(toMap(Order::customer, Order::amount));
+} catch (IllegalStateException e) {
+    System.out.println(e.getMessage());
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Duplicate key 민수 (attempted merging values 12000 and 89000)</code></pre>
+<p>Javadoc은 키가 <code>equals</code> 기준으로 중복되면 수집할 때 <code>IllegalStateException</code>이 발생한다고 명시한다. 메시지 형식은 구현에 있다. 인자 두 개짜리 <code>toMap</code>의 accumulator는 OpenJDK 21에서 다음과 같다.</p>
+<pre data-label="Collectors.uniqKeysMapAccumulator (OpenJDK 21)"><code class="language-java">return (map, element) -> {
+    K k = keyMapper.apply(element);
+    V v = Objects.requireNonNull(valueMapper.apply(element));
+    V u = map.putIfAbsent(k, v);
+    if (u != null) throw duplicateKeyException(k, u, v);
+};</code></pre>
+<p>세 가지가 읽힌다. 첫째, 값이 null이면 <code>requireNonNull</code>에서 즉시 <code>NullPointerException</code>이 난다. 둘째, 키는 검사하지 않으므로 그릇이 <code>HashMap</code>이면 null 키가 들어간다. 실제로 <code>Stream.of("k").collect(toMap(k -> (String) null, k -> k))</code>는 <code>{null=k}</code>를 만든다. 셋째, <code>putIfAbsent</code>가 기존 값을 돌려주면 중복이므로 예외를 던진다. 첫 번째 값은 이미 맵에 들어간 12000, 두 번째 값은 지금 넣으려던 89000이라 메시지가 그렇게 나온다. 병렬에서 쓰이는 combiner(<code>uniqKeysMapMerger</code>)도 오른쪽 맵의 항목을 하나씩 <code>putIfAbsent</code>하며 같은 방식으로 중복을 잡는다.</p>
+<p>중복이 정상인 데이터라면 세 번째 인자로 병합 함수(merge function)를 준다. 이 형태의 accumulator는 <code>map.merge(key, value, mergeFunction)</code> 한 줄이다. <code>Map.merge</code>는 키가 없으면 값을 넣고, 있으면 기존 값과 새 값을 병합 함수에 넘겨 그 결과로 바꾼다. 네 번째 인자로 맵 팩터리를 주면 그릇 종류도 고를 수 있다.</p>
+<pre><code class="language-java">Map<String, Integer> sum = ORDERS.stream()
+    .collect(toMap(Order::customer, Order::amount, Integer::sum, TreeMap::new));
+Map<String, Integer> last = ORDERS.stream()
+    .collect(toMap(Order::customer, Order::amount, (x, y) -> y, LinkedHashMap::new));
+Map<String, Integer> hm = ORDERS.stream()
+    .collect(toMap(Order::customer, Order::amount, Integer::sum));
+System.out.println(sum);
+System.out.println(last);
+System.out.println(hm);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">{민수=101000, 서연=15000, 지영=282000, 현우=138000}
+{민수=89000, 지영=32000, 현우=120000, 서연=15000}
+{현우=138000, 지영=282000, 민수=101000, 서연=15000}</code></pre>
+<p><code>TreeMap</code>은 키의 자연 순서(문자열의 사전 순)로, <code>LinkedHashMap</code>은 키가 처음 들어간 순서로 순회한다. <code>(x, y) -> y</code>는 "나중 값이 이긴다"는 병합 함수라서 민수의 값이 89000으로 남았다. 맵 팩터리를 주지 않으면 그릇은 <code>HashMap</code>이고 순회 순서는 명세가 정하지 않는다. 세 번째 줄의 순서는 키 문자열의 해시값과 <code>HashMap</code> 구현에서 나온 것일 뿐이므로, 출력 순서가 의미 있는 코드라면 반드시 맵 팩터리를 지정해야 한다.</p>
+<p>병합 함수가 있는 경로에서도 null 값은 허용되지 않는다. 이번에는 <code>requireNonNull</code> 때문이 아니라 <code>HashMap.merge</code>가 첫 줄에서 <code>value == null</code>이면 <code>NullPointerException</code>을 던지기 때문이다. 그러니 <code>toMap</code>의 값 함수가 null을 돌려줄 수 있다면 형태와 상관없이 실패한다. 값이 없을 수 있는 데이터는 <code>Optional</code>이나 기본값으로 바꾸거나, <code>groupingBy</code>처럼 다른 컬렉터를 써야 한다. <code>toUnmodifiableMap</code>은 <code>toMap</code>의 결과를 <code>collectingAndThen</code>으로 감싸 <code>Map.ofEntries</code>로 불변 맵을 만드는 컬렉터이고, <code>toConcurrentMap</code>은 그릇이 <code>ConcurrentHashMap</code>이며 특성이 <code>CONCURRENT</code>, <code>UNORDERED</code>, <code>IDENTITY_FINISH</code>인 판이다.</p>
+
+<h3>컬렉터 2: 하나의 값으로 줄이기</h3>
+<p>두 번째 부류는 원소들을 개수, 합계, 평균, 최댓값, 문자열 하나처럼 값 하나로 줄이는 컬렉터다. 스트림에 이미 <code>count()</code>, <code>max()</code>, 기본형 스트림의 <code>sum()</code>이 있는데 왜 같은 일을 하는 컬렉터가 따로 있을까? 이 컬렉터들의 진짜 쓰임새는 단독이 아니라 다음 절의 <code>groupingBy</code> 안에 다운스트림으로 들어가 "그룹마다" 개수와 합계를 내는 데 있다. 스트림의 종단 연산은 스트림 전체에만 적용되지만, 컬렉터는 객체라서 다른 컬렉터에 인자로 넘길 수 있다.</p>
+<p>먼저 구현을 보면 공통 패턴이 하나 보인다. 그릇이 <b>배열</b>이다.</p>
+<pre data-label="Collectors.summingInt, averagingInt, counting (OpenJDK 21)"><code class="language-java">public static <T> Collector<T, ?, Integer>
+summingInt(ToIntFunction<? super T> mapper) {
+    return new CollectorImpl<>(
+            () -> new int[1],
+            (a, t) -> { a[0] += mapper.applyAsInt(t); },
+            (a, b) -> { a[0] += b[0]; return a; },
+            a -> a[0], CH_NOID);
+}
+
+public static <T> Collector<T, ?, Double>
+averagingInt(ToIntFunction<? super T> mapper) {
+    return new CollectorImpl<>(
+            () -> new long[2],
+            (a, t) -> { a[0] += mapper.applyAsInt(t); a[1]++; },
+            (a, b) -> { a[0] += b[0]; a[1] += b[1]; return a; },
+            a -> (a[1] == 0) ? 0.0d : (double) a[0] / a[1], CH_NOID);
+}
+
+public static <T> Collector<T, ?, Long>
+counting() {
+    return summingLong(e -> 1L);
+}</code></pre>
+<p>왜 <code>Integer</code>가 아니라 길이 1짜리 <code>int</code> 배열일까? accumulator는 <code>BiConsumer</code>라서 새 값을 돌려줄 수 없고, 받은 그릇을 고쳐야 한다. 그런데 <code>Integer</code>는 불변 객체라 고칠 수 없다. 그래서 고칠 수 있는 칸 하나, 곧 원소가 하나인 배열을 가변 상자(mutable box)로 쓴다. 배열 객체는 힙에 하나 만들어지고, 누적하는 동안 그 칸의 <code>int</code> 값만 바뀐다. 원소마다 <code>Integer</code> 객체를 새로 만드는 박싱(boxing)이 없다는 것도 장점이다. 결과 <code>Integer</code>로의 박싱은 finisher <code>a -> a[0]</code>에서 한 번만 일어난다. finisher가 필요하므로 특성은 <code>CH_NOID</code>(빈 집합)다.</p>
+<p>그릇의 원소 타입은 결과에 그대로 영향을 준다. <code>summingInt</code>의 칸은 <code>int</code>라서 합이 <code>int</code> 범위를 넘으면 JLS의 정수 덧셈 규칙대로 조용히 넘친다(overflow). 반면 <code>averagingInt</code>는 합계를 <code>long</code> 칸에 쌓고, <code>summarizingInt</code>가 쓰는 <code>IntSummaryStatistics</code>도 합계 필드가 <code>long</code>이다. 같은 입력으로 확인해 보자.</p>
+<pre><code class="language-java">System.out.println(Stream.of(Integer.MAX_VALUE, 1).collect(summingInt(x -> x)));
+System.out.println(Stream.of(Integer.MAX_VALUE, 1).collect(averagingInt(x -> x)));
+System.out.println(Stream.of(Integer.MAX_VALUE, 1).collect(summarizingInt(x -> x)).getSum());</code></pre>
+<pre data-label="실행 결과"><code class="language-text">-2147483648
+1.073741824E9
+2147483648</code></pre>
+<p>합계가 <code>int</code> 범위를 넘을 수 있으면 <code>summingLong</code>을 쓰거나 <code>summarizingInt</code>의 <code>getSum()</code>을 쓴다. <code>counting()</code>이 <code>summingLong(e -> 1L)</code>로 구현되어 결과가 <code>Long</code>이라는 점도 기억해 두자. 이 타입 때문에 생기는 컴파일 오류를 뒤에서 본다. <code>summingDouble</code>과 <code>averagingDouble</code>은 <code>double[3]</code>, <code>double[4]</code>를 그릇으로 쓰는데, 소스 주석이 설명하듯 보정 합산(compensated summation, 소스 주석의 표현으로는 Kahan summation)으로 반올림 오차를 줄이는 값과 단순 합계를 따로 들고 다니기 때문이다. Javadoc은 그래도 부동소수점 합은 값이 기록되는 순서에 따라 달라질 수 있다고 적는다.</p>
+<p><code>summarizingInt</code>는 개수·합계·최솟값·최댓값·평균을 한 번에 모은다. 그릇 <code>IntSummaryStatistics</code>가 곧 결과이므로 특성은 <code>IDENTITY_FINISH</code>이고, 원소마다 <code>accept(int)</code>가 <code>count</code>를 늘리고 <code>sum</code>에 더하고 <code>Math.min</code>, <code>Math.max</code>로 최솟값과 최댓값을 갱신한다. 빈 스트림이면 최솟값과 최댓값이 초깃값 그대로 남는다.</p>
+<pre><code class="language-java">System.out.println(ORDERS.stream().filter(o -> o.city().equals("서울")).collect(summarizingInt(Order::amount)));
+System.out.println(Stream.<Order>empty().collect(summarizingInt(Order::amount)));</code></pre>
+<pre data-label="실행 결과"><code class="language-text">IntSummaryStatistics{count=3, sum=116000, min=12000, average=38666.666667, max=89000}
+IntSummaryStatistics{count=0, sum=0, min=2147483647, average=0.000000, max=-2147483648}</code></pre>
+<p>빈 입력의 최솟값이 <code>Integer.MAX_VALUE</code>로 나오는 것은 버그가 아니라 "아직 아무 값도 보지 않았다"는 초기 상태다. 그래서 통계 객체를 쓸 때는 <code>getCount()</code>가 0인지 먼저 확인해야 한다. <code>toString</code>의 형식은 Javadoc이 "명세하지 않으며 구현과 버전에 따라 달라질 수 있다"고 밝히므로 파싱 대상으로 삼지 않는다. 평균은 개수가 0이면 0.0을 돌려주도록 정해져 있다. <code>averagingInt</code>도 빈 입력에서 0.0을 돌려준다.</p>
+<p>최솟값과 최댓값은 <code>minBy</code>, <code>maxBy</code>가 맡는다. 결과 타입이 <code>Optional<T></code>인 이유는 빈 입력에서 돌려줄 원소가 없기 때문이다. 구현은 <code>reducing(BinaryOperator.maxBy(comparator))</code>이고, 이 <code>reducing</code>은 "값이 있는가"와 "현재 값"을 필드로 든 지역 클래스 <code>OptionalBox</code>를 그릇으로 쓴다. 첫 원소는 그대로 담고, 그다음부터는 이항 연산자로 줄이며, finisher가 <code>Optional.ofNullable(a.value)</code>로 포장한다. <code>BinaryOperator.maxBy</code>의 구현은 <code>comparator.compare(a, b) >= 0 ? a : b</code>라서 같은 크기의 원소가 여럿이면 먼저 누적된 쪽이 남는다. 금액이 같은 두 원소에 <code>maxBy</code>를 적용하면 순차 스트림에서 앞의 원소가 결과다.</p>
+<p><code>reducing</code>은 세 가지 형태가 있다. <code>reducing(identity, op)</code>와 <code>reducing(identity, mapper, op)</code>는 <code>new Object[] { identity }</code>, 곧 identity를 담은 길이 1짜리 배열을 그릇으로 쓰고, 원소마다 <code>a[0] = op.apply(a[0], t)</code>로 칸의 값을 바꿔 끼운다. 그릇은 가변이지만 그 안에서 일어나는 일은 불변 리덕션이다. 이 구조 덕분에 <code>reduce</code>와 같은 계산을 <code>groupingBy</code>의 다운스트림 자리에서 쓸 수 있다. 다만 그룹마다 <code>Integer</code> 같은 불변 객체를 계속 새로 만드는 것은 <code>reduce</code>와 같으므로, 정수 합계라면 <code>summingInt</code>가 더 직접적이다.</p>
+<p>문자열 연결은 <code>joining</code>이다. 인자 없는 <code>joining()</code>은 <code>StringBuilder</code>를 그릇으로 쓰고 finisher <code>StringBuilder::toString</code>으로 마무리한다. 구분자·접두사·접미사를 받는 형태는 <code>StringJoiner</code>를 그릇으로 쓰고 combiner로 <code>StringJoiner::merge</code>를 쓴다. 이 회차 처음의 문제, 곧 <code>reduce</code>로 문자열을 이을 때 단계마다 전체를 복사하는 문제가 여기서 해결된다. 그릇 하나에 계속 덧붙이므로, 지금까지 쌓인 내용 전체를 옮기는 복사는 내부 버퍼가 모자라 커질 때만 일어난다. 입력 원소 타입이 <code>CharSequence</code>로 정해져 있어서, 주문 객체를 바로 넣을 수는 없고 <code>map(Order::customer)</code>나 다음 절의 <code>mapping</code>으로 문자열을 먼저 뽑아야 한다.</p>
+<div class="table-wrap"><table><thead><tr><th>컬렉터</th><th>그릇 A (OpenJDK 21)</th><th>finisher</th><th>결과 R</th><th>빈 입력</th></tr></thead><tbody>
+<tr><td><code>counting()</code></td><td><code>long[1]</code></td><td>칸의 값</td><td><code>Long</code></td><td>0</td></tr>
+<tr><td><code>summingInt</code></td><td><code>int[1]</code></td><td>칸의 값</td><td><code>Integer</code></td><td>0</td></tr>
+<tr><td><code>averagingInt</code></td><td><code>long[2]</code>(합, 개수)</td><td>나눗셈</td><td><code>Double</code></td><td>0.0</td></tr>
+<tr><td><code>summarizingInt</code></td><td><code>IntSummaryStatistics</code></td><td>없음(IDENTITY_FINISH)</td><td><code>IntSummaryStatistics</code></td><td>count=0</td></tr>
+<tr><td><code>minBy</code> / <code>maxBy</code></td><td><code>OptionalBox</code></td><td><code>Optional.ofNullable</code></td><td><code>Optional<T></code></td><td><code>Optional.empty</code></td></tr>
+<tr><td><code>reducing(identity, op)</code></td><td><code>Object[1]</code></td><td>칸의 값</td><td><code>T</code></td><td>identity</td></tr>
+<tr><td><code>joining(",")</code></td><td><code>StringJoiner</code></td><td><code>toString</code></td><td><code>String</code></td><td>빈 문자열(접두사+접미사)</td></tr>
+</tbody></table></div>
+
+<h3>그릇의 크기: 객체 헤더로 계산하는 summingInt와 reducing의 비용</h3>
+<p>앞 절에서 <code>summingInt</code>는 박싱 없이 <code>int[1]</code>의 칸 하나를 고치고, <code>reducing</code>은 칸 안의 불변 값을 원소마다 새로 만든다고 했다. 이 차이가 실제로 몇 바이트인지 말하려면 객체 하나가 힙에서 몇 바이트를 차지하는지부터 알아야 한다. 그런데 이것은 명세가 정하지 않는다. JVMS 2.7은 자바 가상 머신이 객체의 내부 구조를 특정하게 강제하지 않는다고 적는다. 그래서 이 절의 숫자는 모두 <b>OpenJDK 21 HotSpot, 64비트, 기본 옵션</b>이라는 범위 안에서만 맞는 값이다.</p>
+<p>HotSpot에서 모든 자바 객체는 <code>src/hotspot/share/oops/oop.hpp</code>의 <code>oopDesc</code>로 시작한다. 첫 필드는 <code>_mark</code>(마크 워드, markWord)로 64비트 VM에서 8바이트이며 락 상태와 GC 나이(age), 식별 해시코드(identity hash)를 담는다. 둘째 필드 <code>_metadata</code>는 공용체(union)로, 객체의 클래스를 가리키는 <code>Klass*</code>이거나 그것을 32비트로 줄인 <code>narrowKlass</code>다. 압축 클래스 포인터(<code>UseCompressedClassPointers</code>)가 켜져 있으면 뒤의 것을 쓰므로 일반 객체의 헤더는 8 + 4 = 12바이트다. 배열은 여기에 길이가 붙는다. <code>arrayOop.hpp</code>의 주석은 배열의 배치를 "markWord, Klass*, length" 순서로 적고, 클래스 포인터가 압축되어 있으면 길이 필드가 <code>_klass</code> 필드의 나머지 절반을 차지한다고 설명한다. 그리고 <code>header_size_in_bytes()</code>는 길이 필드 끝을 <code>HeapWordSize</code>(8바이트)의 배수로 올린 값을 배열 헤더 크기로 쓴다. 마지막으로 객체 전체 크기는 <code>ObjectAlignmentInBytes</code>의 배수로 올린다. 이 환경에서 <code>java -XX:+PrintFlagsFinal -version</code>으로 본 값은 <code>UseCompressedClassPointers = true</code>, <code>UseCompressedOops = true</code>(참조 필드 4바이트), <code>ObjectAlignmentInBytes = 8</code>이다.</p>
+<div class="table-wrap"><table><thead><tr><th>객체</th><th>계산 (압축 클래스 포인터 켜짐)</th><th>크기</th><th>압축 클래스 포인터를 끄면 (측정)</th></tr></thead><tbody>
+<tr><td><code>Integer</code></td><td>헤더 12 + <code>int value</code> 4</td><td>16</td><td>24</td></tr>
+<tr><td><code>int[1]</code></td><td>배열 헤더 16 + 4 = 20 → 8의 배수</td><td>24</td><td>32</td></tr>
+<tr><td><code>long[1]</code></td><td>배열 헤더 16 + 8</td><td>24</td><td>32</td></tr>
+<tr><td><code>Object[1]</code></td><td>배열 헤더 16 + 압축 참조 4 = 20 → 8의 배수</td><td>24</td><td>32</td></tr>
+<tr><td><code>double[3]</code></td><td>배열 헤더 16 + 24</td><td>40</td><td>48</td></tr>
+</tbody></table></div>
+<p>계산이 맞는지는 측정으로 확인할 수 있다. <code>com.sun.management.ThreadMXBean</code>의 <code>getCurrentThreadAllocatedBytes()</code>는 현재 스레드가 지금까지 힙에 할당한 바이트 수의 근삿값을 돌려준다(JDK 전용 확장 API이고, Javadoc은 구현에 따라 할당 시점과 기록 시점 사이에 지연이 있을 수 있어 근삿값이라고 밝힌다). 같은 객체를 백만 개 만들기 전후의 차이를 백만으로 나누면 객체 하나의 크기가 나온다. 만든 객체는 미리 할당해 둔 배열에 넣어, JIT 컴파일러가 쓰이지 않는 할당이라며 없애지 못하게 했다. 한 번 미리 돌려(warm-up) 클래스 로딩과 람다 연결 비용도 뺐다.</p>
+<pre><code class="language-java">static final com.sun.management.ThreadMXBean MX =
+    (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+static final int N = 1_000_000;
+static Object[] holder = new Object[N];
+
+static void perObject(String name, IntFunction<Object> f) {
+    for (int i = 0; i < N; i++) holder[i] = f.apply(i);          // warm-up
+    long t0 = MX.getCurrentThreadAllocatedBytes();
+    for (int i = 0; i < N; i++) holder[i] = f.apply(i);
+    long d = MX.getCurrentThreadAllocatedBytes() - t0;
+    System.out.printf("%-10s %d bytes / object%n", name, Math.round(d / (double) N));
+}
+// perObject("Integer", i -> Integer.valueOf(i + 1000));  perObject("int[1]", i -> new int[1]); ...</code></pre>
+<pre data-label="실행 결과 (왼쪽: 기본 옵션, 오른쪽: -XX:-UseCompressedClassPointers로 다시 실행)"><code class="language-text">Integer    16 bytes / object          Integer    24 bytes / object
+int[1]     24 bytes / object          int[1]     32 bytes / object
+long[1]    24 bytes / object          long[1]    32 bytes / object
+Object[1]  24 bytes / object          Object[1]  32 bytes / object
+double[3]  40 bytes / object          double[3]  48 bytes / object</code></pre>
+<p>오른쪽 열이 계산을 뒷받침한다. 압축 클래스 포인터를 끄면 클래스 포인터가 8바이트가 되어 <code>Integer</code>의 헤더가 16바이트, 값까지 20바이트, 8의 배수로 올려 24바이트가 된다. 배열은 길이 필드가 클래스 포인터 뒤(오프셋 16)로 밀려나고 헤더가 8의 배수인 24바이트로 올라가므로 모든 배열이 8바이트씩 커졌다. 객체 크기를 정하는 것은 우리가 선언한 필드보다 헤더와 정렬이라는 사실이 숫자로 보인다. <code>Integer</code>의 실제 데이터는 4바이트인데 객체는 16바이트다.</p>
+<p>이제 두 컬렉터를 비교한다. 값이 모두 1000인 <code>Integer</code> 백만 개의 리스트를 미리 만들어 두고, 같은 합계를 두 방식으로 구하며 할당량을 쟀다.</p>
+<pre><code class="language-java">List<Integer> data = IntStream.range(0, N).map(i -> 1000).boxed().toList();
+for (int r = 0; r < 3; r++) {
+    long t0 = MX.getCurrentThreadAllocatedBytes();
+    int s1 = data.stream().collect(summingInt(x -> x));
+    long d1 = MX.getCurrentThreadAllocatedBytes() - t0;
+    t0 = MX.getCurrentThreadAllocatedBytes();
+    int s2 = data.stream().collect(reducing(0, Integer::sum));
+    long d2 = MX.getCurrentThreadAllocatedBytes() - t0;
+    System.out.printf("round %d: summingInt=%d bytes, reducing=%d bytes (sum %d %d)%n", r, d1, d2, s1, s2);
+}</code></pre>
+<pre data-label="실행 결과 (첫 회차의 값은 실행마다 조금씩 다르다)"><code class="language-text">round 0: summingInt=59520 bytes, reducing=16052432 bytes (sum 1000000000 1000000000)
+round 1: summingInt=240 bytes, reducing=16000256 bytes (sum 1000000000 1000000000)
+round 2: summingInt=240 bytes, reducing=16000256 bytes (sum 1000000000 1000000000)</code></pre>
+<p>두 번째 회차부터 보자. <code>summingInt</code>는 원소 백만 개를 처리하는 동안 240바이트만 할당했다. 스트림 파이프라인과 싱크, <code>int[1]</code> 그릇 하나, 결과 <code>Integer</code> 하나처럼 원소 수와 무관하게 한 번만 만드는 객체들의 고정 비용이다. <code>reducing</code>은 16,000,256바이트, 곧 원소마다 정확히 16바이트를 더 할당했다. <code>Integer</code> 하나의 크기다. 첫 회차의 값이 더 큰 것은 처음 쓰이는 람다의 연결과 클래스 로딩이 섞여 있기 때문이다.</p>
+<p>원소마다 <code>Integer</code>가 생기는 경로는 이렇다. <code>reducing(identity, op)</code>의 accumulator는 OpenJDK 21에서 <code>(a, t) -> { a[0] = op.apply(a[0], t); }</code>다. <code>op</code> 자리의 <code>Integer::sum</code>은 <code>int sum(int, int)</code>를 <code>BinaryOperator<Integer></code>에 맞춘 메서드 참조라서, 람다 팩터리가 만든 클래스가 두 인자를 언박싱해 <code>Integer.sum</code>을 부르고 결과 <code>int</code>를 다시 박싱한다. OpenJDK 21에서 이 변환 코드를 생성하는 <code>java.lang.invoke.TypeConvertingMethodAdapter</code>는 박싱에 <code>valueOf</code>를 쓴다. <code>Integer.valueOf</code>의 Javadoc은 -128부터 127까지의 값은 언제나 캐시한다고 약속하는데, 부분합은 1000, 2000, 3000 …으로 처음부터 그 범위 밖이다. 그래서 원소마다 새 <code>Integer</code>가 만들어지고 칸 <code>a[0]</code>에 저장되며, 이전 부분합은 곧바로 쓰레기가 된다. <code>-XX:+PrintCompilation</code>으로 보면 순회 루프(<code>forEachRemaining</code>)는 첫 회차 안에 C2(4단계)로 컴파일되는데, 그 뒤인 두 번째·세 번째 회차에서도 이 측정에서는 그 할당이 그대로 남았다.</p>
+<aside class="note">숫자 하나를 일반화하지는 말자. 할당량은 JIT가 어떤 객체를 탈출 분석(escape analysis)으로 없애느냐에 따라 코드 모양이나 JDK 버전이 바뀌면 달라질 수 있다. 확실한 것은 구조다. <code>summingInt</code>의 그릇에는 원소마다 새 객체를 만들 이유가 없고, 불변 박싱 값을 바꿔 끼우는 <code>reducing</code>에는 있다. 다운스트림 자리에서 정수를 더할 때 <code>summingInt</code>·<code>summingLong</code>을 먼저 고르는 근거가 이것이다.</aside>
+
+<h3>보정 합산: summingDouble이 double[3]을 드는 이유</h3>
+<p>앞의 표에서 <code>summingDouble</code>의 그릇은 <code>double[3]</code>이었다. 정수 합계라면 칸 하나면 충분한데 실수 합계에는 왜 칸이 세 개나 필요할까? 출발점은 JLS 15.18.2의 한 문장이다. 정수 덧셈은 피연산자가 모두 같은 타입이면 결합법칙이 성립하지만, "부동소수점 덧셈은 결합법칙이 성립하지 않는다(Floating-point addition is not associative)". IEEE 754의 <code>double</code>은 유효 숫자가 53비트뿐이라 덧셈 결과를 가장 가까운 표현 가능한 값으로 반올림하는데, 크기가 크게 다른 두 수를 더하면 작은 수의 아랫자리가 반올림에 잘려 나간다.</p>
+<p>극단적인 예를 만들어 보자. 1.0 하나 뒤에 <code>1e-16</code>을 백만 개 붙인 리스트다. 수학적인 합은 1.0000000001이다. 1.0 근처에서 인접한 두 <code>double</code>의 간격은 <code>Math.ulp(1.0)</code> = 2.220446049250313E-16이고, 1.0에 <code>1e-16</code>을 더한 값은 그 간격의 절반보다 작게 움직이므로 가장 가까운 값인 1.0으로 반올림된다. 백만 번 더해도 매번 같은 일이 일어난다.</p>
+<pre><code class="language-java">List<Double> big = new ArrayList<>();
+big.add(1.0);
+for (int i = 0; i < 1_000_000; i++) big.add(1e-16);
+List<Double> small = new ArrayList<>(big.subList(1, big.size()));
+small.add(1.0);                                          // 같은 값, 1.0을 맨 뒤로
+
+System.out.println("reduce, 1.0 first : " + big.stream().reduce(0.0, Double::sum));
+System.out.println("reduce, 1.0 last  : " + small.stream().reduce(0.0, Double::sum));
+System.out.println("summingDouble     : " + big.stream().collect(summingDouble(d -> d)));
+System.out.println("DoubleStream.sum  : " + big.stream().mapToDouble(d -> d).sum());</code></pre>
+<pre data-label="실행 결과"><code class="language-text">reduce, 1.0 first : 1.0
+reduce, 1.0 last  : 1.0000000001
+summingDouble     : 1.0000000001
+DoubleStream.sum  : 1.0000000001</code></pre>
+<p>단순 덧셈 <code>reduce</code>는 같은 값들을 더했는데 순서에 따라 답이 달라졌다. 작은 수끼리 먼저 더해 <code>1e-10</code>까지 키운 뒤 1.0을 더하면 잘려 나갈 것이 없다. 이것이 결합법칙이 깨진다는 말의 실제 모습이다. 그리고 이것은 이 회차 앞에서 본 <code>Collector</code>의 결합 제약과 정면으로 부딪힌다. 병렬 실행은 데이터를 조각으로 나눠 따로 더한 뒤 합치므로, 덧셈의 순서와 묶음이 순차 실행과 달라진다. <code>summingDouble</code>의 Javadoc이 합계가 값이 기록되는 순서에 따라 달라질 수 있고, 절댓값이 작은 것부터 더하면 대체로 더 정확하다고 따로 적는 이유다. 반면 <code>summingDouble</code>은 1.0을 맨 앞에 두고도 1.0000000001을 냈다. 보정 합산 덕분이다.</p>
+<p>OpenJDK 21의 <code>Collectors.sumWithCompensation</code>은 소스 주석이 Kahan summation이라고 부르는 알고리즘이다. 핵심은 세 줄이다.</p>
+<pre data-label="Collectors.sumWithCompensation (OpenJDK 21)"><code class="language-java">static double[] sumWithCompensation(double[] intermediateSum, double value) {
+    double tmp = value - intermediateSum[1];
+    double sum = intermediateSum[0];
+    double velvel = sum + tmp; // Little wolf of rounding error
+    intermediateSum[1] = (velvel - sum) - tmp;
+    intermediateSum[0] = velvel;
+    return intermediateSum;
+}</code></pre>
+<p><code>a[0]</code>은 지금까지의 합(소스 주석의 표현으로 "높은 자리"), <code>a[1]</code>은 보정값("낮은 자리")이다. <code>velvel = sum + tmp</code>에서 반올림이 일어나면, <code>velvel - sum</code>은 "실제로 더해진 양"이고 거기서 <code>tmp</code>를 빼면 "더하려던 양과의 차이", 곧 이번 덧셈에서 생긴 반올림 오차가 된다. 이 오차를 <code>a[1]</code>에 기억해 두었다가 다음 값을 더할 때 <code>value - a[1]</code>로 미리 빼 준다. 잘려 나간 아랫자리를 버리지 않고 다음 덧셈으로 넘기는 것이다. 같은 세 줄을 그대로 옮겨 1.0과 <code>1e-16</code> 세 개를 더하며 칸의 값을 출력해 보면 오차가 넘어가는 모습이 보인다.</p>
+<pre data-label="실행 결과 (sumWithCompensation과 같은 식을 한 단계씩 출력)"><code class="language-text">add 1.0 -> sum=1.0 c=0.0
+add 1.0E-16 -> sum=1.0 c=-1.0E-16
+add 1.0E-16 -> sum=1.0000000000000002 c=2.2044604925031312E-17
+add 1.0E-16 -> sum=1.0000000000000002 c=-7.795539507496869E-17</code></pre>
+<p>두 번째 줄에서 <code>1e-16</code>은 합에 반영되지 못했지만 보정값 <code>c</code>에 -1.0E-16으로 남았다. 세 번째 줄에서는 다음 값 <code>1e-16</code>에서 <code>c</code>를 뺀 2.0E-16을 더하므로, 이번에는 간격의 절반을 넘어 합이 한 칸(2.22E-16) 위로 올라간다. 대신 너무 많이 올라간 만큼 <code>c</code>가 양수로 바뀐다. 단순 덧셈이었다면 세 번 모두 1.0에 머물렀을 것이다. 마지막 결과는 <code>computeFinalSum</code>이 <code>a[0] - a[1]</code>로 계산한다. 병렬 실행의 combiner도 같은 원리를 지킨다. <code>(a, b) -> { sumWithCompensation(a, b[0]); a[2] += b[2]; return sumWithCompensation(a, -b[1]); }</code>는 오른쪽 그릇의 합을 더한 뒤 오른쪽 그릇이 들고 있던 보정값까지 반영한다.</p>
+<p>세 번째 칸 <code>a[2]</code>는 보정 없는 단순 합이다. 소스 주석은 같은 부호의 무한대가 들어온 경우에 올바른 결과를 내기 위한 것이라고 설명한다. 보정 계산에는 <code>velvel - sum</code> 같은 뺄셈이 있어서, <code>velvel</code>과 <code>tmp</code>가 무한대가 되면 무한대에서 무한대를 빼 NaN이 나온다. 실제로 <code>Stream.of(Double.POSITIVE_INFINITY, 1.0)</code>을 세 줄 공식만으로 더하면 NaN이 되지만, <code>summingDouble</code>은 <code>Infinity</code>를 돌려준다. <code>computeFinalSum</code>이 보정 결과가 NaN이고 단순 합이 무한대이면 단순 합을 고르기 때문이다. <code>DoubleStream.sum()</code>도 OpenJDK 21의 <code>DoublePipeline</code>에서 같은 두 함수를 써서 구현되어 있고, <code>averagingDouble</code>은 여기에 개수 칸을 하나 더해 <code>double[4]</code>를 쓴다.</p>
+<p>보정 합산이 결합법칙 문제를 없애 주는 것은 아니다. 오차를 크게 줄일 뿐, 결과가 덧셈 순서와 완전히 무관해진다는 보장은 Javadoc 어디에도 없다. 금액처럼 정확한 십진 계산이 필요한 값은 처음부터 <code>double</code>이 아니라 정수(원 단위의 <code>long</code>)나 <code>BigDecimal</code>로 모아야 하고, <code>BigDecimal</code>이라면 <code>reducing(BigDecimal.ZERO, BigDecimal::add)</code>처럼 앞 절의 비용(원소마다 새 객체)을 감수하게 된다.</p>
+
+<h3>다운스트림 컬렉터 1: groupingBy가 하는 일</h3>
+<p>SQL의 <code>GROUP BY</code>처럼 원소를 어떤 기준으로 묶는 컬렉터가 <code>groupingBy</code>다. 묶는 기준을 계산하는 함수를 분류 함수(classifier)라고 하고, 그 결과가 맵의 키가 된다. 가장 단순한 형태부터 보자.</p>
+<pre><code class="language-java">Map<String, List<Order>> byCity = ORDERS.stream().collect(groupingBy(Order::city));
+System.out.println(byCity.keySet() + " " + byCity.getClass().getSimpleName()
+    + " " + byCity.get("서울").getClass().getSimpleName());
+System.out.println(byCity.get("서울"));</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[서울, 부산, 대구] HashMap ArrayList
+[Order[customer=민수, city=서울, category=도서, amount=12000], Order[customer=민수, city=서울, category=전자, amount=89000], Order[customer=서연, city=서울, category=식품, amount=15000]]</code></pre>
+<p>각 도시의 리스트 안에서는 원소가 스트림에 나온 순서대로 들어 있다. 반면 키의 순서(서울, 부산, 대구)는 <code>HashMap</code>의 구현에서 나온 것이고, Javadoc은 반환되는 <code>Map</code>과 <code>List</code>의 타입·가변성·직렬화 가능성·스레드 안전성을 보장하지 않는다고 적는다. 지금 구현이 <code>HashMap</code>과 <code>ArrayList</code>를 쓴다는 것은 소스를 보면 알 수 있다. <code>groupingBy</code>는 세 가지 오버로드가 있고, 짧은 것이 긴 것을 부르는 사슬이다.</p>
+<pre data-label="Collectors.groupingBy의 오버로드 사슬 (OpenJDK 21)"><code class="language-java">groupingBy(classifier)
+    == groupingBy(classifier, toList())
+groupingBy(classifier, downstream)
+    == groupingBy(classifier, HashMap::new, downstream)
+groupingBy(classifier, mapFactory, downstream)   // 실제 구현은 여기에만 있다</code></pre>
+<p>두 번째 인자 <code>downstream</code>이 이 절의 주인공인 다운스트림 컬렉터다. <code>groupingBy</code>는 "어떻게 묶을지"만 정하고, 묶인 그룹 하나하나를 "어떻게 줄일지"는 다른 컬렉터에 맡긴다. 인자 하나짜리 <code>groupingBy</code>는 그 역할을 <code>toList()</code>에 맡긴 것이다. 세 번째 형태의 본체를 보면 이 위임이 어떻게 이루어지는지 정확히 보인다.</p>
+<pre data-label="Collectors.groupingBy(classifier, mapFactory, downstream) (OpenJDK 21, 발췌)"><code class="language-java">Supplier<A> downstreamSupplier = downstream.supplier();
+BiConsumer<A, ? super T> downstreamAccumulator = downstream.accumulator();
+BiConsumer<Map<K, A>, T> accumulator = (m, t) -> {
+    K key = Objects.requireNonNull(classifier.apply(t), "element cannot be mapped to a null key");
+    A container = m.computeIfAbsent(key, k -> downstreamSupplier.get());
+    downstreamAccumulator.accept(container, t);
+};
+BinaryOperator<Map<K, A>> merger = Collectors.<K, A, Map<K, A>>mapMerger(downstream.combiner());
+Supplier<Map<K, A>> mangledFactory = (Supplier<Map<K, A>>) mapFactory;
+
+if (downstream.characteristics().contains(Collector.Characteristics.IDENTITY_FINISH)) {
+    return new CollectorImpl<>(mangledFactory, accumulator, merger, CH_ID);
+}
+else {
+    Function<A, A> downstreamFinisher = (Function<A, A>) downstream.finisher();
+    Function<Map<K, A>, M> finisher = intermediate -> {
+        intermediate.replaceAll((k, v) -> downstreamFinisher.apply(v));
+        M castResult = (M) intermediate;
+        return castResult;
+    };
+    return new CollectorImpl<>(mangledFactory, accumulator, merger, finisher, CH_NOID);
+}</code></pre>
+<p>이 코드를 네 함수 단위로 읽어 보자. <b>supplier</b>는 맵 팩터리다. 바깥 그릇은 맵 하나다. 다만 누적하는 동안 이 맵의 값은 최종 결과 <code>D</code>가 아니라 다운스트림의 그릇 <code>A</code>다. 그래서 내부에서는 맵 팩터리를 <code>Supplier<Map<K, A>></code>로 캐스팅해(<code>mangledFactory</code>) 쓴다. <b>accumulator</b>는 원소마다 세 가지 일을 한다. 분류 함수로 키를 계산하고(null이면 즉시 예외), <code>computeIfAbsent</code>로 그 키의 다운스트림 그릇을 꺼내되 없으면 다운스트림의 supplier로 새로 만들어 넣고, 그 그릇에 다운스트림의 accumulator로 원소를 넣는다. <b>combiner</b>는 두 맵을 합치는데, 같은 키가 양쪽에 있으면 다운스트림의 combiner로 두 그릇을 합친다. <b>finisher</b>는 다운스트림이 <code>IDENTITY_FINISH</code>면 필요 없고, 아니면 맵의 모든 값을 <code>replaceAll</code>로 다운스트림 finisher의 결과로 바꿔 끼운 뒤 그 맵을 그대로 <code>M</code>으로 캐스팅해 돌려준다.</p>
+<p>말로만 보면 추상적이니 호출을 직접 관찰하자. 앞 절의 로그 컬렉터와 같은 방식으로 금액을 더하는 다운스트림을 만들고, 키 순서가 보이도록 맵 팩터리로 <code>LinkedHashMap::new</code>를 준다. 주문 앞쪽 네 건만 쓴다.</p>
+<pre><code class="language-java">Collector<Order, int[], Integer> tracing = Collector.of(
+    () -> { System.out.println("   supplier"); return new int[1]; },
+    (a, o) -> { System.out.println("   accumulator " + o.city() + " " + o.amount()); a[0] += o.amount(); },
+    (a, b) -> { a[0] += b[0]; return a; },
+    a -> { System.out.println("   finisher " + a[0]); return a[0]; });
+Map<String, Integer> traced = ORDERS.stream().limit(4)
+    .collect(groupingBy(Order::city, LinkedHashMap::new, tracing));
+System.out.println(traced);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">   supplier
+   accumulator 서울 12000
+   supplier
+   accumulator 부산 250000
+   accumulator 서울 89000
+   supplier
+   accumulator 대구 18000
+   finisher 101000
+   finisher 250000
+   finisher 18000
+{서울=101000, 부산=250000, 대구=18000}</code></pre>
+<p>추적해 보자. 첫 원소(서울, 12000)가 오면 맵에 "서울"이 없으므로 <code>computeIfAbsent</code>가 다운스트림 supplier를 불러 <code>int[1]</code>을 만들고 넣는다. 그다음 그 배열에 12000을 더한다. 두 번째 원소(부산)도 같은 과정을 거친다. 세 번째 원소(서울, 89000)는 "서울"의 배열이 이미 있으므로 supplier 없이 accumulator만 불린다. 네 번째 원소(대구)는 새 키다. 다운스트림의 supplier는 원소 수(4)가 아니라 <b>키 수(3)</b>만큼 불렸다. 원소가 다 들어간 뒤 바깥 컬렉터의 finisher가 <code>replaceAll</code>을 돌며 키마다 다운스트림 finisher를 한 번씩 부른다. 그래서 finisher 출력 세 줄은 모든 accumulator 출력이 끝난 뒤에, 맵의 순회 순서대로 나온다.</p>
+<pre class="diagram">누적이 끝난 직후 (맵의 값은 다운스트림 그릇 A)        finisher 후 (같은 맵 객체, 값만 교체)
+
+LinkedHashMap<String, int[]>                          LinkedHashMap<String, Integer>
+ ├─ "서울" ──▶ int[1] { 101000 }                       ├─ "서울" ──▶ Integer 101000
+ ├─ "부산" ──▶ int[1] { 250000 }    replaceAll ──▶     ├─ "부산" ──▶ Integer 250000
+ └─ "대구" ──▶ int[1] {  18000 }    (키마다 finisher)  └─ "대구" ──▶ Integer  18000
+
+    int[1] 배열 세 개는 교체된 뒤 아무도 참조하지 않으므로 GC 대상이 된다.
+    맵 객체는 새로 만들지 않는다. 같은 객체를 (M)으로 캐스팅해 돌려줄 뿐이다.</pre>
+<p>마지막 줄이 이 구현의 핵심 요령이다. 누적하는 동안 맵의 실제 값 타입은 <code>int[]</code>이고, finisher가 끝나면 <code>Integer</code>다. 자바 제네릭은 소거되므로 실행 시점의 <code>LinkedHashMap</code> 객체는 값의 타입을 모른다. 그래서 같은 맵 객체를 "값이 <code>A</code>인 맵"으로 쓰다가 값을 모두 바꾼 뒤 "값이 <code>D</code>인 맵"으로 캐스팅해도 실행 중에는 아무 문제가 없다. 새 맵을 만들고 항목을 복사하는 비용을 아끼는 대신, 소스에 <code>@SuppressWarnings("unchecked")</code>가 붙은 비검사 캐스팅을 두 번 하는 설계다. 이 캐스팅이 안전한 것은 finisher가 모든 값을 빠짐없이 바꾼 뒤에만 맵이 밖으로 나가기 때문이다.</p>
+<x-visual id="java-adv3-07-grouping-memory" title="groupingBy의 중간 맵과 finisher의 값 교체" kind="메모리 구조도" ratio="16:9">
+<x-hint>누적 중인 맵의 값이 다운스트림 그릇(int 배열)이고, finisher가 같은 맵 객체의 값만 결과 객체로 바꿔 끼운다는 것을 보여 준다.</x-hint>
+<x-prompt>왼쪽과 오른쪽 두 상태를 비교하는 메모리 구조도, 흰 배경, 깔끔한 벡터 스타일. 왼쪽 위 제목 "누적 중", 오른쪽 위 제목 "finisher 후". 양쪽 모두 같은 파란 테두리의 맵 상자(라벨 "LinkedHashMap 같은 객체")가 있고, 그 안에 키 칸 3개 "서울", "부산", "대구"가 세로로 있다. 왼쪽에서는 각 키에서 오른쪽으로 화살표가 나가 작은 회색 배열 상자 "int[1] 101000", "int[1] 250000", "int[1] 18000"을 가리킨다. 오른쪽에서는 같은 키들이 주황색 원형 객체 "Integer 101000", "Integer 250000", "Integer 18000"을 가리킨다. 두 상태 사이에 굵은 화살표가 있고 라벨은 "replaceAll: 키마다 finisher". 오른쪽 아래 구석에 흐린 회색으로 떨어져 나간 배열 3개와 라벨 "GC 대상"을 둔다.</x-prompt>
+<x-caption>groupingBy는 누적 중에는 다운스트림 그릇을 값으로 들고 있다가, 마지막에 같은 맵 객체의 값만 결과로 바꿔 끼운다.</x-caption>
+</x-visual>
+<p>다운스트림이 <code>toList()</code>처럼 <code>IDENTITY_FINISH</code>면 그릇이 곧 결과이므로 바꿔 끼울 것이 없다. 그때 <code>groupingBy</code> 전체도 <code>CH_ID</code>, 곧 <code>IDENTITY_FINISH</code>가 되어 <code>Stream.collect</code>의 마지막 단계에서 finisher 호출 자체가 생략된다. 실제로 <code>groupingBy(Order::city).characteristics()</code>는 <code>[IDENTITY_FINISH]</code>, <code>groupingBy(Order::city, counting()).characteristics()</code>는 <code>[]</code>를 출력한다. 특성이 컬렉터를 조립할 때 함께 전파되는 것이다.</p>
+<p>분류 함수가 null을 돌려주면 <code>requireNonNull</code>이 <code>NullPointerException</code>을 던지고, 메시지는 <code>element cannot be mapped to a null key</code>다. 그릇이 null 키를 받을 수 있는 <code>HashMap</code>이어도 이 검사가 맵에 넣기 전에 먼저 실행되므로, <code>toMap</code>과 달리 <code>groupingBy</code>에는 null 키가 들어갈 수 없다. 키가 없을 수 있는 데이터라면 분류 함수 안에서 "미분류" 같은 대체 키로 바꾸거나, 앞에서 <code>filter</code>로 걸러야 한다. 맵 팩터리를 바꾸는 것도 흔한 일이다. 키 순서로 출력하고 싶으면 <code>TreeMap::new</code>, 키가 처음 등장한 순서를 지키고 싶으면 <code>LinkedHashMap::new</code>, 키가 열거형이면 <code>() -> new EnumMap<>(Kind.class)</code> 같은 식이다.</p>
+<p>이제 앞 절의 컬렉터들을 다운스트림 자리에 넣어 보자. 결과가 키 순서로 나오도록 모두 <code>TreeMap::new</code>를 줬다.</p>
+<pre><code class="language-java">Map<String, Long> count = ORDERS.stream().collect(groupingBy(Order::city, TreeMap::new, counting()));
+Map<String, Integer> sum = ORDERS.stream().collect(groupingBy(Order::city, TreeMap::new, summingInt(Order::amount)));
+Map<String, Double> avg = ORDERS.stream().collect(groupingBy(Order::city, TreeMap::new, averagingInt(Order::amount)));
+Map<String, Optional<Order>> max = ORDERS.stream()
+    .collect(groupingBy(Order::city, TreeMap::new, maxBy(Comparator.comparingInt(Order::amount))));
+System.out.println(count);
+System.out.println(sum);
+System.out.println(avg);
+System.out.println(max.get("서울"));</code></pre>
+<pre data-label="실행 결과"><code class="language-text">{대구=2, 부산=2, 서울=3}
+{대구=138000, 부산=282000, 서울=116000}
+{대구=69000.0, 부산=141000.0, 서울=38666.666666666664}
+Optional[Order[customer=민수, city=서울, category=전자, amount=89000]]</code></pre>
+<p>각 줄의 결과 맵 타입을 보면 다운스트림의 결과 타입 <code>D</code>가 그대로 맵의 값 타입이 된다. <code>counting()</code>의 <code>Long</code>, <code>summingInt</code>의 <code>Integer</code>, <code>averagingInt</code>의 <code>Double</code>, <code>maxBy</code>의 <code>Optional<Order></code>다. <code>maxBy</code>의 값이 <code>Optional</code>인 것은 조금 어색하다. <code>groupingBy</code>는 원소가 하나라도 들어온 키만 맵에 만들기 때문에 실제로는 빈 그룹이 생기지 않는다. 그런데 <code>maxBy</code>는 자기가 어디에 쓰일지 모르므로 빈 입력을 대비해 언제나 <code>Optional</code>을 돌려준다. 이 포장을 벗기는 방법은 다음 절의 <code>collectingAndThen</code>이다.</p>
+
+<h3>groupingBy 아래의 HashMap: computeIfAbsent, 크기 조정, 키 하나의 메모리</h3>
+<p>지금까지 <code>groupingBy</code>를 "원소마다 <code>computeIfAbsent</code> 한 번"으로 설명했다. 기본 그릇이 <code>HashMap</code>이므로 그 한 번 안에서 무슨 일이 일어나는지가 곧 <code>groupingBy</code>의 원소당 비용이다. 이 절은 OpenJDK 21의 <code>java.util.HashMap</code> 소스와 직접 측정으로 그 안을 들여다본다. 해시 테이블의 크기와 배치는 Javadoc이 정하지 않는 구현 세부이므로 모두 OpenJDK 21 기준이다.</p>
+<h4>원소 하나가 버킷을 찾는 길</h4>
+<p><code>computeIfAbsent</code>는 먼저 <code>hash(key)</code>를 계산한다. 구현은 <code>(h = key.hashCode()) ^ (h >>> 16)</code>, 곧 키의 <code>hashCode()</code>에 그 위쪽 16비트를 아래쪽에 XOR로 섞은 값이다. 테이블의 길이 n은 언제나 2의 거듭제곱이고 버킷 위치는 <code>(n - 1) & hash</code>, 곧 해시의 아래쪽 비트 몇 개로 정해지므로, 위쪽 비트만 다른 해시들이 같은 버킷에 몰리지 않도록 위쪽 비트를 아래로 내려 섞는 것이다. 버킷을 찾으면 그 안의 연결 리스트를 따라가며 <code>hash</code>가 같고 키가 같은(<code>==</code> 또는 <code>equals</code>) 노드를 찾는다. 찾았고 값이 null이 아니면 그 값을 바로 돌려준다. <code>groupingBy</code>에서 이미 본 키가 다시 올 때의 경로이고, 해시 계산 한 번과 버킷 탐색 한 번으로 끝난다. 없으면 매핑 함수(<code>groupingBy</code>에서는 다운스트림 supplier를 부르는 람다)를 호출하고, 새 노드를 버킷 앞에 연결한 뒤 <code>size</code>를 늘린다.</p>
+<p><code>get</code>으로 찾아보고 없으면 <code>put</code>하는 코드라면 해시 계산과 버킷 탐색을 두 번 해야 한다. <code>computeIfAbsent</code>는 한 번의 탐색 결과(버킷 위치와 그 버킷의 첫 노드)를 그대로 써서 삽입까지 끝낸다. 하나 더 있다. 매핑 함수를 호출하기 전 <code>modCount</code>를 기억해 두었다가 호출 뒤 달라졌으면 <code>ConcurrentModificationException</code>을 던진다. 매핑 함수가 같은 맵을 고치면 방금 찾아 둔 버킷 정보가 무효가 되기 때문이다. <code>groupingBy</code>의 매핑 함수는 다운스트림 그릇을 만들기만 하므로 이 검사에 걸리지 않는다.</p>
+<p>한 버킷에 노드가 몰리면 탐색이 길어진다. OpenJDK 21의 <code>HashMap</code>은 한 버킷의 리스트 길이가 <code>TREEIFY_THRESHOLD</code>(8)에 이르면 <code>treeifyBin</code>을 부르는데, 테이블 길이가 <code>MIN_TREEIFY_CAPACITY</code>(64)보다 작으면 트리로 바꾸는 대신 테이블을 키운다. 키의 <code>hashCode()</code>가 나쁘게 겹치는 분류 함수라면 <code>groupingBy</code>의 원소당 비용이 이 경로로 늘어난다.</p>
+<h4>크기 조정은 언제 일어나는가</h4>
+<p><code>HashMap</code>의 Javadoc은 항목 수가 부하율(load factor)과 현재 용량의 곱을 넘으면 테이블을 대략 두 배 크기로 다시 만든다(rehash)고 설명한다. 기본 용량은 16, 기본 부하율은 0.75이므로 첫 임계값(threshold)은 12다. 서로 다른 키 1000개가 각각 두 번씩 나오는 데이터(<code>k0, k0, k1, k1, …</code>)를 <code>groupingBy</code>하면서 테이블 길이가 바뀌는 순간을 출력해 보자. 맵 팩터리로 <code>computeIfAbsent</code>를 재정의한 <code>HashMap</code> 하위 클래스를 넘기고, 비공개 필드 <code>table</code>의 길이를 리플렉션으로 읽었다. <code>java.util</code> 패키지의 비공개 필드를 읽으므로 <code>--add-opens java.base/java.util=ALL-UNNAMED</code>로 실행해야 하는 관찰용 코드다.</p>
+<pre><code class="language-java">static class Probe<K, V> extends HashMap<K, V> {
+    int calls, last;
+    Probe() { super(); }
+    Probe(int initialCapacity) { super(initialCapacity); }
+    @Override public V computeIfAbsent(K key, Function<? super K, ? extends V> f) {
+        calls++;
+        int before = size();
+        V v = super.computeIfAbsent(key, f);
+        int c = cap(this);                       // 리플렉션으로 읽은 table.length (null이면 0)
+        if (c != last) {
+            System.out.println("  call#" + calls + " size(before)=" + before + " table " + last + " -> " + c);
+            last = c;
+        }
+        return v;
+    }
+}
+
+List<Integer> data = IntStream.range(0, 2000).map(i -> i / 2).boxed().toList();
+// ... 머리글과 "keys=" 줄을 찍는 println, 리플렉션으로 table을 읽는 cap()은 생략
+data.stream().collect(groupingBy(i -> i, () -> new Probe<>(), counting()));
+data.stream().collect(groupingBy(i -> i, () -> new Probe<>((int) Math.ceil(1000 / 0.75)), counting()));</code></pre>
+<pre data-label="실행 결과"><code class="language-text">default HashMap:
+  call#1 size(before)=0 table 0 -> 16
+  call#26 size(before)=13 table 16 -> 32
+  call#50 size(before)=25 table 32 -> 64
+  call#98 size(before)=49 table 64 -> 128
+  call#194 size(before)=97 table 128 -> 256
+  call#386 size(before)=193 table 256 -> 512
+  call#770 size(before)=385 table 512 -> 1024
+  call#1538 size(before)=769 table 1024 -> 2048
+  keys=1000
+HashMap.newHashMap(1000) capacity arg = 1334
+  call#1 size(before)=0 table 0 -> 2048
+  keys=1000</code></pre>
+<p>첫 줄부터 읽자. <code>new HashMap<>()</code>은 생성할 때 테이블을 만들지 않는다. 첫 <code>computeIfAbsent</code>에서 <code>table == null</code>이라 <code>resize()</code>가 길이 16짜리 테이블을 처음 만든다. 그 뒤 테이블은 16, 32, 64 …로 두 배씩 커져 2048에서 멈췄다. 키 1000개를 담는 동안 <code>resize()</code>가 여덟 번 불렸고, 그중 일곱 번은 기존 노드를 모두 새 테이블로 옮기는 작업이었다.</p>
+<p>호출 번호를 보면 미묘한 점이 하나 있다. 13번째 키(<code>12</code>)는 25번째 호출에서 삽입되어 크기가 13이 되었다. 그런데 테이블이 커진 것은 26번째 호출, 같은 키 <code>12</code>가 두 번째로 나와서 <b>이미 있는 키를 찾기만 하는</b> 호출이었다. 소스를 보면 이유가 있다. <code>put</code>이 쓰는 <code>putVal</code>은 삽입한 뒤 <code>if (++size > threshold) resize();</code>로 검사하지만, <code>computeIfAbsent</code>는 탐색을 시작하기 <b>전에</b> <code>size > threshold</code>이면 먼저 <code>resize()</code>한다. 그래서 임계값을 넘긴 다음 호출이 비용을 치른다. 결과에는 아무 차이가 없지만, "크기 조정은 삽입할 때만 일어난다"고 단정하면 이 출력을 설명할 수 없다.</p>
+<p><code>resize()</code>는 노드를 하나하나 다시 해시하지 않는다. 노드에 저장된 <code>hash</code>를 그대로 쓰고, 길이가 두 배가 되므로 새 위치를 정하는 비트가 하나 늘어날 뿐이다. 소스는 <code>(e.hash & oldCap) == 0</code>이면 같은 인덱스 j, 아니면 <code>j + oldCap</code>으로 노드를 나누어(lo 리스트와 hi 리스트) 원래 순서를 지키며 옮긴다. 그래도 모든 노드를 한 번씩 건드리고 새 배열을 할당하는 일이다. 키 수를 미리 알면 이 반복을 없앨 수 있다. 자바 19에 들어온 <code>HashMap.newHashMap(int numMappings)</code>는 Javadoc의 표현으로 초기 용량이 "대체로(generally) 그만큼의 항목을 크기 조정 없이 넣을 수 있을 만큼 큰" 맵을 만든다. 구현은 <code>new HashMap<>((int) Math.ceil(numMappings / 0.75))</code>이고, 생성자는 그 값을 2의 거듭제곱으로 올린 2048을 임계값 자리에 기억해 두었다가 첫 삽입에서 길이 2048의 테이블을 한 번에 만든다. 위 출력의 두 번째 실행이 정확히 그렇다. <code>groupingBy</code>에서는 맵 팩터리로 <code>() -> HashMap.newHashMap(expectedKeys)</code>를 넘기면 된다. <code>new HashMap<>(1000)</code>처럼 키 수를 그대로 용량으로 넘기면 용량 1024에 임계값 768이 되어 키 1000개를 담는 도중 한 번 더 커진다는 점이 이 메서드가 따로 생긴 이유다.</p>
+<p>마지막으로 바깥 finisher의 <code>replaceAll</code>을 소스로 확인하면 앞 절의 그림이 더 정확해진다. <code>HashMap.replaceAll</code>은 테이블 배열을 앞에서부터 돌며 각 노드의 <code>value</code> 필드만 <code>e.value = function.apply(e.key, e.value)</code>로 바꾼다. 키는 그대로이니 해시도 버킷 위치도 그대로이고, 크기 조정도 노드 할당도 없다. 끝난 뒤 <code>modCount</code>가 달라졌으면 <code>ConcurrentModificationException</code>을 던진다. 다운스트림 finisher가 맵을 고치지 않는 한 이 단계는 키 수에 비례하는 단순한 순회다.</p>
+<h4>키 하나가 차지하는 메모리</h4>
+<p>앞 절의 객체 크기 계산을 <code>HashMap</code>의 노드에도 적용할 수 있다. <code>HashMap.Node</code>의 필드는 <code>final int hash</code>, <code>final K key</code>, <code>V value</code>, <code>Node<K,V> next</code>다. 헤더 12바이트에 <code>int</code> 4바이트와 압축 참조 세 개 12바이트를 더하면 28바이트, 8의 배수로 올려 32바이트다. 여기에 테이블 배열의 칸(압축 참조 4바이트)이 키마다 몇 개씩 몫으로 붙는다. 서로 다른 키 2의 20제곱 개(1,048,576개, 모두 1000 이상의 <code>Integer</code>로 미리 만들어 둠)로 재 보자.</p>
+<pre><code class="language-java">int n = 1 << 20;
+List<Integer> keys = IntStream.range(1000, 1000 + n).boxed().toList();
+// (1) 미리 크기를 잡은 HashMap에 put
+HashMap<Integer, Integer> m = HashMap.newHashMap(n);
+for (Integer k : keys) m.put(k, k);
+// (2) 같은 키로 groupingBy + summingInt, 맵 팩터리도 미리 크기를 잡는다
+Map<Integer, Integer> g = keys.stream()
+    .collect(groupingBy(k -> k, () -> HashMap.newHashMap(n), summingInt(k -> k)));
+// (3) 각 키가 두 번씩 나오는 리스트로 (2)를 반복
+// 각각 getCurrentThreadAllocatedBytes() 차이를 n으로 나눈다</code></pre>
+<pre data-label="측정값 정리 (세 번씩 반복한 측정의 둘째·셋째 회차 값, -Xmx2g)"><code class="language-text">put                        40.00 B/key   (table 2097152 slots)
+groupingBy + summingInt     96.00 B/key
+groupingBy, 키마다 원소 2개  112.00 B/key</code></pre>
+<p>숫자를 하나씩 맞춰 보자. <code>put</code>의 40바이트는 노드 32바이트와 테이블 몫 8바이트다. 1,048,576 / 0.75를 2의 거듭제곱으로 올린 테이블 길이는 2,097,152이고, 칸마다 4바이트이므로 테이블 전체가 8MB, 키 하나에 8바이트다. <code>groupingBy</code>의 96바이트는 여기에 다운스트림 그릇 <code>int[1]</code> 24바이트, finisher가 만든 결과 <code>Integer</code> 16바이트(합계가 1000 이상이라 캐시 밖), 그리고 16바이트가 더 붙은 값이다. 마지막 16바이트의 정체는 세 번째 줄이 알려 준다. 같은 키가 한 번 더 나오면 새 노드도 새 그릇도 생기지 않는데, 원소 하나마다 16바이트가 늘었다. 원소마다 실행되는 코드 중 객체를 만드는 것은 <code>groupingBy</code> accumulator 안의 <code>m.computeIfAbsent(key, k -> downstreamSupplier.get())</code>, 곧 지역 변수 <code>downstreamSupplier</code>를 캡처하는 람다다. 캡처한 값을 필드 하나로 든 객체는 헤더 12바이트와 참조 4바이트로 16바이트다.</p>
+<p>이 해석은 따로 확인했다. 키 하나만 든 맵에 <code>computeIfAbsent("k", k -> sup.get())</code>(지역 변수 <code>sup</code>를 캡처)와 <code>computeIfAbsent("k", k -> new int[1])</code>(아무것도 캡처하지 않음)를 백만 번씩 호출하면, 키가 이미 있어서 람다가 한 번도 실행되지 않는데도 앞의 것은 호출마다 16.00바이트, 뒤의 것은 0.00바이트를 할당했다. OpenJDK의 람다 구현에서 캡처하지 않는 람다는 호출 지점마다 미리 만든 인스턴스 하나를 재사용하지만, 캡처하는 람다는 식이 평가될 때마다 캡처한 값을 담은 새 인스턴스를 만든다. 이 측정에서는 JIT 컴파일 뒤에도 그 할당이 제거되지 않았다. 다만 이것은 이 버전, 이 코드 모양에서 측정한 값이다. 탈출 분석이 이런 할당을 없앨 수 있는지는 인라이닝 결과에 달려 있으므로, 다른 JDK 버전이나 다른 호출 맥락에서 같은 숫자가 나온다고 단정할 수 없다.</p>
+<aside class="keyidea"><span>이 절의 핵심</span><p>OpenJDK 21에서 <code>groupingBy(f, summingInt(g))</code>의 비용은 "키마다 노드 32바이트 + 테이블 몫 + 다운스트림 그릇 + 결과 객체"와 "원소마다 해시 계산, 버킷 탐색, 다운스트림 accumulator 한 번(그리고 이 측정에서는 캡처 람다 16바이트)"으로 나뉜다. 키 수를 알면 <code>HashMap.newHashMap</code>으로 크기 조정을 없앨 수 있고, 다운스트림 그릇이 작을수록 키마다의 메모리가 줄어든다.</p></aside>
+
+<h3>다운스트림 컬렉터 2: 컬렉터를 감싸는 컬렉터</h3>
+<p><code>Collectors</code>에는 컬렉터를 받아 컬렉터를 돌려주는 메서드가 여럿 있다. 고차 함수(1회)의 컬렉터 판이다. 이들은 새 그릇을 만들지 않고, 안쪽 컬렉터의 네 함수 중 일부만 바꿔 끼운 새 <code>CollectorImpl</code>을 만든다. 무엇을 바꿔 끼우는지가 각 메서드의 정체다.</p>
+<h4>mapping, filtering, flatMapping: accumulator 앞에 끼어들기</h4>
+<pre data-label="Collectors.mapping과 filtering (OpenJDK 21)"><code class="language-java">public static <T, U, A, R>
+Collector<T, ?, R> mapping(Function<? super T, ? extends U> mapper,
+                           Collector<? super U, A, R> downstream) {
+    BiConsumer<A, ? super U> downstreamAccumulator = downstream.accumulator();
+    return new CollectorImpl<>(downstream.supplier(),
+                               (r, t) -> downstreamAccumulator.accept(r, mapper.apply(t)),
+                               downstream.combiner(), downstream.finisher(),
+                               downstream.characteristics());
+}
+
+public static <T, A, R>
+Collector<T, ?, R> filtering(Predicate<? super T> predicate,
+                             Collector<? super T, A, R> downstream) {
+    BiConsumer<A, ? super T> downstreamAccumulator = downstream.accumulator();
+    return new CollectorImpl<>(downstream.supplier(),
+                               (r, t) -> {
+                                   if (predicate.test(t)) {
+                                       downstreamAccumulator.accept(r, t);
+                                   }
+                               },
+                               downstream.combiner(), downstream.finisher(),
+                               downstream.characteristics());
+}</code></pre>
+<p>supplier, combiner, finisher, 특성은 안쪽 컬렉터의 것을 그대로 넘기고 accumulator만 감쌌다. <code>mapping</code>은 원소를 변환한 뒤 안쪽 accumulator에 넘기고, <code>filtering</code>(자바 9)은 조건을 통과한 원소만 넘긴다. 스트림의 중간 연산 <code>map</code>, <code>filter</code>와 하는 일이 같지만, 위치가 다르다. 스트림의 <code>map</code>은 그룹으로 나누기 <b>전에</b> 모든 원소에 적용되고, 컬렉터의 <code>mapping</code>은 그룹으로 나눈 <b>뒤</b> 각 그룹 안에서 적용된다. 분류에는 원래 원소(주문의 도시)가 필요하고 결과에는 다른 값(고객 이름)이 필요할 때 <code>mapping</code>이 필요한 이유다.</p>
+<pre><code class="language-java">Map<String, List<String>> names = ORDERS.stream()
+    .collect(groupingBy(Order::city, TreeMap::new, mapping(Order::customer, toList())));
+Map<String, TreeSet<String>> uniq = ORDERS.stream()
+    .collect(groupingBy(Order::city, TreeMap::new, mapping(Order::customer, toCollection(TreeSet::new))));
+Map<String, String> joined = ORDERS.stream()
+    .collect(groupingBy(Order::city, TreeMap::new, mapping(Order::customer, joining(","))));
+System.out.println(names);
+System.out.println(uniq);
+System.out.println(joined);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">{대구=[현우, 현우], 부산=[지영, 지영], 서울=[민수, 민수, 서연]}
+{대구=[현우], 부산=[지영], 서울=[민수, 서연]}
+{대구=현우,현우, 부산=지영,지영, 서울=민수,민수,서연}</code></pre>
+<p><code>filter</code>와 <code>filtering</code>의 위치 차이는 결과의 <b>키 집합</b>을 바꾼다. 10만 원 이상 주문의 도시별 건수를 두 방식으로 세어 보자.</p>
+<pre><code class="language-java">Map<String, Long> f1 = ORDERS.stream().filter(o -> o.amount() >= 100000)
+    .collect(groupingBy(Order::city, TreeMap::new, counting()));
+Map<String, Long> f2 = ORDERS.stream()
+    .collect(groupingBy(Order::city, TreeMap::new, filtering(o -> o.amount() >= 100000, counting())));
+System.out.println("filter first=" + f1);
+System.out.println("filtering    =" + f2);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">filter first={대구=1, 부산=1}
+filtering    ={대구=1, 부산=1, 서울=0}</code></pre>
+<p>스트림의 <code>filter</code>를 먼저 쓰면 서울 주문은 <code>groupingBy</code>에 도착조차 하지 않으므로 "서울" 키가 만들어지지 않는다. <code>filtering</code>을 쓰면 서울 주문도 <code>groupingBy</code>의 accumulator에 도착해 <code>computeIfAbsent</code>로 "서울"의 그릇이 먼저 만들어지고, 그다음에 조건에서 걸러진다. 그릇은 만들어졌는데 아무것도 들어가지 않았으니 결과는 0이다. "조건에 맞는 것이 없는 그룹도 0으로 보여야 하는가"가 둘 중 무엇을 쓸지 정하는 기준이다. 보고서처럼 모든 그룹이 표에 나와야 하면 <code>filtering</code>, 해당 그룹이 없어도 되면 앞쪽 <code>filter</code>가 맞다.</p>
+<p><code>flatMapping</code>(자바 9)은 원소 하나를 스트림으로 바꾼 뒤 그 스트림의 원소를 모두 안쪽 accumulator에 넘긴다. OpenJDK 21 구현은 원소마다 <code>mapper.apply(t)</code>로 얻은 스트림을 try-with-resources로 열어 <code>sequential().forEach</code>로 흘려보내고 닫는다. 스트림이 null이면 아무것도 넣지 않는다. 한 원소가 여러 값을 가진 데이터를 그룹별로 펼칠 때 쓴다.</p>
+<pre><code class="language-java">Map<String, TreeSet<String>> tags = Stream.of("a:x,y", "b:y", "a:z")
+    .collect(groupingBy(s -> s.split(":")[0], TreeMap::new,
+             flatMapping(s -> Arrays.stream(s.split(":")[1].split(",")), toCollection(TreeSet::new))));
+System.out.println(tags);   // {a=[x, y, z], b=[y]}</code></pre>
+
+<h4>collectingAndThen: finisher 뒤에 덧붙이기</h4>
+<p><code>collectingAndThen(downstream, f)</code>은 반대쪽 끝, finisher를 바꿔 끼운다. 새 finisher는 <code>downstream.finisher().andThen(f)</code>, 곧 원래 finisher를 실행한 결과에 <code>f</code>를 한 번 더 적용하는 함수 합성이다. 이때 소스는 특성 집합에서 <code>IDENTITY_FINISH</code>를 <b>제거한다</b>. 원래 컬렉터가 finisher 없이 그릇을 바로 돌려주는 컬렉터였더라도, 이제는 <code>f</code>를 반드시 적용해야 하기 때문이다. 이 처리를 빼먹었다면 앞에서 본 "거짓 특성" 실험처럼 <code>f</code>가 건너뛰어졌을 것이다.</p>
+<pre><code class="language-java">Map<String, String> topCustomer = ORDERS.stream().collect(groupingBy(Order::city, TreeMap::new,
+    collectingAndThen(maxBy(Comparator.comparingInt(Order::amount)), o -> o.get().customer())));
+Map<String, Integer> countAsInt = ORDERS.stream().collect(groupingBy(Order::city, TreeMap::new,
+    collectingAndThen(counting(), Long::intValue)));
+System.out.println(topCustomer);   // {대구=현우, 부산=지영, 서울=민수}
+System.out.println(countAsInt);    // {대구=2, 부산=2, 서울=3}</code></pre>
+<p>첫 줄은 <code>maxBy</code>의 <code>Optional</code>을 벗기고 고객 이름만 꺼낸다. <code>groupingBy</code> 안에서는 빈 그룹이 생기지 않으므로 <code>get()</code>이 실패하지 않는다는 앞 절의 분석이 이 코드의 근거다. 같은 다운스트림을 <code>filtering</code> 뒤에 두면 빈 그룹이 생길 수 있으니 그때는 이 근거가 사라진다는 점에 주의한다. 둘째 줄은 <code>counting()</code>의 <code>Long</code>을 <code>Integer</code>로 바꾼다.</p>
+
+<h4>다단계 분류: groupingBy 안의 groupingBy</h4>
+<p><code>groupingBy</code> 자신도 컬렉터이므로 다른 <code>groupingBy</code>의 다운스트림이 될 수 있다. 도시별로 묶고, 그 안에서 다시 분류별 금액 합계를 내 보자.</p>
+<pre><code class="language-java">Map<String, Map<String, Integer>> multi = ORDERS.stream().collect(
+    groupingBy(Order::city, TreeMap::new,
+        groupingBy(Order::category, TreeMap::new, summingInt(Order::amount))));
+System.out.println(multi);</code></pre>
+<pre data-label="실행 결과"><code class="language-text">{대구={도서=18000, 전자=120000}, 부산={식품=32000, 전자=250000}, 서울={도서=12000, 식품=15000, 전자=89000}}</code></pre>
+<p>앞 절의 구현에 대입해 보면 실행 모습이 그려진다. 바깥 맵의 값(다운스트림 그릇)은 안쪽 <code>groupingBy</code>의 그릇, 곧 <code>TreeMap<String, int[]></code>다. 원소 하나가 오면 바깥 accumulator가 도시 키로 안쪽 맵을 찾고(없으면 만들고), 안쪽 accumulator가 분류 키로 <code>int[1]</code>을 찾고(없으면 만들고), 금액을 더한다. 마무리는 바깥 finisher의 <code>replaceAll</code>이 도시마다 안쪽 finisher를 부르고, 안쪽 finisher가 다시 자기 맵의 <code>replaceAll</code>로 <code>int[]</code>를 <code>Integer</code>로 바꾸는 순서로 진행된다. 원소를 두 번 훑지 않는다. 한 번의 순회로 2단계 집계가 끝난다.</p>
+<pre class="diagram">컬렉터 조립 구조 (바깥에서 안쪽으로)
+
+groupingBy(Order::city, TreeMap::new, ─┐          바깥 그릇: TreeMap<도시, 안쪽 그릇>
+   groupingBy(Order::category,  ───────┤          안쪽 그릇: TreeMap<분류, int[1]>
+      TreeMap::new,                    │
+      summingInt(Order::amount)) ──────┘          가장 안쪽 그릇: int[1]
+
+원소 1개의 이동:  Order ─▶ 도시 키로 안쪽 맵 찾기 ─▶ 분류 키로 int[1] 찾기 ─▶ a[0] += amount
+마무리 순서:      바깥 replaceAll ─▶ (도시마다) 안쪽 replaceAll ─▶ (분류마다) int[1] → Integer</pre>
+
+<h4>partitioningBy: 참과 거짓, 언제나 두 칸</h4>
+<p>분류 기준이 참·거짓뿐이라면 <code>partitioningBy(predicate)</code>를 쓴다. <code>groupingBy(o -> 조건)</code>으로도 <code>Boolean</code> 키 맵을 만들 수 있는데 왜 따로 있을까? 결과 맵의 모양이 다르다. 백만 원 이상 주문은 하나도 없으므로 두 방식의 결과를 비교해 보자.</p>
+<pre><code class="language-java">Map<Boolean, List<String>> part = ORDERS.stream()
+    .collect(partitioningBy(o -> o.amount() >= 1_000_000, mapping(Order::customer, toList())));
+Map<Boolean, Long> grouped = ORDERS.stream()
+    .collect(groupingBy(o -> o.amount() >= 1_000_000, counting()));
+System.out.println(part + " " + part.getClass().getName());
+System.out.println(grouped);
+System.out.println(ORDERS.stream().collect(partitioningBy(o -> o.amount() >= 50000, counting())));</code></pre>
+<pre data-label="실행 결과"><code class="language-text">{false=[민수, 지영, 민수, 현우, 지영, 서연, 현우], true=[]} java.util.stream.Collectors$Partition
+{false=7}
+{false=4, true=3}</code></pre>
+<p>Javadoc은 <code>partitioningBy</code>의 결과 맵이 <code>false</code>와 <code>true</code> 키를 <b>언제나 둘 다</b> 갖는다고 명시하고, 한쪽에 원소가 없으면 그 값은 다운스트림의 supplier로 그릇을 만들고 finisher를 적용한 것이라고 설명한다. 구현을 보면 이유가 분명하다. 그릇은 맵이 아니라 필드 두 개(<code>forTrue</code>, <code>forFalse</code>)를 가진 <code>Partition</code> 객체이고, supplier가 처음부터 다운스트림 그릇을 <b>두 개 모두</b> 만들어 넣는다. accumulator는 조건 결과에 따라 둘 중 하나에 넣을 뿐이다. 반면 <code>groupingBy</code>는 원소가 도착한 키만 만들므로 <code>{false=7}</code>처럼 한쪽 키가 없을 수 있다. 결과를 꺼낼 때 <code>part.get(true)</code>가 null이 아니라는 보장이 <code>partitioningBy</code>를 쓰는 이유다.</p>
+<p><code>Partition</code>은 <code>AbstractMap</code>을 상속한 OpenJDK 내부 클래스로, <code>size()</code>는 언제나 2이고 <code>get</code>은 키가 <code>Boolean</code>이면 해당 필드를 돌려준다. <code>put</code>을 재정의하지 않았으므로 <code>AbstractMap</code>의 기본 동작대로 <code>UnsupportedOperationException</code>을 던진다. 순회는 <code>false</code> 항목이 먼저 나오도록 구현되어 있어 출력이 언제나 <code>{false=..., true=...}</code> 순서다. 물론 Javadoc은 결과 맵의 타입과 가변성을 보장하지 않으므로, 결과를 고쳐야 한다면 새 맵에 복사해서 쓴다.</p>
+
+<h4>teeing: 한 번의 순회로 두 컬렉터를 동시에</h4>
+<p>합계와 건수를 함께 구하고 싶을 때, 스트림을 두 번 만들어 각각 수집하는 대신 <code>teeing</code>(자바 12)을 쓸 수 있다. 인자는 다운스트림 컬렉터 두 개와 두 결과를 합치는 함수다.</p>
+<pre><code class="language-java">String tee = ORDERS.stream().collect(teeing(
+    summingInt(Order::amount), counting(), (s, n) -> "합계=" + s + ", 건수=" + n));
+System.out.println(tee);   // 합계=536000, 건수=7</code></pre>
+<p>구현은 두 다운스트림의 그릇을 필드로 함께 든 지역 클래스 <code>PairBox</code>를 그릇으로 쓴다. 원소마다 두 accumulator를 차례로 부르고, combiner는 두 쌍을 각각 합치며, finisher는 두 finisher의 결과를 합치는 함수에 넘긴다. 특성은 두 컬렉터의 특성의 교집합에서 <code>IDENTITY_FINISH</code>를 뺀 것이다. 둘 다 동시성을 허용해야 전체가 동시성을 허용할 수 있고, 마지막에 합치는 함수를 반드시 불러야 하기 때문이다. 결과적으로 원소를 한 번만 순회하면서 두 가지 리덕션을 동시에 해낸다.</p>
+
+<h3>타입으로 읽는 컬렉터: 물음표와 추론 오류</h3>
+<p>컬렉터를 조합하다 보면 긴 제네릭 오류 메시지를 자주 만난다. 메시지가 길 뿐 원리는 단순하다. 자주 만나는 세 가지를 직접 일으켜 보자. 첫째는 <code>counting()</code>의 결과 타입이다.</p>
+<pre><code class="language-java">Map<String, Integer> m = orders.stream()
+    .collect(Collectors.groupingBy(Order::city, Collectors.counting()));</code></pre>
+<pre data-label="javac 오류 (JDK 21)"><code class="language-text">E1.java:7: error: incompatible types: inference variable D has incompatible equality constraints Integer,Long
+            .collect(Collectors.groupingBy(Order::city, Collectors.counting()));
+                    ^
+  where D,T,K,A are type-variables:
+    D extends Object declared in method <T,K,A,D>groupingBy(Function<? super T,? extends K>,Collector<? super T,A,D>)
+    ...</code></pre>
+<p><code>groupingBy</code>의 시그니처에서 다운스트림은 <code>Collector<? super T, A, D></code>이고 결과는 <code>Map<K, D></code>다. 대입 대상 <code>Map<String, Integer></code>에서 <code>D = Integer</code>라는 제약이, <code>counting()</code>의 반환 타입 <code>Collector<T, ?, Long></code>에서 <code>D = Long</code>이라는 제약이 나온다. 같은 변수에 등호 제약 두 개가 충돌하니 추론이 실패한다. <code>Long</code>은 <code>Integer</code>의 하위 타입이 아니고, 제네릭 타입 인자에는 박싱 변환이나 넓히기 변환이 적용되지 않는다. 고치는 방법은 결과 타입을 <code>Map<String, Long></code>으로 받거나, 앞에서 본 <code>collectingAndThen(counting(), Long::intValue)</code>로 바꾸거나, <code>summingInt(o -> 1)</code>처럼 처음부터 <code>Integer</code>를 내는 컬렉터를 쓰는 것이다.</p>
+<p>둘째는 가운데 물음표다. 그릇 타입을 안다고 생각해 변수 타입에 적으면 컴파일되지 않는다.</p>
+<pre><code class="language-java">Collector<String, ArrayList<String>, List<String>> c = Collectors.toList();</code></pre>
+<pre data-label="javac 오류 (JDK 21)"><code class="language-text">E2.java:5: error: incompatible types: no instance(s) of type variable(s) T exist so that Collector<T,?,List<T>> conforms to Collector<String,ArrayList<String>,List<String>></code></pre>
+<p><code>toList()</code>는 <code>Collector<T, ?, List<T>></code>를 돌려준다고 선언되어 있다. 구현이 <code>ArrayList</code>를 쓰든 말든, 선언된 타입에서 가운데 인자는 "알 수 없는 어떤 타입"이고, 그것이 <code>ArrayList<String></code>이라는 보장은 타입 시스템 어디에도 없다. 이것이 Javadoc이 말한 "그릇 타입은 흔히 구현 세부로 숨겨진다"의 실제 모습이다. 덕분에 JDK는 그릇을 바꾸는 구현 변경을 호출 코드를 깨뜨리지 않고 할 수 있다. 컬렉터를 변수에 담을 때는 <code>Collector<String, ?, List<String>></code>처럼 물음표를 그대로 쓴다. 이런 변수를 <code>collect</code>에 넘기면 컴파일러는 물음표를 캡처 변환(capture conversion)으로 "이름 없는 새 타입 변수"로 바꿔 <code>collect</code>의 타입 매개변수 <code>A</code>에 대입한다. 다음 오류 메시지의 <code>CAP#1</code>이 그 이름 없는 타입 변수다.</p>
+<pre><code class="language-java">List<Integer> l = IntStream.range(0, 3).collect(Collectors.toList());</code></pre>
+<pre data-label="javac 오류 (JDK 21, 첫 번째 오류)"><code class="language-text">E3.java:5: error: method collect in interface IntStream cannot be applied to given types;
+        List<Integer> l = IntStream.range(0, 3).collect(Collectors.toList());
+                                               ^
+  required: Supplier<R>,ObjIntConsumer<R>,BiConsumer<R,R>
+  found:    Collector<Object,CAP#1,List<Object>>
+  reason: cannot infer type-variable(s) R
+    (actual and formal argument lists differ in length)
+  ...
+  where CAP#1 is a fresh type-variable:
+    CAP#1 extends Object from capture of ?</code></pre>
+<p>셋째가 이것이다. <code>IntStream</code>에는 세 인자 <code>collect</code>만 있으므로 인자 하나를 넘기면 "인자 목록의 길이가 다르다"는 오류가 난다. 원소가 <code>int</code>인 스트림에 <code>Collector<T, A, R></code>을 쓰려면 <code>T</code>가 참조 타입이어야 하므로, <code>boxed()</code>로 <code>Stream<Integer></code>를 만든 뒤 수집한다. 박싱 비용이 생기므로 합계나 통계가 목적이라면 기본형 스트림의 <code>sum()</code>이나 <code>summaryStatistics()</code>를 쓰는 편이 낫다.</p>
+<aside class="note">실험 중에 만난 함정 하나를 더 적어 둔다. JDK 21의 javac에서 <code>System.out.println(stream.collect(groupingBy(f, TreeMap::new, counting())))</code>처럼 맵 팩터리 생성자 참조가 들어간 <code>collect</code>를 <code>println</code>의 인자로 바로 넣으면 "inference variable R has incompatible bounds" 오류가 나고, 메시지의 상한(upper bounds)에 <code>String</code>이 들어 있다. 오버로드된 <code>println</code> 중 <code>println(String)</code>을 기준으로 추론한 것이다. 같은 식을 <code>() -> new TreeMap<>()</code> 람다로 바꾸거나, 결과를 지역 변수에 먼저 담으면 컴파일된다. 이 회차의 예제가 결과를 대부분 변수에 담는 이유다.</aside>
+
+<h3>병렬 실행과 동시 컬렉터</h3>
+<p>앞에서 본 실행 경로를 <code>groupingBy</code>에 적용하면 병렬 실행의 비용이 어디서 생기는지 보인다. 병렬 스트림에서 잎 작업마다 <code>groupingBy</code>의 supplier가 불려 <b>맵이 잎 수만큼</b> 만들어지고, 안쪽 작업마다 combiner인 <code>mapMerger</code>가 오른쪽 맵의 모든 항목을 왼쪽 맵에 <code>Map.merge</code>로 넣는다. 키가 겹치면 다운스트림의 combiner(리스트라면 <code>addAll</code>)가 불린다. 원소를 그릇에 넣는 일 말고도 맵을 합치는 일이 트리의 높이만큼 반복되는 셈이다. <code>groupingBy</code>와 <code>toMap</code>의 Javadoc 구현 참고(implNote)도 이 컬렉터는 동시 컬렉터가 아니며, 병렬 파이프라인에서 combiner가 한 맵의 키를 다른 맵에 합치는 일은 비쌀 수 있다고 적는다.</p>
+<p>대안으로 제시되는 것이 <code>groupingByConcurrent</code>와 <code>toConcurrentMap</code>이다. 그릇이 <code>ConcurrentHashMap</code>이고, 특성에 <code>CONCURRENT</code>와 <code>UNORDERED</code>가 붙는다. 그래서 병렬 스트림에서 쓰면 <code>ReferencePipeline.collect</code>의 첫 번째 갈래, 곧 공유 맵 하나에 모든 스레드가 직접 넣는 동시 리덕션이 실행되고 맵 합치기가 사라진다. <code>groupingByConcurrent</code>의 구현에는 세부가 하나 더 있다. 다운스트림이 <code>CONCURRENT</code>가 아니면(예: <code>toList()</code>), accumulator가 키의 그릇을 꺼낸 뒤 <code>synchronized (resultContainer)</code> 블록 안에서 다운스트림 accumulator를 부른다. 맵은 <code>ConcurrentHashMap</code>이 보호하고, 그 값인 <code>ArrayList</code>는 그릇 객체의 모니터 락으로 보호하는 것이다. 자바 고급 1편에서 본 모니터 락이 여기서 쓰인다.</p>
+<p>대가는 순서다. 패키지 문서는 여러 스레드가 공유 그릇에 동시에 넣으면 들어가는 순서가 비결정적이므로, 동시 리덕션은 처리 순서가 중요하지 않을 때만 가능하다고 설명한다. 같은 키의 원소들이 원본 순서대로 리스트에 들어가야 한다면 동시 리덕션을 쓸 수 없고 순차 리덕션이나 병합 기반 병렬 리덕션을 써야 한다. 반대로 순서가 필요 없다면 <code>unordered()</code>로 스트림의 순서 제약을 풀거나 <code>UNORDERED</code> 컬렉터를 써야 동시 리덕션 조건이 성립한다. 병렬 스트림을 언제 써야 하는지, 공용 풀과 작업 훔치기가 어떻게 동작하는지는 10회에서 다룬다. 이 회차에서 기억할 것은 컬렉터의 combiner와 특성이 병렬 실행의 비용과 결과 순서를 직접 결정한다는 점이다.</p>
+
+<h3>흔한 오해와 함정</h3>
+<ul>
+<li><b>"<code>Collectors.toList()</code>는 <code>ArrayList</code>를 돌려준다."</b> OpenJDK 21의 구현은 그렇지만 Javadoc은 타입과 가변성을 보장하지 않는다. 결과를 고칠 계획이면 <code>toCollection(ArrayList::new)</code>로 명시한다. 반대로 고치지 않을 결과라면 <code>Stream.toList()</code>가 의도를 더 잘 드러낸다.</li>
+<li><b>"<code>Stream.toList()</code>와 <code>collect(toUnmodifiableList())</code>는 같다."</b> 둘 다 수정할 수 없는 리스트지만 null 처리가 다르다. 앞의 것은 null을 허용하고, 뒤의 것은 <code>NullPointerException</code>을 던진다. 앞의 것은 OpenJDK 21에서 컬렉터를 거치지도 않는다.</li>
+<li><b>"<code>toMap</code>은 같은 키가 오면 덮어쓴다."</b> <code>HashMap.put</code>과 달리 병합 함수가 없는 <code>toMap</code>은 <code>IllegalStateException</code>을 던진다. 덮어쓰려면 <code>(x, y) -> y</code>를 명시해야 한다. 값이 null이면 형태와 상관없이 <code>NullPointerException</code>이다.</li>
+<li><b>"<code>groupingBy</code>의 결과는 키 순서로 정렬된다."</b> 기본 그릇은 <code>HashMap</code>이고 순회 순서는 정해져 있지 않다. 실행해 보니 정렬된 것처럼 보이더라도 우연이다. 순서가 필요하면 <code>TreeMap::new</code>나 <code>LinkedHashMap::new</code>를 준다.</li>
+<li><b>"<code>filter</code> 후 <code>groupingBy</code>와 <code>groupingBy</code> 안의 <code>filtering</code>은 같다."</b> 값은 같아도 키 집합이 다르다. <code>filtering</code>은 조건에 맞는 원소가 없는 그룹도 빈 결과(0, 빈 리스트)로 남긴다.</li>
+<li><b>"<code>partitioningBy</code>는 <code>groupingBy</code>에 boolean 키를 준 것과 같다."</b> <code>partitioningBy</code>는 두 키를 언제나 갖고, <code>groupingBy</code>는 원소가 온 키만 갖는다.</li>
+<li><b>"컬렉터의 accumulator 안에서 바깥 변수를 고쳐도 된다."</b> 컬렉터는 그릇이 스레드에 갇혀 있다는 약속 위에서 병렬로 안전하다. accumulator가 그릇이 아닌 바깥 공유 상태를 고치면 그 약속 밖이므로 병렬에서 경쟁 조건이 생긴다. <code>forEach</code>로 바깥 리스트를 채우는 코드도 같은 이유로 컬렉터로 바꾼다.</li>
+<li><b>"특성은 성능 힌트일 뿐이니 아무거나 붙여도 결과는 같다."</b> <code>IDENTITY_FINISH</code>는 finisher를 실제로 건너뛰게 하고, <code>CONCURRENT</code>는 그릇 하나를 여러 스레드가 공유하게 만든다. 사실이 아닌 특성은 <code>ClassCastException</code>이나 데이터 경쟁으로 이어진다.</li>
+</ul>
+
+<h3>정리: 컬렉터를 읽는 하나의 틀</h3>
+<p>이 회차에서 본 컬렉터는 모두 같은 틀로 읽을 수 있다. "그릇은 무엇인가(supplier), 원소 하나를 어떻게 넣는가(accumulator), 두 그릇을 어떻게 합치는가(combiner), 그릇을 결과로 어떻게 바꾸는가(finisher), 어떤 특성을 갖는가." <code>toList</code>는 <code>ArrayList</code>와 <code>add</code>와 <code>addAll</code>, 항등 finisher다. <code>summingInt</code>는 <code>int[1]</code>과 덧셈, 칸의 값을 꺼내는 finisher다. <code>groupingBy</code>는 맵과 <code>computeIfAbsent</code>, <code>Map.merge</code>, 값을 바꿔 끼우는 <code>replaceAll</code>이다. <code>mapping</code>과 <code>filtering</code>은 accumulator 앞에 끼어들고, <code>collectingAndThen</code>은 finisher 뒤에 덧붙이고, <code>partitioningBy</code>는 그릇 두 개를 처음부터 만들고, <code>teeing</code>은 그릇 두 개를 나란히 든다.</p>
+<p>실행하는 쪽의 규칙도 하나로 정리된다. <code>Stream.collect</code>는 순차면 그릇 하나, 병렬이면 조각마다 그릇 하나를 만들어 왼쪽에 오른쪽을 합치고, 병렬·동시성·무순서 조건이 모두 맞을 때만 공유 그릇 하나를 쓴다. 마지막에 <code>IDENTITY_FINISH</code>면 그릇을 그대로 돌려주고, 아니면 finisher를 한 번 부른다. 이 틀이 머리에 있으면 처음 보는 컬렉터 조합도 "어떤 그릇이 몇 개 생기고, 마지막에 무엇으로 바뀌는가"를 그려 가며 결과를 예측할 수 있다. <code>maxBy</code>와 <code>minBy</code>가 돌려준 <code>Optional</code>을 언제 어떻게 벗겨야 하는지는 8회에서, 동시 컬렉터와 병렬 스트림을 실제로 언제 써야 하는지는 10회에서 이어 간다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>가변 리덕션 (mutable reduction)</dt><dd>결과 값을 매 단계 새로 만들어 바꿔 끼우는 대신, 가변 그릇의 상태를 고쳐 원소를 쌓는 리덕션이다. 스트림에서는 <code>collect</code>가 이 연산이며, 그릇이 조각마다 따로 만들어지므로 병렬에서도 동기화가 필요 없다.</dd>
+<dt>Collector의 네 함수</dt><dd>supplier(새 그릇), accumulator(원소 하나 넣기), combiner(두 그릇 합치기, 병렬에서만), finisher(그릇을 결과로 바꾸기). 타입 매개변수 <code>T</code>, <code>A</code>, <code>R</code>은 입력, 그릇, 결과 타입이다.</dd>
+<dt>특성 (Characteristics)</dt><dd><code>IDENTITY_FINISH</code>는 finisher 생략과 비검사 캐스팅, <code>UNORDERED</code>는 순서 비보존, <code>CONCURRENT</code>는 공유 그릇에 동시 누적 허용을 뜻하며 실제 실행 경로를 바꾼다.</dd>
+<dt>collect의 실행 경로</dt><dd>순차는 싱크 하나와 그릇 하나, 병렬은 잎마다 그릇 하나와 (잎 수 - 1)번의 combine, 병렬·CONCURRENT·(무순서 스트림 또는 UNORDERED)이면 공유 그릇 하나의 동시 리덕션이다.</dd>
+<dt>toList 계열</dt><dd><code>Collectors.toList()</code>는 보장 없음(구현은 <code>ArrayList</code>), <code>toUnmodifiableList()</code>는 불변이고 null 거부, <code>Stream.toList()</code>는 불변이고 null 허용이다.</dd>
+<dt>toMap</dt><dd>병합 함수가 없으면 중복 키에서 <code>IllegalStateException</code>, 값이 null이면 언제나 <code>NullPointerException</code>이다. 병합 함수는 <code>Map.merge</code>로 적용되고, 맵 팩터리로 그릇 종류를 고른다.</dd>
+<dt>groupingBy</dt><dd>원소마다 분류 키로 <code>computeIfAbsent</code>해 다운스트림 그릇을 찾고 넣는다. 누적 중 맵의 값은 다운스트림 그릇이고, 마지막에 <code>replaceAll</code>로 다운스트림 finisher의 결과로 바뀐다. null 키는 거부한다.</dd>
+<dt>컬렉터 어댑터</dt><dd><code>mapping</code>·<code>filtering</code>·<code>flatMapping</code>은 accumulator를 감싸고, <code>collectingAndThen</code>은 finisher를 합성하며 <code>IDENTITY_FINISH</code>를 지운다. <code>partitioningBy</code>는 두 칸을 처음부터 만들고, <code>teeing</code>은 두 컬렉터를 한 번의 순회로 실행한다.</dd>
+<dt>그릇과 객체 크기 (OpenJDK 21 HotSpot)</dt><dd>압축 클래스 포인터가 켜진 기본 설정에서 <code>Integer</code>는 16바이트, <code>int[1]</code>은 24바이트, <code>HashMap.Node</code>는 32바이트다. <code>summingInt</code>는 원소마다 할당이 없고, <code>reducing(0, Integer::sum)</code>은 캐시 범위 밖의 부분합마다 <code>Integer</code>를 새로 만든다.</dd>
+<dt>보정 합산과 HashMap 크기 조정</dt><dd><code>summingDouble</code>은 <code>double[3]</code>에 합·보정값·단순 합을 들고 Kahan 방식으로 반올림 오차를 다음 덧셈에 넘긴다. <code>groupingBy</code>의 기본 <code>HashMap</code>은 키 수가 임계값을 넘을 때마다 두 배로 커지며, 키 수를 알면 <code>HashMap.newHashMap(n)</code>을 맵 팩터리로 넘겨 크기 조정을 없앤다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 컬렉터 관련 장애는 대부분 "데이터가 생각과 달랐을 때" 터진다. 개발 환경에서는 고객 한 명이 주문 한 건뿐이라 잘 돌던 <code>toMap(Order::customer, ...)</code>이 운영 데이터에서 <code>Duplicate key</code> 예외를 던지고, 선택 항목이던 필드가 null인 레코드가 섞이자 <code>toMap</code>이나 <code>groupingBy</code>가 <code>NullPointerException</code>을 던진다. 그래서 키 함수를 쓸 때는 "이 키가 정말 유일한가, null일 수 있는가"를 먼저 묻고, 유일하지 않다면 병합 정책(합산, 최신값, 최댓값)을 코드에 명시해야 한다. 예외 메시지에 키와 두 값이 함께 찍힌다는 것을 알고 있으면 로그만으로 원인 데이터를 바로 찾을 수 있다.</p>
+<p>결과의 가변성도 설계 결정이다. 서비스 계층에서 만든 리스트를 다른 계층이 고치지 못하게 하려면 <code>Stream.toList()</code>나 <code>toUnmodifiableList()</code>로 만들어 넘기고, 받은 쪽에서 원소를 추가해야 하는 경우만 <code>toCollection</code>으로 그릇을 명시한다. 이 선택은 JPA나 스프링에서 엔티티 컬렉션, DTO 목록을 다룰 때 그대로 이어진다. 응답 JSON의 키 순서나 보고서의 행 순서가 중요하다면 <code>groupingBy</code>와 <code>toMap</code>에 맵 팩터리를 반드시 넘긴다. <code>HashMap</code>의 순서는 JDK 버전이나 데이터에 따라 바뀔 수 있는 구현 세부이기 때문이다.</p>
+<p>성능 판단에서는 "한 번의 순회로 끝나는가"를 본다. 같은 데이터에서 합계와 건수, 그룹별 통계를 각각 따로 스트림을 만들어 구하는 대신 <code>summarizingInt</code>, <code>teeing</code>, 다단계 <code>groupingBy</code>로 한 번에 모을 수 있다. 다만 DB에서 가져온 데이터를 애플리케이션에서 묶는 것과 SQL의 <code>GROUP BY</code>로 DB에서 묶는 것은 전송량부터 다르다. 수백만 행을 가져와 <code>groupingBy</code>하기보다 DB에서 집계한 결과만 가져오는 편이 맞는 경우가 많고, 컬렉터는 이미 메모리에 있는 데이터를 다시 모양 짓는 데 쓰는 도구라는 위치를 잊지 않는다. 병렬 스트림에 <code>groupingBy</code>를 쓰려는 순간에는 맵 합치기 비용과 결과 순서 요구를 함께 따져 보고, 판단이 서지 않으면 10회의 기준을 적용한다.</p>
+</x-review>
+
+<x-practice>
+<li>본문의 로그 컬렉터 <code>tracing</code>을 accumulator가 <code>o.category()</code>를 출력하도록 바꾸고, <code>ORDERS.stream().limit(4).collect(groupingBy(Order::category, LinkedHashMap::new, tracing))</code>를 실행했을 때 출력되는 줄을 순서대로 모두 적어라. supplier와 finisher가 각각 몇 번 불리는지, 그 횟수가 무엇에 의해 정해지는지도 설명하라.</li>
+<li><code>Map<String, Integer> m = ORDERS.stream().collect(groupingBy(Order::city, counting()));</code>가 컴파일되지 않는 이유를 <code>groupingBy</code>의 타입 매개변수 <code>D</code>를 중심으로 설명하고, 결과 타입을 <code>Map<String, Integer></code>로 유지하는 수정 방법을 두 가지 제시하라.</li>
+<li>"식품" 분류 주문의 도시별 건수를 (가) 스트림의 <code>filter</code>로 먼저 거른 뒤 <code>groupingBy(Order::city, TreeMap::new, counting())</code>로, (나) <code>groupingBy(Order::city, TreeMap::new, filtering(..., counting()))</code>로 구했다. 두 결과를 각각 적고, 어느 키가 왜 다른지 <code>computeIfAbsent</code>를 근거로 설명하라.</li>
+<li><code>ORDERS.stream().collect(groupingBy(Order::category, summingInt(Order::amount)))</code>에서 누적이 끝난 직후와 finisher가 끝난 뒤의 맵을 본문의 그림처럼 그려라. 맵 객체가 몇 개 만들어지는지, 값 객체는 무엇에서 무엇으로 바뀌는지 적어라.</li>
+<li>고객별 "가장 큰 주문 금액" 맵을 고객이 처음 등장한 순서대로 만들려고 한다. <code>toMap</code>으로 작성하고, 병합 함수를 빼면 어떤 예외와 메시지가 나는지 적어라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> 앞쪽 네 건의 분류는 도서, 전자, 전자, 도서다. 출력은 <code>supplier</code> → <code>accumulator 도서 12000</code> → <code>supplier</code> → <code>accumulator 전자 250000</code> → <code>accumulator 전자 89000</code> → <code>accumulator 도서 18000</code> → <code>finisher 30000</code> → <code>finisher 339000</code> 순이고, 결과는 <code>{도서=30000, 전자=339000}</code>이다(실행해 확인했다). supplier는 <code>computeIfAbsent</code>가 키를 처음 만날 때만 부르므로 원소 수가 아니라 서로 다른 키 수(2)만큼 불린다. finisher는 누적이 모두 끝난 뒤 바깥 finisher의 <code>replaceAll</code>이 키마다 한 번씩 부르므로 역시 키 수만큼, 맵의 순회 순서(<code>LinkedHashMap</code>이므로 처음 등장한 순서)대로 불린다. 순차 스트림이므로 combiner는 불리지 않는다.</p>
+<p><b>2번.</b> <code>groupingBy(classifier, downstream)</code>의 결과는 <code>Map<K, D></code>이고 다운스트림은 <code>Collector<? super T, A, D></code>다. 대입 대상에서 <code>D = Integer</code>, <code>counting()</code>의 반환 타입 <code>Collector<T, ?, Long></code>에서 <code>D = Long</code>이라는 등호 제약이 나와 충돌한다. javac는 "inference variable D has incompatible equality constraints Integer,Long"을 출력한다. 수정 방법은 <code>collectingAndThen(counting(), Long::intValue)</code>로 결과를 변환하거나, <code>summingInt(o -> 1)</code>처럼 처음부터 <code>Integer</code>를 내는 컬렉터를 쓰는 것이다. 두 방법 모두 <code>{대구=2, 부산=2, 서울=3}</code>을 만든다(<code>TreeMap</code>으로 확인).</p>
+<p><b>3번.</b> 식품 주문은 부산(지영)과 서울(서연) 두 건이다. (가)는 <code>{부산=1, 서울=1}</code>, (나)는 <code>{대구=0, 부산=1, 서울=1}</code>이다. (가)에서는 대구의 주문이 <code>filter</code>에서 모두 걸러져 <code>groupingBy</code>의 accumulator에 도착하지 않으므로 "대구" 키가 만들어지지 않는다. (나)에서는 대구 주문도 accumulator에 도착하고, accumulator는 먼저 <code>computeIfAbsent</code>로 "대구"의 그릇(<code>long[1]</code>)을 만든 다음 <code>filtering</code>이 감싼 accumulator에서 조건 검사로 걸러진다. 그릇은 있는데 아무것도 더해지지 않았으므로 finisher가 0을 돌려준다.</p>
+<p><b>4번.</b> 바깥 맵(<code>HashMap</code>)은 하나만 만들어진다. 누적 직후에는 키 "도서", "전자", "식품"이 각각 <code>int[1]</code> 배열 <code>{30000}</code>, <code>{459000}</code>, <code>{47000}</code>을 가리킨다(배열 세 개는 각 키를 처음 만났을 때 다운스트림 supplier가 만들었다). <code>summingInt</code>는 <code>IDENTITY_FINISH</code>가 아니므로 <code>groupingBy</code>의 finisher가 <code>replaceAll</code>로 각 값을 <code>a -> a[0]</code>의 결과인 <code>Integer</code> 30000, 459000, 47000으로 바꿔 끼운다. 맵 객체는 그대로이고 값만 <code>int[]</code>에서 <code>Integer</code>로 바뀌며, 배열들은 더 이상 참조되지 않아 GC 대상이 된다. 출력 시 키 순서는 <code>HashMap</code>의 구현에 달려 있다.</p>
+<p><b>5번.</b> <code>Map<String, Integer> top = ORDERS.stream().collect(toMap(Order::customer, Order::amount, Math::max, LinkedHashMap::new));</code>의 결과는 <code>{민수=89000, 지영=250000, 현우=120000, 서연=15000}</code>이다. 병합 함수 <code>Math::max</code>는 <code>BinaryOperator<Integer></code>로 타깃 타이핑되며, 같은 고객의 두 금액 중 큰 값을 남긴다. 병합 함수를 빼면 민수의 두 번째 주문에서 <code>IllegalStateException</code>이 나고 메시지는 <code>Duplicate key 민수 (attempted merging values 12000 and 89000)</code>이다. 인자 두 개짜리 <code>toMap</code>은 맵 팩터리를 받지 않으므로 순서를 지정하려면 어차피 네 인자 형태를 써야 한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>함수 세 개만 받는 <code>Collector.of(supplier, accumulator, combiner)</code>로 만든 컬렉터를 원소 5개짜리 <b>순차</b> 스트림에 적용했다. OpenJDK 21에서 supplier와 combiner는 각각 몇 번 불리는가?</q>
+<o>supplier 5번, combiner 4번</o>
+<o>supplier 1번, combiner 0번</o>
+<o>supplier 1번, combiner 4번</o>
+<o>supplier 2번, combiner 1번</o>
+<why>순차 실행에서 <code>ReduceOp.evaluateSequential</code>은 싱크를 하나만 만들고, 그 싱크의 <code>begin</code>이 supplier를 한 번 부른다. 합칠 그릇이 없으므로 combiner는 불리지 않는다. 원소 수만큼 불리는 것은 accumulator다. supplier가 여러 번, combiner가 (그릇 수 - 1)번 불리는 것은 병렬 실행에서 잎 작업이 여러 개일 때다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>주문 7건 중 금액이 백만 원 이상인 것은 하나도 없다. <code>ORDERS.stream().collect(partitioningBy(o -> o.amount() >= 1_000_000))</code>의 결과에 대해 옳은 것은?</q>
+<o><code>{false=[...7건]}</code>처럼 <code>false</code> 키만 있다</o>
+<o><code>true</code> 키의 값은 <code>null</code>이다</o>
+<o><code>false</code>와 <code>true</code> 키가 모두 있고, <code>true</code>의 값은 빈 리스트다</o>
+<o>원소가 없는 쪽이 있으면 <code>IllegalStateException</code>이 난다</o>
+<why>Javadoc은 <code>partitioningBy</code>의 결과가 두 키를 언제나 갖는다고 명시한다. 구현의 supplier가 <code>forTrue</code>, <code>forFalse</code> 그릇을 처음부터 둘 다 만들기 때문이다. 원소가 없는 쪽은 다운스트림 supplier가 만든 빈 그릇에 finisher를 적용한 값, 여기서는 빈 리스트다. <code>false</code> 키만 있는 결과는 <code>groupingBy</code>에 boolean 분류 함수를 줬을 때의 모습이다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>Stream.toList()</code>, <code>Collectors.toList()</code>, <code>Collectors.toUnmodifiableList()</code>에 대한 설명으로 옳은 것은?</q>
+<o>셋 다 명세상 <code>ArrayList</code>를 돌려준다</o>
+<o><code>Collectors.toList()</code>의 결과는 명세상 수정할 수 없다</o>
+<o><code>toUnmodifiableList()</code>는 null 원소를 허용하고 <code>Stream.toList()</code>는 거부한다</o>
+<o><code>Stream.toList()</code>는 수정할 수 없는 리스트를 돌려주며 null 원소를 허용한다</o>
+<why><code>Stream.toList()</code>(자바 16)의 Javadoc은 결과가 수정 불가이고 변경 메서드가 언제나 <code>UnsupportedOperationException</code>을 던진다고 명시하며, 실행해 보면 <code>[p, null]</code>처럼 null을 담는다. <code>toUnmodifiableList()</code>(자바 10)는 null에서 <code>NullPointerException</code>을 던지므로 세 번째 보기는 반대로 말했다. <code>Collectors.toList()</code>는 타입과 가변성 모두 보장하지 않는다. OpenJDK 21 구현이 <code>ArrayList</code>를 쓸 뿐이다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>그릇은 <code>StringBuilder</code>, 결과는 <code>String</code>인 컬렉터를 <code>Collector.of(..., finisher, IDENTITY_FINISH)</code>로 만들고 <code>String s = stream.collect(c);</code>로 받았다. 무슨 일이 일어나는가?</q>
+<o>finisher가 호출되지 않고, 호출한 쪽의 <code>checkcast</code>에서 <code>ClassCastException</code>이 난다</o>
+<o>finisher가 정상 호출되어 문자열이 반환된다</o>
+<o><code>Collector.of</code>가 특성과 타입이 맞지 않는다며 <code>IllegalArgumentException</code>을 던진다</o>
+<o>컴파일 오류가 난다</o>
+<why><code>ReferencePipeline.collect</code>는 <code>IDENTITY_FINISH</code>가 있으면 finisher를 부르지 않고 <code>(R) container</code>로 캐스팅한다. 제네릭 소거 때문에 이 캐스팅은 실행 시점에 아무것도 검사하지 않아 <code>StringBuilder</code>가 그대로 빠져나오고, 결과를 <code>String</code> 변수에 담기 위해 컴파일러가 넣은 <code>checkcast</code>에서 예외가 난다. 결과를 <code>Object</code>로 받으면 예외 없이 <code>StringBuilder</code>가 나온다. 타입 검사는 컴파일 시점에 통과하고, <code>Collector.of</code>는 특성의 사실 여부를 검증하지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>Stream.collect(Collector)</code>가 공유 그릇 하나에 여러 스레드가 동시에 누적하는 동시 리덕션을 수행하는 조건은?</q>
+<o>컬렉터가 <code>CONCURRENT</code>이기만 하면 순차 스트림에서도 수행한다</o>
+<o>병렬 스트림이고 그릇이 <code>ConcurrentHashMap</code>이면 수행한다</o>
+<o>병렬 스트림이고, 컬렉터가 <code>CONCURRENT</code>이며, 스트림에 순서가 없거나 컬렉터가 <code>UNORDERED</code>일 때</o>
+<o>병렬 스트림이고 컬렉터가 <code>UNORDERED</code>이면 <code>CONCURRENT</code>가 없어도 수행한다</o>
+<why>Javadoc과 OpenJDK 21의 <code>ReferencePipeline.collect</code> 구현이 정확히 세 조건을 요구한다. 동시 리덕션에서는 원소가 그릇에 들어가는 순서가 비결정적이므로, 순서를 지켜야 하는 경우를 배제하기 위해 세 번째 조건이 붙는다. 실행하는 쪽은 그릇의 실제 클래스를 보지 않고 컬렉터가 선언한 특성만 본다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>가변 리덕션 (mutable reduction)</dt><dd>입력 원소를 가변 결과 그릇에 쌓아 하나의 결과를 만드는 리덕션. 스트림의 <code>collect</code>가 수행한다.</dd>
+<dt>결과 그릇 (result container)</dt><dd>가변 리덕션에서 원소가 누적되는 가변 객체. <code>Collector</code>의 타입 매개변수 <code>A</code>에 해당하며 리스트, 맵, 배열, <code>StringBuilder</code> 등이 쓰인다.</dd>
+<dt>컬렉터 (Collector)</dt><dd>supplier·accumulator·combiner·finisher 네 함수와 특성 집합으로 가변 리덕션을 기술하는 인터페이스. 재사용과 조합이 가능하다.</dd>
+<dt>다운스트림 컬렉터 (downstream collector)</dt><dd><code>groupingBy</code>, <code>partitioningBy</code>, <code>mapping</code> 같은 컬렉터에 인자로 넘겨 그룹이나 변환된 원소를 다시 줄이는 안쪽 컬렉터.</dd>
+<dt>분류 함수 (classifier)</dt><dd><code>groupingBy</code>에서 원소를 키로 바꾸는 함수. 결과 맵의 키가 되며 null을 돌려주면 안 된다.</dd>
+<dt>병합 함수 (merge function)</dt><dd><code>toMap</code>에서 같은 키의 두 값을 하나로 합치는 <code>BinaryOperator</code>. <code>Map.merge</code>를 통해 적용된다.</dd>
+<dt>동시 리덕션 (concurrent reduction)</dt><dd>병렬 실행에서 그릇을 하나만 만들고 여러 스레드가 그 그릇에 accumulator를 동시에 호출하는 방식. 동시 접근에 안전한 그릇과 순서 포기가 전제다.</dd>
+<dt>만남 순서 (encounter order)</dt><dd>스트림 소스가 원소를 내놓는 순서. 순서 있는 스트림에서 <code>UNORDERED</code>가 아닌 컬렉터는 이 순서를 결과에 보존한다.</dd>
+<dt>객체 헤더 (object header)</dt><dd>HotSpot에서 모든 객체 앞에 붙는 메타데이터. 마크 워드 8바이트와 클래스 포인터(압축 시 4바이트)로 이루어지고, 배열은 길이 필드가 더 붙는다. 작은 객체의 크기는 필드보다 헤더와 8바이트 정렬이 좌우한다.</dd>
+<dt>보정 합산 (compensated summation)</dt><dd>부동소수점 덧셈에서 반올림으로 잘린 오차를 별도 변수에 기억해 다음 덧셈에서 되돌려 주는 합산 방법. Kahan summation이라고도 하며 <code>summingDouble</code>과 <code>DoubleStream.sum()</code>이 쓴다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/package-summary.html">java.util.stream 패키지 개요 (Java SE 21 API)</a> — 가변 리덕션의 정의, 부수 효과 대신 리덕션을 쓰라는 예, 동시 리덕션의 세 조건과 순서 문제</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/Collector.html">Collector (Java SE 21 API)</a> — 네 함수, 항등·결합 제약, 라이브러리 쪽 약속(스레드 갇힘), IDENTITY_FINISH의 비검사 캐스팅</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/Collectors.html">Collectors (Java SE 21 API)</a> — toList·toMap·groupingBy·partitioningBy·filtering·flatMapping·teeing의 계약과 도입 버전, 결과 타입 비보장 문구</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/Stream.html">Stream (Java SE 21 API)</a> — 세 인자 collect의 의미(반복문 정의), Stream.toList()의 불변성과 자바 16 도입</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-15.html#jls-15.18.2">JLS §15.18.2 Additive Operators (+ and -) for Numeric Types</a> — 정수 덧셈의 결합법칙과 부동소수점 덧셈이 결합법칙을 따르지 않는다는 규정</li>
+<li><a href="https://github.com/openjdk/jdk21u/blob/master/src/hotspot/share/oops/arrayOop.hpp">OpenJDK 21u HotSpot arrayOop.hpp</a> — 배열 객체의 배치(markWord, 클래스 포인터, 길이)와 헤더 크기 계산</li>
+</x-refs>

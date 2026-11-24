@@ -1,0 +1,528 @@
+<x-meta>
+deck: 결과는 한 줄인데 백만 행을 만지는 대시보드 쿼리를 느린 쿼리 로그, sys 스키마, 핸들러 카운터, EXPLAIN으로 진단하고, 단일 열 인덱스와 복합 인덱스가 InnoDB 안에서 읽는 범위를 비교해 열 순서의 원리를 세운다.
+minutes: 95
+</x-meta>
+
+<x-goals>
+<li>느린 쿼리 로그의 <code>Rows_examined</code>와 <code>Rows_sent</code>, <code>sys.statements_with_full_table_scans</code>, <code>Handler_read_rnd_next</code>로 풀 테이블 스캔을 하는 문장을 찾아낼 수 있다.</li>
+<li>EXPLAIN에서 <code>possible_keys</code>가 NULL인 풀 스캔과, 후보는 있는데 <code>key</code>가 NULL인 풀 스캔을 구분하고 각각의 원인과 처방을 말할 수 있다.</li>
+<li>풀 테이블 스캔이 InnoDB 클러스터형 인덱스의 리프를 처음부터 끝까지 읽는 일이라는 것을 근거로, 응답 시간이 결과 크기가 아니라 테이블 크기에 비례하는 이유와 버퍼 풀·락에 미치는 영향을 설명할 수 있다.</li>
+<li>복합 인덱스의 항목이 열 순서대로 사전식 정렬되어 있다는 사실로부터 최좌측 접두사 규칙과 "등치 조건 열을 앞에, 범위 조건 열을 뒤에" 원칙을 유도하고, <code>key_len</code>으로 검증할 수 있다.</li>
+<li>단일 열 인덱스, 순서가 다른 두 복합 인덱스가 같은 쿼리에서 읽는 인덱스 항목 수와 클러스터형 인덱스 룩업 수를 어림해 비교할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>문제 상황: 개발 환경에서는 빠르던 대시보드 쿼리</h3>
+
+<p>이번 회차는 가상의 쇼핑몰 운영 화면 하나를 붙잡고 진단부터 해결까지 끝까지 따라간다. 아래의 시나리오와 숫자는 설명을 위해 이 원고에서 정한 가정이며, 어떤 시스템에서 잰 측정값이 아니다. 숫자를 정해 두는 이유는 "몇 페이지를 읽는가", "몇 번 찾아 들어가는가"를 구체적으로 세어 보기 위해서다.</p>
+
+<p>운영팀이 쓰는 관리자 대시보드의 첫 화면에 "최근 7일 결제 완료 주문" 카드가 있다. 결제는 끝났지만 아직 출고되지 않은 주문의 건수와 금액 합계를 보여 주는 카드이고, 1분마다 자동으로 새로고침된다. 서비스 초기에는 아무 문제가 없었다. 그런데 주문이 100만 건을 넘기면서 카드가 뜨는 데 몇 초씩 걸리기 시작했고, 관리자 여러 명이 대시보드를 띄워 두는 업무 시간에는 고객용 API의 응답까지 함께 느려졌다. 카드 뒤에서 도는 SQL은 이것 하나다.</p>
+
+<pre><code class="language-sql">SELECT COUNT(*) AS paid_count, SUM(amount) AS paid_amount
+FROM orders
+WHERE status = 'PAID'
+  AND ordered_at >= '2026-11-10 00:00:00'
+  AND ordered_at <  '2026-11-17 00:00:00';</code></pre>
+
+<p>테이블은 02회에서 쓴 <code>orders</code>와 같은 모양이되, 인덱스는 기본 키와 <code>member_id</code> 하나뿐인 상태에서 출발한다. 회원별 주문 조회 화면을 만들 때 필요한 인덱스만 만들어 두고, 관리자 화면은 나중에 붙인 흔한 경로를 떠올리면 된다.</p>
+
+<pre><code class="language-sql">CREATE TABLE orders (
+  id         BIGINT       NOT NULL AUTO_INCREMENT,
+  member_id  BIGINT       NOT NULL,
+  status     VARCHAR(20)  NOT NULL,   -- PENDING, PAID, SHIPPED, DELIVERED, CANCELLED
+  amount     INT          NOT NULL,
+  ordered_at DATETIME     NOT NULL,
+  memo       VARCHAR(200) NULL,
+  PRIMARY KEY (id),
+  KEY idx_orders_member (member_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;</code></pre>
+
+<p>데이터에 대해서는 다음과 같이 가정한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>항목</th><th>가정한 값</th><th>비고</th></tr></thead><tbody>
+<tr><td>전체 행 수</td><td>1,000,000</td><td>약 2년치 주문</td></tr>
+<tr><td>클러스터형 인덱스 리프 페이지</td><td>약 10,000</td><td>한 페이지에 평균 100행(02회와 같은 가정)</td></tr>
+<tr><td>최근 7일 주문</td><td>약 10,000 (1%)</td><td><code>ordered_at</code> 조건만 만족하는 행</td></tr>
+<tr><td><code>status = 'PAID'</code></td><td>약 50,000 (5%)</td><td>2년에 걸쳐 흩어져 있다고 가정</td></tr>
+<tr><td>두 조건을 모두 만족</td><td>약 3,000 (0.3%)</td><td>카드가 실제로 집계하는 행</td></tr>
+</tbody></table></div>
+
+<p>이 회차에 실린 실행 결과는 위 가정에 맞춰 MySQL 안에서 규칙으로 만든 100만 행으로 MySQL 8.4.13에서 실행한 것이다(따로 밝힌 곳은 8.0.46). 그 데이터는 <code>id</code> 순서대로 <code>ordered_at</code>이 2024-11-17부터 늘어나고, 2026-11-10 이상 2026-11-17 미만 구간에 정확히 10,000행이 있다. 상태는 <code>PAID</code> 50,000(그중 최근 7일 3,000), <code>DELIVERED</code> 853,000, <code>CANCELLED</code> 40,000, <code>SHIPPED</code> 36,000, <code>PENDING</code> 21,000행이고 <code>memo</code>는 모두 NULL이다. 리프 페이지 수 가정(한 페이지에 100행)은 실측한 값이 아니다. 실행 시간, 비용, EXPLAIN의 <code>rows</code>·<code>filtered</code> 같은 추정치는 실행 환경과 통계에 따라 달라진다.</p>
+
+<p>이 쿼리가 클라이언트에 돌려주는 것은 건수와 합계가 담긴 <b>한 행</b>이다. 그 한 행을 만들기 위해 실제로 필요한 행은 3,000개다. 이 회차가 끝까지 붙들고 갈 질문은 단 하나다. <b>그 한 행을 만들기 위해 데이터베이스는 몇 개의 행과 몇 개의 페이지를 만졌는가.</b> 필요한 3,000행에 가깝게 만졌다면 잘 짜인 계획이고, 100만 행을 만졌다면 그 차이가 곧 낭비다.</p>
+
+<p>개발 환경에서 빨랐던 이유도 여기서 바로 나온다. 개발 DB에 주문이 1,000건 있었다면 테이블 전체가 열 페이지 남짓이다. 그 정도면 전부 훑어도 순식간이고, 응답 시간만 보고는 아무것도 의심할 수 없다. 테이블 전체를 훑는 계획의 비용은 <b>결과의 크기가 아니라 테이블의 크기</b>에 비례한다. 최근 7일 결제 완료 주문은 매주 3,000건 안팎으로 일정한데도 응답 시간은 테이블과 함께 자란다. "결과는 그대로인데 시간이 데이터 누적과 함께 늘어난다"는 증상은 풀 테이블 스캔(full table scan)의 전형적인 신호다.</p>
+
+<h3>진단 1단계: 느린 쿼리를 찾아내는 세 가지 창구</h3>
+
+<p>실제 장애에서는 "이 SQL이 범인이다"라는 정보가 처음부터 주어지지 않는다. 화면이 느리다는 신고, 데이터베이스 CPU가 높다는 경보에서 출발해 문장을 찾아내야 한다. MySQL은 이를 위한 창구를 여러 개 제공한다. 여기서는 성격이 서로 다른 세 가지를 본다. 느린 쿼리 로그는 "오래 걸린 실행 하나하나"를, sys 스키마는 "정규화된 문장별 누적 통계"를, 핸들러 상태 변수는 "지금 이 세션에서 실행한 문장이 엔진에 무엇을 요청했는가"를 보여 준다.</p>
+
+<h4>느린 쿼리 로그</h4>
+
+<p>느린 쿼리 로그(slow query log)는 실행 시간이 <code>long_query_time</code>초를 넘고, 검사한 행이 <code>min_examined_row_limit</code> 이상인 문장을 기록한다. MySQL 8.0 문서에 따르면 <code>long_query_time</code>의 기본값은 10, 최솟값은 0이고 마이크로초 단위까지 지정할 수 있다. 기본값 10초는 웹 요청 기준으로는 너무 관대하므로 운영에서는 더 낮게 잡는 경우가 많다. 이때 시작 시점의 잠금 획득 시간은 실행 시간에 들어가지 않는다는 점도 문서에 명시되어 있다.</p>
+
+<pre><code class="language-sql">SET GLOBAL slow_query_log = ON;
+SET GLOBAL long_query_time = 0.5;      -- 0.5초 이상 걸린 문장을 기록
+SET GLOBAL log_slow_extra = ON;        -- 8.0.14부터: 문장별 핸들러 카운터 등 추가 필드</code></pre>
+
+<p><code>long_query_time</code>처럼 세션 범위도 있는 시스템 변수는 <code>SET GLOBAL</code>로 바꾸면 그 뒤에 접속한 세션부터 새 값을 받는다. 이미 열려 있는 세션, 심지어 그 명령을 실행한 세션의 세션 값도 바뀌지 않는다(전역 범위만 있는 <code>slow_query_log</code>는 바로 적용된다). 커넥션 풀이 커넥션을 오래 붙잡고 있는 애플리케이션이라면 <code>long_query_time</code>을 낮춘 뒤에도 한동안 로그가 안 쌓이는 것처럼 보일 수 있는 이유다.</p>
+
+<p>로그 파일에는 문장마다 그 앞에 <code>#</code>으로 시작하는 줄이 붙는다. 진단에 쓰는 핵심 필드는 네 개다.</p>
+
+<pre data-label="느린 쿼리 로그 항목의 모양(가정한 데이터 기준)"><code class="language-text"># Time: ...
+# User@Host: ...
+# Query_time: (실행마다 다름)  Lock_time: (실행마다 다름)  Rows_sent: 1  Rows_examined: 1000000
+SET timestamp=...;
+SELECT COUNT(*) AS paid_count, SUM(amount) AS paid_amount FROM orders WHERE status = 'PAID' AND ...;</code></pre>
+
+<p><code>Query_time</code>은 실행 시간, <code>Lock_time</code>은 잠금을 얻는 데 걸린 시간, <code>Rows_sent</code>는 클라이언트로 보낸 행 수, <code>Rows_examined</code>는 서버 계층이 검사한 행 수다. 진단에서 가장 먼저 보는 것은 시간이 아니라 <b><code>Rows_examined</code>와 <code>Rows_sent</code>의 비율</b>이다. 시간은 그 순간의 부하, 버퍼 풀 상태, 디스크 사정에 따라 흔들리지만, 검사한 행 수는 실행 계획이 바뀌지 않는 한 데이터 양에 따라 결정된다. 위 항목은 한 행을 보내기 위해 100만 행을 검사했다고 말한다. 느린 쿼리 로그는 전역 설정을 바꿔야 켤 수 있어 이 원고를 위해 켜 보지는 않았다. 대신 MySQL 8.4.13에서 같은 문장을 실행한 뒤 <code>performance_schema.events_statements_history</code>에서 그 문장의 값을 보면 <code>ROWS_SENT</code>가 1, <code>ROWS_EXAMINED</code>가 1000000이었다. 집계 쿼리라 <code>Rows_sent</code>가 1인 것은 당연하므로, 집계라면 "집계에 실제로 들어간 행(3,000)"과 비교해야 한다. 어느 쪽이든 수백 배 넘게 차이가 난다.</p>
+
+<p>한 가지 정의를 정확히 기억해 두자. 문서는 <code>Rows_examined</code>를 "서버 계층이 검사한 행의 수이며 스토리지 엔진 내부의 처리는 세지 않는다"고 설명한다. 엔진 안에서 걸러지고 서버로 올라오지 않은 인덱스 항목은 이 숫자에 잡히지 않는다는 뜻이다. 이 단서는 뒤에서 인덱스 컨디션 푸시다운이 끼어들 때 다시 중요해진다.</p>
+
+<p>관련 변수가 두 개 더 있다. <code>log_queries_not_using_indexes</code>를 켜면 실행 시간과 상관없이 행을 찾을 때 인덱스를 쓰지 않은 문장도 기록된다. 기본값은 꺼져 있다. 켜더라도 행이 두 개 미만인 테이블처럼 인덱스가 있어도 득이 없는 경우는 기록하지 않는다. 이 옵션은 아직 느리지 않은 풀 스캔, 즉 데이터가 쌓이면 문제가 될 쿼리를 미리 잡아낼 때 쓸모가 있다. 다만 작은 코드 테이블을 훑는 문장까지 모두 기록되므로 양이 많아질 수 있고, 그래서 <code>log_throttle_queries_not_using_indexes</code>로 기록 빈도를 제한할 수 있게 되어 있다. 문서가 밝히는 판단 순서는 "관리 문장이 아니거나 <code>log_slow_admin_statements</code>가 켜져 있을 것 → <code>long_query_time</code> 이상 걸렸거나, 인덱스 미사용 기록이 켜져 있고 인덱스를 쓰지 않았을 것 → <code>min_examined_row_limit</code> 이상 검사했을 것 → 인덱스 미사용 기록의 빈도 제한에 걸리지 않을 것"이다.</p>
+
+<p><code>log_slow_extra</code>(8.0.14부터)를 켜면 파일 출력에 <code>Read_first</code>, <code>Read_key</code>, <code>Read_next</code>, <code>Read_rnd_next</code>, <code>Sort_rows</code>, <code>Created_tmp_disk_tables</code> 같은 필드가 더 붙는다. 이 값들은 세션 누적값이 아니라 그 문장 하나의 값이다. 아래에서 볼 핸들러 상태 변수를 문장마다 로그에 남겨 주는 셈이어서, 나중에 로그만 보고도 "이 문장은 테이블 스캔으로 다음 행 읽기를 100만 번 요청했다"는 것을 확인할 수 있다.</p>
+
+<h4>sys 스키마: statements_with_full_table_scans</h4>
+
+<p>느린 쿼리 로그는 개별 실행의 기록이라서, "0.3초짜리지만 1분에 수백 번 도는 문장"처럼 하나하나는 기준을 넘지 않는 문장을 놓치기 쉽다. Performance Schema는 문장을 리터럴을 제거한 정규화 형태(digest)로 묶어 누적 통계를 모으고, sys 스키마는 그것을 읽기 쉬운 뷰로 보여 준다. 그중 <code>sys.statements_with_full_table_scans</code>는 이름 그대로 풀 테이블 스캔을 한 정규화 문장을 보여 주며, 기본 정렬은 풀 스캔 비율의 내림차순, 그다음 총 지연 시간의 내림차순이다.</p>
+
+<pre><code class="language-sql">SELECT query, exec_count, no_index_used_count, no_index_used_pct,
+       rows_sent_avg, rows_examined_avg
+FROM sys.statements_with_full_table_scans
+WHERE db = 'shop'
+LIMIT 10;</code></pre>
+
+<p>열의 의미는 문서에 정의되어 있다. <code>exec_count</code>는 실행 횟수, <code>no_index_used_count</code>는 인덱스 없이 테이블을 훑은 횟수, <code>no_good_index_used_count</code>는 쓸 만한 인덱스 없이 훑은 횟수, <code>no_index_used_pct</code>는 인덱스를 쓰지 않은 실행의 비율, <code>rows_examined_avg</code>는 실행 한 번에 스토리지 엔진에서 읽은 평균 행 수다. 대시보드 쿼리라면 <code>exec_count</code>가 관리자 수 × 새로고침 횟수만큼 빠르게 늘고, <code>rows_examined_avg</code>가 테이블 행 수에 가깝게 찍힐 것이다. 한 번의 비용이 크고, 그것이 자주 반복된다는 두 사실이 한 줄에 함께 드러난다. 이 숫자들은 서버가 시작된 뒤, 또는 요약 테이블을 비운 뒤부터 누적된 값이다. <code>x$</code>가 붙은 같은 이름의 뷰는 지연 시간 같은 값을 사람이 읽기 좋게 바꾸지 않은 원래 숫자로 보여 준다.</p>
+
+<h4>핸들러 상태 변수</h4>
+
+<p>01회와 02회에서 본 것처럼 서버 계층은 핸들러(handler) API를 통해 스토리지 엔진에 "인덱스로 이 키의 첫 행을 찾아라", "다음 행을 달라" 같은 요청을 보낸다. MySQL은 이 요청의 종류별 횟수를 <code>Handler_read_*</code> 상태 변수로 세어 둔다. 세션 단위로 0으로 되돌린 뒤 문장 하나를 실행하고 값을 보면, 그 문장이 엔진에 어떤 모양의 요청을 보냈는지 정확히 알 수 있다.</p>
+
+<pre><code class="language-sql">FLUSH STATUS;   -- 현재 세션의 상태 변수를 0으로 (값은 전역 누계에 더해진다)
+SELECT COUNT(*), SUM(amount) FROM orders
+WHERE status = 'PAID'
+  AND ordered_at >= '2026-11-10 00:00:00' AND ordered_at < '2026-11-17 00:00:00';
+SHOW SESSION STATUS LIKE 'Handler_read%';</code></pre>
+
+<div class="table-wrap"><table><thead><tr><th>변수</th><th>문서의 정의(요지)</th><th>무엇의 신호인가</th></tr></thead><tbody>
+<tr><td><code>Handler_read_rnd_next</code></td><td>데이터 파일에서 다음 행을 읽으라는 요청의 수. 테이블 스캔을 많이 하면 커진다</td><td>풀 테이블 스캔</td></tr>
+<tr><td><code>Handler_read_key</code></td><td>키로 행을 읽으라는 요청의 수</td><td>인덱스로 시작점을 찾아 들어간 횟수</td></tr>
+<tr><td><code>Handler_read_next</code></td><td>키 순서로 다음 행을 읽으라는 요청의 수. 범위 조건이나 인덱스 스캔에서 증가</td><td>인덱스 범위를 따라 읽은 항목 수</td></tr>
+<tr><td><code>Handler_read_first</code></td><td>인덱스의 첫 항목을 읽은 횟수. 크면 풀 인덱스 스캔이 많다는 뜻</td><td>인덱스 전체 훑기</td></tr>
+</tbody></table></div>
+
+<pre data-label="MySQL 8.4.13에서 실행(인덱스는 기본 키와 idx_orders_member뿐)"><code class="language-text">+-----------------------+---------+
+| Variable_name         | Value   |
++-----------------------+---------+
+| Handler_read_first    | 1       |
+| Handler_read_key      | 1       |
+| Handler_read_last     | 0       |
+| Handler_read_next     | 0       |
+| Handler_read_prev     | 0       |
+| Handler_read_rnd      | 0       |
+| Handler_read_rnd_next | 1000001 |
++-----------------------+---------+</code></pre>
+
+<p>지금의 대시보드 쿼리를 실행하면 <code>Handler_read_rnd_next</code>가 테이블의 행 수 수준(이 데이터에서 행 수 100만보다 1 많은 1,000,001)으로 올라가고, <code>Handler_read_key</code>는 1, <code>Handler_read_next</code>는 0으로 거의 움직이지 않는다. 문서는 <code>Handler_read_rnd_next</code>가 높다는 것이 대개 테이블에 인덱스가 제대로 없거나 쿼리가 있는 인덱스를 활용하도록 작성되지 않았다는 뜻이라고 적고 있다. 이 카운터는 추정치가 아니라 실제로 일어난 요청의 횟수라는 점에서 EXPLAIN과 성격이 다르다. 인덱스를 추가한 뒤 개선을 확인할 때도 같은 방법으로 전후를 비교할 수 있다.</p>
+
+<h3>진단 2단계: EXPLAIN으로 풀 테이블 스캔 확인하기</h3>
+
+<p>범인 후보를 찾았으면 실행 계획을 본다. 02회에서 EXPLAIN의 열을 하나씩 읽는 법을 다뤘으니, 여기서는 풀 테이블 스캔이 계획에서 어떤 모양으로 나타나는지와 그 모양이 가리키는 원인에 집중한다.</p>
+
+<pre data-label="EXPLAIN 결과(MySQL 8.4.13에서 실행, 세로 형식)"><code class="language-text">EXPLAIN SELECT COUNT(*), SUM(amount) FROM orders
+WHERE status = 'PAID'
+  AND ordered_at >= '2026-11-10 00:00:00' AND ordered_at < '2026-11-17 00:00:00'\G
+
+           id: 1
+  select_type: SIMPLE
+        table: orders
+   partitions: NULL
+         type: ALL
+possible_keys: NULL
+          key: NULL
+      key_len: NULL
+          ref: NULL
+         rows: 908765
+     filtered: 1.11
+        Extra: Using where</code></pre>
+
+<p><code>rows</code>(테이블 전체 행 수의 추정치)와 <code>filtered</code>(조건을 통과할 행의 비율 추정치, 퍼센트)는 통계에서 나온 값이라 실행 환경과 통계에 따라 달라진다. 실제 행 수는 1,000,000이지만 추정치는 908,765였고, 같은 규칙으로 8.0.46에 만든 데이터에서는 1,026,660이었다. 나머지 열은 계획이 같으면 같게 나온다. 한 줄씩 읽어 보자.</p>
+
+<ul>
+<li><b><code>type: ALL</code></b>: 문서의 표현으로 "풀 테이블 스캔"이다. InnoDB에서는 클러스터형 인덱스의 리프를 처음부터 끝까지 읽는다는 뜻이다. 문서는 ALL이 const로 표시되지 않은 첫 테이블이 아닌 자리에 나오면 "대개 매우 나쁘다"고까지 적는다. 이 쿼리는 테이블이 하나뿐이라 그 경고에는 해당하지 않지만, 100만 행 테이블의 첫 접근이 ALL이라는 것만으로도 충분히 비싸다.</li>
+<li><b><code>possible_keys: NULL</code></b>: 이 WHERE 절에 쓸 수 있는 인덱스 후보가 <b>하나도 없다</b>는 뜻이다. 옵티마이저가 인덱스를 고민하다가 버린 것이 아니라 애초에 고를 대상이 없었다.</li>
+<li><b><code>key: NULL</code>, <code>key_len: NULL</code></b>: 고른 인덱스가 없으니 길이도 없다. 문서는 <code>key</code>가 NULL이면 <code>key_len</code>도 NULL이라고 정의한다.</li>
+<li><b><code>Extra: Using where</code></b>: 엔진이 넘겨준 행을 서버 계층이 WHERE 조건으로 거른다는 뜻이다. 100만 행이 모두 서버로 올라와 조건 검사를 받고, 그중 3,000행만 집계에 들어간다.</li>
+</ul>
+
+<p>여기서 진단의 갈림길이 하나 있다. 풀 테이블 스캔에는 겉모양은 같아도 원인이 전혀 다른 두 종류가 있다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>모양</th><th>의미</th><th>먼저 의심할 것</th></tr></thead><tbody>
+<tr><td><code>possible_keys: NULL</code>, <code>key: NULL</code>, <code>type: ALL</code></td><td>WHERE 절에 쓸 수 있는 인덱스가 없다</td><td>인덱스가 아예 없거나, 쿼리 모양(열에 씌운 함수, 앞쪽 와일드카드 등) 때문에 있는 인덱스를 범위 조건으로 쓸 수 없다</td></tr>
+<tr><td><code>possible_keys: idx_...</code>, <code>key: NULL</code>, <code>type: ALL</code></td><td>후보는 있었지만 옵티마이저가 풀 스캔이 더 싸다고 판단했다</td><td>조건이 테이블의 너무 많은 부분을 덮거나, 통계가 실제와 어긋났다</td></tr>
+</tbody></table></div>
+
+<p>MySQL 문서의 "풀 테이블 스캔 피하기" 절은 풀 스캔이 일어나는 대표적 조건으로 네 가지를 든다. 테이블이 아주 작아서 키 조회보다 훑는 편이 빠른 경우(문서는 행이 10개 미만이고 행 길이가 짧은 테이블을 예로 든다), <code>ON</code>이나 <code>WHERE</code>에 인덱스 열에 대한 쓸 만한 제한 조건이 없는 경우, 인덱스 열을 상수와 비교하는데 그 상수가 테이블의 너무 많은 부분을 덮는다고 옵티마이저가 인덱스 트리를 보고 계산한 경우, 카디널리티가 낮은 키를 다른 열을 통해 쓰는 경우다. 첫 번째 표의 위 칸이 둘째 조건, 아래 칸이 셋째와 넷째 조건에 해당한다. 지금 대시보드 쿼리는 위 칸이다. <code>status</code>에도 <code>ordered_at</code>에도 인덱스가 없으니 고민할 것도 없이 훑는다.</p>
+
+<p>계획이 실제로 어떻게 실행되었는지는 <code>EXPLAIN ANALYZE</code>로 확인할 수 있다. 03회의 주제이므로 모양만 보자. 트리 형식으로 출력되며, 아래에서 위로 읽는다. 괄호 안의 비용과 시간은 실행 환경과 통계에 따라 달라진다.</p>
+
+<pre data-label="EXPLAIN ANALYZE 출력(MySQL 8.4.13에서 실행)"><code class="language-text">-> Aggregate: count(0), sum(orders.amount)  (cost=93793 rows=1) (actual time=195..195 rows=1 loops=1)
+    -> Filter: ((orders.`status` = 'PAID') and (orders.ordered_at >= TIMESTAMP'2026-11-10 00:00:00') and (orders.ordered_at < TIMESTAMP'2026-11-17 00:00:00'))  (cost=92784 rows=10095) (actual time=193..195 rows=3000 loops=1)
+        -> Table scan on orders  (cost=92784 rows=908765) (actual time=0.206..145 rows=1e+6 loops=1)</code></pre>
+
+<p>맨 아래 <code>Table scan on orders</code>가 실제로 내보낸 행 수는 테이블 전체(<code>rows=1e+6</code>), 그 위 <code>Filter</code>를 통과한 행 수는 3,000, 맨 위 <code>Aggregate</code>가 내보낸 행은 1이다. 층마다 행 수가 급격히 줄어드는 지점, 즉 많이 읽고 조금 남기는 지점이 바로 인덱스가 일을 대신해야 할 자리다.</p>
+
+<x-visual id="db-perf-04-diagnosis-flow" title="느린 대시보드 쿼리를 풀 테이블 스캔으로 진단하는 흐름" kind="순서도" ratio="16:9">
+<x-hint>증상에서 출발해 느린 쿼리 로그·sys 스키마로 문장을 찾고, EXPLAIN의 possible_keys로 두 갈래의 원인을 가르는 흐름을 보여 준다.</x-hint>
+<x-prompt>위에서 아래로 내려가는 순서도. 맨 위 둥근 상자 "화면이 느리다". 아래로 화살표가 내려가 두 개의 나란한 사각형 "느린 쿼리 로그 (Rows_examined)"와 "sys.statements_with_full_table_scans"에 닿고, 두 상자에서 나온 화살표가 하나의 상자 "의심 문장"으로 모인다. 그 아래 마름모 "EXPLAIN type = ALL?"이 있고, 다시 아래 마름모 "possible_keys = NULL?"이 있다. 이 마름모에서 왼쪽 화살표에 "예" 라벨, 끝에 상자 "쓸 인덱스가 없다 / 쿼리 모양 점검"이 있고, 오른쪽 화살표에 "아니오" 라벨, 끝에 상자 "옵티마이저가 스캔을 골랐다 / 분포·통계 점검"이 있다. 두 상자 아래에서 화살표가 모여 마지막 상자 "인덱스 설계 후 재검증"에 닿는다. 흰 배경, 파란 계열 상자, 마름모는 연한 주황.</x-prompt>
+<x-caption>풀 테이블 스캔 진단은 "문장을 찾는 단계"와 "possible_keys로 원인을 가르는 단계"로 나뉜다.</x-caption>
+</x-visual>
+
+<h3>풀 테이블 스캔 때 InnoDB 안에서 일어나는 일</h3>
+
+<p>"풀 스캔은 느리다"는 말은 너무 뭉뚱그려져 있다. 무엇이 얼마나 일어나기에 느린지 한 층 아래로 내려가 보자. InnoDB에서 테이블의 행은 기본 키 순서로 정렬된 B+Tree, 즉 클러스터형 인덱스(clustered index)의 리프 페이지에 들어 있다. 그 구조는 05회와 06회에서 자세히 다루고, 여기서는 "행 전체가 기본 키 순서로 리프 페이지들에 나뉘어 담겨 있고, 리프 페이지끼리는 옆 페이지를 가리키는 연결로 이어져 있다"는 것만 쓰겠다. 풀 테이블 스캔은 가장 왼쪽 리프에서 시작해 이 연결을 따라 마지막 리프까지 가며 모든 레코드를 읽는 일이다.</p>
+
+<pre class="diagram">  클러스터형 인덱스(기본 키 id 순서)
+                         [ 루트 ]
+                  ┌─────────┴─────────┐
+              [ 내부 ]             [ 내부 ]
+          ┌──────┴──────┐       ┌─────┴──────┐
+  리프:  [p1] ──▶ [p2] ──▶ [p3] ──▶ ... ──▶ [p10000]
+         id 1~100  101~200  ...              999901~1000000
+
+  풀 테이블 스캔: p1부터 p10000까지 전부, 레코드 100만 개 전부
+  필요한 행: 최근 7일 + PAID = 약 3,000개 (대부분 끝쪽 페이지에 몰려 있음)</pre>
+
+<p>스캔이 진행되는 동안 일어나는 일을 단계로 쪼개면 다음과 같다.</p>
+
+<figure class="flow-figure"><figcaption>풀 테이블 스캔 한 번의 내부 흐름 (MySQL InnoDB 기준)</figcaption><ol class="flow">
+<li><strong>첫 리프 찾기</strong><span>실행기가 핸들러 API로 스캔 시작을 요청하면 InnoDB는 클러스터형 인덱스의 가장 왼쪽 리프로 내려간다.</span></li>
+<li><strong>페이지 확보</strong><span>필요한 페이지가 버퍼 풀에 없으면 디스크에서 읽어 온다. 리프가 순서대로 이어져 있으므로 접근은 대체로 순차적이고, InnoDB는 순차 접근을 감지하면 선행 읽기(read-ahead)로 다음 페이지 묶음을 미리 가져온다.</span></li>
+<li><strong>레코드 하나를 서버로</strong><span>페이지 안의 레코드를 하나 꺼내 서버 계층이 쓰는 행 형식으로 바꿔 넘긴다. 이것이 "다음 행" 요청 한 번이고, <code>Handler_read_rnd_next</code>가 1 늘어난다.</span></li>
+<li><strong>서버가 조건 검사</strong><span>서버 계층이 <code>status</code>와 <code>ordered_at</code> 조건을 평가한다. 통과하지 못하면 버리고, 통과하면 건수와 합계에 더한다.</span></li>
+<li><strong>반복</strong><span>마지막 리프의 마지막 레코드까지 3~4단계를 되풀이한다. 가정한 데이터에서 100만 번이다.</span></li>
+</ol></figure>
+
+<p>여기서 비용의 성격을 둘로 나눠 보자. 첫째는 <b>I/O</b>다. 버퍼 풀에 테이블이 다 올라와 있지 않다면 1만 개 페이지 중 없는 것을 디스크에서 읽어야 한다. 순차 읽기라 랜덤 읽기보다 유리하지만 양 자체가 테이블 크기다. 둘째는 <b>CPU</b>다. 페이지가 모두 메모리에 있더라도, 100만 개 레코드를 하나씩 꺼내 행 형식으로 바꾸고 서버로 넘겨 조건을 평가하는 일은 고스란히 남는다. "버퍼 풀이 넉넉하니 풀 스캔도 괜찮다"는 생각이 틀리는 이유가 이것이다. 디스크를 건드리지 않아도 CPU 시간은 행 수에 비례해 쓰인다. 대시보드 쿼리를 관리자 열 명이 1분마다 새로고침하면 1분에 1,000만 번의 행 처리가 3만 번의 유효 처리를 위해 일어난다. 고객용 API가 함께 느려진 이유는 대개 이렇게 CPU와 버퍼 풀을 나눠 쓰기 때문이다.</p>
+
+<h4>버퍼 풀은 스캔을 어떻게 견디는가</h4>
+
+<p>풀 스캔이 버퍼 풀에 미치는 영향도 짚어 두자. 버퍼 풀이 순수한 LRU(least recently used) 목록이라면, 큰 테이블 한 번 훑기만으로도 자주 쓰이던 페이지들이 밀려나 버린다. 스캔으로 읽은 페이지는 대부분 다시 쓰이지 않는데도 말이다. InnoDB는 이 문제를 줄이려고 LRU를 변형한 중간점 삽입(midpoint insertion)을 쓴다. 문서에 따르면 목록은 머리 쪽의 새(young) 부분과 꼬리 쪽의 오래된(old) 부분으로 나뉘고, 기본적으로 버퍼 풀의 3/8이 오래된 부분이다(<code>innodb_old_blocks_pct</code> 기본값 37). 새로 읽은 페이지는 목록 맨 앞이 아니라 이 경계, 즉 오래된 부분의 머리에 들어간다. 오래된 부분에 있는 페이지에 접근하면 그때 비로소 새 부분의 머리로 옮겨진다.</p>
+
+<p>그런데 스캔은 한 페이지 안의 레코드를 연달아 읽으므로 같은 페이지에 짧은 시간에 여러 번 접근한다. 이것만으로 "young"이 되어 버리면 보호 장치가 무의미하다. 그래서 <code>innodb_old_blocks_time</code>이 있다. 문서는 이 값을 첫 접근 이후 목록 앞쪽으로 옮기지 않고 접근할 수 있는 시간 창(밀리초)이라고 정의하고, 기본값을 1000으로 적는다. 또 테이블이나 인덱스 스캔에서는 데이터 페이지가 짧은 간격으로 몇 번 접근된 뒤 다시는 쓰이지 않는 것이 전형적인 패턴이라고 설명한다. 즉 스캔이 1초 안에 지나가 버린 페이지는 오래된 부분에 머물다 먼저 밀려나고, 자주 쓰이는 페이지는 새 부분에서 보호된다.</p>
+
+<p>이 장치가 있다고 풀 스캔이 공짜가 되는 것은 아니다. 테이블이 버퍼 풀의 오래된 부분보다 크면 스캔은 매번 그 부분을 처음부터 끝까지 갈아엎고, 다음 스캔 때 같은 페이지를 다시 디스크에서 읽는다. 그리고 앞에서 본 CPU 비용은 버퍼 풀 정책과 아무 관계가 없다. 중간점 삽입은 "스캔이 다른 쿼리의 캐시를 망치는 피해"를 줄여 줄 뿐, 스캔 자체를 싸게 만들지는 않는다.</p>
+
+<h4>읽기는 잠그지 않지만, 쓰기는 훑은 만큼 잠근다</h4>
+
+<p>대시보드 쿼리는 평범한 <code>SELECT</code>이므로 락 문제는 없다. 문서는 <code>SELECT ... FROM</code>이 스냅숏을 읽는 일관된 읽기(consistent read)이고, 격리 수준이 <code>SERIALIZABLE</code>이 아니면 락을 걸지 않는다고 설명한다. 그러나 같은 WHERE 절이 <code>UPDATE</code>나 <code>DELETE</code>에 들어가면 이야기가 완전히 달라진다. 예를 들어 "결제 대기 상태로 30일이 지난 주문을 만료 처리"하는 배치가 있다고 하자.</p>
+
+<pre><code class="language-sql">UPDATE orders
+SET status = 'EXPIRED'
+WHERE status = 'PENDING'
+  AND ordered_at < '2026-10-18 00:00:00';</code></pre>
+
+<p>문서는 잠금 읽기, <code>UPDATE</code>, <code>DELETE</code>가 일반적으로 <b>처리 중에 훑은 모든 인덱스 레코드</b>에 레코드 락을 걸며, 그 행을 제외하는 WHERE 조건이 있어도 상관없다고 설명한다. InnoDB는 정확한 WHERE 조건을 기억하지 않고 어느 인덱스 범위를 훑었는지만 안다는 것이다. 이어서 문장에 맞는 인덱스가 없어 테이블 전체를 훑어야 한다면 테이블의 모든 행이 잠기고, 그 결과 다른 사용자의 모든 INSERT가 막힌다고 명시한다. 인덱스 없는 위 배치가 도는 동안에는 새 주문이 들어오지 못할 수 있다는 뜻이다. MySQL 8.4.13(REPEATABLE READ)에서 이 회차 데이터로 확인해 보면, 위 <code>UPDATE</code>(19,380행 변경)를 트랜잭션 안에서 실행해 둔 동안 <code>performance_schema.data_locks</code>에 X 레코드 락이 1,004,985개 잡혀 있었고, 다른 세션에서 <code>innodb_lock_wait_timeout</code>을 세션 값 2초로 줄인 뒤 넣은 새 주문 <code>INSERT</code>는 <code>ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction</code>으로 끝났다. <code>(status, ordered_at)</code> 인덱스를 만든 뒤 같은 실험을 하면 레코드 락은 <code>X,REC_NOT_GAP</code> 19,381개와 <code>X</code> 19,509개로 줄었고, 같은 <code>INSERT</code>는 기다리지 않고 성공했다. 풀 테이블 스캔은 읽기에서는 "느림"의 문제지만, 쓰기에서는 "동시성"의 문제가 된다. 락의 종류와 범위는 트랜잭션을 다루는 회차의 몫이고, 여기서는 "인덱스가 훑는 범위가 곧 잠기는 범위"라는 사실만 기억하자.</p>
+
+<x-visual id="db-perf-04-full-scan-vs-range" title="풀 테이블 스캔과 인덱스 범위 접근이 만지는 페이지의 차이" kind="구조 비교 그림" ratio="16:9">
+<x-hint>위쪽은 클러스터형 인덱스의 리프 전체를 왼쪽 끝부터 오른쪽 끝까지 훑는 풀 스캔, 아래쪽은 세컨더리 인덱스의 좁은 구간만 읽고 필요한 행만 찾아가는 범위 접근을 대비해 보여 준다.</x-hint>
+<x-prompt>위아래 두 단으로 나뉜 그림. 위 단: 가로로 길게 이어진 작은 사각형 스무 개가 화살표로 연결된 리프 페이지 줄, 왼쪽 끝에 "클러스터형 인덱스 리프" 라벨. 모든 사각형이 회색으로 칠해져 있고 그 위를 왼쪽 끝에서 오른쪽 끝까지 굵은 빨간 화살표가 지나가며 "풀 테이블 스캔: 100만 행" 라벨이 붙어 있다. 오른쪽 끝 두세 개 사각형 안에만 작은 초록 점들이 찍혀 있고 "필요한 3,000행" 라벨. 아래 단: 왼쪽에 작은 트리(루트 하나, 리프 몇 개) "세컨더리 인덱스 (status, ordered_at)", 그 리프 중 한 칸만 초록으로 강조되고 "PAID + 최근 7일 구간" 라벨. 그 칸에서 가는 초록 화살표 여러 개가 오른쪽의 같은 리프 페이지 줄 끝부분 초록 점들로 이어지고 "필요한 행만 찾아감" 라벨. 흰 배경, 위 단은 회색과 빨강, 아래 단은 초록 강조.</x-prompt>
+<x-caption>풀 스캔은 테이블 크기만큼 읽고, 인덱스 범위 접근은 결과 크기만큼 읽는다.</x-caption>
+</x-visual>
+
+<h3>인덱스가 있어도 풀 스캔이 되는 쿼리 모양</h3>
+
+<p>대시보드 쿼리는 인덱스가 아예 없어서 훑었다. 그런데 실무에서 더 자주 만나는 것은 "인덱스를 분명히 만들었는데 EXPLAIN에 ALL이 나온다"는 상황이다. 처방으로 넘어가기 전에, 인덱스를 만들어도 소용이 없게 만드는 쿼리 모양을 먼저 정리해 두자. 그래야 해결 방안에서 만든 인덱스가 실제로 쓰이도록 쿼리를 함께 고칠 수 있다.</p>
+
+<p>원리는 하나로 모인다. MySQL 문서는 단일 열 인덱스에서 <b>범위 조건(range condition)</b>을 "인덱스 열(key part)을 상수 값과 <code>=</code>, <code><=></code>, <code>IN()</code>, <code>IS NULL</code>, <code>IS NOT NULL</code>로 비교하는 것"으로 정의하고, B-Tree 인덱스에서는 여기에 <code>></code>, <code><</code>, <code>>=</code>, <code><=</code>, <code>BETWEEN</code>, <code>!=</code>, <code><></code>, 그리고 와일드카드로 시작하지 않는 상수 문자열과의 <code>LIKE</code>를 더한다. 여기서 "상수"는 쿼리 문자열의 상수, 같은 조인의 const·system 테이블의 열, 상관없는 서브쿼리의 결과, 그리고 이것들로만 이루어진 식이다. 이 정의에 맞지 않는 조건은 인덱스 구간을 정하는 데 쓰이지 못한다. 문서의 설명대로 옵티마이저는 그런 조건을 구간 계산에서 TRUE로 바꿔 치워 버리고, 구간으로 읽은 행에 대해 나중에 전체 WHERE를 다시 검사한다. 구간을 만들 수 있는 조건이 하나도 남지 않으면 인덱스는 후보에서 빠진다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>쿼리 모양</th><th>왜 구간을 못 만드는가</th><th>고치는 방향</th></tr></thead><tbody>
+<tr><td><code>WHERE DATE(ordered_at) = '2026-11-16'</code></td><td>비교 대상이 인덱스 열이 아니라 열에 함수를 씌운 식이다</td><td>열을 그대로 두고 상수 쪽을 구간으로: <code>ordered_at >= '2026-11-16' AND ordered_at < '2026-11-17'</code></td></tr>
+<tr><td><code>WHERE YEAR(ordered_at) = 2026</code></td><td>같은 이유</td><td><code>ordered_at >= '2026-01-01' AND ordered_at < '2027-01-01'</code></td></tr>
+<tr><td>문자열 열을 숫자와 비교: <code>WHERE str_col = 1</code></td><td>문자열과 숫자는 부동소수점 수로 바꿔 비교된다. <code>'1'</code>, <code>' 1'</code>, <code>'1a'</code>처럼 1로 바뀌는 문자열이 여럿이라 인덱스에서 한 자리를 찾을 수 없다</td><td>상수를 열의 타입에 맞춘다: <code>WHERE str_col = '1'</code></td></tr>
+<tr><td><code>WHERE memo LIKE '%환불%'</code></td><td>와일드카드로 시작하는 패턴은 정렬 순서에서 시작점을 정할 수 없다</td><td>접두사 검색으로 바꿀 수 있는지 검토하거나, 전문 검색 같은 다른 도구를 쓴다</td></tr>
+<tr><td><code>WHERE status = 'PAID' OR memo = '긴급'</code></td><td><code>OR</code>의 한쪽에 인덱스를 쓸 수 없는 조건이 있으면, 그쪽을 만족하는 행이 테이블 어디에나 있을 수 있다</td><td>양쪽 모두 인덱스를 쓸 수 있게 하거나(인덱스 머지는 09회), 문장을 나눈다</td></tr>
+</tbody></table></div>
+
+<p>이 모양들이 EXPLAIN에 어떻게 나타나는지 MySQL 8.4.13에서 확인해 보면(<code>idx_orders_status</code>와 <code>idx_orders_ordered_at</code>을 만들어 둔 상태, 문자열 열의 예는 <code>status = 1</code>로 대신했다), 모두 <code>key</code>가 NULL인 <code>type: ALL</code>이지만 <code>possible_keys</code>는 갈린다. <code>DATE(ordered_at) = CURDATE() - INTERVAL 1 DAY</code>와 <code>memo LIKE '%환불%'</code>는 <code>possible_keys</code>가 NULL이었고, <code>status = 1</code>과 <code>status = 'PAID' OR memo = '긴급'</code>은 <code>possible_keys</code>에 <code>idx_orders_status</code>가 나온 채 <code>key</code>가 NULL이었다(<code>status = 1</code>은 8.0.46에서도 같았다). 후보 목록에 이름이 있다고 해서 그 인덱스로 구간을 만들 수 있다는 뜻은 아니므로, 아래 칸 모양이 보이면 분포와 통계뿐 아니라 쿼리 모양도 함께 점검해야 한다.</p>
+
+<p>날짜 함수 패턴은 대시보드 쿼리에서 특히 흔하다. "11월 16일 하루"를 표현할 때 <code>DATE(ordered_at) = '2026-11-16'</code>이 사람 눈에 자연스럽기 때문이다. 하지만 인덱스는 <code>ordered_at</code> 값의 순서로 정렬되어 있고, 옵티마이저는 <code>DATE(ordered_at)</code>라는 식을 그 정렬 순서와 연결하지 않는다. 열에는 손대지 않고 상수 쪽을 <b>반열린 구간(half-open interval)</b>으로 바꾸면 정확히 같은 행을 고르면서 인덱스 구간을 만들 수 있다. 끝을 <code><= '2026-11-16 23:59:59'</code>로 닫지 않고 다음 날 0시 미만으로 여는 이유는, 열이 소수 초를 담는 <code>DATETIME(6)</code> 같은 타입이어도 경계가 새지 않게 하기 위해서다. 이 회차의 대시보드 쿼리가 처음부터 <code>>=</code>와 <code><</code>로 쓰여 있는 것도 같은 이유다.</p>
+
+<p>쿼리를 고칠 수 없는 사정이 있다면 MySQL 8.0.13부터 지원하는 함수 기반 키 파트(functional key part)를 쓸 수 있다. <code>CREATE INDEX idx_orders_order_date ON orders ((DATE(ordered_at)));</code>처럼 식을 괄호로 한 번 더 감싸 정의한다. 문서에 따르면 함수 인덱스는 숨겨진 가상 생성 열(hidden virtual generated column)로 구현되고, 쿼리의 식이 인덱스 정의의 식과 같아야 쓰인다(문서는 <code>SUBSTRING()</code>의 인자가 다르면 쓰이지 않는 예를 보여 준다). 그러나 같은 열에 대해 일반 인덱스와 함수 인덱스를 따로 유지하는 것은 그만큼 쓰기 비용을 늘리므로, 쿼리를 구간으로 고칠 수 있다면 그쪽이 먼저다.</p>
+
+<p>마지막으로, 개발 환경에서의 EXPLAIN을 믿으면 안 되는 이유도 같은 문서에 있다. 테이블이 아주 작으면 옵티마이저는 인덱스가 있어도 훑는 쪽을 고른다. 행이 수십 개뿐인 개발 DB에서 ALL이 나왔다고 인덱스 설계가 틀린 것은 아니고, 반대로 그곳에서 인덱스를 탄다고 운영에서도 탄다는 보장도 없다. 실행 계획은 반드시 운영과 비슷한 규모와 분포의 데이터에서 확인해야 한다.</p>
+
+<h3>해결 방안 1: 단일 열 인덱스와 그 한계</h3>
+
+<p>가장 먼저 떠오르는 처방은 WHERE 절의 열 하나에 인덱스를 거는 것이다. 후보는 <code>status</code>와 <code>ordered_at</code> 두 개다. 둘 다 만들어 보고 각각이 엔진 안에서 무엇을 읽게 되는지 세어 보자. 실험할 때는 한 번에 하나씩 만들고 확인한 뒤 지우는 편이 해석이 깔끔하다.</p>
+
+<pre><code class="language-sql">-- 후보 A
+ALTER TABLE orders ADD INDEX idx_orders_status (status);
+-- 후보 B
+ALTER TABLE orders ADD INDEX idx_orders_ordered_at (ordered_at);</code></pre>
+
+<h4>후보 A: status 인덱스</h4>
+
+<p><code>idx_orders_status</code>로 <code>status = 'PAID'</code>를 찾으면 인덱스에서 <code>'PAID'</code> 구간의 항목 5만 개를 읽고, 항목마다 들어 있는 기본 키로 클러스터형 인덱스를 찾아 들어가 행 전체를 가져온 뒤, 서버가 <code>ordered_at</code> 조건으로 3,000개만 남긴다. 옵티마이저가 이 계획을 고른다면 EXPLAIN은 <code>type: ref</code>, <code>key: idx_orders_status</code>, <code>key_len: 82</code>, <code>ref: const</code>로 나온다. 82는 02회에서 계산한 대로 <code>VARCHAR(20)</code>을 utf8mb4로 저장할 때의 최대 80바이트에 가변 길이 정보 2바이트를 더한 값이고, 열이 <code>NOT NULL</code>이라 NULL 표시 1바이트는 붙지 않는다. <code>Extra</code>에는 <code>ordered_at</code>을 서버가 거른다는 뜻의 <code>Using where</code>가 들어간다.</p>
+
+<p>이 계획의 문제는 클러스터형 인덱스 룩업 5만 번이 어디를 찾아가는가에 있다. 가정에서 <code>'PAID'</code> 주문은 2년에 걸쳐 흩어져 있다. 기본 키는 주문이 들어온 순서대로 늘어나므로, 5만 번의 룩업은 1만 개 리프 페이지 거의 전역에 걸쳐 흩어진 위치를 찾아간다(InnoDB 세컨더리 인덱스 안에서 같은 <code>status</code> 값의 항목은 뒤에 붙은 기본 키 순서로 놓이므로 룩업은 기본 키 오름차순으로 진행되지만, 06회에서 다룰 그 세부와 상관없이 접근할 페이지가 테이블 전역으로 넓게 퍼진다는 사실은 변하지 않는다). 풀 스캔이 1만 페이지를 한 번씩 순서대로 읽는 일이라면, 이 계획은 세컨더리 인덱스 항목 5만 개를 읽는 데 더해 룩업마다 루트에서 리프까지 트리를 다시 내려가므로 그보다 많은 횟수의 페이지 접근을 한다. 옵티마이저는 이 두 비용을 비교해 고르며, 앞에서 본 "후보는 있지만 <code>key</code>가 NULL인 ALL"이 바로 이렇게 나온다. 어느 쪽을 고를지는 통계, 버전, 비용 상수에 따라 달라질 수 있으므로 단정하지 말고 EXPLAIN으로 확인해야 한다. 이 회차의 데이터에서는 MySQL 8.4.13과 8.0.46 모두 <code>type: ref</code>, <code>key_len: 82</code>, <code>Extra: Using where</code>로 이 인덱스를 골랐고, <code>rows</code> 추정치는 97,808이었다. 8.4.13에서 실제로 실행해 보면 EXPLAIN ANALYZE의 인덱스 조회 단계가 50,000행을 내보냈고, <code>Handler_read_next</code>와 문장의 <code>ROWS_EXAMINED</code>도 50,000이었다.</p>
+
+<p>여기서 두 용어를 정확히 하자. <b>카디널리티(cardinality)</b>는 열에 들어 있는 서로 다른 값의 개수다. <code>SHOW INDEX FROM orders</code>의 <code>Cardinality</code> 열이 이 값의 추정치를 보여 준다(이 회차 데이터에서 8.4.13은 <code>idx_orders_status</code>의 <code>Cardinality</code>를 4로 보여 주었다. 표본으로 얻는 추정치라 실제 값 개수와 다를 수 있다). <b>선택도(selectivity)</b>는 조건 하나가 전체 행 중 몇 퍼센트를 고르는가다. 값이 작을수록 "선택적"이라고 말한다. <code>status</code>는 값이 다섯 가지뿐이라 카디널리티가 5다. 평균만 보면 값 하나가 20%를 고르지만, 실제 분포는 고르지 않다. 가정한 데이터에서 <code>'PAID'</code>는 5%, <code>'DELIVERED'</code>는 85%쯤이다. 같은 인덱스, 같은 쿼리 모양인데 상수만 <code>'DELIVERED'</code>로 바뀌면 이 인덱스로 85만 번 룩업을 하는 계획이 되고, 이는 문서가 말하는 "상수가 테이블의 너무 많은 부분을 덮는" 경우의 전형이다.</p>
+
+<p>그렇다면 옵티마이저는 상수마다 다른 분포를 어떻게 아는가. 범위 하나하나에 대해 <b>인덱스 다이브(index dive)</b>를 한다. 문서의 설명으로는 범위의 양 끝으로 인덱스를 내려가 보고 그 사이에 든 행 수를 추정치로 쓴다. 정확한 대신 비교 값이 많아지면 추정에 시간이 더 걸리므로, <code>IN</code> 목록처럼 등치 범위가 많을 때는 <code>eq_range_index_dive_limit</code>를 기준으로 덜 정확하지만 빠른 인덱스 통계 쪽으로 전환한다. <code>status = 'PAID'</code>는 범위가 하나뿐이므로 다이브로 추정한다. 카디널리티 5라는 평균이 아니라 실제 <code>'PAID'</code> 구간을 내려가 보고 판단한다는 뜻이다. 다만 다이브로 얻은 값도 근삿값이다. 이 회차 데이터에서 8.4.13의 <code>rows</code> 추정치는 <code>'PAID'</code>가 97,808(실제 50,000), <code>'DELIVERED'</code>가 534,267(실제 853,000)이었다. 그리고 이 어긋남이 계획을 바꿨다. <code>WHERE status = 'DELIVERED'</code>에 대해 8.4.13과 8.0.46(추정치 601,315) 모두 풀 스캔이 아니라 <code>idx_orders_status</code>로 <code>ref</code>를 골랐고, 8.4.13에서 EXPLAIN ANALYZE로 두 번 재 보니 이 계획의 집계가 655~827ms에 끝난 반면 <code>IGNORE INDEX (idx_orders_status)</code>로 풀 스캔을 시킨 쪽은 두 번 모두 272~273ms였다(시간은 실행 환경에 따라 달라진다). 상수가 테이블의 대부분을 덮는데도 옵티마이저가 인덱스를 고를 수 있다는 것, 그래서 EXPLAIN의 선택을 정답으로 믿지 말고 EXPLAIN ANALYZE로 실제를 봐야 한다는 것을 보여 주는 예다. 인덱스 없는 열의 분포를 옵티마이저에 알려 주는 히스토그램은 10회의 주제다.</p>
+
+<h4>후보 B: ordered_at 인덱스</h4>
+
+<p><code>idx_orders_ordered_at</code>은 <code>ordered_at >= '2026-11-10 00:00:00' AND ordered_at < '2026-11-17 00:00:00'</code>를 구간 하나로 만든다. MySQL 8.4.13에서 EXPLAIN은 <code>type: range</code>, <code>key: idx_orders_ordered_at</code>, <code>key_len: 5</code>, <code>ref: NULL</code>, <code>rows: 18240</code>(추정치, 실제 구간은 10,000행)으로 나오고, <code>Extra</code>는 <code>Using index condition; Using where</code>다(8.0.46도 같다). <code>status</code>는 인덱스에 없으므로 행을 가져온 뒤 서버가 거르고, 그것이 <code>Using where</code>다. <code>Using index condition</code>은 EXPLAIN ANALYZE에 <code>with index condition: ((orders.ordered_at >= ...) and (orders.ordered_at < ...))</code>로 보이듯 인덱스 열인 <code>ordered_at</code>의 조건을 엔진에도 넘겼다는 표시이고, 자세한 것은 08회에서 본다. <code>key_len</code> 5는 MySQL 5.6.4부터 <code>DATETIME</code>이 소수 초 없이 5바이트로 저장되기 때문이다(소수 초 정밀도에 따라 0~3바이트가 더 붙는다).</p>
+
+<p>이번에는 인덱스 항목 1만 개를 읽고 클러스터형 인덱스 룩업도 1만 번 한다. 후보 A보다 다섯 배 적다. 게다가 룩업이 찾아가는 위치에 좋은 성질이 있다. 가정에서 <code>id</code>는 <code>AUTO_INCREMENT</code>이고 주문은 시간 순서로 들어오므로, 최근 7일 주문 1만 건은 클러스터형 인덱스의 맨 끝 1만 행, 즉 마지막 100개 남짓의 리프 페이지에 몰려 있다. 1만 번의 룩업이 실제로 건드리는 서로 다른 리프 페이지는 그 정도이고, 최근 데이터라 버퍼 풀에 있을 가능성도 높다. 같은 "룩업 1만 번"이라도 흩어진 1만 페이지를 찾아가는 것과 이웃한 100페이지를 반복해서 찾아가는 것은 비용이 전혀 다르다. 데이터가 들어오는 순서와 기본 키 순서가 같다는 사실이 여기서 성능으로 이어진다.</p>
+
+<p>그래도 낭비는 남는다. 1만 행을 가져와 서버로 올렸는데 그중 7,000행은 <code>status</code>가 맞지 않아 버려진다. 느린 쿼리 로그로 보면 <code>Rows_examined</code>가 1만, 실제로 쓰인 행은 3,000이다(8.4.13에서 실행하면 EXPLAIN ANALYZE의 범위 스캔 단계가 10,000행, 그 위 <code>Filter</code>가 3,000행을 내보냈고, <code>Handler_read_next</code>와 <code>ROWS_EXAMINED</code>가 모두 10,000이었다). 풀 스캔의 100만에 비하면 극적인 개선이지만, 최근 7일 주문이 늘어날수록, 또는 다른 상태의 비중이 커질수록 버려지는 룩업도 함께 늘어난다. 두 인덱스를 모두 만들어 두면 어떨까. 문서는 여러 인덱스 중에서 고를 수 있을 때 MySQL이 보통 가장 적은 행을 찾는 인덱스, 즉 가장 선택적인 인덱스를 쓴다고 설명한다. 두 인덱스를 각각 읽어 교집합을 만드는 인덱스 머지(index merge)라는 방법도 있지만 그것은 09회의 주제이고, 대개는 처음부터 두 조건을 한 번에 담는 인덱스 하나가 더 낫다. 그것이 복합 인덱스다.</p>
+
+<h3>복합 인덱스는 어떻게 정렬되어 있는가</h3>
+
+<p>복합 인덱스(multiple-column index, composite index)는 여러 열을 묶어 하나의 키로 정렬한 인덱스다. MySQL에서는 열을 16개까지 묶을 수 있다. 복합 인덱스의 모든 성질은 단 하나의 사실에서 나온다. <b>항목이 첫 번째 열 기준으로 정렬되고, 첫 번째 열이 같은 항목끼리는 두 번째 열 기준으로, 그것도 같으면 세 번째 열 기준으로 정렬된다.</b> 사전이 단어를 첫 글자, 둘째 글자 순으로 정렬하는 것과 같아서 사전식 순서(lexicographic order)라고 부른다. 그리고 InnoDB에서 세컨더리 인덱스의 레코드에는 인덱스 열 뒤에 그 행의 기본 키 열이 함께 저장된다. 그래서 <code>(status, ordered_at)</code> 인덱스의 항목은 실제로 <code>(status, ordered_at, id)</code>의 모양이다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>성, 이름 순으로 정렬된 전화번호부</strong><p>전화번호부는 성으로 정렬되고, 같은 성 안에서는 이름으로 정렬된다. "김씨 중 이름이 '민'으로 시작하는 사람"은 김씨 구역을 펼친 뒤 그 안에서 '민' 부분만 읽으면 된다. 하지만 "이름이 '민준'인 사람"은 성마다 흩어져 있어서 책 전체를 넘겨야 한다. 비유가 깨지는 지점도 있다. 전화번호부에는 번호가 바로 적혀 있지만, 세컨더리 인덱스에는 행 전체가 아니라 기본 키만 적혀 있어서 나머지 열이 필요하면 클러스터형 인덱스를 다시 찾아가야 한다. 이 왕복이 앞에서 센 "룩업"이다.</p></aside>
+
+<p><code>(status, ordered_at)</code> 인덱스의 리프를 왼쪽부터 늘어놓으면 이런 모양이 된다. 상태 값의 정렬은 utf8mb4 기본 콜레이션의 알파벳 순서다.</p>
+
+<pre class="diagram">  idx_orders_status_ordered (status, ordered_at) + 기본 키 id
+
+  status     ordered_at            id
+  ─────────  ───────────────────   ───────
+  CANCELLED  2024-11-20 08:01:12      1042
+  CANCELLED  ...                       ...
+  DELIVERED  2024-11-18 00:00:41         3
+  DELIVERED  ...                       ...      ← 전체의 약 85%
+  PAID       2024-11-25 13:40:02      7710
+  PAID       ...                       ...
+  PAID       2026-11-09 23:59:10    989990
+  PAID       2026-11-10 00:00:03    990012  ◀─ 구간 시작
+  PAID       ...                       ...      약 3,000개가
+  PAID       2026-11-16 23:58:40    999950  ◀─ 구간 끝  한 덩어리로 연속
+  PAID       2026-11-17 00:02:11    999981     (구간 밖에서 멈춘다)
+  PENDING    ...                       ...
+  SHIPPED    ...                       ...</pre>
+
+<p>그림의 날짜와 id는 정렬 모양을 보이기 위한 예시다. 중요한 것은 구조다. <code>status = 'PAID'</code>인 항목은 한 덩어리로 모여 있고, 그 안에서 <code>ordered_at</code>은 오름차순이다. 따라서 "PAID이면서 11월 10일 이상 17일 미만"인 항목은 그 덩어리 안에서도 <b>끊김 없이 연속된 한 구간</b>을 이룬다. 엔진은 트리를 내려가 구간의 첫 항목을 찾고, 옆으로 읽다가 구간을 벗어나는 첫 항목을 만나면 멈춘다. 읽은 항목이 곧 필요한 항목이다.</p>
+
+<p>이 정렬 구조에서 MySQL 문서가 말하는 <b>최좌측 접두사(leftmost prefix)</b> 규칙이 바로 나온다. 문서는 <code>(col1, col2, col3)</code> 인덱스가 있으면 <code>(col1)</code>, <code>(col1, col2)</code>, <code>(col1, col2, col3)</code>에 대해 인덱스 검색 능력을 갖고, 열들이 최좌측 접두사를 이루지 않으면 인덱스로 조회할 수 없다고 적는다. 위 그림에서 <code>ordered_at</code>만으로 "11월 10일 이후"를 찾으려 한다고 생각해 보자. 그 날짜의 항목은 CANCELLED 덩어리 안에도, DELIVERED 덩어리 안에도, PAID 덩어리 안에도 흩어져 있다. 시작점 하나를 정해 읽어 나가는 구간이 하나로 만들어지지 않는다. 문서의 범위 최적화 절은 이것을 구간 표기로 보여 준다. 여러 열 인덱스의 구간은 키 튜플의 범위로 표현되고, 첫 열에 대한 조건 <code>key_part1 = 1</code>은 구간 하나를 정의하지만, 세 번째 열에 대한 조건 <code>key_part3 = 'abc'</code>는 구간 하나를 정의하지 못해 범위 접근에 쓸 수 없다. 8.0.13부터 생긴 스킵 스캔(skip scan)이 이 규칙에 예외를 만드는 경우가 있는데, 조건이 까다로워 08회에서 따로 다룬다.</p>
+
+<p>지금 쿼리의 조건을 같은 표기로 쓰면 이렇다.</p>
+
+<pre class="diagram">  (status, ordered_at) 인덱스:
+     ('PAID', '2026-11-10 00:00:00')  <=  (status, ordered_at)  <  ('PAID', '2026-11-17 00:00:00')
+     → 구간 하나. 두 열이 모두 구간의 경계를 정한다.
+
+  (ordered_at, status) 인덱스:
+     ('2026-11-10 00:00:00', -inf)  <=  (ordered_at, status)  <  ('2026-11-17 00:00:00', -inf)
+     → 구간 하나. 하지만 status는 구간을 좁히는 데 쓰이지 않는다.
+       구간 안의 약 10,000개 항목 중 PAID는 여기저기 섞여 있다.
+       (실제 MySQL이 시작 키에 'PAID'를 붙이는 모습은 해결 방안 2에서 본다)</pre>
+
+<p>두 번째 경우가 왜 그런지는 문서의 규칙이 정확히 설명한다. 옵티마이저는 비교 연산자가 <code>=</code>, <code><=></code>, <code>IS NULL</code>인 동안에는 다음 키 파트를 이어서 구간을 좁히는 데 쓴다. 연산자가 <code>></code>, <code><</code>, <code>>=</code>, <code><=</code>, <code>!=</code>, <code><></code>, <code>BETWEEN</code>, <code>LIKE</code>이면 그 조건까지는 쓰지만 <b>그 뒤의 키 파트는 더 고려하지 않는다</b>. 문서의 예에서 <code>key_part1 = 'foo' AND key_part2 >= 10 AND key_part3 > 10</code>은 세 번째 비교를 구간 만들기에 쓰지 않는다. 정렬 구조로 보면 당연하다. <code>ordered_at</code>이 범위로 열려 있으면 그 범위 안에서 <code>ordered_at</code> 값이 계속 바뀌고, <code>status</code>는 <code>ordered_at</code>이 같은 항목끼리에서만 정렬되어 있으므로 범위 전체에 걸쳐서는 아무 순서도 없다.</p>
+
+<x-visual id="db-perf-04-composite-order" title="열 순서가 다른 두 복합 인덱스에서 같은 조건이 차지하는 구간" kind="구조 비교 그림" ratio="16:9">
+<x-hint>(status, ordered_at)에서는 일치 항목이 한 덩어리로 연속하지만, (ordered_at, status)에서는 날짜 구간 전체를 읽어야 하고 일치 항목이 그 안에 흩어져 있다는 것을 나란히 보여 준다.</x-hint>
+<x-prompt>좌우 두 칸으로 나뉜 그림. 각 칸에는 세로로 길게 쌓인 얇은 가로 막대 서른 개가 인덱스 리프 항목을 나타낸다. 왼쪽 칸 제목 "(status, ordered_at)". 막대들이 색 띠로 묶여 위에서부터 "CANCELLED", "DELIVERED", "PAID", "PENDING", "SHIPPED" 라벨이 붙어 있고, PAID 띠 안의 연속된 막대 다섯 개만 초록색으로 칠해져 하나의 괄호로 묶여 있으며 괄호 옆에 "읽는 구간 = 필요한 항목" 라벨. 오른쪽 칸 제목 "(ordered_at, status)". 막대들 위쪽에서 아래로 "날짜 순" 화살표가 있고, 가운데 연속된 막대 열다섯 개가 연한 회색 괄호로 묶여 "읽는 구간: 최근 7일 전체" 라벨, 그 열다섯 개 중 다섯 개만 초록색으로 듬성듬성 칠해져 "PAID" 라벨이 붙어 있다. 흰 배경, 초록 강조, 회색 보조.</x-prompt>
+<x-caption>등치 조건 열이 앞에 있으면 일치 항목이 연속하고, 범위 조건 열이 앞에 있으면 뒤의 열은 구간을 좁히지 못한다.</x-caption>
+</x-visual>
+
+<h3>해결 방안 2: (status, ordered_at) 복합 인덱스</h3>
+
+<p>이제 처방은 분명하다. 등치 조건 열 <code>status</code>를 앞에, 범위 조건 열 <code>ordered_at</code>을 뒤에 둔 복합 인덱스를 만든다.</p>
+
+<pre><code class="language-sql">ALTER TABLE orders ADD INDEX idx_orders_status_ordered (status, ordered_at);
+
+EXPLAIN SELECT COUNT(*), SUM(amount) FROM orders
+WHERE status = 'PAID'
+  AND ordered_at >= '2026-11-10 00:00:00' AND ordered_at < '2026-11-17 00:00:00'\G</code></pre>
+
+<pre data-label="EXPLAIN에서 볼 열(MySQL 8.4.13에서 실행, 8.0.46도 같다)"><code class="language-text">         type: range
+          key: idx_orders_status_ordered
+      key_len: 87
+          ref: NULL
+         rows: 3000</code></pre>
+
+<p>판단의 핵심 증거는 <code>key_len</code> 87이다. <code>status</code> 부분이 82바이트, <code>ordered_at</code> 부분이 5바이트이므로, 87은 <b>두 열이 모두 구간의 경계를 정하는 데 쓰였다</b>는 뜻이다(다만 87이 "두 열이 모두 구간을 좁혔다"까지 보장하지는 않는다는 것을 아래에서 <code>(ordered_at, status)</code>와 비교하며 본다). 만약 82가 나왔다면 <code>status</code>만 구간에 쓰고 날짜는 나중에 거른 것이다. 문서는 <code>key_len</code>으로 여러 열 인덱스의 몇 개 부분이 실제로 쓰였는지 알 수 있다고 설명하며, range 접근에서 <code>key_len</code>은 쓰인 키 파트 중 가장 긴 길이를 담는다. <code>ref</code>가 NULL인 것은 range에서 항상 그렇다. 값 하나를 대 보는 것이 아니라 구간의 경계를 정하기 때문이다. 이 문장의 <code>Extra</code> 열이 보여 주는 정보는 인덱스 컨디션 푸시다운과 함께 08회에서 다룬다.</p>
+
+<p>엔진 안에서 일어나는 일을 다시 세어 보자. 트리를 루트에서 리프까지 한 번 내려가 <code>('PAID', '2026-11-10 00:00:00')</code> 이상인 첫 항목을 찾는다. 그 뒤로 리프를 따라 약 3,000개 항목을 읽는다. 세컨더리 인덱스 항목은 행 전체보다 훨씬 작아서 한 페이지에 많이 들어가므로 이 3,000개는 적은 수의 리프 페이지에 담겨 있다. <code>SUM(amount)</code>에 필요한 <code>amount</code>는 인덱스에 없으므로 항목마다 기본 키로 클러스터형 인덱스를 찾아가 행을 가져온다. 이 3,000번의 룩업은 후보 B에서 본 것처럼 테이블 끝쪽 100여 페이지에 몰린다. 서버로 올라오는 행은 3,000개이고, 모두 조건을 만족하므로 버려지는 것이 없다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>계획</th><th>엔진이 읽는 인덱스 항목</th><th>클러스터형 인덱스 룩업</th><th>Rows_examined</th><th>key_len</th></tr></thead><tbody>
+<tr><td>인덱스 없음(ALL)</td><td>없음(리프 1만 페이지의 레코드 100만 개를 직접 읽음)</td><td>없음</td><td>1,000,000</td><td>NULL</td></tr>
+<tr><td><code>(status)</code>로 ref</td><td>50,000</td><td>50,000 (넓게 흩어짐)</td><td>50,000</td><td>82</td></tr>
+<tr><td><code>(ordered_at)</code>로 range</td><td>10,000</td><td>10,000 (끝쪽에 몰림)</td><td>10,000</td><td>5</td></tr>
+<tr><td><code>(ordered_at, status)</code>로 range + ICP</td><td>10,000</td><td>3,000</td><td>3,000</td><td>87 (아래 설명)</td></tr>
+<tr><td><code>(status, ordered_at)</code>로 range</td><td>3,000</td><td>3,000</td><td>3,000</td><td>87</td></tr>
+</tbody></table></div>
+
+<p>표에서 <code>Rows_examined</code>와 <code>key_len</code>은 이 회차의 데이터로 MySQL 8.4.13에서 실행해 확인한 값이고(<code>key_len</code>은 8.0.46에서도 같았다), 엔진이 읽는 인덱스 항목과 룩업 수는 구조에서 셈한 값이다. 넷째 줄을 주의 깊게 보자. <code>(ordered_at, status)</code> 인덱스에서 <code>status</code>는 구간을 좁히지 못하지만, 인덱스 항목 안에 <code>status</code> 값이 들어 있다. 그래서 MySQL은 인덱스 컨디션 푸시다운(Index Condition Pushdown, ICP)으로 <code>status = 'PAID'</code> 검사를 엔진에 내려보내, 인덱스 항목을 읽는 시점에 맞지 않는 것을 걸러 낼 수 있다. 이것이 적용되면 EXPLAIN의 <code>Extra</code>에 <code>Using index condition</code>이 나타나고, 클러스터형 인덱스 룩업은 3,000번으로 줄어든다. 하지만 엔진이 읽는 인덱스 항목은 여전히 날짜 구간 전체인 1만 개다. ICP의 동작 원리는 08회에서 자세히 본다.</p>
+
+<p>그리고 여기서 앞에서 미뤄 둔 함정이 드러난다. 넷째 줄과 다섯째 줄의 <code>Rows_examined</code>는 둘 다 3,000이다. 문서의 정의대로 <code>Rows_examined</code>는 서버 계층이 검사한 행만 세고 엔진 내부의 처리는 세지 않기 때문에, ICP로 엔진 안에서 버려진 7,000개 항목은 이 숫자에 보이지 않는다. 느린 쿼리 로그만 보고 "두 인덱스가 같은 일을 한다"고 결론 내리면 틀린다. 핸들러 카운터도 마찬가지여서, 8.4.13에서 두 인덱스 모두 <code>Handler_read_key</code> 1, <code>Handler_read_next</code> 3,000이 나왔다. ICP로 걸러진 항목은 서버에 행으로 넘어오지 않으므로 <code>Handler_read_next</code>에도 잡히지 않는다.</p>
+
+<p>더 조심할 것은 <code>key_len</code>이다. 정렬 구조로 보면 <code>(ordered_at, status)</code>에서 <code>status</code>는 구간을 좁히지 못하니 <code>key_len</code>이 5로 나올 것 같지만, MySQL 8.4.13과 8.0.46에서 실제로 실행하면 두 인덱스 모두 <code>key_len: 87</code>, <code>Extra: Using index condition</code>으로 나온다. 차이는 <code>rows</code> 추정치(<code>(ordered_at, status)</code>는 18,102, <code>(status, ordered_at)</code>은 3,000)와, EXPLAIN ANALYZE(또는 <code>EXPLAIN FORMAT=TREE</code>)가 보여 주는 구간에서 드러난다.</p>
+
+<pre data-label="EXPLAIN ANALYZE의 범위 스캔 줄(MySQL 8.4.13에서 실행, 8.0.46도 같다, 비용·시간 생략)"><code class="language-text">(ordered_at, status):
+-> Index range scan on orders using idx_orders_ordered_status over ('2026-11-10 00:00:00' <= ordered_at <= '2026-11-17 00:00:00' AND 'PAID' <= status), with index condition: (...)
+
+(status, ordered_at):
+-> Index range scan on orders using idx_orders_status_ordered over (status = 'PAID' AND '2026-11-10 00:00:00' <= ordered_at < '2026-11-17 00:00:00'), with index condition: (...)</code></pre>
+
+<p>첫 줄의 <code>'PAID' <= status</code>는 구간의 시작 키가 <code>('2026-11-10 00:00:00', 'PAID')</code>라는 뜻이다. 옵티마이저가 <code>ordered_at</code>의 아래쪽 경계 뒤에 <code>status</code> 조건을 시작 키로 이어 붙인 것이고, 앞에서 본 대로 range 접근의 <code>key_len</code>은 쓰인 키 파트 중 가장 긴 길이이므로 87이 된다. 그러나 이 덧붙임은 첫 시각 <code>'2026-11-10 00:00:00'</code>과 정확히 같은 항목들 사이에서 시작점을 옮길 뿐이고, 그 뒤로는 날짜 구간 전체를 읽으며 <code>status</code>를 ICP로 거른다. 둘째 줄처럼 <code>status = 'PAID'</code>가 구간 전체를 고정해야 두 열이 모두 구간을 좁힌 것이다. 그래서 <code>key_len</code>만으로는 "두 열이 모두 구간을 좁혔다"를 증명할 수 없고, <code>rows</code>와 구간 표시를 함께 봐야 한다. 진단 도구마다 무엇을 세고 무엇을 보여 주는지 정확히 알아야 하는 이유다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>복합 인덱스는 열 순서대로 사전식 정렬되어 있다. 그래서 앞쪽 열들이 등치 조건으로 고정될 때만 뒤쪽 열이 구간을 더 좁힐 수 있고, 범위 조건이 나오는 순간 그 뒤의 열은 구간에 기여하지 못한다. 등치 조건 열을 앞에, 범위 조건 열을 뒤에 두면 "읽는 항목 = 필요한 항목"이 되고, 이것은 <code>key_len</code>과 함께 EXPLAIN ANALYZE가 보여 주는 구간과 <code>rows</code>로 확인한다.</p></aside>
+
+<p>이 인덱스는 같은 화면의 목록 쿼리에도 이점을 준다. "최근 결제 완료 주문 20건"을 <code>ORDER BY ordered_at DESC LIMIT 20</code>으로 보여 준다면, <code>status</code>가 등치로 고정된 구간 안에서 항목이 이미 <code>ordered_at</code> 순서로 놓여 있으므로 정렬 작업 없이 인덱스를 거꾸로 읽다가 20건에서 멈출 수 있다. 이 조기 종료와 <code>Using filesort</code>의 진단은 07회의 주제다. 또 카드가 <code>COUNT(*)</code>만 필요했다면 인덱스 항목만으로 답을 낼 수 있어 클러스터형 인덱스 룩업 3,000번마저 사라지는데, 이것이 08회에서 다룰 커버링 인덱스다.</p>
+
+<h3>열 순서를 정하는 원칙과 흔한 오해</h3>
+
+<p>지금까지의 분석을 원칙으로 정리하면 다음과 같다. 첫째, 쿼리에서 등치(<code>=</code>, <code>IN</code>) 조건으로 비교되는 열을 앞에 둔다. 둘째, 범위 조건으로 비교되는 열은 그 뒤에 하나만 둔다. 셋째, 범위 조건 열 뒤에 오는 열은 구간을 좁히지 못하며, 필요하다면 ICP로 거르거나 커버링 용도로만 쓰인다. 이 원칙은 외워야 할 규칙이 아니라 사전식 정렬에서 유도되는 결과이므로, 헷갈릴 때는 정렬된 항목을 직접 그려 보면 된다. 이 원칙을 기준으로 흔한 오해를 하나씩 바로잡자.</p>
+
+<h4>오해 1: "카디널리티가 높은 열을 무조건 앞에 둔다"</h4>
+
+<p>널리 퍼진 경험칙이지만 이 회차의 쿼리가 반례다. <code>ordered_at</code>은 거의 모든 값이 다른 열이고 <code>status</code>는 값이 다섯 개뿐이다. 경험칙대로 <code>(ordered_at, status)</code>를 만들면 위 표의 넷째 줄, 즉 더 나쁜 계획이 된다. 범위 조건 열을 앞에 두는 순간 뒤의 열이 구간에서 빠지기 때문이다.</p>
+
+<p>그렇다면 두 열이 모두 등치 조건일 때는 카디널리티가 중요할까. <code>WHERE status = 'PAID' AND member_id = 42</code>를 생각해 보자. <code>(status, member_id)</code>에서 일치 항목은 <code>('PAID', 42)</code>로 시작하는 연속 구간이고, <code>(member_id, status)</code>에서는 <code>(42, 'PAID')</code>로 시작하는 연속 구간이다. 두 구간에 든 항목은 정확히 같은 행들이고 개수도 같다. 트리를 내려가는 비용도 같은 수준이다. 이 쿼리 하나만 놓고 보면 순서가 결과에 영향을 주지 않는다. 순서가 의미를 갖는 것은 <b>다른 쿼리가 이 인덱스를 얼마나 재사용할 수 있는가</b>에서다. "회원 42번의 주문 전체"를 찾는 쿼리도 있다면 <code>(member_id, status)</code>는 최좌측 접두사 <code>(member_id)</code>로 그 쿼리를 함께 처리할 수 있지만, <code>(status, member_id)</code>는 그럴 수 없다. 카디널리티는 이런 재사용 판단에서 고려할 요소 가운데 하나이지, 열 순서의 제1원칙이 아니다.</p>
+
+<h4>오해 2: "WHERE 절에 쓴 순서와 인덱스 열 순서를 맞춰야 한다"</h4>
+
+<p><code>AND</code>로 묶인 조건은 순서가 의미를 갖지 않는다. 옵티마이저는 WHERE 절 전체를 분석해 인덱스의 각 키 파트에 대응하는 조건을 찾아 구간을 만든다. <code>WHERE ordered_at >= ... AND status = 'PAID'</code>라고 써도 <code>(status, ordered_at)</code> 인덱스는 똑같이 <code>key_len</code> 87로 쓰인다(MySQL 8.4.13에서 확인하면 <code>rows</code> 3000, <code>Extra</code>까지 같은 계획이 나왔다). 중요한 것은 인덱스의 열 순서이고, 쿼리 문자열의 조건 순서가 아니다.</p>
+
+<h4>오해 3: "(a, b) 인덱스가 있으면 b만 쓰는 조건에도 쓰인다"</h4>
+
+<p>최좌측 접두사 규칙에 따라 <code>(status, ordered_at)</code>은 <code>ordered_at</code>만 있는 조건의 구간을 만들지 못한다. "최근 7일 전체 주문 수"처럼 상태와 무관한 쿼리가 따로 있다면 그 쿼리를 위해 <code>ordered_at</code>이 앞에 오는 인덱스가 따로 필요할 수 있다. 다만 두 가지 예외적 경로가 있다. 앞쪽 열의 서로 다른 값마다 구간을 나눠 읽는 스킵 스캔(08회), 그리고 필요한 열이 모두 인덱스에 있을 때 테이블 대신 인덱스 전체를 훑는 <code>type: index</code>다. 후자는 02회에서 본 것처럼 범위를 좁힌 것이 아니라 더 작은 대상을 처음부터 끝까지 훑은 것이다.</p>
+
+<h4>오해 4: "인덱스는 많을수록 좋다"</h4>
+
+<p>세컨더리 인덱스는 공짜가 아니다. 행을 하나 넣거나 지울 때마다 모든 세컨더리 인덱스에도 항목을 넣거나 지워야 하고, 인덱스에 포함된 열을 수정하면 그 인덱스의 항목도 옮겨야 한다. 인덱스마다 디스크 공간을 차지하고, 자주 쓰이면 버퍼 풀의 메모리도 나눠 쓴다. 그래서 인덱스를 추가할 때는 이미 있는 인덱스를 대체할 수 있는지를 함께 본다. <code>(status, ordered_at)</code>을 만들었다면 해결 방안 1에서 만든 <code>(status)</code>는 그 최좌측 접두사이므로 할 수 있는 일이 모두 겹친다. sys 스키마의 <code>schema_redundant_indexes</code> 뷰는 이런 인덱스를 찾아 중복된 인덱스(<code>redundant_index_name</code>), 그것을 중복으로 만드는 지배 인덱스(<code>dominant_index_name</code>), 그리고 지우는 문장(<code>sql_drop_index</code>)까지 보여 준다. 다만 지우기 전에 그 인덱스를 힌트로 지정한 쿼리가 없는지 확인해야 하며, 8.0의 보이지 않는 인덱스(invisible index)로 먼저 옵티마이저에게서 숨겨 보는 운영 방법은 09회에서 다룬다.</p>
+
+<h4>등치 조건의 변형: IN과 부정 조건</h4>
+
+<p>대시보드에 "결제 완료와 출고 중을 함께 보기" 필터가 생겨 <code>status IN ('PAID', 'SHIPPED')</code>가 되었다고 하자. <code>IN</code>은 등치 조건의 <code>OR</code>와 같으므로, <code>(status, ordered_at)</code> 인덱스에서는 <code>('PAID', 날짜 구간)</code>과 <code>('SHIPPED', 날짜 구간)</code>이라는 두 개의 구간이 만들어지고 각 구간에서 두 열이 모두 쓰인다. <code>key_len</code>은 여전히 87이다. 반대로 <code>status <> 'DELIVERED'</code>는 문서의 규칙에서 "그 뒤의 키 파트를 고려하지 않는" 연산자다. 이 경우 구간은 <code>status</code>에 대해서만 만들어지고(<code>'DELIVERED'</code>보다 작은 쪽과 큰 쪽) <code>ordered_at</code>은 구간에 쓰이지 않아 <code>key_len</code>이 82로 떨어진다. MySQL 8.4.13에서 실행하면 <code>IN</code> 쪽은 EXPLAIN ANALYZE에 <code>over (status = 'PAID' AND '2026-11-10 00:00:00' <= ordered_at < '2026-11-17 00:00:00') OR (status = 'SHIPPED' AND ...)</code>처럼 두 구간이 찍히고 <code>key_len</code> 87, <code>rows</code> 6000이었다. <code><></code> 쪽(<code>status <> 'DELIVERED' AND ordered_at >= '2026-11-10'</code>)은 <code>over (status < 'DELIVERED') OR ('DELIVERED' < status)</code>로 <code>key_len</code> 82였고, <code>ordered_at</code> 조건은 구간이 아니라 ICP로 걸러졌다. 같은 의미를 담을 수 있다면 부정 조건보다 값을 나열한 <code>IN</code>이 복합 인덱스와 잘 맞는다.</p>
+
+<h3>인덱스 추가 작업의 비용과 검증 절차</h3>
+
+<p>인덱스를 운영 중인 큰 테이블에 추가하는 일 자체도 짚어 두자. MySQL 8.0의 InnoDB에서 세컨더리 인덱스 추가는 온라인 DDL 문서의 표에 "제자리(in place) 수행: 예, 테이블 재구성: 아니요, 동시 DML 허용: 예"로 정리되어 있다. 문서는 인덱스를 만드는 동안 테이블이 읽기와 쓰기에 계속 열려 있다고 설명한다. 다만 <code>CREATE INDEX</code>는 그 테이블에 접근 중인 모든 트랜잭션이 끝난 뒤에야 완료되어 인덱스의 초기 상태가 테이블의 최신 내용을 반영하게 된다. 오래 열려 있는 트랜잭션이 이 테이블을 붙잡고 있으면 인덱스 생성이 끝나지 않는다는 뜻이므로, 작업 전에 긴 트랜잭션이 없는지 확인한다. 문서는 또 대량 적재 상황이라면 세컨더리 인덱스 없이 테이블을 만들고 데이터를 넣은 뒤 인덱스를 추가하는 편이 전체 과정을 빠르게 할 수 있다고 적는다.</p>
+
+<p>인덱스를 만들었으면 기대한 대로 쓰이는지 반드시 확인한다. 진단에 썼던 도구를 그대로 거꾸로 쓰면 된다.</p>
+
+<figure class="flow-figure"><figcaption>풀 스캔 진단에서 복합 인덱스 적용과 검증까지</figcaption><ol class="flow">
+<li><strong>문장 찾기</strong><span>느린 쿼리 로그의 <code>Rows_examined</code> 대 <code>Rows_sent</code>, <code>sys.statements_with_full_table_scans</code>의 실행 횟수와 평균 검사 행 수로 후보를 고른다.</span></li>
+<li><strong>원인 가르기</strong><span>운영과 비슷한 규모의 데이터에서 EXPLAIN을 본다. <code>possible_keys</code>가 NULL이면 인덱스나 쿼리 모양을, 후보가 있는데 <code>key</code>가 NULL이면 분포와 통계를 의심한다.</span></li>
+<li><strong>쿼리 모양 정리</strong><span>열에 씌운 함수, 타입이 다른 비교, 앞쪽 와일드카드를 걷어 내 조건이 범위 조건이 되게 한다.</span></li>
+<li><strong>인덱스 설계</strong><span>등치 조건 열을 앞에, 범위 조건 열을 뒤에 둔 복합 인덱스를 만든다. 기존 인덱스를 대체할 수 있는지도 본다.</span></li>
+<li><strong>계획 확인</strong><span>EXPLAIN의 <code>type</code>, <code>key</code>, <code>key_len</code>, <code>rows</code>로 두 열이 모두 구간에 쓰였는지 확인한다.</span></li>
+<li><strong>실제 확인</strong><span><code>FLUSH STATUS</code> 후 <code>Handler_read_rnd_next</code>가 사라지고 <code>Handler_read_key</code>, <code>Handler_read_next</code>가 결과 규모로 움직이는지 보고, <code>EXPLAIN ANALYZE</code>로 실제 행 수를 본다.</span></li>
+<li><strong>정리와 추적</strong><span>실험용으로 만든 인덱스와 중복 인덱스를 정리하고, 이후 느린 쿼리 로그와 sys 지표에서 그 문장이 사라졌는지 추적한다.</span></li>
+</ol></figure>
+
+<p>6단계에서 기대하는 모습을 구체적으로 적어 보면, 복합 인덱스로 바뀐 뒤 같은 문장을 실행했을 때 <code>Handler_read_rnd_next</code>는 거의 0이 되고, 구간의 시작점을 찾는 <code>Handler_read_key</code>가 작은 값으로, 구간을 따라 읽는 <code>Handler_read_next</code>가 구간의 항목 수 안팎으로 올라간다. 100만 단위로 움직이던 카운터가 결과 규모의 숫자로 바뀐다는 것이 개선의 실증이다. 이 회차 데이터로 MySQL 8.4.13에서 실행하면 인덱스가 없을 때 <code>Handler_read_rnd_next</code> 1,000,001이던 값이 <code>(status, ordered_at)</code> 인덱스를 만든 뒤에는 <code>Handler_read_rnd_next</code> 0, <code>Handler_read_key</code> 1, <code>Handler_read_next</code> 3,000이 되었고, EXPLAIN ANALYZE의 범위 스캔 단계도 <code>rows=3000</code>을 내보냈다. 다만 앞에서 본 대로 <code>Handler_read_next</code>는 ICP로 걸러진 항목을 세지 않으므로, <code>(ordered_at, status)</code>처럼 엔진 안에서 많이 버리는 계획도 같은 3,000으로 보인다. 정확한 값은 버전과 실행 방식에 따라 조금씩 다를 수 있으므로 "규모가 바뀌었는가"를 보되, 구간 자체는 EXPLAIN으로 확인한다.</p>
+
+<h3>이 회차가 다음 회차들과 이어지는 곳</h3>
+
+<p>이 회차는 일부러 여러 세부를 다음 회차로 미뤘다. 05회는 이 회차에서 "트리를 내려가 첫 항목을 찾고 옆으로 읽는다"고만 말한 B+Tree의 구조와 페이지 분할을, 06회는 세컨더리 인덱스 항목에서 기본 키를 꺼내 클러스터형 인덱스를 다시 찾아가는 룩업의 구조와 비용을 다룬다. 07회는 같은 대시보드의 목록 쿼리처럼 정렬과 <code>LIMIT</code>이 붙을 때 <code>Using filesort</code>를 진단하고 인덱스 순서로 조기 종료하는 법을, 08회는 이 회차에서 잠깐 등장한 ICP, 커버링 인덱스, 스킵 스캔을 다룬다. 09회는 두 단일 인덱스를 합치는 인덱스 머지와 MRR, 힌트, 보이지 않는 인덱스 같은 운영 도구를, 10회는 옵티마이저가 풀 스캔과 인덱스 사이에서 고를 때 쓰는 비용 모델과 히스토그램을 다룬다.</p>
+
+<p>이 회차에서 세운 질문, "결과 하나를 위해 몇 개의 행과 페이지를 만졌는가"는 이후 모든 튜닝 회차에서 똑같이 쓰인다. 조인에서는 바깥 테이블의 행마다 안쪽 테이블을 몇 번 찾아가는가(11회)로, 정렬과 페이징에서는 버려질 행을 몇 개나 읽었다가 버리는가(12회)로 모양만 바뀔 뿐이다. 그리고 JPA로 작성한 조회도 결국 이 SQL이 되어 실행된다는 점에서, 앞선 권에서 본 Querydsl의 동적 조건이 어떤 WHERE 절을 만들어 내는지 알아야 그에 맞는 인덱스를 설계할 수 있다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>풀 테이블 스캔의 신호</dt><dd>결과 크기는 그대로인데 응답 시간이 데이터 누적과 함께 늘어난다. 느린 쿼리 로그의 <code>Rows_examined</code>가 테이블 행 수에 가깝고, <code>Handler_read_rnd_next</code>가 크게 오르며, EXPLAIN의 <code>type</code>이 ALL이다.</dd>
+<dt>두 종류의 ALL</dt><dd><code>possible_keys</code>가 NULL이면 쓸 수 있는 인덱스가 없는 것이고, 후보가 있는데 <code>key</code>가 NULL이면 옵티마이저가 풀 스캔이 더 싸다고 추정한 것이다. 처방이 다르다.</dd>
+<dt>풀 스캔의 실제 비용</dt><dd>InnoDB는 클러스터형 인덱스 리프를 끝까지 읽고 모든 레코드를 서버로 넘겨 조건을 검사한다. 버퍼 풀에 다 있어도 CPU 비용은 행 수에 비례하며, 같은 조건의 UPDATE·DELETE는 훑은 모든 행을 잠근다.</dd>
+<dt>범위 조건의 정의</dt><dd>인덱스 열 자체를 상수와 비교해야 구간을 만들 수 있다. 열에 함수를 씌우거나, 문자열 열을 숫자와 비교하거나, 와일드카드로 시작하는 LIKE는 구간을 만들지 못한다.</dd>
+<dt>단일 열 인덱스의 한계</dt><dd>한 조건으로 구간을 좁히고 나머지 조건은 행을 가져온 뒤 서버가 거르므로, 읽고 버리는 룩업이 남는다. 같은 인덱스라도 상수의 선택도에 따라 풀 스캔이 더 싸질 수 있다.</dd>
+<dt>복합 인덱스의 사전식 정렬</dt><dd>항목은 첫 열, 같으면 둘째 열 순으로 정렬되고 InnoDB에서는 기본 키가 뒤에 붙는다. 여기서 최좌측 접두사 규칙이 나온다.</dd>
+<dt>열 순서 원칙</dt><dd>등치 조건 열을 앞에, 범위 조건 열을 뒤에 둔다. 범위 조건 뒤의 열은 구간을 좁히지 못한다. 결과는 <code>key_len</code>과 EXPLAIN ANALYZE의 구간 표시로 확인한다. <code>(ordered_at, status)</code>도 시작 키에 <code>status</code>가 붙어 <code>key_len</code>이 87로 나올 수 있다.</dd>
+<dt>Rows_examined의 한계</dt><dd>서버 계층이 검사한 행만 세므로, ICP처럼 엔진 안에서 걸러진 인덱스 항목은 보이지 않는다(<code>Handler_read_next</code>도 마찬가지다). EXPLAIN의 <code>rows</code>와 EXPLAIN ANALYZE의 구간 표시를 함께 본다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무의 풀 스캔 장애는 대부분 "처음에는 괜찮았다"로 시작한다. 테이블이 작을 때는 옵티마이저도 스캔을 고르고 응답도 빠르니, 인덱스가 없다는 사실이 드러나지 않는다. 그래서 새 조회 기능을 붙일 때는 응답 시간이 아니라 실행 계획과 검사 행 수를 기준으로 검토하는 습관이 필요하다. 운영과 비슷한 규모의 데이터에서 EXPLAIN을 보고, <code>log_queries_not_using_indexes</code>나 sys 스키마로 "아직 느리지 않은 풀 스캔"을 미리 찾아 두면 장애가 되기 전에 고칠 수 있다.</p>
+<p>인덱스 설계에서 판단이 갈리는 지점은 "이 인덱스가 어떤 쿼리들을 함께 처리해야 하는가"다. 쿼리 하나만 보면 등치 열을 앞에, 범위 열을 뒤에 두는 것으로 끝나지만, 같은 테이블에 다른 조회와 쓰기가 함께 있다. 인덱스가 늘수록 INSERT와 UPDATE가 무거워지므로, 기존 인덱스를 확장해 대체할 수 있는지, 최좌측 접두사로 여러 쿼리를 함께 받을 수 있는지를 따져 개수를 관리한다. 쓰기가 많은 주문 테이블과 읽기 위주의 통계 테이블에서 이 저울은 다르게 기운다.</p>
+<p>관리자 화면처럼 같은 집계를 자주 반복하는 쿼리라면, 인덱스를 잘 만든 뒤에도 "매번 3,000행을 다시 세는 것"이 적절한지 다시 물어볼 수 있다. 결과를 미리 집계해 두는 방법은 12회에서 다룬다. 또 쓰기 쿼리의 풀 스캔은 성능 문제를 넘어 락 문제가 되므로, 배치성 UPDATE와 DELETE의 WHERE 절은 조회 쿼리보다 더 엄격하게 인덱스로 받쳐 두어야 한다. 인덱스가 훑는 범위가 곧 잠기는 범위다.</p>
+</x-review>
+
+<x-practice>
+<li><code>orders</code>에 <code>(status, ordered_at)</code> 인덱스만 있다고 하자. 다음 WHERE 절 각각에 대해 이 인덱스로 구간을 만들 수 있는지, 만든다면 <code>key_len</code>이 얼마인지 답하라. (가) <code>status = 'SHIPPED'</code> (나) <code>ordered_at >= '2026-11-10'</code> (다) <code>status IN ('PAID', 'SHIPPED') AND ordered_at >= '2026-11-10' AND ordered_at < '2026-11-17'</code> (라) <code>status <> 'DELIVERED' AND ordered_at >= '2026-11-10'</code></li>
+<li>대시보드의 "어제 주문 수" 카드가 <code>WHERE DATE(ordered_at) = CURDATE() - INTERVAL 1 DAY</code>로 작성되어 있고 <code>ordered_at</code>에 인덱스가 있는데도 EXPLAIN이 ALL을 보인다. 이유를 범위 조건의 정의로 설명하고, 같은 행을 고르면서 인덱스를 쓸 수 있게 고쳐 써라.</li>
+<li>인덱스가 기본 키뿐인 <code>orders</code>에 <code>UPDATE orders SET status = 'EXPIRED' WHERE status = 'PENDING' AND ordered_at < '2026-10-18'</code> 배치가 REPEATABLE READ에서 실행되는 동안, 다른 세션의 새 주문 INSERT에 무슨 일이 생기는지 설명하라. 어떤 인덱스가 이 문제를 줄이는가?</li>
+<li>해결 방안 1의 <code>(ordered_at)</code> 인덱스를 적용한 뒤 느린 쿼리 로그에 <code>Rows_sent: 1</code>, <code>Rows_examined: 10000</code>이 찍혔다. 이 숫자가 무엇을 말하는지, 다음에 무엇을 해야 하는지 적어라.</li>
+<li>동료가 "<code>(ordered_at, status)</code>로 만들어도 느린 쿼리 로그의 <code>Rows_examined</code>가 3,000으로 <code>(status, ordered_at)</code>과 똑같으니 둘은 같은 성능"이라고 주장한다. 이 주장의 오류를 설명하고, 차이를 보여 줄 증거를 EXPLAIN에서 두 가지 들어라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> (가) 첫 열에 대한 등치 조건이므로 쓸 수 있다. <code>type</code>은 ref, <code>key_len</code>은 <code>status</code> 부분인 82다. (나) <code>ordered_at</code>은 두 번째 열이라 최좌측 접두사가 아니다. 날짜가 같은 항목이 상태별 덩어리마다 흩어져 있어 구간 하나를 만들 수 없으므로 이 조건으로는 조회에 쓰지 못한다(스킵 스캔이라는 예외는 08회). MySQL 8.4.13에서 <code>SELECT COUNT(*), SUM(amount)</code>로 확인하면 <code>possible_keys</code>가 NULL인 ALL이었고, SELECT 목록이 <code>COUNT(*)</code>뿐이면 <code>Using index for skip scan</code>이 나왔다. (다) <code>IN</code>은 등치의 <code>OR</code>이므로 <code>('PAID', 날짜 구간)</code>과 <code>('SHIPPED', 날짜 구간)</code> 두 구간이 만들어지고 각각 두 열을 모두 쓴다. <code>key_len</code>은 87이다. (라) <code><></code>는 문서의 규칙에서 그 뒤 키 파트를 고려하지 않는 연산자다. 인덱스를 쓴다면 <code>status</code>에 대해서만 두 구간이 만들어져 <code>key_len</code>은 82이고, <code>ordered_at</code>은 나중에 거른다. 다만 <code>'DELIVERED'</code>를 뺀 나머지가 테이블의 15% 정도라 옵티마이저가 풀 스캔을 고를 수도 있다. 이 회차 데이터로 확인하면 MySQL 8.4.13은 이 인덱스로 range(<code>key_len</code> 82, <code>ordered_at</code>은 ICP로 거름)를 골랐고, 8.0.46은 <code>possible_keys</code>에 이 인덱스가 있는 채 ALL을 골랐다.</p>
+<p><b>2.</b> 범위 조건은 인덱스 열 자체를 상수와 비교하는 것이다. <code>DATE(ordered_at)</code>은 열이 아니라 열에 함수를 적용한 식이므로 구간을 만드는 데 쓰이지 못하고, 다른 조건이 없으니 인덱스가 후보에서 빠진다. 열을 그대로 두고 상수 쪽을 반열린 구간으로 바꾼다: <code>WHERE ordered_at >= CURDATE() - INTERVAL 1 DAY AND ordered_at < CURDATE()</code>. <code>CURDATE()</code>를 포함한 오른쪽 식은 쿼리 실행 중 한 번 계산되는 상수 식이므로 구간의 경계로 쓰인다. 끝을 23시 59분 59초로 닫지 않는 것은 소수 초가 있는 타입에서도 경계가 새지 않게 하기 위해서다. MySQL 8.4.13에서 확인하면 <code>DATE(ordered_at) = CURDATE() - INTERVAL 1 DAY</code>는 <code>SELECT COUNT(*), SUM(amount)</code>에서 <code>possible_keys</code>가 NULL인 ALL이었고, 고쳐 쓴 조건은 <code>idx_orders_ordered_at</code>으로 range(<code>key_len</code> 5)였다. 덧붙여 SELECT 목록이 <code>COUNT(*)</code>뿐인 <code>WHERE DATE(ordered_at) = '2026-11-16'</code>은 ALL 대신 <code>type: index</code>(<code>possible_keys</code> NULL, <code>Using where; Using index</code>)로 나왔는데, 구간을 만든 것이 아니라 인덱스 전체를 처음부터 끝까지 훑은 것이다.</p>
+<p><b>3.</b> 쓸 인덱스가 없으므로 UPDATE는 클러스터형 인덱스 전체를 훑는다. InnoDB는 UPDATE가 훑은 모든 인덱스 레코드에 락을 걸고, WHERE 조건으로 제외되는 행이라도 상관없다. 문서는 이 경우 테이블의 모든 행이 잠기고 다른 사용자의 INSERT가 모두 막힌다고 설명한다. 따라서 배치가 끝날 때까지 새 주문 INSERT가 대기한다(본문의 MySQL 8.4.13 실험에서는 레코드 락 1,004,985개가 잡혔고, 대기 시간을 2초로 줄인 INSERT가 <code>ERROR 1205</code>로 끝났다). <code>(status, ordered_at)</code> 인덱스가 있으면 UPDATE가 <code>'PENDING'</code>이면서 기준일 이전인 구간만 훑으므로 잠기는 범위가 그 구간 근처로 줄어든다(같은 실험에서 레코드 락이 약 3.9만 개로 줄고 INSERT가 바로 성공했다). 락의 정확한 범위(갭 락 등)는 트랜잭션 회차에서 다룬다.</p>
+<p><b>4.</b> 한 행의 집계를 위해 서버가 1만 행을 검사했다는 뜻이다. 집계에 실제로 쓰인 행이 3,000이라면 7,000행은 클러스터형 인덱스까지 찾아가 가져왔다가 <code>status</code> 조건에서 버려졌다. 풀 스캔의 100만보다 훨씬 낫지만 구간이 조건 하나로만 좁혀졌다는 신호다. EXPLAIN의 <code>key_len</code>이 5인 것으로 확인한 뒤, 등치 열 <code>status</code>를 앞에 둔 <code>(status, ordered_at)</code>으로 바꾸고 <code>key_len</code> 87과 <code>Rows_examined</code> 약 3,000을 확인한다. 이후 <code>(ordered_at)</code> 인덱스를 다른 쿼리가 쓰는지 확인하고 필요 없으면 정리한다.</p>
+<p><b>5.</b> <code>Rows_examined</code>는 서버 계층이 검사한 행만 세고 엔진 내부의 처리는 세지 않는다. <code>(ordered_at, status)</code>에서는 ICP가 엔진 안에서 <code>status</code>를 걸러 서버로 3,000행만 올리지만, 엔진은 날짜 구간의 인덱스 항목 약 1만 개를 모두 읽었다. 그 차이가 이 숫자에 보이지 않을 뿐이다(<code>Handler_read_next</code>도 둘 다 3,000이다). 증거는 첫째, EXPLAIN의 <code>rows</code> 추정치가 다르다(MySQL 8.4.13에서 18,102와 3,000). 둘째, EXPLAIN ANALYZE나 <code>EXPLAIN FORMAT=TREE</code>의 범위 스캔 줄이 보여 주는 구간이 다르다. <code>(ordered_at, status)</code>는 <code>'2026-11-10 00:00:00' <= ordered_at <= '2026-11-17 00:00:00' AND 'PAID' <= status</code>로 날짜 구간 전체를 읽고, <code>(status, ordered_at)</code>은 <code>status = 'PAID' AND '2026-11-10 00:00:00' <= ordered_at < '2026-11-17 00:00:00'</code>로 필요한 구간만 읽는다. 주의할 점은 <code>key_len</code>과 <code>Extra</code>가 증거가 되지 못한다는 것이다. 8.4.13과 8.0.46에서 두 인덱스 모두 <code>key_len</code> 87, <code>Extra: Using index condition</code>으로 나왔다. <code>(ordered_at, status)</code>에서도 시작 키에 <code>'PAID'</code>가 붙어 range의 <code>key_len</code>이 가장 긴 키 파트 길이인 87이 되기 때문이다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>EXPLAIN 결과가 <code>type: ALL</code>, <code>possible_keys: idx_orders_status</code>, <code>key: NULL</code>이다. 가장 정확한 해석은?</q>
+<o><code>status</code> 열에 인덱스가 없어서 훑는다.</o>
+<o>후보 인덱스가 있었지만, 옵티마이저가 그 인덱스로 찾아갈 행이 많아 풀 스캔이 더 싸다고 추정했다.</o>
+<o>인덱스가 손상되어 옵티마이저가 사용을 포기했다.</o>
+<o>WHERE 절의 조건 순서가 인덱스 열 순서와 달라서 인덱스를 쓰지 못했다.</o>
+<why><code>possible_keys</code>에 이름이 있다는 것은 옵티마이저가 그 인덱스를 후보로 검토했다는 뜻이다. 그런데 <code>key</code>가 NULL이면 대개 비용 비교에서 풀 스캔이 이긴 것이다(본문에서 본 <code>status = 1</code>처럼 후보에 올랐다가 구간을 만들지 못해 빠지는 쿼리 모양도 있으니 함께 점검한다). 문서가 말하는 "상수가 테이블의 너무 많은 부분을 덮는" 경우나 카디널리티가 낮은 키의 경우다. 인덱스가 없다면 <code>possible_keys</code>가 NULL이고, AND 조건의 순서는 인덱스 사용과 무관하다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>(status VARCHAR(20) NOT NULL, ordered_at DATETIME NOT NULL)</code> 복합 인덱스, utf8mb4에서 <code>WHERE status = 'PAID' AND ordered_at >= ... AND ordered_at < ...</code>의 EXPLAIN이 <code>type: range</code>, <code>key_len: 87</code>이다. 이 87이 말해 주는 것은?</q>
+<o><code>status</code>만 구간에 쓰였고 날짜는 서버가 걸렀다.</o>
+<o><code>ordered_at</code>만 구간에 쓰였다.</o>
+<o>두 열이 모두 구간의 경계를 정하는 데 쓰였다.</o>
+<o>인덱스만으로 결과를 만들어 테이블을 읽지 않았다.</o>
+<why><code>status</code> 부분은 최대 80바이트에 길이 정보 2바이트를 더한 82, <code>DATETIME</code>은 5바이트이므로 두 열을 모두 쓰면 87이다. <code>status</code>만 썼다면 82가 나온다. <code>key_len</code>은 구간에 쓰인 키 길이를 말할 뿐, 테이블을 읽었는지(커버링 여부)는 알려 주지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>등치 조건 <code>status = 'PAID'</code>와 범위 조건 <code>ordered_at</code> 구간을 함께 쓰는 쿼리에서 <code>(status, ordered_at)</code>가 <code>(ordered_at, status)</code>보다 나은 근본적인 이유는?</q>
+<o>앞 열이 등치로 고정되면 그 안에서 뒤 열이 정렬되어 있어 일치 항목이 한 덩어리로 연속하지만, 범위 열이 앞에 오면 뒤 열은 구간 전체에 걸쳐 정렬되어 있지 않아 구간을 좁히지 못하기 때문이다.</o>
+<o><code>status</code>의 카디널리티가 <code>ordered_at</code>보다 높기 때문이다.</o>
+<o>WHERE 절에 <code>status</code> 조건을 먼저 적었기 때문이다.</o>
+<o>짧은 열을 앞에 두면 B+Tree의 높이가 낮아지기 때문이다.</o>
+<why>복합 인덱스는 사전식으로 정렬된다. 범위 조건이 나오면 그 뒤의 키 파트는 구간 계산에 쓰이지 않는다는 문서의 규칙은 이 정렬 구조에서 나온다. <code>status</code>는 카디널리티가 오히려 낮고, AND 조건의 문자열 순서는 무관하며, 열 순서는 트리 높이를 정하는 요인이 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>(ordered_at, status)</code> 인덱스에 ICP가 적용되어 느린 쿼리 로그의 <code>Rows_examined</code>가 3,000으로, <code>(status, ordered_at)</code>을 쓸 때와 같게 나왔다. 옳은 해석은?</q>
+<o>두 인덱스는 엔진 안에서도 같은 수의 항목을 읽으므로 비용이 같다.</o>
+<o>ICP가 인덱스에서 읽는 항목 수 자체를 3,000으로 줄였다.</o>
+<o><code>Rows_examined</code>는 읽은 클러스터형 인덱스 페이지 수를 센다.</o>
+<o><code>Rows_examined</code>는 엔진 내부에서 걸러진 항목을 세지 않으므로, <code>(ordered_at, status)</code> 쪽은 엔진 안에서 날짜 구간의 항목 약 1만 개를 읽었을 수 있다.</o>
+<why>문서는 <code>Rows_examined</code>를 서버 계층이 검사한 행 수이며 스토리지 엔진 내부의 처리는 세지 않는다고 정의한다. ICP는 인덱스 항목을 읽은 뒤 엔진 안에서 거르는 것이지 읽을 구간을 좁히는 것이 아니다. 차이는 EXPLAIN의 <code>rows</code>(MySQL 8.4.13에서 18,102 대 3,000)와 EXPLAIN ANALYZE가 보여 주는 구간에서 보인다. <code>key_len</code>은 두 인덱스 모두 87로 나와 구별해 주지 못했다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>ordered_at</code>에 인덱스가 있는데 <code>WHERE DATE(ordered_at) = '2026-11-16'</code>가 풀 스캔이 되는 이유로 가장 정확한 것은?</q>
+<o><code>DATE()</code>가 값을 문자열로 바꾸므로 형 변환 오류가 나서 인덱스를 포기한다.</o>
+<o>범위 조건은 인덱스 열 자체를 상수와 비교해야 하는데, 함수를 씌운 식은 인덱스 열이 아니어서 구간을 만들 수 없다.</o>
+<o><code>DATETIME</code> 열의 인덱스는 등치 비교에만 쓸 수 있다.</o>
+<o>옵티마이저는 날짜가 들어간 조건을 언제나 풀 스캔으로 처리한다.</o>
+<why>MySQL 문서는 범위 조건을 "키 파트를 상수와 비교하는 것"으로 정의한다. <code>DATE(ordered_at)</code>은 키 파트가 아니므로 구간 계산에서 제외되고, 남는 조건이 없으면 인덱스는 후보가 되지 못한다. <code>ordered_at >= '2026-11-16' AND ordered_at < '2026-11-17'</code>로 바꾸면 같은 행을 고르면서 range 접근이 가능하다. 대안으로 8.0.13부터 같은 식으로 함수 인덱스를 만들 수 있다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>풀 테이블 스캔(full table scan)</dt><dd>테이블의 모든 행을 읽는 접근. EXPLAIN의 <code>type</code>이 ALL로 나오며, InnoDB에서는 클러스터형 인덱스의 리프를 처음부터 끝까지 읽는다.</dd>
+<dt>느린 쿼리 로그(slow query log)</dt><dd><code>long_query_time</code>을 넘고 <code>min_examined_row_limit</code> 이상 행을 검사한 문장을 기록하는 로그. <code>Query_time</code>, <code>Lock_time</code>, <code>Rows_sent</code>, <code>Rows_examined</code>를 남긴다.</dd>
+<dt>Rows_examined</dt><dd>서버 계층이 검사한 행의 수. 스토리지 엔진 내부에서 걸러진 항목은 포함하지 않는다.</dd>
+<dt>복합 인덱스(multiple-column index)</dt><dd>여러 열을 묶어 사전식 순서로 정렬한 인덱스. MySQL에서는 열을 16개까지 묶을 수 있다.</dd>
+<dt>최좌측 접두사(leftmost prefix)</dt><dd>복합 인덱스의 앞에서부터 연속된 열들의 묶음. 옵티마이저는 최좌측 접두사에 대한 조건으로만 인덱스 조회를 할 수 있다.</dd>
+<dt>범위 조건(range condition)</dt><dd>인덱스 열을 상수와 정해진 연산자로 비교해 인덱스의 구간을 정할 수 있는 조건. 열에 함수를 씌우면 범위 조건이 되지 못한다.</dd>
+<dt>카디널리티(cardinality)</dt><dd>열에 들어 있는 서로 다른 값의 개수. <code>SHOW INDEX</code>의 <code>Cardinality</code>는 그 추정치다.</dd>
+<dt>선택도(selectivity)</dt><dd>조건이 전체 행 중 고르는 비율. 작을수록 인덱스로 좁힐 이득이 크다.</dd>
+<dt>인덱스 다이브(index dive)</dt><dd>범위의 양 끝으로 인덱스를 내려가 그 사이의 행 수를 추정하는 방법. 정확하지만 범위가 많으면 비용이 커져 통계로 전환된다.</dd>
+<dt>중간점 삽입(midpoint insertion)</dt><dd>새로 읽은 페이지를 LRU 목록의 맨 앞이 아니라 오래된 부분의 머리에 넣어, 한 번 읽고 마는 스캔이 자주 쓰는 페이지를 밀어내지 않게 하는 InnoDB 버퍼 풀 정책.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/table-scan-avoidance.html">MySQL 8.0 Reference Manual — Avoiding Full Table Scans</a> — 풀 테이블 스캔이 일어나는 네 가지 조건과 대처</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/slow-query-log.html">MySQL 8.0 Reference Manual — The Slow Query Log</a> — long_query_time, Rows_examined의 정의, log_slow_extra, 기록 판단 순서</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/sys-statements-with-full-table-scans.html">MySQL 8.0 Reference Manual — The statements_with_full_table_scans View</a> — 풀 스캔 문장 누적 통계의 열 정의</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/multiple-column-indexes.html">MySQL 8.0 Reference Manual — Multiple-Column Indexes</a> — 최좌측 접두사 규칙과 복합 인덱스 사용 예</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/range-optimization.html">MySQL 8.0 Reference Manual — Range Optimization</a> — 범위 조건의 정의, 여러 열 인덱스의 구간 규칙, 인덱스 다이브</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-locks-set.html">MySQL 8.0 Reference Manual — Locks Set by Different SQL Statements in InnoDB</a> — 훑은 인덱스 레코드에 거는 락과 풀 스캔 시 전체 잠금</li>
+</x-refs>

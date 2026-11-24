@@ -1,0 +1,1042 @@
+<x-meta>
+deck: 바이트 하나를 쓰는 write() 호출이 JNI와 시스템 콜을 거쳐 커널에 닿기까지를 따라가며, 스트림의 계약과 버퍼링이 성능과 데이터 안전을 어떻게 가르는지 호출 횟수로 확인한다.
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li><code>InputStream.read()</code>가 <code>byte</code>가 아니라 <code>int</code>를 돌려주는 이유를 설명하고, 읽은 값을 <code>byte</code> 변수에 담은 루프가 0xFF에서 멈추는 이유를 <code>javap</code>의 <code>i2b</code> 명령으로 짚어 낼 수 있다.</li>
+<li><code>read(byte[])</code>의 반환값이 무엇을 뜻하는지 Javadoc의 계약으로 설명하고, 반환값을 무시한 복사 루프가 만들어 내는 파일 내용을 바이트 단위로 예측할 수 있다.</li>
+<li><code>FileOutputStream.write()</code> 한 번이 JNI, OpenJDK의 <code>io_util.c</code>, <code>write(2)</code> 시스템 콜을 거쳐 커널에 닿는 경로를 순서대로 설명할 수 있다.</li>
+<li>하나씩 쓰기, 직접 만든 버퍼, <code>BufferedOutputStream</code>, 한 번에 쓰기의 네 방식에 대해 아래 스트림 호출 횟수를 계산하고, 각 방식이 치르는 비용(시스템 콜, 락, 메모리)을 비교할 수 있다.</li>
+<li><code>flush()</code>, <code>close()</code>, <code>FileDescriptor.sync()</code>가 데이터를 어느 층에서 어느 층으로 옮기는지 구분하고, 닫지 않은 <code>BufferedOutputStream</code>의 데이터가 사라지는 이유를 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>메모리 밖으로 나가야 하는 데이터</h3>
+<p>지금까지 다룬 데이터는 대부분 JVM 안에서 태어나고 JVM 안에서 사라졌다. 지역 변수는 스레드의 스택 프레임에 있다가 메서드가 끝나면 없어지고, 객체는 힙에 있다가 GC가 회수한다. 프로세스가 끝나면 그 프로세스에 배정된 메모리는 운영체제가 통째로 거둬 간다. 그러니 회원 목록을 다음 실행에서도 쓰고 싶거나, 다른 컴퓨터에 있는 프로그램에 주문 정보를 보내고 싶다면 데이터를 이 메모리 밖으로 내보내야 한다.</p>
+<p>메모리 밖의 세계는 종류가 다양하다. 디스크의 파일, 네트워크 건너편의 프로세스, 터미널 화면, 다른 프로그램과 연결된 파이프가 모두 프로그램의 바깥이다. 이들 사이에는 공통점이 하나 있다. 모두 <b>바이트(byte)의 나열</b>만 주고받는다는 점이다. 디스크는 문자열이나 객체를 모른다. 네트워크 카드도 마찬가지다. 앞 회차에서 본 것처럼 문자는 인코딩을 거쳐 바이트가 되어야 밖으로 나갈 수 있고, 객체도 결국 어떤 규칙에 따라 바이트로 바뀌어야 한다. 이 회차는 문자나 객체가 되기 이전의 층, 바이트 그 자체를 내보내고 들여오는 일을 다룬다.</p>
+<p>그런데 바깥 세계마다 운영체제가 제공하는 방법이 조금씩 다르다. 파일은 경로로 열고, 네트워크는 주소와 포트로 연결하고, 터미널은 프로세스가 시작될 때 이미 열려 있다. 대상마다 다른 API를 익혀야 한다면 프로그램은 금방 복잡해진다. 자바는 이 차이를 하나의 추상화로 덮는다. 그것이 <b>스트림(stream)</b>이다. 이 회차의 앞부분은 스트림이 무엇을 약속하는지를 보고, 뒷부분은 그 약속 아래에서 실제로 무슨 일이 일어나는지, 그리고 그 일을 몇 번 일으키느냐가 성능을 어떻게 가르는지를 본다.</p>
+
+<h3>스트림: 한 방향으로 흐르는 바이트의 줄</h3>
+<p>스트림은 <b>한쪽 끝에서 다른 쪽 끝으로 순서대로 흘러가는 바이트의 열</b>이다. 이 정의에는 세 가지 성질이 들어 있다. 첫째, 방향이 하나다. 입력 스트림은 읽기만 하고 출력 스트림은 쓰기만 한다. 파일 하나를 읽고 쓰려면 스트림 두 개가 필요하다. 둘째, 순서대로 접근한다. 배열은 <code>arr[1000]</code>처럼 아무 위치나 바로 꺼낼 수 있지만, 스트림은 앞에서부터 하나씩 꺼내야 한다. 이미 읽은 바이트를 되돌리는 기능은 일부 스트림만 선택적으로 제공한다. 셋째, 끝이 있을 수도 있고 없을 수도 있다. 파일은 크기만큼 읽으면 끝나지만, 네트워크 연결은 상대가 연결을 닫기 전까지 끝나지 않는다.</p>
+<p>입력과 출력은 <b>프로그램을 기준으로</b> 정한다. 파일에서 데이터를 가져와 메모리로 들여오면 입력(input), 메모리의 데이터를 파일로 내보내면 출력(output)이다. 디스크 입장에서는 반대로 보이지만 자바 API의 이름은 항상 프로그램 쪽에서 붙인다. 그래서 바이트를 읽는 쪽의 최상위 타입이 <code>InputStream</code>이고, 쓰는 쪽이 <code>OutputStream</code>이다. 대상별로 이 두 타입을 구현한 클래스가 있다.</p>
+<div class="table-wrap"><table><thead><tr><th>대상</th><th>입력</th><th>출력</th><th>다루는 회차</th></tr></thead><tbody>
+<tr><td>파일</td><td><code>FileInputStream</code></td><td><code>FileOutputStream</code></td><td>이 회차</td></tr>
+<tr><td>메모리(바이트 배열)</td><td><code>ByteArrayInputStream</code></td><td><code>ByteArrayOutputStream</code></td><td>이 회차, 03회</td></tr>
+<tr><td>콘솔</td><td><code>System.in</code></td><td><code>System.out</code>, <code>System.err</code> (<code>PrintStream</code>)</td><td>이 회차, 03회</td></tr>
+<tr><td>네트워크(TCP)</td><td><code>Socket.getInputStream()</code></td><td><code>Socket.getOutputStream()</code></td><td>06~08회</td></tr>
+</tbody></table></div>
+<p>표의 오른쪽 두 열이 핵심이다. 대상은 넷이지만 프로그램이 쓰는 타입은 둘뿐이다. 파일에 쓰는 코드와 소켓에 쓰는 코드가 둘 다 <code>OutputStream</code>의 <code>write</code>를 부른다. 그래서 "입력 스트림에서 읽어 출력 스트림으로 복사한다"는 메서드 하나를 만들면 파일 복사, 파일 업로드, 메모리 버퍼 복사에 모두 쓸 수 있다. 이 추상화의 값은 06회 이후 네트워크 프로그램을 만들 때 크게 드러난다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>수도관과 물</strong><p>스트림은 수도관과 닮았다. 물은 한 방향으로만 흐르고, 먼저 들어간 물이 먼저 나온다. 관 너머가 정수장이든 물탱크든 수도꼭지를 여는 방법은 같다. 비유가 깨지는 지점도 있다. 물은 연속적이지만 스트림은 낱개의 바이트로 셀 수 있고, 뒤에서 볼 버퍼링 때문에 "흘려보냈다"고 생각한 바이트가 실제로는 관 중간의 통에 고여 있을 수 있다. 이 회차 후반부의 함정 대부분이 이 고인 물에서 생긴다.</p></aside>
+<p>이름이 같아 헷갈리기 쉬운 것이 하나 있다. <code>java.util.stream.Stream</code>, 흔히 스트림 API라고 부르는 것은 컬렉션 데이터를 함수형으로 처리하는 도구로, 이 회차의 I/O 스트림과는 패키지도 목적도 다르다. 이 권에서 스트림이라고 하면 <code>java.io</code>의 바이트 흐름을 뜻한다.</p>
+<x-visual id="java-adv2-02-stream-sources" title="하나의 추상화로 묶인 여러 입출력 대상" kind="개념도" ratio="16:9">
+<x-hint>프로그램이 InputStream과 OutputStream이라는 두 타입만으로 파일, 메모리, 콘솔, 네트워크를 똑같이 다룬다는 것을 보여 준다.</x-hint>
+<x-prompt>가운데에 둥근 사각형 "자바 프로그램(메모리)"을 둔다. 왼쪽에는 위에서 아래로 네 개의 아이콘 상자 "파일", "바이트 배열", "키보드(System.in)", "소켓"을 세로로 놓고, 각 상자에서 가운데로 향하는 화살표를 그린 뒤 화살표들이 하나의 관 모양 띠 "InputStream"으로 합쳐지게 한다. 오른쪽에도 같은 방식으로 "파일", "바이트 배열", "화면(System.out)", "소켓" 상자를 두고, 가운데에서 하나의 관 모양 띠 "OutputStream"을 거쳐 네 상자로 갈라지는 화살표를 그린다. 관 안에는 작은 정사각형 바이트들이 일렬로 흐르는 모습을 넣는다. 하단에 작은 글씨로 "입력과 출력은 프로그램 기준"이라고 적는다. 평면적인 기술 도해 스타일, 흰 배경, 파란색과 회색 위주.</x-prompt>
+<x-caption>대상은 여럿이지만 프로그램은 InputStream과 OutputStream 두 타입으로만 대화한다.</x-caption>
+</x-visual>
+
+<h3>첫 번째 파일 쓰기와 읽기</h3>
+<p>가장 작은 예제부터 시작한다. 파일에 바이트 세 개를 쓰고, 다시 읽어 출력한 뒤, 덧붙이기 모드로 하나를 더 쓰고 전체를 읽는다. 실행하기 전에 작업 디렉터리에 <code>temp</code> 폴더를 만들어 둔다. 자바 11부터는 <code>java StreamStart1.java</code>처럼 소스 파일 하나를 바로 실행할 수 있으므로 이 회차의 예제는 패키지 없이 쓴다.</p>
+<pre><code class="language-java">import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class StreamStart1 {
+    public static void main(String[] args) throws IOException {
+        FileOutputStream fos = new FileOutputStream("temp/hello.dat");
+        fos.write(65);
+        fos.write(66);
+        fos.write(67);
+        fos.close();
+
+        FileInputStream fis = new FileInputStream("temp/hello.dat");
+        System.out.println(fis.read());
+        System.out.println(fis.read());
+        System.out.println(fis.read());
+        System.out.println(fis.read());   // 파일 끝
+        fis.close();
+
+        FileOutputStream append = new FileOutputStream("temp/hello.dat", true);
+        append.write(68);
+        append.close();
+
+        FileInputStream again = new FileInputStream("temp/hello.dat");
+        int data;
+        while ((data = again.read()) != -1) {
+            System.out.print(data + " ");
+        }
+        System.out.println();
+        again.close();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">65
+66
+67
+-1
+65 66 67 68 </code></pre>
+<p>한 줄씩 따라가 보자. <code>new FileOutputStream("temp/hello.dat")</code>는 운영체제에 파일을 쓰기용으로 열어 달라고 요청한다. 파일이 없으면 새로 만들고, 있으면 길이를 0으로 잘라 낸다. OpenJDK 21의 네이티브 코드(<code>FileOutputStream.c</code>)를 보면 이 요청에 붙이는 플래그가 <code>O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC)</code>로 적혀 있다. 쓰기 전용(<code>O_WRONLY</code>), 없으면 생성(<code>O_CREAT</code>), 그리고 덧붙이기가 아니면 잘라 내기(<code>O_TRUNC</code>)다. 두 번째 인자로 <code>true</code>를 준 생성자는 <code>O_TRUNC</code> 대신 <code>O_APPEND</code>를 붙인다. 그래서 마지막 출력에 기존의 65, 66, 67이 남아 있고 그 뒤에 68이 붙었다.</p>
+<p>열기에 성공하면 운영체제는 <b>파일 디스크립터(file descriptor)</b>라는 작은 정수를 돌려준다. 커널이 프로세스마다 관리하는 "열린 파일 표"의 칸 번호다. 이후의 읽기와 쓰기는 경로가 아니라 이 번호로 요청한다. 자바에서는 <code>java.io.FileDescriptor</code> 객체가 이 번호를 감싸고, <code>FileOutputStream</code>은 그 객체를 필드로 가진다. <code>close()</code>는 커널에 이 번호를 반납하는 일이다. 반납하지 않으면 표의 칸이 계속 차 있게 되고, 프로세스가 열 수 있는 개수 한도에 닿으면 새 파일이나 소켓을 열 때 "Too many open files" 오류가 난다. 스트림을 닫는 일이 단순한 예의가 아니라 운영체제 자원의 반납인 이유다.</p>
+<p>열기는 실패할 수 있다. <code>temp</code> 폴더가 없으면 생성자가 <code>FileNotFoundException</code>을 던진다. <code>FileOutputStream</code>은 파일은 만들어도 중간 디렉터리는 만들지 않는다. macOS에서 돌려 보면 메시지는 <code>temp/hello.dat (No such file or directory)</code>이다. 괄호 안의 문구는 자바가 지어낸 것이 아니라 운영체제가 돌려준 오류 문자열이라서, 운영체제와 언어 설정에 따라 달라진다.</p>
+<p><code>FileInputStream</code>은 같은 파일을 읽기용으로 연다. <code>read()</code>는 다음 바이트 하나를 읽어 돌려주고, 더 읽을 바이트가 없으면 <code>-1</code>을 돌려준다. 그래서 네 번째 <code>read()</code>가 <code>-1</code>이다. 파일의 끝(EOF, end of file)은 예외가 아니라 정상적인 반환값으로 알린다는 점을 기억해 두자. 마지막 <code>while</code> 루프가 "읽은 값을 변수에 담고, 그 값이 -1이 아닌 동안 반복"하는 형태인 이유가 이것이다.</p>
+<p>이 예제는 원리를 드러내려고 <code>close()</code>를 직접 불렀지만, 중간에 예외가 나면 <code>close()</code>까지 가지 못한다. 앞선 권에서 본 try-with-resources를 쓰면 블록을 벗어날 때 예외 여부와 상관없이 <code>close()</code>가 호출된다. 이후 예제는 모두 try-with-resources로 쓴다.</p>
+
+<h3>read()는 왜 byte가 아니라 int를 돌려주는가</h3>
+<p>바이트를 읽는 메서드인데 반환 타입이 <code>int</code>다. 처음 보면 어색하지만 이유는 단순한 셈에 있다. 바이트 하나가 가질 수 있는 비트 패턴은 0x00부터 0xFF까지 256가지다. 파일에는 이 256가지가 모두 나올 수 있다. 그런데 <code>read()</code>는 "더 읽을 것이 없다"는 257번째 신호도 돌려줘야 한다. 자바의 <code>byte</code>는 -128부터 127까지 정확히 256개의 값을 가지므로 남는 값이 없다. 그래서 <code>InputStream.read()</code>의 Javadoc은 이렇게 정한다. 읽은 바이트는 0부터 255 범위의 <code>int</code>로 돌려주고, 스트림의 끝에 도달하면 -1을 돌려준다. 데이터는 항상 0 이상이므로 음수 하나를 신호로 쓸 수 있다.</p>
+<p>쓰는 쪽도 <code>write(int b)</code>로 <code>int</code>를 받는다. <code>OutputStream.write(int)</code>의 Javadoc은 인자의 하위 8비트만 쓰고 상위 24비트는 무시한다고 적는다. 직접 확인해 보자.</p>
+<pre><code class="language-java">import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class ByteRange {
+    public static void main(String[] args) throws IOException {
+        try (FileOutputStream fos = new FileOutputStream("temp/range.dat")) {
+            fos.write(1);
+            fos.write(-1);         // 0xFFFFFFFF -> 하위 8비트 0xFF
+            fos.write(256 + 67);   // 0x00000143 -> 하위 8비트 0x43
+            fos.write(2);
+        }
+
+        try (FileInputStream fis = new FileInputStream("temp/range.dat")) {
+            int data;
+            while ((data = fis.read()) != -1) {
+                System.out.print(data + " ");
+            }
+            System.out.println();
+        }
+
+        try (FileInputStream fis = new FileInputStream("temp/range.dat")) {
+            byte b;
+            int count = 0;
+            while ((b = (byte) fis.read()) != -1) {   // 잘못된 루프
+                count++;
+            }
+            System.out.println("byte 변수로 센 바이트 수: " + count);
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">1 255 67 2
+byte 변수로 센 바이트 수: 1</code></pre>
+<p>첫 줄부터 보자. <code>-1</code>은 32비트 2의 보수로 <code>0xFFFFFFFF</code>이고, 하위 8비트 <code>0xFF</code>만 파일에 들어간다. 읽을 때 <code>read()</code>는 이 바이트를 부호 없는 값으로 해석해 255를 돌려준다. <code>256 + 67</code>은 <code>0x143</code>이고 하위 8비트는 <code>0x43</code>, 즉 67이다. 256은 하위 8비트가 모두 0이라서 사라졌다. 파일에는 4바이트가 들어 있고 첫 번째 루프는 네 개를 모두 읽었다.</p>
+<p>두 번째 루프는 같은 파일에서 하나만 세고 멈췄다. 두 번째 바이트 255를 <code>(byte)</code>로 바꾸는 순간 -1이 되기 때문이다. 이 일이 바이트코드에서 어떻게 일어나는지 <code>javap -c</code>로 보면 분명해진다. 아래는 잘못된 루프와 올바른 루프만 떼어 내 메서드로 만든 뒤 컴파일해 본 결과다.</p>
+<pre data-label="javap -c (JDK 21)"><code class="language-text">static int wrong(java.io.InputStream) throws java.io.IOException;
+  Code:
+     0: iconst_0
+     1: istore_1
+     2: aload_0
+     3: invokevirtual #7     // Method java/io/InputStream.read:()I
+     6: i2b
+     7: dup
+     8: istore_2
+     9: iconst_m1
+    10: if_icmpeq     19
+    13: iinc          1, 1
+    16: goto          2
+    19: iload_1
+    20: ireturn
+
+static int right(java.io.InputStream) throws java.io.IOException;
+  Code:
+     0: iconst_0
+     1: istore_1
+     2: aload_0
+     3: invokevirtual #7     // Method java/io/InputStream.read:()I
+     6: dup
+     7: istore_2
+     8: iconst_m1
+     9: if_icmpeq     18
+    ...</code></pre>
+<p>차이는 6번 위치의 <code>i2b</code> 하나다. JVMS는 <code>i2b</code>를 "int를 byte로 잘라 낸 뒤 다시 int로 부호 확장한다"고 정의한다. 255는 <code>0x000000FF</code>인데, 하위 8비트 <code>0xFF</code>만 남기고 최상위 비트 1을 부호로 보아 확장하면 <code>0xFFFFFFFF</code>, 즉 -1이 된다. 그다음 <code>iconst_m1</code>로 -1을 올리고 <code>if_icmpeq</code>로 비교하니, 데이터 255와 파일 끝 신호 -1을 구별할 방법이 없다. 오른쪽의 올바른 루프에는 <code>i2b</code>가 없다. 읽은 값을 <code>int</code>로 받아 비교하고, 바이트로 바꾸는 일은 비교가 끝난 뒤에 한다. 자바의 <code>byte</code>에도 JVM 피연산자 스택에도 "부호 없는 바이트"라는 타입이 없다는 사실이 이 함정의 뿌리다.</p>
+<p>이 버그는 테스트에서 잘 드러나지 않는다. RFC 3629에 따르면 UTF-8로 인코딩된 텍스트에는 0xF5부터 0xFF까지의 바이트 값이 나오지 않으므로, ASCII나 UTF-8 텍스트 파일로 시험하면 루프가 멀쩡히 끝까지 돈다. 그러다 이미지나 압축 파일처럼 임의의 바이트가 나오는 파일을 만나면 중간에서 조용히 멈춘다. JPEG 파일은 첫 바이트부터 0xFF다. 예외도 나지 않고 결과만 짧아지므로 원인을 찾기 어렵다. 바이트를 다룰 때는 "읽은 값은 <code>int</code>로 받는다"를 규칙으로 삼는다.</p>
+<aside class="note">반대 방향의 변환도 알아 두자. <code>byte</code> 변수에 든 값을 0~255로 보고 싶으면 <code>b & 0xFF</code>로 상위 비트를 지운다. 뒤에서 볼 <code>BufferedInputStream.read()</code>가 내부 배열의 바이트를 돌려줄 때 바로 이 연산을 쓴다.</aside>
+
+<h3>여러 바이트를 한 번에: read(byte[])와 반환값</h3>
+<p>바이트를 하나씩 주고받는 메서드만 있다면 큰 파일을 다룰 때 호출 횟수가 바이트 수만큼 늘어난다. 그래서 두 추상 클래스는 배열 단위로 주고받는 메서드를 함께 제공한다. <code>write(byte[] b)</code>와 <code>write(byte[] b, int off, int len)</code>는 배열의 전부 또는 일부를 쓰고, <code>read(byte[] b)</code>와 <code>read(byte[] b, int off, int len)</code>는 배열에 읽어 담는다. 읽기 쪽에는 중요한 차이가 하나 있다. 반환값이 읽은 바이트 자체가 아니라 <b>읽은 바이트의 개수</b>다.</p>
+<pre><code class="language-java">import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.Arrays;
+
+public class StreamStart2 {
+    public static void main(String[] args) throws IOException {
+        try (FileOutputStream fos = new FileOutputStream("temp/hello.dat")) {
+            byte[] input = {65, 66, 67, 68, 69};
+            fos.write(input);
+        }
+
+        try (FileInputStream fis = new FileInputStream("temp/hello.dat")) {
+            byte[] buffer = new byte[8];
+            int readCount = fis.read(buffer, 0, buffer.length);
+            System.out.println("readCount = " + readCount);
+            System.out.println(Arrays.toString(buffer));
+            System.out.println("next = " + fis.read(buffer));
+        }
+
+        try (FileInputStream fis = new FileInputStream("temp/hello.dat")) {
+            byte[] all = fis.readAllBytes();
+            System.out.println(Arrays.toString(all));
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">readCount = 5
+[65, 66, 67, 68, 69, 0, 0, 0]
+next = -1
+[65, 66, 67, 68, 69]</code></pre>
+<p>8칸짜리 배열을 넘겼지만 파일에는 5바이트뿐이므로 <code>read</code>는 5를 돌려주고 앞의 다섯 칸만 채웠다. 나머지 세 칸은 배열을 만들 때의 기본값 0 그대로다. Javadoc은 이 부분을 정확히 규정한다. 실제로 읽은 개수를 k라고 하면 <code>b[0]</code>부터 <code>b[k-1]</code>까지만 채우고 그 뒤의 원소는 건드리지 않는다. 그리고 배열 길이가 0이 아니라면 적어도 한 바이트는 읽으려고 시도하며, 스트림 끝이라 읽을 것이 없을 때만 -1을 돌려준다. 그래서 다음 호출이 -1이다.</p>
+<p>이 계약에서 놓치기 쉬운 점은 "요청한 만큼 읽는다"는 보장이 없다는 것이다. 보장되는 것은 "최소 한 바이트, 최대 배열 길이만큼"이다. 일반 파일은 끝에 닿기 전까지 대개 요청한 만큼 채워 주지만, 네트워크 스트림은 그 순간까지 도착한 만큼만 돌려준다. 그래서 반환값을 무시하고 "배열이 꽉 찼다"고 가정한 코드는 언젠가 틀린다. 다음은 그런 실수를 일부러 넣은 복사 코드다.</p>
+<pre><code class="language-java">import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class CopyBug {
+    public static void main(String[] args) throws IOException {
+        try (FileOutputStream fos = new FileOutputStream("temp/src.txt")) {
+            fos.write("0123456789".getBytes(StandardCharsets.US_ASCII));
+        }
+
+        try (FileInputStream in = new FileInputStream("temp/src.txt");
+             FileOutputStream out = new FileOutputStream("temp/dst.txt")) {
+            byte[] buf = new byte[8];
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                System.out.println("read -> " + n);
+                out.write(buf);            // 버그: n이 아니라 배열 전체를 쓴다
+            }
+        }
+
+        try (FileInputStream check = new FileInputStream("temp/dst.txt")) {
+            byte[] result = check.readAllBytes();
+            System.out.println(result.length + " bytes: "
+                    + new String(result, StandardCharsets.US_ASCII));
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">read -> 8
+read -> 2
+16 bytes: 0123456789234567</code></pre>
+<p>10바이트 파일을 복사했는데 16바이트가 나왔다. 배열의 상태를 따라가면 이유가 보인다.</p>
+<pre class="diagram">첫 번째 read: 8바이트 읽음
+  buf = [ '0' '1' '2' '3' '4' '5' '6' '7' ]   -> 8바이트 모두 씀 (정상)
+
+두 번째 read: 2바이트 읽음 (b[0], b[1]만 덮어씀)
+  buf = [ '8' '9' '2' '3' '4' '5' '6' '7' ]
+          ^^^^^^^ 새 데이터   ^^^^^^^^^^^^^^^^^^^^^ 이전 read의 찌꺼기
+  -> out.write(buf)가 8바이트를 모두 씀 (6바이트가 쓰레기)
+
+결과: "01234567" + "89234567" = 16바이트</pre>
+<p>Javadoc이 "나머지 원소는 건드리지 않는다"고 했으므로 두 번째 <code>read</code> 뒤의 <code>buf[2]</code>부터 <code>buf[7]</code>에는 첫 번째 읽기의 내용이 그대로 남아 있다. 고치는 방법은 반환값을 그대로 쓰는 것이다. <code>out.write(buf, 0, n)</code>으로 바꾸면 결과는 정확히 10바이트가 된다. 이 "읽은 만큼만 쓴다" 루프는 너무 자주 쓰여서 자바 9부터는 <code>InputStream.transferTo(OutputStream)</code>가 같은 일을 해 준다. OpenJDK 21의 구현은 16,384바이트(<code>DEFAULT_BUFFER_SIZE</code>) 배열을 하나 만들어 <code>read(buffer, 0, 16384)</code>가 -1을 돌려줄 때까지 <code>out.write(buffer, 0, read)</code>를 반복한다.</p>
+<p>세 번째 블록의 <code>readAllBytes()</code>는 스트림 끝까지 읽어 정확한 크기의 배열로 돌려준다. 편리하지만 대가가 있다. 이 메서드가 언제 위험해지는지는 "한 번에 쓰기"를 다룰 때 실험으로 확인한다. 하나만 먼저 짚어 둔다. <code>available()</code>은 "지금 막히지 않고 읽을 수 있는 바이트 수의 추정치"를 돌려주는 메서드인데, 이를 파일 전체 크기로 오해해 배열을 만드는 코드가 종종 보인다. Javadoc은 이 값으로 스트림의 전체 데이터를 담을 버퍼를 할당하는 것은 결코 올바르지 않다고 못 박는다.</p>
+
+<h3>InputStream과 OutputStream이 정한 계약</h3>
+<p>두 클래스는 인터페이스가 아니라 추상 클래스다. 각각 추상 메서드는 단 하나뿐이다. <code>InputStream</code>은 <code>int read()</code>, <code>OutputStream</code>은 <code>void write(int b)</code>. 나머지 메서드는 모두 구현이 들어 있다. 배열 단위 메서드도 마찬가지다. OpenJDK 21의 <code>InputStream.read(byte[], int, int)</code>를 줄여 보면 다음과 같다.</p>
+<pre><code class="language-java">// OpenJDK 21 java.io.InputStream의 기본 구현을 줄여 옮긴 것
+public int read(byte[] b, int off, int len) throws IOException {
+    Objects.checkFromIndexSize(off, len, b.length);
+    if (len == 0) {
+        return 0;
+    }
+    int c = read();                 // 첫 바이트
+    if (c == -1) {
+        return -1;
+    }
+    b[off] = (byte) c;
+    int i = 1;
+    try {
+        for (; i < len; i++) {
+            c = read();             // 한 바이트씩 반복
+            if (c == -1) {
+                break;
+            }
+            b[off + i] = (byte) c;
+        }
+    } catch (IOException ee) {
+    }
+    return i;
+}</code></pre>
+<p>배열 단위로 읽는 메서드가 사실은 <code>read()</code>를 <code>len</code>번 부르는 반복문이다. <code>OutputStream.write(byte[], int, int)</code>도 같은 모양으로 <code>write(int)</code>를 반복한다. 이것은 템플릿 메서드(template method) 구조다. 하위 클래스는 한 바이트를 다루는 법만 알려 주면 나머지 기능을 공짜로 얻는다. 첫 바이트를 읽은 뒤에 난 <code>IOException</code>을 삼키고 지금까지 읽은 개수를 돌려주는 것도 앞 절의 계약("적어도 한 바이트를 읽었으면 그 개수를 돌려준다")과 맞춘 결과다. <code>read()</code>만 구현한 스트림으로 확인해 보자.</p>
+<pre><code class="language-java">import java.io.InputStream;
+
+public class OnlyRead {
+    public static void main(String[] args) throws Exception {
+        CountingSource src = new CountingSource(100);
+        byte[] buf = new byte[64];
+        int n = src.read(buf);
+        System.out.println("read(byte[64]) = " + n + ", read() 호출 횟수 = " + src.calls);
+        n = src.read(buf);
+        System.out.println("read(byte[64]) = " + n + ", read() 호출 횟수 = " + src.calls);
+        n = src.read(buf);
+        System.out.println("read(byte[64]) = " + n + ", read() 호출 횟수 = " + src.calls);
+    }
+
+    static class CountingSource extends InputStream {
+        private int remaining;
+        int calls;
+
+        CountingSource(int size) { this.remaining = size; }
+
+        @Override
+        public int read() {
+            calls++;
+            if (remaining == 0) return -1;
+            remaining--;
+            return 'x';
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">read(byte[64]) = 64, read() 호출 횟수 = 64
+read(byte[64]) = 36, read() 호출 횟수 = 101
+read(byte[64]) = -1, read() 호출 횟수 = 102</code></pre>
+<p>100바이트짜리 원천에서 64칸 배열로 읽었다. 첫 호출은 <code>read()</code>를 64번 불러 배열을 채웠다. 두 번째 호출은 남은 36바이트를 읽는 데 36번, 그리고 37번째 <code>read()</code>가 -1을 돌려줘 루프를 빠져나오는 데 1번, 합쳐 37번을 불렀다. 누적 101이다. 세 번째 호출은 첫 <code>read()</code>부터 -1이므로 곧바로 -1을 돌려준다. 계약은 지켜지지만, 배열로 읽어도 내부에서는 한 바이트씩 처리된다는 사실이 숫자로 드러난다.</p>
+<p>그래서 실제 대상과 연결된 하위 클래스들은 배열 메서드를 반드시 재정의한다. <code>FileInputStream.read(byte[], int, int)</code>는 네이티브 메서드 <code>readBytes</code>를 불러 운영체제에 한 번에 요청하고, <code>ByteArrayInputStream</code>은 <code>System.arraycopy</code>로 내부 배열에서 한 번에 복사한다. 직접 <code>InputStream</code>을 상속해 만들 일이 있다면, <code>read()</code>만 구현하고 끝내면 기능은 맞아도 성능은 이 기본 구현 수준에 머문다는 점을 기억해야 한다.</p>
+<p>왜 인터페이스가 아니라 추상 클래스일까. 두 클래스는 JDK 1.0부터 있었고, 인터페이스에 구현을 넣을 수 있는 디폴트 메서드는 자바 8에서야 생겼다. 기본 구현을 함께 제공하려면 추상 클래스밖에 방법이 없었다. 대신 "닫을 수 있다", "밀어낼 수 있다"는 성질은 인터페이스로 분리되어 있다. 두 클래스 모두 <code>Closeable</code>(<code>close()</code>)을 구현하고, <code>OutputStream</code>은 추가로 <code>Flushable</code>(<code>flush()</code>)을 구현한다. <code>Closeable</code>이 <code>AutoCloseable</code>을 상속하므로 try-with-resources에 쓸 수 있다.</p>
+<p><code>OutputStream.flush()</code>의 기본 구현은 아무것도 하지 않는다. <code>FileOutputStream</code>은 이 메서드를 재정의하지 않는다. 자바 쪽에 모아 두는 버퍼가 없으므로 밀어낼 것도 없기 때문이다. <code>write</code>가 반환되었다면 바이트는 이미 운영체제에 넘어갔다. 이 사실은 뒤에서 데이터가 사라지는 실험을 해석할 때 결정적인 단서가 된다.</p>
+<pre class="diagram">java.io 바이트 스트림의 뼈대 (일부)
+
+         InputStream (abstract)                   OutputStream (abstract)
+         └ abstract int read()                    └ abstract void write(int)
+              │                                         │
+   ┌──────────┼──────────────────┐          ┌──────────┼───────────────────┐
+FileInputStream  ByteArrayInputStream  FileOutputStream  ByteArrayOutputStream
+              │                                         │
+       FilterInputStream                         FilterOutputStream
+       (다른 InputStream을 감싼다)               (다른 OutputStream을 감싼다)
+              │                                         │
+       BufferedInputStream                       BufferedOutputStream
+                                                 PrintStream (System.out)</pre>
+<p>그림 아래쪽의 <code>FilterInputStream</code>과 <code>FilterOutputStream</code>은 스스로 바깥 세계와 연결되지 않는다. 생성자로 다른 스트림을 받아 필드(<code>in</code>, <code>out</code>)에 두고, 받은 요청을 그 스트림에 전달하면서 기능을 하나 덧붙인다. 이렇게 감싸서 기능을 더하는 스트림을 보조 스트림이라고 부른다. 이 회차는 그중 버퍼를 덧붙이는 <code>BufferedXxx</code>만 다루고, 감싸기 구조 자체와 다른 보조 스트림들은 다음 회차에서 문자 스트림과 함께 본다.</p>
+<p>우리가 매일 쓰는 <code>System.out</code>도 이 구조로 조립되어 있다. OpenJDK 21의 <code>System</code> 초기화 코드는 표준 출력 파일 디스크립터로 <code>FileOutputStream</code>을 만들고, 그것을 128바이트짜리 <code>BufferedOutputStream</code>으로 감싼 뒤, 다시 자동 플러시(autoFlush)를 켠 <code>PrintStream</code>으로 감싼다. <code>System.in</code>은 표준 입력 디스크립터의 <code>FileInputStream</code>을 <code>BufferedInputStream</code>으로 감싼 것이다. <code>PrintStream</code> 생성자의 Javadoc에 따르면 autoFlush가 켜져 있으면 바이트 배열을 쓸 때, <code>println</code>을 부를 때, 개행 문자를 쓸 때 버퍼를 비운다. 콘솔 출력이 지연 없이 보이는 이유다.</p>
+
+<h3>한 층 아래로: write() 한 번이 지나가는 길</h3>
+<p>이제 <code>fos.write(65)</code> 한 줄이 실제로 무슨 일을 일으키는지 내려가 보자. 성능 이야기는 전부 이 경로를 몇 번 지나가느냐의 문제로 귀결된다. 아래 내용은 OpenJDK 21의 자바 소스(<code>FileOutputStream.java</code>)와 네이티브 소스(<code>FileOutputStream.c</code>, <code>io_util.c</code>, 유닉스용 <code>io_util_md.c</code>)를 따라간 것이다.</p>
+<figure class="flow-figure"><figcaption>FileOutputStream.write(int) 한 번의 경로 (OpenJDK 21, 유닉스 계열)</figcaption><ol class="flow">
+<li><strong>자바 메서드</strong><span><code>write(int b)</code>가 덧붙이기 여부를 확인하고 <code>Blocker.begin()</code>을 부른 뒤 네이티브 메서드 <code>write(int, boolean)</code>을 호출한다.</span></li>
+<li><strong>JNI 경계</strong><span>자바 코드에서 C 코드로 넘어간다. HotSpot은 이 전환에서 스레드 상태를 '자바 코드 실행 중'에서 '네이티브 코드 실행 중'으로 바꾸고, 인자를 C 호출 규약에 맞춰 넘긴다.</span></li>
+<li><strong>io_util.c의 writeSingle</strong><span>정수의 하위 8비트만 <code>char</code> 하나에 담고, 열린 파일 디스크립터를 꺼내 <code>IO_Write</code>를 부른다.</span></li>
+<li><strong>io_util_md.c의 handleWrite</strong><span><code>write(fd, buf, len)</code> 시스템 콜을 부른다. 시그널로 중단되면(<code>EINTR</code>) 다시 부르도록 <code>RESTARTABLE</code> 매크로로 감싸여 있다.</span></li>
+<li><strong>커널</strong><span>CPU가 커널 모드로 전환되고, 커널은 디스크립터를 검사한 뒤 사용자 메모리의 1바이트를 커널의 페이지 캐시로 복사하고 반환한다.</span></li>
+<li><strong>되돌아오기</strong><span>사용자 모드로 돌아와 JNI 경계를 다시 건너 자바 메서드가 반환된다. 디스크 장치에 실제로 기록하는 일은 이 경로에 들어 있지 않다.</span></li>
+</ol></figure>
+<p>4단계의 <b>시스템 콜(system call)</b>이 핵심이다. 현대 CPU는 권한 수준을 나눠, 일반 프로그램이 실행되는 사용자 모드(user mode)에서는 디스크나 네트워크 장치를 직접 건드리지 못하게 한다. 장치를 다루는 일은 커널 모드(kernel mode)에서 실행되는 운영체제만 할 수 있다. 사용자 프로그램은 x86-64의 <code>syscall</code>이나 ARM64의 <code>svc</code> 같은 전용 명령으로 커널에 들어가 일을 부탁하고, 커널이 일을 마치면 사용자 모드로 돌아온다. 이 왕복에는 모드 전환, 레지스터 보존, 인자 검증 같은 <b>호출당 고정 비용</b>이 든다. 1바이트를 부탁하든 8,192바이트를 부탁하든 이 고정 비용은 거의 같다.</p>
+<p>5단계도 중요하다. 리눅스의 <code>write(2)</code> 매뉴얼은 <code>write()</code>가 성공적으로 반환되었다고 해서 데이터가 디스크에 기록되었다는 보장은 없다고 적는다. 커널은 받은 데이터를 메모리의 페이지 캐시(page cache)에 복사해 두고, 디스크에는 나중에 모아서 기록한다. 같은 매뉴얼은 실제로 쓰인 바이트 수가 요청한 수보다 적을 수 있다고도 적는데, 그래서 OpenJDK의 <code>writeBytes</code>는 요청한 길이를 다 쓸 때까지 반복해서 <code>write</code>를 부른다. 이 두 사실은 마지막 절의 flush 이야기에서 다시 쓴다.</p>
+<p>배열을 쓰는 <code>writeBytes</code> 쪽은 한 단계가 더 있다. <code>io_util.c</code>는 크기 8,192바이트(<code>BUF_SIZE</code>)의 배열을 C 스택에 두고, 요청 길이가 이보다 크면 <code>malloc(len)</code>으로 그만큼의 네이티브 메모리를 따로 할당한다. 그런 다음 JNI 함수 <code>GetByteArrayRegion</code>으로 자바 배열의 내용을 이 C 버퍼에 복사하고, 복사본을 <code>write</code>에 넘긴다. 읽기 쪽 <code>readBytes</code>는 반대로 C 버퍼에 읽은 뒤 <code>SetByteArrayRegion</code>으로 자바 배열에 복사한다. 자바 힙의 배열을 그대로 넘기지 않는 이유는 GC와 관련이 있다. G1 같은 HotSpot의 GC는 객체를 다른 주소로 옮겨 힙을 정리하는데, 시스템 콜이 쓰는 동안 버퍼 주소가 바뀌면 안 된다. GC가 관리하지 않는 C 메모리로 복사해 두면 이 문제가 사라진다. 대신 바이트마다 복사가 한 번 더 일어난다.</p>
+<p>1단계의 <code>Blocker.begin()</code>은 가상 스레드를 위한 장치다. 가상 스레드가 파일 I/O처럼 운영체제 수준에서 막히는 호출을 하면 그 가상 스레드를 실행하던 캐리어 스레드도 함께 막힌다. OpenJDK 21의 <code>Blocker</code>는 현재 스레드가 캐리어 스레드일 때만 스케줄러(<code>ForkJoinPool</code>)에 보상을 요청해 일시적으로 일꾼을 늘리고, 플랫폼 스레드에서는 아무것도 하지 않고 -1을 돌려준다. 플랫폼 스레드로 돌리는 이 회차의 예제에서는 비용이 거의 없는 확인 한 번이다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p><code>FileOutputStream.write</code>와 <code>FileInputStream.read</code>는 호출될 때마다 JNI 경계를 넘고 시스템 콜을 최소 한 번 일으킨다. 호출 한 번의 비용은 "호출당 고정 비용 + 바이트 수에 비례하는 복사 비용"이다. 바이트 수가 정해져 있다면 줄일 수 있는 것은 앞의 항, 즉 <b>호출 횟수</b>뿐이다. 이 회차의 성능 최적화는 모두 이 한 문장의 변주다.</p></aside>
+<x-visual id="java-adv2-02-write-path" title="write() 한 번이 자바 힙에서 디스크까지 가는 층" kind="계층 다이어그램" ratio="16:9">
+<x-hint>자바 배열, JNI가 만든 C 버퍼, 커널 페이지 캐시, 디스크의 네 층과 그 사이를 옮기는 동작(복사, 시스템 콜, 나중의 기록)을 보여 준다.</x-hint>
+<x-prompt>세로로 쌓인 네 개의 가로 띠를 위에서 아래로 그린다. 맨 위 띠 "자바 힙: byte[] 배열", 둘째 띠 "C 버퍼 (스택 8KB 또는 malloc)", 셋째 띠 "커널 페이지 캐시", 맨 아래 띠 "디스크". 첫째와 둘째 띠 사이에 아래로 향하는 화살표와 라벨 "GetByteArrayRegion 복사". 둘째와 셋째 띠 사이에 굵은 아래 화살표와 라벨 "write(2) 시스템 콜". 셋째와 넷째 띠 사이에 점선 아래 화살표와 라벨 "나중에 기록 (fsync로 강제)". 왼쪽에 세로 괄호로 위 두 띠를 묶어 "사용자 모드", 아래 두 띠를 묶어 "커널 모드"라고 적는다. 둘째와 셋째 띠 사이 경계선을 빨간 점선으로 강조한다. 평면적인 기술 도해, 흰 배경.</x-prompt>
+<x-caption>write()가 반환된 시점에 데이터는 커널 페이지 캐시까지 와 있다. 디스크 기록은 그 뒤의 일이다.</x-caption>
+</x-visual>
+
+<h3>native 메서드는 어떤 C 함수와 이어지는가</h3>
+<p>앞 절의 흐름도에서 "JNI 경계"는 한 줄로 지나갔다. 이 경계를 조금 더 열어 보자. <code>FileOutputStream</code>의 공개 메서드 <code>write(int)</code>는 평범한 자바 메서드이고, 실제 일은 <code>private native void write(int b, boolean append)</code>가 한다. 이 native 메서드를 <code>javap -p -v java.io.FileOutputStream</code>으로 보면 다음과 같다.</p>
+<pre data-label="javap -p -v java.io.FileOutputStream (JDK 21, 일부)"><code class="language-text">  private native void write(int, boolean) throws java.io.IOException;
+    descriptor: (IZ)V
+    flags: (0x0102) ACC_PRIVATE, ACC_NATIVE
+    Exceptions:
+      throws java.io.IOException</code></pre>
+<p>플래그에 <code>ACC_NATIVE</code>(0x0100)가 있고, 다른 메서드라면 반드시 있는 <code>Code</code> 속성이 없다. JVMS §4.7.3은 native이거나 abstract인 메서드의 <code>method_info</code>에는 <code>Code</code> 속성이 있어서는 안 된다고 정한다. 클래스 파일 안에 실행할 바이트코드가 한 줄도 없다는 뜻이다. 그렇다면 JVM은 이 메서드가 처음 호출될 때 어느 기계어로 뛰어야 하는지를 어떻게 알까.</p>
+<p>답은 이름이다. JNI 명세의 "Resolving Native Method Names"는 native 메서드를 C 함수 이름으로 바꾸는 규칙을 정한다. 접두사 <code>Java_</code>, 클래스 이진 이름의 <code>/</code>를 <code>_</code>로 바꾼 것, 밑줄 하나, 메서드 이름을 차례로 잇는다. 원래 이름에 있던 <code>_</code>는 <code>_1</code>로, <code>;</code>는 <code>_2</code>로, <code>[</code>는 <code>_3</code>으로, 그 밖의 영숫자가 아닌 문자는 <code>_0xxxx</code>로 이스케이프한다. 같은 이름의 native 메서드가 한 클래스에 둘 이상일 때만 뒤에 <code>__</code>와 이스케이프한 매개변수 디스크립터를 붙인 긴 이름(long name)이 필요하다. <code>FileOutputStream</code>에는 <code>write</code>라는 메서드가 여럿 있지만 native인 것은 <code>write(int, boolean)</code> 하나뿐이라서 짧은 이름 <code>Java_java_io_FileOutputStream_write</code>로 충분하다. 규칙대로라면 긴 이름은 디스크립터 <code>(IZ)V</code>의 매개변수 부분을 붙인 <code>Java_java_io_FileOutputStream_write__IZ</code>다.</p>
+<p>이 함수는 JDK의 <code>lib/libjava.dylib</code>(macOS 기준, 리눅스에서는 <code>libjava.so</code>)에 실제로 들어 있다. 이 실험 환경(macOS, arm64, Temurin 21.0.13)에서 내보낸 심볼을 보면 다음과 같다. 이름 앞의 밑줄 하나는 macOS가 C 심볼에 붙이는 표기 관례다.</p>
+<pre data-label="nm -gU lib/libjava.dylib | grep FileOutputStream (주소는 빌드마다 다르다)"><code class="language-text">0000000000002dc0 T _Java_java_io_FileOutputStream_initIDs
+0000000000002df4 T _Java_java_io_FileOutputStream_open0
+0000000000002e14 T _Java_java_io_FileOutputStream_write
+0000000000002e20 T _Java_java_io_FileOutputStream_writeBytes</code></pre>
+<p>OpenJDK 21의 <code>FileOutputStream.c</code>에서 이 함수의 선언은 <code>Java_java_io_FileOutputStream_write(JNIEnv *env, jobject this, jint byte, jboolean append)</code>다. 자바 쪽 매개변수 두 개 앞에 JNI 환경 포인터와 수신 객체(<code>this</code>)가 붙는다. 본문은 앞 절에서 본 <code>writeSingle</code>을 부르는 한 줄이다.</p>
+<p>HotSpot에서 이 찾기를 맡는 코드는 <code>src/hotspot/share/prims/nativeLookup.cpp</code>다. <code>NativeLookup::lookup</code>은 메서드에 아직 연결된 함수가 없을 때만(<code>has_native_function()</code>이 거짓일 때) <code>lookup_base</code>를 부르고, 찾은 주소를 <code>Method::set_native_function</code>으로 메서드의 VM 내부 구조(<code>Method</code>)에 기록한다. 그 안의 <code>lookup_entry</code>는 짧은 이름, 긴 이름, 그리고 OS별 접두사·접미사를 뺀 짧은 이름과 긴 이름의 네 가지 형태를 차례로 시도한다. 메서드를 정의한 클래스의 로더가 부트스트랩 로더(null)이면 먼저 자바 기본 네이티브 라이브러리(<code>os::native_java_library()</code>, 곧 libjava)에서 <code>os::dll_lookup</code>으로 찾는데, POSIX 계열에서 이 함수는 <code>dlsym</code>을 부르는 한 줄이다. 여기서 찾지 못했거나 다른 로더의 클래스이면 자바 메서드 <code>ClassLoader.findNative</code>를 호출해 그 로더가 <code>System.loadLibrary</code>로 올린 라이브러리에서 찾는다. 모두 실패하면 <code>UnsatisfiedLinkError</code>가 난다.</p>
+<p>이 연결이 언제 일어나는지는 <code>-verbose:jni</code>로 볼 수 있다. JDK 21에서 이 옵션은 통합 로깅의 <code>jni+resolve</code> 태그를 debug 수준으로 켠다. 다음 프로그램은 <code>System.err</code>에 표시를 찍어 가며 <code>FileOutputStream</code>의 메서드를 부른다.</p>
+<pre><code class="language-java">import java.io.FileOutputStream;
+
+public class W {
+    public static void main(String[] args) throws Exception {
+        try (FileOutputStream fos = new FileOutputStream("temp/w.dat")) {
+            System.err.println("--- write(int) 첫 호출 전");
+            fos.write(65);
+            System.err.println("--- write(int) 두 번째 호출 전");
+            fos.write(66);
+            System.err.println("--- write(byte[]) 호출 전");
+            fos.write(new byte[]{67, 68});
+        }
+    }
+}</code></pre>
+<pre data-label="java -verbose:jni W 2>&1 | grep -E 'FileOutputStream|---' (시각은 실행마다 다르다)"><code class="language-text">[0.018s][debug][jni,resolve] [Dynamic-linking native method java.io.FileOutputStream.initIDs ... JNI]
+[0.022s][debug][jni,resolve] [Dynamic-linking native method java.io.FileOutputStream.open0 ... JNI]
+[0.023s][debug][jni,resolve] [Dynamic-linking native method java.io.FileOutputStream.writeBytes ... JNI]
+--- write(int) 첫 호출 전
+[0.023s][debug][jni,resolve] [Dynamic-linking native method java.io.FileOutputStream.write ... JNI]
+--- write(int) 두 번째 호출 전
+--- write(byte[]) 호출 전</code></pre>
+<p>"Dynamic-linking" 문구는 <code>NativeLookup::lookup</code>이 이름으로 함수를 찾았을 때 찍는 로그다. 순서가 연결 시점을 그대로 보여 준다. <code>initIDs</code>는 클래스 초기화 때, <code>open0</code>은 생성자에서 파일을 열 때 연결된다. <code>writeBytes</code>가 우리 코드의 <code>write(byte[])</code>보다 훨씬 먼저 연결된 것은 첫 <code>System.err.println</code> 때문이다. 앞에서 본 것처럼 표준 출력과 표준 오류의 <code>PrintStream</code> 맨 아래에는 <code>FileOutputStream</code>이 있고, 문자열 출력은 결국 <code>writeBytes</code>로 내려간다. <code>write</code>는 첫 <code>write(65)</code> 직전에 한 번 연결되고, 두 번째 호출에서는 아무 로그도 없다. 이미 <code>Method</code>에 주소가 기록되어 있기 때문이다. 같은 출력의 앞부분에는 이 실행에서 "Registering JNI native method" 줄이 139개 있었는데, 이것은 이름으로 찾는 대신 주소를 미리 등록한 메서드를 <code>Method::register_native</code>가 기록한 것이다. 등록은 JNI의 <code>RegisterNatives</code> 함수를 거치거나, 맨 앞에 찍힌 <code>java.lang.Object.hashCode</code>처럼 HotSpot의 <code>javaClasses.cpp</code>(<code>java_lang_Object::register_natives</code>)가 직접 한다.</p>
+<p>정리하면 이름으로 찾는 비용은 메서드마다 처음 한 번뿐이다. 성능에 남는 것은 매 호출마다 치르는 경계 넘기 자체이고, 그 내용이 다음 절의 주제다.</p>
+
+<h3>네이티브 코드 안의 스레드: 상태 전이와 GC</h3>
+<p>함수 주소를 찾았다고 곧바로 C 함수로 뛰지는 않는다. HotSpot은 자바 스레드마다 지금 어떤 종류의 코드를 실행하고 있는지를 나타내는 상태 값(<code>JavaThreadState</code>)을 둔다. 자바 코드를 실행 중인 <code>_thread_in_Java</code>, VM 내부 C++ 코드를 실행 중인 <code>_thread_in_vm</code>, 네이티브 코드를 실행 중인 <code>_thread_in_native</code>, VM 안에서 막혀 있는 <code>_thread_blocked</code> 등이다. native 메서드 호출은 이 상태를 바꾸는 코드로 앞뒤가 감싸여 있다. JIT 컴파일된 코드가 쓰는 네이티브 래퍼는 <code>SharedRuntime::generate_native_wrapper</code>가, 인터프리터의 네이티브 진입점은 <code>TemplateInterpreterGenerator::generate_native_entry</code>가 만든다. 이 실험 환경의 CPU인 aarch64용 OpenJDK 21 소스(<code>sharedRuntime_aarch64.cpp</code>, <code>templateInterpreterGenerator_aarch64.cpp</code>)를 보면 두 곳 모두 같은 순서를 따른다.</p>
+<figure class="flow-figure"><figcaption>native 메서드 호출 앞뒤의 스레드 상태 전이 (OpenJDK 21 HotSpot, aarch64)</figcaption><ol class="flow">
+<li><strong>인자 정리</strong><span>첫 인자로 <code>JNIEnv*</code>를 준비하고, 객체 참조는 GC가 추적할 수 있는 핸들로 감싸 넘긴다.</span></li>
+<li><strong>_thread_in_native로 전환</strong><span>스레드의 상태 필드에 <code>_thread_in_native</code>를 해제(release) 의미의 저장 명령(<code>stlrw</code>)으로 기록한 뒤 C 함수를 호출한다.</span></li>
+<li><strong>_thread_in_native_trans로 전환</strong><span>C 함수가 돌아오면 중간 상태 <code>_thread_in_native_trans</code>를 기록하고, 메모리 장벽 뒤에 세이프포인트 진행 여부를 확인한다. 진행 중이면 끝날 때까지 여기서 기다린다.</span></li>
+<li><strong>_thread_in_Java로 복귀</strong><span>상태를 <code>_thread_in_Java</code>로 되돌리고, 결과값을 자바 쪽으로 넘긴다.</span></li>
+</ol></figure>
+<p>이 상태 값이 중요한 이유는 <b>세이프포인트(safepoint)</b>다. G1의 전체 GC처럼 힙의 객체를 옮기는 작업 일부는 모든 자바 스레드가 힙을 건드리지 않는 지점에 멈춰 있을 때만 할 수 있다. VM은 이런 작업 전에 스레드들을 세이프포인트로 모은다. 그런데 <code>safepoint.cpp</code>의 <code>safepoint_safe_with</code>를 보면 <code>_thread_in_native</code> 상태인 스레드는 자바 스택을 훑을 수 있는 상태이기만 하면 이미 안전한 것으로 친다. 네이티브 코드는 자바 힙의 객체를 직접 만지지 않는다는 전제 때문이다. 그래서 VM은 <code>read(2)</code>에 막혀 언제 돌아올지 모르는 스레드를 기다리지 않고 GC를 진행한다. 그 스레드가 돌아오면 3단계의 확인에서 세이프포인트가 진행 중인 것을 보고 멈춘다. 래퍼 소스의 주석은 중간 상태 <code>_thread_in_native_trans</code>가 왜 필요한지도 적어 둔다. 이 상태 없이 "동기화 중이 아님"을 읽은 직후 VM이 GC를 시작하면, 스레드가 그것을 모른 채 자바 코드로 빠져나가는 경쟁이 생긴다.</p>
+<p>직접 확인해 보자. 다음 프로그램은 표준 입력을 읽는 스레드를 띄워 막히게 해 두고, 그 스레드의 상태와 스택을 출력한 뒤 <code>System.gc()</code>를 부른다. 표준 입력에는 아무것도 보내지 않는 파이프를 연결해 실행한다.</p>
+<pre><code class="language-java">public class Blocked {
+    public static void main(String[] args) throws Exception {
+        Thread reader = new Thread(() -> {
+            try {
+                byte[] buf = new byte[8192];
+                int n = System.in.read(buf);          // 표준 입력에서 막힌다
+                System.out.println("read -> " + n);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }, "reader");
+        reader.setDaemon(true);
+        reader.start();
+        Thread.sleep(500);
+
+        System.out.println("상태: " + reader.getState());
+        for (StackTraceElement e : reader.getStackTrace()) {
+            System.out.println("  at " + e);
+        }
+
+        long start = System.nanoTime();
+        System.gc();
+        System.out.printf("System.gc() 반환까지 %d ms%n",
+                (System.nanoTime() - start) / 1_000_000);
+    }
+}</code></pre>
+<pre data-label="sleep 5 | java -Xlog:safepoint Blocked (시간 값은 실행마다 다르다)"><code class="language-text">상태: RUNNABLE
+  at java.base/java.io.FileInputStream.readBytes(Native Method)
+  at java.base/java.io.FileInputStream.read(FileInputStream.java:287)
+  at java.base/java.io.BufferedInputStream.read1(BufferedInputStream.java:345)
+  at java.base/java.io.BufferedInputStream.implRead(BufferedInputStream.java:420)
+  at java.base/java.io.BufferedInputStream.read(BufferedInputStream.java:399)
+  at java.base/java.io.FilterInputStream.read(FilterInputStream.java:95)
+  at Blocked.lambda$main$0(Blocked.java:6)
+  at java.base/java.lang.Thread.run(Thread.java:1583)
+[0.529s][info][safepoint] Safepoint "G1CollectFull", Time since last: 515642041 ns, Reaching safepoint: 3125 ns, Cleanup: 5084 ns, At safepoint: 2822625 ns, Leaving safepoint: 7291 ns, Total: 2838125 ns
+System.gc() 반환까지 2 ms</code></pre>
+<p>세 가지를 읽어 낼 수 있다. 첫째, 커널 안에서 데이터를 기다리며 막혀 있는 스레드의 자바 상태가 <code>RUNNABLE</code>이다. <code>Thread.State.RUNNABLE</code>의 Javadoc은 이 상태의 스레드가 JVM 안에서 실행 중이지만 프로세서 같은 운영체제의 자원을 기다리고 있을 수도 있다고 적는다. 스레드 덤프에서 <code>RUNNABLE</code>이면서 맨 위 프레임이 <code>(Native Method)</code>라면 CPU를 쓰는 중이 아니라 시스템 콜 안에서 막혀 있을 수 있다는 뜻이다. 둘째, 스택이 이 회차의 구조를 그대로 보여 준다. <code>System.in</code>은 <code>BufferedInputStream</code>이고, 요청한 8,192바이트 배열이 내부 버퍼 크기 이상이므로 <code>read1</code>이 내부 버퍼를 거치지 않고 <code>FileInputStream.read</code>로 바로 넘겼다. 셋째, 세이프포인트 로그의 "Reaching safepoint"가 마이크로초 단위다. 막힌 <code>reader</code> 스레드는 <code>_thread_in_native</code> 상태이므로 VM은 그 스레드를 기다리지 않고 바로 전체 GC를 했다.</p>
+<p>이제 앞 절에서 본 "자바 배열을 C 버퍼로 복사한다"의 이유를 한 층 더 정확히 말할 수 있다. <code>GetByteArrayRegion</code> 같은 JNI 함수는 HotSpot의 <code>jni.cpp</code>에서 <code>JNI_ENTRY</code> 매크로로 정의되고, 이 매크로는 <code>ThreadInVMfromNative</code>로 스레드 상태를 <code>_thread_in_vm</code>으로 바꾼 뒤 본문을 실행한다. <code>_thread_in_vm</code>은 세이프포인트에 안전한 상태가 아니므로 복사하는 동안에는 GC가 그 배열을 옮길 수 없다. 복사가 끝나면 다시 <code>_thread_in_native</code>로 돌아가고, 그다음에 부르는 <code>write(2)</code>나 <code>read(2)</code>는 GC가 관리하지 않는 C 버퍼만 본다. 시스템 콜이 아무리 오래 막혀도 GC는 그 스레드와 상관없이 진행된다. 바이트마다 한 번 더 복사하는 비용으로 이 성질을 얻는 셈이다.</p>
+<p>다른 선택지와 비교하면 차이가 분명해진다. JNI에는 복사 없이 배열을 직접 가리키는 포인터를 얻는 <code>GetPrimitiveArrayCritical</code>도 있다. JNI 명세는 이 함수와 <code>ReleasePrimitiveArrayCritical</code> 사이를 "임계 영역(critical region)"이라 부르며, 그 안에서는 다른 JNI 함수를 부르거나 현재 스레드가 다른 자바 스레드를 기다리며 막힐 수 있는 시스템 콜을 불러서는 안 된다고 정한다. 명세가 드는 예가 바로 다른 자바 스레드가 쓰고 있는 스트림에 대한 <code>read</code>다. 같은 대목은 VM이 이 동안 GC를 일시적으로 끌 수도 있다고 적는다. HotSpot의 기본 GC인 G1이 실제로 그렇게 동작했다. JDK 22에 들어간 <a href="https://openjdk.org/jeps/423">JEP 423(Region Pinning for G1)</a>은 그 전까지 G1이 임계 영역마다 GC를 껐고, 그래서 GC를 일으킨 스레드는 다른 스레드가 모두 임계 영역을 벗어날 때까지 기다려야 했다고 설명한다. JDK 21은 이 변경 이전이다. <code>FileInputStream</code>과 <code>FileOutputStream</code>의 경로는 Region 함수로 복사한 뒤 시스템 콜을 부르므로, 파이프나 터미널처럼 얼마나 막힐지 모르는 읽기에서도 GC를 붙잡지 않는다.</p>
+
+<h3>성능 최적화 1: 하나씩 쓰기</h3>
+<p>경로를 알았으니 이제 10MB(10,485,760바이트) 파일을 네 가지 방식으로 써 보며 호출 횟수를 직접 센다. 시간을 재는 것보다 횟수를 세는 쪽이 원리를 더 정확히 보여 준다. 시간은 하드웨어, 운영체제, 파일 시스템, 그 순간의 부하에 따라 달라지지만, 아래 스트림에 도달한 호출 횟수는 코드만으로 결정되기 때문이다. 아래 프로그램은 <code>FileOutputStream</code> 바로 위에 호출 횟수를 세는 스트림을 끼워 넣고, 네 방식을 차례로 실행한다.</p>
+<pre><code class="language-java">import java.io.BufferedOutputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+
+public class WriteCalls {
+    static final String FILE = "temp/big.dat";
+    static final int FILE_SIZE = 10 * 1024 * 1024;   // 10MB
+    static final int BUFFER_SIZE = 8192;              // 8KB
+
+    public static void main(String[] args) throws IOException {
+        run("1. 하나씩 쓰기", WriteCalls::oneByOne);
+        run("2. 직접 만든 버퍼", WriteCalls::manualBuffer);
+        run("3. BufferedOutputStream", WriteCalls::buffered);
+        run("4. 한 번에 쓰기", WriteCalls::allAtOnce);
+    }
+
+    static void oneByOne(OutputStream out) throws IOException {
+        for (int i = 0; i < FILE_SIZE; i++) {
+            out.write(1);
+        }
+    }
+
+    static void manualBuffer(OutputStream out) throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
+        int index = 0;
+        for (int i = 0; i < FILE_SIZE; i++) {
+            buffer[index++] = 1;
+            if (index == BUFFER_SIZE) {      // 버퍼가 가득 찼다
+                out.write(buffer, 0, index);
+                index = 0;
+            }
+        }
+        if (index > 0) {                     // 남은 조각
+            out.write(buffer, 0, index);
+        }
+    }
+
+    static void buffered(OutputStream out) throws IOException {
+        BufferedOutputStream bos = new BufferedOutputStream(out, BUFFER_SIZE);
+        for (int i = 0; i < FILE_SIZE; i++) {
+            bos.write(1);
+        }
+        bos.flush();                         // 남은 데이터를 아래로 내린다
+    }
+
+    static void allAtOnce(OutputStream out) throws IOException {
+        byte[] all = new byte[FILE_SIZE];
+        java.util.Arrays.fill(all, (byte) 1);
+        out.write(all);
+    }
+
+    interface Job { void write(OutputStream out) throws IOException; }
+
+    static void run(String name, Job job) throws IOException {
+        try (CountingOutputStream counter =
+                     new CountingOutputStream(new FileOutputStream(FILE))) {
+            long start = System.nanoTime();
+            job.write(counter);
+            long ms = (System.nanoTime() - start) / 1_000_000;
+            System.out.printf("%s: FileOutputStream.write 호출 %,d번, %dms%n",
+                    name, counter.calls, ms);
+        }
+    }
+
+    // 아래 스트림(FileOutputStream)에 도달한 write 호출을 센다
+    static class CountingOutputStream extends OutputStream {
+        private final OutputStream target;
+        long calls;
+
+        CountingOutputStream(OutputStream target) { this.target = target; }
+
+        @Override
+        public void write(int b) throws IOException {
+            calls++;
+            target.write(b);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            calls++;
+            target.write(b, off, len);
+        }
+
+        @Override
+        public void close() throws IOException { target.close(); }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (ms 값은 실행마다 다르다)"><code class="language-text">1. 하나씩 쓰기: FileOutputStream.write 호출 10,485,760번, ...ms
+2. 직접 만든 버퍼: FileOutputStream.write 호출 1,280번, ...ms
+3. BufferedOutputStream: FileOutputStream.write 호출 1,280번, ...ms
+4. 한 번에 쓰기: FileOutputStream.write 호출 1번, ...ms</code></pre>
+<p><code>CountingOutputStream</code>이 <code>write(byte[], int, int)</code>를 재정의했다는 점에 주의하자. 재정의하지 않으면 앞 절에서 본 <code>OutputStream</code>의 기본 구현이 배열을 한 바이트씩 쪼개 <code>write(int)</code>로 넘기므로, 세는 장치가 오히려 실험을 망친다. 이렇게 재정의해 두면 이 스트림이 받은 호출이 그대로 <code>FileOutputStream</code>의 호출 한 번, 즉 앞 절의 경로를 한 번 지나가는 일이 된다.</p>
+<p>1번 방식은 10,485,760번 호출한다. 바이트 하나마다 JNI 경계를 넘고, <code>write(2)</code> 시스템 콜로 커널에 들어가고, 1바이트를 페이지 캐시에 복사하고 돌아온다. 일 자체는 1바이트 복사인데 호출당 고정 비용을 천만 번 넘게 치른다. 시간은 환경마다 달라 이 글에 숫자를 적지 않지만, 직접 돌려 보면 1번은 나머지 셋과 자릿수부터 다를 만큼 느리다. 읽기도 똑같다. <code>FileInputStream.read()</code>를 한 바이트씩 부르면 네이티브의 <code>readSingle</code>이 매번 <code>read(2)</code> 시스템 콜을 부르므로, 10MB 파일을 다 읽는 데 10,485,760번에 끝을 알리는 1번을 더해 10,485,761번 호출한다.</p>
+<p>시간을 잴 때 함께 알아 둘 점이 있다. 이런 코드는 처음에는 인터프리터로 실행되다가 JIT 컴파일러가 뜨거운 루프를 기계어로 바꾼 뒤 빨라지므로, 한 번 재서 나온 숫자는 워밍업 구간이 섞인 값이다. 정밀한 비교가 필요하면 OpenJDK의 JMH 같은 마이크로벤치마크 도구를 쓴다. 다만 이 회차의 비교는 호출 횟수 자체가 천 배에서 천만 배까지 차이 나는 경우라서, 측정 방법의 오차로 순서가 뒤집히지는 않는다.</p>
+
+<h3>성능 최적화 2: 버퍼를 직접 만들어 쓰기</h3>
+<p>2번 방식은 바이트를 바로 내보내지 않고 8,192바이트 배열에 모았다가, 배열이 가득 찰 때마다 <code>write(buffer, 0, index)</code>로 한 번에 내보낸다. 이 배열이 <b>버퍼(buffer)</b>다. 10,485,760을 8,192로 나누면 정확히 1,280이므로 호출은 1,280번이다. 바이트를 배열에 넣는 일은 자바 힙 안에서 끝나는 메모리 쓰기이고, 시스템 콜은 8,192바이트마다 한 번만 일어난다. 호출당 고정 비용을 8,192바이트가 나눠 내는 셈이다.</p>
+<p>코드에서 두 군데를 꼭 확인하자. 첫째, 루프가 끝난 뒤의 <code>if (index > 0)</code>이다. 파일 크기가 버퍼 크기의 배수가 아니면 마지막에 덜 찬 버퍼가 남는데, 이 조각을 내보내지 않으면 파일 끝이 잘린다. 이 예제는 크기가 딱 나누어떨어져서 이 분기를 타지 않지만, 크기를 10,000,000바이트로 바꾸면 마지막에 5,760바이트(10,000,000 - 8,192 × 1,220)가 남아 이 분기가 1,221번째 호출을 만든다. 둘째, <code>write(buffer)</code>가 아니라 <code>write(buffer, 0, index)</code>를 쓴다. 앞에서 본 복사 버그와 같은 이유다. 이 두 가지가 버퍼를 직접 다룰 때 가장 흔히 틀리는 곳이고, 뒤에서 볼 <code>BufferedOutputStream</code>은 바로 이 두 가지를 대신 처리해 준다.</p>
+<p>그렇다면 버퍼는 클수록 좋을까. 버퍼 크기를 B라고 하면 호출 횟수는 10,485,760 / B이다. 크기를 두 배로 늘릴 때마다 호출은 절반이 된다. 그런데 줄어드는 <b>절대량</b>을 보면 이야기가 달라진다.</p>
+<div class="table-wrap"><table><thead><tr><th>버퍼 크기 B</th><th>10MB 쓰기 호출 횟수</th><th>바로 위 행보다 줄어든 호출</th></tr></thead><tbody>
+<tr><td>1</td><td>10,485,760</td><td>-</td></tr>
+<tr><td>16</td><td>655,360</td><td>9,830,400</td></tr>
+<tr><td>256</td><td>40,960</td><td>614,400</td></tr>
+<tr><td>1,024</td><td>10,240</td><td>30,720</td></tr>
+<tr><td>4,096</td><td>2,560</td><td>7,680</td></tr>
+<tr><td>8,192</td><td>1,280</td><td>1,280</td></tr>
+<tr><td>65,536</td><td>160</td><td>1,120</td></tr>
+<tr><td>1,048,576</td><td>10</td><td>150</td></tr>
+</tbody></table></div>
+<p>버퍼를 1에서 16으로만 늘려도 980만 번이 넘는 호출이 사라진다. 반면 8KB에서 64KB로 여덟 배를 키워 없앨 수 있는 호출은 1,120번뿐이다. 전체 비용을 "호출 횟수 × 호출당 고정 비용 + 전체 바이트 수 × 바이트당 복사 비용"으로 보면 이유가 분명하다. 버퍼를 키우면 앞의 항만 줄어들고, 뒤의 항은 버퍼 크기와 상관없이 10MB 분량 그대로 남는다. 버퍼가 어느 정도 커지면 앞의 항은 이미 뒤의 항에 비해 작아져서 더 키워도 전체 시간은 거의 변하지 않는다. 이것을 수확 체감(diminishing returns)이라고 한다.</p>
+<p>반대로 버퍼를 너무 키우면 비용이 생긴다. 첫째, 메모리다. 버퍼는 스트림마다 하나씩 생긴다. 서버가 동시에 1,000개의 연결을 처리하면서 연결마다 1MB 버퍼를 둔다면 버퍼만으로 1,000MB 가까운 힙을 쓴다. 둘째, 앞에서 본 OpenJDK 21의 <code>io_util.c</code>는 8,192바이트보다 긴 쓰기 요청을 받을 때마다 그 길이만큼 <code>malloc</code>으로 네이티브 메모리를 할당하고 끝나면 해제한다. 8,192바이트 이하의 요청은 C 스택의 고정 배열을 쓰므로 이 할당이 없다. 이 두 이유 때문에 실무에서는 대개 수 KB에서 수십 KB 사이의 버퍼를 쓴다. JDK 자신의 선택도 이 범위에 있다. OpenJDK 21 소스 기준으로 <code>BufferedInputStream</code>과 <code>BufferedOutputStream</code>의 기본 최대 크기는 8,192바이트이고, <code>InputStream.transferTo</code>와 <code>readNBytes</code>가 쓰는 배열은 16,384바이트다. 이 값들은 Javadoc이 약속한 것이 아니라 구현의 선택이므로 버전에 따라 바뀔 수 있다.</p>
+<x-visual id="java-adv2-02-batching" title="한 바이트씩 보내기와 버퍼로 모아 보내기의 비교" kind="비유 그림" ratio="16:9">
+<x-hint>호출당 고정 비용이 있을 때, 바이트를 하나씩 보내는 것과 버퍼에 모아 한 번에 보내는 것의 차이를 택배 트럭 비유로 보여 준다.</x-hint>
+<x-prompt>화면을 위아래 두 칸으로 나눈다. 위 칸 제목 "하나씩 쓰기": 왼쪽 건물 "자바 프로그램"에서 오른쪽 건물 "커널"까지 도로가 있고, 아주 작은 상자 하나씩을 실은 작은 트럭 수십 대가 줄지어 달린다. 도로 중간에 요금소 "시스템 콜"이 있고 트럭마다 요금소에서 멈춰 있다. 위 칸 오른쪽 아래에 "호출 10,485,760번". 아래 칸 제목 "버퍼로 모아 쓰기": 같은 두 건물과 요금소가 있고, 왼쪽 건물 앞에 상자를 쌓는 창고 "버퍼 8KB"가 있으며, 상자를 가득 실은 큰 트럭 한 대만 요금소를 지난다. 아래 칸 오른쪽 아래에 "호출 1,280번". 평면 일러스트 스타일, 흰 배경, 라벨은 한국어 그대로.</x-prompt>
+<x-caption>요금소(시스템 콜)를 지나는 비용은 짐의 양과 거의 상관없다. 버퍼는 짐을 모아 요금소를 덜 지나게 한다.</x-caption>
+</x-visual>
+
+<h3>성능 최적화 3: BufferedOutputStream으로 쓰기</h3>
+<p>3번 방식은 직접 만든 버퍼 대신 <code>BufferedOutputStream</code>으로 아래 스트림을 감쌌다. 코드는 1번처럼 한 바이트씩 <code>write(1)</code>을 부르는데, 아래 스트림에 도달한 호출은 2번과 똑같이 1,280번이다. 버퍼 관리 코드를 이 클래스가 대신 갖고 있기 때문이다. OpenJDK 21의 구현에서 락 처리를 빼고 핵심만 옮기면 다음과 같다.</p>
+<pre><code class="language-java">// OpenJDK 21 java.io.BufferedOutputStream을 줄여 옮긴 것 (락 처리 생략)
+protected byte[] buf;     // 내부 버퍼
+protected int count;      // 버퍼에 쌓인 바이트 수
+
+private void implWrite(int b) throws IOException {
+    growIfNeeded(1);                 // 작은 버퍼로 시작했다면 키운다
+    if (count >= buf.length) {
+        flushBuffer();               // 가득 찼으면 먼저 비운다
+    }
+    buf[count++] = (byte) b;         // 배열에 넣기만 한다
+}
+
+private void flushBuffer() throws IOException {
+    if (count > 0) {
+        out.write(buf, 0, count);    // 아래 스트림 호출은 여기서만 일어난다
+        count = 0;
+    }
+}
+
+private void implWrite(byte[] b, int off, int len) throws IOException {
+    if (len >= maxBufSize) {         // 버퍼 최대 크기 이상의 요청은
+        flushBuffer();               // 쌓인 것을 먼저 내보내고
+        out.write(b, off, len);      // 복사하지 않고 바로 아래로 넘긴다
+        return;
+    }
+    growIfNeeded(len);
+    if (len > buf.length - count) {  // 들어갈 자리가 없으면
+        flushBuffer();               // 먼저 비운다
+    }
+    System.arraycopy(b, off, buf, count, len);
+    count += len;
+}</code></pre>
+<p>2번 방식에서 우리가 직접 쓴 로직이 그대로 들어 있다. 가득 차면 비우고, 비울 때는 <code>out.write(buf, 0, count)</code>로 쌓인 만큼만 내보낸다. 덜 찬 마지막 조각은 <code>flush()</code>나 <code>close()</code>가 내보낸다. 실험 코드의 <code>buffered</code> 메서드 끝에 <code>bos.flush()</code>가 있는 이유다. 이 줄을 지우면 마지막 버퍼분이 파일에 들어가지 않는다. 이 예제에서는 마지막 8,192바이트가 그렇게 사라진다.</p>
+<p>배열을 쓰는 <code>implWrite(byte[], int, int)</code>의 첫 분기도 눈여겨보자. 요청 길이가 버퍼 최대 크기 이상이면 내부 버퍼를 거치지 않고 바로 아래로 넘긴다. 이미 충분히 큰 덩어리를 굳이 버퍼에 복사했다가 다시 내보낼 이유가 없기 때문이다. 소스 주석은 이렇게 해야 버퍼 스트림을 여러 겹 쌓아도 해가 없다고 설명한다. 작은 배열은 반대로 내부 버퍼에 모인다. 두 경우의 호출 횟수를 세어 보자. 아래 코드는 앞의 <code>WriteCalls</code>에 있는 <code>CountingOutputStream</code>을 재사용하므로 <code>javac -d out WriteCalls.java BufferedBypass.java</code>로 함께 컴파일한 뒤 <code>java -cp out BufferedBypass</code>로 실행한다.</p>
+<pre><code class="language-java">import java.io.BufferedOutputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class BufferedBypass {
+    public static void main(String[] args) throws IOException {
+        WriteCalls.CountingOutputStream c1 =
+                new WriteCalls.CountingOutputStream(new FileOutputStream("temp/a.dat"));
+        try (BufferedOutputStream bos = new BufferedOutputStream(c1, 8192)) {
+            byte[] chunk = new byte[100];
+            for (int i = 0; i < 1000; i++) {
+                bos.write(chunk);                // 100바이트씩 1000번
+            }
+        }
+        System.out.println("100바이트 x 1000번 -> " + c1.calls + "번");
+
+        WriteCalls.CountingOutputStream c2 =
+                new WriteCalls.CountingOutputStream(new FileOutputStream("temp/b.dat"));
+        try (BufferedOutputStream bos = new BufferedOutputStream(c2, 8192)) {
+            byte[] chunk = new byte[8192];
+            for (int i = 0; i < 1280; i++) {
+                bos.write(chunk);                // 8192바이트씩 1280번
+            }
+        }
+        System.out.println("8192바이트 x 1280번 -> " + c2.calls + "번");
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">100바이트 x 1000번 -> 13번
+8192바이트 x 1280번 -> 1280번</code></pre>
+<p>13이라는 숫자를 손으로 맞춰 보자. 8,192바이트 버퍼에 100바이트 덩어리는 81개(8,100바이트)까지 들어간다. 82번째 덩어리가 오면 남은 자리 92바이트보다 요청이 커서 <code>flushBuffer()</code>가 8,100바이트를 내보낸다. 1,000개는 81 × 12 + 28이므로 쓰는 도중에 12번 비우고, 마지막 28개(2,800바이트)는 try-with-resources가 부른 <code>close()</code>가 비운다. 합쳐 13번이다. 두 번째 경우는 모든 요청이 8,192바이트로 버퍼 최대 크기와 같아서 첫 분기를 타고 그대로 통과한다. 호출 1,280번, 내부 버퍼로의 복사는 0번이다.</p>
+<p>그런데 2번과 3번은 아래 스트림 호출 횟수가 같은데도 시간은 같지 않다. 직접 재 보면 3번이 2번보다 눈에 띄게 느리다. 차이는 시스템 콜이 아니라 <b>바이트마다 실행되는 자바 코드</b>에서 온다. 2번은 바이트마다 배열에 값을 넣고 인덱스를 비교하는 것이 전부이고, JIT 컴파일러는 이런 단순한 루프를 좋은 기계어로 바꾼다. 3번은 바이트마다 <code>write(int)</code> 메서드를 호출하고, 그 안에서 락을 잡고, 버퍼 크기를 확인하고, 락을 푼다. 락 부분의 실제 코드는 다음과 같다.</p>
+<pre><code class="language-java">// OpenJDK 21 java.io.BufferedOutputStream.write(int)
+public void write(int b) throws IOException {
+    if (lock != null) {              // 클래스가 정확히 BufferedOutputStream일 때
+        lock.lock();                 // jdk.internal.misc.InternalLock
+        try {
+            implWrite(b);
+        } finally {
+            lock.unlock();
+        }
+    } else {                         // 하위 클래스로 만들었을 때
+        synchronized (this) {
+            implWrite(b);
+        }
+    }
+}</code></pre>
+<p>락이 있는 이유는 스트림이 여러 스레드에서 공유될 수 있기 때문이다. 두 스레드가 동시에 <code>buf[count++] = b</code>를 실행하면 앞 권에서 본 경쟁 조건 그대로 <code>count</code>가 꼬이고 바이트가 덮어써진다. <code>System.out</code>처럼 여러 스레드가 함께 쓰는 스트림이 깨지지 않는 것은 이 락 덕분이다. 락의 종류는 OpenJDK 21에서 상황에 따라 다르다. 생성된 객체의 클래스가 정확히 <code>BufferedOutputStream</code>이면 생성자가 <code>InternalLock.newLockOrNull()</code>로 내부 락을 만드는데, 이 클래스는 <code>ReentrantLock</code>을 감싼 것이다. 하위 클래스로 만들었다면 <code>lock</code>이 <code>null</code>이고 <code>synchronized</code>를 쓴다. 시스템 프로퍼티 <code>jdk.io.useMonitors</code>를 <code>true</code>로 주면 내부 락 대신 항상 모니터를 쓴다. 어느 쪽이든 바이트 하나마다 락 획득과 해제가 따라붙는다는 점은 같다. 한 바이트씩 다룰 때 직접 만든 버퍼가 빠른 이유가 이것이고, 반대로 여러 스레드가 공유하거나 코드가 단순해야 할 때 <code>BufferedOutputStream</code>을 쓰는 이유도 이것이다.</p>
+<p>OpenJDK 21의 <code>BufferedOutputStream</code>에는 기본 생성자로 만들 때만 드러나는 구현 세부가 하나 더 있다. 크기를 지정하지 않으면 최대 크기는 8,192바이트인데, 생성 시점의 스레드가 가상 스레드라면 512바이트 배열로 시작해 필요할 때 <code>growIfNeeded</code>로 최대 크기까지 늘린다. 가상 스레드는 수가 아주 많을 수 있어서 스트림마다 8KB를 미리 잡아 두지 않으려는 것이다. 크기를 직접 지정한 생성자는 처음부터 그 크기로 만들고 늘리지 않는다. Javadoc은 기본 버퍼 크기를 명시하지 않으므로, 크기가 중요하다면 생성자에 직접 넘기는 편이 버전에 따라 흔들리지 않는다.</p>
+<p>마지막으로 닫기의 흐름을 보자. <code>BufferedOutputStream</code>은 <code>close()</code>를 재정의하지 않고 부모 <code>FilterOutputStream</code>의 것을 쓴다.</p>
+<pre><code class="language-java">// OpenJDK 21 java.io.FilterOutputStream.close()를 줄여 옮긴 것
+public void close() throws IOException {
+    if (closed) {
+        return;                      // 두 번 닫아도 안전하다
+    }
+    // ... closed = true (closeLock으로 한 번만 통과시킨다)
+    try {
+        flush();                     // BufferedOutputStream.flush(): 버퍼 비우기 + out.flush()
+    } finally {
+        out.close();                 // 감싼 스트림을 닫는다
+    }
+    // 실제 코드는 flush와 close가 둘 다 실패하면 하나를 suppressed 예외로 붙인다
+}</code></pre>
+<pre class="diagram">bos.close()
+  └ FilterOutputStream.close()
+      ├ bos.flush()
+      │   ├ flushBuffer()  ->  fos.write(buf, 0, count)   (남은 바이트를 커널로)
+      │   └ fos.flush()    ->  OutputStream.flush(): 아무것도 하지 않음
+      └ fos.close()        ->  파일 디스크립터 반납</pre>
+<p>바깥 스트림 하나만 닫으면 남은 데이터를 내보내고, 안쪽 스트림까지 차례로 닫힌다. 그래서 감싼 스트림은 <b>가장 바깥 것만 닫으면 된다</b>. 순서를 거꾸로 해서 안쪽을 먼저 닫으면 어떻게 되는지는 마지막 절에서 실험한다.</p>
+
+<h3>성능 최적화 4: BufferedInputStream으로 읽기</h3>
+<p>읽기 쪽도 같은 원리다. <code>BufferedInputStream</code>은 아래 스트림에서 버퍼 크기만큼 한 번에 읽어 두고, <code>read()</code> 요청은 그 버퍼에서 꺼내 준다. 앞에서 만든 10MB 파일을 한 바이트씩 읽으면서 아래 스트림의 호출 횟수를 세어 보자.</p>
+<pre><code class="language-java">import java.io.BufferedInputStream;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+
+public class ReadCalls {
+    static final String FILE = "temp/big.dat";   // WriteCalls가 만든 10MB 파일
+
+    public static void main(String[] args) throws IOException {
+        // 1. BufferedInputStream으로 한 바이트씩 읽기
+        try (CountingInputStream counter = new CountingInputStream(new FileInputStream(FILE));
+             BufferedInputStream bis = new BufferedInputStream(counter, 8192)) {
+            long total = 0;
+            while (bis.read() != -1) {
+                total++;
+            }
+            System.out.printf("read() %,d바이트 -> FileInputStream.read 호출 %,d번%n",
+                    total, counter.calls);
+        }
+
+        // 2. BufferedInputStream에 버퍼보다 큰 배열을 넘기기
+        try (CountingInputStream counter = new CountingInputStream(new FileInputStream(FILE));
+             BufferedInputStream bis = new BufferedInputStream(counter, 8192)) {
+            byte[] big = new byte[1024 * 1024];   // 1MB
+            long total = 0;
+            int n;
+            while ((n = bis.read(big)) != -1) {
+                total += n;
+            }
+            System.out.printf("read(1MB 배열) %,d바이트 -> FileInputStream.read 호출 %,d번%n",
+                    total, counter.calls);
+        }
+    }
+
+    static class CountingInputStream extends InputStream {
+        private final InputStream source;
+        long calls;
+
+        CountingInputStream(InputStream source) { this.source = source; }
+
+        @Override
+        public int read() throws IOException {
+            calls++;
+            return source.read();
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            calls++;
+            return source.read(b, off, len);
+        }
+
+        @Override
+        public int available() throws IOException { return source.available(); }
+
+        @Override
+        public void close() throws IOException { source.close(); }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">read() 10,485,760바이트 -> FileInputStream.read 호출 1,281번
+read(1MB 배열) 10,485,760바이트 -> FileInputStream.read 호출 11번</code></pre>
+<p>첫 번째 결과는 1,280이 아니라 1,281이다. 1,280번은 8,192바이트씩 데이터를 가져온 호출이고, 마지막 1번은 -1을 받아 스트림 끝을 확인한 호출이다. 쓰기와 달리 읽기는 "더 없다"는 답을 듣기 위해서도 한 번을 물어야 한다. 내부 동작을 보면 이 숫자가 그대로 나온다.</p>
+<pre><code class="language-java">// OpenJDK 21 java.io.BufferedInputStream을 줄여 옮긴 것 (락, mark 처리 생략)
+protected volatile byte[] buf;
+protected int count;   // 버퍼에 들어 있는 유효한 바이트 수
+protected int pos;     // 다음에 돌려줄 위치
+
+private int implRead() throws IOException {
+    if (pos >= count) {          // 버퍼를 다 소비했으면
+        fill();                  // 아래 스트림에서 다시 채운다
+        if (pos >= count)
+            return -1;           // 채우지 못했다 = 스트림 끝
+    }
+    return getBufIfOpen()[pos++] & 0xff;   // 부호 없는 0~255로 돌려준다
+}
+
+private void fill() throws IOException {
+    byte[] buffer = getBufIfOpen();        // 처음 호출이면 이때 배열을 만든다
+    pos = 0;                               // mark가 없으면 이전 내용은 버린다
+    count = pos;
+    int n = getInIfOpen().read(buffer, pos, buffer.length - pos);
+    if (n > 0)
+        count = n + pos;
+}</code></pre>
+<pre class="diagram">BufferedInputStream 내부 (버퍼 8,192바이트)
+
+fill() 직후          pos=0                                count=8192
+                     [■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■]
+read() 3000번 뒤               pos=3000                   count=8192
+                     [□□□□□□□□□□□□□■■■■■■■■■■■■■■■■■■■■■■■■■■■]
+                      (이미 돌려준 바이트)  (아직 남은 바이트)
+read() 8192번 뒤                                   pos=count=8192
+                     [□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□]
+                     -> 다음 read()가 fill()을 불러 다시 채운다
+
+파일 끝에서 fill()   read(...)가 -1  ->  count가 pos 그대로  ->  read()는 -1</pre>
+<p><code>read()</code> 한 번은 대부분 <code>pos</code>를 하나 올리고 배열 원소 하나를 돌려주는 것으로 끝난다. 시스템 콜은 버퍼가 바닥났을 때만 일어난다. 반환문의 <code>& 0xff</code>는 앞에서 본 문제의 해결책이다. 배열에 든 <code>byte</code> 값을 그대로 <code>int</code>로 돌려주면 0xFF가 -1로 부호 확장되어 스트림 끝과 구별할 수 없게 된다. <code>& 0xff</code>로 상위 24비트를 0으로 만들어 0~255 범위로 돌려줘야 <code>read()</code>의 계약이 지켜진다.</p>
+<p>두 번째 결과의 11번은 1MB 요청 10번과 끝을 확인하는 1번이다. 요청한 배열이 내부 버퍼보다 크고 <code>mark</code>를 쓰지 않는 상태라면, OpenJDK 21의 <code>BufferedInputStream</code>은 내부 버퍼를 거치지 않고 호출자의 배열로 바로 읽는다. 쓰기 쪽의 우회와 같은 이유다. 큰 배열로 읽는 코드에서 <code>BufferedInputStream</code>은 해가 없지만 이득도 없다.</p>
+<p>OpenJDK 21의 구현에는 두 가지 세부가 더 있다. 하나는 지연 할당이다. 클래스가 정확히 <code>BufferedInputStream</code>이면 생성자는 길이 0인 공유 배열(<code>EMPTY</code>)만 넣어 두고, 실제 버퍼는 처음 데이터를 읽을 때 만든다. 만들어 놓고 한 번도 읽지 않는 스트림이 메모리를 차지하지 않게 하려는 것이다. 다른 하나는 <code>mark</code>와 <code>reset</code>이다. <code>mark(readlimit)</code>로 현재 위치를 표시해 두면 <code>reset()</code>으로 그 위치로 돌아가 다시 읽을 수 있다. 앞에서 스트림은 되돌릴 수 없다고 했는데, <code>BufferedInputStream</code>은 이미 읽은 바이트를 버퍼에 남겨 두는 방식으로 이를 흉내 낸다. 그래서 되돌아갈 수 있는 거리는 버퍼에 남겨 둘 수 있는 만큼으로 제한된다. <code>FileInputStream</code>의 <code>markSupported()</code>는 <code>false</code>다.</p>
+
+<h3>성능 최적화 5: 한 번에 쓰기와 그 대가</h3>
+<p>4번 방식은 10MB 배열을 통째로 만들어 <code>write(all)</code>을 한 번 부른다. 아래 스트림 호출은 1번이다. 읽기 쪽 짝은 <code>readAllBytes()</code>다. 호출 횟수로만 보면 이보다 나은 방법이 없고, 작은 파일에서는 실제로 가장 간단하고 빠른 방법이다. OpenJDK 21의 <code>FileInputStream</code>은 <code>readAllBytes()</code>를 재정의해 파일 길이와 현재 위치를 먼저 물어보고 그 크기의 배열을 한 번에 만든다. 배열을 늘려 가며 복사할 필요가 없다.</p>
+<p>대가는 메모리다. 파일 크기만큼의 배열이 자바 힙에 있어야 한다. 게다가 앞에서 본 것처럼 <code>FileOutputStream.write</code>는 8,192바이트보다 긴 요청을 받으면 같은 길이의 네이티브 메모리를 <code>malloc</code>으로 잡아 복사하므로, 쓰는 순간에는 같은 데이터가 힙과 네이티브 메모리에 한 벌씩 있다. 파일이 수백 MB라면 이 방식은 힙 부족(<code>OutOfMemoryError</code>)으로 이어질 수 있다. 그리고 힙이 아무리 커도 넘을 수 없는 벽이 하나 있다. 자바 배열의 길이는 <code>int</code>이므로 한 배열에 담을 수 있는 바이트는 2GB 남짓이 한계다. 다음 코드로 확인해 보자.</p>
+<pre><code class="language-java">import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+
+public class BigFile {
+    public static void main(String[] args) throws IOException {
+        try (RandomAccessFile raf = new RandomAccessFile("temp/huge.dat", "rw")) {
+            raf.setLength(3L * 1024 * 1024 * 1024);   // 길이만 3GB로 늘린다
+        }
+        try (FileInputStream fis = new FileInputStream("temp/huge.dat")) {
+            byte[] all = fis.readAllBytes();
+            System.out.println(all.length);
+        } catch (OutOfMemoryError e) {
+            System.out.println(e);
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">java.lang.OutOfMemoryError: Required array size too large for temp/huge.dat: 3221225472 = 3221225472 - 0</code></pre>
+<p><code>RandomAccessFile.setLength</code>는 파일 길이만 늘리고 늘어난 부분의 내용은 정의하지 않는다(Javadoc). 내용을 쓰지 않으므로 3GB 파일이 순식간에 만들어진다. <code>readAllBytes()</code>는 파일 길이 3,221,225,472에서 현재 위치 0을 뺀 크기가 <code>Integer.MAX_VALUE</code>를 넘는 것을 보고, 배열을 만들어 보기도 전에 <code>OutOfMemoryError</code>를 던진다. 메시지의 "= 3221225472 - 0"이 바로 "길이 - 위치" 계산이다. 이 오류는 힙 크기와 무관하다. 힙을 수십 GB로 잡아도 결과는 같다. <code>FileInputStream</code>이 아닌 일반 스트림에서는 <code>InputStream</code>의 기본 구현이 16,384바이트 조각을 모아 가다가 합계가 <code>Integer.MAX_VALUE - 8</code>을 넘으려 할 때 "Required array size too large" 메시지로 같은 오류를 던진다.</p>
+<p>Javadoc도 이 메서드에 대해 바이트 배열로 한 번에 읽는 것이 편한 단순한 경우를 위한 것이며, 많은 양의 데이터를 읽기 위한 것이 아니라고 적어 둔다. 네 방식을 한 표로 정리하면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>방식</th><th>10MB 기준 아래 스트림 호출</th><th>바이트마다 드는 자바 쪽 일</th><th>추가 메모리</th><th>알맞은 상황</th></tr></thead><tbody>
+<tr><td>1. 하나씩 쓰기</td><td>10,485,760</td><td>JNI + 시스템 콜</td><td>없음</td><td>파일에는 쓰지 않는다</td></tr>
+<tr><td>2. 직접 만든 버퍼</td><td>1,280</td><td>배열 저장</td><td>버퍼 크기(8KB)</td><td>바이트 단위로 만들어 내는 데이터를 성능이 중요하게 쓸 때</td></tr>
+<tr><td>3. BufferedOutputStream</td><td>1,280</td><td>메서드 호출 + 락</td><td>버퍼 크기(기본 최대 8KB)</td><td>대부분의 일반적인 경우, 여러 스레드가 공유할 때</td></tr>
+<tr><td>4. 한 번에 쓰기</td><td>1</td><td>없음</td><td>파일 전체 크기(쓰는 순간 네이티브 사본까지)</td><td>크기가 작고 상한이 분명한 파일</td></tr>
+</tbody></table></div>
+<p>실무의 판단 기준은 크기의 상한이다. 설정 파일처럼 크기가 작고 상한이 분명하면 한 번에 읽고 쓴다. 사용자가 올린 파일, 로그, 네트워크에서 받는 데이터처럼 크기를 미리 알 수 없거나 클 수 있으면 버퍼 단위로 나눠 처리한다. 나눠 처리하면 파일이 1GB든 100GB든 메모리 사용량은 버퍼 크기로 고정된다. 앞에서 본 <code>transferTo</code>가 바로 이 방식이다. 참고로 OpenJDK 21의 <code>FileInputStream.transferTo</code>는 대상이 <code>FileOutputStream</code>이면 이 루프 대신 <code>FileChannel.transferTo</code>를 써서 자바 힙을 거치지 않는 경로를 먼저 시도한다. 채널은 이 권의 범위 밖이지만, "추상화는 같아도 구현은 대상에 맞춰 최적화된다"는 예로 기억해 둘 만하다.</p>
+
+<h3>코드를 고치지 않고 호출 횟수 보기: JFR의 파일 이벤트</h3>
+<p>앞의 실험들은 <code>CountingOutputStream</code>을 직접 끼워 넣어 호출을 셌다. 이미 배포된 프로그램이라면 그렇게 코드를 고칠 수 없다. JDK에 들어 있는 JDK Flight Recorder(JFR)는 <code>FileOutputStream</code>의 <code>write</code>와 <code>FileInputStream</code>의 <code>read</code> 호출 하나하나를 <code>jdk.FileWrite</code>, <code>jdk.FileRead</code> 이벤트로 기록할 수 있다. 같은 질문, 즉 "아래 스트림을 몇 번, 한 번에 몇 바이트씩 부르는가"를 코드 수정 없이 던질 수 있다는 뜻이다. 다음 프로그램은 JFR 녹화를 프로그램 안에서 시작하고, 65,536바이트를 세 방식으로 쓴 뒤, 녹화 파일을 읽어 파일별 이벤트 수와 <code>bytesWritten</code> 합계를 출력한다.</p>
+<pre><code class="language-java">import java.io.BufferedOutputStream;
+import java.io.FileOutputStream;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Map;
+import java.util.TreeMap;
+import jdk.jfr.Recording;
+import jdk.jfr.consumer.RecordedEvent;
+import jdk.jfr.consumer.RecordingFile;
+
+public class JfrWrites {
+    static final int SIZE = 64 * 1024;   // 65,536바이트
+
+    public static void main(String[] args) throws Exception {
+        Path jfr = Path.of("temp/writes.jfr");
+        try (Recording r = new Recording()) {
+            r.enable("jdk.FileWrite").withThreshold(Duration.ZERO).withoutStackTrace();
+            r.start();
+
+            try (FileOutputStream out = new FileOutputStream("temp/one.dat")) {
+                for (int i = 0; i < SIZE; i++) out.write(1);
+            }
+            try (BufferedOutputStream out = new BufferedOutputStream(
+                    new FileOutputStream("temp/buffered.dat"), 8192)) {
+                for (int i = 0; i < SIZE; i++) out.write(1);
+            }
+            try (FileOutputStream out = new FileOutputStream("temp/all.dat")) {
+                out.write(new byte[SIZE]);
+            }
+
+            r.stop();
+            r.dump(jfr);
+        }
+
+        Map<String, long[]> stat = new TreeMap<>();   // 파일 이름 -> {이벤트 수, 바이트 합}
+        for (RecordedEvent e : RecordingFile.readAllEvents(jfr)) {
+            String path = e.getString("path");
+            if (!path.endsWith(".dat")) continue;
+            String name = Path.of(path).getFileName().toString();
+            long[] s = stat.computeIfAbsent(name, k -> new long[2]);
+            s[0]++;
+            s[1] += e.getLong("bytesWritten");
+        }
+        stat.forEach((name, s) -> System.out.printf("%-13s 이벤트 %,6d개, bytesWritten 합 %,d%n", name, s[0], s[1]));
+    }
+}</code></pre>
+<pre data-label="java -Xlog:jfr+system=info JfrWrites (로그 시각은 실행마다 다르다, 일부 로그 생략)"><code class="language-text">[0.109s][info][jfr,system] Retransformed JDK classes
+[0.176s][info][jfr,system] Adding instrumentation to event class jdk.jfr.events.FileWriteEvent using retransform
+all.dat       이벤트      1개, bytesWritten 합 65,536
+buffered.dat  이벤트      8개, bytesWritten 합 65,536
+one.dat       이벤트 65,536개, bytesWritten 합 65,536</code></pre>
+<p>숫자는 앞에서 손으로 센 것과 정확히 맞는다. 하나씩 쓰기는 바이트마다 이벤트 하나, 8,192바이트 버퍼는 65,536 / 8,192 = 8번, 한 번에 쓰기는 1번이다. 세 경우 모두 <code>bytesWritten</code>의 합이 65,536이므로 버퍼에 남아 사라진 바이트도 없다. 운영 환경에서 "이 파일 쓰기가 왜 느린가"를 볼 때는 이벤트 수와 이벤트당 평균 바이트 수를 보면 된다. 평균이 1바이트나 수십 바이트라면 앞 절의 하나씩 쓰기 상황이다.</p>
+<p>코드에서 꼭 짚을 곳은 <code>withThreshold(Duration.ZERO)</code>다. JFR 이벤트는 걸린 시간이 임계값(threshold)을 넘을 때만 기록되는데, JDK 21에 들어 있는 설정 파일 <code>lib/jfr/default.jfc</code>는 <code>jdk.FileWrite</code>의 임계값을 20ms로, <code>profile.jfc</code>는 10ms로 둔다. 작은 쓰기 한 번은 대개 이보다 훨씬 짧게 끝나므로 기본 설정으로는 이벤트가 남지 않는다. 실제로 앞 절의 <code>W</code>를 아무 설정 없이 <code>-XX:StartFlightRecording</code>만 붙여 녹화하고 <code>jfr summary</code>로 보면 이 실험 환경에서 <code>jdk.FileWrite</code>는 0개였다. 기본 설정은 "느린 호출 하나"를 찾는 용도이고, "짧은 호출이 너무 많다"를 보려면 임계값을 0으로 내려야 한다. 그 대신 호출마다 이벤트가 쌓인다. 이 실행에서는 약 6만 5천 개의 이벤트로 녹화 파일이 1.8MB 남짓이었다. 운영 중인 서버에서는 짧게만 켜야 한다. 명령행에서는 <code>java '-XX:StartFlightRecording:jdk.FileWrite#threshold=0ms,filename=rec.jfr' ...</code>처럼 이벤트 설정을 함께 줄 수 있고, 결과는 <code>jfr print --events jdk.FileWrite rec.jfr</code>로 볼 수 있다. 앞 절의 <code>W</code> 프로그램을 이렇게 돌리면 <code>temp/w.dat</code>에 대한 이벤트 세 개(1바이트, 1바이트, 2바이트)와 함께 경로가 <code>N/A</code>인 이벤트 세 개가 나온다. 경로 없이 파일 디스크립터로 만든 스트림, 곧 <code>System.err</code>이 <code>println</code>마다 한 번씩 쓴 것이다.</p>
+<p>JFR은 어떻게 JDK 클래스의 호출을 셀까. <code>FileOutputStream</code> 소스에는 JFR 코드가 한 줄도 없다(OpenJDK 21 기준). 대신 JFR이 시작될 때 클래스의 바이트코드를 바꾼다. 위 로그의 "Retransformed JDK classes"가 그 순간이다. OpenJDK 21의 <code>jdk.jfr.internal.PlatformRecorder</code> 생성자는 <code>JDKEvents.addInstrumentation()</code>을 부르고, 이 메서드는 <code>FileInputStream</code>, <code>FileOutputStream</code>, <code>RandomAccessFile</code>, <code>FileChannelImpl</code>, 소켓 스트림과 소켓 채널 구현 클래스, 그리고 <code>Throwable</code>과 <code>Error</code>를 모아 재변환(retransform)을 요청한다. 재변환 콜백 <code>JDKEvents.retransformCallback</code>은 대상 클래스마다 짝이 되는 계측 클래스(<code>FileOutputStreamInstrumentor</code> 등)를 골라 <code>JIClassInstrumentation</code>에 넘긴다. 이 클래스는 JDK 내부에 들어 있는 ASM 라이브러리로 원래 메서드의 본문을 계측 클래스의 메서드 안에 인라인하고, 그 결과로 대상 클래스의 메서드를 바꿔 끼운다. 계측 클래스의 <code>write(int)</code>는 다음과 같다.</p>
+<pre><code class="language-java">// OpenJDK 21 jdk.jfr.internal.instrument.FileOutputStreamInstrumentor
+@JIInstrumentationMethod
+public void write(int b) throws IOException {
+    EventConfiguration eventConfiguration = EventConfigurations.FILE_WRITE;
+    if (!eventConfiguration.isEnabled()) {
+        write(b);                    // 원래 FileOutputStream.write(int)의 본문으로 바뀐다
+        return;
+    }
+    long bytesWritten = 0;
+    long start = 0;
+    try {
+        start = EventConfiguration.timestamp();
+        write(b);
+        bytesWritten = 1;
+    } finally {
+        long duration = EventConfiguration.timestamp() - start;
+        if (eventConfiguration.shouldCommit(duration)) {   // 임계값 비교
+            FileWriteEvent.commit(start, duration, path, bytesWritten);
+        }
+    }
+}</code></pre>
+<p>자기 자신을 부르는 것처럼 보이는 <code>write(b)</code>는 인라인 과정에서 원래 메서드의 본문으로 대체된다. 따라서 재변환된 <code>FileOutputStream.write(int)</code>는 "시작 시각을 재고, 원래 일을 하고, 걸린 시간이 임계값을 넘으면 이벤트를 남긴다"가 된다. 측정 범위가 원래 메서드 전체이므로, 이벤트 하나는 원래 메서드 호출 한 번, 곧 앞에서 본 경로(JNI 경계와 그 아래의 <code>write</code> 시스템 콜)를 한 번 지나는 것에 대응한다. 배열 쓰기에서 커널이 일부만 받아 <code>writeBytes</code>가 <code>write</code>를 되풀이하더라도 이벤트는 하나다. <code>write(byte[])</code>와 <code>write(byte[], int, int)</code>도 같은 모양으로 감싸이고, 읽기 쪽 <code>jdk.FileRead</code> 이벤트는 읽은 바이트 수(<code>bytesRead</code>)와 함께 스트림 끝에 닿았는지(<code>endOfFile</code>)를 필드로 남긴다. 이벤트가 꺼져 있으면 <code>isEnabled()</code> 확인 한 번 뒤에 원래 본문으로 바로 간다. JFR을 켜지 않은 JVM에서는 재변환 자체가 일어나지 않으므로 <code>FileOutputStream</code>은 소스 그대로의 바이트코드로 실행된다.</p>
+
+<h3>flush와 close, 그리고 데이터가 디스크에 닿는 시점</h3>
+<p>버퍼는 호출 횟수를 줄여 주는 대신 새로운 위험을 만든다. "썼다"고 생각한 데이터가 아직 버퍼에 고여 있을 수 있다는 점이다. 이 위험을 정확히 다루려면 데이터가 머무를 수 있는 층을 구분해야 한다. 지금까지 본 것을 모으면 층은 셋이다.</p>
+<div class="table-wrap"><table><thead><tr><th>층</th><th>어디에 있나</th><th>다음 층으로 내리는 것</th><th>자바 프로세스가 끝나면</th><th>운영체제가 멈추면(전원 차단 등)</th></tr></thead><tbody>
+<tr><td><code>BufferedOutputStream</code>의 <code>buf</code></td><td>JVM 힙</td><td><code>flush()</code>, <code>close()</code></td><td>사라진다</td><td>사라진다</td></tr>
+<tr><td>커널 페이지 캐시</td><td>커널 메모리</td><td>커널의 지연 기록, <code>FileDescriptor.sync()</code></td><td>남는다</td><td>사라질 수 있다</td></tr>
+<tr><td>저장 장치</td><td>디스크, SSD</td><td>-</td><td>남는다</td><td>남는다</td></tr>
+</tbody></table></div>
+<p>첫 번째 실험은 <code>flush()</code>가 무엇을 바꾸는지와, 감싼 스트림의 안쪽만 닫으면 어떻게 되는지를 본다.</p>
+<pre><code class="language-java">import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class FlushTest {
+    public static void main(String[] args) throws IOException {
+        File file = new File("temp/flush.dat");
+        BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(file));
+        bos.write("hello".getBytes());
+        System.out.println("write 직후 파일 크기: " + file.length());
+        bos.flush();
+        System.out.println("flush 직후 파일 크기: " + file.length());
+        bos.close();
+
+        File file2 = new File("temp/inner.dat");
+        FileOutputStream inner = new FileOutputStream(file2);
+        BufferedOutputStream outer = new BufferedOutputStream(inner);
+        outer.write("hello".getBytes());
+        inner.close();                       // 안쪽만 닫았다
+        System.out.println("안쪽만 닫은 뒤 파일 크기: " + file2.length());
+        try {
+            outer.close();
+        } catch (IOException e) {
+            System.out.println("바깥 close: " + e);
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">write 직후 파일 크기: 0
+flush 직후 파일 크기: 5
+안쪽만 닫은 뒤 파일 크기: 0
+바깥 close: java.io.IOException: Stream Closed</code></pre>
+<p><code>write</code> 직후의 크기 0은 5바이트가 아직 <code>buf</code> 안에 있다는 뜻이다. <code>flush()</code>가 <code>FileOutputStream.write</code>를 부르자 크기가 5가 되었다. 이때 <code>File.length()</code>가 5를 본다는 것은 데이터가 커널까지 내려갔다는 뜻이지, 디스크에 기록되었다는 뜻은 아니다. 커널은 페이지 캐시에 있는 내용을 기준으로 파일 크기와 내용을 보여 주기 때문에 다른 프로세스도 이 5바이트를 읽을 수 있다. 두 번째 실험에서는 안쪽 <code>FileOutputStream</code>을 먼저 닫아 버렸다. 버퍼의 5바이트는 내려갈 곳을 잃었고, 나중에 바깥을 닫으려 하자 <code>close()</code> 안의 <code>flush()</code>가 이미 닫힌 파일에 쓰려다 실패했다. 메시지 "Stream Closed"는 네이티브 코드가 닫힌 디스크립터를 발견하고 던진 것이다. 데이터는 사라졌다.</p>
+<p>두 번째 실험은 닫지 않고 프로그램을 끝낸다.</p>
+<pre><code class="language-java">import java.io.BufferedOutputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+
+public class NoClose {
+    public static void main(String[] args) throws IOException {
+        BufferedOutputStream buffered =
+                new BufferedOutputStream(new FileOutputStream("temp/buffered.dat"));
+        buffered.write("hello".getBytes());
+
+        FileOutputStream raw = new FileOutputStream("temp/raw.dat");
+        raw.write("hello".getBytes());
+        // 둘 다 닫지 않고 main이 끝난다
+    }
+}</code></pre>
+<pre data-label="프로그램 종료 후 ls -l로 본 파일 크기"><code class="language-text">0 temp/buffered.dat
+5 temp/raw.dat</code></pre>
+<p>둘 다 닫지 않았는데 결과가 다르다. <code>raw.dat</code>의 5바이트는 <code>write</code>가 반환된 순간 이미 커널에 넘어갔다. 앞 절에서 본 것처럼 <code>FileOutputStream</code>에는 자바 쪽 버퍼가 없다. 프로세스가 끝나면 커널이 열린 디스크립터를 정리하지만, 페이지 캐시에 들어간 데이터는 프로세스의 것이 아니라 파일의 것이므로 그대로 남는다. 반면 <code>buffered.dat</code>의 5바이트는 JVM 힙의 배열에 있었고, 프로세스가 끝나면서 힙과 함께 사라졌다. JVM은 종료할 때 열린 <code>BufferedOutputStream</code>을 찾아 비워 주지 않는다.</p>
+<p>"GC가 언젠가 정리해 주지 않을까"라는 기대도 이 상황을 구하지 못한다. OpenJDK 21의 <code>FileInputStream</code>과 <code>FileOutputStream</code>은 생성될 때 파일 디스크립터를 <code>FileCleanable</code>에 등록한다. 이것은 <code>java.lang.ref.Cleaner</code> 기반의 장치로, <code>FileDescriptor</code> 객체가 팬텀 도달 가능(phantom reachable) 상태가 되면 운영체제 디스크립터를 닫는다. 하지만 이 장치가 하는 일은 디스크립터 반납뿐이다. 바깥의 <code>BufferedOutputStream</code>에 무엇이 고여 있는지 모르고, 언제 실행될지도 GC에 달려 있다. 그 사이 디스크립터는 열린 채 남는다. 스트림은 try-with-resources로 명시적으로, 그리고 <b>가장 바깥 것을</b> 닫아야 한다. try-with-resources에 여러 자원을 선언하면 선언의 역순으로 닫으므로, 바깥 스트림을 나중에 선언하면 바깥이 먼저 닫힌다.</p>
+<p>마지막 층, 페이지 캐시에서 저장 장치로 내리는 일은 <code>flush()</code>의 몫이 아니다. <code>FileOutputStream.flush()</code>는 아무것도 하지 않는다는 것을 이미 보았다. 이 층을 강제로 내리려면 <code>fos.getFD().sync()</code>를 부른다. <code>FileDescriptor.sync()</code>의 Javadoc은 모든 시스템 버퍼를 기반 장치와 동기화하도록 강제하고, 수정된 데이터와 속성이 장치에 기록된 뒤에 반환한다고 적는다. 유닉스 계열에서는 <code>fsync</code> 시스템 콜에 해당한다. 이 호출은 실제 장치 기록을 기다리므로 <code>write</code>보다 훨씬 비싸다. 그래서 모든 쓰기마다 부르지 않고, "여기까지는 전원이 나가도 남아 있어야 한다"는 지점에서만 부른다. 데이터베이스가 커밋의 내구성(durability)을 약속할 수 있는 것도 커밋 시점에 로그를 이 층까지 내리기 때문이다.</p>
+<aside class="note">이름이 같은 "flush"가 층마다 다른 일을 한다. <code>BufferedOutputStream.flush()</code>는 JVM 힙에서 커널로, JPA의 <code>EntityManager.flush()</code>는 영속성 컨텍스트의 변경을 SQL로 데이터베이스에 보낸다(커밋은 아니다). 어느 쪽이든 "한 층 아래로 내린다"일 뿐, 마지막 층까지 보장한다는 뜻이 아니다.</aside>
+<x-visual id="java-adv2-02-flush-layers" title="flush, close, sync가 데이터를 옮기는 층" kind="계층 다이어그램" ratio="4:3">
+<x-hint>BufferedOutputStream의 버퍼, 커널 페이지 캐시, 저장 장치의 세 층과, 각 층 사이를 옮기는 메서드, 각 층이 프로세스 종료와 전원 차단에서 살아남는지를 보여 준다.</x-hint>
+<x-prompt>위에서 아래로 세 개의 상자를 쌓는다. 맨 위 "BufferedOutputStream 버퍼 (JVM 힙)", 가운데 "커널 페이지 캐시", 맨 아래 "저장 장치". 맨 위와 가운데 사이의 아래 화살표에 "flush() / close()" 라벨, 가운데와 맨 아래 사이의 아래 화살표에 "sync() (fsync)" 라벨을 붙인다. 각 상자 오른쪽에 작은 아이콘 두 개를 둔다: 번개 아이콘 옆 "프로세스 종료", 전원 플러그 아이콘 옆 "전원 차단". 맨 위 상자는 두 아이콘 모두 빨간 X, 가운데 상자는 "프로세스 종료"에 초록 체크와 "전원 차단"에 빨간 X, 맨 아래 상자는 둘 다 초록 체크. 평면적인 기술 도해, 흰 배경.</x-prompt>
+<x-caption>flush는 한 층, sync는 그다음 한 층을 내린다. 각 층은 살아남는 사고의 범위가 다르다.</x-caption>
+</x-visual>
+
+<h3>흔한 오해, 그리고 이후 회차와의 연결</h3>
+<p>이 회차의 내용은 몇 가지 그럴듯한 오해와 부딪힌다. 하나씩 실제와 맞춰 보자.</p>
+<ul>
+<li><b>"BufferedOutputStream은 디스크 쓰기 횟수를 줄인다."</b> 줄이는 것은 <code>write</code> 시스템 콜의 횟수다. 디스크에 언제 몇 번 기록할지는 커널이 페이지 캐시를 관리하며 정한다. 버퍼링이 빨라지는 이유는 디스크가 아니라 사용자 모드와 커널 모드를 오가는 고정 비용에 있다.</li>
+<li><b>"flush()하면 디스크에 저장된다."</b> <code>flush()</code>는 자바 쪽 버퍼를 커널로 내릴 뿐이다. 전원 차단에도 살아남아야 한다면 <code>FileDescriptor.sync()</code>까지 필요하다.</li>
+<li><b>"read(buf)는 배열을 가득 채운다."</b> 계약은 "최소 1바이트, 최대 배열 길이"다. 반환값만큼만 유효하다. 파일에서는 잘 드러나지 않다가 네트워크에서 터진다.</li>
+<li><b>"읽은 바이트는 byte 변수에 담으면 된다."</b> 비교가 끝나기 전에 <code>byte</code>로 바꾸면 0xFF와 스트림 끝을 구별할 수 없다. 텍스트로는 재현되지 않고 바이너리 파일에서만 조용히 틀린다.</li>
+<li><b>"버퍼는 클수록 좋다."</b> 호출 횟수는 버퍼 크기에 반비례하지만 줄어드는 절대량은 금방 작아진다. 그 뒤로는 메모리만 더 쓴다.</li>
+<li><b>"닫지 않아도 GC가 정리한다."</b> OpenJDK의 클리너는 언젠가 디스크립터를 닫을 뿐, 감싼 스트림의 버퍼를 비우지 않는다. 언제 닫힐지도 보장되지 않는다.</li>
+</ul>
+<p>이 회차의 지식은 이 권의 나머지 회차에서 계속 쓰인다. 다음 회차의 문자 스트림(<code>Reader</code>, <code>Writer</code>)은 이 회차의 바이트 스트림 위에 인코딩을 얹은 것이고, 감싸기로 기능을 더하는 보조 스트림의 구조도 거기서 본격적으로 다룬다. 05회의 <code>Files</code>는 같은 일을 더 짧은 API로 제공하지만 아래에서는 같은 시스템 콜을 부른다. 06회부터의 네트워크 프로그램에서는 <code>Socket.getInputStream()</code>과 <code>getOutputStream()</code>이 돌려주는 것이 바로 이 회차의 <code>InputStream</code>과 <code>OutputStream</code>이다. 거기서는 이 회차의 함정이 더 아프게 돌아온다. <code>read()</code>는 데이터가 올 때까지 스레드를 막고, <code>read(buf)</code>는 도착한 만큼만 돌려주며, 버퍼 출력 스트림에서 <code>flush()</code>를 잊으면 메시지가 상대에게 가지 않아 양쪽이 서로를 기다리며 멈춘다.</p>
+<p>스프링 MVC에서 본 서블릿 응답도 같은 구조다. <code>ServletResponse</code>는 응답 본문을 버퍼에 모았다가 보내며, <code>setBufferSize</code>, <code>flushBuffer</code>, <code>isCommitted</code> 같은 메서드가 이 버퍼를 다룬다. 버퍼가 처음 비워지는 순간 상태 코드와 헤더가 먼저 나가 응답이 커밋되고, 그 뒤에는 상태 코드를 바꿀 수 없다. 10회와 13회에서 HTTP 서버를 직접 만들 때 이 동작을 바이트 수준에서 다시 보게 된다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>스트림은 "바이트를 순서대로 주고받는다"는 계약 하나로 파일, 메모리, 콘솔, 네트워크를 묶는다. 그 계약 아래에서 <code>FileInputStream</code>과 <code>FileOutputStream</code>의 호출 한 번은 JNI와 시스템 콜 한 번이다. 버퍼는 이 호출을 모아 횟수를 줄이고, 그 대가로 데이터가 고여 있는 층을 하나 더 만든다. 성능은 호출 횟수로, 데이터 안전은 각 층을 언제 비우느냐로 판단한다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>스트림(stream)</dt><dd>한 방향으로 순서대로 흐르는 바이트의 열. 입력과 출력은 프로그램을 기준으로 정하고, 대상이 무엇이든 <code>InputStream</code>과 <code>OutputStream</code> 두 타입으로 다룬다.</dd>
+<dt>read()의 반환값</dt><dd>읽은 바이트를 0~255의 <code>int</code>로 돌려주고 스트림 끝이면 -1을 돌려준다. 256가지 바이트 값과 끝 신호를 함께 표현하려면 <code>byte</code>로는 부족하다.</dd>
+<dt>read(byte[])의 계약</dt><dd>최소 1바이트, 최대 배열 길이만큼 읽고 그 개수를 돌려준다. 반환값 뒤쪽의 원소는 건드리지 않으므로 쓸 때는 <code>write(buf, 0, n)</code>처럼 반환값만큼만 쓴다.</dd>
+<dt>추상 클래스의 기본 구현</dt><dd><code>InputStream</code>과 <code>OutputStream</code>의 배열 메서드는 한 바이트 메서드를 반복하는 기본 구현을 갖는다. 파일, 메모리 스트림은 이를 재정의해 한 번에 처리한다.</dd>
+<dt>시스템 콜 비용</dt><dd><code>FileOutputStream.write</code>와 <code>FileInputStream.read</code>는 호출마다 JNI를 넘고 시스템 콜을 일으킨다. 호출당 고정 비용이 있으므로 같은 양을 옮길 때는 호출 횟수가 성능을 가른다.</dd>
+<dt>버퍼링</dt><dd>바이트를 배열에 모아 한 번에 내보내 호출 횟수를 줄인다. 10MB를 8KB 버퍼로 쓰면 호출은 10,485,760번에서 1,280번이 된다. 버퍼를 더 키울수록 줄어드는 호출은 급격히 작아진다.</dd>
+<dt>BufferedOutputStream / BufferedInputStream</dt><dd>버퍼 관리를 대신하는 보조 스트림. 호출마다 락을 잡아 스레드 안전하며, 버퍼보다 큰 요청은 버퍼를 거치지 않고 바로 넘긴다. OpenJDK 21의 기본 최대 크기는 8,192바이트다.</dd>
+<dt>flush, close, sync</dt><dd><code>flush()</code>는 자바 버퍼를 커널로, <code>close()</code>는 flush 후 감싼 스트림을 닫고 디스크립터를 반납한다. 저장 장치까지 내리려면 <code>FileDescriptor.sync()</code>가 필요하다.</dd>
+<dt>native 메서드 연결</dt><dd><code>Code</code> 속성이 없는 native 메서드는 처음 호출될 때 JNI 이름 규칙(<code>Java_클래스_메서드</code>)으로 만든 심볼을 네이티브 라이브러리에서 찾아 연결된다. HotSpot은 찾은 주소를 <code>Method</code>에 기록해 두고 다시 찾지 않는다.</dd>
+<dt>네이티브 호출과 세이프포인트</dt><dd>native 메서드를 실행 중인 스레드는 <code>_thread_in_native</code> 상태라서 GC가 기다리지 않는다. <code>FileOutputStream</code>은 자바 배열을 C 버퍼로 복사한 뒤 시스템 콜을 부르므로, 시스템 콜이 오래 막혀도 GC를 붙잡지 않는다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 "파일 처리가 느리다"는 문제를 받으면 먼저 호출 횟수를 의심한다. 한 바이트나 한 줄 단위로 <code>FileInputStream</code>이나 <code>FileOutputStream</code>을 직접 호출하는 코드가 있다면 버퍼 하나로 호출을 수천 분의 일로 줄일 수 있다. 반대로 이미 8KB 이상의 덩어리로 읽고 쓰는 코드라면 버퍼 크기를 키워도 얻을 것이 거의 없다. 그때 병목은 디스크 자체나 데이터 처리 로직에 있으므로 다른 곳을 봐야 한다. 같은 원리는 네트워크 소켓, 데이터베이스 호출(한 건씩 보내는 대신 배치로 묶기), 로그 출력에도 그대로 적용된다. "호출당 고정 비용이 있는 경계를 몇 번 넘는가"가 공통 질문이다.</p>
+<p>데이터 유실 장애에서는 층을 구분하는 것이 판단의 출발점이다. 애플리케이션이 비정상 종료된 뒤 파일 끝이 잘려 있다면 자바 쪽 버퍼를 비우지 못한 것이고, 원인은 닫지 않은 스트림이나 안쪽부터 닫은 스트림이다. 운영체제가 멈추거나 전원이 나간 뒤에 최근 쓰기가 사라졌다면 페이지 캐시에 있던 데이터이고, 이것은 <code>sync</code> 없이는 막을 수 없다. 모든 쓰기에 <code>sync</code>를 붙이면 안전하지만 처리량이 크게 떨어지므로, 어떤 데이터가 어떤 사고에서 살아남아야 하는지를 먼저 정하고 그 지점에서만 강제한다.</p>
+<p>메모리 장애도 같은 회차의 지식으로 설명된다. 업로드된 파일을 <code>readAllBytes()</code>로 읽는 코드는 작은 파일로 테스트할 때는 문제가 없다가, 큰 파일이 동시에 몇 개 들어오는 순간 힙을 다 쓴다. 2GB가 넘는 파일에서는 힙 크기와 상관없이 실패한다. 크기에 상한이 없는 입력은 버퍼 단위로 흘려보내는 코드(<code>transferTo</code> 같은)로 처리해야 메모리 사용량이 입력 크기와 무관해진다.</p>
+</x-review>
+
+<x-practice>
+<li>파일에 바이트 <code>0x10, 0xFF, 0x20, 0x30</code>이 순서대로 들어 있다. <code>byte b; while ((b = (byte) in.read()) != -1) count++;</code>로 세면 <code>count</code>는 얼마인가? <code>int</code> 변수로 바꾸면 얼마인가? 각각의 루프가 끝나는 순간 피연산자 스택에서 비교되는 두 값을 적어 보라.</li>
+<li>13바이트 파일 "Hello, World!"를 5칸짜리 배열로 읽으면서 <code>out.write(buf)</code>로 복사하는 버그 코드가 있다. <code>read</code>가 호출될 때마다의 반환값과 배열 상태를 적고, 결과 파일의 길이와 내용을 예측하라.</li>
+<li>10MB 파일을 <code>new BufferedOutputStream(fos, 4096)</code>으로 감싸 한 바이트씩 쓰고 닫았다. <code>FileOutputStream.write</code> 호출 횟수는? 같은 스트림에 5,000바이트 배열을 2,000번 쓰면 몇 번인가? 근거가 되는 <code>implWrite</code>의 분기를 짚어 설명하라.</li>
+<li>다음 코드가 실행된 직후 JVM이 정상 종료되었다. <code>a.dat</code>와 <code>b.dat</code>의 크기는 각각 얼마인가? 같은 시점에 컴퓨터의 전원이 나갔다면 결과는 어떻게 달라질 수 있는가?<br><code>var a = new BufferedOutputStream(new FileOutputStream("a.dat")); a.write(new byte[100]);</code><br><code>var b = new FileOutputStream("b.dat"); b.write(new byte[100]);</code></li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> <code>byte</code> 변수로 세면 1이다. 첫 바이트 0x10은 16이라 -1이 아니므로 센다. 두 번째 0xFF는 <code>read()</code>가 255로 돌려주지만 <code>i2b</code>가 하위 8비트 <code>0xFF</code>를 부호 확장해 -1로 만들고, <code>iconst_m1</code>이 올린 -1과 비교해 같으므로 루프가 끝난다. 이때 비교되는 값은 (-1, -1)이다. <code>int</code> 변수로 받으면 255, 32, 48을 모두 센 뒤 다섯 번째 <code>read()</code>가 진짜 -1을 돌려주어 끝나므로 4이고, 마지막 비교는 역시 (-1, -1)이지만 이번에는 스트림 끝의 -1이다.</p>
+<p><b>2번.</b> 첫 <code>read</code>는 5를 돌려주고 배열은 "Hello", 두 번째는 5와 ", Wor", 세 번째는 3("ld!")을 돌려주며 앞 세 칸만 덮어써 배열은 "ld!or"가 된다. 네 번째는 -1이다. <code>write(buf)</code>는 매번 5바이트를 모두 쓰므로 결과는 "Hello" + ", Wor" + "ld!or"로 15바이트, 내용은 "Hello, World!or"다. 마지막 두 바이트 "or"는 두 번째 읽기의 찌꺼기다. <code>write(buf, 0, n)</code>으로 고치면 정확히 13바이트가 된다.</p>
+<p><b>3번.</b> 크기를 지정한 생성자는 처음부터 4,096바이트 버퍼를 만든다. 한 바이트씩 쓰면 4,096바이트마다 한 번 비우므로 10,485,760 / 4,096 = 2,560번이다(마지막 버퍼는 <code>close()</code>가 비운다). 5,000바이트 배열은 버퍼 최대 크기 4,096 이상이므로 <code>len >= maxBufSize</code> 분기를 타서 내부 버퍼를 거치지 않고 바로 아래로 넘어간다. 버퍼가 비어 있으므로 <code>flushBuffer()</code>는 아무것도 쓰지 않고, 호출은 요청마다 한 번씩 2,000번이다.</p>
+<p><b>4번.</b> 정상 종료 시 <code>a.dat</code>는 0바이트, <code>b.dat</code>는 100바이트다. <code>a</code>의 100바이트는 8KB 버퍼(OpenJDK 21에서 플랫폼 스레드로 만든 기본 생성자의 크기)에 들어가 가득 차지 않았으므로 <code>FileOutputStream.write</code>가 한 번도 호출되지 않았고, JVM 종료와 함께 힙에서 사라진다. <code>b</code>의 100바이트는 <code>write</code>가 반환될 때 이미 커널 페이지 캐시에 있으므로 프로세스가 끝나도 남는다. 전원이 나간 경우에는 <code>b.dat</code>의 내용도 아직 저장 장치에 기록되지 않았을 수 있으므로 비어 있거나 일부만 남을 수 있다. 이를 막으려면 <code>b.getFD().sync()</code>를 불러야 한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>InputStream.read()</code>의 반환 타입이 <code>byte</code>가 아니라 <code>int</code>인 가장 근본적인 이유는?</q>
+<o>JVM의 피연산자 스택이 <code>int</code>보다 작은 값을 다룰 수 없어서 성능상 유리하기 때문이다.</o>
+<o>256가지 바이트 값 모두와 별도의 "스트림 끝" 신호를 함께 표현해야 하는데 <code>byte</code>의 256개 값으로는 자리가 없기 때문이다.</o>
+<o>파일 시스템이 바이트를 32비트 단위로 저장하기 때문이다.</o>
+<o>문자 인코딩(UTF-16)과 호환되도록 하기 위해서다.</o>
+<why>바이트 하나는 0x00~0xFF의 256가지 값을 모두 가질 수 있고, 자바의 <code>byte</code>도 정확히 256개 값을 갖는다. 끝을 알리는 257번째 신호를 넣을 자리가 없으므로 데이터는 0~255, 끝은 -1인 <code>int</code>를 쓴다. 피연산자 스택이 <code>byte</code>를 <code>int</code>로 다루는 것은 사실이지만 반환 타입을 정한 이유가 아니며, 파일 시스템의 저장 단위나 문자 인코딩과는 관계가 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>10MB 파일을 한 바이트씩 쓸 때, 직접 만든 8KB 버퍼 방식과 <code>BufferedOutputStream</code>(8KB) 방식은 <code>FileOutputStream.write</code> 호출 횟수가 1,280번으로 같은데도 후자가 더 느리다. 가장 적절한 설명은?</q>
+<o><code>BufferedOutputStream</code>은 내부적으로 버퍼를 두 번 복사해서 시스템 콜이 두 배로 일어난다.</o>
+<o><code>BufferedOutputStream</code>은 매번 <code>flush()</code>를 호출해 디스크 기록을 기다린다.</o>
+<o>바이트마다 메서드 호출, 락 획득과 해제, 버퍼 크기 확인 같은 자바 쪽 작업이 추가로 실행되기 때문이다.</o>
+<o><code>BufferedOutputStream</code>은 가상 스레드용으로 512바이트 버퍼를 쓰기 때문에 호출이 더 많아진다.</o>
+<why>아래 스트림 호출 횟수, 즉 시스템 콜 횟수는 둘 다 1,280번으로 같다. 차이는 바이트마다 실행되는 사용자 모드의 코드에 있다. <code>BufferedOutputStream.write(int)</code>는 스레드 안전을 위해 매 호출마다 락을 잡고 푼다. 시스템 콜이 두 배가 되지 않고, <code>write</code>마다 flush하지도 않는다. 512바이트 시작 버퍼는 가상 스레드에서 기본 생성자를 쓸 때의 이야기이고, 크기를 지정했거나 플랫폼 스레드라면 해당하지 않으며 어차피 최대 크기까지 늘어난다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(f));</code>로 100바이트를 쓰고 <code>bos.flush()</code>를 호출했다. 이 시점의 상태로 옳은 것은?</q>
+<o>데이터는 커널로 넘어갔으므로 다른 프로세스가 파일을 읽으면 100바이트가 보이지만, 전원이 나가면 사라질 수 있다.</o>
+<o>데이터가 저장 장치에 기록되었으므로 전원이 나가도 남는다.</o>
+<o>데이터는 아직 JVM 힙에 있으며 <code>close()</code>를 불러야 커널로 넘어간다.</o>
+<o><code>FileOutputStream.flush()</code>가 <code>fsync</code>를 호출하므로 디스크 기록이 끝난 뒤에 반환된다.</o>
+<why><code>flush()</code>는 내부 버퍼를 <code>FileOutputStream.write</code>로 내려보내고, 그 <code>write</code>는 시스템 콜로 데이터를 커널 페이지 캐시에 넣는다. 커널은 페이지 캐시 기준으로 파일을 보여 주므로 다른 프로세스에게 보인다. 하지만 <code>write(2)</code>의 성공은 디스크 기록을 보장하지 않으며, <code>FileOutputStream.flush()</code>는 아무것도 하지 않는다. 저장 장치까지 내리려면 <code>getFD().sync()</code>가 필요하다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>다음 중 반환값을 올바르게 다룬 파일 복사 루프는?</q>
+<o><code>while (in.read(buf) != -1) out.write(buf);</code></o>
+<o><code>int n = in.available(); byte[] all = new byte[n]; in.read(all); out.write(all);</code></o>
+<o><code>byte b; while ((b = (byte) in.read()) != -1) out.write(b);</code></o>
+<o><code>int n; while ((n = in.read(buf)) != -1) out.write(buf, 0, n);</code></o>
+<why>네 번째만 읽은 개수만큼 쓴다. 첫 번째는 마지막 읽기에서 배열 뒤쪽의 이전 데이터까지 쓴다. 두 번째는 <code>available()</code>을 전체 크기로 오해한 것으로, Javadoc이 이렇게 버퍼를 할당하는 것은 결코 올바르지 않다고 명시하며 <code>read(all)</code>이 배열을 다 채운다는 보장도 없다. 세 번째는 0xFF 바이트를 만나면 스트림 끝으로 오인해 멈춘다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>FileInputStream</code>으로 3GB 파일을 열어 <code>readAllBytes()</code>를 호출했다. 힙을 <code>-Xmx16g</code>로 넉넉하게 주었을 때 OpenJDK 21에서 일어나는 일은?</q>
+<o>힙이 충분하므로 3GB 배열이 만들어지고 정상적으로 반환된다.</o>
+<o>자바 배열의 길이는 <code>int</code> 범위로 제한되므로, 파일 길이를 확인한 단계에서 "Required array size too large" 메시지의 <code>OutOfMemoryError</code>가 난다.</o>
+<o>2GB까지 읽은 뒤 나머지를 버리고 앞부분만 돌려준다.</o>
+<o><code>IOException</code>이 발생하고 스트림이 닫힌다.</o>
+<why>배열 길이는 <code>int</code>이므로 한 배열에 3GB를 담을 수 없다. OpenJDK 21의 <code>FileInputStream.readAllBytes()</code>는 파일 길이에서 현재 위치를 뺀 크기가 <code>Integer.MAX_VALUE</code>를 넘으면 배열을 만들기 전에 <code>OutOfMemoryError</code>를 던진다. 힙 크기와 무관한 한계이며, 데이터를 잘라서 돌려주거나 <code>IOException</code>을 던지지 않는다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>스트림(stream)</dt><dd>한 방향으로 순서대로 흐르는 바이트의 열. 자바에서는 <code>InputStream</code>과 <code>OutputStream</code>이 최상위 타입이다.</dd>
+<dt>파일 디스크립터(file descriptor)</dt><dd>운영체제가 열린 파일이나 소켓에 붙이는 프로세스별 정수 번호. 자바의 <code>FileDescriptor</code>가 감싸며, <code>close()</code>는 이 번호를 반납한다.</dd>
+<dt>시스템 콜(system call)</dt><dd>사용자 모드의 프로그램이 커널에 일을 요청하는 진입점. <code>read(2)</code>, <code>write(2)</code>, <code>fsync(2)</code> 등이 있으며 호출마다 모드 전환의 고정 비용이 든다.</dd>
+<dt>JNI(Java Native Interface)</dt><dd>자바 코드와 C/C++ 네이티브 코드가 서로 호출하는 규약. <code>FileOutputStream</code>의 native 메서드가 이를 통해 OpenJDK의 C 코드로 들어간다.</dd>
+<dt>페이지 캐시(page cache)</dt><dd>커널이 파일 데이터를 메모리에 두는 영역. <code>write</code>는 여기까지 복사하고 반환하며, 저장 장치 기록은 나중에 하거나 <code>fsync</code>로 강제한다.</dd>
+<dt>버퍼(buffer)</dt><dd>데이터를 모아 두었다가 한 번에 옮기기 위한 메모리 영역. 호출 횟수를 줄이는 대신 아직 내려가지 않은 데이터가 머무는 곳이 된다.</dd>
+<dt>보조 스트림(filter stream)</dt><dd>다른 스트림을 감싸 요청을 전달하면서 기능을 덧붙이는 스트림. <code>FilterInputStream</code>과 <code>FilterOutputStream</code>을 상속하며 <code>BufferedXxx</code>가 대표적이다.</dd>
+<dt>EOF(end of file)</dt><dd>더 읽을 데이터가 없는 상태. 자바 바이트 스트림은 이를 예외가 아니라 <code>read</code>의 반환값 -1로 알린다.</dd>
+<dt>세이프포인트(safepoint)</dt><dd>GC처럼 힙 전체를 다루는 VM 작업을 위해 자바 스레드들이 힙을 건드리지 않는 상태로 모이는 지점. HotSpot은 네이티브 코드를 실행 중인 스레드를 이미 안전한 것으로 보고 기다리지 않는다.</dd>
+<dt>JFR(JDK Flight Recorder)</dt><dd>JDK에 들어 있는 이벤트 기록기. OpenJDK 21에서는 시작할 때 <code>FileOutputStream</code> 등의 바이트코드를 재변환해 <code>jdk.FileWrite</code>, <code>jdk.FileRead</code> 같은 I/O 이벤트를 남긴다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/io/InputStream.html">Java SE 21 API: java.io.InputStream</a> — read()의 0~255와 -1 계약, readAllBytes와 available의 주의 사항, transferTo</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/io/BufferedOutputStream.html">Java SE 21 API: java.io.BufferedOutputStream</a> — 바이트마다 하위 시스템을 호출하지 않게 하는 버퍼 출력 스트림의 정의</li>
+<li><a href="https://raw.githubusercontent.com/openjdk/jdk21u/master/src/java.base/share/native/libjava/io_util.c">OpenJDK 21u: io_util.c</a> — readBytes/writeBytes의 8,192바이트 스택 버퍼, malloc, GetByteArrayRegion 복사</li>
+<li><a href="https://raw.githubusercontent.com/openjdk/jdk21u/master/src/java.base/unix/native/libjava/io_util_md.c">OpenJDK 21u: io_util_md.c (unix)</a> — handleRead/handleWrite가 부르는 read/write 시스템 콜과 EINTR 재시도</li>
+<li><a href="https://man7.org/linux/man-pages/man2/write.2.html">Linux man page: write(2)</a> — write 성공이 디스크 기록을 보장하지 않는다는 점과 부분 쓰기</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/specs/jni/design.html">JNI Specification (Java SE 21): Design Overview</a> — native 메서드 이름을 C 함수 이름으로 바꾸는 규칙(짧은 이름, 긴 이름), 배열의 고정과 복사</li>
+</x-refs>

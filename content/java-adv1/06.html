@@ -1,0 +1,879 @@
+<x-meta>
+deck: 잔액 1000원 계좌에서 두 스레드가 800원씩 빼면 잔액이 -600원이 된다. 경합 조건과 임계 영역을 정의하고, synchronized가 바이트코드·모니터·HotSpot 객체 헤더 수준에서 무엇을 하는지 실험으로 확인한다.
+minutes: 100
+</x-meta>
+
+<x-goals>
+<li>공유 필드를 읽고-검사하고-쓰는 코드에서 두 스레드의 실행 순서를 한 줄씩 엇갈려 추적해, 잔액이 음수가 되는 경우와 갱신 하나가 사라지는 경우를 각각 재현하고 설명할 수 있다.</li>
+<li>코드에서 임계 영역의 시작과 끝을 찾아내고, 지역 변수·매개변수·힙 객체 필드 중 무엇이 스레드 사이에 공유되는지 판정할 수 있다.</li>
+<li>synchronized 메서드와 synchronized 블록이 각각 어느 객체의 모니터를 잠그는지(<code>this</code>, <code>Class</code> 객체, 지정한 객체) 말하고, <code>javap</code> 출력에서 <code>ACC_SYNCHRONIZED</code> 플래그와 <code>monitorenter</code>/<code>monitorexit</code>, 예외 테이블을 찾아 읽을 수 있다.</li>
+<li>락을 기다리는 스레드의 <code>BLOCKED</code> 상태를 스레드 덤프로 확인하고, 인터럽트로 깨울 수 없다는 점과 시간 제한이 없다는 점을 근거로 synchronized의 한계를 설명할 수 있다.</li>
+<li>JLS 17.4의 happens-before 규칙으로 synchronized가 원자성과 메모리 가시성을 함께 보장하는 이유를 설명하고, HotSpot(OpenJDK 21)이 객체 헤더와 <code>ObjectMonitor</code>로 락을 구현하는 흐름을 그릴 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>잔액 1000원, 두 번의 800원 출금</h3>
+<p>앞 회차에서는 한 스레드가 쓴 값을 다른 스레드가 보지 못하는 메모리 가시성 문제를 다뤘다. <code>volatile</code>을 붙이면 쓰기와 읽기가 메인 메모리 수준에서 순서가 맞춰져, 한 스레드가 쓴 값을 다른 스레드가 확실히 보게 된다. 그런데 "보이기만 하면" 충분한 경우는 생각보다 적다. 여러 스레드가 같은 값을 읽고, 그 값을 근거로 판단하고, 다시 쓰는 순간 전혀 다른 종류의 문제가 생긴다. 이 회차는 그 문제를 은행 계좌의 출금이라는 가장 익숙한 장면에서 시작한다.</p>
+<p>규칙은 단순하다. 출금하려는 금액이 잔액보다 크면 출금을 거절하고, 그렇지 않으면 잔액에서 출금액을 뺀다. 잔액이 1000원인 계좌에서 800원을 한 번 빼면 200원이 남고, 두 번째 800원 출금은 잔액 부족으로 거절되어야 한다. 한 스레드로 실행하면 이 규칙은 언제나 지켜진다. 아래 코드는 이 규칙을 그대로 옮긴 계좌 클래스다. 검증과 출금 사이에 1초를 쉬게 한 것은, 실제 시스템에서 이 사이에 외부 시스템 호출이나 DB 접근 같은 시간이 드는 일이 끼어든다는 것을 흉내 낸 것이다.</p>
+<pre><code class="language-java">public class Account {
+    private int balance;
+
+    public Account(int initialBalance) {
+        this.balance = initialBalance;
+    }
+
+    public boolean withdraw(int amount) {
+        log("검증 시작: 출금액=" + amount + ", 잔액=" + balance);
+        if (balance < amount) {
+            log("검증 실패: 잔액 부족");
+            return false;
+        }
+        log("검증 통과: 출금액=" + amount + ", 잔액=" + balance);
+        sleep(1000); // 출금 처리에 시간이 걸린다고 가정
+        balance = balance - amount;
+        log("출금 완료: 출금액=" + amount + ", 잔액=" + balance);
+        return true;
+    }
+
+    public int getBalance() {
+        return balance;
+    }
+
+    static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    static void log(String msg) {
+        System.out.println("[" + Thread.currentThread().getName() + "] " + msg);
+    }
+}</code></pre>
+<pre><code class="language-java">public class WithdrawMain {
+    public static void main(String[] args) throws InterruptedException {
+        Account account = new Account(1000);
+        Runnable task = () -> account.withdraw(800);
+        Thread t1 = new Thread(task, "t1");
+        Thread t2 = new Thread(task, "t2");
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+        System.out.println("최종 잔액: " + account.getBalance());
+    }
+}</code></pre>
+<p>두 스레드는 같은 <code>Account</code> 인스턴스 하나를 공유한다. 람다 <code>task</code>가 지역 변수 <code>account</code>를 캡처하고, 두 <code>Thread</code> 객체가 같은 <code>task</code>를 받았으므로 둘 다 힙에 있는 같은 계좌 객체의 <code>withdraw</code>를 호출한다. <code>join()</code>은 두 스레드가 끝날 때까지 main 스레드를 기다리게 한다. 이 원고를 쓰며 JDK 21(Temurin 21.0.13, macOS arm64)에서 같은 프로그램을 세 번 실행했더니 결과가 두 가지로 갈렸다.</p>
+<pre data-label="실행 결과 (1회차)"><code class="language-text">[t2] 검증 시작: 출금액=800, 잔액=1000
+[t1] 검증 시작: 출금액=800, 잔액=1000
+[t2] 검증 통과: 출금액=800, 잔액=1000
+[t1] 검증 통과: 출금액=800, 잔액=1000
+[t1] 출금 완료: 출금액=800, 잔액=200
+[t2] 출금 완료: 출금액=800, 잔액=-600
+최종 잔액: -600</code></pre>
+<pre data-label="실행 결과 (2회차)"><code class="language-text">[t1] 검증 시작: 출금액=800, 잔액=1000
+[t2] 검증 시작: 출금액=800, 잔액=1000
+[t1] 검증 통과: 출금액=800, 잔액=1000
+[t2] 검증 통과: 출금액=800, 잔액=1000
+[t1] 출금 완료: 출금액=800, 잔액=200
+[t2] 출금 완료: 출금액=800, 잔액=200
+최종 잔액: 200</code></pre>
+<p>첫 번째 결과는 누가 봐도 잘못이다. 은행은 1600원을 내주었고 잔액은 -600원이다. 두 번째 결과는 더 교묘하다. 최종 잔액은 200원으로 그럴듯해 보이지만, 로그를 보면 두 번의 출금이 모두 "완료"되었다. 은행은 1600원을 내주고 장부에는 800원만 빠진 것으로 적었다. 어느 쪽이 나올지는 실행할 때마다 다르고, 두 스레드가 어떤 순서로 줄을 찍는지(t1이 먼저인지 t2가 먼저인지)도 실행마다 다르다. 같은 코드, 같은 입력에서 결과가 실행 순서에 따라 달라진다는 것이 이 회차가 다루는 문제의 첫 번째 특징이다.</p>
+
+<h3>무엇이 꼬였는가: 두 실행 순서의 추적</h3>
+<p>결과가 왜 갈리는지 보려면 <code>withdraw</code>를 두 스레드가 실제로 어떤 순서로 실행했는지 한 줄씩 엇갈려 그려 봐야 한다. 먼저 두 결과에 공통인 앞부분이다. 두 스레드는 거의 동시에 시작해 둘 다 잔액 1000을 읽고, 둘 다 <code>1000 < 800</code>이 거짓이므로 검증을 통과한다. 그리고 둘 다 <code>sleep(1000)</code>에 들어간다. 이 시점에 이미 운명은 정해졌다. 두 스레드 모두 "잔액이 충분하다"는 판단을 마친 상태로 잠들었기 때문이다. 판단의 근거였던 잔액 1000은 곧 바뀌지만, 이미 내린 판단은 바뀌지 않는다.</p>
+<pre class="diagram">시간 ↓          t1                               t2                      힙의 balance
+──────────────────────────────────────────────────────────────────────────────────
+ ①   if (balance < 800) → 1000 읽음, 통과                                       1000
+ ②                                     if (balance < 800) → 1000 읽음, 통과      1000
+ ③   sleep(1000)                       sleep(1000)                              1000
+ ④   balance = balance - 800
+       읽기: 1000, 계산: 200, 쓰기: 200                                          200
+ ⑤                                     balance = balance - 800
+                                         읽기: 200, 계산: -600, 쓰기: -600       -600
+──────────────────────────────────────────────────────────────────────────────────
+결과 A: 두 출금 모두 성공, 잔액 -600 (검증이 낡은 값에 근거했다)</pre>
+<p>결과 A는 ④와 ⑤가 겹치지 않은 경우다. t1이 깨어나 1000을 읽고 200을 쓴 뒤에 t2가 깨어나 200을 읽고 -600을 쓴다. 뺄셈 자체는 정확했다. 문제는 t2가 ②에서 내린 판단이다. t2는 1000을 보고 "충분하다"고 판단했지만, 실제 뺄셈은 200을 대상으로 했다. 검사(check)한 시점의 상태와 행동(act)한 시점의 상태가 다르다. 이 모양을 <b>검사 후 행동(check-then-act)</b> 경합이라고 부른다.</p>
+<pre class="diagram">시간 ↓          t1                               t2                      힙의 balance
+──────────────────────────────────────────────────────────────────────────────────
+ ①②③  (결과 A와 같다: 둘 다 1000을 보고 검증 통과, 둘 다 sleep)                1000
+ ④   balance 읽기 → 1000                                                        1000
+ ⑤                                     balance 읽기 → 1000                       1000
+ ⑥   1000 - 800 = 200, 쓰기                                                      200
+ ⑦                                     1000 - 800 = 200, 쓰기                    200
+──────────────────────────────────────────────────────────────────────────────────
+결과 B: 두 출금 모두 성공, 잔액 200 (t1의 쓰기가 t2의 쓰기에 덮여 사라졌다)</pre>
+<p>결과 B는 두 스레드가 거의 같은 순간에 깨어나 <code>balance = balance - amount</code> 한 줄을 겹쳐 실행한 경우다. 이 한 줄이 왜 겹칠 수 있는지는 자바 코드가 아니라 바이트코드를 봐야 보인다. 이 한 줄을 컴파일해 <code>javap -c</code>로 열어 보면 다음과 같다(같은 문장을 담은 작은 메서드를 따로 컴파일한 결과다).</p>
+<pre data-label="javap -c 출력 (balance = balance - amount)"><code class="language-text">0: aload_0
+1: aload_0
+2: getfield      #7                  // Field balance:I
+5: iload_1
+6: isub
+7: putfield      #7                  // Field balance:I</code></pre>
+<p>자바 코드 한 줄이 명령어 여섯 개가 되었다. 핵심은 세 단계다. <code>getfield</code>가 힙에 있는 객체의 <code>balance</code> 필드 값을 꺼내 피연산자 스택(operand stack)에 올리고, <code>isub</code>가 스택 위의 두 값을 빼고, <code>putfield</code>가 결과를 다시 필드에 쓴다. 여기서 피연산자 스택은 JVM 스택의 프레임 안에 있다. 2회차에서 보았듯 JVM 스택은 스레드마다 따로 있다. 그러니 t1이 꺼내 온 1000과 t2가 꺼내 온 1000은 각자의 프레임 안에 따로 놓인 복사본이다. 두 스레드가 각자 1000에서 800을 빼 200을 만들고 각자 <code>putfield</code>로 200을 쓰면, 나중에 쓴 쪽이 먼저 쓴 쪽을 덮는다. 이렇게 한 스레드의 갱신이 흔적 없이 사라지는 것을 <b>갱신 손실(lost update)</b>이라고 하고, 읽고-고치고-쓰는 이 모양을 <b>읽기-수정-쓰기(read-modify-write)</b> 경합이라고 부른다.</p>
+<pre class="diagram">       t1의 JVM 스택                        힙                         t2의 JVM 스택
+  ┌──────────────────────┐      ┌───────────────────────┐      ┌──────────────────────┐
+  │ withdraw 프레임       │      │ Account 객체           │      │ withdraw 프레임       │
+  │  지역변수: this,amount │──┐   │   balance = 1000      │   ┌──│  지역변수: this,amount │
+  │  피연산자 스택: [1000] │  └──▶│                       │◀──┘  │  피연산자 스택: [1000] │
+  └──────────────────────┘      └───────────────────────┘      └──────────────────────┘
+        getfield로 복사해 옴              공유되는 원본                 getfield로 복사해 옴
+        isub → 200, putfield           두 번의 putfield가                isub → 200, putfield
+                                       같은 칸에 200을 쓴다</pre>
+
+<x-visual id="java-adv1-06-withdraw-interleaving" title="두 스레드의 출금이 엇갈려 잔액이 -600원이 되는 실행 순서" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>두 스레드가 같은 잔액을 보고 모두 검증을 통과한 뒤 차례로 빼서 음수가 되는 과정을, 가운데의 공유 잔액 칸 변화와 함께 보여 준다.</x-hint>
+<x-prompt>A clean sequence diagram on a white background. Three vertical lifelines: left labeled "t1", right labeled "t2", and in the center a box labeled "힙의 Account 객체" containing a field "balance". Time flows downward. Step 1: an arrow from t1 to the center box labeled "잔액 1000 읽기", then a small note at t1 "검증 통과". Step 2: the same from t2 labeled "잔액 1000 읽기" with note "검증 통과". Step 3: both lifelines show a gray zigzag segment labeled "sleep". Step 4: an arrow from t1 to the center labeled "200 쓰기"; the balance box value changes to 200. Step 5: an arrow from t2 to the center labeled "-600 쓰기"; the balance box value turns red showing -600. A red bracket on the right spanning step 2 to step 5 labeled "낡은 값에 근거한 판단". Flat design, two accent colors (blue for t1, orange for t2), Korean labels exactly as quoted.</x-prompt>
+<x-caption>t2는 잔액 1000을 보고 판단했지만 실제로는 200에서 뺐다. 검사한 상태와 행동한 상태가 달라진 것이 문제의 핵심이다.</x-caption>
+</x-visual>
+
+<h3>경합 조건: sleep을 빼도 문제는 남는다</h3>
+<p>이처럼 여러 스레드가 공유 자원에 접근할 때 결과가 실행 순서(타이밍)에 따라 달라지는 상황을 <b>경합 조건(race condition)</b>이라고 한다. 예제의 <code>sleep(1000)</code>은 경합이 일어나는 틈을 1초로 크게 벌려, 거의 매번 문제를 재현하기 위한 장치다. 그렇다면 <code>sleep</code>을 지우면 문제가 사라질까. 사라지지 않는다. 틈이 1초에서 수 나노초로 좁아질 뿐이다. 운영체제의 스케줄러는 어느 명령어 사이에서든 스레드를 CPU에서 내릴 수 있고(1회차의 컨텍스트 스위칭), 멀티코어에서는 두 스레드가 아예 같은 순간에 서로 다른 코어에서 같은 코드를 실행한다. 틈이 좁으면 재현 빈도가 낮아지지만, 하루에 수백만 건을 처리하는 서버에서는 낮은 빈도도 결국 일어난다. 그리고 그때는 재현하기 어려운 장애로 나타난다.</p>
+<p>틈이 얼마나 좁아도 문제가 되는지는 숫자 하나를 세는 코드로 쉽게 확인할 수 있다. 앞 회차에서 배운 <code>volatile</code>을 붙인 필드를 두 스레드가 각각 100만 번씩 증가시킨다. 검증도, <code>sleep</code>도 없는, 덧셈 한 줄짜리 코드다.</p>
+<pre><code class="language-java">public class VolCounter {
+    private volatile int count;
+
+    public static void main(String[] args) throws InterruptedException {
+        VolCounter c = new VolCounter();
+        Runnable r = () -> {
+            for (int i = 0; i < 1_000_000; i++) {
+                c.count++;
+            }
+        };
+        Thread t1 = new Thread(r), t2 = new Thread(r);
+        t1.start(); t2.start();
+        t1.join(); t2.join();
+        System.out.println("count = " + c.count);
+    }
+}</code></pre>
+<pre data-label="실행 결과 (세 번 실행, 값은 실행마다 다르다)"><code class="language-text">count = 1107333
+count = 1112668
+count = 1107129</code></pre>
+<p>기대값 2,000,000에 한참 못 미친다. 정확한 값은 실행마다, 기계마다 다르므로 숫자 자체에는 의미가 없다. 의미 있는 것은 "2,000,000보다 작다"는 사실이다. <code>count++</code> 역시 <code>getfield</code>, <code>iconst_1</code>, <code>iadd</code>, <code>putfield</code>로 나뉘는 읽기-수정-쓰기이고, 그 사이에 다른 스레드의 읽기와 쓰기가 끼어들면 증가분이 사라진다. 이 실험에서 <code>javap -c</code>로 람다 본문을 열면 실제로 <code>getfield</code>와 <code>putfield</code> 사이에 <code>iconst_1</code>과 <code>iadd</code>가 끼어 있는 것을 볼 수 있다.</p>
+<p>여기서 중요한 교훈은 <code>volatile</code>이 이 문제를 해결하지 못한다는 점이다. <code>volatile</code>은 각각의 읽기와 쓰기가 다른 스레드에 보이도록 보장할 뿐, "읽기부터 쓰기까지"를 하나로 묶어 주지는 않는다. t1이 읽은 뒤 쓰기 전에 t2가 읽는 것을 막는 장치가 <code>volatile</code>에는 없다. 앞 회차의 문제가 <b>가시성(visibility)</b>이었다면 이 회차의 문제는 <b>원자성(atomicity)</b>이다. 원자적(atomic)이라는 말은 어떤 연산이 중간 상태를 남기지 않고, 다른 스레드가 볼 때 "전혀 실행되지 않았거나 완전히 실행되었거나" 둘 중 하나로만 보인다는 뜻이다. 출금의 "검증부터 차감까지", 카운터의 "읽기부터 쓰기까지"를 원자적으로 만들어야 한다.</p>
+<div class="table-wrap"><table><thead><tr><th>모양</th><th>예</th><th>무엇이 잘못되는가</th></tr></thead><tbody>
+<tr><td>검사 후 행동(check-then-act)</td><td><code>if (balance >= amount) balance -= amount;</code>, <code>if (!map.containsKey(k)) map.put(k, v);</code></td><td>검사한 뒤 행동하기 전에 다른 스레드가 상태를 바꾸면, 행동이 더 이상 참이 아닌 전제에 근거하게 된다</td></tr>
+<tr><td>읽기-수정-쓰기(read-modify-write)</td><td><code>count++</code>, <code>balance = balance - amount</code></td><td>두 스레드가 같은 옛 값을 읽어 각자 계산하면, 나중에 쓴 쪽이 먼저 쓴 쪽을 덮는다(갱신 손실)</td></tr>
+</tbody></table></div>
+<aside class="note">경합 조건(race condition)과 데이터 경합(data race)은 다른 말이다. JLS 17.4.5는 데이터 경합을 happens-before 관계로 순서가 정해지지 않은 두 충돌 접근(같은 변수에 대한 접근 중 하나 이상이 쓰기)으로 정의한다. 데이터 경합이 없다고 해서 경합 조건까지 없어지는 것은 아니다. JLS 17.4.3은 순차 일관성이나 데이터 경합이 없다는 성질만으로는, 원자적으로 보여야 하는 여러 동작의 묶음이 원자적이지 않아서 생기는 오류를 막지 못한다고 적는다. 둘 다 없애야 프로그램이 올바르다.</aside>
+
+<h3>임계 영역: 한 번에 한 스레드만 들어가야 하는 구간</h3>
+<p>문제를 해결하려면 먼저 "어디를" 보호해야 하는지 정확히 짚어야 한다. 여러 스레드가 함께 쓰는 자원(공유 자원)에 접근하며, 동시에 둘 이상의 스레드가 실행하면 결과가 깨지는 코드 구간을 <b>임계 영역(critical section)</b>이라고 한다. 임계 영역에 대한 요구 사항은 하나다. 어느 순간에도 그 구간을 실행하는 스레드는 최대 하나여야 한다. 이것을 <b>상호 배제(mutual exclusion)</b>라고 부른다. 상호 배제가 지켜지면 임계 영역 전체가 다른 스레드가 보기에 하나의 원자적 연산처럼 동작한다.</p>
+<p>임계 영역을 찾는 첫 단계는 "무엇이 공유되는가"를 판정하는 것이다. 2회차에서 본 JVM 런타임 데이터 영역의 구분이 그대로 판정 기준이 된다. 지역 변수와 매개변수는 그 메서드를 호출한 스레드의 JVM 스택 프레임에 있으므로 다른 스레드가 접근할 방법이 없다. 반면 인스턴스 필드는 힙의 객체 안에 있고, 정적 필드는 클래스에 하나뿐이므로 그 객체나 클래스에 닿을 수 있는 모든 스레드가 접근한다. 한 가지 주의할 점은 지역 변수가 "참조"를 담고 있을 때다. 참조 값 자체는 스레드 전용이지만, 그 참조가 가리키는 힙 객체는 다른 스레드도 같은 참조를 가지고 있다면 공유된다. 예제의 람다가 캡처한 <code>account</code>가 바로 그 경우다.</p>
+<div class="table-wrap"><table><thead><tr><th>위치</th><th>저장되는 곳</th><th>스레드 사이에 공유되는가</th></tr></thead><tbody>
+<tr><td>지역 변수, 매개변수(기본형)</td><td>호출한 스레드의 JVM 스택 프레임</td><td>아니다</td></tr>
+<tr><td>지역 변수, 매개변수(참조형)</td><td>참조 값은 스택 프레임, 대상 객체는 힙</td><td>참조 값은 아니다. 대상 객체는 다른 스레드가 같은 객체를 참조하면 공유된다</td></tr>
+<tr><td>인스턴스 필드</td><td>힙의 객체 안</td><td>그 객체를 참조하는 모든 스레드가 공유한다</td></tr>
+<tr><td>정적 필드</td><td>클래스 단위로 하나</td><td>모든 스레드가 공유한다</td></tr>
+</tbody></table></div>
+<p>두 번째 단계는 공유 자원에 대한 접근 중 "함께 묶여야 하는 범위"를 정하는 것이다. 출금 예제에서 공유 자원은 <code>balance</code> 하나다. 그런데 <code>balance</code>를 읽는 곳(검증)과 쓰는 곳(차감)을 각각 따로 보호하는 것으로는 부족하다. 검증에서 읽은 값이 차감할 때까지 유효해야 하기 때문이다. 그래서 임계 영역은 <b>검증에서 balance를 처음 읽는 지점부터 차감 결과를 쓰는 지점까지</b>다. 그 사이에 끼어 있는 <code>sleep(1000)</code>도 임계 영역 안에 포함된다. 반대로 첫 번째 로그(검증 시작)를 찍기 전의 일이나 출금이 끝난 뒤의 일은 <code>balance</code>와 무관하므로 임계 영역 밖에 두어도 된다.</p>
+<pre class="diagram">public boolean withdraw(int amount) {
+    log("검증 시작 ...");                    ← balance를 읽어 로그에 쓰지만 판단에 쓰이지 않는다
+  ┌─────────────────────────────────────── 임계 영역 시작
+  │ if (balance < amount) { ... return false; }   ← 읽기 (판단의 근거)
+  │ sleep(1000);
+  │ balance = balance - amount;                ← 읽기-수정-쓰기
+  └─────────────────────────────────────── 임계 영역 끝
+    log("출금 완료 ...");
+    return true;
+}</pre>
+<p>임계 영역을 정확히 정하는 것은 생각보다 어렵다. 너무 좁게 잡으면(예: 차감 한 줄만 보호) 검사 후 행동 경합이 남는다. 너무 넓게 잡으면(예: 메서드 전체와 그 메서드가 부르는 느린 외부 호출까지) 정확하기는 하지만 스레드들이 줄을 서서 하나씩 지나가게 되어 멀티스레드를 쓰는 의미가 줄어든다. 정확성이 먼저이고, 성능은 정확성을 지킨 범위 안에서 좁혀 가는 문제다. 이 균형은 뒤에서 synchronized 블록을 다룰 때 다시 본다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>열쇠가 하나뿐인 공용 회의실</strong><p>공용 회의실 문 옆에 열쇠가 하나 걸려 있다. 회의실을 쓰려면 열쇠를 가져가야 하고, 열쇠가 없으면 문 앞에서 기다린다. 다 쓴 사람이 열쇠를 걸어 두면 기다리던 사람 중 하나가 가져간다. 회의실 안이 임계 영역이고, 열쇠가 락이다. 이 비유가 깨지는 지점도 있다. 실제 회의실은 문이 잠겨 있어 열쇠 없이 들어갈 수 없지만, 자바의 락은 "열쇠를 가지러 오는 사람끼리만" 순서를 정한다. 락을 거치지 않는 코드는 아무 제약 없이 같은 필드를 읽고 쓸 수 있다. 또 기다리는 사람 중 누가 먼저 열쇠를 가져가는지는 정해져 있지 않다.</p></aside>
+
+<h3>모니터 락: 모든 객체에 붙어 있는 락</h3>
+<p>자바는 상호 배제를 위한 가장 기본적인 장치를 언어 자체에 넣어 두었다. JLS 17.1은 스레드 사이의 통신 수단 중 가장 기본적인 것이 <b>동기화(synchronization)</b>이고, 이것이 <b>모니터(monitor)</b>로 구현된다고 적는다. 그리고 규칙을 다음처럼 정한다. 자바의 모든 객체는 모니터 하나와 연결되어 있고, 스레드는 그 모니터를 잠그거나(lock) 풀 수(unlock) 있다. 한 번에 한 스레드만 모니터의 락을 가질 수 있으며, 같은 모니터를 잠그려는 다른 스레드는 락을 얻을 수 있을 때까지 블록(block)된다.</p>
+<p>이 규칙에서 눈여겨볼 단어는 "모든 객체"다. 자바에서는 <code>new Object()</code>로 만든 아무 객체나, 계좌 객체 자신이나, 클래스를 나타내는 <code>Class</code> 객체나 모두 락으로 쓸 수 있다. 락을 위한 별도의 타입을 만들 필요가 없다는 것은 편리하지만, 대가가 있다. JVM은 모든 객체에 대해 "이 객체가 지금 잠겨 있는가, 누가 잠갔는가"를 기록할 자리를 어딘가에 마련해야 한다. HotSpot이 이 자리를 어떻게 마련하는지는 이 회차 뒷부분에서 객체 헤더를 열어 본다. 이 자리를 흔히 "객체의 모니터 락", "고유 락(intrinsic lock)"이라고 부른다. 이 강좌에서는 JLS의 표현을 따라 모니터 락이라고 부른다.</p>
+<p>JLS 17.1은 한 가지를 더 정한다. 스레드 t는 같은 모니터를 여러 번 잠글 수 있고, 각 unlock은 lock 한 번의 효과를 되돌린다. 즉 모니터 락은 "누가 가졌는가"와 함께 "몇 번 잠갔는가"라는 횟수를 가진다. 이미 락을 가진 스레드가 같은 락을 다시 요청하면 기다리지 않고 횟수만 늘어난다. 이 성질을 <b>재진입(reentrancy)</b>이라고 하며, 뒤에서 왜 이것이 꼭 필요한지 예제로 확인한다. 자바 언어에서 모니터를 잠그는 방법은 두 가지다. 메서드에 <code>synchronized</code> 수정자를 붙이는 방법과, <code>synchronized (식) { ... }</code> 문장을 쓰는 방법이다.</p>
+
+<h3>synchronized 메서드</h3>
+<p>먼저 메서드 쪽이다. 계좌 클래스의 <code>withdraw</code>와 <code>getBalance</code>에 <code>synchronized</code>만 붙인다. 나머지 코드는 한 글자도 바꾸지 않는다.</p>
+<pre><code class="language-java">public class SyncAccount {
+    private int balance;
+
+    public SyncAccount(int initialBalance) {
+        this.balance = initialBalance;
+    }
+
+    public synchronized boolean withdraw(int amount) {
+        log("검증 시작: 출금액=" + amount + ", 잔액=" + balance);
+        if (balance < amount) {
+            log("검증 실패: 잔액 부족");
+            return false;
+        }
+        log("검증 통과: 출금액=" + amount + ", 잔액=" + balance);
+        sleep(1000);
+        balance = balance - amount;
+        log("출금 완료: 출금액=" + amount + ", 잔액=" + balance);
+        return true;
+    }
+
+    public synchronized int getBalance() {
+        return balance;
+    }
+
+    // sleep(), log()는 Account와 같다
+    // ...
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[t1] 검증 시작: 출금액=800, 잔액=1000
+[t1] 검증 통과: 출금액=800, 잔액=1000
+[t1] 출금 완료: 출금액=800, 잔액=200
+[t2] 검증 시작: 출금액=800, 잔액=200
+[t2] 검증 실패: 잔액 부족
+최종 잔액: 200</code></pre>
+<p>이번에는 t1의 로그 세 줄이 끝난 뒤에야 t2의 로그가 시작된다. 어느 스레드가 먼저 락을 잡을지는 실행마다 다를 수 있지만(t2가 먼저 잡으면 이름만 바뀐 같은 결과가 나온다), 한 스레드의 출금이 다른 스레드의 출금 중간에 끼어드는 일은 더 이상 일어나지 않는다. 그리고 나중에 들어간 스레드는 앞 스레드가 남긴 잔액 200을 보고 정확하게 출금을 거절한다. 최종 잔액은 항상 200이고, 출금 성공은 항상 한 번이다.</p>
+<p>JLS 17.1과 8.4.3.6은 synchronized 메서드가 잠그는 모니터를 이렇게 정한다. 인스턴스 메서드면 메서드가 호출된 그 인스턴스, 즉 본문에서 <code>this</code>가 될 객체의 모니터를 잠근다. <code>static</code> 메서드면 그 메서드가 정의된 클래스를 나타내는 <code>Class</code> 객체의 모니터를 잠근다. 그리고 본문이 정상적으로 끝나든 예외 등으로 갑자기(abruptly) 끝나든, 같은 모니터에 대해 unlock이 자동으로 수행된다. 이 정의에서 바로 따라 나오는 결론이 있다. <b>락은 메서드에 붙는 것이 아니라 객체에 붙는다.</b> 같은 계좌 객체에 대해서는 <code>withdraw</code>와 <code>getBalance</code>가 같은 락(그 계좌의 모니터)을 쓰므로 서로를 배제하지만, 계좌 A의 <code>withdraw</code>와 계좌 B의 <code>withdraw</code>는 서로 다른 락을 쓰므로 동시에 실행된다.</p>
+<p>이 결론을 실험으로 확인해 보자. 정적 synchronized 메서드 하나와 인스턴스 synchronized 메서드 하나를 가진 클래스를 만들고, 서로 다른 조합으로 네 스레드를 띄워 0.1초 뒤 상태를 찍는다. 각 메서드는 락을 잡은 채 1초를 쉰다.</p>
+<pre><code class="language-java">public class TwoLocks {
+    static synchronized void staticWork() { pause(); }   // TwoLocks.class 의 모니터
+    synchronized void instanceWork() { pause(); }        // this 의 모니터
+
+    public static void main(String[] args) throws Exception {
+        TwoLocks a = new TwoLocks();
+        TwoLocks b = new TwoLocks();
+        Thread t1 = new Thread(TwoLocks::staticWork, "static");
+        Thread t2 = new Thread(a::instanceWork, "a");
+        Thread t3 = new Thread(b::instanceWork, "b");
+        Thread t4 = new Thread(a::instanceWork, "a-again");
+        t1.start(); t2.start(); t3.start();
+        Thread.sleep(100);
+        t4.start();
+        Thread.sleep(100);
+        for (Thread t : new Thread[]{t1, t2, t3, t4}) {
+            System.out.println(t.getName() + " : " + t.getState());
+        }
+        System.exit(0);
+    }
+
+    static void pause() {
+        try { Thread.sleep(1000); } catch (InterruptedException e) { }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">static : TIMED_WAITING
+a : TIMED_WAITING
+b : TIMED_WAITING
+a-again : BLOCKED</code></pre>
+<p>정적 메서드를 실행하는 스레드, 객체 a의 메서드를 실행하는 스레드, 객체 b의 메서드를 실행하는 스레드는 서로 다른 세 모니터(<code>TwoLocks.class</code>, a, b)를 잠그므로 셋 다 동시에 메서드 안으로 들어가 <code>sleep</code> 중이다(<code>TIMED_WAITING</code>). 오직 a의 모니터를 두 번째로 요청한 <code>a-again</code>만 <code>BLOCKED</code> 상태로 기다린다. 정적 메서드와 인스턴스 메서드가 같은 클래스에 있다고 해서 서로를 배제하지 않는다는 점, 그리고 <code>sleep</code>은 락을 놓지 않는다는 점(<code>Thread.sleep</code>의 Javadoc과 JLS 17.3이 모두 "모니터의 소유권을 잃지 않는다"고 명시한다)을 함께 확인할 수 있다. 정적 필드를 인스턴스 synchronized 메서드로 보호하려는 실수가 바로 이 지점에서 생긴다. 인스턴스마다 락이 다르므로 정적 필드는 전혀 보호되지 않는다.</p>
+
+<h4>getBalance에도 synchronized가 필요한 이유</h4>
+<p><code>getBalance</code>는 값을 읽기만 하는데 왜 synchronized를 붙였을까. 이유는 두 가지다. 첫째, JLS 14.19는 어떤 객체의 락을 얻는 것이 그 자체로는 다른 스레드가 그 객체의 필드에 접근하거나 synchronized가 아닌 메서드를 호출하는 것을 막지 않는다고 명시한다. 락은 "같은 락을 요청하는 코드끼리"의 약속이다. synchronized가 없는 <code>getBalance</code>는 출금이 진행되는 도중에도 언제든 실행될 수 있다. 둘째, 더 중요한 이유는 가시성이다. 뒤에서 자세히 보겠지만 synchronized가 보장하는 가시성은 "같은 모니터를 unlock한 스레드와 그 뒤에 lock한 스레드" 사이에서만 성립한다. 락을 거치지 않고 읽는 스레드는 다른 스레드가 쓴 최신 잔액을 본다는 보장을 받지 못한다. 앞 회차의 가시성 문제가 그대로 돌아오는 것이다.</p>
+
+<h3>바이트코드에서 본 synchronized 메서드</h3>
+<p>synchronized 메서드를 컴파일하면 바이트코드에 무엇이 생길까. 비교를 위해 같은 일을 하는 synchronized 메서드, synchronized 블록, 정적 synchronized 메서드를 한 클래스에 두고 <code>javap -c -v -p</code>로 열어 보았다. 먼저 메서드 쪽이다.</p>
+<pre><code class="language-java">public class Bc {
+    private int balance = 1000;
+
+    public synchronized void syncMethod(int amount) {
+        balance = balance - amount;
+    }
+
+    public void syncBlock(int amount) {
+        synchronized (this) {
+            balance = balance - amount;
+        }
+    }
+
+    public static synchronized void staticSync() {
+    }
+}</code></pre>
+<pre data-label="javap -c -v -p 출력 중 메서드 부분"><code class="language-text">  public synchronized void syncMethod(int);
+    descriptor: (I)V
+    flags: (0x0021) ACC_PUBLIC, ACC_SYNCHRONIZED
+    Code:
+      stack=3, locals=2, args_size=2
+         0: aload_0
+         1: aload_0
+         2: getfield      #7                  // Field balance:I
+         5: iload_1
+         6: isub
+         7: putfield      #7                  // Field balance:I
+        10: return
+
+  public static synchronized void staticSync();
+    descriptor: ()V
+    flags: (0x0029) ACC_PUBLIC, ACC_STATIC, ACC_SYNCHRONIZED
+    Code:
+      stack=0, locals=0, args_size=0
+         0: return</code></pre>
+<p>synchronized 메서드의 본문에는 락과 관련된 명령어가 하나도 없다. 앞에서 본 synchronized가 없는 출금 코드와 명령어가 똑같다. 차이는 메서드의 접근 플래그에 있다. <code>flags</code>에 <code>ACC_SYNCHRONIZED</code>(0x0020)가 켜져 있다. 0x0021은 <code>ACC_PUBLIC</code>(0x0001)과 이 플래그를 더한 값이고, 정적 메서드의 0x0029는 여기에 <code>ACC_STATIC</code>(0x0008)이 더해진 값이다.</p>
+<p>JVMS 2.11.10이 이 플래그의 의미를 정한다. 메서드 수준의 동기화는 메서드 호출과 반환의 일부로 암묵적으로 수행된다. 메서드 호출 명령어(<code>invokevirtual</code> 등)가 이 플래그를 확인하고, 플래그가 켜져 있으면 실행 중인 스레드가 모니터에 들어간 뒤 메서드를 실행하고, 메서드가 정상적으로 끝나든 갑자기 끝나든 모니터에서 나온다. 메서드가 처리하지 않은 예외가 던져지면, 그 예외가 메서드 밖으로 다시 던져지기 전에 모니터가 자동으로 해제된다. 어느 객체의 모니터인지는 언어 규칙과 같다. 인스턴스 메서드면 수신 객체(지역 변수 0번의 <code>this</code>), 정적 메서드면 그 클래스의 <code>Class</code> 객체다. 즉 synchronized 메서드에서 락을 잡고 놓는 일은 컴파일러가 아니라 JVM의 호출·반환 메커니즘이 책임진다.</p>
+<aside class="note">스레드 덤프나 스택 트레이스에서 synchronized 메서드의 프레임은 락을 기다리는 중에도 그 메서드 이름으로 찍힌다. 아래 덤프에서 락을 기다리는 t2의 맨 위 프레임이 <code>withdraw</code>로 보이는 이유다. 아직 본문의 첫 명령어도 실행하지 않았지만, JVMS가 말하는 대로 모니터 진입이 "호출의 일부"이기 때문이다.</aside>
+<h3>락을 기다리는 스레드: BLOCKED 상태</h3>
+<p>synchronized 출금 예제에서 t1이 락을 잡고 1초를 쉬는 동안 t2는 무엇을 하고 있었을까. 3회차와 4회차에서 본 스레드 상태(<code>Thread.State</code>) 가운데 지금까지 자세히 다루지 않은 상태가 하나 있었다. 바로 <code>BLOCKED</code>다. <code>Thread.State.BLOCKED</code>의 Javadoc은 이 상태를 모니터 락을 기다리며 블록된 스레드의 상태로 정의하고, 구체적으로 synchronized 블록이나 메서드에 들어가려고 기다리는 경우와 <code>Object.wait</code>를 호출한 뒤 synchronized 블록에 다시 들어가려고 기다리는 경우를 든다. 뒤의 경우는 8회차(생산자 소비자 문제)에서 다룬다. 이 회차에서 만나는 것은 앞의 경우다.</p>
+<p>스레드 덤프로 직접 확인해 보자. 5초를 쉬는 synchronized 출금 메서드를 두 스레드가 0.1초 간격으로 호출하게 하고, 실행 1.5초쯤에 <code>jstack</code>으로 덤프를 찍었다. 아래는 두 스레드 부분만 발췌한 것이다(주소, 스레드 번호, 시간 값은 실행마다 다르다).</p>
+<pre data-label="jstack 출력 발췌"><code class="language-text">"t1" #20 [26883] prio=5 os_prio=31 cpu=0.06ms elapsed=1.76s tid=0x0000007ac2d1ea00 nid=26883 waiting on condition  [0x000000016e382000]
+   java.lang.Thread.State: TIMED_WAITING (sleeping)
+	at java.lang.Thread.sleep0(java.base@21.0.13/Native Method)
+	at java.lang.Thread.sleep(java.base@21.0.13/Thread.java:509)
+	at DumpMain$Account.withdraw(DumpMain.java:5)
+	- locked <0x0000007010614d20> (a DumpMain$Account)
+	at DumpMain.lambda$main$0(DumpMain.java:11)
+	...
+
+"t2" #21 [27139] prio=5 os_prio=31 cpu=0.23ms elapsed=1.66s tid=0x0000007ac2d1f100 nid=27139 waiting for monitor entry  [0x000000016e58e000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at DumpMain$Account.withdraw(DumpMain.java:5)
+	- waiting to lock <0x0000007010614d20> (a DumpMain$Account)
+	at DumpMain.lambda$main$1(DumpMain.java:12)
+	...</code></pre>
+<p>덤프가 말해 주는 것은 세 가지다. 첫째, t1은 <code>sleep</code> 중이라 상태는 <code>TIMED_WAITING</code>이지만 <code>- locked <0x...4d20></code> 줄이 보여 주듯 계좌 객체의 락을 쥐고 있다. 둘째, t2는 <code>BLOCKED (on object monitor)</code> 상태이고 <code>- waiting to lock</code> 뒤에 t1이 쥔 것과 같은 주소가 찍혀 있다. 이 주소를 따라가면 "누가 누구를 막고 있는가"를 알 수 있다. 운영 중인 서버에서 요청이 멈췄을 때 스레드 덤프를 찍어 같은 주소의 <code>locked</code>와 <code>waiting to lock</code>을 짝지어 보는 것이 락 경합을 진단하는 기본 방법이다. 셋째, t2의 <code>cpu=0.23ms</code>가 보여 주듯 기다리는 동안 t2는 CPU를 거의 쓰지 않는다. 이 스레드는 락을 계속 확인하며 돌고 있는 것이 아니라 잠들어 있다. 어떻게 잠들고 깨어나는지는 HotSpot 구현을 볼 때 다시 다룬다.</p>
+<p><code>BLOCKED</code>는 3회차의 <code>WAITING</code>, <code>TIMED_WAITING</code>과 성격이 다르다. 가장 큰 차이는 인터럽트에 대한 반응이다. <code>sleep</code>이나 <code>join</code>으로 기다리는 스레드는 인터럽트를 받으면 <code>InterruptedException</code>과 함께 깨어난다. 모니터 락을 기다리는 스레드는 그렇지 않다. 다음 실험에서 holder 스레드가 락을 2초 동안 쥐고 있는 동안, 락을 기다리는 waiter 스레드를 인터럽트해 본다.</p>
+<pre><code class="language-java">public class BlockedMain {
+    static final Object lock = new Object();
+
+    public static void main(String[] args) throws Exception {
+        Thread holder = new Thread(() -> {
+            synchronized (lock) {
+                sleep(2000);
+            }
+        }, "holder");
+        Thread waiter = new Thread(() -> {
+            synchronized (lock) {
+                System.out.println("waiter 진입, interrupted=" + Thread.currentThread().isInterrupted());
+            }
+        }, "waiter");
+
+        holder.start();
+        Thread.sleep(100);
+        waiter.start();
+        Thread.sleep(100);
+        System.out.println("holder=" + holder.getState() + ", waiter=" + waiter.getState());
+        System.out.println("main holdsLock=" + Thread.holdsLock(lock));
+
+        waiter.interrupt();
+        Thread.sleep(100);
+        System.out.println("interrupt 후 waiter=" + waiter.getState() + ", isInterrupted=" + waiter.isInterrupted());
+
+        holder.join();
+        waiter.join();
+        System.out.println("끝: waiter=" + waiter.getState());
+    }
+
+    static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { throw new RuntimeException(e); }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">holder=TIMED_WAITING, waiter=BLOCKED
+main holdsLock=false
+interrupt 후 waiter=BLOCKED, isInterrupted=true
+waiter 진입, interrupted=true
+끝: waiter=TERMINATED</code></pre>
+<p>인터럽트를 받은 뒤에도 waiter는 여전히 <code>BLOCKED</code>다. 인터럽트 플래그는 켜졌지만(<code>isInterrupted=true</code>) 락을 기다리는 일은 중단되지 않는다. waiter는 holder가 2초를 다 쉬고 락을 놓은 뒤에야 블록 안으로 들어가고, 들어간 뒤에 플래그가 켜져 있음을 확인할 수 있을 뿐이다. <code>Thread.holdsLock(obj)</code>은 현재 스레드가 그 객체의 모니터 락을 가지고 있는지 알려 주는 정적 메서드로, main 스레드는 이 락을 가진 적이 없으므로 <code>false</code>다. 이 실험의 출력 순서는 각 단계 사이에 0.1초씩 쉬게 해 둔 덕분에 거의 항상 같지만, 엄밀히는 스케줄링에 따라 달라질 수 있다.</p>
+<p>정리하면 모니터 락을 기다리는 스레드에게는 두 가지 출구가 없다. 시간 제한이 없으므로 "1초만 기다려 보고 안 되면 포기한다"를 표현할 수 없고, 인터럽트로도 깨어나지 않으므로 바깥에서 기다림을 취소할 수 없다. 락을 쥔 스레드가 영원히 놓지 않으면(예를 들어 락을 쥔 채 응답 없는 외부 시스템을 기다리면) 기다리는 스레드도 영원히 기다린다. JLS 17.1은 자바 언어가 교착 상태(deadlock)를 막지도, 감지를 요구하지도 않는다고 명시한다. 이 한계는 다음 회차에서 <code>ReentrantLock</code>의 <code>tryLock</code>과 <code>lockInterruptibly</code>가 등장하는 이유가 된다.</p>
+
+<x-visual id="java-adv1-06-monitor-structure" title="모니터 락의 소유자와 진입을 기다리는 스레드들" kind="구조도" ratio="16:9">
+<x-hint>하나의 객체에 연결된 모니터가 소유 스레드 하나와 진입 대기 스레드들(BLOCKED)을 가진다는 것, 그리고 unlock 뒤 대기 스레드들이 다시 경쟁한다는 것을 보여 준다.</x-hint>
+<x-prompt>A structural diagram on a white background. On the left, a rounded rectangle labeled "Account 객체" with a small tag on its edge labeled "모니터". An arrow from that tag goes to a large central box labeled "모니터 락". Inside the central box: a single highlighted slot at the top labeled "소유자: t1" with a lock icon, and below it a counter labeled "재진입 횟수: 1". To the left of the central box, a queue of three small person-shaped thread icons labeled "t2", "t3", "t4" standing in a cluster (not a straight line) under the title "진입 대기 (BLOCKED)". A dashed arrow from the owner slot going out to the right labeled "unlock". A curved arrow from the waiting cluster back into the owner slot labeled "다시 경쟁". At the bottom, a small caption box labeled "순서 보장 없음". Flat style, muted blue and gray, Korean labels exactly as quoted.</x-prompt>
+<x-caption>모니터 락은 소유 스레드와 재진입 횟수를 가진다. 진입을 기다리는 스레드는 BLOCKED 상태로 잠들어 있다가, 락이 풀리면 다시 경쟁한다.</x-caption>
+</x-visual>
+
+<h3>synchronized 블록: 임계 영역만 잠근다</h3>
+<p>synchronized 메서드는 메서드 전체를 임계 영역으로 만든다. 하지만 앞에서 정한 출금의 임계 영역은 메서드 전체가 아니라 "검증에서 차감까지"였다. 메서드 앞뒤에 임계 영역과 무관한 일(로그, 요청 파싱, 결과 변환)이 길게 붙어 있다면, 그 시간 동안에도 다른 스레드가 기다려야 한다. 이럴 때 쓰는 것이 <b>synchronized 문(synchronized statement)</b>, 흔히 synchronized 블록이라 부르는 형태다. 잠글 객체를 괄호 안에 직접 지정하고, 중괄호 안의 코드만 임계 영역으로 만든다.</p>
+<pre><code class="language-java">public boolean withdraw(int amount) {
+    log("거래 시작: 출금액=" + amount);
+    synchronized (this) {
+        log("검증 시작: 출금액=" + amount + ", 잔액=" + balance);
+        if (balance < amount) {
+            log("검증 실패: 잔액 부족");
+            return false;
+        }
+        sleep(1000);
+        balance = balance - amount;
+        log("출금 완료: 출금액=" + amount + ", 잔액=" + balance);
+    }
+    log("거래 종료");
+    return true;
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">[t2] 거래 시작: 출금액=800
+[t1] 거래 시작: 출금액=800
+[t2] 검증 시작: 출금액=800, 잔액=1000
+[t2] 출금 완료: 출금액=800, 잔액=200
+[t2] 거래 종료
+[t1] 검증 시작: 출금액=800, 잔액=200
+[t1] 검증 실패: 잔액 부족
+최종 잔액: 200</code></pre>
+<p>"거래 시작" 로그는 두 스레드가 동시에 찍는다. 이 줄은 블록 밖에 있어 락 없이 실행되기 때문이다. 반면 "검증 시작"부터 "출금 완료"까지는 한 스레드씩 차례로 실행된다. 이번 실행에서는 t2가 먼저 락을 잡았다. 어느 쪽이 먼저인지는 실행마다 다르지만, 결과는 항상 출금 한 번 성공, 한 번 거절이다. 또 하나 눈여겨볼 곳은 <code>return false</code>다. 블록 한가운데에서 메서드를 빠져나가는데, 락은 어떻게 풀릴까. JLS 14.19는 synchronized 문의 실행 규칙을 이렇게 정한다.</p>
+<ol>
+<li>괄호 안의 식(Expression)을 먼저 평가한다. 식의 타입이 참조형이 아니면 컴파일 오류다.</li>
+<li>식의 평가가 갑자기 끝나면(예외), synchronized 문도 같은 이유로 갑자기 끝난다. 값이 <code>null</code>이면 <code>NullPointerException</code>이 던져진다.</li>
+<li>그렇지 않으면 그 값 V의 모니터를 잠그고 블록을 실행한다.</li>
+<li>블록이 정상적으로 끝나면 모니터를 풀고 정상 완료한다. 블록이 어떤 이유로든(<code>return</code>, <code>break</code>, 예외) 갑자기 끝나면 모니터를 풀고 같은 이유로 갑자기 완료한다.</li>
+</ol>
+<p>그러니 <code>return false</code>로 빠져나가도 락은 풀린다. 그런데 앞에서 synchronized 메서드의 락 해제는 JVM의 호출·반환 메커니즘이 책임진다고 했다. 블록은 누가 책임질까. 바이트코드를 보면 답이 나온다.</p>
+
+<h4>monitorenter, monitorexit, 그리고 예외 테이블</h4>
+<p>앞의 <code>Bc</code> 클래스에서 <code>syncBlock</code>의 바이트코드를 보자. 본문은 synchronized 메서드와 똑같이 <code>balance = balance - amount</code> 한 줄이다.</p>
+<pre data-label="javap -c -v -p 출력 중 syncBlock"><code class="language-text">  public void syncBlock(int);
+    descriptor: (I)V
+    flags: (0x0001) ACC_PUBLIC
+    Code:
+      stack=3, locals=4, args_size=2
+         0: aload_0
+         1: dup
+         2: astore_2
+         3: monitorenter
+         4: aload_0
+         5: aload_0
+         6: getfield      #7                  // Field balance:I
+         9: iload_1
+        10: isub
+        11: putfield      #7                  // Field balance:I
+        14: aload_2
+        15: monitorexit
+        16: goto          24
+        19: astore_3
+        20: aload_2
+        21: monitorexit
+        22: aload_3
+        23: athrow
+        24: return
+      Exception table:
+         from    to  target type
+             4    16    19   any
+            19    22    19   any</code></pre>
+<p>이번에는 메서드 플래그에 <code>ACC_SYNCHRONIZED</code>가 없고, 대신 본문에 <code>monitorenter</code>와 <code>monitorexit</code>가 나타난다. 한 줄씩 추적해 보자.</p>
+<ul>
+<li><b>0~3</b>: <code>aload_0</code>로 <code>this</code>를 스택에 올리고, <code>dup</code>로 복제해 하나는 지역 변수 2번에 저장한다(<code>astore_2</code>). 남은 하나로 <code>monitorenter</code>를 실행해 모니터를 잠근다. 잠근 객체를 지역 변수에 따로 보관하는 이유는, 블록 안에서 무슨 일이 일어나든 <b>잠근 바로 그 객체</b>로 풀어야 하기 때문이다. 괄호 안의 식이 필드 참조였고 블록 안에서 그 필드에 다른 객체가 대입되더라도, 해제는 처음 잠근 객체에 대해 일어난다.</li>
+<li><b>4~11</b>: 본문. synchronized가 없는 코드와 같은 <code>getfield</code>, <code>isub</code>, <code>putfield</code>다. 동기화가 바꾸는 것은 이 명령어들이 아니라, 이 명령어들을 다른 스레드와 겹쳐 실행할 수 없게 만드는 바깥 틀이다.</li>
+<li><b>14~16</b>: 정상 경로. 보관해 둔 객체를 꺼내 <code>monitorexit</code>로 풀고 24번 <code>return</code>으로 간다.</li>
+<li><b>19~23</b>: 예외 경로. 예외 테이블의 첫 줄은 "4번부터 16번 직전까지에서 어떤 예외(<code>any</code>)가 나든 19번으로 가라"는 뜻이다. 19번에서 예외 객체를 지역 변수 3번에 저장하고, 보관한 락 객체로 <code>monitorexit</code>를 실행한 다음 예외를 다시 던진다(<code>athrow</code>).</li>
+</ul>
+<p>예외 테이블의 둘째 줄(19~22에서 난 예외도 19번으로)은 예외 경로의 <code>monitorexit</code> 자체가 실패하는 경우까지 감싸는 것이다. JVMS 2.11.10은 synchronized 블록을 제대로 구현하려면 JVM을 대상으로 하는 컴파일러의 협력이 필요하다고 적는다. 그 협력의 내용이 바로 이것이다. 메서드 동기화는 JVM이 알아서 해제해 주지만, 블록 동기화는 <code>javac</code>가 모든 출구에 <code>monitorexit</code>를 직접 깔아 둔다. 같은 장은 "구조적 잠금(structured locking)"이라는 말로, 한 메서드 호출 동안 어떤 모니터에 대한 진입 횟수와 해제 횟수가 일치해야 한다는 규칙을 JVM이 강제해도 되지만 강제할 의무는 없다고 정한다. 자바 컴파일러가 만든 코드는 이 규칙을 항상 지킨다.</p>
+<p>출구가 여러 개면 <code>monitorexit</code>도 여러 개가 된다. 앞의 블록 버전 출금 메서드를 <code>javap</code>로 열면 <code>monitorexit</code>가 세 번 나온다. <code>return false</code> 직전, 블록의 정상 끝, 예외 경로다. 그리고 예외 테이블의 범위는 이 세 출구 사이의 모든 명령어를 덮는다.</p>
+<pre data-label="블록 버전 withdraw의 javap 출력에서 락 관련 명령어만 발췌"><code class="language-text">      12: monitorenter
+      41: monitorexit       ← return false 경로
+      42: ireturn
+      73: monitorexit       ← 블록의 정상 끝
+      74: goto          82
+      79: monitorexit       ← 예외 경로
+      81: athrow
+    Exception table:
+       from    to  target type
+          13    42    77   any
+          43    74    77   any
+          77    80    77   any</code></pre>
+<p>예외가 나도 락이 풀린다는 것을 실행으로도 확인해 두자. 블록 안에서 예외를 던지고 죽는 스레드 뒤에 main 스레드가 같은 락을 요청한다.</p>
+<pre><code class="language-java">public class ExceptionMain {
+    static final Object lock = new Object();
+
+    public static void main(String[] args) throws Exception {
+        Thread t = new Thread(() -> {
+            synchronized (lock) {
+                throw new IllegalStateException("임계 영역 안에서 예외");
+            }
+        }, "t");
+        t.start();
+        t.join();
+        synchronized (lock) {
+            System.out.println("main이 락을 얻었다");
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Exception in thread "t" java.lang.IllegalStateException: 임계 영역 안에서 예외
+	at ExceptionMain.lambda$main$0(ExceptionMain.java:7)
+	at java.base/java.lang.Thread.run(Thread.java:1583)
+main이 락을 얻었다</code></pre>
+<p>스레드 t는 예외로 죽었지만 락은 남기지 않았다. main은 기다림 없이 락을 얻는다. 이것은 다음 회차의 <code>Lock</code>과 대비되는 synchronized의 장점이다. <code>Lock.lock()</code>은 일반 메서드 호출이라 개발자가 <code>finally</code>에서 <code>unlock()</code>을 빠뜨리면 락이 영원히 잠긴 채 남는다. synchronized는 언어와 컴파일러가 해제를 보장하므로 이런 실수가 원천적으로 불가능하다.</p>
+<p>규칙의 나머지 두 줄(참조형이 아니면 컴파일 오류, <code>null</code>이면 예외)도 확인해 보자. <code>int</code> 필드를 괄호에 넣으면 <code>javac</code>는 다음 오류를 낸다. 박싱(boxing)으로 객체를 만들어 주지 않는다는 점이 중요하다.</p>
+<pre data-label="javac 오류"><code class="language-text">Bad.java:5: error: unexpected type
+        synchronized (n) { }
+        ^
+  required: reference
+  found:    int
+1 error</code></pre>
+<p><code>null</code>인 정적 필드를 잠그려 하면 실행 중에 다음 예외가 난다. JDK 21의 메시지는 어떤 식이 <code>null</code>이었는지까지 알려 준다.</p>
+<pre data-label="실행 결과"><code class="language-text">Exception in thread "main" java.lang.NullPointerException: Cannot enter synchronized block because "NullLock.lock" is null
+	at NullLock.main(NullLock.java:4)</code></pre>
+
+<h4>무엇을 락으로 쓸 것인가</h4>
+<p>블록은 잠글 객체를 마음대로 고를 수 있다는 점에서 메서드보다 유연하지만, 그만큼 잘못 고를 여지도 생긴다. 판단의 기준은 하나다. <b>같은 공유 자원을 보호하는 모든 코드는 같은 객체를 잠가야 한다.</b> 출금 예제에서 <code>synchronized (this)</code>를 쓴 이유는 <code>getBalance</code>가 synchronized 메서드, 즉 <code>this</code>의 모니터를 쓰기 때문이다. 블록에서 다른 객체를 잠그면 출금과 잔액 조회가 서로를 배제하지 못한다.</p>
+<p><code>this</code>를 잠그는 방식에는 약점이 하나 있다. 그 객체에 대한 참조를 가진 외부 코드도 같은 객체를 잠글 수 있다는 점이다. 누군가 계좌 객체를 받아 <code>synchronized (account) { ... }</code> 안에서 오래 걸리는 일을 하면, 그동안 계좌의 모든 synchronized 메서드가 멈춘다. 이를 막으려면 외부에 노출되지 않는 전용 락 객체를 둔다. <code>private final Object lock = new Object();</code>를 필드로 두고 모든 임계 영역에서 <code>synchronized (lock)</code>을 쓰는 방식이다. <code>final</code>로 선언하는 것은 락 필드에 다른 객체가 대입되어 스레드마다 다른 객체를 잠그는 사고를 막기 위해서다. 다만 이렇게 하면 메서드에 synchronized를 붙이는 방식과 섞어 쓸 수 없다는 점을 기억해야 한다. 메서드 수정자는 항상 <code>this</code>를 잠그기 때문이다.</p>
+<p>피해야 할 락 객체도 있다. 첫째는 <code>Integer</code>, <code>Long</code> 같은 박싱 클래스와 <code>LocalDate</code> 같은 값 기반 클래스(value-based class)의 인스턴스다. 이런 객체는 같은 값이면 같은 인스턴스가 재사용될 수 있어(예: <code>Integer.valueOf</code>의 캐시) 전혀 무관한 코드와 락을 공유하게 될 수 있다. JDK 21의 <code>javac</code>는 이런 코드에 대해 아무 옵션 없이도 경고를 낸다.</p>
+<pre data-label="javac 경고 (JDK 21, 옵션 없음)"><code class="language-text">Vb.java:4: warning: [synchronization] attempt to synchronize on an instance of a value-based class
+        synchronized (lock) { }
+        ^
+1 warning</code></pre>
+<p>둘째는 문자열 리터럴이다. 같은 내용의 문자열 리터럴은 서로 다른 클래스에 있어도 같은 <code>String</code> 인스턴스를 가리킨다. 실제로 클래스 A와 B에 각각 <code>static final String LOCK = "LOCK";</code>을 두고 두 참조를 <code>==</code>로 비교하면 <code>true</code>가 나온다. 각자 자기 락이라고 생각한 두 코드가 사실은 같은 모니터를 두고 경쟁하게 된다. 셋째는 <code>getClass()</code>의 결과처럼 하위 클래스에서 다른 객체가 될 수 있는 식이다. 상속 구조에서 부모와 자식이 서로 다른 <code>Class</code> 객체를 잠가 배제가 깨진다. 정적 공유 자원을 보호할 때는 클래스 리터럴(<code>Account.class</code>)이나 정적 <code>final</code> 락 객체처럼 항상 같은 객체로 평가되는 식을 쓴다.</p>
+
+<h3>재진입: 같은 스레드는 다시 들어갈 수 있다</h3>
+<p>앞에서 JLS 17.1이 "스레드는 같은 모니터를 여러 번 잠글 수 있다"고 정한다고 했다. 이 규칙이 왜 필요한지는 synchronized 메서드가 같은 객체의 다른 synchronized 메서드를 호출하는 흔한 코드를 보면 알 수 있다.</p>
+<pre><code class="language-java">public class ReentrantMain {
+    private int balance = 1000;
+
+    public synchronized void transferOut(int amount) {
+        System.out.println("transferOut: holdsLock=" + Thread.holdsLock(this));
+        withdraw(amount);   // 같은 객체의 다른 synchronized 메서드
+    }
+
+    public synchronized void withdraw(int amount) {
+        System.out.println("withdraw: holdsLock=" + Thread.holdsLock(this));
+        balance -= amount;
+    }
+
+    public static void main(String[] args) {
+        ReentrantMain a = new ReentrantMain();
+        a.transferOut(300);
+        System.out.println("balance=" + a.balance + ", 끝난 뒤 holdsLock=" + Thread.holdsLock(a));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">transferOut: holdsLock=true
+withdraw: holdsLock=true
+balance=700, 끝난 뒤 holdsLock=false</code></pre>
+<p><code>transferOut</code>에 들어갈 때 main 스레드는 객체 a의 락을 얻었다. 그 안에서 <code>withdraw</code>를 호출하면 다시 a의 락을 요청한다. 만약 모니터 락이 "이미 잠겨 있으면 무조건 기다린다"는 규칙이었다면, main 스레드는 자기 자신이 쥔 락이 풀리기를 기다리며 영원히 멈췄을 것이다. 재진입 규칙 덕분에 락의 소유자가 자신이면 기다리지 않고 들어가며, 내부적으로는 잠근 횟수가 1에서 2로 늘어난다. <code>withdraw</code>가 끝나면 횟수가 1로, <code>transferOut</code>이 끝나면 0으로 줄고, 0이 되는 순간 락이 실제로 풀린다. 마지막 줄의 <code>holdsLock=false</code>가 그 결과다.</p>
+<p>JLS 14.19의 예제 14.19-1도 같은 객체에 대한 synchronized 블록을 두 겹으로 중첩한 프로그램이 정상적으로 출력한다는 것을 보이며, 한 스레드가 모니터를 두 번 이상 잠글 수 없었다면 이 프로그램은 교착 상태에 빠졌을 것이라고 덧붙인다. 재진입은 객체지향 코드에서 특히 중요하다. 부모 클래스의 synchronized 메서드를 자식 클래스가 재정의하고 그 안에서 <code>super.method()</code>를 부르는 것, synchronized 메서드가 헬퍼 메서드를 거쳐 다시 같은 객체의 synchronized 메서드에 닿는 것은 모두 같은 스레드가 같은 락을 다시 요청하는 일이다. 재진입은 synchronized만의 성질이 아니다. 다음 회차의 <code>ReentrantLock</code>은 이름부터 이 성질을 내세운다.</p>
+
+<h3>한 층 아래: HotSpot은 락을 어디에 기록하는가</h3>
+<p>지금까지는 JLS와 JVMS가 정한 규칙, 즉 "무엇이 보장되는가"를 보았다. 이제 HotSpot(OpenJDK 21)이 그 규칙을 "어떻게" 구현하는지 내려가 본다. 여기서부터는 명세가 아니라 구현이므로, JVM 구현이나 버전이 달라지면 바뀔 수 있는 내용이다. 출발점은 앞에서 던진 질문이다. 모든 객체가 락이 될 수 있다면, 락 상태는 어디에 적어 둘까.</p>
+<h4>객체 헤더의 마크 워드</h4>
+<p>HotSpot에서 힙의 모든 객체는 헤더(header)로 시작하고, 헤더의 첫 워드를 <b>마크 워드(mark word)</b>라고 부른다. OpenJDK 21 소스의 <code>markWord.hpp</code> 주석은 64비트 JVM에서 일반 객체의 마크 워드를 "사용하지 않는 25비트, 식별 해시코드 31비트, 사용하지 않는 1비트, GC 나이(age) 4비트, 사용하지 않는 1비트, 락 비트 2비트"로 그린다. 맨 아래 2비트가 락 상태를 나타내고, 상태에 따라 나머지 비트의 의미가 바뀐다.</p>
+<div class="table-wrap"><table><thead><tr><th>하위 2비트</th><th>상태</th><th>나머지 비트에 들어 있는 것 (markWord.hpp 주석 기준)</th></tr></thead><tbody>
+<tr><td><code>01</code></td><td>잠기지 않음(unlocked)</td><td>정상 헤더: 해시코드, GC 나이</td></tr>
+<tr><td><code>00</code></td><td>잠김(locked)</td><td>스택 잠금(stack-locking)을 쓰면 스레드 스택에 옮겨 둔 원래 헤더를 가리키는 포인터. 새 경량 잠금(fast-locking)을 쓰면 원래 헤더가 그대로 남는다</td></tr>
+<tr><td><code>10</code></td><td>모니터(monitor)</td><td>팽창된(inflated) 락. 원래 헤더는 다른 곳으로 옮겨지고, <code>ObjectMonitor</code>를 가리키는 포인터가 들어간다</td></tr>
+<tr><td><code>11</code></td><td>표시됨(marked)</td><td>GC가 객체를 표시하는 데 쓴다</td></tr>
+</tbody></table></div>
+<p>락을 잡는 방법이 여러 가지인 이유는 비용 때문이다. 대부분의 락은 경합 없이 잡히고 풀린다. 한 스레드만 쓰는 객체의 synchronized 메서드를 부르는 경우가 그렇다. 이런 경우에 무거운 자료 구조를 만들고 운영체제의 도움을 받는 것은 낭비다. 그래서 HotSpot은 경합이 없는 동안에는 마크 워드만으로 락을 표현하고, 경합이 생기면 그때 별도의 <code>ObjectMonitor</code> 객체를 만들어 마크 워드가 그것을 가리키게 한다. 이 전환을 <b>락 팽창(lock inflation)</b>이라고 한다.</p>
+<p>OpenJDK 21에는 경합이 없을 때 쓰는 방식이 두 가지 있고, 실험용(experimental) 옵션 <code>LockingMode</code>로 고른다. JDK 21의 <code>globals.hpp</code>에 적힌 설명은 0이 모니터만 쓰는 방식(<code>LM_MONITOR</code>), 1이 모니터와 기존 스택 잠금(<code>LM_LEGACY</code>, 기본값), 2가 모니터와 새 경량 잠금(<code>LM_LIGHTWEIGHT</code>)이다. 이 원고의 실험 환경에서 <code>java -XX:+UnlockExperimentalVMOptions -XX:+PrintFlagsFinal -version</code>으로 확인한 값도 <code>LockingMode = 1</code>이었다. 아래 설명은 JDK 21의 기본값인 스택 잠금을 기준으로 한다.</p>
+<h4>스택 잠금과 재진입의 기록</h4>
+<p>OpenJDK 21의 <code>synchronizer.cpp</code>에 있는 <code>ObjectSynchronizer::enter</code>는 런타임이 락을 얻는 경로를 보여 준다. 스택 잠금 모드(<code>LM_LEGACY</code>)에서 이 함수가 하는 일은 다음과 같다.</p>
+<figure class="flow-figure"><figcaption>OpenJDK 21 LM_LEGACY 모드에서 모니터 진입 경로</figcaption><ol class="flow">
+<li><strong>마크 워드 확인</strong><span>객체의 마크 워드가 잠기지 않은 정상 상태(하위 비트 01)인지 본다.</span></li>
+<li><strong>헤더 옮겨 두기</strong><span>정상 상태라면 원래 마크 워드를 현재 스레드 스택 프레임에 있는 잠금 기록(<code>BasicLock</code>)에 복사해 둔다(displaced header).</span></li>
+<li><strong>CAS로 소유 표시</strong><span>마크 워드를 "그 잠금 기록을 가리키는 포인터"로 바꾸는 비교 후 교환(CAS)을 시도한다. 성공하면 락을 얻은 것이다. 포인터의 하위 2비트가 00이므로 객체는 잠김 상태가 된다.</span></li>
+<li><strong>재진입 판정</strong><span>마크 워드가 이미 잠금 기록 포인터이고 그 기록이 현재 스레드의 스택에 있으면 재진입이다. 새 잠금 기록의 옮겨 둔 헤더 칸을 0(null)으로 두는 것으로 "재진입한 기록"을 표시하고 바로 돌아간다.</span></li>
+<li><strong>팽창</strong><span>그 밖의 경우(CAS 실패, 다른 스레드가 잠근 상태)에는 <code>inflate</code>로 <code>ObjectMonitor</code>를 얻고 <code>ObjectMonitor::enter</code>로 넘어간다.</span></li>
+</ol></figure>
+<p>앞에서 "재진입하면 횟수가 늘어난다"고 했는데, 스택 잠금 상태에서는 그 횟수가 숫자로 따로 저장되지 않는다. 대신 스택에 쌓인 잠금 기록들이 횟수 역할을 한다. 첫 진입의 기록에는 원래 헤더가, 재진입한 기록에는 0이 들어 있다. 프레임이 끝나며 해제할 때 0이 든 기록은 아무것도 하지 않고, 원래 헤더가 든 기록이 그 헤더를 객체에 되돌려 놓으며 락이 풀린다. 팽창된 뒤에는 <code>ObjectMonitor</code>의 재진입 횟수 필드(<code>_recursions</code>, 소스 주석으로는 첫 진입이면 0인 재귀 횟수)가 이 역할을 맡는다.</p>
+<p>팽창이 실제로 경합 때 일어나는지는 HotSpot의 통합 로깅으로 볼 수 있다. 앞의 덤프 실험 프로그램(5초 쉬는 synchronized 출금을 두 스레드가 호출)을 <code>-Xlog:monitorinflation=trace</code>로 실행하고 팽창 기록만 골라내면 다음 줄이 보인다(시간과 주소는 실행마다 다르고, JDK 내부 객체의 줄은 생략했다).</p>
+<pre data-label="java -Xlog:monitorinflation=trace 출력 발췌"><code class="language-text">[0.134s][trace][monitorinflation] inflate(has_locker): object=0x0000007010614d20, mark=0x000000781ccacc42, type='DumpMain$Account'</code></pre>
+<p>계좌 객체(<code>DumpMain$Account</code>)가 프로그램 시작 직후 t2가 락을 요청한 시점에 팽창되었다. <code>has_locker</code>는 팽창 직전에 이 객체가 스택 잠금 상태였다는 뜻이다. t1이 경합 없이 스택 잠금으로 락을 잡아 두었고, t2가 도착해 이미 잠긴 것을 보고 팽창시킨 것이다. 반면 같은 옵션으로 앞의 재진입 예제(<code>ReentrantMain</code>)를 실행하면 <code>ReentrantMain</code> 객체에 대한 팽창 기록은 나오지 않는다. 스레드 하나가 재진입까지 했지만 경합이 없었으므로 끝까지 스택 잠금만으로 처리된 것이다. 참고로 덤프 실험의 로그에는 <code>java.lang.Thread</code> 객체의 팽창도 찍히는데, JDK 21의 <code>Thread.join</code>이 플랫폼 스레드에 대해 <code>synchronized (this)</code> 안에서 <code>wait</code>를 쓰기 때문이다.</p>
+<h4>ObjectMonitor: 소유자, 진입 대기열, 대기 집합</h4>
+<p>팽창된 락의 실체인 <code>ObjectMonitor</code>는 C++ 객체다. OpenJDK 21의 <code>objectMonitor.hpp</code>에서 이 회차와 관련된 필드와 그 소스 주석은 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>필드</th><th>소스 주석의 뜻</th><th>이 회차와의 연결</th></tr></thead><tbody>
+<tr><td><code>_header</code></td><td>옮겨 둔 객체 헤더(마크 워드)</td><td>마크 워드 자리를 모니터 포인터가 차지했으므로 원래 해시코드·나이를 여기 보관한다</td></tr>
+<tr><td><code>_owner</code></td><td>소유 스레드, 또는 BasicLock을 가리키는 포인터</td><td>지금 락을 가진 스레드. <code>Thread.holdsLock</code>과 덤프의 <code>locked</code>가 보는 정보</td></tr>
+<tr><td><code>_recursions</code></td><td>재귀(재진입) 횟수, 첫 진입이면 0</td><td>재진입 카운트</td></tr>
+<tr><td><code>_cxq</code></td><td>진입하려다 블록된, 최근 도착한 스레드들의 연결 리스트</td><td>BLOCKED 스레드가 먼저 들어가는 곳</td></tr>
+<tr><td><code>_EntryList</code></td><td>진입 또는 재진입하려다 블록된 스레드들</td><td>BLOCKED 스레드의 대기열</td></tr>
+<tr><td><code>_WaitSet</code></td><td><code>wait()</code> 중인 스레드들의 연결 리스트</td><td>8회차의 <code>wait</code>/<code>notify</code>가 쓰는 대기 집합</td></tr>
+</tbody></table></div>
+<p><code>objectMonitor.cpp</code> 앞부분의 "동작 원리(Theory of operations)" 주석은 이 필드들이 어떻게 쓰이는지 설명한다. 스레드는 <code>_owner</code> 필드를 CAS로 null에서 자기 자신으로 바꾸는 데 성공하면 모니터를 소유한다. 경쟁하는 스레드는 CAS로 자신을 <code>_cxq</code>에 넣은 뒤 스핀하거나 파킹(park)한다. 실제 진입 코드도 대기열에 들어가기 전에 <code>TrySpin</code>으로 잠깐 돌며 락이 곧 풀리기를 기대해 본다. 파킹은 운영체제 수준에서 스레드를 재우는 것이고, 앞의 덤프에서 BLOCKED 스레드가 CPU를 거의 쓰지 않은 이유가 이것이다. 한 스레드는 어느 순간에도 <code>_cxq</code>, <code>_EntryList</code>, <code>_WaitSet</code> 중 최대 하나에만 들어 있다.</p>
+<p>락을 놓는 쪽의 동작이 공정성과 직결된다. 같은 주석에 따르면 락을 놓는 스레드는 <code>_EntryList</code>에서 "추정 후계자(heir presumptive)" 하나를 골라 깨우지만, 소유권을 그 스레드에게 넘겨주지는 않는다. 소유권을 놓고 후계자를 깨울 뿐이며, 깨어난 스레드는 다시 경쟁해서 락을 얻거나 못 얻으면 다시 잠든다. 주석은 이것을 경쟁적 인계(competitive handoff)라고 부른다. 깨어난 후계자가 CAS를 시도하기 전에 막 도착한 다른 스레드가 먼저 <code>_owner</code>를 차지할 수 있다는 뜻이다. JLS도 모니터를 기다리는 스레드들이 어떤 순서로 락을 얻는지 정하지 않는다. 그러니 synchronized는 오래 기다린 스레드가 먼저 들어간다는 보장, 즉 공정성(fairness)을 주지 않는다. 운이 나쁜 스레드가 계속 밀리는 기아(starvation)도 이론적으로 가능하다.</p>
+
+<x-visual id="java-adv1-06-markword-states" title="HotSpot에서 객체 마크 워드의 락 상태 전이" kind="상태 전이도" ratio="16:9">
+<x-hint>마크 워드의 하위 2비트가 잠기지 않음(01)에서 스택 잠금(00)으로, 경합이 생기면 모니터(10)로 바뀌는 흐름과 각 상태에서 마크 워드가 가리키는 대상을 보여 준다.</x-hint>
+<x-prompt>A state transition diagram on a white background with three large rounded state boxes arranged left to right. Box 1 labeled "잠기지 않음 01" contains a small bit-field strip "해시 | 나이 | 01". Box 2 labeled "스택 잠금 00" has an arrow pointing down from it to a small stack-frame rectangle labeled "스레드 스택의 BasicLock". Box 3 labeled "모니터 10" has an arrow pointing down to a larger rectangle labeled "ObjectMonitor" with three small rows inside labeled "_owner", "_EntryList", "_WaitSet". Transition arrows: from box 1 to box 2 labeled "CAS 성공"; from box 2 back to box 1 labeled "unlock"; from box 2 to box 3 labeled "경합 발생 → 팽창". Above everything, a title strip "OpenJDK 21 LM_LEGACY". Clean flat vector style, neutral colors with one accent for the transition arrows, Korean labels exactly as quoted.</x-prompt>
+<x-caption>OpenJDK 21의 기본 잠금 방식에서 경합이 없으면 마크 워드와 스택의 잠금 기록만으로 락을 표현하고, 경합이 생기면 ObjectMonitor로 팽창한다.</x-caption>
+</x-visual>
+
+<h4>사라진 최적화: 편향 잠금</h4>
+<p>오래된 자료에서 synchronized의 구현을 설명할 때 자주 나오는 <b>편향 잠금(biased locking)</b>은 지금의 JDK에서는 찾을 수 없다. JEP 374에 따르면 편향 잠금은 경합 없는 락에서 CAS조차 피하려는 최적화로, 객체의 모니터를 처음 잠근 스레드 쪽으로 "편향"시켜 이후 같은 스레드의 잠금에서 원자적 명령어를 쓰지 않게 하는 기법이었다. JEP 374는 JDK 15에서 편향 잠금을 기본으로 끄고 관련 옵션을 모두 폐기 예정(deprecated)으로 만들었다. JEP는 그 이유로, 이득을 보던 것이 주로 모든 접근에 동기화를 거는 <code>Hashtable</code>, <code>Vector</code> 같은 초기 컬렉션 API를 쓰는 오래된 애플리케이션이며, 지금은 과거만큼 이득이 뚜렷하지 않고 유지 비용이 크다는 점을 든다. JDK 21에서는 옵션 자체가 없다. 이 원고의 실험 환경에서 <code>java -XX:+UseBiasedLocking -version</code>을 실행하면 <code>Unrecognized VM option 'UseBiasedLocking'</code>을 출력하고 JVM이 시작되지 않는다. 따라서 "synchronized는 편향 잠금, 경량 잠금, 중량 잠금의 세 단계를 거친다"는 설명은 JDK 21 기준으로는 맞지 않는다.</p>
+
+<h3>BLOCKED의 실체: 스레드는 운영체제에서 어떻게 잠들고 깨어나는가</h3>
+<p>앞에서 BLOCKED 스레드가 CPU를 거의 쓰지 않는다는 것과 인터럽트로 깨어나지 않는다는 것을 덤프와 실험으로 확인했고, <code>ObjectMonitor</code>가 경쟁하는 스레드를 "파킹(park)"한다고만 적었다. 이 절에서는 그 파킹이 실제로 어떤 함수를 거쳐 어떤 시스템 콜에 닿는지 따라간다. 출발점은 실행 중인 JVM의 네이티브 호출 스택이다. macOS에는 실행 중인 프로세스의 모든 스레드 스택을 짧은 시간 동안 표본 추출해 보여 주는 <code>sample</code> 명령이 있다. holder 스레드가 락을 쥔 채 8초를 쉬는 동안 waiter 스레드가 같은 락을 요청하게 하고, waiter가 BLOCKED인 동안 <code>sample <pid> 1</code>을 실행했다. 아래는 waiter 스레드의 스택이다(OpenJDK 21 HotSpot, macOS arm64인 이 실험 환경 기준. 표본 수와 주소는 지우고 중간 프레임 몇 개를 줄였다).</p>
+<pre data-label="sample 출력 중 waiter 스레드 (발췌, 위가 바깥쪽 호출)"><code class="language-text">Thread_70818606: Java: waiter
++ thread_start  (in libsystem_pthread.dylib)
++   _pthread_start  (in libsystem_pthread.dylib)
++     thread_native_entry(Thread*)  (in libjvm.dylib)
++       ...  (Thread::call_run, JavaThread::thread_main_inner, JavaCalls::call_helper)
++         ???  (in <unknown binary>)        ← 이런 프레임이 다섯 개
++           InterpreterRuntime::monitorenter(JavaThread*, BasicObjectLock*)  (in libjvm.dylib)
++             ObjectSynchronizer::enter(Handle, BasicLock*, JavaThread*)  (in libjvm.dylib)
++               ObjectMonitor::enter(JavaThread*)  (in libjvm.dylib)
++                 ObjectMonitor::EnterI(JavaThread*)  (in libjvm.dylib)
++                   PlatformEvent::park_nanos(long)  (in libjvm.dylib)
++                     _pthread_cond_wait  (in libsystem_pthread.dylib)
++                       __psynch_cvwait  (in libsystem_kernel.dylib)</code></pre>
+<p>위에서 아래로 읽으면 스레드 하나의 일생이 보인다. pthread 라이브러리가 만든 운영체제 스레드가 JVM의 스레드 진입 함수를 거쳐 자바 코드를 실행한다. <code>???</code>로 찍힌 프레임은 어느 라이브러리 파일에도 속하지 않는 코드, 즉 JVM이 실행 중에 메모리에 만들어 낸 호출 스텁과 템플릿 인터프리터다. 람다 본문은 아직 JIT 컴파일되지 않아 인터프리터가 바이트코드를 하나씩 실행하고 있었고, <code>monitorenter</code>를 만나자 런타임 함수 <code>InterpreterRuntime::monitorenter</code>를 불렀다. 두 번째 인자 <code>BasicObjectLock*</code>은 인터프리터 프레임 안에 마련한 잠금 기록이다. 앞의 흐름도에서 본 <code>ObjectSynchronizer::enter</code>가 그 기록으로 스택 잠금을 시도했다가 실패하고(holder가 이미 잠갔다), 모니터를 얻어 <code>ObjectMonitor::enter</code>로 넘어갔다. 맨 아래의 <code>__psynch_cvwait</code>는 macOS 커널로 들어가는 시스템 콜 진입점이다. BLOCKED 스레드는 결국 커널 안에서 pthread 조건 변수(condition variable)를 기다리며 잠들어 있다. 운영체제 스케줄러가 보기에 이 스레드는 실행할 수 없는 상태이므로 CPU 시간을 받지 않는다. 덤프의 <code>cpu=0.23ms</code>가 거의 늘지 않던 이유다.</p>
+
+<h4>ObjectMonitor::enter와 EnterI가 하는 일</h4>
+<p>커널에 닿기까지 HotSpot은 잠들지 않으려고 여러 번 시도한다. OpenJDK 21의 <code>objectMonitor.cpp</code>에서 <code>ObjectMonitor::enter</code>는 가장 흔한 경우부터 차례로 검사한다. <code>_owner</code>를 CAS로 null에서 자기 자신으로 바꾸는 데 성공하면 바로 돌아간다. 이미 자신이 소유자면 <code>_recursions</code>를 1 늘리고 돌아간다. 소유자 칸에 자기 스택의 <code>BasicLock</code> 주소가 들어 있으면(스택 잠금 상태에서 팽창된 경우) 그것을 스레드 포인터로 바꾸고 재진입 횟수를 1로 둔다. 여기까지 해당하지 않으면 소스 주석이 말하는 "진짜 경합(genuine contention)"이다. 그래도 바로 잠들지 않고 <code>TrySpin</code>으로 한 차례 돌아 본다. 스핀은 모니터마다 둔 <code>_SpinDuration</code> 값만큼 돌며, 스핀으로 락을 얻으면 그 값을 늘리고 실패하면 줄이는 적응형(adaptive) 방식이다. 같은 파일의 초기화 코드는 프로세서가 하나뿐인 기계(<code>os::is_MP()</code>가 거짓)에서는 스핀 한도를 0으로 만든다. 소유자가 같은 CPU를 내놓기 전에는 락이 풀릴 수 없으니 도는 것이 순수한 낭비이기 때문이다.</p>
+<p>스핀까지 실패해야 비로소 스레드 상태가 바뀐다. <code>enter</code>는 <code>JavaThreadBlockedOnMonitorEnterState</code>라는 객체를 만들어 스레드 상태를 "모니터 진입을 기다리며 블록됨"으로 바꾸고, 기다리는 모니터를 스레드의 <code>current_pending_monitor</code>에 기록한다. <code>Thread.getState()</code>가 <code>BLOCKED</code>를 돌려주는 것은 이 시점부터다. 거꾸로 말하면 처음의 스핀으로 락을 얻은 스레드는 BLOCKED를 한 번도 거치지 않는다. 소스 주석도 초기 스핀으로 모니터를 얻으면 JVMTI 이벤트를 보내지 않는다고 적고 있고, JFR의 <code>jdk.JavaMonitorEnter</code> 이벤트 객체도 이 스핀 뒤에야 만들어진다. 따라서 짧게 끝나는 경합은 스레드 덤프에도 JFR 기록에도 잘 남지 않는다. 그다음 <code>EnterI</code>가 대기열에 들어가 잠드는 일을 맡는다.</p>
+<figure class="flow-figure"><figcaption>OpenJDK 21 ObjectMonitor::EnterI의 진행</figcaption><ol class="flow">
+<li><strong>한 번 더 시도</strong><span><code>TryLock</code>으로 <code>_owner</code>가 비었는지 다시 보고, 실패하면 <code>TrySpin</code>을 한 번 더 돈다.</span></li>
+<li><strong>cxq 맨 앞에 끼우기</strong><span>자기 스택에 <code>ObjectWaiter</code> 노드를 만들고 CAS로 <code>_cxq</code> 리스트의 맨 앞에 넣는다. CAS가 경쟁으로 실패할 때마다 락을 한 번 더 시도한다.</span></li>
+<li><strong>책임 스레드 정하기</strong><span>대기열이 비어 있던 상태에서 들어온 첫 스레드는 <code>_Responsible</code>이 된다. 이 스레드는 시간 제한이 있는 park를 쓴다.</span></li>
+<li><strong>잠들기와 깨어나기 반복</strong><span><code>TryLock</code> → park → 깨어나면 <code>TryLock</code> → 실패하면 헛깨어남(futile wakeup) 카운터를 1 늘리고 스핀 → 다시 park. 락을 얻을 때까지 이 고리를 돈다.</span></li>
+<li><strong>대기열에서 빠지기</strong><span>락을 얻으면 <code>UnlinkAfterAcquire</code>로 자기 노드를 <code>_cxq</code>나 <code>_EntryList</code>에서 떼어 낸다.</span></li>
+</ol></figure>
+<p>3단계의 책임 스레드(Responsible)가 왜 필요한지도 소스 주석에 설명되어 있다. 락을 놓는 쪽은 대기열이 비어 보이면 아무도 깨우지 않고 끝나는 빠른 경로를 탄다. 그런데 어떤 스레드가 대기열에 들어가는 순간과 소유자가 그 빠른 경로로 락을 놓는 순간이 엇갈리면, 락은 비어 있는데 모든 대기 스레드가 잠든 채 남는 "좌초(stranding)"가 생길 수 있다. 이를 복구하려고 대기 스레드 중 하나가 주기적으로 깨어나 <code>_owner</code>를 확인한다. 그 주기 <code>recheckInterval</code>은 1밀리초에서 시작해 깨어날 때마다 8배로 늘고, <code>MAX_RECHECK_INTERVAL</code>인 1000밀리초에서 멈춘다. 앞의 <code>sample</code> 출력에서 waiter가 기한 없는 <code>park()</code>가 아니라 <code>park_nanos(long)</code> 안에 있었던 이유가 이것이다. waiter는 혼자 기다렸으므로 책임 스레드였다. 대기 스레드를 둘로 늘려 다시 찍으면 차이가 드러난다.</p>
+<pre data-label="대기 스레드 두 개를 sample로 찍은 결과 (관련 프레임만)"><code class="language-text">== waiter-1 (먼저 도착)
+InterpreterRuntime::monitorenter(JavaThread*, BasicObjectLock*)
+ObjectMonitor::EnterI(JavaThread*)
+PlatformEvent::park_nanos(long)
+_pthread_cond_wait
+__psynch_cvwait
+== waiter-2 (0.1초 뒤 도착)
+InterpreterRuntime::monitorenter(JavaThread*, BasicObjectLock*)
+ObjectMonitor::EnterI(JavaThread*)
+PlatformEvent::park()
+_pthread_cond_wait
+__psynch_cvwait</code></pre>
+
+<h4>PlatformEvent: park와 unpark의 바닥</h4>
+<p>HotSpot의 스레드는 저마다 <code>ParkEvent</code>를 하나씩 가진다. <code>thread.hpp</code>의 필드 주석은 이것이 객체 모니터와 JVMTI raw 모니터 등에 쓰인다고 적는다. POSIX 계열(macOS, Linux)에서 그 바닥은 <code>os_posix.cpp</code>의 <code>PlatformEvent</code>이고, 정수 하나(<code>_event</code>)와 pthread 뮤텍스·조건 변수 한 쌍으로 이루어진다. <code>park()</code>는 <code>_event</code>를 원자적으로 1 줄인다. 원래 값이 1이었다면(이미 누가 unpark해 두었다면) 잠들지 않고 바로 돌아간다. 0이었다면 -1이 되며, 뮤텍스를 잡고 <code>_event</code>가 음수인 동안 <code>pthread_cond_wait</code>를 반복한다. 시간 제한이 있는 <code>park_nanos</code>는 같은 고리에서 <code>pthread_cond_timedwait</code>를 쓰고, 시간이 다 되면 고리를 빠져나온다(앞의 <code>sample</code> 출력에서는 두 경우 모두 그 아래에 <code>_pthread_cond_wait</code>가 찍혔다). <code>unpark()</code>는 <code>_event</code>를 원자적 교환으로 1로 만들고, 원래 값이 -1(누군가 잠들었거나 잠들려는 중)일 때만 뮤텍스를 잡아 실제로 잠든 스레드 수(<code>_nParked</code>)를 확인한 뒤, 뮤텍스를 놓고 나서 <code>pthread_cond_signal</code>을 보낸다. 원래 값이 0이나 1이면 시스템 콜 없이 정수 하나만 바꾸고 끝나는 구조다. 소스 주석은 운영체제 수준의 가짜 깨어남(spurious wakeup)을 무시하려고 조건을 다시 검사한다고 밝힌다.</p>
+<pre class="diagram">  park() 하는 쪽 (BLOCKED가 될 스레드)              unpark() 하는 쪽 (락을 놓는 스레드)
+  ───────────────────────────────────              ─────────────────────────────────
+  _event: 0 → -1 (원자적 감소)
+  pthread_mutex_lock
+  while (_event < 0)
+      pthread_cond_wait  ──── 커널에서 잠듦 ────▶   _event: -1 → 1 (원자적 교환)
+        (macOS: __psynch_cvwait)                    old == -1 이므로
+                                                    pthread_cond_signal ──┐
+      ◀────────────────────── 깨어남 ─────────────────────────────────────┘
+  _event = 0, pthread_mutex_unlock
+  → EnterI로 돌아가 TryLock. 실패하면 다시 park()</pre>
+<p>이 실험은 macOS에서 했으므로 커널 진입점이 <code>__psynch_cvwait</code>로 찍혔다. Linux는 이 원고에서 실행해 보지 않았지만, futex(7) 매뉴얼은 리눅스 커널이 제공하는 futex가 뮤텍스와 조건 변수 같은 고수준 잠금의 재료이며, 대부분의 프로그램은 futex를 직접 쓰지 않고 그 위에 만들어진 NPTL(리눅스의 pthread 구현) 같은 시스템 라이브러리를 쓴다고 설명한다. 같은 매뉴얼은 경합이 없는 경우 futex 연산이 전부 사용자 공간에서 끝나고 커널은 경합이 있을 때만 개입한다고 적는다. HotSpot 쪽 코드(<code>PlatformEvent</code>)는 두 운영체제에서 같고, 그 아래의 pthread 구현이 각자의 커널 기능을 쓰는 구조다.</p>
+
+<h4>인터럽트가 BLOCKED를 깨우지 못하는 이유, 코드로 보기</h4>
+<p>앞의 <code>BlockedMain</code> 실험에서 인터럽트는 BLOCKED 스레드를 깨우지 못했다. 그런데 정확히 말하면 스레드는 잠깐 깨어난다. OpenJDK 21 <code>javaThread.cpp</code>의 <code>JavaThread::interrupt</code>는 대상 스레드의 이벤트 세 개를 모두 unpark한다. <code>Thread.sleep</code>용 <code>_SleepEvent</code>, <code>LockSupport.park</code>용 <code>parker()</code>, 그리고 주석에 "ObjectMonitor와 JvmtiRawMonitor용"이라고 적힌 <code>_ParkEvent</code>다. 그래서 모니터를 기다리던 스레드도 park에서 돌아온다. 하지만 위의 <code>EnterI</code> 고리는 깨어난 뒤 <code>TryLock</code>만 해 볼 뿐 인터럽트 상태를 전혀 검사하지 않는다. 락이 여전히 잡혀 있으니 헛깨어남 카운터를 1 늘리고 다시 잠든다. "인터럽트에 반응하지 않는다"는 동작은 이렇게 구현되어 있다.</p>
+<p>이 카운터는 HotSpot 성능 카운터 <code>sun.rt._sync_FutileWakeups</code>로 공개되어 있어 <code>jcmd <pid> PerfCounter.print</code>로 읽을 수 있다. holder가 락을 9초 쥐고, 0.1초 뒤 도착한 waiter가 혼자 기다리는 프로그램에서, 시작 약 4.1초 뒤에 카운터를 읽고 waiter를 20밀리초 간격으로 다섯 번 인터럽트한 뒤 다시 읽었다. 같은 프로그램을 세 번 실행했고 세 번 모두 값이 같았다.</p>
+<pre data-label="실행 결과 (uptime은 실행마다 조금씩 다르다)"><code class="language-text">uptime≈4156ms sun.rt._sync_FutileWakeups=7
+uptime≈4422ms sun.rt._sync_FutileWakeups=12</code></pre>
+<p>첫 번째 값 7은 책임 스레드의 시간 제한 park로 설명된다. waiter가 대기열에 들어간 뒤 1, 8, 64, 512, 1000, 1000, 1000밀리초 간격으로 깨어났다면 깨어난 시각은 약 1, 9, 73, 585, 1585, 2585, 3585밀리초다. 4초쯤 지난 시점까지 일곱 번이고, 매번 락은 여전히 holder에게 있었으니 모두 헛깨어남이다. 두 번째 값은 정확히 5가 늘었다. 인터럽트 다섯 번이 <code>_ParkEvent</code>를 다섯 번 unpark했고, waiter는 다섯 번 깨어나 락을 확인하고 다섯 번 다시 잠들었다. 인터럽트 다섯 번을 보낸 0.3초 남짓한 구간에서 늘어난 값이 인터럽트 횟수와 정확히 같다.</p>
+
+<h4>깨우는 쪽: exit와 대기열의 순서</h4>
+<p>락을 놓는 <code>ObjectMonitor::exit</code>도 같은 파일에 있다. 재진입 횟수가 남아 있으면 1 줄이고 끝난다. 0이면 해제 의미(release)를 가진 저장으로 <code>_owner</code>를 비우고, 메모리 장벽(storeload) 뒤에 대기열을 본다. <code>_cxq</code>와 <code>_EntryList</code>가 모두 비었거나, 이미 깨어 있는 후계자(<code>_succ</code>, 예를 들어 스핀 중인 스레드)가 있으면 아무도 깨우지 않고 돌아간다. 깨워야 할 때는 락을 다시 잡은 뒤 <code>_EntryList</code>의 맨 앞 스레드를 고른다. <code>_EntryList</code>가 비어 있으면 <code>_cxq</code>를 통째로 떼어 와 <code>_EntryList</code>로 옮기는데, 이때 리스트의 순서를 뒤집지 않고 단방향 리스트를 양방향 리스트로 바꾸기만 한다. 그리고 <code>ExitEpilog</code>에서 그 스레드를 <code>_succ</code>로 표시하고, <code>_owner</code>를 비운 다음 그 스레드의 <code>ParkEvent</code>를 unpark한다.</p>
+<p>여기서 순서에 관한 결론이 하나 나온다. <code>_cxq</code>는 새로 온 스레드를 맨 앞에 끼우는 리스트(LIFO)이고, 옮길 때 순서를 유지하므로 <code>_EntryList</code>의 맨 앞에는 가장 늦게 도착한 스레드가 온다. 실제로 그런지 확인해 보았다. holder가 락을 1초 쥐는 동안 w1, w2, w3, w4가 0.1초 간격으로 차례로 도착해 BLOCKED가 되고, 각자 락을 얻으면 이름을 찍고 10밀리초 뒤에 놓는다. 다섯 번 실행한 결과가 모두 같았다.</p>
+<pre data-label="실행 결과 (5회 모두 같음)"><code class="language-text">w4 w3 w2 w1</code></pre>
+<p>도착한 순서와 정반대다. 이 결과를 synchronized의 규칙으로 받아들이면 안 된다. 스핀 중인 스레드나 막 도착한 스레드가 끼어들면 순서는 얼마든지 바뀌고, 이것은 OpenJDK 21 HotSpot의 현재 구현일 뿐 JLS는 어떤 순서도 약속하지 않는다. 이 실험이 보여 주는 것은 앞에서 말한 "공정성 없음"이 추상적인 가능성이 아니라는 점이다. 이 구현은 문맥 교환 횟수를 줄이는 것을 우선하며, 먼저 온 스레드를 먼저 들여보내는 장치는 이 경로에 없다.</p>
+<p>마지막으로, 스레드 덤프가 <code>locked</code>와 <code>waiting to lock</code>을 구분하는 방법도 이 구조 위에 있다. OpenJDK 21 <code>vframe.cpp</code>의 <code>print_lock_info_on</code>은 각 프레임에 기록된 잠금 기록 목록(인터프리터 프레임의 <code>BasicObjectLock</code>들, 컴파일된 프레임이면 디버그 정보)을 훑으며 객체마다 한 줄씩 찍는다. 그리고 맨 위 프레임의 첫 잠금 기록에 대해서만, 객체의 마크 워드가 모니터를 가리키고 그 모니터가 스레드의 <code>current_pending_monitor</code>와 같거나 스레드가 그 모니터의 소유자가 아니면 <code>locked</code> 대신 <code>waiting to lock</code>을 찍는다. 앞의 덤프에서 BLOCKED t2의 <code>withdraw</code> 프레임에 잠금 기록이 이미 있었던 것은, 스레드가 락을 얻기 전에 프레임에 잠금 기록 자리부터 마련하고 그 기록을 들고 <code>monitorenter</code> 런타임 함수로 들어가기 때문이다. 위 <code>sample</code> 출력의 <code>InterpreterRuntime::monitorenter(JavaThread*, BasicObjectLock*)</code>가 바로 그 모습이다.</p>
+
+<h3>팽창한 모니터는 언제 돌아오는가: 비동기 수축</h3>
+<p>경합 때문에 팽창한 락은 경합이 끝나면 어떻게 될까. 락이 풀리는 순간 마크 워드가 다시 "잠기지 않음"으로 돌아갈 것 같지만, OpenJDK 21에서는 그렇지 않다. 마크 워드는 락이 풀린 뒤에도 계속 <code>ObjectMonitor</code>를 가리키고, 이 연결을 끊고 원래 헤더를 되돌려 놓는 <b>수축(deflation)</b>은 <code>MonitorDeflationThread</code>라는 전용 JVM 스레드가 따로, 나중에 한다. 그동안 그 객체를 잠그는 스레드는 스택 잠금을 거치지 않고 바로 모니터 경로로 간다. <code>synchronizer.cpp</code>의 <code>ObjectSynchronizer::enter</code>는 마크 워드가 잠기지 않은 정상 상태일 때만 스택 잠금 CAS를 시도하고, 그 밖의 경우에는 <code>inflate</code>를 부르는데, <code>inflate</code>는 마크 워드가 이미 모니터를 가리키면 그 모니터를 그대로 돌려준다.</p>
+<p>수축 스레드가 언제 일하는지는 <code>monitorDeflationThread.cpp</code>와 <code>ObjectSynchronizer::is_async_deflation_needed</code>에 적혀 있다. 이 스레드는 <code>GuaranteedSafepointInterval</code>(1000), <code>AsyncDeflationInterval</code>(250), <code>GuaranteedAsyncDeflationInterval</code>(60000) 중 가장 작은 값, 즉 기본값으로는 250밀리초마다 깨어나 수축이 필요한지 검사한다(괄호 안은 이 실험 환경에서 <code>-XX:+UnlockDiagnosticVMOptions -XX:+PrintFlagsFinal</code>로 확인한 기본값이며 단위는 밀리초, 셋 다 진단용 옵션이다). 수축이 필요하다고 판단하는 경우는 세 가지다. 누군가 명시적으로 요청했을 때, 마지막 수축 뒤 <code>AsyncDeflationInterval</code>이 지났고 사용 중인 모니터 수가 상한(ceiling) 대비 <code>MonitorUsedDeflationThreshold</code>(90퍼센트)를 넘었을 때, 그리고 마지막 수축 뒤 <code>GuaranteedAsyncDeflationInterval</code>이 지났을 때다.</p>
+<p>모니터를 몇 개 쓰지 않는 작은 프로그램이라면 세 번째 조건만 걸린다는 뜻이다. 두 스레드가 계좌 객체를 놓고 0.3초 경합한 뒤 65초를 쉬는 프로그램을 <code>-Xlog:monitorinflation=trace:file=defl.log:uptime</code>으로 실행해 확인했다. 아래는 로그에서 계좌 객체와 관련된 줄과 수축 요약만 고른 것이다(주소는 실행마다 다르다).</p>
+<pre data-label="-Xlog:monitorinflation=trace 출력 발췌"><code class="language-text">[0.204s] inflate(has_locker): object=0x0000007010614ce0, mark=0x0000007af2cacd22, type='Defl$Account'
+[60.251s] Async deflation needed: guaranteed interval (60000 ms) is greater than time since last deflation (60243 ms)
+[60.252s] begin deflating: in_use_list stats: ceiling=11264, count=5, max=5
+[60.252s] deflate_monitor: object=0x0000007010614ce0, mark=0x0000007af2cacd22, type='Defl$Account'
+[60.252s] before handshaking: unlinked_count=4, in_use_list stats: ceiling=11264, count=1, max=5
+[60.252s] HandshakeForDeflation::do_thread: thread=0x0000000100c65120
+...        (JVM의 스레드마다 한 줄씩)
+[60.252s] deflated_count=4, {unlinked,deleted}_count=4 monitors in 0.0000562 secs
+[60.252s] end deflating: in_use_list stats: ceiling=11264, count=1, max=5</code></pre>
+<p>경합은 1초도 안 되어 끝났지만 계좌 객체의 모니터는 60초 동안 팽창한 채로 있었다. 이 실행에서 사용 중인 모니터는 5개, 상한은 11264개였으므로 사용률 조건은 걸리지 않았고, 60초 보장 주기가 지나서야 수축이 일어났다. 로그의 <code>mark=0x...cd22</code>도 눈여겨볼 만하다. 끝자리 16진수 2는 2진수로 <code>10</code>이니, 앞의 마크 워드 표에서 본 "모니터" 상태다. 하위 2비트를 떼어 낸 <code>0x...cd20</code>이 <code>ObjectMonitor</code>의 주소다. 같은 로그가 종료 직전에 찍은 사용 중 모니터 목록에서, 다른 객체(<code>mark=0x0000007af2cacb62</code>)의 모니터 주소가 <code>0x0000007af2cacb60</code>으로 찍힌 것으로 이 관계를 확인할 수 있다.</p>
+<p>수축은 Java 스레드를 멈추지 않고 진행되므로 경쟁을 조심스럽게 처리한다. <code>ObjectMonitor::deflate_monitor</code>는 먼저 모니터가 바쁜지(소유자, 대기 스레드, 경합 수, <code>_cxq</code>, <code>_EntryList</code>) 본다. 바쁘지 않으면 <code>_owner</code>를 CAS로 null에서 <code>DEFLATER_MARKER</code>라는 표지로 바꾸고, 경합 수(<code>_contentions</code>)를 CAS로 0에서 <code>INT_MIN</code>으로 바꾼다. 두 CAS가 모두 성공해야 원래 헤더를 객체에 되돌려 놓는다. 그 사이에 Java 스레드가 들어오면 앞의 <code>EnterI</code> 코드에 있던 <code>try_set_owner_from(DEFLATER_MARKER, current)</code>로 표지를 자기 자신으로 바꿔 수축을 취소하고 락을 차지한다. 헤더를 되돌린 뒤에도 모니터 메모리를 바로 해제하지 않고, 로그의 <code>HandshakeForDeflation</code> 줄처럼 모든 스레드와 핸드셰이크를 한 번 거친 뒤에 지운다. 소스 주석은 이 핸드셰이크가 이번 주기에 수축한 모니터를 안전하게 해제하기 위한 것이라고 적는다.</p>
+<aside class="note">이 사실은 진단할 때 쓰인다. 경합이 한 번이라도 있었던 객체는 그 뒤 한동안 팽창된 모니터로 남는다. 그래서 <code>-Xlog:monitorinflation</code> 로그의 <code>in_use_list</code> 수치처럼 "사용 중인 모니터 수"를 볼 때는, 그 수가 지금 경합 중인 락의 수가 아니라 아직 수축되지 않은 모니터의 수라는 점을 감안해야 한다.</aside>
+
+<h3>JIT 컴파일러가 지우는 락: 탈출 분석과 락 생략</h3>
+<p>지금까지 본 비용(스택 잠금 CAS, 팽창, park)은 모두 락 연산이 실제로 실행될 때의 이야기다. HotSpot의 C2 컴파일러는 한 걸음 더 나아가, 필요 없다고 증명할 수 있는 락 연산을 컴파일된 코드에서 아예 없앤다. 근거는 JLS 17.4.4의 정의에서 따라 나온다. 모니터 규칙이 만드는 synchronizes-with 관계는 모니터 m의 unlock과 그 뒤에 일어나는 같은 m의 lock 사이에만 생긴다. 어떤 객체가 그것을 만든 스레드 밖으로 한 번도 나가지 않는다면, 다른 스레드는 그 객체의 모니터를 잠글 수 없다. 그 락은 상호 배제할 상대도 없고, 다른 스레드와 이어지는 happens-before 관계도 만들지 못한다. 그런 락을 지워도 프로그램이 보일 수 있는 결과는 달라지지 않는다.</p>
+<p>객체가 스레드 밖으로 나가는지 판정하는 분석을 <b>탈출 분석(escape analysis)</b>이라고 한다. OpenJDK 21의 C2에서는 <code>escape.cpp</code>의 <code>ConnectionGraph</code>가 이 분석을 하고, <code>callnode.cpp</code>의 <code>LockNode::Ideal</code>이 그 결과를 쓴다. 해당 코드의 주석은 탈출하지 않은 객체를 잠그는 경우 lock/unlock이 불필요하다고 적고, 그런 락 노드에 "NonEscObj" 표시를 붙인다. 표시가 붙은 노드는 나중에 기계어로 펼쳐지지 않는다(<code>macro.cpp</code>의 <code>eliminate_locking_node</code>). 같은 소스는 락 노드의 종류를 <code>Regular</code>, <code>NonEscObj</code>, <code>Coarsened</code>, <code>Nested</code> 네 가지로 이름 붙인다. <code>Coarsened</code>는 같은 객체에 대한 unlock 바로 뒤에 lock이 이어질 때 두 연산을 함께 지워 두 임계 영역을 하나로 합치는 <b>락 병합(lock coarsening)</b>이고, <code>Nested</code>는 이미 잡은 락 안에서 같은 객체를 다시 잠그는 중첩 락을 지우는 것이다. 관련 옵션은 이 실험 환경에서 <code>-XX:+PrintFlagsFinal</code>로 확인한 대로 <code>DoEscapeAnalysis</code>, <code>EliminateLocks</code>, <code>EliminateNestedLocks</code> 모두 기본값 <code>true</code>인 C2 제품 옵션이다. <code>c2_globals.hpp</code>에 적힌 <code>EliminateLocks</code>의 설명은 "가능하면 락을 병합한다(Coarsen locks when possible)"인데, <code>LockNode::Ideal</code>은 탈출하지 않은 객체의 락 제거와 락 병합 둘 다 이 옵션이 켜져 있을 때만 시도한다.</p>
+<p>hsdis가 없어 이 환경에서는 JIT가 만든 기계어를 볼 수 없다. 그래도 락이 지워졌는지는 스레드 덤프로 확인할 수 있다. 앞에서 본 <code>vframe.cpp</code>의 <code>print_lock_info_on</code>은 컴파일된 프레임의 잠금 기록이 "제거됨"으로 표시되어 있으면 <code>locked</code> 대신 <code>eliminated</code>를 찍는다. 이를 이용해 다음 프로그램을 만들었다. <code>work</code>는 메서드 안에서만 쓰는 객체를 잠그고, 아주 가끔 그 안에서 <code>Thread.sleep</code>을 부른다. 처음 2초 동안은 0밀리초씩 쉬며 C2가 이 경로까지 포함해 컴파일하게 하고, 그 뒤에는 3초씩 쉬게 해 덤프를 찍을 틈을 만든다.</p>
+<pre><code class="language-java">public class Elim {
+    static volatile boolean stop;
+    static int sink;
+
+    static void work(int i) throws InterruptedException {
+        Object local = new Object();              // 이 메서드 밖으로 나가지 않는다
+        synchronized (local) {
+            sink += i;
+            if ((i & 0xFFFF) == 0) {              // 가끔 이 경로도 지나가게 해 프로파일에 남긴다
+                Thread.sleep(stop ? 3000 : 0);    // stop 뒤에는 덤프를 찍을 틈
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Thread t = new Thread(() -> {
+            try {
+                for (int i = 0; ; i++) work(i);
+            } catch (InterruptedException e) { }
+        }, "worker");
+        t.setDaemon(true);
+        t.start();
+        Thread.sleep(2000);                       // C2가 work를 컴파일할 시간
+        stop = true;
+        Thread.sleep(3500);
+    }
+}</code></pre>
+<p>실행 3초쯤에 <code>jstack</code>으로 worker 스레드를 찍었다. 기본 옵션으로 세 번 실행해 세 번 모두 같은 결과가 나왔고, <code>-XX:+PrintCompilation</code>으로 <code>Elim::work</code>가 4단계(C2)로 컴파일된 것도 확인했다. 비교를 위해 락 제거를 끈 경우, 탈출 분석을 끈 경우, C1까지만 쓰게 한 경우를 함께 실었다.</p>
+<pre data-label="jstack 출력 중 worker 스레드의 work 프레임 (주소는 실행마다 다르다)"><code class="language-text">== 기본 옵션
+	at Elim.work(Elim.java:10)
+	- eliminated <owner is scalar replaced> (a java.lang.Object)
+== -XX:-EliminateLocks
+	at Elim.work(Elim.java:10)
+	- locked <0x0000007008494470> (a java.lang.Object)
+== -XX:-DoEscapeAnalysis
+	at Elim.work(Elim.java:10)
+	- locked <0x0000007009e8c470> (a java.lang.Object)
+== -XX:TieredStopAtLevel=1
+	at Elim.work(Elim.java:10)
+	- locked <0x00000070077cb080> (a java.lang.Object)</code></pre>
+<p>기본 옵션에서 worker는 synchronized 블록 안에서 잠들어 있는데도 덤프에는 <code>locked</code>가 없다. 대신 <code>eliminated <owner is scalar replaced></code>가 찍혔다. 락이 지워졌을 뿐 아니라 잠글 객체 자체가 힙에 만들어지지 않았다는 뜻이다. 탈출하지 않는 객체를 필드 값들로 쪼개 지역 변수처럼 다루는 <b>스칼라 치환(scalar replacement)</b>이 함께 일어나, 덤프가 보여 줄 객체 주소가 없다. 락 제거를 끄거나(<code>-XX:-EliminateLocks</code>), 탈출 분석을 끄거나(<code>-XX:-DoEscapeAnalysis</code>), C2를 쓰지 않게 하면(<code>-XX:TieredStopAtLevel=1</code>) 같은 자리에 실제 힙 주소와 함께 <code>locked</code>가 찍힌다. 인터프리터와 C1으로 실행되는 동안에는 이 락이 매번 실제로 잡히고 풀린다는 뜻이다.</p>
+<p>이 실험을 만들다 겪은 일도 기록해 둔다. 처음에는 <code>if (stop) Thread.sleep(3000);</code>처럼 워밍업 동안 한 번도 지나가지 않는 분기를 썼는데, 그때는 기본 옵션에서도 덤프에 <code>locked</code>가 찍혔다. <code>-Xlog:deoptimization=debug</code>로 실행해 보니 <code>stop</code>을 바꾼 직후 <code>Elim.work(I)V trap_bci=23 ... unstable_if reinterpret</code>라는 역최적화(deoptimization) 기록이 남았다. C2는 한 번도 실행되지 않은 분기를 "여기 오면 인터프리터로 돌아간다"는 함정(uncommon trap)으로 컴파일해 두었고, 그 분기가 처음 실행되자 컴파일된 프레임을 인터프리터 프레임으로 바꾼 것이다. 이때 지워졌던 락은 그대로 사라지지 않는다. <code>deoptimization.cpp</code>에서 역최적화는 스칼라 치환된 객체를 먼저 힙에 다시 만들고(<code>Deoptimization::realloc_objects</code>), 이어서 <code>Deoptimization::relock_objects</code>가 컴파일된 프레임의 디버그 정보에 "제거됨"으로 남아 있던 잠금 기록을 찾아 그 객체를 실제로 잠근 뒤에 인터프리터로 넘긴다. 인터프리터는 블록 끝에서 <code>monitorexit</code>를 실제로 실행할 것이므로, 그에 맞는 lock이 먼저 있어야 하기 때문이다. 락 제거는 증명이 성립하는 동안만 유지되는 최적화이고, JVM은 그 증명이 깨지는 순간을 위해 원래 상태로 되돌릴 정보를 남겨 둔다.</p>
+<aside class="note">이 최적화를 믿고 코드를 쓸 이유는 없다. 락 제거는 C2가 컴파일한 뒤에야, 그리고 탈출 분석이 객체가 밖으로 나가지 않는다고 증명한 경우에만 일어난다. 객체를 정적 필드나 공유 객체의 필드에 저장하면 탈출한 것으로 판정되고, 메서드 호출 너머로 넘기는 경우에도 분석이 증명하지 못하면 락은 그대로 남는다. 이 실험이 보여 주는 것은 "스레드 하나에서만 쓰는 객체에 붙은 synchronized는 공짜일 수 있다"는 가능성과, 그 판단 근거가 JLS의 happens-before 정의에 있다는 점이다. 성능을 판단하려면 실제 코드에서 측정해야 한다.</aside>
+
+<h3>synchronized는 가시성도 보장한다</h3>
+<p>synchronized를 상호 배제의 도구로만 이해하면 절반만 이해한 것이다. 앞 회차의 가시성 문제를 떠올려 보자. 한 스레드가 필드에 쓴 값을 다른 스레드가 언제 보는지는 그 두 동작 사이에 happens-before 관계가 있느냐로 결정된다. JLS 17.4.4는 모니터 m에 대한 unlock 동작이 그 뒤에 일어나는(동기화 순서상) m에 대한 모든 lock 동작과 동기화된다(synchronizes-with)고 정하고, 17.4.5는 이로부터 "모니터에 대한 unlock은 그 모니터에 대한 이후의 모든 lock보다 먼저 일어난다(happens-before)"는 규칙을 이끌어 낸다.</p>
+<p>이것이 출금 예제에서 무엇을 의미하는지 따라가 보자. t1은 <code>withdraw</code> 안에서 <code>balance</code>에 200을 쓰고, 메서드를 나가며 계좌의 모니터를 unlock한다. t2는 그 뒤에 같은 모니터를 lock하고 <code>balance</code>를 읽는다. 한 스레드 안의 동작은 프로그램 순서대로 happens-before 관계를 이루므로, "t1의 200 쓰기 → t1의 unlock → t2의 lock → t2의 읽기"가 하나의 happens-before 사슬로 이어진다. 따라서 t2는 반드시 200(또는 그 뒤에 쓰인 값)을 본다. 캐시에 남은 1000을 볼 가능성은 명세 수준에서 배제된다. synchronized 출금이 올바른 이유는 상호 배제와 이 가시성 보장이 함께 작동하기 때문이다.</p>
+<pre class="diagram">     t1                                          t2
+  ┌──────────────────────────┐
+  │ lock(account)             │
+  │ balance 읽기 (1000)        │
+  │ balance = 200 쓰기  ───┐   │
+  │ unlock(account) ───────┼──┼──── synchronizes-with ───┐
+  └──────────────────────────┘ │                           ▼
+                               │              ┌──────────────────────────┐
+                               │              │ lock(account)             │
+                               └─ hb ───────▶ │ balance 읽기 → 반드시 200   │
+                                              │ ...                       │
+                                              │ unlock(account)           │
+                                              └──────────────────────────┘
+  hb: happens-before. 프로그램 순서 + 모니터 규칙이 이어져 t1의 쓰기가 t2의 읽기보다 먼저 일어난다.</pre>
+<p>이 규칙에는 조건이 붙어 있다. <b>같은 모니터</b>여야 한다. 쓰는 쪽이 계좌 객체를 잠그고 읽는 쪽이 아무 락도 잡지 않거나 다른 객체를 잠그면 사슬이 이어지지 않는다. 앞에서 <code>getBalance</code>에도 synchronized를 붙인 이유가 여기서 명세 수준으로 정당화된다. 락 없이 읽는 쪽은 최신 값을 본다는 보장을 받지 못하고, 필드가 <code>long</code>이나 <code>double</code>이라면 상황이 더 나쁘다. JLS 17.7은 volatile이 아닌 <code>long</code>/<code>double</code>에 대한 한 번의 쓰기를 32비트 절반씩 두 번의 쓰기로 다룰 수 있게 허용하므로, 락 없이 읽는 스레드는 이론상 앞 절반은 새 값, 뒤 절반은 옛 값인 값을 볼 수도 있다.</p>
+<div class="table-wrap"><table><thead><tr><th></th><th><code>volatile</code></th><th><code>synchronized</code></th></tr></thead><tbody>
+<tr><td>가시성</td><td>보장한다. volatile 쓰기는 그 변수의 이후 읽기보다 먼저 일어난다</td><td>보장한다. unlock은 같은 모니터의 이후 lock보다 먼저 일어난다</td></tr>
+<tr><td>여러 동작의 원자성</td><td>보장하지 않는다. <code>count++</code>는 여전히 깨진다</td><td>보장한다. 같은 락을 쓰는 임계 영역끼리는 겹쳐 실행되지 않는다</td></tr>
+<tr><td>스레드를 기다리게 하는가</td><td>아니다</td><td>그렇다. 락을 얻을 때까지 BLOCKED</td></tr>
+<tr><td>적용 대상</td><td>필드 하나</td><td>코드 구간(메서드 또는 블록)</td></tr>
+</tbody></table></div>
+
+<h3>synchronized의 한계</h3>
+<p>synchronized는 자바 1.0부터 있던, 언어에 내장된 동기화 수단이다. 해제를 언어가 보장하고, 문법이 간단하며, 앞에서 본 것처럼 경합이 없을 때의 비용을 줄이는 구현이 JVM 안에 들어 있다. 대부분의 단순한 상호 배제에는 이것으로 충분하다. 그러나 이 회차에서 확인한 성질들을 모아 보면 분명한 한계도 보인다.</p>
+<ul>
+<li><b>무한 대기</b>: 락을 기다리는 데 시간 제한이 없다. "0.5초 안에 못 얻으면 다른 일을 한다"를 표현할 방법이 없다.</li>
+<li><b>인터럽트 불가</b>: BLOCKED 상태의 스레드는 인터럽트로 깨어나지 않는다. 앞의 실험에서 인터럽트 플래그만 켜진 채 계속 기다렸다.</li>
+<li><b>공정성 없음</b>: 오래 기다린 스레드가 먼저 들어간다는 보장이 없다. HotSpot 구현은 경쟁적 인계 방식이라 막 도착한 스레드가 먼저 락을 차지할 수 있다.</li>
+<li><b>블록 구조에 묶임</b>: 락을 얻는 곳과 푸는 곳이 같은 블록(또는 메서드)이어야 한다. 한 메서드에서 잠그고 다른 메서드에서 푸는 식의 유연한 구조를 만들 수 없다. 해제를 보장하는 장점의 뒷면이다.</li>
+<li><b>대기 집합이 하나</b>: 모니터마다 <code>wait</code> 대기 집합(<code>_WaitSet</code>)이 하나뿐이라, 조건이 다른 스레드들(예: 생산자와 소비자)을 따로 기다리게 할 수 없다. 이 문제는 8~9회차의 주제다.</li>
+</ul>
+<p>JDK 21에서는 가상 스레드(virtual thread)와 관련된 한계가 하나 더 있다. JEP 444(가상 스레드, JDK 21)는 가상 스레드가 synchronized 블록이나 메서드 안의 코드를 실행하는 동안에는 자신을 실행하는 플랫폼 스레드(캐리어, carrier)에서 내려올 수 없는 "고정(pinning)" 상태가 된다고 설명한다. 그 상태에서 I/O 같은 블로킹 작업을 하면 가상 스레드뿐 아니라 캐리어 플랫폼 스레드까지 묶인다. JEP 491은 그 원인을, JVM이 모니터의 소유자를 가상 스레드가 아니라 플랫폼 스레드 기준으로 기록하기 때문이라고 설명한다. 앞에서 본 <code>_owner</code> 필드에 기록되는 것이 바로 그 스레드다. JEP 444는 JDK 21에서 자주 실행되면서 긴 I/O를 감싸는 synchronized를 <code>ReentrantLock</code>으로 바꾸라고 권했고, JEP 491은 JDK 24에서 synchronized 안에서 블록되는 가상 스레드가 캐리어를 놓아줄 수 있도록 고쳤다. 기준 버전인 JDK 21에서는 고정이 일어난다는 점을 기억해 두자.</p>
+<p>이 한계들을 풀기 위해 자바 5는 <code>java.util.concurrent.locks</code> 패키지를 추가했다. 다음 회차에서 <code>LockSupport</code>의 <code>park</code>/<code>unpark</code>부터 시작해 <code>ReentrantLock</code>이 시간 제한, 인터럽트, 공정성을 어떻게 제공하는지 다룬다. 그 뒤 8~9회차의 생산자 소비자 문제에서는 <code>wait</code>/<code>notify</code>와 <code>Condition</code>을, 10회차에서는 락 없이 원자성을 얻는 CAS를, 11회차에서는 이 모든 것을 내부에 품은 동시성 컬렉션을 본다.</p>
+
+<h3>적용 연습과 정리</h3>
+<p>이 절은 이 회차의 원리를 처음 보는 코드에 적용하는 연습이다. 각 코드에서 공유 자원, 임계 영역, 사용한 락을 먼저 짚은 뒤 판정해 보자.</p>
+<h4>연습 1. 지역 변수만 쓰는 메서드</h4>
+<pre><code class="language-java">public int sumTo(int n) {
+    int total = 0;
+    for (int i = 1; i <= n; i++) {
+        total += i;
+    }
+    return total;
+}</code></pre>
+<p>여러 스레드가 같은 객체의 <code>sumTo</code>를 동시에 호출해도 synchronized가 필요 없다. <code>n</code>, <code>total</code>, <code>i</code>는 모두 호출한 스레드의 스택 프레임에 있는 지역 변수이고, 스레드마다 별도의 프레임이 만들어진다. <code>total += i</code>도 읽기-수정-쓰기지만 다른 스레드가 이 <code>total</code>에 닿을 길이 없으니 경합이 없다. 공유 자원이 없으면 임계 영역도 없다.</p>
+<h4>연습 2. 인스턴스 락으로 정적 필드를 보호하려는 코드</h4>
+<pre><code class="language-java">public class Ticket {
+    private static int issued = 0;
+
+    public synchronized int issue() {
+        issued++;
+        return issued;
+    }
+}</code></pre>
+<p><code>Ticket</code> 객체를 여러 개 만들어 스레드마다 다른 객체로 <code>issue()</code>를 부르면 번호가 중복되거나 건너뛴다. synchronized 인스턴스 메서드는 각자의 <code>this</code>를 잠그므로, 객체가 다르면 락도 다르다. 그런데 보호하려는 <code>issued</code>는 정적 필드라 모든 객체가 공유한다. 앞의 <code>TwoLocks</code> 실험에서 객체 a와 b의 메서드가 동시에 실행된 것과 같은 상황이다. 고치려면 <code>issue()</code>를 <code>static synchronized</code>로 만들거나(<code>Ticket.class</code>의 모니터), 정적 <code>final</code> 락 객체를 두고 블록으로 잠근다. 또 <code>return issued;</code>를 블록 밖으로 빼면, 증가와 반환 사이에 다른 스레드의 증가가 끼어들어 내가 받은 번호가 아닌 값을 돌려줄 수 있으므로 반환할 값도 임계 영역 안에서 정해야 한다.</p>
+<h4>연습 3. 쓰기만 잠그고 읽기는 잠그지 않는 코드</h4>
+<pre><code class="language-java">public class Config {
+    private long version;
+
+    public synchronized void update(long v) { version = v; }
+
+    public long current() { return version; }   // synchronized 없음
+}</code></pre>
+<p>쓰기는 잠갔으니 안전하다고 생각하기 쉽지만 읽는 쪽에 두 가지 문제가 있다. 첫째, <code>current()</code>는 모니터를 lock하지 않으므로 <code>update</code>의 unlock과 happens-before 관계가 없다. 다른 스레드의 갱신을 계속 보지 못할 수 있다. 둘째, <code>version</code>이 volatile이 아닌 <code>long</code>이므로 JLS 17.7에 따라 쓰기가 32비트씩 나뉘어 보일 수 있다. <code>current()</code>에도 synchronized를 붙이거나, 이 클래스처럼 필드 하나를 통째로 쓰고 읽기만 한다면 <code>volatile long</code>으로 선언하는 것으로 충분하다. 읽기-수정-쓰기가 없으므로 원자성은 필요 없고 가시성만 있으면 되기 때문이다.</p>
+<h4>연습 4. 불변 객체</h4>
+<p>모든 필드가 <code>final</code>이고 생성자 밖에서 상태를 바꾸는 메서드가 없는 객체는 여러 스레드가 동기화 없이 읽어도 된다. 바뀌는 상태가 없으니 경합 조건이 생길 수 없고, JLS 17.5는 생성자가 끝난 뒤에야 객체 참조를 볼 수 있는 스레드는 그 객체의 <code>final</code> 필드가 올바르게 초기화된 값을 본다고 보장한다. 단서는 "생성자가 끝난 뒤에야"다. 생성자 안에서 <code>this</code>를 다른 스레드에 넘기면(예: 생성자에서 스레드를 시작하며 <code>this</code>를 넘기기) 이 보장이 성립하지 않는다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>여러 스레드가 공유하는 상태를 읽고-판단하고-쓰는 코드는 실행 순서에 따라 결과가 달라지는 경합 조건을 만든다. 그 구간이 임계 영역이고, 한 번에 한 스레드만 실행하도록 상호 배제해야 한다. 자바의 모든 객체는 모니터 락을 가지며, synchronized 메서드는 <code>this</code>(정적이면 <code>Class</code> 객체)를, synchronized 블록은 지정한 객체를 잠근다. 메서드는 <code>ACC_SYNCHRONIZED</code> 플래그로 JVM이, 블록은 <code>monitorenter</code>/<code>monitorexit</code>와 예외 테이블로 컴파일러가 해제를 보장한다. 같은 모니터의 unlock은 이후의 lock보다 먼저 일어나므로 synchronized는 원자성과 가시성을 함께 준다. 대신 락을 기다리는 스레드는 BLOCKED 상태로 시간 제한도, 인터럽트도, 순서 보장도 없이 기다린다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>경합 조건(race condition)</dt><dd>여러 스레드가 공유 자원에 접근할 때 결과가 실행 순서에 따라 달라지는 상황. 검사 후 행동(check-then-act)과 읽기-수정-쓰기(read-modify-write)가 대표적인 모양이다.</dd>
+<dt>원자성과 가시성</dt><dd><code>volatile</code>은 가시성만 주므로 <code>count++</code> 같은 복합 동작은 여전히 깨진다. 여러 동작을 하나로 묶는 원자성은 상호 배제로 얻는다.</dd>
+<dt>임계 영역(critical section)</dt><dd>공유 자원에 접근하며 동시에 둘 이상의 스레드가 실행하면 결과가 깨지는 구간. 판단의 근거를 읽는 지점부터 결과를 쓰는 지점까지를 하나로 잡아야 한다.</dd>
+<dt>모니터 락</dt><dd>자바의 모든 객체에 연결된 락. 한 번에 한 스레드만 가질 수 있고, 같은 스레드는 여러 번 잠글 수 있다(재진입). 락은 메서드가 아니라 객체에 붙는다.</dd>
+<dt>synchronized 메서드</dt><dd>인스턴스 메서드는 <code>this</code>, 정적 메서드는 <code>Class</code> 객체의 모니터를 잠근다. 바이트코드에는 <code>ACC_SYNCHRONIZED</code> 플래그만 붙고, 잠금과 해제는 JVM의 호출·반환이 처리한다.</dd>
+<dt>synchronized 블록</dt><dd>지정한 객체의 모니터를 잠그고 블록만 임계 영역으로 만든다. <code>javac</code>가 <code>monitorenter</code>와 모든 출구의 <code>monitorexit</code>, <code>any</code> 예외 핸들러를 만들어 해제를 보장한다.</dd>
+<dt>BLOCKED 상태</dt><dd>모니터 락을 기다리는 스레드의 상태. 시간 제한이 없고 인터럽트로 깨어나지 않으며, 대기 스레드들 사이의 순서도 보장되지 않는다.</dd>
+<dt>모니터 규칙(happens-before)</dt><dd>같은 모니터의 unlock은 이후의 lock보다 먼저 일어난다. 그래서 같은 락으로 보호한 쓰기와 읽기 사이에는 가시성이 보장된다.</dd>
+<dt>HotSpot의 구현(OpenJDK 21)</dt><dd>경합이 없으면 마크 워드와 스택의 잠금 기록으로 락을 표현하고, 경합이 생기면 <code>ObjectMonitor</code>로 팽창한다. 편향 잠금은 JDK 15에서 기본 비활성화되었고 JDK 21에는 옵션이 없다.</dd>
+<dt>BLOCKED의 바닥과 락 생략(OpenJDK 21)</dt><dd>BLOCKED 스레드는 스핀 뒤 <code>_cxq</code>에 들어가 <code>PlatformEvent</code>의 pthread 조건 변수에서 잠들고, 인터럽트로 깨어나도 락만 다시 확인하고 또 잠든다. 반대로 탈출하지 않는 객체의 락은 C2가 탈출 분석으로 아예 지운다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 synchronized를 다시 만나는 첫 장면은 "가끔 숫자가 안 맞는다"는 장애다. 스프링의 빈은 기본적으로 싱글톤이고, 서블릿 컨테이너는 요청마다 스레드 풀의 스레드를 하나씩 붙여 같은 빈의 메서드를 동시에 호출한다. 이 구조에서 빈의 인스턴스 필드에 요청별 상태나 누적 카운터를 두면 이 회차의 출금 예제와 정확히 같은 경합이 생긴다. 해법은 먼저 공유 상태를 없애는 것(지역 변수로 옮기기, 불변 객체 쓰기)이고, 공유가 꼭 필요할 때에만 임계 영역을 정해 잠근다. 또 synchronized는 한 JVM 안의 스레드끼리만 배제한다는 점을 잊지 말아야 한다. 같은 애플리케이션을 서버 두 대에 띄우면 각 JVM의 계좌 객체는 서로 다른 객체이고 락도 다르다. 여러 서버가 같은 데이터를 고치는 문제는 데이터베이스의 락이나 트랜잭션 격리 수준처럼 공유 저장소 쪽의 장치로 풀어야 한다.</p>
+<p>두 번째 장면은 "서버가 느려지다 멈췄다"는 장애다. 이때 스레드 덤프를 몇 초 간격으로 여러 번 찍어, <code>BLOCKED (on object monitor)</code> 스레드들이 어떤 주소를 <code>waiting to lock</code> 하고 있는지, 그 주소를 <code>locked</code>로 쥔 스레드는 무엇을 하고 있는지를 짝지어 본다. 락을 쥔 스레드가 외부 API 호출이나 DB 쿼리, 파일 I/O에 걸려 있다면 임계 영역 설계가 원인이다. 느린 I/O는 임계 영역 밖으로 빼고, 꼭 안에 둬야 한다면 시간 제한을 걸 수 있는 다음 회차의 <code>Lock</code>을 검토한다. 두 스레드가 서로 상대가 쥔 락을 기다리고 있다면 교착 상태이며, 락을 얻는 순서를 일관되게 정하는 것이 일반적인 해법이다.</p>
+<p>판단이 달라지는 조건도 있다. 경합이 거의 없는 짧은 임계 영역이라면 synchronized는 단순하고 해제가 보장되므로 여전히 좋은 기본값이다. 반면 임계 영역 안에서 블로킹 I/O를 하는 코드를 JDK 21의 가상 스레드 위에서 돌린다면 캐리어 스레드가 고정되는 문제가 생기므로 <code>ReentrantLock</code>으로 바꾸는 것을 고려한다(이 고정은 JDK 24에서 JEP 491로 대부분 해소되었다). 단순한 카운터 하나라면 락 대신 10회차의 Atomic 클래스가, 맵 하나라면 11회차의 동시성 컬렉션이 더 맞는 선택일 수 있다.</p>
+</x-review>
+
+<x-practice>
+<li>필드 <code>count</code>가 0인 객체에서 두 스레드가 각각 <code>count++</code>를 딱 한 번씩 실행한다(동기화 없음). 가능한 최종 값을 모두 쓰고, 각 값이 나오는 실행 순서를 <code>getfield</code>, <code>iadd</code>, <code>putfield</code> 단위로 엇갈려 그려라.</li>
+<li>어떤 클래스에 <code>public synchronized void deposit(int x) { balance += x; }</code>와 <code>public void reset() { balance = 0; }</code>이 있다. 한 스레드는 <code>deposit</code>을, 다른 스레드는 <code>reset</code>을 반복 호출한다. <code>deposit</code>이 synchronized이므로 이 클래스는 안전한가? JLS 14.19의 문장과 모니터 규칙을 근거로 판정하라.</li>
+<li>다음 메서드를 컴파일하면 <code>monitorexit</code>가 몇 개 생기는지 예측하고, 각각이 어느 경로를 위한 것인지 설명하라. <code>int f(boolean flag) { synchronized (lock) { if (flag) return 1; count++; } return 2; }</code></li>
+<li>스레드 덤프에서 스레드 A는 <code>- locked <0x1> (a Account)</code>와 <code>- waiting to lock <0x2> (a Account)</code>를, 스레드 B는 <code>- locked <0x2> (a Account)</code>와 <code>- waiting to lock <0x1> (a Account)</code>를 보이며 둘 다 BLOCKED다. 무슨 일이 일어났는지, 이 상태가 저절로 풀릴 수 있는지, 인터럽트로 풀 수 있는지 설명하라.</li>
+<li>두 계좌 사이의 이체 <code>transfer(Account from, Account to, int amount)</code>를 만든다. <code>synchronized (from)</code>만 잡는 방식과 <code>synchronized (from) { synchronized (to) { ... } }</code> 방식의 문제를 각각 설명하고, 교착 상태 없이 두 계좌를 함께 잠그는 방법을 제시하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> 가능한 최종 값은 2와 1이다. 한 스레드가 <code>getfield</code>(0) → <code>iadd</code>(1) → <code>putfield</code>(1)를 모두 마친 뒤 다른 스레드가 같은 과정을 거치면 두 번째 스레드는 1을 읽어 2를 쓴다. 반대로 t1이 0을 읽고, 쓰기 전에 t2도 0을 읽으면, 둘 다 1을 계산해 1을 쓰므로 최종 값은 1이다. 어떤 순서로 쓰든 나중에 쓴 1이 먼저 쓴 1을 덮는다. 3이나 0은 나올 수 없다. 각 스레드가 정확히 한 번 쓰고, 쓰는 값은 자기가 읽은 값(0 또는 1)에 1을 더한 값이기 때문이다. 이 작은 예가 갱신 손실의 최소 단위다.</p>
+<p><b>2.</b> 안전하지 않다. JLS 14.19는 어떤 객체의 락을 얻는 것이 다른 스레드가 그 객체의 필드에 접근하거나 synchronized가 아닌 메서드를 호출하는 것을 막지 않는다고 명시한다. <code>reset</code>은 락을 요청하지 않으므로 <code>deposit</code>의 <code>getfield</code>와 <code>putfield</code> 사이에 언제든 끼어들 수 있다. 예를 들어 <code>deposit</code>이 100을 읽은 뒤 <code>reset</code>이 0을 쓰고, <code>deposit</code>이 110을 쓰면 초기화가 사라진다. 또 <code>reset</code>의 쓰기와 <code>deposit</code>의 읽기 사이에는 모니터 규칙에 의한 happens-before가 없으므로 가시성도 보장되지 않는다. 같은 필드를 다루는 모든 코드가 같은 락을 써야 하므로 <code>reset</code>에도 synchronized를 붙인다.</p>
+<p><b>3.</b> 세 개다. <code>return 1</code> 직전에 락을 풀기 위한 것 하나, 블록의 정상 끝(<code>count++</code> 다음)에서 풀기 위한 것 하나, 블록 안에서 예외가 났을 때 <code>any</code> 핸들러가 풀고 예외를 다시 던지기 위한 것 하나다. 본문의 블록 버전 출금 메서드가 같은 구조였고 실제로 <code>monitorexit</code>가 세 번 나왔다. <code>return 2</code>는 블록 밖이므로 그 앞에는 <code>monitorexit</code>가 필요 없다. 이미 블록의 정상 끝에서 풀었기 때문이다.</p>
+<p><b>4.</b> 교착 상태(deadlock)다. A는 0x1을 쥐고 0x2를 기다리고, B는 0x2를 쥐고 0x1을 기다린다. 서로가 상대의 락이 풀리기를 기다리므로 어느 쪽도 진행할 수 없고, 락은 블록을 빠져나가야 풀리는데 둘 다 블록 안에서 멈춰 있으니 저절로 풀리지 않는다. BLOCKED 상태는 인터럽트로 깨어나지 않으므로 인터럽트로도 풀 수 없다. JLS 17.1이 말하듯 자바는 교착 상태를 막거나 감지해 주지 않으므로 설계로 피해야 한다. 이 상태의 JVM은 보통 재시작해야 한다.</p>
+<p><b>5.</b> <code>synchronized (from)</code>만 잡으면 <code>to</code>의 잔액 갱신은 보호되지 않는다. 다른 스레드가 <code>to</code>에서 출금하거나 <code>to</code>를 <code>from</code>으로 하는 이체를 동시에 하면 <code>to</code>의 잔액에서 갱신 손실이 생긴다. 두 락을 중첩해 잡으면 이 문제는 사라지지만, 스레드 1이 <code>transfer(a, b)</code>, 스레드 2가 <code>transfer(b, a)</code>를 동시에 호출하면 1은 a를 쥐고 b를, 2는 b를 쥐고 a를 기다리는 4번의 교착 상태가 된다. 해법은 락을 얻는 순서를 전역적으로 하나로 정하는 것이다. 예를 들어 계좌마다 고유한 번호를 두고, 이체 방향과 상관없이 항상 번호가 작은 계좌를 먼저 잠근 뒤 큰 계좌를 잠근다. 모든 스레드가 같은 순서로 잠그면 서로 상대의 락을 쥐고 기다리는 순환이 생길 수 없다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>같은 클래스에 <code>static synchronized void a()</code>와 <code>synchronized void b()</code>가 있다. 스레드 1이 <code>a()</code>를, 스레드 2가 어떤 인스턴스의 <code>b()</code>를 동시에 호출하면?</q>
+<o>같은 클래스의 synchronized 메서드이므로 한 스레드는 BLOCKED가 된다</o>
+<o>둘 다 동시에 실행될 수 있다</o>
+<o>정적 메서드가 먼저 실행되도록 JVM이 순서를 정한다</o>
+<o>컴파일 오류가 난다</o>
+<why>JLS 17.1과 8.4.3.6에 따라 정적 synchronized 메서드는 그 클래스의 <code>Class</code> 객체 모니터를, 인스턴스 synchronized 메서드는 <code>this</code>의 모니터를 잠근다. 서로 다른 객체의 모니터이므로 서로를 배제하지 않는다. 락은 메서드나 클래스가 아니라 객체에 붙는다. 실행 순서를 JVM이 정해 주는 규칙은 없고, 두 수정자를 한 클래스에 함께 쓰는 것은 합법이다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>volatile int count</code>를 두 스레드가 각각 100만 번 <code>count++</code> 하면 결과가 200만보다 작게 나온다. 가장 정확한 이유는?</q>
+<o>volatile 변수의 쓰기가 다른 스레드에 보이지 않기 때문이다</o>
+<o>JIT 컴파일러가 반복문을 최적화해 일부 증가를 지웠기 때문이다</o>
+<o><code>count++</code>는 읽기, 더하기, 쓰기의 세 단계이고, volatile은 각 읽기·쓰기의 가시성만 보장할 뿐 세 단계를 하나로 묶어 주지 않기 때문이다</o>
+<o>int가 32비트라 쓰기가 두 번으로 나뉘기 때문이다</o>
+<why><code>count++</code>는 <code>getfield</code>, <code>iadd</code>, <code>putfield</code>로 나뉜다. 두 스레드가 같은 값을 읽어 각자 더한 뒤 쓰면 하나의 증가가 사라진다(갱신 손실). volatile은 가시성을 보장하므로 첫 번째 보기는 틀렸다. JIT가 어떤 최적화를 하든 결과는 메모리 모델이 예측할 수 있는 범위 안에 있어야 하고(JLS 17.4), 200만보다 작은 값은 최적화가 없어도 읽기와 쓰기 사이에 다른 스레드가 끼어드는 것만으로 나온다. JLS 17.7의 분할 쓰기는 volatile이 아닌 <code>long</code>/<code>double</code>에 관한 것이다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>스레드 A가 모니터 락을 쥔 채 10초 동안 <code>sleep</code> 중이고, 스레드 B는 같은 락을 기다리며 BLOCKED 상태다. 이때 다른 스레드가 B를 인터럽트하면?</q>
+<o>B는 인터럽트 플래그만 켜진 채 계속 BLOCKED로 기다리고, A가 락을 놓은 뒤에야 블록에 들어간다</o>
+<o>B는 즉시 <code>InterruptedException</code>을 받고 기다림을 그만둔다</o>
+<o>A가 대신 인터럽트되어 락을 놓는다</o>
+<o>B는 RUNNABLE 상태로 바뀌어 락 없이 블록에 들어간다</o>
+<why>모니터 락을 기다리는 동작은 인터럽트에 반응하지 않는다. 본문 실험에서 인터럽트 뒤에도 B의 상태는 BLOCKED였고, 블록에 들어간 뒤 <code>isInterrupted()</code>가 true였다. <code>InterruptedException</code>은 <code>sleep</code>, <code>wait</code>, <code>join</code> 같은 메서드가 던지는 것이다. A는 인터럽트되지 않았으므로 영향이 없고, 락 없이 블록에 들어가는 경우는 없다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q><code>synchronized (this) { ... }</code> 블록을 <code>javap</code>로 보면 <code>monitorexit</code>가 두 번 이상 나오고 <code>any</code> 타입의 예외 테이블 항목이 있다. 그 이유는?</q>
+<o>JVM이 락을 두 번 풀어야 완전히 해제되기 때문이다</o>
+<o>재진입을 지원하기 위해 항상 두 번 잠그기 때문이다</o>
+<o>디버깅 정보이고 실행에는 쓰이지 않는다</o>
+<o>블록이 정상으로 끝나는 경로와 예외로 끝나는 경로 모두에서 락을 풀어야 하므로, 컴파일러가 각 출구에 <code>monitorexit</code>를 넣고 모든 예외를 잡아 락을 푼 뒤 다시 던지는 핸들러를 만들기 때문이다</o>
+<why>JLS 14.19는 블록이 정상이든 갑자기든 끝나면 모니터를 푼다고 정하고, JVMS 2.11.10은 synchronized 블록의 올바른 구현에 컴파일러의 협력이 필요하다고 적는다. <code>monitorenter</code>는 한 번뿐이고 각 <code>monitorexit</code>는 서로 다른 경로에서 하나만 실행된다. 예외 테이블은 실제 실행 흐름을 결정하는 정보다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>쓰기 메서드만 synchronized이고 읽기 메서드는 synchronized가 아닌 클래스에서, 읽는 스레드가 최신 값을 본다는 보장이 없는 이유로 가장 정확한 것은?</q>
+<o>읽기 메서드가 BLOCKED 상태가 되기 때문이다</o>
+<o>synchronized 메서드는 CPU 캐시를 쓰지 않기 때문이다</o>
+<o>모니터 규칙의 happens-before는 같은 모니터를 unlock한 스레드와 그 뒤에 lock한 스레드 사이에서만 성립하는데, 읽는 쪽은 lock을 하지 않으므로 쓰기와 읽기 사이에 happens-before 관계가 없기 때문이다</o>
+<o>읽기 메서드가 쓰기 메서드보다 먼저 컴파일되기 때문이다</o>
+<why>JLS 17.4.4·17.4.5에 따라 unlock은 같은 모니터의 이후 lock과 동기화되어 happens-before를 만든다. 락을 거치지 않는 읽기는 이 사슬에 연결되지 않는다. 락 없는 읽기는 기다리지 않으므로 BLOCKED가 되지 않고, "캐시를 쓰지 않는다"는 것은 명세가 정한 설명이 아니다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>경합 조건(race condition)</dt><dd>여러 스레드가 공유 자원에 접근할 때 실행 순서(타이밍)에 따라 결과가 달라지는 상황.</dd>
+<dt>갱신 손실(lost update)</dt><dd>두 스레드가 같은 옛 값을 읽어 각자 계산한 결과를 쓸 때, 나중에 쓴 쪽이 먼저 쓴 쪽의 갱신을 덮어 사라지게 하는 현상.</dd>
+<dt>임계 영역(critical section)</dt><dd>공유 자원에 접근하며, 동시에 둘 이상의 스레드가 실행하면 결과가 깨지는 코드 구간.</dd>
+<dt>상호 배제(mutual exclusion)</dt><dd>임계 영역을 어느 순간에도 최대 한 스레드만 실행하도록 하는 성질.</dd>
+<dt>모니터(monitor)</dt><dd>JLS 17.1에서 자바의 모든 객체에 연결된 동기화 장치. 스레드가 lock/unlock하며, 한 번에 한 스레드만 락을 가진다.</dd>
+<dt>재진입(reentrancy)</dt><dd>이미 락을 가진 스레드가 같은 락을 다시 요청하면 기다리지 않고 잠금 횟수만 늘리는 성질.</dd>
+<dt>BLOCKED</dt><dd>모니터 락을 얻으려고(또는 <code>wait</code> 뒤 다시 얻으려고) 기다리는 스레드의 상태. 인터럽트로 깨어나지 않는다.</dd>
+<dt>마크 워드(mark word)</dt><dd>HotSpot에서 객체 헤더의 첫 워드. 해시코드, GC 나이, 락 상태 비트를 담는다.</dd>
+<dt>락 팽창(lock inflation)</dt><dd>HotSpot이 경합 등으로 인해 마크 워드만으로 표현하던 락을 별도의 <code>ObjectMonitor</code>로 옮기는 일.</dd>
+<dt>탈출 분석(escape analysis)</dt><dd>객체가 만든 메서드나 스레드 밖으로 나가는지 판정하는 컴파일러 분석. HotSpot C2는 그 결과로 나가지 않는 객체의 락을 지우고(락 생략) 할당을 스칼라 치환한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html">JLS SE 21, Chapter 17 Threads and Locks</a> — 17.1 모니터와 synchronized의 정의, 17.4.4·17.4.5 모니터 규칙의 happens-before, 17.5 final 필드, 17.7 long/double의 비원자적 처리</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-14.html#jls-14.19">JLS SE 21, §14.19 The synchronized Statement</a> — synchronized 문의 실행 규칙, null과 참조형 요구, 재진입 예제</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-2.html#jvms-2.11.10">JVMS SE 21, §2.11.10 Synchronization</a> — ACC_SYNCHRONIZED, monitorenter/monitorexit, 구조적 잠금</li>
+<li><a href="https://raw.githubusercontent.com/openjdk/jdk21u/master/src/hotspot/share/runtime/objectMonitor.cpp">OpenJDK 21u objectMonitor.cpp</a> — ObjectMonitor의 동작 원리 주석(cxq, EntryList, 경쟁적 인계)</li>
+<li><a href="https://openjdk.org/jeps/374">JEP 374: Deprecate and Disable Biased Locking</a> — 편향 잠금의 원리와 JDK 15에서의 비활성화</li>
+<li><a href="https://openjdk.org/jeps/491">JEP 491: Synchronize Virtual Threads without Pinning</a> — JDK 21에서 synchronized가 가상 스레드를 고정하는 이유와 JDK 24의 해결</li>
+</x-refs>

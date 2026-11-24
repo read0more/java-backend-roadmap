@@ -1,0 +1,866 @@
+<x-meta>
+deck: 부모 열 하나로 나무를 담는 인접 리스트, 깊이를 모르는 나무를 한 문장으로 훑는 재귀 CTE, 모든 조상-자손 쌍을 미리 저장하는 폐쇄 테이블을 MySQL의 실행 방식과 InnoDB 인덱스로 비교한다.
+minutes: 100
+</x-meta>
+
+<x-goals>
+<li>인접 리스트 모델로 계층을 저장하고, 자기 참조 외래 키가 보장하는 것(부모 행의 존재)과 보장하지 못하는 것(순환, 루트에서의 단절)을 구분해 설명할 수 있다.</li>
+<li>깊이를 모르는 하위 트리와 조상 경로를 재귀 CTE로 조회하고, 반복마다 직전 반복의 결과만 입력이 된다는 규칙에 따라 실행 과정을 표로 추적할 수 있다.</li>
+<li>재귀 CTE에서 경로 열의 타입 추론, 문자열 정렬, 순환, 반복 한도 문제를 MySQL 매뉴얼의 규칙으로 설명하고 각각을 막는 쿼리를 쓸 수 있다.</li>
+<li>폐쇄 테이블을 설계하고, 노드 추가·하위 트리 삭제·하위 트리 이동 때 지우고 넣어야 할 경로 행을 손으로 계산할 수 있다.</li>
+<li>인접 리스트, 경로 열거, 중첩 집합, 폐쇄 테이블을 조회 비용·변경 비용·무결성·저장 공간으로 비교해 상황에 맞는 모델을 고를 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 행은 평평한데 데이터는 나무다</h3>
+
+<p>쇼핑몰의 상품 카테고리를 떠올려 보자. "전체" 아래에 "가전"과 "디지털"이 있고, "가전" 아래에 "TV"와 "주방가전"이 있으며, "TV" 아래에 다시 "OLED TV"와 "LCD TV"가 있다. 회사의 조직도, 게시판의 댓글과 대댓글, 관리자 화면의 메뉴, 시·도 아래 시·군·구, 그 아래 읍·면·동으로 내려가는 행정 구역도 같은 모양이다. 모두 위에서 아래로 가지를 치며 내려가고, 맨 위를 뺀 모든 항목은 바로 위의 항목을 정확히 하나 가진다. 이런 모양의 데이터를 계층 구조(hierarchy) 데이터 또는 트리(tree) 데이터라고 부른다.</p>
+
+<p>관계형 데이터베이스의 테이블은 이 모양을 그대로 담지 못한다. 테이블은 행의 집합이고, 행들은 서로 포함하지도 순서를 갖지도 않은 채 나란히 놓인다. 한 행이 다른 행을 가리키는 수단은 외래 키뿐인데, 외래 키 칸 하나에는 값이 하나만 들어가므로 "바로 위 하나"만 가리킬 수 있다. 문제는 업무가 계층 데이터에 던지는 질문이 대부분 "바로 위"가 아니라 "전부"라는 데 있다. "가전과 그 아래 모든 카테고리의 상품을 보여 달라", "화면 위쪽에 전체 › 가전 › TV처럼 현재 위치의 경로를 찍어 달라", "이 본부 아래 모든 팀의 인원을 합쳐 달라". 몇 단계를 오르내려야 하는지는 데이터마다 다르고, 쿼리를 쓰는 시점에는 알 수 없다.</p>
+
+<p>이 간극 때문에 계층 구조 설계라는 주제가 따로 있다. SQL의 조인은 쿼리에 적은 횟수만큼만 테이블을 잇는다. 조인을 두 번 쓴 쿼리는 두 단계까지만 내려간다. 단계 수가 데이터에 따라 정해지는 질문에 답하려면 어딘가에서 반복이 일어나야 하고, 그 반복을 어디에 두느냐가 설계의 갈림길이 된다. 애플리케이션이 쿼리를 여러 번 보내 반복할 수도 있고, 데이터베이스가 한 문장 안에서 반복하게 할 수도 있으며(재귀 CTE), 반복의 결과를 미리 계산해 테이블에 저장해 둘 수도 있다(폐쇄 테이블, 경로 열거, 중첩 집합). 이 회차는 세 갈래를 차례로 보고, 각각이 조회·변경·무결성·저장 공간에서 무엇을 치르는지 계산해 본다.</p>
+
+<p>설명의 기준은 MySQL 8.0 이상과 InnoDB 저장 엔진이다. 재귀 CTE는 MySQL 8.0에서 처음 지원되었으므로 5.7 이하에서는 쓸 수 없다. 외래 키를 언제 검사하는지, 같은 테이블을 읽으면서 수정할 수 있는지 같은 세부는 제품마다 다르므로 MySQL 매뉴얼로 확인한 범위에서만 "MySQL에서는"이라고 범위를 밝혀 쓴다. 01회의 공통 코드도 코드 그룹이 상위·하위로 나뉘면 이 회차의 문제가 되고, 계층의 한 노드를 논리적으로 지울 때 생기는 문제는 05회의 Soft Delete에서 다시 만난다. 여기서는 계층 자체를 어떻게 저장하고 조회하는지에 집중한다.</p>
+
+<h3>트리의 용어와 우리가 던질 질문들</h3>
+
+<p>먼저 용어를 맞춘다. 트리의 각 항목을 노드(node)라고 하고, 두 노드를 잇는 상하 관계를 간선(edge)이라고 한다. 위쪽 노드는 부모(parent), 아래쪽 노드는 자식(child)이며, 같은 부모를 가진 노드끼리는 형제(sibling)다. 부모가 없는 맨 위 노드가 루트(root), 자식이 없는 노드가 리프(leaf)다. 부모의 부모를 계속 따라 올라가며 만나는 노드 전부가 조상(ancestor)이고, 반대로 자식의 자식을 계속 따라 내려가며 만나는 노드 전부가 자손(descendant)이다. 루트에서 그 노드까지 거치는 간선의 수가 깊이(depth)이고, 한 노드와 그 자손 전체를 묶은 것이 하위 트리(subtree)다.</p>
+
+<p>이 회차 내내 쓸 예제 트리는 아홉 개의 카테고리로 이루어진다. 괄호 안의 숫자가 노드의 id다.</p>
+
+<pre class="diagram">
+전체 (1)                         깊이 0   ← 루트
+├── 가전 (2)                     깊이 1
+│   ├── TV (4)                   깊이 2
+│   │   ├── OLED TV (7)          깊이 3   ← 리프
+│   │   └── LCD TV (8)           깊이 3   ← 리프
+│   └── 주방가전 (5)             깊이 2
+│       └── 냉장고 (9)           깊이 3   ← 리프
+└── 디지털 (3)                   깊이 1
+    └── 음향기기 (6)             깊이 2   ← 리프
+</pre>
+
+<p>트리에는 몇 가지 성질이 있고, 이 성질이 곧 저장 모델이 지켜야 할 무결성 조건이 된다. 루트를 뺀 모든 노드는 부모가 정확히 하나다. 노드가 n개면 간선은 n−1개다. 어떤 노드에서 부모를 따라 올라가면 반드시 루트에 도착하며, 같은 노드를 두 번 지나는 일, 곧 순환(cycle)이 없다. 그래서 루트에서 각 노드로 가는 경로는 하나뿐이다. 루트가 여럿인 숲(forest) 구조도 흔하다. "전체"라는 인위적인 노드 없이 "가전", "디지털"이 각각 최상위 카테고리인 경우가 그렇다. 이 회차의 모델들은 루트가 여럿이어도 똑같이 동작한다.</p>
+
+<p>모델을 비교하려면 질문 목록이 필요하다. 아래 표의 질문은 계층 데이터를 다루는 화면과 배치 작업에서 거의 빠짐없이 나온다. 앞의 두 개는 한 단계짜리 질문이고, 나머지는 단계 수를 데이터가 정한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>번호</th><th>질문</th><th>업무에서의 예</th><th>필요한 단계 수</th></tr></thead><tbody>
+<tr><td>Q1</td><td>직속 자식</td><td>가전을 눌렀을 때 펼쳐질 하위 메뉴</td><td>1단계</td></tr>
+<tr><td>Q2</td><td>부모</td><td>"상위 카테고리로" 버튼</td><td>1단계</td></tr>
+<tr><td>Q3</td><td>모든 자손(하위 트리)</td><td>가전 이하 모든 카테고리의 상품 목록</td><td>데이터가 정한다</td></tr>
+<tr><td>Q4</td><td>모든 조상(경로)</td><td>전체 › 가전 › TV › OLED TV 경로 표시</td><td>데이터가 정한다</td></tr>
+<tr><td>Q5</td><td>깊이와 트리 순서</td><td>들여쓰기한 전체 카테고리 트리 출력</td><td>데이터가 정한다</td></tr>
+<tr><td>Q6</td><td>하위 트리 집계</td><td>카테고리마다 하위 포함 상품 수</td><td>데이터가 정한다 + 집계</td></tr>
+</tbody></table></div>
+
+<p>변경 쪽의 질문도 세 가지를 정해 둔다. 리프 하나를 추가하는 일, 하위 트리 하나를 통째로 지우는 일, 하위 트리 하나를 다른 부모 아래로 옮기는 일이다. 예를 들어 "TV" 하위 트리(TV, OLED TV, LCD TV)를 "가전"에서 "디지털" 아래로 옮기는 개편을 생각해 보자. 이 회차의 모든 모델은 이 여섯 질문과 세 변경으로 평가한다.</p>
+
+<h3>인접 리스트 모델: 부모 하나만 기억한다</h3>
+
+<p>가장 직접적인 표현은 각 행에 자기 부모의 id를 적는 것이다. 이를 인접 리스트 모델(adjacency list model)이라고 부른다. 그래프 이론에서 인접 리스트는 각 노드가 이웃 노드 목록을 들고 있는 표현인데, 관계형 테이블에서는 칸 하나에 값 하나만 넣을 수 있으므로 각 행이 자식 목록 대신 부모 하나만 들고 있고, 자식 목록은 인덱스로 거꾸로 찾는다. 데이터베이스 설계 1편에서 본 일대다 관계에서 외래 키를 "다" 쪽에 두는 규칙을 그대로 적용한 것이다. 다른 점은 관계의 양쪽 끝이 같은 테이블이라는 것뿐이다. 이런 관계를 재귀 관계(recursive relationship) 또는 자기 참조 관계라고 한다.</p>
+
+<pre><code class="language-sql">CREATE TABLE category (
+    id        BIGINT       NOT NULL AUTO_INCREMENT,
+    parent_id BIGINT       NULL,
+    name      VARCHAR(100) NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT fk_category_parent
+        FOREIGN KEY (parent_id) REFERENCES category (id)
+);
+
+INSERT INTO category (id, parent_id, name) VALUES
+    (1, NULL, '전체'),
+    (2, 1,    '가전'),
+    (3, 1,    '디지털'),
+    (4, 2,    'TV'),
+    (5, 2,    '주방가전'),
+    (6, 3,    '음향기기'),
+    (7, 4,    'OLED TV'),
+    (8, 4,    'LCD TV'),
+    (9, 5,    '냉장고');</code></pre>
+
+<p>INSERT 문의 값 순서에 주의하자. 부모 행이 자식 행보다 앞에 있다. MySQL 매뉴얼은 여러 행을 넣거나 지우거나 고치는 문장에서도 외래 키 제약을 행 단위로(row-by-row) 검사하며, 검사를 트랜잭션 커밋까지 미루지 않고 즉시 한다고 밝힌다. 그래서 한 문장 안이라도 자식 행이 먼저 들어가는 순간 아직 없는 부모를 가리키게 되어 1452 오류(Cannot add or update a child row: a foreign key constraint fails)가 난다. SQL 표준이 기본으로 요구하는 것은 문장 전체를 처리한 뒤의 검사라고 매뉴얼이 함께 적고 있으니, 이것은 MySQL의 특성으로 기억해 둔다. 계층 데이터를 일괄 적재할 때는 깊이 순으로 정렬해서 넣어야 한다.</p>
+
+<p>외래 키에는 인덱스가 따라온다. MySQL은 외래 키 검사가 테이블 전체를 훑지 않도록 참조하는 쪽 테이블에 외래 키 열을 맨 앞에 둔 인덱스를 요구하고, 없으면 자동으로 만든다. 그래서 위의 DDL만으로 <code>parent_id</code>에 보조 인덱스가 생긴다. InnoDB에서 보조 인덱스의 각 레코드는 인덱스 열과 함께 그 행의 기본 키 열을 담는다. 따라서 이 인덱스의 리프 레코드는 사실상 <code>(parent_id, id)</code> 쌍으로 정렬되어 있다. Q1 "가전의 직속 자식"은 이 인덱스에서 <code>parent_id = 2</code>인 구간을 한 번 내려가 읽는 범위 스캔이며, 읽은 순서대로 id 4, 5가 나온다. Q2 "OLED TV의 부모"는 행을 읽어 <code>parent_id</code> 값 4를 얻은 뒤 기본 키로 한 번 더 찾는 일이다. 한 단계짜리 질문은 인접 리스트에서 인덱스 탐색 한두 번으로 끝난다.</p>
+
+<p>변경도 단순하다. 리프 추가는 행 하나를 넣는 것이다. 하위 트리 이동은 더 인상적이다. TV 하위 트리를 디지털 아래로 옮기는 일은 <code>UPDATE category SET parent_id = 3 WHERE id = 4</code> 한 문장, 행 하나의 갱신으로 끝난다. OLED TV와 LCD TV의 행은 손댈 필요가 없다. 이들은 "내 부모는 4"라는 사실만 기억하고 있고, 4가 어디에 붙어 있는지는 4의 행에만 적혀 있기 때문이다. "누가 누구 아래에 있는가"라는 사실이 정확히 한 곳에만 저장되어 있다는 것, 이것이 인접 리스트의 가장 큰 장점이다. 같은 사실을 두 곳에 두지 않으니 둘이 어긋날 수도 없다. 정규화가 지키려는 바로 그 성질이다.</p>
+
+<h4>루트의 parent_id는 무엇으로 두는가</h4>
+
+<p>루트에는 부모가 없으므로 <code>parent_id</code>에 무엇을 넣을지 정해야 한다. 흔히 보는 선택지는 셋이다. 첫째는 NULL이다. MySQL의 외래 키는 열 값이 NULL이면 참조 검사를 하지 않으므로 루트 행을 자연스럽게 표현할 수 있고, 최상위 노드는 <code>WHERE parent_id IS NULL</code>로 찾는다. 둘째는 자기 자신의 id를 넣는 방식이다. 이 방식은 MySQL에서 곤란하다. 매뉴얼은 외래 키를 즉시 검사하기 때문에 외래 키로 자기 자신을 참조하는 행은 삭제할 수 없다고 명시한다. 게다가 id를 AUTO_INCREMENT로 만든다면 INSERT 시점에는 자기 id를 모르므로 넣은 뒤 다시 UPDATE해야 한다. 셋째는 0 같은 약속된 값이다. 외래 키를 걸었다면 id가 0인 가짜 행이 실제로 있어야 하고, AUTO_INCREMENT 열에 0을 넣으면 <code>NO_AUTO_VALUE_ON_ZERO</code> SQL 모드가 아닌 한 새 일련번호가 생성되므로 그 가짜 행을 만드는 일부터 번거롭다. 이 회차는 NULL을 쓴다.</p>
+
+<x-visual id="db-design2-02-adjacency-tree" title="인접 리스트: 트리와 parent_id 열의 대응" kind="구조 다이어그램" ratio="16:9">
+<x-hint>트리 그림의 각 간선이 테이블에서는 자식 행의 parent_id 값 하나로 저장된다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 깔끔한 기술 다이어그램. 왼쪽 절반에 9개 노드의 트리를 위에서 아래로 그린다: 맨 위 "전체(1)", 그 아래 "가전(2)"와 "디지털(3)", 가전 아래 "TV(4)"와 "주방가전(5)", 디지털 아래 "음향기기(6)", TV 아래 "OLED TV(7)"와 "LCD TV(8)", 주방가전 아래 "냉장고(9)". 오른쪽 절반에 세 열(id, parent_id, name)짜리 표를 9행으로 그린다. 표의 몇몇 행(예: 7번 행)의 parent_id 칸에서 같은 표의 부모 행(4번 행)의 id 칸으로 휘어진 화살표를 그린다. 트리의 TV(4)→OLED TV(7) 간선과 표의 7번 행 parent_id 칸을 같은 색으로 강조한다. 상단 라벨: "트리의 간선 하나 = 자식 행의 parent_id 하나". 표 아래 라벨: "루트의 parent_id는 NULL". 전체 라벨은 한국어로 하고 장식 없이 단색 계열로.</x-prompt>
+<x-caption>인접 리스트에서 간선은 자식 행의 parent_id 하나로 저장된다. 자식 목록은 parent_id 인덱스로 거꾸로 찾는다.</x-caption>
+</x-visual>
+
+<h3>인접 리스트의 무결성: 외래 키가 지키는 것과 못 지키는 것</h3>
+
+<p>자기 참조 외래 키(self-referencing foreign key)가 보장하는 것은 정확히 하나다. 모든 <code>parent_id</code>가 실제로 존재하는 행을 가리킨다는 것. 부모 없이 떠 있는 고아 행은 생길 수 없다. 자식이 있는 노드를 지우려 할 때의 동작은 참조 동작(referential action)이 정한다. ON DELETE를 적지 않으면 기본값은 NO ACTION이고, MySQL 매뉴얼에 따르면 InnoDB에서 NO ACTION은 RESTRICT와 같다. 자식이 남아 있는 부모 행의 삭제는 즉시 거부되고 1451 오류(Cannot delete or update a parent row: a foreign key constraint fails)가 난다. 계층 데이터에서는 이 기본 동작이 대개 옳다. 실수로 중간 노드 하나를 지워 그 아래 수백 개 카테고리가 사라지는 일을 막아 준다.</p>
+
+<p>자기 참조 관계에서 CASCADE를 쓰고 싶다면 MySQL의 제약 두 가지를 알아야 한다. 매뉴얼은 자기 참조 ON DELETE CASCADE와 ON DELETE SET NULL은 가능하다고 하면서, 연쇄 작업이 15단계보다 깊게 중첩될 수 없다고 적는다. MySQL 8.4.13과 8.0.46에서 parent_id에 ON DELETE CASCADE를 건 20개 노드의 한 줄짜리 체인으로 실행해 보면, 아래로 14단계가 이어진 노드는 그 아래 전체와 함께 지워지지만 아래로 15단계가 이어진 노드를 지우면 3008 오류(Foreign key cascade delete/update exceeds max depth of 15.)로 문장 전체가 실패하고 한 행도 지워지지 않는다. 반대로 ON UPDATE CASCADE와 ON UPDATE SET NULL은 같은 연쇄 안에서 이미 갱신한 테이블을 다시 갱신하게 되면 RESTRICT처럼 동작하므로, 자기 참조에는 사실상 쓸 수 없다. 무한 연쇄를 막기 위한 규칙이다. 기본 키 값을 바꾸는 일 자체가 드물기 때문에 실무에서 ON UPDATE가 문제 되는 경우는 적지만, 하위 트리를 CASCADE로 한 번에 지우는 설계는 깊이 제한을 염두에 두어야 한다.</p>
+
+<p>여러 행을 한 문장으로 지울 때도 행 단위 즉시 검사가 영향을 준다. <code>DELETE FROM category WHERE id IN (4, 7, 8)</code>은 삭제할 행 집합만 보면 TV 하위 트리 전체라서 문제가 없어 보인다. 하지만 InnoDB가 4번 행을 7번, 8번보다 먼저 지우려 하는 순간 7번과 8번은 아직 4를 가리키고 있으므로 RESTRICT가 삭제를 거부한다. MySQL 8.4.13과 8.0.46에서 실제로 이 문장은 1451 오류로 실패하고, 같은 문장에 <code>ORDER BY id DESC</code>를 붙이면 8, 7, 4 순으로 지워져 3행이 삭제된다. MySQL 매뉴얼은 DELETE의 ORDER BY가 참조 무결성 위반을 피하는 순서로 행을 지우는 데 도움이 된다고 설명한다. 자식부터 지우도록 순서를 주거나, 리프부터 여러 문장으로 나누어 지우거나, 아예 하위 트리 삭제를 애플리케이션의 한 트랜잭션 안에서 깊이가 깊은 순서로 처리해야 한다.</p>
+
+<p>이제 외래 키가 지키지 못하는 것을 보자. 순환이다. 다음 UPDATE는 TV(4)의 부모를 OLED TV(7)로 바꾼다.</p>
+
+<pre><code class="language-sql">UPDATE category SET parent_id = 7 WHERE id = 4;   -- 외래 키 검사 통과</code></pre>
+
+<p>7번 행은 존재하므로 외래 키 검사는 통과한다. 그런데 이제 4의 부모는 7이고 7의 부모는 4다. 4에서 부모를 따라 올라가면 4 → 7 → 4 → 7로 끝없이 돌고, 루트에는 영원히 도착하지 못한다. TV, OLED TV, LCD TV 세 노드는 루트에서 내려가는 어떤 탐색에도 나타나지 않는 섬이 된다. 외래 키는 "가리키는 행이 있는가"만 묻는 제약이다. "따라 올라가면 루트에 닿는가"는 여러 행에 걸친 성질이라 행 하나를 보는 검사로는 알 수 없다.</p>
+
+<p>CHECK 제약도 도움이 되지 않는다. MySQL은 8.0.16부터 CHECK 제약을 실제로 검사하지만, 매뉴얼이 정한 제약식의 규칙상 서브쿼리를 쓸 수 없고 AUTO_INCREMENT 속성의 열도 쓸 수 없다. 길이 2 이상의 순환을 찾으려면 다른 행을 읽어야 하므로 서브쿼리 없이는 불가능하고, 가장 짧은 순환인 "자기 자신을 부모로" 하는 경우조차 <code>CHECK (parent_id <> id)</code>를 쓰려 하면 id가 AUTO_INCREMENT라서 거부된다. MySQL 8.4.13과 8.0.46에서 <code>ALTER TABLE category ADD CONSTRAINT chk_self CHECK (parent_id <> id)</code>를 실행하면 3818 오류(Check constraint 'chk_self' cannot refer to an auto-increment column.)가 난다. 결국 인접 리스트에서 순환 방지는 애플리케이션의 몫이다. 노드 X를 새 부모 P 아래로 옮기기 전에 "X가 P의 조상인가", 곧 "P가 X의 하위 트리 안에 있는가"를 확인해야 한다. 이 확인을 어떻게 한 문장으로 하는지는 재귀 CTE를 배운 뒤에 다시 본다.</p>
+<h3>계층 구조 조회의 어려움</h3>
+
+<p>한 단계 질문이 쉬운 대신, 인접 리스트는 여러 단계 질문에서 곧바로 벽을 만난다. Q3 "모든 자손"을 조인으로 풀어 보자. 자식은 한 번 조인, 손자는 두 번 조인이다. 루트에서 세 단계를 내려가는 쿼리는 다음과 같다.</p>
+
+<pre><code class="language-sql">SELECT c1.name AS lv1, c2.name AS lv2, c3.name AS lv3
+  FROM category c1
+  LEFT JOIN category c2 ON c2.parent_id = c1.id
+  LEFT JOIN category c3 ON c3.parent_id = c2.id
+ WHERE c1.parent_id IS NULL
+ ORDER BY c2.id, c3.id;</code></pre>
+
+<pre data-label="실행 결과 (MySQL 8.4.13에서 실행)"><code class="language-text">lv1    lv2      lv3
+-----  -------  ---------
+전체   가전     TV
+전체   가전     주방가전
+전체   디지털   음향기기</code></pre>
+
+<p>결과에 OLED TV, LCD TV, 냉장고가 없다. 깊이 3인 노드들인데, 쿼리가 깊이 2까지만 조인했기 때문이다. 여기서 눈여겨볼 것은 이 쿼리가 오류를 내지 않는다는 점이다. 처음 만들 때 카테고리가 세 단계뿐이었다면 이 쿼리는 정답을 냈을 것이고, 몇 달 뒤 누군가 네 번째 단계를 추가한 순간부터 조용히 틀린 답을 내기 시작한다. 깊이가 쿼리의 문장 구조에 박혀 있기 때문이다. 넉넉하게 조인을 열 번 쓰면 된다고 생각할 수 있지만, 그러면 결과가 열 개의 열로 펼쳐진 넓은 행이 되어 다루기 어렵고, 열한 번째 단계가 생기는 날 같은 문제가 다시 생긴다.</p>
+
+<p>조인 횟수는 쿼리를 쓸 때 정해진다는 것이 핵심이다. 선택, 투영, 조인 같은 연산을 정해진 횟수만큼 조합한 쿼리는 정해진 단계까지만 관계를 따라갈 수 있다. "조상이다"라는 관계는 "부모다"라는 관계를 원하는 만큼 이어 붙인 것, 수학 용어로 부모 관계의 추이적 폐쇄(transitive closure)인데, 몇 번 이어 붙여야 하는지가 데이터에 달려 있다. 그래서 반복 없이는 표현할 수 없다.</p>
+
+<h4>애플리케이션에서 반복하기</h4>
+
+<p>가장 먼저 떠오르는 해법은 애플리케이션이 반복하는 것이다. 노드 하나의 직속 자식을 조회하는 쿼리를 재귀 함수로 부른다. 가전(2)의 하위 트리를 이렇게 모으면 쿼리가 몇 번 나갈까? 2의 자식을 묻고(4, 5), 4의 자식을 묻고(7, 8), 5의 자식을 묻고(9), 7, 8, 9의 자식도 각각 물어야 한다. 리프인지 아닌지는 물어보기 전에는 모르기 때문이다. 하위 트리의 노드 6개마다 한 번씩, 쿼리 6번이 나간다. 일반적으로 하위 트리의 노드 수만큼 쿼리가 나가며, 조상 경로를 구할 때는 깊이만큼 나간다.</p>
+
+<p>쿼리 한 번의 비용은 SQL 실행만이 아니다. 애플리케이션이 커넥션을 통해 요청을 보내고, 서버가 파싱하고 실행하고, 결과를 돌려보내는 왕복(round trip)이 매번 일어난다. 같은 서버 안의 작은 인덱스 탐색은 빠르지만, 네트워크 왕복은 그와 무관하게 매번 고정 비용을 낸다. 노드가 수천 개인 하위 트리라면 수천 번의 왕복이다. JPA로 <code>@ManyToOne</code> 부모와 <code>@OneToMany</code> 자식 컬렉션을 매핑하고 지연 로딩된 자식 컬렉션을 재귀적으로 순회하면 정확히 이 일이 일어난다. JPA 활용 2편에서 본 N+1 문제가 계층 구조에서 깊이 방향으로 반복되는 것이다.</p>
+
+<h4>전부 읽어서 메모리에서 조립하기</h4>
+
+<p>두 번째 해법은 테이블 전체를 한 번에 읽어 애플리케이션 메모리에서 트리를 조립하는 것이다. 카테고리나 메뉴처럼 행이 수백에서 수천 개이고 잘 바뀌지 않는 데이터라면 현실적인 선택이며, 결과를 캐시해 두면 데이터베이스 부담도 거의 없다. 조립은 어렵지 않다. 아래 코드는 DB가 돌려준 순서가 뒤죽박죽이어도 동작하도록 두 번 훑는다. 첫 번째는 모든 노드 객체를 만들어 id로 찾을 수 있게 하고, 두 번째는 각 노드를 부모의 자식 목록에 붙인다.</p>
+
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class TreeBuild {
+
+    record Row(long id, Long parentId, String name) {}
+
+    static final class Node {
+        final long id;
+        final String name;
+        final List<Node> children = new ArrayList<>();
+
+        Node(long id, String name) {
+            this.id = id;
+            this.name = name;
+        }
+    }
+
+    static Node build(List<Row> rows) {
+        Map<Long, Node> byId = new HashMap<>();
+        for (Row r : rows) {                       // 1차: 노드만 만든다
+            byId.put(r.id(), new Node(r.id(), r.name()));
+        }
+        Node root = null;
+        for (Row r : rows) {                       // 2차: 부모에 연결한다
+            Node node = byId.get(r.id());
+            if (r.parentId() == null) {
+                root = node;
+                continue;
+            }
+            Node parent = byId.get(r.parentId());
+            if (parent == null) {
+                throw new IllegalStateException("부모가 없는 행: " + r);
+            }
+            parent.children.add(node);
+        }
+        for (Node n : byId.values()) {
+            n.children.sort(Comparator.comparingLong(c -> c.id));
+        }
+        return root;
+    }
+
+    static void print(Node node, int depth) {
+        System.out.println("  ".repeat(depth) + node.name + " (" + node.id + ")");
+        for (Node child : node.children) {
+            print(child, depth + 1);
+        }
+    }
+
+    public static void main(String[] args) {
+        List<Row> rows = List.of(               // DB가 돌려준 순서라고 가정한다
+                new Row(7, 4L, "OLED TV"),
+                new Row(3, 1L, "디지털"),
+                new Row(1, null, "전체"),
+                new Row(9, 5L, "냉장고"),
+                new Row(4, 2L, "TV"),
+                new Row(2, 1L, "가전"),
+                new Row(8, 4L, "LCD TV"),
+                new Row(6, 3L, "음향기기"),
+                new Row(5, 2L, "주방가전"));
+        print(build(rows), 0);
+    }
+}</code></pre>
+
+<pre data-label="실행 결과"><code class="language-text">전체 (1)
+  가전 (2)
+    TV (4)
+      OLED TV (7)
+      LCD TV (8)
+    주방가전 (5)
+      냉장고 (9)
+  디지털 (3)
+    음향기기 (6)</code></pre>
+
+<p>메모리 관점에서 보면 이 코드는 행마다 <code>Node</code> 객체 하나와 <code>HashMap</code> 엔트리 하나를 힙에 만든다. 두 번의 순회는 각각 행 수에 비례하고, 해시 조회는 평균 상수 시간이므로 조립은 행 수에 비례하는 시간에 끝난다. 정렬은 각 부모의 자식 목록 안에서만 한다. <code>print</code>는 재귀 호출이라 트리 깊이만큼 스택 프레임이 쌓인다. 카테고리처럼 얕은 트리에서는 문제가 되지 않지만, 깊이를 예측할 수 없는 데이터라면 명시적인 스택(<code>ArrayDeque</code>)으로 바꾸는 편이 안전하다. 스레드 스택의 크기는 정해져 있어서 재귀가 너무 깊어지면 <code>StackOverflowError</code>가 나기 때문이다. 이 방식의 진짜 한계는 데이터의 크기다. 댓글처럼 행이 수백만 개인 테이블에서 하위 트리 하나를 보려고 전부 읽을 수는 없다. 그렇다면 반복을 데이터베이스 안으로 가져가야 한다. 그것이 재귀 CTE다.</p>
+
+<h3>CTE: 문장 안에서 이름 붙인 결과 집합</h3>
+
+<p>재귀를 보기 전에 CTE 자체를 정리한다. 공통 테이블 표현식(Common Table Expression, CTE)은 SQL 문장 앞에 <code>WITH</code> 절로 이름을 붙여 정의하는 임시 결과 집합이다. 이름은 그 문장 안에서만 유효하고, 문장이 끝나면 사라진다. 테이블처럼 저장되는 것이 아니라 쿼리의 일부를 이름으로 떼어 낸 것이다. 예를 들어 카테고리마다 직속 자식 수를 구하는 쿼리는 다음처럼 쓸 수 있다.</p>
+
+<pre><code class="language-sql">WITH child_count AS (
+    SELECT parent_id, COUNT(*) AS cnt
+      FROM category
+     WHERE parent_id IS NOT NULL
+     GROUP BY parent_id
+)
+SELECT c.id, c.name, COALESCE(cc.cnt, 0) AS children
+  FROM category c
+  LEFT JOIN child_count cc ON cc.parent_id = c.id
+ ORDER BY c.id;</code></pre>
+
+<pre data-label="실행 결과 (MySQL 8.4.13에서 실행)"><code class="language-text">id  name      children
+--  --------  --------
+ 1  전체             2
+ 2  가전             2
+ 3  디지털           1
+ 4  TV               2
+ 5  주방가전         1
+ 6  음향기기         0
+ 7  OLED TV          0
+ 8  LCD TV           0
+ 9  냉장고           0</code></pre>
+
+<p>같은 일을 FROM 절의 파생 테이블(derived table)로도 할 수 있다. MySQL 매뉴얼은 CTE가 파생 테이블보다 나은 점을 네 가지로 든다. 파생 테이블은 한 쿼리에서 한 번만 참조할 수 있지만 CTE는 여러 번 참조할 수 있다. CTE는 자기 자신을 참조할 수 있다(재귀). 한 CTE가 앞서 정의한 다른 CTE를 참조할 수 있다. 정의가 문장 맨 앞에 모여 있어 읽기 쉽다. 이 중 두 번째가 이 회차의 주인공이다.</p>
+
+<p>옵티마이저는 CTE를 파생 테이블, 뷰 참조와 같은 방식으로 다룬다. 바깥 쿼리에 합쳐 넣을 수 있으면 병합(merge)하고, 그렇지 않으면 내부 임시 테이블로 구체화(materialize)한다. 매뉴얼에 따르면 CTE가 구체화될 때는 쿼리가 그 CTE를 여러 번 참조하더라도 한 번만 구체화되고, 바깥 쿼리의 접근을 빠르게 할 수 있다고 판단하면 옵티마이저가 구체화된 결과에 인덱스를 자동으로 붙이기도 한다. 그리고 재귀 CTE는 언제나 구체화된다. 이 사실은 뒤에서 재귀 CTE의 실행 비용을 볼 때 다시 쓴다.</p>
+
+<h3>재귀 CTE의 실행: 반복마다 직전 결과만 본다</h3>
+
+<p>재귀 CTE(recursive CTE)는 자기 이름을 참조하는 서브쿼리를 가진 CTE다. 매뉴얼이 정한 모양은 정확히 이렇다. <code>WITH</code> 절 안의 어떤 CTE라도 자기 자신을 참조하면 <code>WITH RECURSIVE</code>로 시작해야 한다. 서브쿼리는 두 부분으로 이루어지고, 둘 사이를 <code>UNION ALL</code> 또는 <code>UNION [DISTINCT]</code>로 잇는다. 첫 번째 SELECT는 CTE 이름을 참조하지 않고 출발점이 될 초기 행을 만든다. 이를 비재귀 부분(nonrecursive part)이라고 하고, 흔히 앵커(anchor)라고도 부른다. 두 번째 SELECT는 FROM 절에서 CTE 이름을 참조해 행을 더 만든다. 이것이 재귀 부분(recursive part)이다. 재귀 부분이 새 행을 하나도 만들지 못하면 재귀가 끝난다. <code>RECURSIVE</code>를 빠뜨리면 매뉴얼이 예로 드는 대로 1146 오류(Table '...' doesn't exist)가 나기 쉽다. 아래 하위 트리 쿼리에서 <code>RECURSIVE</code>만 빼고 MySQL 8.4.13과 8.0.46에서 실행하면 "Table 'm_db_design2_02.subtree' doesn't exist"처럼 CTE 이름을 현재 데이터베이스의 테이블로 찾다가 실패한다(m_db_design2_02는 실습에 쓴 데이터베이스 이름이다).</p>
+
+<p>가전(2)의 하위 트리 전체, 곧 Q3을 재귀 CTE로 쓰면 다음과 같다.</p>
+
+<pre><code class="language-sql">WITH RECURSIVE subtree (id, parent_id, name, depth) AS (
+    SELECT id, parent_id, name, 0              -- 비재귀 부분: 출발점
+      FROM category
+     WHERE id = 2
+    UNION ALL
+    SELECT c.id, c.parent_id, c.name, s.depth + 1   -- 재귀 부분
+      FROM subtree s
+      JOIN category c ON c.parent_id = s.id
+)
+SELECT id, name, depth
+  FROM subtree
+ ORDER BY depth, id;</code></pre>
+
+<pre data-label="실행 결과 (MySQL 8.4.13에서 실행)"><code class="language-text">id  name      depth
+--  --------  -----
+ 2  가전          0
+ 4  TV            1
+ 5  주방가전      1
+ 7  OLED TV       2
+ 8  LCD TV        2
+ 9  냉장고        2</code></pre>
+
+<p>이 쿼리를 이해하는 열쇠는 재귀 부분의 <code>FROM subtree s</code>에서 <code>s</code>가 무엇을 가리키느냐다. 지금까지 쌓인 결과 전체가 아니다. MySQL 매뉴얼은 재귀 부분의 각 반복(iteration)은 직전 반복이 만든 행만을 대상으로 동작한다고 명시한다. 이 규칙대로 실행을 한 줄씩 따라가 보자.</p>
+
+<div class="table-wrap"><table><thead><tr><th>반복</th><th>재귀 부분의 입력 s (직전 반복의 결과)</th><th>이번 반복이 만든 행</th><th>지금까지의 누적 결과</th></tr></thead><tbody>
+<tr><td>0 (비재귀 부분)</td><td>없음</td><td>2 가전 (depth 0)</td><td>{2}</td></tr>
+<tr><td>1</td><td>{2}</td><td>4 TV, 5 주방가전 (depth 1)</td><td>{2, 4, 5}</td></tr>
+<tr><td>2</td><td>{4, 5}</td><td>7 OLED TV, 8 LCD TV, 9 냉장고 (depth 2)</td><td>{2, 4, 5, 7, 8, 9}</td></tr>
+<tr><td>3</td><td>{7, 8, 9}</td><td>없음 (7, 8, 9를 부모로 가진 행이 없다)</td><td>종료</td></tr>
+</tbody></table></div>
+
+<p>반복 1에서 재귀 부분은 <code>s</code> = {2}와 category를 <code>c.parent_id = s.id</code>로 조인해 4와 5를 만든다. 반복 2의 입력은 누적 결과 {2, 4, 5}가 아니라 직전 반복이 만든 {4, 5}뿐이다. 만약 누적 결과 전체가 입력이라면 반복 2에서 2가 다시 조인되어 4와 5가 또 만들어지고, 반복할 때마다 같은 행이 쌓여 끝나지 않을 것이다. 직전 반복의 결과만 본다는 규칙 덕분에 각 반복은 트리의 한 층씩을 내려가고, 반복의 입력은 "이번에 새로 발견한 노드들"이라는 경계선(frontier) 역할을 한다. 그래프 탐색에서 너비 우선 탐색(breadth-first search)이 한 층씩 경계를 넓혀 가는 것과 같은 모양이다. 반복 3에서 새 행이 없으므로 재귀가 끝나고, 최종 결과는 각 반복이 만든 행을 모두 합친(UNION ALL) 6행이다.</p>
+
+<p>반복 횟수에도 주목하자. 비재귀 부분을 빼면 반복은 3번 일어났고, 그중 마지막은 "더 없음"을 확인하는 반복이다. 하위 트리의 깊이가 d라면 반복은 d+1번이다. 반복 한 번이 한 층에 대응하므로, 노드 수가 아무리 많아도 반복 횟수는 깊이로 정해진다. 이 사실은 뒤에서 반복 한도를 볼 때 중요해진다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>비상 연락망</strong><p>학교의 비상 연락망을 떠올려 보자. 담임 선생님이 반장들에게 전화하고, 방금 전화를 받은 반장들이 각자 맡은 조원에게 전화하고, 방금 전화를 받은 조원들이 다시 자기 아래에 전화한다. 전화를 거는 사람은 언제나 "방금 전화를 받은 사람"뿐이다. 이미 연락을 돌린 반장이 다시 전화를 돌리지는 않는다. 아무도 새로 전화를 받지 않으면 연락이 끝난다. 재귀 CTE의 반복이 정확히 이렇다. 비유가 깨지는 지점도 있다. 연락망에서는 누가 먼저 전화를 거는지가 결과에 드러나지만, MySQL이 보장하는 것은 각 반복이 직전 반복이 만든 행만 입력으로 받는다는 규칙뿐이다. 행이 만들어진 순서는 최종 결과의 순서를 정하지 않으며, 순서가 필요하면 바깥 쿼리의 ORDER BY로 정해야 한다.</p></aside>
+
+<p>방향을 거꾸로 하면 Q4 "모든 조상"이 된다. 출발점을 OLED TV(7)로 두고, 재귀 부분에서 직전 반복의 행의 <code>parent_id</code>를 id로 가진 행, 곧 부모를 찾는다.</p>
+
+<pre><code class="language-sql">WITH RECURSIVE ancestors (id, parent_id, name, depth) AS (
+    SELECT id, parent_id, name, 0
+      FROM category
+     WHERE id = 7
+    UNION ALL
+    SELECT c.id, c.parent_id, c.name, a.depth + 1
+      FROM ancestors a
+      JOIN category c ON c.id = a.parent_id
+)
+SELECT id, name, depth
+  FROM ancestors
+ ORDER BY depth DESC;</code></pre>
+
+<pre data-label="실행 결과 (MySQL 8.4.13에서 실행)"><code class="language-text">id  name     depth
+--  -------  -----
+ 1  전체         3
+ 2  가전         2
+ 4  TV           1
+ 7  OLED TV      0</code></pre>
+
+<p>여기서 depth는 출발점에서 위로 몇 단계 올라갔는지를 뜻하므로 내림차순으로 정렬하면 루트부터 출발점까지의 경로가 된다. 두 쿼리는 조인 조건의 방향만 다르다. 아래로 내려갈 때는 <code>c.parent_id = s.id</code>로 parent_id 보조 인덱스를 범위 스캔하고, 위로 올라갈 때는 <code>c.id = a.parent_id</code>로 기본 키를 한 번씩 찾는다. 위로 가는 탐색은 반복마다 정확히 한 행만 만든다. 부모는 하나뿐이기 때문이다. 루트에 도착하면 <code>a.parent_id</code>가 NULL이고, NULL과의 등호 비교는 참이 되지 않으므로 재귀 부분이 행을 만들지 못해 끝난다.</p>
+
+<x-visual id="db-design2-02-recursive-iterations" title="재귀 CTE가 반복마다 한 층씩 내려가는 과정" kind="단계 다이어그램" ratio="16:9">
+<x-hint>각 반복의 입력이 누적 결과가 아니라 직전 반복이 만든 행뿐이라는 점, 그래서 반복 하나가 트리의 한 층이 된다는 점을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 단계 다이어그램. 왼쪽에서 오른쪽으로 네 개의 세로 칸을 둔다: "반복 0", "반복 1", "반복 2", "반복 3". 각 칸 위쪽에 그 반복의 입력 상자, 아래쪽에 그 반복이 만든 행 상자를 둔다. 반복 0: 입력 없음, 만든 행 "가전(2)". 반복 1: 입력 "가전(2)", 만든 행 "TV(4)", "주방가전(5)". 반복 2: 입력 "TV(4), 주방가전(5)", 만든 행 "OLED TV(7)", "LCD TV(8)", "냉장고(9)". 반복 3: 입력 "7, 8, 9", 만든 행 비어 있음과 "종료" 표시. 각 칸의 '만든 행' 상자에서 다음 칸의 '입력' 상자로 굵은 화살표를 잇는다. 그림 맨 아래에 모든 '만든 행' 상자가 모여 쌓이는 긴 막대 "누적 결과(UNION ALL)"를 그린다. 상단 제목 라벨: "입력은 직전 반복의 결과뿐". 라벨은 한국어로, 단색 계열의 차분한 색.</x-prompt>
+<x-caption>재귀 부분은 직전 반복이 만든 행만 입력으로 받는다. 그래서 반복 하나가 트리의 한 층에 대응하고, 새 행이 없으면 끝난다.</x-caption>
+</x-visual>
+
+<h3>재귀 쿼리 실전: 경로 열, 정렬, 순환, 반복 한도</h3>
+
+<p>하위 트리와 조상을 구할 수 있게 되었으니, 실제 화면이 요구하는 모양으로 다듬어 보자. Q5 "들여쓰기한 전체 트리"를 출력하려면 각 노드의 깊이와 함께 트리 순서, 곧 부모 바로 뒤에 그 하위 트리가 통째로 이어지는 깊이 우선(depth-first) 순서가 필요하다. 재귀 부분에서는 ORDER BY를 쓸 수 없으므로(제약은 다음 절에서 본다) 순서는 바깥 쿼리가 정해야 하고, 바깥 쿼리가 정렬할 수 있도록 각 행에 루트부터의 경로를 문자열로 달아 둔다. MySQL 매뉴얼의 계층 순회 예제도 같은 방식을 쓴다.</p>
+
+<pre><code class="language-sql">WITH RECURSIVE tree_rows (id, name, depth, path) AS (
+    SELECT id, name, 0, CAST(id AS CHAR(200))
+      FROM category
+     WHERE parent_id IS NULL
+    UNION ALL
+    SELECT c.id, c.name, t.depth + 1, CONCAT(t.path, ',', c.id)
+      FROM tree_rows t
+      JOIN category c ON c.parent_id = t.id
+)
+SELECT id, CONCAT(REPEAT('  ', depth), name) AS label, depth, path
+  FROM tree_rows
+ ORDER BY path;</code></pre>
+
+<pre data-label="실행 결과 (MySQL 8.4.13에서 실행)"><code class="language-text">id  label              depth  path
+--  -----------------  -----  -------
+ 1  전체                   0  1
+ 2    가전                 1  1,2
+ 4      TV                 2  1,2,4
+ 7        OLED TV          3  1,2,4,7
+ 8        LCD TV           3  1,2,4,8
+ 5      주방가전           2  1,2,5
+ 9        냉장고           3  1,2,5,9
+ 3    디지털               1  1,3
+ 6      음향기기           2  1,3,6</code></pre>
+
+<h4>경로 열의 타입은 비재귀 부분이 정한다</h4>
+
+<p>비재귀 부분의 <code>CAST(id AS CHAR(200))</code>가 왜 필요한지가 이 절의 첫 번째 함정이다. MySQL 매뉴얼에 따르면 CTE 결과 열의 타입은 비재귀 부분의 열 타입만으로 추론되고, 재귀 부분은 타입 결정에서 무시되며, 모든 열은 NULL을 허용하게 된다. 재귀 CTE는 구체화되는 임시 테이블이므로 반복을 시작하기 전에 열의 타입과 길이가 정해져야 하는데, 그 시점에 볼 수 있는 것은 비재귀 부분뿐이라고 이해하면 된다. 비재귀 부분에서 경로를 <code>id</code>를 문자열로 바꾼 짧은 값으로 시작하면, 재귀 부분이 CONCAT으로 늘린 긴 문자열이 그 짧은 열에 들어가지 못한다.</p>
+
+<p>그때 일어나는 일은 SQL 모드에 달려 있다. 매뉴얼의 예제는 비재귀 부분에서 <code>'abc'</code>로 시작한 열에 재귀 부분이 <code>CONCAT(str, str)</code>로 더 긴 값을 넣는 경우, 엄격 모드에서는 1406 오류(Data too long for column 'str' at row 1)가 나고, 엄격 모드가 아니면 값이 열 너비에 맞게 잘려 모든 행이 <code>'abc'</code>로 나온다고 보여 준다. 이 예제를 MySQL 8.4.13과 8.0.46에서 그대로 돌려도 같다. 기본 SQL 모드(STRICT_TRANS_TABLES 포함)에서는 1406 오류가 나고, 세션의 sql_mode를 빈 값으로 바꾸면 n이 1, 2, 3인 세 행의 str이 모두 <code>abc</code>로 나오며 경고도 표시되지 않았다. 오류가 나는 쪽이 차라리 낫다. 잘리는 쪽은 경로가 틀린 채로 정렬되어 트리 순서가 조용히 망가진다. 해법은 매뉴얼이 제시하는 대로 비재귀 부분에서 <code>CAST</code>로 열을 충분히 넓게 잡는 것이다. 길이는 계산해서 정한다. id가 최대 6자리이고 구분자 쉼표를 더해 한 단계에 7자라면 CHAR(200)은 28단계까지 담는다.</p>
+
+<p>이름으로 된 경로, 예를 들어 "전체 > 가전 > TV > OLED TV" 같은 이동 경로(breadcrumb) 문자열을 만들 때도 같다. 아래 쿼리는 OLED TV에서 출발해 위로 올라가면서 부모 이름을 앞에 붙이고, 루트에 도착한 행의 경로를 꺼낸다. 비재귀 부분에서 <code>name</code>을 그대로 쓰면 경로 열이 VARCHAR(100)이 되어, 이름이 긴 카테고리가 몇 단계만 쌓여도 100자를 넘는다.</p>
+
+<pre><code class="language-sql">WITH RECURSIVE crumb (id, parent_id, path) AS (
+    SELECT id, parent_id, CAST(name AS CHAR(1000))
+      FROM category
+     WHERE id = 7
+    UNION ALL
+    SELECT c.id, c.parent_id, CONCAT(c.name, ' > ', b.path)
+      FROM crumb b
+      JOIN category c ON c.id = b.parent_id
+)
+SELECT path
+  FROM crumb
+ WHERE parent_id IS NULL;</code></pre>
+
+<pre data-label="실행 결과 (MySQL 8.4.13에서 실행)"><code class="language-text">path
+--------------------------
+전체 > 가전 > TV > OLED TV</code></pre>
+
+<h4>경로 문자열의 정렬은 숫자 순서가 아니다</h4>
+
+<p>두 번째 함정은 정렬이다. 경로는 문자열이므로 <code>ORDER BY path</code>는 사전식(lexicographic) 비교다. 앞의 결과에서는 우연히 문제가 드러나지 않았을 뿐이다. TV 아래에 새 카테고리 QLED TV를 추가해 id 10을 받았다고 하자. 경로는 <code>1,2,4,10</code>이 되는데, 문자열로 비교하면 네 번째 구간의 첫 글자 <code>'1'</code>이 <code>'7'</code>보다 작으므로 <code>1,2,4,7</code>보다 앞에 온다. 결과는 TV 아래에 QLED TV, OLED TV, LCD TV 순서가 된다. 실제로 id 10인 QLED TV를 TV 아래에 넣고 앞의 tree_rows 쿼리를 MySQL 8.4.13과 8.0.46에서 실행하면 경로 <code>1,2,4,10</code>인 행이 <code>1,2,4,7</code>보다 먼저 나온다. MySQL 매뉴얼의 계층 예제 출력에도 같은 현상이 그대로 보인다. 같은 부모 아래에서 id 4610인 직원이 id 72인 직원보다 먼저 나온다.</p>
+
+<p>구간의 길이가 제각각이면 구분자 쉼표가 다른 경로의 숫자와 같은 위치에서 마주치게 되고, 그때의 비교 결과는 문자열의 콜레이션(collation)이 쉼표와 숫자를 어떤 순서로 보느냐에 기대게 된다. 이런 데에 기대지 않는 확실한 방법은 구간마다 폭을 고정하는 것이다. 비재귀 부분을 <code>CAST(LPAD(id, 10, '0') AS CHAR(1000))</code>로, 재귀 부분을 <code>CONCAT(t.path, ',', LPAD(c.id, 10, '0'))</code>로 바꾸면 각 구간이 10자리 숫자가 된다. 모든 경로에서 같은 위치에는 숫자와 숫자, 쉼표와 쉼표만 마주치므로 문자열 순서가 숫자 순서와 일치한다. 이렇게 하면 TV 아래가 OLED TV(7), LCD TV(8), QLED TV(10) 순으로 바로잡힌다(MySQL 8.4.13과 8.0.46에서 실행해 확인했다). 구간 폭은 id의 최대 자릿수에 맞추고, 그만큼 경로 열의 길이도 늘려 잡아야 한다. 화면에 보일 순서를 운영자가 정하는 경우라면 카테고리에 <code>sort_order</code> 같은 정수 열을 두고 그 값을 같은 방식으로 고정 폭으로 만들어 경로에 넣는다. 이름 자체를 경로에 넣어 정렬하는 방식은 이름 길이가 제각각이라 같은 효과를 얻을 수 없다.</p>
+
+<p>깊이 우선 순서 대신 너비 우선(breadth-first) 순서, 곧 층별 순서가 필요하면 <code>ORDER BY depth, id</code>로 충분하다. 어느 쪽이든 핵심은 같다. 재귀 CTE가 행을 만드는 순서에 기대지 말고 바깥 쿼리의 ORDER BY로 순서를 명시한다. ORDER BY 없이 나온 결과의 순서는 정해져 있지 않다.</p>
+
+<h4>순환: 끝나지 않는 재귀</h4>
+
+<p>세 번째 함정은 앞에서 외래 키가 막지 못한다고 했던 순환이다. TV(4)의 부모를 OLED TV(7)로 바꾼 상태에서 두 쿼리를 생각해 보자. 루트에서 내려가는 전체 트리 쿼리는 1, 2, 3, 5, 6, 9만 돌려준다. 2의 자식을 찾는 반복에서 4는 더 이상 <code>parent_id = 2</code>가 아니므로 나타나지 않고, 4, 7, 8은 루트와 연결이 끊긴 섬이 되었다. 오류 없이 세 노드가 사라진다. 한편 4에서 출발하는 하위 트리 쿼리는 반복 1에서 7과 8을, 반복 2에서 7의 자식인 4를, 반복 3에서 다시 7과 8을 만든다. 행이 계속 생기므로 재귀는 스스로 끝나지 않는다. MySQL 8.4.13과 8.0.46에서 실행하면 앞의 쿼리는 오류 없이 1, 2, 3, 5, 6, 9의 여섯 행을 돌려주고, 뒤의 쿼리는 아래의 3636 오류로 중단된다.</p>
+
+<p>이 무한 반복을 멈추는 것이 시스템 변수 <code>cte_max_recursion_depth</code>다. 매뉴얼에 따르면 서버는 이 변수 값보다 많은 단계를 재귀하는 CTE의 실행을 중단하며, 기본값은 1000이다. 범위는 0부터 4294967295까지이고 전역과 세션 범위 모두에서 실행 중에 바꿀 수 있다. 한도를 넘으면 3636 오류(ER_CTE_MAX_RECURSION_DEPTH)가 나며 메시지는 "Recursive query aborted after N iterations. Try increasing @@cte_max_recursion_depth to a larger value."다. N 자리에는 실제 반복 횟수가 들어가며, 기본값 1000인 MySQL 8.4.13과 8.0.46에서 순환 데이터로 실행하면 "Recursive query aborted after 1001 iterations."로 나온다. 앞에서 반복 횟수는 깊이로 정해진다고 했다. 카테고리처럼 깊이가 한 자릿수인 트리에서 이 오류를 만났다면, 한도를 올리기 전에 데이터에 순환이 생겼는지부터 의심하는 것이 옳다.</p>
+
+<p><code>UNION ALL</code> 대신 <code>UNION DISTINCT</code>를 쓰면 될까? 매뉴얼은 비재귀 부분과 재귀 부분을 UNION DISTINCT로 이으면 중복 행이 제거되며, 추이적 폐쇄를 구하는 쿼리에서 무한 반복을 피하는 데 유용하다고 설명한다. 결과 열이 <code>id</code> 하나뿐이라면 실제로 그렇다. 반복 2에서 7의 자식으로 만든 4는 비재귀 부분이 만든 행과 똑같으므로 제거되고, 새 행이 없으니 재귀가 끝나 {4, 7, 8}이 나온다(MySQL 8.4.13과 8.0.46에서 실행해 같은 세 행을 확인했다). 그러나 <code>depth</code>나 <code>path</code> 열이 있으면 이야기가 다르다. 반복할 때마다 depth가 1씩 커지고 경로가 길어지므로 행 전체로 보면 같은 행이 다시 나오지 않는다. 중복 제거는 행 단위로 일어나기 때문에 아무것도 걸러지지 않고, 결국 반복 한도에 걸린다. 결과 열을 <code>(id, depth)</code>로 바꾸어 실행하면 실제로 3636 오류(after 1001 iterations)가 난다. 깊이나 경로가 필요한 실무 쿼리에서는 UNION DISTINCT가 순환을 막아 주지 못한다.</p>
+
+<p>그래서 순환을 직접 감지한다. 경로 열에 지금까지 지나온 id를 모아 두고, 다음에 붙일 id가 이미 경로에 있으면 순환으로 표시한 뒤 그 행에서는 더 내려가지 않는다. <code>FIND_IN_SET(str, strlist)</code>는 쉼표로 구분된 목록에서 문자열의 위치를 돌려주고 없으면 0을 돌려주는 MySQL 함수다.</p>
+
+<pre><code class="language-sql">WITH RECURSIVE subtree (id, path, is_cycle) AS (
+    SELECT id, CAST(id AS CHAR(1000)), 0
+      FROM category
+     WHERE id = 4
+    UNION ALL
+    SELECT c.id,
+           CONCAT(s.path, ',', c.id),
+           FIND_IN_SET(c.id, s.path) > 0
+      FROM subtree s
+      JOIN category c ON c.parent_id = s.id
+     WHERE s.is_cycle = 0
+)
+SELECT id, path, is_cycle FROM subtree;</code></pre>
+
+<pre data-label="실행 결과 (4의 부모를 7로 바꾼 순환 상태에서, MySQL 8.4.13에서 실행)"><code class="language-text">id  path    is_cycle
+--  ------  --------
+ 4  4              0
+ 7  4,7            0
+ 8  4,8            0
+ 4  4,7,4          1</code></pre>
+
+<p>마지막 행이 순환을 알려 준다. 7의 자식으로 4가 다시 나왔고, 4는 이미 경로 <code>4,7</code>에 있으므로 is_cycle이 1이 된다. 다음 반복에서는 <code>s.is_cycle = 0</code> 조건 때문에 이 행에서 더 내려가지 않아 재귀가 끝난다. 결과 순서는 실행에 따라 달라질 수 있으니, 실무에서는 바깥에 ORDER BY를 붙이고 <code>WHERE is_cycle = 1</code>로 순환 행만 모아 데이터 점검에 쓴다.</p>
+
+<p>감지보다 나은 것은 예방이다. 인접 리스트에서 노드 X를 새 부모 P 아래로 옮기기 전에, P에서 위로 올라가는 조상 목록에 X가 있는지 확인한다. 아래로 X의 하위 트리를 훑는 것보다 위로 P의 조상을 훑는 쪽이 싸다. 위로 가는 탐색은 반복마다 한 행씩, 깊이만큼만 일어나기 때문이다.</p>
+
+<pre><code class="language-sql">-- TV(4)를 OLED TV(7) 아래로 옮겨도 되는가? (순환이 생기기 전의 정상 트리에서)
+WITH RECURSIVE up (id, parent_id) AS (
+    SELECT id, parent_id FROM category WHERE id = 7      -- 새 부모 후보
+    UNION ALL
+    SELECT c.id, c.parent_id
+      FROM up
+      JOIN category c ON c.id = up.parent_id
+)
+SELECT COUNT(*) AS would_cycle FROM up WHERE id = 4;    -- 1이면 거부한다</code></pre>
+
+<p>7의 조상은 7, 4, 2, 1이고 그 안에 4가 있으므로 결과는 1이며, 이동을 거부해야 한다. 다만 이 확인과 UPDATE가 별개의 문장이라는 점은 남는다. 두 트랜잭션이 동시에 "A를 B 아래로", "B를 A 아래로" 옮기면서 각자 확인할 때는 상대의 변경이 아직 커밋되지 않았으므로 둘 다 통과하고, 둘 다 커밋하면 순환이 생긴다. 서로 다른 행을 고치는 두 트랜잭션이 각자 읽은 스냅숏으로는 정당했지만 합치면 규칙이 깨지는 전형적인 경우다. 트리 구조를 바꾸는 작업이 동시에 일어날 수 있다면, 구조 변경 전용의 잠금 행을 <code>SELECT ... FOR UPDATE</code>로 먼저 잡게 하는 식으로 구조 변경끼리 차례를 지키게 하는 것이 단순하고 확실하다.</p>
+
+<p>마지막으로 실행 시간의 안전장치다. 매뉴얼은 반복 한도 외에 두 가지를 더 제시한다. 시스템 변수 <code>max_execution_time</code>은 현재 세션에서 실행하는 SELECT 문에 시간 제한(밀리초)을 걸고, 옵티마이저 힌트 <code>MAX_EXECUTION_TIME</code>은 그 힌트를 쓴 SELECT 하나에 시간 제한을 건다. 또 MySQL 8.0.19부터는 재귀 부분에 LIMIT을 쓸 수 있어 바깥으로 나가는 최대 행 수를 제한할 수 있다. 시간 제한 없이 무한 반복에 빠진 쿼리는 다른 세션에서 <code>KILL QUERY</code>로 멈출 수 있다.</p>
+
+<h3>재귀 CTE의 제약과 엔진 안에서 일어나는 일</h3>
+
+<p>MySQL 매뉴얼은 재귀 부분에 쓸 수 없는 구성 요소를 명시한다. SUM() 같은 집계 함수, 윈도 함수, GROUP BY, ORDER BY, DISTINCT다. MySQL 8.0.19 이전에는 LIMIT도 쓸 수 없었다. 이 제약은 비재귀 부분에는 적용되지 않으며, DISTINCT 금지는 UNION의 구성원에 대한 것이라 비재귀 부분과 재귀 부분을 잇는 UNION DISTINCT는 허용된다. 또 재귀 부분은 CTE를 FROM 절에서 한 번만 참조해야 하고, 서브쿼리 안에서 참조할 수 없다. CTE 아닌 다른 테이블과 조인할 수는 있지만, 그때 CTE가 LEFT JOIN의 오른쪽에 와서는 안 된다.</p>
+
+<p>이 목록은 "재귀 부분이 보는 것은 직전 반복의 행뿐"이라는 규칙과 함께 생각하면 기억하기 쉽다. 재귀 부분에서 COUNT를 할 수 있다 해도 그것은 한 층의 행만 센 값일 뿐 하위 트리 전체의 수가 아니다. ORDER BY로 한 반복 안의 행을 정렬해도 최종 결과의 순서를 보장하지 못한다. 하위 트리 전체에 대한 집계와 정렬은 재귀가 다 끝난 뒤 바깥 쿼리에서 해야 의미가 있다. Q6 "카테고리마다 하위 포함 상품 수"를 예로 보자. 상품 테이블 <code>product(id, category_id, name)</code>가 있다고 하자.</p>
+
+<pre><code class="language-sql">WITH RECURSIVE pairs (ancestor_id, descendant_id) AS (
+    SELECT id, id                          -- 모든 노드는 자기 자신의 조상이다
+      FROM category
+    UNION ALL
+    SELECT p.ancestor_id, c.id             -- 조상은 그대로, 자손을 한 층 내린다
+      FROM pairs p
+      JOIN category c ON c.parent_id = p.descendant_id
+)
+SELECT p.ancestor_id, COUNT(pr.id) AS product_count
+  FROM pairs p
+  LEFT JOIN product pr ON pr.category_id = p.descendant_id
+ GROUP BY p.ancestor_id;</code></pre>
+
+<p>집계는 바깥 쿼리의 GROUP BY에 있고, 재귀 부분은 쌍을 만드는 일만 한다. LEFT JOIN도 바깥 쿼리에 있어서 상품이 하나도 없는 카테고리도 0으로 나온다. 그런데 이 CTE가 만드는 것을 자세히 보자. 모든 노드에서 출발해 자손을 한 층씩 내리며 (조상, 자손) 쌍을 만든다. 예제 트리에서는 26개의 쌍이 나온다. 이 쌍의 집합이 바로 부모 관계의 추이적 폐쇄이고, 뒤에서 볼 폐쇄 테이블에 저장되는 내용 그 자체다. 인접 리스트와 재귀 CTE는 이 집합을 쿼리할 때마다 새로 계산하고, 폐쇄 테이블은 미리 계산해서 저장해 둔다. 두 모델의 차이가 여기서 한 줄로 요약된다.</p>
+
+<h4>엔진은 무엇을 반복하는가</h4>
+
+<p>MySQL 매뉴얼은 재귀 CTE가 언제나 구체화된다고 말한다. 구체화는 결과를 내부 임시 테이블에 담는 것이다. 매뉴얼의 내부 임시 테이블 절은 CTE의 평가를 서버가 내부 임시 테이블을 만드는 경우의 하나로 꼽는다. MySQL 8.0에서 메모리 안 내부 임시 테이블의 기본 저장 엔진은 TempTable이고, 8.0.28부터는 <code>tmp_table_size</code>(기본 16MiB)가 TempTable이 만드는 메모리 내부 임시 테이블 하나의 최대 크기를 정한다. 이 한도에 이르면 MySQL은 그 테이블을 InnoDB 디스크 임시 테이블로 자동 변환한다. 재귀 CTE 매뉴얼도 많은 행을 만드는 CTE는 메모리에서 디스크 형식으로 변환될 만큼 큰 내부 임시 테이블이 필요할 수 있고 그때 성능 손해가 있을 수 있다고 적는다.</p>
+
+<figure class="flow-figure"><figcaption>하위 트리 재귀 CTE가 실행되는 흐름</figcaption><ol class="flow">
+<li><strong>비재귀 부분 실행</strong><span>id = 2인 행을 기본 키로 찾아 내부 임시 테이블에 넣는다. 이 행이 첫 번째 반복의 입력이 된다.</span></li>
+<li><strong>재귀 부분 1회 실행</strong><span>직전 반복이 만든 행마다 parent_id 보조 인덱스를 내려가 자식을 찾는다(조인이 이 인덱스를 쓰는 실행 계획일 때). 찾은 행을 임시 테이블에 덧붙이고, 이 행들이 다음 반복의 입력이 된다.</span></li>
+<li><strong>종료 판정</strong><span>이번 반복이 만든 행이 없으면 끝난다. 반복 횟수가 cte_max_recursion_depth를 넘으면 3636 오류로 중단한다.</span></li>
+<li><strong>바깥 쿼리 실행</strong><span>임시 테이블에 쌓인 전체 결과를 읽어 ORDER BY, GROUP BY, 다른 테이블과의 조인을 처리한다.</span></li>
+</ol></figure>
+
+<p>EXPLAIN으로 재귀 CTE를 보면 매뉴얼 설명대로 재귀 부분에 해당하는 행의 Extra 열에 <code>Recursive</code>가 표시된다. 같은 절에서 매뉴얼은 EXPLAIN이 보여 주는 비용 추정치가 반복 한 번당 비용이며 전체 비용과 크게 다를 수 있다고 경고한다. 옵티마이저는 WHERE 절이 언제 거짓이 될지 예측할 수 없으므로 반복 횟수를 알 수 없기 때문이다. 실행 계획에서 확인할 것은 재귀 부분의 조인이 category에 대해 parent_id 인덱스를 쓰는가다. 그 인덱스가 없으면 반복마다 category 전체를 훑게 된다. 외래 키를 걸었다면 인덱스가 자동으로 생기지만, 외래 키 없이 parent_id 열만 둔 설계라면 인덱스를 직접 만들어야 한다.</p>
+
+<p>앞의 하위 트리 쿼리(가전에서 출발)에 EXPLAIN을 붙여 실제로 확인해 보자. 아래 출력의 rows, filtered 같은 추정치와 조인 방식의 선택은 실행 환경과 통계에 따라 달라진다. 먼저 예제의 9행짜리 category에서다.</p>
+
+<pre data-label="EXPLAIN, 9행 category (MySQL 8.4.13에서 실행, 8.0.46도 같음)"><code class="language-text">+----+-------------+------------+------------+-------+--------------------+---------+---------+-------+------+----------+--------------------------------------------+
+| id | select_type | table      | partitions | type  | possible_keys      | key     | key_len | ref   | rows | filtered | Extra                                      |
++----+-------------+------------+------------+-------+--------------------+---------+---------+-------+------+----------+--------------------------------------------+
+|  1 | PRIMARY     | <derived2> | NULL       | ALL   | NULL               | NULL    | NULL    | NULL  |   19 |   100.00 | Using filesort                             |
+|  2 | DERIVED     | category   | NULL       | const | PRIMARY            | PRIMARY | 8       | const |    1 |   100.00 | NULL                                       |
+|  3 | UNION       | s          | NULL       | ALL   | NULL               | NULL    | NULL    | NULL  |    2 |   100.00 | Recursive                                  |
+|  3 | UNION       | c          | NULL       | ALL   | fk_category_parent | NULL    | NULL    | NULL  |    9 |   100.00 | Using where; Using join buffer (hash join) |
++----+-------------+------------+------------+-------+--------------------+---------+---------+-------+------+----------+--------------------------------------------+</code></pre>
+
+<p>id 2 행이 비재귀 부분(기본 키로 한 행), id 3의 두 행이 재귀 부분이고, 직전 반복의 결과인 <code>s</code> 쪽 Extra에 <code>Recursive</code>가 보인다. <code><derived2></code>는 구체화된 CTE 결과를 바깥 쿼리가 읽는 행이다. 그런데 재귀 부분의 <code>c</code>는 fk_category_parent를 후보(possible_keys)로만 올리고, 실제로는 9행 전체를 읽어 해시 조인을 한다. 테이블이 이 정도로 작으면 인덱스를 거치는 것보다 전부 읽는 쪽이 싸다고 판단하기 때문이다. 같은 구조로 노드 10,000개짜리 테이블(id n의 부모가 n DIV 2인 이진 트리, 외래 키 이름 fk_big_parent)을 만들어 ANALYZE TABLE 뒤에 같은 쿼리를 EXPLAIN하면 재귀 부분이 parent_id 인덱스를 쓴다.</p>
+
+<pre data-label="EXPLAIN, 10,000행 테이블 (MySQL 8.4.13에서 실행, 8.0.46도 같음)"><code class="language-text">+----+-------------+------------+------------+-------+---------------+---------------+---------+-------+------+----------+------------------------+
+| id | select_type | table      | partitions | type  | possible_keys | key           | key_len | ref   | rows | filtered | Extra                  |
++----+-------------+------------+------------+-------+---------------+---------------+---------+-------+------+----------+------------------------+
+|  1 | PRIMARY     | <derived2> | NULL       | ALL   | NULL          | NULL          | NULL    | NULL  |    4 |   100.00 | Using filesort         |
+|  2 | DERIVED     | big        | NULL       | const | PRIMARY       | PRIMARY       | 8       | const |    1 |   100.00 | NULL                   |
+|  3 | UNION       | s          | NULL       | ALL   | NULL          | NULL          | NULL    | NULL  |    2 |   100.00 | Recursive; Using where |
+|  3 | UNION       | c          | NULL       | ref   | fk_big_parent | fk_big_parent | 9       | s.id  |    1 |   100.00 | NULL                   |
++----+-------------+------------+------------+-------+---------------+---------------+---------+-------+------+----------+------------------------+</code></pre>
+
+<p>이제 <code>c</code>의 type이 ref, key가 fk_big_parent, ref가 <code>s.id</code>다. 직전 반복의 행 하나마다 parent_id 인덱스를 내려가 자식을 찾는다는 뜻이다. 바깥 쿼리가 읽을 <code><derived2></code>의 rows는 4로 추정되었지만, 이 테이블에서 id 2를 출발점으로 실제로 실행하면 깊이 12까지 5,904행이 나온다. 옵티마이저가 반복 횟수를 알 수 없다는 매뉴얼의 경고가 이런 차이로 나타난다.</p>
+
+<p>비용을 정리해 보자. 크기가 s인 하위 트리를 재귀 CTE로 읽을 때, 각 노드는 한 번씩 반복의 입력이 되고 그때마다 parent_id 인덱스를 한 번 내려간다. 인덱스 탐색은 대략 s번이고, 이름 같은 다른 열이 필요하면 기본 키로 행을 찾는 일이 더해진다. 애플리케이션에서 노드마다 쿼리를 보낼 때도 인덱스 탐색 횟수는 같다. 재귀 CTE가 없애 주는 것은 s번의 네트워크 왕복과 문장 파싱이지, 노드마다 한 번씩 인덱스를 찾는 일 자체는 아니다. 하위 트리가 수십만 노드라면 재귀 CTE도 그만큼 일한다. 이 일을 쓰기 시점으로 옮겨 조회를 한 번의 범위 스캔으로 만드는 것이 폐쇄 테이블이다.</p>
+
+<h3>폐쇄 테이블 모델: 모든 조상-자손 쌍을 저장한다</h3>
+
+<p>폐쇄 테이블(closure table) 모델은 노드 테이블과 별도로, 트리 안의 모든 (조상, 자손) 쌍을 행으로 저장하는 테이블을 둔다. 바로 앞에서 재귀 CTE로 계산한 26개의 쌍을 테이블에 저장해 두는 것이다. 이름의 "폐쇄"는 추이적 폐쇄에서 왔다. 부모 관계만 저장하는 인접 리스트와 달리, 부모의 부모, 그 부모까지 이어지는 모든 조상 관계를 펼쳐서 저장한다. 각 쌍에는 둘 사이의 거리, 곧 몇 단계 떨어져 있는지를 함께 적는다.</p>
+
+<pre><code class="language-sql">CREATE TABLE category (
+    id   BIGINT       NOT NULL AUTO_INCREMENT,
+    name VARCHAR(100) NOT NULL,
+    PRIMARY KEY (id)
+);
+
+CREATE TABLE category_path (
+    ancestor_id   BIGINT NOT NULL,
+    descendant_id BIGINT NOT NULL,
+    depth         INT    NOT NULL,      -- 조상에서 자손까지의 단계 수
+    PRIMARY KEY (ancestor_id, descendant_id),
+    KEY idx_descendant (descendant_id, depth),
+    CONSTRAINT fk_path_ancestor
+        FOREIGN KEY (ancestor_id) REFERENCES category (id),
+    CONSTRAINT fk_path_descendant
+        FOREIGN KEY (descendant_id) REFERENCES category (id)
+);</code></pre>
+
+<p>설계의 세부를 하나씩 보자. 첫째, 모든 노드는 자기 자신과의 쌍을 depth 0으로 가진다. 이 행이 있으면 "X와 그 하위 트리"를 <code>ancestor_id = X</code> 하나로 물을 수 있고, 뒤에서 볼 삽입과 이동 공식이 예외 없이 깔끔해진다. 둘째, 기본 키 <code>(ancestor_id, descendant_id)</code>는 같은 쌍이 두 번 저장되는 것을 막고, InnoDB에서는 클러스터형 인덱스가 되어 같은 조상의 행들을 물리적으로 모아 둔다. 셋째, 두 열 모두 category를 참조하는 외래 키다. 인접 리스트의 parent_id와 마찬가지로, 존재하지 않는 노드를 가리키는 쌍은 저장될 수 없다. 외래 키 열을 맨 앞에 둔 인덱스가 필요하다는 MySQL의 요구는 ancestor_id 쪽은 기본 키가, descendant_id 쪽은 <code>idx_descendant</code>가 만족한다.</p>
+
+<p>이 설계에서 category에는 parent_id가 없다. 부모는 <code>depth = 1</code>인 행으로 알 수 있기 때문이다. 실무에서는 인접 리스트의 parent_id를 그대로 두고 폐쇄 테이블을 덧붙이는 혼합 설계도 흔하다. 직속 부모를 노드 행에서 바로 읽을 수 있고, 폐쇄 테이블이 어긋났을 때 parent_id로부터 다시 계산할 원본이 남는다는 장점이 있다. 대신 같은 사실(직속 부모)이 두 곳에 저장되므로 모든 구조 변경에서 둘을 같은 트랜잭션 안에서 함께 고쳐야 하고, 앞에서 본 자기 참조 외래 키의 삭제 순서 문제도 함께 따라온다. 이 회차는 원리를 분명히 보기 위해 parent_id 없는 설계로 설명한다.</p>
+
+<p>예제 트리의 폐쇄 테이블 전체는 다음과 같다. 조상별로 묶어 보았다.</p>
+
+<pre class="diagram">
+ancestor  descendant(depth)                                         행 수
+1         1(0)  2(1)  3(1)  4(2)  5(2)  6(2)  7(3)  8(3)  9(3)          9
+2         2(0)  4(1)  5(1)  7(2)  8(2)  9(2)                            6
+3         3(0)  6(1)                                                    2
+4         4(0)  7(1)  8(1)                                              3
+5         5(0)  9(1)                                                    2
+6         6(0)                                                          1
+7         7(0)                                                          1
+8         8(0)                                                          1
+9         9(0)                                                          1
+                                                              합계     26
+</pre>
+
+<p>행 수를 노드 쪽에서 세어 보면 규칙이 보인다. 깊이가 d인 노드는 자기 자신과 조상 d개, 모두 d+1개의 조상과 짝을 이루므로 d+1개의 행을 만든다. 예제에서 깊이 0인 노드 1개가 1행, 깊이 1인 노드 2개가 각 2행, 깊이 2인 노드 3개가 각 3행, 깊이 3인 노드 3개가 각 4행이므로 1 + 4 + 9 + 12 = 26이다. 일반적으로 폐쇄 테이블의 행 수는 모든 노드의 (깊이 + 1)을 더한 값이고, 노드 수 n에 (최대 깊이 + 1)을 곱한 값을 넘지 않는다. 이 공식은 뒤에서 공간 비용을 판단할 때 쓴다.</p>
+
+<p>이미 인접 리스트로 운영하던 테이블에서 폐쇄 테이블을 처음 만들 때는 앞에서 본 쌍 생성 재귀 CTE를 그대로 쓰면 된다. MySQL은 <code>INSERT ... WITH ... SELECT ...</code> 형태로 INSERT 안의 SELECT 앞에 WITH 절을 두는 것을 허용한다. 기존 테이블을 <code>category_old(id, parent_id, name)</code>라고 하면 다음과 같다.</p>
+
+<pre><code class="language-sql">INSERT INTO category_path (ancestor_id, descendant_id, depth)
+WITH RECURSIVE pairs (ancestor_id, descendant_id, depth) AS (
+    SELECT id, id, 0
+      FROM category_old
+    UNION ALL
+    SELECT p.ancestor_id, c.id, p.depth + 1
+      FROM pairs p
+      JOIN category_old c ON c.parent_id = p.descendant_id
+)
+SELECT ancestor_id, descendant_id, depth FROM pairs;</code></pre>
+
+<h3>폐쇄 테이블의 조회와 InnoDB 인덱스</h3>
+
+<p>폐쇄 테이블이 있으면 단계 수를 모르는 질문이 모두 조인 한 번짜리 질문으로 바뀐다. 반복이 이미 저장 시점에 끝나 있기 때문이다. 질문 표를 다시 따라가 보자.</p>
+
+<pre><code class="language-sql">-- Q3 가전(2)의 하위 트리 전체 (자기 자신 포함)
+SELECT c.id, c.name, p.depth
+  FROM category_path p
+  JOIN category c ON c.id = p.descendant_id
+ WHERE p.ancestor_id = 2
+ ORDER BY p.depth, c.id;
+
+-- Q4 OLED TV(7)의 조상 경로 (루트부터)
+SELECT c.id, c.name, p.depth
+  FROM category_path p
+  JOIN category c ON c.id = p.ancestor_id
+ WHERE p.descendant_id = 7
+ ORDER BY p.depth DESC;
+
+-- Q1 가전(2)의 직속 자식 / Q2 OLED TV(7)의 부모
+SELECT descendant_id FROM category_path WHERE ancestor_id = 2 AND depth = 1;
+SELECT ancestor_id   FROM category_path WHERE descendant_id = 7 AND depth = 1;
+
+-- Q5 루트에서 두 단계까지만
+SELECT descendant_id, depth FROM category_path WHERE ancestor_id = 1 AND depth <= 2;</code></pre>
+
+<p>Q3의 결과는 재귀 CTE와 똑같이 2, 4, 5, 7, 8, 9의 여섯 행이고, Q4의 결과는 전체(3), 가전(2), TV(1), OLED TV(0)의 네 행이다. Q1은 4와 5, Q2는 4를 돌려준다. Q5는 1부터 6까지의 여섯 노드를 depth 0, 1, 1, 2, 2, 2로 돌려준다(모두 MySQL 8.4.13과 8.0.46에서 실행해 확인했다). Q6의 하위 포함 상품 수는 앞의 재귀 CTE에서 <code>pairs</code> 자리에 category_path를 놓으면 된다.</p>
+
+<pre><code class="language-sql">SELECT p.ancestor_id, COUNT(pr.id) AS product_count
+  FROM category_path p
+  LEFT JOIN product pr ON pr.category_id = p.descendant_id
+ GROUP BY p.ancestor_id;</code></pre>
+
+<p>이 쿼리들이 InnoDB 안에서 어떻게 읽히는지 내려가 보자. category_path의 기본 키는 <code>(ancestor_id, descendant_id)</code>이므로 InnoDB의 클러스터형 인덱스는 행 전체를 이 순서로 정렬해 B+Tree의 리프 페이지에 저장한다. ancestor_id가 2인 행 여섯 개는 리프 페이지 안에서 서로 붙어 있고, 그 안에서 descendant_id 순으로 놓여 있으며, 각 레코드에 depth 값까지 들어 있다. 따라서 Q3의 category_path 부분은 B+Tree를 루트에서 리프까지 한 번 내려가 <code>ancestor_id = 2</code>의 첫 레코드를 찾은 뒤, 리프를 따라 여섯 레코드를 순서대로 읽는 범위 스캔 하나다. 재귀 CTE가 노드마다 인덱스를 한 번씩, 여섯 번 내려가야 했던 것(재귀 부분이 parent_id 인덱스를 쓰는 계획일 때)과 대비된다. MySQL 8.4.13에서 Q3을 EXPLAIN하면 <code>p</code>가 <code>type = ref</code>, <code>key = PRIMARY</code>, <code>ref = const</code>로 나와 기본 키 앞 열로 구간 하나를 읽는다는 것이 보이고, <code>c</code>는 <code>eq_ref</code>로 행마다 기본 키를 한 번 찾는다. Extra의 <code>Using temporary; Using filesort</code>는 <code>ORDER BY p.depth, c.id</code>가 인덱스 순서(descendant_id 순)와 달라서 생기는 정렬이다.</p>
+
+<p>Q4는 반대 방향이라 보조 인덱스 <code>idx_descendant (descendant_id, depth)</code>를 쓴다. InnoDB 매뉴얼에 따르면 보조 인덱스의 각 레코드는 인덱스 열과 함께 그 행의 기본 키 열을 담는다. 이 인덱스의 레코드는 실제로 (descendant_id, depth, ancestor_id)를 담고 있으므로 Q4에 필요한 ancestor_id와 depth를 클러스터형 인덱스를 다시 찾지 않고 보조 인덱스만으로 얻는다. 이런 인덱스를 커버링 인덱스(covering index)라고 한다. 게다가 같은 descendant_id 안에서 레코드가 depth 순으로 정렬되어 있으므로, 옵티마이저는 이 구간을 역순으로 읽어 별도의 정렬 작업 없이 루트부터의 경로 순서를 얻을 수 있다. MySQL 8.4.13에서 Q4를 EXPLAIN하면 실제로 <code>p</code>가 <code>type = ref</code>, <code>key = idx_descendant</code>, <code>Extra = Backward index scan; Using index</code>로 나온다. Using index가 커버링을, Backward index scan이 역순 읽기를, filesort가 없다는 것이 정렬 생략을 보여 준다(rows 같은 추정치는 실행 환경과 통계에 따라 달라진다). 두 방향의 질문 모두에서 "인덱스 한 번 내려가기와 연속된 레코드 읽기"가 폐쇄 테이블의 조회 비용이다.</p>
+
+<x-visual id="db-design2-02-closure-index" title="폐쇄 테이블의 두 인덱스와 하위 트리·조상 조회" kind="구조 다이어그램" ratio="16:9">
+<x-hint>클러스터형 인덱스에서 같은 조상의 행이 연속 구간을 이루고, 보조 인덱스에서 같은 자손의 행이 depth 순으로 모여 있어 두 질문 모두 범위 스캔 하나로 끝난다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 기술 다이어그램, 위아래 두 단. 위 단: "클러스터형 인덱스 (ancestor_id, descendant_id)"라는 제목의 B+Tree. 루트 노드 하나, 그 아래 리프 페이지 3개가 가로로 연결 리스트 화살표로 이어진다. 리프에는 (1,1,0) (1,2,1) ... (2,2,0) (2,4,1) (2,5,1) (2,7,2) (2,8,2) (2,9,2) (3,3,0) ... 처럼 작은 칸들이 순서대로 놓인다. ancestor_id가 2인 여섯 칸을 한 색으로 칠하고 그 위에 "가전(2)의 하위 트리: 연속 구간"이라는 라벨. 루트에서 첫 칸까지 내려가는 화살표 하나. 아래 단: "보조 인덱스 (descendant_id, depth) + 기본 키"라는 제목의 B+Tree. 리프 칸에 (7,0,7) (7,1,4) (7,2,2) (7,3,1) 같은 레코드가 보이고 이 네 칸을 다른 색으로 칠한 뒤 "OLED TV(7)의 조상: depth 순으로 정렬됨" 라벨. 오른쪽 여백에 "인덱스 한 번 내려가기 + 연속 읽기"라는 요약 라벨. 라벨은 한국어, 단색 계열.</x-prompt>
+<x-caption>클러스터형 인덱스에서 같은 조상의 행은 연속 구간이고, 보조 인덱스에서 같은 자손의 행은 depth 순으로 모여 있다. 두 질문 모두 범위 스캔 하나로 끝난다.</x-caption>
+</x-visual>
+
+<h3>폐쇄 테이블의 변경: 삽입, 삭제, 하위 트리 이동</h3>
+
+<p>조회가 싸진 대신 변경은 비싸진다. 인접 리스트에서는 사실이 한 곳에만 있었지만, 폐쇄 테이블에서는 "4가 2 아래에 있다"는 사실이 (2, 4), (2, 7), (2, 8), (1, 4), (1, 7), (1, 8) 같은 여러 행에 퍼져 있다. 구조를 바꾸면 이 행들을 모두 일관되게 고쳐야 한다. 세 가지 변경을 차례로 계산해 보자.</p>
+
+<h4>리프 추가</h4>
+
+<p>TV(4) 아래에 QLED TV를 id 10으로 추가한다. 새 노드의 조상은 "부모의 조상 전부"에 "자기 자신"을 더한 것이다. 부모 4의 조상 행 (1,4,2), (2,4,1), (4,4,0)의 descendant를 10으로 바꾸고 depth를 1씩 늘리면 새 노드의 조상 행이 된다.</p>
+
+<pre><code class="language-sql">START TRANSACTION;
+
+INSERT INTO category (id, name) VALUES (10, 'QLED TV');
+
+INSERT INTO category_path (ancestor_id, descendant_id, depth)
+VALUES (10, 10, 0);                                   -- 자기 자신
+
+INSERT INTO category_path (ancestor_id, descendant_id, depth)
+SELECT ancestor_id, 10, depth + 1                     -- 부모의 조상들을 물려받는다
+  FROM category_path
+ WHERE descendant_id = 4;
+
+COMMIT;</code></pre>
+
+<pre data-label="추가된 경로 행 (MySQL 8.4.13에서 실행)"><code class="language-text">ancestor_id  descendant_id  depth
+-----------  -------------  -----
+          1             10      3
+          2             10      2
+          4             10      1
+         10             10      0</code></pre>
+
+<p>새 노드의 깊이가 3이므로 4행이 추가되어 전체는 30행이 된다. 실무에서는 id를 AUTO_INCREMENT로 받으므로 10 자리에 <code>LAST_INSERT_ID()</code> 값을 쓴다. 세 번째 문장은 category_path에서 읽어 category_path에 넣는다. MySQL 매뉴얼은 INSERT ... SELECT에서 대상 테이블이 SELECT의 FROM 절에 나와도 된다고 하며, 같은 테이블에서 읽어 넣을 때는 SELECT의 결과를 내부 임시 테이블에 먼저 담은 뒤 대상 테이블에 넣는다고 설명한다. 읽는 도중에 방금 넣은 행을 다시 읽는 일이 없다. MySQL 8.4.13과 8.0.46에서 이 트랜잭션을 실행하면 세 번째 INSERT는 오류 없이 3행을 넣고, 위의 4행이 생겨 전체가 30행이 된다. 반면 대상 테이블을 서브쿼리 안에서 읽는 것은 허용되지 않는다는 점도 같은 문서에 있다. 이 차이는 삭제에서 중요해진다.</p>
+
+<h4>하위 트리 삭제</h4>
+
+<p>TV 하위 트리(4, 7, 8)를 지운다고 하자. 지울 경로 행은 자손이 하위 트리 안에 있는 모든 행이다. 조상이 하위 트리 안에 있는 행은 자손도 반드시 하위 트리 안에 있으므로 따로 셀 필요가 없다. 다른 DBMS에서 흔히 보는 형태는 서브쿼리로 하위 트리를 구해 지우는 것이다.</p>
+
+<pre><code class="language-sql">-- MySQL에서는 1093 오류가 나는 형태
+DELETE FROM category_path
+ WHERE descendant_id IN (SELECT descendant_id
+                           FROM category_path
+                          WHERE ancestor_id = 4);</code></pre>
+
+<p>MySQL에서는 이 문장이 실패한다(MySQL 8.4.13과 8.0.46에서 실행해 아래 1093 오류를 확인했다). 매뉴얼의 서브쿼리 제약 절은 일반적으로 한 테이블을 수정하면서 같은 테이블을 서브쿼리에서 읽을 수 없다고 하고, 이때 나는 오류가 1093(You can't specify target table 'category_path' for update in FROM clause)이다. 가장 이해하기 쉬운 우회는 하위 트리의 id 목록을 먼저 읽고, 그 목록으로 지우는 것이다. 읽기와 지우기를 한 트랜잭션에 넣고 읽을 때 <code>FOR UPDATE</code>로 잠가 두면, 목록을 읽은 뒤 지우기 전에 다른 트랜잭션이 이 행들을 바꾸는 것을 막을 수 있다.</p>
+
+<pre><code class="language-sql">START TRANSACTION;
+
+SELECT descendant_id
+  FROM category_path
+ WHERE ancestor_id = 4
+   FOR UPDATE;                                   -- 4, 7, 8
+
+DELETE FROM category_path WHERE descendant_id IN (4, 7, 8);   -- 11행
+DELETE FROM category      WHERE id            IN (4, 7, 8);   -- 3행
+
+COMMIT;</code></pre>
+
+<p>지워지는 경로 행은 4의 조상 행 3개(1, 2, 4), 7의 조상 행 4개(1, 2, 4, 7), 8의 조상 행 4개(1, 2, 4, 8)로 모두 11개이고, 26행 중 15행이 남는다. 남은 여섯 노드의 (깊이 + 1)을 더하면 1 + 2 + 2 + 3 + 3 + 4 = 15이므로 맞는다. 순서도 중요하다. category_path가 category를 참조하므로, 경로 행을 먼저 지우고 노드 행을 나중에 지워야 외래 키 검사를 통과한다. MySQL 8.4.13과 8.0.46에서 실행하면 두 DELETE가 각각 11행, 3행을 지워 15행이 남고, 순서를 바꿔 category를 먼저 지우면 1451 오류(fk_path_ancestor 위반)가 난다. 이 설계의 category에는 자기 참조 외래 키가 없으므로 노드 행끼리의 삭제 순서는 신경 쓰지 않아도 된다.</p>
+
+<h4>하위 트리 이동</h4>
+
+<p>가장 까다로운 것이 이동이다. TV 하위 트리(4, 7, 8)를 가전(2)에서 디지털(3) 아래로 옮겨 보자. 이동은 끊기와 다시 잇기의 두 단계로 나뉜다. 하위 트리 안쪽의 관계, 곧 (4,4), (4,7), (4,8), (7,7), (8,8)은 이동과 무관하게 그대로 유지된다. 바뀌는 것은 하위 트리 바깥의 조상과 하위 트리 안의 노드를 잇는 행뿐이다.</p>
+
+<p>1단계, 끊기. 지울 행은 "자손이 4의 하위 트리 안에 있고, 조상이 4의 진짜 조상(자기 자신 제외)인" 행이다. 4의 진짜 조상은 1과 2, 하위 트리는 4, 7, 8이므로 2 × 3 = 6행이다. MySQL에서는 서브쿼리 대신 다중 테이블 DELETE 문법으로 같은 테이블을 별칭을 달리해 조인한다. 매뉴얼의 다중 테이블 DELETE는 FROM 앞에 적은 테이블에서만 조건에 맞는 행을 지우고, 나머지 테이블은 검색에만 쓴다.</p>
+
+<pre><code class="language-sql">DELETE p
+  FROM category_path AS p
+  JOIN category_path AS sub ON sub.descendant_id = p.descendant_id   -- p의 자손이 하위 트리 안
+  JOIN category_path AS sup ON sup.ancestor_id   = p.ancestor_id     -- p의 조상이 4의 조상
+ WHERE sub.ancestor_id   = 4
+   AND sup.descendant_id = 4
+   AND sup.depth > 0;                                                -- 4 자신은 빼고</code></pre>
+
+<pre data-label="1단계에서 지워지는 행 (MySQL 8.4.13에서 같은 조인을 SELECT로 실행)"><code class="language-text">ancestor_id  descendant_id  depth
+-----------  -------------  -----
+          1              4      2
+          1              7      3
+          1              8      3
+          2              4      1
+          2              7      2
+          2              8      2</code></pre>
+
+<p>2단계, 다시 잇기. 새 부모 3의 조상 전체(자기 자신 포함: 1, 3)와 하위 트리의 노드 전체(4, 7, 8)의 모든 조합을 만든다. 2 × 3 = 6행이다. 새 행의 depth는 "새 조상에서 새 부모까지의 거리 + 새로 생긴 간선 하나 + 4에서 그 자손까지의 거리"다. 예를 들어 (1, 7)은 1에서 3까지 1, 3에서 4까지 1, 4에서 7까지 1이므로 3이다.</p>
+
+<pre><code class="language-sql">INSERT INTO category_path (ancestor_id, descendant_id, depth)
+SELECT sup.ancestor_id, sub.descendant_id, sup.depth + sub.depth + 1
+  FROM category_path AS sup
+ CROSS JOIN category_path AS sub
+ WHERE sup.descendant_id = 3          -- 새 부모와 그 조상들
+   AND sub.ancestor_id   = 4;         -- 옮기는 하위 트리</code></pre>
+
+<pre data-label="2단계에서 추가되는 행 (MySQL 8.4.13에서 실행)"><code class="language-text">ancestor_id  descendant_id  depth
+-----------  -------------  -----
+          1              4      2
+          1              7      3
+          1              8      3
+          3              4      1
+          3              7      2
+          3              8      2</code></pre>
+
+<p>(1, 4, 2), (1, 7, 3), (1, 8, 3)은 1단계에서 지웠다가 같은 값으로 다시 들어왔다. 옛 부모 2와 새 부모 3이 같은 깊이의 형제라서 루트까지의 거리가 변하지 않았기 때문이다. 두 단계는 반드시 한 트랜잭션으로 묶는다. MySQL 8.4.13과 8.0.46에서 실행하면 같은 테이블을 셀프 조인한 다중 테이블 DELETE가 오류 없이 6행을 지우고, INSERT ... SELECT가 6행을 넣는다. 결과는 여전히 26행이고, 이동 후의 인접 관계로 폐쇄를 처음부터 다시 계산한 26행과 비교하면 빠진 행이 하나도 없어 정확히 같다. OLED TV(7)의 조상을 물으면 이제 전체(3), 디지털(2), TV(1), OLED TV(0)가 나온다.</p>
+
+<x-visual id="db-design2-02-subtree-move" title="폐쇄 테이블에서 하위 트리를 옮길 때 지우고 넣는 경로 행" kind="전후 비교 다이어그램" ratio="16:9">
+<x-hint>하위 트리 내부의 경로는 그대로 두고, 옛 조상과 하위 트리를 잇는 경로만 지운 뒤 새 조상과 하위 트리를 잇는 경로를 교차 결합으로 넣는다는 것을 보여 준다.</x-hint>
+<x-prompt>흰 배경의 전후 비교 다이어그램, 좌우 두 패널. 왼쪽 패널 제목 "이동 전": 트리 "전체(1)" 아래 "가전(2)"와 "디지털(3)", 가전 아래 "TV(4)"를 꼭짓점으로 하는 하위 트리(TV, OLED TV(7), LCD TV(8))를 점선 상자로 감싼다. 전체와 가전에서 점선 상자 안의 세 노드로 향하는 빨간 점선 화살표 6개를 그리고 라벨 "끊을 경로 2×3=6행". 오른쪽 패널 제목 "이동 후": 같은 점선 상자가 디지털(3) 아래로 옮겨져 있고, 전체와 디지털에서 상자 안의 세 노드로 향하는 초록 실선 화살표 6개와 라벨 "새로 넣을 경로 2×3=6행". 두 패널 모두 점선 상자 내부에는 회색 화살표로 "그대로 두는 내부 경로"라는 라벨. 가운데에 큰 화살표와 "한 트랜잭션" 라벨. 라벨은 한국어, 장식 없는 단색 계열과 빨강·초록 강조색.</x-prompt>
+<x-caption>하위 트리 이동은 옛 조상과 하위 트리를 잇는 경로를 지우고, 새 조상과 하위 트리를 잇는 경로를 교차 결합으로 넣는 두 단계다.</x-caption>
+</x-visual>
+
+<p>이동의 비용은 공식으로 쓸 수 있다. 하위 트리의 노드 수를 s, 옛 위치에서 옮기는 노드의 진짜 조상 수를 a, 새 부모와 그 조상의 수를 b라고 하면 지우는 행은 a × s, 넣는 행은 b × s다. 예제는 2 × 3과 2 × 3이었다. 노드 1만 개짜리 하위 트리를 깊이 5 근처에서 깊이 5 근처로 옮긴다면 각각 5만 행 안팎을 지우고 넣는다. 인접 리스트에서는 같은 이동이 행 하나의 UPDATE였다. 이 차이가 쓰기 비용의 전부가 아니다. InnoDB에서는 지우고 넣는 행마다 언두 로그와 리두 로그가 기록되고, 바뀐 인덱스 레코드에는 잠금이 걸린다. MySQL 8.0의 기본값인 행 기반 바이너리 로그 형식이라면 바이너리 로그에도 바뀐 행마다 기록이 남는다. 큰 하위 트리의 이동은 그만큼 긴 트랜잭션이 된다.</p>
+
+<p>대신 폐쇄 테이블은 순환 검사를 아주 싸게 만든다. X를 P 아래로 옮기기 전에 "P가 X의 하위 트리 안에 있는가"를 묻는 것은 <code>SELECT 1 FROM category_path WHERE ancestor_id = X AND descendant_id = P</code>, 곧 기본 키 하나를 찾는 일이다. TV(4)를 OLED TV(7) 아래로 옮기려 하면 (4, 7) 행이 있으므로 즉시 거부할 수 있다. 인접 리스트에서 재귀 CTE로 조상을 훑던 검사가 인덱스 한 번 찾기로 줄어든다. 다만 검사와 변경이 별개의 문장이라 동시 실행에서 생기는 문제는 인접 리스트에서와 같으므로, 구조 변경끼리 차례를 지키게 하는 장치는 여전히 필요하다.</p>
+
+<p>공간도 따져 보자. 행 수는 모든 노드의 (깊이 + 1)의 합이다. 카테고리, 조직도, 메뉴처럼 노드는 많아도 깊이가 얕은 트리에서는 노드 수의 몇 배 정도다. 노드 1만 개, 최대 깊이 4인 카테고리라면 많아야 5만 행이다. 반대로 깊이가 노드 수만큼 깊어질 수 있는 데이터, 예를 들어 답글에 답글이 끝없이 이어지는 댓글 스레드에서는 사정이 다르다. 한 줄로 이어진 노드 n개의 체인은 1 + 2 + … + n = n(n+1)/2행을 만든다. 1,000단계로 이어진 답글 체인 하나가 500,500행이다. 폐쇄 테이블을 고를 때는 데이터의 깊이가 어디까지 커질 수 있는지를 먼저 물어야 한다.</p>
+
+<h3>다른 두 모델: 경로 열거와 중첩 집합</h3>
+
+<p>계층을 미리 계산해 저장하는 방법은 폐쇄 테이블만이 아니다. 자주 비교되는 두 모델을 같은 예제 트리로 살펴보고, 폐쇄 테이블과 무엇이 다른지 짚는다.</p>
+
+<h4>경로 열거</h4>
+
+<p>경로 열거(path enumeration) 모델은 각 노드 행에 루트부터 자기까지의 경로를 문자열로 저장한다. 구체화된 경로(materialized path)라고도 한다. 앞에서 재귀 CTE로 만든 경로 열을 아예 테이블에 저장해 두는 셈이다. 예제 트리라면 전체는 <code>/1/</code>, 가전은 <code>/1/2/</code>, TV는 <code>/1/2/4/</code>, OLED TV는 <code>/1/2/4/7/</code>을 가진다. 경로 열에 B+Tree 인덱스를 두면 하위 트리 조회는 접두사 검색이 된다.</p>
+
+<pre><code class="language-sql">SELECT id, name FROM category WHERE path LIKE '/1/2/4/%';   -- TV와 그 하위 트리</code></pre>
+
+<p>MySQL 매뉴얼은 LIKE의 인자가 와일드카드로 시작하지 않는 상수 문자열이면 B-tree 인덱스를 쓸 수 있다고 설명한다. 예를 들어 <code>LIKE 'Patrick%'</code>는 <code>'Patrick'</code> 이상 <code>'Patricl'</code> 미만의 범위만 본다. 그래서 위 조회는 인덱스 범위 스캔 하나다. 예제 아홉 노드에 path 인덱스를 두고 MySQL 8.4.13에서 EXPLAIN하면 <code>type = range</code>, <code>key = path</code>로 나오고, 결과는 TV, OLED TV, LCD TV의 세 행이다. 경로 끝에 구분자를 붙이는 이유도 여기서 나온다. 구분자가 없으면 <code>'/1/2/4%'</code>가 id 40인 노드의 경로 <code>/1/2/40</code>까지 잡아 버린다. 구분자로 끝맺은 <code>'/1/2/4/%'</code>는 그런 오인을 막는다.</p>
+
+<p>조상 조회는 경로 문자열을 잘라서 얻는다. 7의 조상은 경로 <code>/1/2/4/7/</code>에 적힌 1, 2, 4다. 애플리케이션에서 문자열을 나누면 쉽지만, SQL로 조상 행을 조인하려면 <code>'/1/2/4/7/' LIKE CONCAT(path, '%')</code>처럼 상수가 아니라 열 쪽에 와일드카드가 붙는 조건을 써야 해서 인덱스 범위 스캔을 쓸 수 없다. 하위 트리 이동은 하위 트리의 모든 행의 경로 앞부분을 바꾸는 UPDATE다. TV를 디지털 아래로 옮기면 접두사 <code>/1/2/4/</code>를 <code>/1/3/4/</code>로 바꾼다.</p>
+
+<pre><code class="language-sql">UPDATE category
+   SET path = CONCAT('/1/3/4/', SUBSTRING(path, CHAR_LENGTH('/1/2/4/') + 1))
+ WHERE path LIKE '/1/2/4/%';</code></pre>
+
+<p>OLED TV의 경로 <code>/1/2/4/7/</code>에서 앞의 7글자를 떼면 <code>7/</code>이 남고, 새 접두사를 붙이면 <code>/1/3/4/7/</code>이 된다. TV 자신은 남는 부분이 빈 문자열이라 <code>/1/3/4/</code>가 된다. 갱신되는 행은 하위 트리의 노드 수만큼이다. 경로 열거의 가장 큰 약점은 무결성이다. 경로 문자열 안의 숫자들은 외래 키가 아니므로, 존재하지 않는 id가 경로에 들어가도 데이터베이스는 막지 못한다. 경로와 실제 구조가 어긋나도 알려 주는 장치가 없다. 경로 길이도 깊이에 비례해 커지므로 열의 최대 길이를 정할 때 깊이 상한을 가정해야 한다.</p>
+
+<h4>중첩 집합</h4>
+
+<p>중첩 집합(nested set) 모델은 각 노드에 두 개의 번호 <code>lft</code>와 <code>rgt</code>를 매긴다. 트리를 깊이 우선으로 돌면서 노드에 들어갈 때 번호 하나, 나올 때 번호 하나를 1부터 차례로 붙인다. 예제 트리를 자식 id 순으로 돌면 다음과 같다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>노드</th><th>lft</th><th>rgt</th><th>노드</th><th>lft</th><th>rgt</th></tr></thead><tbody>
+<tr><td>전체(1)</td><td>1</td><td>18</td><td>LCD TV(8)</td><td>6</td><td>7</td></tr>
+<tr><td>가전(2)</td><td>2</td><td>13</td><td>주방가전(5)</td><td>9</td><td>12</td></tr>
+<tr><td>TV(4)</td><td>3</td><td>8</td><td>냉장고(9)</td><td>10</td><td>11</td></tr>
+<tr><td>OLED TV(7)</td><td>4</td><td>5</td><td>디지털(3)</td><td>14</td><td>17</td></tr>
+<tr><td></td><td></td><td></td><td>음향기기(6)</td><td>15</td><td>16</td></tr>
+</tbody></table></div>
+
+<p>이렇게 매기면 각 노드의 구간 [lft, rgt]가 그 하위 트리 노드들의 구간을 모두 품는다. 가전의 구간 [2, 13]은 TV [3, 8], 주방가전 [9, 12]와 그 아래 노드들의 구간을 안에 담는다. 그래서 하위 트리 조회는 <code>lft BETWEEN 2 AND 13</code>이라는 범위 조건 하나가 되고, 가전, TV, OLED TV, LCD TV, 주방가전, 냉장고의 여섯 노드가 나온다. 조상 조회는 거꾸로 구간이 자신을 품는 노드다. OLED TV [4, 5]의 조상은 <code>lft < 4 AND rgt > 5</code>인 전체, 가전, TV다. 하위 트리의 크기는 (rgt − lft + 1) / 2로 행을 읽지 않고도 알 수 있고, rgt = lft + 1이면 리프다. 별도의 테이블 없이 열 두 개로 이 모든 것을 얻는다는 점이 중첩 집합의 매력이다.</p>
+
+<p>대가는 변경에서 치른다. 음향기기(6) 아래에 마지막 자식을 넣는다면 새 노드는 [16, 17]을 받고, rgt가 16 이상인 모든 노드의 rgt와 lft가 16보다 큰 모든 노드의 lft를 2씩 늘려야 한다. 이 경우는 트리의 오른쪽 끝이라 음향기기, 디지털, 전체 세 행만 바뀐다. 그러나 OLED TV(7) 아래에 자식을 넣으면 rgt가 5 이상인 노드, 곧 예제의 아홉 노드 전부의 rgt가 바뀌고 lft가 5보다 큰 다섯 노드의 lft도 바뀐다. 삽입 위치 오른쪽에 있는 거의 모든 행을 고쳐야 하므로, 행이 많고 쓰기가 잦은 테이블에서는 갱신량과 잠금 범위가 함께 커진다. 직속 부모를 찾는 일도 의외로 어렵다. 자신을 품는 구간 중 가장 안쪽, 곧 lft가 가장 큰 조상을 골라야 한다. 그래서 중첩 집합은 거의 바뀌지 않고 읽기만 많은 트리에 맞는 모델이다.</p>
+
+<h3>정리: 반복을 어디에 둘 것인가</h3>
+
+<p>이 회차의 모든 모델은 하나의 질문에 대한 서로 다른 답이었다. 계층 조회의 본질은 부모 관계를 정해지지 않은 횟수만큼 이어 붙이는 반복이고, 그 반복을 어디에서 할지를 고르는 것이 계층 구조 설계다. 애플리케이션에서 반복하면 왕복 비용을 낸다. 쿼리 실행 중에 반복하면(재귀 CTE) 조회할 때마다 계산 비용을 낸다. 저장할 때 반복의 결과를 만들어 두면(폐쇄 테이블, 경로 열거, 중첩 집합) 쓸 때마다 갱신 비용을 내고 저장 공간을 더 쓴다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>기준</th><th>인접 리스트 + 재귀 CTE</th><th>경로 열거</th><th>중첩 집합</th><th>폐쇄 테이블</th></tr></thead><tbody>
+<tr><td>직속 자식·부모</td><td>인덱스 한 번</td><td>문자열 처리 필요</td><td>부모 찾기가 까다롭다</td><td>depth = 1 조건 한 번</td></tr>
+<tr><td>하위 트리</td><td>재귀 CTE, 노드마다 인덱스 탐색</td><td>접두사 LIKE 범위 스캔</td><td>BETWEEN 범위 스캔</td><td>클러스터형 인덱스 범위 스캔</td></tr>
+<tr><td>조상 경로</td><td>재귀 CTE, 깊이만큼 기본 키 탐색</td><td>문자열 분해</td><td>범위 조건</td><td>보조 인덱스 범위 스캔</td></tr>
+<tr><td>리프 추가</td><td>1행</td><td>1행</td><td>삽입 위치 오른쪽 행 다수 갱신</td><td>깊이 + 1행</td></tr>
+<tr><td>하위 트리 이동</td><td>1행 UPDATE</td><td>하위 트리 행 수만큼 UPDATE</td><td>대규모 재번호</td><td>a × s 삭제, b × s 삽입</td></tr>
+<tr><td>참조 무결성</td><td>외래 키로 부모 존재 보장, 순환은 못 막음</td><td>경로 안의 id는 검증되지 않음</td><td>번호의 일관성은 애플리케이션 책임</td><td>두 열 모두 외래 키, 경로 집합의 일관성은 애플리케이션 책임</td></tr>
+<tr><td>추가 공간</td><td>없음</td><td>경로 문자열</td><td>열 두 개</td><td>노드마다 깊이 + 1행</td></tr>
+</tbody></table></div>
+
+<p>판단 순서를 정리하면 이렇다. MySQL 8.0 이상이라면 출발점은 인접 리스트와 재귀 CTE다. 사실이 한 곳에만 저장되어 변경이 가장 싸고 안전하며, 재귀 CTE가 깊이를 모르는 질문을 한 문장으로 처리해 준다. 트리가 작고 잘 바뀌지 않는다면(카테고리, 메뉴) 전체를 읽어 메모리에서 조립하고 캐시하는 방법도 충분히 좋은 선택이다. 하위 트리나 조상 조회가 매우 잦고, 하위 트리가 커서 노드마다 인덱스를 찾는 비용이 문제 되거나, 하위 트리 단위의 집계를 큰 테이블과 자주 조인해야 한다면 폐쇄 테이블을 더한다. 이때 parent_id를 함께 둘지는 직속 부모 조회의 빈도와 두 곳을 함께 고치는 부담을 비교해 정한다. 경로 문자열 자체가 업무에 쓸모 있고(정렬, 표시) 이동이 드물다면 경로 열거가, 거의 바뀌지 않는 트리를 읽기만 한다면 중첩 집합이 후보가 된다.</p>
+
+<p>JPA를 쓰는 애플리케이션이라면 이 판단이 엔티티 설계로 이어진다. 인접 리스트는 엔티티 안의 <code>@ManyToOne</code> 부모와 <code>mappedBy</code>를 쓴 <code>@OneToMany</code> 자식 컬렉션으로 자연스럽게 매핑되지만, 지연 로딩된 자식 컬렉션을 재귀적으로 순회하면 앞에서 본 노드 수만큼의 쿼리가 나간다. 하위 트리가 필요할 때는 재귀 CTE를 네이티브 쿼리로 실행하거나, Hibernate 6.2 사용자 가이드가 설명하는 HQL의 with 절을 쓸 수 있다. 이 가이드는 HQL의 재귀 CTE에 너비 우선·깊이 우선 탐색 순서를 지정하는 SEARCH 절과 순환 판정을 지정하는 CYCLE 절을 둘 수 있다고 설명한다. MySQL 매뉴얼의 WITH 문법에는 이 두 절이 없으므로, MySQL에서 직접 SQL을 쓸 때는 이 회차에서 한 것처럼 경로 열을 만들어 정렬하고 순환을 감지한다. 폐쇄 테이블은 두 개의 <code>@ManyToOne</code>과 복합 키를 가진 별도 엔티티로 매핑한다. 데이터베이스 설계 1편에서 본 연결 테이블과 같은 모양이다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>"조상이다"는 "부모다"를 정해지지 않은 횟수만큼 이어 붙인 관계이므로, 계층 조회에는 반드시 반복이 필요하다. 인접 리스트는 부모 하나만 저장해 변경을 한 행으로 끝내고, 반복을 재귀 CTE에 맡긴다. 재귀 CTE의 각 반복은 직전 반복의 행만 보므로 반복 하나가 트리의 한 층이 된다. 폐쇄 테이블은 그 반복의 결과인 모든 (조상, 자손) 쌍을 저장해 조회를 인덱스 범위 스캔 하나로 만들고, 그 대가로 구조 변경마다 (조상 수 × 하위 트리 크기)만큼의 행을 고친다.</p></aside>
+
+<p>같은 권의 다른 회차에서도 이 회차의 생각이 다시 쓰인다. 카테고리가 언제 어디로 옮겨졌는지를 남겨야 한다면 03회와 04회의 변경 이력 설계가, 하위 트리 단위의 집계를 미리 계산해 두는 일은 06회의 통계 테이블 설계가 이어받는다. 폐쇄 테이블 자체가 "조회할 때 계산할 것을 쓸 때 미리 계산해 둔다"는 사전 계산의 한 형태라는 점에서, 06회와 같은 비용 계산을 따른다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>인접 리스트 모델</dt><dd>각 노드 행에 부모의 id 하나만 저장하는 계층 표현이다. 사실이 한 곳에만 있어 하위 트리 이동도 행 하나의 UPDATE로 끝나지만, 여러 단계 질문에는 반복이 필요하다.</dd>
+<dt>자기 참조 외래 키의 한계</dt><dd>parent_id 외래 키는 부모 행의 존재만 보장하고 순환이나 루트에서의 단절은 막지 못한다. MySQL은 외래 키를 행 단위로 즉시 검사하므로 일괄 적재와 다중 행 삭제에서 순서가 중요하다.</dd>
+<dt>재귀 CTE</dt><dd>비재귀 부분이 출발 행을 만들고, 재귀 부분이 CTE 이름을 참조해 행을 더 만드는 WITH RECURSIVE 구조다. 재귀 부분이 새 행을 만들지 못하면 끝나며, MySQL에서 재귀 CTE는 언제나 내부 임시 테이블로 구체화된다.</dd>
+<dt>직전 반복 규칙</dt><dd>재귀 부분의 각 반복은 직전 반복이 만든 행만 입력으로 받는다. 그래서 반복 하나가 트리의 한 층이 되고, 반복 횟수는 노드 수가 아니라 깊이로 정해진다.</dd>
+<dt>경로 열과 타입 추론</dt><dd>CTE 열의 타입은 비재귀 부분만으로 정해지므로, 재귀 부분에서 길어지는 경로 열은 비재귀 부분에서 CAST로 넉넉히 잡아야 한다. 경로 문자열 정렬은 사전식이므로 형제 순서가 필요하면 구간 폭을 고정한다.</dd>
+<dt>순환과 반복 한도</dt><dd>순환이 있으면 재귀가 끝나지 않고 cte_max_recursion_depth(기본 1000)에 걸려 3636 오류로 중단된다. depth나 path 열이 있으면 UNION DISTINCT로는 막을 수 없으므로 경로로 감지하고, 이동 전에 조상 검사로 예방한다.</dd>
+<dt>폐쇄 테이블 모델</dt><dd>자기 자신을 포함한 모든 (조상, 자손, 거리) 쌍을 저장한다. 하위 트리와 조상 조회가 인덱스 범위 스캔 하나가 되고, 행 수는 모든 노드의 (깊이 + 1)의 합이다.</dd>
+<dt>폐쇄 테이블의 이동 비용</dt><dd>하위 트리 이동은 옛 조상과 하위 트리를 잇는 행을 지우고 새 조상과 하위 트리를 교차 결합해 넣는 두 단계이며, 지우는 행은 a × s, 넣는 행은 b × s다.</dd>
+<dt>경로 열거와 중첩 집합</dt><dd>경로 열거는 루트부터의 경로 문자열을 저장해 접두사 검색으로 하위 트리를 찾지만 경로 안의 id는 검증되지 않는다. 중첩 집합은 lft, rgt 구간으로 조회는 싸지만 삽입 때 오른쪽 행 다수를 다시 번호 매긴다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 계층 구조 관련 장애는 대개 조회가 느리다는 보고로 시작하지 않는다. "어떤 카테고리의 상품이 목록에서 사라졌다", "관리 화면의 트리가 끝없이 로딩된다" 같은 이상한 증상으로 온다. 앞의 것은 깊이가 고정된 조인 쿼리에 새 단계가 추가되었거나, 잘못된 이동으로 순환이 생겨 일부 노드가 루트에서 끊긴 경우가 많다. 뒤의 것은 순환이 생긴 데이터를 애플리케이션이 재귀적으로 따라가거나, 재귀 CTE가 반복 한도까지 돌다 3636 오류를 낸 경우다. 이런 증상을 보면 먼저 경로 감지 쿼리로 순환을 찾고, 그다음 데이터를 그렇게 만든 구조 변경 경로에 조상 검사와 직렬화가 있었는지 확인한다.</p>
+<p>모델 선택의 판단은 읽기와 쓰기의 비율, 하위 트리의 크기, 깊이의 상한이라는 세 숫자로 바뀐다. 하위 트리가 수십 노드이고 깊이가 한 자릿수라면 재귀 CTE의 비용은 무시할 만하고, 폐쇄 테이블을 추가하는 것은 일관성을 지켜야 할 곳만 늘린다. 하위 트리가 수만 노드이고 그 하위 트리의 상품을 페이지 단위로 자주 조회한다면, 매 요청마다 수만 번의 인덱스 탐색을 하는 재귀 CTE보다 범위 스캔 하나로 끝나는 폐쇄 테이블이 낫다. 깊이가 데이터에 따라 끝없이 깊어질 수 있다면 폐쇄 테이블의 행 수가 깊이의 제곱으로 늘 수 있으므로 피하거나 깊이를 업무 규칙으로 제한한다.</p>
+<p>폐쇄 테이블을 도입했다면 그것이 원본이 아니라 파생 데이터라는 점을 운영에 반영한다. parent_id를 함께 두었다면 parent_id로부터 폐쇄를 다시 계산해 저장된 것과 비교하는 점검 쿼리를 주기적으로 돌려 둘이 어긋나지 않았는지 확인할 수 있다. 구조 변경은 반드시 한 트랜잭션으로 묶고, 큰 하위 트리를 옮기는 작업은 바뀌는 행 수(a × s + b × s)를 미리 계산해 트랜잭션 크기와 잠금 시간을 가늠한 뒤 한가한 시간에 실행한다.</p>
+</x-review>
+
+<x-practice>
+<li>인접 리스트 예제 트리에서 냉장고(9)의 조상을 구하는 재귀 CTE(본문의 ancestors 쿼리에서 출발점만 9로 바꾼 것)를 실행한다고 하자. 반복마다 재귀 부분의 입력과 새로 만든 행을 표로 쓰고, <code>ORDER BY depth DESC</code>를 붙인 최종 결과를 예측하라. 반복은 비재귀 부분을 빼고 몇 번 일어나는가?</li>
+<li>폐쇄 테이블 예제(26행 상태)에서 음향기기(6) 아래에 사운드바를 id 11로 추가한다. 추가해야 할 경로 행을 모두 쓰고, 추가 후의 전체 행 수를 구하라.</li>
+<li>폐쇄 테이블 예제(26행 상태)에서 주방가전(5) 하위 트리를 가전(2)에서 디지털(3) 아래로 옮긴다. 1단계에서 지워지는 행과 2단계에서 추가되는 행을 depth까지 모두 쓰고, 이동 비용 공식의 a, b, s 값을 밝혀라.</li>
+<li>동료가 순환 문제를 막겠다며 depth 열이 있는 하위 트리 재귀 CTE의 UNION ALL을 UNION DISTINCT로 바꾸었다. TV(4)의 부모가 OLED TV(7)로 잘못 바뀐 데이터에서 4를 출발점으로 이 쿼리를 실행하면 어떻게 되는지 설명하고, 순환을 실제로 막는 방법 두 가지를 제시하라.</li>
+<li>재귀 CTE로 만든 경로 열 <code>CONCAT(t.path, ',', c.id)</code>로 <code>ORDER BY path</code>를 했더니 TV 아래가 QLED TV(10), OLED TV(7), LCD TV(8) 순으로 나왔다. 왜 그런지 설명하고, 콜레이션에 기대지 않고 id 순서를 얻도록 고친 비재귀 부분과 재귀 부분의 경로 식을 써라.</li>
+</x-practice>
+
+<x-answer>
+<p>1번. 비재귀 부분이 (9, 냉장고, parent_id 5, depth 0)을 만든다. 반복 1의 입력은 {9}이고, <code>c.id = a.parent_id</code>로 5 주방가전(depth 1)을 만든다. 반복 2의 입력은 {5}이고 2 가전(depth 2)을 만든다. 반복 3의 입력은 {2}이고 1 전체(depth 3)를 만든다. 반복 4의 입력은 {1}인데 1의 parent_id가 NULL이고 NULL과의 등호 비교는 참이 되지 않으므로 행이 없어 끝난다. 반복은 4번이고 마지막 반복은 "더 없음"을 확인하는 반복이다. 최종 결과는 depth 내림차순으로 전체(3), 가전(2), 주방가전(1), 냉장고(0)다. 위로 가는 탐색은 부모가 하나뿐이라 반복마다 정확히 한 행을 만든다는 점을 확인할 수 있다.</p>
+<p>2번. 새 노드의 조상 행은 부모 6의 조상 행을 물려받고 자기 자신을 더한 것이다. 6의 조상 행은 (1, 6, 2), (3, 6, 1), (6, 6, 0)이므로 descendant를 11로 바꾸고 depth를 1씩 늘린 (1, 11, 3), (3, 11, 2), (6, 11, 1)과 자기 자신 (11, 11, 0)의 4행을 넣는다. 새 노드의 깊이가 3이므로 깊이 + 1 = 4행이 맞고, 전체는 26 + 4 = 30행이 된다.</p>
+<p>3번. 5의 진짜 조상은 1과 2이므로 a = 2, 하위 트리는 5와 9이므로 s = 2다. 1단계에서 (1, 5, 2), (1, 9, 3), (2, 5, 1), (2, 9, 2)의 4행이 지워진다. 새 부모 3과 그 조상은 3(거리 0)과 1(거리 1)이므로 b = 2이고, 하위 트리 행 (5, 5, 0), (5, 9, 1)과 교차 결합해 (1, 5, 2), (1, 9, 3), (3, 5, 1), (3, 9, 2)의 4행을 넣는다. depth는 새 조상에서 3까지의 거리 + 1 + 5에서 자손까지의 거리다. a × s = 4, b × s = 4이고 전체 행 수는 26으로 변하지 않는다. 옛 부모와 새 부모가 같은 깊이라서 1을 조상으로 하는 행은 같은 값으로 지워졌다 다시 들어온다.</p>
+<p>4번. UNION DISTINCT는 행 전체가 같은 중복만 제거한다. depth 열은 반복마다 1씩 커지므로 반복 3에서 다시 나온 7과 8은 (7, depth 3), (8, depth 3)처럼 이전 행과 다른 행이 되어 제거되지 않는다. 재귀는 계속되고 cte_max_recursion_depth(기본 1000)를 넘는 순간 3636 오류로 중단된다. 막는 방법은 첫째, 경로 열에 지나온 id를 모으고 <code>FIND_IN_SET(c.id, s.path) > 0</code>으로 순환을 표시한 뒤 그 행에서 더 내려가지 않게 하는 감지, 둘째, 이동 전에 새 부모의 조상 목록(인접 리스트라면 위로 가는 재귀 CTE, 폐쇄 테이블이라면 기본 키 한 번 찾기)에 옮길 노드가 있는지 확인하고 구조 변경을 직렬화하는 예방이다. 결과 열이 id 하나뿐인 CTE라면 UNION DISTINCT가 실제로 재귀를 끝내지만, 실무 쿼리는 대개 깊이나 경로가 필요하다.</p>
+<p>5번. 경로는 문자열이라 사전식으로 비교된다. <code>1,2,4,10</code>과 <code>1,2,4,7</code>은 네 번째 구간의 첫 글자에서 '1'이 '7'보다 작으므로 QLED TV가 먼저 온다. 문자열 비교는 숫자의 크기가 아니라 같은 위치의 글자를 앞에서부터 비교하기 때문이다. 구간 길이가 제각각이면 쉼표와 숫자가 같은 위치에서 비교되는 경우도 생기는데, 그 결과는 콜레이션에 달려 있다. 고칠 때는 비재귀 부분을 <code>CAST(LPAD(id, 10, '0') AS CHAR(1000))</code>로, 재귀 부분을 <code>CONCAT(t.path, ',', LPAD(c.id, 10, '0'))</code>로 바꾼다. 모든 구간이 같은 폭이 되어 같은 위치끼리 숫자만 비교되므로 OLED TV(7), LCD TV(8), QLED TV(10) 순서가 된다. 열 길이도 구간 폭에 맞춰 늘려야 한다는 점을 잊지 않는다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>MySQL 재귀 CTE의 재귀 부분에서 FROM 절에 적은 CTE 이름은 각 반복에서 무엇을 가리키는가?</q>
+<o>그 시점까지 누적된 CTE 결과 전체</o>
+<o>직전 반복이 만든 행들</o>
+<o>비재귀 부분이 만든 첫 행들만</o>
+<o>CTE를 정의하기 전의 원본 테이블 전체</o>
+<why>매뉴얼은 재귀 부분의 각 반복이 직전 반복이 만든 행만을 대상으로 동작한다고 명시한다. 누적 결과 전체가 입력이라면 이미 처리한 노드가 다시 조인되어 같은 행이 반복해서 만들어질 것이다. 비재귀 부분의 행은 첫 번째 반복의 입력일 뿐이며, 원본 테이블은 재귀 부분이 CTE와 조인하는 상대일 뿐이다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>비재귀 부분에서 경로 열을 <code>name</code>(VARCHAR(100))으로 시작하고 재귀 부분에서 <code>CONCAT</code>으로 상위 이름을 덧붙이는 이동 경로 쿼리가 있다. 경로가 100자를 넘는 데이터에서 엄격 모드의 MySQL은 어떻게 동작하는가?</q>
+<o>재귀 부분의 CONCAT 결과 타입에 맞춰 열이 자동으로 넓어진다</o>
+<o>경고 없이 100자에서 잘린 값이 나온다</o>
+<o>열 타입이 비재귀 부분에서 정해지므로 긴 값이 들어가지 못해 1406 오류가 난다</o>
+<o>재귀가 그 행에서 멈추고 나머지 행만 돌려준다</o>
+<why>CTE 결과 열의 타입은 비재귀 부분만으로 추론되고 재귀 부분은 무시된다. 그래서 경로 열은 VARCHAR(100)이 되고, 더 긴 값을 넣으려 하면 엄격 모드에서는 Data too long 오류(1406)가 난다. 값이 잘리는 것은 엄격 모드가 아닐 때의 동작이다. 해법은 비재귀 부분에서 CAST로 열을 넉넉히 잡는 것이다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>폐쇄 테이블에서 노드 수 s인 하위 트리를 옮긴다. 옮기는 하위 트리 루트의 진짜 조상(자기 자신 제외)이 a개, 새 부모와 그 조상이 모두 b개일 때 category_path에서 지우고 넣는 행 수는?</q>
+<o>지우는 행 s, 넣는 행 s</o>
+<o>지우는 행 a + s, 넣는 행 b + s</o>
+<o>지우는 행 1, 넣는 행 1</o>
+<o>지우는 행 a × s, 넣는 행 b × s</o>
+<why>하위 트리 안쪽의 경로는 그대로 두고, 바깥 조상과 하위 트리 노드를 잇는 경로만 바뀐다. 옛 조상 a개 각각이 하위 트리 노드 s개 각각과 이루던 쌍을 지우고, 새 조상 b개 각각과 하위 트리 노드 s개의 교차 결합을 넣으므로 a × s와 b × s다. 1행만 바뀌는 것은 인접 리스트의 parent_id 갱신이다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>UPDATE category SET parent_id = 7 WHERE id = 4</code>로 TV(4)를 자기 자손인 OLED TV(7) 아래로 옮겼다. parent_id에 자기 참조 외래 키가 있는 MySQL에서 이 UPDATE의 결과로 옳은 것은?</q>
+<o>7번 행이 존재하므로 외래 키 검사를 통과하고, 4와 7이 서로를 부모로 하는 순환이 생긴다</o>
+<o>외래 키가 순환을 감지해 1452 오류로 거부한다</o>
+<o>자기 참조 외래 키에서는 UPDATE가 항상 RESTRICT처럼 동작하므로 거부된다</o>
+<o>ON DELETE CASCADE가 없으므로 parent_id 열은 바뀌지 않는다</o>
+<why>외래 키는 "가리키는 행이 존재하는가"만 검사한다. 7번 행은 존재하므로 통과하고, 4와 7이 서로를 부모로 하는 순환이 생겨 4, 7, 8은 루트에서 끊긴다. 자기 참조에서 RESTRICT처럼 동작하는 것은 ON UPDATE CASCADE/SET NULL이 같은 테이블을 다시 갱신하게 될 때의 연쇄 동작이지, 자식 행의 parent_id를 고치는 일반 UPDATE가 아니다. 순환은 이동 전에 조상 검사로 막아야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>재귀 CTE로 큰 하위 트리를 읽는 것과 폐쇄 테이블로 같은 하위 트리를 읽는 것의 InnoDB 수준 차이를 가장 정확히 설명한 것은?</q>
+<o>둘 다 parent_id 인덱스를 노드마다 한 번씩 내려간다</o>
+<o>재귀 CTE는 네트워크 왕복을 노드마다 하고, 폐쇄 테이블은 한 번만 한다</o>
+<o>재귀 CTE는 반복마다 직전 반복의 행마다 인덱스를 내려가므로 노드 수만큼 탐색하고, 폐쇄 테이블은 클러스터형 인덱스를 한 번 내려가 연속된 레코드를 읽는다</o>
+<o>폐쇄 테이블은 내부 임시 테이블에 구체화되고, 재귀 CTE는 구체화되지 않는다</o>
+<why>재귀 CTE는 한 문장이므로 왕복은 한 번이지만, 엔진 안에서 각 노드가 반복의 입력이 될 때마다 parent_id 인덱스를 내려가 자식을 찾는다. 폐쇄 테이블은 (ancestor_id, descendant_id) 기본 키 덕분에 같은 조상의 행이 클러스터형 인덱스의 연속 구간이라 한 번의 탐색과 순차 읽기로 끝난다. 구체화되는 것은 재귀 CTE 쪽이며, 매뉴얼은 재귀 CTE가 언제나 구체화된다고 말한다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>계층 구조(hierarchy)</dt><dd>루트를 뺀 모든 항목이 정확히 하나의 상위 항목을 가지는 나무 모양의 데이터다. 카테고리, 조직도, 댓글 스레드, 메뉴가 대표적이다.</dd>
+<dt>인접 리스트 모델(adjacency list model)</dt><dd>각 노드 행이 부모의 id를 외래 키로 가지는 계층 표현이다. 같은 테이블을 참조하는 재귀 관계로 구현된다.</dd>
+<dt>추이적 폐쇄(transitive closure)</dt><dd>어떤 관계를 원하는 횟수만큼 이어 붙여 얻는 모든 쌍의 집합이다. 부모 관계의 추이적 폐쇄가 조상-자손 관계다.</dd>
+<dt>공통 테이블 표현식(common table expression, CTE)</dt><dd>문장 앞의 WITH 절에서 이름을 붙여 정의하는 임시 결과 집합이다. 그 문장 안에서만 유효하며 여러 번 참조할 수 있다.</dd>
+<dt>재귀 CTE(recursive CTE)</dt><dd>자기 이름을 참조하는 CTE다. 비재귀 부분이 출발 행을 만들고, 재귀 부분이 직전 반복의 행을 입력으로 새 행을 만들며, 새 행이 없으면 끝난다.</dd>
+<dt>cte_max_recursion_depth</dt><dd>MySQL에서 재귀 CTE의 최대 재귀 단계 수를 정하는 시스템 변수다. 기본값은 1000이고, 넘으면 3636 오류로 실행이 중단된다.</dd>
+<dt>폐쇄 테이블(closure table)</dt><dd>자기 자신을 포함한 모든 (조상, 자손) 쌍과 그 거리를 행으로 저장하는 테이블이다. 조회는 범위 스캔이 되지만 구조 변경 때 여러 행을 고쳐야 한다.</dd>
+<dt>경로 열거(path enumeration)</dt><dd>각 노드에 루트부터의 경로 문자열을 저장하는 모델이다. 구체화된 경로(materialized path)라고도 하며, 하위 트리는 접두사 검색으로 찾는다.</dd>
+<dt>중첩 집합(nested set)</dt><dd>깊이 우선 순회 순서로 각 노드에 lft, rgt 번호를 매겨, 하위 트리를 번호 구간의 포함 관계로 표현하는 모델이다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/with.html">MySQL 8.0 Reference Manual — WITH (Common Table Expressions)</a> — 재귀 CTE의 구조, 직전 반복 규칙, 타입 추론, 재귀 부분 제약, cte_max_recursion_depth, 계층 순회 예제</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/ansi-diff-foreign-keys.html">MySQL 8.0 Reference Manual — FOREIGN KEY Constraint Differences</a> — 자기 참조 CASCADE와 15단계 제한, 행 단위 즉시 검사</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-table-check-constraints.html">MySQL 8.0 Reference Manual — CHECK Constraints</a> — 8.0.16부터의 CHECK 검사와 제약식의 제한(서브쿼리, AUTO_INCREMENT 열)</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/subquery-restrictions.html">MySQL 8.0 Reference Manual — Restrictions on Subqueries</a> — 같은 테이블을 수정하면서 서브쿼리로 읽을 수 없다는 제약</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/derived-table-optimization.html">MySQL 8.0 Reference Manual — Optimizing Derived Tables, View References, and Common Table Expressions</a> — CTE의 병합과 구체화, 재귀 CTE는 언제나 구체화된다는 설명</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-index-types.html">MySQL 8.0 Reference Manual — Clustered and Secondary Indexes</a> — 보조 인덱스 레코드가 기본 키 열을 담는 구조</li>
+</x-refs>

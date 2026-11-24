@@ -1,0 +1,459 @@
+<x-meta>
+deck: 영속성 컨텍스트를 요청 끝까지 열어 두는 OSIV가 지연 로딩을 어디서나 가능하게 만드는 대가로 DB 커넥션을 얼마나 오래 붙잡는지 실험으로 재고, 끄고 나서 조회 코드를 트랜잭션 안으로 모으는 설계까지 따라간다.
+minutes: 80
+</x-meta>
+
+<x-goals>
+<li>OSIV가 켜졌을 때와 꺼졌을 때 영속성 컨텍스트와 JDBC 커넥션이 각각 언제 생기고 언제 반납되는지 요청 처리 순서(preHandle, 핸들러, 뷰 렌더링, afterCompletion) 위에 그려 설명할 수 있다.</li>
+<li>스프링이 하이버네이트의 커넥션 처리 모드를 <code>DELAYED_ACQUISITION_AND_HOLD</code>로 바꾸는 이유와, 그 설정이 OSIV와 만나 커넥션 점유 시간을 요청 전체로 늘리는 과정을 설명할 수 있다.</li>
+<li>스레드 수, 커넥션 풀 크기, 커넥션 점유 시간의 관계를 리틀의 법칙으로 계산해 풀 고갈이 일어나는 조건을 예측할 수 있다.</li>
+<li>OSIV 환경에서 트랜잭션 밖에서 바꾼 엔티티가 뒤의 트랜잭션에서 UPDATE 되는 이유를 설명하고, <code>readOnly = true</code>가 그 상황을 막지 못하는 이유를 스프링 소스 수준에서 말할 수 있다.</li>
+<li>OSIV를 끈 뒤 생기는 <code>LazyInitializationException</code>을 페치 조인, DTO 변환, 커맨드와 쿼리의 분리로 해결하는 구조를 설계할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 영속성 컨텍스트는 언제 닫혀야 하는가</h3>
+
+<p>이 권의 앞 회차들은 모두 "어떤 SQL이 몇 번 실행되는가"를 다뤘다. 2회차에서는 xToOne 관계를 페치 조인으로 한 번에 가져와 N+1을 없앴고, 3회차에서는 컬렉션 페치 조인이 페이징과 부딪히는 이유와 <code>default_batch_fetch_size</code>가 만드는 IN 쿼리를 살폈고, 4회차에서는 엔티티를 거치지 않고 DTO로 바로 조회하는 방법을 비교했다. 이번 회차는 질문의 축이 다르다. SQL의 개수가 아니라 <b>자원을 붙잡고 있는 시간</b>, 더 정확히는 영속성 컨텍스트와 DB 커넥션이 얼마나 오래 살아 있는가를 묻는다.</p>
+
+<p>이 질문이 왜 중요한지는 지연 로딩(lazy loading)에서 출발하면 잘 보인다. 지연 로딩으로 설정된 연관 엔티티는 처음에 프록시(proxy) 객체로 채워진다. 프록시의 게터를 처음 호출하는 순간 하이버네이트는 그 프록시가 속한 세션, 곧 영속성 컨텍스트에게 "이 식별자의 엔티티를 DB에서 읽어 와 달라"고 요청한다. 이 요청이 성공하려면 두 가지가 살아 있어야 한다. 프록시를 만든 영속성 컨텍스트가 아직 닫히지 않았어야 하고, 그 영속성 컨텍스트가 SELECT를 실행할 JDBC 커넥션을 얻을 수 있어야 한다.</p>
+
+<p>그렇다면 영속성 컨텍스트는 언제 닫히는가. 답은 두 가지가 있다. 하나는 "트랜잭션이 끝날 때"이고, 다른 하나는 "웹 요청이 끝날 때"다. 앞의 방식에서는 서비스 계층의 <code>@Transactional</code> 메서드가 반환되는 순간 영속성 컨텍스트가 닫히므로, 컨트롤러나 JSON 직렬화 단계에서 프록시를 건드리면 예외가 난다. 뒤의 방식에서는 요청이 끝날 때까지 영속성 컨텍스트가 열려 있어 어디서든 지연 로딩이 된다. 스프링 부트는 기본값으로 뒤의 방식을 택한다. 이 방식을 OSIV(Open Session In View), JPA 용어로는 Open EntityManager In View라고 부른다.</p>
+
+<p>편리함에는 값이 붙는다. 영속성 컨텍스트가 오래 살면 그 영속성 컨텍스트가 쥔 커넥션도 오래 산다. 커넥션은 풀(pool)에 몇 개 없는 비싼 자원이다. 이 회차는 OSIV를 켜고 끈 두 상태를 실제로 실행해 커넥션이 언제 빠져나가고 언제 돌아오는지 숫자로 확인하고, 그 차이가 트래픽 아래에서 어떤 장애로 번지는지 계산한 다음, OSIV를 끈 상태에서 코드를 어떻게 구성해야 하는지까지 다룬다.</p>
+
+<h3>두 개의 수명: 영속성 컨텍스트와 커넥션</h3>
+
+<p>먼저 OSIV가 없을 때 스프링이 영속성 컨텍스트를 어떻게 관리하는지 정리하자. 리포지토리나 서비스에 <code>@PersistenceContext</code>로 주입받는 <code>EntityManager</code>는 진짜 엔티티 매니저가 아니라 스프링이 만든 공유 프록시(shared EntityManager proxy)다. 이 프록시는 메서드가 호출될 때마다 "지금 이 스레드에 묶인 진짜 엔티티 매니저"를 찾아 호출을 위임한다. 그래서 싱글톤 빈 하나에 주입된 엔티티 매니저를 여러 요청 스레드가 동시에 써도 서로의 영속성 컨텍스트가 섞이지 않는다.</p>
+
+<p>"스레드에 묶는다"는 일은 <code>TransactionSynchronizationManager</code>가 맡는다. 이 클래스는 스레드마다 하나씩 있는 <code>ThreadLocal</code> 맵을 들고 있고, 그 맵에 자원을 키-값으로 넣는다. JPA의 경우 키는 <code>EntityManagerFactory</code>이고 값은 진짜 엔티티 매니저를 감싼 <code>EntityManagerHolder</code>다. <code>JpaTransactionManager</code>는 트랜잭션을 시작할 때 엔티티 매니저를 새로 만들어 이 맵에 넣고, 트랜잭션이 끝나면 맵에서 빼고 엔티티 매니저를 닫는다. 트랜잭션 매니저에 <code>DataSource</code>가 연결되어 있으면 같은 맵에 <code>DataSource</code>를 키로 커넥션 홀더도 넣어 둔다. JDBC 템플릿 같은 다른 데이터 접근 코드가 같은 트랜잭션의 커넥션을 쓰게 하기 위해서다.</p>
+
+<pre class="diagram">요청 스레드 (http-nio-8080-exec-7)
+ └─ ThreadLocal: "Transactional resources"
+     ├─ key: EntityManagerFactory ──> EntityManagerHolder ──> EntityManager(영속성 컨텍스트)
+     │                                                          └─ 1차 캐시, 스냅샷, 프록시
+     └─ key: DataSource ───────────> ConnectionHolder ─────> JDBC Connection (풀에서 빌려 온 것)
+
+공유 프록시 em.find(...) 호출
+   → ThreadLocal 맵에서 EntityManagerFactory 키로 진짜 EntityManager 조회
+   → 있으면 그것에 위임, 없으면(트랜잭션 밖) 일회용 EntityManager로 처리</pre>
+
+<p>커넥션은 영속성 컨텍스트와 별개의 자원이다. 영속성 컨텍스트는 자바 힙에 있는 객체 묶음이지만, 커넥션은 DB 서버와 맺은 TCP 연결과 그 연결 위의 DB 세션이다. 커넥션 풀은 이 연결을 미리 만들어 두고 빌려주고 돌려받는다. JDBC에서 트랜잭션을 시작한다는 것은 커넥션의 자동 커밋(auto-commit)을 끄는 일이고, 커밋이나 롤백 뒤에는 커넥션을 풀로 돌려준다. 따라서 "영속성 컨텍스트가 열려 있다"와 "커넥션을 쥐고 있다"는 같은 말이 아니다. 둘을 얼마나 묶어 두느냐는 하이버네이트의 커넥션 처리 모드가 정하는데, 이 설정이 이 회차의 핵심 장치다. 뒤에서 자세히 본다.</p>
+
+<p>정리하면 OSIV가 없을 때 두 자원의 수명은 트랜잭션과 같다. <code>@Transactional</code> 메서드에 들어가는 순간 엔티티 매니저가 생기고 커넥션을 빌리며, 메서드에서 나오는 순간 커밋하고 커넥션을 돌려주고 엔티티 매니저를 닫는다. 이 엔티티 매니저가 만든 프록시는 메서드 밖으로 나가면 "주인 잃은 프록시"가 된다. 영속성 컨텍스트가 닫혔으니 초기화를 요청할 곳이 없다.</p>
+
+<h3>Open Session In View: 패턴의 이름과 스프링 부트의 기본값</h3>
+
+<p>OSIV라는 이름은 하이버네이트의 <code>Session</code>에서 왔다. 뷰(view)를 그리는 동안에도 세션을 열어 둔다는 뜻이다. 서버가 HTML 템플릿을 렌더링하던 시절, 템플릿이 <code>order.member.name</code> 같은 경로를 따라가다 프록시를 만나면 예외가 났고, 이를 피하려고 요청 전체를 감싸는 필터에서 세션을 열고 닫는 패턴이 퍼졌다. JPA에서는 세션 대신 엔티티 매니저라는 말을 쓰므로 스프링은 JPA용 클래스에 Open EntityManager In View라는 이름을 붙였다. 서블릿 필터로 동작하는 <code>OpenEntityManagerInViewFilter</code>와 스프링 MVC 인터셉터로 동작하는 <code>OpenEntityManagerInViewInterceptor</code> 두 가지가 있다.</p>
+
+<p>스프링 부트는 서블릿 기반 웹 애플리케이션에서 JPA를 쓰면 이 인터셉터를 자동으로 등록한다. 스프링 부트 3.5.16의 자동 구성 클래스 <code>JpaBaseConfiguration.JpaWebConfiguration</code>을 <code>javap</code>로 열어 보면 등록 조건이 애너테이션으로 붙어 있다. 서블릿 웹 애플리케이션일 것, <code>WebMvcConfigurer</code>가 클래스패스에 있을 것, 사용자가 <code>OpenEntityManagerInViewInterceptor</code>나 <code>OpenEntityManagerInViewFilter</code>를 직접 빈으로 등록하지 않았을 것, 그리고 <code>spring.jpa.open-in-view</code> 속성이 참이거나 아예 없을 것(<code>matchIfMissing = true</code>)이다. 등록은 <code>WebMvcConfigurer</code> 구현체 안에서 <code>InterceptorRegistry.addWebRequestInterceptor(...)</code>를 호출하는 방식으로 이루어진다.</p>
+
+<p>같은 클래스에는 경고 로그 한 줄도 들어 있다. 속성을 명시하지 않아 기본값으로 켜진 경우에만 다음 문장을 WARN 레벨로 남긴다.</p>
+
+<pre data-label="스프링 부트 3.5.16 JpaWebConfiguration의 경고 문자열"><code class="language-text">spring.jpa.open-in-view is enabled by default. Therefore, database queries may be performed during view rendering. Explicitly configure spring.jpa.open-in-view to disable this warning</code></pre>
+
+<p>바이트코드를 보면 조건은 <code>jpaProperties.getOpenInView()</code>가 <code>null</code>인지 여부다. 즉 <code>true</code>든 <code>false</code>든 값을 명시하면 경고가 사라진다. 이 경고는 기본값이 켜져 있다는 사실, 그리고 그 결과 뷰 렌더링 중에도 쿼리가 나갈 수 있다는 사실을 개발자가 알고 결정하라는 요구다. 속성의 메타데이터 설명도 같은 내용을 담고 있다. "Register OpenEntityManagerInViewInterceptor. Binds a JPA EntityManager to the thread for the entire processing of the request." 기본값은 <code>true</code>다. 스프링 부트 4.0.8에서는 JPA 자동 구성이 <code>spring-boot-jpa</code> 모듈로 옮겨졌지만, 그 모듈의 메타데이터에서도 속성 이름과 기본값은 같다.</p>
+
+<aside class="note">스프링 부트 레퍼런스의 SQL 데이터베이스 장은 이 동작을 "웹 뷰에서 지연 로딩을 허용하기 위해" 기본으로 등록한다고 설명하고, 원하지 않으면 <code>spring.jpa.open-in-view</code>를 <code>false</code>로 두라고 안내한다.</aside>
+
+<h3>인터셉터 안에서 일어나는 일: 열고, 묶고, 참여시키고, 닫는다</h3>
+
+<p>스프링 프레임워크 6.2.19의 <code>OpenEntityManagerInViewInterceptor</code>를 <code>javap -c</code>로 읽으면 동작이 짧고 분명하다. <code>preHandle</code>은 먼저 현재 스레드에 이미 같은 <code>EntityManagerFactory</code>의 자원이 묶여 있는지 <code>TransactionSynchronizationManager.hasResource(emf)</code>로 확인한다. 이미 있으면 바깥의 누군가(예를 들어 같은 요청을 감싼 OSIV 필터)가 연 엔티티 매니저에 "참여"만 하고, 요청 속성에 참여 횟수를 기록한다. 없으면 <code>createEntityManager()</code>로 엔티티 매니저를 새로 만들어 <code>EntityManagerHolder</code>로 감싼 뒤 <code>bindResource(emf, holder)</code>로 스레드에 묶는다. 비동기 요청을 위한 인터셉터 등록도 이때 함께 한다.</p>
+
+<p><code>afterCompletion</code>은 그 반대다. 참여만 했던 경우에는 참여 횟수를 줄이고 끝낸다. 직접 열었던 경우에는 <code>unbindResource(emf)</code>로 스레드에서 떼어 내고 <code>EntityManagerFactoryUtils.closeEntityManager(...)</code>로 닫는다. 엔티티 매니저가 닫힐 때 하이버네이트 세션이 쥐고 있던 커넥션도 풀로 돌아간다. 사이에 있는 <code>postHandle</code>은 아무 일도 하지 않는다. 인터셉터의 자바독도 이 클래스를 "요청 처리 전체 동안 JPA 엔티티 매니저를 스레드에 묶는다"고 설명하고, 이렇게 묶인 엔티티 매니저를 트랜잭션 매니저가 자동으로 감지한다고 적고 있다.</p>
+
+<p>그 "자동 감지"가 OSIV의 핵심 연결 고리다. <code>JpaTransactionManager</code>는 트랜잭션 객체를 만들 때 스레드의 자원 맵을 먼저 들여다본다. 거기에 <code>EntityManagerHolder</code>가 있으면 그것을 트랜잭션 객체에 넣으면서 "새로 만든 홀더가 아님"이라는 표시를 붙인다. 트랜잭션은 이 기존 엔티티 매니저 위에서 시작되고, 끝날 때 트랜잭션 매니저는 이 표시를 보고 엔티티 매니저를 닫지 않는다. 트랜잭션은 끝났지만 영속성 컨텍스트는 그대로 살아남아 다음 코드로 넘어간다. 같은 요청 안에서 서비스 메서드를 두 번 호출하면 두 트랜잭션이 하나의 영속성 컨텍스트를 나눠 쓰게 된다.</p>
+
+<figure class="flow-figure"><figcaption>OSIV가 켜진 요청 하나의 처리 순서 (DispatcherServlet 기준)</figcaption><ol class="flow">
+<li><strong>preHandle</strong><span>엔티티 매니저를 만들어 EntityManagerFactory를 키로 스레드에 묶는다. 이 시점에는 커넥션을 빌리지 않는다.</span></li>
+<li><strong>핸들러 실행: 서비스 트랜잭션</strong><span>JpaTransactionManager가 묶여 있는 엔티티 매니저를 찾아 그 위에서 트랜잭션을 시작한다. 이때 커넥션을 빌린다. 커밋 후에도 엔티티 매니저는 닫지 않는다.</span></li>
+<li><strong>핸들러 실행: 컨트롤러 나머지와 응답 본문 쓰기</strong><span>@ResponseBody 반환값은 이 단계 안에서 메시지 컨버터가 JSON으로 쓴다. 직렬화 중 프록시를 만나면 지연 로딩이 일어난다.</span></li>
+<li><strong>postHandle, 뷰 렌더링</strong><span>템플릿 엔진이 모델을 따라가며 지연 로딩을 일으킬 수 있다. OSIV 인터셉터의 postHandle은 아무것도 하지 않는다.</span></li>
+<li><strong>afterCompletion</strong><span>엔티티 매니저를 스레드에서 떼어 내고 닫는다. 쥐고 있던 커넥션이 이때 풀로 돌아간다.</span></li>
+</ol></figure>
+
+<p>필터와 인터셉터의 차이는 감싸는 범위다. <code>OpenEntityManagerInViewFilter</code>는 서블릿 필터 체인에서 동작하므로 디스패처 서블릿보다 바깥, 다른 필터들까지 포함한 요청 전체를 감싼다. 인터셉터는 디스패처 서블릿이 핸들러를 찾은 뒤에 호출되므로 그 핸들러의 처리 구간만 감싼다. 자바독은 인터셉터가 스프링 애플리케이션 컨텍스트 안에서 설정되어 빈 와이어링의 이점을 누린다는 점을 필터와의 차이로 든다. 어느 쪽이든 원리는 같다. 요청이 시작될 때 엔티티 매니저를 스레드에 묶고, 끝날 때 닫는다.</p>
+
+<x-visual id="jpa-app2-05-osiv-lifetime" title="OSIV 켜짐과 꺼짐에서 영속성 컨텍스트와 커넥션의 수명 비교" kind="타임라인 다이어그램" ratio="16:9">
+<x-hint>같은 요청을 두 줄의 타임라인으로 나란히 놓고, 영속성 컨텍스트 막대와 커넥션 막대가 OSIV 켜짐에서는 요청 끝까지, 꺼짐에서는 트랜잭션 구간에서만 이어지는 모습을 보여 준다.</x-hint>
+<x-prompt>Two horizontal timelines stacked vertically on a white background, flat technical diagram style. A shared time axis at the bottom runs left to right with five tick labels: "preHandle", "트랜잭션 시작", "트랜잭션 커밋", "JSON 직렬화", "afterCompletion". Top timeline titled "OSIV 켜짐": a long blue bar labeled "영속성 컨텍스트" spans from "preHandle" to "afterCompletion"; below it an orange bar labeled "커넥션 점유" starts at "트랜잭션 시작" and continues all the way to "afterCompletion". A small green dot on the blue bar between "트랜잭션 커밋" and "JSON 직렬화" labeled "지연 로딩 성공". Bottom timeline titled "OSIV 꺼짐": the blue bar and the orange bar both span only from "트랜잭션 시작" to "트랜잭션 커밋". A red X mark after the bars, aligned with "JSON 직렬화", labeled "LazyInitializationException". Keep the two orange bars visually comparable in length.</x-prompt>
+<x-caption>OSIV를 켜면 커넥션 점유가 트랜잭션 시작부터 요청 끝까지 이어지고, 끄면 트랜잭션 구간으로 줄어든다.</x-caption>
+</x-visual>
+
+<h3>실험: 같은 요청을 OSIV를 켜고 끄고 실행한다</h3>
+
+<p>말로 정리한 순서를 실제로 확인하기 위해 작은 실험을 만들었다. 환경은 JDK 21.0.13(Temurin), Spring Framework 6.2.19(<code>spring-orm</code>, <code>spring-webmvc</code>, <code>spring-test</code>), Hibernate ORM 6.6.53.Final, HikariCP 6.3.3, H2 2.3.232다. 스프링 부트 없이 자바 설정으로 <code>LocalContainerEntityManagerFactoryBean</code>, <code>HibernateJpaVendorAdapter</code>, <code>JpaTransactionManager</code>, 히카리 데이터 소스를 구성하고, MockMvc의 단독 구성(standalone setup)으로 디스패처 서블릿을 띄웠다. OSIV를 켤 때는 스프링 부트가 하는 것과 같은 방식으로 <code>OpenEntityManagerInViewInterceptor</code>를 <code>WebRequestHandlerInterceptorAdapter</code>로 감싸 등록했다. 엔티티는 실험용으로 만든 <code>Member</code>와, <code>Member</code>를 지연 로딩 <code>@ManyToOne</code>으로 참조하는 <code>Order</code>(테이블 이름 <code>orders</code>) 두 개다.</p>
+
+<pre><code class="language-java">public class OrderService {
+    @PersistenceContext EntityManager em;
+
+    @Transactional
+    public Order find(Long id) {
+        Main.log("service: tx started");
+        Order o = em.find(Order.class, id);
+        Main.log("service: after em.find");
+        return o;
+    }
+    // ... 데이터 준비용 init(), 다른 트랜잭션용 countMembers() 생략
+}
+
+@RestController
+public class OrderController {
+    // ... 생성자 주입 생략
+
+    @GetMapping("/orders/{id}/member")
+    public String member(@PathVariable Long id) {
+        Order o = service.find(id);                 // 트랜잭션은 여기서 끝난다
+        Main.log("controller: service returned");
+        String name = o.getMember().getName();      // 트랜잭션 밖에서 프록시 초기화
+        Main.log("controller: lazy loaded");
+        return name;
+    }
+}
+
+// Main.log: 라벨, 히카리 풀의 활성 커넥션 수, 실제 트랜잭션 활성 여부를 출력한다
+static void log(String label) {
+    System.out.println(label + " | active=" + ds.getHikariPoolMXBean().getActiveConnections()
+        + " txActive=" + TransactionSynchronizationManager.isActualTransactionActive());
+}</code></pre>
+
+<p><code>active</code>는 히카리 풀이 지금 빌려준 커넥션 수이고, <code>txActive</code>는 현재 스레드에서 실제 트랜잭션이 진행 중인지다. 하이버네이트의 <code>show_sql</code>을 켜 두었으므로 SQL이 실행되는 시점도 함께 찍힌다. 먼저 OSIV를 켠 실행 결과다.</p>
+
+<pre data-label="실행 결과 (OSIV 켜짐)"><code class="language-text">service: tx started | active=1 txActive=true
+Hibernate: select o1_0.id,o1_0.member_id,o1_0.status from orders o1_0 where o1_0.id=?
+service: after em.find | active=1 txActive=true
+controller: service returned | active=1 txActive=false
+Hibernate: select m1_0.id,m1_0.name from Member m1_0 where m1_0.id=?
+controller: lazy loaded | active=1 txActive=false
+response: kim
+after request completed | active=0 txActive=false</code></pre>
+
+<p>한 줄씩 읽어 보자. 첫 줄에서 이미 <code>active=1</code>이다. 아직 SELECT를 하나도 실행하지 않았는데 커넥션을 빌렸다. 트랜잭션을 시작한다는 것이 커넥션의 자동 커밋을 끄는 일이기 때문이다. 다음 줄에서 주문을 읽고, 서비스가 반환한 뒤 컨트롤러에 돌아왔을 때 <code>txActive=false</code>, 즉 트랜잭션은 끝났다. 그런데 <code>active</code>는 여전히 1이다. 커밋했는데도 커넥션이 풀로 돌아가지 않았다. 이어서 <code>getMember().getName()</code>이 회원 SELECT를 일으키고 이름을 정상적으로 읽는다. 커넥션이 0으로 내려가는 것은 MockMvc의 요청 처리가 모두 끝난 뒤, 곧 <code>afterCompletion</code>이 엔티티 매니저를 닫은 뒤다.</p>
+
+<p>이번에는 같은 코드를 OSIV 없이 실행했다.</p>
+
+<pre data-label="실행 결과 (OSIV 꺼짐)"><code class="language-text">service: tx started | active=1 txActive=true
+Hibernate: select o1_0.id,o1_0.member_id,o1_0.status from orders o1_0 where o1_0.id=?
+service: after em.find | active=1 txActive=true
+controller: service returned | active=0 txActive=false
+EXCEPTION: org.hibernate.LazyInitializationException: Could not initialize proxy [lab.Member#1] - no session
+after request completed | active=0 txActive=false</code></pre>
+
+<p>차이는 네 번째 줄에서 시작된다. 서비스가 반환되자마자 <code>active=0</code>이다. 트랜잭션이 끝나는 순간 엔티티 매니저가 닫히고 커넥션이 반납되었다. 그다음 프록시를 초기화하려 하자 하이버네이트 6.6.53은 <code>LazyInitializationException</code>을 던진다. 메시지의 대괄호 안은 "엔티티 이름#식별자"이고, 끝의 <code>no session</code>이 원인을 정확히 말한다. 영속성 컨텍스트가 닫힐 때 하이버네이트는 그 안의 프록시에서 세션 참조를 지우므로, 프록시에는 초기화를 맡길 세션이 아예 없다. 하이버네이트 6.6.53은 세션 참조가 남아 있지만 그 세션이 닫힌 경우에는 <code>the owning session was closed</code>로 끝나는 다른 문구를 쓴다. 메시지의 대소문자와 문구는 하이버네이트 버전에 따라 조금씩 다르므로 로그를 검색할 때는 클래스 이름으로 찾는 편이 안전하다.</p>
+
+<h3>커넥션을 요청 끝까지 쥐고 있는 이유: 커넥션 처리 모드</h3>
+
+<p>실험에서 가장 중요한 관찰은 "커밋 후에도 커넥션이 돌아가지 않았다"는 것이다. 영속성 컨텍스트가 열려 있다는 사실만으로는 이것이 설명되지 않는다. 영속성 컨텍스트는 열어 둔 채 커넥션만 돌려주고, 다음에 필요할 때 다시 빌릴 수도 있기 때문이다. 실제로 하이버네이트는 커넥션을 언제 얻고 언제 놓을지를 고르는 설정을 제공한다. 하이버네이트 6.6의 <code>PhysicalConnectionHandlingMode</code> 자바독은 획득 방식과 반납 방식의 유효한 조합을 다섯 가지로 나열한다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>모드</th><th>획득 시점</th><th>반납 시점</th></tr></thead><tbody>
+<tr><td><code>IMMEDIATE_ACQUISITION_AND_HOLD</code></td><td>세션이 열리자마자</td><td>세션이 닫힐 때</td></tr>
+<tr><td><code>DELAYED_ACQUISITION_AND_HOLD</code></td><td>필요해지는 순간</td><td>세션이 닫힐 때</td></tr>
+<tr><td><code>DELAYED_ACQUISITION_AND_RELEASE_AFTER_STATEMENT</code></td><td>필요해지는 순간</td><td>문장(statement) 하나를 실행할 때마다</td></tr>
+<tr><td><code>DELAYED_ACQUISITION_AND_RELEASE_BEFORE_TRANSACTION_COMPLETION</code></td><td>필요해지는 순간</td><td>커밋이나 롤백 직전</td></tr>
+<tr><td><code>DELAYED_ACQUISITION_AND_RELEASE_AFTER_TRANSACTION</code></td><td>필요해지는 순간</td><td>트랜잭션이 끝날 때마다</td></tr>
+</tbody></table></div>
+
+<p>실험의 첫 줄에서 출력한 <code>new HibernateJpaVendorAdapter().getJpaPropertyMap()</code>의 내용은 <code>{hibernate.cdi.extensions=true, hibernate.connection.handling_mode=DELAYED_ACQUISITION_AND_HOLD}</code>였다. 스프링의 하이버네이트 어댑터가 처리 모드를 <code>DELAYED_ACQUISITION_AND_HOLD</code>로 강제한다는 뜻이다. 자바독의 설명으로는 "필요해지는 순간 얻어서 세션이 닫힐 때까지 쥔다". 어댑터의 <code>setPrepareConnection</code> 자바독은 이 플래그가 기본값 <code>true</code>일 때 어댑터가 이 모드를 직접 적용하며, 끄면 그 개입을 피할 수 있다고 적고 있다.</p>
+
+<p>스프링이 왜 이렇게 하는지는 <code>prepareConnection</code>이라는 이름에 답이 있다. <code>@Transactional(isolation = ..., readOnly = true)</code>처럼 트랜잭션마다 다른 격리 수준이나 읽기 전용 플래그를 쓰려면, 스프링은 트랜잭션 시작 시 그 값을 JDBC 커넥션에 적용하고 트랜잭션이 끝난 뒤 원래 값으로 되돌려야 한다. 중간에 하이버네이트가 커넥션을 반납하고 다른 커넥션을 받아 오면, 설정을 적용한 커넥션과 되돌릴 커넥션이 달라진다. 스프링 6.2.19의 <code>HibernateJpaDialect</code> 바이트코드에는 바로 이 조건을 검사하다 실패할 때 쓰는 메시지가 들어 있다. 사용자 지정 격리 수준을 지원하려면 <code>prepareConnection</code> 플래그가 켜져 있고 하이버네이트의 반납 모드가 <code>ON_CLOSE</code>여야 한다는 내용이다. 커넥션을 세션이 닫힐 때까지 쥐게 만드는 것은 트랜잭션별 커넥션 설정을 안전하게 하기 위한 선택이다.</p>
+
+<p>이 선택은 OSIV가 없을 때는 아무 문제가 없다. 세션의 수명이 트랜잭션과 같으므로 "세션이 닫힐 때까지"는 곧 "트랜잭션이 끝날 때까지"다. 문제는 OSIV와 만날 때 생긴다. OSIV는 세션의 수명을 요청 전체로 늘리고, <code>DELAYED_ACQUISITION_AND_HOLD</code>는 커넥션의 수명을 세션에 묶는다. 두 설정이 겹치면서 커넥션의 수명이 요청 전체로 늘어난다. 실험에서 커밋 뒤에도 <code>active=1</code>이었던 이유가 이것이다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>OSIV가 늘리는 것은 영속성 컨텍스트의 수명이고, 스프링이 하이버네이트에 걸어 둔 <code>DELAYED_ACQUISITION_AND_HOLD</code>는 커넥션을 그 영속성 컨텍스트가 닫힐 때까지 붙잡게 한다. 그래서 OSIV를 켜면 한 요청이 처음 트랜잭션을 시작한 순간부터 응답을 다 쓰고 뷰를 다 그릴 때까지 커넥션 하나를 독점한다. 지연 로딩을 실제로 하든 하지 않든 마찬가지다.</p></aside>
+
+<p>"획득은 지연된다(DELAYED)"는 부분도 정확히 읽어야 한다. OSIV 인터셉터가 <code>preHandle</code>에서 엔티티 매니저를 만드는 것만으로는 커넥션을 빌리지 않는다. 자바독의 표현대로 커넥션은 필요해지는 순간에 얻는다. 그래서 DB를 전혀 쓰지 않는 요청은 OSIV가 켜져 있어도 커넥션을 쓰지 않는다. 반대로 한 번이라도 트랜잭션을 시작하거나 지연 로딩을 하면 그 순간부터 요청이 끝날 때까지 커넥션을 쥔다. 실험에서 <code>service: tx started</code> 줄이 이미 <code>active=1</code>이었던 것처럼, 하이버네이트의 자원 로컬 트랜잭션은 시작할 때 커넥션의 자동 커밋을 꺼야 하므로 트랜잭션 시작이 곧 "필요해지는 순간"이다.</p>
+
+<h3>트랜잭션 밖의 지연 로딩은 어떤 트랜잭션에서 실행되는가</h3>
+
+<p>OSIV 환경에서 컨트롤러가 일으킨 지연 로딩 SELECT는 트랜잭션 밖에서 실행되었다. 그렇다면 DB 입장에서는 이 SELECT가 어떤 트랜잭션에 속할까. 실험에 한 줄을 더 넣어 하이버네이트 세션이 쥔 커넥션의 자동 커밋 상태를 서비스 안과 컨트롤러에서 각각 찍어 보았다(<code>em.unwrap(Session.class).doReturningWork(Connection::getAutoCommit)</code>).</p>
+
+<pre data-label="실행 결과 (OSIV 켜짐, 자동 커밋 상태 추가)"><code class="language-text">service: tx started | active=1 txActive=true
+service: autoCommit=false
+Hibernate: select o1_0.id,o1_0.member_id,o1_0.status from orders o1_0 where o1_0.id=?
+service: after em.find | active=1 txActive=true
+controller: service returned | active=1 txActive=false
+controller: autoCommit=true
+Hibernate: select m1_0.id,m1_0.name from Member m1_0 where m1_0.id=?
+controller: lazy loaded | active=1 txActive=false
+response: kim
+after request completed | active=0 txActive=false</code></pre>
+
+<p>트랜잭션 안에서는 <code>autoCommit=false</code>였고, 트랜잭션이 끝난 뒤 같은 커넥션은 <code>autoCommit=true</code>로 되돌아가 있다. 컨트롤러의 지연 로딩 SELECT는 자동 커밋 모드에서 실행된 것이다. MySQL 레퍼런스 매뉴얼은 InnoDB에서 모든 사용자 활동이 트랜잭션 안에서 일어나며, 자동 커밋이 켜져 있으면 SQL 문장 하나하나가 그 자체로 트랜잭션을 이룬다고 설명한다. 즉 트랜잭션 밖의 지연 로딩은 "트랜잭션이 없는 조회"가 아니라 "문장마다 새로 시작되고 바로 커밋되는 작은 트랜잭션들"이다.</p>
+
+<p>이것이 일관성에 어떤 의미인지 InnoDB의 일관된 읽기(consistent read) 규칙으로 따져 보자. 매뉴얼에 따르면 기본 격리 수준인 REPEATABLE READ에서는 한 트랜잭션 안의 모든 일관된 읽기가 그 트랜잭션의 첫 읽기 때 만든 스냅샷을 본다. 서비스의 <code>@Transactional</code> 안에서 주문과 회원을 함께 읽었다면 둘은 같은 시점의 데이터다. 그러나 주문은 트랜잭션 안에서 읽고 회원은 컨트롤러에서 지연 로딩했다면, 회원 SELECT는 별도의 트랜잭션이므로 그 문장이 실행되는 시점의 최신 커밋 상태를 본다. 그 사이에 다른 요청이 회원 정보를 바꾸고 커밋했다면, 한 응답 안에 서로 다른 시점의 데이터가 섞여 나간다.</p>
+
+<p>대부분의 화면에서는 이 차이가 눈에 띄지 않는다. 그러나 "주문 금액의 합과 주문 항목 목록이 일치해야 한다" 같은 조건이 있는 응답이라면, 트랜잭션 밖의 지연 로딩은 그 조건을 보장하지 못한다. 트랜잭션에 걸어 둔 속성도 적용되지 않는다. 서비스 메서드에 지정한 격리 수준, 읽기 전용 플래그, 타임아웃은 그 메서드의 트랜잭션에만 붙어 있고, 컨트롤러에서 일어나는 지연 로딩은 그 바깥이다. OSIV가 "지연 로딩이 어디서나 된다"는 편리함을 주는 대신, 그 조회들이 어떤 트랜잭션 경계 안에 있는지가 코드에서 보이지 않게 된다.</p>
+
+<h3>커넥션 풀 고갈의 산술</h3>
+
+<p>이제 커넥션 점유 시간이 왜 장애로 번지는지 숫자로 보자. 스프링 부트 3.5.16의 설정 메타데이터에서 내장 톰캣의 <code>server.tomcat.threads.max</code> 기본값은 200이다. 스프링 부트는 히카리CP가 클래스패스에 있으면 항상 그것을 커넥션 풀로 고르고, JPA 스타터를 쓰면 히카리CP가 따라온다. 히카리CP의 README에 따르면 <code>maximumPoolSize</code> 기본값은 10, <code>connectionTimeout</code> 기본값은 30000밀리초(30초)다. README는 풀이 최대 크기에 도달하고 유휴 커넥션이 없으면 <code>getConnection()</code> 호출이 <code>connectionTimeout</code> 동안 블록된 뒤 시간 초과로 끝난다고 설명한다.</p>
+
+<p>기본값만 놓고 보면 요청을 처리할 수 있는 스레드는 200개인데 DB 커넥션은 10개다. 이 비대칭은 그 자체로는 문제가 아니다. 요청마다 커넥션을 쓰는 시간이 짧으면 10개로도 많은 요청을 처리할 수 있다. 이 관계를 정량적으로 보여 주는 것이 큐잉 이론의 리틀의 법칙(Little's law)이다. 안정 상태의 시스템에서 시스템 안에 머무는 평균 개수 L은 평균 도착률 λ와 평균 체류 시간 W의 곱이다. 커넥션 풀에 적용하면 "동시에 빌려 간 커넥션의 평균 수 = 초당 커넥션 요청 수 × 커넥션 하나를 쥐고 있는 평균 시간"이다.</p>
+
+<p>계산 예를 들어 보자. 아래 숫자는 원리를 보이기 위해 가정한 값이다. 초당 50건의 요청이 들어오고, 각 요청의 트랜잭션은 평균 0.1초 동안 커넥션을 쓴다고 하자. OSIV가 꺼져 있으면 L = 50 × 0.1 = 5이므로 평균 5개의 커넥션이 사용 중이고, 풀 10개로 여유가 있다. 이제 같은 요청이 트랜잭션이 끝난 뒤 외부 결제 API를 호출하느라 0.5초를 더 쓰고, 응답 직렬화에 0.05초를 쓴다고 하자. OSIV가 꺼져 있으면 커넥션 점유 시간은 여전히 0.1초라 결과가 같다. OSIV가 켜져 있으면 커넥션 점유 시간은 트랜잭션 시작부터 요청 끝까지인 0.65초가 되어 L = 50 × 0.65 = 32.5다. 풀에는 10개밖에 없으므로 이 부하를 감당할 수 없다.</p>
+
+<p>감당할 수 없을 때 일어나는 일은 연쇄적이다. 커넥션을 얻지 못한 요청 스레드는 <code>getConnection()</code>에서 블록된다. 블록된 스레드는 톰캣의 작업 스레드 하나를 차지한 채 아무 일도 하지 않는다. 새 요청은 남은 스레드로 들어와 역시 블록되고, 스레드 200개가 모두 차면 톰캣은 더 이상 요청을 처리하지 못한다. 기다리던 요청들은 30초 뒤 시간 초과 예외로 실패한다. 원인은 DB가 느린 것이 아니라 "커넥션을 쥔 채 DB와 상관없는 일을 하는 시간"이다. 그래서 DB 서버의 CPU나 쿼리 실행 시간을 보면 한가한데 애플리케이션은 응답하지 못하는, 진단하기 까다로운 모습이 된다.</p>
+
+<p>이 현상을 실험으로 재현했다. 풀 크기를 1, <code>connectionTimeout</code>을 1000밀리초로 줄이고, 요청 A는 트랜잭션이 끝난 뒤 래치(latch)로 대기하며 외부 호출을 흉내 낸다. A가 트랜잭션을 마친 시점에 요청 B가 트랜잭션 하나를 실행하려 한다.</p>
+
+<pre data-label="실행 결과 (풀 크기 1, connectionTimeout 1000ms)"><code class="language-text">=== OSIV=true scenario=pool
+service: tx started | active=1 txActive=true
+Hibernate: select o1_0.id,o1_0.member_id,o1_0.status from orders o1_0 where o1_0.id=?
+service: after em.find | active=1 txActive=true
+slow: after tx, simulating external call | active=1 txActive=false
+request B EXCEPTION: java.sql.SQLTransientConnectionException: LabPool - Connection is not available, request timed out after 1014ms (total=1, active=1, idle=0, waiting=0)
+
+=== OSIV=false scenario=pool
+service: tx started | active=1 txActive=true
+Hibernate: select o1_0.id,o1_0.member_id,o1_0.status from orders o1_0 where o1_0.id=?
+service: after em.find | active=1 txActive=true
+slow: after tx, simulating external call | active=0 txActive=false
+service: tx started | active=1 txActive=true
+Hibernate: select o1_0.id,o1_0.member_id,o1_0.status from orders o1_0 where o1_0.id=?
+service: after em.find | active=1 txActive=true
+request B: ok</code></pre>
+
+<p>OSIV가 켜진 쪽에서 A는 트랜잭션이 끝났는데도 <code>active=1</code>로 하나뿐인 커넥션을 쥐고 있다. B는 1초를 기다린 끝에 <code>SQLTransientConnectionException</code>으로 실패한다. 메시지 괄호 안의 <code>total=1, active=1, idle=0</code>이 풀의 상태를 그대로 보여 준다. 경과 시간 1014ms는 실행마다 조금씩 달라진다. OSIV가 꺼진 쪽에서는 A가 외부 호출을 흉내 내는 동안 <code>active=0</code>이고, B는 곧바로 커넥션을 얻어 성공한다. A가 한 일은 두 경우 모두 같다. 달라진 것은 "A가 기다리는 동안 커넥션을 쥐고 있느냐"뿐이다.</p>
+
+<aside class="note">설정 메타데이터는 <code>server.tomcat.threads.max</code>가 가상 스레드를 켜면 효과가 없다고 적고 있다. 가상 스레드 환경에서는 작업 스레드 수가 동시 요청의 상한 역할을 하지 않으므로, 커넥션 풀 앞에서 기다리는 요청의 수가 스레드 200개로 제한되지 않는다. 커넥션 점유 시간을 줄이는 일이 오히려 더 중요해진다.</aside>
+
+<x-visual id="jpa-app2-05-pool-exhaustion" title="요청 스레드 200개가 커넥션 10개 앞에서 대기하는 풀 고갈 상황" kind="구조 그림" ratio="16:9">
+<x-hint>톰캣 작업 스레드 다수가 왼쪽에, 커넥션 10개짜리 풀이 가운데, DB가 오른쪽에 있고, 커넥션을 쥔 스레드 중 다수가 DB가 아닌 외부 API 호출이나 직렬화를 하고 있어 나머지 스레드가 줄을 서 있는 모습을 보여 준다.</x-hint>
+<x-prompt>Flat technical illustration, left-to-right layout on a white background. Left: a tall column of many small gray worker icons labeled "톰캣 작업 스레드 200개". Middle: a box containing exactly 10 orange plug-shaped slots labeled "히카리 풀 10개", all 10 slots filled and connected to worker icons. Right: a database cylinder labeled "DB" that looks idle, with a small caption "쿼리는 한가함". Among the 10 workers holding connections, 7 have speech-bubble icons labeled "외부 API 호출" or "JSON 직렬화" and are not pointing at the DB; 3 have arrows pointing to the DB labeled "SQL 실행". Below the middle box, a long queue of gray worker icons with hourglass symbols labeled "getConnection() 대기". At the end of the queue, a red label "30초 후 SQLTransientConnectionException". Keep total labels under 12.</x-prompt>
+<x-caption>OSIV가 켜져 있으면 커넥션을 쥔 스레드가 DB와 무관한 일을 하는 동안에도 풀 슬롯이 묶여, DB는 한가한데 요청은 줄을 선다.</x-caption>
+</x-visual>
+
+<h3>함정: 트랜잭션 밖에서 바꾼 엔티티가 뒤늦게 저장된다</h3>
+
+<p>OSIV가 커넥션만 오래 쥐는 것은 아니다. 영속성 컨텍스트가 요청 내내 살아 있으므로, 그 안의 엔티티는 트랜잭션이 끝난 뒤에도 영속 상태로 남는다. 이것이 미묘한 버그를 만든다. 실험에서 컨트롤러가 서비스로 주문을 조회한 뒤 트랜잭션 밖에서 <code>setStatus("CANCEL")</code>을 호출하고, 이어서 주문과 상관없는 다른 트랜잭션 메서드(회원 수를 세는 <code>countMembers()</code>)를 호출했다. 요청이 끝난 뒤 별도의 JDBC 커넥션으로 DB의 상태 값을 읽었다.</p>
+
+<pre data-label="실행 결과 (OSIV 켜짐)"><code class="language-text">--- service.find readOnly=false
+service: tx started | active=1 txActive=true
+Hibernate: select o1_0.id,o1_0.member_id,o1_0.status from orders o1_0 where o1_0.id=?
+service: after em.find | active=1 txActive=true
+controller: status changed outside tx, calling another tx
+Hibernate: select count(m1_0.id) from Member m1_0
+Hibernate: update orders set member_id=?,status=? where id=?
+DB status = CANCEL</code></pre>
+
+<p>회원 수를 세는 트랜잭션이 커밋될 때 주문의 UPDATE가 실행되었다. 이유는 앞에서 본 구조 그대로다. 두 번째 트랜잭션도 OSIV가 연 같은 엔티티 매니저 위에서 시작되었고, 커밋 직전의 플러시(flush)는 영속성 컨텍스트 전체를 대상으로 한다. 하이버네이트는 관리 중인 모든 엔티티를 로딩 시점의 스냅샷과 비교하고, 바뀐 주문을 찾아 UPDATE를 만든다. 그 변경이 어느 트랜잭션에서 일어났는지는 따지지 않는다. 같은 코드를 OSIV 없이 실행하면 주문은 첫 트랜잭션이 끝날 때 준영속(detached) 상태가 되고, 두 번째 트랜잭션은 새 엔티티 매니저를 쓰므로 UPDATE가 나가지 않는다. 실험에서도 <code>DB status = ORDER</code>로 값이 그대로였다.</p>
+
+<p>그렇다면 조회 메서드에 <code>@Transactional(readOnly = true)</code>를 붙이면 막을 수 있을까. 같은 실험에서 주문 조회를 <code>readOnly = true</code> 메서드로 바꿔 실행했다.</p>
+
+<pre data-label="실행 결과 (OSIV 켜짐, 조회 트랜잭션 readOnly = true)"><code class="language-text">--- service.find readOnly=true
+Hibernate: select o1_0.id,o1_0.member_id,o1_0.status from orders o1_0 where o1_0.id=?
+controller: status changed outside tx, calling another tx
+Hibernate: select count(m1_0.id) from Member m1_0
+Hibernate: update orders set member_id=?,status=? where id=?
+DB status = CANCEL</code></pre>
+
+<p>막지 못했다. 이유는 스프링 6.2.19의 <code>HibernateJpaDialect.beginTransaction</code> 바이트코드에서 찾을 수 있다. 읽기 전용 트랜잭션이면 이 메서드는 JDBC 커넥션에 읽기 전용 플래그를 거는 일(앞에서 본 <code>prepareConnection</code>) 말고도 세션에 두 가지를 한다. 하나는 플러시 모드를 <code>MANUAL</code>로 바꾸는 것이다(<code>prepareFlushMode</code>). 이 변경은 트랜잭션이 끝날 때 원래 모드로 되돌려진다. 다른 하나는 <code>session.setDefaultReadOnly(true)</code>로 이후 로딩되는 엔티티를 읽기 전용으로 만드는 것인데, 이 호출은 트랜잭션 정의가 <code>ResourceTransactionDefinition</code>이고 <code>isLocalResource()</code>가 참일 때만 실행된다. <code>JpaTransactionManager</code>는 이 값을 "이 트랜잭션을 위해 엔티티 매니저를 새로 만들었는가"로 채운다. OSIV가 미리 묶어 둔 엔티티 매니저를 재사용하면 이 값이 거짓이므로, 세션 전체를 읽기 전용으로 바꾸는 단계가 건너뛰어진다.</p>
+
+<p>결과적으로 OSIV 아래의 읽기 전용 트랜잭션에서 로딩한 주문은 평범한 관리 엔티티로 남는다. 스냅샷도 그대로 있고, 플러시 모드는 트랜잭션이 끝나면서 원래대로 돌아왔다. 다음 트랜잭션의 커밋이 이 엔티티의 변경을 발견해 UPDATE를 만든다. 같은 이유로, 읽기 전용 엔티티는 스냅샷을 보관하지 않아 메모리를 아낄 수 있다는 이점도 OSIV 아래에서는 이 경로로 얻지 못한다. 이 동작은 스프링 버전마다 구현이 바뀔 수 있는 세부이므로, 버전을 올릴 때는 같은 실험으로 다시 확인하는 것이 좋다.</p>
+
+<p>교훈은 단순하다. 엔티티의 변경은 트랜잭션 안에서만 한다. OSIV가 꺼져 있으면 트랜잭션 밖의 변경은 그냥 무시되므로 버그가 드러나기 쉽다. OSIV가 켜져 있으면 변경이 무시되기도 하고(뒤에 다른 트랜잭션이 없을 때) 저장되기도 하므로(뒤에 다른 트랜잭션이 있을 때), 같은 코드가 호출 순서에 따라 다르게 동작한다. 1차 캐시도 요청 내내 유지되므로, 같은 요청의 두 번째 트랜잭션에서 같은 식별자로 <code>em.find</code>를 호출하면 SELECT 없이 첫 트랜잭션에서 읽은 객체가 그대로 반환된다는 점도 기억해 두자.</p>
+
+<h3>OSIV를 끄면: 지연 로딩은 트랜잭션 안에서 끝내야 한다</h3>
+
+<p><code>spring.jpa.open-in-view=false</code>로 OSIV를 끄면 영속성 컨텍스트와 커넥션의 수명이 다시 트랜잭션과 같아진다. 커넥션 점유 시간은 트랜잭션 구간으로 줄어들고, 트랜잭션 밖의 변경이 몰래 저장되는 문제도 사라진다. 대신 앞의 실험처럼 트랜잭션 밖에서 프록시를 건드리면 <code>LazyInitializationException</code>이 난다. 컨트롤러에서 엔티티의 연관 관계를 탐색하는 코드, <code>@RestController</code>가 엔티티를 그대로 반환해 Jackson이 직렬화하면서 연관 관계를 따라가는 코드, 템플릿이 <code>order.member.name</code>을 그리는 코드가 모두 이 예외를 만난다.</p>
+
+<p>해결의 원칙은 하나다. <b>응답에 필요한 데이터는 트랜잭션이 끝나기 전에 모두 로딩해서 영속성 컨텍스트와 무관한 형태로 바꿔 둔다.</b> 이 권의 앞 회차들이 다룬 기법이 바로 그 수단이다.</p>
+
+<ul>
+<li><b>페치 조인</b>: 필요한 xToOne 연관을 JPQL의 <code>join fetch</code>로 한 번에 읽는다(2회차). 컬렉션 페치 조인과 페이징이 충돌하는 경우의 처리는 3회차에서 다뤘다.</li>
+<li><b>배치 크기</b>: 컬렉션을 지연 로딩하더라도 트랜잭션 안에서 접근하면 <code>default_batch_fetch_size</code>가 여러 프록시를 IN 쿼리 하나로 초기화한다(3회차).</li>
+<li><b>DTO 직접 조회</b>: 처음부터 엔티티가 아닌 DTO로 조회하면 프록시가 생길 일이 없다(4회차).</li>
+<li><b>트랜잭션 안에서의 DTO 변환</b>: 엔티티로 조회하더라도 서비스의 트랜잭션 안에서 DTO로 바꿔 반환한다. 변환 중의 지연 로딩은 트랜잭션 안이므로 성공한다.</li>
+<li><b>명시적 초기화</b>: 트랜잭션 안에서 <code>Hibernate.initialize(proxy)</code>를 호출해 프록시를 강제로 초기화한다. 어떤 연관을 초기화했는지가 코드에 드러나지 않으므로 앞의 방법들보다 의도가 덜 보인다.</li>
+</ul>
+
+<p>여기서 하나 짚어 둘 것이 있다. OSIV를 끄면 지연 로딩을 쓸 수 없다고 오해하기 쉬운데, 그렇지 않다. 트랜잭션 안에서는 지연 로딩이 그대로 동작한다. 바뀌는 것은 지연 로딩이 일어나도 되는 <b>장소</b>다. OSIV가 켜져 있을 때는 그 장소가 요청 전체였고, 꺼지면 트랜잭션 경계 안으로 좁혀진다. 따라서 OSIV를 끈다는 결정은 "어떤 데이터를 어디서 로딩하는가"를 코드 구조로 드러내라는 요구가 된다.</p>
+
+<h3>커맨드와 쿼리를 나눈다</h3>
+
+<p>OSIV를 끄고 나면 서비스 계층에 화면이나 API 하나를 위한 조회 메서드가 늘어난다. 주문 상세 API는 회원 이름과 배송지가 필요하고, 주문 목록 API는 상품 이름까지 필요하며, 관리자 화면은 또 다른 조합을 원한다. 이 메서드들을 주문을 생성하고 취소하는 핵심 비즈니스 로직과 같은 클래스에 넣으면 클래스가 금세 비대해지고, 화면 요구가 바뀔 때마다 핵심 로직을 담은 클래스를 고치게 된다.</p>
+
+<p>이때 쓸 수 있는 설계 원칙이 커맨드-쿼리 분리(CQS, Command-Query Separation)다. 버트런드 마이어(Bertrand Meyer)가 정리한 이 원칙은 원래 메서드 수준의 규칙으로, 메서드는 상태를 바꾸는 커맨드이거나 값을 돌려주는 쿼리이거나 둘 중 하나여야 한다는 것이다. 이것을 서비스 계층에 적용하면, 상태를 바꾸는 핵심 로직을 담은 서비스와 화면·API에 맞춘 조회를 담은 서비스를 별도의 클래스로 나누는 구조가 된다. 둘은 바뀌는 이유와 속도가 다르다. 핵심 로직은 비즈니스 규칙이 바뀔 때만 바뀌고, 조회는 화면과 API 스펙이 바뀔 때마다 바뀐다.</p>
+
+<pre><code class="language-java">// 조회 전용 서비스: 화면·API에 맞춘 데이터를 트랜잭션 안에서 DTO로 만들어 반환한다
+@Service
+@Transactional(readOnly = true)
+public class OrderQueryService {
+
+    @PersistenceContext
+    private EntityManager em;
+
+    public OrderDetailResponse findDetail(Long orderId) {
+        Order order = em.createQuery(
+                "select o from Order o join fetch o.member where o.id = :id", Order.class)
+            .setParameter("id", orderId)
+            .getSingleResult();
+        return new OrderDetailResponse(order.getId(), order.getMember().getName(), order.getStatus());
+    }
+}
+
+public record OrderDetailResponse(Long orderId, String memberName, String status) {}</code></pre>
+
+<p>이 클래스를 앞의 실험 환경에 넣고 OSIV를 끈 상태에서 호출했다(실험에서는 <code>@Service</code> 대신 자바 설정의 <code>@Bean</code>으로 등록했다). 결과는 다음과 같다.</p>
+
+<pre data-label="실행 결과 (OSIV 꺼짐)"><code class="language-text">Hibernate: select o1_0.id,m1_0.id,m1_0.name,o1_0.status from orders o1_0 join Member m1_0 on m1_0.id=o1_0.member_id where o1_0.id=?
+OrderDetailResponse[orderId=1, memberName=kim, status=ORDER]
+after query service | active=0 txActive=false</code></pre>
+
+<p>SELECT 한 번으로 주문과 회원을 함께 읽었고, 반환된 것은 프록시가 아닌 레코드다. 메서드가 끝난 뒤 <code>active=0</code>이므로 커넥션은 이미 돌아갔다. 컨트롤러는 이 레코드를 받아 그대로 반환하면 되고, Jackson이 직렬화하는 동안 영속성 컨텍스트가 필요할 일이 없다. 화면이 회원 이메일을 추가로 원하면 이 조회 서비스의 쿼리와 DTO만 고치면 된다. 핵심 로직을 담은 서비스는 손대지 않는다.</p>
+
+<p>패키지도 나눠 두면 의도가 더 분명해진다. 예를 들어 핵심 서비스는 <code>service</code> 패키지에, 화면 맞춤 조회는 <code>service.query</code> 패키지에 둔다. 조회 서비스의 클래스 선언에 붙인 <code>@Transactional(readOnly = true)</code>는 OSIV가 꺼진 환경에서는 새 엔티티 매니저 위에서 시작되므로, 앞 절에서 본 세션 읽기 전용 설정까지 적용된다. 이 구조는 다음 권들에서도 이어진다. 스프링 데이터 JPA는 리포지토리 계층의 반복 코드를 줄여 주고, Querydsl은 조회 서비스에 들어갈 동적 쿼리를 타입 안전하게 쓰게 해 준다. 둘 다 조회 코드를 트랜잭션 안의 한곳에 모으는 이 구조와 잘 맞는다.</p>
+
+<x-visual id="jpa-app2-05-command-query-split" title="핵심 서비스와 조회 전용 서비스로 나눈 계층 구조" kind="구조 그림" ratio="16:9">
+<x-hint>컨트롤러 아래에 상태를 바꾸는 핵심 서비스와 DTO를 반환하는 조회 서비스가 나란히 있고, 둘 다 트랜잭션 경계 안에서 엔티티를 다루며, 경계 밖으로는 DTO만 나가는 구조를 보여 준다.</x-hint>
+<x-prompt>Layered architecture diagram, flat style, white background. Top box: "컨트롤러". Below it, a dashed rounded rectangle labeled "트랜잭션 경계" containing two side-by-side boxes: left box "핵심 서비스 (커맨드)" with a small note "주문 생성·취소", right box "조회 서비스 (쿼리)" with a small note "readOnly, DTO 변환". Inside the dashed rectangle, below both boxes, a box "엔티티 · 영속성 컨텍스트". Bottom box outside the dashed rectangle: "DB". Arrows: controller to both services (downward); both services to the entity box; entity box to DB. An upward arrow from the right service to the controller labeled "DTO만 반환", drawn crossing the dashed boundary. A small red crossed-out icon next to the controller labeled "엔티티 프록시 금지". Keep labels under 12.</x-prompt>
+<x-caption>OSIV를 끈 구조에서는 엔티티와 지연 로딩이 트랜잭션 경계 안에만 머물고, 경계 밖으로는 DTO만 나간다.</x-caption>
+</x-visual>
+
+<h3>켤 것인가, 끌 것인가</h3>
+
+<p>OSIV는 옳고 그름의 문제가 아니라 비용과 편의의 교환이다. 판단의 중심에는 앞에서 계산한 커넥션 점유 시간이 있다. 트래픽이 적고 요청 처리 시간이 짧은 시스템, 예를 들어 사내 관리자 화면이라면 OSIV가 커넥션을 조금 더 오래 쥐어도 풀이 고갈될 정도의 동시성이 생기지 않는다. 이런 곳에서는 지연 로딩을 어디서나 쓸 수 있다는 편리함이 개발 속도에 더 크게 기여할 수 있다. 반대로 고객이 직접 쓰는 API처럼 동시 요청이 많은 시스템에서는 리틀의 법칙의 W가 곧바로 필요한 커넥션 수로 바뀌므로, 커넥션 점유를 트랜잭션 구간으로 줄이는 쪽이 안전하다.</p>
+
+<p>요청 안에 DB와 무관하게 오래 걸리는 작업이 있는지가 두 번째 기준이다. 외부 API 호출, 파일 업로드 처리, 큰 응답 본문의 직렬화, 무거운 템플릿 렌더링이 트랜잭션 이후에 일어난다면, OSIV는 그 시간 전부를 커넥션 점유 시간에 더한다. 이런 작업이 있는 시스템에서 OSIV를 켜 두면 DB 부하와 상관없이 풀이 고갈될 수 있다는 것을 실험에서 확인했다.</p>
+
+<p>세 번째 기준은 코드가 실행되는 장소다. OSIV는 웹 요청에만 적용된다. 스프링 MVC 인터셉터가 디스패처 서블릿의 요청 처리에 붙어 동작하기 때문이다. <code>@Scheduled</code> 작업, <code>@Async</code> 메서드가 실행되는 별도 스레드, 메시지 리스너, 배치 작업에는 OSIV가 없다. 컨트롤러에서 잘 동작하던 "트랜잭션 밖 지연 로딩"이 같은 서비스를 스케줄러에서 호출하는 순간 <code>LazyInitializationException</code>으로 바뀐다. OSIV를 켠 상태에서 작성된 코드는 이 의존성을 드러내지 않으므로, 웹 밖에서 재사용될 때 문제가 뒤늦게 발견된다. OSIV를 끈 상태에서 작성된 코드는 처음부터 트랜잭션 안에서 필요한 것을 모두 로딩하므로 어디서 호출해도 같은 방식으로 동작한다.</p>
+
+<p>어느 쪽을 고르든 속성은 명시적으로 적는다. 경고 로그가 사라지는 것보다 중요한 이유는, 이 결정이 팀의 코드 작성 규칙을 바꾸기 때문이다. 일부 경로에만 OSIV가 필요하다면 자동 등록을 끄고 인터셉터를 직접 등록하면서 경로를 제한할 수도 있다.</p>
+
+<pre><code class="language-java">// application.properties: spring.jpa.open-in-view=false
+@Configuration
+public class OsivConfig implements WebMvcConfigurer {
+    private final EntityManagerFactory emf;
+
+    public OsivConfig(EntityManagerFactory emf) {
+        this.emf = emf;
+    }
+
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        OpenEntityManagerInViewInterceptor osiv = new OpenEntityManagerInViewInterceptor();
+        osiv.setEntityManagerFactory(emf);
+        registry.addWebRequestInterceptor(osiv).addPathPatterns("/admin/**");
+    }
+}</code></pre>
+
+<p>이 설정에서 인터셉터는 빈이 아니라 직접 생성한 객체이므로 <code>setEntityManagerFactory</code>로 팩토리를 넣어 주었다. <code>addWebRequestInterceptor</code>는 스프링 부트의 자동 구성이 쓰는 것과 같은 등록 메서드이고, 반환되는 <code>InterceptorRegistration</code>의 <code>addPathPatterns</code>로 적용 경로를 좁혔다. 이 코드는 Spring Framework 6.2.19로 컴파일을 확인했다. 다만 경로마다 규칙이 다르면 같은 서비스가 어떤 경로에서는 동작하고 어떤 경로에서는 예외를 내는 혼란이 생길 수 있으므로, 이런 혼합은 관리자 화면처럼 경계가 분명한 경우로 한정하는 편이 좋다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>관점</th><th>OSIV 켜짐</th><th>OSIV 꺼짐</th></tr></thead><tbody>
+<tr><td>영속성 컨텍스트 수명</td><td>요청 시작부터 afterCompletion까지</td><td>트랜잭션 구간</td></tr>
+<tr><td>커넥션 점유</td><td>첫 트랜잭션 시작부터 요청 끝까지</td><td>트랜잭션 구간</td></tr>
+<tr><td>컨트롤러·뷰·직렬화에서 지연 로딩</td><td>된다(자동 커밋 모드의 개별 SELECT)</td><td><code>LazyInitializationException</code></td></tr>
+<tr><td>트랜잭션 밖의 엔티티 변경</td><td>뒤의 트랜잭션 커밋 때 저장될 수 있다</td><td>준영속이므로 저장되지 않는다</td></tr>
+<tr><td>요청 내 여러 트랜잭션</td><td>하나의 영속성 컨텍스트를 공유</td><td>트랜잭션마다 새 영속성 컨텍스트</td></tr>
+<tr><td>코드 구조에 주는 요구</td><td>적다</td><td>필요한 데이터를 트랜잭션 안에서 로딩·변환</td></tr>
+</tbody></table></div>
+
+<h3>흔한 오해 바로잡기</h3>
+
+<p><b>"OSIV는 뷰 템플릿을 쓸 때만 관계있다."</b> 이름에 뷰가 들어 있어 생기는 오해다. 인터셉터는 디스패처 서블릿의 요청 처리 전체를 감싸므로, <code>@RestController</code>가 반환한 객체를 메시지 컨버터가 JSON으로 쓰는 단계도 OSIV 구간 안이다. 그리고 커넥션 점유는 지연 로딩을 하든 하지 않든 첫 트랜잭션부터 요청 끝까지 이어진다. API 서버에도 똑같이 적용된다.</p>
+
+<p><b>"OSIV를 켜면 N+1 문제가 생긴다."</b> N+1은 지연 로딩되는 연관을 반복문에서 하나씩 건드릴 때 생기는 현상이고, OSIV와 무관하게 트랜잭션 안에서도 생긴다. OSIV가 하는 일은 그 지연 로딩이 트랜잭션 밖, 예를 들어 직렬화 중에 일어나도 예외 없이 동작하게 만드는 것이다. 그 결과 N+1이 서비스 코드가 아닌 곳에서 조용히 일어나 발견이 늦어진다. 원인은 로딩 전략이고, OSIV는 그것을 가리는 역할을 한다.</p>
+
+<p><b>"조회 메서드에 readOnly를 붙였으니 OSIV에서도 엔티티가 바뀌지 않는다."</b> 실험에서 보았듯 스프링 6.2.19에서 OSIV가 미리 연 엔티티 매니저를 쓰는 읽기 전용 트랜잭션은 세션을 읽기 전용으로 바꾸지 않는다. 플러시 모드만 트랜잭션 동안 <code>MANUAL</code>로 바뀌었다가 돌아온다. 그래서 그 트랜잭션에서 읽은 엔티티를 밖에서 고치면 뒤의 트랜잭션이 저장한다.</p>
+
+<p><b>"풀 크기를 늘리면 해결된다."</b> 풀을 키우면 고갈되는 시점이 늦춰질 뿐, 커넥션을 쥔 채 DB와 상관없는 일을 하는 구조는 그대로다. DB 서버 쪽에서도 커넥션 하나하나가 세션 상태와 메모리를 쓰므로 무한히 늘릴 수 없고, 여러 애플리케이션 인스턴스가 같은 DB를 쓰면 인스턴스 수만큼 곱해진다. 리틀의 법칙에서 줄여야 하는 것은 L의 상한이 아니라 W다.</p>
+
+<p><b>"OSIV를 끄면 지연 로딩 설정을 모두 즉시 로딩으로 바꿔야 한다."</b> 즉시 로딩(EAGER)은 필요 없는 상황에서도 연관을 읽고, JPQL에서는 N+1을 그대로 만든다. OSIV를 끈 뒤에도 연관은 지연 로딩으로 두고, 각 조회가 필요한 연관을 페치 조인이나 배치 크기로 트랜잭션 안에서 읽는 것이 이 권 전체가 쌓아 온 방법이다.</p>
+
+<h3>이 권의 정리: 조회 성능을 결정하는 세 개의 축</h3>
+
+<p>다섯 회차를 지나며 다룬 내용을 세 개의 축으로 다시 묶을 수 있다. 첫째는 <b>경계</b>다. 1회차에서 엔티티와 API 스펙을 DTO로 분리했다. 엔티티가 바뀌어도 API가 흔들리지 않게 하고, 엔티티의 프록시가 직렬화 경로로 새어 나가지 않게 하는 경계다. 이번 회차의 커맨드-쿼리 분리와 "트랜잭션 밖으로는 DTO만" 원칙은 같은 경계를 트랜잭션 쪽에서 다시 세운 것이다.</p>
+
+<p>둘째는 <b>쿼리의 개수와 모양</b>이다. 2회차부터 4회차까지 지연 로딩이 만드는 N+1을 페치 조인, 배치 크기, DTO 직접 조회로 줄였다. 같은 결과를 얻는 SQL이 한 번인지 N+1번인지, 조인이 행을 몇 배로 늘리는지, 페이징을 DB가 하는지 메모리가 하는지가 이 축의 질문이었다.</p>
+
+<p>셋째는 이번 회차의 <b>자원 점유 시간</b>이다. 쿼리가 아무리 빨라도 커넥션을 쥔 시간이 길면 시스템 전체의 처리량이 커넥션 풀 크기에 묶인다. OSIV는 이 시간을 요청 전체로 늘리는 장치였고, 끄면 트랜잭션 구간으로 줄어든다. 세 축은 서로 얽혀 있다. OSIV를 끄려면 필요한 데이터를 트랜잭션 안에서 로딩해야 하고(둘째 축), 그 결과를 DTO로 바꿔 내보내야 한다(첫째 축). 다음 권인 스프링 데이터 JPA와 Querydsl은 이 구조를 더 적은 코드로 유지하는 도구다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>OSIV (Open Session In View)</dt><dd>영속성 컨텍스트를 웹 요청 전체 동안 열어 두는 패턴. JPA에서는 Open EntityManager In View라 하며, 스프링 부트는 <code>spring.jpa.open-in-view</code> 기본값 <code>true</code>로 인터셉터를 자동 등록한다.</dd>
+<dt>OpenEntityManagerInViewInterceptor</dt><dd><code>preHandle</code>에서 엔티티 매니저를 만들어 스레드에 묶고 <code>afterCompletion</code>에서 닫는다. <code>JpaTransactionManager</code>는 묶인 엔티티 매니저를 찾아 재사용하고, 트랜잭션이 끝나도 닫지 않는다.</dd>
+<dt>DELAYED_ACQUISITION_AND_HOLD</dt><dd>스프링의 하이버네이트 어댑터가 강제하는 커넥션 처리 모드. 필요할 때 커넥션을 얻어 세션이 닫힐 때까지 쥔다. OSIV와 만나면 커넥션 점유가 요청 끝까지 이어진다.</dd>
+<dt>트랜잭션 밖 지연 로딩</dt><dd>OSIV에서 컨트롤러·직렬화 중의 지연 로딩은 자동 커밋 모드에서 문장마다 별도 트랜잭션으로 실행된다. 서비스 트랜잭션과 같은 스냅샷을 본다는 보장이 없다.</dd>
+<dt>커넥션 풀 고갈</dt><dd>리틀의 법칙 L = λW에서 OSIV는 W를 요청 전체 시간으로 늘린다. 히카리CP 기본 풀 10개, 기본 대기 30초를 넘기면 <code>SQLTransientConnectionException</code>이 난다.</dd>
+<dt>트랜잭션 밖 변경의 지연 저장</dt><dd>OSIV에서는 요청 안의 트랜잭션들이 영속성 컨텍스트를 공유하므로, 밖에서 바꾼 엔티티가 뒤 트랜잭션의 커밋 때 UPDATE 된다. 읽기 전용 트랜잭션으로 조회했어도 막지 못한다.</dd>
+<dt>LazyInitializationException</dt><dd>닫힌 영속성 컨텍스트의 프록시를 초기화하려 할 때 나는 예외. OSIV를 끄면 트랜잭션 밖의 지연 로딩에서 발생한다.</dd>
+<dt>커맨드-쿼리 분리</dt><dd>상태를 바꾸는 핵심 서비스와 화면·API 맞춤 조회 서비스를 나누는 구조. 조회 서비스는 읽기 전용 트랜잭션 안에서 필요한 연관을 로딩해 DTO로 반환한다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 OSIV가 문제로 드러나는 모습은 대개 "DB는 한가한데 애플리케이션이 응답하지 않는다"다. 스레드 덤프를 뜨면 다수의 요청 스레드가 커넥션 풀의 <code>getConnection</code>에서 대기하고 있고, 커넥션을 쥔 스레드들은 DB가 아니라 외부 API 응답을 기다리거나 큰 JSON을 쓰고 있다. 이 그림을 보면 OSIV와 트랜잭션 이후의 느린 작업을 먼저 의심한다. 히카리CP의 활성·대기 커넥션 지표를 모니터링에 올려 두면 이 상황을 장애 전에 볼 수 있다.</p>
+
+<p>OSIV를 끄는 결정은 기존 코드베이스에서는 비용이 크다. 컨트롤러와 템플릿 곳곳에 트랜잭션 밖 지연 로딩이 숨어 있기 때문이다. 이때는 한 번에 끄기보다 조회 서비스를 하나씩 분리해 DTO를 반환하도록 바꾸고, 테스트 환경에서 먼저 <code>spring.jpa.open-in-view=false</code>로 돌려 <code>LazyInitializationException</code>이 나는 경로를 찾아내는 방식이 현실적이다. 앞에서 본 경로 제한 등록은 관리자 화면처럼 경계가 분명한 영역에만 OSIV를 남기는 과도기 수단이 될 수 있다.</p>
+
+<p>판단이 달라지는 조건도 기억해 둔다. 트래픽이 작고 요청이 짧으며 트랜잭션 이후에 느린 작업이 없다면 OSIV의 비용은 작다. 반대로 가상 스레드를 켜 동시 요청 수의 상한이 사라졌거나, 외부 호출이 많거나, 여러 인스턴스가 한 DB를 나눠 쓰는 환경이라면 커넥션 점유 시간이 곧 처리량의 상한이 된다. 같은 애플리케이션이라도 이런 조건이 바뀌면 결정을 다시 해야 한다.</p>
+</x-review>
+
+<x-practice>
+<li>OSIV가 켜진 애플리케이션에서 한 요청이 (1) 서비스 트랜잭션 0.05초, (2) 외부 API 호출 0.3초, (3) 응답 직렬화 0.02초로 처리된다. 초당 40건이 들어올 때 OSIV를 켰을 때와 껐을 때 평균 사용 중 커넥션 수를 리틀의 법칙으로 계산하고, 히카리CP 기본 풀 크기로 견딜 수 있는지 판단하라.</li>
+<li>OSIV가 켜진 상태에서 컨트롤러가 <code>Order o = orderService.find(id); o.setStatus("CANCEL"); auditService.record(id);</code>를 실행한다. <code>auditService.record</code>는 감사 로그 엔티티를 저장하는 <code>@Transactional</code> 메서드다. 실행 후 DB의 주문 상태가 어떻게 되는지 예측하고, OSIV를 껐을 때와 비교해 이유를 설명하라.</li>
+<li>OSIV를 끈 애플리케이션에서 <code>@Scheduled</code> 메서드와 컨트롤러가 같은 <code>OrderQueryService.findDetail</code>을 호출한다. 두 경우의 동작이 같은지, OSIV를 켰을 때 컨트롤러가 <code>orderService.find(id).getMember().getName()</code>을 호출하던 코드를 스케줄러로 옮기면 무슨 일이 생기는지 설명하라.</li>
+<li>OSIV가 켜진 요청에서 서비스 트랜잭션이 끝난 뒤 히카리 풀의 활성 커넥션 수가 1로 남아 있다. 이 현상을 만드는 두 가지 설정(또는 장치)을 각각 이름으로 대고, 둘 중 하나만 바뀌었을 때 커넥션이 언제 반납될지 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p>1번: OSIV를 켜면 커넥션 점유 시간은 첫 트랜잭션 시작부터 요청 끝까지이므로 W = 0.05 + 0.3 + 0.02 = 0.37초, L = 40 × 0.37 = 14.8개다. 히카리CP 기본 풀 10개를 넘으므로 평균적으로도 대기가 생기고, 부하가 몰리면 30초 대기 후 예외가 난다. OSIV를 끄면 W = 0.05초, L = 40 × 0.05 = 2개로 여유가 있다. 같은 일을 하는데 필요한 커넥션 수가 일곱 배 넘게 차이 나는 것은, 외부 API 호출 시간이 OSIV에서는 커넥션 점유 시간에 포함되기 때문이다. 리틀의 법칙은 평균에 대한 관계이므로 실제 운영에서는 순간적인 몰림까지 고려해 여유를 더 두어야 한다.</p>
+<p>2번: OSIV가 켜져 있으면 주문 상태는 CANCEL로 저장된다. <code>auditService.record</code>의 트랜잭션도 OSIV가 연 같은 엔티티 매니저 위에서 시작되고, 커밋 직전 플러시가 영속성 컨텍스트 전체를 검사해 바뀐 주문을 찾아 UPDATE 하기 때문이다. <code>orderService.find</code>가 <code>readOnly = true</code>였더라도 OSIV의 엔티티 매니저를 재사용하는 경우 세션이 읽기 전용으로 바뀌지 않으므로 결과는 같다. OSIV를 끄면 주문은 첫 트랜잭션이 끝날 때 준영속이 되고, 감사 로그 트랜잭션은 새 엔티티 매니저를 쓰므로 주문은 바뀌지 않는다. 의도가 취소라면 취소를 서비스의 트랜잭션 메서드로 옮겨야 한다.</p>
+<p>3번: <code>OrderQueryService.findDetail</code>은 트랜잭션 안에서 필요한 연관을 페치 조인으로 읽고 DTO를 반환하므로, OSIV 여부나 호출 장소와 무관하게 똑같이 동작한다. 반면 OSIV에 기대어 트랜잭션 밖에서 <code>getMember().getName()</code>을 호출하던 코드는 스케줄러 스레드로 옮기는 순간 실패한다. OSIV는 디스패처 서블릿의 요청 처리에 붙은 인터셉터이므로 스케줄러 스레드에는 엔티티 매니저를 묶어 주는 존재가 없다. 서비스 트랜잭션이 끝나면 엔티티 매니저가 닫히고, 프록시 초기화에서 <code>LazyInitializationException</code>이 난다.</p>
+<p>4번: 첫째는 <code>OpenEntityManagerInViewInterceptor</code>로, 엔티티 매니저의 수명을 요청 끝까지 늘린다. 둘째는 스프링의 <code>HibernateJpaVendorAdapter</code>가 설정한 커넥션 처리 모드 <code>DELAYED_ACQUISITION_AND_HOLD</code>로, 커넥션을 세션이 닫힐 때까지 쥐게 한다. OSIV만 끄면 세션이 트랜잭션 끝에 닫히므로 커넥션도 트랜잭션 끝에 반납된다. OSIV는 켠 채 처리 모드만 <code>DELAYED_ACQUISITION_AND_RELEASE_AFTER_TRANSACTION</code>으로 바꾸면 하이버네이트는 트랜잭션이 끝날 때 커넥션을 놓고, 트랜잭션 밖의 지연 로딩이 일어나면 그때 다시 얻는다. 다만 이 경우 스프링이 트랜잭션별 격리 수준과 읽기 전용 플래그를 커넥션에 적용하는 <code>prepareConnection</code> 기능과 충돌할 수 있으므로, 어댑터 자바독이 말하는 대로 그 플래그와 함께 판단해야 한다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>OSIV가 켜진 요청에서 서비스의 <code>@Transactional</code> 메서드가 커밋된 직후에도 히카리 풀의 활성 커넥션 수가 줄지 않는 직접적인 이유는?</q>
+<o>JPA 명세가 영속성 컨텍스트가 열려 있는 동안 커넥션을 반납하지 못하게 정해 두었기 때문이다.</o>
+<o>히카리CP가 같은 스레드에 빌려준 커넥션을 요청이 끝날 때까지 회수하지 않기 때문이다.</o>
+<o>스프링이 하이버네이트를 커넥션을 세션이 닫힐 때까지 쥐는 모드로 설정했고, OSIV가 세션을 요청 끝까지 열어 두기 때문이다.</o>
+<o>커밋 후에도 트랜잭션이 요청 끝까지 이어지기 때문이다.</o>
+<why>스프링의 <code>HibernateJpaVendorAdapter</code>는 <code>DELAYED_ACQUISITION_AND_HOLD</code>를 적용해 커넥션 수명을 세션에 묶고, OSIV는 세션 수명을 요청 전체로 늘린다. 두 설정의 조합이 원인이다. 실험에서 커밋 뒤 <code>txActive=false</code>였으므로 트랜잭션이 이어지는 것은 아니고, 히카리CP는 스레드가 아니라 <code>close()</code> 호출로 커넥션을 돌려받는다. 커넥션 반납 시점은 JPA 명세가 아니라 구현의 설정이 정한다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>OSIV가 켜진 상태에서 컨트롤러가 트랜잭션 밖에서 지연 로딩을 일으켰다. MySQL InnoDB 기준으로 이 SELECT에 대한 설명으로 옳은 것은?</q>
+<o>직전 서비스 트랜잭션의 스냅샷을 그대로 이어받아 읽는다.</o>
+<o>자동 커밋 모드에서 실행되어 그 문장 하나가 별도의 트랜잭션을 이룬다.</o>
+<o>트랜잭션이 없으므로 InnoDB는 일관된 읽기를 하지 않고 커밋되지 않은 값도 읽는다.</o>
+<o>하이버네이트가 자동으로 새 읽기 전용 트랜잭션을 열어 서비스와 같은 격리 수준을 적용한다.</o>
+<why>실험에서 트랜잭션 이후 커넥션은 <code>autoCommit=true</code>였다. MySQL 매뉴얼에 따르면 자동 커밋이 켜져 있으면 각 SQL 문장이 그 자체로 트랜잭션이 된다. 따라서 서비스 트랜잭션의 스냅샷과는 무관하게 그 시점의 커밋된 상태를 읽으며, 서비스에 지정한 트랜잭션 속성도 적용되지 않는다. InnoDB의 모든 사용자 활동은 트랜잭션 안에서 일어나므로 "트랜잭션이 없다"는 전제부터 틀렸다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>OSIV가 켜진 요청에서 <code>@Transactional(readOnly = true)</code> 메서드로 조회한 엔티티를 컨트롤러에서 수정한 뒤 다른 <code>@Transactional</code> 메서드를 호출했다. 스프링 6.2.19와 하이버네이트 6.6에서 일어나는 일은?</q>
+<o>엔티티가 읽기 전용으로 로딩되었으므로 UPDATE가 나가지 않는다.</o>
+<o>읽기 전용 트랜잭션의 플러시 모드 MANUAL이 요청 끝까지 유지되므로 UPDATE가 나가지 않는다.</o>
+<o>트랜잭션 밖의 수정이므로 하이버네이트가 예외를 던진다.</o>
+<o>OSIV의 엔티티 매니저를 재사용한 트랜잭션에서는 세션 읽기 전용 설정이 적용되지 않아, 뒤 트랜잭션의 커밋 때 UPDATE가 나간다.</o>
+<why><code>HibernateJpaDialect</code>는 트랜잭션 정의의 <code>isLocalResource()</code>가 참일 때만 <code>setDefaultReadOnly(true)</code>를 호출하고, <code>JpaTransactionManager</code>는 이 값을 "엔티티 매니저를 새로 만들었는가"로 채운다. OSIV가 미리 연 엔티티 매니저를 쓰면 거짓이다. 플러시 모드 MANUAL은 트랜잭션이 끝날 때 원래대로 돌아간다. 하이버네이트는 관리 엔티티의 수정 자체를 막지 않으므로 예외도 나지 않는다. 실험에서 <code>DB status = CANCEL</code>로 확인했다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>OSIV를 끈 뒤 컨트롤러가 엔티티를 그대로 반환하는 API에서 <code>LazyInitializationException</code>이 난다. 근본적인 해결에 가장 가까운 것은?</q>
+<o>응답에 필요한 연관을 서비스 트랜잭션 안에서 페치 조인 등으로 로딩하고, DTO로 바꿔 반환한다.</o>
+<o>연관 관계를 모두 즉시 로딩(EAGER)으로 바꾼다.</o>
+<o>커넥션 풀 크기를 늘린 뒤 OSIV를 다시 켠다.</o>
+<o>컨트롤러 메서드 전체에 <code>@Transactional</code>을 붙여 직렬화까지 트랜잭션 안에서 하게 만든다.</o>
+<why>OSIV를 끈 환경의 원칙은 필요한 데이터를 트랜잭션 안에서 로딩해 영속성 컨텍스트와 무관한 형태로 바꿔 내보내는 것이다. 즉시 로딩은 필요 없는 곳에서도 연관을 읽고 JPQL에서는 N+1을 만든다. 풀 크기를 늘리는 것은 점유 시간 문제를 미룰 뿐이다. 컨트롤러에 트랜잭션을 거는 것은 엔티티 반환과 API 스펙의 결합을 그대로 둔 채 트랜잭션 경계를 넓혀 커넥션 점유를 다시 늘리는 방향이다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>OSIV (Open Session In View)</dt><dd>영속성 컨텍스트(하이버네이트 세션)를 뷰 렌더링이 끝날 때까지, 곧 요청 전체 동안 열어 두는 패턴. JPA 용어로는 Open EntityManager In View.</dd>
+<dt>공유 엔티티 매니저 프록시 (shared EntityManager proxy)</dt><dd><code>@PersistenceContext</code>로 주입되는 스프링의 프록시. 호출마다 현재 스레드에 묶인 실제 엔티티 매니저를 찾아 위임한다.</dd>
+<dt>TransactionSynchronizationManager</dt><dd>스레드별 <code>ThreadLocal</code> 맵에 엔티티 매니저 홀더, 커넥션 홀더 같은 트랜잭션 자원을 묶어 두는 스프링의 클래스.</dd>
+<dt>커넥션 처리 모드 (PhysicalConnectionHandlingMode)</dt><dd>하이버네이트가 JDBC 커넥션을 언제 얻고 언제 놓을지 정하는 설정. 획득 방식과 반납 방식의 다섯 가지 조합이 있다.</dd>
+<dt>자동 커밋 (auto-commit)</dt><dd>JDBC 커넥션에서 문장마다 자동으로 커밋하는 모드. 트랜잭션을 시작한다는 것은 이 모드를 끄는 것이고, InnoDB에서 자동 커밋 중인 각 문장은 별도 트랜잭션이다.</dd>
+<dt>리틀의 법칙 (Little's law)</dt><dd>안정 상태의 시스템에서 평균 체류 개수 L = 평균 도착률 λ × 평균 체류 시간 W라는 관계. 커넥션 풀에서는 사용 중 커넥션 수를 추정하는 데 쓴다.</dd>
+<dt>준영속 상태 (detached)</dt><dd>영속성 컨텍스트가 닫히거나 분리되어 더 이상 관리되지 않는 엔티티의 상태. 변경 감지와 지연 로딩이 동작하지 않는다.</dd>
+<dt>커맨드-쿼리 분리 (CQS, Command-Query Separation)</dt><dd>상태를 바꾸는 연산과 값을 조회하는 연산을 분리하라는 원칙. 서비스 계층에서는 핵심 서비스와 조회 전용 서비스를 나누는 형태로 적용한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-boot/reference/data/sql.html">Spring Boot Reference — SQL Databases (Open EntityManager in View)</a> — 스프링 부트가 OSIV 인터셉터를 기본 등록하고 <code>spring.jpa.open-in-view</code>로 끌 수 있다는 설명, 히카리CP 우선 선택 규칙</li>
+<li><a href="https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/orm/jpa/support/OpenEntityManagerInViewInterceptor.html">Spring Framework Javadoc — OpenEntityManagerInViewInterceptor</a> — 요청 전체 동안 엔티티 매니저를 스레드에 묶고 트랜잭션 매니저가 이를 자동 감지한다는 설명</li>
+<li><a href="https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/orm/jpa/vendor/HibernateJpaVendorAdapter.html">Spring Framework Javadoc — HibernateJpaVendorAdapter</a> — <code>prepareConnection</code> 플래그와 <code>DELAYED_ACQUISITION_AND_HOLD</code> 강제 적용</li>
+<li><a href="https://docs.hibernate.org/orm/6.6/javadocs/org/hibernate/resource/jdbc/spi/PhysicalConnectionHandlingMode.html">Hibernate ORM 6.6 Javadoc — PhysicalConnectionHandlingMode</a> — 커넥션 획득·반납 모드 다섯 가지의 정의</li>
+<li><a href="https://github.com/brettwooldridge/HikariCP">HikariCP README</a> — <code>maximumPoolSize</code>(기본 10), <code>connectionTimeout</code>(기본 30000ms)의 의미</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-autocommit-commit-rollback.html">MySQL 8.0 Reference Manual — autocommit, Commit, and Rollback</a> — 자동 커밋 모드에서 각 SQL 문장이 하나의 트랜잭션이 된다는 설명</li>
+</x-refs>

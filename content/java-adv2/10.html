@@ -1,0 +1,1244 @@
+<x-meta>
+deck: 소켓 위에 HTTP/1.1을 직접 얹어 브라우저와 말이 통하는 서버를 만들며, 메시지의 바이트 구조와 본문 길이 규칙, 스레드 풀, URL 인코딩, 요청·응답 객체, 커맨드 패턴이 서블릿 컨테이너의 뼈대가 되는 과정을 확인한다.
+minutes: 110
+</x-meta>
+
+<x-goals>
+<li>HTTP/1.1 요청을 바이트 단위로 읽어 시작 줄·헤더·빈 줄·본문으로 나누고, 수신자가 본문의 끝을 정하는 규칙(Transfer-Encoding, Content-Length, 연결 종료)을 RFC 9112가 정한 우선순위대로 설명할 수 있다.</li>
+<li>Content-Length를 문자 수로 계산하거나 본문을 <code>Reader</code>로 읽을 때 생기는 잘림과 멈춤을 바이트와 문자의 차이로 설명하고, 바이트 수준 파서로 고칠 수 있다.</li>
+<li>단일 스레드 서버가 요청을 줄 세우는 이유, 스레드 풀이 바꾸는 것과 바꾸지 못하는 것, 소켓을 닫는 책임을 작업 스레드로 넘겨야 하는 이유를 실행 결과로 설명할 수 있다.</li>
+<li>RFC 3986의 퍼센트 인코딩과 HTML 폼 인코딩(공백을 <code>+</code>로)의 차이를 구분하고, 쿼리 문자열을 "먼저 자르고 나중에 디코딩"해야 하는 이유와 문자 집합이 어긋날 때의 결과를 예측할 수 있다.</li>
+<li>경로에서 핸들러를 찾아 호출하는 커맨드 패턴 구조가 서블릿 컨테이너, <code>HttpServlet</code>, 스프링의 <code>DispatcherServlet</code>과 어떻게 대응하는지 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 브라우저와 말이 통하는 서버</h3>
+<p>앞 회차들에서 만든 서버와 클라이언트는 둘 다 우리가 쓴 프로그램이었다. 그래서 메시지 형식도 우리 마음대로 정할 수 있었다. <code>DataOutputStream.writeUTF()</code>로 길이를 앞에 붙여 보내고, 반대편에서 <code>readUTF()</code>로 그 길이만큼 읽으면 그만이었다. 양쪽 코드가 같은 약속을 알고 있으니 문제가 없다. 그런데 클라이언트가 브라우저라면 사정이 달라진다. 브라우저는 우리가 정한 약속을 모른다. 브라우저가 아는 약속은 HTTP 하나다. 주소창에 <code>http://localhost:8080/</code>을 치면 브라우저는 그 주소로 TCP 연결을 맺고, HTTP 규칙에 맞는 바이트를 보낸 뒤, HTTP 규칙에 맞는 바이트가 돌아오기를 기다린다.</p>
+<p>다행히 HTTP/1.1은 TCP 위에서 오가는 텍스트 형식의 메시지다. 따라서 지금까지 쓴 <code>ServerSocket</code>과 <code>Socket</code>, 그리고 바이트 스트림만으로 브라우저와 대화하는 서버를 만들 수 있다. 특별한 라이브러리는 필요 없다. 필요한 것은 규칙을 정확히 아는 것이다. 요청 메시지가 어디서 끝나는지, 본문의 길이를 어떻게 알아내는지, 응답을 보낸 뒤 연결을 어떻게 처리하는지를 정확히 지키지 않으면 브라우저는 응답을 기다리며 멈추거나, 글자가 잘린 화면을 보여 준다.</p>
+<p>이 회차는 두 부분으로 나뉜다. 앞부분은 HTTP 기본 이론과 메서드를 "서버를 직접 구현하는 사람"의 눈으로 다시 읽는다. HTTP 자체의 개념(무상태, 메서드의 의미, 상태 코드)은 「HTTP 웹 기본 지식」 권에서 다뤘으므로, 여기서는 파서가 지켜야 하는 문법과 본문 길이 규칙처럼 구현에 직접 걸리는 부분에 집중한다. 뒷부분은 서버를 다섯 단계로 키운다. 한 번에 한 요청만 처리하는 서버에서 시작해, 동시 요청을 처리하는 스레드 풀, 경로에 따른 기능 분기, URL 인코딩 처리, 요청·응답 객체, 그리고 커맨드 패턴으로 기능을 분리한 구조까지 간다. 마지막에는 이렇게 만든 구조가 CGI에서 서블릿 컨테이너로 이어진 웹 애플리케이션 서버(WAS)의 역사와 어떻게 겹치는지 확인한다.</p>
+<p>예제는 모두 이 글을 위해 새로 쓴 것이다. 본문의 출력은 macOS에서 Temurin JDK 21.0.13과 curl 8.7.1로 실행한 결과이고, 소요 시간이나 스레드 이름처럼 실행마다 달라질 수 있는 값은 그렇다고 밝힌다. 예제의 포트 번호는 설명을 위해 8080으로 적었다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>HTTP 서버가 하는 일의 대부분은 "바이트를 메시지로 자르는 일"이다. TCP는 경계 없는 바이트 흐름만 주므로, 서버는 줄바꿈(CRLF)으로 시작 줄과 헤더를 자르고, 빈 줄로 헤더의 끝을 알고, Content-Length가 말하는 바이트 수만큼 본문을 읽는다. 여기서 바이트와 문자를 혼동하면 응답이 잘리거나 서버가 멈춘다. 그 위에 동시성(스레드 풀), 인코딩(퍼센트 인코딩), 분기(커맨드 패턴)를 얹으면 서블릿 컨테이너의 뼈대가 된다.</p></aside>
+
+<h3>HTTP 기본 이론 ①: 요청은 줄로 나뉜 바이트다</h3>
+<p>현재 HTTP 명세는 의미와 문법을 나눠 적는다. RFC 9110은 메서드, 상태 코드, 헤더 필드의 의미(semantics)를 정하고, RFC 9112는 그 의미를 HTTP/1.1이라는 텍스트 형식으로 어떻게 적는지(message syntax)를 정한다. HTTP/2와 HTTP/3는 같은 의미를 바이너리 프레임에 실어 나르는 다른 문법이다. 이 회차에서 직접 파싱하는 것은 HTTP/1.1의 텍스트 문법이다. 평문 <code>http://</code> 주소로 curl을 실행하면 별다른 옵션 없이 HTTP/1.1로 요청하므로, 실험에도 그대로 쓸 수 있다.</p>
+<p>먼저 실제 요청이 어떤 바이트로 오는지 보자. 연결을 받아 들어온 바이트를 전부 모은 뒤, 보이지 않는 CR(<code>\r</code>, 0x0D)과 LF(<code>\n</code>, 0x0A)를 글자로 바꿔 출력하는 작은 서버를 띄우고 curl로 요청을 세 번 보냈다. 첫 번째는 쿼리 문자열이 있는 GET, 두 번째는 폼 데이터를 보내는 POST(<code>curl -d</code>), 세 번째는 한글이 든 JSON을 보내는 POST다.</p>
+<pre data-label="서버가 받은 원시 바이트 (CR, LF를 글자로 표시)"><code class="language-text">---- 95 bytes
+GET /search?q=%EA%B0%80 HTTP/1.1\r\n
+Host: localhost:8080\r\n
+User-Agent: curl/8.7.1\r\n
+Accept: */*\r\n
+\r\n
+
+---- 172 bytes
+POST /save HTTP/1.1\r\n
+Host: localhost:8080\r\n
+User-Agent: curl/8.7.1\r\n
+Accept: */*\r\n
+Content-Length: 21\r\n
+Content-Type: application/x-www-form-urlencoded\r\n
+\r\n
+name=%EA%B0%80&age=20
+
+---- 150 bytes
+POST /json HTTP/1.1\r\n
+Host: localhost:8080\r\n
+User-Agent: curl/8.7.1\r\n
+Accept: */*\r\n
+Content-Type: application/json\r\n
+Content-Length: 16\r\n
+\r\n
+{"msg":"ìë"}</code></pre>
+<p>(실험은 다른 포트 번호로 했고, 위의 바이트 수는 <code>Host</code> 줄을 8080 기준으로 바꿔 다시 센 값이다.) 세 메시지 모두 같은 모양을 하고 있다. 첫 줄은 요청 줄(request-line)이고, 그 아래로 <code>이름: 값</code> 형태의 헤더 필드 줄이 이어지며, 모든 줄은 CR LF 두 바이트로 끝난다. 헤더가 끝나면 아무것도 없는 줄, 즉 CR LF만 있는 줄이 하나 온다. 그 뒤가 본문(message body)이다. GET 요청에는 본문이 없고, POST 요청에는 <code>Content-Length</code>가 말하는 만큼의 바이트가 붙어 있다.</p>
+<p>세 번째 메시지의 본문이 <code>ìë</code>처럼 깨져 보이는 것은 덤프 프로그램이 바이트를 ISO-8859-1로 문자열화했기 때문이다. 실제 바이트는 UTF-8로 인코딩된 "안녕" 여섯 바이트다. 이 깨짐이 이 회차 내내 따라다닐 핵심을 보여 준다. 소켓으로 오는 것은 문자가 아니라 바이트이고, 그 바이트를 어떤 문자 집합으로 읽느냐는 받는 쪽이 정해야 한다. <code>Content-Length: 16</code>도 바이트 수다. <code>{"msg":"안녕"}</code>은 자바 문자열로는 12글자지만 UTF-8로는 ASCII 10바이트와 한글 6바이트를 합쳐 16바이트다.</p>
+<pre class="diagram">요청 메시지 = 바이트의 나열
+
+ G E T ␠ / s e a r c h ? q = % E A % B 0 % 8 0 ␠ H T T P / 1 . 1 CR LF   ← 요청 줄
+ └메서드┘ └──────── 요청 대상(request-target) ───────┘ └─ HTTP 버전 ─┘
+ H o s t : ␠ l o c a l h o s t : 8 0 8 0 CR LF                         ← 헤더 필드
+ U s e r - A g e n t : ␠ c u r l / 8 . 7 . 1 CR LF                     ← 헤더 필드
+ A c c e p t : ␠ * / * CR LF                                           ← 헤더 필드
+ CR LF                                                                 ← 빈 줄 = 헤더 끝
+ (본문: Content-Length 바이트만큼, 없으면 0바이트)</pre>
+<p>RFC 9112는 이 모양을 ABNF 문법으로 정한다. 요청 줄은 <code>method SP request-target SP HTTP-version</code>이고 CRLF로 끝난다. 세 요소 사이에는 공백(SP) 한 칸이 들어간다. 헤더 필드 줄은 <code>field-name ":" OWS field-value OWS</code>다. OWS(optional whitespace)는 콜론 뒤와 값 끝에 공백이나 탭이 있어도 되고 없어도 된다는 뜻이다. 반면 필드 이름과 콜론 사이에는 공백이 허용되지 않는다. RFC 9112 5.1절은 그런 요청을 받은 서버가 400(Bad Request)으로 거절해야 한다(MUST)고 적는다. 이렇게 엄격한 이유는, 파서마다 <code>Host :</code> 같은 줄을 다르게 해석하면 프록시와 서버가 같은 메시지를 서로 다르게 이해하게 되고, 그 차이가 보안 문제(요청 밀반입, request smuggling)로 이어지기 때문이다.</p>
+<h4>줄의 끝: CRLF와 println의 함정</h4>
+<p>RFC 9112 2.2절은 시작 줄과 필드의 줄 끝이 CRLF라고 정하면서, 받는 쪽은 LF 하나만 와도 줄 끝으로 인정하고 앞의 CR을 무시해도 된다(MAY)고 허용한다. 보내는 쪽에 대해서는 뒤에 LF가 따라오지 않는 CR 단독(bare CR)을 만들어서는 안 된다(MUST NOT)고 정한다. "받을 때는 너그럽게, 보낼 때는 정확하게"다. 우리 서버도 받을 때는 LF로 줄을 자르고 앞의 CR이 있으면 떼어 내고, 보낼 때는 반드시 <code>"\r\n"</code>을 직접 쓴다.</p>
+<p>여기서 자바 초보자가 자주 밟는 함정이 <code>PrintWriter.println()</code>이다. <code>println()</code>이 붙이는 줄 구분자는 CRLF가 아니라 시스템 속성 <code>line.separator</code>의 값이다. macOS와 리눅스에서는 LF 하나, 윈도우에서는 CRLF다. 그래서 <code>println()</code>으로 응답 헤더를 쓴 서버는 윈도우에서는 규칙대로 동작하고, 리눅스 서버에 배포하면 규칙을 어기는 메시지를 보낸다. 상대가 LF만으로도 줄을 인식하는 너그러운 구현이면 겉으로는 잘 돌아가 보이므로 문제를 늦게 발견한다. HTTP 메시지를 손으로 쓸 때는 <code>print("...\r\n")</code>처럼 줄 끝을 명시한다.</p>
+<h4>요청 대상, Host, 그리고 길이 제한</h4>
+<p>요청 줄의 가운데 요소인 요청 대상(request-target)은 보통 <code>/search?q=...</code>처럼 경로와 쿼리로 이루어진 원본 형식(origin-form)이다. 스킴과 호스트는 들어 있지 않다. 그러면 서버는 클라이언트가 어느 호스트 이름으로 접속했는지 어떻게 알까? 그 정보가 <code>Host</code> 헤더다. IP 주소 하나에 여러 도메인을 올리는 가상 호스팅이 가능한 것도 이 헤더 덕분이다. RFC 9112 3.2절은 HTTP/1.1 요청에 클라이언트가 <code>Host</code>를 반드시 보내야 하고(MUST), <code>Host</code>가 없는 HTTP/1.1 요청을 받은 서버는 400으로 응답해야 한다(MUST)고 정한다. 이 회차의 서버는 단순화를 위해 <code>Host</code>를 검사하지 않는다. 범용 서버라면 빠뜨리면 안 되는 검사다.</p>
+<p>요청 줄의 길이에 대해 RFC 9112 3절은 송신자와 수신자 모두 최소 8000옥텟 길이의 요청 줄을 지원할 것을 권장한다(RECOMMENDED). 상한을 정하지 않는다는 뜻이 아니다. 서버는 한 줄을 끝없이 읽어 메모리를 다 쓰지 않도록 어딘가에서 끊어야 하고, 그 기준이 8000옥텟보다 작으면 정상적인 긴 URL을 거절하게 된다는 뜻이다. 뒤에서 만들 파서는 한 줄을 8192바이트까지만 받는다.</p>
+<x-visual id="java-adv2-10-message-anatomy" title="HTTP/1.1 요청 메시지의 바이트 구조" kind="구조도" ratio="16:9">
+<x-hint>요청 메시지가 CRLF로 끝나는 줄들과 빈 줄, 그리고 길이가 정해진 본문으로 이루어진다는 것을 보여 준다.</x-hint>
+<x-prompt>A horizontal strip of byte cells representing an HTTP/1.1 POST request, wrapped into four rows. Row 1: cells spelling "POST /save HTTP/1.1" followed by two small dark cells labeled "CR" and "LF"; a bracket under it labeled "요청 줄". Row 2 and 3: header lines "Host: localhost:8080" and "Content-Length: 21", each ending with CR LF cells; a bracket labeled "헤더 필드". Row 4: a single pair of CR LF cells highlighted in orange with label "빈 줄 = 헤더 끝". Below, a separate block of 21 small cells spelling "name=%EA%B0%80&age=20" with a ruler above it marked "21 바이트" and an arrow from the "Content-Length: 21" text pointing to the ruler. Clean flat vector style, white background, monospace font in the cells, Korean labels exactly as given.</x-prompt>
+<x-caption>요청 메시지의 구조. 줄은 CRLF로 끝나고, 빈 줄이 헤더의 끝을 알리며, 본문의 길이는 Content-Length가 바이트 단위로 알려 준다.</x-caption>
+</x-visual>
+<h4>헤더는 어떤 문자 집합인가</h4>
+<p>헤더 값에 한글을 그대로 넣으면 어떻게 될까? RFC 9110 5.5절은 역사적으로 HTTP가 필드 내용에 ISO-8859-1 문자 집합의 텍스트를 허용했다고 적고, 필드 값은 보통 US-ASCII 범위로 제한된다고 설명한다. 그 밖의 바이트(obs-text)를 받은 수신자는 그것을 해석하지 말고 불투명한 데이터(opaque data)로 다루는 것이 좋다(SHOULD)고 한다. 다시 말해 헤더에는 "이 바이트들을 UTF-8로 읽어라"라는 약속이 없다. 그래서 이 회차의 파서는 헤더 줄을 ISO-8859-1로 문자열화한다. ISO-8859-1은 바이트 0x00~0xFF를 유니코드 U+0000~U+00FF에 하나씩 대응시키므로, 어떤 바이트가 와도 정보가 사라지지 않고 1바이트가 정확히 1글자가 된다. 필요하면 나중에 <code>getBytes(ISO_8859_1)</code>로 원래 바이트를 그대로 되찾을 수 있다. 1회차에서 본 문자 집합과 인코딩의 구분이 여기서 실용적인 선택으로 이어진다. 한글 같은 데이터는 헤더가 아니라 URL(퍼센트 인코딩)이나 본문(Content-Type의 charset)으로 보낸다.</p>
+<p>필드 이름은 대소문자를 구분하지 않는다(RFC 9110 5.1절). <code>Content-Length</code>, <code>content-length</code>, <code>CONTENT-LENGTH</code>는 같은 필드다. 파서는 이름을 한 가지 형태(우리 코드는 소문자)로 정규화해 저장해야 한다. 반대로 메서드 이름은 대소문자를 구분한다(RFC 9110 9.1절). <code>get</code>은 <code>GET</code>이 아니다.</p>
+
+<h3>HTTP 기본 이론 ②: 본문은 어디서 끝나는가, 연결은 언제 끝나는가</h3>
+<p>6회차에서 확인했듯이 TCP는 메시지 경계가 없는 바이트 흐름이다. 보내는 쪽이 <code>write()</code>를 한 번 하든 열 번 하든, 받는 쪽의 <code>read()</code>가 몇 바이트씩 돌려줄지는 정해져 있지 않다. 그래서 HTTP 메시지 안에는 "여기까지가 이 메시지"라는 정보가 반드시 들어 있어야 한다. 헤더의 끝은 빈 줄이 알려 준다. 본문의 끝은 RFC 9112 6.3절이 정한 규칙을 위에서부터 차례로 적용해 정한다.</p>
+<div class="table-wrap"><table><thead><tr><th>순서</th><th>조건</th><th>본문의 길이</th></tr></thead><tbody>
+<tr><td>1</td><td>HEAD 요청에 대한 응답, 1xx·204·304 응답</td><td>본문 없음. 헤더 뒤 빈 줄에서 끝난다</td></tr>
+<tr><td>2</td><td>CONNECT에 대한 2xx 응답</td><td>터널이 된다. 길이 헤더는 무시</td></tr>
+<tr><td>3~4</td><td><code>Transfer-Encoding</code>이 있음</td><td><code>Content-Length</code>보다 우선한다. 마지막 코딩이 chunked면 끝 청크(크기 0)까지. chunked가 아니면 응답은 연결이 닫힐 때까지, 요청은 400으로 거절하고 연결을 닫는다</td></tr>
+<tr><td>5</td><td><code>Content-Length</code> 값이 잘못됨</td><td>메시지 경계를 알 수 없으므로 오류</td></tr>
+<tr><td>6</td><td>올바른 <code>Content-Length</code></td><td>그 값(10진수 바이트 수)만큼</td></tr>
+<tr><td>7</td><td>위 어느 것도 아닌 <b>요청</b></td><td>0. 본문이 없다</td></tr>
+<tr><td>8</td><td>위 어느 것도 아닌 <b>응답</b></td><td>서버가 연결을 닫을 때까지(close-delimited)</td></tr>
+</tbody></table></div>
+<p>이 표에서 서버 구현자가 가져가야 할 사실이 몇 가지 있다. 첫째, 요청 본문이 있는지 없는지는 메서드가 아니라 헤더가 정한다. GET이라도 <code>Content-Length: 5</code>가 붙어 있으면 그 다섯 바이트는 이 요청의 본문이다. 파서가 "GET에는 본문이 없다"고 가정하고 다섯 바이트를 읽지 않으면, 연결을 재사용할 때 그 다섯 바이트를 다음 요청의 첫 바이트로 읽게 된다. 둘째, 요청에는 "연결이 닫힐 때까지"라는 규칙이 없다. 요청을 보낸 클라이언트가 연결을 닫아 버리면 응답을 받을 길이 없기 때문이다. 셋째, 응답은 길이 정보 없이 보내고 연결을 닫는 것으로 끝을 알릴 수 있다. 다만 이 방식은 정상 종료와 도중에 끊긴 전송을 구별할 수 없다는 약점이 있다.</p>
+<h4>지속 연결이 기본이라는 것의 의미</h4>
+<p>RFC 9112 9.3절에 따르면 HTTP/1.1은 지속 연결(persistent connection)이 기본이다. 응답 하나를 보낸 뒤에도 연결은 열린 채로 남고, 같은 연결로 다음 요청이 올 수 있다. <code>Connection: close</code>라는 연결 옵션이 있으면 그 응답을 끝으로 연결을 닫는다. 이 기본값 때문에 응답의 길이 정보가 중요해진다. 서버가 <code>Content-Length</code> 없이 본문을 보내고 연결을 열어 둔 채 다음 요청을 기다리면, 클라이언트는 본문이 다 온 것인지 아직 오고 있는 것인지 알 수 없어 계속 기다린다. 브라우저의 로딩 표시가 멈추지 않는 흔한 원인이 이것이다.</p>
+<p>이 회차의 서버는 가장 단순하면서 틀리지 않는 선택을 한다. 모든 응답에 정확한 <code>Content-Length</code>를 붙이고, <code>Connection: close</code>를 보낸 뒤, 응답을 다 쓰면 연결을 닫는다. 연결 하나에 요청 하나다. 그 대가로 요청마다 TCP 연결 수립(3-way handshake)과 종료를 새로 치른다. 연결을 재사용하려면 한 연결에서 요청을 반복해 읽는 루프, 다음 요청이 오지 않는 연결을 정리하는 유휴 타임아웃(keep-alive timeout), 한 연결이 처리할 요청 수의 상한 같은 것이 필요하다. 톰캣의 HTTP 커넥터 설정에 <code>keepAliveTimeout</code>과 <code>maxKeepAliveRequests</code>(톰캣 10.1 문서 기준 기본값 100)가 있는 이유다.</p>
+<h4>길이를 문자 수로 계산하면</h4>
+<p>정확한 <code>Content-Length</code>라는 말에서 "정확한"은 바이트 수를 뜻한다. 다음 서버는 이를 어기고 자바 문자열의 길이, 즉 UTF-16 코드 유닛 수를 넣는다.</p>
+<pre><code class="language-java">String body = "안녕하세요";
+PrintWriter w = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+w.print("HTTP/1.1 200 OK\r\n");
+w.print("Content-Type: text/plain; charset=UTF-8\r\n");
+w.print("Content-Length: " + body.length() + "\r\n"); // 5: 문자 수
+w.print("\r\n");
+w.print(body);                                        // 15바이트가 나간다
+w.flush();</code></pre>
+<pre data-label="curl -v 출력 일부와 받은 본문의 16진 덤프"><code class="language-text">< HTTP/1.1 200 OK
+< Content-Type: text/plain; charset=UTF-8
+< Content-Length: 5
+<
+{ [15 bytes data]
+* Excess found writing body: excess = 10, size = 5, maxdownload = 5, bytecount = 5
+* Closing connection
+00000000: ec95 88eb 85                             .....</code></pre>
+<p>curl은 15바이트를 받았지만 <code>Content-Length</code>를 믿고 5바이트만 본문으로 취했다. 나머지 10바이트는 "초과분(excess)"으로 처리하고 연결을 닫았다. 받은 다섯 바이트 <code>EC 95 88 EB 85</code>를 보면 앞의 세 바이트 <code>EC 95 88</code>이 "안"이고, <code>EB 85</code>는 "녕"(<code>EB 85 95</code>)의 앞 두 바이트다. 글자 하나가 반으로 잘렸다. 화면에는 "안" 뒤에 깨진 문자가 하나 찍힌다. 이 실험의 응답에는 <code>Connection: close</code>가 없었으므로, 연결을 재사용하는 클라이언트라면 남은 10바이트를 다음 응답의 시작으로 읽으려 했을 것이다. 다음 응답의 상태 줄 자리에 한글 바이트가 오면 그 연결의 이후 응답이 모두 어긋난다. 반대로 <code>Content-Length</code>를 실제보다 크게 적으면 클라이언트는 오지 않을 바이트를 기다리며 멈춘다. 둘 다 "길이"를 문자 단위로 생각해서 생기는 문제다.</p>
+
+<h3>HTTP 메서드: 서버는 메서드에서 무엇을 읽어 내는가</h3>
+<p>메서드는 요청 줄의 첫 토큰이고, 이 요청이 대상 자원에 무엇을 하려는지 알려 준다. 각 메서드의 의미는 「HTTP 웹 기본 지식」 권에서 자세히 다뤘으므로 여기서는 서버 구현자가 메서드를 보고 결정해야 하는 것들을 정리한다.</p>
+<p>우선 무엇을 반드시 구현해야 하는가. RFC 9110 9.1절은 모든 범용 서버가 GET과 HEAD를 지원해야 하고(MUST), 나머지 메서드는 선택(OPTIONAL)이라고 정한다. 서버가 아예 모르는 메서드나 구현하지 않은 메서드를 받으면 501(Not Implemented)로 응답하는 것이 좋다(SHOULD). 메서드 자체는 알지만 이 자원이 그 메서드를 허용하지 않는다면 405(Method Not Allowed)다. 405 응답에는 그 자원이 지금 지원하는 메서드 목록을 담은 <code>Allow</code> 헤더를 반드시 넣어야 한다(RFC 9110 15.5.6절, MUST). 이 둘의 구분은 "서버 전체가 모르는가"와 "이 자원이 거절하는가"의 차이다.</p>
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>요청의 뜻</th><th>안전</th><th>멱등</th><th>서버 구현에서 주의할 점</th></tr></thead><tbody>
+<tr><td>GET</td><td>대상 자원의 현재 표현을 달라</td><td>예</td><td>예</td><td>상태를 바꾸지 않게 만든다. 요청 본문에는 정해진 의미가 없다</td></tr>
+<tr><td>HEAD</td><td>GET과 같되 본문은 빼고</td><td>예</td><td>예</td><td>GET과 같은 헤더(길이 포함)를 보내고 본문은 쓰지 않는다</td></tr>
+<tr><td>POST</td><td>본문을 자원이 정한 방식으로 처리하라</td><td>아니오</td><td>아니오</td><td>재전송되면 두 번 처리될 수 있다</td></tr>
+<tr><td>PUT</td><td>본문으로 대상 자원의 상태를 대체하라</td><td>아니오</td><td>예</td><td>같은 요청을 두 번 받아도 결과가 같게 만든다</td></tr>
+<tr><td>DELETE</td><td>대상 자원과 그 기능의 연결을 끊어라</td><td>아니오</td><td>예</td><td>두 번째 삭제의 응답 코드는 달라도 서버 상태는 같다</td></tr>
+<tr><td>OPTIONS</td><td>통신 옵션을 알려 달라</td><td>예</td><td>예</td><td>CORS 사전 요청에 쓰인다</td></tr>
+</tbody></table></div>
+<p>RFC 9110 9.2절은 이 명세가 정의한 메서드 중 GET, HEAD, OPTIONS, TRACE를 안전(safe)하다고 하고, PUT, DELETE와 안전한 메서드들을 멱등(idempotent)하다고 한다. 캐시 의미가 정의된 메서드는 GET, HEAD, POST다. 이 분류는 서버를 위한 장식이 아니다. 클라이언트와 중간 장치가 이 분류를 믿고 행동하기 때문에, 서버는 그 믿음을 깨지 않게 구현해야 한다. 안전한 메서드는 검색 엔진의 크롤러나 링크 미리 읽기 같은 기능이 사용자 의도 없이도 호출할 수 있다. 그러니 <code>GET /delete?id=3</code>처럼 GET으로 삭제를 구현하면, 어느 날 크롤러가 링크를 따라가다 데이터를 지운다. 멱등은 재시도와 관련된다. RFC 9110은 응답을 읽기 전에 통신이 실패했을 때 요청을 자동으로 다시 보낼 수 있다는 점을 멱등 메서드를 구분하는 이유로 든다. POST는 멱등이 아니므로, 같은 결제 요청이 두 번 처리되지 않도록 서버가 따로 장치(예: 요청 식별 키)를 두어야 한다.</p>
+<h4>GET의 본문, HEAD의 헤더</h4>
+<p>RFC 9110 9.3.1절은 GET 요청에 담긴 내용(content)에는 일반적으로 정의된 의미가 없고, 요청의 의미나 대상을 바꿀 수 없으며, 일부 구현이 요청을 거절하고 연결을 닫게 만들 수도 있다고 적는다. 서버 구현자에게 이 문장은 두 가지 뜻이다. GET 본문에 기능을 걸지 말 것, 그러나 파서는 앞 절의 길이 규칙에 따라 그 본문을 바이트 수만큼 소비하거나 거절할 것. 의미가 없다는 것과 파싱하지 않아도 된다는 것은 다르다.</p>
+<p>HEAD는 서버가 GET이라면 보냈을 헤더를 그대로 보내되 본문을 생략하는 메서드다(RFC 9110 9.3.2절은 같은 헤더 필드를 보내는 것이 좋다(SHOULD)고 적는다). 그래서 HEAD 응답의 <code>Content-Length</code>는 실제로 보내는 0이 아니라 GET이었다면 보냈을 본문 길이다. 앞의 길이 규칙 표 1번에 따라 클라이언트는 HEAD 응답에서 본문을 기대하지 않으므로 이 값을 믿고 기다리지 않는다. 구현하기 가장 쉬운 방법은 GET과 똑같이 처리해 본문을 만든 뒤, 길이만 계산하고 본문 바이트는 소켓에 쓰지 않는 것이다. 자카르타 서블릿의 <code>HttpServlet</code> 문서도 <code>doGet</code>을 재정의하면 HEAD 요청도 자동으로 지원된다고 적는다. 뒤에서 만들 응답 객체도 같은 방식을 쓴다.</p>
+<h4>HTML 폼은 메서드에 따라 데이터를 다른 곳에 싣는다</h4>
+<p>브라우저에서 HTML 폼을 제출하면 데이터가 어디로 가는지는 폼의 메서드가 정한다. <code>method="get"</code>이면 입력값이 <code>?name=...&age=...</code> 형태의 쿼리 문자열이 되어 요청 대상에 붙는다. <code>method="post"</code>면 같은 형식의 문자열이 본문에 실리고 <code>Content-Type: application/x-www-form-urlencoded</code>가 붙는다. 앞의 원시 바이트 덤프에서 두 번째 요청이 바로 이 모양이었다. 서버 입장에서는 같은 <code>이름=값&이름=값</code> 형식을 두 군데(요청 대상의 쿼리, 본문)에서 읽을 수 있어야 한다는 뜻이다. 자카르타 서블릿의 <code>getParameter()</code>가 쿼리와 폼 본문을 구분하지 않고 둘 다에서 값을 찾아 주는 것도 이 때문이다.</p>
+
+<h3>HTTP 서버 1: 한 번에 한 요청</h3>
+<p>이론을 코드로 옮겨 보자. 첫 번째 서버는 연결을 하나 받아 요청 줄과 헤더를 읽고, 고정된 HTML을 돌려준 뒤 연결을 닫는다. 그리고 다음 연결을 받는다. 본문을 읽는 코드는 아직 없다. GET 요청만 처리할 생각이기 때문이다.</p>
+<pre><code class="language-java">import java.io.*;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+
+public class HttpServerV1 {
+    public static void main(String[] args) throws IOException {
+        try (ServerSocket serverSocket = new ServerSocket(8080)) {
+            System.out.println("listening on 8080");
+            while (true) {
+                try (Socket socket = serverSocket.accept()) {
+                    process(socket);
+                } catch (IOException e) {
+                    System.out.println("connection error: " + e);
+                }
+            }
+        }
+    }
+
+    static void process(Socket socket) throws IOException {
+        BufferedReader reader = new BufferedReader(
+                new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+        String requestLine = reader.readLine();
+        if (requestLine == null) {
+            return; // 아무것도 보내지 않고 닫힌 연결
+        }
+        System.out.println("[요청] " + requestLine);
+        String line;
+        while ((line = reader.readLine()) != null && !line.isEmpty()) {
+            System.out.println("  " + line);  // 빈 줄이 나올 때까지가 헤더
+        }
+
+        String body = "<h1>안녕하세요</h1>";
+        byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
+        String head = "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: text/html; charset=UTF-8\r\n"
+                + "Content-Length: " + bodyBytes.length + "\r\n"
+                + "Connection: close\r\n"
+                + "\r\n";
+        OutputStream out = socket.getOutputStream();
+        out.write(head.getBytes(StandardCharsets.US_ASCII));
+        out.write(bodyBytes);
+        out.flush();
+    }
+}</code></pre>
+<p>한 줄씩 따라가 보자. <code>accept()</code>는 커널이 3-way handshake를 끝낸 연결이 대기열에 생길 때까지 메인 스레드를 막는다. 연결이 오면 <code>Socket</code>이 돌아오고, <code>process()</code>가 그 소켓의 입력 스트림을 <code>InputStreamReader</code>와 <code>BufferedReader</code>로 감싼다. <code>readLine()</code>은 LF, CR, CRLF 중 어느 것이 와도 줄 끝으로 보고 줄 끝 문자를 뺀 문자열을 돌려준다. 첫 줄이 요청 줄이고, 이후 빈 문자열이 나올 때까지가 헤더다. 빈 줄을 읽은 뒤에는 더 읽지 않는다. 더 읽으려 하면 클라이언트가 보낼 것이 없으므로 <code>readLine()</code>이 영원히 막힌다. 응답을 다 보내면 <code>try</code> 블록이 끝나면서 소켓이 닫히고, 커널은 상대에게 FIN을 보낸다.</p>
+<p>응답을 만드는 부분에서는 두 가지를 의도적으로 했다. 하나는 본문을 먼저 바이트 배열로 바꾸고 그 배열의 길이를 <code>Content-Length</code>에 쓴 것이다. 앞에서 본 잘림 문제를 피하는 가장 확실한 방법은 "바이트로 바꾼 다음에 센다"는 순서를 지키는 것이다. 다른 하나는 헤더와 본문을 다른 문자 집합으로 바꾼 것이다. 헤더는 ASCII 문자만 쓰므로 <code>US_ASCII</code>로, 본문은 <code>Content-Type</code>에 적은 대로 UTF-8로 바꾼다. 헤더의 <code>charset=UTF-8</code>은 "본문 바이트를 UTF-8로 읽으라"는 선언이고, 실제 바이트가 그 선언과 일치하게 만드는 것은 서버 코드의 몫이다.</p>
+<pre data-label="curl -si http://localhost:8080/hello | xxd (앞부분)"><code class="language-text">00000000: 4854 5450 2f31 2e31 2032 3030 204f 4b0d  HTTP/1.1 200 OK.
+00000010: 0a43 6f6e 7465 6e74 2d54 7970 653a 2074  .Content-Type: t
+00000020: 6578 742f 6874 6d6c 3b20 6368 6172 7365  ext/html; charse
+00000030: 743d 5554 462d 380d 0a43 6f6e 7465 6e74  t=UTF-8..Content
+00000040: 2d4c 656e 6774 683a 2032 340d 0a43 6f6e  -Length: 24..Con
+00000050: 6e65 6374 696f 6e3a 2063 6c6f 7365 0d0a  nection: close..
+00000060: 0d0a 3c68 313e ec95 88eb 8595 ed95 98ec  ..<h1>..........
+00000070: 84b8 ec9a 943c 2f68 313e                 .....</h1></code></pre>
+<p>16진 덤프에서 줄마다 <code>0d 0a</code>(CR LF)가 붙어 있고, <code>0x60</code> 위치의 <code>0d 0a</code>가 빈 줄이다. 그 뒤가 본문이다. <code>Content-Length: 24</code>는 <code>&lt;h1&gt;</code> 4바이트, "안녕하세요" 5글자 × 3바이트 = 15바이트, <code>&lt;/h1&gt;</code> 5바이트를 더한 값이다. 문자 수로 셌다면 14가 되었을 것이다. 서버 콘솔에는 요청 줄과 헤더가 찍힌다.</p>
+<pre data-label="서버 출력"><code class="language-text">listening on 8080
+[요청] GET /hello HTTP/1.1
+  Host: localhost:8080
+  User-Agent: curl/8.7.1
+  Accept: */*</code></pre>
+<p>브라우저로 같은 주소를 열면 헤더가 훨씬 많이 찍히고(<code>Accept-Language</code>, <code>Accept-Encoding</code> 등), 페이지 요청 뒤에 <code>GET /favicon.ico</code> 요청이 따로 오는 것을 볼 수 있다. HTML 표준은 문서가 아이콘 링크를 지정하지 않았을 때 사용자 에이전트가 <code>/favicon.ico</code>를 가져올 수 있다고 정하고 있다. 이 서버는 경로를 보지 않으므로 아이콘 요청에도 같은 HTML을 돌려준다. 경로에 따른 분기는 세 번째 단계에서 넣는다.</p>
+<h4>V1에 숨어 있는 함정 세 가지</h4>
+<p>첫째, 출력 버퍼다. 응답을 <code>PrintWriter</code>나 <code>BufferedOutputStream</code>으로 쓰면서 <code>flush()</code>를 빠뜨리면, 데이터가 자바 쪽 버퍼에 남은 채 소켓이 닫힌다. <code>try-with-resources</code>가 닫는 것은 <code>Socket</code>이지 그 위에 덧씌운 <code>Writer</code>가 아니므로, <code>Writer</code>의 버퍼는 비워지지 않는다. 클라이언트는 빈 응답을 받는다. 2회차에서 본 데코레이터 구조에서, 바깥 층을 닫지 않고 안쪽만 닫으면 바깥 층의 버퍼가 버려지는 것과 같은 이야기다.</p>
+<p>둘째, 요청 줄이 <code>null</code>인 경우다. 연결만 맺고 아무것도 보내지 않은 채 닫는 클라이언트(포트가 열렸는지만 확인하는 도구 등)가 있으므로, 첫 <code>readLine()</code>이 <code>null</code>을 돌려줄 수 있다. 이 검사를 빼면 다음 줄에서 <code>NullPointerException</code>이 난다.</p>
+<p>셋째, 이 서버는 <code>Reader</code>로 요청을 읽는다. GET 요청의 헤더만 읽는 동안에는 문제가 없지만, 본문을 읽기 시작하면 바이트와 문자의 차이가 다시 문제가 된다. 이 함정은 네 번째 단계에서 실험으로 확인하고 고친다.</p>
+
+<h3>HTTP 서버 2: 동시 요청</h3>
+<p>V1은 메인 스레드 하나가 <code>accept()</code>와 요청 처리를 번갈아 한다. 한 요청을 처리하는 동안에는 다음 연결을 받지 않는다. 요청 처리가 빠르면 눈에 띄지 않지만, 처리에 시간이 걸리면 바로 드러난다. 데이터베이스 조회나 외부 API 호출처럼 처리에 3초가 걸린다고 가정하고, <code>process()</code> 안에서 응답을 쓰기 전에 <code>Thread.sleep(3000)</code>을 하도록 바꾼 뒤 curl 세 개를 동시에 실행해 각 요청이 끝날 때까지 걸린 시간을 쟀다.</p>
+<pre data-label="동시에 보낸 요청 3개의 소요 시간 (curl -w %{time_total})"><code class="language-text">req1 3.034149s
+req2 6.045521s
+req3 9.055011s</code></pre>
+<p>세 요청이 동시에 출발했는데 3초, 6초, 9초에 끝났다. 정확한 소수점 아래 값은 실행마다 다르지만 3초 간격으로 줄을 서는 모양은 매번 같다. 두 번째와 세 번째 요청은 그동안 어디에 있었을까? 연결 자체는 이미 맺어져 있었다. TCP 연결 수립은 커널이 처리하므로, 애플리케이션이 <code>accept()</code>를 부르지 않아도 handshake가 끝난 연결은 소켓의 대기열(accept queue)에 쌓인다. 클라이언트가 보낸 요청 바이트도 그 연결의 커널 수신 버퍼에 이미 도착해 있다. 다만 그 연결을 꺼내 읽을 스레드가 없을 뿐이다. 클라이언트 입장에서는 연결이 성공했고 요청도 보냈는데 응답만 오지 않는 상태다.</p>
+<pre class="diagram">단일 스레드 서버의 시간축 (처리 3초)
+
+시간(초)   0          3          6          9
+main     |== req1 ==|== req2 ==|== req3 ==|
+req2     [대기열에서 기다림]
+req3     [대기열에서 기다림 ···············]
+
+커널: 세 연결 모두 0초에 handshake 완료, 요청 바이트도 수신 버퍼에 도착
+JVM : accept()를 부르는 스레드가 하나뿐이라 한 번에 하나씩 꺼낸다</pre>
+<p><code>ServerSocket(int port)</code> 생성자의 Javadoc은 들어오는 연결 요청의 대기열 최대 길이(backlog)를 50으로 설정하고, 대기열이 가득 찼을 때 도착한 연결 요청은 거절된다고 적는다. backlog를 인자로 받는 다른 생성자들의 Javadoc은 이 값이 "요청하는" 최대 길이이고 정확한 의미는 구현에 따라 다르다고 덧붙인다. 운영체제가 실제 값을 조정할 수 있고, 가득 찼을 때 클라이언트가 즉시 거절을 받는지 재시도 끝에 시간 초과를 맞는지도 운영체제에 따라 다르다. 대기열은 처리량을 늘려 주지 않는다. 처리가 막힌 서버 앞에 잠시 줄을 세워 둘 뿐이다.</p>
+<h4>연결마다 작업을 넘긴다</h4>
+<p>해결은 "연결을 받는 일"과 "요청을 처리하는 일"을 다른 스레드에 맡기는 것이다. 메인 스레드는 <code>accept()</code>만 반복하고, 받은 소켓을 작업 스레드에 넘긴다. 연결마다 <code>new Thread()</code>를 만드는 방법도 있지만, 연결 수만큼 스레드가 늘어나면 스레드마다 스택 메모리를 차지하고 스케줄러의 부담이 커지므로, 보통은 개수가 정해진 스레드 풀을 쓴다. 자바 고급 1편에서 다룬 <code>ExecutorService</code>를 그대로 쓰면 된다. 그런데 V1의 구조를 유지한 채 풀만 끼워 넣으면 다음 같은 코드가 나오기 쉽다.</p>
+<pre><code class="language-java">ExecutorService es = Executors.newFixedThreadPool(10);
+try (ServerSocket serverSocket = new ServerSocket(8080)) {
+    while (true) {
+        try (Socket socket = serverSocket.accept()) {   // 문제의 try-with-resources
+            es.submit(() -> {
+                try {
+                    socket.getInputStream().read();
+                } catch (IOException e) {
+                    System.out.println("task: " + e);
+                }
+            });
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">$ curl -s -m 2 http://localhost:8080/ ; echo "curl exit=$?"
+curl exit=52
+(서버 출력) task: java.net.SocketException: Socket is closed</code></pre>
+<p>curl의 종료 코드 52는 서버가 아무 응답 없이 연결을 닫았다(Empty reply from server)는 뜻이다. 원인은 소켓의 수명이다. <code>submit()</code>은 작업을 풀에 맡기기만 하고 즉시 돌아온다. 그러면 <code>try</code> 블록이 끝나면서 메인 스레드가 소켓을 닫는다. 작업 스레드가 실제로 실행될 때는 이미 닫힌 소켓을 받은 셈이다. V1에서는 "소켓을 연 스레드가 처리도 하고 닫기도 했다"는 전제가 맞았지만, 처리를 다른 스레드로 넘기는 순간 그 전제가 깨진다. 소켓을 닫는 책임도 처리와 함께 작업 스레드로 넘겨야 한다. 메인 스레드는 <code>accept()</code>로 받은 소켓을 닫지 않고 넘기며, 작업 스레드의 <code>run()</code>이 <code>try (socket) { ... }</code>로 닫는다. 자바 9부터는 이처럼 사실상 final인 변수를 <code>try-with-resources</code>의 자원으로 바로 쓸 수 있다.</p>
+<h4>submit과 execute: 예외는 어디로 사라지는가</h4>
+<p>작업 스레드에서 예상하지 못한 예외가 나면 어떻게 될까? <code>ExecutorService.submit()</code>으로 맡긴 작업이 던진 예외는 <code>Future</code> 객체 안에 저장되고, 누군가 <code>Future.get()</code>을 불러야 <code>ExecutionException</code>으로 드러난다. 서버의 accept 루프는 <code>Future</code>를 버리므로 예외는 아무 흔적 없이 사라진다. <code>execute()</code>로 맡긴 작업이 던진 예외는 작업 스레드 밖으로 전파되어 스레드의 기본 예외 처리기가 스택 트레이스를 출력한다. 두 메서드로 같은 예외를 던져 봤다.</p>
+<pre><code class="language-java">ExecutorService es = Executors.newFixedThreadPool(1);
+es.submit(() -> { throw new IllegalStateException("submit에서 던짐"); });
+Thread.sleep(200);
+System.out.println("--- execute ---");
+es.execute(() -> { throw new IllegalStateException("execute에서 던짐"); });
+Thread.sleep(200);
+es.shutdown();</code></pre>
+<pre data-label="실행 결과"><code class="language-text">--- execute ---
+Exception in thread "pool-1-thread-1" java.lang.IllegalStateException: execute에서 던짐
+	at SubEx.lambda$main$1(SubEx.java:8)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1583)</code></pre>
+<p><code>submit</code>에서 던진 예외는 출력되지 않았다. 결과를 받을 필요가 없는 "던져 놓고 잊는" 작업이라면 <code>execute()</code>가 맞다. 물론 가장 좋은 것은 작업 안에서 예외를 직접 잡아 로그를 남기고, 가능하면 클라이언트에게 500 응답을 보내는 것이다. 뒤의 최종 버전이 그렇게 한다. 작업 스레드가 예외로 죽으면 <code>ThreadPoolExecutor</code>는 그 스레드를 새 스레드로 교체하므로, 출력된 스택 트레이스의 스레드 이름 뒤 번호가 계속 커지는 것도 흔히 보는 현상이다.</p>
+<h4>풀의 크기가 정하는 것</h4>
+<p>소켓 닫기를 작업 스레드로 옮긴 서버(최종 코드는 뒤에 나온다)에 3초 걸리는 경로를 두고, 풀의 크기를 10과 2로 바꿔 가며 같은 실험을 했다.</p>
+<pre data-label="풀 크기별 소요 시간 (요청 3개 동시)"><code class="language-text">n=10 req1 3.034985s
+n=10 req3 3.032416s
+n=10 req2 3.034464s
+n=2 req2 3.032240s
+n=2 req1 3.037743s
+n=2 req3 6.040228s</code></pre>
+<p>스레드가 10개면 세 요청이 모두 3초 만에 끝났다. 스레드가 2개면 두 요청은 3초, 세 번째는 6초다. 세 번째 연결은 이번에는 커널의 대기열이 아니라 <code>ExecutorService</code>의 작업 큐에서 기다렸다. 메인 스레드는 연결을 즉시 받아 작업으로 넘겼지만, 그 작업을 실행할 스레드가 비지 않았기 때문이다. <code>Executors.newFixedThreadPool()</code>의 Javadoc은 이 풀이 공유되는 무한(unbounded) 큐로 동작한다고 적는다. 즉 요청이 처리 속도보다 빨리 들어오면 큐가 끝없이 길어진다. 큐에서 오래 기다린 요청은 클라이언트가 이미 포기한 뒤에 처리될 수도 있다. 대기를 어디서, 얼마나 허용할지 정하는 것이 서버 설계의 핵심 판단 중 하나다.</p>
+<x-visual id="java-adv2-10-waiting-layers" title="요청이 기다리는 세 곳: 커널 대기열, 작업 큐, 작업 스레드" kind="구조도" ratio="16:9">
+<x-hint>요청이 서버에 도착해 처리되기까지 커널의 accept 대기열, 실행기의 작업 큐, 스레드 풀이라는 세 단계를 거치며 각 단계에서 기다릴 수 있음을 보여 준다.</x-hint>
+<x-prompt>Left-to-right pipeline diagram. Far left: three small laptop icons labeled "클라이언트". Arrow into a box drawn as an OS kernel layer labeled "커널 accept 대기열 (backlog)" containing a short queue of connection tokens. Arrow labeled "accept()" from that box into a single thread figure labeled "메인 스레드". Arrow labeled "execute()" into a long horizontal queue labeled "작업 큐 (무한 큐)". Arrow from the queue into a box with two worker thread figures labeled "작업 스레드 2개". One worker holds a token labeled "req1", the other "req2"; token "req3" waits in the work queue. Under the diagram, a thin timeline with ticks "0초", "3초", "6초". Flat vector style, white background, Korean labels exactly as written.</x-prompt>
+<x-caption>풀 크기가 2일 때 세 번째 요청은 커널이 아니라 작업 큐에서 기다린다. 대기열과 큐는 처리량을 늘리지 않고 기다릴 자리만 만든다.</x-caption>
+</x-visual>
+<p>실제 서블릿 컨테이너도 같은 층을 가지고 있고, 각 층에 상한을 둔다. 톰캣 10.1의 HTTP 커넥터 문서를 보면 요청 처리 스레드의 최대 수 <code>maxThreads</code>는 기본 200, 서버가 동시에 받아 처리하는 연결 수의 상한 <code>maxConnections</code>는 NIO 커넥터에서 기본 8192, 그 상한에 도달했을 때 운영체제가 쌓아 둘 연결 요청 대기열 길이 <code>acceptCount</code>는 기본 100이다. 연결 수 상한이 스레드 수보다 훨씬 큰 것은, NIO 커넥터가 데이터가 도착하지 않은 연결에는 처리 스레드를 붙여 두지 않기 때문이다. 우리 서버는 연결 하나가 처리 스레드 하나를 처음부터 끝까지 붙잡는 구조라서, 스레드 수가 곧 동시에 열어 둘 수 있는 연결 수다. 스프링 부트의 내장 톰캣은 이 값들을 <code>server.tomcat.threads.max</code> 같은 속성으로 노출한다.</p>
+<h4>아무것도 보내지 않는 연결</h4>
+<p>스레드 수가 곧 연결 수인 구조에는 약점이 하나 있다. 연결만 맺고 요청을 보내지 않거나 아주 천천히 보내는 클라이언트가 스레드를 붙잡는다. 풀이 10개인 서버에 이런 연결 10개가 들어오면, 정상 요청은 모두 작업 큐에서 기다린다. 그래서 작업 스레드는 소켓을 받자마자 <code>setSoTimeout()</code>으로 읽기 타임아웃을 걸어야 한다. 이 시간 동안 아무 바이트도 오지 않으면 <code>read()</code>가 <code>SocketTimeoutException</code>을 던지고, 스레드는 연결을 닫고 풀로 돌아간다. 톰캣의 <code>connectionTimeout</code>이 같은 역할을 한다. 톰캣 10.1 문서에 따르면 연결을 받은 뒤 요청 URI 줄이 오기를 기다리는 시간이며, 속성의 기본값은 60000밀리초지만 톰캣과 함께 배포되는 표준 <code>server.xml</code>은 20000밀리초로 설정한다.</p>
+<p>JDK 21에서 정식 기능이 된 가상 스레드(JEP 444)를 쓰면 <code>Executors.newVirtualThreadPerTaskExecutor()</code>로 연결마다 가상 스레드를 하나씩 줄 수 있다. 가상 스레드가 블로킹 소켓 읽기에서 기다리는 동안에는 운반 역할을 하는 플랫폼 스레드를 놓아주므로, 이 회차와 같은 "연결당 스레드" 코드 모양을 유지하면서 훨씬 많은 연결을 붙잡아 둘 수 있다. 다만 기다리는 연결이 많아질 수 있다는 것일 뿐, 데이터베이스 커넥션처럼 뒤에 있는 한정된 자원의 개수가 늘어나는 것은 아니다.</p>
+
+<h3>HTTP 서버 3: 경로에 따라 다른 일을 한다</h3>
+<p>지금까지의 서버는 어떤 요청이 와도 같은 HTML을 돌려준다. 이제 요청 대상의 경로를 보고 다른 일을 하게 만든다. 요청 대상은 경로와 쿼리로 나뉜다. RFC 9112의 원본 형식(origin-form)은 절대 경로 뒤에 선택적으로 <code>?</code>와 쿼리가 붙는 모양이므로, 첫 번째 <code>?</code>를 기준으로 자르면 된다. URL의 <code>#</code> 뒤 프래그먼트(fragment)는 브라우저 안에서만 쓰이고 요청 대상에 실리지 않으므로 서버에는 오지 않는다.</p>
+<pre><code class="language-java">static void process(Socket socket) throws IOException {
+    BufferedReader reader = new BufferedReader(
+            new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+    String requestLine = reader.readLine();
+    if (requestLine == null) {
+        return;
+    }
+    String line;
+    while ((line = reader.readLine()) != null && !line.isEmpty()) {
+        // 헤더는 아직 쓰지 않는다
+    }
+    String target = requestLine.split(" ")[1];      // "GET /search?q=hi HTTP/1.1"의 가운데
+    int q = target.indexOf('?');
+    String path = (q == -1) ? target : target.substring(0, q);
+    String query = (q == -1) ? "" : target.substring(q + 1);
+
+    int status = 200;
+    String body;
+    switch (path) {
+        case "/" -> body = "<h1>홈</h1>";
+        case "/site1" -> body = "<h1>site1</h1>";
+        case "/search" -> body = "<h1>검색: " + query + "</h1>"; // 아직 디코딩도, 이스케이프도 하지 않았다
+        default -> {
+            status = 404;
+            body = "<h1>404 Not Found</h1>";
+        }
+    }
+    send(socket.getOutputStream(), status, body);
+}
+
+static void send(OutputStream out, int status, String body) throws IOException {
+    byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+    String reason = (status == 200) ? "OK" : "Not Found";
+    String head = "HTTP/1.1 " + status + " " + reason + "\r\n"
+            + "Content-Type: text/html; charset=UTF-8\r\n"
+            + "Content-Length: " + bytes.length + "\r\n"
+            + "Connection: close\r\n\r\n";
+    out.write(head.getBytes(StandardCharsets.US_ASCII));
+    out.write(bytes);
+    out.flush();
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">$ curl -s 'http://localhost:8080/search?q=%EA%B0%80+%EB%82%98'
+<h1>검색: q=%EA%B0%80+%EB%82%98</h1>
+$ curl -si http://localhost:8080/x | head -1
+HTTP/1.1 404 Not Found</code></pre>
+<p>분기는 동작한다. 모르는 경로에는 404를 돌려준다. 404 대신 200과 "없는 페이지입니다"라는 HTML을 보내도 브라우저 화면은 비슷하지만, 상태 코드는 사람이 아니라 프로그램이 읽는 정보다. 캐시, 검색 엔진, 모니터링 도구는 본문이 아니라 상태 코드를 보고 판단하므로, 없는 자원에 200을 주면 그들이 잘못된 결론을 내린다.</p>
+<p>그런데 검색 결과에는 두 가지 문제가 보인다. 하나는 <code>q=%EA%B0%80+%EB%82%98</code>가 그대로 찍혔다는 것이다. 사용자가 입력한 것은 "가 나"인데, 서버는 인코딩된 형태를 받았고 그것을 풀지 않았다. 다른 하나는 더 위험하다. 사용자가 보낸 문자열을 HTML에 그대로 끼워 넣었다. 검색어로 <code>&lt;script&gt;...&lt;/script&gt;</code>를 퍼센트 인코딩해 넣은 링크를 다른 사람이 누르면, 그 스크립트가 이 사이트의 페이지 안에서 실행된다. 반사형 XSS(reflected cross-site scripting)다. 요청에서 온 문자열을 HTML에 넣을 때는 <code>&lt;</code>, <code>&gt;</code>, <code>&amp;</code>, <code>"</code>, <code>'</code>를 HTML 문자 참조로 바꾸는 이스케이프를 반드시 거쳐야 한다. 첫 번째 문제는 다음 절의 URL 인코딩이, 두 번째 문제는 최종 버전의 <code>Html.escape()</code>가 해결한다.</p>
+<p>구조에도 문제가 있다. 기능이 하나 늘 때마다 서버의 <code>switch</code> 문을 고쳐야 한다. 소켓을 다루는 코드, 메시지를 파싱하는 코드, 각 페이지의 기능이 한 메서드에 섞여 있다. 페이지가 수십 개가 되면 이 메서드는 감당할 수 없게 된다. 이 문제는 다섯 번째 단계에서 커맨드 패턴으로 푼다.</p>
+
+<h3>URL 인코딩: 구분자와 데이터가 같은 글자를 쓸 때</h3>
+<p>검색어 "가 나&amp;b"를 쿼리 문자열에 그대로 넣으면 <code>?q=가 나&b</code>가 된다. 여기에는 세 가지 문제가 겹쳐 있다. 공백은 요청 줄에서 메서드, 요청 대상, 버전을 나누는 구분자다. 요청 대상 안에 공백이 있으면 요청 줄이 네 조각으로 잘린다. <code>&amp;</code>는 쿼리에서 이름=값 쌍을 나누는 구분자라서, 서버는 <code>b</code>를 새 파라미터 이름으로 읽는다. "가"와 "나"는 ASCII가 아니어서 URI 문법이 허용하는 문자가 아니다. 데이터에 구분자와 같은 글자가 들어 있거나 허용되지 않는 글자가 들어 있을 때, 그 글자를 "구분자가 아닌 데이터"로 표시하는 방법이 필요하다. 그것이 퍼센트 인코딩(percent-encoding)이다.</p>
+<p>RFC 3986 2절은 URI에 쓸 수 있는 문자를 나눈다. 비예약 문자(unreserved)는 영문자, 숫자, 그리고 <code>-</code>, <code>.</code>, <code>_</code>, <code>~</code> 네 기호다. 이 문자들은 어디에 있어도 데이터로 읽힌다. 예약 문자(reserved)는 URI의 구조를 나누는 일반 구분자(gen-delims) <code>: / ? # [ ] @</code>와 각 부분 안에서 하위 구분자로 쓰이는 <code>! $ &amp; ' ( ) * + , ; =</code>(sub-delims)다. 예약 문자를 데이터로 쓰고 싶거나 허용되지 않은 문자를 쓰려면, 그 문자의 바이트를 <code>%</code>와 16진수 두 자리로 적는다. 문법은 <code>pct-encoded = "%" HEXDIG HEXDIG</code>이고, 16진수의 대문자와 소문자는 같은 값이다.</p>
+<p>주의할 점은 퍼센트 인코딩이 "문자"가 아니라 "바이트"를 적는다는 것이다. 한글 "가"(U+AC00)를 인코딩하려면 먼저 어떤 문자 집합으로 바이트를 만들지 정해야 한다. UTF-8이면 <code>EA B0 80</code> 세 바이트이므로 <code>%EA%B0%80</code>이 되고, EUC-KR이면 <code>B0 A1</code> 두 바이트이므로 <code>%B0%A1</code>이 된다. 같은 글자가 문자 집합에 따라 다른 URL이 된다. 받는 쪽은 퍼센트 인코딩을 풀어 바이트를 되찾은 뒤, 보낸 쪽이 쓴 것과 같은 문자 집합으로 그 바이트를 문자로 바꿔야 한다. 오늘날 브라우저와 대부분의 서버는 UTF-8을 쓴다. 1회차에서 본 인코딩 이야기가 URL에서도 똑같이 적용된다.</p>
+<h4>두 가지 인코딩: 퍼센트 인코딩과 폼 인코딩</h4>
+<p>자바에서 이 일을 하는 클래스가 <code>java.net.URLEncoder</code>와 <code>URLDecoder</code>다. 이름 때문에 "URL 인코더"로 생각하기 쉽지만, Javadoc의 첫 문장은 이 클래스가 HTML 폼 인코딩, 즉 <code>application/x-www-form-urlencoded</code> 형식으로 바꾸는 도구라고 밝힌다. 규칙은 이렇다. 영문자와 숫자, 그리고 <code>.</code>, <code>-</code>, <code>*</code>, <code>_</code>는 그대로 둔다. 공백은 <code>+</code>로 바꾼다. 나머지는 지정한 문자 집합으로 바이트를 만든 뒤 각 바이트를 <code>%xy</code>로 적는다. Javadoc은 UTF-8을 권장하며, 문자 집합을 지정하지 않는 옛 메서드는 기본 문자 집합을 쓴다고 적는다. 실제로 돌려 보자.</p>
+<pre><code class="language-java">System.out.println(URLEncoder.encode("가", StandardCharsets.UTF_8));
+System.out.println(URLEncoder.encode("a b+c&d=e~f*g.h-i_j/k", StandardCharsets.UTF_8));
+System.out.println(URLEncoder.encode("가", "EUC-KR"));
+System.out.println(URLDecoder.decode("%EA%B0%80+%2B", StandardCharsets.UTF_8));
+System.out.println(URLDecoder.decode("%B0%A1", StandardCharsets.UTF_8));</code></pre>
+<pre data-label="실행 결과"><code class="language-text">%EA%B0%80
+a+b%2Bc%26d%3De%7Ef*g.h-i_j%2Fk
+%B0%A1
+가 +
+��</code></pre>
+<p>두 번째 줄을 자세히 보자. 공백은 <code>+</code>가 되었고, 원래 있던 <code>+</code>는 <code>%2B</code>가 되었다. 공백을 <code>+</code>로 쓰는 규칙이 있으니 진짜 <code>+</code>는 인코딩해야 구별된다. <code>&amp;</code>와 <code>=</code>는 각각 <code>%26</code>, <code>%3D</code>가 되어 구분자로 오해받지 않는다. 눈여겨볼 것은 <code>~</code>와 <code>*</code>다. RFC 3986에서 <code>~</code>는 비예약 문자인데 <code>URLEncoder</code>는 <code>%7E</code>로 바꿨고, <code>*</code>는 RFC 3986의 하위 구분자인데 그대로 두었다. <code>URLEncoder</code>가 따르는 것이 RFC 3986이 아니라 HTML 폼 인코딩 규칙이기 때문이다. 또 RFC 3986의 퍼센트 인코딩에서 공백은 <code>%20</code>이고 <code>+</code>는 그냥 더하기 기호다. <code>+</code>를 공백으로 읽는 것은 폼 인코딩에서만 통하는 약속이다.</p>
+<p>이 차이 때문에 <code>URLDecoder</code>를 경로에 쓰면 안 된다. <code>/c++/guide</code> 같은 경로를 <code>URLDecoder</code>로 풀면 <code>/c  /guide</code>가 된다. 경로의 <code>+</code>는 공백이 아니다. 이 회차의 서버는 경로를 디코딩하지 않고 받은 그대로 라우팅 키로 쓰고, <code>URLDecoder</code>는 쿼리 문자열과 폼 본문에만 쓴다. 쿼리 문자열에 폼 규칙을 적용하는 것은 브라우저가 GET 폼을 제출할 때 폼 인코딩으로 쿼리를 만들기 때문이다.</p>
+<p>마지막 줄은 문자 집합이 어긋난 결과다. EUC-KR로 인코딩된 "가"의 바이트 <code>B0 A1</code>을 UTF-8로 읽으려 하면, <code>B0</code>은 UTF-8에서 연속 바이트(10xxxxxx)라 글자의 시작이 될 수 없고 <code>A1</code>도 마찬가지다. 디코더는 두 바이트 각각을 대체 문자 U+FFFD(<code>�</code>)로 바꿨다. 예외가 나지 않고 조용히 깨진 글자가 된다는 점이 위험하다. 서버는 문자 집합을 하나로 정하고(UTF-8), 페이지를 보낼 때 <code>Content-Type</code>의 <code>charset</code>으로 그것을 밝혀서, 그 페이지의 폼이 같은 문자 집합으로 제출되게 해야 한다.</p>
+<h4>자르고 나서 디코딩한다</h4>
+<p>쿼리 문자열 <code>q=%26admin%3Dtrue</code>를 생각해 보자. 사용자가 검색창에 <code>&amp;admin=true</code>라는 글자를 그대로 입력한 경우다. 올바른 처리는 먼저 <code>&amp;</code>로 쌍을 자르고(쌍은 <code>q=%26admin%3Dtrue</code> 하나), <code>=</code>로 이름과 값을 자른 뒤(이름 <code>q</code>, 값 <code>%26admin%3Dtrue</code>), 이름과 값을 각각 디코딩하는 것이다. 결과는 파라미터 하나, <code>q</code> = <code>&amp;admin=true</code>다. 순서를 거꾸로 해서 쿼리 전체를 먼저 디코딩하면 <code>q=&amp;admin=true</code>가 되고, 이것을 자르면 <code>q</code>는 빈 값, <code>admin</code>은 <code>true</code>가 된다. 사용자가 입력한 데이터가 구조를 바꿔 버렸다. 퍼센트 인코딩의 목적이 "구분자 글자를 데이터로 표시하는 것"이었으므로, 구분자로 자르는 일은 반드시 디코딩 전에 해야 한다.</p>
+<p>같은 이유로 디코딩은 한 번만 한다. RFC 3986 2.4절은 구현이 같은 문자열을 두 번 이상 퍼센트 인코딩하거나 디코딩해서는 안 된다고 적는다. <code>%2526</code>을 한 번 풀면 <code>%26</code>이고, 두 번 풀면 <code>&amp;</code>다. 앞 단계(예: 보안 필터)가 한 번 풀어서 검사하고 뒤 단계가 또 풀면, 검사를 통과한 문자열과 실제로 쓰이는 문자열이 달라진다. 이중 디코딩은 경로 검사 우회 같은 보안 문제의 단골 원인이다.</p>
+<p>잘못된 퍼센트 인코딩도 처리해야 한다. <code>URLDecoder.decode("100%", UTF_8)</code>는 <code>IllegalArgumentException: URLDecoder: Incomplete trailing escape (%) pattern</code>을, <code>"%zz"</code>는 <code>Illegal hex characters in escape (%) pattern</code>을 던진다. 이것은 클라이언트가 잘못 보낸 것이므로 서버는 500이 아니라 400으로 응답해야 한다. 예외를 잡지 않으면 작업 스레드 밖으로 빠져나가 500이 되거나 연결이 그냥 끊긴다.</p>
+<h4>java.net.URI는 무엇을 해 주고 무엇을 해 주지 않는가</h4>
+<p>자바에는 RFC 2396 계열의 URI 문법을 따르는 <code>java.net.URI</code>도 있다. 이 클래스의 디코딩은 폼 인코딩이 아니라 일반 퍼센트 인코딩 규칙을 따르므로 결과가 다르다.</p>
+<pre><code class="language-java">URI u2 = URI.create("/search?q=%EA%B0%80+%EB%82%98");
+System.out.println(u2.getPath() + " | " + u2.getRawQuery() + " | " + u2.getQuery());
+
+URI u = new URI("http", null, "localhost", 8080, "/search", "q=가 나&x=1+1", null);
+System.out.println(u.toASCIIString());</code></pre>
+<pre data-label="실행 결과"><code class="language-text">/search | q=%EA%B0%80+%EB%82%98 | q=가+나
+http://localhost:8080/search?q=%EA%B0%80%20%EB%82%98&x=1+1</code></pre>
+<p><code>getQuery()</code>는 <code>%XX</code>만 풀고 <code>+</code>는 그대로 둔다. 그래서 브라우저가 GET 폼으로 보낸 "가 나"가 <code>가+나</code>로 보인다. 게다가 <code>getQuery()</code>는 쿼리 전체를 한꺼번에 디코딩하므로, 위에서 본 "디코딩 후 자르기" 문제를 그대로 안고 있다. 쿼리 파라미터를 뽑을 때는 <code>getRawQuery()</code>로 인코딩된 원문을 받아 직접 자르고, 조각마다 <code>URLDecoder</code>를 적용하는 것이 맞다. 여러 인자를 받는 생성자로 URI를 만들 때도, 공백은 <code>%20</code>으로 바꿔 주지만 <code>&amp;</code>와 <code>+</code>는 쿼리에서 쓸 수 있는 글자이므로 그대로 둔다. 값 안의 <code>&amp;</code>를 데이터로 보내려면 값을 미리 인코딩해서 넣어야 한다.</p>
+<aside class="note">헤더에는 퍼센트 인코딩 규칙이 없다. 앞에서 본 것처럼 헤더 값은 사실상 ASCII 범위이고 그 밖의 바이트는 불투명한 데이터로 다뤄진다. 다운로드 파일 이름처럼 헤더에 한글을 넣어야 하는 경우에는 해당 헤더를 정의한 명세가 따로 정한 인코딩 방식을 따른다.</aside>
+<h3>HTTP 서버 4: 요청과 응답을 객체로</h3>
+<p>세 번째 서버에서 메인 흐름에 섞여 있던 일을 정리하면 두 가지다. 들어온 바이트를 해석해 "메서드, 경로, 파라미터, 헤더, 본문"으로 만드는 일과, 상태 코드·헤더·본문을 받아 규칙에 맞는 바이트로 내보내는 일이다. 이 둘을 각각 <code>HttpRequest</code>와 <code>HttpResponse</code> 객체로 감싸면, 기능을 만드는 코드는 "검색어 파라미터를 달라", "이 HTML을 응답에 써라"만 말하면 된다. 줄 끝이 CRLF인지, 길이를 바이트로 셌는지 같은 규칙은 두 객체 안에 한 번만 구현된다. (여기서 만드는 <code>HttpRequest</code>는 이 글의 예제 클래스로, JDK의 HTTP 클라이언트 API인 <code>java.net.http.HttpRequest</code>와는 관계가 없다.)</p>
+<p>그런데 요청 객체를 만들기 전에 V1부터 써 온 읽기 방식, 즉 <code>BufferedReader</code>로 요청을 읽는 방식이 본문 앞에서 무너진다는 것을 확인해야 한다. 헤더까지는 <code>readLine()</code>으로 읽고, 본문은 <code>Content-Length</code>만큼 <code>read(char[], ...)</code>로 읽는 코드를 생각해 보자. 길이 값을 문자 수로 착각한 코드다.</p>
+<pre><code class="language-java">BufferedReader reader = new BufferedReader(
+        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+int contentLength = 0;
+String line;
+while (!(line = reader.readLine()).isEmpty()) {
+    if (line.toLowerCase().startsWith("content-length:")) {
+        contentLength = Integer.parseInt(line.substring(15).strip());
+    }
+}
+char[] body = new char[contentLength];
+int read = 0;
+while (read < contentLength) {          // 16"글자"를 기다린다
+    int r = reader.read(body, read, contentLength - read);
+    System.out.println("read() returned " + r);
+    if (r == -1) break;
+    read += r;
+}</code></pre>
+<pre data-label="curl -m 3 -d '{&quot;msg&quot;:&quot;안녕&quot;}'로 요청했을 때"><code class="language-text">(curl) curl exit=28          ← 3초 타임아웃
+(서버) read() returned 12
+(서버) read() returned -1     ← curl이 포기하고 연결을 닫은 뒤에야
+(서버) chars=12, waited 3.0s</code></pre>
+<p><code>Content-Length: 16</code>을 받은 서버는 16글자를 채울 때까지 반복해 읽는다. 하지만 16바이트는 12글자로 디코딩된다. 첫 <code>read()</code>가 12글자를 돌려준 뒤, 서버는 남은 4글자를 기다리며 막힌다. 클라이언트는 보낼 것을 다 보냈고 응답을 기다린다. 서로가 서로를 기다리는 상태다. 3초 뒤 curl이 타임아웃으로 연결을 닫자 그제야 <code>read()</code>가 -1을 돌려주고 서버가 빠져나왔다. 응답은 받을 사람이 없다. 실제 서비스에서는 클라이언트가 타임아웃을 걸지 않으면 이 스레드는 서버의 읽기 타임아웃이 끝날 때까지 묶인다.</p>
+<p>이 버그가 오래 숨어 있을 수 있는 이유가 있다. HTML 폼의 <code>application/x-www-form-urlencoded</code> 본문은 퍼센트 인코딩을 거친 뒤라 순수한 ASCII다. 앞의 덤프에서 본 <code>name=%EA%B0%80&age=20</code>은 21바이트이고 21글자다. ASCII에서는 바이트 수와 글자 수가 같으므로, 폼만 다루는 동안에는 이 코드가 정상으로 보인다. JSON처럼 UTF-8 문자가 본문에 그대로 실리는 순간 터진다.</p>
+<p>그렇다면 헤더는 <code>Reader</code>로 읽고 본문만 원래 <code>InputStream</code>에서 바이트로 읽으면 될까? 그것도 안 된다. <code>InputStreamReader</code>의 Javadoc은 바이트를 문자로 효율적으로 바꾸기 위해 현재 읽기에 필요한 것보다 많은 바이트를 아래 스트림에서 미리 읽어 둘 수 있다고 적는다. <code>BufferedReader</code>도 문자를 덩어리로 미리 읽는다. 헤더를 읽는 동안 본문 바이트가 이미 <code>Reader</code> 안쪽 버퍼로 빨려 들어가 있을 수 있고, 그 바이트는 아래 <code>InputStream</code>에서 다시 읽을 수 없다. 한 스트림을 <code>Reader</code>로 감싸 읽기 시작했다면 그 뒤로는 바이트 단위로 돌아갈 수 없다고 생각하는 것이 안전하다.</p>
+<p>결론은 처음부터 끝까지 바이트로 읽는 것이다. 줄은 LF 바이트를 만날 때까지 바이트를 모아 만들고, 헤더 줄은 ISO-8859-1로 문자열화하고, 본문은 <code>Content-Length</code>만큼의 바이트를 그대로 받아 둔다. 본문을 어떤 문자 집합으로 해석할지는 본문을 쓰는 쪽(핸들러)이 <code>Content-Type</code>을 보고 정한다. 이것이 요청 객체의 설계다.</p>
+<pre><code class="language-java">import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+
+public class HttpRequest {
+    private static final int MAX_LINE = 8192;        // 시작 줄·헤더 한 줄의 최대 바이트
+    private static final int MAX_BODY = 1024 * 1024; // 본문 최대 바이트
+
+    private String method;
+    private String path;
+    private final Map<String, String> params = new HashMap<>();
+    private final Map<String, String> headers = new HashMap<>();
+    private byte[] body = new byte[0];
+
+    // 요청 하나를 읽는다. 아무 바이트도 오지 않고 연결이 닫혔으면 null
+    public static HttpRequest read(InputStream in) throws IOException {
+        String requestLine = readLine(in);
+        if (requestLine == null) {
+            return null;
+        }
+        HttpRequest request = new HttpRequest();
+        request.parseRequestLine(requestLine);
+        request.parseHeaders(in);
+        request.readBody(in);
+        return request;
+    }
+
+    private void parseRequestLine(String line) {
+        String[] parts = line.split(" ", -1);
+        if (parts.length != 3 || !parts[2].startsWith("HTTP/1.")) {
+            throw new HttpException(400, "bad request-line");
+        }
+        method = parts[0];
+        String target = parts[1];
+        int q = target.indexOf('?');
+        path = (q == -1) ? target : target.substring(0, q);
+        if (q != -1) {
+            parseParams(target.substring(q + 1), params);
+        }
+    }
+
+    private void parseHeaders(InputStream in) throws IOException {
+        while (true) {
+            String line = readLine(in);
+            if (line == null) {
+                throw new HttpException(400, "connection closed in headers");
+            }
+            if (line.isEmpty()) {
+                return; // 빈 줄: 헤더 끝
+            }
+            int colon = line.indexOf(':');
+            if (colon <= 0 || line.charAt(colon - 1) == ' ' || line.charAt(colon - 1) == '\t') {
+                throw new HttpException(400, "bad header");
+            }
+            String name = line.substring(0, colon).toLowerCase(Locale.ROOT);
+            String value = line.substring(colon + 1).strip();
+            headers.put(name, value);
+        }
+    }
+
+    private void readBody(InputStream in) throws IOException {
+        if (headers.containsKey("transfer-encoding")) {
+            throw new HttpException(501, "transfer-encoding not supported");
+        }
+        String length = headers.get("content-length");
+        if (length == null) {
+            return;
+        }
+        int n;
+        try {
+            n = Integer.parseInt(length);
+        } catch (NumberFormatException e) {
+            throw new HttpException(400, "bad content-length");
+        }
+        if (n < 0) {
+            throw new HttpException(400, "bad content-length");
+        }
+        if (n > MAX_BODY) {
+            throw new HttpException(413, "content too large");
+        }
+        body = in.readNBytes(n); // 정확히 n바이트(또는 EOF까지)
+        if (body.length < n) {
+            throw new HttpException(400, "body shorter than content-length");
+        }
+        String type = headers.getOrDefault("content-type", "");
+        if (type.startsWith("application/x-www-form-urlencoded")) {
+            parseParams(new String(body, StandardCharsets.US_ASCII), params);
+        }
+    }
+
+    // a=1&b=%EA%B0%80 → {a=1, b=가}. 먼저 자르고, 그다음 디코딩한다
+    static void parseParams(String raw, Map<String, String> into) {
+        for (String pair : raw.split("&")) {
+            if (pair.isEmpty()) {
+                continue;
+            }
+            int eq = pair.indexOf('=');
+            String name = (eq == -1) ? pair : pair.substring(0, eq);
+            String value = (eq == -1) ? "" : pair.substring(eq + 1);
+            try {
+                into.putIfAbsent(URLDecoder.decode(name, StandardCharsets.UTF_8),
+                                 URLDecoder.decode(value, StandardCharsets.UTF_8));
+            } catch (IllegalArgumentException e) {
+                throw new HttpException(400, "bad percent-encoding");
+            }
+        }
+    }
+
+    // LF까지 읽고 앞의 CR을 떼어 낸다. 헤더는 바이트 그대로 ISO-8859-1로 문자열화
+    private static String readLine(InputStream in) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        int b;
+        while ((b = in.read()) != -1) {
+            if (b == '\n') {
+                byte[] bytes = buf.toByteArray();
+                int len = bytes.length;
+                if (len > 0 && bytes[len - 1] == '\r') {
+                    len--;
+                }
+                return new String(bytes, 0, len, StandardCharsets.ISO_8859_1);
+            }
+            if (buf.size() >= MAX_LINE) {
+                throw new HttpException(400, "line too long");
+            }
+            buf.write(b);
+        }
+        if (buf.size() == 0) {
+            return null; // 요청 없이 닫힌 연결
+        }
+        throw new HttpException(400, "connection closed mid-line");
+    }
+
+    public String getMethod() { return method; }
+    public String getPath() { return path; }
+    public String getParameter(String name) { return params.get(name); }
+    public String getHeader(String name) { return headers.get(name.toLowerCase(Locale.ROOT)); }
+    public byte[] getBody() { return body; }
+
+    @Override
+    public String toString() {
+        return method + " " + path + " params=" + params + " body=" + body.length + "B";
+    }
+}</code></pre>
+<p>위에서부터 읽어 보자. <code>read()</code>는 정적 팩터리 메서드로, 요청 줄 → 헤더 → 본문 순서로 읽는다. 연결이 아무것도 보내지 않고 닫혔으면 <code>null</code>을 돌려줘 호출자가 조용히 끝낼 수 있게 한다. 해석할 수 없는 요청을 만나면 <code>HttpException</code>에 상태 코드를 담아 던진다. 이 예외 클래스는 <code>RuntimeException</code>을 상속하고 <code>int status</code> 필드 하나를 더 가진 작은 클래스다(다음 절에 코드가 있다). 파서 깊은 곳에서 "이건 400이다"라고 판단한 내용을 응답을 쓰는 곳까지 전달하는 수단이다.</p>
+<p><code>parseRequestLine()</code>은 공백 하나로 세 조각이 나오는지 확인한다. <code>split(" ", -1)</code>의 두 번째 인자 -1은 끝의 빈 문자열을 버리지 말라는 뜻이어서, 요청 줄 끝에 공백이 더 붙어 있으면 조각이 넷이 되어 400으로 거절된다. 버전이 <code>HTTP/1.</code>로 시작하는지도 확인한다. 이 서버는 HTTP/1.x의 텍스트 문법만 이해하기 때문이다. 요청 대상은 첫 <code>?</code>에서 경로와 쿼리로 나누고, 쿼리는 <code>parseParams()</code>로 넘긴다. 경로는 디코딩하지 않는다.</p>
+<p><code>parseHeaders()</code>는 빈 줄이 나올 때까지 헤더 줄을 읽는다. 콜론이 없거나 맨 앞에 있으면 이름이 없는 것이므로, 콜론 바로 앞이 공백이나 탭이면 RFC 9112 5.1절이 금지한 형태이므로 400이다. 이름은 <code>Locale.ROOT</code>로 소문자화한다. 기본 로캘로 소문자화하면 터키어 로캘처럼 대문자 I를 점 없는 ı로 바꾸는 환경에서 <code>CONTENT-LENGTH</code>가 다른 문자열이 될 수 있기 때문이다. 같은 이름의 헤더가 두 번 오면 나중 값이 이기는 것은 이 예제의 단순화다. 실제 명세에는 여러 줄의 값을 쉼표로 합쳐 하나의 값으로 보는 규칙이 있고, <code>Content-Length</code>가 서로 다른 값으로 두 번 오는 것은 오류로 다뤄야 하는 위험한 경우다.</p>
+<p><code>readBody()</code>는 앞의 본문 길이 규칙 표를 이 서버가 지원하는 범위로 구현한 것이다. <code>Transfer-Encoding</code>이 있으면 <code>Content-Length</code>보다 우선해야 하는데, 이 서버는 chunked 디코딩을 구현하지 않았으므로 501(Not Implemented)로 거절한다. RFC 9110은 501을 요청을 처리하는 데 필요한 기능을 서버가 지원하지 않는다는 뜻으로 정의한다. <code>Content-Length</code>가 없으면 요청 본문은 0바이트다(표의 7번). 값이 숫자가 아니거나 음수면 400, 상한(1MiB)을 넘으면 413(Content Too Large)이다. 상한은 공격자가 <code>Content-Length: 2000000000</code>을 보내 서버가 그만큼의 배열을 할당하게 만드는 것을 막는다. 본문은 <code>InputStream.readNBytes(n)</code>으로 읽는다. 이 메서드는 n바이트를 채우거나 스트림 끝을 만날 때까지 반복해서 읽어 주므로, TCP가 본문을 몇 조각으로 나눠 보내든 상관없다. 돌려받은 배열이 n보다 짧으면 클라이언트가 약속한 길이를 다 보내지 않고 연결을 닫은 것이다.</p>
+<p>폼 본문(<code>application/x-www-form-urlencoded</code>)이면 쿼리와 같은 규칙으로 파라미터를 뽑는다. 폼 본문은 퍼센트 인코딩을 거친 ASCII이므로 <code>US_ASCII</code>로 문자열화해도 잃는 것이 없다. 실제 한글 복원은 <code>URLDecoder.decode(..., UTF_8)</code>가 <code>%XX</code>를 바이트로 되돌린 뒤 UTF-8로 해석하면서 일어난다. 쿼리와 본문에 같은 이름이 있으면 <code>putIfAbsent</code> 때문에 쿼리의 값이 남는다. <code>parseParams()</code>는 앞 절에서 말한 순서, 즉 <code>&</code>로 자르고 <code>=</code>로 자른 다음 조각마다 디코딩하는 순서를 지킨다. 디코딩 예외는 400으로 바꾼다.</p>
+<p>마지막으로 <code>readLine()</code>은 바이트를 하나씩 읽는다. 여기서 2회차의 내용이 다시 중요해진다. 소켓의 <code>InputStream</code>에 대고 <code>read()</code>를 한 번 부를 때마다 운영체제의 읽기 시스템 콜이 한 번씩 일어난다면, 100바이트짜리 헤더를 읽는 데 시스템 콜이 100번 든다. 그래서 이 메서드에 넘기는 스트림은 반드시 <code>BufferedInputStream</code>으로 감싼다(다음 절의 <code>ConnectionTask</code>가 그렇게 한다). JDK 21의 <code>BufferedInputStream</code>은 기본 8192바이트 버퍼를 쓰므로, 작은 요청이라면 첫 <code>read()</code>에서 시스템 콜 한 번으로 요청 전체가 버퍼에 들어오고, 이후의 바이트 단위 <code>read()</code>는 메모리에서 꺼내는 메서드 호출일 뿐이다. 한 줄의 길이를 8192바이트로 제한한 것은 RFC 9112가 권장하는 최소 8000옥텟을 넘기면서도 끝없이 긴 줄로 메모리를 소모시키는 요청을 막기 위해서다.</p>
+<h4>응답 객체: 길이는 마지막에 센다</h4>
+<pre><code class="language-java">import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class HttpResponse {
+    private final OutputStream out;
+    private final boolean headOnly;   // HEAD 요청이면 헤더만 보낸다
+    private int status = 200;
+    private final Map<String, String> headers = new LinkedHashMap<>();
+    private final StringBuilder body = new StringBuilder();
+    private boolean committed;
+
+    public HttpResponse(OutputStream out, boolean headOnly) {
+        this.out = out;
+        this.headOnly = headOnly;
+        headers.put("Content-Type", "text/html; charset=UTF-8");
+    }
+
+    public void setStatus(int status) { this.status = status; }
+    public void setHeader(String name, String value) { headers.put(name, value); }
+    public HttpResponse write(String text) { body.append(text); return this; }
+
+    // 핸들러가 아니라 서버가 마지막에 한 번 호출한다
+    public void flush() throws IOException {
+        if (committed) {
+            return;
+        }
+        committed = true;
+        byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
+        StringBuilder head = new StringBuilder();
+        head.append("HTTP/1.1 ").append(status).append(' ').append(reason(status)).append("\r\n");
+        headers.forEach((k, v) -> head.append(k).append(": ").append(v).append("\r\n"));
+        head.append("Content-Length: ").append(bytes.length).append("\r\n");
+        head.append("Connection: close\r\n");
+        head.append("\r\n");
+        out.write(head.toString().getBytes(StandardCharsets.ISO_8859_1));
+        if (!headOnly) {
+            out.write(bytes);
+        }
+        out.flush();
+    }
+
+    static String reason(int status) {
+        return switch (status) {
+            case 200 -> "OK";
+            case 400 -> "Bad Request";
+            case 404 -> "Not Found";
+            case 405 -> "Method Not Allowed";
+            case 413 -> "Content Too Large";
+            case 500 -> "Internal Server Error";
+            case 501 -> "Not Implemented";
+            default -> "";
+        };
+    }
+}</code></pre>
+<p>응답 객체의 핵심 결정은 "본문을 바로 소켓에 쓰지 않고 모았다가, 마지막에 길이를 세어 한 번에 보낸다"는 것이다. 핸들러가 <code>write()</code>를 여러 번 불러도 본문은 <code>StringBuilder</code>에 쌓일 뿐이다. 서버가 <code>flush()</code>를 부르는 순간 본문 전체를 UTF-8 바이트로 바꾸고, 그 배열의 길이로 <code>Content-Length</code>를 쓴다. 길이를 아는 시점이 본문이 다 만들어진 뒤이므로, 헤더를 본문보다 먼저 보내야 하는 HTTP에서는 이렇게 모아 두는 수밖에 없다. 본문을 모으지 않고 흘려보내고 싶다면 길이를 미리 알 수 없으므로 chunked 전송이 필요하다. 서블릿 컨테이너의 응답 객체도 버퍼를 가지고 있고, 그 버퍼가 차거나 응답이 끝나면 헤더를 확정해 보낸다(이 시점을 커밋(commit)이라 부른다). 커밋된 뒤에는 상태 코드와 헤더를 바꿀 수 없다. 우리 코드의 <code>committed</code> 플래그가 같은 개념이다.</p>
+<p>헤더를 <code>LinkedHashMap</code>에 담은 것은 넣은 순서대로 내보내기 위해서다. HTTP는 서로 다른 이름의 헤더 순서에 의미를 두지 않지만, 순서가 일정하면 디버깅할 때 읽기 쉽다. 상태 줄의 사유 구문(reason phrase)은 사람을 위한 설명이고, 클라이언트는 숫자 코드만 보고 판단한다. <code>headOnly</code>가 참이면 길이까지 계산한 헤더를 보내고 본문은 쓰지 않는다. 앞에서 본 HEAD의 규칙 그대로다. 헤더 문자열을 <code>ISO_8859_1</code>로 바꾸는 것은 헤더 값에 1바이트를 넘는 문자가 들어가지 않는다는 전제다. <code>setHeader()</code>에 사용자 입력을 넣는다면 CR과 LF가 들어 있지 않은지 반드시 검사해야 한다. 값에 <code>\r\n</code>이 섞이면 공격자가 헤더를 추가하거나 응답을 둘로 쪼갤 수 있다(response splitting).</p>
+
+<h3>HTTP 서버 5: 커맨드 패턴으로 기능을 떼어 낸다</h3>
+<p>요청과 응답이 객체가 되었으니 남은 문제는 세 번째 서버의 <code>switch</code> 문이다. 기능을 추가할 때마다 서버 코드를 고쳐야 하는 구조를 바꾸려면, "경로마다 할 일"을 서버 밖에서 만들어 서버에 등록할 수 있어야 한다. 할 일을 객체로 만들어 넘기는 것, 그것이 커맨드 패턴(command pattern)이다. GoF의 『디자인 패턴』이 정리한 이 패턴의 요지는 요청(해야 할 일)을 객체로 캡슐화해서, 일을 시키는 쪽이 그 일의 구체적인 내용을 모른 채 공통 인터페이스로 실행할 수 있게 하는 것이다. 우리 서버에서 "해야 할 일"은 요청을 받아 응답을 채우는 것이므로, 공통 인터페이스는 메서드 하나면 된다.</p>
+<pre><code class="language-java">import java.io.IOException;
+
+@FunctionalInterface
+public interface RequestHandler {
+    void handle(HttpRequest request, HttpResponse response) throws IOException;
+}</code></pre>
+<pre><code class="language-java">public class HttpException extends RuntimeException {
+    private final int status;
+
+    public HttpException(int status, String message) {
+        super(message);
+        this.status = status;
+    }
+
+    public int status() {
+        return status;
+    }
+}</code></pre>
+<pre><code class="language-java">import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+public class Router {
+    private final Map<String, RequestHandler> handlers = new HashMap<>();
+    private final RequestHandler notFound = (req, res) -> {
+        res.setStatus(404);
+        res.write("<h1>404 Not Found</h1>");
+    };
+
+    // 서버 시작 전에만 호출한다(시작 후에는 읽기만 한다)
+    public void add(String path, RequestHandler handler) {
+        handlers.put(path, handler);
+    }
+
+    public void dispatch(HttpRequest request, HttpResponse response) throws IOException {
+        handlers.getOrDefault(request.getPath(), notFound).handle(request, response);
+    }
+}</code></pre>
+<p><code>Router</code>는 경로를 키로, 핸들러 객체를 값으로 갖는 맵이다. <code>dispatch()</code>는 경로로 핸들러를 찾아 <code>handle()</code>을 부를 뿐, 그 핸들러가 무슨 일을 하는지 모른다. 찾지 못하면 404를 쓰는 기본 핸들러를 쓴다. <code>switch</code> 문의 각 <code>case</code>가 맵의 항목 하나로 바뀌었고, 분기는 문법이 아니라 데이터가 되었다. 이제 연결 하나를 처리하는 작업과 accept 루프를 보자.</p>
+<pre><code class="language-java">import java.io.*;
+import java.net.Socket;
+
+public class ConnectionTask implements Runnable {
+    private final Socket socket;
+    private final Router router;
+
+    public ConnectionTask(Socket socket, Router router) {
+        this.socket = socket;
+        this.router = router;
+    }
+
+    @Override
+    public void run() {
+        try (socket) {
+            socket.setSoTimeout(10_000); // 10초 동안 아무것도 오지 않으면 포기
+            InputStream in = new BufferedInputStream(socket.getInputStream());
+            OutputStream out = new BufferedOutputStream(socket.getOutputStream());
+            HttpResponse response;
+            try {
+                HttpRequest request = HttpRequest.read(in);
+                if (request == null) {
+                    return;
+                }
+                System.out.println("[" + Thread.currentThread().getName() + "] " + request);
+                response = new HttpResponse(out, request.getMethod().equals("HEAD"));
+                router.dispatch(request, response);
+            } catch (HttpException e) {
+                response = error(out, e.status());
+            } catch (IOException e) {
+                throw e;
+            } catch (Exception e) {
+                System.out.println("handler failed: " + e);
+                response = error(out, 500);
+            }
+            response.flush();
+        } catch (IOException e) {
+            System.out.println("connection error: " + e);
+        }
+    }
+
+    // 오류 본문에는 요청에서 온 문자열을 넣지 않는다
+    private static HttpResponse error(OutputStream out, int status) {
+        HttpResponse r = new HttpResponse(out, false);
+        r.setStatus(status);
+        r.write("<h1>" + status + " " + HttpResponse.reason(status) + "</h1>");
+        return r;
+    }
+}</code></pre>
+<pre><code class="language-java">import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class HttpServer {
+    private final int port;
+    private final Router router;
+    private final ExecutorService pool = Executors.newFixedThreadPool(10);
+
+    public HttpServer(int port, Router router) {
+        this.port = port;
+        this.router = router;
+    }
+
+    public void start() throws IOException {
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            System.out.println("listening on " + port);
+            while (true) {
+                Socket socket = serverSocket.accept();
+                pool.execute(new ConnectionTask(socket, router)); // 소켓을 닫는 책임도 넘긴다
+            }
+        }
+    }
+}</code></pre>
+<p><code>ConnectionTask</code>가 앞에서 배운 것을 모두 모은다. 소켓을 닫는 책임은 <code>try (socket)</code>으로 작업 스레드가 진다. 읽기 타임아웃을 걸고, 입출력 스트림을 버퍼로 감싼다. 요청을 읽다가 <code>HttpException</code>이 나면 그 상태 코드로, 핸들러가 예상하지 못한 예외를 던지면 500으로 응답한다. <code>IOException</code>은 소켓 자체의 문제(상대가 연결을 끊었거나 타임아웃)이므로 응답을 시도하지 않고 바깥으로 보내 로그만 남긴다. 응답을 소켓에 쓰는 <code>flush()</code>는 핸들러가 아니라 이 작업이 마지막에 한 번 부른다. 핸들러가 예외를 던지면 쓰다 만 응답 객체는 버리고 새 오류 응답을 만든다. 쓰다 만 본문은 아직 <code>StringBuilder</code>에만 있었으므로 소켓에는 아무것도 나가지 않았다. 응답을 모아 두는 설계가 오류 처리까지 단순하게 만든 것이다.</p>
+<p>오류 응답의 본문에 예외 메시지를 넣지 않은 것은 의도다. 예외 메시지에는 요청에서 온 문자열(잘못된 헤더 줄 등)이나 서버 내부 정보(클래스 이름, SQL)가 섞이기 쉽다. 그것을 HTML에 그대로 넣으면 앞에서 본 XSS가 되고, 내부 정보를 공격자에게 알려 주게 된다. 자세한 내용은 서버 로그에만 남긴다.</p>
+<p>이제 프레임워크와 애플리케이션이 나뉜다. 위의 클래스들(<code>HttpRequest</code>, <code>HttpResponse</code>, <code>RequestHandler</code>, <code>Router</code>, <code>ConnectionTask</code>, <code>HttpServer</code>)은 어떤 사이트를 만들든 그대로 쓰는 부분이다. 사이트마다 달라지는 것은 어떤 경로에 어떤 핸들러를 등록하느냐뿐이다.</p>
+<pre><code class="language-java">public final class Html {
+    private Html() {}
+
+    public static String escape(String s) {
+        if (s == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(s.length());
+        for (char c : s.toCharArray()) {
+            switch (c) {
+                case '<' -> sb.append("&amp;lt;");
+                case '>' -> sb.append("&amp;gt;");
+                case '&' -> sb.append("&amp;amp;");
+                case '"' -> sb.append("&amp;quot;");
+                case '\'' -> sb.append("&amp;#39;");
+                default -> sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+}</code></pre>
+<pre><code class="language-java">import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class App {
+    public static void main(String[] args) throws IOException {
+        Router router = new Router();
+        router.add("/", (req, res) -> res.write("<h1>홈</h1><a href=\"/search?q=hello\">검색</a>"));
+        router.add("/search", (req, res) -> {
+            String q = req.getParameter("q");
+            res.write("<h1>검색어: " + Html.escape(q) + "</h1>");
+        });
+        router.add("/save", (req, res) -> {
+            if (!req.getMethod().equals("POST")) {
+                res.setStatus(405);
+                res.setHeader("Allow", "POST");
+                return;
+            }
+            res.write("<p>name=" + Html.escape(req.getParameter("name"))
+                    + ", age=" + Html.escape(req.getParameter("age")) + "</p>");
+        });
+        router.add("/echo", (req, res) -> {
+            String text = new String(req.getBody(), StandardCharsets.UTF_8);
+            res.setHeader("Content-Type", "text/plain; charset=UTF-8");
+            res.write(req.getBody().length + " bytes, " + text.length() + " chars: " + text);
+        });
+        router.add("/boom", (req, res) -> {
+            throw new IllegalStateException("의도한 오류");
+        });
+        new HttpServer(8080, router).start();
+    }
+}</code></pre>
+<p>핸들러는 람다로 썼다. <code>RequestHandler</code>는 추상 메서드가 하나인 함수형 인터페이스이므로, 람다 식이 그 인터페이스를 구현한 객체가 된다. 커맨드 패턴의 "커맨드 객체"가 람다 하나로 줄어든 것이다. 기능이 커지면 <code>RequestHandler</code>를 구현한 별도 클래스로 옮기면 되고, <code>Router</code> 입장에서는 둘 다 같은 커맨드 객체다. curl로 각 경로를 호출한 결과는 다음과 같다.</p>
+<pre data-label="curl 실행 결과"><code class="language-text">$ curl -s "localhost:8080/search?q=%EA%B0%80+%EB%82%98%26%3Cb%3E"
+<h1>검색어: 가 나&amp;amp;&amp;lt;b&amp;gt;</h1>
+$ curl -s -d 'name=%ED%99%8D%EA%B8%B8%EB%8F%99&age=20' localhost:8080/save
+<p>name=홍길동, age=20</p>
+$ curl -si localhost:8080/save | head -5
+HTTP/1.1 405 Method Not Allowed
+Content-Type: text/html; charset=UTF-8
+Allow: POST
+Content-Length: 0
+Connection: close
+$ curl -s -H 'Content-Type: application/json' -d '{"msg":"안녕"}' localhost:8080/echo
+16 bytes, 12 chars: {"msg":"안녕"}
+$ curl -si localhost:8080/nothing | head -1
+HTTP/1.1 404 Not Found
+$ curl -si localhost:8080/boom | head -1
+HTTP/1.1 500 Internal Server Error
+$ curl -sI localhost:8080/
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=UTF-8
+Content-Length: 48
+Connection: close
+$ curl -si "localhost:8080/search?q=100%" | head -1
+HTTP/1.1 400 Bad Request
+$ curl -si -H 'Transfer-Encoding: chunked' -d 'x' localhost:8080/echo | head -1
+HTTP/1.1 501 Not Implemented
+$ printf 'GET / HTTP/1.1\r\nHost : x\r\n\r\n' | nc localhost 8080 | head -1
+HTTP/1.1 400 Bad Request
+$ printf 'GET / HTTP/1.1\nHost: x\n\n' | nc localhost 8080 | head -1
+HTTP/1.1 200 OK</code></pre>
+<pre data-label="서버 출력 (스레드 이름은 실행마다 다를 수 있다)"><code class="language-text">listening on 8080
+[pool-1-thread-1] GET / params={} body=0B
+[pool-1-thread-2] GET /search params={q=가 나&<b>} body=0B
+[pool-1-thread-3] POST /save params={name=홍길동, age=20} body=39B
+[pool-1-thread-4] GET /save params={} body=0B
+[pool-1-thread-5] POST /echo params={} body=16B
+[pool-1-thread-6] GET /nothing params={} body=0B
+[pool-1-thread-7] GET /boom params={} body=0B
+handler failed: java.lang.IllegalStateException: 의도한 오류
+[pool-1-thread-8] HEAD / params={} body=0B
+[pool-1-thread-2] GET / params={} body=0B</code></pre>
+<p>결과를 하나씩 확인해 보자. 검색어 <code>%EA%B0%80+%EB%82%98%26%3Cb%3E</code>는 쌍을 자른 뒤 디코딩되어 "가 나&amp;&lt;b&gt;"가 되었고, HTML에 넣을 때 이스케이프되어 태그로 해석되지 않는다. 쿼리 안의 <code>%26</code>이 파라미터를 나누지 않은 것도 "자르고 나서 디코딩"의 결과다. 폼 본문 39바이트 가운데 "홍길동"은 27바이트의 <code>%XX</code> 표기로 왔다가, 디코딩을 거쳐 UTF-8 9바이트, 세 글자로 복원되었다. GET으로 <code>/save</code>를 부르면 405와 <code>Allow: POST</code>가 온다. <code>/echo</code>는 16바이트 본문이 12글자임을 보여 준다. 바이트로 읽었기 때문에 멈추지 않는다. 핸들러가 던진 예외는 500으로 바뀌었고 서버는 계속 돈다. HEAD 응답은 GET과 같은 <code>Content-Length: 48</code>을 담지만 본문이 없다. 공백이 섞인 헤더 이름(<code>Host :</code>)은 400으로 거절되고, LF만으로 줄을 끝낸 요청은 받아들인다. 받을 때 너그럽게, 그러나 경계가 모호해지는 곳에서는 엄격하게, 라는 명세의 태도가 그대로 코드가 되었다.</p>
+<p>마지막 줄의 스레드 이름 <code>pool-1-thread-2</code>가 다시 나온 것도 볼 만하다. 고정 크기 풀은 스레드를 요청마다 만들지 않고 재사용한다. 다만 풀의 스레드 10개가 다 만들어지기 전에는 새 작업이 올 때마다 새 스레드를 만드는 것이 <code>ThreadPoolExecutor</code>의 동작이므로, 처음 몇 요청은 번호가 차례로 늘어난다. 어느 스레드가 어느 요청을 맡을지는 실행마다 다르다.</p>
+<x-visual id="java-adv2-10-command-dispatch" title="커맨드 패턴으로 나뉜 프레임워크와 애플리케이션" kind="구조도" ratio="16:9">
+<x-hint>accept 루프와 작업 스레드, 요청 파싱, 라우터가 프레임워크 영역에 있고, 경로별 핸들러 객체가 애플리케이션 영역에서 등록되어 라우터가 공통 인터페이스로 호출한다는 것을 보여 준다.</x-hint>
+<x-prompt>Two horizontal bands. Top band shaded light gray labeled "프레임워크 (어떤 사이트든 공통)": left to right boxes "HttpServer accept 루프" → "ConnectionTask (작업 스레드)" → "HttpRequest 파싱" → "Router" → "HttpResponse flush". Router box contains a small table with three rows: "/" , "/search", "/save" each with an arrow down to the bottom band. Bottom band white labeled "애플리케이션 (사이트마다 다름)": three rounded boxes "홈 핸들러", "검색 핸들러", "저장 핸들러", each marked with the same interface badge "RequestHandler.handle()". A dashed arrow from a box labeled "App.main" to the Router table labeled "등록". Flat vector style, Korean labels exactly as written, no more than 12 labels.</x-prompt>
+<x-caption>프레임워크는 공통 인터페이스로 핸들러를 부르기만 하고, 무엇을 할지는 등록된 핸들러 객체가 정한다.</x-caption>
+</x-visual>
+<h4>커맨드 패턴이 바꾼 것</h4>
+<div class="table-wrap"><table><thead><tr><th>패턴의 역할</th><th>이 서버에서</th><th>하는 일</th></tr></thead><tbody>
+<tr><td>커맨드(공통 인터페이스)</td><td><code>RequestHandler</code></td><td>"요청을 받아 응답을 채운다"는 실행 방법 하나를 정한다</td></tr>
+<tr><td>구체 커맨드</td><td>경로별 람다·클래스</td><td>실제 기능을 담는다</td></tr>
+<tr><td>호출자(invoker)</td><td><code>Router</code>, <code>ConnectionTask</code></td><td>어떤 커맨드인지 모른 채 실행한다</td></tr>
+<tr><td>등록하는 쪽(client)</td><td><code>App.main</code></td><td>어떤 경로에 어떤 커맨드를 둘지 정한다</td></tr>
+</tbody></table></div>
+<p>가장 큰 변화는 의존의 방향이다. 세 번째 서버에서는 서버 코드가 모든 기능을 알고 있었다. 이제 서버 코드는 <code>RequestHandler</code> 인터페이스만 알고, 기능 코드가 서버에 자신을 등록한다. 서버는 정해진 시점에 등록된 객체를 호출한다. 우리가 프레임워크를 부르는 것이 아니라 프레임워크가 우리 코드를 부른다. 스프링 핵심 원리에서 본 제어의 역전(Inversion of Control)이 이 작은 서버에도 그대로 나타난다. 새 페이지를 추가할 때 프레임워크 코드는 한 줄도 바뀌지 않으므로, 확장에는 열려 있고 수정에는 닫혀 있는 구조(OCP)가 된다.</p>
+<h4>여러 스레드가 같은 핸들러를 부른다</h4>
+<p>핸들러 객체는 하나인데 작업 스레드는 열 개다. 같은 경로로 요청 열 개가 동시에 오면 열 개의 스레드가 같은 핸들러 객체의 <code>handle()</code>을 동시에 실행한다. 따라서 핸들러는 요청마다 달라지는 값을 필드에 두면 안 된다. 요청마다 달라지는 것은 모두 매개변수(<code>request</code>, <code>response</code>)와 지역 변수로 다루고, 핸들러 필드에는 불변이거나 스레드 안전한 것만 둔다. 자카르타 서블릿의 <code>HttpServlet</code> Javadoc도 서블릿이 보통 멀티스레드 서버에서 실행되므로 동시 요청을 처리할 수 있어야 하고 공유 자원 접근을 동기화하는 데 주의하라고 적는다. 서블릿 하나, 스프링 컨트롤러 빈 하나를 여러 요청 스레드가 함께 쓰는 구조가 바로 이것이다.</p>
+<p><code>Router</code>의 <code>HashMap</code>은 어떤가? <code>HashMap</code>은 스레드 안전하지 않지만, 이 서버에서는 문제가 없다. 모든 <code>add()</code>는 서버가 시작하기 전 메인 스레드에서 끝나고, 이후에는 읽기만 한다. 그리고 작업 스레드가 맵을 처음 읽는 것은 메인 스레드가 <code>execute()</code>로 작업을 넘긴 뒤다. <code>java.util.concurrent</code> 패키지 문서는 <code>Executor</code>에 <code>Runnable</code>을 제출하기 전에 한 스레드가 한 동작은 그 작업의 실행이 시작되기 전에 일어난다(happens-before)고 보장한다. 자바 고급 1편에서 본 메모리 가시성 문제가 이 보장 덕분에 생기지 않는다. 반대로 서버가 도는 중에 경로를 추가하거나 지우는 기능을 넣는다면, 그때는 <code>ConcurrentHashMap</code>이 필요하다.</p>
+
+<h3>한 층 아래: 요청 하나가 지나가는 길</h3>
+<p>완성된 서버에서 요청 하나가 처리될 때 자바 코드와 운영체제 사이에서 일어나는 일을 시간 순서대로 정리해 보자.</p>
+<figure class="flow-figure"><figcaption>요청 하나의 처리 과정</figcaption><ol class="flow">
+<li><strong>연결 수립</strong><span>클라이언트의 SYN에 커널이 응답해 handshake를 끝내고, 연결을 리스닝 소켓의 accept 대기열에 넣는다. 자바 코드는 아직 아무것도 모른다.</span></li>
+<li><strong>accept()</strong><span>메인 스레드가 대기열에서 연결 하나를 꺼내 <code>Socket</code> 객체를 받는다. 이 연결 전용 파일 디스크립터가 생긴다.</span></li>
+<li><strong>작업 넘기기</strong><span><code>execute()</code>가 <code>ConnectionTask</code>를 작업 큐에 넣는다. 놀고 있는 작업 스레드가 있으면 바로 꺼내 실행하고, 없으면 큐에서 기다린다.</span></li>
+<li><strong>읽기</strong><span>첫 <code>read()</code>에서 <code>BufferedInputStream</code>이 시스템 콜로 최대 8192바이트를 커널 수신 버퍼에서 복사해 온다. 이후 줄 단위 파싱은 자바 힙의 버퍼에서 이루어진다. 데이터가 아직 없으면 스레드는 이 시스템 콜에서 막힌다.</span></li>
+<li><strong>핸들러 실행</strong><span>라우터가 핸들러를 찾아 부르고, 핸들러는 응답 객체의 <code>StringBuilder</code>에 본문을 쌓는다. 소켓에는 아직 아무것도 나가지 않는다.</span></li>
+<li><strong>쓰기</strong><span><code>flush()</code>가 헤더와 본문을 <code>BufferedOutputStream</code>에 쓰고 비운다. 응답이 버퍼보다 작으면 쓰기 시스템 콜 한 번으로 커널 송신 버퍼에 복사되고, 그다음 전송은 커널의 TCP가 맡는다.</span></li>
+<li><strong>닫기</strong><span><code>try (socket)</code>이 소켓을 닫는다. 커널은 송신 버퍼에 남은 데이터를 보낸 뒤 FIN을 보낸다. 작업 스레드는 풀로 돌아가 다음 작업을 기다린다.</span></li>
+</ol></figure>
+<p>4번과 6번에서 버퍼가 하는 일이 크다. 버퍼 없이 <code>readLine()</code>이 바이트마다 소켓 스트림의 <code>read()</code>를 부르면 요청 한 번에 시스템 콜이 수백 번 일어난다. 출력도 헤더와 본문을 따로 <code>write()</code>하면 시스템 콜이 두 번이다. 2회차에서 본 "시스템 콜은 비싸므로 모아서 한 번에"라는 원리가 네트워크에서도 그대로 적용된다.</p>
+<h4>읽지 않은 데이터를 남기고 닫으면</h4>
+<p>7번의 "닫기"에는 함정이 하나 있다. 우리 서버는 본문이 너무 크거나(413) 지원하지 않는 전송 코딩(501)이면 본문을 읽지 않은 채 오류 응답을 쓰고 바로 소켓을 닫는다. 이때 클라이언트가 보낸 본문 바이트가 아직 서버의 수신 버퍼에 남아 있거나 뒤늦게 도착할 수 있다. RFC 9112 9.6절은 서버가 TCP 연결을 즉시 닫으면 클라이언트가 마지막 응답을 읽지 못할 위험이 크다고 경고한다. 서버가 완전히 닫은 뒤 데이터를 더 받으면 서버의 TCP 스택이 리셋(RST)을 보내고, 그 RST가 클라이언트 쪽에서 아직 애플리케이션이 읽지 않은 수신 데이터, 즉 우리가 보낸 오류 응답을 지워 버릴 수 있다는 것이다. 클라이언트는 413 응답 대신 "connection reset"을 보게 된다.</p>
+<p>RFC는 이를 피하기 위해 서버들이 연결을 단계적으로 닫는다고 설명한다. 먼저 쓰기 방향만 닫는 반쪽 닫기(half-close)를 하고, 클라이언트가 연결을 닫거나 충분한 시간이 지날 때까지 남은 입력을 읽어 버린 뒤 완전히 닫는 방식이다. 자바에서는 <code>Socket.shutdownOutput()</code>이 쓰기 방향만 닫는다. 이 회차의 서버는 단순함을 위해 이 처리를 하지 않았다. 범용 서버를 만든다면 오류 응답 뒤에 반쪽 닫기와 제한 시간 있는 읽어 버리기(drain)를 넣어야 한다. 9회차에서 본 FIN과 RST의 차이가 HTTP 응답의 전달 여부를 가르는 순간이다.</p>
+
+<h3>청크 전송 코딩과 두 개의 길이: 파서가 어긋나면 요청이 숨는다</h3>
+<p>앞에서 <code>readBody()</code>는 <code>Transfer-Encoding</code>이 붙은 요청을 501로 거절했다. 단순화라고 적었지만, 명세의 눈으로 보면 꽤 큰 양보다. RFC 9112 6.1절은 수신자가 chunked 전송 코딩을 해석할 수 있어야 한다(MUST)고 적는다. 본문 크기를 미리 알 수 없는 메시지의 경계를 정하는 데 chunked가 결정적인 역할을 하기 때문이다. 같은 절에는 이해하지 못하는 전송 코딩을 받은 서버가 501로 응답하는 것이 좋다(SHOULD)는 문장도 있지만, chunked는 "이해하지 못해도 되는" 코딩이 아니다. 이 절에서는 chunked의 바이트 구조를 보고 이 회차의 파서에 디코더를 붙인 뒤, <code>Content-Length</code>와 <code>Transfer-Encoding</code>이 함께 올 때 명세가 왜 그렇게 조심하는지를 실험으로 확인한다.</p>
+<h4>chunked의 바이트 구조</h4>
+<p>RFC 9112 7.1절의 문법은 다음과 같다. 본문을 덩어리(chunk)로 나누고, 덩어리마다 앞에 그 덩어리의 바이트 수를 16진수로 적는다. 크기가 0인 덩어리가 끝을 알리고, 그 뒤에 선택적인 트레일러 필드들과 빈 줄이 온다.</p>
+<pre data-label="RFC 9112 7.1절의 ABNF"><code class="language-text">chunked-body   = *chunk
+                 last-chunk
+                 trailer-section
+                 CRLF
+
+chunk          = chunk-size [ chunk-ext ] CRLF
+                 chunk-data CRLF
+chunk-size     = 1*HEXDIG
+last-chunk     = 1*("0") [ chunk-ext ] CRLF</code></pre>
+<p>덩어리 하나하나가 자기 길이를 들고 다니므로, 보내는 쪽은 전체 길이를 모르는 채로 만들어지는 대로 보낼 수 있고, 받는 쪽은 연결이 닫히지 않아도 끝을 안다. 앞에서 만든 응답 객체가 "본문을 다 모은 뒤 길이를 세어 보낸다"는 선택을 했다면, chunked는 "길이를 모르는 채로 흘려보내되, 경계는 잃지 않는다"는 반대쪽 선택이다.</p>
+<p>실제 바이트를 보자. JDK의 <code>com.sun.net.httpserver</code>로 띄운 서버(다음 절에서 자세히 본다)에 응답 길이를 0으로 선언하고(<code>sendResponseHeaders(200, 0)</code>) <code>"hello "</code>를 쓴 뒤 <code>flush()</code>, 이어서 <code>"world"</code>를 쓰고 스트림을 닫는 핸들러를 두고, <code>nc</code>로 응답을 받아 CR과 LF를 글자로 바꿔 찍었다.</p>
+<pre data-label="chunked 응답의 원시 바이트 (Date 값은 실행마다 다르다)"><code class="language-text">HTTP/1.1 200 OK\r\n
+Date: Thu, 19 Nov 2026 07:35:30 GMT\r\n
+Transfer-encoding: chunked\r\n
+\r\n
+6\r\n
+hello \r\n
+5\r\n
+world\r\n
+0\r\n
+\r\n</code></pre>
+<p>"6"은 공백을 포함한 <code>hello </code>의 바이트 수이고, "5"는 <code>world</code>의 바이트 수다. 덩어리가 둘로 나뉜 것은 핸들러가 중간에 <code>flush()</code>를 불렀기 때문이다. OpenJDK 21의 <code>sun.net.httpserver.ChunkedOutputStream</code>은 쓴 데이터를 최대 4096바이트(<code>CHUNK_SIZE</code>)까지 모았다가 덩어리 하나로 내보내고, <code>flush()</code>가 불리면 그때까지 모인 만큼을 바로 덩어리로 만든다. 마지막 <code>0\r\n\r\n</code>은 크기 0인 last-chunk와, 트레일러가 없으므로 곧바로 오는 빈 줄이다. 크기가 16진수라는 점도 기억해 두자. curl에 <code>-H 'Transfer-Encoding: chunked' -d '{"msg":"안녕"}'</code>을 주면 curl은 "27 bytes data"를 보냈다고 보고하는데, 크기 줄 <code>10\r\n</code>(16을 16진수로 쓴 것) 4바이트, 데이터 16바이트, 그 뒤 CRLF 2바이트, 마지막 <code>0\r\n\r\n</code> 5바이트를 더한 값이다.</p>
+<h4>디코더: RFC의 의사 코드를 바이트 파서로</h4>
+<p>RFC 9112 7.1.3절은 디코딩 과정을 의사 코드로 보여 준다. 크기 줄을 읽고, 크기가 0보다 큰 동안 그만큼의 데이터와 CRLF를 읽어 본문에 붙인 뒤 다음 크기 줄을 읽는다. 0이 나오면 트레일러 필드를 빈 줄이 나올 때까지 읽는다. 이것을 <code>HttpRequest</code>에 그대로 옮기면 다음과 같다. 줄 읽기는 앞에서 만든 바이트 단위 <code>readLine()</code>을, 상한은 <code>MAX_BODY</code>를 그대로 쓴다.</p>
+<pre><code class="language-java">// HttpRequest에 추가한다. RFC 9112 7.1.3의 의사 코드를 옮겼고, 확장(chunk-ext)과 트레일러는 읽고 버린다
+private static byte[] readChunked(InputStream in) throws IOException {
+    ByteArrayOutputStream content = new ByteArrayOutputStream();
+    while (true) {
+        String line = readLine(in);                    // chunk-size [ chunk-ext ]
+        if (line == null) {
+            throw new HttpException(400, "connection closed in chunked body");
+        }
+        int semi = line.indexOf(';');
+        String hex = (semi == -1 ? line : line.substring(0, semi)).stripTrailing();
+        if (hex.isEmpty()) {
+            throw new HttpException(400, "missing chunk-size");
+        }
+        long size = 0;
+        for (int i = 0; i < hex.length(); i++) {      // parseLong은 부호(+, -)를 받아 주므로 직접 센다
+            int d = Character.digit(hex.charAt(i), 16);
+            if (d == -1) {
+                throw new HttpException(400, "bad chunk-size");
+            }
+            size = size * 16 + d;
+            if (content.size() + size > MAX_BODY) {    // long이 넘치기 전에 상한 검사가 먼저 걸린다
+                throw new HttpException(413, "content too large");
+            }
+        }
+        if (size == 0) {
+            break;                                     // last-chunk
+        }
+        byte[] data = in.readNBytes((int) size);
+        if (data.length < size || !"".equals(readLine(in))) {
+            throw new HttpException(400, "bad chunk-data");
+        }
+        content.write(data);
+    }
+    while (true) {                                     // 트레일러 필드는 빈 줄까지 읽고 버린다
+        String trailer = readLine(in);
+        if (trailer == null) {
+            throw new HttpException(400, "connection closed in trailer");
+        }
+        if (trailer.isEmpty()) {
+            break;
+        }
+    }
+    return content.toByteArray();
+}</code></pre>
+<pre><code class="language-java">// readBody()의 앞부분을 이렇게 바꾼다
+String te = headers.get("transfer-encoding");
+if (te != null) {
+    if (headers.containsKey("content-length")) {
+        throw new HttpException(400, "both transfer-encoding and content-length");
+    }
+    if (!te.equalsIgnoreCase("chunked")) {
+        throw new HttpException(501, "transfer-encoding not supported");
+    }
+    body = readChunked(in);
+    return;
+}
+String length = headers.get("content-length");
+// ... 이하 그대로</code></pre>
+<p>몇 줄에는 명세의 요구가 직접 들어 있다. 첫째, 크기를 <code>Long.parseLong(hex, 16)</code>으로 읽지 않았다. 이 메서드는 맨 앞의 <code>+</code>나 <code>-</code> 부호를 받아들이므로 <code>-1</code>이 음수 크기로 통과한다. 문법이 허용하는 것은 <code>1*HEXDIG</code>, 즉 16진 숫자뿐이다. 둘째, RFC 9112 7.1절은 수신자가 매우 큰 16진수를 예상하고, 정수 변환의 넘침(overflow)이나 정밀도 손실로 파싱 오류가 생기지 않게 막아야 한다(MUST)고 적는다. 위 코드는 자릿수를 하나 더할 때마다 본문 상한과 비교하므로 <code>long</code>이 넘칠 만큼 자라기 훨씬 전에 413으로 끝난다. 셋째, 세미콜론 뒤의 청크 확장은 버린다. 7.1.1절은 수신자가 알지 못하는 청크 확장을 무시해야 하고(MUST), 서버는 확장의 전체 길이를 적당한 양으로 제한하는 것이 좋다고 적는다. 여기서는 <code>readLine()</code>의 한 줄 8192바이트 제한이 그 상한이 된다. 넷째, 트레일러는 읽고 버린다. 7.1.2절은 chunked를 벗겨 내는 수신자가 트레일러 필드를 골라 보관하거나 버려도 되고(MAY), 보관하더라도 그 필드의 정의가 명시적으로 허용하지 않는 한 헤더 영역에 합쳐서는 안 된다(MUST NOT)고 적는다. 마지막으로, chunked를 쓰는 요청이 <code>Transfer-Encoding: gzip, chunked</code>처럼 여러 코딩을 나열할 수도 있는데, 이 서버는 압축 코딩을 구현하지 않았으므로 값이 정확히 <code>chunked</code> 하나일 때만 받고 나머지는 501로 거절한다. 엄밀히 말하면 이것도 단순화다. 501(SHOULD)이 맞는 것은 <code>gzip, chunked</code>처럼 chunked가 마지막이라 경계는 알 수 있지만 앞의 코딩을 모를 때이고, <code>Transfer-Encoding: gzip</code>처럼 요청에서 chunked가 마지막 코딩이 아니면 본문 길이를 믿을 수 있게 정할 수 없으므로 6.3절 4번은 400으로 응답한 뒤 연결을 닫으라고(MUST) 정한다.</p>
+<pre data-label="고친 서버에 보낸 요청과 응답"><code class="language-text">$ curl -s -H 'Transfer-Encoding: chunked' -H 'Content-Type: application/json' -d '{"msg":"안녕"}' localhost:8080/echo
+16 bytes, 12 chars: {"msg":"안녕"}
+
+(확장과 트레일러가 붙은 요청을 nc로)
+6;note=a\r\n hello \r\n 5\r\n world\r\n 0\r\n X-Checksum: 1\r\n \r\n
+→ 11 bytes, 11 chars: hello world
+
+(크기 줄만 바꿔 가며)
+[+5]                    HTTP/1.1 400 Bad Request
+[-1]                    HTTP/1.1 400 Bad Request
+[g]                     HTTP/1.1 400 Bad Request
+[]                      HTTP/1.1 400 Bad Request
+[fffffffffffffffffffff] HTTP/1.1 413 Content Too Large
+[5 다음에 helloXX]       HTTP/1.1 400 Bad Request</code></pre>
+<p>curl이 chunked로 보낸 JSON은 덩어리를 벗겨 낸 뒤 원래의 16바이트로 복원되었다. 확장 <code>;note=a</code>와 트레일러 <code>X-Checksum</code>은 본문에 섞이지 않았다. 16진수 21자리 크기는 <code>long</code>이 담을 수 있는 범위를 훨씬 넘지만, 여섯 번째 자리에서 이미 상한(1MiB)을 넘어 413이 되었다. 크기 5 뒤에 7바이트가 온 경우는 5바이트를 읽은 다음 줄이 빈 줄이 아니므로 400이다. 바이트 수를 세어 경계를 정하는 방식에서는 "세었는데 그 자리에 CRLF가 없다"는 것 자체가 프레이밍이 깨졌다는 증거다.</p>
+<h4>길이 헤더가 둘이면 누가 옳은가</h4>
+<p>이제 chunked를 해석하는 파서와 <code>Content-Length</code>만 보는 파서가 같은 바이트를 받으면 어떻게 되는지 보자. RFC 9112 6.1절에 따르면, 초기 구현 가운데에는 메시지 경계를 위한 chunked와 진행 표시줄에 쓸 추정치 <code>Content-Length</code>를 함께 보내는 것들이 있었다. 그래서 둘을 서로 배타적인 것으로 정하지 않고 <code>Transfer-Encoding</code>이 <code>Content-Length</code>를 덮어쓰는 것으로 정의했다. 문제는 경로 위의 모든 수신자가 이 규칙을 똑같이 지키지는 않는다는 데 있다. 같은 절은 그런 메시지를 전달하면, 아래쪽 수신자 중 하나라도 명세대로 파싱하지 않을 때 요청 밀반입이나 응답 분할(response splitting) 공격으로 이어질 수 있다고 경고한다. 11.2절은 요청 밀반입을 여러 수신자 사이의 파싱 차이를 이용해, 겉보기에 무해한 요청 안에 정책상 막혔을 추가 요청을 숨기는 기법이라고 설명한다.</p>
+<p>다음 프로그램은 연결 하나로 들어온 바이트 흐름을 두 규칙으로 잘라 본다. 하나는 <code>Content-Length</code>만 믿고, 다른 하나는 <code>Transfer-Encoding: chunked</code>를 먼저 믿는다. 본문 길이 37은 <code>0\r\n\r\n</code> 5바이트와 그 뒤의 GET 요청 32바이트를 합친 값이다.</p>
+<pre><code class="language-java">import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+public class Framing {
+    // 연결 하나로 들어온 바이트. 겉보기에는 POST 요청 하나다
+    static final String WIRE =
+            "POST /search HTTP/1.1\r\n" +
+            "Host: x\r\n" +
+            "Content-Length: 37\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
+            "\r\n" +
+            "0\r\n" +
+            "\r\n" +
+            "GET /admin HTTP/1.1\r\n" +
+            "Host: x\r\n" +
+            "\r\n";
+
+    public static void main(String[] args) throws IOException {
+        System.out.println("Content-Length를 믿는 파서: " + split(false));
+        System.out.println("chunked를 믿는 파서     : " + split(true));
+    }
+
+    // 바이트 흐름을 요청 단위로 잘라 각 요청의 요청 줄을 모은다
+    static List<String> split(boolean trustChunked) throws IOException {
+        InputStream in = new ByteArrayInputStream(WIRE.getBytes(StandardCharsets.ISO_8859_1));
+        List<String> requests = new ArrayList<>();
+        String requestLine;
+        while ((requestLine = line(in)) != null) {
+            Map<String, String> h = new HashMap<>();
+            for (String l; !(l = line(in)).isEmpty(); ) {
+                int c = l.indexOf(':');
+                h.put(l.substring(0, c).toLowerCase(Locale.ROOT), l.substring(c + 1).strip());
+            }
+            if (trustChunked && "chunked".equals(h.get("transfer-encoding"))) {
+                for (int size; (size = Integer.parseInt(line(in), 16)) > 0; ) {
+                    in.readNBytes(size);
+                    line(in);              // chunk-data 뒤의 CRLF
+                }
+                line(in);                  // 트레일러 없음: 마지막 빈 줄
+            } else if (h.containsKey("content-length")) {
+                in.readNBytes(Integer.parseInt(h.get("content-length")));
+            }
+            requests.add(requestLine);
+        }
+        return requests;
+    }
+
+    static String line(InputStream in) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        int b;
+        while ((b = in.read()) != -1 && b != '\n') {
+            if (b != '\r') sb.append((char) b);
+        }
+        return (b == -1 && sb.length() == 0) ? null : sb.toString();
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Content-Length를 믿는 파서: [POST /search HTTP/1.1]
+chunked를 믿는 파서     : [POST /search HTTP/1.1, GET /admin HTTP/1.1]</code></pre>
+<p>같은 바이트가 첫 번째 파서에게는 요청 하나, 두 번째 파서에게는 요청 둘이다. <code>Content-Length</code>를 믿는 쪽에서 <code>GET /admin</code>은 POST 본문 안의 데이터일 뿐이다. chunked를 믿는 쪽에서는 크기 0인 덩어리에서 POST 본문이 끝나고, 남은 바이트가 다음 요청으로 읽힌다. 앞쪽에 <code>Content-Length</code>를 믿는 프록시가 있어 요청 줄을 보고 <code>/admin</code> 접근을 막고 있고, 뒤쪽 서버는 chunked를 믿는다고 해 보자. 프록시가 검사한 것은 <code>POST /search</code> 하나뿐인데, 서버는 <code>GET /admin</code>까지 처리한다. 이 차이가 공격이 되는 것은 프록시와 서버 사이의 연결이 재사용되기 때문이다. RFC 9112 9.3절이 말하듯, 지속 연결에서 읽고 남은 데이터는 다음 요청으로 오해된다. 연결 하나에 요청 하나라면 남은 바이트는 연결과 함께 버려진다.</p>
+<p>그래서 명세는 보내는 쪽과 받는 쪽을 모두 막는다. 보내는 쪽에는 <code>Transfer-Encoding</code>이 있는 메시지에 <code>Content-Length</code>를 보내지 말라고(6.2절, MUST NOT) 하고, 받는 쪽에는 둘 다 있는 메시지가 요청 밀반입 시도일 수 있으니 오류로 다루는 편이 좋다고(6.3절 3번) 한다. 6.1절은 서버가 그런 요청을 거절해도 되고(MAY) <code>Transfer-Encoding</code>만으로 처리해도 되지만, 어느 쪽이든 응답한 뒤에는 연결을 닫아야 한다(MUST)고 정한다. 연결을 닫으면 숨겨진 나머지 바이트가 다음 요청이 될 기회가 사라진다. 6.3절 5번은 <code>Content-Length</code> 값이 잘못된 요청에도 400으로 응답한 뒤 연결을 닫으라고(MUST) 하며, 값이 쉼표로 나열되어 있을 때는 모든 값이 올바르고 서로 같을 때만 그 하나의 값으로 처리하도록 허용한다.</p>
+<p>같은 바이트(경로만 각 서버에 있는 것으로 바꿨다)를 위에서 고친 이 회차의 서버와 JDK 21.0.13의 내장 서버에 보냈다.</p>
+<pre data-label="CL과 TE가 함께 있는 요청에 대한 응답"><code class="language-text">(이 회차의 서버, chunked 디코더를 붙인 뒤)
+HTTP/1.1 400 Bad Request
+Content-Type: text/html; charset=UTF-8
+Content-Length: 28
+Connection: close
+
+(JDK 내장 서버)
+HTTP/1.1 400 Bad Request
+Content-Length: 65
+Content-Type: text/html
+Connection: close
+
+<h1>400 Bad Request</h1>Conflicting or malformed headers detected</code></pre>
+<p>OpenJDK 21의 <code>sun.net.httpserver.ServerImpl</code>을 보면, 요청 헤더를 읽은 직후 <code>Content-Length</code>가 있으면서 <code>Transfer-encoding</code>도 있거나 <code>Content-Length</code> 필드가 둘 이상이면 이 메시지로 400을 보내고, <code>Transfer-encoding</code> 값이 <code>chunked</code> 하나가 아니면 501을 보낸다. 실제로 <code>Content-Length: 1</code>을 두 줄 보낸 요청도 같은 400을, <code>Transfer-Encoding: gzip</code>은 501을 받았다(앞에서 본 대로 명세상으로는 400이어야 하는 경우다). 두 서버 모두 6.1절이 허용한 두 선택지 중 "거절"을 택했고, 응답 뒤 연결을 닫는다. 이 회차의 서버는 모든 응답 뒤에 연결을 닫으므로 "응답 뒤 연결 종료" 요구를 처음부터 지키고 있었던 셈이다. 지속 연결을 지원하는 순간 이 규칙은 선택이 아니라 필수가 된다.</p>
+
+<h3>지속 연결을 실제로 구현하면: JDK 내장 HTTP 서버의 소스에서 보는 것</h3>
+<p>이 회차의 서버는 연결 하나에 요청 하나만 처리했고, 지속 연결에 필요한 것은 목록으로만 말했다. 요청을 반복해 읽는 루프, 다음 요청이 오지 않는 연결을 정리하는 유휴 타임아웃, 그리고 앞 절에서 본 "남은 바이트" 문제다. JDK에 들어 있는 <code>jdk.httpserver</code> 모듈(구현은 OpenJDK 21의 <code>sun.net.httpserver</code> 패키지)은 이것들을 실제로 갖춘 작은 서버라서, 우리 서버와 나란히 놓고 보기에 좋다. 아래의 소스 설명은 Temurin 21.0.13에 들어 있는 <code>lib/src.zip</code>의 코드를 기준으로 한 것이고, 공개 API가 아닌 내부 구현이므로 버전에 따라 바뀔 수 있다. 먼저 두 서버에 같은 주소를 두 번 요청해 보자. <code>curl -v URL URL</code>은 한 프로세스에서 두 요청을 차례로 보내며, 가능하면 연결을 재사용한다.</p>
+<pre data-label="curl -v 출력에서 연결 관련 줄만 (Date 값은 생략)"><code class="language-text">(이 회차의 서버, 포트 8080)
+* Connected to localhost (::1) port 8080
+< HTTP/1.1 200 OK
+< Connection: close
+* Closing connection
+* Connected to localhost (::1) port 8080
+< HTTP/1.1 200 OK
+< Connection: close
+* Closing connection
+
+(JDK 내장 서버, 포트 8081)
+* Connected to localhost (::1) port 8081
+< HTTP/1.1 200 OK
+< Content-length: 6
+* Connection #0 to host localhost left intact
+* Re-using existing connection with host localhost
+< HTTP/1.1 200 OK
+< Content-length: 6
+* Connection #0 to host localhost left intact</code></pre>
+<p>우리 서버에서는 curl이 응답마다 <code>Connection: close</code>를 보고 연결을 닫고, 두 번째 요청을 위해 handshake부터 다시 한다. JDK 서버의 응답에는 <code>Connection</code> 헤더가 없다. RFC 9112 9.3절에 따라 HTTP/1.1 응답에 close 옵션이 없으면 연결은 유지되므로, curl은 연결을 열어 둔 채(left intact) 두 번째 요청을 같은 연결로 보냈다. 필드 이름이 <code>Content-length</code>로 소문자가 섞여 있는 것은 JDK 서버가 이름을 그렇게 적기 때문이고, 필드 이름은 대소문자를 구분하지 않으므로 문제가 없다.</p>
+<h4>쉬는 연결은 스레드를 잡지 않는다</h4>
+<p>지속 연결의 비용은 "다음 요청이 언제 올지 모르는 연결"을 들고 있어야 한다는 데 있다. 우리 서버의 구조라면 그런 연결 하나가 작업 스레드 하나를 계속 붙잡는다. JDK 서버는 이 문제를 셀렉터(<code>java.nio.channels.Selector</code>)로 푼다. <code>ServerImpl.start()</code>는 <code>HTTP-Dispatcher</code>라는 이름의 스레드 하나를 띄우고, 이 스레드가 리스닝 채널과 쉬고 있는 모든 연결을 한 셀렉터에 등록해 둔다. 새 연결을 받으면 논블로킹 모드로 바꿔 읽기 관심(<code>OP_READ</code>)으로 등록만 한다. 어떤 연결에 바이트가 도착해 읽을 수 있게 되면, 디스패처는 그 키를 취소하고 채널을 다시 블로킹 모드로 바꾼 뒤, 요청 하나를 처리하는 <code>Exchange</code> 작업을 실행기에 넘긴다. 응답 쓰기가 끝났다는 내부 이벤트(<code>Event.WriteFinished</code>)가 오면 디스패처가 그 연결을 다시 셀렉터에 등록하고 IDLE 상태로 표시한다(<code>reRegister()</code>, <code>markIdle()</code>). 요청을 처리하는 동안에만 작업 스레드를 쓰고, 기다리는 동안에는 셀렉터의 등록 항목 하나로 줄어드는 구조다.</p>
+<p>실행기를 4개짜리 고정 풀로 지정한 JDK 서버에 연결 5개를 맺고, 연결마다 요청 하나씩을 보내 응답을 받은 뒤, 연결을 열어 둔 채로 <code>jcmd PID Thread.print</code>로 스레드 덤프를 떴다. 그 순간 <code>netstat</code>에는 서버 포트 쪽 ESTABLISHED 연결이 5개 있었다.</p>
+<pre data-label="스레드 덤프 (일부, 주소와 시간 값은 실행마다 다르다)"><code class="language-text">"HTTP-Dispatcher" #21 [27651] prio=5 os_prio=31 cpu=16.60ms elapsed=40.45s ... runnable
+   java.lang.Thread.State: RUNNABLE
+	at sun.nio.ch.KQueue.poll(java.base@21.0.13/Native Method)
+	at sun.nio.ch.KQueueSelectorImpl.doSelect(java.base@21.0.13/KQueueSelectorImpl.java:125)
+	at sun.nio.ch.SelectorImpl.lockAndDoSelect(java.base@21.0.13/SelectorImpl.java:130)
+	...
+	at sun.net.httpserver.ServerImpl$Dispatcher.run(jdk.httpserver@21.0.13/ServerImpl.java:527)
+
+"pool-1-thread-1" #23 [33027] ... waiting on condition
+   java.lang.Thread.State: WAITING (parking)
+	at jdk.internal.misc.Unsafe.park(java.base@21.0.13/Native Method)
+	...
+	at java.util.concurrent.LinkedBlockingQueue.take(java.base@21.0.13/LinkedBlockingQueue.java:435)
+	at java.util.concurrent.ThreadPoolExecutor.getTask(java.base@21.0.13/ThreadPoolExecutor.java:1070)
+
+(pool-1-thread-2, -3, -4도 같은 자리에서 WAITING)</code></pre>
+<p>작업 스레드 4개는 모두 실행기의 작업 큐(<code>LinkedBlockingQueue.take()</code>)에서 일감을 기다리고 있다. 연결 5개를 지켜보는 것은 <code>KQueue.poll</code> 네이티브 메서드에 들어가 있는 디스패처 스레드 하나다. OpenJDK 21의 macOS용 <code>DefaultSelectorProvider</code>는 kqueue를 쓰는 <code>KQueueSelectorProvider</code>를, 리눅스용은 epoll을 쓰는 <code>EPollSelectorProvider</code>를 기본 셀렉터로 고른다. 운영체제에 "이 파일 디스크립터들 중 읽을 것이 생기면 깨워 달라"고 한꺼번에 부탁하는 시스템 콜이므로, 쉬는 연결이 늘어도 기다리는 스레드는 하나로 충분하다. 쉬는 연결의 수가 작업 스레드 수보다 많아도 되는 이유가 이것이고, 앞에서 본 톰캣 NIO 커넥터의 <code>maxConnections</code> 기본값이 <code>maxThreads</code>보다 훨씬 큰 것도 같은 생각에서 나온다.</p>
+<p>한 가지 주의할 점이 있다. <code>HttpServer.setExecutor()</code>의 Javadoc은 이 메서드를 부르지 않으면 <code>start()</code>가 만든 스레드를 쓰는 기본 구현이 쓰인다고 적는다. 소스의 <code>DefaultExecutor</code>는 넘겨받은 작업의 <code>run()</code>을 그 자리에서 호출할 뿐이다. 즉 실행기를 지정하지 않은 JDK 서버는 디스패처 스레드 하나가 모든 요청을 차례로 처리하는, 이 회차의 첫 번째 서버와 같은 직렬 서버가 된다. 요청 처리에 시간이 걸리는 핸들러를 둔다면 실행기 지정은 사실상 필수다.</p>
+<h4>응답 길이를 선언하는 세 가지 방법</h4>
+<p>JDK 서버의 핸들러는 본문을 쓰기 전에 <code>sendResponseHeaders(code, length)</code>로 상태 줄과 헤더를 먼저 보낸다. 이 <code>length</code> 인자가 앞의 본문 길이 규칙을 API로 옮긴 것이다. <code>HttpExchange</code>의 Javadoc에 따르면 0보다 크면 정확히 그만큼의 바이트를 보내야 하고, 0이면 chunked 전송 코딩을 써서 임의의 양을 보낼 수 있으며 출력 스트림을 닫는 것으로 본문이 끝나고, -1이면 본문이 없다. 앞 절의 chunked 응답이 <code>sendResponseHeaders(200, 0)</code>으로 만든 것이다. <code>ExchangeImpl</code> 소스를 보면 세부 규칙도 명세를 따른다. 요청이 HTTP/1.0이면 0을 받아도 chunked 대신 길이 없이 보낸 뒤 연결을 닫는 쪽(<code>UndefLengthOutputStream</code>)을 택하는데, RFC 9112 6.1절이 HTTP/1.1 이상을 표시하지 않은 요청에는 <code>Transfer-Encoding</code>을 담은 응답을 보내지 말라고(MUST NOT) 정했기 때문이다. 1xx, 204, 304 응답은 넘긴 값과 관계없이 본문 없이 보내고, HEAD 요청에도 본문을 쓰지 않는다. 우리 응답 객체가 "모았다가 센다"는 한 가지 방법만 썼다면, JDK 서버는 길이를 아는 경우, 모르는 경우, 본문이 없는 경우를 API에서부터 구분하게 했다.</p>
+<h4>읽지 않은 요청 본문: 읽어 버리거나, 닫거나</h4>
+<p>지속 연결에서 가장 까다로운 경우는 핸들러가 요청 본문을 다 읽지 않고 응답했을 때다. RFC 9112 9.3절은 서버가 요청 본문 전체를 읽거나, 응답을 보낸 뒤 연결을 닫아야 한다(MUST)고 정한다. 그러지 않으면 남은 데이터가 다음 요청으로 오해되기 때문이다. 앞 절의 밀반입 실험과 같은 이유다. JDK 서버는 요청 본문 스트림을 <code>LeftOverInputStream</code>(고정 길이면 <code>FixedLengthInputStream</code>, chunked면 <code>ChunkedInputStream</code>)으로 감싸 두고, 교환이 끝나 이 스트림이 닫힐 때 아직 끝까지 읽지 않았으면 <code>drain()</code>으로 남은 바이트를 읽어 버린다. 다만 무한정 읽지는 않는다. 상한은 <code>ServerConfig</code>의 <code>DEFAULT_DRAIN_AMOUNT</code>, 64 × 1024바이트이고 시스템 속성 <code>sun.net.httpserver.drainAmount</code>로 바꿀 수 있다. 상한 안에서 본문 끝에 닿으면 연결을 쉬는 연결로 돌려보내고, 닿지 못하면 디스패처가 <code>WriteFinished</code>를 처리하면서 그 연결을 닫는다.</p>
+<p>본문을 전혀 읽지 않고 <code>sendResponseHeaders(204, -1)</code>만 하는 핸들러에 10,000바이트와 100,000바이트를 POST로 보내고, 같은 curl 프로세스에서 <code>--next</code>로 GET 요청을 이어 보냈다.</p>
+<pre data-label="curl -v 출력에서 연결 관련 줄만"><code class="language-text">(본문 10,000바이트)
+* Connected to localhost (::1) port 8081
+< HTTP/1.1 204 No Content
+* Connection #0 to host localhost left intact
+* Re-using existing connection with host localhost
+< HTTP/1.1 200 OK
+
+(본문 100,000바이트)
+* Connected to localhost (::1) port 8081
+< HTTP/1.1 204 No Content
+* Connection #0 to host localhost left intact
+* Re-using existing connection with host localhost
+* Recv failure: Connection reset by peer
+* Connection died, retrying a fresh connect (retry count: 1)
+* Closing connection
+* Connected to localhost (::1) port 8081
+< HTTP/1.1 200 OK</code></pre>
+<p>10,000바이트는 상한 안이므로 서버가 읽어 버렸고, 다음 요청은 같은 연결을 재사용했다. 100,000바이트에서는 서버가 64KiB만 읽어 버리고 연결을 닫았다. 헤더는 이미 나간 뒤라 204 응답에 <code>Connection: close</code>를 실을 수 없었고, curl은 연결이 살아 있다고 보고 재사용하려다 "Connection reset by peer"를 받은 뒤 새 연결로 다시 시도했다. 서버가 소켓을 닫을 때 클라이언트가 보낸 본문의 나머지가 아직 남아 있거나 뒤이어 도착했으므로, 앞의 "읽지 않은 데이터를 남기고 닫으면"에서 본 RST가 여기서도 나온 것이다. RFC 9112 9.3.1절은 연결이 의도와 관계없이 언제든 닫힐 수 있으니 구현이 그런 비동기적 종료에서 회복할 준비를 해야 한다고 적는데, curl의 재시도가 그 예다. 이 실행 결과는 이 환경에서 얻은 것이고, RST가 오는 시점은 타이밍에 따라 달라질 수 있다. 같은 실험을 되풀이하면 curl이 재사용 전에 연결이 닫힌 것을 먼저 알아채고 RST 없이 곧바로 새 연결을 맺는 경우도 있었다.</p>
+<h4>쉬는 연결의 수명, 그리고 TIME_WAIT가 남는 쪽</h4>
+<p>쉬는 연결을 언제까지 들고 있을지도 서버가 정한다. <code>ServerConfig</code>의 기본값은 유휴 간격 30초(<code>sun.net.httpserver.idleInterval</code>, 초 단위), 그것을 검사하는 타이머 주기 10초(<code>sun.net.httpserver.clockTick</code>, 밀리초 단위), 쉬는 연결 최대 200개(<code>sun.net.httpserver.maxIdleConnections</code>)다. 쉬는 연결이 이미 200개면 새로 쉬게 된 연결은 IDLE로 표시하는 대신 바로 닫힌다. 타이머 작업 <code>IdleTimeoutTask</code>는 10초마다 돌면서 쉬기 시작한 시각에서 30초 이상 지난 연결을 닫는다. 따라서 마지막 응답 뒤 연결이 실제로 닫히는 시점은 30초에서 40초 사이의 어딘가다. 응답을 받은 뒤 아무것도 보내지 않고 기다리는 클라이언트로 재 보니 38.5초 뒤에 연결 끝(빈 읽기)을 받았다. 이 값은 타이머 주기와 어긋난 정도에 따라 실행마다 다르다.</p>
+<p>누가 먼저 닫느냐는 운영체제에도 흔적을 남긴다. 8회차에서 본 것처럼 TIME_WAIT는 먼저 닫은 쪽(active close)에 남는다. 두 서버에 요청 20번을 보낸 직후 <code>netstat -an -p tcp</code>로 TIME_WAIT 줄을 세었다. 이 Mac의 <code>net.inet.tcp.msl</code>은 15000(밀리초)이었고, 실험 사이에 32초를 기다리면 앞 실험의 TIME_WAIT 줄은 모두 사라져 있었다.</p>
+<div class="table-wrap"><table><thead><tr><th>실험</th><th>서버 쪽 TIME_WAIT (로컬 주소가 서버 포트)</th><th>클라이언트 쪽 TIME_WAIT</th></tr></thead><tbody>
+<tr><td>이 회차 서버, curl 20번 실행</td><td>20</td><td>0</td></tr>
+<tr><td>이 회차 서버, curl 한 번에 URL 20개</td><td>20</td><td>0</td></tr>
+<tr><td>JDK 서버, curl 20번 실행</td><td>0</td><td>20</td></tr>
+<tr><td>JDK 서버, curl 한 번에 URL 20개</td><td>0</td><td>1</td></tr>
+</tbody></table></div>
+<p>이 회차의 서버는 응답을 쓰자마자 먼저 닫으므로 TIME_WAIT가 서버 쪽에 요청 수만큼 쌓인다. curl이 연결을 재사용하려 해도 서버가 닫으니 URL 20개를 한 번에 보내도 결과가 같다. 다만 처음 같은 실험을 했을 때는 한 번 클라이언트가 먼저 닫아 19 대 1로 갈렸다. <code>Connection: close</code>를 본 curl도 응답을 다 읽으면 바로 닫기 때문에, 어느 쪽 FIN이 먼저 나가는지가 실행마다 바뀔 수 있다. JDK 서버는 응답 뒤 연결을 열어 두므로 닫는 쪽은 프로세스를 끝내는 curl이고, TIME_WAIT도 클라이언트 쪽에 남는다. URL 20개를 한 프로세스로 보내면 연결 자체가 하나뿐이라 TIME_WAIT도 하나다. 지속 연결은 handshake와 종료 비용을 아끼는 데서 그치지 않고, 연결 종료의 뒷정리를 어느 쪽 커널이 떠안는지도 바꾼다.</p>
+
+<h3>웹 애플리케이션 서버의 역사: 우리가 만든 것은 무엇의 축소판인가</h3>
+<p>웹 초기의 서버는 정적 파일 서버였다. 요청 대상의 경로를 디스크의 파일 경로로 바꾸고, 그 파일을 읽어 보내면 끝이었다. 같은 URL은 언제나 같은 내용을 돌려준다. 그런데 검색 결과나 게시판처럼 요청마다 내용이 달라지는 페이지가 필요해지자, 웹 서버가 요청을 받아 "프로그램"에게 넘기고 그 출력을 응답으로 보내는 방식이 나왔다. 그 약속이 CGI(Common Gateway Interface)다.</p>
+<p>CGI/1.1은 RFC 3875(2004년 10월, Informational)에 정리되어 있다. 웹 서버는 요청마다 외부 프로그램(스크립트)을 실행하고, 요청의 정보(메서드, 쿼리 문자열, 본문 길이 등의 메타 변수)를 환경 변수로, 요청 본문을 표준 입력으로 넘긴다. 스크립트는 헤더 필드, 빈 줄, 본문으로 이루어진 출력을 표준 출력에 쓰고, 웹 서버가 그것을 HTTP 응답으로 만들어 보낸다. 언어를 가리지 않는다는 것이 큰 장점이었다. 반면 요청마다 운영체제 프로세스를 새로 만들고 프로그램을 처음부터 적재해야 한다. 자바로 CGI 스크립트를 쓴다면 요청마다 JVM을 새로 띄우는 셈이고, 요청 사이에 메모리에 무언가를 유지할 수도 없다. 데이터베이스 연결도 요청마다 새로 맺어야 한다.</p>
+<p>서블릿(Servlet)은 이 비용을 정반대 구조로 없앴다. 서버 프로세스(JVM) 하나가 계속 떠 있고, 애플리케이션 코드는 그 안에 객체로 적재된 채 남는다. 요청이 오면 프로세스를 만드는 대신 스레드가 이미 적재된 객체의 메서드를 호출한다. 소켓을 받고, HTTP를 파싱하고, 스레드를 관리하고, 응답을 규칙대로 내보내는 일은 서블릿 컨테이너(servlet container)가 맡고, 애플리케이션 개발자는 <code>service(request, response)</code>에 해당하는 부분만 쓴다. 우리가 만든 서버의 프레임워크 부분이 바로 이 컨테이너의 축소판이다. <code>HttpServlet</code>의 <code>service()</code>는 요청의 메서드를 보고 <code>doGet</code>, <code>doPost</code> 같은 <code>do</code>메서드로 나눠 보내는데, 이것도 메서드를 키로 한 작은 분기다.</p>
+<div class="table-wrap"><table><thead><tr><th>이 회차의 서버</th><th>자카르타 서블릿</th><th>스프링 MVC</th></tr></thead><tbody>
+<tr><td><code>HttpServer</code> + <code>ConnectionTask</code> + 스레드 풀</td><td>서블릿 컨테이너(톰캣의 커넥터와 스레드 풀)</td><td>내장 톰캣(스프링 부트)</td></tr>
+<tr><td><code>HttpRequest</code> / <code>HttpResponse</code></td><td><code>HttpServletRequest</code> / <code>HttpServletResponse</code></td><td>같은 객체를 받거나, 그 위의 추상화(<code>@RequestParam</code> 등)</td></tr>
+<tr><td><code>RequestHandler.handle()</code></td><td><code>Servlet.service()</code>, <code>HttpServlet.doGet()</code> 등</td><td>컨트롤러의 핸들러 메서드</td></tr>
+<tr><td><code>Router</code>의 경로 맵</td><td>서블릿 매핑(URL 패턴 → 서블릿)</td><td><code>DispatcherServlet</code> + <code>HandlerMapping</code></td></tr>
+<tr><td><code>HttpException</code> → 상태 코드</td><td><code>sendError()</code>, 오류 페이지 설정</td><td><code>@ExceptionHandler</code>, <code>ResponseStatusException</code></td></tr>
+</tbody></table></div>
+<p>스프링 MVC는 이 구조 위에 한 층을 더 얹는다. 컨테이너에는 <code>DispatcherServlet</code>이라는 서블릿 하나만 등록하고, 모든 요청을 그 서블릿이 받는다. <code>DispatcherServlet</code>은 핸들러 매핑으로 요청을 처리할 컨트롤러 메서드를 찾아 호출한다. 이것이 프런트 컨트롤러(front controller) 구조이고, 우리 <code>Router</code>가 하는 일과 같은 모양이다. 차이는 핸들러를 등록하는 방법이다. 우리는 <code>router.add("/search", ...)</code>로 직접 등록했지만, 스프링은 <code>@GetMapping("/search")</code> 같은 애노테이션이 붙은 메서드를 찾아 자동으로 등록한다. 클래스의 메서드 목록을 실행 중에 읽고 그 위의 애노테이션을 해석하는 기술이 다음 두 회차의 주제인 리플렉션과 애노테이션이다.</p>
+<h4>javax에서 jakarta로, 배포 방식의 변화</h4>
+<p>서블릿 명세는 오랫동안 Java EE(이전 이름 J2EE)의 일부로 <code>javax.servlet</code> 패키지에서 발전했고, 이후 이클립스 재단으로 옮겨져 자카르타 EE(Jakarta EE)가 되었다. 자카르타 EE의 공식 릴리스 페이지에 따르면 Jakarta EE 8은 2019년 9월 10일에 나왔고 패키지 이름은 여전히 <code>javax</code>였다. 2020년 12월 8일에 나온 Jakarta EE 9에서 패키지 이름이 <code>jakarta.*</code>로 바뀌었다. 자카르타 서블릿 명세 페이지는 Servlet 5.0을 Jakarta EE 9용, 6.0을 Jakarta EE 10(2022년 9월 22일)용, 6.1을 Jakarta EE 11(2025년 6월 26일)용으로 소개한다. 톰캣의 버전 안내 페이지에 따르면 Servlet 6.0을 구현하는 것이 톰캣 10.1.x, 6.1을 구현하는 것이 톰캣 11.0.x다. 이 강좌의 기준인 스프링 부트 3.x가 <code>jakarta.servlet</code> 패키지를 쓰는 것은 이 변화 때문이다. 오래된 자료의 <code>javax.servlet.http.HttpServlet</code>과 지금의 <code>jakarta.servlet.http.HttpServlet</code>은 이름만 다른 같은 계보다.</p>
+<p>배포 방식도 바뀌었다. 전통적으로는 톰캣 같은 서버를 먼저 설치해 두고, 애플리케이션을 WAR 파일로 묶어 그 서버에 올렸다. 서버가 주인이고 애플리케이션은 손님이었다. 스프링 부트는 이를 뒤집어 톰캣을 라이브러리로 애플리케이션 안에 넣고, <code>main()</code>에서 서버를 띄운다. 우리 <code>App.main()</code>이 <code>new HttpServer(8080, router).start()</code>를 부르는 모양이 내장 서버 방식과 같다.</p>
+<p>참고로 JDK 자체에도 같은 구조의 HTTP 서버가 들어 있다. <code>jdk.httpserver</code> 모듈의 <code>com.sun.net.httpserver.HttpServer</code>와 <code>HttpHandler</code>는 자바 6부터 있었고, <code>createContext(path, handler)</code>로 경로에 핸들러를 등록하는 방식이 이 회차의 <code>Router.add()</code>와 같은 커맨드 구조다. JDK 18부터는 정적 파일을 내려 주는 <code>jwebserver</code> 명령도 있다(JEP 408). JDK 21의 <code>jwebserver --help</code>에 따르면 기본으로 루프백 주소 127.0.0.1의 8000번 포트에서 현재 디렉터리를 내려 준다.</p>
+<x-visual id="java-adv2-10-was-history" title="정적 파일 서버에서 내장 서블릿 컨테이너까지" kind="타임라인" ratio="16:9">
+<x-hint>정적 파일 서버, CGI, 서블릿 컨테이너, 내장 서버로 이어지는 구조 변화에서 요청을 처리하는 단위가 파일 → 프로세스 → 스레드로 바뀌는 것을 보여 준다.</x-hint>
+<x-prompt>Four panels left to right connected by arrows, each a small architecture sketch. Panel 1 "정적 파일 서버": a server box with an arrow to a disk icon labeled "파일". Panel 2 "CGI": a web server box spawning three separate process boxes, each labeled "요청마다 프로세스". Panel 3 "서블릿 컨테이너": one large JVM box containing a thread pool (four thread lines) and a single servlet object; label "요청마다 스레드". Panel 4 "내장 서버 (스프링 부트)": an application jar box containing a smaller Tomcat box inside it; label "애플리케이션 안의 서버". Under panel 3, a small tag "javax → jakarta (Jakarta EE 9, 2020)". Flat vector style, white background, Korean labels exactly as written.</x-prompt>
+<x-caption>요청을 처리하는 단위가 파일에서 프로세스로, 다시 이미 떠 있는 JVM 안의 스레드로 바뀌었고, 마지막에는 서버가 애플리케이션 안으로 들어왔다.</x-caption>
+</x-visual>
+<p>웹 서버와 WAS라는 구분도 이 역사에서 나왔다. 정적 파일을 빠르게 내려 주고 연결을 관리하는 데 특화된 서버(웹 서버)와, 애플리케이션 코드를 실행해 동적인 응답을 만드는 서버(WAS)를 나누고, 앞쪽 웹 서버가 동적 요청을 뒤쪽 WAS로 넘기는 구성이 흔하다. 경계는 엄격하지 않다. 톰캣도 정적 파일을 내려 줄 수 있고, 웹 서버도 모듈로 동적 처리를 할 수 있다. 중요한 것은 이름보다 "누가 소켓과 HTTP 파싱과 스레드를 맡고, 누가 기능 코드를 맡는가"라는 역할 분담이다.</p>
+
+<h3>흔한 오해와 함정</h3>
+<ul>
+<li><b>"<code>Content-Length</code>는 본문의 글자 수다."</b> 바이트 수다. UTF-8 한글은 한 글자가 3바이트이므로, 문자열 길이를 쓰면 응답이 잘린다. 반드시 바이트 배열로 바꾼 뒤 그 길이를 쓴다.</li>
+<li><b>"GET 요청에는 본문이 없으니 본문을 읽을 필요가 없다."</b> 본문의 유무는 메서드가 아니라 <code>Content-Length</code>와 <code>Transfer-Encoding</code>이 정한다. GET 본문에는 정의된 의미가 없을 뿐, 파서는 길이 규칙대로 소비하거나 거절해야 한다.</li>
+<li><b>"요청은 <code>BufferedReader</code>로 읽으면 된다."</b> 헤더까지는 동작하지만, 문자 단위 읽기로 바이트 길이의 본문을 읽으면 기다림이 끝나지 않거나 바이트가 <code>Reader</code> 안쪽 버퍼에 갇힌다. HTTP/1.1 파서는 바이트 단위로 쓴다.</li>
+<li><b>"<code>URLEncoder</code>는 URL 인코더다."</b> HTML 폼 인코더다. 공백을 <code>+</code>로 바꾸고 <code>~</code>를 인코딩한다. 경로를 만들거나 해석하는 데 쓰면 <code>+</code>와 공백이 뒤섞인다.</li>
+<li><b>"쿼리는 통째로 디코딩한 뒤 <code>&</code>로 자르면 된다."</b> 데이터 안의 <code>%26</code>이 구분자로 바뀌어 파라미터가 생기거나 사라진다. 자르고 나서 조각마다 한 번만 디코딩한다.</li>
+<li><b>"스레드 풀이 있으면 동시 요청 문제는 끝났다."</b> 풀은 동시에 처리할 개수를 정할 뿐이다. 넘치는 요청은 무한 큐에서 기다리고, 아무것도 보내지 않는 연결은 타임아웃이 없으면 스레드를 영원히 붙잡는다. 상한과 타임아웃이 함께 있어야 한다.</li>
+<li><b>"<code>try-with-resources</code>로 소켓을 감싸 두면 안전하다."</b> 소켓을 다른 스레드에 넘기는 순간, 넘긴 쪽의 <code>try</code>가 끝나며 소켓이 닫힌다. 자원을 닫는 책임은 자원을 마지막으로 쓰는 쪽이 진다.</li>
+</ul>
+
+<h3>정리와 다음 회차와의 연결</h3>
+<p>이 회차에서 만든 서버는 300줄 남짓이지만, 서블릿 컨테이너가 하는 일의 골격을 모두 갖추고 있다. 연결을 받아 스레드 풀에 넘기고, 바이트를 HTTP 메시지로 자르고, 퍼센트 인코딩을 풀어 파라미터를 만들고, 경로로 핸들러를 찾아 부르고, 응답의 길이를 세어 규칙대로 내보낸다. 각 단계에서 마주친 문제(바이트와 문자, 소켓의 소유권, 대기열과 타임아웃, 구분자와 데이터, 공유 객체와 스레드)는 실제 서버에서도 똑같이 나타나는 문제이고, 톰캣의 설정 항목과 서블릿 API의 규칙은 대부분 이 문제들에 대한 답이다.</p>
+<p>남은 불편은 등록 방식이다. 기능을 하나 만들 때마다 <code>App.main()</code>에 <code>router.add(...)</code>를 한 줄씩 추가해야 하고, 한 클래스에 관련된 기능 여러 개를 메서드로 모아 두어도 그 메서드들을 하나하나 람다로 감싸 등록해야 한다. "이 클래스의 메서드들을 실행 중에 찾아서, 메서드 이름이나 붙어 있는 표시를 보고 자동으로 경로에 연결할 수는 없을까?" 이것이 11회차(리플렉션)와 12회차(애노테이션)가 다루는 질문이다. 리플렉션은 <code>Class</code> 객체를 통해 메서드 목록을 읽고 호출하는 방법을, 애노테이션은 메서드에 경로 같은 메타데이터를 붙이고 실행 중에 읽어 내는 방법을 다룬다. 13회차에서는 그 두 도구로 이 서버의 등록 방식을 바꾸며, 스프링 MVC의 <code>@RequestMapping</code>이 어떤 원리로 동작하는지에 한 걸음 더 다가간다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>HTTP/1.1 메시지 구조</dt><dd>시작 줄, 헤더 필드 줄들, 빈 줄, 본문 순서의 바이트다. 줄은 CRLF로 끝나고(수신자는 LF만 와도 인정할 수 있다), 빈 줄이 헤더의 끝을 알린다.</dd>
+<dt>본문 길이 규칙</dt><dd>RFC 9112 6.3절의 순서대로 정한다. Transfer-Encoding이 Content-Length보다 우선하고, 둘 다 없는 요청은 본문이 0바이트, 길이 정보 없는 응답은 연결이 닫힐 때까지가 본문이다.</dd>
+<dt>Content-Length</dt><dd>본문의 바이트 수다. 문자열 길이를 쓰면 다국어 본문이 잘리고, 실제보다 크게 쓰면 상대가 오지 않을 바이트를 기다린다.</dd>
+<dt>메서드와 서버의 의무</dt><dd>범용 서버는 GET과 HEAD를 지원해야 한다. 모르는 메서드에는 501, 자원이 허용하지 않는 메서드에는 Allow 헤더를 담은 405로 응답한다. 안전·멱등 속성은 클라이언트의 재시도와 크롤링 행동을 결정하므로 서버가 지켜야 한다.</dd>
+<dt>스레드 풀과 대기</dt><dd>accept 루프와 처리를 분리하면 동시 요청을 처리할 수 있다. 요청은 커널 대기열, 작업 큐, 작업 스레드에서 기다릴 수 있고, 풀 크기·큐·타임아웃이 대기를 어디서 얼마나 허용할지 정한다.</dd>
+<dt>퍼센트 인코딩과 폼 인코딩</dt><dd>퍼센트 인코딩은 바이트를 %XX로 적어 구분자와 비ASCII를 데이터로 표시한다. 폼 인코딩(URLEncoder)은 공백을 +로 바꾸는 등 규칙이 다르다. 쿼리는 자른 뒤 조각마다 한 번만 디코딩한다.</dd>
+<dt>바이트 단위 파서</dt><dd>Reader는 바이트를 문자로 바꾸며 미리 읽기 때문에 바이트 길이의 본문과 섞어 쓸 수 없다. BufferedInputStream 위에서 줄과 본문을 바이트로 읽는다.</dd>
+<dt>커맨드 패턴</dt><dd>요청 처리를 공통 인터페이스(RequestHandler)를 구현한 객체로 만들어 경로 맵에 등록하고, 호출자는 내용을 모른 채 실행한다. 서블릿 매핑과 DispatcherServlet의 기본 구조다.</dd>
+<dt>chunked와 요청 밀반입</dt><dd>chunked는 덩어리마다 16진수 크기를 붙이고 크기 0인 덩어리로 끝을 알린다. Transfer-Encoding과 Content-Length가 함께 오면 파서마다 경계가 달라져 요청이 숨을 수 있으므로, 서버는 거절하거나 Transfer-Encoding으로만 처리하고 응답 뒤 연결을 닫아야 한다.</dd>
+<dt>서블릿 컨테이너</dt><dd>CGI의 요청당 프로세스 대신 떠 있는 JVM 안에서 스레드가 적재된 객체를 호출하는 구조다. 소켓, 파싱, 스레드, 응답 규칙은 컨테이너가, 기능은 애플리케이션이 맡는다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 "가끔 응답이 잘려요", "한글이 들어가면 요청이 멈춰요" 같은 증상을 만나면 가장 먼저 의심할 곳은 바이트와 문자의 경계다. 직접 소켓을 다루는 코드뿐 아니라, 필터에서 요청 본문을 문자열로 읽었다가 다시 쓰는 코드, 응답 본문을 가공하면서 <code>Content-Length</code>를 다시 계산하지 않는 코드에서도 같은 문제가 생긴다. 서블릿 컨테이너가 파싱을 대신해 주는 환경에서도, 본문을 한 번 읽으면 다시 읽을 수 없다는 것, 길이 헤더와 실제 바이트가 맞아야 한다는 것은 그대로 적용된다.</p>
+<p>스레드 풀 설정은 "많을수록 좋다"가 아니다. 요청 처리가 대부분 데이터베이스를 기다리는 일이라면, 처리 스레드를 늘려도 커넥션 풀이 그보다 작으면 스레드는 커넥션을 기다리는 줄만 길게 만든다. 반대로 외부 API 호출처럼 오래 기다리는 작업이 많으면 적은 스레드로는 금방 바닥난다. 대기열과 타임아웃도 함께 정해야 한다. 큐가 무한하면 장애 상황에서 요청이 쌓여 메모리와 응답 시간이 함께 나빠지고, 클라이언트가 이미 포기한 요청을 서버가 뒤늦게 처리하는 낭비가 생긴다. 상한을 넘는 요청은 빨리 거절하는 편이 전체를 살리는 경우가 많다.</p>
+<p>URL 인코딩 문제는 대개 보안 문제로 돌아온다. 쿼리를 통째로 디코딩한 뒤 자르거나, 프록시와 애플리케이션이 각각 한 번씩 디코딩하거나, 경로를 폼 규칙으로 디코딩하면 검사한 문자열과 실제로 쓰는 문자열이 달라진다. 직접 파싱하지 말고 검증된 라이브러리나 컨테이너의 API를 쓰되, 그 API가 어떤 규칙(폼 인코딩인지, RFC 3986인지)으로 동작하는지는 알고 써야 한다. 사용자 입력을 HTML이나 헤더에 넣을 때 이스케이프하고 CR/LF를 막는 것도 같은 맥락이다.</p>
+</x-review>
+
+<x-practice>
+<li>응답 본문이 <code>"<p>가나다</p>"</code>일 때 올바른 <code>Content-Length</code> 값을 계산하라. 실수로 <code>body.length()</code>를 썼다면 curl은 본문으로 몇 바이트를 받고, 화면에는 무엇이 보이는가?</li>
+<li>스레드 풀 크기가 3인 이 회차의 최종 서버에, 처리에 2초 걸리는 요청 7개가 동시에 도착했다. 각 요청이 끝나는 시각을 예측하고, 4번째 요청이 그동안 어디서 기다렸는지 설명하라.</li>
+<li>쿼리 문자열 <code>name=a%2Bb+c&tag=%26x</code>를 이 회차의 <code>parseParams()</code>로 해석한 결과를 쓰라. 같은 문자열을 <code>URI.create("/p?" + raw).getQuery()</code>로 먼저 디코딩한 뒤 <code>&</code>와 <code>=</code>로 자르면 결과가 어떻게 달라지는가?</li>
+<li>어떤 개발자가 핸들러 클래스에 <code>private String currentUser;</code> 필드를 두고, <code>handle()</code> 첫 줄에서 요청 헤더의 사용자 이름을 이 필드에 저장한 뒤 응답에 출력했다. 동시 요청에서 어떤 일이 생길 수 있는지 스레드 두 개의 실행 순서로 설명하라.</li>
+<li>클라이언트가 <code>Content-Length: 5000000</code>인 POST를 보내자 우리 서버가 413을 응답하고 소켓을 닫았다. 그런데 클라이언트 쪽 로그에는 413이 아니라 "connection reset"이 찍혔다. 무슨 일이 일어났는지 TCP 수준에서 설명하고, 서버 쪽 대책을 제시하라.</li>
+</x-practice>
+
+<x-answer>
+<p>1. <code>&lt;p&gt;</code> 3바이트, "가나다" 3글자 × 3바이트 = 9바이트, <code>&lt;/p&gt;</code> 4바이트를 더해 16바이트다. <code>body.length()</code>는 3 + 3 + 4 = 10이다. 이 값을 쓰면 curl은 앞의 10바이트, 즉 <code>&lt;p&gt;</code>(3바이트)와 "가"(3바이트), "나"(3바이트), 그리고 "다"의 첫 바이트 하나를 본문으로 받는다. 화면에는 <code>&lt;p&gt;가나</code> 뒤에 깨진 문자 하나가 보이고 <code>&lt;/p&gt;</code>는 사라진다. 남은 6바이트는 초과분으로 버려지거나, 연결을 재사용하는 클라이언트에서는 다음 응답의 시작으로 오인된다.</p>
+<p>2. 스레드가 3개이므로 요청 1~3은 0초에 시작해 2초에 끝나고, 4~6은 2초에 시작해 4초에 끝나며, 7은 4초에 시작해 6초에 끝난다(실제 시각은 약간의 오차가 있다). 4번째 요청의 연결은 메인 스레드가 즉시 <code>accept()</code>해서 <code>execute()</code>로 넘겼으므로 커널 대기열이 아니라 <code>newFixedThreadPool</code>의 작업 큐(무한 큐)에서 기다렸다. 그동안 요청 바이트는 커널 수신 버퍼에 들어 있고, 아무 스레드도 그것을 읽지 않는다. 작업 스레드가 <code>setSoTimeout</code>을 거는 것은 작업이 시작된 뒤이므로, 큐에서 기다린 시간은 타임아웃에 포함되지 않는다는 점도 짚어 둘 만하다.</p>
+<p>3. <code>parseParams()</code>는 먼저 <code>&</code>로 잘라 <code>name=a%2Bb+c</code>와 <code>tag=%26x</code>를 얻고, 각각 <code>=</code>로 자른 뒤 디코딩한다. <code>a%2Bb+c</code>는 폼 규칙으로 <code>a+b c</code>가 되고(<code>%2B</code>는 더하기, <code>+</code>는 공백), <code>%26x</code>는 <code>&x</code>가 된다. 결과는 <code>name</code> = "a+b c", <code>tag</code> = "&amp;x"다. <code>getQuery()</code>로 먼저 디코딩하면 <code>name=a+b+c&tag=&x</code>가 된다. <code>getQuery()</code>는 <code>+</code>를 공백으로 바꾸지 않으므로 원래 공백과 원래 더하기를 구별할 수 없게 되고, <code>%26</code>이 구분자 <code>&</code>로 바뀌어 <code>tag</code>는 빈 값, <code>x</code>라는 새 파라미터가 생긴다. 디코딩을 자르기보다 먼저 하면 데이터가 구조를 바꾼다.</p>
+<p>4. 핸들러 객체는 하나이고 필드도 하나다. 스레드 A가 <code>currentUser = "kim"</code>을 저장한 직후, 스레드 B가 같은 필드에 <code>"lee"</code>를 저장하고, 그다음 A가 응답에 <code>currentUser</code>를 출력하면 A의 사용자는 다른 사람의 이름("lee")을 보게 된다. 실행 순서는 스케줄러가 정하므로 가끔만 재현되고, 부하가 클수록 자주 일어난다. 요청마다 달라지는 값은 지역 변수나 매개변수로 다뤄야 한다. 서블릿과 스프링의 싱글톤 컨트롤러에 상태 필드를 두면 안 되는 이유와 같다.</p>
+<p>5. 서버는 본문 5,000,000바이트를 읽지 않은 채 413 응답을 쓰고 소켓을 닫았다. 클라이언트는 그동안에도 본문을 계속 보내고 있었고, 이미 닫힌 소켓으로 데이터가 도착하자 서버의 TCP 스택이 RST를 보냈다. RST를 받은 클라이언트 쪽 TCP는 연결을 즉시 끊으면서 아직 애플리케이션이 읽지 않은 수신 데이터(413 응답)를 버릴 수 있고, 클라이언트는 응답 대신 "connection reset"을 본다. RFC 9112 9.6절이 경고하는 상황이다. 대책은 오류 응답을 보낸 뒤 <code>socket.shutdownOutput()</code>으로 쓰기 방향만 닫고(FIN 전송), 제한 시간과 최대 바이트를 정해 남은 입력을 읽어 버린 뒤 소켓을 닫는 것이다. 클라이언트가 <code>Expect: 100-continue</code>를 쓰도록 해서 본문을 보내기 전에 거절할 기회를 갖는 방법도 있다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>HTTP/1.1 요청에 <code>Content-Length</code>와 <code>Transfer-Encoding</code>이 모두 없다. 서버는 이 요청의 본문 길이를 어떻게 판단해야 하는가?</q>
+<o>클라이언트가 연결을 닫을 때까지 읽은 바이트가 본문이다.</o>
+<o>메서드가 POST면 연결이 닫힐 때까지 읽고, GET이면 본문이 없다.</o>
+<o>메서드와 관계없이 본문은 0바이트다.</o>
+<o>헤더 뒤 빈 줄 다음에 오는 줄 하나가 본문이다.</o>
+<why>RFC 9112 6.3절에 따르면 길이 정보가 없는 요청 메시지의 본문 길이는 0이다. "연결이 닫힐 때까지"는 응답에만 허용되는 방식이다. 요청을 보낸 클라이언트가 연결을 닫으면 응답을 받을 수 없기 때문이다. 본문의 유무는 메서드가 아니라 길이 헤더가 정하며, 본문은 줄 단위 구조가 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>소켓에서 헤더를 <code>BufferedReader.readLine()</code>으로 읽은 뒤, 같은 소켓의 <code>InputStream</code>에서 <code>Content-Length</code>만큼 바이트를 읽으려 한다. 이 방식의 가장 근본적인 문제는?</q>
+<o><code>readLine()</code>이 CRLF를 인식하지 못해 헤더 끝을 찾지 못한다.</o>
+<o><code>Reader</code>가 변환 효율을 위해 바이트를 미리 읽어 두기 때문에, 본문 바이트 일부가 이미 <code>Reader</code> 내부 버퍼로 넘어가 <code>InputStream</code>에서 읽을 수 없을 수 있다.</o>
+<o><code>InputStream</code>은 한 번에 1바이트만 읽을 수 있어 본문을 읽는 데 시스템 콜이 너무 많이 든다.</o>
+<o>헤더를 UTF-8로 디코딩하면 <code>Content-Length</code> 값이 달라진다.</o>
+<why><code>InputStreamReader</code>의 Javadoc은 현재 읽기에 필요한 것보다 많은 바이트를 미리 읽을 수 있다고 적고, <code>BufferedReader</code>도 덩어리로 읽는다. 그래서 헤더 다음에 이어진 본문 바이트가 이미 Reader 쪽으로 빨려 들어갔을 수 있다. <code>readLine()</code>은 CRLF, LF, CR을 모두 줄 끝으로 인식하고, <code>Content-Length</code>는 ASCII 숫자라 디코딩과 무관하며, 시스템 콜 횟수는 버퍼링의 문제일 뿐 정확성의 문제가 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>다음 중 <code>URLEncoder.encode(s, UTF_8)</code>에 대한 설명으로 옳은 것은?</q>
+<o>RFC 3986의 퍼센트 인코딩을 따르므로 공백을 <code>%20</code>으로 바꾼다.</o>
+<o>RFC 3986의 비예약 문자(<code>~</code> 포함)는 모두 그대로 둔다.</o>
+<o>경로 세그먼트를 인코딩하는 데 쓰면 결과가 RFC 3986과 정확히 일치한다.</o>
+<o>HTML 폼 인코딩 도구로, 공백을 <code>+</code>로 바꾸고 원래의 <code>+</code>는 <code>%2B</code>로 바꾼다.</o>
+<why>Javadoc은 이 클래스를 <code>application/x-www-form-urlencoded</code> 형식으로 바꾸는 HTML 폼 인코딩 도구로 소개한다. 실험에서 공백은 <code>+</code>, <code>+</code>는 <code>%2B</code>, <code>~</code>는 <code>%7E</code>가 되었다. RFC 3986과 다르므로 경로 인코딩에 쓰면 공백과 <code>+</code>의 의미가 어긋난다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>accept 루프를 <code>try (Socket socket = serverSocket.accept()) { pool.execute(() -> handle(socket)); }</code>로 작성했다. 무엇이 문제인가?</q>
+<o><code>execute()</code>가 즉시 돌아오고 <code>try</code> 블록이 끝나면서 메인 스레드가 소켓을 닫으므로, 작업 스레드는 닫힌 소켓을 다루게 된다.</o>
+<o><code>execute()</code>는 작업이 끝날 때까지 메인 스레드를 막으므로 동시 처리가 되지 않는다.</o>
+<o>람다 안에서는 <code>try-with-resources</code>로 선언한 변수를 참조할 수 없어 컴파일되지 않는다.</o>
+<o>스레드 풀이 소켓을 자동으로 두 번 닫아 예외가 난다.</o>
+<why><code>execute()</code>는 작업을 맡기기만 하고 바로 돌아온다. <code>try</code>가 끝나며 소켓이 닫히므로 작업 스레드에서는 <code>SocketException: Socket is closed</code>가 나고 클라이언트는 빈 응답을 받는다(curl 종료 코드 52). 소켓은 사실상 final 변수라 람다에서 참조할 수 있고 컴파일은 된다. 닫는 책임을 작업 스레드로 옮겨야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>이 회차의 <code>Router</code>는 <code>HashMap</code>을 쓰는데, 여러 작업 스레드가 동시에 <code>dispatch()</code>로 읽어도 안전한 이유로 가장 정확한 것은?</q>
+<o><code>HashMap</code>의 <code>get()</code>은 내부적으로 동기화되어 있기 때문이다.</o>
+<o>작업 스레드가 10개뿐이라 경쟁이 일어날 확률이 낮기 때문이다.</o>
+<o>모든 등록이 서버 시작 전에 끝나 이후 수정이 없고, <code>Executor</code>에 작업을 제출하기 전의 동작이 작업 실행보다 먼저 일어난다(happens-before)는 보장이 있기 때문이다.</o>
+<o>람다로 만든 핸들러는 불변 객체이므로 맵도 불변이 되기 때문이다.</o>
+<why>읽기만 하는 맵은 안전하게 공개(publish)되었다면 여러 스레드가 읽어도 된다. <code>java.util.concurrent</code> 패키지 문서가 제출 전 동작과 작업 실행 사이의 happens-before를 보장하므로, 메인 스레드가 넣은 항목이 작업 스레드에서 보인다. <code>HashMap</code>은 동기화되어 있지 않고, 확률은 안전성의 근거가 될 수 없으며, 핸들러의 불변성은 맵 자체의 가시성과 무관하다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>요청 줄(request-line)</dt><dd>HTTP/1.1 요청의 첫 줄. 메서드, 요청 대상, HTTP 버전을 공백 하나로 구분하고 CRLF로 끝난다.</dd>
+<dt>CRLF</dt><dd>캐리지 리턴(0x0D)과 라인 피드(0x0A) 두 바이트. HTTP/1.1에서 시작 줄과 헤더 줄의 끝을 나타낸다.</dd>
+<dt>지속 연결(persistent connection)</dt><dd>응답 뒤에도 TCP 연결을 닫지 않고 다음 요청에 재사용하는 방식. HTTP/1.1의 기본값이며 <code>Connection: close</code>로 끝낼 수 있다.</dd>
+<dt>퍼센트 인코딩(percent-encoding)</dt><dd>URI에서 데이터 바이트를 <code>%</code>와 16진수 두 자리로 적는 방식. 구분자 문자나 비ASCII 문자를 데이터로 표시할 때 쓴다(RFC 3986 2.1절).</dd>
+<dt>폼 인코딩(application/x-www-form-urlencoded)</dt><dd>HTML 폼 데이터를 <code>이름=값&이름=값</code> 형태로 만드는 형식. 공백을 <code>+</code>로 바꾸는 점이 일반 퍼센트 인코딩과 다르다.</dd>
+<dt>커맨드 패턴(command pattern)</dt><dd>요청이나 작업을 공통 인터페이스를 구현한 객체로 캡슐화해, 실행하는 쪽이 구체적인 내용을 모른 채 실행할 수 있게 하는 디자인 패턴.</dd>
+<dt>서블릿 컨테이너(servlet container)</dt><dd>소켓 수신, HTTP 파싱, 스레드 관리, 응답 전송을 맡고 애플리케이션의 서블릿 객체를 호출하는 서버. 톰캣이 대표적이다.</dd>
+<dt>CGI(Common Gateway Interface)</dt><dd>웹 서버가 요청마다 외부 프로그램을 실행하고 메타 변수는 환경 변수로, 본문은 표준 입력으로 넘겨 표준 출력을 응답으로 받는 인터페이스(RFC 3875).</dd>
+<dt>청크 전송 코딩(chunked transfer coding)</dt><dd>본문을 덩어리로 나눠 덩어리마다 16진수 바이트 수를 앞에 붙이고, 크기 0인 덩어리와 선택적 트레일러로 끝을 알리는 HTTP/1.1 전송 코딩. 전체 길이를 미리 몰라도 메시지 경계를 지킬 수 있다(RFC 9112 7.1절).</dd>
+<dt>반쪽 닫기(half-close)</dt><dd>TCP 연결의 한 방향(보통 쓰기)만 닫는 것. 자바에서는 <code>Socket.shutdownOutput()</code>으로 하며, 응답 손실을 막는 단계적 연결 종료에 쓰인다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9112.html">RFC 9112 HTTP/1.1</a> — 요청 줄 문법, Host 요구, 줄 끝 규칙(2.2절), 본문 길이 결정 규칙(6.3절), 지속 연결과 단계적 종료(9.3, 9.6절)</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110.html">RFC 9110 HTTP Semantics</a> — 메서드의 안전·멱등·캐시 속성(9.2절), GET과 HEAD(9.3절), 405와 Allow, 501, 필드 이름과 값의 문자 규칙</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc3986.html">RFC 3986 URI Generic Syntax</a> — 퍼센트 인코딩, 예약·비예약 문자, 한 번만 인코딩·디코딩하라는 규칙(2절)</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc3875.html">RFC 3875 The Common Gateway Interface (CGI) Version 1.1</a> — 메타 변수, 표준 입력과 표준 출력을 통한 요청·응답 전달</li>
+<li><a href="https://tomcat.apache.org/tomcat-10.1-doc/config/http.html">Apache Tomcat 10.1 HTTP Connector</a> — maxThreads, maxConnections, acceptCount, connectionTimeout, maxKeepAliveRequests의 의미와 기본값</li>
+<li><a href="https://tomcat.apache.org/whichversion.html">Apache Tomcat Versions</a> — 서블릿 명세 버전과 톰캣 버전의 대응</li>
+</x-refs>

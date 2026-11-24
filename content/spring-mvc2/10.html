@@ -1,0 +1,727 @@
+<x-meta>
+deck: HTTP가 실어 온 문자열이 자바 객체가 되고 다시 화면의 문자열로 돌아가는 길을 Converter·ConversionService·Formatter의 내부 탐색 규칙, 지워진 제네릭, 요청 스레드의 로케일까지 내려가 추적한다.
+minutes: 105
+</x-meta>
+
+<x-goals>
+<li><code>Converter</code>를 구현해 등록하고, 등록하는 순간 스프링이 지워진 제네릭 타입 인자를 클래스 파일의 <code>Signature</code> 속성에서 읽어 낸다는 점과 람다 등록이 실패하는 이유를 바이트코드로 설명할 수 있다.</li>
+<li><code>GenericConversionService</code>가 (원본 타입, 대상 타입) 쌍으로 컨버터를 고르는 순서(클래스 계층 탐색, 나중 등록 우선, 대상 타입 정확 일치 규칙, 캐시)를 따라가 어떤 컨버터가 선택될지 예측할 수 있다.</li>
+<li><code>@RequestParam</code>·<code>@PathVariable</code>·<code>@ModelAttribute</code> 값이 <code>WebDataBinder</code>와 <code>TypeConverterDelegate</code>를 거쳐 컨버전 서비스에 닿는 호출 경로와, 변환 실패가 400 응답·500 응답·<code>typeMismatch</code> 필드 오류로 갈리는 분기를 설명할 수 있다.</li>
+<li><code>Formatter</code>가 <code>Converter</code>와 다른 점(문자열 양방향, 로케일)과 로케일이 요청 스레드의 <code>ThreadLocal</code>로 전달된다는 점을 설명하고, 로케일과 애노테이션에 따른 출력을 예측할 수 있다.</li>
+<li>타임리프의 <code>${{...}}</code>와 <code>th:field</code>가 어떤 경로로 같은 컨버전 서비스를 쓰는지, <code>@RequestBody</code> JSON은 왜 이 경로를 타지 않는지 구분할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>HTTP는 문자열만 실어 온다</h3>
+<p>HTTP 웹 기본 지식과 스프링 MVC 1편에서 본 것을 다시 떠올려 보자. 브라우저가 서버로 보내는 것은 TCP 연결 위를 흐르는 바이트이고, 서블릿 컨테이너는 그 바이트를 HTTP 메시지로 해석한다. 쿼리 스트링이든 <code>application/x-www-form-urlencoded</code> 본문이든 데이터는 <code>이름=값</code> 쌍의 텍스트이며, 퍼센트 인코딩을 풀고 나면 자바의 <code>String</code>이 된다. 그래서 <code>HttpServletRequest.getParameter()</code>의 반환 타입은 언제나 <code>String</code>이다. 사용자가 수량 칸에 10을 입력했어도 서버에 도착한 것은 숫자 10이 아니라 문자 '1'과 '0'의 나열이다. 회선 위에는 타입 정보가 없다.</p>
+<p>그런데 스프링 MVC 1편에서는 컨트롤러 파라미터에 <code>@RequestParam Integer quantity</code>라고 쓰기만 하면 정수가 들어왔다. 상품 폼을 <code>@ModelAttribute</code>로 받을 때도 <code>price</code> 필드는 <code>Integer</code>로 채워졌다. 누군가 중간에서 문자열을 정수로 바꾼 것이다. 이 회차의 질문은 그 "누군가"가 누구이고, 언제 호출되며, 어떤 규칙으로 변환기를 고르는가다. 반대 방향도 있다. 모델에 담긴 <code>Integer 10000</code>이나 <code>LocalDate</code>를 HTML로 그리려면 다시 문자열로 바꿔야 하고, 이때는 "10,000"이나 "25. 3. 1."처럼 사람이 읽는 형태, 그것도 사용자의 언어권에 맞는 형태가 필요하다.</p>
+<p>스프링 애플리케이션에서 이런 타입 변환이 일어나는 자리는 생각보다 많다. 요청 파라미터(<code>@RequestParam</code>), URL 경로 변수(<code>@PathVariable</code>), 폼 객체 바인딩(<code>@ModelAttribute</code>), 설정 값 주입(<code>@Value</code>), 그리고 뷰 렌더링이다. 정수나 불리언 같은 기본 타입은 스프링이 미리 준비한 변환기로 처리되지만, 애플리케이션이 직접 만든 타입은 사정이 다르다. 예를 들어 지도 서비스가 위치를 <code>37.5665,126.9780</code>(위도,경도) 같은 문자열로 주고받는다고 하자. 변환 장치가 없다면 컨트롤러마다 다음 코드를 반복해야 한다.</p>
+<pre><code class="language-java">@GetMapping("/places/near")
+public String near(HttpServletRequest request) {
+    String raw = request.getParameter("at");              // "37.5665,126.9780"
+    String[] parts = raw.split(",");
+    GeoPoint at = new GeoPoint(Double.parseDouble(parts[0]),
+                               Double.parseDouble(parts[1]));
+    // ... 형식이 틀렸을 때의 처리도 컨트롤러마다 따로 만들어야 한다
+    return "places";
+}</code></pre>
+<p>파싱 코드가 흩어지면 형식이 바뀔 때 모든 곳을 고쳐야 하고, 잘못된 입력을 어떤 응답으로 돌려줄지도 컨트롤러마다 달라진다. 원하는 모습은 <code>@RequestParam("at") GeoPoint at</code>이라고 선언만 하고, "문자열을 <code>GeoPoint</code>로 바꾸는 방법"은 한 곳에 한 번만 등록해 두는 것이다. 그 한 곳이 스프링의 타입 변환 시스템, 곧 <code>Converter</code>와 <code>ConversionService</code>이고, 문자열과 로케일을 다루도록 특화한 것이 <code>Formatter</code>다.</p>
+<h4>실험 환경</h4>
+<p>스프링 MVC와 타임리프를 함께 쓰려면 Spring Boot 프로젝트에 <code>spring-boot-starter-web</code>과 <code>spring-boot-starter-thymeleaf</code>를 넣으면 된다. 다만 이 회차의 주인공들은 웹 모듈에 있지 않다. <code>Converter</code>와 <code>ConversionService</code>는 <code>spring-core</code>의 <code>org.springframework.core.convert</code> 패키지에, <code>Formatter</code>와 <code>FormattingConversionService</code>는 <code>spring-context</code>의 <code>org.springframework.format</code> 패키지에 있다. 웹 바깥에서도 쓰이는 범용 장치라는 뜻이다. 그래서 이 회차의 예제 대부분은 서버 없이 <code>main()</code>으로 돌린다. 예제는 JDK 21(Temurin 21.0.13)과 Spring Framework 7.0.10의 <code>spring-core</code>·<code>spring-beans</code>·<code>spring-context</code> jar로 직접 실행한 결과이며, 본문이 근거로 삼은 내부 규칙은 기준 버전인 Spring Framework 6.1.x 소스에서도 같은지 확인했다. 7.x 소스에는 JSpecify의 <code>@Nullable</code>이 타입에 붙어 있지만 동작은 같다.</p>
+
+<x-visual id="spring-mvc2-10-conversion-roundtrip" title="요청 문자열이 객체가 되고 다시 화면 문자열이 되는 왕복" kind="흐름도" ratio="16:9">
+<x-hint>HTTP 요청의 문자열이 컨버전 서비스를 거쳐 자바 객체가 되고, 렌더링 때 다시 같은 서비스를 거쳐 문자열이 되는 왕복을 한 화면에 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 흐르는 가로 흐름도. 맨 왼쪽에 브라우저 아이콘과 말풍선 "at=37.5665,126.9780". 화살표가 가운데의 큰 둥근 사각형 "ConversionService"로 들어가고, 그 안에 작은 카드 세 장 "Converter", "Formatter", "기본 컨버터"가 겹쳐 있다. 위쪽 경로 화살표 라벨 "요청: 문자열 → 객체", 오른쪽 위 상자 "컨트롤러 파라미터 GeoPoint". 오른쪽 상자에서 아래로 내려온 화살표가 "모델"을 지나 다시 가운데 ConversionService로 돌아오고, 아래쪽 경로 화살표 라벨 "응답: 객체 → 문자열". 맨 왼쪽 아래에 HTML 문서 아이콘과 텍스트 "37.5665,126.978". 평면 일러스트, 흰 배경, 파란색과 주황색 두 가지 강조색.</x-prompt>
+<x-caption>같은 컨버전 서비스가 요청 쪽(문자열→객체)과 렌더링 쪽(객체→문자열)을 모두 맡는다.</x-caption>
+</x-visual>
+
+<h3>컨버전 서비스 이전: PropertyEditor와 그 한계</h3>
+<p>스프링이 처음부터 지금의 변환 시스템을 가졌던 것은 아니다. 초기 스프링은 자바빈즈(JavaBeans) 명세의 <code>java.beans.PropertyEditor</code>로 문자열을 객체로 바꿨다. 이 인터페이스는 원래 GUI 빌더의 속성 편집 창을 위해 만들어졌고, 핵심 메서드는 <code>setAsText(String)</code>, <code>getValue()</code>, <code>setValue(Object)</code>, <code>getAsText()</code>다. 변환 결과를 반환값으로 돌려주지 않고 편집기 객체 안에 저장해 두었다가 꺼내 가는 구조라는 점이 중요하다.</p>
+<pre><code class="language-java">import java.beans.PropertyEditorSupport;
+
+public class GeoPointEditor extends PropertyEditorSupport {
+
+    @Override
+    public void setAsText(String text) {
+        String[] parts = text.split(",");
+        setValue(new GeoPoint(Double.parseDouble(parts[0].trim()),
+                              Double.parseDouble(parts[1].trim())));
+    }
+}
+
+// 사용하는 쪽
+GeoPointEditor editor = new GeoPointEditor();
+editor.setAsText("37.5,127.0");          // ① 편집기의 내부 상태를 바꾼다
+GeoPoint p = (GeoPoint) editor.getValue(); // ② 그 상태를 읽는다</code></pre>
+<p>①과 ②가 두 번의 호출로 나뉘어 있고, 그 사이의 결과는 <code>PropertyEditorSupport</code> 안의 필드에 들어 있다. 상태를 가진(stateful) 객체이므로 여러 스레드가 하나의 편집기를 공유하면 결과가 섞인다. 서블릿 컨테이너는 요청마다 스레드 풀의 스레드 하나를 배정하므로, 싱글톤 편집기 하나를 모든 요청이 함께 쓰면 다음과 같은 일이 일어날 수 있다.</p>
+<pre class="diagram">요청 스레드 A                     공유된 GeoPointEditor.value        요청 스레드 B
+---------------------------------------------------------------------------------------
+setAsText("37.5,127.0")   ──▶   GeoPoint(37.5, 127.0)
+                                 GeoPoint(35.1, 129.0)   ◀──   setAsText("35.1,129.0")
+getValue()                ◀──   GeoPoint(35.1, 129.0)          (A가 B의 값을 받는다)
+                                                         ──▶   getValue()</pre>
+<p>그래서 스프링의 <code>BeanWrapper</code>와 <code>DataBinder</code>는 편집기를 공유하지 않고 인스턴스마다 따로 가진다. 기본 편집기 묶음도 <code>PropertyEditorRegistrySupport</code>의 인스턴스 필드에 처음 필요할 때 만들어 담는다. 스프링 MVC는 요청마다 바인더를 새로 만들기 때문에 결국 편집기도 요청마다 새로 생긴다. 안전하지만, 변환 로직이 상태를 가질 이유가 전혀 없는데도 객체를 계속 만들어야 하는 구조다. 게다가 <code>PropertyEditor</code>는 "문자열 ↔ 객체"만 다룬다. <code>Long</code>을 <code>Instant</code>로, 엔티티 ID를 엔티티로 바꾸는 것처럼 문자열이 끼지 않는 변환은 표현할 수 없다.</p>
+<p>Spring Framework 3.0에서 이 문제를 풀기 위해 <code>org.springframework.core.convert</code> 패키지가 들어왔다(<code>Converter</code>와 <code>ConversionService</code>의 Javadoc에 <code>@since 3.0</code>이 적혀 있다). 상태 없는 변환기를 한 번 만들어 모든 스레드가 공유하고, 임의의 타입 쌍을 다룬다. 다만 <code>PropertyEditor</code>가 사라진 것은 아니다. 스프링 공식 문서는 <code>ConversionService</code>가 등록되어 있지 않으면 원래의 <code>PropertyEditor</code> 기반 시스템이 쓰인다고 적고 있고, 뒤에서 보듯 컨트롤러의 <code>@InitBinder</code>로 등록한 사용자 정의 편집기는 지금도 컨버전 서비스보다 먼저 시도된다.</p>
+
+<h3>Converter: 한 방향, 한 쌍의 변환</h3>
+<p>새 시스템의 기본 단위는 <code>org.springframework.core.convert.converter.Converter</code>다. 널 관련 애노테이션을 빼고 보면 선언은 다음과 같다.</p>
+<pre><code class="language-java">@FunctionalInterface
+public interface Converter<S, T> {
+
+    T convert(S source);
+
+    // 5.3부터: 이 변환 결과를 다른 변환기로 이어 붙인다
+    default <U> Converter<S, U> andThen(Converter<? super T, ? extends U> after) {
+        // ...
+    }
+}</code></pre>
+<p>원본 타입 <code>S</code>를 받아 대상 타입 <code>T</code>를 돌려주는 메서드 하나가 전부다. <code>PropertyEditor</code>와 달리 결과를 반환값으로 돌려주므로, 구현이 필드를 쓰지만 않는다면 상태가 없다. 공식 문서는 구현이 스레드 안전(thread-safe)해야 하며, 원본 값이 잘못되었을 때는 <code>IllegalArgumentException</code>을 던지라고 요구한다. 또 하나의 약속이 있다. 원본이 <code>null</code>인 경우는 변환기까지 오지 않는다. 등록된 변환기를 감싸는 <code>ConverterAdapter</code>가 <code>source == null</code>이면 변환기를 부르지 않고 대상 타입이 <code>Optional</code>이면 <code>Optional.empty()</code>를, 아니면 <code>null</code>을 돌려준다. 그래서 <code>convert()</code> 안에서 널 검사를 할 필요가 없다.</p>
+<p>위치 타입과 두 방향의 변환기를 만들어 보자. 변환기는 한 방향만 다루므로 양방향이 필요하면 두 개를 만든다. 이름은 <code>원본To대상</code>으로 짓는 것이 스프링 내부 클래스들의 관례다.</p>
+<pre><code class="language-java">public record GeoPoint(double lat, double lng) {}</code></pre>
+<pre><code class="language-java">import org.springframework.core.convert.converter.Converter;
+
+public class StringToGeoPointConverter implements Converter<String, GeoPoint> {
+
+    @Override
+    public GeoPoint convert(String source) {
+        String[] parts = source.split(",");
+        if (parts.length != 2) {
+            throw new IllegalArgumentException("위도,경도 형식이 아니다: " + source);
+        }
+        double lat = Double.parseDouble(parts[0].trim());
+        double lng = Double.parseDouble(parts[1].trim());
+        return new GeoPoint(lat, lng);
+    }
+}</code></pre>
+<pre><code class="language-java">import org.springframework.core.convert.converter.Converter;
+
+public class GeoPointToStringConverter implements Converter<GeoPoint, String> {
+
+    @Override
+    public String convert(GeoPoint source) {
+        return source.lat() + "," + source.lng();
+    }
+}</code></pre>
+<p>두 변환기 모두 필드가 없다. 인스턴스 하나를 여러 요청 스레드가 동시에 호출해도 각 호출의 지역 변수(<code>parts</code>, <code>lat</code>, <code>lng</code>)는 호출한 스레드의 스택 프레임에 따로 생기므로 서로 간섭하지 않는다. <code>Double.parseDouble</code>이 형식이 틀린 문자열에 던지는 <code>NumberFormatException</code>은 <code>IllegalArgumentException</code>의 하위 클래스라서 계약도 지킨다. 한 가지 눈여겨볼 점은 문자열 왕복이 항등이 아니라는 것이다. "126.9780"을 <code>double</code>로 바꾼 뒤 다시 문자열로 만들면 <code>Double.toString</code> 규칙에 따라 "126.978"이 된다. 객체 → 문자열 → 객체는 같은 값을 돌려주지만 문자열 → 객체 → 문자열은 표기가 바뀔 수 있다. 폼에 다시 표시되는 값이 사용자가 입력한 글자와 다를 수 있다는 뜻이다.</p>
+<p>이 변환기를 직접 <code>new StringToGeoPointConverter().convert("...")</code>로 불러 쓸 수도 있지만, 그러면 처음의 파싱 코드를 클래스로 옮긴 것에 지나지 않는다. 변환기의 가치는 중앙의 등록소에 넣어 두고, 변환이 필요한 쪽은 "이 값을 이 타입으로 바꿔 달라"고만 요청하는 데서 나온다. 그런데 등록소가 변환기를 받아 색인하려면 이 변환기가 어떤 타입에서 어떤 타입으로 바꾸는지 알아야 한다. 자바의 제네릭은 컴파일 후에 지워진다고 배웠는데, 스프링은 이것을 어떻게 알아낼까?</p>
+
+<h3>한 층 아래: 지워진 제네릭을 스프링은 어떻게 읽는가</h3>
+<p>컨버전 서비스의 등록 메서드는 <code>addConverter(Converter<?, ?> converter)</code> 형태로, 변환기 객체 하나만 받는다. 실행 시점의 객체에는 타입 인자가 붙어 있지 않다. 자바의 제네릭은 소거(type erasure) 방식이라서 메서드 디스크립터에서 타입 변수는 상한 타입(여기서는 <code>Object</code>)으로 바뀐다. 컴파일된 <code>StringToGeoPointConverter</code>를 <code>javap -c -p</code>로 열어 보면 이 사실이 그대로 드러난다.</p>
+<pre data-label="javap -c -p StringToGeoPointConverter (발췌)"><code class="language-text">public class StringToGeoPointConverter implements org.springframework.core.convert.converter.Converter<java.lang.String, GeoPoint> {
+
+  public GeoPoint convert(java.lang.String);
+    Code:
+       0: aload_1
+       1: ldc           #7                  // String ,
+       3: invokevirtual #9                  // Method java/lang/String.split:(Ljava/lang/String;)[Ljava/lang/String;
+       ...
+
+  public java.lang.Object convert(java.lang.Object);
+    Code:
+       0: aload_0
+       1: aload_1
+       2: checkcast     #10                 // class java/lang/String
+       5: invokevirtual #39                 // Method convert:(Ljava/lang/String;)LGeoPoint;
+       8: areturn
+}</code></pre>
+<p>소스에는 없던 <code>convert(Object)</code> 메서드가 하나 더 있다. 이것이 컴파일러가 만든 브리지 메서드(bridge method)다. <code>javap -v</code>로 보면 접근 플래그가 <code>0x1041</code>, 곧 <code>ACC_PUBLIC</code>, <code>ACC_BRIDGE</code>, <code>ACC_SYNTHETIC</code>이다. JVMS 4장의 메서드 플래그 표는 <code>ACC_BRIDGE</code>(0x0040)를 컴파일러가 생성한 브리지 메서드라고 정의한다. 인터페이스 <code>Converter</code>의 <code>convert</code>는 소거 후 <code>(Ljava/lang/Object;)Ljava/lang/Object;</code>라는 디스크립터를 가지므로, 인터페이스를 통해 부르는 코드는 이 디스크립터로 호출한다. 실제로 <code>Converter<String, GeoPoint></code> 타입 변수로 <code>convert("1,2")</code>를 부르는 메서드를 컴파일하면 <code>invokeinterface ... Converter.convert:(Ljava/lang/Object;)Ljava/lang/Object;</code>가 나온다. JVM은 이 호출을 브리지 메서드로 연결하고, 브리지는 인자를 <code>checkcast</code>로 <code>String</code>으로 확인한 뒤 진짜 메서드를 <code>invokevirtual</code>로 부른다.</p>
+<p>이 구조 덕분에 컨버전 서비스는 모든 변환기를 <code>Converter<Object, Object></code>로 다룰 수 있다. 실제로 <code>GenericConversionService</code>의 <code>ConverterAdapter</code>는 등록된 변환기를 <code>Converter<Object, Object></code>로 형변환해 필드에 보관하고 <code>this.converter.convert(source)</code>로 부른다. 그 대가로 타입 검사는 실행 시점의 <code>checkcast</code>로 미뤄진다. 원시 타입(raw type)으로 정수를 넘기면 컴파일러는 경고만 하고 넘어가지만, 실행하면 브리지의 <code>checkcast</code>에서 다음 예외가 난다.</p>
+<pre data-label="실행 결과: 원시 타입 Converter에 Integer를 넘겼을 때"><code class="language-text">class java.lang.Integer cannot be cast to class java.lang.String (java.lang.Integer and java.lang.String are in module java.base of loader 'bootstrap')</code></pre>
+<p>그렇다면 타입 인자 <code><String, GeoPoint></code>는 어디에 남아 있을까? 소거는 메서드 디스크립터와 바이트코드에서 타입 인자를 지우지만, 클래스·필드·메서드 선언의 제네릭 정보는 클래스 파일의 <code>Signature</code> 속성(JVMS §4.7.9, 클래스 파일 버전 49.0, 곧 Java SE 5.0부터)에 따로 기록된다. <code>javap -v</code>의 마지막 부분에 다음 줄이 있다.</p>
+<pre data-label="javap -v StringToGeoPointConverter (발췌)"><code class="language-text">Signature: #55    // Ljava/lang/Object;Lorg/springframework/core/convert/converter/Converter<Ljava/lang/String;LGeoPoint;>;</code></pre>
+<p>"상위 클래스는 <code>Object</code>이고 <code>Converter<String, GeoPoint></code>를 구현한다"는 뜻이다. JVM은 실행할 때 이 속성을 쓰지 않지만 리플렉션은 읽을 수 있다. <code>Class.getGenericInterfaces()</code>가 이 속성을 해석해 <code>ParameterizedType</code>을 돌려준다. 스프링의 <code>ResolvableType</code>은 이 리플렉션 API 위에 만든 도구이고, <code>GenericConversionService.addConverter()</code>는 다음처럼 타입을 알아낸다.</p>
+<pre><code class="language-java">// GenericConversionService (Spring Framework 6.1.x / 7.0.x, 요지만 발췌)
+public void addConverter(Converter<?, ?> converter) {
+    ResolvableType[] typeInfo = getRequiredTypeInfo(converter.getClass(), Converter.class);
+    // ... 프록시라면 감싼 원래 클래스로 다시 시도
+    if (typeInfo == null) {
+        throw new IllegalArgumentException("Unable to determine source type <S> and target type <T> for your " +
+                "Converter [" + converter.getClass().getName() + "]; does the class parameterize those types?");
+    }
+    addConverter(new ConverterAdapter(converter, typeInfo[0], typeInfo[1]));
+}
+
+private ResolvableType[] getRequiredTypeInfo(Class<?> converterClass, Class<?> genericIfc) {
+    ResolvableType resolvableType = ResolvableType.forClass(converterClass).as(genericIfc);
+    ResolvableType[] generics = resolvableType.getGenerics();
+    // 타입 인자가 2개가 아니거나 Class로 확정되지 않으면 null
+    // ...
+}</code></pre>
+<p>이제 람다로 변환기를 등록하면 무슨 일이 생기는지 예측할 수 있다. 람다식 <code>s -> new GeoPoint(0, 0)</code>의 클래스는 컴파일 때 만들어지지 않는다. HotSpot(OpenJDK 21)에서는 실행 중에 <code>LambdaMetafactory</code>가 숨은 클래스(hidden class)를 만들어 내는데, 이 클래스에는 <code>Signature</code> 속성이 없다. 같은 람다의 클래스에 <code>getGenericInterfaces()</code>를 불러 보면 <code>[interface org.springframework.core.convert.converter.Converter]</code>처럼 타입 인자 없는 원시 인터페이스만 나오고, <code>isHidden()</code>은 <code>true</code>다. 변수 선언에 적은 <code>Converter<String, GeoPoint></code>는 컴파일러만 아는 정보다.</p>
+<pre><code class="language-java">import org.springframework.core.convert.converter.Converter;
+import org.springframework.core.convert.support.DefaultConversionService;
+
+public class RegistrationDemo {
+
+    static class LoudStringToNumber implements Converter<String, Number> {
+        @Override
+        public Number convert(String source) {
+            System.out.println("  (LoudStringToNumber 호출)");
+            return Long.valueOf(source);
+        }
+    }
+
+    public static void main(String[] args) {
+        DefaultConversionService cs = new DefaultConversionService();
+
+        Converter<String, GeoPoint> lambda = s -> new GeoPoint(0, 0);
+        try {
+            cs.addConverter(lambda);                                   // ①
+        } catch (IllegalArgumentException e) {
+            System.out.println(e.getMessage());
+        }
+
+        cs.addConverter(String.class, GeoPoint.class, lambda);         // ②
+        System.out.println(cs.convert("37.5,127.0", GeoPoint.class));
+
+        cs.addConverter(new StringToGeoPointConverter());              // ③ 같은 쌍에 하나 더
+        System.out.println(cs.convert("37.5,127.0", GeoPoint.class));
+
+        cs.addConverter(new LoudStringToNumber());                     // ④
+        System.out.println("Integer: " + cs.convert("7", Integer.class));
+        System.out.println("Number:  " + cs.convert("7", Number.class));
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">Unable to determine source type <S> and target type <T> for your Converter [RegistrationDemo$$Lambda/0x0000007801011f90]; does the class parameterize those types?
+GeoPoint[lat=0.0, lng=0.0]
+GeoPoint[lat=37.5, lng=127.0]
+Integer: 7
+  (LoudStringToNumber 호출)
+Number:  7</code></pre>
+<p>①은 위에서 본 예외 메시지로 실패한다. 괄호 안의 람다 클래스 이름 뒤 16진수는 숨은 클래스가 만들어질 때 붙는 값이라 실행마다 다르다. ②처럼 원본과 대상 타입을 <code>Class</code> 객체로 직접 알려 주는 오버로드를 쓰면 람다도 등록된다. 리플렉션으로 알아낼 수 없는 정보를 호출하는 쪽이 대신 넘겨주는 것이다. ③과 ④의 결과는 컨버전 서비스의 탐색 규칙을 보여 주는데, 이것은 두 절 뒤에서 내부 자료 구조와 함께 풀어 본다.</p>
+
+<h3>Converter만으로 부족할 때: ConverterFactory와 GenericConverter</h3>
+<p><code>Converter<S, T></code>는 정확히 한 쌍만 다룬다. 그런데 "문자열을 아무 열거형(enum)으로"나 "문자열을 아무 <code>Number</code> 하위 타입으로" 같은 변환을 대상 타입마다 하나씩 등록하는 것은 불가능하다. 열거형은 애플리케이션이 계속 새로 만들기 때문이다. 이런 계층 단위의 변환을 위해 <code>ConverterFactory<S, R></code>가 있다. 이 인터페이스의 메서드는 <code><T extends R> Converter<S, T> getConverter(Class<T> targetType)</code> 하나이며, 대상 타입을 받아 그 타입 전용 변환기를 만들어 준다. 공식 문서도 클래스 계층 전체의 변환 로직을 한곳에 모아야 할 때(예: <code>String</code>에서 <code>Enum</code>으로) 쓰라고 설명한다. 스프링의 <code>StringToEnumConverterFactory</code>와 <code>StringToNumberConverterFactory</code>가 대표적이다. 후자는 <code>(String, Number)</code> 쌍으로 한 번만 등록되지만 <code>Integer</code>, <code>Long</code>, <code>BigDecimal</code> 등 모든 숫자 타입을 처리한다.</p>
+<p><code>GenericConverter</code>는 가장 일반적인 형태다. <code>Set<ConvertiblePair> getConvertibleTypes()</code>로 다룰 수 있는 쌍을 여러 개 선언하고, <code>convert(Object source, TypeDescriptor sourceType, TypeDescriptor targetType)</code>로 변환한다. 핵심은 <code>TypeDescriptor</code>다. 이 객체는 <code>Class</code>만이 아니라 제네릭 타입 인자와 애노테이션까지 담는다. 예를 들어 <code>"1,2,3"</code>을 <code>List<Integer></code>로 바꾸는 <code>StringToCollectionConverter</code>는 대상 <code>TypeDescriptor</code>에서 원소 타입이 <code>Integer</code>라는 것을 읽고, 쉼표로 나눈 조각 하나하나를 다시 컨버전 서비스에 맡겨 정수로 바꾼다. 필드에 붙은 <code>@NumberFormat</code>을 보고 형식을 고르는 것도 <code>TypeDescriptor</code>가 애노테이션을 실어 나르기 때문에 가능하다. 공식 문서는 <code>GenericConverter</code>가 더 복잡한 SPI이므로 꼭 필요할 때만 쓰고 기본 변환에는 <code>Converter</code>나 <code>ConverterFactory</code>를 쓰라고 권한다.</p>
+<p><code>ConditionalGenericConverter</code>는 <code>GenericConverter</code>에 <code>matches(TypeDescriptor, TypeDescriptor)</code> 조건을 더한 것이다. 쌍이 맞더라도 조건이 거짓이면 다음 후보로 넘어간다. 흥미로운 예가 기본 등록되는 <code>ObjectToObjectConverter</code>다. Javadoc에 적힌 알고리즘은 이렇다. 원본 객체에 <code>to대상타입이름()</code> 메서드가 있으면 그것을 부르고, 없으면 대상 타입의 정적 <code>valueOf(원본)</code>·<code>of(원본)</code>·<code>from(원본)</code> 메서드를, 그것도 없으면 원본 하나를 받는 생성자를 리플렉션으로 호출한다. <code>matches()</code>는 그런 메서드나 생성자가 있는지를 검사한다.</p>
+<pre><code class="language-java">public record Celsius(double value) {
+    public static Celsius of(String text) {
+        return new Celsius(Double.parseDouble(text.replace("C", "")));
+    }
+}
+
+DefaultConversionService cs = new DefaultConversionService();
+System.out.println(cs.convert("36.5C", Celsius.class));   // Celsius[value=36.5]</code></pre>
+<p>변환기를 하나도 등록하지 않았는데 변환이 된다. 반면 <code>GeoPoint</code>에는 <code>String</code>을 받는 정적 팩터리 메서드도 생성자도 없으므로 <code>canConvert(String.class, GeoPoint.class)</code>가 <code>false</code>다. 이 관례는 편리하지만, 어떤 정적 메서드가 우연히 이름 규칙에 맞으면 의도하지 않은 변환 경로가 생긴다는 뜻이기도 하다. 네 가지 형태를 정리하면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>형태</th><th>다루는 범위</th><th>타입 정보</th><th>대표 예</th></tr></thead><tbody>
+<tr><td><code>Converter<S, T></code></td><td>정확히 한 쌍</td><td>클래스의 제네릭 선언에서 읽음</td><td><code>StringToBooleanConverter</code></td></tr>
+<tr><td><code>ConverterFactory<S, R></code></td><td>S → R의 모든 하위 타입</td><td>대상 <code>Class</code>를 받아 변환기 생성</td><td><code>StringToEnumConverterFactory</code></td></tr>
+<tr><td><code>GenericConverter</code></td><td>여러 쌍</td><td><code>TypeDescriptor</code>(제네릭, 애노테이션)</td><td><code>StringToCollectionConverter</code></td></tr>
+<tr><td><code>ConditionalGenericConverter</code></td><td>여러 쌍 + 조건</td><td><code>TypeDescriptor</code> + <code>matches()</code></td><td><code>ObjectToObjectConverter</code></td></tr>
+</tbody></table></div>
+
+<h3>ConversionService: 등록하는 쪽과 쓰는 쪽을 나눈다</h3>
+<p>변환기들을 모아 두고 "이 값을 저 타입으로"라는 요청을 처리하는 것이 <code>ConversionService</code>다. 이 인터페이스에는 <code>canConvert(...)</code>와 <code>convert(...)</code>만 있고, 변환기를 넣는 메서드는 없다. 등록은 별도의 <code>ConverterRegistry</code> 인터페이스(<code>addConverter</code>, <code>addConverterFactory</code>, <code>removeConvertible</code>)가 맡는다. 둘을 합친 것이 <code>ConfigurableConversionService</code>이고, 그 구현이 <code>GenericConversionService</code>, 여기에 기본 변환기를 미리 채운 것이 <code>DefaultConversionService</code>다. 계층을 그리면 다음과 같다.</p>
+<pre class="diagram">ConversionService (canConvert, convert)        ConverterRegistry (addConverter ...)
+            ▲                                              ▲
+            └──────────── ConfigurableConversionService ───┘
+                                   ▲
+                       GenericConversionService            FormatterRegistry (addFormatter ...)
+                         ▲                 ▲                        ▲
+         DefaultConversionService    FormattingConversionService ───┘
+                                           ▲
+                           DefaultFormattingConversionService
+                                           ▲
+                       WebConversionService (Spring Boot, 스프링 MVC용)</pre>
+<p>인터페이스를 이렇게 나눈 이유는 스프링 핵심 원리에서 본 인터페이스 분리 원칙(ISP)과 같다. 변환을 쓰는 쪽, 예를 들어 데이터 바인더나 타임리프는 <code>ConversionService</code>에만 의존하므로 실행 중에 변환기를 바꿔 끼울 수단 자체를 갖지 않는다. 변환기를 넣는 일은 설정 코드가 <code>ConverterRegistry</code>나 그 하위 인터페이스인 <code>FormatterRegistry</code>를 통해 애플리케이션 시작 시점에 한다. 공식 문서도 <code>ConversionService</code>를 애플리케이션 시작 때 만들어 여러 스레드가 공유하도록 설계된 상태 없는(stateless) 객체라고 설명하고, 보통 스프링 컨테이너(<code>ApplicationContext</code>)마다 하나를 둔다고 적는다.</p>
+<p>이제 실제로 써 보자. 앞에서 만든 두 변환기를 등록하고, 기본 변환기의 동작도 함께 확인한다.</p>
+<pre><code class="language-java">import org.springframework.core.convert.ConversionFailedException;
+import org.springframework.core.convert.support.DefaultConversionService;
+
+public class ConversionServiceDemo {
+    public static void main(String[] args) {
+        DefaultConversionService cs = new DefaultConversionService();
+
+        System.out.println(cs.convert("10", Integer.class));                // ①
+        System.out.println(cs.convert(" 42 ", Integer.class));              // ②
+        System.out.println(cs.convert("", Integer.class));                  // ③
+        System.out.println(cs.convert("on", Boolean.class));                // ④
+        System.out.println(cs.canConvert(String.class, GeoPoint.class));    // ⑤
+
+        cs.addConverter(new StringToGeoPointConverter());
+        cs.addConverter(new GeoPointToStringConverter());
+
+        GeoPoint seoul = cs.convert("37.5665, 126.9780", GeoPoint.class);  // ⑥
+        System.out.println(seoul);
+        System.out.println(cs.convert(seoul, String.class));                // ⑦
+
+        try {
+            cs.convert("1,000", Integer.class);                             // ⑧
+        } catch (ConversionFailedException e) {
+            System.out.println(e.getMessage());
+            System.out.println("cause = " + e.getCause());
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">10
+42
+null
+true
+false
+GeoPoint[lat=37.5665, lng=126.978]
+37.5665,126.978
+Failed to convert from type [java.lang.String] to type [java.lang.Integer] for value [1,000]
+cause = java.lang.NumberFormatException: For input string: "1,000"</code></pre>
+<p>한 줄씩 따라가 보자. ①은 <code>StringToNumberConverterFactory</code>가 만든 변환기가 처리한다. 이 변환기는 빈 문자열이면 <code>null</code>을 돌려주고, 아니면 <code>NumberUtils.parseNumber()</code>에 맡긴다. ②가 42가 되는 것은 <code>parseNumber()</code>가 파싱 전에 문자열의 모든 공백을 지우기 때문이고, ③이 <code>null</code>인 것은 앞의 빈 문자열 검사 때문이다. 폼에서 숫자 칸을 비워 보내면 <code>Integer</code> 필드에 <code>null</code>이 들어가는 이유가 여기에 있다. ④의 <code>StringToBooleanConverter</code>는 공백을 자르고 <code>Locale.ROOT</code>로 소문자화한 뒤 <code>true</code>·<code>on</code>·<code>yes</code>·<code>1</code>을 참으로, <code>false</code>·<code>off</code>·<code>no</code>·<code>0</code>을 거짓으로 읽는다. HTML 체크박스가 <code>value</code> 속성 없이 체크되면 <code>on</code>을 보내는데, 그 값이 <code>Boolean</code> 필드에 들어갈 수 있는 것이 이 목록 덕분이다. 공백을 자른 결과가 빈 문자열이면 <code>null</code>을 돌려주고, 그 밖의 문자열은 <code>IllegalArgumentException</code>이다.</p>
+<p>⑤는 사용자 정의 변환기를 등록하기 전이라 <code>false</code>이고, ⑥과 ⑦은 등록한 변환기가 동작한 결과다. ⑦에서 "126.978"이 나오는 것은 앞에서 말한 <code>Double.toString</code> 표기 때문이다. ⑧에서 정수 변환기는 쉼표를 모르므로 <code>Integer</code> 파싱 중에 <code>NumberFormatException</code>이 난다. 그런데 바깥으로 나온 예외는 <code>ConversionFailedException</code>이다. 컨버전 서비스는 변환기를 직접 부르지 않고 <code>ConversionUtils.invokeConverter()</code>를 거치는데, 이 메서드가 <code>ConversionFailedException</code>이 아닌 모든 <code>Throwable</code>을 잡아 원본 타입, 대상 타입, 원본 값을 담은 <code>ConversionFailedException</code>으로 감싼다. 변환기 작성자가 어떤 예외를 던지든 호출하는 쪽은 한 종류의 예외만 다루면 된다. 사람이 읽는 "1,000"을 받으려면 정수 변환기가 아니라 뒤에서 볼 포맷터가 필요하다.</p>
+<p>원본이 <code>null</code>인 경우도 짚어 두자. 대상이 참조 타입이면 결과는 <code>null</code>이다. 대상이 <code>int</code> 같은 기본 타입이면 <code>null</code>을 담을 수 없으므로 <code>GenericConversionService</code>가 "A null value cannot be assigned to a primitive type"을 원인으로 하는 <code>ConversionFailedException</code>을 던진다. 웹 요청에서 기본 타입 파라미터의 값이 아예 오지 않은 경우는 이보다 앞에서 인자 리졸버가 따로 검사하는데, 이것은 함정 절에서 다시 본다.</p>
+
+<h3>GenericConversionService 안에서 컨버터를 고르는 규칙</h3>
+<p>등록된 변환기는 <code>GenericConversionService</code> 내부의 <code>Converters</code> 객체에 들어간다. 자료 구조는 단순하다. (원본 클래스, 대상 클래스)를 묶은 <code>ConvertiblePair</code>를 키로, 그 쌍을 다루는 변환기 목록 <code>ConvertersForPair</code>를 값으로 하는 <code>ConcurrentHashMap</code>이 하나 있다. 그리고 <code>getConvertibleTypes()</code>가 <code>null</code>을 돌려주는 조건부 변환기들은 쌍과 무관하게 <code>globalConverters</code>라는 <code>CopyOnWriteArraySet</code>에 들어간다. <code>Converter</code>는 <code>ConverterAdapter</code>로, <code>ConverterFactory</code>는 <code>ConverterFactoryAdapter</code>로 감싸져 모두 <code>GenericConverter</code> 모양으로 저장된다.</p>
+<p><code>ConvertersForPair</code>의 목록은 <code>ConcurrentLinkedDeque</code>이고, 추가는 <code>addFirst()</code>로 한다. 같은 쌍에 변환기가 여럿이면 <b>나중에 등록한 것이 앞에 선다</b>. 앞의 <code>RegistrationDemo</code>에서 ②의 람다 뒤에 ③의 <code>StringToGeoPointConverter</code>를 같은 <code>(String, GeoPoint)</code> 쌍으로 등록하자 결과가 <code>GeoPoint[lat=0.0, lng=0.0]</code>에서 <code>GeoPoint[lat=37.5, lng=127.0]</code>로 바뀐 것이 이 규칙이다. 이 규칙은 사용자 정의 변환기가 기본 변환기를 덮어쓸 수 있는 근거이기도 하다. 기본 변환기는 컨버전 서비스의 생성자에서 먼저 등록되고, 애플리케이션의 변환기는 그 뒤에 등록되기 때문이다.</p>
+<p>변환 요청이 오면 <code>getConverter(sourceType, targetType)</code>가 다음 순서로 움직인다.</p>
+<figure class="flow-figure"><figcaption>getConverter()가 변환기를 찾는 순서</figcaption><ol class="flow">
+<li><strong>캐시 확인</strong><span>(원본 <code>TypeDescriptor</code>, 대상 <code>TypeDescriptor</code>)를 키로 하는 <code>ConcurrentReferenceHashMap</code>을 본다. 이전에 "없음"으로 판명된 조합은 <code>NO_MATCH</code> 표식으로 저장되어 있어 바로 <code>null</code>이 된다.</span></li>
+<li><strong>클래스 계층 목록 만들기</strong><span>원본 타입과 대상 타입 각각에 대해 자기 자신, 상위 클래스, 구현 인터페이스, 마지막으로 <code>Object</code>를 넣은 목록을 만든다. 기본 타입은 래퍼 타입으로 바꿔 시작한다.</span></li>
+<li><strong>이중 반복 탐색</strong><span>바깥 반복은 원본 계층, 안쪽 반복은 대상 계층이다. 각 (원본 후보, 대상 후보) 쌍의 <code>ConvertersForPair</code>를 앞에서부터 보며, 조건부 변환기는 <code>matches()</code>가 참일 때만 고른다. 쌍에 맞는 것이 없으면 전역 조건부 변환기를 시험한다.</span></li>
+<li><strong>기본 판단</strong><span>아무것도 없을 때 원본 타입이 대상 타입에 대입 가능하면 아무 일도 하지 않는 <code>NO_OP</code> 변환기를 쓴다.</span></li>
+<li><strong>결과 캐시</strong><span>찾은 변환기나 <code>NO_MATCH</code>를 캐시에 넣는다. 변환기를 새로 등록하거나 제거하면 캐시 전체를 비운다.</span></li>
+</ol></figure>
+<p>클래스 계층 목록이 실제로 어떻게 생기는지 보자. 이 목록을 만드는 <code>getClassHierarchy()</code>는 private 메서드라서 리플렉션으로 불러 출력했다.</p>
+<pre data-label="실행 결과: getClassHierarchy() (JDK 21)"><code class="language-text">Integer -> [Integer, Number, Comparable, Constable, ConstantDesc, Serializable, Object]
+String -> [String, Serializable, Comparable, CharSequence, Constable, ConstantDesc, Object]
+int -> [Integer, Number, Comparable, Constable, ConstantDesc, Serializable, Object]</code></pre>
+<p>상위 클래스는 현재 후보 바로 뒤에 끼워 넣고 인터페이스는 목록 끝에 붙이기 때문에, <code>Integer</code>의 상위 클래스 <code>Number</code>가 <code>Integer</code>의 인터페이스들보다 앞에 오고 <code>Number</code>가 구현하는 <code>Serializable</code>은 그 뒤에 온다. 인터페이스 순서는 JDK 소스의 <code>implements</code> 선언 순서를 따른다. <code>"7"</code>을 <code>Integer</code>로 바꾸는 요청이라면 탐색은 <code>(String, Integer)</code>, <code>(String, Number)</code>, <code>(String, Comparable)</code> … <code>(String, Object)</code>를 먼저 모두 보고, 그다음에야 <code>(Serializable, Integer)</code>로 넘어간다. 원본 타입의 구체성이 대상 타입의 구체성보다 우선한다.</p>
+<pre class="diagram">"7" → Integer 요청                    대상 후보 →
+                     Integer      Number                     Comparable ... Object
+원본  String         (비어 있음)   [① LoudStringToNumber,      ...
+후보                               ② StringToNumberFactory]
+ ↓    Serializable   ...
+      ...
+      Object         ...                                                    [ObjectToObject ...]
+
+(String, Number) 칸: ①은 ConverterAdapter라서 "대상 정확 일치" 검사에서 탈락
+                     ②는 ConverterFactoryAdapter라서 통과 → Integer 변환기 생성</pre>
+<p>이 그림이 <code>RegistrationDemo</code> ④의 수수께끼를 푼다. <code>LoudStringToNumber</code>는 <code>(String, Number)</code> 쌍으로 등록되어 그 칸의 맨 앞에 있다. 그런데 <code>Integer</code> 요청에서 호출되지 않았다. <code>ConverterAdapter.matches()</code>의 첫 줄이 <code>this.typeInfo.getTargetType() != targetType.getObjectType()</code>이면 <code>false</code>를 돌려주기 때문이다. <code>Converter<S, T></code>는 <b>대상 타입이 정확히 T일 때만</b> 쓰인다. 대상이 <code>Number</code>인 요청에서는 정확히 일치하므로 호출되었다. 반면 <code>ConverterFactoryAdapter</code>에는 이 검사가 없어서 같은 칸의 <code>StringToNumberConverterFactory</code>가 선택되고, 결과는 7이다. "<code>Converter<String, Number></code>를 만들면 모든 숫자 타입에 적용되겠지"라는 기대는 틀린다. 계층 전체를 맡기려면 <code>ConverterFactory</code>를 써야 한다. 뒤에서 볼 포맷터는 또 다르게 동작하니 함께 기억해 두자.</p>
+<p>마지막으로 동시성이다. 변환 요청은 요청 스레드 수십 개에서 동시에 들어온다. 맵은 <code>ConcurrentHashMap</code>, 쌍별 목록은 <code>ConcurrentLinkedDeque</code>, 전역 목록은 <code>CopyOnWriteArraySet</code>, 캐시는 <code>ConcurrentReferenceHashMap</code>이라서 조회가 서로를 막지 않는다. 등록은 캐시를 통째로 비우므로 실행 중에 자주 하면 모든 조회가 다시 탐색을 해야 한다. 등록은 시작할 때 끝내고 이후에는 읽기만 한다는 설계 의도가 자료 구조에서도 드러난다.</p>
+
+<x-visual id="spring-mvc2-10-converter-lookup" title="원본 계층과 대상 계층을 교차해 변환기를 찾는 격자" kind="표 형태 다이어그램" ratio="4:3">
+<x-hint>원본 타입 계층(세로)과 대상 타입 계층(가로)이 만드는 격자를 위에서 아래, 왼쪽에서 오른쪽으로 훑으며 첫 번째로 맞는 변환기를 고르는 과정을 보여 준다.</x-hint>
+<x-prompt>격자 표 그림. 세로 축 제목 "원본 계층", 행 라벨 위에서부터 "String", "Serializable", "Object". 가로 축 제목 "대상 계층", 열 라벨 왼쪽부터 "Integer", "Number", "Object". 첫 행 첫 칸은 비어 있는 회색 칸. 첫 행 둘째 칸에 카드 두 장이 세로로 쌓여 있다: 위 카드 "Converter<String,Number>"에 빨간 X 표시와 작은 말풍선 "대상 정확 일치 아님", 아래 카드 "ConverterFactory"에 초록 체크 표시. 첫 행 왼쪽에서 오른쪽으로 점선 화살표가 지나가며 둘째 칸에서 멈춘다. 위쪽에 작은 라벨 "나중 등록이 앞에". 오른쪽 아래 구석에 작은 상자 "캐시". 평면 스타일, 흰 배경.</x-prompt>
+<x-caption>원본 계층을 바깥 반복으로, 대상 계층을 안쪽 반복으로 훑는다. 같은 칸에서는 나중에 등록한 변환기가 먼저 검사된다.</x-caption>
+</x-visual>
+
+<h3>스프링 MVC에 컨버터 적용하기</h3>
+<p>이제 웹으로 돌아오자. 스프링 MVC에 변환기를 등록하는 공식 통로는 <code>WebMvcConfigurer</code>의 <code>addFormatters(FormatterRegistry registry)</code>다. 이름에 포맷터가 들어 있지만 <code>FormatterRegistry</code>는 <code>ConverterRegistry</code>를 상속하므로 변환기도 여기서 넣는다.</p>
+<pre><code class="language-java">@Configuration
+public class WebConfig implements WebMvcConfigurer {
+
+    @Override
+    public void addFormatters(FormatterRegistry registry) {
+        registry.addConverter(new StringToGeoPointConverter());
+        registry.addConverter(new GeoPointToStringConverter());
+    }
+}</code></pre>
+<pre><code class="language-java">@RestController
+public class PlaceController {
+
+    @GetMapping("/places/near")
+    public String near(@RequestParam("at") GeoPoint at,
+                       @RequestParam(value = "radius", defaultValue = "500") int radius) {
+        return at + " 반경 " + radius + "m";
+    }
+
+    @GetMapping("/places/{point}")
+    public String detail(@PathVariable("point") GeoPoint point) {
+        return point.toString();
+    }
+}</code></pre>
+<p><code>GET /places/near?at=37.5665,126.9780</code>을 보내면 응답 본문은 <code>GeoPoint[lat=37.5665, lng=126.978] 반경 500m</code>다. <code>radius</code>는 보내지 않았으므로 기본값 문자열 "500"이 기본 변환기를 거쳐 <code>int</code>가 되었다. Spring Boot를 쓴다면 설정 클래스 없이 변환기를 빈으로 등록하기만 해도 된다. Spring Boot 레퍼런스는 스프링 MVC 자동 구성 기능으로 <code>Converter</code>, <code>GenericConverter</code>, <code>Formatter</code> 빈의 자동 등록을 명시한다. 내부적으로는 Boot의 <code>WebMvcAutoConfigurationAdapter.addFormatters()</code>가 <code>ApplicationConversionService.addBeans(registry, beanFactory)</code>를 불러 빈 팩토리에서 이런 타입의 빈을 찾아 등록한다.</p>
+<p>그 <code>registry</code>는 어디서 왔을까? 스프링 MVC 설정의 뼈대인 <code>WebMvcConfigurationSupport</code>에는 <code>mvcConversionService</code>라는 빈 메서드가 있고, 기본 구현은 <code>DefaultFormattingConversionService</code>를 만든 뒤 <code>addFormatters(conversionService)</code>를 부른다. <code>@EnableWebMvc</code>가 쓰는 <code>DelegatingWebMvcConfiguration</code>은 이 <code>addFormatters</code>를 등록된 모든 <code>WebMvcConfigurer</code>에 위임한다. Spring Boot는 이 빈 메서드를 덮어써서 <code>WebConversionService</code>(<code>DefaultFormattingConversionService</code>의 하위 클래스)를 만들고, 날짜 형식 설정을 반영한 기본 포맷터를 생성자에서 등록한 뒤 <code>addFormatters</code>를 부른다. 어느 쪽이든 기본 변환기가 먼저, 사용자 변환기가 나중에 들어가므로 앞 절의 <code>addFirst</code> 규칙에 따라 같은 쌍에서는 사용자 변환기가 이긴다.</p>
+<h4>요청 하나가 변환기에 닿기까지</h4>
+<p>컨트롤러 메서드의 파라미터 값은 핸들러 어댑터가 호출 직전에 파라미터마다 맞는 <code>HandlerMethodArgumentResolver</code>를 골라 만든다(스프링 MVC 1편에서 본 구조다). <code>@RequestParam</code>을 처리하는 <code>RequestParamMethodArgumentResolver</code>와 <code>@PathVariable</code>을 처리하는 <code>PathVariableMethodArgumentResolver</code>는 모두 <code>AbstractNamedValueMethodArgumentResolver</code>를 상속하고, 변환은 이 부모 클래스의 <code>convertIfNecessary()</code>에서 일어난다.</p>
+<figure class="flow-figure"><figcaption>@RequestParam("at") GeoPoint의 변환 경로</figcaption><ol class="flow">
+<li><strong>값 꺼내기</strong><span>리졸버가 <code>request.getParameterValues("at")</code>에서 문자열 "37.5665,126.9780"을 얻는다. 값이 없으면 <code>defaultValue</code>를 쓴다.</span></li>
+<li><strong>바인더 만들기</strong><span><code>binderFactory.createBinder(webRequest, null, "at")</code>가 <code>ServletRequestDataBinderFactory</code>를 통해 <code>WebDataBinder</code>를 새로 만든다. 이때 <code>ConfigurableWebBindingInitializer.initBinder()</code>가 <code>binder.setConversionService(mvcConversionService)</code>를 하고, 컨트롤러의 <code>@InitBinder</code> 메서드가 실행된다.</span></li>
+<li><strong>변환 위임</strong><span><code>binder.convertIfNecessary(arg, GeoPoint.class, parameter)</code>가 <code>TypeConverterDelegate</code>로 내려간다.</span></li>
+<li><strong>편집기 먼저, 그다음 컨버전 서비스</strong><span>이 타입에 사용자 정의 <code>PropertyEditor</code>가 있으면 그것을 쓴다. 없고 컨버전 서비스가 <code>canConvert()</code>를 참으로 답하면 <code>convert()</code>를 부른다. 그것도 안 되면 기본 <code>PropertyEditor</code>를 시도한다.</span></li>
+<li><strong>변환기 실행</strong><span>컨버전 서비스가 앞 절의 탐색으로 <code>ConverterAdapter</code>를 찾고, 어댑터가 브리지 메서드를 거쳐 <code>StringToGeoPointConverter.convert()</code>를 부른다.</span></li>
+</ol></figure>
+<p>바인더는 요청마다, 그것도 변환이 필요한 파라미터마다 새로 만들어진다. 반면 그 안에 꽂히는 컨버전 서비스는 애플리케이션 전체에 하나뿐인 싱글톤이다. 상태를 가질 수 있는 바인더(바인딩 결과, 사용자 정의 편집기)는 요청 범위로 짧게 살고, 상태 없는 변환 로직은 길게 살며 공유된다. 앞에서 본 <code>PropertyEditor</code>의 동시성 문제를 이 분리가 해결한다. 같은 이유로 <code>@InitBinder</code>에서 <code>binder.registerCustomEditor(...)</code>로 편집기를 등록하는 것은 지금도 안전하다. 그 편집기는 그 요청의 그 바인더만 쓴다. 그리고 4단계의 순서 때문에, 어떤 타입에 사용자 정의 편집기와 변환기가 함께 있으면 편집기가 이긴다.</p>
+<h4>변환이 실패하면</h4>
+<p><code>GET /places/near?at=abc</code>를 보내 보자. 변환기가 <code>IllegalArgumentException</code>을 던지고, 컨버전 서비스가 이것을 <code>ConversionFailedException</code>으로 감싼다. <code>TypeConverterDelegate</code>는 이 예외를 잠시 보관하고 기본 편집기로 한 번 더 시도하는데, <code>GeoPoint</code>용 편집기는 없으므로 보관한 예외를 다시 던진다. 바인더의 상위 클래스 <code>TypeConverterSupport</code>는 <code>ConversionException</code>과 <code>IllegalArgumentException</code>을 <code>TypeMismatchException</code>으로, <code>ConverterNotFoundException</code>과 <code>IllegalStateException</code>을 <code>ConversionNotSupportedException</code>으로 바꾼다. 리졸버는 이것을 다시 <code>MethodArgumentTypeMismatchException</code>이나 <code>MethodArgumentConversionNotSupportedException</code>으로 감싸 던진다. 어떤 HTTP 상태 코드가 나가는지는 8·9회의 예외 처리 주제에서 등장하는 스프링 기본 예외 처리기 <code>DefaultHandlerExceptionResolver</code>가 정한다.</p>
+<div class="table-wrap"><table><thead><tr><th>상황</th><th>리졸버가 던지는 예외</th><th>DefaultHandlerExceptionResolver의 응답</th></tr></thead><tbody>
+<tr><td>변환기가 있는데 값이 잘못됨 (<code>at=abc</code>)</td><td><code>MethodArgumentTypeMismatchException</code> (<code>TypeMismatchException</code>의 하위 클래스)</td><td>400 Bad Request</td></tr>
+<tr><td>변환기 자체가 없음 (등록을 잊음)</td><td><code>MethodArgumentConversionNotSupportedException</code> (<code>ConversionNotSupportedException</code>의 하위 클래스)</td><td>500 Internal Server Error</td></tr>
+</tbody></table></div>
+<p>두 경우가 다른 상태 코드를 받는 데는 이유가 있다. 앞의 것은 클라이언트가 형식에 맞지 않는 값을 보낸 것이고, 뒤의 것은 서버가 그 타입을 다룰 준비를 하지 않은 프로그래밍 오류다. 변환기 등록을 잊으면 사용자는 400이 아니라 500을 받는다. 한 가지 주의할 것은 <code>ConversionNotSupportedException</code>이 <code>TypeMismatchException</code>을 상속한다는 점이다. 그래서 <code>DefaultHandlerExceptionResolver</code>는 <code>ConversionNotSupportedException</code>을 먼저 검사한다. 예외 처리기를 직접 만들 때 <code>TypeMismatchException</code>만 잡으면 두 경우를 구분하지 못한다.</p>
+<p><code>@ModelAttribute</code> 폼 객체는 경로가 조금 다르다. <code>ModelAttributeMethodProcessor</code>가 바인더를 만들고 <code>bind()</code>를 부르면, 바인더는 대상 객체를 감싼 <code>BeanWrapper</code>로 요청 파라미터를 프로퍼티마다 설정한다. 프로퍼티 값 변환은 같은 <code>TypeConverterDelegate</code>가 하므로 컨버전 서비스도 같다. 다른 것은 실패 처리다. 예외를 던지는 대신 실패를 <code>BindingResult</code>에 <code>FieldError</code>로 기록한다. 4회에서 본 바로 그 동작을 서버 없이 <code>DataBinder</code>로 재현해 보자.</p>
+<pre><code class="language-java">public class Shop {
+    private GeoPoint location;
+    private int visitors;
+    // getter, setter ...
+}
+
+DefaultConversionService cs = new DefaultConversionService();
+cs.addConverter(new StringToGeoPointConverter());
+
+Shop shop = new Shop();
+DataBinder binder = new DataBinder(shop, "shop");
+binder.setConversionService(cs);
+
+MutablePropertyValues values = new MutablePropertyValues();
+values.add("location", "37.5665,126.9780");
+values.add("visitors", "many");
+binder.bind(values);
+
+System.out.println(shop.getLocation() + " / " + shop.getVisitors());
+for (FieldError e : binder.getBindingResult().getFieldErrors()) {
+    System.out.println(e.getField() + " rejected=" + e.getRejectedValue()
+            + " bindingFailure=" + e.isBindingFailure());
+    System.out.println(String.join(", ", e.getCodes()));
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">GeoPoint[lat=37.5665, lng=126.978] / 0
+visitors rejected=many bindingFailure=true
+typeMismatch.shop.visitors, typeMismatch.visitors, typeMismatch.int, typeMismatch</code></pre>
+<p><code>location</code>은 사용자 정의 변환기로 채워졌고, <code>visitors</code>는 변환에 실패해 기본값 0으로 남았다. 실패는 오류 코드 <code>typeMismatch</code>(<code>TypeMismatchException.ERROR_CODE</code>)를 가진 필드 오류가 되고, <code>MessageCodesResolver</code>가 4회에서 본 방식으로 구체적인 코드부터 범용 코드까지 네 개의 메시지 코드를 만든다. <code>errors.properties</code>에 <code>typeMismatch.int</code>를 정의해 두면 사용자에게 "숫자를 입력하라"는 메시지를 보여 줄 수 있는 것이 이 연결 덕분이다. 사용자 정의 타입이라면 <code>typeMismatch.location</code>이나 <code>typeMismatch.GeoPoint</code> 같은 코드에 메시지를 걸면 된다.</p>
+
+<x-visual id="spring-mvc2-10-binder-call-path" title="요청 파라미터가 변환기에 닿는 호출 경로" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>DispatcherServlet에서 사용자 변환기까지의 호출이 어떤 객체들을 거치는지, 요청마다 새로 생기는 객체와 공유되는 싱글톤을 구분해 보여 준다.</x-hint>
+<x-prompt>가로 시퀀스 다이어그램. 위쪽에 왼쪽부터 생명선 일곱 개: "DispatcherServlet", "HandlerAdapter", "ArgumentResolver", "WebDataBinder", "TypeConverterDelegate", "ConversionService", "StringToGeoPointConverter". "WebDataBinder" 머리 상자는 주황색이고 그 아래 작은 라벨 "요청마다 새로 생성". "ConversionService"와 "StringToGeoPointConverter" 머리 상자는 파란색이고 라벨 "싱글톤, 공유". 화살표는 왼쪽에서 오른쪽으로 차례대로: "handle()", "resolveArgument()", "createBinder()", "convertIfNecessary()", "convert()", "convert(String)". 마지막 생명선에서 왼쪽으로 돌아오는 점선 반환 화살표 라벨 "GeoPoint". 흰 배경, 깔끔한 선.</x-prompt>
+<x-caption>바인더는 요청마다 새로 만들어지고, 그 안에 꽂힌 컨버전 서비스와 변환기는 모든 요청이 공유한다.</x-caption>
+</x-visual>
+
+<h3>뷰 템플릿에 컨버터 적용하기</h3>
+<p>요청 쪽의 변환은 바인더가 맡았다. 응답 쪽, 곧 모델의 객체를 HTML 문자열로 그리는 일은 뷰 템플릿이 맡는다. 1회에서 본 것처럼 타임리프의 <code>th:text="${...}"</code>는 식의 결과를 문자열로 바꿔 출력하는데, 이 기본 출력은 스프링의 컨버전 서비스를 거치지 않는다. 컨버전 서비스를 쓰게 하려면 중괄호를 두 겹으로 쓴다. 타임리프의 Thymeleaf + Spring 튜토리얼 9장은 변수 식에 <code>${{...}}</code>, 선택 변수 식에 <code>*{{...}}</code>를 쓰면 컨버전 서비스로 객체를 문자열로 변환·포맷할 수 있다고 설명한다.</p>
+<pre><code class="language-java">@Controller
+public class ConverterViewController {
+
+    @GetMapping("/converter-view")
+    public String view(Model model) {
+        model.addAttribute("number", 10000);
+        model.addAttribute("point", new GeoPoint(37.5665, 126.978));
+        return "converter-view";
+    }
+}</code></pre>
+<pre data-label="converter-view.html (발췌)"><code class="language-xml"><ul>
+    <li>${number}: <span th:text="${number}"></span></li>
+    <li>${{number}}: <span th:text="${{number}}"></span></li>
+    <li>${point}: <span th:text="${point}"></span></li>
+    <li>${{point}}: <span th:text="${{point}}"></span></li>
+</ul></code></pre>
+<p>앞 절의 <code>WebConfig</code>로 두 변환기를 등록한 상태라면 화면에는 차례로 <code>10000</code>, <code>10000</code>, <code>GeoPoint[lat=37.5665, lng=126.978]</code>, <code>37.5665,126.978</code>이 나온다. 숫자는 두 경우가 같아 보인다. 기본 변환기 가운데 <code>Number</code>에서 <code>String</code>으로 가는 것은 <code>toString()</code>을 부르는 <code>ObjectToStringConverter</code>이기 때문이다. 차이는 사용자 정의 타입에서 드러난다. 한 겹 중괄호는 레코드의 <code>toString()</code>을, 두 겹 중괄호는 <code>GeoPointToStringConverter</code>의 결과를 출력한다. 뒤에서 숫자 포맷터를 등록하면 두 번째 줄도 <code>10,000</code>으로 바뀐다.</p>
+<p>폼에서는 별도 표기가 필요 없다. 같은 튜토리얼은 <code>th:field</code>가 언제나 컨버전 서비스를 적용하며, 한 겹 중괄호 식에 컨버전 서비스가 적용되는 경우는 이것뿐이라고 적는다. 폼 객체에 <code>GeoPoint location</code> 필드가 있고 <code><input type="text" th:field="*{location}"></code>로 그리면 <code>value</code> 속성에 <code>37.5665,126.978</code>이 들어가고, 사용자가 이 폼을 제출하면 <code>@ModelAttribute</code> 바인딩에서 <code>StringToGeoPointConverter</code>가 다시 객체로 만든다. 출력과 입력이 같은 컨버전 서비스의 두 변환기로 짝을 이루므로 폼 왕복이 성립한다. 템플릿 안에서 변환을 직접 부르고 싶으면 <code>#conversions</code> 유틸리티 객체를 쓴다(<code>${#conversions.convert(point, 'String')}</code>).</p>
+<h4>타임리프는 스프링의 컨버전 서비스를 어떻게 찾는가</h4>
+<p>타임리프는 스프링과 별개의 라이브러리이므로, 템플릿을 렌더링하는 시점에 스프링 MVC의 컨버전 서비스를 받아 올 통로가 필요하다. 그 통로는 요청 속성(request attribute)이다. <code>WebMvcConfigurationSupport</code>는 핸들러 매핑에 인터셉터를 붙일 때 사용자가 등록한 인터셉터 뒤에 <code>ConversionServiceExposingInterceptor</code>를 항상 추가한다. 이 인터셉터는 <code>preHandle()</code>에서 <code>request.setAttribute(ConversionService.class.getName(), conversionService)</code>를 한다. thymeleaf-spring6의 <code>ThymeleafView</code>는 렌더링할 때 같은 이름의 요청 속성에서 컨버전 서비스를 꺼내(소스 주석에 "might be null!"이라고 적혀 있다) <code>ThymeleafEvaluationContext</code>를 만들고, 이 평가 컨텍스트를 모델 변수에 넣는다. 두 겹 중괄호 변수 식을 평가하는 <code>SPELVariableExpressionEvaluator</code>는 설정된 변환 서비스가 <code>SpringStandardConversionService</code>이면 SpEL 식을 <code>getValue(평가 컨텍스트, 루트, String.class)</code>로 평가하고, 이때 문자열 변환은 평가 컨텍스트의 타입 변환기, 곧 <code>ThymeleafEvaluationContext</code>가 꺼내 온 컨버전 서비스로 만든 <code>StandardTypeConverter</code>가 맡는다.</p>
+<pre class="diagram">요청 처리 중                                     렌더링 중
+HandlerMapping                                   ThymeleafView.render
+  └ ConversionServiceExposingInterceptor           └ request.getAttribute(ConversionService 이름)
+      preHandle: request.setAttribute(                 └ new ThymeleafEvaluationContext(ctx, conversionService)
+        "org.springframework.core.convert                └ ${{point}} → SpEL getValue(..., String.class)
+         .ConversionService", mvcConversionService)          → GeoPointToStringConverter</pre>
+<p>그래서 컨트롤러 파라미터 변환과 화면 출력 변환이 같은 객체를 쓴다. <code>addFormatters</code>에 한 번 등록한 변환기가 두 방향 모두에 효과를 내는 이유가 이 연결이다. 반대로, 이 연결은 스프링 MVC의 핸들러 매핑과 <code>ThymeleafView</code>를 거치는 렌더링에서만 만들어진다. 메일 본문 생성처럼 타임리프 엔진을 직접 호출하는 코드에서는 평가 컨텍스트 변수를 직접 넣어 주지 않는 한 thymeleaf-spring6이 기본 <code>StandardEvaluationContext</code>로 평가 컨텍스트를 대신 만들므로, <code>addFormatters</code>로 등록한 변환기와 포맷터가 쓰이지 않는다. 스프링 기본 변환기로 문자열을 만들 수 없는 타입이라면 두 겹 중괄호에서 <code>ConverterNotFoundException</code>이 원인인 예외가 난다(thymeleaf-spring6 3.1.5와 Spring Framework 6.2.19로 변환기 없는 <code>GeoPoint</code>를 출력해 확인했다).</p>
+
+<h3>Formatter: 문자열과 로케일을 위한 변환</h3>
+<p>지금까지의 <code>Converter</code>는 임의의 두 타입 사이를 잇는 범용 장치다. 그런데 웹 애플리케이션에서 일어나는 변환의 대부분은 특정한 모양을 가진다. 요청을 받을 때는 문자열을 객체로, 화면을 그릴 때는 객체를 문자열로 바꾸고, 그 문자열은 사용자의 언어권에 맞아야 한다. 한국과 미국에서는 1234567을 "1,234,567"로 쓰지만 독일에서는 "1.234.567"로 쓴다. 스프링 공식 문서는 범용 <code>Converter</code> SPI가 이런 포맷 요구를 직접 다루지 않기 때문에 <code>Formatter</code> SPI를 제공한다고 설명하고, 일반 타입 변환에는 <code>Converter</code>를, 웹 같은 클라이언트 환경에서 지역화된 필드 값을 파싱·출력할 때는 <code>Formatter</code>를 쓰라고 정리한다.</p>
+<pre><code class="language-java">package org.springframework.format;
+
+public interface Formatter<T> extends Printer<T>, Parser<T> {
+}
+
+public interface Printer<T> {
+    String print(T object, Locale locale);
+}
+
+public interface Parser<T> {
+    T parse(String text, Locale locale) throws ParseException;
+}</code></pre>
+<p><code>Converter</code>와 세 가지가 다르다. 한쪽 타입이 <code>String</code>으로 고정되어 있고, 한 객체가 출력(<code>print</code>)과 파싱(<code>parse</code>) 양방향을 맡으며, 두 메서드 모두 <code>Locale</code>을 받는다. 파싱이 실패하면 <code>ParseException</code>이나 <code>IllegalArgumentException</code>을 던지라는 것이 문서의 계약이고, 스레드 안전해야 한다는 요구도 같다. 로케일에 따라 숫자를 묶음 표기하는 포맷터를 만들어 보자.</p>
+<pre><code class="language-java">import java.text.NumberFormat;
+import java.text.ParseException;
+import java.util.Locale;
+import org.springframework.format.Formatter;
+
+public class LocalizedNumberFormatter implements Formatter<Number> {
+
+    @Override
+    public Number parse(String text, Locale locale) throws ParseException {
+        return NumberFormat.getNumberInstance(locale).parse(text);
+    }
+
+    @Override
+    public String print(Number object, Locale locale) {
+        return NumberFormat.getNumberInstance(locale).format(object);
+    }
+}</code></pre>
+<p>메서드를 호출할 때마다 <code>NumberFormat</code>을 새로 만드는 데는 이유가 있다. JDK의 <code>NumberFormat</code> Javadoc은 숫자 포맷이 일반적으로 동기화되어 있지 않으며, 여러 스레드가 동시에 접근하려면 외부에서 동기화해야 한다고 적는다. 포맷터 인스턴스는 컨버전 서비스 안에서 모든 요청 스레드가 공유하므로, <code>NumberFormat</code>을 필드에 두고 재사용하면 동시 요청에서 결과가 깨질 수 있다. 앞에서 본 <code>PropertyEditor</code>의 문제가 포맷터 안에서 되살아나는 셈이다. 이제 이 포맷터를 <code>DefaultFormattingConversionService</code>에 넣고 로케일을 바꿔 가며 써 보자.</p>
+<pre><code class="language-java">import java.util.Locale;
+import org.springframework.context.i18n.LocaleContextHolder;
+import org.springframework.format.support.DefaultFormattingConversionService;
+
+public class FormatterDemo {
+    public static void main(String[] args) {
+        DefaultFormattingConversionService fcs = new DefaultFormattingConversionService();
+        fcs.addFormatter(new LocalizedNumberFormatter());
+
+        for (Locale locale : new Locale[] {Locale.KOREA, Locale.GERMANY, Locale.US}) {
+            LocaleContextHolder.setLocale(locale);
+            System.out.println(locale + " -> " + fcs.convert(1234567, String.class));
+        }
+
+        LocaleContextHolder.setLocale(Locale.KOREA);
+        Integer price = fcs.convert("12,500", Integer.class);
+        System.out.println(price + " (" + price.getClass().getSimpleName() + ")");
+        System.out.println(fcs.convert("   ", Integer.class));
+        System.out.println(fcs.convert("12abc", Integer.class));
+
+        LocaleContextHolder.setLocale(Locale.GERMANY);
+        System.out.println(fcs.convert("12,500", Double.class));
+    }
+}</code></pre>
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">ko_KR -> 1,234,567
+de_DE -> 1.234.567
+en_US -> 1,234,567
+12500 (Integer)
+null
+12
+12.5</code></pre>
+<p>세 가지를 눈여겨보자. 첫째, <code>convert()</code>에 로케일을 넘긴 적이 없는데 출력이 로케일마다 다르다. 포맷터에 전달되는 로케일은 <code>LocaleContextHolder</code>에서 온다. 둘째, <code>Formatter<Number></code>로 등록했는데 <code>Integer</code> 요청에 쓰였고, 결과도 정확히 <code>Integer</code>다. 앞 절에서 <code>Converter<String, Number></code>는 <code>Integer</code> 요청에 쓰이지 않았던 것과 대조된다. 셋째, "12abc"가 오류 없이 12가 되었다. 이 셋은 각각 로케일 전달 경로, <code>FormattingConversionService</code>의 어댑터 구조, <code>NumberFormat</code>의 파싱 규칙에서 나온다. 차례로 내려가 보자.</p>
+<h4>로케일은 어디에서 오는가: 요청 스레드의 ThreadLocal</h4>
+<p><code>LocaleContextHolder</code>는 정적 메서드만 가진 클래스이고, 내부에 <code>ThreadLocal<LocaleContext></code> 필드(이름이 "LocaleContext"인 <code>NamedThreadLocal</code>)를 둔다. <code>ThreadLocal</code>은 스레드마다 따로 값을 보관하는 변수다. JDK 구현에서는 각 <code>Thread</code> 객체가 <code>threadLocals</code>라는 자기 맵(<code>ThreadLocal.ThreadLocalMap</code>)을 갖고, <code>ThreadLocal</code> 객체는 그 맵의 키 역할을 한다. 그래서 같은 정적 필드라도 요청 스레드 A에서 읽으면 A의 로케일이, B에서 읽으면 B의 로케일이 나온다. 포맷터 메서드에 로케일 파라미터를 일일이 전달하지 않아도 각 요청의 로케일이 섞이지 않는 이유다.</p>
+<p>값을 넣는 쪽은 <code>DispatcherServlet</code>의 상위 클래스 <code>FrameworkServlet</code>이다. <code>processRequest()</code>는 먼저 이 스레드에 있던 이전 <code>LocaleContext</code>를 지역 변수에 보관하고, <code>buildLocaleContext(request)</code>로 이 요청의 로케일 컨텍스트를 만들어 <code>LocaleContextHolder</code>에 넣은 뒤 <code>doService()</code>를 부른다. 그리고 <code>finally</code> 블록에서 보관해 둔 이전 값으로 되돌린다. <code>DispatcherServlet</code>의 <code>buildLocaleContext()</code>는 3회에서 본 <code>LocaleResolver</code>에 로케일을 묻고, 기본 전략인 <code>AcceptHeaderLocaleResolver</code>는 <code>Accept-Language</code> 요청 헤더를 본다. 컨트롤러 호출과 뷰 렌더링이 모두 <code>doService()</code> 안에서 일어나므로, 파라미터 파싱과 두 겹 중괄호 출력이 같은 요청 로케일을 쓴다.</p>
+<p><code>finally</code>에서 되돌리는 단계가 중요한 이유는 서블릿 컨테이너가 스레드를 풀에서 재사용하기 때문이다. 정리하지 않으면 다음 요청을 받은 같은 스레드가 이전 사용자의 로케일을 그대로 보게 된다. 반대로 요청 스레드가 아닌 곳, 예를 들어 스케줄러 스레드나 직접 만든 스레드에서 포맷터를 부르면 <code>LocaleContextHolder</code>에는 아무것도 없다. 이때 <code>getLocale()</code>은 <code>setDefaultLocale()</code>로 지정한 기본값이 있으면 그것을, 없으면 JVM 기본 로케일(<code>Locale.getDefault()</code>)을 돌려준다. <code>FrameworkServlet</code>의 <code>threadContextInheritable</code> 속성 기본값은 <code>false</code>라서 요청 스레드가 만든 자식 스레드도 로케일을 물려받지 않는다. 같은 코드가 요청 안에서는 "12,500"을, 배치 작업에서는 서버 OS 설정에 따른 다른 표기를 내는 일이 여기서 생긴다.</p>
+
+<x-visual id="spring-mvc2-10-locale-threadlocal" title="요청 스레드마다 다른 로케일이 포맷터에 전달되는 구조" kind="구조도" ratio="16:9">
+<x-hint>두 요청 스레드가 같은 포맷터 인스턴스를 공유하면서도 각자의 ThreadLocal에 담긴 로케일로 다른 결과를 내는 모습을 보여 준다.</x-hint>
+<x-prompt>가로로 긴 구조도. 왼쪽에 위아래로 두 개의 가로 띠, 위 띠 라벨 "요청 스레드 A", 아래 띠 라벨 "요청 스레드 B". 각 띠의 왼쪽 끝에 HTTP 헤더 말풍선, 위는 "Accept-Language: ko-KR", 아래는 "Accept-Language: de-DE". 각 띠 안에 작은 금고 모양 상자 "ThreadLocal", 위 금고 안에 "ko_KR", 아래 금고 안에 "de_DE". 두 띠의 오른쪽에서 화살표가 가운데의 공유 상자 하나 "LocalizedNumberFormatter (싱글톤)"로 모인다. 공유 상자에서 다시 오른쪽으로 두 화살표가 나가 결과 카드 두 장으로 간다: 위 카드 "1,234,567", 아래 카드 "1.234.567". 아래쪽 띠 밖에 작은 주석 "finally에서 원래 값으로 복원". 평면 일러스트, 흰 배경.</x-prompt>
+<x-caption>포맷터 인스턴스는 하나지만 로케일은 스레드마다 따로 보관된다. FrameworkServlet이 요청 시작 때 넣고 끝날 때 되돌린다.</x-caption>
+</x-visual>
+
+<h3>포맷터를 지원하는 컨버전 서비스와 그 적용</h3>
+<p>컨버전 서비스의 탐색 장치는 <code>GenericConverter</code>만 안다. 포맷터를 그 장치에 태우려면 변환기 모양으로 바꿔야 하는데, 이 일을 하는 것이 <code>FormattingConversionService</code>다. 이 클래스는 <code>GenericConversionService</code>를 상속하면서 <code>FormatterRegistry</code>를 구현한다. <code>addFormatter(formatter)</code>를 부르면 먼저 <code>GenericTypeResolver.resolveTypeArgument()</code>로 <code>Formatter<T></code>의 <code>T</code>를 알아낸다. 앞에서 본 <code>Signature</code> 속성을 읽는 같은 원리다. 그다음 두 개의 변환기를 등록한다.</p>
+<pre><code class="language-java">// FormattingConversionService (요지만 발췌)
+public void addFormatterForFieldType(Class<?> fieldType, Formatter<?> formatter) {
+    addConverter(new PrinterConverter(fieldType, formatter, this));   // (fieldType → String)
+    addConverter(new ParserConverter(fieldType, formatter, this));    // (String → fieldType)
+}</code></pre>
+<p><code>LocalizedNumberFormatter</code>라면 <code>(Number, String)</code> 쌍에 <code>PrinterConverter</code>가, <code>(String, Number)</code> 쌍에 <code>ParserConverter</code>가 들어간다. 이 두 어댑터는 <code>ConverterAdapter</code>와 달리 조건 없는 평범한 <code>GenericConverter</code>다. 대상 타입 정확 일치 검사가 없으므로 클래스 계층 탐색에서 <code>(String, Number)</code> 칸에 닿기만 하면 선택된다. <code>Formatter<Number></code>가 <code>Integer</code> 요청에 쓰인 이유가 이것이다. 그리고 등록이 <code>addFirst</code>이므로 같은 칸에 먼저 있던 기본 <code>StringToNumberConverterFactory</code>보다 앞에 선다.</p>
+<p><code>"12,500"</code>을 <code>Integer</code>로 바꾸는 요청을 끝까지 따라가 보자.</p>
+<figure class="flow-figure"><figcaption>"12,500" → Integer (ko_KR)</figcaption><ol class="flow">
+<li><strong>칸 찾기</strong><span><code>(String, Integer)</code> 칸에는 <code>@NumberFormat</code>용 조건부 변환기가 있지만 애노테이션이 없으므로 탈락한다. 다음 <code>(String, Number)</code> 칸의 맨 앞에서 <code>ParserConverter</code>를 고른다.</span></li>
+<li><strong>빈 문자열 검사</strong><span><code>ParserConverter</code>는 <code>StringUtils.hasText(text)</code>가 거짓이면 <code>null</code>을 돌려준다. 공백만 있는 "   "이 <code>null</code>이 된 이유다.</span></li>
+<li><strong>파싱</strong><span><code>parser.parse(text, LocaleContextHolder.getLocale())</code>를 부른다. 한국어 로케일의 <code>NumberFormat</code>은 정수 값을 <code>Long</code> 12500으로 돌려준다.</span></li>
+<li><strong>예외 정리</strong><span>파서가 <code>IllegalArgumentException</code>을 던지면 그대로, <code>ParseException</code> 같은 다른 예외는 "Parse attempt failed for value [...]" 메시지의 <code>IllegalArgumentException</code>으로 감싸 던진다.</span></li>
+<li><strong>후속 변환</strong><span>결과 타입 <code>Long</code>이 요청 타입 <code>Integer</code>에 대입되지 않으므로, 컨버전 서비스에 <code>Long</code> → <code>Integer</code> 변환을 다시 맡긴다. <code>NumberToNumberConverterFactory</code>가 <code>Integer</code> 12500을 만든다.</span></li>
+</ol></figure>
+<p>마지막 단계는 편리하지만 함정도 숨어 있다. 같은 포맷터에 독일 로케일로 "12,500"을 <code>Integer</code>로 요청하면 결과는 12다. 독일어에서 쉼표는 소수점이므로 파서는 <code>Double</code> 12.5를 돌려주고, 후속 변환에서 <code>NumberUtils.convertNumberToTargetClass()</code>가 범위 넘침만 검사하고 <code>Integer.valueOf(number.intValue())</code>로 값을 만들기 때문이다. <code>Double.intValue()</code>는 소수부를 버린다. 오류 없이 값이 바뀐다. 출력 쪽 <code>PrinterConverter</code>는 원본이 프린터가 받는 타입이 아니면 먼저 변환하고, 원본이 <code>null</code>이면 빈 문자열을 돌려준 다음 <code>printer.print(source, LocaleContextHolder.getLocale())</code>를 부른다.</p>
+<h4>"12abc"가 12가 되는 이유와 고치는 법</h4>
+<p><code>NumberFormat.parse(String)</code>의 Javadoc에는 이 메서드가 주어진 문자열 전체를 쓰지 않을 수 있다고 적혀 있다. 앞에서부터 숫자로 읽을 수 있는 데까지 읽고 나머지는 무시한다. 그래서 "12abc"는 12가 된다. 스프링이 제공하는 숫자 포맷터들의 부모 클래스 <code>AbstractNumberFormatter</code>는 이 문제를 <code>ParsePosition</code>으로 막는다. 파싱이 끝난 위치가 문자열 길이와 다르면 <code>ParseException</code>을 던진다. 같은 방식으로 고쳐 보자.</p>
+<pre><code class="language-java">import java.text.NumberFormat;
+import java.text.ParseException;
+import java.text.ParsePosition;
+import java.util.Locale;
+import org.springframework.format.Formatter;
+
+public class StrictNumberFormatter implements Formatter<Number> {
+
+    @Override
+    public Number parse(String text, Locale locale) throws ParseException {
+        NumberFormat format = NumberFormat.getNumberInstance(locale);
+        ParsePosition position = new ParsePosition(0);
+        Number number = format.parse(text, position);
+        if (position.getErrorIndex() != -1 || position.getIndex() != text.length()) {
+            throw new ParseException(text, position.getIndex());
+        }
+        return number;
+    }
+
+    @Override
+    public String print(Number object, Locale locale) {
+        return NumberFormat.getNumberInstance(locale).format(object);
+    }
+}</code></pre>
+<pre data-label="실행 결과: StrictNumberFormatter, ko_KR"><code class="language-text">fcs.convert("12,500", Integer.class) → 12500
+fcs.convert("12abc", Integer.class)  → ConversionFailedException: Failed to convert from type [java.lang.String] to type [java.lang.Integer] for value [12abc]
+                                       cause = java.lang.IllegalArgumentException: Parse attempt failed for value [12abc]</code></pre>
+<p>예외가 감싸이는 순서가 그대로 보인다. 포맷터의 <code>ParseException</code>을 <code>ParserConverter</code>가 <code>IllegalArgumentException</code>으로, 그것을 <code>ConversionUtils</code>가 <code>ConversionFailedException</code>으로 감쌌다. 웹에서는 여기에 바인더가 <code>TypeMismatchException</code> 층을 더하므로, 이 입력은 <code>@RequestParam</code>이라면 400 응답이, <code>@ModelAttribute</code>라면 <code>typeMismatch</code> 필드 오류가 된다.</p>
+<h4>스프링 MVC에 포맷터 적용하기</h4>
+<p>등록 방법은 변환기와 같다. <code>addFormatters()</code>에서 <code>registry.addFormatter(new StrictNumberFormatter())</code>를 부르거나, Spring Boot라면 포맷터를 빈으로 등록한다. 등록하고 나면 <code>@RequestParam Integer price</code>에 <code>price=12,500</code>을 보내도 12500이 들어오고, 앞의 템플릿에서 <code>${{number}}</code>는 한국어 요청에서 <code>10,000</code>을 출력한다. <code>th:field</code>로 그린 <code>Integer</code> 필드도 묶음 표기로 나타나고, 사용자가 그 값을 그대로 제출해도 다시 정수로 바인딩된다.</p>
+<p>그러나 이 등록은 전역이다. <code>(String, Number)</code>와 <code>(Number, String)</code> 칸의 맨 앞에 서므로, 애플리케이션의 모든 숫자 파라미터와 모든 숫자 출력이 이 포맷터를 거친다. 상품 ID를 받는 <code>@PathVariable Long id</code>도, 페이지 번호도 마찬가지다. 앞의 "12abc" 문제를 고치지 않은 포맷터를 전역으로 등록했다면 잘못된 입력이 조용히 다른 값으로 바뀌는 범위가 애플리케이션 전체로 넓어진다. 특정 필드에만 형식을 적용하고 싶다면 다음 절의 애노테이션 방식이 더 맞다. 같은 칸에 기본 변환기와 사용자 변환기가 모두 있을 때 사용자 것이 이기는 이유, 그리고 <code>(String, Integer)</code>처럼 더 구체적인 칸에 변환기가 있으면 그것이 <code>(String, Number)</code> 칸의 포맷터보다 먼저 선택되는 이유는 모두 앞에서 본 탐색 순서로 설명된다.</p>
+<p>정리하면 <code>DefaultFormattingConversionService</code>는 생성자에서 <code>DefaultConversionService.addDefaultConverters(this)</code>로 기본 변환기를 모두 넣고, <code>addDefaultFormatters(this)</code>로 기본 포맷터를 넣는다. 기본 포맷터에는 <code>@NumberFormat</code> 처리기, 클래스패스에 JSR-354(<code>javax.money</code>)가 있을 때의 화폐 포맷터, <code>java.time</code> 타입용 <code>DateTimeFormatterRegistrar</code>, <code>java.util.Date</code> 계열용 <code>DateFormatterRegistrar</code>가 들어 있다. 스프링 MVC가 이 클래스를 기본으로 쓰는 것은 웹이 바로 문자열과 로케일의 세계이기 때문이다.</p>
+
+<h3>스프링이 제공하는 기본 포맷터: @NumberFormat과 @DateTimeFormat</h3>
+<p>전역 포맷터가 타입 단위라면, 애노테이션 포맷터는 필드 단위다. <code>org.springframework.format.annotation</code> 패키지의 <code>@NumberFormat</code>은 숫자 필드에, <code>@DateTimeFormat</code>은 <code>java.util.Date</code>·<code>Calendar</code>·<code>Long</code>과 <code>java.time</code> 타입 필드에 붙인다. <code>@NumberFormat</code>은 <code>style</code>(<code>NUMBER</code>, <code>CURRENCY</code>, <code>PERCENT</code>)이나 <code>pattern</code>을, <code>@DateTimeFormat</code>은 <code>pattern</code>이나 <code>iso</code>(<code>DATE</code>, <code>TIME</code>, <code>DATE_TIME</code>)를 지정한다. 공식 문서가 강조하듯 ISO 형식이나 직접 정한 패턴을 쓰면 로케일과 시스템에 무관하게 파싱·출력할 수 있다.</p>
+<pre><code class="language-java">import java.time.LocalDateTime;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.format.annotation.NumberFormat;
+
+public class OrderForm {
+
+    @NumberFormat(pattern = "#,##0")
+    private Long amount;
+
+    @DateTimeFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+    private LocalDateTime orderedAt;
+
+    // getter, setter ...
+}</code></pre>
+<p>애노테이션과 포맷터를 잇는 것은 <code>AnnotationFormatterFactory<A></code>다. 이 인터페이스는 다룰 필드 타입 집합(<code>getFieldTypes()</code>)과 애노테이션 값을 받아 프린터·파서를 만드는 메서드(<code>getPrinter</code>, <code>getParser</code>)를 가진다. <code>@NumberFormat</code>용 <code>NumberFormatAnnotationFormatterFactory</code>의 필드 타입은 <code>Byte</code>부터 <code>BigDecimal</code>까지의 표준 숫자 타입이다. <code>addFormatterForFieldAnnotation()</code>은 이 필드 타입마다 <code>AnnotationPrinterConverter</code>와 <code>AnnotationParserConverter</code>를 등록하는데, 이 둘은 조건부 변환기이고 <code>matches()</code>는 <code>TypeDescriptor</code>에 해당 애노테이션이 있는지만 본다. 애노테이션 값별로 만든 프린터·파서는 (애노테이션, 필드 타입)을 키로 캐시한다.</p>
+<p>그렇다면 필드의 애노테이션은 어떻게 <code>TypeDescriptor</code>에 실려 오는가? <code>@ModelAttribute</code> 바인딩에서 <code>BeanWrapper</code>는 프로퍼티의 필드·게터·세터에서 <code>TypeDescriptor</code>를 만들고, <code>@RequestParam</code> 같은 메서드 파라미터는 <code>MethodParameter</code>에서 만든다. 그래서 <code>@RequestParam("date") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date</code>처럼 파라미터에 붙여도 동작한다. 서버 없이 확인할 때는 리플렉션으로 필드의 <code>TypeDescriptor</code>를 직접 만들면 된다.</p>
+<pre><code class="language-java">import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.Locale;
+import org.springframework.context.i18n.LocaleContextHolder;
+import org.springframework.core.convert.TypeDescriptor;
+import org.springframework.format.support.DefaultFormattingConversionService;
+
+public class AnnotationFormatDemo {
+    public static void main(String[] args) throws Exception {
+        DefaultFormattingConversionService fcs = new DefaultFormattingConversionService();
+        TypeDescriptor string = TypeDescriptor.valueOf(String.class);
+        TypeDescriptor amount = new TypeDescriptor(OrderForm.class.getDeclaredField("amount"));
+        TypeDescriptor orderedAt = new TypeDescriptor(OrderForm.class.getDeclaredField("orderedAt"));
+
+        System.out.println(fcs.convert(9876543L, amount, string));                    // ①
+        System.out.println(fcs.convert("9,876,543", string, amount));                 // ②
+        System.out.println(fcs.convert(LocalDateTime.of(2025, 3, 1, 9, 5), orderedAt, string)); // ③
+        System.out.println(fcs.convert("2025-03-01 09:05:00", string, orderedAt));    // ④
+
+        try {
+            fcs.convert("9,876,543", Long.class);                                     // ⑤
+        } catch (Exception e) {
+            System.out.println(e.getClass().getSimpleName());
+        }
+
+        LocalDate date = LocalDate.of(2025, 3, 1);                                    // ⑥
+        for (Locale locale : new Locale[] {Locale.KOREA, Locale.US, Locale.GERMANY}) {
+            LocaleContextHolder.setLocale(locale);
+            System.out.println(locale + " -> " + fcs.convert(date, String.class));
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">9,876,543
+9876543
+2025-03-01 09:05:00
+2025-03-01T09:05
+ConversionFailedException
+ko_KR -> 25. 3. 1.
+en_US -> 3/1/25
+de_DE -> 01.03.25</code></pre>
+<p>①과 ②는 <code>amount</code> 필드의 <code>TypeDescriptor</code>가 <code>@NumberFormat</code>을 싣고 있어서 <code>(Long, String)</code>, <code>(String, Long)</code> 칸의 조건부 변환기가 선택된 결과다. ③은 패턴대로 출력되고, ④의 결과는 <code>LocalDateTime</code> 객체이며 화면에 보이는 것은 그 <code>toString()</code>이다. ⑤는 같은 문자열이지만 애노테이션 없는 <code>Long</code> 요청이라 기본 <code>StringToNumberConverterFactory</code>로 가서 실패한다. 같은 <code>Long</code> 타입이라도 어느 필드에 담기느냐에 따라 다른 변환기가 쓰인다는 것, 그 차이를 <code>TypeDescriptor</code>가 만든다는 것이 핵심이다.</p>
+<p>⑥은 애노테이션이 없는 <code>LocalDate</code>다. <code>DateTimeFormatterRegistrar</code>는 따로 형식을 지정받지 않으면 <code>DateTimeFormatter.ofLocalizedDate(FormatStyle.SHORT)</code>를 쓴다. 그래서 로케일마다 표기가 다르고, 한국어에서는 "25. 3. 1."처럼 연도가 두 자리로 줄어든다. 스프링 MVC 문서도 기본적으로 날짜를 파싱·출력할 때 요청 로케일을 고려한다고 적는다. 그런데 HTML의 <code><input type="date"></code>는 로케일과 무관하게 <code>yyyy-MM-dd</code> 형식의 값을 주고받는다. 파싱 쪽은 Spring Framework 6.0 이후 소스의 <code>TemporalAccessorParser</code>가 지정된 형식으로 실패하면 ISO 형식으로 한 번 더 시도하므로 "2025-03-01"도 받아들인다(Spring Framework 7.0.10에서 실행해 확인했다). 출력 쪽은 그렇지 않다. 같은 값을 <code>th:field</code>로 날짜 입력 칸에 다시 그리면 "25. 3. 1."이 <code>value</code>에 들어가고, 이것은 날짜 입력 칸이 받는 형식이 아니다. 스프링 MVC 문서는 이런 경우를 위해 <code>DateTimeFormatterRegistrar</code>의 <code>setUseIsoFormat(true)</code>로 등록하는 방법을 보여 준다.</p>
+<p>Spring Boot에서는 설정 속성으로도 바꿀 수 있다. Spring Boot 레퍼런스는 <code>spring.mvc.format.date</code>(<code>LocalDate</code>와 <code>java.util.Date</code>), <code>spring.mvc.format.time</code>, <code>spring.mvc.format.date-time</code>을 설정하지 않으면 각각 <code>ofLocalizedDate</code>·<code>ofLocalizedTime</code>·<code>ofLocalizedDateTime</code>의 <code>FormatStyle.SHORT</code>를 쓴다고 표로 정리한다. 값으로 패턴 문자열을 주거나, Boot의 <code>DateTimeFormatters</code> 소스에 따르면 <code>iso</code>를 주어 <code>DateTimeFormatter.ISO_LOCAL_DATE</code> 같은 ISO 형식을 고를 수 있다.</p>
+<pre><code class="language-properties">spring.mvc.format.date=iso
+spring.mvc.format.date-time=yyyy-MM-dd HH:mm:ss</code></pre>
+<p>이 속성이 하나라도 설정되면 Boot의 <code>WebConversionService</code>는 기본 포맷터 대신 설정된 형식으로 <code>DateTimeFormatterRegistrar</code>를 구성해 등록한다. 같은 레퍼런스는 이 웹용 컨버전 서비스가 <code>application.properties</code> 값을 바인딩하는 컨버전 서비스와 다르다는 점도 밝힌다. 설정 파일의 <code>30s</code> 같은 <code>Duration</code> 표기를 해석하는 변환기들이 웹 쪽에는 없다는 뜻이다.</p>
+
+<h3>흔한 오해와 함정</h3>
+<h4>"JSON 요청 본문도 컨버전 서비스가 바꾼다"</h4>
+<p>가장 흔한 오해다. <code>@RequestBody</code>로 받는 JSON과 <code>@ResponseBody</code>로 내보내는 JSON은 <code>HttpMessageConverter</code>가 처리하고, 스프링 MVC 1편에서 본 것처럼 JSON이라면 그 구현은 Jackson의 <code>ObjectMapper</code>를 쓴다. 이 경로에는 데이터 바인더도 <code>TypeConverterDelegate</code>도 등장하지 않는다. 그래서 <code>StringToGeoPointConverter</code>를 등록해도 <code>{"location":"37.5,127.0"}</code>은 <code>GeoPoint</code>로 바뀌지 않고, DTO 필드에 붙인 <code>@DateTimeFormat</code>이나 <code>@NumberFormat</code>도 JSON 본문에는 적용되지 않는다. JSON 쪽 형식은 Jackson의 <code>@JsonFormat</code>, 사용자 정의 직렬화기·역직렬화기, Jackson 모듈로 정한다. 같은 컨트롤러 안에서도 쿼리 파라미터와 본문이 서로 다른 변환 체계를 쓴다는 점을 기억하자.</p>
+<pre class="diagram">요청 데이터의 위치                          처리 경로                                    형식 지정 수단
+쿼리 파라미터, 폼, 경로 변수      →  ArgumentResolver → WebDataBinder → ConversionService   Converter, Formatter, @DateTimeFormat
+요청 본문 (JSON)                  →  HttpMessageConverter → Jackson ObjectMapper             @JsonFormat, Jackson 모듈</pre>
+<h4>"Converter는 람다로 등록하면 간단하다"</h4>
+<p><code>addConverter(Converter)</code> 한 인자 버전은 클래스의 <code>Signature</code> 속성에서 타입 인자를 읽으므로 람다나 타입 인자를 확정하지 않은 제네릭 클래스에는 쓸 수 없다. 람다를 쓰려면 <code>addConverter(String.class, GeoPoint.class, lambda)</code>처럼 타입을 직접 넘긴다. 같은 이유로 <code>class MyConverter<T> implements Converter<String, T></code>처럼 타입 변수를 남겨 둔 클래스도 등록 시점에 실패한다.</p>
+<h4>"상위 타입으로 만든 Converter는 하위 타입에도 적용된다"</h4>
+<p><code>Converter<S, T></code>는 대상 타입이 정확히 <code>T</code>일 때만 쓰인다. 하위 타입 전체를 맡기려면 <code>ConverterFactory</code>를 쓴다. 포맷터는 이 제한이 없어서 <code>Formatter<Number></code>는 모든 숫자 타입에 적용된다. 세 장치의 범위가 서로 다르다는 것을 모르면 "등록했는데 안 불린다"와 "등록했더니 예상보다 넓게 불린다"를 모두 겪는다.</p>
+<h4>"변환기에 상태를 두어도 요청마다 새로 생기니 괜찮다"</h4>
+<p>변환기와 포맷터는 컨버전 서비스 안에 한 번 등록되어 모든 요청 스레드가 공유한다. 바인더는 요청마다 새로 생기지만 그 안에 꽂히는 컨버전 서비스는 싱글톤이다. 필드에 <code>SimpleDateFormat</code>이나 <code>NumberFormat</code>, 계산 중간값을 두면 동시 요청에서 결과가 섞인다. 스레드 안전한 <code>DateTimeFormatter</code>를 쓰거나 호출마다 새로 만든다.</p>
+<h4>"@InitBinder로 등록한 것과 컨버전 서비스는 같은 층이다"</h4>
+<p><code>TypeConverterDelegate</code>는 사용자 정의 <code>PropertyEditor</code>를 먼저 찾고, 없을 때만 컨버전 서비스를 쓴다. 어떤 컨트롤러의 <code>@InitBinder</code>에서 <code>registerCustomEditor(GeoPoint.class, ...)</code>를 했다면 그 컨트롤러에서는 전역 변환기가 무시된다. <code>DataBinder.addCustomFormatter()</code>(4.2부터)도 내부에서 포맷터를 <code>PropertyEditor</code> 어댑터로 감싸 사용자 정의 편집기로 등록하므로 같은 우선순위를 가진다. 컨트롤러 하나에만 다른 형식을 적용할 때는 이 성질이 유용하지만, 의도하지 않았다면 디버깅이 어렵다.</p>
+<h4>"기본 타입 파라미터도 값이 없으면 0이 된다"</h4>
+<p><code>@RequestParam(required = false) int page</code>에 값이 오지 않으면 변환할 원본이 없다. <code>AbstractNamedValueMethodArgumentResolver</code>는 변환을 시도하기 전에 이 경우를 검사해서, 파라미터 타입이 <code>boolean</code>이면 <code>false</code>를 넣고 그 밖의 기본 타입이면 "Optional int parameter 'page' is present but cannot be translated into a null value due to being declared as a primitive type."으로 시작하는 <code>IllegalStateException</code>을 던진다. 0이 들어가지 않으며, 이 예외는 <code>DefaultHandlerExceptionResolver</code>가 다루는 종류가 아니어서 서버 오류로 끝난다. 선택 파라미터라면 <code>Integer</code>로 받거나 <code>defaultValue</code>를 준다. 폼 객체라면 <code>visitors</code> 예제처럼 변환 실패 시 필드에 기본값 0이 그대로 남아 있으므로, 0이 사용자의 입력인지 실패의 흔적인지는 <code>BindingResult</code>를 보고 판단해야 한다.</p>
+
+<h3>다른 주제와의 연결</h3>
+<p>이 회차의 장치들은 앞뒤 회차와 다른 권의 여러 곳에서 다시 나온다. 4회의 <code>typeMismatch</code> 오류 코드는 이번에 본 <code>TypeMismatchException</code>이 바인더 안에서 <code>FieldError</code>로 바뀐 결과였고, 3회의 <code>LocaleResolver</code>는 포맷터가 받는 로케일의 출처였다. <code>MethodArgumentTypeMismatchException</code> 같은 예외를 사용자에게 보여 줄 오류 응답으로 바꾸는 일은 8회와 9회의 예외 처리 주제와 이어지고, 11회의 파일 업로드에서는 문자열이 아닌 요청 데이터(<code>MultipartFile</code>)를 컨트롤러 파라미터로 받는 다른 경로가 등장한다.</p>
+<p>스프링 MVC 밖에서도 같은 원리가 쓰인다. Spring Boot의 <code>@ConfigurationProperties</code> 바인딩은 <code>ApplicationConversionService</code>라는 별도의 컨버전 서비스로 설정 문자열을 <code>Duration</code>이나 <code>DataSize</code>로 바꾼다. 스프링 데이터의 웹 지원은 경로 변수의 ID를 엔티티로 바꾸는 변환기를 컨버전 서비스에 등록한다. 지워진 제네릭을 <code>Signature</code> 속성과 <code>ResolvableType</code>으로 읽는 기법은 스프링 컨테이너가 <code>List<MyService></code> 타입의 의존관계를 주입할 때, 이벤트 리스너의 이벤트 타입을 찾을 때에도 쓰인다. 요청 스레드에 정보를 묶어 두는 <code>ThreadLocal</code> 패턴은 <code>RequestContextHolder</code>, 트랜잭션 동기화, 스프링 시큐리티의 인증 정보 보관으로 이어진다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>HTTP는 문자열만 실어 오고 화면도 문자열만 받는다. 스프링은 그 사이를 상태 없는 변환기들의 등록소인 컨버전 서비스 하나로 잇는다. 등록은 시작할 때 <code>FormatterRegistry</code>로, 사용은 요청마다 새로 만든 바인더와 뷰가 <code>ConversionService</code>로 한다. 어떤 변환기가 선택될지는 (원본 계층 × 대상 계층) 탐색, 나중 등록 우선, <code>Converter</code>의 대상 정확 일치 규칙으로 정해지고, 포맷터의 로케일은 요청 스레드의 <code>ThreadLocal</code>에서 온다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>Converter</dt><dd>원본 타입 S를 대상 타입 T로 바꾸는 상태 없는 단방향 변환기. 등록 시 클래스의 제네릭 선언에서 S와 T를 읽고, 대상 타입이 정확히 T일 때만 선택된다.</dd>
+<dt>ConverterFactory / GenericConverter</dt><dd>ConverterFactory는 한 원본에서 어떤 계층의 모든 하위 타입으로 가는 변환을, GenericConverter는 TypeDescriptor(제네릭, 애노테이션)를 보고 여러 쌍을 다루는 변환을 맡는다.</dd>
+<dt>ConversionService</dt><dd>변환을 요청받는 인터페이스. 등록 인터페이스(ConverterRegistry, FormatterRegistry)와 분리되어 있고, 애플리케이션 시작 때 만들어 모든 스레드가 공유한다.</dd>
+<dt>컨버터 탐색 규칙</dt><dd>캐시를 먼저 보고, 원본 계층(바깥)과 대상 계층(안쪽)의 쌍을 차례로 검사한다. 같은 쌍에서는 나중에 등록한 변환기가 앞에 서며, 결과는 NO_MATCH까지 캐시된다.</dd>
+<dt>바인더와 변환 경로</dt><dd>요청마다 새로 만든 WebDataBinder가 TypeConverterDelegate를 통해 사용자 정의 PropertyEditor, ConversionService, 기본 편집기 순서로 변환을 시도한다. 실패는 400(TypeMismatch), 500(ConversionNotSupported), typeMismatch 필드 오류로 갈린다.</dd>
+<dt>Formatter</dt><dd>문자열과 객체 사이의 양방향 변환을 로케일과 함께 다루는 SPI. FormattingConversionService가 PrinterConverter와 ParserConverter로 감싸 등록하며, 대상 정확 일치 제한이 없다.</dd>
+<dt>LocaleContextHolder</dt><dd>요청 로케일을 담는 ThreadLocal 보관소. FrameworkServlet이 요청 시작 때 넣고 finally에서 되돌리며, 요청 밖의 스레드에서는 기본 로케일을 돌려준다.</dd>
+<dt>@NumberFormat / @DateTimeFormat</dt><dd>필드나 파라미터의 TypeDescriptor에 실린 애노테이션을 조건으로 선택되는 포맷터. 타입 단위 전역 포맷터와 달리 필드마다 형식을 정한다.</dd>
+<dt>뷰와 JSON의 경계</dt><dd>타임리프의 ${{...}}와 th:field는 요청 속성으로 전달된 같은 ConversionService를 쓰지만, @RequestBody·@ResponseBody JSON은 HttpMessageConverter와 Jackson이 처리한다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 타입 변환 문제는 대개 "왜 400이 나지?" 또는 "왜 값이 이상하게 들어오지?"로 시작한다. 첫 번째 질문에는 변환이 어느 경로에서 일어났는지부터 확인하는 것이 빠르다. 쿼리 파라미터나 폼이라면 바인더와 컨버전 서비스의 문제이고 <code>MethodArgumentTypeMismatchException</code>이나 <code>BindingResult</code>의 <code>typeMismatch</code>를 보면 된다. JSON 본문이라면 Jackson의 역직렬화 오류이므로 변환기를 아무리 등록해도 해결되지 않는다. 사용자 정의 타입 파라미터가 400이 아니라 500으로 끝난다면 변환기 등록이 빠졌다는 신호다.</p>
+<p>두 번째 질문, 값이 조용히 바뀌는 문제는 더 위험하다. 이 회차에서만도 "12abc"가 12가 되는 관대한 파싱, 독일어 로케일의 "12,500"이 12가 되는 소수부 절삭, 문자열 왕복에서 바뀌는 실수 표기를 보았다. 금액·수량처럼 틀리면 안 되는 값은 전체 문자열 소비를 검사하는 파서를 쓰고, 로케일에 의존하지 않는 형식(ISO, 고정 패턴)을 계약으로 정하는 편이 안전하다. 로케일 의존 형식은 사람이 보는 출력에만 쓰고, 서버가 다시 읽어야 하는 값에는 쓰지 않는다는 원칙이 판단을 단순하게 만든다.</p>
+<p>전역 등록과 필드 단위 등록 사이의 선택도 자주 마주친다. 모든 숫자에 묶음 표기를 적용하는 전역 포맷터는 화면을 한 번에 바꾸지만 ID, 페이지 번호, 내부 API 파라미터까지 함께 바뀐다. 영향 범위를 예측할 수 없다면 <code>@NumberFormat</code>·<code>@DateTimeFormat</code>으로 필요한 필드에만 거는 쪽이 낫다. 반대로 <code>GeoPoint</code>처럼 애플리케이션 전체에서 표기가 하나로 정해진 도메인 타입은 전역 변환기가 맞다. 변환기와 포맷터는 공유되는 싱글톤이므로 상태를 두지 않는다는 원칙은 어느 쪽이든 같다.</p>
+</x-review>
+
+<x-practice>
+<li><code>addFormatters()</code>에서 <code>Converter<String, Number></code>를 구현한 변환기 하나만 등록했다. <code>@RequestParam("id") Long id</code>에 <code>id=12</code>가 오면 이 변환기가 호출되는가? 호출되지 않는다면 누가 변환하는가? 같은 자리에 <code>Formatter<Number></code>를 등록했다면 어떻게 달라지는가?</li>
+<li><code>addFormatters()</code>에서 <code>(String, GeoPoint)</code> 변환기 A를 등록한 뒤 같은 쌍의 변환기 B를 등록했다. 한 컨트롤러에는 <code>@InitBinder</code>로 <code>binder.registerCustomEditor(GeoPoint.class, new GeoPointEditor())</code>가 있다. 이 컨트롤러와 다른 컨트롤러에서 <code>@RequestParam GeoPoint</code>를 변환하는 것은 각각 무엇인가?</li>
+<li>다음 포맷터의 문제를 두 가지 찾고, 각각 어떤 상황에서 드러나는지 설명하라. <code>class PriceFormatter implements Formatter<Long> { private final NumberFormat format = NumberFormat.getNumberInstance(Locale.KOREA); public Long parse(String t, Locale l) throws ParseException { return format.parse(t).longValue(); } public String print(Long v, Locale l) { return format.format(v); } }</code></li>
+<li><code>LocalizedNumberFormatter</code>를 전역 등록한 서버에 <code>Accept-Language: de-DE</code> 헤더와 함께 <code>price=12,500</code>이 <code>@RequestParam Integer price</code>로 들어왔다. <code>price</code>의 값을 예측하고, 그 값이 나오기까지 거친 단계를 적어라.</li>
+<li>DTO에 <code>@DateTimeFormat(pattern = "yyyy.MM.dd") LocalDate date</code> 필드를 두고 한 엔드포인트는 <code>@ModelAttribute</code>로, 다른 엔드포인트는 <code>@RequestBody</code>(JSON)로 받는다. 두 요청에 모두 <code>2025.03.01</code>을 보냈을 때 각각 어떻게 되는지 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p>1. 호출되지 않는다. <code>Converter</code>를 감싼 <code>ConverterAdapter.matches()</code>는 등록된 대상 타입(<code>Number</code>)과 요청 대상 타입(<code>Long</code>)이 정확히 같을 때만 참이다. 탐색은 <code>(String, Long)</code> 칸을 거쳐 <code>(String, Number)</code> 칸에 이르는데, 그 칸의 맨 앞에 있는 사용자 변환기는 탈락하고 다음 순서의 <code>StringToNumberConverterFactory</code>가 선택되어 12L을 만든다. <code>Formatter<Number></code>라면 <code>ParserConverter</code>는 조건이 없는 <code>GenericConverter</code>이므로 같은 칸에서 바로 선택되고, 파싱 결과가 <code>Long</code>이 아니면 컨버전 서비스로 후속 변환까지 한다.</p>
+<p>2. <code>@InitBinder</code>가 있는 컨트롤러에서는 <code>GeoPointEditor</code>가 변환한다. <code>TypeConverterDelegate</code>가 사용자 정의 편집기를 먼저 찾고, 있으면 컨버전 서비스를 시도하지 않기 때문이다. 다른 컨트롤러에서는 바인더에 편집기가 없으므로 컨버전 서비스가 쓰이고, <code>ConvertersForPair</code>가 <code>addFirst</code>로 쌓이므로 나중에 등록한 B가 선택된다. 편집기는 그 요청의 바인더에만 등록되므로 다른 컨트롤러로 새지 않는다.</p>
+<p>3. 첫째, <code>NumberFormat</code>을 필드에 두고 공유한다. 포맷터는 모든 요청 스레드가 함께 쓰는 싱글톤인데 <code>NumberFormat</code>은 동기화되어 있지 않으므로, 동시 요청이 많을 때 간헐적으로 잘못된 값이나 예외가 나올 수 있다. 재현이 어려워 부하 테스트나 운영에서 처음 드러나는 종류의 버그다. 둘째, 파라미터로 받은 로케일 <code>l</code>을 무시하고 언제나 한국 형식을 쓴다. 다른 언어권 사용자에게도 한국식 표기가 나가고, 로케일별 입력을 기대하는 화면과 어긋난다. 덧붙여 <code>parse(String)</code>은 문자열 전체를 소비했는지 확인하지 않으므로 "12abc"를 12로 받아들인다. 호출마다 <code>NumberFormat.getNumberInstance(l)</code>을 만들고 <code>ParsePosition</code>으로 끝 위치를 검사하면 세 문제가 모두 해결된다.</p>
+<p>4. 12다. <code>FrameworkServlet</code>이 <code>AcceptHeaderLocaleResolver</code>로 <code>de_DE</code>를 얻어 <code>LocaleContextHolder</code>에 넣는다. 리졸버가 만든 바인더가 컨버전 서비스에 <code>String</code> → <code>Integer</code>를 요청하고, 탐색은 <code>(String, Number)</code> 칸의 <code>ParserConverter</code>를 고른다. 독일어 <code>NumberFormat</code>에서 쉼표는 소수점이므로 파싱 결과는 <code>Double</code> 12.5다. <code>Double</code>은 <code>Integer</code>에 대입되지 않으므로 컨버전 서비스가 <code>NumberToNumberConverterFactory</code>로 후속 변환을 하고, 이때 소수부가 버려져 12가 된다. 예외가 나지 않으므로 사용자도 서버도 알아차리지 못한다. 실제로 같은 포맷터와 <code>Locale.GERMANY</code>로 <code>convert("12,500", Integer.class)</code>를 실행하면 12가 나온다.</p>
+<p>5. <code>@ModelAttribute</code> 쪽은 바인더가 <code>date</code> 프로퍼티의 <code>TypeDescriptor</code>에서 <code>@DateTimeFormat</code>을 발견하고, 조건부 변환기 <code>AnnotationParserConverter</code>가 <code>yyyy.MM.dd</code> 패턴으로 파싱해 2025-03-01이 들어간다. <code>@RequestBody</code> 쪽은 Jackson이 역직렬화하며 스프링의 <code>@DateTimeFormat</code>을 보지 않는다. Jackson의 <code>LocalDate</code> 역직렬화는 별도 설정이 없으면 ISO 형식을 기대하므로 "2025.03.01"을 읽지 못해 <code>HttpMessageNotReadableException</code>이 되고, <code>DefaultHandlerExceptionResolver</code>는 이것을 400으로 응답한다. JSON 쪽 형식은 <code>@JsonFormat(pattern = "yyyy.MM.dd")</code> 같은 Jackson 수단으로 지정해야 한다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q><code>DefaultConversionService</code>에 <code>Converter<String, Number></code> 구현 L을 등록한 뒤 <code>convert("7", Integer.class)</code>를 부르면 무엇이 변환하는가?</q>
+<o>L. 나중에 등록한 변환기가 언제나 우선하기 때문이다.</o>
+<o>StringToNumberConverterFactory. L은 대상 타입이 정확히 Number일 때만 선택되기 때문이다.</o>
+<o>ObjectToObjectConverter. Integer.valueOf(String)이 있기 때문이다.</o>
+<o>아무것도 없어 ConverterNotFoundException이 난다.</o>
+<why>L과 기본 팩터리는 모두 <code>(String, Number)</code> 칸에 있고 L이 앞에 있다. 그러나 <code>ConverterAdapter.matches()</code>는 대상 타입 정확 일치를 요구하므로 L은 탈락하고, 이 검사가 없는 <code>ConverterFactoryAdapter</code>가 선택된다. 나중 등록 우선은 같은 칸 안에서 조건을 통과한 것끼리의 규칙이다. <code>ObjectToObjectConverter</code>는 <code>(Object, Object)</code> 칸이라 그보다 훨씬 뒤에 검사되며, 변환이 가능하므로 예외도 나지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q><code>cs.addConverter((Converter<String, GeoPoint>) s -> ...)</code>가 IllegalArgumentException으로 실패하는 근본 원인은?</q>
+<o>람다는 함수형 인터페이스가 아닌 Converter를 구현할 수 없기 때문이다.</o>
+<o>컨버전 서비스가 람다의 바이트코드를 실행할 수 없기 때문이다.</o>
+<o>실행 중에 만들어진 람다의 숨은 클래스에는 타입 인자를 기록한 Signature 속성이 없어 리플렉션으로 S와 T를 알 수 없기 때문이다.</o>
+<o>제네릭 소거 때문에 모든 Converter 구현 클래스는 타입 인자를 잃기 때문이다.</o>
+<why>소거는 메서드 디스크립터에서 타입 인자를 지우지만, 클래스 선언의 제네릭 정보는 Signature 속성으로 남아 <code>getGenericInterfaces()</code>로 읽을 수 있다. 일반 클래스는 그래서 등록된다. 람다 클래스는 런타임에 생성되는 숨은 클래스라 이 정보가 없다. <code>Converter</code>는 <code>@FunctionalInterface</code>이므로 람다로 구현하는 것 자체는 가능하다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>포맷터의 <code>print(T, Locale)</code>에 전달되는 로케일은 스프링 MVC 요청 처리 중 어디에서 오는가?</q>
+<o>FrameworkServlet이 요청 시작 때 LocaleResolver의 결과를 넣어 두는 ThreadLocal 기반의 LocaleContextHolder</o>
+<o>포맷터를 등록할 때 함께 지정한 로케일</o>
+<o>언제나 JVM 기본 로케일(Locale.getDefault())</o>
+<o>ConversionService 인스턴스가 필드로 보관하는 마지막 요청의 로케일</o>
+<why><code>PrinterConverter</code>와 <code>ParserConverter</code>는 <code>LocaleContextHolder.getLocale()</code>을 부른다. 이 값은 <code>FrameworkServlet.processRequest()</code>가 요청마다 스레드에 넣고 <code>finally</code>에서 되돌린다. JVM 기본 로케일은 요청 밖에서 컨텍스트가 비어 있을 때의 대체값일 뿐이다. 컨버전 서비스는 공유 싱글톤이므로 요청 로케일을 필드에 보관하면 스레드 사이에 값이 섞인다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>사용자 정의 타입 <code>GeoPoint</code>를 <code>@RequestParam</code>으로 받는데 변환기 등록을 잊었다. 이 요청은 기본 설정에서 어떤 응답으로 끝나는가?</q>
+<o>400. 클라이언트가 보낸 문자열이 GeoPoint가 아니기 때문이다.</o>
+<o>200. 파라미터에 null이 들어가고 메서드가 실행된다.</o>
+<o>400. ConversionFailedException은 언제나 400이기 때문이다.</o>
+<o>500. 변환기를 찾지 못한 것이 ConversionNotSupportedException 계열로 바뀌어 서버 오류로 처리되기 때문이다.</o>
+<why>컨버전 서비스가 <code>canConvert()</code>에 거짓으로 답하고 편집기도 없으면 <code>TypeConverterDelegate</code>가 "no matching editors or conversion strategy found" 메시지의 <code>IllegalStateException</code>을 던지고, 이것이 <code>TypeConverterSupport</code>에서 <code>ConversionNotSupportedException</code>으로, 리졸버에서 <code>MethodArgumentConversionNotSupportedException</code>으로 바뀐다. <code>DefaultHandlerExceptionResolver</code>는 이것을 <code>TypeMismatchException</code>보다 먼저 검사해 서버 오류로 응답한다. 값이 잘못된 경우(변환기가 예외를 던진 경우)만 400이다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>DTO 필드에 <code>@DateTimeFormat(pattern = "yyyy.MM.dd")</code>를 붙였는데 <code>@RequestBody</code> JSON 요청에서 형식이 적용되지 않는다. 이유로 가장 정확한 것은?</q>
+<o>@DateTimeFormat은 LocalDate에는 쓸 수 없고 java.util.Date에만 쓸 수 있다.</o>
+<o>JSON 본문은 HttpMessageConverter(Jackson)가 역직렬화하므로 데이터 바인더와 컨버전 서비스를 거치지 않는다.</o>
+<o>DateTimeFormatterRegistrar가 등록되지 않았기 때문이다.</o>
+<o>요청에 Accept-Language 헤더가 없어서 로케일을 결정하지 못했기 때문이다.</o>
+<why><code>@DateTimeFormat</code>은 <code>java.time</code> 타입에도 적용되고 기본 등록되어 있다. 문제는 경로다. <code>@ModelAttribute</code>·<code>@RequestParam</code>은 바인더를 통해 컨버전 서비스를 쓰지만 <code>@RequestBody</code>는 메시지 컨버터가 Jackson으로 처리하며, 그곳의 형식은 <code>@JsonFormat</code> 같은 Jackson 수단으로 정한다. 패턴을 명시했으므로 로케일과도 무관하다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>타입 변환기(Converter)</dt><dd>원본 타입 S의 값을 대상 타입 T로 바꾸는 스프링의 단방향 변환 인터페이스. Spring Framework 3.0에서 도입되었다.</dd>
+<dt>컨버전 서비스(ConversionService)</dt><dd>등록된 변환기들 가운데 알맞은 것을 찾아 변환을 수행하는 서비스 인터페이스. 상태 없이 여러 스레드가 공유한다.</dd>
+<dt>포맷터(Formatter)</dt><dd>객체와 문자열 사이의 출력(print)과 파싱(parse)을 로케일과 함께 다루는 인터페이스. Printer와 Parser를 합친 것이다.</dd>
+<dt>타입 기술자(TypeDescriptor)</dt><dd>변환의 원본·대상 타입을 Class뿐 아니라 제네릭 타입 인자와 애노테이션까지 포함해 기술하는 스프링의 객체.</dd>
+<dt>속성 편집기(PropertyEditor)</dt><dd>자바빈즈의 문자열↔객체 변환 인터페이스. 변환 결과를 내부 상태로 보관하므로 스레드 사이에 공유할 수 없다.</dd>
+<dt>브리지 메서드(bridge method)</dt><dd>제네릭 인터페이스를 구현할 때 소거된 시그니처와 실제 메서드를 잇기 위해 컴파일러가 만드는 합성 메서드. ACC_BRIDGE 플래그가 붙는다.</dd>
+<dt>Signature 속성(Signature attribute)</dt><dd>클래스·필드·메서드의 제네릭 선언을 기록하는 클래스 파일 속성(JVMS §4.7.9). 리플렉션이 지워진 타입 인자를 읽는 근거다.</dd>
+<dt>스레드 로컬(ThreadLocal)</dt><dd>스레드마다 독립된 값을 보관하는 변수. 스프링은 요청 로케일을 LocaleContextHolder의 ThreadLocal에 담아 전달한다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.spring.io/spring-framework/reference/core/validation/convert.html">Spring Framework Reference — Spring Type Conversion</a> — Converter, ConverterFactory, GenericConverter, ConversionService의 계약과 스레드 안전성</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/core/validation/format.html">Spring Framework Reference — Spring Field Formatting</a> — Formatter SPI, AnnotationFormatterFactory, @NumberFormat·@DateTimeFormat</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-config/conversion.html">Spring Framework Reference — MVC Config: Type Conversion</a> — addFormatters 등록과 날짜 형식의 로케일·ISO 설정</li>
+<li><a href="https://docs.spring.io/spring-boot/reference/web/servlet.html">Spring Boot Reference — Servlet Web Applications</a> — Converter·Formatter 빈 자동 등록과 spring.mvc.format.* 기본값</li>
+<li><a href="https://www.thymeleaf.org/doc/tutorials/3.1/thymeleafspring.html">Tutorial: Thymeleaf + Spring (3.1)</a> — 9장 컨버전 서비스, ${{...}}와 th:field, #conversions</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-4.html">JVMS (Java SE 21) Chapter 4 — The class File Format</a> — ACC_BRIDGE 플래그와 Signature 속성(§4.7.9)</li>
+</x-refs>

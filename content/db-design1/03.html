@@ -1,0 +1,665 @@
+<x-meta>
+deck: 슈퍼 키에서 후보 키·기본 키·대체 키까지 키의 종류를 유일성과 최소성으로 세우고, 자연 키와 대리 키의 선택을 InnoDB 클러스터형 인덱스·페이지 분할·UUID의 비트 구조까지 내려가 따져 본 뒤, 복합 키와 다대다 연결 테이블의 키를 설계한다.
+minutes: 110
+</x-meta>
+
+<x-goals>
+<li>테이블과 업무 규칙이 주어지면 슈퍼 키와 후보 키를 유일성과 최소성으로 판정하고, 그중 기본 키와 대체 키를 고른 이유를 설명할 수 있다.</li>
+<li>자연 키가 실패하는 네 가지 방식(값의 변경, 형식의 변경, 수집 제한, 유일성 붕괴)을 실제 사례로 들고, 자연 키를 기본 키로 삼았을 때 그 변경이 외래 키와 인덱스로 어떻게 번지는지 추적할 수 있다.</li>
+<li>InnoDB에서 기본 키가 행의 물리적 위치와 모든 보조 인덱스 항목의 크기를 정한다는 사실로부터, 키의 너비와 삽입 순서(증가하는 정수, UUIDv4, UUIDv7)가 저장 공간과 페이지 분할에 주는 영향을 설명할 수 있다.</li>
+<li>"대리 키를 기본 키로, 자연 키는 UNIQUE 제약으로"라는 현대적인 기본 설계를 DDL로 쓰고, 이 기본값에서 벗어나야 하는 경우를 판단할 수 있다.</li>
+<li>복합 키의 열 순서를 조회 패턴으로 정하고, 다대다 연결 테이블을 복합 기본 키로 둘지 대리 키와 UNIQUE로 둘지 업무 규칙에 따라 결정할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이 회차의 질문: 행 하나를 무엇으로 가리킬 것인가</h3>
+
+<p>앞 회차에서 개념적 모델링으로 엔티티와 관계를 찾았다. 회원, 상품, 주문 같은 엔티티가 상자로 그려졌고, 상자 사이에 선이 그어졌다. 논리적 모델링은 이 그림을 관계형 데이터베이스가 이해하는 구조, 곧 테이블과 열과 제약으로 옮기는 단계다. 그 첫 번째 작업이 키를 정하는 일이다. 키가 정해지지 않으면 관계선을 테이블로 옮길 수 없다. 주문이 회원을 가리키려면 "어느 회원인지"를 하나로 정해 줄 값이 있어야 하는데, 그 값이 바로 키이기 때문이다.</p>
+
+<p>키가 없는 테이블을 상상해 보자. 회원 테이블에 이름과 생년월일과 전화번호만 있다. 같은 이름, 같은 생년월일을 가진 사람이 두 명 가입하면 둘을 구별할 방법이 없다. 한 사람이 실수로 두 번 가입해도 막을 방법이 없다. 둘 중 한 명의 전화번호를 고치는 <code>UPDATE</code>를 쓰려 해도 <code>WHERE</code> 절에 무엇을 써야 그 한 명만 고칠 수 있을지 알 수 없다. 주문 테이블이 이 회원을 참조하려 해도 이름을 적어 두면 동명이인과 섞이고, 전화번호를 적어 두면 번호가 바뀌는 순간 연결이 끊긴다. 관계형 모델에서 "이 행"을 가리키는 유일한 수단은 값이다. 메모리 주소나 행 번호 같은 숨은 포인터는 모델에 존재하지 않는다. 그래서 행을 하나로 가리킬 값의 조합을 정하는 일은 모델 전체의 토대가 된다.</p>
+
+<p>이 회차는 세 층으로 나아간다. 먼저 키의 종류를 정확한 정의로 세운다. 슈퍼 키, 후보 키, 기본 키, 대체 키, 복합 키, 외래 키는 서로 다른 축에서 붙는 이름이라 처음에는 헷갈리기 쉽다. 다음으로 기본 키를 무엇으로 삼을지, 곧 현실 세계의 식별자를 그대로 쓰는 자연 키와 데이터베이스가 만든 번호를 쓰는 대리 키 사이의 선택을 다룬다. 이 선택은 모델링의 취향 문제가 아니라 저장 엔진의 물리 구조와 맞물린 문제라서, MySQL InnoDB가 기본 키를 어떻게 저장하는지까지 내려가 본다. 마지막으로 여러 열로 이루어진 복합 키를 설계하는 법과, 다대다 관계를 풀어낸 연결 테이블에서 복합 키가 어떤 역할을 하는지 본다.</p>
+
+<p>설명의 기준은 MySQL 8.0 이상과 InnoDB 저장 엔진이다. 키의 정의 자체는 관계형 모델의 개념이라 제품에 따라 달라지지 않지만, 기본 키가 디스크에 어떻게 놓이는지, 자동 증가 값이 어떻게 만들어지는지는 제품마다 다르다. 그런 문장에는 "InnoDB에서는"이라는 범위를 붙인다. 참여도와 일대다 관계(04회), 일대일과 다대다 관계(05회), 식별 관계와 비식별 관계(06회), 정규화(07회)는 뒤 회차의 몫이므로, 여기서는 키를 설명하는 데 필요한 만큼만 끌어온다.</p>
+
+<h3>다양한 종류의 키 1: 슈퍼 키와 후보 키 — 유일성과 최소성</h3>
+
+<p>예제로 쓸 회원 테이블을 정하자. 열은 <code>member_id</code>(회원 번호), <code>email</code>(이메일), <code>phone</code>(휴대폰 번호), <code>name</code>(이름), <code>birth_date</code>(생년월일) 다섯 개다. 업무 규칙은 이렇다고 하자. 회원 번호는 가입할 때 시스템이 하나씩 부여하고 겹치지 않는다. 이메일은 가입할 때 반드시 입력하고 같은 이메일로 두 번 가입할 수 없다. 휴대폰 번호는 입력하지 않아도 되지만, 입력한다면 다른 회원과 겹칠 수 없다. 이름과 생년월일은 반드시 입력하지만 같은 이름과 같은 생년월일을 가진 회원이 여럿 있을 수 있다.</p>
+
+<p><b>슈퍼 키(super key)</b>는 그 값의 조합이 테이블의 모든 행을 서로 구별해 주는 속성들의 집합이다. 조건은 유일성(uniqueness) 하나뿐이다. 위 규칙에서 <code>{member_id}</code>는 슈퍼 키다. 회원 번호가 같은 두 행이 있을 수 없기 때문이다. 그렇다면 <code>{member_id, name}</code>은 어떨까. 회원 번호만으로 이미 모든 행이 구별되므로, 거기에 무엇을 덧붙여도 여전히 모든 행이 구별된다. 따라서 이것도 슈퍼 키다. 극단적으로 다섯 열 전부를 묶은 집합도 슈퍼 키다. 슈퍼 키는 "구별은 된다"는 것만 보장할 뿐, 쓸데없는 열이 섞여 있는지는 따지지 않는다.</p>
+
+<p>슈퍼 키가 몇 개나 되는지 세어 보면 그 성질이 더 분명해진다. 위 규칙에서 혼자서 모든 행을 구별하는 열은 <code>member_id</code>와 <code>email</code>이다. <code>phone</code>은 값이 없는 회원이 여럿일 수 있으므로 혼자서는 구별하지 못하고, <code>name</code>과 <code>birth_date</code>는 조합해도 겹칠 수 있다. 그러면 슈퍼 키는 <code>member_id</code>를 포함하는 집합이거나 <code>email</code>을 포함하는 집합이다. 다섯 열의 부분집합 가운데 <code>member_id</code>를 포함하는 것은 나머지 네 열을 넣고 빼는 경우의 수인 2<sup>4</sup> = 16개, <code>email</code>을 포함하는 것도 16개, 둘 다 포함하는 것은 2<sup>3</sup> = 8개다. 포함·배제 원리로 16 + 16 − 8 = 24개의 슈퍼 키가 있다. 다섯 열짜리 테이블에 슈퍼 키가 24개나 된다는 것은, 슈퍼 키라는 개념만으로는 설계에 쓸 키를 고를 수 없다는 뜻이다.</p>
+
+<p>그래서 두 번째 조건이 필요하다. <b>후보 키(candidate key)</b>는 유일성에 더해 최소성(minimality, irreducibility)을 만족하는 슈퍼 키다. 최소성이란 집합에서 어떤 속성 하나라도 빼면 더는 유일성이 성립하지 않는다는 뜻이다. <code>{member_id, name}</code>에서 <code>name</code>을 빼도 <code>{member_id}</code>가 남아 여전히 유일하므로, 이 집합은 최소가 아니다. 반면 <code>{member_id}</code>는 속성이 하나뿐이고 그것을 빼면 빈 집합이 되어 아무것도 구별하지 못하므로 최소다. 같은 논리로 <code>{email}</code>도 후보 키다. 24개의 슈퍼 키 가운데 후보 키는 이 두 개뿐이다.</p>
+
+<p>최소성을 판정하는 절차를 한 줄씩 적어 보면 이렇다. 속성 집합 K가 주어지면, 먼저 K가 유일한지 업무 규칙으로 확인한다. 유일하지 않으면 슈퍼 키도 아니니 끝이다. 유일하다면 K의 속성을 하나씩 빼 본다. 어느 하나를 뺀 집합이라도 여전히 유일하다면 K는 최소가 아니고, 뺀 집합을 새 K로 삼아 같은 절차를 되풀이한다. 어떤 속성을 빼도 유일성이 깨진다면 K가 후보 키다. 예를 들어 <code>{email, phone, name}</code>에서 시작하면, <code>name</code>을 빼도 유일하고(<code>email</code>이 있으므로), <code>phone</code>을 빼도 유일하며, 결국 <code>{email}</code>에 이른다. 이 절차는 하나의 후보 키에 도달할 뿐 모든 후보 키를 찾아 주지는 않는다. 테이블에 후보 키가 여럿일 수 있기 때문에, 모든 후보 키를 찾으려면 출발 집합을 바꿔 가며 확인해야 한다.</p>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>키는 지금 들어 있는 데이터의 성질이 아니라 앞으로 들어올 수 있는 모든 데이터에 대한 규칙이다. 현재 회원 열 명의 이름이 우연히 모두 다르다고 해서 <code>name</code>이 후보 키가 되지는 않는다. "이 값이 같은 두 행이 존재할 수 있는가"를 데이터가 아니라 업무 규칙에 물어야 한다.</p></aside>
+
+<p>이 점이 키 설계에서 가장 흔히 놓치는 부분이다. 개발 초기에 테스트 데이터를 넣어 보면 이름이나 상품명처럼 사실은 겹칠 수 있는 값이 겹치지 않는 경우가 많다. 그것을 보고 키로 삼으면, 서비스가 커져 동명이인이 들어오는 순간 가입이 실패하거나 엉뚱한 행이 갱신된다. 정규화를 다루는 07회에서는 키를 함수 종속성(functional dependency)이라는 도구로 더 엄밀하게 정의한다. 지금 단계에서는 "키 = 다른 모든 속성의 값을 하나로 정해 주는 최소한의 속성 묶음"이라고 이해해 두면 충분하다.</p>
+
+<p>후보 키가 반드시 열 하나로 이루어지는 것은 아니다. 영화관의 좌석 테이블을 생각해 보자. 열은 <code>theater_id</code>(상영관), <code>seat_row</code>(줄), <code>seat_no</code>(번호), <code>seat_grade</code>(등급)이다. 같은 상영관 안에서도 줄과 번호가 같은 좌석은 하나뿐이지만, 상영관이 다르면 "C열 7번"은 여러 개다. 그러므로 <code>{seat_row, seat_no}</code>는 유일하지 않고, <code>{theater_id, seat_row, seat_no}</code>가 비로소 유일하다. 이 셋 중 무엇을 빼도 유일성이 깨지므로 이 집합은 세 속성으로 이루어진 후보 키다. 이렇게 둘 이상의 속성으로 이루어진 키를 <b>복합 키(composite key)</b>라고 부른다. 복합 키는 후보 키냐 기본 키냐와는 다른 축의 이름으로, 키가 몇 개의 속성으로 구성되었는지를 말한다.</p>
+
+<h3>다양한 종류의 키 2: 기본 키, 대체 키, 외래 키</h3>
+
+<p>후보 키가 여럿이면 그중 하나를 골라 테이블의 대표 식별자로 삼는다. 이것이 <b>기본 키(primary key)</b>다. 선택되지 않은 나머지 후보 키는 <b>대체 키(alternate key)</b>라고 부른다. 회원 테이블에서 <code>member_id</code>를 기본 키로 고르면 <code>email</code>은 대체 키가 된다. 대체 키라는 이름 때문에 "기본 키의 예비품" 정도로 가볍게 여기기 쉽지만, 대체 키도 후보 키이므로 유일성이라는 업무 규칙을 그대로 지니고 있다. 기본 키로 뽑히지 않았다고 해서 이메일 중복 가입을 허용해도 되는 것은 아니다. 그래서 물리 설계에서 대체 키는 <code>UNIQUE</code> 제약으로 반드시 옮겨 적는다.</p>
+
+<p>기본 키로 고르는 후보 키는 다음 조건을 갖출수록 좋다. 첫째, 유일해야 한다. 후보 키라면 이미 만족한다. 둘째, 값이 없어서는 안 된다. 기본 키는 "이 행"을 가리키는 수단인데 값이 없으면 가리킬 수 없다. SQL의 <code>NULL</code>은 다른 어떤 값과도, 심지어 다른 <code>NULL</code>과도 같다고 판정되지 않기 때문에 식별자 노릇을 할 수 없다. 셋째, 값이 바뀌지 않아야 한다. 기본 키는 다른 테이블의 외래 키가 참조하는 대상이고, 뒤에서 보듯 InnoDB에서는 행의 물리적 위치와 모든 보조 인덱스의 내용까지 정하기 때문에, 값이 바뀌면 그 영향이 연쇄적으로 번진다. 넷째, 짧고 단순할수록 좋다. 같은 이유로 기본 키는 여러 곳에 복사되기 때문이다.</p>
+
+<p>두 번째 조건과 관련해 MySQL의 동작을 짚어 두자. MySQL 매뉴얼은 <code>PRIMARY KEY</code>를 "모든 키 열이 <code>NOT NULL</code>이어야 하는 유일 인덱스"로 정의하고, 키 열을 <code>NOT NULL</code>로 선언하지 않았으면 MySQL이 암묵적으로(그리고 조용히) <code>NOT NULL</code>로 선언한다고 적는다. MySQL 8.4.13과 8.0.46에서 확인하면, <code>NULL</code> 여부를 아무것도 적지 않은 열 <code>k INT</code>를 기본 키로 삼은 테이블은 <code>SHOW CREATE TABLE</code>에 <code>`k` int NOT NULL</code>로 나타나고 <code>NULL</code>을 넣으면 <code>ERROR 1048 (23000): Column 'k' cannot be null</code>로 거부된다. 다만 열을 <code>k INT NULL</code>처럼 명시적으로 <code>NULL</code>이라고 적고 기본 키로 삼으면 조용히 바뀌지 않고 테이블 생성 자체가 <code>ERROR 1171 (42000): All parts of a PRIMARY KEY must be NOT NULL; if you need NULL in a key, use UNIQUE instead</code>로 실패한다. 테이블당 기본 키는 하나뿐이고, 그 이름은 언제나 <code>PRIMARY</code>다. 반면 <code>UNIQUE</code> 인덱스에 대해서는 "NULL을 가질 수 있는 열이라면 여러 개의 NULL 값을 허용한다"고 적는다. 이 차이가 앞의 예에서 <code>phone</code>이 후보 키가 될 수 없었던 이유를 물리적으로 보여 준다. <code>phone</code>에 <code>UNIQUE</code>를 걸어도 번호를 입력하지 않은 회원 수천 명이 모두 <code>NULL</code>로 공존할 수 있으므로, <code>phone</code>으로는 그 회원들을 구별할 수 없다.</p>
+
+<pre><code class="language-sql">CREATE TABLE member (
+    member_id   BIGINT       NOT NULL AUTO_INCREMENT,
+    email       VARCHAR(255) NOT NULL,
+    phone       VARCHAR(20)  NULL,
+    name        VARCHAR(50)  NOT NULL,
+    birth_date  DATE         NOT NULL,
+    PRIMARY KEY (member_id),                    -- 기본 키: 선택된 후보 키
+    UNIQUE KEY uk_member_email (email),         -- 대체 키: 선택되지 않은 후보 키
+    UNIQUE KEY uk_member_phone (phone)          -- 키가 아니라 "입력했다면 겹치지 않음"이라는 규칙
+);</code></pre>
+
+<p>위 DDL에서 <code>uk_member_email</code>과 <code>uk_member_phone</code>은 똑같이 <code>UNIQUE</code>로 적혔지만 모델링의 의미는 다르다. <code>email</code>은 <code>NOT NULL</code>과 <code>UNIQUE</code>가 함께 걸려 모든 행을 구별하므로 대체 키다. <code>phone</code>은 <code>NULL</code>을 허용하므로 행을 구별하지 못하고, 그저 "값이 있다면 겹치지 않는다"는 업무 규칙을 표현할 뿐이다. 논리 모델 단계에서 이 둘을 같은 "UK"로 뭉뚱그려 표시하면, 나중에 누군가 <code>phone</code>으로 회원을 식별하는 코드를 짜는 실수를 부를 수 있다.</p>
+
+<p><b>외래 키(foreign key)</b>는 다른 테이블(때로는 같은 테이블)의 후보 키, 대개는 기본 키를 참조하는 속성 또는 속성 집합이다. 데이터베이스 기본편에서 외래 키 제약 조건과 참조 동작(<code>ON DELETE</code>, <code>ON UPDATE</code>)을 다뤘으므로 여기서는 키 설계와 관련된 성질 하나만 강조한다. 외래 키는 참조하는 키의 <b>값을 복사해 온다</b>. 주문 테이블의 <code>member_id</code> 열에는 회원 테이블 기본 키의 값이 그대로 들어 있다. 그러니 기본 키가 길면 그것을 참조하는 모든 자식 테이블의 외래 키 열도 길어지고, 기본 키가 여러 열이면 외래 키도 같은 수의 열이 되며, 기본 키 값이 바뀌면 그 값을 복사해 간 모든 자식 행도 바뀌어야 한다. 기본 키 선택이 그 테이블 하나의 문제가 아닌 이유가 여기 있다.</p>
+
+<p>지금까지 나온 이름들을 축별로 정리하면 다음과 같다. 한 키에 여러 이름이 동시에 붙을 수 있다는 점에 주의하자. 예를 들어 좌석 테이블의 <code>{theater_id, seat_row, seat_no}</code>는 후보 키이면서 복합 키이고, 기본 키로 뽑히면 복합 기본 키이면서 자연 키다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>분류 축</th><th>이름</th><th>정의</th><th>회원 테이블의 예</th></tr></thead><tbody>
+<tr><td rowspan="4">역할</td><td>슈퍼 키</td><td>유일성만 만족하는 속성 집합</td><td><code>{member_id}</code>, <code>{email, name}</code> 등 24개</td></tr>
+<tr><td>후보 키</td><td>유일성과 최소성을 만족하는 슈퍼 키</td><td><code>{member_id}</code>, <code>{email}</code></td></tr>
+<tr><td>기본 키</td><td>후보 키 중 대표로 선택된 하나</td><td><code>{member_id}</code></td></tr>
+<tr><td>대체 키</td><td>선택되지 않은 나머지 후보 키</td><td><code>{email}</code></td></tr>
+<tr><td>참조</td><td>외래 키</td><td>다른 테이블의 후보 키 값을 복사해 참조하는 속성</td><td>주문 테이블의 <code>member_id</code></td></tr>
+<tr><td>구성</td><td>복합 키</td><td>둘 이상의 속성으로 이루어진 키</td><td>좌석의 <code>{theater_id, seat_row, seat_no}</code></td></tr>
+<tr><td>출처</td><td>자연 키 / 대리 키</td><td>현실의 의미를 지닌 값 / 시스템이 만든 의미 없는 값</td><td><code>email</code> / <code>member_id</code></td></tr>
+</tbody></table></div>
+
+<x-visual id="db-design1-03-key-sets" title="슈퍼 키, 후보 키, 기본 키, 대체 키의 포함 관계" kind="개념도" ratio="16:9">
+<x-hint>슈퍼 키 집합 안에 후보 키가 있고, 후보 키가 기본 키 하나와 대체 키들로 나뉜다는 포함 관계를 회원 테이블의 실제 속성 집합으로 보여 준다.</x-hint>
+<x-prompt>A clean concept diagram on a white background made of nested rounded rectangles. The largest outer rectangle is labeled "슈퍼 키 (유일성)" and contains small gray tag chips with text like "{member_id, name}", "{email, phone}", "{member_id, email}". Inside it, a medium rectangle labeled "후보 키 (유일성 + 최소성)" contains two larger chips. The chip "{member_id}" is highlighted in solid blue with a small badge "기본 키". The chip "{email}" is outlined in blue with a badge "대체 키". Outside all rectangles, on the right, a separate gray chip "{name, birth_date}" with a red cross mark and the label "유일하지 않음". Flat vector style, two accent colors (blue and red), no other text.</x-prompt>
+<x-caption>후보 키는 최소인 슈퍼 키이고, 기본 키와 대체 키는 후보 키를 역할에 따라 나눈 이름이다.</x-caption>
+</x-visual>
+
+<h3>자연 키: 현실 세계가 이미 붙여 둔 이름</h3>
+
+<p><b>자연 키(natural key)</b>는 업무 세계에서 이미 쓰이고 있는, 의미를 지닌 식별자를 그대로 키로 삼은 것이다. 비즈니스 키(business key)라고도 부른다. 책의 ISBN, 회원의 이메일, 사업자의 사업자등록번호, 국가의 ISO 국가 코드, 차량의 차대번호, 앞에서 본 좌석의 (상영관, 줄, 번호) 같은 것이 자연 키 후보다. 자연 키는 데이터베이스가 없어도 존재한다. 사람들은 이 값으로 대상을 부르고, 서류에 적고, 다른 시스템과 주고받는다.</p>
+
+<p>자연 키를 기본 키로 쓰면 얻는 것이 분명히 있다. 첫째, 중복이 구조적으로 막힌다. ISBN을 기본 키로 삼은 도서 테이블에는 같은 ISBN의 책이 두 번 들어갈 수 없다. 별도의 <code>UNIQUE</code> 제약을 기억해서 걸어야 할 필요가 없다. 둘째, 키 값 자체가 의미를 지니므로 조인 없이도 읽힌다. 주문 테이블에 <code>country_code</code>가 <code>'KR'</code>로 들어 있으면 국가 테이블과 조인하지 않아도 어느 나라인지 안다. 대리 키라면 <code>country_id = 17</code>을 보고 국가 테이블을 찾아가야 한다. 셋째, 열이 하나 줄어든다. 자연 키가 이미 있는데 대리 키를 따로 두면 열이 하나, 인덱스가 하나 더 생긴다.</p>
+
+<p>문제는 자연 키가 기본 키의 조건, 특히 "바뀌지 않는다"와 "반드시 있다"를 오랫동안 지키지 못하는 경우가 많다는 데 있다. 현실의 식별자는 데이터베이스 설계자가 아니라 현실 세계가 관리하기 때문이다. 실패하는 방식은 크게 네 가지다.</p>
+
+<h4>실패 1: 값이 바뀐다</h4>
+
+<p>이메일은 사람이 바꾼다. 회사를 옮기거나, 쓰던 메일 서비스가 문을 닫거나, 그냥 새 주소를 만든다. 휴대폰 번호도 바뀐다. 이름도 개명으로 바뀐다. 대한민국의 주민등록번호처럼 평생 바뀌지 않을 것 같은 번호도 예외가 아니다. 2017년 5월부터 주민등록번호 변경 제도가 시행되어, 번호 유출로 피해를 입었거나 입을 우려가 있는 사람은 심의를 거쳐 번호를 바꿀 수 있게 되었다. "주민번호는 불변이니 기본 키로 써도 된다"는 전제가 제도 변경 하나로 무너진 것이다.</p>
+
+<h4>실패 2: 형식이 바뀐다</h4>
+
+<p>ISBN은 자연 키의 모범처럼 보인다. 국제 표준이 부여하고, 책마다 하나씩이며, 바뀌지 않는다. 그런데 ISBN 자체의 형식이 바뀐 적이 있다. 2007년 1월 1일부터 ISBN은 10자리에서 13자리가 되었고, 기존의 10자리 번호는 앞에 978을 붙이고 마지막 검증 숫자를 다시 계산하는 방식으로 13자리로 바뀌었다. ISBN-10을 <code>CHAR(10)</code> 기본 키로 쓰던 시스템은 열의 길이를 바꾸고, 모든 기존 값을 변환하고, 그 값을 외래 키로 복사해 간 주문·재고·리뷰 테이블을 모두 같은 방식으로 고쳐야 했다. 같은 책이 바뀐 것이 아니라 그 책을 부르는 이름의 규칙이 바뀐 것인데도 말이다.</p>
+
+<h4>실패 3: 수집할 수 없게 된다</h4>
+
+<p>어떤 자연 키는 법이 수집을 제한한다. 대한민국 개인정보 보호법 제24조의2(주민등록번호 처리의 제한)는 법이 정한 예외에 해당하지 않으면 개인정보처리자가 주민등록번호를 처리할 수 없게 한다. 회원 테이블의 기본 키를 주민등록번호로 설계한 시스템이라면, 키 값을 더는 받을 수 없고 이미 받은 값도 계속 보관할 근거가 사라지는 상황을 맞는다. 기본 키는 행이 존재하는 한 반드시 있어야 하는 값인데, 그 값을 지워야 하는 상황이 된 것이다. 이런 경우에는 키를 바꾸는 것 외에 길이 없다.</p>
+
+<h4>실패 4: 유일하지 않았던 것으로 드러난다</h4>
+
+<p>유일하다고 믿었던 값이 실제로는 겹치는 경우도 있다. 휴대폰 번호는 해지된 뒤 시간이 지나면 다른 가입자에게 다시 배정될 수 있다. 회사 안에서만 쓰던 사원 번호는 다른 회사를 인수해 두 회사의 사원 데이터를 합치는 순간 겹칠 수 있다. 상품 코드는 공급처마다 체계가 달라서, 공급처를 하나 늘리면 다른 공급처의 코드와 같은 값이 들어올 수 있다. 이런 경우 자연 키를 기본 키로 쓴 테이블은 새 데이터를 받아들이지 못하거나, 키에 열을 하나 더 붙여(예: 공급처 코드 + 상품 코드) 복합 키로 바꾸는 큰 공사를 해야 한다.</p>
+
+<h4>바뀐 값이 외래 키를 타고 번지는 과정</h4>
+
+<p>자연 키가 바뀌면 실제로 무슨 일이 일어나는지 추적해 보자. 회원 테이블의 기본 키를 <code>email</code>로 두고, 주문 테이블이 <code>member_email</code>로 그것을 참조한다고 하자. 외래 키에는 <code>ON UPDATE CASCADE</code>를 걸어 부모의 키가 바뀌면 자식도 따라 바뀌게 했다.</p>
+
+<pre><code class="language-sql">CREATE TABLE member_nk (
+    email  VARCHAR(255) NOT NULL,
+    name   VARCHAR(50)  NOT NULL,
+    PRIMARY KEY (email)
+);
+
+CREATE TABLE orders_nk (
+    order_id      BIGINT       NOT NULL AUTO_INCREMENT,
+    member_email  VARCHAR(255) NOT NULL,
+    ordered_at    DATETIME     NOT NULL,
+    PRIMARY KEY (order_id),
+    KEY idx_orders_member (member_email),
+    CONSTRAINT fk_orders_member FOREIGN KEY (member_email)
+        REFERENCES member_nk (email) ON UPDATE CASCADE
+);
+
+-- 회원 한 명이 이메일을 바꾼다
+UPDATE member_nk SET email = 'new@example.com' WHERE email = 'old@example.com';</code></pre>
+
+<p>마지막 <code>UPDATE</code> 한 문장이 하는 일을 순서대로 적어 보자. 먼저 회원 테이블에서 기본 키 값이 바뀐다. InnoDB에서 기본 키는 행이 저장되는 순서를 정하므로(뒤에서 자세히 본다), 키 값이 바뀌면 그 행이 놓일 자리 자체가 바뀐다. 회원 테이블에 보조 인덱스가 있다면 각 보조 인덱스 항목에는 기본 키 값이 들어 있으므로 그 항목들도 새 값으로 고쳐야 한다. 다음으로 외래 키의 <code>ON UPDATE CASCADE</code>에 따라 이 회원의 모든 주문 행에서 <code>member_email</code>이 바뀐다. 이 회원의 주문이 3,000건이면 3,000개 행이 갱신되고, 주문 테이블의 <code>idx_orders_member</code> 인덱스에서도 3,000개 항목이 옛 값 자리에서 빠져 새 값 자리로 옮겨 간다. 주문 테이블을 다시 참조하는 테이블이 있고 그쪽 외래 키도 이 값을 포함한다면 연쇄는 계속된다. 이 모든 변경은 하나의 트랜잭션 안에서 일어나므로, 그동안 관련된 행들에 잠금이 걸린다.</p>
+
+<p>그런데 이 연쇄가 닿지 못하는 곳이 있다. 데이터베이스 밖이다. 애플리케이션 캐시에 <code>old@example.com</code>을 키로 저장해 둔 값, 외부 결제 시스템에 넘겨 둔 회원 식별자, 로그 파일, 다른 서비스의 데이터베이스, 사용자가 즐겨찾기한 URL에 들어 있는 키 값은 <code>ON UPDATE CASCADE</code>가 고쳐 주지 않는다. 기본 키는 시스템 경계를 넘어 퍼져 나가는 값이고, 경계 밖으로 나간 값은 회수할 수 없다. 기본 키에 "바뀌지 않는다"는 조건을 그토록 강하게 요구하는 진짜 이유가 이것이다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>주소로 사람을 부르는 동네</strong><p>어떤 동네에서 사람을 "느티나무길 12번지 사는 사람"으로만 부른다고 하자. 우편, 병원 기록, 은행 계좌가 모두 주소로 그 사람을 가리킨다. 이 사람이 이사하는 순간 모든 기록을 고쳐야 하고, 하나라도 놓치면 그 기록은 엉뚱한 새 입주자를 가리킨다. 그래서 사회는 사람에게 주소와 별개인 번호를 붙여 기록끼리 그 번호로 연결한다. 다만 이 비유에는 한계가 있다. 현실의 고유 번호도 앞에서 본 주민등록번호처럼 바뀌거나 수집이 금지될 수 있지만, 데이터베이스가 직접 만든 대리 키는 외부 제도의 영향을 받지 않는다.</p></aside>
+
+<h3>대리 키: 의미가 없어서 바뀔 이유도 없는 번호</h3>
+
+<p><b>대리 키(surrogate key)</b>는 업무적 의미가 전혀 없는 값을 시스템이 만들어 기본 키로 쓰는 것이다. 인공 키(artificial key)라고도 부른다. MySQL에서는 <code>AUTO_INCREMENT</code> 정수가 가장 흔하고, UUID처럼 전역적으로 유일하도록 만든 128비트 값도 쓴다. 대리 키의 핵심 성질은 "의미가 없다"는 것이다. 의미가 없으니 현실이 바뀌어도 바뀔 이유가 없다. 회원이 이메일을 바꾸든, 개명하든, 법이 바뀌든 <code>member_id = 1042</code>는 그대로다.</p>
+
+<p>대리 키의 장점은 자연 키의 실패 목록을 뒤집은 것과 같다. 값이 바뀌지 않으므로 외래 키를 타고 번지는 연쇄 갱신이 애초에 일어나지 않는다. 시스템이 직접 만들므로 반드시 존재하고, 수집 제한을 받을 일도 없다. 크기가 일정하고 작다. <code>BIGINT</code>는 언제나 8바이트이고, 이메일처럼 길이가 들쭉날쭉하지 않다. 열이 하나라서 외래 키도 열 하나로 끝나고, 조인 조건도 단순하다. 그리고 모든 테이블이 같은 모양의 키를 가지므로 JPA 같은 ORM이 다루기도 쉽다.</p>
+
+<p>그러나 대리 키에도 대가가 있다. 가장 중요한 것은 <b>대리 키는 현실의 중복을 막지 못한다</b>는 점이다. 회원 테이블의 기본 키가 <code>member_id</code>뿐이고 <code>email</code>에 <code>UNIQUE</code>를 걸지 않았다면, 같은 이메일로 두 번 가입한 회원은 <code>member_id</code> 1042와 1043으로 아무 문제 없이 들어간다. 데이터베이스 입장에서 두 행은 키가 다르니 서로 다른 행이다. 현실에서는 한 사람인데 데이터베이스에는 두 사람이 생긴 것이다. 대리 키를 쓴다는 것은 자연 키를 버린다는 뜻이 아니라, 자연 키의 역할을 "행을 가리키는 역할"과 "중복을 막는 역할"로 나누어 앞의 것만 대리 키에게 넘긴다는 뜻이다. 뒤의 역할은 여전히 자연 키의 <code>UNIQUE</code> 제약이 맡아야 한다.</p>
+
+<p>두 번째 대가는 의미가 없다는 성질 그 자체에서 나온다. 주문 테이블에 <code>member_id = 1042</code>만 있으면 그 회원이 누구인지 알려면 회원 테이블과 조인해야 한다. 앞에서 본 국가 코드처럼 자연 키라면 필요 없었을 조인이다. 세 번째로, 대리 키가 외부에 노출되면 의도하지 않은 정보를 흘린다. 순서대로 증가하는 번호는 그 자체로 "지금까지 몇 건이 만들어졌는가"를 알려 주고, 1042번이 있으면 1041번과 1043번도 있으리라고 추측하게 만든다. 이 문제는 뒤의 "현대적인 설계"에서 다시 다룬다.</p>
+
+<h4>AUTO_INCREMENT는 어떻게 번호를 만드는가 (InnoDB)</h4>
+
+<p>대리 키를 이해하려면 그 번호가 만들어지는 방식도 알아야 한다. InnoDB는 <code>AUTO_INCREMENT</code> 열을 가진 테이블마다 메모리에 자동 증가 카운터를 두고, 행이 삽입될 때 이 카운터에서 값을 가져온다. 여러 트랜잭션이 동시에 삽입할 때 이 카운터를 어떻게 보호할지는 <code>innodb_autoinc_lock_mode</code> 설정이 정한다. MySQL 매뉴얼에 따르면 MySQL 8.0부터 기본값은 2(interleaved, 끼워 넣기 모드)이고, 그 전에는 1(consecutive, 연속 모드)이었다. 매뉴얼은 이 변경이 기본 복제 형식이 문장 기반에서 행 기반으로 바뀐 것을 반영한 것이라고 설명한다. 모드 2에서는 어떤 삽입 문도 테이블 수준의 <code>AUTO-INC</code> 잠금을 쓰지 않고 여러 문장이 동시에 실행된다. 값은 동시에 실행되는 모든 삽입 문에 걸쳐 유일하고 단조 증가하는 것이 보장되지만, 번호 할당이 문장들 사이에 끼워 넣어지므로 한 문장이 삽입한 행들의 번호가 연속적이지 않을 수 있다.</p>
+
+<p>번호에는 구멍(gap)이 생긴다는 점도 알아 두어야 한다. 매뉴얼은 모든 잠금 모드에서 자동 증가 값을 만든 트랜잭션이 롤백되면 그 값은 "잃어버린" 것이 되고 다시 쓰이지 않는다고 적는다. 일단 만들어진 값은 롤백되지 않는다. 그래서 <code>AUTO_INCREMENT</code> 열의 값에는 구멍이 있을 수 있다. 이것은 결함이 아니라 설계다. 롤백된 번호를 되돌려 받아 다시 나눠 주려면, 번호를 받은 트랜잭션이 커밋하거나 롤백할 때까지 다른 트랜잭션이 기다려야 한다. 그러면 동시 삽입이 줄을 서게 된다. 구멍을 허용하는 대신 동시성을 얻은 것이다. 따라서 "주문 번호에 빈 번호가 있으면 안 된다"는 요구 사항이 있다면 <code>AUTO_INCREMENT</code>로 해결할 문제가 아니다. 그런 요구는 별도의 채번 로직과 그에 따른 직렬화 비용을 감수해야 한다.</p>
+
+<p>MySQL 8.0에서는 카운터의 영속성도 바뀌었다. 매뉴얼에 따르면 8.0에서는 현재 최대 자동 증가 카운터 값이 바뀔 때마다 리두 로그에 기록되고 체크포인트마다 데이터 사전에 저장되어, 서버를 재시작해도 카운터 값이 유지된다. 다만 서버가 예기치 않게 종료된 경우에는 이전에 할당된 값이 다시 쓰이지 않는다고 보장할 수 없다고 덧붙인다. 마지막으로 자료형의 한계가 있다. 매뉴얼은 열이 자료형의 상한에 이르면 다음 번호 생성 시도가 실패한다고 적는다. MySQL 8.4.13과 8.0.46에서 <code>INT AUTO_INCREMENT</code> 열의 카운터를 2,147,483,647에서 시작하게 하고 두 번 삽입하면, 첫 행은 2,147,483,647을 받고 두 번째 삽입은 <code>ERROR 1062 (23000): Duplicate entry '2147483647' for key 'ai_int.PRIMARY'</code>로 실패한다(<code>ai_int</code>는 실험용 테이블 이름이다). 부호 있는 <code>INT</code>의 최댓값은 2,147,483,647이고 <code>INT UNSIGNED</code>는 4,294,967,295, <code>BIGINT</code>는 2<sup>63</sup>−1 = 9,223,372,036,854,775,807이다. 오래 살아남을 테이블의 대리 키로 <code>INT</code>를 골랐다가 상한에 닿으면 열의 자료형을 바꾸는 큰 작업을 해야 하므로, 행이 많이 쌓일 테이블은 처음부터 <code>BIGINT</code>를 쓰는 것이 일반적인 선택이다. 삽입한 행의 번호는 <code>LAST_INSERT_ID()</code>로 얻는데, 매뉴얼은 이 함수가 커넥션별로 동작해서 다른 커넥션의 삽입에 영향을 받지 않는다고 설명한다.</p>
+
+<h3>성능 트레이드오프 1: InnoDB에서 기본 키는 테이블 그 자체다</h3>
+
+<p>자연 키와 대리 키의 선택이 모델링 취향을 넘어서는 이유는 InnoDB의 저장 구조에 있다. 데이터베이스 입문·기본편에서 B+Tree와 클러스터형 인덱스를 다뤘으니 핵심만 다시 세우고, 그것이 키 선택에 무엇을 뜻하는지 따라가 보자.</p>
+
+<p>MySQL 매뉴얼에 따르면 테이블에 <code>PRIMARY KEY</code>를 정의하면 InnoDB는 그것을 클러스터형 인덱스(clustered index)로 쓴다. 클러스터형 인덱스는 행 데이터 자체를 담는 B+Tree다. 리프 페이지에 인덱스 항목이 아니라 행 전체가 기본 키 순서로 들어 있다. 그러니까 InnoDB 테이블은 "기본 키로 정렬된 B+Tree"이고, 따로 떨어진 힙(heap) 영역에 행이 쌓이는 구조가 아니다. 기본 키를 정하는 순간 행들이 디스크 위에 어떤 순서로 놓일지가 정해진다.</p>
+
+<p>그 밖의 인덱스는 보조 인덱스(secondary index)다. 매뉴얼은 InnoDB의 보조 인덱스 레코드가 보조 인덱스로 지정한 열들과 함께 그 행의 기본 키 열들을 담고 있으며, InnoDB가 이 기본 키 값으로 클러스터형 인덱스에서 행을 찾는다고 설명한다. 보조 인덱스의 리프에는 행의 물리적 주소가 아니라 기본 키 값이 들어 있는 것이다. 그래서 보조 인덱스로 행을 찾으면 B+Tree를 두 번 내려간다. 보조 인덱스에서 기본 키 값을 얻고, 그 값으로 클러스터형 인덱스를 다시 내려가 행을 읽는다.</p>
+
+<pre class="diagram">  보조 인덱스 uk_member_email                클러스터형 인덱스 (PRIMARY = member_id)
+  ┌──────────────────────────────┐          ┌──────────────────────────────────────────┐
+  │ email            │ member_id │          │ member_id │ email          │ name │ ...   │
+  ├──────────────────┼───────────┤          ├───────────┼────────────────┼──────┼───────┤
+  │ a@example.com    │   1043    │ ──┐      │   1041    │ k@example.com  │ ...  │       │
+  │ k@example.com    │   1041    │   │      │   1042    │ z@example.com  │ ...  │       │
+  │ z@example.com    │   1042    │   └────▶ │   1043    │ a@example.com  │ ...  │       │
+  └──────────────────────────────┘          └──────────────────────────────────────────┘
+   email 순으로 정렬, 항목마다 기본 키 값      member_id 순으로 정렬, 리프에 행 전체
+
+  WHERE email = 'a@example.com'
+    1) uk_member_email을 내려가 'a@example.com' 항목에서 member_id = 1043을 얻는다
+    2) 클러스터형 인덱스를 member_id = 1043으로 다시 내려가 행 전체를 읽는다</pre>
+
+<p>이 구조에서 키 선택에 관한 두 가지 결론이 바로 나온다. 첫째, <b>기본 키의 크기는 모든 보조 인덱스에 곱해진다</b>. 매뉴얼은 이를 직접 적는다. 기본 키가 길면 보조 인덱스가 더 많은 공간을 쓰므로 짧은 기본 키가 유리하다는 것이다. 예를 들어 행이 1,000만 개이고 보조 인덱스가 세 개인 테이블을 생각해 보자. 행 헤더나 페이지 구조의 부가 비용은 빼고 각 보조 인덱스 항목에 덧붙는 기본 키 값만 계산하면, 기본 키가 <code>BIGINT</code>(8바이트)일 때 3 × 10,000,000 × 8 = 2억 4천만 바이트다. 기본 키가 평균 25자의 ASCII 이메일이라면(utf8mb4에서도 ASCII 문자는 1바이트다) 3 × 10,000,000 × 25 = 7억 5천만 바이트가 된다. 같은 데이터, 같은 인덱스인데 기본 키 선택 하나로 보조 인덱스가 수억 바이트 커지는 것이다. 인덱스가 커지면 한 페이지에 들어가는 항목 수가 줄고, 같은 범위를 읽는 데 더 많은 페이지가 필요하며, 버퍼 풀에 올려 둘 수 있는 인덱스의 비율도 줄어든다.</p>
+
+<p>둘째, <b>기본 키 값이 바뀌면 그 행이 놓일 자리와 모든 보조 인덱스 항목이 함께 바뀐다</b>. 클러스터형 인덱스는 기본 키 순서로 정렬되어 있으므로 키 값이 바뀌면 행이 정렬 순서상 다른 위치로 가야 하고, 그 행을 가리키던 모든 보조 인덱스 항목은 옛 기본 키 값을 담고 있으므로 새 값으로 고쳐야 한다. 앞에서 추적한 이메일 변경의 연쇄가 테이블 하나 안에서도 이렇게 일어난다. "기본 키는 바뀌지 않아야 한다"는 논리 모델의 원칙이 물리 구조에서도 그대로 비용으로 나타나는 셈이다.</p>
+
+<p>기본 키를 아예 정의하지 않으면 어떻게 될까. 매뉴얼에 따르면 기본 키가 없으면 InnoDB는 모든 키 열이 <code>NOT NULL</code>인 첫 번째 <code>UNIQUE</code> 인덱스를 클러스터형 인덱스로 쓴다. 그런 인덱스도 없으면 행 ID 값을 담은 합성 열 위에 <code>GEN_CLUST_INDEX</code>라는 숨은 클러스터형 인덱스를 만든다. 이 행 ID는 새 행이 삽입될 때마다 단조 증가하는 6바이트 필드다. 결국 InnoDB 테이블에는 어떤 형태로든 클러스터형 인덱스가 있고, 설계자가 키를 정하지 않으면 엔진이 대신 정한다. 다만 숨은 행 ID는 SQL로 조회할 수 없으니 애플리케이션이 행을 가리키는 데 쓸 수 없다. MySQL 8.0.30부터는 <code>sql_generate_invisible_primary_key</code>를 켜면 기본 키 없이 만든 InnoDB 테이블에 <code>my_row_id</code>라는 이름의 <code>BIGINT UNSIGNED NOT NULL AUTO_INCREMENT</code> 보이지 않는(invisible) 열을 기본 키로 자동 추가하는 기능(GIPK)도 있다. 기본값은 <code>OFF</code>다. 8.0.13에서 추가된 <code>sql_require_primary_key</code>는 반대 방향의 안전장치로, 켜 두면 기본 키 없는 테이블을 만드는 문장을 거부한다. 이런 장치들이 생긴 것 자체가 "InnoDB 테이블에는 설계자가 정한 기본 키가 있어야 한다"는 것을 말해 준다.</p>
+
+<x-visual id="db-design1-03-clustered-secondary" title="기본 키 크기가 보조 인덱스에 복사되는 구조" kind="구조 다이어그램" ratio="16:9">
+<x-hint>InnoDB 보조 인덱스의 모든 항목이 기본 키 값을 담고 있어서, 기본 키가 길면 모든 보조 인덱스가 함께 커진다는 점을 BIGINT 기본 키와 이메일 기본 키를 나란히 놓아 보여 준다.</x-hint>
+<x-prompt>A technical comparison diagram on a white background with two stacked rows. Top row labeled "기본 키 = BIGINT (8바이트)": on the left a B+Tree triangle labeled "클러스터형 인덱스" with leaf boxes labeled "행 전체"; on the right three narrow B+Tree triangles labeled "보조 인덱스 1", "보조 인덱스 2", "보조 인덱스 3", each leaf box showing a small key cell plus a tiny blue cell labeled "PK". Bottom row labeled "기본 키 = 이메일 (가변 길이)": the same layout, but the blue "PK" cell in every leaf box of the three secondary trees is drawn much wider, making those triangles visibly fatter. Thin arrows from a secondary leaf box to the clustered tree labeled "기본 키로 다시 탐색". Flat vector style, blue accent for primary key cells, gray for everything else, no other text.</x-prompt>
+<x-caption>InnoDB 보조 인덱스의 항목마다 기본 키 값이 들어 있으므로, 기본 키의 너비는 보조 인덱스의 개수만큼 곱해진다.</x-caption>
+</x-visual>
+
+<h3>성능 트레이드오프 2: 키가 들어오는 순서와 페이지 분할</h3>
+
+<p>기본 키의 크기만큼 중요한 것이 키 값이 들어오는 순서다. 클러스터형 인덱스는 기본 키 순서로 정렬된 B+Tree이므로, 새 행은 키 값에 맞는 리프 페이지의 정해진 자리에 들어가야 한다. <code>AUTO_INCREMENT</code>로 만든 키는 항상 지금까지의 최댓값보다 크므로 새 행은 언제나 B+Tree의 오른쪽 끝 리프에 들어간다. 반면 무작위 값(UUIDv4 같은)이나 이메일처럼 들어오는 순서와 정렬 순서가 상관없는 값은 B+Tree의 아무 리프에나 들어간다.</p>
+
+<p>리프 페이지가 꽉 찬 상태에서 그 페이지에 행이 들어와야 하면 페이지를 나누는 페이지 분할(page split)이 일어난다. MySQL 매뉴얼의 InnoDB 인덱스 물리 구조 설명은 이 차이를 직접 적고 있다. InnoDB는 클러스터형 인덱스에 새 레코드를 삽입할 때 이후의 삽입과 갱신을 위해 페이지의 1/16을 비워 두려 한다. 인덱스 레코드가 순차적으로(오름차순이든 내림차순이든) 삽입되면 결과 인덱스 페이지는 약 15/16이 차고, 무작위 순서로 삽입되면 페이지는 1/2에서 15/16 사이로 찬다. 같은 매뉴얼에 따르면 인덱스 페이지의 기본 크기는 16KB다.</p>
+
+<p>왜 그렇게 되는지 손으로 따라가 보자. 오름차순 삽입에서는 오른쪽 끝 리프가 가득 차면 새 리프를 오른쪽에 하나 열고 거기에 새 행을 넣으면 된다. 이전 리프는 가득 찬 채로 남고, 그 리프에는 다시는 삽입이 오지 않는다. 키가 계속 커지기 때문이다. 무작위 삽입에서는 가득 찬 리프의 한가운데에 행이 끼어들어야 하므로, 리프를 대략 반으로 나눠 절반의 레코드를 새 페이지로 옮기고 그 사이에 행을 넣는다. 나뉜 두 페이지는 각각 절반 정도만 찬 상태가 되고, 이후 무작위 삽입이 그 빈자리를 조금씩 채워 간다. 어떤 페이지는 다시 가득 차서 또 나뉘고, 어떤 페이지는 절반 근처에 머문다. 그래서 1/2에서 15/16 사이의 분포가 나온다.</p>
+
+<p>이 과정을 직접 확인할 수 있도록, 리프 페이지만 흉내 낸 작은 모형을 자바로 만들어 보자. 이것은 InnoDB의 실제 분할 알고리즘이 아니라 원리를 보이기 위한 단순화다. 리프 하나에 키 100개가 들어간다고 하고, 가득 찬 리프에 삽입이 오면 두 가지로 처리한다. 그 리프가 가장 오른쪽 리프이고 새 키가 맨 끝에 붙는 경우라면 새 빈 리프를 열고, 그 밖의 경우라면 리프를 반으로 나눈다. 1부터 100,000까지 증가하는 키와, 시드를 고정한 <code>java.util.Random</code>이 만든 무작위 <code>long</code> 키 100,000개를 각각 넣고 결과를 비교한다.</p>
+
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Random;
+import java.util.TreeMap;
+
+// B+Tree의 리프 페이지만 흉내 낸 단순 모형 (InnoDB의 실제 알고리즘이 아니다)
+public class LeafSplit {
+    static final int CAP = 100;                          // 리프 하나에 들어가는 키 수
+
+    // 키: 리프의 첫 키, 값: 그 리프에 정렬되어 들어 있는 키들
+    final TreeMap<Long, ArrayList<Long>> leaves = new TreeMap<>();
+    int splits = 0;
+
+    void insert(long key) {
+        if (leaves.isEmpty()) {
+            ArrayList<Long> first = new ArrayList<>();
+            first.add(key);
+            leaves.put(key, first);
+            return;
+        }
+        Map.Entry<Long, ArrayList<Long>> e = leaves.floorEntry(key);
+        if (e == null) e = leaves.firstEntry();         // 가장 작은 키보다 작으면 첫 리프로
+        ArrayList<Long> leaf = e.getValue();
+        int pos = Collections.binarySearch(leaf, key);
+        pos = -pos - 1;                                  // 중복 없는 키만 넣는다고 가정
+        if (leaf.size() < CAP) {
+            leaf.add(pos, key);
+            if (pos == 0) { leaves.remove(e.getKey()); leaves.put(key, leaf); }
+            return;
+        }
+        splits++;
+        boolean appendAtRightEnd = (pos == leaf.size()) && (e.getKey().equals(leaves.lastKey()));
+        if (appendAtRightEnd) {                          // 오른쪽 끝에 붙이는 삽입: 새 빈 리프를 연다
+            ArrayList<Long> fresh = new ArrayList<>();
+            fresh.add(key);
+            leaves.put(key, fresh);
+        } else {                                         // 그 밖: 반으로 나눈다
+            leaf.add(pos, key);
+            int mid = leaf.size() / 2;
+            ArrayList<Long> right = new ArrayList<>(leaf.subList(mid, leaf.size()));
+            leaf.subList(mid, leaf.size()).clear();
+            leaves.remove(e.getKey());
+            leaves.put(leaf.get(0), leaf);
+            leaves.put(right.get(0), right);
+        }
+    }
+
+    void report(String name, int n) {
+        System.out.printf("%s: 리프 %d개, 분할 %d회, 평균 채움률 %.1f%%%n",
+                name, leaves.size(), splits, 100.0 * n / (leaves.size() * (double) CAP));
+    }
+
+    public static void main(String[] args) {
+        int n = 100_000;
+        LeafSplit seq = new LeafSplit();
+        for (long k = 1; k <= n; k++) seq.insert(k);    // AUTO_INCREMENT처럼 증가하는 키
+        seq.report("증가하는 키", n);
+
+        LeafSplit rnd = new LeafSplit();
+        Random r = new Random(42);                      // 시드를 고정해 결과를 재현한다
+        for (int i = 0; i < n; i++) rnd.insert(r.nextLong()); // UUIDv4처럼 무작위인 키
+        rnd.report("무작위 키", n);
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">증가하는 키: 리프 1000개, 분할 999회, 평균 채움률 100.0%
+무작위 키: 리프 1462개, 분할 1461회, 평균 채움률 68.4%</code></pre>
+
+<p>결과를 한 줄씩 읽어 보자. 증가하는 키에서는 리프 1,000개가 모두 꽉 찼다. 100,000을 100으로 나눈 값이 그대로 리프 수다. 분할 999회는 모두 "오른쪽 끝에 새 리프를 여는" 분할이라 레코드를 옮기는 일이 한 번도 없었다. 무작위 키에서는 같은 100,000개의 키를 담는 데 리프가 1,462개 필요했고, 평균 채움률은 68.4%다. 분할 1,461회는 모두 레코드의 절반을 새 페이지로 옮기는 분할이었다. <code>java.util.Random</code>은 같은 시드에 대해 같은 수열을 내도록 Javadoc에 알고리즘이 명시되어 있으므로 이 결과는 어느 JDK에서 돌려도 같다. 이 모형은 InnoDB처럼 1/16을 비워 두지 않으므로 증가하는 키에서 100%가 나왔지만, InnoDB에서는 매뉴얼이 말한 대로 약 15/16이 된다. 모형의 숫자 자체보다 중요한 것은 차이의 방향이다. 같은 데이터를 담는데도 무작위 순서로 넣으면 페이지가 더 많이 필요하고, 분할할 때마다 레코드를 옮기는 비용이 든다.</p>
+
+<p>페이지 수가 늘어나는 것만이 문제가 아니다. 증가하는 키에서 삽입이 건드리는 리프는 언제나 오른쪽 끝 하나다. 그 페이지와 그 위의 경로 몇 개만 버퍼 풀에 있으면 삽입은 디스크를 읽지 않고 진행된다. 무작위 키에서는 삽입마다 B+Tree의 어느 리프든 건드릴 수 있다. 인덱스 전체가 버퍼 풀에 들어가는 동안에는 이 차이가 크게 드러나지 않지만, 테이블이 커져 인덱스가 버퍼 풀보다 커지면 삽입할 리프가 메모리에 없을 가능성이 높아지고, 삽입 하나가 디스크 읽기 하나를 부르게 된다. 이 효과는 클러스터형 인덱스에만 해당하지 않는다. 무작위 값이 들어가는 보조 인덱스, 예를 들어 이메일이나 무작위 UUID에 건 <code>UNIQUE</code> 인덱스도 같은 이유로 무작위 삽입을 겪는다. 다만 보조 인덱스 항목은 행 전체보다 작으므로 한 페이지에 더 많은 항목이 들어가 영향이 상대적으로 작다.</p>
+
+<x-visual id="db-design1-03-page-split" title="증가하는 키와 무작위 키의 리프 페이지 분할 비교" kind="비교 다이어그램" ratio="16:9">
+<x-hint>증가하는 키는 오른쪽 끝에 새 페이지를 이어 붙여 꽉 찬 페이지가 남고, 무작위 키는 가운데 페이지를 반으로 나눠 반쯤 찬 페이지가 흩어진다는 대비를 보여 준다.</x-hint>
+<x-prompt>A side-by-side technical diagram on a white background. Left panel titled "증가하는 키": a horizontal row of five leaf page rectangles; the first four are filled almost completely with blue (about 15/16), a small arrow labeled "새 키" points to a new fifth page appended at the right end, labeled "오른쪽 끝에 새 페이지". Right panel titled "무작위 키": a row of leaf page rectangles with varied fill levels from half to nearly full in orange; one full page in the middle is shown splitting into two half-filled pages with a scissors icon and a label "가운데 분할: 절반을 옮김", and several small arrows labeled "새 키" landing on random pages. Under the left panel the text "약 15/16", under the right panel the text "1/2 ~ 15/16". Flat vector style, blue and orange accents, no other text.</x-prompt>
+<x-caption>InnoDB 매뉴얼은 순차 삽입이면 페이지가 약 15/16, 무작위 삽입이면 1/2에서 15/16 사이로 찬다고 적는다.</x-caption>
+</x-visual>
+
+<h3>성능 트레이드오프 3: 자연 키가 이기는 경우</h3>
+
+<p>지금까지만 보면 대리 키가 모든 면에서 나아 보이지만, 성능에서 자연 키가 이기는 경우도 분명히 있다. 균형 잡힌 판단을 위해 반대쪽도 정확히 짚어 두자.</p>
+
+<p>첫째, <b>자연 키로 조회하는 일이 대부분인 테이블</b>이다. 회원 테이블의 기본 키를 <code>member_id</code>로 두고 <code>email</code>에 <code>UNIQUE</code>를 걸었다고 하자. 로그인처럼 이메일로 회원을 찾는 쿼리는 앞의 그림처럼 <code>uk_member_email</code>을 내려가 <code>member_id</code>를 얻고, 다시 클러스터형 인덱스를 내려가야 한다. B+Tree를 두 번 탐색하는 것이다. 이메일이 기본 키라면 클러스터형 인덱스를 한 번 내려가는 것으로 행 전체를 얻는다. 자연 키의 범위로 읽는 쿼리라면 차이가 더 커진다. 기본 키 순서로 행이 모여 있으므로 연속된 리프를 차례로 읽으면 되지만, 보조 인덱스를 거치면 항목마다 클러스터형 인덱스로 흩어진 탐색을 해야 한다.</p>
+
+<p>둘째, <b>쓰기 비용</b>이다. 대리 키와 자연 키의 <code>UNIQUE</code>를 함께 두면 행 하나를 삽입할 때마다 B+Tree 두 개를 고쳐야 한다. 클러스터형 인덱스와 <code>UNIQUE</code> 보조 인덱스다. <code>UNIQUE</code> 인덱스는 삽입 전에 같은 값이 있는지도 확인해야 한다. 자연 키를 기본 키로 쓰면 이 일이 클러스터형 인덱스 하나에서 끝난다. 앞에서 본 것처럼 이메일 같은 자연 키는 들어오는 순서가 무작위라서 클러스터형 인덱스가 무작위 삽입을 겪는다는 단점이 있지만, 대리 키를 쓰더라도 그 무작위 삽입은 <code>UNIQUE</code> 보조 인덱스 쪽으로 자리를 옮길 뿐 사라지지 않는다는 점도 함께 기억해야 한다.</p>
+
+<p>셋째, <b>조인을 없애 주는 짧고 안정적인 코드값</b>이다. ISO 국가 코드(<code>'KR'</code>), ISO 통화 코드(<code>'KRW'</code>), 사내에서 정의하고 관리하는 상태 코드(<code>'PAID'</code>, <code>'SHIPPED'</code>)처럼 짧고, 거의 바뀌지 않으며, 바뀌더라도 그 변경을 우리가 통제할 수 있는 값은 기본 키로 써도 앞에서 본 실패를 겪을 위험이 작다. 이런 값을 외래 키로 가진 테이블은 코드 테이블과 조인하지 않고도 의미를 읽을 수 있다. 넷째, 뒤에서 볼 <b>다대다 연결 테이블</b>이다. 양쪽 외래 키의 조합이 이미 자연스러운 후보 키라서, 대리 키를 따로 두면 열과 인덱스만 하나씩 늘어나는 경우가 많다.</p>
+
+<p>여러 선택지를 한 표로 비교하면 다음과 같다. 숫자는 키 값 자체의 크기이고, 행 헤더 같은 저장 구조의 부가 비용은 포함하지 않았다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>기본 키 후보</th><th>키 값 크기</th><th>삽입 순서</th><th>값이 바뀔 위험</th><th>자연 키로 조회</th></tr></thead><tbody>
+<tr><td><code>BIGINT AUTO_INCREMENT</code></td><td>8바이트</td><td>증가(오른쪽 끝)</td><td>없음</td><td>보조 인덱스 → 클러스터형 인덱스(2회 탐색)</td></tr>
+<tr><td>이메일 <code>VARCHAR</code></td><td>문자열 길이만큼(가변)</td><td>무작위</td><td>높음(사용자가 바꿈)</td><td>클러스터형 인덱스 1회</td></tr>
+<tr><td>UUIDv4 <code>BINARY(16)</code></td><td>16바이트</td><td>무작위</td><td>없음</td><td>보조 인덱스 → 클러스터형 인덱스</td></tr>
+<tr><td>UUIDv7 <code>BINARY(16)</code></td><td>16바이트</td><td>대체로 증가(밀리초 단위 시각순)</td><td>없음</td><td>보조 인덱스 → 클러스터형 인덱스</td></tr>
+<tr><td>UUID 문자열 <code>CHAR(36)</code></td><td>36자(문자 집합에 따라 36바이트 이상)</td><td>버전에 따라 다름</td><td>없음</td><td>보조 인덱스 → 클러스터형 인덱스</td></tr>
+</tbody></table></div>
+
+<h3>UUID를 키로 쓸 때: 버전마다 다른 비트 배치</h3>
+
+<p>대리 키를 데이터베이스가 아니라 애플리케이션이 만들어야 하는 경우가 있다. 여러 데이터베이스에 나뉘어 저장되는 데이터에 전역적으로 겹치지 않는 번호가 필요할 때, 행을 삽입하기 전에 키를 알아야 할 때, 오프라인에서 만든 데이터를 나중에 합칠 때가 그렇다. 이때 흔히 쓰는 것이 UUID(Universally Unique IDentifier)다. UUID는 128비트, 곧 16바이트의 값이고, 사람이 읽는 형식으로는 <code>8-4-4-4-12</code>개의 16진수 숫자를 하이픈으로 이은 36자 문자열로 쓴다. UUID에는 여러 버전이 있고, 버전마다 128비트를 채우는 방식이 다르다. 키로서의 성질, 특히 삽입 순서가 이 비트 배치에서 결정된다. UUID의 표준 문서는 2024년 5월에 나온 RFC 9562이고, 이 문서는 이전 표준인 RFC 4122를 대체(obsolete)한다.</p>
+
+<h4>버전 1: MySQL의 UUID()가 만드는 값</h4>
+
+<p>MySQL 매뉴얼에 따르면 <code>UUID()</code> 함수는 RFC 4122의 버전 1을 따르는 값을 <code>aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee</code> 형식의 문자열로 돌려준다. 앞의 세 숫자는 타임스탬프의 하위·중간·상위 부분으로 만들어지고 상위 부분에는 버전 번호가 들어 있다. 넷째 숫자는 타임스탬프가 단조성을 잃는 경우를 대비한 값이고, 다섯째는 공간적 유일성을 위한 IEEE 802 노드 번호(얻을 수 없으면 난수)다. 버전 1의 타임스탬프는 1582년 10월 15일부터 센 100나노초 단위의 60비트 값이고, 그 하위 32비트(time_low)가 문자열의 맨 앞에 온다.</p>
+
+<p>여기에 함정이 있다. 가장 빨리 변하는 부분이 맨 앞에 있는 것이다. time_low는 100나노초마다 1씩 증가하는 32비트 값이므로 2<sup>32</sup> × 100나노초 = 429.4967296초, 곧 약 7분 9.5초마다 한 바퀴 돌아 다시 작은 값부터 시작한다. 이 값을 그대로 기본 키로 쓰면 7분여 동안은 키가 증가하다가 다시 작은 쪽으로 돌아가는 일이 반복되어, 삽입 위치가 인덱스 전체를 주기적으로 훑게 된다. MySQL 8.0의 <code>UUID_TO_BIN(string_uuid, swap_flag)</code>은 이 문제를 위한 함수다. 매뉴얼에 따르면 결과는 <code>VARBINARY(16)</code>이고, <code>swap_flag</code>가 1이면 time-low와 time-high 부분(첫째와 셋째 16진수 그룹)을 맞바꾸어 빨리 변하는 부분을 오른쪽으로 옮기며, 결과를 인덱스가 걸린 열에 저장할 때 인덱스 효율을 높일 수 있다. 매뉴얼은 이 맞바꿈이 버전 1 형식을 가정하므로 다른 버전의 UUID에는 이점이 없다고도 분명히 적는다. 역변환은 <code>BIN_TO_UUID(binary_uuid, swap_flag)</code>다.</p>
+
+<pre data-label="MySQL 8.4.13·8.0.46에서 실행"><code class="language-sql">SET @u = 'a1b2c3d4-e5f6-11ee-8c90-0242ac120002';
+
+SELECT HEX(UUID_TO_BIN(@u));      -- A1B2C3D4E5F611EE8C900242AC120002  (문자열 순서 그대로)
+SELECT HEX(UUID_TO_BIN(@u, 1));   -- 11EEE5F6A1B2C3D48C900242AC120002  (셋째 그룹과 첫째 그룹을 맞바꿈)
+SELECT BIN_TO_UUID(UUID_TO_BIN(@u, 1), 1);  -- a1b2c3d4-e5f6-11ee-8c90-0242ac120002</code></pre>
+
+<p>두 번째 결과를 바이트 순서로 읽으면 <code>11EE</code>(버전 1과 타임스탬프 상위 12비트), <code>E5F6</code>(타임스탬프 중간 16비트), <code>A1B2C3D4</code>(타임스탬프 하위 32비트) 순서다. 60비트 타임스탬프가 상위 비트부터 하위 비트 순서로 늘어선 것이다. 그래서 맞바꾼 값은 만들어진 시각 순서대로 정렬되고, <code>BINARY</code> 열의 비교는 매뉴얼 표현대로 바이트의 수치 값에 기반하므로 인덱스에 거의 증가하는 순서로 들어간다. 또 하나 알아 둘 것은 매뉴얼의 경고다. <code>UUID()</code> 값은 유일하도록 의도되었지만 추측할 수 없거나 예측 불가능하다는 보장은 없으며, 예측 불가능성이 필요하면 다른 방법으로 만들어야 한다고 적는다. 시각과 노드 번호로 만든 값이니 당연한 결과다.</p>
+
+<h4>버전 4와 버전 7: 자바에서 만드는 값</h4>
+
+<p>자바의 <code>java.util.UUID.randomUUID()</code>는 버전 4 UUID를 만든다. 버전과 변형(variant)을 나타내는 6비트를 뺀 122비트가 모두 난수다. 난수이므로 만들어진 순서와 정렬 순서 사이에 아무 관계가 없고, 앞의 모형에서 본 무작위 삽입을 그대로 겪는다. RFC 9562도 UUIDv4처럼 시간 순서가 없는 버전은 데이터베이스 인덱스 지역성(locality)이 나쁘다고 적는다. 이 문제를 해결하려고 RFC 9562에 새로 정의된 것이 버전 7이다. 레이아웃은 상위 48비트가 밀리초 단위의 유닉스 타임스탬프(<code>unix_ts_ms</code>), 그다음 4비트가 버전(<code>0111</code>), 12비트가 난수(<code>rand_a</code>), 2비트가 변형(<code>10</code>), 나머지 62비트가 난수(<code>rand_b</code>)다. 시각이 맨 앞에 오므로 바이트 순서로 정렬하면 대체로 만들어진 순서가 된다. RFC 9562는 가능하면 버전 1과 6 대신 버전 7을 쓰라고(SHOULD) 권고한다.</p>
+
+<p>JDK 21의 <code>UUID</code> 클래스에는 버전 7을 만드는 팩터리 메서드가 없다. JDK 21 소스(<code>lib/src.zip</code>)를 보면 <code>UUID</code>를 만드는 정적 메서드는 <code>randomUUID()</code>, <code>nameUUIDFromBytes(byte[])</code>, <code>fromString(String)</code>뿐이다. 그러니 레이아웃을 이해하기 위해 RFC 9562의 비트 배치대로 직접 조립해 보자. 시각을 고정해 1밀리초씩 늦게 만든 것으로 치고 버전 7 값 1,000개를 만들고, 비교용으로 버전 4 값 1,000개를 만든다. 그리고 각각을 데이터베이스의 <code>BINARY(16)</code>처럼 16바이트를 앞에서부터 부호 없이 비교해 정렬했을 때 만든 순서와 같은지 확인한다.</p>
+
+<pre><code class="language-java">import java.nio.ByteBuffer;
+import java.security.SecureRandom;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.UUID;
+
+public class UuidOrder {
+    static final SecureRandom RND = new SecureRandom();
+
+    // RFC 9562 5.7: unix_ts_ms(48) | ver(4)=0111 | rand_a(12) | var(2)=10 | rand_b(62)
+    static UUID v7(long unixMillis) {
+        long msb = (unixMillis << 16)              // 상위 48비트: 밀리초 타임스탬프
+                 | (0x7L << 12)                    // 4비트 버전 = 7
+                 | (RND.nextInt() & 0x0FFF);       // rand_a 12비트
+        long lsb = (RND.nextLong() & 0x3FFF_FFFF_FFFF_FFFFL) // rand_b 62비트
+                 | 0x8000_0000_0000_0000L;         // 2비트 variant = 10
+        return new UUID(msb, lsb);
+    }
+
+    // DB의 BINARY(16)처럼 16바이트를 앞에서부터 부호 없이 비교하기 위한 변환
+    static byte[] bytes(UUID u) {
+        return ByteBuffer.allocate(16)
+                .putLong(u.getMostSignificantBits())
+                .putLong(u.getLeastSignificantBits())
+                .array();
+    }
+
+    static boolean sortedEqualsCreated(List<UUID> created) {
+        List<UUID> sorted = new ArrayList<>(created);
+        sorted.sort((a, b) -> Arrays.compareUnsigned(bytes(a), bytes(b)));
+        return sorted.equals(created);
+    }
+
+    public static void main(String[] args) {
+        long base = 1_700_000_000_000L;            // 고정된 시각(밀리초)
+        List<UUID> v4 = new ArrayList<>();
+        List<UUID> v7 = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            v4.add(UUID.randomUUID());
+            v7.add(v7(base + i));                  // 1밀리초씩 늦게 만든 것으로 친다
+        }
+        UUID first = v7.get(0);
+        System.out.println("v4 version=" + v4.get(0).version() + ", variant=" + v4.get(0).variant());
+        System.out.println("v7 version=" + first.version() + ", variant=" + first.variant());
+        System.out.println("v7 첫 값 = " + first);
+        System.out.println("v7 첫 값의 시각 = " + Instant.ofEpochMilli(first.getMostSignificantBits() >>> 16));
+        System.out.println("v4 정렬 순서 == 생성 순서 ? " + sortedEqualsCreated(v4));
+        System.out.println("v7 정렬 순서 == 생성 순서 ? " + sortedEqualsCreated(v7));
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21, 셋째 줄의 018bcfe5-6800-7 뒤는 실행마다 다르다)"><code class="language-text">v4 version=4, variant=2
+v7 version=7, variant=2
+v7 첫 값 = 018bcfe5-6800-7ede-b3b3-dd9529118b69
+v7 첫 값의 시각 = 2023-11-14T22:13:20Z
+v4 정렬 순서 == 생성 순서 ? false
+v7 정렬 순서 == 생성 순서 ? true</code></pre>
+
+<p>한 줄씩 확인해 보자. <code>UUID.version()</code>과 <code>variant()</code>는 비트를 읽어 돌려줄 뿐이므로, 직접 조립한 값에서도 버전 7과 변형 2(RFC가 정의한 변형)가 읽힌다. 고정 시각 1,700,000,000,000밀리초는 16진수로 <code>0x018BCFE56800</code>이고, 이것을 48비트로 왼쪽에 놓았으므로 UUID 문자열은 언제나 <code>018bcfe5-6800-</code>으로 시작하고, 그다음 숫자 <code>7</code>이 버전이다. 그 뒤는 난수라 실행마다 다르다. 상위 64비트를 16비트 오른쪽으로 밀면 시각이 그대로 복원되어 2023-11-14T22:13:20Z가 나온다. 버전 4의 1,000개가 우연히 만든 순서대로 정렬되어 있을 확률은 1/1000!이므로 사실상 언제나 <code>false</code>가 나오고, 버전 7은 시각이 앞에 있으므로 <code>true</code>다.</p>
+
+<p>이 실험에는 의도적으로 감춘 조건이 하나 있다. 값마다 시각을 1밀리초씩 다르게 주었다는 것이다. 실제로는 같은 밀리초 안에 여러 값이 만들어질 수 있고, 그 경우 위의 단순한 구현은 <code>rand_a</code>와 <code>rand_b</code>가 난수이므로 같은 밀리초 안의 값들끼리는 순서가 보장되지 않는다. RFC 9562는 같은 밀리초 안에서도 단조성을 얻기 위한 방법들(예를 들어 난수 자리의 일부를 카운터로 쓰는 방법)을 따로 설명한다. 그러니 버전 7은 "밀리초 단위로는 시각 순서, 그 안에서는 구현에 따라 다름"이라고 이해해야 정확하다. 그래도 인덱스 입장에서는 삽입 위치가 오른쪽 끝 근처에 몰리므로, 버전 4와 같은 전면적인 무작위 삽입은 피할 수 있다.</p>
+
+<aside class="note">자바의 <code>UUID.compareTo</code>는 바이트 순서 비교와 다를 수 있다. JDK 21 소스에서 <code>compareTo</code>는 상위 64비트와 하위 64비트를 <code>Long.compare</code>, 곧 부호 있는 정수로 비교한다. 최상위 비트가 1인 값은 음수로 취급되어 앞에 오므로, 데이터베이스의 <code>BINARY(16)</code> 정렬과 자바 컬렉션의 정렬이 어긋날 수 있다. 위 예제에서 <code>Arrays.compareUnsigned</code>로 따로 비교한 이유다.</aside>
+
+<p>저장 형식도 정해야 한다. UUID를 <code>CHAR(36)</code> 문자열로 저장하면 키 값만 36자이고 비교는 문자 집합의 콜레이션 규칙을 따른다. <code>BINARY(16)</code>으로 저장하면 16바이트이고 비교는 바이트 값 그대로다. 앞에서 본 것처럼 기본 키의 크기는 모든 보조 인덱스에 곱해지므로, UUID를 기본 키로 쓴다면 이진 형식이 일반적인 선택이다. 그래도 16바이트는 <code>BIGINT</code>의 두 배다. UUID가 주는 이점(전역 유일성, 삽입 전에 키를 아는 것)이 정말 필요한지 따져 본 뒤에 고르는 것이 맞다.</p>
+
+<h3>자연 키 vs 대리 키 4: 현대적인 설계</h3>
+
+<p>지금까지의 논의를 모으면 오늘날 널리 쓰이는 기본 설계가 나온다. <b>기본 키는 대리 키로 두고, 자연 키는 대체 키로서 <code>UNIQUE</code>와 <code>NOT NULL</code> 제약을 건다.</b> 이 설계는 자연 키와 대리 키 가운데 하나를 고르는 것이 아니라, 두 키에 서로 다른 역할을 맡기는 것이다. 대리 키는 "행을 가리키는" 역할을 맡는다. 외래 키가 참조하고, 보조 인덱스에 복사되고, 애플리케이션이 행을 다시 찾을 때 쓴다. 바뀌지 않고 작아야 하는 역할이므로 대리 키가 알맞다. 자연 키는 "현실의 중복을 막는" 역할을 맡는다. 같은 이메일로 두 번 가입하는 것을 데이터베이스가 거부하게 만든다. 이 역할은 값의 의미에 달려 있으므로 자연 키만 할 수 있다.</p>
+
+<pre><code class="language-sql">CREATE TABLE book (
+    book_id     BIGINT       NOT NULL AUTO_INCREMENT,   -- 행을 가리키는 역할
+    isbn13      CHAR(13)     NOT NULL,                  -- 현실의 중복을 막는 역할
+    title       VARCHAR(200) NOT NULL,
+    PRIMARY KEY (book_id),
+    UNIQUE KEY uk_book_isbn13 (isbn13)
+);
+
+CREATE TABLE book_review (
+    review_id   BIGINT       NOT NULL AUTO_INCREMENT,
+    book_id     BIGINT       NOT NULL,                  -- 자연 키가 아니라 대리 키를 복사한다
+    rating      TINYINT      NOT NULL,
+    PRIMARY KEY (review_id),
+    CONSTRAINT fk_review_book FOREIGN KEY (book_id) REFERENCES book (book_id)
+);</code></pre>
+
+<p>이 설계에서 ISBN 형식이 다시 바뀐다고 상상해 보자. 고쳐야 할 곳은 <code>book</code> 테이블의 <code>isbn13</code> 열과 그 <code>UNIQUE</code> 인덱스뿐이다. 리뷰, 주문, 재고 테이블은 <code>book_id</code>를 들고 있으므로 아무것도 바뀌지 않는다. 자연 키의 변경이 테이블 하나에 갇히는 것이다. 이것이 이 설계의 가장 큰 가치다. 대가는 앞에서 본 대로 인덱스 하나와 열 하나가 늘고, ISBN으로 책을 찾을 때 B+Tree를 두 번 내려가며, 리뷰 목록에 ISBN을 보여 주려면 <code>book</code>과 조인해야 한다는 것이다. 대부분의 업무 시스템에서 이 대가는 자연 키 변경의 위험보다 작다.</p>
+
+<h4>기본값에서 벗어나는 경우</h4>
+
+<p>기본값은 출발점일 뿐이다. 다음과 같은 경우에는 자연 키나 복합 키를 기본 키로 쓰는 쪽이 낫다. 첫째, 우리가 통제하는 짧은 코드값이다. 상태 코드나 사내 분류 코드처럼 값이 바뀌는 시점과 방식을 우리가 정할 수 있고, 조인을 줄이는 이점이 분명하다면 자연 키가 알맞다. 둘째, 다대다 연결 테이블처럼 양쪽 외래 키의 조합이 곧 후보 키이고, 그 행을 다른 테이블이 참조하지 않는 경우다. 대리 키를 두면 열과 인덱스만 늘어난다. 이것은 뒤에서 자세히 본다. 셋째, 자연 키로 조회하는 비율이 압도적이고 자연 키가 짧고 안정적이며 보조 인덱스가 거의 없는 테이블이다. 이때는 클러스터형 인덱스로 한 번에 찾는 이점이 크다.</p>
+
+<p>반대로 대리 키 중에서도 무엇을 쓸지 정해야 한다. 단일 데이터베이스에서 행을 삽입한 뒤 키를 알아도 된다면 <code>BIGINT AUTO_INCREMENT</code>가 가장 작고 삽입 순서도 가장 좋다. 여러 곳에서 독립적으로 키를 만들어야 하거나 삽입 전에 키를 알아야 한다면 UUID를 고려하되, 인덱스 지역성을 위해 시각이 앞에 오는 버전 7을 <code>BINARY(16)</code>으로 저장하는 쪽이 버전 4보다 낫다. MySQL의 <code>UUID()</code>(버전 1)를 쓴다면 <code>UUID_TO_BIN(…, 1)</code>로 시간 부분을 맞바꿔 저장한다.</p>
+
+<h4>외부에 노출할 식별자는 따로</h4>
+
+<p>대리 키가 URL이나 API 응답으로 외부에 나가면 문제가 생길 수 있다. <code>/orders/1042</code>를 본 사용자는 <code>/orders/1041</code>을 시도해 볼 것이고, 이틀 간격으로 받은 주문 번호의 차이로 하루 주문량을 짐작할 수 있다. 앞의 문제는 권한 검사로 막아야 하는 것이지 식별자를 숨겨서 막을 수 있는 것이 아니다. RFC 9562도 UUID를 그것을 가졌다는 사실만으로 접근을 허락하는 보안 수단(security capability)으로 써서는 안 된다(MUST NOT)고 적는다. 그래도 내부 키가 드러내는 정보를 줄이고 싶다면, 내부에서는 <code>BIGINT</code> 대리 키로 조인하고 외부에는 별도의 공개 식별자 열(예: 무작위 또는 버전 7 UUID에 <code>UNIQUE</code>를 건 열)을 노출하는 방법을 쓴다. 이렇게 하면 내부 키의 작은 크기와 좋은 삽입 순서를 지키면서 외부 노출 문제를 분리할 수 있다. 대가는 열 하나와 <code>UNIQUE</code> 인덱스 하나다.</p>
+
+<h4>JPA와 연결해 보기</h4>
+
+<p>JPA 기본편에서 본 <code>@GeneratedValue(strategy = GenerationType.IDENTITY)</code>는 MySQL의 <code>AUTO_INCREMENT</code>에 키 생성을 맡긴다. Hibernate ORM 사용자 가이드는 이 방식에서 식별자 값을 알기 전에 엔티티 행이 반드시 물리적으로 삽입되어야 하며, 그래서 IDENTITY 생성을 쓰는 엔티티에 대해서는 Hibernate가 INSERT 문을 배치로 묶을 수 없다고 설명한다. <code>persist()</code>를 호출하는 순간 INSERT가 나가는 이유가 키 생성 방식에 있는 것이다. 대량 삽입이 중요한 테이블이라면 이 점이 키 생성 전략을 고르는 기준이 된다.</p>
+
+<p>애플리케이션이 키를 직접 정하는 경우(자연 키, 또는 애플리케이션에서 만든 UUID)에는 스프링 데이터 JPA의 <code>save()</code>가 다르게 동작한다는 점도 기억해 두자. 스프링 데이터 JPA 문서에 따르면 <code>save()</code>는 엔티티가 새것이면 <code>persist()</code>를, 아니면 <code>merge()</code>를 호출하는데, 기본 전략은 non-primitive 버전 속성이 있으면 그것이 <code>null</code>인지로, 없으면 식별자 속성이 <code>null</code>인지로 새것인지를 판단한다. 버전 속성이 없는 엔티티라면 직접 할당한 식별자는 항상 <code>null</code>이 아니므로 새 엔티티도 새것이 아니라고 판단되어 <code>merge()</code>로 처리된다. 문서는 이런 경우 <code>Persistable</code>을 구현해 새것인지를 직접 알려 주는 방법을 안내한다. 키 설계의 선택이 프레임워크의 동작까지 바꾸는 예다.</p>
+
+<h3>복합 키 설계</h3>
+
+<p>복합 키는 둘 이상의 속성으로 이루어진 키다. 앞에서 본 좌석의 <code>{theater_id, seat_row, seat_no}</code>처럼, 현실에서 대상을 구별하는 방식 자체가 여러 값의 조합인 경우 자연스럽게 생긴다. 복합 키를 설계할 때 따져야 할 것은 세 가지다. 최소성, 열의 순서, 그리고 복사되는 비용이다.</p>
+
+<h4>최소성: 필요 없는 열을 넣지 않는다</h4>
+
+<p>복합 키는 "혹시 모르니 하나 더 넣자"는 유혹을 받기 쉽다. 좌석 테이블의 키에 <code>seat_grade</code>까지 넣어 <code>{theater_id, seat_row, seat_no, seat_grade}</code>로 만들면 어떻게 될까. 이것은 여전히 유일하므로 슈퍼 키이긴 하지만 최소가 아니다. 문제는 낭비에서 끝나지 않는다. 이 집합에 <code>UNIQUE</code> 제약을 걸면 데이터베이스는 "같은 상영관, 같은 줄, 같은 번호인데 등급만 다른 두 좌석"을 허용한다. 현실에서는 존재할 수 없는 상태인데 제약이 막아 주지 못하는 것이다. 키에 불필요한 열이 들어가면 그 열의 값만 다르게 해서 중복을 넣을 수 있게 된다. 최소성은 미관의 문제가 아니라 정확성의 문제다.</p>
+
+<h4>열의 순서: 조회 패턴이 정한다</h4>
+
+<p>논리 모델에서 복합 키는 속성의 집합이라 순서가 없다. 그러나 물리적으로 기본 키는 클러스터형 인덱스가 되고, 인덱스는 열의 순서대로 정렬된다. MySQL 매뉴얼은 다중 열 인덱스에 대해 인덱스의 최좌측 접두사(leftmost prefix)라면 무엇이든 옵티마이저가 행을 찾는 데 쓸 수 있고, 열들이 최좌측 접두사를 이루지 않으면 인덱스로 조회할 수 없다고 설명한다. 인덱스 하나에는 열을 최대 16개까지 넣을 수 있다. 데이터베이스 기본편에서 다룬 이 규칙이 복합 기본 키에도 그대로 적용된다.</p>
+
+<p>좌석 테이블의 기본 키를 <code>(theater_id, seat_row, seat_no)</code> 순서로 두면, 행은 상영관별로 모이고 그 안에서 줄별로, 다시 번호별로 정렬된다. "3관의 모든 좌석"은 클러스터형 인덱스의 연속 구간 하나로 읽힌다. "3관 C열의 좌석"도 마찬가지다. 그러나 "모든 상영관의 C열 7번"은 첫 열인 <code>theater_id</code>를 지정하지 않으므로 이 인덱스로 구간을 좁힐 수 없다. 반대로 키를 <code>(seat_row, seat_no, theater_id)</code>로 두면 앞의 질문들이 불리해진다. 집합으로서는 같은 키지만, 어떤 순서로 쓰느냐에 따라 테이블의 물리적 배치와 빠른 쿼리가 달라진다. 가장 자주, 가장 넓게 묶어서 읽는 열을 앞에 두는 것이 원칙이다.</p>
+
+<pre><code class="language-sql">CREATE TABLE seat (
+    theater_id  BIGINT      NOT NULL,
+    seat_row    CHAR(2)     NOT NULL,
+    seat_no     SMALLINT    NOT NULL,
+    seat_grade  VARCHAR(10) NOT NULL,
+    PRIMARY KEY (theater_id, seat_row, seat_no)   -- 상영관 → 줄 → 번호 순으로 행이 모인다
+);
+
+-- 최좌측 접두사를 쓰므로 클러스터형 인덱스의 연속 구간으로 읽는다
+SELECT * FROM seat WHERE theater_id = 3;
+SELECT * FROM seat WHERE theater_id = 3 AND seat_row = 'C';
+
+-- theater_id가 없으므로 이 기본 키로는 구간을 좁히지 못한다
+SELECT * FROM seat WHERE seat_row = 'C' AND seat_no = 7;</code></pre>
+
+<h4>복사되는 비용: 보조 인덱스와 자식 테이블</h4>
+
+<p>복합 기본 키는 앞에서 본 두 가지 복사 비용을 그대로 키운다. 첫째, InnoDB 보조 인덱스의 모든 항목에 기본 키의 모든 열이 들어간다. 좌석 테이블에 <code>seat_grade</code> 인덱스를 만들면 그 항목은 <code>(seat_grade, theater_id, seat_row, seat_no)</code>가 된다. 둘째, 이 테이블을 참조하는 자식 테이블은 외래 키로 세 열을 모두 가져야 한다. 예매 테이블이 좌석을 참조하려면 <code>theater_id</code>, <code>seat_row</code>, <code>seat_no</code>를 모두 들고 있어야 하고, 조인 조건도 세 개가 된다. MySQL 매뉴얼은 외래 키에 대해, 참조되는 테이블에 참조되는 열들이 같은 순서로 맨 앞 열을 이루는 인덱스가 있어야 한다고 적는다. 복합 키를 참조할 때는 열의 순서까지 맞춰야 한다는 뜻이다.</p>
+
+<p>이 복사는 자식에서 끝나지 않을 수 있다. 자식 테이블이 부모의 기본 키를 자기 기본 키의 일부로 삼으면(식별 관계), 손자 테이블은 부모의 키 열과 자식의 키 열을 모두 물려받는다. 관계가 깊어질수록 키 열이 계속 늘어나는 것이다. 이 문제는 식별 관계와 비식별 관계를 다루는 06회의 핵심 주제이므로, 여기서는 "복합 키는 아래로 전파되며 그 비용은 계층의 깊이만큼 커진다"는 점만 기억해 두자.</p>
+
+<p>JPA에서도 복합 키는 비용이 있다. 엔티티의 식별자가 여러 필드이면 <code>@IdClass</code>나 <code>@EmbeddedId</code>로 별도의 식별자 클래스를 만들어야 한다. Hibernate ORM 사용자 가이드가 정리한 Jakarta Persistence의 규칙에 따르면 이 기본 키 클래스는 public이고 public 기본 생성자가 있어야 하며, 직렬화 가능해야 하고, 동등성에 맞게 <code>equals</code>와 <code>hashCode</code>를 정의해야 한다. 이 클래스의 인스턴스가 곧 엔티티의 식별자 값이므로, 같은 열 값을 가진 두 식별자 객체가 같다고 판정되도록 <code>equals</code>와 <code>hashCode</code>를 키 필드 전부로 정의한다. 단일 열 대리 키라면 <code>Long</code> 하나로 끝날 일을 클래스 하나가 떠안는 셈이다.</p>
+
+<pre><code class="language-java">import jakarta.persistence.Embeddable;
+import java.io.Serializable;
+import java.util.Objects;
+
+@Embeddable
+public class SeatId implements Serializable {
+    private Long theaterId;
+    private String seatRow;
+    private Integer seatNo;
+
+    public SeatId() {
+    }
+
+    public SeatId(Long theaterId, String seatRow, Integer seatNo) {
+        this.theaterId = theaterId;
+        this.seatRow = seatRow;
+        this.seatNo = seatNo;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof SeatId other)) return false;
+        return Objects.equals(theaterId, other.theaterId)
+                && Objects.equals(seatRow, other.seatRow)
+                && Objects.equals(seatNo, other.seatNo);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(theaterId, seatRow, seatNo);
+    }
+}
+
+// 엔티티 쪽: @EmbeddedId private SeatId id; 로 식별자를 선언한다
+// ...</code></pre>
+
+<p>복합 키를 쓸지 판단하는 기준을 정리하면 이렇다. 복합 키가 테이블 바깥으로 거의 나가지 않는 경우, 곧 그 테이블을 참조하는 자식이 없거나 적고 보조 인덱스도 적다면 복합 키의 비용은 작고, 현실의 유일성 규칙을 기본 키 하나로 표현하는 이점이 크다. 반대로 그 테이블이 여러 자식 테이블의 부모가 되고 계층이 깊어질 예정이라면, 대리 키를 기본 키로 두고 복합 자연 키에 <code>UNIQUE</code>를 거는 편이 자식들의 외래 키를 열 하나로 유지해 준다.</p>
+
+<h3>다대다 관계와 복합 키</h3>
+
+<p>학생과 강좌의 관계를 생각해 보자. 학생 한 명은 여러 강좌를 듣고, 강좌 하나에는 여러 학생이 있다. 관계형 테이블의 한 칸에는 값 하나만 들어가므로 이 다대다(N:M) 관계는 테이블 두 개만으로는 표현할 수 없다. 그래서 가운데에 연결 테이블(junction table, associative table)을 두어 하나의 다대다 관계를 두 개의 일대다 관계로 푼다. 다대다 관계를 푸는 과정 자체는 05회에서 자세히 다루고, 여기서는 연결 테이블의 키를 어떻게 정하느냐에 집중한다.</p>
+
+<pre><code class="language-sql">CREATE TABLE enrollment (
+    student_id   BIGINT   NOT NULL,
+    course_id    BIGINT   NOT NULL,
+    enrolled_at  DATETIME NOT NULL,
+    PRIMARY KEY (student_id, course_id),              -- 같은 학생이 같은 강좌를 두 번 신청할 수 없다
+    KEY idx_enrollment_course (course_id),            -- 강좌 쪽에서 찾기 위한 인덱스
+    CONSTRAINT fk_enrollment_student FOREIGN KEY (student_id) REFERENCES student (student_id),
+    CONSTRAINT fk_enrollment_course  FOREIGN KEY (course_id)  REFERENCES course (course_id)
+);</code></pre>
+
+<p>연결 테이블의 행 하나는 "이 학생이 이 강좌를 수강한다"는 사실 하나다. 업무 규칙이 "같은 학생은 같은 강좌를 한 번만 신청한다"라면, <code>(student_id, course_id)</code>는 유일하고 어느 하나를 빼면 유일성이 깨지므로 후보 키다. 이것을 기본 키로 삼으면 키가 업무 규칙을 그대로 표현한다. 같은 신청을 두 번 넣으려 하면 기본 키 중복으로 거부된다. 별도의 열도, 별도의 <code>UNIQUE</code> 인덱스도 필요 없다.</p>
+
+<p>이제 물리 구조를 따라가 보자. 클러스터형 인덱스는 <code>(student_id, course_id)</code> 순으로 정렬되므로, 한 학생의 수강 목록은 연속 구간 하나로 읽힌다. "강좌 42를 듣는 학생들"은 첫 열이 <code>course_id</code>가 아니므로 기본 키로 구간을 좁힐 수 없다. 그래서 <code>idx_enrollment_course</code>가 필요하다. 그런데 앞에서 본 규칙대로 InnoDB 보조 인덱스의 항목에는 기본 키 열이 함께 들어 있다. <code>idx_enrollment_course</code>를 <code>(course_id)</code>로만 선언했어도 실제 항목은 <code>course_id</code>와 <code>student_id</code>를 함께 담고 있는 것이다. 따라서 <code>SELECT student_id FROM enrollment WHERE course_id = 42</code>는 이 보조 인덱스만 읽고 클러스터형 인덱스로 돌아가지 않는 커버링 조회가 된다. 두 방향의 조회가 모두 B+Tree 하나씩으로 끝난다. 이 인덱스는 외래 키 <code>fk_enrollment_course</code>에 필요한 인덱스 역할도 한다. MySQL은 외래 키 검사가 테이블 스캔 없이 빠르게 이루어지도록 외래 키와 참조되는 키에 인덱스를 요구하는데, <code>student_id</code> 쪽은 기본 키의 첫 열이 그 역할을 한다.</p>
+
+<pre class="diagram">  클러스터형 인덱스 PRIMARY (student_id, course_id)     보조 인덱스 idx_enrollment_course
+  ┌────────────┬───────────┬─────────────┐               ┌───────────┬────────────┐
+  │ student_id │ course_id │ enrolled_at │               │ course_id │ student_id │ ← 기본 키 열이 함께 저장됨
+  ├────────────┼───────────┼─────────────┤               ├───────────┼────────────┤
+  │     1      │    42     │ ...         │               │    42     │     1      │
+  │     1      │    77     │ ...         │               │    42     │     2      │
+  │     2      │    42     │ ...         │               │    42     │     5      │
+  │     5      │    42     │ ...         │               │    77     │     1      │
+  └────────────┴───────────┴─────────────┘               └───────────┴────────────┘
+   "학생 1의 강좌들" → 앞쪽 연속 구간                      "강좌 42의 학생들" → 앞쪽 연속 구간(커버링)</pre>
+
+<p>같은 연결 테이블을 대리 키로 설계하면 어떻게 될까. <code>enrollment_id</code>를 기본 키로 두면, 중복 신청을 막기 위해 <code>UNIQUE (student_id, course_id)</code>가 여전히 필요하고, 강좌 쪽 조회를 위한 <code>(course_id)</code> 인덱스도 필요하다. B+Tree가 두 개에서 세 개로 늘고, 열이 하나 늘며, "학생 1의 강좌들"은 이제 <code>UNIQUE</code> 보조 인덱스에서 찾아 <code>enrolled_at</code> 같은 다른 열이 필요하면 클러스터형 인덱스로 다시 가야 한다. 대리 키를 추가해서 얻는 것이 없다면 연결 테이블에서는 복합 기본 키가 더 단순하고 효율적이다.</p>
+
+<p>그러나 업무 규칙이 바뀌면 판단도 바뀐다. 첫째, 같은 쌍이 여러 번 나타날 수 있는 경우다. 재수강을 허용해 같은 학생이 같은 강좌를 다른 학기에 다시 들을 수 있다면 <code>(student_id, course_id)</code>는 더는 유일하지 않다. 이때 키는 <code>(student_id, course_id, semester)</code>처럼 쌍을 구별하는 속성을 추가한 복합 키가 되거나, 대리 키를 두고 이 세 열에 <code>UNIQUE</code>를 거는 형태가 된다. 키에 무엇을 넣을지는 결국 "무엇이 같으면 같은 수강인가"라는 업무 규칙이 정한다. 둘째, 연결 테이블의 행이 독자적인 생명을 얻는 경우다. 수강마다 성적, 출결, 과제 제출 같은 하위 데이터가 생기고 그 테이블들이 수강을 참조해야 한다면, 복합 키는 그 모든 자식 테이블에 두세 개의 외래 키 열을 퍼뜨린다. 이때는 대리 키 <code>enrollment_id</code>를 기본 키로 두고 자연 키 조합에 <code>UNIQUE</code>를 거는 것이 앞에서 본 현대적인 기본 설계와 같은 이유로 낫다. 연결 테이블이 "관계"에서 "엔티티"로 승격되는 순간이다.</p>
+
+<x-visual id="db-design1-03-junction-index" title="연결 테이블의 복합 기본 키와 역방향 보조 인덱스" kind="구조 다이어그램" ratio="16:9">
+<x-hint>연결 테이블에서 복합 기본 키가 학생 방향의 조회를, 기본 키 열을 품은 보조 인덱스가 강좌 방향의 조회를 각각 연속 구간 하나로 처리한다는 것을 보여 준다.</x-hint>
+<x-prompt>A technical diagram on a white background. At the top, three tables as boxes: "student" on the left, "course" on the right, and "enrollment" in the middle, with crow's-foot lines from student to enrollment and from course to enrollment. Below enrollment, two B+Tree triangles side by side. Left triangle labeled "PRIMARY (student_id, course_id)" with leaf rows "1 | 42", "1 | 77", "2 | 42", "5 | 42"; the first two rows highlighted in blue with a bracket labeled "학생 1의 강좌들". Right triangle labeled "idx_enrollment_course" with leaf rows "42 | 1", "42 | 2", "42 | 5", "77 | 1"; the first three rows highlighted in green with a bracket labeled "강좌 42의 학생들", and a small tag on the second column labeled "기본 키 열 포함". Flat vector style, blue and green accents, no other text.</x-prompt>
+<x-caption>연결 테이블의 복합 기본 키는 한쪽 방향의 조회를, 기본 키 열을 함께 담는 보조 인덱스는 반대 방향의 조회를 각각 연속 구간으로 처리한다.</x-caption>
+</x-visual>
+
+<h3>흔한 오해와 함정</h3>
+
+<p><b>"대리 키를 쓰면 자연 키는 신경 쓰지 않아도 된다."</b> 가장 흔하고 가장 비싼 오해다. 대리 키는 행을 가리키는 역할만 맡을 뿐, 현실의 중복을 막지 못한다. 자연 키에 <code>UNIQUE</code>를 걸지 않은 회원 테이블에는 같은 사람이 번호만 다르게 여러 번 들어간다. 이런 중복은 나중에 발견해도 어느 행이 진짜인지, 각 행에 매달린 주문을 어떻게 합칠지 정하는 고통스러운 정리 작업을 남긴다. 대리 키를 기본 키로 고른 순간, 자연 키에 대한 <code>UNIQUE</code>는 선택이 아니라 의무가 된다.</p>
+
+<p><b>"UNIQUE를 걸었으니 키다."</b> <code>UNIQUE</code> 제약은 <code>NULL</code>을 허용하는 열에서 여러 개의 <code>NULL</code>을 허용한다. <code>NULL</code>을 허용하는 열은 값이 없는 행들을 서로 구별하지 못하므로 키가 아니다. 대체 키라면 <code>UNIQUE</code>와 <code>NOT NULL</code>이 함께 있어야 한다. 반대로 <code>PRIMARY KEY</code>로 선언한 열은 <code>NULL</code> 여부를 적지 않았다면 MySQL이 조용히 <code>NOT NULL</code>로 만들고, 명시적으로 <code>NULL</code>이라고 적었다면 오류로 거부한다.</p>
+
+<p><b>"AUTO_INCREMENT 번호는 빈틈없이 이어진다."</b> 롤백된 트랜잭션이 받은 번호는 다시 쓰이지 않고, MySQL 8.0의 기본 잠금 모드(2)에서는 한 문장이 삽입한 행들의 번호가 연속적이지 않을 수도 있다. 번호의 연속성에 의미를 두는 업무 로직(예: "번호가 비면 누락된 주문")을 대리 키 위에 세우면 안 된다. 대리 키에는 "유일하다"는 의미만 있다.</p>
+
+<p><b>"UUID는 순서가 없다" 또는 "UUID는 추측할 수 없다."</b> 둘 다 버전에 따라 다르다. 버전 4는 순서가 없지만, 버전 1과 7은 시각을 담고 있어 순서가 있다. 버전 1은 시각이 문자열 앞쪽에서 뒤섞인 순서로 놓여 그대로는 정렬 순서와 생성 순서가 어긋나고, MySQL의 <code>UUID_TO_BIN(…, 1)</code>이 그것을 바로잡는다. 추측 가능성도 마찬가지다. MySQL 매뉴얼은 <code>UUID()</code> 값이 추측할 수 없다는 보장이 없다고 경고하고, RFC 9562는 UUID를 접근 권한의 근거로 쓰지 말라고 적는다. 식별자는 식별의 도구이지 보안의 도구가 아니다.</p>
+
+<p><b>"지금 데이터에 중복이 없으니 키로 써도 된다."</b> 키는 데이터가 아니라 규칙에서 나온다. 개발 데이터에서 겹치지 않던 이름, 상품명, 휴대폰 번호는 서비스가 커지면 겹친다. 후보 키를 정할 때는 언제나 "이 값이 같은 두 대상이 현실에 존재할 수 있는가"를 묻고, 그 답을 업무 담당자에게 확인한다.</p>
+
+<p><b>"복합 키는 낡은 방식이다."</b> 복합 키가 문제를 일으키는 경우는 대개 그것이 여러 자식 테이블로 퍼져 나가는 경우다. 다대다 연결 테이블처럼 참조되지 않는 테이블, 좌석처럼 현실의 유일성 규칙이 원래 여러 값의 조합인 테이블에서는 복합 기본 키가 가장 정확하고 효율적인 표현일 수 있다. 판단 기준은 유행이 아니라 그 키가 어디까지 복사되는가다.</p>
+
+<p><b>"기본 키 순서대로 결과가 나온다."</b> InnoDB 테이블을 <code>ORDER BY</code> 없이 조회하면 기본 키 순서로 나오는 경우가 많아서 이것을 보장으로 착각하기 쉽다. 그러나 SQL은 <code>ORDER BY</code>가 없으면 결과의 순서를 보장하지 않는다. 옵티마이저가 보조 인덱스를 쓰기로 하면 결과가 그 인덱스의 순서로 나올 수 있고, 실행 계획은 데이터와 통계에 따라 바뀐다. 앞의 연결 테이블에서 <code>WHERE course_id = 42</code>가 보조 인덱스로 실행되면 결과는 기본 키 순서가 아니라 보조 인덱스를 읽은 순서로 나올 수 있다. 순서가 필요하면 언제나 <code>ORDER BY</code>를 쓴다.</p>
+
+<h3>정리: 다음 회차와의 연결</h3>
+
+<p>이 회차에서 세운 것을 한 줄로 요약하면 이렇다. 키는 유일성과 최소성이라는 규칙이고, 기본 키는 그 규칙을 만족하는 후보 키 가운데 "바뀌지 않고, 반드시 있고, 짧은" 것을 고른 것이며, InnoDB에서 그 선택은 행의 물리적 배치와 모든 보조 인덱스와 모든 자식 테이블의 외래 키로 복사된다. 그래서 현대적인 기본 설계는 대리 키에 "가리키는 역할"을, 자연 키에 "중복을 막는 역할"을 나누어 맡기고, 복합 키는 그것이 멀리 복사되지 않는 곳, 대표적으로 다대다 연결 테이블에서 적극적으로 쓴다.</p>
+
+<p>다음 회차들은 이 위에 쌓인다. 04회의 참여도와 일대다 관계에서는 외래 키를 어느 테이블에 두는지, 그리고 그 외래 키가 <code>NULL</code>을 허용하는지가 관계의 의미를 어떻게 바꾸는지 본다. 05회는 일대일과 다대다 관계를 테이블로 옮기는 방법을 다루며, 이 회차에서 본 연결 테이블이 그 중심에 있다. 06회의 식별 관계와 비식별 관계는 부모의 기본 키를 자식의 기본 키에 넣을지 말지의 문제이고, 이 회차에서 본 "복합 키의 전파"가 그 비용이다. 07회의 정규화에서는 키를 함수 종속성으로 다시 정의하고, 키가 아닌 속성이 키에 어떻게 종속되어야 하는지를 정규형으로 정리한다. 08회의 물리적 모델링에서는 이 회차에서 잠깐 본 자료형의 크기와 저장 방식을 본격적으로 다룬다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>슈퍼 키와 후보 키</dt><dd>슈퍼 키는 유일성만 만족하는 속성 집합이고, 후보 키는 어떤 속성을 빼도 유일성이 깨지는 최소의 슈퍼 키다. 유일성은 현재 데이터가 아니라 업무 규칙으로 판정한다.</dd>
+<dt>기본 키와 대체 키</dt><dd>후보 키 가운데 대표로 고른 것이 기본 키, 나머지가 대체 키다. 대체 키도 유일성 규칙을 지니므로 <code>UNIQUE</code>와 <code>NOT NULL</code>로 옮겨 적어야 한다.</dd>
+<dt>기본 키의 조건</dt><dd>유일하고, 값이 반드시 있고, 바뀌지 않고, 짧을수록 좋다. 기본 키는 외래 키와 보조 인덱스로 복사되므로 변경과 크기의 비용이 여러 곳으로 번진다.</dd>
+<dt>자연 키의 실패</dt><dd>현실의 식별자는 값이 바뀌고(이메일, 주민등록번호 변경 제도), 형식이 바뀌고(ISBN-10에서 ISBN-13), 수집이 제한되고(개인정보 보호법 제24조의2), 유일하지 않은 것으로 드러난다.</dd>
+<dt>대리 키</dt><dd>의미 없는 시스템 생성 값이라 바뀔 이유가 없고 작다. 현실의 중복은 막지 못하므로 자연 키의 <code>UNIQUE</code>가 반드시 함께 있어야 한다.</dd>
+<dt>InnoDB의 기본 키</dt><dd>기본 키가 클러스터형 인덱스가 되어 행의 물리적 순서를 정하고, 모든 보조 인덱스 항목에 기본 키 열이 들어간다. 증가하는 키는 오른쪽 끝에 삽입되어 페이지가 약 15/16 차고, 무작위 키는 1/2에서 15/16 사이로 찬다.</dd>
+<dt>UUID의 버전</dt><dd>버전 4는 무작위라 인덱스 지역성이 나쁘고, 버전 7은 48비트 밀리초 시각이 앞에 있어 대체로 시각순이다. MySQL의 <code>UUID()</code>는 버전 1이며 <code>UUID_TO_BIN(…, 1)</code>로 시간 부분을 맞바꿔 저장한다.</dd>
+<dt>복합 키 설계</dt><dd>최소성을 지키고, 열 순서는 최좌측 접두사 규칙에 따라 조회 패턴으로 정하며, 보조 인덱스와 자식 테이블로 복사되는 비용을 따진다.</dd>
+<dt>다대다 연결 테이블</dt><dd>양쪽 외래 키의 조합이 후보 키이면 복합 기본 키가 업무 규칙을 그대로 표현하고, 역방향 보조 인덱스가 기본 키 열을 품어 커버링 조회가 된다. 쌍이 반복되거나 행이 다른 테이블에 참조되면 판단이 바뀐다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 키 설계가 문제로 드러나는 시점은 대개 설계한 날이 아니라 몇 년 뒤다. 이메일을 기본 키로 쓴 회원 테이블은 "이메일 변경 기능"이라는 평범한 요구 사항 하나에 수십 개 테이블의 외래 키와 외부 시스템 연동을 함께 고쳐야 하는 작업으로 번진다. 반대로 대리 키만 두고 자연 키의 <code>UNIQUE</code>를 빠뜨린 테이블은 중복 데이터가 조용히 쌓이다가, 정산이나 통계가 맞지 않는 순간에야 발견된다. 두 사고는 방향이 반대지만 원인은 같다. 키의 두 역할, 곧 "가리키기"와 "중복 막기"를 구분하지 않은 것이다. 설계 리뷰에서 테이블마다 "이 테이블의 자연 키는 무엇이고, 그것은 어떤 제약으로 지켜지는가"를 묻는 것만으로 두 사고 대부분을 미리 막을 수 있다.</p>
+<p>성능에서의 판단은 테이블의 크기와 접근 패턴에 따라 달라진다. 행이 수천 개인 코드 테이블에서 기본 키가 <code>CHAR(3)</code>이냐 <code>BIGINT</code>냐는 거의 차이가 없고, 오히려 조인을 줄여 주는 자연 키가 나을 수 있다. 반면 행이 수억 개로 자라 인덱스가 버퍼 풀을 넘어서는 이벤트·로그·주문 테이블에서는 기본 키의 너비와 삽입 순서가 저장 공간, 페이지 분할, 디스크 읽기로 직접 나타난다. 이런 테이블에 UUIDv4를 기본 키로 넣는 결정은 데이터가 작을 때는 아무 문제가 없다가, 데이터가 커진 뒤에야 비용이 드러난다는 점에서 위험하다. 처음부터 증가하는 키나 시각순 키를 쓰는 것이 안전한 기본값이다.</p>
+<p>분산 환경으로 가면 판단 기준이 하나 더 생긴다. 여러 데이터베이스나 서비스가 독립적으로 행을 만들고 나중에 합쳐야 한다면, 단일 데이터베이스의 <code>AUTO_INCREMENT</code>로는 전역 유일성을 얻을 수 없다. 이때 UUIDv7 같은 시각순 전역 식별자가 유력한 선택지가 되고, 같은 밀리초 안의 순서와 시계가 뒤로 가는 경우의 처리 같은 생성기의 세부를 따져 봐야 한다. 어떤 경우든 키를 외부에 노출할 때는 그 키가 무엇을 드러내는지, 그리고 권한 검사가 키와 무관하게 이루어지는지를 별도로 확인해야 한다.</p>
+</x-review>
+
+<x-practice>
+<li>도서관의 대출 테이블에 <code>loan(book_copy_id, member_id, loaned_at, returned_at)</code> 열이 있다. 업무 규칙은 "같은 책 사본은 한 시점에 한 회원에게만 대출되고, 같은 회원이 같은 사본을 여러 번 빌릴 수 있다"이다. <code>{book_copy_id, member_id}</code>, <code>{book_copy_id, loaned_at}</code>, <code>{book_copy_id, member_id, loaned_at}</code> 가운데 후보 키는 무엇인지, 각각 유일성과 최소성으로 판정하라.</li>
+<li>열이 <code>A, B, C, D</code> 넷인 테이블에서 <code>{A}</code>와 <code>{B, C}</code>가 후보 키이고 다른 후보 키는 없다. 슈퍼 키는 모두 몇 개인가? 포함·배제 원리로 계산하라.</li>
+<li>회원 테이블의 기본 키가 <code>email</code>이고, 이 테이블에는 보조 인덱스 두 개가 있으며, 주문·리뷰·포인트 이력 세 테이블이 각각 <code>ON UPDATE CASCADE</code> 외래 키로 회원을 참조한다(각 외래 키 열에는 인덱스가 있다). 한 회원이 이메일을 바꿀 때, 이 회원의 주문이 10건, 리뷰가 3건, 포인트 이력이 50건이라면 고쳐야 하는 인덱스 항목은 기본 키 자리 이동을 포함해 모두 몇 개인지 세어 보라. 그리고 데이터베이스 밖에서 함께 고쳐야 할 수 있는 것을 두 가지 들라.</li>
+<li>MySQL의 <code>UUID()</code>가 만든 값 <code>'5f2a8c10-7d3e-11ef-9a01-3c22fb123456'</code>을 <code>HEX(UUID_TO_BIN(값, 1))</code>로 변환한 결과를 손으로 써 보라. 그리고 맞바꾸지 않은 값을 기본 키로 쓰면 삽입 위치가 어떤 주기로 움직이는지 설명하라.</li>
+<li>연결 테이블 <code>enrollment(student_id, course_id, enrolled_at)</code>의 기본 키가 <code>(student_id, course_id)</code>이고 <code>(course_id)</code>에 보조 인덱스가 있다. 다음 두 쿼리가 각각 어떤 인덱스를 어떻게 읽는지, 클러스터형 인덱스로 돌아가는지 설명하라. (가) <code>SELECT course_id FROM enrollment WHERE student_id = 7</code> (나) <code>SELECT student_id, enrolled_at FROM enrollment WHERE course_id = 42</code></li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> <code>{book_copy_id, member_id}</code>는 같은 회원이 같은 사본을 여러 번 빌릴 수 있으므로 유일하지 않아 슈퍼 키도 아니다. <code>{book_copy_id, loaned_at}</code>는 같은 사본이 한 시점에 한 회원에게만 대출되므로 같은 사본·같은 대출 시각을 가진 행은 하나뿐이어서 유일하다. <code>book_copy_id</code>를 빼면 같은 시각에 다른 사본들이 대출될 수 있어 유일성이 깨지고, <code>loaned_at</code>을 빼면 같은 사본의 여러 대출이 겹치므로 깨진다. 따라서 최소이며 후보 키다. <code>{book_copy_id, member_id, loaned_at}</code>는 유일하지만 <code>member_id</code>를 빼도 <code>{book_copy_id, loaned_at}</code>가 남아 유일하므로 최소가 아니다. 슈퍼 키일 뿐 후보 키가 아니다. 이 판정은 "한 시점에 한 회원"이라는 규칙과, <code>loaned_at</code>이 대출을 구별할 만큼 정밀하게 기록된다는 전제에 기대고 있다는 점도 함께 짚어야 한다.</p>
+<p><b>2.</b> 슈퍼 키는 <code>A</code>를 포함하거나 <code>B, C</code>를 모두 포함하는 집합이다. <code>A</code>를 포함하는 부분집합은 나머지 세 열을 넣고 빼는 2<sup>3</sup> = 8개, <code>B</code>와 <code>C</code>를 모두 포함하는 것은 나머지 두 열(<code>A</code>, <code>D</code>)에 대해 2<sup>2</sup> = 4개, 둘 다 만족하는 것(<code>A</code>, <code>B</code>, <code>C</code>를 모두 포함)은 <code>D</code>를 넣고 빼는 2<sup>1</sup> = 2개다. 8 + 4 − 2 = 10개다.</p>
+<p><b>3.</b> 회원 테이블에서 클러스터형 인덱스의 행이 새 키 자리로 옮겨 가는 것이 1개, 보조 인덱스 두 개의 항목이 기본 키 값을 담고 있으므로 2개가 고쳐진다. 자식 테이블에서는 외래 키 값이 바뀐 행마다 외래 키 인덱스 항목이 바뀌므로 10 + 3 + 50 = 63개다. 자식 테이블의 기본 키가 대리 키라면 자식의 클러스터형 인덱스에서는 행 내용만 바뀌고 자리는 그대로다. 합하면 1 + 2 + 63 = 66개의 인덱스 항목이 바뀐다(자식 테이블에 이 열을 포함하는 다른 보조 인덱스가 있다면 더 늘어난다). 데이터베이스 밖에서는 이메일을 키로 저장한 애플리케이션 캐시, 외부 결제·메일 시스템에 넘겨 둔 회원 식별자, 로그와 분석 데이터, 다른 서비스의 데이터베이스 등이 <code>ON UPDATE CASCADE</code>의 범위 밖에 있다.</p>
+<p><b>4.</b> 그룹은 <code>5f2a8c10</code>(time_low), <code>7d3e</code>(time_mid), <code>11ef</code>(time_high와 버전), <code>9a01</code>, <code>3c22fb123456</code>이다. 첫째와 셋째 그룹을 맞바꾸면 <code>11ef</code> <code>7d3e</code> <code>5f2a8c10</code> <code>9a01</code> <code>3c22fb123456</code> 순서가 되므로 결과는 <code>11EF7D3E5F2A8C109A013C22FB123456</code>이다. 맞바꾸지 않으면 맨 앞의 time_low가 100나노초마다 증가하는 32비트 값이라 2<sup>32</sup> × 100나노초, 곧 약 429.5초(7분 9.5초)마다 한 바퀴 돌아 작은 값으로 돌아간다. 그래서 삽입 위치는 그 주기 동안 인덱스의 왼쪽에서 오른쪽으로 움직였다가 다시 왼쪽으로 돌아가기를 반복하며 인덱스 전체를 훑는다.</p>
+<p><b>5.</b> (가)는 기본 키의 첫 열 <code>student_id</code>로 클러스터형 인덱스의 연속 구간을 읽는다. 클러스터형 인덱스의 리프에는 행 전체가 있으므로 다른 인덱스로 갈 필요가 없다. (나)는 <code>idx_enrollment_course</code>에서 <code>course_id = 42</code>인 연속 구간을 읽는다. 이 항목에는 <code>course_id</code>와 기본 키 열 <code>student_id</code>가 있지만 <code>enrolled_at</code>은 없으므로, 항목마다 기본 키 <code>(student_id, 42)</code>로 클러스터형 인덱스를 다시 내려가 <code>enrolled_at</code>을 읽어야 한다. <code>SELECT student_id</code>만 했다면 보조 인덱스만으로 끝나는 커버링 조회였을 것이다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>회원 테이블에 <code>member_id</code>(시스템 부여, 겹치지 않음), <code>email</code>(필수, 겹치지 않음), <code>phone</code>(선택 입력, 입력하면 겹치지 않음), <code>name</code>이 있다. 후보 키를 바르게 고른 것은?</q>
+<o><code>{member_id}</code>, <code>{email}</code>, <code>{phone}</code></o>
+<o><code>{member_id}</code>, <code>{email}</code>, <code>{member_id, email}</code></o>
+<o><code>{member_id}</code>, <code>{email}</code></o>
+<o><code>{member_id}</code>만. 기본 키가 될 하나만 후보 키다</o>
+<why><code>phone</code>은 입력하지 않은 회원이 여럿일 수 있고 <code>UNIQUE</code>는 여러 NULL을 허용하므로 모든 행을 구별하지 못한다. <code>{member_id, email}</code>은 유일하지만 어느 하나를 빼도 유일하므로 최소가 아니다. 후보 키는 기본 키로 뽑힐 하나만이 아니라 최소인 슈퍼 키 모두를 말한다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>InnoDB 테이블의 기본 키를 <code>BIGINT</code>에서 평균 30바이트인 문자열 자연 키로 바꾸었다. 보조 인덱스가 네 개 있을 때 가장 직접적으로 나타나는 변화는?</q>
+<o>클러스터형 인덱스만 커지고 보조 인덱스는 영향을 받지 않는다</o>
+<o>네 보조 인덱스의 모든 항목이 기본 키 값을 담고 있으므로 네 인덱스가 모두 커진다</o>
+<o>보조 인덱스가 행의 물리적 주소를 담으므로 기본 키 크기와 무관하다</o>
+<o>문자열 키는 해시되어 저장되므로 크기 차이가 없다</o>
+<why>InnoDB의 보조 인덱스 레코드는 기본 키 열을 함께 담고, 그 값으로 클러스터형 인덱스에서 행을 찾는다. 행의 물리적 주소를 담지 않는다. 그래서 MySQL 매뉴얼은 기본 키가 길면 보조 인덱스가 더 많은 공간을 쓴다고 적는다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>대량의 행을 삽입하는 InnoDB 테이블에서 기본 키 후보로 버전 4 UUID와 버전 7 UUID(둘 다 <code>BINARY(16)</code>)를 비교한다. 옳은 설명은?</q>
+<o>둘 다 128비트 난수이므로 페이지 분할 양상이 같다</o>
+<o>버전 7이 더 작으므로 보조 인덱스가 작아진다</o>
+<o>버전 4는 시각을 담고 있어 정렬하면 생성 순서가 된다</o>
+<o>버전 7은 상위 48비트가 밀리초 시각이라 삽입이 B+Tree 오른쪽 끝 근처에 몰려 무작위 분할이 줄어든다</o>
+<why>두 버전 모두 16바이트라 크기는 같다. 버전 4는 122비트가 난수라 순서가 없고, RFC 9562도 시간 순서가 없는 버전은 인덱스 지역성이 나쁘다고 적는다. 버전 7은 시각이 맨 앞에 있어 바이트 순서 정렬이 대체로 생성 순서와 같다(같은 밀리초 안의 순서는 구현에 따라 다르다).</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>회원 테이블을 "<code>member_id BIGINT AUTO_INCREMENT</code> 기본 키 + <code>email</code>에 <code>UNIQUE</code>"로 설계했다. 이 설계에서 <code>UNIQUE (email)</code>을 빼면 생기는 문제로 가장 정확한 것은?</q>
+<o>같은 이메일로 여러 번 가입해도 <code>member_id</code>가 달라 모두 저장된다</o>
+<o>이메일로 조회할 수 없게 된다</o>
+<o><code>member_id</code>가 중복될 수 있다</o>
+<o>외래 키가 회원 테이블을 참조할 수 없게 된다</o>
+<why>대리 키는 행을 가리키는 역할만 하고 현실의 중복을 막지 못한다. <code>UNIQUE</code>가 없어도 이메일로 조회는 할 수 있다(인덱스가 없으면 느릴 뿐이다). <code>member_id</code>의 유일성은 기본 키가 지키고, 외래 키는 <code>member_id</code>를 참조하므로 영향이 없다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>연결 테이블 <code>enrollment</code>의 기본 키가 <code>(student_id, course_id)</code>이고 <code>(course_id)</code>에 보조 인덱스가 있다. <code>SELECT student_id FROM enrollment WHERE course_id = 42</code>의 실행으로 옳은 것은?</q>
+<o>기본 키의 첫 열이 아니므로 반드시 테이블 전체를 스캔한다</o>
+<o>보조 인덱스에서 <code>course_id</code>를 찾은 뒤 항목마다 클러스터형 인덱스로 가서 <code>student_id</code>를 읽는다</o>
+<o>보조 인덱스 항목에 기본 키 열 <code>student_id</code>가 들어 있으므로 보조 인덱스만 읽고 끝낼 수 있다</o>
+<o>복합 기본 키 테이블에는 보조 인덱스를 만들 수 없다</o>
+<why>InnoDB 보조 인덱스의 항목에는 기본 키 열이 함께 저장되므로 <code>(course_id)</code> 인덱스의 항목은 사실상 <code>(course_id, student_id)</code>다. 쿼리가 요구하는 열이 모두 항목 안에 있으므로 클러스터형 인덱스로 돌아갈 필요가 없다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>슈퍼 키(super key)</dt><dd>값의 조합이 테이블의 모든 행을 구별하는 속성 집합. 유일성만 요구하고 불필요한 속성이 섞여 있어도 된다.</dd>
+<dt>후보 키(candidate key)</dt><dd>유일성과 최소성을 모두 만족하는 슈퍼 키. 어떤 속성을 하나라도 빼면 유일성이 깨진다.</dd>
+<dt>기본 키(primary key)</dt><dd>후보 키 가운데 테이블의 대표 식별자로 선택한 하나. MySQL에서는 모든 키 열이 <code>NOT NULL</code>이고 테이블당 하나이며, InnoDB에서는 클러스터형 인덱스가 된다.</dd>
+<dt>대체 키(alternate key)</dt><dd>기본 키로 선택되지 않은 나머지 후보 키. 물리 설계에서 <code>UNIQUE</code>와 <code>NOT NULL</code>로 구현한다.</dd>
+<dt>복합 키(composite key)</dt><dd>둘 이상의 속성으로 이루어진 키. 후보 키·기본 키 같은 역할 구분과는 다른 축의 이름이다.</dd>
+<dt>자연 키(natural key)</dt><dd>업무 세계에서 이미 쓰이는, 의미를 지닌 식별자를 키로 삼은 것. 비즈니스 키라고도 한다.</dd>
+<dt>대리 키(surrogate key)</dt><dd>업무적 의미가 없는 값을 시스템이 만들어 기본 키로 쓰는 것. <code>AUTO_INCREMENT</code> 정수나 UUID가 대표적이다.</dd>
+<dt>클러스터형 인덱스(clustered index)</dt><dd>리프에 행 데이터 자체를 키 순서로 담는 인덱스. InnoDB에서는 기본 키(없으면 NOT NULL UNIQUE 인덱스, 그것도 없으면 숨은 행 ID)가 이 역할을 한다.</dd>
+<dt>페이지 분할(page split)</dt><dd>가득 찬 B+Tree 페이지에 레코드가 들어와야 할 때 페이지를 둘로 나누는 일. 무작위 순서 삽입에서 자주 일어나 페이지 채움률을 낮춘다.</dd>
+<dt>연결 테이블(junction table)</dt><dd>다대다 관계를 두 개의 일대다 관계로 풀기 위해 양쪽 테이블의 키를 외래 키로 담는 테이블. 대개 두 외래 키의 조합이 후보 키다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-index-types.html">MySQL 8.0 Reference Manual — Clustered and Secondary Indexes</a> — 클러스터형 인덱스 선택 규칙, GEN_CLUST_INDEX와 6바이트 행 ID, 보조 인덱스가 기본 키 열을 담는다는 것, 짧은 기본 키의 이점</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-physical-structure.html">MySQL 8.0 Reference Manual — The Physical Structure of an InnoDB Index</a> — 1/16 여유 공간, 순차 삽입 15/16과 무작위 삽입 1/2~15/16, 16KB 기본 페이지 크기</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/create-table.html">MySQL 8.0 Reference Manual — CREATE TABLE Statement</a> — PRIMARY KEY의 암묵적 NOT NULL, UNIQUE 인덱스의 다중 NULL 허용</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-auto-increment-handling.html">MySQL 8.0 Reference Manual — AUTO_INCREMENT Handling in InnoDB</a> — 8.0의 기본 잠금 모드 2, 롤백으로 인한 번호 구멍, 카운터 영속화</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/miscellaneous-functions.html">MySQL 8.0 Reference Manual — Miscellaneous Functions</a> — UUID()의 버전 1 구조와 예측 가능성 경고, UUID_TO_BIN의 swap_flag, BIN_TO_UUID</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9562.html">RFC 9562 — Universally Unique IDentifiers (UUIDs)</a> — RFC 4122 대체, UUIDv7 레이아웃, UUIDv4의 인덱스 지역성, 보안 수단으로 쓰지 말 것</li>
+</x-refs>

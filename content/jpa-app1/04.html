@@ -1,0 +1,782 @@
+<x-meta>
+deck: 재고를 줄이고 주문을 취소하는 규칙을 엔티티 안에 넣고, 그 메서드 호출 하나가 영속성 컨텍스트의 스냅샷 비교와 cascade, 쓰기 지연을 거쳐 어떤 SQL로 바뀌는지 실행 로그로 따라간다
+minutes: 90
+</x-meta>
+
+<x-goals>
+<li>재고 증감과 주문 취소 같은 비즈니스 규칙을 엔티티 메서드로 옮기고, 그것이 트랜잭션 스크립트와 비교해 무엇을 바꾸는지 설명할 수 있다.</li>
+<li>서비스 메서드 하나(주문 생성, 주문 취소)가 실행될 때 나가는 SELECT·INSERT·UPDATE의 순서를 영속성 컨텍스트의 동작(식별자 할당, cascade, 쓰기 지연, 변경 감지)으로 설명할 수 있다.</li>
+<li><code>@Transactional(readOnly = true)</code>가 Hibernate 세션에 무엇을 바꾸는지, 테스트의 <code>@Transactional</code>이 어떤 거짓 양성을 만들 수 있는지 말할 수 있다.</li>
+<li>엔티티 안에서 값을 읽고 고쳐 쓰는 재고 감소가 동시 요청에서 갱신 손실을 일으키는 과정을 그리고, <code>@Version</code>·비관적 잠금·조건부 UPDATE 중 무엇을 고를지 판단할 수 있다.</li>
+<li>조건이 있을 때만 붙는 검색 조건을 JPQL 문자열과 Criteria API로 각각 만들고, 둘이 같은 SQL로 번역되는 경로를 설명할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>규칙은 어디에 살아야 하는가</h3>
+<p>상품과 주문을 다루는 애플리케이션에서 가장 많이 반복되는 규칙은 재고다. 주문이 들어오면 재고를 줄이고, 재고가 모자라면 주문을 거절하고, 주문이 취소되면 재고를 되돌린다. 이 규칙을 서비스 메서드 안에 직접 쓰면 처음에는 아무 문제가 없어 보인다. <code>item.setStockQuantity(item.getStockQuantity() - count)</code> 한 줄과 <code>if</code>문 하나면 된다. 그런데 재고를 바꾸는 경로는 주문만 있는 것이 아니다. 주문 취소, 관리자의 재고 조정, 반품 입고, 묶음 상품 해체가 모두 재고를 건드린다. 경로가 늘어날 때마다 같은 검사를 복사하게 되고, 어느 한 곳에서 음수 검사를 빠뜨리면 재고가 -3인 상품이 생긴다.</p>
+<p>문제의 뿌리는 "재고는 0보다 작아질 수 없다"는 규칙과 그 규칙이 지키는 데이터가 서로 다른 곳에 산다는 점이다. 데이터는 <code>Item</code> 객체에 있고 규칙은 서비스 여러 곳에 흩어져 있다. <code>setStockQuantity</code>라는 문이 열려 있는 한, 규칙을 거치지 않고 데이터를 바꾸는 코드를 막을 방법이 없다. 이 회차는 이 문을 닫는 것에서 시작한다. 재고를 바꾸는 유일한 길을 <code>Item</code>의 메서드로 만들고, 주문을 만들고 취소하는 규칙도 <code>Order</code>와 <code>OrderItem</code> 안으로 옮긴다.</p>
+<p>그렇게 하면 서비스 계층에는 무엇이 남는가. 엔티티를 찾아오고, 엔티티에게 일을 시키고, 트랜잭션의 경계를 정하는 일만 남는다. 이렇게 일을 시켰는데 UPDATE 문은 누가 실행하는가. 이 질문의 답이 영속성 컨텍스트의 변경 감지(dirty checking)다. 이 회차의 절반은 도메인 코드를 쓰는 데, 나머지 절반은 그 코드가 실행될 때 Hibernate 안에서 일어나는 일을 실제 SQL 로그로 확인하는 데 쓴다.</p>
+<aside class="note">이 회차의 예제(회원·상품·주문·주문상품·배송 엔티티와 서비스)는 이 강좌가 직접 설계한 것이다. SQL 로그는 Hibernate ORM 6.6(6.6.53.Final)과 H2 2.3.232로 같은 매핑을 실행해 얻었다. 스프링 부트 없이 Hibernate만 띄웠기 때문에 컬럼 이름이 <code>stockQuantity</code>처럼 필드 이름 그대로, 테이블 이름은 <code>Item</code>처럼 엔티티 이름 그대로(<code>@Table</code>로 이름을 준 <code>orders</code>, <code>order_item</code>은 그 이름대로) 나온다. 스프링 부트는 기본으로 <code>CamelCaseToUnderscoresNamingStrategy</code>를 적용하므로 같은 매핑이 부트에서는 <code>stock_quantity</code>가 된다. 문장의 순서와 개수는 같다.</aside>
+
+<h3>트랜잭션 스크립트와 도메인 모델</h3>
+<p>마틴 파울러는 『Patterns of Enterprise Application Architecture』에서 비즈니스 로직을 조직하는 두 방식에 이름을 붙였다. <b>트랜잭션 스크립트(Transaction Script)</b>는 그의 카탈로그에서 "표현 계층의 요청 하나를 처리하는 프로시저 단위로 비즈니스 로직을 조직한다"고 정의된다. <b>도메인 모델(Domain Model)</b>은 "행동과 데이터를 함께 가진 도메인의 객체 모델"이다. 앞의 재고 코드처럼 서비스 메서드가 처음부터 끝까지 절차를 쥐고 엔티티는 getter/setter만 가진 구조가 트랜잭션 스크립트이고, 엔티티가 자기 데이터에 대한 규칙을 메서드로 가진 구조가 도메인 모델이다.</p>
+<p>두 방식은 옳고 그름의 문제가 아니라 비용 곡선의 문제다. 트랜잭션 스크립트는 요청 하나를 읽으면 동작 전체가 보인다. 규칙이 적고 요청끼리 공유하는 로직이 거의 없을 때는 이 투명함이 가장 큰 장점이다. 반대로 같은 데이터를 여러 요청이 다른 방식으로 바꾸기 시작하면 공유 로직을 어디에 둘지가 문제가 된다. 보통은 유틸리티 메서드나 "공통 서비스"로 빼는데, 그러면 규칙이 데이터와 떨어진 채로 한 번 더 흩어진다. 도메인 모델은 처음에 객체를 설계하는 비용이 들지만, 규칙이 늘어날수록 추가 비용이 완만하다. 규칙이 그 데이터를 가진 객체 안에 한 번만 있기 때문이다.</p>
+<p>JPA는 도메인 모델 쪽에 특히 잘 맞는다. 도메인 모델의 약점은 객체 그래프를 데이터베이스와 오가게 하는 매핑 비용인데, ORM이 바로 그 비용을 떠맡기 때문이다. 엔티티의 필드만 바꾸면 영속성 컨텍스트가 커밋 시점에 무엇이 바뀌었는지 찾아 UPDATE를 만든다. 그래서 엔티티 메서드 <code>removeStock()</code>은 SQL을 전혀 몰라도 된다. 이 성질 덕분에 엔티티의 비즈니스 메서드는 순수한 자바 코드가 되고, 데이터베이스 없이 단위 테스트할 수 있다. 뒤에서 이 장점과 함께, 이 구조가 감추는 비용(지연 로딩으로 인한 추가 SELECT, 동시성)도 함께 본다.</p>
+<div class="table-wrap"><table><thead><tr><th>관점</th><th>트랜잭션 스크립트</th><th>도메인 모델</th></tr></thead><tbody>
+<tr><td>규칙의 위치</td><td>서비스 메서드 본문</td><td>데이터를 가진 엔티티의 메서드</td></tr>
+<tr><td>엔티티의 모습</td><td>필드와 getter/setter</td><td>필드와 상태를 바꾸는 의미 있는 메서드</td></tr>
+<tr><td>서비스의 역할</td><td>절차 전체를 직접 수행</td><td>엔티티 조회, 위임, 트랜잭션 경계</td></tr>
+<tr><td>단위 테스트</td><td>대개 리포지토리를 대체해야 함</td><td>엔티티 메서드는 순수 자바로 테스트 가능</td></tr>
+<tr><td>잘 맞는 경우</td><td>규칙이 단순하고 요청 간 공유가 적을 때</td><td>같은 데이터에 여러 규칙이 겹칠 때</td></tr>
+</tbody></table></div>
+
+<h3>상품 엔티티: 재고를 바꾸는 유일한 문</h3>
+<p>상품 엔티티부터 쓴다. 핵심은 재고 필드에 setter를 두지 않고, 재고를 바꾸는 의미 있는 메서드 두 개만 공개하는 것이다. 이렇게 하면 <code>stockQuantity</code>가 바뀌는 지점이 <code>addStock</code>과 <code>removeStock</code> 두 곳뿐이라는 사실을 컴파일러가 보장한다. 재고 관련 버그가 생기면 이 두 메서드를 호출하는 곳만 찾으면 된다.</p>
+<pre><code class="language-java">package jpabook.shop.domain;
+
+import jakarta.persistence.*;
+
+@Entity
+public class Item {
+
+    @Id @GeneratedValue
+    @Column(name = "item_id")
+    private Long id;
+
+    private String name;
+    private int price;
+    private int stockQuantity;
+
+    protected Item() {          // JPA가 쓰는 기본 생성자
+    }
+
+    public Item(String name, int price, int stockQuantity) {
+        this.name = name;
+        this.price = price;
+        this.stockQuantity = stockQuantity;
+    }
+
+    /** 재고를 늘린다(입고, 주문 취소). */
+    public void addStock(int quantity) {
+        if (quantity <= 0) {
+            throw new IllegalArgumentException("수량은 1 이상이어야 한다: " + quantity);
+        }
+        this.stockQuantity += quantity;
+    }
+
+    /** 재고를 줄인다(주문). 남는 재고가 음수가 되면 거절한다. */
+    public void removeStock(int quantity) {
+        if (quantity <= 0) {
+            throw new IllegalArgumentException("수량은 1 이상이어야 한다: " + quantity);
+        }
+        int rest = this.stockQuantity - quantity;
+        if (rest < 0) {
+            throw new NotEnoughStockException(
+                    "재고 부족: 현재 " + stockQuantity + ", 요청 " + quantity);
+        }
+        this.stockQuantity = rest;
+    }
+
+    public Long getId() { return id; }
+    public String getName() { return name; }
+    public int getPrice() { return price; }
+    public int getStockQuantity() { return stockQuantity; }
+}</code></pre>
+<pre><code class="language-java">package jpabook.shop.exception;
+
+public class NotEnoughStockException extends RuntimeException {
+    public NotEnoughStockException(String message) {
+        super(message);
+    }
+}</code></pre>
+<p><code>removeStock</code>은 검사를 먼저 하고 대입을 나중에 한다. 남는 재고를 지역 변수 <code>rest</code>에 계산해 두고, 음수면 예외를 던지고, 통과했을 때만 필드에 쓴다. 그래서 예외가 나도 객체의 상태는 호출 전과 같다. 순서를 거꾸로 해서 필드를 먼저 줄이고 검사하면, 예외가 난 뒤에도 객체에 -1 같은 값이 남는다. 트랜잭션이 롤백되면 데이터베이스에는 반영되지 않겠지만, 같은 트랜잭션 안에서 그 객체를 다시 읽는 코드나 예외를 잡고 계속 진행하는 코드는 잘못된 값을 보게 된다. 불변식(invariant)을 지키는 메서드는 "실패하면 아무것도 바꾸지 않는다"는 성질을 가져야 한다.</p>
+<h4>예외를 RuntimeException으로 만드는 이유</h4>
+<p><code>NotEnoughStockException</code>이 <code>RuntimeException</code>을 상속한 데는 이유가 있다. 스프링의 선언적 트랜잭션은 기본 설정에서 언체크 예외에만 롤백한다. Spring Framework 레퍼런스는 기본 설정의 트랜잭션 인프라가 <code>RuntimeException</code>과 그 하위 타입, 그리고 <code>Error</code>가 던져질 때만 트랜잭션을 롤백 대상으로 표시하고, 체크 예외는 기본 설정에서 롤백을 일으키지 않는다고 설명한다. 재고 부족 예외를 체크 예외로 만들면 <code>@Transactional</code> 메서드가 그 예외로 끝나도 커밋이 시도된다. 주문 생성 도중에 이미 다른 상품의 재고를 줄였다면 그 변경이 커밋되어 버린다. <code>rollbackFor</code>로 바꿀 수는 있지만, 재고 부족은 호출자가 복구할 수 있는 상황이라기보다 요청 자체를 거절해야 하는 상황이므로 언체크 예외가 의미에도 맞다.</p>
+<h4>setter가 없는데 JPA는 어떻게 값을 채우는가</h4>
+<p>setter를 없애면 "JPA가 조회한 값을 어떻게 넣느냐"는 의문이 생긴다. 답은 접근 방식(access type)에 있다. Jakarta Persistence 명세는 <code>@Id</code> 같은 매핑 애너테이션을 필드에 붙이면 필드 접근(field access)을, getter에 붙이면 프로퍼티 접근(property access)을 기본으로 쓰게 한다. 위 코드는 <code>@Id</code>가 필드에 있으므로 Hibernate는 리플렉션이나 바이트코드로 만든 접근기로 private 필드를 직접 읽고 쓴다. setter는 JPA를 위한 것이 아니라 다른 자바 코드를 위한 공개 API였던 셈이고, 그래서 지워도 매핑에는 아무 영향이 없다.</p>
+<p>같은 이유로 기본 생성자도 필요하다. 명세 2.1절은 엔티티 클래스가 인자 없는 생성자를 가져야 하며 그 생성자는 public 또는 protected여야 한다고 정한다. 조회 결과로 객체를 만들 때 Hibernate는 먼저 빈 객체를 만들고 필드를 채우기 때문이다. 이 생성자를 protected로 두면 같은 패키지 밖의 코드가 <code>new Item()</code>으로 이름도 가격도 없는 상품을 만드는 길을 막을 수 있다. 명세는 또 엔티티 클래스가 final이면 안 되고 메서드와 영속 필드도 final이면 안 된다고 정한다. 이 규칙이 왜 있는지는 뒤에서 지연 로딩 프록시를 볼 때 분명해진다.</p>
+<h4>데이터베이스 없이 테스트되는 규칙</h4>
+<p>규칙을 엔티티에 넣은 직접적인 이득은 테스트에서 보인다. <code>Item</code>은 JPA 애너테이션이 붙어 있을 뿐 평범한 자바 객체다. 애너테이션은 그것을 읽는 쪽이 없으면 아무 일도 하지 않으므로, 스프링 컨테이너도 데이터베이스도 없이 생성자로 만들어 메서드를 부를 수 있다.</p>
+<pre><code class="language-java">import static org.junit.jupiter.api.Assertions.*;
+import org.junit.jupiter.api.Test;
+
+class ItemTest {
+
+    @Test
+    void 재고보다_많이_빼면_거절하고_상태는_그대로다() {
+        Item item = new Item("JPA 책", 20000, 3);
+
+        assertThrows(NotEnoughStockException.class, () -> item.removeStock(4));
+        assertEquals(3, item.getStockQuantity());   // 실패해도 재고는 그대로
+    }
+
+    @Test
+    void 재고를_빼고_다시_넣는다() {
+        Item item = new Item("JPA 책", 20000, 3);
+        item.removeStock(3);
+        assertEquals(0, item.getStockQuantity());
+        item.addStock(2);
+        assertEquals(2, item.getStockQuantity());
+    }
+}</code></pre>
+<p>이 테스트는 밀리초 단위로 끝나고, 재고 규칙이 바뀌면 바로 깨진다. 트랜잭션 스크립트였다면 같은 규칙을 검증하기 위해 서비스를 띄우고 리포지토리를 가짜로 바꾸거나 데이터베이스를 준비해야 했다. 규칙의 위치가 테스트의 비용을 정한다.</p>
+
+<h3>필드 하나를 바꿨을 뿐인데 UPDATE가 나가는 이유</h3>
+<p><code>removeStock</code>은 힙에 있는 <code>Item</code> 객체의 int 필드 하나를 바꿀 뿐이다. 데이터베이스와는 아무 연결이 없다. 그런데 트랜잭션이 커밋되면 <code>update item set ...</code>이 실행된다. 이 연결을 만드는 것이 영속성 컨텍스트의 <b>변경 감지(dirty checking)</b>다. 영속성 컨텍스트는 엔티티를 식별자로 찾아 두는 1차 캐시를 가진다. 변경 감지를 이해하려면 그 안에 무엇이 하나 더 들어 있는지 알아야 한다.</p>
+<p>Hibernate는 엔티티를 조회하거나 저장해 영속 상태로 만들 때 그 순간의 필드 값들을 배열로 복사해 둔다. 이것을 <b>스냅샷(snapshot)</b>, Hibernate 내부 용어로는 로드된 상태(loaded state)라고 부른다. 1차 캐시의 한 칸은 "식별자 → 엔티티 인스턴스"이고, 그 옆에 "엔티티 인스턴스 → 처음 값의 복사본"이 붙어 있는 셈이다. 플러시(flush) 시점이 되면 Hibernate는 영속성 컨텍스트에 있는 모든 엔티티에 대해 현재 필드 값과 스냅샷을 하나씩 비교한다. 다른 값이 하나라도 있으면 그 엔티티에 대한 UPDATE 작업을 쓰기 지연 큐(Hibernate의 <code>ActionQueue</code>)에 넣는다.</p>
+<pre class="diagram">  트랜잭션 시작
+      │
+      ▼
+  em.find(Item.class, 1L)
+      │   SELECT → 결과 행으로 Item 객체 생성
+      │
+      │   영속성 컨텍스트
+      │   ┌──────────────────────────────────────────────────────────┐
+      │   │ 1차 캐시   [Item#1] ──► Item@7a3 {name, price, stock=10}  │
+      │   │ 스냅샷     [Item#1] ──► ["JPA 책", 10000, 10]  (복사본)   │
+      │   └──────────────────────────────────────────────────────────┘
+      ▼
+  item.removeStock(2)        → Item@7a3.stock = 8   (힙의 필드만 바뀜)
+      │
+      ▼
+  커밋 직전 flush
+      │   현재값 ["JPA 책", 10000, 8]  vs  스냅샷 ["JPA 책", 10000, 10]
+      │   다르다 → EntityUpdateAction 등록
+      ▼
+  update item set name=?,price=?,stockQuantity=? where item_id=?
+      │
+      ▼
+  JDBC commit</pre>
+<p>실험 로그를 보면 UPDATE 문의 SET 절에 바뀐 <code>stockQuantity</code>만이 아니라 <code>name</code>과 <code>price</code>까지 들어 있다. Hibernate는 기본적으로 엔티티마다 모든 컬럼을 갱신하는 UPDATE 문을 하나 미리 만들어 두고 재사용한다. SQL 문자열이 항상 같으므로 JDBC 드라이버나 데이터베이스가 문장을 캐시하기 좋고, 배치로 묶기도 쉽다. 바뀐 컬럼만 넣고 싶으면 Hibernate의 <code>@DynamicUpdate</code>를 엔티티에 붙여 플러시마다 SQL을 새로 만들게 할 수 있지만, 이것은 컬럼이 아주 많거나 큰 컬럼이 있을 때 고려할 선택이다.</p>
+<p>스냅샷에는 비용이 있다. 조회한 엔티티마다 필드 값 배열이 하나씩 더 메모리에 생기고, 플러시마다 모든 영속 엔티티를 비교한다. 엔티티 몇십 개를 다루는 트랜잭션에서는 무시할 만하지만, 수만 건을 읽기만 하는 조회에서는 쓸데없는 일이다. 이 비용을 어떻게 끄는지가 바로 다음에 볼 읽기 전용 트랜잭션의 이야기다.</p>
+<x-visual id="jpa-app1-04-dirty-checking" title="스냅샷 비교로 UPDATE가 만들어지는 과정" kind="흐름도" ratio="16:9">
+<x-hint>엔티티 필드만 바뀌었는데 커밋 시점에 UPDATE가 생기는 이유를 1차 캐시·스냅샷·비교·쓰기 지연 큐로 보여 준다.</x-hint>
+<x-prompt>가로로 긴 흐름도. 왼쪽에 "트랜잭션" 이라는 세로 띠가 위에서 아래로 흐른다. 가운데에 큰 상자 "영속성 컨텍스트" 가 있고, 그 안에 위아래로 두 칸: 위 칸 "1차 캐시" 에는 Item 객체 카드(필드 stock=8 이 빨간색으로 강조), 아래 칸 "스냅샷" 에는 회색 배열 카드(stock=10). 두 카드 사이에 저울 아이콘과 라벨 "flush 때 비교". 저울에서 오른쪽으로 화살표가 나가 "쓰기 지연 큐" 라는 작은 상자로 들어가고, 그 안에 카드 한 장 "UPDATE item". 큐에서 오른쪽 끝의 원통형 "데이터베이스" 로 화살표, 화살표 위 라벨 "커밋 직전 실행". 왼쪽 위에는 코드 말풍선 "item.removeStock(2)" 가 1차 캐시의 Item 카드를 가리킨다. 깔끔한 플랫 일러스트, 흰 배경, 파란색과 회색 위주.</x-prompt>
+<x-caption>removeStock()은 힙의 필드만 바꾼다. UPDATE는 플러시 때 스냅샷과의 비교에서 태어난다.</x-caption>
+</x-visual>
+
+<h3>상품 리포지토리: persist와 merge의 갈림길</h3>
+<p>상품 리포지토리는 03회의 회원 리포지토리처럼 <code>EntityManager</code>를 주입받아 쓴다. <code>@PersistenceContext</code>로 주입받는 <code>EntityManager</code>는 실제 엔티티 매니저가 아니라 스프링이 만든 공유 프록시이고, 메서드가 호출될 때마다 현재 스레드의 트랜잭션에 묶인 진짜 엔티티 매니저를 찾아 위임한다는 점을 짚고 넘어가자. 그래서 싱글톤 리포지토리 하나가 동시에 여러 요청을 처리해도 요청마다 다른 영속성 컨텍스트를 쓴다.</p>
+<pre><code class="language-java">package jpabook.shop.repository;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import java.util.List;
+import jpabook.shop.domain.Item;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public class ItemRepository {
+
+    @PersistenceContext
+    private EntityManager em;
+
+    public void save(Item item) {
+        if (item.getId() == null) {
+            em.persist(item);       // 새 엔티티: 영속성 컨텍스트에 등록
+        } else {
+            em.merge(item);         // 이미 식별자가 있는 엔티티: 05회에서 다룬다
+        }
+    }
+
+    public Item findOne(Long id) {
+        return em.find(Item.class, id);
+    }
+
+    public List<Item> findAll() {
+        return em.createQuery("select i from Item i", Item.class)
+                 .getResultList();
+    }
+}</code></pre>
+<p><code>save</code>의 분기는 "식별자가 비어 있으면 새 객체"라는 판단에 기댄다. <code>@GeneratedValue</code>를 쓰는 엔티티는 저장 전까지 <code>id</code>가 <code>null</code>이므로 이 판단이 맞다. 식별자가 이미 있다면 그 객체는 예전에 저장된 적이 있고 지금은 영속성 컨텍스트 밖에 있는 준영속(detached) 객체일 가능성이 높다. 명세는 준영속 객체에 <code>persist</code>를 호출하면 예외가 날 수 있다고 정하므로 <code>merge</code>로 보낸다. 같은 판단을 Spring Data JPA의 <code>SimpleJpaRepository.save()</code>도 한다. Spring Data JPA 3.5의 바이트코드를 보면 이 메서드는 <code>JpaEntityInformation.isNew()</code>로 새 엔티티인지 묻고, 새것이면 <code>persist</code>, 아니면 <code>merge</code>를 호출한다. <code>merge</code>는 인자로 받은 객체를 영속화하지 않고 영속 상태의 다른 객체를 돌려준다는 중요한 차이가 있는데, 이 차이와 그것이 웹 계층에서 일으키는 문제는 05회의 몫이다.</p>
+<h4>persist 순간에 식별자는 어디서 오는가</h4>
+<p><code>persist</code>가 호출되면 엔티티는 영속 상태가 되고, 영속성 컨텍스트는 그 엔티티를 식별자로 관리해야 하므로 식별자가 그 자리에서 필요하다. 식별자를 어디서 얻는지는 생성 전략이 정한다. <code>@GeneratedValue</code>에 전략을 적지 않으면 <code>AUTO</code>이고, Hibernate 6는 시퀀스를 지원하는 데이터베이스에서 엔티티마다 <code>테이블명_SEQ</code> 시퀀스를 쓴다. 실험에서 Hibernate가 만든 DDL은 <code>create sequence Item_SEQ start with 1 increment by 50</code>이었다. 증가폭 50은 시퀀스를 한 번 호출할 때 식별자 50개 구간을 확보해 메모리에서 나눠 주고, 다음 49번은 데이터베이스에 묻지 않기 위한 것이다.</p>
+<pre data-label="실행 로그: 회원과 상품 저장 (Hibernate 6.6 + H2)"><code class="language-text">Hibernate: select next value for Member_SEQ
+---- after persist member, id=1
+Hibernate: select next value for Item_SEQ
+Hibernate: insert into Member (address,name,member_id) values (?,?,?)
+Hibernate: insert into Item (name,price,stockQuantity,item_id) values (?,?,?,?)</code></pre>
+<p>로그의 순서가 핵심이다. <code>persist(member)</code> 직후에 나간 것은 시퀀스 조회뿐이고, INSERT는 아직이다. 식별자 1은 시퀀스에서 받아 객체에 이미 들어갔지만 행은 커밋 직전의 플러시에서야 만들어진다. 이것이 <b>트랜잭션 쓰기 지연(transactional write-behind)</b>이다. 반면 <code>GenerationType.IDENTITY</code>를 쓰면 식별자를 데이터베이스가 INSERT를 실행할 때 정하므로(MySQL의 <code>AUTO_INCREMENT</code>가 그렇다), 식별자를 알려면 INSERT를 먼저 실행할 수밖에 없다. 그래서 IDENTITY 전략의 <code>persist</code>는 호출 즉시 INSERT를 실행한다. 생성 전략 하나가 "SQL이 언제 나가는가"를 바꾼다는 점은 테스트를 해석할 때 다시 중요해진다.</p>
+
+<h3>상품 서비스: 얇지만 필요한 층</h3>
+<pre><code class="language-java">package jpabook.shop.service;
+
+import java.util.List;
+import jpabook.shop.domain.Item;
+import jpabook.shop.repository.ItemRepository;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+@Transactional(readOnly = true)
+public class ItemService {
+
+    private final ItemRepository itemRepository;
+
+    public ItemService(ItemRepository itemRepository) {
+        this.itemRepository = itemRepository;
+    }
+
+    @Transactional
+    public Long saveItem(Item item) {
+        itemRepository.save(item);
+        return item.getId();
+    }
+
+    public List<Item> findItems() {
+        return itemRepository.findAll();
+    }
+
+    public Item findOne(Long itemId) {
+        return itemRepository.findOne(itemId);
+    }
+}</code></pre>
+<p>상품 서비스는 리포지토리에 거의 그대로 위임한다. 이런 층이 왜 필요한가 하는 의문은 자연스럽다. 답은 이 층이 트랜잭션 경계라는 데 있다. 컨트롤러가 리포지토리를 직접 부르면 리포지토리 메서드 하나하나가 따로 트랜잭션이 되거나, 컨트롤러에 <code>@Transactional</code>을 붙여 웹 계층이 트랜잭션을 알게 된다. 서비스 메서드 하나가 "한 번의 비즈니스 요청 = 한 번의 트랜잭션 = 하나의 영속성 컨텍스트"라는 단위를 정의하고, 그 안에서 엔티티를 몇 개 조회하고 바꾸든 커밋 시점에 한꺼번에 반영된다. 지금은 위임뿐이어도, 주문 서비스처럼 여러 엔티티를 엮어야 하는 순간 이 경계가 일을 한다.</p>
+<h4>readOnly = true가 실제로 바꾸는 것</h4>
+<p>클래스에 <code>@Transactional(readOnly = true)</code>를 붙이고 쓰기 메서드에만 <code>@Transactional</code>을 다시 붙인 이유는 기본값을 읽기 전용으로 두기 위해서다. 메서드에 붙은 애너테이션이 클래스의 것보다 우선한다. 그러면 <code>readOnly</code>는 실제로 무엇을 하는가. "힌트일 뿐"이라는 설명이 흔한데, JPA와 Hibernate 조합에서는 구체적인 효과가 있다. Spring Framework 6.2의 <code>HibernateJpaDialect.beginTransaction()</code> 바이트코드를 보면, 읽기 전용 트랜잭션일 때 Hibernate 세션의 플러시 모드를 <code>FlushMode.MANUAL</code>로 바꾸고, 그 트랜잭션이 엔티티 매니저를 새로 연 경우(트랜잭션 로컬 엔티티 매니저)에는 <code>setDefaultReadOnly(true)</code>도 호출한다. 웹 요청 동안 엔티티 매니저를 미리 열어 두는 OSIV 환경처럼 이미 바인딩된 엔티티 매니저에 참여할 때는 플러시 모드만 바뀐다.</p>
+<p>두 설정의 의미는 이렇다. <code>FlushMode.MANUAL</code>은 개발자가 <code>flush()</code>를 직접 부르지 않는 한 자동 플러시를 하지 않는다는 뜻이므로, 커밋 때도 변경 감지가 돌지 않는다. <code>setDefaultReadOnly(true)</code>는 이 세션에서 읽어 들이는 엔티티를 읽기 전용으로 만든다. Hibernate의 <code>Session</code> Javadoc은 읽기 전용 엔티티는 변경 감지 대상이 아니고 영속 상태의 스냅샷도 유지하지 않으며, 수정은 가능하지만 그 변경은 저장되지 않는다고 설명한다. 앞에서 본 스냅샷 배열이 아예 만들어지지 않으니 메모리와 플러시 비용이 함께 준다. 반대로 말하면, 읽기 전용 메서드 안에서 실수로 엔티티를 고쳐도 UPDATE가 나가지 않는다. 쓰기 메서드에 <code>@Transactional</code>을 빠뜨리면 "코드는 실행됐는데 저장이 안 된다"는 증상이 나오는 이유다.</p>
+<aside class="note">위 동작은 스프링이 Hibernate를 JPA 구현체로 쓸 때 <code>JpaTransactionManager</code>가 <code>HibernateJpaDialect</code>를 통해 적용하는 것이다. 다른 JPA 구현체나 다른 트랜잭션 매니저에서는 <code>readOnly</code>의 효과가 다를 수 있다.</aside>
+
+<h3>주문과 주문상품 엔티티: 생성 규칙을 객체가 쥔다</h3>
+<p>주문 도메인은 엔티티 셋이 함께 움직인다. 주문(<code>Order</code>)은 누가 주문했는지와 주문 상태를 가지고, 주문상품(<code>OrderItem</code>)은 어떤 상품을 얼마에 몇 개 샀는지를 가지며, 배송(<code>Delivery</code>)은 배송지와 배송 상태를 가진다. 주문과 상품은 다대다 관계지만, 주문 시점의 가격과 수량이라는 관계 자체의 데이터가 있으므로 그 관계를 <code>OrderItem</code>이라는 엔티티로 승격해 일대다·다대일 두 관계로 푼다. 이 설계의 이유는 02회의 도메인 설계에서 다루는 주제이므로, 여기서는 코드와 그 코드가 지키는 규칙에 집중한다.</p>
+<pre><code class="language-java">package jpabook.shop.domain;
+
+import jakarta.persistence.*;
+import java.util.ArrayList;
+import java.util.List;
+
+@Entity
+@Table(name = "orders")             // ORDER는 SQL 예약어라 테이블 이름을 바꾼다
+public class Order {
+
+    @Id @GeneratedValue
+    @Column(name = "order_id")
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "member_id")
+    private Member member;
+
+    @OneToMany(mappedBy = "order", cascade = CascadeType.ALL)
+    private List<OrderItem> orderItems = new ArrayList<>();
+
+    @OneToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL)
+    @JoinColumn(name = "delivery_id")
+    private Delivery delivery;
+
+    @Enumerated(EnumType.STRING)
+    private OrderStatus status;      // ORDER, CANCEL
+
+    protected Order() {
+    }
+
+    //== 생성 메서드: 주문이 만들어지는 유일한 길 ==//
+    public static Order createOrder(Member member, Delivery delivery, OrderItem... orderItems) {
+        Order order = new Order();
+        order.member = member;
+        order.attachDelivery(delivery);
+        for (OrderItem orderItem : orderItems) {
+            order.addOrderItem(orderItem);
+        }
+        order.status = OrderStatus.ORDER;
+        return order;
+    }
+
+    //== 연관관계 편의 메서드: 양쪽 참조를 함께 맞춘다 ==//
+    private void addOrderItem(OrderItem orderItem) {
+        orderItems.add(orderItem);
+        orderItem.assignOrder(this);
+    }
+
+    private void attachDelivery(Delivery delivery) {
+        this.delivery = delivery;
+        delivery.assignOrder(this);
+    }
+
+    //== 비즈니스 로직 ==//
+    public void cancel() {
+        if (delivery.getStatus() == DeliveryStatus.COMP) {
+            throw new IllegalStateException("배송이 끝난 주문은 취소할 수 없다");
+        }
+        if (status == OrderStatus.CANCEL) {
+            throw new IllegalStateException("이미 취소된 주문이다");
+        }
+        this.status = OrderStatus.CANCEL;
+        for (OrderItem orderItem : orderItems) {
+            orderItem.cancel();
+        }
+    }
+
+    //== 조회 로직 ==//
+    public int getTotalPrice() {
+        int total = 0;
+        for (OrderItem orderItem : orderItems) {
+            total += orderItem.getTotalPrice();
+        }
+        return total;
+    }
+
+    public Long getId() { return id; }
+    public Member getMember() { return member; }
+    public List<OrderItem> getOrderItems() { return orderItems; }
+    public Delivery getDelivery() { return delivery; }
+    public OrderStatus getStatus() { return status; }
+}</code></pre>
+<pre><code class="language-java">package jpabook.shop.domain;
+
+import jakarta.persistence.*;
+
+@Entity
+@Table(name = "order_item")
+public class OrderItem {
+
+    @Id @GeneratedValue
+    @Column(name = "order_item_id")
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "item_id")
+    private Item item;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "order_id")
+    private Order order;
+
+    private int orderPrice;     // 주문 시점의 단가
+    private int count;
+
+    protected OrderItem() {
+    }
+
+    public static OrderItem createOrderItem(Item item, int orderPrice, int count) {
+        item.removeStock(count);           // 재고가 모자라면 여기서 예외, 객체는 만들어지지 않는다
+        OrderItem orderItem = new OrderItem();
+        orderItem.item = item;
+        orderItem.orderPrice = orderPrice;
+        orderItem.count = count;
+        return orderItem;
+    }
+
+    void assignOrder(Order order) {        // 같은 패키지의 Order만 부른다
+        this.order = order;
+    }
+
+    public void cancel() {
+        item.addStock(count);
+    }
+
+    public int getTotalPrice() {
+        return orderPrice * count;
+    }
+
+    public Item getItem() { return item; }
+    public int getOrderPrice() { return orderPrice; }
+    public int getCount() { return count; }
+}</code></pre>
+<pre><code class="language-java">package jpabook.shop.domain;
+
+import jakarta.persistence.*;
+
+@Entity
+public class Delivery {
+
+    @Id @GeneratedValue
+    @Column(name = "delivery_id")
+    private Long id;
+
+    @OneToOne(mappedBy = "delivery", fetch = FetchType.LAZY)
+    private Order order;
+
+    private String address;
+
+    @Enumerated(EnumType.STRING)
+    private DeliveryStatus status;   // READY, COMP
+
+    protected Delivery() {
+    }
+
+    public Delivery(String address) {
+        this.address = address;
+        this.status = DeliveryStatus.READY;
+    }
+
+    void assignOrder(Order order) {
+        this.order = order;
+    }
+
+    public DeliveryStatus getStatus() { return status; }
+}
+
+// Member는 03회의 회원 엔티티를 쓴다. 여기서는 id, name, address 필드와
+// 생성자 Member(String name, String address), getter만 있다고 가정한다. // ...</code></pre>
+<p>이 코드에는 몇 가지 의도적인 선택이 들어 있다. 첫째, 주문과 주문상품은 <b>정적 생성 메서드(static factory method)</b>로만 만든다. 생성자를 protected로 막았으므로 외부 코드는 <code>Order.createOrder()</code>를 거쳐야 하고, 이 메서드 하나가 "주문에는 회원과 배송이 있고, 주문상품이 연결되며, 상태는 ORDER로 시작한다"는 규칙을 한 번에 적용한다. <code>new Order()</code> 후에 setter를 여러 번 부르는 방식이었다면 상태를 빠뜨리거나 주문상품의 역방향 참조를 안 맞춘 반쯤 만들어진 주문이 생길 수 있다. 생성 시점에 불변식을 세우면, 그 뒤로는 객체가 항상 올바른 상태에서 출발한다.</p>
+<p>둘째, <code>createOrderItem</code>이 재고를 줄인다. 주문상품이 생긴다는 것은 그만큼의 재고가 예약된다는 뜻이므로 두 사건을 한 메서드에 묶었다. <code>removeStock</code>을 먼저 호출하므로 재고가 모자라면 주문상품 객체 자체가 만들어지지 않는다. 셋째, <code>orderPrice</code>를 상품의 가격과 별도로 저장한다. 상품의 가격은 내일 바뀔 수 있지만 어제 주문한 금액은 바뀌면 안 된다. 주문상품이 <code>item.getPrice()</code>를 그때그때 읽게 하면 과거 주문의 합계가 가격 변경과 함께 달라진다. 할인이나 쿠폰이 들어오면 주문 단가가 상품 가격과 다른 경우도 생기므로, 단가를 파라미터로 받는다.</p>
+<p>넷째, 연관관계 편의 메서드가 양쪽 참조를 함께 맞춘다. 데이터베이스 입장에서는 외래 키를 가진 쪽(연관관계의 주인)만 중요하다. <code>order_item.order_id</code>는 <code>OrderItem.order</code> 필드가 정하고, <code>Order.orderItems</code> 리스트는 INSERT에 아무 영향이 없다. 하지만 같은 트랜잭션 안에서 <code>order.getTotalPrice()</code>를 부르면 메모리의 리스트를 순회한다. 리스트에 추가하지 않았다면 데이터베이스에는 행이 들어가도 합계는 0이 된다. 편의 메서드는 객체 그래프와 테이블이 같은 모습이 되도록 두 쪽을 한 번에 맞추는 장치다. 이 메서드들을 private이나 패키지 접근으로 둔 것은 생성 메서드 밖에서 관계가 따로 바뀌지 않게 하기 위해서다.</p>
+<h4>cascade = ALL을 어디에 붙이는가</h4>
+<p><code>orderItems</code>와 <code>delivery</code>에는 <code>cascade = CascadeType.ALL</code>을 붙였고, <code>member</code>와 <code>OrderItem.item</code>에는 붙이지 않았다. 기준은 생명주기의 소유다. 주문상품과 배송은 주문이 만들어질 때 함께 만들어지고, 다른 엔티티가 참조하지 않으며, 주문 없이는 의미가 없다. 이런 관계에서는 주문을 저장하거나 삭제할 때 같은 작업을 자식에게 전파하는 것이 자연스럽다. 반면 회원과 상품은 주문과 별개로 존재하고 여러 주문이 공유한다. 주문을 삭제할 때 상품까지 삭제가 전파되면 재앙이다. cascade는 편의 기능이 아니라 "이 객체의 생명주기는 저 객체가 관리한다"는 선언이다.</p>
+<p>명세는 cascade의 의미를 두 시점에서 정한다. Jakarta Persistence 3.1의 3.2.2절은 엔티티 X에 <code>persist</code>를 호출할 때, X에서 Y로 가는 관계에 <code>cascade=PERSIST</code>나 <code>cascade=ALL</code>이 붙어 있으면 Y에도 persist 연산이 적용된다고 정한다. 3.2.4절은 플러시 시점에도 같은 규칙을 적용하고, cascade가 없는 관계로 새(new) 엔티티를 참조하고 있으면 플러시가 <code>IllegalStateException</code>을 던지거나 커밋이 실패한다고 정한다. 다만 Hibernate 6.6에서 직접 해 보면 관계의 종류에 따라 결과가 갈린다. 외래 키를 주문이 가진 <code>delivery</code> 같은 대일 연관에 cascade 없이 새 객체를 넣고 주문만 저장하면, 커밋 때 플러시가 <code>IllegalStateException</code>(원인은 <code>TransientObjectException</code>)으로 실패한다. 반면 <code>orderItems</code>처럼 <code>mappedBy</code> 쪽 컬렉션에서 cascade를 빼고 같은 구조로 실험했을 때는 예외 없이 커밋되었고, 자식 행의 INSERT만 조용히 빠졌다. cascade를 붙이면 주문상품 리포지토리나 배송 리포지토리 없이도 <code>em.persist(order)</code> 한 번으로 세 엔티티가 모두 저장된다.</p>
+
+<h3>주문 리포지토리와 주문 서비스</h3>
+<pre><code class="language-java">@Repository
+public class OrderRepository {
+
+    @PersistenceContext
+    private EntityManager em;
+
+    public void save(Order order) {
+        em.persist(order);          // OrderItem, Delivery는 cascade로 함께 저장된다
+    }
+
+    public Order findOne(Long id) {
+        return em.find(Order.class, id);
+    }
+
+    // public List<Order> findAll(OrderSearch orderSearch) { ... }  검색은 뒤에서 다룬다
+}</code></pre>
+<pre><code class="language-java">@Service
+@Transactional(readOnly = true)
+public class OrderService {
+
+    private final OrderRepository orderRepository;
+    private final MemberRepository memberRepository;   // 03회의 회원 리포지토리
+    private final ItemRepository itemRepository;
+
+    public OrderService(OrderRepository orderRepository,
+                        MemberRepository memberRepository,
+                        ItemRepository itemRepository) {
+        this.orderRepository = orderRepository;
+        this.memberRepository = memberRepository;
+        this.itemRepository = itemRepository;
+    }
+
+    /** 주문 */
+    @Transactional
+    public Long order(Long memberId, Long itemId, int count) {
+        Member member = memberRepository.findOne(memberId);
+        Item item = itemRepository.findOne(itemId);
+
+        Delivery delivery = new Delivery(member.getAddress());
+        OrderItem orderItem = OrderItem.createOrderItem(item, item.getPrice(), count);
+        Order order = Order.createOrder(member, delivery, orderItem);
+
+        orderRepository.save(order);
+        return order.getId();
+    }
+
+    /** 주문 취소 */
+    @Transactional
+    public void cancelOrder(Long orderId) {
+        Order order = orderRepository.findOne(orderId);
+        order.cancel();
+    }
+}</code></pre>
+<p>서비스 코드를 보면 비즈니스 규칙이 한 줄도 없다. <code>order()</code>는 엔티티를 찾고, 생성 메서드를 부르고, 저장한다. <code>cancelOrder()</code>는 두 줄이다. 재고를 되돌리고 상태를 바꾸는 규칙은 모두 <code>Order.cancel()</code> 안에 있고, 바뀐 값을 저장하는 코드는 아예 없다. 트랜잭션 스크립트였다면 <code>cancelOrder()</code>는 상태 확인, 상태 변경, 주문상품 목록 순회, 상품별 재고 복원, 그리고 각 변경을 반영하는 UPDATE 호출까지 담았을 것이다. 그 절차가 사라진 것이 아니라 엔티티와 영속성 컨텍스트로 옮겨 갔다. 이제 그 이동이 실행 시점에 어떤 SQL로 나타나는지 확인해 보자.</p>
+
+<h3>주문 한 건이 SQL이 되기까지</h3>
+<p>재고 10개인 상품을 2개 주문하는 <code>order()</code>를 실행했을 때의 로그다. 이 회차 앞머리의 주석대로 Hibernate 6.6 단독 실행이라 컬럼 이름은 필드 이름 그대로다. 사이사이의 <code>----</code> 줄은 실험 코드가 찍은 표시다.</p>
+<pre data-label="실행 로그: 주문 생성"><code class="language-text">Hibernate: select m1_0.member_id,m1_0.address,m1_0.name from Member m1_0 where m1_0.member_id=?
+Hibernate: select i1_0.item_id,i1_0.name,i1_0.price,i1_0.stockQuantity from Item i1_0 where i1_0.item_id=?
+Hibernate: select next value for orders_SEQ
+Hibernate: select next value for Delivery_SEQ
+Hibernate: select next value for order_item_SEQ
+---- after persist order, id=1 oi.id=1 delivery.id=1
+Hibernate: insert into Delivery (address,status,delivery_id) values (?,?,?)
+Hibernate: insert into orders (delivery_id,member_id,status,order_id) values (?,?,?,?)
+Hibernate: insert into order_item (count,item_id,order_id,orderPrice,order_item_id) values (?,?,?,?,?)
+Hibernate: update Item set name=?,price=?,stockQuantity=? where item_id=?</code></pre>
+<p>한 줄씩 따라가 보자. 처음 두 SELECT는 <code>em.find()</code>로 회원과 상품을 읽은 것이다. 이 시점에 두 엔티티는 1차 캐시에 들어가고 스냅샷이 찍힌다. 다음으로 <code>createOrderItem()</code>이 <code>item.removeStock(2)</code>를 부르지만 SQL은 없다. 상품의 재고 필드가 힙에서 10에서 8로 바뀌었을 뿐이다. 그다음 <code>persist(order)</code>가 호출되자 시퀀스 조회 세 번이 나간다. <code>orders_SEQ</code>가 먼저이고 <code>Delivery_SEQ</code>, <code>order_item_SEQ</code>가 뒤따른다. 이 순서는 Hibernate가 주문의 식별자를 먼저 생성한 뒤 cascade로 배송과 주문상품을 persist하기 때문이다. 실험 코드가 <code>persist</code> 직후 찍은 줄을 보면 세 객체의 식별자가 모두 채워져 있지만, INSERT는 아직 하나도 없다.</p>
+<p>INSERT는 커밋 직전의 플러시에서 나가고, 순서는 배송 → 주문 → 주문상품이다. 시퀀스를 받은 순서(주문 → 배송 → 주문상품)와 다르다. 이유는 외래 키다. <code>orders.delivery_id</code>가 <code>delivery</code>를 참조하므로 배송 행이 먼저 있어야 주문 행을 넣을 수 있고, <code>order_item.order_id</code>가 <code>orders</code>를 참조하므로 주문상품은 주문 뒤에 들어가야 한다. Hibernate 6.6의 <code>AbstractSaveEventListener</code>에는 <code>cascadeBeforeSave</code>와 <code>cascadeAfterSave</code> 두 메서드가 있다. 부모의 INSERT 작업을 큐에 넣기 전에 외래 키를 주문 쪽이 가진 대일(to-one) 연관인 배송의 cascade를 먼저 처리하고, 부모를 큐에 넣은 뒤에 외래 키를 자식 쪽이 가진 컬렉션인 주문상품의 cascade를 처리한다(어느 쪽에서 처리할지는 연관의 외래 키 방향이 정한다). 그래서 식별자는 주문이 먼저 받았지만 INSERT 작업은 배송이 먼저 큐에 들어간다.</p>
+<p>마지막 줄의 <code>update item</code>은 변경 감지의 결과다. 재고를 줄인 것은 시간상 가장 먼저 일어난 일인데 SQL은 가장 나중에 나왔다. Hibernate는 플러시 때 쓰기 지연 큐의 작업을 호출 순서가 아니라 종류별로 정해진 순서로 실행한다. Hibernate 6.6의 <code>ActionQueue</code> 안에 있는 <code>OrderedActions</code> 열거형은 그 순서를 고아 컬렉션 제거, 고아 제거, 엔티티 INSERT, 엔티티 UPDATE, 컬렉션 작업들, 엔티티 DELETE 순으로 정의한다. INSERT가 UPDATE보다, UPDATE가 DELETE보다 먼저다. 같은 종류끼리는 큐에 들어온 순서를 지킨다. 이 고정 순서 덕분에 같은 종류의 문장이 연달아 나오고 JDBC 배치로 묶기 쉬워진다. 반대로 "삭제하고 같은 유니크 값으로 다시 넣기"처럼 순서에 기대는 코드는 이 규칙 때문에 제약 조건 위반을 일으킬 수 있다는 점도 기억해 두자.</p>
+<x-visual id="jpa-app1-04-order-sequence" title="주문 생성 시 식별자 할당과 INSERT 순서" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>persist 시점에는 시퀀스만 호출되고, 커밋 직전 플러시에서 외래 키 순서대로 INSERT가 나간 뒤 변경 감지로 UPDATE가 나가는 흐름.</x-hint>
+<x-prompt>세로 생명선 네 개가 있는 시퀀스 다이어그램. 왼쪽부터 "OrderService", "영속성 컨텍스트", "쓰기 지연 큐", "DB". 위쪽 구간: OrderService에서 영속성 컨텍스트로 화살표 "persist(order)", 영속성 컨텍스트에서 DB로 작은 화살표 세 개가 차례로 "orders_SEQ", "delivery_SEQ", "order_item_SEQ". 영속성 컨텍스트에서 쓰기 지연 큐로 카드 세 장이 쌓이는데 위에서부터 "INSERT delivery", "INSERT orders", "INSERT order_item". 가운데에 가로 점선과 라벨 "커밋 직전 flush". 아래 구간: 영속성 컨텍스트 옆에 저울 아이콘 "변경 감지" 가 있고 카드 "UPDATE item" 이 큐 맨 아래에 추가된다. 큐에서 DB로 네 개의 화살표가 위에서부터 순서대로 같은 라벨로 나간다. 마지막에 OrderService에서 DB로 "commit". 단순한 선과 상자, 흰 배경.</x-prompt>
+<x-caption>식별자는 persist 때 시퀀스에서 받고, INSERT와 UPDATE는 플러시 때 정해진 순서로 실행된다.</x-caption>
+</x-visual>
+
+<h3>주문 취소를 따라가면 보이는 지연 로딩</h3>
+<p>이번에는 새 트랜잭션에서 방금 만든 주문을 취소한다. <code>cancelOrder()</code>의 코드는 <code>findOne</code>과 <code>cancel</code> 두 줄인데, 로그에는 SELECT가 네 번 나온다.</p>
+<pre data-label="실행 로그: 주문 취소"><code class="language-text">Hibernate: select o1_0.order_id,o1_0.delivery_id,o1_0.member_id,o1_0.status from orders o1_0 where o1_0.order_id=?
+---- order loaded
+Hibernate: select d1_0.delivery_id,d1_0.address,d1_0.status from Delivery d1_0 where d1_0.delivery_id=?
+Hibernate: select oi1_0.order_id,oi1_0.order_item_id,oi1_0.count,oi1_0.item_id,oi1_0.orderPrice from order_item oi1_0 where oi1_0.order_id=?
+Hibernate: select i1_0.item_id,i1_0.name,i1_0.price,i1_0.stockQuantity from Item i1_0 where i1_0.item_id=?
+---- cancel called
+Hibernate: update orders set delivery_id=?,member_id=?,status=? where order_id=?
+Hibernate: update Item set name=?,price=?,stockQuantity=? where item_id=?
+---- stock=10</code></pre>
+<p><code>em.find(Order.class, id)</code>가 실행한 첫 SELECT는 <code>orders</code> 테이블만 읽는다. <code>member</code>와 <code>delivery</code>는 <code>FetchType.LAZY</code>이므로 Hibernate는 외래 키 값(<code>member_id</code>, <code>delivery_id</code>)만 읽고, 그 자리에 실제 엔티티 대신 <b>프록시(proxy)</b> 객체를 넣는다. <code>orderItems</code> 컬렉션 자리에는 아직 초기화되지 않은 Hibernate의 영속 컬렉션 래퍼가 들어간다. 참고로 JPA에서 <code>@ManyToOne</code>과 <code>@OneToOne</code>의 기본 fetch 전략은 EAGER이다. LAZY를 직접 적지 않으면 주문을 읽을 때마다 회원과 배송이 함께 조회된다. 대일 관계에 LAZY를 명시하는 습관은 여기서 온다.</p>
+<p><code>cancel()</code>이 시작되면 첫 줄에서 <code>delivery.getStatus()</code>를 호출한다. 이 메서드 호출이 배송 프록시를 초기화해 두 번째 SELECT가 나간다. 다음으로 <code>for</code>문이 <code>orderItems</code>를 순회하려고 반복자를 요청하는 순간 컬렉션이 초기화되어 세 번째 SELECT가 나간다. 각 주문상품의 <code>cancel()</code>이 <code>item.addStock(count)</code>를 호출하면 상품 프록시가 초기화되어 네 번째 SELECT가 나간다. 회원은 끝까지 쓰이지 않았으므로 회원 테이블은 한 번도 읽히지 않았다. 지연 로딩은 "실제로 쓰는 만큼만 읽는다"는 약속을 정확히 지켰다.</p>
+<p>그 대가도 로그에 보인다. 주문상품이 하나여서 상품 SELECT가 한 번이지만, 주문상품이 열 개이고 상품이 모두 다르면 상품 SELECT가 열 번 나간다. 주문 목록 화면에서 주문 백 건의 합계를 보여 주려고 <code>getTotalPrice()</code>를 부르면, 주문 목록 SELECT 한 번에 주문상품 컬렉션 SELECT가 백 번 따라 나온다. 이것이 흔히 N+1 문제라고 부르는 현상이고, 페치 조인 같은 해법은 로드맵의 다음 강의인 「JPA 활용 2」의 주제다. 이 회차에서 기억할 것은, 도메인 모델의 메서드가 객체 그래프를 자유롭게 탐색할수록 그 탐색이 SQL로 번역된다는 사실이다. 엔티티 메서드는 SQL을 모르지만 SQL은 엔티티 메서드를 따라 나간다.</p>
+<p>커밋 직전 플러시에서는 스냅샷과 다른 엔티티 두 개가 발견된다. 상태가 ORDER에서 CANCEL로 바뀐 주문과, 재고가 8에서 10으로 돌아온 상품이다. 그래서 UPDATE가 두 번 나간다. 배송과 주문상품은 읽기만 했으므로 UPDATE가 없다. 엔티티 메서드가 무엇을 바꿨는지 서비스는 몰랐지만, 영속성 컨텍스트는 비교를 통해 정확히 바뀐 엔티티만 찾아냈다.</p>
+<h4>프록시가 엔티티 메서드를 가로채는 방법</h4>
+<p>지연 로딩 프록시는 엔티티 클래스를 상속한 클래스의 인스턴스다. 실험에서 <code>em.find(OrderItem.class, id)</code>로 주문상품을 읽고 <code>item</code> 필드의 실제 클래스를 출력하자, 원래 <code>Item</code> 클래스 이름 뒤에 <code>$HibernateProxy</code>가 붙은 클래스가 나왔고 <code>PersistenceUnitUtil.isLoaded()</code>는 false였다. 이 하위 클래스는 Hibernate가 실행 중에 Byte Buddy로 생성한 것으로, 엔티티의 메서드를 재정의해 호출을 가로챈다. 메서드가 불리면 아직 초기화되지 않았을 때 SELECT로 진짜 엔티티를 읽어 오고, 이후 호출을 그 진짜 객체에 위임한다.</p>
+<p>이 구조에서 명세가 final을 금지한 이유가 나온다. 클래스가 final이면 상속할 수 없어 프록시를 만들 수 없고, 메서드가 final이면 재정의할 수 없어 호출을 가로챌 수 없다. final 메서드를 프록시에 호출하면 가로채기 없이 프록시 객체 자신의 필드를 읽게 되는데, 프록시의 필드는 데이터베이스 값으로 채워진 적이 없다(이 회차의 엔티티라면 기본 생성자가 남긴 null이나 0이다). 같은 함정이 필드 직접 접근에도 있다. 실험 코드에서 실수로 <code>Order.cancel()</code>이 배송의 필드를 <code>delivery.status</code>처럼 직접 읽게 했더니(중첩 클래스로 작성해 private 접근이 가능했다), 배송 SELECT가 아예 나가지 않았고 <code>status</code>는 null이어서 "배송 완료면 취소 불가" 검사가 조용히 통과했다. 다른 엔티티의 상태는 반드시 메서드로 읽어야 하는 이유다. 필드를 private으로 두고 getter와 비즈니스 메서드로만 노출하면 이 실수가 컴파일 단계에서 막힌다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>대리 수령인</strong><p>프록시는 택배를 대신 받아 두는 관리실과 비슷하다. 물건(엔티티)을 달라고 요청(메서드 호출)하면 관리실은 그때 창고에서 꺼내 온다. 그런데 관리실에 직접 들어가 선반(필드)을 뒤지면 물건은 아직 창고에 있으니 빈 선반만 보인다. 이 비유는 관리실이 한 번 꺼내 온 물건을 계속 들고 있다는 점(초기화 후 위임)까지는 맞지만, 프록시가 원래 클래스의 하위 타입이라 <code>getClass()</code> 비교에서 원본과 다르게 보인다는 점은 담지 못한다.</p></aside>
+
+<h3>도메인 모델이 감추는 것과 드러내는 것</h3>
+<p>이제 처음의 질문으로 돌아가 두 패턴을 다시 비교할 수 있다. 도메인 모델 패턴에서 서비스는 얇아지고, 규칙은 엔티티에 모이고, 저장 코드는 사라진다. 사라진 저장 코드의 일은 변경 감지가 맡고, 사라진 조회 코드의 일은 지연 로딩이 맡는다. 코드가 짧아진 만큼 "무엇이 언제 실행되는가"는 코드에서 보이지 않게 되었다. 트랜잭션 스크립트에서는 UPDATE 호출이 서비스 코드에 그대로 적혀 있었지만, 도메인 모델에서는 플러시 시점의 스냅샷 비교가 그것을 결정한다.</p>
+<p>그래서 도메인 모델을 쓸 때 지켜야 할 경계가 있다. 엔티티는 자기 자신과 자기가 소유한 객체(주문에게는 주문상품과 배송)의 상태만 바꾼다. 엔티티가 리포지토리를 주입받아 다른 엔티티를 조회하거나, 외부 API를 호출하거나, 트랜잭션을 시작하면 안 된다. 그런 일은 서비스가 한다. 서비스는 필요한 엔티티를 모두 조회해 엔티티 메서드에 넘겨주고, 엔티티 메서드는 받은 객체들로만 일한다. <code>OrderService.order()</code>가 회원과 상품을 먼저 조회해 <code>createOrder()</code>에 넘긴 것이 이 분업이다. 이 경계를 지키면 엔티티는 계속 순수 자바로 테스트할 수 있고, 서비스는 트랜잭션과 조회의 책임을 진다.</p>
+<p>모든 기능을 도메인 모델로 짜야 하는 것도 아니다. 통계 화면처럼 여러 테이블을 집계해 보여 주기만 하는 기능은 엔티티 그래프를 메모리에 올려 계산하기보다 SQL 한 방이 훨씬 낫다. 한 애플리케이션 안에서도 쓰기 쪽 핵심 규칙은 도메인 모델로, 읽기 전용 조회는 쿼리 중심으로 섞어 쓰는 것이 일반적이다. 판단 기준은 그 기능에 지켜야 할 불변식이 있는가다. 재고는 불변식이 있으므로 엔티티에 들어갔고, 주문 검색은 불변식이 없으므로 리포지토리의 쿼리로 갔다.</p>
+
+<h3>주문 기능 테스트: 롤백되는 트랜잭션 안에서 검증한다는 것</h3>
+<p>엔티티 메서드는 앞에서처럼 순수 자바로 테스트한다. 서비스는 리포지토리와 영속성 컨텍스트까지 엮이므로 스프링 컨테이너를 띄운 통합 테스트로 확인한다.</p>
+<pre><code class="language-java">import static org.junit.jupiter.api.Assertions.*;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.transaction.annotation.Transactional;
+
+@SpringBootTest
+@Transactional
+class OrderServiceTest {
+
+    @PersistenceContext EntityManager em;
+    @Autowired OrderService orderService;
+    @Autowired OrderRepository orderRepository;
+
+    @Test
+    void 상품을_주문하면_재고가_줄고_주문이_생긴다() {
+        Member member = new Member("회원1", "서울");
+        em.persist(member);
+        Item item = new Item("JPA 책", 10000, 10);
+        em.persist(item);
+
+        Long orderId = orderService.order(member.getId(), item.getId(), 2);
+
+        Order order = orderRepository.findOne(orderId);
+        assertEquals(OrderStatus.ORDER, order.getStatus());
+        assertEquals(1, order.getOrderItems().size());
+        assertEquals(20000, order.getTotalPrice());
+        assertEquals(8, item.getStockQuantity());
+    }
+
+    @Test
+    void 재고보다_많이_주문하면_예외가_난다() {
+        Member member = new Member("회원1", "서울");
+        em.persist(member);
+        Item item = new Item("JPA 책", 10000, 10);
+        em.persist(item);
+
+        assertThrows(NotEnoughStockException.class,
+                () -> orderService.order(member.getId(), item.getId(), 11));
+    }
+
+    @Test
+    void 주문을_취소하면_재고가_돌아온다() {
+        Member member = new Member("회원1", "서울");
+        em.persist(member);
+        Item item = new Item("JPA 책", 10000, 10);
+        em.persist(item);
+        Long orderId = orderService.order(member.getId(), item.getId(), 2);
+
+        orderService.cancelOrder(orderId);
+
+        Order order = orderRepository.findOne(orderId);
+        assertEquals(OrderStatus.CANCEL, order.getStatus());
+        assertEquals(10, item.getStockQuantity());
+    }
+}</code></pre>
+<p>이 테스트가 무엇을 검증하고 무엇을 검증하지 않는지 정확히 알아야 한다. Spring TestContext 프레임워크는 테스트 메서드에 <code>@Transactional</code>이 있으면 테스트 전체를 하나의 트랜잭션으로 감싸고, 레퍼런스 문서의 말대로 기본적으로 테스트가 끝나면 그 트랜잭션을 자동으로 롤백한다. 서비스의 <code>@Transactional</code>은 전파 속성이 기본값 <code>REQUIRED</code>이므로 새 트랜잭션을 만들지 않고 테스트의 트랜잭션에 참여한다. 그 결과 테스트 코드와 서비스 코드가 <b>같은 영속성 컨텍스트</b>를 쓴다.</p>
+<p>같은 영속성 컨텍스트를 쓴다는 사실이 테스트 결과를 해석하는 열쇠다. 첫 번째 테스트의 <code>orderRepository.findOne(orderId)</code>는 SELECT를 실행하지 않는다. 방금 <code>persist</code>한 주문이 1차 캐시에 있으므로 같은 인스턴스를 그대로 돌려준다. <code>item.getStockQuantity()</code>가 8인 것도 데이터베이스를 읽은 결과가 아니라, 서비스가 조회한 상품이 테스트가 만든 <code>item</code>과 같은 인스턴스이기 때문이다. 식별자 생성 전략이 시퀀스라면 이 테스트 동안 INSERT는 한 번도 실행되지 않는다. 플러시가 일어나기 전에 롤백되기 때문이다. 테스트는 도메인 로직과 서비스의 조립을 검증했지만, 매핑이 실제 테이블과 맞는지, 제약 조건을 어기지 않는지는 검증하지 않았다.</p>
+<p>Spring 레퍼런스는 이 상황을 "ORM 코드 테스트의 거짓 양성(false positive)"이라고 부른다. 영속성 컨텍스트의 상태를 바꾸는 코드를 테스트할 때 작업 단위를 플러시하지 않으면, 테스트는 통과하지만 같은 코드가 운영 환경에서는 플러시 때 예외를 던질 수 있다는 경고다. 해법은 검증 전에 <code>em.flush()</code>를 호출해 SQL을 실제로 실행시키는 것이고, 데이터베이스에서 다시 읽은 값으로 검증하고 싶으면 이어서 <code>em.clear()</code>로 1차 캐시를 비운 뒤 조회한다. 그러면 SELECT가 실제로 나가고, 그 결과로 만든 새 인스턴스를 검증하게 된다.</p>
+<pre><code class="language-java">    Long orderId = orderService.order(member.getId(), item.getId(), 2);
+    em.flush();     // INSERT, UPDATE를 실제로 실행: 제약 조건 위반이 있으면 여기서 터진다
+    em.clear();     // 1차 캐시를 비운다: 다음 조회는 데이터베이스에서 새로 읽는다
+
+    Order order = orderRepository.findOne(orderId);                  // SELECT 실행
+    assertEquals(8, order.getOrderItems().get(0).getItem().getStockQuantity());</code></pre>
+<p>롤백 기본값은 테스트 사이의 격리를 공짜로 준다. 각 테스트가 남긴 데이터가 다음 테스트에 영향을 주지 않는다. 다만 테스트가 끝난 뒤 데이터베이스를 직접 열어 결과를 보고 싶다면 <code>@Commit</code>(또는 <code>@Rollback(false)</code>)을 붙여 커밋하게 할 수 있다. 예외 테스트에서 <code>assertThrows</code>로 예외를 잡았을 때도 차이가 있다. 서비스의 <code>@Transactional</code> 프록시는 언체크 예외가 빠져나갈 때 참여 중인 트랜잭션을 롤백 전용(rollback-only)으로 표시한다. 테스트 트랜잭션은 어차피 롤백되므로 문제가 없지만, 같은 패턴을 운영 코드에서 쓰면, 즉 바깥 트랜잭션이 안쪽 서비스의 예외를 잡고 계속 진행하면 커밋 시점에 <code>UnexpectedRollbackException</code>을 만나게 된다. 트랜잭션 전파는 스프링 DB 2편에서 다뤘다.</p>
+
+<h3>재고 감소의 경쟁 조건: 엔티티 안의 read-modify-write</h3>
+<p><code>removeStock()</code>은 단일 스레드에서는 완벽하지만, 두 요청이 같은 상품을 동시에 주문하면 이야기가 달라진다. 이 메서드는 "읽고(현재 재고), 계산하고(빼기), 쓴다(필드 대입)"는 세 단계로 이루어져 있고, 각 트랜잭션은 자기 영속성 컨텍스트에 상품의 복사본을 따로 가진다. 멀티스레드 프로그램에서 <code>count++</code>가 원자적이지 않은 것과 같은 구조가, 이번에는 스레드의 메모리가 아니라 트랜잭션의 영속성 컨텍스트 사이에서 일어난다.</p>
+<p>실험으로 확인했다. 엔티티 매니저 두 개(트랜잭션 A, B)를 열고, 둘 다 재고 10인 같은 상품을 조회한 뒤, A가 1개를 빼고 커밋하고, 이어서 B가 1개를 빼고 커밋했다. 기대값은 8이지만 결과는 9였다.</p>
+<pre data-label="실행 로그: 갱신 손실 (H2, 두 트랜잭션을 한 스레드에서 번갈아 실행)"><code class="language-text">Hibernate: select i1_0.item_id,i1_0.name,i1_0.price,i1_0.stockQuantity from Item i1_0 where i1_0.item_id=?
+Hibernate: select i1_0.item_id,i1_0.name,i1_0.price,i1_0.stockQuantity from Item i1_0 where i1_0.item_id=?
+---- both read 10,10
+Hibernate: update Item set name=?,price=?,stockQuantity=? where item_id=?
+Hibernate: update Item set name=?,price=?,stockQuantity=? where item_id=?
+---- final stock=9</code></pre>
+<pre class="diagram">시간 ─────────────────────────────────────────────────────────►
+
+트랜잭션 A   SELECT (stock=10)   removeStock(1) → 9   UPDATE stock=9   COMMIT
+트랜잭션 B        SELECT (stock=10)                                     removeStock(1) → 9   UPDATE stock=9   COMMIT
+
+DB의 stock      10            10                      9(A 커밋)                                  9(B 커밋)
+                                                                       ▲
+                                                 B는 A의 커밋을 모른 채 자기 복사본(10)으로 계산했다</pre>
+<p>원인은 Hibernate가 만드는 UPDATE 문에 있다. SET 절은 <code>stockQuantity=?</code>이고, 바인딩되는 값은 자바 메모리에서 계산한 결과(9)다. 데이터베이스에게 "1 줄여라"가 아니라 "9로 만들어라"라고 말하는 것이다. B의 UPDATE가 실행될 때 데이터베이스의 값은 이미 9였지만, B는 그 값을 보지 않고 자기가 계산한 9를 덮어썼다. 이것이 <b>갱신 손실(lost update)</b>이다.</p>
+<p>MySQL InnoDB의 기본 격리 수준인 REPEATABLE READ에서도 이 결과는 같다. InnoDB에서 일반 SELECT는 잠금 없이 트랜잭션의 스냅샷을 읽는 일관된 읽기(consistent nonlocking read)이므로 두 트랜잭션 모두 10을 읽는다. B의 UPDATE가 A의 커밋 전에 도착하면 A가 그 행에 건 잠금 때문에 기다리지만, 기다린 뒤에는 실행된다. MySQL 매뉴얼은 스냅샷이 SELECT에 적용될 뿐 DML 문에는 꼭 적용되지 않으며, 다른 트랜잭션이 커밋한 행도 UPDATE의 대상이 될 수 있다고 설명한다. 잠금은 두 UPDATE가 동시에 쓰는 것을 막았을 뿐, B가 낡은 값으로 계산한 것은 막지 못한다. 격리 수준을 바꾸는 것이 답이 아니라는 뜻이다.</p>
+<h4>세 가지 해법과 고르는 기준</h4>
+<p>첫째, <b>낙관적 잠금(optimistic locking)</b>이다. 엔티티에 <code>@Version</code> 필드를 두면 Hibernate는 UPDATE 문을 바꾼다. 실험에서 버전 필드가 있는 엔티티로 같은 시나리오를 돌리자 SQL이 <code>update VItem set stockQuantity=?,version=? where id=? and version=?</code>가 되었다. WHERE 절에 "내가 읽었을 때의 버전"이 들어가므로, A가 먼저 커밋해 버전을 올려 두었다면 B의 UPDATE는 조건에 맞는 행을 찾지 못해 0행을 갱신한다. Hibernate는 이를 감지해 B의 커밋에서 <code>jakarta.persistence.OptimisticLockException</code>을 던졌고, 원인 예외는 <code>org.hibernate.StaleObjectStateException</code>이었다(<code>Persistence.createEntityManagerFactory()</code>처럼 JPA 방식으로 부트스트랩하면 이 예외를 <code>jakarta.persistence.RollbackException</code>이 한 번 더 감싼다). 잠금을 미리 걸지 않으므로 충돌이 드문 경우에 비용이 낮고, 충돌하면 한쪽이 실패하므로 재시도나 사용자 안내가 필요하다.</p>
+<p>둘째, <b>비관적 잠금(pessimistic locking)</b>이다. 상품을 조회할 때 <code>em.find(Item.class, id, LockModeType.PESSIMISTIC_WRITE)</code>처럼 쓰기 잠금을 요청하면 잠금을 거는 조회(MySQL이라면 <code>SELECT ... FOR UPDATE</code>)가 실행된다. B는 SELECT 단계에서 A의 커밋을 기다리고, 기다린 뒤에는 A가 반영한 최신 값을 읽는다. 갱신 손실이 원천적으로 사라지지만, 잠금을 쥔 시간 동안 같은 상품의 다른 주문이 줄을 서므로 인기 상품에 주문이 몰리는 상황에서는 처리량이 떨어지고, 여러 상품을 다른 순서로 잠그면 교착 상태가 생길 수 있다.</p>
+<p>셋째, 계산을 데이터베이스에 맡기는 <b>조건부 UPDATE</b>다. <code>update item set stock_quantity = stock_quantity - :count where item_id = :id and stock_quantity >= :count</code>를 JPQL 벌크 연산이나 네이티브 쿼리로 실행하고, 갱신된 행 수가 0이면 재고 부족으로 처리한다. 데이터베이스가 행 잠금을 쥔 채로 최신 값에서 빼므로 갱신 손실이 없고, 왕복도 한 번이다. 대신 재고 규칙이 엔티티 메서드를 벗어나 SQL로 가고, 벌크 연산은 영속성 컨텍스트를 거치지 않으므로 이미 읽어 둔 엔티티와 데이터베이스의 값이 어긋난다. 어느 해법이든 "엔티티 안의 규칙은 한 트랜잭션 안의 정합성만 지킨다"는 사실에서 출발한다. 트랜잭션 사이의 정합성은 데이터베이스의 잠금이나 버전 비교 같은 별도의 장치가 지켜야 한다.</p>
+<x-visual id="jpa-app1-04-lost-update" title="두 트랜잭션의 재고 감소와 갱신 손실" kind="타임라인" ratio="16:9">
+<x-hint>두 트랜잭션이 같은 재고 10을 읽고 각자 9를 계산해 덮어써서 최종 재고가 9가 되는 과정과, @Version이 두 번째 UPDATE를 0행으로 만드는 차이.</x-hint>
+<x-prompt>위아래 두 장의 가로 타임라인. 위쪽 제목 "버전 없음": 두 개의 가로 레인 "트랜잭션 A" 와 "트랜잭션 B", 아래에 회색 레인 "DB stock". A 레인에 상자 "읽기 10", "9 계산", "UPDATE 9", "커밋". B 레인에는 조금 늦게 "읽기 10", 나중에 "9 계산", "UPDATE 9", "커밋". DB 레인 값은 10, 10, 9, 9로 변하고 마지막 9 옆에 빨간 경고 아이콘과 라벨 "갱신 손실". 아래쪽 제목 "@Version 있음": 같은 구성이지만 B의 UPDATE 상자에 "where version=0" 이 적혀 있고, 그 상자에서 나온 빨간 화살표가 "0행 갱신" 을 거쳐 "OptimisticLockException" 상자로 간다. DB 레인 마지막 값은 9 그대로. 플랫한 도식, 흰 배경.</x-prompt>
+<x-caption>엔티티 안의 계산은 트랜잭션마다 따로 일어난다. 버전 비교가 낡은 복사본의 덮어쓰기를 막는다.</x-caption>
+</x-visual>
+
+<h3>주문 검색: 조건이 있을 때만 붙는 WHERE</h3>
+<p>마지막 기능은 주문 검색이다. 회원 이름과 주문 상태로 주문을 찾되, 각 조건은 입력이 있을 때만 적용한다. 검색 조건을 담는 객체는 단순하다.</p>
+<pre><code class="language-java">public class OrderSearch {
+    private String memberName;        // 회원 이름(부분 일치)
+    private OrderStatus orderStatus;  // ORDER, CANCEL
+
+    public String getMemberName() { return memberName; }
+    public void setMemberName(String memberName) { this.memberName = memberName; }
+    public OrderStatus getOrderStatus() { return orderStatus; }
+    public void setOrderStatus(OrderStatus orderStatus) { this.orderStatus = orderStatus; }
+}</code></pre>
+<p>조건이 둘 다 있으면 <code>where o.status = :status and m.name like :name</code>이 되고, 하나만 있으면 그것만, 없으면 WHERE 절이 없어야 한다. 정적인 JPQL 하나로는 이것을 표현할 수 없으므로 쿼리를 실행 시점에 조립해야 한다. 이것을 <b>동적 쿼리(dynamic query)</b>라고 부른다. 첫 번째 방법은 JPQL 문자열을 직접 이어 붙이는 것이다.</p>
+<pre><code class="language-java">public List<Order> findAllByString(OrderSearch orderSearch) {
+    StringBuilder jpql = new StringBuilder("select o from Order o join o.member m");
+    boolean hasWhere = false;
+
+    if (orderSearch.getOrderStatus() != null) {
+        jpql.append(hasWhere ? " and" : " where").append(" o.status = :status");
+        hasWhere = true;
+    }
+    if (StringUtils.hasText(orderSearch.getMemberName())) {
+        jpql.append(hasWhere ? " and" : " where").append(" m.name like :name");
+        hasWhere = true;
+    }
+
+    TypedQuery<Order> query = em.createQuery(jpql.toString(), Order.class)
+                                .setMaxResults(1000);    // 최대 1000건
+    if (orderSearch.getOrderStatus() != null) {
+        query.setParameter("status", orderSearch.getOrderStatus());
+    }
+    if (StringUtils.hasText(orderSearch.getMemberName())) {
+        query.setParameter("name", "%" + orderSearch.getMemberName() + "%");
+    }
+    return query.getResultList();
+}</code></pre>
+<p>이 코드는 동작하지만 실수하기 쉬운 구조다. 조건마다 같은 <code>if</code>를 두 번(문자열 조립, 파라미터 바인딩) 써야 하고, 둘이 어긋나면 "파라미터가 쿼리에 없다"거나 "쿼리의 파라미터가 바인딩되지 않았다"는 예외가 실행 시점에야 난다. <code>" where"</code> 앞의 공백 하나를 빠뜨려도 컴파일은 통과하고 실행 때 파싱 오류가 난다. 그래도 지켜야 할 선이 하나 있다. 사용자 입력은 문자열에 이어 붙이지 않고 반드시 <code>:name</code> 같은 파라미터로 바인딩한다. 입력을 JPQL에 직접 넣으면 SQL 주입과 같은 원리의 JPQL 주입이 가능해지고, 바인딩하면 값은 JDBC의 <code>PreparedStatement</code> 파라미터로 전달되어 쿼리 구조에 섞이지 않는다.</p>
+<p>두 번째 방법은 JPA 표준의 <b>Criteria API</b>다. 문자열 대신 자바 객체로 쿼리를 조립한다.</p>
+<pre><code class="language-java">public List<Order> findAllByCriteria(OrderSearch orderSearch) {
+    CriteriaBuilder cb = em.getCriteriaBuilder();
+    CriteriaQuery<Order> cq = cb.createQuery(Order.class);
+    Root<Order> o = cq.from(Order.class);
+    Join<Order, Member> m = o.join("member", JoinType.INNER);
+
+    List<Predicate> criteria = new ArrayList<>();
+    if (orderSearch.getOrderStatus() != null) {
+        criteria.add(cb.equal(o.get("status"), orderSearch.getOrderStatus()));
+    }
+    if (StringUtils.hasText(orderSearch.getMemberName())) {
+        criteria.add(cb.like(m.<String>get("name"), "%" + orderSearch.getMemberName() + "%"));
+    }
+    cq.where(criteria.toArray(new Predicate[0]));
+
+    return em.createQuery(cq).setMaxResults(1000).getResultList();
+}</code></pre>
+<p>조건이 없으면 빈 배열이 넘어가 WHERE 절이 생기지 않고, 조건마다 <code>if</code>는 한 번뿐이며, 값은 자동으로 파라미터가 된다. 대신 코드만 보고 어떤 쿼리가 나갈지 떠올리기 어렵고, <code>"member"</code>, <code>"status"</code> 같은 속성 이름은 여전히 문자열이라 오타를 컴파일러가 잡지 못한다(메타모델 클래스를 생성하면 이 부분은 해결된다). 이 불편함 때문에 실무에서는 동적 쿼리에 Querydsl을 많이 쓰는데, Querydsl은 로드맵의 뒤쪽 강의에서 다룬다.</p>
+<h4>두 방법은 같은 곳에서 만난다</h4>
+<p>회원 이름 "ki"와 상태 CANCEL로 두 메서드를 실행하자 Hibernate 6.6과 H2에서 똑같은 SQL이 나왔다.</p>
+<pre data-label="실행 로그: JPQL 문자열과 Criteria가 만든 SQL (둘 다 동일)"><code class="language-sql">select o1_0.order_id,o1_0.delivery_id,o1_0.member_id,o1_0.status
+from orders o1_0
+join Member m1_0 on m1_0.member_id=o1_0.member_id
+where o1_0.status=? and m1_0.name like ? escape ''
+fetch first ? rows only</code></pre>
+<p>(로그는 한 줄로 나왔고, 읽기 쉽게 줄을 나눴다.) 두 경로가 같은 SQL에 도달하는 이유는 Hibernate 6의 쿼리 처리 구조에 있다. Hibernate 6는 JPQL(HQL) 문자열을 파싱해 <b>SQM(Semantic Query Model)</b>이라는 의미 트리로 바꾸고, 그 트리를 데이터베이스 방언에 맞는 SQL로 번역한다. Criteria API는 문자열 파싱 단계만 건너뛸 뿐 같은 트리를 직접 만든다. 실험에서 <code>em.getCriteriaBuilder()</code>가 돌려준 객체의 클래스는 <code>org.hibernate.query.sqm.internal.SqmCriteriaNodeBuilder</code>, <code>createQuery()</code>가 만든 쿼리 객체는 <code>org.hibernate.query.sqm.tree.select.SqmSelectStatement</code>였다. 존재하지 않는 엔티티 이름으로 JPQL을 실행했을 때 난 <code>IllegalArgumentException</code>의 원인 예외도 <code>org.hibernate.query.sqm.UnknownEntityException</code>이었다. 문자열이든 객체든 결국 SQM 트리가 되고, SQL은 그 트리에서 만들어진다.</p>
+<p>SQL을 자세히 보면 번역 과정에서 일어난 일이 보인다. JPQL의 <code>join o.member m</code>은 매핑 정보의 <code>@JoinColumn(name = "member_id")</code>를 읽어 <code>on m1_0.member_id=o1_0.member_id</code>라는 조인 조건이 되었다. JPQL에는 조인 조건을 쓰지 않았는데도 SQL에 들어간 것은 연관관계 매핑이 그 정보를 갖고 있기 때문이다. <code>setMaxResults(1000)</code>은 H2 방언에서 표준 SQL의 <code>fetch first ? rows only</code>가 되었다. MySQL은 이 구문 대신 <code>LIMIT</code>를 쓰므로 MySQL 방언에서는 다른 문법이 나온다. 행 수 제한이라는 같은 의도를 데이터베이스마다 다른 문법으로 옮기는 일이 방언의 몫이다. 또 SELECT 절에는 주문 테이블의 컬럼만 있다. 회원은 조인했지만 결과로 가져오지 않았으므로, 결과 주문의 <code>member</code>는 여전히 지연 로딩 프록시다. 검색 결과 화면에서 회원 이름을 출력하면 주문마다 회원 SELECT가 나갈 수 있고, 이것을 한 번에 가져오는 페치 조인은 「JPA 활용 2」의 주제다.</p>
+
+<h3>이 회차의 지식이 다시 쓰이는 곳</h3>
+<p>이 회차에서 만든 구조는 다음 회차들의 출발점이 된다. 05회 웹 계층에서는 상품 수정 화면이 등장하는데, 화면에서 넘어온 상품은 식별자는 있지만 영속성 컨텍스트 밖에 있는 준영속 객체다. 이 회차의 <code>ItemRepository.save()</code>가 그런 객체를 <code>merge</code>로 보내는 분기를 미리 만들어 두었고, 변경 감지로 수정하는 방법과 병합으로 수정하는 방법의 차이는 그 회차에서 본격적으로 다룬다. 로드맵의 다음 강의인 「JPA 활용 2」에서는 주문 취소 로그에서 본 지연 로딩의 추가 SELECT를 줄이는 방법을, Spring Data JPA 강의에서는 이 회차에서 직접 쓴 리포지토리의 반복 코드를 인터페이스 선언만으로 대신하는 방법을 배운다. 그때도 내부에서 일어나는 일은 여기서 본 <code>persist</code>, 스냅샷 비교, 쓰기 지연 큐, SQM 번역이다.</p>
+<aside class="keyidea"><span>이 장의 핵심</span><p>엔티티 메서드는 힙의 필드만 바꾸고, 영속성 컨텍스트가 플러시 때 스냅샷과 비교해 그 변화를 SQL로 옮긴다. 그래서 규칙을 엔티티에 두면 서비스는 조회·위임·트랜잭션 경계만 남는다. 대신 SQL이 나가는 시점과 개수는 코드가 아니라 영속성 컨텍스트의 규칙(식별자 전략, cascade, 지연 로딩, 플러시 순서)이 정하므로, 로그로 확인하는 습관이 필요하다. 엔티티 안의 규칙은 한 트랜잭션 안에서만 정합성을 지키고, 트랜잭션 사이의 정합성은 버전이나 잠금이 지킨다.</p></aside>
+</x-lecture>
+
+<x-summary>
+<dt>도메인 모델 패턴</dt><dd>행동과 데이터를 함께 가진 객체로 비즈니스 로직을 조직하는 방식. 재고 증감과 주문 취소 규칙이 Item과 Order의 메서드가 되고, 서비스는 조회·위임·트랜잭션 경계만 맡는다.</dd>
+<dt>트랜잭션 스크립트 패턴</dt><dd>요청 하나를 처리하는 프로시저 단위로 로직을 조직하는 방식. 규칙이 단순할 때는 투명하지만, 같은 데이터를 여러 요청이 바꾸면 규칙이 흩어진다.</dd>
+<dt>변경 감지</dt><dd>영속 엔티티를 읽을 때 찍어 둔 스냅샷과 플러시 시점의 현재 값을 비교해, 다른 엔티티에 대해 UPDATE를 만드는 동작. Hibernate는 기본으로 모든 컬럼을 갱신하는 UPDATE 문을 쓴다.</dd>
+<dt>쓰기 지연과 플러시 순서</dt><dd>persist와 변경은 즉시 SQL이 되지 않고 ActionQueue에 쌓였다가 플러시 때 INSERT → UPDATE → 컬렉션 작업 → DELETE 순으로 실행된다. IDENTITY 전략은 식별자를 얻으려고 persist 즉시 INSERT한다.</dd>
+<dt>cascade</dt><dd>부모에 대한 persist·remove 등을 자식에게 전파하는 선언. 생명주기를 소유하는 관계(주문 → 주문상품, 배송)에만 붙인다. 명세는 persist 시점과 플러시 시점 모두에 적용한다.</dd>
+<dt>readOnly 트랜잭션</dt><dd>Spring 6.2의 HibernateJpaDialect는 읽기 전용 트랜잭션에서 FlushMode.MANUAL을 적용하고, 트랜잭션이 엔티티 매니저를 새로 연 경우 setDefaultReadOnly(true)도 적용해, 스냅샷을 만들지 않고 변경 감지도 하지 않는다.</dd>
+<dt>지연 로딩 프록시</dt><dd>엔티티를 상속해 실행 중에 생성된 클래스. 메서드 호출을 가로채 처음 쓰일 때 SELECT로 초기화한다. 그래서 엔티티 클래스와 메서드는 final이면 안 되고, 다른 엔티티의 필드에 직접 접근하면 안 된다.</dd>
+<dt>갱신 손실</dt><dd>두 트랜잭션이 같은 값을 읽고 각자 계산한 결과를 덮어써서 한쪽 변경이 사라지는 현상. @Version, 비관적 잠금, 조건부 UPDATE로 막는다.</dd>
+<dt>동적 쿼리와 SQM</dt><dd>조건에 따라 달라지는 쿼리. JPQL 문자열 조립과 Criteria API 모두 Hibernate 6에서 SQM 트리를 거쳐 같은 SQL로 번역된다.</dd>
+</x-summary>
+
+<x-review>
+<p>"주문은 정상 처리됐는데 재고가 안 줄었다"는 장애 보고를 받으면 이 회차의 그림에서 출발한다. 먼저 재고를 바꾼 메서드가 실행된 트랜잭션이 읽기 전용이었는지 본다. 클래스에 <code>readOnly = true</code>를 걸어 두고 쓰기 메서드에 <code>@Transactional</code>을 빠뜨리면, 필드는 바뀌었지만 플러시가 없어 UPDATE가 나가지 않는다. 다음으로 엔티티가 영속 상태였는지 본다. 트랜잭션 밖에서 조회했거나 화면에서 넘어온 준영속 객체의 필드를 바꿨다면 변경 감지 대상이 아니다. SQL 로그를 켜고 UPDATE가 실제로 나갔는지 확인하는 것이 추측보다 빠르다.</p>
+<p>재고가 음수가 되거나 판매 수량과 재고 감소량이 맞지 않는다면 동시성을 의심한다. 단일 요청 테스트로는 절대 재현되지 않으므로, 같은 상품에 대한 동시 주문이 실제로 있었는지 로그의 시간을 맞춰 본다. 해법은 충돌 빈도로 고른다. 충돌이 드문 일반 상품은 <code>@Version</code>으로 충분하고, 실패한 요청은 재시도하거나 사용자에게 다시 시도하라고 알린다. 한정 판매처럼 한 행에 요청이 몰리면 낙관적 잠금은 대부분의 요청을 실패시키므로, 비관적 잠금이나 조건부 UPDATE가 낫다. 이때는 잠금을 쥐는 시간을 줄이기 위해 트랜잭션 안에서 외부 API 호출 같은 느린 작업을 빼는 설계가 함께 필요하다.</p>
+<p>cascade 범위는 데이터 삭제 사고와 직결된다. "편하니까" 모든 연관에 <code>CascadeType.ALL</code>을 붙이면, 주문을 지우는 관리 기능 하나가 공유되는 상품이나 회원까지 지우려 시도할 수 있다. 외래 키 제약이 막아 주면 다행이고, 제약이 없으면 실제로 지워진다. 코드 리뷰에서 cascade를 보면 "이 자식을 다른 엔티티도 참조하는가, 부모 없이 존재할 수 있는가"를 묻는 것이 습관이 되어야 한다.</p>
+</x-review>
+
+<x-practice>
+<li>재고 5인 상품 하나로, 한 트랜잭션 안에서 <code>createOrderItem(item, 1000, 2)</code>를 두 번 호출해 주문상품 두 개를 가진 주문을 만들고 저장한 뒤 커밋했다. 식별자 전략은 이 회차와 같은 시퀀스다. 커밋 직전 플러시에서 실행되는 INSERT와 UPDATE를 순서대로 적고, item에 대한 UPDATE가 몇 번 나가는지 이유와 함께 설명하라.</li>
+<li>같은 서비스 메서드에서 식별자 전략만 <code>GenerationType.IDENTITY</code>로 바꾸면, <code>orderRepository.save(order)</code> 호출 직후(커밋 전)에 이미 실행된 SQL은 무엇인가. 그리고 이 차이가 롤백되는 통합 테스트의 결과 해석에 어떤 영향을 주는지 설명하라.</li>
+<li>동료가 <code>Order.cancel()</code>을 다음처럼 바꾸자고 한다: "<code>for (OrderItem oi : orderItems) { oi.getItem().addStock(oi.getCount()); }</code>로 쓰고 <code>OrderItem.cancel()</code>을 지우자." 동작은 같다. 이 변경이 도메인 모델 관점에서 무엇을 잃는지 설명하라.</li>
+<li>클래스에 <code>@Transactional(readOnly = true)</code>가 붙은 서비스에 다음 메서드가 있다. <code>public void changePrice(Long itemId, int price) { Item item = itemRepository.findOne(itemId); item.changePrice(price); }</code> (Item에 가격 필드를 바꾸는 <code>changePrice</code> 메서드를 추가했다고 하자.) 이 메서드를 호출하면 데이터베이스의 가격은 어떻게 되는가. Hibernate 세션 수준에서 무슨 일이 일어나는지 두 가지 설정을 들어 설명하라.</li>
+<li>재고 1인 상품에 두 요청이 동시에 1개씩 주문했다. (a) 아무 장치가 없을 때, (b) <code>@Version</code>이 있을 때, (c) <code>PESSIMISTIC_WRITE</code>로 조회할 때 각각 최종 재고와 두 요청의 결과(성공/예외)를 예측하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> <code>persist(order)</code> 때 주문, 배송, 주문상품 두 개의 식별자가 시퀀스에서 정해지고 INSERT 작업이 큐에 쌓인다. 배송은 대일 cascade라 주문보다 먼저, 주문상품 두 개는 컬렉션 cascade라 주문 뒤에 들어간다. 플러시 순서는 INSERT delivery → INSERT orders → INSERT order_item → INSERT order_item → UPDATE item이다. item의 UPDATE는 한 번이다. <code>removeStock(2)</code>가 두 번 불려 재고가 5 → 3 → 1로 바뀌었지만, 변경 감지는 플러시 시점의 최종 값(1)과 스냅샷(5)을 한 번 비교할 뿐이므로 엔티티 하나당 UPDATE 하나가 나간다. 중간 값 3은 데이터베이스에 한 번도 기록되지 않는다.</p>
+<p><b>2번.</b> IDENTITY는 식별자를 INSERT 실행 결과로 받으므로 <code>persist</code> 순간 INSERT가 실행된다. cascade로 배송과 주문상품도 persist되므로 save 직후에는 배송, 주문, 주문상품의 INSERT가 이미 실행되어 있다(재고 UPDATE는 변경 감지 대상이라 여전히 플러시 때 나간다). 통합 테스트에서는 INSERT가 실제로 실행되었으므로 INSERT 단계의 제약 조건 위반은 테스트에서 드러난다. 하지만 UPDATE는 플러시 전에 롤백되면 실행되지 않으므로 UPDATE 쪽 문제는 여전히 숨는다. 전략에 따라 테스트가 검증하는 범위가 달라지므로 <code>em.flush()</code>를 명시하는 편이 안전하다.</p>
+<p><b>3번.</b> 동작은 같지만 "주문상품을 취소하면 그 수량만큼 재고가 돌아온다"는 규칙이 주문상품에서 주문으로 옮겨 갔다. 주문이 주문상품의 내부(어떤 상품을 몇 개 샀는가)를 알아야 하므로 결합이 늘고, 나중에 "부분 취소"나 "취소 수수료"처럼 주문상품 단위의 취소 규칙이 생기면 그 규칙을 둘 자리가 없다. 각 객체가 자기 데이터에 대한 규칙을 가진다는 도메인 모델의 원칙에서, 재고 복원은 수량을 가진 주문상품의 일이다.</p>
+<p><b>4번.</b> 가격은 바뀌지 않는다. 메서드에 <code>@Transactional</code>이 없으므로 클래스의 읽기 전용 설정이 적용되고, Spring 6.2의 <code>HibernateJpaDialect</code>는 세션에 <code>FlushMode.MANUAL</code>을 설정해 커밋 때 자동 플러시를 하지 않으며, 트랜잭션이 엔티티 매니저를 새로 연 경우에는 <code>setDefaultReadOnly(true)</code>로 조회한 Item을 읽기 전용 엔티티로 만든다. 읽기 전용 엔티티는 스냅샷이 없고 변경 감지 대상이 아니므로, 힙의 가격 필드는 바뀌어도 UPDATE가 만들어지지 않는다. 예외도 나지 않으므로 조용히 무시된다. 쓰기 메서드에 <code>@Transactional</code>을 붙여야 한다.</p>
+<p><b>5번.</b> (a) 두 트랜잭션 모두 재고 1을 읽고 각자 0을 계산해 UPDATE한다. 두 요청 모두 성공하고 최종 재고는 0이지만, 실제로는 1개로 2건을 판매했다. (b) 먼저 커밋한 쪽이 버전을 올리므로 나중 쪽의 UPDATE는 0행을 갱신하고 <code>OptimisticLockException</code>이 난다. 최종 재고 0, 한 요청 성공, 한 요청 실패. (c) 나중 요청은 SELECT 단계에서 기다렸다가 먼저 요청이 커밋한 재고 0을 읽고, <code>removeStock(1)</code>이 <code>NotEnoughStockException</code>을 던진다. 최종 재고 0, 한 요청 성공, 한 요청은 재고 부족. (b)와 (c) 모두 정합성은 지키지만, (b)는 충돌을 "동시 수정"으로, (c)는 "재고 부족"으로 알리므로 사용자에게 보여 줄 메시지가 다르다.</p>
+</x-answer>
+
+<x-quiz answer="1">
+<q>한 트랜잭션에서 상품을 조회해 <code>removeStock(2)</code>를 호출한 뒤 주문을 <code>persist</code>했다(식별자 전략은 시퀀스). 로그에서 item에 대한 UPDATE가 주문 INSERT들보다 뒤에 나온 이유로 가장 정확한 것은?</q>
+<o>removeStock()이 비동기로 실행되어 늦게 끝났기 때문이다.</o>
+<o>Hibernate는 플러시 때 쓰기 지연 큐의 작업을 호출 순서가 아니라 종류별로 정해진 순서(INSERT 다음 UPDATE)로 실행하고, UPDATE 자체도 플러시 때의 스냅샷 비교에서 만들어지기 때문이다.</o>
+<o>item 테이블이 orders 테이블을 외래 키로 참조하기 때문이다.</o>
+<o>데이터베이스가 UPDATE를 INSERT보다 낮은 우선순위로 처리하기 때문이다.</o>
+<why>재고 변경은 힙의 필드만 바꾸고, UPDATE 작업은 플러시 때 스냅샷 비교로 비로소 생긴다. 실행 순서는 ActionQueue의 OrderedActions가 정하며 INSERT가 UPDATE보다 앞이다. removeStock은 동기 메서드이고, item은 orders를 참조하지 않으며(참조 방향은 order_item → item), 순서는 데이터베이스가 아니라 Hibernate가 정한다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>서비스 클래스에 <code>@Transactional(readOnly = true)</code>만 있고 메서드에는 애너테이션이 없다. 이 메서드에서 조회한 엔티티의 필드를 바꿨을 때 일어나는 일로 맞는 것은? (Spring 6.2 + Hibernate 기준, 트랜잭션이 엔티티 매니저를 새로 여는 경우)</q>
+<o>readOnly는 데이터베이스에 보내는 힌트일 뿐이므로 UPDATE가 정상적으로 실행된다.</o>
+<o>필드를 바꾸는 순간 Hibernate가 예외를 던진다.</o>
+<o>세션이 MANUAL 플러시 모드이고 엔티티가 읽기 전용으로 로드되어 스냅샷이 없으므로, 필드는 바뀌어도 UPDATE가 실행되지 않는다.</o>
+<o>커밋 대신 롤백이 일어나므로 UPDATE가 실행된 뒤 취소된다.</o>
+<why>HibernateJpaDialect는 읽기 전용 트랜잭션에 FlushMode.MANUAL을 적용하고, 트랜잭션이 엔티티 매니저를 새로 연 경우 setDefaultReadOnly(true)도 적용한다. Hibernate 문서에 따르면 읽기 전용 엔티티는 수정할 수는 있지만 변경 감지 대상이 아니어서 저장되지 않는다. 예외는 나지 않으며, 트랜잭션은 커밋되지만 반영할 변경이 없다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>Order의 <code>delivery</code>가 LAZY 프록시인 상태에서, Order의 메서드가 <code>delivery.getStatus()</code> 대신 필드 <code>delivery.status</code>를 직접 읽었다(접근이 가능한 구조라고 하자). 결과로 맞는 것은?</q>
+<o>프록시가 초기화되지 않아 SELECT가 나가지 않고, 프록시 객체 자신의 필드 기본값(null)을 읽는다.</o>
+<o>필드 접근도 프록시가 가로채므로 SELECT가 나가고 올바른 값을 읽는다.</o>
+<o>LazyInitializationException이 즉시 발생한다.</o>
+<o>컴파일 오류가 난다.</o>
+<why>프록시는 엔티티를 상속한 하위 클래스로, 메서드 재정의를 통해서만 호출을 가로챈다. 필드 접근은 가로챌 수 없으므로 초기화되지 않은 프록시 인스턴스의 필드를 그대로 읽는다. 실험에서도 배송 SELECT 없이 null을 읽어 "배송 완료면 취소 불가" 검사가 조용히 통과했다. 예외도 컴파일 오류도 없다는 점이 이 함정을 위험하게 만든다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>두 트랜잭션이 재고 10인 같은 상품을 읽고 각각 1개씩 뺀 뒤 차례로 커밋해 최종 재고가 9가 되었다. MySQL InnoDB REPEATABLE READ에서도 같은 일이 일어나는 이유로 가장 정확한 것은?</q>
+<o>InnoDB는 UPDATE에 행 잠금을 걸지 않기 때문이다.</o>
+<o>REPEATABLE READ는 커밋된 데이터를 절대 보지 못하게 하므로 두 번째 UPDATE가 무시되기 때문이다.</o>
+<o>Hibernate가 두 번째 트랜잭션의 UPDATE를 생략하기 때문이다.</o>
+<o>Hibernate의 UPDATE는 메모리에서 계산한 값(9)을 그대로 쓰는 문장이고, 두 번째 UPDATE는 잠금을 기다린 뒤 실행되지만 이미 낡은 값으로 계산된 9를 덮어쓰기 때문이다.</o>
+<why>SET stockQuantity=? 에는 자바에서 계산한 결과가 바인딩된다. InnoDB는 UPDATE에 행 잠금을 걸어 두 번째 UPDATE를 기다리게 하지만, 기다린 뒤에는 실행한다. 매뉴얼대로 스냅샷은 SELECT에 적용될 뿐 DML은 다른 트랜잭션이 커밋한 행에도 적용된다. 두 번째 UPDATE는 무시되거나 생략되지 않고 실행되어 같은 값을 덮어쓴다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>도메인 모델(Domain Model)</dt><dd>행동과 데이터를 함께 가진 도메인 객체로 비즈니스 로직을 표현하는 패턴. 마틴 파울러의 엔터프라이즈 애플리케이션 패턴 카탈로그에 정의되어 있다.</dd>
+<dt>트랜잭션 스크립트(Transaction Script)</dt><dd>표현 계층의 요청 하나를 처리하는 프로시저 단위로 비즈니스 로직을 조직하는 패턴.</dd>
+<dt>변경 감지(dirty checking)</dt><dd>영속 엔티티의 현재 상태를 로드 시점의 스냅샷과 비교해 바뀐 엔티티를 찾아 UPDATE를 생성하는 영속성 컨텍스트의 기능.</dd>
+<dt>스냅샷(snapshot, loaded state)</dt><dd>엔티티가 영속 상태가 될 때 Hibernate가 복사해 두는 필드 값 배열. 변경 감지의 비교 기준이 된다.</dd>
+<dt>트랜잭션 쓰기 지연(transactional write-behind)</dt><dd>INSERT·UPDATE·DELETE를 즉시 실행하지 않고 모아 두었다가 플러시 때 실행하는 방식.</dd>
+<dt>정적 생성 메서드(static factory method)</dt><dd>생성자 대신 이름 있는 정적 메서드로 객체를 만드는 방식. 생성 시점의 규칙을 한곳에 모으고 생성자를 감출 수 있다.</dd>
+<dt>갱신 손실(lost update)</dt><dd>동시에 실행된 두 트랜잭션 중 한쪽의 변경이 다른 쪽의 덮어쓰기로 사라지는 현상.</dd>
+<dt>낙관적 잠금(optimistic locking)</dt><dd>미리 잠그지 않고 갱신 시점에 버전 값을 비교해 충돌을 감지하는 방식. JPA에서는 @Version으로 지정한다.</dd>
+<dt>비관적 잠금(pessimistic locking)</dt><dd>조회 시점에 데이터베이스 행 잠금을 걸어 다른 트랜잭션의 수정을 막는 방식.</dd>
+<dt>SQM(Semantic Query Model)</dt><dd>Hibernate 6가 HQL/JPQL 문자열과 Criteria 쿼리를 공통으로 표현하는 의미 트리. SQL은 이 트리에서 방언에 맞게 생성된다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://martinfowler.com/eaaCatalog/domainModel.html">Martin Fowler, P of EAA Catalog — Domain Model</a> — 도메인 모델 패턴의 정의</li>
+<li><a href="https://martinfowler.com/eaaCatalog/transactionScript.html">Martin Fowler, P of EAA Catalog — Transaction Script</a> — 트랜잭션 스크립트 패턴의 정의</li>
+<li><a href="https://jakarta.ee/specifications/persistence/3.1/jakarta-persistence-spec-3.1.html">Jakarta Persistence 3.1 Specification</a> — 엔티티 클래스 요건(2.1), persist와 플러시의 cascade 규칙(3.2.2, 3.2.4)</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/rolling-back.html">Spring Framework Reference — Rolling Back a Declarative Transaction</a> — 기본 롤백 규칙(RuntimeException, Error)</li>
+<li><a href="https://docs.spring.io/spring-framework/reference/testing/testcontext-framework/tx.html">Spring Framework Reference — Transaction Management (TestContext)</a> — 테스트 트랜잭션의 기본 롤백과 ORM 테스트의 거짓 양성</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.0/en/innodb-consistent-read.html">MySQL 8.0 Reference Manual — Consistent Nonlocking Reads</a> — 스냅샷이 SELECT에만 적용되고 DML에는 적용되지 않는다는 설명</li>
+</x-refs>

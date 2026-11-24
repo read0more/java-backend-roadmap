@@ -1,0 +1,637 @@
+<x-meta>
+deck: 패키지가 이름과 디렉터리와 클래스패스를 어떻게 묶는지, import가 왜 컴파일 타임의 이름 해석일 뿐인지, 접근 제어자 네 단계를 컴파일러와 JVM이 각각 어떻게 강제하는지를 명세로 확인한다.
+minutes: 80
+</x-meta>
+
+<x-goals>
+<li>완전한 이름(FQCN)이 주어졌을 때 클래스 파일이 놓일 디렉터리와 실행 명령을 쓰고, <code>wrong name</code>·<code>ClassNotFoundException</code>이 나는 상황을 클래스패스로 설명할 수 있다.</li>
+<li><code>import</code>가 클래스 파일에 흔적을 남기지 않는다는 것을 <code>javap</code>로 확인하는 방법을 말하고, 단순 이름이 충돌할 때의 우선순위와 해결 방법을 적용할 수 있다.</li>
+<li><code>private</code>, 패키지 접근, <code>protected</code>, <code>public</code> 네 단계에 대해 "어느 코드에서 접근할 수 있는가"를 JLS 6.6의 규칙대로 판정할 수 있다(다른 패키지의 하위 클래스에서 <code>protected</code>에 접근하는 경우 포함).</li>
+<li>접근 제어가 컴파일 타임과 런타임 양쪽에서 검사된다는 것을 <code>IllegalAccessError</code> 재현 시나리오로 설명할 수 있다.</li>
+<li>불변식을 지키는 책임을 클래스 안에 가두는 방식으로 캡슐화를 설명하고, 참조를 그대로 내주는 접근자가 캡슐화를 깨는 이유를 말할 수 있다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>이름이 모자라는 문제</h3>
+<p>클래스가 열 개일 때는 이름을 짓는 것이 어렵지 않다. 클래스가 수백 개가 되고 여러 사람이 함께 작업하면 사정이 달라진다. 가게 프로그램을 만든다고 하자. 주문을 다루는 쪽에서는 "주문 항목"이라는 뜻으로 <code>Item</code> 클래스를 만들고 싶고, 재고를 다루는 쪽에서는 "재고 품목"이라는 뜻으로 역시 <code>Item</code>을 만들고 싶다. 둘은 필드도 의미도 다르다. 여기에 외부 라이브러리까지 가져다 쓰면 그 안에도 <code>Item</code>이나 <code>User</code>처럼 흔한 이름의 클래스가 들어 있을 수 있다.</p>
+<p>이름을 <code>OrderItem</code>, <code>StockItem</code>처럼 길게 지어 피하는 방법은 규모가 커지면 버티지 못한다. 남이 만든 라이브러리의 이름은 내가 바꿀 수 없기 때문이다. 필요한 것은 이름이 유효한 범위를 나누는 장치, 곧 이름공간(namespace)이다. 자바에서는 <b>패키지</b>(package)가 그 역할을 한다. JLS 7장은 패키지마다 클래스와 인터페이스의 이름 집합이 따로 있고 이것이 이름 충돌을 막는다고 설명한다.</p>
+<p>패키지는 이름공간에 그치지 않는다. 이 회차에서 보겠지만 패키지는 세 가지 일을 한꺼번에 한다. 이름을 구분하는 단위이고, 클래스 파일이 저장되는 위치와 묶여 있으며, 접근 제어의 경계다. 앞의 두 가지가 이 회차의 전반부이고, 세 번째가 후반부의 주제인 접근 제어자로 이어진다.</p>
+
+<h3>패키지 선언과 완전한 이름</h3>
+<p>클래스가 어느 패키지에 속하는지는 소스 파일 맨 위의 <code>package</code> 선언이 정한다. 자바에서 소스 파일 하나를 <b>컴파일 단위</b>(compilation unit)라고 부르는데, JLS 7.3에 따르면 컴파일 단위는 패키지 선언, <code>import</code> 선언들, 최상위 클래스·인터페이스 선언들의 세 부분이 이 순서로 온다. 패키지 선언은 파일에 최대 하나다.</p>
+<pre><code class="language-java">package store.order;
+
+public class Item {
+    public String name;
+    public int quantity;
+
+    public Item(String name, int quantity) {
+        this.name = name;
+        this.quantity = quantity;
+    }
+}</code></pre>
+<pre><code class="language-java">package store.stock;
+
+public class Item {
+    public String name;
+    public int remaining;
+
+    public Item(String name, int remaining) {
+        this.name = name;
+        this.remaining = remaining;
+    }
+}</code></pre>
+<p>두 클래스는 <b>단순 이름</b>(simple name)이 <code>Item</code>으로 같지만 서로 다른 클래스다. 클래스를 유일하게 가리키는 이름은 패키지 이름까지 붙인 <b>완전한 이름</b>(fully qualified name)이다. 흔히 FQCN(fully qualified class name)이라고 줄여 부른다. JLS 6.7은 이름 있는 패키지에 선언된 최상위 클래스의 완전한 이름을 "패키지의 완전한 이름, 점, 클래스의 단순 이름"으로 정의한다. 위 두 클래스의 완전한 이름은 <code>store.order.Item</code>과 <code>store.stock.Item</code>이다. (필드와 생성자 앞에 붙인 <code>public</code>은 다른 패키지에서 쓸 수 있게 하려는 것이다. 이유는 후반부에서 다룬다.)</p>
+<p>두 클래스를 한 곳에서 써 보자.</p>
+<pre><code class="language-java">package store;
+
+import store.order.Item;
+
+public class StoreMain {
+    public static void main(String[] args) {
+        Item ordered = new Item("원두", 2);
+        store.stock.Item stocked = new store.stock.Item("원두", 10);
+        System.out.println(ordered.getClass().getName());
+        System.out.println(stocked.getClass().getName());
+        System.out.println(stocked.remaining - ordered.quantity);
+    }
+}</code></pre>
+<pre data-label="실행 결과"><code class="language-text">store.order.Item
+store.stock.Item
+8</code></pre>
+<p><code>ordered</code>는 <code>import</code> 덕분에 단순 이름 <code>Item</code>으로 썼고, <code>stocked</code>는 완전한 이름을 그대로 적었다. 실행 중인 객체에게 자기 클래스 이름을 물으면(<code>getClass().getName()</code>) 두 경우 모두 완전한 이름이 나온다. 소스에서 어떻게 적었든 프로그램이 실행될 때 클래스의 이름은 완전한 이름 하나뿐이라는 뜻이다.</p>
+<p>이 점은 클래스 파일을 열어 보면 더 분명하다. JVMS 4.2.1은 클래스 파일 구조 안에 나타나는 클래스 이름이 항상 완전한 형태(이진 이름, binary name)로 표현되며, 내부 형식에서는 점 대신 슬래시를 쓴다고 정한다. <code>javap -v store.StoreMain</code>으로 상수 풀을 보면 다음 항목이 있다.</p>
+<pre data-label="javap -v store.StoreMain (상수 풀의 일부)"><code class="language-text">  #7 = Class              #8             // store/order/Item
+ #11 = Methodref          #7.#12         // store/order/Item."<init>":(Ljava/lang/String;I)V
+ #14 = Class              #15            // store/stock/Item
+ #16 = Methodref          #14.#12        // store/stock/Item."<init>":(Ljava/lang/String;I)V
+ #49 = Class              #50            // store/StoreMain</code></pre>
+<p>단순 이름으로 쓴 <code>Item</code>도, 완전한 이름으로 쓴 <code>store.stock.Item</code>도 클래스 파일에는 똑같이 슬래시로 구분된 완전한 이름으로 기록되어 있다. JVM이 다른 클래스를 가리키고 찾을 때 쓰는 이름은 완전한 이름뿐이다. 소스에서 다른 클래스를 단순 이름으로 가리키는 것은 사람이 읽고 쓰기 편하라고 컴파일러가 제공하는 표기이고, 컴파일이 끝나면 그 참조는 모두 완전한 이름으로 바뀌어 있다.</p>
+
+<h3>패키지와 디렉터리, 그리고 클래스패스</h3>
+<p>패키지 이름과 디렉터리는 어떤 관계일까. JLS 7.2는 패키지와 컴파일 단위를 어떻게 저장할지는 호스트 시스템이 정한다고 하면서, 파일 시스템에 저장하는 단순한 구현에서는 패키지 이름의 각 구성 요소 사이에 파일 구분자를 넣어 경로로 바꾼다고 예를 든다. <code>jag.scrabble.board</code>라는 패키지는 <code>jag/scrabble/board</code>라는 디렉터리가 된다. JDK의 도구들이 이 방식을 따른다. <code>javac</code> 문서는 소스 파일의 물리적 배치가 패키지 구조를 그대로 반영하기를 기대한다고 적는다.</p>
+<p>위 세 파일을 다음처럼 두고 컴파일해 보자.</p>
+<pre class="diagram">src/
+└─ store/
+   ├─ StoreMain.java        package store;
+   ├─ order/
+   │  └─ Item.java          package store.order;
+   └─ stock/
+      └─ Item.java          package store.stock;</pre>
+<pre><code class="language-bash">javac -d out src/store/order/Item.java src/store/stock/Item.java src/store/StoreMain.java</code></pre>
+<p><code>-d</code>는 클래스 파일을 내보낼 디렉터리를 지정하는 옵션이다. <code>javac</code> 문서에 따르면 클래스가 패키지에 속해 있으면 컴파일러는 패키지 이름을 반영하는 하위 디렉터리에 클래스 파일을 넣고, 필요한 디렉터리가 없으면 만든다. 결과는 다음과 같다.</p>
+<pre class="diagram">out/                            ← 클래스패스의 루트로 쓸 디렉터리
+└─ store/
+   ├─ StoreMain.class           store.StoreMain
+   ├─ order/
+   │  └─ Item.class             store.order.Item
+   └─ stock/
+      └─ Item.class             store.stock.Item</pre>
+<p>이제 실행한다.</p>
+<pre><code class="language-bash">java -cp out store.StoreMain</code></pre>
+<p>이 명령에는 중요한 점이 두 가지 있다. 첫째, <code>java</code>에 넘기는 것은 파일 경로가 아니라 <b>클래스의 완전한 이름</b>이다. <code>out/store/StoreMain.class</code>도, <code>StoreMain</code>도 아니고 <code>store.StoreMain</code>이다. 둘째, <code>-cp</code>(<code>--class-path</code>)로 <b>클래스패스</b>(class path)를 준다. <code>java</code> 명령 문서는 클래스패스를 클래스 파일을 찾을 디렉터리, JAR 파일, ZIP 압축 파일의 목록이라고 설명한다. 항목이 여러 개면 윈도우에서는 세미콜론, 그 밖의 플랫폼에서는 콜론으로 구분한다. 옵션도 주지 않고 <code>CLASSPATH</code> 환경 변수도 없으면 클래스패스는 현재 디렉터리(<code>.</code>)다.</p>
+<p>클래스를 찾는 방법은 두 정보를 이어 붙이는 것이다. 완전한 이름 <code>store.StoreMain</code>의 점을 디렉터리 구분자로 바꾸고 <code>.class</code>를 붙이면 <code>store/StoreMain.class</code>가 되고, 이것을 클래스패스의 각 항목 아래에서 찾는다. 클래스패스가 <code>out</code>이므로 <code>out/store/StoreMain.class</code>가 대상이다. 실행 중에 <code>store.order.Item</code>이 필요해지면 같은 방법으로 <code>out/store/order/Item.class</code>를 찾는다. JAR 파일은 이 디렉터리 구조를 그대로 담은 압축 파일이어서, 클래스패스 항목이 JAR이면 그 안에서 같은 경로를 찾는다.</p>
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>주소와 우편물 분류함</strong><p>완전한 이름은 "서울시 ○○구 ○○로 12"처럼 큰 단위에서 작은 단위로 좁혀 가는 주소와 같다. 클래스패스는 "어느 우체국의 분류함에서 찾기 시작할 것인가"다. 주소가 같아도 시작하는 우체국이 틀리면 우편물을 찾지 못한다. 비유가 맞지 않는 부분도 있다. 실제 주소에서는 구가 시에 포함되지만, 자바의 패키지 <code>store.order</code>는 <code>store</code>에 "포함"되어 어떤 권한을 물려받는 것이 아니다. 이름의 앞부분이 같을 뿐이다. 이 점은 뒤에서 다시 다룬다.</p></aside>
+<h4>어긋났을 때 벌어지는 일</h4>
+<p>이 구조를 이해했는지는 실패 사례로 확인할 수 있다. <code>out/store</code> 디렉터리로 들어가서 "여기에 StoreMain.class가 있으니까"라고 생각하고 단순 이름으로 실행해 보자.</p>
+<pre><code class="language-bash">cd out/store
+java StoreMain</code></pre>
+<pre data-label="실행 결과 (원인 부분)"><code class="language-text">java.lang.NoClassDefFoundError: StoreMain (wrong name: store/StoreMain)</code></pre>
+<p>클래스패스는 현재 디렉터리이고, 요청한 이름은 <code>StoreMain</code>이므로 JVM은 <code>./StoreMain.class</code>를 찾는다. 파일은 있다. 그런데 그 파일을 읽어 보니 안에 기록된 클래스 이름이 <code>store/StoreMain</code>이다. 요청한 이름과 파일이 스스로 밝히는 이름이 달라서 JVM은 이 파일을 거부한다. 여기서 알 수 있는 사실은, 클래스의 패키지는 파일이 놓인 디렉터리만으로 정해지는 것이 아니라 <b>클래스 파일 안에 기록되어 있다</b>는 것이다. 디렉터리 구조는 그 이름으로 파일을 찾아가기 위한 약속이고, 둘이 일치해야 한다.</p>
+<p>반대로 클래스패스를 주지 않고 엉뚱한 디렉터리에서 <code>java store.StoreMain</code>을 실행하면 이번에는 파일 자체를 찾지 못한다.</p>
+<pre data-label="실행 결과 (원인 부분)"><code class="language-text">java.lang.ClassNotFoundException: store.StoreMain</code></pre>
+<p>이름은 맞지만 찾기 시작할 위치가 틀린 경우다. 실무에서 만나는 <code>ClassNotFoundException</code>과 <code>NoClassDefFoundError</code>의 상당수는 결국 "그 완전한 이름에 해당하는 클래스 파일이 클래스패스 위에 있는가"라는 질문으로 돌아온다. IDE와 빌드 도구는 이 클래스패스를 대신 조립해 줄 뿐이고, 밑바닥의 규칙은 같다.</p>
+
+<x-visual id="java-basic-05-fqcn-classpath" title="완전한 이름과 클래스패스가 합쳐져 클래스 파일 경로가 되는 과정" kind="구조 다이어그램" ratio="16:9">
+<x-hint>클래스패스 루트 디렉터리 아래에서 완전한 이름의 점을 디렉터리 구분자로 바꾼 경로를 따라가 클래스 파일을 찾는다는 것을 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 읽는 깔끔한 기술 다이어그램. 왼쪽 위에 터미널 모양 상자가 있고 안에 고정폭 글꼴로 "java -cp out store.StoreMain" 이 적혀 있다. 이 명령의 "out" 부분에서 아래로 화살표가 나와 라벨 "클래스패스: 찾기 시작할 위치"가 붙은 폴더 아이콘 "out/"을 가리킨다. 명령의 "store.StoreMain" 부분에서 화살표가 나와 라벨 "완전한 이름: 점을 디렉터리 구분자로"가 붙은 상자 "store/StoreMain.class"를 가리킨다. 오른쪽에는 폴더 트리 그림: 최상위 폴더 "out", 그 아래 폴더 "store", 그 아래 파일 "StoreMain.class"와 폴더 "order", "stock", 각 폴더 안에 파일 "Item.class". 트리에서 "out" 폴더는 파랑, "store/StoreMain.class"로 이어지는 경로는 주황색 굵은 선으로 강조한다. 맨 아래에 한 줄 요약 라벨 "클래스패스 + 완전한 이름 = 클래스 파일의 위치". 흰 배경, 얇은 선, 한국어 라벨은 따옴표 안의 문구 그대로.</x-prompt>
+<x-caption>JVM은 클래스패스의 각 항목 아래에서 완전한 이름에 대응하는 경로를 찾는다.</x-caption>
+</x-visual>
+
+<h3>import는 컴파일 타임의 이름 해석이다</h3>
+<p>다른 패키지의 클래스를 쓰는 원칙적인 방법은 완전한 이름을 적는 것이다. 매번 <code>store.stock.Item</code>이라고 쓰는 것은 번거로우므로 <code>import</code> 선언이 있다. JLS 7.5는 <code>import</code> 선언이 이름 붙은 클래스, 인터페이스, 정적 멤버를 식별자 하나짜리 단순 이름으로 가리킬 수 있게 해 준다고 정의한다. 하는 일은 이것이 전부다. 종류는 네 가지다.</p>
+<div class="table-wrap"><table><thead><tr><th>형태</th><th>이름(JLS)</th><th>의미</th></tr></thead><tbody>
+<tr><td><code>import store.order.Item;</code></td><td>단일 타입 import</td><td>클래스 하나를 단순 이름으로 쓸 수 있게 한다</td></tr>
+<tr><td><code>import store.order.*;</code></td><td>필요 시 타입 import</td><td>그 패키지의 접근 가능한 클래스를 필요할 때 단순 이름으로 쓸 수 있게 한다</td></tr>
+<tr><td><code>import static java.lang.Math.max;</code></td><td>단일 정적 import</td><td>정적 멤버 하나를 단순 이름으로 쓸 수 있게 한다(6회)</td></tr>
+<tr><td><code>import static java.lang.Math.*;</code></td><td>필요 시 정적 import</td><td>그 클래스의 접근 가능한 정적 멤버를 필요할 때 단순 이름으로 쓸 수 있게 한다(6회)</td></tr>
+</tbody></table></div>
+<p><code>import</code>의 효력이 미치는 범위는 그 선언이 들어 있는 컴파일 단위 하나다(JLS 7.5). 같은 패키지의 다른 파일에는 영향을 주지 않는다. 그래서 파일마다 필요한 <code>import</code>를 따로 적어야 한다.</p>
+<p><code>import</code> 없이도 단순 이름으로 쓸 수 있는 클래스가 두 부류 있다. 하나는 같은 패키지의 클래스다. 자기 패키지에 선언된 클래스는 처음부터 이름의 유효 범위 안에 있다. 다른 하나는 <code>java.lang</code> 패키지의 클래스다. JLS 7.3은 모든 컴파일 단위가 <code>java.lang</code>의 모든 <code>public</code> 클래스와 인터페이스를 암묵적으로 import한다고 정한다. 파일 맨 위에 <code>import java.lang.*;</code>가 적혀 있는 것과 같다. <code>String</code>, <code>System</code>, <code>Math</code>, <code>Object</code>를 <code>import</code> 없이 쓸 수 있었던 이유다.</p>
+<h4>클래스 파일에는 import가 없다</h4>
+<p><code>import</code>가 이름을 줄여 쓰게 해 주는 표기일 뿐이라는 것은 실험으로 확인할 수 있다. 같은 프로그램을 한 번은 <code>import</code>로, 한 번은 완전한 이름으로 쓴다.</p>
+<pre><code class="language-java">package app;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class Demo {
+    public static void main(String[] args) {
+        List<String> names = new ArrayList<>();
+        names.add("kim");
+        System.out.println(names);
+    }
+}</code></pre>
+<pre><code class="language-java">package app;
+
+public class Demo {
+    public static void main(String[] args) {
+        java.util.List<String> names = new java.util.ArrayList<>();
+        names.add("kim");
+        System.out.println(names);
+    }
+}</code></pre>
+<p>두 소스를 디버그 정보를 빼는 옵션 <code>-g:none</code>으로 각각 컴파일하면 만들어진 두 <code>Demo.class</code>는 바이트 단위로 완전히 같다(JDK 21의 <code>javac</code>로 확인한 결과다). 옵션 없이 컴파일하면 차이가 생기는데, 그것은 <code>import</code> 두 줄 때문에 소스의 줄 번호가 밀려서 디버깅용 줄 번호 표가 달라지는 것뿐이다. 클래스 파일 형식에는 <code>import</code>를 기록하는 자리가 없다. 컴파일러는 소스의 단순 이름 <code>List</code>를 만나면 <code>import</code> 선언을 참고해 <code>java.util.List</code>라는 완전한 이름으로 바꾸고, 그 완전한 이름을 상수 풀에 적는다.</p>
+<p>여기서 몇 가지 오해가 한꺼번에 풀린다.</p>
+<ul>
+<li><b><code>import</code>는 코드를 가져오지 않는다.</b> 다른 파일의 내용을 끌어와 붙이는 것이 아니다. 이름을 해석하는 규칙을 컴파일러에게 알려 줄 뿐이다.</li>
+<li><b><code>import java.util.*;</code>가 프로그램을 무겁게 만들지 않는다.</b> 와일드카드로 import해도 클래스 파일의 상수 풀에는 실제로 사용한 클래스의 이름만 들어간다. <code>java.util</code>의 수많은 클래스 가운데 <code>List</code>와 <code>ArrayList</code>만 썼다면 그 둘만 기록된다.</li>
+<li><b><code>import</code>는 클래스를 로딩하지 않는다.</b> 실행 중에 어떤 클래스가 언제 메모리에 올라오는지는 <code>import</code>와 관계가 없다. OpenJDK 21의 HotSpot에서 클래스 로딩 로그(<code>-Xlog:class+load</code>)를 켜고 실행해 보면 <code>import</code>만 하고 실행 중에 쓰지 않은 클래스는 로딩되지 않는다. 클래스가 초기화되는 시점의 규칙은 6회에서 다룬다.</li>
+</ul>
+<h4>단순 이름이 충돌할 때</h4>
+<p><code>store.order.Item</code>과 <code>store.stock.Item</code>을 한 파일에서 둘 다 써야 한다면 어떻게 될까. 컴파일러가 정한 규칙은 다음과 같다(오류 메시지는 JDK 21 <code>javac</code> 기준).</p>
+<div class="table-wrap"><table><thead><tr><th>상황</th><th>결과</th></tr></thead><tbody>
+<tr><td><code>import store.order.Item;</code>과 <code>import store.stock.Item;</code>을 함께 선언</td><td>선언 자체가 컴파일 오류. <code>a type with the same simple name is already defined by the single-type-import of Item</code></td></tr>
+<tr><td><code>import store.order.*;</code>과 <code>import store.stock.*;</code>을 함께 선언하고 <code>Item</code>을 사용하지 않음</td><td>오류 없음</td></tr>
+<tr><td>위와 같이 선언하고 <code>Item</code>을 단순 이름으로 사용</td><td>사용한 자리에서 컴파일 오류. <code>reference to Item is ambiguous</code></td></tr>
+<tr><td><code>import store.order.Item;</code>과 <code>import store.stock.*;</code>을 함께 선언하고 <code>Item</code>을 사용</td><td>오류 없음. <code>Item</code>은 <code>store.order.Item</code></td></tr>
+</tbody></table></div>
+<p>마지막 줄이 우선순위 규칙이다. 클래스 하나를 콕 집은 단일 타입 import는 와일드카드 import가 들여온 같은 이름을 가린다. 같은 패키지에 선언된 클래스도 와일드카드 import보다 우선한다(JLS 7.5.2). 그래서 두 <code>Item</code>을 함께 써야 할 때의 표준적인 해법은 앞의 <code>StoreMain</code>처럼 더 자주 쓰는 쪽을 <code>import</code>하고 다른 쪽은 완전한 이름으로 적는 것이다. 자바에는 import하면서 별명을 붙이는 문법이 없다.</p>
+<p>표준 라이브러리에서도 같은 일이 생긴다. <code>import java.util.*;</code>과 <code>import java.sql.*;</code>을 함께 쓰고 <code>Date</code>를 사용하면 <code>reference to Date is ambiguous</code> 오류가 난다. 두 패키지에 모두 <code>Date</code>가 있기 때문이다. <code>import java.util.Date;</code>를 한 줄 추가하면 단일 타입 import가 우선하므로 해결된다.</p>
+
+<h3>패키지 규칙</h3>
+<h4>이름 짓기</h4>
+<p>패키지 이름은 전 세계의 다른 코드와 겹치지 않아야 의미가 있다. JLS 6.1은 널리 배포할 패키지라면 자신이 가진 인터넷 도메인 이름을 구성 요소 단위로 뒤집어 접두사로 쓰기를 제안한다. 도메인이 <code>example.com</code>이면 <code>com.example</code>로 시작하고, 그 아래에 프로젝트와 기능 이름을 붙여 <code>com.example.shop.order</code>처럼 만든다. 도메인 이름은 등록 체계에 의해 유일하므로, 이 관례를 따르면 서로 모르는 두 조직이 같은 패키지 이름을 고를 일이 없다. 또 <code>javac</code> 문서는 패키지 이름은 소문자로, 클래스 이름은 대문자로 시작하는 것이 널리 받아들여진 관례라고 적는다. 이 관례 덕분에 <code>store.order.Item</code>을 보면 어디까지가 패키지이고 어디부터가 클래스인지 눈으로 구분할 수 있다.</p>
+<h4>계층은 이름일 뿐이다</h4>
+<p><code>store.order</code>는 <code>store</code>의 하위 패키지(subpackage)라고 부른다. 디렉터리도 안에 들어 있으니 포함 관계처럼 보인다. 그러나 JLS 7.1은 패키지의 계층적 이름 구조가 관련된 패키지를 관례적으로 정리하기 위한 편의일 뿐, 그 자체로는 의미가 없다고 못 박는다. 예로 든 것이 <code>oliver</code>와 <code>oliver.twist</code>다. <code>oliver.twist</code> 패키지의 코드는 <code>oliver</code> 패키지의 클래스에 대해 다른 아무 패키지의 코드보다 나은 접근 권한을 갖지 않는다.</p>
+<p>실용적인 결론이 두 가지 나온다. 첫째, <code>import store.*;</code>는 <code>store</code> 패키지에 직접 선언된 클래스만 대상으로 하고 <code>store.order.Item</code>은 들여오지 않는다. <code>import</code>는 패키지를 들여오는 것이 아니라 클래스를 들여오는 것이어서, <code>import store.*;</code> 뒤에 <code>order.Item</code>이라고 써도 <code>package order does not exist</code> 오류가 난다. 둘째, 뒤에서 볼 "같은 패키지"라는 접근 제어의 조건에서 <code>store</code>와 <code>store.order</code>는 서로 남이다. 패키지가 같은지는 완전한 이름이 정확히 같은지로만 판단한다.</p>
+<h4>이름 없는 패키지</h4>
+<p><code>package</code> 선언이 없는 소스 파일의 클래스는 <b>이름 없는 패키지</b>(unnamed package)에 속한다. 흔히 디폴트 패키지라고 부른다. JLS 7.4.2는 이것이 작은 프로그램이나 임시 프로그램을 만들 때, 또는 개발을 막 시작할 때의 편의를 위한 것이라고 설명한다. 지금까지의 예제 가운데 <code>package</code> 선언 없이 쓴 클래스들이 여기에 속했다.</p>
+<p>이름 없는 패키지에는 실질적인 제약이 있다. 단일 타입 import로 들여올 수 있는 클래스는 이름 있는 패키지의 멤버여야 한다(JLS 7.5.1). 이름 없는 패키지의 클래스는 완전한 이름이 단순 이름과 같아서 <code>import</code>로 가리킬 방법이 없고, 따라서 이름 있는 패키지의 코드에서는 그 클래스를 쓸 수 없다. 프로젝트가 패키지를 쓰기 시작하면 모든 클래스를 이름 있는 패키지에 넣어야 하는 이유다.</p>
+<h4>한 패키지 안에서의 이름</h4>
+<p>한 패키지는 같은 이름의 멤버를 둘 가질 수 없다(JLS 7.1). 같은 패키지에 <code>Item</code> 클래스를 두 번 선언할 수 없는 것은 당연하고, 패키지 <code>store</code>에 <code>order</code>라는 하위 패키지가 있으면 <code>store</code> 안에 <code>order</code>라는 이름의 클래스를 둘 수도 없다. 패키지 이름을 소문자로, 클래스 이름을 대문자로 시작하는 관례를 지키면 이런 충돌은 일어나지 않는다.</p>
+
+<h3>패키지 활용: 구조를 잡는다</h3>
+<p>패키지를 어떻게 나눌지는 언어가 정해 주지 않는다. 다만 지금까지의 규칙에서 판단의 기준을 끌어낼 수 있다. 패키지는 이름공간이자 접근 제어의 경계이므로, 한 패키지에는 서로 긴밀하게 협력하고 함께 바뀌는 클래스들을 모으고, 패키지 바깥에는 꼭 필요한 클래스와 메서드만 내보이는 것이 패키지라는 장치를 제대로 쓰는 방법이다.</p>
+<pre class="diagram">com.example.shop                 ← 프로젝트의 루트 패키지
+├─ ShopMain                      프로그램의 시작점(main)
+├─ order
+│  ├─ Order                      public: 다른 패키지에서 사용
+│  ├─ OrderService               public
+│  └─ OrderNumberGenerator       패키지 접근: order 안에서만 쓰는 내부 부품
+├─ member
+│  ├─ Member
+│  └─ MemberService
+└─ stock
+   └─ Inventory</pre>
+<p>이런 구조에서 <code>order</code> 패키지의 코드가 <code>stock</code>의 <code>Inventory</code>를 쓰려면 <code>import com.example.shop.stock.Inventory;</code>가 필요하다. 파일 맨 위의 <code>import</code> 목록은 그 클래스가 다른 어떤 패키지에 의존하는지를 그대로 보여 주는 목록이 된다. <code>import</code>가 양방향으로 얽혀 있다면(<code>order</code>가 <code>stock</code>을, <code>stock</code>이 다시 <code>order</code>를 import) 두 패키지는 사실상 한 덩어리이고, 나눈 의미가 줄어든다.</p>
+<p>위 그림의 <code>OrderNumberGenerator</code>처럼 패키지 안에서만 쓰는 클래스를 바깥에 숨기는 방법, 그리고 클래스 안의 필드와 메서드를 숨기는 방법이 이제부터 볼 접근 제어자다.</p>
+
+<h3>접근 제어가 필요한 이유: 규칙을 우회하는 코드</h3>
+<p>실내 온도 조절기를 클래스로 만든다고 하자. 목표 온도는 30도를 넘으면 안 된다는 규칙이 있다. 3회에서 배운 대로 데이터와 기능을 묶어, 온도를 올리는 메서드 안에 그 규칙을 넣었다.</p>
+<pre><code class="language-java">package home.device;
+
+public class Thermostat {
+    int target = 22;
+    int step = 1;
+
+    public void warmer() {
+        if (target + step > 30) {
+            System.out.println("30도를 넘길 수 없습니다.");
+            return;
+        }
+        target += step;
+    }
+}</code></pre>
+<p><code>warmer()</code>만 호출하는 한 목표 온도는 30도를 넘지 않는다. 문제는 이 클래스를 쓰는 다른 개발자가 메서드를 거치지 않을 수 있다는 것이다.</p>
+<pre><code class="language-java">Thermostat t = new Thermostat();
+t.target = 99;      // 규칙을 거치지 않고 필드에 직접 대입</code></pre>
+<p>이 코드는 컴파일되고 실행된다. 필드가 열려 있는 한, 메서드에 넣은 검사는 "지켜 주면 좋은 권고"에 지나지 않는다. 4회에서 생성자로 "유효한 상태로만 태어나게" 만들었지만, 태어난 뒤에 누구나 필드를 고칠 수 있다면 그 보장은 한 줄로 무너진다. 클래스를 만든 사람이 "이 필드는 내 메서드를 통해서만 바뀐다"고 확신할 수 있어야 불변식을 책임질 수 있다.</p>
+<p>해법은 필드 선언 앞에 <code>private</code>을 붙이는 것이다.</p>
+<pre><code class="language-java">private int target = 22;</code></pre>
+<p>이제 클래스 바깥의 <code>t.target = 99;</code>는 컴파일되지 않는다. <code>javac</code>는 <code>target has private access in Thermostat</code>이라고 알려 준다. 목표 온도를 바꾸는 길은 <code>warmer()</code> 같은 공개 메서드뿐이고, 그 메서드는 클래스 작성자가 통제한다. JLS 6.6은 접근 제어의 목적을 패키지나 클래스의 사용자가 그 구현의 불필요한 세부 사항에 의존하지 못하게 하는 것이라고 밝힌다. 접근 제어자는 "여기까지는 약속이고, 여기부터는 내부 사정이니 건드리지 말라"는 선을 컴파일러가 강제하게 만드는 수단이다.</p>
+
+<h3>접근 제어자 네 단계의 정확한 규칙</h3>
+<p>자바의 접근 수준은 네 가지다. 키워드는 <code>private</code>, <code>protected</code>, <code>public</code> 세 개이고, 아무것도 적지 않은 경우가 네 번째 수준인 <b>패키지 접근</b>(package access)이다. 흔히 default 접근이라고도 부르지만 <code>default</code>라는 키워드를 적는 것이 아니라 접근 제어자를 생략하는 것이다. JLS 6.6.1의 규칙을 좁은 것부터 정리하면 다음과 같다.</p>
+<div class="table-wrap"><table><thead><tr><th>접근 수준</th><th>표기</th><th>접근이 허용되는 코드의 위치</th></tr></thead><tbody>
+<tr><td>private</td><td><code>private</code></td><td>그 멤버의 선언을 둘러싼 최상위 클래스의 본문 안</td></tr>
+<tr><td>패키지 접근</td><td>(적지 않음)</td><td>그 클래스가 선언된 패키지 안</td></tr>
+<tr><td>protected</td><td><code>protected</code></td><td>같은 패키지 안, 그리고 다른 패키지에 있는 하위 클래스의 본문 안(추가 조건이 있다)</td></tr>
+<tr><td>public</td><td><code>public</code></td><td>어디서나</td></tr>
+</tbody></table></div>
+<p>표를 읽을 때 놓치기 쉬운 전제가 세 가지 있다.</p>
+<p>첫째, 접근 가능 여부는 <b>"어느 객체가"가 아니라 "어느 위치의 코드가"</b>로 결정된다. JLS 6.6은 접근 가능성이 컴파일 타임에 결정할 수 있는 정적 성질이며 타입과 선언의 제어자에만 의존한다고 적는다. 실행 중에 어떤 객체가 어떤 객체에게 메시지를 보내는지는 따지지 않는다. 접근하려는 코드가 소스의 어느 클래스, 어느 패키지 안에 적혀 있는지만 본다.</p>
+<p>둘째, 멤버에 접근하려면 <b>조건 두 개가 모두</b> 성립해야 한다. JLS 6.6.1은 클래스의 멤버나 생성자가 접근 가능하려면 (가) 그 멤버를 가진 클래스 자체가 접근 가능하고 (나) 멤버의 선언이 접근을 허용해야 한다고 정한다. <code>public</code> 메서드라도 그 메서드가 들어 있는 클래스가 다른 패키지에 공개되지 않았다면 다른 패키지에서는 부를 수 없다.</p>
+<p>셋째, 표의 "어디서나"에는 단서가 있다. Java 9부터 있는 모듈 시스템을 쓰는 경우, <code>public</code> 최상위 클래스가 모듈 밖에서 접근 가능하려면 그 클래스의 패키지를 모듈이 내보내야(export) 한다(JLS 6.6.1). 모듈 선언 없이 클래스패스에서 실행하는 프로그램에서는 이 조건을 의식할 일이 거의 없으므로, 이 회차에서는 패키지와 클래스 단위의 규칙에 집중한다.</p>
+<p>네 수준은 넓이 순으로 포함 관계를 이룬다. <code>private</code>이 허용하는 위치는 패키지 접근이 허용하는 위치에 포함되고, 패키지 접근은 <code>protected</code>에, <code>protected</code>는 <code>public</code>에 포함된다.</p>
+<pre class="diagram">  public     ┌──────────────────────────────────────────────┐
+             │ 모든 패키지의 코드                            │
+  protected  │  ┌────────────────────────────────────────┐  │
+             │  │ 다른 패키지에 있는 하위 클래스의 본문   │  │
+  (패키지)   │  │  ┌──────────────────────────────────┐  │  │
+             │  │  │ 같은 패키지의 코드                │  │  │
+  private    │  │  │  ┌────────────────────────────┐  │  │  │
+             │  │  │  │ 같은 최상위 클래스의 본문   │  │  │  │
+             │  │  │  └────────────────────────────┘  │  │  │
+             │  │  └──────────────────────────────────┘  │  │
+             │  └────────────────────────────────────────┘  │
+             └──────────────────────────────────────────────┘</pre>
+
+<x-visual id="java-basic-05-access-levels" title="private, 패키지 접근, protected, public 네 접근 수준의 포함 관계" kind="개념 다이어그램" ratio="4:3">
+<x-hint>네 접근 수준이 허용하는 코드의 위치가 안쪽에서 바깥쪽으로 넓어지는 포함 관계라는 것을 동심 사각형으로 보여 준다.</x-hint>
+<x-prompt>네 겹의 둥근 모서리 사각형이 안에서 밖으로 겹쳐 있는 동심 구조 다이어그램. 가장 안쪽 사각형은 진한 파랑, 라벨 "private" 과 그 아래 작은 글씨 "같은 최상위 클래스의 본문". 두 번째 사각형은 조금 옅은 파랑, 왼쪽 위 모서리에 라벨 "패키지 접근 (제어자 없음)" 과 작은 글씨 "같은 패키지의 코드". 세 번째 사각형은 더 옅은 파랑, 라벨 "protected" 와 작은 글씨 "다른 패키지의 하위 클래스 본문". 가장 바깥 사각형은 아주 옅은 회색, 라벨 "public" 과 작은 글씨 "모든 패키지의 코드". 오른쪽 바깥에 위에서 아래로 향하는 세로 화살표가 있고 위쪽 끝에 "넓다", 아래쪽 끝에 "좁다" 라벨. 각 층의 라벨은 서로 겹치지 않게 왼쪽 위에 계단식으로 배치. 흰 배경, 얇은 테두리선, 한국어 라벨은 따옴표 안의 문구 그대로.</x-prompt>
+<x-caption>안쪽 수준이 허용하는 위치는 바깥쪽 수준에서도 항상 허용된다.</x-caption>
+</x-visual>
+
+<h3>필드와 메서드에 쓰기</h3>
+<p>네 수준을 한 클래스에 모두 넣고, 같은 패키지와 다른 패키지에서 각각 접근해 보면 규칙이 손에 잡힌다.</p>
+<pre><code class="language-java">package home.device;
+
+public class Thermostat {
+    private int target = 22;          // private
+    int step = 1;                     // 접근 제어자 없음: 패키지 접근
+    protected String model = "T-1";   // protected
+    public String room = "거실";       // public
+
+    public void warmer() {
+        if (target + step > 30) {
+            System.out.println("30도를 넘길 수 없습니다.");
+            return;
+        }
+        target += step;
+    }
+
+    public int getTarget() {
+        return target;
+    }
+
+    public boolean sameTarget(Thermostat other) {
+        return this.target == other.target;
+    }
+}</code></pre>
+<pre><code class="language-java">package home.device;                  // 같은 패키지
+
+public class Panel {
+    public static void main(String[] args) {
+        Thermostat t = new Thermostat();
+        t.step = 2;                                              // 패키지 접근: 허용
+        System.out.println(t.model + " " + t.room + " " + t.step);  // T-1 거실 2
+        // t.target = 25;   // private: 컴파일 오류
+    }
+}</code></pre>
+<pre><code class="language-java">package home.app;                     // 다른 패키지
+
+import home.device.Thermostat;
+
+public class AppMain {
+    public static void main(String[] args) {
+        Thermostat t = new Thermostat();
+        t.room = "침실";    // public: 허용
+        t.target = 99;     // 컴파일 오류
+        t.step = 50;       // 컴파일 오류
+        t.model = "X";     // 컴파일 오류
+    }
+}</code></pre>
+<pre data-label="javac 21의 오류 메시지"><code class="language-text">error: target has private access in Thermostat
+error: step is not public in Thermostat; cannot be accessed from outside package
+error: model has protected access in Thermostat</code></pre>
+<p>같은 패키지의 <code>Panel</code>에서는 <code>private</code>인 <code>target</code>만 막힌다. 다른 패키지의 <code>AppMain</code>에서는 <code>public</code>인 <code>room</code>만 열려 있다. <code>protected</code>인 <code>model</code>이 <code>Panel</code>에서 허용된 것에 주목하자. <code>protected</code>는 "자식에게만"이 아니라 같은 패키지에도 열려 있다. 패키지 접근보다 넓은 수준이기 때문이다. 메서드에도 똑같은 규칙이 적용된다. 클래스 내부에서만 쓰는 보조 메서드는 <code>private</code>으로, 외부에 제공하는 기능은 <code>public</code>으로 선언한다.</p>
+<h4>private은 객체 단위가 아니라 클래스 단위다</h4>
+<p><code>sameTarget</code> 메서드를 보자. <code>this.target</code>은 물론이고 매개변수로 받은 <b>다른 객체</b>의 <code>other.target</code>도 읽는다. <code>private</code>인데도 컴파일된다. <code>private</code>의 규칙이 "자기 객체만 접근할 수 있다"가 아니라 "그 선언을 둘러싼 최상위 클래스의 본문 안에서 접근할 수 있다"이기 때문이다. <code>other.target</code>이라는 식이 적힌 위치가 <code>Thermostat</code> 클래스의 본문이므로 허용된다. 접근 제어는 코드의 위치를 본다는 첫 번째 전제가 여기서 그대로 드러난다.</p>
+<p>이 규칙은 설계상 자연스럽다. 접근 제어가 막으려는 것은 "구현의 세부 사항을 모르는 바깥 코드가 내부에 의존하는 것"이다. 같은 클래스 안의 코드는 그 클래스의 구현을 아는 코드이므로, 같은 클래스의 다른 인스턴스 내부를 들여다봐도 숨겨야 할 대상에게 숨긴 것이 새 나가지 않는다. 두 객체를 비교하거나 복사하는 메서드를 쓸 수 있는 것도 이 덕분이다.</p>
+
+<h3>protected의 세부 규칙</h3>
+<p><code>protected</code>는 상속과 함께 쓰는 접근 수준이다. 상속은 8회에서 본격적으로 다루므로, 여기서는 <code>class B extends A</code>가 "B는 A를 물려받은 하위 클래스(subclass)이고 A의 필드와 메서드를 갖는다"는 뜻이라는 것만 알고 규칙의 모양을 본다. 흔히 <code>protected</code>를 "같은 패키지와 자식 클래스에서 접근 가능"이라고 요약한다. 이 요약은 다른 패키지의 하위 클래스에 대해 중요한 조건 하나를 빠뜨리고 있다.</p>
+<p>JLS 6.6.2는 한 문장으로 원칙을 세운다. 객체의 <code>protected</code> 멤버는 그것이 선언된 패키지 바깥에서는 <b>그 객체의 구현을 책임지는 코드</b>만 접근할 수 있다. 구체적으로(JLS 6.6.2.1), <code>protected</code> 멤버가 클래스 C에 선언되어 있고 다른 패키지의 하위 클래스 S의 본문에서 접근한다면, 인스턴스 필드나 인스턴스 메서드에 대한 접근은 <code>표현식.멤버</code>에서 그 표현식의 타입이 <b>S이거나 S의 하위 클래스일 때만</b> 허용된다.</p>
+<pre><code class="language-java">package home.lab;                     // Thermostat과 다른 패키지
+
+import home.device.Thermostat;
+
+public class SmartThermostat extends Thermostat {
+    void rename() {
+        this.model = "S-1";              // (1) 허용
+        model = "S-2";                   // (2) 허용: this.model과 같다
+    }
+
+    void copyFrom(SmartThermostat other) {
+        this.model = other.model;        // (3) 허용: other의 타입이 SmartThermostat
+    }
+
+    void copyFromBase(Thermostat other) {
+        this.model = other.model;        // (4) 컴파일 오류: model has protected access in Thermostat
+    }
+}</code></pre>
+<p>(1)과 (2)는 자기 자신을 통한 접근이고, (3)은 같은 클래스 <code>SmartThermostat</code> 타입의 다른 객체를 통한 접근이다. 셋 다 "표현식의 타입이 S"라는 조건을 만족한다. (4)는 다르다. <code>other</code>의 타입은 상위 클래스인 <code>Thermostat</code>이다. 그 변수가 실제로 가리키는 객체는 <code>SmartThermostat</code>일 수도 있지만, <code>Thermostat</code>을 물려받은 전혀 다른 하위 클래스의 객체일 수도 있고 그냥 <code>Thermostat</code>일 수도 있다. <code>SmartThermostat</code>은 그런 객체의 구현을 책임지는 클래스가 아니다. 그래서 하위 클래스라는 이유만으로 "상위 클래스 타입의 아무 객체"의 <code>protected</code> 멤버를 건드리는 것은 허용되지 않는다.</p>
+<p>이 조건이 없다면 <code>protected</code>는 쉽게 뚫린다. 어떤 클래스의 <code>protected</code> 필드를 고치고 싶은 사람은 그 클래스를 물려받는 클래스를 하나 만들기만 하면, 프로그램 안의 모든 해당 타입 객체의 내부를 고칠 수 있게 되기 때문이다. 같은 패키지에서는 이 제한이 없다. 같은 패키지의 코드에는 <code>protected</code>가 패키지 접근과 똑같이 열려 있으므로 <code>Panel</code>에서 <code>t.model</code>을 읽을 수 있었다.</p>
+<p><code>protected</code> 생성자에도 비슷한 규칙이 있다(JLS 6.6.2.2). 다른 패키지의 하위 클래스는 자신의 생성자에서 <code>super(...)</code>로 상위 클래스의 <code>protected</code> 생성자를 호출할 수 있지만, <code>new 상위클래스(...)</code>로 상위 클래스의 객체를 직접 만들 수는 없다. 하위 클래스의 생성자가 상위 클래스 부분을 초기화하는 것은 "자기 객체의 구현"이지만, 상위 클래스의 독립된 객체를 만드는 것은 그렇지 않기 때문이다.</p>
+<pre class="diagram">package home.device                         package home.lab
+┌─────────────────────────┐                ┌──────────────────────────────────────┐
+│ class Thermostat        │   extends      │ class SmartThermostat                │
+│   protected model       │ ◀───────────── │                                      │
+└─────────────────────────┘                │  this.model            → 허용        │
+                                           │  (SmartThermostat 타입).model → 허용 │
+                                           │  (Thermostat 타입).model     → 오류  │
+                                           └──────────────────────────────────────┘
+판정 기준: 점(.) 앞 표현식의 컴파일 타임 타입이 접근하는 클래스 자신이거나 그 하위 클래스인가</pre>
+
+<h3>클래스 레벨의 접근 제어</h3>
+<p>접근 제어자는 클래스 선언에도 붙는다. 다만 다른 클래스 안에 들어 있지 않은 <b>최상위 클래스</b>(top level class)에 쓸 수 있는 것은 두 가지뿐이다. <code>public</code>을 붙이거나, 아무것도 붙이지 않아 패키지 접근으로 두거나. JLS 7.6은 최상위 클래스 선언에 <code>protected</code>나 <code>private</code>이 있으면 컴파일 오류라고 정한다. 실제로 <code>private class Hidden { }</code>을 컴파일하면 <code>modifier private not allowed here</code> 오류가 난다. 최상위 클래스를 둘러싼 것은 패키지뿐이므로 "이 클래스의 본문 안에서만"이나 "하위 클래스에서만"이라는 범위가 성립하지 않는다.</p>
+<ul>
+<li><b><code>public</code> 클래스</b>: 다른 패키지에서도 쓸 수 있다. 패키지가 바깥에 내놓는 공개 부품이다.</li>
+<li><b>패키지 접근 클래스</b>: 선언된 패키지 안에서만 쓸 수 있다. 패키지 내부의 구현 부품이다.</li>
+</ul>
+<pre><code class="language-java">package home.device;
+
+class Sensor {                 // 패키지 접근 클래스
+    int read() { return 21; }
+}</code></pre>
+<p>다른 패키지에서 이 클래스를 쓰려고 하면 <code>import</code>부터 막힌다. <code>import home.device.Sensor;</code>에 대해 <code>javac</code>는 <code>Sensor is not public in home.device; cannot be accessed from outside package</code> 오류를 낸다. 하위 패키지인 <code>home.device.sub</code>에서 완전한 이름으로 써도 같은 오류다. 앞에서 본 대로 하위 패키지는 접근 제어에서 아무 특권이 없다. 그리고 멤버 접근의 두 조건을 떠올리면, <code>Sensor</code> 안에 <code>public</code> 메서드를 선언해 두어도 다른 패키지에서는 클래스 자체가 보이지 않으므로 그 메서드를 부를 수 없다.</p>
+<h4>public 클래스와 파일 이름</h4>
+<p><code>public</code> 클래스는 클래스 이름과 같은 이름의 소스 파일에 선언해야 한다. <code>public class Right</code>를 <code>Wrong.java</code>에 쓰면 <code>javac</code>는 <code>class Right is public, should be declared in a file named Right.java</code> 오류를 낸다. JLS 7.6은 이것을 패키지를 파일 시스템에 저장하는 구현이 선택적으로 강제할 수 있는 제한으로 설명하며, 그 목적을 컴파일러가 패키지 안에서 이름으로 클래스를 쉽게 찾을 수 있게 하는 것이라고 적는다. 이 제한에서 "소스 파일 하나에 <code>public</code> 최상위 클래스는 최대 하나"라는 규칙이 따라 나온다. 패키지 접근 클래스는 한 파일에 여러 개 있어도 되지만, JLS도 언급하듯 클래스 하나에 파일 하나를 쓰는 것이 일반적인 관행이다.</p>
+<h4>생성자에도 접근 제어자가 붙는다</h4>
+<p>생성자의 접근 수준은 "누가 이 클래스의 객체를 만들 수 있는가"를 정한다. 생성자를 <code>private</code>으로 선언하면 클래스 바깥의 <code>new</code>는 <code>has private access</code> 오류로 막히고, 객체는 그 클래스 안의 코드만 만들 수 있다. JLS 8.8.10은 접근할 수 없는 생성자를 선언해 클래스의 인스턴스화를 막을 수 있다고 설명한다. 4회에서 본 기본 생성자 규칙도 여기에 닿아 있다. 컴파일러가 만드는 기본 생성자는 클래스와 같은 접근 수준을 갖는다. <code>public class</code>의 기본 생성자는 <code>public</code>이고, 패키지 접근 클래스의 기본 생성자는 패키지 접근이다.</p>
+
+<h3>접근 제어는 누가 강제하는가: 컴파일러와 JVM</h3>
+<p>지금까지 본 오류는 모두 컴파일 오류였다. 그러면 접근 제어는 컴파일러만의 검사이고, 컴파일을 통과한 뒤에는 아무 제약이 없을까. 그렇지 않다. 접근 수준은 클래스 파일에 기록되고, JVM이 실행 중에 한 번 더 검사한다.</p>
+<h4>클래스 파일의 access_flags</h4>
+<p><code>javap -p -v home.device.Thermostat</code>으로 필드 정보를 보면 접근 제어자가 플래그 값으로 저장되어 있다.</p>
+<pre data-label="javap -p -v home.device.Thermostat (필드 부분)"><code class="language-text">  private int target;
+    descriptor: I
+    flags: (0x0002) ACC_PRIVATE
+
+  int step;
+    descriptor: I
+    flags: (0x0000)
+
+  protected java.lang.String model;
+    descriptor: Ljava/lang/String;
+    flags: (0x0004) ACC_PROTECTED
+
+  public java.lang.String room;
+    descriptor: Ljava/lang/String;
+    flags: (0x0001) ACC_PUBLIC</code></pre>
+<p>패키지 접근인 <code>step</code>은 세 플래그 가운데 아무것도 켜져 있지 않다. 소스에서 키워드를 적지 않은 것이 클래스 파일에서도 "플래그 없음"으로 표현된다. 클래스 자체의 플래그에도 <code>ACC_PUBLIC</code>이 있어서 <code>public class</code>인지 아닌지가 기록된다.</p>
+<h4>해석 단계의 접근 검사와 IllegalAccessError</h4>
+<p>JVM은 클래스 파일에 완전한 이름으로 적힌 클래스·필드·메서드 참조(심벌릭 참조)를 실제 대상으로 연결하는 <b>해석</b>(resolution) 작업을 한다. JVMS 5.4.4는 이 해석 과정에서 접근 제어가 적용되고, 참조하는 클래스가 대상에 접근할 수 없으면 <code>IllegalAccessError</code>를 던진다고 정한다. 규칙의 내용은 언어의 규칙과 대응한다. 필드나 메서드는 <code>public</code>이거나, <code>protected</code>이면서 참조하는 클래스가 선언 클래스 자신 또는 그 하위 클래스이거나, <code>protected</code> 또는 패키지 접근이면서 같은 런타임 패키지의 클래스에 선언되어 있거나, <code>private</code>이면서 같은 네스트(nest)에 속한 클래스에 선언되어 있을 때 접근 가능하다.</p>
+<p>컴파일러가 이미 검사했는데 JVM의 검사가 실패할 일이 있을까. 클래스들이 <b>따로 컴파일</b>되면 생긴다. 다음 순서로 재현할 수 있다.</p>
+<pre><code class="language-java">// 1단계: 두 클래스를 함께 컴파일한다
+public class Gauge {
+    public int level = 5;
+}
+
+public class Reader {
+    public static void main(String[] args) {
+        Gauge g = new Gauge();
+        System.out.println("객체 생성 완료");
+        System.out.println(g.level);
+    }
+}</code></pre>
+<pre><code class="language-java">// 2단계: Gauge의 필드를 private으로 바꾸고 Gauge.java만 다시 컴파일한다
+public class Gauge {
+    private int level = 5;
+}</code></pre>
+<pre data-label="3단계: 예전에 컴파일한 Reader를 그대로 실행한 결과 (JDK 21)"><code class="language-text">객체 생성 완료
+Exception in thread "main" java.lang.IllegalAccessError: class Reader tried to access private field Gauge.level (Reader and Gauge are in unnamed module of loader 'app')
+	at Reader.main(Reader.java:5)</code></pre>
+<p><code>Reader.class</code>는 <code>level</code>이 <code>public</code>이던 시절에 컴파일되어 <code>Gauge.level</code>을 읽는 명령을 담고 있다. 새 <code>Gauge.class</code>에서 그 필드는 <code>ACC_PRIVATE</code>이다. JVM은 <code>Reader</code>가 그 필드 참조를 해석하는 순간 접근 규칙 위반을 발견하고 오류를 던진다. 컴파일러를 거치지 않은 조합이라도 접근 규칙이 지켜진다는 것을 JVM이 보장하는 것이다.</p>
+<p>출력의 첫 줄 "객체 생성 완료"가 찍힌 뒤에 오류가 난 것도 볼 만하다. JVMS 5.4는 구현이 심벌릭 참조를 실제로 쓰일 때 하나씩 해석하는 지연(lazy) 방식을 택해도 되고 미리 한꺼번에 해석하는 방식을 택해도 된다고 허용한다. 위 결과는 이 실행에서 필드 참조의 해석이 그 필드를 읽는 명령이 처음 실행될 때 일어났음을 보여 준다. 실무에서 이 오류는 대개 라이브러리 버전이 섞였을 때 나타난다. 내 코드는 라이브러리 1.0에 맞춰 컴파일되었는데 실행 시 클래스패스에는 접근 수준이 바뀐 2.0이 올라온 경우다.</p>
+<h4>JVM이 보는 "같은 패키지"와 "같은 클래스"</h4>
+<p>JVM의 규칙은 언어의 규칙과 단위가 조금 다르다. "같은 패키지"는 <b>런타임 패키지</b>(run-time package)로 판단하는데, JVMS 5.3에 따르면 런타임 패키지는 패키지 이름과 그 클래스를 정의한 클래스 로더의 쌍으로 결정된다. 패키지 이름이 같아도 서로 다른 클래스 로더가 정의한 클래스들은 같은 런타임 패키지가 아니어서 서로의 패키지 접근 멤버를 쓸 수 없다. 클래스 로더는 뒤의 강의에서 다루므로 지금은 "JVM에서 패키지의 정체는 이름만이 아니다"라는 것만 기억해 두자.</p>
+<p><code>private</code>의 단위는 네스트다. 언어 규칙에서 <code>private</code> 멤버는 "최상위 클래스의 본문 안"이면 어디서든 접근할 수 있으므로, 클래스 안에 선언한 중첩 클래스와 바깥 클래스는 서로의 <code>private</code> 멤버를 쓸 수 있다. 그런데 중첩 클래스는 별도의 클래스 파일로 컴파일된다. JDK 11의 JEP 181은 이렇게 논리적으로 한 덩어리인 클래스들을 네스트로 묶어, JVM 수준에서도 서로의 <code>private</code> 멤버에 접근할 수 있게 했다. 중첩 클래스는 중급 1편의 주제다.</p>
+<h4>리플렉션과의 관계</h4>
+<p>자바에는 실행 중에 클래스의 구조를 조회하고 필드와 메서드를 이름으로 다루는 리플렉션(reflection) API가 있다. 리플렉션도 기본적으로는 언어의 접근 규칙을 따르지만, <code>setAccessible(true)</code>를 호출하면 그 검사를 끌 수 있다. Javadoc은 이 값이 <code>true</code>이면 리플렉션 객체가 사용될 때 자바 언어의 접근 제어 검사를 억제한다고 설명한다.</p>
+<pre><code class="language-java">import java.lang.reflect.Field;
+
+class Vault {
+    private int secret = 42;
+}
+
+public class Peek {
+    public static void main(String[] args) throws Exception {
+        Vault v = new Vault();
+        Field f = Vault.class.getDeclaredField("secret");
+        try {
+            System.out.println(f.get(v));
+        } catch (IllegalAccessException e) {
+            System.out.println("거부: " + e.getClass().getSimpleName());
+        }
+        f.setAccessible(true);
+        System.out.println(f.get(v));
+
+        Field value = String.class.getDeclaredField("value");
+        try {
+            value.setAccessible(true);
+        } catch (RuntimeException e) {
+            System.out.println("거부: " + e.getClass().getName());
+        }
+    }
+}</code></pre>
+<pre data-label="실행 결과 (JDK 21, 클래스패스에서 실행)"><code class="language-text">거부: IllegalAccessException
+42
+거부: java.lang.reflect.InaccessibleObjectException</code></pre>
+<p>처음에는 리플렉션으로도 <code>private</code> 필드를 읽지 못한다. <code>setAccessible(true)</code>를 부른 뒤에는 읽힌다. 따라서 같은 모듈 안에서 <code>private</code>은 뚫을 수 없는 보안 장벽이 아니다. <code>private</code>이 막는 것은 "실수로, 또는 무심코 내부에 의존하는 일반 코드"이고, 그것만으로도 설계 도구로서의 가치는 충분하다. 프레임워크가 <code>private</code> 필드나 <code>private</code> 생성자를 다룰 수 있는 것도 이 통로가 있어서다. 스프링 프레임워크의 <code>ReflectionUtils.makeAccessible</code>이 바로 필요할 때 <code>setAccessible(true)</code>를 호출해 주는 유틸리티다.</p>
+<p>세 번째 줄은 그 통로에도 한계가 있음을 보여 준다. JDK의 <code>String</code> 클래스 내부 필드에 대해서는 <code>setAccessible(true)</code> 자체가 예외로 거부된다. Javadoc에 따르면 선언 클래스가 다른 모듈에 있고 그 패키지가 호출자의 모듈에 열려(open) 있지 않으면 이 메서드로 <code>private</code> 멤버 접근을 켤 수 없다. JDK 내부 요소에 대한 이 강한 캡슐화는 JDK 16의 JEP 396에서 기본 동작이 되었고, JDK 17의 JEP 403부터는 명령행 옵션 하나로 완화할 수도 없게 되었다. 접근 제어자보다 한 단계 바깥에 모듈이라는 더 단단한 경계가 있는 것이다.</p>
+
+<x-visual id="java-basic-05-access-enforcement" title="접근 제어가 컴파일 타임과 런타임 두 지점에서 검사되는 흐름" kind="흐름 다이어그램" ratio="16:9">
+<x-hint>소스의 접근 제어자가 컴파일러에서 한 번 검사되고 클래스 파일의 플래그로 기록된 뒤, JVM이 심벌릭 참조를 해석할 때 다시 검사되어 위반 시 IllegalAccessError가 난다는 두 단계 구조를 보여 준다.</x-hint>
+<x-prompt>왼쪽에서 오른쪽으로 흐르는 세 단계 파이프라인 다이어그램. 첫 번째 상자 "소스 코드 (.java)" 안에 작은 코드 조각 "private int target;". 오른쪽으로 화살표 "javac". 화살표 위에 방패 모양 아이콘과 라벨 "검사 ① 컴파일 타임", 그 아래 작은 빨간 말풍선 "위반 시 컴파일 오류". 두 번째 상자 "클래스 파일 (.class)" 안에 "flags: ACC_PRIVATE". 오른쪽으로 화살표 "로딩과 링크". 세 번째 상자 "JVM 실행" 안에 "심벌릭 참조 해석". 세 번째 상자 위에 방패 모양 아이콘과 라벨 "검사 ② 런타임(해석 단계)", 그 아래 작은 빨간 말풍선 "위반 시 IllegalAccessError". 다이어그램 아래쪽에 점선으로 그린 우회 화살표가 두 번째 상자 아래에서 시작해 세 번째 상자로 들어가며 라벨 "따로 컴파일된 클래스 파일". 흰 배경, 얇은 선, 파랑과 빨강 두 가지 강조색, 한국어 라벨은 따옴표 안의 문구 그대로.</x-prompt>
+<x-caption>컴파일러의 검사를 거치지 않은 클래스 파일 조합도 JVM의 해석 단계에서 같은 규칙으로 걸러진다.</x-caption>
+</x-visual>
+
+<h3>캡슐화</h3>
+<p><b>캡슐화</b>(encapsulation)는 데이터와 그 데이터를 다루는 메서드를 하나로 묶고, 외부에는 꼭 필요한 것만 내보이며 나머지는 감추는 것이다. 3회에서 "묶는다"를 했고, 이 회차의 접근 제어자가 "감춘다"를 가능하게 한다. 무엇을 감추는가에 대한 기준은 두 가지로 정리할 수 있다.</p>
+<ul>
+<li><b>데이터를 감춘다.</b> 객체의 필드는 불변식의 재료다. 필드가 열려 있으면 불변식을 지킬 책임이 프로그램 전체로 흩어진다. 필드는 <code>private</code>으로 두고 메서드를 통해서만 바뀌게 하는 것이 출발점이다.</li>
+<li><b>내부에서만 쓰는 기능을 감춘다.</b> 공개 메서드를 구현하기 위한 보조 메서드는 외부에서 부를 이유가 없다. 공개된 메서드는 한번 누군가 쓰기 시작하면 바꾸기 어려운 약속이 되므로, 약속할 필요가 없는 것은 <code>private</code>으로 둔다.</li>
+</ul>
+<p>필드가 둘 이상 얽힌 불변식을 가진 예로 보자. 재고는 창고에 있는 수량(<code>onHand</code>)과 주문에 잡혀 있는 수량(<code>reserved</code>)을 갖고, 언제나 <code>0 <= reserved <= onHand</code>여야 한다.</p>
+<pre><code class="language-java">package store.stock;
+
+public class Inventory {
+    private int onHand;     // 창고에 있는 수량
+    private int reserved;   // 주문에 잡힌 수량. 항상 0 <= reserved <= onHand
+
+    public Inventory(int onHand) {
+        if (onHand < 0) {
+            throw new IllegalArgumentException("재고는 음수일 수 없다: " + onHand);
+        }
+        this.onHand = onHand;
+    }
+
+    public boolean reserve(int amount) {
+        if (!isPositive(amount) || amount > available()) {
+            return false;
+        }
+        reserved += amount;
+        return true;
+    }
+
+    public void ship(int amount) {
+        if (!isPositive(amount) || amount > reserved) {
+            throw new IllegalArgumentException("출고할 수 없는 수량: " + amount);
+        }
+        reserved -= amount;
+        onHand -= amount;
+    }
+
+    public int available() {
+        return onHand - reserved;
+    }
+
+    private boolean isPositive(int amount) {
+        return amount > 0;
+    }
+}</code></pre>
+<pre><code class="language-java">package store.app;
+
+import store.stock.Inventory;
+
+public class InventoryMain {
+    public static void main(String[] args) {
+        Inventory inv = new Inventory(10);
+        System.out.println(inv.reserve(4));   // true  (가용 10 → 6)
+        System.out.println(inv.reserve(7));   // false (가용 6보다 많다)
+        inv.ship(3);                          // onHand 7, reserved 1
+        System.out.println(inv.available());  // 6
+    }
+}</code></pre>
+<p>이 클래스가 주는 이점을 두 가지로 나눠 보자.</p>
+<p><b>불변식의 검증 지점이 한정된다.</b> <code>onHand</code>와 <code>reserved</code>를 바꿀 수 있는 코드는 이 파일 안의 생성자와 메서드 두 개뿐이다. "재고가 음수가 되었다"는 버그가 보고되면 살펴볼 곳은 이 클래스 하나다. 필드가 <code>public</code>이었다면 프로그램 전체에서 그 필드에 대입하는 모든 코드가 용의자가 된다. <code>ship</code>이 두 필드를 함께 줄이는 것도 중요하다. 바깥 코드가 <code>reserved</code>만 줄이고 <code>onHand</code>를 잊는 식으로 두 필드의 관계가 어긋날 여지가 없다.</p>
+<p><b>내부 표현을 바꿀 자유가 생긴다.</b> 바깥 코드가 아는 것은 <code>reserve</code>, <code>ship</code>, <code>available</code>이라는 메서드뿐이다. 나중에 <code>reserved</code>를 숫자 하나가 아니라 주문별 예약 목록으로 바꾸더라도, 세 메서드의 시그니처와 의미가 유지되는 한 다른 패키지의 코드는 한 줄도 고칠 필요가 없다. JLS가 접근 제어의 목적으로 말한 "구현의 불필요한 세부 사항에 의존하지 못하게 한다"가 바로 이것이다. 감춘 만큼 나중에 바꿀 수 있다.</p>
+<h4>접근자를 기계적으로 만들면 캡슐화가 아니다</h4>
+<p>필드를 <code>private</code>으로 바꾸고 모든 필드에 값을 읽는 메서드와 값을 넣는 메서드를 <code>public</code>으로 만들어 주면 형식상 <code>private</code>이지만 실질은 필드를 공개한 것과 다르지 않다. <code>setReserved(int)</code>가 아무 검사 없이 값을 대입한다면 불변식은 다시 바깥 코드의 손에 넘어간다. 캡슐화의 기준은 "필드에 <code>private</code>이 붙었는가"가 아니라 "불변식을 깨는 조작이 바깥에서 가능한가"다. 값을 바꾸는 통로는 <code>reserve</code>, <code>ship</code>처럼 의미 있는 동작 단위로 열고, 그 안에서 규칙을 검사한다.</p>
+<p>읽는 쪽에도 함정이 있다. 2회에서 본 대로 참조형 변수에는 참조값이 들어 있다. <code>private</code> 필드가 배열이나 다른 객체를 가리킬 때, 그 참조를 그대로 반환하는 메서드를 열어 두면 바깥 코드는 필드 이름에는 접근하지 못해도 <b>필드가 가리키는 객체</b>는 마음대로 고칠 수 있다. <code>private</code>이 보호하는 것은 변수의 이름이지, 그 변수가 가리키는 힙의 객체가 아니다. 이 문제는 연습 문제에서 직접 추적해 본다.</p>
+<h4>접근 수준을 고르는 순서</h4>
+<p>새 필드나 메서드를 선언할 때는 가장 좁은 수준에서 시작해 필요가 확인될 때만 넓힌다. 좁은 것을 넓히는 일은 기존 코드를 깨지 않지만, 넓게 열었던 것을 좁히면 그것을 쓰던 코드가 깨진다(앞의 <code>IllegalAccessError</code> 실험이 그 예다). 필드는 <code>private</code>, 클래스 안에서만 쓰는 메서드도 <code>private</code>, 같은 패키지의 협력 클래스에만 필요하면 패키지 접근, 패키지 바깥에 약속할 기능만 <code>public</code>으로 둔다. 클래스도 마찬가지로, 패키지 바깥에서 쓸 이유가 없으면 <code>public</code>을 붙이지 않는다.</p>
+
+<h3>다른 주제와의 연결</h3>
+<p>패키지와 접근 제어는 이후의 거의 모든 주제의 배경이 된다. 바로 다음 6회에서는 <code>static</code> 멤버를 단순 이름으로 쓰게 해 주는 <code>import static</code>을 다루는데, 이것도 이 회차에서 본 것과 같은 컴파일 타임의 이름 해석이다. 8회의 상속에서는 <code>protected</code>가 실제로 쓰이는 모습과, 메서드를 오버라이딩할 때 접근 수준을 더 좁힐 수 없다는 규칙을 만난다.</p>
+<p>스프링 부트는 패키지 구조를 직접 이용한다. 스프링 부트 문서는 메인 애플리케이션 클래스를 다른 클래스들보다 위에 있는 루트 패키지에 두기를 권하고, 그 클래스에 붙인 애너테이션이 컴포넌트를 찾기 시작하는 기준 패키지를 암묵적으로 정한다고 설명한다. 같은 문서는 <code>package</code> 선언이 없는 디폴트 패키지의 사용을 피하라고도 적는다. 이 회차에서 본 "이름 없는 패키지는 임시 용도"라는 JLS의 설명과 같은 방향이다.</p>
+<p>JPA 엔티티의 인자 없는 생성자를 <code>public</code> 또는 <code>protected</code>로 선언해야 한다는 명세의 요구는 생성자의 접근 수준 문제다. 애플리케이션 코드가 값 없이 <code>new</code>로 엔티티를 만드는 것은 막고 싶지만 생성자는 있어야 할 때, <code>protected</code>로 선언하는 선택을 이 회차의 규칙으로 읽을 수 있다. 다른 패키지의 일반 코드에서는 <code>new</code>가 컴파일되지 않고, 같은 패키지와 하위 클래스의 생성자에서는 호출할 수 있다.</p>
+<p>마지막으로, <code>ClassNotFoundException</code>, <code>NoClassDefFoundError</code>, <code>IllegalAccessError</code>는 운영 환경에서 실제로 만나는 오류들이다. 셋 다 "완전한 이름으로 클래스를 찾고, 찾은 클래스의 멤버에 접근 규칙을 적용한다"는 이 회차의 흐름 어딘가가 어긋난 것이다. 오류 메시지에 적힌 완전한 이름과 클래스패스를 대조하는 것이 진단의 첫걸음이다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>패키지</dt><dd>클래스 이름의 범위를 나누는 이름공간이자 접근 제어의 경계이며, 클래스 파일의 저장 위치와 묶여 있다. 하위 패키지는 이름의 앞부분이 같을 뿐 상위 패키지와 특별한 관계가 없다.</dd>
+<dt>완전한 이름(FQCN)</dt><dd>패키지 이름과 단순 이름을 점으로 이은 이름. 클래스 파일 안에서 클래스는 항상 완전한 이름으로 기록되고, JVM도 단순 이름이 아니라 완전한 이름으로 클래스를 찾는다.</dd>
+<dt>클래스패스</dt><dd>클래스 파일을 찾기 시작할 디렉터리·JAR의 목록. 클래스패스 항목 아래에서 완전한 이름의 점을 디렉터리 구분자로 바꾼 경로를 찾는다.</dd>
+<dt>import</dt><dd>다른 패키지의 클래스를 단순 이름으로 쓰게 해 주는 컴파일 타임의 이름 해석 규칙. 클래스 파일에 남지 않고, 코드를 포함하거나 클래스를 로딩하지 않는다.</dd>
+<dt>접근 수준 네 가지</dt><dd><code>private</code>(같은 최상위 클래스 본문), 패키지 접근(같은 패키지), <code>protected</code>(같은 패키지 + 다른 패키지의 하위 클래스 본문), <code>public</code>(어디서나). 코드가 적힌 위치와 선언의 제어자로 판정한다.</dd>
+<dt>protected의 조건</dt><dd>다른 패키지의 하위 클래스 S에서 인스턴스 멤버에 접근할 때는 점 앞 표현식의 타입이 S이거나 S의 하위 클래스여야 한다.</dd>
+<dt>클래스 레벨 접근 제어</dt><dd>최상위 클래스는 <code>public</code> 또는 패키지 접근만 가능하다. <code>public</code> 클래스는 같은 이름의 소스 파일에 선언한다.</dd>
+<dt>두 번의 검사</dt><dd>접근 규칙은 컴파일러가 검사하고, 클래스 파일의 플래그로 기록되어 JVM이 해석 단계에서 다시 검사한다. 런타임 위반은 <code>IllegalAccessError</code>다.</dd>
+<dt>캡슐화</dt><dd>데이터와 기능을 묶고 불변식을 깨는 조작이 바깥에서 불가능하도록 감추는 것. 감춘 부분은 외부 코드를 깨지 않고 바꿀 수 있다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 접근 수준은 "지금 누가 쓰는가"보다 "앞으로 무엇을 바꾸고 싶은가"로 정한다. <code>public</code>으로 연 클래스와 메서드는 사용하는 코드가 생기는 순간 약속이 되고, 그 약속을 깨는 변경은 컴파일 오류(같이 빌드되는 코드)나 <code>IllegalAccessError</code>·<code>NoSuchMethodError</code> 같은 링크 오류(따로 배포되는 라이브러리)로 돌아온다. 특히 여러 팀이 쓰는 공용 라이브러리에서는 패키지 접근 클래스로 내부 구현을 감춰 두는 것이 이후 버전에서 구조를 바꿀 수 있는 거의 유일한 여지다. 반대로 한 애플리케이션 안에서만 쓰이고 함께 컴파일되는 코드라면 접근 수준을 넓히는 비용이 작으므로, 처음부터 넓게 열 이유가 없다.</p>
+<p>클래스 관련 오류를 만났을 때는 메시지의 종류로 원인의 층을 가른다. <code>ClassNotFoundException</code>이나 "wrong name"이 붙은 <code>NoClassDefFoundError</code>는 완전한 이름과 클래스패스의 대응 문제다. 실행 명령의 클래스패스, 패키징된 JAR 안의 경로, <code>package</code> 선언을 차례로 확인한다. <code>IllegalAccessError</code>는 이름으로 클래스를 찾는 데는 성공했지만 접근 규칙에서 걸린 것이므로, 컴파일할 때 본 클래스와 실행할 때 로딩된 클래스가 같은 버전인지를 의심한다. 같은 완전한 이름의 클래스가 클래스패스의 여러 JAR에 들어 있으면 어느 쪽이 먼저 발견되느냐에 따라 동작이 달라지므로, 의존 라이브러리의 버전 충돌을 먼저 확인한다.</p>
+<p>캡슐화에 대한 판단이 달라지는 경우도 있다. 단순히 값을 실어 나르는 용도의 객체(요청·응답 데이터, 설정 값 묶음)는 지켜야 할 불변식이 거의 없으므로 모든 값을 읽을 수 있게 여는 것이 자연스럽다. 이런 객체에는 변경 통로를 닫고 읽기만 여는 방식이 잘 맞는다. 반면 상태 변화에 규칙이 있는 객체(재고, 주문 상태, 계좌)에서 값을 그대로 대입하는 공개 메서드가 보인다면, 그 규칙이 호출하는 쪽 코드 여러 곳에 흩어져 있다는 신호로 읽어야 한다.</p>
+</x-review>
+
+<x-practice>
+<li>클래스 <code>com.example.shop.order.OrderMain</code>을 컴파일한 결과물을 <code>build/classes</code> 디렉터리 아래에 두려고 한다. (가) 클래스 파일의 전체 경로를 적어라. (나) 프로젝트 루트에서 이 클래스를 실행하는 <code>java</code> 명령을 적어라. (다) <code>build/classes/com/example/shop/order</code>로 이동해 <code>java OrderMain</code>을 실행하면 어떤 종류의 오류가 나며, 그 이유는 무엇인가.</li>
+<li>본문의 <code>Thermostat</code>(<code>home.device</code> 패키지)에 대해, 다음 다섯 위치의 코드가 <code>target</code>(private), <code>step</code>(패키지 접근), <code>model</code>(protected), <code>room</code>(public) 각각에 접근할 수 있는지 표로 정리하라. (a) <code>Thermostat</code> 자신의 메서드 안에서 다른 <code>Thermostat</code> 객체를 통해, (b) <code>home.device.Panel</code>, (c) <code>home.lab.SmartThermostat extends Thermostat</code>에서 <code>this</code>를 통해, (d) 같은 <code>SmartThermostat</code>에서 <code>Thermostat</code> 타입 매개변수를 통해, (e) <code>home.app.AppMain</code>.</li>
+<li>다음 클래스는 "각 점수는 항상 0~100"이라는 불변식을 지키려고 필드를 <code>private</code>으로 두고 검사하는 메서드를 만들었다. <code>main</code>의 출력 두 줄을 예측하고, 불변식이 깨진 경로를 참조값의 관점에서 설명하라. 그리고 고치는 방법을 한 가지 제시하라.
+<pre><code class="language-java">public class ScoreBoard {
+    private int[] scores = {90, 80, 70};   // 각 점수는 항상 0~100
+
+    public int[] getScores() {
+        return scores;
+    }
+
+    public void setScore(int index, int score) {
+        if (score < 0 || score > 100) {
+            return;
+        }
+        scores[index] = score;
+    }
+
+    public static void main(String[] args) {
+        ScoreBoard board = new ScoreBoard();
+        board.setScore(0, 999);
+        System.out.println(board.getScores()[0]);
+        int[] s = board.getScores();
+        s[0] = 999;
+        System.out.println(board.getScores()[0]);
+    }
+}</code></pre></li>
+<li>어떤 소스 파일의 맨 위에 <code>import java.util.*;</code>와 <code>import java.sql.*;</code>이 있고 본문에서 <code>Date d;</code>를 선언했더니 컴파일 오류가 났다. (가) 오류의 원인을 설명하라. (나) <code>import</code> 한 줄을 추가해 <code>java.util.Date</code>를 쓰도록 고쳐라. (다) 이 수정 전후로, <code>Date</code>를 쓰지 않는 다른 클래스 파일의 내용이 달라지는가.</li>
+<li>라이브러리 1.0의 <code>public class Config</code>에는 <code>public String path;</code> 필드가 있었고, 애플리케이션은 이 필드를 직접 읽도록 컴파일되었다. 라이브러리 2.0에서 이 필드가 <code>private</code>으로 바뀌고 <code>getPath()</code>가 추가되었다. 애플리케이션을 다시 컴파일하지 않고 라이브러리 JAR만 2.0으로 교체해 실행하면 어떤 일이 일어나는가. 언제, 어떤 오류가, 왜 나는지 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1.</b> (가) <code>build/classes/com/example/shop/order/OrderMain.class</code>. 클래스패스 루트 아래에 완전한 이름의 점을 디렉터리 구분자로 바꾼 경로다. (나) <code>java -cp build/classes com.example.shop.order.OrderMain</code>. 인자는 파일 경로가 아니라 완전한 이름이다. (다) <code>NoClassDefFoundError</code>이고 메시지에 <code>wrong name: com/example/shop/order/OrderMain</code>이 붙는다. 클래스패스가 현재 디렉터리이므로 <code>./OrderMain.class</code>를 찾는 데는 성공하지만, 그 파일 안에 기록된 클래스 이름은 <code>com/example/shop/order/OrderMain</code>이어서 요청한 이름 <code>OrderMain</code>과 일치하지 않는다.</p>
+<p><b>2.</b> (a) 넷 모두 가능. <code>private</code>은 같은 최상위 클래스의 본문 안이면 다른 객체의 것이라도 접근할 수 있다. (b) <code>target</code>만 불가, 나머지 셋 가능. 같은 패키지이므로 패키지 접근과 <code>protected</code>가 열려 있다. (c) <code>model</code>과 <code>room</code> 가능, <code>target</code>과 <code>step</code> 불가. 다른 패키지이므로 패키지 접근은 닫혀 있고, <code>protected</code>는 <code>this</code>(타입이 <code>SmartThermostat</code>)를 통하므로 허용된다. (d) <code>room</code>만 가능. 점 앞 표현식의 타입이 <code>Thermostat</code>이어서 <code>SmartThermostat</code> 또는 그 하위 클래스가 아니므로 <code>model</code>에 접근할 수 없다(JLS 6.6.2.1). (e) <code>room</code>만 가능.</p>
+<p><b>3.</b> 출력은 <code>90</code>과 <code>999</code>다. <code>setScore(0, 999)</code>는 검사에 걸려 아무것도 바꾸지 않으므로 첫 줄은 90이다. <code>getScores()</code>는 필드 <code>scores</code>에 든 참조값을 그대로 반환한다. 지역 변수 <code>s</code>와 필드 <code>scores</code>는 힙의 같은 배열을 가리키므로 <code>s[0] = 999</code>는 <code>ScoreBoard</code> 내부의 배열을 직접 고친다. <code>private</code>은 <code>scores</code>라는 이름으로 접근하는 것을 막을 뿐, 그 참조가 가리키는 배열 객체를 보호하지 않는다. 고치는 방법: <code>getScores()</code>가 <code>scores.clone()</code>처럼 복사본을 반환하게 하거나, 배열 전체를 내주는 대신 <code>int getScore(int index)</code>처럼 값 하나를 반환하는 메서드만 제공한다.</p>
+<p><b>4.</b> (가) 두 와일드카드 import가 각각 <code>java.util.Date</code>와 <code>java.sql.Date</code>를 단순 이름 <code>Date</code>로 쓸 수 있게 하므로, <code>Date</code>가 어느 쪽인지 정할 수 없어 <code>reference to Date is ambiguous</code> 오류가 난다. 선언만으로는 오류가 아니고 사용하는 순간 오류가 된다. (나) <code>import java.util.Date;</code>를 추가한다. 단일 타입 import는 와일드카드 import가 들여온 같은 이름을 가리므로 <code>Date</code>는 <code>java.util.Date</code>로 해석된다. (다) 달라지지 않는다. <code>import</code>는 그 선언이 들어 있는 컴파일 단위 안에서만 효력이 있고, 클래스 파일에는 <code>import</code>가 기록되지 않는다.</p>
+<p><b>5.</b> 애플리케이션의 클래스 파일에는 <code>Config.path</code> 필드를 읽는 명령과 그 필드에 대한 심벌릭 참조가 그대로 남아 있다. JVM이 그 참조를 해석할 때(본문의 실험에서는 그 필드를 읽는 코드가 처음 실행될 때) 접근 제어를 적용하는데, 새 <code>Config</code>에서 <code>path</code>는 <code>private</code>이고 애플리케이션 클래스는 <code>Config</code>와 같은 네스트가 아니므로 <code>IllegalAccessError</code>가 던져진다(JVMS 5.4.4). 프로그램 시작 시점이 아니라 해당 코드 경로가 실행될 때 나타날 수 있으므로, 자주 실행되지 않는 경로라면 배포 후 한참 지나 발견될 수 있다. 애플리케이션을 2.0에 맞춰 다시 컴파일하면 이번에는 컴파일 오류로 미리 드러난다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q><code>import java.util.*;</code>를 선언하고 <code>ArrayList</code>만 사용한 클래스를 컴파일했다. 만들어진 클래스 파일에 대한 설명으로 옳은 것은?</q>
+<o><code>java.util</code> 패키지의 모든 클래스 이름이 상수 풀에 기록된다</o>
+<o>import 선언 목록이 클래스 파일의 별도 영역에 저장되어 실행 시 JVM이 참조한다</o>
+<o>실제로 사용한 <code>java/util/ArrayList</code>만 완전한 이름으로 상수 풀에 기록되고, import 선언 자체는 남지 않는다</o>
+<o><code>ArrayList</code>의 바이트코드가 이 클래스 파일 안에 복사되어 들어간다</o>
+<why><code>import</code>는 컴파일러가 단순 이름을 완전한 이름으로 해석하는 데 쓰는 규칙일 뿐이다. 컴파일러는 사용된 클래스의 완전한 이름만 상수 풀에 적고, 클래스 파일 형식에는 import를 기록하는 자리가 없다. 와일드카드라고 해서 패키지 전체가 기록되거나 다른 클래스의 코드가 복사되지 않는다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>out/store/StoreMain.class</code>(완전한 이름 <code>store.StoreMain</code>)가 있다. <code>out/store</code> 디렉터리에서 <code>java StoreMain</code>을 실행하면 <code>wrong name</code> 오류가 나는 이유로 가장 정확한 것은?</q>
+<o>클래스패스에 <code>StoreMain.class</code> 파일이 없어서</o>
+<o>파일은 찾았지만 클래스 파일 안에 기록된 이름 <code>store/StoreMain</code>이 요청한 이름 <code>StoreMain</code>과 달라서</o>
+<o><code>main</code> 메서드가 <code>public</code>이 아니어서</o>
+<o>패키지가 있는 클래스는 JAR로 묶어야만 실행할 수 있어서</o>
+<why>클래스패스가 현재 디렉터리이므로 <code>./StoreMain.class</code>는 발견된다. 그러나 클래스의 완전한 이름은 클래스 파일 내부에 기록되어 있고, JVM은 요청한 이름과 그 이름이 일치하지 않으면 거부한다. 파일이 없는 경우라면 <code>ClassNotFoundException</code>이 원인으로 표시된다. 올바른 실행은 <code>out</code>을 클래스패스로 두고 <code>store.StoreMain</code>을 지정하는 것이다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>패키지 <code>a</code>의 <code>public class Base</code>에 <code>protected int count;</code>가 있다. 패키지 <code>b</code>의 <code>class Derived extends Base</code> 안의 메서드 <code>void f(Base x, Derived y)</code>에서 컴파일되지 않는 것은?</q>
+<o><code>this.count = 1;</code></o>
+<o><code>count = 2;</code></o>
+<o><code>y.count = 3;</code></o>
+<o><code>x.count = 4;</code></o>
+<why>다른 패키지의 하위 클래스에서 <code>protected</code> 인스턴스 멤버에 접근하려면 점 앞 표현식의 타입이 그 하위 클래스 자신이거나 그 하위 클래스의 하위 타입이어야 한다(JLS 6.6.2.1). <code>this</code>와 <code>y</code>는 타입이 <code>Derived</code>이므로 허용되지만, <code>x</code>는 타입이 <code>Base</code>이므로 허용되지 않는다. <code>Derived</code>는 임의의 <code>Base</code> 객체의 구현을 책임지는 클래스가 아니기 때문이다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q><code>private</code> 필드에 대한 설명으로 옳은 것은?</q>
+<o>같은 클래스의 메서드 안에서는 매개변수로 받은 다른 인스턴스의 <code>private</code> 필드도 읽을 수 있다</o>
+<o>객체 자신만 접근할 수 있으므로 같은 클래스의 다른 인스턴스에서는 읽을 수 없다</o>
+<o>컴파일러만 검사하므로, 접근하는 쪽을 다시 컴파일하지 않으면 실행 중에는 아무 제약이 없다</o>
+<o><code>private</code> 필드가 가리키는 배열은 그 참조를 반환하는 메서드가 있어도 바깥에서 수정할 수 없다</o>
+<why><code>private</code>의 범위는 객체가 아니라 그 선언을 둘러싼 최상위 클래스의 본문이다. 접근하는 코드가 같은 클래스 안에 적혀 있으면 어느 인스턴스의 필드든 접근할 수 있다. 접근 규칙은 JVM도 해석 단계에서 검사하므로 위반하면 실행 중에 <code>IllegalAccessError</code>가 난다. <code>private</code>은 변수 이름에 대한 접근을 막을 뿐이어서, 참조를 반환하면 그 참조가 가리키는 객체는 바깥에서 수정할 수 있다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q>패키지 <code>store</code>와 <code>store.order</code>의 관계에 대한 설명으로 옳은 것은?</q>
+<o><code>store.order</code>의 코드는 <code>store</code>의 패키지 접근 클래스를 쓸 수 있다</o>
+<o>이름의 앞부분이 같을 뿐이며, 접근 제어에서 두 패키지는 서로 다른 패키지다</o>
+<o><code>import store.*;</code>는 <code>store.order</code>의 클래스도 함께 들여온다</o>
+<o><code>store.order</code>의 클래스 파일은 <code>store</code> 디렉터리와 무관한 위치에 두어야 한다</o>
+<why>JLS 7.1은 패키지의 계층적 이름 구조가 정리를 위한 관례일 뿐 그 자체로 의미가 없다고 정한다. 하위 패키지의 코드는 상위 패키지의 클래스에 대해 다른 패키지보다 나은 접근 권한을 갖지 않고, 와일드카드 import는 해당 패키지에 직접 선언된 클래스만 대상으로 한다. 저장 위치는 이름을 따라 <code>store/order/</code> 디렉터리가 된다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>패키지(package)</dt><dd>클래스와 인터페이스, 하위 패키지를 멤버로 갖는 이름공간. 접근 제어의 경계이기도 하다.</dd>
+<dt>완전한 이름(fully qualified name, FQCN)</dt><dd>패키지 이름까지 포함한 클래스의 이름. 예: <code>store.order.Item</code>. 클래스 파일 내부에서는 점 대신 슬래시를 쓴 형태로 기록된다.</dd>
+<dt>컴파일 단위(compilation unit)</dt><dd>소스 파일 하나. 패키지 선언, import 선언, 최상위 클래스·인터페이스 선언으로 이루어진다.</dd>
+<dt>클래스패스(class path)</dt><dd>컴파일러와 JVM이 클래스 파일을 찾는 디렉터리, JAR 파일, ZIP 파일의 목록.</dd>
+<dt>이름 없는 패키지(unnamed package)</dt><dd><code>package</code> 선언이 없는 컴파일 단위가 속하는 패키지. 디폴트 패키지라고도 부른다.</dd>
+<dt>접근 제어자(access modifier)</dt><dd>클래스, 필드, 메서드, 생성자에 접근할 수 있는 코드의 범위를 정하는 <code>private</code>, <code>protected</code>, <code>public</code> 키워드. 생략하면 패키지 접근이다.</dd>
+<dt>패키지 접근(package access)</dt><dd>접근 제어자를 적지 않았을 때의 접근 수준. 같은 패키지의 코드에서만 접근할 수 있다.</dd>
+<dt>캡슐화(encapsulation)</dt><dd>데이터와 그것을 다루는 기능을 묶고, 불변식을 지키는 데 필요한 내부를 외부로부터 감추는 것.</dd>
+<dt>해석(resolution)</dt><dd>JVM이 클래스 파일의 심벌릭 참조를 실제 클래스·필드·메서드로 연결하는 작업. 이 과정에서 접근 제어가 적용된다.</dd>
+<dt>런타임 패키지(run-time package)</dt><dd>JVM이 "같은 패키지"를 판단하는 단위. 패키지 이름과 클래스를 정의한 클래스 로더의 쌍으로 결정된다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-7.html">JLS 7장 Packages and Modules</a> — 패키지 멤버(§7.1), 파일 시스템 저장 방식(§7.2), 컴파일 단위와 java.lang 자동 import(§7.3), 이름 없는 패키지(§7.4.2), import 선언(§7.5), 최상위 클래스 선언(§7.6)</li>
+<li><a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-6.html#jls-6.6">JLS §6.6 Access Control</a> — 접근 가능성의 판정 규칙(§6.6.1)과 protected의 세부 규칙(§6.6.2), 완전한 이름의 정의(§6.7)</li>
+<li><a href="https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-5.html#jvms-5.4.4">JVMS §5.4.4 Access Control</a> — 해석 단계의 접근 제어, IllegalAccessError, 네스트</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html">java 명령 문서 (JDK 21)</a> — --class-path 옵션과 기본 클래스패스</li>
+<li><a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/reflect/AccessibleObject.html">AccessibleObject (Java SE 21 API)</a> — setAccessible의 동작과 모듈에 따른 제한</li>
+<li><a href="https://openjdk.org/jeps/403">JEP 403: Strongly Encapsulate JDK Internals</a> — JDK 16(JEP 396)에서 기본 동작이 된 JDK 내부 요소의 강한 캡슐화를 JDK 17부터 명령행 옵션 하나로 완화할 수 없게 한 변경</li>
+</x-refs>
+

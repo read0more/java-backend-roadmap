@@ -1,0 +1,746 @@
+<x-meta>
+deck: 요청 줄 맨 앞의 토큰 하나가 서버·프록시·캐시·클라이언트 라이브러리에 무엇을 약속하는지를 RFC 9110의 정의와 안전·멱등·캐시 가능이라는 세 속성으로 따져 본다.
+minutes: 85
+</x-meta>
+
+<x-goals>
+<li>동사가 섞인 URI 설계를 자원(URI)과 행위(메서드)로 나누어 다시 설계하고, 그렇게 나누면 요청 경로 위의 기계들이 무엇을 판단할 수 있게 되는지 설명한다.</li>
+<li>GET·HEAD·POST·PUT·PATCH·DELETE의 뜻을 RFC 9110과 RFC 5789의 정의에 근거해 구분하고, POST와 PUT, PUT과 PATCH의 차이를 서버 상태의 변화로 보여 준다.</li>
+<li>안전·멱등·캐시 가능의 정의를 말하고, 아홉 개 메서드가 각 속성을 갖는지 표로 채운다.</li>
+<li>응답이 돌아오지 않은 상황을 TCP 연결 수준에서 세 경우로 나누어 그리고, 어떤 요청을 자동으로 다시 보내도 되는지 멱등성으로 판단한다.</li>
+<li>같은 요청을 두 번 보냈을 때 서버 상태와 응답 코드가 각각 어떻게 되는지 메서드별로 예측한다.</li>
+</x-goals>
+
+<x-lecture>
+<h3>연결은 닿았다, 이제 무엇을 하라고 말할 것인가</h3>
+
+<p>02회에서 URI가 "어느 서버의 무엇"을 가리키는 식별자라는 것을, 03회에서 HTTP가 요청과 응답이라는 두 종류의 메시지를 주고받는 무상태 프로토콜이라는 것을 보았다. 요청 메시지의 첫 줄은 <code>GET /notes/1 HTTP/1.1</code>처럼 생겼고, 지금까지는 그 줄의 가운데 조각인 요청 대상에만 관심을 두었다. 이 장은 맨 앞 조각인 메서드(method)를 다룬다.</p>
+
+<p>메서드가 풀어야 하는 문제는 단순하다. URI는 대상을 가리킬 뿐 그 대상을 어떻게 하라는 말은 하지 않는다. 메모 1번을 읽어 달라는 요청과 메모 1번을 지워 달라는 요청은 같은 대상을 향하지만 전혀 다른 요청이다. 이 차이를 메시지의 어딘가에 적어야 하는데 후보는 셋이다. URI 안에 동사를 섞어 넣을 수도 있고, 본문에 적을 수도 있고, 대상과 분리된 별도의 자리를 둘 수도 있다. HTTP는 세 번째를 골랐고 그 자리가 메서드다.</p>
+
+<p>어디에 적든 서버만 알아들으면 되는 것 아니냐고 물을 수 있다. 클라이언트와 서버 둘만 있다면 그렇다. 그러나 요청은 혼자 다니지 않는다. 브라우저, HTTP 클라이언트 라이브러리, 프록시, 로드 밸런서, 캐시, 검색 엔진의 수집기가 요청을 만들거나 중계하거나 대신 보낸다. 이들은 우리 서비스의 API 문서를 읽지 않는다. 그런데도 "이 응답을 저장해 두었다가 다시 써도 되는가", "연결이 끊겼는데 같은 요청을 다시 보내도 되는가", "사용자가 누르기 전에 미리 받아 두어도 되는가"를 스스로 판단해야 한다.</p>
+
+<p>이 판단의 근거가 될 수 있는 것은 표준이 뜻을 정해 둔 부분뿐이다. 그래서 이 장의 질문은 "메서드를 어떻게 쓰는가"보다 한 단계 아래에 있다. 메서드라는 토큰 하나가 요청 경로 위의 모든 참여자에게 무엇을 약속하는가, 그리고 그 약속이 깨지면 어디에서 무슨 일이 벌어지는가다. 먼저 메모를 다루는 작은 API를 설계하면서 메서드가 왜 필요한지 확인하고, 이어서 메서드 각각의 정의를 RFC 9110과 RFC 5789에서 읽은 다음, 마지막으로 안전·멱등·캐시 가능이라는 세 가지 속성을 TCP 연결 수준까지 내려가 따져 본다.</p>
+
+<h3>HTTP API를 만들어 보자: 동사를 URI에서 꺼내기</h3>
+
+<p>메모를 저장하는 서비스가 있고, 다른 프로그램이 쓸 수 있도록 HTTP API를 열어야 한다고 하자. 요구 사항은 다섯 가지다. 메모 목록을 본다, 메모 한 건을 본다, 새 메모를 등록한다, 메모를 고친다, 메모를 지운다. 가장 먼저 떠오르는 설계는 요구 사항의 문장을 그대로 URI로 옮기는 것이다.</p>
+
+<pre data-label="첫 번째 설계: 하려는 일을 URI에 적는다"><code class="language-text">/getNoteList
+/getNote?id=1
+/createNote
+/updateNote?id=1
+/deleteNote?id=1</code></pre>
+
+<p>돌아가게 만들 수는 있다. 그러나 02회에서 정리한 URI의 역할에 비추어 보면 세 군데가 어긋난다. 첫째, <b>같은 대상에 식별자가 여러 개</b>다. 메모 1번은 하나인데 그것을 가리키는 URI가 <code>/getNote?id=1</code>, <code>/updateNote?id=1</code>, <code>/deleteNote?id=1</code> 세 개다. URI는 자원을 식별하라고 있는 것인데 여기서는 "자원에 대해 하려는 일"을 식별하고 있다. 메모 1번을 고쳤을 때 캐시가 버려야 할 응답이 어느 URI의 것인지 기계는 알 수 없다.</p>
+
+<p>둘째, <b>동사의 어휘가 설계자마다 다르다</b>. 등록을 create라고 쓸지 add, register, new라고 쓸지는 팀의 취향이고, 삭제도 delete, remove, erase가 모두 가능하다. 요구 사항이 늘 때마다 URI도 는다. 이 API를 쓰려는 쪽은 문서를 읽고 이름을 외워야 하고, 다른 서비스의 API로 넘어가면 처음부터 다시 외워야 한다.</p>
+
+<p>셋째가 가장 무겁다. <b>중간의 기계들이 요청의 성격을 알 길이 없다</b>. <code>/deleteNote?id=1</code>이 조회인지 삭제인지는 영어 단어를 읽어야 알 수 있고, 프록시와 캐시와 수집기는 영어 단어를 읽지 않는다. 이 URI가 어느 페이지에 링크로 걸려 있으면 수집기는 다른 링크와 똑같이 따라가 볼 것이고, 그 순간 메모가 지워진다.</p>
+
+<h4>자원을 먼저 찾고, 행위는 따로 적는다</h4>
+
+<p>고치는 방법은 URI에서 동사를 걷어 내고 명사만 남기는 것이다. 이 서비스에 있는 자원(resource)은 무엇인가. "메모 조회"나 "메모 등록"은 자원이 아니다. 그것은 자원에 대해 하는 일이다. 식별할 대상은 둘뿐이다. 메모 전체의 모음과, 그 안의 메모 한 건이다.</p>
+
+<ul>
+<li><code>/notes</code> — 메모 모음. 여러 메모를 담고 있는 자원이라는 뜻에서 컬렉션(collection)이라고 부른다.</li>
+<li><code>/notes/{id}</code> — 메모 한 건. <code>{id}</code> 자리에는 메모 번호가 들어간다.</li>
+</ul>
+
+<p>이제 "무엇을 할 것인가"는 URI 바깥, 메서드 자리에 적는다. HTTP는 이 자리에 쓸 동사를 미리 정해 두었다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>하려는 일</th><th>메서드</th><th>요청 대상</th><th>본문에 싣는 것</th></tr></thead><tbody>
+<tr><td>메모 목록을 본다</td><td><code>GET</code></td><td><code>/notes</code></td><td>없음</td></tr>
+<tr><td>메모 한 건을 본다</td><td><code>GET</code></td><td><code>/notes/1</code></td><td>없음</td></tr>
+<tr><td>새 메모를 등록한다(번호는 서버가 정한다)</td><td><code>POST</code></td><td><code>/notes</code></td><td>새 메모의 내용</td></tr>
+<tr><td>메모를 통째로 바꾼다</td><td><code>PUT</code></td><td><code>/notes/1</code></td><td>바뀐 뒤의 메모 전체</td></tr>
+<tr><td>메모의 일부만 고친다</td><td><code>PATCH</code></td><td><code>/notes/1</code></td><td>무엇을 어떻게 바꿀지에 대한 설명</td></tr>
+<tr><td>메모를 지운다</td><td><code>DELETE</code></td><td><code>/notes/1</code></td><td>없음</td></tr>
+</tbody></table></div>
+
+<p>URI는 두 개로 줄었고 동사는 표준 어휘 다섯 개로 고정되었다. 메모 1번의 식별자는 어떤 일을 하든 <code>/notes/1</code> 하나다. 무엇보다 요청의 성격이 메시지의 정해진 자리에 표준 어휘로 적히므로, 우리 API를 처음 보는 기계도 <code>GET</code>이면 읽기이고 <code>DELETE</code>이면 지우기라는 것을 안다. RFC 9110은 서두에서 HTTP가 자원의 종류나 구현 방식과 무관하게 균일한 인터페이스(uniform interface)를 제공한다고 적는데, 그 균일함의 실체가 이것이다. 대상은 얼마든지 늘어나도 대상을 다루는 동작의 종류는 그대로다.</p>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>송장의 주소 칸과 취급 표시 칸</strong><p>택배 송장에는 받는 곳 주소와 별도로 "냉장", "취급 주의" 같은 취급 표시 칸이 있다. 표시의 종류가 몇 가지로 정해져 있어서, 물건이 거쳐 가는 모든 집하장은 보낸 사람의 사정을 몰라도 상자를 어떻게 다뤄야 하는지 안다. URI가 주소 칸이고 메서드가 취급 표시 칸이다. 비유가 깨지는 지점도 있다. 취급 표시는 내용물의 성질을 알려 줄 뿐이지만 메서드는 받는 쪽이 수행할 동작 자체를 지정한다. 그리고 냉장 표시가 붙은 상자에 실제로 무엇이 들었는지 집하장이 확인할 수 없듯, GET이라고 적힌 요청을 받은 서버가 정말 읽기만 하는지는 프로토콜이 강제하지 못한다. 그 약속을 지킬 책임은 서버를 만든 쪽에 있다.</p></aside>
+
+<p>모든 요구 사항이 이 다섯 동사로 깔끔하게 떨어지는 것은 아니다. "지운 메모를 복원한다"나 "메모 전체를 다른 계정으로 옮긴다" 같은 일은 조회·등록·교체·수정·삭제 어느 것에도 딱 맞지 않는다. 그런 경우를 어떻게 설계하는지는 05회의 몫이다. 이 장에서는 동사 각각이 정확히 무엇을 뜻하는지에 집중한다.</p>
+
+<h3>메서드는 메시지의 어디에 있고 누가 읽는가</h3>
+
+<p>HTTP/1.1 요청 메시지의 첫 줄을 요청 줄(request line)이라 하고, RFC 9112는 그 문법을 <code>method SP request-target SP HTTP-version</code>으로 정의한다. SP는 공백 문자 하나다. 서버는 연결에서 바이트를 읽다가 첫 공백을 만나면 그 앞까지를 메서드로, 다음 공백까지를 요청 대상으로 잘라 낸다. 메서드는 메시지 전체에서 가장 먼저 읽히는 조각이다.</p>
+
+<pre data-label="요청 줄의 첫 토큰이 메서드다"><code class="language-http">DELETE /notes/7 HTTP/1.1
+Host: api.example.com
+</code></pre>
+
+<p>메서드는 문법상 토큰(token), 곧 영문자와 숫자와 몇 가지 기호로 이뤄진 문자열일 뿐이다. 여기서 두 가지 성질이 따라 나온다. 하나는 <b>대소문자를 구분한다</b>는 점이다. RFC 9112는 요청 메서드가 대소문자를 구분한다고 명시하고, RFC 9110은 표준 메서드가 관례상 모두 대문자로 정의된다고 적는다. 따라서 <code>get</code>은 <code>GET</code>의 다른 표기가 아니라 서버가 모르는 별개의 메서드다. 헤더 필드 이름이 대소문자를 가리지 않는 것과 대비된다.</p>
+
+<p>다른 하나는 <b>메서드의 집합이 닫혀 있지 않다</b>는 점이다. 문법은 토큰이기만 하면 받아들이므로 새 메서드를 표준에 추가할 수 있다. IANA는 "Hypertext Transfer Protocol (HTTP) Method Registry"라는 등록부를 운영하고, RFC 9110은 메서드를 등록할 때 이름과 함께 안전한지, 멱등인지를 반드시 적도록 한다. 뒤에서 다룰 속성이 부가 설명이 아니라 메서드 정의의 일부라는 뜻이다. PATCH는 RFC 9110이 아닌 별도 문서(RFC 5789)로 정의되어 이 등록부에 올라 있는 메서드다.</p>
+
+<p>HTTP/2와 HTTP/3에는 요청 줄이 없다. 대신 <code>:method</code>라는 유사 헤더 필드(pseudo-header field)에 같은 값을 싣는다. 실어 나르는 형식만 다르고 뜻은 같다. 메서드의 의미는 버전별 문서가 아니라 모든 버전이 공유하는 RFC 9110에 정의되어 있기 때문이다. RFC 9110이 정의하는 메서드는 여덟 개이고, 여기에 RFC 5789의 PATCH를 더한 아홉 개가 이 장의 범위다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>뜻</th><th>정의한 문서</th></tr></thead><tbody>
+<tr><td><code>GET</code></td><td>대상 자원의 현재 표현을 전송해 달라</td><td>RFC 9110 9.3.1</td></tr>
+<tr><td><code>HEAD</code></td><td>GET과 같되 응답 콘텐츠는 보내지 말라</td><td>RFC 9110 9.3.2</td></tr>
+<tr><td><code>POST</code></td><td>요청 콘텐츠를 그 자원 고유의 방식으로 처리해 달라</td><td>RFC 9110 9.3.3</td></tr>
+<tr><td><code>PUT</code></td><td>대상 자원의 현재 표현 전부를 요청 콘텐츠로 교체하라</td><td>RFC 9110 9.3.4</td></tr>
+<tr><td><code>DELETE</code></td><td>대상 자원의 현재 표현 전부를 제거하라</td><td>RFC 9110 9.3.5</td></tr>
+<tr><td><code>CONNECT</code></td><td>대상이 가리키는 서버까지 터널을 열어 달라</td><td>RFC 9110 9.3.6</td></tr>
+<tr><td><code>OPTIONS</code></td><td>대상 자원에 쓸 수 있는 통신 옵션을 알려 달라</td><td>RFC 9110 9.3.7</td></tr>
+<tr><td><code>TRACE</code></td><td>대상까지의 경로를 따라 메시지를 되돌려 보내 달라(루프백 시험)</td><td>RFC 9110 9.3.8</td></tr>
+<tr><td><code>PATCH</code></td><td>요청에 담긴 변경 사항 묶음을 자원에 적용하라</td><td>RFC 5789</td></tr>
+</tbody></table></div>
+
+<p>아래쪽 세 줄은 이 장에서 길게 다루지 않으므로 여기서 한 번만 설명한다. CONNECT는 프록시에게 목적지 서버까지 바이트를 그대로 중계하는 터널을 만들어 달라고 요청하는 메서드이고, 프록시를 거쳐 TLS 연결을 맺을 때 쓰인다. OPTIONS는 자원을 건드리지 않고 그 자원에 어떤 메서드를 쓸 수 있는지를 묻는 데 쓰인다. TRACE는 요청이 중간 장비를 거치며 어떻게 바뀌어 도착하는지 확인하려는 진단용 메서드다.</p>
+
+<p>서버가 이 메서드를 모두 구현해야 하는 것은 아니다. RFC 9110이 범용 서버에 요구하는 것은 GET과 HEAD뿐이고 나머지는 선택이다. 대신 받아들이지 않을 때의 응답이 두 갈래로 정해져 있다. 서버가 알지 못하거나 구현하지 않은 메서드라면 501(Not Implemented)로, 알고 구현도 했지만 그 자원에는 허용하지 않는 메서드라면 405(Method Not Allowed)로 답한다. 405 응답에는 그 자원이 지원하는 메서드를 나열한 <code>Allow</code> 헤더를 반드시 붙여야 한다. 501은 서버에 대한 진술이고 405는 자원에 대한 진술이다.</p>
+
+<h4>메서드를 읽는 다섯 참여자</h4>
+
+<p>메서드를 읽는 것은 서버만이 아니다. 요청이 만들어져 서버에 닿기까지 거치는 참여자마다 같은 토큰을 보고 서로 다른 판단을 내린다. 뒤에서 하나씩 근거를 확인할 내용을 먼저 한자리에 모아 둔다.</p>
+
+<figure class="flow-figure"><figcaption>같은 메서드 토큰을 보고 각 참여자가 내리는 판단</figcaption><ol class="flow">
+<li><strong>사용자 에이전트(브라우저)</strong><span>안전하지 않은 요청이 사용자가 모르는 사이에 나가지 않도록 구분한다. 링크를 미리 받아 둘 때는 안전한 메서드만 쓴다.</span></li>
+<li><strong>HTTP 클라이언트 라이브러리</strong><span>응답을 받기 전에 연결이 끊겼을 때 같은 요청을 자동으로 다시 보낼지를 메서드로 정한다.</span></li>
+<li><strong>프록시·로드 밸런서</strong><span>멱등이 아닌 요청은 자동으로 재시도해서는 안 된다는 규칙을 메서드로 적용한다.</span></li>
+<li><strong>캐시</strong><span>응답을 저장해도 되는 메서드인지 보고, 안전하지 않은 메서드가 성공하면 그 URI로 저장해 둔 응답을 무효화한다.</span></li>
+<li><strong>오리진 서버</strong><span>메서드와 경로의 조합으로 처리할 코드를 고르고, 처리할 수 없으면 501이나 405로 답한다.</span></li>
+</ol></figure>
+
+<aside class="keyidea"><span>이 장의 핵심</span><p>RFC 9110 9.1절은 메서드 토큰이 요청 의미의 일차적 원천(the primary source of request semantics)이라고 적는다. 본문과 헤더는 그 의미를 보충할 뿐이다. 요청 경로 위의 참여자 대부분은 본문을 해석할 수 없으므로, 그들이 기댈 수 있는 것은 표준이 뜻과 속성을 정해 둔 이 토큰 하나다.</p></aside>
+
+<x-visual id="http-04-method-readers" title="요청 줄의 메서드 토큰을 브라우저, 클라이언트 라이브러리, 프록시, 캐시, 오리진 서버가 각각 읽고 서로 다른 판단을 내리는 모습" kind="구조 다이어그램" ratio="16:9">
+<x-hint>메서드 토큰 하나를 요청 경로 위의 다섯 참여자가 저마다 다른 질문에 답하는 데 쓴다는 것을 한 장으로 보여 준다.</x-hint>
+<x-prompt>흰 배경의 가로형 기술 다이어그램. 맨 위 중앙에 고정폭 글꼴로 요청 한 줄 "DELETE /notes/7 HTTP/1.1"을 크게 쓰고, 맨 앞 단어 DELETE만 주황색 둥근 사각형으로 감싼 뒤 그 위에 작은 라벨 "메서드"를 붙인다. 그 아래에 왼쪽에서 오른쪽으로 다섯 개의 둥근 사각형 노드를 한 줄로 놓고 회색 실선 화살표로 차례로 잇는다. 노드 라벨은 순서대로 "브라우저", "클라이언트 라이브러리", "프록시", "캐시", "오리진 서버". 주황색 점선 다섯 가닥이 위의 주황색 사각형에서 각 노드로 내려온다. 각 노드 아래에는 말풍선을 하나씩 두고 순서대로 "사용자에게 확인을 받을까?", "끊기면 다시 보내도 되나?", "재시도가 금지된 요청인가?", "저장해 둔 응답을 버려야 하나?", "어느 코드로 처리할까?"라고 쓴다. 평면적인 선화 스타일, 색은 회색과 주황색 두 가지만 사용.</x-prompt>
+<x-caption>메서드는 서버만 읽지 않는다. 경로 위의 참여자마다 같은 토큰으로 다른 질문에 답한다.</x-caption>
+</x-visual>
+
+<h3>GET과 HEAD: 표현을 가져온다</h3>
+
+<p>메서드의 정의를 읽으려면 표현(representation)이라는 말부터 잡아야 한다. 자원은 "메모 1번"처럼 추상적인 대상이고 그 자체를 네트워크로 보낼 수는 없다. 보낼 수 있는 것은 그 자원의 어느 시점 상태를 특정 형식의 바이트로 옮긴 것과, 그 바이트가 무엇인지 설명하는 메타데이터다. RFC 9110은 이것을 표현이라 부른다. 같은 메모가 JSON으로도 HTML로도 표현될 수 있고, 여러 표현 가운데 무엇이 선택되는지는 07회에서 다룬다. 지금은 HTTP가 주고받는 것이 자원 자체가 아니라 자원의 표현이라는 점만 쥐고 가면 된다.</p>
+
+<p>RFC 9110 9.3.1절은 GET을 대상 자원의 현재 선택된 표현을 전송해 달라는 요청으로 정의하고, GET이 정보를 가져오는 일차적 수단이며 거의 모든 성능 최적화의 초점이라고 덧붙인다. 요청과 응답은 다음과 같은 모양이다.</p>
+
+<pre data-label="요청"><code class="language-http">GET /notes/2 HTTP/1.1
+Host: api.example.com
+Accept: application/json
+</code></pre>
+
+<pre data-label="응답"><code class="language-http">HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 32
+
+{"title":"두유","memo":"2팩"}</code></pre>
+
+<p>정의는 한 줄이지만 거기서 따라 나오는 결과 세 가지는 짚어 둘 만하다.</p>
+
+<p><b>URI는 파일 경로가 아니다.</b> RFC 9110은 자원 식별자를 원격 파일 시스템의 경로로, 표현을 그 파일의 사본으로 생각하고 싶어지지만 실제로는 그런 제한이 없다고 적는다. 서버가 요청마다 데이터베이스를 조회해 표현을 만들어 내든 디스크의 파일을 그대로 읽어 주든, 클라이언트가 볼 수 있는 것은 "이 URI에 GET을 보내면 표현이 온다"는 인터페이스뿐이다. <code>/notes</code>에 대한 GET이 돌려주는 목록도 어딘가에 저장된 파일이 아니라 요청 시점의 상태에서 계산된 표현이다.</p>
+
+<p><b>GET 요청에는 본문을 싣지 않는다.</b> 문법이 금지하는 것은 아니다. 그러나 RFC 9110은 GET 요청으로 받은 콘텐츠에는 일반적으로 정의된 의미가 없고, 요청의 뜻이나 대상을 바꿀 수 없으며, 요청 밀수(request smuggling) 공격의 가능성 때문에 일부 구현은 그런 요청을 거부하고 연결을 닫을 수 있다고 적는다. 그래서 클라이언트는 오리진 서버가 그런 요청을 지원한다고 미리 밝힌 경우가 아니면 GET에 콘텐츠를 만들어 넣지 말아야 한다. 이유는 앞에서 본 구조에 있다. 중간의 참여자는 메서드와 URI만으로 요청을 판단한다. RFC 9111에 따르면 캐시가 저장된 응답을 찾는 키는 최소한 요청 메서드와 대상 URI로 구성되고, GET만 캐시하는 흔한 구현은 URI만을 키로 쓴다. 본문이 결과를 바꿀 수 있다면 캐시는 다른 조건으로 만들어진 응답을 내줄 것이다. 무엇을 가져올지 고르는 정보는 전부 URI, 곧 경로와 쿼리에 있어야 한다.</p>
+
+<p>이 규칙의 실무적 대가는 길이다. RFC 9112는 송신자와 수신자가 최소 8000옥텟 길이의 요청 줄을 지원하도록 권고하고, 서버가 처리하려는 것보다 긴 요청 대상을 받으면 414(URI Too Long)로 답하도록 한다. 검색 조건이 아주 많아 쿼리 문자열이 이 한계에 가까워지는 API는 조회인데도 POST에 본문을 실어 보내는 선택을 하기도 한다. 그 순간 뒤에서 볼 GET의 속성을 모두 잃는다는 것을 알고 해야 하는 선택이다.</p>
+
+<p><b>URI에 적은 것은 기록에 남는다.</b> RFC 9110 17.9절은 URI가 보호하라고 있는 것이 아니라 공유하라고 있는 것이라고 적고, 많은 서버와 프록시와 사용자 에이전트가 대상 URI를 제3자가 볼 수 있는 곳에 기록하거나 표시한다고 경고한다. 서버의 접근 로그, 브라우저의 방문 기록과 북마크가 그런 곳이다. 비밀번호나 인증 토큰을 쿼리에 실으면 안 되는 이유가 이것이다. 흔히 "GET은 주소에 보이니까 위험하고 POST는 본문에 숨기니까 안전하다"고 말하지만, 전송 구간의 도청을 막는 것은 메서드가 아니라 TLS이고 TLS는 URI와 본문을 똑같이 암호화한다. 차이는 전송 중이 아니라 양 끝과 중간 장비가 무엇을 기록으로 남기느냐에 있다.</p>
+
+<h4>HEAD: 본문 없는 GET</h4>
+
+<p>HEAD는 GET과 같되 서버가 응답에 콘텐츠를 보내서는 안 되는 메서드다. 서버는 GET이었다면 보냈을 헤더 필드를 그대로 보내는 것이 권장된다. 그래서 HEAD 응답의 <code>Content-Length</code>는 지금 보내는 본문의 길이(0)가 아니라 GET이었다면 보냈을 본문의 길이를 뜻한다. 자원이 존재하는지, 크기가 얼마인지, 마지막으로 받아 둔 뒤에 바뀌었는지를 본문을 내려받지 않고 확인하는 데 쓴다. 수 기가바이트짜리 파일을 내려받기 전에 크기를 묻는 요청이 전형적인 용도다.</p>
+
+<h3>POST: 자원이 스스로 정한 방식으로 처리한다</h3>
+
+<p>RFC 9110 9.3.3절은 POST를 이렇게 정의한다. 요청에 동봉한 표현을 대상 자원이 자신의 고유한 의미에 따라 처리해 달라는 요청이다. 다른 메서드의 정의와 결이 다르다. GET은 "표현을 달라", PUT은 "이 표현으로 바꿔라", DELETE는 "제거하라"처럼 무슨 일이 일어날지가 메서드에 적혀 있다. POST는 무슨 일이 일어날지를 메서드가 말하지 않고 대상 자원에게 맡긴다. <code>POST /notes</code>가 "메모를 하나 추가한다"는 뜻인 것은 HTTP가 그렇게 정해서가 아니라 <code>/notes</code>라는 자원이 자신에게 온 POST를 그렇게 처리하기로 했기 때문이다.</p>
+
+<p>RFC는 POST가 쓰이는 기능의 예로 네 가지를 든다.</p>
+
+<ul>
+<li>HTML 폼에 입력한 필드처럼 데이터 한 덩어리를 데이터 처리 프로세스에 넘기는 것</li>
+<li>게시판, 메일링 리스트, 블로그 같은 글 모음에 메시지를 올리는 것</li>
+<li>오리진 서버가 아직 식별자를 정하지 않은 새 자원을 만드는 것</li>
+<li>자원의 기존 표현에 데이터를 덧붙이는 것</li>
+</ul>
+
+<p>세 번째가 메모 API의 "등록"이다. 핵심은 "아직 식별자가 정해지지 않은"이라는 구절이다. 클라이언트는 새 메모가 몇 번이 될지 모른다. 그래서 새 메모의 URI가 아니라 메모 모음의 URI에 요청을 보내고, 번호는 서버가 정한다. RFC는 POST를 처리한 결과로 자원이 만들어졌다면 서버가 201(Created) 응답을 보내고 <code>Location</code> 헤더에 만들어진 자원의 식별자를 담도록 권고한다. 클라이언트는 이 헤더를 읽고서야 방금 만든 메모의 주소를 알게 된다.</p>
+
+<pre data-label="요청"><code class="language-http">POST /notes HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+Content-Length: 32
+
+{"title":"우유","memo":"2팩"}</code></pre>
+
+<pre data-label="응답"><code class="language-http">HTTP/1.1 201 Created
+Location: /notes/1
+</code></pre>
+
+<p>이 요청을 똑같이 한 번 더 보내면 어떻게 되는가. 서버는 두 번째 요청을 받고 새 번호를 하나 더 발급해 <code>/notes/2</code>를 만든다. 내용이 같은 메모가 두 건 생긴다. 서버 쪽에서 보면 "같은 내용의 메모를 두 개 만들고 싶은 사용자"와 "같은 요청이 어쩌다 두 번 도착한 상황"을 메시지만으로는 구별할 수 없다. 이 성질이 뒤에서 다룰 멱등성의 반대편이다.</p>
+
+<p>POST의 처리 결과가 이미 존재하는 다른 자원의 표현과 같다면, 서버는 303(See Other)과 <code>Location</code>으로 그 자원을 가리켜 사용자 에이전트를 그쪽으로 보낼 수 있다. 응답 코드 각각의 의미는 06회에서 다룬다.</p>
+
+<p>정리하면 POST는 가장 제약이 적은 메서드다. 서버가 번호를 정하는 등록, 단순한 데이터 변경으로 끝나지 않는 처리 요청, 다른 메서드의 정의에 맞지 않는 모든 동작이 POST로 온다. 제약이 적다는 것은 보장도 적다는 뜻이다. 중간의 참여자는 POST 요청이 무엇을 하는지 전혀 가정할 수 없으므로 가장 보수적으로 다룬다. 저장하지 않고, 미리 보내지 않고, 끊겼다고 다시 보내지 않는다.</p>
+
+<h3>PUT: 그 자리에 통째로 놓는다</h3>
+
+<p>RFC 9110 9.3.4절의 정의는 이렇다. PUT은 대상 자원의 상태를, 요청 메시지 콘텐츠에 동봉한 표현이 정의하는 상태로 생성하거나 교체해 달라는 요청이다. 이 한 문장에 PUT의 성질 두 가지가 들어 있다.</p>
+
+<p>첫째, <b>대상은 만들거나 바꿀 바로 그 자원</b>이다. <code>PUT /notes/7</code>은 "<code>/notes/7</code>이라는 자리에 이 표현을 놓아라"는 뜻이다. 그 자리에 아무것도 없었다면 새로 만들어지고, 이미 있었다면 교체된다. 클라이언트가 자원의 URI를 알고 지정한다는 점이 POST와 다르다. RFC는 두 메서드의 근본적인 차이가 동봉한 표현에 대한 의도의 차이에 있다고 정리한다. POST에서 대상 자원은 받은 표현을 자기 방식대로 처리하는 주체이고, PUT에서 동봉한 표현은 대상 자원의 상태를 대체하는 것으로 정의된다.</p>
+
+<p>둘째, <b>교체는 전체 교체</b>다. 동봉한 표현이 곧 새 상태이므로 표현에 없는 것은 새 상태에도 없다. 제목과 본문이 있는 메모에 제목만 담은 표현을 PUT으로 보내면 본문은 사라진다. 일부만 고치고 싶다면 PUT은 맞는 도구가 아니다. RFC 9110은 일부 오리진 서버가 <code>Content-Range</code> 헤더를 요청 수정자로 써서 부분 PUT을 지원한다고 언급하지만, 이는 일반적으로 기대할 수 있는 동작이 아니다. 부분 수정에는 다음 절의 PATCH를 쓰거나, 고치려는 부분에 별도의 URI를 주어 그 자원을 PUT으로 교체한다.</p>
+
+<p>응답 코드도 정해져 있다. 대상 자원에 현재 표현이 없었고 PUT이 그것을 성공적으로 만들었다면 서버는 201(Created)을 보내야 한다. 현재 표현이 있었고 성공적으로 수정했다면 200(OK)이나 204(No Content) 중 하나를 보내야 한다. 클라이언트는 응답 코드만 보고도 새로 만들어졌는지 교체되었는지를 구별할 수 있다.</p>
+
+<pre data-label="요청"><code class="language-http">PUT /notes/7 HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+Content-Length: 32
+
+{"title":"회의","memo":"3시"}</code></pre>
+
+<aside class="analogy"><span>일상에서 가져온 비유</span><strong>번호가 붙은 사물함과 접수 창구</strong><p>PUT은 번호가 붙은 사물함 칸에 상자를 넣는 일이다. 칸이 비어 있으면 채우고, 상자가 이미 있으면 꺼내고 새 상자를 넣는다. 같은 상자를 몇 번 넣어도 그 칸에는 그 상자 하나가 있을 뿐이다. POST는 접수 창구에 상자를 맡기는 일이다. 어느 칸에 넣을지는 창구가 정하고, 맡길 때마다 새 칸이 배정된다. 비유가 깨지는 지점은 서버가 수동적인 사물함이 아니라는 데 있다. 서버는 받은 표현이 그 자원의 제약에 맞는지 검사해 거절할 수 있고, 저장하면서 형식을 바꿀 수도 있으며, PUT 하나가 다른 자원의 상태에 영향을 줄 수도 있다.</p></aside>
+
+<p>PUT으로 자원을 만들 수 있으려면 클라이언트가 식별자를 정할 수 있어야 한다. 파일 이름을 사용자가 정하는 저장소나, 클라이언트가 고유한 식별자를 스스로 만들어 쓰는 시스템이 그런 경우다. 서버가 일련번호를 발급하는 구조에서는 클라이언트가 번호를 알 수 없으므로 생성은 POST가, 이미 번호를 아는 자원의 교체는 PUT이 맡게 된다. "POST는 생성, PUT은 수정"이라는 흔한 요약은 이 구조에서 나온 결과이지 정의가 아니다.</p>
+
+<h3>PATCH: 바꿀 부분만 설명한다</h3>
+
+<p>PUT으로 메모의 제목 한 줄을 고치려면 클라이언트는 메모 전체를 보내야 한다. 표현이 크면 전송량이 아깝고, 더 큰 문제는 전체를 보내려면 전체를 알고 있어야 한다는 점이다. 클라이언트는 먼저 GET으로 메모를 받아 제목만 바꾼 뒤 PUT으로 되돌려 보내는데, 그 사이에 다른 클라이언트가 본문을 고쳤다면 내가 보낸 예전 본문이 그것을 덮어쓴다. 바꾸려는 부분만 지목할 수단이 필요하다.</p>
+
+<p>그 수단이 RFC 5789가 정의한 PATCH다. PATCH는 요청에 담긴 변경 사항 묶음을 대상 자원에 적용해 달라는 요청이다. RFC 5789는 PUT과의 차이를 이렇게 설명한다. PUT에서 동봉한 것은 자원의 수정된 버전이고 클라이언트는 저장된 버전을 그것으로 교체해 달라고 요청한다. PATCH에서 동봉한 것은 현재 서버에 있는 자원을 어떻게 고쳐 새 버전을 만들지 설명하는 지시의 묶음이다. PUT의 본문은 <b>결과</b>이고 PATCH의 본문은 <b>방법</b>이다.</p>
+
+<p>이 지시의 묶음을 패치 문서(patch document)라 하고, 그 형식은 미디어 타입으로 구별한다. 같은 PATCH 요청이라도 <code>Content-Type</code>이 무엇이냐에 따라 본문을 해석하는 규칙이 달라진다는 뜻이다. JSON 자원에 대해서는 표준화된 형식이 둘 있다.</p>
+
+<h4>JSON 병합 패치(RFC 7396)</h4>
+
+<p>미디어 타입은 <code>application/merge-patch+json</code>이다. 패치 문서는 바꾸려는 부분만 담은 JSON이고, 서버는 그것을 원본에 겹쳐 놓는다. 패치에 없는 멤버는 원본에 그대로 남고, 값이 <code>null</code>인 멤버는 원본에서 제거된다. 그 밖의 멤버는 값이 객체이면 같은 규칙을 그 안쪽에 다시 적용하고, 객체가 아니면 원본의 값을 대체한다. RFC 7396이 드는 예가 규칙 전부를 보여 준다.</p>
+
+<pre data-label="JSON 병합 패치의 적용"><code class="language-text">원본   {"a":"b", "c":{"d":"e", "f":"g"}}
+패치   {"a":"z", "c":{"f":null}}
+결과   {"a":"z", "c":{"d":"e"}}</code></pre>
+
+<p><code>a</code>는 새 값으로 바뀌었고, <code>c</code> 안의 <code>d</code>는 패치에 언급되지 않아 남았으며, <code>f</code>는 <code>null</code>이라 제거되었다. 형식이 직관적인 대신 한계가 둘 있다. <code>null</code>이 "제거"의 뜻으로 쓰이므로 어떤 값을 <code>null</code>로 설정할 방법이 없다. 그리고 객체가 아닌 대상은 부분적으로 고칠 수 없어서, 배열은 원소 하나만 바꾸려 해도 배열 전체를 새로 보내 통째로 대체해야 한다.</p>
+
+<h4>JSON 패치(RFC 6902)</h4>
+
+<p>미디어 타입은 <code>application/json-patch+json</code>이다. 패치 문서는 연산의 배열이고, 각 연산은 <code>op</code> 멤버에 <code>add</code>, <code>remove</code>, <code>replace</code>, <code>move</code>, <code>copy</code>, <code>test</code> 가운데 하나를 적는다. 연산은 배열에 적힌 순서대로 적용된다.</p>
+
+<pre><code class="language-json">[
+  {"op": "test",    "path": "/title",  "value": "우유"},
+  {"op": "replace", "path": "/title",  "value": "두유"},
+  {"op": "add",     "path": "/tags/-", "value": "장보기"}
+]</code></pre>
+
+<p>첫 연산 <code>test</code>는 지정한 위치의 값이 주어진 값과 같은지 검사한다. 제목이 여전히 "우유"일 때만 뒤의 연산을 진행하라는 조건이다. 둘째 연산은 제목을 바꾸고, 셋째 연산은 경로 끝의 <code>-</code>를 써서 <code>tags</code> 배열의 끝에 원소를 덧붙인다. 연산 가운데 하나라도 실패하면 패치 전체가 성공하지 못한 것으로 처리된다.</p>
+
+<p>이 "전부 아니면 전무"는 패치 형식이 아니라 PATCH 메서드 자체의 요구다. RFC 5789는 서버가 변경 묶음 전체를 원자적으로 적용해야 하고, 적용 도중에 들어온 GET에 부분적으로 수정된 표현을 내주어서는 안 된다고 규정한다. 서버가 지원하는 패치 형식은 <code>Accept-Patch</code> 응답 헤더로 알리고, 지원하지 않는 형식의 패치 문서에는 415(Unsupported Media Type)로, 형식은 이해했지만 적용할 수 없는 패치 문서에는 422나 409 같은 코드로 답할 수 있다.</p>
+
+<p>PATCH에서 놓치기 쉬운 점은 속성이다. RFC 5789는 PATCH가 안전하지도 멱등이지도 않다고 정의한다. 위 예의 셋째 연산을 보면 이유가 드러난다. 같은 패치를 두 번 적용하면 태그가 두 개 덧붙는다. 한편 같은 RFC는 PATCH 요청을 멱등이 되도록 만들어 보낼 수 있다고도 적는다. 제목을 "두유"로 바꾸는 병합 패치는 몇 번을 적용해도 결과가 같다. 그렇다면 왜 메서드 전체가 멱등이 아닌 것으로 등록되어 있는가. 속성은 개별 요청이 아니라 메서드에 붙기 때문이다. 중간의 참여자는 본문의 패치 문서를 해석하지 못하므로, 멱등이 아닐 수 있는 요청이 하나라도 가능한 메서드는 멱등이 아닌 것으로 취급할 수밖에 없다.</p>
+
+<h3>DELETE: 자원과 그 기능의 연결을 끊는다</h3>
+
+<p>RFC 9110 9.3.5절은 DELETE를 조심스럽게 정의한다. 오리진 서버가 대상 자원과 그 현재 기능 사이의 연결을 제거해 달라는 요청이다. "데이터를 지워 달라"가 아니다. RFC는 이 메서드가 유닉스의 <code>rm</code> 명령과 비슷하다고 설명한다. <code>rm</code>이 하는 일은 이름과 파일 내용 사이의 연결을 끊는 것이고, DELETE도 오리진 서버의 URI 매핑에 대한 삭제를 표현할 뿐 그 뒤에 있던 정보가 실제로 삭제되기를 기대하는 것은 아니다.</p>
+
+<p>이 정의 덕분에 서버의 구현 선택이 넓어진다. 행을 물리적으로 지워도 되고, 삭제 표시만 해 두어도 되고, 보관소로 옮겨도 된다. 클라이언트에게 보장되는 것은 DELETE가 성공한 뒤에는 그 URI가 더 이상 예전의 자원으로 동작하지 않는다는 점뿐이다. 응답 코드는 세 가지가 권고된다. 동작이 성공할 가능성이 높지만 아직 실행되지 않았다면 202(Accepted), 실행되었고 더 보낼 정보가 없다면 204(No Content), 실행되었고 응답에 상태를 설명하는 표현을 담는다면 200(OK)이다. GET과 마찬가지로 DELETE 요청의 콘텐츠에도 일반적으로 정의된 의미가 없다.</p>
+
+<p>이미 지워진 자원에 DELETE를 한 번 더 보내면 대개 404(Not Found)가 돌아온다. 첫 번째 응답과 두 번째 응답이 다르지만 서버의 상태는 한 번 보냈을 때와 같다. 이 차이가 멱등의 정의를 읽을 때 중요해진다.</p>
+
+<h3>직접 확인: JDK만으로 메모 API를 돌려 보기</h3>
+
+<p>지금까지의 정의를 실제 메시지 교환으로 확인해 보자. 외부 라이브러리 없이 JDK에 들어 있는 <code>com.sun.net.httpserver.HttpServer</code>로 서버를, <code>java.net.http.HttpClient</code>로 클라이언트를 만든다. 프레임워크가 메서드에 따라 코드를 골라 주는 일을 여기서는 <code>switch</code> 문이 드러내 놓고 한다. 예제의 목적은 서버 작성법이 아니라 같은 요청을 반복했을 때 서버 상태가 어떻게 변하는지를 관찰하는 것이다.</p>
+
+<pre data-label="NoteApi.java"><code class="language-java">import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpRequest.BodyPublishers;
+import java.net.http.HttpResponse;
+import java.net.http.HttpResponse.BodyHandlers;
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.StringJoiner;
+import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class NoteApi {
+    // 서버가 가진 자원의 상태: 메모 번호 -> (필드 이름 -> 값)
+    static final Map<Integer, Map<String, String>> notes = new TreeMap<>();
+    static int nextId = 1;
+    static final Set<String> IMPLEMENTED = Set.of("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE");
+
+    static synchronized void handle(HttpExchange ex) throws IOException {
+        String method = ex.getRequestMethod();
+        String path = ex.getRequestURI().getPath();
+        String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        if (!IMPLEMENTED.contains(method)) {               // 서버가 구현하지 않은 메서드
+            send(ex, 501, "");
+            return;
+        }
+
+        if (path.equals("/notes")) {                       // 컬렉션 자원
+            switch (method) {
+                case "GET", "HEAD" -> send(ex, 200, notes.keySet().toString());
+                case "POST" -> {                           // 새 번호는 서버가 정한다
+                    int id = nextId++;
+                    notes.put(id, parse(body));
+                    ex.getResponseHeaders().set("Location", "/notes/" + id);
+                    send(ex, 201, "");
+                }
+                default -> notAllowed(ex, "GET, HEAD, POST");
+            }
+            return;
+        }
+
+        int id = Integer.parseInt(path.substring("/notes/".length()));   // 개별 자원
+        Map<String, String> current = notes.get(id);
+        switch (method) {
+            case "GET", "HEAD" -> send(ex, current == null ? 404 : 200,
+                                       current == null ? "" : toJson(current));
+            case "PUT" -> {                                // 받은 표현으로 통째로 갈아 끼운다
+                notes.put(id, parse(body));
+                send(ex, current == null ? 201 : 204, "");
+            }
+            case "PATCH" -> {                              // 보낸 필드만 덮어쓴다
+                if (current == null) { send(ex, 404, ""); return; }
+                current.putAll(parse(body));
+                send(ex, 204, "");
+            }
+            case "DELETE" -> send(ex, notes.remove(id) == null ? 404 : 204, "");
+            default -> notAllowed(ex, "GET, HEAD, PUT, PATCH, DELETE");
+        }
+    }
+
+    static void notAllowed(HttpExchange ex, String allow) throws IOException {
+        ex.getResponseHeaders().set("Allow", allow);       // 이 자원이 허용하는 메서드 목록
+        send(ex, 405, "");
+    }
+
+    static void send(HttpExchange ex, int status, String text) throws IOException {
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        if (ex.getRequestMethod().equals("HEAD")) {        // 헤더는 GET과 같게, 본문은 보내지 않는다
+            ex.getResponseHeaders().set("Content-Length", String.valueOf(bytes.length));
+            ex.sendResponseHeaders(status, -1);
+        } else if (bytes.length == 0) {
+            ex.sendResponseHeaders(status, -1);
+        } else {
+            ex.sendResponseHeaders(status, bytes.length);
+            ex.getResponseBody().write(bytes);
+        }
+        ex.close();
+    }
+
+    // 예제용 최소 파서: {"이름":"값", ...} 꼴의 평평한 JSON만 읽는다
+    static Map<String, String> parse(String json) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        Matcher m = Pattern.compile("\"(\\w+)\"\\s*:\\s*\"([^\"]*)\"").matcher(json);
+        while (m.find()) fields.put(m.group(1), m.group(2));
+        return fields;
+    }
+
+    static String toJson(Map<String, String> fields) {
+        StringJoiner j = new StringJoiner(",", "{", "}");
+        fields.forEach((k, v) -> j.add("\"" + k + "\":\"" + v + "\""));
+        return j.toString();
+    }
+
+    static final HttpClient client = HttpClient.newHttpClient();
+    static String base;
+
+    static void call(String method, String path, String body) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(URI.create(base + path))
+                .method(method, body == null ? BodyPublishers.noBody() : BodyPublishers.ofString(body))
+                .build();
+        HttpResponse<String> res = client.send(request, BodyHandlers.ofString());
+        StringBuilder line = new StringBuilder(method + " " + path + " -> " + res.statusCode());
+        for (String name : method.equals("HEAD") ? new String[] {"Content-Length"}
+                                                 : new String[] {"Location", "Allow"}) {
+            res.headers().firstValue(name).ifPresent(v -> line.append(" | " + name + ": " + v));
+        }
+        if (!res.body().isEmpty()) line.append(" | ").append(res.body());
+        System.out.println(line);
+    }
+
+    public static void main(String[] args) throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/notes", NoteApi::handle);
+        server.start();
+        base = "http://127.0.0.1:" + server.getAddress().getPort();
+
+        String milk = "{\"title\":\"우유\",\"memo\":\"2팩\"}";
+        call("POST", "/notes", milk);                      // ①
+        call("POST", "/notes", milk);                      // ② 같은 요청을 한 번 더
+        call("GET", "/notes", null);
+
+        String meeting = "{\"title\":\"회의\",\"memo\":\"3시\"}";
+        call("PUT", "/notes/7", meeting);                  // ③
+        call("PUT", "/notes/7", meeting);                  // ④ 같은 요청을 한 번 더
+        call("GET", "/notes", null);
+
+        String onlyTitle = "{\"title\":\"두유\"}";
+        call("PUT", "/notes/1", onlyTitle);                // ⑤ 제목만 담은 PUT
+        call("GET", "/notes/1", null);
+        call("PATCH", "/notes/2", onlyTitle);              // ⑥ 제목만 담은 PATCH
+        call("GET", "/notes/2", null);
+
+        call("DELETE", "/notes/7", null);                  // ⑦
+        call("DELETE", "/notes/7", null);                  // ⑧ 같은 요청을 한 번 더
+        call("HEAD", "/notes/2", null);                    // ⑨
+        call("DELETE", "/notes", null);                    // ⑩ 컬렉션에는 허용하지 않은 메서드
+        call("get", "/notes", null);                       // ⑪ 소문자 메서드
+        call("GET", "/notes", null);
+        server.stop(0);
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">POST /notes -> 201 | Location: /notes/1
+POST /notes -> 201 | Location: /notes/2
+GET /notes -> 200 | [1, 2]
+PUT /notes/7 -> 201
+PUT /notes/7 -> 204
+GET /notes -> 200 | [1, 2, 7]
+PUT /notes/1 -> 204
+GET /notes/1 -> 200 | {"title":"두유"}
+PATCH /notes/2 -> 204
+GET /notes/2 -> 200 | {"title":"두유","memo":"2팩"}
+DELETE /notes/7 -> 204
+DELETE /notes/7 -> 404
+HEAD /notes/2 -> 200 | Content-Length: 32
+DELETE /notes -> 405 | Allow: GET, HEAD, POST
+get /notes -> 501
+GET /notes -> 200 | [1, 2]</code></pre>
+
+<p>출력의 각 줄을 서버 상태의 변화와 나란히 놓으면 메서드의 정의가 그대로 보인다.</p>
+
+<pre class="diagram">단계  요청                             응답                         요청 뒤 서버 상태
+ ①   POST /notes  {우유, 2팩}          201  Location: /notes/1      1={우유, 2팩}
+ ②   POST /notes  {우유, 2팩}          201  Location: /notes/2      1={우유, 2팩}  2={우유, 2팩}
+ ③   PUT /notes/7 {회의, 3시}          201                          1, 2, 7={회의, 3시}
+ ④   PUT /notes/7 {회의, 3시}          204                          ③ 뒤와 같다
+ ⑤   PUT /notes/1 {title:두유}         204                          1={title:두유}             ← memo가 사라졌다
+ ⑥   PATCH /notes/2 {title:두유}       204                          2={title:두유, memo:2팩}    ← memo가 남았다
+ ⑦   DELETE /notes/7                   204                          1, 2
+ ⑧   DELETE /notes/7                   404                          ⑦ 뒤와 같다
+ ⑨   HEAD /notes/2                     200  Content-Length: 32      변화 없음 (응답 본문도 없음)
+ ⑩   DELETE /notes                     405  Allow: GET, HEAD, POST  변화 없음
+ ⑪   get /notes                        501                          변화 없음</pre>
+
+<p><b>①과 ②</b>는 바이트 하나 다르지 않은 요청인데 서버는 자원을 둘 만들었다. 한 번 보냈을 때의 상태와 두 번 보냈을 때의 상태가 다르다. <b>③과 ④</b>도 같은 요청의 반복이지만 결과는 다르다. 첫 번째는 없던 자리에 표현을 놓았으므로 201, 두 번째는 있던 것을 같은 내용으로 교체했으므로 204다. 응답 코드는 달라졌지만 서버에는 7번 메모가 하나 있을 뿐이고 그 내용도 같다.</p>
+
+<p><b>⑤와 ⑥</b>은 같은 본문 <code>{"title":"두유"}</code>를 메서드만 바꿔 보낸 것이다. PUT을 받은 1번 메모는 본문이 곧 새 상태이므로 <code>memo</code> 필드가 없어졌다. PATCH를 받은 2번 메모는 보낸 필드만 덮어써서 <code>memo</code>가 남았다. 덧붙여 둘 것이 있다. 이 예제 서버는 PATCH 본문의 미디어 타입을 확인하지 않고 "보낸 필드만 덮어쓰기"로 해석한다. 병합 패치와 닮았지만 표준 형식을 구현한 것은 아니고, 실제 서버라면 지원하는 패치 형식을 정해 두고 그 밖의 형식에는 415로 답해야 한다.</p>
+
+<p><b>⑦과 ⑧</b>에서 두 번째 DELETE는 404를 받았다. 지울 것이 없었기 때문이다. 그래도 서버 상태는 한 번 지웠을 때와 같다. <b>⑨</b>의 HEAD 응답에는 본문이 없는데 <code>Content-Length</code>는 32다. GET이었다면 보냈을 표현의 바이트 수다. <b>⑩</b>은 서버가 DELETE를 구현했지만 컬렉션 자원에는 허용하지 않은 경우이고, 응답의 <code>Allow</code> 헤더가 이 자원에 쓸 수 있는 메서드를 알려 준다. <b>⑪</b>은 메서드가 대소문자를 구분한다는 것을 보여 준다. 서버는 <code>get</code>이라는 메서드를 알지 못하므로 501로 답했다.</p>
+
+<aside class="note">예제는 관찰을 쉽게 하려고 두 가지를 단순화했다. 번호를 서버가 발급하는 POST와 클라이언트가 지정하는 PUT 생성을 한 서버에 섞어 두었는데, 실제 서비스에서는 식별자를 누가 정하는지를 한쪽으로 정해 두어야 번호가 충돌하지 않는다. 또 201 응답에 본문을 싣지 않았는데, RFC 9110은 만들어진 자원을 가리키며 요청의 처리 상태를 설명하는 표현을 함께 보내도록 권고한다.</aside>
+
+<x-visual id="http-04-put-vs-patch" title="제목만 담은 같은 본문을 PUT으로 보냈을 때와 PATCH로 보냈을 때 서버에 남는 메모 상태의 차이" kind="비교 다이어그램" ratio="16:9">
+<x-hint>PUT은 본문이 곧 새 상태라서 빠진 필드가 사라지고, PATCH는 지목한 필드만 바뀐다는 것을 전후 상태 카드로 대비한다.</x-hint>
+<x-prompt>흰 배경의 좌우 대칭 비교 다이어그램. 맨 위 중앙에 메모 카드 하나를 그리고 카드 제목을 "요청 전"이라 쓴다. 카드 안에는 두 줄 "title: 우유", "memo: 2팩". 그 아래 중앙에 작은 봉투 아이콘과 라벨 "본문에는 title: 두유 한 줄만"을 둔다. 봉투에서 왼쪽 아래와 오른쪽 아래로 굵은 화살표 두 개가 갈라진다. 왼쪽 화살표에는 파란색 라벨 "PUT", 오른쪽 화살표에는 초록색 라벨 "PATCH". 왼쪽 아래 카드에는 "title: 두유" 한 줄만 있고 둘째 줄 자리는 점선으로 비워 둔 채 옆에 빨간 글씨 "memo 사라짐"을 쓴다. 오른쪽 아래 카드에는 "title: 두유", "memo: 2팩" 두 줄이 있고 둘째 줄 옆에 초록 글씨 "memo 유지"를 쓴다. 왼쪽 카드 아래 캡션 "본문이 곧 새 상태", 오른쪽 카드 아래 캡션 "본문은 고치는 방법". 평면적인 선화 스타일.</x-prompt>
+<x-caption>같은 본문이라도 PUT은 결과로, PATCH는 방법으로 해석된다.</x-caption>
+</x-visual>
+
+<h3>메서드의 속성 1 — 안전: 읽기만 하겠다는 약속</h3>
+
+<p>메서드 각각의 뜻을 읽었으니 이제 메서드를 가로지르는 속성을 본다. RFC 9110 9.2절은 세 가지를 정의한다. 안전(safe), 멱등(idempotent), 캐시 가능(cacheable)이다. 세 속성 모두 "이 메서드로 온 요청을 요청 경로 위의 참여자가 어떻게 다뤄도 되는가"에 대한 답이다.</p>
+
+<p>RFC 9110 9.2.1절에 따르면 요청 메서드는 정의된 의미가 본질적으로 읽기 전용일 때 안전하다고 한다. 풀어 쓰면, 클라이언트가 그 메서드를 자원에 적용한 결과로 오리진 서버의 상태가 바뀌기를 요청하지도 기대하지도 않는다는 뜻이다. RFC 9110이 정의한 메서드 가운데 GET, HEAD, OPTIONS, TRACE가 안전하다.</p>
+
+<p>이 정의가 서버가 아니라 클라이언트의 처지에서 쓰여 있다는 점을 눈여겨봐야 한다. 안전하다는 것은 "서버에서 아무 일도 일어나지 않는다"가 아니다. RFC는 안전한 메서드를 처리하면서도 서버가 읽기 전용이 아닌 동작을 하거나 부수 효과를 낼 수 있다고 분명히 적는다. 대부분의 서버는 메서드와 무관하게 모든 요청을 접근 로그에 기록하고, 그 로그가 저장소를 가득 채워 서버가 멈출 수도 있다. 그래도 그 요청은 안전한 것으로 본다. 중요한 것은 클라이언트가 그 추가 동작을 요청하지 않았고 그에 대한 책임을 지지 않는다는 점이다. 글을 읽을 때마다 조회 수가 올라가는 게시판도 같은 논리로 설명된다. 사용자가 요청한 것은 글을 읽는 일이지 숫자를 올리는 일이 아니다.</p>
+
+<h4>이 구분으로 가능해지는 일</h4>
+
+<p>RFC는 안전한 메서드와 그렇지 않은 메서드를 구분하는 목적을 직접 밝힌다. 자동화된 수집 프로세스(스파이더)와 캐시 성능 최적화(미리 가져오기)가 해를 끼칠 걱정 없이 동작하도록 하는 것이다. 검색 엔진의 수집기는 페이지에서 찾은 링크를 GET으로 따라가 본다. 브라우저는 사용자가 누를 법한 링크의 문서를 미리 받아 두기도 한다. 둘 다 "GET은 보내도 아무것도 망가뜨리지 않는다"는 전제 위에 서 있다. 이 전제가 없다면 수집기는 링크 하나를 따라갈 때마다 그 사이트의 문서를 읽고 사람에게 허락을 받아야 했을 것이다.</p>
+
+<p>사용자 에이전트에도 의무가 있다. RFC는 사용자 에이전트가 사용자에게 가능한 동작을 제시할 때 안전한 메서드와 안전하지 않은 메서드를 구분해서, 안전하지 않은 동작이 요청되기 전에 사용자가 그 사실을 알 수 있게 하라고 권고한다. POST의 결과로 받은 페이지를 새로 고치려 하면 주요 브라우저가 양식을 다시 제출할지 묻는 것이 이 권고가 구현된 모습이다. 같은 페이지를 GET으로 받았다면 묻지 않고 다시 요청한다.</p>
+
+<h4>약속을 깬 서버에서 벌어지는 일</h4>
+
+<p>프로토콜은 서버가 약속을 지키는지 검사하지 못한다. <code>GET /notes/1/delete</code>를 받아 메모를 지우는 서버를 만드는 것은 얼마든지 가능하다. RFC는 이 경우의 책임 소재를 정해 둔다. 대상 URI 안의 매개변수가 동작을 고르는 효과를 내도록 자원을 구성했다면, 그 동작이 요청 메서드의 의미와 일치하도록 하는 것은 자원 소유자의 책임이다. 그런 자원의 목적이 안전하지 않은 동작이라면 안전한 메서드로 접근했을 때 그 동작을 비활성화하거나 거부해야 한다. RFC가 드는 예는 웹 기반 편집 소프트웨어가 쿼리에 <code>page?do=delete</code>처럼 동작을 적는 경우다.</p>
+
+<p>이 규칙을 어기면 무슨 일이 생기는지도 RFC에 적혀 있다. 링크 유지 보수, 미리 가져오기, 검색 색인 구축을 위해 모든 URI 참조에 자동으로 GET을 보내는 프로세스가 돌 때 원치 않는 부수 효과가 일어난다. 삭제 링크가 줄마다 걸린 관리 화면을 그런 프로세스가 한 번 훑으면 링크마다 삭제가 실행된다. 그 프로세스는 잘못한 것이 없다. 안전하다고 정의된 메서드를 보냈을 뿐이다. 사람이 끼어 있어도 마찬가지다. 상태를 바꾸는 동작이 GET에 걸려 있으면, 다른 사이트의 페이지가 그 URI를 이미지 주소로 적어 두는 것만으로 방문자의 브라우저가 요청을 보내게 된다. RFC가 구분의 두 번째 목적으로 든 것, 곧 신뢰할 수 없는 콘텐츠를 처리할 때 사용자 에이전트가 안전하지 않은 메서드의 자동 사용에 제약을 걸 수 있게 한다는 것이 이 상황을 가리킨다.</p>
+
+<p>용어 혼동 하나를 미리 막아 둔다. 여기서 말하는 안전은 보안(security)이 아니다. 안전한 메서드의 응답으로도 비밀 정보가 새어 나갈 수 있고, 권한 검사는 메서드와 무관하게 필요하다. 안전은 오직 "이 요청이 서버 상태를 바꾸려는 의도를 담고 있는가"에 대한 속성이다.</p>
+
+<h3>메서드의 속성 2 — 멱등: 다시 보내도 되는가</h3>
+
+<p>멱등(idempotent)은 수학에서 온 말이다. 어떤 연산을 한 번 적용한 결과와 여러 번 적용한 결과가 같을 때 그 연산을 멱등이라 한다. 절댓값을 구하는 연산이 그렇다. 한 번 취하든 두 번 취하든 결과는 같다. 프로그램으로 옮기면 <code>x = 5</code>는 멱등이고 <code>x = x + 1</code>은 멱등이 아니다. 대입은 몇 번을 실행해도 x가 5이지만 증가는 실행할 때마다 값이 달라진다.</p>
+
+<p>RFC 9110 9.2.2절은 이 개념을 요청에 옮겨 놓는다. 어떤 메서드로 동일한 요청을 여러 번 보냈을 때 서버에 의도된 효과가 그 요청을 한 번 보냈을 때의 효과와 같으면 그 메서드는 멱등이다. RFC 9110이 정의한 메서드 가운데 PUT, DELETE, 그리고 안전한 메서드 전부가 멱등이다. 앞의 실행 결과에 이미 답이 있었다. PUT은 대입이다. "7번 메모의 상태는 이것"이라는 요청은 몇 번을 보내도 같은 상태에 도달한다. DELETE는 "없는 상태로 만들라"는 대입이다. 안전한 메서드는 상태를 바꾸려는 의도가 없으니 당연히 멱등이다. POST는 증가에 해당한다. 보낼 때마다 메모가 하나씩 늘었다.</p>
+
+<p>정의의 구절 셋을 정확히 읽어야 오해가 없다.</p>
+
+<p><b>"서버에 의도된 효과"</b>이지 응답이 아니다. 두 번째 DELETE는 404를 받았고 두 번째 PUT은 201이 아닌 204를 받았다. 응답은 달라질 수 있고, RFC도 반복한 요청의 응답은 다를 수 있다고 적는다. 멱등이 보장하는 것은 요청이 끝난 뒤 서버의 상태다.</p>
+
+<p><b>"동일한 요청을 여러 번"</b>이지 다른 요청이 끼어든 경우가 아니다. 내가 <code>PUT /notes/1</code>로 제목을 "두유"로 바꾼 뒤 다른 사용자가 "귀리 우유"로 바꾸었고, 그 뒤에 내 요청이 다시 전송되면 제목은 도로 "두유"가 된다. 멱등은 이 상황을 막아 주지 않는다. 멱등은 같은 요청의 반복이 한 번과 같다는 것만 말하고, 여러 클라이언트의 요청이 섞일 때의 결과는 다른 문제다. 그 문제는 08회에서 다룰 조건부 요청으로 푼다.</p>
+
+<p><b>"의도된"</b> 효과다. RFC는 안전의 정의와 마찬가지로 멱등 속성도 사용자가 요청한 것에만 적용된다고 적는다. 서버는 요청마다 로그를 따로 남기고, 변경 이력을 보관하고, 그 밖의 멱등이 아닌 부수 효과를 구현할 자유가 있다. PUT이 올 때마다 수정 이력이 한 줄씩 쌓여도 PUT은 멱등이다.</p>
+
+<h4>응답이 사라지는 세 지점</h4>
+
+<p>멱등이 왜 따로 이름을 얻을 만큼 중요한가. RFC의 답은 한 문장이다. 클라이언트가 서버의 응답을 읽기 전에 통신 장애가 생기면 그 요청을 자동으로 반복할 수 있기 때문에 멱등 메서드를 구분한다. 이 문장의 무게를 느끼려면 01회에서 본 TCP 수준으로 내려가, 클라이언트가 실제로 무엇을 알 수 있는지 따져 봐야 한다.</p>
+
+<p>클라이언트 프로그램이 소켓에 요청을 쓰면 그 바이트는 운영체제의 송신 버퍼로 복사되고 쓰기 호출은 거기서 돌아온다. 호출이 성공했다는 것은 커널이 바이트를 넘겨받았다는 뜻이지 상대에게 도착했다는 뜻이 아니다. 바이트가 상대 호스트에 도착하면 상대의 TCP가 ACK를 보내지만, 그 ACK도 상대 커널이 바이트를 받았다는 것만 확인해 준다. 서버 프로그램이 그 바이트를 읽었는지, 읽어서 처리를 시작했는지, 처리를 끝냈는지는 TCP가 알려 주지 않는다. 클라이언트가 처리 여부를 알 수 있는 통로는 하나, HTTP 응답뿐이다.</p>
+
+<p>그런데 응답이 오지 않는다. 클라이언트가 기다리다 타임아웃을 내거나 연결이 끊긴다. 이때 서버에서 일어났을 수 있는 일은 크게 세 가지다.</p>
+
+<pre class="diagram">     클라이언트                                              서버
+         │                                                    │
+ (A)     │── 요청 ───────────── ✗                             │   요청이 도착하지 못했다
+         │                                                    │   → 처리되지 않았다
+         │                                                    │
+ (B)     │── 요청 ──────────────────────────────────────────▶ │   도착했지만 읽기 전이나 처리 도중에
+         │                                                    ✗   서버가 멈췄다 → 안 됐거나 일부만 됐다
+         │                                                    │
+ (C)     │── 요청 ──────────────────────────────────────────▶ │   처리를 끝냈다
+         │                             ✗ ◀──────────── 응답 ──│   응답이 돌아오는 길에 사라졌다
+         │                                                        → 처리는 끝나 있다
+         │
+         └─ 세 경우 모두 클라이언트가 보는 것은 같다: 타임아웃 또는 연결 끊김</pre>
+
+<p>(A)에서는 서버가 요청을 본 적이 없다. (B)에서는 요청이 도착했지만 서버 프로세스가 죽거나 멈춰서 처리가 끝나지 않았다. (C)에서는 서버가 처리를 마치고 응답까지 보냈는데 그 응답이 돌아오는 길에 연결이 끊겼다. 서버의 상태는 세 경우가 전혀 다르지만 클라이언트에게 주어진 정보는 똑같다. 응답이 없다는 사실 하나다. 타임아웃은 "실패했다"가 아니라 "모른다"를 뜻한다.</p>
+
+<p>모르는 상태에서 클라이언트가 할 수 있는 일은 둘이다. 포기하면 (A)와 (B)의 경우 요청이 끝내 처리되지 않는다. 다시 보내면 (C)의 경우 같은 요청이 두 번 처리된다. 여기서 멱등이 길을 터 준다. 요청이 멱등이면 (C)에서 두 번 처리되어도 결과가 한 번 처리된 것과 같으므로, 세 경우를 구별하지 못한 채로 그냥 다시 보내면 된다. RFC가 드는 예가 바로 이것이다. 클라이언트가 PUT 요청을 보냈는데 응답을 받기 전에 연결이 닫혔다면, 새 연결을 맺고 그 요청을 다시 시도할 수 있다. 원래 요청이 성공했더라도 반복이 같은 효과를 낸다는 것을 알기 때문이다.</p>
+
+<x-visual id="http-04-lost-response" title="요청 유실, 처리 중 장애, 응답 유실의 세 경우에 서버 상태는 다르지만 클라이언트가 관찰하는 것은 똑같이 타임아웃인 모습" kind="시퀀스 다이어그램" ratio="16:9">
+<x-hint>응답이 오지 않는 세 가지 원인을 나란히 놓아, 클라이언트 쪽에서는 구별할 수 없다는 점을 보여 준다.</x-hint>
+<x-prompt>흰 배경에 세 개의 작은 시퀀스 다이어그램을 가로로 나란히 배치한다. 각 패널에는 왼쪽 세로선 "클라이언트"와 오른쪽 세로선 "서버"가 있다. 첫째 패널 제목은 "(A) 요청 유실": 클라이언트에서 서버로 가는 화살표가 중간에서 빨간 X 표시로 끊기고, 서버 세로선 옆에 회색 라벨 "처리 안 됨". 둘째 패널 제목은 "(B) 처리 중 장애": 요청 화살표가 서버에 닿고, 서버 세로선 위에 빨간 번개 표시와 라벨 "알 수 없음". 셋째 패널 제목은 "(C) 응답 유실": 요청 화살표가 서버에 닿고 서버 옆에 초록 체크와 라벨 "처리 완료", 서버에서 클라이언트로 돌아오는 화살표가 중간에서 빨간 X 표시로 끊긴다. 세 패널 모두 클라이언트 세로선 아래에 같은 모양의 시계 아이콘과 라벨 "타임아웃"을 둔다. 그림 맨 아래를 가로지르는 띠에 "클라이언트가 보는 것은 세 경우 모두 같다"라고 쓴다. 평면적인 선화 스타일, 강조색은 빨강과 초록만 사용.</x-prompt>
+<x-caption>응답이 없다는 사실만으로는 서버가 요청을 처리했는지 알 수 없다.</x-caption>
+</x-visual>
+
+<h4>재시도 규칙</h4>
+
+<p>이 논리의 반대쪽이 규칙이 된다. RFC 9110은 클라이언트가 멱등이 아닌 메서드의 요청을 자동으로 재시도하지 말아야 한다고 규정한다. 예외는 메서드와 상관없이 그 요청의 의미가 실제로 멱등임을 알 수단이 있거나, 원래 요청이 적용되지 않았음을 탐지할 수단이 있는 경우다. 프록시에 대한 규정은 더 강하다. 프록시는 멱등이 아닌 요청을 자동으로 재시도해서는 안 된다. 프록시는 클라이언트와 서버 사이의 사적인 약속을 알 길이 없기 때문이다.</p>
+
+<p>연결 재사용이 이 규칙을 일상적인 문제로 만든다. HTTP/1.1은 한 번 맺은 연결로 여러 요청을 차례로 보내는데, RFC 9112 9.5절은 클라이언트·서버·프록시 누구든 언제든 전송 연결을 닫을 수 있다고 적고 이런 예를 든다. 서버가 한동안 쓰이지 않은 연결을 닫기로 한 바로 그 순간에 클라이언트가 그 연결로 새 요청을 보내기 시작했을 수 있다. 서버의 관점에서는 유휴 연결을 닫은 것이지만 클라이언트의 관점에서는 요청이 진행 중이었다. 양쪽 모두 규칙대로 움직였는데도 요청 하나가 응답 없이 사라진다. 그래서 같은 문서의 9.3.1절은 구현이 예고 없는 연결 종료에서 복구할 필요를 예상해야 한다고 적고, 자동 재시도의 조건은 RFC 9110의 멱등 절을 따르라고 가리킨다. 한 연결에 응답을 기다리지 않고 요청을 연달아 보내는 파이프라이닝에도 같은 기준이 쓰인다. 사용자 에이전트는 멱등이 아닌 메서드의 최종 응답 상태 코드를 받기 전에는 그 뒤로 요청을 이어 보내지 말아야 한다.</p>
+
+<h4>직접 확인: 응답 없이 끊긴 연결과 JDK HttpClient</h4>
+
+<p>클라이언트 라이브러리가 실제로 메서드를 보고 재시도 여부를 정하는지 확인해 보자. 요청을 헤더 끝까지 읽고 "처리했다"고 출력한 다음 응답을 한 바이트도 쓰지 않고 연결을 닫는 서버를 소켓으로 만든다. 앞의 그림에서 (C)를 인위적으로 만든 것이다. 이 서버에 GET, PUT, POST를 차례로 보낸다.</p>
+
+<pre data-label="LostResponse.java"><code class="language-java">import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpRequest.BodyPublishers;
+import java.net.http.HttpResponse.BodyHandlers;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+public class LostResponse {
+    public static void main(String[] args) throws Exception {
+        ServerSocket listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+        Thread server = new Thread(() -> {
+            int handled = 0;
+            while (true) {
+                try (Socket socket = listener.accept()) {
+                    BufferedReader in = new BufferedReader(
+                            new InputStreamReader(socket.getInputStream(), StandardCharsets.ISO_8859_1));
+                    String requestLine = in.readLine();
+                    String header;
+                    while ((header = in.readLine()) != null && !header.isEmpty()) { }   // 헤더 끝까지 읽는다
+                    System.out.println("  서버: [" + requestLine + "] 처리 완료 (누적 " + ++handled + "건)");
+                    // 응답을 쓰지 않고 try-with-resources가 소켓을 닫는다: 응답이 유실된 상황
+                } catch (IOException e) {
+                    return;
+                }
+            }
+        });
+        server.setDaemon(true);
+        server.start();
+
+        HttpClient client = HttpClient.newHttpClient();
+        URI uri = URI.create("http://127.0.0.1:" + listener.getLocalPort() + "/orders/42");
+        for (String method : List.of("GET", "PUT", "POST")) {
+            System.out.println("클라이언트: " + method + " 전송");
+            try {
+                client.send(HttpRequest.newBuilder(uri).method(method, BodyPublishers.noBody()).build(),
+                            BodyHandlers.ofString());
+            } catch (IOException e) {
+                System.out.println("클라이언트: " + method + " 실패 (" + e.getClass().getSimpleName() + ")");
+            }
+        }
+    }
+}</code></pre>
+
+<pre data-label="실행 결과 (JDK 21)"><code class="language-text">클라이언트: GET 전송
+  서버: [GET /orders/42 HTTP/1.1] 처리 완료 (누적 1건)
+  서버: [GET /orders/42 HTTP/1.1] 처리 완료 (누적 2건)
+클라이언트: GET 실패 (IOException)
+클라이언트: PUT 전송
+  서버: [PUT /orders/42 HTTP/1.1] 처리 완료 (누적 3건)
+클라이언트: PUT 실패 (IOException)
+클라이언트: POST 전송
+  서버: [POST /orders/42 HTTP/1.1] 처리 완료 (누적 4건)
+클라이언트: POST 실패 (IOException)</code></pre>
+
+<p>세 요청 모두 클라이언트 코드에서는 <code>IOException</code>으로 끝났다. 그런데 서버가 받은 요청은 네 건이다. GET이 두 번 도착했다. 응용 코드는 <code>send</code>를 한 번 호출했을 뿐인데 라이브러리가 연결이 끊긴 것을 보고 스스로 한 번 더 보낸 것이다. PUT과 POST는 한 번씩만 도착했다.</p>
+
+<p>OpenJDK 21의 소스에서 이 동작의 근거를 찾을 수 있다. <code>jdk.internal.net.http.MultiExchange</code> 클래스에 요청이 멱등 메서드인지를 판단하는 메서드가 있는데, GET과 HEAD에 대해서만 참을 돌려준다. 연결이 갑자기 닫혔을 때 이 판단이 참인 요청만 한 번 더 시도한다. 시스템 속성 <code>jdk.httpclient.enableAllMethodRetry</code>를 켜면 모든 메서드를 재시도하도록 바뀌고, 같은 프로그램을 <code>-Djdk.httpclient.enableAllMethodRetry=true</code>와 함께 실행하면 서버가 PUT과 POST도 두 번씩 받는 것을 확인할 수 있다.</p>
+
+<p>여기서 명세와 구현을 구분해야 한다. RFC 9110은 PUT을 멱등으로 정의하므로 PUT의 자동 재시도는 허용된다. 그러나 허용이지 의무가 아니다. OpenJDK 21의 <code>HttpClient</code>는 멱등 메서드 가운데 GET과 HEAD만 재시도하는 더 보수적인 선택을 했다. 구현마다 선이 다르다는 것을 보여 주는 반대편 사례가 같은 JDK 안에 있다. 오래된 <code>HttpURLConnection</code>은 응답을 읽다가 입출력 오류가 나면 요청을 한 번 더 보내는데, POST도 기본으로 여기에 포함된다(요청 본문을 스트리밍 모드로 보내는 경우는 제외된다). 구현 클래스 <code>sun.net.www.http.HttpClient</code>의 소스에는 이전 릴리스의 동작을 유지하려고 POST 재시도를 기본으로 켜 둔다는 주석이 있고, 시스템 속성 <code>sun.net.http.retryPost</code>를 <code>false</code>로 주어야 꺼진다. 위 서버에 <code>HttpURLConnection</code>으로 본문 없는 POST를 보내면 JDK 21에서 서버는 요청을 두 번 받고, 이 속성을 끄면 한 번만 받는다. 응용 코드가 한 번 호출한 POST가 서버에서 두 번 처리될 수 있다는 뜻이고, 그 POST가 주문이나 결제라면 그대로 중복이 된다.</p>
+
+<h4>멱등이 아닌 요청을 다시 보내야 할 때</h4>
+
+<p>POST 요청이 응답 없이 끊겼다고 해서 영영 손을 놓을 수는 없다. RFC가 남겨 둔 두 가지 예외가 설계의 출발점이다. 하나는 원래 요청이 적용되었는지 탐지하는 것이다. 다시 보내기 전에 GET으로 상태를 조회해 주문이 이미 만들어졌는지 확인하는 방식이 여기에 해당한다. 다른 하나는 요청의 의미를 실제로 멱등이 되게 만드는 것이다. 클라이언트가 식별자를 미리 정해 그 식별자가 들어간 URI에 PUT으로 생성하면, 같은 요청이 두 번 도착해도 자원은 하나다. 또는 요청마다 고유한 키를 헤더에 실어 보내고, 서버가 이미 처리한 키의 요청은 다시 처리하지 않게 하는 방식이 있다. IETF의 HTTPAPI 작업 그룹이 이 용도의 <code>Idempotency-Key</code> 요청 헤더를 표준화하는 문서를 작성하고 있는데, 2026년 10월에 나온 08판 기준으로 아직 RFC가 아닌 <a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/">인터넷 초안</a>이다.</p>
+
+<h3>메서드의 속성 3 — 캐시 가능, 그리고 세 속성을 한 표로</h3>
+
+<p>세 번째 속성은 응답을 저장해 두었다가 나중의 요청에 다시 써도 되는가다. RFC 9110 9.2.3절은 캐시가 응답을 저장하고 사용하려면 그 메서드가 캐싱을 명시적으로 허용하고, 어떤 조건에서 저장된 응답으로 이후 요청을 충족할 수 있는지를 상세히 정해 두어야 한다고 적는다. 그렇게 하지 않은 메서드는 캐시할 수 없다. 그리고 이 명세가 캐싱 의미를 정의한 메서드는 GET, HEAD, POST이지만 압도적 다수의 캐시 구현은 GET과 HEAD만 지원한다고 덧붙인다.</p>
+
+<p>GET이 캐시에 잘 맞는 이유는 앞에서 본 두 가지에서 나온다. GET은 안전하므로 요청을 서버에 보내지 않고 저장된 응답으로 대신해도, 일어났어야 할 상태 변화가 빠지는 일이 없다. 그리고 GET 요청은 본문 없이 메서드와 URI만으로 무엇을 원하는지가 정해지므로 그 둘을 키로 저장된 응답을 찾을 수 있다. POST는 사정이 다르다. RFC 9110은 POST 응답이 명시적인 신선도 정보와 함께 POST의 대상 URI와 같은 값의 <code>Content-Location</code> 헤더를 포함할 때에만 캐시할 수 있다고 한정한다. PATCH에도 RFC 5789가 같은 조건을 달아 두었고, 그렇게 저장된 PATCH 응답은 이후의 GET과 HEAD 요청에 답하는 데에만 쓸 수 있다. PUT, DELETE, OPTIONS, TRACE, CONNECT의 응답은 캐시할 수 없다고 각 메서드의 절에 명시되어 있다.</p>
+
+<p>캐시는 저장만 하지 않고 버리기도 하는데, 버리는 판단에도 메서드의 속성이 쓰인다. RFC 9111 4.4절은 PUT, POST, DELETE 같은 안전하지 않은 메서드가 오리진 서버의 상태를 바꿀 가능성이 있으므로 중간의 캐시가 저장된 응답을 무효화해야 한다고 적는다. 구체적으로는 안전하지 않은 메서드의 요청에 오류가 아닌 상태 코드(2xx 또는 3xx)의 응답이 돌아오면 캐시가 그 대상 URI를 무효화해야 한다. <code>PUT /notes/1</code>이 성공해 캐시를 지나가면 그 캐시가 갖고 있던 <code>GET /notes/1</code>의 응답은 무효화된다. RFC 9111이 말하는 무효화는 저장된 응답을 지우거나, 다시 내주기 전에 반드시 검증을 거쳐야 하는 상태로 표시하는 것이다. 이 장의 첫머리에서 본 설계, 곧 읽기와 쓰기가 서로 다른 URI를 쓰는 설계에서는 이 장치가 동작하지 않는다. <code>/updateNote?id=1</code>이 성공해도 캐시가 무효화하는 것은 그 URI이지 <code>/getNote?id=1</code>이 아니기 때문이다. 캐시의 저장과 재사용 규칙 전체는 08회에서 다룬다.</p>
+
+<div class="table-wrap"><table><thead><tr><th>메서드</th><th>안전</th><th>멱등</th><th>캐시 가능</th><th>같은 요청을 두 번 보내면</th></tr></thead><tbody>
+<tr><td><code>GET</code></td><td>○</td><td>○</td><td>○</td><td>상태 변화 없음. 같은 자원의 표현을 두 번 받는다</td></tr>
+<tr><td><code>HEAD</code></td><td>○</td><td>○</td><td>○</td><td>상태 변화 없음</td></tr>
+<tr><td><code>OPTIONS</code></td><td>○</td><td>○</td><td>×</td><td>상태 변화 없음</td></tr>
+<tr><td><code>TRACE</code></td><td>○</td><td>○</td><td>×</td><td>상태 변화 없음</td></tr>
+<tr><td><code>PUT</code></td><td>×</td><td>○</td><td>×</td><td>한 번 보낸 것과 같은 상태. 응답은 201에서 200/204로 달라질 수 있다</td></tr>
+<tr><td><code>DELETE</code></td><td>×</td><td>○</td><td>×</td><td>한 번 보낸 것과 같은 상태. 두 번째 응답은 404일 수 있다</td></tr>
+<tr><td><code>POST</code></td><td>×</td><td>×</td><td>조건부</td><td>처리가 두 번 일어날 수 있다(자원 두 개, 주문 두 건)</td></tr>
+<tr><td><code>PATCH</code></td><td>×</td><td>×</td><td>조건부</td><td>패치 문서에 따라 다르다. 변경이 두 번 적용될 수 있다</td></tr>
+<tr><td><code>CONNECT</code></td><td>×</td><td>×</td><td>×</td><td>터널을 여는 요청이라 자원 상태의 반복 적용으로 논할 대상이 아니다</td></tr>
+</tbody></table></div>
+
+<p>표에서 읽어 둘 관계가 둘 있다. 첫째, 안전한 메서드는 모두 멱등이다. RFC가 멱등 메서드의 목록에 "안전한 요청 메서드"를 통째로 넣어 두었다. 반대 방향은 성립하지 않는다. PUT과 DELETE는 상태를 바꾸므로 안전하지 않지만 멱등이다. 둘째, 세 속성 모두 메서드의 정의에 속한 것이지 서버가 구현하면서 정하는 것이 아니다. 서버가 GET으로 상태를 바꾸도록 구현해도 캐시와 수집기와 클라이언트 라이브러리는 여전히 GET을 안전하고 멱등이며 캐시 가능한 메서드로 다룬다. 서버가 POST를 멱등하게 구현해 두어도 프록시는 그 POST를 재시도하지 않는다.</p>
+
+<x-visual id="http-04-method-properties" title="아홉 개 HTTP 메서드를 안전, 멱등, 캐시 가능 속성에 따라 배치한 포함 관계 그림" kind="벤 다이어그램" ratio="4:3">
+<x-hint>안전한 메서드의 집합이 멱등 메서드의 집합 안에 들어 있고, POST·PATCH·CONNECT는 그 바깥에 있다는 포함 관계를 한눈에 보여 준다.</x-hint>
+<x-prompt>흰 배경의 벤 다이어그램. 큰 파란색 원을 그리고 원 위쪽 가장자리에 라벨 "멱등"을 쓴다. 그 원 안쪽에 작은 초록색 원을 넣고 라벨 "안전"을 쓴다. 초록색 원 안에는 둥근 알약 모양 태그 네 개 "GET", "HEAD", "OPTIONS", "TRACE"를 배치한다. 파란색 원 안이지만 초록색 원 바깥인 고리 부분에는 태그 두 개 "PUT", "DELETE"를 배치한다. 파란색 원 바깥의 오른쪽 여백에는 회색 태그 세 개 "POST", "PATCH", "CONNECT"를 세로로 배치한다. "GET"과 "HEAD" 태그에만 작은 주황색 별을 붙이고, 그림 아래쪽 범례에 주황색 별과 함께 "캐시 가능"이라고 쓴다. 평면적인 선화 스타일, 글자는 고정폭 글꼴.</x-prompt>
+<x-caption>안전하면 멱등이지만, 멱등이라고 안전한 것은 아니다.</x-caption>
+</x-visual>
+
+<h3>흔한 오해와 함정</h3>
+
+<p><b>"POST는 생성, PUT은 수정이다."</b> 데이터베이스의 생성·조회·수정·삭제에 메서드를 하나씩 짝지은 이 요약은 흔한 구조에서 나온 결과일 뿐 정의가 아니다. PUT은 자원이 없으면 만들고 있으면 교체한다. POST는 생성만 하는 메서드가 아니라 자원이 정한 임의의 처리를 뜻한다. 둘을 가르는 기준은 생성이냐 수정이냐가 아니라, 클라이언트가 자원의 URI를 지정하는가와 본문이 그 자원의 새 상태 전체인가다.</p>
+
+<p><b>"멱등이면 응답이 매번 같다."</b> 정의가 말하는 것은 서버에 의도된 효과다. 실행 결과에서 본 대로 두 번째 DELETE는 404를, 두 번째 PUT은 204를 받았다. 거꾸로 응답이 매번 같아 보인다고 멱등인 것도 아니다. POST가 매번 201을 돌려줘도 그때마다 자원이 하나씩 늘어난다.</p>
+
+<p><b>"멱등이면 동시에 여러 요청이 와도 문제없다."</b> 멱등은 같은 요청의 반복에 대한 속성이지 서로 다른 요청의 순서에 대한 속성이 아니다. 두 클라이언트가 같은 자원에 서로 다른 PUT을 보내면 나중에 도착한 쪽이 앞의 것을 덮어쓴다. 재시도가 끼어들면 순서는 더 꼬인다. 이 문제는 메서드의 속성이 아니라 조건부 요청이나 서버 쪽의 동시성 제어로 푼다.</p>
+
+<p><b>"타임아웃이 났으니 요청은 실패했다."</b> 응답이 오지 않았다는 것은 서버가 처리하지 않았다는 뜻이 아니다. 앞의 세 경우 가운데 (C)라면 처리는 끝나 있다. 타임아웃 뒤에 사용자에게 "실패했습니다. 다시 시도하세요"라고 안내하는 화면은, 그 요청이 멱등이 아닐 때 중복 처리를 사람 손으로 유도하는 셈이 된다.</p>
+
+<p><b>"PATCH는 가벼운 PUT이다."</b> 본문이 작다는 점만 닮았다. PUT의 본문은 새 상태이고 PATCH의 본문은 고치는 지시다. 그래서 PATCH의 본문은 약속된 패치 형식 없이는 해석할 수 없고, PATCH는 멱등으로 취급되지 않아 중간 장비가 재시도해 주지 않는다. 필드 몇 개뿐인 작은 자원이라면 전체를 PUT으로 교체하는 편이 의미도 단순하고 재시도에도 안전하다.</p>
+
+<p><b>"조회는 GET, 나머지는 전부 POST로 해도 동작한다."</b> 동작은 한다. 잃는 것은 표준이 주는 보장이다. 교체와 삭제를 POST로 보내면 그 요청이 멱등이라는 사실을 요청 경로 위의 누구도 알 수 없다. 연결이 끊겼을 때 안심하고 다시 보낼 수 있었던 요청이 "모른다"의 영역으로 넘어간다.</p>
+
+<h3>다음 주제와의 연결</h3>
+
+<p>이 장은 메서드의 뜻과 속성을 정의 수준에서 읽었다. 05회는 이 메서드들을 실제 상황에 배치한다. 쿼리 문자열과 본문 가운데 어디에 데이터를 실을지, HTML 폼처럼 GET과 POST만 보낼 수 있는 클라이언트에서는 어떻게 하는지, 다섯 동사에 맞지 않는 동작에 어떤 URI를 줄지가 그 내용이다. 06회는 이 장에서 이름만 나온 201, 202, 204, 303, 404, 405, 501 같은 상태 코드의 뜻을 차례로 다룬다. 07회에서는 표현과 콘텐츠 협상을, 08회에서는 GET의 캐시 가능 속성이 실제로 동작하는 방식과, 동시에 들어온 PUT이 서로를 덮어쓰지 않게 하는 조건부 요청을 다룬다.</p>
+
+<p>로드맵 뒤쪽에서도 이 장의 내용은 계속 나온다. 서블릿의 <code>HttpServlet</code>은 요청 메서드에 따라 <code>doGet</code>, <code>doPost</code> 같은 메서드로 처리를 나누고, 스프링 MVC의 <code>@GetMapping</code>, <code>@PostMapping</code>, <code>@PutMapping</code>, <code>@PatchMapping</code>, <code>@DeleteMapping</code>은 "이 메서드와 이 경로의 요청을 이 코드가 처리한다"는 조건을 선언하는 애너테이션이다. 이 장의 예제에서 <code>switch</code> 문이 하던 일을 프레임워크가 대신하는 것이다. 요청이 도착한 뒤에 벌어지는 일은 달라지지 않는다.</p>
+
+<p>데이터베이스 쪽으로도 이어진다. 응답이 사라지는 세 경우에서 "처리가 끝났다"의 경계는 서버가 트랜잭션을 커밋한 순간이다. 커밋은 끝났는데 응답이 전달되지 못한 요청을 다시 받았을 때 중복으로 처리하지 않으려면 서버는 그 요청을 이미 처리했다는 사실을 데이터베이스에 남겨 두어야 한다. 트랜잭션과 유일성 제약을 다루는 권에서 이 문제를 다시 만난다.</p>
+</x-lecture>
+
+<x-summary>
+<dt>자원과 행위의 분리</dt><dd>URI는 대상만 식별하고, 그 대상에 무엇을 할지는 요청 줄 맨 앞의 메서드가 표준 어휘로 말한다. 그래야 API를 모르는 중간 참여자도 요청의 성격을 판단할 수 있다.</dd>
+<dt>GET과 HEAD</dt><dd>GET은 대상 자원의 현재 선택된 표현을 전송해 달라는 요청이고 HEAD는 같은 응답에서 콘텐츠만 뺀 것이다. 무엇을 가져올지는 본문이 아니라 URI로 지정한다.</dd>
+<dt>POST</dt><dd>동봉한 표현을 대상 자원이 자신의 방식으로 처리해 달라는 요청이다. 서버가 식별자를 정하는 생성에 쓰이며, 이때 201과 Location으로 새 자원의 위치를 알린다.</dd>
+<dt>PUT</dt><dd>대상 자원의 상태를 동봉한 표현으로 생성하거나 통째로 교체한다. 클라이언트가 URI를 지정하고, 본문에 없는 것은 새 상태에도 없다.</dd>
+<dt>PATCH</dt><dd>RFC 5789가 정의한 부분 수정 메서드다. 본문은 새 상태가 아니라 미디어 타입으로 형식이 정해진 변경 지시이고, 서버는 그것을 원자적으로 적용해야 한다.</dd>
+<dt>DELETE</dt><dd>대상 자원과 그 현재 기능의 연결을 제거해 달라는 요청이다. URI 매핑의 삭제를 뜻하며 데이터의 물리적 삭제를 요구하지는 않는다.</dd>
+<dt>안전</dt><dd>클라이언트가 서버 상태의 변화를 요청하지도 기대하지도 않는 메서드의 속성이다. GET, HEAD, OPTIONS, TRACE가 해당하고, 수집과 미리 가져오기가 이 약속에 기댄다.</dd>
+<dt>멱등</dt><dd>같은 요청을 여러 번 보낸 효과가 한 번 보낸 효과와 같은 속성이다. 안전한 메서드와 PUT, DELETE가 해당하며, 응답 없이 연결이 끊겼을 때 자동으로 다시 보내도 되는 근거가 된다.</dd>
+<dt>캐시 가능</dt><dd>응답을 저장해 이후 요청에 재사용해도 되는 속성이다. 명세상 GET, HEAD와 조건부로 POST가 해당하지만 대부분의 캐시는 GET과 HEAD만 다룬다.</dd>
+</x-summary>
+
+<x-review>
+<p>실무에서 다시 판단하면, 이 장의 지식이 가장 먼저 쓰이는 곳은 타임아웃과 재시도 설정이다. 주문·결제처럼 중복이 사고가 되는 API를 호출하는 쪽이라면 사용하는 HTTP 클라이언트, 그 앞의 프록시와 게이트웨이가 어떤 메서드를 자동으로 재시도하는지를 기본값까지 확인해야 한다. 본문에서 본 것처럼 같은 JDK 안에서도 <code>java.net.http.HttpClient</code>는 GET과 HEAD만 재시도하고 <code>HttpURLConnection</code>은 기본 설정에서 POST도 한 번 더 보낸다. 재시도는 응용 코드에 보이지 않는 곳에서 일어나므로, 장애 뒤에 중복 주문이 발견되었을 때 응용 로그에는 호출이 한 번만 찍혀 있을 수 있다.</p>
+
+<p>API를 제공하는 쪽이라면 판단의 순서가 반대다. 상태를 바꾸는 요청 각각에 대해 "이 요청이 두 번 도착하면 어떻게 되는가"를 설계 단계에서 답해 둔다. 요청이 본래 대입의 성격이면 PUT으로 노출해 표준이 주는 멱등 보장을 그대로 쓴다. 본래 증가의 성격이면 POST로 두되, 클라이언트가 보낸 고유 키를 저장해 같은 키의 요청을 한 번만 처리하도록 만든다. 어느 쪽이든 서버가 "이미 처리했다"를 판단할 근거를 응답 유실과 무관하게 남겨 두는 것이 핵심이다. 호출량이 적고 중복이 무해한 내부 API라면 이 비용을 들이지 않는 판단도 합리적이다.</p>
+
+<p>메서드 선택은 인프라의 동작을 바꾼다. 상태를 바꾸는 동작을 GET에 걸어 두면 수집기와 미리 가져오기가 그 동작을 실행한다. 반대로 순수한 조회를 POST로 열어 두면 캐시도, 자동 재시도도 받지 못한다. 검색 조건이 URI에 담기 어려울 만큼 크거나 민감해서 POST를 쓰기로 했다면 그 대가를 알고 고른 것이어야 한다. PUT과 PATCH 사이의 선택에도 조건이 있다. 전체 교체는 의미가 단순하고 멱등이지만, 표현에 필드가 추가된 뒤에도 새 필드를 모르는 클라이언트가 예전 모양의 표현을 PUT으로 보내면 그 필드가 지워질 수 있다. 여러 클라이언트가 서로 다른 필드를 고치는 자원이라면 PATCH가 맞고, 그때는 패치 형식을 표준 미디어 타입으로 정해 두는 편이 나중의 혼란을 줄인다.</p>
+</x-review>
+
+<x-practice>
+<li>본문의 <code>NoteApi</code> 서버가 메모 1번 <code>{"title":"A","memo":"B"}</code> 하나만 갖고 있고 <code>nextId</code>가 2인 상태에서 다음 요청을 순서대로 보낸다. 각 요청의 응답 코드와, 모든 요청이 끝난 뒤의 서버 상태를 적어라. (가) <code>PATCH /notes/1</code> 본문 <code>{"memo":"C"}</code> (나) <code>PUT /notes/1</code> 본문 <code>{"memo":"D"}</code> (다) <code>PUT /notes/5</code> 본문 <code>{"title":"E"}</code> (라) <code>DELETE /notes/3</code> (마) <code>POST /notes</code> 본문 <code>{"title":"F"}</code> (바) <code>PATCH /notes/9</code> 본문 <code>{"title":"G"}</code></li>
+<li>다음 동작 각각이 멱등인지 판단하고 이유를 한 문장으로 적어라. 그리고 어울리는 메서드를 골라라. (가) 잔액을 5000으로 설정한다 (나) 잔액에서 1000을 차감한다 (다) 장바구니를 비운다 (라) 좋아요 상태를 뒤집는다(켜져 있으면 끄고 꺼져 있으면 켠다) (마) 좋아요 상태를 켬으로 설정한다</li>
+<li>클라이언트가 <code>POST /payments</code>를 보내고 3초를 기다렸지만 응답이 오지 않아 타임아웃이 났다. 이 시점에 서버에서 일어났을 수 있는 일을 세 가지로 나누어 적고, 클라이언트가 이 셋을 구별할 수 없는 이유를 TCP가 알려 주는 것과 알려 주지 않는 것으로 설명하라. 이어서 이 요청을 안전하게 다시 보낼 수 있게 하는 설계를 두 가지 제시하라.</li>
+<li>어느 관리 화면의 메모 목록에는 줄마다 <code>/admin/notes/{id}/delete</code>로 가는 링크가 있고, 서버는 이 URI에 대한 GET을 받으면 메모를 지운다. 깨진 링크를 찾아 주는 점검 도구를 도입한 다음 날 메모가 전부 사라졌다. 원인을 설명하고, RFC 9110의 안전한 메서드 규정에 비추어 책임이 어느 쪽에 있는지와 고치는 방법을 적어라.</li>
+<li>다음 PATCH 요청 각각을 같은 내용으로 두 번 보냈을 때 서버 상태가 한 번 보냈을 때와 같은지 판단하라. (가) JSON 병합 패치 <code>{"title":"두유"}</code> (나) JSON 패치 <code>[{"op":"add","path":"/tags/-","value":"장보기"}]</code> (다) JSON 패치 <code>[{"op":"remove","path":"/memo"}]</code>. 그리고 (가)처럼 반복해도 결과가 같은 요청이 있는데도 프록시가 PATCH를 자동으로 재시도하지 않는 이유를 설명하라.</li>
+</x-practice>
+
+<x-answer>
+<p><b>1번.</b> (가) 204. PATCH는 보낸 필드만 덮어쓰므로 1번은 <code>{title:A, memo:C}</code>가 된다. (나) 204. PUT은 본문이 곧 새 상태이므로 1번은 <code>{memo:D}</code>가 되고 <code>title</code>은 사라진다. 이미 있던 자원의 교체라서 201이 아니다. (다) 201. 5번 자리에 표현이 없었으므로 새로 만들어진다. (라) 404. 3번은 없었고 상태는 변하지 않는다. (마) 201과 <code>Location: /notes/2</code>. 서버가 <code>nextId</code>의 값 2를 발급한다. (바) 404. 이 서버의 PATCH는 없는 자원을 만들지 않는다. 최종 상태는 1번 <code>{memo:D}</code>, 2번 <code>{title:F}</code>, 5번 <code>{title:E}</code>다.</p>
+
+<p><b>2번.</b> (가) 멱등이다. 대입이라 몇 번을 실행해도 잔액은 5000이다. 잔액 자원에 대한 PUT이 어울린다. (나) 멱등이 아니다. 실행할 때마다 1000씩 줄어든다. POST가 어울린다. (다) 멱등이다. 이미 빈 장바구니를 다시 비워도 빈 상태다. 장바구니 내용에 대한 DELETE가 어울린다. (라) 멱등이 아니다. 두 번 실행하면 원래 상태로 돌아오므로 한 번 실행한 효과와 다르다. POST가 어울린다. (마) 멱등이다. 이미 켜져 있어도 켬 상태로 남는다. 좋아요 상태에 대한 PUT이 어울린다. (라)와 (마)는 사용자에게는 같은 버튼일 수 있지만 요청의 의미가 다르고, 응답이 유실되어 다시 보낼 때의 결과가 갈린다.</p>
+
+<p><b>3번.</b> 가능한 경우는 요청이 서버에 도착하지 못한 경우, 도착했지만 처리가 끝나기 전에 서버가 멈춘 경우, 처리를 끝내고 응답을 보냈지만 응답이 오는 길에 사라진 경우다. 처리가 느려 아직 진행 중인 경우도 클라이언트에게는 같은 모습이다. TCP가 클라이언트에 알려 주는 것은 많아야 "상대 커널이 바이트를 받았다"까지이고, 서버 프로그램이 그 요청을 읽고 처리했는지는 알려 주지 않는다. 처리 여부를 전하는 유일한 통로가 HTTP 응답인데 그것이 오지 않았으므로 구별할 수 없다. 설계는 예를 들어 이렇다. 첫째, 클라이언트가 결제 식별자를 미리 만들어 <code>PUT /payments/{식별자}</code>로 보내면 요청이 멱등이 되어 그대로 다시 보낼 수 있다. 둘째, POST를 유지하되 요청마다 고유 키를 헤더에 싣고 서버가 처리한 키를 저장해 같은 키의 요청에는 처음의 결과를 돌려준다. 다시 보내기 전에 GET으로 결제가 만들어졌는지 조회하는 방법도 RFC가 말하는 "원래 요청이 적용되지 않았음을 탐지할 수단"에 해당한다.</p>
+
+<p><b>4번.</b> 점검 도구는 페이지의 모든 링크에 GET을 보내 응답 코드를 확인한다. 삭제 링크도 링크이므로 줄마다 GET이 나갔고 서버는 그때마다 메모를 지웠다. 도구는 안전하다고 정의된 메서드만 썼으므로 잘못이 없다. RFC 9110 9.2.1절은 URI의 매개변수로 동작을 고르게 만든 자원에서 그 동작이 메서드의 의미와 일치하도록 하는 것이 자원 소유자의 책임이고, 안전하지 않은 동작은 안전한 메서드로 접근했을 때 비활성화하거나 거부해야 한다고 규정한다. 고치려면 삭제를 <code>DELETE /admin/notes/{id}</code>로 받도록 바꾸고(폼만 쓸 수 있는 화면이라면 POST), GET으로 온 삭제 요청은 405로 거부한다.</p>
+
+<p><b>5번.</b> (가) 같다. 제목을 "두유"로 정하는 대입이라 반복해도 상태가 같다. (나) 다르다. 적용할 때마다 배열 끝에 원소가 하나씩 덧붙는다. (다) 상태는 같다. 첫 번째 적용에서 <code>memo</code>가 제거된다. RFC 6902의 <code>remove</code>는 대상 위치가 존재해야 성공하므로 두 번째 적용은 실패하고, PATCH는 원자적이므로 실패한 패치는 상태를 바꾸지 않는다. 응답은 달라지지만 서버 상태는 한 번 적용한 것과 같다. 프록시가 재시도하지 않는 이유는 속성이 요청이 아니라 메서드에 붙기 때문이다. 프록시는 본문의 패치 문서를 해석하지 않으므로 지금 지나가는 PATCH가 (가)인지 (나)인지 알 수 없고, RFC 5789가 PATCH를 멱등이 아닌 메서드로 정의했으므로 RFC 9110의 "프록시는 멱등이 아닌 요청을 자동으로 재시도해서는 안 된다"가 그대로 적용된다.</p>
+</x-answer>
+
+<x-quiz answer="2">
+<q>어떤 서버는 <code>GET /notes/1</code>을 처리할 때마다 조회 수를 1 올리고 접근 로그를 한 줄 남긴다. RFC 9110의 정의에 비추어 옳은 설명은?</q>
+<o>서버의 상태가 바뀌므로 이 GET은 안전하지 않고, 수집기가 보내서는 안 되는 요청이다.</o>
+<o>조회 수 증가는 허용되지만 로그 기록은 안전성 위반이다.</o>
+<o>클라이언트가 상태 변화를 요청하거나 기대한 것이 아니므로 안전한 요청이다.</o>
+<o>안전 여부는 서버 구현이 정하는 것이라 표준으로는 판단할 수 없다.</o>
+<why>안전의 정의는 클라이언트의 처지에서 쓰여 있다. 클라이언트가 상태 변화를 요청하지도 기대하지도 않으면 안전하고, 서버가 스스로 일으키는 부수 효과(로그, 집계)는 이 속성을 깨지 않는다. RFC는 접근 로그를 직접 예로 든다. 안전 여부는 메서드의 정의에 속하므로 구현이 정하는 것도 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="1">
+<q><code>DELETE /notes/7</code>을 두 번 보냈더니 첫 응답은 204, 둘째 응답은 404였다. DELETE의 멱등성에 대해 옳은 것은?</q>
+<o>두 응답이 다르므로 이 서버의 DELETE는 멱등이 아니다.</o>
+<o>두 번 보낸 뒤의 서버 상태가 한 번 보낸 뒤와 같으므로 멱등이다. 응답은 달라도 된다.</o>
+<o>둘째 응답도 204로 돌려주도록 고쳐야만 멱등이 된다.</o>
+<o>DELETE는 안전한 메서드이므로 자동으로 멱등이다.</o>
+<why>멱등의 정의는 서버에 의도된 효과가 한 번 보낸 것과 같은가를 묻는다. 7번 메모가 없는 상태라는 점은 한 번이든 두 번이든 같다. RFC도 반복한 요청의 응답이 다를 수 있다고 적는다. DELETE는 상태를 바꾸므로 안전한 메서드가 아니다.</why>
+</x-quiz>
+
+<x-quiz answer="3">
+<q>요청을 보낸 뒤 응답을 받기 전에 연결이 끊겼다. 추가 정보 없이 자동으로 다시 보내도 되는 것으로 RFC 9110이 인정하는 요청은?</q>
+<o><code>POST /orders</code>로 보낸 주문 생성 요청</o>
+<o>JSON 패치로 배열 끝에 원소를 덧붙이는 <code>PATCH /notes/1</code> 요청</o>
+<o>프록시에 터널을 요청하는 <code>CONNECT</code> 요청</o>
+<o>메모의 전체 표현을 담은 <code>PUT /notes/7</code> 요청</o>
+<why>PUT은 멱등으로 정의되어 있어, 원래 요청이 이미 처리되었더라도 반복의 효과가 같다. RFC가 재시도의 예로 드는 것이 바로 응답 전에 연결이 닫힌 PUT이다. POST, PATCH, CONNECT는 멱등이 아닌 메서드이므로 그 요청이 실제로 멱등임을 알거나 원래 요청이 적용되지 않았음을 탐지할 수단이 없으면 자동으로 재시도하지 말아야 한다.</why>
+</x-quiz>
+
+<x-quiz answer="0">
+<q>메모 1번의 상태가 <code>{"title":"우유","memo":"2팩"}</code>이다. 본문 <code>{"title":"두유"}</code>를 담아 <code>PUT /notes/1</code>을 보냈고 서버가 이를 받아들였다. PUT의 정의에 따른 새 상태는?</q>
+<o><code>{"title":"두유"}</code>. 본문이 곧 새 상태이므로 memo는 없어진다.</o>
+<o><code>{"title":"두유","memo":"2팩"}</code>. 보낸 필드만 바뀐다.</o>
+<o>상태는 그대로이고 새 메모가 하나 더 만들어진다.</o>
+<o><code>{"title":"우유","memo":"2팩"}</code>. PUT은 없는 자원을 만들 때만 효과가 있다.</o>
+<why>PUT은 대상 자원의 상태를 동봉한 표현이 정의하는 상태로 교체한다. 표현에 없는 필드는 새 상태에도 없다. 보낸 필드만 바꾸는 것은 PATCH의 일이고, 새 자원을 따로 만드는 것은 컬렉션에 대한 POST의 일이다.</why>
+</x-quiz>
+
+<x-quiz answer="2">
+<q>몇 번을 적용해도 결과가 같은 PATCH 요청도 만들 수 있는데, PATCH 메서드가 멱등이 아닌 것으로 정의된 이유로 가장 알맞은 것은?</q>
+<o>PATCH의 응답 본문이 요청마다 달라지기 때문이다.</o>
+<o>PATCH가 RFC 9110이 아닌 별도 문서에 정의되어 있기 때문이다.</o>
+<o>속성은 메서드 단위로 붙고, 본문을 해석하지 못하는 중간 참여자는 멱등이 아닌 요청이 가능한 메서드를 멱등으로 다룰 수 없기 때문이다.</o>
+<o>PATCH는 언제나 기존 값에 덧붙이는 연산만 표현하기 때문이다.</o>
+<why>재시도 여부를 정하는 클라이언트 라이브러리와 프록시가 볼 수 있는 것은 메서드 토큰이다. 패치 문서에 덧붙이기 같은 연산이 올 수 있는 이상 PATCH 전체를 멱등으로 취급할 수 없다. 응답이 달라지는 것은 멱등과 무관하고, 정의된 문서가 어디인지도 속성과 무관하다.</why>
+</x-quiz>
+
+<x-glossary>
+<dt>메서드(method)</dt><dd>요청 줄의 첫 토큰으로, 대상 자원에 무엇을 할지를 나타낸다. 대소문자를 구분하며 요청 의미의 일차적 원천이다.</dd>
+<dt>자원(resource)</dt><dd>URI로 식별되는 요청의 대상. 파일이나 데이터베이스의 행에 한정되지 않고 식별할 수 있는 것은 무엇이든 될 수 있다.</dd>
+<dt>표현(representation)</dt><dd>자원의 어느 시점 상태를 전송할 수 있는 형식으로 옮긴 데이터와 그 메타데이터. HTTP가 실제로 주고받는 것이다.</dd>
+<dt>컬렉션(collection)</dt><dd>다른 자원들을 담고 있는 자원. 예제의 <code>/notes</code>가 해당하며, 서버가 식별자를 정하는 생성 요청의 대상이 된다.</dd>
+<dt>안전한 메서드(safe method)</dt><dd>클라이언트가 서버 상태의 변화를 요청하지도 기대하지도 않는, 의미가 본질적으로 읽기 전용인 메서드.</dd>
+<dt>멱등(idempotent)</dt><dd>동일한 요청을 여러 번 보냈을 때 서버에 의도된 효과가 한 번 보냈을 때와 같은 성질.</dd>
+<dt>캐시 가능(cacheable)</dt><dd>그 메서드의 응답을 저장해 두었다가 이후 요청에 재사용하는 것이 명세로 허용된 성질.</dd>
+<dt>패치 문서(patch document)</dt><dd>PATCH 요청의 본문으로, 자원을 어떻게 고칠지를 설명하는 변경 지시의 묶음. 형식은 미디어 타입으로 구별한다.</dd>
+<dt>오리진 서버(origin server)</dt><dd>대상 자원에 대해 권위 있는 응답을 만들어 내는 서버. 프록시나 캐시 같은 중간 참여자와 구별해 부르는 말이다.</dd>
+</x-glossary>
+
+<x-refs>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110.html">RFC 9110 HTTP Semantics</a> — 9장(메서드의 정의와 안전·멱등·캐시 가능 속성), 15장(201·204·405·501), 17.9절(URI에 담긴 민감 정보)</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc5789.html">RFC 5789 PATCH Method for HTTP</a> — PATCH의 정의, PUT과의 차이, 원자성, Accept-Patch</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9112.html">RFC 9112 HTTP/1.1</a> — 요청 줄 문법(3절), 재시도와 파이프라이닝(9.3절), 연결 종료와 타임아웃(9.5절)</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9111.html">RFC 9111 HTTP Caching</a> — 캐시 키(2절), 안전하지 않은 메서드에 의한 무효화(4.4절)</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc7396.html">RFC 7396 JSON Merge Patch</a> — application/merge-patch+json의 적용 규칙과 예</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc6902.html">RFC 6902 JSON Patch</a> — application/json-patch+json의 연산과 적용 순서</li>
+</x-refs>
