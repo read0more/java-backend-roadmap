@@ -26,7 +26,6 @@
   $('#resume-link').href='#'+state.last;
   $('#resume-link').textContent=state.done.length||Object.keys(state.notes).length||state.last!==FIRST?'이어서 학습하기 →':'첫 수업 시작하기 →';
  }
- function closeMenu(){$('#sidebar').classList.remove('is-open');$('#menu-toggle').setAttribute('aria-expanded','false');}
  function route(){
   const hash=decodeURIComponent(location.hash.slice(1)||'home');
   const m=hash.match(/^(lesson-\d\d)(?:-|$)/);
@@ -38,17 +37,19 @@
   $('#current-label').textContent=active==='home'?'수업 안내':(active.startsWith('lesson')?active.slice(-2)+'회 · ':'')+h.textContent;
   document.title=(active==='home'?TITLE:h.textContent+' · '+BRAND);
   if(active.startsWith('lesson')){state.last=active;save();}
-  progress();closeMenu();
+  const outlineLink = $('#lesson-outline-link');
+  const outline = document.getElementById(active + '-toc');
+  outlineLink.hidden = !outline;
+  if (outline) {
+    outlineLink.href = '#' + outline.id;
+    if (hash === outline.id) outline.open = true;
+  }
+  progress();
   const anchor=document.getElementById(hash);
   requestAnimationFrame(()=>{if(anchor&&hash!==active){anchor.scrollIntoView({behavior:'auto',block:'start'});}else{window.scrollTo({top:0,behavior:'auto'});if(changed)h.focus({preventScroll:true});}});
  }
  window.addEventListener('hashchange',route);
- $('#menu-toggle').addEventListener('click',()=>{const open=$('#sidebar').classList.toggle('is-open');$('#menu-toggle').setAttribute('aria-expanded',String(open));});
- document.addEventListener('keydown',e=>{if(e.key==='Escape')closeMenu();});
- document.addEventListener('click',e=>{if(window.innerWidth<=860&&!e.target.closest('#sidebar')&&!e.target.closest('#menu-toggle'))closeMenu();});
  $$('[data-complete]').forEach(b=>b.addEventListener('click',()=>{const n=+b.dataset.complete;state.done=state.done.includes(n)?state.done.filter(x=>x!==n):[...state.done,n];save();progress();toast(state.done.includes(n)?'오늘의 학습을 기록했어요.':'완료 표시를 취소했어요.');}));
- function updateTheme(){const dark=document.documentElement.dataset.theme==='dark';$('#theme-toggle').textContent=dark?'라이트 모드':'다크 모드';$('#theme-toggle').setAttribute('aria-label',dark?'라이트 모드로 전환':'다크 모드로 전환');}
- $('#theme-toggle').addEventListener('click',()=>{document.documentElement.dataset.theme=document.documentElement.dataset.theme==='dark'?'light':'dark';try{localStorage.setItem(ROADMAP_THEME_KEY,document.documentElement.dataset.theme);}catch(e){}updateTheme();});updateTheme();
  function feedback(form,choice){const correct=choice===+form.dataset.answer;const p=$('.feedback',form);p.hidden=false;p.className='feedback '+(correct?'correct':'wrong');p.textContent=(correct?'맞았어요. ':'다시 생각해 보세요. ')+$('.explanation',form).textContent;}
  function hydrate(){
   $$('[data-note]').forEach(el=>el.value=state.notes[el.dataset.note]||'');
